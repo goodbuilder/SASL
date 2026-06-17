@@ -1,0 +1,5 @@
+string cam
+---
+int8 index
+float32 zoom
+bool response

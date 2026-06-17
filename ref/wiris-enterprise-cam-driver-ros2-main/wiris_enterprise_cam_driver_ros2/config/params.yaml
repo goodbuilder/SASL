@@ -1,0 +1,26 @@
+wiris_stream:
+  ros__parameters:
+    camera:
+      ip: "10.0.0.230"
+      video_port: 8554
+    rtsp:
+      transport: "udp"
+      latency_ms: 50
+      drop_on_latency: true
+    target: "auto"
+    decoder: "auto"
+    appsink:
+      max_buffers: 1
+      drop: true
+    frame_id: "wiris_camera"
+    publish_eo_topic: "/wiris/eo/image_raw"
+    publish_ir_topic: "/wiris/ir/image_raw"
+    publish_rate_hz: 30.0
+    stamp_source: "now"
+
+wiris_service:
+  ros__parameters:
+    camera:
+      ip: "10.0.0.230"
+      ctrl_port: 2240
+    debug: false

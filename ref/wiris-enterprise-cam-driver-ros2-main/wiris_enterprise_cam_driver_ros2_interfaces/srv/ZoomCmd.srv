@@ -1,0 +1,4 @@
+string cam
+int8 index
+---
+bool response

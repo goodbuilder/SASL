@@ -1,0 +1,142 @@
+{
+  "keys": {},
+  "groups": {
+    "mainwindow": {
+      "keys": {
+        "geometry": {
+          "repr(QByteArray.hex)": "b'01d9d0cb00030000000000000000004a00000ab3000006d1000000000000004a00000ab3000006d100000000000000000b40000000000000004a00000ab3000006d1'",
+          "type": "repr(QByteArray.hex)"
+        },
+        "state": {
+          "repr(QByteArray.hex)": "b'000000ff00000000fd000000020000000200000aba00000000fc0100000002fb0000005a007200710074005f0069006d006100670065005f0076006900650077005f005f0049006d0061006700650056006900650077005f005f0031005f005f0049006d006100670065005600690065007700570069006400670065007401000000000000055a000001ba00fffffffb0000005a007200710074005f0069006d006100670065005f0076006900650077005f005f0049006d0061006700650056006900650077005f005f0032005f005f0049006d006100670065005600690065007700570069006400670065007401000000000000055a000001ba00ffffff000000030000000000000318fc0100000001fc00000000ffffffff0000012400fffffffc0200000003fb00000042007200710074005f0070006c006f0074005f005f0050006c006f0074005f005f0031005f005f00440061007400610050006c006f00740057006900640067006500740100000000000001040000002c00fffffffb00000042007200710074005f0070006c006f0074005f005f0050006c006f0074005f005f0032005f005f00440061007400610050006c006f00740057006900640067006500740100000000000001040000002c00fffffffb00000042007200710074005f0070006c006f0074005f005f0050006c006f0074005f005f0033005f005f00440061007400610050006c006f00740057006900640067006500740100000000000001040000002c00ffffff000000000000000000000004000000040000000800000008fc00000000'",
+          "type": "repr(QByteArray.hex)"
+        }
+      },
+      "groups": {
+        "toolbar_areas": {
+          "keys": {
+            "MinimizedDockWidgetsToolbar": {
+              "repr": "8",
+              "type": "repr"
+            }
+          },
+          "groups": {}
+        }
+      }
+    },
+    "pluginmanager": {
+      "keys": {
+        "running-plugins": {
+          "repr": "{'rqt_image_view/ImageView': [1, 2], 'rqt_plot/Plot': [1, 2, 3]}",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    },
+    "plugin__rqt_image_view__ImageView__1": {
+      "keys": {
+        "topic": {
+          "repr": "'/left_camera/detection_image'",
+          "type": "repr"
+        },
+        "dynamic_range": {
+          "repr": "False",
+          "type": "repr"
+        },
+        "max_range": {
+          "repr": "10.0",
+          "type": "repr"
+        },
+        "num_gridlines": {
+          "repr": "0",
+          "type": "repr"
+        },
+        "mouse_pub_topic": {
+          "repr": "''",
+          "type": "repr"
+        },
+        "hide_toolbar": {
+          "repr": "False",
+          "type": "repr"
+        },
+        "rotate_state": {
+          "repr": "0",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    },
+    "plugin__rqt_image_view__ImageView__2": {
+      "keys": {
+        "topic": {
+          "repr": "'/right_camera/detection_image'",
+          "type": "repr"
+        },
+        "dynamic_range": {
+          "repr": "False",
+          "type": "repr"
+        },
+        "max_range": {
+          "repr": "10.0",
+          "type": "repr"
+        },
+        "num_gridlines": {
+          "repr": "0",
+          "type": "repr"
+        },
+        "mouse_pub_topic": {
+          "repr": "''",
+          "type": "repr"
+        },
+        "hide_toolbar": {
+          "repr": "False",
+          "type": "repr"
+        },
+        "rotate_state": {
+          "repr": "0",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    },
+    "plugin__rqt_plot__Plot__1": {
+      "keys": {
+        "autoscroll": {
+          "repr": "True",
+          "type": "repr"
+        },
+        "topics": {
+          "repr": "['/ground_truth_position/data[0]', '/stereo/estimated_position/data[0]']",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    },
+    "plugin__rqt_plot__Plot__2": {
+      "keys": {
+        "autoscroll": {
+          "repr": "True",
+          "type": "repr"
+        },
+        "topics": {
+          "repr": "['/ground_truth_position/data[1]', '/stereo/estimated_position/data[1]']",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    },
+    "plugin__rqt_plot__Plot__3": {
+      "keys": {
+        "autoscroll": {
+          "repr": "True",
+          "type": "repr"
+        },
+        "topics": {
+          "repr": "['/ground_truth_position/data[2]', '/stereo/estimated_position/data[2]']",
+          "type": "repr"
+        }
+      },
+      "groups": {}
+    }
+  }
+}

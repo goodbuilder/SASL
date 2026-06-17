@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Codex/agent session state
+.codex
+.agents/
+.omx/
+**/.codex
+**/.agents/
+**/.omx/
+
+# Virtual environments and dependency installs
+.venv/
+venv/
+env/
+node_modules/
+
+# ROS/colcon/build outputs
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+
+# Large generated experiment/runtime outputs
+Simulation/results/
+Simulation/Simulation/results/
+Simulation/reports/**
+!Simulation/reports/
+!Simulation/reports/**/*.md
+!Simulation/reports/**/*.txt
+!Simulation/reports/experiments/
+!Simulation/reports/experiments/*.md
+!Simulation/reports/experiments/*.csv
+Simulation/reports/experiments/EXP-*/
+Simulation/bags/
+*.bag
+*.db3
+*.ulg
+
+# Model weights and large binary assets
+*.pt
+*.onnx
+*.engine
+ref/yolo_models/
+
+# Captured calibration/raw media. Keep derived JSON calibration files tracked.
+apps/StereoDistance/calibration_captures/left/
+apps/StereoDistance/calibration_captures/right/
+*.mp4
+*.avi
+*.mov
+
+# Reference/raw office archives are not needed for code rollback.
+*.zip
+*.pptx
+*.xlsx
+*.xls
+
+# OS/editor noise
+.DS_Store
+*~
+*.tmp
+*.bak

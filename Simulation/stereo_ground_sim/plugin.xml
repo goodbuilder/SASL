@@ -1,0 +1,17 @@
+<library path="src">
+  <class name="stereo_ground_sim/RecorderPanel" type="stereo_ground_sim.recorder_panel.RecorderPanel" base_class_type="rqt_gui_py::Plugin">
+    <description>
+      A compact CSV, MP4, and debug rosbag recording panel for the stereo ground simulation operator view.
+    </description>
+    <qtgui>
+      <group>
+        <label>Simulation</label>
+        <icon type="theme">folder</icon>
+        <statustip>Simulation operator tools.</statustip>
+      </group>
+      <label>Recorder Panel</label>
+      <icon type="theme">media-record</icon>
+      <statustip>Start and stop lite/full/debug recording presets.</statustip>
+    </qtgui>
+  </class>
+</library>

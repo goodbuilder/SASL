@@ -1,0 +1,37 @@
+{
+  "keys": {},
+  "groups": {
+    "pluginmanager": {
+      "keys": {
+        "running-plugins": {
+          "repr": "{'rqt_bag/Bag': [1], 'rqt_image_view/ImageView': [1, 2]}",
+          "type": "repr"
+        }
+      },
+      "groups": {
+        "plugin__rqt_bag__Bag__1": {
+          "keys": {},
+          "groups": {}
+        },
+        "plugin__rqt_image_view__ImageView__1": {
+          "keys": {
+            "topic": {
+              "repr": "'/left_camera/detection_image'",
+              "type": "repr"
+            }
+          },
+          "groups": {}
+        },
+        "plugin__rqt_image_view__ImageView__2": {
+          "keys": {
+            "topic": {
+              "repr": "'/right_camera/detection_image'",
+              "type": "repr"
+            }
+          },
+          "groups": {}
+        }
+      }
+    }
+  }
+}

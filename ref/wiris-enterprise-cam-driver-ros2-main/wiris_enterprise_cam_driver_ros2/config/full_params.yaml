@@ -1,0 +1,185 @@
+wiris_service:
+  ros__parameters:
+    WirisEntpCam:
+      activationInfo:
+        ipAddress: "10.0.0.230"
+        ipPort: "2240"
+        videoPort: "8554"
+        licenseKey: "qphqh0pgu0qgpm"
+      commandAbbreviations:
+        basicInfo:
+          getSerial: "GSRN"
+          getArticleNum: "GATN"
+          getFirmwareVersion: "GFWV"
+          getGpsData: "GGPS"
+          setDateTime: "SDTI"  # yyyy/mm/dd-hh:mm:ss (string)
+          getDateTime: "GDTI"
+          getMemTestResult: "GMST"
+          getMemSizeInfo: "GMSI"
+          getMemSizeLeft: "GMFR"
+          getNumCapturedImages: "GMCP"
+          getSecRecordedEoVid: "GVRC"
+          getSecRecordedThermalVid: "GTRC"
+          getCurrThermalCamResolution: "GTRE"
+        captureRecord:
+          imgCapture: "CPTR"
+          getCaptureStatus: "ICPT"
+          setPeriodicCapture: "SPIC"   # SECOND
+          getPeriodicCapture: "GPIC"
+        imageCtrl:
+          setInterpolation: "STII"  # TRUE FALSE
+          getInterpolation: "GTII"
+          setModeJpeg: "SIRJ"  # TRUE FALSE
+          getModeJpeg: "GIRJ"
+          setModeTiff: "SIRT"  # TRUE FALSE
+          getModeTiff: "GIRT"
+          setModeCwsiTiff: "SICT"  # TRUE FALSE
+          getModeCwsiTiff: "GICT"
+          setModeSuperResolution: "SISR"  # TRUE FALSE
+          getModeSuperResolution: "GISR"
+          setModeScreenshot: "SISS"  # TRUE FALSE
+          getModeScreenshot: "GISS"
+          setModeEoImage: "SIVI"  # TRUE FALSE
+          getModeEoImage: "GIVI"
+          setModeEoHighResolutionImage: "SIHR"  # TRUE FALSE
+          getModeEoHighResolutionImage: "GIHR"
+          setModeEoVideo: "SVTH"  # TRUE FALSE
+          getModeEoVideo: "GVTH"
+          setModeThermalVideo: "SVHR"  # TRUE FALSE
+          getModeThermalVideo: "GVHR"
+          setModeEoVidResolution: "SVVI"  # 1920x1080
+          getModeEoVidResolution: "GVVI"
+          setModeEoVidHighResolution: "SVHR"  # 4000x3000
+          getModeEoVidHighResolution: "GVHR"
+          setImgVidLocation: "SILC" # SSD SD_CARD FLASH_DRIVE
+          getImgVidLocation: "GILC"
+          setModeResolution: "SHRR" # 4656x3496 2320x1744 1920x1080
+          getModeResolution: "GHRR" # default: 1920x1080
+          setShowPosHdmiLRF: "SLRF" # TRUE FALSE
+          getShowPosHdmiLRF: "GLRF"
+        mainSetting:
+          setAct: "ACTV"    # licensekey
+          getAct: "IACT"
+          getHwStatus: "HIWS"
+          setEthMode: "SETH"    # TRUE FALSE
+          getEthMode: "GETH"
+          setNullChar: "SDLM"  # NULL
+          getNullChar: "GDLM"
+          setTempUnit: "STUT"    # K (Kelvin), C (Celsius), F (Fahrenheit)
+          getTempUnit: "GTUT"
+          setThermalRangeMeasMode: "SRMD"  # AUTOMATIC MANUAL SPAN
+          getThermalRangeMeasMode: "GRMD"
+          setManualThermalRangeMeas: "SRMM"  #(2) MIN MAX
+          getManualThermalRangeMeas: "GRMM"
+          setManualThermalSpan: "SRWC"  #(2) CENTER WINDOW
+          getManualThermalSpan: "GRWC"
+          setManualEnv: "SREN"   #(2) min.temp max.temp
+          getManualEnv: "GREN"
+          getPossiibleEnv: "GREL"
+          setLayout: "SLAY"  # SECURITY FULLSCREEN PIP
+          setPipTransperency: "STTY"
+          setMainCam: "SMCA"    # THERMO VISIBLE
+          getMainCam: "GMCA"
+          setGpsInfoView: "SGPI"  # POSITION ALTITUDE_SPEED
+          getGpsInfoView: "GGPI"
+          getLaserDist: "GLRD"
+          setDefaultSettings: "SDST"  # No input
+          setShutDown: "SHDW"    # No input
+          setReboot: "REBT"    # No input
+        shutterCtrl:
+          setShutterMode: "STSC" # TRUE: synchronous, FALSE: asynchronous
+          getShutterMode: "GTSC"
+          setShutterPeriod: "STCP"  # PERIOD IN SECONDS
+          getShutterPeriod: "GTCP"
+          getShutterPeriodStatus: "GTSN"
+          getThermalShutter: "IMCR"
+        thermalInfo:
+          getTempMaxLocation: "GTEX"
+          getTempRoi: "GROT"    # upper left corner ([0, 0]) and ends in right down corner ([width‐1, height‐1]), top-left corner(x,y), width, height
+          getTempPixel: "GOPT"  # upper left corner ([0, 0]) and ends in right down corner ([width‐1, height‐1])
+        thermalPallete:
+          setThermalPaletteName: "SPTE"  # PALETTE NAME  0 BLACKRED, 1 BLUERED, 2 BWIRON, 3 BWIRONI, 4 BWRAINBOW
+          setThermalPaletteIndex: "SPTI"  # INDEX NUMBER 0 BLACKRED, 1 BLUERED, 2 BWIRON, 3 BWIRONI, 4 BWRAINBOW
+          getCurrentThermalPalette: "GPTE"
+          getThermalPaletteList: "GPTL"
+          setThermalColorMap: "SCMP"    # COLOR MAP INDEX number
+          getThermalColorMap: "GCMP"
+          getThermalColorMapList: "GCML"
+          setThermalEmissivity: "STEM"  # EMISSIVITY VALUE (0.01-1.00)
+          getThermalEmissivity: "GTEM"
+          setThermalAtmospericTemp: "STAT"  # ATMOSPHERIC TEMPERATURE (Celsius)
+          getThermalAtmospericTemp: "GTAT"
+        thermalPixelStatus:
+          setTempAlarmMode: "SALM"  # ABOVE BELOW BETWEEN OUTSIDE OFF
+          getTempAlarmMode: "GALM"
+          setTempAlarmVal: "SALV"    # (2) AboveVal, BelowVal
+          getTempAlarmVal: "GALV"
+          setTempAlarmColor: "SALC"  # RED GREEN BLUE
+          getTempAlarmColor: "GALC"
+        zoomCtrl:
+          setZoomInMainDiscrete: "SZIN"    # No input (1-by-1)
+          setZoomOutMainDiscrete: "SZOT"    # No input (1-by-1)
+          setZoomMainSimultaneous: "SZSM"   # TRUE FALSE
+          getZoomMainSimultaneous: "GZSM"    
+          setZoomThermalDiscrete: "SZTN"    # ZOOM level index
+          getZoomThermalDiscrete: "GZTV"
+          getZoomThermalDiscCmd: "GZTL"
+          setZoomEoDiscrete: "SZVN"    # ZOOM level index
+          getZoomEoDiscrete: "GZVV"
+          getZoomEoDiscCmd: "GZVL"
+          setAutoFocus: "SGFA"   # No input
+          setInfFocus: "SGFI"    # No input
+      settings:
+        frameRate: 30
+        tempUint: "C" 
+        range: "AUTOMATIC"
+        replyTerminator: "\x00"
+        minThermalRange: -10.0  # Celsius
+        maxThermalRange: 60.0   # Celsius
+        layout: "FULLSCREEN"
+        gpsInfo: "POSITION"
+        transperency: 50    # 0-100 percentage
+        mainCam: "VISIBLE"  # VISIBLE THERMO
+        capturePeriod: 1  # seconds
+        relRangeHz: 10.0
+        alarmMode: "OUTSIDE"
+        emissitity: 0.75
+        atmosphericTemp: 25.0 # Celsius
+        shutterMode: "TRUE"
+        shutterPeriod: 240
+        imgVidLocation: "SD_CARD"
+        imgVidResolution: "1920x1080"
+        thermalPalletteName: "BLACKRED"
+      topics:
+        booting:
+          rebootServer: "/wiris_cam/srv/reboot"
+        pinger:
+          pingServer: "/wiris_cam/server_node/ping"
+        images:
+          eoImg: "/wiris_cam/pub/eo_img"
+          irImg: "/wiris_cam/pub/ir_img"
+        zoomService:
+          zoomCtrl: "/wiris_cam/srv/zoom_ctrl"
+          zoomStatus: "/wiris_cam/srv/zoom_status"
+        relativeRangePub:
+          relRangeStatus: "/wiris_cam/pub/relative_range_status"
+
+wiris_stream:
+  ros__parameters:
+    camera:
+      ip: "10.0.0.230"
+      video_port: 8554
+    rtsp:
+      transport: "udp"
+      latency_ms: 50
+      drop_on_latency: true
+    target: "auto"
+    decoder: "auto"
+    appsink:
+      max_buffers: 1
+      drop: true
+    frame_id: "wiris_camera"
+    publish_eo_topic: "/wiris/eo/image_raw"
+    publish_ir_topic: "/wiris/ir/image_raw"
+    publish_rate_hz: 30.0
+    stamp_source: "now"
