@@ -12,7 +12,11 @@ from typing import Iterable, Mapping, Sequence
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
-NED_TO_RDF_CONTRACT = "rdf_right=east, rdf_down=down, rdf_forward=north"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "explicit_transform_required: truth_rdf must be stereo_center_RDF from a declared "
+    "T_source_to_stereo_rdf or an already stereo-frame truth producer; direct source-frame "
+    "axis aliasing is forbidden"
+)
 
 TRUTH_RDF_FIELDS = (
     ("truth_right_m", "truth_down_m", "truth_forward_m"),
@@ -86,12 +90,6 @@ def row_diagnostic(
 ) -> dict[str, object]:
     truth_source, truth_rdf = first_vector(row, TRUTH_RDF_FIELDS)
     truth_ned_source, truth_ned = first_vector(row, TRUTH_NED_FIELDS)
-    if truth_rdf is None and truth_ned is not None:
-        truth_rdf = [truth_ned[1], truth_ned[2], truth_ned[0]]
-        truth_source = truth_ned_source
-    if truth_ned is None and truth_rdf is not None:
-        truth_ned = [truth_rdf[2], truth_rdf[0], truth_rdf[1]]
-        truth_ned_source = ("derived_from_rdf", "derived_from_rdf", "derived_from_rdf")
 
     raw_source, raw_rdf = first_vector(row, RAW_RDF_FIELDS)
     left_u_name, left_u = first_float(row, ("left_u_px", "left_cx_px", "left_cx"))
@@ -106,7 +104,9 @@ def row_diagnostic(
 
     reasons: list[str] = []
     if truth_rdf is None:
-        reasons.append("missing_truth_rdf_or_ned")
+        reasons.append("missing_truth_rdf")
+    if truth_rdf is None and truth_ned is not None:
+        reasons.append("missing_explicit_T_source_to_stereo_rdf")
     if raw_rdf is None and None in (left_u, left_v, disparity):
         reasons.append("missing_raw_rdf_or_triangulation_inputs")
     if disparity is None:
@@ -162,7 +162,10 @@ def summarize(diagnostics: Sequence[Mapping[str, object]], *, min_target_count: 
         "rdf_axis_contract": RDF_AXIS_CONTRACT,
         "ned_axis_contract": NED_AXIS_CONTRACT,
         "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
-        "ned_to_rdf_contract": NED_TO_RDF_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
+        "direct_source_axis_alias_allowed": False,
+        "direct_ned_to_rdf_axis_alias_allowed": False,
+        "ned_to_rdf_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
     }
 
 

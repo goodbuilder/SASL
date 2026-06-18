@@ -27,6 +27,7 @@ CAMERA_MODEL_CONFIG="${CAMERA_MODEL_CONFIG:-$ROOT_DIR/config/camera_model.env}"
 YOLO_CONFIG="${YOLO_CONFIG:-$ROOT_DIR/config/yolo.env}"
 ATTITUDE_CONFIG="${ATTITUDE_CONFIG:-$ROOT_DIR/config/camera_attitude.env}"
 DRONE_MISSION_CONFIG="${DRONE_MISSION_CONFIG:-$ROOT_DIR/config/drone_mission.env}"
+SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
 
 YOLO_MODEL_PATH_FROM_ENV="${YOLO_MODEL_PATH+x}"; YOLO_MODEL_PATH_ENV_VALUE="${YOLO_MODEL_PATH:-}"
 YOLO_CLASS_NAME_FROM_ENV="${YOLO_CLASS_NAME+x}"; YOLO_CLASS_NAME_ENV_VALUE="${YOLO_CLASS_NAME:-}"
@@ -109,6 +110,49 @@ fi
 [[ -n "$YOLO_PYTHONPATH_FROM_ENV" ]] && YOLO_PYTHONPATH="$YOLO_PYTHONPATH_ENV_VALUE"
 [[ -n "$BBOX_CENTER_ADJUSTMENT_ENABLE_FROM_ENV" ]] && BBOX_CENTER_ADJUSTMENT_ENABLE="$BBOX_CENTER_ADJUSTMENT_ENABLE_ENV_VALUE"
 [[ -n "$BBOX_CENTER_ADJUSTMENT_PATH_FROM_ENV" ]] && BBOX_CENTER_ADJUSTMENT_PATH="$BBOX_CENTER_ADJUSTMENT_PATH_ENV_VALUE"
+
+if [[ -n "$SIM_SCENARIO_CONFIG" ]]; then
+  if [[ "$SIM_SCENARIO_CONFIG" != /* && -f "$CALLER_CWD/$SIM_SCENARIO_CONFIG" ]]; then
+    SIM_SCENARIO_CONFIG="$CALLER_CWD/$SIM_SCENARIO_CONFIG"
+  elif [[ "$SIM_SCENARIO_CONFIG" != /* && -f "$ROOT_DIR/config/scenarios/$SIM_SCENARIO_CONFIG" ]]; then
+    SIM_SCENARIO_CONFIG="$ROOT_DIR/config/scenarios/$SIM_SCENARIO_CONFIG"
+  fi
+  if [[ ! -f "$SIM_SCENARIO_CONFIG" ]]; then
+    echo "error: SIM_SCENARIO_CONFIG not found: $SIM_SCENARIO_CONFIG" >&2
+    exit 2
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  source "$SIM_SCENARIO_CONFIG"
+  set +a
+  [[ -n "$CAMERA_BASELINE_M_FROM_ENV" ]] && CAMERA_BASELINE_M="$CAMERA_BASELINE_M_ENV_VALUE"
+  [[ -n "$CAMERA_HEIGHT_M_FROM_ENV" ]] && CAMERA_HEIGHT_M="$CAMERA_HEIGHT_M_ENV_VALUE"
+  [[ -n "$CAMERA_HORIZONTAL_FOV_RAD_FROM_ENV" ]] && CAMERA_HORIZONTAL_FOV_RAD="$CAMERA_HORIZONTAL_FOV_RAD_ENV_VALUE"
+  [[ -n "$CAMERA_IMAGE_WIDTH_PX_FROM_ENV" ]] && CAMERA_IMAGE_WIDTH_PX="$CAMERA_IMAGE_WIDTH_PX_ENV_VALUE"
+  [[ -n "$CAMERA_IMAGE_HEIGHT_PX_FROM_ENV" ]] && CAMERA_IMAGE_HEIGHT_PX="$CAMERA_IMAGE_HEIGHT_PX_ENV_VALUE"
+  [[ -n "$CAMERA_UPDATE_RATE_HZ_FROM_ENV" ]] && CAMERA_UPDATE_RATE_HZ="$CAMERA_UPDATE_RATE_HZ_ENV_VALUE"
+  [[ -n "$CAMERA_CLIP_NEAR_M_FROM_ENV" ]] && CAMERA_CLIP_NEAR_M="$CAMERA_CLIP_NEAR_M_ENV_VALUE"
+  [[ -n "$CAMERA_CLIP_FAR_M_FROM_ENV" ]] && CAMERA_CLIP_FAR_M="$CAMERA_CLIP_FAR_M_ENV_VALUE"
+  [[ -n "$DRONE_SPAWN_X_M_FROM_ENV" ]] && DRONE_SPAWN_X_M="$DRONE_SPAWN_X_M_ENV_VALUE"
+  [[ -n "$DRONE_SPAWN_Y_M_FROM_ENV" ]] && DRONE_SPAWN_Y_M="$DRONE_SPAWN_Y_M_ENV_VALUE"
+  [[ -n "$DRONE_SPAWN_Z_M_FROM_ENV" ]] && DRONE_SPAWN_Z_M="$DRONE_SPAWN_Z_M_ENV_VALUE"
+  [[ -n "$DRONE_SPAWN_YAW_DEG_FROM_ENV" ]] && DRONE_SPAWN_YAW_DEG="$DRONE_SPAWN_YAW_DEG_ENV_VALUE"
+  [[ -n "$DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV" ]] && DRONE_TAKEOFF_ALTITUDE_M="$DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE"
+  [[ -n "$DRONE_FORWARD_SPEED_MPS_FROM_ENV" ]] && DRONE_FORWARD_SPEED_MPS="$DRONE_FORWARD_SPEED_MPS_ENV_VALUE"
+  [[ -n "$DRONE_TARGET_DISTANCE_M_FROM_ENV" ]] && DRONE_TARGET_DISTANCE_M="$DRONE_TARGET_DISTANCE_M_ENV_VALUE"
+  [[ -n "$DRONE_FIRST_HOVER_S_FROM_ENV" ]] && DRONE_FIRST_HOVER_S="$DRONE_FIRST_HOVER_S_ENV_VALUE"
+  [[ -n "$DRONE_FINAL_HOVER_S_FROM_ENV" ]] && DRONE_FINAL_HOVER_S="$DRONE_FINAL_HOVER_S_ENV_VALUE"
+  [[ -n "$DRONE_LAND_DURATION_S_FROM_ENV" ]] && DRONE_LAND_DURATION_S="$DRONE_LAND_DURATION_S_ENV_VALUE"
+  [[ -n "$DRONE_LAND_TIMEOUT_S_FROM_ENV" ]] && DRONE_LAND_TIMEOUT_S="$DRONE_LAND_TIMEOUT_S_ENV_VALUE"
+  [[ -n "$YOLO_MODEL_PATH_FROM_ENV" ]] && YOLO_MODEL_PATH="$YOLO_MODEL_PATH_ENV_VALUE"
+  [[ -n "$YOLO_CLASS_NAME_FROM_ENV" ]] && YOLO_CLASS_NAME="$YOLO_CLASS_NAME_ENV_VALUE"
+  [[ -n "$YOLO_CONFIDENCE_FROM_ENV" ]] && YOLO_CONFIDENCE="$YOLO_CONFIDENCE_ENV_VALUE"
+  [[ -n "$YOLO_DEVICE_FROM_ENV" ]] && YOLO_DEVICE="$YOLO_DEVICE_ENV_VALUE"
+  [[ -n "$YOLO_TARGET_HZ_FROM_ENV" ]] && YOLO_TARGET_HZ="$YOLO_TARGET_HZ_ENV_VALUE"
+  [[ -n "$YOLO_IMGSZ_FROM_ENV" ]] && YOLO_IMGSZ="$YOLO_IMGSZ_ENV_VALUE"
+  [[ -n "$YOLO_PYTHON_FROM_ENV" ]] && YOLO_PYTHON="$YOLO_PYTHON_ENV_VALUE"
+  [[ -n "$YOLO_PYTHONPATH_FROM_ENV" ]] && YOLO_PYTHONPATH="$YOLO_PYTHONPATH_ENV_VALUE"
+fi
 
 resolve_existing_dir() {
   local candidate
@@ -241,7 +285,10 @@ MAVLink.
 
 Camera attitude defaults are read from config/camera_attitude.env.
 Drone spawn and auto mission defaults are read from config/drone_mission.env.
-Any launch arg passed here overrides that file.
+Set SIM_SCENARIO_CONFIG to a file under config/scenarios/ to override baseline,
+camera height, zoom/FOV, target size/range, mission, and YOLO settings as one
+named digital-twin scenario. Explicit environment variables and launch args
+still override scenario values.
 
 Options:
   --save [DIR]           Save a lite CSV session while observing. Alias for --record-lite.
@@ -256,6 +303,17 @@ Options:
                          Use /ground_truth_position as fallback calibration truth.
   --calibration-truth-topic TOPIC
                          PX4 truth topic for calibration CSV. Default: /fmu/out/vehicle_local_position.
+  --calibration-local-truth-topic TOPIC
+                         PX4 local NED topic recorded into local_truth_* fields.
+  --calibration-global-truth-topic TOPIC
+                         PX4 global position topic recorded into global_truth_* fields.
+  --calibration-gps-truth-topic TOPIC
+                         PX4 GPS position topic recorded into gps_truth_* fields.
+  --calibration-truth-source SOURCE
+                         PX4 truth source contract: local_ned, global_position, or gps_position.
+                         Default: local_ned.
+  --calibration-sim-truth-role ROLE
+                         Role for /ground_truth_position: oracle or training. Default: oracle.
   --calibration-hz VALUE Calibration CSV write rate. Default: 10.0.
   --yolo-model FILE      Use this YOLO .pt file for drone detection.
   --select-yolo-model    Open a file picker for selecting a YOLO .pt file.
@@ -265,8 +323,29 @@ Options:
   --yolo-hz VALUE        YOLO scheduler target in Hz. Default: 40.0 to keep measured output above 20 Hz.
   --yolo-imgsz PIXELS    YOLO inference image size. Default from config/yolo.env.
   --yolo-python FILE     Python used for the YOLO distance node. Default: local .venv or python3.
-  --bbox-adjustment FILE Use a 6x4 bbox-center adjustment CSV and publish corrected_position.
+  --bbox-adjustment FILE Use a 6x4 bbox-center CSV or JSON runtime profile and publish corrected_position.
   --no-bbox-adjustment   Disable bbox-center adjustment even if env defaults are set.
+  --observation-fusion-manifest FILE
+                         Fuse runtime image observations before raw RDF/profile apply.
+  --observation-fusion-tier TIER
+                         Select a tier from the observation-fusion manifest.
+  --no-observation-fusion
+                         Disable observation fusion even if env defaults are set.
+  --disparity-residual-profile FILE
+                         Apply a runtime residual disparity profile after bbox/profile correction.
+  --disparity-residual-feature-selector FILE
+                         Let StereoDistanceNode select a residual disparity profile from runtime
+                         image/disparity/RDF summary features.
+  --disparity-residual-feature-catalog FILE
+                         Residual profile catalog JSON for --disparity-residual-feature-selector.
+  --disparity-residual-feature-window-size N
+                         Rolling runtime feature window size for node-side residual selection.
+  --disparity-residual-feature-min-samples N
+                         Minimum samples before node-side residual selection is allowed.
+  --no-disparity-residual
+                         Disable residual disparity correction even if env defaults are set.
+  --no-disparity-residual-feature-selector
+                         Disable node-side residual feature selection.
   --plot-hz VALUE        Distance graph topic publish rate in Hz. Default: 30.0.
   --actual-hz VALUE      Gazebo actual-distance pose read rate in Hz. Default: 15.0.
   --plot-window S        Visible rqt_plot X-axis window in seconds. Default: 30.0.
@@ -279,6 +358,8 @@ Options:
   --px4-dir DIR          PX4-Autopilot directory. Default: $PX4_DIR
   --px4-model-name NAME  Existing Gazebo model to attach PX4 to. Default: x500_15m.
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
+  --headless             Do not start Gazebo GUI or rqt_gui. Useful for automated
+                         record-lite smoke runs.
   --auto-mission         Start PX4 offboard takeoff/approach/land after the app starts.
   --mission              Alias for --auto-mission.
   --quick-mission        Faster PX4 offboard approach settings for smoke testing.
@@ -301,6 +382,7 @@ bag_view=false
 open_params=false
 start_px4=true
 show_detection_images=true
+headless=false
 launch_input=()
 mission_args=()
 selected_yolo_model=""
@@ -351,6 +433,26 @@ while (($#)); do
       ;;
     --calibration-truth-topic)
       launch_input+=("calibration_truth_topic:=${2:?missing value for --calibration-truth-topic}")
+      shift 2
+      ;;
+    --calibration-local-truth-topic)
+      launch_input+=("calibration_local_truth_topic:=${2:?missing value for --calibration-local-truth-topic}")
+      shift 2
+      ;;
+    --calibration-global-truth-topic)
+      launch_input+=("calibration_global_truth_topic:=${2:?missing value for --calibration-global-truth-topic}")
+      shift 2
+      ;;
+    --calibration-gps-truth-topic)
+      launch_input+=("calibration_gps_truth_topic:=${2:?missing value for --calibration-gps-truth-topic}")
+      shift 2
+      ;;
+    --calibration-truth-source)
+      launch_input+=("calibration_truth_source:=${2:?missing value for --calibration-truth-source}")
+      shift 2
+      ;;
+    --calibration-sim-truth-role)
+      launch_input+=("calibration_sim_truth_role:=${2:?missing value for --calibration-sim-truth-role}")
       shift 2
       ;;
     --calibration-hz)
@@ -410,6 +512,49 @@ while (($#)); do
       launch_input+=("enable_bbox_center_adjustment:=false")
       shift
       ;;
+    --observation-fusion-manifest)
+      launch_input+=("enable_observation_fusion:=true")
+      launch_input+=("observation_fusion_manifest_path:=${2:?missing value for --observation-fusion-manifest}")
+      shift 2
+      ;;
+    --observation-fusion-tier)
+      launch_input+=("observation_fusion_tier:=${2:?missing value for --observation-fusion-tier}")
+      shift 2
+      ;;
+    --no-observation-fusion)
+      launch_input+=("enable_observation_fusion:=false")
+      shift
+      ;;
+    --disparity-residual-profile)
+      launch_input+=("enable_disparity_residual_profile:=true")
+      launch_input+=("disparity_residual_profile_path:=${2:?missing value for --disparity-residual-profile}")
+      shift 2
+      ;;
+    --disparity-residual-feature-selector)
+      launch_input+=("enable_disparity_residual_feature_selector:=true")
+      launch_input+=("disparity_residual_feature_selector_model_path:=${2:?missing value for --disparity-residual-feature-selector}")
+      shift 2
+      ;;
+    --disparity-residual-feature-catalog)
+      launch_input+=("disparity_residual_feature_selector_catalog_path:=${2:?missing value for --disparity-residual-feature-catalog}")
+      shift 2
+      ;;
+    --disparity-residual-feature-window-size)
+      launch_input+=("disparity_residual_feature_selector_window_size:=${2:?missing value for --disparity-residual-feature-window-size}")
+      shift 2
+      ;;
+    --disparity-residual-feature-min-samples)
+      launch_input+=("disparity_residual_feature_selector_min_samples:=${2:?missing value for --disparity-residual-feature-min-samples}")
+      shift 2
+      ;;
+    --no-disparity-residual)
+      launch_input+=("enable_disparity_residual_profile:=false")
+      shift
+      ;;
+    --no-disparity-residual-feature-selector)
+      launch_input+=("enable_disparity_residual_feature_selector:=false")
+      shift
+      ;;
     --plot-hz)
       launch_input+=("plot_publish_hz:=${2:?missing value for --plot-hz}")
       shift 2
@@ -432,6 +577,11 @@ while (($#)); do
       ;;
     --bag-view)
       bag_view=true
+      shift
+      ;;
+    --headless)
+      headless=true
+      show_detection_images=false
       shift
       ;;
     --params)
@@ -538,6 +688,7 @@ cleanup_previous_run() {
   terminate_matching TERM "^gz sim gui$"
   terminate_gz_sim_processes TERM
   terminate_matching TERM "rqt_gui --clear-config --perspective-file $ROOT_DIR/config/operator_rqt"
+  terminate_matching TERM "rqt_gui --clear-config .*stereo_ground_sim.operator_panel.OperatorPanel"
   terminate_matching TERM "operator_recorder --mode"
   terminate_matching TERM "calibration_csv_recorder"
   terminate_matching TERM "ros2 bag record .* /stereo/distance"
@@ -561,6 +712,7 @@ cleanup_previous_run() {
   terminate_matching KILL "^gz sim gui$"
   terminate_gz_sim_processes KILL
   terminate_matching KILL "rqt_gui --clear-config --perspective-file $ROOT_DIR/config/operator_rqt"
+  terminate_matching KILL "rqt_gui --clear-config .*stereo_ground_sim.operator_panel.OperatorPanel"
   terminate_matching KILL "operator_recorder --mode"
   terminate_matching KILL "calibration_csv_recorder"
   terminate_matching KILL "ros2 bag record .* /stereo/distance"
@@ -586,6 +738,7 @@ cleanup() {
     fi
   done
   terminate_matching KILL "rqt_gui --clear-config --perspective-file $ROOT_DIR/config/operator_rqt"
+  terminate_matching KILL "rqt_gui --clear-config .*stereo_ground_sim.operator_panel.OperatorPanel"
   terminate_matching KILL "operator_recorder --mode"
   terminate_matching KILL "calibration_csv_recorder"
   terminate_matching KILL "stereo_ground_sim.detection_overlay_node"
@@ -631,12 +784,27 @@ add_default_launch_arg() {
   fi
 }
 
+add_optional_default_launch_arg() {
+  local name="$1"
+  local value="$2"
+  shift 2
+  if [[ -n "$value" ]] && ! has_launch_arg "$name" "$@"; then
+    launch_args+=("$name:=$value")
+  fi
+}
+
 add_default_launch_arg left_roll_error_deg "${LEFT_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg left_pitch_error_deg "${LEFT_PITCH_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg left_yaw_error_deg "${LEFT_YAW_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg right_roll_error_deg "${RIGHT_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg right_pitch_error_deg "${RIGHT_PITCH_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg right_yaw_error_deg "${RIGHT_YAW_ERROR_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg scenario_name "${SIM_SCENARIO_NAME:-unspecified}" "${launch_input[@]}"
+add_default_launch_arg target_class "${SIM_TARGET_CLASS:-unspecified}" "${launch_input[@]}"
+add_default_launch_arg target_size_m "${SIM_TARGET_SIZE_M:-nan}" "${launch_input[@]}"
+add_default_launch_arg scenario_range_min_m "${SIM_RANGE_MIN_M:-nan}" "${launch_input[@]}"
+add_default_launch_arg scenario_range_max_m "${SIM_RANGE_MAX_M:-nan}" "${launch_input[@]}"
+add_default_launch_arg zoom_index "${SIM_ZOOM_INDEX:-nan}" "${launch_input[@]}"
 add_default_launch_arg baseline_m "${CAMERA_BASELINE_M:-25.0}" "${launch_input[@]}"
 add_default_launch_arg camera_height_m "${CAMERA_HEIGHT_M:-5.0}" "${launch_input[@]}"
 add_default_launch_arg horizontal_fov_rad "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" "${launch_input[@]}"
@@ -694,10 +862,22 @@ if [[ -x "$DEFAULT_YOLO_PYTHON" ]]; then
 fi
 add_default_launch_arg plot_publish_hz "$DEFAULT_PLOT_HZ" "${launch_input[@]}"
 add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${launch_input[@]}"
-add_default_launch_arg enable_bbox_center_adjustment "${BBOX_CENTER_ADJUSTMENT_ENABLE:-false}" "${launch_input[@]}"
-add_default_launch_arg bbox_center_adjustment_path "${BBOX_CENTER_ADJUSTMENT_PATH:-$DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH}" "${launch_input[@]}"
-if ! has_launch_arg gz_gui "${launch_input[@]}"; then
-  launch_args+=("gz_gui:=true")
+	add_default_launch_arg enable_bbox_center_adjustment "${BBOX_CENTER_ADJUSTMENT_ENABLE:-false}" "${launch_input[@]}"
+	add_default_launch_arg bbox_center_adjustment_path "${BBOX_CENTER_ADJUSTMENT_PATH:-$DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH}" "${launch_input[@]}"
+	add_default_launch_arg enable_observation_fusion "${OBSERVATION_FUSION_ENABLE:-false}" "${launch_input[@]}"
+	add_optional_default_launch_arg observation_fusion_manifest_path "${OBSERVATION_FUSION_MANIFEST_PATH:-}" "${launch_input[@]}"
+	add_optional_default_launch_arg observation_fusion_tier "${OBSERVATION_FUSION_TIER:-}" "${launch_input[@]}"
+	add_default_launch_arg enable_disparity_residual_feature_selector "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_ENABLE:-false}" "${launch_input[@]}"
+	add_optional_default_launch_arg disparity_residual_feature_selector_model_path "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MODEL_PATH:-}" "${launch_input[@]}"
+	add_optional_default_launch_arg disparity_residual_feature_selector_catalog_path "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_CATALOG_PATH:-}" "${launch_input[@]}"
+	add_default_launch_arg disparity_residual_feature_selector_window_size "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_WINDOW_SIZE:-1}" "${launch_input[@]}"
+	add_default_launch_arg disparity_residual_feature_selector_min_samples "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MIN_SAMPLES:-1}" "${launch_input[@]}"
+	if ! has_launch_arg gz_gui "${launch_input[@]}"; then
+  if [[ "$headless" == true ]]; then
+    launch_args+=("gz_gui:=false")
+  else
+    launch_args+=("gz_gui:=true")
+  fi
 fi
 if ! has_launch_arg launch_rviz "${launch_input[@]}"; then
   launch_args+=("launch_rviz:=false")
@@ -762,33 +942,49 @@ else
   rqt_image_topic_mode="raw"
 fi
 
-setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
-  --clear-config \
-  --perspective-file "$perspective_file" &
-children+=("$!")
-
-sleep 3
-rqt_pid="$(pgrep -n -f 'rqt_gui --clear-config --perspective-file' || true)"
-if [[ -n "$rqt_pid" ]]; then
-  if [[ "$open_params" == true && "$bag_view" != true ]]; then
-    for _ in {1..5}; do
-      rqt_pid="$(pgrep -n -f '/lib/rqt_gui/rqt_gui --clear-config --perspective-file' || pgrep -n -f 'rqt_gui --clear-config --perspective-file' || true)"
-      [[ -n "$rqt_pid" ]] || break
-      env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
-        --command-pid "$rqt_pid" \
-        --command-start-plugin rqt_reconfigure/Param \
-        --args /stereo_distance_node >/dev/null 2>&1 && break
-      sleep 1
-    done
+if [[ "$headless" != true ]]; then
+  if [[ "$bag_view" != true ]]; then
+    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+      --clear-config \
+      --force-discover \
+      --reload-import \
+      --standalone stereo_ground_sim.operator_panel.OperatorPanel &
+  else
+    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+      --clear-config \
+      --force-discover \
+      --reload-import \
+      --perspective-file "$perspective_file" &
   fi
-  for _ in {1..8}; do
-    rqt_pid="$(pgrep -n -f '/lib/rqt_gui/rqt_gui --clear-config --perspective-file' || pgrep -n -f 'rqt_gui --clear-config --perspective-file' || true)"
-    [[ -n "$rqt_pid" ]] || break
-    env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
-      --command-pid "$rqt_pid" \
-      --command-start-plugin stereo_ground_sim/RecorderPanel >/dev/null 2>&1 && break
-    sleep 1
-  done
+  children+=("$!")
+
+  sleep 3
+  rqt_pid="$(pgrep -n -f 'rqt_gui --clear-config' || true)"
+  if [[ -n "$rqt_pid" ]]; then
+    if [[ "$open_params" == true && "$bag_view" != true ]]; then
+      for _ in {1..5}; do
+        rqt_pid="$(pgrep -n -f '/lib/rqt_gui/rqt_gui --clear-config' || pgrep -n -f 'rqt_gui --clear-config' || true)"
+        [[ -n "$rqt_pid" ]] || break
+        env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+          --command-pid "$rqt_pid" \
+          --command-start-plugin rqt_reconfigure/Param \
+          --args /stereo_distance_node >/dev/null 2>&1 && break
+        sleep 1
+      done
+    fi
+    if [[ "$bag_view" == true ]]; then
+      for _ in {1..8}; do
+        rqt_pid="$(pgrep -n -f '/lib/rqt_gui/rqt_gui --clear-config --perspective-file' || pgrep -n -f 'rqt_gui --clear-config --perspective-file' || true)"
+        [[ -n "$rqt_pid" ]] || break
+        env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+          --command-pid "$rqt_pid" \
+          --command-start-plugin stereo_ground_sim/RecorderPanel >/dev/null 2>&1 && break
+        sleep 1
+      done
+    fi
+  fi
+else
+  printf '%s\n' "Headless mode: rqt_gui is disabled."
 fi
 
 if [[ -n "$record_mode" ]]; then
@@ -819,8 +1015,10 @@ if [[ "$start_px4" == true ]]; then
 fi
 if [[ "$bag_view" == true ]]; then
   printf '%s\n' "The single rqt_gui window contains left/right camera views and rqt_bag."
+elif [[ "$headless" == true ]]; then
+  printf '%s\n' "Headless mode: no rqt_gui window was started."
 else
-  printf '%s\n' "The single rqt_gui window contains left/right camera views and the distance plot."
+  printf '%s\n' "The single rqt_gui window contains left/right camera views and Forward/Right/Down plots."
 fi
 printf '%s\n' "Use QGC for normal control of the existing x500_15m target."
 if [[ "$run_mission" == true && "$start_px4" == true ]]; then

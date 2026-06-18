@@ -381,6 +381,7 @@ def main() -> None:
         "internal_correction_frame": "stereo_center_opencv_optical",
         "internal_correction_axis_order": "right,down,forward",
         "public_stereodistance_topic_order": "forward,right,down,range",
+        "truth_rdf_transform_contract": NED_TO_RDF_CONTRACT,
         "ned_to_rdf_contract": NED_TO_RDF_CONTRACT,
         "runtime_truth_used": False,
         "best_method": best,
@@ -402,7 +403,7 @@ def main() -> None:
         "",
         (
             "Coordinate contract: PX4/local NED truth `north/east/down` is converted to stereo-center "
-            "OpenCV optical RDF by `rdf_right=east`, `rdf_down=down`, `rdf_forward=north`. Internal "
+            "OpenCV optical RDF by an explicit T_source_to_stereo_rdf; direct NED-to-RDF axis aliasing is forbidden. Internal "
             "correction is RDF `right/down/forward`; public StereoDistance topics remain FRD+range "
             "`forward/right/down/range`."
         ),

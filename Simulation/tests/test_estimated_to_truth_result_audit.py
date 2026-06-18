@@ -53,6 +53,11 @@ class EstimatedToTruthResultAuditTests(unittest.TestCase):
                         "runtime_truth_used": False,
                         "coordinate_contracts_explicit": True,
                         "alias_contracts_explicit": True,
+                        "truth_rdf_transform_contract": (
+                            "explicit T_source_to_stereo_rdf required; direct axis alias "
+                            "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+                        ),
+                        "direct_ned_to_rdf_axis_alias_allowed": False,
                         "runtime_profile_exportable": True,
                         "stereodistance_applicable": True,
                         "preflight": {"pass_preflight": True},
@@ -89,6 +94,11 @@ class EstimatedToTruthResultAuditTests(unittest.TestCase):
                         "runtime_truth_used": False,
                         "coordinate_contracts_explicit": True,
                         "alias_contracts_explicit": True,
+                        "truth_rdf_transform_contract": (
+                            "explicit T_source_to_stereo_rdf required; direct axis alias "
+                            "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+                        ),
+                        "direct_ned_to_rdf_axis_alias_allowed": False,
                         "runtime_profile_exportable": True,
                         "stereodistance_applicable": True,
                         "promotion_check": {},
@@ -103,6 +113,31 @@ class EstimatedToTruthResultAuditTests(unittest.TestCase):
         self.assertFalse(audit["pass_audit"])
         self.assertIn("promotion_check/promotion_check.json", audit["missing_artifacts"])
         self.assertIn("promotion_check_passed", audit["failed_metric_checks"])
+
+    def test_audit_fails_direct_ned_to_rdf_axis_alias(self) -> None:
+        module = load_audit_module()
+        metrics = {
+            "status": "STRICT_PASS",
+            "scenario": "synthetic_rtk_px4_ned_to_stereo_rdf_1852m",
+            "validation_range_rmse_raw_m": 5.0,
+            "validation_range_rmse_corrected_m": 1.0,
+            "validation_position_rmse_raw_m": 6.0,
+            "validation_position_rmse_corrected_m": 1.2,
+            "target_1852m_abs_mean_error_m": 0.5,
+            "target_1852m_sample_count": 4,
+            "runtime_truth_used": False,
+            "coordinate_contracts_explicit": True,
+            "alias_contracts_explicit": True,
+            "truth_rdf_transform_contract": "synthetic_bridge: rdf_right=east, rdf_down=down, rdf_forward=north",
+            "runtime_profile_exportable": True,
+            "stereodistance_applicable": True,
+            "promotion_check": {"pass_promotion_check": True},
+            "gate_result": {"verdict": "STRICT_PASS"},
+        }
+
+        checks = module.check_metrics(metrics)
+
+        self.assertFalse(checks["direct_axis_alias_forbidden"])
 
 
 if __name__ == "__main__":

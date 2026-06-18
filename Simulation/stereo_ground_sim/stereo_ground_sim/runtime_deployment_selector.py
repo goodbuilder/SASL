@@ -14,6 +14,7 @@ import numpy as np
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
 DEFAULT_CAMERA_WIDTH_PX = 1280.0
+DEFAULT_CAMERA_HEIGHT_PX = 720.0
 DEFAULT_CAMERA_HORIZONTAL_FOV_RAD = 0.154997710698
 DEFAULT_CAMERA_BASELINE_M = 25.0
 DEFAULT_NOMINAL_DISPARITY_FORWARD_PRODUCT_PX_M = (
@@ -161,6 +162,510 @@ class RuntimeMeasurementSample:
         )
 
 
+@dataclass(frozen=True)
+class RuntimeImageObservation:
+    """One runtime left-image stereo observation.
+
+    Input contract: ``left_u_px``/``left_v_px`` are left-image pixel coordinates,
+    and ``measured_disparity_px`` is left minus right image disparity in pixels.
+    No PX4/RTK truth, validation metric, or replay label is accepted here.
+    """
+
+    left_u_px: float
+    left_v_px: float
+    measured_disparity_px: float
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, object]) -> "RuntimeImageObservation | None":
+        left_u = finite_float(row.get("left_u_px", row.get("left_cx_px")))
+        left_v = finite_float(row.get("left_v_px", row.get("left_cy_px")))
+        disparity = finite_float(row.get("measured_disparity_px", row.get("raw_disparity_px")))
+        if not all(math.isfinite(value) for value in (left_u, left_v, disparity)):
+            return None
+        if disparity <= 0.0:
+            return None
+        return cls(
+            left_u_px=left_u,
+            left_v_px=left_v,
+            measured_disparity_px=disparity,
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeStereoCameraContract:
+    """Fixed stereo geometry used to convert image observations to RDF.
+
+    Output frame is stereo-center OpenCV optical RDF:
+    ``right_m = +image right``, ``down_m = +image down``,
+    ``forward_m = +optical forward``. Baseline is along RDF right, and the
+    public StereoDistance FRD+range topic is not used in this conversion.
+    """
+
+    width_px: float = DEFAULT_CAMERA_WIDTH_PX
+    height_px: float = DEFAULT_CAMERA_HEIGHT_PX
+    horizontal_fov_rad: float = DEFAULT_CAMERA_HORIZONTAL_FOV_RAD
+    baseline_m: float = DEFAULT_CAMERA_BASELINE_M
+
+    @property
+    def fx_px(self) -> float:
+        return (self.width_px * 0.5) / math.tan(self.horizontal_fov_rad * 0.5)
+
+    @property
+    def fy_px(self) -> float:
+        return self.fx_px
+
+    @property
+    def cx_px(self) -> float:
+        return self.width_px * 0.5
+
+    @property
+    def cy_px(self) -> float:
+        return self.height_px * 0.5
+
+    def triangulate_left_observation(self, observation: RuntimeImageObservation) -> RuntimeMeasurementSample | None:
+        disparity = finite_float(observation.measured_disparity_px)
+        if not math.isfinite(disparity) or disparity <= 0.0:
+            return None
+        forward_m = self.fx_px * self.baseline_m / disparity
+        right_m = (observation.left_u_px - self.cx_px) * forward_m / self.fx_px - self.baseline_m * 0.5
+        down_m = (observation.left_v_px - self.cy_px) * forward_m / self.fy_px
+        if not all(math.isfinite(value) for value in (right_m, down_m, forward_m)):
+            return None
+        raw_range_m = math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
+        return RuntimeMeasurementSample(
+            raw_right_m=right_m,
+            raw_down_m=down_m,
+            raw_forward_m=forward_m,
+            measured_disparity_px=disparity,
+            raw_range_m=raw_range_m,
+            left_u_px=observation.left_u_px,
+            left_v_px=observation.left_v_px,
+        )
+
+
+@dataclass(frozen=True)
+class RuntimeScenarioMetadata:
+    """Runtime geometry used to guard scenario-specific profiles.
+
+    All fields are metadata only. They do not introduce PX4/GPS truth into
+    runtime selection; they describe the current camera/target setup so a
+    profile can no-op outside its validated envelope.
+    """
+
+    baseline_m: float | None = None
+    camera_height_m: float | None = None
+    target_size_m: float | None = None
+    zoom_index: float | None = None
+    horizontal_fov_rad: float | None = None
+    raw_range_m: float | None = None
+
+    @classmethod
+    def from_features(cls, features: Mapping[str, object]) -> "RuntimeScenarioMetadata":
+        return cls(
+            baseline_m=_optional_finite(features.get("baseline_m")),
+            camera_height_m=_optional_finite(features.get("camera_height_m")),
+            target_size_m=_optional_finite(features.get("target_size_m")),
+            zoom_index=_optional_finite(features.get("zoom_index")),
+            horizontal_fov_rad=_optional_finite(features.get("horizontal_fov_rad")),
+            raw_range_m=_optional_finite(features.get("raw_range_m", features.get("raw_range_mean_m"))),
+        )
+
+
+def _optional_finite(value: object) -> float | None:
+    parsed = finite_float(value)
+    return parsed if math.isfinite(parsed) else None
+
+
+def _range_contains(bounds: object, value: float | None) -> bool:
+    if value is None or not isinstance(bounds, Sequence) or isinstance(bounds, (str, bytes)) or len(bounds) != 2:
+        return True
+    lower = _optional_finite(bounds[0])
+    upper = _optional_finite(bounds[1])
+    if lower is not None and value < lower:
+        return False
+    if upper is not None and value > upper:
+        return False
+    return True
+
+
+def _scalar_matches(expected: object, value: float | None, *, tolerance: float = 1.0e-6) -> bool:
+    if value is None or expected in (None, ""):
+        return True
+    parsed = _optional_finite(expected)
+    if parsed is None:
+        return True
+    return abs(value - parsed) <= tolerance
+
+
+def scenario_envelope_match(
+    envelope: Mapping[str, object] | None,
+    scenario: RuntimeScenarioMetadata,
+) -> tuple[bool, list[str]]:
+    if not envelope:
+        return True, []
+    failures: list[str] = []
+    if not _range_contains(envelope.get("baseline_m"), scenario.baseline_m):
+        failures.append("baseline_m_outside_envelope")
+    if not _range_contains(envelope.get("camera_height_m"), scenario.camera_height_m):
+        failures.append("camera_height_m_outside_envelope")
+    if not _range_contains(envelope.get("target_size_m"), scenario.target_size_m):
+        failures.append("target_size_m_outside_envelope")
+    if not _range_contains(envelope.get("range_m"), scenario.raw_range_m):
+        failures.append("range_m_outside_envelope")
+    if not _scalar_matches(envelope.get("zoom_index"), scenario.zoom_index):
+        failures.append("zoom_index_outside_envelope")
+    if not _scalar_matches(envelope.get("horizontal_fov_rad"), scenario.horizontal_fov_rad, tolerance=1.0e-9):
+        failures.append("horizontal_fov_rad_outside_envelope")
+    return not failures, failures
+
+
+def fused_runtime_observation_value(
+    values: Sequence[float],
+    *,
+    mode: str = "median",
+    trim_fraction: float = 0.2,
+) -> float:
+    arr = finite_array(values)
+    if arr.size == 0:
+        return float("nan")
+    arr = np.sort(arr)
+    if mode == "median":
+        return float(np.median(arr))
+    if mode == "mean":
+        return float(np.mean(arr))
+    if mode == "trimmed_mean":
+        trim = int(math.floor(max(0.0, float(trim_fraction)) * arr.size))
+        if trim * 2 >= arr.size:
+            return float(np.median(arr))
+        return float(np.mean(arr[trim : arr.size - trim]))
+    raise ValueError(f"unsupported runtime observation fusion mode: {mode}")
+
+
+def fuse_runtime_image_observations(
+    observations: Iterable[RuntimeImageObservation],
+    *,
+    min_observations: int = 1,
+    mode: str = "median",
+    trim_fraction: float = 0.2,
+) -> RuntimeImageObservation | None:
+    valid_observations = [
+        observation
+        for observation in observations
+        if all(
+            math.isfinite(value)
+            for value in (
+                observation.left_u_px,
+                observation.left_v_px,
+                observation.measured_disparity_px,
+            )
+        )
+        and observation.measured_disparity_px > 0.0
+    ]
+    if len(valid_observations) < max(1, int(min_observations)):
+        return None
+    fused = RuntimeImageObservation(
+        left_u_px=fused_runtime_observation_value(
+            [observation.left_u_px for observation in valid_observations],
+            mode=mode,
+            trim_fraction=trim_fraction,
+        ),
+        left_v_px=fused_runtime_observation_value(
+            [observation.left_v_px for observation in valid_observations],
+            mode=mode,
+            trim_fraction=trim_fraction,
+        ),
+        measured_disparity_px=fused_runtime_observation_value(
+            [observation.measured_disparity_px for observation in valid_observations],
+            mode=mode,
+            trim_fraction=trim_fraction,
+        ),
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (
+            fused.left_u_px,
+            fused.left_v_px,
+            fused.measured_disparity_px,
+        )
+    ):
+        return None
+    if fused.measured_disparity_px <= 0.0:
+        return None
+    return fused
+
+
+class RepeatedObservationFusion:
+    """Fuse multiple independent image observations into one raw RDF sample.
+
+    Runtime input assumptions: observations are independent detections for the
+    same timestamp or short burst, expressed only as left image center pixels and
+    measured disparity. Output is a ``RuntimeMeasurementSample`` in stereo-center
+    RDF, ready for profile application or runtime selector features.
+    """
+
+    def __init__(
+        self,
+        *,
+        camera: RuntimeStereoCameraContract | None = None,
+        min_observations: int = 3,
+        mode: str = "median",
+        trim_fraction: float = 0.2,
+    ) -> None:
+        self.camera = camera if camera is not None else RuntimeStereoCameraContract()
+        self.min_observations = max(1, int(min_observations))
+        self.mode = mode
+        self.trim_fraction = float(trim_fraction)
+
+    def fuse(self, observations: Iterable[RuntimeImageObservation]) -> RuntimeMeasurementSample | None:
+        fused = fuse_runtime_image_observations(
+            observations,
+            min_observations=self.min_observations,
+            mode=self.mode,
+            trim_fraction=self.trim_fraction,
+        )
+        if fused is None:
+            return None
+        return self.camera.triangulate_left_observation(fused)
+
+    def fuse_rows(self, rows: Iterable[Mapping[str, object]]) -> RuntimeMeasurementSample | None:
+        observations = [
+            observation
+            for row in rows
+            if (observation := RuntimeImageObservation.from_mapping(row)) is not None
+        ]
+        return self.fuse(observations)
+
+
+class MultiBurstObservationFusion:
+    """Fuse several short image-observation bursts into one raw RDF sample.
+
+    Runtime input assumptions: each burst contains left-image center pixels and
+    measured disparity for the same target over a short time span. Common-mode
+    image association errors may exist within one burst, so each burst is first
+    fused in pixel/disparity space and the burst representatives are fused
+    again. Output is a stereo-center RDF ``RuntimeMeasurementSample``.
+    """
+
+    def __init__(
+        self,
+        *,
+        camera: RuntimeStereoCameraContract | None = None,
+        min_bursts: int = 3,
+        min_observations_per_burst: int = 5,
+        inner_mode: str = "trimmed_mean",
+        outer_mode: str = "median",
+        trim_fraction: float = 0.2,
+    ) -> None:
+        self.camera = camera if camera is not None else RuntimeStereoCameraContract()
+        self.min_bursts = max(1, int(min_bursts))
+        self.min_observations_per_burst = max(1, int(min_observations_per_burst))
+        self.inner_mode = inner_mode
+        self.outer_mode = outer_mode
+        self.trim_fraction = float(trim_fraction)
+
+    def fuse(self, bursts: Iterable[Iterable[RuntimeImageObservation]]) -> RuntimeMeasurementSample | None:
+        fused_bursts: list[RuntimeImageObservation] = []
+        for burst in bursts:
+            fused_burst = fuse_runtime_image_observations(
+                burst,
+                min_observations=self.min_observations_per_burst,
+                mode=self.inner_mode,
+                trim_fraction=self.trim_fraction,
+            )
+            if fused_burst is not None:
+                fused_bursts.append(fused_burst)
+        if len(fused_bursts) < self.min_bursts:
+            return None
+        fused = fuse_runtime_image_observations(
+            fused_bursts,
+            min_observations=self.min_bursts,
+            mode=self.outer_mode,
+            trim_fraction=self.trim_fraction,
+        )
+        if fused is None:
+            return None
+        return self.camera.triangulate_left_observation(fused)
+
+    def fuse_row_groups(self, row_groups: Iterable[Iterable[Mapping[str, object]]]) -> RuntimeMeasurementSample | None:
+        bursts: list[list[RuntimeImageObservation]] = []
+        for rows in row_groups:
+            burst = [
+                observation
+                for row in rows
+                if (observation := RuntimeImageObservation.from_mapping(row)) is not None
+            ]
+            bursts.append(burst)
+        return self.fuse(bursts)
+
+
+@dataclass(frozen=True)
+class DisparityResidualRuntimeProfile:
+    """Runtime residual correction driven by measured disparity.
+
+    The coefficients are fitted offline with calibration truth, but applying the
+    profile consumes only a runtime ``RuntimeMeasurementSample`` in
+    stereo-center RDF plus its measured disparity. Array/field order is explicit:
+    RDF is right/down/forward, and public FRD topics are not inputs here.
+    """
+
+    feature_space: str
+    correction_space: str
+    degree: int
+    feature_mean: float
+    feature_scale: float
+    coefficients_low_to_high: tuple[float, ...]
+    correction_clip: float
+    profile_id: str = ""
+    method: str = ""
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object]) -> "DisparityResidualRuntimeProfile":
+        profile_type = str(payload.get("profile_type", payload.get("class", "")))
+        if profile_type not in {"DisparityResidualRuntimeProfile", "disparity_residual_runtime_profile"}:
+            raise ValueError(f"unsupported disparity residual profile type: {profile_type}")
+        coefficients = payload.get("coefficients_low_to_high", [])
+        if not isinstance(coefficients, Sequence) or isinstance(coefficients, (str, bytes)):
+            raise ValueError("coefficients_low_to_high must be a list")
+        return cls(
+            feature_space=str(payload.get("feature_space", "log_disparity")),
+            correction_space=str(payload.get("correction_space", "ray_scale")),
+            degree=int(finite_float(payload.get("degree"), 0.0)),
+            feature_mean=finite_float(payload.get("feature_mean"), 0.0),
+            feature_scale=max(1.0e-12, finite_float(payload.get("feature_scale"), 1.0)),
+            coefficients_low_to_high=tuple(float(value) for value in coefficients),
+            correction_clip=max(0.0, finite_float(payload.get("correction_clip"), 0.0)),
+            profile_id=str(payload.get("profile_id", "")),
+            method=str(payload.get("method", "")),
+        )
+
+    @classmethod
+    def from_json_file(cls, path: str | Path) -> "DisparityResidualRuntimeProfile":
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            raise ValueError("disparity residual profile must be a JSON object")
+        return cls.from_mapping(payload)
+
+    def _feature(self, sample: RuntimeMeasurementSample) -> float:
+        disparity = finite_float(sample.measured_disparity_px)
+        if not math.isfinite(disparity) or disparity <= 0.0:
+            return float("nan")
+        if self.feature_space in {"disparity", "inverse_depth"}:
+            return disparity
+        if self.feature_space == "log_disparity":
+            return math.log(max(disparity, 1.0e-9))
+        return float("nan")
+
+    def correction_value(self, sample: RuntimeMeasurementSample) -> float:
+        feature = self._feature(sample)
+        if not math.isfinite(feature):
+            return float("nan")
+        z = (feature - self.feature_mean) / max(self.feature_scale, 1.0e-12)
+        value = 0.0
+        power = 1.0
+        for coefficient in self.coefficients_low_to_high:
+            value += float(coefficient) * power
+            power *= z
+        if self.correction_clip > 0.0:
+            value = max(-self.correction_clip, min(self.correction_clip, value))
+        return float(value)
+
+    def apply(self, sample: RuntimeMeasurementSample) -> RuntimeMeasurementSample | None:
+        correction = self.correction_value(sample)
+        if not math.isfinite(correction):
+            return None
+        right = float(sample.raw_right_m)
+        down = float(sample.raw_down_m)
+        forward = float(sample.raw_forward_m)
+        if self.correction_space == "forward_add":
+            forward = forward + correction
+        elif self.correction_space == "ray_scale":
+            scale = 1.0 + correction
+            right *= scale
+            down *= scale
+            forward *= scale
+        else:
+            return None
+        if not all(math.isfinite(value) for value in (right, down, forward)):
+            return None
+        return RuntimeMeasurementSample(
+            raw_right_m=right,
+            raw_down_m=down,
+            raw_forward_m=forward,
+            measured_disparity_px=sample.measured_disparity_px,
+            raw_range_m=math.sqrt(right * right + down * down + forward * forward),
+            left_u_px=sample.left_u_px,
+            left_v_px=sample.left_v_px,
+        )
+
+
+def build_observation_fusion_adapter(
+    adapter_config: Mapping[str, object],
+    *,
+    camera: RuntimeStereoCameraContract | None = None,
+) -> RepeatedObservationFusion | MultiBurstObservationFusion:
+    """Build a runtime observation-fusion adapter from manifest config.
+
+    The config is expected to come from
+    ``observation_fusion_runtime_manifest.json``. It selects only the fusion
+    strategy and numeric parameters; it does not add truth, validation metrics,
+    public FRD positions, or replay labels to the runtime input contract.
+    """
+    adapter_class = str(adapter_config.get("class", ""))
+    if adapter_class == "RepeatedObservationFusion":
+        return RepeatedObservationFusion(
+            camera=camera,
+            min_observations=int(finite_float(adapter_config.get("min_observations"), 3.0)),
+            mode=str(adapter_config.get("mode", "median")),
+            trim_fraction=finite_float(adapter_config.get("trim_fraction"), 0.2),
+        )
+    if adapter_class == "MultiBurstObservationFusion":
+        return MultiBurstObservationFusion(
+            camera=camera,
+            min_bursts=int(finite_float(adapter_config.get("min_bursts"), 3.0)),
+            min_observations_per_burst=int(
+                finite_float(
+                    adapter_config.get("min_observations_per_burst"),
+                    5.0,
+                )
+            ),
+            inner_mode=str(adapter_config.get("inner_mode", "trimmed_mean")),
+            outer_mode=str(adapter_config.get("outer_mode", "median")),
+            trim_fraction=finite_float(adapter_config.get("trim_fraction"), 0.2),
+        )
+    raise ValueError(f"unsupported observation fusion adapter class: {adapter_class}")
+
+
+def observation_fusion_tier(
+    manifest: Mapping[str, object],
+    *,
+    tier: str | None = None,
+) -> Mapping[str, object]:
+    tiers = manifest.get("tiers")
+    if not isinstance(tiers, Sequence) or isinstance(tiers, (str, bytes)):
+        raise ValueError("observation fusion manifest must contain a tiers list")
+    selected_tier = tier or str(manifest.get("default_recommendation", ""))
+    for item in tiers:
+        if isinstance(item, Mapping) and str(item.get("tier", "")) == selected_tier:
+            return item
+    raise ValueError(f"observation fusion tier not found: {selected_tier}")
+
+
+def load_observation_fusion_adapter_from_manifest(
+    path: str | Path,
+    *,
+    tier: str | None = None,
+    camera: RuntimeStereoCameraContract | None = None,
+) -> tuple[RepeatedObservationFusion | MultiBurstObservationFusion, Mapping[str, object]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError("observation fusion manifest must be a JSON object")
+    tier_payload = observation_fusion_tier(payload, tier=tier)
+    adapter_config = tier_payload.get("adapter")
+    if not isinstance(adapter_config, Mapping):
+        raise ValueError("observation fusion tier must contain an adapter object")
+    return build_observation_fusion_adapter(adapter_config, camera=camera), tier_payload
+
+
 class RuntimeFeatureWindow:
     def __init__(self, max_samples: int = 520) -> None:
         self.max_samples = max(1, int(max_samples))
@@ -291,6 +796,14 @@ class PackagedRuntimeDeploymentSelector:
         self.override_rule = parse_override_rule(str(self.manifest.get("runtime_rule", "")))
         self.override_profile_label = str(self.manifest.get("override_profile_label", "single_pooled"))
         self.baseline_selector = str(self.manifest.get("baseline_selector", "catalog_guard"))
+        label_map = self.manifest.get("label_profile_map", {})
+        self.label_profile_map = {
+            str(key): str(value)
+            for key, value in label_map.items()
+            if str(key) and str(value)
+        } if isinstance(label_map, Mapping) else {}
+        envelope = self.manifest.get("validated_envelope", {})
+        self.validated_envelope = dict(envelope) if isinstance(envelope, Mapping) else {}
 
     @classmethod
     def from_json_file(cls, path: str | Path) -> "PackagedRuntimeDeploymentSelector":
@@ -299,13 +812,34 @@ class PackagedRuntimeDeploymentSelector:
             raise ValueError("runtime deployment selector manifest must be a JSON object")
         return cls(payload)
 
-    def select(self, features: Mapping[str, float]) -> dict[str, object]:
+    def select(self, features: Mapping[str, object]) -> dict[str, object]:
+        scenario = RuntimeScenarioMetadata.from_features(features)
+        envelope_ok, envelope_failures = scenario_envelope_match(self.validated_envelope, scenario)
         use_override = override_applies(features, self.override_rule)
-        selected_label = self.override_profile_label if use_override else self.baseline_selector
+        deployment_label = str(
+            features.get(
+                "deployment_label",
+                features.get("scenario_label", features.get("scenario_name", "")),
+            )
+            or ""
+        )
+        label_profile = self.label_profile_map.get(deployment_label, "")
+        label_selection_applied = bool(label_profile) and envelope_ok
+        if label_selection_applied:
+            selected_label = label_profile
+        elif use_override and envelope_ok:
+            selected_label = self.override_profile_label
+        else:
+            selected_label = self.baseline_selector
         return {
             "selected_label": selected_label,
-            "override_applied": use_override,
+            "deployment_label": deployment_label,
+            "label_selection_applied": label_selection_applied,
+            "override_applied": (not label_selection_applied) and use_override and envelope_ok,
+            "scenario_envelope_ok": envelope_ok,
+            "scenario_envelope_failures": envelope_failures,
             "override_rule": dict(self.override_rule),
+            "label_profile_map": dict(self.label_profile_map),
             "axis_contract": RDF_AXIS_CONTRACT,
             "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
             "selection_contract": self.manifest.get("selection_contract", ""),

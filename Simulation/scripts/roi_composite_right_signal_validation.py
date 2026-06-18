@@ -15,6 +15,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +23,17 @@ from pathlib import Path
 import numpy as np
 
 
-APP_DIR = Path(__file__).resolve().parents[2] / "apps" / "StereoDistance"
+def _find_stereo_distance_app() -> Path:
+    if os.environ.get("STEREO_DISTANCE_APP"):
+        return Path(os.environ["STEREO_DISTANCE_APP"]).expanduser()
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "StereoDistance"
+        if (candidate / "wiris_stereo_distance").is_dir():
+            return candidate
+    return Path(__file__).resolve().parents[2] / "StereoDistance"
+
+
+APP_DIR = _find_stereo_distance_app()
 sys.path.insert(0, str(APP_DIR))
 
 from wiris_stereo_distance.tracking_filter import (  # noqa: E402

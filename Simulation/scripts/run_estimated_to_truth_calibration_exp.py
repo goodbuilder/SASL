@@ -18,11 +18,15 @@ GATE_SCRIPT = ROOT_DIR / "scripts" / "experiment_pass_gate.py"
 PREFLIGHT_SCRIPT = ROOT_DIR / "scripts" / "calibration_csv_preflight.py"
 PROMOTION_CHECK_SCRIPT = ROOT_DIR / "scripts" / "stereodistance_profile_promotion_check.py"
 RESULT_AUDIT_SCRIPT = ROOT_DIR / "scripts" / "estimated_to_truth_result_audit.py"
+TRUTH_CONVERTER_SCRIPT = ROOT_DIR / "scripts" / "convert_truth_source_to_stereo_rdf.py"
 
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
-NED_TO_RDF_CONTRACT = "rdf_right=east, rdf_down=down, rdf_forward=north"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "explicit_transform_required: evaluate in stereo_center_RDF; direct axis alias "
+    "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+)
 SEARCH_SPACE_DESCRIPTION = (
     "raw, global_rotation, global_scale_rotation, sim3, linear disparity, "
     "trimmed/ransac/huber/range-weighted/robust-loss sim3, quadratic disparity, "
@@ -40,6 +44,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mode", choices=("synthetic", "csv"), default="synthetic")
     parser.add_argument("--input-csv", type=Path)
+    parser.add_argument(
+        "--truth-transform-json",
+        type=Path,
+        help=(
+            "CSV mode only. Convert source-frame truth fields into stereo-center "
+            "truth_right/down/forward before preflight and fitting."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--experiment-id", default="")
     parser.add_argument("--seed", type=int, default=20260613)
@@ -173,6 +185,18 @@ def build_metrics(
                 str(output_dir / "preflight" / "preflight_summary.txt"),
             ]
         )
+    conversion_summary_path = output_dir / "truth_rdf_conversion" / "truth_rdf_conversion_summary.json"
+    conversion_summary: dict[str, Any] = {}
+    converted_input_csv = output_dir / "truth_rdf_conversion" / "input_with_truth_rdf.csv"
+    if conversion_summary_path.exists():
+        conversion_summary = load_json(conversion_summary_path)
+        artifacts.extend(
+            [
+                str(conversion_summary_path),
+                str(output_dir / "truth_rdf_conversion" / "truth_rdf_conversion_summary.txt"),
+                str(converted_input_csv),
+            ]
+        )
     promotion_check_path = output_dir / "promotion_check" / "promotion_check.json"
     promotion_check: dict[str, Any] = {}
     if promotion_check_path.exists():
@@ -214,7 +238,7 @@ def build_metrics(
         "candidate_count": len(comparison_rows),
         "rejected_candidate_count": max(0, len(comparison_rows) - 2),
         "selection_metric_defined": True,
-        "selection_metric": "validation range RMSE with penalties for 1852m target error, train/validation gap, and model complexity",
+        "selection_metric": "validation range RMSE with penalties for scenario target-range error, train/validation gap, and model complexity",
         "validation_split_strategy": f"random {run_config.get('train_ratio', 0.8):.0%}:{1.0 - float(run_config.get('train_ratio', 0.8)):.0%} split",
         "overfit_control": "held-out validation split, train/validation gap, model complexity penalty",
         "stereodistance_applicable": runtime_profile_path.exists()
@@ -228,6 +252,9 @@ def build_metrics(
         "calibration_truth_source": (
             "synthetic PX4 local NED equivalent" if mode == "synthetic" else str(input_csv or "")
         ),
+        "calibration_truth_source_input_csv": str(input_csv or ""),
+        "pipeline_input_csv": str(converted_input_csv if conversion_summary else input_csv or ""),
+        "truth_rdf_conversion": conversion_summary,
         "measurement_runtime_inputs": [
             "raw_rdf_m",
             "measured_disparity_px",
@@ -251,7 +278,7 @@ def build_metrics(
         "csv_report_field_contract": "named RDF/NED fields only; no ambiguous x/y/z evidence fields",
         "stereo_measurement_frame": "stereo_center_opencv_optical",
         "stereo_measurement_axis_order": "right,down,forward",
-        "ned_to_rdf_contract": NED_TO_RDF_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
         "report_count": 1,
         "trial_count": 1,
         "sample_count": finite_int(run_config.get("sample_count")),
@@ -270,6 +297,11 @@ def build_metrics(
         "validation_forward_rmse_corrected_m": finite_float(selected.get("validation_forward_rmse_m")),
         "target_range_m": finite_float(run_config.get("target_range_m"), 1852.0),
         "target_window_half_width_m": finite_float(run_config.get("target_window_m"), 30.0),
+        "target_range_sample_count": target_count,
+        "target_range_min_sample_count": min_target_count,
+        "target_range_abs_mean_error_m": finite_float(selected.get("validation_target_abs_mean_error_m"), float("inf")),
+        "target_range_rmse_m": finite_float(selected.get("validation_target_rmse_m"), float("inf")),
+        "target_range_tolerance_m": 10.0,
         "target_1852m_sample_count": target_count,
         "target_1852m_min_sample_count": min_target_count,
         "target_1852m_abs_mean_error_m": finite_float(selected.get("validation_target_abs_mean_error_m"), float("inf")),
@@ -317,6 +349,43 @@ def run_command(cmd: Sequence[str], *, cwd: Path) -> None:
     subprocess.run(list(cmd), cwd=str(cwd), check=True)
 
 
+def pipeline_input_csv(args: argparse.Namespace) -> Path | None:
+    return getattr(args, "pipeline_input_csv", None) or args.input_csv
+
+
+def prepare_csv_input(args: argparse.Namespace) -> dict[str, Any]:
+    if args.mode != "csv":
+        return {}
+    if args.input_csv is None:
+        raise SystemExit("--input-csv is required for --mode csv")
+    if args.truth_transform_json is None:
+        args.pipeline_input_csv = args.input_csv
+        return {}
+
+    conversion_dir = args.output_dir / "truth_rdf_conversion"
+    converted_csv = conversion_dir / "input_with_truth_rdf.csv"
+    summary_json = conversion_dir / "truth_rdf_conversion_summary.json"
+    summary_txt = conversion_dir / "truth_rdf_conversion_summary.txt"
+    cmd = [
+        sys.executable,
+        str(TRUTH_CONVERTER_SCRIPT),
+        "--input-csv",
+        str(args.input_csv),
+        "--output-csv",
+        str(converted_csv),
+        "--transform-json",
+        str(args.truth_transform_json),
+        "--summary-json",
+        str(summary_json),
+        "--summary-txt",
+        str(summary_txt),
+        "--strict",
+    ]
+    run_command(cmd, cwd=ROOT_DIR.parent)
+    args.pipeline_input_csv = converted_csv
+    return load_json(summary_json) if summary_json.exists() else {}
+
+
 def run_pipeline(args: argparse.Namespace) -> None:
     cmd = [
         sys.executable,
@@ -337,23 +406,25 @@ def run_pipeline(args: argparse.Namespace) -> None:
         str(args.target_window_m),
     ]
     if args.mode == "csv":
-        if args.input_csv is None:
+        input_csv = pipeline_input_csv(args)
+        if input_csv is None:
             raise SystemExit("--input-csv is required for --mode csv")
-        cmd.extend(["--input-csv", str(args.input_csv)])
+        cmd.extend(["--input-csv", str(input_csv)])
     run_command(cmd, cwd=ROOT_DIR.parent)
 
 
 def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
     if args.mode != "csv":
         return {}
-    if args.input_csv is None:
+    input_csv = pipeline_input_csv(args)
+    if input_csv is None:
         raise SystemExit("--input-csv is required for --mode csv")
     preflight_dir = args.output_dir / "preflight"
     cmd = [
         sys.executable,
         str(PREFLIGHT_SCRIPT),
         "--input-csv",
-        str(args.input_csv),
+        str(input_csv),
         "--output-dir",
         str(preflight_dir),
         "--target-range-m",
@@ -486,7 +557,7 @@ def write_promotion_summary(path: Path, metrics: Mapping[str, Any], gate_result:
         f"- PX4 truth: {NED_AXIS_CONTRACT}",
         f"- internal correction: {RDF_AXIS_CONTRACT}",
         f"- StereoDistance public topic: {PUBLIC_TOPIC_CONTRACT}",
-        f"- NED to RDF: {NED_TO_RDF_CONTRACT}",
+        f"- source truth to stereo-center RDF: {TRUTH_RDF_TRANSFORM_CONTRACT}",
         "",
         "runtime_contract:",
         "- calibration truth is used only for fitting and validation",
@@ -502,6 +573,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     experiment_id = args.experiment_id or args.output_dir.name
 
+    prepare_csv_input(args)
     run_preflight(args)
     run_pipeline(args)
     run_replay(args)

@@ -90,6 +90,7 @@ def main() -> None:
         "coordinate_contracts_explicit": True,
         "rdf_axis_contract": fresh.RDF_AXIS_CONTRACT,
         "public_topic_contract": fresh.PUBLIC_TOPIC_CONTRACT,
+        "truth_rdf_transform_contract": fresh.TRUTH_RDF_TRANSFORM_CONTRACT,
         "ned_to_rdf_contract": fresh.NED_TO_RDF_CONTRACT,
         "selection_contract": "scenario label selects one fixed runtime profile; no truth/replay metrics are runtime inputs",
         **fresh.aggregate(seed_rows),

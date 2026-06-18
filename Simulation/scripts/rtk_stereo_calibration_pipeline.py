@@ -31,10 +31,25 @@ from select_stereodistance_profile_from_catalog import method_contract_fields  #
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 SYNTHETIC_NED_TO_RDF_CONTRACT = (
-    "synthetic_bridge: rdf_right=east, rdf_down=down, rdf_forward=north"
+    "explicit_transform: truth_rdf = R_ned_to_stereo_rdf * (truth_ned - origin_ned); "
+    "direct axis alias rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
 )
 STEREODISTANCE_PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
 DEFAULT_TARGET_RANGE_M = 1852.0
+SYNTHETIC_STEREO_ORIGIN_NED_M = np.array([120.0, -35.0, 8.0], dtype=float)
+SYNTHETIC_NED_TO_STEREO_RDF_ROTATION = Rotation.from_euler("zyx", [17.0, -4.0, 2.5], degrees=True)
+
+
+def ned_to_stereo_rdf_explicit(ned_m: Sequence[float]) -> np.ndarray:
+    """Convert PX4 local NED to stereo-center RDF with an explicit extrinsic."""
+    ned = np.asarray(ned_m, dtype=float)
+    return SYNTHETIC_NED_TO_STEREO_RDF_ROTATION.apply(ned - SYNTHETIC_STEREO_ORIGIN_NED_M)
+
+
+def stereo_rdf_to_ned_explicit(rdf_m: Sequence[float]) -> np.ndarray:
+    """Inverse of the explicit synthetic stereo-center RDF extrinsic."""
+    rdf = np.asarray(rdf_m, dtype=float)
+    return SYNTHETIC_NED_TO_STEREO_RDF_ROTATION.inv().apply(rdf) + SYNTHETIC_STEREO_ORIGIN_NED_M
 
 
 @dataclass(frozen=True)
@@ -112,6 +127,13 @@ class CalibrationSample:
     left_v_px: float
     measured_disparity_px: float
     true_disparity_px: float
+    truth_source_frame: str = ""
+    truth_source_axis_order: str = ""
+    truth_source_fields: str = ""
+    truth_rdf_transform_contract: str = ""
+    truth_source_origin_m: str = ""
+    truth_source_to_stereo_rdf_translation_m: str = ""
+    truth_source_to_stereo_rdf_rotation_matrix: str = ""
 
     @property
     def truth_range_m(self) -> float:
@@ -177,8 +199,9 @@ class SyntheticCalibrationDataSource:
                 forward_m = self.target_range_m + trajectory_rng.normal(0.0, 2.0)
             truth_rdf = np.array([right_m, down_m, forward_m], dtype=float)
 
-            # Synthetic bridge from PX4 local NED to stereo-center RDF.
-            truth_ned = np.array([truth_rdf[2], truth_rdf[0], truth_rdf[1]], dtype=float)
+            # Synthetic truth still records PX4 local NED, but the NED/RDF
+            # relationship is an explicit non-aligned extrinsic, not an axis alias.
+            truth_ned = stereo_rdf_to_ned_explicit(truth_rdf)
 
             true_disparity = camera.fx_true_px * camera.baseline_m / truth_rdf[2]
             left_u_true = camera.cx_px + (truth_rdf[0] + camera.baseline_m * 0.5) * camera.fx_true_px / truth_rdf[2]
@@ -226,6 +249,16 @@ class SyntheticCalibrationDataSource:
                     left_v_px=float(left_v_meas),
                     measured_disparity_px=float(measured_disparity),
                     true_disparity_px=float(true_disparity),
+                    truth_source_frame="px4_local_position_ned",
+                    truth_source_axis_order="north,east,down",
+                    truth_source_fields="truth_north_m,truth_east_m,truth_down_ned_m",
+                    truth_rdf_transform_contract=SYNTHETIC_NED_TO_RDF_CONTRACT,
+                    truth_source_origin_m=",".join(f"{value:.9f}" for value in SYNTHETIC_STEREO_ORIGIN_NED_M),
+                    truth_source_to_stereo_rdf_translation_m="0.000000000,0.000000000,0.000000000",
+                    truth_source_to_stereo_rdf_rotation_matrix=json.dumps(
+                        SYNTHETIC_NED_TO_STEREO_RDF_ROTATION.as_matrix().tolist(),
+                        separators=(",", ":"),
+                    ),
                 )
             )
         return samples
@@ -271,9 +304,9 @@ class CsvCalibrationDataSource:
                 if d_meas is None and left_u is not None and right_u is not None:
                     d_meas = abs(float(left_u) - float(right_u))
                 if truth_rdf is None and truth_ned is not None:
-                    truth_rdf = np.array([truth_ned[1], truth_ned[2], truth_ned[0]], dtype=float)
+                    continue
                 if truth_ned is None and truth_rdf is not None:
-                    truth_ned = np.array([truth_rdf[2], truth_rdf[0], truth_rdf[1]], dtype=float)
+                    truth_ned = np.array([math.nan, math.nan, math.nan], dtype=float)
                 if raw_rdf is None and None not in (left_u, left_v, d_meas):
                     raw_rdf = triangulate_left_disparity(
                         left_u_px=float(left_u),
@@ -306,6 +339,25 @@ class CsvCalibrationDataSource:
                         left_v_px=float(left_v),
                         measured_disparity_px=float(d_meas),
                         true_disparity_px=float(true_disparity),
+                        truth_source_frame=str(row.get("truth_source_frame") or row.get("source_frame") or ""),
+                        truth_source_axis_order=str(row.get("truth_source_axis_order") or row.get("source_axis_order") or ""),
+                        truth_source_fields=str(row.get("truth_source_fields") or row.get("source_fields") or ""),
+                        truth_rdf_transform_contract=str(
+                            row.get("truth_rdf_transform_contract")
+                            or row.get("truth_rdf_contract")
+                            or "already_stereo_center_RDF_truth_or_external_transform_declared"
+                        ),
+                        truth_source_origin_m=str(row.get("truth_source_origin_m") or row.get("origin_source_m") or ""),
+                        truth_source_to_stereo_rdf_translation_m=str(
+                            row.get("truth_source_to_stereo_rdf_translation_m")
+                            or row.get("translation_rdf_m")
+                            or ""
+                        ),
+                        truth_source_to_stereo_rdf_rotation_matrix=str(
+                            row.get("truth_source_to_stereo_rdf_rotation_matrix")
+                            or row.get("rotation_matrix_source_to_stereo_rdf")
+                            or ""
+                        ),
                     )
                 )
         if not samples:
@@ -362,6 +414,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disparity-outlier-px", type=float, default=0.0)
     parser.add_argument("--bbox-outlier-rate", type=float, default=0.0)
     parser.add_argument("--bbox-outlier-px", type=float, default=0.0)
+    parser.add_argument(
+        "--local-sweep-config-dir",
+        type=Path,
+        help=(
+            "Directory containing rtk_stereo_local_sweep_candidate JSON files. "
+            "Supported configs are appended to the normal method search. "
+            "Offline fitting may use truth; exported runtime profiles must remain raw RDF/disparity only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -458,6 +519,13 @@ def split_samples(
             left_v_px=sample.left_v_px,
             measured_disparity_px=sample.measured_disparity_px,
             true_disparity_px=sample.true_disparity_px,
+            truth_source_frame=sample.truth_source_frame,
+            truth_source_axis_order=sample.truth_source_axis_order,
+            truth_source_fields=sample.truth_source_fields,
+            truth_rdf_transform_contract=sample.truth_rdf_transform_contract,
+            truth_source_origin_m=sample.truth_source_origin_m,
+            truth_source_to_stereo_rdf_translation_m=sample.truth_source_to_stereo_rdf_translation_m,
+            truth_source_to_stereo_rdf_rotation_matrix=sample.truth_source_to_stereo_rdf_rotation_matrix,
         )
         if split == "train":
             train.append(updated)
@@ -2015,6 +2083,61 @@ def fit_binned_residual_lut(
     }
 
 
+def fit_weighted_binned_residual_lut(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    weights: np.ndarray,
+    *,
+    bin_count: int = 7,
+    min_samples_per_bin: int = 4,
+) -> dict[str, object]:
+    x_values = np.asarray(x_values, dtype=float).reshape(-1)
+    y_values = np.asarray(y_values, dtype=float).reshape(-1)
+    weights = np.asarray(weights, dtype=float).reshape(-1)
+    if x_values.size != y_values.size or x_values.size != weights.size:
+        raise ValueError("x_values, y_values, and weights must have same length")
+    valid = np.isfinite(x_values) & np.isfinite(y_values) & np.isfinite(weights) & (weights > 0.0)
+    x_values = x_values[valid]
+    y_values = y_values[valid]
+    weights = weights[valid]
+    if x_values.size == 0:
+        return {"x_values_px": [], "residual_values_m": [], "bin_sample_counts": [], "bin_weight_sums": []}
+    order = np.argsort(x_values)
+    x_values = x_values[order]
+    y_values = y_values[order]
+    weights = weights[order]
+    bin_count = max(1, min(int(bin_count), int(x_values.size)))
+    edges = np.linspace(0, x_values.size, bin_count + 1, dtype=int)
+    x_lut: list[float] = []
+    y_lut: list[float] = []
+    counts: list[int] = []
+    weight_sums: list[float] = []
+    for start, stop in zip(edges[:-1], edges[1:]):
+        if stop <= start:
+            continue
+        bin_x = x_values[start:stop]
+        bin_y = y_values[start:stop]
+        bin_weights = weights[start:stop]
+        if bin_x.size < max(1, min_samples_per_bin) and x_values.size >= min_samples_per_bin:
+            continue
+        x_lut.append(weighted_quantile(bin_x, bin_weights, 0.5))
+        y_lut.append(weighted_quantile(bin_y, bin_weights, 0.5))
+        counts.append(int(bin_x.size))
+        weight_sums.append(float(np.sum(bin_weights)))
+    if not x_lut:
+        x_lut = [weighted_quantile(x_values, weights, 0.5)]
+        y_lut = [weighted_quantile(y_values, weights, 0.5)]
+        counts = [int(x_values.size)]
+        weight_sums = [float(np.sum(weights))]
+    return {
+        "x_values_px": x_lut,
+        "residual_values_m": y_lut,
+        "bin_sample_counts": counts,
+        "bin_weight_sums": weight_sums,
+        "fit_basis": "target-weighted quantile-binned weighted-median residual LUT with linear interpolation and edge clamping",
+    }
+
+
 def weighted_pava(values: np.ndarray, weights: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=float).reshape(-1)
     weights = np.asarray(weights, dtype=float).reshape(-1)
@@ -2785,11 +2908,374 @@ def apply_rdf_residual_lut(points: np.ndarray, d_meas: np.ndarray, lut_by_axis: 
     return corrected
 
 
+def load_local_sweep_configs(config_dir: Path | None) -> list[dict[str, object]]:
+    if config_dir is None:
+        return []
+    if not config_dir.is_dir():
+        raise ValueError(f"--local-sweep-config-dir is not a directory: {config_dir}")
+    configs: list[dict[str, object]] = []
+    for path in sorted(config_dir.glob("*.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"local sweep config must be a JSON object: {path}")
+        payload = dict(payload)
+        payload["_config_path"] = str(path)
+        configs.append(payload)
+    return configs
+
+
+def local_sweep_config_supported(config: Mapping[str, object]) -> tuple[bool, str]:
+    if str(config.get("mode", "")) != "rtk_stereo_local_sweep_candidate":
+        return False, "mode_not_rtk_stereo_local_sweep_candidate"
+    if bool(config.get("runtime_truth_used", False)):
+        return False, "runtime_truth_used_true"
+    if str(config.get("registration_model", "")) != "sim3":
+        return False, "unsupported_registration_model"
+    if str(config.get("forward_key", "")) not in {"raw_forward", "base_forward"}:
+        return False, "unsupported_forward_key"
+    if str(config.get("robust_loss", "none")) not in {"none", "huber", "cauchy"}:
+        return False, "unsupported_robust_loss"
+    if str(config.get("residual_basis", "")) not in {
+        "inverse_depth",
+        "range_normalized",
+        "meter",
+        "blended_disparity_inverse_depth",
+    }:
+        return False, "unsupported_residual_basis"
+    return True, "native_pipeline"
+
+
+def local_config_float(config: Mapping[str, object], name: str, default: float) -> float:
+    value = finite_float(config.get(name))
+    return default if value is None else float(value)
+
+
+def local_config_int(config: Mapping[str, object], name: str, default: int) -> int:
+    value = finite_float(config.get(name))
+    return default if value is None else int(round(float(value)))
+
+
+def local_robust_weights(residual: np.ndarray, robust_loss: str) -> tuple[np.ndarray, dict[str, object]]:
+    residual = np.asarray(residual, dtype=float).reshape(-1)
+    finite = residual[np.isfinite(residual)]
+    if robust_loss == "none" or finite.size == 0:
+        return np.ones_like(residual, dtype=float), {"robust_loss": "none", "scale_m": 0.0}
+    median = float(np.median(finite))
+    mad = float(np.median(np.abs(finite - median)))
+    scale = max(1.4826 * mad, float(np.std(finite)), 1.0e-9)
+    normalized = np.abs(residual - median) / scale
+    if robust_loss == "huber":
+        delta = 1.345
+        weights = np.ones_like(residual, dtype=float)
+        large = normalized > delta
+        weights[large] = delta / np.maximum(normalized[large], 1.0e-12)
+        return weights, {"robust_loss": "huber", "scale_m": scale, "delta": delta}
+    if robust_loss == "cauchy":
+        c = 2.3849
+        weights = 1.0 / (1.0 + np.square(normalized / c))
+        return weights, {"robust_loss": "cauchy", "scale_m": scale, "c": c}
+    raise ValueError(f"unsupported robust_loss: {robust_loss}")
+
+
+def append_local_sweep_methods(
+    methods: list[FittedMethod],
+    *,
+    configs: Sequence[Mapping[str, object]],
+    raw_train: np.ndarray,
+    truth_train: np.ndarray,
+    d_meas: np.ndarray,
+    sim_scale: float,
+    sim_rotation: Rotation,
+    sim_translation: np.ndarray,
+    sim_train: np.ndarray,
+    forward_residual: np.ndarray,
+    target_weights: np.ndarray,
+) -> list[dict[str, object]]:
+    status_rows: list[dict[str, object]] = []
+    existing_names = {method.name for method in methods}
+    for config in configs:
+        method_name = str(config.get("method", "")).strip()
+        supported, reason = local_sweep_config_supported(config)
+        row = {
+            "method": method_name,
+            "config_path": config.get("_config_path", ""),
+            "status": "PENDING",
+            "reason": reason,
+            "axis_contract": RDF_AXIS_CONTRACT,
+            "public_topic_contract": STEREODISTANCE_PUBLIC_TOPIC_CONTRACT,
+            "runtime_truth_used": False,
+        }
+        if not method_name:
+            row.update(status="SKIP", reason="missing_method")
+            status_rows.append(row)
+            continue
+        if method_name in existing_names:
+            row.update(status="SKIP", reason="method_already_exists")
+            status_rows.append(row)
+            continue
+        if not supported:
+            row.update(status="SKIP")
+            status_rows.append(row)
+            continue
+
+        bin_count = local_config_int(config, "bin_count", 11)
+        prior_strength = local_config_float(config, "prior_strength_samples", 8.0)
+        residual_gain = local_config_float(config, "residual_gain", 1.0)
+        target_weight = max(0.0, local_config_float(config, "target_weight", 0.0))
+        residual_basis = str(config.get("residual_basis", "inverse_depth"))
+        robust_loss = str(config.get("robust_loss", "none"))
+        forward_key = str(config.get("forward_key", "raw_forward"))
+        monotone = bool(config.get("monotone", False))
+        x_key = raw_train[:, 2] if forward_key == "raw_forward" else sim_train[:, 2]
+        robust_weights, robust_info = local_robust_weights(forward_residual, robust_loss)
+        fit_weights = (1.0 + target_weight * np.asarray(target_weights, dtype=float)) * robust_weights
+        weighted_fit = target_weight > 0.0 or robust_loss != "none"
+
+        disp_lut: Mapping[str, object] | None = None
+        if residual_basis == "inverse_depth":
+            if weighted_fit:
+                inv_delta = (1.0 / truth_train[:, 2]) - (1.0 / sim_train[:, 2])
+                base_lut = fit_weighted_binned_residual_lut(
+                    x_key,
+                    inv_delta,
+                    fit_weights,
+                    bin_count=bin_count,
+                )
+                x_lut = np.asarray(base_lut.get("x_values_px", []), dtype=float)
+                inv_delta_lut = np.asarray(base_lut.get("residual_values_m", []), dtype=float)
+                counts = np.asarray(base_lut.get("bin_weight_sums", base_lut.get("bin_sample_counts", [])), dtype=float)
+                base_forward_lut = np.asarray(
+                    [
+                        weighted_quantile(sim_train[:, 2][np.argsort(np.abs(x_key - x_value))[: max(1, min(12, x_key.size))]], np.ones(max(1, min(12, x_key.size))), 0.5)
+                        for x_value in x_lut
+                    ],
+                    dtype=float,
+                )
+                if counts.size != inv_delta_lut.size:
+                    counts = np.ones_like(inv_delta_lut)
+                prior = weighted_quantile(inv_delta, fit_weights, 0.5)
+                shrunk = (counts * inv_delta_lut + prior_strength * prior) / (counts + prior_strength)
+                if monotone and shrunk.size:
+                    increasing = weighted_pava(shrunk, counts)
+                    decreasing = -weighted_pava(-shrunk, counts)
+                    shrunk = increasing if float(np.sum(counts * np.square(increasing - shrunk))) <= float(np.sum(counts * np.square(decreasing - shrunk))) else decreasing
+                corrected_forward = 1.0 / ((1.0 / base_forward_lut) + shrunk)
+                lut = {
+                    "x_values_m": [float(value) for value in x_lut],
+                    "residual_values_m": [float(value) for value in corrected_forward - base_forward_lut],
+                    "inverse_depth_delta_values_1_per_m": [float(value) for value in shrunk],
+                    "base_forward_values_m": [float(value) for value in base_forward_lut],
+                    "prior_strength_samples": float(prior_strength),
+                    "target_weight": float(target_weight),
+                    "robust_fit": robust_info,
+                    "bin_weight_sums": [float(value) for value in counts],
+                    "fit_basis": "target-weighted local sweep inverse-depth forward residual LUT",
+                }
+            else:
+                lut = (
+                    fit_monotone_inverse_depth_residual_lut(
+                        x_key,
+                        sim_train[:, 2],
+                        truth_train[:, 2],
+                        bin_count=bin_count,
+                        prior_strength=prior_strength,
+                    )
+                    if monotone
+                    else fit_inverse_depth_residual_lut(
+                        x_key,
+                        sim_train[:, 2],
+                        truth_train[:, 2],
+                        bin_count=bin_count,
+                        prior_strength=prior_strength,
+                    )
+                )
+        elif residual_basis == "range_normalized":
+            if weighted_fit:
+                normalized = forward_residual / np.where(np.abs(x_key) > 1.0e-6, x_key, np.nan)
+                base_lut = fit_weighted_binned_residual_lut(x_key, normalized, fit_weights, bin_count=bin_count)
+                x_lut = np.asarray(base_lut.get("x_values_px", []), dtype=float)
+                ratio = np.asarray(base_lut.get("residual_values_m", []), dtype=float)
+                counts = np.asarray(base_lut.get("bin_weight_sums", base_lut.get("bin_sample_counts", [])), dtype=float)
+                if counts.size != ratio.size:
+                    counts = np.ones_like(ratio)
+                prior = weighted_quantile(normalized, fit_weights, 0.5)
+                shrunk = (counts * ratio + prior_strength * prior) / (counts + prior_strength)
+                if monotone and shrunk.size:
+                    increasing = weighted_pava(shrunk, counts)
+                    decreasing = -weighted_pava(-shrunk, counts)
+                    shrunk = increasing if float(np.sum(counts * np.square(increasing - shrunk))) <= float(np.sum(counts * np.square(decreasing - shrunk))) else decreasing
+                lut = {
+                    "x_values_m": [float(value) for value in x_lut],
+                    "residual_values_m": [float(value) for value in shrunk * x_lut],
+                    "normalized_residual_values": [float(value) for value in shrunk],
+                    "target_weight": float(target_weight),
+                    "robust_fit": robust_info,
+                    "bin_weight_sums": [float(value) for value in counts],
+                    "fit_basis": "target-weighted local sweep range-normalized residual LUT",
+                }
+            else:
+                lut = fit_range_normalized_residual_lut(
+                    x_key,
+                    forward_residual,
+                    bin_count=bin_count,
+                    prior_strength=prior_strength,
+                )
+                if monotone:
+                    ratio = np.asarray(lut.get("normalized_residual_values", []), dtype=float)
+                    counts = np.asarray(lut.get("bin_sample_counts", []), dtype=float)
+                    x_lut = np.asarray(lut.get("x_values_m", []), dtype=float)
+                    if ratio.size and x_lut.size == ratio.size:
+                        if counts.size != ratio.size:
+                            counts = np.ones_like(ratio)
+                        increasing = weighted_pava(ratio, counts)
+                        decreasing = -weighted_pava(-ratio, counts)
+                        monotone_ratio = increasing if float(np.sum(counts * np.square(increasing - ratio))) <= float(np.sum(counts * np.square(decreasing - ratio))) else decreasing
+                        lut["normalized_residual_values"] = [float(value) for value in monotone_ratio]
+                        lut["pre_monotone_normalized_residual_values"] = [float(value) for value in ratio]
+                        lut["residual_values_m"] = [float(value) for value in monotone_ratio * x_lut]
+                        lut["fit_basis"] = f"{lut.get('fit_basis', 'range-normalized residual LUT')}; monotone ratio projection"
+        elif residual_basis == "meter":
+            base_lut = (
+                fit_monotone_binned_residual_lut(x_key, forward_residual, bin_count=bin_count)
+                if monotone and not weighted_fit
+                else fit_weighted_binned_residual_lut(x_key, forward_residual, fit_weights, bin_count=bin_count)
+                if weighted_fit
+                else fit_binned_residual_lut(x_key, forward_residual, bin_count=bin_count)
+            )
+            lut = relabel_residual_lut_x_values(
+                base_lut,
+                x_key="x_values_m",
+                fit_basis_suffix=f"{forward_key} meter residual",
+            )
+        else:
+            if weighted_fit:
+                inv_delta = (1.0 / truth_train[:, 2]) - (1.0 / sim_train[:, 2])
+                base_lut = fit_weighted_binned_residual_lut(x_key, inv_delta, fit_weights, bin_count=bin_count)
+                x_lut = np.asarray(base_lut.get("x_values_px", []), dtype=float)
+                inv_delta_lut = np.asarray(base_lut.get("residual_values_m", []), dtype=float)
+                counts = np.asarray(base_lut.get("bin_weight_sums", base_lut.get("bin_sample_counts", [])), dtype=float)
+                base_forward_lut = np.asarray(
+                    [
+                        weighted_quantile(sim_train[:, 2][np.argsort(np.abs(x_key - x_value))[: max(1, min(12, x_key.size))]], np.ones(max(1, min(12, x_key.size))), 0.5)
+                        for x_value in x_lut
+                    ],
+                    dtype=float,
+                )
+                if counts.size != inv_delta_lut.size:
+                    counts = np.ones_like(inv_delta_lut)
+                prior = weighted_quantile(inv_delta, fit_weights, 0.5)
+                shrunk = (counts * inv_delta_lut + prior_strength * prior) / (counts + prior_strength)
+                if monotone and shrunk.size:
+                    increasing = weighted_pava(shrunk, counts)
+                    decreasing = -weighted_pava(-shrunk, counts)
+                    shrunk = increasing if float(np.sum(counts * np.square(increasing - shrunk))) <= float(np.sum(counts * np.square(decreasing - shrunk))) else decreasing
+                corrected_forward = 1.0 / ((1.0 / base_forward_lut) + shrunk)
+                lut = {
+                    "x_values_m": [float(value) for value in x_lut],
+                    "residual_values_m": [float(value) for value in 0.5 * (corrected_forward - base_forward_lut)],
+                    "inverse_depth_delta_values_1_per_m": [float(value) for value in shrunk],
+                    "base_forward_values_m": [float(value) for value in base_forward_lut],
+                    "prior_strength_samples": float(prior_strength),
+                    "target_weight": float(target_weight),
+                    "robust_fit": robust_info,
+                    "bin_weight_sums": [float(value) for value in counts],
+                    "fit_basis": "weighted local sweep blended inverse-depth share",
+                }
+            else:
+                lut = (
+                    fit_monotone_inverse_depth_residual_lut(
+                        x_key,
+                        sim_train[:, 2],
+                        truth_train[:, 2],
+                        bin_count=bin_count,
+                        prior_strength=prior_strength,
+                    )
+                    if monotone
+                    else fit_inverse_depth_residual_lut(
+                        x_key,
+                        sim_train[:, 2],
+                        truth_train[:, 2],
+                        bin_count=bin_count,
+                        prior_strength=prior_strength,
+                    )
+                )
+                values = np.asarray(lut.get("residual_values_m", []), dtype=float)
+                if values.size:
+                    lut["residual_values_m"] = [float(0.5 * value) for value in values]
+            values = np.asarray(lut.get("residual_values_m", []), dtype=float)
+            disp_lut = scale_residual_lut(
+                fit_weighted_binned_residual_lut(d_meas, forward_residual, fit_weights, bin_count=bin_count)
+                if weighted_fit
+                else fit_binned_residual_lut(d_meas, forward_residual, bin_count=bin_count),
+                residual_scale=0.5,
+                fit_basis_suffix="local sweep blended disparity/inverse-depth share",
+            )
+
+        if abs(residual_gain - 1.0) > 1.0e-12:
+            lut = scale_residual_lut(
+                lut,
+                residual_scale=residual_gain,
+                fit_basis_suffix=f"local sweep residual gain {residual_gain:g}",
+            )
+
+        parameters: dict[str, object] = {
+            "sim3_scale": sim_scale,
+            "sim3_rotation_euler_zyx_deg": sim_rotation.as_euler("zyx", degrees=True).tolist(),
+            "sim3_rotation_matrix_rdf": sim_rotation.as_matrix().tolist(),
+            "sim3_translation_rdf_m": sim_translation.tolist(),
+            "forward_residual_raw_forward_lut": lut,
+            "residual_lut_bin_count": bin_count,
+            "local_sweep_config": {key: value for key, value in config.items() if not str(key).startswith("_")},
+            "local_sweep_forward_key": forward_key,
+            "local_sweep_target_weight": target_weight,
+            "local_sweep_robust_fit": robust_info,
+            "reference_basis": (
+                "Local sweep Sim(3)+forward residual candidate fitted offline from PX4/RTK truth. "
+                "Runtime apply uses raw stereo-center RDF/disparity and fixed exported parameters only."
+            ),
+        }
+        if disp_lut is not None:
+            parameters["forward_residual_disparity_lut"] = disp_lut
+
+        def predict_local(
+            samples: Sequence[CalibrationSample],
+            *,
+            sim_scale: float = sim_scale,
+            sim_rotation: Rotation = sim_rotation,
+            sim_translation: np.ndarray = sim_translation,
+            lut: Mapping[str, object] = lut,
+            disp_lut: Mapping[str, object] | None = disp_lut,
+            forward_key: str = forward_key,
+        ) -> np.ndarray:
+            sim_points = predict_sim3(stack(samples, "raw_rdf_m"), sim_scale, sim_rotation, sim_translation)
+            query = stack(samples, "raw_rdf_m")[:, 2] if forward_key == "raw_forward" else sim_points[:, 2]
+            corrected = apply_forward_residual_lut(sim_points, query, lut)
+            if disp_lut is not None:
+                corrected = apply_forward_residual_lut(corrected, measured_disparity(samples), disp_lut)
+            return corrected
+
+        disp_complexity = len(disp_lut.get("x_values_px", [])) if disp_lut is not None else 0
+        methods.append(
+            FittedMethod(
+                name=method_name,
+                predict=predict_local,
+                parameters=parameters,
+                model_complexity=8 + len(lut.get("x_values_m", [])) + disp_complexity,
+            )
+        )
+        existing_names.add(method_name)
+        row.update(status="ADDED", reason="native_pipeline")
+        status_rows.append(row)
+    return status_rows
+
+
 def fit_methods(
     train_samples: Sequence[CalibrationSample],
     *,
     camera: CameraModel,
     target_range_m: float = DEFAULT_TARGET_RANGE_M,
+    local_sweep_configs: Sequence[Mapping[str, object]] = (),
+    local_sweep_status_rows: list[dict[str, object]] | None = None,
 ) -> list[FittedMethod]:
     raw_train = stack(train_samples, "raw_rdf_m")
     truth_train = stack(train_samples, "truth_rdf_m")
@@ -3406,65 +3892,86 @@ def fit_methods(
         )
     )
 
-    joint_huber_coeff, joint_huber_rotation, joint_huber_info = fit_nonlinear_disparity_ray_rotation(
-        train_samples,
-        loss="huber",
-        f_scale_m=1.5,
-    )
-    methods.append(
-        FittedMethod(
-            name="huber_joint_disparity_ray_rotation_nls",
-            predict=lambda samples, joint_huber_coeff=joint_huber_coeff, joint_huber_rotation=joint_huber_rotation: (
-                predict_disparity_ray_rotation(samples, joint_huber_coeff, joint_huber_rotation)
-            ),
-            parameters={
-                "scale": 1.0,
-                "rotation_euler_zyx_deg": joint_huber_rotation.as_euler("zyx", degrees=True).tolist(),
-                "rotation_matrix_rdf": joint_huber_rotation.as_matrix().tolist(),
-                "translation_rdf_m": [0.0, 0.0, 0.0],
-                "raw_rdf_ray_disparity_correction_coefficients_high_to_low": joint_huber_coeff.tolist(),
-                "joint_disparity_ray_rotation_fit": joint_huber_info,
-                "reference_basis": (
-                    "Huber robust nonlinear least-squares joint fit of corrected disparity d_corr=a*d+b "
-                    "and RDF rotation. Runtime scales raw RDF by d/d_corr and applies the fixed rotation."
-                ),
-            },
-            model_complexity=5,
-        )
-    )
-
-    for sigma_m in (60.0, 160.0, 250.0):
-        sigma_label = int(round(sigma_m))
-        target_joint_weights = target_range_weights(train_samples, target_range_m=target_range_m, sigma_m=sigma_m)
-        target_joint_coeff, target_joint_rotation, target_joint_info = fit_nonlinear_disparity_ray_rotation(
+    for huber_f_scale_m, huber_name_suffix in (
+        (1.5, ""),
+        (0.75, "_fscale0p75"),
+        (1.0, "_fscale1p0"),
+        (2.0, "_fscale2p0"),
+        (3.0, "_fscale3p0"),
+    ):
+        joint_huber_coeff, joint_huber_rotation, joint_huber_info = fit_nonlinear_disparity_ray_rotation(
             train_samples,
-            weights=target_joint_weights,
             loss="huber",
-            f_scale_m=1.5,
+            f_scale_m=huber_f_scale_m,
         )
         methods.append(
             FittedMethod(
-                name=f"target_weighted_huber_joint_disparity_ray_rotation_nls_sigma{sigma_label:03d}",
-                predict=lambda samples, target_joint_coeff=target_joint_coeff, target_joint_rotation=target_joint_rotation: (
-                    predict_disparity_ray_rotation(samples, target_joint_coeff, target_joint_rotation)
+                name=f"huber_joint_disparity_ray_rotation_nls{huber_name_suffix}",
+                predict=lambda samples, joint_huber_coeff=joint_huber_coeff, joint_huber_rotation=joint_huber_rotation: (
+                    predict_disparity_ray_rotation(samples, joint_huber_coeff, joint_huber_rotation)
                 ),
                 parameters={
                     "scale": 1.0,
-                    "rotation_euler_zyx_deg": target_joint_rotation.as_euler("zyx", degrees=True).tolist(),
-                    "rotation_matrix_rdf": target_joint_rotation.as_matrix().tolist(),
+                    "rotation_euler_zyx_deg": joint_huber_rotation.as_euler("zyx", degrees=True).tolist(),
+                    "rotation_matrix_rdf": joint_huber_rotation.as_matrix().tolist(),
                     "translation_rdf_m": [0.0, 0.0, 0.0],
-                    "raw_rdf_ray_disparity_correction_coefficients_high_to_low": target_joint_coeff.tolist(),
-                    "joint_disparity_ray_rotation_fit": target_joint_info,
-                    "target_range_weight_sigma_m": sigma_m,
+                    "raw_rdf_ray_disparity_correction_coefficients_high_to_low": joint_huber_coeff.tolist(),
+                    "joint_disparity_ray_rotation_fit": joint_huber_info,
                     "reference_basis": (
-                        "Target-range weighted Huber nonlinear least-squares joint fit of corrected disparity "
-                        "d_corr=a*d+b and RDF rotation. Runtime scales raw RDF by d/d_corr and applies "
-                        "the fixed rotation."
+                        "Huber robust nonlinear least-squares joint fit of corrected disparity d_corr=a*d+b "
+                        "and RDF rotation. Runtime scales raw RDF by d/d_corr and applies the fixed rotation."
                     ),
                 },
-                model_complexity=6,
+                model_complexity=5,
             )
         )
+
+    for sigma_m in (30.0, 45.0, 60.0, 90.0, 120.0, 160.0, 250.0):
+        sigma_label = int(round(sigma_m))
+        target_joint_weights = target_range_weights(train_samples, target_range_m=target_range_m, sigma_m=sigma_m)
+        target_joint_f_scale_grid = [(1.5, "")]
+        if sigma_label == 60:
+            target_joint_f_scale_grid.extend(
+                [
+                    (0.75, "_fscale0p75"),
+                    (1.0, "_fscale1p0"),
+                    (2.0, "_fscale2p0"),
+                    (3.0, "_fscale3p0"),
+                ]
+            )
+        for target_joint_f_scale_m, target_joint_name_suffix in target_joint_f_scale_grid:
+            target_joint_coeff, target_joint_rotation, target_joint_info = fit_nonlinear_disparity_ray_rotation(
+                train_samples,
+                weights=target_joint_weights,
+                loss="huber",
+                f_scale_m=target_joint_f_scale_m,
+            )
+            methods.append(
+                FittedMethod(
+                    name=(
+                        f"target_weighted_huber_joint_disparity_ray_rotation_nls_"
+                        f"sigma{sigma_label:03d}{target_joint_name_suffix}"
+                    ),
+                    predict=lambda samples, target_joint_coeff=target_joint_coeff, target_joint_rotation=target_joint_rotation: (
+                        predict_disparity_ray_rotation(samples, target_joint_coeff, target_joint_rotation)
+                    ),
+                    parameters={
+                        "scale": 1.0,
+                        "rotation_euler_zyx_deg": target_joint_rotation.as_euler("zyx", degrees=True).tolist(),
+                        "rotation_matrix_rdf": target_joint_rotation.as_matrix().tolist(),
+                        "translation_rdf_m": [0.0, 0.0, 0.0],
+                        "raw_rdf_ray_disparity_correction_coefficients_high_to_low": target_joint_coeff.tolist(),
+                        "joint_disparity_ray_rotation_fit": target_joint_info,
+                        "target_range_weight_sigma_m": sigma_m,
+                        "reference_basis": (
+                            "Target-range weighted Huber nonlinear least-squares joint fit of corrected disparity "
+                            "d_corr=a*d+b and RDF rotation. Runtime scales raw RDF by d/d_corr and applies "
+                            "the fixed rotation."
+                        ),
+                    },
+                    model_complexity=6,
+                )
+            )
 
     diagonal_affine_matrix, diagonal_affine_translation = fit_diagonal_affine_rdf(raw_train, truth_train)
     methods.append(
@@ -5395,6 +5902,28 @@ def fit_methods(
 
     sim_train = sim_scale * apply_rotation_to_rows(raw_train, sim_rotation) + sim_translation
     forward_residual = truth_train[:, 2] - sim_train[:, 2]
+    if local_sweep_configs:
+        local_target_weights = target_range_weights(
+            train_samples,
+            target_range_m=target_range_m,
+            sigma_m=120.0,
+            floor=0.02,
+        )
+        status_rows = append_local_sweep_methods(
+            methods,
+            configs=local_sweep_configs,
+            raw_train=raw_train,
+            truth_train=truth_train,
+            d_meas=d_meas,
+            sim_scale=sim_scale,
+            sim_rotation=sim_rotation,
+            sim_translation=sim_translation,
+            sim_train=sim_train,
+            forward_residual=forward_residual,
+            target_weights=local_target_weights,
+        )
+        if local_sweep_status_rows is not None:
+            local_sweep_status_rows.extend(status_rows)
     residual_coeff = np.polyfit(d_meas, forward_residual, deg=2)
     methods.append(
         FittedMethod(
@@ -6460,7 +6989,13 @@ def rows_for_samples(samples: Sequence[CalibrationSample]) -> list[dict[str, obj
                 "t_s": f"{sample.t_s:.6f}",
                 "ned_axis_contract": NED_AXIS_CONTRACT,
                 "rdf_axis_contract": RDF_AXIS_CONTRACT,
-                "synthetic_bridge_contract": SYNTHETIC_NED_TO_RDF_CONTRACT,
+                "truth_source_frame": sample.truth_source_frame,
+                "truth_source_axis_order": sample.truth_source_axis_order,
+                "truth_source_fields": sample.truth_source_fields,
+                "truth_rdf_transform_contract": sample.truth_rdf_transform_contract,
+                "truth_source_origin_m": sample.truth_source_origin_m,
+                "truth_source_to_stereo_rdf_translation_m": sample.truth_source_to_stereo_rdf_translation_m,
+                "truth_source_to_stereo_rdf_rotation_matrix": sample.truth_source_to_stereo_rdf_rotation_matrix,
                 "truth_north_m": f"{sample.truth_ned_m[0]:.9f}",
                 "truth_east_m": f"{sample.truth_ned_m[1]:.9f}",
                 "truth_down_ned_m": f"{sample.truth_ned_m[2]:.9f}",
@@ -6786,6 +7321,10 @@ def runtime_profile_for_method(method: FittedMethod, *, experiment_id: str) -> d
             profile["forward_residual_disparity_lut"] = method.parameters["forward_residual_disparity_lut"]
         if has_forward_raw_lut:
             profile["forward_residual_raw_forward_lut"] = method.parameters["forward_residual_raw_forward_lut"]
+            profile["forward_residual_raw_forward_query"] = method.parameters.get(
+                "local_sweep_forward_key",
+                "raw_forward",
+            )
         if "forward_residual_agreement_gate" in method.parameters:
             profile["forward_residual_agreement_gate"] = method.parameters["forward_residual_agreement_gate"]
         if has_rdf_lut:
@@ -6834,7 +7373,8 @@ def choose_recommendation(rows: Sequence[dict[str, object]]) -> tuple[str, str]:
         )
         improves = validation_rmse < raw_val
         target_ok = target_window_count > 0 and math.isfinite(target_abs) and target_abs <= 10.0
-        if not improves or not target_ok:
+        axes_ok = axis_regression_penalty <= 1.0e-9
+        if not improves or not target_ok or not axes_ok:
             continue
         score = (
             validation_rmse
@@ -6848,14 +7388,15 @@ def choose_recommendation(rows: Sequence[dict[str, object]]) -> tuple[str, str]:
         reason = (
             "No correction candidate passed validation gating. A candidate must reduce validation range RMSE "
             "relative to raw and have at least one validation sample in the 1852m target window with absolute "
-            "mean range error within +/-10m. Keeping raw output and exporting no final runtime profile."
+            "mean range error within +/-10m, with no RDF axis RMSE regression relative to raw. "
+            "Keeping raw output and exporting no final runtime profile."
         )
         return "raw", reason
     candidates.sort(key=lambda item: item[0])
     best = candidates[0][3]
     reason = (
         "Selected by validation range RMSE, 1852m target-window absolute mean error, "
-        "train/validation gap, and model complexity. "
+        "RDF axis non-regression, train/validation gap, and model complexity. "
         f"Raw validation range RMSE={raw_val:.3f} m; selected "
         f"{best['method']} validation range RMSE={float(best['validation_range_rmse_m']):.3f} m, "
         f"1852m abs mean error={float(best['validation_target_abs_mean_error_m']):.3f} m."
@@ -6990,27 +7531,39 @@ def policy_recommendation_rows(
         ),
     ]
     policy_rows = []
+
+    def make_policy_row(policy_name: str, purpose: str, row: dict[str, object]) -> dict[str, object]:
+        return {
+            "policy": policy_name,
+            "purpose": purpose,
+            "method": row["method"],
+            "is_final_recommendation": row["method"] == final_recommendation,
+            "validation_range_rmse_m": row["validation_range_rmse_m"],
+            "validation_position_rmse_m": row["validation_position_rmse_m"],
+            "validation_right_rmse_m": row["validation_right_rmse_m"],
+            "validation_down_rmse_m": row["validation_down_rmse_m"],
+            "validation_forward_rmse_m": row["validation_forward_rmse_m"],
+            "validation_target_abs_mean_error_m": row["validation_target_abs_mean_error_m"],
+            "validation_target_rmse_m": row["validation_target_rmse_m"],
+            "validation_target_max_abs_error_m": row["validation_target_max_abs_error_m"],
+            "generalization_gap_range_rmse_m": row["generalization_gap_range_rmse_m"],
+            "model_complexity": row["model_complexity"],
+            "raw_validation_range_rmse_m": raw_validation_rmse,
+            "target_tolerance_m": 10.0,
+        }
+
     for policy_name, purpose, row in policies:
-        policy_rows.append(
-            {
-                "policy": policy_name,
-                "purpose": purpose,
-                "method": row["method"],
-                "is_final_recommendation": row["method"] == final_recommendation,
-                "validation_range_rmse_m": row["validation_range_rmse_m"],
-                "validation_position_rmse_m": row["validation_position_rmse_m"],
-                "validation_right_rmse_m": row["validation_right_rmse_m"],
-                "validation_down_rmse_m": row["validation_down_rmse_m"],
-                "validation_forward_rmse_m": row["validation_forward_rmse_m"],
-                "validation_target_abs_mean_error_m": row["validation_target_abs_mean_error_m"],
-                "validation_target_rmse_m": row["validation_target_rmse_m"],
-                "validation_target_max_abs_error_m": row["validation_target_max_abs_error_m"],
-                "generalization_gap_range_rmse_m": row["generalization_gap_range_rmse_m"],
-                "model_complexity": row["model_complexity"],
-                "raw_validation_range_rmse_m": raw_validation_rmse,
-                "target_tolerance_m": 10.0,
-            }
-        )
+        policy_rows.append(make_policy_row(policy_name, purpose, row))
+    if not any(row["is_final_recommendation"] for row in policy_rows):
+        final_row = next((row for row in candidates if row["method"] == final_recommendation), None)
+        if final_row is not None:
+            policy_rows.append(
+                make_policy_row(
+                    "final_recommendation",
+                    "Method selected by the final validation gate, including RDF axis non-regression.",
+                    final_row,
+                )
+            )
     return policy_rows
 
 
@@ -7122,7 +7675,7 @@ def write_summary(
         f"Output directory: {output_dir}",
         f"NED contract: {NED_AXIS_CONTRACT}",
         f"RDF contract: {RDF_AXIS_CONTRACT}",
-        f"Synthetic bridge: {SYNTHETIC_NED_TO_RDF_CONTRACT}",
+        f"NED to stereo RDF truth transform: {SYNTHETIC_NED_TO_RDF_CONTRACT}",
         "Split target-window coverage: train={train}, validation={validation}, total={total}".format(
             train=config.get("train_target_window_count", "unknown"),
             validation=config.get("validation_target_window_count", "unknown"),
@@ -7433,7 +7986,15 @@ def main() -> int:
     )
     write_csv(output_dir / "calibration_samples.csv", rows_for_samples(all_samples))
 
-    methods = fit_methods(train_samples, camera=camera, target_range_m=args.target_range_m)
+    local_sweep_configs = load_local_sweep_configs(args.local_sweep_config_dir)
+    local_sweep_status_rows: list[dict[str, object]] = []
+    methods = fit_methods(
+        train_samples,
+        camera=camera,
+        target_range_m=args.target_range_m,
+        local_sweep_configs=local_sweep_configs,
+        local_sweep_status_rows=local_sweep_status_rows,
+    )
     train_predictions = {method.name: method.predict(train_samples) for method in methods}
     validation_predictions = {method.name: method.predict(validation_samples) for method in methods}
 
@@ -7520,6 +8081,10 @@ def main() -> int:
         "target_range_m": args.target_range_m,
         "target_window_m": args.target_window_m,
         "synthetic_target_oversample_count": args.synthetic_target_oversample_count,
+        "local_sweep_config_dir": str(args.local_sweep_config_dir) if args.local_sweep_config_dir else "",
+        "local_sweep_config_count": len(local_sweep_configs),
+        "local_sweep_added_count": sum(1 for row in local_sweep_status_rows if row.get("status") == "ADDED"),
+        "local_sweep_skipped_count": sum(1 for row in local_sweep_status_rows if row.get("status") == "SKIP"),
         "camera": camera.__dict__,
         "error_injection": {
             "yaw_deg": injection.yaw_deg,
@@ -7537,13 +8102,34 @@ def main() -> int:
         "contracts": {
             "ned": NED_AXIS_CONTRACT,
             "rdf": RDF_AXIS_CONTRACT,
-            "synthetic_bridge": SYNTHETIC_NED_TO_RDF_CONTRACT,
+            "truth_rdf_transform_contract": "truth_rdf must be stereo_center_RDF from per-sample T_source_to_stereo_rdf metadata or an already stereo-frame truth producer",
+            "direct_source_axis_alias_allowed": False,
+            "ned_to_stereo_rdf": SYNTHETIC_NED_TO_RDF_CONTRACT,
+            "direct_ned_to_rdf_axis_alias_allowed": False,
+            "synthetic_stereo_origin_ned_m": SYNTHETIC_STEREO_ORIGIN_NED_M.tolist(),
+            "synthetic_ned_to_stereo_rdf_euler_zyx_deg": [17.0, -4.0, 2.5],
             "stereodistance_public_topic": STEREODISTANCE_PUBLIC_TOPIC_CONTRACT,
         },
         "recommendation": recommendation,
         "recommendation_reason": reason,
     }
     write_json(output_dir / "run_config.json", config)
+    if local_sweep_status_rows:
+        write_csv(output_dir / "local_sweep_config_status.csv", local_sweep_status_rows)
+        write_json(
+            output_dir / "local_sweep_config_status.json",
+            {
+                "mode": "rtk_stereo_local_sweep_config_status",
+                "config_dir": str(args.local_sweep_config_dir) if args.local_sweep_config_dir else "",
+                "config_count": len(local_sweep_configs),
+                "added_count": sum(1 for row in local_sweep_status_rows if row.get("status") == "ADDED"),
+                "skipped_count": sum(1 for row in local_sweep_status_rows if row.get("status") == "SKIP"),
+                "axis_contract": RDF_AXIS_CONTRACT,
+                "public_topic_contract": STEREODISTANCE_PUBLIC_TOPIC_CONTRACT,
+                "runtime_truth_used": False,
+                "rows": local_sweep_status_rows,
+            },
+        )
     raw_comparison_row = next(row for row in comparison_rows if row["method"] == "raw")
     runtime_profile_manifest: list[dict[str, object]] = []
     for method in methods:

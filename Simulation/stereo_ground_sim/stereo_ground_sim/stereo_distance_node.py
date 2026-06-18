@@ -4,6 +4,7 @@ import os
 import subprocess
 import threading
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -25,11 +26,28 @@ from stereo_ground_sim.runtime_guard_policy import (
     EstimatedToTruthDisparityProfile,
     EstimatedToTruthSim3Profile,
 )
+from stereo_ground_sim.runtime_deployment_selector import (
+    DisparityResidualRuntimeProfile,
+    MultiBurstObservationFusion,
+    RepeatedObservationFusion,
+    RuntimeImageObservation,
+    RuntimeMeasurementSample,
+    RuntimeStereoCameraContract,
+    load_observation_fusion_adapter_from_manifest,
+)
+from stereo_ground_sim.disparity_residual_feature_summary import feature_summary_from_arrays, feature_summary_from_runtime_rows
+from stereo_ground_sim.disparity_residual_feature_selector import DisparityResidualFeatureSelector
 
 
 class StereoDistanceNode(Node):
     def __init__(self):
         super().__init__("stereo_distance_node")
+        self.declare_parameter("scenario_name", "unspecified")
+        self.declare_parameter("target_class", "unspecified")
+        self.declare_parameter("target_size_m", float("nan"))
+        self.declare_parameter("scenario_range_min_m", float("nan"))
+        self.declare_parameter("scenario_range_max_m", float("nan"))
+        self.declare_parameter("zoom_index", float("nan"))
         self.declare_parameter("baseline_m", 25.0)
         self.declare_parameter("camera_height_m", 5.0)
         self.declare_parameter("horizontal_fov_rad", 0.154997710698)
@@ -62,6 +80,14 @@ class StereoDistanceNode(Node):
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("yolo_imgsz", 1280)
+        self.declare_parameter("enable_synthetic_detections", False)
+        self.declare_parameter("synthetic_detection_width_px", 1280)
+        self.declare_parameter("synthetic_detection_height_px", 720)
+        self.declare_parameter("synthetic_detection_bbox_size_px", 32.0)
+        self.declare_parameter("enable_external_bbox_detections", False)
+        self.declare_parameter("external_bbox_detections_topic", "/stereo/external_detections")
+        self.declare_parameter("external_bbox_detection_width_px", 1280)
+        self.declare_parameter("external_bbox_detection_height_px", 720)
         self.declare_parameter(
             "plot_publish_hz",
             30.0,
@@ -69,7 +95,23 @@ class StereoDistanceNode(Node):
         )
         self.declare_parameter("enable_bbox_center_adjustment", False)
         self.declare_parameter("bbox_center_adjustment_path", "")
+        self.declare_parameter("enable_observation_fusion", False)
+        self.declare_parameter("observation_fusion_manifest_path", "")
+        self.declare_parameter("observation_fusion_tier", "")
+        self.declare_parameter("enable_disparity_residual_profile", False)
+        self.declare_parameter("disparity_residual_profile_path", "")
+        self.declare_parameter("enable_disparity_residual_feature_selector", False)
+        self.declare_parameter("disparity_residual_feature_selector_model_path", "")
+        self.declare_parameter("disparity_residual_feature_selector_catalog_path", "")
+        self.declare_parameter("disparity_residual_feature_selector_window_size", 1)
+        self.declare_parameter("disparity_residual_feature_selector_min_samples", 1)
 
+        self.scenario_name = str(self.get_parameter("scenario_name").value)
+        self.target_class = str(self.get_parameter("target_class").value)
+        self.target_size_m = self._float_param("target_size_m")
+        self.scenario_range_min_m = self._float_param("scenario_range_min_m")
+        self.scenario_range_max_m = self._float_param("scenario_range_max_m")
+        self.zoom_index = self._float_param("zoom_index")
         self.baseline_m = self._float_param("baseline_m")
         self.camera_height_m = self._float_param("camera_height_m")
         self.horizontal_fov_rad = self._float_param("horizontal_fov_rad")
@@ -94,10 +136,54 @@ class StereoDistanceNode(Node):
         self.yolo_device = str(self.get_parameter("yolo_device").value)
         self.yolo_target_hz = self._float_param("yolo_target_hz")
         self.yolo_imgsz = int(self.get_parameter("yolo_imgsz").value)
+        self.enable_synthetic_detections = self._bool_param("enable_synthetic_detections")
+        self.synthetic_detection_width_px = max(1, int(self.get_parameter("synthetic_detection_width_px").value))
+        self.synthetic_detection_height_px = max(1, int(self.get_parameter("synthetic_detection_height_px").value))
+        self.synthetic_detection_bbox_size_px = max(
+            1.0,
+            self._float_param("synthetic_detection_bbox_size_px"),
+        )
+        self.enable_external_bbox_detections = self._bool_param("enable_external_bbox_detections")
+        self.external_bbox_detections_topic = str(self.get_parameter("external_bbox_detections_topic").value)
+        self.external_bbox_detection_width_px = max(1, int(self.get_parameter("external_bbox_detection_width_px").value))
+        self.external_bbox_detection_height_px = max(
+            1,
+            int(self.get_parameter("external_bbox_detection_height_px").value),
+        )
         self.plot_publish_hz = max(1.0, self._float_param("plot_publish_hz"))
         self.enable_bbox_center_adjustment = self._bool_param("enable_bbox_center_adjustment")
         self.bbox_center_adjustment_path = str(self.get_parameter("bbox_center_adjustment_path").value)
         self.bbox_center_adjustment = self._load_bbox_center_adjustment()
+        self.enable_observation_fusion = self._bool_param("enable_observation_fusion")
+        self.observation_fusion_manifest_path = str(self.get_parameter("observation_fusion_manifest_path").value)
+        self.observation_fusion_tier = str(self.get_parameter("observation_fusion_tier").value)
+        self.observation_fusion_adapter = self._load_observation_fusion_adapter()
+        self.observation_fusion_buffer = deque(
+            maxlen=self._observation_fusion_required_observations(self.observation_fusion_adapter)
+        )
+        self.enable_disparity_residual_profile = self._bool_param("enable_disparity_residual_profile")
+        self.disparity_residual_profile_path = str(self.get_parameter("disparity_residual_profile_path").value)
+        self.disparity_residual_profile = self._load_disparity_residual_profile()
+        self.enable_disparity_residual_feature_selector = self._bool_param("enable_disparity_residual_feature_selector")
+        self.disparity_residual_feature_selector_model_path = str(
+            self.get_parameter("disparity_residual_feature_selector_model_path").value
+        )
+        self.disparity_residual_feature_selector_catalog_path = str(
+            self.get_parameter("disparity_residual_feature_selector_catalog_path").value
+        )
+        self.disparity_residual_feature_selector_window_size = max(
+            1,
+            int(self.get_parameter("disparity_residual_feature_selector_window_size").value),
+        )
+        self.disparity_residual_feature_selector_min_samples = max(
+            1,
+            int(self.get_parameter("disparity_residual_feature_selector_min_samples").value),
+        )
+        self.disparity_residual_feature_selector_window = deque(
+            maxlen=self.disparity_residual_feature_selector_window_size
+        )
+        self.disparity_residual_feature_selector = self._load_disparity_residual_feature_selector()
+        self.disparity_residual_feature_selected_label = ""
         self.yolo_model = None
         self.yolo_model_device = None
         self.yolo_model_loaded_path = None
@@ -159,6 +245,7 @@ class StereoDistanceNode(Node):
                 "fallback_level": 3,
                 "fallback_reason": "init",
             },
+            "observation_fusion_status": "disabled",
             "actual_distance_m": self.approach_start_distance_m,
             "distance_error_m": None,
             "mission_phase": "init",
@@ -198,6 +285,19 @@ class StereoDistanceNode(Node):
         self.detections_pub = self.create_publisher(
             Float32MultiArray, "/stereo/detections", 10
         )
+        if self.enable_external_bbox_detections:
+            self.create_subscription(
+                Float32MultiArray,
+                self.external_bbox_detections_topic,
+                self._external_detections_cb,
+                10,
+            )
+            self.get_logger().info(
+                "External bbox detections enabled on "
+                f"{self.external_bbox_detections_topic}; message contract is "
+                "Float32MultiArray [left_valid,x1,y1,x2,y2,conf,cx,cy,"
+                "right_valid,x1,y1,x2,y2,conf,cx,cy]."
+            )
         camera_qos = QoSProfile(
             depth=1,
             history=HistoryPolicy.KEEP_LAST,
@@ -218,12 +318,21 @@ class StereoDistanceNode(Node):
             )
         else:
             disabled_reason = self.yolo_runtime_disable_reason or self.yolo_load_error
-            self.get_logger().warning(
-                "YOLO image subscriptions disabled because yolo_target_hz is 0 "
-                "or no usable yolo_model_path/runtime is configured."
-                + (f" ({disabled_reason})" if disabled_reason else "")
-            )
+            if self.enable_synthetic_detections:
+                self.get_logger().info(
+                    "YOLO image subscriptions disabled; synthetic detection mode is enabled "
+                    "for headless/operator pipeline validation."
+                )
+            else:
+                self.get_logger().warning(
+                    "YOLO image subscriptions disabled because yolo_target_hz is 0 "
+                    "or no usable yolo_model_path/runtime is configured."
+                    + (f" ({disabled_reason})" if disabled_reason else "")
+                )
         self.create_timer(0.2, self._publish_marker)
+        if self.enable_synthetic_detections:
+            synthetic_hz = self.yolo_target_hz if self.yolo_target_hz > 0.0 else self.plot_publish_hz
+            self.create_timer(1.0 / max(1.0, float(synthetic_hz)), self._publish_synthetic_detection_sample)
         self.add_on_set_parameters_callback(self._on_param_update)
         self.plot_thread = threading.Thread(target=self._plot_publish_loop, daemon=True)
         self.plot_thread.start()
@@ -303,6 +412,22 @@ class StereoDistanceNode(Node):
                 self.yolo_target_hz = max(0.0, float(param.value))
             elif param.name == "yolo_imgsz":
                 self.yolo_imgsz = max(64, int(param.value))
+            elif param.name == "enable_synthetic_detections":
+                self.enable_synthetic_detections = self._coerce_bool(param.value)
+            elif param.name == "synthetic_detection_width_px":
+                self.synthetic_detection_width_px = max(1, int(param.value))
+            elif param.name == "synthetic_detection_height_px":
+                self.synthetic_detection_height_px = max(1, int(param.value))
+            elif param.name == "synthetic_detection_bbox_size_px":
+                self.synthetic_detection_bbox_size_px = max(1.0, float(param.value))
+            elif param.name == "enable_external_bbox_detections":
+                self.enable_external_bbox_detections = self._coerce_bool(param.value)
+            elif param.name == "external_bbox_detections_topic":
+                self.external_bbox_detections_topic = str(param.value)
+            elif param.name == "external_bbox_detection_width_px":
+                self.external_bbox_detection_width_px = max(1, int(param.value))
+            elif param.name == "external_bbox_detection_height_px":
+                self.external_bbox_detection_height_px = max(1, int(param.value))
             elif param.name == "plot_publish_hz":
                 self.plot_publish_hz = max(1.0, float(param.value))
             elif param.name == "enable_bbox_center_adjustment":
@@ -311,7 +436,135 @@ class StereoDistanceNode(Node):
             elif param.name == "bbox_center_adjustment_path":
                 self.bbox_center_adjustment_path = str(param.value)
                 self.bbox_center_adjustment = self._load_bbox_center_adjustment()
+            elif param.name == "enable_observation_fusion":
+                self.enable_observation_fusion = self._coerce_bool(param.value)
+                self.observation_fusion_adapter = self._load_observation_fusion_adapter()
+                self._reset_observation_fusion_buffer()
+            elif param.name == "observation_fusion_manifest_path":
+                self.observation_fusion_manifest_path = str(param.value)
+                self.observation_fusion_adapter = self._load_observation_fusion_adapter()
+                self._reset_observation_fusion_buffer()
+            elif param.name == "observation_fusion_tier":
+                self.observation_fusion_tier = str(param.value)
+                self.observation_fusion_adapter = self._load_observation_fusion_adapter()
+                self._reset_observation_fusion_buffer()
+            elif param.name == "enable_disparity_residual_profile":
+                self.enable_disparity_residual_profile = self._coerce_bool(param.value)
+                self.disparity_residual_profile = self._load_disparity_residual_profile()
+            elif param.name == "disparity_residual_profile_path":
+                self.disparity_residual_profile_path = str(param.value)
+                self.disparity_residual_profile = self._load_disparity_residual_profile()
+            elif param.name == "enable_disparity_residual_feature_selector":
+                self.enable_disparity_residual_feature_selector = self._coerce_bool(param.value)
+                self.disparity_residual_feature_selector = self._load_disparity_residual_feature_selector()
+            elif param.name == "disparity_residual_feature_selector_model_path":
+                self.disparity_residual_feature_selector_model_path = str(param.value)
+                self.disparity_residual_feature_selector = self._load_disparity_residual_feature_selector()
+            elif param.name == "disparity_residual_feature_selector_catalog_path":
+                self.disparity_residual_feature_selector_catalog_path = str(param.value)
+                self.disparity_residual_feature_selector = self._load_disparity_residual_feature_selector()
+            elif param.name == "disparity_residual_feature_selector_window_size":
+                self.disparity_residual_feature_selector_window_size = max(1, int(param.value))
+                self._reset_disparity_residual_feature_selector_window()
+            elif param.name == "disparity_residual_feature_selector_min_samples":
+                self.disparity_residual_feature_selector_min_samples = max(1, int(param.value))
         return SetParametersResult(successful=True)
+
+    def _observation_fusion_required_observations(self, adapter):
+        if isinstance(adapter, RepeatedObservationFusion):
+            return max(1, int(adapter.min_observations))
+        if isinstance(adapter, MultiBurstObservationFusion):
+            return max(1, int(adapter.min_bursts) * int(adapter.min_observations_per_burst))
+        return 1
+
+    def _reset_observation_fusion_buffer(self):
+        self.observation_fusion_buffer = deque(
+            maxlen=self._observation_fusion_required_observations(self.observation_fusion_adapter)
+        )
+
+    def _load_observation_fusion_adapter(self):
+        if not self.enable_observation_fusion:
+            return None
+        path = str(self.observation_fusion_manifest_path or "").strip()
+        if not path:
+            self.get_logger().warning("observation fusion enabled but no manifest path was provided.")
+            return None
+        if not os.path.exists(path):
+            self.get_logger().warning(f"observation fusion manifest not found: {path}")
+            return None
+        camera = RuntimeStereoCameraContract(
+            width_px=1280.0,
+            height_px=720.0,
+            horizontal_fov_rad=float(self.horizontal_fov_rad),
+            baseline_m=float(self.baseline_m),
+        )
+        tier = str(self.observation_fusion_tier or "").strip() or None
+        try:
+            adapter, tier_payload = load_observation_fusion_adapter_from_manifest(
+                path,
+                tier=tier,
+                camera=camera,
+            )
+        except Exception as exc:
+            self.get_logger().warning(f"failed to load observation fusion manifest {path}: {exc}")
+            return None
+        self.get_logger().info(
+            "Loaded observation fusion manifest: "
+            f"{path} (tier={tier_payload.get('tier', tier or 'default')}, "
+            f"adapter={type(adapter).__name__})"
+        )
+        return adapter
+
+    def _load_disparity_residual_profile(self):
+        if not getattr(self, "enable_disparity_residual_profile", False):
+            return None
+        path = str(getattr(self, "disparity_residual_profile_path", "") or "").strip()
+        if not path:
+            self.get_logger().warning("disparity residual profile enabled but no profile path was provided.")
+            return None
+        if not os.path.exists(path):
+            self.get_logger().warning(f"disparity residual profile not found: {path}")
+            return None
+        try:
+            profile = DisparityResidualRuntimeProfile.from_json_file(path)
+        except Exception as exc:
+            self.get_logger().warning(f"failed to load disparity residual profile {path}: {exc}")
+            return None
+        self.get_logger().info(
+            "Loaded disparity residual profile: "
+            f"{path} (profile_id={profile.profile_id}, method={profile.method})"
+        )
+        return profile
+
+    def _load_disparity_residual_feature_selector(self):
+        if not getattr(self, "enable_disparity_residual_feature_selector", False):
+            return None
+        model_path = str(getattr(self, "disparity_residual_feature_selector_model_path", "") or "").strip()
+        catalog_path = str(getattr(self, "disparity_residual_feature_selector_catalog_path", "") or "").strip()
+        if not model_path or not catalog_path:
+            self.get_logger().warning("disparity residual feature selector enabled but model/catalog path is missing.")
+            return None
+        if not os.path.exists(model_path):
+            self.get_logger().warning(f"disparity residual feature selector model not found: {model_path}")
+            return None
+        if not os.path.exists(catalog_path):
+            self.get_logger().warning(f"disparity residual feature selector catalog not found: {catalog_path}")
+            return None
+        try:
+            selector = DisparityResidualFeatureSelector(
+                selector_model_json=model_path,
+                catalog_json=catalog_path,
+            )
+        except Exception as exc:
+            self.get_logger().warning(f"failed to load disparity residual feature selector: {exc}")
+            return None
+        self.get_logger().info(f"Loaded disparity residual feature selector: {model_path}")
+        return selector
+
+    def _reset_disparity_residual_feature_selector_window(self):
+        self.disparity_residual_feature_selector_window = deque(
+            maxlen=max(1, int(getattr(self, "disparity_residual_feature_selector_window_size", 1)))
+        )
 
     def _load_bbox_center_adjustment(self):
         if not self.enable_bbox_center_adjustment:
@@ -1010,13 +1263,61 @@ class StereoDistanceNode(Node):
         )
 
     def _profile_status_to_msg(self, metrics):
-        status = metrics.get("profile_status") or self._profile_status()
+        status = dict(metrics.get("profile_status") or self._profile_status())
+        adapter = getattr(self, "observation_fusion_adapter", None)
+        residual_profile = getattr(self, "disparity_residual_profile", None)
+        status["observation_fusion_status"] = str(metrics.get("observation_fusion_status", "disabled"))
+        status["observation_fusion_adapter"] = "" if adapter is None else type(adapter).__name__
+        status["observation_fusion_buffer_count"] = len(getattr(self, "observation_fusion_buffer", []))
+        status["observation_fusion_required_count"] = self._observation_fusion_required_observations(adapter)
+        status["disparity_residual_status"] = str(metrics.get("disparity_residual_status", "disabled"))
+        status["disparity_residual_profile_id"] = "" if residual_profile is None else residual_profile.profile_id
+        status["disparity_residual_feature_summary_status"] = str(
+            metrics.get("disparity_residual_feature_summary_status", "disabled")
+        )
+        status["disparity_residual_feature_selector_summary_status"] = str(
+            metrics.get("disparity_residual_feature_selector_summary_status", "disabled")
+        )
+        status["disparity_residual_feature_selector_window_count"] = int(
+            metrics.get("disparity_residual_feature_selector_window_count", 0)
+        )
+        status["disparity_residual_feature_selector_status"] = str(
+            metrics.get("disparity_residual_feature_selector_status", "disabled")
+        )
+        status["disparity_residual_feature_selected_label"] = str(
+            metrics.get("disparity_residual_feature_selected_label", "")
+        )
         return String(data=json.dumps(status, ensure_ascii=False, sort_keys=True))
 
     def _detections_to_msg(self, left, right):
         msg = Float32MultiArray()
         msg.data = self._detection_to_values(left) + self._detection_to_values(right)
         return msg
+
+    def _detection_from_values(self, values):
+        if len(values) < 8:
+            return None
+        try:
+            valid = float(values[0]) > 0.5
+            x1 = float(values[1])
+            y1 = float(values[2])
+            x2 = float(values[3])
+            y2 = float(values[4])
+            confidence = float(values[5])
+            cx = float(values[6])
+            cy = float(values[7])
+        except (TypeError, ValueError):
+            return None
+        if not valid:
+            return None
+        if not all(math.isfinite(value) for value in (x1, y1, x2, y2, confidence, cx, cy)):
+            return None
+        return {
+            "bbox": (x1, y1, x2, y2),
+            "confidence": confidence,
+            "cx": cx,
+            "cy": cy,
+        }
 
     def _detection_to_values(self, detection):
         if detection is None or "bbox" not in detection:
@@ -1032,6 +1333,24 @@ class StereoDistanceNode(Node):
             float(detection.get("cx", math.nan)),
             float(detection.get("cy", math.nan)),
         ]
+
+    def _external_detections_cb(self, msg):
+        values = list(getattr(msg, "data", []))
+        left = self._detection_from_values(values[:8])
+        right = self._detection_from_values(values[8:16])
+        state = self._mission_state()
+        actual = self._read_actual_distance(state["distance_m"])
+        width = int(getattr(self, "external_bbox_detection_width_px", 1280))
+        height = int(getattr(self, "external_bbox_detection_height_px", 720))
+        synthetic_image = np.zeros((height, width, 3), dtype=np.uint8)
+        metrics = self._calculate_metrics(synthetic_image, left, right, float(actual), state["phase"])
+        metrics["status"] = "External bbox tracking"
+        with self.lock:
+            self.left_detection = left
+            self.right_detection = right
+            self.metrics = metrics
+        self.detections_pub.publish(self._detections_to_msg(left, right))
+        self._publish_estimated_position(metrics)
 
     def _msg_to_rgb(self, msg):
         encoding = msg.encoding.lower()
@@ -1398,6 +1717,137 @@ class StereoDistanceNode(Node):
             "disparity_px": disparity,
         }
 
+    def _synthetic_detection_pair_from_rdf(self, *, right_m, down_m, forward_m, width, height):
+        if not math.isfinite(float(forward_m)) or float(forward_m) <= 0.0:
+            return None, None
+        width = float(width)
+        height = float(height)
+        fx = (width * 0.5) / math.tan(self.horizontal_fov_rad * 0.5)
+        fy = fx
+        image_cx = width * 0.5
+        image_cy = height * 0.5
+        forward = float(forward_m)
+        disparity = fx * float(self.baseline_m) / forward
+        if not math.isfinite(disparity) or disparity < 0.5:
+            return None, None
+        center_u = image_cx + float(right_m) * fx / forward
+        center_v = image_cy + float(down_m) * fy / forward
+        left_cx = center_u + disparity * 0.5
+        right_cx = center_u - disparity * 0.5
+        left_cy = center_v
+        right_cy = center_v
+        if not all(math.isfinite(value) for value in (left_cx, right_cx, left_cy, right_cy)):
+            return None, None
+        bbox_size = float(self.synthetic_detection_bbox_size_px)
+
+        def detection(cx, cy):
+            half = bbox_size * 0.5
+            return {
+                "cx": float(cx),
+                "cy": float(cy),
+                "confidence": 1.0,
+                "bbox": (
+                    float(cx - half),
+                    float(cy - half),
+                    float(cx + half),
+                    float(cy + half),
+                ),
+            }
+
+        return detection(left_cx, left_cy), detection(right_cx, right_cy)
+
+    def _publish_synthetic_detection_sample(self):
+        if not self.enable_synthetic_detections:
+            return
+        state = self._mission_state()
+        actual = self._read_actual_distance(state["distance_m"])
+        self.cached_actual_distance = actual
+        position = dict(self.cached_ground_truth_position)
+        if not math.isfinite(float(position.get("forward_m", math.nan))):
+            position["forward_m"] = float(actual)
+        width = int(self.synthetic_detection_width_px)
+        height = int(self.synthetic_detection_height_px)
+        left, right = self._synthetic_detection_pair_from_rdf(
+            right_m=float(position.get("right_m", 0.0)),
+            down_m=float(position.get("down_m", self.camera_height_m - self.target_center_z_m)),
+            forward_m=float(position.get("forward_m", actual)),
+            width=width,
+            height=height,
+        )
+        synthetic_image = np.zeros((height, width, 3), dtype=np.uint8)
+        metrics = self._calculate_metrics(synthetic_image, left, right, float(actual), state["phase"])
+        metrics["status"] = "Synthetic bbox tracking for headless/operator pipeline validation"
+        with self.lock:
+            self.left_detection = left
+            self.right_detection = right
+            self.metrics = metrics
+        self.detections_pub.publish(self._detections_to_msg(left, right))
+        self._publish_estimated_position(metrics)
+
+    def _raw_from_runtime_sample(self, sample):
+        raw_range = (
+            float(sample.raw_range_m)
+            if sample.raw_range_m is not None and math.isfinite(float(sample.raw_range_m))
+            else math.sqrt(
+                sample.raw_right_m * sample.raw_right_m
+                + sample.raw_down_m * sample.raw_down_m
+                + sample.raw_forward_m * sample.raw_forward_m
+            )
+        )
+        raw = {
+            "right_m": float(sample.raw_right_m),
+            "down_m": float(sample.raw_down_m),
+            "forward_m": float(sample.raw_forward_m),
+            "range_m": raw_range,
+            "distance_m": float(sample.raw_forward_m),
+            "disparity_px": float(sample.measured_disparity_px),
+        }
+        if sample.left_u_px is not None:
+            raw["left_u_px"] = float(sample.left_u_px)
+            raw["right_u_px"] = float(sample.left_u_px) - float(sample.measured_disparity_px)
+        if sample.left_v_px is not None:
+            raw["left_v_px"] = float(sample.left_v_px)
+            raw["right_v_px"] = float(sample.left_v_px)
+        return raw
+
+    def _apply_observation_fusion(self, left, right, width, height):
+        adapter = getattr(self, "observation_fusion_adapter", None)
+        if adapter is None:
+            return None, "disabled"
+        disparity = abs(float(left["cx"]) - float(right["cx"]))
+        if disparity < 0.5:
+            return None, "invalid_disparity"
+        observation = RuntimeImageObservation.from_mapping(
+            {
+                "left_u_px": float(left["cx"]),
+                "left_v_px": float(left["cy"]),
+                "measured_disparity_px": disparity,
+            }
+        )
+        if observation is None:
+            return None, "invalid_observation"
+        self.observation_fusion_buffer.append(observation)
+        adapter.camera = RuntimeStereoCameraContract(
+            width_px=float(width),
+            height_px=float(height),
+            horizontal_fov_rad=float(self.horizontal_fov_rad),
+            baseline_m=float(self.baseline_m),
+        )
+        observations = list(self.observation_fusion_buffer)
+        if isinstance(adapter, RepeatedObservationFusion):
+            fused = adapter.fuse(observations)
+        elif isinstance(adapter, MultiBurstObservationFusion):
+            per_burst = int(adapter.min_observations_per_burst)
+            required = int(adapter.min_bursts) * per_burst
+            recent = observations[-required:]
+            bursts = [recent[index : index + per_burst] for index in range(0, len(recent), per_burst)]
+            fused = adapter.fuse(bursts)
+        else:
+            return None, "unsupported_adapter"
+        if fused is None:
+            return None, f"warming_up:{len(observations)}/{self._observation_fusion_required_observations(adapter)}"
+        return self._raw_from_runtime_sample(fused), f"fused:{type(adapter).__name__}:{len(observations)}"
+
     def _adjust_bbox_centers(self, left, right):
         matrix = self.bbox_center_adjustment
         if matrix is None or not isinstance(matrix, np.ndarray):
@@ -1629,11 +2079,11 @@ class StereoDistanceNode(Node):
             return None, self._profile_status()
         profile_raw = dict(raw)
         if left is not None:
-            profile_raw["left_u_px"] = left.get("cx")
-            profile_raw["left_v_px"] = left.get("cy")
+            profile_raw.setdefault("left_u_px", left.get("cx"))
+            profile_raw.setdefault("left_v_px", left.get("cy"))
         if right is not None:
-            profile_raw["right_u_px"] = right.get("cx")
-            profile_raw["right_v_px"] = right.get("cy")
+            profile_raw.setdefault("right_u_px", right.get("cx"))
+            profile_raw.setdefault("right_v_px", right.get("cy"))
         result = profile.apply(profile_raw)
         return result.corrected, result.status
 
@@ -1650,6 +2100,127 @@ class StereoDistanceNode(Node):
             return None, self._profile_status()
         result = profile.apply(raw)
         return result.corrected, result.status
+
+    def _apply_disparity_residual_profile(self, corrected, raw, profile=None):
+        if profile is None:
+            profile = getattr(self, "disparity_residual_profile", None)
+        if not isinstance(profile, DisparityResidualRuntimeProfile):
+            return corrected, "disabled"
+        if corrected is None:
+            return corrected, "skipped:no_corrected_base"
+        disparity = raw.get("disparity_px")
+        if disparity is None or not math.isfinite(float(disparity)) or float(disparity) <= 0.0:
+            return corrected, "skipped:invalid_disparity"
+        sample = RuntimeMeasurementSample(
+            raw_right_m=float(corrected["right_m"]),
+            raw_down_m=float(corrected["down_m"]),
+            raw_forward_m=float(corrected["forward_m"]),
+            measured_disparity_px=float(disparity),
+            raw_range_m=float(corrected.get("range_m", math.nan)),
+            left_u_px=raw.get("left_u_px"),
+            left_v_px=raw.get("left_v_px"),
+        )
+        residual = profile.apply(sample)
+        if residual is None:
+            return corrected, "skipped:profile_noop"
+        return self._raw_from_runtime_sample(residual), f"applied:{profile.profile_id or profile.method}"
+
+    def _select_disparity_residual_profile_from_features(self, feature_summary):
+        selector = getattr(self, "disparity_residual_feature_selector", None)
+        if not isinstance(selector, DisparityResidualFeatureSelector):
+            return None, "disabled", ""
+        selection = selector.select(feature_summary)
+        label = str(selection.get("selected_label", ""))
+        profile_path = str(selection.get("selected_profile", ""))
+        if not selection.get("selected_profile_exists", False):
+            return None, f"skipped:profile_missing:{label}", label
+        try:
+            profile = DisparityResidualRuntimeProfile.from_json_file(profile_path)
+        except Exception as exc:
+            return None, f"skipped:{type(exc).__name__}:{label}", label
+        return profile, f"selected:{label}", label
+
+    def _append_disparity_residual_feature_selector_window(self, *, raw, corrected):
+        if raw is None:
+            return "skipped:no_raw"
+        required = ("left_u_px", "left_v_px", "disparity_px", "right_m", "down_m", "forward_m")
+        if any(raw.get(field) is None for field in required):
+            return "skipped:missing_runtime_fields"
+        observation = corrected if corrected is not None else raw
+        try:
+            row = {
+                "left_u_px": float(raw["left_u_px"]),
+                "left_v_px": float(raw["left_v_px"]),
+                "measured_disparity_px": float(raw["disparity_px"]),
+                "fused_disparity_px": float(observation.get("disparity_px", raw["disparity_px"])),
+                "raw_right_m": float(raw["right_m"]),
+                "raw_down_m": float(raw["down_m"]),
+                "raw_forward_m": float(raw["forward_m"]),
+                "observation_right_m": float(observation["right_m"]),
+                "observation_down_m": float(observation["down_m"]),
+                "observation_forward_m": float(observation["forward_m"]),
+            }
+        except Exception as exc:
+            return f"skipped:{type(exc).__name__}"
+        window = getattr(self, "disparity_residual_feature_selector_window", None)
+        if not isinstance(window, deque):
+            self._reset_disparity_residual_feature_selector_window()
+            window = self.disparity_residual_feature_selector_window
+        window.append(row)
+        return f"ready:{len(window)}"
+
+    def _disparity_residual_feature_selector_summary(self, *, raw, corrected):
+        append_status = self._append_disparity_residual_feature_selector_window(raw=raw, corrected=corrected)
+        if not append_status.startswith("ready:"):
+            return {}, append_status
+        window = getattr(self, "disparity_residual_feature_selector_window", deque())
+        min_samples = max(1, int(getattr(self, "disparity_residual_feature_selector_min_samples", 1)))
+        if len(window) < min_samples:
+            return {}, f"accumulating:{len(window)}/{min_samples}"
+        try:
+            feature_row = feature_summary_from_runtime_rows(
+                list(window),
+                feature_label="stereodistance_node_runtime_window",
+                observation_rdf_source="corrected_runtime_window",
+            )
+        except Exception as exc:
+            return {}, f"skipped:{type(exc).__name__}"
+        return feature_row, f"ready:runtime_window:{len(window)}"
+
+    def _disparity_residual_feature_summary(self, *, raw, corrected):
+        if raw is None:
+            return {}, "skipped:no_raw"
+        required = ("left_u_px", "left_v_px", "disparity_px", "right_m", "down_m", "forward_m")
+        if any(raw.get(field) is None for field in required):
+            return {}, "skipped:missing_runtime_fields"
+        observation = corrected if corrected is not None else raw
+        observation_source = "corrected_current_sample" if corrected is not None else "raw_current_sample_fallback"
+        try:
+            feature_row = feature_summary_from_arrays(
+                left_u_px=[float(raw["left_u_px"])],
+                left_v_px=[float(raw["left_v_px"])],
+                measured_disparity_px=[float(raw["disparity_px"])],
+                raw_rdf_m=[
+                    [
+                        float(raw["right_m"]),
+                        float(raw["down_m"]),
+                        float(raw["forward_m"]),
+                    ]
+                ],
+                fused_disparity_px=[float(observation.get("disparity_px", raw["disparity_px"]))],
+                observation_rdf_m=[
+                    [
+                        float(observation["right_m"]),
+                        float(observation["down_m"]),
+                        float(observation["forward_m"]),
+                    ]
+                ],
+                feature_label="stereodistance_node_current_sample",
+                observation_rdf_source=observation_source,
+            )
+        except Exception as exc:
+            return {}, f"skipped:{type(exc).__name__}"
+        return feature_row, "ready:current_sample"
 
     def _calculate_metrics(self, left_image, left, right, actual, phase):
         if left is None or right is None:
@@ -1672,6 +2243,7 @@ class StereoDistanceNode(Node):
                     3,
                     "incomplete_bbox_pair",
                 ),
+                "observation_fusion_status": "incomplete_bbox_pair",
                 "actual_distance_m": actual,
                 "distance_error_m": None,
                 "mission_phase": phase,
@@ -1681,6 +2253,14 @@ class StereoDistanceNode(Node):
         width = left_image.shape[1]
         height = left_image.shape[0]
         raw = self._position_from_centers(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
+        observation_fusion_status = "disabled"
+        fused_raw, observation_fusion_status = self._apply_observation_fusion(left, right, width, height)
+        if fused_raw is not None:
+            raw = fused_raw
+        raw.setdefault("left_u_px", float(left["cx"]))
+        raw.setdefault("left_v_px", float(left["cy"]))
+        raw.setdefault("right_u_px", float(right["cx"]))
+        raw.setdefault("right_v_px", float(right["cy"]))
         corrected = None
         bbox_adjustment = None
         profile_status = self._profile_status()
@@ -1727,6 +2307,35 @@ class StereoDistanceNode(Node):
             )
             if not isinstance(self.bbox_center_adjustment, OriginBBoxReprojectionProfile):
                 profile_status = self._profile_status("global_affine_csv", "global_affine_csv", 0, "csv_affine")
+        pre_residual_feature_summary, pre_residual_feature_summary_status = self._disparity_residual_feature_summary(
+            raw=raw,
+            corrected=corrected,
+        )
+        selector_feature_summary = pre_residual_feature_summary
+        selector_feature_summary_status = pre_residual_feature_summary_status
+        selected_residual_profile = None
+        feature_selector_status = "disabled"
+        feature_selected_label = ""
+        if not isinstance(getattr(self, "disparity_residual_profile", None), DisparityResidualRuntimeProfile):
+            if isinstance(getattr(self, "disparity_residual_feature_selector", None), DisparityResidualFeatureSelector):
+                selector_feature_summary, selector_feature_summary_status = (
+                    self._disparity_residual_feature_selector_summary(raw=raw, corrected=corrected)
+                )
+            if selector_feature_summary:
+                selected_residual_profile, feature_selector_status, feature_selected_label = (
+                    self._select_disparity_residual_profile_from_features(selector_feature_summary)
+                )
+            elif selector_feature_summary_status != pre_residual_feature_summary_status:
+                feature_selector_status = selector_feature_summary_status
+        corrected, disparity_residual_status = self._apply_disparity_residual_profile(
+            corrected,
+            raw,
+            profile=selected_residual_profile,
+        )
+        feature_summary, feature_summary_status = self._disparity_residual_feature_summary(raw=raw, corrected=corrected)
+        if feature_summary_status != "ready:current_sample":
+            feature_summary_status = pre_residual_feature_summary_status
+            feature_summary = pre_residual_feature_summary
         error = None if raw["distance_m"] is None else raw["distance_m"] - actual
         return {
             "distance_m": raw["distance_m"],
@@ -1742,10 +2351,20 @@ class StereoDistanceNode(Node):
             "corrected_disparity_px": None if corrected is None else corrected["disparity_px"],
             "bbox_adjustment": bbox_adjustment,
             "profile_status": profile_status,
+            "observation_fusion_status": observation_fusion_status,
+            "disparity_residual_status": disparity_residual_status,
+            "disparity_residual_feature_summary_status": feature_summary_status,
+            "disparity_residual_feature_summary": feature_summary,
+            "disparity_residual_feature_selector_summary_status": selector_feature_summary_status,
+            "disparity_residual_feature_selector_window_count": len(
+                getattr(self, "disparity_residual_feature_selector_window", [])
+            ),
+            "disparity_residual_feature_selector_status": feature_selector_status,
+            "disparity_residual_feature_selected_label": feature_selected_label,
             "actual_distance_m": actual,
             "distance_error_m": error,
             "mission_phase": phase,
-            "status": f"YOLO tracking {self.yolo_class_name}",
+            "status": f"YOLO tracking {self.yolo_class_name}; observation_fusion={observation_fusion_status}",
         }
 
     def _publish_marker(self):

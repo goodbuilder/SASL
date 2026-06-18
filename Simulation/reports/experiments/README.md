@@ -8,9 +8,12 @@ correction-method work.
 StereoDistance correction experiments exist to learn, from calibration-flight
 data, a runtime-safe mapping from stereo `estimated` measurements to the
 corresponding `truth` measurements. During calibration, PX4 local position NED
-may be used as ground truth and converted under an explicit contract to the
-stereo-center camera RDF frame. During measurement-only operation, that truth is
-not available and must not be used as a runtime input.
+may be used as ground truth, but it is not the only allowed truth source. RTK or
+GNSS world coordinates, Gazebo world/model pose, external tracker frames, or an
+already stereo-center RDF truth topic may also be used when their source frame,
+origin/reference point, units, time basis, target truth point, and transform into
+stereo-center camera RDF are explicit. During measurement-only operation, truth
+is not available and must not be used as a runtime input.
 
 The common objective is to remove the repeatable global gap between `estimated`
 and `truth`, including camera attitude error, origin/reference-point offset, and
@@ -32,6 +35,13 @@ Every experiment must keep these contracts explicit:
 - PX4 local position uses `north/east/down`.
 - Stereo correction math and learned profiles use internal RDF:
   `right/down/forward`.
+- Validation is performed in stereo-center RDF by comparing `corrected_rdf`
+  against `truth_rdf`.
+- `truth_rdf` must be produced by a declared `T_source_to_stereo_rdf` transform or
+  by a truth producer that is already in the stereo-center RDF frame.
+- Do not assume the camera optical frame is aligned with local NED. The direct
+  alias `rdf_right=east`, `rdf_down=down`, `rdf_forward=north` is forbidden for
+  both real and synthetic experiments.
 - Legacy StereoDistance ROS `Float32MultiArray` position topics use public
   FRD+range order: `forward/right/down/range`.
 - CSV/report data should prefer named fields such as `estimated_right_m`,

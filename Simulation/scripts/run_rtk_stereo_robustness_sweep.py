@@ -20,10 +20,30 @@ MULTI_SEED_SCRIPT = ROOT_DIR / "scripts" / "run_rtk_stereo_policy_multi_seed_val
 PIPELINE_SCRIPT = ROOT_DIR / "scripts" / "rtk_stereo_calibration_pipeline.py"
 PROFILE_REPLAY_SCRIPT = ROOT_DIR / "scripts" / "stereodistance_profile_replay.py"
 PROFILE_PROMOTION_CHECK_SCRIPT = ROOT_DIR / "scripts" / "stereodistance_profile_promotion_check.py"
+SCENARIO_CATALOG_SELECTOR_EXPORT_SCRIPT = ROOT_DIR / "scripts" / "export_robustness_scenario_catalog_selector.py"
+RUNTIME_DEPLOYMENT_FRONTIER_EXPORT_SCRIPT = ROOT_DIR / "scripts" / "export_stereodistance_runtime_deployment_frontier.py"
+OPERATOR_VIEW_LAUNCH_CHECK_SCRIPT = ROOT_DIR / "scripts" / "check_stereodistance_operator_view_launch.py"
 
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "truth_rdf must be stereo_center_RDF from explicit T_source_to_stereo_rdf "
+    "or an already stereo-frame truth producer; direct NED-to-RDF axis alias is forbidden"
+)
+ROBUSTNESS_ACCEPTANCE_ITEMS = (
+    "scenario_run_coverage",
+    "coordinate_contract",
+    "scenario_recommendations",
+    "robust_method_summary",
+    "robust_recommendation",
+    "robust_policy_transfer",
+    "scenario_profile_catalog",
+    "scenario_catalog_promotion",
+    "scenario_catalog_transfer_coverage",
+    "deployment_strategy",
+    "runtime_label_selector_package",
+)
 
 
 @dataclass(frozen=True)
@@ -529,6 +549,80 @@ def collect_scenario_outputs(
     return run_row, gate_rows, recommendation_row
 
 
+def collect_scenario_coordinate_contracts(
+    *,
+    output_dir: Path,
+    scenarios: Sequence[Scenario],
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for scenario in scenarios:
+        scenario_dir = output_dir / scenario.name
+        summary_path = scenario_dir / "multi_seed_summary.json"
+        seed_contract_path = scenario_dir / "seed_coordinate_contracts.csv"
+        summary: Mapping[str, object] = {}
+        if summary_path.exists():
+            payload = json.loads(summary_path.read_text(encoding="utf-8"))
+            if isinstance(payload, Mapping) and isinstance(payload.get("coordinate_contract_summary"), Mapping):
+                summary = payload["coordinate_contract_summary"]
+        rows.append(
+            {
+                "scenario": scenario.name,
+                "purpose": scenario.purpose,
+                "summary_loaded": bool(summary),
+                "seed_contract_count": int(summary.get("seed_contract_count", 0) or 0),
+                "loaded_contract_count": int(summary.get("loaded_contract_count", 0) or 0),
+                "direct_axis_alias_forbidden_count": int(
+                    summary.get("direct_axis_alias_forbidden_count", 0) or 0
+                ),
+                "all_loaded_contracts_forbid_direct_axis_alias": parse_bool(
+                    summary.get("all_loaded_contracts_forbid_direct_axis_alias")
+                ),
+                "truth_rdf_transform_contract": summary.get(
+                    "truth_rdf_transform_contract", TRUTH_RDF_TRANSFORM_CONTRACT
+                ),
+                "seed_coordinate_contracts_path": (
+                    str(seed_contract_path.relative_to(output_dir)) if seed_contract_path.exists() else ""
+                ),
+                "axis_contract": RDF_AXIS_CONTRACT,
+                "ned_axis_contract": NED_AXIS_CONTRACT,
+            }
+        )
+    return rows
+
+
+def robustness_coordinate_contract_summary(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    scenario_count: int,
+) -> dict[str, object]:
+    summary_loaded_count = sum(1 for row in rows if parse_bool(row.get("summary_loaded")))
+    scenario_forbidden_count = sum(
+        1 for row in rows if parse_bool(row.get("all_loaded_contracts_forbid_direct_axis_alias"))
+    )
+    loaded_contract_count = sum(int(row.get("loaded_contract_count", 0) or 0) for row in rows)
+    direct_alias_forbidden_count = sum(
+        int(row.get("direct_axis_alias_forbidden_count", 0) or 0) for row in rows
+    )
+    all_scenarios_forbid = (
+        scenario_count > 0
+        and summary_loaded_count == scenario_count
+        and scenario_forbidden_count == scenario_count
+        and loaded_contract_count > 0
+        and direct_alias_forbidden_count == loaded_contract_count
+    )
+    return {
+        "scenario_count": scenario_count,
+        "summary_loaded_scenario_count": summary_loaded_count,
+        "scenario_direct_axis_alias_forbidden_count": scenario_forbidden_count,
+        "loaded_contract_count": loaded_contract_count,
+        "direct_axis_alias_forbidden_count": direct_alias_forbidden_count,
+        "all_scenarios_forbid_direct_axis_alias": all_scenarios_forbid,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
+        "axis_contract": RDF_AXIS_CONTRACT,
+        "ned_axis_contract": NED_AXIS_CONTRACT,
+    }
+
+
 def collect_scenario_near_tie_profiles(
     *,
     output_dir: Path,
@@ -648,15 +742,37 @@ def choose_robust_recommendation(summary_rows: Sequence[Mapping[str, object]]) -
         }
     strict = [row for row in summary_rows if bool(row.get("strict_pass_all_scenarios"))]
     performance = [row for row in summary_rows if bool(row.get("performance_pass_all_scenarios"))]
-    if strict:
+    axis_clean = [
+        row
+        for row in summary_rows
+        if finite_float(row.get("axis_rmse_regression_sum_mean_m"), float("inf")) <= 0.0
+    ]
+    strict_axis_clean = [row for row in strict if row in axis_clean]
+    performance_axis_clean = [row for row in performance if row in axis_clean]
+    if strict_axis_clean:
         mode = "strict_all_scenarios"
-        candidates = strict
-    elif performance:
+        candidates = strict_axis_clean
+        reason = "selected_from_cross_scenario_method_stability_gate_with_rdf_axis_nonregression"
+    elif performance_axis_clean:
         mode = "performance_all_scenarios"
+        candidates = performance_axis_clean
+        reason = "selected_from_performance_gate_with_rdf_axis_nonregression"
+    elif axis_clean:
+        mode = "best_partial_axis_clean_robustness"
+        candidates = axis_clean
+        reason = "no_all_scenario_axis_clean_candidate_available"
+    elif strict:
+        mode = "strict_all_scenarios_axis_regression_fallback"
+        candidates = strict
+        reason = "no_rdf_axis_nonregression_candidate_available"
+    elif performance:
+        mode = "performance_all_scenarios_axis_regression_fallback"
         candidates = performance
+        reason = "no_rdf_axis_nonregression_candidate_available"
     else:
         mode = "best_partial_robustness"
         candidates = list(summary_rows)
+        reason = "no_rdf_axis_nonregression_candidate_available"
     selected = min(
         candidates,
         key=lambda row: (
@@ -670,7 +786,7 @@ def choose_robust_recommendation(summary_rows: Sequence[Mapping[str, object]]) -
         "recommendation_mode": mode,
         "method": selected["method"],
         **method_contract_fields(str(selected["method"])),
-        "reason": "selected_from_cross_scenario_method_stability_gate",
+        "reason": reason,
         "robust_score": selected["robust_score"],
         "strict_pass_count": selected["strict_pass_count"],
         "performance_pass_count": selected["performance_pass_count"],
@@ -680,9 +796,455 @@ def choose_robust_recommendation(summary_rows: Sequence[Mapping[str, object]]) -
         "target_abs_mean_error_mean_m": selected["target_abs_mean_error_mean_m"],
         "target_abs_mean_error_max_m": selected["target_abs_mean_error_max_m"],
         "axis_rmse_regression_sum_mean_m": selected["axis_rmse_regression_sum_mean_m"],
+        "rdf_axis_nonregression_pass": finite_float(
+            selected.get("axis_rmse_regression_sum_mean_m"), float("inf")
+        )
+        <= 0.0,
         "model_complexity_mean": selected["model_complexity_mean"],
         "axis_contract": RDF_AXIS_CONTRACT,
         "runtime_input_contract": "raw stereo-center RDF(right,down,forward) plus measured disparity; no runtime truth",
+    }
+
+
+def build_robustness_acceptance_matrix(
+    *,
+    scenario_count: int,
+    run_rows: Sequence[Mapping[str, object]],
+    recommendation_rows: Sequence[Mapping[str, object]],
+    robust_summary_rows: Sequence[Mapping[str, object]],
+    robust_recommendation: Mapping[str, object],
+    policy_transfer_summary_rows: Sequence[Mapping[str, object]],
+    scenario_catalog_summary: Mapping[str, object],
+    scenario_catalog_promotion_summary: Mapping[str, object],
+    catalog_transfer_source_summary_rows: Sequence[Mapping[str, object]],
+    deployment_strategy: Mapping[str, object],
+    coordinate_contract_summary: Mapping[str, object],
+    runtime_label_selector_package: Mapping[str, object] | None = None,
+) -> dict[str, dict[str, object]]:
+    completed_scenarios = sum(1 for row in run_rows if parse_bool(row.get("pass_run")))
+    scenario_recommendation_count = sum(1 for row in recommendation_rows if str(row.get("method", "")))
+    strict_method_count = sum(1 for row in robust_summary_rows if parse_bool(row.get("strict_pass_all_scenarios")))
+    performance_method_count = sum(1 for row in robust_summary_rows if parse_bool(row.get("performance_pass_all_scenarios")))
+    policy_transfer_pass_count = sum(
+        1 for row in policy_transfer_summary_rows if parse_bool(row.get("pass_all_transfer_replays"))
+    )
+    catalog_ready = parse_bool(scenario_catalog_summary.get("pass_scenario_profile_catalog")) and parse_bool(
+        scenario_catalog_promotion_summary.get("pass_catalog_promotion_checks")
+    )
+    catalog_source_pass_count = sum(
+        1 for row in catalog_transfer_source_summary_rows if parse_bool(row.get("pass_all_transfer_replays"))
+    )
+    robust_recommendation_axis_clean = (
+        finite_float(robust_recommendation.get("axis_rmse_regression_sum_mean_m"), float("inf")) <= 0.0
+    )
+    deployment_validated = (
+        parse_bool(deployment_strategy.get("single_profile_pass"))
+        or parse_bool(deployment_strategy.get("scenario_catalog_ready"))
+        or str(deployment_strategy.get("deployment_strategy", "")) in {
+            "single_runtime_profile",
+            "single_near_tie_runtime_profile",
+            "single_pooled_runtime_profile",
+            "scenario_profile_catalog",
+        }
+    )
+    selector_package = dict(runtime_label_selector_package or {})
+    selector_package_ready = (
+        selector_package.get("status") == "PASS"
+        and selector_package.get("selector_export_status") == "PASS"
+        and selector_package.get("frontier_status") == "PASS"
+        and not parse_bool(selector_package.get("runtime_truth_used", True))
+        and int(selector_package.get("profile_count", 0) or 0) > 0
+        and int(selector_package.get("deployment_label_count", 0) or 0) > 0
+        and selector_package.get("operator_launch_status") == "PASS"
+        and int(selector_package.get("operator_launch_check_count", 0) or 0) > 0
+        and selector_package.get("operator_launch_check_count") == selector_package.get("operator_launch_pass_count")
+        and bool(str(selector_package.get("selector_json", "")))
+    )
+    return {
+        "scenario_run_coverage": {
+            "status": "PASS" if scenario_count > 0 and completed_scenarios == scenario_count else "FAIL",
+            "path": "scenario_runs.csv",
+            "evidence": {
+                "scenario_count": scenario_count,
+                "completed_scenario_count": completed_scenarios,
+            },
+        },
+        "coordinate_contract": {
+            "status": (
+                "PASS"
+                if parse_bool(coordinate_contract_summary.get("all_scenarios_forbid_direct_axis_alias"))
+                else "FAIL"
+            ),
+            "path": "scenario_coordinate_contracts.csv",
+            "evidence": {
+                "truth_rdf_transform_contract": coordinate_contract_summary.get(
+                    "truth_rdf_transform_contract", TRUTH_RDF_TRANSFORM_CONTRACT
+                ),
+                "scenario_count": coordinate_contract_summary.get("scenario_count", scenario_count),
+                "summary_loaded_scenario_count": coordinate_contract_summary.get(
+                    "summary_loaded_scenario_count", 0
+                ),
+                "scenario_direct_axis_alias_forbidden_count": coordinate_contract_summary.get(
+                    "scenario_direct_axis_alias_forbidden_count", 0
+                ),
+                "loaded_contract_count": coordinate_contract_summary.get("loaded_contract_count", 0),
+                "direct_axis_alias_forbidden_count": coordinate_contract_summary.get(
+                    "direct_axis_alias_forbidden_count", 0
+                ),
+            },
+        },
+        "scenario_recommendations": {
+            "status": "PASS" if scenario_recommendation_count == scenario_count and scenario_count > 0 else "FAIL",
+            "path": "scenario_recommendations.csv",
+            "evidence": {
+                "scenario_recommendation_count": scenario_recommendation_count,
+                "scenario_count": scenario_count,
+            },
+        },
+        "robust_method_summary": {
+            "status": "PASS" if robust_summary_rows and performance_method_count > 0 else "FAIL",
+            "path": "robust_method_summary.csv",
+            "evidence": {
+                "method_count": len(robust_summary_rows),
+                "strict_all_scenario_method_count": strict_method_count,
+                "performance_all_scenario_method_count": performance_method_count,
+            },
+        },
+        "robust_recommendation": {
+            "status": (
+                "PASS"
+                if str(robust_recommendation.get("method", "")) and robust_recommendation_axis_clean
+                else "FAIL"
+            ),
+            "path": "robustness_summary.json",
+            "evidence": {
+                "method": robust_recommendation.get("method", ""),
+                "recommendation_mode": robust_recommendation.get("recommendation_mode", ""),
+                "strict_pass_count": robust_recommendation.get("strict_pass_count", 0),
+                "performance_pass_count": robust_recommendation.get("performance_pass_count", 0),
+                "rdf_axis_nonregression_pass": robust_recommendation_axis_clean,
+                "axis_rmse_regression_sum_mean_m": robust_recommendation.get("axis_rmse_regression_sum_mean_m", ""),
+            },
+        },
+        "robust_policy_transfer": {
+            "status": "PASS" if policy_transfer_pass_count > 0 or catalog_ready else "FAIL",
+            "path": "robust_policy_profile_transfer_summary.csv",
+            "evidence": {
+                "policy_transfer_profile_count": len(policy_transfer_summary_rows),
+                "pass_all_transfer_profile_count": policy_transfer_pass_count,
+                "scenario_catalog_ready": catalog_ready,
+                "interpretation": (
+                    "single representative policy transfer is not required when the validated "
+                    "deployment strategy is a scenario-specific catalog"
+                    if catalog_ready and policy_transfer_pass_count == 0
+                    else "single representative policy transfer evidence available"
+                ),
+            },
+        },
+        "scenario_profile_catalog": {
+            "status": "PASS" if parse_bool(scenario_catalog_summary.get("pass_scenario_profile_catalog")) else "FAIL",
+            "path": "scenario_profile_catalog.json",
+            "evidence": {
+                "catalog_profile_count": scenario_catalog_summary.get("catalog_profile_count", 0),
+                "profile_exists_count": scenario_catalog_summary.get("profile_exists_count", 0),
+                "cross_seed_pass_count": scenario_catalog_summary.get("cross_seed_pass_count", 0),
+            },
+        },
+        "scenario_catalog_promotion": {
+            "status": "PASS" if parse_bool(scenario_catalog_promotion_summary.get("pass_catalog_promotion_checks")) else "FAIL",
+            "path": "scenario_profile_catalog_promotion_checks.json",
+            "evidence": {
+                "catalog_promotion_check_count": scenario_catalog_promotion_summary.get("catalog_promotion_check_count", 0),
+                "catalog_promotion_pass_count": scenario_catalog_promotion_summary.get("catalog_promotion_pass_count", 0),
+                "runtime_truth_used": False,
+            },
+        },
+        "scenario_catalog_transfer_coverage": {
+            "status": "PASS" if catalog_source_pass_count > 0 or catalog_ready else "FAIL",
+            "path": "scenario_profile_catalog_transfer_coverage.csv",
+            "evidence": {
+                "source_profile_count": len(catalog_transfer_source_summary_rows),
+                "pass_all_source_profile_count": catalog_source_pass_count,
+                "scenario_catalog_ready": catalog_ready,
+            },
+        },
+        "deployment_strategy": {
+            "status": "PASS" if deployment_validated else "FAIL",
+            "path": "deployment_strategy_recommendation.json",
+            "evidence": {
+                "deployment_strategy": deployment_strategy.get("deployment_strategy", ""),
+                "single_profile_pass": bool(deployment_strategy.get("single_profile_pass", False)),
+                "scenario_catalog_ready": bool(deployment_strategy.get("scenario_catalog_ready", False)),
+                "runtime_profile_contract": deployment_strategy.get("runtime_profile_contract", ""),
+            },
+        },
+        "runtime_label_selector_package": {
+            "status": "PASS" if selector_package_ready else "FAIL",
+            "path": "runtime_label_selector_package/runtime_profile_label_selector.json",
+            "evidence": {
+                "status": selector_package.get("status", ""),
+                "selector_export_status": selector_package.get("selector_export_status", ""),
+                "frontier_status": selector_package.get("frontier_status", ""),
+                "operator_launch_status": selector_package.get("operator_launch_status", ""),
+                "profile_count": selector_package.get("profile_count", 0),
+                "deployment_label_count": selector_package.get("deployment_label_count", 0),
+                "operator_launch_check_count": selector_package.get("operator_launch_check_count", 0),
+                "operator_launch_pass_count": selector_package.get("operator_launch_pass_count", 0),
+                "runtime_truth_used": bool(selector_package.get("runtime_truth_used", True)),
+                "selector_json": selector_package.get("selector_json", ""),
+                "selection_contract": selector_package.get("selection_contract", ""),
+            },
+        },
+    }
+
+
+def load_json_if_exists(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return dict(payload) if isinstance(payload, Mapping) else {}
+
+
+def command_tail(text: str, limit: int = 4000) -> str:
+    return text[-limit:] if len(text) > limit else text
+
+
+def safe_artifact_label(value: object) -> str:
+    text = str(value).strip().lower() or "default"
+    cleaned = "".join(char if char.isalnum() else "_" for char in text).strip("_")
+    return cleaned or "default"
+
+
+def runtime_selector_deployment_labels(selector_json: Path) -> list[str]:
+    manifest = load_json_if_exists(selector_json)
+    label_map = manifest.get("label_profile_map", {})
+    labels = sorted(str(label) for label in label_map.keys()) if isinstance(label_map, Mapping) else []
+    baseline_selector = str(manifest.get("baseline_selector", ""))
+    if "" not in labels:
+        labels.insert(0, "")
+    baseline_label = ""
+    if baseline_selector and isinstance(label_map, Mapping):
+        for label, profile_label in label_map.items():
+            if str(profile_label) == baseline_selector:
+                baseline_label = str(label)
+                break
+    if baseline_label and baseline_label in labels:
+        labels.remove(baseline_label)
+        labels.insert(1 if labels and labels[0] == "" else 0, baseline_label)
+    return list(dict.fromkeys(labels))
+
+
+def run_runtime_selector_operator_launch_checks(
+    *,
+    selector_json: Path,
+    output_dir: Path,
+) -> dict[str, object]:
+    labels = runtime_selector_deployment_labels(selector_json)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict[str, object]] = []
+    for index, label in enumerate(labels):
+        safe_label = safe_artifact_label(label if label else "default")
+        output_json = output_dir / f"operator_view_launch_check_{index:02d}_{safe_label}.json"
+        output_txt = output_dir / f"operator_view_launch_check_{index:02d}_{safe_label}.txt"
+        command = [
+            sys.executable,
+            str(OPERATOR_VIEW_LAUNCH_CHECK_SCRIPT),
+            "--selector-json",
+            str(selector_json),
+            "--output-json",
+            str(output_json),
+            "--output-txt",
+            str(output_txt),
+        ]
+        if label:
+            command.extend(["--deployment-label", label])
+        result = subprocess.run(
+            command,
+            cwd=ROOT_DIR,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        payload = load_json_if_exists(output_json)
+        rows.append(
+            {
+                "deployment_label": label or "__default__",
+                "status": payload.get("status", "FAIL" if result.returncode else "PASS"),
+                "returncode": result.returncode,
+                "selected_label": payload.get("selected_label", ""),
+                "profile_json": payload.get("profile_json", ""),
+                "method": payload.get("method", ""),
+                "bbox_adjustment_arg_present": payload.get("bbox_adjustment_arg_present", False),
+                "runtime_truth_used": payload.get("runtime_truth_used", True),
+                "failure_count": payload.get("failure_count", 0),
+                "failures": ";".join(str(item) for item in payload.get("failures", []))
+                if isinstance(payload.get("failures", []), list)
+                else "",
+                "output_json": str(output_json),
+                "output_txt": str(output_txt),
+                "stdout_tail": command_tail(result.stdout, 1200),
+                "stderr_tail": command_tail(result.stderr, 1200),
+            }
+        )
+    pass_count = sum(1 for row in rows if row.get("status") == "PASS")
+    truth_used_count = sum(1 for row in rows if parse_bool(row.get("runtime_truth_used")))
+    bbox_arg_count = sum(1 for row in rows if parse_bool(row.get("bbox_adjustment_arg_present")))
+    summary = {
+        "mode": "runtime_selector_operator_launch_checks",
+        "status": "PASS" if rows and pass_count == len(rows) and truth_used_count == 0 and bbox_arg_count == len(rows) else "FAIL",
+        "selector_json": str(selector_json),
+        "check_count": len(rows),
+        "pass_count": pass_count,
+        "bbox_adjustment_arg_count": bbox_arg_count,
+        "runtime_truth_used_count": truth_used_count,
+        "runtime_truth_used": truth_used_count > 0,
+        "rows_csv": str(output_dir / "operator_view_launch_checks.csv"),
+        "axis_contract": RDF_AXIS_CONTRACT,
+        "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+    }
+    write_csv(output_dir / "operator_view_launch_checks.csv", rows)
+    write_json(output_dir / "operator_view_launch_checks.json", {"summary": summary, "rows": rows})
+    lines = [
+        "Runtime selector operator-view launch checks",
+        f"status: {summary['status']}",
+        f"selector_json: {selector_json}",
+        f"check_count: {summary['check_count']}",
+        f"pass_count: {summary['pass_count']}",
+        f"bbox_adjustment_arg_count: {summary['bbox_adjustment_arg_count']}",
+        f"runtime_truth_used_count: {summary['runtime_truth_used_count']}",
+        "",
+        "Checks:",
+    ]
+    for row in rows:
+        lines.append(
+            "- {label}: status={status}, selected={selected}, method={method}, bbox_arg={bbox}".format(
+                label=row.get("deployment_label", ""),
+                status=row.get("status", ""),
+                selected=row.get("selected_label", ""),
+                method=row.get("method", ""),
+                bbox=row.get("bbox_adjustment_arg_present", False),
+            )
+        )
+    (output_dir / "operator_view_launch_checks.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return summary
+
+
+def export_runtime_label_selector_package(
+    *,
+    output_dir: Path,
+    scenario_catalog_summary: Mapping[str, object],
+    baseline_scenario: str = "nominal",
+) -> dict[str, object]:
+    if not parse_bool(scenario_catalog_summary.get("pass_scenario_profile_catalog")):
+        return {
+            "mode": "robustness_scenario_catalog_selector_export",
+            "status": "SKIPPED",
+            "reason": "scenario_profile_catalog_not_ready",
+            "selector_package_dir": "",
+            "selector_json": "",
+            "runtime_truth_used": False,
+            "axis_contract": RDF_AXIS_CONTRACT,
+            "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+        }
+
+    package_dir = output_dir / "runtime_label_selector_package"
+    selector_command = [
+        sys.executable,
+        str(SCENARIO_CATALOG_SELECTOR_EXPORT_SCRIPT),
+        "--robustness-dir",
+        str(output_dir),
+        "--output-dir",
+        str(package_dir),
+        "--baseline-scenario",
+        baseline_scenario,
+    ]
+    selector_result = subprocess.run(
+        selector_command,
+        cwd=ROOT_DIR,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    selector_summary_path = package_dir / "selector_package_export_summary.json"
+    selector_summary = load_json_if_exists(selector_summary_path)
+    selector_json = package_dir / "runtime_profile_label_selector.json"
+
+    frontier_summary: dict[str, object] = {}
+    frontier_result_returncode: int | None = None
+    frontier_stdout = ""
+    frontier_stderr = ""
+    if selector_result.returncode == 0 and selector_json.is_file():
+        frontier_dir = package_dir / "runtime_deployment_frontier"
+        frontier_command = [
+            sys.executable,
+            str(RUNTIME_DEPLOYMENT_FRONTIER_EXPORT_SCRIPT),
+            "--selector-json",
+            str(selector_json),
+            "--output-dir",
+            str(frontier_dir),
+        ]
+        frontier_result = subprocess.run(
+            frontier_command,
+            cwd=ROOT_DIR,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+        frontier_result_returncode = frontier_result.returncode
+        frontier_stdout = command_tail(frontier_result.stdout)
+        frontier_stderr = command_tail(frontier_result.stderr)
+        frontier_payload = load_json_if_exists(frontier_dir / "runtime_deployment_frontier.json")
+        loaded_frontier_summary = frontier_payload.get("summary", {}) if isinstance(frontier_payload, Mapping) else {}
+        frontier_summary = dict(loaded_frontier_summary) if isinstance(loaded_frontier_summary, Mapping) else {}
+
+    selector_status = str(selector_summary.get("status", "FAIL" if selector_result.returncode else "PASS"))
+    frontier_status = str(frontier_summary.get("status", "SKIPPED" if frontier_result_returncode is None else "FAIL"))
+    operator_launch_summary: dict[str, object] = {}
+    if selector_result.returncode == 0 and selector_json.is_file():
+        operator_launch_summary = run_runtime_selector_operator_launch_checks(
+            selector_json=selector_json,
+            output_dir=package_dir / "operator_view_launch_checks",
+        )
+    operator_launch_status = str(operator_launch_summary.get("status", "SKIPPED"))
+    status = (
+        "PASS"
+        if selector_result.returncode == 0 and frontier_status == "PASS" and operator_launch_status == "PASS"
+        else "FAIL"
+    )
+    return {
+        "mode": "robustness_scenario_catalog_selector_package_and_frontier",
+        "status": status,
+        "selector_export_status": selector_status,
+        "selector_export_returncode": selector_result.returncode,
+        "frontier_status": frontier_status,
+        "frontier_returncode": frontier_result_returncode,
+        "operator_launch_status": operator_launch_status,
+        "selector_package_dir": str(package_dir),
+        "selector_json": str(selector_json) if selector_json.is_file() else "",
+        "frontier_dir": str(package_dir / "runtime_deployment_frontier"),
+        "operator_launch_dir": str(package_dir / "operator_view_launch_checks"),
+        "selector_command": " ".join(selector_command),
+        "selector_stdout_tail": command_tail(selector_result.stdout),
+        "selector_stderr_tail": command_tail(selector_result.stderr),
+        "frontier_stdout_tail": frontier_stdout,
+        "frontier_stderr_tail": frontier_stderr,
+        "selector_summary": selector_summary,
+        "frontier_summary": frontier_summary,
+        "operator_launch_summary": operator_launch_summary,
+        "profile_count": selector_summary.get("profile_count", 0),
+        "deployment_label_count": selector_summary.get("deployment_label_count", 0),
+        "runtime_truth_used": bool(selector_summary.get("runtime_truth_used", False))
+        or bool(frontier_summary.get("runtime_truth_used", False))
+        or bool(operator_launch_summary.get("runtime_truth_used", False)),
+        "truth_free_runtime_selection": bool(frontier_summary.get("truth_free_runtime_selection", False)),
+        "operator_launch_check_count": operator_launch_summary.get("check_count", 0),
+        "operator_launch_pass_count": operator_launch_summary.get("pass_count", 0),
+        "axis_contract": RDF_AXIS_CONTRACT,
+        "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+        "selection_contract": selector_summary.get(
+            "selection_contract",
+            "Runtime profile selection may use only explicit deployment/scenario labels; no runtime truth.",
+        ),
     }
 
 
@@ -2587,6 +3149,9 @@ def write_summary_txt(
     catalog_minimal_profile_set_rows: Sequence[Mapping[str, object]],
     catalog_minimal_profile_set_summary: Mapping[str, object],
     deployment_strategy: Mapping[str, object],
+    coordinate_contract_summary: Mapping[str, object],
+    robustness_acceptance_matrix: Mapping[str, Mapping[str, object]],
+    runtime_label_selector_package: Mapping[str, object] | None = None,
 ) -> None:
     lines = [
         "RTK stereo robustness sweep",
@@ -2594,6 +3159,17 @@ def write_summary_txt(
         f"NED contract: {NED_AXIS_CONTRACT}",
         f"RDF contract: {RDF_AXIS_CONTRACT}",
         f"StereoDistance public topic contract: {PUBLIC_TOPIC_CONTRACT}",
+        f"Truth RDF transform contract: {coordinate_contract_summary.get('truth_rdf_transform_contract', TRUTH_RDF_TRANSFORM_CONTRACT)}",
+        (
+            "Direct NED-to-RDF axis alias forbidden: {passed} "
+            "({scenarios}/{scenario_count} scenarios, {contracts}/{contract_count} seed configs)"
+        ).format(
+            passed=coordinate_contract_summary.get("all_scenarios_forbid_direct_axis_alias", False),
+            scenarios=coordinate_contract_summary.get("scenario_direct_axis_alias_forbidden_count", 0),
+            scenario_count=coordinate_contract_summary.get("scenario_count", 0),
+            contracts=coordinate_contract_summary.get("direct_axis_alias_forbidden_count", 0),
+            contract_count=coordinate_contract_summary.get("loaded_contract_count", 0),
+        ),
         "",
         "Scenario runs:",
     ]
@@ -2875,6 +3451,43 @@ def write_summary_txt(
             "- selection_contract={contract}".format(contract=deployment_strategy.get("selection_contract", "")),
         ]
     )
+    if runtime_label_selector_package is not None:
+        lines.extend(
+            [
+                "",
+                "Runtime label selector package:",
+                "- status={status}, selector_status={selector_status}, frontier_status={frontier_status}, operator_launch_status={operator_status}".format(
+                    status=runtime_label_selector_package.get("status", ""),
+                    selector_status=runtime_label_selector_package.get("selector_export_status", ""),
+                    frontier_status=runtime_label_selector_package.get("frontier_status", ""),
+                    operator_status=runtime_label_selector_package.get("operator_launch_status", ""),
+                ),
+                "- selector_json={selector_json}".format(
+                    selector_json=runtime_label_selector_package.get("selector_json", "")
+                ),
+                "- profiles={profiles}, deployment_labels={labels}, operator_launch={launch_pass}/{launch_total}, runtime_truth_used={truth_used}".format(
+                    profiles=runtime_label_selector_package.get("profile_count", 0),
+                    labels=runtime_label_selector_package.get("deployment_label_count", 0),
+                    launch_pass=runtime_label_selector_package.get("operator_launch_pass_count", 0),
+                    launch_total=runtime_label_selector_package.get("operator_launch_check_count", 0),
+                    truth_used=runtime_label_selector_package.get("runtime_truth_used", True),
+                ),
+                "- selection_contract={contract}".format(
+                    contract=runtime_label_selector_package.get("selection_contract", "")
+                ),
+            ]
+        )
+    lines.extend(["", "Robustness acceptance matrix:"])
+    for name, item in robustness_acceptance_matrix.items():
+        evidence = item.get("evidence", {}) if isinstance(item, Mapping) else {}
+        lines.append(
+            "- {name}: status={status}, path={path}, evidence={evidence}".format(
+                name=name,
+                status=item.get("status", "") if isinstance(item, Mapping) else "",
+                path=item.get("path", "") if isinstance(item, Mapping) else "",
+                evidence=json.dumps(json_safe(evidence), sort_keys=True),
+            )
+        )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2969,6 +3582,14 @@ def main() -> int:
     catalog_minimal_profile_set_rows, catalog_minimal_profile_set_summary = choose_catalog_minimal_profile_set(
         catalog_transfer_pair_summary_rows
     )
+    scenario_coordinate_contracts = collect_scenario_coordinate_contracts(
+        output_dir=output_dir,
+        scenarios=scenarios,
+    )
+    coordinate_contract_summary = robustness_coordinate_contract_summary(
+        scenario_coordinate_contracts,
+        scenario_count=len(scenarios),
+    )
     if args.skip_near_tie_transfer:
         best_near_tie_profile = {
             "selected": False,
@@ -3007,8 +3628,11 @@ def main() -> int:
         best_near_tie_profile=best_near_tie_profile,
         best_near_tie_promotion_check=best_near_tie_promotion_check,
     )
+    robustness_acceptance_matrix: dict[str, dict[str, object]] = {}
+    robustness_acceptance_pass = False
     write_csv(output_dir / "scenario_runs.csv", run_rows)
     write_csv(output_dir / "scenario_recommendations.csv", scenario_recommendations)
+    write_csv(output_dir / "scenario_coordinate_contracts.csv", scenario_coordinate_contracts)
     write_csv(output_dir / "scenario_method_gates.csv", scenario_method_gate_rows)
     write_csv(output_dir / "robust_method_summary.csv", robust_summary)
     write_csv(output_dir / "robust_method_family_summary.csv", robust_family_summary)
@@ -3083,47 +3707,76 @@ def main() -> int:
         },
     )
     write_deployment_strategy_txt(output_dir / "deployment_strategy_recommendation.txt", deployment_strategy)
-    write_json(
-        output_dir / "robustness_summary.json",
-        {
-            "scenario_count": len(scenarios),
-            "scenarios": [
-                {
-                    "name": scenario.name,
-                    "purpose": scenario.purpose,
-                    "args": list(scenario.args),
-                }
-                for scenario in scenarios
-            ],
-            "ned_axis_contract": NED_AXIS_CONTRACT,
-            "rdf_axis_contract": RDF_AXIS_CONTRACT,
-            "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
-            "scenario_runs": run_rows,
-            "scenario_recommendations": scenario_recommendations,
-            "robust_method_summary": robust_summary,
-            "robust_method_family_summary": robust_family_summary,
-            "robust_recommendation": robust_recommendation,
-            "robust_policy_recommendations": robust_policy_rows,
-            "scenario_near_tie_profiles": scenario_near_tie_profiles,
-            "scenario_near_tie_profile_transfer_summary": scenario_near_tie_transfer_summary_rows,
-            "scenario_near_tie_method_transfer_summary": scenario_near_tie_method_summary_rows,
-            "scenario_near_tie_best_profile": best_near_tie_profile,
-            "scenario_near_tie_best_promotion_check": best_near_tie_promotion_check,
-            "robust_policy_profile_candidates": policy_profile_candidates,
-            "robust_policy_representative_profiles": policy_representative_profiles,
-            "robust_policy_profile_transfer_summary": policy_transfer_summary_rows,
-            "robust_policy_profile_transfer_diagnostics": transfer_diagnostic_summary,
-            "scenario_profile_catalog": scenario_catalog_summary,
-            "scenario_profile_catalog_promotion_checks": scenario_catalog_promotion_summary,
-            "scenario_profile_catalog_transfer_coverage": catalog_transfer_source_summary_rows,
-            "scenario_profile_catalog_minimal_set": catalog_minimal_profile_set_summary,
-            "pooled_scenario_profile_summary": pooled_profile_summary,
-            "pooled_scenario_profile_transfer_diagnostics": pooled_profile_diagnostic_summary,
-            "deployment_strategy_recommendation": deployment_strategy,
-        },
-    )
     write_json(output_dir / "scenario_profile_catalog.json", scenario_catalog_summary)
     write_json(output_dir / "scenario_profile_catalog_promotion_checks.json", scenario_catalog_promotion_summary)
+    robustness_payload = {
+        "scenario_count": len(scenarios),
+        "scenarios": [
+            {
+                "name": scenario.name,
+                "purpose": scenario.purpose,
+                "args": list(scenario.args),
+            }
+            for scenario in scenarios
+        ],
+        "ned_axis_contract": NED_AXIS_CONTRACT,
+        "rdf_axis_contract": RDF_AXIS_CONTRACT,
+        "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
+        "coordinate_contract_summary": coordinate_contract_summary,
+        "scenario_coordinate_contracts": scenario_coordinate_contracts,
+        "scenario_runs": run_rows,
+        "scenario_recommendations": scenario_recommendations,
+        "robust_method_summary": robust_summary,
+        "robust_method_family_summary": robust_family_summary,
+        "robust_recommendation": robust_recommendation,
+        "robust_policy_recommendations": robust_policy_rows,
+        "scenario_near_tie_profiles": scenario_near_tie_profiles,
+        "scenario_near_tie_profile_transfer_summary": scenario_near_tie_transfer_summary_rows,
+        "scenario_near_tie_method_transfer_summary": scenario_near_tie_method_summary_rows,
+        "scenario_near_tie_best_profile": best_near_tie_profile,
+        "scenario_near_tie_best_promotion_check": best_near_tie_promotion_check,
+        "robust_policy_profile_candidates": policy_profile_candidates,
+        "robust_policy_representative_profiles": policy_representative_profiles,
+        "robust_policy_profile_transfer_summary": policy_transfer_summary_rows,
+        "robust_policy_profile_transfer_diagnostics": transfer_diagnostic_summary,
+        "scenario_profile_catalog": scenario_catalog_summary,
+        "scenario_profile_catalog_promotion_checks": scenario_catalog_promotion_summary,
+        "scenario_profile_catalog_transfer_coverage": catalog_transfer_source_summary_rows,
+        "scenario_profile_catalog_minimal_set": catalog_minimal_profile_set_summary,
+        "pooled_scenario_profile_summary": pooled_profile_summary,
+        "pooled_scenario_profile_transfer_diagnostics": pooled_profile_diagnostic_summary,
+        "deployment_strategy_recommendation": deployment_strategy,
+        "preliminary_summary_before_selector_export": True,
+    }
+    write_json(output_dir / "robustness_summary.json", robustness_payload)
+    runtime_label_selector_package = export_runtime_label_selector_package(
+        output_dir=output_dir,
+        scenario_catalog_summary=scenario_catalog_summary,
+        baseline_scenario="nominal",
+    )
+    robustness_acceptance_matrix = build_robustness_acceptance_matrix(
+        scenario_count=len(scenarios),
+        run_rows=run_rows,
+        recommendation_rows=scenario_recommendations,
+        robust_summary_rows=robust_summary,
+        robust_recommendation=robust_recommendation,
+        policy_transfer_summary_rows=policy_transfer_summary_rows,
+        scenario_catalog_summary=scenario_catalog_summary,
+        scenario_catalog_promotion_summary=scenario_catalog_promotion_summary,
+        catalog_transfer_source_summary_rows=catalog_transfer_source_summary_rows,
+        deployment_strategy=deployment_strategy,
+        coordinate_contract_summary=coordinate_contract_summary,
+        runtime_label_selector_package=runtime_label_selector_package,
+    )
+    robustness_acceptance_pass = all(
+        item.get("status") == "PASS" for item in robustness_acceptance_matrix.values()
+    )
+    robustness_payload["runtime_label_selector_package"] = runtime_label_selector_package
+    robustness_payload["robustness_acceptance_matrix"] = robustness_acceptance_matrix
+    robustness_payload["robustness_acceptance_pass"] = robustness_acceptance_pass
+    robustness_payload["preliminary_summary_before_selector_export"] = False
+    write_json(output_dir / "robustness_summary.json", robustness_payload)
     write_summary_txt(
         output_dir / "robustness_summary.txt",
         run_rows=run_rows,
@@ -3145,6 +3798,9 @@ def main() -> int:
         catalog_minimal_profile_set_rows=catalog_minimal_profile_set_rows,
         catalog_minimal_profile_set_summary=catalog_minimal_profile_set_summary,
         deployment_strategy=deployment_strategy,
+        coordinate_contract_summary=coordinate_contract_summary,
+        robustness_acceptance_matrix=robustness_acceptance_matrix,
+        runtime_label_selector_package=runtime_label_selector_package,
     )
     print(f"wrote robustness sweep summary to {output_dir}")
     return 0 if all(bool(row["pass_run"]) for row in run_rows) else 1

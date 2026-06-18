@@ -201,6 +201,48 @@ class StereoDistanceProfileReplayTests(unittest.TestCase):
         self.assertAlmostEqual(float(predictions[0]["corrected_down_m"]), 22.0)
         self.assertAlmostEqual(float(predictions[0]["corrected_forward_m"]), 103.0)
 
+    def test_replay_rejects_ned_only_truth_without_explicit_rdf(self) -> None:
+        module = load_replay_module()
+        profile = module.EstimatedToTruthSim3Profile.from_json_dict(
+            {
+                "mode": "estimated_to_truth_sim3",
+                "profile_id": "unit-ned-only-replay",
+                "scale": 1.0,
+                "rotation_matrix_rdf": [
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                "translation_rdf_m": [0.0, 0.0, 0.0],
+            }
+        )
+        rows = [
+            {
+                "split": "validation",
+                "truth_north_m": "100.0",
+                "truth_east_m": "10.0",
+                "truth_down_ned_m": "2.0",
+                "raw_forward_m": "100.0",
+                "raw_right_m": "10.0",
+                "raw_down_m": "2.0",
+                "raw_disparity_px": "10.0",
+            }
+        ]
+
+        predictions, summary = module.replay_rows(
+            rows,
+            profile,
+            split_filter="validation",
+            target_range_m=100.0,
+            target_window_m=10.0,
+        )
+
+        self.assertEqual(predictions, [])
+        self.assertEqual(summary["evaluated_row_count"], 0)
+        self.assertEqual(summary["skipped_row_count"], 1)
+        self.assertFalse(summary["direct_ned_to_rdf_axis_alias_allowed"])
+        self.assertIn("T_source_to_stereo_rdf", summary["truth_rdf_transform_contract"])
+
     def test_replay_main_writes_outputs(self) -> None:
         module = load_replay_module()
         with tempfile.TemporaryDirectory() as tmpdir:

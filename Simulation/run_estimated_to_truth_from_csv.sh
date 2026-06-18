@@ -16,7 +16,7 @@ Runs the recorded calibration CSV promotion flow:
 Options:
   --input-csv FILE       Calibration CSV. If omitted, use the newest CSV under results/calibration_flight.
   --output-dir DIR       Output directory. Default: results/estimated_to_truth_calibration_<timestamp>
-  --target-range-m M     Target range for PASS statistics. Default: 1852.
+  --target-range-m M     Scenario target range for PASS statistics. Default: 1852.
   --target-window-m M    Half-width around target range. Default: 30.
   --min-target-count N   Minimum validation target-window rows. Default: 3.
   --strict-preflight     Stop before fitting if preflight target coverage is insufficient.
@@ -133,7 +133,7 @@ fi
 
 printf '%s\n' "Calibration CSV: $input_csv"
 printf '%s\n' "Output directory: $output_dir"
-printf '%s\n' "Target range/window: ${target_range_m} m +/- ${target_window_m} m"
+printf '%s\n' "Scenario target range/window: ${target_range_m} m +/- ${target_window_m} m"
 printf '%s\n' "Minimum target-window count: $min_target_count"
 printf '%s\n' "Command:"
 printf '  %q' "${cmd[@]}"

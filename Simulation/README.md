@@ -47,11 +47,104 @@ PX4 local position NED를 보정 비행의 ground truth로 두고, 스테레오 
 있다. 실제 Gazebo/PX4/YOLO 토픽 CSV가 아직 없어도 synthetic mode가 기본으로
 동작한다.
 
+이 저장소의 `Simulation/.venv`는 현재 별도 패키지 설치용 pip 환경이 아니라
+시스템 Python 패키지를 참조하는 lightweight venv로 사용한다. 따라서 README의
+`Simulation/.venv/bin/python` 명령은 시스템에 설치된 `numpy`, `scipy`,
+`matplotlib`, `opencv-python` 계열 패키지를 볼 수 있어야 한다. 이 환경에서는
+`Simulation/.venv/pyvenv.cfg`의 `include-system-site-packages = true` 설정으로
+검증됐고, acceptance dashboard wrapper와 deployment package check가 이 경로로
+PASS했다.
+
 좌표계 계약은 다음과 같다.
 
 - PX4 local position: `px4_local_position_ned:north,east,down`
 - 스테레오 중심 카메라 좌표: `stereo_center_opencv_optical:RDF(right,down,forward)`
-- synthetic bridge: `rdf_right=east`, `rdf_down=down`, `rdf_forward=north`
+- 평가는 항상 스테레오 중심 RDF에서 수행한다:
+  `corrected_rdf` vs `truth_rdf`.
+- `truth_rdf`는 반드시 명시적인 `T_source_to_stereo_rdf`로 생성된 값이어야 한다.
+  시뮬레이션에서도 카메라 optical frame이 local NED에 대해
+  `forward=north`, `right=east`, `down=down`으로 정렬되어 있다는 직접 축
+  alias 가정은 사용하지 않는다.
+- 실제 CSV/비행 데이터에서 PX4 NED만 있고 `truth_right_m`,
+  `truth_down_m`, `truth_forward_m` 또는 동등한 명시 변환 산출물이 없으면
+  보정 평가 입력으로 보지 않는다.
+
+허용되는 truth source는 PX4 local position NED에 한정되지 않는다. 보정/검증에는
+다음 source를 사용할 수 있다.
+
+- PX4 local position NED: source frame을 `px4_local_position_ned`로 둔
+  `T_source_to_stereo_rdf`가 필요하다.
+- RTK/GNSS world 좌표(LLH/ECEF/ENU/NED): 기준 원점과
+  `T_world_to_stereo_rdf`가 필요하다.
+- Gazebo world/model pose: Gazebo world frame과 stereo rig frame 사이
+  `T_gazebo_world_to_stereo_rdf`가 필요하다.
+- 외부 계측 장비(motion capture, total station, LiDAR tracker 등):
+  장비 frame에서 stereo-center RDF로 가는 transform이 필요하다.
+- 이미 stereo-center RDF로 발행/저장된 truth:
+  producer가 RDF `right/down/forward`와 truth point를 명시해야 한다.
+
+어떤 source를 쓰더라도 평가 입력은 동일하다.
+
+```text
+truth_source_position --T_source_to_stereo_rdf--> truth_rdf
+estimated_camera_rdf  --calibration_profile-----> corrected_rdf
+evaluation: corrected_rdf vs truth_rdf
+```
+
+source-frame truth CSV를 보정 pipeline에 넣기 전에는 명시 transform JSON으로
+`truth_right_m`, `truth_down_m`, `truth_forward_m`을 생성한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/convert_truth_source_to_stereo_rdf.py \
+  --input-csv Simulation/results/calibration_flight/telemetry_ned_only.csv \
+  --output-csv Simulation/results/calibration_flight/telemetry_with_truth_rdf.csv \
+  --transform-json Simulation/config/truth_source_to_stereo_rdf.example.json \
+  --strict
+```
+
+transform JSON은 source frame, source axis order, source field, origin, rotation, translation을
+명시해야 한다. 예시는 다음과 같다.
+
+```json
+{
+  "source_frame": "px4_local_position_ned",
+  "source_axis_order": ["north", "east", "down"],
+  "source_fields": ["truth_north_m", "truth_east_m", "truth_down_ned_m"],
+  "origin_source_m": [0.0, 0.0, 0.0],
+  "rotation_euler_zyx_deg_source_to_stereo_rdf": [12.0, -3.0, 1.5],
+  "translation_rdf_m": [0.0, 0.0, 0.0]
+}
+```
+
+`rotation_matrix_source_to_stereo_rdf`를 3x3 행렬로 제공해도 된다. 이 transform은
+카메라 optical frame과 local/world frame의 실제 외부표정 또는 별도 보정 산출물이어야
+하며, NED와 RDF 축을 이름만 바꿔 대응시키는 직접 alias는 허용하지 않는다.
+변환 도구는 NED source에서 `rdf_right=east`, `rdf_down=down`,
+`rdf_forward=north`가 되는 순열 행렬을 입력하면 실패한다.
+
+CSV 없이 transform 파일만 먼저 검증하려면:
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/convert_truth_source_to_stereo_rdf.py \
+  --transform-json Simulation/config/truth_source_to_stereo_rdf.example.json \
+  --validate-only
+```
+
+end-to-end wrapper에서도 같은 변환을 바로 연결할 수 있다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_estimated_to_truth_calibration_exp.py \
+  --mode csv \
+  --input-csv Simulation/results/calibration_flight/telemetry_ned_only.csv \
+  --truth-transform-json Simulation/config/truth_source_to_stereo_rdf.example.json \
+  --output-dir Simulation/results/rtk_stereo_calibration_from_csv \
+  --strict-preflight
+```
+
+이 경우 wrapper는 `truth_rdf_conversion/input_with_truth_rdf.csv`를 먼저 만들고,
+그 변환된 CSV를 preflight와 fitting pipeline에 전달한다. 원본 source-frame CSV와
+변환 summary는 `metrics.json`의 `calibration_truth_source_input_csv`,
+`pipeline_input_csv`, `truth_rdf_conversion`에 함께 기록된다.
 
 보정 후보는 모두 RDF 배열 순서 `[Right, Down, Forward]`에서 학습/평가된다.
 legacy `x/y/z` 필드는 쓰지 않고 CSV에는 `*_right_m`, `*_down_m`,
@@ -139,7 +232,15 @@ StereoDistance loader 호환성과 runtime truth 입력 금지를 확인한다.
 `representative_cross_seed_replay_summary.csv/json`은 동일한 대표 profile을
 모든 완료 seed의 validation split에 다시 replay해, 특정 seed에만 맞는
 profile인지 아니면 seed 전체에서 raw 대비 개선과 1852m 조건을 통과하는지
-검증한다.
+검증한다. `multi_seed_summary.json/txt`에는 `multi_seed_acceptance_matrix`도
+포함된다. 이 matrix는 `seed_runs.csv`, `method_aggregate_summary.csv`,
+`policy_stability_gate.csv`, `method_stability_gate.csv`,
+`multi_seed_recommendation.json`, `multi_seed_recommended_profiles.csv`,
+`representative_profile_checks.json`,
+`representative_cross_seed_replay_summary.csv`가 각각 seed coverage, raw 대비
+validation 개선, 1852m target error, 추천 후보 존재, runtime profile 존재,
+StereoDistance promotion check, cross-seed replay 조건을 통과했는지 PASS/FAIL과
+증거 metric으로 기록한다.
 
 오차 주입 조건을 바꿔도 같은 보정 계열이 유지되는지 보려면 robustness
 sweep을 실행한다. 이 sweep은 multi-seed 검증을 여러 synthetic error
@@ -333,6 +434,21 @@ ridge/Tikhonov 후보도 포함된다. 이 후보는 baseline/focal scale 오차
 `single_pooled_runtime_profile`을 권장한다. 단일 profile 계열이 모두 깨지지만
 scenario별 catalog가 cross-seed replay와 promotion check를 통과하면
 `scenario_profile_catalog`를 권장한다.
+`robustness_summary.json/txt`에는 `robustness_acceptance_matrix`도 포함된다.
+이 matrix는 `scenario_runs.csv`, `scenario_recommendations.csv`,
+`robust_method_summary.csv`, `robust_policy_profile_transfer_summary.csv`,
+`scenario_profile_catalog.json`,
+`scenario_profile_catalog_promotion_checks.json`,
+`scenario_profile_catalog_transfer_coverage.csv`,
+`deployment_strategy_recommendation.json`이 각각 scenario coverage, scenario별
+추천 존재, cross-scenario method pass, policy profile transfer, scenario catalog,
+StereoDistance promotion, catalog transfer coverage, 최종 deployment strategy
+조건을 통과했는지 PASS/FAIL과 증거 metric으로 기록한다.
+cross-scenario robust recommendation은 strict/performance pass 후보 중에서도
+RDF right/down/forward 축별 RMSE regression sum이 `0`인 후보를 먼저 고른다.
+range RMSE나 1852m error가 낮아도 RDF 축별 non-regression을 깨는 후보는
+axis-clean 후보가 하나라도 있으면 robust recommendation에서 제외되고, acceptance
+matrix의 `robust_recommendation` evidence에도 `rdf_axis_nonregression_pass`가 기록된다.
 
 StereoDistance는 런타임에 단일 profile JSON을 읽으므로, catalog에서 현재
 환경 profile을 명시적으로 선택해 active profile로 복사한 뒤 사용한다.
@@ -1829,6 +1945,529 @@ target max abs `13.786m`였고, EXP-196의 forward-only fusion도 `47/50`, targe
 causal alpha-beta fusion은 runtime stabilizer 후보로는 의미가 있지만, 현재
 `bbox_outlier_stress`의 final PASS 방법은 아니다.
 
+EXP-198~199는 outlier가 생기는 더 앞단인 image-space `left_u_px`, `left_v_px`,
+`measured_disparity_px`를 causal alpha-beta로 prefilter한 뒤 measured-camera RDF로
+재삼각측량하고 runtime profile을 적용한 probe이다. 실행 예시는 다음과 같다.
+
+```bash
+python3 Simulation/scripts/run_runtime_image_prefilter_sweep.py \
+  --experiment-id EXP-YYYYMMDD-NNN-bbox-outlier-causal-image-prefilter \
+  --profile-json Simulation/reports/experiments/EXP-YYYYMMDD-NNN-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json \
+  --output-dir Simulation/reports/experiments/EXP-YYYYMMDD-NNN-bbox-outlier-causal-image-prefilter \
+  --scenario bbox_outlier_stress \
+  --seed-start 20297659 \
+  --trial-count 50 \
+  --sample-count 1680 \
+  --train-ratio 0.75 \
+  --target-oversample-count 72
+```
+
+좌표 계약은 image pixel `u/v/disparity`를 필터링한 뒤 camera intrinsics/baseline으로
+stereo-center RDF `right/down/forward`를 재구성하고, calibration/evaluation truth는
+PX4 local NED에서 RDF로 변환해 audit에만 사용한다. EXP-198의 작은 disparity clip은
+정상 range sweep까지 왜곡해 전체 `0/50` 실패를 만들었다. EXP-199의 wide-clip sanity
+check에서 no-op-like 설정은 base profile의 `39/50`, target max `18.836m`를 재현했고,
+best guarded image prefilter는 `46/50`, target max `15.397m`에 그쳤다. 따라서 직접
+pixel/disparity alpha-beta prefilter도 final PASS 방법은 아니며, 다음 후보는
+inverse-depth-domain filtering이나 detector confidence 기반 gate로 분리한다.
+
+EXP-200은 disparity를 직접 clip하지 않고 `disparity/(fx*baseline)` inverse-depth
+도메인에서 causal alpha-beta prefilter를 적용한 probe이다. 결과적으로 best setting은
+사실상 inverse-depth no-clip(`id999`)과 mild image-center smoothing이었고 `46/50`,
+target max abs `15.397m`였다. 실제 inverse-depth clipping은 strict target gate를
+개선하지 못했다. 따라서 현재 synthetic bbox-outlier 실패는 disparity/inverse-depth
+값의 단순 smoothing보다 detector confidence, association 품질 신호, 반복 독립 관측,
+또는 false association을 명시적으로 reject하는 모델이 필요한 문제로 남긴다.
+
+EXP-201은 이 가설 중 반복 독립 관측을 검증한 probe이다. 같은 timestamp/truth에서
+여러 독립 `left_u_px`, `left_v_px`, `measured_disparity_px` 관측을 생성하고
+median 또는 trimmed mean으로 합성한 뒤 measured-camera RDF로 재삼각측량하고 runtime
+profile을 적용했다. 실행 예시는 다음과 같다.
+
+```bash
+python3 Simulation/scripts/run_runtime_repeated_observation_fusion_sweep.py \
+  --experiment-id EXP-YYYYMMDD-NNN-bbox-outlier-repeated-observation-fusion \
+  --profile-json Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json \
+  --output-dir Simulation/reports/experiments/EXP-YYYYMMDD-NNN-bbox-outlier-repeated-observation-fusion \
+  --scenario bbox_outlier_stress \
+  --seed-start 20297659 \
+  --trial-count 50 \
+  --sample-count 1680 \
+  --train-ratio 0.75 \
+  --target-oversample-count 72 \
+  --repeat-counts 1,3,5,7 \
+  --fusion-modes median,trimmed_mean
+```
+
+결과는 반복 독립 관측이 bbox-outlier 관측가능성 문제를 실제로 깬다는 것을 보였다.
+단일 반복 관측 `n=1`은 `43/50`, target max `16.990m`로 실패했지만, `n=3 median`은
+`50/50` STRICT_PASS, range RMSE mean `0.524m`, target max abs `2.650m`였다. 가장
+강한 target-worst 결과는 `n=7 median`으로 `50/50`, range RMSE mean `0.347m`,
+position RMSE mean `0.365m`, target max abs `2.150m`였다. 이 방법은 runtime truth를
+사용하지 않지만, 실제 StereoDistance 적용에는 같은 timestamp 또는 짧은 burst 안에서
+독립적인 bbox/disparity 관측을 여러 개 확보해야 한다.
+
+실제 StereoDistance 런타임 연결에는
+`stereo_ground_sim.runtime_deployment_selector.RepeatedObservationFusion`을 사용한다.
+입력은 같은 timestamp 또는 짧은 burst의 `left_u_px`, `left_v_px`,
+`measured_disparity_px` 관측 목록이며, 출력은 기존 runtime profile/selector가 받는
+`RuntimeMeasurementSample`이다. 이 변환의 좌표 계약은 left image pixel/disparity에서
+camera intrinsics/baseline으로 stereo-center RDF `right/down/forward`를 재구성하는
+것이다. public `/stereo/estimated_position`의 FRD+range 배열은 이 단계의 입력이
+아니며, PX4/RTK truth와 validation/replay metric도 runtime 입력으로 쓰지 않는다.
+EXP-201 기준 최소 실용 설정은 `min_observations=3`, `mode="median"`이고, 더 낮은
+target-worst error가 필요하면 `min_observations=7`, `mode="median"`을 후보로 둔다.
+
+EXP-202는 같은 seed block에서 repeat count를 `1/3/5/7/9/11/15`로 넓히고
+`median`, `trimmed_mean`, `mean`을 비교했다. best는
+`repeated_observation_trimmed_mean_n15_trim0p2`로 `50/50` STRICT_PASS,
+range RMSE mean/max `0.221/0.272m`, position RMSE mean/max `0.248/0.293m`,
+1852m target max abs worst `1.152m`였다. `n15 median`도 `50/50`,
+target max abs worst `1.226m`로 거의 같은 수준이었다. 따라서 반복 관측 branch의
+현재 결론은 다음과 같다. 실제 처리량이나 latency 제약이 크면 `n=3 median`을 최소
+실용 baseline으로 두고, 짧은 burst 안에서 15개 독립 관측을 확보할 수 있으면
+`n=15 trimmed_mean`을 bbox-outlier 대응 best-quality 후보로 둔다. `mean`도 n15에서는
+PASS였지만 target worst `2.132m`로 robust fusion보다 약하므로 우선순위는 낮다.
+
+EXP-203~205는 `n=15 trimmed_mean`의 trim fraction 민감도를 확인했다. `trim=0.1`,
+`0.3`, `0.4` 모두 `50/50` STRICT_PASS였지만, EXP-202의 `trim=0.2`가 range RMSE
+mean `0.221m`와 target max abs worst `1.152m`로 가장 낮았다. 따라서 현재
+best-quality runtime observation fusion 설정은 `min_observations=15`,
+`mode="trimmed_mean"`, `trim_fraction=0.2`로 유지한다.
+
+EXP-206~207은 같은 `trim=0.2`로 관측 수를 더 늘린 saturation check이다.
+`n=21 trimmed_mean`은 `50/50` STRICT_PASS, range RMSE mean/max `0.194/0.229m`,
+target max abs worst `0.927m`였고, `n=31 trimmed_mean`은 `50/50` STRICT_PASS,
+range RMSE mean/max `0.169/0.199m`, position RMSE mean/max `0.202/0.226m`,
+target max abs worst `0.886m`였다. 즉 synthetic independent-observation 조건에서는
+관측 수를 늘릴수록 성능이 계속 좋아진다. 다만 실제 StereoDistance에서는 같은 timestamp
+또는 짧은 burst 안의 latency, target motion blur, detector correlation 때문에 무작정
+큰 n을 기본값으로 둘 수 없다. 현재 runtime tier는 `n=3 median`을 최소 실용 baseline,
+`n=15 trimmed_mean`을 balanced high-quality 후보, `n=31 trimmed_mean`을 latency를
+허용하는 offline/slow-burst best-quality 후보로 둔다.
+
+EXP-208~209는 더 큰 관측 수 `n=51/75`의 high-count check이다. `n=51 trimmed_mean`은
+range RMSE mean/max `0.146/0.162m`, target max abs worst `0.803m`였고,
+`n=75 trimmed_mean`은 range RMSE mean/max `0.132/0.154m`, position RMSE mean/max
+`0.172/0.189m`, target max abs worst `0.614m`였다. 이 결과는 반복 관측이 현재
+bbox-outlier synthetic model에서 거의 averaging-law처럼 동작한다는 것을 보여준다.
+하지만 실제 런타임 기본값은 독립성이 검증된 detector/burst pipeline의 frame rate와
+target motion 조건으로 결정해야 한다. 따라서 `n=75`는 현재 synthetic 최고 성능
+상한으로 기록하고, 실시간 후보는 여전히 `n=3`, `n=15`, `n=31` tier를 우선 검토한다.
+
+EXP-210은 반복 관측의 핵심 가정인 독립성을 깨고, 같은 timestamp/burst 안의
+`left_u_px`, `left_v_px`, `measured_disparity_px` 관측들이 공통 noise/outlier 성분을
+공유하는 경우를 평가했다. 실행은 다음과 같다.
+
+```bash
+python3 Simulation/scripts/run_runtime_correlated_repeated_observation_sweep.py \
+  --experiment-id EXP-YYYYMMDD-NNN-bbox-outlier-correlated-repeated-observation \
+  --profile-json Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json \
+  --output-dir Simulation/reports/experiments/EXP-YYYYMMDD-NNN-bbox-outlier-correlated-repeated-observation \
+  --scenario bbox_outlier_stress \
+  --seed-start 20297659 \
+  --trial-count 50 \
+  --sample-count 1680 \
+  --train-ratio 0.75 \
+  --target-oversample-count 72 \
+  --repeat-counts 15,31 \
+  --fusion-modes trimmed_mean \
+  --trim-fraction 0.2 \
+  --common-fractions 0,0.25,0.5,0.75,1
+```
+
+결과는 반복 관측 fusion의 적용 조건을 좁혀준다. common fraction `0`에서는 `n=15`,
+`n=31` 모두 `50/50` STRICT_PASS였지만, common fraction `0.25`부터는 strict PASS가
+깨졌다. `n=31 common0.25`는 pass `46/50`, target max abs worst `16.586m`,
+`n=31 common0.75`는 pass `49/50`, target max abs worst `13.024m`였다. 즉 여러
+관측을 모아도 같은 false association 또는 같은 detector bias를 공유하면 target max
+gate를 보장하지 못한다. 실제 StereoDistance 적용 요구사항은 단순 repeat count가
+아니라 “독립 관측”이다. 같은 프레임 crop을 여러 번 후처리하는 반복은 충분하지 않고,
+서로 다른 detector augmentation, 시간적으로 분리된 frame, tracker association
+confidence, epipolar/size/kinematic consistency gate 등으로 common-mode outlier를
+줄여야 한다.
+
+EXP-211~212는 EXP-210의 common-mode 실패를 줄이기 위해 같은 총 관측 수를 하나의
+burst에 몰아넣지 않고 여러 burst로 나눈 뒤 계층적으로 fusion했다. burst 내부는
+`trimmed_mean`, burst 사이 outer fusion은 `median`을 사용했다. 실행 예시는 다음과
+같다.
+
+```bash
+python3 Simulation/scripts/run_runtime_multiburst_observation_fusion_sweep.py \
+  --experiment-id EXP-YYYYMMDD-NNN-bbox-outlier-multiburst-common1-confirmation \
+  --profile-json Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json \
+  --output-dir Simulation/reports/experiments/EXP-YYYYMMDD-NNN-bbox-outlier-multiburst-common1-confirmation \
+  --scenario bbox_outlier_stress \
+  --seed-start 20297659 \
+  --trial-count 50 \
+  --sample-count 1680 \
+  --train-ratio 0.75 \
+  --target-oversample-count 72 \
+  --burst-specs 3x5,5x5 \
+  --inner-modes trimmed_mean \
+  --outer-modes median \
+  --trim-fraction 0.2 \
+  --common-fractions 1
+```
+
+EXP-211의 12-seed early probe에서 단일 burst `1x15`는 common0.5/1.0에서 실패했지만,
+`3x5`와 `5x5`는 common1.0에서도 `12/12` STRICT_PASS였다. EXP-212의 50-seed 확인도
+같은 결론이다. `3x5`는 `50/50` STRICT_PASS, range RMSE mean/max `0.525/0.733m`,
+position RMSE mean/max `0.538/0.742m`, target max abs worst `4.193m`였다. `5x5`도
+`50/50` STRICT_PASS이고 aggregate RMSE는 더 낮았지만 target max abs worst는
+`7.513m`로 `3x5`보다 나빴다. 따라서 common-mode outlier 대응 추천은 target gate
+중심이면 `3 bursts x 5 observations` + inner trimmed mean + outer median이고,
+aggregate RMSE 중심이면 `5x5`도 후보로 둔다. 실제 StereoDistance에서는 burst 간
+시간 간격이 target motion으로 인한 geometry change를 만들지 않을 만큼 짧아야 하고,
+동시에 detector/crop common-mode failure는 재샘플링될 만큼 독립적이어야 한다.
+
+실제 StereoDistance 런타임에서 EXP-212 구조를 쓰려면
+`stereo_ground_sim.runtime_deployment_selector.MultiBurstObservationFusion`을 사용한다.
+입력은 burst별 `left_u_px`, `left_v_px`, `measured_disparity_px` row group이고,
+출력은 `RuntimeMeasurementSample`이다. 권장 target-gate 설정은
+`min_bursts=3`, `min_observations_per_burst=5`, `inner_mode="trimmed_mean"`,
+`outer_mode="median"`, `trim_fraction=0.2`이다. 이 adapter는 public
+`/stereo/estimated_position` FRD 배열을 입력으로 받지 않고, pixel/disparity를
+camera intrinsics/baseline으로 stereo-center RDF `right/down/forward`로 재구성한다.
+생성된 `RuntimeMeasurementSample`은 기존 runtime profile apply payload 또는
+`RuntimeFeatureWindow.add()`에 그대로 넘긴다. 단일 burst 안에서도 관측 독립성이
+확실하면 `RepeatedObservationFusion`을 쓸 수 있지만, 같은 detector/crop 실패가
+반복될 위험이 있으면 multi-burst adapter를 우선한다.
+
+현재 observation-fusion 배포 tier를 JSON/CSV/TXT manifest로 묶으려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/export_observation_fusion_runtime_manifest.py \
+  --root-dir . \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_manifest
+```
+
+생성 산출물은 다음과 같다.
+
+- `observation_fusion_runtime_manifest.json`: runtime adapter class와 설정,
+  evidence metric, 좌표 계약을 포함한 machine-readable manifest.
+- `observation_fusion_runtime_manifest.csv`: tier별 PASS/metric 비교표.
+- `observation_fusion_runtime_manifest_summary.txt`: 사람이 읽는 요약.
+
+EXP-213은 같은 observation-fusion 계열을 small-drone range/camera geometry로 옮긴
+검증이다. close scenario는 2m baseline, 4x FOV, 20-120m range, 50m target window를
+사용했고, mid scenario는 5m baseline, 8x FOV, 80-350m range, 180m target window를
+사용했다. 실행은 다음과 같다.
+
+```bash
+python3 Simulation/scripts/run_runtime_small_drone_observation_fusion_sweep.py \
+  --experiment-id EXP-YYYYMMDD-NNN-small-drone-observation-fusion \
+  --output-dir Simulation/reports/experiments/EXP-YYYYMMDD-NNN-small-drone-observation-fusion \
+  --trial-count 50 \
+  --sample-count 360 \
+  --target-oversample-count 32 \
+  --burst-specs 1x3,3x3,3x5 \
+  --inner-modes median \
+  --outer-modes median \
+  --correction-modes fusion_only,sim3,affine_ridge \
+  --common-fractions 0,1
+```
+
+결론은 두 갈래다. `fusion_only`는 close/mid 모두 실패했으므로 small-drone 보정법으로
+단독 사용하지 않는다. 반면 `1x3 median + calibration-time Sim3`는 두 scenario에서
+각각 `50/50` STRICT_PASS였고 runtime truth를 쓰지 않았다. close range RMSE는
+`0.2775 -> 0.0623m`, mid range RMSE는 `0.6143 -> 0.0953m`였으며 target max abs는
+각각 `0.160m`, `0.301m`였다. 더 많은 관측을 쓸 수 있으면 `3x5 median + affine_ridge`
+가 품질 우선 후보이며 close/mid range RMSE를 각각 `0.0337m`, `0.0524m`까지 낮췄다.
+실제 배포 전에는 small-drone profile export와 camera/body extrinsic 검증이 필요하다.
+
+초기 manifest의 default recommendation은 `common_mode_target_gate`였고, 이후 fresh
+deployment package의 default recommendation은 `fresh_common_mode_b5x5_aggregate_best`였다.
+EXP-215 full follow-up 이후 최신 fresh deployment package의 default recommendation은
+`fresh_common_mode_b7x3_aggregate_best`이다. 이 tier는 bbox, combined sensor,
+disparity noise, intrinsic-identity stress 전체의 method aggregate를 근거로 고른
+7x3 multi-burst 후보다. 이유는 실제
+detector/crop/disparity error가 짧은 burst 안에서 상관될 수 있다고 보고, 단일 scenario
+best나 독립 반복 관측보다 all-scenario aggregate common-mode 대응을 우선하기 때문이다.
+관측 독립성이 별도 검증되면 `fresh_independent_n7_low_latency` 같은 반복 관측 tier로
+전환할 수 있다. manifest도 runtime truth를 사용하지 않으며, 입력 계약은 image
+`u/v/disparity`, 출력 계약은 stereo-center RDF이다.
+
+ROS2/StereoDistance runtime node에서 manifest를 직접 읽어 adapter를 만들려면 다음
+loader를 사용한다.
+
+```python
+from stereo_ground_sim.runtime_deployment_selector import (
+    RuntimeFeatureWindow,
+    load_observation_fusion_adapter_from_manifest,
+)
+
+adapter, tier = load_observation_fusion_adapter_from_manifest(
+    "Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json"
+)
+
+# default tier는 MultiBurstObservationFusion이므로 burst별 row group을 넣는다.
+sample = adapter.fuse_row_groups(
+    [
+        burst0_rows,  # each row has left_u_px, left_v_px, measured_disparity_px
+        burst1_rows,
+        burst2_rows,
+        burst3_rows,
+        burst4_rows,
+        burst5_rows,
+        burst6_rows,
+    ]
+)
+if sample is not None:
+    feature_window = RuntimeFeatureWindow()
+    feature_window.add(sample)
+```
+
+`tier="fresh_independent_n7_low_latency"`처럼 tier 이름을 지정하면 독립 반복 관측용
+`RepeatedObservationFusion`을 로드할 수 있다. 이 loader는 adapter 설정만 만들며,
+public `/stereo/estimated_position` FRD 배열이나 PX4/RTK truth를 observation-fusion
+입력으로 받지 않는다.
+
+manifest의 모든 tier가 실제 runtime adapter로 로드되고 RDF smoke reconstruction을
+통과하는지 확인하려면 다음 audit을 실행한다.
+
+```bash
+python3 Simulation/scripts/audit_observation_fusion_runtime_manifest.py \
+  --manifest-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_manifest/audit
+```
+
+현재 audit 결과는 `12/12 PASS`이다. `RepeatedObservationFusion` tier들은 synthetic
+RDF smoke sample을 수치 오차 수준으로 복원했고, `MultiBurstObservationFusion` tier들은
+inner/outer fusion offset 때문에 max axis error가 tolerance `0.2m` 안에
+들었다. audit 산출물은 `observation_fusion_runtime_manifest_audit.csv/json` 및
+`observation_fusion_runtime_manifest_audit_summary.txt`이다.
+
+CSV observation 로그에 manifest를 적용해 runtime RDF sample CSV를 만들려면 다음
+apply bridge를 사용한다.
+
+```bash
+python3 Simulation/scripts/apply_observation_fusion_runtime_manifest.py \
+  --manifest-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/profile_apply_smoke/synthetic_multiburst_observations.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_manifest/apply_smoke
+```
+
+입력 CSV 계약은 `group_id`, 선택적 `burst_id`, `left_u_px`, `left_v_px`,
+`measured_disparity_px`이다. default `fresh_common_mode_b7x3_aggregate_best` tier는
+`MultiBurstObservationFusion`이므로 `burst_id`로 burst를 나눈다. `tier`를
+`fresh_independent_n7_low_latency`처럼 반복 관측 tier로 지정하면 `burst_id` 없이
+`group_id`별 row 묶음을 `RepeatedObservationFusion`으로 처리한다. 출력
+`observation_fusion_runtime_samples.csv`는 `group_id`별 stereo-center RDF
+`raw_right_m/raw_down_m/raw_forward_m/raw_range_m`와 fused image/disparity 값을 저장한다.
+smoke 결과는 `valid_samples 1/1`, default tier `fresh_common_mode_b7x3_aggregate_best`,
+RDF `right=3.981m`, `down=1.500m`, `forward=800.011m`였다.
+
+observation fusion 입력 CSV 자체의 axis/schema 계약을 먼저 검증하려면 다음 validator를
+실행한다.
+
+```bash
+python3 Simulation/scripts/validate_observation_fusion_runtime_input_schema.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_manifest/apply_smoke/synthetic_multiburst_observations.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_manifest/apply_smoke/input_schema_validation \
+  --require-burst-id
+```
+
+이 gate는 필수 field `group_id`, `left_u_px`, `left_v_px`,
+`measured_disparity_px`, multiburst용 `burst_id`, finite numeric value, 양수 disparity,
+PX4/RTK truth field 부재를 검사한다. package smoke의 input validation은 `PASS`,
+row count `15`, group count `1`, burst count `3`이다. 좌표 계약은 image
+`u/v/disparity` 입력이며, 출력은 stereo-center RDF 재구성 준비 상태이다.
+
+ROS2 topic과 CSV 경계의 좌표 계약을 manifest로 저장하려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/export_observation_fusion_topic_contract_manifest.py \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package/topic_contract
+```
+
+출력은 `observation_fusion_topic_contract_manifest.json/csv` 및
+`observation_fusion_topic_contract_manifest_summary.txt`이다. 기본 계약은
+`/fmu/out/vehicle_local_position`과 `/ground_truth_position`을 calibration/validation
+truth로만 표시하고, runtime input은 좌/우 image, 좌/우 bbox, positive measured
+disparity로 제한한다. 내부 measurement frame은 stereo-center RDF
+`right/down/forward`, public StereoDistance topic frame은 FRD+range
+`forward/right/down/range`이다.
+
+좌/우 YOLO BBox 또는 synthetic BBox 중심을 observation-fusion 입력 계약으로 바꾸려면
+다음 bridge를 사용한다.
+
+```bash
+python3 Simulation/scripts/convert_stereo_bbox_observations_to_fusion_input.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_package/bbox_conversion_smoke/synthetic_stereo_bbox_observations.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package/bbox_conversion_smoke
+```
+
+입력은 `left_bbox_cx_px/left_bbox_cy_px`, `right_bbox_cx_px/right_bbox_cy_px`
+또는 `left_bbox_xmin_px/.../xmax/ymax`, `right_bbox_xmin_px/.../xmax/ymax`를 받는다.
+`measured_disparity_px`가 있으면 그대로 쓰고, 없으면 `left_u_px - right_u_px`로
+계산한다. 출력 `observation_fusion_bbox_converted_input.csv`는 `group_id`,
+선택적 `burst_id`, `left_u_px`, `left_v_px`, `measured_disparity_px`를 저장하므로
+그대로 input schema validator와 manifest apply bridge에 넣을 수 있다. package smoke의
+bbox conversion은 `PASS`, input row `15`, output row `15`, failure count `0`이고,
+변환된 CSV의 input schema validation도 `PASS`이다. 이 bridge도 PX4/RTK truth field를
+runtime 입력으로 받지 않는다.
+
+deployment package smoke는 변환된 BBox CSV를 실제 observation fusion adapter와
+runtime profile에도 그대로 넣어 본다. `observation_fusion_bbox_runtime_samples.csv`는
+변환된 BBox 중심에서 재구성한 raw stereo-center RDF를 저장하고,
+`observation_fusion_bbox_corrected_runtime_samples.csv`는 corrected RDF 및 public
+FRD+range alias를 저장한다. 현재 bbox-converted end-to-end path는 raw apply valid
+sample `1/1`, profile apply valid output `1/1`, output schema validation `PASS`이다.
+
+보정 비행 recorder CSV처럼 truth와 runtime 관측이 한 파일에 함께 들어 있는 경우에는
+runtime observation input만 추출하는 bridge를 먼저 실행한다.
+
+```bash
+python3 Simulation/scripts/extract_observation_fusion_input_from_calibration_csv.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_package/calibration_csv_bridge_smoke/synthetic_calibration_recorder_rows.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package/calibration_csv_bridge_smoke
+```
+
+이 bridge는 `truth_*`, `px4_*`, `rtk_*` 계열 column을 runtime output에서 제거하고,
+좌/우 bbox 또는 `left_cx_px/left_cy_px`, `right_cx_px/right_cy_px`,
+`measured_disparity_px`만 사용해 `observation_fusion_calibration_runtime_input.csv`를
+만든다. package smoke에서는 truth column `5`개를 drop했고, 추출 output row `15/15`,
+input schema validation `PASS`, raw apply valid sample `1/1`, profile apply valid
+output `1/1`, output schema validation `PASS`였다. 즉 calibration-time truth는
+검증용 CSV에 남아 있어도 runtime observation path에는 전달되지 않는다.
+
+deployment package는 세 runtime 입력 경로의 출력 동등성도 검사한다. 기준 CSV는
+synthetic `u/v/disparity` path의 `observation_fusion_corrected_runtime_samples.csv`이고,
+비교 대상은 BBox-converted path와 calibration-extracted path의 corrected runtime CSV이다.
+현재 `observation_fusion_path_equivalence.txt` 결과는 tolerance `1e-9`에서 `PASS`이며,
+raw RDF, corrected RDF, public FRD+range, image `u/v`, measured disparity의 max delta가
+모두 `0.0`이다.
+
+observation fusion 뒤에 기존 StereoDistance runtime correction profile까지 한 번에
+적용하려면 다음 end-to-end bridge를 사용한다.
+
+```bash
+python3 Simulation/scripts/apply_observation_fusion_with_runtime_profile.py \
+  --manifest-json Simulation/results/observation_fusion_runtime_deployment_manifest/observation_fusion_runtime_manifest.json \
+  --profile-json Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_manifest/apply_smoke/synthetic_multiburst_observations.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_manifest/profile_apply_smoke
+```
+
+출력 `observation_fusion_corrected_runtime_samples.csv`는 raw stereo-center RDF와
+corrected stereo-center RDF를 함께 저장한다. 또한 ROS topic 발행에 바로 쓸 수 있도록
+public StereoDistance FRD+range alias도 함께 저장한다. 내부 RDF field는
+`raw_right_m/raw_down_m/raw_forward_m` 및
+`corrected_right_m/corrected_down_m/corrected_forward_m`이고, public topic alias는
+`raw_public_forward_m/raw_public_right_m/raw_public_down_m/raw_public_range_m` 및
+`corrected_public_forward_m/corrected_public_right_m/corrected_public_down_m/corrected_public_range_m`이다.
+smoke 결과는 `valid_fused_samples 1/1`, `valid_profile_outputs 1/1`, profile fallback
+level `0`이었다. 예시 raw RDF는 `right=3.997m`, `down=1.497m`, `forward=800.000m`이고
+corrected RDF는 `right=6.656m`, `down=2.624m`, `forward=799.305m`이다. 같은 row의
+corrected public alias는 `[forward,right,down,range]=[799.305,6.656,2.624,799.337]`이다.
+이 단계도 runtime truth를 사용하지 않는다.
+
+corrected runtime CSV를 실제 public topic payload로 분리하려면 다음 exporter를 사용한다.
+
+```bash
+python3 Simulation/scripts/export_observation_fusion_public_topic_payload.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_package/profile_apply_smoke/observation_fusion_corrected_runtime_samples.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package/public_topic_payload
+```
+
+출력 `observation_fusion_public_topic_payload.csv`는 `/stereo/corrected_position`에
+실을 `std_msgs/msg/Float32MultiArray` payload를 `forward,right,down,range` 순서로 저장한다.
+현재 smoke payload는
+`[799.3053304217467,6.656288291423835,2.623733437361108,799.3373514302873]`이고,
+public topic payload export는 `PASS`, payload row count `1`이다.
+
+publish 직전 payload CSV 계약을 별도로 검증하려면 다음 validator를 실행한다.
+
+```bash
+python3 Simulation/scripts/validate_observation_fusion_public_topic_payload.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_package/public_topic_payload/observation_fusion_public_topic_payload.csv \
+  --source-csv Simulation/results/observation_fusion_runtime_deployment_package/profile_apply_smoke/observation_fusion_corrected_runtime_samples.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package/public_topic_payload
+```
+
+이 validator는 topic `/stereo/corrected_position`, message type
+`std_msgs/msg/Float32MultiArray`, axis order `forward,right,down,range`, payload JSON
+배열 순서, range 일관성, runtime truth flag를 검사한다. `--source-csv`를 함께 주면
+payload 값이 source corrected CSV의 `corrected_public_*` alias와 같은지도 확인한다.
+현재 public topic payload validation은 `PASS`, source equivalence도 `PASS`, row count
+`1`, failure count `0`이다.
+
+payload CSV를 ROS2 publisher 직전 단계까지 재생하려면 다음 dry-run을 실행한다.
+
+```bash
+python3 Simulation/scripts/publish_observation_fusion_public_topic_payload.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_package/public_topic_payload/observation_fusion_public_topic_payload.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package/public_topic_payload \
+  --dry-run \
+  --once
+```
+
+현재 dry-run은 payload count `1`, status `PASS`이고
+`[799.3053304217467, 6.656288291423835, 2.623733437361108, 799.3373514302873]`를
+`/stereo/corrected_position` payload로 확인했다. 실제 ROS2 환경에서 발행하려면
+`--dry-run`을 빼고 같은 명령을 실행한다. 이 publisher도 payload CSV의
+`Float32MultiArray[forward,right,down,range]` 계약을 검증한 뒤 발행한다.
+
+end-to-end output CSV의 axis/schema 계약을 검증하려면 다음 validator를 실행한다.
+
+```bash
+python3 Simulation/scripts/validate_observation_fusion_runtime_output_schema.py \
+  --input-csv Simulation/results/observation_fusion_runtime_deployment_manifest/profile_apply_smoke/observation_fusion_corrected_runtime_samples.csv \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_manifest/profile_apply_smoke/schema_validation
+```
+
+현재 smoke output validation은 `PASS`, row count `1`, failure count `0`이다. 이 gate는
+내부 RDF `right/down/forward`, public alias `forward/right/down/range`, range 계산,
+runtime truth flag, forbidden truth fields를 함께 검사한다.
+
+topic contract export, manifest export, adapter audit, synthetic CSV generation,
+bbox-to-fusion conversion, input schema validation, raw observation fusion apply,
+runtime profile apply, output schema validation, package acceptance check를 한 번에
+재현하려면 deployment package wrapper를 실행한다.
+
+```bash
+python3 Simulation/scripts/run_observation_fusion_deployment_package.py \
+  --root-dir . \
+  --output-dir Simulation/results/observation_fusion_runtime_deployment_package \
+  --profile-json Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json
+```
+
+현재 package smoke 결과는 default tier `fresh_common_mode_b7x3_aggregate_best`, manifest audit `12/12`,
+topic contract manifest export `PASS`, bbox conversion `PASS`, bbox converted input
+schema validation `PASS`, bbox-converted raw apply valid sample `1/1`, bbox-converted
+profile apply valid output `1/1`, bbox-converted output schema validation `PASS`,
+calibration CSV extraction `PASS`, calibration truth columns dropped `5`, calibration
+runtime profile apply valid output `1/1`, calibration output schema validation `PASS`,
+path equivalence `PASS`, public topic payload export `PASS`, public topic payload
+validation `PASS`, public topic payload publish dry-run `PASS`, input schema validation
+`PASS`, raw apply valid sample `1/1`, profile apply valid output `1/1`, output schema
+validation `PASS`, StereoDistance node smoke `PASS`, all-tier override smoke `PASS`,
+operator-view fusion launch check `PASS`, operator-view tier override check `PASS`,
+operator-view package-dir launch check `PASS`, package acceptance `PASS`, deployment
+inventory `PASS`이다.
+패키지 산출물은 manifest `json/csv/txt`, audit `csv/json/txt`, raw apply smoke,
+profile apply smoke, topic contract manifest, bbox conversion smoke, input/output schema
+validation, acceptance check, 그리고
+`active_runtime_profile.json`과 `observation_fusion_deployment_package_summary.json/txt`를
+포함한다. package-dir launch check는 wrapper가 package 내부
+`active_runtime_profile.json`과 package-local observation-fusion manifest를 자동 해석하는지
+검증한다. deployment inventory는
+`inventory/observation_fusion_deployment_inventory.json/csv/txt`로 저장되며, 재생성 가능한
+검증 로그인 `inventory/`와 `acceptance_check/`를 제외한 package 파일들의 상대 경로,
+크기, SHA-256을 기록하고 즉시 재검증한다. 최신 fresh package inventory는 73개 파일,
+161744 bytes를 기록한다. 기존 inventory를 다시 검증할 때는 같은
+스크립트에 `--inventory-json`을 지정한다. acceptance check는
+하위 JSON들을 다시 열어 topic truth offline-only, bbox/disparity runtime input,
+default tier와 package summary 일치, default tier의 all-scenario aggregate scope,
+truth-free MultiBurst adapter, aggregate STRICT_PASS evidence, manifest audit 전 tier PASS,
+bbox conversion PASS, bbox-converted raw/profile apply PASS,
+calibration CSV truth-drop bridge PASS, input/output schema PASS, raw/profile valid
+output, packaged profile hash/source consistency, 세 runtime 입력 경로의 RDF/public output 동등성, public
+`Float32MultiArray[forward,right,down,range]` payload export를 함께 검증한다. 이 wrapper도
+runtime truth를 사용하지 않으며 좌표 계약은 image `u/v/disparity` -> raw
+stereo-center RDF -> corrected stereo-center RDF -> public FRD+range alias이다.
+
 Corrected deployment comparison은
 `Simulation/results/rtk_stereo_theil_sen_full_family_probe/deployment_strategy_corrected_comparison.csv`
 에 저장한다. 2026-06-16 기준 비교는 다음과 같다.
@@ -2408,9 +3047,21 @@ set에서 충분한 표본으로 평가되도록 하는 것이다. 실제 CSV mo
 좌/우 카메라 image 또는 synthetic BBox 중심, YOLO BBox 결과를 먼저 명시적
 축 필드가 있는 CSV로 저장한 뒤 실행한다.
 
+실제 topic interface contract는 synthetic mode와 분리한다. 기본
+calibration/evaluation truth source는 `/fmu/out/vehicle_local_position`일 수 있지만,
+PX4 NED만으로는 평가용 `truth_rdf`가 되지 않는다. PX4 NED, RTK/GNSS world,
+Gazebo world/model pose, 외부 tracker, 또는 stereo-frame truth topic 중 어떤 source를
+쓰더라도 `T_source_to_stereo_rdf` 또는 이미 stereo-center RDF임을 증명하는 producer
+contract가 필요하다. 좌/우 `camera image topic`은 raw stereo image source,
+`YOLO BBox topic`은 left/right bbox center와 confidence source, disparity topic은
+measured disparity source다. runtime input은 이 topic들에서 생성된 stereo-center
+RDF(`right/down/forward`)와 measured disparity뿐이며, PX4/RTK/NED/world truth,
+validation RMSE, target-window error는 runtime input으로 넣지 않는다.
+
 라이브 ROS 2 토픽에서 calibration CSV를 직접 만들려면 다음 recorder를
 사용한다. 이 recorder는 PX4 `VehicleLocalPosition.x/y/z`를 NED
-`north/east/down`으로만 해석하고, StereoDistance
+`north/east/down`으로만 해석하며, PX4 NED를 `truth_right_m`,
+`truth_down_m`, `truth_forward_m`으로 자동 변환하지 않는다. StereoDistance
 `/stereo/estimated_position`은 public FRD+range
 `forward/right/down/range`로 해석한 뒤 CSV에는 named RDF/NED 필드만 쓴다.
 Gazebo synthetic truth를 같이 기록해야 하는 경우에는
@@ -2464,6 +3115,26 @@ Simulation/.venv/bin/python Simulation/scripts/rtk_stereo_calibration_pipeline.p
   --output-dir Simulation/results/rtk_stereo_calibration_from_csv
 ```
 
+pipeline 실행과 최종 산출물 audit을 한 번에 끝내려면 다음 단일 Python entrypoint를
+사용한다. 실제 CSV가 준비되기 전에는 `--mode synthetic`으로 동일한 산출물 계약을
+smoke test할 수 있다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_rtk_stereo_calibration_with_audit.py \
+  --output-dir Simulation/results/rtk_stereo_calibration_from_csv \
+  --mode csv \
+  --input-csv Simulation/results/calibration_flight/telemetry.csv
+```
+
+이 wrapper는 `rtk_stereo_calibration_pipeline.py`에 나머지 인자를 그대로 전달하고,
+성공 후 `audit_rtk_stereo_calibration_outputs.py`를 실행한다. audit 실패 시 wrapper도
+실패하며, 산출물은 `output_audit/rtk_stereo_calibration_output_audit.json/txt` 및
+`output_audit/rtk_stereo_calibration_with_audit_summary.json/txt`이다. wrapper도
+runtime truth를 사용하지 않으며, truth는 calibration/evaluation 단계에서만 쓰인다.
+단일-run 최종 추천은 validation range RMSE가 raw보다 낮고 1852m target-window
+abs mean error가 10m 이하이며, RDF right/down/forward 축별 validation RMSE가 raw
+대비 후퇴하지 않는 후보만 대상으로 한다.
+
 CSV 품질을 먼저 확인하려면 preflight를 실행한다. 이 단계는 pipeline loader와
 같은 named NED/RDF/FRD 계약으로 usable row 수, skip 사유, 1852m target
 window 표본 수를 보고한다.
@@ -2500,11 +3171,69 @@ CSV 경로를 생략하면 `results/calibration_flight` 아래 최신 CSV를 찾
 
 후처리 결과의 runtime profile을 측정 실행에 적용하려면 다음 wrapper를
 사용한다. profile 경로를 생략하면 `results/` 아래 최신
-`sim3_runtime_profile.json`을 찾는다.
+`active_runtime_profile.json` 또는 `sim3_runtime_profile.json`을 찾는다.
 
 ```bash
 ./run_operator_view_with_calibration_profile.sh
 ```
+
+검증된 deployment package를 바로 쓰려면 package directory를 지정한다. 이
+wrapper는 package 안의 `active_runtime_profile.json`을 기존
+`run_operator_view.sh --bbox-adjustment` 경로로 넘기며, runtime 입력은
+stereo-center RDF와 measured disparity뿐이다.
+
+```bash
+./run_operator_view_with_calibration_profile.sh \
+  --package-dir results/rtk_stereo_acceptance_matrix_summary/deployment_package
+```
+
+runtime 관측 외란 조건처럼 profile을 여러 개 보관해야 하는 경우에는 live truth가
+아니라 운용자가 명시한 deployment/scenario label로만 선택한다. 예를 들어
+`Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selector.json`
+은 `nominal`/`current_default`를 기존 active package로, `runtime_observation_stress`
+및 stress scenario label을 observation-stress package로 매핑한다. 이 selector의
+입력은 `deployment_label`, `scenario_label`, `scenario_name` 같은 배포 메타데이터
+뿐이며, PX4/RTK truth, validation error, replay winner는 runtime 선택 입력으로
+금지된다.
+
+```bash
+./run_operator_view_with_calibration_profile.sh \
+  --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selector.json \
+  --deployment-label runtime_observation_stress \
+  -- --no-px4 yolo_target_hz:=0.0
+```
+
+wrapper는 selector 검사를 먼저 수행한 뒤 선택된 label의 `package_paths` 또는
+`profile_paths`를 실제 `run_operator_view.sh --bbox-adjustment <profile>` 명령으로
+해석한다. selector 해석 smoke 결과는
+`Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/operator_view_launch_check_selector_stress.json|txt`
+에 PASS로 기록되어 있다. 이 단계에서도 runtime profile 입력은 stereo-center RDF
+`right/down/forward`와 measured disparity이고, public StereoDistance topic은
+FRD+range `forward/right/down/range`이다.
+
+selector를 실행하지 않고 선택 결과만 파일로 남기려면:
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/select_stereodistance_runtime_profile_by_label.py \
+  --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selector.json \
+  --deployment-label runtime_observation_stress \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selection_stress.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selection_stress.txt
+```
+
+배포자가 볼 수 있는 selector frontier를 CSV/JSON/TXT로 요약하려면:
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/export_stereodistance_runtime_deployment_frontier.py \
+  --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selector.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_deployment_frontier
+```
+
+이 산출물은 `runtime_deployment_frontier_labels.csv`에
+`nominal -> current_active`, `runtime_observation_stress -> stress_active` 같은
+label route를 기록하고, `runtime_deployment_frontier_profiles.csv`에 각 deployable
+profile의 method, SHA-256, package path, readiness status를 기록한다. selection
+입력은 배포/scenario label뿐이며 runtime truth/PX4/RTK/NED 값은 포함하지 않는다.
 
 명시 profile을 쓰려면:
 
@@ -2687,6 +3416,25 @@ CSV 입력은 최소한 다음 중 하나의 truth 계약과 raw RDF 또는 BBox
   `sigma=120m`이고, `060`은 더 좁은 1852m 집중, `250`은 더 넓은 거리 안정성을
   시험한다. 선택은 validation RMSE, 1852m error, train/validation gap, 복잡도
   기준으로만 이루어진다.
+- `target_weighted_huber_joint_disparity_ray_rotation_nls_sigma030/045/060/090/120/160/250`:
+  corrected disparity 선형항과 RDF rotation을 함께 fitting하는 Huber NLS 후보에
+  1852m target-range weight 폭 grid를 적용한다. 기존 robustness 결과에서
+  `sigma060`이 active PASS family가 되었으므로, planner의 `exploit_active_family`
+  지시에 따라 30/45/90/120m 후보를 추가해 target 집중 강도와 전체 validation
+  안정성 사이의 trade-off를 더 촘촘히 탐색한다. runtime profile은 고정된
+  disparity correction 계수와 RDF rotation만 사용하며, PX4/RTK/NED truth는
+  calibration/evaluation에만 사용된다.
+- `huber_joint_disparity_ray_rotation_nls_fscale0p75/1p0/2p0/3p0`,
+  `target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060_fscale0p75/1p0/2p0/3p0`:
+  Huber robust loss의 residual cutoff(`f_scale_m`)를 grid-search한다. 목적은
+  bbox center jitter, disparity bias drift, mixed runtime observation stress에서
+  이상치 억제 강도가 너무 약하거나 강할 때 validation RMSE, 1852m 근방 max
+  error, RDF axis non-regression이 어떻게 변하는지 자동으로 확인하는 것이다.
+  후보 선택과 PASS 판정은 train RMSE가 아니라 validation split, 1852m target
+  window, train/validation gap, model complexity, RDF axis regression gate를
+  기준으로 한다. runtime 입력 계약은 기존 joint 후보와 동일하게 stereo-center
+  RDF(`right,down,forward`)와 measured disparity뿐이며, PX4 local NED truth는
+  calibration/evaluation 단계에서만 사용된다.
 - `target_shrunk_global_inverse_depth_linear_shrink025/040/050/060/075`,
   `target_shrunk_inverse_depth_linear_then_sim3_shrink025/040/050/060/075`: global
   inverse-depth coefficients와 target-weighted coefficients를 25/40/50/60/75% 비율로
@@ -2893,12 +3641,1511 @@ CSV 입력은 최소한 다음 중 하나의 truth 계약과 raw RDF 또는 BBox
 - `pareto_frontier.png`: 보정 후보들의 validation/1852m/복잡도 tradeoff 그래프
 - `summary.txt`: 각 보정법 성능 비교표와 최종 추천 보정법
 - `method_parameters.json`, `run_config.json`: 재현용 설정과 보정 파라미터
-- `sim3_runtime_profile.json`: 최종 추천이 Sim(3) 계열일 때 StereoDistance
-  runtime에 바로 넣을 수 있는 `estimated_to_truth_sim3` JSON profile
+- `sim3_runtime_profile.json`: legacy 파일명이다. 최종 추천 profile을
+  최상위로 복사한 StereoDistance runtime JSON이며, 실제 `mode`는
+  `estimated_to_truth_sim3`, `estimated_to_truth_disparity_poly`,
+  `estimated_to_truth_affine_rdf` 중 하나일 수 있다.
 - `runtime_profiles/`: 최종 추천 여부와 무관하게 StereoDistance runtime에
   적용 가능한 후보 profile 전체와 `manifest.json`
 - `policy_profiles/`: 목적별 추천 후보의 StereoDistance runtime profile과
   `manifest.json`
+
+생성된 calibration 결과 폴더가 최종 산출물 계약을 만족하는지 재학습 없이 검사하려면
+다음 audit을 실행한다.
+
+```bash
+python3 Simulation/scripts/audit_rtk_stereo_calibration_outputs.py \
+  --result-dir Simulation/results/rtk_stereo_calibration_<RUN_ID>
+```
+
+이 audit은 `method_comparison.csv`, `validation_predictions.csv`,
+`target_1852m_stats.csv`, `policy_recommendations.csv/json`, PNG 4종, `summary.txt`,
+`run_config.json`, `method_parameters.json`, `runtime_profiles/manifest.json` 존재 여부와
+schema를 확인한다. 또한 80:20 train/validation split, 최종 추천이 `raw` 대비
+validation range RMSE를 개선하는지, validation set에 1852m target-window sample이
+있는지, 추천 후보의 1852m abs mean error가 `10m` 이하인지, validation prediction의
+RDF axis/error field가 finite인지, 추천 후보의 RDF right/down/forward validation
+RMSE가 raw 대비 후퇴하지 않는지, policy recommendation의 final method가 run config
+recommendation과 일치하는지, `runtime_profiles/manifest.json`의 모든 후보 profile이
+method table metric과 일치하고 실제 파일로 존재하는지, runtime input에
+truth/PX4/RTK/NED field가 들어가지 않는지, forbidden runtime input에 truth/PX4/RTK가
+명시됐는지, 각 profile을 `stereo_ground_sim.runtime_guard_policy`의 실제 runtime
+class로 로드하고 대표 raw RDF/BBox-center/disparity sample에 apply할 수 있는지,
+선택된 `runtime_profiles/<method>.json`이 run config 추천과 일치하는지, top-level
+`sim3_runtime_profile.json`이 selected profile 파일과 동일한지,
+method table에는 있지만 runtime profile manifest에 없는 method가 `none_raw` 또는
+`offline_or_nonpreferred_runtime_candidate` family로 명시된 예외인지,
+`policy_profiles/manifest.json`의 목적별 profile들이 실제 파일로 존재하고 metric이
+method table과 일치하며 runtime class load/apply smoke를 통과하는지, RDF 계약이
+`right/down/forward`로 기록됐는지, public StereoDistance alias가
+`forward/right/down/range`인지, PNG 4종이 plot으로 볼 수 있는 최소 크기
+`640x360` 이상인지 검사한다. 산출물은
+`output_audit/rtk_stereo_calibration_output_audit.json/txt`이다. 이 audit에는
+`deliverable_evidence_matrix`도 포함되며, 사용자가 요구한 최종 산출물인
+보정법별 성능 비교 CSV, 보정 전/후 거리 오차 그래프, 거리별 residual disparity
+그래프, RDF 축별 RMSE 그래프, 1852m 근방 오차 통계, validation prediction CSV,
+최종 추천 summary, runtime/policy profile manifest가 각각 어떤 파일과 metric으로
+PASS됐는지 기록한다.
+`run_rtk_stereo_calibration_with_audit.py`는 audit 통과 후
+`inventory/rtk_stereo_calibration_output_inventory.json/csv/txt`도 생성한다.
+이 inventory는 재생성 로그인 `output_audit/`와 `inventory/` 자체를 제외한 calibration
+결과 파일의 상대 경로, 크기, SHA-256을 기록하고 즉시 재검증한다. 기존 inventory를
+다시 검증하려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/export_rtk_stereo_calibration_output_inventory.py \
+  --result-dir Simulation/results/rtk_stereo_calibration_<RUN_ID> \
+  --inventory-json Simulation/results/rtk_stereo_calibration_<RUN_ID>/inventory/rtk_stereo_calibration_output_inventory.json
+```
+
+단일 run audit, multi-seed acceptance, robustness acceptance를 한 파일로 묶어
+현재 실험 단계별 PASS/FAIL을 보려면 다음 wrapper를 실행한다. 이 wrapper는
+단일 run audit의 `deliverable_evidence_matrix`가 method comparison CSV,
+거리오차/residual disparity/RDF axis PNG, RDF 축별 non-regression evidence,
+1852m 통계, validation prediction, runtime/policy profile manifest를 모두 포함하고
+각 항목이 PASS일 때만 single-run stage를 PASS로 인정한다. 또한
+deployment strategy에서 `active_runtime_profile.json`을 export하고,
+`calibration_samples.csv`의 validation raw RDF/BBox-center/disparity sample로
+StereoDistance promotion check를 실행한 뒤, 그 promotion 결과를 최종
+acceptance matrix에 다시 포함한다. 또한 promotion check가 검증한
+`active_runtime_profile.json`과 최종 dashboard 재생성 후 남은
+`active_runtime_profile.json`의 SHA-256이 같은지 확인해, 검증된 profile과
+최종 배포 파일이 달라지는 경우를 FAIL 처리한다. 최종 산출물에는
+`active_profile_deployment_manifest.json/txt`와
+`active_profile_deployment_manifest_validation.json/txt`도 포함된다. manifest는
+배포할 profile 경로, SHA-256, method/mode, runtime input 계약, promotion
+check 경로와 sample apply 결과, 최종 acceptance 결과를 기록하고, validation은
+그 manifest가 실제 profile/promotion/acceptance 파일과 일치하는지 재검증한다.
+`deployment_package/`에는 실제 StereoDistance에 넣을
+`active_runtime_profile.json`, manifest/validation, promotion evidence, final
+acceptance summary, public `/stereo/corrected_position` FRD+range payload
+dry-run evidence, `DEPLOYMENT_README.txt`,
+`deployment_package_manifest.json/txt` checksum inventory가 함께 복사된다.
+wrapper는 마지막에 `deployment_package_check.json/txt`도 생성해
+패키지 내부 파일들의 존재, 크기, SHA-256, active profile 계약, 실제 runtime
+profile loader/apply smoke, `StereoDistanceNode` loader 경로, promotion evidence
+PASS, final acceptance summary PASS, manifest validation PASS를 다시 검사한다.
+public payload evidence는 profile을 직접 적용한 corrected RDF와 실제
+`StereoDistanceNode`의 `/stereo/corrected_position` 발행 helper가 만든
+`Float32MultiArray` 배열이 `0.001m` 허용오차 안에서 같은지도 검사한다.
+deployment manifest validation, deployment package check, wrapper summary, readiness summary에는
+`final_rdf_axis_nonregression_status: PASS`가 직접 기록되어, RDF 축별
+non-regression gate 통과 여부를 package evidence 파일을 다시 열지 않고도 확인할 수
+있다.
+그 다음 `deployment_package/inventory/stereodistance_deployment_package_inventory.json/csv/txt`를
+생성해 `inventory/` 자체를 제외한 패키지 전체 파일의 상대 경로, 크기,
+SHA-256을 기록하고 즉시 재검증한다.
+`--install-rehearsal-profile`을 지정하면 package check PASS 이후에만 해당
+경로로 active profile 설치 리허설을 수행하고, 설치 파일 SHA-256 일치 여부를
+wrapper summary에 함께 기록한다. install rehearsal을 수행한 경우 wrapper는
+마지막에 `deployment_readiness.json/txt/csv`도 자동 생성해 wrapper summary,
+deployment manifest validation, package check, install rehearsal, active profile
+SHA-256, public `/stereo/corrected_position` FRD+range payload dry-run,
+`StereoDistanceNode` 발행 경로 동등성, operator-view launch command 해석,
+runtime truth-free 입력 계약을 한 번 더 재검증한다. operator-view check는
+`run_operator_view_with_calibration_profile.sh --package-dir <package> --print-only`
+를 실행해 package `active_runtime_profile.json`이 실제
+`run_operator_view.sh --bbox-adjustment <profile>` 명령으로 풀리는지 확인한다.
+scenario-labeled profile selector를 사용하는 경우에는
+`--selector-json <manifest> --deployment-label <label>` 경로도 같은 check로 검증할
+수 있으며, 이때도 selector 입력은 배포/scenario label 메타데이터뿐이다.
+또한 `stereo_ground_sim.launch.py`가 `enable_bbox_center_adjustment`와
+`bbox_center_adjustment_path` launch argument를 선언하고, 두 값을
+`stereo_distance_node` params YAML에 전달하는지도 확인한다.
+
+```bash
+python3 Simulation/scripts/run_rtk_stereo_acceptance_dashboard_with_promotion.py \
+  --single-audit-json Simulation/results/rtk_stereo_calibration_<RUN_ID>/output_audit/rtk_stereo_calibration_output_audit.json \
+  --multi-seed-summary-json Simulation/results/rtk_stereo_policy_multi_seed/multi_seed_summary.json \
+  --robustness-summary-json Simulation/results/rtk_stereo_robustness_sweep/robustness_summary.json \
+  --deployment-strategy-json Simulation/results/rtk_stereo_robustness_sweep/deployment_strategy_recommendation.json \
+  --output-active-profile Simulation/results/rtk_stereo_acceptance_matrix_summary/active_runtime_profile.json \
+  --calibration-samples-csv Simulation/results/rtk_stereo_calibration_<RUN_ID>/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_acceptance_matrix_summary \
+  --split validation \
+  --max-samples 50 \
+  --runtime-profile-selector-json Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selector.json \
+  --runtime-profile-selector-deployment-label runtime_observation_stress \
+  --matrix-active-profile-gate-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_matrix/active_profile_matrix_gate/active_profile_matrix_gate.json \
+  --install-rehearsal-profile Simulation/results/rtk_stereo_acceptance_matrix_summary/install_rehearsal/active_runtime_profile.json \
+  --force-install-rehearsal
+```
+
+`--runtime-profile-selector-json`를 지정하면 기본 package 기반
+`operator_view_launch_check.json|txt`에 더해
+`operator_view_launch_check_selector.json|txt`도 생성한다. 이 추가 check는
+selector가 배포/scenario label만으로 profile을 고른 뒤, 최종 operator 명령이
+선택된 `active_runtime_profile.json`을 `--bbox-adjustment`로 넘기는지 확인한다.
+또한 `runtime_deployment_frontier/` 아래에 label route와 profile/package/readiness
+상태를 요약한 CSV/JSON/TXT를 자동 생성하고, deployment readiness는 이 frontier
+evidence까지 PASS인지 확인한다. selector를 쓰지 않는 일반 dashboard 실행에서는
+이 추가 산출물을 만들지 않는다.
+`--matrix-active-profile-gate-json`을 함께 지정하면 wrapper가 자동 생성하는
+`deployment_readiness.json/csv/txt`에 common-CSV frontier matrix gate 결과도
+포함한다. 이 경우 active profile SHA/method가 matrix-selected method와 일치하고,
+해당 method가 모든 validation/replay run을 통과하며, runtime 입력이
+stereo-center RDF + measured disparity만 사용하는지도 최종 readiness에서 다시
+검사한다.
+
+selector를 쓰는 dashboard package에는 `deployment_package/evidence/` 아래에도
+`runtime_profile_label_selector.json`, 이동 가능한
+`package_runtime_profile_label_selector.json`, 그리고 `runtime_deployment_frontier/*`가
+복사된다. `package_runtime_profile_label_selector.json`은 패키지 내부
+`../active_runtime_profile.json`을 가리키므로, 패키지만 다른 환경으로 옮겨도 지원
+label을 이 패키지 active profile로 해석할 수 있다. 원본 selector/frontier는 어떤
+deployment/scenario label이 어떤 profile/package로 해석되는지, 그 profile의 readiness와
+SHA-256이 무엇인지 감사하기 위한 evidence로 남긴다.
+
+현재 PASS 후보를 기준선으로 두고 다음 자동탐색 축을 정하려면 method search planner를
+실행한다. 이 도구는 새 보정값을 fitting하지 않고, robustness summary의 method별
+validation RMSE, 1852m target-window error, RDF axis non-regression, scenario
+coverage, model complexity를 읽어 top method frontier와 family별 다음 action을
+CSV/JSON/TXT로 기록한다. calibration/evaluation truth는 기존 robustness evidence에만
+사용되고, 산출물에는 runtime profile 입력이 stereo-center RDF(`right,down,forward`)와
+measured disparity뿐이며 PX4/RTK/NED truth를 runtime 입력으로 쓰지 않는다는 계약을
+명시한다.
+
+```bash
+python3 Simulation/scripts/plan_stereodistance_method_search.py \
+  --robustness-summary-json Simulation/results/rtk_stereo_robustness_sweep/robustness_summary.json \
+  --dashboard-summary-json Simulation/results/rtk_stereo_acceptance_matrix_summary/rtk_stereo_acceptance_dashboard_with_promotion_summary.json \
+  --active-profile-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/method_search_plan \
+  --top-n 20
+```
+
+주요 산출물은 `method_search_frontier.csv`, `family_search_priorities.csv`,
+`method_search_plan.json`, `method_search_plan.txt`이다. `--active-profile-json`을
+제공하면 planner의 `active_method`는 실제 export된 StereoDistance runtime profile
+method를 뜻하고, `robust_recommendation_method`는 robustness frontier에서 가장 강한
+offline 후보를 뜻한다. 두 값이 다를 수 있으므로
+`active_profile_matches_robust_recommendation`을 함께 확인한다.
+`exploit_active_family`는 현재 active PASS family 주변의 좁은 hyperparameter sweep 대상,
+`promote_as_alternate_frontier`는 active profile 대안으로 보존할 후보,
+`add_stability_regularization`은 validation 성능은 있으나 strict/stability 조건을 더
+강화해야 하는 후보, `diagnose_axis_regression`은 RDF 축별 RMSE 악화를 먼저 해결해야
+하는 후보를 뜻한다. 이 planner 결과는 다음 EXP sweep의 method family, sigma/shrink,
+Huber/TLS threshold, residual disparity/range term 탐색 우선순위를 정하는 입력으로 쓴다.
+
+새 sweep/dashboard가 PASS했더라도 기존 active profile을 바로 교체하지 않는다. 후보
+간 비교는 다음 스크립트로 수행한다. 각 후보는 dashboard directory와 그 후보를 만든
+robustness summary를 함께 제공해야 하며, 선택 기준은 readiness PASS,
+`final_rdf_axis_nonregression_status: PASS`, runtime truth-free, balanced
+validation/1852m target score 순이다. 이 score는 robust validation RMSE mean/max,
+1852m target max error를 함께 보므로, 1852m target max가 아주 조금 좋아졌지만
+전체 validation RMSE가 크게 나빠진 후보는 교체 후보로 승격하지 않는다. Dashboard
+promotion replay sample은 후보마다 다를 수 있으므로, exported active profile
+validation RMSE는 tie-break/evidence로만 남기고 primary score에는 넣지 않는다.
+
+```bash
+python3 Simulation/scripts/compare_stereodistance_active_profile_candidates.py \
+  --candidate current_active:Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke:Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/robustness_summary.json \
+  --candidate new_candidate:Simulation/results/rtk_stereo_runtime_observation_stress_sigma_grid_dashboard:Simulation/results/rtk_stereo_runtime_observation_stress_sigma_grid_full/robustness_summary.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_sigma_grid_full/profile_candidate_comparison
+```
+
+산출물은 `profile_candidate_comparison.csv/json/txt`이다. 이 비교는
+calibration/evaluation truth를 새로 사용하지 않고, 이미 생성된 offline evidence만
+읽는다. runtime 입력 계약은 stereo-center RDF(`right,down,forward`)와 measured
+disparity이며, public output은 FRD+range이다. 또한
+`profile_matches_robust_recommendation`과 `method_selection_scope`를 기록해, 실제
+export된 active runtime profile method와 robustness frontier recommendation이 서로
+다른 경우를 명확히 구분한다. `promotion_sample_fingerprint_sha256`,
+`promotion_sample_unique_fingerprint_count`, `promotion_samples_comparable`은 후보
+간 promotion replay CSV가 같은 데이터였는지 감사하기 위한 evidence이다.
+
+실제 export된 `active_runtime_profile.json`끼리 같은 calibration CSV에서 직접
+비교하려면 common-CSV replay 비교를 실행한다. 이 비교는 robust summary 기반 최종
+선택을 대체하지 않고, 동일한 validation rows에서 profile apply 결과를 확인하는
+보조 evidence이다. PX4/RTK truth는 replay 평가에만 쓰이며 runtime 입력은 계속
+stereo-center RDF(`right,down,forward`)와 measured disparity뿐이다.
+
+```bash
+python3 Simulation/scripts/compare_stereodistance_profiles_on_common_csv.py \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/mixed_runtime_observation_stress/seed_20260618/calibration_samples.csv \
+  --profile current_active:Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/active_runtime_profile.json \
+  --profile fscale_candidate:Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360_dashboard/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_profile_comparison \
+  --split validation
+```
+
+산출물은 `common_csv_profile_comparison.csv/json/txt`,
+`common_csv_profile_predictions.csv`,
+`common_csv_target_window_stats.csv/json/txt`,
+`common_csv_profile_range_errors.png`,
+`common_csv_profile_axis_rmse.png`,
+`common_csv_residual_disparity_by_range.png`이다.
+`common_csv_target_window_stats.*`는 동일 validation rows 중 1852m target-window에
+들어간 sample의 raw/corrected range error 통계를 후보별로 따로 기록한다.
+`pass_common_replay`는 같은 CSV에서 raw 대비 range RMSE 개선, RDF right/down/forward
+축별 RMSE non-regression, 1852m target-window max error `±10m` 이내를 모두 만족할 때
+참이다.
+
+같은 방식으로 method-search frontier의 seed runtime profile도 직접 replay할 수 있다.
+수동으로 `--profile`을 나열하지 않으려면 frontier CSV와 `runtime_profiles/` 디렉터리를
+다음 wrapper에 넘긴다.
+
+```bash
+python3 Simulation/scripts/run_common_csv_frontier_profile_comparison.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/method_search_plan/method_search_frontier.csv \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/mixed_runtime_observation_stress/seed_20260618/runtime_profiles \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/mixed_runtime_observation_stress/seed_20260618/calibration_samples.csv \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/active_runtime_profile.json \
+  --active-label current_active_sigma060 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_comparison_auto \
+  --top-n 12 \
+  --split validation
+```
+
+이 wrapper는 `method_search_frontier.csv`의 상위 method를
+`runtime_profiles/<method>.json`으로 매핑하고, 존재하는 profile만 같은 CSV replay에
+넣는다. 추가 산출물은 `frontier_profile_candidate_manifest.csv/json/txt`이며, 어떤
+frontier 후보가 실제 runtime profile로 발견됐고 replay에 포함됐는지 기록한다.
+2026-06-17 기준
+`rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_comparison_auto`
+에서는 current active와 mixed-runtime seed의 top frontier 12개를 같은 validation CSV에
+적용했다. 결과는 `current_active_sigma060`이 corrected range RMSE `1.117m`,
+1852m target max abs `1.445m`, RDF axis non-regression PASS로 가장 낮은 passing
+score를 유지했다. `target_weighted_huber_left_disparity_camera_geometry_sim3_quadratic_residual_raw_forward_lut_sigma160`,
+`target_weighted_inverse_depth_linear_then_sim3_sigma060`,
+`huber_left_disparity_camera_geometry_sim3`, `huber_joint_disparity_ray_rotation_nls`도
+PASS했지만 score가 더 컸다.
+`disparity_quadratic_then_sim3`와 target-weighted disparity Sim(3)+LUT 계열 일부는
+range/1852m error는 통과했지만 Right/Down 축 RMSE가 raw보다 커져
+`pass_common_replay: false`로 남긴다. 이 비교도 PX4/RTK truth를 offline 평가에만
+사용하며 runtime profile 입력은 stereo-center RDF와 measured disparity뿐이다.
+
+단일 CSV가 아니라 sweep root 아래 모든 `scenario/seed_*` run에 같은 frontier replay를
+적용하려면 matrix wrapper를 실행한다.
+
+```bash
+python3 Simulation/scripts/run_common_csv_frontier_profile_matrix.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/method_search_plan/method_search_frontier.csv \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/active_runtime_profile.json \
+  --active-label current_active_sigma060 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_matrix \
+  --top-n 12 \
+  --split validation
+```
+
+이 wrapper는 각 run의 `calibration_samples.csv`와 `runtime_profiles/`를 찾아 run별
+`common_csv_profile_comparison.*`을 생성하고, 전체를
+`frontier_profile_matrix_runs.csv`, `frontier_profile_matrix_methods.csv`,
+`frontier_profile_matrix_summary.json/txt`로 집계한다. 시각 검토용으로
+`frontier_profile_matrix_pass_counts.png`,
+`frontier_profile_matrix_rmse.png`,
+`frontier_profile_matrix_target_errors.png`도 저장한다. 같은 method가 active profile과
+frontier profile 양쪽에 있으면 run별 best replay row 하나만 method aggregate에
+반영한다. 이 aggregate는 method family 비교에는 유용하지만 단일 deployable profile
+검증으로 해석하면 안 된다. 같은 method 이름 아래에 current active profile과
+run별/pooled profile이 함께 있을 수 있기 때문이다. 단일 배포 후보 판단은 반드시
+아래 active-profile gate 또는 deployable profile policy selection처럼 실제
+`profile_json` 경로를 기준으로 다시 확인한다.
+
+2026-06-17 fscale-grid 3개 scenario x 2개 seed 결과의 초기 top-12/top-20/top-50
+matrix aggregate에서는 `target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060`
+계열이 6/6 PASS처럼 보였다. 그러나 corrected exact-profile gate로 현재
+`active_runtime_profile.json` SHA-256
+`19a3a69ee1a8c5c373bbb7000fc087f43310be494473ad0e05955c5b40bf7a63`만 다시 검사하면
+actual active profile은 2/6 PASS, RDF axis 2/6 PASS, 1852m target 6/6 PASS다.
+target error 자체는 충분히 작지만, 축별 non-regression 조건을 만족하지 못하므로
+현재 active profile을 최종 배포 후보로 승격하지 않는다.
+같은 frontier CSV의 전체 20개 후보를 `--top-n 20`으로 다시 replay한
+`common_csv_frontier_profile_matrix_top20/`에서도 추천은 변하지 않았다.
+top-20 결과는 6개 run, 20개 method를 평가했고, selected method는 여전히
+`target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060`이다. 이 method는
+6/6 PASS, 4/6 run selected, corrected range RMSE mean/max `1.501/2.157m`,
+1852m target max `3.955m`, score mean `3.948`이었다. 추가로 들어온
+`inverse_depth_linear_then_sim3`, target-shrunk inverse-depth 계열도 6/6 PASS였지만
+score mean과 target worst-case가 더 커 active profile을 대체하지 않았다.
+
+matrix 추천이 실제 active runtime profile과 일치하는지 최종 gate로 확인하려면 다음을
+실행한다.
+
+```bash
+python3 Simulation/scripts/check_common_csv_frontier_matrix_active_profile.py \
+  --matrix-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_matrix/frontier_profile_matrix_summary.json \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_matrix/active_profile_matrix_gate
+```
+
+산출물은 `active_profile_matrix_gate.csv/json/txt`이다. 이 gate는 matrix 자체가 PASS인지,
+matrix selected method와 active profile method가 같은지, active method가 모든 run을
+통과했는지, 그리고 실제 `profile_json` row가 모든 replay run에서 PASS했는지 확인한다.
+active profile runtime input이 truth/PX4/RTK/NED-free인지도 함께 확인한다. corrected
+gate의 중요한 차이는 method aggregate PASS만으로 충분하다고 보지 않고, run별
+`common_csv_profile_comparison.csv`에서 active profile 경로와 같은 row를 찾아
+pass count, RDF axis pass count, 1852m target pass count를 다시 계산한다는 점이다.
+
+frontier CSV 밖의 후보까지 넓히려면 seed별 `method_comparison.csv` 전체를 집계하는
+broad ranking을 먼저 만든다.
+
+```bash
+python3 Simulation/scripts/rank_sweep_method_comparison_candidates.py \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/broad_method_candidate_rank \
+  --target-error-limit-m 10.0
+```
+
+산출물은 `broad_method_candidate_rank.csv/json/txt`와
+`broad_method_candidate_run_rows.csv`이다. 이 ranking은 각 seed에서 이미 계산된
+offline validation metric을 집계해 raw 대비 range 개선, RDF right/down/forward
+non-regression, 1852m target error, runtime profile JSON 존재를 확인한다.
+2026-06-17 fscale-grid 결과에서는 6개 run, 248개 method를 집계했고 자기 validation
+기준 1위는 `target_weighted_huber_joint_disparity_ray_rotation_nls_sigma030`이었다
+(`6/6` PASS, range RMSE mean `1.505m`, 1852m target max `4.011m`). 이 단계는
+후보 발굴용이며 최종 선택은 여전히 같은 common-CSV replay matrix로 검증한다.
+
+```bash
+python3 Simulation/scripts/run_common_csv_frontier_profile_matrix.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/broad_method_candidate_rank/broad_method_candidate_rank.csv \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_dashboard_smoke/active_runtime_profile.json \
+  --active-label current_active_sigma060 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_broad_profile_matrix_top20 \
+  --top-n 20 \
+  --split validation
+```
+
+broad 후보를 전체 248개로 넓힌 뒤 단일 deployable profile을 검증하려면, 각 run의
+local profile이 아니라 하나의 pooled profile directory를 고정해 matrix를 다시 만든다.
+이렇게 해야 실제 StereoDistance에 넣을 수 있는 단일 JSON profile의 전이 성능을 볼 수
+있다.
+
+```bash
+python3 Simulation/scripts/run_common_csv_frontier_profile_matrix.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/broad_method_candidate_rank/broad_method_candidate_rank.csv \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/runtime_profiles \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active \
+  --top-n 248 \
+  --split validation
+```
+
+이 결과는 6개 replay run, 247개 deployable method를 평가했고, matrix score 기준
+selected method는 `affine_monotone_binned_residual_raw_forward_bins11`이다. 이 후보는
+6/6 PASS, RDF axis 6/6 PASS, 1852m target 6/6 PASS, validation range RMSE mean/max
+`2.064/3.408m`, 1852m target max abs `3.131m`였다. 그러나 사용자의 최종 기준은
+train RMSE나 단일 score가 아니라 validation RMSE, 1852m 근방 오차, 모델 안정성이므로
+정책별 deployable profile selection을 추가로 실행한다.
+
+```bash
+python3 Simulation/scripts/select_deployable_profile_from_common_csv_matrix.py \
+  --matrix-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/frontier_profile_matrix_summary.json \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/runtime_profiles \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection \
+  --target-error-limit-m 10.0 \
+  --recommended-policy range_priority
+```
+
+산출물은 `deployable_profile_policy_selection.csv/json/txt`와
+`deployable_profile_candidates.csv`이다. hard gate는 단일 profile JSON 존재,
+truth/PX4/RTK/NED-free runtime input, 6/6 replay PASS, RDF axis 6/6 PASS,
+1852m target 6/6 PASS, 1852m 최대 절대오차 `10m` 이하를 모두 요구한다.
+2026-06-18 현재 hard gate 통과 후보는 166개이며, 정책별 winner는 다음과 같다.
+
+- `range_priority`: `sim3_inverse_depth_binned_residual_raw_forward_bins11`,
+  validation range RMSE mean/max `1.883/2.981m`, 1852m target max abs `3.535m`
+- `target_priority`: `tukey_range_weighted_sim3`,
+  validation range RMSE mean/max `2.222/3.387m`, 1852m target max abs `3.005m`
+- `score_priority`: `affine_monotone_binned_residual_raw_forward_bins11`,
+  validation range RMSE mean/max `2.064/3.408m`, 1852m target max abs `3.131m`
+- `balanced`: `huber_joint_disparity_ray_rotation_nls_fscale0p75`,
+  validation range RMSE mean/max `1.892/3.103m`, 1852m target max abs `3.501m`
+
+현재 추천은 `range_priority` 기준의
+`sim3_inverse_depth_binned_residual_raw_forward_bins11`이다. 1852m 오차는 모든 정책 후보가
+`±10m` 조건을 충분히 만족하므로, validation range RMSE mean/max와 all-run RDF axis
+안정성을 우선했다. 이 profile의 SHA-256은
+`9fcb2e3107be8dd15a7335bab59d09f3d23df03cb74e72172f9a819e18626ceb`이다. 단, 추천은
+배포 패키지로 즉시 설치한다는 뜻이 아니라, 이 profile로 acceptance dashboard,
+promotion check, deployment readiness를 다시 실행한 뒤 active profile로 승격한다는
+뜻이다. 모든 선택 단계는 offline calibration/evaluation replay evidence만 읽으며,
+runtime StereoDistance 입력으로 truth/PX4/RTK/NED를 추가하지 않는다.
+
+추천 profile의 StereoDistance loader/apply smoke는 다음처럼 단독으로 확인한다.
+
+```bash
+python3 Simulation/scripts/stereodistance_profile_promotion_check.py \
+  --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/runtime_profiles/sim3_inverse_depth_binned_residual_raw_forward_bins11.json \
+  --sample-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_promotion_check \
+  --split validation \
+  --max-samples 80
+```
+
+2026-06-18 실행 결과는 `pass_promotion_check: true`, `schema_load_ok: true`,
+`node_loader_ok: true`, `sample_apply_count: 80`, `sample_invalid_count: 0`,
+`runtime_truth_used: false`였다.
+
+정책 선택 결과를 실제 `active_runtime_profile.json` 후보로 복사하고, 같은 단계에서
+promotion check와 public FRD+range payload dry-run까지 묶으려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/export_deployable_profile_candidate_from_policy_selection.py \
+  --policy-selection-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/deployable_profile_policy_selection.json \
+  --output-active-profile Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate \
+  --sample-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/calibration_samples.csv \
+  --split validation \
+  --max-samples 80
+```
+
+산출물은 `deployable_profile_candidate_export.json/txt`,
+`active_runtime_profile.json`, `promotion_check/*`,
+`public_topic_payload/public_corrected_position_payload_summary.json`,
+`public_topic_payload/public_corrected_position_payload.csv`이다. 2026-06-18 실행 결과는
+`status: PASS`, `recommendation: use_as_next_acceptance_dashboard_active_profile`,
+promotion sample apply `80/80`, public payload sample `80/80`, public payload
+node-equivalence `PASS`, runtime truth `false`였다. public payload axis order는
+`forward_m,right_m,down_m,range_m`이며, profile runtime 입력은 여전히
+stereo-center RDF `right/down/forward`와 measured disparity다.
+
+주의할 점은 기존 `check_common_csv_frontier_matrix_active_profile.py` gate가
+“matrix score 기준 selected method와 active profile이 같은가”를 확인하는 gate라는
+것이다. 현재 range-priority 추천은 validation range RMSE를 우선하므로 matrix score
+selected method인 `affine_monotone_binned_residual_raw_forward_bins11`과 다르다. 따라서
+이 후보를 기존 matrix-selected readiness gate에 그대로 넣으면 gate 목적상 FAIL하는
+것이 정상이다. range-priority 후보의 근거는
+`deployable_profile_policy_selection.json`과
+`range_priority_active_candidate/deployable_profile_candidate_export.json`이며, 최종
+배포 readiness에는 policy-selection evidence를 별도로 반영해야 한다.
+
+policy-selection active 후보 전용 readiness는 다음으로 확인한다.
+
+```bash
+python3 Simulation/scripts/check_deployable_profile_candidate_readiness.py \
+  --candidate-export-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate/deployable_profile_candidate_export.json \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate/deployable_profile_candidate_readiness.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate/deployable_profile_candidate_readiness.txt \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate/deployable_profile_candidate_readiness.csv
+```
+
+이 gate는 profile SHA 일치, policy-selection PASS, 6/6 replay PASS, RDF axis 6/6
+PASS, 1852m target 6/6 PASS, promotion check PASS, public FRD+range payload PASS,
+runtime truth-free 계약을 모두 확인한다. 2026-06-18 실행 결과는 `status: PASS`,
+`failure_count: 0`, validation range RMSE mean/max `1.883/2.981m`, 1852m target
+max abs `3.535m`이다.
+
+이 후보를 다음 acceptance-dashboard 실행에 넘길 수 있는 작은 evidence package로
+묶으려면 다음을 실행한다. 이 패키지는 기존 full deployment package와 달리 최종 설치
+승격물이 아니라, policy-selection 후보와 그 검증 근거를 안전하게 옮기기 위한
+candidate package다.
+
+```bash
+python3 Simulation/scripts/export_deployable_profile_candidate_package.py \
+  --candidate-readiness-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_active_candidate/deployable_profile_candidate_readiness.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package
+```
+
+생성 파일은 `active_runtime_profile.json`,
+`deployable_profile_candidate_package_manifest.json`,
+`DEPLOYABLE_PROFILE_CANDIDATE_README.txt`, 그리고 `evidence/` 아래의 policy selection,
+candidate export, readiness, promotion check, public payload CSV/JSON이다. 패키지 자체를
+검사하려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/check_deployable_profile_candidate_package.py \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package/deployable_profile_candidate_package_check.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package/deployable_profile_candidate_package_check.txt
+```
+
+2026-06-18 실행 결과는 `status: PASS`, `failure_count: 0`, runtime apply smoke
+`PASS`, file count `8`, replay pass `6/6`, RDF axis pass `6/6`, target pass `6/6`,
+promotion sample `80`, public payload sample `80`, public payload node-equivalence
+`PASS`, runtime truth `false`였다.
+
+candidate package가 operator-view launch wrapper에 실제로 연결되는지 확인하려면
+다음 dry-run checker를 실행한다.
+
+```bash
+python3 Simulation/scripts/check_stereodistance_operator_view_launch.py \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package/operator_view_launch_check.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package/operator_view_launch_check.txt
+```
+
+2026-06-18 실행 결과는 `status: PASS`, `package_type: candidate_package`,
+`package_check_status: PASS`, `bbox_adjustment_arg_present: true`, launch contract
+`PASS`, runtime truth `false`였다. 출력 command는 candidate package 내부
+`active_runtime_profile.json`을 `run_operator_view.sh --bbox-adjustment`에 넘긴다.
+실제 operator view를 띄울 때는 같은 package-dir을 사용하되 `--print-only` 없이 실행한다.
+
+```bash
+./Simulation/run_operator_view_with_calibration_profile.sh \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package \
+  -- --no-px4 yolo_target_hz:=0.0
+```
+
+다른 policy winner도 같은 candidate package/operator-view gate를 통과하는지 비교하려면
+다음 suite wrapper를 실행한다. 이 wrapper는 각 policy에 대해 policy selection,
+active candidate export, readiness, candidate package export/check, operator-view
+dry-run, candidate package portability smoke check, 최종 package summary를 생성한다.
+`--pipeline-dir`를 함께 지정하면 최종 선택 package에 대해 install rehearsal과
+deliverables audit까지 같은 suite summary에 포함한다.
+
+```bash
+python3 Simulation/scripts/run_deployable_profile_policy_package_suite.py \
+  --matrix-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/frontier_profile_matrix_summary.json \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/runtime_profiles \
+  --sample-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite \
+  --policies range_priority,target_priority,score_priority,balanced \
+  --split validation \
+  --max-samples 80 \
+  --target-error-limit-m 10.0 \
+  --pipeline-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline
+```
+
+산출물은 `deployable_profile_policy_package_suite_summary.json/txt`, 각 policy별
+`selection/`, `active_candidate/`, `candidate_package/`, 각 candidate package 내부
+`deployable_profile_candidate_package_portability.json/txt`, 그리고
+`package_summary/deployable_profile_candidate_package_summary.csv/json/txt`이다.
+`--pipeline-dir`를 지정한 최종 감사 모드에서는 선택된 policy 아래
+`install_rehearsal/install_manifest.json/txt`와
+`deliverables_check/deployable_profile_deliverables_check.json/txt`,
+`goal_acceptance/rtk_stereo_goal_acceptance.csv/json/txt`도 생성된다.
+2026-06-18 suite 실행 결과는 4개 policy 모두 `PASS`이고 최종 선택은
+`range_priority`의 `sim3_inverse_depth_binned_residual_raw_forward_bins11`이다.
+같은 summary에 `selected_install_status: PASS`,
+`selected_deliverables_status: PASS`, `selected_goal_acceptance_status: PASS`,
+runtime truth `false`가 기록됐다.
+
+최종 acceptance 증거를 한 디렉터리로 고정하려면 다음 bundle exporter를 실행한다.
+이 bundle은 최종 runtime profile, candidate package manifest/check, operator/portability
+check, goal acceptance, deliverables check, suite summary, 필수 CSV/PNG/TXT 산출물을
+복사하고 각 파일의 SHA256을 기록한다. 내부 보정/검증 좌표계는
+`stereo_center_opencv_optical:RDF(right,down,forward)`, public StereoDistance topic
+계약은 `FRD_range(forward,right,down,range)`로 유지한다. PX4/RTK/NED truth는
+calibration/evaluation evidence로만 포함되고 runtime input에는 포함되지 않는다.
+
+```bash
+python3 Simulation/scripts/export_rtk_stereo_goal_acceptance_bundle.py \
+  --goal-acceptance-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/goal_acceptance/rtk_stereo_goal_acceptance.json \
+  --suite-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/deployable_profile_policy_package_suite_summary.json \
+  --deliverables-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/deliverables_check/deployable_profile_deliverables_check.json \
+  --candidate-package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/final_acceptance_bundle
+```
+
+2026-06-18 bundle 실행 결과는 `status: PASS`, file count `29`,
+profile SHA256 `9fcb2e3107be8dd15a7335bab59d09f3d23df03cb74e72172f9a819e18626ceb`,
+validation range RMSE `1.852601842130819m`, raw validation range RMSE
+`3.7799663436141038m`, 1852m target max abs error `4.524451953154312m`,
+goal acceptance `11/11 PASS`, runtime truth `false`였다. 주요 출력은
+`final_acceptance_bundle/rtk_stereo_goal_acceptance_bundle_manifest.json`,
+`final_acceptance_bundle/rtk_stereo_goal_acceptance_bundle_files.csv`,
+`final_acceptance_bundle/rtk_stereo_goal_acceptance_bundle_summary.txt`,
+`final_acceptance_bundle/candidate_package/`, `final_acceptance_bundle/evidence/`,
+`final_acceptance_bundle/artifacts/`이다.
+
+자동 탐색이 특정 방법군에 갇히지 않았는지 확인하려면 method-search catalog audit를
+실행한다. 이 감사는 frontier matrix와 deployable policy selection, 최종 bundle을 함께
+읽어서 rotation/pose alignment, scale/intrinsic compensation, Sim(3), disparity 또는
+inverse-depth, nonlinear/binned residual, geometry+disparity 조합 계열이 모두 포함됐는지
+확인한다. 또한 hard gate를 통과한 후보가 runtime truth-free이고, RDF/FRD 계약을 지키는지
+검사한다.
+
+```bash
+python3 Simulation/scripts/audit_rtk_stereo_method_search_catalog.py \
+  --matrix-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/frontier_profile_matrix_summary.json \
+  --policy-selection-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/selection/deployable_profile_policy_selection.json \
+  --bundle-manifest-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/final_acceptance_bundle/rtk_stereo_goal_acceptance_bundle_manifest.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/method_search_catalog_audit \
+  --min-method-count 12 \
+  --target-error-limit-m 10.0
+```
+
+2026-06-18 catalog audit 결과는 `status: PASS`, method count `247/12`, required
+family coverage `PASS`, deployable hard-gate pass count `166`, selected method
+`sim3_inverse_depth_binned_residual_raw_forward_bins11`, runtime truth `false`,
+coordinate contract `PASS`였다. 다음 자동 탐색 action은 현재 best family 주변의
+local sweep을 계속하되 alternate 후보를 보존하는 것이다. 출력은
+`method_search_catalog_audit/rtk_stereo_method_search_catalog_audit.json/txt`,
+`rtk_stereo_method_search_family_coverage.csv`,
+`rtk_stereo_method_search_candidate_status.csv`,
+`rtk_stereo_method_search_next_actions.csv`이다.
+
+catalog audit의 next action을 실제 다음 sweep 후보로 내보내려면 local sweep plan exporter를
+실행한다. 이 단계는 새 보정법을 fitting하지 않고, 현재 최종 후보
+`sim3_inverse_depth_binned_residual_raw_forward_bins11` 주변에서 중복되지 않는 후보 config를
+만든다. 탐색 축은 residual basis, bin count, residual prior strength, residual gain,
+target weighting, robust loss, monotonic constraint, forward key이며, 이미 catalog에 존재하는
+method 이름은 제외한다.
+
+```bash
+python3 Simulation/scripts/export_rtk_stereo_local_sweep_plan.py \
+  --catalog-audit-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/method_search_catalog_audit/rtk_stereo_method_search_catalog_audit.json \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_plan \
+  --max-candidates 64
+```
+
+2026-06-18 local sweep plan 결과는 `status: PASS`, base method
+`sim3_inverse_depth_binned_residual_raw_forward_bins11`, new candidate count `64`,
+excluded existing method count `247`, runtime truth `false`였다. 상위 후보는
+`sim3_inverse_depth_monotone_binned_residual_raw_forward_bins11`,
+`sim3_inverse_depth_binned_residual_base_forward_bins11`,
+`sim3_inverse_depth_monotone_binned_residual_base_forward_bins11`,
+`sim3_inverse_depth_cauchy_binned_residual_raw_forward_bins11`,
+`sim3_inverse_depth_huber_binned_residual_raw_forward_bins11` 순서다. 출력은
+`local_sweep_plan/rtk_stereo_local_sweep_plan.json/txt`,
+`local_sweep_plan/rtk_stereo_local_sweep_candidates.csv`,
+`local_sweep_plan/rtk_stereo_local_sweep_candidate_configs.csv`,
+`local_sweep_plan/candidate_configs/*.json`이다. 이 config들은 offline fitting 시에만 truth를
+사용하고, runtime export 후보는 `raw_right_m/raw_down_m/raw_forward_m/raw_disparity_px`만
+입력으로 허용해야 한다.
+
+생성된 local sweep config를 실제 calibration pipeline에 연결하려면
+`--local-sweep-config-dir`를 지정한다. 현재 pipeline은 이 plan의 target-weight,
+Huber/Cauchy robust-weight, range-normalized monotone, blended inverse-depth/disparity
+monotone 조합까지 native method search에 추가한다. 각 config의 추가/스킵 상태는
+`local_sweep_config_status.csv/json`에 기록된다.
+
+```bash
+python3 Simulation/scripts/rtk_stereo_calibration_pipeline.py \
+  --mode csv \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64 \
+  --target-range-m 1852.0 \
+  --target-window-m 30.0 \
+  --local-sweep-config-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_plan/candidate_configs
+```
+
+2026-06-18 full local sweep probe 결과는 64개 config 중 native pipeline `ADDED` 64개,
+`SKIP` 0개였다. `base_forward` query 후보는 runtime profile에
+`forward_residual_raw_forward_query: base_forward`를 기록하고, runtime apply도 Sim(3) 적용 후
+forward 값을 LUT query로 사용한다. 추가 후보 중 validation RMSE 상위는
+`sim3_meter_binned_residual_raw_forward_bins11` `1.918516m`,
+`sim3_meter_binned_residual_base_forward_bins11` `1.918523m`,
+`sim3_meter_targetw0p25_binned_residual_raw_forward_bins11` `1.919962m`,
+`sim3_meter_monotone_targetw0p25_binned_residual_raw_forward_bins11` `1.919962m`였다.
+이번 probe의 전체 최종 추천은 기존 내장 후보
+`huber_joint_disparity_ray_rotation_nls`였고 validation RMSE `1.916m`, raw validation RMSE
+`4.021m`, 1852m abs mean error `0.003m`였다. 전체 method comparison row 수는 313개다.
+따라서 local 후보는 스킵 없이 평가되고 runtime profile까지 생성되지만
+현재 최종 acceptance bundle의 `range_priority` 후보를 대체하려면 common-CSV matrix,
+package, deliverables, goal acceptance까지 다시 통과해야 한다.
+
+full local sweep 후보를 pooled CSV 결과만으로 판단하지 않으려면 local-only frontier를
+내보낸 뒤 기존 common-CSV matrix에 재검증한다. 이 단계는 calibration-time truth를 offline
+검증에만 사용하고, replay되는 runtime profile은 `stereo-center RDF(right,down,forward) +
+measured disparity`만 입력으로 사용한다. 출력 public topic 계약은
+`FRD+range(forward,right,down,range)`다.
+
+```bash
+python3 Simulation/scripts/export_rtk_stereo_local_sweep_frontier.py \
+  --method-comparison-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/method_comparison.csv \
+  --local-sweep-status-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_config_status.csv \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/runtime_profiles \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_frontier.csv \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_frontier.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_frontier.txt \
+  --top-n 64
+
+python3 Simulation/scripts/run_common_csv_frontier_profile_matrix.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_frontier.csv \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_common_csv_matrix_full64 \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/runtime_profiles \
+  --top-n 64 \
+  --split validation \
+  --target-range-m 1852.0 \
+  --target-window-m 30.0
+```
+
+2026-06-18 local-only common-CSV matrix 결과는 `status: PASS`, run count `6`,
+method count `64`, runtime truth `false`였다. matrix selected method는
+`sim3_blended_disp_invdepth_monotone_targetw0p25_binned_residual_raw_forward_bins11`이며
+6/6 run에서 PASS했다. 성능은 RMSE mean/max `1.981/3.616m`, 1852m target max
+`3.734m`이다. target error는 여전히 `±10m` 조건을 만족하지만, 기존 acceptance 후보
+`sim3_inverse_depth_binned_residual_raw_forward_bins11`의 common-CSV matrix RMSE mean/max
+`1.883/2.981m`, target max `3.535m`보다 낮지 않다. 따라서 이번 local sweep은
+alternate 후보 탐색에는 유효하지만 최종 `range_priority` 추천을 교체하지 않는다. 주요 출력은
+`local_sweep_pipeline_probe_full64/local_sweep_frontier.csv/json/txt`,
+`local_sweep_common_csv_matrix_full64/frontier_profile_matrix_summary.json/txt`,
+`frontier_profile_matrix_methods.csv`, `frontier_profile_matrix_runs.csv`,
+`frontier_profile_matrix_rmse.png`, `frontier_profile_matrix_target_errors.png`이다.
+
+local-only matrix의 selected 후보를 중심으로 다시 탐색하되 이미 평가한 64개 local 후보를
+반복하지 않으려면 plan exporter에 `--exclude-methods-csv`를 지정한다. 이 CSV는
+`method` 컬럼을 가진 frontier/status/method comparison 파일이면 된다. 아래 round2는
+1차 local matrix selected profile을 active로 삼고 catalog 247개와 1차 local 64개를
+제외한 96개 후보를 생성한다.
+
+```bash
+python3 Simulation/scripts/export_rtk_stereo_local_sweep_plan.py \
+  --catalog-audit-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/method_search_catalog_audit/rtk_stereo_method_search_catalog_audit.json \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/runtime_profiles/sim3_blended_disp_invdepth_monotone_targetw0p25_binned_residual_raw_forward_bins11.json \
+  --exclude-methods-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_frontier.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_plan_round2 \
+  --max-candidates 96
+
+python3 Simulation/scripts/rtk_stereo_calibration_pipeline.py \
+  --mode csv \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96 \
+  --target-range-m 1852.0 \
+  --target-window-m 30.0 \
+  --local-sweep-config-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_plan_round2/candidate_configs
+
+python3 Simulation/scripts/export_rtk_stereo_local_sweep_frontier.py \
+  --method-comparison-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/method_comparison.csv \
+  --local-sweep-status-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/local_sweep_config_status.csv \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/runtime_profiles \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/local_sweep_frontier.csv \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/local_sweep_frontier.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/local_sweep_frontier.txt \
+  --top-n 96
+
+python3 Simulation/scripts/run_common_csv_frontier_profile_matrix.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/local_sweep_frontier.csv \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_common_csv_matrix_round2_96 \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/runtime_profiles \
+  --top-n 96 \
+  --split validation \
+  --target-range-m 1852.0 \
+  --target-window-m 30.0
+```
+
+2026-06-18 round2 결과는 plan `PASS`, excluded extra methods `64`, candidate count
+`96`, pipeline native `ADDED` 96/96, frontier missing profile `0`, common-CSV matrix
+`PASS`였다. round2 matrix selected method는
+`sim3_blended_disp_invdepth_monotone_targetw1_binned_residual_raw_forward_bins11`이고
+6/6 run에서 PASS했다. 성능은 RMSE mean/max `1.971/3.556m`, 1852m target max
+`3.611m`이다. 이는 1차 local matrix selected `1.981/3.616m`, target max `3.734m`보다
+개선됐지만, 기존 최종 acceptance 후보 `sim3_inverse_depth_binned_residual_raw_forward_bins11`
+의 RMSE mean/max `1.883/2.981m`, target max `3.535m`보다 낮지는 않다. 따라서 round2도
+최종 추천 교체 조건은 충족하지 못했고, 다음 탐색은 같은 후보 반복이 아니라 bin count,
+prior strength, residual gain 축을 더 멀리 보내거나, scenario별 selector/portfolio
+전략으로 분리해야 한다.
+
+round2 winner 주변을 한 번 더 탐색하려면 round1과 round2 frontier를 모두 제외하고
+round3 plan을 만든다. 이 round는 residual gain `0.75/1.25`와 target-weight 주변 후보가
+주로 남는다.
+
+```bash
+python3 Simulation/scripts/export_rtk_stereo_local_sweep_plan.py \
+  --catalog-audit-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/method_search_catalog_audit/rtk_stereo_method_search_catalog_audit.json \
+  --active-profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/runtime_profiles/sim3_blended_disp_invdepth_monotone_targetw1_binned_residual_raw_forward_bins11.json \
+  --exclude-methods-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_full64/local_sweep_frontier.csv \
+  --exclude-methods-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round2_96/local_sweep_frontier.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_plan_round3 \
+  --max-candidates 128
+
+python3 Simulation/scripts/rtk_stereo_calibration_pipeline.py \
+  --mode csv \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128 \
+  --target-range-m 1852.0 \
+  --target-window-m 30.0 \
+  --local-sweep-config-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_plan_round3/candidate_configs
+
+python3 Simulation/scripts/export_rtk_stereo_local_sweep_frontier.py \
+  --method-comparison-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/method_comparison.csv \
+  --local-sweep-status-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/local_sweep_config_status.csv \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/runtime_profiles \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/local_sweep_frontier.csv \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/local_sweep_frontier.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/local_sweep_frontier.txt \
+  --top-n 128
+
+python3 Simulation/scripts/run_common_csv_frontier_profile_matrix.py \
+  --frontier-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/local_sweep_frontier.csv \
+  --sweep-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_common_csv_matrix_round3_128 \
+  --runtime-profiles-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_pipeline_probe_round3_128/runtime_profiles \
+  --top-n 128 \
+  --split validation \
+  --target-range-m 1852.0 \
+  --target-window-m 30.0
+```
+
+2026-06-18 round3 결과는 plan `PASS`, excluded extra methods `160`, candidate count
+`128`, pipeline native `ADDED` 128/128, frontier missing profile `0`, common-CSV matrix
+`PASS`였다. round3 matrix selected method는
+`sim3_blended_disp_invdepth_monotone_gain0p75_binned_residual_base_forward_bins11`이고
+6/6 run에서 PASS했다. 성능은 RMSE mean/max `1.964/3.518m`, 1852m target max
+`3.554m`이다. round3는 round2보다 더 좋아졌고 target max는 기존 최종 후보의
+`3.535m`에 가까워졌지만, RMSE mean/max는 여전히 기존 최종 후보
+`1.883/2.981m`보다 크다. 따라서 최종 추천은 계속
+`sim3_inverse_depth_binned_residual_raw_forward_bins11`로 유지한다. 세 번의 local sweep이
+모두 6/6 PASS이지만 global single-profile 교체에는 실패했으므로, 다음 자동 탐색은
+단일 전역 winner를 더 미세 조정하기보다 scenario/seed label 또는 runtime 관측 품질에 따른
+truth-free selector/portfolio를 비교하는 방향이 더 적합하다.
+
+단일 profile을 더 미세 조정하는 대신 selector/portfolio가 유리한지 확인하려면 기존
+all248 matrix와 local round1-3 matrix를 합친 후보 pool을 감사한다. 이 audit은 offline
+validation truth로 점수를 계산하지만, deployable selector 후보는 runtime truth를 쓰지 않는
+`global_single` 또는 `scenario_loso`만 추천 대상으로 삼는다. `scenario_insample`과
+`per_run_oracle`은 상한/진단값이며 배포 추천이 아니다.
+
+```bash
+python3 Simulation/scripts/audit_common_csv_matrix_selector_portfolio.py \
+  --matrix-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active \
+  --matrix-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_common_csv_matrix_full64 \
+  --matrix-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_common_csv_matrix_round2_96 \
+  --matrix-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/local_sweep_common_csv_matrix_round3_128 \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/selector_portfolio_audit_all248_plus_local_rmse \
+  --objective rmse_then_target
+```
+
+2026-06-18 selector portfolio audit 결과는 `status: PASS`, candidate method count
+`535`, run count `6`, runtime truth `false`였다. 세 objective(`score`,
+`target_then_rmse`, `rmse_then_target`) 모두에서 deployable 추천은 `scenario_loso`였다.
+RMSE 우선 objective 기준 `scenario_loso`는 RMSE mean/max `1.632/2.617m`, 1852m target
+max `3.517m`로 기존 최종 단일 후보 `1.883/2.981m`, target max `3.535m`보다 좋았다.
+score objective 기준도 `scenario_loso`는 `1.758/2.617m`, target max `2.696m`였다.
+따라서 다음 구현 단계는 단일 global profile 교체가 아니라, calibration-time matrix에서
+scenario/deployment label별 profile map을 export하고 operator-view selector package로
+검증하는 것이다. selector 입력은 scenario/deployment label 또는 raw runtime feature이며,
+PX4/RTK/NED truth, validation error, replay label은 runtime 입력으로 쓰지 않는다.
+주요 출력은 `selector_portfolio_summary.json/txt`,
+`selector_portfolio_modes.csv`, `selector_portfolio_selected_runs.csv`,
+`selector_portfolio_methods.csv`, `selector_portfolio_modes.png`이다.
+
+`scenario_loso` 결과를 실제 operator-view selector 경로로 쓰려면 selector package를
+내보낸다. 이 exporter는 scenario label용 profile map과 감사 재현용
+`scenario:seed` label을 함께 만든다. 실제 운용 기본 label은 scenario 이름
+(`bbox_quantization_stress`, `disparity_bias_drift_stress`,
+`mixed_runtime_observation_stress`)이며, seed label은 replay audit 재현용이다.
+
+```bash
+python3 Simulation/scripts/export_common_csv_selector_package.py \
+  --selector-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/selector_portfolio_audit_all248_plus_local_rmse/selector_portfolio_summary.json \
+  --selected-runs-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/selector_portfolio_audit_all248_plus_local_rmse/selector_portfolio_selected_runs.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse \
+  --selector-mode scenario_loso \
+  --objective rmse_then_target
+
+python3 Simulation/scripts/select_stereodistance_runtime_profile_by_label.py \
+  --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/runtime_profile_label_selector.json \
+  --deployment-label bbox_quantization_stress \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selection_bbox_quantization_stress.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selection_bbox_quantization_stress.txt
+
+python3 Simulation/scripts/export_stereodistance_runtime_deployment_frontier.py \
+  --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/runtime_profile_label_selector.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/runtime_deployment_frontier
+
+python3 Simulation/scripts/check_stereodistance_operator_view_launch.py \
+  --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/runtime_profile_label_selector.json \
+  --deployment-label bbox_quantization_stress \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/operator_view_launch_check_selector_bbox.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/operator_view_launch_check_selector_bbox.txt
+```
+
+2026-06-18 selector package export 결과는 `status: PASS`, scenario label count `3`,
+deployment label count `15`, profile count `10`, runtime truth `false`였다. 세 scenario
+label selection은 모두 `PASS`였고, `bbox_quantization_stress` operator-view selector
+smoke도 `PASS`였다. 이 check는 selector JSON을 받아 selected label
+`scenario_bbox_quantization_stress`를 해석하고, lightweight profile package의
+`active_runtime_profile.json`을 `run_operator_view.sh --bbox-adjustment`로 넘기는
+print-only command를 검증했다. 생성 출력은
+`scenario_loso_selector_package_rmse/runtime_profile_label_selector.json`,
+`selector_package_profiles.csv`, `selector_package_labels.csv`,
+`runtime_deployment_frontier/runtime_deployment_frontier.json/csv/txt`,
+`selection_<scenario>.json/txt`, `operator_view_launch_check_selector_bbox.json/txt`이다.
+
+export된 selector package가 실제 배포 후보로 충분한지 한 번에 확인하려면 readiness
+checker를 실행한다. 이 check는 selector export, portfolio summary, runtime deployment
+frontier, operator-view selector smoke, scenario label selection 결과를 함께 검사한다.
+PASS 조건은 deployable recommendation이 `scenario_loso`이고, `scenario_loso` validation
+RMSE mean이 `global_single`보다 낮으며, 1852m target max error가 허용치 안에 있고,
+frontier/operator/label selection이 모두 PASS이며, runtime truth 입력이 없는 것이다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/check_common_csv_selector_package_readiness.py \
+  --selector-package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse \
+  --portfolio-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/selector_portfolio_audit_all248_plus_local_rmse/selector_portfolio_summary.json \
+  --frontier-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/runtime_deployment_frontier/runtime_deployment_frontier.json \
+  --operator-check-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/operator_view_launch_check_selector_bbox.json \
+  --selection-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selection_bbox_quantization_stress.json \
+  --selection-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selection_disparity_bias_drift_stress.json \
+  --selection-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selection_mixed_runtime_observation_stress.json \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selector_package_readiness.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selector_package_readiness.txt \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/selector_package_readiness.csv
+```
+
+2026-06-18 readiness 결과는 `status: PASS`, `recommended_deployable_selector_mode:
+scenario_loso`, RMSE mean/max `1.632/2.617m`, 1852m target max `3.517m`였다. 같은
+audit의 `global_single`은 RMSE mean/max `2.023/2.617m`, target max `4.914m`였으므로,
+scenario label을 배포 메타데이터나 운용자 설정으로 줄 수 있다면 이 selector package가
+현재 단일 profile보다 강한 배포 후보이다. readiness의 axis contract는
+`stereo_center_opencv_optical:RDF(right,down,forward)`이고, StereoDistance 공개 topic
+contract는 `FRD_range(forward,right,down,range)`로 분리된다. selector package는
+deployment/scenario label만 선택 입력으로 사용하며, 선택된 runtime profile은
+stereo-center RDF와 measured disparity만 소비한다. PX4/RTK/NED truth는 offline evidence로만
+남는다.
+
+명시적인 scenario label 없이 raw runtime-like feature만으로 profile을 고르는 후보도
+같은 3-scenario sweep에서 다시 확인한다. 이 guard는 `raw_right_m`, `raw_down_m`,
+`raw_forward_m`, `raw_range_m`, `measured_disparity_px`, `left_u_px`, `left_v_px`
+통계와 offline transfer matrix만 사용하고, truth/error/replay winner는 selection 입력에서
+금지한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/select_stereodistance_profile_by_runtime_measurement_guard.py \
+  --sweep-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --catalog-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog/manifest.json \
+  --minimal-set-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog_minimal_set.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_measurement_guard_audit_common_csv_selector_followup \
+  --candidate-source-mode all_catalog \
+  --selection-policy transfer_risk_fallback \
+  --transfer-low-risk-rmse-limit-m 1.3 \
+  --transfer-low-risk-target-limit-m 2.5 \
+  --audit-all-sweep-seeds
+```
+
+2026-06-18 follow-up 결과는 `pass_count: 6/6`, validation-only `6/6`, validation RMSE
+mean/max `1.549/2.264m`, 1852m target mean/max `0.409/1.334m`, target max abs worst
+`3.358m`였다. 이 결과는 명시 scenario label selector의 RMSE mean/max
+`1.632/2.617m`보다 낮다. 다만 현재 audit은 3개 known scenario와 2개 seed 안에서의
+raw-feature 분리 결과이므로, 곧바로 최종 배포 추천을 교체하지 않고 “manual scenario label을
+대체할 수 있는 자동 selector 후보”로 둔다. 다음 검증은 leave-one-scenario-out 또는 새
+오차 regime에서 raw-feature selector가 틀린 profile을 고르지 않는지 확인하는 것이다.
+산출물은
+`runtime_measurement_guard_audit_common_csv_selector_followup/runtime_measurement_guard_audit.csv`,
+`runtime_measurement_guard_summary.json/txt`,
+`runtime_measurement_guard_selection_counts.png`이다.
+
+더 엄격하게 target scenario를 feature library와 candidate source set에서 제외하면 다음처럼
+leave-one-scenario-out raw selector를 감사한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/audit_runtime_measurement_guard_policies.py \
+  --sweep-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --catalog-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog/manifest.json \
+  --minimal-set-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog_minimal_set.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_measurement_guard_policy_audit_loso_followup \
+  --candidate-source-modes all_catalog \
+  --policies nearest_centroid,robust_family_fallback,transfer_risk_fallback,intrinsic_scale_gap_transfer_risk,feature_vote_transfer_risk,knn_transfer_risk,centroid_knn_union_transfer_risk,centroid_knn_veto_transfer_risk \
+  --transfer-low-risk-rmse-limit-m 1.3 \
+  --transfer-low-risk-target-limit-m 2.5 \
+  --exclude-target-scenario-from-library
+```
+
+2026-06-18 LOSO policy audit도 모든 policy가 `6/6` PASS였지만, best recommendation은
+단순 `nearest_centroid`였고 validation RMSE mean/max `2.612/3.493m`, target max abs worst
+`5.595m`로 known-scenario raw selector와 명시 `scenario_loso` selector보다 약했다.
+`feature_vote_transfer_risk`와 `centroid_knn_union_transfer_risk`는 RMSE mean과 target
+worst를 `2.486m`, `5.255m`까지 낮췄지만, fallback 2회와 복잡도 penalty 때문에 현재
+policy score에서는 추천되지 않았다. 이 결과의 의미는 자동 selector가 unknown regime에서도
+`±10m` target gate는 유지하지만, 현재 feature만으로는 scenario label을 알고 고르는
+selector의 정확도를 대체하기에는 아직 부족하다는 것이다. 따라서 배포 우선순위는
+1) 운용자가 scenario/deployment label을 줄 수 있으면 `scenario_loso selector package`,
+2) label이 없으면 raw-feature selector를 candidate로 쓰되 새 regime/실제 보정 비행 replay로
+한 번 더 검증하는 순서로 둔다.
+
+raw-feature selector를 실제 active profile export 경로로 smoke하려면 truth 열을 제거한
+runtime-only CSV를 입력으로 `export_stereodistance_profile_by_operating_mode.py`를 실행한다.
+CSV에는 좌표 계약 문자열처럼 쉼표가 포함된 field가 있으므로, runtime-only CSV를 만들 때
+단순 field number split이 아니라 CSV parser를 사용해야 한다. 필요한 runtime 열은
+`sample_id`, `split`, `raw_right_m`, `raw_down_m`, `raw_forward_m`, `raw_range_m`,
+`left_u_px`, `left_v_px`, `measured_disparity_px`이다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/export_runtime_guard_input_from_calibration_csv.py \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/bbox_quantization_stress/seed_20260617/calibration_samples.csv \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_export_followup/bbox_seed20260617_runtime_only.csv \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_export_followup/runtime_guard_input_export_summary.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_export_followup/runtime_guard_input_export_summary.txt
+
+Simulation/.venv/bin/python Simulation/scripts/export_stereodistance_profile_by_operating_mode.py \
+  --catalog-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog/manifest.json \
+  --input-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_export_followup/bbox_seed20260617_runtime_only.csv \
+  --output-profile Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_export_followup/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_export_followup \
+  --sweep-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --minimal-set-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog_minimal_set.json \
+  --mode auto \
+  --runtime-candidate-source-mode all_catalog \
+  --runtime-selection-policy transfer_risk_fallback \
+  --transfer-low-risk-rmse-limit-m 1.3 \
+  --transfer-low-risk-target-limit-m 2.5
+```
+
+2026-06-18 smoke 결과는 runtime input export `status: PASS`, output row count `360`,
+runtime truth `false`였고, operating-mode export는 `selected_operating_mode:
+runtime_guard`, `has_truth_fields: false`, `has_runtime_fields: true`, selected source
+`bbox_quantization_stress`, calibration-required block `false`였다. 생성된
+`runtime_guard_operating_mode_export_followup/active_runtime_profile.json`은
+`stereodistance_profile_promotion_check.py`에서도 `pass_promotion_check: true`,
+`sample_apply_count: 50`, `sample_invalid_count: 0`, runtime truth `false`를 기록했다.
+즉 scenario label 없이 raw RDF/disparity CSV만 있어도 현재 catalog에서 active profile을
+선택해 StereoDistance loader가 읽을 수 있는 형태로 export할 수 있다. 이 smoke는
+runtime 적용 경로 확인이고, 성능 평가는 위 runtime guard audit과 별도로 본다.
+
+같은 runtime_guard operating-mode export 경로를 모든 scenario/seed calibration CSV에
+대해 반복 확인하려면 batch smoke를 실행한다. 이 wrapper는 각 calibration CSV를
+truth-free runtime guard CSV로 변환하고, active profile export와 promotion check를
+순서대로 실행한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_runtime_guard_operating_mode_batch_smoke.py \
+  --sweep-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360 \
+  --catalog-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog/manifest.json \
+  --minimal-set-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/scenario_profile_catalog_minimal_set.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_batch_smoke_followup \
+  --runtime-candidate-source-mode all_catalog \
+  --runtime-selection-policy transfer_risk_fallback \
+  --transfer-low-risk-rmse-limit-m 1.3 \
+  --transfer-low-risk-target-limit-m 2.5 \
+  --split validation \
+  --max-samples 50
+```
+
+출력은 `runtime_guard_operating_mode_batch_smoke.csv`,
+`runtime_guard_operating_mode_batch_smoke_summary.json/txt`, 그리고 각
+`<scenario>/<seed>/runtime_guard_input.csv`,
+`<scenario>/<seed>/active_runtime_profile.json`,
+`<scenario>/<seed>/promotion_check/promotion_check.json/txt`이다. 이 batch smoke도
+selection/evaluation metric을 재계산하지 않고, runtime 적용 경로가 truth-free CSV와
+StereoDistance loader 기준으로 깨지지 않는지 확인한다.
+
+2026-06-18 batch smoke 결과는 `status: PASS`, run/pass `6/6`, runtime truth `false`였다.
+각 scenario/seed의 promotion check는 `sample_apply_count: 50`, `sample_invalid_count: 0`을
+기록했다. 선택 source는 bbox quantization 2개 seed가 `bbox_quantization_stress`,
+disparity-bias drift 2개 seed가 `disparity_bias_drift_stress`, mixed runtime observation
+2개 seed가 `mixed_runtime_observation_stress`였고, 모두 `runtime_guard` operating mode와
+StereoDistance loader promotion을 통과했다.
+
+batch smoke가 만든 lightweight profile package들을 operator-view wrapper까지 통과시키려면
+다음 readiness check를 실행한다. 이 check는 각 `<scenario>/<seed>/active_runtime_profile.json`
+의 부모 디렉터리를 lightweight package로 보고,
+`run_operator_view_with_calibration_profile.sh --print-only --package-dir ...` 경로가
+`--bbox-adjustment`에 같은 profile을 넘기는지 검사한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/check_runtime_guard_batch_operator_view.py \
+  --batch-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_batch_smoke_followup/runtime_guard_operating_mode_batch_smoke.csv \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_batch_operator_view_followup
+```
+
+출력은 `runtime_guard_batch_operator_view_readiness.csv`,
+`runtime_guard_batch_operator_view_readiness_summary.json/txt`, 그리고 각
+`<scenario>/<seed>/operator_view_launch_check.json/txt`이다. 이 단계도 실제 ROS2/Gazebo를
+띄우지 않고 print-only command contract를 확인한다.
+
+2026-06-18 operator-view batch readiness 결과는 `status: PASS`, run/pass `6/6`,
+runtime truth `false`였다. 6개 모두 `package_type: lightweight_profile_package`,
+package check `PASS`, wrapper return code `0`, launch contract `PASS`였고, wrapper가
+해석한 `resolved_runtime_profile`은 각 run의 `active_runtime_profile.json`과 일치했다.
+
+자동 `runtime_guard` 경로를 하나의 배포 후보로 볼 수 있는지 최종 점검하려면 다음
+readiness checker를 실행한다. 이 check는 known-scenario raw-feature audit, stricter
+leave-one-scenario-out policy audit, runtime_guard operating-mode batch smoke,
+operator-view batch readiness를 함께 묶는다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/check_runtime_guard_deployment_readiness.py \
+  --known-guard-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_measurement_guard_audit_common_csv_selector_followup/runtime_measurement_guard_summary.json \
+  --loso-policy-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_measurement_guard_policy_audit_loso_followup/runtime_measurement_guard_policy_audit_summary.json \
+  --batch-smoke-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_batch_smoke_followup/runtime_guard_operating_mode_batch_smoke_summary.json \
+  --operator-readiness-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_batch_operator_view_followup/runtime_guard_batch_operator_view_readiness_summary.json \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_deployment_readiness_followup/runtime_guard_deployment_readiness.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_deployment_readiness_followup/runtime_guard_deployment_readiness.txt \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_deployment_readiness_followup/runtime_guard_deployment_readiness.csv
+```
+
+이 readiness의 PASS 기준은 known-scenario raw selector와 LOSO policy audit가 모두
+`±10m` target gate를 통과하고, runtime_guard batch smoke와 operator-view batch readiness가
+같은 run count로 전부 PASS하며, 모든 단계가 runtime truth 없이 stereo-center RDF와 measured
+disparity 기반 입력 계약을 유지하는 것이다. 이 결과가 PASS이면 `runtime_guard`는
+“label이 없을 때 쓸 자동 배포 후보”가 된다. 단, manual scenario/deployment label을 줄 수
+있으면 위 `scenario_loso selector package`가 여전히 우선 후보이고, runtime_guard는 실제
+보정 비행 CSV나 새 오차 regime replay로 한 번 더 검증한다.
+
+2026-06-18 runtime_guard deployment readiness 결과는 `status: PASS`,
+recommendation `runtime_guard_candidate_ready_for_real_calibration_csv_replay`였다.
+known-scenario raw selector는 `6/6` PASS, RMSE mean/max `1.549/2.264m`, target max
+`3.358m`였고, LOSO policy audit도 `6/6` PASS, best policy `nearest_centroid`, RMSE
+mean/max `2.612/3.493m`, target max `5.595m`였다. batch smoke와 operator-view readiness는
+각각 `6/6` PASS였다. 따라서 자동 runtime_guard는 “새 실제 보정 비행 CSV replay로 넘어갈
+수 있는 후보”로 승격한다.
+
+deployment readiness는 기존 3개 runtime observation stress scenario에서의 검증이다. 기존
+stress set에 과적합되지 않았는지 보려면 exported runtime profile을 독립 synthetic seed와
+다른 perturbation family(`nominal`, `yaw_pitch_stress`, `disparity_noise_stress`,
+`intrinsic_scale_stress`, `combined_sensor_stress`, `bbox_outlier_stress`)에 replay한다.
+이 fresh replay도 runtime profile 입력은 stereo-center RDF와 measured disparity만 사용하고,
+PX4/NED truth는 offline 평가에만 사용한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/audit_runtime_profile_fresh_seed_replay.py \
+  --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_operating_mode_batch_smoke_followup/bbox_quantization_stress/seed_20260617/active_runtime_profile.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_fresh_seed_replay_followup/bbox_profile \
+  --experiment-id EXP-20260618-runtime-guard-fresh-replay-bbox \
+  --seed-start 20310000 \
+  --trial-count 20 \
+  --sample-count 840 \
+  --target-oversample-count 48
+
+Simulation/.venv/bin/python Simulation/scripts/summarize_fresh_seed_profile_replays.py \
+  --replay-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/runtime_guard_fresh_seed_replay_followup \
+  --replay-root Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/selector_package_fresh_seed_replay_followup \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/fresh_seed_profile_replay_combined_followup
+```
+
+2026-06-18 fresh-seed replay에서는 runtime_guard batch에서 선택된 대표 profile 3개와
+scenario selector package의 전체 profile 10개를 비교했다. 합산 결과는 `status: FAIL`,
+strict pass `0/13`, runtime truth `false`였다. 가장 좋은 ranked candidate는 selector package의
+run-level bbox profile
+`rtk_stereo_calibration-sim3_blended_disp_invdepth_monotone_huber_gain1p25_binned_residual_base_forward_bins11`
+였고, pass rate `0.817`, range RMSE mean `1.567m`, position RMSE mean `3.076m`였지만
+1852m 근방 target max abs error가 `14.219m`로 `±10m` gate를 넘었다. runtime_guard batch
+대표 profile 중 best는 `rtk_stereo_calibration-theil_sen_global_inverse_depth_linear`였고
+pass rate `0.808`, range RMSE mean `1.541m`, target max `14.927m`였다.
+
+따라서 현재 결론은 둘로 나눈다. 기존 stress scenario와 operator-view 경로 기준으로는
+`scenario_loso selector package`와 `runtime_guard`가 모두 배포 후보지만, 새 synthetic
+perturbation family까지 포함한 최종 보정법으로는 아직 PASS가 아니다. 다음 탐색은
+fresh replay의 tail failure를 줄이는 방향, 특히 intrinsic scale stress와 bbox/disparity
+outlier stress에서 1852m target error를 `±10m` 이내로 제한하는 runtime guard 또는 더 보수적인
+profile selection rule을 찾아야 한다.
+
+후속 탐색으로 기존 best Sim(3) profile에 runtime-safe guard를 덧붙여 fresh replay를
+반복했다. `export_guarded_runtime_profile.py`는 임의의 Sim(3) runtime profile에
+`target_disparity_range_delta_cap_guard`, `target_disparity_blend_guard`,
+`target_range_away_blend_guard`를 주입한다. 이 guard들은 measured disparity, raw range,
+corrected range만 사용하고 truth는 사용하지 않는다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/export_guarded_runtime_profile.py \
+  --input-profile Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/packages/run_bbox_quantization_stress_seed_20260618/active_runtime_profile.json \
+  --output-profile Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/fresh_guard_profile_sweep_followup/cap0p5/active_runtime_profile.json \
+  --guard-mode target_disparity_range_delta_cap \
+  --half-width-px 0.35 \
+  --range-delta-cap-m 0.5
+```
+
+2026-06-18 guard sweep 결과는 아직 `FAIL`이다. 12개 guard variant 중 best는
+`away_w70_a0p75`였고 pass rate `0.825`, range RMSE mean `1.604m`, position RMSE mean
+`3.089m`, target max `12.899m`였다. range-delta cap 계열의 best는 `cap0p5`로 target max를
+기존 `14.219m`에서 `12.216m`까지 줄였지만 `±10m` gate는 통과하지 못했다. 즉 단일 프레임
+profile에 target-neighborhood guard만 추가하는 방식은 tail error를 줄이지만 충분하지 않다.
+
+worst row 분석에서는 bbox/disparity outlier가 섞인 validation target-window sample에서
+measured disparity가 true disparity보다 약 `+2.2px` 크게 튀어 raw range가 truth보다 약
+`37m` 짧아지는 사례가 확인됐다. 이 정보는 offline 분석에서만 알 수 있으며, 실제 runtime에서
+true disparity는 사용할 수 없다. 따라서 이 tail은 global pose/origin 보정만의 문제가 아니라
+measurement outlier rejection 문제로 분리해 다뤄야 한다.
+
+같은 이유로 `audit_runtime_profile_fresh_seed_replay.py`에 corrected RDF range history만 쓰는
+trailing temporal filter 옵션도 추가했다. 초기 trailing median과 낮은 threshold linear filter는
+접근 비행의 정상 range 증가까지 outlier로 처리해 성능이 크게 악화됐고, cascade를 제거한
+trailing linear prediction도 bbox-outlier replay에서 PASS하지 못했다. 현재 결론은 단순 temporal
+range smoothing이 아니라, 영상/BBox/disparity 측정 단계에서 outlier score를 산출하거나,
+시간 연속성과 stereo geometry를 함께 쓰는 robust tracker/filter가 필요하다는 것이다.
+
+그 다음에는 measured disparity history만 쓰는 runtime-safe prefilter도 시험했다. 이 prefilter는
+이전 measured disparity로 현재 disparity를 예측하고, threshold를 넘는 경우 raw RDF bearing은
+유지한 채 range를 measured/predicted disparity 비율로 rescale한다. raw range target-window
+제한 옵션도 추가해 1852m 주변에서만 동작하게 할 수 있다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/audit_runtime_profile_fresh_seed_replay.py \
+  --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/fresh_bbox_outlier_direct_calibration_followup/policy_profiles/target_max_stable.json \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/fresh_disparity_prefilter_replay_followup/w5_th3p5 \
+  --experiment-id EXP-20260618-fresh-disparity-prefilter-w5-th3p5 \
+  --scenarios bbox_outlier_stress \
+  --disparity-prefilter-window 5 \
+  --disparity-prefilter-threshold-px 3.5
+```
+
+2026-06-18 disparity prefilter sweep도 `FAIL`이었다. 12개 variant 중 target max만 보면
+`w5_th3p5`가 `9.106m`로 `±10m` gate 안에 들어왔지만, prefilter count가 `944/4200` 수준으로
+너무 많아 range RMSE mean이 `8.479m`, position RMSE mean이 `9.543m`까지 악화됐고 pass rate도
+`5/20`에 그쳤다. raw-range window를 걸면 false positive는 줄었지만 prefilter가 거의 작동하지
+않거나 target max가 다시 `14m` 이상으로 남았다. 따라서 단순 disparity trend thresholding은
+tail만 줄이고 전체 정확도를 해치는 tradeoff가 커서 최종 후보가 아니다.
+
+이미 각 policy package가 만들어져 있을 때는 다음 요약만 단독 실행할 수 있다.
+
+```bash
+python3 Simulation/scripts/summarize_deployable_profile_candidate_packages.py \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection_target_priority/candidate_package \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection_score_priority/candidate_package \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection_balanced/candidate_package \
+  --output-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_summary
+```
+
+2026-06-18 결과는 4개 policy package 모두 package/operator-ready `PASS`였다. package와
+operator-view까지 통과한 후보 중 validation range RMSE 기준 최종 선택은 계속
+`range_priority`의 `sim3_inverse_depth_binned_residual_raw_forward_bins11`이다.
+
+- `range_priority`: RMSE mean/max `1.883/2.981m`, target max `3.535m`
+- `balanced`: RMSE mean/max `1.892/3.103m`, target max `3.501m`
+- `score_priority`: RMSE mean/max `2.064/3.408m`, target max `3.131m`
+- `target_priority`: RMSE mean/max `2.222/3.387m`, target max `3.005m`
+
+모든 후보가 1852m `±10m` 조건과 RDF axis 6/6 조건을 만족하므로, 현재 기본 추천은
+validation range RMSE가 가장 낮은 `range_priority` 후보로 유지한다. target worst-case를
+최우선으로 두는 별도 운용 모드에서는 `target_priority` 후보를 alternate package로
+보존한다.
+
+candidate package를 다른 디렉터리로 옮겨도 package-local `active_runtime_profile.json`만
+참조하는지 확인하려면 다음 portability smoke check를 실행한다. 이 check는 패키지를
+임시 디렉터리로 복사한 뒤 package checker와 operator-view dry-run을 다시 실행한다.
+
+```bash
+python3 Simulation/scripts/check_deployable_profile_candidate_package_portability.py \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package/deployable_profile_candidate_package_portability.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package/deployable_profile_candidate_package_portability.txt
+```
+
+2026-06-18에는 suite의 4개 policy candidate package 모두 portability `PASS`였다.
+각 복사본에서 package check `PASS`, operator-view dry-run `PASS`,
+`package_type: candidate_package`, runtime truth `false`, 그리고 복사된 패키지 내부
+`active_runtime_profile.json` 해석을 확인했다. 이 검증의 입력/출력 계약은 runtime
+profile 입력 `stereo-center RDF(right,down,forward) + measured disparity`, public topic
+출력 `FRD+range(forward,right,down,range)`이다.
+
+배포 패키지를 다른 디렉터리로 옮겨도 package-local selector가 원본 실험 결과
+경로가 아니라 패키지 내부 `active_runtime_profile.json`만 참조하는지 smoke
+검증하려면 다음을 실행한다. selector를 쓰는 acceptance dashboard wrapper는 이
+검증을 자동 실행하고, 결과를
+`deployment_package/evidence/package_portability_check.json|txt`와
+`deployment_readiness.json/csv/txt`에 포함한다.
+
+```bash
+python3 Simulation/scripts/check_stereodistance_deployment_package_portability.py \
+  --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
+  --deployment-label runtime_observation_stress \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package/evidence/package_portability_check.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package/evidence/package_portability_check.txt
+```
+
+이 check는 패키지를 임시 디렉터리로 복사한 뒤
+`evidence/package_runtime_profile_label_selector.json`을 실행하고, 선택 결과가
+복사된 패키지 내부 `active_runtime_profile.json`과 복사된 package dir을 가리키는지
+확인한다. 입력 label은 운용자가 정한 배포/scenario label뿐이며, PX4/RTK/NED truth나
+validation/replay 오차값은 selector 입력으로 사용하지 않는다.
+
+이미 생성된 manifest만 단독으로 재검증하려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/validate_stereodistance_active_profile_deployment_manifest.py \
+  --manifest-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_deployment_manifest.json \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_deployment_manifest_validation.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_deployment_manifest_validation.txt
+```
+
+검증된 manifest에서 배포 패키지만 다시 만들려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/export_stereodistance_active_profile_deployment_package.py \
+  --manifest-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_deployment_manifest.json \
+  --manifest-validation-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_deployment_manifest_validation.json \
+  --output-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package
+```
+
+이미 만들어진 배포 패키지만 단독 검사하려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/check_stereodistance_active_profile_deployment_package.py \
+  --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package/deployment_package_check.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package/deployment_package_check.txt
+```
+
+이미 생성된 배포 패키지 inventory만 단독 재검증하려면 다음을 실행한다. 이
+검증은 `deployment_package/inventory/` 자체를 제외한 패키지 파일들의 상대
+경로, 크기, SHA-256이 기록 당시와 같은지만 확인하며, PX4 NED truth,
+stereo-center RDF, public FRD+range 좌표값을 변환하거나 다시 계산하지 않는다.
+
+```bash
+python3 Simulation/scripts/export_stereodistance_deployment_package_inventory.py \
+  --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
+  --inventory-json Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package/inventory/stereodistance_deployment_package_inventory.json \
+  --output-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package/inventory
+```
+
+패키지 검사까지 통과한 active profile을 실제 StereoDistance 런타임 profile
+경로로 설치하려면 다음을 실행한다. 이 명령은 full deployment package와
+lightweight candidate package를 자동 감지한다. 먼저 해당 package checker를 다시
+실행하고, candidate package에 portability evidence가 있으면 그것도 `PASS`인지 확인한
+뒤 `active_runtime_profile.json`만 지정 경로로 복사한다. 설치된 파일의 SHA-256은
+package manifest의 `active_profile_sha256`과 같아야 한다. 기본값은 기존 파일을
+덮어쓰지 않으며, 의도적으로 교체할 때만 `--force`를 지정한다.
+런타임 입력 계약은 설치 후에도 stereo-center RDF(`right_m`, `down_m`,
+`forward_m`)와 measured disparity이며, PX4/RTK/NED truth는 입력하지 않는다.
+
+```bash
+python3 Simulation/scripts/install_stereodistance_active_profile_package.py \
+  --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
+  --output-profile <StereoDistance-runtime-profile-path>/active_runtime_profile.json \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/profile_install/install_manifest.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/profile_install/install_manifest.txt
+```
+
+현재 policy suite의 최종 추천 candidate package를 설치 리허설하려면 다음처럼
+결과 폴더 안의 rehearsal 경로를 출력 대상으로 둔다.
+
+```bash
+python3 Simulation/scripts/install_stereodistance_active_profile_package.py \
+  --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package \
+  --output-profile Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/install_rehearsal/active_runtime_profile.json \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/install_rehearsal/install_manifest.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/install_rehearsal/install_manifest.txt \
+  --force
+```
+
+2026-06-18 실행 결과는 `status: PASS`, `package_type: candidate_package`,
+`package_check_status: PASS`, `portability_check_status: PASS`, 설치 SHA-256
+`9fcb2e3107be8dd15a7335bab59d09f3d23df03cb74e72172f9a819e18626ceb` 일치,
+runtime truth `false`였다. 실제 StereoDistance 운용 경로에 쓸 때는 같은 명령의
+`--output-profile`만 운용 profile 경로로 바꾼다.
+
+최종 추천 package가 원래 요구한 CSV/PNG/TXT 산출물과 연결되어 있는지 한 번에
+감사하려면 다음을 실행한다. 이 check는 보정값을 다시 계산하지 않고, pooled pipeline의
+`method_comparison.csv`, `target_1852m_stats.csv`, `validation_predictions.csv`,
+`range_error_before_after.png`, `residual_disparity_by_distance.png`,
+`rdf_axis_rmse.png`, `summary.txt`와 package/operator/portability/install evidence를
+검사한다. 또한 selected method가 raw보다 validation range RMSE를 줄였는지,
+1852m target max error가 `±10m` 안인지, RDF/NED/FRD 계약이 명시되어 있는지 확인한다.
+
+```bash
+python3 Simulation/scripts/check_deployable_profile_deliverables.py \
+  --pipeline-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/pooled_scenario_profile/pipeline \
+  --package-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/package_summary/deployable_profile_candidate_package_summary.json \
+  --candidate-package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package \
+  --install-manifest-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/install_rehearsal/install_manifest.json \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/deliverables_check/deployable_profile_deliverables_check.json \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/deliverables_check/deployable_profile_deliverables_check.txt
+```
+
+2026-06-18 실행 결과는 `status: PASS`, selected method
+`sim3_inverse_depth_binned_residual_raw_forward_bins11`, pooled pipeline validation
+range RMSE `1.853m` 대 raw `3.780m`, pooled pipeline 1852m max abs error
+`4.524m`, package/operator/portability/install `PASS`, runtime truth `false`였다.
+같은 package의 common-CSV matrix worst target max error는 위 package summary 기준
+`3.535m`이며, 두 검증 모두 `±10m` 조건을 만족한다.
+
+원래 실험 목표의 numbered requirements와 최종 산출물 요구를 행 단위로 감사하려면
+다음 checklist를 실행한다. 이 check는 suite summary, deliverables check, candidate
+package manifest, README interface contract를 함께 읽고, PX4 NED truth offline-only,
+stereo-center RDF/BBox/disparity 입력, synthetic/error injection, method family coverage,
+train/validation split, validation/1852m PASS, CSV/PNG/TXT 산출물, runtime package readiness,
+실제 topic 교체 interface, validation 중심 최종 선택 정책을 각각 PASS/FAIL로 기록한다.
+
+```bash
+python3 Simulation/scripts/check_rtk_stereo_goal_acceptance.py \
+  --suite-summary-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/deployable_profile_policy_package_suite_summary.json \
+  --deliverables-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/deliverables_check/deployable_profile_deliverables_check.json \
+  --candidate-package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/candidate_package \
+  --readme Simulation/README.md \
+  --output-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/goal_acceptance/rtk_stereo_goal_acceptance.json \
+  --output-csv Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/goal_acceptance/rtk_stereo_goal_acceptance.csv \
+  --output-txt Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/goal_acceptance/rtk_stereo_goal_acceptance.txt
+```
+
+2026-06-18 실행 결과는 `status: PASS`, `pass_count: 11/11`, selected policy
+`range_priority`, selected method `sim3_inverse_depth_binned_residual_raw_forward_bins11`,
+runtime truth `false`였다.
+
+ROS2/Gazebo operator view에서 검증된 배포 패키지를 바로 적용하려면 다음을
+사용한다. `--print-only`를 붙이면 실제 ROS2/Gazebo를 띄우지 않고
+`run_operator_view.sh --bbox-adjustment <package>/active_runtime_profile.json`
+명령만 확인한다.
+
+```bash
+./run_operator_view_with_calibration_profile.sh \
+  --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
+  --print-only \
+  -- --no-px4 yolo_target_hz:=0.0
+```
+
+같은 조건을 JSON/TXT evidence로 남기려면 다음 checker를 실행한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/check_stereodistance_operator_view_launch.py \
+  --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/operator_view_launch_check.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/operator_view_launch_check.txt
+```
+
+launch 파일의 profile parameter contract만 단독 확인하려면 다음을 실행한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/check_stereodistance_launch_profile_contract.py \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/launch_profile_contract.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/launch_profile_contract.txt
+```
+
+wrapper summary, deployment manifest, package check, install rehearsal을 모두
+수동으로 다시 최종 점검하려면 readiness checker를 실행한다. 이 단계는 보정법을
+다시 학습하지 않고, 이미 생성된 evidence가 서로 같은 active profile SHA-256을
+가리키는지, promotion/package/install/public topic payload 상태가 PASS인지,
+operator-view launch check가 PASS인지, runtime 입력이 truth/PX4/RTK/NED를
+요구하지 않는지 확인한다.
+`--install-rehearsal-profile`을 넣어 wrapper를 실행했다면 같은 파일들이
+wrapper에서 이미 자동 생성된다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/check_rtk_stereo_deployment_readiness.py \
+  --wrapper-summary-json Simulation/results/rtk_stereo_acceptance_matrix_summary/rtk_stereo_acceptance_dashboard_with_promotion_summary.json \
+  --matrix-active-profile-gate-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_frontier_profile_matrix/active_profile_matrix_gate/active_profile_matrix_gate.json \
+  --output-json Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_readiness.json \
+  --output-txt Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_readiness.txt \
+  --output-csv Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_readiness.csv
+```
+
+같은 과정을 수동으로 나눠 디버그하려면 다음 summary를 실행한다. 단독 promotion
+check까지 matrix에 넣으려면 아래 `stereodistance_profile_promotion_check.py`를 먼저
+실행해 `promotion_check.json`을 만든 뒤 `--promotion-check-json`을 함께 지정한다.
+
+```bash
+python3 Simulation/scripts/summarize_rtk_stereo_acceptance_matrices.py \
+  --single-audit-json Simulation/results/rtk_stereo_calibration_<RUN_ID>/output_audit/rtk_stereo_calibration_output_audit.json \
+  --multi-seed-summary-json Simulation/results/rtk_stereo_policy_multi_seed/multi_seed_summary.json \
+  --robustness-summary-json Simulation/results/rtk_stereo_robustness_sweep/robustness_summary.json \
+  --deployment-strategy-json Simulation/results/rtk_stereo_robustness_sweep/deployment_strategy_recommendation.json \
+  --output-active-profile Simulation/results/rtk_stereo_acceptance_matrix_summary/active_runtime_profile.json \
+  --promotion-check-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_promotion_check/promotion_check.json \
+  --output-dir Simulation/results/rtk_stereo_acceptance_matrix_summary
+```
+
+출력은 `rtk_stereo_acceptance_matrix_summary.json/csv/txt`이며, 단일 산출물
+계약, seed/split 안정성, cross-scenario robustness/deployment strategy를
+동일한 CSV row schema로 기록한다. 이 summary도 좌표값을 변환하지 않고,
+PX4/RTK NED truth는 calibration/evaluation evidence로만, runtime profile은
+stereo-center RDF와 measured disparity 입력으로만 사용됐는지 확인한다.
+`--deployment-strategy-json`과 `--output-active-profile`을 함께 지정하면
+검증된 deployment strategy에 따라 실제 StereoDistance에 넣을
+`active_runtime_profile.json`도 복사하고, `active_profile_export` PASS row를
+summary matrix에 추가한다. 이 row는 최종 export 파일 자체를 다시 읽어
+runtime profile class로 로드하고 대표 raw RDF/BBox-center/disparity 입력에
+apply할 수 있는지, runtime input이 truth/PX4/RTK/NED를 포함하지 않는지,
+forbidden runtime input에 truth/PX4/RTK가 명시됐는지도 직접 검사한다.
+deployment strategy가 `scenario_profile_catalog`이면
+runtime truth가 아니라 보정/배포 메타데이터 또는 운용자 설정에서 온
+`--scenario <label>`을 추가로 지정해야 한다.
+export된 active profile을 StereoDistance promotion gate로 단독 재검증하려면
+다음을 실행한다. `--sample-csv`는 `validation_predictions.csv`가 아니라 raw RDF,
+left image center, measured disparity를 가진 `calibration_samples.csv`여야 한다.
+
+```bash
+python3 Simulation/scripts/stereodistance_profile_promotion_check.py \
+  --profile-json Simulation/results/rtk_stereo_acceptance_matrix_summary/active_runtime_profile.json \
+  --sample-csv Simulation/results/rtk_stereo_calibration_<RUN_ID>/calibration_samples.csv \
+  --output-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/active_profile_promotion_check \
+  --split validation \
+  --max-samples 50
+```
+
+이 promotion check는 runtime profile schema load, 실제 `StereoDistanceNode`
+profile loader, axis contract 선언, forbidden runtime input 선언,
+truth/PX4/RTK/NED-free runtime input, validation raw sample apply를 검사한다.
+`--promotion-check-json`을 summary 명령에 함께 넣으면 이 독립 promotion 결과도
+`standalone_profile_promotion` row로 acceptance matrix에 포함되어, sample apply
+0건 또는 invalid sample이 있으면 전체 `overall_pass`가 실패한다.
 
 강건/가중 Sim(3) 후보의 목적은 bbox center, origin 차이, 자세각 오차,
 baseline/focal/disparity 오차가 섞여 만든 raw stereo RDF와 PX4/RTK truth
@@ -3015,6 +5262,7 @@ Gazebo 카메라 센서는 기본 30Hz(`CAMERA_UPDATE_RATE_HZ=30.0`)로 설정�
 각 Plot의 시간축은 최근 30초 창으로 autoscroll되며, 값 축은 현재 보이는 데이터 범위에 맞춰 자동으로 다시 잡히도록 실행 시 rqt_plot 패치를 적용합니다. 시간 창 길이는 `--plot-window 30`처럼 바꿀 수 있습니다.
 기본 YOLO 설정은 `config/yolo.env`에서 읽습니다. 기본 모델은 Ultralytics 기본 모델 이름 `yolov8n.pt`, class는 `any`, confidence는 `0.10`입니다. 모델 파일이 로컬에 없으면 Ultralytics가 런타임에 기본 위치로 내려받을 수 있습니다.
 기본 실행은 YOLO 거리 계산을 `yolo_target_hz:=40.0`, `yolo_device:=cuda:0`, `yolo_imgsz:=1280`으로 요청합니다. 2 km 부근의 작은 드론 bbox를 양쪽 카메라에서 유지하고 YOLO stride 32 경고를 피하기 위해 카메라 가로 해상도와 같은 1280 입력 크기를 기본으로 사용합니다. 거리 노드는 `config/yolo.env`의 `YOLO_PYTHON` 또는 로컬 `.venv`, 없으면 `python3`로 실행합니다. CUDA가 실제로 잡히면 CUDA/FP16으로 좌/우 이미지를 batch 추론하고, CUDA가 잡히지 않으면 CPU로 fallback하더라도 YOLO 이미지 구독과 거리 계산을 계속 시도합니다. CPU fallback은 느릴 수 있으므로 필요하면 `--yolo-hz`나 `yolo_imgsz`를 낮춥니다.
+YOLO runtime bootstrap은 기본적으로 CUDA PyTorch wheel을 요구합니다(`YOLO_TORCH_BACKEND=cuda`, `YOLO_TORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu126`). CPU-only 환경을 의도적으로 쓰려면 `YOLO_TORCH_BACKEND=cpu ./run_operator_view.sh ...`처럼 실행합니다. CUDA wheel이 설치되어도 OS에서 NVIDIA driver와 `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm` 장치 노드가 정상이어야 `torch.cuda.is_available()`이 true가 됩니다.
 YOLO bbox overlay 화면은 기본으로 켜집니다(`overlay_publish_hz:=20.0`). Overlay 이미지는 전용 `detection_overlay_node`가 raw HD 카메라와 `/stereo/detections` bbox 결과를 결합해 발행하므로, YOLO 거리 계산 루프와 이미지 그리기/rqt 표시 부하를 분리합니다. Overlay 노드는 최신 카메라 프레임을 캐시하고 좌/우 이미지를 교차 발행해 부하 피크를 줄입니다. 이 값은 목표 발행률이며, Gazebo/rqt/PX4 부하에 따라 실측 Hz는 낮아질 수 있습니다. YOLO 거리 계산에 자원을 우선 배정하려면 `--raw-view`를 붙여 overlay 발행을 끕니다.
 YOLO 실제 추론 Hz는 `/stereo/yolo_update_hz`를 기준으로 확인합니다. `/target_distance`는 그래프 표시를 위해 마지막 거리값도 `plot_publish_hz`로 재발행하므로, 이 토픽 Hz가 곧 YOLO 추론 Hz를 의미하지는 않습니다.
 실시간 기록은 앱 가운데의 Recorder 패널에서 `Start Lite`, `Start Full`, `Start Debug`, `Stop` 버튼으로 제어합니다. `Lite`는 Excel/MATLAB용 `telemetry.csv`, `Full`은 CSV와 좌/우 overlay MP4, `Debug`는 CSV/MP4와 재현용 rosbag을 함께 저장합니다. 새 `telemetry.csv`에는 `axis_contract=stereo_center_frd:forward_right_down`이 들어가며, 카메라 기준 실제 위치는 `drone_forward_m`, `drone_right_m`, `drone_down_m`, 카메라 기준 실제 3D 직선거리는 `ground_truth_m`으로 저장됩니다. 스테레오 3D 추정값은 `estimated_forward_m`, `estimated_right_m`, `estimated_down_m`, `estimated_range_m`과 raw YOLO alias `raw_forward_m/right_m/down_m`, bbox 보정 alias `corrected_forward_m/right_m/down_m`으로 저장합니다. 새 CSV는 공개 축 필드로 legacy `x/y/z`를 내보내지 않습니다. 명령 실행과 동시에 기록을 시작해야 하는 경우에는 `--record-lite`, `--record-full`, `--record-debug` 옵션을 사용할 수 있습니다.
@@ -3517,5 +5765,260 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 
 ## 변경 이력
 
+- 2026-06-18: fresh-seed replay에서 단일 frame 보정 profile과 단순 raw/disparity/alpha-beta prefilter는 1852 m worst-case tail을 안정적으로 통과하지 못했습니다. 실패 원인은 전역 자세/원점 보정 부족보다 순간 disparity/BBox 측정 이상치가 장거리에서 증폭되는 문제로 좁혀졌습니다. 후속으로 `repeated_observation_trimmed_mean_n7_trim0p2`를 적용해 left image `u/v`와 measured disparity를 7회 독립 관측 후 trimmed mean으로 fuse하고 stereo-center RDF로 재삼각측량한 뒤 runtime profile을 적용했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/repeated_observation_fusion_all_scenarios_followup/aggregate_summary/`에 CSV/TXT로 저장되어 있습니다. nominal, yaw/pitch, disparity noise, combined sensor, bbox outlier stress는 기존 bbox-runtime profile과 함께 STRICT_PASS이고, intrinsic-only stress는 calibrated profile이 range RMSE를 악화시켜 identity passthrough profile이 STRICT_PASS입니다. runtime 입력은 fused pixel/disparity와 raw RDF뿐이며 PX4/NED truth는 synthetic generation/audit 전용입니다. 내부 보정 좌표는 stereo-center RDF(right, down, forward), public StereoDistance topic 계약은 FRD+range(forward, right, down, range)입니다.
+- 2026-06-18: repeated observation의 독립 오차 가정이 너무 낙관적인지 확인하기 위해 common-mode 오차를 포함한 multi-burst fusion도 검증했습니다. `multiburst_observation_*_b5x5_trim0p2_common0p5` 계열은 bbox outlier, combined sensor, disparity noise, intrinsic identity stress에서 모두 20/20 STRICT_PASS입니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/aggregate_summary/`에 저장되어 있습니다. 이 결과는 실제 운용에서 단일 BBox 중심 하나를 바로 보정하지 말고, 짧은 burst 단위로 pixel/disparity를 robust fusion한 뒤 보정 profile 또는 identity passthrough를 적용하는 구조가 더 적합하다는 증거입니다.
+- 2026-06-18: 최신 multi-burst 결과를 StereoDistance runtime에서 읽을 수 있는 observation-fusion manifest로 export했습니다. manifest는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_runtime_manifest/observation_fusion_runtime_manifest.json`이며 초기 fresh 기본 tier는 `fresh_common_mode_b5x5_aggregate_best`였습니다. audit, raw apply smoke, runtime profile apply smoke, input/output schema validation을 통과했습니다. 이 manifest는 image `left_u_px/left_v_px/measured_disparity_px` burst를 stereo-center RDF로 fuse하는 adapter 설정만 포함하며, PX4/NED truth나 validation metric은 runtime 입력으로 사용하지 않습니다.
+- 2026-06-18: fresh multi-burst manifest를 전체 observation-fusion deployment package로 묶었습니다. 패키지는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/`이며 acceptance check `PASS`입니다. 포함 검증은 manifest audit, bbox conversion/apply/profile apply, calibration CSV truth-column drop/extract/apply/profile apply, path equivalence, public topic payload validation/source equivalence/dry-run publish, input/output schema validation, StereoDistance node smoke, all-tier override smoke, operator-view fusion launch check입니다. 초기 node smoke는 package manifest default 5x5 tier로 `fused:MultiBurstObservationFusion:25`와 finite corrected range를 확인했습니다.
+  EXP-215 full follow-up 이후 package default를 `fresh_common_mode_b7x3_aggregate_best`로 승격했습니다. EXP-226 이후 최신 all-tier override smoke는 12개 tier 모두 실제 `StereoDistanceNode` helper path에서 fused 상태를 확인했고, `fresh_independent_n7_low_latency`는 `fused:RepeatedObservationFusion:7`, default는 `fused:MultiBurstObservationFusion:21`, `fresh_common_mode_b9x3_range_quality`와 `fresh_common_mode_b9x3_target_tail_high_common`은 `fused:MultiBurstObservationFusion:27`, `fresh_common_mode_b12x3_target_tail_slow`는 `fused:MultiBurstObservationFusion:36`, `fresh_common_mode_b15x3_target_tail_mid_slow`는 `fused:MultiBurstObservationFusion:45`, `fresh_common_mode_b16x3_target_tail_upper_bound`는 `fused:MultiBurstObservationFusion:48`, 5x5 fallback tier들은 `fused:MultiBurstObservationFusion:25`로 PASS했습니다. operator-view tier override dry-run도 `fresh_independent_n7_low_latency`를 `--observation-fusion-tier`로 전달해 PASS했습니다. 패키지는 검증된 `active_runtime_profile.json`을 내부에 복사하고, package-dir operator-view dry-run이 package-local profile/manifest를 자동 해석하는지 확인해 PASS했습니다. inventory/checksum gate도 재생성했으며 `inventory/`와 `acceptance_check/`를 제외한 73개 파일, 161744 bytes를 기록합니다.
+- 2026-06-18: multi-burst 결과 전체 CSV에서 latency frontier를 다시 산출했습니다. 새 산출물은 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/aggregate_summary/multiburst_observation_latency_frontier.csv`, `multiburst_observation_method_aggregate.csv`, `multiburst_observation_latency_frontier.txt`입니다. 15관측 3x5 후보도 bbox/combined/disparity/intrinsic-identity stress 모두 STRICT_PASS이지만, 당시 all-scenario worst target error와 mean validation range RMSE 기준 best aggregate는 25관측 `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p5`였습니다. 이후 EXP-215에서 21관측 7x3 후보가 이 기준을 갱신했습니다.
+- 2026-06-18: EXP-214 expanded multi-burst probe로 `3x3/3x5/3x7/5x3/5x5/7x3/7x5` burst spec과 median/trimmed-mean inner/outer 조합을 추가 탐색했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_expanded_probe/aggregate_summary_selector/`에 저장했습니다. selector-compatible 평가에서는 bbox/combined/disparity stress는 active runtime profile, intrinsic-only stress는 identity passthrough profile을 사용했으며 runtime truth는 사용하지 않았습니다. best aggregate probe는 `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p2_common0p5`로 4/4 STRICT_PASS, 21 observations, target worst `6.009134m`, mean range RMSE `1.402767m`입니다. 이 단계에서는 full-size 재검증 전이라 후보로만 기록했고, 이후 EXP-215 full follow-up에서 default 승격 조건을 통과했습니다. 좌표 계약은 image `left_u_px/left_v_px/measured_disparity_px` -> stereo-center RDF(right,down,forward) -> public FRD+range이며, PX4/NED truth는 synthetic generation/audit 전용입니다.
+- 2026-06-18: EXP-215에서 EXP-214의 `7x3 trimmed_mean/trimmed_mean common0.5` 후보를 기존 full follow-up seed/sample 조건으로 재검증했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b7x3_full_followup/aggregate_summary/`에 저장했습니다. 4개 stress 모두 STRICT_PASS, target worst `5.063616m`, mean range RMSE `1.308669m`, mean position RMSE `3.624118m`로 기존 b5x5 default의 target worst `6.046387m`, mean range RMSE `1.326220m`, mean position RMSE `3.630421m`보다 모두 낮고 관측 수도 25에서 21로 줄었습니다. 이에 fresh deployment default를 `fresh_common_mode_b7x3_aggregate_best`로 승격하고 기존 b5x5 aggregate는 fallback tier로 유지했습니다.
+- 2026-06-18: EXP-216에서 high-burst `9x3/11x3` 후보를 같은 full follow-up 조건으로 추가 탐색했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_highburst3_followup/aggregate_summary/`에 저장했습니다. `9x3`는 4/4 STRICT_PASS, target worst `5.079371m`, mean range RMSE `1.296722m`, mean position RMSE `3.621114m`였고, `11x3`는 mean range RMSE `1.287791m`로 더 낮지만 target worst가 `5.392157m`로 악화되었습니다. default selection rule은 1852m target worst를 먼저 보므로 `7x3` default를 유지하고, `9x3`는 aggregate range RMSE를 더 중시할 때 쓰는 `fresh_common_mode_b9x3_range_quality` override tier로 추가했습니다.
+- 2026-06-18: EXP-217에서 중간 후보 `8x3`과 burst 내부 관측을 늘린 `7x4`도 같은 full follow-up 조건으로 확인했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_midburst_followup/aggregate_summary/`에 저장했습니다. `8x3`는 4/4 STRICT_PASS, target worst `5.553816m`, mean range RMSE `1.298221m`, 관측 24개였고, `7x4`는 4/4 STRICT_PASS, target worst `5.285188m`, mean range RMSE `1.307341m`, 관측 28개였습니다. 둘 다 기존 `7x3` default보다 target worst가 나쁘고, `7x4`는 관측수도 더 많으므로 manifest tier로 승격하지 않았습니다. 이 결과는 현재 target-worst 우선 선택에서는 burst 수/관측 수를 단순히 늘리는 것보다 `7x3` 구성이 더 안정적이라는 negative evidence로 기록합니다.
+- 2026-06-18: EXP-218에서 active `7x3` 구조의 trim fraction을 `0.1/0.2/0.25/0.3/0.4`로 바꿔 같은 full follow-up 조건에서 재검증했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b7x3_trim_followup/aggregate_summary_with_baseline/`에 baseline `trim0.2` 포함 CSV/TXT로 저장했습니다. 목적은 StereoDistance runtime 입력 계약을 바꾸지 않고 hierarchical trimming만 조정해 target-window tail error와 validation RMSE가 더 안정적인지 확인하는 것입니다. 입력은 image `left_u_px/left_v_px/measured_disparity_px`를 7 bursts x 3 observations로 묶은 runtime 관측이며, PX4/NED truth는 synthetic evaluation/audit에만 사용합니다. 출력은 stereo-center RDF(right,down,forward)이고 public topic은 FRD+range(forward,right,down,range)입니다. 모든 trim 후보가 4/4 STRICT_PASS였지만, `trim0.1`은 target worst를 `5.018522m`로 약간 낮추는 대신 mean range RMSE `1.327366m`와 mean position RMSE `3.627202m`로 default보다 후퇴했습니다. `trim0.25`는 이 7x3 discrete geometry에서 `trim0.2`와 동일했고, `trim0.3/0.4`는 target worst가 각각 `5.222556m`/`5.442956m`로 악화되었습니다. 따라서 active default는 validation RMSE와 outlier robustness가 더 안정적인 `trim0.2`로 유지하고, `trim0.1`은 target-tail specialist 후보로만 기록합니다.
+- 2026-06-18: EXP-219에서 within-burst common-mode image/disparity error를 더 강하게 둔 `common0.75/1.0` 조건으로 `3x5/5x5/7x3/9x3` 후보를 재검증했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_common_mode_followup/aggregate_summary/`에 저장했습니다. 목적은 active `7x3` default가 높은 관측 상관에서도 유지되는지, 아니면 이미 추가한 `9x3` range-quality override가 더 적합한지 확인하는 것입니다. 입력/출력 계약은 EXP-218과 동일하게 image `left_u_px/left_v_px/measured_disparity_px` -> stereo-center RDF(right,down,forward) -> public FRD+range이며, PX4/NED truth와 common-mode fraction은 synthetic audit에만 사용합니다. 4개 stress 모두에서 best aggregate는 `9x3 trim0.2 common0.75`였고 4/4 STRICT_PASS, target worst `6.150405m`, mean range RMSE `1.389720m`, mean position RMSE `3.648680m`입니다. 같은 조건의 `7x3 common0.75`는 target worst `6.407873m`, mean range RMSE `1.406747m`였습니다. 따라서 기본 운용 default는 기존 `7x3 trim0.2 common0.5`로 유지하지만, 관측 상관이나 range RMSE 우선 운용에서는 `fresh_common_mode_b9x3_range_quality` override를 우선 후보로 본다는 근거를 추가합니다.
+- 2026-06-18: EXP-220에서 high-common-mode `9x3` override의 trim fraction을 `0.1/0.2/0.25/0.3/0.4`로 다시 훑었습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b9x3_trim_common_followup/aggregate_summary_with_baseline/`에 baseline `trim0.2` 포함 CSV/TXT로 저장했습니다. `trim0.1 common0.75`는 4/4 STRICT_PASS, target worst `5.986332m`로 high-common-mode 조건에서 가장 낮은 1852m tail error를 냈지만 mean range RMSE `1.403496m`, mean position RMSE `3.651919m`로 `trim0.2 common0.75`의 `1.389720m`/`3.648680m`보다 후퇴했습니다. 따라서 기존 `fresh_common_mode_b9x3_range_quality`는 range-quality override로 유지하고, target-tail 우선 운용을 위해 `fresh_common_mode_b9x3_target_tail_high_common` tier를 추가했습니다. package 재생성 후 manifest audit `9/9`, all-tier override smoke `9/9`, acceptance check `PASS`, runtime truth `false`입니다.
+- 2026-06-18: EXP-221에서 high-common-mode 조건의 `b9x3` 주변 burst shape `8x3/8x4/10x3/10x4/11x3/12x3`와 trim `0.1/0.2`를 비교했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_adjacent_shape_followup/aggregate_summary/`에 저장했습니다. best aggregate는 `12x3 trim0.1 common0.75`로 4/4 STRICT_PASS, 36 observations, target worst `5.839273m`, mean range RMSE `1.380696m`, mean position RMSE `3.646339m`였습니다. 이는 EXP-220의 `9x3 trim0.1 common0.75`보다 target-tail과 평균 RMSE가 모두 낮지만 27관측에서 36관측으로 늘어납니다. 따라서 default와 b9x3 lower-latency override는 유지하고, latency/motion budget이 허용될 때 쓰는 `fresh_common_mode_b12x3_target_tail_slow` tier를 추가했습니다. package 재생성 후 manifest audit `10/10`, all-tier override smoke `10/10`, acceptance check `PASS`, runtime truth `false`입니다.
+- 2026-06-18: EXP-222에서 `12x3` 이후 포화 여부를 보기 위해 `12x3/14x3/16x3/12x4/14x4`, trim `0.1`, common `0.75`를 비교했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_saturation_followup/aggregate_summary/`에 저장했습니다. best target-tail aggregate는 `16x3 trim0.1 common0.75`로 4/4 STRICT_PASS, 48 observations, target worst `5.691110m`, mean range RMSE `1.381157m`, mean position RMSE `3.647368m`였습니다. `12x3`보다 target worst는 낮지만 평균 range/position RMSE가 근소하게 후퇴하고 관측 수가 36에서 48로 늘어납니다. 따라서 `fresh_common_mode_b16x3_target_tail_upper_bound`를 latency-tolerant target-tail upper-bound tier로 추가하고, balanced slow target-tail은 `12x3`로 유지합니다. package 재생성 후 manifest audit `11/11`, all-tier override smoke `11/11`, acceptance check `PASS`, runtime truth `false`입니다.
+- 2026-06-18: EXP-223에서 `b16x3` upper-bound tier의 trim/common 민감도를 `trim=0.05/0.10/0.15/0.20`, `common=0.5/0.75/1.0`로 다시 확인했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b16x3_sensitivity_followup/aggregate_summary/`에 저장했습니다. best aggregate는 `16x3 trim0.2 common0.5`로 4/4 STRICT_PASS, 48 observations, target worst `5.490163m`, mean range RMSE `1.360747m`, mean position RMSE `3.614085m`였습니다. 이는 EXP-222의 `16x3 trim0.1 common0.75`보다 target-tail, 평균 range RMSE, 평균 position RMSE를 모두 낮추므로 `fresh_common_mode_b16x3_target_tail_upper_bound` evidence를 EXP-223 결과로 교체했습니다. default는 여전히 21관측 `b7x3`, balanced slow target-tail은 36관측 `b12x3`이고, `b16x3`는 48관측 latency를 허용할 때만 쓰는 upper-bound override입니다. package 재생성 후 manifest audit `11/11`, all-tier override smoke `11/11`, acceptance check `PASS`, inventory `73` files / `156421` bytes, runtime truth `false`입니다.
+- 2026-06-18: EXP-224에서 EXP-223의 best 조건인 `trim0.2 common0.5`를 고정하고 burst count `13x3/14x3/15x3/16x3/17x3/18x3/20x3`를 비교했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_burst_count_common0p5_followup/aggregate_summary/`에 저장했습니다. all-scenario best는 여전히 `16x3 trim0.2 common0.5`로 4/4 STRICT_PASS, 48 observations, target worst `5.490163m`, mean range RMSE `1.360747m`, mean position RMSE `3.614085m`였습니다. `15x3`는 45 observations로 낮은 latency 후보지만 target worst가 `5.646591m`로 후퇴했고, `17x3/18x3/20x3`는 관측 수 증가에도 disparity stress target-tail이 악화되었습니다. 따라서 EXP-224는 `16x3`가 현재 48관측 upper-bound 포화점이라는 negative evidence로 기록하고, runtime manifest tier는 변경하지 않습니다.
+- 2026-06-18: EXP-225에서 `16x3 trim0.2 common0.5` 구조를 유지한 채 inner/outer fusion mode를 `median/trimmed_mean/mean` 조합으로 비교했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b16x3_mode_followup/aggregate_summary/`에 저장했습니다. all-scenario best는 기존 `inner trimmed_mean / outer trimmed_mean`이며 4/4 STRICT_PASS, target worst `5.490163m`, mean range RMSE `1.360747m`, mean position RMSE `3.614085m`를 유지했습니다. `inner mean / outer trimmed_mean`은 aggregate 수치상 동률이지만 burst 내부 outlier에 대한 의미가 약하고, `median/median`은 bbox stress에서는 target-tail이 좋았으나 disparity stress worst가 `5.819561m`로 후퇴했습니다. 따라서 EXP-225도 runtime manifest tier 변경 없이 기존 `trimmed_mean/trimmed_mean` upper-bound를 유지하는 negative evidence로 기록합니다.
+- 2026-06-18: EXP-226에서 45관측 `b15x3` lower-latency target-tail 후보의 trim fraction을 `0.10/0.15/0.25/0.30`로 비교했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b15x3_trim_followup/aggregate_summary/`에 저장했습니다. best aggregate는 `15x3 trim0.15 common0.5`로 4/4 STRICT_PASS, 45 observations, target worst `5.633070m`, mean range RMSE `1.367329m`, mean position RMSE `3.617117m`였습니다. 이는 EXP-224의 `15x3 trim0.2` target worst `5.646591m`보다 약간 좋고, 36관측 `b12x3`보다 target-tail이 낮지만 48관측 `b16x3` upper-bound보다는 후퇴합니다. 따라서 `fresh_common_mode_b15x3_target_tail_mid_slow` tier를 추가해 b12x3와 b16x3 사이의 latency/target-tail trade-off로 제공했습니다. package 재생성 후 manifest audit `12/12`, all-tier override smoke `12/12`, b15x3 override `fused:MultiBurstObservationFusion:45`, acceptance check `PASS`, inventory `73` files / `161744` bytes, runtime truth `false`입니다.
+- 2026-06-18: EXP-227에서 36관측 `b12x3` slow target-tail tier도 EXP-223/226에서 강했던 `common0.5` 조건으로 재평가했습니다. trim fraction은 `0.10/0.15/0.20/0.25`를 비교했고 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_b12x3_common0p5_trim_followup/aggregate_summary/`에 저장했습니다. best aggregate는 `12x3 trim0.1 common0.5`와 discrete-equivalent `trim0.15`로 4/4 STRICT_PASS, 36 observations, target worst `6.206171m`, mean range RMSE `1.372707m`, mean position RMSE `3.617990m`였습니다. 이는 기존 `fresh_common_mode_b12x3_target_tail_slow` evidence인 `12x3 trim0.1 common0.75`의 target worst `5.839273m`보다 나쁘므로 b12x3 tier는 기존 high-common evidence를 유지합니다. EXP-227은 b12x3에서는 moderate common-mode가 target-tail을 개선하지 못한다는 negative evidence입니다.
+- 2026-06-18: observation-fusion deployment acceptance checker에 default-tier policy gate, all-tier override smoke gate, operator-view tier override gate를 추가했습니다. 이제 package check는 manifest default와 package summary default가 일치하는지, default tier가 `selection_scope=all_scenario_aggregate`인지, adapter가 truth-free `MultiBurstObservationFusion`인지, aggregate evidence가 `STRICT_PASS`이며 pass/trial이 전부 통과인지 확인한다. 또한 manifest의 모든 tier override가 실제 node helper path에서 fused 상태로 통과하는지, operator wrapper가 저지연 tier override를 실제 `--observation-fusion-tier` 인자로 전달하는지 확인합니다. EXP-222 upper-bound target-tail tier 추가 후 fresh package acceptance는 `default_selection_scope=all_scenario_aggregate`, `default_evidence_pass=4/4`, `tier_override_smoke_pass=11/11`, `operator_view_fusion_tier_override=fresh_independent_n7_low_latency`, `failure_count=0`으로 다시 PASS했습니다.
+- 2026-06-18: observation-fusion manifest를 실제 `stereo_distance_node` 실행 경로에 연결했습니다. 새 launch 파라미터는 `enable_observation_fusion`, `observation_fusion_manifest_path`, `observation_fusion_tier`입니다. 노드는 YOLO left/right bbox center에서 만든 runtime image observation(`left_u_px`, `left_v_px`, measured disparity)을 짧은 buffer에 쌓고, manifest adapter가 요구하는 개수에 도달하면 fused observation을 stereo-center RDF(`right,down,forward`)로 재삼각측량한 뒤 기존 bbox/runtime profile 보정 입력으로 사용합니다. warm-up 또는 fusion 실패 시 기존 단일-frame raw RDF를 그대로 사용합니다. 실행 예시는 다음과 같습니다.
+
+```bash
+./run_operator_view_with_calibration_profile.sh \
+  --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/fresh_guard_profile_sweep_followup/away_w100_a0p75/active_runtime_profile.json \
+  --observation-fusion-manifest Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json \
+  -- --no-px4
+```
+
+runtime 입력은 영상 기반 `left_u_px/left_v_px/measured_disparity_px`와 그로부터 계산된 raw stereo-center RDF뿐입니다. PX4/RTK/NED truth는 calibration/evaluation evidence로만 사용하고 runtime path에는 들어가지 않습니다. `/stereo/estimated_position` 및 `/stereo/corrected_position` 공개 topic은 기존 FRD+range(`forward,right,down,range`) 순서를 유지합니다.
+이 경로의 operator dry-run evidence는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/operator_view_fusion_launch_check.json` 및 `.txt`에 저장되어 있으며, `observation_fusion_manifest_status=PASS`, `launch_contract_status=PASS`, `runtime_truth_used=false`를 기록합니다.
+운용 중에는 `/stereo/profile_status` JSON에서 `observation_fusion_status`, `observation_fusion_adapter`, `observation_fusion_buffer_count`, `observation_fusion_required_count`를 확인할 수 있습니다. 예를 들어 default multi-burst tier는 required count가 burst 수와 burst당 observation 수의 곱으로 표시되며, warm-up 중에는 기존 단일-frame raw RDF가 계속 발행됩니다.
+- 2026-06-18: EXP-228에서 현재 fresh observation-fusion deployment tier들의 offline portfolio upper bound를 진단했습니다. 도구는 `Simulation/scripts/summarize_observation_fusion_tier_portfolio.py`이며, 기본 비교는 `selection_scope=all_scenario_aggregate` tier만 포함합니다. single-source fallback tier는 scenario label이 aggregate tier와 직접 비교되지 않도록 기본 oracle에서 제외하고, 필요할 때만 `--include-single-source`로 포함합니다. 재실행 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_tier_portfolio_followup/EXP-20260618-228-tier-portfolio/`에 저장했습니다. aggregate-only oracle은 4개 scenario에서 `status=PASS`, `runtime_truth_used=false`, default tier `fresh_common_mode_b7x3_aggregate_best`, default worst target error `5.063616m`, oracle worst target error `5.063616m`로 동일했습니다. scenario별 oracle은 bbox outlier에서 27관측 `b9x3 range_quality`, combined/intrinsic stress에서 48관측 `b16x3 target_tail_upper_bound`, disparity noise에서 21관측 default `b7x3`를 골랐습니다. 따라서 현재 배포된 all-scenario aggregate tier들만 runtime selector로 고르는 방식은 worst-case target-tail을 더 줄이지 못하며, 다음 탐색은 disparity-noise stress 자체를 낮추는 새 관측/잔차 모델 또는 truth-free runtime feature 기반 selector로 진행해야 합니다. 이 진단은 offline validation only이고 runtime 입력은 계속 image `left_u_px/left_v_px/measured_disparity_px` 및 stereo-center RDF이며, PX4/NED truth는 사용하지 않습니다.
+- 2026-06-18: EXP-229에서 EXP-228의 병목인 `disparity_noise_stress`만 대상으로 `b7x3` low-trim/mode probe를 수행했습니다. 공정 비교를 위해 EXP-218과 같은 scenario-loso profile 및 seed range(`21220000..21220019`)를 사용했고, 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_disparity_b7x3_lowtrim_mode_probe_matched/aggregate_summary/`에 저장했습니다. `trim0.05/0.10/0.15`와 inner/outer `median/trimmed_mean/mean` 조합은 모두 STRICT_PASS였지만 best target max는 기존 `b7x3 trim0.1`과 같은 `5.018522m`, range mean `1.997943m`에 머물렀습니다. median outer 조합은 target-tail이 더 나빴고, discrete 7x3 구조에서는 여러 low-trim/mean 조합이 같은 fused value로 수렴했습니다. 따라서 b7x3 mode/low-trim만으로는 disparity-noise 병목을 더 줄이지 못하며 manifest tier는 변경하지 않습니다.
+- 2026-06-18: EXP-230/231에서 disparity-noise 병목에 causal alpha-beta motion innovation gate가 도움이 되는지 확인했습니다. EXP-230은 corrected RDF stream 단독 motion fusion을 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/motion_fusion_disparity_probe/`에 저장했고, best는 STRICT_PASS였지만 target max `8.555299m`, range mean `2.298741m`로 b7x3 observation fusion보다 나빴습니다. EXP-231은 새 도구 `Simulation/scripts/run_runtime_multiburst_motion_fusion_sweep.py`로 image `left_u_px/left_v_px/measured_disparity_px` multi-burst fusion 뒤 corrected stereo-center RDF에 motion gate를 추가했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_motion_fusion_disparity_probe/forward/`에 저장했습니다. best는 `alpha=1.0`, `innovation_clip=40m`로 observation-only와 완전히 같은 target max `5.018522m`, range mean `1.997943m`였고, 더 강한 temporal gate는 target max를 20m 이상으로 악화시켰습니다. 따라서 현재 disparity-noise stress에서는 temporal motion smoothing/gating이 추가 개선을 만들지 못하며, 다음 탐색은 disparity/inverse-depth residual 자체 또는 runtime observable selector로 진행합니다. 좌표 계약은 두 단계 모두 stereo-center RDF이고 public topic은 계속 FRD+range입니다.
+- 2026-06-18: EXP-232/233에서 multi-burst observation fusion 이후 남는 disparity/range residual을 calibration-time train split으로 fit하는 새 후보를 추가했습니다. 실행 도구는 `Simulation/scripts/run_runtime_multiburst_disparity_residual_sweep.py`이고, 요약 도구는 `Simulation/scripts/summarize_multiburst_disparity_residual_results.py`입니다. 이 방법은 train truth로만 residual polynomial을 학습하고, runtime 적용에는 fused `measured_disparity_px` 또는 `log_disparity`와 corrected stereo-center RDF만 사용합니다. PX4/NED truth, target label, true disparity는 runtime 입력이 아닙니다. `disparity_noise_stress` 단독 probe(EXP-232)는 기존 b7x3 observation-only target max `5.018522m`, range mean `1.997943m`를 `log_disparity` degree-2 ray-scale residual로 target max `1.645409m`, range mean `0.459445m`까지 낮췄습니다. 이어서 bbox/combined/intrinsic까지 같은 family를 확인한 EXP-233 aggregate 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/aggregate_summary/`에 저장했습니다. 4개 scenario 공통 best는 `b7x3 trim0.05 common0.5 + ray_scale log_disparity degree2 ridge1 clip0.5`로 4/4 STRICT_PASS, 21 observations, residual target worst `3.288941m`, residual range RMSE mean across scenarios `0.442031m`, residual position RMSE mean `2.946359m`입니다. scenario별로 disparity, combined, intrinsic은 target-tail과 range가 크게 개선됐고, bbox는 target max가 `3.220680m`에서 `3.288941m`로 약간 나빠졌지만 여전히 1852m ±10m gate 안입니다. 이 후보는 현재 default b7x3의 worst `5.063616m`와 EXP-228 aggregate-tier oracle worst `5.063616m`를 모두 낮추는 첫 residual-family 증거입니다. 단, 아직 deployment manifest/node runtime export에는 넣지 않았으므로 후속 작업은 residual coefficients export, loader/apply smoke, package check입니다.
+- 2026-06-18: EXP-232/233 residual family를 runtime-loadable JSON까지 연결했습니다. `stereo_ground_sim.runtime_deployment_selector.DisparityResidualRuntimeProfile`은 JSON의 `coefficients_low_to_high`, `feature_mean`, `feature_scale`, `feature_space`, `correction_space`, `correction_clip`을 읽고 `RuntimeMeasurementSample`에 적용합니다. runtime apply 입력은 corrected stereo-center RDF(`right,down,forward`)와 fused `measured_disparity_px`뿐이며, public FRD topic이나 PX4/RTK truth는 입력이 아닙니다. Export 도구는 `Simulation/scripts/export_runtime_disparity_residual_profile.py`, loader/apply smoke 도구는 `Simulation/scripts/check_runtime_disparity_residual_profile.py`입니다. 대표 export는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/runtime_profile_export/disparity_noise_seed21220000_residual_profile.json`에 저장했고, validation smoke는 `.../runtime_profile_export/disparity_noise_seed21220000_check/`에 저장했습니다. smoke 결과는 `status=PASS`, validation rows `420`, observation range RMSE `1.965520m -> 0.438736m`, target max abs error `4.447238m -> 1.098600m`, `runtime_truth_used=false`입니다.
+- 2026-06-18: EXP-235에서 EXP-234 residual profile을 fresh observation-fusion deployment package에 포함했습니다. `Simulation/scripts/run_observation_fusion_deployment_package.py`는 이제 선택 인자 `--disparity-residual-profile-json`을 받아 package-local `disparity_residual_profile.json`으로 복사하고, `StereoDistanceNode` smoke에서 observation fusion -> base runtime profile -> residual profile 적용 순서를 확인합니다. `Simulation/scripts/check_observation_fusion_deployment_package.py`는 residual profile이 포함된 경우 `DisparityResidualRuntimeProfile` type, truth-free runtime input, coordinate contract, source hash, node smoke `applied:*` 상태를 acceptance gate로 검증합니다. 재생성한 fresh package는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/`이며 acceptance `PASS`, manifest audit `12/12`, tier override smoke `12/12`, default node smoke `fused:MultiBurstObservationFusion:21`, residual smoke `applied:disparity_noise_stress_seed_21220000_disparity_residual`, inventory `74` files / `165416` bytes입니다. 런타임 입력은 여전히 image `left_u_px/left_v_px`, `measured_disparity_px`, stereo-center RDF이며, PX4/NED/RTK truth는 calibration/evaluation evidence에만 남습니다.
+- 2026-06-18: EXP-236/237에서 residual profile 일반화 범위를 확인했습니다. 새 도구 `Simulation/scripts/run_runtime_pooled_disparity_residual_profile.py`는 여러 scenario/seed의 train split을 합쳐 하나의 `DisparityResidualRuntimeProfile`을 fit하고 validation split으로 평가합니다. EXP-236의 4-scenario 단일 pooled profile은 `60/80` PASS로 실패했습니다. best는 target worst를 `5.018522m -> 4.691842m`로 줄였지만, `intrinsic_scale_stress`에서 raw 대비 range 개선 조건을 모두 실패했고 `disparity_noise_stress` 평균 range도 `1.997943m -> 2.097912m`로 악화되었습니다. 따라서 하나의 global residual polynomial을 모든 stress에 무조건 적용하는 방식은 rejected evidence로 둡니다. 반면 EXP-237 scenario별 pooled profile catalog는 4개 scenario 각각 `20/20 STRICT_PASS`입니다. 대표 성능은 bbox range mean `0.563071m -> 0.524207m`, combined target max `2.476891m -> 1.865128m`, disparity target max `5.018522m -> 1.621288m`, intrinsic target max `4.309140m -> 0.953251m`입니다. scenario-pooled disparity profile은 실제 `StereoDistanceNode` smoke도 `applied:EXP-20260618-237-disparity-scenario-residual-profile_pooled_disparity_residual`로 PASS했습니다. 이 branch의 결론은 “unconditional single residual”이 아니라, 배포 label/운용 mode/관측 stress classifier가 있을 때 선택 가능한 residual profile catalog입니다. runtime selection은 future work이며 PX4/NED/RTK truth 또는 validation metric을 runtime selector 입력으로 쓰면 안 됩니다.
+- 2026-06-18: EXP-238에서 EXP-237 scenario residual profile들을 label-selectable catalog로 묶고 operator 실행 경로에 연결했습니다. 새 도구는 `Simulation/scripts/export_disparity_residual_profile_catalog.py`와 `Simulation/scripts/select_disparity_residual_profile_by_label.py`입니다. catalog는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/`에 저장했으며, `bbox_outlier_stress`, `combined_sensor_stress`, `disparity_noise_stress`, `intrinsic_scale_stress` label이 각각 package-local residual JSON으로 resolve됩니다. selector 입력은 `deployment_label`, `scenario_label`, `scenario_name`뿐이고, forbidden runtime fields에는 PX4/RTK truth, validation error, target-window label, true disparity, true image feature가 명시됩니다. `run_operator_view.sh`와 `run_operator_view_with_calibration_profile.sh`는 이제 `--disparity-residual-profile`/`--disparity-residual-profile-json` 및 `--disparity-residual-selector-json`을 통해 `enable_disparity_residual_profile`과 `disparity_residual_profile_path`를 launch/node parameter로 전달합니다. `check_stereodistance_launch_profile_contract.py`와 `check_stereodistance_operator_view_launch.py`도 이 경로를 검증합니다. 저장된 operator evidence `.../scenario_residual_catalog/operator_view_launch_check_residual_selector.json`은 `PASS`이고 command에 observation fusion manifest, base runtime profile, resolved disparity residual profile이 모두 포함됐습니다. 예시는 다음과 같습니다.
+
+```bash
+./run_operator_view_with_calibration_profile.sh \
+  --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/packages/run_bbox_quantization_stress_seed_20260618/active_runtime_profile.json \
+  --observation-fusion-manifest Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json \
+  --disparity-residual-selector-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/disparity_residual_profile_label_selector.json \
+  --deployment-label disparity_noise_stress \
+  -- --no-px4
+```
+
+이 명령의 residual selector는 명시 label만 사용합니다. 실제 자동 selector를 만들기 전까지는 운영자가 deployment label을 고르거나, 별도 truth-free 관측 stress classifier가 label을 제공해야 합니다.
+- 2026-06-18: EXP-239에서 scenario residual catalog의 cross-scenario transfer matrix를 만들었습니다. 새 도구는 `Simulation/scripts/evaluate_disparity_residual_catalog_transfer.py`이며, 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/transfer_matrix/`에 저장했습니다. label-matched profile은 4/4 scenario에서 `STRICT_PASS`입니다. 하지만 wrong-profile transfer는 위험합니다. bbox profile은 combined/disparity에서도 gate는 통과하지만 range 개선이 약하고, intrinsic scenario에서는 `0/20` 실패입니다. disparity profile은 bbox/combined에서 gate는 통과해도 range를 크게 악화시키고, intrinsic에서는 `0/20` 실패입니다. intrinsic profile은 bbox에서 `17/20`, disparity에서 `5/20`만 통과합니다. 결론은 residual catalog를 자동 적용하려면 stress classifier 또는 명시 deployment label의 신뢰도가 필요하다는 것입니다. selector가 불확실할 때는 residual profile을 끄거나 conservative default를 쓰는 guard가 필요합니다. 이 transfer 평가에서도 truth는 offline metric 전용이고, residual apply는 measured disparity와 corrected stereo-center RDF만 사용했습니다.
+- 2026-06-18: EXP-240에서 residual catalog 자동 적용을 위한 truth-free feature-domain guard를 시험했습니다. 새 도구는 `Simulation/scripts/evaluate_disparity_residual_feature_guard.py`이며, 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/feature_guard/`에 저장했습니다. guard decision은 measured disparity feature z-score p95와 residual correction magnitude p95만 사용하고, PX4/RTK/NED truth는 offline metric에만 사용했습니다. 결과는 `FAIL`입니다. viable guard는 `0/120`이고, 가장 보수적인 bbox row는 wrong-profile 적용을 `0/60`으로 막았지만 residual 적용도 `0`회라서 단순 disable fallback입니다. combined/disparity profile의 best row는 label-matched `20/20`을 유지했지만 wrong-profile에도 `33/60`회 적용됐고, intrinsic profile은 wrong-profile `60/60`회 적용됐습니다. 따라서 현재 두 feature만으로는 EXP-238 explicit label selector를 대체할 수 없습니다. 다음 자동 탐색은 image-quality, detector/tracker confidence, epipolar consistency, temporal innovation, calibration metadata처럼 truth-free이면서 scenario를 더 잘 분리하는 feature를 추가해야 합니다.
+- 2026-06-18: EXP-241에서 단일 threshold guard 대신 truth-free multi-feature nearest-centroid selector를 시험했습니다. 새 도구는 `Simulation/scripts/evaluate_disparity_residual_feature_selector.py`이며, 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/feature_selector/`에 저장했습니다. selector feature는 image-space `left_u_px/left_v_px`, measured/fused disparity 통계, raw/observation stereo-center RDF 통계뿐이며, PX4/RTK/NED truth, validation error, target-window label, true disparity, true image feature는 사용하지 않습니다. 4개 stress scenario에서 seed 앞 10개/scenario로 centroid를 만들고 뒤 10개/scenario를 selector validation으로 평가한 결과 `STRICT_PASS`입니다. scenario label match `40/40`, selected residual pass `40/40`, selected range RMSE mean `0.439528m`, 1852m target max abs worst `3.186540m`입니다. Per-scenario heldout target worst는 bbox `3.186540m`, combined `1.713508m`, disparity `1.489892m`, intrinsic `0.819831m`입니다. 이 결과는 explicit label selector를 자동화할 가능성이 있지만 아직 synthetic feature-window 증거입니다. 다음 단계는 selector model export, operator/node runtime wiring, 그리고 실제 CSV/log에서 같은 truth-free feature separation이 유지되는지 검증하는 것입니다.
+- 2026-06-18: EXP-242에서 EXP-241 selector model을 실제 residual catalog profile path로 resolve하는 smoke를 추가했습니다. 새 도구는 `Simulation/scripts/select_disparity_residual_profile_by_features.py`입니다. 입력은 saved selector model JSON, residual catalog JSON, feature JSON 또는 CSV row이며, forbidden selector/runtime fields에 truth/PX4/RTK/NED/validation/replay token이 있으면 FAIL합니다. Smoke 출력은 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/feature_selector/feature_selector_profile_resolution_smoke.json|txt`입니다. held-out feature CSV row `10`에서 `bbox_outlier_stress`를 선택했고, `scenario_residual_catalog/profiles/bbox_outlier_stress.json`으로 resolve했습니다. 이 smoke는 자동 selector 배포를 위한 software-path evidence이며, 아직 live `StereoDistanceNode` 내부 feature extractor/selector wiring은 아닙니다.
+- 2026-06-18: EXP-243에서 feature selector를 operator wrapper print-only 경로에 연결했습니다. `run_operator_view_with_calibration_profile.sh`는 이제 `--disparity-residual-feature-selector-json`, `--disparity-residual-feature-catalog-json`, `--disparity-residual-feature-csv`/`--disparity-residual-feature-json`, `--disparity-residual-feature-row-index`를 받을 수 있습니다. wrapper는 feature selector로 residual profile을 resolve한 뒤 기존 `run_operator_view.sh --disparity-residual-profile` 인자로 넘깁니다. `Simulation/scripts/check_stereodistance_operator_view_launch.py`도 같은 경로를 검증합니다. 저장된 evidence는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/feature_selector/operator_view_launch_check_feature_selector.json|txt`이고 `PASS`입니다. 이 smoke는 held-out feature CSV row `10`에서 `bbox_outlier_stress` residual을 선택하고, command에 base runtime profile, observation-fusion manifest, resolved residual profile, `--no-px4`, `yolo_target_hz:=0.0`이 모두 들어가는 것을 확인했습니다. 아직 live node 내부에서 feature summary를 직접 생성하는 단계는 아니며, 실제 로그/CSV에서 만든 truth-free feature row를 operator 실행에 넣는 중간 배포 경로입니다.
+- 2026-06-18: EXP-244에서 runtime observation/RDF CSV에서 feature selector 입력 row를 만드는 파일 기반 경로를 추가했습니다. 새 도구는 `Simulation/scripts/export_disparity_residual_feature_row_from_observations.py`입니다. 필수 입력 컬럼은 `left_u_px`, `left_v_px`, `measured_disparity_px`, `raw_right_m`, `raw_down_m`, `raw_forward_m`이고, 선택 컬럼 `fused_disparity_px`, `observation_right_m`, `observation_down_m`, `observation_forward_m`이 있으면 함께 사용합니다. truth/PX4/RTK/NED/validation/replay 컬럼은 거부합니다. Smoke 입력은 `.../feature_selector/runtime_observation_window_smoke_input.csv`이고, exporter 출력은 `.../feature_selector/runtime_observation_window_feature_export/disparity_residual_selector_feature_row.json|csv`입니다. 이 feature JSON을 EXP-241 selector에 넣으면 `disparity_noise_stress` residual profile로 resolve됐고, operator-view check `.../runtime_observation_window_feature_export/operator_view_launch_check_feature_json.json|txt`도 `PASS`입니다. 즉 현재 파일 기반 경로는 `runtime observation CSV -> feature row JSON/CSV -> residual profile selection -> operator command`까지 이어집니다. live `StereoDistanceNode` 내부에서 이 feature row를 직접 계산하는 것은 아직 다음 단계입니다.
+- 2026-06-18: EXP-245에서 feature selector summary 계산을 공용 패키지 모듈로 분리했습니다. 새 모듈은 `Simulation/stereo_ground_sim/stereo_ground_sim/disparity_residual_feature_summary.py`이고, `feature_summary_from_arrays`와 `feature_summary_from_runtime_rows`를 제공합니다. `export_disparity_residual_feature_row_from_observations.py`와 `evaluate_disparity_residual_feature_selector.py`는 이제 같은 함수로 image/disparity/RDF 통계를 계산합니다. 새 테스트는 RDF axis order `right,down,forward`, raw RDF fallback, truth-free metadata를 확인합니다. 리팩터링 뒤 EXP-244 runtime observation CSV export와 operator-view feature-selector smoke를 다시 돌렸고 둘 다 `PASS`입니다. 이 단계의 목적은 live node 내부 feature extractor를 만들 때 동일 계산식을 재사용할 수 있게 하는 것입니다.
+- 2026-06-18: EXP-246에서 `StereoDistanceNode` 내부에서 같은 feature summary를 생성하도록 최소 통합했습니다. `_calculate_metrics`는 이제 `disparity_residual_feature_summary_status`와 `disparity_residual_feature_summary`를 metrics/profile status에 넣습니다. base correction이 있으면 corrected stereo-center RDF를 observation RDF로 쓰고, base correction이 없으면 raw RDF fallback을 사용합니다. `Simulation/scripts/check_stereodistance_observation_fusion_node_smoke.py`는 feature summary가 `ready:current_sample`인지, `raw_forward_m_mean`이 있는지, profile status에도 같은 상태가 들어가는지 검사합니다. 저장된 smoke는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/feature_selector/node_smoke_feature_summary_residual.json|txt`이고 `PASS`입니다. 이 단계는 아직 node 내부 자동 residual selection이 아니라, live node가 selector와 동일한 truth-free feature schema를 만들 수 있음을 검증한 것입니다.
+- 2026-06-18: EXP-247에서 `StereoDistanceNode` 내부 자동 residual selection까지 연결했습니다. 새 모듈 `stereo_ground_sim.disparity_residual_feature_selector`는 EXP-241 nearest-centroid selector model과 EXP-238 residual catalog를 읽고, 현재 sample의 image/disparity/RDF feature summary만으로 residual profile을 선택합니다. launch argument는 `enable_disparity_residual_feature_selector`, `disparity_residual_feature_selector_model_path`, `disparity_residual_feature_selector_catalog_path`이며, `run_operator_view.sh`에서는 `--disparity-residual-feature-selector`와 `--disparity-residual-feature-catalog`로 전달합니다. `run_operator_view_with_calibration_profile.sh`에는 파일 기반 pre-resolve selector와 구분되는 `--node-disparity-residual-feature-selector-json`, `--node-disparity-residual-feature-catalog-json` 옵션을 추가했습니다. explicit residual profile이 있으면 explicit profile이 우선이고, node-side selector는 explicit residual source와 함께 쓰지 않도록 wrapper에서 막습니다. Node smoke `.../feature_selector/node_smoke_feature_selector_auto_residual.json|txt`는 `selected:disparity_noise_stress`, residual `applied:EXP-20260618-237-disparity-scenario-residual-profile_pooled_disparity_residual`, observation fusion `fused:MultiBurstObservationFusion:21`로 `PASS`입니다. Operator dry-run evidence `.../feature_selector/operator_view_launch_check_node_feature_selector.json|txt`도 base runtime profile, observation-fusion manifest, node selector model/catalog를 command에 포함해 `PASS`입니다. 목적은 runtime truth 없이 StereoDistance가 관측 feature로 residual catalog를 자동 선택하는 것이며, 입력은 image `left_u_px/left_v_px`, measured/fused disparity, raw/corrected stereo-center RDF summary뿐입니다. PX4/NED/RTK truth, validation error, target-window label, true disparity/image feature는 selector runtime 입력이 아닙니다. 출력 계약은 내부 stereo-center RDF(right,down,forward), public topic FRD+range입니다.
+- 2026-06-18: EXP-248에서 EXP-247의 current-sample selector를 rolling runtime window selector로 확장했습니다. `StereoDistanceNode`는 이제 `disparity_residual_feature_selector_window_size`와 `disparity_residual_feature_selector_min_samples` launch parameter를 받아 최근 image/disparity/raw RDF/base-corrected RDF 관측 row를 누적하고, window summary가 준비된 뒤 residual profile을 선택합니다. 기본값은 둘 다 `1`이라 기존 current-sample 동작과 호환됩니다. `run_operator_view.sh`는 `--disparity-residual-feature-window-size`, `--disparity-residual-feature-min-samples`를 지원하고, calibration-profile wrapper는 `--node-disparity-residual-feature-window-size`, `--node-disparity-residual-feature-min-samples`를 지원합니다. 새 node smoke `.../feature_selector/node_smoke_feature_selector_windowed_auto_residual.json|txt`는 window size `21`, min samples `7`에서 selector summary `ready:runtime_window:21`, selector `selected:disparity_noise_stress`, residual `applied:EXP-20260618-237-disparity-scenario-residual-profile_pooled_disparity_residual`, observation fusion `fused:MultiBurstObservationFusion:21`로 `PASS`입니다. Operator dry-run `.../feature_selector/operator_view_launch_check_node_feature_selector_windowed.json|txt`도 window args가 command에 들어가는지 확인해 `PASS`입니다. 이 단계는 EXP-241의 window-stat selector 가정에 더 가깝게 node runtime 경로를 맞춘 것이며, 아직 recorded calibration CSV/live camera 로그에서 selector separation을 검증한 것은 아닙니다.
+- 2026-06-18: EXP-249에서 EXP-241에 저장된 feature-window validation rows를 `StereoDistanceNode`가 사용하는 동일 selector class로 replay했습니다. 새 도구는 `Simulation/scripts/check_disparity_residual_feature_selector_replay.py`이며, selector model JSON, residual catalog JSON, feature CSV를 받아 지정 split의 feature rows를 `stereo_ground_sim.disparity_residual_feature_selector.DisparityResidualFeatureSelector`로 다시 선택합니다. forbidden runtime column은 truth/PX4/RTK/NED/validation/replay 계열을 거부하되 `runtime_truth_used=false` 메타데이터만 허용합니다. 저장된 evidence `.../feature_selector/node_selector_feature_window_replay.json|csv|txt`는 EXP-241 validation split `40` rows에 대해 `PASS`, label match `40/40`, selected profile exists `40/40`, runtime truth count `0`, distance margin min `0.576134`입니다. 이 결과는 offline evaluator와 node runtime selector class가 같은 saved feature-window evidence에서 같은 residual label을 고른다는 software-path 검증입니다. 여전히 다음 단계는 recorded/live observation windows에서 feature 분리가 유지되는지 확인하는 것입니다.
+- 2026-06-18: EXP-250에서 runtime observation CSV를 rolling window로 잘라 selector replay까지 수행하는 recorded/live 로그용 검증 경로를 추가했습니다. 새 도구는 `Simulation/scripts/check_disparity_residual_selector_on_observation_windows.py`입니다. 입력 CSV 필수 컬럼은 image `left_u_px`, `left_v_px`, `measured_disparity_px`와 raw stereo-center RDF `raw_right_m`, `raw_down_m`, `raw_forward_m`이며, 선택 컬럼 `fused_disparity_px`, `observation_right_m`, `observation_down_m`, `observation_forward_m`이 있으면 사용합니다. truth/PX4/RTK/NED/validation/replay 컬럼은 거부합니다. 도구는 `--window-size`, `--stride`, `--min-samples`로 rolling windows를 만들고, 각 window feature summary를 EXP-241 selector model과 EXP-238 residual catalog에 replay합니다. Smoke evidence `.../feature_selector/runtime_observation_window_selector_replay/observation_window_selector_replay_summary.json|txt`는 기존 `runtime_observation_window_smoke_input.csv` 5 rows를 window size `5`로 처리해 `PASS`, selected label `disparity_noise_stress`, label match `1/1`, profile exists `1/1`, runtime truth `false`, distance margin `0.920563`입니다. 이 단계는 실제 recorded/live observation CSV가 들어왔을 때 selector 안정성을 같은 계약으로 바로 검증할 수 있는 경로입니다.
+- 2026-06-18: EXP-251에서 operator recorder의 `telemetry.csv`를 selector observation CSV로 바꾸는 bridge를 추가했습니다. 새 도구는 `Simulation/scripts/export_selector_observation_csv_from_operator_telemetry.py`입니다. operator telemetry source는 public FRD(`forward,right,down,range`) 필드와 ground-truth 비교 컬럼을 함께 담기 때문에 selector에 직접 넣지 않습니다. bridge는 `left_cx/left_cy`, `raw_disparity_px`, public FRD raw/corrected fields를 읽어 selector용 명시 RDF 컬럼 `raw_right_m/raw_down_m/raw_forward_m`, `observation_right_m/observation_down_m/observation_forward_m`으로 내보내고, `drone_*`, `ground_truth`, `actual`, PX4/RTK/NED 계열 컬럼은 drop합니다. Smoke evidence `.../feature_selector/operator_telemetry_selector_bridge_smoke/operator_telemetry_to_selector_observation_summary.json|txt`는 input rows `5`, output rows `5`, dropped truth columns `4`, runtime truth `false`로 `PASS`입니다. 그 출력 CSV를 EXP-250 checker에 넣은 `.../operator_telemetry_selector_bridge_smoke/window_selector_replay/observation_window_selector_replay_summary.json|txt`도 selected label `disparity_noise_stress`, label match `1/1`, profile exists `1/1`, distance margin `0.925397`로 `PASS`입니다. 이로써 `run_operator_view.sh --record-lite`로 남긴 telemetry를 truth-free selector replay로 넘기는 소프트웨어 경로가 생겼습니다.
+- 2026-06-18: EXP-252에서 EXP-251 bridge와 EXP-250 rolling-window replay를 한 명령으로 묶는 operator telemetry selector replay wrapper를 추가했습니다. 새 도구는 `Simulation/scripts/run_operator_telemetry_selector_replay.py`입니다. 입력은 `run_operator_view.sh --record-lite`류의 `telemetry.csv`, EXP-241 selector model JSON, EXP-238 residual catalog JSON이며, 출력은 `selector_observations.csv`, bridge summary, window replay CSV/JSON/TXT, 통합 summary입니다. 이 wrapper도 runtime truth를 쓰지 않고, 입력 telemetry의 public FRD(`forward,right,down,range`) 필드를 selector용 stereo-center RDF(`right,down,forward`) 컬럼으로 명시 변환한 뒤 truth/PX4/RTK/NED 컬럼을 drop합니다. Smoke evidence `.../feature_selector/operator_telemetry_selector_replay_smoke/operator_telemetry_selector_replay_summary.json|txt`는 input rows `5`, dropped truth columns `4`, window count `1`, selected label `disparity_noise_stress`, label match `1/1`, profile exists `1/1`, distance margin min `0.925397`, runtime truth `false`로 `PASS`입니다. 실제 녹화 telemetry가 생기면 같은 명령에 `--input-telemetry-csv`만 교체해서 selector가 어떤 residual profile을 고르는지 즉시 검사할 수 있습니다.
+- 2026-06-18: EXP-253에서 operator/observation rolling-window selector replay summary에 label 안정성 지표를 추가했습니다. `Simulation/scripts/check_disparity_residual_selector_on_observation_windows.py`와 `Simulation/scripts/run_operator_telemetry_selector_replay.py`는 이제 `selected_label_counts`, `dominant_selected_label`, `dominant_selected_label_count`, `selector_label_stable`을 JSON/TXT summary에 기록합니다. 긴 telemetry에서 window마다 residual profile 선택이 흔들리는지 확인하기 위한 지표이며, selector 입력 계약은 변하지 않습니다. EXP-252 smoke를 재실행한 결과 `selected_label_counts={"disparity_noise_stress": 1}`, dominant label `disparity_noise_stress`, `selector_label_stable=true`, runtime truth `false`로 `PASS`입니다.
+- 2026-06-18: EXP-254에서 operator/observation rolling-window selector replay에 선택형 runtime-safe gate를 추가했습니다. `Simulation/scripts/check_disparity_residual_selector_on_observation_windows.py`와 `Simulation/scripts/run_operator_telemetry_selector_replay.py`는 이제 `--require-stable-label`과 `--min-distance-margin`을 지원합니다. 이 gate는 PX4/RTK/NED truth나 validation error를 보지 않고, selector가 window들에서 같은 residual label을 고르는지와 nearest-centroid distance margin이 지정 threshold 이상인지로만 PASS/FAIL을 정합니다. Gated smoke evidence `.../feature_selector/operator_telemetry_selector_replay_gated_smoke/operator_telemetry_selector_replay_summary.json|txt`는 `--require-stable-label --min-distance-margin 0.5` 조건에서 selected label `disparity_noise_stress`, label match `1/1`, profile exists `1/1`, selector label stable `true`, distance margin min `0.925397`, runtime truth `false`로 `PASS`입니다. 실제 긴 telemetry에서는 이 gate가 residual profile 적용 전 선택 churn이나 낮은 confidence를 fail로 드러내는 배포 전 검문 역할을 합니다.
+- 2026-06-18: EXP-255에서 gated selector replay 결과를 실제 operator 적용 결정 artifact로 내보내도록 확장했습니다. `Simulation/scripts/run_operator_telemetry_selector_replay.py`는 이제 통합 summary와 별도로 `operator_telemetry_selector_decision.json|txt`를 씁니다. 이 artifact는 replay/export/gate가 모두 PASS이고 runtime truth가 쓰이지 않았으며 선택 profile path가 존재할 때만 `apply_residual_allowed=true`를 기록하고, 그때만 `recommended_residual_profile`을 채웁니다. Gate 실패나 export 실패에서는 recommended profile을 빈 문자열로 남겨 downstream이 residual을 적용하지 못하게 합니다. Gated smoke evidence `.../feature_selector/operator_telemetry_selector_replay_gated_smoke/operator_telemetry_selector_decision.json|txt`는 `apply_residual_allowed=true`, recommended label `disparity_noise_stress`, recommended profile `scenario_residual_catalog/profiles/disparity_noise_stress.json`, selector label stable `true`, distance margin min `0.925397`, runtime truth `false`로 `PASS`입니다.
+- 2026-06-18: EXP-256에서 EXP-255 decision artifact를 operator launch dry-run 경로에 연결했습니다. `Simulation/run_operator_view_with_calibration_profile.sh`와 `Simulation/scripts/check_stereodistance_operator_view_launch.py`는 이제 `--disparity-residual-decision-json`을 지원합니다. Wrapper는 decision JSON의 `apply_residual_allowed=true`를 확인한 뒤에만 `recommended_residual_profile`을 `run_operator_view.sh --disparity-residual-profile`로 넘깁니다. Decision이 FAIL이거나 apply가 허용되지 않으면 wrapper는 에러로 종료하고 residual profile을 적용하지 않습니다. Smoke evidence `.../feature_selector/operator_telemetry_selector_replay_gated_smoke/operator_view_launch_check_residual_decision.json|txt`는 EXP-255 decision artifact를 입력으로 받아 residual decision label `disparity_noise_stress`, resolved residual profile `scenario_residual_catalog/profiles/disparity_noise_stress.json`, observation-fusion manifest, base runtime profile이 command에 모두 들어가는 것을 `PASS`로 확인했습니다. 이 경로도 runtime truth를 쓰지 않고, public output 계약은 FRD+range로 유지됩니다.
+- 2026-06-18: EXP-257에서 실제 녹화 telemetry 적용 전용 end-to-end preflight를 추가했습니다. 새 도구는 `Simulation/scripts/run_operator_telemetry_residual_preflight.py`입니다. 이 스크립트는 `telemetry.csv -> truth-drop selector replay -> gated decision artifact -> operator launch dry-run`을 한 번에 수행합니다. Selector decision이 PASS이고 `apply_residual_allowed=true`일 때만 `check_stereodistance_operator_view_launch.py --disparity-residual-decision-json`을 호출하며, gate가 실패하면 operator launch check를 만들지 않고 preflight를 FAIL로 끝냅니다. Smoke evidence `.../feature_selector/operator_telemetry_residual_preflight_smoke/operator_telemetry_residual_preflight_summary.json|txt`는 selected label `disparity_noise_stress`, apply residual allowed `true`, resolved residual profile `scenario_residual_catalog/profiles/disparity_noise_stress.json`, operator launch status `PASS`, runtime truth `false`로 `PASS`입니다. 이 경로가 실제 `run_operator_view.sh --record-lite` telemetry를 residual 적용 전에 검사하는 표준 preflight가 됩니다.
+- 2026-06-18: EXP-258에서 EXP-257 preflight 산출물용 readiness checker를 추가했습니다. 새 도구는 `Simulation/scripts/check_operator_telemetry_residual_preflight_readiness.py`입니다. 이 checker는 preflight summary, selector decision JSON, operator launch check JSON이 모두 존재하는지, preflight/decision/launch status가 모두 `PASS`인지, `apply_residual_allowed=true`인지, recommended residual profile과 launch에서 resolved residual profile이 같은지, `--disparity-residual-profile` 인자가 실제 command에 들어갔는지, runtime truth가 쓰이지 않았는지, public FRD -> stereo-center RDF -> public FRD+range 계약이 기록됐는지를 검사합니다. Smoke evidence `.../feature_selector/operator_telemetry_residual_preflight_smoke/operator_telemetry_residual_preflight_readiness.json|txt`는 selected label `disparity_noise_stress`, residual arg present `true`, decision apply allowed `true`, runtime truth `false`로 `PASS`입니다. 이로써 preflight output 자체도 배포 전 artifact gate를 통과해야 live residual enablement 후보가 됩니다.
+- 2026-06-18: EXP-259에서 `Simulation/scripts/run_operator_telemetry_residual_preflight.py`에 최신 telemetry 자동 선택 옵션을 추가했습니다. `--latest-telemetry-root DIR`와 `--latest-telemetry-pattern '**/telemetry.csv'`를 사용하면 지정 root 아래에서 mtime이 가장 최신인 `telemetry.csv`를 골라 preflight에 넣습니다. Probe evidence `.../feature_selector/operator_latest_telemetry_residual_preflight_probe/operator_telemetry_residual_preflight_summary.json|txt`는 최신 파일 `Simulation/bags/operator_20260529_221251_lite/telemetry.csv`를 선택했지만 `FAIL`입니다. 이유는 이 과거 recorder CSV가 현재 residual preflight가 요구하는 public FRD raw/corrected fields(`raw_forward_m/raw_right_m/raw_down_m`, `corrected_forward_m/corrected_right_m/corrected_down_m`)를 갖지 않아 selector observation export가 valid row를 만들 수 없었기 때문입니다. 따라서 residual apply는 허용되지 않았고 operator launch check도 생성되지 않았습니다. 이는 보정 실패가 아니라 schema gate가 live residual enablement를 막은 정상 동작이며, 다음 실제 녹화는 EXP-251 이후 telemetry schema로 생성해야 합니다.
+- 2026-06-18: EXP-260에서 실제 telemetry residual preflight 앞단에 schema audit gate를 추가했습니다. 새 도구는 `Simulation/scripts/audit_operator_telemetry_residual_preflight_schema.py`입니다. 이 audit는 operator telemetry가 public FRD raw fields(`raw_forward_m/raw_right_m/raw_down_m` 또는 `estimated_*` alias), corrected FRD fields(`corrected_forward_m/corrected_right_m/corrected_down_m`), image center, measured disparity를 갖는지 먼저 검사하고, valid row가 `--min-samples`보다 적으면 selector replay를 시작하지 않습니다. `run_operator_telemetry_residual_preflight.py`는 이제 `operator_telemetry_schema_audit.json|txt`를 쓰고, audit 실패 시 `operator_telemetry_selector_decision.json|txt`를 `SKIPPED`, `apply_residual_allowed=false`로 덮어 stale decision이 downstream에 남지 않게 합니다. 같은 latest telemetry probe를 재실행한 evidence는 `.../feature_selector/operator_latest_telemetry_residual_preflight_probe/operator_telemetry_schema_audit.json|txt` 및 preflight summary입니다. 결과는 여전히 `FAIL`이지만 실패 지점이 selector/export row 실패가 아니라 schema audit로 앞당겨졌습니다: input rows `9384`, valid rows `0`, missing groups `raw_forward_m/raw_right_m/raw_down_m` 및 `observation_forward_m/observation_right_m/observation_down_m`, runtime truth `false`, residual apply `false`, launch `SKIPPED`. 좌표 계약은 source public FRD -> selector stereo-center RDF -> public FRD+range입니다.
+- 2026-06-18: EXP-261에서 다음 실제 operator telemetry가 EXP-260 schema audit를 통과할 수 있도록 recorder schema를 고정했습니다. `Simulation/stereo_ground_sim/stereo_ground_sim/operator_recorder.py`는 이제 CSV `axis_contract`를 `stereodistance_public_frd:forward,right,down,range`로 기록하고, manifest에 raw/estimated/corrected public FRD fields를 명시합니다. `json` import 누락도 보완해 `/stereo/profile_status` JSON metadata(`profile_id`, `profile_mode`, `fallback_level`)가 CSV에 정상 기록됩니다. 새 테스트 `Simulation/tests/test_operator_recorder_schema.py`는 recorder callback output이 `raw_forward_m/raw_right_m/raw_down_m`, `estimated_forward_m/estimated_right_m/estimated_down_m`, `corrected_forward_m/corrected_right_m/corrected_down_m`, `raw_disparity_px`, image center를 포함하고, 그 telemetry row가 `audit_operator_telemetry_residual_preflight_schema.py`에서 `PASS`하는지 확인합니다. 즉 기존 bags의 구 schema는 여전히 FAIL이지만, 다음 `run_operator_view.sh --record-lite` 녹화는 residual preflight가 요구하는 public FRD raw/corrected 계약을 만족해야 합니다. selector 내부 변환은 여전히 stereo-center RDF(`right,down,forward`)이고, runtime truth는 사용하지 않습니다.
+- 2026-06-18: EXP-262에서 current recorder schema telemetry가 full residual preflight와 readiness를 통과하는지 단일 Python smoke로 검증했습니다. 새 도구는 `Simulation/scripts/run_operator_current_schema_preflight_smoke.py`입니다. 이 스크립트는 `stereodistance_public_frd:forward,right,down,range` telemetry CSV를 생성하고, `run_operator_telemetry_residual_preflight.py`와 `check_operator_telemetry_residual_preflight_readiness.py`를 연속 실행합니다. Evidence는 `.../feature_selector/operator_current_schema_preflight_smoke/`에 저장했습니다. 결과는 `PASS`: schema audit valid rows `5/5`, selected label `disparity_noise_stress`, distance margin min `0.9253968578`, `apply_residual_allowed=true`, operator launch dry-run `PASS`, readiness `PASS`, runtime truth `false`입니다. 생성된 source CSV는 public FRD+range이고, selector observation CSV는 explicit stereo-center RDF(`right,down,forward`)입니다. 따라서 실제 old bags는 아직 FAIL이지만, EXP-261 이후 형식으로 새로 녹화한 telemetry가 들어오면 residual preflight가 끝까지 통과할 수 있는 software path가 검증됐습니다.
+- 2026-06-18: EXP-263에서 실제 최신 `Simulation/bags` telemetry를 위한 live gate wrapper를 추가했습니다. 새 도구는 `Simulation/scripts/run_operator_latest_telemetry_residual_gate.py`입니다. 이 wrapper는 최신 `telemetry.csv`를 선택해 residual preflight를 실행하고, preflight가 `PASS`이고 `apply_residual_allowed=true`일 때만 readiness checker를 실행합니다. 같은 old latest telemetry로 실행한 evidence는 `.../feature_selector/operator_latest_telemetry_residual_gate_probe/operator_latest_telemetry_residual_gate_summary.json|txt`입니다. 현재 결과는 `FAIL`: 선택된 파일은 `Simulation/bags/operator_20260529_221251_lite/telemetry.csv`, preflight `FAIL`, readiness `SKIPPED`, residual apply `false`, operator launch `SKIPPED`, runtime truth `false`입니다. 실패 원인은 EXP-260과 동일하게 old schema가 public FRD raw/corrected groups를 갖지 않는 것입니다. 새 로그를 `run_operator_view.sh --record-lite`로 녹화한 뒤 이 wrapper를 다시 실행하는 것이 실제 live residual enablement gate가 됩니다.
+- 2026-06-18: EXP-264에서 실제 녹화 전 `run_operator_view.sh --record-lite` 경로가 current recorder schema를 쓸 준비가 되었는지 확인하는 pre-record readiness checker를 추가했습니다. 새 도구는 `Simulation/scripts/check_operator_recording_preflight_readiness.py`입니다. 이 checker는 `run_operator_view.sh`가 `--record-lite/full/debug` 옵션과 `stereo_ground_sim.operator_recorder` 실행 경로를 갖는지, `setup.py`에 `operator_recorder = stereo_ground_sim.operator_recorder:main` entry point가 있는지, recorder schema가 `stereodistance_public_frd:forward,right,down,range`와 raw/estimated/corrected public FRD fields 및 image/disparity fields를 포함하는지 검사합니다. Evidence `.../feature_selector/operator_recording_preflight_readiness/operator_recording_preflight_readiness.json|txt`는 `PASS`이며 ambiguous x/y/z recorder fields `0`, runtime truth `false`입니다. 추천 녹화 명령 템플릿은 `cd Simulation && ./run_operator_view.sh --record-lite bags/operator_$(date +%Y%m%d_%H%M%S)_lite --bbox-adjustment <active_runtime_profile.json>`입니다.
+- 2026-06-18: EXP-265에서 residual live enablement 전 과정을 한 명령으로 묶는 suite를 추가했습니다. 새 도구는 `Simulation/scripts/run_operator_residual_enablement_suite.py`입니다. suite는 (1) EXP-264 source recording readiness, (2) installed ROS overlay recorder readiness, (3) installed recorder CSV row smoke, (4) EXP-262 current-schema software smoke, (5) EXP-263 latest real-telemetry live gate를 순서대로 실행합니다. Evidence `.../feature_selector/operator_residual_enablement_suite/operator_residual_enablement_suite_summary.json|txt`의 현재 결과는 overall `FAIL`입니다. 하지만 세부 결과는 recording readiness `PASS`, install overlay readiness `PASS`, installed CSV smoke `PASS`, current-schema smoke `PASS`, latest gate `FAIL`입니다. 즉 소스와 실제 ROS install overlay의 recorder schema 및 CSV row output, software path는 public FRD+range -> stereo-center RDF selector -> residual decision -> operator launch dry-run까지 준비됐고, 남은 실패는 현재 최신 실제 bags telemetry가 old schema인 점으로 좁혀졌습니다. 선택된 latest 파일은 `Simulation/bags/operator_20260529_221251_lite/telemetry.csv`, residual apply `false`, operator launch `SKIPPED`, runtime truth `false`입니다.
+- 2026-06-18: EXP-266에서 fresh `record-lite` 녹화와 EXP-265 suite 실행을 묶는 operational wrapper를 추가했습니다. 새 도구는 `Simulation/scripts/run_operator_record_lite_and_residual_suite.py`입니다. 이 wrapper는 `run_operator_view_with_calibration_profile.sh -- --record-lite DIR` 명령을 구성하고, 선택적으로 지정 시간 녹화를 실행한 뒤 최신 telemetry 기준으로 residual enablement suite를 실행합니다. `--print-only`는 실제 ROS/Gazebo/PX4를 실행하지 않고 record command와 suite args만 저장합니다. Evidence `.../feature_selector/operator_record_lite_and_residual_suite_print_only/operator_record_lite_and_residual_suite_summary.json|txt`는 `PASS`, `record_status=PRINT_ONLY`, `suite_status=PRINT_ONLY`, runtime truth `false`입니다. 실제 비행/시뮬레이션 녹화에서는 `--operator-arg=--no-px4` 같은 dry-run 인자를 제거하거나 상황에 맞게 조정한 뒤 실행해야 합니다.
+- 2026-06-18: EXP-267에서 EXP-266 wrapper에 fresh telemetry guard를 추가했습니다. `run_operator_record_lite_and_residual_suite.py`는 이제 실행 후 `record_dir/telemetry.csv` 존재 여부와 EXP-265 suite가 선택한 `latest_input_telemetry_csv`가 그 파일인지 확인합니다. `--skip-record`는 기존 latest telemetry를 검사하는 명시 모드라 이 guard를 강제하지 않지만, 실제 record 모드에서 녹화가 실행되지 않았거나 `record_dir/telemetry.csv`가 없거나 suite가 다른 telemetry를 잡으면 FAIL입니다. Print-only evidence는 같은 `.../operator_record_lite_and_residual_suite_print_only/`에 갱신됐고 `record_telemetry_csv=Simulation/bags/operator_next_current_schema_lite/telemetry.csv`, `record_telemetry_exists=false`, `suite_used_record_telemetry=false`를 명시합니다. 이 값들은 print-only라 정보 필드이며, 실제 실행에서는 live residual enablement가 과거 old log를 재사용하는 것을 막는 gate가 됩니다.
+- 2026-06-18: EXP-268에서 EXP-267 wrapper에 `--synthetic-record` 모드를 추가해 ROS/Gazebo/PX4 없이도 non-print record-lite residual enablement 경로를 검증했습니다. 이 모드는 `record_dir/telemetry.csv`에 current public FRD+range schema telemetry를 새로 쓰고, EXP-265 suite가 그 파일을 latest telemetry로 선택해야만 PASS합니다. Evidence `.../feature_selector/operator_record_lite_synthetic_enablement_suite/operator_record_lite_and_residual_suite_summary.json|txt`는 `PASS`: `record_status=SYNTHETIC`, `record_telemetry_exists=true`, `record_telemetry_fresh=true`, `suite_used_record_telemetry=true`, latest gate `PASS`, selected residual label `disparity_noise_stress`, runtime truth `false`입니다. 이것은 실제 비행/시뮬레이션 녹화 증거가 아니라 current-schema synthetic telemetry가 운영 wrapper의 freshness/schema/selector/readiness gate를 끝까지 통과한다는 software-path evidence입니다. 실제 Gazebo/PX4 실행에서는 `--synthetic-record`를 빼고 fresh `--record-lite` telemetry를 만들어 같은 wrapper를 다시 통과시켜야 합니다.
+- 2026-06-18: EXP-269에서 실제 `run_operator_view.sh`가 사용하는 installed ROS overlay의 recorder schema를 검사하는 gate를 추가하고 overlay를 갱신했습니다. 새 도구 `Simulation/scripts/check_operator_recording_install_overlay_readiness.py`는 `/opt/ros/humble/setup.bash`와 `Simulation/install/setup.bash`를 source한 뒤 `stereo_ground_sim.operator_recorder`를 import하여 installed `AXIS_CONTRACT`와 raw/corrected public FRD fields, image/disparity fields를 확인합니다. Build 전 evidence `.../operator_recording_install_overlay_readiness_before_build/`는 `FAIL`이었고 installed axis contract가 `stereo_center_frd:forward_right_down`으로 stale였습니다. `colcon build --packages-select stereo_ground_sim` 후 evidence `.../operator_recording_install_overlay_readiness_after_build/`는 `PASS`, installed axis contract `stereodistance_public_frd:forward,right,down,range`입니다. EXP-265 suite에도 이 installed overlay gate를 포함했습니다. 이 단계는 source 파일만 고치고 실제 ROS 실행 경로가 stale로 남는 문제를 막기 위한 배포 전 gate입니다.
+- 2026-06-18: EXP-270에서 installed ROS overlay의 `operator_recorder`가 실제 CSV row를 current schema로 쓰는지 확인하는 smoke를 추가했습니다. 새 도구 `Simulation/scripts/run_installed_operator_recorder_csv_smoke.py`는 `/opt/ros/humble/setup.bash`와 `Simulation/install/setup.bash`를 source한 subprocess에서 installed `stereo_ground_sim.operator_recorder`를 import하고, callback 경로로 `telemetry.csv` 한 row를 쓴 뒤 기존 schema audit에 통과시키는 방식입니다. Evidence `.../feature_selector/installed_operator_recorder_csv_smoke/installed_operator_recorder_csv_smoke_summary.json|txt`는 `PASS`: installed axis contract `stereodistance_public_frd:forward,right,down,range`, schema audit valid rows `1/1`, first row `raw_forward_m=1000`, `corrected_forward_m=999`, `raw_disparity_px=200`, runtime truth `false`입니다. EXP-265 suite에도 이 installed CSV smoke를 포함했습니다. 이는 실제 Gazebo/PX4 녹화 전, 설치된 recorder가 current public FRD+range telemetry를 residual preflight가 읽을 수 있는 형태로 쓰는지 검증하는 gate입니다.
+- 2026-06-18: EXP-271에서 headless operator record-lite가 GUI/YOLO 없이도 current telemetry row를 만들 수 있도록 `StereoDistanceNode`에 `enable_synthetic_detections:=true` launch mode를 추가했습니다. 이 모드는 stereo-center RDF(`right,down,forward`) 위치를 synthetic left/right BBox center와 disparity로 역투영한 뒤 기존 `/stereo/detections`, `/stereo/estimated_position`, `/stereo/corrected_position` publish path를 그대로 사용합니다. 실제 측정 성능 증거가 아니라 headless/operator recording and residual gate 검증용입니다. Evidence `.../feature_selector/operator_record_lite_headless_synthetic_detection_intrinsic_split_label_probe/operator_record_lite_and_residual_suite_summary.json|txt`는 `PASS`: `record_telemetry_exists=true`, schema audit valid rows `234/234`, latest gate `PASS`, selected residual label `intrinsic_scale_stress` stable `214/214`, `distance_margin_min=1.043713`, operator launch `PASS`, runtime truth `false`입니다. Suite에는 `--current-schema-expected-label`을 추가해 내부 current-schema smoke의 고정 기대 라벨(`disparity_noise_stress`)과 live/latest telemetry 기대 라벨을 분리했습니다.
+- 2026-06-18: EXP-272에서 실제 YOLO/BBox publisher를 붙이기 위한 external BBox runtime input을 추가했습니다. `StereoDistanceNode`는 `enable_external_bbox_detections:=true`일 때 `external_bbox_detections_topic`의 `std_msgs/msg/Float32MultiArray`를 구독합니다. 기본 topic은 `/stereo/external_detections`이고 메시지 계약은 `[left_valid,left_x1,left_y1,left_x2,left_y2,left_confidence,left_cx,left_cy,right_valid,right_x1,right_y1,right_x2,right_y2,right_confidence,right_cx,right_cy]`입니다. 입력 `cx/cy/x1/y1/x2/y2`는 image pixel coordinate이고, node 내부 계산은 stereo-center RDF(`right,down,forward`)로 수행되며 public output topic은 계속 `/stereo/estimated_position`, `/stereo/corrected_position`의 `[forward,right,down,range]`입니다. 이 runtime path는 calibration truth, PX4/RTK/NED truth를 입력으로 쓰지 않습니다. Unit evidence는 external callback이 estimated public FRD를 발행하는 것을 확인했고, print-only wrapper evidence는 `enable_external_bbox_detections:=true external_bbox_detections_topic:=/yolo/stereo_bbox`가 operator command에 전달되는 것을 확인했습니다.
+- 2026-06-18: EXP-273에서 external BBox sidecar publisher를 실제 headless record-lite wrapper에 붙여 synthetic detection 없이 current telemetry와 residual gate를 통과시켰습니다. 새 sidecar는 `Simulation/stereo_ground_sim/stereo_ground_sim/external_bbox_publisher.py`이며, real YOLO/BBox publisher가 준비되기 전 `/stereo/external_detections`에 같은 16-field `Float32MultiArray` 계약을 발행하는 integration substitute입니다. Evidence `.../feature_selector/operator_record_lite_external_bbox_sidecar_clean2_probe/operator_record_lite_and_residual_suite_summary.json|txt`는 overall `PASS`: `record_status=TIMEOUT_TERMINATED`, `sidecar_returncode=0`, `record_telemetry_exists=true`, `record_telemetry_fresh=true`, `suite_used_record_telemetry=true`, schema audit valid rows `463/463`, selector window count `443`, selected residual label `disparity_noise_stress`, label stable `true`, `distance_margin_min=1.211552`, `apply_residual_allowed=true`, operator launch `PASS`, runtime truth `false`입니다. 이 결과는 측정 정확도 PASS가 아니라 external BBox topic -> StereoDistance estimated/corrected public FRD telemetry -> truth-free selector/preflight -> residual launch gate까지의 software-path PASS입니다.
+- 2026-06-18: EXP-274에서 EXP-273 telemetry를 재검토하며 recorder detection schema bug를 수정했습니다. `/stereo/detections` message는 16개 값(`left/right valid,x1,y1,x2,y2,confidence,cx,cy`)인데 recorder CSV `DETECTION_FIELDS`에는 width/height/raw-disparity 파생 필드가 함께 있어, 기존 `_detections_cb`가 단순 zip을 사용하면 right-side fields가 밀렸습니다. `Simulation/stereo_ground_sim/stereo_ground_sim/operator_recorder.py`는 이제 `DETECTION_MESSAGE_FIELDS`를 별도로 사용해 16개 message field를 먼저 매핑하고, `left/right_width_px`, `left/right_height_px`, `raw_disparity_px=left_cx-right_cx`를 명시 계산합니다. 또한 `export_selector_observation_csv_from_operator_telemetry.py`는 detection 수신 전 warm-up row를 skip하고 valid rows가 있으면 PASS할 수 있게 했습니다. 새 validator `Simulation/scripts/validate_external_bbox_topic_contract.py`는 real YOLO/BBox publisher 교체 전 16-field `Float32MultiArray`의 길이, finite 값, bbox bounds, center-in-box, confidence range, positive left-minus-right disparity, forbidden truth columns를 검사합니다. Evidence `.../feature_selector/operator_record_lite_external_bbox_sidecar_schemafix2_probe/operator_record_lite_and_residual_suite_summary.json|txt`는 full record-lite `PASS`: `sidecar_returncode=0`, schema audit valid rows `473/474`, selector windows `453`, selected label `disparity_noise_stress` stable `453/453`, `distance_margin_min=1.211552`, `runtime_truth_used=false`입니다. External BBox contract validator smoke `.../feature_selector/external_bbox_topic_contract_validation_schemafix2_smoke/external_bbox_topic_contract_validation.json|txt`도 `PASS`: valid pair `473/473`, disparity min/max `206.041138px`, forbidden truth input 없음입니다.
+- 2026-06-18: EXP-275에서 record-lite 반복 실행 후 `Simulation/.venv/pyvenv.cfg`가 `include-system-site-packages = false`로 되돌아가 numpy/ROS Python import가 깨지는 환경 문제를 수정했습니다. 원인은 `run_operator_view.sh`가 YOLO runtime 준비를 위해 호출하는 `Simulation/scripts/ensure_yolo_runtime.sh`가 `.venv`를 `python -m venv`로 재생성하면서 system-site 설정을 보존하지 않은 것이었습니다. 이제 이 스크립트는 기존 venv를 검사하기 전 `ensure_system_site_packages`로 `pyvenv.cfg`를 `true`로 정규화하고, 새 venv 생성도 `python -m venv --system-site-packages`로 수행합니다. 테스트 `Simulation/tests/test_ensure_yolo_runtime.py`는 이 동작을 회귀 방지하고, fake venv 행동 smoke도 false -> true 정규화를 확인했습니다. 이 변경은 측정 알고리즘이 아니라 반복 가능한 EXP/runtime 검증 환경을 안정화하기 위한 software-path gate입니다.
+- 2026-06-18: EXP-276에서 real YOLO/BBox publisher를 residual pipeline에 연결하기 전 topic 자체를 독립적으로 sampling/검증하는 preflight wrapper를 추가했습니다. 새 도구 `Simulation/scripts/run_external_bbox_topic_preflight.py`는 live ROS2 `std_msgs/msg/Float32MultiArray` topic을 `--topic`으로 일정 시간 샘플링하거나, 이미 저장된 sample CSV를 `--input-csv`로 받아 EXP-274 validator를 실행합니다. 산출물은 `external_bbox_topic_samples.csv`, `external_bbox_topic_contract_validation.json|txt`, `external_bbox_topic_preflight_summary.json|txt`이고, gate는 16-field 길이, finite 값, bbox geometry/bounds, confidence range, center-in-box, positive `left_cx-right_cx`, forbidden truth columns, runtime truth 미사용을 확인합니다. Offline smoke evidence `.../feature_selector/external_bbox_topic_preflight_schemafix2_smoke/external_bbox_topic_preflight_summary.json|txt`는 EXP-274 sidecar samples 기준 `PASS`: sample count `473`, valid pair `473/473`, disparity min/max `206.041138px`, runtime truth `false`입니다. 이것도 측정 정확도 PASS가 아니라 real BBox publisher 투입 전 topic contract gate입니다.
+- 2026-06-18: EXP-277에서 EXP-276 preflight를 `run_operator_record_lite_and_residual_suite.py`의 선행 gate로 통합했습니다. 새 옵션 `--external-bbox-preflight`를 켜면 wrapper는 record-lite 또는 synthetic record를 시작하기 전에 `run_external_bbox_topic_preflight.py`를 실행합니다. Preflight가 `PASS`가 아니면 `record_status=SKIPPED_BY_EXTERNAL_BBOX_PREFLIGHT`, `suite_status=SKIPPED_BY_EXTERNAL_BBOX_PREFLIGHT`로 종료하여 잘못된 YOLO/BBox topic이 residual enablement까지 넘어가지 못하게 합니다. Smoke evidence `.../feature_selector/operator_record_lite_external_bbox_preflight_synthetic_gate/operator_record_lite_and_residual_suite_summary.json|txt`는 `PASS`: external BBox preflight `PASS`, sample count `473`, valid pair `473/473`, synthetic current-schema record fresh/selected `true`, latest gate `PASS`, selected residual label `disparity_noise_stress`, operator launch `PASS`, runtime truth `false`입니다. Unit test는 정상 preflight 후 suite 진행과 음수 disparity preflight failure가 record/suite를 skip하는 경로를 모두 고정합니다.
+- 2026-06-18: EXP-278에서 EXP-277 gate의 negative safety behavior를 artifact로 남겼습니다. 입력 CSV `.../feature_selector/external_bbox_topic_preflight_negative_guard_input/external_bbox_bad_disparity_samples.csv`는 bbox bounds와 center-in-box는 정상으로 유지하되 `left_cx=700`, `right_cx=730`이라 `left_cx-right_cx=-30px`가 되도록 만들었습니다. Evidence `.../feature_selector/operator_record_lite_external_bbox_preflight_negative_guard/operator_record_lite_and_residual_suite_summary.json|txt`는 wrapper status `FAIL`이지만 gate behavior는 기대대로입니다: external BBox preflight `FAIL`, failure `row0:left_minus_right_disparity_below_min:-30`, `record_status=SKIPPED_BY_EXTERNAL_BBOX_PREFLIGHT`, `suite_status=SKIPPED_BY_EXTERNAL_BBOX_PREFLIGHT`, record telemetry missing, suite not run, runtime truth `false`. 이 실험은 bad external BBox topic을 residual enablement로 통과시키지 않는 negative guard PASS입니다.
+- 2026-06-18: EXP-279에서 external BBox preflight에 최소 valid pair gate를 추가했습니다. `run_external_bbox_topic_preflight.py`는 이제 `--min-valid-pairs`를 받고, validator는 통과했더라도 valid pair 수가 부족하면 `valid_pair_count_below_min`으로 FAIL합니다. 또한 `--min-disparity-px <= 0` 설정은 positive `left_cx-right_cx` 계약을 우회할 수 있으므로 `config:min_disparity_px_not_positive`로 FAIL합니다. `run_operator_record_lite_and_residual_suite.py`도 `--external-bbox-preflight-min-valid-pairs`를 받아 record/suite 전 preflight에 전달합니다. Evidence `.../feature_selector/external_bbox_topic_preflight_min_valid_pairs_pass/external_bbox_topic_preflight_summary.json|txt`는 EXP-274 samples에 `min_valid_pairs=5`를 걸어 `473/473`으로 PASS했고, `.../feature_selector/operator_record_lite_external_bbox_preflight_min_pairs_negative_guard/operator_record_lite_and_residual_suite_summary.json|txt`는 positive disparity one-row sample에서 `valid_pair_count=1<2`로 record/suite를 skip했습니다. `.../feature_selector/external_bbox_topic_preflight_min_disparity_config_guard/`는 `min_disparity_px=0` 설정 자체가 FAIL되는 것을 남깁니다.
+- 2026-06-18: EXP-280에서 external BBox preflight의 live ROS2 topic sampling path를 검증했습니다. `stereo_ground_sim.external_bbox_publisher` sidecar를 `/stereo/external_detections_live_preflight`에 30Hz로 띄우고, `run_external_bbox_topic_preflight.py --topic /stereo/external_detections_live_preflight --sample-seconds 3 --max-samples 60 --min-valid-pairs 5`를 실행했습니다. Evidence `.../feature_selector/external_bbox_topic_live_preflight_sidecar_smoke/external_bbox_topic_preflight_summary.json|txt`는 `source_mode=ros_topic`, sample count `60`, valid pair `60/60`, disparity min/max `206.041138px`, runtime truth `false`로 `PASS`입니다. 참고로 sandbox 내부에서는 ROS2 DDS transport socket 생성이 제한되어 `topic:no_samples`가 발생했으며, live topic smoke는 socket 권한이 있는 환경에서 실행해야 합니다. CSV smoke와 달리 이 결과는 sampler가 실제 `Float32MultiArray` topic에서 메시지를 수신했음을 보입니다.
+
+Headless synthetic-detection record-lite residual gate 예:
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_residual_suite.py \
+  --profile-json <active_runtime_profile.json> \
+  --latest-telemetry-root Simulation/bags \
+  --record-dir Simulation/bags/operator_headless_synthetic_detection_current_schema_lite \
+  --record-seconds 20 \
+  --selector-model-json <disparity_residual_feature_selector_model.json> \
+  --catalog-json <disparity_residual_profile_label_selector.json> \
+  --output-dir <results_dir> \
+  --window-size 21 \
+  --min-samples 5 \
+  --expected-label intrinsic_scale_stress \
+  --current-schema-expected-label disparity_noise_stress \
+  --require-stable-label \
+  --min-distance-margin 0.5 \
+  --operator-arg=--headless \
+  --operator-arg=--no-px4 \
+  --operator-arg=yolo_target_hz:=0.0 \
+  --operator-arg=gz_gui:=false \
+  --operator-arg=enable_synthetic_detections:=true
+```
+
+실제 YOLO/BBox topic 교체 예:
+
+```bash
+./Simulation/run_operator_view_with_calibration_profile.sh \
+  --profile-json <active_runtime_profile.json> \
+  -- \
+  --headless \
+  --no-px4 \
+  yolo_target_hz:=0.0 \
+  enable_external_bbox_detections:=true \
+  external_bbox_detections_topic:=/yolo/stereo_bbox \
+  gz_gui:=false
+```
+
+이 경우 `/yolo/stereo_bbox` publisher가 위 16개 값의 `Float32MultiArray`를 발행해야 합니다. Recorder와 residual preflight는 public FRD+range telemetry를 읽고 selector 내부에서만 stereo-center RDF로 변환합니다.
+
+YOLO publisher 없이 external BBox topic path를 integration smoke로 재현하려면 sidecar publisher를 사용한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_residual_suite.py \
+  --profile-json <active_runtime_profile.json> \
+  --latest-telemetry-root Simulation/bags \
+  --record-dir Simulation/bags/operator_external_bbox_sidecar_current_schema_lite \
+  --record-seconds 22 \
+  --selector-model-json <disparity_residual_feature_selector_model.json> \
+  --catalog-json <disparity_residual_profile_label_selector.json> \
+  --output-dir <results_dir> \
+  --window-size 21 \
+  --min-samples 5 \
+  --current-schema-expected-label disparity_noise_stress \
+  --require-stable-label \
+  --min-distance-margin 0.5 \
+  --operator-arg=--headless \
+  --operator-arg=--no-px4 \
+  --operator-arg=yolo_target_hz:=0.0 \
+  --operator-arg=gz_gui:=false \
+  --operator-arg=enable_external_bbox_detections:=true \
+  --operator-arg=external_bbox_detections_topic:=/stereo/external_detections \
+  --external-bbox-publisher \
+  --external-bbox-topic /stereo/external_detections \
+  --external-bbox-forward-m 1000 \
+  --external-bbox-right-m 7 \
+  --external-bbox-down-m 4
+```
+
+Real YOLO/BBox topic을 residual suite에 넣을 때는 record 전에 preflight gate를 켠다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_residual_suite.py \
+  --profile-json <active_runtime_profile.json> \
+  --latest-telemetry-root Simulation/bags \
+  --record-dir Simulation/bags/operator_external_bbox_live_lite \
+  --record-seconds 22 \
+  --selector-model-json <disparity_residual_feature_selector_model.json> \
+  --catalog-json <disparity_residual_profile_label_selector.json> \
+  --output-dir <results_dir> \
+  --window-size 21 \
+  --min-samples 5 \
+  --expected-label disparity_noise_stress \
+  --current-schema-expected-label disparity_noise_stress \
+  --require-stable-label \
+  --min-distance-margin 0.5 \
+  --external-bbox-preflight \
+  --external-bbox-preflight-topic /yolo/stereo_bbox \
+  --external-bbox-preflight-sample-seconds 5 \
+  --external-bbox-preflight-min-valid-pairs 5 \
+  --operator-arg=--headless \
+  --operator-arg=--no-px4 \
+  --operator-arg=yolo_target_hz:=0.0 \
+  --operator-arg=gz_gui:=false \
+  --operator-arg=enable_external_bbox_detections:=true \
+  --operator-arg=external_bbox_detections_topic:=/yolo/stereo_bbox
+```
+
+`--external-bbox-preflight`가 실패하면 이 wrapper는 record telemetry를 쓰지 않고 residual suite도 실행하지 않는다. 예를 들어 left-minus-right disparity가 음수인 sample은 `record_status=SKIPPED_BY_EXTERNAL_BBOX_PREFLIGHT`와 `suite_status=SKIPPED_BY_EXTERNAL_BBOX_PREFLIGHT`로 종료되어야 한다.
+
+실제 YOLO/BBox publisher가 낼 sample CSV 또는 `ros2 topic echo`에서 추출한 16개 값을 먼저 검증하려면 다음 contract validator를 사용한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/validate_external_bbox_topic_contract.py \
+  --input-csv <external_bbox_samples.csv> \
+  --output-dir <results_dir>/external_bbox_topic_contract_validation \
+  --width-px 1280 \
+  --height-px 720 \
+  --min-disparity-px 0.5
+```
+
+CSV는 16개 컬럼(`left_valid,left_x1,left_y1,left_x2,left_y2,left_confidence,left_cx,left_cy,right_valid,right_x1,right_y1,right_x2,right_y2,right_confidence,right_cx,right_cy`)을 갖거나, 단일 `data` 컬럼에 16개 숫자를 공백/쉼표/세미콜론으로 저장할 수 있다. 이 validator도 calibration truth, PX4/RTK/NED truth 컬럼을 runtime topic 입력으로 허용하지 않는다.
+
+실제 ROS2 topic을 바로 샘플링해 같은 검증을 실행하려면 preflight wrapper를 사용한다.
+
+```bash
+Simulation/.venv/bin/python Simulation/scripts/run_external_bbox_topic_preflight.py \
+  --topic /yolo/stereo_bbox \
+  --sample-seconds 5 \
+  --max-samples 200 \
+  --min-valid-pairs 5 \
+  --output-dir <results_dir>/external_bbox_topic_preflight \
+  --width-px 1280 \
+  --height-px 720 \
+  --min-disparity-px 0.5
+```
+
+이미 저장된 CSV로 동일한 wrapper를 재현하려면 `--topic` 대신 `--input-csv <external_bbox_samples.csv>`를 사용한다. 이 wrapper가 `PASS`한 뒤에만 `enable_external_bbox_detections:=true external_bbox_detections_topic:=/yolo/stereo_bbox`를 record-lite/residual gate에 연결한다.
+
+Live ROS2 topic 검증은 DDS transport socket을 열 수 있는 환경에서 실행해야 한다. 제한된 sandbox에서 `topic:no_samples`가 발생하면 같은 명령을 실제 ROS2 실행 권한이 있는 셸에서 다시 실행한다.
+- 2026-06-18: non-alias synthetic robustness 결과를 StereoDistance에서 바로 선택할 수 있는 scenario catalog label selector package로 export했다. 입력 결과는 `Simulation/results/non_alias_robustness_default6_seed2_probe`이며, direct NED-to-RDF alias는 6개 scenario/12개 seed config 모두에서 금지 상태로 확인됐다. 생성 명령은 다음과 같다.
+
+```bash
+python3 Simulation/scripts/export_robustness_scenario_catalog_selector.py \
+  --robustness-dir Simulation/results/non_alias_robustness_default6_seed2_probe \
+  --output-dir Simulation/results/non_alias_robustness_default6_seed2_probe/runtime_label_selector_package_operator_gate \
+  --baseline-scenario nominal \
+  --with-deployment-frontier \
+  --with-operator-launch-checks
+```
+
+생성물은 `runtime_label_selector_package_operator_gate/runtime_profile_label_selector.json`이며, `deployment_label`, `scenario_label`, `scenario_name` 같은 명시적 operator/deployment metadata만 사용한다. PX4/RTK/NED truth, validation error, target-window label, replay metric은 runtime selection input이 아니다. 같은 명령이 `runtime_deployment_frontier/`와 `operator_view_launch_checks/`도 함께 생성한다. 6-scenario evidence에서 selector export `PASS`, frontier `PASS`, operator launch `19/19 PASS`, runtime truth `false`를 확인했다.
+
+6-scenario selector deployment readiness를 한 번에 재검증하려면 다음을 실행한다.
+
+```bash
+python3 Simulation/scripts/check_non_alias_selector_deployment_readiness.py \
+  --robustness-dir Simulation/results/non_alias_robustness_default6_seed2_probe \
+  --selector-package-dir Simulation/results/non_alias_robustness_default6_seed2_probe/runtime_label_selector_package_operator_gate \
+  --readme Simulation/README.md \
+  --output-json Simulation/results/non_alias_robustness_default6_seed2_probe/runtime_label_selector_package_operator_gate/non_alias_selector_deployment_readiness.json \
+  --output-csv Simulation/results/non_alias_robustness_default6_seed2_probe/runtime_label_selector_package_operator_gate/non_alias_selector_deployment_readiness.csv \
+  --output-txt Simulation/results/non_alias_robustness_default6_seed2_probe/runtime_label_selector_package_operator_gate/non_alias_selector_deployment_readiness.txt
+```
+
+저장된 readiness 결과는 `PASS`, requirement `7/7`, scenario/profile `6/6`, operator launch `19/19`, runtime truth `false`다.
+
+2026-06-18 이후 `run_rtk_stereo_robustness_sweep.py`는 scenario catalog가 PASS이면 위 selector package와 deployment frontier를 자동으로 생성한다. 별도 export 명령 없이 단일 robustness sweep 결과의 `robustness_summary.json|txt`에 `runtime_label_selector_package` 섹션이 기록된다. 이 산출물은 robustness acceptance matrix의 `runtime_label_selector_package` 항목에도 포함되며, selector export `PASS`, frontier `PASS`, operator-view launch dry-run `PASS`, profile/label count 양수, runtime truth `false`를 모두 만족해야 전체 robustness acceptance가 PASS다. Smoke evidence는 `Simulation/results/non_alias_robustness_auto_selector_operator_gate_smoke`이며, 2개 non-alias synthetic scenario에서 direct NED-to-RDF alias 금지 `2/2`, selector export `PASS`, frontier `PASS`, operator launch `7/7 PASS`, runtime truth `false`, final robustness acceptance `PASS`를 확인했다.
+
+중요: synthetic mode에서도 카메라 optical frame이 local NED에 대해 `forward=north`, `right=east`, `down=down`으로 정렬되어 있다고 가정하면 안 된다. `truth_rdf`는 explicit `T_source_to_stereo_rdf` 또는 이미 stereo-frame truth를 내는 producer에서만 와야 하며, 직접 alias `rdf_right=east`, `rdf_down=down`, `rdf_forward=north`는 현재 gate에서 금지된다. 평가는 계속 stereo-center RDF(right,down,forward)에서 수행하고, StereoDistance public topic은 별도 FRD+range(forward,right,down,range) 계약으로 변환된다.
 - 2026-06-11: EXP009 `bounded_gain_forward_cell_guard` JSON profile을 StereoDistance runtime loader에서 지원하도록 추가했습니다. 보수 Down guard를 적용한 EXP013은 5-trial Simulation Runtime 검증 `PASS`이며, 아직 hardware/WIRIS 검증은 아닙니다.
 - 2026-06-09: YOLO inference 기본 입력 크기를 `1280`으로 통일했습니다.

@@ -28,7 +28,11 @@ import rtk_stereo_calibration_pipeline as pipe  # noqa: E402
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 IMAGE_CONTRACT = "left image pixel center u/v and measured stereo disparity in pixels"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
-NED_TO_RDF_CONTRACT = "rdf_right=east, rdf_down=down, rdf_forward=north"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "explicit T_source_to_stereo_rdf required; direct axis alias "
+    "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+)
+NED_TO_RDF_CONTRACT = TRUTH_RDF_TRANSFORM_CONTRACT
 RUNTIME_INPUT_CONTRACT = (
     "causal image-space prefilter consumes timestamped left_u_px, left_v_px, measured_disparity_px, "
     "camera intrinsics/baseline, and calibration-fixed profile parameters; PX4/RTK truth is audit-only"
@@ -407,6 +411,7 @@ def main() -> None:
         "image_contract": IMAGE_CONTRACT,
         "rdf_axis_contract": RDF_AXIS_CONTRACT,
         "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
         "ned_to_rdf_contract": NED_TO_RDF_CONTRACT,
         "runtime_input_contract": RUNTIME_INPUT_CONTRACT,
         "runtime_truth_used": False,

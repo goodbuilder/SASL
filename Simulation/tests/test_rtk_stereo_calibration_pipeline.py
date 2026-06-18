@@ -28,6 +28,55 @@ def load_pipeline_module():
 
 
 class RtkStereoCalibrationPipelineTests(unittest.TestCase):
+    def test_synthetic_truth_uses_explicit_non_alias_ned_to_rdf_transform(self) -> None:
+        module = load_pipeline_module()
+        truth_rdf = np.array([20.0, 5.0, 1852.0], dtype=float)
+
+        truth_ned = module.stereo_rdf_to_ned_explicit(truth_rdf)
+        roundtrip_rdf = module.ned_to_stereo_rdf_explicit(truth_ned)
+
+        np.testing.assert_allclose(roundtrip_rdf, truth_rdf, atol=1.0e-9)
+        self.assertFalse(
+            np.allclose(
+                truth_rdf,
+                np.array([truth_ned[1], truth_ned[2], truth_ned[0]], dtype=float),
+                atol=1.0e-9,
+                rtol=0.0,
+            )
+        )
+        self.assertIn("explicit_transform", module.SYNTHETIC_NED_TO_RDF_CONTRACT)
+        self.assertIn("forbidden", module.SYNTHETIC_NED_TO_RDF_CONTRACT)
+
+    def test_split_preserves_truth_transform_metadata_for_reports(self) -> None:
+        module = load_pipeline_module()
+        source = module.SyntheticCalibrationDataSource(
+            camera=module.CameraModel(),
+            injection=module.ErrorInjection(),
+            sample_count=8,
+            seed=123,
+            target_range_m=1852.0,
+            target_window_m=30.0,
+            target_oversample_count=2,
+        )
+        loaded = source.load_samples()
+
+        train, validation = module.split_samples(
+            loaded,
+            train_ratio=0.75,
+            seed=321,
+            target_range_m=1852.0,
+            target_window_m=30.0,
+        )
+        rows = module.rows_for_samples([*train, *validation])
+
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(row["truth_source_frame"], "px4_local_position_ned")
+            self.assertEqual(row["truth_source_axis_order"], "north,east,down")
+            self.assertIn("explicit_transform", row["truth_rdf_transform_contract"])
+            self.assertNotIn("synthetic_bridge: rdf_right=east", row["truth_rdf_transform_contract"])
+            self.assertTrue(row["truth_source_to_stereo_rdf_rotation_matrix"])
+
     def test_triangulation_uses_rdf_axis_contract(self) -> None:
         module = load_pipeline_module()
         camera = module.CameraModel()
@@ -589,6 +638,49 @@ class RtkStereoCalibrationPipelineTests(unittest.TestCase):
         self.assertEqual(recommendation, "raw")
         self.assertIn("No correction candidate passed", reason)
 
+    def test_choose_recommendation_rejects_rdf_axis_regression(self) -> None:
+        module = load_pipeline_module()
+        rows = [
+            {
+                "method": "raw",
+                "validation_range_rmse_m": 5.0,
+                "validation_right_rmse_m": 1.0,
+                "validation_down_rmse_m": 1.0,
+                "validation_forward_rmse_m": 5.0,
+                "validation_target_abs_mean_error_m": 5.0,
+                "validation_target_window_count": 2,
+                "generalization_gap_range_rmse_m": 0.0,
+                "model_complexity": 0,
+            },
+            {
+                "method": "lower_range_but_axis_regresses",
+                "validation_range_rmse_m": 0.8,
+                "validation_right_rmse_m": 0.5,
+                "validation_down_rmse_m": 1.1,
+                "validation_forward_rmse_m": 0.7,
+                "validation_target_abs_mean_error_m": 0.5,
+                "validation_target_window_count": 2,
+                "generalization_gap_range_rmse_m": 0.0,
+                "model_complexity": 1,
+            },
+            {
+                "method": "axis_safe",
+                "validation_range_rmse_m": 1.2,
+                "validation_right_rmse_m": 0.6,
+                "validation_down_rmse_m": 0.9,
+                "validation_forward_rmse_m": 1.0,
+                "validation_target_abs_mean_error_m": 0.8,
+                "validation_target_window_count": 2,
+                "generalization_gap_range_rmse_m": 0.0,
+                "model_complexity": 1,
+            },
+        ]
+
+        recommendation, reason = module.choose_recommendation(rows)
+
+        self.assertEqual(recommendation, "axis_safe")
+        self.assertIn("RDF axis non-regression", reason)
+
     def test_robust_sim3_variants_reduce_outlier_influence_in_rdf_rows(self) -> None:
         module = load_pipeline_module()
         source = np.array(
@@ -862,7 +954,19 @@ class RtkStereoCalibrationPipelineTests(unittest.TestCase):
         self.assertIn("disparity_quadratic_then_sim3", method_names)
         self.assertIn("joint_disparity_ray_rotation_nls", method_names)
         self.assertIn("huber_joint_disparity_ray_rotation_nls", method_names)
+        self.assertIn("huber_joint_disparity_ray_rotation_nls_fscale0p75", method_names)
+        self.assertIn("huber_joint_disparity_ray_rotation_nls_fscale1p0", method_names)
+        self.assertIn("huber_joint_disparity_ray_rotation_nls_fscale2p0", method_names)
+        self.assertIn("huber_joint_disparity_ray_rotation_nls_fscale3p0", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma030", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma045", method_names)
         self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060_fscale0p75", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060_fscale1p0", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060_fscale2p0", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma060_fscale3p0", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma090", method_names)
+        self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma120", method_names)
         self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma160", method_names)
         self.assertIn("target_weighted_huber_joint_disparity_ray_rotation_nls_sigma250", method_names)
         self.assertIn("global_inverse_depth_linear", method_names)
@@ -1880,6 +1984,59 @@ class RtkStereoCalibrationPipelineTests(unittest.TestCase):
         self.assertEqual(by_policy["lowest_complexity_pass"]["method"], "simple")
         self.assertEqual(by_policy["lowest_validation_rmse"]["method"], "balanced")
 
+    def test_policy_recommendations_include_final_recommendation_row_when_needed(self) -> None:
+        module = load_pipeline_module()
+        rows = [
+            {
+                "method": "raw",
+                "validation_range_rmse_m": 5.0,
+                "validation_position_rmse_m": 6.0,
+                "validation_right_rmse_m": 5.0,
+                "validation_down_rmse_m": 5.0,
+                "validation_forward_rmse_m": 5.0,
+                "validation_target_abs_mean_error_m": 5.0,
+                "validation_target_rmse_m": 5.5,
+                "validation_target_max_abs_error_m": 6.0,
+                "validation_target_window_count": 1,
+                "generalization_gap_range_rmse_m": 0.0,
+                "model_complexity": 0,
+            },
+            {
+                "method": "balanced",
+                "validation_range_rmse_m": 1.0,
+                "validation_position_rmse_m": 1.2,
+                "validation_right_rmse_m": 0.7,
+                "validation_down_rmse_m": 0.8,
+                "validation_forward_rmse_m": 1.0,
+                "validation_target_abs_mean_error_m": 1.0,
+                "validation_target_rmse_m": 1.3,
+                "validation_target_max_abs_error_m": 1.8,
+                "validation_target_window_count": 1,
+                "generalization_gap_range_rmse_m": 0.1,
+                "model_complexity": 7,
+            },
+            {
+                "method": "axis_safe_final",
+                "validation_range_rmse_m": 1.4,
+                "validation_position_rmse_m": 4.2,
+                "validation_right_rmse_m": 4.0,
+                "validation_down_rmse_m": 4.0,
+                "validation_forward_rmse_m": 1.2,
+                "validation_target_abs_mean_error_m": 1.2,
+                "validation_target_rmse_m": 1.4,
+                "validation_target_max_abs_error_m": 2.0,
+                "validation_target_window_count": 1,
+                "generalization_gap_range_rmse_m": 0.0,
+                "model_complexity": 8,
+            },
+        ]
+
+        policy_rows = module.policy_recommendation_rows(rows, final_recommendation="axis_safe_final")
+        by_policy = {row["policy"]: row for row in policy_rows}
+
+        self.assertEqual(by_policy["final_recommendation"]["method"], "axis_safe_final")
+        self.assertTrue(by_policy["final_recommendation"]["is_final_recommendation"])
+
     def test_csv_source_accepts_recorded_style_gt_alias_and_center_disparity(self) -> None:
         module = load_pipeline_module()
         row = (
@@ -1895,9 +2052,48 @@ class RtkStereoCalibrationPipelineTests(unittest.TestCase):
 
         self.assertEqual(len(samples), 1)
         np.testing.assert_allclose(samples[0].truth_rdf_m, np.array([8.0, 4.0, 1000.0]))
-        np.testing.assert_allclose(samples[0].truth_ned_m, np.array([1000.0, 8.0, 4.0]))
+        self.assertTrue(np.all(np.isnan(samples[0].truth_ned_m)))
         np.testing.assert_allclose(samples[0].raw_rdf_m, np.array([7.5, 4.2, 1002.0]))
         self.assertEqual(samples[0].measured_disparity_px, 200.0)
+
+    def test_csv_source_rejects_ned_only_truth_without_explicit_rdf(self) -> None:
+        module = load_pipeline_module()
+        row = (
+            "truth_north_m,truth_east_m,truth_down_ned_m,"
+            "estimated_forward_m,estimated_right_m,estimated_down_m,"
+            "measured_disparity_px\n"
+            "1000.0,8.0,4.0,1002.0,7.5,4.2,200.0\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ned_only.csv"
+            path.write_text(row, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "no usable calibration rows"):
+                module.CsvCalibrationDataSource(path, camera=module.CameraModel()).load_samples()
+
+    def test_csv_source_preserves_truth_transform_metadata_in_sample_rows(self) -> None:
+        module = load_pipeline_module()
+        row = (
+            "truth_right_m,truth_down_m,truth_forward_m,"
+            "truth_source_frame,truth_source_axis_order,truth_source_fields,"
+            "truth_rdf_transform_contract,truth_source_origin_m,"
+            "truth_source_to_stereo_rdf_translation_m,truth_source_to_stereo_rdf_rotation_matrix,"
+            "estimated_right_m,estimated_down_m,estimated_forward_m,measured_disparity_px\n"
+            "8.0,4.0,1000.0,"
+            "rtk_enu,\"east,north,up\",\"rtk_e,rtk_n,rtk_u\","
+            "T_source_to_stereo_rdf: explicit transform,\"1.0,2.0,3.0\","
+            "\"0.0,0.0,0.0\",\"[[1,0,0],[0,1,0],[0,0,1]]\","
+            "7.5,4.2,1002.0,200.0\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "converted.csv"
+            path.write_text(row, encoding="utf-8")
+            samples = module.CsvCalibrationDataSource(path, camera=module.CameraModel()).load_samples()
+
+        sample_rows = module.rows_for_samples(samples)
+        self.assertEqual(sample_rows[0]["truth_source_frame"], "rtk_enu")
+        self.assertEqual(sample_rows[0]["truth_source_axis_order"], "east,north,up")
+        self.assertIn("T_source_to_stereo_rdf", sample_rows[0]["truth_rdf_transform_contract"])
+        self.assertNotIn("explicit_transform: truth_rdf = R_ned_to_stereo_rdf", sample_rows[0]["truth_rdf_transform_contract"])
 
     def test_csv_source_accepts_ros2_calibration_recorder_contract(self) -> None:
         module = load_pipeline_module()

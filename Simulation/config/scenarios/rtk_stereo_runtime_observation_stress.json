@@ -1,0 +1,66 @@
+{
+  "scenarios": [
+    {
+      "name": "bbox_quantization_stress",
+      "purpose": "Synthetic validation with stronger image-feature center jitter and occasional bbox-center outliers while keeping the PX4/NED truth contract offline-only.",
+      "args": [
+        "--bbox-noise-px",
+        "0.38",
+        "--bbox-outlier-rate",
+        "0.05",
+        "--bbox-outlier-px",
+        "1.8",
+        "--disparity-noise-px",
+        "0.09"
+      ]
+    },
+    {
+      "name": "disparity_bias_drift_stress",
+      "purpose": "Synthetic validation with stronger measured-disparity bias/noise and small focal/baseline scale drift to probe long-range range-error transfer.",
+      "args": [
+        "--disparity-bias-px",
+        "0.72",
+        "--disparity-noise-px",
+        "0.16",
+        "--disparity-outlier-rate",
+        "0.04",
+        "--disparity-outlier-px",
+        "0.36",
+        "--baseline-scale-error",
+        "0.010",
+        "--focal-scale-error",
+        "-0.007"
+      ]
+    },
+    {
+      "name": "mixed_runtime_observation_stress",
+      "purpose": "Synthetic validation combining camera attitude error, image-feature jitter, disparity bias/noise, and mild outliers under the same RDF runtime input contract.",
+      "args": [
+        "--yaw-error-deg",
+        "0.95",
+        "--pitch-error-deg",
+        "-0.52",
+        "--roll-error-deg",
+        "0.18",
+        "--baseline-scale-error",
+        "0.011",
+        "--focal-scale-error",
+        "-0.007",
+        "--disparity-bias-px",
+        "0.68",
+        "--disparity-noise-px",
+        "0.15",
+        "--bbox-noise-px",
+        "0.34",
+        "--bbox-outlier-rate",
+        "0.04",
+        "--bbox-outlier-px",
+        "1.6",
+        "--disparity-outlier-rate",
+        "0.04",
+        "--disparity-outlier-px",
+        "0.34"
+      ]
+    }
+  ]
+}

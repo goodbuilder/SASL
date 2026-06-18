@@ -32,6 +32,31 @@ from select_stereodistance_profile_from_catalog import method_contract_fields  #
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "truth_rdf must be stereo_center_RDF from explicit T_source_to_stereo_rdf "
+    "or an already stereo-frame truth producer; direct NED-to-RDF axis alias is forbidden"
+)
+FORBIDDEN_DIRECT_ALIAS_TOKENS = (
+    "synthetic_bridge: rdf_right=east",
+    "rdf_right=east, rdf_down=down, rdf_forward=north",
+)
+FORBIDDEN_CONTEXT_TOKENS = (
+    "forbidden",
+    "not allowed",
+    "invalid",
+    "must not",
+)
+MULTI_SEED_ACCEPTANCE_ITEMS = (
+    "seed_run_coverage",
+    "coordinate_contract",
+    "method_aggregate_summary",
+    "policy_stability_gate",
+    "method_stability_gate",
+    "multi_seed_recommendation",
+    "recommended_runtime_profiles",
+    "representative_profile_checks",
+    "representative_cross_seed_replay",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,6 +162,64 @@ def finite_values(values: Sequence[float]) -> list[float]:
 def finite_mean(values: Sequence[float]) -> float:
     clean = finite_values(values)
     return mean(clean)
+
+
+def collect_contract_text(payload: Mapping[str, object]) -> str:
+    parts: list[str] = []
+    for key in (
+        "truth_rdf_transform_contract",
+        "ned_to_rdf_contract",
+        "truth_source_to_stereo_rdf_contract",
+    ):
+        value = payload.get(key)
+        if value is not None:
+            parts.append(str(value))
+    contracts = payload.get("contracts")
+    if isinstance(contracts, Mapping):
+        for value in contracts.values():
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+def direct_axis_alias_forbidden(payload: Mapping[str, object]) -> bool:
+    for key in (
+        "direct_ned_to_rdf_axis_alias_allowed",
+        "direct_source_axis_alias_allowed",
+        "direct_axis_alias_allowed",
+    ):
+        if bool(payload.get(key, False)):
+            return False
+    contracts = payload.get("contracts")
+    if isinstance(contracts, Mapping):
+        for key in (
+            "direct_ned_to_rdf_axis_alias_allowed",
+            "direct_source_axis_alias_allowed",
+            "direct_axis_alias_allowed",
+        ):
+            if bool(contracts.get(key, False)):
+                return False
+    text = collect_contract_text(payload).lower()
+    if not text:
+        return False
+    for token in FORBIDDEN_DIRECT_ALIAS_TOKENS:
+        if token in text and not any(context in text for context in FORBIDDEN_CONTEXT_TOKENS):
+            return False
+    return True
+
+
+def seed_contract_summary(seed_contract_rows: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    completed = [row for row in seed_contract_rows if bool(row.get("run_config_loaded"))]
+    forbidden_count = sum(1 for row in completed if bool(row.get("direct_axis_alias_forbidden")))
+    return {
+        "seed_contract_count": len(seed_contract_rows),
+        "loaded_contract_count": len(completed),
+        "direct_axis_alias_forbidden_count": forbidden_count,
+        "all_loaded_contracts_forbid_direct_axis_alias": bool(completed) and forbidden_count == len(completed),
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
+        "rdf_axis_contract": RDF_AXIS_CONTRACT,
+        "ned_axis_contract": NED_AXIS_CONTRACT,
+        "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+    }
 
 
 def bootstrap_mean_ci(
@@ -646,6 +729,119 @@ def choose_multi_seed_recommendation(method_gate_rows: Sequence[Mapping[str, obj
     }
 
 
+def build_multi_seed_acceptance_matrix(
+    *,
+    seed_count: int,
+    completed_seed_count: int,
+    contract_summary: Mapping[str, object],
+    method_rows: Sequence[Mapping[str, object]],
+    policy_gate_rows: Sequence[Mapping[str, object]],
+    method_gate_rows: Sequence[Mapping[str, object]],
+    recommendation: Mapping[str, object],
+    recommended_profiles: Sequence[Mapping[str, object]],
+    representative_checks: Mapping[str, object],
+    cross_seed_replay: Mapping[str, object],
+) -> dict[str, dict[str, object]]:
+    strict_policy_count = sum(1 for row in policy_gate_rows if bool(row.get("strict_pass")))
+    performance_policy_count = sum(1 for row in policy_gate_rows if bool(row.get("performance_pass")))
+    strict_method_count = sum(1 for row in method_gate_rows if bool(row.get("strict_pass")))
+    performance_method_count = sum(1 for row in method_gate_rows if bool(row.get("performance_pass")))
+    recommended_method = str(recommendation.get("method", ""))
+    profile_exists_count = sum(1 for row in recommended_profiles if bool(row.get("profile_exists")))
+    return {
+        "seed_run_coverage": {
+            "status": "PASS" if seed_count > 0 and completed_seed_count == seed_count else "FAIL",
+            "path": "seed_runs.csv",
+            "evidence": {
+                "seed_count": seed_count,
+                "completed_seed_count": completed_seed_count,
+            },
+        },
+        "coordinate_contract": {
+            "status": "PASS" if bool(contract_summary.get("all_loaded_contracts_forbid_direct_axis_alias")) else "FAIL",
+            "path": "seed_coordinate_contracts.csv",
+            "evidence": {
+                "loaded_contract_count": contract_summary.get("loaded_contract_count", 0),
+                "direct_axis_alias_forbidden_count": contract_summary.get(
+                    "direct_axis_alias_forbidden_count",
+                    0,
+                ),
+                "truth_rdf_transform_contract": contract_summary.get(
+                    "truth_rdf_transform_contract",
+                    TRUTH_RDF_TRANSFORM_CONTRACT,
+                ),
+                "axis_contract": RDF_AXIS_CONTRACT,
+                "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+            },
+        },
+        "method_aggregate_summary": {
+            "status": "PASS" if bool(method_rows) and any(str(row.get("method")) == "raw" for row in method_rows) else "FAIL",
+            "path": "method_aggregate_summary.csv",
+            "evidence": {
+                "method_count": len(method_rows),
+                "has_raw_baseline": any(str(row.get("method")) == "raw" for row in method_rows),
+            },
+        },
+        "policy_stability_gate": {
+            "status": "PASS" if bool(policy_gate_rows) and performance_policy_count > 0 else "FAIL",
+            "path": "policy_stability_gate.csv",
+            "evidence": {
+                "policy_count": len(policy_gate_rows),
+                "strict_pass_count": strict_policy_count,
+                "performance_pass_count": performance_policy_count,
+            },
+        },
+        "method_stability_gate": {
+            "status": "PASS" if bool(method_gate_rows) and performance_method_count > 0 else "FAIL",
+            "path": "method_stability_gate.csv",
+            "evidence": {
+                "method_count": len(method_gate_rows),
+                "strict_pass_count": strict_method_count,
+                "performance_pass_count": performance_method_count,
+            },
+        },
+        "multi_seed_recommendation": {
+            "status": "PASS" if bool(recommended_method) else "FAIL",
+            "path": "multi_seed_recommendation.json",
+            "evidence": {
+                "method": recommended_method,
+                "recommendation_mode": recommendation.get("recommendation_mode", ""),
+                "score": recommendation.get("score"),
+                "reason": recommendation.get("reason", ""),
+            },
+        },
+        "recommended_runtime_profiles": {
+            "status": "PASS" if bool(recommended_profiles) and profile_exists_count == len(recommended_profiles) else "FAIL",
+            "path": "multi_seed_recommended_profiles.csv",
+            "evidence": {
+                "profile_count": len(recommended_profiles),
+                "profile_exists_count": profile_exists_count,
+                "axis_contract": RDF_AXIS_CONTRACT,
+                "runtime_input_contract": "raw stereo-center RDF(right,down,forward) plus measured disparity; no runtime truth",
+            },
+        },
+        "representative_profile_checks": {
+            "status": "PASS" if bool(representative_checks.get("pass_representative_profile_checks")) else "FAIL",
+            "path": "representative_profile_checks.json",
+            "evidence": {
+                "replay_pass": bool(representative_checks.get("replay_pass")),
+                "promotion_pass": bool(representative_checks.get("promotion_pass")),
+                "validation_range_rmse_raw_m": representative_checks.get("validation_range_rmse_raw_m"),
+                "validation_range_rmse_corrected_m": representative_checks.get("validation_range_rmse_corrected_m"),
+                "target_abs_mean_error_corrected_m": representative_checks.get("target_abs_mean_error_corrected_m"),
+            },
+        },
+        "representative_cross_seed_replay": {
+            "status": "PASS" if bool(cross_seed_replay.get("pass_cross_seed_replay")) else "FAIL",
+            "path": "representative_cross_seed_replay_summary.csv",
+            "evidence": {
+                "seed_count": cross_seed_replay.get("seed_count", 0),
+                "passed_seed_count": cross_seed_replay.get("passed_seed_count", 0),
+            },
+        },
+    }
+
+
 def method_family_diagnostic_rows(method_gate_rows: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
     grouped: dict[tuple[str, str, str, str], list[Mapping[str, object]]] = defaultdict(list)
     for row in method_gate_rows:
@@ -1106,6 +1302,7 @@ def write_summary(
     path: Path,
     *,
     seed_count: int,
+    contract_summary: Mapping[str, object],
     policy_rows: Sequence[Mapping[str, object]],
     method_rows: Sequence[Mapping[str, object]],
     gate_rows: Sequence[Mapping[str, object]],
@@ -1118,6 +1315,7 @@ def write_summary(
     representative_profile: Mapping[str, object],
     representative_checks: Mapping[str, object],
     cross_seed_replay: Mapping[str, object],
+    acceptance_matrix: Mapping[str, Mapping[str, object]],
 ) -> None:
     lines = [
         "RTK stereo policy multi-seed validation",
@@ -1126,6 +1324,12 @@ def write_summary(
         f"NED contract: {NED_AXIS_CONTRACT}",
         f"RDF contract: {RDF_AXIS_CONTRACT}",
         f"StereoDistance public topic contract: {PUBLIC_TOPIC_CONTRACT}",
+        f"Truth RDF transform contract: {contract_summary.get('truth_rdf_transform_contract', TRUTH_RDF_TRANSFORM_CONTRACT)}",
+        "Direct NED-to-RDF axis alias forbidden: {passed} ({count}/{total} loaded seed configs)".format(
+            passed=contract_summary.get("all_loaded_contracts_forbid_direct_axis_alias", False),
+            count=contract_summary.get("direct_axis_alias_forbidden_count", 0),
+            total=contract_summary.get("loaded_contract_count", 0),
+        ),
         "",
         "Policy stability:",
     ]
@@ -1288,6 +1492,17 @@ def write_summary(
             ),
         ]
     )
+    lines.extend(["", "Multi-seed acceptance matrix:"])
+    for name, item in acceptance_matrix.items():
+        evidence = item.get("evidence", {}) if isinstance(item, Mapping) else {}
+        lines.append(
+            "- {name}: status={status}, path={path}, evidence={evidence}".format(
+                name=name,
+                status=item.get("status", "") if isinstance(item, Mapping) else "",
+                path=item.get("path", "") if isinstance(item, Mapping) else "",
+                evidence=json.dumps(json_safe(evidence), sort_keys=True),
+            )
+        )
     lines.extend(["", "Top methods by mean validation RMSE:"])
     for row in list(method_rows)[:8]:
         lines.append(
@@ -1369,6 +1584,7 @@ def main() -> int:
     seeds = parse_seed_list(args.seeds)
 
     run_rows: list[dict[str, object]] = []
+    seed_contract_rows: list[dict[str, object]] = []
     per_seed_method_rows: list[dict[str, object]] = []
     per_seed_policy_rows: list[dict[str, object]] = []
     for seed in seeds:
@@ -1383,8 +1599,49 @@ def main() -> int:
             }
         )
         if exit_code != 0:
+            seed_contract_rows.append(
+                {
+                    "seed": seed,
+                    "run_config_loaded": False,
+                    "direct_axis_alias_forbidden": False,
+                    "truth_rdf_transform_contract": "",
+                    "ned_axis_contract": NED_AXIS_CONTRACT,
+                    "rdf_axis_contract": RDF_AXIS_CONTRACT,
+                    "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+                }
+            )
             continue
         run_config = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+        run_contracts = run_config.get("contracts") if isinstance(run_config.get("contracts"), dict) else {}
+        seed_contract_rows.append(
+            {
+                "seed": seed,
+                "run_config_loaded": True,
+                "direct_axis_alias_forbidden": direct_axis_alias_forbidden(run_config),
+                "truth_rdf_transform_contract": run_contracts.get(
+                    "truth_rdf_transform_contract",
+                    run_config.get("truth_rdf_transform_contract", TRUTH_RDF_TRANSFORM_CONTRACT),
+                ),
+                "ned_to_stereo_rdf_contract": run_contracts.get("ned_to_stereo_rdf", ""),
+                "direct_ned_to_rdf_axis_alias_allowed": bool(
+                    run_contracts.get(
+                        "direct_ned_to_rdf_axis_alias_allowed",
+                        run_config.get("direct_ned_to_rdf_axis_alias_allowed", False),
+                    )
+                ),
+                "synthetic_stereo_origin_ned_m": json.dumps(
+                    run_contracts.get("synthetic_stereo_origin_ned_m", []),
+                    sort_keys=True,
+                ),
+                "synthetic_ned_to_stereo_rdf_euler_zyx_deg": json.dumps(
+                    run_contracts.get("synthetic_ned_to_stereo_rdf_euler_zyx_deg", []),
+                    sort_keys=True,
+                ),
+                "ned_axis_contract": NED_AXIS_CONTRACT,
+                "rdf_axis_contract": RDF_AXIS_CONTRACT,
+                "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+            }
+        )
         recommendation = str(run_config.get("recommendation", ""))
         for row in read_csv(run_dir / "method_comparison.csv"):
             row_out: dict[str, object] = {"seed": seed, **row}
@@ -1394,6 +1651,7 @@ def main() -> int:
             per_seed_policy_rows.append({"seed": seed, **row})
 
     write_csv(output_dir / "seed_runs.csv", run_rows)
+    write_csv(output_dir / "seed_coordinate_contracts.csv", seed_contract_rows)
     write_csv(output_dir / "per_seed_method_comparison.csv", per_seed_method_rows)
     write_csv(output_dir / "per_seed_policy_recommendations.csv", per_seed_policy_rows)
     method_aggregate = aggregate_method_rows(per_seed_method_rows) if per_seed_method_rows else []
@@ -1401,6 +1659,7 @@ def main() -> int:
     write_csv(output_dir / "method_aggregate_summary.csv", method_aggregate)
     write_csv(output_dir / "policy_stability_summary.csv", policy_aggregate)
     completed_seed_count = sum(1 for row in run_rows if row["pass_run"])
+    contract_summary = seed_contract_summary(seed_contract_rows)
     gate_rows = policy_stability_gate_rows(
         policy_aggregate,
         method_aggregate,
@@ -1448,6 +1707,19 @@ def main() -> int:
         target_range_m=args.target_range_m,
         target_window_m=args.target_window_m,
     )
+    acceptance_matrix = build_multi_seed_acceptance_matrix(
+        seed_count=len(seeds),
+        completed_seed_count=completed_seed_count,
+        contract_summary=contract_summary,
+        method_rows=method_aggregate,
+        policy_gate_rows=gate_rows,
+        method_gate_rows=method_gate_rows,
+        recommendation=multi_seed_recommendation,
+        recommended_profiles=recommended_profiles,
+        representative_checks=representative_checks,
+        cross_seed_replay=cross_seed_replay,
+    )
+    acceptance_pass = all(item.get("status") == "PASS" for item in acceptance_matrix.values())
     write_csv(output_dir / "policy_stability_gate.csv", gate_rows)
     write_csv(output_dir / "method_stability_gate.csv", method_gate_rows)
     write_csv(output_dir / "selection_near_ties.csv", near_tie_rows)
@@ -1475,9 +1747,12 @@ def main() -> int:
     summary = {
         "seed_count": len(seeds),
         "completed_seed_count": completed_seed_count,
+        "coordinate_contract_summary": contract_summary,
+        "seed_coordinate_contracts": seed_contract_rows,
         "rdf_axis_contract": RDF_AXIS_CONTRACT,
         "ned_axis_contract": NED_AXIS_CONTRACT,
         "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
         "policy_stability_summary": policy_aggregate,
         "policy_stability_gate": gate_rows,
         "method_stability_gate": method_gate_rows,
@@ -1490,6 +1765,8 @@ def main() -> int:
         "multi_seed_representative_profile": representative_profile,
         "representative_profile_checks": representative_checks,
         "representative_cross_seed_replay": cross_seed_replay,
+        "multi_seed_acceptance_matrix": acceptance_matrix,
+        "multi_seed_acceptance_pass": acceptance_pass,
     }
     write_json(output_dir / "multi_seed_summary.json", summary)
     plot_policy_stability(output_dir / "policy_stability_ci.png", policy_aggregate, gate_rows)
@@ -1497,6 +1774,7 @@ def main() -> int:
     write_summary(
         output_dir / "multi_seed_summary.txt",
         seed_count=len(seeds),
+        contract_summary=contract_summary,
         policy_rows=policy_aggregate,
         method_rows=method_aggregate,
         gate_rows=gate_rows,
@@ -1509,6 +1787,7 @@ def main() -> int:
         representative_profile=representative_profile,
         representative_checks=representative_checks,
         cross_seed_replay=cross_seed_replay,
+        acceptance_matrix=acceptance_matrix,
     )
     print(f"wrote multi-seed summary to {output_dir}")
     return 0 if all(bool(row["pass_run"]) for row in run_rows) else 1

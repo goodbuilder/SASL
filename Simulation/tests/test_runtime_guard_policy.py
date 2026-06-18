@@ -4,6 +4,8 @@ import math
 import sys
 import tempfile
 import unittest
+from collections import deque
+import json
 from pathlib import Path
 
 import numpy as np
@@ -14,12 +16,27 @@ if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from stereo_ground_sim.external_bbox_publisher import detection_values_from_rdf
 from stereo_ground_sim.runtime_guard_policy import (
     BoundedGainForwardCellGuardPolicy,
     EstimatedToTruthAffineProfile,
     EstimatedToTruthDisparityProfile,
     EstimatedToTruthSim3Profile,
 )
+from stereo_ground_sim.runtime_deployment_selector import MultiBurstObservationFusion, RepeatedObservationFusion
+
+
+class FakeMsg:
+    def __init__(self, data):
+        self.data = data
+
+
+class FakePublisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(msg)
 
 
 def make_policy_case():
@@ -95,6 +112,16 @@ def make_policy_case():
 
 
 class RuntimeGuardPolicyTests(unittest.TestCase):
+    def make_node_logger(self):
+        return type(
+            "Logger",
+            (),
+            {
+                "warning": lambda self, msg: None,
+                "info": lambda self, msg: None,
+            },
+        )()
+
     def test_stereo_distance_node_loads_estimated_to_truth_sim3_profile(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             profile_path = Path(tmpdir) / "sim3_profile.json"
@@ -112,14 +139,7 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
             node = StereoDistanceNode.__new__(StereoDistanceNode)
             node.enable_bbox_center_adjustment = True
             node.bbox_center_adjustment_path = str(profile_path)
-            node.get_logger = lambda: type(
-                "Logger",
-                (),
-                {
-                    "warning": lambda self, msg: None,
-                    "info": lambda self, msg: None,
-                },
-            )()
+            node.get_logger = self.make_node_logger
 
             loaded = StereoDistanceNode._load_bbox_center_adjustment(node)
 
@@ -142,14 +162,7 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
             node = StereoDistanceNode.__new__(StereoDistanceNode)
             node.enable_bbox_center_adjustment = True
             node.bbox_center_adjustment_path = str(profile_path)
-            node.get_logger = lambda: type(
-                "Logger",
-                (),
-                {
-                    "warning": lambda self, msg: None,
-                    "info": lambda self, msg: None,
-                },
-            )()
+            node.get_logger = self.make_node_logger
 
             loaded = StereoDistanceNode._load_bbox_center_adjustment(node)
 
@@ -172,14 +185,7 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
             node = StereoDistanceNode.__new__(StereoDistanceNode)
             node.enable_bbox_center_adjustment = True
             node.bbox_center_adjustment_path = str(profile_path)
-            node.get_logger = lambda: type(
-                "Logger",
-                (),
-                {
-                    "warning": lambda self, msg: None,
-                    "info": lambda self, msg: None,
-                },
-            )()
+            node.get_logger = self.make_node_logger
 
             loaded = StereoDistanceNode._load_bbox_center_adjustment(node)
 
@@ -223,6 +229,291 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
                 + metrics["corrected_forward_m"] ** 2
             ),
         )
+
+    def test_stereo_distance_node_synthetic_detections_preserve_rdf_axis_order(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+        node.horizontal_fov_rad = 0.154997710698
+        node.baseline_m = 25.0
+        node.synthetic_detection_bbox_size_px = 32.0
+        node.yolo_load_error = ""
+        node.yolo_class_name = "drone"
+        node.bbox_center_adjustment = None
+        node.observation_fusion_adapter = None
+        node.observation_fusion_buffer = deque(maxlen=1)
+        node.disparity_residual_profile = None
+        node.disparity_residual_feature_selector = None
+        node.disparity_residual_feature_selector_window = deque(maxlen=1)
+
+        left, right = StereoDistanceNode._synthetic_detection_pair_from_rdf(
+            node,
+            right_m=7.0,
+            down_m=4.0,
+            forward_m=1000.0,
+            width=1280,
+            height=720,
+        )
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+
+        metrics = StereoDistanceNode._calculate_metrics(node, image, left, right, 1000.0, "unit")
+
+        self.assertAlmostEqual(metrics["estimated_right_m"], 7.0, places=6)
+        self.assertAlmostEqual(metrics["estimated_down_m"], 4.0, places=6)
+        self.assertAlmostEqual(metrics["estimated_forward_m"], 1000.0, places=6)
+        self.assertGreater(metrics["disparity_px"], 0.5)
+        self.assertGreater(left["cx"], right["cx"])
+
+    def test_stereo_distance_node_parses_external_bbox_detection_values(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+
+        detection = StereoDistanceNode._detection_from_values(
+            node,
+            [1, 650.0, 340.0, 750.0, 394.0, 0.91, 700.0, 367.0],
+        )
+        invalid = StereoDistanceNode._detection_from_values(
+            node,
+            [0, 650.0, 340.0, 750.0, 394.0, 0.91, 700.0, 367.0],
+        )
+
+        self.assertIsNotNone(detection)
+        assert detection is not None
+        self.assertEqual(detection["bbox"], (650.0, 340.0, 750.0, 394.0))
+        self.assertEqual(detection["cx"], 700.0)
+        self.assertIsNone(invalid)
+
+    def test_external_bbox_publisher_values_preserve_pixel_disparity_contract(self) -> None:
+        values = detection_values_from_rdf(
+            right_m=7.0,
+            down_m=4.0,
+            forward_m=1000.0,
+            width_px=1280,
+            height_px=720,
+            horizontal_fov_rad=0.154997710698,
+            baseline_m=25.0,
+            bbox_size_px=32.0,
+        )
+
+        self.assertEqual(len(values), 16)
+        self.assertEqual(values[0], 1.0)
+        self.assertEqual(values[8], 1.0)
+        left_cx = values[6]
+        left_cy = values[7]
+        right_cx = values[14]
+        right_cy = values[15]
+        self.assertGreater(left_cx, right_cx)
+        self.assertAlmostEqual(left_cy, right_cy)
+        disparity = left_cx - right_cx
+        self.assertGreater(disparity, 0.5)
+
+    def test_stereo_distance_node_external_bbox_callback_publishes_public_frd(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+        node.horizontal_fov_rad = 0.154997710698
+        node.baseline_m = 25.0
+        node.camera_height_m = 5.0
+        node.target_center_z_m = 5.0
+        node.approach_start_distance_m = 1000.0
+        node.approach_end_distance_m = 1000.0
+        node.approach_duration_s = 1.0
+        node.takeoff_duration_s = 0.0
+        node.first_hover_duration_s = 0.0
+        node.final_hover_duration_s = 0.0
+        node.land_duration_s = 0.0
+        node.takeoff_altitude_m = 5.0
+        node.mission_profile = "manual"
+        node.start_time = 0.0
+        node.actual_distance_source = "manual"
+        node.cached_actual_distance = 1000.0
+        node.cached_ground_truth_position = {
+            "right_m": 0.0,
+            "down_m": 0.0,
+            "forward_m": 1000.0,
+            "ground_truth_m": 1000.0,
+        }
+        node.external_bbox_detection_width_px = 1280
+        node.external_bbox_detection_height_px = 720
+        node.synthetic_detection_bbox_size_px = 32.0
+        node.yolo_load_error = ""
+        node.yolo_class_name = "external"
+        node.bbox_center_adjustment = None
+        node.observation_fusion_adapter = None
+        node.observation_fusion_buffer = deque(maxlen=1)
+        node.disparity_residual_profile = None
+        node.disparity_residual_feature_selector = None
+        node.disparity_residual_feature_selector_window = deque(maxlen=1)
+        node.lock = type("NullLock", (), {"__enter__": lambda self: None, "__exit__": lambda self, *args: None})()
+        node.detections_pub = FakePublisher()
+        node.estimated_position_pub = FakePublisher()
+        node.corrected_position_pub = FakePublisher()
+        node.bbox_adjustment_pub = FakePublisher()
+        node.profile_status_pub = FakePublisher()
+
+        left, right = StereoDistanceNode._synthetic_detection_pair_from_rdf(
+            node,
+            right_m=7.0,
+            down_m=4.0,
+            forward_m=1000.0,
+            width=1280,
+            height=720,
+        )
+        assert left is not None and right is not None
+        msg = FakeMsg(StereoDistanceNode._detections_to_msg(node, left, right).data)
+
+        StereoDistanceNode._external_detections_cb(node, msg)
+
+        self.assertEqual(len(node.detections_pub.messages), 1)
+        self.assertEqual(len(node.estimated_position_pub.messages), 1)
+        estimated = node.estimated_position_pub.messages[-1].data
+        self.assertAlmostEqual(estimated[0], 1000.0, places=3)
+        self.assertAlmostEqual(estimated[1], 7.0, places=3)
+        self.assertAlmostEqual(estimated[2], 4.0, places=3)
+        self.assertEqual(node.metrics["status"], "External bbox tracking")
+
+    def test_stereo_distance_node_loads_observation_fusion_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_path = Path(tmpdir) / "observation_fusion_runtime_manifest.json"
+            manifest_path.write_text(
+                """{
+  "default_recommendation": "unit_repeated",
+  "tiers": [
+    {
+      "tier": "unit_repeated",
+      "adapter": {
+        "class": "RepeatedObservationFusion",
+        "min_observations": 3,
+        "mode": "median",
+        "trim_fraction": 0.0
+      }
+    }
+  ]
+}
+""",
+                encoding="utf-8",
+            )
+            node = StereoDistanceNode.__new__(StereoDistanceNode)
+            node.enable_observation_fusion = True
+            node.observation_fusion_manifest_path = str(manifest_path)
+            node.observation_fusion_tier = ""
+            node.horizontal_fov_rad = 0.154997710698
+            node.baseline_m = 25.0
+            node.get_logger = self.make_node_logger
+
+            loaded = StereoDistanceNode._load_observation_fusion_adapter(node)
+
+        self.assertIsInstance(loaded, RepeatedObservationFusion)
+        self.assertEqual(loaded.min_observations, 3)
+
+    def test_stereo_distance_node_applies_observation_fusion_before_profile(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+        node.horizontal_fov_rad = 0.154997710698
+        node.baseline_m = 25.0
+        node.yolo_load_error = ""
+        node.yolo_class_name = "drone"
+        node.bbox_center_adjustment = None
+        node.observation_fusion_adapter = RepeatedObservationFusion(min_observations=3, mode="median")
+        node.observation_fusion_buffer = deque(maxlen=3)
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        normal_left = {"cx": 700.0, "cy": 367.0, "bbox": (650.0, 340.0, 750.0, 394.0)}
+        normal_right = {"cx": 528.0, "cy": 367.0, "bbox": (478.0, 340.0, 578.0, 394.0)}
+        outlier_left = {"cx": 900.0, "cy": 367.0, "bbox": (850.0, 340.0, 950.0, 394.0)}
+        outlier_right = {"cx": 728.0, "cy": 367.0, "bbox": (678.0, 340.0, 778.0, 394.0)}
+
+        StereoDistanceNode._calculate_metrics(node, image, normal_left, normal_right, 1000.0, "unit")
+        StereoDistanceNode._calculate_metrics(node, image, normal_left, normal_right, 1000.0, "unit")
+        metrics = StereoDistanceNode._calculate_metrics(node, image, outlier_left, outlier_right, 1000.0, "unit")
+        expected = StereoDistanceNode._position_from_centers(
+            node,
+            normal_left["cx"],
+            normal_left["cy"],
+            normal_right["cx"],
+            normal_right["cy"],
+            1280,
+            720,
+        )
+
+        self.assertIn("observation_fusion=fused:RepeatedObservationFusion:3", metrics["status"])
+        self.assertAlmostEqual(metrics["estimated_right_m"], expected["right_m"])
+        self.assertAlmostEqual(metrics["estimated_down_m"], expected["down_m"])
+        self.assertAlmostEqual(metrics["estimated_forward_m"], expected["forward_m"])
+
+    def test_stereo_distance_node_applies_multiburst_observation_fusion_before_profile(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+        node.horizontal_fov_rad = 0.154997710698
+        node.baseline_m = 25.0
+        node.yolo_load_error = ""
+        node.yolo_class_name = "drone"
+        node.bbox_center_adjustment = None
+        node.observation_fusion_adapter = MultiBurstObservationFusion(
+            min_bursts=2,
+            min_observations_per_burst=3,
+            inner_mode="median",
+            outer_mode="median",
+            trim_fraction=0.0,
+        )
+        node.observation_fusion_buffer = deque(maxlen=6)
+        image = np.zeros((720, 1280, 3), dtype=np.uint8)
+        normal_left = {"cx": 700.0, "cy": 367.0, "bbox": (650.0, 340.0, 750.0, 394.0)}
+        normal_right = {"cx": 528.0, "cy": 367.0, "bbox": (478.0, 340.0, 578.0, 394.0)}
+        outlier_left = {"cx": 900.0, "cy": 430.0, "bbox": (850.0, 400.0, 950.0, 460.0)}
+        outlier_right = {"cx": 728.0, "cy": 430.0, "bbox": (678.0, 400.0, 778.0, 460.0)}
+
+        sequence = [
+            (normal_left, normal_right),
+            (normal_left, normal_right),
+            (outlier_left, outlier_right),
+            (normal_left, normal_right),
+            (normal_left, normal_right),
+            (outlier_left, outlier_right),
+        ]
+        metrics = None
+        for left, right in sequence:
+            metrics = StereoDistanceNode._calculate_metrics(node, image, left, right, 1000.0, "unit")
+        assert metrics is not None
+        expected = StereoDistanceNode._position_from_centers(
+            node,
+            normal_left["cx"],
+            normal_left["cy"],
+            normal_right["cx"],
+            normal_right["cy"],
+            1280,
+            720,
+        )
+
+        self.assertIn("observation_fusion=fused:MultiBurstObservationFusion:6", metrics["status"])
+        self.assertAlmostEqual(metrics["estimated_right_m"], expected["right_m"])
+        self.assertAlmostEqual(metrics["estimated_down_m"], expected["down_m"])
+        self.assertAlmostEqual(metrics["estimated_forward_m"], expected["forward_m"])
+
+    def test_stereo_distance_node_profile_status_reports_observation_fusion_state(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+        node.observation_fusion_adapter = MultiBurstObservationFusion(
+            min_bursts=2,
+            min_observations_per_burst=3,
+        )
+        node.observation_fusion_buffer = deque(maxlen=6)
+        node.observation_fusion_buffer.extend(
+            [
+                object(),
+                object(),
+            ]
+        )
+        metrics = {
+            "profile_status": StereoDistanceNode._profile_status(
+                node,
+                "unit-profile",
+                "estimated_to_truth_sim3",
+                0,
+                "unit",
+            ),
+            "observation_fusion_status": "warming_up:2/6",
+        }
+
+        msg = StereoDistanceNode._profile_status_to_msg(node, metrics)
+        payload = json.loads(msg.data)
+
+        self.assertEqual(payload["profile_id"], "unit-profile")
+        self.assertEqual(payload["observation_fusion_status"], "warming_up:2/6")
+        self.assertEqual(payload["observation_fusion_adapter"], "MultiBurstObservationFusion")
+        self.assertEqual(payload["observation_fusion_buffer_count"], 2)
+        self.assertEqual(payload["observation_fusion_required_count"], 6)
 
     def test_stereo_distance_node_passes_bbox_center_to_left_disparity_profile(self) -> None:
         node = StereoDistanceNode.__new__(StereoDistanceNode)

@@ -27,7 +27,11 @@ import rtk_stereo_calibration_pipeline as pipe  # noqa: E402
 
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
-NED_TO_RDF_CONTRACT = "rdf_right=east, rdf_down=down, rdf_forward=north"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "explicit T_source_to_stereo_rdf required; direct axis alias "
+    "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+)
+NED_TO_RDF_CONTRACT = TRUTH_RDF_TRANSFORM_CONTRACT
 RUNTIME_INPUT_CONTRACT = (
     "causal alpha-beta motion fusion consumes timestamped corrected stereo-center RDF only; "
     "PX4/RTK truth is audit-only"
@@ -381,6 +385,7 @@ def main() -> None:
         "coordinate_contracts_explicit": True,
         "rdf_axis_contract": RDF_AXIS_CONTRACT,
         "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
         "ned_to_rdf_contract": NED_TO_RDF_CONTRACT,
         "runtime_input_contract": RUNTIME_INPUT_CONTRACT,
         "runtime_truth_used": False,

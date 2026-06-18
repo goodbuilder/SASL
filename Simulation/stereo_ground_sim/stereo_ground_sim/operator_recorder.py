@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import math
 import os
 import signal
@@ -17,7 +18,7 @@ from std_msgs.msg import Float32, Float32MultiArray, String
 
 cv2 = None
 _CLOSING = False
-AXIS_CONTRACT = "stereo_center_frd:forward_right_down"
+AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
 
 
 NUMERIC_TOPICS = {
@@ -100,6 +101,25 @@ DETECTION_FIELDS = [
     "right_height_px",
     "raw_disparity_px",
     "yolo_measurement_raw_range_m",
+]
+
+DETECTION_MESSAGE_FIELDS = [
+    "left_valid",
+    "left_x1",
+    "left_y1",
+    "left_x2",
+    "left_y2",
+    "left_confidence",
+    "left_cx",
+    "left_cy",
+    "right_valid",
+    "right_x1",
+    "right_y1",
+    "right_x2",
+    "right_y2",
+    "right_confidence",
+    "right_cx",
+    "right_cy",
 ]
 
 PROFILE_STATUS_FIELDS = [
@@ -201,7 +221,7 @@ class OperatorRecorder(Node):
             f"csv=telemetry.csv",
             f"csv_hz={self.csv_hz:g}",
             f"axis_contract={AXIS_CONTRACT}",
-            "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m and estimated_forward_m/estimated_right_m/estimated_down_m",
+            "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, raw_forward_m/raw_right_m/raw_down_m, estimated_forward_m/estimated_right_m/estimated_down_m, corrected_forward_m/corrected_right_m/corrected_down_m",
             "axis_aliases=public CSV uses forward/right/down; legacy x/y/z is intentionally not emitted",
             "estimated_position_topic=/stereo/estimated_position publishes raw forward/right/down/range",
             "corrected_position_topic=/stereo/corrected_position publishes bbox-adjusted forward/right/down/range",
@@ -376,10 +396,10 @@ class OperatorRecorder(Node):
         self.last_stamp["/stereo/bbox_adjustment"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _detections_cb(self, msg):
-        values = list(msg.data[:16])
-        while len(values) < 16:
+        values = list(msg.data[: len(DETECTION_MESSAGE_FIELDS)])
+        while len(values) < len(DETECTION_MESSAGE_FIELDS):
             values.append(math.nan)
-        for field, value in zip(DETECTION_FIELDS, values):
+        for field, value in zip(DETECTION_MESSAGE_FIELDS, values):
             self.latest[field] = float(value)
         left_width = self.latest.get("left_x2", math.nan) - self.latest.get("left_x1", math.nan)
         left_height = self.latest.get("left_y2", math.nan) - self.latest.get("left_y1", math.nan)
@@ -389,7 +409,12 @@ class OperatorRecorder(Node):
         self.latest["left_height_px"] = left_height
         self.latest["right_width_px"] = right_width
         self.latest["right_height_px"] = right_height
-        self.latest["raw_disparity_px"] = self.latest.get("disparity_px", math.nan)
+        left_cx = self.latest.get("left_cx", math.nan)
+        right_cx = self.latest.get("right_cx", math.nan)
+        if math.isfinite(left_cx) and math.isfinite(right_cx):
+            self.latest["raw_disparity_px"] = left_cx - right_cx
+        else:
+            self.latest["raw_disparity_px"] = self.latest.get("disparity_px", math.nan)
         self.latest["yolo_measurement_raw_range_m"] = self.latest.get("raw_range_m", math.nan)
         self.last_stamp["/stereo/detections"] = self.get_clock().now().nanoseconds * 1e-9
 

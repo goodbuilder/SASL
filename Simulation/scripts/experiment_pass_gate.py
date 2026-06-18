@@ -9,6 +9,16 @@ from typing import Any
 
 
 AXES = ("right", "down", "forward")
+FORBIDDEN_DIRECT_ALIAS_TOKENS = (
+    "synthetic_bridge: rdf_right=east",
+    "rdf_right=east, rdf_down=down, rdf_forward=north",
+)
+FORBIDDEN_CONTEXT_TOKENS = (
+    "forbidden",
+    "not allowed",
+    "invalid",
+    "must not",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,6 +57,64 @@ def improved(raw: float | None, corrected: float | None, *, strict: bool) -> boo
     return corrected < raw if strict else corrected <= raw
 
 
+def first_finite(payload: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        value = finite_float(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def first_present(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def collect_contract_text(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "truth_rdf_transform_contract",
+        "ned_to_rdf_contract",
+        "truth_source_to_stereo_rdf_contract",
+    ):
+        value = payload.get(key)
+        if value is not None:
+            parts.append(str(value))
+    contracts = payload.get("contracts")
+    if isinstance(contracts, dict):
+        for value in contracts.values():
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+def direct_axis_alias_forbidden(payload: dict[str, Any]) -> bool:
+    for key in (
+        "direct_ned_to_rdf_axis_alias_allowed",
+        "direct_source_axis_alias_allowed",
+        "direct_axis_alias_allowed",
+    ):
+        if bool(payload.get(key, False)):
+            return False
+    contracts = payload.get("contracts")
+    if isinstance(contracts, dict):
+        for key in (
+            "direct_ned_to_rdf_axis_alias_allowed",
+            "direct_source_axis_alias_allowed",
+            "direct_axis_alias_allowed",
+        ):
+            if bool(contracts.get(key, False)):
+                return False
+    text = collect_contract_text(payload).lower()
+    if not text:
+        return False
+    for token in FORBIDDEN_DIRECT_ALIAS_TOKENS:
+        if token in text and not any(context in text for context in FORBIDDEN_CONTEXT_TOKENS):
+            return False
+    return True
+
+
 def evaluate(payload: dict[str, Any]) -> dict[str, Any]:
     checks: dict[str, Any] = {}
 
@@ -79,10 +147,13 @@ def evaluate(payload: dict[str, Any]) -> dict[str, Any]:
     checks["axis_strict_improvement"] = axis_strict
     checks["axis_checks"] = axis_checks
 
-    target_error = finite_float(payload.get("target_1852m_abs_mean_error_m"))
-    target_tolerance = finite_float(payload.get("target_1852m_tolerance_m")) or 10.0
-    target_count = payload.get("target_1852m_sample_count")
-    min_target_count = payload.get("target_1852m_min_sample_count", 3)
+    target_range_m = first_finite(payload, "target_range_m", "target_1852m_range_m")
+    target_error = first_finite(payload, "target_range_abs_mean_error_m", "target_1852m_abs_mean_error_m")
+    target_tolerance = first_finite(payload, "target_range_tolerance_m", "target_1852m_tolerance_m") or 10.0
+    target_count = first_present(payload, "target_range_sample_count", "target_1852m_sample_count")
+    min_target_count = first_present(payload, "target_range_min_sample_count", "target_1852m_min_sample_count")
+    if min_target_count is None:
+        min_target_count = 3
     try:
         target_count_int = int(target_count)
     except (TypeError, ValueError):
@@ -91,10 +162,15 @@ def evaluate(payload: dict[str, Any]) -> dict[str, Any]:
         min_target_count_int = int(min_target_count)
     except (TypeError, ValueError):
         min_target_count_int = 3
-    checks["target_1852m_error_within_tolerance"] = (
+    checks["target_range_m"] = target_range_m
+    checks["target_range_error_within_tolerance"] = (
         target_error is not None and target_error <= target_tolerance
     )
-    checks["target_1852m_sample_count_ok"] = target_count_int >= min_target_count_int
+    checks["target_range_sample_count_ok"] = target_count_int >= min_target_count_int
+    checks["target_range_sample_count"] = target_count_int
+    checks["target_range_min_sample_count"] = min_target_count_int
+    checks["target_1852m_error_within_tolerance"] = checks["target_range_error_within_tolerance"]
+    checks["target_1852m_sample_count_ok"] = checks["target_range_sample_count_ok"]
     checks["target_1852m_sample_count"] = target_count_int
     checks["target_1852m_min_sample_count"] = min_target_count_int
 
@@ -114,6 +190,7 @@ def evaluate(payload: dict[str, Any]) -> dict[str, Any]:
     checks["offline_only"] = bool_value(payload, "offline_only")
     checks["coordinate_contracts_explicit"] = bool_value(payload, "coordinate_contracts_explicit")
     checks["alias_contracts_explicit"] = bool_value(payload, "alias_contracts_explicit")
+    checks["direct_axis_alias_forbidden"] = direct_axis_alias_forbidden(payload)
 
     hard_fail_reasons = []
     if not checks["runtime_truth_not_used"]:
@@ -136,31 +213,33 @@ def evaluate(payload: dict[str, Any]) -> dict[str, Any]:
         hard_fail_reasons.append("coordinate_contracts_missing")
     if not checks["alias_contracts_explicit"]:
         hard_fail_reasons.append("alias_contracts_missing")
+    if not checks["direct_axis_alias_forbidden"]:
+        hard_fail_reasons.append("direct_axis_alias_not_forbidden")
     if not checks["validation_range_improved"]:
         hard_fail_reasons.append("validation_range_not_improved")
-    if not checks["target_1852m_error_within_tolerance"]:
-        hard_fail_reasons.append("target_1852m_error_fail")
+    if not checks["target_range_error_within_tolerance"]:
+        hard_fail_reasons.append("target_range_error_fail")
 
     strict_pass = (
         not hard_fail_reasons
         and checks["validation_position_improved"]
         and checks["axis_reported"]
         and checks["axis_strict_improvement"]
-        and checks["target_1852m_sample_count_ok"]
+        and checks["target_range_sample_count_ok"]
         and checks["train_validation_gap_stable"]
     )
     pass_result = (
         not hard_fail_reasons
         and checks["axis_reported"]
         and checks["axis_nonregression"]
-        and checks["target_1852m_sample_count_ok"]
+        and checks["target_range_sample_count_ok"]
     )
     conditional = (
         not hard_fail_reasons
         and (
             not checks["validation_position_improved"]
             or not checks["axis_nonregression"]
-            or not checks["target_1852m_sample_count_ok"]
+            or not checks["target_range_sample_count_ok"]
             or not checks["train_validation_gap_stable"]
         )
     )
@@ -174,8 +253,8 @@ def evaluate(payload: dict[str, Any]) -> dict[str, Any]:
     else:
         verdict = "FAIL"
 
-    if not checks["target_1852m_sample_count_ok"] and "target_1852m_under_sampled" not in hard_fail_reasons:
-        hard_fail_reasons.append("target_1852m_under_sampled")
+    if not checks["target_range_sample_count_ok"] and "target_range_under_sampled" not in hard_fail_reasons:
+        hard_fail_reasons.append("target_range_under_sampled")
     if checks["axis_reported"] and not checks["axis_nonregression"]:
         hard_fail_reasons.append("axis_regression")
     if not checks["validation_position_improved"]:

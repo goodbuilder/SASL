@@ -16,7 +16,8 @@ model_files = list(model_files_by_dir.items())
 setup(
     name=package_name,
     version="0.1.0",
-    packages=[package_name],
+    packages=[package_name, "sasl_common"],
+    package_dir={"sasl_common": "../../sasl_common"},
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
@@ -36,6 +37,7 @@ setup(
         "console_scripts": [
             "stereo_distance_node = stereo_ground_sim.stereo_distance_node:main",
             "detection_overlay_node = stereo_ground_sim.detection_overlay_node:main",
+            "external_bbox_publisher = stereo_ground_sim.external_bbox_publisher:main",
             "operator_recorder = stereo_ground_sim.operator_recorder:main",
             "calibration_csv_recorder = stereo_ground_sim.calibration_csv_recorder:main",
         ],

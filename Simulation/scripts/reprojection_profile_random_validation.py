@@ -17,7 +17,19 @@ import rclpy
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 PROJECT_DIR = ROOT_DIR.parent
-APP_DIR = PROJECT_DIR / "apps" / "StereoDistance"
+
+
+def _find_stereo_distance_app() -> Path:
+    if os.environ.get("STEREO_DISTANCE_APP"):
+        return Path(os.environ["STEREO_DISTANCE_APP"]).expanduser()
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "StereoDistance"
+        if (candidate / "wiris_stereo_distance").is_dir():
+            return candidate
+    return PROJECT_DIR / "StereoDistance"
+
+
+APP_DIR = _find_stereo_distance_app()
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(APP_DIR))
 

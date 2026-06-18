@@ -24,13 +24,31 @@ attempts must create an experiment record under `reports/experiments/`.
    calibration-time truth use, measurement-time runtime inputs, and coordinate
    contracts before execution. Distinguish PX4 NED, internal correction RDF,
    and any public StereoDistance FRD+range topic arrays.
-5. Write metrics and verdict after execution, even for failures.
-6. For estimated-to-truth correction claims, run or manually satisfy the
+   Evaluation is in `stereo_center_RDF`: compare `corrected_rdf` with
+   `truth_rdf`. `truth_rdf` must come from an explicit
+   `T_source_to_stereo_rdf` transform or an already stereo-frame truth producer.
+   The source may be PX4 local NED, RTK/GNSS world coordinates, Gazebo
+   world/model pose, an external tracker, or a stereo-frame truth topic, but the
+   experiment must state the source frame, origin/reference point, transform,
+   units, time basis, and target truth point.
+   Do not use a direct axis alias such as `rdf_right=east`,
+   `rdf_down=down`, `rdf_forward=north`; this is forbidden for real data and
+   for synthetic experiments.
+5. Record scenario metadata before execution: scenario name, target class,
+   target size, range band or target range, stereo baseline, camera height,
+   zoom/FOV, image size, intrinsics basis, and injected attitude/noise/outlier
+   conditions.
+6. Keep fixed scenario/session parameters in metadata or the experiment
+   README, and keep time-varying observations in timestamped artifacts. Runtime
+   rows must include the active scenario/profile/intrinsics identifiers needed
+   to reproduce a mid-run setting change.
+7. Write metrics and verdict after execution, even for failures.
+8. For estimated-to-truth correction claims, run or manually satisfy the
    Estimated-to-Truth Runtime PASS gate in `docs/experiment-gates.md`.
-7. Update `reports/experiments/experiment_registry.csv` after every completed,
+9. Update `reports/experiments/experiment_registry.csv` after every completed,
    blocked, rejected, or promoted experiment.
-8. Do not claim a method is better unless the registry row links the evidence.
-9. Do not overwrite previous experiment directories. Create a new experiment
+10. Do not claim a method is better unless the registry row links the evidence.
+11. Do not overwrite previous experiment directories. Create a new experiment
    ID for reruns with changed inputs, thresholds, gates, or code.
 
 ## Experiment ID
@@ -70,6 +88,81 @@ reports/experiments/EXP-YYYYMMDD-NNN-method/
 
 Use `reports/experiments/templates/` as the starting point.
 
+## Storage Contract
+
+Experiment records use the same split as StereoDistance session storage:
+
+- Fixed scenario/session parameters belong in `README.md`, `metrics.json`, or a
+  profile/deployment manifest. This includes scenario name, target class/size,
+  baseline, camera height, zoom/FOV, image size, intrinsics basis, validated
+  envelope, truth source, time basis, units, and coordinate/axis contracts.
+- Time-varying observations belong in timestamped artifacts listed from
+  `artifacts.txt`. This includes raw and corrected StereoDistance RDF/FRD
+  samples, truth N/E/D samples, bbox geometry/confidence, disparity/range,
+  frame timestamps, latency/sample age, outlier flags, and active profile or
+  intrinsics IDs.
+- PX4 truth may be recorded as local NED, global position, or GPS position.
+  Local NED is the primary calibration/evaluation source. GPS/global
+  `lat/lon/alt` must be preserved as raw source data and converted to local NED
+  with an explicit origin before any comparison. Live GPS/global conversion in
+  StereoDistance is an operational monitor; final calibration/PASS evidence must
+  be regenerated offline from saved rows or ULog with the selected origin, time
+  basis, and `T_source_to_stereo_rdf` or alignment profile.
+- When a Simulation experiment is intended to compare truth-source choices, use
+  one shared measurement run and record all three truth-source contracts:
+  `local_ned`, `global_position`, and `gps_position`. Build three separate
+  profiles from the same measurement rows, one per selected truth source. The
+  profile training step must use only that selected source; it must not use the
+  Gazebo oracle.
+- Gazebo true world/model pose is the independent oracle for Simulation
+  evaluation. Convert the Gazebo target truth point to stereo-center RDF/FRD
+  with an explicit transform, then evaluate all three profiles against that same
+  oracle on the same validation trajectory. Record both profile error versus
+  oracle and source-to-oracle error so truth-source noise is separated from
+  correction-method error.
+- Parameters that may change during a run must be represented both ways: the
+  allowed contract or initial value in metadata, and the active value or stable
+  identifier on each affected row.
+
+## Reference Policy
+
+Use references to justify the method design, the coordinate contract, and the
+runtime applicability claim. A reference can motivate an experiment, but it does
+not make a method pass; PASS status requires local validation under the project
+gates.
+
+Reference sources are prioritized as follows:
+
+- Internal project evidence first for behavior claims: prior EXP records,
+  `metrics.json`, `verdict.md`, `promotion_summary.txt`, replay outputs, saved
+  profiles, ULog/session rows, and tests.
+- Geometry and calibration theory for model assumptions: stereo
+  triangulation, reprojection error, bundle adjustment, Sim3, residual models,
+  temporal filtering, and robust statistics.
+- Official coordinate and telemetry documents for frame contracts: PX4,
+  MAVLink, ROS REP-103/REP-105, ROS message definitions, ULog field producers,
+  and producer code. Blog posts or informal examples are not enough to resolve
+  NED/ENU/FRD/RDF ambiguity.
+- Hardware and simulation documents for scenario parameters: WIRIS camera
+  specs/SDK, lens/FOV/zoom/timestamp behavior, Pixhawk/GPS/RTK/RM3100
+  datasheets, Gazebo/Ignition model definitions, calibration JSON, and measured
+  field logs.
+
+Use these reference levels:
+
+| Level | Meaning |
+| --- | --- |
+| `R0` | No reference; exploratory only. |
+| `R1` | Internal prior result or local implementation precedent. |
+| `R2` | Standard geometry, calibration, filtering, or measurement-model principle. |
+| `R3` | Official documentation, producer code, primary dataset/schema, or peer-reviewed paper. |
+| `R4` | Multiple independent references plus local validation evidence. |
+
+Each experiment's `references.md` must state what each reference supports and
+what it does not prove. In particular, coordinate/frame references must name the
+producer, field names, axis order, units, and whether the reference applies to
+position, orientation, image pixels, or public topic arrays.
+
 ## Lifecycle
 
 Use one lifecycle stage at a time:
@@ -107,6 +200,7 @@ Use one primary status in the registry:
 | `BLOCKED` | Could not run for non-method reasons. |
 | `REJECTED` | Should not be rerun without a material change. |
 | `PROMOTED` | Approved for runtime integration or next-stage implementation. |
+| `PASS_CROSS_GEOMETRY` | Validated across multiple scenario families, with scenario envelope metadata and safe no-op/profile selection outside validated conditions. |
 
 ## Evidence Levels
 

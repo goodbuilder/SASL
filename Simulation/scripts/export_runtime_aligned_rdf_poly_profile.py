@@ -130,8 +130,11 @@ def fit_profile(args: argparse.Namespace) -> tuple[dict[str, object], list[pipe.
             "input_axis_order": "right,down,forward",
             "output_frame": "stereo_center_opencv_optical",
             "output_axis_order": "right,down,forward",
-            "truth_source_frame_for_calibration_only": "px4_local_position_ned:north,east,down",
-            "ned_to_rdf_contract": "rdf_right=east, rdf_down=down, rdf_forward=north",
+            "truth_source_frame_for_calibration_only": "source frame declared by calibration data",
+            "truth_rdf_transform_contract": (
+                "truth_rdf must be stereo_center_RDF from explicit T_source_to_stereo_rdf; "
+                "direct NED-to-RDF axis alias is forbidden"
+            ),
             "public_stereodistance_topic_order": "forward,right,down,range",
         },
         "robust_fit_audit": {

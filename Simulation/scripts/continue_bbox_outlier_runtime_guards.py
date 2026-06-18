@@ -23,7 +23,11 @@ import rtk_stereo_calibration_pipeline as pipeline  # noqa: E402
 from stereo_ground_sim.runtime_guard_policy import EstimatedToTruthSim3Profile  # noqa: E402
 
 
-NED_TO_RDF_CONTRACT = "rdf_right=east, rdf_down=down, rdf_forward=north"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "explicit T_source_to_stereo_rdf required; direct axis alias "
+    "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+)
+NED_TO_RDF_CONTRACT = TRUTH_RDF_TRANSFORM_CONTRACT
 TARGET_RANGE_M = 1852.0
 TARGET_WINDOW_M = 30.0
 PROFILE_JSON = (
@@ -1509,6 +1513,7 @@ def run_experiment(
         "internal_correction_frame": "stereo_center_opencv_optical",
         "internal_correction_axis_order": "right,down,forward",
         "public_stereodistance_topic_order": "forward,right,down,range",
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
         "ned_to_rdf_contract": NED_TO_RDF_CONTRACT,
         "runtime_truth_used": False,
         "methods": rows,
@@ -1539,7 +1544,7 @@ def write_outputs(exp_dir: Path, metrics: Mapping[str, object], method_specs: Se
         "",
         "Method: replay fixed d6/d7 runtime profile under bbox/disparity outlier stress, then apply runtime-safe guard variants. Runtime inputs are raw RDF/range, measured disparity, and fixed profile output; truth is used only for offline scoring.",
         "",
-        "Coordinate contract: PX4/local NED truth `north/east/down` is converted to stereo-center OpenCV optical RDF by `rdf_right=east`, `rdf_down=down`, `rdf_forward=north`. Internal correction is RDF `right/down/forward`; public StereoDistance topics remain FRD+range `forward/right/down/range`.",
+        "Coordinate contract: validation truth must be stereo-center OpenCV optical RDF from an explicit T_source_to_stereo_rdf; direct NED-to-RDF axis aliasing is forbidden. Internal correction is RDF `right/down/forward`; public StereoDistance topics remain FRD+range `forward/right/down/range`.",
         "",
         "Pass/fail criteria: STRICT_PASS if any method improves aggregate range and position RMSE versus raw, has invalid count 0, nonzero target-window coverage, and runtime truth is unused.",
         "",

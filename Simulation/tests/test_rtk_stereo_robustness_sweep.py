@@ -27,6 +27,41 @@ def load_sweep_module():
 
 
 class RtkStereoRobustnessSweepTests(unittest.TestCase):
+    def write_json(self, path: Path, payload: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def write_runtime_profile(self, path: Path, method: str) -> None:
+        self.write_json(
+            path,
+            {
+                "profile_id": f"profile-{method}",
+                "method": method,
+                "mode": "estimated_to_truth_sim3",
+                "axis_contract": "internal_policy_vector=RDF(right,down,forward)",
+                "runtime_inputs": ["raw_right_m", "raw_down_m", "raw_forward_m", "raw_disparity_px"],
+                "forbidden_runtime_inputs": ["calibration_truth", "px4_rtk_truth"],
+                "scale": 1.0,
+                "rotation_matrix_rdf": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                "translation_rdf_m": [0.0, 0.0, 0.0],
+            },
+        )
+
+    def selector_package_pass_summary(self) -> dict[str, object]:
+        return {
+            "status": "PASS",
+            "selector_export_status": "PASS",
+            "frontier_status": "PASS",
+            "operator_launch_status": "PASS",
+            "profile_count": 2,
+            "deployment_label_count": 6,
+            "operator_launch_check_count": 6,
+            "operator_launch_pass_count": 6,
+            "runtime_truth_used": False,
+            "selector_json": "/tmp/runtime_label_selector_package/runtime_profile_label_selector.json",
+            "selection_contract": "explicit deployment/scenario label only; no runtime truth",
+        }
+
     def test_parse_scenario_list_selects_known_scenarios(self) -> None:
         module = load_sweep_module()
 
@@ -57,6 +92,62 @@ class RtkStereoRobustnessSweepTests(unittest.TestCase):
             args = module.parse_args()
 
         self.assertTrue(args.skip_near_tie_transfer)
+
+    def test_export_runtime_label_selector_package_runs_selector_and_frontier(self) -> None:
+        module = load_sweep_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            catalog_dir = output_dir / "scenario_profile_catalog"
+            self.write_runtime_profile(catalog_dir / "nominal_runtime_profile.json", "sim3_nominal")
+            self.write_runtime_profile(catalog_dir / "stress_runtime_profile.json", "sim3_stress")
+            rows = [
+                {
+                    "scenario": "nominal",
+                    "method": "sim3_nominal",
+                    "catalog_profile_path": "scenario_profile_catalog/nominal_runtime_profile.json",
+                    "axis_contract": module.RDF_AXIS_CONTRACT,
+                },
+                {
+                    "scenario": "stress",
+                    "method": "sim3_stress",
+                    "catalog_profile_path": "scenario_profile_catalog/stress_runtime_profile.json",
+                    "axis_contract": module.RDF_AXIS_CONTRACT,
+                },
+            ]
+            scenario_catalog_summary = {
+                "catalog_profile_count": 2,
+                "profile_exists_count": 2,
+                "cross_seed_pass_count": 2,
+                "pass_scenario_profile_catalog": True,
+                "rows": rows,
+            }
+            self.write_json(output_dir / "scenario_profile_catalog.json", scenario_catalog_summary)
+            self.write_json(
+                output_dir / "robustness_summary.json",
+                {
+                    "robustness_acceptance_pass": True,
+                    "runtime_truth_used": False,
+                    "rdf_axis_contract": module.RDF_AXIS_CONTRACT,
+                    "truth_rdf_transform_contract": module.TRUTH_RDF_TRANSFORM_CONTRACT,
+                },
+            )
+            (output_dir / "scenario_coordinate_contracts.csv").write_text(
+                "scenario,all_loaded_contracts_forbid_direct_axis_alias\nnominal,True\nstress,True\n",
+                encoding="utf-8",
+            )
+
+            summary = module.export_runtime_label_selector_package(
+                output_dir=output_dir,
+                scenario_catalog_summary=scenario_catalog_summary,
+                baseline_scenario="nominal",
+            )
+
+            self.assertEqual(summary["status"], "PASS")
+            self.assertEqual(summary["selector_export_status"], "PASS")
+            self.assertEqual(summary["frontier_status"], "PASS")
+            self.assertEqual(summary["profile_count"], 2)
+            self.assertFalse(summary["runtime_truth_used"])
+            self.assertTrue(Path(summary["selector_json"]).is_file())
 
     def test_custom_scenario_config_extends_scenario_registry(self) -> None:
         module = load_sweep_module()
@@ -272,6 +363,21 @@ class RtkStereoRobustnessSweepTests(unittest.TestCase):
                 "robust_score": 1.5,
             },
             {
+                "method": "strict_all_axis_clean",
+                "strict_pass_all_scenarios": True,
+                "performance_pass_all_scenarios": True,
+                "strict_pass_count": 2,
+                "performance_pass_count": 2,
+                "expected_scenario_count": 2,
+                "validation_range_rmse_mean_m": 1.3,
+                "validation_range_rmse_max_m": 1.4,
+                "target_abs_mean_error_mean_m": 0.7,
+                "target_abs_mean_error_max_m": 0.9,
+                "axis_rmse_regression_sum_mean_m": 0.0,
+                "model_complexity_mean": 4,
+                "robust_score": 1.6,
+            },
+            {
                 "method": "partial_low_rmse",
                 "strict_pass_all_scenarios": False,
                 "performance_pass_all_scenarios": False,
@@ -291,7 +397,49 @@ class RtkStereoRobustnessSweepTests(unittest.TestCase):
         recommendation = module.choose_robust_recommendation(rows)
 
         self.assertEqual(recommendation["recommendation_mode"], "strict_all_scenarios")
-        self.assertEqual(recommendation["method"], "strict_all")
+        self.assertEqual(recommendation["method"], "strict_all_axis_clean")
+        self.assertTrue(recommendation["rdf_axis_nonregression_pass"])
+
+    def test_choose_robust_recommendation_rejects_axis_regression_when_clean_candidate_exists(self) -> None:
+        module = load_sweep_module()
+        rows = [
+            {
+                "method": "strict_axis_regresses",
+                "strict_pass_all_scenarios": True,
+                "performance_pass_all_scenarios": True,
+                "strict_pass_count": 2,
+                "performance_pass_count": 2,
+                "expected_scenario_count": 2,
+                "validation_range_rmse_mean_m": 0.3,
+                "validation_range_rmse_max_m": 0.4,
+                "target_abs_mean_error_mean_m": 0.1,
+                "target_abs_mean_error_max_m": 0.2,
+                "axis_rmse_regression_sum_mean_m": 0.2,
+                "model_complexity_mean": 3,
+                "robust_score": 0.3,
+            },
+            {
+                "method": "partial_axis_clean",
+                "strict_pass_all_scenarios": False,
+                "performance_pass_all_scenarios": False,
+                "strict_pass_count": 1,
+                "performance_pass_count": 1,
+                "expected_scenario_count": 2,
+                "validation_range_rmse_mean_m": 0.8,
+                "validation_range_rmse_max_m": 0.9,
+                "target_abs_mean_error_mean_m": 0.4,
+                "target_abs_mean_error_max_m": 0.5,
+                "axis_rmse_regression_sum_mean_m": 0.0,
+                "model_complexity_mean": 4,
+                "robust_score": 0.8,
+            },
+        ]
+
+        recommendation = module.choose_robust_recommendation(rows)
+
+        self.assertEqual(recommendation["recommendation_mode"], "best_partial_axis_clean_robustness")
+        self.assertEqual(recommendation["method"], "partial_axis_clean")
+        self.assertTrue(recommendation["rdf_axis_nonregression_pass"])
 
     def test_choose_robust_recommendation_reports_empty_input(self) -> None:
         module = load_sweep_module()
@@ -299,6 +447,234 @@ class RtkStereoRobustnessSweepTests(unittest.TestCase):
         recommendation = module.choose_robust_recommendation([])
 
         self.assertEqual(recommendation["recommendation_mode"], "none")
+
+    def test_robustness_acceptance_matrix_records_deployment_evidence(self) -> None:
+        module = load_sweep_module()
+
+        matrix = module.build_robustness_acceptance_matrix(
+            scenario_count=2,
+            run_rows=[
+                {"scenario": "nominal", "pass_run": True},
+                {"scenario": "stress", "pass_run": True},
+            ],
+            recommendation_rows=[
+                {"scenario": "nominal", "method": "sim3"},
+                {"scenario": "stress", "method": "sim3"},
+            ],
+            robust_summary_rows=[
+                {
+                    "method": "sim3",
+                    "strict_pass_all_scenarios": True,
+                    "performance_pass_all_scenarios": True,
+                }
+            ],
+            robust_recommendation={
+                "method": "sim3",
+                "recommendation_mode": "strict_all_scenarios",
+                "strict_pass_count": 2,
+                "performance_pass_count": 2,
+                "axis_rmse_regression_sum_mean_m": 0.0,
+            },
+            policy_transfer_summary_rows=[
+                {"policy": "balanced", "pass_all_transfer_replays": True},
+            ],
+            scenario_catalog_summary={
+                "pass_scenario_profile_catalog": True,
+                "catalog_profile_count": 2,
+                "profile_exists_count": 2,
+                "cross_seed_pass_count": 2,
+            },
+            scenario_catalog_promotion_summary={
+                "pass_catalog_promotion_checks": True,
+                "catalog_promotion_check_count": 2,
+                "catalog_promotion_pass_count": 2,
+            },
+            catalog_transfer_source_summary_rows=[
+                {"source_scenario": "nominal", "pass_all_transfer_replays": True},
+            ],
+            deployment_strategy={
+                "deployment_strategy": "single_runtime_profile",
+                "single_profile_pass": True,
+                "scenario_catalog_ready": True,
+                "runtime_profile_contract": "runtime uses raw RDF/disparity only",
+            },
+            coordinate_contract_summary={
+                "scenario_count": 2,
+                "summary_loaded_scenario_count": 2,
+                "scenario_direct_axis_alias_forbidden_count": 2,
+                "loaded_contract_count": 4,
+                "direct_axis_alias_forbidden_count": 4,
+                "all_scenarios_forbid_direct_axis_alias": True,
+                "truth_rdf_transform_contract": module.TRUTH_RDF_TRANSFORM_CONTRACT,
+            },
+            runtime_label_selector_package=self.selector_package_pass_summary(),
+        )
+
+        self.assertEqual(sorted(matrix.keys()), sorted(module.ROBUSTNESS_ACCEPTANCE_ITEMS))
+        self.assertTrue(all(item["status"] == "PASS" for item in matrix.values()))
+        self.assertEqual(matrix["coordinate_contract"]["path"], "scenario_coordinate_contracts.csv")
+        self.assertEqual(
+            matrix["coordinate_contract"]["evidence"]["truth_rdf_transform_contract"],
+            module.TRUTH_RDF_TRANSFORM_CONTRACT,
+        )
+        self.assertEqual(matrix["robust_method_summary"]["evidence"]["strict_all_scenario_method_count"], 1)
+        self.assertTrue(matrix["robust_recommendation"]["evidence"]["rdf_axis_nonregression_pass"])
+        self.assertEqual(matrix["deployment_strategy"]["evidence"]["deployment_strategy"], "single_runtime_profile")
+        self.assertEqual(matrix["runtime_label_selector_package"]["status"], "PASS")
+        self.assertFalse(matrix["runtime_label_selector_package"]["evidence"]["runtime_truth_used"])
+
+    def test_robustness_acceptance_matrix_exposes_incomplete_strategy(self) -> None:
+        module = load_sweep_module()
+
+        matrix = module.build_robustness_acceptance_matrix(
+            scenario_count=2,
+            run_rows=[{"scenario": "nominal", "pass_run": True}],
+            recommendation_rows=[{"scenario": "nominal", "method": ""}],
+            robust_summary_rows=[],
+            robust_recommendation={"method": "", "recommendation_mode": "none"},
+            policy_transfer_summary_rows=[],
+            scenario_catalog_summary={"pass_scenario_profile_catalog": False},
+            scenario_catalog_promotion_summary={"pass_catalog_promotion_checks": False},
+            catalog_transfer_source_summary_rows=[],
+            deployment_strategy={
+                "deployment_strategy": "no_validated_runtime_strategy",
+                "single_profile_pass": False,
+                "scenario_catalog_ready": False,
+            },
+            coordinate_contract_summary={
+                "scenario_count": 2,
+                "summary_loaded_scenario_count": 1,
+                "scenario_direct_axis_alias_forbidden_count": 0,
+                "loaded_contract_count": 1,
+                "direct_axis_alias_forbidden_count": 0,
+                "all_scenarios_forbid_direct_axis_alias": False,
+                "truth_rdf_transform_contract": module.TRUTH_RDF_TRANSFORM_CONTRACT,
+            },
+            runtime_label_selector_package={
+                "status": "FAIL",
+                "selector_export_status": "PASS",
+                "frontier_status": "FAIL",
+            "profile_count": 0,
+            "deployment_label_count": 0,
+            "operator_launch_status": "FAIL",
+            "operator_launch_check_count": 1,
+            "operator_launch_pass_count": 0,
+            "runtime_truth_used": True,
+            "selector_json": "",
+        },
+        )
+
+        self.assertEqual(matrix["scenario_run_coverage"]["status"], "FAIL")
+        self.assertEqual(matrix["coordinate_contract"]["status"], "FAIL")
+        self.assertEqual(matrix["scenario_recommendations"]["status"], "FAIL")
+        self.assertEqual(matrix["robust_recommendation"]["status"], "FAIL")
+        self.assertEqual(matrix["deployment_strategy"]["status"], "FAIL")
+        self.assertEqual(matrix["runtime_label_selector_package"]["status"], "FAIL")
+
+    def test_robustness_acceptance_allows_catalog_when_single_policy_transfer_fails(self) -> None:
+        module = load_sweep_module()
+
+        matrix = module.build_robustness_acceptance_matrix(
+            scenario_count=2,
+            run_rows=[
+                {"scenario": "nominal", "pass_run": True},
+                {"scenario": "stress", "pass_run": True},
+            ],
+            recommendation_rows=[
+                {"scenario": "nominal", "method": "sim3"},
+                {"scenario": "stress", "method": "inverse_depth"},
+            ],
+            robust_summary_rows=[
+                {
+                    "method": "sim3",
+                    "strict_pass_all_scenarios": True,
+                    "performance_pass_all_scenarios": True,
+                }
+            ],
+            robust_recommendation={
+                "method": "sim3",
+                "recommendation_mode": "strict_all_scenarios",
+                "strict_pass_count": 2,
+                "performance_pass_count": 2,
+                "axis_rmse_regression_sum_mean_m": 0.0,
+            },
+            policy_transfer_summary_rows=[
+                {"policy": "balanced", "pass_all_transfer_replays": False},
+            ],
+            scenario_catalog_summary={
+                "pass_scenario_profile_catalog": True,
+                "catalog_profile_count": 2,
+                "profile_exists_count": 2,
+                "cross_seed_pass_count": 2,
+            },
+            scenario_catalog_promotion_summary={
+                "pass_catalog_promotion_checks": True,
+                "catalog_promotion_check_count": 2,
+                "catalog_promotion_pass_count": 2,
+            },
+            catalog_transfer_source_summary_rows=[],
+            deployment_strategy={
+                "deployment_strategy": "scenario_profile_catalog",
+                "single_profile_pass": False,
+                "scenario_catalog_ready": True,
+            },
+            coordinate_contract_summary={
+                "scenario_count": 2,
+                "summary_loaded_scenario_count": 2,
+                "scenario_direct_axis_alias_forbidden_count": 2,
+                "loaded_contract_count": 2,
+                "direct_axis_alias_forbidden_count": 2,
+                "all_scenarios_forbid_direct_axis_alias": True,
+                "truth_rdf_transform_contract": module.TRUTH_RDF_TRANSFORM_CONTRACT,
+            },
+            runtime_label_selector_package=self.selector_package_pass_summary(),
+        )
+
+        self.assertEqual(matrix["robust_policy_transfer"]["status"], "PASS")
+        self.assertTrue(matrix["robust_policy_transfer"]["evidence"]["scenario_catalog_ready"])
+        self.assertIn("scenario-specific catalog", matrix["robust_policy_transfer"]["evidence"]["interpretation"])
+
+    def test_robust_coordinate_contract_summary_requires_all_scenarios_to_forbid_direct_alias(self) -> None:
+        module = load_sweep_module()
+
+        pass_summary = module.robustness_coordinate_contract_summary(
+            [
+                {
+                    "summary_loaded": True,
+                    "loaded_contract_count": 2,
+                    "direct_axis_alias_forbidden_count": 2,
+                    "all_loaded_contracts_forbid_direct_axis_alias": True,
+                },
+                {
+                    "summary_loaded": True,
+                    "loaded_contract_count": 2,
+                    "direct_axis_alias_forbidden_count": 2,
+                    "all_loaded_contracts_forbid_direct_axis_alias": True,
+                },
+            ],
+            scenario_count=2,
+        )
+        fail_summary = module.robustness_coordinate_contract_summary(
+            [
+                {
+                    "summary_loaded": True,
+                    "loaded_contract_count": 2,
+                    "direct_axis_alias_forbidden_count": 2,
+                    "all_loaded_contracts_forbid_direct_axis_alias": True,
+                },
+                {
+                    "summary_loaded": True,
+                    "loaded_contract_count": 2,
+                    "direct_axis_alias_forbidden_count": 1,
+                    "all_loaded_contracts_forbid_direct_axis_alias": False,
+                },
+            ],
+            scenario_count=2,
+        )
+
+        self.assertTrue(pass_summary["all_scenarios_forbid_direct_axis_alias"])
+        self.assertFalse(fail_summary["all_scenarios_forbid_direct_axis_alias"])
+        self.assertEqual(pass_summary["truth_rdf_transform_contract"], module.TRUTH_RDF_TRANSFORM_CONTRACT)
 
     def test_robust_policy_recommendations_expose_tradeoff_policies(self) -> None:
         module = load_sweep_module()

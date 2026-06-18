@@ -52,8 +52,8 @@ Simulation/bags/
 ref/yolo_models/
 
 # Captured calibration/raw media. Keep derived JSON calibration files tracked.
-apps/StereoDistance/calibration_captures/left/
-apps/StereoDistance/calibration_captures/right/
+StereoDistance/calibration_captures/left/
+StereoDistance/calibration_captures/right/
 *.mp4
 *.avi
 *.mov

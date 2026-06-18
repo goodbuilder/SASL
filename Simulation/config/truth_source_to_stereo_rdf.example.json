@@ -1,0 +1,9 @@
+{
+  "source_frame": "px4_local_position_ned",
+  "source_axis_order": ["north", "east", "down"],
+  "source_fields": ["truth_north_m", "truth_east_m", "truth_down_ned_m"],
+  "origin_source_m": [0.0, 0.0, 0.0],
+  "rotation_euler_zyx_deg_source_to_stereo_rdf": [12.0, -3.0, 1.5],
+  "translation_rdf_m": [0.0, 0.0, 0.0],
+  "contract": "Example only. Replace with measured T_source_to_stereo_rdf before using real calibration evidence. Direct NED-to-RDF axis aliasing is forbidden."
+}

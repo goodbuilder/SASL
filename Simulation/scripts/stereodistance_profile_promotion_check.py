@@ -31,6 +31,7 @@ FORBIDDEN_RUNTIME_INPUTS = {
     "true_disparity",
     "true_image_feature_location",
 }
+FORBIDDEN_RUNTIME_INPUT_TOKENS = ("truth", "gt_", "px4", "rtk", "ned")
 
 
 def parse_args() -> argparse.Namespace:
@@ -104,6 +105,18 @@ def load_runtime_profile(payload: Mapping[str, object]):
     if mode == EstimatedToTruthAffineProfile.mode:
         return EstimatedToTruthAffineProfile.from_json_dict(payload)
     raise ValueError(f"unsupported runtime profile mode: {mode!r}")
+
+
+def axis_contract_declared(payload: Mapping[str, object]) -> bool:
+    return "RDF(right,down,forward)" in str(payload.get("axis_contract", ""))
+
+
+def runtime_inputs_truth_free(payload: Mapping[str, object]) -> bool:
+    runtime_inputs = payload.get("runtime_inputs", [])
+    if not isinstance(runtime_inputs, list):
+        return False
+    joined = " ".join(str(item).lower() for item in runtime_inputs)
+    return not any(token in joined for token in FORBIDDEN_RUNTIME_INPUT_TOKENS)
 
 
 def node_loader_check(path: Path) -> tuple[bool, str]:
@@ -233,8 +246,8 @@ def run_check(
     node_load_ok, node_loader_log = node_loader_check(profile_json)
     forbidden_runtime_inputs = set(str(item) for item in payload.get("forbidden_runtime_inputs", []))
     forbidden_declared = FORBIDDEN_RUNTIME_INPUTS.issubset(forbidden_runtime_inputs)
-    runtime_inputs = [str(item) for item in payload.get("runtime_inputs", [])]
-    runtime_truth_used = any(item in FORBIDDEN_RUNTIME_INPUTS for item in runtime_inputs)
+    axis_contract_ok = axis_contract_declared(payload)
+    runtime_truth_used = not runtime_inputs_truth_free(payload)
 
     applied_count = 0
     invalid_count = 0
@@ -250,6 +263,7 @@ def run_check(
     pass_check = bool(
         schema_load_ok
         and node_load_ok
+        and axis_contract_ok
         and forbidden_declared
         and not runtime_truth_used
         and sample_check_ok
@@ -263,6 +277,7 @@ def run_check(
         "schema_error": schema_error,
         "node_loader_ok": node_load_ok,
         "node_loader_log": node_loader_log,
+        "axis_contract_declared": axis_contract_ok,
         "runtime_truth_used": runtime_truth_used,
         "forbidden_runtime_inputs_declared": forbidden_declared,
         "sample_csv": str(sample_csv) if sample_csv else "",

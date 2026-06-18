@@ -163,6 +163,7 @@ class EstimatedToTruthSim3Profile:
         forward_residual_clamp_max_abs_m: float | None = None,
         forward_residual_disparity_lut: Mapping[str, object] | None = None,
         forward_residual_raw_forward_lut: Mapping[str, object] | None = None,
+        forward_residual_raw_forward_query: str = "raw_forward",
         forward_residual_agreement_gate: Mapping[str, object] | None = None,
         rdf_residual_disparity_coefficients: Mapping[str, Sequence[float]] | None = None,
         rdf_residual_disparity_lut: Mapping[str, Mapping[str, object]] | None = None,
@@ -206,6 +207,9 @@ class EstimatedToTruthSim3Profile:
             forward_residual_raw_forward_lut,
             x_key="x_values_m",
         )
+        if forward_residual_raw_forward_query not in {"raw_forward", "base_forward"}:
+            raise ValueError("forward_residual_raw_forward_query must be raw_forward or base_forward")
+        self.forward_residual_raw_forward_query = str(forward_residual_raw_forward_query)
         self.forward_residual_agreement_gate = self._parse_agreement_gate(forward_residual_agreement_gate)
         residual_by_axis = rdf_residual_disparity_coefficients or {}
         self.rdf_residual_disparity_coefficients = {
@@ -271,6 +275,9 @@ class EstimatedToTruthSim3Profile:
         raw_forward_lut = data.get("forward_residual_raw_forward_lut")
         if raw_forward_lut is not None and not isinstance(raw_forward_lut, Mapping):
             raise ValueError("forward residual raw-forward LUT must be an object")
+        raw_forward_query = str(data.get("forward_residual_raw_forward_query", "raw_forward") or "raw_forward")
+        if raw_forward_query not in {"raw_forward", "base_forward"}:
+            raise ValueError("forward_residual_raw_forward_query must be raw_forward or base_forward")
         agreement_gate = data.get("forward_residual_agreement_gate")
         if agreement_gate is not None and not isinstance(agreement_gate, Mapping):
             raise ValueError("forward residual agreement gate must be an object")
@@ -331,6 +338,7 @@ class EstimatedToTruthSim3Profile:
             ),
             forward_residual_disparity_lut=forward_lut,
             forward_residual_raw_forward_lut=raw_forward_lut,
+            forward_residual_raw_forward_query=raw_forward_query,
             forward_residual_agreement_gate=agreement_gate,
             rdf_residual_disparity_coefficients=rdf_residual,
             rdf_residual_disparity_lut=rdf_lut,
@@ -816,7 +824,11 @@ class EstimatedToTruthSim3Profile:
             )
             lut_residuals.append(lut_residual)
         if self.forward_residual_raw_forward_lut["x_values_px"]:
-            raw_forward = float(raw["forward_m"])
+            raw_forward = (
+                float(raw["forward_m"])
+                if self.forward_residual_raw_forward_query == "raw_forward"
+                else float(corrected_point[2])
+            )
             lut_residual = _interp_piecewise_linear(
                 raw_forward,
                 self.forward_residual_raw_forward_lut["x_values_px"],

@@ -14,4 +14,19 @@
       <statustip>Start and stop lite/full/debug recording presets.</statustip>
     </qtgui>
   </class>
+  <class name="stereo_ground_sim/OperatorPanel" type="stereo_ground_sim.operator_panel.OperatorPanel" base_class_type="rqt_gui_py::Plugin">
+    <description>
+      A fixed-layout operator panel with left/right camera images on the left and FRD plots on the right.
+    </description>
+    <qtgui>
+      <group>
+        <label>Simulation</label>
+        <icon type="theme">folder</icon>
+        <statustip>Simulation operator tools.</statustip>
+      </group>
+      <label>Operator Panel</label>
+      <icon type="theme">video-display</icon>
+      <statustip>Show stereo images and Forward/Right/Down trend plots in a fixed layout.</statustip>
+    </qtgui>
+  </class>
 </library>

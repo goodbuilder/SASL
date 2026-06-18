@@ -31,6 +31,10 @@ from stereo_ground_sim.runtime_guard_policy import (
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
+TRUTH_RDF_TRANSFORM_CONTRACT = (
+    "truth_rdf must already be stereo_center_RDF from a declared T_source_to_stereo_rdf; "
+    "direct NED-to-RDF axis alias is forbidden"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,16 +90,7 @@ def truth_rdf_from_row(row: Mapping[str, str]) -> np.ndarray | None:
     )
     if truth_rdf is not None:
         return truth_rdf
-    truth_ned = first_vector(
-        row,
-        (
-            ("truth_north_m", "truth_east_m", "truth_down_ned_m"),
-            ("north_m", "east_m", "down_m"),
-        ),
-    )
-    if truth_ned is None:
-        return None
-    return np.array([truth_ned[1], truth_ned[2], truth_ned[0]], dtype=float)
+    return None
 
 
 def raw_rdf_from_row(row: Mapping[str, str]) -> np.ndarray | None:
@@ -261,6 +256,8 @@ def replay_rows(
         "skipped_row_count": skipped,
         "split_filter": split_filter,
         "rdf_axis_contract": RDF_AXIS_CONTRACT,
+        "truth_rdf_transform_contract": TRUTH_RDF_TRANSFORM_CONTRACT,
+        "direct_ned_to_rdf_axis_alias_allowed": False,
         "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
         "validation_range_rmse_raw_m": rmse(raw_range_errors),
         "validation_range_rmse_corrected_m": rmse(corrected_range_errors),

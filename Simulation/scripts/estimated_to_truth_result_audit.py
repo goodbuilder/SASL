@@ -46,6 +46,17 @@ CSV_PREFLIGHT_ARTIFACTS = [
     "preflight/preflight_summary.txt",
 ]
 
+FORBIDDEN_DIRECT_ALIAS_TOKENS = (
+    "synthetic_bridge: rdf_right=east",
+    "rdf_right=east, rdf_down=down, rdf_forward=north",
+)
+FORBIDDEN_CONTEXT_TOKENS = (
+    "forbidden",
+    "not allowed",
+    "invalid",
+    "must not",
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -81,6 +92,49 @@ def all_true(status: Mapping[str, bool]) -> bool:
     return all(bool(value) for value in status.values())
 
 
+def collect_contract_text(metrics: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for key in (
+        "truth_rdf_transform_contract",
+        "ned_to_rdf_contract",
+        "truth_source_to_stereo_rdf_contract",
+    ):
+        value = metrics.get(key)
+        if value is not None:
+            parts.append(str(value))
+    contracts = metrics.get("contracts")
+    if isinstance(contracts, Mapping):
+        for value in contracts.values():
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+def direct_axis_alias_forbidden(metrics: Mapping[str, Any]) -> bool:
+    for key in (
+        "direct_ned_to_rdf_axis_alias_allowed",
+        "direct_source_axis_alias_allowed",
+        "direct_axis_alias_allowed",
+    ):
+        if bool(metrics.get(key, False)):
+            return False
+    contracts = metrics.get("contracts")
+    if isinstance(contracts, Mapping):
+        for key in (
+            "direct_ned_to_rdf_axis_alias_allowed",
+            "direct_source_axis_alias_allowed",
+            "direct_axis_alias_allowed",
+        ):
+            if bool(contracts.get(key, False)):
+                return False
+    text = collect_contract_text(metrics).lower()
+    if not text:
+        return False
+    for token in FORBIDDEN_DIRECT_ALIAS_TOKENS:
+        if token in text and not any(context in text for context in FORBIDDEN_CONTEXT_TOKENS):
+            return False
+    return True
+
+
 def check_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
     gate_result = metrics.get("gate_result") if isinstance(metrics.get("gate_result"), dict) else {}
     validation_range_raw = finite_float(metrics.get("validation_range_rmse_raw_m"))
@@ -111,6 +165,7 @@ def check_metrics(metrics: Mapping[str, Any]) -> dict[str, Any]:
         "runtime_truth_not_used": not bool(metrics.get("runtime_truth_used")),
         "coordinate_contracts_explicit": bool(metrics.get("coordinate_contracts_explicit")),
         "alias_contracts_explicit": bool(metrics.get("alias_contracts_explicit")),
+        "direct_axis_alias_forbidden": direct_axis_alias_forbidden(metrics),
         "runtime_profile_exportable": bool(metrics.get("runtime_profile_exportable")),
         "stereodistance_applicable": bool(metrics.get("stereodistance_applicable")),
         "promotion_check_passed": bool(promotion_check.get("pass_promotion_check")),

@@ -203,6 +203,38 @@ class RtkStereoPolicyMultiSeedValidationTests(unittest.TestCase):
         self.assertEqual(low, 1.25)
         self.assertEqual(high, 1.25)
 
+    def test_seed_contract_summary_rejects_direct_axis_alias(self) -> None:
+        module = load_multi_seed_module()
+        valid_payload = {
+            "contracts": {
+                "truth_rdf_transform_contract": "truth_rdf from explicit T_source_to_stereo_rdf",
+                "ned_to_stereo_rdf": (
+                    "explicit_transform: truth_rdf = R_ned_to_stereo_rdf * "
+                    "(truth_ned - origin_ned); direct axis alias "
+                    "rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+                ),
+                "direct_ned_to_rdf_axis_alias_allowed": False,
+            }
+        }
+        invalid_payload = {
+            "truth_rdf_transform_contract": (
+                "synthetic_bridge: rdf_right=east, rdf_down=down, rdf_forward=north"
+            )
+        }
+
+        self.assertTrue(module.direct_axis_alias_forbidden(valid_payload))
+        self.assertFalse(module.direct_axis_alias_forbidden(invalid_payload))
+
+        summary = module.seed_contract_summary(
+            [
+                {"run_config_loaded": True, "direct_axis_alias_forbidden": True},
+                {"run_config_loaded": True, "direct_axis_alias_forbidden": False},
+            ]
+        )
+
+        self.assertFalse(summary["all_loaded_contracts_forbid_direct_axis_alias"])
+        self.assertEqual(summary["direct_axis_alias_forbidden_count"], 1)
+
     def test_policy_stability_gate_separates_performance_from_method_stability(self) -> None:
         module = load_multi_seed_module()
         policy_rows = [
@@ -595,6 +627,90 @@ class RtkStereoPolicyMultiSeedValidationTests(unittest.TestCase):
         )
 
         self.assertEqual(recommendation["recommendation_mode"], "none")
+
+    def test_multi_seed_acceptance_matrix_records_required_evidence(self) -> None:
+        module = load_multi_seed_module()
+
+        matrix = module.build_multi_seed_acceptance_matrix(
+            seed_count=2,
+            completed_seed_count=2,
+            contract_summary={
+                "loaded_contract_count": 2,
+                "direct_axis_alias_forbidden_count": 2,
+                "all_loaded_contracts_forbid_direct_axis_alias": True,
+                "truth_rdf_transform_contract": module.TRUTH_RDF_TRANSFORM_CONTRACT,
+            },
+            method_rows=[
+                {"method": "raw"},
+                {"method": "sim3"},
+            ],
+            policy_gate_rows=[
+                {"policy": "balanced", "strict_pass": True, "performance_pass": True},
+            ],
+            method_gate_rows=[
+                {"method": "raw", "strict_pass": False, "performance_pass": False},
+                {"method": "sim3", "strict_pass": True, "performance_pass": True},
+            ],
+            recommendation={"method": "sim3", "recommendation_mode": "strict_pass", "score": 1.0},
+            recommended_profiles=[
+                {"profile_exists": True},
+                {"profile_exists": True},
+            ],
+            representative_checks={
+                "pass_representative_profile_checks": True,
+                "replay_pass": True,
+                "promotion_pass": True,
+                "validation_range_rmse_raw_m": 2.0,
+                "validation_range_rmse_corrected_m": 1.0,
+                "target_abs_mean_error_corrected_m": 0.5,
+            },
+            cross_seed_replay={
+                "pass_cross_seed_replay": True,
+                "seed_count": 2,
+                "passed_seed_count": 2,
+            },
+        )
+
+        self.assertEqual(sorted(matrix.keys()), sorted(module.MULTI_SEED_ACCEPTANCE_ITEMS))
+        self.assertTrue(all(item["status"] == "PASS" for item in matrix.values()))
+        self.assertEqual(matrix["coordinate_contract"]["status"], "PASS")
+        self.assertEqual(matrix["recommended_runtime_profiles"]["evidence"]["profile_exists_count"], 2)
+        self.assertEqual(matrix["representative_cross_seed_replay"]["evidence"]["passed_seed_count"], 2)
+
+    def test_multi_seed_acceptance_matrix_exposes_replay_failure(self) -> None:
+        module = load_multi_seed_module()
+
+        matrix = module.build_multi_seed_acceptance_matrix(
+            seed_count=2,
+            completed_seed_count=1,
+            contract_summary={
+                "loaded_contract_count": 1,
+                "direct_axis_alias_forbidden_count": 0,
+                "all_loaded_contracts_forbid_direct_axis_alias": False,
+                "truth_rdf_transform_contract": module.TRUTH_RDF_TRANSFORM_CONTRACT,
+            },
+            method_rows=[{"method": "raw"}],
+            policy_gate_rows=[],
+            method_gate_rows=[],
+            recommendation={"method": "", "recommendation_mode": "none"},
+            recommended_profiles=[],
+            representative_checks={
+                "pass_representative_profile_checks": False,
+                "replay_pass": False,
+                "promotion_pass": True,
+            },
+            cross_seed_replay={
+                "pass_cross_seed_replay": False,
+                "seed_count": 1,
+                "passed_seed_count": 0,
+            },
+        )
+
+        self.assertEqual(matrix["seed_run_coverage"]["status"], "FAIL")
+        self.assertEqual(matrix["coordinate_contract"]["status"], "FAIL")
+        self.assertEqual(matrix["multi_seed_recommendation"]["status"], "FAIL")
+        self.assertEqual(matrix["representative_profile_checks"]["status"], "FAIL")
+        self.assertEqual(matrix["representative_cross_seed_replay"]["status"], "FAIL")
 
     def test_method_family_diagnostics_groups_and_ranks_contract_families(self) -> None:
         module = load_multi_seed_module()

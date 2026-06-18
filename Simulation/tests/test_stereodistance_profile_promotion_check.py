@@ -36,6 +36,7 @@ class StereoDistanceProfilePromotionCheckTests(unittest.TestCase):
                     {
                         "mode": "estimated_to_truth_sim3",
                         "profile_id": "unit-promotion",
+                        "axis_contract": module.RDF_AXIS_CONTRACT,
                         "runtime_inputs": [
                             "raw_right_m",
                             "raw_down_m",
@@ -90,6 +91,7 @@ class StereoDistanceProfilePromotionCheckTests(unittest.TestCase):
                     {
                         "mode": "estimated_to_truth_disparity_poly",
                         "profile_id": "unit-disparity-promotion",
+                        "axis_contract": module.RDF_AXIS_CONTRACT,
                         "runtime_inputs": [
                             "raw_right_m",
                             "raw_down_m",
@@ -138,6 +140,7 @@ class StereoDistanceProfilePromotionCheckTests(unittest.TestCase):
                     {
                         "mode": "estimated_to_truth_affine_rdf",
                         "profile_id": "unit-affine-promotion",
+                        "axis_contract": module.RDF_AXIS_CONTRACT,
                         "runtime_inputs": [
                             "raw_right_m",
                             "raw_down_m",
@@ -190,6 +193,7 @@ class StereoDistanceProfilePromotionCheckTests(unittest.TestCase):
                     {
                         "mode": "estimated_to_truth_sim3",
                         "profile_id": "unit-left-geometry-promotion",
+                        "axis_contract": module.RDF_AXIS_CONTRACT,
                         "runtime_inputs": [
                             "raw_right_m",
                             "raw_down_m",
@@ -246,6 +250,46 @@ class StereoDistanceProfilePromotionCheckTests(unittest.TestCase):
         self.assertEqual(summary["sample_invalid_count"], 0)
         self.assertIn("left_u_px", sample_rows)
         self.assertIn("left_v_px", sample_rows)
+
+    def test_promotion_check_rejects_missing_axis_contract_and_truth_runtime_input(self) -> None:
+        module = load_check_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            profile_json = tmp / "bad_profile.json"
+            profile_json.write_text(
+                json.dumps(
+                    {
+                        "mode": "estimated_to_truth_sim3",
+                        "profile_id": "unit-bad-contract",
+                        "runtime_inputs": [
+                            "raw_right_m",
+                            "raw_down_m",
+                            "raw_forward_m",
+                            "px4_ned_truth_forward_m",
+                        ],
+                        "forbidden_runtime_inputs": [
+                            "calibration_truth",
+                            "px4_rtk_truth",
+                            "true_disparity",
+                            "true_image_feature_location",
+                        ],
+                        "scale": 1.0,
+                        "rotation_matrix_rdf": [
+                            [1.0, 0.0, 0.0],
+                            [0.0, 1.0, 0.0],
+                            [0.0, 0.0, 1.0],
+                        ],
+                        "translation_rdf_m": [0.0, 0.0, 0.0],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            summary = module.run_check(profile_json, tmp / "out")
+
+        self.assertFalse(summary["pass_promotion_check"])
+        self.assertFalse(summary["axis_contract_declared"])
+        self.assertTrue(summary["runtime_truth_used"])
 
 
 if __name__ == "__main__":
