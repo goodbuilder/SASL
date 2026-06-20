@@ -349,9 +349,14 @@ summary_path = sys.argv[1]
 tolerance_m = float(sys.argv[2])
 summary = json.load(open(summary_path, encoding="utf-8"))
 failures = []
+method = str(summary.get("profile_method", ""))
+if method == "origin-bbox-reprojection-grid-v1":
+    corrected_prefix = "origin_bbox_reprojection"
+else:
+    corrected_prefix = "origin_bbox"
 for axis in ("right", "down", "forward"):
     raw = summary.get(f"raw_{axis}_error_rmse_m")
-    corrected = summary.get(f"origin_bbox_{axis}_error_rmse_m")
+    corrected = summary.get(f"{corrected_prefix}_{axis}_error_rmse_m")
     if raw is None or corrected is None:
         failures.append(f"{axis}: missing RMSE")
         continue

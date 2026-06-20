@@ -133,9 +133,17 @@ def main() -> int:
         target_range_m=float(args.target_range_m),
         target_window_m=float(args.target_window_m),
     )
+    raw_metrics = pipe.evaluate_predictions(
+        validation_samples,
+        series.raw_validation_points,
+        target_range_m=float(args.target_range_m),
+        target_window_m=float(args.target_window_m),
+    )
     status = (
         "PASS"
-        if residual_metrics["range_rmse_m"] < observation_metrics["range_rmse_m"]
+        if residual_metrics["range_rmse_m"] < raw_metrics["range_rmse_m"]
+        and residual_metrics["position_rmse_m"] < raw_metrics["position_rmse_m"]
+        and residual_metrics["target_window_count"] > 0
         and residual_metrics["target_max_abs_error_m"] <= 10.0
         else "FAIL"
     )
@@ -149,14 +157,24 @@ def main() -> int:
         "scenario": str(args.scenario),
         "seed": int(args.seed),
         "validation_sample_count": len(validation_samples),
+        "range_rmse_raw_m": raw_metrics["range_rmse_m"],
         "range_rmse_observation_m": observation_metrics["range_rmse_m"],
         "range_rmse_residual_m": residual_metrics["range_rmse_m"],
+        "position_rmse_raw_m": raw_metrics["position_rmse_m"],
         "position_rmse_observation_m": observation_metrics["position_rmse_m"],
         "position_rmse_residual_m": residual_metrics["position_rmse_m"],
+        "target_max_abs_error_raw_m": raw_metrics["target_max_abs_error_m"],
         "target_max_abs_error_observation_m": observation_metrics["target_max_abs_error_m"],
         "target_max_abs_error_residual_m": residual_metrics["target_max_abs_error_m"],
+        "target_rmse_raw_m": raw_metrics["target_rmse_m"],
         "target_rmse_observation_m": observation_metrics["target_rmse_m"],
         "target_rmse_residual_m": residual_metrics["target_rmse_m"],
+        "residual_improves_raw_range": residual_metrics["range_rmse_m"] < raw_metrics["range_rmse_m"],
+        "residual_improves_raw_position": residual_metrics["position_rmse_m"] < raw_metrics["position_rmse_m"],
+        "residual_improves_observation_range": residual_metrics["range_rmse_m"]
+        < observation_metrics["range_rmse_m"],
+        "residual_improves_observation_position": residual_metrics["position_rmse_m"]
+        < observation_metrics["position_rmse_m"],
         "runtime_truth_used": False,
         "coordinate_contracts_explicit": True,
         "runtime_input_contract": payload.get("runtime_input_contract", ""),
@@ -175,8 +193,10 @@ def main() -> int:
                 f"status: {summary['status']}",
                 f"scenario: {summary['scenario']}",
                 f"seed: {summary['seed']}",
+                f"range_rmse_raw_m: {summary['range_rmse_raw_m']:.6f}",
                 f"range_rmse_observation_m: {summary['range_rmse_observation_m']:.6f}",
                 f"range_rmse_residual_m: {summary['range_rmse_residual_m']:.6f}",
+                f"target_max_abs_error_raw_m: {summary['target_max_abs_error_raw_m']:.6f}",
                 f"target_max_abs_error_observation_m: {summary['target_max_abs_error_observation_m']:.6f}",
                 f"target_max_abs_error_residual_m: {summary['target_max_abs_error_residual_m']:.6f}",
                 "runtime_truth_used: False",

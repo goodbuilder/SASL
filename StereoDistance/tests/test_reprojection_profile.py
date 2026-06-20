@@ -164,6 +164,7 @@ def test_profile_build_defaults_to_conservative_component_gain_policy() -> None:
     result = profile.apply(650.0, 360.0, 620.0, 360.0, raw_disparity_px=30.0)
 
     assert profile.correction_mode == "component_gains"
+    assert profile.output_policy == "range_only_forward_fusion"
     assert result.corrected_left_u == 650.25
     assert result.corrected_right_u == 619.75
     assert result.corrected_left_v == 360.1

@@ -30,6 +30,7 @@ def _find_stereo_distance_app() -> Path:
 
 
 APP_DIR = _find_stereo_distance_app()
+sys.path.insert(0, str(PROJECT_DIR))
 sys.path.insert(0, str(SCRIPT_DIR))
 sys.path.insert(0, str(APP_DIR))
 

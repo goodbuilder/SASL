@@ -4,6 +4,7 @@ from pathlib import Path
 
 from wiris_stereo_distance.simulation_origin import (
     OriginBboxProfile,
+    aggregate_summary_files,
     build_origin_bbox_reprojection_profile_from_telemetry,
     build_origin_bbox_profile_from_telemetry,
     build_profile_from_telemetry,
@@ -477,6 +478,37 @@ def test_origin_bbox_reprojection_range_only_policy_preserves_raw_lateral(tmp_pa
     assert evaluated[0]["origin_bbox_reprojection_corrected_down_m"] == "2.000000"
     assert evaluated[0]["origin_bbox_reprojection_corrected_forward_m"] != "30.000000"
     assert summary["profile_output_policy"] == "range_only_forward_fusion"
+    assert summary["origin_bbox_reprojection_right_error_rmse_m"] == summary["raw_right_error_rmse_m"]
+    assert summary["origin_bbox_reprojection_down_error_rmse_m"] == summary["raw_down_error_rmse_m"]
+    assert summary["origin_bbox_reprojection_forward_error_rmse_m"] < summary["raw_forward_error_rmse_m"]
+    assert summary["origin_bbox_reprojection_position_improvement_ratio"] > 0.0
+
+
+def test_aggregate_summary_files_includes_reprojection_metrics(tmp_path: Path) -> None:
+    paths = []
+    for index, forward_rmse in enumerate((20.0, 18.0), start=1):
+        path = tmp_path / f"summary_{index}.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "raw_forward_error_rmse_m": 30.0,
+                    "origin_bbox_reprojection_forward_error_rmse_m": forward_rmse,
+                    "origin_bbox_reprojection_forward_improvement_ratio": (30.0 - forward_rmse) / 30.0,
+                    "raw_position_error_rmse_m": 31.0,
+                    "origin_bbox_reprojection_position_error_rmse_m": forward_rmse + 1.0,
+                    "origin_bbox_reprojection_position_improvement_ratio": (31.0 - forward_rmse - 1.0)
+                    / 31.0,
+                }
+            ),
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    summary = aggregate_summary_files(paths)
+
+    assert summary["origin_bbox_reprojection_forward_error_rmse_mean_m"] == 19.0
+    assert summary["origin_bbox_reprojection_forward_error_rmse_max_m"] == 20.0
+    assert summary["origin_bbox_reprojection_forward_improvement_ratio_min"] > 0.3
 
 
 def test_simulation_comparison_rows_accepts_legacy_xyz_aliases() -> None:

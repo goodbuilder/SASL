@@ -1,5 +1,32 @@
 # 업데이트 기록
 
+## v1.6.5 — 2026-06-21 — Simulation 최종 PASS 보정법 기본 경로 정렬
+
+- 변경:
+  - Origin-BBOX Reprojection Profile의 기본 `output_policy`를 `range_only_forward_fusion`으로 바꿔 raw `Right/Down`을 보존하고 reprojection 보정의 `Forward`만 최종 출력에 쓰게 했다.
+  - Simulation profile 생성 CLI에 `--reprojection-output-policy`를 추가하고, `origin-bbox-reprojection` 생성 기본값을 `range_only_forward_fusion`으로 연결했다.
+  - 반복 평가 fail-fast와 aggregate summary가 `origin_bbox_reprojection_*` RMSE/개선율 키를 인식하게 했다.
+  - `Simulation/scripts/reprojection_profile_random_validation.py`가 repo root의 `sasl_common`을 찾도록 `sys.path`를 보강했다.
+- 방법 계약:
+  - 방법명: `origin-bbox-reprojection-grid-v1` + `component_gains` + `range_only_forward_fusion`.
+  - 목적: bbox center pixel residual로 stereo Forward/Range를 안정화하되 lateral 축은 raw 값을 보존해 Right/Down regression을 막는다.
+  - 입력 가정: Simulation/StreoDistance 비교 row는 `stereo_center_frd:forward_right_down`, bbox center는 좌/우 이미지 pixel, profile lookup은 평균 screen `u/v`와 `raw_disparity_px` exact cell이다.
+  - 출력 계약: corrected bbox center와 재삼각측량 결과를 기록하되 최종 corrected `Right/Down`은 raw, `Forward`는 reprojection-corrected 값을 쓴다.
+  - PASS 기준: 보정용 trajectory와 분리된 5개 validation trajectory 모두에서 `Right/Down/Forward` RMSE가 raw보다 증가하지 않아야 하며, Position/Range 개선은 권장 지표로 별도 보고한다.
+- 확인:
+  - 저장 report 스캔: `Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625/result.txt` → `final_pass=yes`.
+  - 해당 report의 `validation_gate_summary.csv`는 trial 2..6 모두 `pass=yes`; RMSE 개선 최소값은 Right `+0.000065 m`, Down `+0.002199 m`, Forward `+3.436333 m`.
+  - 추가 후보 스캔: `EXP-20260618-281-fresh-stereodistance-disparity-residual-search`는 `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_log_disparity_deg1_ridge1_clip0p5`로 4/4 stress scenario STRICT_PASS를 기록했다.
+  - EXP281 runtime export 후속 확인: scenario별 best residual profile 4개를 export하고 seed `281000..281004`를 다시 검사해 20/20 PASS를 확인했다. 평균 range RMSE는 raw `2.951825 m`, observation `1.417889 m`, residual `0.360935 m`; worst target max abs error는 residual `2.435533 m`였다. Label selector catalog와 `disparity_noise_stress` operator launch smoke도 PASS했다. 산출물은 ignored report 경로 `Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/`에 있으며, 큰 CSV/log는 커밋 대상이 아니다.
+  - `QT_QPA_PLATFORM=offscreen python3 -m pytest -q StereoDistance/tests/test_reprojection_profile.py StereoDistance/tests/test_simulation_origin.py StereoDistance/tests/test_stereo.py::test_range_only_reprojection_output_policy_preserves_raw_lateral -p no:cacheprovider` → 21 passed
+  - `QT_QPA_PLATFORM=offscreen python3 -m pytest -q Simulation/tests/test_runtime_disparity_residual_profile.py Simulation/tests/test_disparity_residual_profile_catalog.py Simulation/tests/test_check_stereodistance_operator_view_launch.py -p no:cacheprovider` → 14 passed
+  - `bash -n StereoDistance/scripts/simulation_origin_profile_generate.sh StereoDistance/scripts/simulation_origin_evaluate.sh`
+  - `PYTHONPYCACHEPREFIX=/tmp/stereodistance_pycache python3 -m py_compile StereoDistance/scripts/simulation_origin_tools.py StereoDistance/wiris_stereo_distance/simulation_origin.py StereoDistance/wiris_stereo_distance/reprojection_profile.py`
+  - `python3 Simulation/scripts/reprojection_profile_random_validation.py --trajectory-diagnostics-only --profile-output-policy range_only_forward_fusion --output-dir /tmp/sasl_reprojection_diag_check` → trajectory diagnostics generated.
+- 남은 위험:
+  - `range_only_forward_fusion`은 lateral 축 개선을 주장하지 않는 보수 적용이다. strict all-axis improvement 후보는 별도 실험 registry의 guarded 정책을 계속 검토해야 한다.
+  - EXP281 runtime export는 explicit deployment/scenario label selector가 필요하다. 자동 label/feature selector 없이 모든 상황에 하나의 residual profile을 적용하면 안 된다.
+
 ## v1.6.4 — 2026-06-21 — Pixhawk 2 DDS export 펌웨어 적용 및 RM3100 ID 확장
 
 - 변경:

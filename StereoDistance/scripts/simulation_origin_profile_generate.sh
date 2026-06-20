@@ -26,6 +26,7 @@ MIN_SAMPLES="${ORIGIN_PROFILE_MIN_SAMPLES:-30}"
 PROFILE_ID="${ORIGIN_PROFILE_ID:-}"
 SPAWN_FRONT_M="${ORIGIN_PROFILE_SPAWN_FRONT_M:-}"
 PROFILE_KIND="${ORIGIN_PROFILE_KIND:-origin-bbox}"
+REPROJECTION_OUTPUT_POLICY="${ORIGIN_PROFILE_REPROJECTION_OUTPUT_POLICY:-range_only_forward_fusion}"
 MIN_CELL_SAMPLES="${ORIGIN_PROFILE_MIN_CELL_SAMPLES:-50}"
 RESIDUAL_GAIN="${ORIGIN_PROFILE_RESIDUAL_GAIN:-0.2}"
 MIN_CORRECTION_NORM_M="${ORIGIN_PROFILE_MIN_CORRECTION_NORM_M:-0.25}"
@@ -56,7 +57,10 @@ Options:
                          Use validation telemetry for per-cell/per-axis gain selection.
   --profile-id ID
   --min-samples N
-  --profile-kind KIND    alignment or origin-bbox. Default: origin-bbox
+  --profile-kind KIND    alignment, origin-bbox, or origin-bbox-reprojection. Default: origin-bbox
+  --reprojection-output-policy POLICY
+                         For origin-bbox-reprojection: triangulated or
+                         range_only_forward_fusion. Default: range_only_forward_fusion
   --min-cell-samples N   Minimum samples per Origin-BBOX residual cell. Default: 50
   --residual-gain N      Scale applied to Origin-BBOX residuals. Default: 0.2
   --min-correction-norm-m N
@@ -86,6 +90,7 @@ while (($#)); do
     --profile-id) PROFILE_ID="${2:?missing value for --profile-id}"; shift 2 ;;
     --min-samples) MIN_SAMPLES="${2:?missing value for --min-samples}"; shift 2 ;;
     --profile-kind) PROFILE_KIND="${2:?missing value for --profile-kind}"; shift 2 ;;
+    --reprojection-output-policy) REPROJECTION_OUTPUT_POLICY="${2:?missing value for --reprojection-output-policy}"; shift 2 ;;
     --min-cell-samples) MIN_CELL_SAMPLES="${2:?missing value for --min-cell-samples}"; shift 2 ;;
     --residual-gain) RESIDUAL_GAIN="${2:?missing value for --residual-gain}"; shift 2 ;;
     --min-correction-norm-m) MIN_CORRECTION_NORM_M="${2:?missing value for --min-correction-norm-m}"; shift 2 ;;
@@ -148,6 +153,7 @@ done
   --summary-json "$SUMMARY_JSON" \
   --min-samples "$MIN_SAMPLES" \
   --profile-kind "$PROFILE_KIND" \
+  --reprojection-output-policy "$REPROJECTION_OUTPUT_POLICY" \
   --min-cell-samples "$MIN_CELL_SAMPLES" \
   --residual-gain "$RESIDUAL_GAIN" \
   --min-correction-norm-m "$MIN_CORRECTION_NORM_M" \

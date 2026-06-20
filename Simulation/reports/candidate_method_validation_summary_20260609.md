@@ -5,6 +5,34 @@ session can resume without re-running already rejected branches.
 
 ## Pause / Resume Snapshot
 
+- 2026-06-21 scan update: current `final_pass=yes` Simulation-origin candidate
+  for the StereoDistance app path is
+  `origin-bbox-reprojection-grid-v1 + component_gains` with
+  `disparity_gain=0.125`, `screen_u_gain=0.0`, `screen_v_gain=0.025`, and
+  conservative `range_only_forward_fusion` output. Evidence:
+  `reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625/result.txt`
+  has `final_pass=yes`; `validation_gate_summary.csv` has trials 2..6 all
+  `pass=yes` with minimum RMSE improvements Right `+0.000065 m`, Down
+  `+0.002199 m`, Forward `+3.436333 m`. Purpose: stabilize Forward/Range from
+  bbox reprojection residuals while preserving raw Right/Down unless a
+  separately validated all-axis policy is loaded. Input/output contract remains
+  Simulation/StereoDistance FRD comparison,
+  `stereo_center_frd:forward_right_down`; bbox labels are image pixel residuals
+  `duL/dvL/duR/dvR`.
+- 2026-06-21 continuation: EXP281 was advanced from search evidence to
+  runtime-export smoke evidence. Four scenario-labeled
+  `DisparityResidualRuntimeProfile` JSONs were exported from the scenario-best
+  ray-scale residual settings and checked on seeds `281000..281004` for
+  `bbox_outlier_stress`, `combined_sensor_stress`, `disparity_noise_stress`,
+  and `intrinsic_scale_stress`. Result: `20/20` PASS under the EXP281 runtime
+  residual gate: residual range and position RMSE must improve over raw, target
+  window must exist, and residual target max abs error must be `<=10 m`. Mean
+  range RMSE was raw `2.951825 m`, observation `1.417889 m`, residual
+  `0.360935 m`; residual worst target max abs error was `2.435533 m`. The
+  label selector catalog and `disparity_noise_stress` operator launch smoke
+  also passed. Runtime contract: residual apply consumes measured/fused
+  disparity plus corrected stereo-center RDF only; scenario selection uses
+  explicit deployment/scenario labels and no PX4/RTK/NED truth.
 - Paused by user after offline aggregate and guard-sweep validation. Do not
   treat any later partial ROS2/Gazebo output as validation evidence.
 - After resuming offline-only work, `bbox_anchor_cell_guard_cross_validation.py`

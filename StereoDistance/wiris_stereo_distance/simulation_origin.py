@@ -1219,8 +1219,14 @@ def evaluate_origin_bbox_reprojection_profile_rows(
     corrected_position_rmse = summary.get("origin_bbox_reprojection_position_error_rmse_m")
     if isinstance(raw_range_rmse, float) and isinstance(corrected_range_rmse, float):
         summary["origin_bbox_reprojection_range_rmse_delta_m"] = corrected_range_rmse - raw_range_rmse
+        summary["origin_bbox_reprojection_range_improvement_ratio"] = (
+            (raw_range_rmse - corrected_range_rmse) / raw_range_rmse if raw_range_rmse else 0.0
+        )
     if isinstance(raw_position_rmse, float) and isinstance(corrected_position_rmse, float):
         summary["origin_bbox_reprojection_position_rmse_delta_m"] = corrected_position_rmse - raw_position_rmse
+        summary["origin_bbox_reprojection_position_improvement_ratio"] = (
+            (raw_position_rmse - corrected_position_rmse) / raw_position_rmse if raw_position_rmse else 0.0
+        )
     for fallback_reason, count in sorted(fallback_counts.items()):
         summary[f"origin_bbox_reprojection_fallback_{fallback_reason}_count"] = float(count)
     return evaluated, summary
@@ -1684,6 +1690,11 @@ def aggregate_summary_files(paths: Sequence[Path]) -> dict[str, object]:
         "origin_bbox_right_error_rmse_m",
         "origin_bbox_down_error_rmse_m",
         "origin_bbox_forward_error_rmse_m",
+        "origin_bbox_reprojection_range_error_rmse_m",
+        "origin_bbox_reprojection_position_error_rmse_m",
+        "origin_bbox_reprojection_right_error_rmse_m",
+        "origin_bbox_reprojection_down_error_rmse_m",
+        "origin_bbox_reprojection_forward_error_rmse_m",
     ):
         values = [float(row[key]) for row in rows if row.get(key) is not None]
         prefix = key[:-2]
@@ -1695,6 +1706,11 @@ def aggregate_summary_files(paths: Sequence[Path]) -> dict[str, object]:
         "origin_bbox_right_improvement_ratio",
         "origin_bbox_down_improvement_ratio",
         "origin_bbox_forward_improvement_ratio",
+        "origin_bbox_reprojection_range_improvement_ratio",
+        "origin_bbox_reprojection_position_improvement_ratio",
+        "origin_bbox_reprojection_right_improvement_ratio",
+        "origin_bbox_reprojection_down_improvement_ratio",
+        "origin_bbox_reprojection_forward_improvement_ratio",
     ):
         values = [float(row[key]) for row in rows if row.get(key) is not None]
         summary[f"{key}_mean"] = statistics.fmean(values) if values else None

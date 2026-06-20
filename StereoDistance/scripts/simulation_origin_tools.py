@@ -20,6 +20,7 @@ for parent in Path(__file__).resolve().parents:
 from wiris_stereo_distance.reprojection_profile import (  # noqa: E402
     DEFAULT_REPROJECTION_CORRECTION_MODE,
     DEFAULT_REPROJECTION_DISPARITY_GAIN,
+    DEFAULT_REPROJECTION_OUTPUT_POLICY,
     DEFAULT_REPROJECTION_SCREEN_U_GAIN,
     DEFAULT_REPROJECTION_SCREEN_V_GAIN,
 )
@@ -136,6 +137,15 @@ def _build_parser() -> argparse.ArgumentParser:
     profile_parser.add_argument("--reprojection-disparity-gain", type=float, default=DEFAULT_REPROJECTION_DISPARITY_GAIN)
     profile_parser.add_argument("--reprojection-screen-u-gain", type=float, default=DEFAULT_REPROJECTION_SCREEN_U_GAIN)
     profile_parser.add_argument("--reprojection-screen-v-gain", type=float, default=DEFAULT_REPROJECTION_SCREEN_V_GAIN)
+    profile_parser.add_argument(
+        "--reprojection-output-policy",
+        choices=("triangulated", "range_only_forward_fusion"),
+        default=DEFAULT_REPROJECTION_OUTPUT_POLICY,
+        help=(
+            "Corrected output policy. range_only_forward_fusion preserves raw Right/Down and applies only "
+            "the reprojection-derived Forward value."
+        ),
+    )
     profile_parser.add_argument("--image-width-px", type=float, default=1280.0)
     profile_parser.add_argument("--image-height-px", type=float, default=720.0)
     profile_parser.add_argument("--focal-length-px", type=float)
@@ -296,6 +306,7 @@ def main() -> int:
                 disparity_gain=args.reprojection_disparity_gain,
                 screen_u_gain=args.reprojection_screen_u_gain,
                 screen_v_gain=args.reprojection_screen_v_gain,
+                output_policy=args.reprojection_output_policy,
             )
             evaluated, summary = evaluate_origin_bbox_reprojection_profile_rows(
                 rows,
