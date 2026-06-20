@@ -337,6 +337,15 @@ promoted as final Simulation PASS correction methods:
   inverse-depth prefilter reports are not final PASS candidates. Their
   `best_method.status` is `FAIL` and their target-window max errors exceed the
   10 m gate.
+- Runtime alpha-beta motion fusion over the EXP198 base runtime profile is not
+  a promising PASS branch. A fresh bbox-outlier smoke
+  (`run_runtime_motion_fusion_sweep.py`, seeds `286000..286002`, RDF axes,
+  alpha `0.15/0.3/0.5`, beta `0.02/0.05`, innovation clips `0.5/1.0 m`) found
+  best method `causal_alpha_beta_rdf_innovation_clip_a0p5_b0p05_g1` with
+  status `FAIL`, pass count `0/3`, range RMSE worsening from about `2.53 m` raw
+  to `82.86 m` fused, and position RMSE worsening from about `4.99 m` raw to
+  `92.54 m` fused. Runtime truth remained `false`, and the RDF/FRD contracts
+  were explicit; the failure is performance, not a coordinate-contract gap.
 - Registry slug `small_drone_multiburst_median_b1x3_sim3` is already covered
   by promoted candidate
   `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`;
