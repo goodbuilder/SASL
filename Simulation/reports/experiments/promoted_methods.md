@@ -337,6 +337,18 @@ promoted as final Simulation PASS correction methods:
   inverse-depth prefilter reports are not final PASS candidates. Their
   `best_method.status` is `FAIL` and their target-window max errors exceed the
   10 m gate.
+- Fresh prefilter rechecks keep inverse-depth filtering as a near-pass lead,
+  not a promoted method. Image-space prefiltering on bbox-outlier stress
+  (seeds `286200..286204`) stayed `FAIL` with pass count `0/5` and corrected
+  range/position RMSE exploding above `960 m`. Inverse-depth prefiltering found
+  a small 5/5 `STRICT_PASS` smoke for
+  `causal_inverse_depth_prefilter_a1_b0_uv20_id0p001`, but the same branch on a
+  50-seed fresh block failed `46/50` with target max abs `12.26 m`. A narrower
+  50-seed alpha/clip grid improved to
+  `causal_inverse_depth_prefilter_a0p85_b0_uv20_id0p0005`, `49/50`, target max
+  abs `10.43 m`; seed `286418` remains outside the 10 m gate. Runtime truth was
+  `false` and image/RDF/FRD contracts were explicit, so this is a performance
+  tail failure rather than a coordinate-contract failure.
 - Runtime alpha-beta motion fusion over the EXP198 base runtime profile is not
   a promising PASS branch. A fresh bbox-outlier smoke
   (`run_runtime_motion_fusion_sweep.py`, seeds `286000..286002`, RDF axes,
