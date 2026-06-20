@@ -33,6 +33,25 @@ session can resume without re-running already rejected branches.
   also passed. Runtime contract: residual apply consumes measured/fused
   disparity plus corrected stereo-center RDF only; scenario selection uses
   explicit deployment/scenario labels and no PX4/RTK/NED truth.
+- 2026-06-21 non-alias follow-up: registry rows for
+  `EXP-20260618-281-non-alias-robustness-catalog-selector` and
+  `EXP-20260618-282-non-alias-auto-selector-smoke` point to
+  `Simulation/results/...` directories that are not present in this checkout, so
+  they are not used as standalone proof. A current-checkout reproduction smoke
+  was run instead:
+  `python3 Simulation/scripts/run_rtk_stereo_robustness_sweep.py --output-dir /tmp/sasl_non_alias_auto_selector_smoke --scenarios nominal,combined_sensor_stress --seeds 282000 --sample-count 80 --synthetic-target-oversample-count 12 --pooled-candidate-scan-limit 2 --skip-near-tie-transfer`.
+  Result: final robustness acceptance PASS on 2/2 non-alias scenarios, direct
+  NED-to-RDF alias forbidden 2/2, robust recommendation
+  `sim3_local_linear_residual_disparity_sigma080_support5`, validation RMSE mean
+  `0.877502 m`, target max `1.471397 m`, scenario catalog profiles 2/2,
+  selector package PASS, deployment frontier PASS, operator launch 7/7 PASS,
+  runtime truth unused. Coordinate contract: PX4/local truth remains
+  calibration/evaluation-only and must be converted through explicit
+  `T_source_to_stereo_rdf`; runtime correction consumes stereo-center RDF
+  `right/down/forward` plus disparity; public StereoDistance output remains
+  FRD+range `forward/right/down/range`. Scope note: this is a small
+  current-checkout smoke, not a replacement for the missing full six-scenario
+  artifact.
 - Paused by user after offline aggregate and guard-sweep validation. Do not
   treat any later partial ROS2/Gazebo output as validation evidence.
 - After resuming offline-only work, `bbox_anchor_cell_guard_cross_validation.py`
