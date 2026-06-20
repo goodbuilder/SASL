@@ -89,6 +89,59 @@ def test_evaluate_origin_reprojection_report_rejects_axis_regression() -> None:
     assert "origin_reprojection:down_improvement" in evaluation["failures"]
 
 
+def test_evaluate_bbox_anchor_fullscreen_report_accepts_final_pass() -> None:
+    module = load_module()
+    result = {
+        "result_text": "final_pass=yes\n",
+        "profile": {
+            "method": "bbox_internal_origin_anchor_profile_v1",
+            "application_contract": "runtime uses bbox x1/y1/width/height only",
+        },
+        "rows": [
+            {
+                "sample_count": "10",
+                "pass": "yes",
+                "right_rmse_improvement_m": "0.1",
+                "down_rmse_improvement_m": "0.01",
+                "forward_rmse_improvement_m": "1.0",
+                "position_rmse_improvement_m": "1.0",
+            }
+            for _ in range(5)
+        ],
+    }
+
+    evaluation = module.evaluate_bbox_anchor_fullscreen_report(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["pass_count"] == 5
+
+
+def test_evaluate_origin_bbox_output_report_accepts_final_pass() -> None:
+    module = load_module()
+    result = {
+        "result_text": "final_pass=yes\n",
+        "metadata": {
+            "axis_contract": "stereo_center_frd:forward_right_down",
+            "pass_rule": "for every trial, RDF axis corrected MAE must be strictly lower",
+        },
+        "rows": [
+            {
+                "samples": "10",
+                "pass": "yes",
+                "right_improvement_m": "0.1",
+                "down_improvement_m": "0.01",
+                "forward_improvement_m": "1.0",
+            }
+            for _ in range(3)
+        ],
+    }
+
+    evaluation = module.evaluate_origin_bbox_output_report(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["pass_count"] == 3
+
+
 def test_evaluate_small_drone_report_accepts_strict_all_axis_pass() -> None:
     module = load_module()
     result = {
@@ -367,10 +420,12 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 20
+    assert len(default_candidates) == 22
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
+        "bbox_anchor_global_fullscreen_right_att_0p1",
+        "origin_bbox_output_validation_8trials_slow",
         "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
         "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
         "repeated_observation_median_n3_trim0p2",

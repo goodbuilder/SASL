@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=20`, `pass_count=20`,
+Expected result: `status=PASS`, `candidate_count=22`, `pass_count=22`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=21`, `pass_count=21`; the
+Expected result: `status=PASS`, `candidate_count=23`, `pass_count=23`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -48,6 +48,36 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `3.436333 m`.
   - Promotion status: simulation-origin candidate only; not hardware/WIRIS
     validated.
+
+- `bbox_anchor_global_fullscreen_right_att_0p1`
+  - Status: `PASS`
+  - Report: `Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625`
+  - Meaning: saved Simulation bbox-anchor PASS candidate. Runtime uses bbox
+    `x1/y1/width/height` only, then stereo ray triangulation with right
+    extrinsic rotation.
+  - Evidence: `result.txt` has `final_pass=yes`; `validation_gate_summary.csv`
+    has 5/5 validation trials `pass=yes`, 1654 validation samples, and positive
+    minimum RMSE improvement on Right, Down, Forward, and Position. Current
+    checker result: min Right `0.235088 m`, min Down `0.000256 m`, min Forward
+    `34.786204 m`.
+  - Promotion status: simulation saved-report candidate only; not
+    hardware/WIRIS validated.
+
+- `origin_bbox_output_validation_8trials_slow`
+  - Status: `PASS`
+  - Report:
+    `Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616`
+  - Meaning: legacy origin-bbox output PASS report under
+    `stereo_center_frd:forward_right_down`; checker requires corrected MAE to be
+    strictly lower for Right, Down, and Forward in committed summary rows.
+  - Evidence: `result.txt` has `final_pass=yes`; `summary.csv` has 3/3
+    validation trials `pass=yes`, 1127 validation samples, and positive minimum
+    MAE improvement on Right, Down, and Forward.
+  - Portability note: metadata contains historical machine-local source paths;
+    current reproducibility evidence is limited to the committed result and
+    summary artifacts.
+  - Promotion status: legacy simulation saved-report candidate only; not
+    hardware/WIRIS validated.
 
 - `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`
   - Status: `STRICT_PASS`

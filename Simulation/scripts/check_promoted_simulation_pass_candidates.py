@@ -22,6 +22,12 @@ DEFAULT_ORIGIN_REPROJECTION_REPORT = (
     / "reports"
     / "origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625"
 )
+DEFAULT_BBOX_ANCHOR_FULLSCREEN_REPORT = (
+    ROOT_DIR / "reports" / "bbox_anchor_global_fullscreen_right_att_0p1_seed20260625"
+)
+DEFAULT_ORIGIN_BBOX_OUTPUT_REPORT = (
+    ROOT_DIR / "reports" / "origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616"
+)
 DEFAULT_SMALL_DRONE_REPORT = (
     ROOT_DIR / "reports" / "experiments" / "EXP-20260617-213-small-drone-observation-fusion"
 )
@@ -154,6 +160,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disparity-residual-profile-json", type=Path, default=DEFAULT_RESIDUAL_PROFILE)
     parser.add_argument("--promoted-manifest-json", type=Path, default=DEFAULT_PROMOTED_MANIFEST)
     parser.add_argument("--origin-reprojection-report-dir", type=Path, default=DEFAULT_ORIGIN_REPROJECTION_REPORT)
+    parser.add_argument("--bbox-anchor-fullscreen-report-dir", type=Path, default=DEFAULT_BBOX_ANCHOR_FULLSCREEN_REPORT)
+    parser.add_argument("--origin-bbox-output-report-dir", type=Path, default=DEFAULT_ORIGIN_BBOX_OUTPUT_REPORT)
     parser.add_argument("--small-drone-report-dir", type=Path, default=DEFAULT_SMALL_DRONE_REPORT)
     parser.add_argument(
         "--multiburst-residual-aggregate-report-dir",
@@ -161,6 +169,8 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MULTIBURST_RESIDUAL_AGGREGATE_REPORT,
     )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
+    parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
+    parser.add_argument("--skip-origin-bbox-output-report", action="store_true")
     parser.add_argument("--skip-small-drone-report", action="store_true")
     parser.add_argument("--skip-bbox-outlier-report", action="store_true")
     parser.add_argument("--skip-multiburst-residual-aggregate-report", action="store_true")
@@ -265,6 +275,184 @@ def compact_origin_reprojection_result(result: Mapping[str, object]) -> dict[str
         "summary": {
             "row_count": len(rows) if isinstance(rows, list) else 0,
             "final_pass": "final_pass=yes" in str(result.get("result_text", "")),
+        },
+    }
+
+
+def run_bbox_anchor_fullscreen_report_check(report_dir: Path) -> dict[str, object]:
+    result_path = report_dir / "result.txt"
+    summary_path = report_dir / "validation_gate_summary.csv"
+    profile_path = report_dir / "bbox_anchor_profile.json"
+    result_text = result_path.read_text(encoding="utf-8") if result_path.is_file() else ""
+    rows: list[dict[str, str]] = []
+    if summary_path.is_file():
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    profile = load_json(profile_path) if profile_path.is_file() else {}
+    return {
+        "report_dir": str(report_dir),
+        "result_path": str(result_path),
+        "summary_path": str(summary_path),
+        "profile_path": str(profile_path),
+        "result_text": result_text,
+        "rows": rows,
+        "profile": profile,
+    }
+
+
+def evaluate_bbox_anchor_fullscreen_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    result_text = str(result.get("result_text", ""))
+    rows = result.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    profile = result.get("profile", {})
+    if not isinstance(profile, Mapping):
+        profile = {}
+
+    require("final_pass=yes" in result_text, failures, "bbox_anchor_fullscreen:final_pass")
+    require(profile.get("method") == "bbox_internal_origin_anchor_profile_v1", failures, "bbox_anchor_fullscreen:profile_method")
+    require(str(profile.get("application_contract", "")).startswith("runtime uses bbox"), failures, "bbox_anchor_fullscreen:application_contract")
+    require(len(rows) >= 5, failures, "bbox_anchor_fullscreen:trial_count")
+    pass_count = 0
+    sample_count = 0
+    min_right = float("inf")
+    min_down = float("inf")
+    min_forward = float("inf")
+    min_position = float("inf")
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("pass", "")).strip().lower() == "yes":
+            pass_count += 1
+        sample_count += int(float_value(row.get("sample_count")))
+        min_right = min(min_right, float_value(row.get("right_rmse_improvement_m"), default=-1.0))
+        min_down = min(min_down, float_value(row.get("down_rmse_improvement_m"), default=-1.0))
+        min_forward = min(min_forward, float_value(row.get("forward_rmse_improvement_m"), default=-1.0))
+        min_position = min(min_position, float_value(row.get("position_rmse_improvement_m"), default=-1.0))
+    require(pass_count == len(rows) and pass_count >= 5, failures, "bbox_anchor_fullscreen:trial_pass_count")
+    require(min_right > 0.0, failures, "bbox_anchor_fullscreen:right_improvement")
+    require(min_down > 0.0, failures, "bbox_anchor_fullscreen:down_improvement")
+    require(min_forward > 0.0, failures, "bbox_anchor_fullscreen:forward_improvement")
+    require(min_position > 0.0, failures, "bbox_anchor_fullscreen:position_improvement")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "acceptance_status": "PASS" if "final_pass=yes" in result_text else "FAIL",
+        "trial_count": len(rows),
+        "pass_count": pass_count,
+        "sample_count": sample_count,
+        "min_right_improvement_m": None if min_right == float("inf") else min_right,
+        "min_down_improvement_m": None if min_down == float("inf") else min_down,
+        "min_forward_improvement_m": None if min_forward == float("inf") else min_forward,
+        "min_position_improvement_m": None if min_position == float("inf") else min_position,
+        "fusion_status": "bbox_anchor_fullscreen_saved_report",
+        "disparity_residual_status": "not_applicable",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_bbox_anchor_fullscreen_result(result: Mapping[str, object]) -> dict[str, object]:
+    rows = result.get("rows", [])
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "result_path": result.get("result_path", ""),
+        "summary_path": result.get("summary_path", ""),
+        "profile_path": result.get("profile_path", ""),
+        "summary": {
+            "row_count": len(rows) if isinstance(rows, list) else 0,
+            "final_pass": "final_pass=yes" in str(result.get("result_text", "")),
+        },
+    }
+
+
+def run_origin_bbox_output_report_check(report_dir: Path) -> dict[str, object]:
+    result_path = report_dir / "result.txt"
+    summary_path = report_dir / "summary.csv"
+    metadata_path = report_dir / "metadata.json"
+    result_text = result_path.read_text(encoding="utf-8") if result_path.is_file() else ""
+    rows: list[dict[str, str]] = []
+    if summary_path.is_file():
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    metadata = load_json(metadata_path) if metadata_path.is_file() else {}
+    return {
+        "report_dir": str(report_dir),
+        "result_path": str(result_path),
+        "summary_path": str(summary_path),
+        "metadata_path": str(metadata_path),
+        "result_text": result_text,
+        "rows": rows,
+        "metadata": metadata,
+    }
+
+
+def evaluate_origin_bbox_output_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    result_text = str(result.get("result_text", ""))
+    rows = result.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    metadata = result.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+
+    require("final_pass=yes" in result_text, failures, "origin_bbox_output:final_pass")
+    require(metadata.get("axis_contract") == "stereo_center_frd:forward_right_down", failures, "origin_bbox_output:axis_contract")
+    require("strictly lower" in str(metadata.get("pass_rule", "")), failures, "origin_bbox_output:pass_rule")
+    require(len(rows) >= 3, failures, "origin_bbox_output:trial_count")
+    pass_count = 0
+    sample_count = 0
+    min_right = float("inf")
+    min_down = float("inf")
+    min_forward = float("inf")
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("pass", "")).strip().lower() == "yes":
+            pass_count += 1
+        sample_count += int(float_value(row.get("samples")))
+        min_right = min(min_right, float_value(row.get("right_improvement_m"), default=-1.0))
+        min_down = min(min_down, float_value(row.get("down_improvement_m"), default=-1.0))
+        min_forward = min(min_forward, float_value(row.get("forward_improvement_m"), default=-1.0))
+    require(pass_count == len(rows) and pass_count >= 3, failures, "origin_bbox_output:trial_pass_count")
+    require(min_right > 0.0, failures, "origin_bbox_output:right_improvement")
+    require(min_down > 0.0, failures, "origin_bbox_output:down_improvement")
+    require(min_forward > 0.0, failures, "origin_bbox_output:forward_improvement")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "acceptance_status": "PASS" if "final_pass=yes" in result_text else "FAIL",
+        "trial_count": len(rows),
+        "pass_count": pass_count,
+        "sample_count": sample_count,
+        "min_right_improvement_m": None if min_right == float("inf") else min_right,
+        "min_down_improvement_m": None if min_down == float("inf") else min_down,
+        "min_forward_improvement_m": None if min_forward == float("inf") else min_forward,
+        "fusion_status": "origin_bbox_output_saved_report",
+        "disparity_residual_status": "not_applicable",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_origin_bbox_output_result(result: Mapping[str, object]) -> dict[str, object]:
+    rows = result.get("rows", [])
+    metadata = result.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "result_path": result.get("result_path", ""),
+        "summary_path": result.get("summary_path", ""),
+        "metadata_path": result.get("metadata_path", ""),
+        "summary": {
+            "row_count": len(rows) if isinstance(rows, list) else 0,
+            "final_pass": "final_pass=yes" in str(result.get("result_text", "")),
+            "axis_contract": metadata.get("axis_contract", ""),
         },
     }
 
@@ -887,6 +1075,28 @@ def main() -> int:
                 "name": "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
                 "result": compact_origin_reprojection_result(origin_result),
                 "evaluation": origin_evaluation,
+            }
+        )
+
+    if not args.skip_bbox_anchor_fullscreen_report:
+        bbox_anchor_result = run_bbox_anchor_fullscreen_report_check(Path(args.bbox_anchor_fullscreen_report_dir))
+        bbox_anchor_evaluation = evaluate_bbox_anchor_fullscreen_report(bbox_anchor_result)
+        candidates.append(
+            {
+                "name": "bbox_anchor_global_fullscreen_right_att_0p1",
+                "result": compact_bbox_anchor_fullscreen_result(bbox_anchor_result),
+                "evaluation": bbox_anchor_evaluation,
+            }
+        )
+
+    if not args.skip_origin_bbox_output_report:
+        origin_bbox_output_result = run_origin_bbox_output_report_check(Path(args.origin_bbox_output_report_dir))
+        origin_bbox_output_evaluation = evaluate_origin_bbox_output_report(origin_bbox_output_result)
+        candidates.append(
+            {
+                "name": "origin_bbox_output_validation_8trials_slow",
+                "result": compact_origin_bbox_output_result(origin_bbox_output_result),
+                "evaluation": origin_bbox_output_evaluation,
             }
         )
 

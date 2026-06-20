@@ -32,6 +32,46 @@
       "promotion_limit": "simulation evidence only; not hardware/WIRIS validated"
     },
     {
+      "id": "bbox_anchor_global_fullscreen_right_att_0p1",
+      "status": "PASS",
+      "scope": "simulation_bbox_anchor_saved_report",
+      "method": "bbox internal origin anchor profile v1, global fullscreen anchor",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625",
+        "result_txt": "Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625/result.txt",
+        "validation_gate_summary_csv": "Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625/validation_gate_summary.csv",
+        "final_pass": true,
+        "validation_trial_pass": "5/5",
+        "validation_sample_count": 1654,
+        "min_right_rmse_improvement_m": 0.235088043,
+        "min_down_rmse_improvement_m": 0.000256281,
+        "min_forward_rmse_improvement_m": 34.78620407
+      },
+      "runtime_contract": "Runtime uses bbox x1/y1/width/height only, then stereo ray triangulation with right extrinsic rotation; validation report compares stereo-center RDF improvements.",
+      "promotion_limit": "simulation saved-report candidate only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "origin_bbox_output_validation_8trials_slow",
+      "status": "PASS",
+      "scope": "simulation_origin_bbox_output_saved_report",
+      "method": "origin-bbox output profile validation, slow 8-trial run",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616",
+        "result_txt": "Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616/result.txt",
+        "summary_csv": "Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616/summary.csv",
+        "final_pass": true,
+        "validation_trial_pass": "3/3",
+        "validation_sample_count": 1127,
+        "min_right_mae_improvement_m": 0.0152450943,
+        "min_down_mae_improvement_m": 0.0291990022,
+        "min_forward_mae_improvement_m": 0.47364686
+      },
+      "runtime_contract": "Metadata axis contract is stereo_center_frd:forward_right_down; checker requires corrected MAE to be strictly lower for Right, Down, and Forward in repo-local summary rows.",
+      "promotion_limit": "legacy simulation saved-report candidate only; metadata contains historical machine-local source paths, so current reproducibility evidence is limited to committed result/summary artifacts"
+    },
+    {
       "id": "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
       "status": "STRICT_PASS",
       "scope": "simulation_small_drone_observation_fusion_saved_report",
