@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=3`, `pass_count=3`,
+Expected result: `status=PASS`, `candidate_count=5`, `pass_count=5`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=4`, `pass_count=4`; the
+Expected result: `status=PASS`, `candidate_count=6`, `pass_count=6`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -48,6 +48,37 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `3.436333 m`.
   - Promotion status: simulation-origin candidate only; not hardware/WIRIS
     validated.
+
+- `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`
+  - Status: `STRICT_PASS`
+  - Experiment: `EXP-20260617-213-small-drone-observation-fusion`
+  - Meaning: latency-oriented small-drone observation fusion candidate using
+    1 burst x 3 observations. It consumes only image `u/v`, measured disparity,
+    fixed camera intrinsics, and fixed stereo baseline at runtime.
+  - Evidence:
+    `Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_method_summary.csv`
+    and `small_drone_observation_metrics.json`: close 2m-baseline/4x and mid
+    5m-baseline/8x scenarios both passed `50/50`; range RMSE improved
+    `0.2775 -> 0.0623 m` and `0.6143 -> 0.0953 m`; position and RDF-axis RMSE
+    all improved; target max abs stayed below each scenario limit; runtime truth
+    `false`.
+  - Promotion status: small-drone synthetic scenario candidate only; not
+    hardware/WIRIS validated.
+
+- `small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge`
+  - Status: `STRICT_PASS`
+  - Experiment: `EXP-20260617-213-small-drone-observation-fusion`
+  - Meaning: quality-oriented small-drone observation fusion candidate using
+    3 bursts x 5 observations when 15 observations are affordable at runtime.
+  - Evidence:
+    `Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_method_summary.csv`
+    and `small_drone_observation_metrics.json`: close 2m-baseline/4x and mid
+    5m-baseline/8x scenarios both passed `50/50`; range RMSE improved
+    `0.2775 -> 0.0337 m` and `0.6143 -> 0.0524 m`; position and RDF-axis RMSE
+    all improved; target max abs stayed below each scenario limit; runtime truth
+    `false`.
+  - Promotion status: small-drone synthetic scenario candidate only; not
+    hardware/WIRIS validated.
 
 - `fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual`
   - Status: `PASS`

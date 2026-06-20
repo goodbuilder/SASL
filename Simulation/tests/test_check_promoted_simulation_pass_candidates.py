@@ -89,6 +89,126 @@ def test_evaluate_origin_reprojection_report_rejects_axis_regression() -> None:
     assert "origin_reprojection:down_improvement" in evaluation["failures"]
 
 
+def test_evaluate_small_drone_report_accepts_strict_all_axis_pass() -> None:
+    module = load_module()
+    result = {
+        "method": "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
+        "metrics": {
+            "sample_count": 360,
+            "coordinate_contracts_explicit": True,
+            "runtime_truth_used": False,
+            "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+            "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        },
+        "rows": [
+            {
+                "scenario": "small_drone_close_2m_4x",
+                "status": "STRICT_PASS",
+                "pass_count": "50",
+                "trial_count": "50",
+                "runtime_truth_used": "False",
+                "range_rmse_raw_mean_m": "0.27",
+                "range_rmse_corrected_mean_m": "0.06",
+                "position_rmse_raw_mean_m": "0.31",
+                "position_rmse_corrected_mean_m": "0.07",
+                "right_rmse_raw_mean_m": "0.14",
+                "right_rmse_corrected_mean_m": "0.01",
+                "down_rmse_raw_mean_m": "0.05",
+                "down_rmse_corrected_mean_m": "0.01",
+                "forward_rmse_raw_mean_m": "0.28",
+                "forward_rmse_corrected_mean_m": "0.06",
+                "target_max_abs_error_corrected_max_m": "0.16",
+                "target_error_limit_m": "1.5",
+            },
+            {
+                "scenario": "small_drone_mid_5m_8x",
+                "status": "STRICT_PASS",
+                "pass_count": "50",
+                "trial_count": "50",
+                "runtime_truth_used": "False",
+                "range_rmse_raw_mean_m": "0.61",
+                "range_rmse_corrected_mean_m": "0.10",
+                "position_rmse_raw_mean_m": "0.76",
+                "position_rmse_corrected_mean_m": "0.11",
+                "right_rmse_raw_mean_m": "0.42",
+                "right_rmse_corrected_mean_m": "0.02",
+                "down_rmse_raw_mean_m": "0.17",
+                "down_rmse_corrected_mean_m": "0.01",
+                "forward_rmse_raw_mean_m": "0.62",
+                "forward_rmse_corrected_mean_m": "0.10",
+                "target_max_abs_error_corrected_max_m": "0.30",
+                "target_error_limit_m": "3.0",
+            },
+        ],
+    }
+
+    evaluation = module.evaluate_small_drone_report(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["scenario_count"] == 2
+    assert evaluation["pass_count"] == 100
+    assert evaluation["sample_count"] == 36000
+
+
+def test_evaluate_small_drone_report_rejects_axis_regression() -> None:
+    module = load_module()
+    result = {
+        "method": "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
+        "metrics": {
+            "sample_count": 360,
+            "coordinate_contracts_explicit": True,
+            "runtime_truth_used": False,
+            "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+            "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        },
+        "rows": [
+            {
+                "scenario": "small_drone_close_2m_4x",
+                "status": "STRICT_PASS",
+                "pass_count": "50",
+                "trial_count": "50",
+                "runtime_truth_used": "False",
+                "range_rmse_raw_mean_m": "0.27",
+                "range_rmse_corrected_mean_m": "0.06",
+                "position_rmse_raw_mean_m": "0.31",
+                "position_rmse_corrected_mean_m": "0.07",
+                "right_rmse_raw_mean_m": "0.14",
+                "right_rmse_corrected_mean_m": "0.15",
+                "down_rmse_raw_mean_m": "0.05",
+                "down_rmse_corrected_mean_m": "0.01",
+                "forward_rmse_raw_mean_m": "0.28",
+                "forward_rmse_corrected_mean_m": "0.06",
+                "target_max_abs_error_corrected_max_m": "0.16",
+                "target_error_limit_m": "1.5",
+            },
+            {
+                "scenario": "small_drone_mid_5m_8x",
+                "status": "STRICT_PASS",
+                "pass_count": "50",
+                "trial_count": "50",
+                "runtime_truth_used": "False",
+                "range_rmse_raw_mean_m": "0.61",
+                "range_rmse_corrected_mean_m": "0.10",
+                "position_rmse_raw_mean_m": "0.76",
+                "position_rmse_corrected_mean_m": "0.11",
+                "right_rmse_raw_mean_m": "0.42",
+                "right_rmse_corrected_mean_m": "0.02",
+                "down_rmse_raw_mean_m": "0.17",
+                "down_rmse_corrected_mean_m": "0.01",
+                "forward_rmse_raw_mean_m": "0.62",
+                "forward_rmse_corrected_mean_m": "0.10",
+                "target_max_abs_error_corrected_max_m": "0.30",
+                "target_error_limit_m": "3.0",
+            },
+        ],
+    }
+
+    evaluation = module.evaluate_small_drone_report(result)
+
+    assert evaluation["status"] == "FAIL"
+    assert "small_drone:right_improvement" in evaluation["failures"]
+
+
 def test_evaluate_package_result_rejects_missing_residual_apply() -> None:
     module = load_module()
     result = {
@@ -144,10 +264,12 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 3
+    assert len(default_candidates) == 5
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
+        "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
+        "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
         "fresh_common_mode_b7x3_aggregate_best",
         "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
     }

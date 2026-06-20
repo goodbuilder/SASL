@@ -32,6 +32,44 @@
       "promotion_limit": "simulation evidence only; not hardware/WIRIS validated"
     },
     {
+      "id": "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
+      "status": "STRICT_PASS",
+      "scope": "simulation_small_drone_observation_fusion_saved_report",
+      "method": "small-drone multiburst observation fusion, 1 burst x 3 observations, median/median, trim 0.2, common 0.0, sim3 correction",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion",
+        "metrics_json": "Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_metrics.json",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_method_summary.csv",
+        "scenario_pass": "2/2",
+        "trial_pass": "100/100",
+        "validation_rows": 9000,
+        "close_range_rmse_raw_to_corrected_m": "0.2775 -> 0.0623",
+        "mid_range_rmse_raw_to_corrected_m": "0.6143 -> 0.0953"
+      },
+      "runtime_contract": "Small-drone observation fusion consumes only runtime left_u_px, left_v_px, measured_disparity_px, fixed camera intrinsics, and fixed stereo baseline; validation truth remains offline-only.",
+      "promotion_limit": "small-drone synthetic close/mid scenario evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
+      "status": "STRICT_PASS",
+      "scope": "simulation_small_drone_observation_fusion_saved_report",
+      "method": "small-drone multiburst observation fusion, 3 bursts x 5 observations, median/median, trim 0.2, common 0.0, affine ridge correction",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion",
+        "metrics_json": "Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_metrics.json",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_method_summary.csv",
+        "scenario_pass": "2/2",
+        "trial_pass": "100/100",
+        "validation_rows": 9000,
+        "close_range_rmse_raw_to_corrected_m": "0.2775 -> 0.0337",
+        "mid_range_rmse_raw_to_corrected_m": "0.6143 -> 0.0524"
+      },
+      "runtime_contract": "Small-drone observation fusion consumes only runtime left_u_px, left_v_px, measured_disparity_px, fixed camera intrinsics, and fixed stereo baseline; validation truth remains offline-only.",
+      "promotion_limit": "quality-oriented small-drone synthetic close/mid scenario evidence only; not hardware/WIRIS validated"
+    },
+    {
       "id": "fresh_common_mode_b7x3_aggregate_best",
       "status": "PASS",
       "scope": "software_deployment_package",

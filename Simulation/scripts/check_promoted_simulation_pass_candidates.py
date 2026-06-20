@@ -22,6 +22,13 @@ DEFAULT_ORIGIN_REPROJECTION_REPORT = (
     / "reports"
     / "origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625"
 )
+DEFAULT_SMALL_DRONE_REPORT = (
+    ROOT_DIR / "reports" / "experiments" / "EXP-20260617-213-small-drone-observation-fusion"
+)
+SMALL_DRONE_PROMOTED_METHODS = [
+    "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
+    "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,7 +40,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disparity-residual-profile-json", type=Path, default=DEFAULT_RESIDUAL_PROFILE)
     parser.add_argument("--promoted-manifest-json", type=Path, default=DEFAULT_PROMOTED_MANIFEST)
     parser.add_argument("--origin-reprojection-report-dir", type=Path, default=DEFAULT_ORIGIN_REPROJECTION_REPORT)
+    parser.add_argument("--small-drone-report-dir", type=Path, default=DEFAULT_SMALL_DRONE_REPORT)
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
+    parser.add_argument("--skip-small-drone-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -135,6 +144,151 @@ def compact_origin_reprojection_result(result: Mapping[str, object]) -> dict[str
         "summary": {
             "row_count": len(rows) if isinstance(rows, list) else 0,
             "final_pass": "final_pass=yes" in str(result.get("result_text", "")),
+        },
+    }
+
+
+def run_small_drone_report_check(report_dir: Path, method: str) -> dict[str, object]:
+    metrics_path = report_dir / "small_drone_observation_metrics.json"
+    summary_path = report_dir / "small_drone_observation_method_summary.csv"
+    metrics = load_json(metrics_path) if metrics_path.is_file() else {}
+    rows: list[dict[str, str]] = []
+    if summary_path.is_file():
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            rows = [row for row in csv.DictReader(handle) if row.get("method") == method]
+    return {
+        "report_dir": str(report_dir),
+        "metrics_path": str(metrics_path),
+        "summary_path": str(summary_path),
+        "method": method,
+        "metrics": metrics,
+        "rows": rows,
+    }
+
+
+def evaluate_small_drone_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    metrics = result.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    rows = result.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    method = str(result.get("method", ""))
+
+    expected_scenarios = {"small_drone_close_2m_4x", "small_drone_mid_5m_8x"}
+    seen_scenarios: set[str] = set()
+    sample_count = 0
+    min_range_improvement = float("inf")
+    min_position_improvement = float("inf")
+    min_right_improvement = float("inf")
+    min_down_improvement = float("inf")
+    min_forward_improvement = float("inf")
+    max_target_ratio = 0.0
+    pass_count = 0
+    trial_count = 0
+
+    require(metrics.get("coordinate_contracts_explicit") is True, failures, "small_drone:coordinate_contract")
+    require(metrics.get("runtime_truth_used") is False, failures, "small_drone:runtime_truth")
+    require(
+        metrics.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+        failures,
+        "small_drone:rdf_axis_contract",
+    )
+    require(
+        metrics.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        failures,
+        "small_drone:public_topic_contract",
+    )
+
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        scenario = str(row.get("scenario", ""))
+        if scenario in expected_scenarios:
+            seen_scenarios.add(scenario)
+        row_pass = int(float_value(row.get("pass_count")))
+        row_trials = int(float_value(row.get("trial_count")))
+        pass_count += row_pass
+        trial_count += row_trials
+        sample_count += row_trials * int(float_value(metrics.get("sample_count")))
+        require(row.get("status") == "STRICT_PASS", failures, f"small_drone:{scenario}:status")
+        require(row_pass == row_trials and row_trials == 50, failures, f"small_drone:{scenario}:pass_count")
+        require(str(row.get("runtime_truth_used", "")).lower() == "false", failures, f"small_drone:{scenario}:runtime_truth")
+
+        range_improvement = float_value(row.get("range_rmse_raw_mean_m")) - float_value(
+            row.get("range_rmse_corrected_mean_m")
+        )
+        position_improvement = float_value(row.get("position_rmse_raw_mean_m")) - float_value(
+            row.get("position_rmse_corrected_mean_m")
+        )
+        right_improvement = float_value(row.get("right_rmse_raw_mean_m")) - float_value(
+            row.get("right_rmse_corrected_mean_m")
+        )
+        down_improvement = float_value(row.get("down_rmse_raw_mean_m")) - float_value(
+            row.get("down_rmse_corrected_mean_m")
+        )
+        forward_improvement = float_value(row.get("forward_rmse_raw_mean_m")) - float_value(
+            row.get("forward_rmse_corrected_mean_m")
+        )
+        min_range_improvement = min(min_range_improvement, range_improvement)
+        min_position_improvement = min(min_position_improvement, position_improvement)
+        min_right_improvement = min(min_right_improvement, right_improvement)
+        min_down_improvement = min(min_down_improvement, down_improvement)
+        min_forward_improvement = min(min_forward_improvement, forward_improvement)
+        target_limit = float_value(row.get("target_error_limit_m"))
+        target_max = float_value(row.get("target_max_abs_error_corrected_max_m"))
+        if target_limit > 0.0:
+            max_target_ratio = max(max_target_ratio, target_max / target_limit)
+        require(target_max < target_limit, failures, f"small_drone:{scenario}:target_limit")
+
+    require(seen_scenarios == expected_scenarios, failures, "small_drone:scenario_coverage")
+    require(len(rows) == 2, failures, "small_drone:method_row_count")
+    require(min_range_improvement > 0.0, failures, "small_drone:range_improvement")
+    require(min_position_improvement > 0.0, failures, "small_drone:position_improvement")
+    require(min_right_improvement > 0.0, failures, "small_drone:right_improvement")
+    require(min_down_improvement > 0.0, failures, "small_drone:down_improvement")
+    require(min_forward_improvement > 0.0, failures, "small_drone:forward_improvement")
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "method": method,
+        "acceptance_status": "STRICT_PASS" if not failures else "FAIL",
+        "scenario_count": len(seen_scenarios),
+        "pass_count": pass_count,
+        "trial_count": trial_count,
+        "sample_count": sample_count,
+        "min_range_improvement_m": None if min_range_improvement == float("inf") else min_range_improvement,
+        "min_position_improvement_m": None if min_position_improvement == float("inf") else min_position_improvement,
+        "min_right_improvement_m": None if min_right_improvement == float("inf") else min_right_improvement,
+        "min_down_improvement_m": None if min_down_improvement == float("inf") else min_down_improvement,
+        "min_forward_improvement_m": None if min_forward_improvement == float("inf") else min_forward_improvement,
+        "max_target_error_to_limit_ratio": max_target_ratio,
+        "fusion_status": "small_drone_observation_fusion",
+        "disparity_residual_status": "not_applicable",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_small_drone_result(result: Mapping[str, object]) -> dict[str, object]:
+    rows = result.get("rows", [])
+    metrics = result.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "metrics_path": result.get("metrics_path", ""),
+        "summary_path": result.get("summary_path", ""),
+        "method": result.get("method", ""),
+        "summary": {
+            "row_count": len(rows) if isinstance(rows, list) else 0,
+            "coordinate_contracts_explicit": metrics.get("coordinate_contracts_explicit", False),
+            "runtime_truth_used": metrics.get("runtime_truth_used", True),
+            "rdf_axis_contract": metrics.get("rdf_axis_contract", ""),
+            "public_topic_contract": metrics.get("public_topic_contract", ""),
         },
     }
 
@@ -405,6 +559,18 @@ def main() -> int:
                 "evaluation": origin_evaluation,
             }
         )
+
+    if not args.skip_small_drone_report:
+        for method in SMALL_DRONE_PROMOTED_METHODS:
+            small_drone_result = run_small_drone_report_check(Path(args.small_drone_report_dir), method)
+            small_drone_evaluation = evaluate_small_drone_report(small_drone_result)
+            candidates.append(
+                {
+                    "name": method,
+                    "result": compact_small_drone_result(small_drone_result),
+                    "evaluation": small_drone_evaluation,
+                }
+            )
 
     base_dir = output_dir / "observation_fusion"
     base_result = run_package_check(
