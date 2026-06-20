@@ -70,6 +70,33 @@ BBOX_OUTLIER_PROMOTED_METHODS = [
         "metrics_json": "repeated_observation_metrics.json",
     },
     {
+        "method": "correlated_repeated_observation_trimmed_mean_n15_trim0p2_common0",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-210-bbox-outlier-correlated-repeated-observation",
+        "summary_csv": "correlated_repeated_observation_method_summary.csv",
+        "metrics_json": "correlated_repeated_observation_metrics.json",
+    },
+    {
+        "method": "correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-210-bbox-outlier-correlated-repeated-observation",
+        "summary_csv": "correlated_repeated_observation_method_summary.csv",
+        "metrics_json": "correlated_repeated_observation_metrics.json",
+    },
+    {
+        "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p25",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion",
+        "summary_csv": "multiburst_observation_method_summary.csv",
+        "metrics_json": "multiburst_observation_metrics.json",
+    },
+    {
         "method": "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
         "report_dir": ROOT_DIR
         / "reports"

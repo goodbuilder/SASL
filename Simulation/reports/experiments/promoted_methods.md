@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=11`, `pass_count=11`,
+Expected result: `status=PASS`, `candidate_count=14`, `pass_count=14`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=12`, `pass_count=12`; the
+Expected result: `status=PASS`, `candidate_count=15`, `pass_count=15`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -87,6 +87,8 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended`,
     `EXP-20260617-207-bbox-outlier-n31-trim0p2`,
     `EXP-20260617-209-bbox-outlier-n75-trim0p2`, and
+    `EXP-20260617-210-bbox-outlier-correlated-repeated-observation`,
+    `EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion`, and
     `EXP-20260617-212-bbox-outlier-multiburst-common1-confirmation`
   - Methods:
     `repeated_observation_median_n3_trim0p2`,
@@ -94,6 +96,9 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `repeated_observation_trimmed_mean_n15_trim0p2`,
     `repeated_observation_trimmed_mean_n31_trim0p2`,
     `repeated_observation_trimmed_mean_n75_trim0p2`, and
+    `correlated_repeated_observation_trimmed_mean_n15_trim0p2_common0`,
+    `correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0`,
+    `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p25`, and
     `multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1`.
   - Evidence: each saved report row is `50/50` `STRICT_PASS`, improves range
     and position RMSE versus raw, keeps target max abs error under the 10m

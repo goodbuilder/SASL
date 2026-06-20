@@ -155,6 +155,57 @@
       "promotion_limit": "bbox-outlier synthetic upper-bound candidate only; high observation count requires latency validation"
     },
     {
+      "id": "correlated_repeated_observation_trimmed_mean_n15_trim0p2_common0",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_correlated_repeated_observation_saved_report",
+      "method": "correlated repeated observation fusion, trimmed mean, n=15, trim 0.2, common 0.0",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation/correlated_repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2225",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2486",
+        "target_max_abs_error_m": 1.1762613852793038
+      },
+      "runtime_contract": "Correlated repeated-observation fusion consumes multiple left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; the correlation model and PX4/RTK truth are synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic correlated-observation candidate only; real observation correlation and latency must be validated"
+    },
+    {
+      "id": "correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_correlated_repeated_observation_saved_report",
+      "method": "correlated repeated observation fusion, trimmed mean, n=31, trim 0.2, common 0.0",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation/correlated_repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1690",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2019",
+        "target_max_abs_error_m": 0.9865546146425004
+      },
+      "runtime_contract": "Correlated repeated-observation fusion consumes multiple left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; the correlation model and PX4/RTK truth are synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic correlated-observation quality candidate only; high observation count requires latency validation"
+    },
+    {
+      "id": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p25",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_multiburst_common_mode_saved_report",
+      "method": "multi-burst observation fusion, inner trimmed mean, outer trimmed mean, 5 bursts x 5 observations, trim 0.2, common 0.25",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion/multiburst_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2460",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2699",
+        "target_max_abs_error_m": 1.4121575735146052
+      },
+      "runtime_contract": "Multi-burst observation fusion consumes left_u_px, left_v_px, and measured_disparity_px observations grouped into bursts; common-mode error is synthetic/audit-only and PX4/RTK truth is not runtime input.",
+      "promotion_limit": "bbox-outlier common-mode synthetic candidate only; not hardware/WIRIS validated"
+    },
+    {
       "id": "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
       "status": "STRICT_PASS",
       "scope": "simulation_bbox_outlier_multiburst_common_mode_saved_report",
