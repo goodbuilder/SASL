@@ -293,11 +293,28 @@ The current checkout was re-scanned for repo-local PASS evidence after adding
 the EXP281 scenario residual catalog. These records are intentionally not
 promoted as final Simulation PASS correction methods:
 
+- `Simulation/reports` saved-report audit found no additional all-trial
+  `final_pass=yes` report outside the promoted manifest. Many historical
+  `validation_gate_summary.csv` files contain one or more `pass=yes` rows, but
+  their report-level gates are mixed or incomplete; they remain excluded unless
+  `result.txt` reports `final_pass=yes` and every validation trial passes under
+  the same coordinate contract. The all-trial local reports found by this scan
+  are already covered by promoted candidates:
+  `origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion`,
+  `bbox_anchor_global_fullscreen_right_att_0p1`, and
+  `origin_bbox_output_validation_8trials_slow`.
 - `runtime_export_degree1` under
   `EXP-20260618-281-fresh-stereodistance-disparity-residual-search` is not a
   final PASS candidate. It has bbox-outlier runtime residual checks `3/4`
   `PASS`; seed `281003` is `FAIL` because residual range and position RMSE
   regress. The later `runtime_export_scenario_best` catalog supersedes it.
+- `EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion-probe` is not
+  promoted separately. It is a 12-trial probe for
+  `multiburst_observation_inner_trimmed_mean_outer_median_b5x5_trim0p2_common0p5`;
+  the promoted common-mode entry uses the fuller
+  `EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion` report, and
+  deployment evidence is superseded by the fresh b7x3 observation-fusion and
+  EXP281 residual catalog checks.
 - `EXP-20260617-198`, `EXP-20260617-199`, and `EXP-20260617-200` image or
   inverse-depth prefilter reports are not final PASS candidates. Their
   `best_method.status` is `FAIL` and their target-window max errors exceed the
