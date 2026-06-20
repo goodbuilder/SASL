@@ -324,6 +324,19 @@ promoted as final Simulation PASS correction methods:
   `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`;
   the same report also contributes the promoted quality candidate
   `small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge`.
+- `experiment_registry.csv` currently has five local PASS/STRICT_PASS rows
+  whose `method_slug` is not a promoted manifest id. Two are alias or parent
+  records already covered by promoted entries:
+  `small_drone_multiburst_median_b1x3_sim3` and
+  `multiburst_b7x3_log_disparity_ray_scale_residual`. The remaining local
+  PASS rows are recorder/topic/runtime-environment gates
+  (`operator_recorder_current_schema_lock`, `external_bbox_topic_runtime_input`,
+  and `yolo_runtime_venv_system_site_stability`), not correction methods with
+  final measurement PASS evidence.
+- The registry also contains 35 PASS/STRICT_PASS rows whose referenced
+  artifacts are not present in the current checkout. They remain historical
+  leads only until their source artifacts are restored or rerun under the
+  current coordinate-contract gate.
 - Legacy `PARTIAL_PASS`/`FAMILY_LOCAL_PASS` bbox-anchor reports are kept as
   baselines or family-local evidence only. They are not global final PASS
   corrections under the strict all-axis gate.
