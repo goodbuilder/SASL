@@ -308,6 +308,16 @@ promoted as final Simulation PASS correction methods:
   final PASS candidate. It has bbox-outlier runtime residual checks `3/4`
   `PASS`; seed `281003` is `FAIL` because residual range and position RMSE
   regress. The later `runtime_export_scenario_best` catalog supersedes it.
+- The four scenario-level EXP281 `multiburst_disparity_residual_metrics.json`
+  `STRICT_PASS` methods are covered by
+  `scenario_labeled_disparity_residual_profile_catalog_exp281`, not promoted as
+  unlabeled universal residuals. Their runtime profiles appear in
+  `runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_catalog.csv`
+  for `bbox_outlier_stress`, `combined_sensor_stress`,
+  `disparity_noise_stress`, and `intrinsic_scale_stress`; the selector may use
+  only explicit `deployment_label`, `scenario_label`, or `scenario_name`
+  metadata and forbids PX4/RTK truth, validation errors, target-window labels,
+  true disparity, and true image features at runtime.
 - `EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion-probe` is not
   promoted separately. It is a 12-trial probe for
   `multiburst_observation_inner_trimmed_mean_outer_median_b5x5_trim0p2_common0p5`;
