@@ -242,11 +242,19 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Meaning: current non-alias robustness route when deployment/scenario labels
     are explicit. A single universal profile is rejected; the valid strategy is
     a scenario profile catalog selected by operator/deployment metadata.
-  - Evidence: current-checkout six-scenario smoke at
-    `/tmp/sasl_non_alias_default6_smoke` passed final robustness acceptance,
-    direct NED-to-RDF alias forbidden 6/6, scenario catalog profiles 6/6,
-    StereoDistance promotion 6/6, selector package PASS, deployment frontier
-    PASS, operator launch 19/19 PASS, runtime truth `false`.
+  - Evidence: the extended checker command with `--include-non-alias-smoke`
+    runs the current-checkout six-scenario smoke and requires final robustness
+    acceptance `PASS`, direct NED-to-RDF alias forbidden 6/6, scenario catalog
+    profiles 6/6, StereoDistance promotion 6/6, selector package `PASS`,
+    deployment frontier `PASS`, operator launch 19/19 `PASS`, and runtime truth
+    `false`.
+  - Current smoke strategy: `deployment_strategy=scenario_profile_catalog` and
+    `single_profile_pass=false`. The label routes select
+    `ridge_global_inverse_depth_linear_lambda1p0` for nominal/intrinsic-scale,
+    `ridge_global_inverse_depth_linear_lambda10p0` for disparity-noise/combined
+    sensor stress, and
+    `target_weighted_disparity_quadratic_then_sim3_target_weighted_quadratic_residual_raw_forward_lut_sigma040`
+    for bbox-outlier stress.
   - Promotion status: simulation/software catalog candidate only; not
     hardware/WIRIS validated.
 
