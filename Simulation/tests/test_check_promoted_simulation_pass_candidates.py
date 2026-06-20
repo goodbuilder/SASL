@@ -209,6 +209,69 @@ def test_evaluate_small_drone_report_rejects_axis_regression() -> None:
     assert "small_drone:right_improvement" in evaluation["failures"]
 
 
+def test_evaluate_bbox_outlier_report_accepts_strict_pass() -> None:
+    module = load_module()
+    result = {
+        "method": "repeated_observation_median_n7_trim0p2",
+        "metrics": {
+            "coordinate_contracts_explicit": True,
+            "runtime_truth_used": False,
+        },
+        "rows": [
+            {
+                "status": "STRICT_PASS",
+                "pass_count": "50",
+                "trial_count": "50",
+                "runtime_truth_used": "False",
+                "range_rmse_raw_mean_m": "2.65",
+                "range_rmse_corrected_mean_m": "0.35",
+                "position_rmse_raw_mean_m": "5.09",
+                "position_rmse_corrected_mean_m": "0.37",
+                "target_max_abs_error_corrected_max_m": "2.15",
+                "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+                "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            }
+        ],
+    }
+
+    evaluation = module.evaluate_bbox_outlier_report(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["pass_count"] == 50
+    assert evaluation["target_max_abs_error_m"] == 2.15
+
+
+def test_evaluate_bbox_outlier_report_rejects_target_gate_failure() -> None:
+    module = load_module()
+    result = {
+        "method": "repeated_observation_median_n7_trim0p2",
+        "metrics": {
+            "coordinate_contracts_explicit": True,
+            "runtime_truth_used": False,
+        },
+        "rows": [
+            {
+                "status": "STRICT_PASS",
+                "pass_count": "50",
+                "trial_count": "50",
+                "runtime_truth_used": "False",
+                "range_rmse_raw_mean_m": "2.65",
+                "range_rmse_corrected_mean_m": "0.35",
+                "position_rmse_raw_mean_m": "5.09",
+                "position_rmse_corrected_mean_m": "0.37",
+                "target_max_abs_error_corrected_max_m": "10.01",
+                "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+                "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            }
+        ],
+    }
+
+    evaluation = module.evaluate_bbox_outlier_report(result)
+
+    assert evaluation["status"] == "FAIL"
+    assert "bbox_outlier:target_gate_10m" in evaluation["failures"]
+
+
 def test_evaluate_package_result_rejects_missing_residual_apply() -> None:
     module = load_module()
     result = {
@@ -264,12 +327,18 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 5
+    assert len(default_candidates) == 11
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
         "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
         "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
+        "repeated_observation_median_n3_trim0p2",
+        "repeated_observation_median_n7_trim0p2",
+        "repeated_observation_trimmed_mean_n15_trim0p2",
+        "repeated_observation_trimmed_mean_n31_trim0p2",
+        "repeated_observation_trimmed_mean_n75_trim0p2",
+        "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
         "fresh_common_mode_b7x3_aggregate_best",
         "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
     }

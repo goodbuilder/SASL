@@ -29,6 +29,56 @@ SMALL_DRONE_PROMOTED_METHODS = [
     "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
     "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
 ]
+BBOX_OUTLIER_PROMOTED_METHODS = [
+    {
+        "method": "repeated_observation_median_n3_trim0p2",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-201-bbox-outlier-repeated-observation-fusion",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_median_n7_trim0p2",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-201-bbox-outlier-repeated-observation-fusion",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n15_trim0p2",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n31_trim0p2",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-207-bbox-outlier-n31-trim0p2",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n75_trim0p2",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-209-bbox-outlier-n75-trim0p2",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
+        "report_dir": ROOT_DIR
+        / "reports"
+        / "experiments"
+        / "EXP-20260617-212-bbox-outlier-multiburst-common1-confirmation",
+        "summary_csv": "multiburst_observation_method_summary.csv",
+        "metrics_json": "multiburst_observation_metrics.json",
+    },
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -43,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--small-drone-report-dir", type=Path, default=DEFAULT_SMALL_DRONE_REPORT)
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-small-drone-report", action="store_true")
+    parser.add_argument("--skip-bbox-outlier-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -289,6 +340,100 @@ def compact_small_drone_result(result: Mapping[str, object]) -> dict[str, object
             "runtime_truth_used": metrics.get("runtime_truth_used", True),
             "rdf_axis_contract": metrics.get("rdf_axis_contract", ""),
             "public_topic_contract": metrics.get("public_topic_contract", ""),
+        },
+    }
+
+
+def run_bbox_outlier_report_check(config: Mapping[str, object]) -> dict[str, object]:
+    report_dir = Path(config["report_dir"])
+    method = str(config["method"])
+    metrics_path = report_dir / str(config["metrics_json"])
+    summary_path = report_dir / str(config["summary_csv"])
+    metrics = load_json(metrics_path) if metrics_path.is_file() else {}
+    rows: list[dict[str, str]] = []
+    if summary_path.is_file():
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            rows = [row for row in csv.DictReader(handle) if row.get("method") == method]
+    return {
+        "report_dir": str(report_dir),
+        "metrics_path": str(metrics_path),
+        "summary_path": str(summary_path),
+        "method": method,
+        "metrics": metrics,
+        "rows": rows,
+    }
+
+
+def evaluate_bbox_outlier_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    metrics = result.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    rows = result.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    row = rows[0] if rows and isinstance(rows[0], Mapping) else {}
+
+    require(metrics.get("coordinate_contracts_explicit") is True, failures, "bbox_outlier:coordinate_contract")
+    require(metrics.get("runtime_truth_used") is False, failures, "bbox_outlier:runtime_truth")
+    require(
+        row.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+        failures,
+        "bbox_outlier:rdf_axis_contract",
+    )
+    require(
+        row.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        failures,
+        "bbox_outlier:public_topic_contract",
+    )
+    require(len(rows) == 1, failures, "bbox_outlier:method_row_count")
+    require(row.get("status") == "STRICT_PASS", failures, "bbox_outlier:status")
+    pass_count = int(float_value(row.get("pass_count")))
+    trial_count = int(float_value(row.get("trial_count")))
+    require(pass_count == trial_count and trial_count == 50, failures, "bbox_outlier:pass_count")
+    require(str(row.get("runtime_truth_used", "")).lower() == "false", failures, "bbox_outlier:row_runtime_truth")
+    range_improvement = float_value(row.get("range_rmse_raw_mean_m")) - float_value(
+        row.get("range_rmse_corrected_mean_m")
+    )
+    position_improvement = float_value(row.get("position_rmse_raw_mean_m")) - float_value(
+        row.get("position_rmse_corrected_mean_m")
+    )
+    target_max = float_value(row.get("target_max_abs_error_corrected_max_m"))
+    require(range_improvement > 0.0, failures, "bbox_outlier:range_improvement")
+    require(position_improvement > 0.0, failures, "bbox_outlier:position_improvement")
+    require(target_max < 10.0, failures, "bbox_outlier:target_gate_10m")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "method": result.get("method", ""),
+        "acceptance_status": "STRICT_PASS" if not failures else "FAIL",
+        "pass_count": pass_count,
+        "trial_count": trial_count,
+        "range_improvement_m": range_improvement,
+        "position_improvement_m": position_improvement,
+        "target_max_abs_error_m": target_max,
+        "fusion_status": "bbox_outlier_observation_fusion",
+        "disparity_residual_status": "not_applicable",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_bbox_outlier_result(result: Mapping[str, object]) -> dict[str, object]:
+    rows = result.get("rows", [])
+    metrics = result.get("metrics", {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "metrics_path": result.get("metrics_path", ""),
+        "summary_path": result.get("summary_path", ""),
+        "method": result.get("method", ""),
+        "summary": {
+            "row_count": len(rows) if isinstance(rows, list) else 0,
+            "coordinate_contracts_explicit": metrics.get("coordinate_contracts_explicit", False),
+            "runtime_truth_used": metrics.get("runtime_truth_used", True),
         },
     }
 
@@ -569,6 +714,18 @@ def main() -> int:
                     "name": method,
                     "result": compact_small_drone_result(small_drone_result),
                     "evaluation": small_drone_evaluation,
+                }
+            )
+
+    if not args.skip_bbox_outlier_report:
+        for config in BBOX_OUTLIER_PROMOTED_METHODS:
+            bbox_outlier_result = run_bbox_outlier_report_check(config)
+            bbox_outlier_evaluation = evaluate_bbox_outlier_report(bbox_outlier_result)
+            candidates.append(
+                {
+                    "name": config["method"],
+                    "result": compact_bbox_outlier_result(bbox_outlier_result),
+                    "evaluation": bbox_outlier_evaluation,
                 }
             )
 

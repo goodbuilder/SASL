@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=5`, `pass_count=5`,
+Expected result: `status=PASS`, `candidate_count=11`, `pass_count=11`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=6`, `pass_count=6`; the
+Expected result: `status=PASS`, `candidate_count=12`, `pass_count=12`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -79,6 +79,29 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `false`.
   - Promotion status: small-drone synthetic scenario candidate only; not
     hardware/WIRIS validated.
+
+- BBox-outlier repeated/multiburst observation fusion candidates
+  - Status: `STRICT_PASS`
+  - Experiments:
+    `EXP-20260617-201-bbox-outlier-repeated-observation-fusion`,
+    `EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended`,
+    `EXP-20260617-207-bbox-outlier-n31-trim0p2`,
+    `EXP-20260617-209-bbox-outlier-n75-trim0p2`, and
+    `EXP-20260617-212-bbox-outlier-multiburst-common1-confirmation`
+  - Methods:
+    `repeated_observation_median_n3_trim0p2`,
+    `repeated_observation_median_n7_trim0p2`,
+    `repeated_observation_trimmed_mean_n15_trim0p2`,
+    `repeated_observation_trimmed_mean_n31_trim0p2`,
+    `repeated_observation_trimmed_mean_n75_trim0p2`, and
+    `multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1`.
+  - Evidence: each saved report row is `50/50` `STRICT_PASS`, improves range
+    and position RMSE versus raw, keeps target max abs error under the 10m
+    simulation gate, declares stereo-center RDF and public FRD+range contracts,
+    and records runtime truth `false`.
+  - Promotion status: bbox-outlier synthetic scenario candidates only. Repeated
+    observation methods require independence and latency validation before real
+    deployment; high-count variants are quality/upper-bound evidence.
 
 - `fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual`
   - Status: `PASS`
