@@ -15,6 +15,19 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
 Expected result: `status=PASS`, `candidate_count=2`, `pass_count=2`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
+To also re-run the heavier six-scenario non-alias catalog smoke:
+
+```bash
+python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
+  --output-dir /tmp/sasl_promoted_pass_candidates_check_with_non_alias \
+  --include-non-alias-smoke
+```
+
+Expected result: `status=PASS`, `candidate_count=3`, `pass_count=3`; the
+non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
+`single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
+runtime truth `false`, and direct NED-to-RDF alias forbidden.
+
 ## Current Simulation Software Deployment PASS
 
 - `fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual`

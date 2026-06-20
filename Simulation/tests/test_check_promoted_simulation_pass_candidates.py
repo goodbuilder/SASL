@@ -87,3 +87,60 @@ def test_write_outputs_records_candidate_status(tmp_path: Path) -> None:
     text = (tmp_path / "promoted_simulation_pass_candidates_check.txt").read_text(encoding="utf-8")
     assert saved["status"] == "PASS"
     assert "candidate: status=PASS" in text
+
+
+def test_evaluate_non_alias_result_accepts_catalog_selector_pass() -> None:
+    module = load_module()
+    result = {
+        "returncode": 0,
+        "summary": {
+            "robustness_acceptance_pass": True,
+            "coordinate_contract_summary": {
+                "all_scenarios_forbid_direct_axis_alias": True,
+            },
+            "deployment_strategy_recommendation": {
+                "deployment_strategy": "scenario_profile_catalog",
+                "single_profile_pass": False,
+            },
+            "runtime_label_selector_package": {
+                "status": "PASS",
+                "frontier_status": "PASS",
+                "operator_launch_status": "PASS",
+                "runtime_truth_used": False,
+            },
+        },
+    }
+
+    evaluation = module.evaluate_non_alias_result(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["failure_count"] == 0
+
+
+def test_evaluate_non_alias_result_rejects_single_profile_strategy() -> None:
+    module = load_module()
+    result = {
+        "returncode": 0,
+        "summary": {
+            "robustness_acceptance_pass": True,
+            "coordinate_contract_summary": {
+                "all_scenarios_forbid_direct_axis_alias": True,
+            },
+            "deployment_strategy_recommendation": {
+                "deployment_strategy": "single_runtime_profile",
+                "single_profile_pass": True,
+            },
+            "runtime_label_selector_package": {
+                "status": "PASS",
+                "frontier_status": "PASS",
+                "operator_launch_status": "PASS",
+                "runtime_truth_used": False,
+            },
+        },
+    }
+
+    evaluation = module.evaluate_non_alias_result(result)
+
+    assert evaluation["status"] == "FAIL"
+    assert "deployment:strategy" in evaluation["failures"]
+    assert "deployment:single_profile_rejected" in evaluation["failures"]
