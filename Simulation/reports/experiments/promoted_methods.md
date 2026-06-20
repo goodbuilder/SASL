@@ -349,6 +349,15 @@ promoted as final Simulation PASS correction methods:
   abs `10.43 m`; seed `286418` remains outside the 10 m gate. Runtime truth was
   `false` and image/RDF/FRD contracts were explicit, so this is a performance
   tail failure rather than a coordinate-contract failure.
+- A finer 50-seed inverse-depth grid around the near-pass point improved the
+  best small-scale tail only slightly:
+  `causal_inverse_depth_prefilter_a0p86_b0p0001_uv999_id0p0005`, `49/50`,
+  target max abs `10.32 m`, still failing seed `286418`. Re-running the same
+  family at the default larger sample scale (`1680` samples, target oversample
+  `72`) did not validate the near-pass; the best result was
+  `causal_inverse_depth_prefilter_a0p84_b0p0005_uv999_id0p0005`, `47/50`,
+  target max abs `12.09 m`. Do not promote inverse-depth prefiltering without
+  a new tail-safe validation block.
 - Runtime alpha-beta motion fusion over the EXP198 base runtime profile is not
   a promising PASS branch. A fresh bbox-outlier smoke
   (`run_runtime_motion_fusion_sweep.py`, seeds `286000..286002`, RDF axes,
