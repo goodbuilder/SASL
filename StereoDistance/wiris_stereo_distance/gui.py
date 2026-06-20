@@ -10708,6 +10708,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                         missing.append(f"{self._px4_mag_camera_label(side)} {key}")
             if missing:
                 self._log("[픽스호크] ROS2 only 센서 미게시: " + ", ".join(missing))
+                QtCore.QTimer.singleShot(500, self._start_mavlink_sensor_auxiliary_if_needed)
             return
         topics = ", ".join(topic for _side, topic, _ok in checks)
         self.pixhawk_connection_label.setText("픽스호크 ROS2: topic 이름만 있음, PX4 publisher 없음")
@@ -10849,6 +10850,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         ]
         if not missing_sides:
             return
+        missing_sides = self._deduplicate_mavlink_auxiliary_sides(missing_sides)
+        if not missing_sides:
+            return
         subscriber = self._ensure_mavlink_subscriber()
         started: list[str] = []
         for side in missing_sides:
@@ -10874,6 +10878,35 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _start_mavlink_gps2_auxiliary_if_needed(self) -> None:
         self._start_mavlink_sensor_auxiliary_if_needed()
+
+    def _deduplicate_mavlink_auxiliary_sides(self, sides: Sequence[str]) -> list[str]:
+        selected: list[str] = []
+        by_url: dict[str, list[str]] = {}
+        for side in sides:
+            url_edit = self.left_mavlink_url_edit if side == "left" else self.right_mavlink_url_edit
+            url = url_edit.text().strip()
+            if not url:
+                continue
+            by_url.setdefault(url, []).append(side)
+        for url, url_sides in by_url.items():
+            if len(url_sides) == 1:
+                selected.append(url_sides[0])
+                continue
+            preferred = max(url_sides, key=self._mavlink_auxiliary_side_score)
+            labels = ", ".join(self._px4_mag_camera_label(side) for side in url_sides)
+            self._log(
+                f"[픽스호크] {labels} MAVLink URL이 동일합니다({url}). "
+                f"중복 serial open을 피하려고 {self._px4_mag_camera_label(preferred)} 보조 수신만 시작합니다."
+            )
+            selected.append(preferred)
+        return selected
+
+    def _mavlink_auxiliary_side_score(self, side: str) -> tuple[int, int, int]:
+        return (
+            1 if side in self._mavlink_connected_sides() else 0,
+            1 if self.latest_gps_sensors.get(side) or side in self.latest_gps else 0,
+            1 if side in self.latest_extrinsics else 0,
+        )
 
     def _configured_mavlink_sides(self) -> tuple[str, ...]:
         sides = []

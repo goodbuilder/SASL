@@ -2005,6 +2005,58 @@ def test_ros2_session_starts_mavlink_auxiliary_when_magnetometer_missing(monkeyp
     _ = app
 
 
+def test_mavlink_auxiliary_deduplicates_same_url_to_active_ros2_side(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import GpsSensorState
+
+    class FakeSignal:
+        def connect(self, _slot) -> None:
+            pass
+
+    class FakeMavlinkSubscriber:
+        def __init__(self, *args, **kwargs) -> None:
+            self.extrinsic_changed = FakeSignal()
+            self.gps_changed = FakeSignal()
+            self.mag_sensor_changed = FakeSignal()
+            self.gps_sensor_changed = FakeSignal()
+            self.gnss_relative_changed = FakeSignal()
+            self.custom_watch_changed = FakeSignal()
+            self.shell_output = FakeSignal()
+            self.status_changed = FakeSignal()
+            self.urls = {"left": kwargs.get("left_url", ""), "right": kwargs.get("right_url", "")}
+            self.baudrates = {"left": kwargs.get("left_baud", 57600), "right": kwargs.get("right_baud", 57600)}
+            self.connections = {}
+            self.started = []
+
+        def start(self, camera=None) -> None:
+            cameras = ("left", "right") if camera is None else (camera,)
+            for side in cameras:
+                if self.urls.get(side):
+                    self.connections[side] = object()
+                    self.started.append(side)
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk = object()
+    widget.left_mavlink_url_edit.setText("/dev/ttyACM0")
+    widget.right_mavlink_url_edit.setText("/dev/ttyACM0")
+    widget.latest_gps_sensors["right"] = {
+        "GPS1": GpsSensorState("right", "uav_1", "GPS1", 1.0, "/uav_1/fmu/out/vehicle_gps_position")
+    }
+
+    widget._start_mavlink_sensor_auxiliary_if_needed()
+
+    assert widget.mavlink_pixhawk is not None
+    assert widget.mavlink_pixhawk.started == ["right"]
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_ros2_only_alignment_marks_unpublished_gps2_and_mag_topics(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
