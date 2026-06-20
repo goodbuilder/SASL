@@ -346,6 +346,16 @@ promoted as final Simulation PASS correction methods:
   to `82.86 m` fused, and position RMSE worsening from about `4.99 m` raw to
   `92.54 m` fused. Runtime truth remained `false`, and the RDF/FRD contracts
   were explicit; the failure is performance, not a coordinate-contract gap.
+- Multi-burst observation plus alpha-beta motion fusion is also excluded as a
+  motion branch. A matching bbox-outlier smoke
+  (`run_runtime_multiburst_motion_fusion_sweep.py`, seeds `286100..286102`,
+  b7x3 trimmed-mean observation fusion, RDF alpha-beta grid) found the best
+  motion method `FAIL`, pass count `0/3`. The observation stage itself improved
+  range RMSE to about `0.39 m` and target max abs error to about `1.14 m`, but
+  the motion stage regressed range RMSE to about `83.17 m`, position RMSE to
+  about `92.61 m`, and target max abs error to about `74.62 m`. Keep the
+  promoted observation-fusion path; do not add this motion layer as a PASS
+  correction.
 - Registry slug `small_drone_multiburst_median_b1x3_sim3` is already covered
   by promoted candidate
   `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`;
