@@ -25,6 +25,13 @@ DEFAULT_ORIGIN_REPROJECTION_REPORT = (
 DEFAULT_SMALL_DRONE_REPORT = (
     ROOT_DIR / "reports" / "experiments" / "EXP-20260617-213-small-drone-observation-fusion"
 )
+DEFAULT_MULTIBURST_RESIDUAL_AGGREGATE_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260618-281-fresh-stereodistance-disparity-residual-search"
+    / "aggregate_summary"
+)
 SMALL_DRONE_PROMOTED_METHODS = [
     "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
     "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
@@ -148,9 +155,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--promoted-manifest-json", type=Path, default=DEFAULT_PROMOTED_MANIFEST)
     parser.add_argument("--origin-reprojection-report-dir", type=Path, default=DEFAULT_ORIGIN_REPROJECTION_REPORT)
     parser.add_argument("--small-drone-report-dir", type=Path, default=DEFAULT_SMALL_DRONE_REPORT)
+    parser.add_argument(
+        "--multiburst-residual-aggregate-report-dir",
+        type=Path,
+        default=DEFAULT_MULTIBURST_RESIDUAL_AGGREGATE_REPORT,
+    )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-small-drone-report", action="store_true")
     parser.add_argument("--skip-bbox-outlier-report", action="store_true")
+    parser.add_argument("--skip-multiburst-residual-aggregate-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -495,6 +508,121 @@ def compact_bbox_outlier_result(result: Mapping[str, object]) -> dict[str, objec
     }
 
 
+def run_multiburst_residual_aggregate_report_check(report_dir: Path) -> dict[str, object]:
+    summary_path = report_dir / "multiburst_disparity_residual_summary.json"
+    scenario_best_path = report_dir / "multiburst_disparity_residual_scenario_best.csv"
+    summary = load_json(summary_path) if summary_path.is_file() else {}
+    rows: list[dict[str, str]] = []
+    if scenario_best_path.is_file():
+        with scenario_best_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    return {
+        "report_dir": str(report_dir),
+        "summary_path": str(summary_path),
+        "scenario_best_path": str(scenario_best_path),
+        "summary": summary,
+        "rows": rows,
+    }
+
+
+def evaluate_multiburst_residual_aggregate_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    summary = result.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    best = summary.get("best_method", {})
+    if not isinstance(best, Mapping):
+        best = {}
+    rows = result.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+
+    require(summary.get("status") == "PASS", failures, "multiburst_residual:summary_status")
+    require(summary.get("scenario_count") == 4, failures, "multiburst_residual:scenario_count")
+    require(summary.get("runtime_truth_used") is False, failures, "multiburst_residual:runtime_truth")
+    require(best.get("all_scenarios_strict_pass") is True, failures, "multiburst_residual:all_scenarios_strict_pass")
+    require(int(float_value(best.get("strict_pass_scenario_count"))) == 4, failures, "multiburst_residual:strict_pass_count")
+    require(
+        best.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+        failures,
+        "multiburst_residual:rdf_axis_contract",
+    )
+    require(
+        best.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        failures,
+        "multiburst_residual:public_topic_contract",
+    )
+    require(best.get("runtime_truth_used") is False, failures, "multiburst_residual:best_runtime_truth")
+    observation_target_worst = float_value(best.get("target_max_abs_error_observation_worst_m"))
+    residual_target_worst = float_value(best.get("target_max_abs_error_residual_worst_m"))
+    observation_range_mean = float_value(best.get("range_rmse_observation_mean_across_scenarios_m"))
+    residual_range_mean = float_value(best.get("range_rmse_residual_mean_across_scenarios_m"))
+    observation_position_mean = float_value(best.get("position_rmse_observation_mean_across_scenarios_m"))
+    residual_position_mean = float_value(best.get("position_rmse_residual_mean_across_scenarios_m"))
+    require(residual_target_worst < observation_target_worst, failures, "multiburst_residual:target_worst_improvement")
+    require(residual_target_worst < 10.0, failures, "multiburst_residual:target_gate_10m")
+    require(residual_range_mean < observation_range_mean, failures, "multiburst_residual:range_improvement")
+    require(residual_position_mean < observation_position_mean, failures, "multiburst_residual:position_improvement")
+
+    scenario_pass_count = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if row.get("status") == "STRICT_PASS":
+            scenario_pass_count += 1
+        require(str(row.get("runtime_truth_used", "")).lower() == "false", failures, "multiburst_residual:row_runtime_truth")
+        require(
+            row.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+            failures,
+            "multiburst_residual:row_rdf_axis_contract",
+        )
+        require(
+            row.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            failures,
+            "multiburst_residual:row_public_topic_contract",
+        )
+    require(len(rows) == 4 and scenario_pass_count == 4, failures, "multiburst_residual:scenario_rows")
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "method": best.get("method", ""),
+        "acceptance_status": summary.get("status", ""),
+        "scenario_count": summary.get("scenario_count", 0),
+        "strict_pass_scenario_count": best.get("strict_pass_scenario_count", 0),
+        "target_max_abs_error_residual_worst_m": residual_target_worst,
+        "range_rmse_residual_mean_across_scenarios_m": residual_range_mean,
+        "position_rmse_residual_mean_across_scenarios_m": residual_position_mean,
+        "fusion_status": "multiburst_disparity_residual_aggregate",
+        "disparity_residual_status": "aggregate_saved_report",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_multiburst_residual_aggregate_result(result: Mapping[str, object]) -> dict[str, object]:
+    summary = result.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    best = summary.get("best_method", {})
+    if not isinstance(best, Mapping):
+        best = {}
+    rows = result.get("rows", [])
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "summary_path": result.get("summary_path", ""),
+        "scenario_best_path": result.get("scenario_best_path", ""),
+        "summary": {
+            "status": summary.get("status", ""),
+            "scenario_count": summary.get("scenario_count", 0),
+            "row_count": len(rows) if isinstance(rows, list) else 0,
+            "best_method": best.get("method", ""),
+            "runtime_truth_used": summary.get("runtime_truth_used", True),
+        },
+    }
+
+
 def run_package_check(
     *,
     output_dir: Path,
@@ -785,6 +913,19 @@ def main() -> int:
                     "evaluation": bbox_outlier_evaluation,
                 }
             )
+
+    if not args.skip_multiburst_residual_aggregate_report:
+        residual_aggregate_result = run_multiburst_residual_aggregate_report_check(
+            Path(args.multiburst_residual_aggregate_report_dir)
+        )
+        residual_aggregate_evaluation = evaluate_multiburst_residual_aggregate_report(residual_aggregate_result)
+        candidates.append(
+            {
+                "name": "multiburst_disparity_residual_aggregate_best",
+                "result": compact_multiburst_residual_aggregate_result(residual_aggregate_result),
+                "evaluation": residual_aggregate_evaluation,
+            }
+        )
 
     base_dir = output_dir / "observation_fusion"
     base_result = run_package_check(

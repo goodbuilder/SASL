@@ -308,6 +308,24 @@
       "promotion_limit": "bbox-outlier common-mode synthetic scenario only; not hardware/WIRIS validated"
     },
     {
+      "id": "multiburst_disparity_residual_aggregate_best",
+      "status": "PASS",
+      "scope": "simulation_multiburst_disparity_residual_aggregate_saved_report",
+      "method": "multiburst observation fusion b7x3 trim0.05 common0.5 + ray_scale log_disparity degree1 ridge1 clip0.5 residual",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary",
+        "summary_json": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary/multiburst_disparity_residual_summary.json",
+        "scenario_best_csv": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary/multiburst_disparity_residual_scenario_best.csv",
+        "scenario_pass": "4/4",
+        "target_worst_observation_to_residual_m": "5.0912 -> 2.4378",
+        "range_rmse_observation_to_residual_mean_m": "1.4179 -> 0.4052",
+        "position_rmse_observation_to_residual_mean_m": "2.7947 -> 1.8618"
+      },
+      "runtime_contract": "Residual coefficients are fit with calibration-time truth only; runtime application consumes fused measured_disparity_px/log_disparity and corrected stereo-center RDF right/down/forward, then publishes public FRD+range.",
+      "promotion_limit": "simulation aggregate residual evidence only; scenario-specific residual catalogs still require explicit deployment labels or truth-free selector guards"
+    },
+    {
       "id": "fresh_common_mode_b7x3_aggregate_best",
       "status": "PASS",
       "scope": "software_deployment_package",

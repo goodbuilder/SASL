@@ -272,6 +272,46 @@ def test_evaluate_bbox_outlier_report_rejects_target_gate_failure() -> None:
     assert "bbox_outlier:target_gate_10m" in evaluation["failures"]
 
 
+def test_evaluate_multiburst_residual_aggregate_report_accepts_pass() -> None:
+    module = load_module()
+    result = {
+        "summary": {
+            "status": "PASS",
+            "scenario_count": 4,
+            "runtime_truth_used": False,
+            "best_method": {
+                "method": "residual",
+                "all_scenarios_strict_pass": True,
+                "strict_pass_scenario_count": 4,
+                "target_max_abs_error_observation_worst_m": 5.0,
+                "target_max_abs_error_residual_worst_m": 2.0,
+                "range_rmse_observation_mean_across_scenarios_m": 1.0,
+                "range_rmse_residual_mean_across_scenarios_m": 0.4,
+                "position_rmse_observation_mean_across_scenarios_m": 2.0,
+                "position_rmse_residual_mean_across_scenarios_m": 1.0,
+                "runtime_truth_used": False,
+                "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+                "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            },
+        },
+        "rows": [
+            {
+                "status": "STRICT_PASS",
+                "runtime_truth_used": "False",
+                "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+                "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            }
+            for _ in range(4)
+        ],
+    }
+
+    evaluation = module.evaluate_multiburst_residual_aggregate_report(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["scenario_count"] == 4
+    assert evaluation["target_max_abs_error_residual_worst_m"] == 2.0
+
+
 def test_evaluate_package_result_rejects_missing_residual_apply() -> None:
     module = load_module()
     result = {
@@ -327,7 +367,7 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 19
+    assert len(default_candidates) == 20
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
@@ -347,6 +387,7 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
         "correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0",
         "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p25",
         "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
+        "multiburst_disparity_residual_aggregate_best",
         "fresh_common_mode_b7x3_aggregate_best",
         "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
     }

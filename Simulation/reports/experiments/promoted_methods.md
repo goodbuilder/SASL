@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=19`, `pass_count=19`,
+Expected result: `status=PASS`, `candidate_count=20`, `pass_count=20`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=20`, `pass_count=20`; the
+Expected result: `status=PASS`, `candidate_count=21`, `pass_count=21`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -142,6 +142,24 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Promotion status: simulation/software deployment candidate only; not
     hardware/WIRIS validated. Do not use this residual profile as an
     unconditional all-scenario residual; it is scenario-specific.
+
+- `multiburst_disparity_residual_aggregate_best`
+  - Status: `PASS`
+  - Experiment: `EXP-20260618-281-fresh-stereodistance-disparity-residual-search`
+  - Meaning: aggregate saved-report residual candidate after b7x3 observation
+    fusion. Calibration-time truth fits the residual coefficients; runtime
+    apply consumes fused disparity/log-disparity plus corrected stereo-center
+    RDF only.
+  - Evidence:
+    `aggregate_summary/multiburst_disparity_residual_summary.json` and
+    `multiburst_disparity_residual_scenario_best.csv`: 4/4 stress scenarios
+    `STRICT_PASS`, target worst improved `5.0912 -> 2.4378 m`, mean range RMSE
+    improved `1.4179 -> 0.4052 m`, mean position RMSE improved
+    `2.7947 -> 1.8618 m`, runtime truth `false`, and RDF/public topic contracts
+    explicit.
+  - Promotion status: simulation aggregate residual candidate only; residual
+    catalogs still require explicit deployment labels or truth-free selector
+    guards.
 
 - `fresh_common_mode_b7x3_aggregate_best`
   - Status: `PASS`
