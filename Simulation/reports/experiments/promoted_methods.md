@@ -202,10 +202,12 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Evidence:
     `runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_label_selector.json`,
     `disparity_residual_profile_catalog.csv`, four `selection_*.json` files,
-    four residual profiles, and `runtime_export_scenario_best/runtime_export_summary.json`.
+    four residual profiles, `runtime_export_scenario_best/runtime_export_summary.json`,
+    and `runtime_export_scenario_best/operator_view_launch_check_disparity_noise.json`.
     Current checker requires selector `PASS`, 4/4 label selections `PASS`,
     20/20 runtime-export checks `PASS`, runtime truth `false`, stereo-center
-    OpenCV optical RDF axis contracts, and public FRD+range topic contracts.
+    OpenCV optical RDF axis contracts, public FRD+range topic contracts, and
+    operator launch residual forwarding `PASS`.
   - Promotion status: simulation saved catalog candidate only; deploy only with
     explicit truth-free operator/deployment labels, not as an unconditional
     single all-scenario residual.

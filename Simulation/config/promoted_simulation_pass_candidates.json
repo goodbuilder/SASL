@@ -376,8 +376,10 @@
         "selector_json": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_label_selector.json",
         "catalog_csv": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_catalog.csv",
         "runtime_export_summary_json": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/runtime_export_summary.json",
+        "operator_launch_check_json": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/operator_view_launch_check_disparity_noise.json",
         "selection_pass": "4/4",
         "runtime_export_pass": "20/20",
+        "operator_launch_status": "PASS",
         "scenario_labels": [
           "bbox_outlier_stress",
           "combined_sensor_stress",

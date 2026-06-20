@@ -397,6 +397,13 @@ def test_evaluate_scenario_residual_catalog_accepts_label_selector_pass() -> Non
             "runtime_truth_used": False,
             "coordinate_contracts_explicit": True,
         },
+        "operator_launch": {
+            "status": "PASS",
+            "residual_label_selection_status": "PASS",
+            "residual_selected_label": "disparity_noise_stress",
+            "disparity_residual_arg_present": True,
+            "runtime_truth_used": False,
+        },
         "catalog_rows": [
             {
                 "profile_label": label,

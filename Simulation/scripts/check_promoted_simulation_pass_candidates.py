@@ -829,8 +829,10 @@ def run_scenario_residual_catalog_check(catalog_dir: Path) -> dict[str, object]:
     selector_path = catalog_dir / "disparity_residual_profile_label_selector.json"
     catalog_csv_path = catalog_dir / "disparity_residual_profile_catalog.csv"
     runtime_export_summary_path = catalog_dir.parent / "runtime_export_summary.json"
+    operator_launch_path = catalog_dir.parent / "operator_view_launch_check_disparity_noise.json"
     selector = load_json(selector_path) if selector_path.is_file() else {}
     runtime_export_summary = load_json(runtime_export_summary_path) if runtime_export_summary_path.is_file() else {}
+    operator_launch = load_json(operator_launch_path) if operator_launch_path.is_file() else {}
     catalog_rows: list[dict[str, str]] = []
     if catalog_csv_path.is_file():
         with catalog_csv_path.open(newline="", encoding="utf-8") as handle:
@@ -853,8 +855,10 @@ def run_scenario_residual_catalog_check(catalog_dir: Path) -> dict[str, object]:
         "selector_path": str(selector_path),
         "catalog_csv_path": str(catalog_csv_path),
         "runtime_export_summary_path": str(runtime_export_summary_path),
+        "operator_launch_path": str(operator_launch_path),
         "selector": selector,
         "runtime_export_summary": runtime_export_summary,
+        "operator_launch": operator_launch,
         "catalog_rows": catalog_rows,
         "selections": selections,
         "profiles": profiles,
@@ -869,6 +873,9 @@ def evaluate_scenario_residual_catalog(result: Mapping[str, object]) -> dict[str
     runtime_export_summary = result.get("runtime_export_summary", {})
     if not isinstance(runtime_export_summary, Mapping):
         runtime_export_summary = {}
+    operator_launch = result.get("operator_launch", {})
+    if not isinstance(operator_launch, Mapping):
+        operator_launch = {}
     catalog_rows = result.get("catalog_rows", [])
     if not isinstance(catalog_rows, list):
         catalog_rows = []
@@ -940,6 +947,23 @@ def evaluate_scenario_residual_catalog(result: Mapping[str, object]) -> dict[str
         failures,
         "scenario_residual_catalog:runtime_summary_pass_count",
     )
+    require(operator_launch.get("status") == "PASS", failures, "scenario_residual_catalog:operator_launch_status")
+    require(
+        operator_launch.get("residual_label_selection_status") == "PASS",
+        failures,
+        "scenario_residual_catalog:operator_residual_selection_status",
+    )
+    require(
+        operator_launch.get("residual_selected_label") == "disparity_noise_stress",
+        failures,
+        "scenario_residual_catalog:operator_residual_label",
+    )
+    require(
+        operator_launch.get("disparity_residual_arg_present") is True,
+        failures,
+        "scenario_residual_catalog:operator_residual_arg",
+    )
+    require(operator_launch.get("runtime_truth_used") is False, failures, "scenario_residual_catalog:operator_truth")
     require(len(catalog_rows) == 4, failures, "scenario_residual_catalog:catalog_row_count")
 
     selected_count = 0
@@ -993,6 +1017,7 @@ def evaluate_scenario_residual_catalog(result: Mapping[str, object]) -> dict[str
         "selected_pass_count": selected_count,
         "runtime_export_check_count": runtime_export_summary.get("check_count", 0),
         "runtime_export_pass_count": runtime_export_summary.get("pass_count", 0),
+        "operator_launch_status": operator_launch.get("status", ""),
         "fusion_status": "scenario_disparity_residual_catalog",
         "disparity_residual_status": "label_selector_saved_report",
         "runtime_truth_used": False,
@@ -1007,6 +1032,9 @@ def compact_scenario_residual_catalog_result(result: Mapping[str, object]) -> di
     runtime_export_summary = result.get("runtime_export_summary", {})
     if not isinstance(runtime_export_summary, Mapping):
         runtime_export_summary = {}
+    operator_launch = result.get("operator_launch", {})
+    if not isinstance(operator_launch, Mapping):
+        operator_launch = {}
     catalog_rows = result.get("catalog_rows", [])
     selections = result.get("selections", {})
     if not isinstance(selections, Mapping):
@@ -1016,11 +1044,13 @@ def compact_scenario_residual_catalog_result(result: Mapping[str, object]) -> di
         "selector_path": result.get("selector_path", ""),
         "catalog_csv_path": result.get("catalog_csv_path", ""),
         "runtime_export_summary_path": result.get("runtime_export_summary_path", ""),
+        "operator_launch_path": result.get("operator_launch_path", ""),
         "summary": {
             "selector_status": selector.get("status", ""),
             "catalog_row_count": len(catalog_rows) if isinstance(catalog_rows, list) else 0,
             "selection_count": len(selections),
             "runtime_export_status": runtime_export_summary.get("status", ""),
+            "operator_launch_status": operator_launch.get("status", ""),
             "runtime_truth_used": selector.get("runtime_truth_used", True),
         },
     }
