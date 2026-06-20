@@ -208,7 +208,9 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     from raw `1.851247 m` and observation `2.385011 m` to residual
     `0.223355 m`. An additional intrinsic-scale tail check on seeds
     `287500..287599` also passed `100/100`, with residual target max abs error
-    `1.199696 m`. Runtime truth was `false`; RDF and public FRD+range
+    `1.199696 m`. An additional bbox-outlier tail check on seeds
+    `287600..287699` passed `100/100`, with residual target max abs error
+    `4.067334 m`. Runtime truth was `false`; RDF and public FRD+range
     contracts were explicit.
   - Promotion status: Simulation software PASS candidate; not hardware/WIRIS
     validated and not yet wired into the promoted manifest checker.

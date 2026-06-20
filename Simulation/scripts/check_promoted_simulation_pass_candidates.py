@@ -64,6 +64,7 @@ ALL_SCENARIO_RESIDUAL_SCENARIOS = {
     "disparity_noise_stress": (50, 287450, 287499),
     "intrinsic_scale_stress": (50, 287200, 287249),
     "intrinsic_scale_stress_fresh100": (100, 287500, 287599),
+    "bbox_outlier_stress_fresh100": (100, 287600, 287699),
 }
 SMALL_DRONE_PROMOTED_METHODS = [
     "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",

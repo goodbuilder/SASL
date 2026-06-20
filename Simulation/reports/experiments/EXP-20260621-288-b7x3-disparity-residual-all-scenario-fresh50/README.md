@@ -40,3 +40,10 @@ Additional tail check: `intrinsic_scale_stress_fresh100` reran the same method
 on seeds `287500..287599` and passed `100/100` with range RMSE
 `1.852460 -> 2.388347 -> 0.224077 m`, position RMSE
 `2.395674 -> 0.292032 m`, and residual target max abs `1.199696 m`.
+
+Additional bbox-outlier tail check: `bbox_outlier_stress_fresh100` reran the
+same method on seeds `287600..287699` and passed `100/100` with range RMSE
+`2.605711 -> 0.405026 -> 0.400922 m`, position RMSE
+`0.422627 -> 0.418697 m`, and residual target max abs `4.067334 m`. The
+residual target maximum is slightly worse than observation-only (`3.980994 m`)
+but remains inside the 10 m final gate while range/position gates pass.
