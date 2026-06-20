@@ -5,6 +5,9 @@ correction.
 
 ## Repo-Local Recheck
 
+Machine-readable candidate manifest:
+`Simulation/config/promoted_simulation_pass_candidates.json`.
+
 Run the current repo-local software deployment PASS gate with:
 
 ```bash

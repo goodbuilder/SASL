@@ -8,6 +8,7 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT_DIR / "scripts" / "check_promoted_simulation_pass_candidates.py"
+PROMOTED_MANIFEST_PATH = ROOT_DIR / "config" / "promoted_simulation_pass_candidates.json"
 
 
 def load_module():
@@ -134,6 +135,24 @@ def test_write_outputs_records_candidate_status(tmp_path: Path) -> None:
     text = (tmp_path / "promoted_simulation_pass_candidates_check.txt").read_text(encoding="utf-8")
     assert saved["status"] == "PASS"
     assert "candidate: status=PASS" in text
+
+
+def test_promoted_manifest_declares_checker_candidate_sets() -> None:
+    manifest = json.loads(PROMOTED_MANIFEST_PATH.read_text(encoding="utf-8"))
+    candidates = manifest["candidates"]
+    default_candidates = [row for row in candidates if row.get("checker_included_by_default") is True]
+    optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
+
+    assert manifest["hardware_validated_complete_all_axis"] is False
+    assert len(default_candidates) == 3
+    assert len(optional_candidates) == 1
+    assert {row["id"] for row in default_candidates} == {
+        "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
+        "fresh_common_mode_b7x3_aggregate_best",
+        "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
+    }
+    assert optional_candidates[0]["id"] == "non_alias_scenario_profile_catalog_label_selector"
+    assert optional_candidates[0]["checker_option"] == "--include-non-alias-smoke"
 
 
 def test_evaluate_non_alias_result_accepts_catalog_selector_pass() -> None:

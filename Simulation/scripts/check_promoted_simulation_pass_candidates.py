@@ -16,6 +16,7 @@ PACKAGE_SCRIPT = ROOT_DIR / "scripts" / "run_observation_fusion_deployment_packa
 ROBUSTNESS_SCRIPT = ROOT_DIR / "scripts" / "run_rtk_stereo_robustness_sweep.py"
 DEFAULT_TIER_SPEC = ROOT_DIR / "config" / "observation_fusion_fresh_deployment_tiers.json"
 DEFAULT_RESIDUAL_PROFILE = ROOT_DIR / "config" / "disparity_residual_profile_disparity_noise_stress.json"
+DEFAULT_PROMOTED_MANIFEST = ROOT_DIR / "config" / "promoted_simulation_pass_candidates.json"
 DEFAULT_ORIGIN_REPROJECTION_REPORT = (
     ROOT_DIR
     / "reports"
@@ -30,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--tier-spec-json", type=Path, default=DEFAULT_TIER_SPEC)
     parser.add_argument("--disparity-residual-profile-json", type=Path, default=DEFAULT_RESIDUAL_PROFILE)
+    parser.add_argument("--promoted-manifest-json", type=Path, default=DEFAULT_PROMOTED_MANIFEST)
     parser.add_argument("--origin-reprojection-report-dir", type=Path, default=DEFAULT_ORIGIN_REPROJECTION_REPORT)
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
@@ -473,6 +475,7 @@ def main() -> int:
         "failure_count": failure_count,
         "tier_spec_json": str(tier_spec_json),
         "disparity_residual_profile_json": "" if residual_profile_json is None else str(residual_profile_json),
+        "promoted_manifest_json": str(Path(args.promoted_manifest_json)),
         "runtime_truth_used": False,
         "coordinate_contracts_explicit": True,
         "candidates": candidates,

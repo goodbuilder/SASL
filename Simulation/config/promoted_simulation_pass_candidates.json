@@ -1,0 +1,86 @@
+{
+  "manifest": "promoted_simulation_pass_candidates",
+  "version": 1,
+  "hardware_validated_complete_all_axis": false,
+  "default_recheck_command": "python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py --output-dir /tmp/sasl_promoted_pass_candidates_check",
+  "extended_recheck_command": "python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py --output-dir /tmp/sasl_promoted_pass_candidates_check_with_non_alias --include-non-alias-smoke",
+  "coordinate_contract": {
+    "internal_measurement_frame": "stereo-center RDF right/down/forward",
+    "public_stereodistance_frame": "FRD+range forward/right/down/range",
+    "truth_transform_requirement": "truth_rdf must come from explicit T_source_to_stereo_rdf or an already stereo-frame producer; direct NED-to-RDF alias is forbidden",
+    "runtime_truth_used": false
+  },
+  "candidates": [
+    {
+      "id": "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
+      "status": "PASS",
+      "scope": "simulation_origin_saved_report",
+      "method": "origin-bbox-reprojection-grid-v1 + component_gains + range_only_forward_fusion",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625",
+        "result_txt": "Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625/result.txt",
+        "validation_gate_summary_csv": "Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625/validation_gate_summary.csv",
+        "final_pass": true,
+        "validation_trial_pass": "5/5",
+        "validation_sample_count": 1944,
+        "min_right_rmse_improvement_m": 0.00006538888756901784,
+        "min_down_rmse_improvement_m": 0.0021987374456409192,
+        "min_forward_rmse_improvement_m": 3.436332772030994
+      },
+      "runtime_contract": "Simulation-origin oracle-style validation; reprojection profile records corrected bbox diagnostics and uses raw Right/Down plus corrected Forward under range_only_forward_fusion.",
+      "promotion_limit": "simulation evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "fresh_common_mode_b7x3_aggregate_best",
+      "status": "PASS",
+      "scope": "software_deployment_package",
+      "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p2_common0p5",
+      "checker_included_by_default": true,
+      "evidence": {
+        "tier_spec_json": "Simulation/config/observation_fusion_fresh_deployment_tiers.json",
+        "tier_evidence_csv": "Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv",
+        "expected_acceptance_status": "PASS",
+        "expected_node_fusion_status": "fused:MultiBurstObservationFusion:21"
+      },
+      "runtime_contract": "Runtime adapter consumes image u/v and measured disparity, then emits stereo-center RDF right/down/forward before public FRD+range publishing.",
+      "promotion_limit": "simulation/software deployment evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
+      "status": "PASS",
+      "scope": "software_deployment_package_scenario_residual",
+      "method": "fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual",
+      "checker_included_by_default": true,
+      "evidence": {
+        "tier_spec_json": "Simulation/config/observation_fusion_fresh_deployment_tiers.json",
+        "tier_evidence_csv": "Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv",
+        "disparity_residual_profile_json": "Simulation/config/disparity_residual_profile_disparity_noise_stress.json",
+        "expected_acceptance_status": "PASS",
+        "expected_node_fusion_status": "fused:MultiBurstObservationFusion:21",
+        "expected_residual_status_prefix": "applied:"
+      },
+      "runtime_contract": "Residual apply consumes fused measured_disparity_px and corrected stereo-center RDF only.",
+      "promotion_limit": "scenario-specific residual; do not deploy as unconditional all-scenario residual"
+    },
+    {
+      "id": "non_alias_scenario_profile_catalog_label_selector",
+      "status": "PASS",
+      "scope": "simulation_software_catalog_selector",
+      "method": "scenario profile catalog selected by explicit deployment/scenario label",
+      "checker_included_by_default": false,
+      "checker_option": "--include-non-alias-smoke",
+      "evidence": {
+        "expected_robustness_acceptance_pass": true,
+        "expected_deployment_strategy": "scenario_profile_catalog",
+        "expected_single_profile_pass": false,
+        "expected_scenario_catalog_profiles": 6,
+        "expected_scenario_catalog_promotion_pass_count": 6,
+        "expected_selector_package_status": "PASS",
+        "expected_operator_launch": "19/19"
+      },
+      "runtime_contract": "Runtime selection uses explicit deployment/scenario labels only; it must not inspect PX4/RTK/NED truth, validation errors, target-window labels, or replay metrics.",
+      "promotion_limit": "simulation/software catalog evidence only; not hardware/WIRIS validated"
+    }
+  ]
+}
