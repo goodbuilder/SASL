@@ -191,6 +191,26 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     catalogs still require explicit deployment labels or truth-free selector
     guards.
 
+- `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_deg2_ridge0_clip0p25`
+  - Status: `STRICT_PASS`
+  - Experiment:
+    `EXP-20260621-288-b7x3-disparity-residual-all-scenario-fresh50`
+  - Meaning: single six-scenario Simulation candidate combining 7x3
+    trimmed-mean observation fusion with a degree-2 disparity polynomial
+    ray-scale residual. Calibration-time fitting uses train-split truth;
+    runtime application consumes fused measured disparity and corrected
+    stereo-center RDF only.
+  - Evidence: six fresh 50-seed scenario blocks all passed, `300/300` total:
+    nominal (`287250..287299`), yaw/pitch (`287300..287349`), bbox-outlier
+    (`287350..287399`), combined-sensor (`287400..287449`), disparity-noise
+    (`287450..287499`), and intrinsic-scale (`287200..287249`). Worst residual
+    target max abs error was `3.382935 m`; intrinsic-scale range RMSE recovered
+    from raw `1.851247 m` and observation `2.385011 m` to residual
+    `0.223355 m`. Runtime truth was `false`; RDF and public FRD+range
+    contracts were explicit.
+  - Promotion status: Simulation software PASS candidate; not hardware/WIRIS
+    validated and not yet wired into the promoted manifest checker.
+
 - `scenario_labeled_disparity_residual_profile_catalog_exp281`
   - Status: `PASS`
   - Experiment: `EXP-20260618-281-fresh-stereodistance-disparity-residual-search`
