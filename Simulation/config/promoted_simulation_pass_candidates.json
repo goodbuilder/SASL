@@ -366,6 +366,29 @@
       "promotion_limit": "simulation aggregate residual evidence only; scenario-specific residual catalogs still require explicit deployment labels or truth-free selector guards"
     },
     {
+      "id": "scenario_labeled_disparity_residual_profile_catalog_exp281",
+      "status": "PASS",
+      "scope": "simulation_disparity_residual_catalog_saved_report",
+      "method": "scenario-labeled disparity residual profile catalog selected by explicit deployment/scenario label",
+      "checker_included_by_default": true,
+      "evidence": {
+        "catalog_dir": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog",
+        "selector_json": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_label_selector.json",
+        "catalog_csv": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_catalog.csv",
+        "runtime_export_summary_json": "Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/runtime_export_summary.json",
+        "selection_pass": "4/4",
+        "runtime_export_pass": "20/20",
+        "scenario_labels": [
+          "bbox_outlier_stress",
+          "combined_sensor_stress",
+          "disparity_noise_stress",
+          "intrinsic_scale_stress"
+        ]
+      },
+      "runtime_contract": "Runtime residual profile selection uses explicit deployment_label/scenario_label/scenario_name only. Selected profiles consume measured disparity and corrected stereo-center RDF right/down/forward, then publish public FRD+range.",
+      "promotion_limit": "scenario-labeled residual catalog evidence only; deploy only with explicit truth-free operator/deployment labels, not as an unconditional single all-scenario residual"
+    },
+    {
       "id": "fresh_common_mode_b7x3_aggregate_best",
       "status": "PASS",
       "scope": "software_deployment_package",

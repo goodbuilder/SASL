@@ -365,6 +365,72 @@ def test_evaluate_multiburst_residual_aggregate_report_accepts_pass() -> None:
     assert evaluation["target_max_abs_error_residual_worst_m"] == 2.0
 
 
+def test_evaluate_scenario_residual_catalog_accepts_label_selector_pass() -> None:
+    module = load_module()
+    labels = [
+        "bbox_outlier_stress",
+        "combined_sensor_stress",
+        "disparity_noise_stress",
+        "intrinsic_scale_stress",
+    ]
+    result = {
+        "selector": {
+            "mode": "stereodistance_disparity_residual_profile_label_selector",
+            "status": "PASS",
+            "profile_paths": {label: f"profiles/{label}.json" for label in labels},
+            "selection_input_fields": ["deployment_label", "scenario_label", "scenario_name"],
+            "forbidden_runtime_fields": [
+                "px4_local_position",
+                "rtk_truth",
+                "calibration_truth",
+                "validation_error",
+            ],
+            "runtime_truth_used": False,
+            "coordinate_contracts_explicit": True,
+            "axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+            "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        },
+        "runtime_export_summary": {
+            "status": "PASS",
+            "check_count": 20,
+            "pass_count": 20,
+            "runtime_truth_used": False,
+            "coordinate_contracts_explicit": True,
+        },
+        "catalog_rows": [
+            {
+                "profile_label": label,
+                "runtime_truth_used": "False",
+            }
+            for label in labels
+        ],
+        "selections": {
+            label: {
+                "status": "PASS",
+                "selected_label": label,
+                "label_selection_applied": True,
+                "runtime_truth_used": False,
+            }
+            for label in labels
+        },
+        "profiles": {
+            label: {
+                "profile_type": "DisparityResidualRuntimeProfile",
+                "runtime_truth_used": False,
+                "runtime_input_contract": "exported residual profile consumes runtime measurements",
+                "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+                "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            }
+            for label in labels
+        },
+    }
+
+    evaluation = module.evaluate_scenario_residual_catalog(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["selected_pass_count"] == 4
+
+
 def test_evaluate_package_result_rejects_missing_residual_apply() -> None:
     module = load_module()
     result = {
@@ -420,7 +486,7 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 22
+    assert len(default_candidates) == 23
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
@@ -443,6 +509,7 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
         "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p25",
         "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
         "multiburst_disparity_residual_aggregate_best",
+        "scenario_labeled_disparity_residual_profile_catalog_exp281",
         "fresh_common_mode_b7x3_aggregate_best",
         "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
     }

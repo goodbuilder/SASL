@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=22`, `pass_count=22`,
+Expected result: `status=PASS`, `candidate_count=23`, `pass_count=23`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=23`, `pass_count=23`; the
+Expected result: `status=PASS`, `candidate_count=24`, `pass_count=24`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -190,6 +190,25 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Promotion status: simulation aggregate residual candidate only; residual
     catalogs still require explicit deployment labels or truth-free selector
     guards.
+
+- `scenario_labeled_disparity_residual_profile_catalog_exp281`
+  - Status: `PASS`
+  - Experiment: `EXP-20260618-281-fresh-stereodistance-disparity-residual-search`
+  - Meaning: saved runtime-export residual profile catalog for four stress
+    scenarios. Runtime selection uses explicit `deployment_label`,
+    `scenario_label`, or `scenario_name` only; it must not inspect PX4/RTK
+    truth, validation errors, target-window labels, true disparity, or true
+    image features.
+  - Evidence:
+    `runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_label_selector.json`,
+    `disparity_residual_profile_catalog.csv`, four `selection_*.json` files,
+    four residual profiles, and `runtime_export_scenario_best/runtime_export_summary.json`.
+    Current checker requires selector `PASS`, 4/4 label selections `PASS`,
+    20/20 runtime-export checks `PASS`, runtime truth `false`, stereo-center
+    OpenCV optical RDF axis contracts, and public FRD+range topic contracts.
+  - Promotion status: simulation saved catalog candidate only; deploy only with
+    explicit truth-free operator/deployment labels, not as an unconditional
+    single all-scenario residual.
 
 - `fresh_common_mode_b7x3_aggregate_best`
   - Status: `PASS`

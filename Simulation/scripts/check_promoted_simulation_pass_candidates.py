@@ -38,6 +38,14 @@ DEFAULT_MULTIBURST_RESIDUAL_AGGREGATE_REPORT = (
     / "EXP-20260618-281-fresh-stereodistance-disparity-residual-search"
     / "aggregate_summary"
 )
+DEFAULT_SCENARIO_RESIDUAL_CATALOG_DIR = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260618-281-fresh-stereodistance-disparity-residual-search"
+    / "runtime_export_scenario_best"
+    / "scenario_residual_catalog"
+)
 SMALL_DRONE_PROMOTED_METHODS = [
     "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
     "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
@@ -168,12 +176,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_MULTIBURST_RESIDUAL_AGGREGATE_REPORT,
     )
+    parser.add_argument(
+        "--scenario-residual-catalog-dir",
+        type=Path,
+        default=DEFAULT_SCENARIO_RESIDUAL_CATALOG_DIR,
+    )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
     parser.add_argument("--skip-origin-bbox-output-report", action="store_true")
     parser.add_argument("--skip-small-drone-report", action="store_true")
     parser.add_argument("--skip-bbox-outlier-report", action="store_true")
     parser.add_argument("--skip-multiburst-residual-aggregate-report", action="store_true")
+    parser.add_argument("--skip-scenario-residual-catalog", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -811,6 +825,207 @@ def compact_multiburst_residual_aggregate_result(result: Mapping[str, object]) -
     }
 
 
+def run_scenario_residual_catalog_check(catalog_dir: Path) -> dict[str, object]:
+    selector_path = catalog_dir / "disparity_residual_profile_label_selector.json"
+    catalog_csv_path = catalog_dir / "disparity_residual_profile_catalog.csv"
+    runtime_export_summary_path = catalog_dir.parent / "runtime_export_summary.json"
+    selector = load_json(selector_path) if selector_path.is_file() else {}
+    runtime_export_summary = load_json(runtime_export_summary_path) if runtime_export_summary_path.is_file() else {}
+    catalog_rows: list[dict[str, str]] = []
+    if catalog_csv_path.is_file():
+        with catalog_csv_path.open(newline="", encoding="utf-8") as handle:
+            catalog_rows = list(csv.DictReader(handle))
+
+    profile_paths = selector.get("profile_paths", {})
+    if not isinstance(profile_paths, Mapping):
+        profile_paths = {}
+    selections: dict[str, object] = {}
+    profiles: dict[str, object] = {}
+    for label, profile_rel in profile_paths.items():
+        label_text = str(label)
+        selection_path = catalog_dir / f"selection_{label_text}.json"
+        profile_path = catalog_dir / str(profile_rel)
+        selections[label_text] = load_json(selection_path) if selection_path.is_file() else {}
+        profiles[label_text] = load_json(profile_path) if profile_path.is_file() else {}
+
+    return {
+        "catalog_dir": str(catalog_dir),
+        "selector_path": str(selector_path),
+        "catalog_csv_path": str(catalog_csv_path),
+        "runtime_export_summary_path": str(runtime_export_summary_path),
+        "selector": selector,
+        "runtime_export_summary": runtime_export_summary,
+        "catalog_rows": catalog_rows,
+        "selections": selections,
+        "profiles": profiles,
+    }
+
+
+def evaluate_scenario_residual_catalog(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    selector = result.get("selector", {})
+    if not isinstance(selector, Mapping):
+        selector = {}
+    runtime_export_summary = result.get("runtime_export_summary", {})
+    if not isinstance(runtime_export_summary, Mapping):
+        runtime_export_summary = {}
+    catalog_rows = result.get("catalog_rows", [])
+    if not isinstance(catalog_rows, list):
+        catalog_rows = []
+    selections = result.get("selections", {})
+    if not isinstance(selections, Mapping):
+        selections = {}
+    profiles = result.get("profiles", {})
+    if not isinstance(profiles, Mapping):
+        profiles = {}
+
+    expected_labels = {
+        "bbox_outlier_stress",
+        "combined_sensor_stress",
+        "disparity_noise_stress",
+        "intrinsic_scale_stress",
+    }
+    profile_paths = selector.get("profile_paths", {})
+    if not isinstance(profile_paths, Mapping):
+        profile_paths = {}
+
+    require(selector.get("status") == "PASS", failures, "scenario_residual_catalog:selector_status")
+    require(
+        selector.get("mode") == "stereodistance_disparity_residual_profile_label_selector",
+        failures,
+        "scenario_residual_catalog:selector_mode",
+    )
+    require(selector.get("runtime_truth_used") is False, failures, "scenario_residual_catalog:selector_runtime_truth")
+    require(
+        selector.get("coordinate_contracts_explicit") is True,
+        failures,
+        "scenario_residual_catalog:selector_coordinate_contract",
+    )
+    require(
+        selector.get("axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+        failures,
+        "scenario_residual_catalog:selector_axis_contract",
+    )
+    require(
+        selector.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        failures,
+        "scenario_residual_catalog:selector_public_topic_contract",
+    )
+    require(
+        set(selector.get("selection_input_fields", [])) == {"deployment_label", "scenario_label", "scenario_name"},
+        failures,
+        "scenario_residual_catalog:selection_inputs",
+    )
+    forbidden_fields = set(selector.get("forbidden_runtime_fields", []))
+    require(
+        {"px4_local_position", "rtk_truth", "calibration_truth", "validation_error"}.issubset(forbidden_fields),
+        failures,
+        "scenario_residual_catalog:forbidden_runtime_fields",
+    )
+    require(set(profile_paths.keys()) == expected_labels, failures, "scenario_residual_catalog:profile_labels")
+    require(runtime_export_summary.get("status") == "PASS", failures, "scenario_residual_catalog:runtime_summary_status")
+    require(
+        runtime_export_summary.get("runtime_truth_used") is False,
+        failures,
+        "scenario_residual_catalog:runtime_summary_truth",
+    )
+    require(
+        runtime_export_summary.get("coordinate_contracts_explicit") is True,
+        failures,
+        "scenario_residual_catalog:runtime_summary_coordinate_contract",
+    )
+    require(
+        int(float_value(runtime_export_summary.get("check_count"))) == 20
+        and int(float_value(runtime_export_summary.get("pass_count"))) == 20,
+        failures,
+        "scenario_residual_catalog:runtime_summary_pass_count",
+    )
+    require(len(catalog_rows) == 4, failures, "scenario_residual_catalog:catalog_row_count")
+
+    selected_count = 0
+    for label in sorted(expected_labels):
+        selection = selections.get(label, {})
+        if not isinstance(selection, Mapping):
+            selection = {}
+        profile = profiles.get(label, {})
+        if not isinstance(profile, Mapping):
+            profile = {}
+        row = next((row for row in catalog_rows if isinstance(row, Mapping) and row.get("profile_label") == label), {})
+        require(selection.get("status") == "PASS", failures, f"scenario_residual_catalog:{label}:selection_status")
+        require(selection.get("selected_label") == label, failures, f"scenario_residual_catalog:{label}:selected_label")
+        require(
+            selection.get("label_selection_applied") is True,
+            failures,
+            f"scenario_residual_catalog:{label}:selection_applied",
+        )
+        require(selection.get("runtime_truth_used") is False, failures, f"scenario_residual_catalog:{label}:runtime_truth")
+        require(profile.get("profile_type") == "DisparityResidualRuntimeProfile", failures, f"scenario_residual_catalog:{label}:profile_type")
+        require(profile.get("runtime_truth_used") is False, failures, f"scenario_residual_catalog:{label}:profile_runtime_truth")
+        require(
+            profile.get("runtime_input_contract", "").startswith("exported residual profile"),
+            failures,
+            f"scenario_residual_catalog:{label}:runtime_input_contract",
+        )
+        require(
+            profile.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+            failures,
+            f"scenario_residual_catalog:{label}:rdf_axis_contract",
+        )
+        require(
+            profile.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            failures,
+            f"scenario_residual_catalog:{label}:public_topic_contract",
+        )
+        require(
+            str(row.get("runtime_truth_used", "")).lower() == "false",
+            failures,
+            f"scenario_residual_catalog:{label}:catalog_runtime_truth",
+        )
+        if selection.get("status") == "PASS":
+            selected_count += 1
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "acceptance_status": selector.get("status", ""),
+        "scenario_count": len(expected_labels),
+        "selected_pass_count": selected_count,
+        "runtime_export_check_count": runtime_export_summary.get("check_count", 0),
+        "runtime_export_pass_count": runtime_export_summary.get("pass_count", 0),
+        "fusion_status": "scenario_disparity_residual_catalog",
+        "disparity_residual_status": "label_selector_saved_report",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_scenario_residual_catalog_result(result: Mapping[str, object]) -> dict[str, object]:
+    selector = result.get("selector", {})
+    if not isinstance(selector, Mapping):
+        selector = {}
+    runtime_export_summary = result.get("runtime_export_summary", {})
+    if not isinstance(runtime_export_summary, Mapping):
+        runtime_export_summary = {}
+    catalog_rows = result.get("catalog_rows", [])
+    selections = result.get("selections", {})
+    if not isinstance(selections, Mapping):
+        selections = {}
+    return {
+        "catalog_dir": result.get("catalog_dir", ""),
+        "selector_path": result.get("selector_path", ""),
+        "catalog_csv_path": result.get("catalog_csv_path", ""),
+        "runtime_export_summary_path": result.get("runtime_export_summary_path", ""),
+        "summary": {
+            "selector_status": selector.get("status", ""),
+            "catalog_row_count": len(catalog_rows) if isinstance(catalog_rows, list) else 0,
+            "selection_count": len(selections),
+            "runtime_export_status": runtime_export_summary.get("status", ""),
+            "runtime_truth_used": selector.get("runtime_truth_used", True),
+        },
+    }
+
+
 def run_package_check(
     *,
     output_dir: Path,
@@ -1134,6 +1349,17 @@ def main() -> int:
                 "name": "multiburst_disparity_residual_aggregate_best",
                 "result": compact_multiburst_residual_aggregate_result(residual_aggregate_result),
                 "evaluation": residual_aggregate_evaluation,
+            }
+        )
+
+    if not args.skip_scenario_residual_catalog:
+        scenario_catalog_result = run_scenario_residual_catalog_check(Path(args.scenario_residual_catalog_dir))
+        scenario_catalog_evaluation = evaluate_scenario_residual_catalog(scenario_catalog_result)
+        candidates.append(
+            {
+                "name": "scenario_labeled_disparity_residual_profile_catalog_exp281",
+                "result": compact_scenario_residual_catalog_result(scenario_catalog_result),
+                "evaluation": scenario_catalog_evaluation,
             }
         )
 
