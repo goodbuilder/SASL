@@ -58,8 +58,38 @@ BBOX_OUTLIER_PROMOTED_METHODS = [
         "metrics_json": "repeated_observation_metrics.json",
     },
     {
+        "method": "repeated_observation_trimmed_mean_n15_trim0p1",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-203-bbox-outlier-n15-trim0p1",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n15_trim0p3",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-204-bbox-outlier-n15-trim0p3",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n15_trim0p4",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-205-bbox-outlier-n15-trim0p4",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n21_trim0p2",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-206-bbox-outlier-n21-trim0p2",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
         "method": "repeated_observation_trimmed_mean_n31_trim0p2",
         "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-207-bbox-outlier-n31-trim0p2",
+        "summary_csv": "repeated_observation_method_summary.csv",
+        "metrics_json": "repeated_observation_metrics.json",
+    },
+    {
+        "method": "repeated_observation_trimmed_mean_n51_trim0p2",
+        "report_dir": ROOT_DIR / "reports" / "experiments" / "EXP-20260617-208-bbox-outlier-n51-trim0p2",
         "summary_csv": "repeated_observation_method_summary.csv",
         "metrics_json": "repeated_observation_metrics.json",
     },

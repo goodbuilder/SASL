@@ -121,6 +121,74 @@
       "promotion_limit": "bbox-outlier synthetic scenario only; independence and latency must be validated before hardware use"
     },
     {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p1",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.1",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-203-bbox-outlier-n15-trim0p1",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-203-bbox-outlier-n15-trim0p1/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2371",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2622",
+        "target_max_abs_error_m": 1.5324440793920076
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic n15 trim-sensitivity candidate only; trim0.2 remains the stronger n15 default"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p3",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.3",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-204-bbox-outlier-n15-trim0p3",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-204-bbox-outlier-n15-trim0p3/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2249",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2507",
+        "target_max_abs_error_m": 1.1750158595118592
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic n15 trim-sensitivity candidate only; trim0.2 remains the stronger n15 default"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p4",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.4",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-205-bbox-outlier-n15-trim0p4",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-205-bbox-outlier-n15-trim0p4/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2370",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2616",
+        "target_max_abs_error_m": 1.18871662966626
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic n15 trim-sensitivity candidate only; trim0.2 remains the stronger n15 default"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n21_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=21, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-206-bbox-outlier-n21-trim0p2",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-206-bbox-outlier-n21-trim0p2/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1937",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2231",
+        "target_max_abs_error_m": 0.9268674399672818
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic quality candidate only; observation count requires latency validation"
+    },
+    {
       "id": "repeated_observation_trimmed_mean_n31_trim0p2",
       "status": "STRICT_PASS",
       "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
@@ -136,6 +204,23 @@
       },
       "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
       "promotion_limit": "bbox-outlier synthetic quality candidate only; high observation count requires latency validation"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n51_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=51, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260617-208-bbox-outlier-n51-trim0p2",
+        "method_summary_csv": "Simulation/reports/experiments/EXP-20260617-208-bbox-outlier-n51-trim0p2/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1455",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.1825",
+        "target_max_abs_error_m": 0.802752453134417
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic upper-bound candidate only; high observation count requires latency validation"
     },
     {
       "id": "repeated_observation_trimmed_mean_n75_trim0p2",

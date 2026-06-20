@@ -327,7 +327,7 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 14
+    assert len(default_candidates) == 19
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
@@ -336,7 +336,12 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
         "repeated_observation_median_n3_trim0p2",
         "repeated_observation_median_n7_trim0p2",
         "repeated_observation_trimmed_mean_n15_trim0p2",
+        "repeated_observation_trimmed_mean_n15_trim0p1",
+        "repeated_observation_trimmed_mean_n15_trim0p3",
+        "repeated_observation_trimmed_mean_n15_trim0p4",
+        "repeated_observation_trimmed_mean_n21_trim0p2",
         "repeated_observation_trimmed_mean_n31_trim0p2",
+        "repeated_observation_trimmed_mean_n51_trim0p2",
         "repeated_observation_trimmed_mean_n75_trim0p2",
         "correlated_repeated_observation_trimmed_mean_n15_trim0p2_common0",
         "correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0",

@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=14`, `pass_count=14`,
+Expected result: `status=PASS`, `candidate_count=19`, `pass_count=19`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=15`, `pass_count=15`; the
+Expected result: `status=PASS`, `candidate_count=20`, `pass_count=20`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -85,7 +85,12 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Experiments:
     `EXP-20260617-201-bbox-outlier-repeated-observation-fusion`,
     `EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended`,
+    `EXP-20260617-203-bbox-outlier-n15-trim0p1`,
+    `EXP-20260617-204-bbox-outlier-n15-trim0p3`,
+    `EXP-20260617-205-bbox-outlier-n15-trim0p4`,
+    `EXP-20260617-206-bbox-outlier-n21-trim0p2`,
     `EXP-20260617-207-bbox-outlier-n31-trim0p2`,
+    `EXP-20260617-208-bbox-outlier-n51-trim0p2`,
     `EXP-20260617-209-bbox-outlier-n75-trim0p2`, and
     `EXP-20260617-210-bbox-outlier-correlated-repeated-observation`,
     `EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion`, and
@@ -94,7 +99,12 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `repeated_observation_median_n3_trim0p2`,
     `repeated_observation_median_n7_trim0p2`,
     `repeated_observation_trimmed_mean_n15_trim0p2`,
+    `repeated_observation_trimmed_mean_n15_trim0p1`,
+    `repeated_observation_trimmed_mean_n15_trim0p3`,
+    `repeated_observation_trimmed_mean_n15_trim0p4`,
+    `repeated_observation_trimmed_mean_n21_trim0p2`,
     `repeated_observation_trimmed_mean_n31_trim0p2`,
+    `repeated_observation_trimmed_mean_n51_trim0p2`,
     `repeated_observation_trimmed_mean_n75_trim0p2`, and
     `correlated_repeated_observation_trimmed_mean_n15_trim0p2_common0`,
     `correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0`,
