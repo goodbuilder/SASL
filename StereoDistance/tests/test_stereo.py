@@ -3598,6 +3598,66 @@ def test_px4_mag_manager_tracks_actual_selected_mag_per_pixhawk(monkeypatch) -> 
     _ = app
 
 
+def test_px4_mag_manager_uses_mavlink_params_when_connected(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.px4_mag_manager import GPS1_MAG_ID, GPS2_MAG_ID, RM3100_BACKUP_ID, RM3100_PRIMARY_ID
+
+    class FakeMavlink:
+        def __init__(self) -> None:
+            self.connections = {"left": object()}
+            self._heartbeat_logged = {"left"}
+            self.values = {
+                "UAVCAN_ENABLE": 2,
+                "UAVCAN_SUB_MAG": 1,
+                "EKF2_MAG_TYPE": 0,
+                "CAL_MAG0_ID": GPS1_MAG_ID,
+                "CAL_MAG0_PRIO": 75,
+                "CAL_MAG0_ROT": 0,
+                "CAL_MAG1_ID": GPS2_MAG_ID,
+                "CAL_MAG1_PRIO": 75,
+                "CAL_MAG1_ROT": 0,
+                "CAL_MAG2_ID": RM3100_PRIMARY_ID,
+                "CAL_MAG2_PRIO": 50,
+                "CAL_MAG2_ROT": 0,
+                "CAL_MAG3_ID": RM3100_BACKUP_ID,
+                "CAL_MAG3_PRIO": 50,
+                "CAL_MAG3_ROT": 0,
+                "CAL_MAG4_ID": None,
+                "CAL_MAG4_PRIO": None,
+                "CAL_MAG4_ROT": None,
+            }
+            self.set_calls: list[tuple[str, str, int]] = []
+
+        def read_param_int(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | None:
+            assert camera == "left"
+            return self.values.get(name)
+
+        def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
+            assert camera == "left"
+            self.values[name] = value
+            self.set_calls.append((camera, name, value))
+            return value
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.mavlink_pixhawk = FakeMavlink()
+    widget.latest_vehicle_mag_device_ids["left"] = GPS1_MAG_ID
+
+    widget.use_rm3100_for_yaw_from_panel("left")
+
+    assert ("left", "CAL_MAG0_PRIO", 0) in widget.mavlink_pixhawk.set_calls
+    assert ("left", "CAL_MAG1_PRIO", 0) in widget.mavlink_pixhawk.set_calls
+    assert ("left", "CAL_MAG2_PRIO", 100) in widget.mavlink_pixhawk.set_calls
+    assert ("left", "CAL_MAG3_PRIO", 90) in widget.mavlink_pixhawk.set_calls
+    assert "Actual selected MAG" in widget.px4_mag_status_labels["left"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_session_save_writes_session_folder_and_pixhawk_mag_csv(tmp_path, monkeypatch) -> None:
     import csv
     import json

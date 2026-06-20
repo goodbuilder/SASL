@@ -260,6 +260,22 @@ from wiris_stereo_distance.wiris_zoom import (
     send_tcp_line,
 )
 
+
+class MavlinkParameterStore:
+    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> None:
+        self.subscriber = subscriber
+        self.camera = camera
+
+    def get_param(self, name: str) -> int | float | None:
+        return self.subscriber.read_param_int(self.camera, name, timeout_s=1.5)
+
+    def set_param(self, name: str, value: int | float) -> None:
+        expected = int(value)
+        actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
+        if actual != expected:
+            raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
+
+
 FORM_LABEL_MIN_WIDTH = 138
 FORM_BUTTON_MIN_WIDTH = 112
 NETWORK_FIELD_MIN_WIDTHS = {
@@ -2353,11 +2369,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         alignment_tabs.setDocumentMode(True)
         alignment_tabs.addTab(alignment_overview_tab, "개요")
         alignment_tabs.addTab(rtk_tab, "GNSS / Baseline")
-        alignment_tabs.addTab(alignment_mag_tab, "Magnetometer / Yaw")
+        alignment_tabs.addTab(alignment_mag_tab, "MAG / Yaw")
         alignment_tabs.addTab(alignment_attitude_tab, "Attitude")
-        alignment_tabs.addTab(alignment_coordinate_tab, "Coordinate System")
+        alignment_tabs.addTab(alignment_coordinate_tab, "좌표계")
         alignment_tabs.addTab(alignment_validation_tab, "Validation")
-        alignment_tabs.addTab(alignment_profile_tab, "Alignment Profile")
+        alignment_tabs.addTab(alignment_profile_tab, "Profile")
         alignment_layout.addWidget(alignment_tabs, 1)
         self.alignment_tabs = alignment_tabs
         self.alignment_overview_tab_index = alignment_tabs.indexOf(alignment_overview_tab)
@@ -5218,15 +5234,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         layout.addWidget(scroll_area, 1)
         layout = content_layout
 
-        status_group = QtWidgets.QGroupBox("CAN1/CAN2 Magnetometer 상태")
+        status_group = QtWidgets.QGroupBox("Magnetometer 역할별 상태")
         grid = QtWidgets.QGridLayout(status_group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
         headers = ("Side", "Sensor", "Device ID", "Priority", "Selected", "Health", "Calibration", "Field Strength", "Rate", "Timestamp")
         for column, header in enumerate(headers):
-            grid.addWidget(QtWidgets.QLabel(header), 0, column)
+            header_label = QtWidgets.QLabel(header)
+            header_label.setWordWrap(True)
+            grid.addWidget(header_label, 0, column)
+            grid.setColumnMinimumWidth(column, 74 if column >= 2 else 56)
         self.alignment_mag_labels: dict[str, dict[str, QtWidgets.QLabel]] = {}
         row = 1
         for side, side_label in (("left", "Left"), ("right", "Right")):
-            for slot in ("CAN1", "CAN2"):
+            for slot in ("BOARD", "CAN1", "CAN2", "GPS1_MAG", "GPS2_MAG"):
                 key = f"{side}_{slot}"
                 self.alignment_mag_labels[key] = {}
                 grid.addWidget(QtWidgets.QLabel(side_label), row, 0)
@@ -5235,12 +5256,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     label = QtWidgets.QLabel("대기 중")
                     label.setObjectName("statusStrip")
                     label.setWordWrap(True)
+                    label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                    label.setMinimumWidth(72)
                     grid.addWidget(label, row, column)
                     self.alignment_mag_labels[key][field] = label
                 row += 1
         layout.addWidget(status_group)
         compare_group = QtWidgets.QGroupBox("Heading / Yaw 비교")
         compare_form = QtWidgets.QGridLayout(compare_group)
+        compare_form.setColumnStretch(1, 1)
         self.alignment_mag_compare_labels: dict[str, QtWidgets.QLabel] = {}
         for row, (key, title) in enumerate(
             (
@@ -5251,6 +5275,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         ):
             label = QtWidgets.QLabel("대기 중")
             label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             compare_form.addWidget(QtWidgets.QLabel(title), row, 0)
             compare_form.addWidget(label, row, 1)
             self.alignment_mag_compare_labels[key] = label
@@ -5258,8 +5284,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         yaw_group = QtWidgets.QGroupBox("Yaw 기준 Magnetometer 선택")
         yaw_form = QtWidgets.QGridLayout(yaw_group)
+        yaw_form.setColumnStretch(1, 1)
+        yaw_form.setColumnStretch(3, 1)
         for row, (side, title) in enumerate((("left", "Left Pixhawk"), ("right", "Right Pixhawk"))):
             combo = QtWidgets.QComboBox()
+            combo.setMinimumWidth(180)
             combo.addItem("PX4 현재 설정", "current")
             combo.addItem("CAN1", "CAN1")
             combo.addItem("CAN2", "CAN2")
@@ -5276,9 +5305,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.rm3100_yaw_source_status_labels[side] = status
         layout.addWidget(yaw_group)
 
-        self.alignment_mag_heading_plot = RtkAlignmentPlot()
-        layout.addWidget(self.alignment_mag_heading_plot, 1)
         self._build_px4_mag_manager_panel(layout)
+        self.alignment_mag_heading_plot = RtkAlignmentPlot()
+        self.alignment_mag_heading_plot.setMinimumHeight(160)
+        layout.addWidget(self.alignment_mag_heading_plot, 1)
         layout.addStretch(1)
 
     def _build_alignment_attitude_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
@@ -5296,6 +5326,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         group = QtWidgets.QGroupBox("Pixhawk EKF Attitude")
         grid = QtWidgets.QGridLayout(group)
         grid.setVerticalSpacing(6)
+        grid.setColumnStretch(1, 1)
         self.alignment_attitude_labels: dict[str, QtWidgets.QLabel] = {}
         for row, (key, title) in enumerate(
             (
@@ -5315,10 +5346,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             grid.addWidget(label, row, 1)
             self.alignment_attitude_labels[key] = label
         group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
-        layout.addWidget(group)
 
         compare_group = QtWidgets.QGroupBox("자세 축 비교")
         compare_form = QtWidgets.QGridLayout(compare_group)
+        compare_form.setColumnStretch(1, 1)
+        compare_form.setColumnStretch(2, 1)
+        compare_form.setColumnStretch(3, 1)
         compare_form.addWidget(QtWidgets.QLabel("축"), 0, 0)
         compare_form.addWidget(QtWidgets.QLabel("Left"), 0, 1)
         compare_form.addWidget(QtWidgets.QLabel("Right"), 0, 2)
@@ -5335,17 +5368,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             compare_form.addWidget(right_label, row, 2)
             compare_form.addWidget(delta_label, row, 3)
             self.attitude_compare_labels[axis.lower()] = (left_label, right_label, delta_label)
-        layout.addWidget(compare_group)
+        attitude_summary_row = QtWidgets.QHBoxLayout()
+        attitude_summary_row.setSpacing(8)
+        attitude_summary_row.addWidget(group, 2)
+        attitude_summary_row.addWidget(compare_group, 1)
+        layout.addLayout(attitude_summary_row)
 
         self.alignment_optical_axis_plot = RtkAlignmentPlot()
+        self.alignment_optical_axis_plot.setMinimumHeight(180)
         layout.addWidget(self.alignment_optical_axis_plot, 1)
         self.attitude_plots = {
             "roll": AttitudeHistoryPlot("Roll"),
             "pitch": AttitudeHistoryPlot("Pitch"),
             "yaw": AttitudeHistoryPlot("Yaw"),
         }
-        for plot in self.attitude_plots.values():
-            layout.addWidget(plot, 1)
+        attitude_history_tabs = QtWidgets.QTabWidget()
+        attitude_history_tabs.setDocumentMode(True)
+        for axis, plot in self.attitude_plots.items():
+            plot.setMinimumHeight(180)
+            tab = QtWidgets.QWidget()
+            tab_layout = QtWidgets.QVBoxLayout(tab)
+            tab_layout.setContentsMargins(0, 0, 0, 0)
+            tab_layout.addWidget(plot)
+            attitude_history_tabs.addTab(tab, axis.title())
+        layout.addWidget(attitude_history_tabs, 1)
 
     def _build_alignment_coordinate_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         group = QtWidgets.QGroupBox("좌표계 계약")
@@ -5888,7 +5934,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not hasattr(self, "alignment_mag_labels"):
             return
         for side in ("left", "right"):
-            for slot in ("CAN1", "CAN2"):
+            for slot in ("BOARD", "CAN1", "CAN2", "GPS1_MAG", "GPS2_MAG"):
                 key = f"{side}_{slot}"
                 labels = self.alignment_mag_labels[key]
                 state = self.latest_mag_sensors.get(side, {}).get(slot)
@@ -5899,9 +5945,24 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                         label.setText(text)
                     continue
                 device_id, device_source = self._mag_state_display_device_id(side, state)
+                if slot == "CAN1":
+                    priority_text = "Yaw target 100"
+                    selected_text = device_source
+                elif slot == "CAN2":
+                    priority_text = "Backup 90"
+                    selected_text = device_source
+                elif slot in {"GPS1_MAG", "GPS2_MAG"}:
+                    priority_text = "Disabled 0"
+                    selected_text = "raw only"
+                elif slot == "BOARD":
+                    priority_text = "PX4 selected"
+                    selected_text = device_source
+                else:
+                    priority_text = "PX4 param"
+                    selected_text = device_source
                 labels["device"].setText("--" if device_id is None else str(device_id))
-                labels["priority"].setText("PX4 param")
-                labels["selected"].setText(device_source)
+                labels["priority"].setText(priority_text)
+                labels["selected"].setText(selected_text)
                 labels["health"].setText("OK" if state.magnitude is not None else "waiting")
                 labels["calibration"].setText("PX4 EKF")
                 labels["field"].setText("--" if state.magnitude is None else f"{state.magnitude:.3f} G")
@@ -10753,8 +10814,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.mavlink_pixhawk is None:
             return set()
         connections = getattr(self.mavlink_pixhawk, "connections", {})
+        heartbeat_sides = getattr(self.mavlink_pixhawk, "_heartbeat_logged", set())
         try:
-            return {side for side in ("left", "right") if side in connections}
+            return {side for side in ("left", "right") if side in connections and side in heartbeat_sides}
         except TypeError:
             return set()
 
@@ -11314,6 +11376,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         mavlink = getattr(self, "mavlink_pixhawk", None)
         return mavlink is not None and camera in getattr(mavlink, "connections", {})
 
+    def _sync_px4_mag_manager_store(self, camera: str) -> bool:
+        manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
+        if manager is None:
+            return False
+        mavlink = getattr(self, "mavlink_pixhawk", None)
+        if mavlink is not None and camera in getattr(mavlink, "connections", {}):
+            current_store = getattr(manager, "store", None)
+            if not (
+                isinstance(current_store, MavlinkParameterStore)
+                and current_store.subscriber is mavlink
+                and current_store.camera == camera
+            ):
+                manager.store = MavlinkParameterStore(mavlink, camera)
+            return True
+        current_store = getattr(manager, "store", None)
+        if isinstance(current_store, MavlinkParameterStore):
+            manager.store = MockParameterStore(current_pixhawk_6x_mag_params())
+        return False
+
     def _set_px4_mag_manager_button_state(
         self,
         camera: str,
@@ -11378,6 +11459,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if not self._px4_mag_manager_has_data_source(side):
                 self._clear_px4_mag_manager_ui(side)
                 continue
+            self._sync_px4_mag_manager_store(side)
             manager.actual_selected_device_id = self.latest_vehicle_mag_device_ids.get(side)
             status = manager.refresh()
             self._render_px4_mag_status(side, status)
@@ -11391,6 +11473,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         if manager.armed:
             self._log(f"[PX4 MAG] {label} 설정 변경 차단: Disarm required")
+            self.refresh_px4_mag_manager(camera)
+            return
+        using_mavlink_params = self._sync_px4_mag_manager_store(camera)
+        if not using_mavlink_params:
+            self._log(f"[PX4 MAG] {label} 설정 변경 차단: 실제 PX4 파라미터 쓰기는 MAVLink 연결이 필요합니다.")
             self.refresh_px4_mag_manager(camera)
             return
         try:
@@ -11413,7 +11500,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if manager.armed:
             self._log(f"[PX4 MAG] {label} param save 차단: Disarm required")
         else:
-            self._log(f"[PX4 MAG] {label} QGC 또는 PX4 shell에서 `param save` 후 reboot 필요")
+            if self.mavlink_pixhawk is not None and camera in self._mavlink_connected_sides():
+                try:
+                    self.mavlink_pixhawk.send_shell_command(camera, "param save")
+                except Exception as exc:
+                    self._log(f"[PX4 MAG] {label} param save 명령 실패: {exc}")
+                else:
+                    self._log(f"[PX4 MAG] {label} MAVLink PX4 shell로 `param save` 명령을 전송했습니다.")
+            else:
+                self._log(f"[PX4 MAG] {label} QGC 또는 PX4 shell에서 `param save` 후 reboot 필요")
         self.refresh_px4_mag_manager(camera)
 
     def reboot_px4_from_panel(self, camera: str = "left") -> None:
@@ -11427,14 +11522,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[PX4 MAG] {label} reboot 차단: Disarm required")
             self.refresh_px4_mag_manager(camera)
             return
+        if self.mavlink_pixhawk is None or camera not in self._mavlink_connected_sides():
+            self._log(f"[PX4 MAG] {label} PX4 재부팅: QGC 또는 PX4 shell에서 수행 필요")
+            self.refresh_px4_mag_manager(camera)
+            return
         result = QtWidgets.QMessageBox.question(
             self,
             f"Reboot {label}",
-            f"{label} reboot command is not wired in this GUI path.\nQGC 또는 PX4 shell에서 재부팅하세요.",
-            QtWidgets.QMessageBox.Ok,
+            f"{label} Pixhawk에 MAVLink 재부팅 명령을 보냅니다.\n계속할까요?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
         )
-        if result == QtWidgets.QMessageBox.Ok:
-            self._log(f"[PX4 MAG] {label} PX4 재부팅: QGC 또는 PX4 shell에서 수행 필요")
+        if result == QtWidgets.QMessageBox.Yes:
+            try:
+                self.mavlink_pixhawk.reboot_autopilot(camera)
+            except Exception as exc:
+                self._log(f"[PX4 MAG] {label} MAVLink 재부팅 명령 실패: {exc}")
+            else:
+                self._log(f"[PX4 MAG] {label} MAVLink 재부팅 명령을 전송했습니다.")
+        else:
+            self._log(f"[PX4 MAG] {label} MAVLink 재부팅 명령을 취소했습니다.")
         self.refresh_px4_mag_manager(camera)
 
     def _render_px4_mag_status(self, camera: str, status) -> None:

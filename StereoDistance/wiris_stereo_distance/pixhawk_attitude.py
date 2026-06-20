@@ -13,7 +13,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from wiris_stereo_distance.px4_mag_manager import RM3100_BACKUP_ID, RM3100_PRIMARY_IDS
+from wiris_stereo_distance.px4_mag_manager import (
+    BOARD_INTERNAL_MAG_ID,
+    GPS1_MAG_ID,
+    GPS2_MAG_ID,
+    RM3100_BACKUP_ID,
+    RM3100_PRIMARY_IDS,
+)
 from wiris_stereo_distance.rtk_geometry import GpsPositionState, gps_state_from_message, gps_topic
 
 from PyQt5 import QtCore
@@ -890,6 +896,12 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
             return "CAN1"
         if device_id == RM3100_BACKUP_ID:
             return "CAN2"
+        if device_id == BOARD_INTERNAL_MAG_ID:
+            return "BOARD"
+        if device_id == GPS1_MAG_ID:
+            return "GPS1_MAG"
+        if device_id == GPS2_MAG_ID:
+            return "GPS2_MAG"
         return self._slot_for_device(self.mag_device_slots, camera, device_id, "MAG")
 
     def _handle_mag_message(self, camera: str, namespace: str, message: Any, *, topic: str | None = None) -> None:

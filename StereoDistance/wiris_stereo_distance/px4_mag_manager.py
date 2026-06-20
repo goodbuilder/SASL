@@ -10,7 +10,11 @@ RM3100_ALTERNATE_PRIMARY_ID = 8944643
 RM3100_PRIMARY_IDS = (RM3100_PRIMARY_ID, RM3100_ALTERNATE_PRIMARY_ID)
 RM3100_BACKUP_ID = 8944387
 RM3100_IDS = (*RM3100_PRIMARY_IDS, RM3100_BACKUP_ID)
-INTERNAL_MAG_IDS = (396809, 396817, 4395041)
+BOARD_INTERNAL_MAG_ID = 4395041
+GPS1_MAG_ID = 396809
+GPS2_MAG_ID = 396817
+GPS_MAG_IDS = (GPS1_MAG_ID, GPS2_MAG_ID)
+INTERNAL_MAG_IDS = (BOARD_INTERNAL_MAG_ID, *GPS_MAG_IDS)
 MAG_SLOTS = tuple(range(5))
 MAG_PARAM_NAMES = (
     "UAVCAN_ENABLE",
@@ -126,8 +130,12 @@ def identify_mag_device(device_id: int | None) -> MagDeviceInfo:
         return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7C", "DroneCAN", True)
     if device_id == RM3100_BACKUP_ID:
         return MagDeviceInfo(device_id, "RM3100 #2 / UAVCAN node 0x7B", "DroneCAN", True)
-    if device_id in INTERNAL_MAG_IDS:
-        return MagDeviceInfo(device_id, "I2C/internal or GPS compass", "I2C/Internal/GPS", False)
+    if device_id == BOARD_INTERNAL_MAG_ID:
+        return MagDeviceInfo(device_id, "Board internal BMM150", "Pixhawk internal I2C", False)
+    if device_id == GPS1_MAG_ID:
+        return MagDeviceInfo(device_id, "GPS1 integrated IST8310 compass", "GPS1 I2C compass", False)
+    if device_id == GPS2_MAG_ID:
+        return MagDeviceInfo(device_id, "GPS2 integrated IST8310 compass", "GPS2 I2C compass", False)
     if device_id is None:
         return MagDeviceInfo(device_id, "N/A", "N/A", False)
     return MagDeviceInfo(device_id, "Unknown MAG", "Unknown", False)
@@ -180,8 +188,10 @@ def build_mag_status(
     elif any(device_id in RM3100_PRIMARY_IDS for device_id in registered_rm3100) and RM3100_BACKUP_ID not in registered_rm3100:
         warnings.append("Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.")
 
-    if actual_selected_device_id in INTERNAL_MAG_IDS:
-        warnings.append("PX4 is still using I2C/internal magnetometer, not RM3100.")
+    if actual_selected_device_id == BOARD_INTERNAL_MAG_ID:
+        warnings.append("PX4 is still using the board internal magnetometer, not RM3100.")
+    elif actual_selected_device_id in GPS_MAG_IDS:
+        warnings.append("PX4 is still using a GPS integrated magnetometer, not RM3100.")
     elif actual_selected_device_id in RM3100_IDS:
         warnings.append("PX4 is using RM3100 as selected magnetometer.")
     elif actual_selected_device_id is None:
@@ -277,6 +287,7 @@ class Px4MagManager:
             "Use RM3100 for Yaw",
             f"before={before}",
             f"after={after}",
+            "GPS1/GPS2 integrated compass priority is set to 0.",
             "Run param save and reboot PX4 if PX4 does not persist changes automatically.",
         ]
         return self.refresh()
