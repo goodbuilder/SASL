@@ -367,6 +367,21 @@ promoted as final Simulation PASS correction methods:
   `causal_inverse_depth_prefilter_a0p84_b0p0005_uv999_id0p0005`, `47/50`,
   target max abs `12.09 m`. Do not promote inverse-depth prefiltering without
   a new tail-safe validation block.
+- `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5`
+  is not an all-scenario single deployment candidate despite additional fresh
+  PASS evidence. The boundary audit
+  `EXP-20260621-287-observation-fusion-scenario-boundary-fresh50` found
+  `STRICT_PASS` on nominal (`287000..287049`), yaw/pitch stress
+  (`287100..287149`), combined-sensor stress (`286600..286649`), and
+  disparity-noise stress (`286700..286749`), matching the earlier bbox-outlier
+  fresh50 evidence from EXP286. However, intrinsic-scale stress failed `0/50`
+  for the direct `trim0p05` run (`286800..286849`) and also failed `0/50`
+  across median/trimmed-mean inner/outer grids with trim fractions `0`, `0.1`,
+  and `0.2` (`286850..286999`). The failure is the range-improvement gate:
+  corrected intrinsic-scale range RMSE stayed around `2.39 m` while raw range
+  RMSE stayed around `1.84..1.85 m`. Runtime truth was `false`; image
+  `u/v/disparity_px`, stereo-center RDF, and public FRD+range contracts were
+  explicit in every saved metrics file.
 - Runtime alpha-beta motion fusion over the EXP198 base runtime profile is not
   a promising PASS branch. A fresh bbox-outlier smoke
   (`run_runtime_motion_fusion_sweep.py`, seeds `286000..286002`, RDF axes,
