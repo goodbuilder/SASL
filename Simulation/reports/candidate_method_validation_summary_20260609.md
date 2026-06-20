@@ -66,6 +66,23 @@ session can resume without re-running already rejected branches.
   runtime truth unused. Runtime selection must therefore use explicit
   deployment/scenario labels; automatic or unconditional single-profile
   deployment is rejected by this smoke.
+- 2026-06-21 observation-fusion package replay: the built-in historical default
+  `common_mode_target_gate` package smoke failed final acceptance with
+  `manifest:default_tier_not_all_scenario_aggregate`, so it is not the current
+  final PASS route. A repo-local replay fixture was added instead:
+  `Simulation/config/observation_fusion_fresh_deployment_tiers.json` plus
+  `Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv`.
+  Re-run command:
+  `python3 Simulation/scripts/run_observation_fusion_deployment_package.py --output-dir /tmp/sasl_observation_fusion_repo_tier_package_smoke --tier-spec-json Simulation/config/observation_fusion_fresh_deployment_tiers.json`.
+  Result: `acceptance_status=PASS`, default
+  `fresh_common_mode_b7x3_aggregate_best`, manifest audit 2/2, default node
+  smoke `fused:MultiBurstObservationFusion:21`, tier override smoke 2/2,
+  operator-view fusion/package launches PASS, public topic payload gates PASS,
+  inventory PASS, runtime truth false, coordinate contracts explicit. Contract:
+  runtime observation fusion consumes image `u/v` and measured disparity, emits
+  stereo-center RDF `right/down/forward`, and the public StereoDistance topic is
+  FRD+range `forward/right/down/range`; PX4/NED/RTK truth is not a runtime
+  input.
 - Paused by user after offline aggregate and guard-sweep validation. Do not
   treat any later partial ROS2/Gazebo output as validation evidence.
 - After resuming offline-only work, `bbox_anchor_cell_guard_cross_validation.py`

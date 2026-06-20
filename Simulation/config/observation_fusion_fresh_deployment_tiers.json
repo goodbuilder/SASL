@@ -1,0 +1,19 @@
+[
+  {
+    "tier": "fresh_common_mode_b7x3_aggregate_best",
+    "purpose": "fresh all-scenario aggregate observation-fusion default from EXP-20260618-215",
+    "source_csv": "Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv",
+    "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p2_common0p5",
+    "adapter_class": "MultiBurstObservationFusion",
+    "runtime_condition": "Default all-scenario aggregate deployment tier when 21 observations fit the latency budget.",
+    "selection_scope": "all_scenario_aggregate"
+  },
+  {
+    "tier": "balanced_independent",
+    "purpose": "operator override smoke tier for independent repeated observations",
+    "source_csv": "Simulation/reports/experiments/EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended/repeated_observation_method_summary.csv",
+    "method": "repeated_observation_trimmed_mean_n15_trim0p2",
+    "adapter_class": "RepeatedObservationFusion",
+    "runtime_condition": "Use only when 15 independent observations can be collected within the latency budget."
+  }
+]
