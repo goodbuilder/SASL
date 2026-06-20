@@ -32,9 +32,9 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.rtsp_transport == "udp"
     assert settings.measurement_display_mode == "detection"
     assert settings.ros_domain_id == 0
-    assert settings.pixhawk_host_address == "10.41.10.1"
-    assert settings.left_pixhawk_eth_ip == "192.168.0.2"
-    assert settings.right_pixhawk_eth_ip == "192.168.0.3"
+    assert settings.pixhawk_host_address == "10.0.0.10"
+    assert settings.left_pixhawk_eth_ip == "10.0.0.2"
+    assert settings.right_pixhawk_eth_ip == "10.0.0.3"
     assert settings.left_mavlink_url == "udpin:0.0.0.0:14550"
     assert settings.right_mavlink_url == "udpin:0.0.0.0:14551"
     assert settings.uam_telemetry_source == "ros2"
@@ -96,7 +96,7 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         right_mavlink_baud=57600,
         mavlink_configure_streams=False,
         mavlink_stream_rate=1_000_000,
-        mavlink_start_ros2=False,
+        mavlink_configure_uxrce_agent=False,
         uxrce_port=9999,
         auto_load_intrinsics=False,
         manual_focal_override=True,
@@ -148,6 +148,15 @@ def test_load_settings_ignores_unknown_legacy_keys(tmp_path: Path) -> None:
     assert settings.measurement_display_mode == "preview"
     assert not hasattr(settings, "legacy_removed_mount_key")
     assert not hasattr(settings, "legacy_removed_runtime_key")
+
+
+def test_load_settings_accepts_legacy_mavlink_start_ros2_key(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-uxrce-settings.json"
+    path.write_text('{"mavlink_start_ros2": false}')
+
+    settings = load_settings(path)
+
+    assert settings.mavlink_configure_uxrce_agent is False
 
 
 def test_load_settings_normalizes_removed_calibration_extrinsics_source(tmp_path: Path) -> None:

@@ -6,7 +6,20 @@ source /opt/ros/humble/setup.bash
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SASL_ROOT="$(cd "$APP_DIR/.." && pwd)"
-PX4_WORKSPACE_SETUP="${PX4_WORKSPACE_SETUP:-$SASL_ROOT/workspace/main/install/setup.bash}"
+export PATH="$HOME/.local/bin:$PATH"
+export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+PX4_WORKSPACE_SETUP="${PX4_WORKSPACE_SETUP:-}"
+if [[ -z "$PX4_WORKSPACE_SETUP" ]]; then
+  for candidate in \
+    "$SASL_ROOT/px4_msgs_ws/install/setup.bash" \
+    "$SASL_ROOT/workspace/main/install/setup.bash" \
+    "$HOME/px4_msgs_ws/install/setup.bash"; do
+    if [[ -f "$candidate" ]]; then
+      PX4_WORKSPACE_SETUP="$candidate"
+      break
+    fi
+  done
+fi
 if [[ -f "$PX4_WORKSPACE_SETUP" ]]; then
   # shellcheck disable=SC1090
   source "$PX4_WORKSPACE_SETUP"

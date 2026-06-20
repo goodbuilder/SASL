@@ -13,7 +13,7 @@ from pathlib import Path
 
 DEFAULT_SETTINGS = Path("stereo_distance_settings.json")
 DEFAULT_ROS_SETUP = Path("/opt/ros/humble/setup.bash")
-DEFAULT_PX4_SETUP = Path("/home/moontaehyung/Capstone/workspace/main/install/setup.bash")
+DEFAULT_PX4_SETUP = Path(__file__).resolve().parents[2] / "workspace" / "main" / "install" / "setup.bash"
 DEFAULT_AGENT_LOG = Path("/tmp/stereo_microxrceagent.log")
 PX4_TOPIC_SUFFIXES = (
     "vehicle_attitude",

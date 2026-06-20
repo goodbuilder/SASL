@@ -270,7 +270,7 @@ def test_mavlink_gps_raw_int_maps_to_gps_state() -> None:
     assert gps.heading_deg == 90.12
 
 
-def test_mavlink_start_ros2_client_sends_px4_shell_command() -> None:
+def test_mavlink_start_px4_uxrce_client_shell_sends_px4_shell_command() -> None:
     from types import SimpleNamespace
 
     from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
@@ -288,7 +288,7 @@ def test_mavlink_start_ros2_client_sends_px4_shell_command() -> None:
     subscriber = DualPixhawkMavlinkSubscriber(left_url="udpin:0.0.0.0:14550", right_url="")
     subscriber.connections["left"] = connection
 
-    subscriber.start_ros2_client(host_ip="192.168.0.254", port=8888, namespaces={"left": "uav_0"})
+    subscriber.start_px4_uxrce_client_shell(host_ip="192.168.0.254", port=8888, namespaces={"left": "uav_0"})
 
     assert {item[0] for item in sent} == {10}
     assert {item[1] for item in sent} == {5}
@@ -298,7 +298,7 @@ def test_mavlink_start_ros2_client_sends_px4_shell_command() -> None:
     )
 
 
-def test_mavlink_start_ros2_client_retries_after_first_heartbeat() -> None:
+def test_mavlink_start_px4_uxrce_client_shell_retries_after_first_heartbeat() -> None:
     from types import SimpleNamespace
 
     from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
@@ -328,7 +328,7 @@ def test_mavlink_start_ros2_client_retries_after_first_heartbeat() -> None:
     subscriber = DualPixhawkMavlinkSubscriber(left_url="udpin:0.0.0.0:14550", right_url="")
     subscriber.connections["left"] = connection
 
-    subscriber.start_ros2_client(host_ip="10.41.10.1", port=8888, namespaces={"left": "uav_0"})
+    subscriber.start_px4_uxrce_client_shell(host_ip="10.41.10.1", port=8888, namespaces={"left": "uav_0"})
     assert sent == []
 
     subscriber._handle_mavlink_message("left", FakeHeartbeat())
@@ -337,6 +337,14 @@ def test_mavlink_start_ros2_client_retries_after_first_heartbeat() -> None:
         "uxrce_dds_client stop\n"
         "uxrce_dds_client start -t udp -p 8888 -h 10.41.10.1 -n uav_0\n"
     )
+
+
+def test_mavlink_param_int_encoding_preserves_unsigned_ip_values() -> None:
+    from wiris_stereo_distance.pixhawk_attitude import _mavlink_int_to_param_float, _mavlink_param_float_to_int
+
+    value = 3232235558
+
+    assert _mavlink_param_float_to_int(_mavlink_int_to_param_float(value)) == value
 
 
 def test_mavlink_send_shell_command_targets_selected_pixhawk() -> None:
@@ -359,6 +367,30 @@ def test_mavlink_send_shell_command_targets_selected_pixhawk() -> None:
     subscriber.send_shell_command("right", "listener vehicle_attitude")
 
     assert sent == ["listener vehicle_attitude\n"]
+
+
+def test_mavlink_reboot_autopilot_sends_preflight_reboot_command() -> None:
+    from types import SimpleNamespace
+
+    from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    sent = []
+
+    class FakeMav:
+        def command_long_send(self, *args):
+            sent.append(args)
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    subscriber.connections["right"] = SimpleNamespace(
+        mav=FakeMav(),
+        mavlink=SimpleNamespace(MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN=246),
+        target_system=2,
+        target_component=1,
+    )
+
+    subscriber.reboot_autopilot("right")
+
+    assert sent == [(2, 1, 246, 0, 1, 0, 0, 0, 0, 0, 0)]
 
 
 def test_mavlink_configure_streams_sends_px4_shell_commands() -> None:
@@ -552,163 +584,6 @@ def test_wiris_pixhawk_and_yolo_logs_are_routed_separately() -> None:
     _ = app
 
 
-def test_auto_detect_usb_pixhawk_fills_both_when_two_devices(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui, "probe_usb_mavlink_devices", lambda timeout_s=0.8: [("/dev/ttyACM0", 57600), ("/dev/ttyACM1", 115200)])
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    widget.auto_detect_usb_pixhawks()
-
-    assert widget.left_mavlink_url_edit.text() == "/dev/ttyACM0"
-    assert widget.left_mavlink_baud_spin.value() == 57600
-    assert widget.right_mavlink_url_edit.text() == "/dev/ttyACM1"
-    assert widget.right_mavlink_baud_spin.value() == 115200
-    assert widget.pixhawk_candidate_table.rowCount() == 2
-
-    widget.deleteLater()
-    _ = app
-
-
-
-def test_auto_detect_single_usb_pixhawk_uses_selected_target(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui, "probe_usb_mavlink_devices", lambda timeout_s=0.8: [("/dev/ttyACM0", 57600)])
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.usb_setup_target_combo.setCurrentIndex(1)
-
-    widget.auto_detect_usb_pixhawks()
-
-    assert widget.left_mavlink_url_edit.text() == ""
-    assert widget.right_mavlink_url_edit.text() == "/dev/ttyACM0"
-    assert widget.right_mavlink_baud_spin.value() == 57600
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_manual_pixhawk_usb_candidate_applies_selected_side(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui, "probe_usb_mavlink_devices", lambda timeout_s=0.8: [("/dev/ttyACM2", 921600)])
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    widget.auto_detect_usb_pixhawks()
-    widget.pixhawk_candidate_table.selectRow(0)
-    widget.apply_selected_pixhawk_candidate("left")
-
-    assert widget.left_mavlink_url_edit.text() == "/dev/ttyACM2"
-    assert widget.left_mavlink_baud_spin.value() == 921600
-    assert not widget.left_px4_shell_button.isEnabled()
-    assert not widget.left_persist_eth_button.isEnabled()
-    assert "MAVLink 연결을 누르세요" in widget.pixhawk_connection_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_manual_pixhawk_usb_candidate_restarts_active_mavlink_session(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    class FakeSignal:
-        def connect(self, _slot) -> None:
-            pass
-
-    class FakeMavlinkSubscriber:
-        instances = []
-
-        def __init__(self, *, left_url, right_url, left_baud=57600, right_baud=57600, custom_watches=()) -> None:
-            self.left_url = left_url
-            self.right_url = right_url
-            self.left_baud = left_baud
-            self.right_baud = right_baud
-            self.urls = {"left": left_url, "right": right_url}
-            self.baudrates = {"left": left_baud, "right": right_baud}
-            self.custom_watches = custom_watches
-            self.connections = {}
-            self.stopped = False
-            self.extrinsic_changed = FakeSignal()
-            self.gps_changed = FakeSignal()
-            self.mag_sensor_changed = FakeSignal()
-            self.gps_sensor_changed = FakeSignal()
-            self.gnss_relative_changed = FakeSignal()
-            self.custom_watch_changed = FakeSignal()
-            self.shell_output = FakeSignal()
-            self.status_changed = FakeSignal()
-            self.instances.append(self)
-
-        def start(self, camera=None) -> None:
-            cameras = ("left", "right") if camera is None else (camera,)
-            if "left" in cameras and self.urls["left"]:
-                self.left_url = self.urls["left"]
-                self.left_baud = self.baudrates["left"]
-                self.connections["left"] = object()
-            if "right" in cameras and self.urls["right"]:
-                self.right_url = self.urls["right"]
-                self.right_baud = self.baudrates["right"]
-                self.connections["right"] = object()
-
-        def stop(self, camera=None) -> None:
-            self.stopped = True
-            if camera is None:
-                self.connections.clear()
-            else:
-                self.connections.pop(camera, None)
-
-        def configure_mavlink_streams(self, **_kwargs) -> None:
-            pass
-
-        def start_ros2_client(self, **_kwargs) -> None:
-            pass
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.mavlink_configure_streams_checkbox.setChecked(False)
-    widget.mavlink_start_ros2_checkbox.setChecked(False)
-    widget.left_mavlink_url_edit.setText("/dev/ttyOLD")
-    widget.right_mavlink_url_edit.setText("")
-
-    widget.connect_mavlink_pixhawk("left")
-    old_subscriber = FakeMavlinkSubscriber.instances[-1]
-    assert widget.left_px4_shell_button.isEnabled()
-    assert widget.left_persist_eth_button.isEnabled()
-    assert not widget.right_px4_shell_button.isEnabled()
-    assert not widget.right_persist_eth_button.isEnabled()
-    assert widget.left_mavlink_button.text() == "P1 MAVLink 해제"
-    assert widget.right_mavlink_button.text() == "P2 MAVLink 연결"
-
-    widget._set_pixhawk_candidate_rows(
-        [{"kind": "USB", "value": "/dev/ttyACM2", "baud": 921600, "status": "serial"}]
-    )
-    widget.pixhawk_candidate_table.selectRow(0)
-    widget.apply_selected_pixhawk_candidate("left")
-
-    new_subscriber = FakeMavlinkSubscriber.instances[-1]
-    assert old_subscriber.stopped
-    assert new_subscriber is widget.mavlink_pixhawk
-    assert new_subscriber.left_url == "/dev/ttyACM2"
-    assert new_subscriber.left_baud == 921600
-    assert widget.left_px4_shell_button.isEnabled()
-    assert widget.left_persist_eth_button.isEnabled()
-
-    widget.deleteLater()
-    _ = app
-
-
 def test_manual_pixhawk_ros2_candidate_applies_namespace(monkeypatch) -> None:
     from types import SimpleNamespace
 
@@ -731,31 +606,442 @@ def test_manual_pixhawk_ros2_candidate_applies_namespace(monkeypatch) -> None:
     _ = app
 
 
-def test_persistent_pixhawk_eth_command_uses_side_ip_and_host() -> None:
+def test_usb_pixhawk_discovery_lists_candidates_without_assignment(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
-    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "usb_mavlink_device_candidates", lambda: ["/dev/ttyACM0"])
+    monkeypatch.setattr(gui, "probe_usb_mavlink_devices", lambda candidates, timeout_s=0.8: [("/dev/ttyACM0", 57600)])
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    left_before = widget.left_mavlink_url_edit.text()
+    right_before = widget.right_mavlink_url_edit.text()
+
+    widget.discover_usb_pixhawk_connections()
+
+    assert widget.left_mavlink_url_edit.text() == left_before
+    assert widget.right_mavlink_url_edit.text() == right_before
+    assert widget.pixhawk_candidate_table.rowCount() == 1
+    assert widget.pixhawk_candidate_table.item(0, 0).text() == "USB"
+    assert widget.pixhawk_candidate_table.item(0, 1).text() == "/dev/ttyACM0"
+    assert widget.pixhawk_candidate_table.item(0, 2).text() == "57600"
+    assert widget.pixhawk_candidate_table.item(0, 3).text() == "MAVLink heartbeat"
+    widget.pixhawk_candidate_table.selectRow(0)
+    assert not widget.apply_pixhawk_candidate_host_button.isEnabled()
+    assert widget.apply_pixhawk_candidate_left_button.isEnabled()
+    assert widget.apply_pixhawk_candidate_right_button.isEnabled()
+    assert "MAVLink URL에 적용" in widget.apply_pixhawk_candidate_left_button.toolTip()
+    assert widget.clear_pixhawk_candidate_button.isEnabled()
+
+    widget.clear_pixhawk_candidate_button.click()
+
+    assert widget.pixhawk_candidate_table.rowCount() == 0
+    assert not widget.clear_pixhawk_candidate_button.isEnabled()
+    assert not widget.apply_pixhawk_candidate_host_button.isEnabled()
+    assert not widget.apply_pixhawk_candidate_left_button.isEnabled()
+    assert not widget.apply_pixhawk_candidate_right_button.isEnabled()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_mavlink_url_candidates_apply_without_connecting(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.left_mavlink_url_edit.setText("/dev/ttyACM0")
+
+    widget.discover_mavlink_url_candidates()
+
+    assert widget.pixhawk_candidate_table.rowCount() == 2
+    assert widget.pixhawk_candidate_table.item(0, 0).text() == "MAVLink"
+    assert widget.pixhawk_candidate_table.item(0, 1).text() == "udpin:0.0.0.0:14550"
+    assert widget.pixhawk_candidate_table.item(0, 3).text() == "Ethernet UDP listen"
+    widget.pixhawk_candidate_table.selectRow(0)
+    assert widget.apply_pixhawk_candidate_left_button.isEnabled()
+    assert "MAVLink URL 후보" in widget.apply_pixhawk_candidate_left_button.toolTip()
+
+    widget.apply_selected_pixhawk_candidate("left")
+
+    assert widget.left_mavlink_url_edit.text() == "udpin:0.0.0.0:14550"
+    assert widget.mavlink_pixhawk is None
+    assert "Pixhawk 1 MAVLink 연결을 누르세요" in widget.pixhawk_connection_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_ros2_pixhawk_discovery_includes_mavlink_url_candidates(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget._apply_pixhawk_discovery(SimpleNamespace(domain_id=7, namespaces=("uav_0",), topics=()))
+
+    kinds = [widget.pixhawk_candidate_table.item(row, 0).text() for row in range(widget.pixhawk_candidate_table.rowCount())]
+    values = [widget.pixhawk_candidate_table.item(row, 1).text() for row in range(widget.pixhawk_candidate_table.rowCount())]
+    assert kinds == ["ROS2", "MAVLink", "MAVLink"]
+    assert values == ["uav_0", "udpin:0.0.0.0:14550", "udpin:0.0.0.0:14551"]
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_usb_pixhawk_discovery_reports_permission_denied(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "usb_mavlink_device_candidates", lambda: ["/dev/ttyACM0"])
+    monkeypatch.setattr(gui, "probe_usb_mavlink_devices", lambda candidates, timeout_s=0.8: [])
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_usb_pixhawk_probe_status", lambda self, device: "permission denied: add user to dialout")
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget.discover_usb_pixhawk_connections()
+
+    assert widget.pixhawk_candidate_table.item(0, 3).text() == "permission denied: add user to dialout"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_ros2_pixhawk_candidate_enables_apply_buttons(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget._apply_pixhawk_discovery(SimpleNamespace(domain_id=7, namespaces=("uav_0",), topics=()))
+    widget.pixhawk_candidate_table.selectRow(0)
+
+    assert not widget.apply_pixhawk_candidate_host_button.isEnabled()
+    assert widget.apply_pixhawk_candidate_left_button.isEnabled()
+    assert widget.apply_pixhawk_candidate_right_button.isEnabled()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_usb_pixhawk_candidate_applies_selected_side_without_connecting(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "usb_mavlink_device_candidates", lambda: ["/dev/ttyACM0"])
+    monkeypatch.setattr(gui, "probe_usb_mavlink_devices", lambda candidates, timeout_s=0.8: [("/dev/ttyACM0", 921600)])
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget.discover_usb_pixhawk_connections()
+    widget.pixhawk_candidate_table.selectRow(0)
+    widget.apply_selected_pixhawk_candidate("right")
+
+    assert widget.right_mavlink_url_edit.text() == "/dev/ttyACM0"
+    assert widget.right_mavlink_baud_spin.value() == 921600
+    assert widget.mavlink_pixhawk is None
+    assert "Pixhawk 2 MAVLink 연결을 누르세요" in widget.pixhawk_connection_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_usb_pixhawk_candidate_disconnects_active_side_before_manual_reconnect(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    stopped = []
+    logs = []
+    widget._log = logs.append
+    widget.mavlink_pixhawk = SimpleNamespace(
+        connections={"right": object()},
+        stop=lambda camera=None: stopped.append(camera),
+    )
+    widget._set_pixhawk_candidate_rows(
+        [{"kind": "USB", "value": "/dev/ttyACM0", "baud": 57600, "status": "MAVLink heartbeat"}]
+    )
+
+    widget.pixhawk_candidate_table.selectRow(0)
+    widget.apply_selected_pixhawk_candidate("right")
+
+    assert stopped == ["right"]
+    assert widget.right_mavlink_url_edit.text() == "/dev/ttyACM0"
+    assert any("다시 연결하세요" in message for message in logs)
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_persistent_pixhawk_eth_command_uses_side_ip_and_host(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = WirisStereoDistancePanel()
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [SimpleNamespace(name="pixhawk0", address=ip_interface("192.168.0.254/24"))],
+    )
+    widget = gui.WirisStereoDistancePanel()
     widget.pixhawk_host_address_edit.setText("192.168.0.254")
     widget.right_pixhawk_eth_ip_edit.setText("192.168.0.3")
     widget.right_mavlink_url_edit.setText("/dev/ttyACM0")
 
     command = widget._persistent_pixhawk_eth_command("right")
+    extras_text = widget._persistent_pixhawk_extras_text("right")
+    net_cfg_text = widget._persistent_pixhawk_net_cfg_text("right")
 
     assert "ifconfig eth0 192.168.0.3 netmask 255.255.255.0 up" in command
+    assert "param set MAV_2_CONFIG 0" in command
     assert "param set UXRCE_DDS_CFG 1000" in command
     assert "param set UXRCE_DDS_KEY 2" in command
     assert "param set UXRCE_DDS_DOM_ID 0" in command
     assert "param set UXRCE_DDS_AG_IP 3232235774" in command
+    assert "param set UXRCE_DDS_PTCFG 0" in command
+    assert "param set UXRCE_DDS_SYNCC 0" in command
+    assert "param set UXRCE_DDS_SYNCT 1" in command
     assert "uxrce_dds_client stop" in command
     assert "uxrce_dds_client start -t udp -p 8888 -h 192.168.0.254 -n uav_1" in command
-    assert "mavlink start -x -u 14551 -t 192.168.0.254 -o 14551 -r 2000000 -m normal" in command
+    assert "mavlink start -x" not in command
     assert "echo 'ifup eth0' > /fs/microsd/etc/extras.txt" in command
     assert "echo 'ifconfig eth0 192.168.0.3 netmask 255.255.255.0 up' >> /fs/microsd/etc/extras.txt" in command
     assert "echo 'uxrce_dds_client start -t udp -p 8888 -h 192.168.0.254 -n uav_1' >> /fs/microsd/etc/extras.txt" in command
     assert "cat /fs/microsd/etc/extras.txt" in command
+    assert "ifconfig eth0 192.168.0.3 netmask 255.255.255.0 up" in extras_text
+    assert "uxrce_dds_client start -t udp -p 8888 -h 192.168.0.254 -n uav_1" in extras_text
+    assert "mavlink start -x" not in extras_text
+    assert "echo '" not in extras_text
+    assert "IPADDR=192.168.0.3" in net_cfg_text
+    assert "ROUTER=192.168.0.254" in net_cfg_text
+    assert "BOOTPROTO=static" in net_cfg_text
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_persistent_pixhawk_eth_uses_mavlink_ftp_for_extras(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [SimpleNamespace(name="pixhawk0", address=ip_interface("10.0.0.10/24"))],
+    )
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk_host_address_edit.setText("10.0.0.10")
+    widget.left_pixhawk_eth_ip_edit.setText("10.0.0.2")
+    widget.left_mavlink_url_edit.setText("/dev/ttyACM0")
+    sent_shell = []
+    ftp_writes = []
+    widget.mavlink_pixhawk = SimpleNamespace(
+        connections={"left": object()},
+        send_shell_command=lambda camera, command: sent_shell.append((camera, command)),
+        write_remote_file_mavftp=lambda camera, path, content: ftp_writes.append((camera, path, content)),
+    )
+
+    widget.apply_persistent_pixhawk_eth("left")
+
+    assert sent_shell and sent_shell[0][0] == "left"
+    assert ftp_writes == [
+        ("left", "/fs/microsd/etc/extras.txt", widget._persistent_pixhawk_extras_text("left")),
+        ("left", "/fs/microsd/net.cfg", widget._persistent_pixhawk_net_cfg_text("left")),
+    ]
+    assert "ifconfig eth0 10.0.0.2 netmask 255.255.255.0 up" in ftp_writes[0][2]
+    assert "IPADDR=10.0.0.2" in ftp_writes[1][2]
+    assert "ROUTER=10.0.0.10" in ftp_writes[1][2]
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_pixhawk_host_ip_auto_corrects_to_local_interface_for_pixhawk_subnet(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [
+            SimpleNamespace(name="enp46s0", address=ip_interface("10.0.0.10/24")),
+            SimpleNamespace(name="wlo1", address=ip_interface("192.168.0.38/24")),
+        ],
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk_host_address_edit.setText("10.41.10.1")
+    widget.left_pixhawk_eth_ip_edit.setText("192.168.0.2")
+    widget.right_pixhawk_eth_ip_edit.setText("192.168.0.3")
+
+    host_ip = widget._pixhawk_host_ip_for_uxrce()
+
+    assert host_ip == "192.168.0.38"
+    assert widget.pixhawk_host_address_edit.text() == "192.168.0.38"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_pixhawk_host_ip_keeps_existing_local_address(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [
+            SimpleNamespace(name="enp46s0", address=ip_interface("10.0.0.10/24")),
+            SimpleNamespace(name="wlo1", address=ip_interface("192.168.0.38/24")),
+        ],
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk_host_address_edit.setText("10.0.0.10")
+    widget.left_pixhawk_eth_ip_edit.setText("192.168.0.2")
+
+    host_ip = widget._pixhawk_host_ip_for_uxrce()
+
+    assert host_ip == "10.0.0.10"
+    assert widget.pixhawk_host_address_edit.text() == "10.0.0.10"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_discover_pc_pixhawk_ip_button_fills_host_from_pixhawk_subnet(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [
+            SimpleNamespace(name="enp46s0", address=ip_interface("10.0.0.10/24")),
+            SimpleNamespace(name="wlo1", address=ip_interface("192.168.0.38/24")),
+        ],
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget._save_current_settings = lambda: None
+    widget.pixhawk_host_address_edit.setText("10.41.10.1")
+    widget.left_pixhawk_eth_ip_edit.setText("192.168.0.2")
+    widget.right_pixhawk_eth_ip_edit.setText("192.168.0.3")
+
+    widget.detect_pixhawk_host_ip_button.click()
+
+    assert widget.pixhawk_host_address_edit.text() == "10.41.10.1"
+    assert "후보 표시됨" in widget.pixhawk_connection_label.text()
+    assert widget.pixhawk_candidate_table.rowCount() == 2
+    assert widget.pixhawk_candidate_table.item(0, 0).text() == "PC_IP"
+    assert widget.pixhawk_candidate_table.item(0, 1).text() == "10.0.0.10"
+    assert widget.pixhawk_candidate_table.item(0, 4).text() == "enp46s0"
+    assert widget.pixhawk_candidate_table.item(1, 1).text() == "192.168.0.38"
+    assert "Wi-Fi" in widget.pixhawk_candidate_table.item(1, 3).text()
+
+    widget.pixhawk_candidate_table.selectRow(0)
+    assert widget.apply_pixhawk_candidate_host_button.isEnabled()
+    assert not widget.apply_pixhawk_candidate_left_button.isEnabled()
+    assert not widget.apply_pixhawk_candidate_right_button.isEnabled()
+    widget.apply_selected_pixhawk_candidate("host")
+
+    assert widget.pixhawk_host_address_edit.text() == "10.0.0.10"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_pixhawk_host_ip_prefers_active_mavlink_remote_subnet(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [
+            SimpleNamespace(name="enp46s0", address=ip_interface("10.0.0.10/24")),
+            SimpleNamespace(name="wlo1", address=ip_interface("192.168.0.38/24")),
+        ],
+    )
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk_host_address_edit.setText("10.0.0.10")
+    widget.left_pixhawk_eth_ip_edit.setText("10.0.0.2")
+    widget.right_pixhawk_eth_ip_edit.setText("10.0.0.3")
+
+    host_ip = widget._pixhawk_host_ip_for_uxrce(extra_hints=("192.168.0.3",))
+
+    assert host_ip == "192.168.0.38"
+    assert widget.pixhawk_host_address_edit.text() == "192.168.0.38"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_pixhawk_common_setup_has_pc_ip_discovery_button(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    assert widget.detect_pixhawk_host_ip_button.text() == "PC IP 탐색"
+    assert widget.detect_pixhawk_host_ip_button.parent() is widget.pixhawk_common_setup_group
 
     widget.deleteLater()
     _ = app
@@ -1206,10 +1492,14 @@ def test_action_button_rows_and_runtime_header_orientations(monkeypatch) -> None
     assert max(pixhawk_tops) - min(pixhawk_tops) <= 1
     assert widget.apply_candidate_left_button.text() == "Left에 적용"
     assert widget.apply_candidate_right_button.text() == "Right에 적용"
+    assert widget.apply_pixhawk_candidate_host_button.text() == "Host에 적용"
     assert widget.apply_pixhawk_candidate_left_button.text() == "P1에 적용"
     assert widget.apply_pixhawk_candidate_right_button.text() == "P2에 적용"
-    assert widget.pixhawk_auto_detect_button.parentWidget().title() == "1 탐색 후보 / USB 할당"
-    assert widget.auto_detect_usb_pixhawk_button.parentWidget().title() == "1 탐색 후보 / USB 할당"
+    assert widget.clear_pixhawk_candidate_button.text() == "Clear"
+    assert widget.pixhawk_auto_detect_button.parentWidget().title() == "1 ROS2 탐색 후보"
+    assert widget.pixhawk_usb_discover_button.parentWidget().title() == "1 ROS2 탐색 후보"
+    assert widget.pixhawk_usb_discover_button.text() == "USB 연결 탐색"
+    assert not hasattr(widget, "usb_setup_target_combo")
     pixhawk_candidate_group = widget.findChild(QtWidgets.QGroupBox, "pixhawkCandidateGroup")
     assert pixhawk_candidate_group is not None
     assert pixhawk_candidate_group.height() >= pixhawk_candidate_group.sizeHint().height()
@@ -1219,19 +1509,17 @@ def test_action_button_rows_and_runtime_header_orientations(monkeypatch) -> None
         widget.pixhawk_candidate_table.columnWidth(column)
         for column in range(widget.pixhawk_candidate_table.columnCount())
     ]
-    assert len(pixhawk_candidate_widths) == 4
+    assert len(pixhawk_candidate_widths) == 5
     assert max(pixhawk_candidate_widths) - min(pixhawk_candidate_widths) <= 1
     pixhawk_candidate_rows = [
         (
             min(
-                widget.usb_setup_target_combo.geometry().top(),
-                widget.auto_detect_usb_pixhawk_button.geometry().top(),
                 widget.pixhawk_auto_detect_button.geometry().top(),
+                widget.pixhawk_usb_discover_button.geometry().top(),
             ),
             max(
-                widget.usb_setup_target_combo.geometry().bottom(),
-                widget.auto_detect_usb_pixhawk_button.geometry().bottom(),
                 widget.pixhawk_auto_detect_button.geometry().bottom(),
+                widget.pixhawk_usb_discover_button.geometry().bottom(),
             ),
         ),
         (
@@ -1240,10 +1528,14 @@ def test_action_button_rows_and_runtime_header_orientations(monkeypatch) -> None
         ),
         (
             min(
+                widget.clear_pixhawk_candidate_button.geometry().top(),
+                widget.apply_pixhawk_candidate_host_button.geometry().top(),
                 widget.apply_pixhawk_candidate_left_button.geometry().top(),
                 widget.apply_pixhawk_candidate_right_button.geometry().top(),
             ),
             max(
+                widget.clear_pixhawk_candidate_button.geometry().bottom(),
+                widget.apply_pixhawk_candidate_host_button.geometry().bottom(),
                 widget.apply_pixhawk_candidate_left_button.geometry().bottom(),
                 widget.apply_pixhawk_candidate_right_button.geometry().bottom(),
             ),
@@ -1251,9 +1543,11 @@ def test_action_button_rows_and_runtime_header_orientations(monkeypatch) -> None
     ]
     for previous_row, current_row in zip(pixhawk_candidate_rows, pixhawk_candidate_rows[1:]):
         assert previous_row[1] < current_row[0]
+    assert widget.clear_pixhawk_candidate_button.geometry().left() < widget.apply_pixhawk_candidate_host_button.geometry().left()
     assert widget.pixhawk_common_setup_group.title() == "0 공통 준비"
     assert widget.pixhawk_pair_settings_group.title() == "2 Pixhawk 1/2 사전 설정"
     assert widget.pixhawk_connection_actions_group.title() == "3 연결 실행"
+    assert widget.pixhawk_advanced_diagnostics_group.title() == "4 고급 / 진단"
     left_pixhawk_group = widget.findChild(QtWidgets.QGroupBox, "leftPixhawkWorkflowGroup")
     right_pixhawk_group = widget.findChild(QtWidgets.QGroupBox, "rightPixhawkWorkflowGroup")
     assert left_pixhawk_group is not None
@@ -1271,14 +1565,19 @@ def test_action_button_rows_and_runtime_header_orientations(monkeypatch) -> None
     assert right_pixhawk_form.itemAtPosition(2, 1).widget() is widget.right_pixhawk_eth_ip_edit
     assert left_pixhawk_form.itemAtPosition(3, 1).widget() is widget.left_namespace_edit
     assert right_pixhawk_form.itemAtPosition(3, 1).widget() is widget.right_namespace_edit
-    assert widget.left_px4_shell_button.parentWidget().title() == "Pixhawk 1"
-    assert widget.right_px4_shell_button.parentWidget().title() == "Pixhawk 2"
-    assert widget.left_persist_eth_button.parentWidget().title() == "Pixhawk 1"
-    assert widget.right_persist_eth_button.parentWidget().title() == "Pixhawk 2"
+    assert widget.left_px4_shell_button.parentWidget().title() == "4 고급 / 진단"
+    assert widget.right_px4_shell_button.parentWidget().title() == "4 고급 / 진단"
+    assert widget.left_persist_eth_button.parentWidget().title() == "4 고급 / 진단"
+    assert widget.right_persist_eth_button.parentWidget().title() == "4 고급 / 진단"
+    assert widget.left_reboot_pixhawk_button.parentWidget().title() == "4 고급 / 진단"
+    assert widget.right_reboot_pixhawk_button.parentWidget().title() == "4 고급 / 진단"
     assert widget.left_mavlink_button.parentWidget().title() == "3 연결 실행"
     assert widget.right_mavlink_button.parentWidget().title() == "3 연결 실행"
+    assert widget.left_uxrce_param_button.parentWidget().title() == "3 연결 실행"
+    assert widget.right_uxrce_param_button.parentWidget().title() == "3 연결 실행"
     assert abs(widget.left_px4_shell_button.geometry().top() - widget.left_persist_eth_button.geometry().top()) <= 1
     assert abs(widget.right_px4_shell_button.geometry().top() - widget.right_persist_eth_button.geometry().top()) <= 1
+    assert abs(widget.left_reboot_pixhawk_button.geometry().top() - widget.right_reboot_pixhawk_button.geometry().top()) <= 1
     assert (
         widget.pixhawk_pair_settings_group.height()
         >= widget.pixhawk_pair_settings_group.sizeHint().height()
@@ -1308,7 +1607,7 @@ def test_action_button_rows_and_runtime_header_orientations(monkeypatch) -> None
         )
 
     for side_form in (left_pixhawk_form, right_pixhawk_form):
-        pixhawk_side_row_bounds_by_row = [pixhawk_side_row_bounds(side_form, row) for row in range(5)]
+        pixhawk_side_row_bounds_by_row = [pixhawk_side_row_bounds(side_form, row) for row in range(4)]
         for previous_row, current_row in zip(
             pixhawk_side_row_bounds_by_row,
             pixhawk_side_row_bounds_by_row[1:],
@@ -1440,7 +1739,7 @@ def test_mavlink_connection_routes_sensor_signals_to_alignment(monkeypatch) -> N
             self.baudrates = {"left": kwargs.get("left_baud", 57600), "right": kwargs.get("right_baud", 57600)}
             self.connections = {"left": object(), "right": object()}
             self.configure_calls = []
-            self.ros2_calls = []
+            self.uxrce_client_shell_calls = []
             self.stopped = False
 
         def start(self, camera=None) -> None:
@@ -1449,8 +1748,8 @@ def test_mavlink_connection_routes_sensor_signals_to_alignment(monkeypatch) -> N
         def configure_mavlink_streams(self, **kwargs) -> None:
             self.configure_calls.append(kwargs)
 
-        def start_ros2_client(self, **kwargs) -> None:
-            self.ros2_calls.append(kwargs)
+        def start_px4_uxrce_client_shell(self, **kwargs) -> None:
+            self.uxrce_client_shell_calls.append(kwargs)
 
         def stop(self, camera=None) -> None:
             self.stopped = True
@@ -1460,7 +1759,7 @@ def test_mavlink_connection_routes_sensor_signals_to_alignment(monkeypatch) -> N
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
     widget.mavlink_configure_streams_checkbox.setChecked(False)
-    widget.mavlink_start_ros2_checkbox.setChecked(False)
+    widget.mavlink_configure_uxrce_agent_checkbox.setChecked(False)
 
     widget.connect_mavlink_pixhawk()
 
@@ -1474,7 +1773,277 @@ def test_mavlink_connection_routes_sensor_signals_to_alignment(monkeypatch) -> N
     _ = app
 
 
+def test_mavlink_connection_requests_and_logs_actual_eth0_ip(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    class FakeSignal:
+        def __init__(self) -> None:
+            self.slots = []
+
+        def connect(self, slot) -> None:
+            self.slots.append(slot)
+
+    class FakeMavlinkSubscriber:
+        def __init__(self, *args, **kwargs) -> None:
+            self.extrinsic_changed = FakeSignal()
+            self.gps_changed = FakeSignal()
+            self.mag_sensor_changed = FakeSignal()
+            self.gps_sensor_changed = FakeSignal()
+            self.gnss_relative_changed = FakeSignal()
+            self.custom_watch_changed = FakeSignal()
+            self.shell_output = FakeSignal()
+            self.status_changed = FakeSignal()
+            self.urls = {"left": kwargs.get("left_url", ""), "right": kwargs.get("right_url", "")}
+            self.baudrates = {"left": kwargs.get("left_baud", 57600), "right": kwargs.get("right_baud", 57600)}
+            self.connections = {}
+            self.shell_commands = []
+
+        def start(self, camera=None) -> None:
+            cameras = ("left", "right") if camera is None else (camera,)
+            for side in cameras:
+                if self.urls.get(side):
+                    self.connections[side] = object()
+
+        def send_shell_command(self, camera, command) -> None:
+            self.shell_commands.append((camera, command))
+
+        def stop(self, camera=None) -> None:
+            self.connections.clear()
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    logs = []
+    widget._log = logs.append
+    widget.mavlink_configure_streams_checkbox.setChecked(False)
+    widget.mavlink_configure_uxrce_agent_checkbox.setChecked(False)
+    widget.left_mavlink_url_edit.setText("/dev/ttyACM0")
+    widget.right_mavlink_url_edit.setText("")
+    widget.left_pixhawk_eth_ip_edit.setText("10.0.0.2")
+
+    widget.connect_mavlink_pixhawk("left")
+
+    assert widget.mavlink_pixhawk.shell_commands == [("left", "ifconfig eth0")]
+
+    widget._append_px4_shell_output("left", "eth0 Link encap:Ethernet\n inet addr:10.0.0.2\n")
+
+    assert any("실제 eth0 IP 확인: 10.0.0.2" in message for message in logs)
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_manual_mavlink_connection_skips_blocking_setup(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    class FakeSignal:
+        def connect(self, _slot) -> None:
+            pass
+
+    class FakeMavlinkSubscriber:
+        def __init__(self, *args, **kwargs) -> None:
+            self.extrinsic_changed = FakeSignal()
+            self.gps_changed = FakeSignal()
+            self.mag_sensor_changed = FakeSignal()
+            self.gps_sensor_changed = FakeSignal()
+            self.gnss_relative_changed = FakeSignal()
+            self.custom_watch_changed = FakeSignal()
+            self.shell_output = FakeSignal()
+            self.status_changed = FakeSignal()
+            self.urls = {"left": kwargs.get("left_url", ""), "right": kwargs.get("right_url", "")}
+            self.baudrates = {"left": kwargs.get("left_baud", 57600), "right": kwargs.get("right_baud", 57600)}
+            self.connections = {}
+            self.configure_calls = []
+            self.param_sets = []
+
+        def start(self, camera=None) -> None:
+            cameras = ("left", "right") if camera is None else (camera,)
+            for side in cameras:
+                if self.urls.get(side):
+                    self.connections[side] = object()
+
+        def configure_mavlink_streams(self, **kwargs) -> None:
+            self.configure_calls.append(kwargs)
+
+        def set_param_int(self, camera, name, value):
+            self.param_sets.append((camera, name, value))
+            return value
+
+        def send_shell_command(self, _camera, _command) -> None:
+            pass
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    logs = []
+    widget._log = logs.append
+    widget.mavlink_configure_streams_checkbox.setChecked(True)
+    widget.mavlink_configure_uxrce_agent_checkbox.setChecked(True)
+    widget.left_mavlink_url_edit.setText("udpin:0.0.0.0:14550")
+    widget.right_mavlink_url_edit.setText("")
+
+    widget.connect_mavlink_pixhawk("left")
+
+    assert widget.mavlink_pixhawk is not None
+    assert widget.mavlink_pixhawk.configure_calls == []
+    assert widget.mavlink_pixhawk.param_sets == []
+    assert any("일반 MAVLink 연결에서는 UI 응답성" in message for message in logs)
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_ros2_session_starts_mavlink_gps2_auxiliary_when_sensor_gps_missing(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    class FakeSignal:
+        def connect(self, _slot) -> None:
+            pass
+
+    class FakeMavlinkSubscriber:
+        def __init__(self, *args, **kwargs) -> None:
+            self.extrinsic_changed = FakeSignal()
+            self.gps_changed = FakeSignal()
+            self.mag_sensor_changed = FakeSignal()
+            self.gps_sensor_changed = FakeSignal()
+            self.gnss_relative_changed = FakeSignal()
+            self.custom_watch_changed = FakeSignal()
+            self.shell_output = FakeSignal()
+            self.status_changed = FakeSignal()
+            self.urls = {"left": kwargs.get("left_url", ""), "right": kwargs.get("right_url", "")}
+            self.baudrates = {"left": kwargs.get("left_baud", 57600), "right": kwargs.get("right_baud", 57600)}
+            self.connections = {}
+            self.started = []
+
+        def start(self, camera=None) -> None:
+            cameras = ("left", "right") if camera is None else (camera,)
+            for side in cameras:
+                if self.urls.get(side):
+                    self.connections[side] = object()
+                    self.started.append(side)
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    logs = []
+    widget._log = logs.append
+    widget.pixhawk = object()
+    widget.left_mavlink_url_edit.setText("udpin:0.0.0.0:14550")
+    widget.right_mavlink_url_edit.setText("")
+    widget.latest_gps_sensors["left"] = {}
+
+    widget._start_mavlink_sensor_auxiliary_if_needed()
+
+    assert widget.mavlink_pixhawk is not None
+    assert widget.mavlink_pixhawk.started == ["left"]
+    assert "MAVLink 센서 보조" in widget.pixhawk_connection_label.text()
+    assert any("GPS2/RM3100 보조 수신" in message for message in logs)
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_ros2_session_starts_mavlink_auxiliary_when_magnetometer_missing(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import GpsSensorState
+
+    class FakeSignal:
+        def connect(self, _slot) -> None:
+            pass
+
+    class FakeMavlinkSubscriber:
+        def __init__(self, *args, **kwargs) -> None:
+            self.extrinsic_changed = FakeSignal()
+            self.gps_changed = FakeSignal()
+            self.mag_sensor_changed = FakeSignal()
+            self.gps_sensor_changed = FakeSignal()
+            self.gnss_relative_changed = FakeSignal()
+            self.custom_watch_changed = FakeSignal()
+            self.shell_output = FakeSignal()
+            self.status_changed = FakeSignal()
+            self.urls = {"left": kwargs.get("left_url", ""), "right": kwargs.get("right_url", "")}
+            self.baudrates = {"left": kwargs.get("left_baud", 57600), "right": kwargs.get("right_baud", 57600)}
+            self.connections = {}
+            self.started = []
+
+        def start(self, camera=None) -> None:
+            cameras = ("left", "right") if camera is None else (camera,)
+            for side in cameras:
+                if self.urls.get(side):
+                    self.connections[side] = object()
+                    self.started.append(side)
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk = object()
+    widget.left_mavlink_url_edit.setText("udpin:0.0.0.0:14550")
+    widget.right_mavlink_url_edit.setText("")
+    widget.latest_gps_sensors["left"] = {
+        "GPS2": GpsSensorState("left", "uav_0", "GPS2", 1.0, "/uav_0/fmu/out/sensor_gps")
+    }
+    widget.latest_mag_sensors["left"] = {}
+
+    widget._start_mavlink_sensor_auxiliary_if_needed()
+
+    assert widget.mavlink_pixhawk is not None
+    assert widget.mavlink_pixhawk.started == ["left"]
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_ros2_only_alignment_marks_unpublished_gps2_and_mag_topics(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk = object()
+    widget.ros2_sensor_topic_publishers = {
+        "left": {
+            "vehicle_gps_position": True,
+            "sensor_gps": False,
+            "sensor_mag": False,
+            "vehicle_magnetometer": False,
+        },
+        "right": {
+            "vehicle_gps_position": True,
+            "sensor_gps": False,
+            "sensor_mag": False,
+            "vehicle_magnetometer": False,
+        },
+    }
+
+    widget._refresh_ros2_only_alignment_availability()
+
+    assert "ROS2 미게시" in widget.alignment_overview_labels["left_gps2"].text()
+    assert "ROS2 미게시" in widget.alignment_overview_labels["left_can1"].text()
+    assert "ROS2 sensor_gps 미게시" in widget.f9p_slot_labels["left"]["GPS2"].text()
+    assert "ROS2 미게시" in widget.alignment_mag_labels["left_CAN1"]["device"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
+    from ipaddress import ip_interface
+    from types import SimpleNamespace
+
     from PyQt5 import QtWidgets
 
     import wiris_stereo_distance.gui as gui
@@ -1507,7 +2076,7 @@ def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
             self.baudrates = {"left": left_baud, "right": right_baud}
             self.connections = {}
             self.configure_calls = []
-            self.ros2_calls = []
+            self.param_sets = []
             self.extrinsic_changed = FakeSignal()
             self.gps_changed = FakeSignal()
             self.mag_sensor_changed = FakeSignal()
@@ -1527,8 +2096,9 @@ def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
         def configure_mavlink_streams(self, **kwargs) -> None:
             self.configure_calls.append(kwargs)
 
-        def start_ros2_client(self, **kwargs) -> None:
-            self.ros2_calls.append(kwargs)
+        def set_param_int(self, camera, name, value):
+            self.param_sets.append((camera, name, value))
+            return value
 
         def stop(self, camera=None) -> None:
             if camera is None:
@@ -1538,6 +2108,11 @@ def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_ensure_micro_xrce_agent", lambda self: None)
+    monkeypatch.setattr(
+        gui,
+        "local_ipv4_interfaces",
+        lambda **_kwargs: [SimpleNamespace(name="pixhawk0", address=ip_interface("10.41.10.1/24"))],
+    )
     monkeypatch.setattr(gui, "DualPixhawkAttitudeSubscriber", FailingRos2Subscriber)
     monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -1552,22 +2127,23 @@ def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
     assert widget.pixhawk is None
     assert widget.mavlink_pixhawk is not None
     assert set(widget.mavlink_pixhawk.connections) == {"left", "right"}
-    assert widget.mavlink_pixhawk.configure_calls[-1]["host_ip"] == "10.41.10.1"
-    assert widget.mavlink_pixhawk.configure_calls[-1]["cameras"] == {"left", "right"}
-    assert widget.mavlink_pixhawk.ros2_calls[-1] == {
-        "host_ip": "10.41.10.1",
-        "port": widget.uxrce_port_spin.value(),
-        "namespaces": {"left": "uav_0", "right": "uav_1"},
-        "cameras": {"left", "right"},
-    }
-    assert widget._ros2_retry_after_mavlink_setup is True
+    assert widget.mavlink_pixhawk.configure_calls == []
+    assert ("left", "MAV_2_CONFIG", 0) in widget.mavlink_pixhawk.param_sets
+    assert ("right", "MAV_2_CONFIG", 0) in widget.mavlink_pixhawk.param_sets
+    assert ("left", "UXRCE_DDS_AG_IP", 170461697) in widget.mavlink_pixhawk.param_sets
+    assert ("right", "UXRCE_DDS_AG_IP", 170461697) in widget.mavlink_pixhawk.param_sets
+    assert ("left", "UXRCE_DDS_KEY", 1) in widget.mavlink_pixhawk.param_sets
+    assert ("right", "UXRCE_DDS_KEY", 2) in widget.mavlink_pixhawk.param_sets
+    assert ("left", "UXRCE_DDS_PTCFG", 0) in widget.mavlink_pixhawk.param_sets
+    assert ("right", "UXRCE_DDS_SYNCT", 1) in widget.mavlink_pixhawk.param_sets
+    assert widget._ros2_retry_after_uxrce_agent_setup is False
     assert "MAVLink" in widget.pixhawk_connection_label.text()
 
     widget.deleteLater()
     _ = app
 
 
-def test_auto_start_pixhawk_selects_rm3100_and_connects(monkeypatch) -> None:
+def test_auto_start_pixhawk_selects_baseline_and_connects(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     import wiris_stereo_distance.gui as gui
@@ -1584,7 +2160,7 @@ def test_auto_start_pixhawk_selects_rm3100_and_connects(monkeypatch) -> None:
 
     assert calls == ["connect"]
     assert widget.tabs.currentIndex() == widget.alignment_tab_index
-    assert widget.alignment_tabs.currentIndex() == widget.rm3100_alignment_tab_index
+    assert widget.alignment_tabs.currentIndex() == widget.baseline_alignment_tab_index
 
     widget.deleteLater()
     _ = app
@@ -1604,9 +2180,8 @@ def test_binary_options_use_checkable_toggle_buttons(monkeypatch) -> None:
         widget.require_rtk_fixed_checkbox,
         widget.manual_focal_checkbox,
         widget.same_class_checkbox,
-        widget.require_attitude_checkbox,
         widget.mavlink_configure_streams_checkbox,
-        widget.mavlink_start_ros2_checkbox,
+        widget.mavlink_configure_uxrce_agent_checkbox,
         widget.stip_reboot_checkbox,
     ]
     for button in toggles:
@@ -1617,7 +2192,8 @@ def test_binary_options_use_checkable_toggle_buttons(monkeypatch) -> None:
     assert isinstance(widget.distance_mode_combo, QtWidgets.QComboBox)
     assert widget.distance_mode_combo.findData("disparity") == -1
     assert widget.distance_mode_combo.findData("calibration") == -1
-    assert widget.distance_mode_combo.itemText(widget.distance_mode_combo.findData("pixhawk")) == "Pixhawk 자세 + RTK 위치"
+    assert widget.distance_mode_combo.itemText(widget.distance_mode_combo.findData("pixhawk")) == "Pixhawk 자세 + GPS/RTK baseline"
+    assert not hasattr(widget, "require_attitude_checkbox")
     assert isinstance(widget.measurement_display_combo, QtWidgets.QComboBox)
     assert widget.measurement_display_combo.itemText(widget.measurement_display_combo.findData("detection")) == "계산 선택 프레임"
     assert widget.measurement_display_combo.itemText(widget.measurement_display_combo.findData("preview")) == "실시간 Preview"
@@ -2010,7 +2586,7 @@ def test_rtk_alignment_view_separates_antenna_and_camera_baseline(monkeypatch) -
 
     import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
-    from wiris_stereo_distance.rtk_geometry import RtkBaselineEstimate
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -2126,12 +2702,103 @@ def test_live_gps_baseline_visualizes_without_rtk_fixed_or_reference_toggle(monk
     assert widget.latest_rtk_baseline.fix_quality == "DEGRADED"
     assert widget.rtk_alignment_plot.baseline is widget.latest_rtk_baseline
     assert "GPS baseline:" in widget.rtk_baseline_label.text()
-    assert "참고 OFF, 표시만" in widget.rtk_baseline_label.text()
+    assert "계산 OFF, 표시만" in widget.rtk_baseline_label.text()
     assert "left 3D_FIX" in widget.rtk_baseline_label.text()
     assert "right 3D_FIX" in widget.rtk_baseline_label.text()
-    assert "안테나 |T|=" in widget.rtk_alignment_detail_label.text()
-    assert "GPS-only 모드" in widget.rtk_alignment_detail_label.text()
+    assert "RTK Fixed: NO" in widget.rtk_fixed_status_label.text()
+    assert "GPS baseline 계산 OFF" in widget.rtk_fixed_status_label.text()
+    assert "ENU E/N/U=" in widget.rtk_alignment_detail_label.text()
+    assert "NED N/E/D=" in widget.rtk_alignment_detail_label.text()
     assert "GPS 위치 대기" not in widget.rtk_alignment_detail_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_gps_only_baseline_can_drive_pixhawk_translation_when_fixed_not_required(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget.use_rtk_baseline_checkbox.setChecked(True)
+    widget.require_rtk_fixed_checkbox.setChecked(False)
+    now_s = time.monotonic()
+    widget._update_gps(
+        "left",
+        GpsPositionState("left", "/uav_0", now_s, "gps", 37.0, 127.0, 10.0, fix_type=3, satellites_used=8, eph_m=2.5),
+    )
+    widget._update_gps(
+        "right",
+        GpsPositionState("right", "/uav_1", now_s, "gps", 37.0, 127.000003, 10.0, fix_type=3, satellites_used=9, eph_m=2.2),
+    )
+    widget.latest_extrinsics["left"] = CameraExtrinsicState(
+        camera="left",
+        namespace="/uav_0",
+        roll_deg=0.0,
+        pitch_deg=0.0,
+        yaw_deg=0.0,
+        timestamp_s=now_s,
+        topic="/uav_0/fmu/out/vehicle_attitude",
+        q=(1.0, 0.0, 0.0, 0.0),
+    )
+
+    translation = widget._translation_right_in_left_m()
+
+    assert translation is not None
+    assert widget.latest_rtk_baseline is not None
+    assert abs(sum(component * component for component in translation) ** 0.5 - widget.latest_rtk_baseline.baseline_m) < 1e-6
+    assert widget.latest_rtk_baseline is not None
+    assert widget.latest_rtk_baseline.fix_quality == "DEGRADED"
+    assert "RTK Fixed: NO" in widget.rtk_fixed_status_label.text()
+    assert "사용 가능" in widget.rtk_fixed_status_label.text()
+    assert "baseline_source_detail: live GPS/RTK baseline" in widget._format_stereo_geometry_text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_rtk_fixed_required_blocks_gps_only_translation(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget.use_rtk_baseline_checkbox.setChecked(True)
+    widget.require_rtk_fixed_checkbox.setChecked(True)
+    now_s = time.monotonic()
+    widget._update_gps(
+        "left",
+        GpsPositionState("left", "/uav_0", now_s, "gps", 37.0, 127.0, 10.0, fix_type=3, satellites_used=8, eph_m=2.5),
+    )
+    widget._update_gps(
+        "right",
+        GpsPositionState("right", "/uav_1", now_s, "gps", 37.0, 127.000003, 10.0, fix_type=3, satellites_used=9, eph_m=2.2),
+    )
+    widget.latest_extrinsics["left"] = CameraExtrinsicState(
+        camera="left",
+        namespace="/uav_0",
+        roll_deg=0.0,
+        pitch_deg=0.0,
+        yaw_deg=0.0,
+        timestamp_s=now_s,
+        topic="/uav_0/fmu/out/vehicle_attitude",
+        q=(1.0, 0.0, 0.0, 0.0),
+    )
+
+    assert widget._translation_right_in_left_m() is None
+    assert "RTK Fixed required" in widget.rtk_fixed_status_label.text()
+    assert widget._active_baseline_m()[1] == "gps-rtk-blocked"
 
     widget.deleteLater()
     _ = app
@@ -2144,14 +2811,13 @@ def test_pixhawk_translation_scales_to_measurement_baseline(monkeypatch) -> None
 
     import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
-    from wiris_stereo_distance.rtk_geometry import RtkBaselineEstimate
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
 
     widget.use_rtk_baseline_checkbox.setChecked(True)
-    widget.baseline_spin.setValue(0.5)
     widget.latest_rtk_baseline = RtkBaselineEstimate(
         baseline_m=0.374,
         north_m=0.0,
@@ -2161,27 +2827,24 @@ def test_pixhawk_translation_scales_to_measurement_baseline(monkeypatch) -> None
         right_age_s=0.02,
         fix_quality="GOOD",
     )
+    now_s = time.monotonic()
+    widget.latest_gps["left"] = GpsPositionState("left", "/uav_0", now_s, "gps", 37.0, 127.0, 10.0, fix_type=6)
+    widget.latest_gps["right"] = GpsPositionState("right", "/uav_1", now_s, "gps", 37.0, 127.000003, 10.0, fix_type=6)
     widget.latest_extrinsics["left"] = CameraExtrinsicState(
         camera="left",
         namespace="/uav_0",
         roll_deg=0.0,
         pitch_deg=0.0,
         yaw_deg=0.0,
-        timestamp_s=time.monotonic(),
+        timestamp_s=now_s,
         topic="mavlink/ATTITUDE",
         q=(1.0, 0.0, 0.0, 0.0),
     )
 
     translation = widget._translation_right_in_left_m()
     assert translation is not None
-    assert abs(sqrt(sum(component * component for component in translation)) - 0.5) < 1e-6
-    assert translation == (0.5, 0.0, 0.0)
-
-    widget.baseline_spin.setValue(0.25)
-    translation = widget._translation_right_in_left_m()
-    assert translation is not None
-    assert abs(sqrt(sum(component * component for component in translation)) - 0.25) < 1e-6
-    assert translation == (0.25, 0.0, 0.0)
+    assert abs(sqrt(sum(component * component for component in translation)) - 0.3) < 1e-6
+    assert translation == (0.3, 0.0, 0.0)
 
     widget.deleteLater()
     _ = app
@@ -2192,13 +2855,12 @@ def test_pixhawk_translation_uses_nominal_shared_rig_without_mount_correction_ui
 
     import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
-    from wiris_stereo_distance.rtk_geometry import RtkBaselineEstimate
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
 
-    widget.baseline_spin.setValue(1.0)
     widget.latest_rtk_baseline = RtkBaselineEstimate(
         baseline_m=1.0,
         north_m=0.0,
@@ -2208,13 +2870,16 @@ def test_pixhawk_translation_uses_nominal_shared_rig_without_mount_correction_ui
         right_age_s=0.02,
         fix_quality="GOOD",
     )
+    now_s = time.monotonic()
+    widget.latest_gps["left"] = GpsPositionState("left", "/uav_0", now_s, "gps", 37.0, 127.0, 10.0, fix_type=6)
+    widget.latest_gps["right"] = GpsPositionState("right", "/uav_1", now_s, "gps", 37.0, 127.00001, 10.0, fix_type=6)
     widget.latest_extrinsics["left"] = CameraExtrinsicState(
         camera="left",
         namespace="/uav_0",
         roll_deg=0.0,
         pitch_deg=0.0,
         yaw_deg=0.0,
-        timestamp_s=time.monotonic(),
+        timestamp_s=now_s,
         topic="mavlink/ATTITUDE",
         q=(1.0, 0.0, 0.0, 0.0),
     )
@@ -2223,8 +2888,37 @@ def test_pixhawk_translation_uses_nominal_shared_rig_without_mount_correction_ui
 
     assert translation is not None
     assert tuple(round(component, 6) for component in translation) == (1.0, 0.0, 0.0)
-    assert "장착=nominal shared rig" in widget._distance_parameters_summary()
-    assert "baseline과 Pixhawk 자세만" in widget.mount_assumption_label.text()
+    assert "장착=GPS/RTK baseline only" in widget._distance_parameters_summary()
+    assert "수동 baseline 입력은 사용하지 않고" in widget.mount_assumption_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_pixhawk_translation_waits_without_gps_baseline(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget.latest_rtk_baseline = None
+    now_s = time.monotonic()
+    widget.latest_extrinsics["left"] = CameraExtrinsicState(
+        camera="left",
+        namespace="/uav_0",
+        roll_deg=0.0,
+        pitch_deg=0.0,
+        yaw_deg=0.0,
+        timestamp_s=now_s,
+        topic="mavlink/ATTITUDE",
+        q=(1.0, 0.0, 0.0, 0.0),
+    )
+
+    assert widget._translation_right_in_left_m() is None
 
     widget.deleteLater()
     _ = app
@@ -2696,13 +3390,14 @@ def test_rm3100_yaw_source_selection_sets_px4_primary_mag(monkeypatch) -> None:
     _ = app
 
 
-def test_rm3100_yaw_source_selection_rejects_missing_device_id(monkeypatch) -> None:
+def test_rm3100_yaw_source_selection_uses_inferred_mavlink_device_id(monkeypatch) -> None:
     from types import SimpleNamespace
 
     from PyQt5 import QtWidgets
 
     import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.pixhawk_attitude import MagSensorState
+    from wiris_stereo_distance.px4_mag_manager import RM3100_BACKUP_ID
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -2727,8 +3422,11 @@ def test_rm3100_yaw_source_selection_rejects_missing_device_id(monkeypatch) -> N
 
     widget.apply_rm3100_yaw_source("left")
 
-    assert sent == []
-    assert "device_id 없음" in widget.rm3100_yaw_source_status_labels["left"].text()
+    assert sent == [
+        ("left", f"param set CAL_MAG_PRIME {RM3100_BACKUP_ID}\nparam save\nparam show CAL_MAG_PRIME")
+    ]
+    assert f"CAN2 device={RM3100_BACKUP_ID}" in widget.rm3100_yaw_source_status_labels["left"].text()
+    assert "PX4 param inferred" in widget.rm3100_yaw_source_status_labels["left"].text()
 
     widget.deleteLater()
     _ = app
@@ -3426,11 +4124,180 @@ def test_mavlink_gps2_raw_maps_to_second_gps_sensor() -> None:
         FakeMavlinkMessage(fix_type=6, satellites_visible=20, eph=3, epv=4, lat=370000001, lon=1270000001, alt=123000),
     )
 
-    assert gps_positions == []
+    assert gps_positions[0][0] == "left_GPS2"
+    assert gps_positions[0][1].topic == "mavlink/GPS2_RAW"
+    assert gps_positions[0][1].latitude_deg == 37.0000001
     assert gps_sensors[0][0] == "left"
     assert gps_sensors[0][1].sensor_slot == "GPS2"
     assert gps_sensors[0][1].topic == "mavlink/GPS2_RAW"
     assert gps_sensors[0][1].eph_m == 0.03
+
+
+def test_gps_sensor_labels_show_ros2_topic_and_mavlink_field(monkeypatch) -> None:
+    import time
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import GpsSensorState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    now_s = time.monotonic()
+
+    widget._update_gps_sensor(
+        "left",
+        GpsSensorState(
+            camera="left",
+            namespace="uav_0",
+            sensor_slot="GPS1",
+            timestamp_s=now_s,
+            topic="/uav_0/fmu/out/vehicle_gps_position",
+            device_id=42,
+            fix_type=3,
+            satellites_used=8,
+            eph_m=2.5,
+            epv_m=3.5,
+            px4_timestamp_s=12.345,
+        ),
+    )
+    widget._update_gps_sensor(
+        "left",
+        GpsSensorState(
+            camera="left",
+            namespace="uav_0",
+            sensor_slot="GPS2",
+            timestamp_s=now_s,
+            topic="mavlink/GPS2_RAW",
+            fix_type=6,
+            satellites_used=18,
+            eph_m=0.03,
+            epv_m=0.04,
+        ),
+    )
+
+    gps1_text = widget.f9p_slot_labels["left"]["GPS1"].text()
+    gps2_text = widget.f9p_slot_labels["left"]["GPS2"].text()
+    compare_text = widget.f9p_compare_labels["left"].text()
+
+    assert "ROS2 /uav_0/fmu/out/vehicle_gps_position" in gps1_text
+    assert "MAVLink GPS2_RAW" in gps2_text
+    assert "px4_t=12.345s" in gps1_text
+    assert "src=ROS2 /uav_0/fmu/out/vehicle_gps_position / MAVLink GPS2_RAW" in compare_text
+    assert widget.f9p_slot_labels["left"]["GPS1"].wordWrap()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_baseline_alignment_tab_collects_gps_and_computes_baseline(monkeypatch) -> None:
+    import time
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.pixhawk_attitude import GpsSensorState
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    now_s = time.monotonic()
+
+    widget._update_gps(
+        "left",
+        GpsPositionState(
+            camera="left",
+            namespace="uav_0",
+            timestamp_s=now_s,
+            topic="/uav_0/fmu/out/vehicle_gps_position",
+            latitude_deg=37.0,
+            longitude_deg=127.0,
+            altitude_m=10.0,
+            fix_type=3,
+            satellites_used=8,
+            eph_m=2.0,
+            epv_m=3.0,
+        ),
+    )
+    widget._update_gps(
+        "right",
+        GpsPositionState(
+            camera="right",
+            namespace="uav_1",
+            timestamp_s=now_s,
+            topic="/uav_1/fmu/out/vehicle_gps_position",
+            latitude_deg=37.0,
+            longitude_deg=127.000003,
+            altitude_m=10.1,
+            fix_type=3,
+            satellites_used=9,
+            eph_m=2.1,
+            epv_m=3.1,
+        ),
+    )
+    widget._update_gps_sensor(
+        "left",
+        GpsSensorState(
+            camera="left",
+            namespace="uav_0",
+            sensor_slot="GPS1",
+            timestamp_s=now_s,
+            topic="mavlink/GPS_RAW_INT",
+            fix_type=3,
+            satellites_used=8,
+            eph_m=2.0,
+        ),
+    )
+
+    assert widget.alignment_tabs.tabText(widget.baseline_alignment_tab_index) == "GNSS / Baseline"
+    assert [widget.baseline_tabs.tabText(index) for index in range(widget.baseline_tabs.count())] == [
+        "GPS 인식",
+        "ROS2 Topic / MAVLink Field",
+        "Baseline 계산",
+        "신뢰성 평가",
+        "Baseline Profile",
+    ]
+    assert "3D_FIX" in widget.baseline_gps_card_labels["left"]["rtk"].text()
+    assert "MAVLink GPS_RAW_INT" in widget.baseline_gps_card_labels["left"]["gps1"].text() or "인식" in widget.baseline_gps_card_labels["left"]["gps1"].text()
+    assert widget.latest_baseline_vector is not None
+    assert "m" in widget.baseline_calc_labels["length"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_baseline_alignment_sampling_updates_quality(monkeypatch) -> None:
+    import time
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    now_s = time.monotonic()
+
+    widget.require_rtk_fixed_checkbox.setChecked(False)
+    widget.start_baseline_sampling()
+    widget._update_gps(
+        "left",
+        GpsPositionState("left", "/uav_0", now_s, "gps", 37.0, 127.0, 10.0, fix_type=6, eph_m=0.01, epv_m=0.02),
+    )
+    widget._update_gps(
+        "right",
+        GpsPositionState("right", "/uav_1", now_s, "gps", 37.0, 127.000003, 10.0, fix_type=6, eph_m=0.01, epv_m=0.02),
+    )
+    widget.stop_baseline_sampling()
+
+    assert widget.latest_baseline_quality is not None
+    assert "Quality:" in widget.baseline_quality_badge.text()
+
+    widget.deleteLater()
+    _ = app
 
 
 def test_mavlink_gps_raw_yaw_emits_gnss_relative_heading() -> None:
@@ -3604,9 +4471,13 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
         "줌 내부 파라미터",
     ]
     assert [widget.alignment_tabs.tabText(index) for index in range(widget.alignment_tabs.count())] == [
-        "Baseline",
-        "MAG",
-        "자세",
+        "개요",
+        "GNSS / Baseline",
+        "Magnetometer / Yaw",
+        "Attitude",
+        "Coordinate System",
+        "Validation",
+        "Alignment Profile",
     ]
     assert [widget.pixhawk_tabs.tabText(index) for index in range(widget.pixhawk_tabs.count())] == [
         "요약",
@@ -3649,7 +4520,7 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert widget.extrinsics_settings_group.title() == "기본: 외부 파라미터 / Baseline"
     assert widget.extrinsics_settings_group.isVisible()
     assert isinstance(widget.distance_mode_combo, QtWidgets.QComboBox)
-    assert widget.distance_mode_combo.currentText() == "Pixhawk 자세 + RTK 위치"
+    assert widget.distance_mode_combo.currentText() == "Pixhawk 자세 + GPS/RTK baseline"
     assert widget.measurement_display_combo.currentText() == "계산 선택 프레임"
     assert widget.stereo_parameter_splitter.orientation() == QtCore.Qt.Horizontal
     assert widget.stereo_parameter_splitter.count() == 2
@@ -3657,7 +4528,7 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert len(sizes) == 2
     assert sizes[0] > 0 and sizes[1] > 0
     assert abs(sizes[0] - sizes[1]) < max(sizes)
-    assert widget.distance_mode_combo.itemText(widget.distance_mode_combo.findData("pixhawk")) == "Pixhawk 자세 + RTK 위치"
+    assert widget.distance_mode_combo.itemText(widget.distance_mode_combo.findData("pixhawk")) == "Pixhawk 자세 + GPS/RTK baseline"
     assert widget.save_intrinsics_button.parentWidget().title() == "저장 / 적용"
     assert widget.apply_intrinsics_button.parentWidget().title() == "저장 / 적용"
     assert widget.apply_intrinsics_button.text() == "계산에 적용"
@@ -3669,7 +4540,7 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert "roll:  1.000000 deg" in widget.left_extrinsics_text.toPlainText()
     assert "intrinsics_source: active calibration result" in widget.stereo_geometry_text.toPlainText()
     assert "focal_source: calibrated intrinsics average fx" in widget.stereo_geometry_text.toPlainText()
-    assert "baseline_source_detail: manual baseline spinbox" in widget.stereo_geometry_text.toPlainText()
+    assert "baseline_source_detail: GPS/RTK baseline disabled" in widget.stereo_geometry_text.toPlainText()
     assert "distance_method: 3D ray fallback: Pixhawk 자세 대기 중" in widget.stereo_geometry_text.toPlainText()
     assert "use_3d_distance: true" in widget.stereo_geometry_text.toPlainText()
     assert "계산 파라미터:" in widget.distance_parameters_label.text()
@@ -3871,7 +4742,7 @@ def test_camera_parameters_tab_shows_sources_without_pixhawk() -> None:
     assert "source: none (Pixhawk disconnected or waiting)" in widget.right_extrinsics_text.toPlainText()
     assert "intrinsics_source: active calibration result" in widget.stereo_geometry_text.toPlainText()
     assert "focal_source: calibrated intrinsics average fx" in widget.stereo_geometry_text.toPlainText()
-    assert "baseline_source_detail: manual baseline spinbox" in widget.stereo_geometry_text.toPlainText()
+    assert "baseline_source_detail: waiting for live GPS/RTK baseline" in widget.stereo_geometry_text.toPlainText()
     assert "distance_method: 3D ray fallback: Pixhawk 자세 대기 중" in widget.stereo_geometry_text.toPlainText()
 
     widget.deleteLater()
@@ -3884,11 +4755,10 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
     from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
     from wiris_stereo_distance.gui import WirisStereoDistancePanel
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
-    from wiris_stereo_distance.rtk_geometry import RtkBaselineEstimate
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = WirisStereoDistancePanel()
-    widget.baseline_spin.setValue(0.3)
     intrinsics = CameraIntrinsics(
         width=1280,
         height=720,
@@ -3911,6 +4781,8 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
         right_age_s=0.0,
         fix_quality="GOOD",
     )
+    widget.latest_gps["left"] = GpsPositionState("left", "/uav_0", 10.0, "gps", 37.0, 127.0, 10.0, fix_type=6)
+    widget.latest_gps["right"] = GpsPositionState("right", "/uav_1", 10.0, "gps", 37.0, 127.000003, 10.0, fix_type=6)
     for camera in ("left", "right"):
         widget._update_extrinsic(
             camera,
@@ -3931,12 +4803,12 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
     widget._update_detection("right", detection("right", x1=640, y1=340, x2=660, y2=380, t=10.0))
 
     assert "triangulated-pixhawk" in widget.distance_label.text()
-    assert "baseline=manual:0.300m" in widget.distance_label.text()
+    assert "baseline=gps-rtk:0.300m" in widget.distance_label.text()
     assert "gap:" in widget.triangulation_quality_gap_label.text()
     assert "mode: triangulated-pixhawk" in widget.triangulation_quality_mode_label.text()
     assert "Raw center 3D point:" in widget.triangulation_quality_raw_point_label.text()
-    assert "3D ray 거리: Pixhawk 자세 + RTK 위치 사용" in widget.stereo_geometry_text.toPlainText()
-    assert "위치/자세 출처=Pixhawk 자세 + RTK 위치" in widget.distance_parameters_label.text()
+    assert "3D ray 거리: Pixhawk 자세 + GPS/RTK baseline 사용" in widget.stereo_geometry_text.toPlainText()
+    assert "위치/자세 출처=Pixhawk 자세 + GPS/RTK baseline" in widget.distance_parameters_label.text()
 
     widget.deleteLater()
     _ = app
@@ -4003,7 +4875,6 @@ def test_no_detection_event_does_not_clear_recent_measurement_match(monkeypatch)
         right=intrinsics,
         board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.03),
     )
-    widget.baseline_spin.setValue(0.3)
     widget.latest_rtk_baseline = RtkBaselineEstimate(
         baseline_m=0.3,
         north_m=0.0,
@@ -4082,8 +4953,8 @@ def test_measurement_settings_show_only_selected_parameter_source_controls(monke
     app.processEvents()
 
     assert not widget.focal_spin.isVisible()
-    assert widget.baseline_spin.isVisible()
-    assert widget.max_attitude_age_spin.isVisible()
+    assert not widget.baseline_spin.isVisible()
+    assert not hasattr(widget, "max_attitude_age_spin")
     assert "체커보드 보정값" in widget.intrinsics_status_label.text()
 
     widget.intrinsics_source_combo.setCurrentIndex(widget.intrinsics_source_combo.findData("manual"))
@@ -4091,15 +4962,15 @@ def test_measurement_settings_show_only_selected_parameter_source_controls(monke
     app.processEvents()
 
     assert widget.focal_spin.isVisible()
-    assert widget.baseline_spin.isVisible()
-    assert widget.max_attitude_age_spin.isVisible()
+    assert not widget.baseline_spin.isVisible()
+    assert not hasattr(widget, "max_attitude_age_spin")
     assert widget.manual_focal_checkbox.isChecked()
 
     widget.deleteLater()
     _ = app
 
 
-def test_gps_baseline_calculator_applies_manual_baseline(monkeypatch) -> None:
+def test_manual_gps_baseline_calculator_is_removed(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     from wiris_stereo_distance.gui import WirisStereoDistancePanel
@@ -4108,20 +4979,44 @@ def test_gps_baseline_calculator_applies_manual_baseline(monkeypatch) -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = WirisStereoDistancePanel()
 
-    widget.gps_baseline_spins["left"]["lat"].setValue(37.0)
-    widget.gps_baseline_spins["left"]["lon"].setValue(127.0)
-    widget.gps_baseline_spins["left"]["alt"].setValue(10.0)
-    widget.gps_baseline_spins["right"]["lat"].setValue(37.0)
-    widget.gps_baseline_spins["right"]["lon"].setValue(127.00001)
-    widget.gps_baseline_spins["right"]["alt"].setValue(10.0)
+    assert not widget.baseline_spin.isVisible()
+    assert widget.gps_baseline_spins == {}
+    assert not hasattr(widget, "gps_baseline_result_label")
+    assert not hasattr(widget, "calculate_gps_baseline")
+    assert not hasattr(widget, "apply_gps_baseline_to_manual_input")
 
-    result = widget.calculate_gps_baseline()
-    assert result is not None
-    assert 0.8 < result.baseline_m < 1.0
-    widget.apply_gps_baseline_to_manual_input()
+    widget.deleteLater()
+    _ = app
 
-    assert abs(widget.baseline_spin.value() - result.baseline_m) < 0.001
-    assert "baseline_source_detail: manual baseline spinbox" in widget.stereo_geometry_text.toPlainText()
+
+def test_wiris_pc_time_uses_one_shared_stus_timestamp_for_both_cameras(monkeypatch) -> None:
+    import threading
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.wiris_command_target_combo.setCurrentIndex(widget.wiris_command_target_combo.findData("both"))
+    sent_commands = []
+    lock = threading.Lock()
+
+    def fake_send_tcp_line(command):
+        with lock:
+            sent_commands.append(command.command)
+        return ""
+
+    monkeypatch.setattr(gui, "send_tcp_line", fake_send_tcp_line)
+
+    widget.set_selected_wiris_time_from_pc()
+
+    assert len(sent_commands) == 2
+    assert sent_commands[0] == sent_commands[1]
+    assert sent_commands[0].startswith("STUS ")
+    assert "명령 UTC 차이" in widget.wiris_command_status_label.text()
+    assert "0.000 ms" in widget.wiris_command_status_label.text()
 
     widget.deleteLater()
     _ = app
@@ -4959,9 +5854,10 @@ def test_bias_recording_saves_bbox_drone_raw_corrected_and_error_fields(monkeypa
     assert row["body_frame"] == "px4_frd"
     assert row["camera_frame"] == "opencv_optical"
     assert row["camera_mount_profile"] == "front_camera_z_to_body_x_x_to_body_y"
-    assert row["mount_assumption_model"] == "nominal-shared-rig-v1"
-    assert row["mount_assumption_status"] == "nominal shared rig"
-    assert row["mount_assumption_detail"] == "same_left_right_rig; baseline_used_as_effective_stereo_translation"
+    assert row["mount_assumption_model"] == "gps-rtk-baseline-only-v1"
+    assert row["mount_assumption_status"] == "GPS/RTK baseline only"
+    assert row["mount_assumption_detail"] == "live_gps_rtk_baseline_used_as_stereo_translation"
+    assert "manual_baseline_setting_m" not in row
     assert row["left_bbox_center_x_px"] == "120.000"
     assert row["right_bbox_confidence"] == "0.900000"
     assert row["bbox_mid_timestamp_s"] == "3.025000"
@@ -5033,6 +5929,124 @@ def test_uam_mavlink_watch_updates_live_buffer(monkeypatch) -> None:
     assert widget.uam_live_telemetry_samples[-1].source == "live-mavlink:left"
     assert "source=live-mavlink:left" in widget.uam_latest_label.text()
     assert any(point.series == "truth_north_m" and point.value == 10.0 for point in widget.uam_raw_plot.points)
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_uam_usb_mavlink_uses_separate_subscriber(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    class FakeSignal:
+        def __init__(self) -> None:
+            self.slots = []
+
+        def connect(self, slot) -> None:
+            self.slots.append(slot)
+
+    class FakeMavlinkSubscriber:
+        instances = []
+
+        def __init__(self, *, left_url, right_url, left_baud=57600, right_baud=57600, custom_watches=()) -> None:
+            self.urls = {"left": left_url, "right": right_url}
+            self.baudrates = {"left": left_baud, "right": right_baud}
+            self.custom_watches = list(custom_watches)
+            self.connections = {}
+            self.gps_changed = FakeSignal()
+            self.custom_watch_changed = FakeSignal()
+            self.status_changed = FakeSignal()
+            self.extrinsic_changed = FakeSignal()
+            self.mag_sensor_changed = FakeSignal()
+            self.gps_sensor_changed = FakeSignal()
+            self.gnss_relative_changed = FakeSignal()
+            self.shell_output = FakeSignal()
+            self.started_camera = None
+            self.instances.append(self)
+
+        def start(self, camera=None) -> None:
+            self.started_camera = camera
+            if camera == "left" and self.urls["left"]:
+                self.connections["left"] = object()
+
+        def stop(self, camera=None) -> None:
+            self.connections.clear()
+
+        def add_custom_watch(self, spec) -> None:
+            self.custom_watches.append(spec)
+
+        def remove_custom_watch(self, key) -> None:
+            self.custom_watches = [spec for spec in self.custom_watches if spec.get("key") != key]
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget._set_combo_data(widget.uam_source_combo, "mavlink")
+    widget.uam_mavlink_url_edit.setText("/dev/ttyACM7")
+    widget.uam_mavlink_baud_spin.setValue(921600)
+
+    widget.connect_uam_telemetry_from_ui()
+
+    subscriber = widget.uam_mavlink_pixhawk
+    assert subscriber is not None
+    assert widget.mavlink_pixhawk is None
+    assert subscriber.urls == {"left": "/dev/ttyACM7", "right": ""}
+    assert subscriber.baudrates["left"] == 921600
+    assert subscriber.started_camera == "left"
+    assert all(spec["source"] == "uam_mavlink" for spec in subscriber.custom_watches)
+    assert {spec["key"] for spec in subscriber.custom_watches} == {"uam_x", "uam_y", "uam_z"}
+    assert "USB MAVLink watch 등록" in widget.uam_status_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_uam_usb_mavlink_gps_converts_to_local_ned(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget._set_combo_data(widget.uam_source_combo, "mavlink_gps")
+
+    widget._update_uam_live_telemetry_from_gps(
+        "left",
+        GpsPositionState(
+            camera="left",
+            namespace="uam_usb",
+            timestamp_s=10.0,
+            topic="mavlink/GPS_RAW_INT",
+            latitude_deg=37.0,
+            longitude_deg=127.0,
+            altitude_m=100.0,
+        ),
+    )
+    widget._update_uam_live_telemetry_from_gps(
+        "left",
+        GpsPositionState(
+            camera="left",
+            namespace="uam_usb",
+            timestamp_s=11.0,
+            topic="mavlink/GPS_RAW_INT",
+            latitude_deg=37.00001,
+            longitude_deg=127.00002,
+            altitude_m=98.5,
+        ),
+    )
+
+    assert widget.latest_drone_position_m is not None
+    north_m, east_m, down_m = widget.latest_drone_position_m
+    assert north_m > 0.0
+    assert east_m > 0.0
+    assert down_m == 1.5
+    assert widget.latest_drone_truth_sample is not None
+    assert widget.latest_drone_truth_sample.source_frame == "global_lla"
+    assert widget.latest_drone_truth_sample.source_axis_contract == "lat_deg,lon_deg,alt_m"
 
     widget.deleteLater()
     _ = app

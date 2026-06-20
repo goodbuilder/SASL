@@ -28,6 +28,8 @@ log/
 **/build/
 **/install/
 **/log/
+workspace/main/src/px4_msgs/
+workspace/live_measurement_check/
 
 # Large generated experiment/runtime outputs
 Simulation/results/

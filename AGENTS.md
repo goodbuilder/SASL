@@ -1,7 +1,7 @@
 # AGENTS.md - 영상감시시스템 공통 작업 규칙
 
-This file applies to `/home/moontaehyung/영상감시시스템` and every child
-directory unless a deeper `AGENTS.md` adds more specific rules.
+This file applies to the `SASL` repository and every child directory
+unless a deeper `AGENTS.md` adds more specific rules.
 
 ## Coordinate Contract Gate
 
@@ -57,6 +57,44 @@ For experiment or correction-method changes:
   validation only.
 - Treat partial failures as information: report what improved, what
   regressed, and which conditions were outside the validated range.
+
+## Git Portability Discipline
+
+The intended workflow is to push the `SASL` repository, clone or pull it
+on a notebook, and continue work from the pushed files without relying on
+untracked machine-local state.
+
+When adding or changing dependencies, generated interfaces, firmware
+helpers, scripts, parameters, or non-app files:
+
+- Keep reproducible source, configuration, scripts, and documentation
+  inside the `SASL` git tree when they are required to continue the work
+  on another machine.
+- Do not make required project state live only in absolute local paths
+  such as `/home/moon/px4_msgs_ws`, `/opt/...`, `/tmp/...`, or a desktop
+  download directory. If such a path is used for local execution, provide
+  a repo-relative alternative or document the setup command that recreates
+  it.
+- Prefer repo-local workspaces such as `SASL/workspace/main/src/...` for
+  ROS interface source packages. Build products such as `build/`,
+  `install/`, and `log/` should normally be regenerated on the target
+  machine instead of committed. If ROS tooling cannot build reliably from
+  the checkout path, keep only the build/log cache outside the repository
+  and leave the reproducible source plus setup script under `SASL`.
+- If PX4 firmware source changes are required, keep the patch, fork,
+  submodule, or setup script under `SASL` rather than only modifying a
+  separate checkout. The notebook clone must make it clear which PX4
+  source revision and DDS/uORB export changes are needed.
+- Do not commit machine-specific caches, virtual environments, compiled
+  outputs, large downloaded model files, or secrets unless the repository
+  already tracks them intentionally and the user has confirmed that they
+  belong in git.
+- When a command, script, test, or app setting references a local absolute
+  path, either convert it to a repo-relative path or record why the
+  absolute path is intentionally machine-local.
+- Before finalizing a change that affects portability, run `git status`
+  from the `SASL` root and call out any required files that are untracked,
+  ignored, or outside the repository.
 
 ## Verification
 

@@ -118,11 +118,18 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         super().__init__()
         self.points: deque[DistanceHistoryPoint] = deque(maxlen=600)
         self._selected_point_keys: set[tuple[float, float, str]] = set()
+        self.empty_message = "그래프 미표시: 좌/우 YOLO 검출 쌍 대기 중"
         self.setMinimumHeight(260)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
         self.setMouseTracking(True)
         self.setToolTip("왼쪽 클릭: 점의 정보를 추가/해제합니다. 빈 곳 왼쪽 클릭: 선택 해제. 오른쪽 클릭: 해당 점 삭제.")
+
+    def set_empty_message(self, message: str | None) -> None:
+        cleaned = str(message or "").strip()
+        self.empty_message = cleaned or "그래프 미표시: 좌/우 YOLO 검출 쌍 대기 중"
+        if not self.points:
+            self.update()
 
     def add_point(self, point: DistanceHistoryPoint) -> None:
         self.points.append(point)
@@ -313,7 +320,8 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
         if not self.points:
             painter.setPen(QtGui.QColor(CHART_MUTED))
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "3D 거리 기록: YOLO 매칭 대기 중")
+            text_rect = self.rect().adjusted(24, 24, -24, -24)
+            painter.drawText(text_rect, QtCore.Qt.AlignCenter | QtCore.Qt.TextWordWrap, self.empty_message)
             painter.end()
             return
         global_start_s = self.points[0].timestamp_s

@@ -49,6 +49,35 @@ uam_stereo_ui/
 
 If PyQt6 is not available, use PySide6 with minimal changes.
 
+## Notebook Handoff
+
+The working handoff model is:
+
+1. Push this `SASL` repository.
+2. Clone or pull it on the notebook.
+3. Recreate local ROS build outputs from tracked scripts instead of
+   copying machine-local workspaces.
+
+For the PX4 ROS message overlay used by `StereoDistance`, run:
+
+```bash
+cd SASL
+scripts/bootstrap_ros_workspace.sh
+```
+
+This prepares `workspace/main/src/px4_msgs` at the pinned PX4 message
+revision and builds the local overlay at `workspace/main/install/setup.bash`.
+The source clone and generated overlay are intentionally not tracked by
+this repository; they are reproducible local state. The script keeps the
+ROS build/log cache under `~/.cache/sasl_ros_workspace/...` so ROS message
+generation does not depend on the checkout path being ASCII-only.
+`StereoDistance/run.sh` automatically sources
+`workspace/main/install/setup.bash` when it exists.
+
+If a future task requires PX4 firmware/DDS export changes, keep the
+patch, submodule, fork reference, or setup script inside `SASL` so the
+notebook clone can reproduce the same firmware source state.
+
 ## Main Tabs
 
 Create these top-level tabs:

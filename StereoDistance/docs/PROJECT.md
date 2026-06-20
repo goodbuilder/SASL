@@ -75,7 +75,7 @@ Pixhawk 연결의 우선 의도는 ROS2/uXRCE 경로를 살리는 것이다. ROS
 
 따라서 ROS2 연결 실패 시 MAVLink는 두 역할을 가진다.
 
-- 복구 경로: Pixhawk 쪽 MAVLink stream 설정과 `uxrce_dds_client start -t udp -p <port> -h <host> -n <namespace>` 명령을 전송해 ROS2가 다시 붙을 조건을 만든다.
+- 복구 경로: Pixhawk 쪽 MAVLink stream 설정과 MAVLink `PARAM_SET`/readback 기반 `UXRCE_DDS_*` 설정으로 ROS2가 다시 붙을 조건을 만든다. Shell은 고급/진단 기능이며, Shell이 응답하지 않는 장비에서는 `uxrce_dds_client` namespace/재시작은 PX4 재부팅 또는 별도 차량 설정에 의존한다.
 - 대체 경로: ROS2가 끝내 붙지 않아도 MAVLink `ATTITUDE`, GPS, GNSS relative, `SCALED_IMU*`로 가능한 자세/GPS/MAG raw telemetry를 계속 받아 정렬과 측정 입력을 최대한 유지한다.
 
 이 fallback은 ROS2를 완전히 대체하는 기능이 아니다. ROS2 전용 `vehicle_magnetometer.device_id`, namespace 기반 topic 식별, arbitrary `/fmu/out/...` custom field, 구조화된 parameter service는 MAVLink만으로 보장하지 않는다. 앱은 가능한 값은 MAVLink source로 명확히 표시하고, 대체할 수 없는 값은 대기/제한 상태로 남겨야 한다.

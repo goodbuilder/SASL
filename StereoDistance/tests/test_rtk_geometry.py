@@ -62,7 +62,7 @@ def test_ned_delta_and_baseline_between_two_fixed_rtk_positions() -> None:
     )
 
     delta = ned_delta_m(left, right)
-    baseline = estimate_rtk_baseline(left, right, now_s=100.2, max_age_s=1.0, require_fixed=True, max_eph_m=0.1)
+    baseline = estimate_rtk_baseline(left, right, now_s=100.2, require_fixed=True)
 
     assert delta is not None
     assert round(delta[1], 3) == 0.089
@@ -76,7 +76,7 @@ def test_rtk_baseline_blocks_when_fixed_required_but_float() -> None:
     left = GpsPositionState("left", "uav_0", 1.0, "topic", 37.0, 127.0, 10.0, fix_type=5)
     right = GpsPositionState("right", "uav_1", 1.0, "topic", 37.0, 127.000001, 10.0, fix_type=6)
 
-    baseline = estimate_rtk_baseline(left, right, now_s=1.1, max_age_s=1.0, require_fixed=True)
+    baseline = estimate_rtk_baseline(left, right, now_s=1.1, require_fixed=True)
 
     assert baseline is not None
     assert baseline.fix_quality == "BAD"

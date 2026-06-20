@@ -36,6 +36,25 @@ Coordinate contract:
   explicit `T_source_to_stereo_rdf` transform, or by a producer that is already
   in stereo-center RDF and declares that frame contract.
 
+## Fresh StereoDistance Residual PASS
+
+- `EXP-20260618-281-fresh-stereodistance-disparity-residual-search`
+  - Method:
+    `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_log_disparity_deg1_ridge1_clip0p5`.
+  - Result: aggregate `PASS` on fresh local Simulation validation.
+  - Evidence:
+    `Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary/multiburst_disparity_residual_summary.txt`.
+  - Scope: 4 synthetic stress scenarios, 5 fresh seeds per scenario, 600
+    samples per seed, 64 residual candidates searched after PASS was first
+    found.
+  - Metrics: 4/4 scenarios strict pass, observation target worst
+    `5.091243m`, residual target worst `2.437792m`, mean range RMSE
+    `1.417889m -> 0.405203m`, mean position RMSE
+    `2.794734m -> 1.861814m`.
+  - Runtime contract: consumes fused `measured_disparity_px` and corrected
+    stereo-center RDF only; PX4/RTK/NED truth and target labels are
+    calibration/evaluation-only.
+
 ## Estimated-to-Truth Runtime Contract-Limited PASS
 
 | Experiment | Method | Status | Gate | Evidence | Current role |

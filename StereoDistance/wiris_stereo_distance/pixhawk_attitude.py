@@ -3,11 +3,14 @@ from __future__ import annotations
 import glob
 import math
 import os
+import io
 import re
+import struct
 import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from wiris_stereo_distance.rtk_geometry import GpsPositionState, gps_state_from_message, gps_topic
@@ -534,6 +537,7 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         }
         self.node: Any = None
         self.executor: Any = None
+        self.context: Any = None
         self.subscriptions: list[Any] = []
         self.custom_watches = list(custom_watches)
         self.custom_watch_subscriptions: dict[str, Any] = {}
@@ -559,16 +563,25 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         import os
 
         os.environ["ROS_DOMAIN_ID"] = str(self.domain_id)
-        if not rclpy.ok():
-            rclpy.init(args=None)
+        if hasattr(rclpy, "context") and hasattr(rclpy.context, "Context"):
+            self.context = rclpy.context.Context()
+            rclpy.init(args=None, context=self.context)
+        else:
+            self.context = None
+            if not rclpy.ok():
+                rclpy.init(args=None)
         msg_type = self._optional_message_type("px4_msgs/msg/VehicleAttitude")
         sensor_mag_msg_type = self._optional_message_type("px4_msgs/msg/SensorMag")
         vehicle_mag_msg_type = self._optional_message_type("px4_msgs/msg/VehicleMagnetometer")
         sensor_gps_msg_type = self._optional_message_type("px4_msgs/msg/SensorGps")
         gnss_relative_msg_type = self._optional_message_type("px4_msgs/msg/SensorGnssRelative")
-        gps_msg_type = self._optional_message_type("px4_msgs/msg/VehicleGpsPosition")
-        self.node = rclpy.create_node("wiris_stereo_dual_pixhawk_attitude")
-        self.executor = SingleThreadedExecutor()
+        gps_msg_type = self._optional_message_type("px4_msgs/msg/VehicleGpsPosition", quiet=True)
+        if self.context is not None:
+            self.node = rclpy.create_node("wiris_stereo_dual_pixhawk_attitude", context=self.context)
+            self.executor = SingleThreadedExecutor(context=self.context)
+        else:
+            self.node = rclpy.create_node("wiris_stereo_dual_pixhawk_attitude")
+            self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         self.subscriptions = []
         for camera, namespace in self.namespaces.items():
@@ -738,11 +751,12 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
             )
         )
 
-    def _optional_message_type(self, name: str):
+    def _optional_message_type(self, name: str, *, quiet: bool = False):
         try:
             return get_message(name)
         except Exception as exc:
-            self.status_changed.emit(f"메시지 타입 없음: {name} ({exc})")
+            if not quiet:
+                self.status_changed.emit(f"메시지 타입 없음: {name} ({exc})")
             return None
 
     def _gps_position_subscription_type(
@@ -797,6 +811,12 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
             self.node.destroy_node()
         self.node = None
         self.executor = None
+        if self.context is not None:
+            try:
+                self.context.shutdown()
+            except Exception:
+                pass
+        self.context = None
         self.subscriptions = []
         self.custom_watch_subscriptions = {}
         self.status_changed.emit("구독 중지됨")
@@ -1061,7 +1081,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 continue
             self._apply_mavlink_stream_config(camera, connection)
 
-    def start_ros2_client(
+    def start_px4_uxrce_client_shell(
         self,
         *,
         host_ip: str,
@@ -1080,6 +1100,38 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             if camera not in target_cameras:
                 continue
             self._apply_ros2_client_config(camera, connection)
+
+    def start_ros2_client(
+        self,
+        *,
+        host_ip: str,
+        port: int = 8888,
+        namespaces: dict[str, str] | None = None,
+        cameras: set[str] | tuple[str, ...] | list[str] | None = None,
+    ) -> None:
+        self.start_px4_uxrce_client_shell(
+            host_ip=host_ip,
+            port=port,
+            namespaces=namespaces,
+            cameras=cameras,
+        )
+
+    def read_param_int(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | None:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        return _mavlink_read_param_int(connection, name, timeout_s=timeout_s)
+
+    def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        actual = _mavlink_set_param_int(connection, name, int(value), timeout_s=timeout_s)
+        if actual == int(value):
+            self.status_changed.emit(f"{camera_label_ko(camera)} PX4 param 설정 확인: {name}={actual}")
+        else:
+            self.status_changed.emit(f"{camera_label_ko(camera)} PX4 param 설정 불일치: {name} expected={int(value)} actual={actual}")
+        return actual
 
     def _apply_pending_connection_setup(self, camera: str, connection: Any) -> None:
         if self._mavlink_stream_config is not None and camera not in self._mavlink_stream_configured:
@@ -1181,6 +1233,39 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         _send_mavlink_shell_command(connection, command)
         self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell 명령 전송: {command}")
 
+    def write_remote_file_mavftp(self, camera: str, remote_path: str, content: str | bytes) -> None:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        _write_mavlink_ftp_file(connection, remote_path, content)
+        self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink FTP 파일 저장: {remote_path}")
+
+    def reboot_autopilot(self, camera: str) -> None:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        mav = getattr(connection, "mav", None)
+        if mav is None or not hasattr(mav, "command_long_send"):
+            raise RuntimeError("MAVLink COMMAND_LONG을 지원하지 않는 연결입니다.")
+        mavlink = getattr(connection, "mavlink", None)
+        command_id = _mavlink_constant(mavlink, "MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN", 246)
+        target_system = int(getattr(connection, "target_system", 0) or 1)
+        target_component = int(getattr(connection, "target_component", 0) or 1)
+        mav.command_long_send(
+            target_system,
+            target_component,
+            command_id,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        )
+        self.status_changed.emit(f"{camera_label_ko(camera)} PX4 MAVLink 재부팅 명령 전송")
+
     def spin_once(self) -> None:
         for camera, connection in list(self.connections.items()):
             while True:
@@ -1228,6 +1313,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             )
             if message_type == "GPS_RAW_INT":
                 self.gps_changed.emit(camera, gps)
+            else:
+                self.gps_changed.emit(f"{camera}_GPS2", gps)
             self.gps_sensor_changed.emit(
                 camera, _gps_sensor_state_from_mavlink(camera, namespace, message, topic, now_s)
             )
@@ -1290,7 +1377,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             return
         for spec in self.custom_watches:
             source = str(spec.get("source", "")).strip().lower()
-            if source and source != "mavlink":
+            if source and source not in {"mavlink", "uam_mavlink"}:
                 continue
             target_message = str(spec.get("message", "") or spec.get("topic", "")).strip().upper()
             if target_message and target_message != message_type.upper():
@@ -1552,6 +1639,113 @@ def _send_mavlink_shell_command(connection: Any, command: str) -> None:
         chunk = payload[offset : offset + 70]
         data = list(chunk) + [0] * (70 - len(chunk))
         mav.serial_control_send(device, flags, 0, 0, len(chunk), data)
+
+
+def _write_mavlink_ftp_file(connection: Any, remote_path: str, content: str | bytes) -> None:
+    try:
+        from pymavlink import mavftp
+        from pymavlink.mavftp import FtpError
+    except Exception as exc:
+        raise RuntimeError(f"pymavlink MAVFTP를 사용할 수 없습니다. ({exc})") from exc
+    if not remote_path.startswith("/"):
+        raise ValueError(f"MAVLink FTP remote path must be absolute: {remote_path}")
+    payload = content.encode("utf-8") if isinstance(content, str) else bytes(content)
+    target_system = int(getattr(connection, "target_system", 0) or 1)
+    target_component = int(getattr(connection, "target_component", 0) or 1)
+    ftp = mavftp.MAVFTP(connection, target_system, target_component)
+    directory = str(Path(remote_path).parent)
+    if directory and directory not in {"/", "/fs/microsd"}:
+        mkdir_result = ftp.cmd_mkdir([directory])
+        if mkdir_result.return_code not in (FtpError.Success, FtpError.FileExists):
+            raise RuntimeError(f"MAVLink FTP mkdir 실패: {directory} ({mkdir_result.return_code})")
+    rm_result = ftp.cmd_rm([remote_path])
+    if rm_result.return_code not in (FtpError.Success, FtpError.FileNotFound):
+        raise RuntimeError(f"MAVLink FTP 기존 파일 삭제 실패: {remote_path} ({rm_result.return_code})")
+    handle = io.BytesIO(payload)
+    create_result = ftp.cmd_put(["extras.txt", remote_path], fh=handle)
+    if create_result.return_code != FtpError.Success:
+        raise RuntimeError(f"MAVLink FTP 파일 생성 실패: {remote_path} ({create_result.return_code})")
+    write_result = ftp.process_ftp_reply("WriteFile", timeout=8)
+    if write_result.return_code != FtpError.Success:
+        raise RuntimeError(f"MAVLink FTP 파일 쓰기 실패: {remote_path} ({write_result.return_code})")
+
+
+def _mavlink_param_id(name: str) -> bytes:
+    encoded = name.encode("ascii", errors="strict")
+    if len(encoded) > 16:
+        raise ValueError(f"MAVLink PARAM id is longer than 16 bytes: {name}")
+    return encoded
+
+
+def _mavlink_param_id_text(message: Any) -> str:
+    raw = getattr(message, "param_id", "")
+    if isinstance(raw, bytes):
+        return raw.rstrip(b"\x00").decode("ascii", errors="replace")
+    return str(raw).rstrip("\x00")
+
+
+def _mavlink_int_to_param_float(value: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", int(value) & 0xFFFFFFFF))[0]
+
+
+def _mavlink_param_float_to_int(value: Any) -> int:
+    return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+
+
+def _mavlink_recv_param_value(connection: Any, name: str, *, timeout_s: float) -> int | None:
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        message = connection.recv_match(type="PARAM_VALUE", blocking=True, timeout=min(0.2, remaining))
+        if message is None:
+            continue
+        if _mavlink_param_id_text(message) != name:
+            continue
+        return _mavlink_param_float_to_int(getattr(message, "param_value"))
+    return None
+
+
+def _mavlink_read_param_int(connection: Any, name: str, *, timeout_s: float = 2.0) -> int | None:
+    if hasattr(connection, "param_fetch_one"):
+        try:
+            value = connection.param_fetch_one(name, timeout=timeout_s)
+        except TypeError:
+            value = connection.param_fetch_one(name)
+        except Exception:
+            value = None
+        if value is not None:
+            try:
+                return _mavlink_param_float_to_int(value)
+            except Exception:
+                try:
+                    return int(value)
+                except Exception:
+                    pass
+    mav = getattr(connection, "mav", None)
+    if mav is None or not hasattr(mav, "param_request_read_send"):
+        return None
+    target_system = int(getattr(connection, "target_system", 0) or 1)
+    target_component = int(getattr(connection, "target_component", 0) or 1)
+    mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
+    return _mavlink_recv_param_value(connection, name, timeout_s=timeout_s)
+
+
+def _mavlink_set_param_int(connection: Any, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
+    mav = getattr(connection, "mav", None)
+    if mav is None or not hasattr(mav, "param_set_send"):
+        raise RuntimeError("MAVLink PARAM_SET을 지원하지 않는 연결입니다.")
+    mavlink = getattr(connection, "mavlink", None)
+    target_system = int(getattr(connection, "target_system", 0) or 1)
+    target_component = int(getattr(connection, "target_component", 0) or 1)
+    param_type = _mavlink_constant(mavlink, "MAV_PARAM_TYPE_INT32", 6)
+    mav.param_set_send(
+        target_system,
+        target_component,
+        _mavlink_param_id(name),
+        _mavlink_int_to_param_float(int(value)),
+        param_type,
+    )
+    return _mavlink_recv_param_value(connection, name, timeout_s=timeout_s)
 
 
 def _decode_mavlink_serial_control(message: Any) -> str:

@@ -43,16 +43,16 @@ class AppSettings:
     ros_domain_id: int = 0
     left_namespace: str = "uav_0"
     right_namespace: str = "uav_1"
-    pixhawk_host_address: str = "10.41.10.1"
-    left_pixhawk_eth_ip: str = "192.168.0.2"
-    right_pixhawk_eth_ip: str = "192.168.0.3"
+    pixhawk_host_address: str = "10.0.0.10"
+    left_pixhawk_eth_ip: str = "10.0.0.2"
+    right_pixhawk_eth_ip: str = "10.0.0.3"
     left_mavlink_url: str = "udpin:0.0.0.0:14550"
     right_mavlink_url: str = "udpin:0.0.0.0:14551"
     left_mavlink_baud: int = 57600
     right_mavlink_baud: int = 57600
     mavlink_configure_streams: bool = True
     mavlink_stream_rate: int = 2_000_000
-    mavlink_start_ros2: bool = True
+    mavlink_configure_uxrce_agent: bool = True
     uxrce_port: int = 8888
     auto_load_intrinsics: bool = True
     manual_focal_override: bool = False
@@ -67,6 +67,8 @@ class AppSettings:
     uam_ros2_y_field: str = "y"
     uam_ros2_z_field: str = "z"
     uam_mavlink_side: str = "left"
+    uam_mavlink_url: str = "/dev/ttyACM0"
+    uam_mavlink_baud: int = 57600
     uam_mavlink_message: str = "LOCAL_POSITION_NED"
     uam_mavlink_x_field: str = "x"
     uam_mavlink_y_field: str = "y"
@@ -138,7 +140,12 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
             payload.get("mavlink_configure_streams", AppSettings.mavlink_configure_streams)
         ),
         mavlink_stream_rate=int(payload.get("mavlink_stream_rate", AppSettings.mavlink_stream_rate)),
-        mavlink_start_ros2=bool(payload.get("mavlink_start_ros2", AppSettings.mavlink_start_ros2)),
+        mavlink_configure_uxrce_agent=bool(
+            payload.get(
+                "mavlink_configure_uxrce_agent",
+                payload.get("mavlink_start_ros2", AppSettings.mavlink_configure_uxrce_agent),
+            )
+        ),
         uxrce_port=int(payload.get("uxrce_port", AppSettings.uxrce_port)),
         auto_load_intrinsics=bool(payload.get("auto_load_intrinsics", True)),
         manual_focal_override=bool(payload.get("manual_focal_override", False)),
@@ -153,6 +160,8 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         uam_ros2_y_field=str(payload.get("uam_ros2_y_field", AppSettings.uam_ros2_y_field)),
         uam_ros2_z_field=str(payload.get("uam_ros2_z_field", AppSettings.uam_ros2_z_field)),
         uam_mavlink_side=str(payload.get("uam_mavlink_side", AppSettings.uam_mavlink_side)),
+        uam_mavlink_url=str(payload.get("uam_mavlink_url", AppSettings.uam_mavlink_url)),
+        uam_mavlink_baud=int(payload.get("uam_mavlink_baud", AppSettings.uam_mavlink_baud)),
         uam_mavlink_message=str(payload.get("uam_mavlink_message", AppSettings.uam_mavlink_message)),
         uam_mavlink_x_field=str(payload.get("uam_mavlink_x_field", AppSettings.uam_mavlink_x_field)),
         uam_mavlink_y_field=str(payload.get("uam_mavlink_y_field", AppSettings.uam_mavlink_y_field)),

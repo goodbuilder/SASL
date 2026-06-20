@@ -99,7 +99,7 @@ The `연결` tab contains `WIRIS`, `Pixhawk`, and `UAM`. It keeps only the prima
 The `시간` tab contains WIRIS still-image EXIF timestamp comparison.
 The `보정` tab contains a `체커보드` subtab for checkerboard capture/calibration/zoom control and a `줌 내부 파라미터` subtab for per-zoom intrinsics with save/apply controls.
 The `파라미터` tab contains `내부` and `외부/기하` subtabs so intrinsics and live geometry state can be inspected separately.
-The `정렬` tab contains `Baseline`, `MAG`, and `자세`.
+The `정렬` tab contains `개요`, `GNSS / Baseline`, `Magnetometer / Yaw`, `Attitude`, `Coordinate System`, `Validation`, and `Alignment Profile`.
 The `고급` tab contains `WIRIS SDK`, `필드 감시`, and `Bias 보정`.
 The `측정` tab contains `실시간`, `계산 설정`, and `삼각측량 품질`.
 The `저장·분석` tab contains `세션 저장`, `UAM 비교`, and `기록 샘플`.
@@ -149,17 +149,23 @@ Use this top-level tab for model, inference-device, and stream processing settin
 This connection subtab assumes Pixhawk calibration was already completed in QGC and focuses on ROS2/MAVLink transport setup.
 
 - `Pixhawk 자동 탐색` scans ROS2 PX4 topics using the current `ROS_DOMAIN_ID` and fills Pixhawk namespaces.
-- The Pixhawk subtab is ordered as `0 공통 준비`, `1 탐색 후보 / USB 할당`, `2 Pixhawk 1/2 사전 설정`, and `3 연결 실행` so USB bootstrap, persistent Ethernet/uXRCE setup, MAVLink, and ROS2 checks stay in the field order.
-- `1 탐색 후보 / USB 할당` lists ROS2 namespace and USB MAVLink candidates. Select a row and use `P1에 적용` or `P2에 적용` to apply that namespace or USB MAVLink device to a specific Pixhawk side.
-- `2 Pixhawk 1/2 사전 설정` keeps Pixhawk 1 and Pixhawk 2 in separate panels with each side's MAVLink URL, baudrate, Ethernet IP, namespace, PX4 shell, and `ETH 저장` action.
+- The Pixhawk subtab is ordered as `0 공통 준비`, `1 탐색 후보 / USB 할당`, `2 Pixhawk 1/2 사전 설정`, `3 연결 실행`, and `4 고급 / 진단` so USB bootstrap, uXRCE parameter setup, MAVLink, ROS2 checks, and shell diagnostics stay in the field order.
+- `1 탐색 후보 / USB 할당` lists ROS2 namespace, USB MAVLink, Ethernet MAVLink URL, and PC IP candidates. Select a row and use `P1에 적용` or `P2에 적용` to apply that namespace or MAVLink URL to a specific Pixhawk side.
+- Pixhawk `PC IP 탐색` appends all local IPv4 candidates to the Pixhawk candidate table as `PC_IP` rows and does not change `Pixhawk Host IP` by itself. Select the intended wired Pixhawk/uXRCE Agent IP and press `Host에 적용` explicitly when both wired Ethernet and Wi-Fi are active.
+- `2 Pixhawk 1/2 사전 설정` keeps Pixhawk 1 and Pixhawk 2 in separate panels with each side's MAVLink URL, baudrate, Ethernet IP, and namespace.
+- `3 연결 실행` contains Pixhawk swapping, P1/P2 MAVLink connection, P1/P2 uXRCE parameter setup, and ROS2 connection.
+- `4 고급 / 진단` contains PX4 Shell, `ETH 저장`, and MAVLink reboot actions. Shell is diagnostic only; use `P1/P2 재부팅` for reboot when Shell/serial-control does not respond.
+- `MAVLink URL 후보` adds the common Ethernet UDP MAVLink URLs `udpin:0.0.0.0:14550` and `udpin:0.0.0.0:14551` to the candidate table without connecting. Apply one to P1/P2, then press `MAVLink 연결`.
 - `MAVLink 연결` opens direct MAVLink links; while connected, the same button changes to `MAVLink 해제`.
 - `ROS2 연결` starts or reuses `MicroXRCEAgent`, then subscribes to available PX4 ROS2 topics; while connected, the same button changes to `ROS2 해제`.
-- `픽스호크 Host IP` should be the PC address reachable from the Pixhawk Ethernet/uXRCE network. The field default is `10.41.10.1`.
-- If `ROS2 연결` fails during session startup, the GUI automatically starts the configured MAVLink side(s), sends the selected MAVLink stream setup and Pixhawk-side `uxrce_dds_client` command when those toggles are enabled, keeps MAVLink telemetry as fallback, and retries ROS2 after the ROS2 client command is sent.
-- After each MAVLink heartbeat, the app requests `ATTITUDE`, `GPS_RAW_INT`, `GPS2_RAW`, `SCALED_IMU`, `SCALED_IMU2`, and `SCALED_IMU3` with `MAV_CMD_SET_MESSAGE_INTERVAL`. This lets the alignment tab fill RM3100 CAN1/CAN2 readings from MAVLink when PX4 ROS2 magnetometer topics are not published.
-- When `ROS2 client 시작` is enabled, the MAVLink path sends `uxrce_dds_client stop` and restarts the Pixhawk-side client with the selected namespace, for example `-n uav_0` or `-n uav_1`. If the initial UDP shell command is sent before a MAVLink peer is known, the app retries the pending setup after the first heartbeat.
-- Launching with `--start-pixhawk` or `--connect-pixhawk` automatically opens MAVLink and switches the first view to `정렬 > MAG`.
+- If ROS2 is connected but `sensor_gps` or `sensor_mag` data is not published, the GUI starts the configured MAVLink URL(s) as an auxiliary sensor receiver after startup. This keeps ROS2 attitude/GPS1 data active while using MAVLink `GPS2_RAW` for the GPS2 slot and `SCALED_IMU*` for RM3100 CAN1/CAN2 slots.
+- `픽스호크 Host IP` should be the PC address reachable from the Pixhawk Ethernet/uXRCE network. The field default is `10.0.0.10`; Pixhawk 1/2 Ethernet defaults are `10.0.0.2` and `10.0.0.3`.
+- If `ROS2 연결` fails during session startup, the GUI automatically starts the configured MAVLink side(s), sends the selected MAVLink stream setup, writes PX4 `UXRCE_DDS_*` parameters with MAVLink `PARAM_SET` when `PX4 uXRCE Agent 설정` is enabled, verifies them by readback, keeps MAVLink telemetry as fallback, and retries ROS2.
+- After each MAVLink heartbeat, the app requests `ATTITUDE`, `GPS_RAW_INT`, `GPS2_RAW`, `SCALED_IMU`, `SCALED_IMU2`, and `SCALED_IMU3` with `MAV_CMD_SET_MESSAGE_INTERVAL`. `GPS_RAW_INT` fills the GPS1 position path; `GPS2_RAW` fills the GPS2 sensor slot and a `left_GPS2`/`right_GPS2` raw LLA position path for Baseline GPS2 selection; `SCALED_IMU` and `SCALED_IMU2` fill RM3100 CAN1/CAN2 magnetometer slots. MAVLink fields can also be inspected in the field browser.
+- When `PX4 uXRCE Agent 설정` is enabled, the MAVLink path sets `UXRCE_DDS_CFG`, `UXRCE_DDS_KEY`, `UXRCE_DDS_DOM_ID`, `UXRCE_DDS_AG_IP`, and `UXRCE_DDS_PRT`. Here `AG_IP` means the PC Micro XRCE-DDS Agent IP that the PX4 uXRCE-DDS Client connects to. If ROS2 topics still have no PX4 publishers after readback succeeds, reboot PX4 or restart `uxrce_dds_client`; PX4 namespace still depends on the vehicle-side client configuration.
+- Launching with `--start-pixhawk` or `--connect-pixhawk` automatically opens MAVLink and switches the first view to `정렬 > Baseline`.
 - `Pixhawk 1 Shell` and `Pixhawk 2 Shell` open PX4 shell dialogs over an active MAVLink connection.
+- `P1 재부팅` and `P2 재부팅` send MAVLink `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` over the active MAVLink link. Use these instead of typing `reboot` in Shell when PX4 Shell does not respond.
 
 ### 연결 > UAM
 
@@ -187,32 +193,24 @@ Use this subtab for UAM/drone ground truth telemetry. It is separate from `연�
 
 ### 정렬
 
-Use this top-level tab to align the field geometry and sensor sources used by measurement.
+Use this top-level tab to define and validate the stereo-camera extrinsic parameters used by measurement. Alignment does not use video or YOLO.
 
-- `Baseline` aligns the physical RTK antenna baseline with the camera baseline needed by stereo measurement.
-- `MAG` compares Pixhawk 1/2 health, RM3100 CAN1/CAN2 readings, F9P GPS1/GPS2 data, and dual-GNSS heading readiness.
-- `MAG > 요약` includes a `PX4 Magnetometer / RM3100 관리` panel split into `Pixhawk 1` and `Pixhawk 2` tabs. Each tab lists that Pixhawk's `CAL_MAG0` through `CAL_MAG4` device IDs, priorities, expected selected MAG, and actual selected MAG when `/fmu/out/vehicle_magnetometer` provides `device_id`.
-- The current Pixhawk 6X Pro custom DDS firmware build exports `/fmu/out/sensor_mag` so RM3100 raw samples can be graphed. It intentionally does not export `/fmu/out/vehicle_magnetometer` because the v6x FLASH image is full; actual selected MAG remains unavailable over ROS2 in that build.
-- `RM3100을 Yaw 기준으로` runs against the selected Pixhawk tab: it raises registered RM3100 priorities to `100` and `90` and sets non-RM3100 `CAL_MAG*_PRIO` values to `0`; `파라미터 저장` and reboot still require QGC or PX4 shell unless a MAVROS2 command path is wired for the field setup.
-- In each RM3100 panel, `Yaw 기준` can query the current PX4 `CAL_MAG_PRIME` setting or apply a CAN1/CAN2 RM3100 sample with a known `device_id` as the primary magnetometer via MAVLink PX4 shell.
-- `자세` compares Pixhawk attitude streams when two namespaces are configured.
-- `요약` shows Pixhawk 1 and Pixhawk 2 health side by side.
-- `픽스호크 1` and `픽스호크 2` each show `RM3100 · CAN1/CAN2`, `F9P · GPS1/GPS2`, magnitude delta, vector-angle delta, GNSS quality comparison, sample skew, and dual-GNSS heading readiness.
-- Roll, Pitch, and Yaw each have a separate graph.
-- Each graph plots two series: Pixhawk 1 and Pixhawk 2.
-- Y-axis range defaults to `Auto` and can be changed per axis.
+- `정렬 > 개요` summarizes Pixhawk, GPS1/GPS2, CAN1/CAN2, baseline, attitude delta, and overall GOOD/WARNING/BAD alignment state.
+- `정렬 > GNSS / Baseline` contains `GPS 인식`, `ROS2 Topic / MAVLink Field`, `Baseline 계산`, `신뢰성 평가`, and `Baseline Profile`. It computes WGS84 GPS positions into ENU `[E,N,U]` and NED `[N,E,D]` using the selected left camera GPS as origin.
+- `정렬 > Magnetometer / Yaw` shows CAN1/CAN2 magnetometer status, field strength, selected/health/calibration placeholders, CAN1-vs-CAN2 difference, and left-vs-right heading readiness. GPS is not used in this tab.
+- `정렬 > Attitude` shows Pixhawk EKF Roll/Pitch/Yaw, quaternion, and left-right yaw/pitch/roll differences. It is the final attitude source for extrinsic orientation.
+- `정렬 > Coordinate System` records the coordinate contract: Global Frame (`ENU`/`NED`), Camera Frame (`RDF`/`ROS Optical Frame`), Origin (`Left Camera`/`Midpoint`), and the Pixhawk FRD to camera RDF transform.
+- `정렬 > Validation` compares stored vs current baseline and attitude, estimates baseline/yaw/pitch error contribution at a user-entered distance, and returns PASS/FAIL.
+- `정렬 > Alignment Profile` saves/loads/compares/exports YAML profiles containing baseline vector, baseline quality, Roll/Pitch/Yaw, coordinate settings, GPS source mapping, magnetometer source mapping, and timestamp.
 
 ROS2 topic subscription is tolerant of missing PX4 message types. Missing GPS or magnetometer topic types should not make the whole Pixhawk connection fail.
 When ROS2 magnetometer topics have no publisher, `MAVLink 연결` can still populate RM3100 CAN fields from `SCALED_IMU*` magnetometer values after the stream request succeeds.
 
 - `측정 > 계산 설정`의 `Baseline` is the shared baseline reference for the Pixhawk 3D path's translation magnitude.
-- The `Baseline > GPS 계산` subtab can calculate a baseline from left/right latitude, longitude, and altitude, then apply that result into the manual `Baseline` field.
-- `Baseline > 실시간 GPS` keeps the live Pixhawk GPS baseline as an alignment reference for N/E/D, quality, and camera-frame component checks; the Pixhawk 3D path still uses the measurement-tab `Baseline` as its scale reference.
-- `RTK Fixed 품질 확인` marks non-fixed GPS as degraded/bad quality for the live reference, but GPS-only 3D fixes can still be visualized.
-- The baseline display shows length, N/E/D vector, sample age, quality, and warnings.
-- The alignment visualization separates the antenna vector from the camera-frame components. The left plot shows the GPS antenna baseline in the N/E plane, and the right plot shows camera-frame X/Z once Pixhawk attitude is available.
-- If only GPS is available, the right plot still draws a GPS-only E/U projection instead of waiting for MAG or attitude data.
-- The same visualization overlays camera attitude arrows inside the camera X/Z plot: the optical-axis arrow reflects yaw/pitch, the roll arc shows roll, and the summary text reports relative `ΔR/P/Y`.
+- `Baseline` keeps the live Pixhawk GPS baseline as the direction source for N/E/D and ENU checks when `실시간 GPS baseline 사용` is enabled; the Pixhawk 3D path still uses the measurement-tab `Baseline` as its scale reference.
+- GPS-only operation is allowed when both Pixhawks have at least a 3D GPS fix (`fix_type >= 3`) and `RTK Fixed 품질 확인` is off. This is less accurate than RTK and should be treated as degraded, especially for short camera baselines.
+- `RTK Fixed 품질 확인` shows whether both sides are fixed RTK and blocks GPS-only translation when enabled. Keep it off for base-station-free GPS-only measurements; turn it on when RTK fixed is required.
+- The baseline display shows length, ENU/NED vectors, sample age, quality, and warnings.
 - The camera-frame X component shows the left/right optical-baseline component. The full RTK antenna length is shown for alignment but is not automatically equivalent to the camera optical baseline.
 
 ### 보정
@@ -236,7 +234,7 @@ Use this tab after camera connection and WIRIS timestamp verification, before pa
 Use this tab after `보정` to confirm the geometry that will be used by alignment and measurement.
 
 - `내부` shows the currently loaded left/right intrinsics, distortion coefficients, image count, reprojection error, and whether the result is active or only the latest calibration output. Zoom-specific saves are keyed off the visible WIRIS zoom level used when saving or loading calibration.
-- `외부/기하` shows live Pixhawk-derived pose, the source of the effective focal length and baseline, the fixed `nominal-shared-rig-v1` mount assumption, loaded UAM ground truth source/sample counts, and whether a 2D bbox-center adjustment matrix is loaded. The `계산 설정` view still splits `내부 파라미터` and `외부/기하` side by side around the center line. The default measurement mode is 3D ray triangulation with `Pixhawk 자세 + RTK 위치`; if required intrinsics, attitude, or RTK translation are unavailable, the app waits instead of recording a simple disparity fallback.
+- `외부/기하` shows live Pixhawk-derived pose, the source of the effective focal length and baseline, the fixed `nominal-shared-rig-v1` mount assumption, loaded UAM ground truth source/sample counts, and whether a 2D bbox-center adjustment matrix is loaded. The `계산 설정` view still splits `내부 파라미터` and `외부/기하` side by side around the center line. The default measurement mode is 3D ray triangulation with `Pixhawk 자세 + GPS/RTK baseline`; if required intrinsics, attitude, or GPS/RTK baseline translation are unavailable, the app waits instead of recording a simple disparity fallback.
 - `수동 초점거리 사용` allows manual `fx` entry when a checkerboard is unavailable. The focal-length and WIRIS zoom-level tooltips include nominal WIRIS OZ zoom estimates from index `0` to `14`, using the 1280x720 HFOV 63.7 degree estimate where index `0` is about `1,030 px` and index `14` is about `30,906 px`.
 
 ### 고급 > WIRIS SDK
@@ -256,7 +254,7 @@ Use this tab after `보정` to confirm the geometry that will be used by alignme
 Use this tab to start and monitor object distance.
 
 - `실시간` contains live WIRIS views, stream receive/YOLO Hz status, distance status, recording controls, and a split Right/Down/Forward/Range graph. Press `세션 기록 시작` before collecting rows that must later be compared with ULog. The Range pane always plots `YOLO Range`, the stereo baseline-center distance estimated from YOLO/stereo. If a UAM alignment profile is loaded and live UAM N/E/D telemetry is available, it also plots `Telemetry Range`, the baseline-center reference distance computed from live telemetry through the profile origin, and stores `telemetry_range_m`/`telemetry_range_error_m` fields in the sample row. All displayed Range/Distance values are baseline-center distances, so UI and new CSV labels omit `baseline`. This is an operational monitor; final accuracy reporting should use `저장·분석 > UAM 비교` with ULog-based matching.
-- `계산 설정` contains focal length, baseline, sync gates, class matching, and attitude-gating settings for `Pixhawk 자세 + RTK 위치` 3D ray triangulation. The graph records only successful ray-triangulated samples. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
+- `계산 설정` contains focal length, baseline, sync gates, class matching, and attitude-gating settings for `Pixhawk 자세 + GPS/RTK baseline` 3D ray triangulation. The graph records only successful ray-triangulated samples. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
 - If an Origin-BBOX Reprojection Profile JSON is loaded in `고급 > Bias 보정`, the measurement path applies it before display/recording: raw bbox center and raw triangulation are kept, corrected bbox center is triangulated again, and the CSV stores `left/right_cx`, `left/right_width_px`, `left/right_height_px`, `left/right_confidence`, `raw_disparity_px`, `raw_range_m`, `left/right_corrected_cx/cy`, `left/right_bbox_du/dv_px`, corrected `Right/Down/Forward/Range`, `profile_output_policy`, and profile fallback fields. Missing cells, out-of-range bins, incomplete bbox pairs, and bad disparity are no-op fallbacks. Profiles built without an explicit correction mode now default to conservative `component_gains`; use `full` only as a diagnostic baseline when validation proves it does not regress Right/Down. If `profile_output_policy=range_only_forward_fusion`, the displayed/saved corrected `Right/Down` remain raw values while corrected `Forward` comes from the reprojection-triangulated point.
 - `삼각측량 품질` is a display-only panel for the current 3D ray result. It shows ray gap, distance, baseline, method, raw/corrected 3D point, and a simple left/right ray midpoint sketch; it does not add warning thresholds, automatic decisions, or save-analysis fields.
 - `YOLO 측정 시작` restarts camera streams in YOLO/depth mode; while measuring, the same button changes to `YOLO 측정 중지` and returns to camera preview mode while keeping Pixhawk connections active.
@@ -349,7 +347,7 @@ ROS2 path:
 - `ROS_DOMAIN_ID`
 - Pixhawk 1 namespace
 - Pixhawk 2 namespace
-- Pixhawk Host IP / uXRCE Agent IP, normally `10.41.10.1`
+- Pixhawk Host IP / uXRCE Agent IP, normally `10.0.0.10`
 - `MicroXRCEAgent` UDP port, commonly `8888`
 - `/fmu/out/sensor_mag` for RM3100 raw magnetometer samples when the PX4 DDS export includes it
 - `/fmu/out/vehicle_magnetometer` for actual selected MAG `device_id` when px4_ros_com publishes it
@@ -367,9 +365,9 @@ MAVLink path:
 - Pixhawk 1 MAVLink URL, commonly `udpin:0.0.0.0:14550`
 - Pixhawk 2 MAVLink URL, commonly `udpin:0.0.0.0:14551`
 - Optional stream configuration through PX4 shell commands. Pending setup is retried after the first heartbeat so UDP `udpin` links can learn their peer before shell commands are sent.
-- Optional `uxrce_dds_client` start command through MAVLink shell. The command includes the selected PX4 namespace.
+- Optional uXRCE setup through MAVLink `PARAM_SET`/readback for `UXRCE_DDS_CFG`, `UXRCE_DDS_KEY`, `UXRCE_DDS_DOM_ID`, `UXRCE_DDS_AG_IP`, and `UXRCE_DDS_PRT`. This does not replace a vehicle-side namespace/client restart configuration.
 
-MAVLink and ROS2 connection paths are separate but can be used together during recovery. MAVLink can reach PX4 shell, start PX4-side clients, configure MAVLink streams, and provide fallback `ATTITUDE`, GPS, GNSS relative, and `SCALED_IMU*` samples while ROS2 is unavailable. ROS2 still requires PX4 topics to be published through XRCE-DDS. Treat ROS2 as actually connected only when `ros2 topic info -v` shows PX4 publishers and `ros2 topic hz` receives samples; a topic name alone can come from this GUI's subscriptions.
+MAVLink and ROS2 connection paths are separate but can be used together during recovery. MAVLink can configure uXRCE parameters, reach PX4 shell for diagnostics when the shell path works, configure MAVLink streams, and provide fallback `ATTITUDE`, GPS, GNSS relative, and `SCALED_IMU*` samples while ROS2 is unavailable. ROS2 still requires PX4 topics to be published through XRCE-DDS. Treat ROS2 as actually connected only when `ros2 topic info -v` shows PX4 publishers and `ros2 topic hz` receives samples; a topic name alone can come from this GUI's subscriptions.
 
 MAVLink fallback does not fully replace ROS2/uORB. Actual selected MAG `device_id`, ROS2 namespace identity, arbitrary `/fmu/out/...` custom fields, and structured parameter services still require ROS2/px4_ros_com or MAVROS2/QGC/PX4 shell support.
 
@@ -418,8 +416,7 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - Keep STIP changes in `IP Address / IP Mask 변경` as a deliberate last step. Normal manual connection should use `카메라망 / NIC`, `탐색 후보`, left/right `IP Address / Telnet port`, `RTSP port / 영상`, then `검증 / 활성화`.
 - Start in `연결 > Pixhawk` from `0 공통 준비`, then use `1 탐색 후보 / USB 할당` to discover USB/ROS2 candidates and assign them with `P1에 적용` or `P2에 적용`.
 - Use `2 Pixhawk 1/2 사전 설정` to confirm each side's MAVLink URL, baudrate, Ethernet IP, and namespace before `ETH 저장`, then use `3 연결 실행` for `MAVLink 연결` followed by `ROS2 연결`.
-- Use `정렬 > MAG > 요약 > 새로고침` before changing magnetometer priority, then confirm RM3100 IDs `8944899` and, when present, `8944387` are shown as RM3100 devices.
-- Do not change MAG parameters while PX4 is armed. The MAG manager disables or rejects `RM3100을 Yaw 기준으로`, save, and reboot actions when armed state is known.
+- Use `정렬 > Baseline` to confirm GPS1/GPS2 recognition and baseline reliability before measurement.
 - Use `영상 수신 확인` before `카메라 Preview 연결`; require `frame-ok`, not only port-open.
 - Keep `GStreamer` as the default stream backend and `NVIDIA` as the default decoder for low-latency operation. Try `OpenCV Auto` when the explicit GStreamer or OpenCV/FFmpeg paths fail on a PC. Use `PyAV` when the `av` package is installed in the active Python environment.
 - Use `카메라 Preview 연결` to verify both camera streams and Hz before starting YOLO.
@@ -432,7 +429,7 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - Keep `Preview W` at the stream's native width when you want the GUI to see the encoded frame without downscaling. For the current WIRIS visible stream, `1920` preserves the 1080p frame. Detection still uses the original frame, not the preview image.
 - Use `CUDA 추론` when a CUDA GPU is available.
 - Use `CPU 추론` only when GPU inference is unavailable or intentionally disabled. If CUDA prediction fails at runtime, the worker retries on CPU so preview and YOLO can continue when possible.
-- Use the live GPS baseline only when GPS quality and sample age are acceptable.
+- Use the live GPS baseline after confirming both Pixhawks have usable GPS fixes; `eph` and sample age remain visible as diagnostics.
 - Use calibrated intrinsics for real measurements. Default focal and baseline values are placeholders for setup/testing.
 - If checkerboard calibration is unavailable, enable `수동 초점거리 사용` and enter the estimated `fx px` for the current WIRIS visible zoom ratio from the tooltip. Treat this as a temporary estimate, not a replacement for per-zoom calibration.
 - Use the connected-state `카메라 Preview 해제`, `ROS2 해제`, and `MAVLink 해제` button states independently when isolating connection issues.
@@ -456,7 +453,7 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - `Preview W` reduces GUI copy/scale cost, but it does not eliminate all decode cost.
 - YOLO throughput is intentionally uncapped, so a weak CPU/GPU can still become the bottleneck during depth mode.
 - During measurement, `검출 없음` frames do not clear the previous valid left/right detections; sparse detections can still form a timestamp-matched distance pair within the configured `최대 Δt`.
-- Distance rows are recorded only after 3D ray triangulation succeeds. Use `Pixhawk 자세 + RTK 위치` with calibrated intrinsics and RTK translation.
+- Distance rows are recorded only after 3D ray triangulation succeeds. Use `Pixhawk 자세 + GPS/RTK baseline` with calibrated intrinsics and live GPS/RTK translation; GPS-only fixes work with degraded accuracy, while RTK Fixed remains the preferred field setup.
 - Stream processing is process-isolated per camera, but total CPU/GPU, memory bandwidth, and RTSP network capacity can still bottleneck the system.
 - `Auto` decoder mode falls back from NVIDIA to software when the NVIDIA decoder cannot be created. It cannot fix missing frames from the RTSP source itself.
 - The RTSP pipeline drops stale buffered frames when it falls behind. This favors current frames over complete historical frame delivery, which is better for live distance measurement.
@@ -505,7 +502,7 @@ The bootstrap installs `requirements/calibration.txt` and verifies `import cv2`.
 ### 2026-06-02
 
 - Added `연결 > UAM` and `저장·분석 > UAM Ground Truth 비교` so ULog-first post-flight analysis can fall back to live ROS2/MAVLink UAM telemetry or embedded recorded drone rows.
-- Added a PX4 Magnetometer / RM3100 manager panel under `정렬 > MAG > 요약`, plus a mockable `px4_mag_manager_node` that publishes `/px4_mag_manager/status` and exposes refresh/use/save/reboot Trigger services.
+- Replaced the alignment workflow with `정렬 > Baseline`, including GPS recognition, ROS2/MAVLink field browsing, baseline calculation, reliability evaluation, and YAML profile save/load.
 - Added RM3100 priority logic and tests for the current Pixhawk 6X Pro values and the two-RM3100 backup case.
 - Kept measurement-tab camera preview alive when YOLO model loading or per-frame inference fails, including a CUDA prediction failure path that retries on CPU.
 - Preserved recent valid detections across intermittent `검출 없음` frames so sparse left/right detections can still match and produce distance estimates.
@@ -513,7 +510,7 @@ The bootstrap installs `requirements/calibration.txt` and verifies `import cv2`.
 - Decoupled stream readers from YOLO inference so measurement-mode `수신` Hz counts decoded reader frames while YOLO Hz counts successful inference frames.
 - Reordered tabs for the field workflow: `연결`, `시간`, `보정`, `파라미터`, `정렬`, `YOLO`, `측정`, `저장·분석`, `고급`; moved `WIRIS SDK` after `Pixhawk` inside `연결`.
 - Split stereo detection-pair validation from the old simple disparity distance formula so 3D triangulation does not depend on that calculation path.
-- Applied the fixed front-facing camera mount frame contract to Pixhawk-based RTK translation and ray rotation, and record `world_frame`, `body_frame`, `camera_frame`, and `camera_mount_profile` in distance CSV rows.
+- Applied the fixed front-facing camera mount frame contract to Pixhawk-based GPS/RTK translation and ray rotation, and record `world_frame`, `body_frame`, `camera_frame`, and `camera_mount_profile` in distance CSV rows.
 - Split WIRIS SDK controls into the separate `연결 > WIRIS SDK` subtab.
 
 ### 2026-05-17
@@ -549,8 +546,8 @@ The bootstrap installs `requirements/calibration.txt` and verifies `import cv2`.
 
 ### 2026-05-18
 
-- Requested MAVLink `SCALED_IMU*` sensor streams automatically on heartbeat so the `정렬 > MAG` panels can show CAN1/CAN2 magnetometer values even when ROS2 magnetometer topics are unavailable.
-- Added `--start-pixhawk` / `--connect-pixhawk` startup flags to open MAVLink and show the RM3100 alignment view immediately during field checks.
+- Requested MAVLink `GPS_RAW_INT` and `GPS2_RAW` streams automatically on heartbeat so `정렬 > Baseline` can inspect GNSS data even when ROS2 GPS topics are unavailable.
+- Added `--start-pixhawk` / `--connect-pixhawk` startup flags to open MAVLink and show the Baseline alignment view immediately during field checks.
 - Added GStreamer RTP timestamp and RTCP Sender Report based NTP estimate CSV fields for left/right stream timing diagnostics.
 - Removed the measurement-tab live `t`, `age`, `wall`, `src`, display-delta, `srcPTS`, and RTP/RTCP timing readouts so routine monitoring focuses on receive Hz and YOLO Hz.
 - Added YOLO Hz next to receive Hz in the measurement-tab live camera status chips.

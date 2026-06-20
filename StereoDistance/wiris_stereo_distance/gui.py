@@ -7,6 +7,7 @@ import faulthandler
 import json
 import math
 import os
+import re
 import signal
 import sys
 import threading
@@ -67,12 +68,31 @@ from wiris_stereo_distance.network import (
     interface_addresses,
     interface_has_address,
     interface_link_exists,
+    local_ipv4_interfaces,
     nm_connection_ipv4_addresses,
     nm_device_connection_name,
     resolve_nm_interface_address,
     rtsp_host_port,
     select_host_for_camera,
     tcp_port_scan_sequence,
+)
+from wiris_stereo_distance.baseline_alignment import (
+    BaselineQuality,
+    BaselineVector,
+    baseline_from_gps,
+    baseline_profile_payload,
+    dump_baseline_profile,
+    evaluate_baseline_quality,
+    load_baseline_profile,
+)
+from wiris_stereo_distance.alignment_managers import (
+    AlignmentProfileManager,
+    AlignmentValidator,
+    AttitudeMonitor,
+    BaselineManager,
+    CoordinateSystemManager,
+    GNSSMonitor,
+    MagnetometerMonitor,
 )
 from wiris_stereo_distance.photo_clock import (
     ClockFolderResult,
@@ -89,19 +109,23 @@ from wiris_stereo_distance.pixhawk_attitude import (
     DualPixhawkAttitudeSubscriber,
     DualPixhawkMavlinkSubscriber,
     camera_label_ko,
-    probe_usb_mavlink_devices,
     describe_ros2_message_fields,
     discover_mavlink_messages,
     discover_pixhawk_topics,
     discover_ros2_topic_types,
     mavlink_graphable_fields_for_message,
+    probe_usb_mavlink_devices,
+    usb_mavlink_device_candidates,
+    _ros2_topic_has_publisher,
 )
 from wiris_stereo_distance.px4_mag_manager import (
     MockParameterStore,
     Px4MagManager,
+    RM3100_BACKUP_ID,
+    RM3100_PRIMARY_ID,
     current_pixhawk_6x_mag_params,
 )
-from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate, estimate_rtk_baseline, ned_delta_m
+from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate, estimate_rtk_baseline
 from wiris_stereo_distance.recording_session import (
     format_video_paths,
     raw_video_paths,
@@ -171,7 +195,7 @@ from wiris_stereo_distance.theme import (
     WARNING_BG,
     WARNING_TEXT,
 )
-from wiris_stereo_distance.sync import TimedSampleBuffer, classify_sync_quality, match_nearest_pair
+from wiris_stereo_distance.sync import TimedSampleBuffer, match_nearest_pair
 from wiris_stereo_distance.triangulation import (
     RayTriangulationResult,
     camera_translation_right_in_left_camera,
@@ -212,6 +236,7 @@ from wiris_stereo_distance.yolo_stream import (
     normalize_rtsp_transport,
     normalize_stream_backend,
 )
+
 from wiris_stereo_distance.wiris_zoom import (
     DEFAULT_ZOOM_CONTROL_PORT,
     DEFAULT_ZOOM_IN_TEMPLATE,
@@ -2072,7 +2097,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         self.pixhawk: DualPixhawkAttitudeSubscriber | None = None
         self.mavlink_pixhawk: DualPixhawkMavlinkSubscriber | None = None
-        self._ros2_retry_after_mavlink_setup = False
+        self.uam_mavlink_pixhawk: DualPixhawkMavlinkSubscriber | None = None
+        self._ros2_retry_after_uxrce_agent_setup = False
+        self._eth0_probe_buffers: dict[str, str] = {}
+        self._eth0_probe_tokens: dict[str, int] = {}
+        self._eth0_probe_counter = 0
         self.px4_shell_dialogs: dict[str, Px4ShellDialog] = {}
         self.camera_connected = False
         self.yolo_enabled = False
@@ -2134,8 +2163,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "pitch": deque(maxlen=600),
             "yaw": deque(maxlen=600),
         }
+        self.gnss_monitor = GNSSMonitor()
+        self.baseline_manager = BaselineManager(self.gnss_monitor)
+        self.magnetometer_monitor = MagnetometerMonitor()
+        self.attitude_monitor = AttitudeMonitor()
+        self.coordinate_system_manager = CoordinateSystemManager()
+        self.alignment_validator = AlignmentValidator()
+        self.alignment_profile_manager = AlignmentProfileManager()
+        self.loaded_alignment_profile: dict[str, object] | None = None
         self.latest_mag_sensors: dict[str, dict[str, object]] = {"left": {}, "right": {}}
         self.latest_vehicle_mag_device_ids: dict[str, int | None] = {"left": None, "right": None}
+        self.ros2_sensor_topic_publishers: dict[str, dict[str, bool]] = {"left": {}, "right": {}}
         self.px4_mag_managers = {
             "left": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
             "right": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
@@ -2177,10 +2215,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         time_layout = QtWidgets.QVBoxLayout(time_tab)
         alignment_tab = QtWidgets.QWidget()
         alignment_layout = QtWidgets.QVBoxLayout(alignment_tab)
+        alignment_overview_tab = QtWidgets.QWidget()
+        alignment_overview_layout = QtWidgets.QVBoxLayout(alignment_overview_tab)
         rtk_tab = QtWidgets.QWidget()
         rtk_layout = QtWidgets.QVBoxLayout(rtk_tab)
+        alignment_mag_tab = QtWidgets.QWidget()
+        alignment_mag_layout = QtWidgets.QVBoxLayout(alignment_mag_tab)
+        alignment_attitude_tab = QtWidgets.QWidget()
+        alignment_attitude_layout = QtWidgets.QVBoxLayout(alignment_attitude_tab)
+        alignment_coordinate_tab = QtWidgets.QWidget()
+        alignment_coordinate_layout = QtWidgets.QVBoxLayout(alignment_coordinate_tab)
+        alignment_validation_tab = QtWidgets.QWidget()
+        alignment_validation_layout = QtWidgets.QVBoxLayout(alignment_validation_tab)
+        alignment_profile_tab = QtWidgets.QWidget()
+        alignment_profile_layout = QtWidgets.QVBoxLayout(alignment_profile_tab)
+        signal_alignment_tab = QtWidgets.QWidget()
+        signal_alignment_layout = QtWidgets.QVBoxLayout(signal_alignment_tab)
         rm3100_alignment_tab = QtWidgets.QWidget()
         rm3100_alignment_layout = QtWidgets.QVBoxLayout(rm3100_alignment_tab)
+        yaw_alignment_tab = QtWidgets.QWidget()
+        yaw_alignment_layout = QtWidgets.QVBoxLayout(yaw_alignment_tab)
         calibration_tab = QtWidgets.QWidget()
         calibration_layout = QtWidgets.QVBoxLayout(calibration_tab)
         checkerboard_calibration_tab = QtWidgets.QWidget()
@@ -2221,8 +2275,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             setup_layout,
             time_layout,
             alignment_layout,
+            alignment_overview_layout,
             rtk_layout,
+            alignment_mag_layout,
+            alignment_attitude_layout,
+            alignment_coordinate_layout,
+            alignment_validation_layout,
+            alignment_profile_layout,
+            signal_alignment_layout,
             rm3100_alignment_layout,
+            yaw_alignment_layout,
             calibration_layout,
             checkerboard_calibration_layout,
             zoom_intrinsics_layout,
@@ -2286,10 +2348,24 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         alignment_tabs = QtWidgets.QTabWidget()
         alignment_tabs.setDocumentMode(True)
-        alignment_tabs.addTab(rtk_tab, "Baseline")
+        alignment_tabs.addTab(alignment_overview_tab, "개요")
+        alignment_tabs.addTab(rtk_tab, "GNSS / Baseline")
+        alignment_tabs.addTab(alignment_mag_tab, "Magnetometer / Yaw")
+        alignment_tabs.addTab(alignment_attitude_tab, "Attitude")
+        alignment_tabs.addTab(alignment_coordinate_tab, "Coordinate System")
+        alignment_tabs.addTab(alignment_validation_tab, "Validation")
+        alignment_tabs.addTab(alignment_profile_tab, "Alignment Profile")
         alignment_layout.addWidget(alignment_tabs, 1)
         self.alignment_tabs = alignment_tabs
+        self.alignment_overview_tab_index = alignment_tabs.indexOf(alignment_overview_tab)
         self.baseline_alignment_tab_index = alignment_tabs.indexOf(rtk_tab)
+        self.signal_alignment_tab_index = self.baseline_alignment_tab_index
+        self.rm3100_alignment_tab_index = alignment_tabs.indexOf(alignment_mag_tab)
+        self.yaw_alignment_tab_index = self.rm3100_alignment_tab_index
+        self.attitude_alignment_tab_index = alignment_tabs.indexOf(alignment_attitude_tab)
+        self.coordinate_alignment_tab_index = alignment_tabs.indexOf(alignment_coordinate_tab)
+        self.validation_alignment_tab_index = alignment_tabs.indexOf(alignment_validation_tab)
+        self.alignment_profile_tab_index = alignment_tabs.indexOf(alignment_profile_tab)
 
         advanced_tabs = QtWidgets.QTabWidget()
         advanced_tabs.setDocumentMode(True)
@@ -2473,16 +2549,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._camera_candidate_rows: list[dict[str, object]] = []
         self.pixhawk_auto_detect_button = QtWidgets.QPushButton("Pixhawk 자동 탐색")
         self.pixhawk_auto_detect_button.clicked.connect(self.auto_detect_pixhawks)
-        self.pixhawk_candidate_table = QtWidgets.QTableWidget(0, 4)
-        self.pixhawk_candidate_table.setHorizontalHeaderLabels(["종류", "값", "Baud", "상태"])
+        self.pixhawk_usb_discover_button = QtWidgets.QPushButton("USB 연결 탐색")
+        self.pixhawk_usb_discover_button.clicked.connect(self.discover_usb_pixhawk_connections)
+        self.pixhawk_mavlink_url_candidate_button = QtWidgets.QPushButton("MAVLink URL 후보")
+        self.pixhawk_mavlink_url_candidate_button.clicked.connect(self.discover_mavlink_url_candidates)
+        self.pixhawk_candidate_table = QtWidgets.QTableWidget(0, 5)
+        self.pixhawk_candidate_table.setHorizontalHeaderLabels(["종류", "값", "Baud", "상태", "인터페이스"])
         self.pixhawk_candidate_table.verticalHeader().setVisible(False)
         self.pixhawk_candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.pixhawk_candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.pixhawk_candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.pixhawk_candidate_table.setMinimumHeight(110)
+        self.pixhawk_candidate_table.itemSelectionChanged.connect(self._refresh_pixhawk_candidate_actions)
         pixhawk_candidate_header = self.pixhawk_candidate_table.horizontalHeader()
         pixhawk_candidate_header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
         pixhawk_candidate_header.setStretchLastSection(False)
+        self.clear_pixhawk_candidate_button = QtWidgets.QPushButton("Clear")
+        self.clear_pixhawk_candidate_button.clicked.connect(self.clear_pixhawk_candidate_history)
+        self.clear_pixhawk_candidate_button.setEnabled(False)
+        self.clear_pixhawk_candidate_button.setToolTip("Pixhawk 탐색 후보 내역을 지웁니다.")
+        self.apply_pixhawk_candidate_host_button = QtWidgets.QPushButton("Host에 적용")
+        self.apply_pixhawk_candidate_host_button.clicked.connect(
+            lambda _checked=False: self.apply_selected_pixhawk_candidate("host")
+        )
         self.apply_pixhawk_candidate_left_button = QtWidgets.QPushButton("P1에 적용")
         self.apply_pixhawk_candidate_left_button.clicked.connect(
             lambda _checked=False: self.apply_selected_pixhawk_candidate("left")
@@ -2496,11 +2585,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.swap_camera_button.clicked.connect(self.swap_cameras)
         self.swap_pixhawk_button = QtWidgets.QPushButton("Pixhawk 교체")
         self.swap_pixhawk_button.clicked.connect(self.swap_pixhawks)
-        self.auto_detect_usb_pixhawk_button = QtWidgets.QPushButton("USB Pixhawk 탐색")
-        self.auto_detect_usb_pixhawk_button.clicked.connect(self.auto_detect_usb_pixhawks)
-        self.usb_setup_target_combo = QtWidgets.QComboBox()
-        self.usb_setup_target_combo.addItem("픽스호크 1 설정", "left")
-        self.usb_setup_target_combo.addItem("픽스호크 2 설정", "right")
         self.check_button = QtWidgets.QPushButton("영상 수신 확인")
         self.check_button.clicked.connect(self.check_cameras)
         self.check_control_button = QtWidgets.QPushButton("제어 확인")
@@ -2515,22 +2599,36 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connect_button.clicked.connect(self.toggle_camera_connection)
         self.pixhawk_button = QtWidgets.QPushButton("ROS2 연결")
         self.pixhawk_button.clicked.connect(self.toggle_ros2_connection)
+        self.detect_pixhawk_host_ip_button = QtWidgets.QPushButton("PC IP 탐색")
+        self.detect_pixhawk_host_ip_button.clicked.connect(self.discover_pc_pixhawk_ip)
         self.left_mavlink_button = QtWidgets.QPushButton("P1 MAVLink 연결")
         self.left_mavlink_button.clicked.connect(lambda _checked=False: self.toggle_mavlink_connection("left"))
         self.right_mavlink_button = QtWidgets.QPushButton("P2 MAVLink 연결")
         self.right_mavlink_button.clicked.connect(lambda _checked=False: self.toggle_mavlink_connection("right"))
+        self.left_uxrce_param_button = QtWidgets.QPushButton("P1 uXRCE 설정")
+        self.left_uxrce_param_button.setEnabled(False)
+        self.left_uxrce_param_button.clicked.connect(lambda _checked=False: self.apply_uxrce_params_from_mavlink("left"))
+        self.right_uxrce_param_button = QtWidgets.QPushButton("P2 uXRCE 설정")
+        self.right_uxrce_param_button.setEnabled(False)
+        self.right_uxrce_param_button.clicked.connect(lambda _checked=False: self.apply_uxrce_params_from_mavlink("right"))
         self.left_px4_shell_button = QtWidgets.QPushButton("P1 Shell")
         self.left_px4_shell_button.setEnabled(False)
         self.left_px4_shell_button.clicked.connect(lambda: self.open_px4_shell("left"))
         self.left_persist_eth_button = QtWidgets.QPushButton("ETH 저장")
         self.left_persist_eth_button.setEnabled(False)
         self.left_persist_eth_button.clicked.connect(lambda: self.apply_persistent_pixhawk_eth("left"))
+        self.left_reboot_pixhawk_button = QtWidgets.QPushButton("P1 재부팅")
+        self.left_reboot_pixhawk_button.setEnabled(False)
+        self.left_reboot_pixhawk_button.clicked.connect(lambda _checked=False: self.reboot_pixhawk_from_mavlink("left"))
         self.right_px4_shell_button = QtWidgets.QPushButton("P2 Shell")
         self.right_px4_shell_button.setEnabled(False)
         self.right_px4_shell_button.clicked.connect(lambda: self.open_px4_shell("right"))
         self.right_persist_eth_button = QtWidgets.QPushButton("ETH 저장")
         self.right_persist_eth_button.setEnabled(False)
         self.right_persist_eth_button.clicked.connect(lambda: self.apply_persistent_pixhawk_eth("right"))
+        self.right_reboot_pixhawk_button = QtWidgets.QPushButton("P2 재부팅")
+        self.right_reboot_pixhawk_button.setEnabled(False)
+        self.right_reboot_pixhawk_button.clicked.connect(lambda _checked=False: self.reboot_pixhawk_from_mavlink("right"))
         self.domain_spin = QtWidgets.QSpinBox()
         self.domain_spin.setRange(0, 232)
         self.domain_spin.setValue(self.settings.ros_domain_id)
@@ -2548,9 +2646,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "MAVLink stream 설정",
             self.settings.mavlink_configure_streams,
         )
-        self.mavlink_start_ros2_checkbox = self._build_toggle_button(
-            "ROS2 client 시작",
-            self.settings.mavlink_start_ros2,
+        self.mavlink_configure_uxrce_agent_checkbox = self._build_toggle_button(
+            "PX4 uXRCE Agent 설정",
+            self.settings.mavlink_configure_uxrce_agent,
         )
         self.mavlink_stream_rate_spin = QtWidgets.QSpinBox()
         self.mavlink_stream_rate_spin.setRange(1_000, 10_000_000)
@@ -2577,11 +2675,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.left_rtsp_apply_button.setText("RTSP 적용")
         self.right_rtsp_apply_button.setText("RTSP 적용")
         self.pixhawk_auto_detect_button.setText("Pixhawk 자동 탐색")
+        self.pixhawk_usb_discover_button.setText("USB 연결 탐색")
+        self.pixhawk_mavlink_url_candidate_button.setText("MAVLink URL 후보")
+        self.detect_pixhawk_host_ip_button.setText("PC IP 탐색")
+        self.clear_pixhawk_candidate_button.setText("Clear")
+        self.apply_pixhawk_candidate_host_button.setText("Host에 적용")
         self.apply_pixhawk_candidate_left_button.setText("P1에 적용")
         self.apply_pixhawk_candidate_right_button.setText("P2에 적용")
         self.swap_camera_button.setText("좌우 카메라 교체")
         self.swap_pixhawk_button.setText("Pixhawk 교체")
-        self.auto_detect_usb_pixhawk_button.setText("USB Pixhawk 탐색")
         self.check_button.setText("영상 수신 확인")
         self.check_control_button.setText("제어 확인")
         self.enable_rtsp_button.setText("영상 송출 활성화")
@@ -2589,6 +2691,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.pixhawk_button.setText("ROS2 연결")
         self.left_mavlink_button.setText("P1 MAVLink 연결")
         self.right_mavlink_button.setText("P2 MAVLink 연결")
+        self.left_uxrce_param_button.setText("P1 uXRCE 설정")
+        self.right_uxrce_param_button.setText("P2 uXRCE 설정")
         self.start_button.setText("YOLO 측정 시작")
         self.left_stip_button.setText("STIP 적용")
         self.right_stip_button.setText("STIP 적용")
@@ -2596,6 +2700,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.right_px4_shell_button.setText("P2 Shell")
         self.left_persist_eth_button.setText("ETH 저장")
         self.right_persist_eth_button.setText("ETH 저장")
+        self.left_reboot_pixhawk_button.setText("P1 재부팅")
+        self.right_reboot_pixhawk_button.setText("P2 재부팅")
         self.browse_weights_button.setText("파일 선택")
         self._refresh_yolo_device_toggle()
 
@@ -2769,35 +2875,37 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         pixhawk_common_form.setContentsMargins(12, 24, 12, 12)
         pixhawk_common_form.setColumnStretch(1, 1)
         pixhawk_common_form.setColumnStretch(3, 1)
-        pixhawk_common_form.setColumnStretch(5, 1)
+        pixhawk_common_form.setColumnStretch(6, 1)
         pixhawk_common_form.addWidget(QtWidgets.QLabel("픽스호크 Host IP"), 0, 0)
         pixhawk_common_form.addWidget(self.pixhawk_host_address_edit, 0, 1)
-        pixhawk_common_form.addWidget(QtWidgets.QLabel("ROS_DOMAIN_ID"), 0, 2)
-        pixhawk_common_form.addWidget(self.domain_spin, 0, 3)
-        pixhawk_common_form.addWidget(QtWidgets.QLabel("uXRCE 포트"), 0, 4)
-        pixhawk_common_form.addWidget(self.uxrce_port_spin, 0, 5)
+        pixhawk_common_form.addWidget(self.detect_pixhawk_host_ip_button, 0, 2)
+        pixhawk_common_form.addWidget(QtWidgets.QLabel("ROS_DOMAIN_ID"), 0, 3)
+        pixhawk_common_form.addWidget(self.domain_spin, 0, 4)
+        pixhawk_common_form.addWidget(QtWidgets.QLabel("uXRCE 포트"), 0, 5)
+        pixhawk_common_form.addWidget(self.uxrce_port_spin, 0, 6)
         pixhawk_common_form.addWidget(QtWidgets.QLabel("MAV 속도"), 1, 0)
         pixhawk_common_form.addWidget(self.mavlink_stream_rate_spin, 1, 1)
         pixhawk_common_form.addWidget(self.mavlink_configure_streams_checkbox, 1, 2, 1, 2)
-        pixhawk_common_form.addWidget(self.mavlink_start_ros2_checkbox, 1, 4, 1, 2)
+        pixhawk_common_form.addWidget(self.mavlink_configure_uxrce_agent_checkbox, 1, 4, 1, 3)
         self.pixhawk_common_setup_group = pixhawk_common_group
         pixhawk_form.addWidget(pixhawk_common_group, 0, 0, 1, 6)
 
-        pixhawk_candidate_group = QtWidgets.QGroupBox("1 탐색 후보 / USB 할당")
+        pixhawk_candidate_group = QtWidgets.QGroupBox("1 ROS2 탐색 후보")
         pixhawk_candidate_group.setObjectName("pixhawkCandidateGroup")
         pixhawk_candidate_layout = QtWidgets.QVBoxLayout(pixhawk_candidate_group)
         pixhawk_candidate_layout.setSpacing(10)
         pixhawk_candidate_layout.setContentsMargins(12, 24, 12, 12)
         pixhawk_candidate_discovery_actions = QtWidgets.QHBoxLayout()
         pixhawk_candidate_discovery_actions.setSpacing(6)
-        pixhawk_candidate_discovery_actions.addWidget(QtWidgets.QLabel("USB 대상"))
-        pixhawk_candidate_discovery_actions.addWidget(self.usb_setup_target_combo, 1)
-        pixhawk_candidate_discovery_actions.addWidget(self.auto_detect_usb_pixhawk_button, 1)
         pixhawk_candidate_discovery_actions.addWidget(self.pixhawk_auto_detect_button, 1)
+        pixhawk_candidate_discovery_actions.addWidget(self.pixhawk_usb_discover_button, 1)
+        pixhawk_candidate_discovery_actions.addWidget(self.pixhawk_mavlink_url_candidate_button, 1)
         pixhawk_candidate_layout.addLayout(pixhawk_candidate_discovery_actions)
         pixhawk_candidate_layout.addWidget(self.pixhawk_candidate_table)
         pixhawk_candidate_actions = QtWidgets.QHBoxLayout()
         pixhawk_candidate_actions.setSpacing(6)
+        pixhawk_candidate_actions.addWidget(self.clear_pixhawk_candidate_button, 1)
+        pixhawk_candidate_actions.addWidget(self.apply_pixhawk_candidate_host_button, 1)
         pixhawk_candidate_actions.addWidget(self.apply_pixhawk_candidate_left_button, 1)
         pixhawk_candidate_actions.addWidget(self.apply_pixhawk_candidate_right_button, 1)
         pixhawk_candidate_layout.addLayout(pixhawk_candidate_actions)
@@ -2811,8 +2919,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             eth_ip_edit: QtWidgets.QLineEdit,
             mavlink_url_edit: QtWidgets.QLineEdit,
             baud_spin: QtWidgets.QSpinBox,
-            shell_button: QtWidgets.QPushButton,
-            persist_button: QtWidgets.QPushButton,
         ) -> QtWidgets.QGroupBox:
             side_group = QtWidgets.QGroupBox(title)
             side_group.setObjectName(object_name)
@@ -2832,14 +2938,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
                 side_form.addWidget(label, row, 0)
                 side_form.addWidget(field_widget, row, 1)
-            actions = QtWidgets.QHBoxLayout()
-            actions.setSpacing(6)
-            actions.addWidget(shell_button, 1)
-            actions.addWidget(persist_button, 1)
-            action_label = QtWidgets.QLabel("PX4 작업")
-            action_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            side_form.addWidget(action_label, 4, 0)
-            side_form.addLayout(actions, 4, 1)
             return side_group
 
         pixhawk_pair_group = QtWidgets.QGroupBox("2 Pixhawk 1/2 사전 설정")
@@ -2854,8 +2952,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.left_pixhawk_eth_ip_edit,
             self.left_mavlink_url_edit,
             self.left_mavlink_baud_spin,
-            self.left_px4_shell_button,
-            self.left_persist_eth_button,
         )
         right_pixhawk_group = build_pixhawk_side_group(
             "Pixhawk 2",
@@ -2864,8 +2960,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_pixhawk_eth_ip_edit,
             self.right_mavlink_url_edit,
             self.right_mavlink_baud_spin,
-            self.right_px4_shell_button,
-            self.right_persist_eth_button,
         )
         pixhawk_pair_layout.addWidget(left_pixhawk_group, 1)
         pixhawk_pair_layout.addWidget(right_pixhawk_group, 1)
@@ -2879,13 +2973,37 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         pixhawk_connection_actions = QtWidgets.QHBoxLayout(pixhawk_connection_group)
         pixhawk_connection_actions.setSpacing(6)
         pixhawk_connection_actions.setContentsMargins(12, 24, 12, 12)
-        for button in (self.swap_pixhawk_button, self.left_mavlink_button, self.right_mavlink_button, self.pixhawk_button):
+        for button in (
+            self.swap_pixhawk_button,
+            self.left_mavlink_button,
+            self.right_mavlink_button,
+            self.left_uxrce_param_button,
+            self.right_uxrce_param_button,
+            self.pixhawk_button,
+        ):
             pixhawk_connection_actions.addWidget(button, 1)
         self.pixhawk_connection_actions_group = pixhawk_connection_group
         pixhawk_form.addWidget(pixhawk_connection_group, 3, 0, 1, 6)
+
+        pixhawk_advanced_group = QtWidgets.QGroupBox("4 고급 / 진단")
+        pixhawk_advanced_group.setObjectName("pixhawkAdvancedDiagnosticsGroup")
+        pixhawk_advanced_actions = QtWidgets.QHBoxLayout(pixhawk_advanced_group)
+        pixhawk_advanced_actions.setSpacing(6)
+        pixhawk_advanced_actions.setContentsMargins(12, 24, 12, 12)
+        for button in (
+            self.left_px4_shell_button,
+            self.right_px4_shell_button,
+            self.left_persist_eth_button,
+            self.right_persist_eth_button,
+            self.left_reboot_pixhawk_button,
+            self.right_reboot_pixhawk_button,
+        ):
+            pixhawk_advanced_actions.addWidget(button, 1)
+        self.pixhawk_advanced_diagnostics_group = pixhawk_advanced_group
+        pixhawk_form.addWidget(pixhawk_advanced_group, 4, 0, 1, 6)
         self.pixhawk_connection_label = QtWidgets.QLabel(STARTUP_PIXHAWK_STATUS)
         self.pixhawk_connection_label.setObjectName("statusStrip")
-        pixhawk_form.addWidget(self.pixhawk_connection_label, 4, 0, 1, 6)
+        pixhawk_form.addWidget(self.pixhawk_connection_label, 5, 0, 1, 6)
 
         camera_scroll = QtWidgets.QScrollArea()
         camera_scroll.setWidgetResizable(True)
@@ -2984,41 +3102,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.max_dt_spin.setValue(0.25)
         self.max_dt_spin.setSuffix(" s")
         self.max_dt_spin.valueChanged.connect(lambda _value: self._refresh_camera_parameters_tab())
-        self.max_dy_spin = QtWidgets.QDoubleSpinBox()
-        self.max_dy_spin.setRange(0.0, 2000.0)
-        self.max_dy_spin.setValue(80.0)
-        self.max_dy_spin.setSuffix(" px")
         self.same_class_checkbox = self._build_toggle_button("같은 클래스만 매칭", True)
-        self.max_dy_spin.valueChanged.connect(lambda _value: self._refresh_camera_parameters_tab())
         self.same_class_checkbox.toggled.connect(lambda _checked: self._refresh_camera_parameters_tab())
-        self.require_attitude_checkbox = self._build_toggle_button("자세 동기화 필터", False)
-        self.require_attitude_checkbox.toggled.connect(lambda _checked: self._refresh_camera_parameters_tab())
-        self.max_attitude_age_spin = QtWidgets.QDoubleSpinBox()
-        self.max_attitude_age_spin.setRange(0.01, 10.0)
-        self.max_attitude_age_spin.setValue(0.10)
-        self.max_attitude_age_spin.setSuffix(" s")
-        self.max_attitude_pair_dt_spin = QtWidgets.QDoubleSpinBox()
-        self.max_attitude_pair_dt_spin.setRange(0.01, 10.0)
-        self.max_attitude_pair_dt_spin.setValue(0.05)
-        self.max_attitude_pair_dt_spin.setSuffix(" s")
         self.use_rtk_baseline_checkbox = self._build_toggle_button(
-            "실시간 GPS 참고",
+            "실시간 GPS baseline 사용",
             self.settings.use_rtk_baseline,
         )
-        self.use_rtk_baseline_checkbox.toggled.connect(lambda _checked: self._refresh_camera_parameters_tab())
+        self.use_rtk_baseline_checkbox.toggled.connect(self._handle_gps_baseline_toggle_changed)
         self.require_rtk_fixed_checkbox = self._build_toggle_button(
             "RTK Fixed 품질 확인",
             self.settings.require_rtk_fixed,
         )
-        self.require_rtk_fixed_checkbox.toggled.connect(lambda _checked: self._refresh_camera_parameters_tab())
-        self.max_gps_age_spin = QtWidgets.QDoubleSpinBox()
-        self.max_gps_age_spin.setRange(0.05, 30.0)
-        self.max_gps_age_spin.setValue(1.0)
-        self.max_gps_age_spin.setSuffix(" s")
-        self.max_gps_eph_spin = QtWidgets.QDoubleSpinBox()
-        self.max_gps_eph_spin.setRange(0.01, 100.0)
-        self.max_gps_eph_spin.setValue(0.10)
-        self.max_gps_eph_spin.setSuffix(" m")
+        self.require_rtk_fixed_checkbox.toggled.connect(self._handle_gps_baseline_toggle_changed)
         self.distance_label = QtWidgets.QLabel("거리: 좌/우 검출 매칭 대기 중")
         self.distance_label.setObjectName("distanceStatus")
         self.distance_label.setWordWrap(True)
@@ -3027,9 +3122,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_mode_combo.setAccessibleName("외부 파라미터 계산 방식")
         self.distance_mode_combo.setToolTip(
             "3D ray 거리 계산에 사용할 외부 파라미터 출처를 고릅니다.\n"
-            "Pixhawk 자세와 RTK translation을 사용합니다."
+            "Pixhawk 자세와 GPS/RTK baseline translation을 사용합니다."
         )
-        self.distance_mode_combo.addItem("Pixhawk 자세 + RTK 위치", "pixhawk")
+        self.distance_mode_combo.addItem("Pixhawk 자세 + GPS/RTK baseline", "pixhawk")
         initial_distance_mode = "pixhawk"
         self.distance_mode_combo.setCurrentIndex(self.distance_mode_combo.findData(initial_distance_mode))
         self._distance_mode_last_source = initial_distance_mode
@@ -3074,16 +3169,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_mode_label = QtWidgets.QLabel("계산 방식")
         self.baseline_label = QtWidgets.QLabel("Baseline")
         self.mount_assumption_label = QtWidgets.QLabel(
-            "장착 가정: nominal shared rig. "
-            "좌/우 리그를 동일 구조로 보고 baseline과 Pixhawk 자세만 계산에 사용합니다."
+            "장착 가정: GPS/RTK baseline only. "
+            "수동 baseline 입력은 사용하지 않고 좌/우 Pixhawk GPS baseline과 자세만 계산에 사용합니다."
         )
         self.mount_assumption_label.setObjectName("statusStrip")
         self.mount_assumption_label.setWordWrap(True)
         extrinsics_form.addWidget(self.distance_mode_label, 0, 0)
         extrinsics_form.addWidget(self.distance_mode_combo, 0, 1)
-        extrinsics_form.addWidget(self.baseline_label, 1, 0)
-        extrinsics_form.addWidget(self.baseline_spin, 1, 1)
-        extrinsics_form.addWidget(self.mount_assumption_label, 2, 0, 1, 2)
+        self.baseline_label.setVisible(False)
+        self.baseline_spin.setVisible(False)
+        extrinsics_form.addWidget(self.mount_assumption_label, 1, 0, 1, 2)
 
         stereo_parameter_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         stereo_parameter_splitter.setObjectName("stereoParameterSplitter")
@@ -3114,49 +3209,36 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         match_form = QtWidgets.QGridLayout(match_group)
         match_form.setHorizontalSpacing(8)
         match_form.setColumnStretch(1, 1)
-        match_form.setColumnStretch(3, 1)
         match_form.addWidget(QtWidgets.QLabel("최대 Δt"), 0, 0)
         match_form.addWidget(self.max_dt_spin, 0, 1)
-        match_form.addWidget(QtWidgets.QLabel("최대 Δy"), 0, 2)
-        match_form.addWidget(self.max_dy_spin, 0, 3)
         match_form.addWidget(QtWidgets.QLabel("영상 표시"), 1, 0)
-        match_form.addWidget(self.measurement_display_combo, 1, 1, 1, 3)
+        match_form.addWidget(self.measurement_display_combo, 1, 1)
         match_form.addWidget(self.same_class_checkbox, 2, 0, 1, 2)
-
-        self.attitude_sync_group = QtWidgets.QGroupBox("자세 동기화")
-        attitude_sync_form = QtWidgets.QGridLayout(self.attitude_sync_group)
-        attitude_sync_form.setHorizontalSpacing(8)
-        attitude_sync_form.setColumnStretch(1, 1)
-        attitude_sync_form.setColumnStretch(3, 1)
-        self.pixhawk_attitude_age_label = QtWidgets.QLabel("최대 age")
-        self.pixhawk_attitude_pair_dt_label = QtWidgets.QLabel("최대 Δt")
-        attitude_sync_form.addWidget(self.pixhawk_attitude_age_label, 0, 0)
-        attitude_sync_form.addWidget(self.max_attitude_age_spin, 0, 1)
-        attitude_sync_form.addWidget(self.pixhawk_attitude_pair_dt_label, 0, 2)
-        attitude_sync_form.addWidget(self.max_attitude_pair_dt_spin, 0, 3)
-        attitude_sync_form.addWidget(self.require_attitude_checkbox, 1, 0, 1, 4)
 
         stereo_form.addWidget(self.current_parameters_group, 0, 0, 1, 6)
         stereo_form.addWidget(stereo_parameter_splitter, 1, 0, 1, 6)
         stereo_form.addWidget(match_group, 2, 0, 1, 6)
-        stereo_form.addWidget(self.attitude_sync_group, 3, 0, 1, 6)
-        stereo_form.addWidget(self.distance_label, 4, 0, 1, 6)
+        stereo_form.addWidget(self.distance_label, 3, 0, 1, 6)
         stereo_layout.addWidget(stereo)
         stereo_layout.addStretch(1)
 
         self.left_gps_label = QtWidgets.QLabel("픽스호크 1 GPS/RTK: 미연결")
         self.right_gps_label = QtWidgets.QLabel("픽스호크 2 GPS/RTK: 미연결")
         self.rtk_baseline_label = QtWidgets.QLabel("GPS baseline: 대기 중")
-        for rtk_label in (self.left_gps_label, self.right_gps_label, self.rtk_baseline_label):
+        self.rtk_fixed_status_label = QtWidgets.QLabel("RTK Fixed: 좌/우 GPS 대기 중")
+        self.rtk_summary_labels: dict[str, QtWidgets.QLabel] = {}
+        for key, text in (
+            ("baseline", "Baseline: 대기 중"),
+            ("camera", "Camera: 자세 대기 중"),
+            ("status", "Status: GPS 대기 중"),
+        ):
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("statChip")
+            label.setWordWrap(True)
+            self.rtk_summary_labels[key] = label
+        for rtk_label in (self.left_gps_label, self.right_gps_label, self.rtk_baseline_label, self.rtk_fixed_status_label):
             rtk_label.setObjectName("statusStrip")
             rtk_label.setWordWrap(True)
-        self.gps_baseline_result_label = QtWidgets.QLabel("GPS baseline: 좌/우 위도/경도를 입력하세요.")
-        self.gps_baseline_result_label.setObjectName("statusStrip")
-        self.gps_baseline_result_label.setWordWrap(True)
-        self.apply_gps_baseline_button = QtWidgets.QPushButton("Baseline에 적용")
-        self.apply_gps_baseline_button.clicked.connect(self.apply_gps_baseline_to_manual_input)
-        self.calculate_gps_baseline_button = QtWidgets.QPushButton("GPS baseline 계산")
-        self.calculate_gps_baseline_button.clicked.connect(self.calculate_gps_baseline)
         setup_layout.addWidget(connection_tabs, 1)
         pixhawk_tabs = QtWidgets.QTabWidget()
         pixhawk_summary_tab = QtWidgets.QWidget()
@@ -3173,14 +3255,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         pixhawk_tabs.addTab(pixhawk_1_tab, "픽스호크 1")
         pixhawk_tabs.addTab(pixhawk_2_tab, "픽스호크 2")
         self.pixhawk_tabs = pixhawk_tabs
-        rm3100_alignment_layout.addWidget(pixhawk_tabs, 1)
-        alignment_tabs.addTab(rm3100_alignment_tab, "MAG")
-        alignment_tabs.addTab(pixhawk_attitude_tab, "자세")
         advanced_tabs.addTab(wiris_command_panel, "WIRIS SDK")
         advanced_tabs.addTab(custom_watch_tab, "필드 감시")
         advanced_tabs.addTab(center_bias_tab, "Bias 보정")
-        self.rm3100_alignment_tab_index = alignment_tabs.indexOf(rm3100_alignment_tab)
-        self.attitude_alignment_tab_index = alignment_tabs.indexOf(pixhawk_attitude_tab)
+        self._handle_alignment_step_changed(alignment_tabs.currentIndex())
         self.advanced_wiris_command_tab_index = advanced_tabs.indexOf(wiris_command_panel)
         self.advanced_custom_watch_tab_index = advanced_tabs.indexOf(custom_watch_tab)
         self.advanced_center_bias_tab_index = advanced_tabs.indexOf(center_bias_tab)
@@ -3198,6 +3276,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             left_label = QtWidgets.QLabel("대기 중")
             right_label = QtWidgets.QLabel("대기 중")
             delta_label = QtWidgets.QLabel("대기 중")
+            for label in (left_label, right_label, delta_label):
+                label.setObjectName("statusStrip")
             attitude_compare_form.addWidget(QtWidgets.QLabel(axis), row, 0)
             attitude_compare_form.addWidget(left_label, row, 1)
             attitude_compare_form.addWidget(right_label, row, 2)
@@ -3252,11 +3332,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gps_sensor_labels: dict[str, dict[str, QtWidgets.QLabel]] = {"left": {}, "right": {}}
         self.mag_sensor_plots: dict[str, TelemetryHistoryPlot] = {}
         self.gps_sensor_plots: dict[str, TelemetryHistoryPlot] = {}
-        self._build_pixhawk_sensor_health_tabs(
-            pixhawk_summary_layout,
-            pixhawk_1_layout,
-            pixhawk_2_layout,
-        )
+        self.pixhawk_sensor_summary_labels: dict[str, dict[str, QtWidgets.QLabel]] = {"left": {}, "right": {}}
+        self.rm3100_slot_labels: dict[str, dict[str, QtWidgets.QLabel]] = {"left": {}, "right": {}}
+        self.rm3100_yaw_source_combos: dict[str, QtWidgets.QComboBox] = {}
+        self.rm3100_yaw_source_status_labels: dict[str, QtWidgets.QLabel] = {}
+        self.f9p_slot_labels: dict[str, dict[str, QtWidgets.QLabel]] = {"left": {}, "right": {}}
+        self.rm3100_compare_labels: dict[str, QtWidgets.QLabel] = {}
+        self.f9p_compare_labels: dict[str, QtWidgets.QLabel] = {}
+        self.gnss_heading_labels: dict[str, QtWidgets.QLabel] = {}
+        self.rm3100_norm_plots: dict[str, TelemetryHistoryPlot] = {}
+        self.rm3100_delta_plots: dict[str, TelemetryHistoryPlot] = {}
+        self.f9p_sats_plots: dict[str, TelemetryHistoryPlot] = {}
+        self.f9p_quality_plots: dict[str, TelemetryHistoryPlot] = {}
+        self._build_alignment_overview_tab(alignment_overview_layout)
+        self._build_baseline_alignment_tab(rtk_layout)
+        self._build_alignment_magnetometer_tab(alignment_mag_layout)
+        self._build_alignment_attitude_tab(alignment_attitude_layout)
+        self._build_alignment_coordinate_tab(alignment_coordinate_layout)
+        self._build_alignment_validation_tab(alignment_validation_layout)
+        self._build_alignment_profile_tab(alignment_profile_layout)
 
         zoom_group = QtWidgets.QGroupBox("WIRIS 줌 명령 제어")
         zoom_group.setObjectName("checkerboardZoomControlGroup")
@@ -3423,76 +3517,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calib_form.addWidget(self.calib_dir_edit, 1, 1, 1, 5)
         calib_form.addWidget(self.capture_calibration_button, 1, 6)
         calib_form.addWidget(self.run_calibration_button, 1, 7)
-
-        baseline_subtabs = QtWidgets.QTabWidget()
-        baseline_subtabs.setDocumentMode(True)
-        live_rtk_tab = QtWidgets.QWidget()
-        live_rtk_layout = QtWidgets.QVBoxLayout(live_rtk_tab)
-        gps_baseline_tab = QtWidgets.QWidget()
-        gps_baseline_layout = QtWidgets.QVBoxLayout(gps_baseline_tab)
-        baseline_subtabs.addTab(live_rtk_tab, "실시간 GPS")
-        baseline_subtabs.addTab(gps_baseline_tab, "GPS 계산")
-        self.baseline_subtabs = baseline_subtabs
-        self.gps_baseline_tab_index = baseline_subtabs.indexOf(gps_baseline_tab)
-
-        rtk_group = QtWidgets.QGroupBox("GPS baseline / 삼각측량 참고")
-        rtk_form = QtWidgets.QGridLayout(rtk_group)
-        rtk_form.setHorizontalSpacing(8)
-        rtk_form.setColumnStretch(1, 1)
-        rtk_form.setColumnStretch(3, 1)
-        rtk_form.setColumnStretch(5, 1)
-        rtk_form.addWidget(self.use_rtk_baseline_checkbox, 0, 0, 1, 3)
-        rtk_form.addWidget(self.require_rtk_fixed_checkbox, 0, 3, 1, 3)
-        rtk_form.addWidget(QtWidgets.QLabel("GPS 최대 age"), 1, 0)
-        rtk_form.addWidget(self.max_gps_age_spin, 1, 1)
-        rtk_form.addWidget(QtWidgets.QLabel("GPS 최대 eph"), 1, 2)
-        rtk_form.addWidget(self.max_gps_eph_spin, 1, 3)
-        rtk_form.addWidget(self.rtk_baseline_label, 2, 0, 1, 6)
-        self.rtk_alignment_detail_label = QtWidgets.QLabel("정렬 성분: GPS baseline 대기 중")
-        self.rtk_alignment_detail_label.setObjectName("statusStrip")
-        self.rtk_alignment_detail_label.setWordWrap(True)
-        self.rtk_alignment_plot = RtkAlignmentPlot()
-        live_rtk_layout.addWidget(rtk_group)
-        live_rtk_layout.addWidget(self.left_gps_label)
-        live_rtk_layout.addWidget(self.right_gps_label)
-        live_rtk_layout.addWidget(self.rtk_alignment_detail_label)
-        live_rtk_layout.addWidget(self.rtk_alignment_plot, 1)
-
-        gps_input_group = QtWidgets.QGroupBox("위도/경도 baseline 계산")
-        gps_input_form = QtWidgets.QGridLayout(gps_input_group)
-        gps_input_form.setHorizontalSpacing(8)
-        for column in (1, 3):
-            gps_input_form.setColumnStretch(column, 1)
-        for row, (side, title) in enumerate((("left", "Left"), ("right", "Right"))):
-            gps_input_form.addWidget(QtWidgets.QLabel(title), row, 0)
-            self.gps_baseline_spins[side] = {}
-            for offset, (key, label_text, minimum, maximum, decimals) in enumerate(
-                (
-                    ("lat", "위도", -90.0, 90.0, 8),
-                    ("lon", "경도", -180.0, 180.0, 8),
-                    ("alt", "고도", -1000.0, 10000.0, 3),
-                ),
-                start=1,
-            ):
-                spin = QtWidgets.QDoubleSpinBox()
-                spin.setRange(minimum, maximum)
-                spin.setDecimals(decimals)
-                spin.setSingleStep(0.000001 if key != "alt" else 0.1)
-                if key == "alt":
-                    spin.setSuffix(" m")
-                spin.valueChanged.connect(lambda _value: self.calculate_gps_baseline())
-                self.gps_baseline_spins[side][key] = spin
-                gps_input_form.addWidget(QtWidgets.QLabel(label_text), row, offset * 2 - 1)
-                gps_input_form.addWidget(spin, row, offset * 2)
-        gps_actions = QtWidgets.QHBoxLayout()
-        gps_actions.addWidget(self.calculate_gps_baseline_button)
-        gps_actions.addWidget(self.apply_gps_baseline_button)
-        gps_actions.addStretch(1)
-        gps_baseline_layout.addWidget(gps_input_group)
-        gps_baseline_layout.addLayout(gps_actions)
-        gps_baseline_layout.addWidget(self.gps_baseline_result_label)
-        gps_baseline_layout.addStretch(1)
-        rtk_layout.addWidget(baseline_subtabs, 1)
 
         calibration_top_stack = QtWidgets.QVBoxLayout()
         calibration_top_stack.setSpacing(6)
@@ -3988,9 +4012,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         self.uam_source_combo = QtWidgets.QComboBox()
         self.uam_source_combo.addItem("ROS2 topic", "ros2")
-        self.uam_source_combo.addItem("MAVLink LOCAL_POSITION_NED", "mavlink")
-        self.uam_source_combo.addItem("MAVLink GPS Position", "mavlink_gps")
-        self.uam_source_combo.addItem("MAVLink Global Position", "mavlink_global")
+        self.uam_source_combo.addItem("USB MAVLink LOCAL_POSITION_NED", "mavlink")
+        self.uam_source_combo.addItem("USB MAVLink GPS Position", "mavlink_gps")
+        self.uam_source_combo.addItem("USB MAVLink Global Position", "mavlink_global")
         self.uam_source_combo.addItem("사용 안 함", "off")
         self._set_combo_data(self.uam_source_combo, self.settings.uam_telemetry_source)
 
@@ -3999,9 +4023,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.uam_ros2_y_field_edit = QtWidgets.QLineEdit(self.settings.uam_ros2_y_field)
         self.uam_ros2_z_field_edit = QtWidgets.QLineEdit(self.settings.uam_ros2_z_field)
 
+        self.uam_mavlink_url_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_url)
+        self.uam_mavlink_baud_spin = self._build_mavlink_baud_spin()
+        self.uam_mavlink_baud_spin.setValue(self.settings.uam_mavlink_baud)
         self.uam_mavlink_side_combo = QtWidgets.QComboBox()
-        self.uam_mavlink_side_combo.addItem("Pixhawk 1", "left")
-        self.uam_mavlink_side_combo.addItem("Pixhawk 2", "right")
+        self.uam_mavlink_side_combo.addItem("UAM USB", "left")
         self._set_combo_data(self.uam_mavlink_side_combo, self.settings.uam_mavlink_side)
         self.uam_mavlink_message_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_message)
         self.uam_mavlink_x_field_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_x_field)
@@ -4037,17 +4063,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         form.addWidget(self.uam_ros2_x_field_edit, 2, 1)
         form.addWidget(self.uam_ros2_y_field_edit, 2, 2)
         form.addWidget(self.uam_ros2_z_field_edit, 2, 3)
-        form.addWidget(QtWidgets.QLabel("MAVLink Pixhawk"), 3, 0)
-        form.addWidget(self.uam_mavlink_side_combo, 3, 1)
-        form.addWidget(QtWidgets.QLabel("Message"), 3, 2)
-        form.addWidget(self.uam_mavlink_message_edit, 3, 3)
-        form.addWidget(QtWidgets.QLabel("MAVLink N/E/D field"), 4, 0)
-        form.addWidget(self.uam_mavlink_x_field_edit, 4, 1)
-        form.addWidget(self.uam_mavlink_y_field_edit, 4, 2)
-        form.addWidget(self.uam_mavlink_z_field_edit, 4, 3)
-        form.addWidget(self.uam_status_label, 5, 0, 1, 5)
-        form.addWidget(self.uam_mount_reference_label, 6, 0, 1, 5)
-        form.addWidget(self.uam_latest_label, 7, 0, 1, 5)
+        form.addWidget(QtWidgets.QLabel("UAM USB port"), 3, 0)
+        form.addWidget(self.uam_mavlink_url_edit, 3, 1)
+        form.addWidget(QtWidgets.QLabel("Baud"), 3, 2)
+        form.addWidget(self.uam_mavlink_baud_spin, 3, 3)
+        form.addWidget(QtWidgets.QLabel("Message"), 4, 0)
+        form.addWidget(self.uam_mavlink_message_edit, 4, 1)
+        form.addWidget(QtWidgets.QLabel("MAVLink N/E/D field"), 5, 0)
+        form.addWidget(self.uam_mavlink_x_field_edit, 5, 1)
+        form.addWidget(self.uam_mavlink_y_field_edit, 5, 2)
+        form.addWidget(self.uam_mavlink_z_field_edit, 5, 3)
+        form.addWidget(self.uam_status_label, 6, 0, 1, 5)
+        form.addWidget(self.uam_mount_reference_label, 7, 0, 1, 5)
+        form.addWidget(self.uam_latest_label, 8, 0, 1, 5)
 
         self.uam_live_plot = TelemetryHistoryPlot("UAM Ground Truth N/E/D", "m")
         self.uam_live_plot.setMinimumHeight(260)
@@ -4108,7 +4136,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         tooltips = {
             self.interface_edit: "카메라 네트워크 도달성을 확인할 때 사용할 로컬 네트워크 인터페이스입니다.",
             self.host_address_edit: "WIRIS 카메라망에서 PC가 사용할 IP입니다. 카메라 IP가 아니며 Pixhawk host 주소와도 별개입니다.",
-            self.pixhawk_host_address_edit: "Pixhawk가 MAVLink stream과 uXRCE-DDS 대상으로 사용할 PC 주소입니다. 예: 10.41.10.1",
+            self.pixhawk_host_address_edit: "Pixhawk가 uXRCE-DDS 대상으로 사용할 PC 주소입니다. 예: 10.0.0.10",
             self.left_url_edit: "왼쪽 카메라 스트림의 전체 RTSP URL입니다. 카메라 IP, 포트, 경로를 포함합니다.",
             self.right_url_edit: "오른쪽 카메라 스트림의 전체 RTSP URL입니다. 카메라 IP, 포트, 경로를 포함합니다.",
             self.left_rtsp_ip_edit: "왼쪽 RTSP URL에 적용할 OSD IP Address 값입니다. Telnet 제어 host는 이 버튼으로 바꾸지 않습니다.",
@@ -4157,22 +4185,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "완료되면 오른쪽 RTSP URL의 host도 같이 갱신됩니다."
             ),
             self.pixhawk_auto_detect_button: "현재 ROS_DOMAIN_ID에서 ROS2 PX4 토픽을 스캔해 Pixhawk namespace를 채웁니다.",
+            self.pixhawk_usb_discover_button: "OS에 보이는 USB Pixhawk 포트와 MAVLink heartbeat/권한 상태를 후보 표에 표시합니다. 자동 할당은 하지 않습니다.",
+            self.pixhawk_mavlink_url_candidate_button: "Ethernet MAVLink UDP 기본 URL 후보를 표에 추가합니다. PX4가 해당 UDP 포트로 MAVLink를 보내고 있어야 연결됩니다.",
+            self.detect_pixhawk_host_ip_button: "P1/P2 Pixhawk ETH IP 대역에 맞는 이 PC의 IPv4를 찾아 Pixhawk Host IP에 채웁니다.",
             self.swap_camera_button: "좌/우 카메라 RTSP URL과 IP Address/Telnet port를 서로 바꿉니다. 실행 중인 스트림은 새 매핑으로 재시작됩니다.",
             self.swap_pixhawk_button: "Pixhawk 1/2 ROS namespace와 MAVLink URL을 서로 바꿉니다. 구독은 새 매핑으로 재시작됩니다.",
-            self.usb_setup_target_combo: "USB로 연결된 단일 Pixhawk를 ETH 설정에서 왼쪽/오른쪽 중 어디로 볼지 선택합니다.",
-            self.auto_detect_usb_pixhawk_button: "/dev/ttyACM* 및 /dev/ttyUSB*에서 MAVLink heartbeat를 찾아 선택한 Pixhawk 대상만 채웁니다.",
             self.check_button: "좌/우 RTSP 호스트의 RTSP 포트가 열려 있는지 확인합니다.",
             self.camera_connect_button: "좌/우 RTSP Preview를 연결하거나, 연결 중이면 카메라 Preview와 활성 YOLO 검출을 중지합니다.",
             self.pixhawk_button: "ROS2 Pixhawk 세션을 연결하거나, 연결 중이면 ROS2 토픽 구독을 중지합니다.",
             self.left_mavlink_button: "Pixhawk 1 MAVLink 세션을 연결하거나, 연결 중이면 P1 MAVLink 링크만 중지합니다.",
             self.right_mavlink_button: "Pixhawk 2 MAVLink 세션을 연결하거나, 연결 중이면 P2 MAVLink 링크만 중지합니다.",
+            self.left_uxrce_param_button: "활성 P1 MAVLink 연결로 PX4 UXRCE_DDS_* 파라미터를 Pixhawk Host IP에 맞게 설정하고 확인합니다.",
+            self.right_uxrce_param_button: "활성 P2 MAVLink 연결로 PX4 UXRCE_DDS_* 파라미터를 Pixhawk Host IP에 맞게 설정하고 확인합니다.",
             self.uam_source_combo: "UAM/드론 ground truth 위치를 ROS2 topic으로 받을지, MAVLink fallback으로 받을지 선택합니다.",
             self.uam_ros2_topic_edit: "ROS2 ground truth 위치 topic입니다. 기본값은 PX4 vehicle_local_position입니다.",
             self.uam_ros2_x_field_edit: "ROS2 ground truth North field입니다. PX4 local position에서는 보통 x입니다.",
             self.uam_ros2_y_field_edit: "ROS2 ground truth East field입니다. PX4 local position에서는 보통 y입니다.",
             self.uam_ros2_z_field_edit: "ROS2 ground truth Down field입니다. PX4 local position에서는 보통 z입니다.",
-            self.uam_mavlink_side_combo: "MAVLink fallback ground truth를 받을 Pixhawk 링크입니다.",
-            self.uam_mavlink_message_edit: "MAVLink fallback 위치 메시지입니다. 예: LOCAL_POSITION_NED",
+            self.uam_mavlink_url_edit: "UAM/드론 PX4 텔레메트리를 받을 별도 USB MAVLink 포트입니다. 예: /dev/ttyACM0, /dev/serial/by-id/...",
+            self.uam_mavlink_baud_spin: "UAM USB MAVLink 포트 baud rate입니다.",
+            self.uam_mavlink_side_combo: "내부 UAM USB 링크 슬롯입니다. 좌/우 Pixhawk와 분리되어 있습니다.",
+            self.uam_mavlink_message_edit: "UAM USB MAVLink 위치 메시지입니다. LOCAL_POSITION_NED는 x=north, y=east, z=down입니다.",
             self.uam_mavlink_x_field_edit: "MAVLink ground truth North field입니다. LOCAL_POSITION_NED에서는 x입니다.",
             self.uam_mavlink_y_field_edit: "MAVLink ground truth East field입니다. LOCAL_POSITION_NED에서는 y입니다.",
             self.uam_mavlink_z_field_edit: "MAVLink ground truth Down field입니다. LOCAL_POSITION_NED에서는 z입니다.",
@@ -4204,6 +4237,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_px4_shell_button: "활성 MAVLink 연결을 통해 Pixhawk 2 PX4 shell 창을 엽니다.",
             self.left_persist_eth_button: "왼쪽 Pixhawk eth0/MAVLink UDP 설정을 즉시 적용하고 extras.txt에 저장합니다.",
             self.right_persist_eth_button: "오른쪽 Pixhawk eth0/MAVLink UDP 설정을 즉시 적용하고 extras.txt에 저장합니다.",
+            self.left_reboot_pixhawk_button: "활성 MAVLink 연결로 Pixhawk 1에 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN을 보냅니다.",
+            self.right_reboot_pixhawk_button: "활성 MAVLink 연결로 Pixhawk 2에 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN을 보냅니다.",
             self.camera_connection_label: "좌/우 카메라 Preview 연결 상태와 측정된 프레임 속도를 표시합니다.",
             self.runtime_camera_settings_group: "실시간 카메라 화면 위의 실행 버튼, 스트림 설정, 프레임 상태 표시를 접거나 펼칩니다.",
             self.runtime_stream_settings_label: "현재 RTSP 전송 방식(TCP/UDP), 수신 백엔드, 디코더, 지연, 미리보기 속도를 표시합니다.",
@@ -4226,15 +4261,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.domain_spin: "PX4/ROS2 uORB 토픽 탐색에 사용할 ROS_DOMAIN_ID입니다.",
             self.left_namespace_edit: "Pixhawk 1의 ROS2 namespace입니다. 왼쪽 카메라와 매핑됩니다.",
             self.right_namespace_edit: "Pixhawk 2의 ROS2 namespace입니다. 오른쪽 카메라와 매핑됩니다.",
-            self.left_pixhawk_eth_ip_edit: "왼쪽 Pixhawk에 적용하고 저장할 eth0 고정 IP입니다. 예: 192.168.0.2",
-            self.right_pixhawk_eth_ip_edit: "오른쪽 Pixhawk에 적용하고 저장할 eth0 고정 IP입니다. 예: 192.168.0.3",
+            self.left_pixhawk_eth_ip_edit: "왼쪽 Pixhawk에 적용하고 저장할 eth0 고정 IP입니다. 예: 10.0.0.2",
+            self.right_pixhawk_eth_ip_edit: "오른쪽 Pixhawk에 적용하고 저장할 eth0 고정 IP입니다. 예: 10.0.0.3",
             self.left_mavlink_url_edit: "Pixhawk 1 MAVLink URL입니다. 예: udpin:0.0.0.0:14550, /dev/ttyACM0, tcp:192.168.0.3:5760",
             self.right_mavlink_url_edit: "Pixhawk 2 MAVLink URL입니다. 예: udpin:0.0.0.0:14551, /dev/ttyACM1, tcp:10.41.10.2:5760",
             self.left_mavlink_baud_spin: "Pixhawk 1 MAVLink URL이 시리얼 장치일 때 사용할 baud rate입니다.",
             self.right_mavlink_baud_spin: "Pixhawk 2 MAVLink URL이 시리얼 장치일 때 사용할 baud rate입니다.",
             self.mavlink_configure_streams_checkbox: "MAVLink 연결 후 MAV_SYS_ID 설정과 Pixhawk Host IP 방향 MAVLink stream 시작 명령을 보냅니다.",
             self.mavlink_stream_rate_spin: "PX4 shell로 MAVLink stream을 설정할 때 사용할 mavlink start -r 값입니다.",
-            self.mavlink_start_ros2_checkbox: "MAVLink 연결 후 Pixhawk Host IP 방향 uxrce_dds_client 시작 명령을 보냅니다.",
+            self.mavlink_configure_uxrce_agent_checkbox: "MAVLink 연결 후 PX4 uXRCE-DDS Client가 접속할 PC Micro XRCE-DDS Agent IP/port 파라미터를 설정하고 readback으로 확인합니다.",
             self.uxrce_port_spin: "호스트 PC의 Micro XRCE-DDS Agent UDP 포트입니다. 일반적으로 8888입니다.",
             self.custom_watch_name_edit: "사용자 지정 ROS2/uORB 필드 감시의 표시 이름입니다.",
             self.custom_watch_topic_edit: "감시할 전체 ROS2 토픽입니다. 예: /uav_0/fmu/out/vehicle_local_position",
@@ -4257,8 +4292,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.attitude_plots["yaw"]: "Yaw 각도 이력입니다. Pixhawk 1과 Pixhawk 2가 같은 그래프에 별도 선으로 표시됩니다.",
             self.use_rtk_baseline_checkbox: "실시간 Pixhawk GPS baseline을 정렬 참고값으로 표시합니다. 거리 계산은 Baseline 입력값을 사용합니다.",
             self.require_rtk_fixed_checkbox: "실시간 GPS baseline 품질 판단에서 두 GPS 위치가 RTK Fixed인지 확인합니다. 꺼져 있으면 일반 3D GPS도 시각화합니다.",
-            self.max_gps_age_spin: "baseline 추정에 사용할 RTK/GPS 샘플의 최대 허용 age입니다.",
-            self.max_gps_eph_spin: "GPS baseline 품질 판단에 사용할 최대 수평 위치 오차입니다.",
             self.rtk_baseline_label: "실시간 baseline 길이, N/E/D 벡터, 샘플 age, GPS/RTK 품질 경고를 표시합니다.",
             self.rtk_alignment_detail_label: "안테나 baseline과 카메라 기준 Right/Down/Forward 성분을 분리해 표시합니다.",
             self.rtk_alignment_plot: "GPS 안테나 baseline과 카메라 기준 baseline 성분을 시각화합니다.",
@@ -4281,7 +4314,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.wiris_command_send_button: "편집한 SDK 명령을 선택한 WIRIS 대상으로 전송합니다.",
             self.wiris_set_pc_time_button: (
                 "선택한 WIRIS 대상의 RTC를 PC 현재 UTC로 설정합니다. "
-                "STUS seconds microseconds 명령을 보내며 좌/우 전송 시각 차이를 로그에 남깁니다."
+                "양쪽 전송에서는 같은 STUS UTC 값을 만들고 명령 UTC/TCP 호출 시작 차이를 로그에 남깁니다."
             ),
             self.wiris_command_log: "카메라 SDK 명령 응답 로그입니다.",
             self.calib_cols_spin: "체커보드 내부 코너의 열 개수입니다.",
@@ -4299,7 +4332,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.zoom_intrinsics_compare_list: "저장된 내부 파라미터 파일들을 스크롤로 비교합니다. 항목은 드래그해서 순서를 바꿀 수 있습니다.",
             self.intrinsics_source_combo: "거리 계산에 사용할 내부 파라미터 출처입니다. 체커보드 보정값 또는 수동 초점거리 fallback 중 하나만 선택합니다.",
             self.intrinsics_status_label: "현재 내부 파라미터 적용 상태와 초점거리 출처를 표시합니다.",
-            self.distance_mode_combo: "3D ray 거리 계산은 Pixhawk 자세와 RTK translation을 사용합니다.",
+            self.distance_mode_combo: "3D ray 거리 계산은 Pixhawk 자세와 GPS/RTK baseline translation을 사용합니다.",
             self.measurement_display_combo: "측정탭 좌/우 영상에 실시간 preview를 보여줄지, 거리 계산에 실제로 선택된 검출 프레임 쌍을 보여줄지 선택합니다.",
             self.distance_parameters_label: "현재 거리 계산에 쓰이는 초점거리, baseline/translation, 위치/자세 출처를 요약합니다.",
             self.calibration_left_preview: "체커보드 검출 overlay가 표시되는 왼쪽 보정 미리보기입니다.",
@@ -4315,16 +4348,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "체커보드가 없을 때만 켜고, 체커보드 보정값을 쓰려면 끄세요.\n\n"
                 + WIRIS_VISIBLE_ZOOM_FX_TOOLTIP
             ),
-            self.baseline_spin: "거리 계산에 항상 사용하는 수동 카메라 baseline입니다. GPS 계산 탭에서 계산한 값을 여기에 적용할 수 있습니다.",
+            self.baseline_spin: "거리 계산에 항상 사용하는 수동 카메라 baseline입니다. Baseline 탭의 보조 수동 계산 값을 여기에 적용할 수 있습니다.",
             self.max_dt_spin: (
                 "좌/우 검출을 같은 순간의 샘플로 볼 최대 timestamp 차이입니다.\n"
                 "거리 그래프는 허용 Δt 안의 최근 후보 중 timestamp 차이가 작은 새 검출 쌍만 기록합니다."
             ),
-            self.max_dy_spin: "좌/우 검출 매칭에서 허용할 최대 세로 중심 차이입니다.",
             self.same_class_checkbox: "좌/우 YOLO 검출 class가 같을 때만 매칭합니다.",
-            self.require_attitude_checkbox: "자세 샘플이 없거나 오래됐을 때 거리 표시를 차단합니다.",
-            self.max_attitude_age_spin: "동기화 품질에 사용할 자세 샘플의 최대 허용 age입니다.",
-            self.max_attitude_pair_dt_spin: "좌/우 자세 샘플 간 최대 허용 timestamp 차이입니다.",
             self.distance_label: "현재 거리 추정값, 계산 방식, 동기화 품질, 경고를 자세히 표시합니다.",
             self.start_button: "YOLO 검출과 3D 거리 측정을 시작하거나, 측정 중이면 Pixhawk 연결은 유지한 채 카메라 Preview로 돌아갑니다.",
             self.record_button: (
@@ -4873,11 +4902,134 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _make_button_expand(self, button: QtWidgets.QPushButton) -> None:
         button.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
+    def _build_alignment_workflow_header(self, layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("정렬 작업 순서")
+        grid = QtWidgets.QGridLayout(group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        self.alignment_step_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self.alignment_step_status_labels: dict[str, QtWidgets.QLabel] = {}
+        steps = (
+            ("gps", "1 GPS", "신호 안정 확인"),
+            ("baseline", "2 Baseline", "카메라 간격 조정"),
+            ("mag", "3 MAG", "CAN1/CAN2 비교"),
+            ("yaw", "4 Yaw", "기준 MAG 선택"),
+            ("attitude", "5 자세", "R/P/Y 맞춤"),
+        )
+        for column, (key, title, initial_status) in enumerate(steps):
+            button = QtWidgets.QPushButton(title)
+            button.setCheckable(True)
+            button.setProperty("role", "toggle")
+            button.clicked.connect(lambda _checked=False, step=key: self._set_alignment_step(step))
+            status_label = QtWidgets.QLabel(initial_status)
+            status_label.setObjectName("statChip")
+            status_label.setWordWrap(True)
+            grid.addWidget(button, 0, column)
+            grid.addWidget(status_label, 1, column)
+            grid.setColumnStretch(column, 1)
+            self.alignment_step_buttons[key] = button
+            self.alignment_step_status_labels[key] = status_label
+        layout.addWidget(group)
+        self._refresh_alignment_workflow_status()
+
+    def _alignment_step_index(self, step: str) -> int | None:
+        attr_by_step = {
+            "gps": "signal_alignment_tab_index",
+            "baseline": "baseline_alignment_tab_index",
+            "mag": "rm3100_alignment_tab_index",
+            "yaw": "yaw_alignment_tab_index",
+            "attitude": "attitude_alignment_tab_index",
+        }
+        attr = attr_by_step.get(step)
+        if attr is None or not hasattr(self, attr):
+            return None
+        return int(getattr(self, attr))
+
+    def _set_alignment_step(self, step: str) -> None:
+        index = self._alignment_step_index(step)
+        if index is not None and hasattr(self, "alignment_tabs"):
+            self.alignment_tabs.setCurrentIndex(index)
+
+    def _handle_alignment_step_changed(self, index: int) -> None:
+        for step, button in getattr(self, "alignment_step_buttons", {}).items():
+            step_index = self._alignment_step_index(step)
+            button.setChecked(step_index == index)
+        self._refresh_alignment_workflow_status()
+
+    def _set_alignment_step_status(self, step: str, text: str, level: str) -> None:
+        label = getattr(self, "alignment_step_status_labels", {}).get(step)
+        if label is not None:
+            self._set_health_label(label, text, level)
+
+    def _refresh_alignment_workflow_status(self) -> None:
+        if not hasattr(self, "alignment_step_status_labels"):
+            return
+
+        gps_ready = [
+            self._gps_fix_ready_for_baseline(self.latest_gps.get("left")),
+            self._gps_fix_ready_for_baseline(self.latest_gps.get("right")),
+        ]
+        gps_count = sum(1 for ready in gps_ready if ready)
+        if gps_count == 2:
+            self._set_alignment_step_status("gps", "P1/P2 GPS OK", "good")
+        elif gps_count:
+            self._set_alignment_step_status("gps", f"GPS {gps_count}/2", "warn")
+        else:
+            self._set_alignment_step_status("gps", "GPS 대기", "idle")
+
+        baseline = self.latest_rtk_baseline
+        if baseline is None:
+            self._set_alignment_step_status("baseline", "baseline 대기", "idle")
+        else:
+            usable, reason = self._gps_baseline_usable_for_translation(baseline)
+            self._set_alignment_step_status(
+                "baseline",
+                f"{baseline.baseline_m:.3f} m" if usable else reason,
+                "good" if usable else "bad",
+            )
+
+        mag_count = sum(1 for side in ("left", "right") for slot in ("CAN1", "CAN2") if slot in self.latest_mag_sensors.get(side, {}))
+        if mag_count >= 4:
+            self._set_alignment_step_status("mag", "CAN1/CAN2 OK", "good")
+        elif mag_count:
+            self._set_alignment_step_status("mag", f"MAG {mag_count}/4", "warn")
+        else:
+            self._set_alignment_step_status("mag", "MAG 대기", "idle")
+
+        selected_mag_count = sum(1 for value in self.latest_vehicle_mag_device_ids.values() if value is not None)
+        if selected_mag_count >= 2:
+            self._set_alignment_step_status("yaw", "Yaw 기준 확인", "good")
+        elif mag_count:
+            self._set_alignment_step_status("yaw", "Yaw 선택 필요", "warn")
+        else:
+            self._set_alignment_step_status("yaw", "Yaw 대기", "idle")
+
+        left = self.latest_extrinsics.get("left")
+        right = self.latest_extrinsics.get("right")
+        if left is not None and right is not None:
+            deltas = {
+                "roll": right.roll_deg - left.roll_deg,
+                "pitch": right.pitch_deg - left.pitch_deg,
+                "yaw": right.yaw_deg - left.yaw_deg,
+            }
+            levels = [self._attitude_delta_level(axis, delta) for axis, delta in deltas.items()]
+            level = "bad" if "bad" in levels else "warn" if "warn" in levels else "good"
+            self._set_alignment_step_status(
+                "attitude",
+                f"ΔR/P/Y {deltas['roll']:+.1f}/{deltas['pitch']:+.1f}/{deltas['yaw']:+.1f}°",
+                level,
+            )
+        elif left is not None or right is not None:
+            self._set_alignment_step_status("attitude", "자세 1/2", "warn")
+        else:
+            self._set_alignment_step_status("attitude", "자세 대기", "idle")
+
     def _build_pixhawk_sensor_health_tabs(
         self,
         summary_layout: QtWidgets.QVBoxLayout,
         pixhawk_1_layout: QtWidgets.QVBoxLayout,
         pixhawk_2_layout: QtWidgets.QVBoxLayout,
+        yaw_layout: QtWidgets.QVBoxLayout,
     ) -> None:
         summary_group = QtWidgets.QGroupBox("픽스호크 센서 상태")
         summary_form = QtWidgets.QGridLayout(summary_group)
@@ -4894,7 +5046,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 summary_form.addWidget(label, row, column)
                 self.pixhawk_sensor_summary_labels[camera][key] = label
         summary_layout.addWidget(summary_group)
-        self._build_px4_mag_manager_panel(summary_layout)
         summary_layout.addStretch(1)
 
         self.rm3100_slot_labels: dict[str, dict[str, QtWidgets.QLabel]] = {"left": {}, "right": {}}
@@ -4911,6 +5062,1133 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         self._build_single_pixhawk_sensor_tab(pixhawk_1_layout, "left", "Pixhawk 1")
         self._build_single_pixhawk_sensor_tab(pixhawk_2_layout, "right", "Pixhawk 2")
+        self._build_px4_mag_manager_panel(yaw_layout)
+        yaw_layout.addStretch(1)
+
+    def _build_alignment_signal_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        layout.setSpacing(8)
+        status_group = QtWidgets.QGroupBox("GPS / Baseline 입력 신호")
+        status_form = QtWidgets.QGridLayout(status_group)
+        status_form.setHorizontalSpacing(8)
+        status_form.setVerticalSpacing(6)
+        status_form.setColumnStretch(1, 1)
+        self.signal_attitude_labels: dict[str, QtWidgets.QLabel] = {}
+        self.signal_gps_position_labels: dict[str, QtWidgets.QLabel] = {}
+        self.signal_gps_sensor_labels: dict[str, QtWidgets.QLabel] = {}
+        for row, (camera, title) in enumerate((("left", "P1"), ("right", "P2"))):
+            status_form.addWidget(QtWidgets.QLabel(title), row, 0)
+            attitude_label = QtWidgets.QLabel("Attitude: 대기 중")
+            position_label = QtWidgets.QLabel("GPS position: 대기 중")
+            sensor_label = QtWidgets.QLabel("GPS sensor: 대기 중")
+            for label in (attitude_label, position_label, sensor_label):
+                label.setObjectName("statusStrip")
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            status_form.addWidget(attitude_label, row, 1)
+            status_form.addWidget(position_label, row, 2)
+            status_form.addWidget(sensor_label, row, 3)
+            self.signal_attitude_labels[camera] = attitude_label
+            self.signal_gps_position_labels[camera] = position_label
+            self.signal_gps_sensor_labels[camera] = sensor_label
+        layout.addWidget(status_group)
+
+        self.signal_gps_sats_plot = TelemetryHistoryPlot("GPS 위성 수 수신 확인 (ROS2/MAVLink)", "sats")
+        self.signal_gps_sats_plot.set_series_labels(
+            {
+                "left_GPS1": "P1 GPS1",
+                "left_GPS2": "P1 GPS2",
+                "right_GPS1": "P2 GPS1",
+                "right_GPS2": "P2 GPS2",
+            }
+        )
+        self.signal_gps_eph_plot = TelemetryHistoryPlot("GPS eph 수신 확인 (ROS2/MAVLink)", "m")
+        self.signal_gps_eph_plot.set_series_labels(
+            {
+                "left_GPS1": "P1 GPS1",
+                "left_GPS2": "P1 GPS2",
+                "right_GPS1": "P2 GPS1",
+                "right_GPS2": "P2 GPS2",
+            }
+        )
+        self.signal_attitude_age_plot = TelemetryHistoryPlot("Pixhawk 자세 age", "ms")
+        self.signal_attitude_age_plot.set_series_labels({"left": "P1 attitude", "right": "P2 attitude"})
+        graph_tabs = QtWidgets.QTabWidget()
+        graph_tabs.setDocumentMode(True)
+        gps_tab = QtWidgets.QWidget()
+        gps_layout = QtWidgets.QHBoxLayout(gps_tab)
+        gps_layout.setContentsMargins(0, 0, 0, 0)
+        gps_layout.setSpacing(8)
+        gps_layout.addWidget(self.signal_gps_sats_plot, 1)
+        gps_layout.addWidget(self.signal_gps_eph_plot, 1)
+        attitude_tab = QtWidgets.QWidget()
+        attitude_layout = QtWidgets.QVBoxLayout(attitude_tab)
+        attitude_layout.setContentsMargins(0, 0, 0, 0)
+        attitude_layout.addWidget(self.signal_attitude_age_plot, 1)
+        graph_tabs.addTab(gps_tab, "GPS 그래프")
+        graph_tabs.addTab(attitude_tab, "자세 그래프")
+        layout.addWidget(graph_tabs, 1)
+
+    def _build_baseline_alignment_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        layout.setSpacing(8)
+        self.baseline_sampling_active = False
+        self.baseline_sampling_started_s: float | None = None
+        self.baseline_samples: list[tuple[BaselineVector, GpsPositionState, GpsPositionState]] = []
+        self.latest_baseline_quality: BaselineQuality | None = None
+        self.latest_baseline_vector: BaselineVector | None = None
+        self.loaded_baseline_profile_vector: tuple[float, float, float] | None = None
+        self.baseline_gps_rate_history: dict[str, deque[float]] = {"left": deque(maxlen=120), "right": deque(maxlen=120)}
+
+        self.baseline_tabs = QtWidgets.QTabWidget()
+        self.baseline_tabs.setDocumentMode(True)
+        gps_tab = QtWidgets.QWidget()
+        fields_tab = QtWidgets.QWidget()
+        calc_tab = QtWidgets.QWidget()
+        quality_tab = QtWidgets.QWidget()
+        profile_tab = QtWidgets.QWidget()
+        gps_layout = QtWidgets.QVBoxLayout(gps_tab)
+        fields_layout = QtWidgets.QVBoxLayout(fields_tab)
+        calc_layout = QtWidgets.QVBoxLayout(calc_tab)
+        quality_layout = QtWidgets.QVBoxLayout(quality_tab)
+        profile_layout = QtWidgets.QVBoxLayout(profile_tab)
+        for child_layout in (gps_layout, fields_layout, calc_layout, quality_layout, profile_layout):
+            child_layout.setContentsMargins(6, 6, 6, 6)
+            child_layout.setSpacing(8)
+        self._build_baseline_gps_recognition_view(gps_layout)
+        self._build_baseline_field_browser_view(fields_layout)
+        self._build_baseline_calculation_view(calc_layout)
+        self._build_baseline_quality_view(quality_layout)
+        self._build_baseline_profile_view(profile_layout)
+        self.baseline_tabs.addTab(gps_tab, "GPS 인식")
+        self.baseline_tabs.addTab(fields_tab, "ROS2 Topic / MAVLink Field")
+        self.baseline_tabs.addTab(calc_tab, "Baseline 계산")
+        self.baseline_tabs.addTab(quality_tab, "신뢰성 평가")
+        self.baseline_tabs.addTab(profile_tab, "Baseline Profile")
+        layout.addWidget(self.baseline_tabs, 1)
+        self.refresh_baseline_field_browser()
+        self._refresh_baseline_alignment_ui()
+
+    def _build_alignment_overview_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("정렬 상태 개요")
+        grid = QtWidgets.QGridLayout(group)
+        self.alignment_overview_labels: dict[str, QtWidgets.QLabel] = {}
+        items = (
+            ("left_pixhawk", "Left Pixhawk 상태"),
+            ("right_pixhawk", "Right Pixhawk 상태"),
+            ("left_gps1", "Left GPS1 상태"),
+            ("left_gps2", "Left GPS2 상태"),
+            ("right_gps1", "Right GPS1 상태"),
+            ("right_gps2", "Right GPS2 상태"),
+            ("left_can1", "Left CAN1 Magnetometer 상태"),
+            ("left_can2", "Left CAN2 Magnetometer 상태"),
+            ("right_can1", "Right CAN1 Magnetometer 상태"),
+            ("right_can2", "Right CAN2 Magnetometer 상태"),
+            ("baseline_length", "Baseline Length"),
+            ("baseline_std", "Baseline Std"),
+            ("baseline_quality", "Baseline Quality"),
+            ("left_rpy", "Left Roll/Pitch/Yaw"),
+            ("right_rpy", "Right Roll/Pitch/Yaw"),
+            ("yaw_diff", "Left-Right Yaw Difference"),
+            ("pitch_diff", "Left-Right Pitch Difference"),
+            ("roll_diff", "Left-Right Roll Difference"),
+            ("alignment_quality", "Alignment Quality Badge"),
+        )
+        for index, (key, title) in enumerate(items):
+            row = index // 2
+            column = (index % 2) * 2
+            label = QtWidgets.QLabel("대기 중")
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            grid.addWidget(QtWidgets.QLabel(title), row, column)
+            grid.addWidget(label, row, column + 1)
+            self.alignment_overview_labels[key] = label
+        layout.addWidget(group, 1)
+
+    def _build_alignment_magnetometer_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(8)
+        scroll_area.setWidget(content)
+        layout.addWidget(scroll_area, 1)
+        layout = content_layout
+
+        status_group = QtWidgets.QGroupBox("CAN1/CAN2 Magnetometer 상태")
+        grid = QtWidgets.QGridLayout(status_group)
+        headers = ("Side", "Sensor", "Device ID", "Priority", "Selected", "Health", "Calibration", "Field Strength", "Rate", "Timestamp")
+        for column, header in enumerate(headers):
+            grid.addWidget(QtWidgets.QLabel(header), 0, column)
+        self.alignment_mag_labels: dict[str, dict[str, QtWidgets.QLabel]] = {}
+        row = 1
+        for side, side_label in (("left", "Left"), ("right", "Right")):
+            for slot in ("CAN1", "CAN2"):
+                key = f"{side}_{slot}"
+                self.alignment_mag_labels[key] = {}
+                grid.addWidget(QtWidgets.QLabel(side_label), row, 0)
+                grid.addWidget(QtWidgets.QLabel(slot), row, 1)
+                for column, field in enumerate(("device", "priority", "selected", "health", "calibration", "field", "rate", "timestamp"), start=2):
+                    label = QtWidgets.QLabel("대기 중")
+                    label.setObjectName("statusStrip")
+                    label.setWordWrap(True)
+                    grid.addWidget(label, row, column)
+                    self.alignment_mag_labels[key][field] = label
+                row += 1
+        layout.addWidget(status_group)
+        compare_group = QtWidgets.QGroupBox("Heading / Yaw 비교")
+        compare_form = QtWidgets.QGridLayout(compare_group)
+        self.alignment_mag_compare_labels: dict[str, QtWidgets.QLabel] = {}
+        for row, (key, title) in enumerate(
+            (
+                ("left_can_diff", "Left CAN1 vs CAN2 Difference"),
+                ("right_can_diff", "Right CAN1 vs CAN2 Difference"),
+                ("left_right_diff", "Left vs Right Difference"),
+            )
+        ):
+            label = QtWidgets.QLabel("대기 중")
+            label.setObjectName("statusStrip")
+            compare_form.addWidget(QtWidgets.QLabel(title), row, 0)
+            compare_form.addWidget(label, row, 1)
+            self.alignment_mag_compare_labels[key] = label
+        layout.addWidget(compare_group)
+
+        yaw_group = QtWidgets.QGroupBox("Yaw 기준 Magnetometer 선택")
+        yaw_form = QtWidgets.QGridLayout(yaw_group)
+        for row, (side, title) in enumerate((("left", "Left Pixhawk"), ("right", "Right Pixhawk"))):
+            combo = QtWidgets.QComboBox()
+            combo.addItem("PX4 현재 설정", "current")
+            combo.addItem("CAN1", "CAN1")
+            combo.addItem("CAN2", "CAN2")
+            button = QtWidgets.QPushButton("선택 적용")
+            status = QtWidgets.QLabel("Yaw 기준: PX4 현재 설정")
+            status.setObjectName("statusStrip")
+            status.setWordWrap(True)
+            button.clicked.connect(lambda _checked=False, camera=side: self.apply_rm3100_yaw_source(camera))
+            yaw_form.addWidget(QtWidgets.QLabel(title), row, 0)
+            yaw_form.addWidget(combo, row, 1)
+            yaw_form.addWidget(button, row, 2)
+            yaw_form.addWidget(status, row, 3)
+            self.rm3100_yaw_source_combos[side] = combo
+            self.rm3100_yaw_source_status_labels[side] = status
+        layout.addWidget(yaw_group)
+
+        self.alignment_mag_heading_plot = RtkAlignmentPlot()
+        layout.addWidget(self.alignment_mag_heading_plot, 1)
+        self._build_px4_mag_manager_panel(layout)
+        layout.addStretch(1)
+
+    def _build_alignment_attitude_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
+        content = QtWidgets.QWidget()
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(8)
+        scroll_area.setWidget(content)
+        layout.addWidget(scroll_area, 1)
+        layout = content_layout
+
+        group = QtWidgets.QGroupBox("Pixhawk EKF Attitude")
+        grid = QtWidgets.QGridLayout(group)
+        grid.setVerticalSpacing(6)
+        self.alignment_attitude_labels: dict[str, QtWidgets.QLabel] = {}
+        for row, (key, title) in enumerate(
+            (
+                ("left_rpy", "Left Roll/Pitch/Yaw"),
+                ("left_q", "Left Quaternion"),
+                ("right_rpy", "Right Roll/Pitch/Yaw"),
+                ("right_q", "Right Quaternion"),
+                ("yaw_diff", "Yaw Difference"),
+                ("pitch_diff", "Pitch Difference"),
+                ("roll_diff", "Roll Difference"),
+            )
+        ):
+            label = QtWidgets.QLabel("대기 중")
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            grid.addWidget(label, row, 1)
+            self.alignment_attitude_labels[key] = label
+        group.setSizePolicy(QtWidgets.QSizePolicy.Preferred, QtWidgets.QSizePolicy.Minimum)
+        layout.addWidget(group)
+
+        compare_group = QtWidgets.QGroupBox("자세 축 비교")
+        compare_form = QtWidgets.QGridLayout(compare_group)
+        compare_form.addWidget(QtWidgets.QLabel("축"), 0, 0)
+        compare_form.addWidget(QtWidgets.QLabel("Left"), 0, 1)
+        compare_form.addWidget(QtWidgets.QLabel("Right"), 0, 2)
+        compare_form.addWidget(QtWidgets.QLabel("Difference"), 0, 3)
+        self.attitude_compare_labels = {}
+        for row, axis in enumerate(("Roll", "Pitch", "Yaw"), start=1):
+            left_label = QtWidgets.QLabel("대기 중")
+            right_label = QtWidgets.QLabel("대기 중")
+            delta_label = QtWidgets.QLabel("대기 중")
+            for label in (left_label, right_label, delta_label):
+                label.setObjectName("statusStrip")
+            compare_form.addWidget(QtWidgets.QLabel(axis), row, 0)
+            compare_form.addWidget(left_label, row, 1)
+            compare_form.addWidget(right_label, row, 2)
+            compare_form.addWidget(delta_label, row, 3)
+            self.attitude_compare_labels[axis.lower()] = (left_label, right_label, delta_label)
+        layout.addWidget(compare_group)
+
+        self.alignment_optical_axis_plot = RtkAlignmentPlot()
+        layout.addWidget(self.alignment_optical_axis_plot, 1)
+        self.attitude_plots = {
+            "roll": AttitudeHistoryPlot("Roll"),
+            "pitch": AttitudeHistoryPlot("Pitch"),
+            "yaw": AttitudeHistoryPlot("Yaw"),
+        }
+        for plot in self.attitude_plots.values():
+            layout.addWidget(plot, 1)
+
+    def _build_alignment_coordinate_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        group = QtWidgets.QGroupBox("좌표계 계약")
+        form = QtWidgets.QGridLayout(group)
+        self.alignment_global_frame_combo = QtWidgets.QComboBox()
+        self.alignment_global_frame_combo.addItems(["ENU", "NED"])
+        self.alignment_camera_frame_combo = QtWidgets.QComboBox()
+        self.alignment_camera_frame_combo.addItems(["RDF", "ROS Optical Frame"])
+        self.alignment_origin_combo = QtWidgets.QComboBox()
+        self.alignment_origin_combo.addItems(["Left Camera", "Midpoint"])
+        self.alignment_transform_text = QtWidgets.QPlainTextEdit("0 1 0\n0 0 1\n1 0 0")
+        self.alignment_transform_text.setMaximumHeight(90)
+        for widget in (self.alignment_global_frame_combo, self.alignment_camera_frame_combo, self.alignment_origin_combo):
+            widget.currentIndexChanged.connect(self._refresh_coordinate_system_settings)
+        self.alignment_transform_text.textChanged.connect(self._refresh_coordinate_system_settings)
+        form.addWidget(QtWidgets.QLabel("Global Frame"), 0, 0)
+        form.addWidget(self.alignment_global_frame_combo, 0, 1)
+        form.addWidget(QtWidgets.QLabel("Camera Frame"), 1, 0)
+        form.addWidget(self.alignment_camera_frame_combo, 1, 1)
+        form.addWidget(QtWidgets.QLabel("Origin"), 2, 0)
+        form.addWidget(self.alignment_origin_combo, 2, 1)
+        form.addWidget(QtWidgets.QLabel("Pixhawk FRD -> Camera RDF"), 3, 0)
+        form.addWidget(self.alignment_transform_text, 3, 1)
+        layout.addWidget(group)
+        self.alignment_tf_tree_label = QtWidgets.QLabel("TF Tree: 대기 중")
+        self.alignment_tf_tree_label.setObjectName("statusStrip")
+        self.alignment_tf_tree_label.setWordWrap(True)
+        layout.addWidget(self.alignment_tf_tree_label)
+        layout.addStretch(1)
+        self._refresh_coordinate_system_settings()
+
+    def _build_alignment_validation_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        control = QtWidgets.QHBoxLayout()
+        self.alignment_validation_distance_spin = QtWidgets.QDoubleSpinBox()
+        self.alignment_validation_distance_spin.setRange(1.0, 10000.0)
+        self.alignment_validation_distance_spin.setValue(1852.0)
+        self.alignment_validation_distance_spin.setSuffix(" m")
+        self.alignment_validation_distance_spin.valueChanged.connect(lambda _value: self._refresh_alignment_validation())
+        control.addWidget(QtWidgets.QLabel("Distance"))
+        control.addWidget(self.alignment_validation_distance_spin)
+        control.addStretch(1)
+        layout.addLayout(control)
+        group = QtWidgets.QGroupBox("정렬 품질 검증")
+        grid = QtWidgets.QGridLayout(group)
+        self.alignment_validation_labels: dict[str, QtWidgets.QLabel] = {}
+        for row, (key, title) in enumerate(
+            (
+                ("baseline_length", "Stored vs Current Length Difference"),
+                ("baseline_vector", "Stored vs Current Vector Difference"),
+                ("yaw", "Stored vs Current Yaw Difference"),
+                ("pitch", "Stored vs Current Pitch Difference"),
+                ("roll", "Stored vs Current Roll Difference"),
+                ("baseline_error", "Baseline Error Contribution"),
+                ("yaw_error", "Yaw Error Contribution"),
+                ("pitch_error", "Pitch Error Contribution"),
+                ("status", "Alignment Status"),
+            )
+        ):
+            label = QtWidgets.QLabel("대기 중")
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            grid.addWidget(label, row, 1)
+            self.alignment_validation_labels[key] = label
+        layout.addWidget(group)
+        layout.addStretch(1)
+
+    def _build_alignment_profile_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        actions = QtWidgets.QHBoxLayout()
+        self.alignment_profile_save_button = QtWidgets.QPushButton("Save")
+        self.alignment_profile_load_button = QtWidgets.QPushButton("Load")
+        self.alignment_profile_compare_button = QtWidgets.QPushButton("Compare")
+        self.alignment_profile_export_button = QtWidgets.QPushButton("Export")
+        self.alignment_profile_save_button.clicked.connect(self.save_alignment_profile)
+        self.alignment_profile_load_button.clicked.connect(self.load_alignment_profile)
+        self.alignment_profile_compare_button.clicked.connect(self._refresh_alignment_validation)
+        self.alignment_profile_export_button.clicked.connect(self.save_alignment_profile)
+        for button in (
+            self.alignment_profile_save_button,
+            self.alignment_profile_load_button,
+            self.alignment_profile_compare_button,
+            self.alignment_profile_export_button,
+        ):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.alignment_profile_status_label = QtWidgets.QLabel("Alignment Profile: 대기 중")
+        self.alignment_profile_status_label.setObjectName("statusStrip")
+        self.alignment_profile_status_label.setWordWrap(True)
+        layout.addWidget(self.alignment_profile_status_label)
+        self.alignment_profile_preview = QtWidgets.QPlainTextEdit()
+        self.alignment_profile_preview.setReadOnly(True)
+        layout.addWidget(self.alignment_profile_preview, 1)
+
+    def _build_baseline_gps_recognition_view(self, layout: QtWidgets.QVBoxLayout) -> None:
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        self.baseline_gps_card_labels: dict[str, dict[str, QtWidgets.QLabel]] = {"left": {}, "right": {}}
+        fields = (
+            ("connection", "연결 상태"),
+            ("gps1", "GPS1 인식"),
+            ("gps2", "GPS2 인식"),
+            ("fix", "fix_type"),
+            ("rtk", "RTK 상태"),
+            ("sats", "satellites_visible"),
+            ("eph", "eph"),
+            ("epv", "epv"),
+            ("h_acc", "h_acc"),
+            ("v_acc", "v_acc"),
+            ("lla", "lat / lon / alt"),
+            ("rate", "message rate"),
+            ("age", "last update age"),
+            ("timestamp", "time_usec / timestamp"),
+        )
+        for side, title in (("left", "좌측 Pixhawk"), ("right", "우측 Pixhawk")):
+            group = QtWidgets.QGroupBox(title)
+            form = QtWidgets.QGridLayout(group)
+            form.setColumnStretch(1, 1)
+            for row_index, (key, label_text) in enumerate(fields):
+                label = QtWidgets.QLabel("대기 중")
+                label.setObjectName("statusStrip")
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                form.addWidget(QtWidgets.QLabel(label_text), row_index, 0)
+                form.addWidget(label, row_index, 1)
+                self.baseline_gps_card_labels[side][key] = label
+            row.addWidget(group, 1)
+        layout.addLayout(row, 2)
+        hint = QtWidgets.QLabel("GPS1/GPS2가 모두 있으면 Baseline 계산 화면에서 사용할 수신기를 선택합니다. 위치 계산은 raw GNSS/RTK 필드를 우선 사용합니다.")
+        hint.setObjectName("statusStrip")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        detail_group = QtWidgets.QGroupBox("GPS1/GPS2 ROS2 Topic / MAVLink Field 상태")
+        detail_form = QtWidgets.QGridLayout(detail_group)
+        detail_form.setColumnStretch(1, 1)
+        detail_form.setColumnStretch(3, 1)
+        for column, title in ((0, "좌측 Pixhawk"), (2, "우측 Pixhawk")):
+            detail_form.addWidget(QtWidgets.QLabel(title), 0, column, 1, 2)
+        for column, side in ((0, "left"), (2, "right")):
+            for row_index, slot in enumerate(("GPS1", "GPS2"), start=1):
+                label = QtWidgets.QLabel("대기 중")
+                label.setObjectName("statusStrip")
+                label.setWordWrap(True)
+                label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+                detail_form.addWidget(QtWidgets.QLabel(slot), row_index, column)
+                detail_form.addWidget(label, row_index, column + 1)
+                self.f9p_slot_labels[side][slot] = label
+                self.gps_sensor_labels[side][slot] = label
+            compare_label = QtWidgets.QLabel("GPS1/GPS2 품질 비교: 대기 중")
+            compare_label.setObjectName("statusStrip")
+            compare_label.setWordWrap(True)
+            compare_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+            detail_form.addWidget(QtWidgets.QLabel("비교"), 3, column)
+            detail_form.addWidget(compare_label, 3, column + 1)
+            self.f9p_compare_labels[side] = compare_label
+        layout.addWidget(detail_group)
+
+    def _build_baseline_field_browser_view(self, layout: QtWidgets.QVBoxLayout) -> None:
+        actions = QtWidgets.QHBoxLayout()
+        self.baseline_scan_topics_button = QtWidgets.QPushButton("ROS2 Topic 스캔")
+        self.baseline_scan_topics_button.clicked.connect(self.refresh_baseline_field_browser)
+        actions.addWidget(self.baseline_scan_topics_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        split = QtWidgets.QHBoxLayout()
+        self.baseline_ros2_topic_table = QtWidgets.QTableWidget(0, 3)
+        self.baseline_ros2_topic_table.setHorizontalHeaderLabels(["우선", "Topic", "Type"])
+        self.baseline_ros2_topic_table.verticalHeader().setVisible(False)
+        self.baseline_ros2_topic_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.baseline_ros2_topic_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.baseline_ros2_topic_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        self.baseline_ros2_topic_table.itemSelectionChanged.connect(self._show_selected_baseline_ros2_fields)
+        self.baseline_ros2_field_list = QtWidgets.QListWidget()
+        ros2_group = QtWidgets.QGroupBox("ROS2 Topic")
+        ros2_layout = QtWidgets.QHBoxLayout(ros2_group)
+        ros2_layout.addWidget(self.baseline_ros2_topic_table, 2)
+        ros2_layout.addWidget(self.baseline_ros2_field_list, 1)
+        split.addWidget(ros2_group, 2)
+
+        self.baseline_mavlink_message_table = QtWidgets.QTableWidget(0, 2)
+        self.baseline_mavlink_message_table.setHorizontalHeaderLabels(["Message", "Fields"])
+        self.baseline_mavlink_message_table.verticalHeader().setVisible(False)
+        self.baseline_mavlink_message_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.baseline_mavlink_message_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+        mav_group = QtWidgets.QGroupBox("MAVLink Raw")
+        mav_layout = QtWidgets.QVBoxLayout(mav_group)
+        mav_layout.addWidget(self.baseline_mavlink_message_table)
+        split.addWidget(mav_group, 1)
+        layout.addLayout(split, 1)
+
+    def _build_baseline_calculation_view(self, layout: QtWidgets.QVBoxLayout) -> None:
+        control_group = QtWidgets.QGroupBox("Baseline 입력 선택")
+        form = QtWidgets.QGridLayout(control_group)
+        self.baseline_left_gps_combo = QtWidgets.QComboBox()
+        self.baseline_right_gps_combo = QtWidgets.QComboBox()
+        for combo in (self.baseline_left_gps_combo, self.baseline_right_gps_combo):
+            combo.addItem("GPS1", "GPS1")
+            combo.addItem("GPS2", "GPS2")
+            combo.currentIndexChanged.connect(lambda _index: self._handle_baseline_source_changed())
+        form.addWidget(QtWidgets.QLabel("좌측 카메라 기준 GPS"), 0, 0)
+        form.addWidget(self.baseline_left_gps_combo, 0, 1)
+        form.addWidget(QtWidgets.QLabel("우측 카메라 기준 GPS"), 0, 2)
+        form.addWidget(self.baseline_right_gps_combo, 0, 3)
+        form.addWidget(self.use_rtk_baseline_checkbox, 1, 0, 1, 2)
+        form.addWidget(self.require_rtk_fixed_checkbox, 1, 2, 1, 2)
+        layout.addWidget(control_group)
+
+        summary_group = QtWidgets.QGroupBox("Baseline 계산 결과")
+        summary_form = QtWidgets.QGridLayout(summary_group)
+        self.baseline_calc_labels: dict[str, QtWidgets.QLabel] = {}
+        for row, (key, label_text) in enumerate(
+            (
+                ("enu", "baseline vector ENU [E,N,U]"),
+                ("ned", "baseline vector NED [N,E,D]"),
+                ("length", "baseline length"),
+                ("azimuth", "azimuth"),
+                ("elevation", "elevation"),
+                ("altitude_delta", "left-right altitude difference"),
+                ("timestamp_delta", "left-right timestamp delta"),
+                ("profile_delta", "profile delta"),
+            )
+        ):
+            label = QtWidgets.QLabel("대기 중")
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            summary_form.addWidget(QtWidgets.QLabel(label_text), row, 0)
+            summary_form.addWidget(label, row, 1)
+            self.baseline_calc_labels[key] = label
+        layout.addWidget(summary_group)
+
+        self.rtk_alignment_plot = RtkAlignmentPlot()
+        self.rtk_alignment_detail_label = QtWidgets.QLabel("정렬 성분: GPS baseline 대기 중")
+        self.rtk_alignment_detail_label.setObjectName("statusStrip")
+        self.rtk_alignment_detail_label.setWordWrap(True)
+        layout.addWidget(self.rtk_alignment_detail_label)
+        layout.addWidget(self.rtk_alignment_plot, 1)
+
+    def _build_baseline_quality_view(self, layout: QtWidgets.QVBoxLayout) -> None:
+        actions = QtWidgets.QHBoxLayout()
+        self.baseline_sample_duration_spin = QtWidgets.QDoubleSpinBox()
+        self.baseline_sample_duration_spin.setRange(10.0, 30.0)
+        self.baseline_sample_duration_spin.setValue(10.0)
+        self.baseline_sample_duration_spin.setSuffix(" s")
+        self.baseline_start_sampling_button = QtWidgets.QPushButton("Start Sampling")
+        self.baseline_stop_sampling_button = QtWidgets.QPushButton("Stop Sampling")
+        self.baseline_start_sampling_button.clicked.connect(self.start_baseline_sampling)
+        self.baseline_stop_sampling_button.clicked.connect(self.stop_baseline_sampling)
+        actions.addWidget(QtWidgets.QLabel("수집 시간"))
+        actions.addWidget(self.baseline_sample_duration_spin)
+        actions.addWidget(self.baseline_start_sampling_button)
+        actions.addWidget(self.baseline_stop_sampling_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+
+        self.baseline_quality_badge = QtWidgets.QLabel("Quality: 대기 중")
+        self.baseline_quality_badge.setObjectName("distanceStatus")
+        layout.addWidget(self.baseline_quality_badge)
+        stats_group = QtWidgets.QGroupBox("신뢰성 평가")
+        stats_form = QtWidgets.QGridLayout(stats_group)
+        self.baseline_quality_labels: dict[str, QtWidgets.QLabel] = {}
+        for row, (key, label_text) in enumerate(
+            (
+                ("length_mean", "baseline length mean"),
+                ("length_std", "baseline length std"),
+                ("enu_mean", "ENU vector mean"),
+                ("enu_std", "ENU vector std"),
+                ("rtk_ratio", "RTK Fixed ratio"),
+                ("message_rate", "GPS message rate"),
+                ("timestamp_delta", "left-right timestamp delta"),
+                ("outliers", "outlier count"),
+                ("jumps", "baseline jump count"),
+                ("acc", "mean h_acc / v_acc"),
+            )
+        ):
+            label = QtWidgets.QLabel("대기 중")
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            stats_form.addWidget(QtWidgets.QLabel(label_text), row, 0)
+            stats_form.addWidget(label, row, 1)
+            self.baseline_quality_labels[key] = label
+        layout.addWidget(stats_group)
+        self.baseline_length_plot = TelemetryHistoryPlot("Baseline length time-series", "m")
+        layout.addWidget(self.baseline_length_plot, 1)
+
+    def _handle_baseline_source_changed(self) -> None:
+        if hasattr(self, "baseline_left_gps_combo"):
+            self.gnss_monitor.left_source = str(self.baseline_left_gps_combo.currentData() or "GPS1")
+            self.gnss_monitor.right_source = str(self.baseline_right_gps_combo.currentData() or "GPS1")
+        self._refresh_baseline_alignment_ui()
+
+    def _build_baseline_profile_view(self, layout: QtWidgets.QVBoxLayout) -> None:
+        actions = QtWidgets.QHBoxLayout()
+        self.baseline_save_profile_button = QtWidgets.QPushButton("Save Baseline Profile")
+        self.baseline_load_profile_button = QtWidgets.QPushButton("Load Profile")
+        self.baseline_save_profile_button.clicked.connect(self.save_baseline_profile)
+        self.baseline_load_profile_button.clicked.connect(self.load_baseline_profile)
+        actions.addWidget(self.baseline_save_profile_button)
+        actions.addWidget(self.baseline_load_profile_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.baseline_profile_status_label = QtWidgets.QLabel("Baseline profile: 대기 중")
+        self.baseline_profile_status_label.setObjectName("statusStrip")
+        self.baseline_profile_status_label.setWordWrap(True)
+        layout.addWidget(self.baseline_profile_status_label)
+        self.baseline_profile_preview = QtWidgets.QPlainTextEdit()
+        self.baseline_profile_preview.setReadOnly(True)
+        layout.addWidget(self.baseline_profile_preview, 1)
+
+    def refresh_baseline_field_browser(self) -> None:
+        if not hasattr(self, "baseline_ros2_topic_table"):
+            return
+        priority_topics = (
+            "/mavros/global_position/global",
+            "/mavros/gpsstatus/gps1/raw",
+            "/mavros/gpsstatus/gps2/raw",
+            "/mavros/local_position/pose",
+            "/mavros/imu/data",
+            "/fmu/out/vehicle_gps_position",
+            "/fmu/out/sensor_gps",
+            "/fmu/out/vehicle_global_position",
+            "/fmu/out/vehicle_local_position",
+        )
+        discovered = discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.0)
+        by_name = {item.get("name", ""): item.get("type", "") for item in discovered}
+        rows: list[tuple[str, str, str]] = []
+        for topic in priority_topics:
+            rows.append(("yes", topic, by_name.pop(topic, "")))
+        for topic, topic_type in sorted(by_name.items()):
+            if any(pattern in topic for pattern in ("/fmu/out/", "/mavros/")):
+                rows.append(("", topic, topic_type))
+        self.baseline_ros2_topic_table.setRowCount(len(rows))
+        for row, (priority, topic, topic_type) in enumerate(rows):
+            for column, value in enumerate((priority, topic, topic_type)):
+                self.baseline_ros2_topic_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
+
+        mavlink_rows = {
+            "GPS_RAW_INT": (
+                "time_usec, fix_type, lat, lon, alt, eph, epv, vel, cog, satellites_visible, "
+                "h_acc, v_acc, vel_acc, hdg_acc, yaw"
+            ),
+            "GPS2_RAW": (
+                "time_usec, fix_type, lat, lon, alt, eph, epv, vel, cog, satellites_visible, "
+                "h_acc, v_acc, vel_acc, hdg_acc, yaw"
+            ),
+            "GLOBAL_POSITION_INT": "time_boot_ms, lat, lon, alt, relative_alt, vx, vy, vz, hdg",
+        }
+        self.baseline_mavlink_message_table.setRowCount(len(mavlink_rows))
+        for row, (message, fields) in enumerate(mavlink_rows.items()):
+            self.baseline_mavlink_message_table.setItem(row, 0, QtWidgets.QTableWidgetItem(message))
+            self.baseline_mavlink_message_table.setItem(row, 1, QtWidgets.QTableWidgetItem(fields))
+
+    def _show_selected_baseline_ros2_fields(self) -> None:
+        if not hasattr(self, "baseline_ros2_topic_table"):
+            return
+        selected = self.baseline_ros2_topic_table.selectedItems()
+        if not selected:
+            return
+        row = selected[0].row()
+        type_item = self.baseline_ros2_topic_table.item(row, 2)
+        topic_type = "" if type_item is None else type_item.text().strip()
+        self.baseline_ros2_field_list.clear()
+        if not topic_type:
+            self.baseline_ros2_field_list.addItem("message type 대기 중")
+            return
+        try:
+            fields = describe_ros2_message_fields(topic_type)
+        except Exception as exc:
+            self.baseline_ros2_field_list.addItem(f"field 조회 실패: {exc}")
+            return
+        for field in fields:
+            self.baseline_ros2_field_list.addItem(field)
+
+    def _selected_baseline_gps_state(self, side: str) -> GpsPositionState | None:
+        combo = self.baseline_left_gps_combo if side == "left" else self.baseline_right_gps_combo
+        slot = str(combo.currentData() or "GPS1") if hasattr(self, "baseline_left_gps_combo") else "GPS1"
+        if slot == "GPS1":
+            return self.latest_gps.get(side)
+        # GPS2 position is only usable when the producer emits raw GPS2 lat/lon into latest_gps.
+        state = self.latest_gps.get(f"{side}_GPS2")
+        return state if isinstance(state, GpsPositionState) else None
+
+    def _current_baseline_vector(self) -> tuple[BaselineVector, GpsPositionState, GpsPositionState] | None:
+        left = self._selected_baseline_gps_state("left")
+        right = self._selected_baseline_gps_state("right")
+        if left is None or right is None:
+            return None
+        vector = baseline_from_gps(left, right)
+        if vector is None or vector.timestamp_delta_ms > 200.0:
+            return None
+        return vector, left, right
+
+    def _refresh_baseline_alignment_ui(self) -> None:
+        self._refresh_baseline_gps_cards()
+        current = self._current_baseline_vector()
+        if current is None:
+            self.latest_baseline_vector = None
+            if hasattr(self, "baseline_calc_labels"):
+                for label in self.baseline_calc_labels.values():
+                    self._set_health_label(label, "대기 중", "idle")
+            if hasattr(self, "rtk_alignment_detail_label"):
+                self._set_label_text_if_changed(
+                    self.rtk_alignment_detail_label,
+                    "정렬 성분: 좌/우 GPS 위치 또는 timestamp 동기화 대기 중",
+                )
+            return
+        vector, left, right = current
+        self.latest_baseline_vector = vector
+        if hasattr(self, "baseline_calc_labels"):
+            self._set_label_text_if_changed(
+                self.baseline_calc_labels["enu"],
+                f"[{vector.east_m:+.4f}, {vector.north_m:+.4f}, {vector.up_m:+.4f}] m",
+            )
+            self._set_label_text_if_changed(
+                self.baseline_calc_labels["ned"],
+                f"[{vector.north_m:+.4f}, {vector.east_m:+.4f}, {-vector.up_m:+.4f}] m",
+            )
+            self._set_label_text_if_changed(self.baseline_calc_labels["length"], f"{vector.length_m:.4f} m")
+            self._set_label_text_if_changed(self.baseline_calc_labels["azimuth"], f"{vector.azimuth_deg:.2f} deg")
+            self._set_label_text_if_changed(self.baseline_calc_labels["elevation"], f"{vector.elevation_deg:.2f} deg")
+            self._set_label_text_if_changed(
+                self.baseline_calc_labels["altitude_delta"], f"{vector.altitude_delta_m:+.4f} m"
+            )
+            self._set_label_text_if_changed(
+                self.baseline_calc_labels["timestamp_delta"], f"{vector.timestamp_delta_ms:.1f} ms"
+            )
+            if self.loaded_baseline_profile_vector is None:
+                self._set_health_label(self.baseline_calc_labels["profile_delta"], "profile 없음", "idle")
+            else:
+                delta = sqrt(
+                    (vector.east_m - self.loaded_baseline_profile_vector[0]) ** 2
+                    + (vector.north_m - self.loaded_baseline_profile_vector[1]) ** 2
+                    + (vector.up_m - self.loaded_baseline_profile_vector[2]) ** 2
+                )
+                self._set_health_label(
+                    self.baseline_calc_labels["profile_delta"],
+                    f"{delta:.3f} m",
+                    "warn" if delta >= 0.05 else "good",
+                )
+        if hasattr(self, "rtk_alignment_plot"):
+            estimate = RtkBaselineEstimate(
+                baseline_m=vector.length_m,
+                north_m=vector.north_m,
+                east_m=vector.east_m,
+                down_m=-vector.up_m,
+                left_age_s=max(0.0, time.monotonic() - left.timestamp_s),
+                right_age_s=max(0.0, time.monotonic() - right.timestamp_s),
+                fix_quality="GOOD" if left.fix_type == 6 and right.fix_type == 6 else "DEGRADED",
+            )
+            self.latest_rtk_baseline = estimate
+            self.rtk_alignment_plot.set_alignment(estimate)
+            self._set_label_text_if_changed(
+                self.rtk_alignment_detail_label,
+                f"ENU E/N/U={vector.east_m:+.3f}/{vector.north_m:+.3f}/{vector.up_m:+.3f} m | "
+                f"NED N/E/D={vector.north_m:+.3f}/{vector.east_m:+.3f}/{-vector.up_m:+.3f} m",
+            )
+        self._refresh_alignment_overview()
+        self._refresh_alignment_validation()
+
+    def _refresh_baseline_gps_cards(self) -> None:
+        if not hasattr(self, "baseline_gps_card_labels"):
+            return
+        now_s = time.monotonic()
+        for side, labels in self.baseline_gps_card_labels.items():
+            gps = self.latest_gps.get(side)
+            sensors = self.latest_gps_sensors.get(side, {})
+            connected = gps is not None or bool(sensors)
+            self._set_health_label(labels["connection"], "connected" if connected else "waiting", "good" if connected else "idle")
+            for slot_key, label_key in (("GPS1", "gps1"), ("GPS2", "gps2")):
+                state = sensors.get(slot_key)
+                unavailable = state is None and self._ros2_only_unavailable(side, slot_key)
+                level = "good" if state is not None else "warn" if unavailable else "idle"
+                text = "인식" if state is not None else "ROS2 미게시" if unavailable else "대기"
+                if state is not None and state.fix_type is not None:
+                    text += f" fix={state.fix_type}"
+                self._set_health_label(labels[label_key], text, level)
+            if gps is None:
+                for key in ("fix", "rtk", "sats", "eph", "epv", "h_acc", "v_acc", "lla", "rate", "age", "timestamp"):
+                    labels[key].setText("대기 중")
+                continue
+            age_ms = max(0.0, now_s - gps.timestamp_s) * 1000.0
+            rate = self._baseline_message_rate(side)
+            labels["fix"].setText("--" if gps.fix_type is None else str(gps.fix_type))
+            self._set_health_label(labels["rtk"], gps.rtk_label, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
+            labels["sats"].setText("--" if gps.satellites_used is None else str(gps.satellites_used))
+            labels["eph"].setText("--" if gps.eph_m is None else f"{gps.eph_m:.3f} m")
+            labels["epv"].setText("--" if gps.epv_m is None else f"{gps.epv_m:.3f} m")
+            labels["h_acc"].setText("--" if gps.eph_m is None else f"{gps.eph_m:.3f} m")
+            labels["v_acc"].setText("--" if gps.epv_m is None else f"{gps.epv_m:.3f} m")
+            if gps.has_position:
+                labels["lla"].setText(f"{gps.latitude_deg:.8f}, {gps.longitude_deg:.8f}, {gps.altitude_m:.3f} m")
+            else:
+                labels["lla"].setText("position 대기")
+            labels["rate"].setText(f"{rate:.2f} Hz")
+            labels["age"].setText(f"{age_ms:.0f} ms")
+            labels["timestamp"].setText("--" if gps.px4_timestamp_s is None else f"{gps.px4_timestamp_s:.6f} s")
+
+    def _refresh_alignment_overview(self) -> None:
+        if not hasattr(self, "alignment_overview_labels"):
+            return
+        labels = self.alignment_overview_labels
+        for side, key in (("left", "left_pixhawk"), ("right", "right_pixhawk")):
+            connected = side in self.latest_gps or side in self.latest_extrinsics
+            self._set_health_label(labels[key], "connected" if connected else "waiting", "good" if connected else "idle")
+        for side in ("left", "right"):
+            for slot in ("GPS1", "GPS2"):
+                state = self.latest_gps_sensors.get(side, {}).get(slot)
+                unavailable = state is None and self._ros2_only_unavailable(side, slot)
+                level = "good" if state is not None else "warn" if unavailable else "idle"
+                text = "인식" if state is not None else "ROS2 미게시" if unavailable else "대기"
+                self._set_health_label(labels[f"{side}_{slot.lower()}"], text, level)
+            for slot in ("CAN1", "CAN2"):
+                state = self.latest_mag_sensors.get(side, {}).get(slot)
+                unavailable = state is None and self._ros2_only_unavailable(side, slot)
+                level = "good" if state is not None else "warn" if unavailable else "idle"
+                text = "인식" if state is not None else "ROS2 미게시" if unavailable else "대기"
+                self._set_health_label(labels[f"{side}_{slot.lower()}"], text, level)
+        vector = self.latest_baseline_vector
+        quality = self.latest_baseline_quality
+        labels["baseline_length"].setText("대기 중" if vector is None else f"{vector.length_m:.4f} m")
+        labels["baseline_std"].setText("대기 중" if quality is None else f"{quality.baseline_length_std_m:.4f} m")
+        self._set_health_label(
+            labels["baseline_quality"],
+            "대기 중" if quality is None else quality.grade,
+            "idle" if quality is None else "good" if quality.grade == "GOOD" else "warn" if quality.grade == "WARNING" else "bad",
+        )
+        left = self.latest_extrinsics.get("left")
+        right = self.latest_extrinsics.get("right")
+        labels["left_rpy"].setText("대기 중" if left is None else f"{left.roll_deg:.2f}/{left.pitch_deg:.2f}/{left.yaw_deg:.2f} deg")
+        labels["right_rpy"].setText("대기 중" if right is None else f"{right.roll_deg:.2f}/{right.pitch_deg:.2f}/{right.yaw_deg:.2f} deg")
+        if left is not None and right is not None:
+            labels["yaw_diff"].setText(f"{right.yaw_deg - left.yaw_deg:+.2f} deg")
+            labels["pitch_diff"].setText(f"{right.pitch_deg - left.pitch_deg:+.2f} deg")
+            labels["roll_diff"].setText(f"{right.roll_deg - left.roll_deg:+.2f} deg")
+        grade = "GOOD" if quality is not None and quality.grade == "GOOD" else "WARNING" if vector is not None else "BAD"
+        self._set_health_label(labels["alignment_quality"], grade, "good" if grade == "GOOD" else "warn" if grade == "WARNING" else "bad")
+
+    def _refresh_alignment_magnetometer_ui(self) -> None:
+        if not hasattr(self, "alignment_mag_labels"):
+            return
+        for side in ("left", "right"):
+            for slot in ("CAN1", "CAN2"):
+                key = f"{side}_{slot}"
+                labels = self.alignment_mag_labels[key]
+                state = self.latest_mag_sensors.get(side, {}).get(slot)
+                if state is None:
+                    unavailable = self._ros2_only_unavailable(side, slot)
+                    text = "ROS2 미게시" if unavailable else "대기 중"
+                    for label in labels.values():
+                        label.setText(text)
+                    continue
+                device_id, device_source = self._mag_state_display_device_id(side, state)
+                labels["device"].setText("--" if device_id is None else str(device_id))
+                labels["priority"].setText("PX4 param")
+                labels["selected"].setText(device_source)
+                labels["health"].setText("OK" if state.magnitude is not None else "waiting")
+                labels["calibration"].setText("PX4 EKF")
+                labels["field"].setText("--" if state.magnitude is None else f"{state.magnitude:.3f} G")
+                labels["rate"].setText("live")
+                labels["timestamp"].setText(f"{state.timestamp_s:.3f}")
+        left_diff = self.magnetometer_monitor.can_difference("left")
+        right_diff = self.magnetometer_monitor.can_difference("right")
+        self.alignment_mag_compare_labels["left_can_diff"].setText("--" if left_diff is None else f"{left_diff:.3f} G")
+        self.alignment_mag_compare_labels["right_can_diff"].setText("--" if right_diff is None else f"{right_diff:.3f} G")
+        self.alignment_mag_compare_labels["left_right_diff"].setText("heading source 대기")
+
+    def _mag_state_display_device_id(self, camera: str, state: object) -> tuple[int | None, str]:
+        device_id = getattr(state, "device_id", None)
+        if device_id is not None:
+            return int(device_id), "telemetry"
+        topic = str(getattr(state, "topic", ""))
+        if topic.startswith("mavlink/SCALED_IMU"):
+            inferred = self._inferred_rm3100_device_id_for_slot(camera, str(getattr(state, "sensor_slot", "")))
+            if inferred is not None:
+                return inferred, "PX4 param inferred"
+        return None, "unknown"
+
+    def _inferred_rm3100_device_id_for_slot(self, camera: str, sensor_slot: str) -> int | None:
+        manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
+        params = None
+        if manager is not None:
+            store = getattr(manager, "store", None)
+            values = getattr(store, "values", None)
+            if isinstance(values, dict):
+                params = values
+        if params is None:
+            params = current_pixhawk_6x_mag_params()
+        rm_ids = []
+        for value in params.values():
+            try:
+                candidate = int(value)
+            except (TypeError, ValueError):
+                continue
+            if candidate in {RM3100_PRIMARY_ID, RM3100_BACKUP_ID} and candidate not in rm_ids:
+                rm_ids.append(candidate)
+        if sensor_slot == "CAN1":
+            return rm_ids[0] if rm_ids else RM3100_PRIMARY_ID
+        if sensor_slot == "CAN2":
+            if len(rm_ids) >= 2:
+                return rm_ids[1]
+            return RM3100_BACKUP_ID
+        return None
+
+    def _refresh_alignment_attitude_ui(self) -> None:
+        if not hasattr(self, "alignment_attitude_labels"):
+            return
+        for side, prefix in (("left", "left"), ("right", "right")):
+            state = self.latest_extrinsics.get(side)
+            if state is None:
+                self.alignment_attitude_labels[f"{prefix}_rpy"].setText("대기 중")
+                self.alignment_attitude_labels[f"{prefix}_q"].setText("대기 중")
+            else:
+                self.alignment_attitude_labels[f"{prefix}_rpy"].setText(
+                    f"{state.roll_deg:.3f} / {state.pitch_deg:.3f} / {state.yaw_deg:.3f} deg"
+                )
+                self.alignment_attitude_labels[f"{prefix}_q"].setText(", ".join(f"{value:.6f}" for value in state.q))
+        left = self.latest_extrinsics.get("left")
+        right = self.latest_extrinsics.get("right")
+        if left is not None and right is not None:
+            self.alignment_attitude_labels["yaw_diff"].setText(f"{right.yaw_deg - left.yaw_deg:+.3f} deg")
+            self.alignment_attitude_labels["pitch_diff"].setText(f"{right.pitch_deg - left.pitch_deg:+.3f} deg")
+            self.alignment_attitude_labels["roll_diff"].setText(f"{right.roll_deg - left.roll_deg:+.3f} deg")
+
+    def _refresh_coordinate_system_settings(self) -> None:
+        if not hasattr(self, "alignment_global_frame_combo"):
+            return
+        self.coordinate_system_manager.update(
+            global_frame=self.alignment_global_frame_combo.currentText(),
+            camera_frame=self.alignment_camera_frame_combo.currentText(),
+            origin=self.alignment_origin_combo.currentText(),
+        )
+        self.alignment_tf_tree_label.setText(f"TF Tree: {self.coordinate_system_manager.tf_tree_text()}")
+
+    def _refresh_alignment_validation(self) -> None:
+        if not hasattr(self, "alignment_validation_labels"):
+            return
+        stored_baseline = None
+        if self.loaded_alignment_profile:
+            vector = (
+                self.loaded_alignment_profile.get("alignment_profile", {})
+                .get("baseline", {})
+                .get("vector_m")
+            )
+            if isinstance(vector, list) and len(vector) == 3:
+                stored_baseline = (float(vector[0]), float(vector[1]), float(vector[2]))
+        result = self.alignment_validator.validate(
+            stored_baseline_enu_m=stored_baseline,
+            current_baseline=self.latest_baseline_vector,
+            stored_rpy_deg=(0.0, 0.0, 0.0),
+            current_rpy_delta_deg=self.attitude_monitor.deltas(),
+            distance_m=self.alignment_validation_distance_spin.value() if hasattr(self, "alignment_validation_distance_spin") else 1852.0,
+        )
+        labels = self.alignment_validation_labels
+        labels["baseline_length"].setText("--" if result.baseline_length_difference_m is None else f"{result.baseline_length_difference_m:.4f} m")
+        labels["baseline_vector"].setText("--" if result.baseline_vector_difference_m is None else f"{result.baseline_vector_difference_m:.4f} m")
+        labels["yaw"].setText("--" if result.yaw_difference_deg is None else f"{result.yaw_difference_deg:.3f} deg")
+        labels["pitch"].setText("--" if result.pitch_difference_deg is None else f"{result.pitch_difference_deg:.3f} deg")
+        labels["roll"].setText("--" if result.roll_difference_deg is None else f"{result.roll_difference_deg:.3f} deg")
+        labels["baseline_error"].setText("--" if result.baseline_error_contribution_m is None else f"{result.baseline_error_contribution_m:.3f} m")
+        labels["yaw_error"].setText("--" if result.yaw_error_contribution_m is None else f"{result.yaw_error_contribution_m:.3f} m")
+        labels["pitch_error"].setText("--" if result.pitch_error_contribution_m is None else f"{result.pitch_error_contribution_m:.3f} m")
+        self._set_health_label(labels["status"], result.status, "good" if result.status == "PASS" else "bad")
+
+    def _baseline_message_rate(self, side: str) -> float:
+        history = self.baseline_gps_rate_history.get(side)
+        if not history or len(history) < 2:
+            return 0.0
+        duration = max(history[-1] - history[0], 1e-6)
+        return (len(history) - 1) / duration
+
+    def start_baseline_sampling(self) -> None:
+        self.baseline_sampling_active = True
+        self.baseline_sampling_started_s = time.monotonic()
+        self.baseline_samples.clear()
+        self.latest_baseline_quality = None
+        self.baseline_quality_badge.setText("Quality: sampling")
+        self._set_health_label(self.baseline_quality_badge, "Quality: sampling", "warn")
+
+    def stop_baseline_sampling(self) -> None:
+        self.baseline_sampling_active = False
+        self._finalize_baseline_quality()
+
+    def _append_baseline_sample_if_active(self) -> None:
+        if not getattr(self, "baseline_sampling_active", False):
+            return
+        current = self._current_baseline_vector()
+        if current is None:
+            return
+        self.baseline_samples.append(current)
+        vector, _left, _right = current
+        if hasattr(self, "baseline_length_plot"):
+            self.baseline_length_plot.add_point(TelemetryHistoryPoint(time.monotonic(), "length", vector.length_m))
+        duration = self.baseline_sample_duration_spin.value() if hasattr(self, "baseline_sample_duration_spin") else 10.0
+        started = self.baseline_sampling_started_s or time.monotonic()
+        if time.monotonic() - started >= duration:
+            self.stop_baseline_sampling()
+
+    def _finalize_baseline_quality(self) -> None:
+        duration = 0.0
+        if self.baseline_sampling_started_s is not None:
+            duration = max(0.0, time.monotonic() - self.baseline_sampling_started_s)
+        quality = evaluate_baseline_quality(self.baseline_samples, duration_s=duration)
+        self.latest_baseline_quality = quality
+        self._render_baseline_quality(quality)
+
+    def _render_baseline_quality(self, quality: BaselineQuality | None) -> None:
+        if not hasattr(self, "baseline_quality_labels"):
+            return
+        if quality is None:
+            self._set_health_label(self.baseline_quality_badge, "Quality: 샘플 대기", "idle")
+            return
+        level = "good" if quality.grade == "GOOD" else "warn" if quality.grade == "WARNING" else "bad"
+        self._set_health_label(self.baseline_quality_badge, f"Quality: {quality.grade}", level)
+        self.baseline_quality_labels["length_mean"].setText(f"{quality.baseline_length_mean_m:.4f} m")
+        self.baseline_quality_labels["length_std"].setText(f"{quality.baseline_length_std_m:.4f} m")
+        self.baseline_quality_labels["enu_mean"].setText(
+            f"[{quality.enu_mean_m[0]:+.4f}, {quality.enu_mean_m[1]:+.4f}, {quality.enu_mean_m[2]:+.4f}] m"
+        )
+        self.baseline_quality_labels["enu_std"].setText(
+            f"[{quality.enu_std_m[0]:.4f}, {quality.enu_std_m[1]:.4f}, {quality.enu_std_m[2]:.4f}] m"
+        )
+        self.baseline_quality_labels["rtk_ratio"].setText(f"{quality.rtk_fixed_ratio * 100.0:.1f}%")
+        self.baseline_quality_labels["message_rate"].setText(f"{quality.gps_message_rate_hz:.2f} Hz")
+        self.baseline_quality_labels["timestamp_delta"].setText(f"{quality.timestamp_delta_ms:.1f} ms")
+        self.baseline_quality_labels["outliers"].setText(str(quality.outlier_count))
+        self.baseline_quality_labels["jumps"].setText(str(quality.baseline_jump_count))
+        h_acc = "--" if quality.mean_h_acc_m is None else f"{quality.mean_h_acc_m:.3f} m"
+        v_acc = "--" if quality.mean_v_acc_m is None else f"{quality.mean_v_acc_m:.3f} m"
+        self.baseline_quality_labels["acc"].setText(f"{h_acc} / {v_acc}")
+
+    def _baseline_profile_topics(self) -> tuple[str, str, str, str]:
+        return (
+            self._gps_sensor_topic("left", "GPS1"),
+            self._gps_sensor_topic("left", "GPS2"),
+            self._gps_sensor_topic("right", "GPS1"),
+            self._gps_sensor_topic("right", "GPS2"),
+        )
+
+    def _gps_sensor_topic(self, side: str, slot: str) -> str:
+        state = self.latest_gps_sensors.get(side, {}).get(slot)
+        return "" if state is None else str(getattr(state, "topic", ""))
+
+    def save_baseline_profile(self) -> None:
+        current = self._current_baseline_vector()
+        if current is None:
+            QtWidgets.QMessageBox.warning(self, "Baseline Profile", "저장할 유효한 baseline이 없습니다.")
+            return
+        vector, left, right = current
+        if left.fix_type != 6 or right.fix_type != 6:
+            QtWidgets.QMessageBox.warning(self, "Baseline Profile", "RTK Fixed가 아닌 상태입니다. 저장 전 품질을 확인하세요.")
+        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Baseline Profile",
+            str(APP_ROOT / "baseline_profile.yaml"),
+            "YAML (*.yaml *.yml)",
+        )
+        if not selected:
+            return
+        payload = baseline_profile_payload(
+            left_gps1_topic=self._baseline_profile_topics()[0],
+            left_gps2_topic=self._baseline_profile_topics()[1],
+            right_gps1_topic=self._baseline_profile_topics()[2],
+            right_gps2_topic=self._baseline_profile_topics()[3],
+            baseline=vector,
+            quality=self.latest_baseline_quality,
+        )
+        path = Path(selected)
+        path.write_text(dump_baseline_profile(payload), encoding="utf-8")
+        self.baseline_profile_preview.setPlainText(dump_baseline_profile(payload))
+        self.baseline_profile_status_label.setText(f"Baseline profile 저장: {path}")
+
+    def load_baseline_profile(self) -> None:
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Baseline Profile",
+            str(APP_ROOT),
+            "YAML (*.yaml *.yml)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            payload = load_baseline_profile(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Baseline Profile", str(exc))
+            return
+        profile = payload["baseline_profile"]
+        vector = profile.get("baseline", {}).get("vector_m", [0.0, 0.0, 0.0])
+        if isinstance(vector, list) and len(vector) == 3:
+            self.loaded_baseline_profile_vector = (float(vector[0]), float(vector[1]), float(vector[2]))
+        self.baseline_profile_preview.setPlainText(path.read_text(encoding="utf-8"))
+        self.baseline_profile_status_label.setText(f"Baseline profile 불러옴: {path}")
+        self._refresh_baseline_alignment_ui()
+
+    def save_alignment_profile(self) -> None:
+        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Alignment Profile",
+            str(APP_ROOT / "alignment_profile.yaml"),
+            "YAML (*.yaml *.yml)",
+        )
+        if not selected:
+            return
+        payload = self.alignment_profile_manager.build_payload(
+            baseline=self.latest_baseline_vector,
+            baseline_quality=self.latest_baseline_quality,
+            left_attitude=self.latest_extrinsics.get("left"),
+            right_attitude=self.latest_extrinsics.get("right"),
+            coordinate_settings=self.coordinate_system_manager.settings,
+            gps_mapping={
+                "left_camera": str(self.baseline_left_gps_combo.currentData() or "GPS1") if hasattr(self, "baseline_left_gps_combo") else "GPS1",
+                "right_camera": str(self.baseline_right_gps_combo.currentData() or "GPS1") if hasattr(self, "baseline_right_gps_combo") else "GPS1",
+            },
+            magnetometer_mapping={
+                "left_can1": "CAN1",
+                "left_can2": "CAN2",
+                "right_can1": "CAN1",
+                "right_can2": "CAN2",
+            },
+        )
+        text = self.alignment_profile_manager.dump(payload)
+        path = Path(selected)
+        path.write_text(text, encoding="utf-8")
+        self.alignment_profile_preview.setPlainText(text)
+        self.alignment_profile_status_label.setText(f"Alignment Profile 저장: {path}")
+
+    def load_alignment_profile(self) -> None:
+        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Alignment Profile",
+            str(APP_ROOT),
+            "YAML (*.yaml *.yml)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            payload = self.alignment_profile_manager.load(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            QtWidgets.QMessageBox.warning(self, "Alignment Profile", str(exc))
+            return
+        self.loaded_alignment_profile = payload
+        self.alignment_profile_preview.setPlainText(path.read_text(encoding="utf-8"))
+        self.alignment_profile_status_label.setText(f"Alignment Profile 불러옴: {path}")
+        self._refresh_alignment_validation()
 
     def _build_px4_mag_manager_panel(self, layout: QtWidgets.QVBoxLayout) -> None:
         group = QtWidgets.QGroupBox("PX4 Magnetometer / RM3100 관리")
@@ -4955,6 +6233,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         layout.addWidget(status_label)
 
+        detail_group = QtWidgets.QGroupBox("상세: CAL_MAG 슬롯 / priority")
+        detail_layout = QtWidgets.QVBoxLayout(detail_group)
         table = QtWidgets.QTableWidget(0, 10)
         table.setHorizontalHeaderLabels(
             [
@@ -4976,7 +6256,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(9, QtWidgets.QHeaderView.Stretch)
-        layout.addWidget(table)
+        detail_layout.addWidget(table)
+        self._configure_collapsible_group(detail_group, checked=False)
+        layout.addWidget(detail_group)
 
         self.px4_mag_refresh_buttons[camera] = refresh_button
         self.px4_mag_use_rm3100_buttons[camera] = use_rm3100_button
@@ -5051,12 +6333,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for row, slot in enumerate(("GPS1", "GPS2"), start=2):
             label = QtWidgets.QLabel("대기 중")
             label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             gnss_form.addWidget(QtWidgets.QLabel(f"F9P · {slot}"), row, 0)
             gnss_form.addWidget(label, row, 1)
             self.f9p_slot_labels[camera][slot] = label
             self.gps_sensor_labels[camera][slot] = label
         f9p_compare_label = QtWidgets.QLabel("GPS1/GPS2 품질 비교: 대기 중")
         f9p_compare_label.setObjectName("statusStrip")
+        f9p_compare_label.setWordWrap(True)
+        f9p_compare_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         gnss_form.addWidget(QtWidgets.QLabel("비교"), 4, 0)
         gnss_form.addWidget(f9p_compare_label, 4, 1)
         self.f9p_compare_labels[camera] = f9p_compare_label
@@ -5065,7 +6351,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         gnss_form.addWidget(QtWidgets.QLabel("Moving Base"), 5, 0)
         gnss_form.addWidget(gnss_heading_label, 5, 1)
         self.gnss_heading_labels[camera] = gnss_heading_label
-        top_row.addWidget(gnss_group, 1)
         layout.addLayout(top_row)
 
         rm3100_norm_plot = TelemetryHistoryPlot(f"{title} 자기장 크기 안정성 (CAN1/CAN2)", "G")
@@ -5079,23 +6364,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.f9p_sats_plots[camera] = f9p_sats_plot
         self.f9p_quality_plots[camera] = f9p_quality_plot
 
-        graph_tabs = QtWidgets.QTabWidget()
-        graph_tabs.setDocumentMode(True)
-        rm_graph_tab = QtWidgets.QWidget()
-        rm_graph_layout = QtWidgets.QHBoxLayout(rm_graph_tab)
-        rm_graph_layout.setContentsMargins(0, 0, 0, 0)
+        rm_graph_layout = QtWidgets.QHBoxLayout()
         rm_graph_layout.setSpacing(8)
         rm_graph_layout.addWidget(rm3100_norm_plot, 1)
         rm_graph_layout.addWidget(rm3100_delta_plot, 1)
-        f9p_graph_tab = QtWidgets.QWidget()
-        f9p_graph_layout = QtWidgets.QHBoxLayout(f9p_graph_tab)
+        layout.addLayout(rm_graph_layout, 1)
+
+        f9p_detail_group = QtWidgets.QGroupBox(f"상세: {title} · F9P GNSS")
+        f9p_detail_layout = QtWidgets.QVBoxLayout(f9p_detail_group)
+        f9p_detail_layout.addWidget(gnss_group)
+        f9p_graph_layout = QtWidgets.QHBoxLayout()
         f9p_graph_layout.setContentsMargins(0, 0, 0, 0)
         f9p_graph_layout.setSpacing(8)
         f9p_graph_layout.addWidget(f9p_sats_plot, 1)
         f9p_graph_layout.addWidget(f9p_quality_plot, 1)
-        graph_tabs.addTab(rm_graph_tab, "RM3100 그래프")
-        graph_tabs.addTab(f9p_graph_tab, "F9P 그래프")
-        layout.addWidget(graph_tabs, 1)
+        f9p_detail_layout.addLayout(f9p_graph_layout)
+        self._configure_collapsible_group(f9p_detail_group, checked=False)
+        layout.addWidget(f9p_detail_group)
 
     def _build_clock_sync_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         layout.setSpacing(8)
@@ -6240,6 +7525,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 }
                 for namespace in namespaces
             ]
+            + self._mavlink_url_candidate_rows()
         )
         if namespaces:
             self.left_namespace_edit.setText(namespaces[0])
@@ -6254,13 +7540,113 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._pixhawk_candidate_rows = rows
         self.pixhawk_candidate_table.setRowCount(len(rows))
         for row, entry in enumerate(rows):
-            for column, key in enumerate(("kind", "value", "baud", "status")):
+            for column, key in enumerate(("kind", "value", "baud", "status", "interface")):
                 item = QtWidgets.QTableWidgetItem(str(entry.get(key, "")))
                 self.pixhawk_candidate_table.setItem(row, column, item)
         self.pixhawk_candidate_table.resizeRowsToContents()
+        self._refresh_pixhawk_candidate_actions()
 
     def _append_pixhawk_candidate_rows(self, rows: list[dict[str, object]]) -> None:
         self._set_pixhawk_candidate_rows([*self._pixhawk_candidate_rows, *rows])
+
+    def clear_pixhawk_candidate_history(self) -> None:
+        if not self._pixhawk_candidate_rows:
+            return
+        self._set_pixhawk_candidate_rows([])
+        self._log("[픽스호크] 탐색 후보 내역을 지웠습니다.")
+
+    def _refresh_pixhawk_candidate_actions(self) -> None:
+        row = self.pixhawk_candidate_table.currentRow()
+        kind = ""
+        if 0 <= row < len(self._pixhawk_candidate_rows):
+            kind = str(self._pixhawk_candidate_rows[row].get("kind", ""))
+        self.clear_pixhawk_candidate_button.setEnabled(bool(self._pixhawk_candidate_rows))
+        self.clear_pixhawk_candidate_button.setToolTip("Pixhawk 탐색 후보 내역을 지웁니다.")
+        self.apply_pixhawk_candidate_host_button.setEnabled(kind == "PC_IP")
+        self.apply_pixhawk_candidate_host_button.setToolTip(
+            "선택한 PC IP 후보를 Pixhawk Host IP/uXRCE Agent IP에 적용합니다."
+            if kind == "PC_IP"
+            else "PC_IP 후보를 선택하면 Host에 적용할 수 있습니다."
+        )
+        side_enabled = kind in {"ROS2", "USB", "MAVLink"}
+        for button in (self.apply_pixhawk_candidate_left_button, self.apply_pixhawk_candidate_right_button):
+            button.setEnabled(side_enabled)
+            if kind == "ROS2":
+                button.setToolTip("선택한 ROS2 namespace 후보를 Pixhawk에 적용합니다.")
+            elif kind == "USB":
+                button.setToolTip("선택한 USB 후보를 P1/P2 MAVLink URL에 적용합니다. 연결은 적용 후 직접 누르세요.")
+            elif kind == "MAVLink":
+                button.setToolTip("선택한 MAVLink URL 후보를 P1/P2 MAVLink URL에 적용합니다. 연결은 적용 후 직접 누르세요.")
+            else:
+                button.setToolTip("ROS2, USB, MAVLink 후보를 선택하면 P1/P2에 적용할 수 있습니다.")
+
+    def _mavlink_url_candidate_rows(self) -> list[dict[str, object]]:
+        host_ip = self.pixhawk_host_address_edit.text().strip() or "0.0.0.0"
+        return [
+            {
+                "kind": "MAVLink",
+                "value": "udpin:0.0.0.0:14550",
+                "baud": "",
+                "status": "Ethernet UDP listen",
+                "interface": host_ip,
+            },
+            {
+                "kind": "MAVLink",
+                "value": "udpin:0.0.0.0:14551",
+                "baud": "",
+                "status": "Ethernet UDP listen",
+                "interface": host_ip,
+            },
+        ]
+
+    def discover_mavlink_url_candidates(self) -> None:
+        rows = self._mavlink_url_candidate_rows()
+        self._append_pixhawk_candidate_rows(rows)
+        for row in rows:
+            self._log(
+                f"[픽스호크] MAVLink URL 후보: {row['value']} "
+                f"status={row['status']} host={row['interface']}"
+            )
+
+    def discover_usb_pixhawk_connections(self) -> None:
+        self.pixhawk_usb_discover_button.setEnabled(False)
+        self._log("[픽스호크] USB Pixhawk 연결 탐색을 시작합니다. 후보는 자동 할당하지 않습니다.")
+        try:
+            candidates = usb_mavlink_device_candidates()
+            found = probe_usb_mavlink_devices(candidates=candidates, timeout_s=0.8) if candidates else []
+        except Exception as exc:
+            self.pixhawk_usb_discover_button.setEnabled(True)
+            self._log(f"[픽스호크] USB Pixhawk 연결 탐색 실패: {exc}")
+            return
+        self.pixhawk_usb_discover_button.setEnabled(True)
+        rows: list[dict[str, object]] = []
+        found_by_device = {device: baud for device, baud in found}
+        for device in candidates:
+            baud = found_by_device.get(device, "")
+            if baud:
+                status = "MAVLink heartbeat"
+            else:
+                status = self._usb_pixhawk_probe_status(device)
+            rows.append({"kind": "USB", "value": device, "baud": baud, "status": status})
+        if not rows:
+            self._log("[픽스호크] USB Pixhawk 장치가 보이지 않습니다: /dev/ttyACM*, /dev/ttyUSB* 없음")
+            return
+        self._append_pixhawk_candidate_rows(rows)
+        for row in rows:
+            self._log(
+                f"[픽스호크] USB 후보: {row['value']} "
+                f"baud={row['baud'] or '-'} status={row['status']}"
+            )
+
+    def _usb_pixhawk_probe_status(self, device: str) -> str:
+        try:
+            with open(device, "rb", buffering=0):
+                pass
+        except PermissionError:
+            return "permission denied: add user to dialout"
+        except OSError as exc:
+            return f"open failed: {exc}"
+        return "no heartbeat"
 
     def _selected_pixhawk_candidate(self) -> dict[str, object] | None:
         row = self.pixhawk_candidate_table.currentRow()
@@ -6278,6 +7664,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not value:
             self._log("[픽스호크] 선택 후보에 적용할 값이 없습니다.")
             return
+        if kind == "PC_IP":
+            if side != "host":
+                self._log("[픽스호크] PC IP 후보는 Host에 적용 버튼으로 적용하세요.")
+                return
+            old_text = self.pixhawk_host_address_edit.text().strip()
+            self.pixhawk_host_address_edit.setText(value)
+            self._log(
+                f"[픽스호크] 선택 PC IP 후보를 Pixhawk Host IP에 적용했습니다: "
+                f"{old_text or '<empty>'} -> {value} ({entry.get('interface', '')})"
+            )
+            self.pixhawk_connection_label.setText(f"Pixhawk Host IP 후보 적용됨: {value}")
+            self._save_current_settings()
+            self._refresh_operation_header()
+            return
+        if side not in {"left", "right"}:
+            self._log(f"[픽스호크] {kind} 후보는 P1/P2에 적용하세요.")
+            return
         mavlink_was_active = side in self._mavlink_connected_sides()
         ros2_was_active = self.pixhawk is not None
         if kind == "ROS2":
@@ -6285,7 +7688,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 self.left_namespace_edit.setText(value)
             else:
                 self.right_namespace_edit.setText(value)
-        elif kind == "USB":
+        elif kind in {"USB", "MAVLink"}:
             try:
                 baud = int(entry.get("baud") or 0)
             except (TypeError, ValueError):
@@ -6303,14 +7706,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         label = "Pixhawk 1" if side == "left" else "Pixhawk 2"
         self._log(f"[픽스호크] 선택 후보를 {label}에 적용했습니다: {kind} {value}")
-        if kind == "USB":
+        if kind in {"USB", "MAVLink"}:
             self._refresh_mavlink_side_actions()
             if mavlink_was_active:
-                self._log(f"[픽스호크] {label} USB 후보 적용으로 {label} MAVLink 세션을 새 설정으로 재시작합니다.")
+                self._log(f"[픽스호크] {label} MAVLink URL 후보 적용으로 기존 {label} MAVLink 세션을 해제합니다. 다시 연결하세요.")
                 self.disconnect_mavlink_pixhawk(side)
-                self.connect_mavlink_pixhawk(side)
-            else:
-                self.pixhawk_connection_label.setText(f"{label} USB 후보 적용됨: {label} MAVLink 연결을 누르세요.")
+            self.pixhawk_connection_label.setText(f"{label} MAVLink URL 후보 적용됨: {label} MAVLink 연결을 누르세요.")
         elif kind == "ROS2":
             if ros2_was_active:
                 self._log("[픽스호크] ROS2 후보 적용으로 ROS2 세션을 새 namespace로 재시작합니다.")
@@ -6863,6 +8264,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._update_distance_settings_visibility()
         self._refresh_camera_parameters_tab()
 
+    def _handle_gps_baseline_toggle_changed(self, _checked: bool) -> None:
+        self._refresh_rtk_baseline()
+        self._refresh_camera_parameters_tab()
+        self._refresh_distance()
+
     def _handle_measurement_display_mode_changed(self, _index: int) -> None:
         if self._measurement_display_mode() == "preview":
             self._clear_measurement_pair_display()
@@ -6886,18 +8292,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for widget in (self.distance_mode_label, self.distance_mode_combo):
             widget.setVisible(True)
         for widget in (self.baseline_label, self.baseline_spin):
-            widget.setVisible(True)
-        pixhawk_visible = True
-        if hasattr(self, "attitude_sync_group"):
-            self.attitude_sync_group.setVisible(pixhawk_visible)
-        for widget in (
-            self.pixhawk_attitude_age_label,
-            self.max_attitude_age_spin,
-            self.pixhawk_attitude_pair_dt_label,
-            self.max_attitude_pair_dt_spin,
-            self.require_attitude_checkbox,
-        ):
-            widget.setVisible(pixhawk_visible)
+            widget.setVisible(False)
 
         source_text = "수동 fallback" if manual_intrinsics else "체커보드 보정값"
         if self.active_intrinsics is not None:
@@ -6966,12 +8361,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return f"spinbox fallback ({self.focal_spin.value():.6f} px)"
 
     def _baseline_source_label(self, baseline_source: str, baseline_m: float) -> str:
-        if baseline_source == "manual":
-            return f"manual baseline spinbox ({baseline_m:.6f} m)"
-        if baseline_source == "rtk-unavailable":
-            return f"manual baseline fallback (RTK unavailable, {baseline_m:.6f} m)"
-        if baseline_source == "rtk-blocked":
-            return f"manual baseline fallback (RTK fixed required, {baseline_m:.6f} m)"
+        if baseline_source == "gps-rtk-disabled":
+            return "GPS/RTK baseline disabled"
+        if baseline_source == "gps-rtk-waiting":
+            return "waiting for live GPS/RTK baseline"
+        if baseline_source == "gps-rtk":
+            return f"live GPS/RTK baseline ({baseline_m:.6f} m)"
+        if baseline_source == "gps-rtk-blocked":
+            return "live GPS/RTK baseline blocked"
         if baseline_source.startswith("RTK"):
             return f"{baseline_source} from Pixhawk/GPS"
         return baseline_source
@@ -6997,7 +8394,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return "preview" if mode == "preview" else "detection"
 
     def _distance_mode_label(self) -> str:
-        return "Pixhawk 자세 + RTK 위치"
+        return "Pixhawk 자세 + GPS/RTK baseline"
 
     def _triangulation_extrinsics_source(self) -> str:
         return "pixhawk"
@@ -7010,11 +8407,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if left_ext is None or right_ext is None:
             return "3D ray fallback: Pixhawk 자세 대기 중"
         if self._translation_right_in_left_m() is None:
-            return "3D ray fallback: RTK 위치 대기 중"
-        return "3D ray 거리: Pixhawk 자세 + RTK 위치 사용"
+            return "3D ray fallback: GPS/RTK baseline 대기 중"
+        return "3D ray 거리: Pixhawk 자세 + GPS/RTK baseline 사용"
 
     def _triangulation_extrinsics_source_label(self) -> str:
-        return "Pixhawk 자세 + RTK 위치"
+        return "Pixhawk 자세 + GPS/RTK baseline"
 
     def _distance_parameters_summary(self) -> str:
         path = self._measurement_path_label()
@@ -7299,8 +8696,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             intrinsics_state = "latest loaded/calculated, not applied"
         else:
             intrinsics_state = "not loaded"
-        baseline_source = "manual"
-        baseline_m = self.baseline_spin.value()
+        baseline_source = "gps-rtk-waiting"
+        baseline_m = 0.0
         warnings: tuple[str, ...] = ()
         if hasattr(self, "use_rtk_baseline_checkbox"):
             baseline_m, baseline_source, warnings = self._active_baseline_m()
@@ -7328,7 +8725,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"body_frame: {BODY_FRAME}\n"
             f"camera_frame: {CAMERA_FRAME}\n"
             f"camera_mount_profile: {CAMERA_MOUNT_PROFILE}\n"
-            "mount_assumption_model: nominal-shared-rig-v1\n"
+            "mount_assumption_model: gps-rtk-baseline-only-v1\n"
             f"mount_assumption_status: {self._mount_assumption_status_label()}\n"
             f"manual_focal_reference: {self.focal_spin.value():.6f} px\n"
             f"focal_source: {self._focal_source_label()}\n"
@@ -7337,16 +8734,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"baseline_source_detail: {self._baseline_source_label(baseline_source, baseline_m)}\n"
             f"parameter_summary: {self._distance_parameters_summary()}\n"
             f"baseline_warnings: {warning_text}\n\n"
-            f"manual_baseline: {self.baseline_spin.value():.6f} m\n"
             f"rtk_baseline: {rtk_text}\n"
             f"translation_right_in_left: {translation_text}\n"
             f"{self._format_mount_assumption_summary()}\n\n"
             f"{self._bbox_center_adjustment_summary()}\n\n"
             f"{self._format_uam_telemetry_summary()}\n\n"
             f"max_detection_dt: {self.max_dt_spin.value():.6f} s\n"
-            f"max_vertical_delta: {self.max_dy_spin.value():.3f} px\n"
+            "max_vertical_delta: disabled\n"
             f"same_class_required: {self.same_class_checkbox.isChecked()}\n"
-            f"attitude_gate: {self.require_attitude_checkbox.isChecked()}"
+            "attitude_gate: false"
         )
 
     def _refresh_camera_parameters_tab(self) -> None:
@@ -7690,6 +9086,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.stop_yolo_streams()
         self.disconnect_pixhawk()
         self.disconnect_mavlink_pixhawk()
+        self._stop_calibration_preview_worker()
+        for attr in (
+            "camera_auto_detect_thread",
+            "pixhawk_auto_detect_thread",
+            "rtsp_check_thread",
+            "rtsp_enable_thread",
+        ):
+            thread = getattr(self, attr, None)
+            if thread is None:
+                continue
+            thread.quit()
+            thread.wait(1000)
+            setattr(self, attr, None)
 
     def _distance_history_key(self, point: DistanceHistoryPoint) -> tuple[float, float, str]:
         return point.sample_key or (point.timestamp_s, point.distance_m, point.method)
@@ -8304,6 +9713,64 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connection_label.setText(f"camera host IP: found {resolved_text}")
         self._refresh_operation_header()
 
+    def discover_pc_pixhawk_ip(self) -> None:
+        interfaces = local_ipv4_interfaces(include_wireless=True)
+        if not interfaces:
+            self._log("[픽스호크] PC IP 탐색: 활성 IPv4 인터페이스를 찾지 못했습니다.")
+            self.pixhawk_connection_label.setText("pixhawk host IP: not found")
+            self._refresh_operation_header()
+            return
+        self._append_pixhawk_host_ip_candidates(interfaces)
+        self.pixhawk_connection_label.setText("pixhawk host IP: 후보 표시됨 - 표에서 PC_IP를 선택해 적용하세요")
+        self._refresh_operation_header()
+
+    def _append_pixhawk_host_ip_candidates(self, interfaces: Sequence[object]) -> None:
+        hints: list[IPv4Address] = []
+        for text in (
+            self.left_pixhawk_eth_ip_edit.text().strip(),
+            self.right_pixhawk_eth_ip_edit.text().strip(),
+            *self._active_mavlink_remote_hosts(),
+        ):
+            if not text:
+                continue
+            try:
+                hints.append(IPv4Address(str(text).split("/", 1)[0]))
+            except ValueError:
+                continue
+        rows: list[dict[str, object]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in interfaces:
+            ip_text = str(candidate.address.ip)
+            interface_name = str(getattr(candidate, "name", ""))
+            key = (interface_name, ip_text)
+            if key in seen:
+                continue
+            seen.add(key)
+            matching_hints = [str(hint) for hint in hints if hint in candidate.address.network]
+            status_parts = [str(candidate.address.network)]
+            if matching_hints:
+                status_parts.append("Pixhawk subnet match: " + ", ".join(matching_hints))
+            if interface_name.startswith(("wl", "wlan")):
+                status_parts.append("Wi-Fi")
+            else:
+                status_parts.append("wired/other")
+            rows.append(
+                {
+                    "kind": "PC_IP",
+                    "value": ip_text,
+                    "baud": "",
+                    "status": " | ".join(status_parts),
+                    "interface": interface_name,
+                }
+            )
+        if rows:
+            self._append_pixhawk_candidate_rows(rows)
+            for row in rows:
+                self._log(
+                    f"[픽스호크] PC IP 후보: {row['interface']} {row['value']} "
+                    f"({row['status']})"
+                )
+
     def apply_pc_camera_ip(self) -> None:
         interface_name = self.interface_edit.text().strip()
         address_text = self.host_address_edit.text().strip()
@@ -8774,59 +10241,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             message += " [기록 샘플은 찾지 못함]"
         self._log(message)
 
-
-    def auto_detect_usb_pixhawks(self) -> None:
-        self.auto_detect_usb_pixhawk_button.setEnabled(False)
-        self._log("[픽스호크] USB Pixhawk 자동 탐지를 시작합니다...")
-        try:
-            found = probe_usb_mavlink_devices(timeout_s=0.8)
-        except Exception as exc:
-            self._log(f"[픽스호크] USB Pixhawk 자동 탐지 실패: {exc}")
-            self.auto_detect_usb_pixhawk_button.setEnabled(True)
-            return
-        self.auto_detect_usb_pixhawk_button.setEnabled(True)
-        if not found:
-            self._log("[픽스호크] USB Pixhawk를 찾지 못했습니다. USB 연결, QGC 점유, dialout 권한을 확인하세요.")
-            return
-        self._append_pixhawk_candidate_rows(
-            [
-                {
-                    "kind": "USB",
-                    "value": device,
-                    "baud": int(baud),
-                    "status": "MAVLink probe",
-                }
-                for device, baud in found
-            ]
-        )
-        if len(found) == 1:
-            target = str(self.usb_setup_target_combo.currentData() or "left")
-            device, baud = found[0]
-            if target == "left":
-                self.left_mavlink_url_edit.setText(device)
-                self.left_mavlink_baud_spin.setValue(int(baud))
-                self.right_mavlink_url_edit.clear()
-                self._log(f"[픽스호크] Left Pixhawk USB 설정: {device} @ {baud}; Right는 이번 설정에서 비활성화했습니다.")
-            else:
-                self.right_mavlink_url_edit.setText(device)
-                self.right_mavlink_baud_spin.setValue(int(baud))
-                self.left_mavlink_url_edit.clear()
-                self._log(f"[픽스호크] Right Pixhawk USB 설정: {device} @ {baud}; Left는 이번 설정에서 비활성화했습니다.")
-            return
-        targets = (
-            ("Pixhawk 1", self.left_mavlink_url_edit, self.left_mavlink_baud_spin),
-            ("Pixhawk 2", self.right_mavlink_url_edit, self.right_mavlink_baud_spin),
-        )
-        for (device, baud), (label, url_edit, baud_spin) in zip(found, targets):
-            url_edit.setText(device)
-            baud_spin.setValue(int(baud))
-            self._log(f"[픽스호크] {label} USB 자동 설정: {device} @ {baud}")
-        if len(found) > len(targets):
-            extra = ", ".join(device for device, _baud in found[len(targets):])
-            self._log(f"[픽스호크] 추가 USB Pixhawk 후보는 사용하지 않았습니다: {extra}")
-
-
-
     def discover_custom_topic_watch(self) -> None:
         self._log("[픽스호크] ROS2 topic 탐색을 시작합니다...")
         topics = discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.5)
@@ -8917,6 +10331,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.pixhawk.add_custom_watch(spec)
         if source == "mavlink" and self.mavlink_pixhawk is not None:
             self.mavlink_pixhawk.add_custom_watch(spec)
+        if source == "uam_mavlink" and self.uam_mavlink_pixhawk is not None:
+            self.uam_mavlink_pixhawk.add_custom_watch(spec)
 
     def remove_custom_topic_watch(self, key: str) -> None:
         removed_specs = [spec for spec in self.custom_watch_specs if str(spec.get("key", "")) == key]
@@ -8934,6 +10350,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.pixhawk.remove_custom_watch(key)
         if self.mavlink_pixhawk is not None:
             self.mavlink_pixhawk.remove_custom_watch(key)
+        if self.uam_mavlink_pixhawk is not None:
+            self.uam_mavlink_pixhawk.remove_custom_watch(key)
         self._log(f"[픽스호크] Custom watch 제거: {key}")
 
     def remove_selected_custom_topic_watch(self) -> None:
@@ -9034,6 +10452,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def disconnect_uam_telemetry_from_ui(self) -> None:
         self._remove_uam_axis_watches()
+        if self.uam_mavlink_pixhawk is not None:
+            self.uam_mavlink_pixhawk.stop()
+            self.uam_mavlink_pixhawk = None
         self.uam_status_label.setText(
             f"UAM telemetry: 해제됨, 실시간 buffer={len(self.uam_live_telemetry_samples)}개 유지"
         )
@@ -9050,6 +10471,48 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._last_uam_live_sample_signature = None
         self._log("[UAM] ground truth 텔레메트리 watch를 해제했습니다. Pixhawk ROS2/MAVLink 링크는 유지합니다.")
         self._refresh_camera_parameters_tab()
+
+    def _ensure_uam_mavlink_subscriber(self) -> DualPixhawkMavlinkSubscriber:
+        url = self.uam_mavlink_url_edit.text().strip()
+        baud = self.uam_mavlink_baud_spin.value()
+        if not url:
+            raise RuntimeError("UAM USB MAVLink 포트가 비어 있습니다.")
+        if self.uam_mavlink_pixhawk is None:
+            self.uam_mavlink_pixhawk = DualPixhawkMavlinkSubscriber(
+                left_url=url,
+                right_url="",
+                left_baud=baud,
+                right_baud=baud,
+                custom_watches=tuple(self.custom_watch_specs),
+            )
+            self.uam_mavlink_pixhawk.gps_changed.connect(self._update_uam_live_telemetry_from_gps)
+            self.uam_mavlink_pixhawk.custom_watch_changed.connect(self._update_custom_watch)
+            self.uam_mavlink_pixhawk.status_changed.connect(
+                lambda text: self._log(f"[UAM] USB MAVLink {text}")
+            )
+        else:
+            if hasattr(self.uam_mavlink_pixhawk, "urls"):
+                self.uam_mavlink_pixhawk.urls["left"] = url
+                self.uam_mavlink_pixhawk.urls["right"] = ""
+            if hasattr(self.uam_mavlink_pixhawk, "baudrates"):
+                self.uam_mavlink_pixhawk.baudrates["left"] = baud
+                self.uam_mavlink_pixhawk.baudrates["right"] = baud
+        return self.uam_mavlink_pixhawk
+
+    def connect_uam_mavlink_usb(self) -> bool:
+        try:
+            subscriber = self._ensure_uam_mavlink_subscriber()
+            subscriber.start("left")
+        except Exception as exc:
+            if self.uam_mavlink_pixhawk is not None:
+                try:
+                    self.uam_mavlink_pixhawk.stop()
+                except Exception:
+                    pass
+                self.uam_mavlink_pixhawk = None
+            self._log(f"[UAM] USB MAVLink 연결 실패: {exc}")
+            return False
+        return bool(getattr(subscriber, "connections", {}).get("left"))
 
     def connect_uam_telemetry_from_ui(self) -> None:
         source = str(self.uam_source_combo.currentData() or "ros2")
@@ -9079,16 +10542,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[UAM] ROS2 ground truth 텔레메트리 watch 등록: {topic} {fields} ({state})")
             self._save_current_settings()
             return
-        side = str(self.uam_mavlink_side_combo.currentData() or "left")
         if source in {"mavlink_gps", "mavlink_global"}:
-            self.connect_mavlink_pixhawk(side)
-            connected = side in self._mavlink_connected_sides()
+            connected = self.connect_uam_mavlink_usb()
             label = "GPS Position" if source == "mavlink_gps" else "Global Position"
             state = "MAVLink 연결됨" if connected else "MAVLink 연결 대기/실패"
             self.uam_status_label.setText(
-                f"UAM telemetry: MAVLink {label} 수신 후 lat/lon/alt -> local NED 변환 - {state}"
+                f"UAM telemetry: USB MAVLink {label} 수신 후 lat/lon/alt -> local NED 변환 - {state}"
             )
-            self._log(f"[UAM] MAVLink {label} ground truth 변환 대기: {side} ({state})")
+            self._log(f"[UAM] USB MAVLink {label} ground truth 변환 대기 ({state})")
             self._save_current_settings()
             return
         message = self.uam_mavlink_message_edit.text().strip().upper()
@@ -9105,17 +10566,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 key=f"uam_{axis}",
                 topic=message,
                 field=field,
-                source="mavlink",
+                source="uam_mavlink",
                 message=message,
             )
-        self.connect_mavlink_pixhawk(side)
-        connected = side in self._mavlink_connected_sides()
+        connected = self.connect_uam_mavlink_usb()
         state = "MAVLink 연결됨" if connected else "MAVLink 연결 대기/실패"
         self.uam_status_label.setText(
-            f"UAM telemetry: MAVLink watch 등록 {side}:{message} "
+            f"UAM telemetry: USB MAVLink watch 등록 {message} "
             f"({fields['x']}, {fields['y']}, {fields['z']}) - {state}"
         )
-        self._log(f"[UAM] MAVLink ground truth 텔레메트리 watch 등록: {side} {message} {fields} ({state})")
+        self._log(f"[UAM] USB MAVLink ground truth 텔레메트리 watch 등록: {message} {fields} ({state})")
         self._save_current_settings()
 
     def clear_uam_live_telemetry(self) -> None:
@@ -9184,6 +10644,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._refresh_session_toggle_buttons()
             self.pixhawk_connection_label.setText("픽스호크 ROS2: 세션 시작, 데이터 대기 중")
             self._log("[픽스호크] ROS2 세션을 시작했습니다. 데이터 수신을 기다립니다.")
+            QtCore.QTimer.singleShot(2000, self._verify_ros2_pixhawk_publishers)
             self.refresh_px4_mag_manager()
             self._refresh_operation_header()
             return True
@@ -9205,6 +10666,83 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             self._log(f"[픽스호크] MicroXRCEAgent가 이미 실행 중입니다: {message}")
 
+    def _verify_ros2_pixhawk_publishers(self) -> None:
+        if self.pixhawk is None:
+            return
+        domain_id = int(self.domain_spin.value())
+        checks = []
+        for side, namespace in (
+            ("left", self.left_namespace_edit.text().strip().strip("/")),
+            ("right", self.right_namespace_edit.text().strip().strip("/")),
+        ):
+            topic = f"/{namespace}/fmu/out/vehicle_attitude" if namespace else "/fmu/out/vehicle_attitude"
+            ok = _ros2_topic_has_publisher(domain_id, topic, timeout_s=0.8)
+            checks.append((side, topic, ok))
+            sensor_checks = {
+                "vehicle_gps_position": (
+                    f"/{namespace}/fmu/out/vehicle_gps_position" if namespace else "/fmu/out/vehicle_gps_position"
+                ),
+                "sensor_gps": f"/{namespace}/fmu/out/sensor_gps" if namespace else "/fmu/out/sensor_gps",
+                "sensor_mag": f"/{namespace}/fmu/out/sensor_mag" if namespace else "/fmu/out/sensor_mag",
+                "vehicle_magnetometer": (
+                    f"/{namespace}/fmu/out/vehicle_magnetometer" if namespace else "/fmu/out/vehicle_magnetometer"
+                ),
+            }
+            self.ros2_sensor_topic_publishers[side] = {
+                key: _ros2_topic_has_publisher(domain_id, sensor_topic, timeout_s=0.2)
+                for key, sensor_topic in sensor_checks.items()
+            }
+        self._refresh_ros2_only_alignment_availability()
+        if any(ok for _side, _topic, ok in checks):
+            ok_topics = ", ".join(topic for _side, topic, ok in checks if ok)
+            self.pixhawk_connection_label.setText(f"픽스호크 ROS2: publisher 확인됨 ({ok_topics})")
+            self._log(f"[픽스호크] ROS2 publisher 확인: {ok_topics}")
+            missing = []
+            for side, topics in self.ros2_sensor_topic_publishers.items():
+                for key in ("sensor_gps", "sensor_mag", "vehicle_magnetometer"):
+                    if not topics.get(key, False):
+                        missing.append(f"{self._px4_mag_camera_label(side)} {key}")
+            if missing:
+                self._log("[픽스호크] ROS2 only 센서 미게시: " + ", ".join(missing))
+            return
+        topics = ", ".join(topic for _side, topic, _ok in checks)
+        self.pixhawk_connection_label.setText("픽스호크 ROS2: topic 이름만 있음, PX4 publisher 없음")
+        self._log(
+            "[픽스호크] ROS2 publisher 없음: topic 이름은 앱 subscription 때문에 보일 수 있습니다. "
+            f"확인 topic={topics}. MicroXRCEAgent, Pixhawk Host IP, PX4 uXRCE client 재부팅/재시작을 확인하세요."
+        )
+
+    def _refresh_ros2_only_alignment_availability(self) -> None:
+        self._refresh_baseline_gps_cards()
+        self._refresh_alignment_magnetometer_ui()
+        self._refresh_alignment_overview()
+        self._refresh_pixhawk_sensor_health()
+        for side in ("left", "right"):
+            gps2_label = self.f9p_slot_labels.get(side, {}).get("GPS2") if hasattr(self, "f9p_slot_labels") else None
+            if gps2_label is not None and "GPS2" not in self.latest_gps_sensors.get(side, {}) and self._ros2_only_unavailable(side, "GPS2"):
+                self._set_health_label(gps2_label, "ROS2 sensor_gps 미게시", "warn")
+            for slot in ("CAN1", "CAN2"):
+                mag_label = self.rm3100_slot_labels.get(side, {}).get(slot) if hasattr(self, "rm3100_slot_labels") else None
+                if mag_label is not None and slot not in self.latest_mag_sensors.get(side, {}) and self._ros2_only_unavailable(side, slot):
+                    self._set_health_label(mag_label, "ROS2 sensor_mag/vehicle_magnetometer 미게시", "warn")
+
+    def _ros2_topic_available(self, side: str, key: str) -> bool:
+        return bool(self.ros2_sensor_topic_publishers.get(side, {}).get(key, False))
+
+    def _ros2_only_unavailable(self, side: str, kind: str) -> bool:
+        if self.pixhawk is None:
+            return False
+        if self.mavlink_pixhawk is not None and side in self._mavlink_connected_sides():
+            return False
+        if kind == "GPS2":
+            return not self._ros2_topic_available(side, "sensor_gps")
+        if kind in {"CAN1", "CAN2", "MAG"}:
+            return not (
+                self._ros2_topic_available(side, "sensor_mag")
+                or self._ros2_topic_available(side, "vehicle_magnetometer")
+            )
+        return False
+
     def _mavlink_connected_sides(self) -> set[str]:
         if self.mavlink_pixhawk is None:
             return set()
@@ -9216,10 +10754,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _refresh_mavlink_side_actions(self) -> None:
         connected_sides = self._mavlink_connected_sides()
+        self.left_uxrce_param_button.setEnabled("left" in connected_sides)
+        self.right_uxrce_param_button.setEnabled("right" in connected_sides)
         self.left_px4_shell_button.setEnabled("left" in connected_sides)
         self.right_px4_shell_button.setEnabled("right" in connected_sides)
         self.left_persist_eth_button.setEnabled("left" in connected_sides)
         self.right_persist_eth_button.setEnabled("right" in connected_sides)
+        self.left_reboot_pixhawk_button.setEnabled("left" in connected_sides)
+        self.right_reboot_pixhawk_button.setEnabled("right" in connected_sides)
 
     def disconnect_pixhawk(self) -> None:
         if self.pixhawk is not None:
@@ -9275,13 +10817,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _handle_mavlink_status_changed(self, text: str) -> None:
         self._log(f"[픽스호크] {text}")
-        if not self._ros2_retry_after_mavlink_setup:
-            return
-        if "ROS2 client 실행 명령 전송" not in text:
-            return
-        self._ros2_retry_after_mavlink_setup = False
-        self._log("[픽스호크] MAVLink로 ROS2 client 설정을 전송했습니다. 잠시 후 ROS2 연결을 재시도합니다.")
-        QtCore.QTimer.singleShot(2500, self._retry_ros2_after_mavlink_recovery)
 
     def _retry_ros2_after_mavlink_recovery(self) -> None:
         if self.pixhawk is not None:
@@ -9291,6 +10826,50 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log("[픽스호크] MAVLink 복구 설정 이후 ROS2 세션이 시작되었습니다.")
         else:
             self._log("[픽스호크] ROS2 재시도 실패. MAVLink telemetry fallback을 유지합니다.")
+
+    def _start_mavlink_sensor_auxiliary_if_needed(self) -> None:
+        if self.pixhawk is None:
+            return
+        configured_sides = self._configured_mavlink_sides()
+        if not configured_sides:
+            self._log("[픽스호크] GPS2/RM3100 보조 수신용 MAVLink URL이 없어 ROS2 sensor topic만 사용합니다.")
+            return
+        missing_sides = [
+            side
+            for side in configured_sides
+            if (
+                "GPS2" not in self.latest_gps_sensors.get(side, {})
+                or "CAN1" not in self.latest_mag_sensors.get(side, {})
+                or "CAN2" not in self.latest_mag_sensors.get(side, {})
+            )
+        ]
+        if not missing_sides:
+            return
+        subscriber = self._ensure_mavlink_subscriber()
+        started: list[str] = []
+        for side in missing_sides:
+            if side in self._mavlink_connected_sides():
+                continue
+            try:
+                subscriber.start(side)
+            except Exception as exc:
+                self._log(f"[픽스호크] {self._px4_mag_camera_label(side)} GPS2/RM3100 MAVLink 보조 수신 시작 실패: {exc}")
+                continue
+            started.append(side)
+        if not started:
+            return
+        self._refresh_session_toggle_buttons()
+        self._refresh_mavlink_side_actions()
+        labels = ", ".join(self._px4_mag_camera_label(side) for side in started)
+        self._log(
+            f"[픽스호크] {labels} GPS2/RM3100 보조 수신을 MAVLink로 시작했습니다. "
+            "ROS2 자세/위치 세션은 유지하고 GPS_RAW_INT/GPS2_RAW/SCALED_IMU*만 보조로 수신합니다."
+        )
+        self.pixhawk_connection_label.setText(f"픽스호크 ROS2 + MAVLink 센서 보조: {labels} 데이터 대기 중")
+        self._refresh_operation_header()
+
+    def _start_mavlink_gps2_auxiliary_if_needed(self) -> None:
+        self._start_mavlink_sensor_auxiliary_if_needed()
 
     def _configured_mavlink_sides(self) -> tuple[str, ...]:
         sides = []
@@ -9309,8 +10888,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         setup_sides = self._mavlink_setup_target_sides(target_sides)
         if not setup_sides:
             return
-        host_ip = self._pixhawk_host_ip_for_uxrce()
-        if self.mavlink_configure_streams_checkbox.isChecked():
+        host_ip = self._validated_pixhawk_host_ip_for_manual_uxrce(sorted(setup_sides)[0])
+        if self.mavlink_configure_streams_checkbox.isChecked() and not self.mavlink_configure_uxrce_agent_checkbox.isChecked():
             subscriber.configure_mavlink_streams(
                 host_ip=host_ip,
                 ports={
@@ -9321,23 +10900,32 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 rate=self.mavlink_stream_rate_spin.value(),
                 cameras=setup_sides,
             )
-        if self.mavlink_start_ros2_checkbox.isChecked():
-            subscriber.start_ros2_client(
-                host_ip=host_ip,
-                port=self.uxrce_port_spin.value(),
-                namespaces={
-                    "left": self.left_namespace_edit.text().strip(),
-                    "right": self.right_namespace_edit.text().strip(),
-                },
-                cameras=setup_sides,
+        elif self.mavlink_configure_streams_checkbox.isChecked():
+            self._log(
+                "[픽스호크] Ethernet uXRCE 설정 중이므로 PX4 Ethernet MAVLink stream 시작은 건너뜁니다. "
+                "USB MAVLink telemetry와 MAV_CMD_SET_MESSAGE_INTERVAL fallback을 사용합니다."
             )
+        if self.mavlink_configure_uxrce_agent_checkbox.isChecked():
+            configured_sides = [
+                side
+                for side in sorted(setup_sides)
+                if self._apply_uxrce_params_for_side(subscriber, side, host_ip=host_ip, emit_success=False)
+            ]
+            if configured_sides and self._ros2_retry_after_uxrce_agent_setup:
+                self._ros2_retry_after_uxrce_agent_setup = False
+                labels = ", ".join(self._px4_mag_camera_label(side) for side in configured_sides)
+                self._log(
+                    f"[픽스호크] MAVLink로 {labels} uXRCE 파라미터를 확인했습니다. "
+                    "PX4 재부팅/클라이언트 재시작 후 ROS2 연결을 재시도합니다."
+                )
+                QtCore.QTimer.singleShot(2500, self._retry_ros2_after_mavlink_recovery)
 
     def _start_mavlink_recovery_after_ros2_failure(self, error: Exception) -> None:
         if not self._configured_mavlink_sides():
             self._log("[픽스호크] ROS2 복구용 MAVLink URL이 없어 MAVLink fallback을 시작하지 못했습니다.")
             return
-        self._ros2_retry_after_mavlink_setup = self.mavlink_start_ros2_checkbox.isChecked()
-        if self._ros2_retry_after_mavlink_setup:
+        self._ros2_retry_after_uxrce_agent_setup = self.mavlink_configure_uxrce_agent_checkbox.isChecked()
+        if self._ros2_retry_after_uxrce_agent_setup:
             self._log(
                 "[픽스호크] ROS2 실패 후 MAVLink 복구를 시작합니다. "
                 "PX4에 MAVLink stream/uXRCE-DDS client 설정을 전송합니다."
@@ -9345,14 +10933,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             self._log(
                 "[픽스호크] ROS2 실패 후 MAVLink telemetry fallback을 시작합니다. "
-                "ROS2 client 시작 옵션이 꺼져 있어 ROS2 자동 재시도는 건너뜁니다."
+                "PX4 uXRCE Agent 설정 옵션이 꺼져 있어 ROS2 자동 재시도는 건너뜁니다."
             )
         try:
             self.connect_mavlink_pixhawk(force_setup=True)
             if not self._mavlink_connected_sides():
-                self._ros2_retry_after_mavlink_setup = False
+                self._ros2_retry_after_uxrce_agent_setup = False
         except Exception as fallback_exc:
-            self._ros2_retry_after_mavlink_setup = False
+            self._ros2_retry_after_uxrce_agent_setup = False
             self._log(f"[픽스호크] MAVLink 복구/fallback 시작 실패: {fallback_exc} (원래 ROS2 오류: {error})")
 
     def connect_mavlink_pixhawk(self, camera: str | None = None, *, force_setup: bool = False) -> None:
@@ -9364,12 +10952,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         try:
             subscriber = self._ensure_mavlink_subscriber()
             subscriber.start(camera)
-            self._apply_mavlink_pixhawk_setup(subscriber, target_sides)
+            if force_setup:
+                self._apply_mavlink_pixhawk_setup(subscriber, target_sides)
+            elif self.mavlink_configure_streams_checkbox.isChecked() or self.mavlink_configure_uxrce_agent_checkbox.isChecked():
+                self._log(
+                    "[픽스호크] 일반 MAVLink 연결에서는 UI 응답성을 위해 stream/uXRCE 설정을 자동 실행하지 않습니다. "
+                    "필요하면 P1/P2 uXRCE 설정 버튼 또는 ROS2 복구 경로를 사용하세요."
+                )
             self._refresh_session_toggle_buttons()
             self._refresh_mavlink_side_actions()
             label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
             self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
             self._log(f"[픽스호크] {label} MAVLink 세션을 시작했습니다. 데이터 수신을 기다립니다.")
+            self._request_mavlink_eth0_status(target_sides)
             self.refresh_px4_mag_manager()
             self._refresh_operation_header()
         except Exception as exc:
@@ -9409,6 +11004,71 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
 
 
+    def apply_uxrce_params_from_mavlink(self, camera: str) -> None:
+        if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 실패: MAVLink 연결이 없습니다.")
+            return
+        try:
+            host_ip = self._validated_pixhawk_host_ip_for_manual_uxrce(camera)
+            ok = self._apply_uxrce_params_for_side(self.mavlink_pixhawk, camera, host_ip=host_ip, emit_success=True)
+        except Exception as exc:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 실패: {exc}")
+            return
+        if ok:
+            self.pixhawk_connection_label.setText(
+                f"{camera_label_ko(camera)} uXRCE 설정 확인 완료: PX4 재부팅/클라이언트 재시작 후 ROS2 연결"
+            )
+
+    def _apply_uxrce_params_for_side(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        camera: str,
+        *,
+        host_ip: str,
+        emit_success: bool,
+    ) -> bool:
+        if camera not in subscriber.connections:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 건너뜀: MAVLink 연결 없음")
+            return False
+        dds_key = 1 if camera == "left" else 2
+        params = {
+            "MAV_2_CONFIG": 0,
+            "UXRCE_DDS_CFG": 1000,
+            "UXRCE_DDS_KEY": dds_key,
+            "UXRCE_DDS_DOM_ID": int(self.domain_spin.value()),
+            "UXRCE_DDS_AG_IP": int(IPv4Address(host_ip)),
+            "UXRCE_DDS_PRT": int(self.uxrce_port_spin.value()),
+            "UXRCE_DDS_PTCFG": 0,
+            "UXRCE_DDS_SYNCC": 0,
+            "UXRCE_DDS_SYNCT": 1,
+        }
+        mismatches: list[str] = []
+        for name, expected in params.items():
+            actual = subscriber.set_param_int(camera, name, expected)
+            if actual != expected:
+                mismatches.append(f"{name}: expected={expected}, actual={actual}")
+        if mismatches:
+            self._log(
+                f"[픽스호크] {camera_label_ko(camera)} uXRCE 파라미터 readback 불일치: "
+                + "; ".join(mismatches)
+            )
+            return False
+        namespace = (self.left_namespace_edit if camera == "left" else self.right_namespace_edit).text().strip()
+        message = (
+            f"{camera_label_ko(camera)} uXRCE 파라미터 확인: "
+            f"agent={host_ip}:{self.uxrce_port_spin.value()}, domain={self.domain_spin.value()}, "
+            f"key={dds_key}, namespace={namespace or '<default>'}. "
+            "Shell이 아닌 MAVLink PARAM_SET/readback 경로입니다. "
+            "Ethernet uXRCE 충돌 방지를 위해 MAV_2_CONFIG=0도 확인합니다."
+        )
+        self._log(f"[픽스호크] {message}")
+        if emit_success:
+            self._log(
+                f"[픽스호크] {camera_label_ko(camera)} ROS2 topic이 계속 없으면 PX4 재부팅 또는 "
+                "uxrce_dds_client 재시작이 필요합니다."
+            )
+        return True
+
     def apply_persistent_pixhawk_eth(self, camera: str) -> None:
         if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
             self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: MAVLink 연결이 없습니다.")
@@ -9417,25 +11077,97 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             command = self._persistent_pixhawk_eth_command(camera)
             self.mavlink_pixhawk.send_shell_command(camera, command)
         except Exception as exc:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: {exc}")
+            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell 즉시 적용 명령 실패: {exc}")
+        else:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell 즉시 적용 명령을 전송했습니다.")
+        try:
+            extras_text = self._persistent_pixhawk_extras_text(camera)
+            self.mavlink_pixhawk.write_remote_file_mavftp(camera, "/fs/microsd/etc/extras.txt", extras_text)
+            net_cfg_text = self._persistent_pixhawk_net_cfg_text(camera)
+            self.mavlink_pixhawk.write_remote_file_mavftp(camera, "/fs/microsd/net.cfg", net_cfg_text)
+        except Exception as exc:
+            self._log(
+                f"[픽스호크] {camera_label_ko(camera)} ETH MAVLink FTP 영구 저장 실패: {exc}. "
+                "PX4 shell과 MAVLink FTP가 모두 막히면 앱만으로 eth0 영구 설정을 저장할 수 없습니다."
+            )
             return
-        self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 설정 적용/영구 저장 명령을 전송했습니다.")
+        self._log(
+            f"[픽스호크] {camera_label_ko(camera)} ETH MAVLink FTP 영구 저장 완료: "
+            "/fs/microsd/net.cfg, /fs/microsd/etc/extras.txt. PX4 재부팅 후 ping으로 eth0 적용을 확인하세요."
+        )
+
+    def reboot_pixhawk_from_mavlink(self, camera: str) -> None:
+        if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} 재부팅 실패: MAVLink 연결이 없습니다.")
+            return
+        result = QtWidgets.QMessageBox.question(
+            self,
+            f"{camera_label_ko(camera)} PX4 재부팅",
+            f"{camera_label_ko(camera)} Pixhawk에 MAVLink 재부팅 명령을 보냅니다.\n계속할까요?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 취소했습니다.")
+            return
+        try:
+            self.mavlink_pixhawk.reboot_autopilot(camera)
+        except Exception as exc:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령 실패: {exc}")
+            return
+        self._log(
+            f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 전송했습니다. "
+            "연결이 끊긴 뒤 부팅 완료 후 다시 MAVLink/ROS2를 연결하세요."
+        )
 
     def _persistent_pixhawk_eth_command(self, camera: str) -> str:
+        setup = self._persistent_pixhawk_eth_setup(camera)
+        extras = "/fs/microsd/etc/extras.txt"
+        extras_lines = setup["extras_lines"]
+        return "\n".join(
+            (
+                "mkdir /fs/microsd/etc",
+                setup["ifup_cmd"],
+                setup["ifconfig_cmd"],
+                *setup["param_lines"],
+                "param save",
+                setup["uxrce_stop_cmd"],
+                setup["uxrce_start_cmd"],
+                "uxrce_dds_client status",
+                f"echo '{extras_lines[0]}' > {extras}",
+                *(f"echo '{line}' >> {extras}" for line in extras_lines[1:]),
+                f"cat {extras}",
+            )
+        )
+
+    def _persistent_pixhawk_extras_text(self, camera: str) -> str:
+        setup = self._persistent_pixhawk_eth_setup(camera)
+        return "\n".join(setup["extras_lines"]) + "\n"
+
+    def _persistent_pixhawk_net_cfg_text(self, camera: str) -> str:
+        setup = self._persistent_pixhawk_eth_setup(camera)
+        return "\n".join(
+            (
+                "DEVICE=eth0",
+                "BOOTPROTO=static",
+                "NETMASK=255.255.255.0",
+                f"IPADDR={setup['eth_ip']}",
+                f"ROUTER={setup['host_ip']}",
+            )
+        ) + "\n"
+
+    def _persistent_pixhawk_eth_setup(self, camera: str) -> dict[str, object]:
         if camera == "left":
             eth_ip = self.left_pixhawk_eth_ip_edit.text().strip()
-            port = self._mavlink_stream_port(self.left_mavlink_url_edit.text().strip(), default=14550)
             namespace = self.left_namespace_edit.text().strip().strip("/")
             dds_key = 1
         elif camera == "right":
             eth_ip = self.right_pixhawk_eth_ip_edit.text().strip()
-            port = self._mavlink_stream_port(self.right_mavlink_url_edit.text().strip(), default=14551)
             namespace = self.right_namespace_edit.text().strip().strip("/")
             dds_key = 2
         else:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
         host_ip = self._pixhawk_host_ip_for_uxrce()
-        rate = int(self.mavlink_stream_rate_spin.value())
         for label, value in (
             ("Pixhawk ETH IP", eth_ip),
             ("Pixhawk Host IP", host_ip),
@@ -9444,35 +11176,32 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if not value or any(ch.isspace() or ch in "'\";`$" for ch in value):
                 raise ValueError(f"{label} 값이 비어 있거나 shell 명령에 사용할 수 없는 문자를 포함합니다: {value!r}")
         host_ip_int = int(IPv4Address(host_ip))
+        ifup_cmd = "ifup eth0"
         ifconfig_cmd = f"ifconfig eth0 {eth_ip} netmask 255.255.255.0 up"
-        mavlink_cmd = f"mavlink start -x -u {port} -t {host_ip} -o {port} -r {rate} -m normal"
         uxrce_stop_cmd = "uxrce_dds_client stop"
         uxrce_start_cmd = f"uxrce_dds_client start -t udp -p {self.uxrce_port_spin.value()} -h {host_ip} -n {namespace}"
-        extras = "/fs/microsd/etc/extras.txt"
-        return "\n".join(
-            (
-                "mkdir /fs/microsd/etc",
-                "ifup eth0",
-                ifconfig_cmd,
-                "param set UXRCE_DDS_CFG 1000",
-                f"param set UXRCE_DDS_KEY {dds_key}",
-                f"param set UXRCE_DDS_DOM_ID {self.domain_spin.value()}",
-                f"param set UXRCE_DDS_AG_IP {host_ip_int}",
-                f"param set UXRCE_DDS_PRT {self.uxrce_port_spin.value()}",
-                "param save",
-                uxrce_stop_cmd,
-                uxrce_start_cmd,
-                mavlink_cmd,
-                "mavlink status",
-                "uxrce_dds_client status",
-                f"echo 'ifup eth0' > {extras}",
-                f"echo '{ifconfig_cmd}' >> {extras}",
-                f"echo '{uxrce_stop_cmd}' >> {extras}",
-                f"echo '{uxrce_start_cmd}' >> {extras}",
-                f"echo '{mavlink_cmd}' >> {extras}",
-                f"cat {extras}",
-            )
-        )
+        param_lines = [
+            "param set MAV_2_CONFIG 0",
+            "param set UXRCE_DDS_CFG 1000",
+            f"param set UXRCE_DDS_KEY {dds_key}",
+            f"param set UXRCE_DDS_DOM_ID {self.domain_spin.value()}",
+            f"param set UXRCE_DDS_AG_IP {host_ip_int}",
+            f"param set UXRCE_DDS_PRT {self.uxrce_port_spin.value()}",
+            "param set UXRCE_DDS_PTCFG 0",
+            "param set UXRCE_DDS_SYNCC 0",
+            "param set UXRCE_DDS_SYNCT 1",
+        ]
+        extras_lines = [ifup_cmd, ifconfig_cmd, uxrce_stop_cmd, uxrce_start_cmd]
+        return {
+            "eth_ip": eth_ip,
+            "host_ip": host_ip,
+            "ifup_cmd": ifup_cmd,
+            "ifconfig_cmd": ifconfig_cmd,
+            "uxrce_stop_cmd": uxrce_stop_cmd,
+            "uxrce_start_cmd": uxrce_start_cmd,
+            "param_lines": param_lines,
+            "extras_lines": extras_lines,
+        }
 
     def open_px4_shell(self, camera: str) -> None:
         if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
@@ -9521,19 +11250,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 status_label.setText(status_text)
             self._log(f"[픽스호크] {camera_label_ko(camera)} {status_text}")
             return
-        device_id = getattr(state, "device_id", None)
+        device_id, device_source = self._mag_state_display_device_id(camera, state)
         if device_id is None:
             status_text = f"Yaw 기준 적용 실패: {selected} device_id 없음"
             if status_label is not None:
                 status_label.setText(status_text)
             self._log(
                 f"[픽스호크] {camera_label_ko(camera)} {status_text}. "
-                "MAVLink SCALED_IMU fallback 샘플은 CAL_MAG_PRIME 자동 매칭에 사용할 수 없습니다."
+                "MAVLink SCALED_IMU fallback 샘플에서 PX4 파라미터 기반 device_id도 찾지 못했습니다."
             )
             return
         command = f"param set CAL_MAG_PRIME {int(device_id)}\nparam save\nparam show CAL_MAG_PRIME"
         self._send_px4_shell_command(camera, command)
-        status_text = f"Yaw 기준: {selected} device={int(device_id)} 적용 명령 전송"
+        status_text = f"Yaw 기준: {selected} device={int(device_id)} ({device_source}) 적용 명령 전송"
         if status_label is not None:
             status_label.setText(status_text)
         self._log(f"[픽스호크] {camera_label_ko(camera)} {status_text}")
@@ -9577,10 +11306,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if table is not None:
             table.setRowCount(0)
         if status_label is not None:
-            status_label.setText(
-                f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: 프로토콜 수신 대기 중\n"
-                "물리 연결과 별개로 MAVLink/ROS2에서 실제 MAG device_id를 수신하면 관리 내용이 표시됩니다."
-            )
+            if self._ros2_only_unavailable(camera, "MAG"):
+                status_label.setText(
+                    f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: ROS2 MAG topic 미게시\n"
+                    "/fmu/out/sensor_mag 또는 /fmu/out/vehicle_magnetometer가 publish되면 실제 MAG device_id가 표시됩니다."
+                )
+            else:
+                status_label.setText(
+                    f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: 프로토콜 수신 대기 중\n"
+                    "물리 연결과 별개로 MAVLink/ROS2에서 실제 MAG device_id를 수신하면 관리 내용이 표시됩니다."
+                )
         self._set_px4_mag_manager_button_state(
             camera,
             refresh_enabled=False,
@@ -9720,17 +11455,208 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _append_px4_shell_output(self, camera: str, text: str) -> None:
+        self._handle_eth0_probe_output(camera, text)
         dialog = self.px4_shell_dialogs.get(camera)
         if dialog is not None:
             dialog.append_output(text)
 
-    def _pixhawk_host_ip_for_uxrce(self) -> str:
+    def _request_mavlink_eth0_status(self, target_sides: Sequence[str]) -> None:
+        if self.mavlink_pixhawk is None:
+            return
+        connected_sides = self._mavlink_connected_sides()
+        for camera in target_sides:
+            if camera not in connected_sides:
+                continue
+            self._eth0_probe_counter += 1
+            token = self._eth0_probe_counter
+            self._eth0_probe_tokens[camera] = token
+            self._eth0_probe_buffers[camera] = ""
+            label = camera_label_ko(camera)
+            try:
+                self.mavlink_pixhawk.send_shell_command(camera, "ifconfig eth0")
+            except Exception as exc:
+                self._eth0_probe_tokens.pop(camera, None)
+                self._eth0_probe_buffers.pop(camera, None)
+                self._log(f"[픽스호크] {label} 실제 eth0 확인 실패: PX4 shell 명령 전송 실패 ({exc})")
+                continue
+            configured_ip = (
+                self.left_pixhawk_eth_ip_edit.text().strip()
+                if camera == "left"
+                else self.right_pixhawk_eth_ip_edit.text().strip()
+            )
+            self._log(
+                f"[픽스호크] {label} 실제 eth0 확인 요청: ifconfig eth0 "
+                f"(GUI 설정값={configured_ip or '<empty>'})"
+            )
+            QtCore.QTimer.singleShot(2500, lambda camera=camera, token=token: self._finish_eth0_probe_if_pending(camera, token))
+
+    def _handle_eth0_probe_output(self, camera: str, text: str) -> None:
+        if camera not in self._eth0_probe_tokens:
+            return
+        buffer = self._eth0_probe_buffers.get(camera, "") + text
+        self._eth0_probe_buffers[camera] = buffer
+        lower = buffer.lower()
+        if "eth0" not in lower:
+            return
+        match = re.search(r"(?:inet addr:|inet\s+)(\d{1,3}(?:\.\d{1,3}){3})", buffer)
+        if match:
+            ip_text = match.group(1)
+            try:
+                IPv4Address(ip_text)
+            except ValueError:
+                return
+            self._clear_eth0_probe(camera)
+            self._log(f"[픽스호크] {camera_label_ko(camera)} 실제 eth0 IP 확인: {ip_text}")
+            return
+        if any(marker in lower for marker in ("no such device", "not found", "invalid interface", "does not exist")):
+            self._clear_eth0_probe(camera)
+            self._log(f"[픽스호크] {camera_label_ko(camera)} 실제 eth0 확인 실패: eth0 인터페이스를 찾지 못했습니다.")
+
+    def _finish_eth0_probe_if_pending(self, camera: str, token: int) -> None:
+        if self._eth0_probe_tokens.get(camera) != token:
+            return
+        self._clear_eth0_probe(camera)
+        self._log(
+            f"[픽스호크] {camera_label_ko(camera)} 실제 eth0 확인 실패: "
+            "PX4 shell 응답이 없어 MAVLink만으로 현재 eth0 IP를 확인할 수 없습니다."
+        )
+
+    def _clear_eth0_probe(self, camera: str) -> None:
+        self._eth0_probe_tokens.pop(camera, None)
+        self._eth0_probe_buffers.pop(camera, None)
+
+    def _validated_pixhawk_host_ip_for_manual_uxrce(self, camera: str) -> str:
+        text = self.pixhawk_host_address_edit.text().strip()
+        if "/" in text:
+            text = text.split("/", 1)[0]
+        if not text:
+            raise ValueError("Pixhawk Host IP가 비어 있습니다. PC IP 탐색 후 PC_IP 후보를 명시적으로 적용하세요.")
+        try:
+            host_ip = IPv4Address(text)
+        except ValueError as exc:
+            raise ValueError(f"Pixhawk Host IP 형식이 올바르지 않습니다: {text}") from exc
+        interfaces = local_ipv4_interfaces(include_wireless=True)
+        matching = [candidate for candidate in interfaces if candidate.address.ip == host_ip]
+        if not matching:
+            available = ", ".join(f"{candidate.name}={candidate.address}" for candidate in interfaces) or "none"
+            raise ValueError(
+                f"Pixhawk Host IP가 현재 PC 주소가 아닙니다: {text}. 사용 가능한 IPv4={available}"
+            )
+        interface_name = str(getattr(matching[0], "name", ""))
+        if interface_name.startswith(("wl", "wlan")):
+            self._log(
+                f"[픽스호크] 경고: Pixhawk Host IP {host_ip}는 Wi-Fi 인터페이스({interface_name})입니다. "
+                "Pixhawk가 유선 ETH로 연결되어 있으면 ROS2/uXRCE가 붙지 않을 수 있습니다."
+            )
+        pixhawk_ip_text = (
+            self.left_pixhawk_eth_ip_edit.text().strip()
+            if camera == "left"
+            else self.right_pixhawk_eth_ip_edit.text().strip()
+        )
+        if pixhawk_ip_text:
+            try:
+                pixhawk_ip = IPv4Address(pixhawk_ip_text.split("/", 1)[0])
+            except ValueError:
+                pixhawk_ip = None
+            if pixhawk_ip is not None and not any(pixhawk_ip in candidate.address.network for candidate in matching):
+                self._log(
+                    f"[픽스호크] 경고: {camera_label_ko(camera)} Pixhawk ETH IP {pixhawk_ip}와 "
+                    f"Pixhawk Host IP {host_ip}가 같은 PC 인터페이스 subnet에 없습니다."
+                )
+        return str(host_ip)
+
+    def _pixhawk_host_ip_for_uxrce(self, *, extra_hints: Sequence[str] = ()) -> str:
         text = self.pixhawk_host_address_edit.text().strip()
         if "/" in text:
             text = text.split("/", 1)[0]
         if not text:
             raise ValueError("Pixhawk Host IP가 비어 있어 uXRCE-DDS client를 시작할 수 없습니다.")
-        return text
+        try:
+            current_ip = IPv4Address(text)
+        except ValueError as exc:
+            raise ValueError(f"Pixhawk Host IP 형식이 올바르지 않습니다: {text}") from exc
+        interfaces = local_ipv4_interfaces(include_wireless=True)
+        local_ips = {candidate.address.ip for candidate in interfaces}
+        if current_ip in local_ips and not extra_hints:
+            return text
+        selected = self._select_pixhawk_host_interface(interfaces, extra_hints=extra_hints)
+        if current_ip in local_ips and selected is not None and selected.address.ip == current_ip:
+            return text
+        if selected is None:
+            available = ", ".join(f"{candidate.name}={candidate.address}" for candidate in interfaces) or "none"
+            raise ValueError(
+                f"Pixhawk Host IP가 현재 PC 주소가 아닙니다: {text}. 사용 가능한 IPv4={available}"
+            )
+        host_ip = str(selected.address.ip)
+        self.pixhawk_host_address_edit.setText(host_ip)
+        self._log(
+            f"[픽스호크] Host IP 자동 보정: {text} -> {host_ip} "
+            f"({selected.name}, {selected.address.network})"
+        )
+        return host_ip
+
+    def _select_pixhawk_host_interface(
+        self,
+        interfaces: Sequence[object],
+        *,
+        extra_hints: Sequence[str] = (),
+    ) -> object | None:
+        hints: list[IPv4Address] = []
+        for text in extra_hints:
+            try:
+                hints.append(IPv4Address(str(text).split("/", 1)[0]))
+            except ValueError:
+                continue
+        for edit in (self.left_pixhawk_eth_ip_edit, self.right_pixhawk_eth_ip_edit):
+            text = edit.text().strip()
+            if not text:
+                continue
+            try:
+                hints.append(IPv4Address(text.split("/", 1)[0]))
+            except ValueError:
+                continue
+        for hint in hints:
+            for candidate in interfaces:
+                if hint in candidate.address.network:
+                    return candidate
+        if not interfaces:
+            return None
+        camera_network = IPv4Address(DEFAULT_HOST_ADDRESS.split("/", 1)[0])
+        non_camera = [candidate for candidate in interfaces if camera_network not in candidate.address.network]
+        return non_camera[0] if non_camera else interfaces[0]
+
+    def _active_mavlink_remote_hosts(self) -> tuple[str, ...]:
+        hosts: list[str] = []
+        subscriber = self.mavlink_pixhawk
+        if subscriber is None:
+            return ()
+        return self._mavlink_remote_hosts_for_sides(subscriber, tuple(getattr(subscriber, "connections", {}).keys()))
+
+    def _mavlink_remote_hosts_for_sides(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        sides: Sequence[str],
+    ) -> tuple[str, ...]:
+        hosts: list[str] = []
+        side_set = set(sides)
+        for connection in getattr(subscriber, "connections", {}).values():
+            side = next(
+                (
+                    key
+                    for key, candidate in getattr(subscriber, "connections", {}).items()
+                    if candidate is connection
+                ),
+                "",
+            )
+            if side_set and side not in side_set:
+                continue
+            clients = getattr(connection, "clients", None)
+            if not clients:
+                continue
+            for client in clients:
+                if isinstance(client, tuple) and client:
+                    hosts.append(str(client[0]))
+        return tuple(dict.fromkeys(hosts))
 
     def _build_mavlink_baud_spin(self) -> QtWidgets.QSpinBox:
         spin = QtWidgets.QSpinBox()
@@ -9740,13 +11666,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return spin
 
     def _mount_assumption_status_label(self) -> str:
-        return "nominal shared rig"
+        return "GPS/RTK baseline only"
 
     def _format_mount_assumption_summary(self) -> str:
         return (
             "mount_assumption:\n"
-            "  model: nominal-shared-rig-v1\n"
-            "  calculation: baseline_and_pixhawk_attitude_only"
+            "  model: gps-rtk-baseline-only-v1\n"
+            "  calculation: live_gps_rtk_baseline_and_pixhawk_attitude_only"
         )
 
     def _set_combo_data(self, combo: QtWidgets.QComboBox, value: str) -> None:
@@ -9865,8 +11791,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         statuses: dict[str, str] = {}
         send_times: dict[str, float] = {}
+        tcp_start_times: dict[str, float] = {}
         command_logs: dict[str, str] = {}
-        barrier = threading.Barrier(len(target_infos)) if len(target_infos) >= 2 else None
+        shared_command_time_s: dict[str, float] = {}
+
+        def capture_shared_command_time() -> None:
+            shared_command_time_s["unix"] = time.time()
+
+        barrier = (
+            threading.Barrier(len(target_infos), action=capture_shared_command_time)
+            if len(target_infos) >= 2
+            else None
+        )
 
         def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
             camera_name = self._camera_name_ko(label)
@@ -9874,7 +11810,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             try:
                 if barrier is not None:
                     barrier.wait(timeout=max(1.0, float(timeout_s)))
-                    unix_time_s = time.time()
+                    unix_time_s = float(shared_command_time_s.get("unix", time.time()))
                 command_text = self._stus_command_from_unix_time(unix_time_s)
                 command = build_wiris_command(
                     host=host,
@@ -9884,6 +11820,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     terminator=LINE_TERMINATOR,
                 )
                 send_times[label] = unix_time_s
+                tcp_start_times[label] = time.perf_counter()
                 response = send_tcp_line(command)
             except Exception as exc:
                 statuses[label] = f"실패: {exc}"
@@ -9925,9 +11862,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ]
             first_label, first_time_s = ordered_times[0]
             last_label, last_time_s = ordered_times[-1]
+            tcp_skew_text = ""
+            ordered_tcp_times = [
+                (label, tcp_start_times[label])
+                for label, _host, _port, _timeout_s in target_infos
+                if label in tcp_start_times
+            ]
+            if len(ordered_tcp_times) >= 2:
+                _first_tcp_label, first_tcp_s = ordered_tcp_times[0]
+                _last_tcp_label, last_tcp_s = ordered_tcp_times[-1]
+                tcp_skew_text = f", TCP 호출 시작 차이: {(last_tcp_s - first_tcp_s) * 1000.0:.3f} ms"
             skew_text = (
-                f" | 전송 시각 차이 {self._camera_name_ko(first_label)}→"
+                f" | 명령 UTC 차이 {self._camera_name_ko(first_label)}→"
                 f"{self._camera_name_ko(last_label)}: {(last_time_s - first_time_s) * 1000.0:.3f} ms"
+                f"{tcp_skew_text}"
             )
         status_text = " | ".join(
             f"{self._camera_name_ko(label)}: {statuses.get(label, '<no response>')}"
@@ -10105,7 +12053,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             right_mavlink_baud=self.right_mavlink_baud_spin.value(),
             mavlink_configure_streams=self.mavlink_configure_streams_checkbox.isChecked(),
             mavlink_stream_rate=self.mavlink_stream_rate_spin.value(),
-            mavlink_start_ros2=self.mavlink_start_ros2_checkbox.isChecked(),
+            mavlink_configure_uxrce_agent=self.mavlink_configure_uxrce_agent_checkbox.isChecked(),
             uxrce_port=self.uxrce_port_spin.value(),
             auto_load_intrinsics=True,
             manual_focal_override=self.manual_focal_checkbox.isChecked(),
@@ -10120,6 +12068,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             uam_ros2_y_field=self.uam_ros2_y_field_edit.text().strip(),
             uam_ros2_z_field=self.uam_ros2_z_field_edit.text().strip(),
             uam_mavlink_side=str(self.uam_mavlink_side_combo.currentData() or "left"),
+            uam_mavlink_url=self.uam_mavlink_url_edit.text().strip(),
+            uam_mavlink_baud=self.uam_mavlink_baud_spin.value(),
             uam_mavlink_message=self.uam_mavlink_message_edit.text().strip().upper(),
             uam_mavlink_x_field=self.uam_mavlink_x_field_edit.text().strip(),
             uam_mavlink_y_field=self.uam_mavlink_y_field_edit.text().strip(),
@@ -10388,54 +12338,60 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_distance()
 
     def _active_baseline_m(self) -> tuple[float, str, tuple[str, ...]]:
-        return self.baseline_spin.value(), "manual", ()
+        if not self._live_gps_baseline_enabled():
+            return 0.0, "gps-rtk-disabled", ("GPS/RTK baseline disabled",)
+        baseline = self.latest_rtk_baseline
+        if baseline is None:
+            return 0.0, "gps-rtk-waiting", ("waiting for live GPS baseline",)
+        usable, reason = self._gps_baseline_usable_for_translation(baseline)
+        if not usable:
+            return baseline.baseline_m, "gps-rtk-blocked", (*baseline.warnings, reason)
+        return baseline.baseline_m, "gps-rtk", baseline.warnings
 
-    def _gps_baseline_state_from_inputs(self, camera: str) -> GpsPositionState:
-        spins = self.gps_baseline_spins[camera]
-        return GpsPositionState(
-            camera=camera,
-            namespace="manual-gps-baseline",
-            timestamp_s=time.monotonic(),
-            topic="manual:gps-baseline",
-            latitude_deg=spins["lat"].value(),
-            longitude_deg=spins["lon"].value(),
-            altitude_m=spins["alt"].value(),
-        )
+    def _live_gps_baseline_enabled(self) -> bool:
+        return not hasattr(self, "use_rtk_baseline_checkbox") or self.use_rtk_baseline_checkbox.isChecked()
 
-    def calculate_gps_baseline(self) -> RtkBaselineEstimate | None:
-        if not hasattr(self, "gps_baseline_result_label"):
-            return None
-        left = self._gps_baseline_state_from_inputs("left")
-        right = self._gps_baseline_state_from_inputs("right")
-        delta = ned_delta_m(left, right)
-        if delta is None:
-            self.gps_baseline_result_label.setText("GPS baseline: 좌/우 위도/경도를 입력하세요.")
-            return None
-        north, east, down = delta
-        baseline_m = math.sqrt(north * north + east * east + down * down)
-        result = RtkBaselineEstimate(
-            baseline_m=baseline_m,
-            north_m=north,
-            east_m=east,
-            down_m=down,
-            left_age_s=0.0,
-            right_age_s=0.0,
-            fix_quality="MANUAL",
-        )
-        self.gps_baseline_result_label.setText(
-            f"GPS baseline: {baseline_m:.3f} m | "
-            f"N/E/D={north:.3f}/{east:.3f}/{down:.3f} m | "
-            "거리 계산에는 Baseline 입력값이 사용됩니다."
-        )
-        return result
+    def _gps_fix_ready_for_baseline(self, state: GpsPositionState | None) -> bool:
+        return state is not None and state.has_position and state.fix_type is not None and state.fix_type >= 3
 
-    def apply_gps_baseline_to_manual_input(self) -> None:
-        result = self.calculate_gps_baseline()
-        if result is None:
-            return
-        self.baseline_spin.setValue(result.baseline_m)
-        self._refresh_camera_parameters_tab()
-        self._log(f"[정렬] GPS 계산 baseline을 수동 Baseline에 적용했습니다: {result.baseline_m:.3f} m")
+    def _gps_baseline_usable_for_translation(self, baseline: RtkBaselineEstimate | None) -> tuple[bool, str]:
+        if baseline is None:
+            return False, "live GPS baseline waiting"
+        left = self.latest_gps.get("left")
+        right = self.latest_gps.get("right")
+        if left is None or right is None:
+            if self.require_rtk_fixed_checkbox.isChecked() and baseline.fix_quality != "GOOD":
+                return False, "RTK Fixed required"
+            if baseline.baseline_m <= 0.0:
+                return False, "GPS baseline length <= 0"
+            return True, "usable"
+        if not self._gps_fix_ready_for_baseline(left) or not self._gps_fix_ready_for_baseline(right):
+            return False, "GPS fix < 3D"
+        if self.require_rtk_fixed_checkbox.isChecked() and not (
+            left is not None and right is not None and left.fix_type == 6 and right.fix_type == 6
+        ):
+            return False, "RTK Fixed required"
+        if baseline.baseline_m <= 0.0:
+            return False, "GPS baseline length <= 0"
+        return True, "usable"
+
+    def _rtk_fixed_status_text(self, baseline: RtkBaselineEstimate | None) -> str:
+        left = self.latest_gps.get("left")
+        right = self.latest_gps.get("right")
+
+        def side_text(label: str, state: GpsPositionState | None) -> str:
+            if state is None:
+                return f"{label}=대기"
+            sats = "--" if state.satellites_used is None else str(state.satellites_used)
+            eph = "--" if state.eph_m is None else f"{state.eph_m:.2f}m"
+            return f"{label}={state.rtk_label}(fix={state.fix_type}, sats={sats}, eph={eph})"
+
+        fixed = left is not None and right is not None and left.fix_type == 6 and right.fix_type == 6
+        usable, reason = self._gps_baseline_usable_for_translation(baseline)
+        mode = "계산 ON" if self._live_gps_baseline_enabled() else "계산 OFF"
+        fixed_text = "YES" if fixed else "NO"
+        usability = "사용 가능" if usable else f"대기/차단: {reason}"
+        return f"RTK Fixed: {fixed_text} | GPS baseline {mode}, {usability} | {side_text('P1', left)} | {side_text('P2', right)}"
 
     def _refresh_rtk_baseline(self) -> RtkBaselineEstimate | None:
         gps_reference_enabled = (
@@ -10445,18 +12401,31 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.latest_gps.get("left"),
             self.latest_gps.get("right"),
             now_s=time.monotonic(),
-            max_age_s=self.max_gps_age_spin.value(),
             require_fixed=self.require_rtk_fixed_checkbox.isChecked(),
-            max_eph_m=self.max_gps_eph_spin.value(),
         )
         self.latest_rtk_baseline = baseline
-        reference_text = "" if gps_reference_enabled else " | 참고 OFF, 표시만"
+        reference_text = " | 계산 ON" if gps_reference_enabled else " | 계산 OFF, 표시만"
+        if hasattr(self, "rtk_fixed_status_label"):
+            self.rtk_fixed_status_label.setText(self._rtk_fixed_status_text(baseline))
         if baseline is None:
+            self._set_rtk_summary_chip("baseline", "Baseline: 대기 중", "idle")
+            self._set_rtk_summary_chip("camera", "Camera: 자세 대기 중", "idle")
+            self._set_rtk_summary_chip("status", "Status: GPS 대기 중", "idle")
             self.rtk_baseline_label.setText(f"GPS baseline: 좌/우 GPS 대기 중{reference_text}")
             self._refresh_rtk_alignment_view()
             self._refresh_operation_header()
+            self._refresh_alignment_workflow_status()
             return None
         warning_text = f" | {'; '.join(baseline.warnings)}" if baseline.warnings else ""
+        usable, reason = self._gps_baseline_usable_for_translation(baseline)
+        baseline_level = "good" if baseline.fix_quality == "GOOD" else "warn" if baseline.fix_quality == "DEGRADED" else "bad"
+        status_level = "good" if usable else "bad"
+        self._set_rtk_summary_chip("baseline", f"Baseline {baseline.baseline_m:.3f} m", baseline_level)
+        self._set_rtk_summary_chip(
+            "status",
+            "Status: 사용 가능" if usable else f"Status: {reason}",
+            status_level,
+        )
         self.rtk_baseline_label.setText(
             f"GPS baseline: {baseline.baseline_m:.3f} m "
             f"N/E/D={baseline.north_m:.3f}/{baseline.east_m:.3f}/{baseline.down_m:.3f} m "
@@ -10465,7 +12434,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self._refresh_rtk_alignment_view()
         self._refresh_operation_header()
+        self._refresh_alignment_workflow_status()
         return baseline
+
+    def _set_rtk_summary_chip(self, key: str, text: str, level: str) -> None:
+        labels = getattr(self, "rtk_summary_labels", {})
+        label = labels.get(key)
+        if label is not None:
+            self._set_health_label(label, text, level)
 
     def _refresh_rtk_alignment_view(self) -> None:
         if not hasattr(self, "rtk_alignment_plot"):
@@ -10481,7 +12457,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "정렬 성분: 좌/우 GPS 위치 대기 중. 안테나 baseline은 카메라 광축 수직 baseline과 다를 수 있습니다."
             )
             return
-        camera_translation = self._translation_right_in_left_m()
+        camera_translation = self._alignment_view_camera_translation_right_in_left_m(baseline)
         left_ext = self.latest_extrinsics.get("left")
         right_ext = self.latest_extrinsics.get("right")
         self.rtk_alignment_plot.set_alignment(baseline, camera_translation, left_ext, right_ext)
@@ -10490,6 +12466,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"N/E/D={baseline.north_m:.3f}/{baseline.east_m:.3f}/{baseline.down_m:.3f} m"
         )
         if camera_translation is None:
+            self._set_rtk_summary_chip("camera", "Camera: 자세 대기 중", "warn")
             self.rtk_alignment_detail_label.setText(
                 f"정렬 성분: {antenna_text}. GPS-only 모드: N/E/D 기준선을 표시합니다. "
                 "카메라 기준 Right/Down/Forward 변환은 픽스호크 자세 수신 후 추가됩니다."
@@ -10503,6 +12480,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"{relative.pitch_deg:+.2f}/{relative.yaw_deg:+.2f}°."
             )
         x_m, y_m, z_m = camera_translation
+        forward_warn = abs(z_m) > max(0.2, abs(x_m) * 0.5)
+        down_warn = abs(y_m) > max(0.1, abs(x_m) * 0.25)
+        self._set_rtk_summary_chip(
+            "camera",
+            f"Camera R/D/F {x_m:+.3f}/{y_m:+.3f}/{z_m:+.3f} m",
+            "warn" if forward_warn or down_warn else "good",
+        )
         self.rtk_alignment_detail_label.setText(
             f"정렬 성분: {antenna_text}. "
             f"카메라 기준 Right={x_m:.3f} m, Down={y_m:.3f} m, Forward={z_m:.3f} m. "
@@ -10510,9 +12494,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _translation_right_in_left_m(self) -> tuple[float, float, float] | None:
-        baseline = self.latest_rtk_baseline
         left_ext = self.latest_extrinsics.get("left")
-        if baseline is None or left_ext is None:
+        if left_ext is None:
+            return None
+        if not self._live_gps_baseline_enabled():
+            return None
+        baseline = self.latest_rtk_baseline
+        if baseline is None:
+            return None
+        usable, _reason = self._gps_baseline_usable_for_translation(baseline)
+        if not usable:
             return None
         right_ext = self.latest_extrinsics.get("right")
         world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
@@ -10520,7 +12511,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             baseline_right_in_left_world_m=world_vector,
             left_body_to_world_q=left_ext.q,
             right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
-            scale_to_m=self.baseline_spin.value(),
+            scale_to_m=None,
+        )
+
+    def _alignment_view_camera_translation_right_in_left_m(
+        self, baseline: RtkBaselineEstimate
+    ) -> tuple[float, float, float] | None:
+        left_ext = self.latest_extrinsics.get("left")
+        if left_ext is None:
+            return None
+        right_ext = self.latest_extrinsics.get("right")
+        world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
+        return camera_translation_right_in_left_camera(
+            baseline_right_in_left_world_m=world_vector,
+            left_body_to_world_q=left_ext.q,
+            right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
+            scale_to_m=None,
         )
 
     def _refresh_distance(self) -> None:
@@ -10562,28 +12568,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             attitude_pair_delta_s = abs(left_ext.timestamp_s - right_ext.timestamp_s)
             relative = relative_attitude(left_ext.q, right_ext.q)
 
-        quality, warnings = classify_sync_quality(
-            camera_delta_s=pair.delta_s,
-            max_camera_delta_s=self.max_dt_spin.value(),
-            left_attitude_age_s=left_attitude.age_s if left_attitude is not None else None,
-            right_attitude_age_s=right_attitude.age_s if right_attitude is not None else None,
-            max_attitude_age_s=self.max_attitude_age_spin.value(),
-            attitude_pair_delta_s=attitude_pair_delta_s,
-            max_attitude_pair_delta_s=self.max_attitude_pair_dt_spin.value(),
-            require_attitude=self.require_attitude_checkbox.isChecked(),
-            bias_captured=False,
-        )
-        if self.require_attitude_checkbox.isChecked() and quality == "BAD":
-            self._clear_triangulation_quality("자세 동기화 조건 미충족")
-            self._set_distance_text(
-                "거리: 자세 동기화 조건 미충족 | " + "; ".join(warnings),
-                quality=quality,
-                detail="그래프 미표시: 자세 동기화 조건을 만족하지 못했습니다.",
-            )
-            return
+        quality = "GOOD"
+        warnings: tuple[str, ...] = ()
 
         baseline_m, baseline_source, baseline_warnings = self._active_baseline_m()
-        if baseline_source == "rtk-blocked":
+        if baseline_source in {"rtk-blocked", "gps-rtk-blocked"}:
             self._clear_triangulation_quality("GPS baseline 조건 미충족")
             self._set_distance_text(
                 "거리: GPS baseline 조건 미충족 | " + "; ".join(baseline_warnings),
@@ -10599,7 +12588,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             focal_length_px=self.focal_spin.value(),
             baseline_m=baseline_m,
             max_time_delta_s=self.max_dt_spin.value(),
-            max_vertical_delta_px=self.max_dy_spin.value(),
+            max_vertical_delta_px=float("inf"),
             require_same_class=self.same_class_checkbox.isChecked(),
         )
         triangulation_source = self._triangulation_extrinsics_source()
@@ -10634,7 +12623,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_distance_text(
                 "거리: 유효한 스테레오 기하 대기 중",
                 quality="BAD",
-                detail="그래프 미표시: 현재 입력으로는 유효한 스테레오 기하를 만들 수 없습니다.",
+                detail=self._stereo_geometry_wait_detail(pair),
             )
             return
         if triangulated is None:
@@ -10643,7 +12632,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_distance_text(
                 f"거리: 3D ray 기하 대기 중 ({self._triangulation_extrinsics_source_label()}){warning_text}",
                 quality="BAD",
-                detail="그래프 미표시: 3D 모드에서는 triangulation 결과가 있을 때만 거리를 기록합니다.",
+                detail=self._triangulation_wait_detail(combined_warnings),
             )
             return
         if estimate is None:
@@ -10752,8 +12741,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if not tracking_result.accepted:
                 tracking_state = "predict"
             tracking_text = f" kf={tracking_state} ni={tracking_result.normalized_innovation:.1f}"
-        display_baseline_source = "manual"
-        display_baseline_m = self.baseline_spin.value()
+        display_baseline_source = baseline_source
+        display_baseline_m = baseline_m
         self._update_triangulation_quality(
             triangulated=triangulated,
             method_text=method_text,
@@ -10840,6 +12829,53 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "그래프 미표시: 좌/우 bbox timestamp가 `최대 Δt` 안에서 아직 맞지 않습니다 "
             f"(left={left_count}, right={right_count})."
         )
+
+    def _stereo_geometry_wait_detail(self, pair) -> str:
+        left = pair.left
+        right = pair.right
+        left_class = getattr(left, "class_name", None) or f"class {getattr(left, 'class_id', '?')}"
+        right_class = getattr(right, "class_name", None) or f"class {getattr(right, 'class_id', '?')}"
+        left_center = getattr(left, "center", (0.0, 0.0))
+        right_center = getattr(right, "center", (0.0, 0.0))
+        disparity_px = abs(float(left_center[0]) - float(right_center[0]))
+        time_delta_ms = abs(float(left.timestamp_s) - float(right.timestamp_s)) * 1000.0
+        if self.same_class_checkbox.isChecked() and left.class_id != right.class_id:
+            return (
+                "그래프 미표시: `같은 클래스만 매칭`이 켜져 있지만 좌/우 class가 다릅니다. "
+                f"left={left_class}, right={right_class}."
+            )
+        if not isfinite(disparity_px) or disparity_px <= 1e-6:
+            return (
+                "그래프 미표시: 좌/우 bbox 중심의 x 차이가 0에 가까워 disparity를 만들 수 없습니다. "
+                f"left_x={float(left_center[0]):.1f}px, right_x={float(right_center[0]):.1f}px."
+            )
+        if time_delta_ms > self.max_dt_spin.value() * 1000.0:
+            return (
+                "그래프 미표시: 좌/우 bbox timestamp 차이가 `최대 Δt`보다 큽니다. "
+                f"camΔt={time_delta_ms:.0f}ms, limit={self.max_dt_spin.value() * 1000.0:.0f}ms."
+            )
+        return (
+            "그래프 미표시: 좌/우 bbox는 선택됐지만 거리 계산용 stereo match가 생성되지 않았습니다. "
+            f"disparity={disparity_px:.1f}px, camΔt={time_delta_ms:.0f}ms."
+        )
+
+    def _triangulation_wait_detail(self, warnings: tuple[str, ...]) -> str:
+        warning_text = "; ".join(warnings)
+        if any("waiting for Pixhawk R" in warning for warning in warnings):
+            return (
+                "그래프 미표시: bbox 매칭은 됐지만 Pixhawk 자세 샘플이 아직 없어 3D ray 방향을 만들 수 없습니다. "
+                f"{warning_text}"
+            )
+        if any("waiting for RTK T" in warning for warning in warnings):
+            return (
+                "그래프 미표시: bbox 매칭은 됐지만 좌/우 카메라 translation을 만들 RTK/GPS baseline이 아직 없습니다. "
+                f"{warning_text}"
+            )
+        if any("triangulation error" in warning for warning in warnings):
+            return f"그래프 미표시: triangulation 계산 중 오류가 발생했습니다. {warning_text}"
+        if warning_text:
+            return f"그래프 미표시: 3D ray triangulation 결과가 아직 없습니다. {warning_text}"
+        return "그래프 미표시: bbox 매칭은 됐지만 3D ray triangulation 결과가 아직 없습니다."
 
     def _inactive_profile_status(self) -> dict[str, str]:
         return {
@@ -11549,7 +13585,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _record_external_parameters(self, *, estimate) -> dict[str, str]:
         row: dict[str, str] = {
-            "manual_baseline_setting_m": self._fmt_record_float(self.baseline_spin.value(), 6),
             "use_rtk_baseline": self._fmt_record_bool(self.use_rtk_baseline_checkbox.isChecked()),
             "require_rtk_fixed": self._fmt_record_bool(self.require_rtk_fixed_checkbox.isChecked()),
             "use_triangulation": self._fmt_record_bool(True),
@@ -11558,10 +13593,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "body_frame": BODY_FRAME,
             "camera_frame": CAMERA_FRAME,
             "camera_mount_profile": CAMERA_MOUNT_PROFILE,
-            "mount_assumption_model": "nominal-shared-rig-v1",
+            "mount_assumption_model": "gps-rtk-baseline-only-v1",
             "mount_assumption_status": self._mount_assumption_status_label(),
-            "mount_assumption_detail": "same_left_right_rig; baseline_used_as_effective_stereo_translation",
-            "require_attitude": self._fmt_record_bool(self.require_attitude_checkbox.isChecked()),
+            "mount_assumption_detail": "live_gps_rtk_baseline_used_as_stereo_translation",
+            "require_attitude": self._fmt_record_bool(False),
             "left_attitude_age_s": self._fmt_record_float(estimate.left_attitude_age_s, 6),
             "right_attitude_age_s": self._fmt_record_float(estimate.right_attitude_age_s, 6),
             "attitude_pair_delta_s": self._fmt_record_float(estimate.attitude_pair_delta_s, 6),
@@ -11730,6 +13765,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _set_distance_text(self, text: str, *, quality: str = "unknown", detail: str | None = None) -> None:
         self.last_distance_status = text
         self.last_distance_quality = quality
+        if hasattr(self, "distance_plot"):
+            self.distance_plot.set_empty_message(detail or text)
         if detail:
             self.distance_label.setTextFormat(QtCore.Qt.RichText)
         else:
@@ -11760,6 +13797,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"yaw={extrinsic.yaw_deg:.4f}°, age={age_ms:.0f}ms{px4_text}"
         )
         self.latest_extrinsics[camera] = extrinsic
+        self.attitude_monitor.update(camera, extrinsic)
         self._record_external_timeline_row(
             camera,
             "pixhawk_attitude",
@@ -11777,16 +13815,33 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self.attitude_buffers[camera].add(extrinsic)
         self.pixhawk_attitude_times[camera].append(time.monotonic())
+        if hasattr(self, "signal_attitude_labels"):
+            source = self._telemetry_source_label(extrinsic.topic)
+            self.signal_attitude_labels[camera].setText(
+                f"Attitude: {source} | roll={extrinsic.roll_deg:.2f} pitch={extrinsic.pitch_deg:.2f} "
+                f"yaw={extrinsic.yaw_deg:.2f} | age={age_ms:.0f}ms{px4_text}"
+            )
+        if hasattr(self, "signal_attitude_age_plot"):
+            self.signal_attitude_age_plot.add_point(TelemetryHistoryPoint(time.monotonic(), camera, age_ms))
         self._update_pixhawk_connection_status()
         self._update_relative_attitude_status()
         self._refresh_rtk_alignment_view()
+        self._refresh_alignment_attitude_ui()
+        self._refresh_alignment_overview()
+        self._refresh_alignment_validation()
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
 
 
     def _update_gps(self, camera: str, gps: GpsPositionState) -> None:
         self.latest_gps[camera] = gps
-        self._update_uam_live_telemetry_from_gps(camera, gps)
+        if camera in {"left", "right"}:
+            self.gnss_monitor.update_position(camera, gps)
+        if hasattr(self, "baseline_gps_rate_history") and camera in self.baseline_gps_rate_history:
+            self.baseline_gps_rate_history[camera].append(time.monotonic())
+        uam_source = str(self.uam_source_combo.currentData() or "") if hasattr(self, "uam_source_combo") else ""
+        if uam_source not in {"mavlink_gps", "mavlink_global"}:
+            self._update_uam_live_telemetry_from_gps(camera, gps)
         self._record_external_timeline_row(
             camera,
             "gps_rtk",
@@ -11809,27 +13864,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             },
         )
         age_ms = max(0.0, time.monotonic() - gps.timestamp_s) * 1000.0
-        position_text = "position=waiting"
-        if gps.has_position:
-            position_text = (
-                f"lat={gps.latitude_deg:.7f}, lon={gps.longitude_deg:.7f}, alt={gps.altitude_m:.2f}m"
-            )
         accuracy_text = []
-        if gps.eph_m is not None:
-            accuracy_text.append(f"eph={gps.eph_m:.2f}m")
-        if gps.epv_m is not None:
-            accuracy_text.append(f"epv={gps.epv_m:.2f}m")
         if gps.satellites_used is not None:
             accuracy_text.append(f"sats={gps.satellites_used}")
+        if gps.eph_m is not None:
+            accuracy_text.append(f"eph={gps.eph_m:.2f}m")
         if gps.heading_deg is not None:
             accuracy_text.append(f"gpsYaw={gps.heading_deg:.2f}°")
         extra = " ".join(accuracy_text)
-        text = f"{camera} GPS/RTK: {gps.rtk_label}, age={age_ms:.0f}ms, {position_text} {extra}"
+        source = self._telemetry_source_label(gps.topic)
+        text = f"{camera} GPS/RTK: {source} | {gps.rtk_label}, age={age_ms:.0f}ms, {extra}"
         if camera == "left":
-            self.left_gps_label.setText(text)
+            self._set_health_label(self.left_gps_label, text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
         elif camera == "right":
-            self.right_gps_label.setText(text)
+            self._set_health_label(self.right_gps_label, text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
+        if hasattr(self, "signal_gps_position_labels") and camera in self.signal_gps_position_labels:
+            self._set_health_label(
+                self.signal_gps_position_labels[camera],
+                f"GPS position: {self._telemetry_source_label(gps.topic)} | {gps.rtk_label} | "
+                f"{self._gps_position_summary_text(gps, age_ms=age_ms)}",
+                self._gps_fix_level(gps.fix_type, age_ms=age_ms),
+            )
         self._refresh_rtk_baseline()
+        self._refresh_baseline_alignment_ui()
+        self._append_baseline_sample_if_active()
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
 
@@ -11839,8 +13897,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         source = str(self.uam_source_combo.currentData() or "")
         if source not in {"mavlink_gps", "mavlink_global"}:
             return
-        selected_side = str(self.uam_mavlink_side_combo.currentData() or "left")
-        if camera != selected_side or not gps.has_position:
+        if camera not in {"left", "uam"} or not gps.has_position:
             return
         topic = str(gps.topic or "")
         if source == "mavlink_global" and "GLOBAL_POSITION_INT" not in topic:
@@ -11917,13 +13974,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.latest_vehicle_mag_device_ids[camera] = int(state.device_id)
             self.refresh_px4_mag_manager(camera)
         self.latest_mag_sensors.setdefault(camera, {})[state.sensor_slot] = state
+        if topic.startswith("mavlink/SCALED_IMU"):
+            table = self.px4_mag_tables.get(camera) if hasattr(self, "px4_mag_tables") else None
+            if table is not None and table.rowCount() == 0 and self._mag_state_display_device_id(camera, state)[0] is not None:
+                self.refresh_px4_mag_manager(camera)
+        self.magnetometer_monitor.update(camera, state)
         label = self.mag_sensor_labels.get(camera, {}).get(state.sensor_slot)
         age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
         components = "x/y/z=waiting"
         if state.x is not None and state.y is not None and state.z is not None:
             components = f"x/y/z={state.x:.3f}/{state.y:.3f}/{state.z:.3f}"
         magnitude = f" mag={state.magnitude:.3f}" if state.magnitude is not None else ""
-        device = f" device={state.device_id}" if state.device_id is not None else ""
+        device_id, device_source = self._mag_state_display_device_id(camera, state)
+        device = "" if device_id is None else f" device={device_id} ({device_source})"
         text = f"{components}{magnitude}, age={age_ms:.0f}ms{device}"
         if label is not None:
             label.setText(text)
@@ -11936,19 +13999,32 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 if plot is not None:
                     plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.magnitude))
         self._refresh_pixhawk_sensor_health()
+        self._refresh_alignment_workflow_status()
+        self._refresh_alignment_magnetometer_ui()
+        self._refresh_alignment_overview()
 
     def _update_gps_sensor(self, camera: str, state) -> None:
         self.latest_gps_sensors.setdefault(camera, {})[state.sensor_slot] = state
+        self.gnss_monitor.update_sensor(camera, state.sensor_slot, state)
         label = self.gps_sensor_labels.get(camera, {}).get(state.sensor_slot)
-        age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
-        sats = f"sats={state.satellites_used}" if state.satellites_used is not None else "sats=waiting"
-        fix = f"fix={state.fix_type}" if state.fix_type is not None else "fix=waiting"
-        eph = f" eph={state.eph_m:.2f}m" if state.eph_m is not None else ""
-        epv = f" epv={state.epv_m:.2f}m" if state.epv_m is not None else ""
-        device = f" device={state.device_id}" if state.device_id is not None else ""
-        text = f"{fix} {sats}{eph}{epv}, age={age_ms:.0f}ms{device}"
+        text = self._gps_sensor_status_text(state, include_source=True, include_detail=True)
         if label is not None:
             label.setText(text)
+        if hasattr(self, "signal_gps_sensor_labels") and camera in self.signal_gps_sensor_labels:
+            age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
+            self._set_health_label(
+                self.signal_gps_sensor_labels[camera],
+                f"GPS sensor: {state.sensor_slot} | "
+                f"{self._gps_sensor_status_text(state, include_source=True, include_detail=False)}",
+                self._gps_fix_level(state.fix_type, age_ms=age_ms),
+            )
+        signal_series = f"{camera}_{state.sensor_slot}"
+        if state.satellites_used is not None and hasattr(self, "signal_gps_sats_plot"):
+            self.signal_gps_sats_plot.add_point(
+                TelemetryHistoryPoint(state.timestamp_s, signal_series, float(state.satellites_used))
+            )
+        if state.eph_m is not None and hasattr(self, "signal_gps_eph_plot"):
+            self.signal_gps_eph_plot.add_point(TelemetryHistoryPoint(state.timestamp_s, signal_series, state.eph_m))
         if state.satellites_used is not None:
             legacy_plot = self.gps_sensor_plots.get(camera)
             if legacy_plot is not None:
@@ -11964,6 +14040,38 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if plot is not None:
                 plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.eph_m))
         self._refresh_pixhawk_sensor_health()
+        self._refresh_alignment_workflow_status()
+        self._refresh_baseline_alignment_ui()
+        self._refresh_f9p_compare_label(camera)
+
+    def _refresh_f9p_compare_label(self, camera: str) -> None:
+        label = self.f9p_compare_labels.get(camera)
+        if label is None:
+            return
+        now_s = time.monotonic()
+        gps_slots = self.latest_gps_sensors.get(camera, {})
+        gps_detected = sum(1 for slot in ("GPS1", "GPS2") if slot in gps_slots)
+        gps1 = gps_slots.get("GPS1")
+        gps2 = gps_slots.get("GPS2")
+        if gps1 is None or gps2 is None:
+            self._set_health_label(label, f"{gps_detected}/2 detected", "bad" if gps_detected else "idle")
+            return
+        details = []
+        if gps1.fix_type is not None and gps2.fix_type is not None:
+            details.append(f"fix={self._fix_type_label(gps1.fix_type)}/{self._fix_type_label(gps2.fix_type)}")
+        if gps1.satellites_used is not None and gps2.satellites_used is not None:
+            details.append(f"Δsats={abs(gps1.satellites_used - gps2.satellites_used)}")
+        if gps1.eph_m is not None and gps2.eph_m is not None:
+            details.append(f"Δeph={abs(gps1.eph_m - gps2.eph_m):.2f}m")
+        details.append(f"skew={abs(gps1.timestamp_s - gps2.timestamp_s) * 1000.0:.0f}ms")
+        details.append(f"src={self._telemetry_source_label(gps1.topic)} / {self._telemetry_source_label(gps2.topic)}")
+        poor_fix = (gps1.fix_type is not None and gps1.fix_type < 3) or (
+            gps2.fix_type is not None and gps2.fix_type < 3
+        )
+        not_rtk = (gps1.fix_type or 0) < 5 or (gps2.fix_type or 0) < 5
+        stale = now_s - gps1.timestamp_s > 1.0 or now_s - gps2.timestamp_s > 1.0
+        level = "bad" if poor_fix else "warn" if stale or not_rtk else "good"
+        self._set_health_label(label, f"2/2 detected · {' · '.join(details)}", level)
 
     def _update_gnss_relative(self, camera: str, state) -> None:
         self.latest_gnss_relative[camera] = state
@@ -12011,11 +14119,78 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "idle": (PANEL_ALT_BG, PANEL_BORDER, TEXT_MUTED),
         }
         background, border, color = colors.get(level, colors["idle"])
-        label.setText(text)
-        label.setStyleSheet(
+        style = (
             f"background: {background}; border: 1px solid {border}; "
             f"border-radius: 0px; color: {color}; padding: 6px 8px; font-weight: 600;"
         )
+        if label.text() == text and label.property("healthLevel") == level and label.styleSheet() == style:
+            return
+        label.setProperty("healthLevel", level)
+        label.setText(text)
+        label.setStyleSheet(style)
+
+    def _set_label_text_if_changed(self, label: QtWidgets.QLabel, text: str) -> None:
+        if label.text() != text:
+            label.setText(text)
+
+    def _telemetry_source_label(self, topic: object) -> str:
+        text = str(topic or "").strip()
+        if not text:
+            return "source=unknown"
+        if text.startswith("mavlink/"):
+            return f"MAVLink {text.removeprefix('mavlink/')}"
+        if "/fmu/out/" in text:
+            return f"ROS2 {text}"
+        return text
+
+    def _gps_position_summary_text(self, gps: GpsPositionState, *, age_ms: float) -> str:
+        sats = f"sats={gps.satellites_used}" if gps.satellites_used is not None else "sats=waiting"
+        eph = f" | eph={gps.eph_m:.2f}m" if gps.eph_m is not None else ""
+        return f"{sats}{eph} | age={age_ms:.0f}ms"
+
+    def _gps_fix_level(self, fix_type: int | None, *, age_ms: float | None = None) -> str:
+        if fix_type is None or fix_type < 3:
+            return "bad"
+        if age_ms is not None and age_ms > 3000:
+            return "bad"
+        if age_ms is not None and age_ms > 1000:
+            return "warn"
+        if fix_type >= 6:
+            return "good"
+        return "warn"
+
+    def _gps_sensor_status_text(
+        self,
+        state: object,
+        *,
+        now_s: float | None = None,
+        include_source: bool,
+        include_detail: bool = True,
+    ) -> str:
+        if now_s is None:
+            now_s = time.monotonic()
+        age_ms = max(0.0, now_s - float(getattr(state, "timestamp_s", now_s))) * 1000.0
+        fix_value = getattr(state, "fix_type", None)
+        fix = self._fix_type_label(fix_value)
+        sats = (
+            f"sats={getattr(state, 'satellites_used')}"
+            if getattr(state, "satellites_used", None) is not None
+            else "sats=waiting"
+        )
+        eph = f" | eph={getattr(state, 'eph_m'):.2f}m" if getattr(state, "eph_m", None) is not None else ""
+        epv = ""
+        device = ""
+        px4_time = ""
+        if include_detail:
+            epv = f" | epv={getattr(state, 'epv_m'):.2f}m" if getattr(state, "epv_m", None) is not None else ""
+            device = f" | device={getattr(state, 'device_id')}" if getattr(state, "device_id", None) is not None else ""
+            px4_time = (
+                f" | px4_t={getattr(state, 'px4_timestamp_s'):.3f}s"
+                if getattr(state, "px4_timestamp_s", None) is not None
+                else ""
+            )
+        source = f" | {self._telemetry_source_label(getattr(state, 'topic', ''))}" if include_source else ""
+        return f"fix={fix} | {sats}{eph}{epv} | age={age_ms:.0f}ms{device}{px4_time}{source}"
 
     def _vector_angle_deg(self, first, second) -> float | None:
         if (
@@ -12050,6 +14225,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _refresh_pixhawk_sensor_health(self) -> None:
         if not hasattr(self, "pixhawk_sensor_summary_labels"):
             return
+        if not self.pixhawk_sensor_summary_labels.get("left") and not self.pixhawk_sensor_summary_labels.get("right"):
+            return
         now_s = time.monotonic()
         for camera, title in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
             self._refresh_one_pixhawk_sensor_health(camera, title, now_s)
@@ -12062,7 +14239,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for slot, label in self.rm3100_slot_labels[camera].items():
             state = mag_slots.get(slot)
             if state is None:
-                self._set_health_label(label, "waiting", "idle")
+                unavailable = self._ros2_only_unavailable(camera, slot)
+                self._set_health_label(label, "ROS2 sensor_mag/vehicle_magnetometer 미게시" if unavailable else "waiting", "warn" if unavailable else "idle")
                 continue
             age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
             components = "x/y/z=waiting"
@@ -12078,7 +14256,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         can1 = mag_slots.get("CAN1")
         can2 = mag_slots.get("CAN2")
         rm_level = "bad"
-        rm_summary = f"{rm_detected}/2 detected"
+        rm_unavailable = rm_detected == 0 and self._ros2_only_unavailable(camera, "MAG")
+        rm_summary = (
+            "Status: ROS2 MAG topic 미게시 | 0/2 detected"
+            if rm_unavailable
+            else f"Status: 대기 중 | {rm_detected}/2 detected"
+        )
         if can1 is not None and can2 is not None:
             can1_age = now_s - can1.timestamp_s
             can2_age = now_s - can2.timestamp_s
@@ -12098,36 +14281,46 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             abnormal_delta = delta_mag is not None and delta_mag > 0.20
             abnormal_angle = angle is not None and angle > 20.0
             rm_level = "warn" if stale or abnormal_delta or abnormal_angle else "good"
-            rm_summary = f"2/2 detected · {' · '.join(details)}"
+            status = "WARN" if rm_level == "warn" else "OK"
+            can1_text = "--" if can1.magnitude is None else f"{can1.magnitude:.3f}G"
+            can2_text = "--" if can2.magnitude is None else f"{can2.magnitude:.3f}G"
+            delta_text = "--" if delta_mag is None else f"{delta_mag:.3f}G"
+            angle_text = "--" if angle is None else f"{angle:.1f}deg"
+            rm_summary = f"Status: {status} | CAN1 {can1_text} / CAN2 {can2_text} | Δ {delta_text}, {angle_text}"
             self._set_health_label(self.rm3100_compare_labels[camera], rm_summary, rm_level)
         else:
-            self._set_health_label(self.rm3100_compare_labels[camera], rm_summary, "bad" if rm_detected else "idle")
+            self._set_health_label(
+                self.rm3100_compare_labels[camera],
+                rm_summary,
+                "bad" if rm_detected else "warn" if rm_unavailable else "idle",
+            )
         self._set_health_label(
             self.pixhawk_sensor_summary_labels[camera]["rm3100"],
             f"{title}: {rm_summary}",
-            rm_level if rm_detected else "idle",
+            rm_level if rm_detected else "warn" if rm_unavailable else "idle",
         )
 
         gps_detected = sum(1 for slot in ("GPS1", "GPS2") if slot in gps_slots)
         for slot, label in self.f9p_slot_labels[camera].items():
             state = gps_slots.get(slot)
             if state is None:
-                self._set_health_label(label, "waiting", "idle")
+                unavailable = self._ros2_only_unavailable(camera, slot)
+                self._set_health_label(label, "ROS2 sensor_gps 미게시" if unavailable else "waiting", "warn" if unavailable else "idle")
                 continue
             age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
-            fix = self._fix_type_label(state.fix_type)
-            sats = f"sats={state.satellites_used}" if state.satellites_used is not None else "sats=waiting"
-            eph = f" | eph={state.eph_m:.2f}m" if state.eph_m is not None else ""
-            epv = f" | epv={state.epv_m:.2f}m" if state.epv_m is not None else ""
-            device = f" | device={state.device_id}" if state.device_id is not None else ""
             poor_fix = state.fix_type is not None and state.fix_type < 3
             level = "bad" if age_ms > 3000 or poor_fix else "warn" if age_ms > 1000 or (state.fix_type or 0) < 5 else "good"
-            self._set_health_label(label, f"fix={fix} | {sats}{eph}{epv} | age={age_ms:.0f}ms{device}", level)
+            self._set_health_label(label, self._gps_sensor_status_text(state, now_s=now_s, include_source=True), level)
 
         gps1 = gps_slots.get("GPS1")
         gps2 = gps_slots.get("GPS2")
         f9p_level = "bad"
-        f9p_summary = f"{gps_detected}/2 detected"
+        gps2_unavailable = gps2 is None and self._ros2_only_unavailable(camera, "GPS2")
+        f9p_summary = (
+            f"{gps_detected}/2 detected · GPS2 ROS2 sensor_gps 미게시"
+            if gps2_unavailable
+            else f"{gps_detected}/2 detected"
+        )
         if gps1 is not None and gps2 is not None:
             details = []
             if gps1.fix_type is not None and gps2.fix_type is not None:
@@ -12137,6 +14330,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if gps1.eph_m is not None and gps2.eph_m is not None:
                 details.append(f"Δeph={abs(gps1.eph_m - gps2.eph_m):.2f}m")
             details.append(f"skew={abs(gps1.timestamp_s - gps2.timestamp_s) * 1000.0:.0f}ms")
+            details.append(f"src={self._telemetry_source_label(gps1.topic)} / {self._telemetry_source_label(gps2.topic)}")
             poor_fix = (gps1.fix_type is not None and gps1.fix_type < 3) or (gps2.fix_type is not None and gps2.fix_type < 3)
             not_rtk = (gps1.fix_type or 0) < 5 or (gps2.fix_type or 0) < 5
             stale = now_s - gps1.timestamp_s > 1.0 or now_s - gps2.timestamp_s > 1.0
@@ -12144,11 +14338,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f9p_summary = f"2/2 detected · {' · '.join(details)}"
             self._set_health_label(self.f9p_compare_labels[camera], f9p_summary, f9p_level)
         else:
-            self._set_health_label(self.f9p_compare_labels[camera], f9p_summary, "bad" if gps_detected else "idle")
+            self._set_health_label(
+                self.f9p_compare_labels[camera],
+                f9p_summary,
+                "bad" if gps_detected else "warn" if gps2_unavailable else "idle",
+            )
         self._set_health_label(
             self.pixhawk_sensor_summary_labels[camera]["f9p"],
             f"{title}: {f9p_summary}",
-            f9p_level if gps_detected else "idle",
+            f9p_level if gps_detected else "warn" if gps2_unavailable else "idle",
         )
         heading_text = "GNSS Heading: sensor_gnss_relative waiting"
         heading_level = "idle"
@@ -12186,6 +14384,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_health_label(self.pixhawk_sensor_summary_labels[camera]["heading"], heading_text, heading_level)
 
     def _update_relative_attitude_status(self) -> None:
+        if not hasattr(self, "attitude_compare_labels"):
+            return
         left = self.latest_extrinsics.get("left")
         right = self.latest_extrinsics.get("right")
         axis_values = (
@@ -12198,10 +14398,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             left_label.setText("대기 중" if left_value is None else f"{left_value:.4f} deg")
             right_label.setText("대기 중" if right_value is None else f"{right_value:.4f} deg")
             if left_value is None or right_value is None:
-                delta_label.setText("대기 중")
+                self._set_health_label(delta_label, "대기 중", "idle")
             else:
-                delta_label.setText(f"{right_value - left_value:.4f} deg")
+                delta = right_value - left_value
+                self._set_health_label(
+                    delta_label,
+                    f"Δ{axis.capitalize()} {delta:+.2f}°",
+                    self._attitude_delta_level(axis, delta),
+                )
         if left is None and right is None:
+            self._refresh_alignment_workflow_status()
             return
         now_s = time.monotonic()
         for axis, left_value, right_value in axis_values:
@@ -12212,6 +14418,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             self.attitude_history[axis].append(point)
             self.attitude_plots[axis].add_point(point)
+        self._refresh_alignment_workflow_status()
+
+    def _attitude_delta_level(self, axis: str, delta_deg: float) -> str:
+        abs_delta = abs(delta_deg)
+        good_limit = 3.0 if axis == "yaw" else 1.0
+        bad_limit = 8.0 if axis == "yaw" else 3.0
+        if abs_delta <= good_limit:
+            return "good"
+        if abs_delta <= bad_limit:
+            return "warn"
+        return "bad"
 
     def _initial_status(self) -> None:
         self._log("[연결] 네트워크 인터페이스 상태:\n" + interface_addresses(self.interface_edit.text().strip()))
@@ -12225,7 +14442,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _auto_start_pixhawk(self) -> None:
         self.tabs.setCurrentIndex(self.alignment_tab_index)
-        self.alignment_tabs.setCurrentIndex(self.rm3100_alignment_tab_index)
+        self.alignment_tabs.setCurrentIndex(self.baseline_alignment_tab_index)
         if self.mavlink_pixhawk is None:
             self.connect_mavlink_pixhawk()
 

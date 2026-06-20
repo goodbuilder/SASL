@@ -155,3 +155,25 @@ must point to the detailed experiment directory or legacy artifacts.
 Existing report directories under `reports/` are not moved. When legacy results
 matter, add a registry row with `EXP-LEGACY-...` and list the original paths in
 `legacy_artifacts`.
+
+## 2026-06-18 Fresh StereoDistance Residual Search
+
+`EXP-20260618-281-fresh-stereodistance-disparity-residual-search` reran a
+Simulation-local search for a StereoDistance-applicable correction method after
+the result directories were found missing from the current checkout. The fresh
+run used `Simulation/.venv/bin/python`, 4 synthetic stress scenarios, 5 fresh
+seeds per scenario, 600 samples per seed, and 64 candidate residual settings.
+
+The selected method is
+`multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_log_disparity_deg1_ridge1_clip0p5`.
+It applies a ray-scale residual from fused `log_disparity` after 7x3
+multi-burst observation fusion. Aggregate validation is `PASS`: 4/4 scenarios
+strict pass, observation-only target worst `5.091243m`, residual target worst
+`2.437792m`, mean range RMSE `1.417889m -> 0.405203m`, runtime truth `false`.
+
+The same sweep continued beyond the first PASS and rejected the weaker
+`forward_add` branch for this gate. A representative `forward_add log_disparity
+degree2 ridge1 clip0.5` candidate passed only 3/4 scenarios because
+`intrinsic_scale_stress` passed 2/5 trials. The failure mode is consistent with
+absolute forward-meter correction being less stable than scaling the whole
+stereo ray under intrinsic/scale-like error.

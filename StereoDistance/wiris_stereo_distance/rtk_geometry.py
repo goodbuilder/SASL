@@ -140,9 +140,7 @@ def estimate_rtk_baseline(
     right: GpsPositionState | None,
     *,
     now_s: float,
-    max_age_s: float,
     require_fixed: bool,
-    max_eph_m: float | None = None,
 ) -> RtkBaselineEstimate | None:
     if left is None or right is None:
         return None
@@ -154,22 +152,11 @@ def estimate_rtk_baseline(
     left_age = max(0.0, now_s - left.timestamp_s)
     right_age = max(0.0, now_s - right.timestamp_s)
     warnings: list[str] = []
-    if left_age > max_age_s:
-        warnings.append(f"left GPS age {left_age * 1000:.0f}ms")
-    if right_age > max_age_s:
-        warnings.append(f"right GPS age {right_age * 1000:.0f}ms")
     if left.fix_type != 6:
         warnings.append(f"left {left.rtk_label}")
     if right.fix_type != 6:
         warnings.append(f"right {right.rtk_label}")
-    if max_eph_m is not None:
-        if left.eph_m is not None and left.eph_m > max_eph_m:
-            warnings.append(f"left eph {left.eph_m:.2f}m")
-        if right.eph_m is not None and right.eph_m > max_eph_m:
-            warnings.append(f"right eph {right.eph_m:.2f}m")
     if require_fixed and any("RTK_FIXED" not in state.rtk_label for state in (left, right)):
-        quality = "BAD"
-    elif any(age > max_age_s for age in (left_age, right_age)):
         quality = "BAD"
     elif warnings:
         quality = "DEGRADED"

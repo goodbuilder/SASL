@@ -84,7 +84,7 @@ def check_tcp_port(host: str, port: int, *, timeout: float = 1.0) -> bool:
         return False
 
 
-def local_ipv4_interfaces() -> list[InterfaceCandidate]:
+def local_ipv4_interfaces(*, include_wireless: bool = False) -> list[InterfaceCandidate]:
     result = subprocess.run(
         ["ip", "-o", "-4", "addr", "show", "scope", "global"],
         check=False,
@@ -99,7 +99,7 @@ def local_ipv4_interfaces() -> list[InterfaceCandidate]:
         if len(parts) < 4:
             continue
         name = parts[1]
-        if _skip_interface(name):
+        if _skip_interface(name, include_wireless=include_wireless):
             continue
         try:
             candidates.append(InterfaceCandidate(name=name, address=ip_interface(parts[3])))
@@ -720,8 +720,10 @@ def wired_interface_names() -> tuple[str, ...]:
     return tuple(names)
 
 
-def _skip_interface(name: str) -> bool:
-    prefixes = ("lo", "docker", "br-", "veth", "virbr", "tailscale", "zt", "wg", "wl", "wlan", "wlp", "wwan")
+def _skip_interface(name: str, *, include_wireless: bool = False) -> bool:
+    prefixes = ("lo", "docker", "br-", "veth", "virbr", "tailscale", "zt", "wg")
+    if not include_wireless:
+        prefixes = (*prefixes, "wl", "wlan", "wlp", "wwan")
     return name.startswith(prefixes)
 
 

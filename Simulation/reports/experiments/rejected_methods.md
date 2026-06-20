@@ -5,6 +5,17 @@ in inputs, observation model, gate, or method.
 
 ## Rejected For Current Gate
 
+- Absolute `forward_add` disparity residual after 7x3 multi-burst fusion
+  - Reason: EXP-20260618-281 continued the residual sweep after the ray-scale
+    PASS and found 16/64 aggregate candidates failed. The representative
+    `forward_add log_disparity degree2 ridge1 clip0.5` candidate passed only
+    3/4 scenarios; `intrinsic_scale_stress` passed 2/5 trials. It improved
+    average range but left residual target worst at `4.591243m` and was less
+    stable than ray-scale correction.
+  - Interpretation: adding an absolute meter offset to Forward is weaker under
+    scale-like camera error because right/down/forward remain on an
+    inconsistent ray. Prefer `ray_scale log_disparity` residuals for the next
+    StereoDistance export attempt.
 - Bbox non-center geometry-only anchors
   - Reason: no all-report strict improvement; lateral regressions remain.
   - Revisit only if the observation model changes.
