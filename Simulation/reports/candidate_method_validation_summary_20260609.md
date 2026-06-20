@@ -52,6 +52,20 @@ session can resume without re-running already rejected branches.
   FRD+range `forward/right/down/range`. Scope note: this is a small
   current-checkout smoke, not a replacement for the missing full six-scenario
   artifact.
+- 2026-06-21 six-scenario non-alias smoke: a broader current-checkout smoke was
+  run with the built-in six scenarios:
+  `python3 Simulation/scripts/run_rtk_stereo_robustness_sweep.py --output-dir /tmp/sasl_non_alias_default6_smoke --seeds 282010 --sample-count 80 --synthetic-target-oversample-count 12 --pooled-candidate-scan-limit 2 --skip-near-tie-transfer`.
+  Result: `robustness_acceptance_pass=true`; direct NED-to-RDF alias forbidden
+  6/6; robust recommendation
+  `sim3_spline_residual_raw_forward_smooth025` strict/performance 6/6 with RDF
+  axis non-regression. The deployment strategy was not a single profile:
+  representative policy transfer failed (`target_guard` 5/6, other policies
+  2/6) and the pooled profile passed 4/6. The PASS route is the scenario
+  profile catalog: profiles 6/6, cross-seed 6/6, StereoDistance promotion 6/6,
+  selector package PASS, deployment frontier PASS, operator launch 19/19 PASS,
+  runtime truth unused. Runtime selection must therefore use explicit
+  deployment/scenario labels; automatic or unconditional single-profile
+  deployment is rejected by this smoke.
 - Paused by user after offline aggregate and guard-sweep validation. Do not
   treat any later partial ROS2/Gazebo output as validation evidence.
 - After resuming offline-only work, `bbox_anchor_cell_guard_cross_validation.py`
