@@ -31,6 +31,9 @@ log/
 workspace/main/src/px4_msgs/
 workspace/live_measurement_check/
 
+# Local PX4 firmware checkout/build tree. Commit patches/docs instead.
+firmware/PX4-Autopilot/
+
 # Large generated experiment/runtime outputs
 Simulation/results/
 Simulation/Simulation/results/

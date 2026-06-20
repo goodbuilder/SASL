@@ -1,0 +1,129 @@
+diff --git a/src/modules/uxrce_dds_client/dds_topics.h.em b/src/modules/uxrce_dds_client/dds_topics.h.em
+index deba362..efe74a6 100644
+--- a/src/modules/uxrce_dds_client/dds_topics.h.em
++++ b/src/modules/uxrce_dds_client/dds_topics.h.em
+@@ -60,6 +60,7 @@ static constexpr uint32_t get_message_version() {
+ 
+ struct SendSubscription {
+ 	const struct orb_metadata *orb_meta;
++	uint8_t orb_instance;
+ 	uxrObjectId data_writer;
+ 	const char* dds_type_name;
+ 	const char* topic;
+@@ -72,7 +73,8 @@ struct SendSubscription {
+ struct SendTopicsSubs {
+ 	SendSubscription send_subscriptions[@(len(publications))] = {
+ @[    for pub in publications]@
+-			{ ORB_ID(@(pub['topic_simple'])),
++			{ ORB_ID(@(pub['uorb_topic_simple'])),
++			  @(pub['uorb_instance']),
+ 			  uxr_object_id(0, UXR_INVALID_ID),
+ 			  "@(pub['dds_type'])",
+ 			  "@(pub['topic'])",
+@@ -96,12 +98,18 @@ bool SendTopicsSubs::init(uxrSession *session, uxrStreamId reliable_out_stream_i
+ 	bool ret = true;
+ 	for (unsigned idx = 0; idx < sizeof(send_subscriptions)/sizeof(send_subscriptions[0]); ++idx) {
+ 		if (fds[idx].events == 0) {
+-			fds[idx].fd = orb_subscribe(send_subscriptions[idx].orb_meta);
++			if (send_subscriptions[idx].orb_instance > 0) {
++				fds[idx].fd = orb_subscribe_multi(send_subscriptions[idx].orb_meta, send_subscriptions[idx].orb_instance);
++
++			} else {
++				fds[idx].fd = orb_subscribe(send_subscriptions[idx].orb_meta);
++			}
++
+ 			fds[idx].events = POLLIN;
+ 			orb_set_interval(fds[idx].fd, UXRCE_DEFAULT_POLL_RATE);
+ 		}
+ 
+-		if (!create_data_writer(session, reliable_out_stream_id, participant_id, static_cast<ORB_ID>(send_subscriptions[idx].orb_meta->o_id), client_namespace, send_subscriptions[idx].topic,
++		if (!create_data_writer(session, reliable_out_stream_id, participant_id, static_cast<ORB_ID>(send_subscriptions[idx].orb_meta->o_id), send_subscriptions[idx].orb_instance, client_namespace, send_subscriptions[idx].topic,
+ 								   send_subscriptions[idx].message_version,
+ 								   send_subscriptions[idx].dds_type_name, send_subscriptions[idx].data_writer)) {
+ 			ret = false;
+diff --git a/src/modules/uxrce_dds_client/dds_topics.yaml b/src/modules/uxrce_dds_client/dds_topics.yaml
+index 24c30d8..4bf773b 100644
+--- a/src/modules/uxrce_dds_client/dds_topics.yaml
++++ b/src/modules/uxrce_dds_client/dds_topics.yaml
+@@ -62,6 +62,44 @@ publications:
+   - topic: /fmu/out/vehicle_gps_position
+     type: px4_msgs::msg::SensorGps
+ 
++  - topic: /fmu/out/sensor_gps_0
++    type: px4_msgs::msg::SensorGps
++    uorb_topic: sensor_gps
++    uorb_instance: 0
++
++  - topic: /fmu/out/sensor_gps_1
++    type: px4_msgs::msg::SensorGps
++    uorb_topic: sensor_gps
++    uorb_instance: 1
++
++  - topic: /fmu/out/sensor_mag_0
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 0
++
++  - topic: /fmu/out/sensor_mag_1
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 1
++
++  - topic: /fmu/out/sensor_mag_2
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 2
++
++  - topic: /fmu/out/sensor_mag_3
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 3
++
++  - topic: /fmu/out/sensor_mag_4
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 4
++
++  - topic: /fmu/out/vehicle_magnetometer
++    type: px4_msgs::msg::VehicleMagnetometer
++
+   - topic: /fmu/out/vehicle_local_position
+     type: px4_msgs::msg::VehicleLocalPosition
+ 
+diff --git a/src/modules/uxrce_dds_client/generate_dds_topics.py b/src/modules/uxrce_dds_client/generate_dds_topics.py
+index 78e3bf3..21a7a55 100644
+--- a/src/modules/uxrce_dds_client/generate_dds_topics.py
++++ b/src/modules/uxrce_dds_client/generate_dds_topics.py
+@@ -95,6 +95,8 @@ def process_message_type(msg_type):
+     msg_type['dds_type'] = msg_type['type'].replace("::msg::", "::msg::dds_::") + "_"
+     # topic_simple: eg vehicle_status
+     msg_type['topic_simple'] = msg_type['topic'].split('/')[-1]
++    msg_type['uorb_topic_simple'] = msg_type.get('uorb_topic', msg_type['topic_simple'])
++    msg_type['uorb_instance'] = int(msg_type.get('uorb_instance', 0))
+ 
+ pubs_not_empty = msg_map['publications'] is not None
+ if pubs_not_empty:
+diff --git a/src/modules/uxrce_dds_client/utilities.hpp b/src/modules/uxrce_dds_client/utilities.hpp
+index c2d038b..c864f30 100644
+--- a/src/modules/uxrce_dds_client/utilities.hpp
++++ b/src/modules/uxrce_dds_client/utilities.hpp
+@@ -50,8 +50,8 @@ static bool generate_topic_name(char *topic_name, const char *client_namespace,
+ }
+ 
+ static bool create_data_writer(uxrSession *session, uxrStreamId reliable_out_stream_id, uxrObjectId participant_id,
+-			       ORB_ID orb_id, const char *client_namespace, const char *topic, uint32_t message_version, const char *type_name,
+-			       uxrObjectId &datawriter_id)
++			       ORB_ID orb_id, uint8_t instance, const char *client_namespace, const char *topic,
++			       uint32_t message_version, const char *type_name, uxrObjectId &datawriter_id)
+ {
+ 	// topic
+ 	char topic_name[TOPIC_NAME_SIZE];
+@@ -61,7 +61,7 @@ static bool create_data_writer(uxrSession *session, uxrStreamId reliable_out_str
+ 		return false;
+ 	}
+ 
+-	uxrObjectId topic_id = topic_id_from_orb(orb_id);
++	uxrObjectId topic_id = topic_id_from_orb(orb_id, instance);
+ 	uint16_t topic_req = uxr_buffer_create_topic_bin(session, reliable_out_stream_id, topic_id, participant_id, topic_name,
+ 			     type_name, UXR_REPLACE);
+ 

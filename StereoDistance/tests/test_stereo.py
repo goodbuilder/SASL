@@ -2033,7 +2033,7 @@ def test_ros2_only_alignment_marks_unpublished_gps2_and_mag_topics(monkeypatch) 
 
     assert "ROS2 미게시" in widget.alignment_overview_labels["left_gps2"].text()
     assert "ROS2 미게시" in widget.alignment_overview_labels["left_can1"].text()
-    assert "ROS2 sensor_gps 미게시" in widget.f9p_slot_labels["left"]["GPS2"].text()
+    assert "ROS2 sensor_gps(_0/_1) 미게시" in widget.f9p_slot_labels["left"]["GPS2"].text()
     assert "ROS2 미게시" in widget.alignment_mag_labels["left_CAN1"]["device"].text()
 
     widget.deleteLater()
@@ -3292,6 +3292,49 @@ def test_dual_pixhawk_start_uses_sensor_gps_for_vehicle_gps_position_when_needed
 
     assert "/uav_0/fmu/out/vehicle_gps_position" in fake_node.topics
     assert "/uav_0/fmu/out/sensor_gps" in fake_node.topics
+    assert "/uav_0/fmu/out/sensor_gps_0" in fake_node.topics
+    assert "/uav_0/fmu/out/sensor_gps_1" in fake_node.topics
+
+
+def test_dual_pixhawk_start_subscribes_sensor_mag_instances(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    import wiris_stereo_distance.pixhawk_attitude as pixhawk_attitude
+    from wiris_stereo_distance.pixhawk_attitude import DualPixhawkAttitudeSubscriber
+
+    class FakeNode:
+        def __init__(self) -> None:
+            self.topics = []
+
+        def create_subscription(self, _msg_type, topic, _callback, _qos):
+            self.topics.append(topic)
+            return topic
+
+    class FakeExecutor:
+        def add_node(self, _node) -> None:
+            return None
+
+    fake_node = FakeNode()
+
+    def fake_get_message(name: str):
+        if name in {"px4_msgs/msg/VehicleAttitude", "px4_msgs/msg/SensorMag"}:
+            return object
+        raise AttributeError(name)
+
+    monkeypatch.setattr(pixhawk_attitude, "get_message", fake_get_message)
+    monkeypatch.setattr(pixhawk_attitude, "SingleThreadedExecutor", FakeExecutor)
+    monkeypatch.setattr(
+        pixhawk_attitude,
+        "rclpy",
+        SimpleNamespace(ok=lambda: True, create_node=lambda _name: fake_node),
+    )
+
+    subscriber = DualPixhawkAttitudeSubscriber(domain_id=0, left_namespace="uav_0", right_namespace="")
+    subscriber.start()
+
+    assert "/uav_0/fmu/out/sensor_mag" in fake_node.topics
+    for instance in range(5):
+        assert f"/uav_0/fmu/out/sensor_mag_{instance}" in fake_node.topics
 
 
 def test_dual_pixhawk_vehicle_gps_sensor_gps_fallback_emits_both_states() -> None:

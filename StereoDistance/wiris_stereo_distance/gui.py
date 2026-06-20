@@ -115,6 +115,8 @@ from wiris_stereo_distance.pixhawk_attitude import (
     discover_ros2_topic_types,
     mavlink_graphable_fields_for_message,
     probe_usb_mavlink_devices,
+    sensor_gps_topics,
+    sensor_mag_topics,
     usb_mavlink_device_candidates,
     _ros2_topic_has_publisher,
 )
@@ -10680,18 +10682,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             checks.append((side, topic, ok))
             sensor_checks = {
                 "vehicle_gps_position": (
-                    f"/{namespace}/fmu/out/vehicle_gps_position" if namespace else "/fmu/out/vehicle_gps_position"
+                    f"/{namespace}/fmu/out/vehicle_gps_position" if namespace else "/fmu/out/vehicle_gps_position",
                 ),
-                "sensor_gps": f"/{namespace}/fmu/out/sensor_gps" if namespace else "/fmu/out/sensor_gps",
-                "sensor_mag": f"/{namespace}/fmu/out/sensor_mag" if namespace else "/fmu/out/sensor_mag",
+                "sensor_gps": sensor_gps_topics(namespace),
+                "sensor_mag": sensor_mag_topics(namespace),
                 "vehicle_magnetometer": (
-                    f"/{namespace}/fmu/out/vehicle_magnetometer" if namespace else "/fmu/out/vehicle_magnetometer"
+                    f"/{namespace}/fmu/out/vehicle_magnetometer" if namespace else "/fmu/out/vehicle_magnetometer",
                 ),
             }
-            self.ros2_sensor_topic_publishers[side] = {
-                key: _ros2_topic_has_publisher(domain_id, sensor_topic, timeout_s=0.2)
-                for key, sensor_topic in sensor_checks.items()
-            }
+            self.ros2_sensor_topic_publishers[side] = {}
+            for key, sensor_topics in sensor_checks.items():
+                self.ros2_sensor_topic_publishers[side][key] = any(
+                    _ros2_topic_has_publisher(domain_id, sensor_topic, timeout_s=0.2)
+                    for sensor_topic in sensor_topics
+                )
         self._refresh_ros2_only_alignment_availability()
         if any(ok for _side, _topic, ok in checks):
             ok_topics = ", ".join(topic for _side, topic, ok in checks if ok)
@@ -10720,11 +10724,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for side in ("left", "right"):
             gps2_label = self.f9p_slot_labels.get(side, {}).get("GPS2") if hasattr(self, "f9p_slot_labels") else None
             if gps2_label is not None and "GPS2" not in self.latest_gps_sensors.get(side, {}) and self._ros2_only_unavailable(side, "GPS2"):
-                self._set_health_label(gps2_label, "ROS2 sensor_gps 미게시", "warn")
+                self._set_health_label(gps2_label, "ROS2 sensor_gps(_0/_1) 미게시", "warn")
             for slot in ("CAN1", "CAN2"):
                 mag_label = self.rm3100_slot_labels.get(side, {}).get(slot) if hasattr(self, "rm3100_slot_labels") else None
                 if mag_label is not None and slot not in self.latest_mag_sensors.get(side, {}) and self._ros2_only_unavailable(side, slot):
-                    self._set_health_label(mag_label, "ROS2 sensor_mag/vehicle_magnetometer 미게시", "warn")
+                    self._set_health_label(mag_label, "ROS2 sensor_mag(_0..4)/vehicle_magnetometer 미게시", "warn")
 
     def _ros2_topic_available(self, side: str, key: str) -> bool:
         return bool(self.ros2_sensor_topic_publishers.get(side, {}).get(key, False))
@@ -14240,7 +14244,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             state = mag_slots.get(slot)
             if state is None:
                 unavailable = self._ros2_only_unavailable(camera, slot)
-                self._set_health_label(label, "ROS2 sensor_mag/vehicle_magnetometer 미게시" if unavailable else "waiting", "warn" if unavailable else "idle")
+                self._set_health_label(
+                    label,
+                    "ROS2 sensor_mag(_0..4)/vehicle_magnetometer 미게시" if unavailable else "waiting",
+                    "warn" if unavailable else "idle",
+                )
                 continue
             age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
             components = "x/y/z=waiting"
@@ -14305,7 +14313,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             state = gps_slots.get(slot)
             if state is None:
                 unavailable = self._ros2_only_unavailable(camera, slot)
-                self._set_health_label(label, "ROS2 sensor_gps 미게시" if unavailable else "waiting", "warn" if unavailable else "idle")
+                self._set_health_label(
+                    label,
+                    "ROS2 sensor_gps(_0/_1) 미게시" if unavailable else "waiting",
+                    "warn" if unavailable else "idle",
+                )
                 continue
             age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
             poor_fix = state.fix_type is not None and state.fix_type < 3
@@ -14317,7 +14329,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         f9p_level = "bad"
         gps2_unavailable = gps2 is None and self._ros2_only_unavailable(camera, "GPS2")
         f9p_summary = (
-            f"{gps_detected}/2 detected · GPS2 ROS2 sensor_gps 미게시"
+            f"{gps_detected}/2 detected · GPS2 ROS2 sensor_gps(_0/_1) 미게시"
             if gps2_unavailable
             else f"{gps_detected}/2 detected"
         )

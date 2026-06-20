@@ -190,6 +190,19 @@ def sensor_mag_topic(namespace: str) -> str:
     return f"/{normalized}/fmu/out/sensor_mag" if normalized else "/fmu/out/sensor_mag"
 
 
+def sensor_mag_topics(namespace: str) -> tuple[str, ...]:
+    normalized = namespace.strip().strip("/")
+    prefix = f"/{normalized}/fmu/out" if normalized else "/fmu/out"
+    return (
+        f"{prefix}/sensor_mag",
+        f"{prefix}/sensor_mag_0",
+        f"{prefix}/sensor_mag_1",
+        f"{prefix}/sensor_mag_2",
+        f"{prefix}/sensor_mag_3",
+        f"{prefix}/sensor_mag_4",
+    )
+
+
 def vehicle_magnetometer_topic(namespace: str) -> str:
     normalized = namespace.strip().strip("/")
     return f"/{normalized}/fmu/out/vehicle_magnetometer" if normalized else "/fmu/out/vehicle_magnetometer"
@@ -198,6 +211,16 @@ def vehicle_magnetometer_topic(namespace: str) -> str:
 def sensor_gps_topic(namespace: str) -> str:
     normalized = namespace.strip().strip("/")
     return f"/{normalized}/fmu/out/sensor_gps" if normalized else "/fmu/out/sensor_gps"
+
+
+def sensor_gps_topics(namespace: str) -> tuple[str, ...]:
+    normalized = namespace.strip().strip("/")
+    prefix = f"/{normalized}/fmu/out" if normalized else "/fmu/out"
+    return (
+        f"{prefix}/sensor_gps",
+        f"{prefix}/sensor_gps_0",
+        f"{prefix}/sensor_gps_1",
+    )
 
 
 def sensor_gnss_relative_topic(namespace: str) -> str:
@@ -615,19 +638,20 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
                 self.subscriptions.append(gps_subscription)
                 self.status_changed.emit(f"구독 시작: {camera_label_ko(camera)} {gps_topic(namespace)}")
             if sensor_mag_msg_type is not None:
-                mag_subscription = self.node.create_subscription(
-                    sensor_mag_msg_type,
-                    sensor_mag_topic(namespace),
-                    lambda message, camera=camera, namespace=namespace: self._handle_mag_message(
-                        camera,
-                        namespace,
-                        message,
-                        topic=sensor_mag_topic(namespace),
-                    ),
-                    _qos_for_px4_out(),
-                )
-                self.subscriptions.append(mag_subscription)
-                self.status_changed.emit(f"구독 시작: {camera_label_ko(camera)} {sensor_mag_topic(namespace)}")
+                for topic in sensor_mag_topics(namespace):
+                    mag_subscription = self.node.create_subscription(
+                        sensor_mag_msg_type,
+                        topic,
+                        lambda message, camera=camera, namespace=namespace, topic=topic: self._handle_mag_message(
+                            camera,
+                            namespace,
+                            message,
+                            topic=topic,
+                        ),
+                        _qos_for_px4_out(),
+                    )
+                    self.subscriptions.append(mag_subscription)
+                    self.status_changed.emit(f"구독 시작: {camera_label_ko(camera)} {topic}")
             if vehicle_mag_msg_type is not None:
                 vehicle_mag_subscription = self.node.create_subscription(
                     vehicle_mag_msg_type,
@@ -645,19 +669,20 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
                     f"구독 시작: {camera_label_ko(camera)} {vehicle_magnetometer_topic(namespace)}"
                 )
             if sensor_gps_msg_type is not None:
-                sensor_gps_subscription = self.node.create_subscription(
-                    sensor_gps_msg_type,
-                    sensor_gps_topic(namespace),
-                    lambda message, camera=camera, namespace=namespace: self._handle_sensor_gps_message(
-                        camera,
-                        namespace,
-                        message,
-                        topic=sensor_gps_topic(namespace),
-                    ),
-                    _qos_for_px4_out(),
-                )
-                self.subscriptions.append(sensor_gps_subscription)
-                self.status_changed.emit(f"구독 시작: {camera_label_ko(camera)} {sensor_gps_topic(namespace)}")
+                for topic in sensor_gps_topics(namespace):
+                    sensor_gps_subscription = self.node.create_subscription(
+                        sensor_gps_msg_type,
+                        topic,
+                        lambda message, camera=camera, namespace=namespace, topic=topic: self._handle_sensor_gps_message(
+                            camera,
+                            namespace,
+                            message,
+                            topic=topic,
+                        ),
+                        _qos_for_px4_out(),
+                    )
+                    self.subscriptions.append(sensor_gps_subscription)
+                    self.status_changed.emit(f"구독 시작: {camera_label_ko(camera)} {topic}")
             if gnss_relative_msg_type is not None:
                 gnss_relative_subscription = self.node.create_subscription(
                     gnss_relative_msg_type,
