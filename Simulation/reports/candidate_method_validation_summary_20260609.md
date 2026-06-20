@@ -83,6 +83,18 @@ session can resume without re-running already rejected branches.
   stereo-center RDF `right/down/forward`, and the public StereoDistance topic is
   FRD+range `forward/right/down/range`; PX4/NED/RTK truth is not a runtime
   input.
+- 2026-06-21 combined package replay: the same repo-local observation-fusion
+  package was rerun with a tracked disparity residual profile at
+  `Simulation/config/disparity_residual_profile_disparity_noise_stress.json`.
+  Command:
+  `python3 Simulation/scripts/run_observation_fusion_deployment_package.py --output-dir /tmp/sasl_observation_fusion_with_config_residual_profile_smoke --tier-spec-json Simulation/config/observation_fusion_fresh_deployment_tiers.json --disparity-residual-profile-json Simulation/config/disparity_residual_profile_disparity_noise_stress.json`.
+  Result: `acceptance_status=PASS`, manifest audit 2/2, default node smoke
+  `fused:MultiBurstObservationFusion:21`, residual node smoke
+  `applied:disparity_noise_stress_seed_281000_disparity_residual`, tier
+  override smoke 2/2, operator-view fusion/package launches PASS, inventory 74
+  files, runtime truth false, coordinate contracts explicit. Scope note: the
+  residual profile is `disparity_noise_stress`-specific and must not be treated
+  as an unconditional residual for all scenarios.
 - Paused by user after offline aggregate and guard-sweep validation. Do not
   treat any later partial ROS2/Gazebo output as validation evidence.
 - After resuming offline-only work, `bbox_anchor_cell_guard_cross_validation.py`

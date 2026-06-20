@@ -5,6 +5,31 @@ correction.
 
 ## Current Simulation Software Deployment PASS
 
+- `fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual`
+  - Status: `PASS`
+  - Experiments:
+    `EXP-20260618-215-b7x3-full-followup` and
+    `EXP-20260618-281-fresh-stereodistance-disparity-residual-search`
+  - Meaning: current repo-reproducible combined observation-fusion plus
+    disparity-residual deployment package PASS for the StereoDistance software
+    path. The observation-fusion default is 7x3 `MultiBurstObservationFusion`;
+    the residual profile is scenario-specific for `disparity_noise_stress`.
+  - Evidence:
+    `Simulation/config/observation_fusion_fresh_deployment_tiers.json`,
+    `Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv`,
+    and
+    `Simulation/config/disparity_residual_profile_disparity_noise_stress.json`.
+    Current-checkout replay:
+    `python3 Simulation/scripts/run_observation_fusion_deployment_package.py --output-dir /tmp/sasl_observation_fusion_with_config_residual_profile_smoke --tier-spec-json Simulation/config/observation_fusion_fresh_deployment_tiers.json --disparity-residual-profile-json Simulation/config/disparity_residual_profile_disparity_noise_stress.json`
+    returned `acceptance_status=PASS`, default node smoke
+    `fused:MultiBurstObservationFusion:21`, residual node smoke
+    `applied:disparity_noise_stress_seed_281000_disparity_residual`,
+    operator-view package launch `PASS`, runtime truth `false`, and explicit
+    coordinate contracts.
+  - Promotion status: simulation/software deployment candidate only; not
+    hardware/WIRIS validated. Do not use this residual profile as an
+    unconditional all-scenario residual; it is scenario-specific.
+
 - `fresh_common_mode_b7x3_aggregate_best`
   - Status: `PASS`
   - Experiment: `EXP-20260618-215-b7x3-full-followup`
