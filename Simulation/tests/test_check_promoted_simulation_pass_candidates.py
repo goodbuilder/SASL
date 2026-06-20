@@ -41,6 +41,53 @@ def test_evaluate_package_result_accepts_base_observation_fusion_pass() -> None:
     assert evaluation["failure_count"] == 0
 
 
+def test_evaluate_origin_reprojection_report_requires_all_axis_improvements() -> None:
+    module = load_module()
+    result = {
+        "result_text": "final_pass=yes\n",
+        "rows": [
+            {
+                "samples": "10",
+                "pass": "yes",
+                "right_rmse_improvement_m": "0.1",
+                "down_rmse_improvement_m": "0.2",
+                "forward_rmse_improvement_m": "1.0",
+            }
+            for _ in range(5)
+        ],
+    }
+
+    evaluation = module.evaluate_origin_reprojection_report(result)
+
+    assert evaluation["status"] == "PASS"
+    assert evaluation["pass_count"] == 5
+    assert evaluation["min_forward_improvement_m"] == 1.0
+
+
+def test_evaluate_origin_reprojection_report_rejects_axis_regression() -> None:
+    module = load_module()
+    rows = [
+        {
+            "samples": "10",
+            "pass": "yes",
+            "right_rmse_improvement_m": "0.1",
+            "down_rmse_improvement_m": "0.2",
+            "forward_rmse_improvement_m": "1.0",
+        }
+        for _ in range(5)
+    ]
+    rows[2]["down_rmse_improvement_m"] = "-0.01"
+    result = {
+        "result_text": "final_pass=yes\n",
+        "rows": rows,
+    }
+
+    evaluation = module.evaluate_origin_reprojection_report(result)
+
+    assert evaluation["status"] == "FAIL"
+    assert "origin_reprojection:down_improvement" in evaluation["failures"]
+
+
 def test_evaluate_package_result_rejects_missing_residual_apply() -> None:
     module = load_module()
     result = {

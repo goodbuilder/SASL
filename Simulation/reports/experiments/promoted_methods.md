@@ -12,7 +12,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=2`, `pass_count=2`,
+Expected result: `status=PASS`, `candidate_count=3`, `pass_count=3`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -23,12 +23,28 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=3`, `pass_count=3`; the
+Expected result: `status=PASS`, `candidate_count=4`, `pass_count=4`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
 
 ## Current Simulation Software Deployment PASS
+
+- `origin-bbox-reprojection-grid-v1 + component_gains + range_only_forward_fusion`
+  - Status: `PASS`
+  - Report:
+    `Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625`
+  - Meaning: current saved Simulation-origin reprojection PASS candidate. It is
+    an oracle-style Simulation truth validation report, not hardware evidence.
+    The policy corrects bbox reprojection with conservative component gains and
+    uses the `range_only_forward_fusion` output contract.
+  - Evidence: `result.txt` has `final_pass=yes`; `validation_gate_summary.csv`
+    has 5/5 validation trials `pass=yes`, 1944 validation samples, and positive
+    minimum RMSE improvement on Right, Down, and Forward. Current checker
+    result: min Right `0.000065 m`, min Down `0.002199 m`, min Forward
+    `3.436333 m`.
+  - Promotion status: simulation-origin candidate only; not hardware/WIRIS
+    validated.
 
 - `fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual`
   - Status: `PASS`

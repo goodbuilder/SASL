@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import subprocess
 import sys
@@ -15,6 +16,11 @@ PACKAGE_SCRIPT = ROOT_DIR / "scripts" / "run_observation_fusion_deployment_packa
 ROBUSTNESS_SCRIPT = ROOT_DIR / "scripts" / "run_rtk_stereo_robustness_sweep.py"
 DEFAULT_TIER_SPEC = ROOT_DIR / "config" / "observation_fusion_fresh_deployment_tiers.json"
 DEFAULT_RESIDUAL_PROFILE = ROOT_DIR / "config" / "disparity_residual_profile_disparity_noise_stress.json"
+DEFAULT_ORIGIN_REPROJECTION_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +30,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--tier-spec-json", type=Path, default=DEFAULT_TIER_SPEC)
     parser.add_argument("--disparity-residual-profile-json", type=Path, default=DEFAULT_RESIDUAL_PROFILE)
+    parser.add_argument("--origin-reprojection-report-dir", type=Path, default=DEFAULT_ORIGIN_REPROJECTION_REPORT)
+    parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -46,6 +54,87 @@ def load_json(path: Path) -> dict[str, object]:
 def require(condition: bool, failures: list[str], reason: str) -> None:
     if not condition:
         failures.append(reason)
+
+
+def float_value(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def run_origin_reprojection_report_check(report_dir: Path) -> dict[str, object]:
+    result_path = report_dir / "result.txt"
+    summary_path = report_dir / "validation_gate_summary.csv"
+    result_text = result_path.read_text(encoding="utf-8") if result_path.is_file() else ""
+    rows: list[dict[str, str]] = []
+    if summary_path.is_file():
+        with summary_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+    return {
+        "report_dir": str(report_dir),
+        "result_path": str(result_path),
+        "summary_path": str(summary_path),
+        "result_text": result_text,
+        "rows": rows,
+    }
+
+
+def evaluate_origin_reprojection_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    result_text = str(result.get("result_text", ""))
+    rows = result.get("rows", [])
+    if not isinstance(rows, list):
+        rows = []
+    require("final_pass=yes" in result_text, failures, "origin_reprojection:final_pass")
+    require(len(rows) >= 5, failures, "origin_reprojection:trial_count")
+    pass_count = 0
+    min_right = float("inf")
+    min_down = float("inf")
+    min_forward = float("inf")
+    sample_count = 0
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("pass", "")).strip().lower() == "yes":
+            pass_count += 1
+        sample_count += int(float_value(row.get("samples")))
+        min_right = min(min_right, float_value(row.get("right_rmse_improvement_m"), default=-1.0))
+        min_down = min(min_down, float_value(row.get("down_rmse_improvement_m"), default=-1.0))
+        min_forward = min(min_forward, float_value(row.get("forward_rmse_improvement_m"), default=-1.0))
+    require(pass_count == len(rows) and pass_count >= 5, failures, "origin_reprojection:trial_pass_count")
+    require(min_right > 0.0, failures, "origin_reprojection:right_improvement")
+    require(min_down > 0.0, failures, "origin_reprojection:down_improvement")
+    require(min_forward > 0.0, failures, "origin_reprojection:forward_improvement")
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "acceptance_status": "PASS" if "final_pass=yes" in result_text else "FAIL",
+        "trial_count": len(rows),
+        "pass_count": pass_count,
+        "sample_count": sample_count,
+        "min_right_improvement_m": None if min_right == float("inf") else min_right,
+        "min_down_improvement_m": None if min_down == float("inf") else min_down,
+        "min_forward_improvement_m": None if min_forward == float("inf") else min_forward,
+        "fusion_status": "not_applicable",
+        "disparity_residual_status": "not_applicable",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_origin_reprojection_result(result: Mapping[str, object]) -> dict[str, object]:
+    rows = result.get("rows", [])
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "result_path": result.get("result_path", ""),
+        "summary_path": result.get("summary_path", ""),
+        "summary": {
+            "row_count": len(rows) if isinstance(rows, list) else 0,
+            "final_pass": "final_pass=yes" in str(result.get("result_text", "")),
+        },
+    }
 
 
 def run_package_check(
@@ -303,6 +392,17 @@ def main() -> int:
     tier_spec_json = Path(args.tier_spec_json)
     residual_profile_json = None if args.skip_residual else Path(args.disparity_residual_profile_json)
     candidates: list[dict[str, object]] = []
+
+    if not args.skip_origin_reprojection_report:
+        origin_result = run_origin_reprojection_report_check(Path(args.origin_reprojection_report_dir))
+        origin_evaluation = evaluate_origin_reprojection_report(origin_result)
+        candidates.append(
+            {
+                "name": "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
+                "result": compact_origin_reprojection_result(origin_result),
+                "evaluation": origin_evaluation,
+            }
+        )
 
     base_dir = output_dir / "observation_fusion"
     base_result = run_package_check(
