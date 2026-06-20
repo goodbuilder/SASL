@@ -13,6 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from wiris_stereo_distance.px4_mag_manager import RM3100_BACKUP_ID, RM3100_PRIMARY_ID
 from wiris_stereo_distance.rtk_geometry import GpsPositionState, gps_state_from_message, gps_topic
 
 from PyQt5 import QtCore
@@ -884,6 +885,13 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
             camera_slots[device_id] = f"{prefix}{len(camera_slots) + 1}"
         return camera_slots[device_id]
 
+    def _mag_slot_for_device(self, camera: str, device_id: int | None) -> str:
+        if device_id == RM3100_PRIMARY_ID:
+            return "CAN1"
+        if device_id == RM3100_BACKUP_ID:
+            return "CAN2"
+        return self._slot_for_device(self.mag_device_slots, camera, device_id, "MAG")
+
     def _handle_mag_message(self, camera: str, namespace: str, message: Any, *, topic: str | None = None) -> None:
         now_s = time.monotonic()
         device_id = getattr(message, "device_id", None)
@@ -904,7 +912,7 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
             sensor_slot=(
                 "SELECTED"
                 if "vehicle_magnetometer" in resolved_topic
-                else self._slot_for_device(self.mag_device_slots, camera, device_id, "CAN")
+                else self._mag_slot_for_device(camera, device_id)
             ),
             timestamp_s=now_s,
             topic=resolved_topic,

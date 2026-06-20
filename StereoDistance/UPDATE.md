@@ -1,5 +1,19 @@
 # 업데이트 기록
 
+## v1.6.3 — 2026-06-21 — ROS2 RM3100 MAG 슬롯 인식 수정
+
+- 변경:
+  - ROS2 `sensor_mag_*` 수신 시 알려진 RM3100 device ID `8944899`, `8944387`을 정렬 탭의 `CAN1`, `CAN2`로 우선 매핑하게 했다.
+  - 내부/GPS compass MAG는 `MAG1..` 보조 슬롯으로 분리해 Magnetometer/Yaw 화면이 RM3100이 아닌 MAG를 CAN1/CAN2로 오인하지 않게 했다.
+  - RM3100 device ID 우선 매핑 단위 테스트를 추가했다.
+- 이유:
+  - Pixhawk 1은 ROS2로 `sensor_mag_0..4`를 모두 publish하지만, 기존 앱은 도착 순서대로 CAN1/CAN2를 붙여 실제 RM3100인 `sensor_mag_3`, `sensor_mag_4`가 정렬 화면에 나타나지 않았다.
+- 확인:
+  - `PYTHONPATH=/usr/lib/python3/dist-packages:/home/moon/Desktop/SASL:/home/moon/Desktop/SASL/StereoDistance /home/moon/Desktop/SASL/Simulation/.venv/bin/python -m pytest tests/test_pixhawk_attitude.py tests/test_px4_mag_manager.py tests/test_stereo.py -k 'ros2_mag_slots_prioritize_known_rm3100_ids_for_can_labels or known_rm3100 or ros2_only_alignment_marks_unpublished_gps2_and_mag_topics or apply_rm3100'` → 3 passed
+  - Pixhawk 1 USB 연결 상태에서 ROS2만 연결해 정렬 탭을 오프스크린 조작/캡처했고, Left GPS1/GPS2와 Left CAN1/CAN2 RM3100 device ID `8944899`, `8944387` 표시를 확인했다.
+- 남은 위험:
+  - Pixhawk 2는 아직 USB로 직접 설정/검증하지 않았다. 현재 캡처에서 Right GPS2/MAG는 미게시 상태로 남아 있다.
+
 ## v1.6.2 — 2026-06-17 — 앱 디렉터리 루트 이동
 
 - 변경:
