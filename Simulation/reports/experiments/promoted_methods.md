@@ -206,7 +206,9 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     (`287450..287499`), and intrinsic-scale (`287200..287249`). Worst residual
     target max abs error was `3.382935 m`; intrinsic-scale range RMSE recovered
     from raw `1.851247 m` and observation `2.385011 m` to residual
-    `0.223355 m`. Runtime truth was `false`; RDF and public FRD+range
+    `0.223355 m`. An additional intrinsic-scale tail check on seeds
+    `287500..287599` also passed `100/100`, with residual target max abs error
+    `1.199696 m`. Runtime truth was `false`; RDF and public FRD+range
     contracts were explicit.
   - Promotion status: Simulation software PASS candidate; not hardware/WIRIS
     validated and not yet wired into the promoted manifest checker.

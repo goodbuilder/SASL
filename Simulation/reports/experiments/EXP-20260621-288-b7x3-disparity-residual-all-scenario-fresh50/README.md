@@ -35,3 +35,8 @@ passing validation seeds.
 
 This method fixes the intrinsic-scale boundary found in EXP-20260621-287, where
 observation fusion alone failed the range-improvement gate.
+
+Additional tail check: `intrinsic_scale_stress_fresh100` reran the same method
+on seeds `287500..287599` and passed `100/100` with range RMSE
+`1.852460 -> 2.388347 -> 0.224077 m`, position RMSE
+`2.395674 -> 0.292032 m`, and residual target max abs `1.199696 m`.
