@@ -286,3 +286,27 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Status: stable Right/Forward candidate, not a Down solution.
   - Meaning: current best all-family non-noop bbox-anchor branch for
     Right/Forward, with Down no-op.
+
+## Current Audit Exclusions
+
+The current checkout was re-scanned for repo-local PASS evidence after adding
+the EXP281 scenario residual catalog. These records are intentionally not
+promoted as final Simulation PASS correction methods:
+
+- `runtime_export_degree1` under
+  `EXP-20260618-281-fresh-stereodistance-disparity-residual-search` is not a
+  final PASS candidate. It has bbox-outlier runtime residual checks `3/4`
+  `PASS`; seed `281003` is `FAIL` because residual range and position RMSE
+  regress. The later `runtime_export_scenario_best` catalog supersedes it.
+- `EXP-20260617-198`, `EXP-20260617-199`, and `EXP-20260617-200` image or
+  inverse-depth prefilter reports are not final PASS candidates. Their
+  `best_method.status` is `FAIL` and their target-window max errors exceed the
+  10 m gate.
+- Registry slug `small_drone_multiburst_median_b1x3_sim3` is already covered
+  by promoted candidate
+  `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`;
+  the same report also contributes the promoted quality candidate
+  `small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge`.
+- Legacy `PARTIAL_PASS`/`FAMILY_LOCAL_PASS` bbox-anchor reports are kept as
+  baselines or family-local evidence only. They are not global final PASS
+  corrections under the strict all-axis gate.
