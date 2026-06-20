@@ -46,6 +46,25 @@ DEFAULT_SCENARIO_RESIDUAL_CATALOG_DIR = (
     / "runtime_export_scenario_best"
     / "scenario_residual_catalog"
 )
+DEFAULT_ALL_SCENARIO_RESIDUAL_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260621-288-b7x3-disparity-residual-all-scenario-fresh50"
+)
+ALL_SCENARIO_RESIDUAL_METHOD = (
+    "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5"
+    "_residual_ray_scale_disparity_deg2_ridge0_clip0p25"
+)
+ALL_SCENARIO_RESIDUAL_SCENARIOS = {
+    "nominal": (50, 287250, 287299),
+    "yaw_pitch_stress": (50, 287300, 287349),
+    "bbox_outlier_stress": (50, 287350, 287399),
+    "combined_sensor_stress": (50, 287400, 287449),
+    "disparity_noise_stress": (50, 287450, 287499),
+    "intrinsic_scale_stress": (50, 287200, 287249),
+    "intrinsic_scale_stress_fresh100": (100, 287500, 287599),
+}
 SMALL_DRONE_PROMOTED_METHODS = [
     "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
     "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
@@ -181,6 +200,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_SCENARIO_RESIDUAL_CATALOG_DIR,
     )
+    parser.add_argument(
+        "--all-scenario-residual-report-dir",
+        type=Path,
+        default=DEFAULT_ALL_SCENARIO_RESIDUAL_REPORT,
+    )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
     parser.add_argument("--skip-origin-bbox-output-report", action="store_true")
@@ -188,6 +212,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-bbox-outlier-report", action="store_true")
     parser.add_argument("--skip-multiburst-residual-aggregate-report", action="store_true")
     parser.add_argument("--skip-scenario-residual-catalog", action="store_true")
+    parser.add_argument("--skip-all-scenario-residual-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -825,6 +850,190 @@ def compact_multiburst_residual_aggregate_result(result: Mapping[str, object]) -
     }
 
 
+def run_all_scenario_residual_report_check(report_dir: Path) -> dict[str, object]:
+    scenario_results: dict[str, object] = {}
+    for scenario in ALL_SCENARIO_RESIDUAL_SCENARIOS:
+        metrics_path = report_dir / scenario / "multiburst_disparity_residual_metrics.json"
+        seed_metrics_path = report_dir / scenario / "multiburst_disparity_residual_seed_metrics.csv"
+        metrics = load_json(metrics_path) if metrics_path.is_file() else {}
+        seed_rows: list[dict[str, str]] = []
+        if seed_metrics_path.is_file():
+            with seed_metrics_path.open(newline="", encoding="utf-8") as handle:
+                seed_rows = [
+                    row for row in csv.DictReader(handle) if row.get("method") == ALL_SCENARIO_RESIDUAL_METHOD
+                ]
+        scenario_results[scenario] = {
+            "metrics_path": str(metrics_path),
+            "seed_metrics_path": str(seed_metrics_path),
+            "metrics": metrics,
+            "seed_rows": seed_rows,
+        }
+    return {
+        "report_dir": str(report_dir),
+        "method": ALL_SCENARIO_RESIDUAL_METHOD,
+        "scenario_results": scenario_results,
+    }
+
+
+def evaluate_all_scenario_residual_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    scenario_results = result.get("scenario_results", {})
+    if not isinstance(scenario_results, Mapping):
+        scenario_results = {}
+    require(
+        set(scenario_results.keys()) == set(ALL_SCENARIO_RESIDUAL_SCENARIOS.keys()),
+        failures,
+        "all_scenario_residual:scenario_coverage",
+    )
+
+    pass_count_total = 0
+    trial_count_total = 0
+    worst_target_max = 0.0
+    max_residual_range_mean = 0.0
+    max_residual_position_mean = 0.0
+    scenario_pass_count = 0
+
+    for scenario, (expected_trials, expected_seed_start, expected_seed_end) in ALL_SCENARIO_RESIDUAL_SCENARIOS.items():
+        scenario_result = scenario_results.get(scenario, {})
+        if not isinstance(scenario_result, Mapping):
+            scenario_result = {}
+        metrics = scenario_result.get("metrics", {})
+        if not isinstance(metrics, Mapping):
+            metrics = {}
+        seed_rows = scenario_result.get("seed_rows", [])
+        if not isinstance(seed_rows, list):
+            seed_rows = []
+        best = metrics.get("best_method", {})
+        if not isinstance(best, Mapping):
+            best = {}
+
+        require(metrics.get("coordinate_contracts_explicit") is True, failures, f"all_scenario_residual:{scenario}:coordinate_contract")
+        require(metrics.get("runtime_truth_used") is False, failures, f"all_scenario_residual:{scenario}:runtime_truth")
+        require(
+            metrics.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+            failures,
+            f"all_scenario_residual:{scenario}:rdf_axis_contract",
+        )
+        require(
+            metrics.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            failures,
+            f"all_scenario_residual:{scenario}:public_topic_contract",
+        )
+        require(metrics.get("seed_start") == expected_seed_start, failures, f"all_scenario_residual:{scenario}:seed_start")
+        require(metrics.get("seed_end") == expected_seed_end, failures, f"all_scenario_residual:{scenario}:seed_end")
+        require(metrics.get("trial_count") == expected_trials, failures, f"all_scenario_residual:{scenario}:trial_count")
+        require(best.get("method") == ALL_SCENARIO_RESIDUAL_METHOD, failures, f"all_scenario_residual:{scenario}:method")
+        require(best.get("status") == "STRICT_PASS", failures, f"all_scenario_residual:{scenario}:status")
+        scenario_pass_count += 1 if best.get("status") == "STRICT_PASS" else 0
+        pass_count = int(float_value(best.get("pass_count")))
+        trial_count = int(float_value(best.get("trial_count")))
+        pass_count_total += pass_count
+        trial_count_total += trial_count
+        require(pass_count == trial_count == expected_trials, failures, f"all_scenario_residual:{scenario}:pass_count")
+        require(len(seed_rows) == expected_trials, failures, f"all_scenario_residual:{scenario}:seed_row_count")
+
+        require(best.get("runtime_truth_used") is False, failures, f"all_scenario_residual:{scenario}:best_runtime_truth")
+        require(
+            best.get("runtime_input_contract", "").startswith("calibration-time residual fit uses train truth only"),
+            failures,
+            f"all_scenario_residual:{scenario}:runtime_input_contract",
+        )
+        require(
+            float_value(best.get("range_rmse_residual_mean_m"))
+            < float_value(best.get("range_rmse_raw_mean_m")),
+            failures,
+            f"all_scenario_residual:{scenario}:raw_range_improvement",
+        )
+        require(
+            float_value(best.get("position_rmse_residual_mean_m"))
+            < float_value(best.get("position_rmse_raw_mean_m"), default=float("inf")),
+            failures,
+            f"all_scenario_residual:{scenario}:raw_position_improvement",
+        )
+        require(
+            float_value(best.get("range_rmse_residual_mean_m"))
+            < float_value(best.get("range_rmse_observation_mean_m"), default=float("inf")),
+            failures,
+            f"all_scenario_residual:{scenario}:observation_range_improvement",
+        )
+        require(
+            float_value(best.get("target_max_abs_error_residual_max_m")) <= 10.0,
+            failures,
+            f"all_scenario_residual:{scenario}:target_gate_10m",
+        )
+        worst_target_max = max(worst_target_max, float_value(best.get("target_max_abs_error_residual_max_m")))
+        max_residual_range_mean = max(max_residual_range_mean, float_value(best.get("range_rmse_residual_mean_m")))
+        max_residual_position_mean = max(max_residual_position_mean, float_value(best.get("position_rmse_residual_mean_m")))
+
+        for row in seed_rows:
+            if not isinstance(row, Mapping):
+                continue
+            require(row.get("method") == ALL_SCENARIO_RESIDUAL_METHOD, failures, f"all_scenario_residual:{scenario}:seed_method")
+            require(row.get("status") == "PASS", failures, f"all_scenario_residual:{scenario}:seed_status")
+            require(str(row.get("runtime_truth_used", "")).lower() == "false", failures, f"all_scenario_residual:{scenario}:seed_runtime_truth")
+            require(
+                row.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+                failures,
+                f"all_scenario_residual:{scenario}:seed_rdf_axis_contract",
+            )
+            require(
+                row.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+                failures,
+                f"all_scenario_residual:{scenario}:seed_public_topic_contract",
+            )
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "method": ALL_SCENARIO_RESIDUAL_METHOD,
+        "acceptance_status": "STRICT_PASS" if not failures else "FAIL",
+        "scenario_count": len(ALL_SCENARIO_RESIDUAL_SCENARIOS),
+        "strict_pass_scenario_count": scenario_pass_count,
+        "pass_count": pass_count_total,
+        "trial_count": trial_count_total,
+        "target_max_abs_error_residual_worst_m": worst_target_max,
+        "range_rmse_residual_mean_max_m": max_residual_range_mean,
+        "position_rmse_residual_mean_max_m": max_residual_position_mean,
+        "fusion_status": "multiburst_observation_fusion_b7x3",
+        "disparity_residual_status": "single_disparity_ray_scale_saved_report",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_all_scenario_residual_result(result: Mapping[str, object]) -> dict[str, object]:
+    scenario_results = result.get("scenario_results", {})
+    if not isinstance(scenario_results, Mapping):
+        scenario_results = {}
+    scenarios: dict[str, object] = {}
+    for scenario, scenario_result in scenario_results.items():
+        if not isinstance(scenario_result, Mapping):
+            continue
+        metrics = scenario_result.get("metrics", {})
+        if not isinstance(metrics, Mapping):
+            metrics = {}
+        best = metrics.get("best_method", {})
+        if not isinstance(best, Mapping):
+            best = {}
+        seed_rows = scenario_result.get("seed_rows", [])
+        scenarios[str(scenario)] = {
+            "metrics_path": scenario_result.get("metrics_path", ""),
+            "seed_metrics_path": scenario_result.get("seed_metrics_path", ""),
+            "status": best.get("status", ""),
+            "pass_count": best.get("pass_count", 0),
+            "trial_count": best.get("trial_count", 0),
+            "seed_row_count": len(seed_rows) if isinstance(seed_rows, list) else 0,
+            "runtime_truth_used": metrics.get("runtime_truth_used", True),
+        }
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "method": result.get("method", ""),
+        "scenario_count": len(scenarios),
+        "scenarios": scenarios,
+    }
+
+
 def run_scenario_residual_catalog_check(catalog_dir: Path) -> dict[str, object]:
     selector_path = catalog_dir / "disparity_residual_profile_label_selector.json"
     catalog_csv_path = catalog_dir / "disparity_residual_profile_catalog.csv"
@@ -1390,6 +1599,19 @@ def main() -> int:
                 "name": "scenario_labeled_disparity_residual_profile_catalog_exp281",
                 "result": compact_scenario_residual_catalog_result(scenario_catalog_result),
                 "evaluation": scenario_catalog_evaluation,
+            }
+        )
+
+    if not args.skip_all_scenario_residual_report:
+        all_scenario_residual_result = run_all_scenario_residual_report_check(
+            Path(args.all_scenario_residual_report_dir)
+        )
+        all_scenario_residual_evaluation = evaluate_all_scenario_residual_report(all_scenario_residual_result)
+        candidates.append(
+            {
+                "name": "multiburst_b7x3_disparity_ray_scale_residual_all_scenario_fresh50",
+                "result": compact_all_scenario_residual_result(all_scenario_residual_result),
+                "evaluation": all_scenario_residual_evaluation,
             }
         )
 
