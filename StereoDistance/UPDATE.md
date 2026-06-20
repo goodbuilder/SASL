@@ -1,5 +1,22 @@
 # 업데이트 기록
 
+## v1.6.4 — 2026-06-21 — Pixhawk 2 DDS export 펌웨어 적용 및 RM3100 ID 확장
+
+- 변경:
+  - Pixhawk 2에 PX4 1.16 DDS export 패치 빌드를 업로드해 `/uav_1/fmu/out/sensor_gps_0`, `sensor_gps_1`, `sensor_mag_0..4`, `vehicle_magnetometer`가 ROS2로 publish되게 했다.
+  - Pixhawk 2의 RM3100 primary device ID `8944643`을 알려진 RM3100 ID로 추가하고, 정렬 탭에서 `CAN1`로 매핑하게 했다.
+  - RM3100 ID 식별과 ROS2 MAG 슬롯 매핑 테스트를 보강했다.
+- 이유:
+  - Pixhawk 2는 PX4 내부 uORB에는 GPS2/MAG가 있었지만 기본 stable 펌웨어라 ROS2 DDS에는 raw GPS/MAG instance가 나오지 않았다.
+  - Pixhawk 2의 RM3100 primary ID가 Pixhawk 1의 `8944899`와 달라 앱이 CAN1로 분류하지 못할 수 있었다.
+- 확인:
+  - Pixhawk 2 PX4 shell: `UXRCE_DDS_KEY=2`, `uxrce_dds_client Running, connected`, patched build `9ca30ebf2c1daef30c806c60e3be3008d5766e6b`, build datetime `Jun 21 2026 01:44:58`.
+  - ROS2 echo: `/uav_1/fmu/out/sensor_gps_0`, `sensor_gps_1`, `sensor_mag_3(device_id=8944643)`, `sensor_mag_4(device_id=8944387)`, `vehicle_magnetometer` publisher와 샘플 확인.
+  - `PYTHONPATH=/usr/lib/python3/dist-packages:/home/moon/Desktop/SASL:/home/moon/Desktop/SASL/StereoDistance /home/moon/Desktop/SASL/Simulation/.venv/bin/python -m pytest StereoDistance/tests/test_pixhawk_attitude.py StereoDistance/tests/test_px4_mag_manager.py StereoDistance/tests/test_stereo.py -k 'ros2_mag_slots_prioritize_known_rm3100_ids_for_can_labels or known_rm3100 or pixhawk2_rm3100_primary_variant or ros2_only_alignment_marks_unpublished_gps2_and_mag_topics or apply_rm3100'` → 4 passed
+  - 앱을 ROS2만으로 오프스크린 조작해 정렬 탭에서 Right GPS1/GPS2와 Right CAN1=`8944643`, CAN2=`8944387` 표시를 확인했다.
+- 남은 위험:
+  - PX4 `vehicle_magnetometer` selected device는 현재 `396817` 내부 MAG로 보고된다. RM3100을 실제 Yaw 기준으로 쓰려면 CAL_MAG priority/CAL_MAG_PRIME 설정을 별도로 적용해야 한다.
+
 ## v1.6.3 — 2026-06-21 — ROS2 RM3100 MAG 슬롯 인식 수정
 
 - 변경:

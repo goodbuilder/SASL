@@ -90,7 +90,7 @@ ros2 topic echo --once /uav_1/fmu/out/sensor_gps_1
 ros2 topic echo --once /uav_1/fmu/out/sensor_mag_4
 ```
 
-## 2026-06-21 Hardware Finding
+## 2026-06-21 Hardware Finding - Pixhawk 1
 
 The USB-connected FMU v6X was successfully flashed with the patched firmware:
 
@@ -126,6 +126,32 @@ actual Ethernet-connected Pixhawks and set unique DDS keys, normally:
 
 Then restart the Micro XRCE-DDS Agent and reboot or restart
 `uxrce_dds_client` on both Pixhawks.
+
+## 2026-06-21 Hardware Finding - Pixhawk 2
+
+The USB-connected Pixhawk 2 was flashed with the same patched DDS export
+firmware after entering the bootloader with `reboot -b`.
+
+- PX4 git hash: `9ca30ebf2c1daef30c806c60e3be3008d5766e6b`
+- PX4 branch: `release/1.16`
+- Build datetime reported by PX4 shell: `Jun 21 2026 01:44:58`
+- `UXRCE_DDS_KEY=2`
+- uXRCE-DDS status: `Running, connected`
+- Agent IP/port: `10.0.0.10:8888`
+- ROS namespace: `/uav_1`
+
+Runtime checks after flashing:
+
+- `/uav_1/fmu/out/sensor_gps_0`: publisher present, `device_id=11141125`
+- `/uav_1/fmu/out/sensor_gps_1`: publisher present, `device_id=11141181`
+- `/uav_1/fmu/out/sensor_mag_3`: publisher present, `device_id=8944643`
+- `/uav_1/fmu/out/sensor_mag_4`: publisher present, `device_id=8944387`
+- `/uav_1/fmu/out/vehicle_magnetometer`: publisher present, selected
+  `device_id=396817`
+
+Pixhawk 2 uses RM3100 device ID `8944643` for the primary RM3100 where
+Pixhawk 1 used `8944899`. The StereoDistance app treats both as known RM3100
+primary IDs and maps them to alignment `CAN1`; `8944387` maps to `CAN2`.
 
 ## Coordinate Contract
 

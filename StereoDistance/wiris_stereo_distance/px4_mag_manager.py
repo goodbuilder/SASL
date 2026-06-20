@@ -6,8 +6,10 @@ from typing import Protocol
 
 
 RM3100_PRIMARY_ID = 8944899
+RM3100_ALTERNATE_PRIMARY_ID = 8944643
+RM3100_PRIMARY_IDS = (RM3100_PRIMARY_ID, RM3100_ALTERNATE_PRIMARY_ID)
 RM3100_BACKUP_ID = 8944387
-RM3100_IDS = (RM3100_PRIMARY_ID, RM3100_BACKUP_ID)
+RM3100_IDS = (*RM3100_PRIMARY_IDS, RM3100_BACKUP_ID)
 INTERNAL_MAG_IDS = (396809, 396817, 4395041)
 MAG_SLOTS = tuple(range(5))
 MAG_PARAM_NAMES = (
@@ -120,6 +122,8 @@ def current_pixhawk_6x_mag_params() -> dict[str, int | float | None]:
 def identify_mag_device(device_id: int | None) -> MagDeviceInfo:
     if device_id == RM3100_PRIMARY_ID:
         return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7D", "DroneCAN", True)
+    if device_id == RM3100_ALTERNATE_PRIMARY_ID:
+        return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7C", "DroneCAN", True)
     if device_id == RM3100_BACKUP_ID:
         return MagDeviceInfo(device_id, "RM3100 #2 / UAVCAN node 0x7B", "DroneCAN", True)
     if device_id in INTERNAL_MAG_IDS:
@@ -173,7 +177,7 @@ def build_mag_status(
     ]
     if not registered_rm3100:
         warnings.append("No RM3100 registered in CAL_MAG. Run Compass Calibration with RM3100 connected.")
-    elif RM3100_PRIMARY_ID in registered_rm3100 and RM3100_BACKUP_ID not in registered_rm3100:
+    elif any(device_id in RM3100_PRIMARY_IDS for device_id in registered_rm3100) and RM3100_BACKUP_ID not in registered_rm3100:
         warnings.append("Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.")
 
     if actual_selected_device_id in INTERNAL_MAG_IDS:

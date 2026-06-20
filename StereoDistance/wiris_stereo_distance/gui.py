@@ -124,6 +124,7 @@ from wiris_stereo_distance.px4_mag_manager import (
     MockParameterStore,
     Px4MagManager,
     RM3100_BACKUP_ID,
+    RM3100_IDS,
     RM3100_PRIMARY_ID,
     current_pixhawk_6x_mag_params,
 )
@@ -5939,7 +5940,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 candidate = int(value)
             except (TypeError, ValueError):
                 continue
-            if candidate in {RM3100_PRIMARY_ID, RM3100_BACKUP_ID} and candidate not in rm_ids:
+            if candidate in RM3100_IDS and candidate not in rm_ids:
                 rm_ids.append(candidate)
         if sensor_slot == "CAN1":
             return rm_ids[0] if rm_ids else RM3100_PRIMARY_ID

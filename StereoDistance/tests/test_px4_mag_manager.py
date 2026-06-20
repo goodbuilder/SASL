@@ -1,4 +1,5 @@
 from wiris_stereo_distance.px4_mag_manager import (
+    RM3100_ALTERNATE_PRIMARY_ID,
     RM3100_BACKUP_ID,
     RM3100_PRIMARY_ID,
     MockParameterStore,
@@ -11,12 +12,26 @@ from wiris_stereo_distance.px4_mag_manager import (
 
 def test_identifies_known_rm3100_devices() -> None:
     primary = identify_mag_device(RM3100_PRIMARY_ID)
+    alternate_primary = identify_mag_device(RM3100_ALTERNATE_PRIMARY_ID)
     backup = identify_mag_device(RM3100_BACKUP_ID)
 
     assert primary.is_rm3100
     assert "0x7D" in primary.device_type
+    assert alternate_primary.is_rm3100
+    assert "0x7C" in alternate_primary.device_type
     assert backup.is_rm3100
     assert "0x7B" in backup.device_type
+
+
+def test_pixhawk2_rm3100_primary_variant_is_registered_as_rm3100() -> None:
+    params = current_pixhawk_6x_mag_params()
+    params["CAL_MAG3_ID"] = RM3100_ALTERNATE_PRIMARY_ID
+
+    status = build_mag_status(params, actual_selected_device_id=RM3100_ALTERNATE_PRIMARY_ID)
+
+    assert status.slots[3].is_rm3100
+    assert status.is_actual_rm3100
+    assert "PX4 is using RM3100" in status.warning_text
 
 
 def test_current_state_marks_cal_mag3_as_rm3100_but_expected_tie_uses_first_highest_priority() -> None:
