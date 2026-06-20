@@ -231,6 +231,15 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `fused:MultiBurstObservationFusion:21`, tier override smoke `2/2`,
     operator-view package launch `PASS`, runtime truth `false`, and explicit
     coordinate contracts.
+    Additional fresh bbox-outlier family evidence is recorded in
+    `Simulation/reports/experiments/EXP-20260621-286-bbox-outlier-b7x3-observation-fresh50`:
+    `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5`
+    passed `50/50 STRICT_PASS` on seeds `286500..286549`, with range RMSE
+    `2.614845 -> 0.407532 m`, position RMSE `5.084014 -> 0.425134 m`, target
+    max abs `3.087384 m`, runtime truth `false`, and explicit image/RDF/FRD
+    contracts. This is bbox-outlier family evidence for `trim_fraction=0.05`;
+    the deployment tier evidence remains the all-scenario `trim_fraction=0.2`
+    aggregate.
   - Promotion status: simulation/software deployment candidate only; not
     hardware/WIRIS validated.
 
