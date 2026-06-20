@@ -3,6 +3,18 @@
 No method is currently promoted as hardware-validated complete all-axis
 correction.
 
+## Repo-Local Recheck
+
+Run the current repo-local software deployment PASS gate with:
+
+```bash
+python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
+  --output-dir /tmp/sasl_promoted_pass_candidates_check
+```
+
+Expected result: `status=PASS`, `candidate_count=2`, `pass_count=2`,
+`runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
+
 ## Current Simulation Software Deployment PASS
 
 - `fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual`
