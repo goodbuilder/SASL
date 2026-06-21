@@ -64,11 +64,21 @@ DEFAULT_SCENARIO_POOLED_RESIDUAL_TRANSFER_REPORT = (
     / "experiments"
     / "EXP-20260621-290-scenario-pooled-catalog-label-matched-fresh100"
 )
+DEFAULT_UNIVERSAL_PRODUCT_RESIDUAL_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260621-292-universal-product-residual-fresh100"
+)
 ALL_SCENARIO_RESIDUAL_METHOD = (
     "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5"
     "_residual_ray_scale_disparity_deg2_ridge0_clip0p25"
 )
 SCENARIO_POOLED_RESIDUAL_METHOD = ALL_SCENARIO_RESIDUAL_METHOD + "_pooled"
+UNIVERSAL_PRODUCT_RESIDUAL_METHOD = (
+    "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5"
+    "_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled"
+)
 SCENARIO_POOLED_RESIDUAL_LABELS = {
     "nominal": (50, 287800, 287849),
     "yaw_pitch_stress": (50, 287850, 287899),
@@ -237,6 +247,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_SCENARIO_POOLED_RESIDUAL_TRANSFER_REPORT,
     )
+    parser.add_argument(
+        "--universal-product-residual-report-dir",
+        type=Path,
+        default=DEFAULT_UNIVERSAL_PRODUCT_RESIDUAL_REPORT,
+    )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
     parser.add_argument("--skip-origin-bbox-output-report", action="store_true")
@@ -246,6 +261,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-scenario-residual-catalog", action="store_true")
     parser.add_argument("--skip-all-scenario-residual-report", action="store_true")
     parser.add_argument("--skip-scenario-pooled-residual-catalog-report", action="store_true")
+    parser.add_argument("--skip-universal-product-residual-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -1279,6 +1295,126 @@ def compact_scenario_pooled_residual_catalog_result(result: Mapping[str, object]
     }
 
 
+def run_universal_product_residual_report_check(report_dir: Path) -> dict[str, object]:
+    summary_path = report_dir / "pooled_disparity_residual_summary.json"
+    profile_path = report_dir / "pooled_disparity_residual_profile.json"
+    seed_metrics_path = report_dir / "pooled_disparity_residual_seed_metrics.csv"
+    summary = load_json(summary_path) if summary_path.is_file() else {}
+    profile = load_json(profile_path) if profile_path.is_file() else {}
+    seed_rows: list[dict[str, str]] = []
+    if seed_metrics_path.is_file():
+        with seed_metrics_path.open(newline="", encoding="utf-8") as handle:
+            seed_rows = list(csv.DictReader(handle))
+    return {
+        "report_dir": str(report_dir),
+        "summary_path": str(summary_path),
+        "profile_path": str(profile_path),
+        "seed_metrics_path": str(seed_metrics_path),
+        "summary": summary,
+        "profile": profile,
+        "seed_rows": seed_rows,
+    }
+
+
+def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    summary = result.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    profile = result.get("profile", {})
+    if not isinstance(profile, Mapping):
+        profile = {}
+    seed_rows = result.get("seed_rows", [])
+    if not isinstance(seed_rows, list):
+        seed_rows = []
+    best = summary.get("best_method", {})
+    if not isinstance(best, Mapping):
+        best = {}
+
+    expected_scenarios = set(SCENARIO_POOLED_RESIDUAL_LABELS)
+    scenario_counts: dict[str, int] = {}
+    scenario_pass_counts: dict[str, int] = {}
+    for row in seed_rows:
+        if not isinstance(row, Mapping):
+            continue
+        scenario = str(row.get("scenario", ""))
+        scenario_counts[scenario] = scenario_counts.get(scenario, 0) + 1
+        if row.get("status") == "PASS":
+            scenario_pass_counts[scenario] = scenario_pass_counts.get(scenario, 0) + 1
+
+    require(summary.get("runtime_truth_used") is False, failures, "universal_product_residual:summary_truth")
+    require(
+        summary.get("coordinate_contracts_explicit") is True,
+        failures,
+        "universal_product_residual:summary_coordinate_contract",
+    )
+    require(best.get("method") == UNIVERSAL_PRODUCT_RESIDUAL_METHOD, failures, "universal_product_residual:method")
+    require(best.get("status") == "STRICT_PASS", failures, "universal_product_residual:status")
+    require(int(float_value(best.get("pass_count"))) == 600, failures, "universal_product_residual:pass_count")
+    require(int(float_value(best.get("trial_count"))) == 600, failures, "universal_product_residual:trial_count")
+    require(best.get("feature_space") == "disparity_forward_product", failures, "universal_product_residual:feature")
+    require(best.get("correction_space") == "ray_scale", failures, "universal_product_residual:correction")
+    require(int(float_value(best.get("degree"))) == 1, failures, "universal_product_residual:degree")
+    require(abs(float_value(best.get("ridge_lambda")) - 10.0) < 1.0e-9, failures, "universal_product_residual:ridge")
+    require(abs(float_value(best.get("correction_clip")) - 0.1) < 1.0e-9, failures, "universal_product_residual:clip")
+    require(set(scenario_counts) == expected_scenarios, failures, "universal_product_residual:scenario_set")
+    for scenario in expected_scenarios:
+        require(scenario_counts.get(scenario) == 100, failures, f"universal_product_residual:{scenario}:trial_count")
+        require(scenario_pass_counts.get(scenario) == 100, failures, f"universal_product_residual:{scenario}:pass_count")
+    require(profile.get("runtime_truth_used") is False, failures, "universal_product_residual:profile_truth")
+    require(profile.get("feature_space") == "disparity_forward_product", failures, "universal_product_residual:profile_feature")
+    require(
+        profile.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+        failures,
+        "universal_product_residual:profile_rdf_axis_contract",
+    )
+    require(
+        profile.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        failures,
+        "universal_product_residual:profile_public_topic_contract",
+    )
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "method": UNIVERSAL_PRODUCT_RESIDUAL_METHOD,
+        "acceptance_status": "STRICT_PASS" if not failures else "FAIL",
+        "scenario_count": len(expected_scenarios),
+        "pass_count": int(float_value(best.get("pass_count"))),
+        "trial_count": int(float_value(best.get("trial_count"))),
+        "target_max_abs_error_residual_worst_m": float_value(best.get("target_max_abs_error_residual_max_m")),
+        "range_rmse_residual_mean_m": float_value(best.get("range_rmse_residual_mean_m")),
+        "fusion_status": "multiburst_observation_fusion_b7x3",
+        "disparity_residual_status": "single_product_feature_pooled_saved_report",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_universal_product_residual_result(result: Mapping[str, object]) -> dict[str, object]:
+    summary = result.get("summary", {})
+    if not isinstance(summary, Mapping):
+        summary = {}
+    best = summary.get("best_method", {})
+    if not isinstance(best, Mapping):
+        best = {}
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "summary_path": result.get("summary_path", ""),
+        "profile_path": result.get("profile_path", ""),
+        "seed_metrics_path": result.get("seed_metrics_path", ""),
+        "summary": {
+            "status": best.get("status", ""),
+            "method": best.get("method", ""),
+            "pass_count": best.get("pass_count", 0),
+            "trial_count": best.get("trial_count", 0),
+            "feature_space": best.get("feature_space", ""),
+            "runtime_truth_used": summary.get("runtime_truth_used", True),
+        },
+    }
+
+
 def run_scenario_residual_catalog_check(catalog_dir: Path) -> dict[str, object]:
     selector_path = catalog_dir / "disparity_residual_profile_label_selector.json"
     catalog_csv_path = catalog_dir / "disparity_residual_profile_catalog.csv"
@@ -1873,6 +2009,21 @@ def main() -> int:
                 "name": "scenario_pooled_disparity_residual_catalog_exp289",
                 "result": compact_scenario_pooled_residual_catalog_result(scenario_pooled_residual_result),
                 "evaluation": scenario_pooled_residual_evaluation,
+            }
+        )
+
+    if not args.skip_universal_product_residual_report:
+        universal_product_residual_result = run_universal_product_residual_report_check(
+            Path(args.universal_product_residual_report_dir)
+        )
+        universal_product_residual_evaluation = evaluate_universal_product_residual_report(
+            universal_product_residual_result
+        )
+        candidates.append(
+            {
+                "name": "universal_product_disparity_forward_residual_exp292",
+                "result": compact_universal_product_residual_result(universal_product_residual_result),
+                "evaluation": universal_product_residual_evaluation,
             }
         )
 

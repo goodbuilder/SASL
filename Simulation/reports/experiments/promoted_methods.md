@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=25`, `pass_count=25`,
+Expected result: `status=PASS`, `candidate_count=26`, `pass_count=26`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=26`, `pass_count=26`; the
+Expected result: `status=PASS`, `candidate_count=27`, `pass_count=27`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -254,6 +254,23 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     and stereo-center RDF, with public FRD+range output.
   - Promotion status: simulation scenario-labeled catalog candidate only; not
     hardware/WIRIS validated.
+
+- `universal_product_disparity_forward_residual_exp292`
+  - Status: `STRICT_PASS`
+  - Experiment:
+    `EXP-20260621-292-universal-product-residual-fresh100`
+  - Meaning: single six-scenario pooled runtime residual profile using the
+    truth-free feature `measured_disparity_px * raw_forward_m`, where
+    `raw_forward_m` is the forward axis of stereo-center RDF.
+  - Evidence: fresh100 validation on seeds `289100..289199` passed `100/100`
+    for each of six scenarios (`600/600` total). Method:
+    `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled`.
+    Runtime truth was `false`; profile application consumes fused measured
+    disparity and stereo-center RDF, with public FRD+range output.
+  - Promotion status: simulation saved-report candidate only; runtime package
+    and hardware/WIRIS validation still required. Mean RMSE versus observation
+    can regress in some non-intrinsic scenarios, so do not deploy without a
+    field-facing acceptance review.
 
 - `fresh_common_mode_b7x3_aggregate_best`
   - Status: `PASS`

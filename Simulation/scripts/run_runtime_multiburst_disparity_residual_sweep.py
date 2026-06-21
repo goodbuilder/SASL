@@ -31,8 +31,8 @@ import run_runtime_repeated_observation_fusion_sweep as repeated  # noqa: E402
 
 RUNTIME_INPUT_CONTRACT = (
     "calibration-time residual fit uses train truth only; runtime applies a polynomial residual model "
-    "from fused measured_disparity_px, inverse_depth, or corrected stereo-center RDF raw_forward_m; "
-    "PX4/RTK truth is audit-only"
+    "from fused measured_disparity_px, inverse_depth, corrected stereo-center RDF raw_forward_m, "
+    "or measured_disparity_px*raw_forward_m; PX4/RTK truth is audit-only"
 )
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
@@ -94,7 +94,17 @@ def feature_values(
         if feature_space == "raw_forward":
             return raw_forward
         return np.log(np.maximum(raw_forward, 1.0e-9))
-    raise ValueError("feature_space must be disparity, inverse_depth, log_disparity, raw_forward, or log_raw_forward")
+    if feature_space in {"disparity_forward_product", "log_disparity_forward_product"}:
+        if raw_forward_m is None:
+            raise ValueError(f"feature_space {feature_space} requires raw_forward_m")
+        product = disparity * np.asarray(raw_forward_m, dtype=float)
+        if feature_space == "disparity_forward_product":
+            return product
+        return np.log(np.maximum(product, 1.0e-9))
+    raise ValueError(
+        "feature_space must be disparity, inverse_depth, log_disparity, raw_forward, "
+        "log_raw_forward, disparity_forward_product, or log_disparity_forward_product"
+    )
 
 
 def normalized_vander(values: np.ndarray, *, degree: int, mean: float, scale: float) -> np.ndarray:
