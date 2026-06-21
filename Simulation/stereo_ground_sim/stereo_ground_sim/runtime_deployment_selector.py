@@ -500,12 +500,13 @@ class MultiBurstObservationFusion:
 
 @dataclass(frozen=True)
 class DisparityResidualRuntimeProfile:
-    """Runtime residual correction driven by measured disparity.
+    """Runtime residual correction driven by runtime measurement features.
 
     The coefficients are fitted offline with calibration truth, but applying the
     profile consumes only a runtime ``RuntimeMeasurementSample`` in
-    stereo-center RDF plus its measured disparity. Array/field order is explicit:
-    RDF is right/down/forward, and public FRD topics are not inputs here.
+    stereo-center RDF plus its measured disparity. Array/field order is
+    explicit: RDF is right/down/forward, so ``raw_forward_m`` is the forward
+    axis of the stereo-center RDF point. Public FRD topics are not inputs here.
     """
 
     feature_space: str
@@ -553,6 +554,13 @@ class DisparityResidualRuntimeProfile:
             return disparity
         if self.feature_space == "log_disparity":
             return math.log(max(disparity, 1.0e-9))
+        raw_forward = finite_float(sample.raw_forward_m)
+        if self.feature_space == "raw_forward":
+            return raw_forward
+        if self.feature_space == "log_raw_forward":
+            if not math.isfinite(raw_forward) or raw_forward <= 0.0:
+                return float("nan")
+            return math.log(max(raw_forward, 1.0e-9))
         return float("nan")
 
     def correction_value(self, sample: RuntimeMeasurementSample) -> float:

@@ -100,6 +100,37 @@ class RuntimeDeploymentSelectorTests(unittest.TestCase):
         self.assertAlmostEqual(features["left_v_std_px"], 2.0)
         self.assertTrue(math.isfinite(features["disparity_forward_product_ratio_to_nominal"]))
 
+    def test_disparity_residual_profile_can_use_raw_forward_feature(self) -> None:
+        module = load_module()
+        sample = module.RuntimeMeasurementSample(
+            raw_right_m=2.0,
+            raw_down_m=1.0,
+            raw_forward_m=100.0,
+            measured_disparity_px=12.0,
+            raw_range_m=100.03,
+            left_u_px=640.0,
+            left_v_px=360.0,
+        )
+
+        profile = module.DisparityResidualRuntimeProfile(
+            feature_space="raw_forward",
+            correction_space="forward_add",
+            degree=1,
+            feature_mean=100.0,
+            feature_scale=10.0,
+            coefficients_low_to_high=(5.0, 0.0),
+            correction_clip=10.0,
+        )
+
+        corrected = profile.apply(sample)
+
+        self.assertIsNotNone(corrected)
+        assert corrected is not None
+        self.assertAlmostEqual(corrected.raw_right_m, 2.0)
+        self.assertAlmostEqual(corrected.raw_down_m, 1.0)
+        self.assertAlmostEqual(corrected.raw_forward_m, 105.0)
+        self.assertAlmostEqual(corrected.measured_disparity_px, 12.0)
+
     def test_runtime_image_observation_mapping_accepts_bbox_aliases(self) -> None:
         module = load_module()
 

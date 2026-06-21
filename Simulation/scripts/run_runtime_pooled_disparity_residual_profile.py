@@ -75,7 +75,13 @@ def train_arrays(
             target = np.sum(truth * points, axis=1) / np.maximum(denom, 1.0e-12) - 1.0
         else:
             raise ValueError("correction_space must be forward_add or ray_scale")
-        features.append(residual.feature_values(series.fused_disparity_px[train_mask], feature_space=feature_space))
+        features.append(
+            residual.feature_values(
+                series.fused_disparity_px[train_mask],
+                feature_space=feature_space,
+                raw_forward_m=series.observation_points[train_mask, 2],
+            )
+        )
         targets.append(target[train_mask])
     return np.concatenate(features), np.concatenate(targets)
 

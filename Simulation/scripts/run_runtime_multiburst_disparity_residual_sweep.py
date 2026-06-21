@@ -31,8 +31,8 @@ import run_runtime_repeated_observation_fusion_sweep as repeated  # noqa: E402
 
 RUNTIME_INPUT_CONTRACT = (
     "calibration-time residual fit uses train truth only; runtime applies a polynomial residual model "
-    "from fused measured_disparity_px or inverse_depth plus corrected stereo-center RDF; PX4/RTK truth "
-    "is audit-only"
+    "from fused measured_disparity_px, inverse_depth, or corrected stereo-center RDF raw_forward_m; "
+    "PX4/RTK truth is audit-only"
 )
 RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
 PUBLIC_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
@@ -74,7 +74,12 @@ def parse_int_list(value: str) -> list[int]:
     return parsed
 
 
-def feature_values(disparity_px: np.ndarray, *, feature_space: str) -> np.ndarray:
+def feature_values(
+    disparity_px: np.ndarray,
+    *,
+    feature_space: str,
+    raw_forward_m: np.ndarray | None = None,
+) -> np.ndarray:
     disparity = np.asarray(disparity_px, dtype=float)
     if feature_space == "disparity":
         return disparity
@@ -82,7 +87,14 @@ def feature_values(disparity_px: np.ndarray, *, feature_space: str) -> np.ndarra
         return disparity
     if feature_space == "log_disparity":
         return np.log(np.maximum(disparity, 1.0e-9))
-    raise ValueError("feature_space must be disparity, inverse_depth, or log_disparity")
+    if feature_space in {"raw_forward", "log_raw_forward"}:
+        if raw_forward_m is None:
+            raise ValueError(f"feature_space {feature_space} requires raw_forward_m")
+        raw_forward = np.asarray(raw_forward_m, dtype=float)
+        if feature_space == "raw_forward":
+            return raw_forward
+        return np.log(np.maximum(raw_forward, 1.0e-9))
+    raise ValueError("feature_space must be disparity, inverse_depth, log_disparity, raw_forward, or log_raw_forward")
 
 
 def normalized_vander(values: np.ndarray, *, degree: int, mean: float, scale: float) -> np.ndarray:
@@ -120,8 +132,13 @@ def fit_ridge_polynomial(
     return mean, scale, tuple(float(value) for value in coeff)
 
 
-def predict_model(model: ResidualModel, disparity_px: np.ndarray) -> np.ndarray:
-    x = feature_values(disparity_px, feature_space=model.feature_space)
+def predict_model(
+    model: ResidualModel,
+    disparity_px: np.ndarray,
+    *,
+    raw_forward_m: np.ndarray | None = None,
+) -> np.ndarray:
+    x = feature_values(disparity_px, feature_space=model.feature_space, raw_forward_m=raw_forward_m)
     design = normalized_vander(x, degree=model.degree, mean=model.feature_mean, scale=model.feature_scale)
     pred = design @ np.asarray(model.coefficients_low_to_high, dtype=float)
     return np.clip(pred, -float(model.correction_clip), float(model.correction_clip))
@@ -273,7 +290,11 @@ def fit_residual_model(
         residual = scale - 1.0
     else:
         raise ValueError("correction_space must be forward_add or ray_scale")
-    x = feature_values(series.fused_disparity_px, feature_space=feature_space)
+    x = feature_values(
+        series.fused_disparity_px,
+        feature_space=feature_space,
+        raw_forward_m=series.observation_points[:, 2],
+    )
     mean, scale, coeff = fit_ridge_polynomial(
         x[train_mask],
         residual[train_mask],
@@ -293,7 +314,11 @@ def fit_residual_model(
 
 
 def apply_residual_model(series: MultiburstProfileSeries, model: ResidualModel) -> np.ndarray:
-    correction = predict_model(model, series.fused_disparity_px)
+    correction = predict_model(
+        model,
+        series.fused_disparity_px,
+        raw_forward_m=series.observation_points[:, 2],
+    )
     corrected = np.asarray(series.observation_points, dtype=float).copy()
     if model.correction_space == "forward_add":
         corrected[:, 2] = corrected[:, 2] + correction
