@@ -453,6 +453,8 @@
         "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled",
         "fresh100_pass": "600/600",
         "tail_fresh100_pass": "600/600",
+        "tail2_report_dir": "Simulation/reports/experiments/EXP-20260621-294-universal-product-residual-tail2-fresh100",
+        "tail2_fresh100_pass": "600/600",
         "runtime_package_smoke": "PASS",
         "feature": "measured_disparity_px * raw_forward_m",
         "train_ratio": "0.5"
