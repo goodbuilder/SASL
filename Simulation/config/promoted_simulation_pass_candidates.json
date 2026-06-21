@@ -421,6 +421,25 @@
       "promotion_limit": "simulation saved-report evidence only; not hardware/WIRIS validated and not yet packaged as the default runtime deployment"
     },
     {
+      "id": "scenario_pooled_disparity_residual_catalog_exp289",
+      "status": "PASS",
+      "scope": "simulation_scenario_pooled_disparity_residual_catalog_saved_report",
+      "method": "scenario-labeled pooled b7x3 disparity ray-scale residual catalog",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog",
+        "catalog_json": "Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog/scenario_pooled_disparity_residual_catalog.json",
+        "transfer_summary_json": "Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog/catalog_transfer_eval/disparity_residual_catalog_transfer_summary.json",
+        "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_deg2_ridge0_clip0p25_pooled",
+        "scenario_profile_pass": "300/300",
+        "label_matched_transfer_pass": "6/6",
+        "label_matched_transfer_trials": "20 per scenario",
+        "single_pooled_profile_result": "FAIL 100/120; intrinsic_scale_stress failed 0/20"
+      },
+      "runtime_contract": "Runtime residual profile selection uses explicit deployment_label/scenario_label/scenario_name only. Selected pooled profiles consume fused measured_disparity_px and corrected stereo-center RDF right/down/forward, then publish public FRD+range.",
+      "promotion_limit": "scenario-labeled simulation catalog evidence only; not hardware/WIRIS validated and not an unconditional single-profile residual"
+    },
+    {
       "id": "fresh_common_mode_b7x3_aggregate_best",
       "status": "PASS",
       "scope": "software_deployment_package",

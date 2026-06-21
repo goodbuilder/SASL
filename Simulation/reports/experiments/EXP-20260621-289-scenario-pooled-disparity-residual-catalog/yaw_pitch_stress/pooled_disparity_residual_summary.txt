@@ -1,0 +1,10 @@
+Pooled runtime disparity residual profile search
+experiment_id: EXP-SEARCH-20260621-pooled-residual-yawpitch
+status: STRICT_PASS
+best_method: multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_deg2_ridge0_clip0p25_pooled
+pass_count: 50/50
+target_max_abs_error_residual_max_m: 1.3072996253031306
+range_rmse_residual_mean_m: 0.2242621155462109
+output_profile_json: /tmp/sasl_pooled_residual_yawpitch/pooled_disparity_residual_profile.json
+runtime_truth_used: False
+Coordinate contract: pooled fit uses calibration/evaluation truth only for train/eval; runtime profile consumes measured disparity and stereo-center RDF right/down/forward.

@@ -52,10 +52,25 @@ DEFAULT_ALL_SCENARIO_RESIDUAL_REPORT = (
     / "experiments"
     / "EXP-20260621-288-b7x3-disparity-residual-all-scenario-fresh50"
 )
+DEFAULT_SCENARIO_POOLED_RESIDUAL_CATALOG_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260621-289-scenario-pooled-disparity-residual-catalog"
+)
 ALL_SCENARIO_RESIDUAL_METHOD = (
     "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5"
     "_residual_ray_scale_disparity_deg2_ridge0_clip0p25"
 )
+SCENARIO_POOLED_RESIDUAL_METHOD = ALL_SCENARIO_RESIDUAL_METHOD + "_pooled"
+SCENARIO_POOLED_RESIDUAL_LABELS = {
+    "nominal": (50, 287800, 287849),
+    "yaw_pitch_stress": (50, 287850, 287899),
+    "bbox_outlier_stress": (50, 287900, 287949),
+    "combined_sensor_stress": (50, 287950, 287999),
+    "disparity_noise_stress": (50, 288000, 288049),
+    "intrinsic_scale_stress": (50, 288050, 288099),
+}
 ALL_SCENARIO_RESIDUAL_SCENARIOS = {
     "nominal": (50, 287250, 287299),
     "yaw_pitch_stress": (50, 287300, 287349),
@@ -206,6 +221,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_ALL_SCENARIO_RESIDUAL_REPORT,
     )
+    parser.add_argument(
+        "--scenario-pooled-residual-catalog-report-dir",
+        type=Path,
+        default=DEFAULT_SCENARIO_POOLED_RESIDUAL_CATALOG_REPORT,
+    )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
     parser.add_argument("--skip-origin-bbox-output-report", action="store_true")
@@ -214,6 +234,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--skip-multiburst-residual-aggregate-report", action="store_true")
     parser.add_argument("--skip-scenario-residual-catalog", action="store_true")
     parser.add_argument("--skip-all-scenario-residual-report", action="store_true")
+    parser.add_argument("--skip-scenario-pooled-residual-catalog-report", action="store_true")
     parser.add_argument("--skip-residual", action="store_true")
     parser.add_argument(
         "--include-non-alias-smoke",
@@ -1035,6 +1056,206 @@ def compact_all_scenario_residual_result(result: Mapping[str, object]) -> dict[s
     }
 
 
+def run_scenario_pooled_residual_catalog_report_check(report_dir: Path) -> dict[str, object]:
+    catalog_path = report_dir / "scenario_pooled_disparity_residual_catalog.json"
+    transfer_summary_path = report_dir / "catalog_transfer_eval" / "disparity_residual_catalog_transfer_summary.json"
+    transfer_matrix_path = report_dir / "catalog_transfer_eval" / "disparity_residual_catalog_transfer_matrix.csv"
+    catalog = load_json(catalog_path) if catalog_path.is_file() else {}
+    transfer_summary = load_json(transfer_summary_path) if transfer_summary_path.is_file() else {}
+    matrix_rows: list[dict[str, str]] = []
+    if transfer_matrix_path.is_file():
+        with transfer_matrix_path.open(newline="", encoding="utf-8") as handle:
+            matrix_rows = list(csv.DictReader(handle))
+    scenario_summaries: dict[str, object] = {}
+    for scenario in SCENARIO_POOLED_RESIDUAL_LABELS:
+        summary_path = report_dir / scenario / "pooled_disparity_residual_summary.json"
+        profile_path = report_dir / scenario / "pooled_disparity_residual_profile.json"
+        scenario_summaries[scenario] = {
+            "summary_path": str(summary_path),
+            "profile_path": str(profile_path),
+            "summary": load_json(summary_path) if summary_path.is_file() else {},
+            "profile": load_json(profile_path) if profile_path.is_file() else {},
+        }
+    return {
+        "report_dir": str(report_dir),
+        "catalog_path": str(catalog_path),
+        "transfer_summary_path": str(transfer_summary_path),
+        "transfer_matrix_path": str(transfer_matrix_path),
+        "catalog": catalog,
+        "transfer_summary": transfer_summary,
+        "matrix_rows": matrix_rows,
+        "scenario_summaries": scenario_summaries,
+    }
+
+
+def evaluate_scenario_pooled_residual_catalog_report(result: Mapping[str, object]) -> dict[str, object]:
+    failures: list[str] = []
+    catalog = result.get("catalog", {})
+    if not isinstance(catalog, Mapping):
+        catalog = {}
+    transfer_summary = result.get("transfer_summary", {})
+    if not isinstance(transfer_summary, Mapping):
+        transfer_summary = {}
+    matrix_rows = result.get("matrix_rows", [])
+    if not isinstance(matrix_rows, list):
+        matrix_rows = []
+    scenario_summaries = result.get("scenario_summaries", {})
+    if not isinstance(scenario_summaries, Mapping):
+        scenario_summaries = {}
+
+    expected_labels = set(SCENARIO_POOLED_RESIDUAL_LABELS)
+    profile_paths = catalog.get("profile_paths", {})
+    if not isinstance(profile_paths, Mapping):
+        profile_paths = {}
+    require(catalog.get("status") == "PASS", failures, "scenario_pooled_residual:catalog_status")
+    require(set(profile_paths.keys()) == expected_labels, failures, "scenario_pooled_residual:profile_labels")
+    require(catalog.get("runtime_truth_used") is False, failures, "scenario_pooled_residual:catalog_runtime_truth")
+    require(
+        catalog.get("coordinate_contracts_explicit") is True,
+        failures,
+        "scenario_pooled_residual:catalog_coordinate_contract",
+    )
+    require(
+        catalog.get("axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+        failures,
+        "scenario_pooled_residual:catalog_axis_contract",
+    )
+    require(
+        catalog.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+        failures,
+        "scenario_pooled_residual:catalog_public_topic_contract",
+    )
+    forbidden_fields = set(catalog.get("forbidden_runtime_fields", []))
+    require(
+        {"px4_local_position", "rtk_truth", "calibration_truth", "validation_error"}.issubset(forbidden_fields),
+        failures,
+        "scenario_pooled_residual:forbidden_runtime_fields",
+    )
+    require(transfer_summary.get("status") == "PASS", failures, "scenario_pooled_residual:transfer_status")
+    require(
+        int(float_value(transfer_summary.get("label_matched_strict_pass_count"))) == len(expected_labels),
+        failures,
+        "scenario_pooled_residual:label_matched_pass_count",
+    )
+    require(transfer_summary.get("runtime_truth_used") is False, failures, "scenario_pooled_residual:transfer_runtime_truth")
+    require(
+        transfer_summary.get("coordinate_contracts_explicit") is True,
+        failures,
+        "scenario_pooled_residual:transfer_coordinate_contract",
+    )
+
+    pass_count_total = 0
+    trial_count_total = 0
+    label_matched_pass_count = 0
+    worst_label_target = 0.0
+    for scenario, (expected_trials, expected_seed_start, expected_seed_end) in SCENARIO_POOLED_RESIDUAL_LABELS.items():
+        scenario_result = scenario_summaries.get(scenario, {})
+        if not isinstance(scenario_result, Mapping):
+            scenario_result = {}
+        summary = scenario_result.get("summary", {})
+        profile = scenario_result.get("profile", {})
+        if not isinstance(summary, Mapping):
+            summary = {}
+        if not isinstance(profile, Mapping):
+            profile = {}
+        best = summary.get("best_method", {})
+        if not isinstance(best, Mapping):
+            best = {}
+        require(summary.get("runtime_truth_used") is False, failures, f"scenario_pooled_residual:{scenario}:summary_truth")
+        require(
+            summary.get("coordinate_contracts_explicit") is True,
+            failures,
+            f"scenario_pooled_residual:{scenario}:summary_coordinate_contract",
+        )
+        require(summary.get("seed_start") == expected_seed_start, failures, f"scenario_pooled_residual:{scenario}:seed_start")
+        require(summary.get("seed_end") == expected_seed_end, failures, f"scenario_pooled_residual:{scenario}:seed_end")
+        require(
+            summary.get("trial_count_per_scenario") == expected_trials,
+            failures,
+            f"scenario_pooled_residual:{scenario}:trial_count",
+        )
+        require(best.get("method") == SCENARIO_POOLED_RESIDUAL_METHOD, failures, f"scenario_pooled_residual:{scenario}:method")
+        require(best.get("status") == "STRICT_PASS", failures, f"scenario_pooled_residual:{scenario}:status")
+        pass_count = int(float_value(best.get("pass_count")))
+        trial_count = int(float_value(best.get("trial_count")))
+        pass_count_total += pass_count
+        trial_count_total += trial_count
+        require(pass_count == trial_count == expected_trials, failures, f"scenario_pooled_residual:{scenario}:pass_count")
+        require(profile.get("runtime_truth_used") is False, failures, f"scenario_pooled_residual:{scenario}:profile_truth")
+        require(
+            profile.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
+            failures,
+            f"scenario_pooled_residual:{scenario}:profile_rdf_axis_contract",
+        )
+        require(
+            profile.get("public_topic_contract") == "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+            failures,
+            f"scenario_pooled_residual:{scenario}:profile_public_topic_contract",
+        )
+
+        label_row = next(
+            (
+                row
+                for row in matrix_rows
+                if isinstance(row, Mapping)
+                and row.get("eval_scenario") == scenario
+                and row.get("profile_label") == scenario
+            ),
+            {},
+        )
+        require(label_row.get("status") == "STRICT_PASS", failures, f"scenario_pooled_residual:{scenario}:label_transfer_status")
+        require(int(float_value(label_row.get("pass_count"))) == 20, failures, f"scenario_pooled_residual:{scenario}:label_transfer_pass_count")
+        require(str(label_row.get("runtime_truth_used", "")).lower() == "false", failures, f"scenario_pooled_residual:{scenario}:label_transfer_truth")
+        if label_row.get("status") == "STRICT_PASS":
+            label_matched_pass_count += 1
+        worst_label_target = max(worst_label_target, float_value(label_row.get("target_max_abs_error_residual_max_m")))
+
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "failure_count": len(failures),
+        "failures": failures,
+        "method": SCENARIO_POOLED_RESIDUAL_METHOD,
+        "acceptance_status": "PASS" if not failures else "FAIL",
+        "scenario_count": len(expected_labels),
+        "profile_count": len(profile_paths),
+        "scenario_profile_pass_count": pass_count_total,
+        "scenario_profile_trial_count": trial_count_total,
+        "label_matched_strict_pass_count": label_matched_pass_count,
+        "label_matched_scenario_count": len(expected_labels),
+        "label_transfer_target_max_abs_error_residual_worst_m": worst_label_target,
+        "fusion_status": "multiburst_observation_fusion_b7x3",
+        "disparity_residual_status": "scenario_pooled_disparity_residual_catalog",
+        "runtime_truth_used": False,
+        "coordinate_contracts_explicit": True,
+    }
+
+
+def compact_scenario_pooled_residual_catalog_result(result: Mapping[str, object]) -> dict[str, object]:
+    catalog = result.get("catalog", {})
+    if not isinstance(catalog, Mapping):
+        catalog = {}
+    transfer_summary = result.get("transfer_summary", {})
+    if not isinstance(transfer_summary, Mapping):
+        transfer_summary = {}
+    profile_paths = catalog.get("profile_paths", {})
+    if not isinstance(profile_paths, Mapping):
+        profile_paths = {}
+    return {
+        "report_dir": result.get("report_dir", ""),
+        "catalog_path": result.get("catalog_path", ""),
+        "transfer_summary_path": result.get("transfer_summary_path", ""),
+        "transfer_matrix_path": result.get("transfer_matrix_path", ""),
+        "summary": {
+            "catalog_status": catalog.get("status", ""),
+            "profile_count": len(profile_paths),
+            "transfer_status": transfer_summary.get("status", ""),
+            "label_matched_strict_pass_count": transfer_summary.get("label_matched_strict_pass_count", 0),
+            "label_matched_scenario_count": transfer_summary.get("label_matched_scenario_count", 0),
+            "runtime_truth_used": transfer_summary.get("runtime_truth_used", True),
+        },
+    }
+
+
 def run_scenario_residual_catalog_check(catalog_dir: Path) -> dict[str, object]:
     selector_path = catalog_dir / "disparity_residual_profile_label_selector.json"
     catalog_csv_path = catalog_dir / "disparity_residual_profile_catalog.csv"
@@ -1613,6 +1834,21 @@ def main() -> int:
                 "name": "multiburst_b7x3_disparity_ray_scale_residual_all_scenario_fresh50",
                 "result": compact_all_scenario_residual_result(all_scenario_residual_result),
                 "evaluation": all_scenario_residual_evaluation,
+            }
+        )
+
+    if not args.skip_scenario_pooled_residual_catalog_report:
+        scenario_pooled_residual_result = run_scenario_pooled_residual_catalog_report_check(
+            Path(args.scenario_pooled_residual_catalog_report_dir)
+        )
+        scenario_pooled_residual_evaluation = evaluate_scenario_pooled_residual_catalog_report(
+            scenario_pooled_residual_result
+        )
+        candidates.append(
+            {
+                "name": "scenario_pooled_disparity_residual_catalog_exp289",
+                "result": compact_scenario_pooled_residual_catalog_result(scenario_pooled_residual_result),
+                "evaluation": scenario_pooled_residual_evaluation,
             }
         )
 

@@ -1,0 +1,30 @@
+{
+  "mode": "scenario_pooled_disparity_residual_catalog",
+  "status": "PASS",
+  "profile_paths": {
+    "nominal": "nominal/pooled_disparity_residual_profile.json",
+    "yaw_pitch_stress": "yaw_pitch_stress/pooled_disparity_residual_profile.json",
+    "bbox_outlier_stress": "bbox_outlier_stress/pooled_disparity_residual_profile.json",
+    "combined_sensor_stress": "combined_sensor_stress/pooled_disparity_residual_profile.json",
+    "disparity_noise_stress": "disparity_noise_stress/pooled_disparity_residual_profile.json",
+    "intrinsic_scale_stress": "intrinsic_scale_stress/pooled_disparity_residual_profile.json"
+  },
+  "selection_input_fields": [
+    "deployment_label",
+    "scenario_label",
+    "scenario_name"
+  ],
+  "forbidden_runtime_fields": [
+    "px4_local_position",
+    "rtk_truth",
+    "calibration_truth",
+    "validation_error",
+    "target_window_label",
+    "true_disparity_px",
+    "true_image_feature"
+  ],
+  "runtime_truth_used": false,
+  "coordinate_contracts_explicit": true,
+  "axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+  "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)"
+}

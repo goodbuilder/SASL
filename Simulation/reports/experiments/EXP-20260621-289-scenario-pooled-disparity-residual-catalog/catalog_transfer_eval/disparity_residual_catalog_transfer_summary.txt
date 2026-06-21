@@ -1,0 +1,7 @@
+Disparity residual catalog transfer evaluation
+status: PASS
+catalog_json: Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog/scenario_pooled_disparity_residual_catalog.json
+label_matched: 6/6
+output_matrix_csv: Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog/catalog_transfer_eval/disparity_residual_catalog_transfer_matrix.csv
+runtime_truth_used: False
+truth is used only for offline transfer metrics; residual profile application consumes measured disparity and corrected stereo-center RDF right/down/forward; public output remains FRD+range

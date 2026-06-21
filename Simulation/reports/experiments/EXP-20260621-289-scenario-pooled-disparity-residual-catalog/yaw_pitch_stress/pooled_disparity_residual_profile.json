@@ -1,0 +1,55 @@
+{
+  "profile_type": "DisparityResidualRuntimeProfile",
+  "profile_id": "EXP-SEARCH-20260621-pooled-residual-yawpitch_pooled_disparity_residual",
+  "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_deg2_ridge0_clip0p25_pooled",
+  "feature_space": "disparity",
+  "correction_space": "ray_scale",
+  "degree": 2,
+  "ridge_lambda": 0.0,
+  "correction_clip": 0.25,
+  "feature_mean": 244.51911845038654,
+  "feature_scale": 163.2962666544501,
+  "coefficients_low_to_high": [
+    -5.800792598219709e-06,
+    -3.782298232835676e-05,
+    1.5528786411740057e-05
+  ],
+  "observation_fusion": {
+    "burst_count": 7,
+    "observations_per_burst": 3,
+    "inner_mode": "trimmed_mean",
+    "outer_mode": "trimmed_mean",
+    "trim_fraction": 0.05,
+    "common_fraction": 0.5
+  },
+  "fit_source": {
+    "base_profile_json": "Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json",
+    "scenarios": [
+      "yaw_pitch_stress"
+    ],
+    "seed_start": 287850,
+    "seed_end": 287899,
+    "trial_count_per_scenario": 50,
+    "sample_count": 1680,
+    "train_ratio": 0.75,
+    "target_range_m": 1852.0,
+    "target_window_m": 30.0,
+    "target_oversample_count": 72,
+    "truth_usage": "pooled_calibration_train_splits_only"
+  },
+  "runtime_inputs": [
+    "raw_right_m",
+    "raw_down_m",
+    "raw_forward_m",
+    "measured_disparity_px",
+    "left_u_px",
+    "left_v_px"
+  ],
+  "runtime_truth_used": false,
+  "coordinate_contracts_explicit": true,
+  "runtime_input_contract": "calibration-time residual fit uses train truth only; runtime applies a polynomial residual model from fused measured_disparity_px or inverse_depth plus corrected stereo-center RDF; PX4/RTK truth is audit-only",
+  "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+  "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+  "truth_rdf_transform_contract": "explicit T_source_to_stereo_rdf required; direct axis alias rdf_right=east/rdf_down=down/rdf_forward=north is forbidden",
+  "ned_to_rdf_contract": "explicit T_source_to_stereo_rdf required; direct axis alias rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+}

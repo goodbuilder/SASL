@@ -15,7 +15,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --output-dir /tmp/sasl_promoted_pass_candidates_check
 ```
 
-Expected result: `status=PASS`, `candidate_count=24`, `pass_count=24`,
+Expected result: `status=PASS`, `candidate_count=25`, `pass_count=25`,
 `runtime_truth_used=false`, and `coordinate_contracts_explicit=true`.
 
 To also re-run the heavier six-scenario non-alias catalog smoke:
@@ -26,7 +26,7 @@ python3 Simulation/scripts/check_promoted_simulation_pass_candidates.py \
   --include-non-alias-smoke
 ```
 
-Expected result: `status=PASS`, `candidate_count=25`, `pass_count=25`; the
+Expected result: `status=PASS`, `candidate_count=26`, `pass_count=26`; the
 non-alias candidate must report `deployment_strategy=scenario_profile_catalog`,
 `single_profile_pass=false`, selector package `PASS`, operator launch `PASS`,
 runtime truth `false`, and direct NED-to-RDF alias forbidden.
@@ -235,6 +235,24 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Promotion status: simulation saved catalog candidate only; deploy only with
     explicit truth-free operator/deployment labels, not as an unconditional
     single all-scenario residual.
+
+- `scenario_pooled_disparity_residual_catalog_exp289`
+  - Status: `PASS`
+  - Experiment:
+    `EXP-20260621-289-scenario-pooled-disparity-residual-catalog`
+  - Meaning: scenario-labeled catalog of runtime-loadable pooled residual
+    profiles using the EXP288 b7x3 disparity ray-scale method. Each profile is
+    pooled over 50 calibration/evaluation seeds for its own scenario; runtime
+    selection must use explicit truth-free deployment/scenario labels.
+  - Evidence: six label-specific pooled profiles passed `50/50` each
+    (`300/300` total). A fresh transfer evaluation on seeds `288100..288119`
+    passed label-matched `6/6` scenarios. A single pooled 6-scenario profile was
+    also tested and failed `100/120` because intrinsic-scale failed `0/20`, so
+    this is a catalog method rather than an unconditional single profile.
+    Runtime truth was `false`; profile application consumes measured disparity
+    and stereo-center RDF, with public FRD+range output.
+  - Promotion status: simulation scenario-labeled catalog candidate only; not
+    hardware/WIRIS validated.
 
 - `fresh_common_mode_b7x3_aggregate_best`
   - Status: `PASS`
