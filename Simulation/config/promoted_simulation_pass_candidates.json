@@ -452,9 +452,10 @@
         "runtime_package_smoke_summary_json": "Simulation/reports/experiments/EXP-20260621-292-universal-product-residual-fresh100/runtime_package_smoke/observation_fusion_deployment_package_summary.json",
         "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled",
         "fresh100_pass": "600/600",
+        "tail_fresh100_pass": "600/600",
         "runtime_package_smoke": "PASS",
         "feature": "measured_disparity_px * raw_forward_m",
-        "train_ratio": "0.6"
+        "train_ratio": "0.5"
       },
       "runtime_contract": "Runtime application consumes fused measured_disparity_px and corrected stereo-center RDF right/down/forward. The residual feature is measured_disparity_px * raw_forward_m, where raw_forward_m is RDF forward. It then publishes public FRD+range.",
       "promotion_limit": "simulation saved-report evidence only; runtime package and hardware/WIRIS validation still required; mean RMSE versus observation can regress in non-intrinsic scenarios"

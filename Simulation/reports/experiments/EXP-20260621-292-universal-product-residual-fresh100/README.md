@@ -16,7 +16,7 @@ product `measured_disparity_px * raw_forward_m`.
   `intrinsic_scale_stress`
 - Seeds: `289100..289199`
 - Trials: `100` per scenario, `600` total
-- Train ratio: `0.6`
+- Train ratio: `0.5`
 - Observation fusion: b7x3 trimmed mean, trim `0.05`, common fraction `0.5`
 - Residual method:
   `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled`
@@ -39,7 +39,7 @@ The fixed product residual profile passed `600/600` fresh trials.
 | disparity_noise_stress | 100/100 |
 | intrinsic_scale_stress | 100/100 |
 
-Worst residual target max-abs error was `6.313016 m`, below the 10 m
+Worst residual target max-abs error was `6.311829 m`, below the 10 m
 simulation gate. This method optimizes the strict simulation PASS criteria
 against raw triangulation; it can worsen mean RMSE versus the b7x3 observation
 output in some non-intrinsic scenarios. Treat it as a simulation PASS candidate
@@ -52,6 +52,11 @@ Runtime package smoke:
 - StereoDistance node smoke reports
   `applied:EXP-20260621-292-universal-product-residual-fresh100_pooled_disparity_residual`.
 - Runtime truth remains `false`.
+
+Follow-up tail validation:
+
+- `EXP-20260621-293-universal-product-residual-tail-fresh100` passed an
+  independent fresh100 block (`289300..289399`) with `600/600` STRICT_PASS.
 
 ## Coordinate Contract
 

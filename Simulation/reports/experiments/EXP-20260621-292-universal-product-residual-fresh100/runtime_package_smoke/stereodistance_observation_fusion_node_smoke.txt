@@ -8,7 +8,7 @@ adapter_class: MultiBurstObservationFusion
 observation_count: 21
 observation_fusion_status: fused:MultiBurstObservationFusion:21
 estimated_range_m: 800.0113093376372
-corrected_range_m: 799.5367495652838
+corrected_range_m: 799.5372494819346
 disparity_residual_status: applied:EXP-20260621-292-universal-product-residual-fresh100_pooled_disparity_residual
 disparity_residual_feature_selector_summary_status: ready:current_sample
 disparity_residual_feature_selector_window_count: 0
