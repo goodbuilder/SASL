@@ -45,6 +45,14 @@ against raw triangulation; it can worsen mean RMSE versus the b7x3 observation
 output in some non-intrinsic scenarios. Treat it as a simulation PASS candidate
 that still needs runtime package and hardware/WIRIS validation before field use.
 
+Runtime package smoke:
+
+- `runtime_package_smoke/observation_fusion_deployment_package_summary.json`
+  reports `acceptance_status: PASS`.
+- StereoDistance node smoke reports
+  `applied:EXP-20260621-292-universal-product-residual-fresh100_pooled_disparity_residual`.
+- Runtime truth remains `false`.
+
 ## Coordinate Contract
 
 - Image inputs: `left_u_px`, `left_v_px`, and `measured_disparity_px`.

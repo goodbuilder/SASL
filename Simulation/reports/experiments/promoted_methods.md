@@ -265,11 +265,12 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
   - Evidence: fresh100 validation on seeds `289100..289199` passed `100/100`
     for each of six scenarios (`600/600` total). Method:
     `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled`.
-    Runtime truth was `false`; profile application consumes fused measured
-    disparity and stereo-center RDF, with public FRD+range output.
-  - Promotion status: simulation saved-report candidate only; runtime package
-    and hardware/WIRIS validation still required. Mean RMSE versus observation
-    can regress in some non-intrinsic scenarios, so do not deploy without a
+    Runtime package smoke passed with the residual applied in the StereoDistance
+    node path. Runtime truth was `false`; profile application consumes fused
+    measured disparity and stereo-center RDF, with public FRD+range output.
+  - Promotion status: simulation plus runtime package smoke candidate only;
+    hardware/WIRIS validation still required. Mean RMSE versus observation can
+    regress in some non-intrinsic scenarios, so do not deploy without a
     field-facing acceptance review.
 
 - `fresh_common_mode_b7x3_aggregate_best`

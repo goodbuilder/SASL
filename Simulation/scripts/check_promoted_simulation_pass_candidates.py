@@ -1299,8 +1299,14 @@ def run_universal_product_residual_report_check(report_dir: Path) -> dict[str, o
     summary_path = report_dir / "pooled_disparity_residual_summary.json"
     profile_path = report_dir / "pooled_disparity_residual_profile.json"
     seed_metrics_path = report_dir / "pooled_disparity_residual_seed_metrics.csv"
+    package_summary_path = report_dir / "runtime_package_smoke" / "observation_fusion_deployment_package_summary.json"
+    package_acceptance_path = (
+        report_dir / "runtime_package_smoke" / "observation_fusion_deployment_package_acceptance.json"
+    )
     summary = load_json(summary_path) if summary_path.is_file() else {}
     profile = load_json(profile_path) if profile_path.is_file() else {}
+    package_summary = load_json(package_summary_path) if package_summary_path.is_file() else {}
+    package_acceptance = load_json(package_acceptance_path) if package_acceptance_path.is_file() else {}
     seed_rows: list[dict[str, str]] = []
     if seed_metrics_path.is_file():
         with seed_metrics_path.open(newline="", encoding="utf-8") as handle:
@@ -1310,8 +1316,12 @@ def run_universal_product_residual_report_check(report_dir: Path) -> dict[str, o
         "summary_path": str(summary_path),
         "profile_path": str(profile_path),
         "seed_metrics_path": str(seed_metrics_path),
+        "package_summary_path": str(package_summary_path),
+        "package_acceptance_path": str(package_acceptance_path),
         "summary": summary,
         "profile": profile,
+        "package_summary": package_summary,
+        "package_acceptance": package_acceptance,
         "seed_rows": seed_rows,
     }
 
@@ -1324,6 +1334,12 @@ def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> 
     profile = result.get("profile", {})
     if not isinstance(profile, Mapping):
         profile = {}
+    package_summary = result.get("package_summary", {})
+    if not isinstance(package_summary, Mapping):
+        package_summary = {}
+    package_acceptance = result.get("package_acceptance", {})
+    if not isinstance(package_acceptance, Mapping):
+        package_acceptance = {}
     seed_rows = result.get("seed_rows", [])
     if not isinstance(seed_rows, list):
         seed_rows = []
@@ -1364,6 +1380,27 @@ def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> 
     require(profile.get("runtime_truth_used") is False, failures, "universal_product_residual:profile_truth")
     require(profile.get("feature_space") == "disparity_forward_product", failures, "universal_product_residual:profile_feature")
     require(
+        package_summary.get("acceptance_status") == "PASS",
+        failures,
+        "universal_product_residual:package_acceptance_status",
+    )
+    require(
+        str(package_summary.get("stereodistance_node_smoke_disparity_residual_status", "")).startswith("applied:"),
+        failures,
+        "universal_product_residual:package_node_residual_applied",
+    )
+    require(
+        package_summary.get("runtime_truth_used") is False,
+        failures,
+        "universal_product_residual:package_truth",
+    )
+    require(package_acceptance.get("status") == "PASS", failures, "universal_product_residual:acceptance_status")
+    require(
+        package_acceptance.get("runtime_truth_used") is False,
+        failures,
+        "universal_product_residual:acceptance_truth",
+    )
+    require(
         profile.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
         failures,
         "universal_product_residual:profile_rdf_axis_contract",
@@ -1385,6 +1422,7 @@ def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> 
         "trial_count": int(float_value(best.get("trial_count"))),
         "target_max_abs_error_residual_worst_m": float_value(best.get("target_max_abs_error_residual_max_m")),
         "range_rmse_residual_mean_m": float_value(best.get("range_rmse_residual_mean_m")),
+        "runtime_package_acceptance_status": package_summary.get("acceptance_status", ""),
         "fusion_status": "multiburst_observation_fusion_b7x3",
         "disparity_residual_status": "single_product_feature_pooled_saved_report",
         "runtime_truth_used": False,
@@ -1404,6 +1442,8 @@ def compact_universal_product_residual_result(result: Mapping[str, object]) -> d
         "summary_path": result.get("summary_path", ""),
         "profile_path": result.get("profile_path", ""),
         "seed_metrics_path": result.get("seed_metrics_path", ""),
+        "package_summary_path": result.get("package_summary_path", ""),
+        "package_acceptance_path": result.get("package_acceptance_path", ""),
         "summary": {
             "status": best.get("status", ""),
             "method": best.get("method", ""),

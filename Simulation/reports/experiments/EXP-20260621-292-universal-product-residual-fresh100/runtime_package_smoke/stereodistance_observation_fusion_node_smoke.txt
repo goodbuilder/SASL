@@ -1,0 +1,19 @@
+StereoDistance observation-fusion node smoke
+status: PASS
+manifest_json: /tmp/sasl_exp292_product_runtime_package_smoke/observation_fusion_runtime_manifest.json
+profile_json: Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json
+disparity_residual_profile_json: /tmp/sasl_exp292_product_runtime_package_smoke/disparity_residual_profile.json
+tier: fresh_common_mode_b7x3_aggregate_best
+adapter_class: MultiBurstObservationFusion
+observation_count: 21
+observation_fusion_status: fused:MultiBurstObservationFusion:21
+estimated_range_m: 800.0113093376372
+corrected_range_m: 799.5367495652838
+disparity_residual_status: applied:EXP-20260621-292-universal-product-residual-fresh100_pooled_disparity_residual
+disparity_residual_feature_selector_summary_status: ready:current_sample
+disparity_residual_feature_selector_window_count: 0
+disparity_residual_feature_selector_status: disabled
+disparity_residual_feature_selected_label:
+runtime_truth_used: False
+coordinate_contract: runtime image left_u_px/left_v_px/measured_disparity_px -> stereo-center RDF(right,down,forward); node feature summary uses current raw/corrected stereo-center RDF only; public StereoDistance output remains FRD+range
+failure_count: 0

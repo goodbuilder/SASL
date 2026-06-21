@@ -291,7 +291,16 @@ def check_package(package_dir: Path) -> dict[str, object]:
                 "disparity_residual_profile:runtime_truth_input",
             )
             require(
-                str(residual_profile.get("feature_space", "")) in {"disparity", "inverse_depth", "log_disparity"},
+                str(residual_profile.get("feature_space", ""))
+                in {
+                    "disparity",
+                    "inverse_depth",
+                    "log_disparity",
+                    "raw_forward",
+                    "log_raw_forward",
+                    "disparity_forward_product",
+                    "log_disparity_forward_product",
+                },
                 failures,
                 "disparity_residual_profile:feature_space",
             )
