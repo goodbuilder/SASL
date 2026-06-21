@@ -457,6 +457,8 @@
         "tail2_fresh100_pass": "600/600",
         "tail3_report_dir": "Simulation/reports/experiments/EXP-20260621-295-universal-product-residual-tail3-fresh100",
         "tail3_fresh100_pass": "600/600",
+        "tail4_report_dir": "Simulation/reports/experiments/EXP-20260621-296-universal-product-residual-tail4-fresh100",
+        "tail4_fresh100_pass": "600/600",
         "runtime_package_smoke": "PASS",
         "feature": "measured_disparity_px * raw_forward_m",
         "train_ratio": "0.5"

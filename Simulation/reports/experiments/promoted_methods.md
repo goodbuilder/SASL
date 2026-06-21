@@ -264,8 +264,8 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     `raw_forward_m` is the forward axis of stereo-center RDF.
   - Evidence: fresh100 validation on seeds `289100..289199` passed `100/100`
     for each of six scenarios (`600/600` total), with tail fresh100 blocks on
-    seeds `289300..289399`, `289500..289599`, and `289700..289799` also
-    passing `600/600` each. Method:
+    seeds `289300..289399`, `289500..289599`, `289700..289799`, and
+    `289900..289999` also passing `600/600` each. Method:
     `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled`.
     Train ratio was `0.5`. Runtime package smoke passed with the residual applied in the StereoDistance
     node path. Runtime truth was `false`; profile application consumes fused

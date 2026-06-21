@@ -88,6 +88,12 @@ DEFAULT_UNIVERSAL_PRODUCT_RESIDUAL_TAIL3_REPORT = (
     / "experiments"
     / "EXP-20260621-295-universal-product-residual-tail3-fresh100"
 )
+DEFAULT_UNIVERSAL_PRODUCT_RESIDUAL_TAIL4_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260621-296-universal-product-residual-tail4-fresh100"
+)
 ALL_SCENARIO_RESIDUAL_METHOD = (
     "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5"
     "_residual_ray_scale_disparity_deg2_ridge0_clip0p25"
@@ -284,6 +290,11 @@ def parse_args() -> argparse.Namespace:
         "--universal-product-residual-tail3-report-dir",
         type=Path,
         default=DEFAULT_UNIVERSAL_PRODUCT_RESIDUAL_TAIL3_REPORT,
+    )
+    parser.add_argument(
+        "--universal-product-residual-tail4-report-dir",
+        type=Path,
+        default=DEFAULT_UNIVERSAL_PRODUCT_RESIDUAL_TAIL4_REPORT,
     )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
@@ -1329,7 +1340,11 @@ def compact_scenario_pooled_residual_catalog_result(result: Mapping[str, object]
 
 
 def run_universal_product_residual_report_check(
-    report_dir: Path, tail_report_dir: Path, tail2_report_dir: Path, tail3_report_dir: Path
+    report_dir: Path,
+    tail_report_dir: Path,
+    tail2_report_dir: Path,
+    tail3_report_dir: Path,
+    tail4_report_dir: Path,
 ) -> dict[str, object]:
     summary_path = report_dir / "pooled_disparity_residual_summary.json"
     profile_path = report_dir / "pooled_disparity_residual_profile.json"
@@ -1344,6 +1359,8 @@ def run_universal_product_residual_report_check(
     tail2_seed_metrics_path = tail2_report_dir / "pooled_disparity_residual_seed_metrics.csv"
     tail3_summary_path = tail3_report_dir / "pooled_disparity_residual_summary.json"
     tail3_seed_metrics_path = tail3_report_dir / "pooled_disparity_residual_seed_metrics.csv"
+    tail4_summary_path = tail4_report_dir / "pooled_disparity_residual_summary.json"
+    tail4_seed_metrics_path = tail4_report_dir / "pooled_disparity_residual_seed_metrics.csv"
     summary = load_json(summary_path) if summary_path.is_file() else {}
     profile = load_json(profile_path) if profile_path.is_file() else {}
     package_summary = load_json(package_summary_path) if package_summary_path.is_file() else {}
@@ -1351,6 +1368,7 @@ def run_universal_product_residual_report_check(
     tail_summary = load_json(tail_summary_path) if tail_summary_path.is_file() else {}
     tail2_summary = load_json(tail2_summary_path) if tail2_summary_path.is_file() else {}
     tail3_summary = load_json(tail3_summary_path) if tail3_summary_path.is_file() else {}
+    tail4_summary = load_json(tail4_summary_path) if tail4_summary_path.is_file() else {}
     seed_rows: list[dict[str, str]] = []
     if seed_metrics_path.is_file():
         with seed_metrics_path.open(newline="", encoding="utf-8") as handle:
@@ -1371,6 +1389,9 @@ def run_universal_product_residual_report_check(
         "tail3_report_dir": str(tail3_report_dir),
         "tail3_summary_path": str(tail3_summary_path),
         "tail3_seed_metrics_path": str(tail3_seed_metrics_path),
+        "tail4_report_dir": str(tail4_report_dir),
+        "tail4_summary_path": str(tail4_summary_path),
+        "tail4_seed_metrics_path": str(tail4_seed_metrics_path),
         "summary": summary,
         "profile": profile,
         "package_summary": package_summary,
@@ -1378,6 +1399,7 @@ def run_universal_product_residual_report_check(
         "tail_summary": tail_summary,
         "tail2_summary": tail2_summary,
         "tail3_summary": tail3_summary,
+        "tail4_summary": tail4_summary,
         "seed_rows": seed_rows,
     }
 
@@ -1414,6 +1436,12 @@ def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> 
     tail3_best = tail3_summary.get("best_method", {})
     if not isinstance(tail3_best, Mapping):
         tail3_best = {}
+    tail4_summary = result.get("tail4_summary", {})
+    if not isinstance(tail4_summary, Mapping):
+        tail4_summary = {}
+    tail4_best = tail4_summary.get("best_method", {})
+    if not isinstance(tail4_best, Mapping):
+        tail4_best = {}
     seed_rows = result.get("seed_rows", [])
     if not isinstance(seed_rows, list):
         seed_rows = []
@@ -1513,6 +1541,23 @@ def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> 
         failures,
         "universal_product_residual:tail3_trial_count",
     )
+    require(tail4_summary.get("runtime_truth_used") is False, failures, "universal_product_residual:tail4_truth")
+    require(
+        tail4_best.get("method") == UNIVERSAL_PRODUCT_RESIDUAL_METHOD,
+        failures,
+        "universal_product_residual:tail4_method",
+    )
+    require(tail4_best.get("status") == "STRICT_PASS", failures, "universal_product_residual:tail4_status")
+    require(
+        int(float_value(tail4_best.get("pass_count"))) == 600,
+        failures,
+        "universal_product_residual:tail4_pass_count",
+    )
+    require(
+        int(float_value(tail4_best.get("trial_count"))) == 600,
+        failures,
+        "universal_product_residual:tail4_trial_count",
+    )
     require(
         profile.get("rdf_axis_contract") == "stereo_center_opencv_optical:RDF(right,down,forward)",
         failures,
@@ -1542,6 +1587,8 @@ def evaluate_universal_product_residual_report(result: Mapping[str, object]) -> 
         "tail2_trial_count": int(float_value(tail2_best.get("trial_count"))),
         "tail3_pass_count": int(float_value(tail3_best.get("pass_count"))),
         "tail3_trial_count": int(float_value(tail3_best.get("trial_count"))),
+        "tail4_pass_count": int(float_value(tail4_best.get("pass_count"))),
+        "tail4_trial_count": int(float_value(tail4_best.get("trial_count"))),
         "fusion_status": "multiburst_observation_fusion_b7x3",
         "disparity_residual_status": "single_product_feature_pooled_saved_report",
         "runtime_truth_used": False,
@@ -1566,6 +1613,7 @@ def compact_universal_product_residual_result(result: Mapping[str, object]) -> d
         "tail_summary_path": result.get("tail_summary_path", ""),
         "tail2_summary_path": result.get("tail2_summary_path", ""),
         "tail3_summary_path": result.get("tail3_summary_path", ""),
+        "tail4_summary_path": result.get("tail4_summary_path", ""),
         "summary": {
             "status": best.get("status", ""),
             "method": best.get("method", ""),
@@ -2180,6 +2228,7 @@ def main() -> int:
             Path(args.universal_product_residual_tail_report_dir),
             Path(args.universal_product_residual_tail2_report_dir),
             Path(args.universal_product_residual_tail3_report_dir),
+            Path(args.universal_product_residual_tail4_report_dir),
         )
         universal_product_residual_evaluation = evaluate_universal_product_residual_report(
             universal_product_residual_result
