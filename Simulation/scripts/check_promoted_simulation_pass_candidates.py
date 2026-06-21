@@ -58,6 +58,12 @@ DEFAULT_SCENARIO_POOLED_RESIDUAL_CATALOG_REPORT = (
     / "experiments"
     / "EXP-20260621-289-scenario-pooled-disparity-residual-catalog"
 )
+DEFAULT_SCENARIO_POOLED_RESIDUAL_TRANSFER_REPORT = (
+    ROOT_DIR
+    / "reports"
+    / "experiments"
+    / "EXP-20260621-290-scenario-pooled-catalog-label-matched-fresh100"
+)
 ALL_SCENARIO_RESIDUAL_METHOD = (
     "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5"
     "_residual_ray_scale_disparity_deg2_ridge0_clip0p25"
@@ -225,6 +231,11 @@ def parse_args() -> argparse.Namespace:
         "--scenario-pooled-residual-catalog-report-dir",
         type=Path,
         default=DEFAULT_SCENARIO_POOLED_RESIDUAL_CATALOG_REPORT,
+    )
+    parser.add_argument(
+        "--scenario-pooled-residual-transfer-report-dir",
+        type=Path,
+        default=DEFAULT_SCENARIO_POOLED_RESIDUAL_TRANSFER_REPORT,
     )
     parser.add_argument("--skip-origin-reprojection-report", action="store_true")
     parser.add_argument("--skip-bbox-anchor-fullscreen-report", action="store_true")
@@ -1056,10 +1067,10 @@ def compact_all_scenario_residual_result(result: Mapping[str, object]) -> dict[s
     }
 
 
-def run_scenario_pooled_residual_catalog_report_check(report_dir: Path) -> dict[str, object]:
+def run_scenario_pooled_residual_catalog_report_check(report_dir: Path, transfer_report_dir: Path) -> dict[str, object]:
     catalog_path = report_dir / "scenario_pooled_disparity_residual_catalog.json"
-    transfer_summary_path = report_dir / "catalog_transfer_eval" / "disparity_residual_catalog_transfer_summary.json"
-    transfer_matrix_path = report_dir / "catalog_transfer_eval" / "disparity_residual_catalog_transfer_matrix.csv"
+    transfer_summary_path = transfer_report_dir / "disparity_residual_catalog_transfer_summary.json"
+    transfer_matrix_path = transfer_report_dir / "disparity_residual_catalog_transfer_matrix.csv"
     catalog = load_json(catalog_path) if catalog_path.is_file() else {}
     transfer_summary = load_json(transfer_summary_path) if transfer_summary_path.is_file() else {}
     matrix_rows: list[dict[str, str]] = []
@@ -1078,6 +1089,7 @@ def run_scenario_pooled_residual_catalog_report_check(report_dir: Path) -> dict[
         }
     return {
         "report_dir": str(report_dir),
+        "transfer_report_dir": str(transfer_report_dir),
         "catalog_path": str(catalog_path),
         "transfer_summary_path": str(transfer_summary_path),
         "transfer_matrix_path": str(transfer_matrix_path),
@@ -1132,6 +1144,16 @@ def evaluate_scenario_pooled_residual_catalog_report(result: Mapping[str, object
         "scenario_pooled_residual:forbidden_runtime_fields",
     )
     require(transfer_summary.get("status") == "PASS", failures, "scenario_pooled_residual:transfer_status")
+    require(
+        transfer_summary.get("label_matched_only") is True,
+        failures,
+        "scenario_pooled_residual:transfer_label_matched_only",
+    )
+    require(
+        int(float_value(transfer_summary.get("trial_count"))) == 100,
+        failures,
+        "scenario_pooled_residual:transfer_trial_count",
+    )
     require(
         int(float_value(transfer_summary.get("label_matched_strict_pass_count"))) == len(expected_labels),
         failures,
@@ -1204,7 +1226,7 @@ def evaluate_scenario_pooled_residual_catalog_report(result: Mapping[str, object
             {},
         )
         require(label_row.get("status") == "STRICT_PASS", failures, f"scenario_pooled_residual:{scenario}:label_transfer_status")
-        require(int(float_value(label_row.get("pass_count"))) == 20, failures, f"scenario_pooled_residual:{scenario}:label_transfer_pass_count")
+        require(int(float_value(label_row.get("pass_count"))) == 100, failures, f"scenario_pooled_residual:{scenario}:label_transfer_pass_count")
         require(str(label_row.get("runtime_truth_used", "")).lower() == "false", failures, f"scenario_pooled_residual:{scenario}:label_transfer_truth")
         if label_row.get("status") == "STRICT_PASS":
             label_matched_pass_count += 1
@@ -1242,6 +1264,7 @@ def compact_scenario_pooled_residual_catalog_result(result: Mapping[str, object]
         profile_paths = {}
     return {
         "report_dir": result.get("report_dir", ""),
+        "transfer_report_dir": result.get("transfer_report_dir", ""),
         "catalog_path": result.get("catalog_path", ""),
         "transfer_summary_path": result.get("transfer_summary_path", ""),
         "transfer_matrix_path": result.get("transfer_matrix_path", ""),
@@ -1839,7 +1862,8 @@ def main() -> int:
 
     if not args.skip_scenario_pooled_residual_catalog_report:
         scenario_pooled_residual_result = run_scenario_pooled_residual_catalog_report_check(
-            Path(args.scenario_pooled_residual_catalog_report_dir)
+            Path(args.scenario_pooled_residual_catalog_report_dir),
+            Path(args.scenario_pooled_residual_transfer_report_dir),
         )
         scenario_pooled_residual_evaluation = evaluate_scenario_pooled_residual_catalog_report(
             scenario_pooled_residual_result

@@ -57,6 +57,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--target-range-m", type=float, default=1852.0)
     parser.add_argument("--target-window-m", type=float, default=30.0)
     parser.add_argument("--target-oversample-count", type=int, default=72)
+    parser.add_argument(
+        "--label-matched-only",
+        action="store_true",
+        help="Evaluate only the profile whose catalog label matches each scenario.",
+    )
     return parser.parse_args(argv)
 
 
@@ -244,9 +249,16 @@ def run(argv: Sequence[str] | None = None) -> dict[str, object]:
     profile_payloads = {label: load_json(path) for label, path in profile_paths.items()}
     rows: list[dict[str, object]] = []
     for eval_scenario in args.scenarios:
+        if args.label_matched_only and eval_scenario not in runtime_profiles:
+            raise ValueError(f"missing label-matched profile for scenario: {eval_scenario}")
         for seed_index in range(int(args.trial_count)):
             seed = int(args.seed_start) + seed_index
-            for profile_label, runtime_profile in runtime_profiles.items():
+            profile_items = (
+                [(eval_scenario, runtime_profiles[eval_scenario])]
+                if args.label_matched_only
+                else list(runtime_profiles.items())
+            )
+            for profile_label, runtime_profile in profile_items:
                 observation = profile_payloads[profile_label].get("observation_fusion", {})
                 if not isinstance(observation, Mapping):
                     observation = {}
@@ -295,6 +307,7 @@ def run(argv: Sequence[str] | None = None) -> dict[str, object]:
         "base_profile_json": str(args.base_profile_json),
         "scenario_count": len(args.scenarios),
         "profile_count": len(runtime_profiles),
+        "label_matched_only": bool(args.label_matched_only),
         "seed_start": int(args.seed_start),
         "seed_end": int(args.seed_start) + int(args.trial_count) - 1,
         "trial_count": int(args.trial_count),

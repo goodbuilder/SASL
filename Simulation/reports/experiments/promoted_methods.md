@@ -245,10 +245,11 @@ runtime truth `false`, and direct NED-to-RDF alias forbidden.
     pooled over 50 calibration/evaluation seeds for its own scenario; runtime
     selection must use explicit truth-free deployment/scenario labels.
   - Evidence: six label-specific pooled profiles passed `50/50` each
-    (`300/300` total). A fresh transfer evaluation on seeds `288100..288119`
-    passed label-matched `6/6` scenarios. A single pooled 6-scenario profile was
-    also tested and failed `100/120` because intrinsic-scale failed `0/20`, so
-    this is a catalog method rather than an unconditional single profile.
+    (`300/300` total). Fresh label-matched transfer on seeds `288400..288499`
+    passed `100/100` for each of six scenarios (`600/600` total). A single
+    pooled 6-scenario profile was also tested and failed `100/120` because
+    intrinsic-scale failed `0/20`, so this is a catalog method rather than an
+    unconditional single profile.
     Runtime truth was `false`; profile application consumes measured disparity
     and stereo-center RDF, with public FRD+range output.
   - Promotion status: simulation scenario-labeled catalog candidate only; not
