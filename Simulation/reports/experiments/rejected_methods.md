@@ -612,3 +612,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: stronger ridge keeps the tracked target row close to EXP391
     but worsens worst target and aggregate RMSE. Reject this ratio ray-scale
     regularization setting.
+
+- `EXP-20260623-402-b15x7-common0p2-disparityoverforward-ridge30-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.428529 m`.
+  - Interpretation: lower ridge behaves close to ridge `3000`; it does not
+    reduce intrinsic-scale failures and still worsens aggregate RMSE. Reject
+    this ratio ray-scale regularization setting.
