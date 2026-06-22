@@ -1279,3 +1279,12 @@ in inputs, observation model, gate, or method.
     `2.497483 m`.
   - Interpretation: ridge `30` does not fix the raw-forward ray-scale RMSE
     regression or intrinsic failures. Reject standalone deployment.
+
+- `EXP-20260623-487-b21x5-common0p02-inversedepth-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; intrinsic seed
+    `298188` improves from `3.587690 m` to `3.567690 m`, but aggregate target
+    max regresses from `4.076885 m` to `4.096885 m`.
+  - Interpretation: inverse-depth additive gives selected intrinsic relief but
+    worsens aggregate metrics and remains undeployable. Reject standalone
+    deployment.
