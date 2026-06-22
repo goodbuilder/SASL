@@ -734,3 +734,11 @@ in inputs, observation model, gate, or method.
     than the scalar additive branches, but still worsens observation aggregate
     and does not fix intrinsic-scale failures. Reject this additive interaction
     branch.
+
+- `EXP-20260623-422-b15x7-common0p1-logdisparityforwardproduct-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.659469 m`.
+  - Interpretation: log product additive correction is effectively tied with
+    unlogged product additive correction and still worsens aggregate RMSE.
+    Reject this log interaction branch.
