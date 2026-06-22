@@ -1157,3 +1157,13 @@ in inputs, observation model, gate, or method.
     regresses from `4.348758 m` to `4.368757 m`.
   - Interpretation: common `0.1` worsens the disparity-over-forward additive
     branch relative to common `0.05` and `0.02`. Reject standalone deployment.
+
+- `EXP-20260623-474-b15x7-common0p05-forwardoverdisparity-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.131533 m` to `4.054890 m`, but range RMSE regresses from
+    `0.912856 m` to `0.916160 m` and position RMSE regresses from
+    `2.486601 m` to `2.504185 m`.
+  - Interpretation: forward-over-disparity ray scaling gives target-tail relief
+    but worsens average accuracy and still fails the intrinsic gate. Reject
+    standalone deployment.
