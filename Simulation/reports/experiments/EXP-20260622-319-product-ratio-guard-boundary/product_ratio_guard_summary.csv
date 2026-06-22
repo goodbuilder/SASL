@@ -1,0 +1,8 @@
+source,intrinsic_min,intrinsic_max,non_intrinsic_min,non_intrinsic_max,perfect_separation,midpoint_threshold
+Simulation/reports/experiments/EXP-20260622-312-runtime-raw-forward-guard-window-sensitivity/window_sensitivity.csv,1.0022265531383678,1.006695205483106,1.0002870194555762,1.0067199953050532,False,1.0044732742217106
+Simulation/reports/experiments/EXP-20260622-313-runtime-raw-forward-guard-oversample-sensitivity/oversample_sensitivity.csv,1.005931238458632,1.0059345954300627,1.003985838004323,1.0058996985292261,True,1.005915468493929
+Simulation/reports/experiments/EXP-20260622-314-runtime-raw-forward-guard-train-ratio-sensitivity/train_ratio_sensitivity.csv,1.0059316444526487,1.0059352842385194,1.0039860594781924,1.0059007996630285,True,1.0059162220578386
+Simulation/reports/experiments/EXP-20260622-315-runtime-raw-forward-guard-b9x5-sensitivity/b9x5_sensitivity.csv,1.0059319272603886,1.0059348055532,1.0039863650400143,1.0059004318334779,True,1.0059161795469334
+Simulation/reports/experiments/EXP-20260622-316-runtime-raw-forward-guard-median-b9x5-sensitivity/median_b9x5_sensitivity.csv,1.0059316198674848,1.0059342099269781,1.0039860357632453,1.0058996948884023,True,1.0059156573779435
+Simulation/reports/experiments/EXP-20260622-317-runtime-raw-forward-guard-b11x5-sensitivity/b11x5_sensitivity.csv,1.0059319229353154,1.0059346058704355,1.0039862467857301,1.0058998729002557,True,1.0059158979177856
+Simulation/reports/experiments/EXP-20260622-318-runtime-raw-forward-guard-common0p8-b9x5-sensitivity/common0p8_b9x5_sensitivity.csv,1.0059326025839488,1.0059345427909034,1.0039870577432985,1.0058996159101268,True,1.0059161092470377

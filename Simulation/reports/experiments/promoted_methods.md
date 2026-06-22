@@ -741,3 +741,14 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is stereo-center OpenCV optical RDF
   `raw_forward_mean_m` over the default 520-sample window.
 - Next action: continue stress-variant validation.
+
+## EXP-20260622-319 Product-Ratio Guard Boundary
+
+- Status: boundary evidence; not a promoted guard.
+- Finding: `disparity_forward_product_ratio_to_nominal` separates most
+  fixed-window variants, but overlaps when EXP312 window-size sensitivity rows
+  are pooled.
+- Contract: product ratio is derived from runtime `measured_disparity_px *
+  raw_forward_m`, where `raw_forward_m` is stereo-center RDF forward.
+- Next action: keep `raw_forward_mean_m` as primary guard unless a stricter
+  fixed-window product-ratio contract is needed later.
