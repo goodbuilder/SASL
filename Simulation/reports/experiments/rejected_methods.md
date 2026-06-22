@@ -670,3 +670,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: log scaling improves the tracked seed versus raw-forward
     ray-scale but worsens worst target and range aggregate. Reject this
     log-raw-forward ray-scale branch.
+
+- `EXP-20260623-414-b15x7-common0p1-lograwforward-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.688441 m`.
+  - Interpretation: log scaling stays near the raw-forward additive aggregate
+    anchor but does not improve it and still fails every intrinsic-scale row.
+    Reject this log additive branch.
