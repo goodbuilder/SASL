@@ -588,3 +588,11 @@ in inputs, observation model, gate, or method.
     (`0.924142 m` to `0.917849 m`) and position RMSE (`2.492225 m` to
     `2.489703 m`), but misses every intrinsic-scale target row. Reject as a
     standalone method and retain the aggregate-preserving behavior as a clue.
+
+- `EXP-20260623-399-b15x7-common0p2-rawforward-forwardadd-deg2-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.691247 m`.
+  - Interpretation: degree `2` matches the degree `1` failure count and tracked
+    target row while slightly worsening aggregate RMSE. Reject this quadratic
+    raw-forward additive branch.
