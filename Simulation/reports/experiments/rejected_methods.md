@@ -1133,3 +1133,11 @@ in inputs, observation model, gate, or method.
     `0.975941 m`.
   - Interpretation: stronger ridge regularization does not reduce the
     disparity-over-forward ray-scale blow-up. Reject standalone deployment.
+
+- `EXP-20260623-471-b15x7-common0p05-disparityoverforward-forwardadd-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max matches
+    degree 1 at `4.131533 m` to `4.151533 m`, while range RMSE is slightly
+    worse at `0.914358 m`.
+  - Interpretation: degree 2 does not improve the disparity-over-forward
+    additive branch. Reject standalone deployment.
