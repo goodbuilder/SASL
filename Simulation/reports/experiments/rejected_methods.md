@@ -1075,3 +1075,11 @@ in inputs, observation model, gate, or method.
     `0.914699 m`.
   - Interpretation: fewer, larger bursts are worse than b15x7 and b21x5 for
     this branch. Reject standalone deployment.
+
+- `EXP-20260623-464-b21x5-common0p05-rawforward-forwardadd-degree1-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; clip `0.01`
+    softens intrinsic seed `298188` to `3.603210 m` to `3.613209 m`, but range
+    RMSE improvement shrinks to `0.911104 m` to `0.907569 m`.
+  - Interpretation: softened b21x5 clip does not recover intrinsic rows and
+    loses much of the RMSE benefit. Reject standalone deployment.
