@@ -955,3 +955,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: log-disparity-only ray scale is aggregate-stable but does
     not recover intrinsic-scale rows. Reject standalone deployment and use as a
     lower-regression contrast branch.
+
+- `EXP-20260623-450-b15x7-common0p1-logdisparity-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; common `0.1`
+    target max is `4.348758 m` to `4.317681 m`, worse than the common0.05
+    log-disparity ray-scale contrast branch.
+  - Interpretation: stricter common sampling does not recover intrinsic-scale
+    rows and slightly worsens aggregate metrics. Reject standalone deployment.
