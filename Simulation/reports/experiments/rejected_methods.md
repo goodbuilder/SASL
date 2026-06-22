@@ -981,3 +981,13 @@ in inputs, observation model, gate, or method.
   - Interpretation: inverse-depth ray scale gives selected intrinsic relief
     but is aggregate-worse than log-disparity ray scale and still fails the
     intrinsic gate. Reject standalone deployment.
+
+- `EXP-20260623-453-b15x7-common0p05-rawforward-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.131533 m` to `3.985144 m` and range RMSE only moves from
+    `0.912856 m` to `0.913125 m`, but intrinsic seed `298188` regresses from
+    `3.623977 m` to `3.799632 m`.
+  - Interpretation: raw-forward ray scale is aggregate-stable and useful as a
+    contrast branch, but it does not solve intrinsic-scale rows. Reject
+    standalone deployment.
