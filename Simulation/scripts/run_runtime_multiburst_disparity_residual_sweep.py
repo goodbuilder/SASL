@@ -94,16 +94,27 @@ def feature_values(
         if feature_space == "raw_forward":
             return raw_forward
         return np.log(np.maximum(raw_forward, 1.0e-9))
-    if feature_space in {"disparity_forward_product", "log_disparity_forward_product"}:
+    if feature_space in {
+        "disparity_forward_product",
+        "log_disparity_forward_product",
+        "forward_over_disparity",
+        "disparity_over_forward",
+    }:
         if raw_forward_m is None:
             raise ValueError(f"feature_space {feature_space} requires raw_forward_m")
-        product = disparity * np.asarray(raw_forward_m, dtype=float)
+        raw_forward = np.asarray(raw_forward_m, dtype=float)
+        product = disparity * raw_forward
         if feature_space == "disparity_forward_product":
             return product
-        return np.log(np.maximum(product, 1.0e-9))
+        if feature_space == "log_disparity_forward_product":
+            return np.log(np.maximum(product, 1.0e-9))
+        if feature_space == "forward_over_disparity":
+            return raw_forward / np.maximum(disparity, 1.0e-9)
+        return disparity / np.maximum(raw_forward, 1.0e-9)
     raise ValueError(
         "feature_space must be disparity, inverse_depth, log_disparity, raw_forward, "
-        "log_raw_forward, disparity_forward_product, or log_disparity_forward_product"
+        "log_raw_forward, disparity_forward_product, log_disparity_forward_product, "
+        "forward_over_disparity, or disparity_over_forward"
     )
 
 

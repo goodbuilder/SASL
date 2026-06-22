@@ -475,6 +475,15 @@ promoted as final Simulation PASS correction methods:
   `raw_forward_m` as stereo-center RDF forward. Continue with different feature
   families or richer models rather than promoting this scalar log-product
   branch.
+- Ratio scalar features are runtime-supported after EXP299 but are not a PASS
+  correction. The tested features were `forward_over_disparity =
+  raw_forward_m / measured_disparity_px` and `disparity_over_forward =
+  measured_disparity_px / raw_forward_m`. The fresh30 screen over seeds
+  `290700..290729` found the best method
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_forward_add_forward_over_disparity_deg1_ridge10_clip0p1_pooled`
+  at `150/180`. Mean range RMSE improved, but the strict per-seed PASS gate
+  failed, so this ratio branch should not be promoted without a new model or
+  selector strategy.
 - Registry slug `small_drone_multiburst_median_b1x3_sim3` is already covered
   by promoted candidate
   `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`;

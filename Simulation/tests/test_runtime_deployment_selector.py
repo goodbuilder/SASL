@@ -161,6 +161,48 @@ class RuntimeDeploymentSelectorTests(unittest.TestCase):
         self.assertAlmostEqual(corrected.raw_down_m, 1.1)
         self.assertAlmostEqual(corrected.raw_forward_m, 110.0)
 
+    def test_disparity_residual_profile_can_use_forward_disparity_ratio_features(self) -> None:
+        module = load_module()
+        sample = module.RuntimeMeasurementSample(
+            raw_right_m=2.0,
+            raw_down_m=1.0,
+            raw_forward_m=100.0,
+            measured_disparity_px=10.0,
+            raw_range_m=100.03,
+            left_u_px=640.0,
+            left_v_px=360.0,
+        )
+
+        profile = module.DisparityResidualRuntimeProfile(
+            feature_space="forward_over_disparity",
+            correction_space="forward_add",
+            degree=1,
+            feature_mean=10.0,
+            feature_scale=1.0,
+            coefficients_low_to_high=(3.0, 0.0),
+            correction_clip=5.0,
+        )
+        corrected = profile.apply(sample)
+
+        self.assertIsNotNone(corrected)
+        assert corrected is not None
+        self.assertAlmostEqual(corrected.raw_forward_m, 103.0)
+
+        inverse_profile = module.DisparityResidualRuntimeProfile(
+            feature_space="disparity_over_forward",
+            correction_space="forward_add",
+            degree=1,
+            feature_mean=0.1,
+            feature_scale=0.01,
+            coefficients_low_to_high=(-2.0, 0.0),
+            correction_clip=5.0,
+        )
+        inverse_corrected = inverse_profile.apply(sample)
+
+        self.assertIsNotNone(inverse_corrected)
+        assert inverse_corrected is not None
+        self.assertAlmostEqual(inverse_corrected.raw_forward_m, 98.0)
+
     def test_runtime_image_observation_mapping_accepts_bbox_aliases(self) -> None:
         module = load_module()
 

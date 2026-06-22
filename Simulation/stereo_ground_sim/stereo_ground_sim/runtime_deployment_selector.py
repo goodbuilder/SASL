@@ -507,8 +507,10 @@ class DisparityResidualRuntimeProfile:
     stereo-center RDF plus its measured disparity. Array/field order is
     explicit: RDF is right/down/forward, so ``raw_forward_m`` is the forward
     axis of the stereo-center RDF point. The product feature is
-    ``measured_disparity_px * raw_forward_m``. Public FRD topics are not inputs
-    here.
+    ``measured_disparity_px * raw_forward_m``. Ratio features keep the same
+    contracts: ``forward_over_disparity`` is RDF forward divided by measured
+    disparity, and ``disparity_over_forward`` is the inverse ratio. Public FRD
+    topics are not inputs here.
     """
 
     feature_space: str
@@ -570,6 +572,12 @@ class DisparityResidualRuntimeProfile:
             if not math.isfinite(product) or product <= 0.0:
                 return float("nan")
             return math.log(max(product, 1.0e-9))
+        if self.feature_space == "forward_over_disparity":
+            return raw_forward / max(disparity, 1.0e-9)
+        if self.feature_space == "disparity_over_forward":
+            if not math.isfinite(raw_forward) or raw_forward <= 0.0:
+                return float("nan")
+            return disparity / max(raw_forward, 1.0e-9)
         return float("nan")
 
     def correction_value(self, sample: RuntimeMeasurementSample) -> float:
