@@ -1059,3 +1059,21 @@ promoted as final Simulation PASS correction methods:
   remains `FRD+range`.
 - Next action: try a non-product intrinsic fallback family; do not stop at PASS
   or repeated seed checks.
+
+## EXP-20260622-342 B15x5 Common0.3 Non-Product Fallback Family Fresh100
+
+- Status: `FAIL`; no non-product fallback family passed the same fresh100 gate.
+- Evidence: seeds `298100..298199`, six scenarios, b15x5 common0.3 fusion,
+  72 combinations over non-product feature spaces, correction spaces, degrees,
+  and clips.
+- Best script-selected method:
+  `raw_forward` degree3 `ray_scale`, clip `0.02`, `500/600`.
+- Result: target max-abs improved from `4.732347 m` to `4.499028 m`, but range
+  only changed from `0.933270 m` to `0.930948 m` and position regressed from
+  `2.496382 m` to `2.510136 m`.
+- Contract: features come from the fused runtime measurement stream in
+  stereo-center OpenCV optical RDF; corrections output stereo-center RDF
+  forward-add or ray-scale; public output remains `FRD+range`.
+- Next action: product fallback still gives better strict coverage; search a
+  targeted intrinsic-row exception or a different fusion shell, not broad
+  non-product fallback.
