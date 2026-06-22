@@ -662,3 +662,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: degree `2` lowers the worst target residual but worsens the
     tracked intrinsic-scale row and aggregate RMSE versus degree `1`. Reject
     this quadratic raw-forward ray-scale branch.
+
+- `EXP-20260623-413-b15x7-common0p1-lograwforward-rayscale-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.701293 m`.
+  - Interpretation: log scaling improves the tracked seed versus raw-forward
+    ray-scale but worsens worst target and range aggregate. Reject this
+    log-raw-forward ray-scale branch.
