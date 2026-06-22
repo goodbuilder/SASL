@@ -1243,3 +1243,11 @@ in inputs, observation model, gate, or method.
     at `0.902118 m`.
   - Interpretation: degree 2 does not improve the b21x5 common `0.02`
     raw-forward additive branch. Reject standalone deployment.
+
+- `EXP-20260623-483-b21x5-common0p02-rawforward-forwardadd-degree1-ridge30-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max and RMSE
+    are effectively identical to EXP479, with target max `4.076885 m` to
+    `4.056885 m` and range RMSE `0.908840 m` to `0.902026 m`.
+  - Interpretation: ridge `30` does not change the b21x5 common `0.02`
+    raw-forward additive branch. Reject standalone deployment.
