@@ -909,3 +909,10 @@ in inputs, observation model, gate, or method.
   - Interpretation: strict pass is nonterminal and not sufficient here because
     aggregate accuracy regresses heavily. Reject standalone deployment, keep as
     a high-pass-count blending anchor.
+
+- `EXP-20260623-444-b15x7-common0p1-logdisparityforwardproduct-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `STRICT_PASS`, `120/120` passes.
+  - Evidence: no gate failures, but range RMSE regressed from `0.916652 m` to
+    `1.108084 m` and target max regressed from `4.348758 m` to `5.094019 m`.
+  - Interpretation: common `0.1` keeps strict pass behavior but worsens worst
+    residual target error versus common0.05. Reject standalone deployment.
