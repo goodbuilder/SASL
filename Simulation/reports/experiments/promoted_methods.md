@@ -875,3 +875,18 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
   `raw_forward_mean_m` after base profile correction and b15x5 fusion.
 - Next action: continue with larger-shell and guard sensitivity variants.
+
+## EXP-20260622-329 B17x5 Runtime Raw-Forward Guard Selector Fresh50
+
+- Status: `STRICT_PASS` on fresh50; not a terminal search success.
+- Selector:
+  use b17x5 product ray-scale fallback when `raw_forward_mean_m > 1771.0`;
+  otherwise use b17x5 log-disparity forward-add.
+- Evidence: seeds `296900..296949`, six scenarios, `300/300`; guard branch
+  selected `50` rows and non-guard branch selected `250` rows.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved; range and position means improved beyond the b15x5 fresh50
+  selector.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m` after base profile correction and b17x5 fusion.
+- Next action: run fresh100 validation; continue exploring new variants.
