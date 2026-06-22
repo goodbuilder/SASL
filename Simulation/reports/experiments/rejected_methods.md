@@ -464,3 +464,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: `disparity_over_forward` improves the tracked target row
     versus the other single-feature ratio scouts, but max target and aggregate
     RMSE regress too much. Reject as a standalone guard fallback feature.
+
+- `EXP-20260622-373-b15x5-common0p2-product-deg2-oversample48-local20-scout`
+  - Result: `FAIL`, `117/120` passes.
+  - Evidence: failures were `intrinsic_scale_stress` seeds `298188`, `298193`,
+    and `298198`; seed `298188` residual target max-abs was `2.747281 m`.
+  - Interpretation: degree2 product reduces the failure count versus
+    single-feature ratio scouts but is worse than degree1 common0.2 on target
+    row and aggregate RMSE. Reject this ridge300 quadratic setting.
