@@ -1457,3 +1457,16 @@ promoted as final Simulation PASS correction methods:
   common0.2 fusion; public output remains `FRD+range`.
 - Next action: aggregate RMSE still regresses; test selector behavior or another
   fusion axis.
+
+## EXP-20260622-379 B15x9 Common0.2 Product Oversample48 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x9 common0.2 product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: passes `120/120`.
+- Known target row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs `2.654313 m`, worse than b15x7 and b15x5 common0.2.
+- Contract: product feature uses stereo-center RDF `raw_forward_m` after b15x9
+  common0.2 fusion; public output remains `FRD+range`.
+- Next action: longer burst is not monotonic; prefer b15x7 for this branch and
+  continue another axis.
