@@ -765,3 +765,16 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is stereo-center OpenCV optical RDF
   `raw_forward_mean_m`; selector branches output stereo-center RDF corrections.
 - Next action: run fresh100 validation.
+
+## EXP-20260622-321 B9x5 Runtime Raw-Forward Guard Selector Fresh100
+
+- Status: `STRICT_PASS` on fresh100; not a terminal search success.
+- Selector:
+  use b9x5 product ray-scale fallback when `raw_forward_mean_m > 1771.0`;
+  otherwise use b9x5 log-disparity forward-add.
+- Evidence: seeds `295500..295599`, six scenarios, `600/600`.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; selector branches output stereo-center RDF corrections.
+- Next action: continue stress-variant validation and package/test work.
