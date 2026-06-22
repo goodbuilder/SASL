@@ -472,3 +472,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: degree2 product reduces the failure count versus
     single-feature ratio scouts but is worse than degree1 common0.2 on target
     row and aggregate RMSE. Reject this ridge300 quadratic setting.
+
+- `EXP-20260622-374-b15x5-common0p2-product-deg2-ridge3000-oversample48-local20-scout`
+  - Result: `FAIL`, `115/120` passes.
+  - Evidence: failures were `intrinsic_scale_stress` seeds `298181`, `298188`,
+    `298193`, `298198`, and `298199`; seed `298188` residual target max-abs was
+    `2.757494 m`.
+  - Interpretation: ridge3000 does not stabilize the quadratic product branch;
+    it increases the failure count versus ridge300 with similar aggregate
+    regression. Reject this regularization setting.
