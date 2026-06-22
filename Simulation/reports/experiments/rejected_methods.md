@@ -972,3 +972,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: looser common sampling slightly helps RMSE versus common
     `0.05` but does not recover intrinsic-scale rows and worsens target max.
     Reject standalone deployment.
+
+- `EXP-20260623-452-b15x7-common0p05-inversedepth-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; inverse-depth ray
+    scale improves intrinsic seed `298188` from `3.623977 m` to `3.496363 m`
+    but regresses range RMSE from `0.912856 m` to `0.947511 m`.
+  - Interpretation: inverse-depth ray scale gives selected intrinsic relief
+    but is aggregate-worse than log-disparity ray scale and still fails the
+    intrinsic gate. Reject standalone deployment.
