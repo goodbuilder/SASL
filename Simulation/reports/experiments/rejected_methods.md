@@ -432,3 +432,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: `inverse_depth` ray-scale reduces aggregate regression
     compared with the product branch, but it does not protect the intrinsic
     scale target rows. Reject as the current guard fallback feature.
+
+- `EXP-20260622-369-b15x5-common0p2-rawforward-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.857175 m`.
+  - Interpretation: `raw_forward` ray-scale keeps range RMSE near observation
+    (`0.927983 m` to `0.925776 m`) but still misses the intrinsic-scale target
+    gate. Reject as a standalone guard fallback feature.
