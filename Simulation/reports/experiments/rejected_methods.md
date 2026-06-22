@@ -991,3 +991,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: raw-forward ray scale is aggregate-stable and useful as a
     contrast branch, but it does not solve intrinsic-scale rows. Reject
     standalone deployment.
+
+- `EXP-20260623-454-b15x7-common0p05-rawforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; range RMSE improves
+    from `0.912856 m` to `0.906170 m`, position RMSE improves from
+    `2.486601 m` to `2.483988 m`, and target max moves from `4.131533 m` to
+    `4.111533 m`.
+  - Interpretation: raw-forward forward-add is a low-regression branch but
+    still cannot pass intrinsic-scale rows. Reject standalone deployment.
