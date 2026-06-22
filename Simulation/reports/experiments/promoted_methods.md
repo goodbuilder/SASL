@@ -1154,3 +1154,20 @@ promoted as final Simulation PASS correction methods:
   outputs stereo-center RDF correction; public output remains `FRD+range`.
 - Next action: use this only as a guard fallback and build a selector to retain
   common0.3 aggregate gains.
+
+## EXP-20260622-348 B15x5 Common0.3 Oversample48 Runtime Guard Selector Fresh100
+
+- Status: `STRICT_PASS` on fresh100; not a terminal success.
+- Evidence: seeds `298100..298199`, six scenarios, b15x5 common0.3
+  forward-add non-guard branch plus oversample48 ridge300 product guard branch.
+- Selector: use oversample48 product ray-scale when `raw_forward_mean_m >
+  1771.0`; otherwise use common0.3 log-disparity forward-add.
+- Result: `600/600`; guard branch `100`, non-guard branch `500`.
+- Aggregate result: target max-abs `4.732347 m` to `4.632350 m`, range RMSE
+  mean `0.933151 m` to `0.815560 m`, position RMSE mean `2.496262 m` to
+  `2.391517 m`.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; branch outputs remain stereo-center RDF corrections and
+  public output remains `FRD+range`.
+- Next action: continue independent validations and new correction ideas; do
+  not stop at this PASS.
