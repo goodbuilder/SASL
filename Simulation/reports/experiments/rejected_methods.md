@@ -1307,3 +1307,13 @@ in inputs, observation model, gate, or method.
   - Interpretation: log-disparity additive is low-regression but weaker than
     raw-forward EXP479 and still fails intrinsic rows. Reject standalone
     deployment.
+
+- `EXP-20260623-490-b21x5-common0p02-logdisparity-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.076885 m` to `4.052020 m`, but range RMSE regresses from
+    `0.908840 m` to `0.917946 m` and position RMSE regresses from
+    `2.484420 m` to `2.497215 m`.
+  - Interpretation: log-disparity ray scaling gives target-tail relief but
+    worsens average accuracy and still fails intrinsic rows. Reject standalone
+    deployment.
