@@ -464,6 +464,17 @@ promoted as final Simulation PASS correction methods:
   about `92.61 m`, and target max abs error to about `74.62 m`. Keep the
   promoted observation-fusion path; do not add this motion layer as a PASS
   correction.
+- `log_disparity_forward_product` scalar residual is a near-pass boundary, not
+  a promoted correction. EXP298 found the best fresh30 screen
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_log_disparity_forward_product_deg1_ridge10_clip0p05_pooled`
+  at `180/180 STRICT_PASS` on seeds `290300..290329`. A fresh100 replay on
+  seeds `290500..290599` failed `599/600`, and a tuned grid over degree,
+  ridge, and clip still failed `599/600`; the remaining failure was
+  `intrinsic_scale_stress` seed `290537`. Runtime truth remained `false`, and
+  the feature contract was `log(measured_disparity_px * raw_forward_m)`, with
+  `raw_forward_m` as stereo-center RDF forward. Continue with different feature
+  families or richer models rather than promoting this scalar log-product
+  branch.
 - Registry slug `small_drone_multiburst_median_b1x3_sim3` is already covered
   by promoted candidate
   `small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3`;
