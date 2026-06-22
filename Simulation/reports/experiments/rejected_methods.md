@@ -1186,3 +1186,12 @@ in inputs, observation model, gate, or method.
     `2.483518 m`.
   - Interpretation: b21x5 log raw forward additive is a low-regression branch,
     but it still fails every intrinsic row. Reject standalone deployment.
+
+- `EXP-20260623-477-b21x5-common0p05-forwardoverdisparity-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.219042 m` to `4.199042 m`, range RMSE improves from `0.911104 m`
+    to `0.904404 m`, and position RMSE improves from `2.485454 m` to
+    `2.482839 m`.
+  - Interpretation: b21x5 forward-over-disparity additive improves aggregate
+    metrics but still fails every intrinsic row. Reject standalone deployment.
