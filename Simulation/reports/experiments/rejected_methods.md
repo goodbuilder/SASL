@@ -489,3 +489,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: product `forward_add` preserves aggregate RMSE almost
     exactly, but it does not apply enough target-row correction. Reject as a
     standalone guard fallback while retaining it as a blending clue.
+
+- `EXP-20260622-377-b15x5-common0p2-logproduct-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.670298 m`.
+  - Interpretation: log-product `forward_add` is effectively identical to the
+    non-log product additive branch on this scout. Reject as a standalone guard
+    fallback.
