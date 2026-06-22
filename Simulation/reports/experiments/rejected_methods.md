@@ -1225,3 +1225,13 @@ in inputs, observation model, gate, or method.
   - Interpretation: clip `0.01` reduces intrinsic regression but loses much of
     the EXP479 aggregate gain and still fails intrinsic rows. Reject standalone
     deployment.
+
+- `EXP-20260623-481-b21x5-common0p01-rawforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.082800 m` to `4.062800 m`, range RMSE improves from `0.908683 m`
+    to `0.901896 m`, and position RMSE improves from `2.484307 m` to
+    `2.481682 m`.
+  - Interpretation: common `0.01` slightly improves RMSE but is worse than
+    EXP479 on target tail and still fails intrinsic rows. Reject standalone
+    deployment.
