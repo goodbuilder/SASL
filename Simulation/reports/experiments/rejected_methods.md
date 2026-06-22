@@ -799,3 +799,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: common0.05 clip `0.01` softens the tracked intrinsic tail
     versus clip `0.02`, but reduces aggregate gain and leaves pass count
     unchanged. Reject standalone deployment.
+
+- `EXP-20260623-430-b15x7-common0p2-logdisparity-forwardadd-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.685612 m`.
+  - Interpretation: common `0.2` improves residuals within its own filtered
+    population, but the observation baseline is worse than common0.05 and pass
+    count remains unchanged. Reject this wider common-fraction direction.
