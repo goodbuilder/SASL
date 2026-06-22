@@ -1031,3 +1031,13 @@ promoted as final Simulation PASS correction methods:
   `raw_forward_mean_m` after base profile correction and b15x5 common0.3 fusion.
 - Next action: do not promote common0.3 by threshold; inspect failing row or
   use common0.4.
+
+## EXP-20260622-340 B15x5 Common0.3 Product Clip Sweep Fresh100
+
+- Status: `FAIL`; product fallback clip adjustment does not recover common0.3.
+- Evidence: clips `0.005..0.03`, seeds `298100..298199`, six scenarios.
+- Result: every clip remains `599/600`; failing row is seed `298188`,
+  `intrinsic_scale_stress`.
+- Contract: product fallback uses `measured_disparity_px * raw_forward_m` and
+  outputs stereo-center RDF ray-scale correction.
+- Next action: try a different intrinsic fallback family or use common0.4.
