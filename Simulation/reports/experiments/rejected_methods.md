@@ -448,3 +448,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: `log_raw_forward` improves the target row versus raw
     forward, but aggregate range RMSE regresses more and the intrinsic-scale
     gate still fails. Reject as a standalone guard fallback feature.
+
+- `EXP-20260622-371-b15x5-common0p2-forwardoverdisparity-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.941890 m`.
+  - Interpretation: `forward_over_disparity` keeps aggregate range RMSE near
+    observation, but target-row protection is weaker than raw/log-raw-forward.
+    Reject as a standalone guard fallback feature.
