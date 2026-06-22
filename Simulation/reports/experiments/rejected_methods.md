@@ -1215,3 +1215,13 @@ in inputs, observation model, gate, or method.
   - Interpretation: b21x5 common `0.02` raw-forward additive is a stronger
     low-regression baseline, but still fails every intrinsic row. Reject
     standalone deployment.
+
+- `EXP-20260623-480-b21x5-common0p02-rawforward-forwardadd-degree1-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.076885 m` to `4.066885 m`, range RMSE improves from `0.908840 m`
+    to `0.905240 m`, and position RMSE improves from `2.484420 m` to
+    `2.482994 m`.
+  - Interpretation: clip `0.01` reduces intrinsic regression but loses much of
+    the EXP479 aggregate gain and still fails intrinsic rows. Reject standalone
+    deployment.
