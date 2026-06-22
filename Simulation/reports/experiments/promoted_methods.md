@@ -1242,3 +1242,15 @@ promoted as final Simulation PASS correction methods:
 - Contract: product feature uses stereo-center RDF `raw_forward_m`; ray-scale
   outputs stereo-center RDF correction; public output remains `FRD+range`.
 - Next action: search a different correction/fusion axis.
+
+## EXP-20260622-354 B15x5 Product Oversample48 Clip Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x5 common0.3 product
+  ray-scale, target oversample count `48`, ridge `300`, clips `0.005..0.02`.
+- Result: all clips pass `120/120` and produce identical metrics.
+- Known failing row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs remains `2.538524 m` for every clip.
+- Contract: product feature uses stereo-center RDF `raw_forward_m`; ray-scale
+  outputs stereo-center RDF correction; public output remains `FRD+range`.
+- Next action: clip is not the lever; search another correction/fusion axis.
