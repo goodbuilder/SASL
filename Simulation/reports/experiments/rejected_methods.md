@@ -725,3 +725,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: inverse-depth additive correction matches the plain
     disparity additive branch at scout precision, so it is not a distinct
     improvement axis. Reject this duplicate scalar additive branch.
+
+- `EXP-20260623-421-b15x7-common0p1-disparityforwardproduct-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.659469 m`.
+  - Interpretation: product additive correction regresses aggregate RMSE less
+    than the scalar additive branches, but still worsens observation aggregate
+    and does not fix intrinsic-scale failures. Reject this additive interaction
+    branch.
