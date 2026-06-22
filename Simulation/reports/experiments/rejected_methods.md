@@ -831,3 +831,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: degree 3 nearly saturates degree 2; pass count and target
     max are unchanged while aggregate RMSE improves only slightly. Reject
     standalone deployment.
+
+- `EXP-20260623-434-b15x7-common0p05-logdisparity-rayscale-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.814988 m`.
+  - Interpretation: ray-scale correction lowers the worst target max but
+    regresses aggregate range/position RMSE and worsens the tracked intrinsic
+    target tail. Reject standalone deployment, keep as a blending anchor.
