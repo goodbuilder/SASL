@@ -938,3 +938,11 @@ in inputs, observation model, gate, or method.
     `1.105966 m` and target max regressed from `4.131533 m` to `4.861383 m`.
   - Interpretation: clip `0.005` duplicates clip `0.02`; aggregate regression
     is unchanged. Reject standalone deployment.
+
+- `EXP-20260623-448-b15x7-common0p05-logdisparityforwardproduct-rayscale-degree1-ridge3-oversample24-local20-scout`
+  - Result: `STRICT_PASS`, `120/120` passes.
+  - Evidence: no gate failures, but range RMSE regressed from `0.912811 m` to
+    `1.105861 m` and target max regressed from `4.151822 m` to `4.888552 m`.
+  - Interpretation: reducing target oversample count from `48` to `24` keeps
+    the strict-pass behavior but does not reduce aggregate regression enough.
+    Reject standalone deployment.
