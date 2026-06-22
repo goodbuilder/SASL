@@ -1049,3 +1049,12 @@ in inputs, observation model, gate, or method.
     oversample `48`, moving from `4.151822 m` to `4.131823 m`.
   - Interpretation: lower target oversampling keeps RMSE improvement but does
     not recover intrinsic rows. Reject standalone deployment.
+
+- `EXP-20260623-461-b15x7-common0p05-rawforward-forwardadd-degree1-ridge3-oversample12-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; range RMSE improves
+    from `0.912015 m` to `0.905362 m`, but target max is worse than
+    oversample `24`, moving from `4.184992 m` to `4.164993 m`.
+  - Interpretation: lower oversampling improves RMSE but continues to worsen
+    target max and does not recover intrinsic rows. Reject standalone
+    deployment.
