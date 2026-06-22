@@ -456,3 +456,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: `forward_over_disparity` keeps aggregate range RMSE near
     observation, but target-row protection is weaker than raw/log-raw-forward.
     Reject as a standalone guard fallback feature.
+
+- `EXP-20260622-372-b15x5-common0p2-disparityoverforward-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.446209 m`.
+  - Interpretation: `disparity_over_forward` improves the tracked target row
+    versus the other single-feature ratio scouts, but max target and aggregate
+    RMSE regress too much. Reject as a standalone guard fallback feature.
