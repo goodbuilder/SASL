@@ -654,3 +654,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: clip `0.01` exactly matches clip `0.02` at scout precision;
     the clip is not active and failures remain unchanged. Reject this clip
     setting.
+
+- `EXP-20260623-412-b15x7-common0p1-rawforward-rayscale-deg2-ridge30-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.899702 m`.
+  - Interpretation: degree `2` lowers the worst target residual but worsens the
+    tracked intrinsic-scale row and aggregate RMSE versus degree `1`. Reject
+    this quadratic raw-forward ray-scale branch.
