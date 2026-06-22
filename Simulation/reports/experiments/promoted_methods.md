@@ -1496,3 +1496,15 @@ promoted as final Simulation PASS correction methods:
   common0.2 fusion; public output remains `FRD+range`.
 - Next action: b15x7 remains the best local fusion point; continue another
   axis.
+
+## EXP-20260622-382 B15x7 Common0.15 Product Oversample48 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x7 common0.15 product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: passes `120/120`.
+- Known target row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs `2.621128 m`, worse than b15x7 common0.2.
+- Contract: product feature uses stereo-center RDF `raw_forward_m` after b15x7
+  common0.15 fusion; public output remains `FRD+range`.
+- Next action: common0.2 remains better for b15x7; continue another axis.
