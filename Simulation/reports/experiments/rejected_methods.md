@@ -1270,3 +1270,12 @@ in inputs, observation model, gate, or method.
     `2.497484 m`.
   - Interpretation: clip `0.01` does not change the raw-forward ray-scale
     branch. Reject standalone deployment.
+
+- `EXP-20260623-486-b21x5-common0p02-rawforward-rayscale-degree1-ridge30-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max is
+    `3.927187 m`, with range RMSE regressing from `0.908840 m` to
+    `0.910070 m` and position RMSE regressing from `2.484420 m` to
+    `2.497483 m`.
+  - Interpretation: ridge `30` does not fix the raw-forward ray-scale RMSE
+    regression or intrinsic failures. Reject standalone deployment.
