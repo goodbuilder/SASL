@@ -577,3 +577,17 @@ promoted as final Simulation PASS correction methods:
   stereo-center OpenCV optical RDF forward; public output remains `FRD+range`.
 - Caveat: changing the train split alone did not remove aggregate regression.
 - Next action: continue with aggregate-improving objective or model changes.
+
+## EXP-20260622-305 Log-Disparity Aggregate Boundary
+
+- Status: `FAIL` under the strict raw-baseline gate, but useful boundary
+  evidence for aggregate-improving methods.
+- Method:
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b9x5_trim0p05_common0p5_residual_ray_scale_log_disparity_deg2_ridge0_clip0p25_pooled`
+- Evidence: fresh20 seeds `292900..292919`, six scenarios, `100/120`.
+- Contract: runtime uses measured disparity-derived `log_disparity`; public
+  output remains `FRD+range`. Truth remains calibration/evaluation-only.
+- Observation-relative result: target max-abs and range mean improved, but
+  position mean regressed slightly and no candidate improved all three.
+- Next action: search correction spaces/objectives that preserve target/range
+  improvement while also improving position.
