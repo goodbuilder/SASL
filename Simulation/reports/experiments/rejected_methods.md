@@ -901,3 +901,11 @@ in inputs, observation model, gate, or method.
   - Evidence: `intrinsic_scale_stress` seeds `298188` and `298198` failed.
   - Interpretation: ridge `300` leaves aggregate RMSE severely regressed and
     loses one pass versus ridge `3`. Reject standalone deployment.
+
+- `EXP-20260623-443-b15x7-common0p05-logdisparityforwardproduct-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `STRICT_PASS`, `120/120` passes.
+  - Evidence: no gate failures, but range RMSE regressed from `0.912856 m` to
+    `1.105966 m` and target max regressed from `4.131533 m` to `4.861383 m`.
+  - Interpretation: strict pass is nonterminal and not sufficient here because
+    aggregate accuracy regresses heavily. Reject standalone deployment, keep as
+    a high-pass-count blending anchor.
