@@ -783,3 +783,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: clip `0.01` softens intrinsic-tail regression slightly but
     gives back aggregate gain and does not change pass count. Reject standalone
     deployment and continue searching.
+
+- `EXP-20260623-428-b15x7-common0p05-logdisparity-forwardadd-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.637634 m`.
+  - Interpretation: common `0.05` lowers the filtered-population worst target
+    and aggregate RMSE, but does not change the intrinsic-scale pass count.
+    Reject standalone deployment and keep exploring common-fraction/blend axes.
