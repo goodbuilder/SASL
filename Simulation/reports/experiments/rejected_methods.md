@@ -424,3 +424,11 @@ in inputs, observation model, gate, or method.
 - `bbox_anchor_vertical_global_report_trial_down_guard`
   - Reason: best family-local bbox Down branch, but all-family replay failed
     `15/90` held-out report/trial gates.
+
+- `EXP-20260622-368-b15x5-common0p2-inversedepth-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.559493 m`.
+  - Interpretation: `inverse_depth` ray-scale reduces aggregate regression
+    compared with the product branch, but it does not protect the intrinsic
+    scale target rows. Reject as the current guard fallback feature.
