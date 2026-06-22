@@ -823,3 +823,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: degree 2 with clip `0.01` softens the tracked tail but
     gives back most of the degree-2 clip `0.02` aggregate gain. Reject
     standalone deployment.
+
+- `EXP-20260623-433-b15x7-common0p05-logdisparity-forwardadd-degree3-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.643976 m`.
+  - Interpretation: degree 3 nearly saturates degree 2; pass count and target
+    max are unchanged while aggregate RMSE improves only slightly. Reject
+    standalone deployment.
