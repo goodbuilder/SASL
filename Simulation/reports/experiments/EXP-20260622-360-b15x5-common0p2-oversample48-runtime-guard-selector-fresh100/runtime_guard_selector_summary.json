@@ -1,0 +1,20 @@
+{
+  "experiment_id": "EXP-20260622-360-b15x5-common0p2-oversample48-runtime-guard-selector-fresh100",
+  "status": "STRICT_PASS",
+  "pass_count": 600,
+  "trial_count": 600,
+  "guard_threshold_m": 1771.0,
+  "guard_branch_count": 100,
+  "non_guard_branch_count": 500,
+  "target_max_abs_error_observation_max_m": 4.732347283529862,
+  "target_max_abs_error_residual_max_m": 4.632349957035103,
+  "range_rmse_observation_mean_m": 0.9328890814786828,
+  "range_rmse_residual_mean_m": 0.8152333970146328,
+  "position_rmse_observation_mean_m": 2.496000770974089,
+  "position_rmse_residual_mean_m": 2.3911925780667374,
+  "runtime_truth_used": false,
+  "runtime_input_contract": "selector uses trailing raw_forward_mean_m from stereo-center RDF forward after base profile correction and b15x5 common0.3 fusion; no truth or scenario label at runtime",
+  "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+  "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+  "branch_contract": "raw_forward_mean_m > 1771.0 selects b15x5 common0.2 target_oversample48 ridge300 disparity_forward_product ray_scale fallback; otherwise b15x5 common0.3 log_disparity forward_add"
+}

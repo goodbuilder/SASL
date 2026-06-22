@@ -1311,3 +1311,31 @@ promoted as final Simulation PASS correction methods:
   output remains `FRD+range`.
 - Next action: expand common0.2 oversample48 product branch to fresh100 and
   test it as a guard fallback.
+
+## EXP-20260622-359 B15x5 Common0.2 Product Oversample48 Fresh100
+
+- Status: `STRICT_PASS` on fresh100; not a terminal success.
+- Evidence: seeds `298100..298199`, six scenarios, b15x5 common0.2 product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: passes `600/600`, but globally regresses aggregate residual metrics.
+- Aggregate: target max-abs `4.734651 m` to `5.450191 m`, range RMSE mean
+  `0.927707 m` to `1.112059 m`, position RMSE mean `2.493208 m` to
+  `2.565751 m`.
+- Contract: product feature uses stereo-center RDF `raw_forward_m` after b15x5
+  common0.2 fusion; public output remains `FRD+range`.
+- Next action: use only as a guard fallback candidate.
+
+## EXP-20260622-360 B15x5 Common0.2 Oversample48 Runtime Guard Selector Fresh100
+
+- Status: `STRICT_PASS` on fresh100; not a terminal success.
+- Evidence: seeds `298100..298199`, six scenarios, common0.3 forward-add
+  non-guard branch plus common0.2 oversample48 product guard branch.
+- Result: `600/600`; guard branch `100`, non-guard branch `500`.
+- Aggregate result: target max-abs `4.732347 m` to `4.632350 m`, range RMSE
+  mean `0.932889 m` to `0.815233 m`, position RMSE mean `2.496001 m` to
+  `2.391193 m`.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; branch outputs remain stereo-center RDF corrections and
+  public output remains `FRD+range`.
+- Next action: validate this selector on independent seed blocks and keep
+  searching beyond repeated PASS.
