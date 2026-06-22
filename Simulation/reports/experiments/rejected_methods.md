@@ -924,3 +924,10 @@ in inputs, observation model, gate, or method.
   - Interpretation: common `0.02` keeps strict pass behavior but does not
     reduce aggregate regression and worsens target max versus common0.05.
     Reject standalone deployment.
+
+- `EXP-20260623-446-b15x7-common0p05-logdisparityforwardproduct-rayscale-degree1-ridge0p3-oversample48-local20-scout`
+  - Result: `STRICT_PASS`, `120/120` passes.
+  - Evidence: no gate failures, but range RMSE regressed from `0.912856 m` to
+    `1.105969 m` and target max regressed from `4.131533 m` to `4.861392 m`.
+  - Interpretation: ridge `0.3` duplicates ridge `3` at scout precision and
+    does not reduce aggregate regression. Reject standalone deployment.
