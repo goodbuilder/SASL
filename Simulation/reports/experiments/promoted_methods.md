@@ -674,3 +674,15 @@ promoted as final Simulation PASS correction methods:
   `raw_forward_mean_m`; selector branches are unchanged from EXP310.
 - Next action: keep `1771.0 m` as the recorded threshold and continue testing
   stress variants.
+
+## EXP-20260622-312 Runtime Raw-Forward Guard Window Sensitivity
+
+- Status: guard sensitivity support; not a terminal search success.
+- Evidence: fresh50 seeds `293900..293949`, window sizes `120`, `260`,
+  `520`, and `1680` all perfectly separated intrinsic from non-intrinsic
+  scenarios by `raw_forward_mean_m`.
+- Caveat: the absolute threshold changes with window size. The recorded
+  `1771.0 m` threshold is tied to `RuntimeFeatureWindow(max_samples=520)`.
+- Contract: guard feature is stereo-center OpenCV optical RDF forward mean.
+- Next action: keep validating stress variants and avoid changing runtime
+  window length without recalibrating the guard.
