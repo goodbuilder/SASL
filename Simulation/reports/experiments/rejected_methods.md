@@ -1177,3 +1177,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: log raw forward ray scaling gives weak target-tail relief
     with worse average accuracy and no intrinsic gate fix. Reject standalone
     deployment.
+
+- `EXP-20260623-476-b21x5-common0p05-lograwforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.219042 m` to `4.207238 m`, range RMSE improves from `0.911104 m`
+    to `0.905883 m`, and position RMSE improves from `2.485454 m` to
+    `2.483518 m`.
+  - Interpretation: b21x5 log raw forward additive is a low-regression branch,
+    but it still fails every intrinsic row. Reject standalone deployment.
