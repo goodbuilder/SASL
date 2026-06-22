@@ -1008,3 +1008,11 @@ in inputs, observation model, gate, or method.
     `0.906259 m`.
   - Interpretation: degree 2 duplicates degree 1 at scout precision and does
     not recover intrinsic-scale rows. Reject standalone deployment.
+
+- `EXP-20260623-456-b15x7-common0p1-rawforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; common `0.1`
+    improves range RMSE from `0.916652 m` to `0.910094 m` but target max is
+    worse than common `0.05`, moving from `4.348758 m` to `4.328759 m`.
+  - Interpretation: stricter common sampling keeps the low-regression shape but
+    does not recover intrinsic rows. Reject standalone deployment.
