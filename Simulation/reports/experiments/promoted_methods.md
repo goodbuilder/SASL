@@ -1282,3 +1282,18 @@ promoted as final Simulation PASS correction methods:
   fusion; ray-scale outputs stereo-center RDF correction; public output remains
   `FRD+range`.
 - Next action: try another fusion shell or correction family.
+
+## EXP-20260622-357 B19x5 Product Oversample48 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b19x5 common0.3 product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: passes `120/120`, and raw observation aggregate improves, but product
+  residual still regresses.
+- Known failing row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs `2.746343 m`, worse than b15x5.
+- Contract: product feature uses stereo-center RDF `raw_forward_m` after b19x5
+  fusion; ray-scale outputs stereo-center RDF correction; public output remains
+  `FRD+range`.
+- Next action: larger fusion shell is not enough; search another correction
+  family.
