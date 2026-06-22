@@ -591,3 +591,19 @@ promoted as final Simulation PASS correction methods:
   position mean regressed slightly and no candidate improved all three.
 - Next action: search correction spaces/objectives that preserve target/range
   improvement while also improving position.
+
+## EXP-20260622-306 Log-Disparity Forward-Add Aggregate Boundary
+
+- Status: `FAIL` under the strict raw-baseline gate, but important
+  aggregate-improving evidence.
+- Method:
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_forward_add_log_disparity_deg3_ridge100_clip0p1_pooled`
+- Evidence: fresh100 seeds `293300..293399`, six scenarios, `500/600`.
+- Contract: runtime uses `log(measured_disparity_px)` and a stereo-center RDF
+  forward-add correction; public output remains `FRD+range`. Truth remains
+  calibration/evaluation-only.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved.
+- Failure boundary: all `100` strict failures were in `intrinsic_scale_stress`.
+- Next action: search intrinsic-scale guards, selectors, or features that
+  preserve the aggregate improvement while avoiding intrinsic failures.

@@ -1,0 +1,7 @@
+scenario,pass_count,fail_count,trial_count
+bbox_outlier_stress,100,0,100
+combined_sensor_stress,100,0,100
+disparity_noise_stress,100,0,100
+intrinsic_scale_stress,0,100,100
+nominal,100,0,100
+yaw_pitch_stress,100,0,100
