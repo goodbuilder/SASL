@@ -904,3 +904,14 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
   `raw_forward_mean_m` after base profile correction and b17x5 fusion.
 - Next action: test guard sensitivity and nearby shell variants.
+
+## EXP-20260622-331 B15x5 Runtime Guard Threshold Sensitivity
+
+- Status: threshold sweep keeps `STRICT_PASS` at `1771.0..1773.0`.
+- Evidence: EXP328 b15x5 fresh100 branch rows, thresholds
+  `1769.0..1774.0`.
+- Result: `1771.0..1773.0` all keep `600/600` with the same aggregate
+  metrics; `1774.0` drops to `501/600`.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m` after base profile correction and b15x5 fusion.
+- Next action: keep `1771.0 m` as conservative guard and continue variants.
