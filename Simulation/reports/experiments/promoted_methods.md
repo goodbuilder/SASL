@@ -1095,3 +1095,18 @@ promoted as final Simulation PASS correction methods:
   `FRD+range`.
 - Next action: try a targeted exception for the high-forward intrinsic row or a
   different common fraction/shell rather than simply increasing burst count.
+
+## EXP-20260622-344 B15x5 Common0.4 Forward-Add on Common0.3 Seeds Fresh100
+
+- Status: `FAIL`; common0.4 log-disparity forward-add is not a viable targeted
+  exception for the common0.3 product fallback failure.
+- Evidence: seeds `298100..298199`, six scenarios, b15x5 common0.4
+  log-disparity forward-add degree3 clip `0.1`.
+- Result: `500/600`; all intrinsic stress rows fail.
+- Failed target row: seed `298188`, `intrinsic_scale_stress`, regresses from
+  `3.948672 m` observation to `4.048669 m` residual.
+- Contract: log-disparity comes from the fused runtime stream; forward-add
+  outputs stereo-center RDF forward correction; public output remains
+  `FRD+range`.
+- Next action: use short scout runs for new exception candidates before
+  spending fresh100 on full validation.
