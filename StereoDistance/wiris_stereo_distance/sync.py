@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Generic, Iterable, Protocol, TypeVar
+from typing import Callable, Generic, Iterable, Protocol, TypeVar
 
 
 class Timestamped(Protocol):
@@ -61,19 +61,27 @@ def match_nearest_pair(
     right_samples: Iterable[T],
     *,
     max_delta_s: float,
+    timestamp: Callable[[T], float | None] | None = None,
 ) -> MatchedPair[T] | None:
     left_list = list(left_samples)
     right_list = list(right_samples)
     if not left_list or not right_list:
         return None
+    timestamp_fn = timestamp or (lambda sample: float(sample.timestamp_s))
 
     candidates: list[MatchedPair[T]] = []
     for left in left_list:
         for right in right_list:
-            delta = abs(float(left.timestamp_s) - float(right.timestamp_s))
+            raw_left_timestamp_s = timestamp_fn(left)
+            raw_right_timestamp_s = timestamp_fn(right)
+            if raw_left_timestamp_s is None or raw_right_timestamp_s is None:
+                continue
+            left_timestamp_s = float(raw_left_timestamp_s)
+            right_timestamp_s = float(raw_right_timestamp_s)
+            delta = abs(left_timestamp_s - right_timestamp_s)
             if delta > max_delta_s:
                 continue
-            midpoint = (float(left.timestamp_s) + float(right.timestamp_s)) / 2.0
+            midpoint = (left_timestamp_s + right_timestamp_s) / 2.0
             candidates.append(MatchedPair(left=left, right=right, delta_s=delta, midpoint_s=midpoint))
     if not candidates:
         return None

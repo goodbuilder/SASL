@@ -34,6 +34,18 @@ class AppSettings:
     yolo_input_size: int = 416
     yolo_conf_threshold: float = 0.5
     yolo_iou_threshold: float = 0.45
+    yolo_gate_class_enabled: bool = False
+    yolo_gate_class_text: str = ""
+    yolo_gate_min_bbox_enabled: bool = False
+    yolo_gate_min_width_px: int = 0
+    yolo_gate_min_height_px: int = 0
+    yolo_gate_min_area_px: int = 0
+    yolo_gate_matching_enabled: bool = True
+    yolo_gate_time_delta_enabled: bool = True
+    yolo_gate_vertical_delta_enabled: bool = True
+    yolo_gate_max_vertical_delta_px: float = 80.0
+    yolo_gate_max_time_delta_s: float = 0.25
+    yolo_gate_time_basis: str = "camera_rtc_required"
     preview_width: int = 1920
     preview_rate_hz: float = 15.0
     rtsp_latency_ms: int = 50
@@ -120,6 +132,30 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         yolo_input_size=int(payload.get("yolo_input_size", AppSettings.yolo_input_size)),
         yolo_conf_threshold=float(payload.get("yolo_conf_threshold", AppSettings.yolo_conf_threshold)),
         yolo_iou_threshold=float(payload.get("yolo_iou_threshold", AppSettings.yolo_iou_threshold)),
+        yolo_gate_class_enabled=bool(payload.get("yolo_gate_class_enabled", AppSettings.yolo_gate_class_enabled)),
+        yolo_gate_class_text=str(payload.get("yolo_gate_class_text", AppSettings.yolo_gate_class_text)),
+        yolo_gate_min_bbox_enabled=bool(
+            payload.get("yolo_gate_min_bbox_enabled", AppSettings.yolo_gate_min_bbox_enabled)
+        ),
+        yolo_gate_min_width_px=int(payload.get("yolo_gate_min_width_px", AppSettings.yolo_gate_min_width_px)),
+        yolo_gate_min_height_px=int(payload.get("yolo_gate_min_height_px", AppSettings.yolo_gate_min_height_px)),
+        yolo_gate_min_area_px=int(payload.get("yolo_gate_min_area_px", AppSettings.yolo_gate_min_area_px)),
+        yolo_gate_matching_enabled=bool(
+            payload.get("yolo_gate_matching_enabled", AppSettings.yolo_gate_matching_enabled)
+        ),
+        yolo_gate_time_delta_enabled=bool(
+            payload.get("yolo_gate_time_delta_enabled", AppSettings.yolo_gate_time_delta_enabled)
+        ),
+        yolo_gate_vertical_delta_enabled=bool(
+            payload.get("yolo_gate_vertical_delta_enabled", AppSettings.yolo_gate_vertical_delta_enabled)
+        ),
+        yolo_gate_max_vertical_delta_px=float(
+            payload.get("yolo_gate_max_vertical_delta_px", AppSettings.yolo_gate_max_vertical_delta_px)
+        ),
+        yolo_gate_max_time_delta_s=float(
+            payload.get("yolo_gate_max_time_delta_s", AppSettings.yolo_gate_max_time_delta_s)
+        ),
+        yolo_gate_time_basis=str(payload.get("yolo_gate_time_basis", AppSettings.yolo_gate_time_basis)),
         preview_width=int(payload.get("preview_width", AppSettings.preview_width)),
         preview_rate_hz=float(payload.get("preview_rate_hz", AppSettings.preview_rate_hz)),
         rtsp_latency_ms=int(payload.get("rtsp_latency_ms", AppSettings.rtsp_latency_ms)),

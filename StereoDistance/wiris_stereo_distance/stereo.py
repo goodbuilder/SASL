@@ -53,6 +53,7 @@ class StereoCalibration:
     max_time_delta_s: float = 0.25
     max_vertical_delta_px: float = 80.0
     require_same_class: bool = True
+    timestamp_basis: str = "detection"
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,21 @@ class StereoEstimate(StereoMatch):
     distance_m: float = 0.0
 
 
+def detection_timestamp_for_basis(observation: DetectionObservation, timestamp_basis: str = "detection") -> float | None:
+    if timestamp_basis in {"camera_rtcp", "camera_rtc_required"}:
+        value = observation.timestamp_metadata.get("rtcp_frame_ntp_unix_s")
+        if value is not None:
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = float("nan")
+            if isfinite(parsed):
+                return parsed
+        if timestamp_basis == "camera_rtc_required":
+            return None
+    return float(observation.timestamp_s)
+
+
 def match_stereo_observations(
     left: DetectionObservation | None,
     right: DetectionObservation | None,
@@ -103,7 +119,11 @@ def match_stereo_observations(
     disparity = abs(left_center_x - right_center_x)
     if not isfinite(disparity) or disparity <= 1e-6:
         return None
-    time_delta = abs(left.timestamp_s - right.timestamp_s)
+    left_timestamp_s = detection_timestamp_for_basis(left, calibration.timestamp_basis)
+    right_timestamp_s = detection_timestamp_for_basis(right, calibration.timestamp_basis)
+    if left_timestamp_s is None or right_timestamp_s is None:
+        return None
+    time_delta = abs(left_timestamp_s - right_timestamp_s)
     if time_delta > calibration.max_time_delta_s:
         return None
     vertical_delta = abs(left_center_y - right_center_y)

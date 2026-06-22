@@ -18,8 +18,8 @@ def session_dir(root: Path, session_id: str | None = None) -> Path:
 def raw_video_paths(root: Path, session_id: str | None = None) -> dict[str, Path]:
     output_dir = session_dir(root, session_id)
     return {
-        "left": output_dir / "raw_video_left.mp4",
-        "right": output_dir / "raw_video_right.mp4",
+        "left": output_dir / "video" / "raw_left.mp4",
+        "right": output_dir / "video" / "raw_right.mp4",
     }
 
 
@@ -53,6 +53,7 @@ class SavedSessionFiles:
 
 
 def write_dynamic_csv(output: Path, rows: list[dict[str, object]]) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w", newline="", encoding="utf-8") as handle:
         fieldnames = list(dict.fromkeys(field for row in rows for field in row.keys()))
         writer = csv.DictWriter(
@@ -74,26 +75,27 @@ def save_session_files(
     uam_analysis_rows: list[dict[str, object]] | None = None,
 ) -> SavedSessionFiles:
     output_dir.mkdir(parents=True, exist_ok=True)
-    metadata_output = output_dir / "session_metadata.json"
+    metadata_output = output_dir / "metadata" / "session_metadata.json"
+    metadata_output.parent.mkdir(parents=True, exist_ok=True)
     metadata_output.write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
     distance_output = None
     if distance_rows:
-        distance_output = output_dir / "distance_history.csv"
+        distance_output = output_dir / "measurements" / "distance_history.csv"
         write_dynamic_csv(distance_output, distance_rows)
     external_output = None
     if external_parameter_rows:
-        external_output = output_dir / "external_parameters.csv"
+        external_output = output_dir / "alignment" / "external_parameters.csv"
         write_dynamic_csv(external_output, external_parameter_rows)
     mag_output = None
     if pixhawk_mag_rows:
-        mag_output = output_dir / "pixhawk_mag_status.csv"
+        mag_output = output_dir / "alignment" / "pixhawk_mag_status.csv"
         write_dynamic_csv(mag_output, pixhawk_mag_rows)
     uam_analysis_output = None
     if uam_analysis_rows:
-        uam_analysis_output = output_dir / "uam_analysis.csv"
+        uam_analysis_output = output_dir / "measurements" / "uam_analysis.csv"
         write_dynamic_csv(uam_analysis_output, uam_analysis_rows)
     return SavedSessionFiles(
         metadata=metadata_output,

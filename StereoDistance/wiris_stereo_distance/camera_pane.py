@@ -45,6 +45,9 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images: dict[float, QtGui.QImage] = {}
         self.measurement_frame_order: deque[float] = deque(maxlen=120)
         self.measurement_pair_display_active = False
+        self.selected_measurement_frame_timestamp_s: float | None = None
+        self.selected_measurement_frame_lookup_delta_s: float | None = None
+        self.detection_stream_active = False
         self.bbox_center_adjustment: tuple[tuple[float, float, float, float], tuple[float, float, float, float]] | None = None
         self.stream_generation = 0
         self.current_status = "중지됨"
@@ -73,6 +76,9 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images.clear()
         self.measurement_frame_order.clear()
         self.measurement_pair_display_active = False
+        self.selected_measurement_frame_timestamp_s = None
+        self.selected_measurement_frame_lookup_delta_s = None
+        self.detection_stream_active = bool(enable_detection)
         self.image_label.setPixmap(QtGui.QPixmap())
         self.image_label.setText("YOLO 시작 중..." if enable_detection else "카메라 연결 중...")
         self._set_detection_label(None)
@@ -130,6 +136,9 @@ class CameraPane(QtWidgets.QGroupBox):
         self.measurement_frame_images.clear()
         self.measurement_frame_order.clear()
         self.measurement_pair_display_active = False
+        self.selected_measurement_frame_timestamp_s = None
+        self.selected_measurement_frame_lookup_delta_s = None
+        self.detection_stream_active = False
         self.image_label.setText("중지됨")
         self.image_label.setPixmap(QtGui.QPixmap())
         self._set_status("중지됨")
@@ -150,9 +159,10 @@ class CameraPane(QtWidgets.QGroupBox):
         frame_metadata.setdefault("source_timestamp_s", None)
         frame_metadata.setdefault("timestamp_source", "app-receive")
         frame_metadata.setdefault("timestamp_reference", infer_camera_timestamp_reference(frame_metadata))
-        if self.measurement_pair_display_active:
+        if self.measurement_pair_display_active and self.detection_stream_active:
             self.frame_changed.emit(self.camera_label, image, frame_metadata)
             return
+        self.measurement_pair_display_active = False
         self.latest_image = image
         self.frame_changed.emit(self.camera_label, image, frame_metadata)
         self._refresh_pixmap()
@@ -177,27 +187,45 @@ class CameraPane(QtWidgets.QGroupBox):
         self._store_measurement_frame(timestamp_s, image)
 
     def show_measurement_frame_for_detection(self, detection: DetectionObservation) -> bool:
-        image = self.measurement_frame_images.get(float(detection.timestamp_s))
+        detection_timestamp_s = float(detection.timestamp_s)
+        image = self.measurement_frame_images.get(detection_timestamp_s)
+        selected_timestamp_s = detection_timestamp_s if image is not None else None
         if image is None:
-            image = self._nearest_measurement_frame(float(detection.timestamp_s))
+            nearest = self._nearest_measurement_frame(detection_timestamp_s)
+            if nearest is not None:
+                selected_timestamp_s, image = nearest
         if image is None:
             self.measurement_pair_display_active = False
+            self.selected_measurement_frame_timestamp_s = None
+            self.selected_measurement_frame_lookup_delta_s = None
             return False
+        self.selected_measurement_frame_timestamp_s = selected_timestamp_s
+        self.selected_measurement_frame_lookup_delta_s = (
+            None if selected_timestamp_s is None else selected_timestamp_s - detection_timestamp_s
+        )
+        self.show_selected_measurement_frame(image)
+        return True
+
+    def show_selected_measurement_frame(self, image: QtGui.QImage) -> None:
         self.measurement_pair_display_active = True
         self.latest_image = image.copy()
         self._refresh_pixmap()
-        return True
 
     def clear_measurement_pair_display(self) -> None:
         self.measurement_pair_display_active = False
+        self.selected_measurement_frame_timestamp_s = None
+        self.selected_measurement_frame_lookup_delta_s = None
 
-    def _nearest_measurement_frame(self, timestamp_s: float) -> QtGui.QImage | None:
+    def _nearest_measurement_frame(self, timestamp_s: float) -> tuple[float, QtGui.QImage] | None:
         if not self.measurement_frame_images:
             return None
         key = min(self.measurement_frame_images, key=lambda candidate: abs(candidate - timestamp_s))
         if abs(key - timestamp_s) > 0.001:
             return None
-        return self.measurement_frame_images.get(key)
+        image = self.measurement_frame_images.get(key)
+        if image is None:
+            return None
+        return key, image
 
     def _refresh_pixmap(self) -> None:
         if self.latest_image is None:

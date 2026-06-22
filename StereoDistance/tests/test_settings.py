@@ -31,6 +31,10 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.stream_backend == "gstreamer"
     assert settings.rtsp_transport == "udp"
     assert settings.measurement_display_mode == "detection"
+    assert settings.yolo_gate_matching_enabled is True
+    assert settings.yolo_gate_time_delta_enabled is True
+    assert settings.yolo_gate_vertical_delta_enabled is True
+    assert settings.yolo_gate_time_basis == "camera_rtc_required"
     assert settings.ros_domain_id == 0
     assert settings.pixhawk_host_address == "10.0.0.10"
     assert settings.left_pixhawk_eth_ip == "10.0.0.2"

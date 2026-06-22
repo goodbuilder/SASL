@@ -62,7 +62,7 @@ class TriangulationQualityPlot(QtWidgets.QWidget):
         painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
         rect = self.rect().adjusted(12, 12, -12, -12)
         painter.setPen(QtGui.QPen(QtGui.QColor(CHART_TEXT), 1))
-        painter.drawText(rect.x(), rect.y() + 16, "삼각측량 ray / gap")
+        painter.drawText(rect.x(), rect.y() + 16, "측정 ray / gap")
         content = rect.adjusted(0, 30, 0, 0)
         if not self.state:
             painter.setPen(QtGui.QColor(CHART_MUTED))
@@ -93,7 +93,6 @@ class TriangulationQualityPlot(QtWidgets.QWidget):
         summary = (
             f"gap={self._fmt(self.state.get('closest_gap_m'))} m   "
             f"distance={self._fmt(self.state.get('distance_m'))} m   "
-            f"baseline={self._fmt(self.state.get('baseline_m'))} m   "
             f"{self.state.get('method', '')}"
         )
         painter.drawText(content.adjusted(0, 0, 0, -4), QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom, summary)

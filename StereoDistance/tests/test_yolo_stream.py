@@ -21,11 +21,17 @@ from wiris_stereo_distance.yolo_stream import (
     GstRtpTimingTracker,
     STREAM_BACKEND_OPENCV_AUTO,
     STREAM_BACKEND_PYAV,
+    RtpFrameTiming,
     RtcpSenderReportTiming,
     YoloStreamWorker,
+    _open_record_video_writer,
     _process_frame_for_output,
+    _release_record_video_writer,
     _run_opencv_stream,
+    _write_record_video_frame,
+    build_ffmpeg_recording_command,
     build_gst_pipeline_text,
+    build_gst_recording_pipeline_text,
     decoder_candidates,
     effective_yolo_max_rate_hz,
     estimate_rtcp_ntp_unix_seconds,
@@ -187,12 +193,77 @@ def test_rtcp_sender_report_interval_logging_triggers_on_new_sr() -> None:
     assert messages == [message]
 
 
+def test_rtp_timing_tracker_does_not_attach_stale_timing_to_known_pts() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+    timing = RtpFrameTiming(
+        rtp_timestamp=90_000,
+        rtp_ssrc=1234,
+        rtp_marker_seq=10,
+        rtp_pts_s=1.0,
+    )
+    with tracker._lock:
+        tracker._timing_by_pts_ns[1_000_000_000] = timing
+
+    assert tracker._pop_frame_timing(1_100_000_000) is None
+
+    with tracker._lock:
+        assert tracker._timing_by_pts_ns[1_000_000_000] is timing
+    assert tracker._pop_frame_timing(None) is timing
+
+
 def test_gstreamer_pipeline_can_drop_delta_frames_for_keyframe_only_diagnostics() -> None:
     pipeline = build_gst_pipeline_text("rtsp://10.0.0.232:8554/visible", keyframe_only=True)
 
     assert "h264parse config-interval=-1 disable-passthrough=true" in pipeline
     assert "video/x-h264,alignment=au" in pipeline
     assert "identity drop-buffer-flags=delta-unit" in pipeline
+
+
+def test_gstreamer_pipeline_records_encoded_h264_without_reencoding(tmp_path) -> None:
+    record_path = tmp_path / "raw left.mkv"
+    pipeline = build_gst_pipeline_text(
+        "rtsp://10.0.0.232:8554/visible",
+        record_video_path=str(record_path),
+    )
+
+    assert "! tee name=encoded" in pipeline
+    assert "encoded. ! queue" in pipeline
+    assert "! matroskamux" in pipeline
+    assert f"! filesink location='{record_path}' sync=false" in pipeline
+    assert pipeline.count("h264parse") >= 2
+    assert "! videoconvert ! video/x-raw,format=BGR ! appsink" in pipeline
+
+
+def test_gstreamer_recording_pipeline_saves_encoded_h264_without_decode(tmp_path) -> None:
+    record_path = tmp_path / "raw left.mkv"
+    pipeline = build_gst_recording_pipeline_text(
+        "rtsp://10.0.0.232:8554/visible",
+        record_video_path=str(record_path),
+    )
+
+    assert "rtph264depay" in pipeline
+    assert "! h264parse config-interval=-1" in pipeline
+    assert "! matroskamux" in pipeline
+    assert f"! filesink location='{record_path}' sync=false" in pipeline
+    assert "videoconvert" not in pipeline
+    assert "appsink" not in pipeline
+
+
+def test_ffmpeg_recording_command_copies_h264_to_mp4_with_generated_pts(tmp_path) -> None:
+    record_path = tmp_path / "raw left.mp4"
+    command = build_ffmpeg_recording_command(
+        "rtsp://10.0.0.232:8554/visible",
+        transport="udp",
+        record_video_path=str(record_path),
+    )
+
+    assert command[:7] == ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-rtsp_transport", "udp", "-use_wallclock_as_timestamps"]
+    assert "+genpts" in command
+    assert "-c:v" in command
+    assert "copy" in command
+    assert "-movflags" in command
+    assert "+faststart" in command
+    assert str(record_path) == command[-1]
 
 
 def test_gstreamer_pipeline_can_use_nvidia_decoder() -> None:
@@ -309,6 +380,111 @@ def test_yolo_worker_passes_rtsp_latency_to_runtime_config() -> None:
     )
     assert "latency=25" in pipeline
     assert "protocols=tcp" in pipeline
+
+
+def test_yolo_worker_request_stop_allows_child_cleanup() -> None:
+    class FakeStopEvent:
+        def __init__(self) -> None:
+            self.set_called = False
+
+        def set(self) -> None:
+            self.set_called = True
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.terminate_called = False
+
+        def is_alive(self) -> bool:
+            return True
+
+        def terminate(self) -> None:
+            self.terminate_called = True
+
+    worker = YoloStreamWorker(
+        url="rtsp://10.0.0.232:8554/visible",
+        weights_path="weights.pt",
+        device="cpu",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=30.0,
+        enable_detection=False,
+    )
+    stop_event = FakeStopEvent()
+    process = FakeProcess()
+    worker._stop_event = stop_event
+    worker._process = process
+
+    worker.request_stop()
+
+    assert stop_event.set_called
+    assert not process.terminate_called
+
+
+def test_record_video_writer_runs_on_background_thread(tmp_path) -> None:
+    class FakeVideoWriter:
+        written = 0
+        released = False
+        thread_ids: list[int] = []
+
+        def __init__(self, *_args):
+            pass
+
+        def isOpened(self):
+            return True
+
+        def write(self, _frame):
+            type(self).written += 1
+            type(self).thread_ids.append(threading.get_ident())
+
+        def release(self):
+            type(self).released = True
+
+    class FakeCv2:
+        INTER_AREA = 3
+        VideoWriter = FakeVideoWriter
+
+        @staticmethod
+        def VideoWriter_fourcc(*_args):
+            return 0
+
+        @staticmethod
+        def resize(frame, size, interpolation=None):
+            _ = interpolation
+            return np.zeros((size[1], size[0], 3), dtype=frame.dtype)
+
+    class FakeOutputQueue:
+        def __init__(self):
+            self.messages = []
+
+        def put(self, message):
+            self.messages.append(message)
+
+    output_queue = FakeOutputQueue()
+    writer_state = _open_record_video_writer(
+        FakeCv2,
+        {
+            "record_video_path": str(tmp_path / "left.mp4"),
+            "record_video_fps": 30.0,
+            "record_video_queue_size": 8,
+        },
+        output_queue,
+        16,
+        9,
+    )
+    assert writer_state is not None
+    caller_thread_id = threading.get_ident()
+
+    for _ in range(4):
+        _write_record_video_frame(FakeCv2, writer_state, np.zeros((9, 16, 3), dtype=np.uint8))
+    _release_record_video_writer(output_queue, writer_state)
+
+    assert FakeVideoWriter.released
+    assert FakeVideoWriter.written == 4
+    assert FakeVideoWriter.thread_ids
+    assert all(thread_id != caller_thread_id for thread_id in FakeVideoWriter.thread_ids)
+    assert any(message[0] == "status" and "영상 녹화 시작" in message[1] for message in output_queue.messages)
+    assert any(message[0] == "status" and "영상 녹화 저장 완료" in message[1] for message in output_queue.messages)
 
 
 def test_yolo_worker_uses_cuda_thread_default_without_rate_limit() -> None:

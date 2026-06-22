@@ -3,6 +3,10 @@ from __future__ import annotations
 import os
 import multiprocessing
 import queue
+import shlex
+import shutil
+import signal
+import subprocess
 import threading
 import time
 from collections import deque
@@ -50,6 +54,7 @@ NTP_UNIX_EPOCH_OFFSET_S = 2_208_988_800
 UINT32_MODULUS = 2**32
 UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
+DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
 
 
 @dataclass(frozen=True)
@@ -187,26 +192,126 @@ def _record_video_fps(config: dict[str, Any]) -> float:
     return max(1.0, fps)
 
 
+def _record_video_queue_size(config: dict[str, Any]) -> int:
+    try:
+        size = int(config.get("record_video_queue_size") or DEFAULT_RECORD_VIDEO_QUEUE_SIZE)
+    except (TypeError, ValueError):
+        size = DEFAULT_RECORD_VIDEO_QUEUE_SIZE
+    return max(1, size)
+
+
+def _gst_location(value: str) -> str:
+    return shlex.quote(str(Path(value).expanduser()))
+
+
+class AsyncVideoWriter:
+    def __init__(
+        self,
+        cv2,
+        *,
+        path: str,
+        fps: float,
+        width: int,
+        height: int,
+        max_queue_size: int,
+        output_queue,
+    ) -> None:
+        self.cv2 = cv2
+        self.path = str(path)
+        self.fps = float(fps)
+        self.width = int(width)
+        self.height = int(height)
+        self.output_queue = output_queue
+        self.frames: queue.Queue[Any] = queue.Queue(maxsize=max_queue_size)
+        self.stop_event = threading.Event()
+        self.dropped_frames = 0
+        self.written_frames = 0
+        self._last_drop_status_s = 0.0
+        self.thread = threading.Thread(target=self._run, name="stereo-video-writer", daemon=True)
+        self.thread.start()
+
+    def enqueue(self, frame) -> None:
+        if self.stop_event.is_set():
+            return
+        try:
+            self.frames.put_nowait(frame)
+            return
+        except queue.Full:
+            pass
+        try:
+            self.frames.get_nowait()
+            self.frames.task_done()
+        except queue.Empty:
+            pass
+        self.dropped_frames += 1
+        now_s = time.monotonic()
+        if now_s - self._last_drop_status_s >= 1.0:
+            self._last_drop_status_s = now_s
+            _emit_status(
+                self.output_queue,
+                f"영상 녹화 queue 포화: 오래된 프레임 드롭 중 ({self.dropped_frames} dropped)",
+            )
+        try:
+            self.frames.put_nowait(frame)
+        except queue.Full:
+            self.dropped_frames += 1
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=5.0)
+        if self.thread.is_alive():
+            _emit_status(self.output_queue, f"영상 녹화 writer 종료 지연: {self.path}")
+
+    def _run(self) -> None:
+        writer = None
+        try:
+            output_path = Path(self.path).expanduser()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            fourcc = self.cv2.VideoWriter_fourcc(*"mp4v")
+            writer = self.cv2.VideoWriter(str(output_path), fourcc, self.fps, (self.width, self.height))
+            if not writer.isOpened():
+                writer.release()
+                _emit_status(self.output_queue, f"영상 녹화 파일 열기 실패: {output_path}")
+                return
+            _emit_status(self.output_queue, f"영상 녹화 시작: {output_path}")
+            while not self.stop_event.is_set() or not self.frames.empty():
+                try:
+                    frame = self.frames.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                try:
+                    if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                        frame = self.cv2.resize(frame, (self.width, self.height), interpolation=self.cv2.INTER_AREA)
+                    writer.write(frame)
+                    self.written_frames += 1
+                finally:
+                    self.frames.task_done()
+        except Exception as exc:
+            _emit_status(self.output_queue, f"영상 녹화 writer 오류: {exc}")
+        finally:
+            if writer is not None:
+                writer.release()
+            _emit_status(
+                self.output_queue,
+                f"영상 녹화 저장 완료: {self.path} "
+                f"(written={self.written_frames}, dropped={self.dropped_frames})",
+            )
+
+
 def _open_record_video_writer(cv2, config: dict[str, Any], output_queue, width: int, height: int):
     path = _record_video_path(config)
     if not path or width <= 0 or height <= 0:
         return None
     try:
-        output_path = Path(path).expanduser()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_path), fourcc, _record_video_fps(config), (int(width), int(height)))
-        if not writer.isOpened():
-            writer.release()
-            _emit_status(output_queue, f"영상 녹화 파일 열기 실패: {output_path}")
-            return None
-        _emit_status(output_queue, f"영상 녹화 시작: {output_path}")
-        return {
-            "writer": writer,
-            "path": str(output_path),
-            "width": int(width),
-            "height": int(height),
-        }
+        return AsyncVideoWriter(
+            cv2,
+            path=path,
+            fps=_record_video_fps(config),
+            width=width,
+            height=height,
+            max_queue_size=_record_video_queue_size(config),
+            output_queue=output_queue,
+        )
     except Exception as exc:
         _emit_status(output_queue, f"영상 녹화 시작 실패: {exc}")
         return None
@@ -215,21 +320,13 @@ def _open_record_video_writer(cv2, config: dict[str, Any], output_queue, width: 
 def _write_record_video_frame(cv2, writer_state, frame) -> None:
     if writer_state is None:
         return
-    writer = writer_state["writer"]
-    width = int(writer_state["width"])
-    height = int(writer_state["height"])
-    if frame.shape[1] != width or frame.shape[0] != height:
-        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-    writer.write(frame)
+    writer_state.enqueue(frame)
 
 
 def _release_record_video_writer(output_queue, writer_state) -> None:
     if writer_state is None:
         return
-    try:
-        writer_state["writer"].release()
-    finally:
-        _emit_status(output_queue, f"영상 녹화 저장 완료: {writer_state['path']}")
+    writer_state.close()
 
 
 def normalize_decoder_mode(decoder: str | None) -> str:
@@ -598,6 +695,7 @@ class GstRtpTimingTracker:
                 timing = self._pop_nearest_timing_locked(pts_ns)
                 if timing is not None:
                     return timing
+                return None
             if self._timing_by_pts_ns:
                 oldest_pts = min(self._timing_by_pts_ns)
                 return self._timing_by_pts_ns.pop(oldest_pts, None)
@@ -667,6 +765,7 @@ def build_gst_pipeline_text(
     decoder: str = NVIDIA_H264_DECODER,
     transport: str = RTSP_TRANSPORT_UDP,
     keyframe_only: bool = False,
+    record_video_path: str = "",
 ) -> str:
     latency_ms = max(0, int(latency_ms))
     rtsp_transport = normalize_rtsp_transport(transport)
@@ -679,6 +778,27 @@ def build_gst_pipeline_text(
             "! video/x-h264,alignment=au "
             "! identity drop-buffer-flags=delta-unit silent=true "
             "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+        )
+    record_path = str(record_video_path or "").strip()
+    if record_path:
+        return (
+            f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
+            "drop-on-latency=true do-rtcp=true "
+            "! rtph264depay name=depay source-info=true "
+            "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+            f"! {h264parse_element} "
+            f"{keyframe_filter}"
+            "! tee name=encoded "
+            "encoded. ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+            f"! {decoder_element} "
+            "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
+            "! videoconvert "
+            "! video/x-raw,format=BGR "
+            "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true "
+            "encoded. ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 "
+            "! h264parse config-interval=-1 "
+            "! matroskamux "
+            f"! filesink location={_gst_location(record_path)} sync=false"
         )
     return (
         f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
@@ -696,6 +816,212 @@ def build_gst_pipeline_text(
     )
 
 
+def build_gst_recording_pipeline_text(
+    url: str,
+    *,
+    latency_ms: int = DEFAULT_RTSP_LATENCY_MS,
+    transport: str = RTSP_TRANSPORT_UDP,
+    record_video_path: str,
+) -> str:
+    latency_ms = max(0, int(latency_ms))
+    rtsp_transport = normalize_rtsp_transport(transport)
+    return (
+        f"rtspsrc location={url} latency={latency_ms} protocols={rtsp_transport} "
+        "drop-on-latency=true do-rtcp=true "
+        "! rtph264depay "
+        "! h264parse config-interval=-1 "
+        "! matroskamux "
+        f"! filesink location={_gst_location(record_video_path)} sync=false"
+    )
+
+
+def build_ffmpeg_recording_command(
+    url: str,
+    *,
+    transport: str = RTSP_TRANSPORT_UDP,
+    record_video_path: str,
+) -> list[str]:
+    rtsp_transport = "tcp" if normalize_rtsp_transport(transport) == RTSP_TRANSPORT_TCP else "udp"
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-rtsp_transport",
+        rtsp_transport,
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-fflags",
+        "+genpts",
+        "-i",
+        str(url),
+        "-an",
+        "-c:v",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-y",
+        str(Path(record_video_path).expanduser()),
+    ]
+
+
+def _iter_ffmpeg_recording_pids(record_video_path: str) -> list[int]:
+    target_path = str(Path(record_video_path).expanduser())
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return []
+    pids: list[int] = []
+    for pid_dir in proc_root.iterdir():
+        if not pid_dir.name.isdigit():
+            continue
+        try:
+            cmdline_bytes = (pid_dir / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not cmdline_bytes:
+            continue
+        parts = [part.decode(errors="ignore") for part in cmdline_bytes.split(b"\0") if part]
+        if not parts:
+            continue
+        if Path(parts[0]).name != "ffmpeg":
+            continue
+        if target_path in parts:
+            pids.append(int(pid_dir.name))
+    return pids
+
+
+def _stop_stale_ffmpeg_recorders(record_video_path: str, output_queue) -> None:
+    stale_pids = _iter_ffmpeg_recording_pids(record_video_path)
+    if not stale_pids:
+        return
+    for pid in stale_pids:
+        try:
+            os.killpg(pid, signal.SIGINT)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGINT)
+            except OSError:
+                continue
+    deadline_s = time.monotonic() + 3.0
+    while time.monotonic() < deadline_s:
+        if not _iter_ffmpeg_recording_pids(record_video_path):
+            _emit_status(output_queue, f"기존 ffmpeg MP4 녹화 정리 완료: {record_video_path}")
+            return
+        time.sleep(0.1)
+    for pid in _iter_ffmpeg_recording_pids(record_video_path):
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                continue
+    _emit_status(output_queue, f"기존 ffmpeg MP4 녹화 강제 정리 요청: {record_video_path}")
+
+
+def _start_ffmpeg_encoded_recording_process(config: dict[str, Any], output_queue):
+    record_path = _record_video_path(config)
+    if not record_path:
+        return None
+    if shutil.which("ffmpeg") is None:
+        _emit_status(output_queue, "ffmpeg 없음: MP4 원본 녹화를 시작할 수 없습니다.")
+        return None
+    try:
+        Path(record_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        _stop_stale_ffmpeg_recorders(record_path, output_queue)
+        command = build_ffmpeg_recording_command(
+            str(config["url"]),
+            transport=str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)),
+            record_video_path=record_path,
+        )
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _emit_status(output_queue, f"ffmpeg H264 MP4 원본 녹화 시작: {record_path}")
+        return process
+    except Exception as exc:
+        _emit_status(output_queue, f"ffmpeg H264 MP4 원본 녹화 시작 실패: {exc}")
+        return None
+
+
+def _stop_ffmpeg_encoded_recording_process(process, output_queue, record_video_path: str) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.write(b"q\n")
+                    process.stdin.flush()
+                    process.stdin.close()
+                except Exception:
+                    pass
+            try:
+                process.wait(timeout=8.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGINT)
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    process.wait(timeout=2.0)
+        _emit_status(output_queue, f"ffmpeg H264 MP4 원본 녹화 종료: {record_video_path} (exit={process.returncode})")
+    except Exception as exc:
+        _emit_status(output_queue, f"ffmpeg H264 MP4 원본 녹화 종료 실패: {exc}")
+
+
+def _start_gst_encoded_recording_process(config: dict[str, Any], output_queue):
+    record_path = _record_video_path(config)
+    if not record_path:
+        return None
+    try:
+        Path(record_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+        pipeline_text = build_gst_recording_pipeline_text(
+            str(config["url"]),
+            latency_ms=int(config.get("rtsp_latency_ms", DEFAULT_RTSP_LATENCY_MS)),
+            transport=str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)),
+            record_video_path=record_path,
+        )
+        process = subprocess.Popen(
+            ["gst-launch-1.0", "-e", *shlex.split(pipeline_text)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _emit_status(output_queue, f"GStreamer H264 원본 녹화 프로세스 시작: {record_path}")
+        return process
+    except Exception as exc:
+        _emit_status(output_queue, f"GStreamer H264 원본 녹화 프로세스 시작 실패: {exc}")
+        return None
+
+
+def _stop_gst_encoded_recording_process(process, output_queue, record_video_path: str) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGINT)
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2.0)
+        _emit_status(
+            output_queue,
+            f"GStreamer H264 원본 녹화 프로세스 종료: {record_video_path} (exit={process.returncode})",
+        )
+    except Exception as exc:
+        _emit_status(output_queue, f"GStreamer H264 원본 녹화 프로세스 종료 실패: {exc}")
+
+
 def _launch_gst_pipeline(
     Gst,
     url: str,
@@ -704,6 +1030,7 @@ def _launch_gst_pipeline(
     decoder_mode: str,
     transport: str,
     keyframe_only: bool,
+    record_video_path: str,
     output_queue,
     rtp_timing_tracker: GstRtpTimingTracker | None = None,
 ):
@@ -715,6 +1042,7 @@ def _launch_gst_pipeline(
             decoder=decoder,
             transport=transport,
             keyframe_only=keyframe_only,
+            record_video_path=record_video_path,
         )
         pipeline = None
         try:
@@ -729,6 +1057,8 @@ def _launch_gst_pipeline(
             if state_result == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError(f"{decoder} failed to enter PLAYING state")
             _emit_status(output_queue, f"GStreamer 디코더: {decoder}")
+            if record_video_path:
+                _emit_status(output_queue, f"GStreamer H264 원본 녹화 시작: {record_video_path}")
             return pipeline, sink, bus, decoder
         except Exception as exc:
             last_error = f"{decoder}: {exc}"
@@ -739,6 +1069,32 @@ def _launch_gst_pipeline(
                 continue
             break
     raise RuntimeError(last_error or "no usable decoder")
+
+
+def _finalize_gst_recording(Gst, pipeline, bus, output_queue, record_video_path: str) -> None:
+    if not record_video_path:
+        return
+    try:
+        pipeline.send_event(Gst.Event.new_eos())
+        deadline_s = time.monotonic() + 3.0
+        while time.monotonic() < deadline_s:
+            message = bus.timed_pop_filtered(
+                200_000_000,
+                Gst.MessageType.EOS | Gst.MessageType.ERROR,
+            )
+            if message is None:
+                continue
+            if message.type == Gst.MessageType.ERROR:
+                error, debug = message.parse_error()
+                detail = error.message if debug is None else f"{error.message} ({debug})"
+                _emit_status(output_queue, f"GStreamer 녹화 종료 오류: {detail}")
+                return
+            if message.type == Gst.MessageType.EOS:
+                _emit_status(output_queue, f"GStreamer H264 원본 녹화 저장 완료: {record_video_path}")
+                return
+        _emit_status(output_queue, f"GStreamer 녹화 EOS 대기 시간 초과: {record_video_path}")
+    except Exception as exc:
+        _emit_status(output_queue, f"GStreamer 녹화 종료 실패: {exc}")
 
 
 def _load_yolo_model(config: dict[str, Any], output_queue, enable_detection: bool):
@@ -942,6 +1298,8 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         GstRtp,
         status_callback=lambda text: _emit_status(output_queue, text),
     )
+    record_video_path = _record_video_path(config)
+    recording_process = _start_ffmpeg_encoded_recording_process(config, output_queue)
     try:
         pipeline, sink, bus, _decoder = _launch_gst_pipeline(
             Gst,
@@ -950,11 +1308,13 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             decoder_mode=str(config.get("decoder", DECODER_AUTO)),
             transport=str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)),
             keyframe_only=keyframe_only,
+            record_video_path="",
             output_queue=output_queue,
             rtp_timing_tracker=rtp_timing_tracker,
         )
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 오류: {exc}")
+        _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
         return
 
     rate_limiter = AdaptiveYoloRateLimiter.from_config(config, enable_detection=enable_detection)
@@ -972,10 +1332,8 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
     latest_width = 0
     latest_height = 0
     reader_stop = threading.Event()
-    record_writer_state = None
-
     def reader_loop() -> None:
-        nonlocal decoded_frames, latest_frame, latest_height, latest_sequence, latest_width, record_writer_state
+        nonlocal decoded_frames, latest_frame, latest_height, latest_sequence, latest_width
         while not stop_event.is_set() and not reader_stop.is_set():
             sample = sink.emit("try-pull-sample", 200_000_000)
             if sample is None:
@@ -994,10 +1352,6 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
             finally:
                 buffer.unmap(map_info)
-            if _record_video_path(config):
-                if record_writer_state is None:
-                    record_writer_state = _open_record_video_writer(cv2, config, output_queue, width, height)
-                _write_record_video_frame(cv2, record_writer_state, frame)
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
@@ -1132,7 +1486,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         reader_stop.set()
         pipeline.set_state(Gst.State.NULL)
         reader.join(timeout=1.0)
-        _release_record_video_writer(output_queue, record_writer_state)
+        _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
         _emit_status(output_queue, "중지됨")
 
 
@@ -1641,9 +1995,6 @@ class YoloStreamWorker(QtCore.QObject):
         self._stop_requested = True
         if self._stop_event is not None:
             self._stop_event.set()
-        process = self._process
-        if process is not None and process.is_alive():
-            process.terminate()
 
     def _queue_has_pending_messages(self) -> bool:
         if self._output_queue is None:
