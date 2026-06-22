@@ -742,3 +742,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: log product additive correction is effectively tied with
     unlogged product additive correction and still worsens aggregate RMSE.
     Reject this log interaction branch.
+
+- `EXP-20260623-423-b15x7-common0p1-logdisparity-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.689243 m`.
+  - Interpretation: log-disparity additive correction improves overall target
+    max and aggregate range/position RMSE, but still fails all intrinsic-scale
+    rows. Reject as standalone deployment candidate, but keep as a promising
+    aggregate anchor for further tuning.
