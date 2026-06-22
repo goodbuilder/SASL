@@ -1235,3 +1235,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: common `0.01` slightly improves RMSE but is worse than
     EXP479 on target tail and still fails intrinsic rows. Reject standalone
     deployment.
+
+- `EXP-20260623-482-b21x5-common0p02-rawforward-forwardadd-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max matches
+    EXP479 at `4.076885 m` to `4.056885 m`, while range RMSE is slightly worse
+    at `0.902118 m`.
+  - Interpretation: degree 2 does not improve the b21x5 common `0.02`
+    raw-forward additive branch. Reject standalone deployment.
