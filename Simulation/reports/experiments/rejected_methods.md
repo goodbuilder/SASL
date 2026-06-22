@@ -709,3 +709,11 @@ in inputs, observation model, gate, or method.
     residual target max-abs was `3.549610 m`.
   - Interpretation: inverse-depth matches plain disparity at scout precision and
     is not a distinct improvement axis. Reject this scalar branch.
+
+- `EXP-20260623-419-b15x7-common0p1-disparity-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.659469 m`.
+  - Interpretation: plain disparity additive correction slightly improves the
+    tracked intrinsic seed but worsens worst target error and aggregate
+    range/position RMSE. Reject this scalar additive branch.
