@@ -505,3 +505,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: b15x7 fusion does not fix the inverse-depth target failure
     pattern. Aggregate regression remains small, but strict target protection is
     insufficient. Reject as a standalone guard fallback.
+
+- `EXP-20260623-388-b15x7-common0p2-rawforward-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.836855 m`.
+  - Interpretation: raw-forward under b15x7 preserves the aggregate RMSE clue
+    (`0.924142 m` to `0.921861 m`) but still misses every intrinsic-scale target
+    row. Reject as a standalone guard fallback.
