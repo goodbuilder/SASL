@@ -1041,3 +1041,21 @@ promoted as final Simulation PASS correction methods:
 - Contract: product fallback uses `measured_disparity_px * raw_forward_m` and
   outputs stereo-center RDF ray-scale correction.
 - Next action: try a different intrinsic fallback family or use common0.4.
+
+## EXP-20260622-341 B15x5 Common0.3/Common0.4 Cross Guard Selector Fresh100
+
+- Status: `FAIL`; common0.4 product fallback does not recover the common0.3
+  fresh100 strict failure when used only for guard rows.
+- Evidence: seeds `298100..298199`, six scenarios, common0.3 non-guard
+  forward-add branch plus common0.4 product guard branch.
+- Result: `599/600`; failing row remains seed `298188`,
+  `intrinsic_scale_stress`, selected by the product guard branch.
+- Aggregate result: target max-abs `4.732347 m` to `4.632350 m`, range RMSE
+  mean `0.933193 m` to `0.815708 m`, position RMSE mean `2.496306 m` to
+  `2.391667 m`.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m` after base profile correction and b15x5 common0.3
+  fusion; branch outputs remain stereo-center RDF corrections and public output
+  remains `FRD+range`.
+- Next action: try a non-product intrinsic fallback family; do not stop at PASS
+  or repeated seed checks.
