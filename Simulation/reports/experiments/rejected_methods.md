@@ -1016,3 +1016,11 @@ in inputs, observation model, gate, or method.
     worse than common `0.05`, moving from `4.348758 m` to `4.328759 m`.
   - Interpretation: stricter common sampling keeps the low-regression shape but
     does not recover intrinsic rows. Reject standalone deployment.
+
+- `EXP-20260623-457-b15x7-common0p02-rawforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; range RMSE improves
+    from `0.912369 m` to `0.905603 m`, but target max is worse than common
+    `0.05`, moving from `4.255268 m` to `4.235268 m`.
+  - Interpretation: looser common sampling gives the best RMSE in this branch
+    but still fails intrinsic rows. Reject standalone deployment.
