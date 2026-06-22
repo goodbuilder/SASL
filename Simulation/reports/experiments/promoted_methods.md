@@ -1546,3 +1546,16 @@ promoted as final Simulation PASS correction methods:
   common0.2 fusion; public output remains `FRD+range`.
 - Next action: oversample48 remains the local target-oversampling candidate;
   continue another axis.
+
+## EXP-20260622-386 B15x7 Common0.2 LogProduct Oversample48 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x7 common0.2 log-product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: passes `120/120`.
+- Known target row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs `2.490744 m`, effectively matching unlogged b15x7 product.
+- Contract: feature uses log of fused disparity times stereo-center RDF
+  `raw_forward_m` after b15x7 common0.2 fusion; public output remains
+  `FRD+range`.
+- Next action: log scaling does not move this branch; continue another axis.
