@@ -1033,3 +1033,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: smaller clip softens intrinsic regression but does not
     recover the intrinsic gate and gives up most RMSE improvement. Reject
     standalone deployment.
+
+- `EXP-20260623-459-b15x7-common0p05-rawforward-forwardadd-degree1-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; range RMSE improves
+    from `0.912856 m` to `0.909327 m`, while intrinsic seed `298188` regresses
+    from `3.623977 m` to `3.633976 m`.
+  - Interpretation: midpoint clip gives midpoint behavior but does not recover
+    intrinsic-scale rows. Reject standalone deployment.
