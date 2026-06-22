@@ -767,3 +767,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: lowering ridge from `30` to `3` is nearly saturated:
     aggregate RMSE improves only slightly while intrinsic-tail behavior slightly
     worsens. Reject as standalone deployment candidate and continue searching.
+
+- `EXP-20260623-426-b15x7-common0p1-logdisparity-forwardadd-ridge0p3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.689651 m`.
+  - Interpretation: lowering ridge from `3` to `0.3` is saturated and does not
+    change pass count or intrinsic-tail behavior. Reject standalone deployment
+    and move future search to other tuning axes.
