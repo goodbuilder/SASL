@@ -638,3 +638,11 @@ in inputs, observation model, gate, or method.
     (`0.916652 m` to `0.916164 m`) and lowers worst target versus the additive
     raw-forward branch, but it still fails every intrinsic-scale target row and
     worsens position RMSE. Reject as a standalone method.
+
+- `EXP-20260623-410-b15x7-common0p1-rawforward-rayscale-ridge30-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.838256 m`.
+  - Interpretation: ridge `30` is effectively tied with ridge `300`; it does
+    not reduce intrinsic-scale failures and still worsens position RMSE. Reject
+    this lower-ridge raw-forward ray-scale branch.
