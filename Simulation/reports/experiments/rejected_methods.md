@@ -570,3 +570,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: b15x7 quadratic product reduces the failure count, but it
     is worse than degree1 product on the tracked target row and aggregate RMSE.
     Reject this quadratic setting.
+
+- `EXP-20260623-396-b15x7-common0p2-product-deg2-ridge3000-oversample48-local20-scout`
+  - Result: `FAIL`, `113/120` passes.
+  - Evidence: all seven failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `2.735516 m`.
+  - Interpretation: stronger ridge slightly lowers the worst residual versus
+    ridge `300`, but increases intrinsic-scale failures from two to seven and
+    keeps the aggregate RMSE regression. Reject this stronger quadratic ridge
+    setting.
