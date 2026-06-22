@@ -1099,3 +1099,12 @@ in inputs, observation model, gate, or method.
     `0.906159 m`, matching the raw-forward additive branch.
   - Interpretation: forward-over-disparity is effectively duplicate behavior
     for this scout. Reject standalone deployment.
+
+- `EXP-20260623-467-b15x7-common0p05-disparityoverforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; intrinsic seed
+    `298188` improves from `3.623977 m` to `3.603977 m`, but target max
+    regresses from `4.131533 m` to `4.151533 m`.
+  - Interpretation: the inverse ratio gives selected intrinsic relief but
+    worsens aggregate metrics and still fails the intrinsic gate. Reject
+    standalone deployment.
