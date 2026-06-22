@@ -1394,3 +1394,15 @@ promoted as final Simulation PASS correction methods:
 - Contract: product feature uses stereo-center RDF `raw_forward_m` after b15x5
   common0.1 fusion; public output remains `FRD+range`.
 - Next action: common0.1 is not useful; search a different axis.
+
+## EXP-20260622-365 B15x5 Common0.25 Product Oversample48 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x5 common0.25 product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: passes `120/120`.
+- Known failing row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs `2.534521 m`, between common0.2 and common0.3.
+- Contract: product feature uses stereo-center RDF `raw_forward_m` after b15x5
+  common0.25 fusion; public output remains `FRD+range`.
+- Next action: common0.2 remains stronger; continue exploring other axes.
