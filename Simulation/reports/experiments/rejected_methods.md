@@ -717,3 +717,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: plain disparity additive correction slightly improves the
     tracked intrinsic seed but worsens worst target error and aggregate
     range/position RMSE. Reject this scalar additive branch.
+
+- `EXP-20260623-420-b15x7-common0p1-inversedepth-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.659469 m`.
+  - Interpretation: inverse-depth additive correction matches the plain
+    disparity additive branch at scout precision, so it is not a distinct
+    improvement axis. Reject this duplicate scalar additive branch.
