@@ -931,3 +931,10 @@ in inputs, observation model, gate, or method.
     `1.105969 m` and target max regressed from `4.131533 m` to `4.861392 m`.
   - Interpretation: ridge `0.3` duplicates ridge `3` at scout precision and
     does not reduce aggregate regression. Reject standalone deployment.
+
+- `EXP-20260623-447-b15x7-common0p05-logdisparityforwardproduct-rayscale-degree1-ridge3-clip0p005-oversample48-local20-scout`
+  - Result: `STRICT_PASS`, `120/120` passes.
+  - Evidence: no gate failures, but range RMSE regressed from `0.912856 m` to
+    `1.105966 m` and target max regressed from `4.131533 m` to `4.861383 m`.
+  - Interpretation: clip `0.005` duplicates clip `0.02`; aggregate regression
+    is unchanged. Reject standalone deployment.
