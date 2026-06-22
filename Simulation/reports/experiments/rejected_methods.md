@@ -1091,3 +1091,11 @@ in inputs, observation model, gate, or method.
     from `3.623977 m` to `3.636818 m`.
   - Interpretation: log raw forward softens the linear raw-forward branch but
     still does not recover intrinsic rows. Reject standalone deployment.
+
+- `EXP-20260623-466-b15x7-common0p05-forwardoverdisparity-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max is
+    `4.131533 m` to `4.111533 m`, and range RMSE is `0.912856 m` to
+    `0.906159 m`, matching the raw-forward additive branch.
+  - Interpretation: forward-over-disparity is effectively duplicate behavior
+    for this scout. Reject standalone deployment.
