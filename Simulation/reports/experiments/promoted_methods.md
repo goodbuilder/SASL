@@ -1077,3 +1077,21 @@ promoted as final Simulation PASS correction methods:
 - Next action: product fallback still gives better strict coverage; search a
   targeted intrinsic-row exception or a different fusion shell, not broad
   non-product fallback.
+
+## EXP-20260622-343 B17x5 Common0.3 Forward/Product Same Seeds Fresh100
+
+- Status: `FAIL`; increasing the common0.3 fusion shell to b17x5 does not
+  recover the isolated intrinsic product fallback failure.
+- Evidence: seeds `298100..298199`, six scenarios, b17x5 common0.3 fusion,
+  log-disparity forward-add and product ray-scale families.
+- Best method: product ray-scale degree1 clip `0.02`, `599/600`.
+- Result: fused observation aggregate improves slightly versus b15x5 common0.3,
+  but product residual regresses target max-abs from `4.699601 m` to
+  `5.443396 m` and range mean from `0.929549 m` to `1.112710 m`.
+- Failed row: seed `298188`, `intrinsic_scale_stress`, residual target max-abs
+  `2.713982 m`.
+- Contract: product feature uses stereo-center RDF `raw_forward_m`; residual
+  outputs remain stereo-center RDF corrections and public output remains
+  `FRD+range`.
+- Next action: try a targeted exception for the high-forward intrinsic row or a
+  different common fraction/shell rather than simply increasing burst count.
