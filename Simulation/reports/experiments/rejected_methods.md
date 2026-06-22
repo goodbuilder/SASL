@@ -554,3 +554,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: b15x7 product forward-add preserves aggregate RMSE almost
     exactly, but still under-corrects intrinsic-scale target rows. Reject as a
     standalone additive fallback.
+
+- `EXP-20260623-394-b15x7-common0p2-logproduct-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.651248 m`.
+  - Interpretation: log-product forward-add matches the non-log additive branch
+    and still under-corrects intrinsic-scale target rows. Reject as a standalone
+    additive fallback.
