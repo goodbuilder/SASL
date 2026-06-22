@@ -620,3 +620,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: lower ridge behaves close to ridge `3000`; it does not
     reduce intrinsic-scale failures and still worsens aggregate RMSE. Reject
     this ratio ray-scale regularization setting.
+
+- `EXP-20260623-408-b15x7-common0p1-rawforward-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.699468 m`.
+  - Interpretation: common0.1 raw-forward `forward_add` improves aggregate
+    range RMSE to `0.910094 m` and position RMSE to `2.485815 m`, but it still
+    fails every intrinsic-scale target row. Reject as a standalone method and
+    keep as an aggregate anchor for blended or gated target protection.
