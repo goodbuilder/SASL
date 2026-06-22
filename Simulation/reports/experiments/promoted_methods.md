@@ -1110,3 +1110,17 @@ promoted as final Simulation PASS correction methods:
   `FRD+range`.
 - Next action: use short scout runs for new exception candidates before
   spending fresh100 on full validation.
+
+## EXP-20260622-345 B15x5 Product Common-Fraction Local20 Scout
+
+- Status: `FAIL`; product common-fraction adjustment around the known failing
+  seed does not recover the high-forward intrinsic row.
+- Evidence: seeds `298180..298199`, six scenarios, b15x5 product ray-scale,
+  common fractions `0.25`, `0.35`, `0.45`, `0.55`, `0.65`.
+- Result: every common fraction remains `119/120`.
+- Failed row: seed `298188`, `intrinsic_scale_stress`; best failed-row target
+  residual in the scout is common `0.25` at `2.588480 m`.
+- Contract: product feature uses stereo-center RDF `raw_forward_m`; ray-scale
+  outputs stereo-center RDF correction; public output remains `FRD+range`.
+- Next action: try a different exception signal or a correction blend; common
+  fraction alone is not sufficient.
