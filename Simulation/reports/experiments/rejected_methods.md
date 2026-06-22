@@ -538,3 +538,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: disparity-over-forward gives the best tracked target row
     among the b15x7 ratio/raw-forward family so far, but still fails the strict
     gate and regresses aggregate RMSE. Reject as a standalone guard fallback.
+
+- `EXP-20260623-392-b15x7-common0p2-disparity-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.544095 m`.
+  - Interpretation: plain disparity matches the inverse-depth scout because the
+    runtime feature path treats both as the disparity scalar. It still misses all
+    intrinsic-scale target rows. Reject as a standalone guard fallback.
