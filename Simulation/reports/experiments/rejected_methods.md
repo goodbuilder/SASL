@@ -807,3 +807,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: common `0.2` improves residuals within its own filtered
     population, but the observation baseline is worse than common0.05 and pass
     count remains unchanged. Reject this wider common-fraction direction.
+
+- `EXP-20260623-431-b15x7-common0p05-logdisparity-forwardadd-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.643976 m`.
+  - Interpretation: degree 2 improves aggregate metrics over the degree-1
+    common0.05 anchor, but worsens tracked intrinsic-tail behavior and does not
+    change pass count. Reject standalone deployment, keep as aggregate anchor.
