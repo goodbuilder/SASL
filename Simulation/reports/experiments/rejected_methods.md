@@ -497,3 +497,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: log-product `forward_add` is effectively identical to the
     non-log product additive branch on this scout. Reject as a standalone guard
     fallback.
+
+- `EXP-20260622-387-b15x7-common0p2-inversedepth-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.544095 m`.
+  - Interpretation: b15x7 fusion does not fix the inverse-depth target failure
+    pattern. Aggregate regression remains small, but strict target protection is
+    insufficient. Reject as a standalone guard fallback.
