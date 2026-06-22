@@ -1297,3 +1297,13 @@ in inputs, observation model, gate, or method.
     `0.944352 m`.
   - Interpretation: inverse-depth ray scaling amplifies selected intrinsic
     relief but causes aggregate blow-up. Reject standalone deployment.
+
+- `EXP-20260623-489-b21x5-common0p02-logdisparity-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.076885 m` to `4.065071 m`, range RMSE improves from `0.908840 m`
+    to `0.903244 m`, and position RMSE improves from `2.484420 m` to
+    `2.482324 m`.
+  - Interpretation: log-disparity additive is low-regression but weaker than
+    raw-forward EXP479 and still fails intrinsic rows. Reject standalone
+    deployment.
