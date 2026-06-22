@@ -629,3 +629,12 @@ in inputs, observation model, gate, or method.
     range RMSE to `0.910094 m` and position RMSE to `2.485815 m`, but it still
     fails every intrinsic-scale target row. Reject as a standalone method and
     keep as an aggregate anchor for blended or gated target protection.
+
+- `EXP-20260623-409-b15x7-common0p1-rawforward-rayscale-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.836726 m`.
+  - Interpretation: raw-forward `ray_scale` nearly preserves range RMSE
+    (`0.916652 m` to `0.916164 m`) and lowers worst target versus the additive
+    raw-forward branch, but it still fails every intrinsic-scale target row and
+    worsens position RMSE. Reject as a standalone method.
