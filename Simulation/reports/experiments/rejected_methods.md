@@ -895,3 +895,9 @@ in inputs, observation model, gate, or method.
   - Interpretation: clip `0.01` duplicates clip `0.02`; aggregate regression
     and pass count are unchanged. Reject standalone deployment, keep as
     high-pass-count blend anchor.
+
+- `EXP-20260623-442-b15x7-common0p05-logdisparityforwardproduct-rayscale-degree2-ridge300-oversample48-local20-scout`
+  - Result: `FAIL`, `118/120` passes.
+  - Evidence: `intrinsic_scale_stress` seeds `298188` and `298198` failed.
+  - Interpretation: ridge `300` leaves aggregate RMSE severely regressed and
+    loses one pass versus ridge `3`. Reject standalone deployment.
