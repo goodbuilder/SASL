@@ -622,3 +622,17 @@ promoted as final Simulation PASS correction methods:
   work if a runtime-safe guard is found.
 - Next action: derive a guard from runtime measurements or telemetry, then
   retest without scenario truth.
+
+## EXP-20260622-308 Runtime Raw-Forward Guard Selector
+
+- Status: `STRICT_PASS` on one fresh100 seed block; not final.
+- Selector:
+  use product ray-scale fallback when measurement-window
+  `raw_forward_mean_m > 1771.0`; otherwise use log-disparity forward-add.
+- Evidence: shared fresh100 seeds `293300..293399`, six scenarios, `600/600`.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved.
+- Contract: `raw_forward_mean_m` is stereo-center OpenCV optical RDF forward
+  from runtime measurements; no scenario label or truth is consumed at runtime.
+- Caveat: the guard threshold is same-block evidence only.
+- Next action: retest the guard on independent seeds and stress variants.
