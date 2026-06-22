@@ -519,3 +519,18 @@ promoted as final Simulation PASS correction methods:
   fused observation, so this remains a candidate variant rather than a final
   selection.
 - Next action: continue exploring new correction families despite this PASS.
+
+## EXP-20260622-301 B11x5 Product Residual Variant
+
+- Status: `STRICT_PASS` evidence only; not a terminal search success.
+- Method:
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b11x5_trim0p1_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge100_clip0p02_pooled`
+- Evidence: fresh30 seeds `291500..291529` passed `180/180`; fresh100
+  seeds `291700..291799` passed `600/600`.
+- Contract: runtime uses `measured_disparity_px * raw_forward_m`, where
+  `raw_forward_m` is stereo-center OpenCV optical RDF forward; public output
+  remains `FRD+range`.
+- Caveat: target max-abs and mean RMSE aggregates regressed relative to the
+  fused observation, matching the b9x5 pattern.
+- Next action: keep searching for correction families that improve aggregate
+  errors, not only the strict gate.
