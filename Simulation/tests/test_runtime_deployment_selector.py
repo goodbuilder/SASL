@@ -433,6 +433,34 @@ class RuntimeDeploymentSelectorTests(unittest.TestCase):
         self.assertFalse(baseline["override_applied"])
         self.assertEqual(selected["axis_contract"], module.RDF_AXIS_CONTRACT)
 
+    def test_packaged_selector_applies_raw_forward_guard_without_truth(self) -> None:
+        module = load_module()
+        selector = module.PackagedRuntimeDeploymentSelector(
+            {
+                "baseline_selector": "log_disparity_forward_add",
+                "override_profile_label": "product_ray_scale_intrinsic_fallback",
+                "runtime_rule": (
+                    "use log_disparity_forward_add unless "
+                    "feature_raw_forward_mean_m gt 1771.0, "
+                    "then use product_ray_scale_intrinsic_fallback"
+                ),
+                "selection_contract": (
+                    "runtime guard uses stereo-center RDF raw_forward_mean_m; "
+                    "scenario labels and truth are forbidden"
+                ),
+            }
+        )
+
+        intrinsic_like = selector.select({"raw_forward_mean_m": 1773.2})
+        nominal_like = selector.select({"raw_forward_mean_m": 1770.6})
+
+        self.assertEqual(intrinsic_like["selected_label"], "product_ray_scale_intrinsic_fallback")
+        self.assertTrue(intrinsic_like["override_applied"])
+        self.assertEqual(nominal_like["selected_label"], "log_disparity_forward_add")
+        self.assertFalse(nominal_like["override_applied"])
+        self.assertEqual(intrinsic_like["axis_contract"], module.RDF_AXIS_CONTRACT)
+        self.assertNotIn("truth", intrinsic_like["override_rule"]["feature_name"])
+
     def test_packaged_selector_loads_from_json_file(self) -> None:
         module = load_module()
         with tempfile.TemporaryDirectory() as tmpdir:

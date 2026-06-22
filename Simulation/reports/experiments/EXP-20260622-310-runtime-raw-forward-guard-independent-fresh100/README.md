@@ -37,6 +37,7 @@ observation-relative aggregate metrics:
 This is the strongest guard-selector evidence so far, but it remains an
 ongoing search result rather than a terminal success. Next work should package
 the selector manifest and add runtime/unit tests for the guard behavior.
+`runtime_selector_manifest.json` records the deployable selector rule shape.
 
 ## Coordinate Contract
 
