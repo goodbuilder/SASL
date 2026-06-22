@@ -759,3 +759,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: lowering ridge from `300` to `30` slightly improves
     aggregate RMSE but does not improve pass count or intrinsic-tail behavior.
     Reject as standalone deployment candidate and continue tuning.
+
+- `EXP-20260623-425-b15x7-common0p1-logdisparity-forwardadd-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.689647 m`.
+  - Interpretation: lowering ridge from `30` to `3` is nearly saturated:
+    aggregate RMSE improves only slightly while intrinsic-tail behavior slightly
+    worsens. Reject as standalone deployment candidate and continue searching.
