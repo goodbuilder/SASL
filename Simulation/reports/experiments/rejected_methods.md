@@ -481,3 +481,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: ridge3000 does not stabilize the quadratic product branch;
     it increases the failure count versus ridge300 with similar aggregate
     regression. Reject this regularization setting.
+
+- `EXP-20260622-376-b15x5-common0p2-product-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.670298 m`.
+  - Interpretation: product `forward_add` preserves aggregate RMSE almost
+    exactly, but it does not apply enough target-row correction. Reject as a
+    standalone guard fallback while retaining it as a blending clue.
