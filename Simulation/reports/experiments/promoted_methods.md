@@ -1139,3 +1139,18 @@ promoted as final Simulation PASS correction methods:
   outputs stereo-center RDF correction; public output remains `FRD+range`.
 - Next action: expand oversample48 ridge300 to fresh100, then continue searching
   regardless of PASS.
+
+## EXP-20260622-347 B15x5 Product Oversample48 Ridge300 Fresh100
+
+- Status: `STRICT_PASS` on fresh100; not a terminal success.
+- Evidence: seeds `298100..298199`, six scenarios, b15x5 common0.3 product
+  ray-scale, target oversample count `48`, ridge `300`.
+- Result: `600/600`; seed `298188`, `intrinsic_scale_stress`, recovers to
+  residual target max-abs `2.540842 m`.
+- Caveat: global aggregate residual metrics regress: range RMSE mean
+  `0.933520 m` to `1.114182 m`, position RMSE mean `2.496093 m` to
+  `2.567073 m`.
+- Contract: product feature uses stereo-center RDF `raw_forward_m`; ray-scale
+  outputs stereo-center RDF correction; public output remains `FRD+range`.
+- Next action: use this only as a guard fallback and build a selector to retain
+  common0.3 aggregate gains.
