@@ -1067,3 +1067,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: more bursts with fewer observations improve RMSE but do
     not recover intrinsic rows and worsen target max. Reject standalone
     deployment.
+
+- `EXP-20260623-463-b7x15-common0p05-rawforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max is
+    `4.462819 m` to `4.442819 m`, and range RMSE is `0.921180 m` to
+    `0.914699 m`.
+  - Interpretation: fewer, larger bursts are worse than b15x7 and b21x5 for
+    this branch. Reject standalone deployment.
