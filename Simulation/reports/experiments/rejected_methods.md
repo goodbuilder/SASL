@@ -1261,3 +1261,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: raw-forward ray scaling is a strong target-tail reducer but
     worsens average accuracy and still fails intrinsic rows. Reject standalone
     deployment.
+
+- `EXP-20260623-485-b21x5-common0p02-rawforward-rayscale-degree1-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; metrics duplicate
+    EXP484 with target max `4.076885 m` to `3.927041 m`, range RMSE
+    `0.908840 m` to `0.910064 m`, and position RMSE `2.484420 m` to
+    `2.497484 m`.
+  - Interpretation: clip `0.01` does not change the raw-forward ray-scale
+    branch. Reject standalone deployment.
