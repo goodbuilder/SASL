@@ -1195,3 +1195,13 @@ in inputs, observation model, gate, or method.
     `2.482839 m`.
   - Interpretation: b21x5 forward-over-disparity additive improves aggregate
     metrics but still fails every intrinsic row. Reject standalone deployment.
+
+- `EXP-20260623-478-b21x5-common0p05-forwardoverdisparity-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.219042 m` to `4.056638 m`, but range RMSE regresses from
+    `0.911104 m` to `0.915198 m` and position RMSE regresses from
+    `2.485454 m` to `2.503430 m`.
+  - Interpretation: b21x5 forward-over-disparity ray scaling lowers target tail
+    but worsens average accuracy and still fails intrinsic rows. Reject
+    standalone deployment.
