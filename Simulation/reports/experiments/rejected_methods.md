@@ -513,3 +513,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: raw-forward under b15x7 preserves the aggregate RMSE clue
     (`0.924142 m` to `0.921861 m`) but still misses every intrinsic-scale target
     row. Reject as a standalone guard fallback.
+
+- `EXP-20260623-389-b15x7-common0p2-lograwforward-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.700561 m`.
+  - Interpretation: log-raw-forward improves the tracked target row versus
+    raw-forward but still fails every intrinsic-scale target row and gives up
+    the raw-forward aggregate improvement. Reject as a standalone guard
+    fallback.
