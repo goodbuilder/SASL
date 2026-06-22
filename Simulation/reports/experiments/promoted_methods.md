@@ -1607,3 +1607,19 @@ promoted as final Simulation PASS correction methods:
   common0.2 fusion; public output remains `FRD+range`.
 - Next action: lower ridge is not a meaningful aggregate fix; continue another
   correction idea.
+
+## EXP-20260623-405 B15x7 Common0.2 Product Ridge0.3 Oversample48 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x7 common0.2 product
+  ray-scale, target oversample count `48`, ridge `0.3`, clip `0.02`.
+- Result: passes `120/120`.
+- Known target row: seed `298188`, `intrinsic_scale_stress`, residual target
+  max-abs `2.487816 m`, effectively the same as ridge `3`.
+- Aggregate: range RMSE mean regresses from `0.924142 m` observation to
+  `1.110352 m` residual; position RMSE mean regresses from `2.492225 m` to
+  `2.565507 m`.
+- Contract: product feature uses stereo-center RDF `raw_forward_m` after b15x7
+  common0.2 fusion; public output remains `FRD+range`.
+- Next action: lower-ridge tuning has saturated; move to a different correction
+  idea.
