@@ -1325,3 +1325,12 @@ in inputs, observation model, gate, or method.
     max regresses from `4.076885 m` to `4.096885 m`.
   - Interpretation: the product feature gives selected intrinsic relief but
     worsens aggregate metrics. Reject standalone deployment.
+
+- `EXP-20260623-492-b21x5-common0p02-logdisparityforwardproduct-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `STRICT_PASS`, `120/120` passes.
+  - Evidence: intrinsic seed `298188` improves from `3.587690 m` to
+    `2.442553 m`, but aggregate target max regresses from `4.076885 m` to
+    `4.793879 m`, range RMSE regresses from `0.908840 m` to `1.103529 m`, and
+    position RMSE regresses from `2.484420 m` to `2.561510 m`.
+  - Interpretation: gate pass with aggregate blow-up. Reject standalone
+    deployment and continue searching despite pass status.
