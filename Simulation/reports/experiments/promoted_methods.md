@@ -650,3 +650,17 @@ promoted as final Simulation PASS correction methods:
   from runtime measurements; no scenario label or truth is consumed at runtime.
 - Next action: continue with more independent seeds, stress variants, and
   implementation tests instead of stopping at this PASS.
+
+## EXP-20260622-310 Runtime Raw-Forward Guard Independent Fresh100
+
+- Status: `STRICT_PASS` on independent fresh100; not final.
+- Selector:
+  use product ray-scale fallback when measurement-window
+  `raw_forward_mean_m > 1771.0`; otherwise use log-disparity forward-add.
+- Evidence: independent seeds `293700..293799`, six scenarios, `600/600`.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved again.
+- Contract: `raw_forward_mean_m` is stereo-center OpenCV optical RDF forward
+  from runtime measurements; no scenario label or truth is consumed at runtime.
+- Next action: package the selector manifest, add runtime guard tests, and keep
+  validating stress variants.
