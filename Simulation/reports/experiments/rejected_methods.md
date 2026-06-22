@@ -440,3 +440,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: `raw_forward` ray-scale keeps range RMSE near observation
     (`0.927983 m` to `0.925776 m`) but still misses the intrinsic-scale target
     gate. Reject as a standalone guard fallback feature.
+
+- `EXP-20260622-370-b15x5-common0p2-lograwforward-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.714327 m`.
+  - Interpretation: `log_raw_forward` improves the target row versus raw
+    forward, but aggregate range RMSE regresses more and the intrinsic-scale
+    gate still fails. Reject as a standalone guard fallback feature.
