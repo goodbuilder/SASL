@@ -1288,3 +1288,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: inverse-depth additive gives selected intrinsic relief but
     worsens aggregate metrics and remains undeployable. Reject standalone
     deployment.
+
+- `EXP-20260623-488-b21x5-common0p02-inversedepth-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; intrinsic seed
+    `298188` improves from `3.587690 m` to `3.459413 m`, but aggregate target
+    max regresses from `4.076885 m` to `4.204353 m` and range RMSE regresses to
+    `0.944352 m`.
+  - Interpretation: inverse-depth ray scaling amplifies selected intrinsic
+    relief but causes aggregate blow-up. Reject standalone deployment.
