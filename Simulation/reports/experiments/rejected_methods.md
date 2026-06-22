@@ -604,3 +604,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: additive correction does not retain the
     `disparity_over_forward` ray-scale target-row clue and slightly regresses
     aggregate RMSE. Reject as a standalone additive ratio fallback.
+
+- `EXP-20260623-401-b15x7-common0p2-disparityoverforward-ridge3000-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.424058 m`.
+  - Interpretation: stronger ridge keeps the tracked target row close to EXP391
+    but worsens worst target and aggregate RMSE. Reject this ratio ray-scale
+    regularization setting.
