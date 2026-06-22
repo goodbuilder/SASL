@@ -550,3 +550,30 @@ promoted as final Simulation PASS correction methods:
   quality problem.
 - Next action: continue with correction ideas that can improve aggregate
   errors, not only strict-pass counts.
+
+## EXP-20260622-303 Common0p8 B9x5 Product Residual Variant
+
+- Status: `STRICT_PASS` evidence only; not a terminal search success.
+- Method:
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b9x5_trim0p05_common0p8_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p05_pooled`
+- Evidence: fresh20 seeds `292100..292119` passed `120/120`; fresh100
+  seeds `292300..292399` passed `600/600`.
+- Contract: runtime uses `measured_disparity_px * raw_forward_m`, where
+  `raw_forward_m` is stereo-center OpenCV optical RDF forward; public output
+  remains `FRD+range`.
+- Caveat: common fraction `0.8` preserved strict-pass behavior but did not
+  fix aggregate target/range/position RMSE regression.
+- Next action: continue with new correction families and objective choices.
+
+## EXP-20260622-304 Train Ratio Product Residual Scout
+
+- Status: `STRICT_PASS` scout only; not promotion evidence by itself.
+- Method selected for both train-ratio scouts:
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b9x5_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge100_clip0p02_pooled`
+- Evidence: train ratio `0.35` passed `120/120`; train ratio `0.65` passed
+  `120/120`.
+- Contract: train truth is calibration/evaluation-only. Runtime uses
+  `measured_disparity_px * raw_forward_m`, with `raw_forward_m` in
+  stereo-center OpenCV optical RDF forward; public output remains `FRD+range`.
+- Caveat: changing the train split alone did not remove aggregate regression.
+- Next action: continue with aggregate-improving objective or model changes.
