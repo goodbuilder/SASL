@@ -505,3 +505,17 @@ promoted as final Simulation PASS correction methods:
 - Legacy `PARTIAL_PASS`/`FAMILY_LOCAL_PASS` bbox-anchor reports are kept as
   baselines or family-local evidence only. They are not global final PASS
   corrections under the strict all-axis gate.
+
+## EXP-20260622-300 B9x5 Product Residual Variant
+
+- Status: `STRICT_PASS` evidence only; not a terminal search success.
+- Method:
+  `multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b9x5_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p05_pooled`
+- Evidence: fresh100 seeds `291100..291199`, six scenarios, `600/600`.
+- Contract: runtime uses `measured_disparity_px * raw_forward_m`, where
+  `raw_forward_m` is stereo-center OpenCV optical RDF forward; public output
+  remains `FRD+range`.
+- Caveat: target max-abs and mean RMSE aggregates regressed relative to the
+  fused observation, so this remains a candidate variant rather than a final
+  selection.
+- Next action: continue exploring new correction families despite this PASS.
