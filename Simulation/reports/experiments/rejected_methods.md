@@ -1041,3 +1041,11 @@ in inputs, observation model, gate, or method.
     from `3.623977 m` to `3.633976 m`.
   - Interpretation: midpoint clip gives midpoint behavior but does not recover
     intrinsic-scale rows. Reject standalone deployment.
+
+- `EXP-20260623-460-b15x7-common0p05-rawforward-forwardadd-degree1-ridge3-oversample24-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; range RMSE improves
+    from `0.912811 m` to `0.906141 m`, but target max is slightly worse than
+    oversample `48`, moving from `4.151822 m` to `4.131823 m`.
+  - Interpretation: lower target oversampling keeps RMSE improvement but does
+    not recover intrinsic rows. Reject standalone deployment.
