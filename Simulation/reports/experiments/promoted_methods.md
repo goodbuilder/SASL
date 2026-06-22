@@ -695,3 +695,12 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is stereo-center OpenCV optical RDF
   `raw_forward_mean_m` over the default 520-sample window.
 - Next action: continue stress-variant validation.
+
+## EXP-20260622-314 Runtime Raw-Forward Guard Train-Ratio Sensitivity
+
+- Status: guard sensitivity support; not a terminal search success.
+- Evidence: train ratios `0.35` and `0.65`, seeds `294300..294319`, both
+  preserved intrinsic separation with the `1771.0 m` threshold.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m` over the default 520-sample window.
+- Next action: continue stress-variant validation.
