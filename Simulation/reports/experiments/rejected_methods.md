@@ -1251,3 +1251,13 @@ in inputs, observation model, gate, or method.
     `4.056885 m` and range RMSE `0.908840 m` to `0.902026 m`.
   - Interpretation: ridge `30` does not change the b21x5 common `0.02`
     raw-forward additive branch. Reject standalone deployment.
+
+- `EXP-20260623-484-b21x5-common0p02-rawforward-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max improves
+    from `4.076885 m` to `3.927041 m`, but range RMSE regresses from
+    `0.908840 m` to `0.910064 m` and position RMSE regresses from
+    `2.484420 m` to `2.497484 m`.
+  - Interpretation: raw-forward ray scaling is a strong target-tail reducer but
+    worsens average accuracy and still fails intrinsic rows. Reject standalone
+    deployment.
