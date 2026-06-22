@@ -863,3 +863,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: raw-forward ray-scale correction is weaker than
     log-disparity ray-scale for this branch, with less worst-target improvement
     and more aggregate regression. Reject standalone deployment.
+
+- `EXP-20260623-438-b15x7-common0p05-logdisparityforwardproduct-forwardadd-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs improved to `3.603977 m`.
+  - Interpretation: the interaction feature improves selected intrinsic-tail
+    rows but worsens overall target max and aggregate RMSE. Reject standalone
+    deployment, keep only as a possible blend feature.
