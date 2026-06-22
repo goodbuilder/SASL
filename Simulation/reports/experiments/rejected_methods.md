@@ -1000,3 +1000,11 @@ in inputs, observation model, gate, or method.
     `4.111533 m`.
   - Interpretation: raw-forward forward-add is a low-regression branch but
     still cannot pass intrinsic-scale rows. Reject standalone deployment.
+
+- `EXP-20260623-455-b15x7-common0p05-rawforward-forwardadd-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; target max remains
+    `4.131533 m` to `4.111533 m`, with range RMSE `0.912856 m` to
+    `0.906259 m`.
+  - Interpretation: degree 2 duplicates degree 1 at scout precision and does
+    not recover intrinsic-scale rows. Reject standalone deployment.
