@@ -646,3 +646,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: ridge `30` is effectively tied with ridge `300`; it does
     not reduce intrinsic-scale failures and still worsens position RMSE. Reject
     this lower-ridge raw-forward ray-scale branch.
+
+- `EXP-20260623-411-b15x7-common0p1-rawforward-rayscale-ridge30-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.838256 m`.
+  - Interpretation: clip `0.01` exactly matches clip `0.02` at scout precision;
+    the clip is not active and failures remain unchanged. Reject this clip
+    setting.
