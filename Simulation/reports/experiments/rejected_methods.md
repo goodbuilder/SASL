@@ -791,3 +791,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: common `0.05` lowers the filtered-population worst target
     and aggregate RMSE, but does not change the intrinsic-scale pass count.
     Reject standalone deployment and keep exploring common-fraction/blend axes.
+
+- `EXP-20260623-429-b15x7-common0p05-logdisparity-forwardadd-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.633976 m`.
+  - Interpretation: common0.05 clip `0.01` softens the tracked intrinsic tail
+    versus clip `0.02`, but reduces aggregate gain and leaves pass count
+    unchanged. Reject standalone deployment.
