@@ -596,3 +596,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: degree `2` matches the degree `1` failure count and tracked
     target row while slightly worsening aggregate RMSE. Reject this quadratic
     raw-forward additive branch.
+
+- `EXP-20260623-400-b15x7-common0p2-disparityoverforward-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.651248 m`.
+  - Interpretation: additive correction does not retain the
+    `disparity_over_forward` ray-scale target-row clue and slightly regresses
+    aggregate RMSE. Reject as a standalone additive ratio fallback.
