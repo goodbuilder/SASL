@@ -1058,3 +1058,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: lower oversampling improves RMSE but continues to worsen
     target max and does not recover intrinsic rows. Reject standalone
     deployment.
+
+- `EXP-20260623-462-b21x5-common0p05-rawforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; b21x5 improves
+    range RMSE from `0.911104 m` to `0.904418 m`, but target max is worse than
+    b15x7, moving from `4.219042 m` to `4.199042 m`.
+  - Interpretation: more bursts with fewer observations improve RMSE but do
+    not recover intrinsic rows and worsen target max. Reject standalone
+    deployment.
