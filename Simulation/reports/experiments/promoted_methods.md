@@ -1368,3 +1368,16 @@ promoted as final Simulation PASS correction methods:
   public output remains `FRD+range`.
 - Next action: continue new correction ideas; repeated PASS is evidence, not a
   stop condition.
+
+## EXP-20260622-363 B15x5 Common0.2 Guard Threshold Sensitivity Dual Fresh100
+
+- Status: `STRICT_PASS` for thresholds `1769.0..1773.0` on both checked seed
+  blocks; not a terminal success.
+- Evidence: seed blocks `298100..298199` and `299000..299099`, six scenarios,
+  thresholds `1769.0..1774.0`.
+- Result: thresholds `1771.0..1773.0` keep guard count `100` and preserve the
+  best aggregate metrics on both blocks; `1774.0` fails on both blocks.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; branch outputs remain stereo-center RDF corrections and
+  public output remains `FRD+range`.
+- Next action: continue searching beyond threshold validation.
