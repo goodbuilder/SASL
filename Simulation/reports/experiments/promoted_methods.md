@@ -664,3 +664,13 @@ promoted as final Simulation PASS correction methods:
   from runtime measurements; no scenario label or truth is consumed at runtime.
 - Next action: package the selector manifest, add runtime guard tests, and keep
   validating stress variants.
+
+## EXP-20260622-311 Runtime Raw-Forward Guard Threshold Sensitivity
+
+- Status: threshold robustness support; not a terminal search success.
+- Evidence: thresholds `1770.8..1773.0 m` preserved strict pass and aggregate
+  improvement across EXP308, EXP309, and EXP310 seed blocks.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; selector branches are unchanged from EXP310.
+- Next action: keep `1771.0 m` as the recorded threshold and continue testing
+  stress variants.
