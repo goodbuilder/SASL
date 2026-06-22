@@ -1117,3 +1117,11 @@ in inputs, observation model, gate, or method.
     `0.975815 m`.
   - Interpretation: whole-ray scaling increases intrinsic relief but causes
     unacceptable aggregate regression. Reject standalone deployment.
+
+- `EXP-20260623-469-b15x7-common0p05-disparityoverforward-rayscale-degree1-ridge3-clip0p005-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; metrics duplicate
+    clip `0.02`, with target max `4.131533 m` to `4.373617 m` and range RMSE
+    `0.912856 m` to `0.975815 m`.
+  - Interpretation: lowering the clip does not reduce the aggregate blow-up.
+    Reject standalone deployment.
