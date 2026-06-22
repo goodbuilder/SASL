@@ -946,3 +946,12 @@ in inputs, observation model, gate, or method.
   - Interpretation: reducing target oversample count from `48` to `24` keeps
     the strict-pass behavior but does not reduce aggregate regression enough.
     Reject standalone deployment.
+
+- `EXP-20260623-449-b15x7-common0p05-logdisparity-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; aggregate metrics
+    are much more stable than the interaction ray-scale branch, with range RMSE
+    `0.912856 m` to `0.921242 m` and target max `4.131533 m` to `4.109082 m`.
+  - Interpretation: log-disparity-only ray scale is aggregate-stable but does
+    not recover intrinsic-scale rows. Reject standalone deployment and use as a
+    lower-regression contrast branch.
