@@ -855,3 +855,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: ridge `300` slightly lowers worst target max versus
     ridge `3`, but does not fix aggregate range/position regression or pass
     count. Reject standalone deployment.
+
+- `EXP-20260623-437-b15x7-common0p05-rawforward-rayscale-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.864106 m`.
+  - Interpretation: raw-forward ray-scale correction is weaker than
+    log-disparity ray-scale for this branch, with less worst-target improvement
+    and more aggregate regression. Reject standalone deployment.
