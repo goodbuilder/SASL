@@ -636,3 +636,17 @@ promoted as final Simulation PASS correction methods:
   from runtime measurements; no scenario label or truth is consumed at runtime.
 - Caveat: the guard threshold is same-block evidence only.
 - Next action: retest the guard on independent seeds and stress variants.
+
+## EXP-20260622-309 Runtime Raw-Forward Guard Independent Fresh50
+
+- Status: `STRICT_PASS` on independent fresh50; not final.
+- Selector:
+  use product ray-scale fallback when measurement-window
+  `raw_forward_mean_m > 1771.0`; otherwise use log-disparity forward-add.
+- Evidence: independent seeds `293500..293549`, six scenarios, `300/300`.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved again.
+- Contract: `raw_forward_mean_m` is stereo-center OpenCV optical RDF forward
+  from runtime measurements; no scenario label or truth is consumed at runtime.
+- Next action: continue with more independent seeds, stress variants, and
+  implementation tests instead of stopping at this PASS.
