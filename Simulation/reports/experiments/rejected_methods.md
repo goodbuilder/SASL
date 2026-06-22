@@ -847,3 +847,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: ray-scale clip `0.01` matches clip `0.02` at scout
     precision, so clipping does not resolve aggregate regression or intrinsic
     failures. Reject standalone deployment.
+
+- `EXP-20260623-436-b15x7-common0p05-logdisparity-rayscale-degree2-ridge300-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.811794 m`.
+  - Interpretation: ridge `300` slightly lowers worst target max versus
+    ridge `3`, but does not fix aggregate range/position regression or pass
+    count. Reject standalone deployment.
