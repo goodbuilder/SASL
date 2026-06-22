@@ -1317,3 +1317,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: log-disparity ray scaling gives target-tail relief but
     worsens average accuracy and still fails intrinsic rows. Reject standalone
     deployment.
+
+- `EXP-20260623-491-b21x5-common0p02-logdisparityforwardproduct-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; intrinsic seed
+    `298188` improves from `3.587690 m` to `3.567690 m`, but aggregate target
+    max regresses from `4.076885 m` to `4.096885 m`.
+  - Interpretation: the product feature gives selected intrinsic relief but
+    worsens aggregate metrics. Reject standalone deployment.
