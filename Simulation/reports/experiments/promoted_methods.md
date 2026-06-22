@@ -686,3 +686,12 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is stereo-center OpenCV optical RDF forward mean.
 - Next action: keep validating stress variants and avoid changing runtime
   window length without recalibrating the guard.
+
+## EXP-20260622-313 Runtime Raw-Forward Guard Oversample Sensitivity
+
+- Status: guard sensitivity support; not a terminal search success.
+- Evidence: target oversample counts `36` and `144`, seeds `294100..294119`,
+  both preserved intrinsic separation with the `1771.0 m` threshold.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m` over the default 520-sample window.
+- Next action: continue stress-variant validation.
