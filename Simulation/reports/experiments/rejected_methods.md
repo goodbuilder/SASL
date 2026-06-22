@@ -530,3 +530,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: forward-over-disparity keeps aggregate RMSE near
     observation, but target-row protection is weaker than the product branch and
     every intrinsic-scale row still fails. Reject as a standalone guard fallback.
+
+- `EXP-20260623-391-b15x7-common0p2-disparityoverforward-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.428112 m`.
+  - Interpretation: disparity-over-forward gives the best tracked target row
+    among the b15x7 ratio/raw-forward family so far, but still fails the strict
+    gate and regresses aggregate RMSE. Reject as a standalone guard fallback.
