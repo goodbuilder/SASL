@@ -871,3 +871,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: the interaction feature improves selected intrinsic-tail
     rows but worsens overall target max and aggregate RMSE. Reject standalone
     deployment, keep only as a possible blend feature.
+
+- `EXP-20260623-439-b15x7-common0p05-logdisparityforwardproduct-forwardadd-degree2-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs improved to `3.613977 m`.
+  - Interpretation: clip `0.01` reduces aggregate regression versus clip
+    `0.02` while retaining part of the tail improvement, but aggregate metrics
+    still worsen and pass count is unchanged. Reject standalone deployment.
