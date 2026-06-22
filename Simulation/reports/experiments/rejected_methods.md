@@ -579,3 +579,12 @@ in inputs, observation model, gate, or method.
     ridge `300`, but increases intrinsic-scale failures from two to seven and
     keeps the aggregate RMSE regression. Reject this stronger quadratic ridge
     setting.
+
+- `EXP-20260623-398-b15x7-common0p2-rawforward-forwardadd-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.691247 m`.
+  - Interpretation: raw-forward `forward_add` improves aggregate range RMSE
+    (`0.924142 m` to `0.917849 m`) and position RMSE (`2.492225 m` to
+    `2.489703 m`), but misses every intrinsic-scale target row. Reject as a
+    standalone method and retain the aggregate-preserving behavior as a clue.
