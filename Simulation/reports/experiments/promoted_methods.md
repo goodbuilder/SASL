@@ -704,3 +704,12 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is stereo-center OpenCV optical RDF
   `raw_forward_mean_m` over the default 520-sample window.
 - Next action: continue stress-variant validation.
+
+## EXP-20260622-315 Runtime Raw-Forward Guard B9x5 Sensitivity
+
+- Status: guard sensitivity support; not a terminal search success.
+- Evidence: b9x5 trimmed-mean fusion, seeds `294500..294519`, preserved
+  intrinsic separation with the `1771.0 m` threshold.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m` over the default 520-sample window.
+- Next action: continue stress-variant validation.
