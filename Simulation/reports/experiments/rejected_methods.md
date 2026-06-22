@@ -775,3 +775,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: lowering ridge from `3` to `0.3` is saturated and does not
     change pass count or intrinsic-tail behavior. Reject standalone deployment
     and move future search to other tuning axes.
+
+- `EXP-20260623-427-b15x7-common0p1-logdisparity-forwardadd-ridge3-clip0p01-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs regressed to `3.689468 m`.
+  - Interpretation: clip `0.01` softens intrinsic-tail regression slightly but
+    gives back aggregate gain and does not change pass count. Reject standalone
+    deployment and continue searching.
