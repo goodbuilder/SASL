@@ -1125,3 +1125,11 @@ in inputs, observation model, gate, or method.
     `0.912856 m` to `0.975815 m`.
   - Interpretation: lowering the clip does not reduce the aggregate blow-up.
     Reject standalone deployment.
+
+- `EXP-20260623-470-b15x7-common0p05-disparityoverforward-rayscale-degree1-ridge300-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; ridge `300`
+    regresses target max from `4.131533 m` to `4.374069 m` and range RMSE to
+    `0.975941 m`.
+  - Interpretation: stronger ridge regularization does not reduce the
+    disparity-over-forward ray-scale blow-up. Reject standalone deployment.
