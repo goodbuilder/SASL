@@ -963,3 +963,12 @@ in inputs, observation model, gate, or method.
     log-disparity ray-scale contrast branch.
   - Interpretation: stricter common sampling does not recover intrinsic-scale
     rows and slightly worsens aggregate metrics. Reject standalone deployment.
+
+- `EXP-20260623-451-b15x7-common0p02-logdisparity-rayscale-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; common `0.02`
+    target max is `4.255268 m` to `4.220372 m`, with range RMSE
+    `0.912369 m` to `0.920500 m`.
+  - Interpretation: looser common sampling slightly helps RMSE versus common
+    `0.05` but does not recover intrinsic-scale rows and worsens target max.
+    Reject standalone deployment.
