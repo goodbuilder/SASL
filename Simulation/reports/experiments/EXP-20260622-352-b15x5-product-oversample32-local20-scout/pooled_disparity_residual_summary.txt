@@ -1,0 +1,10 @@
+Pooled runtime disparity residual profile search
+experiment_id: EXP-SCOUT-20260622-b15x5-common0p3-product-oversample32-local20
+status: STRICT_PASS
+best_method: multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b15x5_trim0p1_common0p3_residual_ray_scale_disparity_forward_product_deg1_ridge1000_clip0p02_pooled
+pass_count: 120/120
+target_max_abs_error_residual_max_m: 5.462657718806213
+range_rmse_residual_mean_m: 1.1142797836834768
+output_profile_json: /tmp/sasl_b15x5_common0p3_product_oversample32_local20/pooled_disparity_residual_profile.json
+runtime_truth_used: False
+Coordinate contract: pooled fit uses calibration/evaluation truth only for train/eval; runtime profile consumes measured disparity and stereo-center RDF right/down/forward.

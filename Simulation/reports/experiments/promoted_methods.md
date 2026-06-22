@@ -1213,3 +1213,18 @@ promoted as final Simulation PASS correction methods:
   public output remains `FRD+range`.
 - Next action: continue searching; repeated PASS is evidence, not a stop
   condition.
+
+## EXP-20260622-352 B15x5 Product Oversample32 Local20 Scout
+
+- Status: `STRICT_PASS` on local20; not a terminal success.
+- Evidence: seeds `298180..298199`, six scenarios, b15x5 common0.3 product
+  ray-scale, target oversample count `32`, ridge lambdas `100`, `300`, `1000`.
+- Result: all ridge variants pass `120/120`; script-selected ridge `1000`.
+- Known failing row: seed `298188`, `intrinsic_scale_stress`, passes, but best
+  residual target max-abs is `2.583701 m`, worse than oversample48.
+- Caveat: global aggregate residual metrics still regress; do not prioritize
+  fresh100 expansion over stronger new ideas.
+- Contract: product feature uses stereo-center RDF `raw_forward_m`; ray-scale
+  outputs stereo-center RDF correction; public output remains `FRD+range`.
+- Next action: try alternate guard branch shaping rather than smaller
+  oversampling alone.
