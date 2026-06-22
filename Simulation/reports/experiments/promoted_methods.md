@@ -607,3 +607,18 @@ promoted as final Simulation PASS correction methods:
 - Failure boundary: all `100` strict failures were in `intrinsic_scale_stress`.
 - Next action: search intrinsic-scale guards, selectors, or features that
   preserve the aggregate improvement while avoiding intrinsic failures.
+
+## EXP-20260622-307 Oracle Intrinsic Fallback Selector Boundary
+
+- Status: `STRICT_PASS` as an offline oracle selector only.
+- Selector:
+  use EXP306 log-disparity forward-add for non-intrinsic scenarios, and product
+  ray-scale residual for `intrinsic_scale_stress`.
+- Evidence: shared fresh100 seeds `293300..293399`, six scenarios, `600/600`.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved.
+- Contract caveat: scenario label is offline validation metadata and is not a
+  runtime input. This row is a boundary showing that an intrinsic fallback can
+  work if a runtime-safe guard is found.
+- Next action: derive a guard from runtime measurements or telemetry, then
+  retest without scenario truth.
