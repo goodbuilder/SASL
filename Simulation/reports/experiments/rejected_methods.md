@@ -562,3 +562,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: log-product forward-add matches the non-log additive branch
     and still under-corrects intrinsic-scale target rows. Reject as a standalone
     additive fallback.
+
+- `EXP-20260623-395-b15x7-common0p2-product-deg2-oversample48-local20-scout`
+  - Result: `FAIL`, `118/120` passes.
+  - Evidence: failures were `intrinsic_scale_stress` seeds `298188` and
+    `298198`; seed `298188` residual target max-abs was `2.725512 m`.
+  - Interpretation: b15x7 quadratic product reduces the failure count, but it
+    is worse than degree1 product on the tracked target row and aggregate RMSE.
+    Reject this quadratic setting.
