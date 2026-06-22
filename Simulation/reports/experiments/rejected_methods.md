@@ -686,3 +686,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: forward-over-disparity lowers worst target residual versus
     observation, but fails every intrinsic-scale row and worsens aggregate RMSE.
     Reject this ratio ray-scale branch.
+
+- `EXP-20260623-416-b15x7-common0p1-disparityoverforward-rayscale-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.435931 m`.
+  - Interpretation: disparity-over-forward improves the tracked seed but
+    worsens worst target and aggregate RMSE heavily. Reject this ratio
+    ray-scale branch.
