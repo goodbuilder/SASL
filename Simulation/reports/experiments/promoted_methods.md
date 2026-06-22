@@ -752,3 +752,16 @@ promoted as final Simulation PASS correction methods:
   raw_forward_m`, where `raw_forward_m` is stereo-center RDF forward.
 - Next action: keep `raw_forward_mean_m` as primary guard unless a stricter
   fixed-window product-ratio contract is needed later.
+
+## EXP-20260622-320 B9x5 Runtime Raw-Forward Guard Selector
+
+- Status: `STRICT_PASS` on fresh50; not a terminal search success.
+- Selector:
+  use b9x5 product ray-scale fallback when `raw_forward_mean_m > 1771.0`;
+  otherwise use b9x5 log-disparity forward-add.
+- Evidence: seeds `295300..295349`, six scenarios, `300/300`.
+- Observation-relative result: target max-abs, range mean, and position mean
+  all improved.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; selector branches output stereo-center RDF corrections.
+- Next action: run fresh100 validation.
