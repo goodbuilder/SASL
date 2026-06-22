@@ -778,3 +778,14 @@ promoted as final Simulation PASS correction methods:
 - Contract: guard feature is stereo-center OpenCV optical RDF
   `raw_forward_mean_m`; selector branches output stereo-center RDF corrections.
 - Next action: continue stress-variant validation and package/test work.
+
+## EXP-20260622-322 B9x5 Runtime Guard Threshold Sensitivity
+
+- Status: threshold robustness support; not a terminal search success.
+- Evidence: threshold `1771.0 m` preserved b9x5 selector pass counts
+  `300/300` and `600/600` across EXP320 and EXP321.
+- Caveat: fresh50 dropped to `299/300` at `1773.0 m`, so the guard should stay
+  at the recorded `1771.0 m`.
+- Contract: guard feature is stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`.
+- Next action: continue stress-variant validation.
