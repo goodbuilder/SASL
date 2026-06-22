@@ -1339,3 +1339,17 @@ promoted as final Simulation PASS correction methods:
   public output remains `FRD+range`.
 - Next action: validate this selector on independent seed blocks and keep
   searching beyond repeated PASS.
+
+## EXP-20260622-361 B15x5 Common0.2 Oversample48 Guard Selector Independent299000 Fresh100
+
+- Status: `STRICT_PASS` on independent fresh100; not a terminal success.
+- Evidence: seeds `299000..299099`, six scenarios, same common0.2 selector as
+  EXP360.
+- Result: `600/600`; guard branch `100`, non-guard branch `500`.
+- Aggregate result: target max-abs `5.158900 m` to `5.058902 m`, range RMSE
+  mean `0.932459 m` to `0.815042 m`, position RMSE mean `2.493689 m` to
+  `2.389116 m`.
+- Contract: guard feature is trailing-window stereo-center OpenCV optical RDF
+  `raw_forward_mean_m`; branch outputs remain stereo-center RDF corrections and
+  public output remains `FRD+range`.
+- Next action: validate another independent block and continue new ideas.
