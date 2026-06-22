@@ -702,3 +702,10 @@ in inputs, observation model, gate, or method.
   - Interpretation: plain disparity improves the tracked seed but fails every
     intrinsic-scale row and regresses aggregate RMSE. Reject this plain
     disparity ray-scale branch.
+
+- `EXP-20260623-418-b15x7-common0p1-inversedepth-rayscale-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.549610 m`.
+  - Interpretation: inverse-depth matches plain disparity at scout precision and
+    is not a distinct improvement axis. Reject this scalar branch.
