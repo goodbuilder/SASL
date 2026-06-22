@@ -1141,3 +1141,11 @@ in inputs, observation model, gate, or method.
     worse at `0.914358 m`.
   - Interpretation: degree 2 does not improve the disparity-over-forward
     additive branch. Reject standalone deployment.
+
+- `EXP-20260623-472-b15x7-common0p02-disparityoverforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; intrinsic seed
+    `298188` improves from `3.638059 m` to `3.618060 m`, but target max
+    regresses from `4.255268 m` to `4.275268 m`.
+  - Interpretation: common `0.02` does not make the disparity-over-forward
+    additive branch deployable. Reject standalone deployment.
