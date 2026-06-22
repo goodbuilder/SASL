@@ -37,6 +37,8 @@ aggregate improvement.
 
 This is strong simulation evidence, not a stopping condition. Continue with
 additional stress variants and packaging/tests.
+`runtime_selector_manifest.json` records the deployable selector rule shape for
+this b9x5 variant.
 
 ## Coordinate Contract
 

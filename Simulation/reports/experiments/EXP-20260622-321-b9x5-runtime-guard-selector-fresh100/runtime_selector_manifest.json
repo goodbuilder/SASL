@@ -1,0 +1,16 @@
+{
+  "profile_type": "PackagedRuntimeDeploymentSelector",
+  "baseline_selector": "b9x5_log_disparity_forward_add",
+  "override_profile_label": "b9x5_product_ray_scale_intrinsic_fallback",
+  "runtime_rule": "use b9x5_log_disparity_forward_add unless feature_raw_forward_mean_m gt 1771.0, then use b9x5_product_ray_scale_intrinsic_fallback",
+  "selection_contract": "Runtime guard uses measurement-window raw_forward_mean_m in stereo-center OpenCV optical RDF. Scenario labels, target labels, and truth are forbidden runtime inputs.",
+  "axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+  "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+  "evidence": {
+    "fresh50_experiment": "EXP-20260622-320-b9x5-runtime-guard-selector-fresh50",
+    "fresh100_experiment": "EXP-20260622-321-b9x5-runtime-guard-selector-fresh100",
+    "threshold_sensitivity_experiment": "EXP-20260622-322-b9x5-runtime-guard-threshold-sensitivity",
+    "guard_feature": "raw_forward_mean_m",
+    "guard_threshold_m": 1771.0
+  }
+}

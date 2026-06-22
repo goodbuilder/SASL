@@ -461,6 +461,30 @@ class RuntimeDeploymentSelectorTests(unittest.TestCase):
         self.assertEqual(intrinsic_like["axis_contract"], module.RDF_AXIS_CONTRACT)
         self.assertNotIn("truth", intrinsic_like["override_rule"]["feature_name"])
 
+    def test_packaged_selector_applies_b9x5_raw_forward_guard_labels(self) -> None:
+        module = load_module()
+        selector = module.PackagedRuntimeDeploymentSelector(
+            {
+                "baseline_selector": "b9x5_log_disparity_forward_add",
+                "override_profile_label": "b9x5_product_ray_scale_intrinsic_fallback",
+                "runtime_rule": (
+                    "use b9x5_log_disparity_forward_add unless "
+                    "feature_raw_forward_mean_m gt 1771.0, "
+                    "then use b9x5_product_ray_scale_intrinsic_fallback"
+                ),
+                "selection_contract": "raw-forward runtime guard only",
+            }
+        )
+
+        self.assertEqual(
+            selector.select({"raw_forward_mean_m": 1773.4})["selected_label"],
+            "b9x5_product_ray_scale_intrinsic_fallback",
+        )
+        self.assertEqual(
+            selector.select({"raw_forward_mean_m": 1770.4})["selected_label"],
+            "b9x5_log_disparity_forward_add",
+        )
+
     def test_packaged_selector_loads_from_json_file(self) -> None:
         module = load_module()
         with tempfile.TemporaryDirectory() as tmpdir:
