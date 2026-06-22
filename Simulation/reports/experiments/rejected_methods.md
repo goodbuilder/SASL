@@ -879,3 +879,11 @@ in inputs, observation model, gate, or method.
   - Interpretation: clip `0.01` reduces aggregate regression versus clip
     `0.02` while retaining part of the tail improvement, but aggregate metrics
     still worsen and pass count is unchanged. Reject standalone deployment.
+
+- `EXP-20260623-440-b15x7-common0p05-logdisparityforwardproduct-rayscale-degree2-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `119/120` passes.
+  - Evidence: the only failure was `intrinsic_scale_stress` seed `298188`, whose
+    residual target max-abs improved to `2.668908 m`.
+  - Interpretation: this interaction ray-scale branch sharply improves pass
+    count but heavily worsens aggregate RMSE and overall residual target max.
+    Reject standalone deployment, keep as high-pass-count blend anchor.
