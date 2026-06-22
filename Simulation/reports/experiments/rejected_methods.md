@@ -522,3 +522,11 @@ in inputs, observation model, gate, or method.
     raw-forward but still fails every intrinsic-scale target row and gives up
     the raw-forward aggregate improvement. Reject as a standalone guard
     fallback.
+
+- `EXP-20260623-390-b15x7-common0p2-forwardoverdisparity-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all `20` failures were `intrinsic_scale_stress`; seed `298188`
+    residual target max-abs was `3.914895 m`.
+  - Interpretation: forward-over-disparity keeps aggregate RMSE near
+    observation, but target-row protection is weaker than the product branch and
+    every intrinsic-scale row still fails. Reject as a standalone guard fallback.

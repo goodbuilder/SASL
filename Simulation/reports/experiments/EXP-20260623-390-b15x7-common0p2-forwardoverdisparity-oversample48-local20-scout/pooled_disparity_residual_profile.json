@@ -1,0 +1,59 @@
+{
+  "profile_type": "DisparityResidualRuntimeProfile",
+  "profile_id": "EXP-SCOUT-20260623-b15x7-common0p2-forwardoverdisparity-oversample48-local20_pooled_disparity_residual",
+  "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b15x7_trim0p1_common0p2_residual_ray_scale_forward_over_disparity_deg1_ridge300_clip0p02_pooled",
+  "feature_space": "forward_over_disparity",
+  "correction_space": "ray_scale",
+  "degree": 1,
+  "ridge_lambda": 300.0,
+  "correction_clip": 0.02,
+  "feature_mean": 7.652842440196822,
+  "feature_scale": 5.8998544394291494,
+  "coefficients_low_to_high": [
+    -0.0002134972057842311,
+    0.00022053507032017086
+  ],
+  "observation_fusion": {
+    "burst_count": 15,
+    "observations_per_burst": 7,
+    "inner_mode": "trimmed_mean",
+    "outer_mode": "trimmed_mean",
+    "trim_fraction": 0.1,
+    "common_fraction": 0.2
+  },
+  "fit_source": {
+    "base_profile_json": "Simulation/reports/experiments/EXP-20260617-198-bbox-outlier-causal-image-prefilter/base_profile/recommended_runtime_profile.json",
+    "scenarios": [
+      "nominal",
+      "yaw_pitch_stress",
+      "bbox_outlier_stress",
+      "combined_sensor_stress",
+      "disparity_noise_stress",
+      "intrinsic_scale_stress"
+    ],
+    "seed_start": 298180,
+    "seed_end": 298199,
+    "trial_count_per_scenario": 20,
+    "sample_count": 1680,
+    "train_ratio": 0.5,
+    "target_range_m": 1852.0,
+    "target_window_m": 30.0,
+    "target_oversample_count": 48,
+    "truth_usage": "pooled_calibration_train_splits_only"
+  },
+  "runtime_inputs": [
+    "raw_right_m",
+    "raw_down_m",
+    "raw_forward_m",
+    "measured_disparity_px",
+    "left_u_px",
+    "left_v_px"
+  ],
+  "runtime_truth_used": false,
+  "coordinate_contracts_explicit": true,
+  "runtime_input_contract": "calibration-time residual fit uses train truth only; runtime applies a polynomial residual model from fused measured_disparity_px, inverse_depth, corrected stereo-center RDF raw_forward_m, or measured_disparity_px*raw_forward_m; PX4/RTK truth is audit-only",
+  "rdf_axis_contract": "stereo_center_opencv_optical:RDF(right,down,forward)",
+  "public_topic_contract": "stereodistance_position_topics:FRD_range(forward,right,down,range)",
+  "truth_rdf_transform_contract": "explicit T_source_to_stereo_rdf required; direct axis alias rdf_right=east/rdf_down=down/rdf_forward=north is forbidden",
+  "ned_to_rdf_contract": "explicit T_source_to_stereo_rdf required; direct axis alias rdf_right=east/rdf_down=down/rdf_forward=north is forbidden"
+}
