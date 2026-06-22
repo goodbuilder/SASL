@@ -1083,3 +1083,11 @@ in inputs, observation model, gate, or method.
     RMSE improvement shrinks to `0.911104 m` to `0.907569 m`.
   - Interpretation: softened b21x5 clip does not recover intrinsic rows and
     loses much of the RMSE benefit. Reject standalone deployment.
+
+- `EXP-20260623-465-b15x7-common0p05-lograwforward-forwardadd-degree1-ridge3-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; range RMSE improves
+    from `0.912856 m` to `0.907625 m`, and intrinsic seed `298188` regresses
+    from `3.623977 m` to `3.636818 m`.
+  - Interpretation: log raw forward softens the linear raw-forward branch but
+    still does not recover intrinsic rows. Reject standalone deployment.
