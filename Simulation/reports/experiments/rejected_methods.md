@@ -1024,3 +1024,12 @@ in inputs, observation model, gate, or method.
     `0.05`, moving from `4.255268 m` to `4.235268 m`.
   - Interpretation: looser common sampling gives the best RMSE in this branch
     but still fails intrinsic rows. Reject standalone deployment.
+
+- `EXP-20260623-458-b15x7-common0p05-rawforward-forwardadd-degree1-ridge3-clip0p005-oversample48-local20-scout`
+  - Result: `FAIL`, `100/120` passes.
+  - Evidence: all 20 failures are `intrinsic_scale_stress`; intrinsic seed
+    `298188` regression shrinks to `3.623977 m` to `3.628976 m`, but range RMSE
+    improvement also shrinks to `0.912856 m` to `0.911046 m`.
+  - Interpretation: smaller clip softens intrinsic regression but does not
+    recover the intrinsic gate and gives up most RMSE improvement. Reject
+    standalone deployment.
