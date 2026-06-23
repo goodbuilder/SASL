@@ -18,7 +18,7 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.manual_focal_override is False
     assert settings.use_triangulation is True
     assert settings.intrinsics_path == DEFAULT_INTRINSICS_PATH
-    assert settings.yolo_weights_path == "/home/moontaehyung/Capstone/models/Capstone.pt"
+    assert settings.yolo_weights_path == "yolov8m.pt"
     assert settings.interface_name == "enx588694fce07e"
     assert settings.left_rtsp_url == "rtsp://10.0.0.231:8554/visible"
     assert settings.right_rtsp_url == "rtsp://10.0.0.232:8554/visible"
@@ -41,6 +41,11 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.right_pixhawk_eth_ip == "10.0.0.3"
     assert settings.left_mavlink_url == "udpin:0.0.0.0:14550"
     assert settings.right_mavlink_url == "udpin:0.0.0.0:14551"
+    assert settings.gnss_base_serial_port == "/dev/ttyACM0"
+    assert settings.gnss_base_baud == 460800
+    assert settings.gnss_base_survey_in_min_duration_s == 300
+    assert settings.gnss_base_survey_in_accuracy_m == 1.0
+    assert settings.gnss_base_rtcm_injection_target == "both"
     assert settings.uam_telemetry_source == "ros2"
     assert settings.uam_ros2_topic == "/uav_0/fmu/out/vehicle_local_position"
     assert settings.uam_ros2_x_field == "x"
@@ -108,6 +113,11 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         measurement_display_mode="preview",
         use_rtk_baseline=False,
         require_rtk_fixed=False,
+        gnss_base_serial_port="/dev/ttyUSB9",
+        gnss_base_baud=115200,
+        gnss_base_survey_in_min_duration_s=600,
+        gnss_base_survey_in_accuracy_m=0.25,
+        gnss_base_rtcm_injection_target="left",
         uam_telemetry_source="mavlink",
         uam_ros2_topic="/vehicle/local",
         uam_ros2_x_field="position[0]",

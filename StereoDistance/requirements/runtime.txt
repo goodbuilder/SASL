@@ -3,3 +3,4 @@ PyGObject
 ultralytics
 av
 pyulog
+pyserial

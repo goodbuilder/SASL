@@ -7,8 +7,10 @@ import faulthandler
 import json
 import math
 import os
+import queue
 import re
 import signal
+import struct
 import sys
 import threading
 import time
@@ -2005,6 +2007,370 @@ class RtspStreamCheckWorker(QtCore.QObject):
             pipeline.set_state(Gst.State.NULL)
 
 
+def _ubx_checksum(data: bytes) -> tuple[int, int]:
+    ck_a = 0
+    ck_b = 0
+    for value in data:
+        ck_a = (ck_a + value) & 0xFF
+        ck_b = (ck_b + ck_a) & 0xFF
+    return ck_a, ck_b
+
+
+def ubx_frame(message_class: int, message_id: int, payload: bytes) -> bytes:
+    header = bytes((message_class & 0xFF, message_id & 0xFF)) + len(payload).to_bytes(2, "little")
+    ck_a, ck_b = _ubx_checksum(header + payload)
+    return b"\xb5\x62" + header + payload + bytes((ck_a, ck_b))
+
+
+def ubx_cfg_tmode3_survey_in_frame(*, min_duration_s: int, accuracy_m: float) -> bytes:
+    min_duration_s = max(1, int(min_duration_s))
+    accuracy_0_1mm = max(1, int(round(float(accuracy_m) / 0.0001)))
+    payload = struct.pack(
+        "<BBHlllbbbBIII8s",
+        0,
+        0,
+        1,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        min_duration_s,
+        accuracy_0_1mm,
+        b"\x00" * 8,
+    )
+    return ubx_frame(0x06, 0x71, payload)
+
+
+def ubx_cfg_tmode3_disabled_frame() -> bytes:
+    payload = struct.pack(
+        "<BBHlllbbbBIII8s",
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        b"\x00" * 8,
+    )
+    return ubx_frame(0x06, 0x71, payload)
+
+
+def parse_ubx_nav_svin(payload: bytes) -> dict[str, object] | None:
+    if len(payload) < 40:
+        return None
+    (
+        _version,
+        _reserved0,
+        _itow_ms,
+        duration_s,
+        mean_x_cm,
+        mean_y_cm,
+        mean_z_cm,
+        mean_x_hp_0_1mm,
+        mean_y_hp_0_1mm,
+        mean_z_hp_0_1mm,
+        _reserved1,
+        mean_acc_0_1mm,
+        observations,
+        valid,
+        active,
+        _reserved2,
+    ) = struct.unpack_from("<B3sLLlllbbbBLLBBH", payload, 0)
+    return {
+        "duration_s": int(duration_s),
+        "mean_accuracy_m": float(mean_acc_0_1mm) * 0.0001,
+        "observations": int(observations),
+        "valid": bool(valid),
+        "active": bool(active),
+        "mean_x_m": float(mean_x_cm) * 0.01 + float(mean_x_hp_0_1mm) * 0.0001,
+        "mean_y_m": float(mean_y_cm) * 0.01 + float(mean_y_hp_0_1mm) * 0.0001,
+        "mean_z_m": float(mean_z_cm) * 0.01 + float(mean_z_hp_0_1mm) * 0.0001,
+    }
+
+
+def parse_ubx_base_satellite_count(message_class: int, message_id: int, payload: bytes) -> int | None:
+    if message_class != 0x01:
+        return None
+    if message_id == 0x07 and len(payload) >= 24:
+        return int(payload[23])
+    if message_id == 0x35 and len(payload) >= 8:
+        return int(payload[5])
+    return None
+
+
+def parse_nmea_gga_satellite_count(line: str) -> tuple[int, int] | None:
+    text = line.strip()
+    if not text.startswith(("$GNGGA", "$GPGGA", "$GAGGA", "$GLGGA", "$GBGGA")):
+        return None
+    if "*" in text:
+        body, checksum_text = text[1:].split("*", 1)
+        checksum = 0
+        for char in body:
+            checksum ^= ord(char)
+        try:
+            expected = int(checksum_text[:2], 16)
+        except ValueError:
+            return None
+        if checksum != expected:
+            return None
+        fields = body.split(",")
+    else:
+        fields = text[1:].split(",")
+    if len(fields) <= 7:
+        return None
+    try:
+        fix_quality = int(fields[6] or "0")
+        satellites = int(fields[7] or "0")
+    except ValueError:
+        return None
+    return satellites, fix_quality
+
+
+def gnss_base_serial_port_candidates() -> list[str]:
+    candidates: list[str] = []
+    for pattern in ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"):
+        for path in sorted(Path("/").glob(pattern.removeprefix("/"))):
+            text = str(path)
+            if text not in candidates:
+                candidates.append(text)
+    return candidates
+
+
+def probe_gnss_base_serial_ports(candidates: Sequence[str], *, baud: int, timeout_s: float = 0.6) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    try:
+        import serial  # type: ignore[import-not-found]
+    except Exception as exc:
+        return [
+            {
+                "port": str(candidate),
+                "target": os.path.realpath(str(candidate)),
+                "baud": int(baud),
+                "status": f"pyserial 필요: {exc}",
+                "ubx": False,
+                "messages": "",
+            }
+            for candidate in candidates
+        ]
+    for candidate in candidates:
+        port = str(candidate)
+        parser = UbxStreamParser()
+        nmea_buffer = ""
+        messages_seen: set[str] = set()
+        total_bytes = 0
+        status = "no data"
+        ubx_detected = False
+        try:
+            with serial.Serial(port, int(baud), timeout=0.1) as serial_obj:
+                deadline = time.monotonic() + max(0.1, float(timeout_s))
+                while time.monotonic() < deadline:
+                    chunk = serial_obj.read(4096)
+                    if not chunk:
+                        continue
+                    total_bytes += len(chunk)
+                    nmea_buffer += chunk.decode("ascii", "ignore")
+                    if "\n" in nmea_buffer:
+                        lines = nmea_buffer.splitlines()
+                        nmea_buffer = "" if nmea_buffer.endswith(("\n", "\r")) else lines.pop() if lines else nmea_buffer
+                        for line in lines:
+                            gga = parse_nmea_gga_satellite_count(line)
+                            if gga is not None:
+                                satellites, fix_quality = gga
+                                messages_seen.add(f"NMEA-GGA sats={satellites} fix={fix_quality}")
+                    for message_class, message_id, payload in parser.feed(chunk):
+                        ubx_detected = True
+                        if message_class == 0x01 and message_id == 0x3B:
+                            messages_seen.add("NAV-SVIN")
+                        elif message_class == 0x01 and message_id == 0x07:
+                            sat_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
+                            messages_seen.add("NAV-PVT" if sat_count is None else f"NAV-PVT sats={sat_count}")
+                        elif message_class == 0x01 and message_id == 0x35:
+                            sat_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
+                            messages_seen.add("NAV-SAT" if sat_count is None else f"NAV-SAT sats={sat_count}")
+                        else:
+                            messages_seen.add(f"UBX {message_class:02X}/{message_id:02X}")
+                    if messages_seen:
+                        break
+            if messages_seen:
+                status = "GNSS data detected"
+            elif total_bytes:
+                status = f"raw data only ({total_bytes} bytes)"
+        except Exception as exc:
+            status = str(exc)
+        rows.append(
+            {
+                "port": port,
+                "target": os.path.realpath(port),
+                "baud": int(baud),
+                "status": status,
+                "ubx": ubx_detected,
+                "messages": ", ".join(sorted(messages_seen)),
+            }
+        )
+    return rows
+
+
+class UbxStreamParser:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[tuple[int, int, bytes]]:
+        self._buffer.extend(data)
+        messages: list[tuple[int, int, bytes]] = []
+        while True:
+            sync_index = self._buffer.find(b"\xb5\x62")
+            if sync_index < 0:
+                if len(self._buffer) > 1:
+                    del self._buffer[:-1]
+                break
+            if sync_index:
+                del self._buffer[:sync_index]
+            if len(self._buffer) < 8:
+                break
+            payload_len = int.from_bytes(self._buffer[4:6], "little")
+            frame_len = 8 + payload_len
+            if len(self._buffer) < frame_len:
+                break
+            frame = bytes(self._buffer[:frame_len])
+            del self._buffer[:frame_len]
+            ck_a, ck_b = _ubx_checksum(frame[2:-2])
+            if ck_a != frame[-2] or ck_b != frame[-1]:
+                continue
+            messages.append((frame[2], frame[3], frame[6:-2]))
+        return messages
+
+
+class GnssBaseSerialWorker(QtCore.QObject):
+    connected = QtCore.pyqtSignal(str, int)
+    stats_changed = QtCore.pyqtSignal(int, float, float)
+    survey_in_changed = QtCore.pyqtSignal(object)
+    satellite_count_changed = QtCore.pyqtSignal(int, str)
+    command_sent = QtCore.pyqtSignal(str, int)
+    failed = QtCore.pyqtSignal(str)
+    disconnected = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, port: str, baud: int) -> None:
+        super().__init__()
+        self.port = port
+        self.baud = int(baud)
+        self._stop_requested = False
+        self._write_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        serial_obj = None
+        total_bytes = 0
+        started_s = time.monotonic()
+        last_emit_s = started_s
+        last_rx_s: float | None = None
+        ubx_parser = UbxStreamParser()
+        nmea_buffer = ""
+        try:
+            try:
+                import serial  # type: ignore[import-not-found]
+            except Exception as exc:
+                self.failed.emit(f"pyserial 필요: {exc}")
+                return
+            serial_obj = serial.Serial(self.port, self.baud, timeout=0.2)
+            self.connected.emit(self.port, self.baud)
+            while not self._stop_requested:
+                self._drain_writes(serial_obj)
+                chunk = serial_obj.read(4096)
+                now_s = time.monotonic()
+                if chunk:
+                    total_bytes += len(chunk)
+                    last_rx_s = now_s
+                    nmea_buffer += chunk.decode("ascii", "ignore")
+                    if "\n" in nmea_buffer:
+                        lines = nmea_buffer.splitlines()
+                        nmea_buffer = "" if nmea_buffer.endswith(("\n", "\r")) else lines.pop() if lines else nmea_buffer
+                        for line in lines:
+                            gga = parse_nmea_gga_satellite_count(line)
+                            if gga is not None:
+                                satellites, fix_quality = gga
+                                self.satellite_count_changed.emit(satellites, f"NMEA-GGA fix={fix_quality}")
+                    for message_class, message_id, payload in ubx_parser.feed(chunk):
+                        if message_class == 0x01 and message_id == 0x3B:
+                            survey_in = parse_ubx_nav_svin(payload)
+                            if survey_in is not None:
+                                self.survey_in_changed.emit(survey_in)
+                        satellite_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
+                        if satellite_count is not None:
+                            source = "NAV-PVT" if message_id == 0x07 else "NAV-SAT"
+                            self.satellite_count_changed.emit(satellite_count, source)
+                if now_s - last_emit_s >= 0.5:
+                    elapsed_s = max(1e-6, now_s - started_s)
+                    rate_bps = total_bytes / elapsed_s
+                    age_s = -1.0 if last_rx_s is None else max(0.0, now_s - last_rx_s)
+                    self.stats_changed.emit(total_bytes, rate_bps, age_s)
+                    last_emit_s = now_s
+            self.disconnected.emit("disconnected")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if serial_obj is not None:
+                try:
+                    serial_obj.close()
+                except Exception:
+                    pass
+            self.finished.emit()
+
+    @QtCore.pyqtSlot()
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    @QtCore.pyqtSlot(str, bytes)
+    def send_bytes(self, label: str, payload: bytes) -> None:
+        self._write_queue.put((label, bytes(payload)))
+
+    def _drain_writes(self, serial_obj) -> None:
+        while True:
+            try:
+                label, payload = self._write_queue.get_nowait()
+            except queue.Empty:
+                return
+            serial_obj.write(payload)
+            try:
+                serial_obj.flush()
+            except Exception:
+                pass
+            self.command_sent.emit(label, len(payload))
+
+
+class GnssBaseSerialDetectWorker(QtCore.QObject):
+    detected = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, baud: int) -> None:
+        super().__init__()
+        self.baud = int(baud)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            candidates = gnss_base_serial_port_candidates()
+            rows = probe_gnss_base_serial_ports(candidates, baud=self.baud, timeout_s=0.6)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.detected.emit(rows)
+        finally:
+            self.finished.emit()
+
+
 class CheckerboardPreviewWorker(QtCore.QObject):
     result_ready = QtCore.pyqtSignal(object)
 
@@ -2265,6 +2631,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.rtsp_check_worker: RtspStreamCheckWorker | None = None
         self.rtsp_enable_thread: QtCore.QThread | None = None
         self.rtsp_enable_worker: WirisRtspEnableWorker | None = None
+        self.gnss_base_serial_thread: QtCore.QThread | None = None
+        self.gnss_base_serial_worker: GnssBaseSerialWorker | None = None
+        self.gnss_base_serial_connected = False
+        self.gnss_base_detect_thread: QtCore.QThread | None = None
+        self.gnss_base_detect_worker: GnssBaseSerialDetectWorker | None = None
+        self._gnss_base_candidate_rows: list[dict[str, object]] = []
         self.auto_wiris_connect_pending = False
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
@@ -2394,6 +2766,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         alignment_validation_layout = QtWidgets.QVBoxLayout(alignment_validation_tab)
         alignment_profile_tab = QtWidgets.QWidget()
         alignment_profile_layout = QtWidgets.QVBoxLayout(alignment_profile_tab)
+        gnss_base_tab = QtWidgets.QWidget()
+        gnss_base_layout = QtWidgets.QVBoxLayout(gnss_base_tab)
         signal_alignment_tab = QtWidgets.QWidget()
         signal_alignment_layout = QtWidgets.QVBoxLayout(signal_alignment_tab)
         rm3100_alignment_tab = QtWidgets.QWidget()
@@ -2519,6 +2893,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         alignment_tabs.setDocumentMode(True)
         alignment_tabs.addTab(alignment_overview_tab, "센서 인식")
         alignment_tabs.addTab(rtk_tab, "소스 / 품질")
+        alignment_tabs.addTab(gnss_base_tab, "GNSS Base")
         alignment_tabs.addTab(mag_management_tab, "MAG 관리")
         alignment_tabs.addTab(alignment_mag_tab, "Baseline 계산")
         alignment_tabs.addTab(alignment_attitude_tab, "Baseline / 자세 정렬")
@@ -2527,6 +2902,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.alignment_overview_tab_index = alignment_tabs.indexOf(alignment_overview_tab)
         self.signal_alignment_tab_index = self.alignment_overview_tab_index
         self.source_quality_alignment_tab_index = alignment_tabs.indexOf(rtk_tab)
+        self.gnss_base_alignment_tab_index = alignment_tabs.indexOf(gnss_base_tab)
         self.rm3100_alignment_tab_index = alignment_tabs.indexOf(mag_management_tab)
         self.baseline_alignment_tab_index = alignment_tabs.indexOf(alignment_mag_tab)
         self.yaw_alignment_tab_index = alignment_tabs.indexOf(alignment_attitude_tab)
@@ -3565,6 +3941,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._init_baseline_alignment_state()
         self._build_alignment_sensor_recognition_tab(alignment_overview_layout)
         self._build_alignment_source_quality_tab(rtk_layout)
+        self._build_gnss_base_tab(gnss_base_layout)
         self._build_alignment_magnetometer_tab(
             mag_management_layout,
             include_manager=True,
@@ -5444,6 +5821,126 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._build_baseline_source_selection_view(content_layout)
         self._build_baseline_quality_view(content_layout)
 
+    def _build_gnss_base_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        layout.setSpacing(8)
+        self.gnss_base_status_labels: dict[str, QtWidgets.QLabel] = {}
+
+        settings_group = QtWidgets.QGroupBox("GNSS Base 설정")
+        settings_form = QtWidgets.QGridLayout(settings_group)
+        self.gnss_base_serial_port_edit = QtWidgets.QLineEdit(self.settings.gnss_base_serial_port)
+        self.gnss_base_baud_spin = QtWidgets.QSpinBox()
+        self.gnss_base_baud_spin.setRange(1200, 4000000)
+        self.gnss_base_baud_spin.setValue(int(self.settings.gnss_base_baud))
+        self.gnss_base_survey_duration_spin = QtWidgets.QSpinBox()
+        self.gnss_base_survey_duration_spin.setRange(1, 86400)
+        self.gnss_base_survey_duration_spin.setValue(int(self.settings.gnss_base_survey_in_min_duration_s))
+        self.gnss_base_survey_accuracy_spin = QtWidgets.QDoubleSpinBox()
+        self.gnss_base_survey_accuracy_spin.setDecimals(3)
+        self.gnss_base_survey_accuracy_spin.setRange(0.001, 100.0)
+        self.gnss_base_survey_accuracy_spin.setSingleStep(0.1)
+        self.gnss_base_survey_accuracy_spin.setValue(float(self.settings.gnss_base_survey_in_accuracy_m))
+        self.gnss_base_rtcm_target_combo = QtWidgets.QComboBox()
+        self.gnss_base_rtcm_target_combo.addItem("비활성", "disabled")
+        self.gnss_base_rtcm_target_combo.addItem("좌/우 Pixhawk", "both")
+        self.gnss_base_rtcm_target_combo.addItem("Left Pixhawk", "left")
+        self.gnss_base_rtcm_target_combo.addItem("Right Pixhawk", "right")
+        self._set_combo_data(self.gnss_base_rtcm_target_combo, self.settings.gnss_base_rtcm_injection_target)
+        settings_items = (
+            ("Base serial port", self.gnss_base_serial_port_edit),
+            ("Baudrate", self.gnss_base_baud_spin),
+            ("Survey-in 최소 시간(s)", self.gnss_base_survey_duration_spin),
+            ("Survey-in 목표 정확도(m)", self.gnss_base_survey_accuracy_spin),
+            ("RTCM 주입 대상", self.gnss_base_rtcm_target_combo),
+        )
+        for row, (title, widget) in enumerate(settings_items):
+            settings_form.addWidget(QtWidgets.QLabel(title), row, 0)
+            settings_form.addWidget(widget, row, 1)
+        self.gnss_base_connect_button = QtWidgets.QPushButton("Base 연결")
+        self.gnss_base_connect_button.clicked.connect(self.connect_gnss_base_serial)
+        self.gnss_base_disconnect_button = QtWidgets.QPushButton("연결 해제")
+        self.gnss_base_disconnect_button.clicked.connect(self.disconnect_gnss_base_serial)
+        self.gnss_base_disconnect_button.setEnabled(False)
+        self.gnss_base_survey_start_button = QtWidgets.QPushButton("Survey-in 시작")
+        self.gnss_base_survey_start_button.clicked.connect(self.start_gnss_base_survey_in)
+        self.gnss_base_survey_start_button.setEnabled(False)
+        self.gnss_base_survey_stop_button = QtWidgets.QPushButton("Survey-in 중지")
+        self.gnss_base_survey_stop_button.clicked.connect(self.stop_gnss_base_survey_in)
+        self.gnss_base_survey_stop_button.setEnabled(False)
+        self.gnss_base_discover_button = QtWidgets.QPushButton("Base 포트 탐색")
+        self.gnss_base_discover_button.clicked.connect(self.discover_gnss_base_serial_ports)
+        self.gnss_base_apply_candidate_button = QtWidgets.QPushButton("선택 포트 적용")
+        self.gnss_base_apply_candidate_button.clicked.connect(self.apply_selected_gnss_base_candidate)
+        self.gnss_base_apply_candidate_button.setEnabled(False)
+        button_row = QtWidgets.QHBoxLayout()
+        button_row.addWidget(self.gnss_base_connect_button)
+        button_row.addWidget(self.gnss_base_disconnect_button)
+        button_row.addWidget(self.gnss_base_survey_start_button)
+        button_row.addWidget(self.gnss_base_survey_stop_button)
+        button_row.addWidget(self.gnss_base_discover_button)
+        button_row.addWidget(self.gnss_base_apply_candidate_button)
+        button_row.addStretch(1)
+        settings_form.addLayout(button_row, len(settings_items), 0, 1, 2)
+
+        self.gnss_base_candidate_table = QtWidgets.QTableWidget(0, 5)
+        self.gnss_base_candidate_table.setHorizontalHeaderLabels(["Port", "Target", "Baud", "상태", "UBX 메시지"])
+        self.gnss_base_candidate_table.verticalHeader().setVisible(False)
+        self.gnss_base_candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.gnss_base_candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.gnss_base_candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.gnss_base_candidate_table.setMinimumHeight(110)
+        self.gnss_base_candidate_table.itemSelectionChanged.connect(self._refresh_gnss_base_candidate_actions)
+        gnss_candidate_header = self.gnss_base_candidate_table.horizontalHeader()
+        gnss_candidate_header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
+        settings_form.addWidget(self.gnss_base_candidate_table, len(settings_items) + 1, 0, 1, 2)
+
+        base_group = QtWidgets.QGroupBox("GNSS Base 연결")
+        base_grid = QtWidgets.QGridLayout(base_group)
+        base_items = (
+            ("connection", "Base 연결", "대기 중", "idle"),
+            ("survey_in", "Survey-in", "미연결", "idle"),
+            ("base_satellites", "Base 위성 수", "대기 중", "idle"),
+            ("rtcm_rx", "Raw 수신", "없음", "idle"),
+            ("rtcm_injection", "RTCM 주입", "비활성", "idle"),
+        )
+        for row, (key, title, text, level) in enumerate(base_items):
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            base_grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            base_grid.addWidget(label, row, 1)
+            self.gnss_base_status_labels[key] = label
+            self._set_health_label(label, text, level)
+
+        rover_group = QtWidgets.QGroupBox("Rover RTK 상태")
+        rover_grid = QtWidgets.QGridLayout(rover_group)
+        rover_items = (
+            ("left_rover", "Left rover", "GPS/RTK 대기 중"),
+            ("right_rover", "Right rover", "GPS/RTK 대기 중"),
+            ("baseline", "GPS/RTK baseline", "대기 중"),
+        )
+        for row, (key, title, text) in enumerate(rover_items):
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            rover_grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            rover_grid.addWidget(label, row, 1)
+            self.gnss_base_status_labels[key] = label
+            self._set_health_label(label, text, "idle")
+
+        note = QtWidgets.QLabel(
+            "현재 단계는 base serial raw 수신과 UBX NAV-SVIN survey-in 상태 읽기까지 지원합니다. "
+            "다음 단계에서 survey-in 시작/중지 명령을 추가합니다."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("statusStrip")
+
+        layout.addWidget(settings_group)
+        layout.addWidget(base_group)
+        layout.addWidget(rover_group)
+        layout.addWidget(note)
+        layout.addStretch(1)
+        self._refresh_gnss_base_tab()
+
     def _build_baseline_alignment_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         layout.setSpacing(8)
         self._init_baseline_alignment_state()
@@ -6285,6 +6782,255 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         grade = "GOOD" if quality is not None and quality.grade == "GOOD" else "WARNING" if vector is not None else "BAD"
         self._set_health_label(labels["alignment_quality"], grade, "good" if grade == "GOOD" else "warn" if grade == "WARNING" else "bad")
+
+    def _refresh_gnss_base_tab(self) -> None:
+        if not hasattr(self, "gnss_base_status_labels"):
+            return
+        labels = self.gnss_base_status_labels
+        now_s = time.monotonic()
+        for side, key in (("left", "left_rover"), ("right", "right_rover")):
+            gps = self.latest_gps.get(side)
+            if gps is None:
+                self._set_health_label(labels[key], "GPS/RTK 대기 중", "idle")
+                continue
+            age_ms = max(0.0, now_s - gps.timestamp_s) * 1000.0
+            sats = "sats=--" if gps.satellites_used is None else f"sats={gps.satellites_used}"
+            eph = "" if gps.eph_m is None else f" | eph={gps.eph_m:.2f}m"
+            text = f"{gps.rtk_label} | {sats}{eph} | age={age_ms:.0f}ms"
+            self._set_health_label(labels[key], text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
+
+        baseline = self.latest_rtk_baseline
+        if baseline is None:
+            self._set_health_label(labels["baseline"], "대기 중", "idle")
+            return
+        usable, reason = self._gps_baseline_usable_for_translation(baseline)
+        level = "good" if usable and baseline.fix_quality == "GOOD" else "warn" if usable else "bad"
+        text = (
+            f"{baseline.baseline_m:.3f} m | {baseline.fix_quality} | "
+            f"N/E/D={baseline.north_m:+.3f}/{baseline.east_m:+.3f}/{baseline.down_m:+.3f} m"
+        )
+        if not usable:
+            text = f"{text} | {reason}"
+        self._set_health_label(labels["baseline"], text, level)
+
+    def connect_gnss_base_serial(self) -> None:
+        if self.gnss_base_serial_thread is not None:
+            return
+        port = self.gnss_base_serial_port_edit.text().strip()
+        if not port:
+            self._set_health_label(self.gnss_base_status_labels["connection"], "serial port 필요", "bad")
+            return
+        baud = int(self.gnss_base_baud_spin.value())
+        self._set_health_label(self.gnss_base_status_labels["connection"], f"connecting {port} @ {baud}", "warn")
+        self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "raw bytes 대기 중", "idle")
+        self.gnss_base_connect_button.setEnabled(False)
+        self.gnss_base_disconnect_button.setEnabled(True)
+        thread = QtCore.QThread(self)
+        worker = GnssBaseSerialWorker(port=port, baud=baud)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.connected.connect(self._handle_gnss_base_serial_connected)
+        worker.stats_changed.connect(self._handle_gnss_base_serial_stats)
+        worker.survey_in_changed.connect(self._handle_gnss_base_survey_in)
+        worker.satellite_count_changed.connect(self._handle_gnss_base_satellite_count)
+        worker.command_sent.connect(self._handle_gnss_base_command_sent)
+        worker.failed.connect(self._handle_gnss_base_serial_failed)
+        worker.disconnected.connect(self._handle_gnss_base_serial_disconnected)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda: self._clear_gnss_base_serial_worker(thread))
+        self.gnss_base_serial_thread = thread
+        self.gnss_base_serial_worker = worker
+        thread.start()
+
+    def disconnect_gnss_base_serial(self) -> None:
+        worker = self.gnss_base_serial_worker
+        if worker is not None:
+            worker.request_stop()
+        thread = self.gnss_base_serial_thread
+        if thread is not None and not thread.wait(1500):
+            thread.quit()
+            thread.wait(500)
+
+    def start_gnss_base_survey_in(self) -> None:
+        worker = self.gnss_base_serial_worker
+        if worker is None:
+            self._set_health_label(self.gnss_base_status_labels["survey_in"], "serial 미연결", "bad")
+            return
+        frame = ubx_cfg_tmode3_survey_in_frame(
+            min_duration_s=self.gnss_base_survey_duration_spin.value(),
+            accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
+        )
+        worker.send_bytes("CFG-TMODE3 survey-in start", frame)
+        self._set_health_label(self.gnss_base_status_labels["survey_in"], "survey-in 시작 명령 전송 대기", "warn")
+
+    def stop_gnss_base_survey_in(self) -> None:
+        worker = self.gnss_base_serial_worker
+        if worker is None:
+            self._set_health_label(self.gnss_base_status_labels["survey_in"], "serial 미연결", "bad")
+            return
+        worker.send_bytes("CFG-TMODE3 disabled", ubx_cfg_tmode3_disabled_frame())
+        self._set_health_label(self.gnss_base_status_labels["survey_in"], "survey-in 중지 명령 전송 대기", "warn")
+
+    def discover_gnss_base_serial_ports(self) -> None:
+        if self.gnss_base_detect_thread is not None:
+            return
+        self.gnss_base_discover_button.setEnabled(False)
+        self.gnss_base_apply_candidate_button.setEnabled(False)
+        self._set_health_label(self.gnss_base_status_labels["connection"], "base port 탐색 중", "warn")
+        thread = QtCore.QThread(self)
+        worker = GnssBaseSerialDetectWorker(baud=self.gnss_base_baud_spin.value())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.detected.connect(self._handle_gnss_base_candidates_detected)
+        worker.failed.connect(self._handle_gnss_base_candidate_detect_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda: self._clear_gnss_base_detect_worker(thread))
+        self.gnss_base_detect_thread = thread
+        self.gnss_base_detect_worker = worker
+        thread.start()
+
+    def _handle_gnss_base_candidates_detected(self, rows: object) -> None:
+        candidate_rows = [dict(row) for row in rows] if isinstance(rows, list) else []
+        self._set_gnss_base_candidate_rows(candidate_rows)
+        count = len(candidate_rows)
+        ubx_count = sum(1 for row in candidate_rows if row.get("ubx"))
+        level = "good" if ubx_count else "warn" if count else "bad"
+        self._set_health_label(
+            self.gnss_base_status_labels["connection"],
+            f"탐색 완료: {count} candidates, UBX {ubx_count}",
+            level,
+        )
+
+    def _handle_gnss_base_candidate_detect_failed(self, message: str) -> None:
+        self._set_health_label(self.gnss_base_status_labels["connection"], f"탐색 실패: {message}", "bad")
+
+    def _clear_gnss_base_detect_worker(self, thread: QtCore.QThread) -> None:
+        if self.gnss_base_detect_thread is thread:
+            self.gnss_base_detect_thread = None
+            self.gnss_base_detect_worker = None
+            if hasattr(self, "gnss_base_discover_button"):
+                self.gnss_base_discover_button.setEnabled(True)
+            self._refresh_gnss_base_candidate_actions()
+        thread.deleteLater()
+
+    def _set_gnss_base_candidate_rows(self, rows: list[dict[str, object]]) -> None:
+        self._gnss_base_candidate_rows = rows
+        table = self.gnss_base_candidate_table
+        table.setRowCount(len(rows))
+        keys = ("port", "target", "baud", "status", "messages")
+        for row_index, row in enumerate(rows):
+            for column, key in enumerate(keys):
+                item = QtWidgets.QTableWidgetItem(str(row.get(key, "")))
+                table.setItem(row_index, column, item)
+        table.resizeRowsToContents()
+        self._refresh_gnss_base_candidate_actions()
+
+    def _refresh_gnss_base_candidate_actions(self) -> None:
+        row = self.gnss_base_candidate_table.currentRow() if hasattr(self, "gnss_base_candidate_table") else -1
+        self.gnss_base_apply_candidate_button.setEnabled(0 <= row < len(self._gnss_base_candidate_rows))
+
+    def apply_selected_gnss_base_candidate(self) -> None:
+        row = self.gnss_base_candidate_table.currentRow()
+        if row < 0 or row >= len(self._gnss_base_candidate_rows):
+            self._set_health_label(self.gnss_base_status_labels["connection"], "포트 후보를 먼저 선택하세요", "warn")
+            return
+        entry = self._gnss_base_candidate_rows[row]
+        port = str(entry.get("port", "")).strip()
+        if not port:
+            self._set_health_label(self.gnss_base_status_labels["connection"], "선택 후보 port가 비어 있습니다", "bad")
+            return
+        self.gnss_base_serial_port_edit.setText(port)
+        try:
+            baud = int(entry.get("baud", self.gnss_base_baud_spin.value()))
+        except (TypeError, ValueError):
+            baud = self.gnss_base_baud_spin.value()
+        self.gnss_base_baud_spin.setValue(baud)
+        self._set_health_label(self.gnss_base_status_labels["connection"], f"선택 포트 적용: {port}", "good")
+
+    def _handle_gnss_base_serial_connected(self, port: str, baud: int) -> None:
+        self.gnss_base_serial_connected = True
+        self._set_health_label(self.gnss_base_status_labels["connection"], f"connected {port} @ {baud}", "good")
+        self._set_health_label(self.gnss_base_status_labels["survey_in"], "UBX NAV-SVIN 대기 중", "idle")
+        self._set_health_label(self.gnss_base_status_labels["base_satellites"], "UBX NAV-PVT/NAV-SAT 대기 중", "idle")
+        self.gnss_base_survey_start_button.setEnabled(True)
+        self.gnss_base_survey_stop_button.setEnabled(True)
+
+    def _handle_gnss_base_serial_stats(self, total_bytes: int, rate_bps: float, age_s: float) -> None:
+        age_text = "no data" if age_s < 0.0 else f"age={age_s:.1f}s"
+        level = "good" if rate_bps > 0.0 and 0.0 <= age_s < 2.0 else "warn" if rate_bps > 0.0 else "idle"
+        self._set_health_label(
+            self.gnss_base_status_labels["rtcm_rx"],
+            f"raw={total_bytes} bytes | {rate_bps:.1f} B/s | {age_text}",
+            level,
+        )
+
+    def _handle_gnss_base_serial_failed(self, message: str) -> None:
+        self.gnss_base_serial_connected = False
+        self._set_health_label(self.gnss_base_status_labels["connection"], f"failed: {message}", "bad")
+        self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
+        self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
+        self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "없음", "idle")
+        self.gnss_base_survey_start_button.setEnabled(False)
+        self.gnss_base_survey_stop_button.setEnabled(False)
+
+    def _handle_gnss_base_serial_disconnected(self, message: str) -> None:
+        self.gnss_base_serial_connected = False
+        self._set_health_label(self.gnss_base_status_labels["connection"], message, "idle")
+        self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
+        self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
+        self.gnss_base_survey_start_button.setEnabled(False)
+        self.gnss_base_survey_stop_button.setEnabled(False)
+
+    def _handle_gnss_base_satellite_count(self, count: int, source: str) -> None:
+        level = "good" if count >= 12 else "warn" if count >= 6 else "bad"
+        self._set_health_label(
+            self.gnss_base_status_labels["base_satellites"],
+            f"{count} satellites | {source}",
+            level,
+        )
+
+    def _handle_gnss_base_command_sent(self, label: str, byte_count: int) -> None:
+        self._set_health_label(
+            self.gnss_base_status_labels["connection"],
+            f"connected | sent {label} ({byte_count} bytes)",
+            "good",
+        )
+
+    def _handle_gnss_base_survey_in(self, state: object) -> None:
+        if not isinstance(state, dict):
+            return
+        active = bool(state.get("active"))
+        valid = bool(state.get("valid"))
+        duration_s = int(state.get("duration_s") or 0)
+        accuracy_m = float(state.get("mean_accuracy_m") or 0.0)
+        observations = int(state.get("observations") or 0)
+        mean_x_m = float(state.get("mean_x_m") or 0.0)
+        mean_y_m = float(state.get("mean_y_m") or 0.0)
+        mean_z_m = float(state.get("mean_z_m") or 0.0)
+        status = "valid" if valid else "active" if active else "not running"
+        level = "good" if valid else "warn" if active else "idle"
+        text = (
+            f"{status} | duration={duration_s}s | acc={accuracy_m:.4f}m | obs={observations} | "
+            f"ECEF={mean_x_m:.3f}/{mean_y_m:.3f}/{mean_z_m:.3f}m"
+        )
+        self._set_health_label(self.gnss_base_status_labels["survey_in"], text, level)
+
+    def _clear_gnss_base_serial_worker(self, thread: QtCore.QThread) -> None:
+        if self.gnss_base_serial_thread is thread:
+            self.gnss_base_serial_thread = None
+            self.gnss_base_serial_worker = None
+            self.gnss_base_serial_connected = False
+            if hasattr(self, "gnss_base_connect_button"):
+                self.gnss_base_connect_button.setEnabled(True)
+            if hasattr(self, "gnss_base_disconnect_button"):
+                self.gnss_base_disconnect_button.setEnabled(False)
+            if hasattr(self, "gnss_base_survey_start_button"):
+                self.gnss_base_survey_start_button.setEnabled(False)
+            if hasattr(self, "gnss_base_survey_stop_button"):
+                self.gnss_base_survey_stop_button.setEnabled(False)
+        thread.deleteLater()
 
     def _refresh_alignment_magnetometer_ui(self) -> None:
         if not hasattr(self, "alignment_mag_labels"):
@@ -12617,6 +13363,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             measurement_display_mode=self._measurement_display_mode(),
             use_rtk_baseline=True,
             require_rtk_fixed=False,
+            gnss_base_serial_port=self.gnss_base_serial_port_edit.text().strip() or "/dev/ttyACM0",
+            gnss_base_baud=self.gnss_base_baud_spin.value(),
+            gnss_base_survey_in_min_duration_s=self.gnss_base_survey_duration_spin.value(),
+            gnss_base_survey_in_accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
+            gnss_base_rtcm_injection_target=str(self.gnss_base_rtcm_target_combo.currentData() or "disabled"),
             uam_telemetry_source=str(self.uam_source_combo.currentData() or "ros2"),
             uam_ros2_topic=self.uam_ros2_topic_edit.text().strip(),
             uam_ros2_x_field=self.uam_ros2_x_field_edit.text().strip(),
@@ -12871,6 +13622,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.rtsp_enable_thread is not None:
             self.rtsp_enable_thread.quit()
             self.rtsp_enable_thread.wait(1000)
+        if self.gnss_base_detect_thread is not None:
+            self.gnss_base_detect_thread.quit()
+            self.gnss_base_detect_thread.wait(1000)
+        self.disconnect_gnss_base_serial()
         self.stop_all()
         super().closeEvent(event)
 
@@ -14523,6 +15278,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_rtk_alignment_view()
         self._refresh_alignment_attitude_ui()
         self._refresh_alignment_overview()
+        self._refresh_gnss_base_tab()
         self._refresh_alignment_validation()
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
@@ -14582,6 +15338,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
         self._refresh_rtk_baseline()
         self._refresh_baseline_alignment_ui()
+        self._refresh_gnss_base_tab()
         self._append_baseline_sample_if_active()
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
@@ -14737,6 +15494,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_pixhawk_sensor_health()
         self._refresh_alignment_workflow_status()
         self._refresh_baseline_alignment_ui()
+        self._refresh_gnss_base_tab()
         self._refresh_f9p_compare_label(camera)
 
     def _refresh_f9p_compare_label(self, camera: str) -> None:

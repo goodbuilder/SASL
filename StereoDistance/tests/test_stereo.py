@@ -1,3 +1,4 @@
+import struct
 import time
 from pathlib import Path
 
@@ -49,6 +50,121 @@ def process_events_until(app, predicate, *, timeout_s: float = 2.0) -> bool:
         time.sleep(0.01)
     app.processEvents()
     return bool(predicate())
+
+
+def test_ubx_nav_svin_parser_extracts_survey_in_state() -> None:
+    import wiris_stereo_distance.gui as gui
+
+    payload = struct.pack(
+        "<B3sLLlllbbbBLLBBH",
+        0,
+        b"\x00\x00\x00",
+        123000,
+        321,
+        1000,
+        -2000,
+        3000,
+        1,
+        -2,
+        3,
+        0,
+        1234,
+        456,
+        1,
+        0,
+        0,
+    )
+    parser = gui.UbxStreamParser()
+
+    messages = parser.feed(b"noise" + gui.ubx_frame(0x01, 0x3B, payload))
+
+    assert len(messages) == 1
+    message_class, message_id, parsed_payload = messages[0]
+    assert (message_class, message_id) == (0x01, 0x3B)
+    state = gui.parse_ubx_nav_svin(parsed_payload)
+    assert state is not None
+    assert state["duration_s"] == 321
+    assert state["valid"] is True
+    assert state["active"] is False
+    assert state["observations"] == 456
+    assert state["mean_accuracy_m"] == pytest.approx(0.1234)
+    assert state["mean_x_m"] == pytest.approx(10.0001)
+    assert state["mean_y_m"] == pytest.approx(-20.0002)
+    assert state["mean_z_m"] == pytest.approx(30.0003)
+
+
+def test_ubx_cfg_tmode3_frames_encode_survey_in_and_disabled_modes() -> None:
+    import wiris_stereo_distance.gui as gui
+
+    parser = gui.UbxStreamParser()
+    messages = parser.feed(gui.ubx_cfg_tmode3_survey_in_frame(min_duration_s=600, accuracy_m=0.25))
+
+    assert len(messages) == 1
+    message_class, message_id, payload = messages[0]
+    assert (message_class, message_id) == (0x06, 0x71)
+    version, _reserved0, flags = struct.unpack_from("<BBH", payload, 0)
+    assert version == 0
+    assert flags == 1
+    assert struct.unpack_from("<I", payload, 24)[0] == 600
+    assert struct.unpack_from("<I", payload, 28)[0] == 2500
+
+    disabled_messages = parser.feed(gui.ubx_cfg_tmode3_disabled_frame())
+    assert len(disabled_messages) == 1
+    _message_class, _message_id, disabled_payload = disabled_messages[0]
+    assert struct.unpack_from("<H", disabled_payload, 2)[0] == 0
+
+
+def test_ubx_base_satellite_count_uses_nav_pvt_or_nav_sat() -> None:
+    import wiris_stereo_distance.gui as gui
+
+    nav_pvt_payload = bytearray(92)
+    nav_pvt_payload[23] = 17
+    nav_sat_payload = bytearray(8)
+    nav_sat_payload[5] = 19
+
+    assert gui.parse_ubx_base_satellite_count(0x01, 0x07, bytes(nav_pvt_payload)) == 17
+    assert gui.parse_ubx_base_satellite_count(0x01, 0x35, bytes(nav_sat_payload)) == 19
+    assert gui.parse_ubx_base_satellite_count(0x01, 0x3B, b"\x00" * 40) is None
+
+
+def test_nmea_gga_satellite_count_parser_reads_base_fallback() -> None:
+    import wiris_stereo_distance.gui as gui
+
+    line = "$GNGGA,005621.90,3658.07765,N,12752.45633,E,2,12,0.89,118.4,M,20.7,M,,0137*49"
+
+    assert gui.parse_nmea_gga_satellite_count(line) == (12, 2)
+    assert gui.parse_nmea_gga_satellite_count("$GNVTG,,T,,M,0.012,N,0.023,K,D*3A") is None
+    assert gui.parse_nmea_gga_satellite_count(line.replace("*49", "*00")) is None
+
+
+def test_gnss_base_candidate_rows_apply_selected_port(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget._set_gnss_base_candidate_rows(
+        [
+            {
+                "port": "/dev/serial/by-id/usb-F9P",
+                "target": "/dev/ttyACM0",
+                "baud": 460800,
+                "status": "UBX detected",
+                "ubx": True,
+                "messages": "NAV-SVIN, NAV-PVT sats=17",
+            }
+        ]
+    )
+    widget.gnss_base_candidate_table.selectRow(0)
+    widget.apply_selected_gnss_base_candidate()
+
+    assert widget.gnss_base_serial_port_edit.text() == "/dev/serial/by-id/usb-F9P"
+    assert widget.gnss_base_baud_spin.value() == 460800
+    widget._save_current_settings = lambda: None
+    widget.close()
+    app.processEvents()
 
 
 def test_estimate_distance_from_bbox_centers() -> None:

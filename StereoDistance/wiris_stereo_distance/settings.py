@@ -15,7 +15,7 @@ DEFAULT_CLOCK_DOWNLOAD_DIR = "clock_captures"
 @dataclass(frozen=True)
 class AppSettings:
     intrinsics_path: str = DEFAULT_INTRINSICS_PATH
-    yolo_weights_path: str = "/home/moontaehyung/Capstone/models/Capstone.pt"
+    yolo_weights_path: str = "yolov8m.pt"
     interface_name: str = "enx588694fce07e"
     camera_host_address: str = "10.0.0.10/24"
     left_rtsp_url: str = "rtsp://10.0.0.231:8554/visible"
@@ -73,6 +73,11 @@ class AppSettings:
     measurement_display_mode: str = "detection"
     use_rtk_baseline: bool = True
     require_rtk_fixed: bool = False
+    gnss_base_serial_port: str = "/dev/ttyACM0"
+    gnss_base_baud: int = 460800
+    gnss_base_survey_in_min_duration_s: int = 300
+    gnss_base_survey_in_accuracy_m: float = 1.0
+    gnss_base_rtcm_injection_target: str = "both"
     uam_telemetry_source: str = "ros2"
     uam_ros2_topic: str = "/uav_0/fmu/out/vehicle_local_position"
     uam_ros2_x_field: str = "x"
@@ -190,6 +195,20 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         measurement_display_mode=str(payload.get("measurement_display_mode", AppSettings.measurement_display_mode)),
         use_rtk_baseline=bool(payload.get("use_rtk_baseline", True)),
         require_rtk_fixed=bool(payload.get("require_rtk_fixed", False)),
+        gnss_base_serial_port=str(payload.get("gnss_base_serial_port", AppSettings.gnss_base_serial_port)),
+        gnss_base_baud=int(payload.get("gnss_base_baud", AppSettings.gnss_base_baud)),
+        gnss_base_survey_in_min_duration_s=int(
+            payload.get(
+                "gnss_base_survey_in_min_duration_s",
+                AppSettings.gnss_base_survey_in_min_duration_s,
+            )
+        ),
+        gnss_base_survey_in_accuracy_m=float(
+            payload.get("gnss_base_survey_in_accuracy_m", AppSettings.gnss_base_survey_in_accuracy_m)
+        ),
+        gnss_base_rtcm_injection_target=str(
+            payload.get("gnss_base_rtcm_injection_target", AppSettings.gnss_base_rtcm_injection_target)
+        ),
         uam_telemetry_source=str(payload.get("uam_telemetry_source", AppSettings.uam_telemetry_source)),
         uam_ros2_topic=str(payload.get("uam_ros2_topic", AppSettings.uam_ros2_topic)),
         uam_ros2_x_field=str(payload.get("uam_ros2_x_field", AppSettings.uam_ros2_x_field)),
