@@ -16,8 +16,8 @@ for ros_path in (
             sys.path.insert(0, path_text)
 
 for workspace in (
-    SASL_ROOT / "px4_msgs_ws",
     SASL_ROOT / "workspace" / "main",
+    SASL_ROOT / "px4_msgs_ws",
     Path.home() / "px4_msgs_ws",
 ):
     install_dir = workspace / "install"
@@ -31,8 +31,8 @@ for workspace in (
 library_paths = [
     Path("/opt/ros/humble/lib"),
     *(workspace / "install" / "px4_msgs" / "lib" for workspace in (
-        SASL_ROOT / "px4_msgs_ws",
         SASL_ROOT / "workspace" / "main",
+        SASL_ROOT / "px4_msgs_ws",
         Path.home() / "px4_msgs_ws",
     )),
 ]

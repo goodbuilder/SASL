@@ -11,8 +11,8 @@ export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 PX4_WORKSPACE_SETUP="${PX4_WORKSPACE_SETUP:-}"
 if [[ -z "$PX4_WORKSPACE_SETUP" ]]; then
   for candidate in \
-    "$SASL_ROOT/px4_msgs_ws/install/setup.bash" \
     "$SASL_ROOT/workspace/main/install/setup.bash" \
+    "$SASL_ROOT/px4_msgs_ws/install/setup.bash" \
     "$HOME/px4_msgs_ws/install/setup.bash"; do
     if [[ -f "$candidate" ]]; then
       PX4_WORKSPACE_SETUP="$candidate"
