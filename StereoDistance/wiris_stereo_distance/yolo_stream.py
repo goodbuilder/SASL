@@ -7,6 +7,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -17,8 +18,9 @@ from typing import Any, Callable
 from PyQt5 import QtCore, QtGui
 
 
-DEFAULT_YOLO_PYTHON = "/home/moontaehyung/Capstone/.venv/bin/python"
-DEFAULT_YOLO_WEIGHTS = "/home/moontaehyung/Capstone/models/Capstone.pt"
+SASL_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_YOLO_PYTHON = os.environ.get("PYTHON_BIN") or sys.executable
+DEFAULT_YOLO_WEIGHTS = os.environ.get("YOLO_MODEL_PATH") or str(SASL_ROOT / "models" / "sasl_uav.pt")
 DEFAULT_RTSP_LATENCY_MS = 50
 DEFAULT_PREVIEW_DISPLAY_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_MAX_RATE_HZ = 20.0

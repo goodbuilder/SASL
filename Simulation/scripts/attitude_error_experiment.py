@@ -104,7 +104,7 @@ def parse_args():
     parser.add_argument("--yolo-device", default="cuda:0")
     parser.add_argument("--yolo-target-hz", type=float, default=40.0)
     parser.add_argument("--yolo-imgsz", type=int, default=1280)
-    parser.add_argument("--yolo-python", default="/home/moontaehyung/Capstone/.venv/bin/python")
+    parser.add_argument("--yolo-python", default=sys.executable)
     parser.add_argument("--baseline-m", type=float, default=25.0)
     parser.add_argument("--camera-height-m", type=float, default=5.0)
     parser.add_argument("--horizontal-fov-rad", type=float, default=0.154997710698)

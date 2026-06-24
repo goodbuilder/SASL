@@ -206,7 +206,6 @@ if [[ -z "$PX4_DIR" ]]; then
   PX4_DIR="$(resolve_existing_dir \
     "$ROOT_DIR/../PX4-Autopilot" \
     "$HOME/PX4-Autopilot" \
-    "$HOME/Capstone/source/PX4-Autopilot" \
     "$HOME/source/PX4-Autopilot" || true
   )"
 fi

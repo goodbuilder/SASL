@@ -1,0 +1,144 @@
+diff --git a/src/modules/uxrce_dds_client/dds_topics.h.em b/src/modules/uxrce_dds_client/dds_topics.h.em
+index 763cbb2990..1749c33503 100644
+--- a/src/modules/uxrce_dds_client/dds_topics.h.em
++++ b/src/modules/uxrce_dds_client/dds_topics.h.em
+@@ -74,7 +74,7 @@ struct SendSubscription {
+ struct SendTopicsSubs {
+ 	SendSubscription send_subscriptions[@(len(publications))] = {
+ @[    for pub in publications]@
+-			{ ORB_ID(@(pub['topic_simple'])),
++			{ ORB_ID(@(pub['uorb_topic_simple'])),
+ 			  uxr_object_id(0, UXR_INVALID_ID),
+ 			  "@(pub['dds_type'])",
+ 			  "@(pub['topic'])",
+@@ -82,7 +82,7 @@ struct SendTopicsSubs {
+ 			  ucdr_topic_size_@(pub['simple_base_type'])(),
+ 			  &ucdr_serialize_@(pub['simple_base_type']),
+ 			  static_cast<uint64_t>((@(pub.get('rate_limit', 0)) > 0) ? (1e3 / @(pub.get('rate_limit', 1e3))) : UXRCE_DEFAULT_POLL_INTERVAL_MS),
+-			  @(pub['instance'])
++			  @(pub['uorb_instance'])
+ 			},
+ @[    end for]@
+ 	};
+diff --git a/src/modules/uxrce_dds_client/dds_topics.yaml b/src/modules/uxrce_dds_client/dds_topics.yaml
+index 56e5b36b6f..2d389549d3 100644
+--- a/src/modules/uxrce_dds_client/dds_topics.yaml
++++ b/src/modules/uxrce_dds_client/dds_topics.yaml
+@@ -46,13 +46,14 @@ publications:
+   - topic: /fmu/out/sensor_combined
+     type: px4_msgs::msg::SensorCombined
+ 
++  - topic: /fmu/out/distance_sensor
++    type: px4_msgs::msg::DistanceSensor
++    rate_limit: 50.
++
+   - topic: /fmu/out/timesync_status
+     type: px4_msgs::msg::TimesyncStatus
+     rate_limit: 10.
+ 
+-  - topic: /fmu/out/transponder_report
+-    type: px4_msgs::msg::TransponderReport
+-
+   # - topic: /fmu/out/vehicle_angular_velocity
+   #   type: px4_msgs::msg::VehicleAngularVelocity
+ 
+@@ -79,6 +80,36 @@ publications:
+     type: px4_msgs::msg::SensorGps
+     rate_limit: 50.
+ 
++  - topic: /fmu/out/sensor_mag_0
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 0
++    rate_limit: 50.
++
++  - topic: /fmu/out/sensor_mag_1
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 1
++    rate_limit: 50.
++
++  - topic: /fmu/out/sensor_mag_2
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 2
++    rate_limit: 50.
++
++  - topic: /fmu/out/sensor_mag_3
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 3
++    rate_limit: 50.
++
++  - topic: /fmu/out/sensor_mag_4
++    type: px4_msgs::msg::SensorMag
++    uorb_topic: sensor_mag
++    uorb_instance: 4
++    rate_limit: 50.
++
+   - topic: /fmu/out/vehicle_local_position
+     type: px4_msgs::msg::VehicleLocalPosition
+     rate_limit: 50.
+@@ -91,24 +122,25 @@ publications:
+     type: px4_msgs::msg::VehicleStatus
+     rate_limit: 5.
+ 
+-  - topic: /fmu/out/airspeed_validated
+-    type: px4_msgs::msg::AirspeedValidated
+-    rate_limit: 50.
+-
+-  - topic: /fmu/out/vtol_vehicle_status
+-    type: px4_msgs::msg::VtolVehicleStatus
+-
+   - topic: /fmu/out/home_position
+     type: px4_msgs::msg::HomePosition
+     rate_limit: 5.
+ 
+-  - topic: /fmu/out/wind
+-    type: px4_msgs::msg::Wind
+-    rate_limit: 1.
++  - topic: /fmu/out/sensor_gps_0
++    type: px4_msgs::msg::SensorGps
++    uorb_topic: sensor_gps
++    uorb_instance: 0
++    rate_limit: 50.
++
++  - topic: /fmu/out/sensor_gps_1
++    type: px4_msgs::msg::SensorGps
++    uorb_topic: sensor_gps
++    uorb_instance: 1
++    rate_limit: 50.
+ 
+-  - topic: /fmu/out/gimbal_device_attitude_status
+-    type: px4_msgs::msg::GimbalDeviceAttitudeStatus
+-    rate_limit: 20.
++  - topic: /fmu/out/vehicle_magnetometer
++    type: px4_msgs::msg::VehicleMagnetometer
++    rate_limit: 50.
+ 
+ # Create uORB::Publication
+ subscriptions:
+diff --git a/src/modules/uxrce_dds_client/generate_dds_topics.py b/src/modules/uxrce_dds_client/generate_dds_topics.py
+index 23ecd6213d..c0a9cd2b60 100644
+--- a/src/modules/uxrce_dds_client/generate_dds_topics.py
++++ b/src/modules/uxrce_dds_client/generate_dds_topics.py
+@@ -101,6 +101,7 @@ def process_message_type(msg_type):
+     msg_type['dds_type'] = msg_type['type'].replace("::msg::", "::msg::dds_::") + "_"
+     # topic_simple: eg vehicle_status
+     msg_type['topic_simple'] = msg_type['topic'].split('/')[-1]
++    msg_type['uorb_topic_simple'] = msg_type.get('uorb_topic', msg_type['topic_simple'])
+ 
+ def process_message_instance(msg_type):
+     if 'instance' in msg_type:
+@@ -112,6 +113,11 @@ def process_message_instance(msg_type):
+     else:
+         # if instance is not given,
+         msg_type['instance'] = 0
++    if 'uorb_instance' in msg_type:
++        if not (type(msg_type['uorb_instance']) is int and msg_type['uorb_instance'] >= 0) :
++            raise TypeError("`uorb_instance` must be a non negative integer")
++    else:
++        msg_type['uorb_instance'] = msg_type['instance']
+ 
+ merged_em_globals['namespace'] = namespace
+ 

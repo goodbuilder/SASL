@@ -87,10 +87,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--yolo-device", default="cuda:0")
     parser.add_argument("--yolo-target-hz", type=float, default=40.0)
     parser.add_argument("--yolo-imgsz", type=int, default=1280)
-    parser.add_argument("--yolo-python", default="/home/moontaehyung/Capstone/.venv/bin/python")
+    parser.add_argument("--yolo-python", default=sys.executable)
     parser.add_argument(
         "--yolo-pythonpath",
-        default="/home/moontaehyung/Capstone/.venv/lib/python3.10/site-packages",
+        default="",
     )
     parser.add_argument("--target-model-name", default="x500_15m")
     parser.add_argument("--target-yaw-deg", type=float, default=-90.0)

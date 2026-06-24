@@ -2,7 +2,15 @@
 
 This directory stores reproducible firmware work for the SASL Pixhawk setup.
 Do not commit a full `PX4-Autopilot` checkout here. Keep the checkout local and
-commit only patches, notes, and small scripts.
+commit only patches, notes, small scripts, and selected flashable `.px4`
+artifacts that need to be shared with the SASL project.
+
+Tracked flashable artifacts:
+
+- `firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`
+  - FMU v6X custom PX4 v1.17-alpha build with SASL GPS/MAG DDS export patches.
+  - SHA256:
+    `63410eca73fc864770afee773e6e41bd6b7787fd802a3df1f7ff73720b699ea8`
 
 ## PX4 1.16 GPS2/MAG DDS Patch
 
@@ -160,3 +168,111 @@ primary IDs and maps them to alignment `CAN1`; `8944387` maps to `CAN2`.
 fields are meters. `sensor_mag_*` uses PX4 `SensorMag` raw sensor axes and
 `device_id`; the patch does not transform axes or convert frames. It only
 exports existing PX4 uORB instances through DDS.
+
+## PX4 v1.17 GPS2/MAG DDS Patch
+
+Patch:
+
+```sh
+firmware/patches/px4-v1.17-uxrce-sensor-gps-mag-instances.patch
+```
+
+This is the v1.17-alpha/local-main equivalent of the 1.16 GPS2/MAG DDS
+export patch. PX4 v1.17 already carries an `instance` path in the uXRCE-DDS
+generator, but StereoDistance needs stable DDS names such as
+`/fmu/out/sensor_gps_0` while subscribing to the underlying `sensor_gps`
+uORB instance. The patch adds `uorb_topic` and `uorb_instance` aliases so DDS
+topic names and uORB source names can differ.
+
+Apply from any local PX4-Autopilot checkout:
+
+```sh
+cd /path/to/PX4-Autopilot
+git apply /path/to/SASL/firmware/patches/px4-v1.17-uxrce-sensor-gps-mag-instances.patch
+```
+
+Build and flash:
+
+```sh
+make px4_fmu-v6x_default
+make px4_fmu-v6x_default upload
+```
+
+Or flash the tracked custom artifact through QGroundControl's custom firmware
+file flow:
+
+```text
+firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4
+```
+
+Expected build check:
+
+```sh
+strings build/px4_fmu-v6x_default/px4_fmu-v6x_default.elf \
+  | rg '/fmu/out/(sensor_gps|sensor_mag|vehicle_magnetometer)'
+```
+
+Expected entries include `sensor_gps_0`, `sensor_gps_1`,
+`sensor_mag_0` through `sensor_mag_4`, and `vehicle_magnetometer`.
+
+## 2026-06-24 Hardware Finding - Pixhawk 1 v1.17 Patch
+
+The USB-connected FMU v6X was flashed from:
+
+- PX4 checkout: local PX4-Autopilot checkout previously stored under
+  `/home/moontaehyung/Capstone/source/PX4-Autopilot`
+- PX4 git describe: `v1.17.0-alpha1-1214-g7b1e54889d-dirty`
+- Firmware artifact:
+  `firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`
+- Build timestamp: `2026-06-24 06:10:22 KST`
+- USB serial reported by uploader: `002100263433510636363338`
+
+Build evidence:
+
+- `strings build/px4_fmu-v6x_default/px4_fmu-v6x_default.elf | rg '/fmu/out/(sensor_gps|sensor_mag|vehicle_magnetometer)'`
+  showed `/fmu/out/sensor_gps_0`, `/fmu/out/sensor_gps_1`,
+  `/fmu/out/sensor_mag_0..4`, and `/fmu/out/vehicle_magnetometer`.
+
+Runtime evidence after upload:
+
+- `/uav_0/fmu/out/sensor_gps_0`
+- `/uav_0/fmu/out/sensor_gps_1`
+- `/uav_0/fmu/out/sensor_mag_0`
+- `/uav_0/fmu/out/sensor_mag_1`
+- `/uav_0/fmu/out/sensor_mag_2`
+- `/uav_0/fmu/out/sensor_mag_3`
+- `/uav_0/fmu/out/sensor_mag_4`
+- `/uav_0/fmu/out/vehicle_magnetometer`
+
+At that checkpoint `/uav_1` still showed only `vehicle_attitude`, so Pixhawk 2
+still needed the same firmware upload.
+
+## 2026-06-24 Hardware Finding - Pixhawk 2 v1.17 Patch
+
+The USB-connected Pixhawk 2 did not enter bootloader through the normal
+`make ... upload` reboot loop. It was reachable as MAVLink system `2`, so it
+was put into bootloader with `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` parameter 1
+set to `3`, then flashed directly with `Tools/px4_uploader.py`.
+
+- USB serial reported by uploader: `0049002b3433510336363338`
+- Firmware artifact:
+  `firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`
+- Upload result: complete, 100% verified
+
+Runtime evidence after upload:
+
+- `/uav_1/fmu/out/sensor_gps_0`
+- `/uav_1/fmu/out/sensor_gps_1`
+- `/uav_1/fmu/out/sensor_mag_0`
+- `/uav_1/fmu/out/sensor_mag_1`
+- `/uav_1/fmu/out/sensor_mag_2`
+- `/uav_1/fmu/out/sensor_mag_3`
+- `/uav_1/fmu/out/sensor_mag_4`
+- `/uav_1/fmu/out/vehicle_magnetometer`
+
+Sample checks:
+
+- `/uav_1/fmu/out/sensor_gps_1`: `device_id=11141181`, `fix_type=0`
+  at the indoor/no-fix checkpoint.
+- `/uav_1/fmu/out/sensor_mag_4`: `device_id=8944395`, raw vector
+  `x=-0.99267578125`, `y=-1.3486328125`, `z=-0.70849609375`.
