@@ -22,7 +22,6 @@ SASL_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_YOLO_PYTHON = os.environ.get("PYTHON_BIN") or sys.executable
 DEFAULT_YOLO_WEIGHTS = os.environ.get("YOLO_MODEL_PATH") or str(SASL_ROOT / "models" / "sasl_uav.pt")
 DEFAULT_RTSP_LATENCY_MS = 50
-DEFAULT_PREVIEW_DISPLAY_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_MAX_RATE_HZ = 20.0
 DEFAULT_CPU_YOLO_INITIAL_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ = 20.0
@@ -35,6 +34,8 @@ CPU_DECODE_HZ_RECOVERY = 16.0
 CPU_DECODE_HZ_STRONG_RECOVERY = 18.0
 DEFAULT_CPU_WORKER_THREADS = 4
 DEFAULT_CUDA_WORKER_THREADS = 1
+DEFAULT_EVENT_QUEUE_SIZE = 128
+DEFAULT_FRAME_QUEUE_SIZE = 2
 YOLO_INPUT_SIZE_STRIDE = 32
 DECODER_AUTO = "auto"
 DECODER_NVIDIA = "nvidia"
@@ -1149,6 +1150,10 @@ def _process_frame_for_output(
                     device=predict_device or None,
                     verbose=False,
                 )[0]
+                active_device = (predict_device or "auto").strip() or "auto"
+                requested_device = str(config.get("_requested_yolo_device") or configured_device or "").strip().lower()
+                config["_active_yolo_device"] = active_device
+                config["_yolo_cpu_fallback_active"] = active_device.lower() == "cpu" and requested_device not in {"", "cpu"}
                 if attempt_index > 0:
                     config["device"] = "cpu"
                     config["_cpu_fallback_attempted"] = True
@@ -1157,6 +1162,7 @@ def _process_frame_for_output(
             except Exception as exc:
                 if attempt_index + 1 < len(predict_devices):
                     config["_cpu_fallback_attempted"] = True
+                    config["_yolo_cpu_fallback_active"] = False
                     _emit_status(output_queue, f"추론 오류({exc}); CPU로 재시도합니다.")
                     continue
                 last_error_s = float(config.get("_last_inference_error_s", 0.0) or 0.0)
@@ -1280,6 +1286,13 @@ def _emit_stream_status(output_queue, enable_detection: bool, best_detection, no
     return now_s
 
 
+def _yolo_device_stats(config: dict[str, Any]) -> tuple[str, str, bool]:
+    requested_device = str(config.get("_requested_yolo_device") or config.get("device") or "").strip()
+    active_device = str(config.get("_active_yolo_device") or "").strip()
+    cpu_fallback = bool(config.get("_yolo_cpu_fallback_active", False))
+    return requested_device, active_device, cpu_fallback
+
+
 def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
     try:
         import gi
@@ -1320,9 +1333,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         return
 
     rate_limiter = AdaptiveYoloRateLimiter.from_config(config, enable_detection=enable_detection)
-    display_interval_s = 0.0 if config["display_rate_hz"] <= 0.0 else 1.0 / config["display_rate_hz"]
     next_frame_s = 0.0
-    next_display_s = 0.0
     last_status_s = 0.0
     last_stats_s = time.monotonic()
     displayed_frames = 0
@@ -1335,7 +1346,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
     latest_height = 0
     reader_stop = threading.Event()
     def reader_loop() -> None:
-        nonlocal decoded_frames, latest_frame, latest_height, latest_sequence, latest_width
+        nonlocal decoded_frames, displayed_frames, latest_frame, latest_height, latest_sequence, latest_width
         while not stop_event.is_set() and not reader_stop.is_set():
             sample = sink.emit("try-pull-sample", 200_000_000)
             if sample is None:
@@ -1354,9 +1365,20 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((height, width, 3)).copy()
             finally:
                 buffer.unmap(map_info)
+            _emit_preview_frame(
+                cv2,
+                frame,
+                config,
+                output_queue,
+                timestamp_s=receive_s,
+                source_timestamp_s=source_timestamp_s,
+                timestamp_source="gstreamer-pts",
+                extra_metadata=rtp_timing_metadata,
+            )
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
+                displayed_frames += 1
                 latest_width = width
                 latest_height = height
                 latest_frame = {
@@ -1394,10 +1416,12 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 with latest_lock:
                     interval_decoded_frames = decoded_frames
                     decoded_frames = 0
+                    interval_displayed_frames = displayed_frames
+                    displayed_frames = 0
                     stats_width = latest_width
                     stats_height = latest_height
                 decoded_hz = interval_decoded_frames / elapsed_s
-                displayed_hz = displayed_frames / elapsed_s
+                displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
                 output_queue.put(
                     (
@@ -1408,10 +1432,10 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                         stats_width,
                         stats_height,
                         rate_limiter.target_rate_hz,
+                        *_yolo_device_stats(config),
                     )
                 )
                 rate_limiter.update(decoded_hz=decoded_hz, inferred_hz=inferred_hz)
-                displayed_frames = 0
                 inferred_frames = 0
                 last_stats_s = now_s
             with latest_lock:
@@ -1426,10 +1450,8 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             if sequence == last_processed_sequence:
                 time.sleep(0.005)
                 continue
-            if not enable_detection and now_s < next_display_s:
-                last_processed_sequence = sequence
-                continue
             if now_s < next_frame_s:
+                last_processed_sequence = sequence
                 time.sleep(min(0.02, max(0.0, next_frame_s - now_s)))
                 continue
             last_processed_sequence = sequence
@@ -1438,7 +1460,6 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             frame = frame_record["frame"]
             source_timestamp_s = frame_record["source_timestamp_s"]
             rtp_timing_metadata = dict(frame_record["rtp_timing_metadata"])
-            should_emit_preview = now_s >= next_display_s
             detection_timestamp_metadata = {
                 "timestamp_s": float(frame_record["timestamp_s"]),
                 "source_timestamp_s": None if source_timestamp_s is None else float(source_timestamp_s),
@@ -1461,7 +1482,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 output_queue=output_queue,
                 now_s=float(frame_record["timestamp_s"]),
                 enable_detection=enable_detection,
-                draw_preview_overlay=should_emit_preview,
+                draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
             )
             if annotated is None:
@@ -1471,19 +1492,6 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
 
-            if should_emit_preview:
-                next_display_s = now_s + display_interval_s
-                _emit_preview_frame(
-                    cv2,
-                    annotated,
-                    config,
-                    output_queue,
-                    timestamp_s=float(frame_record["timestamp_s"]),
-                    source_timestamp_s=source_timestamp_s,
-                    timestamp_source="gstreamer-pts",
-                    extra_metadata=rtp_timing_metadata,
-                )
-                displayed_frames += 1
     finally:
         reader_stop.set()
         pipeline.set_state(Gst.State.NULL)
@@ -1509,9 +1517,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
         return
 
     rate_limiter = AdaptiveYoloRateLimiter.from_config(config, enable_detection=enable_detection)
-    display_interval_s = 0.0 if config["display_rate_hz"] <= 0.0 else 1.0 / config["display_rate_hz"]
     next_frame_s = 0.0
-    next_display_s = 0.0
     last_status_s = 0.0
     last_stats_s = time.monotonic()
     displayed_frames = 0
@@ -1526,7 +1532,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
     record_writer_state = None
 
     def reader_loop() -> None:
-        nonlocal decoded_frames, height, latest_frame, latest_sequence, record_writer_state, width
+        nonlocal decoded_frames, displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
         while not stop_event.is_set() and not reader_stop.is_set():
             ok, frame = cap.read()
             receive_s = time.monotonic()
@@ -1538,9 +1544,18 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 if record_writer_state is None:
                     record_writer_state = _open_record_video_writer(cv2, config, output_queue, frame_width, frame_height)
                 _write_record_video_frame(cv2, record_writer_state, frame)
+            _emit_preview_frame(
+                cv2,
+                frame,
+                config,
+                output_queue,
+                timestamp_s=receive_s,
+                timestamp_source=f"{backend}-read",
+            )
             with latest_lock:
                 latest_sequence += 1
                 decoded_frames += 1
+                displayed_frames += 1
                 width = frame_width
                 height = frame_height
                 latest_frame = {
@@ -1563,10 +1578,12 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 with latest_lock:
                     interval_decoded_frames = decoded_frames
                     decoded_frames = 0
+                    interval_displayed_frames = displayed_frames
+                    displayed_frames = 0
                     stats_width = width
                     stats_height = height
                 decoded_hz = interval_decoded_frames / elapsed_s
-                displayed_hz = displayed_frames / elapsed_s
+                displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
                 output_queue.put(
                     (
@@ -1577,10 +1594,10 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                         stats_width,
                         stats_height,
                         rate_limiter.target_rate_hz,
+                        *_yolo_device_stats(config),
                     )
                 )
                 rate_limiter.update(decoded_hz=decoded_hz, inferred_hz=inferred_hz)
-                displayed_frames = 0
                 inferred_frames = 0
                 last_stats_s = now_s
             with latest_lock:
@@ -1595,17 +1612,14 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
             if sequence == last_processed_sequence:
                 time.sleep(0.005)
                 continue
-            if not enable_detection and now_s < next_display_s:
-                last_processed_sequence = sequence
-                continue
             if now_s < next_frame_s:
+                last_processed_sequence = sequence
                 time.sleep(min(0.02, max(0.0, next_frame_s - now_s)))
                 continue
             last_processed_sequence = sequence
             next_frame_s = now_s + rate_limiter.interval_s
 
             frame = frame_record["frame"]
-            should_emit_preview = now_s >= next_display_s
             detection_timestamp_metadata = {
                 "timestamp_s": float(frame_record["timestamp_s"]),
                 "source_timestamp_s": None,
@@ -1620,7 +1634,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 output_queue=output_queue,
                 now_s=float(frame_record["timestamp_s"]),
                 enable_detection=enable_detection,
-                draw_preview_overlay=should_emit_preview,
+                draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
             )
             if annotated is None:
@@ -1630,17 +1644,6 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
 
-            if should_emit_preview:
-                next_display_s = now_s + display_interval_s
-                _emit_preview_frame(
-                    cv2,
-                    annotated,
-                    config,
-                    output_queue,
-                    timestamp_s=float(frame_record["timestamp_s"]),
-                    timestamp_source=f"{backend}-read",
-                )
-                displayed_frames += 1
     finally:
         reader_stop.set()
         reader.join(timeout=1.0)
@@ -1677,9 +1680,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
         return
 
     rate_limiter = AdaptiveYoloRateLimiter.from_config(config, enable_detection=enable_detection)
-    display_interval_s = 0.0 if config["display_rate_hz"] <= 0.0 else 1.0 / config["display_rate_hz"]
     next_frame_s = 0.0
-    next_display_s = 0.0
     last_status_s = 0.0
     last_stats_s = time.monotonic()
     displayed_frames = 0
@@ -1694,7 +1695,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
     record_writer_state = None
 
     def reader_loop() -> None:
-        nonlocal decoded_frames, height, latest_frame, latest_sequence, record_writer_state, width
+        nonlocal decoded_frames, displayed_frames, height, latest_frame, latest_sequence, record_writer_state, width
         try:
             for packet in container.demux(video_stream):
                 if stop_event.is_set() or reader_stop.is_set():
@@ -1722,9 +1723,19 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                         source_timestamp_s = float(av_frame.pts * av_frame.time_base)
                         timestamp_source = "pyav-pts"
                         timestamp_reference = "source"
+                    _emit_preview_frame(
+                        cv2,
+                        frame,
+                        config,
+                        output_queue,
+                        timestamp_s=receive_s,
+                        source_timestamp_s=source_timestamp_s,
+                        timestamp_source=timestamp_source,
+                    )
                     with latest_lock:
                         latest_sequence += 1
                         decoded_frames += 1
+                        displayed_frames += 1
                         width = frame_width
                         height = frame_height
                         latest_frame = {
@@ -1753,10 +1764,12 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 with latest_lock:
                     interval_decoded_frames = decoded_frames
                     decoded_frames = 0
+                    interval_displayed_frames = displayed_frames
+                    displayed_frames = 0
                     stats_width = width
                     stats_height = height
                 decoded_hz = interval_decoded_frames / elapsed_s
-                displayed_hz = displayed_frames / elapsed_s
+                displayed_hz = interval_displayed_frames / elapsed_s
                 inferred_hz = inferred_frames / elapsed_s
                 output_queue.put(
                     (
@@ -1767,10 +1780,10 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                         stats_width,
                         stats_height,
                         rate_limiter.target_rate_hz,
+                        *_yolo_device_stats(config),
                     )
                 )
                 rate_limiter.update(decoded_hz=decoded_hz, inferred_hz=inferred_hz)
-                displayed_frames = 0
                 inferred_frames = 0
                 last_stats_s = now_s
             with latest_lock:
@@ -1785,17 +1798,14 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
             if sequence == last_processed_sequence:
                 time.sleep(0.005)
                 continue
-            if not enable_detection and now_s < next_display_s:
-                last_processed_sequence = sequence
-                continue
             if now_s < next_frame_s:
+                last_processed_sequence = sequence
                 time.sleep(min(0.02, max(0.0, next_frame_s - now_s)))
                 continue
             last_processed_sequence = sequence
             next_frame_s = now_s + rate_limiter.interval_s
 
             frame = frame_record["frame"]
-            should_emit_preview = now_s >= next_display_s
             detection_timestamp_metadata = {
                 "timestamp_s": float(frame_record["timestamp_s"]),
                 "source_timestamp_s": frame_record["source_timestamp_s"],
@@ -1810,7 +1820,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 output_queue=output_queue,
                 now_s=float(frame_record["timestamp_s"]),
                 enable_detection=enable_detection,
-                draw_preview_overlay=should_emit_preview,
+                draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
             )
             if annotated is None:
@@ -1820,18 +1830,6 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 inferred_frames += 1
             last_status_s = _emit_stream_status(output_queue, enable_detection, best_detection, now_s, last_status_s)
 
-            if should_emit_preview:
-                next_display_s = now_s + display_interval_s
-                _emit_preview_frame(
-                    cv2,
-                    annotated,
-                    config,
-                    output_queue,
-                    timestamp_s=float(frame_record["timestamp_s"]),
-                    source_timestamp_s=frame_record["source_timestamp_s"],
-                    timestamp_source=str(frame_record["timestamp_source"]),
-                )
-                displayed_frames += 1
     finally:
         reader_stop.set()
         reader.join(timeout=1.0)
@@ -1880,14 +1878,39 @@ def _run_yolo_process(config: dict[str, Any], output_queue, stop_event) -> None:
 
 
 class _BoundedProcessOutputQueue:
-    def __init__(self, output_queue) -> None:
-        self.output_queue = output_queue
+    def __init__(self, event_queue, frame_queue) -> None:
+        self.event_queue = event_queue
+        self.frame_queue = frame_queue
 
     def put(self, message) -> None:
-        try:
-            self.output_queue.put_nowait(message)
-        except queue.Full:
+        if message and message[0] == "frame":
+            try:
+                self.frame_queue.put_nowait(message)
+            except queue.Full:
+                return
             return
+        self.event_queue.put(message)
+
+
+def _queue_has_pending_messages(message_queue) -> bool:
+    if message_queue is None:
+        return False
+    try:
+        return not message_queue.empty()
+    except Exception:
+        return False
+
+
+def _get_queue_message(message_queue, *, timeout_s: float):
+    if message_queue is None:
+        raise queue.Empty
+    return message_queue.get(timeout=timeout_s)
+
+
+def _get_queue_message_nowait(message_queue):
+    if message_queue is None:
+        raise queue.Empty
+    return message_queue.get_nowait()
 
 
 class YoloStreamWorker(QtCore.QObject):
@@ -1908,7 +1931,7 @@ class YoloStreamWorker(QtCore.QObject):
         conf_threshold: float,
         iou_threshold: float,
         max_rate_hz: float,
-        display_rate_hz: float = DEFAULT_PREVIEW_DISPLAY_RATE_HZ,
+        display_rate_hz: float = 0.0,
         preview_max_width: int = 960,
         rtsp_latency_ms: int = DEFAULT_RTSP_LATENCY_MS,
         decoder: str = DECODER_NVIDIA,
@@ -1917,6 +1940,8 @@ class YoloStreamWorker(QtCore.QObject):
         enable_detection: bool = True,
         record_video_path: str = "",
         record_video_fps: float = 30.0,
+        event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE,
+        frame_queue_size: int = DEFAULT_FRAME_QUEUE_SIZE,
     ) -> None:
         super().__init__()
         effective_max_rate = effective_yolo_max_rate_hz(
@@ -1929,6 +1954,7 @@ class YoloStreamWorker(QtCore.QObject):
             "url": url,
             "weights_path": weights_path,
             "device": device,
+            "_requested_yolo_device": device,
             "input_size": normalize_yolo_input_size(input_size),
             "conf_threshold": conf_threshold,
             "iou_threshold": iou_threshold,
@@ -1946,10 +1972,13 @@ class YoloStreamWorker(QtCore.QObject):
             "worker_cpu_threads": _default_worker_cpu_threads(device),
             "record_video_path": str(record_video_path or ""),
             "record_video_fps": _record_video_fps({"record_video_fps": record_video_fps}),
+            "event_queue_size": max(1, int(event_queue_size)),
+            "frame_queue_size": max(1, int(frame_queue_size)),
         }
         self._mp_context = multiprocessing.get_context("spawn")
         self._stop_event = None
-        self._output_queue = None
+        self._event_queue = None
+        self._frame_queue = None
         self._process = None
         self._stop_requested = False
         self._finished = False
@@ -1960,10 +1989,11 @@ class YoloStreamWorker(QtCore.QObject):
         self.status_changed.emit(status)
         self._stop_requested = False
         self._stop_event = self._mp_context.Event()
-        self._output_queue = self._mp_context.Queue(maxsize=8)
+        self._event_queue = self._mp_context.Queue(maxsize=int(self.config["event_queue_size"]))
+        self._frame_queue = self._mp_context.Queue(maxsize=int(self.config["frame_queue_size"]))
         process = self._mp_context.Process(
             target=_run_yolo_process,
-            args=(self.config, _BoundedProcessOutputQueue(self._output_queue), self._stop_event),
+            args=(self.config, _BoundedProcessOutputQueue(self._event_queue, self._frame_queue), self._stop_event),
             daemon=True,
         )
         self._process = process
@@ -1999,24 +2029,26 @@ class YoloStreamWorker(QtCore.QObject):
             self._stop_event.set()
 
     def _queue_has_pending_messages(self) -> bool:
-        if self._output_queue is None:
-            return False
-        try:
-            return not self._output_queue.empty()
-        except Exception:
-            return False
+        return _queue_has_pending_messages(self._event_queue) or _queue_has_pending_messages(self._frame_queue)
 
     def _drain_output_queue(self, *, timeout_s: float) -> None:
-        if self._output_queue is None:
-            return
         try:
-            message = self._output_queue.get(timeout=timeout_s)
+            message = _get_queue_message(self._event_queue, timeout_s=0.0)
         except queue.Empty:
-            return
+            try:
+                message = _get_queue_message(self._frame_queue, timeout_s=timeout_s)
+            except queue.Empty:
+                return
         self._handle_worker_message(message)
         while True:
             try:
-                message = self._output_queue.get_nowait()
+                message = _get_queue_message_nowait(self._event_queue)
+            except queue.Empty:
+                break
+            self._handle_worker_message(message)
+        while True:
+            try:
+                message = _get_queue_message_nowait(self._frame_queue)
             except queue.Empty:
                 break
             self._handle_worker_message(message)
@@ -2032,7 +2064,8 @@ class YoloStreamWorker(QtCore.QObject):
                 process.join(timeout=1.0)
         self._process = None
         self._stop_event = None
-        self._output_queue = None
+        self._event_queue = None
+        self._frame_queue = None
 
     def _handle_worker_message(self, message) -> None:
         kind = message[0]
@@ -2094,11 +2127,30 @@ class YoloStreamWorker(QtCore.QObject):
             )
             return
         if kind == "stats":
-            if len(message) >= 7:
+            if len(message) >= 10:
+                (
+                    _kind,
+                    decoded_hz,
+                    displayed_hz,
+                    inferred_hz,
+                    width,
+                    height,
+                    target_rate_hz,
+                    requested_device,
+                    active_device,
+                    cpu_fallback,
+                ) = message
+            elif len(message) >= 7:
                 _kind, decoded_hz, displayed_hz, inferred_hz, width, height, target_rate_hz = message
+                requested_device = self.config.get("_requested_yolo_device", self.config["device"])
+                active_device = ""
+                cpu_fallback = False
             else:
                 _kind, decoded_hz, displayed_hz, inferred_hz, width, height = message
                 target_rate_hz = 0.0
+                requested_device = self.config.get("_requested_yolo_device", self.config["device"])
+                active_device = ""
+                cpu_fallback = False
             self.stats_ready.emit(
                 {
                     "decoded_hz": decoded_hz,
@@ -2111,6 +2163,9 @@ class YoloStreamWorker(QtCore.QObject):
                     "rtsp_transport": self.config["rtsp_transport"],
                     "enable_detection": self.config["enable_detection"],
                     "yolo_target_hz": target_rate_hz,
+                    "yolo_requested_device": requested_device,
+                    "yolo_actual_device": active_device,
+                    "yolo_cpu_fallback": cpu_fallback,
                 }
             )
 

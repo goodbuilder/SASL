@@ -41,8 +41,8 @@ StereoDistance는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데
    - 단순 disparity 값은 진단 지표로만 취급하고, 필요한 입력이 없을 때 임의의 거리값을 기록하지 않는다.
 
 5. 복구 가능한 현장 운용
-   - ROS2/uXRCE가 막히면 MAVLink로 Pixhawk 쪽 설정을 전달해 ROS2 복구를 시도한다.
-   - 복구 전까지는 MAVLink telemetry fallback으로 가능한 자세/GPS/MAG raw 값을 유지하되, 대체할 수 없는 ROS2 전용 정보는 제한 상태로 표시한다.
+   - Rover RTK 운용에서는 MAVLink heartbeat를 먼저 확인해 RTCM 주입, PX4 parameter, shell/재부팅, Ethernet MAVLink bootstrap 같은 제어 경로를 확보한다.
+   - ROS2/uXRCE는 자세/GPS/MAG/custom field를 구조화해 받는 고속 telemetry 경로로 유지하되, MAVLink 제어 채널이 없으면 Rover RTK 운용 준비 완료로 보지 않는다.
 
 6. 검증 가능한 저장
    - 측정 CSV, 외부 파라미터, MAG 상태, 영상 파일, 설정을 같은 세션 단위로 묶는다.
@@ -61,24 +61,26 @@ StereoDistance는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데
 
 - QGC를 대체하지 않는다. Pixhawk 보정과 최종 파라미터 저장은 QGC 또는 PX4 shell 흐름을 전제로 한다.
 - WIRIS 카메라 연결, RTSP 프레임 수신 확인, WIRIS SDK 명령, still image EXIF 시간 비교를 앱 안에서 다룬다.
-- Pixhawk는 ROS2/uXRCE와 MAVLink 경로를 모두 지원하며, 현장에서는 실제 publisher/sample, heartbeat, MAG device_id 수신 여부를 분리해서 확인한다.
-- ROS2 연결이 막히면 MAVLink를 복구 경로로 사용해 Pixhawk 쪽 MAVLink stream과 `uxrce_dds_client` 설정을 전송하고, ROS2 재시도 전까지 MAVLink telemetry fallback을 유지한다.
+- Pixhawk는 MAVLink와 ROS2/uXRCE 경로를 모두 지원한다. 현장에서는 Rover MAVLink heartbeat, ROS2 publisher/sample, MAG device_id 수신 여부를 분리해서 확인한다.
+- Rover RTK 운용의 우선 경로는 MAVLink다. Base RTCM은 Rover Pixhawk MAVLink `GPS_RTCM_DATA`로 주입하며, ROS2가 살아 있어도 MAVLink heartbeat가 없으면 RTCM 주입과 PX4 제어는 준비되지 않은 상태로 본다.
+- ROS2 연결이 막히면 MAVLink를 복구 경로로 사용해 Pixhawk 쪽 MAVLink stream과 `uxrce_dds_client` 설정을 전송한다. 반대로 ROS2는 MAVLink가 제공하지 못하는 namespace 기반 uORB telemetry와 custom field 확인을 보강한다.
 - UAM/드론 ground truth 텔레메트리는 `연결 > UAM`에서 별도로 연결한다. 정상 경로는 ROS2 `vehicle_local_position`이고, ROS2가 막히면 MAVLink `LOCAL_POSITION_NED` 또는 GPS/global-derived 위치 메시지를 실시간 fallback 버퍼로 유지한다.
 - 측정은 내부 파라미터, Pixhawk 자세, RTK/baseline, 좌/우 YOLO 검출 매칭이 준비됐을 때 3D ray triangulation 결과를 기록하는 것을 목표로 한다.
 - 하드웨어 연결 성공 여부는 자동 테스트만으로 증명할 수 없으므로, 진단 스크립트와 현장 smoke check를 함께 사용한다.
 
 ## Pixhawk 연결 의도
 
-Pixhawk 연결의 우선 의도는 ROS2/uXRCE 경로를 살리는 것이다. ROS2는 PX4 uORB 데이터를 namespace와 topic 기준으로 구조화해서 받을 수 있으므로, 정상 연결 상태에서는 자세, GPS, MAG, custom field 감시의 주 경로로 둔다.
+Pixhawk 연결의 우선 의도는 Rover MAVLink 제어 채널을 먼저 확보하는 것이다. MAVLink heartbeat가 있어야 Base RTCM을 Rover Pixhawk에 `GPS_RTCM_DATA`로 주입하고, PX4 parameter read/write, shell/진단, 재부팅, Ethernet MAVLink bootstrap 같은 복구 작업을 앱 안에서 수행할 수 있다. 따라서 Rover RTK 운용에서는 ROS2 topic sample이 들어오더라도 MAVLink heartbeat가 없으면 준비 완료로 보지 않는다.
 
-다만 현장에서는 ROS2 graph, MicroXRCEAgent, Pixhawk 쪽 `uxrce_dds_client`, Ethernet 설정 중 하나만 어긋나도 ROS2 sample이 들어오지 않을 수 있다. 이때 앱은 사용자가 수동으로 QGC나 PX4 shell을 오가며 복구하기 전에, 이미 연결 가능한 MAVLink를 사용해 Pixhawk에 필요한 설정값을 전달해야 한다.
+ROS2/uXRCE는 PX4 uORB 데이터를 namespace와 topic 기준으로 구조화해서 받는 telemetry 경로다. 자세, GPS, MAG, custom field 감시에는 중요하지만 RTCM 주입이나 PX4 제어 채널을 대체하지 않는다.
 
-따라서 ROS2 연결 실패 시 MAVLink는 두 역할을 가진다.
+따라서 MAVLink는 세 역할을 가진다.
 
-- 복구 경로: Pixhawk 쪽 MAVLink stream 설정과 MAVLink `PARAM_SET`/readback 기반 `UXRCE_DDS_*` 설정으로 ROS2가 다시 붙을 조건을 만든다. Shell은 고급/진단 기능이며, Shell이 응답하지 않는 장비에서는 `uxrce_dds_client` namespace/재시작은 PX4 재부팅 또는 별도 차량 설정에 의존한다.
-- 대체 경로: ROS2가 끝내 붙지 않아도 MAVLink `ATTITUDE`, GPS, GNSS relative, `SCALED_IMU*`로 가능한 자세/GPS/MAG raw telemetry를 계속 받아 정렬과 측정 입력을 최대한 유지한다.
+- RTCM 주입 경로: GNSS Base serial에서 분리한 RTCM3 frame을 선택한 Rover Pixhawk MAVLink 연결에 `GPS_RTCM_DATA`로 보낸다.
+- 복구/제어 경로: Pixhawk 쪽 MAVLink stream 설정, MAVLink `PARAM_SET`/readback 기반 `UXRCE_DDS_*` 설정, PX4 shell, 재부팅, USB를 통한 Ethernet MAVLink bootstrap을 수행한다.
+- telemetry 보조 경로: ROS2가 끝내 붙지 않아도 MAVLink `ATTITUDE`, GPS, GNSS relative, `SCALED_IMU*`로 가능한 자세/GPS/MAG raw telemetry를 계속 받아 정렬과 측정 입력을 최대한 유지한다.
 
-이 fallback은 ROS2를 완전히 대체하는 기능이 아니다. ROS2 전용 `vehicle_magnetometer.device_id`, namespace 기반 topic 식별, arbitrary `/fmu/out/...` custom field, 구조화된 parameter service는 MAVLink만으로 보장하지 않는다. 앱은 가능한 값은 MAVLink source로 명확히 표시하고, 대체할 수 없는 값은 대기/제한 상태로 남겨야 한다.
+MAVLink-first는 ROS2를 제거한다는 뜻이 아니다. ROS2 전용 `vehicle_magnetometer.device_id`, namespace 기반 topic 식별, arbitrary `/fmu/out/...` custom field, 구조화된 parameter service는 MAVLink만으로 보장하지 않는다. 앱은 제어/RTCM은 MAVLink 기준으로, 고속 uORB telemetry와 source identity는 ROS2 기준으로 분리해서 표시해야 한다.
 
 ## UAM Ground Truth 분석 방법
 
@@ -279,7 +281,7 @@ StereoDistance는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스�
 - RTSP는 포트 open만으로 충분하지 않다. `영상 수신 확인`에서 첫 프레임 수신까지 확인한다.
 - 카메라 preview는 YOLO 없이 스트림 상태를 확인하는 용도다.
 - YOLO 측정은 실제 거리 측정이 필요할 때만 시작한다.
-- Pixhawk ROS2와 MAVLink는 별도 경로지만 복구 과정에서는 함께 사용할 수 있다.
+- Pixhawk MAVLink와 ROS2는 별도 경로이며 현장 운용에서는 MAVLink heartbeat를 먼저 확보한다. ROS2는 그 뒤 telemetry/source identity를 보강한다.
 - ROS2는 topic 이름만으로 연결 성공으로 보지 않는다. publisher와 sample 수신까지 확인한다.
 - MAVLink는 heartbeat와 필요한 메시지 수신을 확인한다.
 
@@ -298,7 +300,7 @@ StereoDistance는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스�
 - 스타일과 디자인 토큰은 Python 코드 안에 흩어두지 않고 별도 디자인 기준 문서와 테마 코드로 이동한다.
 - 측정 경로는 3D ray triangulation을 우선하며, 단순 disparity 값은 진단 지표로만 취급한다.
 - hardware I/O와 UI orchestration은 남아 있는 결합 지점이므로 큰 수정 전에 관련 테스트나 현장 smoke check 기준을 먼저 정한다.
-- Pixhawk 연결은 ROS2를 선호하되, 실패 시 MAVLink로 uXRCE 설정을 밀어 넣고 가능한 자세/GPS/MAG raw telemetry를 계속 사용한다. 단, ROS2 전용 device_id, namespace, custom uORB field는 fallback 대상이 아니다.
+- Pixhawk 연결은 Rover RTCM/PX4 제어를 위해 MAVLink를 먼저 확보하고, 이후 ROS2로 namespace 기반 uORB telemetry를 보강한다. 단, ROS2 전용 device_id, namespace, custom uORB field는 MAVLink 대체 대상이 아니다.
 
 ## 현재 결합 지점과 분리 계획
 

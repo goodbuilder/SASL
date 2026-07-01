@@ -75,3 +75,7 @@ StereoDistance/calibration_captures/right/
 *~
 *.tmp
 *.bak
+
+# Local SSH keys
+SASL
+SASL.pub

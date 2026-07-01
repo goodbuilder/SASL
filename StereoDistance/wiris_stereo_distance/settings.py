@@ -40,15 +40,16 @@ class AppSettings:
     yolo_gate_min_width_px: int = 0
     yolo_gate_min_height_px: int = 0
     yolo_gate_min_area_px: int = 0
-    yolo_gate_matching_enabled: bool = True
-    yolo_gate_time_delta_enabled: bool = True
-    yolo_gate_vertical_delta_enabled: bool = True
+    yolo_gate_matching_enabled: bool = False
+    yolo_gate_time_delta_enabled: bool = False
+    yolo_gate_vertical_delta_enabled: bool = False
     yolo_gate_max_vertical_delta_px: float = 80.0
     yolo_gate_max_time_delta_s: float = 0.25
     yolo_gate_time_basis: str = "camera_rtc_required"
     preview_width: int = 1920
-    preview_rate_hz: float = 15.0
     rtsp_latency_ms: int = 50
+    yolo_event_queue_size: int = 128
+    yolo_frame_queue_size: int = 2
     rtsp_decoder: str = "nvidia"
     stream_backend: str = "gstreamer"
     rtsp_transport: str = "udp"
@@ -62,6 +63,10 @@ class AppSettings:
     right_mavlink_url: str = "udpin:0.0.0.0:14551"
     left_mavlink_baud: int = 57600
     right_mavlink_baud: int = 57600
+    left_pixhawk_bootstrap_url: str = ""
+    right_pixhawk_bootstrap_url: str = ""
+    left_pixhawk_bootstrap_baud: int = 57600
+    right_pixhawk_bootstrap_baud: int = 57600
     mavlink_configure_streams: bool = True
     mavlink_stream_rate: int = 2_000_000
     mavlink_configure_uxrce_agent: bool = True
@@ -78,7 +83,7 @@ class AppSettings:
     gnss_base_survey_in_min_duration_s: int = 300
     gnss_base_survey_in_accuracy_m: float = 1.0
     gnss_base_rtcm_injection_target: str = "both"
-    uam_telemetry_source: str = "ros2"
+    uam_telemetry_source: str = "mavlink"
     uam_ros2_topic: str = "/uav_0/fmu/out/vehicle_local_position"
     uam_ros2_x_field: str = "x"
     uam_ros2_y_field: str = "y"
@@ -162,8 +167,15 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         ),
         yolo_gate_time_basis=str(payload.get("yolo_gate_time_basis", AppSettings.yolo_gate_time_basis)),
         preview_width=int(payload.get("preview_width", AppSettings.preview_width)),
-        preview_rate_hz=float(payload.get("preview_rate_hz", AppSettings.preview_rate_hz)),
         rtsp_latency_ms=int(payload.get("rtsp_latency_ms", AppSettings.rtsp_latency_ms)),
+        yolo_event_queue_size=max(
+            1,
+            int(payload.get("yolo_event_queue_size", AppSettings.yolo_event_queue_size)),
+        ),
+        yolo_frame_queue_size=max(
+            1,
+            int(payload.get("yolo_frame_queue_size", AppSettings.yolo_frame_queue_size)),
+        ),
         rtsp_decoder=str(payload.get("rtsp_decoder", AppSettings.rtsp_decoder)),
         stream_backend=str(payload.get("stream_backend", AppSettings.stream_backend)),
         rtsp_transport=str(payload.get("rtsp_transport", AppSettings.rtsp_transport)),
@@ -177,6 +189,18 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         right_mavlink_url=str(payload.get("right_mavlink_url", AppSettings.right_mavlink_url)),
         left_mavlink_baud=int(payload.get("left_mavlink_baud", AppSettings.left_mavlink_baud)),
         right_mavlink_baud=int(payload.get("right_mavlink_baud", AppSettings.right_mavlink_baud)),
+        left_pixhawk_bootstrap_url=str(
+            payload.get("left_pixhawk_bootstrap_url", AppSettings.left_pixhawk_bootstrap_url)
+        ),
+        right_pixhawk_bootstrap_url=str(
+            payload.get("right_pixhawk_bootstrap_url", AppSettings.right_pixhawk_bootstrap_url)
+        ),
+        left_pixhawk_bootstrap_baud=int(
+            payload.get("left_pixhawk_bootstrap_baud", AppSettings.left_pixhawk_bootstrap_baud)
+        ),
+        right_pixhawk_bootstrap_baud=int(
+            payload.get("right_pixhawk_bootstrap_baud", AppSettings.right_pixhawk_bootstrap_baud)
+        ),
         mavlink_configure_streams=bool(
             payload.get("mavlink_configure_streams", AppSettings.mavlink_configure_streams)
         ),

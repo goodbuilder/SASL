@@ -137,7 +137,6 @@ Use this top-level tab for model, inference-device, and stream processing settin
 - `IoU 임계값`: YOLO non-max suppression IoU threshold.
 - `가중치`: YOLO model weights path. A changed value is persisted by `전체 설정 저장` or when the window closes.
 - `미리보기 폭(px)`: maximum preview image width sent to Qt. Keep this at `1920` for the current 1080p WIRIS stream so Qt receives the encoded frame without an extra resize. YOLO detection still uses the original decoded frame.
-- `미리보기 Hz`: maximum preview display rate in Qt. It cannot exceed the camera RTP/RTSP source FPS. `15 Hz` is the current tuned default so preview load stays aligned with the YOLO target.
 - `RTP 지연(ms)`: GStreamer RTP jitter-buffer latency in milliseconds.
 - `디코더`: RTSP H.264 decoder mode. `NVIDIA` is the default and forces `nvh264dec`; `Auto` tries NVIDIA first and falls back to software; `Software` forces `avdec_h264`.
 - `수신 백엔드`: RTSP receive backend. `GStreamer` gives the best latency/drop/decoder control; `OpenCV/FFmpeg` is a simpler fallback path; `OpenCV Auto` lets OpenCV choose the available capture backend; `PyAV` uses the optional `av` package and reports `pyav-pts` when frame PTS is available.
@@ -146,24 +145,29 @@ Use this top-level tab for model, inference-device, and stream processing settin
 
 ### 연결 > Pixhawk
 
-This connection subtab assumes Pixhawk calibration was already completed in QGC and focuses on ROS2/MAVLink transport setup.
+This connection subtab assumes Pixhawk calibration was already completed in QGC and focuses on MAVLink-first Rover control plus ROS2/uXRCE telemetry setup.
 
 - `Pixhawk 자동 탐색` scans ROS2 PX4 topics using the current `ROS_DOMAIN_ID` and fills Pixhawk namespaces.
-- The Pixhawk subtab is ordered as `0 공통 준비`, `1 탐색 후보 / USB 할당`, `2 Pixhawk 1/2 사전 설정`, `3 연결 실행`, and `4 고급 / 진단` so USB bootstrap, uXRCE parameter setup, MAVLink, ROS2 checks, and shell diagnostics stay in the field order.
-- `1 탐색 후보 / USB 할당` lists ROS2 namespace, USB MAVLink, Ethernet MAVLink URL, and PC IP candidates. Select a row and use `P1에 적용` or `P2에 적용` to apply that namespace or MAVLink URL to a specific Pixhawk side.
-- Pixhawk `PC IP 탐색` appends all local IPv4 candidates to the Pixhawk candidate table as `PC_IP` rows and does not change `Pixhawk Host IP` by itself. Select the intended wired Pixhawk/uXRCE Agent IP and press `Host에 적용` explicitly when both wired Ethernet and Wi-Fi are active.
-- `2 Pixhawk 1/2 사전 설정` keeps Pixhawk 1 and Pixhawk 2 in separate panels with each side's MAVLink URL, baudrate, Ethernet IP, and namespace.
-- `3 연결 실행` contains Pixhawk swapping, P1/P2 MAVLink connection, P1/P2 uXRCE parameter setup, and ROS2 connection.
+- The Pixhawk subtab is ordered as `0 공통 네트워크`, `1 연결 후보`, `2 Rover MAVLink / RTCM`, `3 ROS2 Telemetry`, and `4 고급 / 진단` so the shared host IP/P1-P2 mapping, MAVLink URL/USB control, RTCM-capable heartbeat, ROS2 telemetry, and shell diagnostics stay in the field order.
+- `0 공통 네트워크` contains the shared `Pixhawk Host IP` and `P1/P2 매핑 교체`. The mapping swap is kept here because it exchanges both MAVLink and ROS2 side assignments.
+- `1 연결 후보` stacks three candidate areas vertically: `PC / Host IP`, `MAVLink / USB 제어`, and `ROS2 Namespace`. Each area has its own double-height full-width table and only exposes the apply buttons that match that candidate type.
+- Pixhawk `PC IP 탐색` appends all local IPv4 candidates to the `PC / Host IP` table as `PC_IP` rows and does not change `Pixhawk Host IP` by itself. Select the intended wired Pixhawk/uXRCE Agent IP and press `Host에 적용` explicitly when both wired Ethernet and Wi-Fi are active.
+- `MAVLink / USB 제어` contains Ethernet MAVLink URL candidates, USB control-port candidates, and USB serial direct MAVLink candidates. Apply these with `P1에 적용` or `P2에 적용`.
+- `ROS2 Namespace` contains ROS2 namespace candidates from `Pixhawk 자동 탐색`. Apply these with `P1 적용` or `P2 적용`.
+- `2 Rover MAVLink / RTCM` keeps MAVLink-only settings together: MAVLink stream rate, MAVLink stream setup toggle, each side's Ethernet MAVLink URL, MAVLink baudrate, USB control/bootstrap port, and Ethernet IP. Its action row contains P1/P2 MAVLink connection and P1/P2 Ethernet MAVLink start over USB.
+- `3 ROS2 Telemetry` keeps ROS2/uXRCE settings together: `ROS_DOMAIN_ID`, uXRCE port, PX4 uXRCE Agent setup toggle, and P1/P2 ROS2 namespaces. It then provides P1/P2 ROS2 connection and P1/P2 uXRCE parameter setup. The uXRCE setup buttons are placed here because they serve ROS2 recovery, but they still require an active MAVLink heartbeat.
 - `4 고급 / 진단` contains PX4 Shell, `ETH 저장`, and MAVLink reboot actions. Shell is diagnostic only; use `P1/P2 재부팅` for reboot when Shell/serial-control does not respond.
-- `MAVLink URL 후보` adds the common Ethernet UDP MAVLink URLs `udpin:0.0.0.0:14550` and `udpin:0.0.0.0:14551` to the candidate table without connecting. Apply one to P1/P2, then press `MAVLink 연결`.
-- `MAVLink 연결` opens direct MAVLink links; while connected, the same button changes to `MAVLink 해제`.
-- `ROS2 연결` starts or reuses `MicroXRCEAgent`, then subscribes to available PX4 ROS2 topics; while connected, the same button changes to `ROS2 해제`.
+- `MAVLink URL 후보` adds common Ethernet UDP listen candidates `udpin:0.0.0.0:14550` and `udpin:0.0.0.0:14551`, plus P1/P2 Ethernet `tcp:<Pixhawk ETH IP>:5760` and `udpout:<Pixhawk ETH IP>:<port>` candidates when Pixhawk ETH IP fields are filled. Apply one to P1/P2, then press `MAVLink 연결`.
+- `USB 연결 탐색` scans `/dev/serial/by-id/*`, `/dev/ttyACM*`, and `/dev/ttyUSB*` using common MAVLink baudrates including `57600`, `115200`, and `921600`. A USB row applies to `USB 제어 포트` for Ethernet bootstrap; a `MAVLink` row from the same device applies the serial device directly to the side's MAVLink URL and baudrate.
+- `MAVLink 연결` opens direct MAVLink links; while connected, the same button changes to `MAVLink 해제`. Rover RTCM injection and PX4 control require MAVLink heartbeat, not only a UDP socket.
+- `P1/P2 ETH MAV 시작(USB)` uses the configured USB control/bootstrap port to send PX4 shell commands that bring up `eth0` and start the Ethernet MAVLink stream toward the current Pixhawk Host IP, then reconnects the app's UDP MAVLink listener. If the saved USB baud is wrong, it tries the fast MAVLink baud candidates `57600`, `115200`, and `921600`; if PX4 rejects `mavlink start -m normal`, it retries the bootstrap stream with `-m onboard -n eth0`.
+- `ROS2 연결` starts or reuses `MicroXRCEAgent`, then subscribes to available PX4 ROS2 topics; while connected, the same button changes to `ROS2 해제`. ROS2 is the structured telemetry path and does not replace MAVLink RTCM/control.
 - If ROS2 is connected but `sensor_gps` or `sensor_mag` data is not published, the GUI starts the configured MAVLink URL(s) as an auxiliary sensor receiver after startup. This keeps ROS2 attitude/GPS1 data active while using MAVLink `GPS2_RAW` for the GPS2 slot and `SCALED_IMU*` for RM3100 CAN1/CAN2 slots.
 - `픽스호크 Host IP` should be the PC address reachable from the Pixhawk Ethernet/uXRCE network. The field default is `10.0.0.10`; Pixhawk 1/2 Ethernet defaults are `10.0.0.2` and `10.0.0.3`.
-- If `ROS2 연결` fails during session startup, the GUI automatically starts the configured MAVLink side(s), sends the selected MAVLink stream setup, writes PX4 `UXRCE_DDS_*` parameters with MAVLink `PARAM_SET` when `PX4 uXRCE Agent 설정` is enabled, verifies them by readback, keeps MAVLink telemetry as fallback, and retries ROS2.
+- If `ROS2 연결` fails during session startup, the GUI can use the already configured MAVLink side(s) to send MAVLink stream setup and PX4 `UXRCE_DDS_*` parameters with MAVLink `PARAM_SET` when `PX4 uXRCE Agent 설정` is enabled, verifies them by readback, keeps MAVLink telemetry active, and retries ROS2.
 - After each MAVLink heartbeat, the app requests `ATTITUDE`, `GPS_RAW_INT`, `GPS2_RAW`, `SCALED_IMU`, `SCALED_IMU2`, and `SCALED_IMU3` with `MAV_CMD_SET_MESSAGE_INTERVAL`. `GPS_RAW_INT` fills the GPS1 position path; `GPS2_RAW` fills the GPS2 sensor slot and a `left_GPS2`/`right_GPS2` raw LLA position path for Baseline GPS2 selection; `SCALED_IMU` and `SCALED_IMU2` fill RM3100 CAN1/CAN2 magnetometer slots. MAVLink fields can also be inspected in the field browser.
 - When `PX4 uXRCE Agent 설정` is enabled, the MAVLink path sets `UXRCE_DDS_CFG`, `UXRCE_DDS_KEY`, `UXRCE_DDS_DOM_ID`, `UXRCE_DDS_AG_IP`, and `UXRCE_DDS_PRT`. Here `AG_IP` means the PC Micro XRCE-DDS Agent IP that the PX4 uXRCE-DDS Client connects to. If ROS2 topics still have no PX4 publishers after readback succeeds, reboot PX4 or restart `uxrce_dds_client`; PX4 namespace still depends on the vehicle-side client configuration.
-- Launching with `--start-pixhawk` or `--connect-pixhawk` automatically opens MAVLink and switches the first view to `정렬 > Baseline`.
+- Launching with `--start-pixhawk` or `--connect-pixhawk` automatically opens MAVLink first and switches the first view to `정렬 > Baseline`.
 - `Pixhawk 1 Shell` and `Pixhawk 2 Shell` open PX4 shell dialogs over an active MAVLink connection.
 - `P1 재부팅` and `P2 재부팅` send MAVLink `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` over the active MAVLink link. Use these instead of typing `reboot` in Shell when PX4 Shell does not respond.
 
@@ -171,8 +175,10 @@ This connection subtab assumes Pixhawk calibration was already completed in QGC 
 
 Use this subtab for UAM/drone ground truth telemetry. It is separate from `연결 > Pixhawk` because the same Pixhawk transport can serve two roles: vehicle telemetry for measurement geometry and UAM/drone center telemetry for accuracy analysis. The experiment assumes the UAM/drone GPS antenna and Pixhawk are mounted at the vehicle center, so the received PX4 local position is treated as the body-origin ground truth N/E/D.
 
-- `소스` selects `ROS2 topic`, `MAVLink LOCAL_POSITION_NED`, `MAVLink GPS Position`, `MAVLink Global Position`, or `사용 안 함`.
-- ROS2 mode registers `uam_x`, `uam_y`, and `uam_z` watches against the selected topic and fields. The default is `/uav_0/fmu/out/vehicle_local_position` with `x/y/z`.
+- UAM Telemetry Pixhawk is separate from the `연결 > Pixhawk` P1/P2 Rover Pixhawks. P1/P2 handle the stereo rig/rover attitude, GNSS, MAG, RTCM injection, and PX4 setup. UAM Telemetry Pixhawk provides the tracked UAM/drone ground truth N/E/D source.
+- Pixhawk connection candidates, P1/P2 MAVLink URLs, and P1/P2 ROS2 namespaces are not automatically applied to UAM Telemetry. Set the UAM device MAVLink URL or ROS2 topic in this tab explicitly.
+- `Telemetry source` selects the UAM truth source contract: `MAVLink Local NED`, `MAVLink GPS-derived`, `MAVLink Global-derived`, `ROS2 Topic`, or `Off`. The default is `MAVLink Local NED`.
+- ROS2 mode registers `uam_x`, `uam_y`, and `uam_z` watches against the selected topic and fields. The default ROS2 topic is `/uav_0/fmu/out/vehicle_local_position` with `x/y/z`.
 - MAVLink `LOCAL_POSITION_NED` mode registers the same `uam_x/y/z` watches against a selected Pixhawk side and message. The default message is `LOCAL_POSITION_NED` with `x/y/z`.
 - MAVLink GPS/global modes do not write raw `lat/lon/alt` into `uam_x/y/z`.
   They receive `GPS_RAW_INT`/`GPS2_RAW` or `GLOBAL_POSITION_INT`, preserve the
@@ -186,8 +192,8 @@ Use this subtab for UAM/drone ground truth telemetry. It is separate from `연�
   choose exactly one truth source contract (`local_ned`, `global_position`, or
   `gps_position`) for that profile/evaluation run. Do not mix the three truth
   sources inside one calibration profile.
-- `UAM 텔레메트리 연결` starts the selected watch path. ROS2 remains the preferred source, but MAVLink keeps a live fallback buffer when ROS2 is blocked.
-- `UAM 텔레메트리 해제` removes only the UAM `uam_x/y/z` watches. It does not disconnect Pixhawk ROS2/MAVLink, and it keeps the live buffer for fallback analysis.
+- `Telemetry 연결` starts the selected telemetry source path and fills the live UAM ground truth buffer.
+- `Telemetry 해제` removes only the UAM `uam_x/y/z` watches. It does not disconnect Pixhawk ROS2/MAVLink, and it keeps the live buffer for fallback analysis.
 - `실시간 버퍼 초기화` clears only the live UAM ground truth buffer and N/E/D graph; it does not delete saved session rows or selected ULog files.
 - The latest UAM/drone center coordinate is also reused by `고급 > Bias 보정`. `연결 > UAM` is the single ground-truth telemetry entry point; legacy `drone_x/y/z` values are accepted only when they already exist in old recorded rows.
 
@@ -196,8 +202,10 @@ Use this subtab for UAM/drone ground truth telemetry. It is separate from `연�
 Use this top-level tab to define and validate the stereo-camera extrinsic parameters used by measurement. Alignment does not use video or YOLO.
 
 - `정렬 > 개요` summarizes Pixhawk, GPS1/GPS2, CAN1/CAN2, baseline, attitude delta, and overall GOOD/WARNING/BAD alignment state.
+- `정렬 > GNSS Base` connects to the Base GNSS serial port, starts/stops u-blox Survey-in with `CFG-TMODE3`, polls `NAV-SVIN`, and forwards detected RTCM3 frames to the selected Left/Right Rover Pixhawk MAVLink links via `GPS_RTCM_DATA`. The Base only needs to supply RTCM frames; the selected Rover side must have MAVLink heartbeat for injection.
 - `정렬 > GNSS / Baseline` contains `GPS 인식`, `ROS2 Topic / MAVLink Field`, `Baseline 계산`, `신뢰성 평가`, and `Baseline Profile`. It computes WGS84 GPS positions into ENU `[E,N,U]` and NED `[N,E,D]` using the selected left camera GPS as origin.
 - `정렬 > Magnetometer / Yaw` shows CAN1/CAN2 magnetometer status, field strength, selected/health/calibration placeholders, CAN1-vs-CAN2 difference, and left-vs-right heading readiness. GPS is not used in this tab.
+- `정렬 > MAG 관리` separates ROS2 MAG telemetry from PX4 parameter readback. ROS2 `sensor_mag_*` can identify raw MAG slots and `vehicle_magnetometer` can identify the actual selected MAG `device_id`, but `CAL_MAG*_PRIO` values are shown only when MAVLink PARAM readback is connected. In ROS2-only mode the CAL_MAG slot/priority table stays empty and the status label reports that MAVLink/QGC/PX4 shell is required for real priority values.
 - `정렬 > Attitude` shows Pixhawk EKF Roll/Pitch/Yaw, quaternion, and left-right yaw/pitch/roll differences. It is the final attitude source for extrinsic orientation.
 - `정렬 > Coordinate System` records the coordinate contract: Global Frame (`ENU`/`NED`), Camera Frame (`RDF`/`ROS Optical Frame`), Origin (`Left Camera`/`Midpoint`), and the Pixhawk FRD to camera RDF transform.
 - `정렬 > Validation` compares stored vs current baseline and attitude, estimates baseline/yaw/pitch error contribution at a user-entered distance, and returns PASS/FAIL.
@@ -367,7 +375,7 @@ MAVLink path:
 - Optional stream configuration through PX4 shell commands. Pending setup is retried after the first heartbeat so UDP `udpin` links can learn their peer before shell commands are sent.
 - Optional uXRCE setup through MAVLink `PARAM_SET`/readback for `UXRCE_DDS_CFG`, `UXRCE_DDS_KEY`, `UXRCE_DDS_DOM_ID`, `UXRCE_DDS_AG_IP`, and `UXRCE_DDS_PRT`. This does not replace a vehicle-side namespace/client restart configuration.
 
-MAVLink and ROS2 connection paths are separate but can be used together during recovery. MAVLink can configure uXRCE parameters, reach PX4 shell for diagnostics when the shell path works, configure MAVLink streams, and provide fallback `ATTITUDE`, GPS, GNSS relative, and `SCALED_IMU*` samples while ROS2 is unavailable. ROS2 still requires PX4 topics to be published through XRCE-DDS. Treat ROS2 as actually connected only when `ros2 topic info -v` shows PX4 publishers and `ros2 topic hz` receives samples; a topic name alone can come from this GUI's subscriptions.
+MAVLink and ROS2 connection paths are separate and can be used together. Rover operation is MAVLink-first because MAVLink carries RTCM injection, PX4 parameter control, shell diagnostics, reboot, Ethernet MAVLink bootstrap, and telemetry fallback. ROS2 still requires PX4 topics to be published through XRCE-DDS and should be treated as actually connected only when `ros2 topic info -v` shows PX4 publishers and `ros2 topic hz` receives samples; a topic name alone can come from this GUI's subscriptions.
 
 MAVLink fallback does not fully replace ROS2/uORB. Actual selected MAG `device_id`, ROS2 namespace identity, arbitrary `/fmu/out/...` custom fields, and structured parameter services still require ROS2/px4_ros_com or MAVROS2/QGC/PX4 shell support.
 
@@ -414,8 +422,9 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 - Use `영상 주소 탐색` to fill RTSP URLs after the cameras are reachable on the network.
 - Use the `탐색 후보` table when automatic assignment is not the desired left/right mapping. `선택 NIC` applies the selected candidate interface and PC IP; `Left에 적용` / `Right에 적용` applies selected RTSP or WIRIS candidates to that side and copies the discovered SDK port into that side's control-port field when present.
 - Keep STIP changes in `IP Address / IP Mask 변경` as a deliberate last step. Normal manual connection should use `카메라망 / NIC`, `탐색 후보`, left/right `IP Address / Telnet port`, `RTSP port / 영상`, then `검증 / 활성화`.
-- Start in `연결 > Pixhawk` from `0 공통 준비`, then use `1 탐색 후보 / USB 할당` to discover USB/ROS2 candidates and assign them with `P1에 적용` or `P2에 적용`.
-- Use `2 Pixhawk 1/2 사전 설정` to confirm each side's MAVLink URL, baudrate, Ethernet IP, and namespace before `ETH 저장`, then use `3 연결 실행` for `MAVLink 연결` followed by `ROS2 연결`.
+- Start in `연결 > Pixhawk` from `0 공통 네트워크` to confirm Pixhawk Host IP or swap the current P1/P2 mapping, then use `1 연결 후보` to discover PC IP, Ethernet MAVLink URL, USB control, and ROS2 namespace candidates and assign them with `Host에 적용`, `P1에 적용`, or `P2에 적용`.
+- Use `2 Rover MAVLink / RTCM` to confirm MAVLink stream rate, each side's Ethernet MAVLink URL, USB control port, and Ethernet IP, then confirm P1/P2 MAVLink heartbeat first. If Ethernet MAVLink is not arriving, use `P1/P2 ETH MAV 시작(USB)`. Use `3 ROS2 Telemetry` after MAVLink/RTCM readiness to confirm ROS_DOMAIN_ID, uXRCE port, namespaces, and connect ROS2.
+- In `정렬 > GNSS Base`, select the Rover RTCM injection target only after the target Pixhawk MAVLink heartbeat is available.
 - Use `정렬 > Baseline` to confirm GPS1/GPS2 recognition and baseline reliability before measurement.
 - Use `영상 수신 확인` before `카메라 Preview 연결`; require `frame-ok`, not only port-open.
 - Keep `GStreamer` as the default stream backend and `NVIDIA` as the default decoder for low-latency operation. Try `OpenCV Auto` when the explicit GStreamer or OpenCV/FFmpeg paths fail on a PC. Use `PyAV` when the `av` package is installed in the active Python environment.
@@ -475,7 +484,7 @@ If OpenCV calibration dependencies need repair:
 
 ```bash
 cd <STEREO_DISTANCE_APP>
-PYTHON_BIN=/home/moontaehyung/Capstone/.venv/bin/python ./scripts/bootstrap_calibration_deps.sh
+PYTHON_BIN=.venv/bin/python ./scripts/bootstrap_calibration_deps.sh
 ```
 
 Or run the bootstrap before opening the GUI:

@@ -377,6 +377,7 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         rect = self._plot_rects().get(field)
         if rect is None:
             return
+        painter.setBrush(QtCore.Qt.NoBrush)
         painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
         painter.drawRect(rect)
         painter.setPen(QtGui.QColor(CHART_TEXT))

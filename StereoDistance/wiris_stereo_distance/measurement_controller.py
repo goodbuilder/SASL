@@ -101,7 +101,7 @@ def _with_warning(warnings: tuple[str, ...], message: str) -> tuple[str, ...]:
 
 def _triangulate(inputs: MeasurementGeometryInput, warnings: tuple[str, ...]) -> _TriangulationAttempt:
     if inputs.intrinsics is None:
-        return _TriangulationAttempt(None, warnings)
+        return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for intrinsics"))
     try:
         if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
             return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for Pixhawk R"))

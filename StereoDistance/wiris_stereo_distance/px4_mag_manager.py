@@ -9,7 +9,9 @@ RM3100_PRIMARY_ID = 8944899
 RM3100_ALTERNATE_PRIMARY_ID = 8944643
 RM3100_PRIMARY_IDS = (RM3100_PRIMARY_ID, RM3100_ALTERNATE_PRIMARY_ID)
 RM3100_BACKUP_ID = 8944387
-RM3100_IDS = (*RM3100_PRIMARY_IDS, RM3100_BACKUP_ID)
+RM3100_ALTERNATE_BACKUP_ID = 8944395
+RM3100_BACKUP_IDS = (RM3100_BACKUP_ID, RM3100_ALTERNATE_BACKUP_ID)
+RM3100_IDS = (*RM3100_PRIMARY_IDS, *RM3100_BACKUP_IDS)
 BOARD_INTERNAL_MAG_ID = 4395041
 GPS1_MAG_ID = 396809
 GPS2_MAG_ID = 396817
@@ -128,7 +130,7 @@ def identify_mag_device(device_id: int | None) -> MagDeviceInfo:
         return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7D", "DroneCAN", True)
     if device_id == RM3100_ALTERNATE_PRIMARY_ID:
         return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7C", "DroneCAN", True)
-    if device_id == RM3100_BACKUP_ID:
+    if device_id in RM3100_BACKUP_IDS:
         return MagDeviceInfo(device_id, "RM3100 #2 / UAVCAN node 0x7B", "DroneCAN", True)
     if device_id == BOARD_INTERNAL_MAG_ID:
         return MagDeviceInfo(device_id, "Board internal BMM150", "Pixhawk internal I2C", False)
@@ -185,7 +187,9 @@ def build_mag_status(
     ]
     if not registered_rm3100:
         warnings.append("No RM3100 registered in CAL_MAG. Run Compass Calibration with RM3100 connected.")
-    elif any(device_id in RM3100_PRIMARY_IDS for device_id in registered_rm3100) and RM3100_BACKUP_ID not in registered_rm3100:
+    elif any(device_id in RM3100_PRIMARY_IDS for device_id in registered_rm3100) and not any(
+        device_id in RM3100_BACKUP_IDS for device_id in registered_rm3100
+    ):
         warnings.append("Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.")
 
     if actual_selected_device_id == BOARD_INTERNAL_MAG_ID:

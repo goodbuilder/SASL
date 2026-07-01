@@ -17,7 +17,7 @@ from wiris_stereo_distance.px4_mag_manager import (
     BOARD_INTERNAL_MAG_ID,
     GPS1_MAG_ID,
     GPS2_MAG_ID,
-    RM3100_BACKUP_ID,
+    RM3100_BACKUP_IDS,
     RM3100_PRIMARY_IDS,
 )
 from wiris_stereo_distance.rtk_geometry import GpsPositionState, gps_state_from_message, gps_topic
@@ -470,14 +470,29 @@ def _qos_for_px4_out():
     )
 
 
-DEFAULT_USB_MAVLINK_BAUDRATES = (57600, 115200)
+DEFAULT_USB_MAVLINK_BAUDRATES = (57600, 115200, 921600)
 
 
-def usb_mavlink_device_candidates(patterns: tuple[str, ...] = ("/dev/ttyACM*", "/dev/ttyUSB*")) -> list[str]:
+@dataclass(frozen=True)
+class MavlinkShellCommandResult:
+    command: str
+    output: str
+    flag_label: str
+
+
+def usb_mavlink_device_candidates(
+    patterns: tuple[str, ...] = ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"),
+) -> list[str]:
     candidates: list[str] = []
+    targets_seen: set[str] = set()
     for pattern in patterns:
-        candidates.extend(glob.glob(pattern))
-    return sorted(dict.fromkeys(candidates))
+        for candidate in sorted(glob.glob(pattern)):
+            target = os.path.realpath(candidate)
+            if target in targets_seen:
+                continue
+            targets_seen.add(target)
+            candidates.append(candidate)
+    return candidates
 
 
 def probe_usb_mavlink_devices(
@@ -558,13 +573,24 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
     custom_watch_changed = QtCore.pyqtSignal(object)
     status_changed = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, domain_id: int, left_namespace: str, right_namespace: str, custom_watches: tuple[dict[str, str], ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        domain_id: int,
+        left_namespace: str,
+        right_namespace: str,
+        custom_watches: tuple[dict[str, str], ...] = (),
+        active_sides: tuple[str, ...] = ("left", "right"),
+    ) -> None:
         super().__init__()
         self.domain_id = int(domain_id)
         self.namespaces = {
             "left": left_namespace.strip().strip("/"),
             "right": right_namespace.strip().strip("/"),
         }
+        self.active_sides = tuple(side for side in active_sides if side in self.namespaces)
+        if not self.active_sides:
+            self.active_sides = ("left", "right")
         self.node: Any = None
         self.executor: Any = None
         self.context: Any = None
@@ -606,15 +632,18 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         sensor_gps_msg_type = self._optional_message_type("px4_msgs/msg/SensorGps")
         gnss_relative_msg_type = self._optional_message_type("px4_msgs/msg/SensorGnssRelative")
         gps_msg_type = self._optional_message_type("px4_msgs/msg/VehicleGpsPosition", quiet=True)
+        side_suffix = "_".join(self.active_sides)
+        node_name = f"wiris_stereo_{side_suffix}_pixhawk_attitude"
         if self.context is not None:
-            self.node = rclpy.create_node("wiris_stereo_dual_pixhawk_attitude", context=self.context)
+            self.node = rclpy.create_node(node_name, context=self.context)
             self.executor = SingleThreadedExecutor(context=self.context)
         else:
-            self.node = rclpy.create_node("wiris_stereo_dual_pixhawk_attitude")
+            self.node = rclpy.create_node(node_name)
             self.executor = SingleThreadedExecutor()
         self.executor.add_node(self.node)
         self.subscriptions = []
-        for camera, namespace in self.namespaces.items():
+        for camera in self.active_sides:
+            namespace = self.namespaces[camera]
             if msg_type is not None:
                 topic = attitude_topic(namespace)
                 subscription = self.node.create_subscription(
@@ -894,7 +923,7 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
     def _mag_slot_for_device(self, camera: str, device_id: int | None) -> str:
         if device_id in RM3100_PRIMARY_IDS:
             return "CAN1"
-        if device_id == RM3100_BACKUP_ID:
+        if device_id in RM3100_BACKUP_IDS:
             return "CAN2"
         if device_id == BOARD_INTERNAL_MAG_ID:
             return "BOARD"
@@ -1178,6 +1207,16 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             self.status_changed.emit(f"{camera_label_ko(camera)} PX4 param 설정 불일치: {name} expected={int(value)} actual={actual}")
         return actual
 
+    def send_rtcm_data(self, camera: str, payload: bytes) -> int:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        packet_count = _send_mavlink_rtcm_data(connection, payload)
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} RTCM 주입: {len(payload)} bytes / {packet_count} MAVLink packets"
+        )
+        return packet_count
+
     def _apply_pending_connection_setup(self, camera: str, connection: Any) -> None:
         if self._mavlink_stream_config is not None and camera not in self._mavlink_stream_configured:
             self._apply_mavlink_stream_config(camera, connection)
@@ -1275,8 +1314,20 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         connection = self.connections.get(camera)
         if connection is None:
             raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        _send_mavlink_shell_command(connection, command)
+        result = _send_mavlink_shell_command(connection, command)
+        if result.flag_label != "respond+exclusive":
+            self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell fallback 사용: {result.flag_label}")
         self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell 명령 전송: {command}")
+
+    def send_shell_command_with_result(self, camera: str, command: str, *, timeout_s: float = 2.0) -> MavlinkShellCommandResult:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        result = _send_mavlink_shell_command(connection, command, timeout_s=timeout_s)
+        if result.flag_label != "respond+exclusive":
+            self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell fallback 사용: {result.flag_label}")
+        self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell 명령 전송: {command}")
+        return result
 
     def write_remote_file_mavftp(self, camera: str, remote_path: str, content: str | bytes) -> None:
         connection = self.connections.get(camera)
@@ -1669,21 +1720,96 @@ def _mavlink_hdg_acc_deg_e5_to_rad(value: Any) -> float | None:
     return math.radians(float(value) * 1e-5)
 
 
-def _send_mavlink_shell_command(connection: Any, command: str) -> None:
+def _serial_control_output_from_message(message: Any) -> str:
+    try:
+        count = int(getattr(message, "count", 0) or 0)
+        data = bytes(getattr(message, "data", [])[:count])
+    except Exception:
+        return ""
+    return data.decode("utf-8", errors="replace")
+
+
+def _read_mavlink_shell_output(connection: Any, *, timeout_s: float) -> str:
+    recv_match = getattr(connection, "recv_match", None)
+    if recv_match is None:
+        return ""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    chunks: list[str] = []
+    while time.monotonic() < deadline:
+        message = recv_match(type="SERIAL_CONTROL", blocking=True, timeout=0.05)
+        if message is None:
+            continue
+        text = _serial_control_output_from_message(message)
+        if text:
+            chunks.append(text)
+    return "".join(chunks)
+
+
+def _send_mavlink_shell_payload(mav: Any, *, device: int, flags: int, payload: bytes) -> None:
+    for offset in range(0, len(payload), 70):
+        chunk = payload[offset : offset + 70]
+        data = list(chunk) + [0] * (70 - len(chunk))
+        mav.serial_control_send(device, flags, 0, 0, len(chunk), data)
+
+
+def _send_mavlink_shell_command(
+    connection: Any,
+    command: str,
+    *,
+    timeout_s: float = 0.8,
+) -> MavlinkShellCommandResult:
     mav = getattr(connection, "mav", None)
     if mav is None or not hasattr(mav, "serial_control_send"):
         raise RuntimeError("MAVLink serial control을 지원하지 않는 연결입니다.")
     mavlink = getattr(connection, "mavlink", None)
     device = _mavlink_constant(mavlink, "SERIAL_CONTROL_DEV_SHELL", 10)
-    flags = (
-        _mavlink_constant(mavlink, "SERIAL_CONTROL_FLAG_RESPOND", 1)
-        | _mavlink_constant(mavlink, "SERIAL_CONTROL_FLAG_EXCLUSIVE", 4)
+    respond_flag = _mavlink_constant(mavlink, "SERIAL_CONTROL_FLAG_RESPOND", 2)
+    exclusive_flag = _mavlink_constant(mavlink, "SERIAL_CONTROL_FLAG_EXCLUSIVE", 4)
+    variants = (
+        ("respond+exclusive", respond_flag | exclusive_flag),
+        ("respond", respond_flag),
     )
     payload = (command.rstrip() + "\n").encode("utf-8")
-    for offset in range(0, len(payload), 70):
-        chunk = payload[offset : offset + 70]
-        data = list(chunk) + [0] * (70 - len(chunk))
-        mav.serial_control_send(device, flags, 0, 0, len(chunk), data)
+    selected_label, selected_flags = variants[-1]
+    probe_output = ""
+    for label, flags in variants:
+        # Opening the shell first matters on PX4 NSH links that only respond after a read request.
+        mav.serial_control_send(device, flags, 0, 0, 0, [0] * 70)
+        output = _read_mavlink_shell_output(connection, timeout_s=min(timeout_s, 0.25))
+        if output or label == variants[-1][0]:
+            selected_label = label
+            selected_flags = flags
+            probe_output = output
+            break
+    _send_mavlink_shell_payload(mav, device=device, flags=selected_flags, payload=payload)
+    command_output = _read_mavlink_shell_output(connection, timeout_s=timeout_s)
+    return MavlinkShellCommandResult(
+        command=command,
+        output=probe_output + command_output,
+        flag_label=selected_label,
+    )
+
+
+def _send_mavlink_rtcm_data(connection: Any, payload: bytes) -> int:
+    mav = getattr(connection, "mav", None)
+    if mav is None or not hasattr(mav, "gps_rtcm_data_send"):
+        raise RuntimeError("MAVLink GPS_RTCM_DATA를 지원하지 않는 연결입니다.")
+    data = bytes(payload)
+    if not data:
+        return 0
+    max_chunk = 180
+    max_fragmented_payload = max_chunk * 4
+    if len(data) > max_fragmented_payload:
+        raise ValueError(f"RTCM frame too large for MAVLink GPS_RTCM_DATA: {len(data)} > {max_fragmented_payload} bytes")
+    chunks = [data[offset : offset + max_chunk] for offset in range(0, len(data), max_chunk)]
+    sequence_id = int(time.monotonic() * 1000) & 0x1F
+    fragmented = len(chunks) > 1
+    for fragment_id, chunk in enumerate(chunks):
+        flags = 0
+        if fragmented:
+            flags = 1 | ((fragment_id & 0x03) << 1) | ((sequence_id & 0x1F) << 3)
+        mav.gps_rtcm_data_send(flags, len(chunk), list(chunk) + [0] * (max_chunk - len(chunk)))
+    return len(chunks)
 
 
 def _write_mavlink_ftp_file(connection: Any, remote_path: str, content: str | bytes) -> None:

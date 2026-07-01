@@ -1,5 +1,205 @@
 # 업데이트 기록
 
+## v1.6.18 — 2026-06-29 — Pixhawk MAVLink-first 운용 기준
+
+- 변경:
+  - `연결 > Pixhawk` 후보 그룹명을 `1 연결 후보`로 바꾸고, 내부를 `PC / Host IP`, `MAVLink / USB 제어`, `ROS2 Namespace` 후보 영역으로 분리했다.
+  - `0 공통 네트워크`에는 MAVLink와 ROS2가 함께 쓰는 Pixhawk Host IP와 `P1/P2 매핑 교체`를 배치했다.
+  - 기존 `2 Pixhawk 1/2 사전 설정`과 `3 연결 실행`을 `2 Rover MAVLink / RTCM`, `3 ROS2 Telemetry`로 분리했다.
+  - MAVLink stream rate/setup, P1/P2 Ethernet MAVLink URL, USB 제어 포트, ETH IP, MAVLink/USB bootstrap 버튼은 `Rover MAVLink / RTCM`에 두고, ROS_DOMAIN_ID/uXRCE 포트/PX4 uXRCE Agent 설정, ROS2 namespace, P1/P2 ROS2 연결, uXRCE 설정 버튼은 `ROS2 Telemetry`에 배치했다. MAVLink/ROS2 양쪽 매핑을 함께 바꾸는 `P1/P2 매핑 교체`는 공통 네트워크에 둔다.
+  - 주 UI에서 `ROS2 전체 연결` 버튼을 제거해 P1/P2 개별 ROS2 연결만 노출했다.
+  - `docs/PROJECT.md`의 Pixhawk 연결 의도를 ROS2-first/fallback 관점에서 Rover MAVLink-first 관점으로 갱신했다.
+  - `docs/usage.md`에 RTCM 주입, PX4 제어, USB bootstrap, MAVLink heartbeat 확인을 ROS2 연결보다 먼저 수행하는 운용 순서를 명시했다.
+- 이유:
+  - Base RTCM을 Rover GNSS로 넣는 실제 주입 경로는 ROS2가 아니라 Rover Pixhawk MAVLink `GPS_RTCM_DATA`이므로, Rover RTK 운용 준비 조건은 ROS2 topic 수신보다 MAVLink heartbeat 확인이 먼저이기 때문이다.
+- 확인:
+  - `연결 > Pixhawk` 버튼 배치 회귀 테스트와 문서 설명을 MAVLink-first 기준으로 갱신했다.
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. Rover 제어/RTCM 채널은 MAVLink, 구조화된 uORB telemetry/source identity는 ROS2라는 운용 우선순위만 명확히 했다.
+
+## v1.6.17 — 2026-06-24 — SASL 펌웨어 artifact 분리
+
+- 변경:
+  - 커스텀 PX4 FMU v6X `.px4` 산출물을 `firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`로 복사해 SASL repo에서 git push 가능한 artifact로 관리하게 했다.
+  - 같은 폴더에 `MANIFEST.md`를 추가해 QGC custom firmware 업로드 경로, SHA256, 빌드 출처, DDS export 목적을 기록했다.
+  - 실행 코드/스크립트의 `Capstone` 기본 Python/PX4 경로 의존을 제거하고 SASL 내부 경로 또는 현재 Python/환경변수 override를 사용하게 했다.
+- 이유:
+  - SASL과 Capstone 작업공간을 분리하고, Pixhawk에 넣는 커스텀 펌웨어를 SASL repo만으로 전달/업로드할 수 있어야 하기 때문이다.
+- 확인:
+  - `sha256sum firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4` → `63410eca73fc864770afee773e6e41bd6b7787fd802a3df1f7ff73720b699ea8`
+  - `git check-ignore -v firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4` → ignore rule 없음
+
+## v1.6.16 — 2026-06-24 — ROS2-only MAG priority 표시 분리
+
+- 변경:
+  - `정렬 > MAG 관리`가 ROS2-only selected MAG 수신만으로 CAL_MAG 슬롯/priority 표를 채우지 않게 했다.
+  - ROS2 `vehicle_magnetometer` selected `device_id`는 상태 라벨에 실제 telemetry로 표시하고, `CAL_MAG*_PRIO` readback/적용은 MAVLink PARAM 연결이 필요하다고 명시한다.
+  - ROS2 raw `sensor_mag_*`는 들어오지만 selected `vehicle_magnetometer` 샘플이 없는 경우, raw 슬롯 수신 중/selected MAG 대기 상태를 표시한다.
+- 이유:
+  - 현장 상태에서 P1/P2 모두 raw `sensor_mag_0..4`는 publish됐지만 P1 `/uav_0/fmu/out/vehicle_magnetometer`는 샘플이 없고, P2 `/uav_1/fmu/out/vehicle_magnetometer`만 `device_id=396809`를 약 46.7Hz로 publish했다.
+  - 기존 UI는 P2 selected MAG 샘플 수신만으로 mock/default CAL_MAG priority 표를 열어 실제 PX4 priority readback처럼 보일 수 있었다.
+- 확인:
+  - live ROS2: P1 `sensor_mag_0..4` device_id `4395041/396809/396817/8944899/8944395`, P1 `vehicle_magnetometer` 샘플 없음.
+  - live ROS2: P2 `sensor_mag_0..4` device_id `4395041/396809/396817/8944643/8944395`, P2 `vehicle_magnetometer device_id=396809`.
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'px4_mag_manager or vehicle_magnetometer or alternate_rm3100_backup_id or ros2_only_alignment'` → 8 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 205 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. ROS2 MAG raw topic과 selected `vehicle_magnetometer` source identity, 그리고 MAVLink PARAM readback 가능 여부의 UI 계약만 분리했다.
+
+## v1.6.15 — 2026-06-24 — GNSS Base RTCM Rover 주입
+
+- 변경:
+  - GNSS Base serial 수신 byte stream에서 RTCM3 frame을 분리해 `RTCM 주입 대상`으로 선택한 Left/Right Pixhawk MAVLink 연결에 `GPS_RTCM_DATA`로 전송한다.
+  - 180 byte를 넘는 RTCM frame은 MAVLink `GPS_RTCM_DATA` fragmentation flags를 사용해 여러 packet으로 나눠 보낸다.
+  - `RTCM 주입` 상태 라벨에 주입 대상, byte 수, 실패 상태를 표시한다.
+- 이유:
+  - 기존 GNSS Base 탭은 Survey-in과 raw 수신 상태만 보여주고, Base RTCM correction을 Rover Pixhawk로 전달하지 않았다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'rtcm or gnss_base_survey_in or ubx'` → 8 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_settings.py` → 7 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 204 passed
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. Base serial RTCM3 byte frame을 Rover Pixhawk MAVLink `GPS_RTCM_DATA`로 전달하는 transport 경로만 추가했다.
+
+## v1.6.14 — 2026-06-24 — PX4 SensorGps DDS payload mismatch 수정
+
+- 변경:
+  - `SASL/scripts/bootstrap_ros_workspace.sh`의 기본 `PX4_MSGS_REF`를 현재 PX4 펌웨어의 `SensorGps.msg`와 일치하는 `f7d9fcb65e2cdf4cf556f658bde55682403dcc8c`로 갱신했다.
+  - repo-local ROS workspace `SASL/workspace/main`의 `px4_msgs`를 새 ref로 checkout하고 재빌드했다.
+- 이유:
+  - 기존 ROS workspace의 `px4_msgs/msg/SensorGps`는 `authentication_state`, `system_error`, `antenna_offset_x/y/z` 필드가 없는 167 byte reader였다.
+  - 현재 PX4 펌웨어는 해당 필드를 포함한 180 byte `sensor_gps` payload를 publish해서 FastDDS가 `Change payload size of '180' bytes is larger than the history payload size of '167' bytes` 오류를 냈다.
+- 확인:
+  - live ROS2 echo: `/uav_0/fmu/out/sensor_gps_1`, `/uav_1/fmu/out/sensor_gps_1` 모두 RTPS payload size 오류 없이 decode.
+  - `ros2 interface show px4_msgs/msg/SensorGps` → `antenna_offset_x/y/z` 포함 확인.
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'gps or ros2_connections_are_split_by_pixhawk_side'` → 18 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 201 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+- 좌표/소스 계약:
+  - GPS payload schema만 펌웨어와 맞췄다. 앱의 좌표 변환은 변경하지 않았고, 새 `antenna_offset_x/y/z` 필드는 PX4 body FRD frame 값으로 message에 존재하지만 현재 앱 계산에는 사용하지 않는다.
+
+## v1.6.13 — 2026-06-24 — GNSS Base 탭 스크롤/높이 보정
+
+- 변경:
+  - GNSS Base 탭 전체를 `QScrollArea`로 감싸 작은 화면에서도 설정/연결/Survey-in/Rover 상태 그룹을 스크롤로 볼 수 있게 했다.
+  - `GNSS Base 연결`과 `Survey-in 진행` 그룹에 최소 높이를 부여해 상태 라벨과 그래프가 세로로 눌려 잘리지 않게 했다.
+- 이유:
+  - Survey-in 시각화가 추가되면서 고정 높이 화면에서 GNSS Base 그룹의 상하 공간이 부족해 일부 내용이 잘릴 수 있었다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'gnss_base_survey_in_visualization or gnss_base_survey_in_command_status'` → 2 passed
+  - compact offscreen render: GNSS Base viewport `448 px`, content `1337 px`, vertical scrollbar max `859`
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 201 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+- 좌표/소스 계약:
+  - 좌표/측정/telemetry 값은 변경하지 않았다. GNSS Base 탭 레이아웃과 표시 영역만 변경했다.
+
+## v1.6.12 — 2026-06-24 — Survey-in 진행 시각화
+
+- 변경:
+  - GNSS Base 탭에 `Survey-in 진행` 섹션을 추가했다.
+  - `UBX-NAV-SVIN` 상태 수신 시 최소 시간 대비 진행률, 목표/현재 정확도, 관측 수를 즉시 표시한다.
+  - Survey-in accuracy/target 추이와 observations 추이를 그래프로 표시한다.
+- 이유:
+  - Survey-in은 시간이 오래 걸리는 절차라 `active/valid` 텍스트만으로는 진행 중인지, 정확도가 목표에 접근하는지 판단하기 어렵다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'gnss_base_survey_in or ubx'` → 5 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 201 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. `NAV-SVIN` ECEF mean 값은 기존 상태 텍스트에만 유지하고, 새 시각화는 duration/accuracy/observations scalar만 사용한다.
+
+## v1.6.11 — 2026-06-24 — GNSS Base Survey-in 상태 대기 표시 수정
+
+- 변경:
+  - `Survey-in 시작/중지` 후 UBX `CFG-TMODE3` 명령이 실제 serial write까지 완료되면 Survey-in 상태 라벨을 `전송 완료 | NAV-SVIN 상태 수신 대기`로 갱신하게 했다.
+  - u-blox receiver가 `NAV-SVIN`을 주기 출력하지 않는 경우에도 상태를 읽을 수 있도록 GNSS Base serial worker가 `UBX-NAV-SVIN` poll frame을 주기적으로 전송하게 했다.
+  - Survey-in 시작/중지 직후에도 `NAV-SVIN` poll을 즉시 추가 전송한다.
+- 이유:
+  - 기존 UI는 시작 버튼 클릭 직후 `survey-in 시작 명령 전송 대기`를 표시한 뒤, 명령 전송 완료 signal에서는 connection 라벨만 바꿨다. 따라서 명령이 나갔더라도 `NAV-SVIN` 수신 전까지 Survey-in 라벨이 계속 “전송 대기”로 남을 수 있었다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'ubx or gnss_base'` → 5 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 200 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. GNSS Base serial UBX command/status 표시와 NAV-SVIN status polling만 변경했다.
+
+## v1.6.10 — 2026-06-24 — CAN2 RM3100 대체 Device ID 인식
+
+- 변경:
+  - 실제 P1/P2 ROS2 `/fmu/out/sensor_mag_4`에서 확인된 RM3100 CAN2 `device_id=8944395`를 기존 CAN2 ID `8944387`과 같은 보조 RM3100으로 등록했다.
+  - ROS2 MAG slot mapper와 PX4 MAG 관리 UI가 `8944395`를 `CAN2`로 표시하도록 수정했다.
+  - PX4 MAG manager가 `8944395`를 두 번째 RM3100으로 인정해 `Second RM3100 is not registered` 경고를 잘못 띄우지 않게 했다.
+- 이유:
+  - live ROS2 샘플은 P1 `/uav_0/fmu/out/sensor_mag_4`, P2 `/uav_1/fmu/out/sensor_mag_4` 모두 `device_id=8944395`로 publish되고 있었지만, 앱은 `8944387`만 CAN2로 인식해 CAN2를 미게시처럼 표시했다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'alternate_rm3100_backup_id or can2_mag_sensor or ros2_connections_are_split_by_pixhawk_side'` → 4 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 199 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+  - live ROS2 echo: `/uav_0/fmu/out/sensor_mag_4`, `/uav_1/fmu/out/sensor_mag_4` 모두 `device_id=8944395` 수신.
+  - live ROS2 subscriber smoke: `8944395`가 P1/P2 각각 `CAN2`로 매핑됨.
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. ROS2 MAG source identity 중 `device_id=8944395`의 역할만 CAN2 RM3100으로 확장했다.
+
+## v1.6.9 — 2026-06-24 — P1/P2 ROS2 세션 분리
+
+- 변경:
+  - 연결 화면에 `P1 ROS2 연결`, `P2 ROS2 연결` 버튼을 추가해 `/uav_0`, `/uav_1` ROS2 구독 세션을 개별로 시작/해제할 수 있게 했다.
+  - ROS2 subscriber가 `active_sides`를 받아 한 node가 한쪽 Pixhawk namespace만 구독하도록 했다.
+  - 기존 `ROS2 전체 연결/해제` 버튼은 P1/P2 세션을 순차적으로 조작하는 wrapper로 유지했다.
+  - ROS2 실패 후 MAVLink 복구와 GPS2/RM3100 보조 수신도 side별 ROS2 연결 상태를 기준으로 동작하게 했다.
+- 이유:
+  - P1/P2의 BOARD MAG와 일부 외부 MAG `device_id`가 동일할 수 있어, `device_id` 단독이 아니라 `side + namespace + topic instance + device_id`로 source identity를 보존해야 한다.
+  - 현장 검증에서 P1만 끄거나 P2만 끄는 식으로 `/uav_0`, `/uav_1` publisher/sample이 독립적으로 사라지는지 확인할 수 있어야 한다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'mavlink or ros2 or pixhawk'` → 70 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py` → 197 passed
+  - `STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --check` → `StereoDistance runtime check ok`
+- 좌표/소스 계약:
+  - 좌표 변환은 변경하지 않았다. P1/P2 telemetry source identity만 분리하며, ROS2 MAG/GPS 상태는 side/namespace/topic/device_id 조합으로 해석해야 한다.
+
+## v1.6.8 — 2026-06-24 — 앱 실행 Pixhawk 연결 확인
+
+- 확인:
+  - `scripts/bootstrap_ros_workspace.sh`가 정식 `px4_msgs` 준비 경로임을 확인했다. 이 스크립트는 `SASL/workspace/main/install/setup.bash`를 만들고, `StereoDistance/run.sh`는 해당 overlay가 있으면 자동 source한다.
+  - 임시로 `PX4_WORKSPACE_SETUP=/home/moontaehyung/Capstone/workspace/main/install/setup.bash STEREO_BOOTSTRAP_CALIBRATION_DEPS=1 bash run.sh --start-pixhawk`로 앱을 실행해 P1/P2 연결을 확인했다.
+  - 앱 프로세스 `main.py --start-pixhawk`가 P1/P2 MAVLink UDP `0.0.0.0:14550`, `0.0.0.0:14551`을 열었다.
+  - ROS2 샘플 확인: `/uav_0`, `/uav_1` 모두 `vehicle_attitude`, `sensor_gps_1`, `sensor_mag_4` 샘플 수신.
+- 남은 위험:
+  - 실내 상태라 `sensor_gps_1`은 `fix_type=0`, `satellites_used=0`이다. 따라서 baseline 계산 화면은 GPS fix가 잡힐 때까지 대기 상태가 정상이다.
+
+## v1.6.7 — 2026-06-24 — PX4 v1.17 GPS/MAG DDS export 펌웨어 P1 적용
+
+- 변경:
+  - PX4 v1.17-alpha 로컬 checkout에 맞춘 raw GPS/MAG DDS export 패치 `firmware/patches/px4-v1.17-uxrce-sensor-gps-mag-instances.patch`를 추가했다.
+  - `/home/moontaehyung/Capstone/source/PX4-Autopilot`에서 `px4_fmu-v6x_default`를 빌드하고 USB FMU v6X 한 대에 업로드했다.
+- 이유:
+  - 최신 stock 펌웨어에서는 `/uav_0`, `/uav_1` 모두 `vehicle_attitude` 등 selected topic만 보이고, 앱이 GPS1/GPS2 및 CAN1/CAN2를 구분하는 데 필요한 `sensor_gps_*`, `sensor_mag_*`, `vehicle_magnetometer` DDS topic이 publish되지 않았다.
+- 확인:
+  - `PYTHON_EXECUTABLE=/home/moontaehyung/Capstone/.venv/bin/python make px4_fmu-v6x_default` → build passed, `px4_fmu-v6x_default.px4` 생성.
+  - `strings build/px4_fmu-v6x_default/px4_fmu-v6x_default.elf | rg '/fmu/out/(sensor_gps|sensor_mag|vehicle_magnetometer)'` → `sensor_gps_0`, `sensor_gps_1`, `sensor_mag_0..4`, `vehicle_magnetometer` 확인.
+  - `PYTHON_EXECUTABLE=/home/moontaehyung/Capstone/.venv/bin/python timeout 60s make px4_fmu-v6x_default upload` → `/dev/ttyACM0` FMU v6X serial `002100263433510636363338` 업로드 완료.
+  - 업로드 후 ROS2 topic 확인: `/uav_0/fmu/out/sensor_gps_0`, `sensor_gps_1`, `sensor_mag_0..4`, `vehicle_magnetometer` publish 확인.
+  - P2 USB 연결 후 MAVLink system `2`에 bootloader reboot 명령을 직접 보내고 `Tools/px4_uploader.py`로 업로드했다. uploader serial은 `0049002b3433510336363338`.
+  - P2 업로드 후 `/uav_1/fmu/out/sensor_gps_0`, `sensor_gps_1`, `sensor_mag_0..4`, `vehicle_magnetometer` publish 확인.
+  - `source /opt/ros/humble/setup.bash && source /home/moontaehyung/Capstone/workspace/main/install/setup.bash && ros2 topic echo --once /uav_1/fmu/out/sensor_gps_1` → `device_id=11141181`, `fix_type=0` 샘플 확인.
+  - 동일 source 후 `/uav_1/fmu/out/sensor_mag_4` echo → `device_id=8944395`, raw vector 샘플 확인.
+- 남은 위험:
+  - 빌드 출력의 FLASH 사용량은 `1966016 B / 1920 KB`로 100.00%에 근접한다. 빌드는 통과했지만 향후 topic/module 추가 시 flash 여유를 다시 확인해야 한다.
+
+## v1.6.6 — 2026-06-24 — MAVLink heartbeat 후 P1/P2 액션 버튼 갱신
+
+- 변경:
+  - Pixhawk MAVLink status 수신 시 세션 버튼과 P1/P2 MAVLink 액션 버튼 enabled 상태를 다시 계산하게 했다.
+  - P1/P2 MAVLink 소켓 연결 후 heartbeat가 들어와도 `P1 Shell`, `P1 uXRCE 설정`, `ETH 저장`, `P1 재부팅` 버튼이 회색으로 남는 회귀 테스트를 추가했다.
+- 이유:
+  - `P1 MAVLink 해제` 표시는 열린 소켓 기준으로 갱신됐지만, Shell/uXRCE/ETH/재부팅 버튼은 heartbeat 기록 기준이라 heartbeat 이후 별도 refresh가 필요했다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'mavlink_heartbeat_status_refreshes_side_action_buttons or mavlink_toggle_disconnects_open_socket_without_heartbeat or session_buttons_toggle_labels_and_roles'` → 3 passed
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_stereo.py -k 'mavlink'` → 36 passed
+- 남은 위험:
+  - 이미 실행 중인 앱 프로세스에는 코드 변경이 반영되지 않는다. 앱을 재시작하거나 해당 화면/연결 흐름을 새 코드로 다시 실행해야 한다.
+
 ## v1.6.5 — 2026-06-21 — Simulation 최종 PASS 보정법 기본 경로 정렬
 
 - 변경:
@@ -74,7 +274,7 @@
   - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoDistance python3 -m pytest StereoDistance/tests` → 286 passed
   - `bash StereoDistance/scripts/simulation_origin_evaluate.sh --dry-run --validation-run --repeats 1 --output-dir /tmp/stereodistance_eval_after_move`
 - 남은 위험:
-  - `/home/moontaehyung/Capstone/...` 기본값은 장비/개발환경 기본값으로 남아 있으며, 필요 시 `PYTHON_BIN`, `PX4_WORKSPACE_SETUP`, `PX4_DIR`, `OPERATOR_RECORDER_PYTHON`으로 override해야 한다.
+  - 장비/개발환경 경로는 SASL 내부 탐색 또는 `PYTHON_BIN`, `PX4_WORKSPACE_SETUP`, `PX4_DIR`, `OPERATOR_RECORDER_PYTHON` override에 의존한다.
 
 ## v1.6.1 — 2026-06-09 — Reprojection Profile component gain 안정화
 

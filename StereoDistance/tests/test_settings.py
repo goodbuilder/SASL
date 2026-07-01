@@ -26,14 +26,17 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.right_control_host == "10.0.0.232"
     assert settings.yolo_input_size == 416
     assert settings.preview_width == 1920
-    assert settings.preview_rate_hz == 15.0
+    assert settings.yolo_event_queue_size == 128
+    assert settings.yolo_frame_queue_size == 2
     assert settings.rtsp_decoder == "nvidia"
     assert settings.stream_backend == "gstreamer"
     assert settings.rtsp_transport == "udp"
     assert settings.measurement_display_mode == "detection"
-    assert settings.yolo_gate_matching_enabled is True
-    assert settings.yolo_gate_time_delta_enabled is True
-    assert settings.yolo_gate_vertical_delta_enabled is True
+    assert settings.yolo_gate_class_enabled is False
+    assert settings.yolo_gate_min_bbox_enabled is False
+    assert settings.yolo_gate_matching_enabled is False
+    assert settings.yolo_gate_time_delta_enabled is False
+    assert settings.yolo_gate_vertical_delta_enabled is False
     assert settings.yolo_gate_time_basis == "camera_rtc_required"
     assert settings.ros_domain_id == 0
     assert settings.pixhawk_host_address == "10.0.0.10"
@@ -41,12 +44,16 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.right_pixhawk_eth_ip == "10.0.0.3"
     assert settings.left_mavlink_url == "udpin:0.0.0.0:14550"
     assert settings.right_mavlink_url == "udpin:0.0.0.0:14551"
+    assert settings.left_pixhawk_bootstrap_url == ""
+    assert settings.right_pixhawk_bootstrap_url == ""
+    assert settings.left_pixhawk_bootstrap_baud == 57600
+    assert settings.right_pixhawk_bootstrap_baud == 57600
     assert settings.gnss_base_serial_port == "/dev/ttyACM0"
     assert settings.gnss_base_baud == 460800
     assert settings.gnss_base_survey_in_min_duration_s == 300
     assert settings.gnss_base_survey_in_accuracy_m == 1.0
     assert settings.gnss_base_rtcm_injection_target == "both"
-    assert settings.uam_telemetry_source == "ros2"
+    assert settings.uam_telemetry_source == "mavlink"
     assert settings.uam_ros2_topic == "/uav_0/fmu/out/vehicle_local_position"
     assert settings.uam_ros2_x_field == "x"
     assert settings.uam_ros2_y_field == "y"
@@ -88,8 +95,9 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         yolo_conf_threshold=0.4,
         yolo_iou_threshold=0.6,
         preview_width=1280,
-        preview_rate_hz=30.0,
         rtsp_latency_ms=250,
+        yolo_event_queue_size=256,
+        yolo_frame_queue_size=4,
         rtsp_decoder="software",
         stream_backend="opencv",
         rtsp_transport="tcp",
@@ -103,6 +111,10 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         right_mavlink_url="/dev/ttyACM1",
         left_mavlink_baud=115200,
         right_mavlink_baud=57600,
+        left_pixhawk_bootstrap_url="/dev/serial/by-id/usb-PX4-left",
+        right_pixhawk_bootstrap_url="/dev/serial/by-id/usb-PX4-right",
+        left_pixhawk_bootstrap_baud=921600,
+        right_pixhawk_bootstrap_baud=115200,
         mavlink_configure_streams=False,
         mavlink_stream_rate=1_000_000,
         mavlink_configure_uxrce_agent=False,

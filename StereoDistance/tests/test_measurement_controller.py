@@ -83,6 +83,27 @@ def test_measurement_controller_reports_pixhawk_geometry_waiting() -> None:
     assert "triangulation waiting for Pixhawk R" in result.warnings
 
 
+def test_measurement_controller_reports_intrinsics_waiting() -> None:
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=detection("left", x1=690.0, x2=710.0),
+            right=detection("right", x1=640.0, x2=660.0),
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=None,
+            triangulation_source="pixhawk",
+            left_extrinsic=pixhawk_attitude(),
+            right_extrinsic=pixhawk_attitude(),
+            translation_right_in_left_m=(0.3, 0.0, 0.0),
+            sync_quality="GOOD",
+        )
+    )
+
+    assert result.match is not None
+    assert result.triangulated is None
+    assert result.estimate is None
+    assert "triangulation waiting for intrinsics" in result.warnings
+
+
 def test_measurement_controller_keeps_match_validation_separate_from_triangulation() -> None:
     result = calculate_measurement_geometry(
         MeasurementGeometryInput(

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import queue
 import threading
 import time
 
@@ -24,6 +25,7 @@ from wiris_stereo_distance.yolo_stream import (
     RtpFrameTiming,
     RtcpSenderReportTiming,
     YoloStreamWorker,
+    _BoundedProcessOutputQueue,
     _open_record_video_writer,
     _process_frame_for_output,
     _release_record_video_writer,
@@ -121,6 +123,22 @@ class _FastFakeCapture:
 
     def release(self) -> None:
         self.released = True
+
+
+def test_process_output_queue_drops_preview_frames_without_dropping_detection_events() -> None:
+    event_queue: queue.Queue = queue.Queue(maxsize=1)
+    frame_queue: queue.Queue = queue.Queue(maxsize=1)
+    output_queue = _BoundedProcessOutputQueue(event_queue, frame_queue)
+
+    output_queue.put(("frame", {}, 1, 1, b"a"))
+    output_queue.put(("frame", {}, 1, 1, b"b"))
+    output_queue.put(("detection", 1.0, 1, 1, {"confidence": 0.9}, [], {}))
+
+    assert frame_queue.qsize() == 1
+    assert frame_queue.get_nowait()[4] == b"a"
+    event = event_queue.get_nowait()
+    assert event[0] == "detection"
+    assert event[4]["confidence"] == 0.9
 
 
 def _predict_config() -> dict:
@@ -504,6 +522,26 @@ def test_yolo_worker_uses_cuda_thread_default_without_rate_limit() -> None:
     assert worker.config["max_rate_hz"] == 0.0
     assert worker.config["adaptive_rate"] is False
     assert worker.config["worker_cpu_threads"] == DEFAULT_CUDA_WORKER_THREADS
+    assert worker.config["event_queue_size"] == 128
+    assert worker.config["frame_queue_size"] == 2
+
+
+def test_yolo_worker_accepts_configurable_process_queue_sizes() -> None:
+    worker = YoloStreamWorker(
+        url="rtsp://10.0.0.232:8554/visible",
+        weights_path="weights.pt",
+        device="cuda:0",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        event_queue_size=256,
+        frame_queue_size=4,
+        enable_detection=True,
+    )
+
+    assert worker.config["event_queue_size"] == 256
+    assert worker.config["frame_queue_size"] == 4
 
 
 def test_yolo_worker_defaults_to_nvidia_decoder() -> None:
@@ -808,10 +846,43 @@ def test_yolo_worker_emits_target_rate_in_stats(monkeypatch) -> None:
     assert received[0]["decoded_hz"] == 18.0
     assert received[0]["inferred_hz"] == 7.0
     assert received[0]["yolo_target_hz"] == 9.5
+    assert received[0]["yolo_requested_device"] == "cpu"
+    assert received[0]["yolo_actual_device"] == ""
+    assert received[0]["yolo_cpu_fallback"] is False
     _ = app
 
 
-def test_opencv_receive_hz_counts_reader_frames_not_yolo_limited_frames() -> None:
+def test_yolo_worker_emits_actual_device_and_cpu_fallback_in_stats(monkeypatch) -> None:
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+
+    from PyQt5 import QtWidgets
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    worker = YoloStreamWorker(
+        url="rtsp://10.0.0.232:8554/visible",
+        weights_path="weights.pt",
+        device="cuda:0",
+        input_size=640,
+        conf_threshold=0.5,
+        iou_threshold=0.45,
+        max_rate_hz=0.0,
+        display_rate_hz=20.0,
+        preview_max_width=960,
+        enable_detection=True,
+    )
+    received = []
+    worker.stats_ready.connect(received.append)
+
+    worker._handle_worker_message(("stats", 18.0, 7.0, 7.0, 1280, 720, 9.5, "cuda:0", "cpu", True))
+
+    assert len(received) == 1
+    assert received[0]["yolo_requested_device"] == "cuda:0"
+    assert received[0]["yolo_actual_device"] == "cpu"
+    assert received[0]["yolo_cpu_fallback"] is True
+    _ = app
+
+
+def test_opencv_receive_and_display_hz_are_not_yolo_or_preview_limited() -> None:
     stop_event = threading.Event()
     capture = _FastFakeCapture()
     stats_messages = []
@@ -838,7 +909,7 @@ def test_opencv_receive_hz_counts_reader_frames_not_yolo_limited_frames() -> Non
             "url": "rtsp://example/stream",
             "rtsp_transport": "tcp",
             "stream_backend": "opencv",
-            "display_rate_hz": 0.0,
+            "display_rate_hz": 1.0,
             "max_rate_hz": 5.0,
             "adaptive_rate": False,
             "input_size": 640,
@@ -856,7 +927,23 @@ def test_opencv_receive_hz_counts_reader_frames_not_yolo_limited_frames() -> Non
 
     assert capture.released
     assert stats_messages
-    _kind, decoded_hz, _displayed_hz, inferred_hz, width, height, _target_rate_hz = stats_messages[0]
+    (
+        _kind,
+        decoded_hz,
+        displayed_hz,
+        inferred_hz,
+        width,
+        height,
+        _target_rate_hz,
+        requested_device,
+        actual_device,
+        cpu_fallback,
+    ) = stats_messages[0]
     assert width == 32
     assert height == 24
     assert decoded_hz > inferred_hz * 2.0
+    assert displayed_hz > 1.0
+    assert abs(displayed_hz - decoded_hz) < 0.001
+    assert requested_device == "cpu"
+    assert actual_device == "cpu"
+    assert cpu_fallback is False
