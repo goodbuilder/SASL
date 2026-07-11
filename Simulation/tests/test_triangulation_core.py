@@ -64,6 +64,54 @@ class TriangulationCoreTests(unittest.TestCase):
         self.assertEqual(ray3d.origin.xyz_m, (0.0, 0.0, 0.0))
         self.assertEqual(ray3d.direction.xyz_unit, (0.0, 0.0, 1.0))
 
+    def test_camera_ray_from_pixel_always_uses_camera_optical_rdf(self) -> None:
+        ray3d = camera_ray_from_pixel(650.0, 370.0, self.intrinsics())
+
+        self.assertEqual(ray3d.frame, FrameId.CAMERA_OPTICAL_RDF)
+        self.assertEqual(ray3d.origin.frame, FrameId.CAMERA_OPTICAL_RDF)
+        self.assertEqual(ray3d.direction.frame, FrameId.CAMERA_OPTICAL_RDF)
+        self.assertGreater(ray3d.direction.xyz_unit[0], 0.0)
+        self.assertGreater(ray3d.direction.xyz_unit[1], 0.0)
+        self.assertGreater(ray3d.direction.xyz_unit[2], 0.0)
+        with self.assertRaises(TypeError):
+            camera_ray_from_pixel(650.0, 370.0, self.intrinsics(), frame=FrameId.BASELINE_CENTER_FRD)
+
+    def test_intrinsics_reject_invalid_image_dimensions(self) -> None:
+        invalid_cases = [
+            {"width_px": 1280.5},
+            {"height_px": 720.5},
+            {"width_px": True},
+            {"height_px": False},
+            {"width_px": 0},
+            {"height_px": -1},
+        ]
+        base = dict(width_px=1280, height_px=720, fx_px=900.0, fy_px=900.0, cx_px=640.0, cy_px=360.0)
+        for override in invalid_cases:
+            with self.subTest(override=override):
+                values = {**base, **override}
+                with self.assertRaises((TypeError, ValueError)):
+                    PinholeIntrinsics(**values)
+
+    def test_triangulation_rejects_invalid_tolerances(self) -> None:
+        left = ray((0.0, -1.0, 0.0), (10.0, 1.0, 0.0))
+        right = ray((0.0, 1.0, 0.0), (10.0, -1.0, 0.0))
+        invalid_kwargs = [
+            {"zero_baseline_tolerance_m": math.nan},
+            {"zero_baseline_tolerance_m": math.inf},
+            {"parallel_denominator_tolerance": math.nan},
+            {"parallel_denominator_tolerance": math.inf},
+            {"parallel_denominator_tolerance": 1.0},
+            {"parallel_denominator_tolerance": 1.1},
+            {"min_intersection_angle_rad": math.nan},
+            {"min_intersection_angle_rad": math.inf},
+            {"min_intersection_angle_rad": math.pi / 2.0 + 1.0e-12},
+        ]
+
+        for kwargs in invalid_kwargs:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    closest_points_between_rays(left, right, **kwargs)
+
     def test_ideal_parallel_stereo_geometry(self) -> None:
         baseline_m = 25.0
         point = np.array((1000.0, 7.0, 4.0), dtype=float)
@@ -245,6 +293,16 @@ class TriangulationCoreTests(unittest.TestCase):
         self.assertAlmostEqual(result.range_m, swapped.range_m, places=12)
         self.assertAlmostEqual(result.ray_gap_m, swapped.ray_gap_m, places=12)
         self.assertAlmostEqual(result.intersection_angle_rad, swapped.intersection_angle_rad, places=12)
+        self.assertLess(
+            norm(np.asarray(result.closest_point_left_m) - np.asarray(swapped.closest_point_right_m)),
+            1.0e-12,
+        )
+        self.assertLess(
+            norm(np.asarray(result.closest_point_right_m) - np.asarray(swapped.closest_point_left_m)),
+            1.0e-12,
+        )
+        self.assertAlmostEqual(result.left_ray_parameter_m, swapped.right_ray_parameter_m, places=12)
+        self.assertAlmostEqual(result.right_ray_parameter_m, swapped.left_ray_parameter_m, places=12)
 
     def test_known_point_projection_and_reconstruction(self) -> None:
         intrinsics = self.intrinsics()

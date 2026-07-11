@@ -110,16 +110,21 @@ class CoordinateFrameTests(unittest.TestCase):
         self.assertLess(max_error, 1.0e-9)
 
     def test_rdf_to_frd_axis_transform(self) -> None:
+        r_frd_rdf = ((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
         rdf_to_frd = RigidTransform3D(
             source_frame=FrameId.CAMERA_OPTICAL_RDF,
             target_frame=FrameId.BASELINE_CENTER_FRD,
-            rotation_target_source=((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            rotation_target_source=r_frd_rdf,
             origin_target_in_source_m=(0.0, 0.0, 0.0),
         )
 
-        result = transform_direction(FrameDirection((0.0, 0.0, 1.0), FrameId.CAMERA_OPTICAL_RDF), rdf_to_frd)
+        right = transform_direction(FrameDirection((1.0, 0.0, 0.0), FrameId.CAMERA_OPTICAL_RDF), rdf_to_frd)
+        down = transform_direction(FrameDirection((0.0, 1.0, 0.0), FrameId.CAMERA_OPTICAL_RDF), rdf_to_frd)
+        forward = transform_direction(FrameDirection((0.0, 0.0, 1.0), FrameId.CAMERA_OPTICAL_RDF), rdf_to_frd)
 
-        assert_tuple_close(self, result.xyz_unit, (1.0, 0.0, 0.0))
+        assert_tuple_close(self, right.xyz_unit, (0.0, 1.0, 0.0))
+        assert_tuple_close(self, down.xyz_unit, (0.0, 0.0, 1.0))
+        assert_tuple_close(self, forward.xyz_unit, (1.0, 0.0, 0.0))
 
     def test_quaternion_order_round_trip(self) -> None:
         px4 = (0.5, -0.5, 0.5, -0.5)

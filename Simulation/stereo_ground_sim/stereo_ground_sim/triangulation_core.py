@@ -38,16 +38,18 @@ class PinholeIntrinsics:
     cy_px: float
 
     def __post_init__(self) -> None:
-        if int(self.width_px) <= 0:
-            raise ValueError("width_px must be positive")
-        if int(self.height_px) <= 0:
-            raise ValueError("height_px must be positive")
-        object.__setattr__(self, "width_px", int(self.width_px))
-        object.__setattr__(self, "height_px", int(self.height_px))
+        object.__setattr__(
+            self,
+            "width_px",
+            _positive_integer(self.width_px, field_name="width_px"),
+        )
+        object.__setattr__(
+            self,
+            "height_px",
+            _positive_integer(self.height_px, field_name="height_px"),
+        )
         for field_name in ("fx_px", "fy_px", "cx_px", "cy_px"):
-            value = float(getattr(self, field_name))
-            if not math.isfinite(value):
-                raise ValueError(f"{field_name} must be finite")
+            value = _finite_float(getattr(self, field_name), field_name=field_name)
             if field_name in ("fx_px", "fy_px") and value <= 0.0:
                 raise ValueError(f"{field_name} must be positive")
             object.__setattr__(self, field_name, value)
@@ -81,7 +83,20 @@ class TriangulationResult:
     range_m: float | None
 
 
-def _finite_float(value: float, *, field_name: str) -> float:
+def _positive_integer(value: object, *, field_name: str) -> int:
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{field_name} must be a positive integer, not bool")
+    if not isinstance(value, (int, np.integer)):
+        raise TypeError(f"{field_name} must be a positive integer")
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return parsed
+
+
+def _finite_float(value: object, *, field_name: str) -> float:
+    if isinstance(value, (bool, np.bool_, str)):
+        raise TypeError(f"{field_name} must be a finite float")
     parsed = float(value)
     if not math.isfinite(parsed):
         raise ValueError(f"{field_name} must be finite")
@@ -142,8 +157,6 @@ def camera_ray_from_pixel(
     u_px: float,
     v_px: float,
     intrinsics: PinholeIntrinsics,
-    *,
-    frame: FrameId = FrameId.CAMERA_OPTICAL_RDF,
 ) -> Ray3D:
     """Create an ideal pinhole camera ray from floating-point pixel coordinates.
 
@@ -153,19 +166,20 @@ def camera_ray_from_pixel(
     The unnormalized Camera Optical RDF direction is
     `((u-cx)/fx, (v-cy)/fy, 1.0)`, where RDF is X right, Y down, Z forward.
     The ray origin is the camera optical center `(0, 0, 0)` in meters.
+    The returned ray is always in `FrameId.CAMERA_OPTICAL_RDF`; convert to any
+    other frame with `transform_ray()`.
     """
 
     u = _finite_float(u_px, field_name="u_px")
     v = _finite_float(v_px, field_name="v_px")
-    frame = FrameId(frame)
     direction = (
         (u - intrinsics.cx_px) / intrinsics.fx_px,
         (v - intrinsics.cy_px) / intrinsics.fy_px,
         1.0,
     )
     return Ray3D(
-        origin=FramePoint((0.0, 0.0, 0.0), frame),
-        direction=FrameDirection.from_vector(direction, frame),
+        origin=FramePoint((0.0, 0.0, 0.0), FrameId.CAMERA_OPTICAL_RDF),
+        direction=FrameDirection.from_vector(direction, FrameId.CAMERA_OPTICAL_RDF),
     )
 
 
@@ -189,10 +203,18 @@ def closest_points_between_rays(
 
     if left_ray.frame != right_ray.frame:
         raise ValueError("left and right rays must be in the same frame")
+    zero_baseline_tolerance_m = _finite_float(
+        zero_baseline_tolerance_m,
+        field_name="zero_baseline_tolerance_m",
+    )
+    parallel_denominator_tolerance = _finite_float(
+        parallel_denominator_tolerance,
+        field_name="parallel_denominator_tolerance",
+    )
     if zero_baseline_tolerance_m < 0.0:
         raise ValueError("zero_baseline_tolerance_m must be non-negative")
-    if parallel_denominator_tolerance < 0.0:
-        raise ValueError("parallel_denominator_tolerance must be non-negative")
+    if parallel_denominator_tolerance < 0.0 or parallel_denominator_tolerance >= 1.0:
+        raise ValueError("parallel_denominator_tolerance must be >= 0 and < 1")
     if min_intersection_angle_rad is not None:
         min_intersection_angle_rad = _finite_float(
             min_intersection_angle_rad,
@@ -200,6 +222,8 @@ def closest_points_between_rays(
         )
         if min_intersection_angle_rad < 0.0:
             raise ValueError("min_intersection_angle_rad must be non-negative")
+        if min_intersection_angle_rad > math.pi / 2.0:
+            raise ValueError("min_intersection_angle_rad must be <= pi/2")
 
     output_frame = left_ray.frame
     o_left = _vector3(left_ray.origin.xyz_m, field_name="left origin")
