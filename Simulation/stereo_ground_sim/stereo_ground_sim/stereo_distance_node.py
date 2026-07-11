@@ -566,6 +566,17 @@ class StereoDistanceNode(Node):
             "ground_truth_m": float(range_m),
         }
 
+    def _comparison_actual_and_error_for_publish(self, *, metrics, ground_truth_metadata):
+        if self.actual_distance_source == "gazebo" and ground_truth_metadata.get("oracle_valid") is not True:
+            return math.nan, math.nan
+        actual = metrics.get("actual_distance_m")
+        if actual is None:
+            actual = self._actual_distance()
+        error = metrics.get("distance_error_m")
+        actual_value = math.nan if actual is None else float(actual)
+        error_value = math.nan if error is None else float(error)
+        return actual_value, error_value
+
     def _on_param_update(self, params):
         for param in params:
             if param.name in ORACLE_STATIC_PARAMETERS:
@@ -1120,9 +1131,7 @@ class StereoDistanceNode(Node):
                 getattr(self, "cached_ground_truth_metadata", self._initial_gazebo_oracle_metadata())
             )
 
-        actual = metrics.get("actual_distance_m", self._actual_distance())
         distance = metrics.get("distance_m")
-        error = metrics.get("distance_error_m")
         disparity = metrics.get("disparity_px")
         estimated_right = metrics.get("estimated_right_m")
         estimated_down = metrics.get("estimated_down_m")
@@ -1135,11 +1144,11 @@ class StereoDistanceNode(Node):
         bbox_adjustment = metrics.get("bbox_adjustment")
 
         distance_value = math.nan if distance is None else float(distance)
-        error_value = math.nan if error is None else float(error)
         disparity_value = math.nan if disparity is None else float(disparity)
-        if self.actual_distance_source == "gazebo" and ground_truth_metadata.get("oracle_valid") is not True:
-            actual = math.nan
-            error_value = math.nan
+        actual_value, error_value = self._comparison_actual_and_error_for_publish(
+            metrics=metrics,
+            ground_truth_metadata=ground_truth_metadata,
+        )
         estimated_position_values = [
             math.nan if estimated_forward is None else float(estimated_forward),
             math.nan if estimated_right is None else float(estimated_right),
@@ -1164,7 +1173,7 @@ class StereoDistanceNode(Node):
         self.comparison_pub.publish(
             Float32MultiArray(
                 data=[
-                    float(actual),
+                    actual_value,
                     distance_value,
                     error_value,
                     disparity_value,
@@ -1398,6 +1407,17 @@ class StereoDistanceNode(Node):
             left, right = self._detect_drone_pair(left_image, right_image, device=device)
             metrics = self._calculate_metrics(left_image, left, right, actual, phase)
             with self.lock:
+                ground_truth_metadata = dict(
+                    getattr(self, "cached_ground_truth_metadata", self._initial_gazebo_oracle_metadata())
+                )
+                comparison_actual, comparison_error = self._comparison_actual_and_error_for_publish(
+                    metrics=metrics,
+                    ground_truth_metadata=ground_truth_metadata,
+                )
+                metrics = dict(metrics)
+                if self.actual_distance_source == "gazebo" and ground_truth_metadata.get("oracle_valid") is not True:
+                    metrics["actual_distance_m"] = comparison_actual
+                    metrics["distance_error_m"] = comparison_error
                 self.left_detection = left
                 self.right_detection = right
                 self.metrics = metrics
@@ -1409,7 +1429,7 @@ class StereoDistanceNode(Node):
             if distance is not None:
                 self.distance_pub.publish(Float32(data=float(distance)))
             if error is not None:
-                self.error_pub.publish(Float32(data=float(error)))
+                self.error_pub.publish(Float32(data=comparison_error))
             if disparity is not None:
                 self.disparity_pub.publish(Float32(data=float(disparity)))
             self._publish_estimated_position(metrics)
@@ -1417,9 +1437,9 @@ class StereoDistanceNode(Node):
                 self.comparison_pub.publish(
                     Float32MultiArray(
                         data=[
-                            float(actual),
+                            comparison_actual,
                             float(distance),
-                            float(error),
+                            comparison_error,
                             float(disparity),
                         ]
                     )

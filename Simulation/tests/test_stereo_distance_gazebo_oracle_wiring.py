@@ -191,6 +191,14 @@ class FakeProcess:
         self.stdout = list(lines)
 
 
+class FakeCondition:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+
 class TrackingLock:
     def __init__(self):
         self.depth = 0
@@ -272,8 +280,9 @@ def make_node(*, tracking_lock=False):
         "mission_phase": "init",
         "status": "unit",
     }
-    node.actual_distance_pub = FakePublisher(getattr(node.lock, "depth", None) and node.lock)
-    node.ground_truth_position_pub = FakePublisher(getattr(node.lock, "depth", None) and node.lock)
+    publish_lock = node.lock if hasattr(node.lock, "depth") else None
+    node.actual_distance_pub = FakePublisher(publish_lock)
+    node.ground_truth_position_pub = FakePublisher(publish_lock)
     node.distance_pub = FakePublisher()
     node.error_pub = FakePublisher()
     node.disparity_pub = FakePublisher()
@@ -282,6 +291,13 @@ def make_node(*, tracking_lock=False):
     node.bbox_adjustment_pub = FakePublisher()
     node.profile_status_pub = FakePublisher()
     node.comparison_pub = FakePublisher()
+    node.yolo_inference_ms_pub = FakePublisher()
+    node.yolo_update_hz_pub = FakePublisher()
+    node.detections_pub = FakePublisher()
+    node.yolo_condition = FakeCondition()
+    node.yolo_inference_in_progress = False
+    node.last_yolo_completion = None
+    node.resolved_yolo_device = "cpu"
     node.gazebo_pose_stream_started = True
     node._mission_state = lambda: {"distance_m": 999.0, "phase": "unit"}
     return node
@@ -290,6 +306,54 @@ def make_node(*, tracking_lock=False):
 def consume_one(node, record):
     node.last_gazebo_pose_sample_attempt = 0.0
     StereoDistanceNode._consume_gazebo_pose_stream(node, FakeProcess([line_for(record)]))
+
+
+def direct_yolo_metrics(actual, *, distance=123.0, disparity=4.0):
+    error = None if distance is None else distance - actual
+    return {
+        "distance_m": distance,
+        "disparity_px": disparity,
+        "estimated_right_m": 0.0,
+        "estimated_down_m": 0.0,
+        "estimated_forward_m": distance,
+        "estimated_range_m": distance,
+        "corrected_right_m": None,
+        "corrected_down_m": None,
+        "corrected_forward_m": None,
+        "corrected_range_m": None,
+        "bbox_adjustment": None,
+        "profile_status": {"profile_id": "", "profile_mode": "", "fallback_level": 3, "fallback_reason": "unit"},
+        "observation_fusion_status": "disabled",
+        "general_ray_shadow": {"valid": False, "status": "not_computed"},
+        "actual_distance_m": actual,
+        "distance_error_m": error,
+        "mission_phase": "unit",
+        "status": "unit yolo",
+    }
+
+
+def install_direct_yolo_stubs(node, *, metrics_factory=None):
+    factory = metrics_factory or (lambda actual: direct_yolo_metrics(actual))
+    node._msg_to_rgb = lambda msg: msg
+    node._resolve_yolo_device = lambda: "cpu"
+    node._detect_drone_pair = lambda left, right, device=None: (
+        {"bbox": (0.0, 0.0, 1.0, 1.0), "confidence": 1.0, "cx": 0.5, "cy": 0.5},
+        {"bbox": (0.0, 0.0, 1.0, 1.0), "confidence": 1.0, "cx": 0.4, "cy": 0.5},
+    )
+    node._calculate_metrics = lambda left_image, left, right, actual, phase: factory(actual)
+    node._detections_to_msg = lambda left, right: types.SimpleNamespace(data=[1.0])
+    node._publish_estimated_position = lambda metrics: None
+
+
+def run_direct_yolo_update(node):
+    StereoDistanceNode._update_metrics_from_messages(
+        node,
+        object(),
+        object(),
+        node.cached_actual_distance,
+        "unit",
+        device="cpu",
+    )
 
 
 class StereoDistanceGazeboOracleWiringTests(unittest.TestCase):
@@ -640,6 +704,96 @@ class StereoDistanceGazeboOracleWiringTests(unittest.TestCase):
         comparison = node.comparison_pub.messages[-1].data
         self.assertEqual(comparison[0], -50.0)
         self.assertEqual(comparison[2], -173.0)
+
+    def test_direct_yolo_path_masks_invalid_latest_oracle_truth(self):
+        node = make_node()
+        consume_one(node, payload(x=0.0, y=100.0, z=5.0))
+        cached_actual = node.cached_actual_distance
+        cached_position = dict(node.cached_ground_truth_position)
+        sequence = node.actual_distance_sample_seq
+        last_valid_update = node.last_gazebo_pose_update
+        node.last_gazebo_pose_sample_attempt = 0.0
+        consume_one(node, payload("missing_model"))
+        install_direct_yolo_stubs(node)
+
+        run_direct_yolo_update(node)
+
+        comparison = node.comparison_pub.messages[-1].data
+        self.assertTrue(math.isnan(comparison[0]))
+        self.assertEqual(comparison[1], 123.0)
+        self.assertTrue(math.isnan(comparison[2]))
+        self.assertEqual(comparison[3], 4.0)
+        self.assertTrue(math.isnan(node.error_pub.messages[-1].data))
+        self.assertEqual(node.cached_actual_distance, cached_actual)
+        self.assertEqual(node.cached_ground_truth_position, cached_position)
+        self.assertEqual(node.actual_distance_sample_seq, sequence)
+        self.assertEqual(node.last_gazebo_pose_update, last_valid_update)
+        self.assertTrue(math.isnan(node.metrics["actual_distance_m"]))
+        self.assertTrue(math.isnan(node.metrics["distance_error_m"]))
+
+    def test_direct_yolo_path_valid_recovery_uses_signed_oracle_truth(self):
+        node = make_node()
+        consume_one(node, payload("missing_model"))
+        node.last_gazebo_pose_sample_attempt = 0.0
+        consume_one(node, payload(x=0.0, y=-50.0, z=5.0))
+        install_direct_yolo_stubs(node)
+
+        run_direct_yolo_update(node)
+
+        comparison = node.comparison_pub.messages[-1].data
+        self.assertEqual(comparison[0], -50.0)
+        self.assertEqual(comparison[1], 123.0)
+        self.assertEqual(comparison[2], 173.0)
+        self.assertEqual(node.error_pub.messages[-1].data, 173.0)
+
+    def test_plot_and_direct_yolo_paths_share_invalid_comparison_policy(self):
+        metrics = direct_yolo_metrics(100.0)
+        node = make_node()
+        consume_one(node, payload(x=0.0, y=100.0, z=5.0))
+        node.last_gazebo_pose_sample_attempt = 0.0
+        consume_one(node, payload("missing_model"))
+        metadata = dict(node.cached_ground_truth_metadata)
+        helper_actual, helper_error = StereoDistanceNode._comparison_actual_and_error_for_publish(
+            node,
+            metrics=metrics,
+            ground_truth_metadata=metadata,
+        )
+        self.assertTrue(math.isnan(helper_actual))
+        self.assertTrue(math.isnan(helper_error))
+
+        node.metrics = dict(metrics)
+        StereoDistanceNode._publish_plot_samples(node)
+        plot_comparison = node.comparison_pub.messages[-1].data
+
+        install_direct_yolo_stubs(node, metrics_factory=lambda actual: dict(metrics))
+        run_direct_yolo_update(node)
+        direct_comparison = node.comparison_pub.messages[-1].data
+
+        self.assertTrue(math.isnan(plot_comparison[0]))
+        self.assertEqual(plot_comparison[1], direct_comparison[1])
+        self.assertTrue(math.isnan(plot_comparison[2]))
+        self.assertTrue(math.isnan(direct_comparison[0]))
+        self.assertTrue(math.isnan(direct_comparison[2]))
+
+    def test_direct_yolo_publish_occurs_outside_lock(self):
+        node = make_node(tracking_lock=True)
+        consume_one(node, payload(x=0.0, y=100.0, z=5.0))
+        node.last_gazebo_pose_sample_attempt = 0.0
+        consume_one(node, payload("missing_model"))
+        node.distance_pub = FakePublisher(node.lock)
+        node.error_pub = FakePublisher(node.lock)
+        node.disparity_pub = FakePublisher(node.lock)
+        node.comparison_pub = FakePublisher(node.lock)
+        node.detections_pub = FakePublisher(node.lock)
+        node.yolo_inference_ms_pub = FakePublisher(node.lock)
+        node.yolo_update_hz_pub = FakePublisher(node.lock)
+        install_direct_yolo_stubs(node)
+
+        run_direct_yolo_update(node)
+
+        self.assertEqual(len(node.comparison_pub.messages), 1)
+        self.assertEqual(len(node.error_pub.messages), 1)
+        self.assertEqual(node.lock.depth, 0)
 
     def test_publish_ground_truth_position_order(self):
         node = make_node()
