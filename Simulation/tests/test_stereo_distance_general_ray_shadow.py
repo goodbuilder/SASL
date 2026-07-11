@@ -6,15 +6,55 @@ import sys
 import types
 import unittest
 from collections import deque
+from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
 
 import numpy as np
 
 
-def install_ros_import_stubs() -> None:
-    if "rclpy" in sys.modules or find_spec("rclpy") is not None:
-        return
+PACKAGE_DIR = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
+if str(PACKAGE_DIR) not in sys.path:
+    sys.path.insert(0, str(PACKAGE_DIR))
+
+
+ROS_IMPORT_MODULES = (
+    "rclpy",
+    "rclpy.executors",
+    "rclpy.node",
+    "rclpy.qos",
+    "rcl_interfaces",
+    "rcl_interfaces.msg",
+    "sensor_msgs",
+    "sensor_msgs.msg",
+    "std_msgs",
+    "std_msgs.msg",
+    "visualization_msgs",
+    "visualization_msgs.msg",
+    "stereo_ground_sim.stereo_distance_node",
+)
+_MISSING = object()
+
+
+def _module_snapshot(names=ROS_IMPORT_MODULES) -> dict[str, object]:
+    return {name: sys.modules.get(name, _MISSING) for name in names}
+
+
+def _restore_module_snapshot(snapshot: dict[str, object]) -> None:
+    for name, module in snapshot.items():
+        if module is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
+
+
+def _make_ros_import_stubs() -> dict[str, types.ModuleType]:
+    """Create temporary ROS stubs for direct-method Node import only.
+
+    These tests validate StereoDistanceNode direct-method wiring. They do not
+    constitute a ROS 2 executor, publisher transport, or Gazebo runtime smoke
+    test.
+    """
 
     class Message:
         def __init__(self, **kwargs):
@@ -68,33 +108,61 @@ def install_ros_import_stubs() -> None:
     visualization_msgs_msg = types.ModuleType("visualization_msgs.msg")
     visualization_msgs_msg.Marker = Marker
 
-    sys.modules.update(
-        {
-            "rclpy": rclpy,
-            "rclpy.executors": rclpy_executors,
-            "rclpy.node": rclpy_node,
-            "rclpy.qos": rclpy_qos,
-            "rcl_interfaces": rcl_interfaces,
-            "rcl_interfaces.msg": rcl_interfaces_msg,
-            "sensor_msgs": sensor_msgs,
-            "sensor_msgs.msg": sensor_msgs_msg,
-            "std_msgs": std_msgs,
-            "std_msgs.msg": std_msgs_msg,
-            "visualization_msgs": visualization_msgs,
-            "visualization_msgs.msg": visualization_msgs_msg,
-        }
-    )
+    rcl_interfaces.msg = rcl_interfaces_msg
+    sensor_msgs.msg = sensor_msgs_msg
+    std_msgs.msg = std_msgs_msg
+    visualization_msgs.msg = visualization_msgs_msg
+
+    return {
+        "rclpy": rclpy,
+        "rclpy.executors": rclpy_executors,
+        "rclpy.node": rclpy_node,
+        "rclpy.qos": rclpy_qos,
+        "rcl_interfaces": rcl_interfaces,
+        "rcl_interfaces.msg": rcl_interfaces_msg,
+        "sensor_msgs": sensor_msgs,
+        "sensor_msgs.msg": sensor_msgs_msg,
+        "std_msgs": std_msgs,
+        "std_msgs.msg": std_msgs_msg,
+        "visualization_msgs": visualization_msgs,
+        "visualization_msgs.msg": visualization_msgs_msg,
+    }
 
 
-install_ros_import_stubs()
+def import_stereo_distance_node_class():
+    """Import StereoDistanceNode without leaving fallback ROS stubs behind.
 
-PACKAGE_DIR = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
-if str(PACKAGE_DIR) not in sys.path:
-    sys.path.insert(0, str(PACKAGE_DIR))
+    These tests validate StereoDistanceNode direct-method wiring. They do not
+    constitute a ROS 2 executor, publisher transport, or Gazebo runtime smoke
+    test.
+    """
+
+    module_name = "stereo_ground_sim.stereo_distance_node"
+    if find_spec("rclpy") is not None:
+        return import_module(module_name).StereoDistanceNode, False
+
+    snapshot = _module_snapshot()
+    package = sys.modules.get("stereo_ground_sim")
+    had_package_attr = package is not None and hasattr(package, "stereo_distance_node")
+    package_attr = getattr(package, "stereo_distance_node", None) if package is not None else None
+    try:
+        sys.modules.pop(module_name, None)
+        sys.modules.update(_make_ros_import_stubs())
+        module = import_module(module_name)
+        return module.StereoDistanceNode, True
+    finally:
+        _restore_module_snapshot(snapshot)
+        if package is not None:
+            if had_package_attr:
+                setattr(package, "stereo_distance_node", package_attr)
+            elif hasattr(package, "stereo_distance_node"):
+                delattr(package, "stereo_distance_node")
 
 from stereo_ground_sim.runtime_guard_policy import EstimatedToTruthSim3Profile  # noqa: E402
-from stereo_ground_sim.stereo_distance_node import StereoDistanceNode  # noqa: E402
 from stereo_ground_sim.stereo_triangulation_adapter import COMPARISON_SOURCE  # noqa: E402
+
+
+StereoDistanceNode, USING_ROS_IMPORT_STUBS = import_stereo_distance_node_class()
 
 
 WIDTH_PX = 1280
@@ -160,7 +228,26 @@ def assert_json_compatible_primitives(testcase: unittest.TestCase, value) -> Non
     testcase.fail(f"non-primitive value in shadow summary: {type(value)!r}")
 
 
+def assert_sequence_almost_equal(testcase: unittest.TestCase, actual, expected, delta: float = 1.0e-5) -> None:
+    testcase.assertEqual(len(actual), len(expected))
+    for actual_value, expected_value in zip(actual, expected):
+        testcase.assertAlmostEqual(float(actual_value), expected_value, delta=delta)
+
+
 class StereoDistanceGeneralRayShadowTests(unittest.TestCase):
+    def test_fallback_ros_stubs_do_not_leak_sys_modules(self) -> None:
+        if not USING_ROS_IMPORT_STUBS:
+            self.skipTest("real rclpy import path is available")
+        before = _module_snapshot()
+
+        node_class, used_stubs = import_stereo_distance_node_class()
+        after = _module_snapshot()
+
+        self.assertTrue(used_stubs)
+        self.assertEqual(node_class.__name__, "StereoDistanceNode")
+        for name in ROS_IMPORT_MODULES:
+            self.assertIs(after[name], before[name], msg=name)
+
     def assert_shadow_compatible(self, metrics, places: int = 6) -> None:
         shadow = metrics["general_ray_shadow"]
         self.assertTrue(shadow["valid"])
@@ -286,8 +373,8 @@ class StereoDistanceGeneralRayShadowTests(unittest.TestCase):
 
         StereoDistanceNode._publish_estimated_position(node, metrics)
 
-        self.assertEqual(node.estimated_position_pub.messages[-1].data, [100.0, 7.0, 4.0, 100.325])
-        self.assertEqual(node.corrected_position_pub.messages[-1].data, [103.0, 8.0, 6.0, 103.348])
+        assert_sequence_almost_equal(self, node.estimated_position_pub.messages[-1].data, [100.0, 7.0, 4.0, 100.325])
+        assert_sequence_almost_equal(self, node.corrected_position_pub.messages[-1].data, [103.0, 8.0, 6.0, 103.348])
 
     def test_profile_status_json_does_not_include_shadow(self) -> None:
         node = make_node()
