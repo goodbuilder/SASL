@@ -35,6 +35,7 @@ class OracleStatus(str, Enum):
     MISSING_POSITION = "missing_position"
     NON_FINITE_POSITION = "non_finite_position"
     UNSUPPORTED_POSE_FORMAT = "unsupported_pose_format"
+    UNSUPPORTED_NONZERO_LINK_OFFSET = "unsupported_nonzero_link_offset"
 
 
 @dataclass(frozen=True)
@@ -206,34 +207,17 @@ def select_oracle_pose(payload: Any, policy: OracleSourcePolicy) -> OraclePoseSe
     records = _named_pose_records(payload)
     for priority, source in enumerate(policy.sources):
         fallback_used, fallback_reason = _fallback_metadata_for_priority(priority)
-        for exact_name in source.exact_names:
-            matches = [record for record in records if record.name == exact_name]
-            if len(matches) > 1:
-                return _invalid_selection(OracleStatus.AMBIGUOUS_ENTITY_NAME)
-            if len(matches) == 1:
-                return _selection_from_record(
-                    record=matches[0],
-                    status=_ok_status_for_role(source.role),
-                    role=source.role,
-                    match_kind=OracleMatchKind.EXACT,
-                    source_priority=priority,
-                    fallback_used=fallback_used,
-                    fallback_reason=fallback_reason,
-                )
-
-        suffix_matches = [
-            record
-            for record in records
-            if any(record.name.endswith(suffix) for suffix in source.scoped_suffixes)
-        ]
-        if len(suffix_matches) > 1:
+        match_status, record, match_kind = _match_source_record(records, source)
+        if match_status == OracleStatus.AMBIGUOUS_ENTITY_NAME:
             return _invalid_selection(OracleStatus.AMBIGUOUS_ENTITY_NAME)
-        if len(suffix_matches) == 1:
+        if record is not None and match_kind is not None:
             return _selection_from_record(
-                record=suffix_matches[0],
+                records=records,
+                policy=policy,
+                record=record,
                 status=_ok_status_for_role(source.role),
                 role=source.role,
-                match_kind=OracleMatchKind.UNIQUE_SCOPED_SUFFIX,
+                match_kind=match_kind,
                 source_priority=priority,
                 fallback_used=fallback_used,
                 fallback_reason=fallback_reason,
@@ -308,6 +292,8 @@ def _named_pose_records(payload: dict[str, Any] | list[Any]) -> tuple[_NamedReco
 
 def _selection_from_record(
     *,
+    records: tuple[_NamedRecord, ...],
+    policy: OracleSourcePolicy,
     record: _NamedRecord,
     status: OracleStatus,
     role: OracleSourceRole,
@@ -316,7 +302,15 @@ def _selection_from_record(
     fallback_used: bool,
     fallback_reason: str,
 ) -> OraclePoseSelection:
-    parse_status, point = _parse_world_position(record.record)
+    if role in (OracleSourceRole.TARGET_REFERENCE_LINK, OracleSourceRole.BASE_LINK) and _has_valid_entity_id(
+        record.record
+    ):
+        parse_status, point = _pose_v_link_world_position(records=records, policy=policy, link_record=record)
+    elif role == OracleSourceRole.MODEL_POSE and _has_valid_entity_id(record.record):
+        parse_status, xyz = _parse_protojson_vector3(_position_field(record.record), field_name="position")
+        point = FramePoint(xyz, FrameId.GAZEBO_WORLD_ENU) if parse_status is None and xyz is not None else None
+    else:
+        parse_status, point = _parse_world_position(record.record)
     if parse_status is not None:
         return OraclePoseSelection(
             valid=False,
@@ -340,6 +334,91 @@ def _selection_from_record(
         fallback_reason=fallback_reason,
         point_world_enu_m=point,
     )
+
+
+def _match_source_record(
+    records: tuple[_NamedRecord, ...], source: OracleSourceCandidate
+) -> tuple[OracleStatus, _NamedRecord | None, OracleMatchKind | None]:
+    for exact_name in source.exact_names:
+        matches = [record for record in records if record.name == exact_name]
+        if len(matches) > 1:
+            return OracleStatus.AMBIGUOUS_ENTITY_NAME, None, None
+        if len(matches) == 1:
+            return _ok_status_for_role(source.role), matches[0], OracleMatchKind.EXACT
+
+    suffix_matches = [
+        record
+        for record in records
+        if any(record.name.endswith(suffix) for suffix in source.scoped_suffixes)
+    ]
+    if len(suffix_matches) > 1:
+        return OracleStatus.AMBIGUOUS_ENTITY_NAME, None, None
+    if len(suffix_matches) == 1:
+        return _ok_status_for_role(source.role), suffix_matches[0], OracleMatchKind.UNIQUE_SCOPED_SUFFIX
+    return OracleStatus.ORACLE_SOURCE_NOT_FOUND, None, None
+
+
+def _pose_v_link_world_position(
+    *,
+    records: tuple[_NamedRecord, ...],
+    policy: OracleSourcePolicy,
+    link_record: _NamedRecord,
+) -> tuple[OracleStatus | None, FramePoint | None]:
+    model_source = policy.sources[2]
+    model_match_status, model_record, _match_kind = _match_source_record(records, model_source)
+    if model_match_status == OracleStatus.AMBIGUOUS_ENTITY_NAME:
+        return OracleStatus.AMBIGUOUS_ENTITY_NAME, None
+    if model_record is None:
+        return OracleStatus.ORACLE_SOURCE_NOT_FOUND, None
+    if not _has_valid_entity_id(model_record.record):
+        return OracleStatus.UNSUPPORTED_POSE_FORMAT, None
+
+    link_status, link_local = _parse_protojson_vector3(_position_field(link_record.record), field_name="position")
+    if link_status is not None or link_local is None:
+        return link_status, None
+    if math.sqrt(sum(value * value for value in link_local)) > 1.0e-9:
+        return OracleStatus.UNSUPPORTED_NONZERO_LINK_OFFSET, None
+
+    model_status, model_world = _parse_protojson_vector3(_position_field(model_record.record), field_name="position")
+    if model_status is not None or model_world is None:
+        return model_status, None
+    return None, FramePoint(model_world, FrameId.GAZEBO_WORLD_ENU)
+
+
+def _has_valid_entity_id(record: Mapping[str, Any]) -> bool:
+    entity_id = record.get("id")
+    if isinstance(entity_id, bool) or not isinstance(entity_id, int):
+        return False
+    return entity_id > 0
+
+
+def _position_field(record: Mapping[str, Any]) -> Any:
+    if "position" in record:
+        return record["position"]
+    if "pos" in record:
+        return record["pos"]
+    return None
+
+
+def _parse_protojson_vector3(position: Any, *, field_name: str) -> tuple[OracleStatus | None, tuple[float, float, float] | None]:
+    if position is None:
+        return OracleStatus.MISSING_POSITION, None
+    if not isinstance(position, Mapping):
+        return OracleStatus.UNSUPPORTED_POSE_FORMAT, None
+
+    values: list[float] = []
+    for axis in ("x", "y", "z"):
+        value = position.get(axis, 0.0)
+        if isinstance(value, bool):
+            return OracleStatus.UNSUPPORTED_POSE_FORMAT, None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return OracleStatus.UNSUPPORTED_POSE_FORMAT, None
+        if not math.isfinite(parsed):
+            return OracleStatus.NON_FINITE_POSITION, None
+        values.append(parsed)
+    return None, tuple(values)
 
 
 def _parse_world_position(record: Mapping[str, Any]) -> tuple[OracleStatus | None, FramePoint | None]:

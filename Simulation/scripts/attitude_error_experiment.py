@@ -110,7 +110,7 @@ def parse_args():
     parser.add_argument("--horizontal-fov-rad", type=float, default=0.154997710698)
     parser.add_argument("--image-width-px", type=int, default=1280)
     parser.add_argument("--image-height-px", type=int, default=720)
-    parser.add_argument("--camera-update-rate-hz", type=float, default=60.0)
+    parser.add_argument("--camera-update-rate-hz", type=float, default=20.0)
     parser.add_argument("--camera-clip-near-m", type=float, default=0.1)
     parser.add_argument("--camera-clip-far-m", type=float, default=2500.0)
     parser.add_argument("--target-spawn-x-m", type=float, default=0.0)

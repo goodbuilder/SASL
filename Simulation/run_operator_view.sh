@@ -809,7 +809,7 @@ add_default_launch_arg camera_height_m "${CAMERA_HEIGHT_M:-5.0}" "${launch_input
 add_default_launch_arg horizontal_fov_rad "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" "${launch_input[@]}"
 add_default_launch_arg camera_image_width_px "${CAMERA_IMAGE_WIDTH_PX:-1280}" "${launch_input[@]}"
 add_default_launch_arg camera_image_height_px "${CAMERA_IMAGE_HEIGHT_PX:-720}" "${launch_input[@]}"
-add_default_launch_arg camera_update_rate_hz "${CAMERA_UPDATE_RATE_HZ:-60.0}" "${launch_input[@]}"
+add_default_launch_arg camera_update_rate_hz "${CAMERA_UPDATE_RATE_HZ:-20.0}" "${launch_input[@]}"
 add_default_launch_arg camera_clip_near_m "${CAMERA_CLIP_NEAR_M:-0.1}" "${launch_input[@]}"
 add_default_launch_arg camera_clip_far_m "${CAMERA_CLIP_FAR_M:-2500.0}" "${launch_input[@]}"
 

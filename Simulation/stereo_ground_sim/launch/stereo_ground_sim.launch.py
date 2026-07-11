@@ -28,12 +28,19 @@ def _bool_config(context, name):
 def _param_yaml_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        numeric_values = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, (int, float)) or not math.isfinite(float(item)):
+                raise ValueError("Only finite numeric YAML sequence values are supported")
+            numeric_values.append(float(item))
+        return json.dumps(numeric_values)
     if isinstance(value, (int, float)):
         return str(value)
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def _write_distance_node_params(context):
+def _write_distance_node_params(context, params_file=None):
     float_params = {
         "baseline_m",
         "camera_height_m",
@@ -99,6 +106,8 @@ def _write_distance_node_params(context):
         "actual_distance_read_hz",
         "actual_distance_source",
         "target_model_name",
+        "target_reference_link_name",
+        "oracle_base_link_name",
         "yolo_model_path",
         "yolo_class_name",
         "yolo_confidence",
@@ -140,7 +149,21 @@ def _write_distance_node_params(context):
         else:
             params[name] = raw
 
-    params_file = os.path.join(tempfile.gettempdir(), "stereo_distance_node_params.yaml")
+    params["baseline_origin_world_enu_m"] = [0.0, 0.0, float(params["camera_height_m"])]
+    params["rotation_baseline_world_row_major"] = [
+        0.0,
+        1.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -1.0,
+    ]
+
+    if params_file is None:
+        params_file = os.path.join(tempfile.gettempdir(), "stereo_distance_node_params.yaml")
     with open(params_file, "w", encoding="utf-8") as handle:
         handle.write("/stereo_distance_node:\n")
         handle.write("  ros__parameters:\n")
@@ -213,7 +236,7 @@ def _ground_grid_visuals(size_m=4000.0, spacing_m=100.0, thickness_m=0.7):
     return "\n".join(visuals)
 
 
-def _generate_world(context):
+def _generate_world(context, generated_world_path=None):
     share_dir = get_package_share_directory("stereo_ground_sim")
     source_world = os.path.join(share_dir, "worlds", "stereo_ground_drone.sdf")
     with open(source_world, "r", encoding="utf-8") as handle:
@@ -256,7 +279,14 @@ def _generate_world(context):
             f"<horizontal_fov>{fov_value}</horizontal_fov>",
             f"<horizontal_fov>{horizontal_fov_rad:.12f}</horizontal_fov>",
         )
-    world = world.replace("<update_rate>60</update_rate>", f"<update_rate>{camera_update_rate_hz:.6f}</update_rate>")
+    camera_rate_token = "<update_rate>20</update_rate>"
+    camera_rate_token_count = world.count(camera_rate_token)
+    if camera_rate_token_count != 2:
+        raise RuntimeError(
+            "Expected exactly two source camera update_rate tokens "
+            f"{camera_rate_token!r}; found {camera_rate_token_count}"
+        )
+    world = world.replace(camera_rate_token, f"<update_rate>{camera_update_rate_hz:.6f}</update_rate>")
     world = world.replace("<width>1280</width>", f"<width>{camera_image_width_px}</width>")
     world = world.replace("<height>720</height>", f"<height>{camera_image_height_px}</height>")
     world = world.replace("<near>0.1</near>", f"<near>{camera_clip_near_m:.6f}</near>")
@@ -280,7 +310,7 @@ def _generate_world(context):
 
     world = world.replace("        <!-- GROUND_GRID_VISUALS -->", _ground_grid_visuals(), 1)
 
-    generated = os.path.join(tempfile.gettempdir(), "stereo_ground_drone_attitude_error.sdf")
+    generated = generated_world_path or os.path.join(tempfile.gettempdir(), "stereo_ground_drone_attitude_error.sdf")
     with open(generated, "w", encoding="utf-8") as handle:
         handle.write(world)
     return generated
@@ -402,7 +432,7 @@ def generate_launch_description():
             DeclareLaunchArgument("horizontal_fov_rad", default_value="0.154997710698"),
             DeclareLaunchArgument("camera_image_width_px", default_value="1280"),
             DeclareLaunchArgument("camera_image_height_px", default_value="720"),
-            DeclareLaunchArgument("camera_update_rate_hz", default_value="60.0"),
+            DeclareLaunchArgument("camera_update_rate_hz", default_value="20.0"),
             DeclareLaunchArgument("camera_clip_near_m", default_value="0.1"),
             DeclareLaunchArgument("camera_clip_far_m", default_value="2500.0"),
             DeclareLaunchArgument("approach_start_distance_m", default_value="2000.0"),
@@ -423,6 +453,8 @@ def generate_launch_description():
             DeclareLaunchArgument("actual_distance_source", default_value="gazebo"),
             DeclareLaunchArgument("actual_distance_read_hz", default_value="15.0"),
             DeclareLaunchArgument("target_model_name", default_value="x500_15m"),
+            DeclareLaunchArgument("target_reference_link_name", default_value="target_reference_link"),
+            DeclareLaunchArgument("oracle_base_link_name", default_value="base_link"),
             DeclareLaunchArgument("yolo_model_path", default_value=""),
             DeclareLaunchArgument("yolo_class_name", default_value="drone"),
             DeclareLaunchArgument("yolo_confidence", default_value="0.25"),
