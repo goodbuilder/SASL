@@ -37,10 +37,40 @@ from stereo_ground_sim.runtime_deployment_selector import (
 )
 from stereo_ground_sim.disparity_residual_feature_summary import feature_summary_from_arrays, feature_summary_from_runtime_rows
 from stereo_ground_sim.disparity_residual_feature_selector import DisparityResidualFeatureSelector
+from stereo_ground_sim.gazebo_oracle import (
+    OracleStatus,
+    ground_truth_from_gazebo_pose_payload as compute_gazebo_ground_truth,
+    make_gazebo_world_to_baseline_transform,
+    x500_oracle_source_policy,
+)
 from stereo_ground_sim.stereo_triangulation_adapter import (
     general_ray_shadow_not_computed,
     general_ray_shadow_summary,
     triangulate_nominal_stereo_centers,
+)
+
+
+ORACLE_STATIC_PARAMETERS = {
+    "target_model_name",
+    "target_reference_link_name",
+    "oracle_base_link_name",
+    "baseline_origin_world_enu_m",
+    "rotation_baseline_world_row_major",
+}
+DEFAULT_BASELINE_ORIGIN_WORLD_ENU_M = (0.0, 0.0, 5.0)
+DEFAULT_ROTATION_BASELINE_WORLD_ROW_MAJOR = (
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    -1.0,
+)
+ORACLE_STATIC_PARAMETER_REJECTION_REASON = (
+    "oracle source and baseline frame parameters require node restart"
 )
 
 
@@ -67,6 +97,13 @@ class StereoDistanceNode(Node):
         self.declare_parameter("final_hover_duration_s", 5.0)
         self.declare_parameter("land_duration_s", 10.0)
         self.declare_parameter("target_model_name", "x500_15m")
+        self.declare_parameter("target_reference_link_name", "target_reference_link")
+        self.declare_parameter("oracle_base_link_name", "base_link")
+        self.declare_parameter("baseline_origin_world_enu_m", list(DEFAULT_BASELINE_ORIGIN_WORLD_ENU_M))
+        self.declare_parameter(
+            "rotation_baseline_world_row_major",
+            list(DEFAULT_ROTATION_BASELINE_WORLD_ROW_MAJOR),
+        )
         self.declare_parameter("target_center_z_m", 5.0)
         self.declare_parameter("fly_target_in_gazebo", False)
         self.declare_parameter("actual_distance_source", "gazebo")
@@ -131,6 +168,22 @@ class StereoDistanceNode(Node):
         self.final_hover_duration_s = self._float_param("final_hover_duration_s")
         self.land_duration_s = self._float_param("land_duration_s")
         self.target_model_name = self.get_parameter("target_model_name").value
+        self.target_reference_link_name = self.get_parameter("target_reference_link_name").value
+        self.oracle_base_link_name = self.get_parameter("oracle_base_link_name").value
+        self.baseline_origin_world_enu_m = tuple(self.get_parameter("baseline_origin_world_enu_m").value)
+        self.rotation_baseline_world_row_major = tuple(
+            self.get_parameter("rotation_baseline_world_row_major").value
+        )
+        (
+            self.gazebo_oracle_policy,
+            self.gazebo_world_to_baseline_transform,
+        ) = self._build_gazebo_oracle_configuration(
+            target_model_name=self.target_model_name,
+            target_reference_link_name=self.target_reference_link_name,
+            oracle_base_link_name=self.oracle_base_link_name,
+            baseline_origin_world_enu_m=self.baseline_origin_world_enu_m,
+            rotation_baseline_world_row_major=self.rotation_baseline_world_row_major,
+        )
         self.target_center_z_m = self._float_param("target_center_z_m")
         self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
         self.actual_distance_source = self.get_parameter("actual_distance_source").value
@@ -209,13 +262,14 @@ class StereoDistanceNode(Node):
         self.right_detection = None
         self.start_time = time.monotonic()
         self.last_gazebo_velocity_update = 0.0
+        self.last_gazebo_pose_sample_attempt = 0.0
         self.last_gazebo_pose_update = 0.0
         self.gazebo_pose_read_in_progress = False
         self.gazebo_pose_stream_process = None
         self.gazebo_pose_stream_thread = None
         self.gazebo_pose_stream_started = False
         self.actual_distance_sample_seq = 0
-        self.last_published_actual_distance_seq = -1
+        self.last_published_actual_distance_seq = 0
         self.cached_actual_distance = self.approach_start_distance_m
         self.cached_ground_truth_position = {
             "right_m": 0.0,
@@ -227,6 +281,8 @@ class StereoDistanceNode(Node):
                 self.approach_start_distance_m,
             ),
         }
+        self.has_valid_gazebo_ground_truth = False
+        self.cached_ground_truth_metadata = self._initial_gazebo_oracle_metadata()
         self.shutdown_event = threading.Event()
 
         self.left_msg = None
@@ -366,7 +422,157 @@ class StereoDistanceNode(Node):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    @staticmethod
+    def _finite_float_sequence(values, *, field_name, expected_length):
+        if isinstance(values, (str, bytes)) or isinstance(values, bool):
+            raise ValueError(f"{field_name} must be a numeric sequence")
+        try:
+            items = tuple(values)
+        except TypeError as exc:
+            raise ValueError(f"{field_name} must be a numeric sequence") from exc
+        if len(items) != expected_length:
+            raise ValueError(f"{field_name} must contain exactly {expected_length} values")
+        parsed = []
+        for value in items:
+            if isinstance(value, bool):
+                raise ValueError(f"{field_name} must not contain bool values")
+            try:
+                number = float(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field_name} must contain finite numeric values") from exc
+            if not math.isfinite(number):
+                raise ValueError(f"{field_name} must contain only finite values")
+            parsed.append(number)
+        return tuple(parsed)
+
+    @staticmethod
+    def _non_empty_string(value, *, field_name):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{field_name} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _build_gazebo_oracle_configuration(
+        *,
+        target_model_name,
+        target_reference_link_name,
+        oracle_base_link_name,
+        baseline_origin_world_enu_m,
+        rotation_baseline_world_row_major,
+    ):
+        model_name = StereoDistanceNode._non_empty_string(
+            target_model_name,
+            field_name="target_model_name",
+        )
+        target_reference_name = StereoDistanceNode._non_empty_string(
+            target_reference_link_name,
+            field_name="target_reference_link_name",
+        )
+        base_link_name = StereoDistanceNode._non_empty_string(
+            oracle_base_link_name,
+            field_name="oracle_base_link_name",
+        )
+        origin = StereoDistanceNode._finite_float_sequence(
+            baseline_origin_world_enu_m,
+            field_name="baseline_origin_world_enu_m",
+            expected_length=3,
+        )
+        rotation_values = StereoDistanceNode._finite_float_sequence(
+            rotation_baseline_world_row_major,
+            field_name="rotation_baseline_world_row_major",
+            expected_length=9,
+        )
+        rotation = (
+            rotation_values[0:3],
+            rotation_values[3:6],
+            rotation_values[6:9],
+        )
+        policy = x500_oracle_source_policy(
+            model_name=model_name,
+            target_reference_link_name=target_reference_name,
+            base_link_name=base_link_name,
+        )
+        transform = make_gazebo_world_to_baseline_transform(
+            origin_world_enu_m=origin,
+            rotation_baseline_world=rotation,
+        )
+        return policy, transform
+
+    @staticmethod
+    def _initial_gazebo_oracle_metadata():
+        return {
+            "oracle_valid": False,
+            "oracle_has_last_valid": False,
+            "oracle_status": "not_computed_init",
+            "oracle_source_role": None,
+            "oracle_matched_entity_name": None,
+            "oracle_match_kind": None,
+            "oracle_source_priority": None,
+            "oracle_fallback_used": False,
+            "oracle_fallback_reason": "",
+            "oracle_source_frame": "gazebo_world_enu",
+            "oracle_output_frame": "baseline_center_frd",
+            "oracle_last_sample_monotonic_s": None,
+            "oracle_last_valid_monotonic_s": None,
+        }
+
+    @staticmethod
+    def _enum_value_or_none(value):
+        if value is None:
+            return None
+        return getattr(value, "value", str(value))
+
+    def _gazebo_oracle_metadata_from_result(self, result, *, now):
+        last_valid = None
+        if hasattr(self, "cached_ground_truth_metadata"):
+            last_valid = self.cached_ground_truth_metadata.get("oracle_last_valid_monotonic_s")
+        return {
+            "oracle_valid": bool(result.valid),
+            "oracle_has_last_valid": bool(self.has_valid_gazebo_ground_truth or result.valid),
+            "oracle_status": self._enum_value_or_none(result.status),
+            "oracle_source_role": self._enum_value_or_none(result.source_role),
+            "oracle_matched_entity_name": result.matched_entity_name,
+            "oracle_match_kind": self._enum_value_or_none(result.match_kind),
+            "oracle_source_priority": result.source_priority,
+            "oracle_fallback_used": bool(result.fallback_used),
+            "oracle_fallback_reason": str(result.fallback_reason),
+            "oracle_source_frame": "gazebo_world_enu",
+            "oracle_output_frame": "baseline_center_frd",
+            "oracle_last_sample_monotonic_s": float(now),
+            "oracle_last_valid_monotonic_s": float(now) if result.valid else last_valid,
+        }
+
+    def _gazebo_oracle_metadata_from_status(self, status, *, now):
+        metadata = dict(getattr(self, "cached_ground_truth_metadata", self._initial_gazebo_oracle_metadata()))
+        metadata.update(
+            {
+                "oracle_valid": False,
+                "oracle_has_last_valid": bool(getattr(self, "has_valid_gazebo_ground_truth", False)),
+                "oracle_status": self._enum_value_or_none(status),
+                "oracle_last_sample_monotonic_s": float(now),
+            }
+        )
+        return metadata
+
+    def _ground_truth_position_from_oracle_result(self, result):
+        if not result.valid or result.point_baseline_center_frd_m is None:
+            return None
+        forward_m, right_m, down_m = result.point_baseline_center_frd_m.xyz_m
+        range_m = self._actual_range_m(right_m, down_m, forward_m)
+        return {
+            "right_m": float(right_m),
+            "down_m": float(down_m),
+            "forward_m": float(forward_m),
+            "ground_truth_m": float(range_m),
+        }
+
     def _on_param_update(self, params):
+        for param in params:
+            if param.name in ORACLE_STATIC_PARAMETERS:
+                return SetParametersResult(
+                    successful=False,
+                    reason=ORACLE_STATIC_PARAMETER_REJECTION_REASON,
+                )
         for param in params:
             if param.name == "baseline_m":
                 self.baseline_m = float(param.value)
@@ -842,17 +1048,27 @@ class StereoDistanceNode(Node):
     def _publish_actual_distance(self):
         state = self._mission_state()
         actual = self._read_actual_distance(state["distance_m"])
-        self.cached_actual_distance = actual
-        self.reference_distance_m = actual
-        with self.lock:
-            self.metrics["actual_distance_m"] = actual
-            self.metrics["mission_phase"] = state["phase"]
         if self.actual_distance_source == "gazebo":
-            if self.actual_distance_sample_seq != self.last_published_actual_distance_seq:
-                self.actual_distance_pub.publish(Float32(data=float(actual)))
-                self._publish_ground_truth_position()
-                self.last_published_actual_distance_seq = self.actual_distance_sample_seq
+            actual_to_publish = None
+            position_to_publish = None
+            with self.lock:
+                self.reference_distance_m = actual
+                self.metrics["actual_distance_m"] = actual
+                self.metrics["mission_phase"] = state["phase"]
+                metadata = dict(getattr(self, "cached_ground_truth_metadata", {}))
+                if (
+                    metadata.get("oracle_valid") is True
+                    and self.actual_distance_sample_seq != self.last_published_actual_distance_seq
+                ):
+                    self.last_published_actual_distance_seq = self.actual_distance_sample_seq
+                    position_to_publish = dict(self.cached_ground_truth_position)
+                    actual_to_publish = float(position_to_publish["forward_m"])
+            if position_to_publish is not None:
+                self.actual_distance_pub.publish(Float32(data=actual_to_publish))
+                self._publish_ground_truth_position(position_to_publish)
         else:
+            self.cached_actual_distance = actual
+            self.reference_distance_m = actual
             self.actual_distance_pub.publish(Float32(data=float(actual)))
             self.cached_ground_truth_position = {
                 "right_m": 0.0,
@@ -864,13 +1080,16 @@ class StereoDistanceNode(Node):
                     float(actual),
                 ),
             }
-            self._publish_ground_truth_position()
+            with self.lock:
+                self.metrics["actual_distance_m"] = actual
+                self.metrics["mission_phase"] = state["phase"]
+            self._publish_ground_truth_position(dict(self.cached_ground_truth_position))
         self._publish_plot_samples()
         if self.fly_target_in_gazebo:
             self._command_gazebo_target_pose(state)
 
-    def _publish_ground_truth_position(self):
-        position = self.cached_ground_truth_position
+    def _publish_ground_truth_position(self, position=None):
+        position = dict(position if position is not None else self.cached_ground_truth_position)
         self.ground_truth_position_pub.publish(
             Float32MultiArray(
                 data=[
@@ -897,6 +1116,9 @@ class StereoDistanceNode(Node):
     def _publish_plot_samples(self):
         with self.lock:
             metrics = dict(self.metrics)
+            ground_truth_metadata = dict(
+                getattr(self, "cached_ground_truth_metadata", self._initial_gazebo_oracle_metadata())
+            )
 
         actual = metrics.get("actual_distance_m", self._actual_distance())
         distance = metrics.get("distance_m")
@@ -915,6 +1137,9 @@ class StereoDistanceNode(Node):
         distance_value = math.nan if distance is None else float(distance)
         error_value = math.nan if error is None else float(error)
         disparity_value = math.nan if disparity is None else float(disparity)
+        if self.actual_distance_source == "gazebo" and ground_truth_metadata.get("oracle_valid") is not True:
+            actual = math.nan
+            error_value = math.nan
         estimated_position_values = [
             math.nan if estimated_forward is None else float(estimated_forward),
             math.nan if estimated_right is None else float(estimated_right),
@@ -1009,25 +1234,60 @@ class StereoDistanceNode(Node):
                 return
             now = time.monotonic()
             read_period_s = 1.0 / max(0.1, float(self.actual_distance_read_hz))
-            if now - self.last_gazebo_pose_update < read_period_s:
-                continue
+            with self.lock:
+                if now - self.last_gazebo_pose_sample_attempt < read_period_s:
+                    continue
+                self.last_gazebo_pose_sample_attempt = now
             line = line.strip()
             if not line:
                 continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
+                with self.lock:
+                    self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_status(
+                        OracleStatus.MALFORMED_POSE_PAYLOAD,
+                        now=now,
+                    )
                 continue
-            ground_truth = self._ground_truth_from_gazebo_pose_payload(payload)
+            oracle_result = self._gazebo_oracle_result_from_payload(payload)
+            if not oracle_result.valid:
+                with self.lock:
+                    self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_result(
+                        oracle_result,
+                        now=now,
+                    )
+                continue
+            ground_truth = self._ground_truth_position_from_oracle_result(oracle_result)
             if ground_truth is None:
+                with self.lock:
+                    self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_status(
+                        OracleStatus.UNSUPPORTED_POSE_FORMAT,
+                        now=now,
+                    )
                 continue
-            self.cached_actual_distance = ground_truth["forward_m"]
-            self.cached_ground_truth_position = ground_truth
-            self.last_gazebo_pose_update = now
-            self.actual_distance_sample_seq += 1
-            self.actual_distance_pub.publish(Float32(data=float(ground_truth["forward_m"])))
-            self._publish_ground_truth_position()
-            self.last_published_actual_distance_seq = self.actual_distance_sample_seq
+            with self.lock:
+                self.cached_actual_distance = ground_truth["forward_m"]
+                self.cached_ground_truth_position = dict(ground_truth)
+                self.last_gazebo_pose_update = now
+                self.actual_distance_sample_seq += 1
+                self.has_valid_gazebo_ground_truth = True
+                self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_result(
+                    oracle_result,
+                    now=now,
+                )
+                self.last_published_actual_distance_seq = self.actual_distance_sample_seq
+                publish_position = dict(self.cached_ground_truth_position)
+                publish_forward = float(publish_position["forward_m"])
+            self.actual_distance_pub.publish(Float32(data=publish_forward))
+            self._publish_ground_truth_position(publish_position)
+
+    def _gazebo_oracle_result_from_payload(self, payload):
+        return compute_gazebo_ground_truth(
+            payload,
+            self.gazebo_oracle_policy,
+            self.gazebo_world_to_baseline_transform,
+        )
 
     def _distance_from_gazebo_pose_payload(self, payload):
         ground_truth = self._ground_truth_from_gazebo_pose_payload(payload)
@@ -1039,26 +1299,8 @@ class StereoDistanceNode(Node):
         return math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
 
     def _ground_truth_from_gazebo_pose_payload(self, payload):
-        pose = self._find_pose_by_name(payload, self.target_model_name)
-        if pose is None:
-            return None
-        position = pose.get("position") or pose.get("pos") or {}
-        try:
-            world_right_m = float(position["x"])
-            world_forward_m = float(position["y"])
-            world_up_m = float(position["z"])
-            right_m = world_right_m
-            down_m = self.camera_height_m - world_up_m
-            forward_m = abs(world_forward_m)
-            range_distance = self._actual_range_m(right_m, down_m, forward_m)
-            return {
-                "right_m": right_m,
-                "down_m": down_m,
-                "forward_m": forward_m,
-                "ground_truth_m": range_distance,
-            }
-        except (KeyError, TypeError, ValueError):
-            return None
+        result = self._gazebo_oracle_result_from_payload(payload)
+        return self._ground_truth_position_from_oracle_result(result)
 
     def shutdown(self):
         self.shutdown_event.set()
@@ -1069,21 +1311,6 @@ class StereoDistanceNode(Node):
                 process.wait(timeout=1.0)
             except subprocess.TimeoutExpired:
                 process.kill()
-
-    def _find_pose_by_name(self, value, name):
-        if isinstance(value, dict):
-            if value.get("name") == name and ("position" in value or "pos" in value):
-                return value
-            for child in value.values():
-                found = self._find_pose_by_name(child, name)
-                if found is not None:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = self._find_pose_by_name(child, name)
-                if found is not None:
-                    return found
-        return None
 
     def _command_gazebo_target_pose(self, state):
         now = time.monotonic()
