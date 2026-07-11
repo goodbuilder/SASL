@@ -37,6 +37,11 @@ from stereo_ground_sim.runtime_deployment_selector import (
 )
 from stereo_ground_sim.disparity_residual_feature_summary import feature_summary_from_arrays, feature_summary_from_runtime_rows
 from stereo_ground_sim.disparity_residual_feature_selector import DisparityResidualFeatureSelector
+from stereo_ground_sim.stereo_triangulation_adapter import (
+    general_ray_shadow_not_computed,
+    general_ray_shadow_summary,
+    triangulate_nominal_stereo_centers,
+)
 
 
 class StereoDistanceNode(Node):
@@ -246,6 +251,9 @@ class StereoDistanceNode(Node):
                 "fallback_reason": "init",
             },
             "observation_fusion_status": "disabled",
+            "general_ray_shadow": general_ray_shadow_not_computed(
+                status="not_computed_init",
+            ),
             "actual_distance_m": self.approach_start_distance_m,
             "distance_error_m": None,
             "mission_phase": "init",
@@ -2244,6 +2252,9 @@ class StereoDistanceNode(Node):
                     "incomplete_bbox_pair",
                 ),
                 "observation_fusion_status": "incomplete_bbox_pair",
+                "general_ray_shadow": general_ray_shadow_not_computed(
+                    status="not_computed_incomplete_bbox_pair",
+                ),
                 "actual_distance_m": actual,
                 "distance_error_m": None,
                 "mission_phase": phase,
@@ -2252,7 +2263,25 @@ class StereoDistanceNode(Node):
 
         width = left_image.shape[1]
         height = left_image.shape[0]
-        raw = self._position_from_centers(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
+        legacy_raw = self._position_from_centers(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
+        general_ray_shadow_result = triangulate_nominal_stereo_centers(
+            left_cx_px=left["cx"],
+            left_cy_px=left["cy"],
+            right_cx_px=right["cx"],
+            right_cy_px=right["cy"],
+            width_px=int(width),
+            height_px=int(height),
+            horizontal_fov_rad=self.horizontal_fov_rad,
+            baseline_m=self.baseline_m,
+        )
+        general_ray_shadow = general_ray_shadow_summary(
+            general_ray_shadow_result,
+            legacy_forward_m=legacy_raw.get("forward_m"),
+            legacy_right_m=legacy_raw.get("right_m"),
+            legacy_down_m=legacy_raw.get("down_m"),
+            legacy_range_m=legacy_raw.get("range_m"),
+        )
+        raw = legacy_raw
         observation_fusion_status = "disabled"
         fused_raw, observation_fusion_status = self._apply_observation_fusion(left, right, width, height)
         if fused_raw is not None:
@@ -2352,6 +2381,7 @@ class StereoDistanceNode(Node):
             "bbox_adjustment": bbox_adjustment,
             "profile_status": profile_status,
             "observation_fusion_status": observation_fusion_status,
+            "general_ray_shadow": general_ray_shadow,
             "disparity_residual_status": disparity_residual_status,
             "disparity_residual_feature_summary_status": feature_summary_status,
             "disparity_residual_feature_summary": feature_summary,
