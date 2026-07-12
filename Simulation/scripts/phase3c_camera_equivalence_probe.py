@@ -50,7 +50,7 @@ from stereo_ground_sim.gazebo_oracle import make_gazebo_world_to_baseline_transf
 from stereo_ground_sim.stereo_triangulation_adapter import pinhole_intrinsics_from_horizontal_fov
 
 
-BASE_COMMIT = "cf19ec9b240374c427add2c8bc486a2f316d0164"
+BASE_COMMIT = "8d24008acd9e61c641963d7cf08682cfaae1b8e1"
 WORLD_NAME = "stereo_ground_drone"
 MARKER_MODEL_NAME = "phase3c_equivalence_marker"
 WIDTH_PX = 1280
@@ -71,6 +71,7 @@ R_M_C_ZERO_CANDIDATE = (
     (-1.0, 0.0, 0.0),
     (0.0, -1.0, 0.0),
 )
+REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE = 11
 
 MARKER_POINTS_BASELINE_FRD_M = {
     "center": (1852.0, 20.0, -6.0),
@@ -237,10 +238,10 @@ def rotation_from_sdf_rpy(roll_rad: float, pitch_rad: float, yaw_rad: float) -> 
 
 def quaternion_xyzw_to_wxyz(orientation: dict[str, Any]) -> tuple[float, float, float, float]:
     return (
-        float(orientation["w"]),
-        float(orientation["x"]),
-        float(orientation["y"]),
-        float(orientation["z"]),
+        float(orientation.get("w", 1.0)),
+        float(orientation.get("x", 0.0)),
+        float(orientation.get("y", 0.0)),
+        float(orientation.get("z", 0.0)),
     )
 
 
@@ -274,6 +275,37 @@ def add_marker_to_world_xml(world_xml: str, marker_world_enu_m: tuple[float, flo
     include_index = next((idx for idx, child in enumerate(list(world)) if child.tag == "include"), len(list(world)))
     world.insert(include_index, model)
     return ET.tostring(root, encoding="unicode")
+
+
+def _pose_text_to_values(text: str | None) -> tuple[float, float, float, float, float, float]:
+    if text is None or not text.strip():
+        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    values = [float(item) for item in text.split()]
+    if len(values) != 6:
+        raise ValueError(f"expected six pose values, got {len(values)}")
+    return tuple(values)  # type: ignore[return-value]
+
+
+def parse_generated_model_poses(world_path: Path) -> dict[str, dict[str, Any]]:
+    root = ET.fromstring(world_path.read_text(encoding="utf-8"))
+    world = root.find("world")
+    if world is None:
+        raise ValueError("world element not found")
+    poses: dict[str, dict[str, Any]] = {}
+    for model in world.findall("model"):
+        name = model.attrib.get("name")
+        if not name:
+            continue
+        x, y, z, roll, pitch, yaw = _pose_text_to_values(model.findtext("pose"))
+        poses[name] = {
+            "position_world_enu_m": (x, y, z),
+            "roll_rad": roll,
+            "pitch_rad": pitch,
+            "yaw_rad": yaw,
+            "rotation_world_model": rotation_from_sdf_rpy(roll, pitch, yaw),
+            "has_identity_link": model.find("link[@name='link']") is not None and _pose_text_to_values(model.find("link[@name='link']").findtext("pose") if model.find("link[@name='link']") is not None else None) == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        }
+    return poses
 
 
 def write_probe_world(base_world_path: Path, output_world_path: Path, marker_world_enu_m: tuple[float, float, float]) -> Path:
@@ -439,6 +471,43 @@ def intrinsic_delta_from_camera_info(camera_info: dict[str, Any], analytic_intri
     }
 
 
+def validate_camera_info(camera_info_by_topic: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    analytic = intrinsics()
+    topic_to_side = {
+        "/left_camera/camera_info": "left",
+        "/right_camera/camera_info": "right",
+    }
+    result: dict[str, Any] = {"valid": True, "sides": {}, "camera_info_intrinsic_delta": {}}
+    for topic, side in topic_to_side.items():
+        info = camera_info_by_topic.get(topic)
+        side_result = {"valid": False, "status": "missing"}
+        if info is not None:
+            k = info.get("k")
+            p = info.get("p")
+            finite_k = isinstance(k, list) and len(k) == 9 and all(isinstance(v, (int, float)) and math.isfinite(float(v)) for v in k)
+            finite_p = isinstance(p, list) and len(p) == 12 and all(isinstance(v, (int, float)) and math.isfinite(float(v)) for v in p)
+            dims_ok = info.get("width") == WIDTH_PX and info.get("height") == HEIGHT_PX
+            valid = bool(dims_ok and finite_k and finite_p)
+            if not dims_ok:
+                status = "dimension_mismatch"
+            elif not finite_k or not finite_p:
+                status = "invalid_k_or_p"
+            else:
+                status = "ok"
+            side_result = {
+                "valid": valid,
+                "status": status,
+                "width": info.get("width"),
+                "height": info.get("height"),
+                "k_length": len(k) if isinstance(k, list) else None,
+                "p_length": len(p) if isinstance(p, list) else None,
+            }
+        result["sides"][side] = side_result
+        result["camera_info_intrinsic_delta"][side] = intrinsic_delta_from_camera_info(info or {}, analytic)
+        result["valid"] = result["valid"] and bool(side_result["valid"])
+    return result
+
+
 def residual(rendered: dict[str, float], analytic: dict[str, float]) -> dict[str, float]:
     du = float(rendered["u_px"]) - float(analytic["u_px"])
     dv = float(rendered["v_px"]) - float(analytic["v_px"])
@@ -561,9 +630,19 @@ def environment_metadata() -> dict[str, Any]:
         "sdformat_versions": run(["gz", "sdf", "--versions"]),
         "gz_msgs_versions": run(["gz", "msg", "--versions"]),
         "ros_distro": os.environ.get("ROS_DISTRO"),
+        "ros_domain_id": os.environ.get("ROS_DOMAIN_ID"),
+        "gz_partition": os.environ.get("GZ_PARTITION"),
         "headless_rendering_supported": "--headless-rendering" in (run(["gz", "sim", "--help"]) or ""),
         "quaternion_payload_order": "x,y,z,w",
     }
+
+
+def configure_runtime_isolation(output_dir: Path) -> dict[str, str]:
+    partition = os.environ.get("GZ_PARTITION") or f"phase3c_{os.getpid()}_{abs(hash(str(output_dir))) % 100000}"
+    domain_id = os.environ.get("ROS_DOMAIN_ID") or str(100 + (os.getpid() % 100))
+    os.environ["GZ_PARTITION"] = partition
+    os.environ["ROS_DOMAIN_ID"] = domain_id
+    return {"GZ_PARTITION": partition, "ROS_DOMAIN_ID": domain_id}
 
 
 def start_process(name: str, command: list[str], log_path: Path, *, env: dict[str, str] | None = None) -> ProcessHandle:
@@ -597,7 +676,7 @@ def stop_process(handle: ProcessHandle, *, timeout_s: float = 10.0) -> None:
         handle.log_handle.close()
 
 
-def set_marker_pose(world_xyz: tuple[float, float, float], *, timeout_ms: int = 5000) -> bool:
+def set_marker_pose(world_xyz: tuple[float, float, float], *, timeout_ms: int = 5000, env: dict[str, str] | None = None) -> bool:
     request = (
         f'name: "{MARKER_MODEL_NAME}" '
         f'position {{ x: {world_xyz[0]:.9f} y: {world_xyz[1]:.9f} z: {world_xyz[2]:.9f} }} '
@@ -622,11 +701,12 @@ def set_marker_pose(world_xyz: tuple[float, float, float], *, timeout_ms: int = 
         stderr=subprocess.STDOUT,
         text=True,
         check=False,
+        env=env,
     )
     return result.returncode == 0 and "true" in result.stdout.lower()
 
 
-def echo_gz_topic_json(topic: str, *, num: int = 1, timeout_s: float = 5.0) -> list[dict[str, Any]]:
+def echo_gz_topic_json(topic: str, *, num: int = 1, timeout_s: float = 5.0, env: dict[str, str] | None = None) -> list[dict[str, Any]]:
     result = subprocess.run(
         ["gz", "topic", "-e", "-t", topic, "--json-output", "-n", str(num)],
         stdout=subprocess.PIPE,
@@ -634,6 +714,7 @@ def echo_gz_topic_json(topic: str, *, num: int = 1, timeout_s: float = 5.0) -> l
         text=True,
         check=False,
         timeout=timeout_s,
+        env=env,
     )
     messages = []
     for line in result.stdout.splitlines():
@@ -647,18 +728,27 @@ def echo_gz_topic_json(topic: str, *, num: int = 1, timeout_s: float = 5.0) -> l
     return messages
 
 
-def _pose_records(payload: Any) -> list[dict[str, Any]]:
+def _pose_records(payload: Any, parent_name: str | None = None) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         records = []
-        if "name" in payload and ("position" in payload or "pos" in payload):
+        name = payload.get("name")
+        scoped_name = f"{parent_name}::{name}" if parent_name and name and ("position" in payload or "pose" in payload or "pos" in payload) else name
+        if scoped_name and ("position" in payload or "pose" in payload or "pos" in payload):
+            if scoped_name != name:
+                payload = dict(payload)
+                payload["name"] = scoped_name
             records.append(payload)
-        for value in payload.values():
-            records.extend(_pose_records(value))
+        child_parent = name if name and parent_name is None else parent_name
+        for key, value in payload.items():
+            if key in {"link", "links"} and name:
+                records.extend(_pose_records(value, name))
+            else:
+                records.extend(_pose_records(value, child_parent))
         return records
     if isinstance(payload, list):
         records = []
         for item in payload:
-            records.extend(_pose_records(item))
+            records.extend(_pose_records(item, parent_name))
         return records
     return []
 
@@ -672,10 +762,132 @@ def pose_by_name(payloads: list[dict[str, Any]], name: str) -> dict[str, Any] | 
 
 
 def pose_rotation_matrix(record: dict[str, Any]) -> tuple[tuple[float, float, float], ...] | None:
-    orientation = record.get("orientation") or record.get("rot")
+    source = record.get("pose") if isinstance(record.get("pose"), dict) else record
+    orientation = source.get("orientation") or source.get("rot")
     if not isinstance(orientation, dict):
         return None
     return rotation_matrix_from_quaternion_wxyz(quaternion_xyzw_to_wxyz(orientation))
+
+
+def pose_position_xyz(record: dict[str, Any]) -> tuple[float, float, float] | None:
+    source = record.get("pose") if isinstance(record.get("pose"), dict) else record
+    position = source.get("position") or source.get("pos")
+    if not isinstance(position, dict):
+        return None
+    return (
+        float(position.get("x", 0.0)),
+        float(position.get("y", 0.0)),
+        float(position.get("z", 0.0)),
+    )
+
+
+def vector_norm(values: tuple[float, float, float]) -> float:
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+def vector_delta(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def matrix_max_abs_delta(a: Any, b: Any) -> float:
+    return float(np.max(np.abs(np.asarray(a, dtype=float) - np.asarray(b, dtype=float))))
+
+
+def _pose_check(name: str, value: float | None, tolerance: float) -> dict[str, Any]:
+    return {
+        "name": name,
+        "value": value,
+        "tolerance": tolerance,
+        "passed": value is not None and math.isfinite(float(value)) and value <= tolerance,
+    }
+
+
+def pose_evidence_from_records(
+    *,
+    generated_poses: dict[str, dict[str, Any]],
+    runtime_records: dict[str, dict[str, Any] | None],
+    commanded_marker_world_enu_m: tuple[float, float, float],
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+    details: dict[str, Any] = {"checks": checks}
+
+    def _runtime_position(name: str) -> tuple[float, float, float] | None:
+        record = runtime_records.get(name)
+        return pose_position_xyz(record) if record is not None else None
+
+    def _runtime_rotation(name: str) -> tuple[tuple[float, float, float], ...] | None:
+        record = runtime_records.get(name)
+        return pose_rotation_matrix(record) if record is not None else None
+
+    for side in ("left", "right"):
+        model_name = f"{side}_stereo_camera"
+        link_name = f"{model_name}::link"
+        generated = generated_poses.get(model_name)
+        model_pos = _runtime_position(model_name)
+        link_pos = _runtime_position(link_name)
+        model_rot = _runtime_rotation(model_name)
+        link_rot = _runtime_rotation(link_name)
+        generated_pos = generated.get("position_world_enu_m") if generated else None
+        generated_rot = generated.get("rotation_world_model") if generated else None
+        center_error = vector_norm(vector_delta(model_pos, generated_pos)) if model_pos and generated_pos else None
+        rotation_error = matrix_max_abs_delta(model_rot, generated_rot) if model_rot is not None and generated_rot is not None else None
+        model_link_center_error = vector_norm(vector_delta(model_pos, link_pos)) if model_pos and link_pos else None
+        model_link_rotation_error = matrix_max_abs_delta(model_rot, link_rot) if model_rot is not None and link_rot is not None else None
+        details[f"{side}_generated_runtime_center_error_m"] = center_error
+        details[f"{side}_generated_runtime_rotation_max_error"] = rotation_error
+        details[f"{side}_model_link_center_error_m"] = model_link_center_error
+        details[f"{side}_model_link_rotation_max_error"] = model_link_rotation_error
+        checks.append(_pose_check(f"{side}_generated_runtime_center", center_error, 1.0e-6))
+        checks.append(_pose_check(f"{side}_generated_runtime_rotation", rotation_error, 1.0e-8))
+        checks.append(_pose_check(f"{side}_model_link_center", model_link_center_error, 1.0e-6))
+        checks.append(_pose_check(f"{side}_model_link_rotation", model_link_rotation_error, 1.0e-8))
+
+    left_pos = _runtime_position("left_stereo_camera")
+    right_pos = _runtime_position("right_stereo_camera")
+    if left_pos and right_pos:
+        baseline_vector = vector_delta(right_pos, left_pos)
+        baseline_length_m = vector_norm(baseline_vector)
+        midpoint = tuple((left_pos[idx] + right_pos[idx]) / 2.0 for idx in range(3))
+        baseline_length_error = abs(baseline_length_m - BASELINE_M)
+        baseline_midpoint_error = vector_norm(vector_delta(midpoint, O_W_B))
+    else:
+        baseline_length_m = None
+        midpoint = None
+        baseline_length_error = None
+        baseline_midpoint_error = None
+    marker_pos = _runtime_position(MARKER_MODEL_NAME)
+    marker_pose_error = vector_norm(vector_delta(marker_pos, commanded_marker_world_enu_m)) if marker_pos else None
+    details.update(
+        {
+            "runtime_baseline_length_m": baseline_length_m,
+            "baseline_length_error_m": baseline_length_error,
+            "runtime_baseline_midpoint_world_enu_m": midpoint,
+            "baseline_midpoint_error_m": baseline_midpoint_error,
+            "marker_commanded_runtime_position_error_m": marker_pose_error,
+        }
+    )
+    checks.append(_pose_check("baseline_length", baseline_length_error, 1.0e-6))
+    checks.append(_pose_check("baseline_midpoint", baseline_midpoint_error, 1.0e-6))
+    checks.append(_pose_check("marker_commanded_runtime_position", marker_pose_error, 1.0e-6))
+    details["valid"] = all(check["passed"] for check in checks)
+    details["confirmed_check_count"] = sum(1 for check in checks if check["passed"])
+    details["required_check_count"] = len(checks)
+    return details
+
+
+def complete_static_identity_link_records(
+    generated_poses: dict[str, dict[str, Any]],
+    runtime_records: dict[str, dict[str, Any] | None],
+) -> dict[str, dict[str, Any] | None]:
+    completed = dict(runtime_records)
+    for model_name in ("left_stereo_camera", "right_stereo_camera"):
+        link_name = f"{model_name}::link"
+        if completed.get(link_name) is None and completed.get(model_name) is not None and generated_poses.get(model_name, {}).get("has_identity_link"):
+            link_record = dict(completed[model_name])
+            link_record["name"] = link_name
+            link_record["pose_source"] = "implicit_static_identity_link_from_model_pose"
+            completed[link_name] = link_record
+    return completed
 
 
 class RosImageCollector:
@@ -738,8 +950,11 @@ def sample_marker_from_images(
     for topic in topics:
         frames = list(collector.images[topic])[-sample_frames:]
         detections = []
+        decoded_count = 0
         for received_monotonic_s, msg in frames:
             rgb, decode_status = decode_image_to_rgb_array(msg)
+            if decode_status == "ok":
+                decoded_count += 1
             detection = detect_marker(rgb, threshold=marker_threshold)
             if decode_status != "ok":
                 detection = MarkerDetection(False, decode_status, None, None, 0, 0, None, "weighted_rgb_dominance")
@@ -759,10 +974,22 @@ def sample_marker_from_images(
                 },
             )
         valid_detections = [item for item in detections if item.valid]
-        if not valid_detections:
+        requested_count = sample_frames
+        valid_count = len(valid_detections)
+        invalid_count = requested_count - valid_count
+        frame_success_rate = 0.0 if requested_count == 0 else valid_count / requested_count
+        if not valid_detections or frame_success_rate < 0.95:
             result["valid"] = False
-            result["status"] = "marker_not_found"
-            result["cameras"][topic] = {"valid": False, "status_counts": _status_counts(detections)}
+            result["status"] = "marker_detection_rate_below_threshold" if valid_detections else "marker_not_found"
+            result["cameras"][topic] = {
+                "valid": False,
+                "requested_frame_count": requested_count,
+                "decoded_frame_count": decoded_count,
+                "valid_detection_frame_count": valid_count,
+                "invalid_detection_frame_count": invalid_count,
+                "frame_detection_success_rate": frame_success_rate,
+                "status_counts": _status_counts(detections),
+            }
             continue
         us = [item.u_px for item in valid_detections if item.u_px is not None]
         vs = [item.v_px for item in valid_detections if item.v_px is not None]
@@ -772,6 +999,11 @@ def sample_marker_from_images(
             "v_px": float(np.median(vs)),
             "stddev_px": float(max(np.std(us), np.std(vs))),
             "accepted_frame_count": len(valid_detections),
+            "requested_frame_count": requested_count,
+            "decoded_frame_count": decoded_count,
+            "valid_detection_frame_count": valid_count,
+            "invalid_detection_frame_count": invalid_count,
+            "frame_detection_success_rate": frame_success_rate,
             "status_counts": _status_counts(detections),
         }
     return result
@@ -791,17 +1023,21 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
     first_marker = case.marker_names[0]
     production_world = generate_production_world(case, base_world, package_share=package_share)
     write_probe_world(production_world, probe_world, marker_world_point(first_marker))
+    generated_poses = parse_generated_model_poses(probe_world)
 
     env = os.environ.copy()
     models_dir = str(package_share / "models")
     env["GZ_SIM_RESOURCE_PATH"] = os.pathsep.join([models_dir, env.get("GZ_SIM_RESOURCE_PATH", "")]).rstrip(os.pathsep)
+    case_log_dir = output_dir / "logs" / case.name
     gz_command = ["gz", "sim", "-r", "-s"]
     if args.headless and environment_metadata().get("headless_rendering_supported"):
         gz_command.append("--headless-rendering")
     if args.gui:
         gz_command = ["gz", "sim", "-r"]
     gz_command.append(str(probe_world))
-    gz = start_process("gz", gz_command, output_dir / "launch.log", env=env)
+    gz_log_path = case_log_dir / "gazebo.log"
+    bridge_log_path = case_log_dir / "bridge.log"
+    gz = start_process("gz", gz_command, gz_log_path, env=env)
     bridge = start_process(
         "bridge",
         [
@@ -814,7 +1050,7 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
             "/right_camera/image@sensor_msgs/msg/Image[gz.msgs.Image",
             "/right_camera/camera_info@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo",
         ],
-        output_dir / "bridge.log",
+        bridge_log_path,
         env=env,
     )
     handles = [gz, bridge]
@@ -834,17 +1070,53 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
                 output_dir / "camera_info.json",
                 {topic: camera_info_to_dict(msg) for topic, msg in collector.camera_info.items()},
             )
-            topics = subprocess.run(["gz", "topic", "-l"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+            topics = subprocess.run(["gz", "topic", "-l"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False, env=env)
             (output_dir / "gz_topics.txt").write_text(topics.stdout, encoding="utf-8")
             for marker_name in case.marker_names:
                 world_xyz = marker_world_point(marker_name)
-                pose_ok = set_marker_pose(world_xyz, timeout_ms=int(args.pose_timeout_s * 1000))
+                pose_ok = set_marker_pose(world_xyz, timeout_ms=int(args.pose_timeout_s * 1000), env=env)
                 time.sleep(0.5)
-                pose_payloads = echo_gz_topic_json(f"/world/{WORLD_NAME}/pose/info", num=1, timeout_s=args.pose_timeout_s)
-                marker_pose = pose_by_name(pose_payloads, MARKER_MODEL_NAME)
-                append_jsonl(output_dir / "pose_samples.jsonl", {"case": case.name, "marker": marker_name, "pose_ok": pose_ok, "marker_pose": marker_pose})
-                if not pose_ok or marker_pose is None:
-                    results.append({"case": case.name, "marker": marker_name, "valid": False, "status": "marker_pose_unconfirmed"})
+                pose_payloads = echo_gz_topic_json(f"/world/{WORLD_NAME}/pose/info", num=1, timeout_s=args.pose_timeout_s, env=env)
+                pose_payloads.extend(echo_gz_topic_json(f"/world/{WORLD_NAME}/state", num=1, timeout_s=args.pose_timeout_s, env=env))
+                required_pose_names = (
+                    "left_stereo_camera",
+                    "left_stereo_camera::link",
+                    "right_stereo_camera",
+                    "right_stereo_camera::link",
+                    MARKER_MODEL_NAME,
+                )
+                runtime_records = {name: pose_by_name(pose_payloads, name) for name in required_pose_names}
+                raw_runtime_pose_names_present = {name: runtime_records[name] is not None for name in required_pose_names}
+                runtime_records = complete_static_identity_link_records(generated_poses, runtime_records)
+                pose_evidence = pose_evidence_from_records(
+                    generated_poses=generated_poses,
+                    runtime_records=runtime_records,
+                    commanded_marker_world_enu_m=world_xyz,
+                )
+                pose_evidence["pose_command_success"] = pose_ok
+                pose_evidence["runtime_pose_names_present"] = {name: runtime_records[name] is not None for name in required_pose_names}
+                pose_evidence["raw_runtime_pose_names_present"] = raw_runtime_pose_names_present
+                append_jsonl(
+                    output_dir / "pose_samples.jsonl",
+                    {
+                        "case": case.name,
+                        "marker": marker_name,
+                        "pose_ok": pose_ok,
+                        "pose_evidence": pose_evidence,
+                        "runtime_records": runtime_records,
+                    },
+                )
+                if not pose_ok or not pose_evidence["valid"]:
+                    result = {
+                        "case": case.name,
+                        "marker": marker_name,
+                        "valid": False,
+                        "status": "pose_infrastructure_invalid",
+                        "pose_evidence": pose_evidence,
+                        "log_paths": {"gazebo": str(gz_log_path), "bridge": str(bridge_log_path)},
+                    }
+                    append_jsonl(output_dir / "case_results.jsonl", result)
+                    results.append(result)
                     continue
                 sample = sample_marker_from_images(
                     collector,
@@ -867,7 +1139,9 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
                     "marker_baseline_center_frd_m": MARKER_POINTS_BASELINE_FRD_M[marker_name],
                     "analytic_projection": analytic,
                     "sample": sample,
-                    "valid": bool(sample.get("valid") and analytic["valid"]),
+                    "pose_evidence": pose_evidence,
+                    "log_paths": {"gazebo": str(gz_log_path), "bridge": str(bridge_log_path)},
+                    "valid": bool(sample.get("valid") and analytic["valid"] and pose_evidence["valid"]),
                     "status": "ok" if sample.get("valid") and analytic["valid"] else sample.get("status", analytic["status"]),
                 }
                 append_jsonl(output_dir / "case_results.jsonl", result)
@@ -886,21 +1160,57 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
     single_axis_differential_errors = []
     composite_differential_errors = []
     centroid_stddevs = []
-    success = 0
-    total = 0
+    requested_detection_frames = 0
+    valid_detection_frames = 0
     observations: dict[tuple[str, str, str], dict[str, float]] = {}
-    required_cases = {case.name for case in case_matrix(matrix_name)}
-    observed_cases = {result.get("case") for result in results}
+    result_by_key = {(result.get("case"), result.get("marker")): result for result in results}
+    required_case_defs = case_matrix(matrix_name)
+    required_case_names = {case.name for case in required_case_defs}
+    pose_confirmed = 0
+    pose_required = 0
+    pose_values = {
+        "camera_center_error_max_m": [],
+        "model_link_center_error_max_m": [],
+        "baseline_length_error_max_m": [],
+        "baseline_midpoint_error_max_m": [],
+        "marker_pose_error_max_m": [],
+        "generated_runtime_rotation_max_error": [],
+        "model_link_rotation_max_error": [],
+    }
+    case_log_paths: dict[str, Any] = {}
     for result in results:
-        total += 2
-        if not result.get("valid"):
+        pose = result.get("pose_evidence") or {}
+        pose_confirmed += int(pose.get("confirmed_check_count") or 0)
+        pose_required += int(pose.get("required_check_count") or 0)
+        for side in ("left", "right"):
+            for key, target in (
+                (f"{side}_generated_runtime_center_error_m", "camera_center_error_max_m"),
+                (f"{side}_generated_runtime_rotation_max_error", "generated_runtime_rotation_max_error"),
+                (f"{side}_model_link_center_error_m", "model_link_center_error_max_m"),
+                (f"{side}_model_link_rotation_max_error", "model_link_rotation_max_error"),
+            ):
+                value = pose.get(key)
+                if value is not None:
+                    pose_values[target].append(float(value))
+        for key, target in (
+            ("baseline_length_error_m", "baseline_length_error_max_m"),
+            ("baseline_midpoint_error_m", "baseline_midpoint_error_max_m"),
+            ("marker_commanded_runtime_position_error_m", "marker_pose_error_max_m"),
+        ):
+            value = pose.get(key)
+            if value is not None:
+                pose_values[target].append(float(value))
+        if result.get("log_paths"):
+            case_log_paths.setdefault(str(result.get("case")), result.get("log_paths"))
+        if not result.get("sample"):
             continue
         sample = result["sample"]["cameras"]
         analytic = result["analytic_projection"]
         for side, topic in (("left", "/left_camera/image"), ("right", "/right_camera/image")):
             cam = sample.get(topic, {})
-            if cam.get("valid") and analytic[side]["u_px"] is not None:
-                success += 1
+            requested_detection_frames += int(cam.get("requested_frame_count") or 0)
+            valid_detection_frames += int(cam.get("valid_detection_frame_count") or 0)
+            if cam.get("valid") and analytic.get(side, {}).get("u_px") is not None:
                 rendered = {"u_px": cam["u_px"], "v_px": cam["v_px"]}
                 expected = {"u_px": analytic[side]["u_px"], "v_px": analytic[side]["v_px"]}
                 observations[(result["case"], result["marker"], side)] = {
@@ -922,6 +1232,8 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
 
     sign_matched = 0
     sign_total = 0
+    sign_evaluable = 0
+    sign_details = []
     for (case_name, marker_name, side), obs in observations.items():
         zero = observations.get(("zero", marker_name, side))
         if zero is None or case_name == "zero":
@@ -940,10 +1252,96 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
             moved_side = "left" if case_name.startswith("left_") else "right"
             if side == moved_side:
                 sign_total += 1
-                if _sign(rendered_du) == _sign(analytic_du) and _sign(rendered_dv) == _sign(analytic_dv):
+                analytic_shift = np.asarray([analytic_du, analytic_dv], dtype=float)
+                rendered_shift = np.asarray([rendered_du, rendered_dv], dtype=float)
+                analytic_norm = float(np.linalg.norm(analytic_shift))
+                rendered_norm = float(np.linalg.norm(rendered_shift))
+                evaluable = analytic_norm >= 0.25 and rendered_norm >= 0.25
+                dominant_index = int(np.argmax(np.abs(analytic_shift)))
+                dot = float(np.dot(analytic_shift, rendered_shift))
+                matched = bool(evaluable and dot > 0.0 and _sign(float(analytic_shift[dominant_index])) == _sign(float(rendered_shift[dominant_index])))
+                if evaluable:
+                    sign_evaluable += 1
+                if matched:
                     sign_matched += 1
+                sign_details.append(
+                    {
+                        "case": case_name,
+                        "camera": side,
+                        "analytic_shift_px": [analytic_du, analytic_dv],
+                        "rendered_shift_px": [rendered_du, rendered_dv],
+                        "dot_product": dot,
+                        "dominant_component": "u" if dominant_index == 0 else "v",
+                        "evaluable": evaluable,
+                        "matched": matched,
+                    }
+                )
         elif case_name == "composite":
             composite_differential_errors.append(error_px)
+
+    covered_cases = 0
+    for case in required_case_defs:
+        case_covered = True
+        for marker_name in case.marker_names:
+            result = result_by_key.get((case.name, marker_name))
+            if result is None:
+                case_covered = False
+                break
+            sample = result.get("sample", {})
+            cameras = sample.get("cameras", {})
+            analytic = result.get("analytic_projection", {})
+            if not (
+                (result.get("pose_evidence") or {}).get("valid")
+                and analytic.get("valid")
+                and cameras.get("/left_camera/image", {}).get("valid")
+                and cameras.get("/right_camera/image", {}).get("valid")
+            ):
+                case_covered = False
+                break
+        if case_covered:
+            covered_cases += 1
+
+    camera_info_path = output_dir / "camera_info.json"
+    camera_info_payload = json.loads(camera_info_path.read_text(encoding="utf-8")) if camera_info_path.exists() else {}
+    camera_info_validation = validate_camera_info(camera_info_payload)
+    expected_pose_required = sum(len(case.marker_names) for case in required_case_defs) * REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE
+    pose_coverage_rate = 0.0 if expected_pose_required == 0 else pose_confirmed / expected_pose_required
+    marker_detection_success_rate = 0.0 if requested_detection_frames == 0 else valid_detection_frames / requested_detection_frames
+    required_case_coverage_rate = covered_cases / max(1, len(required_case_names))
+    required_single_axis = sum(
+        1
+        for case in required_case_defs
+        if case.name.startswith(("left_roll_", "left_pitch_", "left_yaw_", "right_roll_", "right_pitch_", "right_yaw_"))
+        and case.name.endswith(("_positive", "_negative"))
+    )
+    all_single_axis_evaluable = sign_evaluable == required_single_axis
+    pose_residual_summary = {
+        key: (max(values) if values else None)
+        for key, values in pose_values.items()
+    }
+    pose_tolerances_ok = (
+        pose_residual_summary["camera_center_error_max_m"] is not None
+        and pose_residual_summary["camera_center_error_max_m"] <= 1.0e-6
+        and pose_residual_summary["generated_runtime_rotation_max_error"] is not None
+        and pose_residual_summary["generated_runtime_rotation_max_error"] <= 1.0e-8
+        and pose_residual_summary["model_link_center_error_max_m"] is not None
+        and pose_residual_summary["model_link_center_error_max_m"] <= 1.0e-6
+        and pose_residual_summary["model_link_rotation_max_error"] is not None
+        and pose_residual_summary["model_link_rotation_max_error"] <= 1.0e-8
+        and pose_residual_summary["baseline_length_error_max_m"] is not None
+        and pose_residual_summary["baseline_length_error_max_m"] <= 1.0e-6
+        and pose_residual_summary["baseline_midpoint_error_max_m"] is not None
+        and pose_residual_summary["baseline_midpoint_error_max_m"] <= 1.0e-6
+        and pose_residual_summary["marker_pose_error_max_m"] is not None
+        and pose_residual_summary["marker_pose_error_max_m"] <= 1.0e-6
+    )
+    infrastructure_valid = (
+        pose_coverage_rate == 1.0
+        and required_case_coverage_rate == 1.0
+        and marker_detection_success_rate >= 0.95
+        and bool(camera_info_validation["valid"])
+        and pose_tolerances_ok
+    )
     summary = {
         "schema_version": 1,
         "base_commit": BASE_COMMIT,
@@ -951,22 +1349,27 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
         "environment": environment_metadata(),
         "case_matrix": matrix_name,
         "thresholds": thresholds,
-        "infrastructure_valid": total > 0 and success / total >= 0.95 and required_cases.issubset(observed_cases),
-        "marker_detection_success_rate": 0.0 if total == 0 else success / total,
-        "pose_coverage_rate": 1.0 if required_cases.issubset(observed_cases) else len(observed_cases & required_cases) / max(1, len(required_cases)),
-        "required_case_coverage_rate": 1.0 if required_cases.issubset(observed_cases) else len(observed_cases & required_cases) / max(1, len(required_cases)),
-        "single_axis_sign_agreement": {"matched": sign_matched, "total": sign_total},
+        "infrastructure_valid": infrastructure_valid,
+        "marker_detection_success_rate": marker_detection_success_rate,
+        "marker_detection_frame_counts": {
+            "requested": requested_detection_frames,
+            "valid": valid_detection_frames,
+            "invalid": requested_detection_frames - valid_detection_frames,
+        },
+        "pose_coverage_rate": pose_coverage_rate,
+        "pose_check_counts": {"confirmed": pose_confirmed, "required": expected_pose_required, "observed_required": pose_required},
+        "required_case_coverage_rate": required_case_coverage_rate,
+        "single_axis_sign_agreement": {"matched": sign_matched, "total": sign_total, "evaluable": sign_evaluable, "required_evaluable": required_single_axis},
+        "single_axis_sign_details": sign_details,
         "absolute_residual_summary": summarize(absolute_errors),
         "differential_residual_summary": summarize(single_axis_differential_errors),
         "composite_differential_residual_summary": summarize(composite_differential_errors),
         "centroid_stddev_summary": summarize([value for value in centroid_stddevs if math.isfinite(float(value))]),
-        "pose_residual_summary": {
-            "camera_center_error_max_m": None,
-            "baseline_length_error_max_m": None,
-            "baseline_midpoint_error_max_m": None,
-            "rotation_matrix_max_error": None,
-        },
-        "camera_info_intrinsic_delta": {},
+        "pose_residual_summary": pose_residual_summary,
+        "camera_info_valid": bool(camera_info_validation["valid"]),
+        "camera_info_validation": camera_info_validation["sides"],
+        "camera_info_intrinsic_delta": camera_info_validation["camera_info_intrinsic_delta"],
+        "case_log_paths": case_log_paths,
         "current_mapping_hypothesis": {
             "R_M_C_ZERO_CANDIDATE": R_M_C_ZERO_CANDIDATE,
             "roll_sdf_error": "+roll_camera_error",
@@ -1009,6 +1412,7 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("ROS_LOG_DIR", str(output_dir / "ros_logs"))
+    configure_runtime_isolation(output_dir)
     write_json(output_dir / "environment.json", environment_metadata())
     if get_package_share_directory is None:
         raise RuntimeError("ament_index_python is required for runtime probing")

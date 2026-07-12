@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -41,6 +42,85 @@ class DummyImage:
 
 
 class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
+    def write_camera_info(self, root: Path, *, valid: bool = True) -> None:
+        intr = probe.intrinsics()
+        info = {}
+        for topic in ("/left_camera/camera_info", "/right_camera/camera_info"):
+            info[topic] = {
+                "width": probe.WIDTH_PX if valid else 1,
+                "height": probe.HEIGHT_PX,
+                "k": [intr.fx_px, 0.0, intr.cx_px, 0.0, intr.fy_px, intr.cy_px, 0.0, 0.0, 1.0],
+                "p": [intr.fx_px, 0.0, intr.cx_px, 0.0, 0.0, intr.fy_px, intr.cy_px, 0.0, 0.0, 0.0, 1.0, 0.0],
+            }
+        (root / "camera_info.json").write_text(json.dumps(info), encoding="utf-8")
+
+    def make_result(
+        self,
+        *,
+        case: str = "zero",
+        marker: str = "center",
+        valid_frames: int = 10,
+        requested_frames: int = 10,
+        pose_valid: bool = True,
+        left_shift: tuple[float, float] = (0.0, 0.0),
+        right_shift: tuple[float, float] = (0.0, 0.0),
+        analytic_left_shift: tuple[float, float] = (0.0, 0.0),
+        analytic_right_shift: tuple[float, float] = (0.0, 0.0),
+    ) -> dict:
+        analytic = probe.analytic_projection(marker, probe.AttitudeCase(case, probe.CameraAttitudeErrorDeg(0.0, 0.0, 0.0), probe.CameraAttitudeErrorDeg(0.0, 0.0, 0.0), (marker,)))
+        left = analytic["left"]
+        right = analytic["right"]
+        analytic = json.loads(json.dumps(analytic))
+        analytic["left"]["u_px"] += analytic_left_shift[0]
+        analytic["left"]["v_px"] += analytic_left_shift[1]
+        analytic["right"]["u_px"] += analytic_right_shift[0]
+        analytic["right"]["v_px"] += analytic_right_shift[1]
+
+        def camera_payload(base, shift):
+            return {
+                "valid": valid_frames / requested_frames >= 0.95,
+                "u_px": base["u_px"] + shift[0],
+                "v_px": base["v_px"] + shift[1],
+                "stddev_px": 0.0,
+                "requested_frame_count": requested_frames,
+                "decoded_frame_count": requested_frames,
+                "valid_detection_frame_count": valid_frames,
+                "invalid_detection_frame_count": requested_frames - valid_frames,
+                "frame_detection_success_rate": valid_frames / requested_frames,
+            }
+
+        checks = [{"name": f"check_{idx}", "value": 0.0, "tolerance": 1.0, "passed": pose_valid} for idx in range(probe.REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE)]
+        return {
+            "case": case,
+            "marker": marker,
+            "valid": pose_valid and valid_frames / requested_frames >= 0.95,
+            "pose_evidence": {
+                "valid": pose_valid,
+                "confirmed_check_count": probe.REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE if pose_valid else 0,
+                "required_check_count": probe.REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE,
+                "checks": checks,
+                "left_generated_runtime_center_error_m": 0.0 if pose_valid else None,
+                "right_generated_runtime_center_error_m": 0.0 if pose_valid else None,
+                "left_generated_runtime_rotation_max_error": 0.0 if pose_valid else None,
+                "right_generated_runtime_rotation_max_error": 0.0 if pose_valid else None,
+                "left_model_link_center_error_m": 0.0 if pose_valid else None,
+                "right_model_link_center_error_m": 0.0 if pose_valid else None,
+                "left_model_link_rotation_max_error": 0.0 if pose_valid else None,
+                "right_model_link_rotation_max_error": 0.0 if pose_valid else None,
+                "baseline_length_error_m": 0.0 if pose_valid else None,
+                "baseline_midpoint_error_m": 0.0 if pose_valid else None,
+                "marker_commanded_runtime_position_error_m": 0.0 if pose_valid else None,
+            },
+            "sample": {
+                "cameras": {
+                    "/left_camera/image": camera_payload(left, left_shift),
+                    "/right_camera/image": camera_payload(right, right_shift),
+                }
+            },
+            "analytic_projection": analytic,
+            "log_paths": {"gazebo": "/tmp/gazebo.log", "bridge": "/tmp/bridge.log"},
+        }
+
     def test_marker_points_round_trip_and_expected_world_coordinates(self) -> None:
         for name, expected_world in probe.EXPECTED_MARKER_POINTS_WORLD_ENU_M.items():
             actual_world = probe.marker_world_point(name)
@@ -194,6 +274,85 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
         self.assertAlmostEqual(result["cx_delta_px"], -2.0)
         self.assertAlmostEqual(result["cy_delta_px"], -4.0)
 
+    def test_generated_and_runtime_pose_residuals(self) -> None:
+        world = probe.add_marker_to_world_xml(
+            """<sdf version="1.9"><world name="w"><model name="left_stereo_camera"><pose>-12.5 0 5 0 0 0</pose></model><model name="right_stereo_camera"><pose>12.5 0 5 0 0 0</pose></model></world></sdf>""",
+            (20.0, 1852.0, 11.0),
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "world.sdf"
+            path.write_text(world, encoding="utf-8")
+            generated = probe.parse_generated_model_poses(path)
+        runtime = {
+            "left_stereo_camera": {"name": "left_stereo_camera", "position": {"x": -12.5, "y": 0.0, "z": 5.0}, "orientation": {"x": 0, "y": 0, "z": 0, "w": 1}},
+            "left_stereo_camera::link": {"name": "left_stereo_camera::link", "position": {"x": -12.5, "y": 0.0, "z": 5.0}, "orientation": {"w": 1}},
+            "right_stereo_camera": {"name": "right_stereo_camera", "position": {"x": 12.5, "y": 0.0, "z": 5.0}, "orientation": {"w": 1}},
+            "right_stereo_camera::link": {"name": "right_stereo_camera::link", "position": {"x": 12.5, "y": 0.0, "z": 5.0}, "orientation": {"w": 1}},
+            probe.MARKER_MODEL_NAME: {"name": probe.MARKER_MODEL_NAME, "position": {"x": 20.0, "y": 1852.0, "z": 11.0}, "orientation": {"w": 1}},
+        }
+        evidence = probe.pose_evidence_from_records(
+            generated_poses=generated,
+            runtime_records=runtime,
+            commanded_marker_world_enu_m=(20.0, 1852.0, 11.0),
+        )
+        self.assertTrue(evidence["valid"])
+        self.assertEqual(evidence["confirmed_check_count"], probe.REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE)
+        self.assertAlmostEqual(evidence["baseline_length_error_m"], 0.0)
+        self.assertAlmostEqual(evidence["marker_commanded_runtime_position_error_m"], 0.0)
+
+    def test_missing_or_stale_pose_is_infrastructure_invalid(self) -> None:
+        generated = {
+            "left_stereo_camera": {"position_world_enu_m": (-12.5, 0.0, 5.0), "rotation_world_model": np.eye(3).tolist()},
+            "right_stereo_camera": {"position_world_enu_m": (12.5, 0.0, 5.0), "rotation_world_model": np.eye(3).tolist()},
+            probe.MARKER_MODEL_NAME: {"position_world_enu_m": (20.0, 1852.0, 11.0), "rotation_world_model": np.eye(3).tolist()},
+        }
+        runtime = {
+            "left_stereo_camera": {"position": {"x": -12.5, "y": 0, "z": 5}, "orientation": {"w": 1}},
+            "left_stereo_camera::link": {"position": {"x": -12.5, "y": 0, "z": 5}, "orientation": {"w": 1}},
+            "right_stereo_camera": {"position": {"x": 12.5, "y": 0, "z": 5}, "orientation": {"w": 1}},
+            "right_stereo_camera::link": None,
+            probe.MARKER_MODEL_NAME: {"position": {"x": 21.0, "y": 1852.0, "z": 11.0}, "orientation": {"w": 1}},
+        }
+        evidence = probe.pose_evidence_from_records(
+            generated_poses=generated,
+            runtime_records=runtime,
+            commanded_marker_world_enu_m=(20.0, 1852.0, 11.0),
+        )
+        self.assertFalse(evidence["valid"])
+        self.assertLess(evidence["confirmed_check_count"], evidence["required_check_count"])
+        self.assertGreater(evidence["marker_commanded_runtime_position_error_m"], 0.9)
+
+    def test_static_identity_link_records_are_completed_from_exact_model_pose(self) -> None:
+        generated = {
+            "left_stereo_camera": {"has_identity_link": True},
+            "right_stereo_camera": {"has_identity_link": True},
+        }
+        runtime = {
+            "left_stereo_camera": {"name": "left_stereo_camera", "position": {"x": -12.5, "y": 0.0, "z": 5.0}, "orientation": {"w": 1}},
+            "left_stereo_camera::link": None,
+            "right_stereo_camera": {"name": "right_stereo_camera", "position": {"x": 12.5, "y": 0.0, "z": 5.0}, "orientation": {"w": 1}},
+            "right_stereo_camera::link": None,
+        }
+        completed = probe.complete_static_identity_link_records(generated, runtime)
+        self.assertEqual(completed["left_stereo_camera::link"]["name"], "left_stereo_camera::link")
+        self.assertEqual(completed["left_stereo_camera::link"]["pose_source"], "implicit_static_identity_link_from_model_pose")
+
+    def test_camera_info_validation(self) -> None:
+        intr = probe.intrinsics()
+        valid_info = {
+            "/left_camera/camera_info": {"width": 1280, "height": 720, "k": [intr.fx_px, 0, intr.cx_px, 0, intr.fy_px, intr.cy_px, 0, 0, 1], "p": [intr.fx_px, 0, intr.cx_px, 0, 0, intr.fy_px, intr.cy_px, 0, 0, 0, 1, 0]},
+            "/right_camera/camera_info": {"width": 1280, "height": 720, "k": [intr.fx_px, 0, intr.cx_px, 0, intr.fy_px, intr.cy_px, 0, 0, 1], "p": [intr.fx_px, 0, intr.cx_px, 0, 0, intr.fy_px, intr.cy_px, 0, 0, 0, 1, 0]},
+        }
+        self.assertTrue(probe.validate_camera_info(valid_info)["valid"])
+        missing = probe.validate_camera_info({"/left_camera/camera_info": valid_info["/left_camera/camera_info"]})
+        self.assertFalse(missing["valid"])
+        bad_dims = json.loads(json.dumps(valid_info))
+        bad_dims["/left_camera/camera_info"]["width"] = 1
+        self.assertEqual(probe.validate_camera_info(bad_dims)["sides"]["left"]["status"], "dimension_mismatch")
+        bad_k = json.loads(json.dumps(valid_info))
+        bad_k["/right_camera/camera_info"]["k"][0] = math.nan
+        self.assertEqual(probe.validate_camera_info(bad_k)["sides"]["right"]["status"], "invalid_k_or_p")
+
     def test_absolute_and_differential_residuals(self) -> None:
         absolute = probe.residual({"u_px": 12.0, "v_px": 9.0}, {"u_px": 10.0, "v_px": 5.0})
         self.assertEqual(absolute["du_px"], 2.0)
@@ -224,6 +383,72 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
         self.assertEqual(probe.determine_verdict(bad), "not_equivalent")
         bad["infrastructure_valid"] = False
         self.assertEqual(probe.determine_verdict(bad), "inconclusive")
+
+    def test_summary_uses_frame_detection_pose_camera_info_and_required_case_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.write_camera_info(root)
+            results = [self.make_result(case="zero", marker=name) for name in probe.MARKER_POINTS_BASELINE_FRD_M]
+            for case in probe.standard_cases()[1:]:
+                if case.name.startswith("left_") and case.name.endswith(("_positive", "_negative")):
+                    results.append(self.make_result(case=case.name, marker="center", left_shift=(1.0, 0.0), analytic_left_shift=(1.0, 0.0)))
+                elif case.name.startswith("right_") and case.name.endswith(("_positive", "_negative")):
+                    results.append(self.make_result(case=case.name, marker="center", right_shift=(1.0, 0.0), analytic_right_shift=(1.0, 0.0)))
+                else:
+                    results.append(self.make_result(case=case.name, marker="center"))
+            summary = probe.summarize_runtime_results(results, root, "standard", {"marker_detection_success_min": 0.95})
+            self.assertEqual(summary["pose_coverage_rate"], 1.0)
+            self.assertEqual(summary["required_case_coverage_rate"], 1.0)
+            self.assertEqual(summary["marker_detection_success_rate"], 1.0)
+            self.assertTrue(summary["camera_info_valid"])
+            self.assertTrue(summary["infrastructure_valid"])
+
+            root2 = Path(tmpdir) / "bad"
+            root2.mkdir()
+            self.write_camera_info(root2)
+            bad_results = [self.make_result(case="zero", marker="center", valid_frames=1)]
+            bad_summary = probe.summarize_runtime_results(bad_results, root2, "smoke", {})
+            self.assertAlmostEqual(bad_summary["marker_detection_success_rate"], 0.1)
+            self.assertFalse(bad_summary["infrastructure_valid"])
+            self.assertEqual(bad_summary["equivalence_verdict"], "inconclusive")
+
+    def test_required_case_coverage_is_not_case_name_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.write_camera_info(root)
+            results = [self.make_result(case="zero", marker="center")]
+            summary = probe.summarize_runtime_results(results, root, "standard", {})
+            self.assertLess(summary["required_case_coverage_rate"], 1.0)
+            self.assertEqual(summary["equivalence_verdict"], "inconclusive")
+
+    def test_single_axis_direction_evaluability(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            self.write_camera_info(root)
+            zero = self.make_result(case="zero", marker="center")
+            aligned = self.make_result(
+                case="left_yaw_positive",
+                marker="center",
+                left_shift=(-2.0, 0.5),
+                analytic_left_shift=(-1.0, 0.25),
+            )
+            opposite = self.make_result(
+                case="left_yaw_negative",
+                marker="center",
+                left_shift=(+2.0, -0.5),
+                analytic_left_shift=(-1.0, 0.25),
+            )
+            near_zero = self.make_result(
+                case="left_roll_positive",
+                marker="center",
+                left_shift=(0.1, 0.0),
+                analytic_left_shift=(0.1, 0.0),
+            )
+            summary = probe.summarize_runtime_results([zero, aligned, opposite, near_zero], root, "smoke", {})
+            details = {item["case"]: item for item in summary["single_axis_sign_details"]}
+            self.assertTrue(details["left_yaw_positive"]["matched"])
+            self.assertFalse(details["left_yaw_negative"]["matched"])
+            self.assertFalse(details["left_roll_positive"]["evaluable"])
 
     def test_json_finite_null_policy(self) -> None:
         payload = {"ok": 1.0, "nan": math.nan, "inf": math.inf, "items": [1.0, -math.inf]}
