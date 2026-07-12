@@ -11,6 +11,8 @@ from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
 
+import numpy as np
+
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 if str(PACKAGE_DIR) not in sys.path:
@@ -207,6 +209,7 @@ def make_node(mode: str = "both") -> StereoDistanceNode:
     node.camera_clip_near_m = 0.1
     node.camera_clip_far_m = 2500.0
     node.lock = threading.Lock()
+    node.yolo_condition = threading.Condition(node.lock)
     node.oracle_sample_seq = 0
     node.current_ground_truth_snapshot = invalid_snapshot(0, "not_computed_init")
     node.last_valid_ground_truth_snapshot = None
@@ -236,6 +239,9 @@ def make_node(mode: str = "both") -> StereoDistanceNode:
     node.bbox_adjustment_pub = FakePublisher()
     node.actual_distance_pub = FakePublisher()
     node.ground_truth_position_pub = FakePublisher()
+    node.yolo_inference_ms_pub = FakePublisher()
+    node.yolo_update_hz_pub = FakePublisher()
+    node.last_yolo_completion = None
     node.synthetic_detection_bbox_size_px = 32.0
     node.left_msg = None
     node.right_msg = None
@@ -254,6 +260,14 @@ def ideal_pixel_centers(node: StereoDistanceNode, snapshot: GroundTruthSnapshot)
         {"cx": measurement.left_u_px, "cy": measurement.left_v_px},
         {"cx": measurement.right_u_px, "cy": measurement.right_v_px},
     )
+
+
+def status_payload(node: StereoDistanceNode) -> dict[str, object]:
+    return json.loads(node.observation_status_pub.messages[-1].data)
+
+
+def assert_nan_array(testcase: unittest.TestCase, msg) -> None:
+    testcase.assertTrue(all(math.isnan(value) for value in msg.data))
 
 
 class StereoDistanceObservationModeTests(unittest.TestCase):
@@ -368,6 +382,8 @@ class StereoDistanceObservationModeTests(unittest.TestCase):
             right,
             source=node_module.BBOX_SOURCE_EXTERNAL,
             observation_received_monotonic_s=20.0,
+            source_width_px=1280,
+            source_height_px=720,
         )
 
         self.assertIsNone(bbox)
@@ -387,6 +403,8 @@ class StereoDistanceObservationModeTests(unittest.TestCase):
             right,
             source=node_module.BBOX_SOURCE_EXTERNAL,
             observation_received_monotonic_s=22.0,
+            source_width_px=1280,
+            source_height_px=720,
         )
 
         self.assertTrue(bbox.valid)
@@ -406,16 +424,24 @@ class StereoDistanceObservationModeTests(unittest.TestCase):
             None,
             source=node_module.BBOX_SOURCE_EXTERNAL,
             observation_received_monotonic_s=24.0,
+            source_width_px=1280,
+            source_height_px=720,
         )
 
         self.assertFalse(bbox.valid)
-        self.assertIsNone(comparison)
+        self.assertFalse(comparison.valid)
+        self.assertEqual(comparison.status, "bbox_invalid")
+        self.assertTrue(comparison.same_oracle_sequence)
         self.assertTrue(all(math.isnan(value) for value in node.bbox_general_ray_estimated_position_pub.messages[-1].data))
+        assert_nan_array(self, node.bbox_vs_ideal_pixel_delta_pub.messages[-1])
+        assert_nan_array(self, node.bbox_vs_ideal_position_delta_pub.messages[-1])
         payload = node.observation_status_pub.messages[-1].data
         self.assertNotIn("NaN", payload)
         status = json.loads(payload)
         self.assertEqual(status["bbox_status"], "incomplete_bbox_pair")
-        self.assertIsNone(status["comparison_valid"])
+        self.assertFalse(status["comparison_valid"])
+        self.assertEqual(status["comparison_status"], "bbox_invalid")
+        self.assertTrue(status["same_oracle_sequence"])
 
     def test_synthetic_detection_research_source_label(self) -> None:
         node = make_node("both")
@@ -430,11 +456,179 @@ class StereoDistanceObservationModeTests(unittest.TestCase):
             right,
             source=node_module.BBOX_SOURCE_SYNTHETIC,
             observation_received_monotonic_s=25.0,
+            source_width_px=1280,
+            source_height_px=720,
         )
 
         self.assertEqual(bbox.observation_source, "synthetic_bbox_compatibility")
         status = json.loads(node.observation_status_pub.messages[-1].data)
         self.assertEqual(status["bbox_observation_source"], "synthetic_bbox_compatibility")
+
+    def test_new_oracle_event_does_not_reuse_previous_bbox_or_comparison(self) -> None:
+        node = make_node("both")
+        node.bbox_configured_source = node_module.BBOX_SOURCE_EXTERNAL
+        snapshot1 = valid_snapshot(1)
+        node.current_ground_truth_snapshot = snapshot1
+        left, right = ideal_pixel_centers(node, snapshot1)
+        bbox1, comparison1 = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            left,
+            right,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=20.0,
+            source_width_px=1280,
+            source_height_px=720,
+        )
+        self.assertTrue(bbox1.valid)
+        self.assertTrue(comparison1.valid)
+
+        snapshot2 = invalid_snapshot(2)
+        node.current_ground_truth_snapshot = snapshot2
+        StereoDistanceNode._process_ideal_snapshot(node, snapshot2)
+
+        status = status_payload(node)
+        self.assertEqual(status["oracle_sequence"], 2)
+        self.assertEqual(status["ideal_oracle_sequence"], 2)
+        self.assertIsNone(status["bbox_oracle_sequence"])
+        self.assertIsNone(status["comparison_valid"])
+        self.assertIsNone(status["same_oracle_sequence"])
+        self.assertNotEqual(status["bbox_left_u_px"], left["cx"])
+        assert_nan_array(self, node.bbox_vs_ideal_pixel_delta_pub.messages[-1])
+        assert_nan_array(self, node.bbox_vs_ideal_position_delta_pub.messages[-1])
+
+    def test_incomplete_bbox_pair_does_not_reuse_previous_comparison(self) -> None:
+        node = make_node("both")
+        node.bbox_configured_source = node_module.BBOX_SOURCE_EXTERNAL
+        snapshot1 = valid_snapshot(1)
+        node.current_ground_truth_snapshot = snapshot1
+        left, right = ideal_pixel_centers(node, snapshot1)
+        _bbox1, comparison1 = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            left,
+            right,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=20.0,
+            source_width_px=1280,
+            source_height_px=720,
+        )
+        self.assertTrue(comparison1.valid)
+
+        snapshot2 = valid_snapshot(2)
+        node.current_ground_truth_snapshot = snapshot2
+        bbox2, comparison2 = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            None,
+            None,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=21.0,
+            source_width_px=1280,
+            source_height_px=720,
+        )
+
+        self.assertFalse(bbox2.valid)
+        self.assertEqual(bbox2.oracle_sequence, 2)
+        self.assertFalse(comparison2.valid)
+        self.assertEqual(comparison2.status, "bbox_invalid")
+        self.assertTrue(comparison2.same_oracle_sequence)
+        status = status_payload(node)
+        self.assertEqual(status["bbox_status"], "incomplete_bbox_pair")
+        self.assertEqual(status["bbox_oracle_sequence"], 2)
+        self.assertFalse(status["comparison_valid"])
+        self.assertEqual(status["comparison_status"], "bbox_invalid")
+        self.assertTrue(status["same_oracle_sequence"])
+        assert_nan_array(self, node.bbox_vs_ideal_pixel_delta_pub.messages[-1])
+        assert_nan_array(self, node.bbox_vs_ideal_position_delta_pub.messages[-1])
+
+    def test_bbox_source_pixels_are_scaled_to_canonical_camera_frame(self) -> None:
+        node = make_node("both")
+        node.bbox_configured_source = node_module.BBOX_SOURCE_EXTERNAL
+        snapshot = valid_snapshot(10)
+        node.current_ground_truth_snapshot = snapshot
+        left, right = ideal_pixel_centers(node, snapshot)
+        source_left = {"cx": left["cx"] * 0.5, "cy": left["cy"] * 0.5}
+        source_right = {"cx": right["cx"] * 0.5, "cy": right["cy"] * 0.5}
+
+        bbox, comparison = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            source_left,
+            source_right,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=30.0,
+            source_width_px=640,
+            source_height_px=360,
+        )
+
+        self.assertTrue(bbox.valid)
+        self.assertAlmostEqual(bbox.left_u_px, left["cx"], delta=1e-9)
+        self.assertAlmostEqual(bbox.left_v_px, left["cy"], delta=1e-9)
+        self.assertAlmostEqual(bbox.right_u_px, right["cx"], delta=1e-9)
+        self.assertAlmostEqual(bbox.right_v_px, right["cy"], delta=1e-9)
+        self.assertLess(comparison.bbox_minus_ideal_norm_m, 1e-6)
+        self.assertLess(abs(comparison.pixel_delta_left_px[0]), 1e-9)
+        self.assertLess(abs(comparison.pixel_delta_left_px[1]), 1e-9)
+        self.assertLess(abs(comparison.pixel_delta_right_px[0]), 1e-9)
+        self.assertLess(abs(comparison.pixel_delta_right_px[1]), 1e-9)
+
+    def test_external_and_synthetic_call_sites_pass_configured_source_dimensions(self) -> None:
+        node = make_node("both")
+        captured = []
+        node.external_bbox_detection_width_px = 640
+        node.external_bbox_detection_height_px = 360
+        node.synthetic_detection_width_px = 320
+        node.synthetic_detection_height_px = 180
+        node.enable_synthetic_detections = True
+        node._mission_state = lambda: {"distance_m": 1000.0, "phase": "test"}
+        node._read_actual_distance = lambda fallback: fallback
+        node._calculate_metrics = lambda image, left, right, actual, phase: {"status": "ok"}
+        node._publish_estimated_position = lambda metrics: None
+        node._synthetic_detection_pair_from_rdf = lambda **kwargs: (
+            {"bbox": (0.0, 0.0, 2.0, 2.0), "confidence": 1.0, "cx": 1.0, "cy": 1.0},
+            {"bbox": (0.0, 0.0, 2.0, 2.0), "confidence": 1.0, "cx": 1.0, "cy": 1.0},
+        )
+        node.cached_ground_truth_position = {"right_m": 0.0, "down_m": 0.0, "forward_m": 1000.0}
+        node.camera_height_m = 5.0
+        node.target_center_z_m = 5.0
+
+        def capture(left, right, *, source, observation_received_monotonic_s, source_width_px, source_height_px):
+            captured.append((source, source_width_px, source_height_px))
+            return None, None
+
+        node._process_bbox_research_observation = capture
+        msg = types.SimpleNamespace(
+            data=[
+                1.0, 0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 1.0,
+                1.0, 0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 1.0,
+            ]
+        )
+        StereoDistanceNode._external_detections_cb(node, msg)
+        StereoDistanceNode._publish_synthetic_detection_sample(node)
+
+        self.assertEqual(captured[0], (node_module.BBOX_SOURCE_EXTERNAL, 640, 360))
+        self.assertEqual(captured[1], (node_module.BBOX_SOURCE_SYNTHETIC, 320, 180))
+
+    def test_yolo_image_dimension_mismatch_publishes_structured_invalid(self) -> None:
+        node = make_node("both")
+        node.bbox_configured_source = node_module.BBOX_SOURCE_YOLO
+        node.current_ground_truth_snapshot = valid_snapshot(11)
+        node._msg_to_rgb = lambda msg: msg.image
+        node._resolve_yolo_device = lambda: "cpu"
+        node.resolved_yolo_device = "cpu"
+        left_msg = types.SimpleNamespace(image=np.zeros((720, 1280, 3), dtype=np.uint8))
+        right_msg = types.SimpleNamespace(image=np.zeros((360, 640, 3), dtype=np.uint8))
+
+        StereoDistanceNode._update_metrics_from_messages(
+            node,
+            left_msg,
+            right_msg,
+            actual=1000.0,
+            phase="test",
+        )
+
+        status = status_payload(node)
+        self.assertEqual(status["bbox_status"], "invalid_bbox_source_dimensions")
+        self.assertEqual(status["bbox_oracle_sequence"], 11)
+        self.assertFalse(status["comparison_valid"])
+        self.assertEqual(status["comparison_status"], "bbox_invalid")
 
 
 if __name__ == "__main__":

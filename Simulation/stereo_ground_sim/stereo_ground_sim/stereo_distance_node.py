@@ -85,6 +85,7 @@ BBOX_SOURCE_YOLO = "yolo_rendered_rgb"
 BBOX_SOURCE_EXTERNAL = "external_bbox"
 BBOX_SOURCE_SYNTHETIC = "synthetic_bbox_compatibility"
 BBOX_SOURCE_UNAVAILABLE = "unavailable"
+_OBSERVATION_STATUS_UNSET = object()
 DEFAULT_BASELINE_ORIGIN_WORLD_ENU_M = (0.0, 0.0, 5.0)
 DEFAULT_ROTATION_BASELINE_WORLD_ROW_MAJOR = (
     0.0,
@@ -871,6 +872,11 @@ class StereoDistanceNode(Node):
             f"{prefix}_valid": None if measurement is None else bool(measurement.valid),
             f"{prefix}_status": None if measurement is None else measurement.status,
             f"{prefix}_observation_source": None if measurement is None else measurement.observation_source,
+            f"{prefix}_oracle_sequence": None if measurement is None else measurement.oracle_sequence,
+            f"{prefix}_oracle_received_monotonic_s": None if measurement is None else measurement.oracle_received_monotonic_s,
+            f"{prefix}_observation_received_monotonic_s": (
+                None if measurement is None else measurement.observation_received_monotonic_s
+            ),
             f"{prefix}_left_u_px": None if measurement is None else measurement.left_u_px,
             f"{prefix}_left_v_px": None if measurement is None else measurement.left_v_px,
             f"{prefix}_right_u_px": None if measurement is None else measurement.right_u_px,
@@ -881,15 +887,31 @@ class StereoDistanceNode(Node):
             f"{prefix}_intersection_angle_rad": None if measurement is None else measurement.intersection_angle_rad,
         }
 
-    def _publish_observation_status(self, *, snapshot=None, ideal=None, bbox=None, comparison=None):
+    def _publish_observation_status(
+        self,
+        *,
+        snapshot=_OBSERVATION_STATUS_UNSET,
+        ideal=_OBSERVATION_STATUS_UNSET,
+        bbox=_OBSERVATION_STATUS_UNSET,
+        comparison=_OBSERVATION_STATUS_UNSET,
+    ):
         if not hasattr(self, "observation_status_pub"):
             return
-        if snapshot is None or ideal is None or bbox is None or comparison is None:
+        if (
+            snapshot is _OBSERVATION_STATUS_UNSET
+            or ideal is _OBSERVATION_STATUS_UNSET
+            or bbox is _OBSERVATION_STATUS_UNSET
+            or comparison is _OBSERVATION_STATUS_UNSET
+        ):
             with self.lock:
-                snapshot = snapshot or getattr(self, "current_ground_truth_snapshot", None)
-                ideal = ideal if ideal is not None else getattr(self, "latest_ideal_measurement", None)
-                bbox = bbox if bbox is not None else getattr(self, "latest_bbox_general_ray_measurement", None)
-                comparison = comparison if comparison is not None else getattr(self, "latest_observation_comparison", None)
+                if snapshot is _OBSERVATION_STATUS_UNSET:
+                    snapshot = getattr(self, "current_ground_truth_snapshot", None)
+                if ideal is _OBSERVATION_STATUS_UNSET:
+                    ideal = getattr(self, "latest_ideal_measurement", None)
+                if bbox is _OBSERVATION_STATUS_UNSET:
+                    bbox = getattr(self, "latest_bbox_general_ray_measurement", None)
+                if comparison is _OBSERVATION_STATUS_UNSET:
+                    comparison = getattr(self, "latest_observation_comparison", None)
         if snapshot is None:
             snapshot = self._current_ground_truth_snapshot_copy()
         payload = {
@@ -932,10 +954,11 @@ class StereoDistanceNode(Node):
 
     def _process_ideal_snapshot(self, snapshot):
         if not self._ideal_branch_enabled():
-            self._publish_observation_status(snapshot=snapshot)
+            self._publish_observation_status(snapshot=snapshot, ideal=None, bbox=None, comparison=None)
             return None
         measurement = self._compute_ideal_measurement(snapshot)
         bbox = None
+        comparison = None
         if self._bbox_branch_enabled() and getattr(self, "bbox_configured_source", BBOX_SOURCE_UNAVAILABLE) == BBOX_SOURCE_UNAVAILABLE:
             bbox = self._invalid_bbox_measurement(
                 snapshot,
@@ -950,7 +973,9 @@ class StereoDistanceNode(Node):
         self._publish_ideal_measurement(measurement)
         if bbox is not None:
             self._publish_bbox_general_ray_measurement(bbox)
-        self._publish_observation_status(snapshot=snapshot, ideal=measurement, bbox=bbox)
+        if self._observation_mode() == "both":
+            self._publish_comparison_measurement(comparison)
+        self._publish_observation_status(snapshot=snapshot, ideal=measurement, bbox=bbox, comparison=comparison)
         return measurement
 
     def _invalid_bbox_measurement(self, snapshot, *, status, source, observation_received_monotonic_s):
@@ -978,25 +1003,71 @@ class StereoDistanceNode(Node):
             right_ray_parameter_m=None,
         )
 
-    def _process_bbox_research_observation(self, left, right, *, source, observation_received_monotonic_s):
+    def _bbox_source_dimensions(self, source_width_px, source_height_px):
+        width_px = self._positive_int_config(source_width_px, field_name="source_width_px")
+        height_px = self._positive_int_config(source_height_px, field_name="source_height_px")
+        return width_px, height_px
+
+    def _canonical_research_detection(self, detection, *, source_width_px, source_height_px):
+        if detection is None:
+            return None
+        canonical_width_px = getattr(self, "camera_image_width_px", 1280)
+        canonical_height_px = getattr(self, "camera_image_height_px", 720)
+        scaled = dict(detection)
+        scaled["cx"] = float(detection["cx"]) * float(canonical_width_px) / float(source_width_px)
+        scaled["cy"] = float(detection["cy"]) * float(canonical_height_px) / float(source_height_px)
+        return scaled
+
+    def _process_bbox_research_observation(
+        self,
+        left,
+        right,
+        *,
+        source,
+        observation_received_monotonic_s,
+        source_width_px,
+        source_height_px,
+    ):
         if not self._bbox_branch_enabled() or not hasattr(self, "bbox_general_ray_estimated_position_pub"):
             return None, None
         snapshot = self._current_ground_truth_snapshot_copy()
-        if left is None or right is None:
+        ideal = None
+        comparison = None
+        dimensions_valid = True
+        try:
+            source_width_px, source_height_px = self._bbox_source_dimensions(source_width_px, source_height_px)
+        except (TypeError, ValueError):
+            dimensions_valid = False
+            bbox = self._invalid_bbox_measurement(
+                snapshot,
+                status="invalid_bbox_source_dimensions",
+                source=source,
+                observation_received_monotonic_s=observation_received_monotonic_s,
+            )
+        if dimensions_valid and (left is None or right is None):
             bbox = self._invalid_bbox_measurement(
                 snapshot,
                 status="incomplete_bbox_pair",
                 source=source,
                 observation_received_monotonic_s=observation_received_monotonic_s,
             )
-            comparison = None
-        else:
+        elif dimensions_valid:
             try:
+                canonical_left = self._canonical_research_detection(
+                    left,
+                    source_width_px=source_width_px,
+                    source_height_px=source_height_px,
+                )
+                canonical_right = self._canonical_research_detection(
+                    right,
+                    source_width_px=source_width_px,
+                    source_height_px=source_height_px,
+                )
                 pixels = PixelObservation(
-                    left["cx"],
-                    left["cy"],
-                    right["cx"],
-                    right["cy"],
+                    canonical_left["cx"],
+                    canonical_left["cy"],
+                    canonical_right["cx"],
+                    canonical_right["cy"],
                     source,
                     observation_received_monotonic_s,
                 )
@@ -1015,12 +1086,11 @@ class StereoDistanceNode(Node):
                     source=source,
                     observation_received_monotonic_s=observation_received_monotonic_s,
                 )
-            comparison = None
-            if self._observation_mode() == "both":
-                ideal = self._compute_ideal_measurement(snapshot)
-                comparison = compare_observation_measurements(ideal, bbox)
-                with self.lock:
-                    self.latest_ideal_measurement = ideal
+        if self._observation_mode() == "both":
+            ideal = self._compute_ideal_measurement(snapshot)
+            comparison = compare_observation_measurements(ideal, bbox)
+            with self.lock:
+                self.latest_ideal_measurement = ideal
         with self.lock:
             self.latest_bbox_general_ray_measurement = bbox
             self.latest_observation_comparison = comparison
@@ -1913,6 +1983,20 @@ class StereoDistanceNode(Node):
             right_image = self._msg_to_rgb(right_msg)
             if left_image is None or right_image is None:
                 return
+            left_shape = getattr(left_image, "shape", None)
+            right_shape = getattr(right_image, "shape", None)
+            if left_shape is not None and right_shape is not None and left_shape[:2] != right_shape[:2]:
+                self._process_bbox_research_observation(
+                    None,
+                    None,
+                    source=BBOX_SOURCE_YOLO,
+                    observation_received_monotonic_s=started,
+                    source_width_px=0,
+                    source_height_px=0,
+                )
+                return
+            source_width_px = left_shape[1] if left_shape is not None else getattr(self, "camera_image_width_px", 1280)
+            source_height_px = left_shape[0] if left_shape is not None else getattr(self, "camera_image_height_px", 720)
             if device is None:
                 device = self.resolved_yolo_device or self._resolve_yolo_device()
             left, right = self._detect_drone_pair(left_image, right_image, device=device)
@@ -1938,6 +2022,8 @@ class StereoDistanceNode(Node):
                 right,
                 source=BBOX_SOURCE_YOLO,
                 observation_received_monotonic_s=started,
+                source_width_px=source_width_px,
+                source_height_px=source_height_px,
             )
 
             disparity = metrics.get("disparity_px")
@@ -2127,6 +2213,8 @@ class StereoDistanceNode(Node):
             right,
             source=BBOX_SOURCE_EXTERNAL,
             observation_received_monotonic_s=time.monotonic(),
+            source_width_px=width,
+            source_height_px=height,
         )
         self._publish_estimated_position(metrics)
 
@@ -2565,6 +2653,8 @@ class StereoDistanceNode(Node):
             right,
             source=BBOX_SOURCE_SYNTHETIC,
             observation_received_monotonic_s=time.monotonic(),
+            source_width_px=width,
+            source_height_px=height,
         )
         self._publish_estimated_position(metrics)
 
