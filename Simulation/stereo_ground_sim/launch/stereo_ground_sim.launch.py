@@ -45,6 +45,8 @@ def _write_distance_node_params(context, params_file=None):
         "baseline_m",
         "camera_height_m",
         "horizontal_fov_rad",
+        "camera_clip_near_m",
+        "camera_clip_far_m",
         "approach_start_distance_m",
         "approach_end_distance_m",
         "approach_duration_s",
@@ -66,6 +68,8 @@ def _write_distance_node_params(context, params_file=None):
     }
     int_params = {
         "yolo_imgsz",
+        "camera_image_width_px",
+        "camera_image_height_px",
         "synthetic_detection_width_px",
         "synthetic_detection_height_px",
         "external_bbox_detection_width_px",
@@ -92,10 +96,15 @@ def _write_distance_node_params(context, params_file=None):
         "baseline_m",
         "camera_height_m",
         "horizontal_fov_rad",
+        "camera_image_width_px",
+        "camera_image_height_px",
+        "camera_clip_near_m",
+        "camera_clip_far_m",
         "approach_start_distance_m",
         "approach_end_distance_m",
         "approach_duration_s",
         "mission_profile",
+        "observation_mode",
         "takeoff_altitude_m",
         "takeoff_duration_s",
         "first_hover_duration_s",
@@ -136,10 +145,20 @@ def _write_distance_node_params(context, params_file=None):
         "disparity_residual_feature_selector_window_size",
         "disparity_residual_feature_selector_min_samples",
     ]
+    default_params = {
+        "observation_mode": "both",
+        "camera_image_width_px": 1280,
+        "camera_image_height_px": 720,
+        "camera_clip_near_m": 0.1,
+        "camera_clip_far_m": 2500.0,
+    }
 
     params = {}
     for name in names:
-        raw = LaunchConfiguration(name).perform(context)
+        try:
+            raw = LaunchConfiguration(name).perform(context)
+        except KeyError:
+            raw = default_params[name]
         if name in float_params:
             params[name] = float(raw)
         elif name in int_params:
@@ -443,6 +462,7 @@ def generate_launch_description():
             DeclareLaunchArgument("approach_end_distance_m", default_value="200.0"),
             DeclareLaunchArgument("approach_duration_s", default_value="120.0"),
             DeclareLaunchArgument("mission_profile", default_value="manual"),
+            DeclareLaunchArgument("observation_mode", default_value="both"),
             DeclareLaunchArgument("takeoff_altitude_m", default_value="10.0"),
             DeclareLaunchArgument("takeoff_duration_s", default_value="10.0"),
             DeclareLaunchArgument("first_hover_duration_s", default_value="5.0"),

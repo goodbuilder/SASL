@@ -14,6 +14,11 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import Image as ImageMsg
 from std_msgs.msg import Float32, Float32MultiArray, String
+try:
+    from std_msgs.msg import Float64, Float64MultiArray
+except ImportError:  # Test stubs in non-ROS environments may only define Float32 messages.
+    Float64 = Float32
+    Float64MultiArray = Float32MultiArray
 from visualization_msgs.msg import Marker
 
 from stereo_ground_sim.reprojection_profile import (
@@ -43,9 +48,19 @@ from stereo_ground_sim.gazebo_oracle import (
     make_gazebo_world_to_baseline_transform,
     x500_oracle_source_policy,
 )
+from stereo_ground_sim.coordinate_frames import FrameId, FramePoint
+from stereo_ground_sim.observation_comparison import (
+    GroundTruthSnapshot,
+    ObservationMeasurementResult,
+    PixelObservation,
+    bbox_measurement_from_pixels,
+    compare_observation_measurements,
+    ideal_measurement_from_snapshot,
+)
 from stereo_ground_sim.stereo_triangulation_adapter import (
     general_ray_shadow_not_computed,
     general_ray_shadow_summary,
+    pinhole_intrinsics_from_horizontal_fov,
     triangulate_nominal_stereo_centers,
 )
 
@@ -56,7 +71,20 @@ ORACLE_STATIC_PARAMETERS = {
     "oracle_base_link_name",
     "baseline_origin_world_enu_m",
     "rotation_baseline_world_row_major",
+    "observation_mode",
+    "camera_image_width_px",
+    "camera_image_height_px",
+    "camera_clip_near_m",
+    "camera_clip_far_m",
+    "enable_synthetic_detections",
+    "enable_external_bbox_detections",
+    "external_bbox_detections_topic",
 }
+OBSERVATION_MODES = {"bbox", "ideal_projection", "both"}
+BBOX_SOURCE_YOLO = "yolo_rendered_rgb"
+BBOX_SOURCE_EXTERNAL = "external_bbox"
+BBOX_SOURCE_SYNTHETIC = "synthetic_bbox_compatibility"
+BBOX_SOURCE_UNAVAILABLE = "unavailable"
 DEFAULT_BASELINE_ORIGIN_WORLD_ENU_M = (0.0, 0.0, 5.0)
 DEFAULT_ROTATION_BASELINE_WORLD_ROW_MAJOR = (
     0.0,
@@ -70,7 +98,7 @@ DEFAULT_ROTATION_BASELINE_WORLD_ROW_MAJOR = (
     -1.0,
 )
 ORACLE_STATIC_PARAMETER_REJECTION_REASON = (
-    "oracle source and baseline frame parameters require node restart"
+    "oracle source, observation topology, and camera projection parameters require node restart"
 )
 
 
@@ -86,11 +114,16 @@ class StereoDistanceNode(Node):
         self.declare_parameter("baseline_m", 25.0)
         self.declare_parameter("camera_height_m", 5.0)
         self.declare_parameter("horizontal_fov_rad", 0.154997710698)
+        self.declare_parameter("camera_image_width_px", 1280)
+        self.declare_parameter("camera_image_height_px", 720)
+        self.declare_parameter("camera_clip_near_m", 0.1)
+        self.declare_parameter("camera_clip_far_m", 2500.0)
         self.declare_parameter("reference_distance_m", 45.0)
         self.declare_parameter("approach_start_distance_m", 2000.0)
         self.declare_parameter("approach_end_distance_m", 300.0)
         self.declare_parameter("approach_duration_s", 120.0)
         self.declare_parameter("mission_profile", "manual")
+        self.declare_parameter("observation_mode", "both")
         self.declare_parameter("takeoff_altitude_m", 10.0)
         self.declare_parameter("takeoff_duration_s", 10.0)
         self.declare_parameter("first_hover_duration_s", 5.0)
@@ -157,11 +190,23 @@ class StereoDistanceNode(Node):
         self.baseline_m = self._float_param("baseline_m")
         self.camera_height_m = self._float_param("camera_height_m")
         self.horizontal_fov_rad = self._float_param("horizontal_fov_rad")
+        self.camera_image_width_px = self._positive_int_config(
+            self.get_parameter("camera_image_width_px").value,
+            field_name="camera_image_width_px",
+        )
+        self.camera_image_height_px = self._positive_int_config(
+            self.get_parameter("camera_image_height_px").value,
+            field_name="camera_image_height_px",
+        )
+        self.camera_clip_near_m = self._float_param("camera_clip_near_m")
+        self.camera_clip_far_m = self._float_param("camera_clip_far_m")
+        self._validate_camera_clip_config(self.camera_clip_near_m, self.camera_clip_far_m)
         self.reference_distance_m = self._float_param("reference_distance_m")
         self.approach_start_distance_m = self._float_param("approach_start_distance_m")
         self.approach_end_distance_m = self._float_param("approach_end_distance_m")
         self.approach_duration_s = self._float_param("approach_duration_s")
         self.mission_profile = self.get_parameter("mission_profile").value
+        self.observation_mode = self._observation_mode_value(self.get_parameter("observation_mode").value)
         self.takeoff_altitude_m = self._float_param("takeoff_altitude_m")
         self.takeoff_duration_s = self._float_param("takeoff_duration_s")
         self.first_hover_duration_s = self._float_param("first_hover_duration_s")
@@ -203,6 +248,7 @@ class StereoDistanceNode(Node):
         )
         self.enable_external_bbox_detections = self._bool_param("enable_external_bbox_detections")
         self.external_bbox_detections_topic = str(self.get_parameter("external_bbox_detections_topic").value)
+        self.bbox_configured_source = self._configured_bbox_source_label()
         self.external_bbox_detection_width_px = max(1, int(self.get_parameter("external_bbox_detection_width_px").value))
         self.external_bbox_detection_height_px = max(
             1,
@@ -283,6 +329,22 @@ class StereoDistanceNode(Node):
         }
         self.has_valid_gazebo_ground_truth = False
         self.cached_ground_truth_metadata = self._initial_gazebo_oracle_metadata()
+        self.oracle_sample_seq = 0
+        self.current_ground_truth_snapshot = GroundTruthSnapshot(
+            sequence=0,
+            received_monotonic_s=0.0,
+            point_baseline_center_frd=None,
+            range_m=None,
+            oracle_valid=False,
+            oracle_status="not_computed_init",
+            oracle_source_role=None,
+            oracle_matched_entity_name=None,
+            oracle_fallback_used=False,
+        )
+        self.last_valid_ground_truth_snapshot = None
+        self.latest_ideal_measurement = None
+        self.latest_bbox_general_ray_measurement = None
+        self.latest_observation_comparison = None
         self.shutdown_event = threading.Event()
 
         self.left_msg = None
@@ -349,7 +411,27 @@ class StereoDistanceNode(Node):
         self.detections_pub = self.create_publisher(
             Float32MultiArray, "/stereo/detections", 10
         )
-        if self.enable_external_bbox_detections:
+        self.ideal_estimated_position_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/ideal/estimated_position", 10
+        )
+        self.ideal_position_error_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/ideal/position_error", 10
+        )
+        self.ideal_disparity_pub = self.create_publisher(Float64, "/stereo/ideal/disparity", 10)
+        self.bbox_general_ray_estimated_position_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/bbox_general_ray/estimated_position", 10
+        )
+        self.bbox_general_ray_position_error_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/bbox_general_ray/position_error", 10
+        )
+        self.bbox_vs_ideal_pixel_delta_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/bbox_vs_ideal/pixel_delta", 10
+        )
+        self.bbox_vs_ideal_position_delta_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/bbox_vs_ideal/position_delta", 10
+        )
+        self.observation_status_pub = self.create_publisher(String, "/stereo/observation_status", 10)
+        if self._bbox_branch_enabled() and self.enable_external_bbox_detections:
             self.create_subscription(
                 Float32MultiArray,
                 self.external_bbox_detections_topic,
@@ -382,7 +464,7 @@ class StereoDistanceNode(Node):
             )
         else:
             disabled_reason = self.yolo_runtime_disable_reason or self.yolo_load_error
-            if self.enable_synthetic_detections:
+            if self._bbox_branch_enabled() and self.enable_synthetic_detections:
                 self.get_logger().info(
                     "YOLO image subscriptions disabled; synthetic detection mode is enabled "
                     "for headless/operator pipeline validation."
@@ -394,7 +476,7 @@ class StereoDistanceNode(Node):
                     + (f" ({disabled_reason})" if disabled_reason else "")
                 )
         self.create_timer(0.2, self._publish_marker)
-        if self.enable_synthetic_detections:
+        if self._bbox_branch_enabled() and self.enable_synthetic_detections:
             synthetic_hz = self.yolo_target_hz if self.yolo_target_hz > 0.0 else self.plot_publish_hz
             self.create_timer(1.0 / max(1.0, float(synthetic_hz)), self._publish_synthetic_detection_sample)
         self.add_on_set_parameters_callback(self._on_param_update)
@@ -421,6 +503,60 @@ class StereoDistanceNode(Node):
         if isinstance(value, str):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
+
+    @staticmethod
+    def _observation_mode_value(value):
+        if not isinstance(value, str):
+            raise ValueError("observation_mode must be a string")
+        mode = value.strip()
+        if mode not in OBSERVATION_MODES:
+            raise ValueError(
+                "observation_mode must be one of: bbox, ideal_projection, both"
+            )
+        return mode
+
+    @staticmethod
+    def _positive_int_config(value, *, field_name):
+        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+            raise ValueError(f"{field_name} must be a positive integer")
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError(f"{field_name} must be positive")
+        return parsed
+
+    @staticmethod
+    def _validate_camera_clip_config(near_m, far_m):
+        if isinstance(near_m, bool) or isinstance(far_m, bool):
+            raise ValueError("camera clip values must be finite floats")
+        near = float(near_m)
+        far = float(far_m)
+        if not math.isfinite(near) or not math.isfinite(far):
+            raise ValueError("camera clip values must be finite")
+        if near < 0.0 or far <= near:
+            raise ValueError("camera clip range must satisfy 0 <= near < far")
+
+    def _observation_mode(self):
+        return getattr(self, "observation_mode", "bbox")
+
+    def _ideal_branch_enabled(self):
+        return self._observation_mode() in ("ideal_projection", "both")
+
+    def _bbox_branch_enabled(self):
+        return self._observation_mode() in ("bbox", "both")
+
+    def _configured_bbox_source_label(self):
+        configured = []
+        if str(getattr(self, "yolo_model_path", "")).strip() and float(getattr(self, "yolo_target_hz", 0.0)) > 0.0:
+            configured.append(BBOX_SOURCE_YOLO)
+        if bool(getattr(self, "enable_external_bbox_detections", False)):
+            configured.append(BBOX_SOURCE_EXTERNAL)
+        if bool(getattr(self, "enable_synthetic_detections", False)):
+            configured.append(BBOX_SOURCE_SYNTHETIC)
+        if len(configured) > 1:
+            raise ValueError(f"only one BBox observation source may be configured, got: {configured}")
+        if not configured:
+            return BBOX_SOURCE_UNAVAILABLE
+        return configured[0]
 
     @staticmethod
     def _finite_float_sequence(values, *, field_name, expected_length):
@@ -565,6 +701,334 @@ class StereoDistanceNode(Node):
             "forward_m": float(forward_m),
             "ground_truth_m": float(range_m),
         }
+
+    def _snapshot_from_oracle_result(self, *, sequence, result, now, ground_truth=None):
+        if result.valid and result.point_baseline_center_frd_m is not None:
+            range_m = None if ground_truth is None else ground_truth.get("ground_truth_m")
+            if range_m is None:
+                range_m = self._actual_range_m(*(
+                    result.point_baseline_center_frd_m.xyz_m[index]
+                    for index in (1, 2, 0)
+                ))
+            return GroundTruthSnapshot(
+                sequence=sequence,
+                received_monotonic_s=now,
+                point_baseline_center_frd=result.point_baseline_center_frd_m,
+                range_m=float(range_m),
+                oracle_valid=True,
+                oracle_status=self._enum_value_or_none(result.status),
+                oracle_source_role=self._enum_value_or_none(result.source_role),
+                oracle_matched_entity_name=result.matched_entity_name,
+                oracle_fallback_used=bool(result.fallback_used),
+            )
+        return GroundTruthSnapshot(
+            sequence=sequence,
+            received_monotonic_s=now,
+            point_baseline_center_frd=None,
+            range_m=None,
+            oracle_valid=False,
+            oracle_status=self._enum_value_or_none(result.status),
+            oracle_source_role=self._enum_value_or_none(result.source_role),
+            oracle_matched_entity_name=result.matched_entity_name,
+            oracle_fallback_used=bool(result.fallback_used),
+        )
+
+    def _snapshot_from_status(self, *, sequence, status, now):
+        return GroundTruthSnapshot(
+            sequence=sequence,
+            received_monotonic_s=now,
+            point_baseline_center_frd=None,
+            range_m=None,
+            oracle_valid=False,
+            oracle_status=self._enum_value_or_none(status),
+            oracle_source_role=None,
+            oracle_matched_entity_name=None,
+            oracle_fallback_used=False,
+        )
+
+    def _next_oracle_sample_seq_locked(self):
+        sequence = int(getattr(self, "oracle_sample_seq", 0)) + 1
+        self.oracle_sample_seq = sequence
+        return sequence
+
+    def _current_ground_truth_snapshot_copy(self):
+        with self.lock:
+            return getattr(
+                self,
+                "current_ground_truth_snapshot",
+                GroundTruthSnapshot(
+                    sequence=0,
+                    received_monotonic_s=0.0,
+                    point_baseline_center_frd=None,
+                    range_m=None,
+                    oracle_valid=False,
+                    oracle_status="not_computed_init",
+                    oracle_source_role=None,
+                    oracle_matched_entity_name=None,
+                    oracle_fallback_used=False,
+                ),
+            )
+
+    def _ideal_intrinsics(self):
+        return pinhole_intrinsics_from_horizontal_fov(
+            width_px=getattr(self, "camera_image_width_px", 1280),
+            height_px=getattr(self, "camera_image_height_px", 720),
+            horizontal_fov_rad=getattr(self, "horizontal_fov_rad", 0.154997710698),
+        )
+
+    @staticmethod
+    def _nan4_msg():
+        return Float64MultiArray(data=[math.nan, math.nan, math.nan, math.nan])
+
+    @staticmethod
+    def _nan5_msg():
+        return Float64MultiArray(data=[math.nan, math.nan, math.nan, math.nan, math.nan])
+
+    @staticmethod
+    def _position_msg_from_measurement(measurement):
+        if measurement is None or measurement.estimated_point_baseline_center_frd_m is None or measurement.estimated_range_m is None:
+            return StereoDistanceNode._nan4_msg()
+        forward_m, right_m, down_m = measurement.estimated_point_baseline_center_frd_m
+        return Float64MultiArray(data=[float(forward_m), float(right_m), float(down_m), float(measurement.estimated_range_m)])
+
+    @staticmethod
+    def _error_msg_from_measurement(measurement):
+        if measurement is None or measurement.error_vector_baseline_center_frd_m is None or measurement.error_norm_m is None:
+            return StereoDistanceNode._nan4_msg()
+        forward_m, right_m, down_m = measurement.error_vector_baseline_center_frd_m
+        return Float64MultiArray(data=[float(forward_m), float(right_m), float(down_m), float(measurement.error_norm_m)])
+
+    def _publish_ideal_measurement(self, measurement):
+        if not hasattr(self, "ideal_estimated_position_pub"):
+            return
+        self.ideal_estimated_position_pub.publish(self._position_msg_from_measurement(measurement))
+        self.ideal_position_error_pub.publish(self._error_msg_from_measurement(measurement))
+        disparity = math.nan if measurement is None or measurement.signed_disparity_px is None else float(measurement.signed_disparity_px)
+        self.ideal_disparity_pub.publish(Float64(data=disparity))
+
+    def _publish_bbox_general_ray_measurement(self, measurement):
+        if not hasattr(self, "bbox_general_ray_estimated_position_pub"):
+            return
+        self.bbox_general_ray_estimated_position_pub.publish(self._position_msg_from_measurement(measurement))
+        self.bbox_general_ray_position_error_pub.publish(self._error_msg_from_measurement(measurement))
+
+    def _publish_comparison_measurement(self, comparison):
+        if not hasattr(self, "bbox_vs_ideal_pixel_delta_pub"):
+            return
+        if (
+            comparison is None
+            or comparison.pixel_delta_left_px is None
+            or comparison.pixel_delta_right_px is None
+            or comparison.disparity_delta_px is None
+        ):
+            self.bbox_vs_ideal_pixel_delta_pub.publish(self._nan5_msg())
+        else:
+            self.bbox_vs_ideal_pixel_delta_pub.publish(
+                Float64MultiArray(
+                    data=[
+                        float(comparison.pixel_delta_left_px[0]),
+                        float(comparison.pixel_delta_left_px[1]),
+                        float(comparison.pixel_delta_right_px[0]),
+                        float(comparison.pixel_delta_right_px[1]),
+                        float(comparison.disparity_delta_px),
+                    ]
+                )
+            )
+        if (
+            comparison is None
+            or comparison.bbox_minus_ideal_position_baseline_center_frd_m is None
+            or comparison.bbox_minus_ideal_norm_m is None
+        ):
+            self.bbox_vs_ideal_position_delta_pub.publish(self._nan4_msg())
+        else:
+            forward_m, right_m, down_m = comparison.bbox_minus_ideal_position_baseline_center_frd_m
+            self.bbox_vs_ideal_position_delta_pub.publish(
+                Float64MultiArray(
+                    data=[
+                        float(forward_m),
+                        float(right_m),
+                        float(down_m),
+                        float(comparison.bbox_minus_ideal_norm_m),
+                    ]
+                )
+            )
+
+    @staticmethod
+    def _json_safe(value):
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, (str, bool, int)) or value is None:
+            return value
+        if isinstance(value, (list, tuple)):
+            return [StereoDistanceNode._json_safe(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): StereoDistanceNode._json_safe(item) for key, item in value.items()}
+        return str(value)
+
+    @staticmethod
+    def _measurement_json_fields(measurement, *, prefix):
+        return {
+            f"{prefix}_valid": None if measurement is None else bool(measurement.valid),
+            f"{prefix}_status": None if measurement is None else measurement.status,
+            f"{prefix}_observation_source": None if measurement is None else measurement.observation_source,
+            f"{prefix}_left_u_px": None if measurement is None else measurement.left_u_px,
+            f"{prefix}_left_v_px": None if measurement is None else measurement.left_v_px,
+            f"{prefix}_right_u_px": None if measurement is None else measurement.right_u_px,
+            f"{prefix}_right_v_px": None if measurement is None else measurement.right_v_px,
+            f"{prefix}_signed_disparity_px": None if measurement is None else measurement.signed_disparity_px,
+            f"{prefix}_pixel_bounds_status": None if measurement is None else measurement.pixel_bounds_status,
+            f"{prefix}_ray_gap_m": None if measurement is None else measurement.ray_gap_m,
+            f"{prefix}_intersection_angle_rad": None if measurement is None else measurement.intersection_angle_rad,
+        }
+
+    def _publish_observation_status(self, *, snapshot=None, ideal=None, bbox=None, comparison=None):
+        if not hasattr(self, "observation_status_pub"):
+            return
+        if snapshot is None or ideal is None or bbox is None or comparison is None:
+            with self.lock:
+                snapshot = snapshot or getattr(self, "current_ground_truth_snapshot", None)
+                ideal = ideal if ideal is not None else getattr(self, "latest_ideal_measurement", None)
+                bbox = bbox if bbox is not None else getattr(self, "latest_bbox_general_ray_measurement", None)
+                comparison = comparison if comparison is not None else getattr(self, "latest_observation_comparison", None)
+        if snapshot is None:
+            snapshot = self._current_ground_truth_snapshot_copy()
+        payload = {
+            "observation_mode": self._observation_mode(),
+            "output_frame": FrameId.BASELINE_CENTER_FRD.value,
+            "position_unit": "m",
+            "pixel_unit": "px",
+            "ray_gap_unit": "m",
+            "intersection_angle_unit": "rad",
+            "oracle_sequence": snapshot.sequence,
+            "oracle_valid": snapshot.oracle_valid,
+            "oracle_status": snapshot.oracle_status,
+            "oracle_source_role": snapshot.oracle_source_role,
+            "oracle_matched_entity_name": snapshot.oracle_matched_entity_name,
+            "oracle_fallback_used": snapshot.oracle_fallback_used,
+            "oracle_received_monotonic_s": snapshot.received_monotonic_s,
+            "ideal_enabled": self._ideal_branch_enabled(),
+            "bbox_enabled": self._bbox_branch_enabled(),
+            "bbox_configured_source": getattr(self, "bbox_configured_source", BBOX_SOURCE_UNAVAILABLE),
+            "bbox_observation_received_monotonic_s": None if bbox is None else bbox.observation_received_monotonic_s,
+            "comparison_valid": None if comparison is None else comparison.valid,
+            "comparison_status": None if comparison is None else comparison.status,
+            "same_oracle_sequence": None if comparison is None else comparison.same_oracle_sequence,
+            "error_identity_residual_m": None if comparison is None else comparison.error_identity_residual_m,
+        }
+        payload.update(self._measurement_json_fields(ideal, prefix="ideal"))
+        payload.update(self._measurement_json_fields(bbox, prefix="bbox"))
+        self.observation_status_pub.publish(
+            String(data=json.dumps(self._json_safe(payload), ensure_ascii=False, sort_keys=True))
+        )
+
+    def _compute_ideal_measurement(self, snapshot):
+        return ideal_measurement_from_snapshot(
+            snapshot,
+            intrinsics=self._ideal_intrinsics(),
+            baseline_m=getattr(self, "baseline_m", 25.0),
+            clip_near_m=getattr(self, "camera_clip_near_m", 0.1),
+            clip_far_m=getattr(self, "camera_clip_far_m", 2500.0),
+        )
+
+    def _process_ideal_snapshot(self, snapshot):
+        if not self._ideal_branch_enabled():
+            self._publish_observation_status(snapshot=snapshot)
+            return None
+        measurement = self._compute_ideal_measurement(snapshot)
+        bbox = None
+        if self._bbox_branch_enabled() and getattr(self, "bbox_configured_source", BBOX_SOURCE_UNAVAILABLE) == BBOX_SOURCE_UNAVAILABLE:
+            bbox = self._invalid_bbox_measurement(
+                snapshot,
+                status="bbox_source_unavailable",
+                source=BBOX_SOURCE_UNAVAILABLE,
+                observation_received_monotonic_s=None,
+            )
+        with self.lock:
+            self.latest_ideal_measurement = measurement
+            if bbox is not None:
+                self.latest_bbox_general_ray_measurement = bbox
+        self._publish_ideal_measurement(measurement)
+        if bbox is not None:
+            self._publish_bbox_general_ray_measurement(bbox)
+        self._publish_observation_status(snapshot=snapshot, ideal=measurement, bbox=bbox)
+        return measurement
+
+    def _invalid_bbox_measurement(self, snapshot, *, status, source, observation_received_monotonic_s):
+        return ObservationMeasurementResult(
+            valid=False,
+            status=status,
+            observation_source=source,
+            oracle_sequence=snapshot.sequence,
+            oracle_received_monotonic_s=snapshot.received_monotonic_s,
+            observation_received_monotonic_s=observation_received_monotonic_s,
+            left_u_px=None,
+            left_v_px=None,
+            right_u_px=None,
+            right_v_px=None,
+            signed_disparity_px=None,
+            vertical_disparity_px=None,
+            pixel_bounds_status="not_evaluated",
+            estimated_point_baseline_center_frd_m=None,
+            estimated_range_m=None,
+            error_vector_baseline_center_frd_m=None,
+            error_norm_m=None,
+            ray_gap_m=None,
+            intersection_angle_rad=None,
+            left_ray_parameter_m=None,
+            right_ray_parameter_m=None,
+        )
+
+    def _process_bbox_research_observation(self, left, right, *, source, observation_received_monotonic_s):
+        if not self._bbox_branch_enabled() or not hasattr(self, "bbox_general_ray_estimated_position_pub"):
+            return None, None
+        snapshot = self._current_ground_truth_snapshot_copy()
+        if left is None or right is None:
+            bbox = self._invalid_bbox_measurement(
+                snapshot,
+                status="incomplete_bbox_pair",
+                source=source,
+                observation_received_monotonic_s=observation_received_monotonic_s,
+            )
+            comparison = None
+        else:
+            try:
+                pixels = PixelObservation(
+                    left["cx"],
+                    left["cy"],
+                    right["cx"],
+                    right["cy"],
+                    source,
+                    observation_received_monotonic_s,
+                )
+                bbox = bbox_measurement_from_pixels(
+                    snapshot,
+                    pixels,
+                    width_px=getattr(self, "camera_image_width_px", 1280),
+                    height_px=getattr(self, "camera_image_height_px", 720),
+                    horizontal_fov_rad=getattr(self, "horizontal_fov_rad", 0.154997710698),
+                    baseline_m=getattr(self, "baseline_m", 25.0),
+                )
+            except (TypeError, ValueError):
+                bbox = self._invalid_bbox_measurement(
+                    snapshot,
+                    status="invalid_bbox_pixels",
+                    source=source,
+                    observation_received_monotonic_s=observation_received_monotonic_s,
+                )
+            comparison = None
+            if self._observation_mode() == "both":
+                ideal = self._compute_ideal_measurement(snapshot)
+                comparison = compare_observation_measurements(ideal, bbox)
+                with self.lock:
+                    self.latest_ideal_measurement = ideal
+        with self.lock:
+            self.latest_bbox_general_ray_measurement = bbox
+            self.latest_observation_comparison = comparison
+        self._publish_bbox_general_ray_measurement(bbox)
+        if self._observation_mode() == "both":
+            self._publish_comparison_measurement(comparison)
+        self._publish_observation_status(snapshot=snapshot, bbox=bbox, comparison=comparison)
+        return bbox, comparison
 
     def _comparison_actual_and_error_for_publish(self, *, metrics, ground_truth_metadata):
         if self.actual_distance_source == "gazebo" and ground_truth_metadata.get("oracle_valid") is not True:
@@ -929,6 +1393,8 @@ class StereoDistanceNode(Node):
         return loaded
 
     def _should_subscribe_camera_images(self):
+        if not self._bbox_branch_enabled():
+            return False
         if self.yolo_target_hz <= 0.0:
             return False
         if not self.yolo_model_path.strip():
@@ -1203,37 +1669,45 @@ class StereoDistanceNode(Node):
             "gz",
             "topic",
             "-e",
+            "-n",
+            "1",
             "-t",
             "/world/stereo_ground_drone/pose/info",
             "--json-output",
         ]
         while not self.shutdown_event.is_set():
+            process = None
             try:
-                self.gazebo_pose_stream_process = subprocess.Popen(
+                process = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                     text=True,
-                    bufsize=1,
                 )
+                self.gazebo_pose_stream_process = process
+                try:
+                    stdout, _stderr = process.communicate(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        stdout, _stderr = process.communicate(timeout=1.0)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        stdout, _stderr = process.communicate()
             except OSError:
                 self.shutdown_event.wait(0.5)
                 continue
-
-            process = self.gazebo_pose_stream_process
-            try:
-                self._consume_gazebo_pose_stream(process)
             finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
                 self.gazebo_pose_stream_process = None
 
+            if stdout and stdout.strip():
+                lines = stdout.splitlines()
+                if not lines:
+                    lines = [stdout]
+                self._consume_gazebo_pose_stream(type("PoseStreamSample", (), {"stdout": lines})())
+
             if not self.shutdown_event.is_set():
-                self.shutdown_event.wait(0.5)
+                self.shutdown_event.wait(0.05)
 
     def _consume_gazebo_pose_stream(self, process):
         if process.stdout is None:
@@ -1253,29 +1727,57 @@ class StereoDistanceNode(Node):
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
+                snapshot_to_publish = None
                 with self.lock:
+                    oracle_sample_seq = self._next_oracle_sample_seq_locked()
                     self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_status(
                         OracleStatus.MALFORMED_POSE_PAYLOAD,
                         now=now,
                     )
+                    snapshot_to_publish = self._snapshot_from_status(
+                        sequence=oracle_sample_seq,
+                        status=OracleStatus.MALFORMED_POSE_PAYLOAD,
+                        now=now,
+                    )
+                    self.current_ground_truth_snapshot = snapshot_to_publish
+                self._process_ideal_snapshot(snapshot_to_publish)
                 continue
             oracle_result = self._gazebo_oracle_result_from_payload(payload)
             if not oracle_result.valid:
+                snapshot_to_publish = None
                 with self.lock:
+                    oracle_sample_seq = self._next_oracle_sample_seq_locked()
                     self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_result(
                         oracle_result,
                         now=now,
                     )
+                    snapshot_to_publish = self._snapshot_from_oracle_result(
+                        sequence=oracle_sample_seq,
+                        result=oracle_result,
+                        now=now,
+                    )
+                    self.current_ground_truth_snapshot = snapshot_to_publish
+                self._process_ideal_snapshot(snapshot_to_publish)
                 continue
             ground_truth = self._ground_truth_position_from_oracle_result(oracle_result)
             if ground_truth is None:
+                snapshot_to_publish = None
                 with self.lock:
+                    oracle_sample_seq = self._next_oracle_sample_seq_locked()
                     self.cached_ground_truth_metadata = self._gazebo_oracle_metadata_from_status(
                         OracleStatus.UNSUPPORTED_POSE_FORMAT,
                         now=now,
                     )
+                    snapshot_to_publish = self._snapshot_from_status(
+                        sequence=oracle_sample_seq,
+                        status=OracleStatus.UNSUPPORTED_POSE_FORMAT,
+                        now=now,
+                    )
+                    self.current_ground_truth_snapshot = snapshot_to_publish
+                self._process_ideal_snapshot(snapshot_to_publish)
                 continue
             with self.lock:
+                oracle_sample_seq = self._next_oracle_sample_seq_locked()
                 self.cached_actual_distance = ground_truth["forward_m"]
                 self.cached_ground_truth_position = dict(ground_truth)
                 self.last_gazebo_pose_update = now
@@ -1288,8 +1790,17 @@ class StereoDistanceNode(Node):
                 self.last_published_actual_distance_seq = self.actual_distance_sample_seq
                 publish_position = dict(self.cached_ground_truth_position)
                 publish_forward = float(publish_position["forward_m"])
+                snapshot_to_publish = self._snapshot_from_oracle_result(
+                    sequence=oracle_sample_seq,
+                    result=oracle_result,
+                    now=now,
+                    ground_truth=ground_truth,
+                )
+                self.current_ground_truth_snapshot = snapshot_to_publish
+                self.last_valid_ground_truth_snapshot = snapshot_to_publish
             self.actual_distance_pub.publish(Float32(data=publish_forward))
             self._publish_ground_truth_position(publish_position)
+            self._process_ideal_snapshot(snapshot_to_publish)
 
     def _gazebo_oracle_result_from_payload(self, payload):
         return compute_gazebo_ground_truth(
@@ -1422,6 +1933,12 @@ class StereoDistanceNode(Node):
                 self.right_detection = right
                 self.metrics = metrics
             self.detections_pub.publish(self._detections_to_msg(left, right))
+            self._process_bbox_research_observation(
+                left,
+                right,
+                source=BBOX_SOURCE_YOLO,
+                observation_received_monotonic_s=started,
+            )
 
             disparity = metrics.get("disparity_px")
             distance = metrics.get("distance_m")
@@ -1605,6 +2122,12 @@ class StereoDistanceNode(Node):
             self.right_detection = right
             self.metrics = metrics
         self.detections_pub.publish(self._detections_to_msg(left, right))
+        self._process_bbox_research_observation(
+            left,
+            right,
+            source=BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=time.monotonic(),
+        )
         self._publish_estimated_position(metrics)
 
     def _msg_to_rgb(self, msg):
@@ -2037,6 +2560,12 @@ class StereoDistanceNode(Node):
             self.right_detection = right
             self.metrics = metrics
         self.detections_pub.publish(self._detections_to_msg(left, right))
+        self._process_bbox_research_observation(
+            left,
+            right,
+            source=BBOX_SOURCE_SYNTHETIC,
+            observation_received_monotonic_s=time.monotonic(),
+        )
         self._publish_estimated_position(metrics)
 
     def _raw_from_runtime_sample(self, sample):

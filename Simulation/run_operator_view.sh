@@ -827,6 +827,7 @@ fi
 
 add_default_launch_arg approach_start_distance_m "$approach_start_default" "${launch_input[@]}"
 add_default_launch_arg approach_end_distance_m "$approach_end_default" "${launch_input[@]}"
+add_default_launch_arg observation_mode "${OBSERVATION_MODE:-both}" "${launch_input[@]}"
 if [[ -n "$approach_start_default" && -n "$approach_end_default" && -n "${DRONE_FORWARD_SPEED_MPS:-}" ]]; then
   launch_approach_duration_s="$(
     awk -v start="$approach_start_default" -v end="$approach_end_default" -v speed="$DRONE_FORWARD_SPEED_MPS" \
