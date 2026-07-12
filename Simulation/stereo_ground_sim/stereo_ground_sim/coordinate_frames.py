@@ -245,6 +245,27 @@ def transform_ray(ray: Ray3D, transform: RigidTransform3D) -> Ray3D:
     )
 
 
+def inverse_rigid_transform(transform: RigidTransform3D) -> RigidTransform3D:
+    """Return the inverse rigid transform.
+
+    For an A -> B transform using `p_B = R_B_A @ (p_A - o_A_B)`, the inverse
+    B -> A transform uses `R_A_B = R_B_A.T` and `o_B_A = -R_B_A @ o_A_B`.
+    """
+
+    if not isinstance(transform, RigidTransform3D):
+        raise TypeError("transform must be a RigidTransform3D")
+    rotation = np.asarray(transform.rotation_target_source, dtype=float)
+    origin = np.asarray(transform.origin_target_in_source_m, dtype=float)
+    inverse_rotation = rotation.T
+    inverse_origin = -(rotation @ origin)
+    return RigidTransform3D(
+        source_frame=transform.target_frame,
+        target_frame=transform.source_frame,
+        rotation_target_source=tuple(tuple(float(value) for value in row) for row in inverse_rotation),
+        origin_target_in_source_m=_vector3(inverse_origin, field_name="inverse_origin_target_in_source_m"),
+    )
+
+
 def _normalized_quaternion_wxyz(q_wxyz: Iterable[float]) -> tuple[float, float, float, float]:
     values = tuple(float(value) for value in q_wxyz)
     if len(values) != 4:
@@ -313,6 +334,7 @@ __all__ = [
     "Ray3D",
     "RigidTransform3D",
     "UNIT_VECTOR_ABS_TOL",
+    "inverse_rigid_transform",
     "quaternion_wxyz_to_xyzw",
     "quaternion_xyzw_to_wxyz",
     "rotation_matrix_from_quaternion_wxyz",
