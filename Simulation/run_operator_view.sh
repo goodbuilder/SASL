@@ -275,7 +275,7 @@ the Bag plugin instead of the distance Plot plugin.
 
 Default launch choices for operator observation:
   - gz_gui:=true
-  - launch_rviz:=false
+  - launch_rviz:=true
 
 The stereo experiment target is moved by QGroundControl after the PX4 SITL
 bridge connects. By default this script starts PX4 SITL in standalone Gazebo
@@ -872,7 +872,7 @@ add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${
 	add_optional_default_launch_arg disparity_residual_feature_selector_catalog_path "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_CATALOG_PATH:-}" "${launch_input[@]}"
 	add_default_launch_arg disparity_residual_feature_selector_window_size "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_WINDOW_SIZE:-1}" "${launch_input[@]}"
 	add_default_launch_arg disparity_residual_feature_selector_min_samples "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MIN_SAMPLES:-1}" "${launch_input[@]}"
-	if ! has_launch_arg gz_gui "${launch_input[@]}"; then
+if ! has_launch_arg gz_gui "${launch_input[@]}"; then
   if [[ "$headless" == true ]]; then
     launch_args+=("gz_gui:=false")
   else
@@ -880,7 +880,11 @@ add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${
   fi
 fi
 if ! has_launch_arg launch_rviz "${launch_input[@]}"; then
-  launch_args+=("launch_rviz:=false")
+  if [[ "$headless" == true ]]; then
+    launch_args+=("launch_rviz:=false")
+  else
+    launch_args+=("launch_rviz:=true")
+  fi
 fi
 launch_args+=("${launch_input[@]}")
 

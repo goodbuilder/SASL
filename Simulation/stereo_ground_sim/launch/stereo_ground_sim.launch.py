@@ -504,7 +504,7 @@ def generate_launch_description():
             DeclareLaunchArgument("disparity_residual_feature_selector_catalog_path", default_value=""),
             DeclareLaunchArgument("disparity_residual_feature_selector_window_size", default_value="1"),
             DeclareLaunchArgument("disparity_residual_feature_selector_min_samples", default_value="1"),
-            DeclareLaunchArgument("gz_gui", default_value="false"),
+            DeclareLaunchArgument("gz_gui", default_value="true"),
             DeclareLaunchArgument("launch_rviz", default_value="true"),
             DeclareLaunchArgument("record_calibration_csv", default_value="false"),
             DeclareLaunchArgument(
