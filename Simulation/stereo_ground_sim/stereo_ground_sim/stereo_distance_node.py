@@ -914,6 +914,20 @@ class StereoDistanceNode(Node):
                     comparison = getattr(self, "latest_observation_comparison", None)
         if snapshot is None:
             snapshot = self._current_ground_truth_snapshot_copy()
+        if ideal is not None and ideal.oracle_sequence != snapshot.sequence:
+            ideal = None
+        if bbox is not None and bbox.oracle_sequence != snapshot.sequence:
+            bbox = None
+        if (
+            comparison is not None
+            and (
+                ideal is None
+                or bbox is None
+                or comparison.ideal.oracle_sequence != snapshot.sequence
+                or comparison.bbox.oracle_sequence != snapshot.sequence
+            )
+        ):
+            comparison = None
         payload = {
             "observation_mode": self._observation_mode(),
             "output_frame": FrameId.BASELINE_CENTER_FRD.value,
@@ -1089,15 +1103,15 @@ class StereoDistanceNode(Node):
         if self._observation_mode() == "both":
             ideal = self._compute_ideal_measurement(snapshot)
             comparison = compare_observation_measurements(ideal, bbox)
-            with self.lock:
-                self.latest_ideal_measurement = ideal
         with self.lock:
+            if ideal is not None:
+                self.latest_ideal_measurement = ideal
             self.latest_bbox_general_ray_measurement = bbox
             self.latest_observation_comparison = comparison
         self._publish_bbox_general_ray_measurement(bbox)
         if self._observation_mode() == "both":
             self._publish_comparison_measurement(comparison)
-        self._publish_observation_status(snapshot=snapshot, bbox=bbox, comparison=comparison)
+        self._publish_observation_status(snapshot=snapshot, ideal=ideal, bbox=bbox, comparison=comparison)
         return bbox, comparison
 
     def _comparison_actual_and_error_for_publish(self, *, metrics, ground_truth_metadata):

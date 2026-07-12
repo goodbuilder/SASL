@@ -413,6 +413,98 @@ class StereoDistanceObservationModeTests(unittest.TestCase):
         self.assertEqual(bbox.oracle_sequence, snapshot.sequence)
         self.assertLess(comparison.bbox_minus_ideal_norm_m, 1e-6)
 
+    def test_bbox_status_receives_local_coherent_tuple_explicitly(self) -> None:
+        node = make_node("both")
+        node.bbox_configured_source = node_module.BBOX_SOURCE_EXTERNAL
+        snapshot = valid_snapshot(70)
+        node.current_ground_truth_snapshot = snapshot
+        left, right = ideal_pixel_centers(node, snapshot)
+        calls = []
+        original_publish_status = node._publish_observation_status
+
+        def capture_status(*, snapshot, ideal, bbox, comparison):
+            calls.append((snapshot, ideal, bbox, comparison))
+            return original_publish_status(
+                snapshot=snapshot,
+                ideal=ideal,
+                bbox=bbox,
+                comparison=comparison,
+            )
+
+        node._publish_observation_status = capture_status
+        _bbox, comparison = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            left,
+            right,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=22.0,
+            source_width_px=1280,
+            source_height_px=720,
+        )
+
+        self.assertTrue(comparison.valid)
+        called_snapshot, called_ideal, called_bbox, called_comparison = calls[-1]
+        self.assertEqual(called_snapshot.sequence, 70)
+        self.assertIsNotNone(called_ideal)
+        self.assertEqual(called_ideal.oracle_sequence, called_snapshot.sequence)
+        self.assertEqual(called_bbox.oracle_sequence, called_snapshot.sequence)
+        self.assertTrue(called_comparison.same_oracle_sequence)
+
+    def test_local_status_tuple_ignores_concurrently_advanced_ideal_cache(self) -> None:
+        node = make_node("both")
+        node.bbox_configured_source = node_module.BBOX_SOURCE_EXTERNAL
+        snapshot10 = valid_snapshot(10)
+        snapshot11 = valid_snapshot(11)
+        node.current_ground_truth_snapshot = snapshot10
+        node.latest_ideal_measurement = StereoDistanceNode._compute_ideal_measurement(node, snapshot11)
+        left, right = ideal_pixel_centers(node, snapshot10)
+
+        _bbox, comparison = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            left,
+            right,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=22.0,
+            source_width_px=1280,
+            source_height_px=720,
+        )
+
+        self.assertTrue(comparison.valid)
+        status = status_payload(node)
+        self.assertEqual(status["oracle_sequence"], 10)
+        self.assertEqual(status["ideal_oracle_sequence"], 10)
+        self.assertEqual(status["bbox_oracle_sequence"], 10)
+        self.assertTrue(status["same_oracle_sequence"])
+
+    def test_omitted_status_filters_stale_cached_measurements(self) -> None:
+        node = make_node("both")
+        snapshot11 = valid_snapshot(11)
+        snapshot12 = valid_snapshot(12)
+        node.current_ground_truth_snapshot = snapshot11
+        left, right = ideal_pixel_centers(node, snapshot11)
+        bbox, comparison = StereoDistanceNode._process_bbox_research_observation(
+            node,
+            left,
+            right,
+            source=node_module.BBOX_SOURCE_EXTERNAL,
+            observation_received_monotonic_s=22.0,
+            source_width_px=1280,
+            source_height_px=720,
+        )
+        node.latest_ideal_measurement = comparison.ideal
+        node.latest_bbox_general_ray_measurement = bbox
+        node.latest_observation_comparison = comparison
+        node.current_ground_truth_snapshot = snapshot12
+
+        StereoDistanceNode._publish_observation_status(node)
+
+        status = status_payload(node)
+        self.assertEqual(status["oracle_sequence"], 12)
+        self.assertIsNone(status["ideal_oracle_sequence"])
+        self.assertIsNone(status["bbox_oracle_sequence"])
+        self.assertIsNone(status["comparison_valid"])
+        self.assertIsNone(status["same_oracle_sequence"])
+
     def test_incomplete_bbox_pair_publishes_nan_and_status(self) -> None:
         node = make_node("both")
         node.bbox_configured_source = node_module.BBOX_SOURCE_EXTERNAL
