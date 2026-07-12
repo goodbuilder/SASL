@@ -12,6 +12,7 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
+import stereo_ground_sim.attitude_error_model as attitude_error_module  # noqa: E402
 from stereo_ground_sim.attitude_error_model import (  # noqa: E402
     AttitudeErrorDecomposition,
     CameraAttitudeErrorDeg,
@@ -92,6 +93,17 @@ def center_of(transform: RigidTransform3D):
 
 
 class AttitudeErrorModelTests(unittest.TestCase):
+    def test_module_docstring_records_rotation_contract(self) -> None:
+        doc = attitude_error_module.__doc__
+
+        self.assertIsNotNone(doc)
+        assert doc is not None
+        self.assertIn("fixed-axis", doc)
+        self.assertIn("nominal Camera Optical RDF", doc)
+        self.assertIn("R_delta_C = R_Y(yaw) @ R_X(pitch) @ R_Z(roll)", doc)
+        self.assertIn("R_B_C_actual = R_B_C_nominal @ R_delta_C", doc)
+        self.assertIn("does not claim equivalence with Gazebo SDF Euler semantics", doc)
+
     def test_rotation_contract_single_axis_and_composite_order(self) -> None:
         angle = math.radians(0.5)
         c = math.cos(angle)

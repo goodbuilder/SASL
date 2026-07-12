@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Pure camera attitude-error transforms and Raw reconstruction math.
 
 Phase 3A models camera attitude error as an active fixed-axis rotation expressed
@@ -20,6 +18,8 @@ This module does not claim equivalence with Gazebo SDF Euler semantics; that is
 reserved for Phase 3C. It has no ROS, file I/O, environment, UI, or logging
 dependencies.
 """
+
+from __future__ import annotations
 
 import math
 from dataclasses import dataclass
