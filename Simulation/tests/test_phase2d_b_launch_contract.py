@@ -189,6 +189,12 @@ class Phase2DBLaunchContractTests(unittest.TestCase):
         self.assertEqual(source_default("camera_clip_near_m"), "0.1")
         self.assertEqual(source_default("camera_clip_far_m"), "2500.0")
         self.assertEqual(source_default("camera_update_rate_hz"), "20.0")
+        self.assertEqual(source_default("left_roll_error_deg"), "0.0")
+        self.assertEqual(source_default("left_pitch_error_deg"), "0.0")
+        self.assertEqual(source_default("left_yaw_error_deg"), "0.0")
+        self.assertEqual(source_default("right_roll_error_deg"), "0.0")
+        self.assertEqual(source_default("right_pitch_error_deg"), "0.0")
+        self.assertEqual(source_default("right_yaw_error_deg"), "0.0")
 
     def test_distance_node_params_propagate_defaults_and_phase2c_contract(self) -> None:
         module = load_launch_module()
@@ -202,6 +208,12 @@ class Phase2DBLaunchContractTests(unittest.TestCase):
         self.assertEqual(params["camera_image_height_px"], 720)
         self.assertEqual(params["camera_clip_near_m"], 0.1)
         self.assertEqual(params["camera_clip_far_m"], 2500.0)
+        self.assertEqual(params["left_roll_error_deg"], 0.0)
+        self.assertEqual(params["left_pitch_error_deg"], 0.0)
+        self.assertEqual(params["left_yaw_error_deg"], 0.0)
+        self.assertEqual(params["right_roll_error_deg"], 0.0)
+        self.assertEqual(params["right_pitch_error_deg"], 0.0)
+        self.assertEqual(params["right_yaw_error_deg"], 0.0)
         self.assertEqual(params["baseline_origin_world_enu_m"], [0.0, 0.0, 5.0])
         self.assertEqual(
             params["rotation_baseline_world_row_major"],
@@ -219,6 +231,12 @@ class Phase2DBLaunchContractTests(unittest.TestCase):
                 camera_image_height_px=1080,
                 camera_clip_near_m=0.2,
                 camera_clip_far_m=1800.5,
+                left_roll_error_deg=0.1,
+                left_pitch_error_deg=-0.2,
+                left_yaw_error_deg=0.3,
+                right_roll_error_deg=-0.4,
+                right_pitch_error_deg=0.5,
+                right_yaw_error_deg=-0.6,
             )
         )
         with tempfile.NamedTemporaryFile(suffix=".yaml") as tmp:
@@ -235,6 +253,31 @@ class Phase2DBLaunchContractTests(unittest.TestCase):
         self.assertIs(type(params["camera_clip_near_m"]), float)
         self.assertEqual(params["camera_clip_far_m"], 1800.5)
         self.assertIs(type(params["camera_clip_far_m"]), float)
+        self.assertEqual(params["left_roll_error_deg"], 0.1)
+        self.assertIs(type(params["left_roll_error_deg"]), float)
+        self.assertEqual(params["left_pitch_error_deg"], -0.2)
+        self.assertIs(type(params["left_pitch_error_deg"]), float)
+        self.assertEqual(params["left_yaw_error_deg"], 0.3)
+        self.assertIs(type(params["left_yaw_error_deg"]), float)
+        self.assertEqual(params["right_roll_error_deg"], -0.4)
+        self.assertIs(type(params["right_roll_error_deg"]), float)
+        self.assertEqual(params["right_pitch_error_deg"], 0.5)
+        self.assertIs(type(params["right_pitch_error_deg"]), float)
+        self.assertEqual(params["right_yaw_error_deg"], -0.6)
+        self.assertIs(type(params["right_yaw_error_deg"]), float)
+
+    def test_launch_attitude_values_feed_world_and_distance_node_yaml(self) -> None:
+        text = LAUNCH_FILE.read_text(encoding="utf-8")
+        for name in (
+            "left_roll_error_deg",
+            "left_pitch_error_deg",
+            "left_yaw_error_deg",
+            "right_roll_error_deg",
+            "right_pitch_error_deg",
+            "right_yaw_error_deg",
+        ):
+            self.assertIn(f'_float_config(context, "{name}")', text)
+            self.assertIn(f'"{name}"', text)
 
     def test_custom_bbox_mode_propagates(self) -> None:
         module = load_launch_module()

@@ -49,6 +49,12 @@ from stereo_ground_sim.gazebo_oracle import (
     x500_oracle_source_policy,
 )
 from stereo_ground_sim.coordinate_frames import FrameId, FramePoint
+from stereo_ground_sim.attitude_error_model import (
+    CameraAttitudeErrorDeg,
+    RawAttitudeMeasurement,
+    StereoAttitudeErrorConfig,
+    evaluate_raw_attitude_measurement,
+)
 from stereo_ground_sim.observation_comparison import (
     GroundTruthSnapshot,
     ObservationMeasurementResult,
@@ -80,6 +86,14 @@ ORACLE_STATIC_PARAMETERS = {
     "enable_external_bbox_detections",
     "external_bbox_detections_topic",
 }
+ATTITUDE_STATIC_PARAMETERS = {
+    "left_roll_error_deg",
+    "left_pitch_error_deg",
+    "left_yaw_error_deg",
+    "right_roll_error_deg",
+    "right_pitch_error_deg",
+    "right_yaw_error_deg",
+}
 OBSERVATION_MODES = {"bbox", "ideal_projection", "both"}
 BBOX_SOURCE_YOLO = "yolo_rendered_rgb"
 BBOX_SOURCE_EXTERNAL = "external_bbox"
@@ -100,6 +114,10 @@ DEFAULT_ROTATION_BASELINE_WORLD_ROW_MAJOR = (
 )
 ORACLE_STATIC_PARAMETER_REJECTION_REASON = (
     "oracle source, observation topology, and camera projection parameters require node restart"
+)
+ATTITUDE_STATIC_PARAMETER_REJECTION_REASON = (
+    "camera attitude parameters affect both Node analytic math and Gazebo camera pose "
+    "and require a full simulation restart"
 )
 
 
@@ -125,6 +143,12 @@ class StereoDistanceNode(Node):
         self.declare_parameter("approach_duration_s", 120.0)
         self.declare_parameter("mission_profile", "manual")
         self.declare_parameter("observation_mode", "both")
+        self.declare_parameter("left_roll_error_deg", 0.0)
+        self.declare_parameter("left_pitch_error_deg", 0.0)
+        self.declare_parameter("left_yaw_error_deg", 0.0)
+        self.declare_parameter("right_roll_error_deg", 0.0)
+        self.declare_parameter("right_pitch_error_deg", 0.0)
+        self.declare_parameter("right_yaw_error_deg", 0.0)
         self.declare_parameter("takeoff_altitude_m", 10.0)
         self.declare_parameter("takeoff_duration_s", 10.0)
         self.declare_parameter("first_hover_duration_s", 5.0)
@@ -208,6 +232,7 @@ class StereoDistanceNode(Node):
         self.approach_duration_s = self._float_param("approach_duration_s")
         self.mission_profile = self.get_parameter("mission_profile").value
         self.observation_mode = self._observation_mode_value(self.get_parameter("observation_mode").value)
+        self.attitude_error_config = self._attitude_error_config()
         self.takeoff_altitude_m = self._float_param("takeoff_altitude_m")
         self.takeoff_duration_s = self._float_param("takeoff_duration_s")
         self.first_hover_duration_s = self._float_param("first_hover_duration_s")
@@ -432,6 +457,22 @@ class StereoDistanceNode(Node):
             Float64MultiArray, "/stereo/bbox_vs_ideal/position_delta", 10
         )
         self.observation_status_pub = self.create_publisher(String, "/stereo/observation_status", 10)
+        self.attitude_actual_pixels_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/attitude_model/actual/pixels", 10
+        )
+        self.attitude_actual_disparity_pub = self.create_publisher(
+            Float64, "/stereo/attitude_model/actual/disparity", 10
+        )
+        self.attitude_raw_estimated_position_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/attitude_model/raw/estimated_position", 10
+        )
+        self.attitude_raw_position_error_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/attitude_model/raw/position_error", 10
+        )
+        self.attitude_raw_ray_quality_pub = self.create_publisher(
+            Float64MultiArray, "/stereo/attitude_model/raw/ray_quality", 10
+        )
+        self.attitude_model_status_pub = self.create_publisher(String, "/stereo/attitude_model/status", 10)
         if self._bbox_branch_enabled() and self.enable_external_bbox_detections:
             self.create_subscription(
                 Float32MultiArray,
@@ -496,6 +537,19 @@ class StereoDistanceNode(Node):
 
     def _float_param(self, name):
         return float(self.get_parameter(name).value)
+
+    def _attitude_error_config(self):
+        left = CameraAttitudeErrorDeg(
+            roll_deg=self.get_parameter("left_roll_error_deg").value,
+            pitch_deg=self.get_parameter("left_pitch_error_deg").value,
+            yaw_deg=self.get_parameter("left_yaw_error_deg").value,
+        )
+        right = CameraAttitudeErrorDeg(
+            roll_deg=self.get_parameter("right_roll_error_deg").value,
+            pitch_deg=self.get_parameter("right_pitch_error_deg").value,
+            yaw_deg=self.get_parameter("right_yaw_error_deg").value,
+        )
+        return StereoAttitudeErrorConfig(left=left, right=right)
 
     def _bool_param(self, name):
         return self._coerce_bool(self.get_parameter(name).value)
@@ -786,6 +840,10 @@ class StereoDistanceNode(Node):
         return Float64MultiArray(data=[math.nan, math.nan, math.nan, math.nan, math.nan])
 
     @staticmethod
+    def _nan6_msg():
+        return Float64MultiArray(data=[math.nan, math.nan, math.nan, math.nan, math.nan, math.nan])
+
+    @staticmethod
     def _position_msg_from_measurement(measurement):
         if measurement is None or measurement.estimated_point_baseline_center_frd_m is None or measurement.estimated_range_m is None:
             return StereoDistanceNode._nan4_msg()
@@ -853,6 +911,90 @@ class StereoDistanceNode(Node):
                     ]
                 )
             )
+
+    @staticmethod
+    def _finite_or_nan(value):
+        if value is None:
+            return math.nan
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else math.nan
+
+    def _attitude_actual_pixels_msg(self, measurement):
+        if measurement is None or not measurement.actual_projection.valid:
+            return self._nan6_msg()
+        projection = measurement.actual_projection
+        values = (
+            projection.left.u_px,
+            projection.left.v_px,
+            projection.right.u_px,
+            projection.right.v_px,
+            projection.signed_disparity_px,
+            projection.vertical_disparity_px,
+        )
+        if any(value is None for value in values):
+            return self._nan6_msg()
+        return Float64MultiArray(data=[float(value) for value in values])
+
+    def _attitude_raw_position_msg(self, measurement):
+        if (
+            measurement is None
+            or not measurement.valid
+            or measurement.raw_point_baseline_center_frd_m is None
+            or measurement.raw_triangulation is None
+            or measurement.raw_triangulation.range_m is None
+        ):
+            return self._nan4_msg()
+        forward_m, right_m, down_m = measurement.raw_point_baseline_center_frd_m
+        return Float64MultiArray(
+            data=[
+                float(forward_m),
+                float(right_m),
+                float(down_m),
+                float(measurement.raw_triangulation.range_m),
+            ]
+        )
+
+    def _attitude_raw_error_msg(self, measurement):
+        if (
+            measurement is None
+            or not measurement.valid
+            or measurement.raw_error_baseline_center_frd_m is None
+            or measurement.raw_error_norm_m is None
+        ):
+            return self._nan4_msg()
+        forward_m, right_m, down_m = measurement.raw_error_baseline_center_frd_m
+        return Float64MultiArray(
+            data=[float(forward_m), float(right_m), float(down_m), float(measurement.raw_error_norm_m)]
+        )
+
+    def _attitude_ray_quality_msg(self, measurement):
+        triangulation = None if measurement is None else measurement.raw_triangulation
+        if triangulation is None:
+            return self._nan4_msg()
+        return Float64MultiArray(
+            data=[
+                self._finite_or_nan(triangulation.ray_gap_m),
+                self._finite_or_nan(triangulation.intersection_angle_rad),
+                self._finite_or_nan(triangulation.left_ray_parameter_m),
+                self._finite_or_nan(triangulation.right_ray_parameter_m),
+            ]
+        )
+
+    def _publish_attitude_model_numeric(self, measurement):
+        if not hasattr(self, "attitude_actual_pixels_pub"):
+            return
+        self.attitude_actual_pixels_pub.publish(self._attitude_actual_pixels_msg(measurement))
+        disparity = math.nan
+        if (
+            measurement is not None
+            and measurement.actual_projection.valid
+            and measurement.actual_projection.signed_disparity_px is not None
+        ):
+            disparity = float(measurement.actual_projection.signed_disparity_px)
+        self.attitude_actual_disparity_pub.publish(Float64(data=disparity))
+        self.attitude_raw_estimated_position_pub.publish(self._attitude_raw_position_msg(measurement))
+        self.attitude_raw_position_error_pub.publish(self._attitude_raw_error_msg(measurement))
+        self.attitude_raw_ray_quality_pub.publish(self._attitude_ray_quality_msg(measurement))
 
     @staticmethod
     def _json_safe(value):
@@ -956,6 +1098,109 @@ class StereoDistanceNode(Node):
         self.observation_status_pub.publish(
             String(data=json.dumps(self._json_safe(payload), ensure_ascii=False, sort_keys=True))
         )
+
+    def _compute_attitude_model_measurement(self, snapshot):
+        if (
+            not isinstance(snapshot, GroundTruthSnapshot)
+            or not snapshot.oracle_valid
+            or snapshot.point_baseline_center_frd is None
+        ):
+            return None
+        return evaluate_raw_attitude_measurement(
+            snapshot.point_baseline_center_frd,
+            self._ideal_intrinsics(),
+            getattr(self, "baseline_m", 25.0),
+            getattr(self, "attitude_error_config", StereoAttitudeErrorConfig(
+                left=CameraAttitudeErrorDeg(0.0, 0.0, 0.0),
+                right=CameraAttitudeErrorDeg(0.0, 0.0, 0.0),
+            )),
+            clip_near_m=getattr(self, "camera_clip_near_m", 0.1),
+            clip_far_m=getattr(self, "camera_clip_far_m", 2500.0),
+        )
+
+    def _attitude_model_status_payload(self, snapshot, measurement):
+        projection = None if measurement is None else measurement.actual_projection
+        left_projection = None if projection is None else projection.left
+        right_projection = None if projection is None else projection.right
+        triangulation = None if measurement is None else measurement.raw_triangulation
+        raw_point = None if measurement is None else measurement.raw_point_baseline_center_frd_m
+        raw_error = None if measurement is None else measurement.raw_error_baseline_center_frd_m
+        decomposition = None if measurement is None else measurement.decomposition
+        config = getattr(self, "attitude_error_config", None)
+        left_error = None if config is None else config.left
+        right_error = None if config is None else config.right
+        return {
+            "schema_version": 1,
+            "measurement_source": "phase3a_analytic_attitude_model",
+            "rendered_camera_used": False,
+            "gazebo_sdf_equivalence_verified": False,
+            "oracle_sequence": snapshot.sequence,
+            "oracle_received_monotonic_s": snapshot.received_monotonic_s,
+            "oracle_valid": snapshot.oracle_valid,
+            "oracle_status": snapshot.oracle_status,
+            "oracle_source_role": snapshot.oracle_source_role,
+            "oracle_matched_entity_name": snapshot.oracle_matched_entity_name,
+            "oracle_fallback_used": snapshot.oracle_fallback_used,
+            "attitude_model_valid": False if measurement is None else bool(measurement.valid),
+            "attitude_model_status": "invalid_oracle_snapshot" if measurement is None else measurement.status,
+            "output_frame": FrameId.BASELINE_CENTER_FRD.value,
+            "position_unit": "m",
+            "pixel_unit": "px",
+            "angle_unit": "rad",
+            "attitude_input_unit": "deg",
+            "left_roll_error_deg": None if left_error is None else left_error.roll_deg,
+            "left_pitch_error_deg": None if left_error is None else left_error.pitch_deg,
+            "left_yaw_error_deg": None if left_error is None else left_error.yaw_deg,
+            "right_roll_error_deg": None if right_error is None else right_error.roll_deg,
+            "right_pitch_error_deg": None if right_error is None else right_error.pitch_deg,
+            "right_yaw_error_deg": None if right_error is None else right_error.yaw_deg,
+            "common_roll_deg": None if decomposition is None else decomposition.common_roll_deg,
+            "common_pitch_deg": None if decomposition is None else decomposition.common_pitch_deg,
+            "common_yaw_deg": None if decomposition is None else decomposition.common_yaw_deg,
+            "relative_roll_deg": None if decomposition is None else decomposition.relative_roll_deg,
+            "relative_pitch_deg": None if decomposition is None else decomposition.relative_pitch_deg,
+            "relative_yaw_deg": None if decomposition is None else decomposition.relative_yaw_deg,
+            "actual_left_projection_status": None if left_projection is None else self._enum_value_or_none(left_projection.status),
+            "actual_right_projection_status": None if right_projection is None else self._enum_value_or_none(right_projection.status),
+            "actual_left_u_px": None if left_projection is None else left_projection.u_px,
+            "actual_left_v_px": None if left_projection is None else left_projection.v_px,
+            "actual_right_u_px": None if right_projection is None else right_projection.u_px,
+            "actual_right_v_px": None if right_projection is None else right_projection.v_px,
+            "actual_signed_disparity_px": None if projection is None else projection.signed_disparity_px,
+            "actual_vertical_disparity_px": None if projection is None else projection.vertical_disparity_px,
+            "raw_triangulation_status": None if triangulation is None else self._enum_value_or_none(triangulation.status),
+            "raw_forward_m": None if raw_point is None else raw_point[0],
+            "raw_right_m": None if raw_point is None else raw_point[1],
+            "raw_down_m": None if raw_point is None else raw_point[2],
+            "raw_range_m": None if triangulation is None else triangulation.range_m,
+            "raw_error_forward_m": None if raw_error is None else raw_error[0],
+            "raw_error_right_m": None if raw_error is None else raw_error[1],
+            "raw_error_down_m": None if raw_error is None else raw_error[2],
+            "raw_error_norm_m": None if measurement is None else measurement.raw_error_norm_m,
+            "ray_gap_m": None if triangulation is None else triangulation.ray_gap_m,
+            "intersection_angle_rad": None if triangulation is None else triangulation.intersection_angle_rad,
+            "left_ray_parameter_m": None if triangulation is None else triangulation.left_ray_parameter_m,
+            "right_ray_parameter_m": None if triangulation is None else triangulation.right_ray_parameter_m,
+        }
+
+    def _publish_attitude_model_status(self, snapshot, measurement):
+        if not hasattr(self, "attitude_model_status_pub"):
+            return
+        payload = self._attitude_model_status_payload(snapshot, measurement)
+        self.attitude_model_status_pub.publish(
+            String(data=json.dumps(self._json_safe(payload), ensure_ascii=False, sort_keys=True))
+        )
+
+    def _process_attitude_model_snapshot(self, snapshot):
+        measurement = self._compute_attitude_model_measurement(snapshot)
+        self._publish_attitude_model_numeric(measurement)
+        self._publish_attitude_model_status(snapshot, measurement)
+        return measurement
+
+    def _process_oracle_snapshot_measurements(self, snapshot):
+        attitude_measurement = self._process_attitude_model_snapshot(snapshot)
+        ideal_measurement = self._process_ideal_snapshot(snapshot)
+        return attitude_measurement, ideal_measurement
 
     def _compute_ideal_measurement(self, snapshot):
         return ideal_measurement_from_snapshot(
@@ -1126,6 +1371,12 @@ class StereoDistanceNode(Node):
         return actual_value, error_value
 
     def _on_param_update(self, params):
+        for param in params:
+            if param.name in ATTITUDE_STATIC_PARAMETERS:
+                return SetParametersResult(
+                    successful=False,
+                    reason=ATTITUDE_STATIC_PARAMETER_REJECTION_REASON,
+                )
         for param in params:
             if param.name in ORACLE_STATIC_PARAMETERS:
                 return SetParametersResult(
@@ -1824,7 +2075,7 @@ class StereoDistanceNode(Node):
                         now=now,
                     )
                     self.current_ground_truth_snapshot = snapshot_to_publish
-                self._process_ideal_snapshot(snapshot_to_publish)
+                self._process_oracle_snapshot_measurements(snapshot_to_publish)
                 continue
             oracle_result = self._gazebo_oracle_result_from_payload(payload)
             if not oracle_result.valid:
@@ -1841,7 +2092,7 @@ class StereoDistanceNode(Node):
                         now=now,
                     )
                     self.current_ground_truth_snapshot = snapshot_to_publish
-                self._process_ideal_snapshot(snapshot_to_publish)
+                self._process_oracle_snapshot_measurements(snapshot_to_publish)
                 continue
             ground_truth = self._ground_truth_position_from_oracle_result(oracle_result)
             if ground_truth is None:
@@ -1858,7 +2109,7 @@ class StereoDistanceNode(Node):
                         now=now,
                     )
                     self.current_ground_truth_snapshot = snapshot_to_publish
-                self._process_ideal_snapshot(snapshot_to_publish)
+                self._process_oracle_snapshot_measurements(snapshot_to_publish)
                 continue
             with self.lock:
                 oracle_sample_seq = self._next_oracle_sample_seq_locked()
@@ -1884,7 +2135,7 @@ class StereoDistanceNode(Node):
                 self.last_valid_ground_truth_snapshot = snapshot_to_publish
             self.actual_distance_pub.publish(Float32(data=publish_forward))
             self._publish_ground_truth_position(publish_position)
-            self._process_ideal_snapshot(snapshot_to_publish)
+            self._process_oracle_snapshot_measurements(snapshot_to_publish)
 
     def _gazebo_oracle_result_from_payload(self, payload):
         return compute_gazebo_ground_truth(
