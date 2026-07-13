@@ -1148,6 +1148,7 @@ def sample_absolute_offset_from_images(
     marker_name: str,
     radius_m: float,
     analytic: dict[str, Any],
+    camera_info_by_topic: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     topics = ("/left_camera/image", "/right_camera/image")
     target_counts = {topic: len(collector.images[topic]) + discard_frames + sample_frames for topic in topics}
@@ -1191,6 +1192,14 @@ def sample_absolute_offset_from_images(
         for (threshold, mode), records in by_cell.items():
             valid = [record for record in records if record["valid"]]
             analytic_side = analytic[camera]
+            analytic_k = intrinsics()
+            info = (camera_info_by_topic or {}).get(f"/{camera}_camera/camera_info", {})
+            info_k = info.get("k") or info.get("K") or []
+            if len(info_k) >= 6:
+                camera_fx, camera_fy, camera_cx, camera_cy = map(float, (info_k[0], info_k[4], info_k[2], info_k[5]))
+            else:
+                camera_fx = camera_fy = camera_cx = camera_cy = math.nan
+            analytic_u, analytic_v = float(analytic_side["u_px"]), float(analytic_side["v_px"])
             observation = {
                 "radius_m": radius_m, "marker": marker_name, "camera": camera,
                 "threshold": threshold, "centroid_mode": mode,
@@ -1199,7 +1208,13 @@ def sample_absolute_offset_from_images(
                 "frame_success_rate": len(valid) / len(records) if records else 0.0,
                 "valid": len(valid) >= max(0, len(records) - 1) and bool(valid),
                 "status_counts": _status_counts([MarkerDetection(bool(r["valid"]), str(r["status"]), r["u_px"], r["v_px"], int(r["pixel_count"]), int(r["component_count"]), tuple(r["bbox"]) if r["bbox"] else None, str(r["centroid_mode"]), int(r["core_pixel_count"])) for r in records]),
-                "analytic_u_px": analytic_side["u_px"], "analytic_v_px": analytic_side["v_px"],
+                "analytic_u_px": analytic_u, "analytic_v_px": analytic_v,
+                "analytic_fx_px": analytic_k.fx_px, "analytic_fy_px": analytic_k.fy_px,
+                "analytic_cx_px": analytic_k.cx_px, "analytic_cy_px": analytic_k.cy_px,
+                "camera_info_fx_px": camera_fx, "camera_info_fy_px": camera_fy,
+                "camera_info_cx_px": camera_cx, "camera_info_cy_px": camera_cy,
+                "normalized_x": (analytic_u - analytic_k.cx_px) / analytic_k.fx_px,
+                "normalized_y": (analytic_v - analytic_k.cy_px) / analytic_k.fy_px,
             }
             if valid:
                 us, vs = [float(r["u_px"]) for r in valid], [float(r["v_px"]) for r in valid]
@@ -1322,6 +1337,7 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
                         thresholds=args.threshold_sweep, centroid_modes=args.centroid_modes,
                         output_dir=output_dir, marker_name=marker_name, radius_m=args.marker_radius_m,
                         analytic=analytic,
+                        camera_info_by_topic={topic: camera_info_to_dict(msg) for topic, msg in collector.camera_info.items()},
                     )
                 else:
                     sample = sample_marker_from_images(
