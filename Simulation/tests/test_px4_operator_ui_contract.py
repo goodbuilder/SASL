@@ -13,6 +13,7 @@ from stereo_ground_sim.px4_status_adapter import (  # noqa: E402
     PX4_STATUS_TOPIC,
     build_status_payload,
     decode_px4_custom_mode,
+    flight_contract_from_parameters,
     infer_mission_phase,
     navigation_mode_from_heartbeat,
 )
@@ -27,6 +28,16 @@ from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
 
 class Px4OperatorUiContractTests(unittest.TestCase):
     def test_status_payload_is_authoritative_and_finite(self):
+        contract = flight_contract_from_parameters(
+            {
+                "flight_authority": "px4_sitl",
+                "fly_target_in_gazebo": False,
+                "mission_profile": "manual",
+                "actual_distance_source": "gazebo",
+            },
+            checked_monotonic_s=10.0,
+            now_monotonic_s=10.1,
+        )
         payload = build_status_payload(
             connected=True,
             armed=False,
@@ -40,9 +51,14 @@ class Px4OperatorUiContractTests(unittest.TestCase):
             sample_timestamp_us=120000,
             receive_monotonic_s=10.0,
             status="ok",
+            flight_contract=contract,
+            mission_phase_source="inferred_mavlink_state",
+            mission_phase_confidence="medium",
         )
         self.assertEqual(payload["flight_authority"], "px4_sitl")
         self.assertFalse(payload["gazebo_motion_enabled"])
+        self.assertTrue(payload["flight_contract"]["verified"])
+        self.assertEqual(payload["mission_phase_source"], "inferred_mavlink_state")
         self.assertEqual(parse_px4_status(json.dumps(payload))["schema_version"], 1)
         self.assertEqual(px4_contract_state(payload), "safe")
         self.assertEqual(PX4_STATUS_TOPIC, "/simulation/px4/status")
@@ -56,7 +72,7 @@ class Px4OperatorUiContractTests(unittest.TestCase):
     def test_missing_status_is_not_fabricated(self):
         self.assertEqual(parse_px4_status("not-json"), {})
         self.assertEqual(px4_contract_state({}), "unavailable")
-        self.assertIn("unavailable", px4_overall_status({}).lower())
+        self.assertIn("unverified", px4_overall_status({}).lower())
 
     def test_phase_is_derived_from_telemetry(self):
         common = {

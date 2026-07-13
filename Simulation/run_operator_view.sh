@@ -1087,24 +1087,16 @@ if [[ "$start_px4" == true ]]; then
   ' _ "$PX4_DIR" "$PX4_GZ_WORLD" "$PX4_GZ_MODEL_NAME" "${DISPLAY:-:0}" >"$PX4_CONSOLE_LOG" 2>&1 &
   children+=("$!")
   printf '%s\n' "PX4 SITL will attach to Gazebo model: $PX4_GZ_MODEL_NAME"
-  printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550."
+  printf '%s\n' "PX4 GCS telemetry endpoint is selected from PX4 px4-rc.mavlink (adapter default: udpout to local UDP 18570; QGC remains on remote UDP 14550)."
   if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
     printf '%s\n' "PX4 console log: $PX4_CONSOLE_LOG"
   fi
 fi
 
-PX4_STATUS_CONNECT="${PX4_STATUS_CONNECT:-udpin:0.0.0.0:14550}"
+PX4_STATUS_CONNECT="${PX4_STATUS_CONNECT:-udpout:127.0.0.1:18570}"
 setsid env PX4_STATUS_CONNECT="$PX4_STATUS_CONNECT" ros2 run stereo_ground_sim px4_status_adapter &
 children+=("$!")
-printf '%s\n' "PX4 status adapter: read-only MAVLink GCS telemetry on $PX4_STATUS_CONNECT"
-
-if [[ "$run_mission" == true ]]; then
-  printf '%s\n' "PX4 connection gate: checking heartbeat and LOCAL_POSITION_NED before mission commands."
-  if ! timeout --signal=TERM "$PX4_CONNECTION_TIMEOUT_S" "$ROOT_DIR/run_auto_mission.sh" --check-connection; then
-    printf '%s\n' "error: PX4 connection gate failed; no arm or mission command will be sent." >&2
-    exit 2
-  fi
-fi
+printf '%s\n' "PX4 status adapter: read-only MAVLink GCS telemetry via $PX4_STATUS_CONNECT (QGC bind remains separate)"
 
 perspective_file="$ROOT_DIR/config/operator_rqt.perspective"
 if [[ "$bag_view" == true ]]; then
@@ -1173,9 +1165,16 @@ if [[ -n "$record_mode" ]]; then
 fi
 
 if [[ "$run_mission" == true ]]; then
-  setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_auto_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
+  printf '%s\n' "PX4 auto mission will wait ${mission_delay_s}s for the operator panel and recorder."
+  sleep "$mission_delay_s"
+  printf '%s\n' "PX4 connection gate: checking heartbeat and LOCAL_POSITION_NED before mission commands."
+  if ! timeout --signal=TERM "$PX4_CONNECTION_TIMEOUT_S" "$ROOT_DIR/run_auto_mission.sh" --check-connection "${mission_args[@]}"; then
+    printf '%s\n' "error: PX4 connection gate failed; no arm or mission command will be sent." >&2
+    exit 2
+  fi
+  setsid "$ROOT_DIR/run_auto_mission.sh" "${mission_args[@]}" &
   children+=("$!")
-  printf '%s\n' "PX4 auto mission will start after ${mission_delay_s}s."
+  printf '%s\n' "PX4 auto mission started after ${mission_delay_s}s and a successful connection gate."
 fi
 
 printf '%s\n' "Operator view started."

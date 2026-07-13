@@ -121,7 +121,6 @@ def _write_distance_node_params(context, params_file=None):
         "scenario_range_min_m",
         "scenario_range_max_m",
         "zoom_index",
-        "flight_authority",
     }
     int_params = {
         "yolo_imgsz",
@@ -162,6 +161,7 @@ def _write_distance_node_params(context, params_file=None):
         "approach_duration_s",
         "mission_profile",
         "observation_mode",
+        "flight_authority",
         "left_roll_error_deg",
         "left_pitch_error_deg",
         "left_yaw_error_deg",
@@ -210,6 +210,9 @@ def _write_distance_node_params(context, params_file=None):
     ]
     default_params = {
         "flight_authority": PX4_ONLY_FLIGHT_AUTHORITY,
+        "fly_target_in_gazebo": False,
+        "mission_profile": "manual",
+        "actual_distance_source": "gazebo",
         "observation_mode": "both",
         "camera_image_width_px": 1280,
         "camera_image_height_px": 720,

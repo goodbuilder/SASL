@@ -29,6 +29,7 @@ SOURCE_KEYS = (
 
 PX4_STATUS_TOPIC = "/simulation/px4/status"
 PX4_PHASES = (
+    "UNAVAILABLE",
     "WAITING",
     "CONNECTED",
     "PRESTREAM",
@@ -52,6 +53,19 @@ TOP_BAR_FIELDS = (
     "GT SOURCE",
     "OVERALL STATUS",
 )
+FLIGHT_CONTRACT_FIELDS = (
+    "flight_authority",
+    "fly_target_in_gazebo",
+    "mission_profile",
+    "actual_distance_source",
+)
+EXPECTED_FLIGHT_CONTRACT = {
+    "flight_authority": "px4_sitl",
+    "fly_target_in_gazebo": False,
+    "mission_profile": "manual",
+    "actual_distance_source": "gazebo",
+}
+FLIGHT_CONTRACT_SOURCE = "stereo_distance_node_parameters"
 
 
 def finite_float(value):
@@ -79,9 +93,50 @@ def px4_contract_state(status):
     """Return ``safe``, ``violation``, or ``unavailable`` for UI display."""
     if not isinstance(status, dict) or not status:
         return "unavailable"
-    if status.get("flight_authority") != "px4_sitl" or status.get("gazebo_motion_enabled") is not False:
+    contract = status.get("flight_contract")
+    if not isinstance(contract, dict):
+        # Preserve an explicit legacy violation diagnostic, but never treat
+        # top-level adapter constants as proof of the live node contract.
+        if status.get("flight_authority") not in (None, "px4_sitl") or status.get("gazebo_motion_enabled") not in (None, False):
+            return "violation"
+        return "unavailable"
+    if contract.get("verified") is True and contract.get("source") == FLIGHT_CONTRACT_SOURCE:
+        for name, expected in EXPECTED_FLIGHT_CONTRACT.items():
+            actual = contract.get(name)
+            if isinstance(expected, bool):
+                matches = isinstance(actual, bool) and actual is expected
+            else:
+                matches = isinstance(actual, str) and actual == expected
+            if not matches:
+                return "violation"
+        return "safe"
+    error = str(contract.get("error") or "").lower()
+    if "violation" in error or contract.get("source") not in (None, FLIGHT_CONTRACT_SOURCE) or any(
+        name in contract
+        and contract.get(name) is not None
+        and (
+            (isinstance(expected, bool) and not (isinstance(contract.get(name), bool) and contract.get(name) is expected))
+            or (not isinstance(expected, bool) and not (isinstance(contract.get(name), str) and contract.get(name) == expected))
+        )
+        for name, expected in EXPECTED_FLIGHT_CONTRACT.items()
+    ):
         return "violation"
-    return "safe"
+    return "unavailable"
+
+
+def mission_phase_display(status):
+    """Render mission phase with explicit authoritative/inferred provenance."""
+    if not isinstance(status, dict):
+        return "UNAVAILABLE"
+    phase = str(status.get("mission_phase") or "UNAVAILABLE")
+    source = status.get("mission_phase_source")
+    if phase not in PX4_PHASES:
+        return "UNAVAILABLE"
+    if source == "authoritative_mission_event" and phase != "UNAVAILABLE":
+        return phase
+    if source == "inferred_mavlink_state" and phase != "UNAVAILABLE":
+        return f"{phase} (INFERRED)"
+    return "UNAVAILABLE"
 
 
 def px4_overall_status(status, source_states=None):
@@ -90,7 +145,7 @@ def px4_overall_status(status, source_states=None):
     if contract == "violation":
         return "ERROR — FLIGHT AUTHORITY CONTRACT VIOLATION"
     if contract == "unavailable":
-        return "WAITING — PX4 status unavailable"
+        return "DEGRADED — FLIGHT AUTHORITY UNVERIFIED"
     if not status.get("px4_connected"):
         return "DEGRADED — PX4 unavailable"
     if status.get("failsafe"):
@@ -226,7 +281,7 @@ def stale_marker_action(state):
 
 
 __all__ = [
-    "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "PX4_STATUS_TOPIC", "PX4_PHASES", "TOP_BAR_FIELDS", "finite_float",
+    "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "PX4_STATUS_TOPIC", "PX4_PHASES", "TOP_BAR_FIELDS", "FLIGHT_CONTRACT_FIELDS", "EXPECTED_FLIGHT_CONTRACT", "FLIGHT_CONTRACT_SOURCE", "finite_float",
     "source_valid", "source_state", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
-    "plot_series_for_source", "should_append_plot", "stale_marker_action", "parse_px4_status", "px4_contract_state", "px4_overall_status", "status_field", "format_status_vector", "format_receive_age",
+    "plot_series_for_source", "should_append_plot", "stale_marker_action", "parse_px4_status", "px4_contract_state", "px4_overall_status", "mission_phase_display", "status_field", "format_status_vector", "format_receive_age",
 ]

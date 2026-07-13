@@ -23,6 +23,7 @@ from python_qt_binding.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QScrollArea,
     QSplitter,
     QSizePolicy,
     QTabWidget,
@@ -39,6 +40,7 @@ from stereo_ground_sim.simulation_ui_contract import (
     fallback_transition,
     format_receive_age,
     format_status_vector,
+    mission_phase_display,
     parse_px4_status,
     px4_contract_state,
     px4_overall_status,
@@ -193,7 +195,10 @@ class CameraView(QLabel):
 class FrdPlotStack(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(700, 520)
+        # The plot is a selectable detail tab; keep the primary authority and
+        # position panels visible at 1700x1017 and 1920x1080.  The tab expands
+        # with the window instead of imposing a screen-height minimum.
+        self.setMinimumSize(700, 280)
         self.samples = {axis: {name: deque(maxlen=900) for name, _topic in POSITION_TOPICS} for axis, _index in (("Forward", 0), ("Right", 1), ("Down", 2))}
 
     def append(self, series_name, values):
@@ -264,7 +269,10 @@ class OperatorPanel(Plugin):
 
         self._widget = QWidget()
         self._widget.setWindowTitle("Stereo Simulation Research Operator Panel")
-        self._widget.setMinimumSize(1700, 950)
+        # Keep the panel usable with window decorations at 1700x1017.  The
+        # right detail column scrolls internally instead of forcing the whole
+        # window taller than the available screen.
+        self._widget.setMinimumSize(1280, 720)
         root = QVBoxLayout(self._widget)
         root.setContentsMargins(8, 8, 8, 8)
 
@@ -337,16 +345,18 @@ class OperatorPanel(Plugin):
                 grid.addWidget(label_map[other_key], row, 3)
 
         authority_box, authority_grid = compact_group("FLIGHT AUTHORITY")
-        self._authority_labels = {key: compact_label(value=True) for key in ("control", "gazebo", "flight_authority", "fly_target", "mission_profile", "ground_truth", "frame")}
+        self._authority_labels = {key: compact_label(value=True) for key in ("control", "gazebo", "flight_authority", "fly_target", "mission_profile", "actual_source", "ground_truth", "frame")}
         add_pair(authority_grid, 0, "control", "Control authority", "gazebo", "Gazebo direct motion")
         add_pair(authority_grid, 1, "flight_authority", "flight_authority", "fly_target", "fly_target_in_gazebo")
-        add_pair(authority_grid, 2, "mission_profile", "mission_profile", "ground_truth", "Ground Truth provider")
+        add_pair(authority_grid, 2, "mission_profile", "mission_profile", "actual_source", "actual_distance_source")
         authority_grid.addWidget(compact_label("Output frame"), 3, 0)
         authority_grid.addWidget(self._authority_labels["frame"], 3, 1, 1, 3)
+        authority_grid.addWidget(compact_label("Ground Truth provider"), 4, 0)
+        authority_grid.addWidget(self._authority_labels["ground_truth"], 4, 1, 1, 3)
         primary_layout.addWidget(authority_box)
 
         px4_box, px4_grid = compact_group("PX4 FLIGHT STATE")
-        self._px4_labels = {key: compact_label(value=True) for key in ("heartbeat", "armed", "mode", "failsafe", "phase", "local_ned", "velocity_ned", "sample_timestamp")}
+        self._px4_labels = {key: compact_label(value=True) for key in ("heartbeat", "armed", "mode", "failsafe", "phase", "phase_source", "local_ned", "velocity_ned", "sample_timestamp", "connection_source", "endpoint_coexistence")}
         add_pair(px4_grid, 0, "heartbeat", "Heartbeat", "armed", "Armed")
         add_pair(px4_grid, 1, "mode", "Navigation mode", "failsafe", "Failsafe")
         add_pair(px4_grid, 2, "phase", "Mission phase", "sample_timestamp", "PX4 sample timestamp")
@@ -354,6 +364,12 @@ class OperatorPanel(Plugin):
         px4_grid.addWidget(self._px4_labels["local_ned"], 3, 1, 1, 3)
         px4_grid.addWidget(compact_label("PX4 velocity NED — AUXILIARY [m/s]"), 4, 0)
         px4_grid.addWidget(self._px4_labels["velocity_ned"], 4, 1, 1, 3)
+        px4_grid.addWidget(compact_label("Status source"), 5, 0)
+        px4_grid.addWidget(self._px4_labels["connection_source"], 5, 1)
+        px4_grid.addWidget(compact_label("Endpoint coexistence"), 5, 2)
+        px4_grid.addWidget(self._px4_labels["endpoint_coexistence"], 5, 3)
+        px4_grid.addWidget(compact_label("Mission phase provenance"), 6, 0)
+        px4_grid.addWidget(self._px4_labels["phase_source"], 6, 1, 1, 3)
         primary_layout.addWidget(px4_box)
 
         self._range_labels = {key: compact_label(value=True) for key in ("truth", "observed_raw", "analytic_raw", "corrected", "raw_error", "corrected_error", "improvement")}
@@ -368,7 +384,6 @@ class OperatorPanel(Plugin):
         range_grid.addWidget(self._range_labels["raw_error"], 2, 1)
         range_grid.addWidget(self._range_labels["corrected_error"], 2, 2)
         range_grid.addWidget(self._range_labels["improvement"], 2, 3)
-        primary_layout.addWidget(range_box)
         self._position_labels = {}
         self._position_state_labels, self._position_age_labels = {}, {}
         position_box = QGroupBox("POSITION — baseline_center_frd [m]")
@@ -390,6 +405,7 @@ class OperatorPanel(Plugin):
             position_grid.addWidget(self._position_state_labels[name], row, 5)
             position_grid.addWidget(self._position_age_labels[name], row, 6)
         primary_layout.addWidget(position_box)
+        primary_layout.addWidget(range_box)
         self._geometry_labels = {}
         geometry, geometry_grid = compact_group("GEOMETRY QUALITY")
         for key in ("observed_disparity", "analytic_disparity", "analytic_vertical_disparity", "ray_gap", "intersection_angle", "status", "profile"):
@@ -406,9 +422,19 @@ class OperatorPanel(Plugin):
         source_grid.addWidget(compact_label("Frame / sample timestamp"), 1, 0)
         source_grid.addWidget(compact_label("Message-level frame: unavailable | Message sample timestamp: unavailable"), 1, 1, 1, 3)
         primary_layout.addWidget(source_box)
-        body_splitter.addWidget(self._primary)
-        body_splitter.setStretchFactor(0, 64)
-        body_splitter.setStretchFactor(1, 36)
+        self._primary.setMinimumWidth(0)
+        self._primary.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._primary_scroll = QScrollArea()
+        self._primary_scroll.setFrameShape(QFrame.NoFrame)
+        self._primary_scroll.setWidgetResizable(True)
+        self._primary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._primary_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._primary_scroll.setWidget(self._primary)
+        body_splitter.addWidget(self._primary_scroll)
+        body_splitter.setChildrenCollapsible(False)
+        body_splitter.setStretchFactor(0, 3)
+        body_splitter.setStretchFactor(1, 2)
+        body_splitter.setSizes([1100, 580])
         root.addWidget(body_splitter, 6)
 
         self._tabs = QTabWidget()
@@ -418,7 +444,7 @@ class OperatorPanel(Plugin):
         self._tabs.addTab(self._geometry_tab(), "Geometry")
         self._tabs.addTab(self._attitude_tab(), "Attitude")
         self._event_log = QPlainTextEdit(); self._event_log.setReadOnly(True); self._tabs.addTab(self._event_log, "Event Log")
-        root.addWidget(self._tabs, 3)
+        root.addWidget(self._tabs, 2)
 
         context.add_widget(self._widget)
         self._bridge.image.connect(self._handle_image)
@@ -556,39 +582,64 @@ class OperatorPanel(Plugin):
     def _render_px4_status(self, status):
         status = status if isinstance(status, dict) else {}
         state = self._source_states.get("px4_status", "waiting")
-        age = None if "px4_status" not in self._received else time.monotonic() - self._received["px4_status"]
-        contract = px4_contract_state(status)
+        live = state == "valid"
+        contract = px4_contract_state(status) if live else "unavailable"
         if contract == "safe":
-            authority_text, gazebo_text = "PX4 SITL ONLY", "BLOCKED"
+            authority_text, gazebo_text = "PX4 SITL ONLY — VERIFIED", "BLOCKED — VERIFIED"
         elif contract == "violation":
             authority_text, gazebo_text = "ERROR — CONTRACT VIOLATION", "ERROR — ENABLED"
         else:
-            authority_text, gazebo_text = "unavailable", "unavailable"
-        connected = status.get("px4_connected") is True and state == "valid"
-        connection_text = "CONNECTED" if connected else ("STALE" if state == "stale" else "unavailable")
-        armed_text = "ARMED" if status.get("armed") is True and connected else ("DISARMED" if connected else "unavailable")
-        mode = status_field(status, "navigation_mode")
-        phase = status_field(status, "mission_phase")
+            authority_text, gazebo_text = "UNVERIFIED", "UNVERIFIED"
+        connected = status.get("px4_connected") is True and live
+        if connected:
+            connection_text = "CONNECTED"
+        elif state == "stale":
+            connection_text = "STALE"
+        elif live and status.get("status") == "ERROR":
+            connection_text = "ERROR"
+        else:
+            connection_text = "DISCONNECTED" if live else "UNAVAILABLE"
+        armed_text = "ARMED" if status.get("armed") is True and connected else ("DISARMED" if connected else "UNAVAILABLE")
+        mode = status_field(status, "navigation_mode") if connected else "unavailable"
+        phase = mission_phase_display(status) if connected else "UNAVAILABLE"
+        phase_source = status_field(status, "mission_phase_source") if connected else "unavailable"
+        phase_confidence = status_field(status, "mission_phase_confidence") if connected else "unavailable"
         observation = self._latest.get("observation_status") or {}
         attitude = self._latest.get("attitude_status") or {}
         source = attitude.get("oracle_source_role") or observation.get("oracle_source_role") or "unavailable"
         source_text = str(source)
-        overall = px4_overall_status(status, self._source_states)
+        overall = px4_overall_status(status if live else {}, self._source_states)
         if state == "stale":
             overall = f"DEGRADED — PX4 status stale; receive age: {format_receive_age(self._received.get('px4_status'), time.monotonic())}"
+        contract_values = status.get("flight_contract") if isinstance(status.get("flight_contract"), dict) else {}
+        flight_authority = status_field(contract_values, "flight_authority")
+        fly_target = contract_values.get("fly_target_in_gazebo")
+        fly_target_text = str(fly_target).lower() if isinstance(fly_target, bool) else "unavailable"
+        mission_profile = status_field(contract_values, "mission_profile")
+        actual_distance_source = status_field(contract_values, "actual_distance_source")
         for key, value in (("AUTHORITY", authority_text), ("GAZEBO MOTION", gazebo_text), ("PX4 CONNECTION", connection_text), ("ARM", armed_text), ("MODE", str(mode)), ("MISSION PHASE", str(phase)), ("GT SOURCE", source_text), ("OVERALL STATUS", overall)):
             self._top_status_labels[key].setText(value)
-        for key, value in (("control", authority_text), ("gazebo", gazebo_text), ("flight_authority", status_field(status, "flight_authority")), ("fly_target", "false" if contract == "safe" else "unavailable"), ("mission_profile", "manual" if contract == "safe" else "unavailable"), ("ground_truth", "Gazebo target_reference_link"), ("frame", CONTRACT_FRAME)):
+        for key, value in (("control", authority_text), ("gazebo", gazebo_text), ("flight_authority", flight_authority), ("fly_target", fly_target_text), ("mission_profile", mission_profile), ("actual_source", actual_distance_source), ("ground_truth", "Gazebo target_reference_link"), ("frame", CONTRACT_FRAME)):
             self._authority_labels[key].setText(str(value))
         self._px4_labels["heartbeat"].setText(connection_text)
         self._px4_labels["armed"].setText(armed_text)
         self._px4_labels["mode"].setText(str(mode))
         self._px4_labels["failsafe"].setText("TRUE" if status.get("failsafe") is True else ("FALSE" if connected else "unavailable"))
         self._px4_labels["phase"].setText(str(phase))
-        self._px4_labels["local_ned"].setText(format_status_vector(status.get("local_ned_m"), ("north", "east", "down")))
-        self._px4_labels["velocity_ned"].setText(format_status_vector(status.get("velocity_ned_mps"), ("north", "east", "down")))
-        sample_timestamp = status_field(status, "sample_timestamp_us")
+        self._px4_labels["phase_source"].setText(f"{phase_source} / {phase_confidence}")
+        local_position_status = status_field(status, "local_position_status")
+        if connected and local_position_status == "valid":
+            local_ned_text = f"{format_status_vector(status.get('local_ned_m'), ('north', 'east', 'down'))} — VALID"
+        elif local_position_status == "stale":
+            local_ned_text = "STALE — PX4 Local NED unavailable"
+        else:
+            local_ned_text = "unavailable"
+        self._px4_labels["local_ned"].setText(local_ned_text)
+        self._px4_labels["velocity_ned"].setText(format_status_vector(status.get("velocity_ned_mps"), ("north", "east", "down")) if connected else "unavailable")
+        sample_timestamp = status_field(status, "sample_timestamp_us") if connected else "unavailable"
         self._px4_labels["sample_timestamp"].setText("unavailable" if sample_timestamp == "unavailable" else f"{sample_timestamp} µs")
+        self._px4_labels["connection_source"].setText(status_field(status, "status_connection_source"))
+        self._px4_labels["endpoint_coexistence"].setText(status_field(status, "endpoint_coexistence"))
         previous = self._last_px4_status
         if isinstance(previous, dict) and isinstance(status, dict):
             transitions = (("px4_connected", "PX4 connected"), ("armed", "PX4 armed"), ("navigation_mode", "PX4 navigation mode"), ("mission_phase", "PX4 mission phase"), ("failsafe", "PX4 failsafe"))
