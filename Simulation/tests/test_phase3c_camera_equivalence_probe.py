@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import math
 import sys
 import tempfile
 import types
 import unittest
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +55,95 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
                 "p": [intr.fx_px, 0.0, intr.cx_px, 0.0, 0.0, intr.fy_px, intr.cy_px, 0.0, 0.0, 0.0, 1.0, 0.0],
             }
         (root / "camera_info.json").write_text(json.dumps(info), encoding="utf-8")
+
+    def make_fake_image_collector(self, *, maxlen: int = 3, initial_count: int = 10):
+        collector = object.__new__(probe.RosImageCollector)
+        topics = ("/left_camera/image", "/right_camera/image")
+        collector.images = {topic: deque(maxlen=maxlen) for topic in topics}
+        collector.received_image_counts = {topic: initial_count for topic in topics}
+        return collector, topics
+
+    def test_receive_counter_exceeds_deque_maxlen_and_is_topic_independent(self) -> None:
+        collector, topics = self.make_fake_image_collector(maxlen=3, initial_count=0)
+        for index in range(5):
+            collector._record_image(topics[0], index)
+        collector._record_image(topics[1], "right")
+        self.assertEqual(len(collector.images[topics[0]]), 3)
+        self.assertEqual(collector.received_image_counts[topics[0]], 5)
+        self.assertEqual(len(collector.images[topics[1]]), 1)
+        self.assertEqual(collector.received_image_counts[topics[1]], 1)
+
+    def test_sampling_uses_monotonic_count_when_deque_is_full(self) -> None:
+        collector, topics = self.make_fake_image_collector(maxlen=3, initial_count=10)
+        image = np.zeros((probe.HEIGHT_PX, probe.WIDTH_PX, 3), dtype=np.uint8)
+        image[350:354, 630:634] = (255, 0, 255)
+        messages = [DummyImage("rgb8", image), DummyImage("rgb8", image)]
+        for topic in topics:
+            collector.images[topic].extend([(0.0, messages[0])] * 3)
+
+        def spin_until(predicate, timeout_s):
+            for message in messages:
+                for topic in topics:
+                    collector._record_image(topic, message)
+            return predicate()
+
+        collector.spin_until = spin_until
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = probe.sample_marker_from_images(
+                collector,
+                discard_frames=0,
+                sample_frames=2,
+                marker_threshold=80.0,
+                output_dir=Path(tmpdir),
+                case_name="zero",
+                marker_name="center",
+            )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["frame_wait_diagnostics"]["start_received_counts"][topics[0]], 10)
+        self.assertEqual(result["frame_wait_diagnostics"]["target_received_counts"][topics[0]], 12)
+        self.assertEqual(result["frame_wait_diagnostics"]["final_received_counts"][topics[0]], 12)
+        self.assertEqual(result["frame_wait_diagnostics"]["final_deque_lengths"][topics[0]], 3)
+
+    def test_image_wait_diagnostics_include_counts_and_deque_length(self) -> None:
+        collector, topics = self.make_fake_image_collector(maxlen=3, initial_count=250)
+        start = {topic: 250 for topic in topics}
+        target = {topic: 270 for topic in topics}
+        diagnostics = probe._image_wait_diagnostics(
+            collector, topics, start, target, discard_frames=10, sample_frames=10,
+        )
+        self.assertEqual(diagnostics["target_received_counts"][topics[0]], 270)
+        self.assertEqual(diagnostics["final_received_counts"][topics[0]], 250)
+        self.assertEqual(diagnostics["final_deque_lengths"][topics[0]], 0)
+        self.assertEqual(diagnostics["deque_maxlen"], 3)
+
+    def test_sampling_waits_on_received_counts_not_deque_length(self) -> None:
+        marker_source = inspect.getsource(probe.sample_marker_from_images)
+        absolute_source = inspect.getsource(probe.sample_absolute_offset_from_images)
+        old_wait = "len(collector.images[topic]) + discard_frames + sample_frames"
+        self.assertNotIn(old_wait, marker_source)
+        self.assertNotIn(old_wait, absolute_source)
+        self.assertIn("collector.received_image_counts", marker_source)
+        self.assertIn("collector.received_image_counts", absolute_source)
+
+    def test_timeout_returns_frame_wait_diagnostics(self) -> None:
+        collector, topics = self.make_fake_image_collector(maxlen=3, initial_count=250)
+        collector.spin_until = lambda predicate, timeout_s: False
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = probe.sample_marker_from_images(
+                collector,
+                discard_frames=10,
+                sample_frames=10,
+                marker_threshold=80.0,
+                output_dir=Path(tmpdir),
+                case_name="zero",
+                marker_name="center",
+            )
+        diagnostics = result["frame_wait_diagnostics"]
+        self.assertEqual(result["status"], "image_topic_timeout")
+        self.assertEqual(diagnostics["start_received_counts"][topics[0]], 250)
+        self.assertEqual(diagnostics["target_received_counts"][topics[0]], 270)
+        self.assertEqual(diagnostics["final_received_counts"][topics[0]], 250)
+        self.assertEqual(diagnostics["final_deque_lengths"][topics[0]], 0)
 
     def make_result(
         self,
@@ -382,6 +473,54 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
         self.assertEqual(diff["delta_u_residual_px"], 1.0)
         self.assertEqual(diff["delta_v_residual_px"], 1.0)
 
+    def test_pixel_coordinate_helper_preserves_fractional_and_negative_values(self) -> None:
+        converted = probe.array_index_to_pixel_center_px(1.25, -2.75)
+        self.assertEqual(converted.convention, probe.PIXEL_CONVENTION_COMPARISON_CENTER)
+        self.assertEqual(converted.u_px, 1.75)
+        self.assertEqual(converted.v_px, -2.25)
+
+    def test_pixel_coordinate_helper_validates_without_rounding_or_clipping(self) -> None:
+        for value in (True, "1", math.nan, math.inf, -math.inf):
+            with self.assertRaises((TypeError, ValueError)):
+                probe.array_index_to_pixel_center_px(value, 0.0)
+        with self.assertRaises(ValueError):
+            probe.PixelCoordinate2D(0.0, 0.0, "")
+        self.assertEqual(probe.array_index_to_pixel_center_px(0.0, 0.0).u_px, 0.5)
+
+    def test_normalized_verdict_is_separate_from_raw_verdict(self) -> None:
+        summary = {
+            "infrastructure_valid": True,
+            "pose_coverage_rate": 1.0,
+            "marker_detection_success_rate": 1.0,
+            "required_case_coverage_rate": 1.0,
+            "absolute_residual_summary": {"median": 0.70, "max": 0.80},
+            "raw_absolute_residual_summary": {"median": 0.70, "max": 0.80},
+            "normalized_absolute_residual_summary": {"median": 0.05, "max": 0.20},
+            "differential_residual_summary": {"median": 0.1, "max": 0.2},
+            "composite_differential_residual_summary": {"median": 0.2, "max": 0.4},
+            "centroid_stddev_summary": {"max": 0.05},
+            "single_axis_sign_agreement": {"matched": 12, "total": 12},
+            "pixel_coordinate_contract": {
+                "rendered_detector_output_convention": probe.PIXEL_CONVENTION_INTEGER_INDEX_LATTICE,
+                "rendered_comparison_convention": probe.PIXEL_CONVENTION_COMPARISON_CENTER,
+                "analytic_projection_convention": probe.PIXEL_CONVENTION_ANALYTIC_CONTINUOUS,
+                "integer_index_to_comparison_center_offset_px": [0.5, 0.5],
+                "evidence_commit": probe.PIXEL_CONVENTION_EVIDENCE_COMMIT,
+                "evidence_cause_verdict": probe.PIXEL_CONVENTION_EVIDENCE_CAUSE_VERDICT,
+            },
+        }
+        self.assertEqual(probe.determine_verdict(summary), "not_equivalent")
+        self.assertEqual(probe.determine_pixel_convention_normalized_verdict(summary), "equivalent")
+
+    def test_normalized_verdict_rejects_missing_or_invalid_contract(self) -> None:
+        summary = {
+            "infrastructure_valid": True,
+            "normalized_absolute_residual_summary": {"median": 0.1, "max": 0.2},
+        }
+        self.assertEqual(probe.determine_pixel_convention_normalized_verdict(summary), "inconclusive")
+        summary["pixel_coordinate_contract"] = {"evidence_commit": "wrong"}
+        self.assertEqual(probe.determine_pixel_convention_normalized_verdict(summary), "inconclusive")
+
     def test_verdicts_equivalent_not_equivalent_and_inconclusive(self) -> None:
         equivalent = {
             "infrastructure_valid": True,
@@ -467,12 +606,17 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
             self.assertEqual(summary["marker_detection_success_rate"], 1.0)
             self.assertTrue(summary["camera_info_valid"])
             self.assertTrue(summary["infrastructure_valid"])
-            self.assertEqual(summary["base_commit"], "37d48b309779c7ac008579df09a1941711e1f059")
+            self.assertEqual(summary["base_commit"], "c5e0e609b3990948347d26cc5d57865ef18ee280")
             self.assertEqual(summary["roll_observability_marker"], "right_positive")
             self.assertIsInstance(summary["pre_adapter_evidence_available"], bool)
             self.assertEqual(summary["pre_adapter_evidence_reference"], "/tmp/sasl-phase3c-a-standard-review-fix")
             self.assertFalse(summary["gazebo_sdf_equivalence_verified"])
             self.assertEqual(summary["attitude_semantics_verdict"], "aligned")
+            self.assertEqual(summary["equivalence_verdict"], summary["raw_equivalence_verdict"])
+            self.assertEqual(summary["absolute_residual_summary"], summary["raw_absolute_residual_summary"])
+            self.assertIn("pixel_coordinate_contract", summary)
+            self.assertIn("pixel_coordinate_observations", summary)
+            self.assertFalse(summary["full_rendered_pixel_equivalence_verified"])
 
             root2 = Path(tmpdir) / "bad"
             root2.mkdir()

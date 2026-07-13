@@ -14,6 +14,7 @@ import argparse
 import importlib.util
 import json
 import math
+import numbers
 import os
 import signal
 import subprocess
@@ -50,7 +51,13 @@ from stereo_ground_sim.gazebo_oracle import make_gazebo_world_to_baseline_transf
 from stereo_ground_sim.stereo_triangulation_adapter import pinhole_intrinsics_from_horizontal_fov
 
 
-BASE_COMMIT = "37d48b309779c7ac008579df09a1941711e1f059"
+BASE_COMMIT = "c5e0e609b3990948347d26cc5d57865ef18ee280"
+PIXEL_CONVENTION_EVIDENCE_COMMIT = BASE_COMMIT
+PIXEL_CONVENTION_EVIDENCE_CAUSE_VERDICT = "half_pixel_convention"
+PIXEL_CONVENTION_OFFSET_PX = (0.5, 0.5)
+PIXEL_CONVENTION_INTEGER_INDEX_LATTICE = "rendered_integer_index_lattice"
+PIXEL_CONVENTION_COMPARISON_CENTER = "gazebo_marker_comparison_pixel_center"
+PIXEL_CONVENTION_ANALYTIC_CONTINUOUS = "analytic_projection_continuous"
 PRE_ADAPTER_EVIDENCE_REFERENCE = "/tmp/sasl-phase3c-a-standard-review-fix"
 ROLL_OBSERVABILITY_MARKER = "right_positive"
 ATTITUDE_SEMANTICS_CRITERIA = {
@@ -126,6 +133,37 @@ class MarkerDetection:
     bbox: tuple[int, int, int, int] | None
     centroid_method: str
     core_pixel_count: int = 0
+
+
+@dataclass(frozen=True)
+class PixelCoordinate2D:
+    u_px: float
+    v_px: float
+    convention: str
+
+    def __post_init__(self) -> None:
+        for name, value in (("u_px", self.u_px), ("v_px", self.v_px)):
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Real):
+                raise TypeError(f"{name} must be a finite real number")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if not isinstance(self.convention, str) or not self.convention:
+            raise ValueError("convention must be a non-empty string")
+
+
+def array_index_to_pixel_center_px(u_index_px: float, v_index_px: float) -> PixelCoordinate2D:
+    """Convert the probe's rendered index lattice to its comparison contract."""
+
+    source = PixelCoordinate2D(
+        u_px=u_index_px,
+        v_px=v_index_px,
+        convention=PIXEL_CONVENTION_INTEGER_INDEX_LATTICE,
+    )
+    return PixelCoordinate2D(
+        u_px=float(source.u_px) + PIXEL_CONVENTION_OFFSET_PX[0],
+        v_px=float(source.v_px) + PIXEL_CONVENTION_OFFSET_PX[1],
+        convention=PIXEL_CONVENTION_COMPARISON_CENTER,
+    )
 
 
 @dataclass(frozen=True)
@@ -601,7 +639,11 @@ def summarize(values: list[float]) -> dict[str, float | None]:
     }
 
 
-def determine_verdict(summary: dict[str, Any]) -> str:
+def _determine_equivalence_verdict(
+    summary: dict[str, Any],
+    *,
+    absolute_summary_key: str,
+) -> str:
     if not summary.get("infrastructure_valid", False):
         return "inconclusive"
     if summary.get("pose_coverage_rate", 0.0) < 1.0:
@@ -610,7 +652,7 @@ def determine_verdict(summary: dict[str, Any]) -> str:
         return "inconclusive"
     if summary.get("required_case_coverage_rate", 0.0) < 1.0:
         return "inconclusive"
-    absolute = summary.get("absolute_residual_summary", {})
+    absolute = summary.get(absolute_summary_key, {})
     differential = summary.get("differential_residual_summary", {})
     composite = summary.get("composite_differential_residual_summary", {})
     centroid = summary.get("centroid_stddev_summary", {})
@@ -626,6 +668,40 @@ def determine_verdict(summary: dict[str, Any]) -> str:
         and sign.get("matched") == sign.get("total") == 12
     )
     return "equivalent" if equivalent else "not_equivalent"
+
+
+def determine_verdict(summary: dict[str, Any]) -> str:
+    """Preserve the public raw-equivalence verdict contract."""
+
+    return _determine_equivalence_verdict(
+        summary,
+        absolute_summary_key="absolute_residual_summary",
+    )
+
+
+def _pixel_coordinate_contract_is_valid(summary: dict[str, Any]) -> bool:
+    contract = summary.get("pixel_coordinate_contract")
+    if not isinstance(contract, dict):
+        return False
+    return (
+        contract.get("rendered_detector_output_convention") == PIXEL_CONVENTION_INTEGER_INDEX_LATTICE
+        and contract.get("rendered_comparison_convention") == PIXEL_CONVENTION_COMPARISON_CENTER
+        and contract.get("analytic_projection_convention") == PIXEL_CONVENTION_ANALYTIC_CONTINUOUS
+        and contract.get("integer_index_to_comparison_center_offset_px") == list(PIXEL_CONVENTION_OFFSET_PX)
+        and contract.get("evidence_commit") == PIXEL_CONVENTION_EVIDENCE_COMMIT
+        and contract.get("evidence_cause_verdict") == PIXEL_CONVENTION_EVIDENCE_CAUSE_VERDICT
+    )
+
+
+def determine_pixel_convention_normalized_verdict(summary: dict[str, Any]) -> str:
+    if not _pixel_coordinate_contract_is_valid(summary):
+        return "inconclusive"
+    if "normalized_absolute_residual_summary" not in summary:
+        return "inconclusive"
+    return _determine_equivalence_verdict(
+        summary,
+        absolute_summary_key="normalized_absolute_residual_summary",
+    )
 
 
 def determine_attitude_semantics_verdict(summary: dict[str, Any]) -> str:
@@ -664,13 +740,17 @@ def determine_attitude_semantics_verdict(summary: dict[str, Any]) -> str:
     return "aligned" if semantics_aligned else "not_aligned"
 
 
-def classify_mismatches(summary: dict[str, Any]) -> list[str]:
+def classify_mismatches(
+    summary: dict[str, Any],
+    *,
+    absolute_summary_key: str = "absolute_residual_summary",
+) -> list[str]:
     classes: list[str] = []
     pose = summary.get("pose_residual_summary", {})
     camera_center_error = pose.get("camera_center_error_max_m")
     if camera_center_error is not None and camera_center_error > 1.0e-6:
         classes.append("center_mismatch")
-    absolute = summary.get("absolute_residual_summary", {})
+    absolute = summary.get(absolute_summary_key, {})
     if absolute.get("max") is not None and absolute["max"] > 1.0:
         classes.append("nominal_optical_mapping_mismatch")
     sign = summary.get("single_axis_sign_agreement", {})
@@ -994,11 +1074,16 @@ class RosImageCollector:
         self.rclpy = rclpy
         self.node = Node("phase3c_camera_equivalence_probe")
         self.images = {topic: deque(maxlen=200) for topic in topics}
+        self.received_image_counts = {topic: 0 for topic in topics}
         self.camera_info = {}
         for topic in topics:
-            self.node.create_subscription(Image, topic, lambda msg, topic=topic: self.images[topic].append((time.monotonic(), msg)), 10)
+            self.node.create_subscription(Image, topic, lambda msg, topic=topic: self._record_image(topic, msg), 10)
         for topic in camera_info_topics:
             self.node.create_subscription(CameraInfo, topic, lambda msg, topic=topic: self.camera_info.setdefault(topic, msg), 10)
+
+    def _record_image(self, topic: str, msg: Any) -> None:
+        self.received_image_counts[topic] += 1
+        self.images[topic].append((time.monotonic(), msg))
 
     def spin_until(self, predicate, timeout_s: float) -> bool:
         end = time.monotonic() + timeout_s
@@ -1027,6 +1112,26 @@ def camera_info_to_dict(msg: Any) -> dict[str, Any]:
     }
 
 
+def _image_wait_diagnostics(
+    collector: RosImageCollector,
+    topics: tuple[str, ...],
+    start_counts: dict[str, int],
+    target_counts: dict[str, int],
+    *,
+    discard_frames: int,
+    sample_frames: int,
+) -> dict[str, Any]:
+    return {
+        "start_received_counts": {topic: int(start_counts[topic]) for topic in topics},
+        "target_received_counts": {topic: int(target_counts[topic]) for topic in topics},
+        "final_received_counts": {topic: int(collector.received_image_counts[topic]) for topic in topics},
+        "final_deque_lengths": {topic: len(collector.images[topic]) for topic in topics},
+        "deque_maxlen": max((collector.images[topic].maxlen or 0) for topic in topics),
+        "discard_frames": int(discard_frames),
+        "sample_frames": int(sample_frames),
+    }
+
+
 def sample_marker_from_images(
     collector: RosImageCollector,
     *,
@@ -1038,10 +1143,22 @@ def sample_marker_from_images(
     marker_name: str,
 ) -> dict[str, Any]:
     topics = ("/left_camera/image", "/right_camera/image")
-    target_counts = {topic: len(collector.images[topic]) + discard_frames + sample_frames for topic in topics}
-    if not collector.spin_until(lambda: all(len(collector.images[t]) >= target_counts[t] for t in topics), timeout_s=20.0):
-        return {"valid": False, "status": "image_topic_timeout"}
-    result: dict[str, Any] = {"valid": True, "status": "ok", "cameras": {}}
+    start_counts = {topic: int(collector.received_image_counts[topic]) for topic in topics}
+    target_counts = {topic: start_counts[topic] + discard_frames + sample_frames for topic in topics}
+    if not collector.spin_until(lambda: all(collector.received_image_counts[t] >= target_counts[t] for t in topics), timeout_s=20.0):
+        return {
+            "valid": False,
+            "status": "image_topic_timeout",
+            "frame_wait_diagnostics": _image_wait_diagnostics(
+                collector, topics, start_counts, target_counts,
+                discard_frames=discard_frames, sample_frames=sample_frames,
+            ),
+        }
+    wait_diagnostics = _image_wait_diagnostics(
+        collector, topics, start_counts, target_counts,
+        discard_frames=discard_frames, sample_frames=sample_frames,
+    )
+    result: dict[str, Any] = {"valid": True, "status": "ok", "cameras": {}, "frame_wait_diagnostics": wait_diagnostics}
     for topic in topics:
         frames = list(collector.images[topic])[-sample_frames:]
         detections = []
@@ -1084,14 +1201,27 @@ def sample_marker_from_images(
                 "invalid_detection_frame_count": invalid_count,
                 "frame_detection_success_rate": frame_success_rate,
                 "status_counts": _status_counts(detections),
+                "coordinate_convention": PIXEL_CONVENTION_INTEGER_INDEX_LATTICE,
+                "normalized_coordinate_convention": PIXEL_CONVENTION_COMPARISON_CENTER,
+                "normalization_offset_px": list(PIXEL_CONVENTION_OFFSET_PX),
+                "normalized_u_px": None,
+                "normalized_v_px": None,
             }
             continue
         us = [item.u_px for item in valid_detections if item.u_px is not None]
         vs = [item.v_px for item in valid_detections if item.v_px is not None]
+        u_px = float(np.median(us))
+        v_px = float(np.median(vs))
+        normalized = array_index_to_pixel_center_px(u_px, v_px)
         result["cameras"][topic] = {
             "valid": True,
-            "u_px": float(np.median(us)),
-            "v_px": float(np.median(vs)),
+            "u_px": u_px,
+            "v_px": v_px,
+            "coordinate_convention": PIXEL_CONVENTION_INTEGER_INDEX_LATTICE,
+            "normalized_u_px": normalized.u_px,
+            "normalized_v_px": normalized.v_px,
+            "normalized_coordinate_convention": normalized.convention,
+            "normalization_offset_px": list(PIXEL_CONVENTION_OFFSET_PX),
             "stddev_px": float(max(np.std(us), np.std(vs))),
             "accepted_frame_count": len(valid_detections),
             "requested_frame_count": requested_count,
@@ -1151,9 +1281,22 @@ def sample_absolute_offset_from_images(
     camera_info_by_topic: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     topics = ("/left_camera/image", "/right_camera/image")
-    target_counts = {topic: len(collector.images[topic]) + discard_frames + sample_frames for topic in topics}
-    if not collector.spin_until(lambda: all(len(collector.images[t]) >= target_counts[t] for t in topics), timeout_s=20.0):
-        return {"valid": False, "status": "image_topic_timeout", "cells": []}
+    start_counts = {topic: int(collector.received_image_counts[topic]) for topic in topics}
+    target_counts = {topic: start_counts[topic] + discard_frames + sample_frames for topic in topics}
+    if not collector.spin_until(lambda: all(collector.received_image_counts[t] >= target_counts[t] for t in topics), timeout_s=20.0):
+        return {
+            "valid": False,
+            "status": "image_topic_timeout",
+            "cells": [],
+            "frame_wait_diagnostics": _image_wait_diagnostics(
+                collector, topics, start_counts, target_counts,
+                discard_frames=discard_frames, sample_frames=sample_frames,
+            ),
+        }
+    wait_diagnostics = _image_wait_diagnostics(
+        collector, topics, start_counts, target_counts,
+        discard_frames=discard_frames, sample_frames=sample_frames,
+    )
     cells: list[dict[str, Any]] = []
     for topic in topics:
         camera = "left" if topic.startswith("/left") else "right"
@@ -1225,7 +1368,12 @@ def sample_absolute_offset_from_images(
                 observation.update({"rendered_u_px": None, "rendered_v_px": None, "stddev_u_px": None, "stddev_v_px": None, "delta_u_px": None, "delta_v_px": None, "residual_norm_px": None, "component_area_min_px": None, "component_area_max_px": None, "component_area_median_px": None, "bbox_width_median_px": None, "bbox_height_median_px": None})
             append_jsonl(output_dir / "absolute_offset_observations.jsonl", observation)
             cells.append(observation)
-    return {"valid": all(cell["valid"] for cell in cells), "status": "ok" if cells and all(cell["valid"] for cell in cells) else "marker_detection_rate_below_threshold", "cells": cells}
+    return {
+        "valid": all(cell["valid"] for cell in cells),
+        "status": "ok" if cells and all(cell["valid"] for cell in cells) else "marker_detection_rate_below_threshold",
+        "cells": cells,
+        "frame_wait_diagnostics": wait_diagnostics,
+    }
 
 
 def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, package_share: Path) -> list[dict[str, Any]]:
@@ -1427,6 +1575,7 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
     if matrix_name == "absolute_offset":
         return summarize_absolute_offset_results(results, output_dir, args)
     absolute_errors = []
+    normalized_absolute_errors = []
     single_axis_differential_errors = []
     composite_differential_errors = []
     centroid_stddevs = []
@@ -1486,11 +1635,19 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
                 observations[(result["case"], result["marker"], side)] = {
                     "rendered_u": float(cam["u_px"]),
                     "rendered_v": float(cam["v_px"]),
+                    "normalized_rendered_u": float(cam.get("normalized_u_px", float(cam["u_px"]) + 0.5)),
+                    "normalized_rendered_v": float(cam.get("normalized_v_px", float(cam["v_px"]) + 0.5)),
                     "analytic_u": float(analytic[side]["u_px"]),
                     "analytic_v": float(analytic[side]["v_px"]),
                 }
                 if result.get("case") == "zero":
                     absolute_errors.append(residual(rendered, expected)["pixel_error_px"])
+                    normalized_errors = residual(
+                        {"u_px": observations[(result["case"], result["marker"], side)]["normalized_rendered_u"],
+                         "v_px": observations[(result["case"], result["marker"], side)]["normalized_rendered_v"]},
+                        expected,
+                    )
+                    normalized_absolute_errors.append(normalized_errors["pixel_error_px"])
                 centroid_stddevs.append(cam.get("stddev_px", math.nan))
 
     def _sign(value: float) -> int:
@@ -1632,6 +1789,8 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
         "single_axis_sign_agreement": {"matched": sign_matched, "total": sign_total, "evaluable": sign_evaluable, "required_evaluable": required_single_axis},
         "single_axis_sign_details": sign_details,
         "absolute_residual_summary": summarize(absolute_errors),
+        "raw_absolute_residual_summary": summarize(absolute_errors),
+        "normalized_absolute_residual_summary": summarize(normalized_absolute_errors),
         "differential_residual_summary": summarize(single_axis_differential_errors),
         "composite_differential_residual_summary": summarize(composite_differential_errors),
         "centroid_stddev_summary": summarize([value for value in centroid_stddevs if math.isfinite(float(value))]),
@@ -1652,10 +1811,66 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
             "verified_contract": False,
         },
         "gazebo_sdf_equivalence_verified": False,
+        "schema_extensions": ["gazebo_rendered_pixel_convention_v1"],
+        "pixel_coordinate_contract": {
+            "rendered_detector_output_convention": PIXEL_CONVENTION_INTEGER_INDEX_LATTICE,
+            "rendered_comparison_convention": PIXEL_CONVENTION_COMPARISON_CENTER,
+            "analytic_projection_convention": PIXEL_CONVENTION_ANALYTIC_CONTINUOUS,
+            "integer_index_to_comparison_center_offset_px": list(PIXEL_CONVENTION_OFFSET_PX),
+            "evidence_commit": PIXEL_CONVENTION_EVIDENCE_COMMIT,
+            "evidence_cause_verdict": PIXEL_CONVENTION_EVIDENCE_CAUSE_VERDICT,
+        },
     }
     summary["equivalence_verdict"] = determine_verdict(summary)
+    summary["raw_equivalence_verdict"] = summary["equivalence_verdict"]
+    summary["pixel_convention_normalized_equivalence_verdict"] = determine_pixel_convention_normalized_verdict(summary)
     summary["attitude_semantics_verdict"] = determine_attitude_semantics_verdict(summary)
     summary["mismatch_classifications"] = classify_mismatches(summary)
+    summary["raw_mismatch_classifications"] = list(summary["mismatch_classifications"])
+    summary["pixel_convention_normalized_mismatch_classifications"] = classify_mismatches(
+        summary,
+        absolute_summary_key="normalized_absolute_residual_summary",
+    )
+    summary["pixel_coordinate_observations"] = [
+        {
+            "case": case_name,
+            "marker": marker_name,
+            "camera": side,
+            "rendered_raw": {
+                "u_px": obs["rendered_u"],
+                "v_px": obs["rendered_v"],
+                "convention": PIXEL_CONVENTION_INTEGER_INDEX_LATTICE,
+            },
+            "rendered_normalized": {
+                "u_px": obs["normalized_rendered_u"],
+                "v_px": obs["normalized_rendered_v"],
+                "convention": PIXEL_CONVENTION_COMPARISON_CENTER,
+            },
+            "analytic": {
+                "u_px": obs["analytic_u"],
+                "v_px": obs["analytic_v"],
+                "convention": PIXEL_CONVENTION_ANALYTIC_CONTINUOUS,
+            },
+        }
+        for (case_name, marker_name, side), obs in sorted(observations.items())
+    ]
+    summary["zero_observation_count"] = sum(1 for key in observations if key[0] == "zero")
+    zero_observation_count = sum(
+        1 for key in observations if key[0] == "zero"
+    )
+    normalized_contract_values_ok = all(
+        math.isclose(obs["normalized_rendered_u"], obs["rendered_u"] + 0.5, abs_tol=1.0e-12)
+        and math.isclose(obs["normalized_rendered_v"], obs["rendered_v"] + 0.5, abs_tol=1.0e-12)
+        for obs in observations.values()
+    )
+    summary["rendered_pixel_convention_verified"] = bool(
+        summary["infrastructure_valid"]
+        and zero_observation_count > 0
+        and normalized_contract_values_ok
+        and summary["pixel_convention_normalized_equivalence_verdict"] == "equivalent"
+        and summary["attitude_semantics_verdict"] == "aligned"
+    )
+    summary["full_rendered_pixel_equivalence_verified"] = False
     write_json(output_dir / "summary.json", summary)
     return summary
 
