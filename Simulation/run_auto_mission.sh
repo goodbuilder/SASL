@@ -92,6 +92,9 @@ USAGE
 mission_args=()
 provided_args=()
 
+printf '%s\n' "Flight authority: PX4 SITL ONLY"
+printf '%s\n' "PX4 Local NED: AUXILIARY ONLY — NOT GROUND TRUTH"
+
 has_provided_arg() {
   local name="$1"
   local arg

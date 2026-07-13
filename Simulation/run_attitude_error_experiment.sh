@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+printf '%s\n' "This legacy sweep is disabled by the PX4-only flight-authority contract." >&2
+printf '%s\n' "A PX4-native attitude-error sweep runner has not yet been implemented." >&2
+exit 2
+
 SHOW_HELP=false
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SHOW_HELP=true

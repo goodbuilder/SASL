@@ -119,6 +119,63 @@ ATTITUDE_STATIC_PARAMETER_REJECTION_REASON = (
     "camera attitude parameters affect both Node analytic math and Gazebo camera pose "
     "and require a full simulation restart"
 )
+PX4_ONLY_FLIGHT_AUTHORITY = "px4_sitl"
+PX4_ONLY_PARAMETER_NAMES = {
+    "flight_authority",
+    "fly_target_in_gazebo",
+    "mission_profile",
+    "actual_distance_source",
+}
+PX4_ONLY_CONTRACT_ERROR = (
+    "Gazebo-driven target motion is prohibited by the PX4-only flight-authority contract."
+)
+PX4_ONLY_PARAMETER_REJECTION_REASON = (
+    "PX4-only flight-authority parameters are immutable after node startup; "
+    + PX4_ONLY_CONTRACT_ERROR
+)
+
+
+def validate_px4_only_contract(
+    *,
+    flight_authority,
+    fly_target_in_gazebo,
+    mission_profile,
+    actual_distance_source,
+):
+    """Reject every node configuration that can give flight authority to Gazebo."""
+    violations = []
+    if str(flight_authority) != PX4_ONLY_FLIGHT_AUTHORITY:
+        violations.append(
+            f"flight_authority={flight_authority!r} (expected {PX4_ONLY_FLIGHT_AUTHORITY!r})"
+        )
+    if isinstance(fly_target_in_gazebo, bool):
+        gazebo_motion_enabled = fly_target_in_gazebo
+    else:
+        gazebo_motion_enabled = str(fly_target_in_gazebo).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
+    if gazebo_motion_enabled:
+        violations.append(
+            f"fly_target_in_gazebo={fly_target_in_gazebo!r} (expected false)"
+        )
+    if str(mission_profile) != "manual":
+        violations.append(
+            f"mission_profile={mission_profile!r} (expected manual)"
+        )
+    if str(actual_distance_source) != "gazebo":
+        violations.append(
+            f"actual_distance_source={actual_distance_source!r} (expected gazebo)"
+        )
+    if violations:
+        raise RuntimeError(
+            "PX4-only flight-authority contract violation: "
+            + "; ".join(violations)
+            + ". "
+            + PX4_ONLY_CONTRACT_ERROR
+        )
 
 
 class StereoDistanceNode(Node):
@@ -141,6 +198,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("approach_start_distance_m", 2000.0)
         self.declare_parameter("approach_end_distance_m", 300.0)
         self.declare_parameter("approach_duration_s", 120.0)
+        self.declare_parameter("flight_authority", PX4_ONLY_FLIGHT_AUTHORITY)
         self.declare_parameter("mission_profile", "manual")
         self.declare_parameter("observation_mode", "both")
         self.declare_parameter("left_roll_error_deg", 0.0)
@@ -245,6 +303,16 @@ class StereoDistanceNode(Node):
         self.rotation_baseline_world_row_major = tuple(
             self.get_parameter("rotation_baseline_world_row_major").value
         )
+        self.flight_authority = str(self.get_parameter("flight_authority").value)
+        self.target_center_z_m = self._float_param("target_center_z_m")
+        self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
+        self.actual_distance_source = self.get_parameter("actual_distance_source").value
+        validate_px4_only_contract(
+            flight_authority=self.flight_authority,
+            fly_target_in_gazebo=self.fly_target_in_gazebo,
+            mission_profile=self.mission_profile,
+            actual_distance_source=self.actual_distance_source,
+        )
         (
             self.gazebo_oracle_policy,
             self.gazebo_world_to_baseline_transform,
@@ -255,9 +323,6 @@ class StereoDistanceNode(Node):
             baseline_origin_world_enu_m=self.baseline_origin_world_enu_m,
             rotation_baseline_world_row_major=self.rotation_baseline_world_row_major,
         )
-        self.target_center_z_m = self._float_param("target_center_z_m")
-        self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
-        self.actual_distance_source = self.get_parameter("actual_distance_source").value
         self.actual_distance_read_hz = max(0.1, self._float_param("actual_distance_read_hz"))
         self.yolo_model_path = str(self.get_parameter("yolo_model_path").value)
         self.yolo_class_name = str(self.get_parameter("yolo_class_name").value)
@@ -1371,6 +1436,12 @@ class StereoDistanceNode(Node):
         return actual_value, error_value
 
     def _on_param_update(self, params):
+        for param in params:
+            if param.name in PX4_ONLY_PARAMETER_NAMES:
+                return SetParametersResult(
+                    successful=False,
+                    reason=PX4_ONLY_PARAMETER_REJECTION_REASON,
+                )
         for param in params:
             if param.name in ATTITUDE_STATIC_PARAMETERS:
                 return SetParametersResult(

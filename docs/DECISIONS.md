@@ -81,3 +81,13 @@
 
 - Phase 0은 분석과 문서 작성만 한다.
 - 명백한 코드 문제도 수정하지 않고 위치와 위험을 기록한다.
+
+## D-016. PX4 SITL만 Simulation 비행 권한을 가진다
+
+- Simulation의 arm, takeoff, 이동, 자세, approach와 landing 명령은 PX4 SITL이 독점한다.
+- `fly_target_in_gazebo`는 항상 `false`, `mission_profile`은 항상 `manual`, `actual_distance_source`는 항상 `gazebo`다.
+- Gazebo `target_reference_link` pose는 Ground Truth oracle로만 읽으며 비행 제어 source가 아니다.
+- PX4 Local NED는 보조 비교값이며 Ground Truth로 승격하지 않는다.
+- 기존 Gazebo-driven attitude-error sweep은 PX4-native 대체 runner가 구현될 때까지 비활성화한다.
+
+근거: 동적 Gazebo 모델에 scripted pose를 주기적으로 적용하면 중력/충돌 물리와 pose reset이 충돌하여 비행 권한과 Ground Truth source가 혼합된다.

@@ -13,9 +13,61 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
   SHOW_HELP=true
 fi
 
+validate_px4_only_launch_args() {
+  local arg value
+  for arg in "$@"; do
+    case "$arg" in
+      flight_authority:=*)
+        value="${arg#*:=}"
+        if [[ "$value" != "px4_sitl" ]]; then
+          printf '%s\n' "error: flight_authority must be px4_sitl (got $value)." >&2
+          return 1
+        fi
+        ;;
+      fly_target_in_gazebo:=*)
+        value="${arg#*:=}"
+        case "${value,,}" in
+          false|0|no|off) ;;
+          *)
+            printf '%s\n' "error: fly_target_in_gazebo must be false under the PX4-only flight-authority contract (got $value)." >&2
+            return 1
+            ;;
+        esac
+        ;;
+      mission_profile:=*)
+        value="${arg#*:=}"
+        if [[ "$value" != "manual" ]]; then
+          printf '%s\n' "error: mission_profile must be manual under the PX4-only flight-authority contract (got $value)." >&2
+          return 1
+        fi
+        ;;
+      actual_distance_source:=*)
+        value="${arg#*:=}"
+        if [[ "$value" != "gazebo" ]]; then
+          printf '%s\n' "error: actual_distance_source must be gazebo under the PX4-only flight-authority contract (got $value)." >&2
+          return 1
+        fi
+        ;;
+    esac
+  done
+}
+
+if [[ "$SHOW_HELP" != true ]]; then
+  for raw_arg in "$@"; do
+    if [[ "$raw_arg" == "--no-px4" ]]; then
+      printf '%s\n' "error: --no-px4 is disabled; Simulation requires PX4 SITL flight authority." >&2
+      exit 2
+    fi
+  done
+  if ! validate_px4_only_launch_args "$@"; then
+    exit 2
+  fi
+fi
+
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/ros2-launch-log}"
 export GZ_CONFIG_HOME="${GZ_CONFIG_HOME:-/tmp/gz-config}"
 PX4_CONSOLE_LOG="${PX4_CONSOLE_LOG:-/dev/null}"
+PX4_CONNECTION_TIMEOUT_S="${PX4_CONNECTION_TIMEOUT_S:-30}"
 export GZ_SIM_RESOURCE_PATH="$COLCON_INSTALL_BASE/stereo_ground_sim/share/stereo_ground_sim/models:${GZ_SIM_RESOURCE_PATH:-}"
 RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
 DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-20.0}"
@@ -205,6 +257,36 @@ resolve_executable() {
   return 1
 }
 
+is_px4_autopilot_checkout() {
+  local directory="$1"
+  [[ -f "$directory/Makefile" ]] \
+    && [[ -d "$directory/src" ]] \
+    && [[ -d "$directory/Tools/simulation/gz" ]]
+}
+
+has_launch_arg() {
+  local name="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "$name":=* ]] && return 0
+  done
+  return 1
+}
+
+get_launch_arg_value() {
+  local name="$1"
+  shift
+  local arg
+  for arg in "$@"; do
+    if [[ "$arg" == "$name":=* ]]; then
+      printf '%s\n' "${arg#*:=}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [[ -z "$PX4_DIR" ]]; then
   PX4_DIR="$(resolve_existing_dir \
     "$ROOT_DIR/../PX4-Autopilot" \
@@ -357,7 +439,7 @@ Options:
   YOLO_PYTHONPATH can point at a Python site-packages directory containing
                          cv2, torch, and ultralytics.
   --params               Also open Dynamic Reconfigure in rqt_gui.
-  --no-px4               Do not start PX4 SITL / MAVLink for QGC.
+  --no-px4               Rejected: PX4 SITL is mandatory for Simulation flight authority.
   --px4-dir DIR          PX4-Autopilot directory. Default: $PX4_DIR
   --px4-model-name NAME  Existing Gazebo model to attach PX4 to. Default: x500_15m.
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
@@ -643,8 +725,8 @@ while (($#)); do
       shift
       ;;
     --no-px4)
-      start_px4=false
-      shift
+      printf '%s\n' "error: --no-px4 is disabled; Simulation requires PX4 SITL flight authority." >&2
+      exit 2
       ;;
     --px4-dir)
       PX4_DIR="${2:?missing value for --px4-dir}"
@@ -689,12 +771,21 @@ while (($#)); do
   esac
 done
 
-if [[ "$start_px4" == true && ! -d "${PX4_DIR:-}" ]]; then
-  printf '%s\n' \
-    "error: PX4 mode was requested, but PX4_Autopilot was not found." \
-    "Set PX4_DIR to your PX4-Autopilot checkout or run with --no-px4." >&2
+if ! validate_px4_only_launch_args "${launch_input[@]}"; then
   exit 2
 fi
+
+if [[ ! -d "${PX4_DIR:-}" ]] || ! is_px4_autopilot_checkout "$PX4_DIR"; then
+  printf '%s\n' \
+    "error: PX4_Autopilot checkout was not found or is invalid: ${PX4_DIR:-<unset>}." \
+    "Set PX4_DIR to a checkout containing Makefile, src/, and Tools/simulation/gz/." >&2
+  exit 2
+fi
+
+printf '%s\n' "Flight authority: PX4 SITL ONLY"
+printf '%s\n' "Gazebo direct motion: BLOCKED"
+printf '%s\n' "Ground Truth: Gazebo target_reference_link"
+printf '%s\n' "PX4 Local NED: AUXILIARY ONLY — NOT GROUND TRUTH"
 
 set +u
 # shellcheck disable=SC1091
@@ -805,29 +896,6 @@ cleanup() {
 trap cleanup EXIT INT TERM
 cleanup_previous_run
 
-has_launch_arg() {
-  local name="$1"
-  shift
-  local arg
-  for arg in "$@"; do
-    [[ "$arg" == "$name":=* ]] && return 0
-  done
-  return 1
-}
-
-get_launch_arg_value() {
-  local name="$1"
-  shift
-  local arg
-  for arg in "$@"; do
-    if [[ "$arg" == "$name":=* ]]; then
-      printf '%s\n' "${arg#*:=}"
-      return 0
-    fi
-  done
-  return 1
-}
-
 launch_args=()
 add_default_launch_arg() {
   local name="$1"
@@ -883,6 +951,10 @@ fi
 add_default_launch_arg approach_start_distance_m "$approach_start_default" "${launch_input[@]}"
 add_default_launch_arg approach_end_distance_m "$approach_end_default" "${launch_input[@]}"
 add_default_launch_arg observation_mode "${OBSERVATION_MODE:-both}" "${launch_input[@]}"
+add_default_launch_arg flight_authority "px4_sitl" "${launch_input[@]}"
+add_default_launch_arg fly_target_in_gazebo "false" "${launch_input[@]}"
+add_default_launch_arg mission_profile "manual" "${launch_input[@]}"
+add_default_launch_arg actual_distance_source "gazebo" "${launch_input[@]}"
 if [[ -n "$approach_start_default" && -n "$approach_end_default" && -n "${DRONE_FORWARD_SPEED_MPS:-}" ]]; then
   launch_approach_duration_s="$(
     awk -v start="$approach_start_default" -v end="$approach_end_default" -v speed="$DRONE_FORWARD_SPEED_MPS" \
@@ -1017,6 +1089,14 @@ if [[ "$start_px4" == true ]]; then
   fi
 fi
 
+if [[ "$run_mission" == true ]]; then
+  printf '%s\n' "PX4 connection gate: checking heartbeat and LOCAL_POSITION_NED before mission commands."
+  if ! timeout --signal=TERM "$PX4_CONNECTION_TIMEOUT_S" "$ROOT_DIR/run_auto_mission.sh" --check-connection; then
+    printf '%s\n' "error: PX4 connection gate failed; no arm or mission command will be sent." >&2
+    exit 2
+  fi
+fi
+
 perspective_file="$ROOT_DIR/config/operator_rqt.perspective"
 if [[ "$bag_view" == true ]]; then
   perspective_file="$ROOT_DIR/config/operator_rqt_bag.perspective"
@@ -1086,13 +1166,9 @@ if [[ -n "$record_mode" ]]; then
 fi
 
 if [[ "$run_mission" == true ]]; then
-  if [[ "$start_px4" != true ]]; then
-    printf '%s\n' "warning: --auto-mission ignored because --no-px4 was set." >&2
-  else
-    setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_auto_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
-    children+=("$!")
-    printf '%s\n' "PX4 auto mission will start after ${mission_delay_s}s."
-  fi
+  setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_auto_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
+  children+=("$!")
+  printf '%s\n' "PX4 auto mission will start after ${mission_delay_s}s."
 fi
 
 printf '%s\n' "Operator view started."

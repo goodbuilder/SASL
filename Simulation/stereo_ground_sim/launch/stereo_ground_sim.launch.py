@@ -32,6 +32,45 @@ def _bool_config(context, name):
     return LaunchConfiguration(name).perform(context).strip().lower() in ("1", "true", "yes", "on")
 
 
+PX4_ONLY_FLIGHT_AUTHORITY = "px4_sitl"
+PX4_ONLY_CONTRACT_ERROR = (
+    "Gazebo-driven target motion is prohibited by the PX4-only flight-authority contract."
+)
+
+
+def _validate_px4_only_contract(context):
+    values = {
+        "flight_authority": LaunchConfiguration("flight_authority").perform(context).strip(),
+        "fly_target_in_gazebo": LaunchConfiguration("fly_target_in_gazebo").perform(context).strip(),
+        "mission_profile": LaunchConfiguration("mission_profile").perform(context).strip(),
+        "actual_distance_source": LaunchConfiguration("actual_distance_source").perform(context).strip(),
+    }
+    violations = []
+    if values["flight_authority"] != PX4_ONLY_FLIGHT_AUTHORITY:
+        violations.append(
+            f"flight_authority={values['flight_authority']!r} (expected {PX4_ONLY_FLIGHT_AUTHORITY!r})"
+        )
+    if values["fly_target_in_gazebo"].lower() not in ("false", "0", "no", "off"):
+        violations.append(
+            f"fly_target_in_gazebo={values['fly_target_in_gazebo']!r} (expected false)"
+        )
+    if values["mission_profile"] != "manual":
+        violations.append(
+            f"mission_profile={values['mission_profile']!r} (expected manual)"
+        )
+    if values["actual_distance_source"] != "gazebo":
+        violations.append(
+            f"actual_distance_source={values['actual_distance_source']!r} (expected gazebo)"
+        )
+    if violations:
+        raise RuntimeError(
+            "PX4-only flight-authority contract violation: "
+            + "; ".join(violations)
+            + ". "
+            + PX4_ONLY_CONTRACT_ERROR
+        )
+
+
 def _zero_small_angle(value):
     return 0.0 if abs(value) < 5.0e-15 else value
 
@@ -82,6 +121,7 @@ def _write_distance_node_params(context, params_file=None):
         "scenario_range_min_m",
         "scenario_range_max_m",
         "zoom_index",
+        "flight_authority",
     }
     int_params = {
         "yolo_imgsz",
@@ -169,6 +209,7 @@ def _write_distance_node_params(context, params_file=None):
         "disparity_residual_feature_selector_min_samples",
     ]
     default_params = {
+        "flight_authority": PX4_ONLY_FLIGHT_AUTHORITY,
         "observation_mode": "both",
         "camera_image_width_px": 1280,
         "camera_image_height_px": 720,
@@ -404,6 +445,7 @@ def _generate_world(context, generated_world_path=None):
 
 
 def _launch_setup(context, *args, **kwargs):
+    _validate_px4_only_contract(context)
     world = _generate_world(context)
     share_dir = get_package_share_directory("stereo_ground_sim")
     models_dir = os.path.join(share_dir, "models")
@@ -544,6 +586,7 @@ def generate_launch_description():
             DeclareLaunchArgument("target_spawn_yaw_deg", default_value="-90.0"),
             DeclareLaunchArgument("approach_end_distance_m", default_value="200.0"),
             DeclareLaunchArgument("approach_duration_s", default_value="120.0"),
+            DeclareLaunchArgument("flight_authority", default_value=PX4_ONLY_FLIGHT_AUTHORITY),
             DeclareLaunchArgument("mission_profile", default_value="manual"),
             DeclareLaunchArgument("observation_mode", default_value="both"),
             DeclareLaunchArgument("takeoff_altitude_m", default_value="10.0"),

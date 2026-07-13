@@ -12,6 +12,17 @@ import threading
 import time
 from pathlib import Path
 
+if __name__ == "__main__":
+    print(
+        "This legacy sweep is disabled by the PX4-only flight-authority contract.",
+        file=sys.stderr,
+    )
+    print(
+        "A PX4-native attitude-error sweep runner has not yet been implemented.",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32, Float32MultiArray
@@ -688,6 +699,18 @@ def stop_existing_attitude_processes(lines, timeout_s=10.0):
 
 
 def main():
+    print(
+        "This legacy sweep is disabled by the PX4-only flight-authority contract.",
+        file=sys.stderr,
+    )
+    print(
+        "A PX4-native attitude-error sweep runner has not yet been implemented.",
+        file=sys.stderr,
+    )
+    return 2
+
+    # The former sweep implementation remains below for provenance, but is
+    # intentionally unreachable until a PX4-native runner replaces it.
     args = parse_args()
     root = Path(__file__).resolve().parents[1]
     output_dir = Path(args.output_dir) if args.output_dir else root / "reports" / f"attitude_error_{dt.datetime.now():%Y%m%d_%H%M%S}"

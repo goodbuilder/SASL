@@ -465,6 +465,8 @@ def wait_landed(master, timeout_s):
 
 
 def run(args):
+    print("Flight authority: PX4 SITL ONLY", flush=True)
+    print("PX4 Local NED: AUXILIARY ONLY — NOT GROUND TRUTH", flush=True)
     master = mavutil.mavlink_connection(args.connect, autoreconnect=True)
     wait_heartbeat(master, args.heartbeat_timeout_s)
     heartbeat = GcsHeartbeat(master)
