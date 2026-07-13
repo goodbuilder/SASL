@@ -20,14 +20,22 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
             self.assertIn(tab, source)
         for field in ("truth", "raw", "corrected", "disparity", "vertical_disparity", "ray_gap", "intersection_angle"):
             self.assertIn(field, source)
+        for label in ("Observed/BBox Raw", "Analytic Attitude Raw", "observed_disparity_px", "analytic_disparity_px"):
+            self.assertIn(label, source)
         self.assertTrue(any(isinstance(node, ast.ClassDef) and node.name == "OperatorPanel" for node in ast.walk(tree)))
 
     def test_panel_does_not_fake_frame_or_sample_timestamp(self):
         source = PANEL.read_text(encoding="utf-8")
         self.assertIn('Message-level frame: unavailable', source)
         self.assertIn('Message sample timestamp: unavailable', source)
-        self.assertIn('samples not synchronized', source)
+        self.assertIn('UNSYNCHRONIZED', source)
         self.assertNotIn('sample_time = time.monotonic()', source)
+        self.assertIn("synchronized=False", source)
+
+    def test_plot_updates_are_source_local(self):
+        source = PANEL.read_text(encoding="utf-8")
+        self.assertIn("self._bridge.plot.emit(key, value or [])", source)
+        self.assertNotIn("for name, _topic in POSITION_TOPICS:\n            self._plot_stack.append", source)
 
     def test_pure_numeric_helpers_reject_non_finite_values(self):
         sys.path.insert(0, str(ROOT / "stereo_ground_sim"))

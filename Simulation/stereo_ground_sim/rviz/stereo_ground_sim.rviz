@@ -81,7 +81,7 @@ Visualization Manager:
         corrected_estimate: true
         diagnostics: true
         ground_truth: true
-        raw_estimate: true
+        analytic_attitude_raw: true
         ray_gap/analytic: true
         rays/analytic/left: true
         rays/analytic/right: true

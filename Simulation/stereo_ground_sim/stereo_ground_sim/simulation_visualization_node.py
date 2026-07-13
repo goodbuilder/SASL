@@ -116,7 +116,7 @@ class SimulationVisualizationNode(Node):
         self.horizontal_fov_rad = float(self.get_parameter("horizontal_fov_rad").value)
         self.stale_timeout_s = float(self.get_parameter("stale_timeout_s").value)
         self.latest: dict[str, Any] = {"ground_truth": None, "raw": None, "corrected": None, "status": {}}
-        self.last_update_monotonic_s = 0.0
+        self.receive_times = {key: 0.0 for key in ("ground_truth", "raw", "corrected", "status")}
         self.paths = {key: deque(maxlen=500) for key in ("ground_truth", "raw", "corrected")}
         self.marker_pub = self.create_publisher(MarkerArray, MARKER_TOPIC, 10)
         self.path_pubs = {
@@ -133,9 +133,9 @@ class SimulationVisualizationNode(Node):
     def _position_callback(self, key: str, msg: Any) -> None:
         values = finite_vector(getattr(msg, "data", None), length=4)
         self.latest[key] = None if values is None else values[:3]
+        self.receive_times[key] = time.monotonic()
         if self.latest[key] is not None:
             self.paths[key].append(self.latest[key])
-        self.last_update_monotonic_s = time.monotonic()
 
     def _ground_truth_cb(self, msg: Any) -> None:
         self._position_callback("ground_truth", msg)
@@ -152,7 +152,11 @@ class SimulationVisualizationNode(Node):
         except (TypeError, ValueError, json.JSONDecodeError):
             payload = {}
         self.latest["status"] = payload if isinstance(payload, dict) else {}
-        self.last_update_monotonic_s = time.monotonic()
+        self.receive_times["status"] = time.monotonic()
+
+    def _is_fresh(self, key: str) -> bool:
+        received = self.receive_times.get(key, 0.0)
+        return received > 0.0 and time.monotonic() - received <= self.stale_timeout_s
 
     @staticmethod
     def _stamp(node: "SimulationVisualizationNode") -> Any:
@@ -207,7 +211,7 @@ class SimulationVisualizationNode(Node):
                 width_px=self.width_px, height_px=self.height_px, horizontal_fov_rad=self.horizontal_fov_rad
             )
             pixels = (status.get("actual_left_u_px"), status.get("actual_left_v_px"), status.get("actual_right_u_px"), status.get("actual_right_v_px"))
-            if all(value is not None and math.isfinite(float(value)) for value in pixels):
+            if self._is_fresh("status") and all(value is not None and math.isfinite(float(value)) for value in pixels):
                 left_ray, right_ray = nominal_stereo_rays_from_centers(
                     left_cx_px=float(pixels[0]), left_cy_px=float(pixels[1]),
                     right_cx_px=float(pixels[2]), right_cy_px=float(pixels[3]),
@@ -230,10 +234,10 @@ class SimulationVisualizationNode(Node):
                     markers.append(self._line_marker(32, "ray_gap/analytic", left_closest, right_closest, (1.0, 1.0, 0.1)))
             for marker_id, namespace, key, color in (
                 (20, "ground_truth", "ground_truth", (0.2, 1.0, 0.2)),
-                (21, "raw_estimate", "raw", (1.0, 0.2, 0.2)),
+                (21, "analytic_attitude_raw", "raw", (1.0, 0.2, 0.2)),
                 (22, "corrected_estimate", "corrected", (0.8, 0.2, 1.0)),
             ):
-                marker = self._point_marker(marker_id, namespace, self.latest[key], color)
+                marker = self._point_marker(marker_id, namespace, self.latest[key] if self._is_fresh(key) else None, color)
                 if marker is not None:
                     markers.append(marker)
         except (TypeError, ValueError, OverflowError):
@@ -249,7 +253,7 @@ class SimulationVisualizationNode(Node):
             f"angle: {status.get('intersection_angle_rad', '--')} rad",
             "ray source: analytic attitude-model pixels",
             "rays/observed: unavailable — no trusted observed ray topic",
-            f"stale: {self.last_update_monotonic_s <= 0.0 or time.monotonic() - self.last_update_monotonic_s > self.stale_timeout_s}",
+            f"stale sources: {', '.join(key for key in self.receive_times if not self._is_fresh(key)) or 'none'}",
         ])
         markers.append(text)
         array = MarkerArray()
@@ -258,7 +262,9 @@ class SimulationVisualizationNode(Node):
         self._publish_paths()
 
     def _publish_paths(self) -> None:
-        stamp = self._stamp(self)
+        # Legacy array topics have no sample stamp.  A zero stamp prevents the
+        # receive-time publication instant from masquerading as sample time.
+        stamp = type(self._stamp(self))()
         for key, publisher in self.path_pubs.items():
             path = Path()
             path.header.frame_id = BASELINE_FRAME

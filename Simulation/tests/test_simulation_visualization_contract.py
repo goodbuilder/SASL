@@ -65,6 +65,14 @@ class SimulationVisualizationContractTests(unittest.TestCase):
         self.assertNotIn("triangulate_nominal_stereo_centers", source)
         self.assertNotIn("project_nominal_stereo_point", source)
 
+    def test_analytic_raw_and_stale_path_contract_are_explicit(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "stereo_ground_sim" / "stereo_ground_sim" / "simulation_visualization_node.py").read_text(encoding="utf-8")
+        self.assertIn('"analytic_attitude_raw"', source)
+        self.assertIn("self.receive_times", source)
+        self.assertIn("zero stamp", source)
+        self.assertIn('"rays/analytic/left"', source)
+        self.assertNotIn('"rays/observed/left"', source)
+
     def test_legacy_distance_marker_uses_the_rviz_fixed_frame(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "stereo_ground_sim" / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
         self.assertIn('marker.header.frame_id = "baseline_center_frd"', source)
