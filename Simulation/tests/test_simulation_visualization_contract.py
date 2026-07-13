@@ -16,6 +16,7 @@ from stereo_ground_sim.simulation_visualization_node import (  # noqa: E402
     GROUND_TRUTH_PATH_TOPIC,
     MARKER_TOPIC,
     RAW_PATH_TOPIC,
+    MARKER_IDENTITIES,
     camera_centers_baseline_frd,
     finite_vector,
     safe_marker_vector,
@@ -72,6 +73,10 @@ class SimulationVisualizationContractTests(unittest.TestCase):
         self.assertIn("zero stamp", source)
         self.assertIn('"rays/analytic/left"', source)
         self.assertNotIn('"rays/observed/left"', source)
+
+    def test_analytic_raw_add_delete_identity_matches(self) -> None:
+        self.assertIn(("analytic_attitude_raw", 21), MARKER_IDENTITIES)
+        self.assertIn(("raw_estimate", 21), MARKER_IDENTITIES)
 
     def test_legacy_distance_marker_uses_the_rviz_fixed_frame(self) -> None:
         source = (Path(__file__).resolve().parents[1] / "stereo_ground_sim" / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")

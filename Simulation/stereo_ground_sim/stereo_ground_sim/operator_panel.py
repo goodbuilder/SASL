@@ -34,7 +34,9 @@ from stereo_ground_sim.simulation_ui_contract import (
     STALE_TIMEOUT_S,
     UNSYNCHRONIZED,
     finite_float as contract_finite_float,
+    fallback_transition,
     source_state,
+    stale_display,
     synchronized_comparison_errors,
     transition_events,
 )
@@ -384,7 +386,7 @@ class OperatorPanel(Plugin):
 
     def _image_cb(self, name, msg):
         key = f"{name}_image"
-        self._record(key, True)
+        self._record(key, {"received": True})
         self._bridge.image.emit(name, self._image_payload(msg))
 
     def _render_snapshot(self, snapshot):
@@ -406,13 +408,9 @@ class OperatorPanel(Plugin):
         self._geometry_labels["status"].setText(str(observation.get("status") or attitude.get("raw_triangulation_status") or "unavailable")); self._geometry_labels["profile"].setText(str(profile.get("profile_id") or profile.get("status") or "unavailable"))
         source = attitude.get("oracle_source_role") or observation.get("oracle_source_role") or "unavailable"; fallback = attitude.get("oracle_fallback_used", observation.get("oracle_fallback_used", "unavailable")); receive = self._received.get("attitude_status") or self._received.get("observation_status"); age = "unavailable" if receive is None else f"{time.monotonic() - receive:.3f} s"
         self._source_status.setText(f"Ground Truth source: {source}\nGround Truth fallback: {fallback}\nContract frame: {CONTRACT_FRAME}\nMessage-level frame: unavailable\nMessage sample timestamp: unavailable\nReceive age: {age}")
-        if self._last_fallback is not None and fallback != self._last_fallback:
-            self._bridge.event.emit(f"Ground Truth fallback changed: {self._last_fallback} → {fallback}")
-        if self._last_fallback is None and fallback not in (None, False, "False", "unavailable"):
-            self._bridge.event.emit("Ground Truth fallback started")
-        if self._last_fallback not in (None, False, "False", "unavailable") and fallback in (False, "False"):
-            self._bridge.event.emit("Ground Truth fallback ended")
-        self._last_fallback = fallback
+        for event in fallback_transition(self._last_fallback, {"fallback": fallback, "source": source}):
+            self._bridge.event.emit(event)
+        self._last_fallback = {"fallback": fallback, "source": source}
         profile_status = profile.get("status") or profile.get("profile_mode") or profile.get("profile_id")
         if self._last_profile_status is not None and profile_status != self._last_profile_status:
             self._bridge.event.emit(f"Profile status changed: {self._last_profile_status} → {profile_status}")
@@ -430,6 +428,29 @@ class OperatorPanel(Plugin):
         state_text = ", ".join(f"{key}={state}" for key, state in self._source_states.items())
         current = self._source_status.text().split("\n")[:5]
         self._source_status.setText("\n".join(current + [f"Source states: {state_text}"]))
+        self._render_snapshot(dict(self._latest))
+        position_rows = (("ground_truth", "Ground Truth"), ("observed_raw", "Observed/BBox Raw"), ("analytic_raw", "Analytic Attitude Raw"), ("corrected", "Corrected"))
+        for source, row_name in position_rows:
+            values = self._latest.get(source) or []
+            state = self._source_states[source]
+            age = now - self._received[source] if source in self._received else None
+            for index, label in enumerate(self._position_labels[row_name][:3]):
+                label.setText(stale_display(values[index] if len(values) > index else None, state, unit="m", age=age))
+            norm = math.sqrt(sum(float(v) ** 2 for v in values[:3])) if len(values) >= 3 and all(v is not None for v in values[:3]) else None
+            self._position_labels[row_name][3].setText(stale_display(norm, state, unit="m", age=age))
+        for key, label_key, unit in (("ground_truth_range", "truth", "m"), ("observed_disparity_px", "observed_disparity", "px"), ("analytic_disparity_px", "analytic_disparity", "px")):
+            age = now - self._received[key] if key in self._received else None
+            label = self._range_labels[label_key] if label_key in self._range_labels else self._geometry_labels[label_key]
+            label.setText(stale_display(self._latest.get(key), self._source_states[key], unit=unit, age=age))
+        for key, label_key, unit in (("pixels", "analytic_vertical_disparity", "px"), ("ray_quality", "ray_gap", "m")):
+            values = self._latest.get(key) or []
+            value = values[5] if key == "pixels" and len(values) > 5 else (values[0] if key == "ray_quality" and values else None)
+            age = now - self._received[key] if key in self._received else None
+            self._geometry_labels[label_key].setText(stale_display(value, self._source_states[key], unit=unit, age=age))
+        ray_age = now - self._received["ray_quality"] if "ray_quality" in self._received else None
+        ray_state = self._source_states["ray_quality"]
+        ray_values = self._latest.get("ray_quality") or []
+        self._geometry_labels["intersection_angle"].setText(stale_display(math.degrees(ray_values[1]) if len(ray_values) > 1 and ray_values[1] is not None else None, ray_state, unit="deg", age=ray_age))
         if stale:
             self._status.setText("STALE — " + ", ".join(stale) + "; receive age view")
 

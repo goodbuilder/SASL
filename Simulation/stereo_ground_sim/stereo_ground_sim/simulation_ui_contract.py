@@ -18,6 +18,11 @@ SOURCE_KEYS = (
     "profile_status",
     "left_image",
     "right_image",
+    "ground_truth_range",
+    "observed_disparity_px",
+    "analytic_disparity_px",
+    "pixels",
+    "ray_quality",
 )
 
 
@@ -42,11 +47,45 @@ def source_valid(value) -> bool:
 
 
 def source_state(received_at, value, now, threshold=STALE_TIMEOUT_S) -> str:
-    if not source_valid(value):
-        return "invalid"
     if received_at is None:
         return "waiting"
+    if not source_valid(value):
+        return "invalid"
     return "stale" if now - received_at > threshold else "valid"
+
+
+def stale_display(value, state, *, unit="", age=None):
+    if state == "stale":
+        suffix = "unavailable" if age is None else f"{age:.1f} s"
+        numeric = "unavailable" if finite_float(value) is None else f"{float(value):.3f}{(' ' + unit) if unit else ''}"
+        return f"STALE — last {numeric}; receive age: {suffix}"
+    if state in {"waiting", "invalid"}:
+        return "unavailable" if state == "invalid" else "WAITING"
+    numeric = finite_float(value)
+    return "unavailable" if numeric is None else f"{numeric:.3f}{(' ' + unit) if unit else ''}"
+
+
+def fallback_transition(previous, current):
+    """Return exactly one event for a fallback boolean/source transition."""
+    def normalize(value):
+        if isinstance(value, dict):
+            source = value.get("source") or value.get("oracle_source_role")
+            flag = value.get("fallback", value.get("oracle_fallback_used", False))
+            if flag in (None, False, "False", "false", "unavailable", "None"):
+                return False, None
+            return True, source
+        if value in (None, False, "False", "false", "unavailable", "None"):
+            return False, None
+        return bool(value), None
+    old_flag, old_source = normalize(previous)
+    new_flag, new_source = normalize(current)
+    if old_flag == new_flag and old_source == new_source:
+        return []
+    if not old_flag and new_flag:
+        return ["Ground Truth fallback started"]
+    if old_flag and not new_flag:
+        return ["Ground Truth fallback ended"]
+    return [f"Ground Truth fallback source changed: {old_source or 'unknown'} → {new_source or 'unknown'}"]
 
 
 def transition_events(previous, current):
@@ -99,6 +138,6 @@ def stale_marker_action(state):
 
 __all__ = [
     "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "finite_float",
-    "source_valid", "source_state", "transition_events", "synchronized_comparison_errors",
+    "source_valid", "source_state", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
     "plot_series_for_source", "should_append_plot", "stale_marker_action",
 ]

@@ -24,10 +24,10 @@ MARKER_TOPIC = "/simulation/visualization/markers"
 GROUND_TRUTH_PATH_TOPIC = "/simulation/visualization/ground_truth_path"
 RAW_PATH_TOPIC = "/simulation/visualization/raw_path"
 CORRECTED_PATH_TOPIC = "/simulation/visualization/corrected_path"
-_MARKER_IDENTITIES = (
+MARKER_IDENTITIES = (
     ("camera_optical_centers", 1), ("camera_optical_centers", 2),
     ("rays/analytic/left", 10), ("rays/analytic/right", 11),
-    ("ground_truth", 20), ("raw_estimate", 21), ("corrected_estimate", 22),
+    ("ground_truth", 20), ("raw_estimate", 21), ("analytic_attitude_raw", 21), ("corrected_estimate", 22),
     ("closest_points/analytic", 30), ("closest_points/analytic", 31),
     ("ray_gap/analytic", 32), ("baseline_axes", 40), ("baseline_axes", 41),
     ("diagnostics", 50),
@@ -174,7 +174,7 @@ class SimulationVisualizationNode(Node):
         return marker
 
     def _delete_markers(self) -> list[Any]:
-        return [self._make_marker(marker_id, namespace, Marker.SPHERE, action=Marker.DELETE) for namespace, marker_id in _MARKER_IDENTITIES]
+        return [self._make_marker(marker_id, namespace, Marker.SPHERE, action=Marker.DELETE) for namespace, marker_id in MARKER_IDENTITIES]
 
     def _point_marker(self, marker_id: int, namespace: str, point: tuple[float, float, float] | None, color: tuple[float, float, float]) -> Any | None:
         if point is None:
@@ -304,6 +304,7 @@ __all__ = [
     "finite_vector",
     "safe_marker_vector",
     "stable_marker_identity",
+    "MARKER_IDENTITIES",
     "SimulationVisualizationNode",
     "main",
 ]

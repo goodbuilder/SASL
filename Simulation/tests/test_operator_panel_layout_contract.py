@@ -22,6 +22,8 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
             self.assertIn(field, source)
         for label in ("Observed/BBox Raw", "Analytic Attitude Raw", "observed_disparity_px", "analytic_disparity_px"):
             self.assertIn(label, source)
+        for source_name in ("ground_truth_range", "observed_disparity_px", "analytic_disparity_px", "pixels", "ray_quality"):
+            self.assertIn(source_name, source)
         self.assertTrue(any(isinstance(node, ast.ClassDef) and node.name == "OperatorPanel" for node in ast.walk(tree)))
 
     def test_panel_does_not_fake_frame_or_sample_timestamp(self):

@@ -100,7 +100,7 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/Path
       Enabled: true
-      Name: Raw Path
+      Name: Analytic Attitude Raw Path
       Topic:
         Depth: 5
         Durability Policy: Volatile
