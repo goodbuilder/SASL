@@ -3562,7 +3562,10 @@ class StereoDistanceNode(Node):
             )
 
         marker = Marker()
-        marker.header.frame_id = "map"
+        # Keep the legacy text marker visible with the RViz research view.  Its
+        # displayed values are already in baseline-center FRD; this changes no
+        # production measurement or projection result.
+        marker.header.frame_id = "baseline_center_frd"
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = "stereo"
         marker.id = 1

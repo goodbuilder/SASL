@@ -4,6 +4,9 @@ set -euo pipefail
 CALLER_CWD="$(pwd)"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
+COLCON_BUILD_BASE="${SIM_COLCON_BUILD_BASE:-/tmp/sasl-simulation-build}"
+COLCON_INSTALL_BASE="${SIM_COLCON_INSTALL_BASE:-/tmp/sasl-simulation-install}"
+COLCON_LOG_BASE="${SIM_COLCON_LOG_BASE:-/tmp/sasl-simulation-log}"
 
 SHOW_HELP=false
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -13,7 +16,7 @@ fi
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/ros2-launch-log}"
 export GZ_CONFIG_HOME="${GZ_CONFIG_HOME:-/tmp/gz-config}"
 PX4_CONSOLE_LOG="${PX4_CONSOLE_LOG:-/dev/null}"
-export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/install/stereo_ground_sim/share/stereo_ground_sim/models:${GZ_SIM_RESOURCE_PATH:-}"
+export GZ_SIM_RESOURCE_PATH="$COLCON_INSTALL_BASE/stereo_ground_sim/share/stereo_ground_sim/models:${GZ_SIM_RESOURCE_PATH:-}"
 RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
 DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-20.0}"
 DEFAULT_PLOT_HZ="${DEFAULT_PLOT_HZ:-30.0}"
@@ -276,6 +279,7 @@ the Bag plugin instead of the distance Plot plugin.
 Default launch choices for operator observation:
   - gz_gui:=true
   - launch_rviz:=true
+  - launch_visualization_markers:=true
 
 The stereo experiment target is moved by QGroundControl after the PX4 SITL
 bridge connects. By default this script starts PX4 SITL in standalone Gazebo
@@ -357,6 +361,10 @@ Options:
   --px4-dir DIR          PX4-Autopilot directory. Default: $PX4_DIR
   --px4-model-name NAME  Existing Gazebo model to attach PX4 to. Default: x500_15m.
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
+  --gazebo-gui           Start Gazebo with its GUI (default).
+  --no-gazebo-gui        Start the Gazebo server without its GUI.
+  --rviz                 Start RViz (default).
+  --no-rviz              Do not start RViz.
   --headless             Do not start Gazebo GUI or rqt_gui. Useful for automated
                          record-lite smoke runs.
   --auto-mission         Start PX4 offboard takeoff/approach/land after the app starts.
@@ -382,6 +390,10 @@ open_params=false
 start_px4=true
 show_detection_images=true
 headless=false
+gazebo_gui=true
+launch_rviz=true
+gui_option_seen=false
+headless_option_seen=false
 launch_input=()
 mission_args=()
 selected_yolo_model=""
@@ -579,8 +591,51 @@ while (($#)); do
       shift
       ;;
     --headless)
+      if [[ "$gui_option_seen" == true ]]; then
+        printf '%s\n' "error: --headless cannot be combined with --gazebo-gui/--no-gazebo-gui/--rviz/--no-rviz." >&2
+        exit 2
+      fi
       headless=true
+      headless_option_seen=true
+      gazebo_gui=false
+      launch_rviz=false
       show_detection_images=false
+      shift
+      ;;
+    --gazebo-gui)
+      if [[ "$headless_option_seen" == true ]]; then
+        printf '%s\n' "error: --gazebo-gui cannot be combined with --headless." >&2
+        exit 2
+      fi
+      gazebo_gui=true
+      gui_option_seen=true
+      shift
+      ;;
+    --no-gazebo-gui)
+      if [[ "$headless_option_seen" == true ]]; then
+        printf '%s\n' "error: --no-gazebo-gui cannot be combined with --headless." >&2
+        exit 2
+      fi
+      gazebo_gui=false
+      gui_option_seen=true
+      shift
+      ;;
+    --rviz)
+      if [[ "$headless_option_seen" == true ]]; then
+        printf '%s\n' "error: --rviz cannot be combined with --headless." >&2
+        exit 2
+      fi
+      launch_rviz=true
+      gui_option_seen=true
+      shift
+      ;;
+    --no-rviz)
+      if [[ "$headless_option_seen" == true ]]; then
+        printf '%s\n' "error: --no-rviz cannot be combined with --headless." >&2
+        exit 2
+      fi
+      launch_rviz=false
+      gui_option_seen=true
       shift
       ;;
     --params)
@@ -872,19 +927,42 @@ add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${
 	add_optional_default_launch_arg disparity_residual_feature_selector_catalog_path "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_CATALOG_PATH:-}" "${launch_input[@]}"
 	add_default_launch_arg disparity_residual_feature_selector_window_size "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_WINDOW_SIZE:-1}" "${launch_input[@]}"
 	add_default_launch_arg disparity_residual_feature_selector_min_samples "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MIN_SAMPLES:-1}" "${launch_input[@]}"
+if [[ "$gui_option_seen" == true ]] && has_launch_arg gz_gui "${launch_input[@]}"; then
+  printf '%s\n' "error: use either --gazebo-gui/--no-gazebo-gui or gz_gui:=..., not both." >&2
+  exit 2
+fi
+if [[ "$headless" == true ]] && has_launch_arg gz_gui "${launch_input[@]}"; then
+  printf '%s\n' "error: --headless cannot be combined with gz_gui:=...." >&2
+  exit 2
+fi
 if ! has_launch_arg gz_gui "${launch_input[@]}"; then
   if [[ "$headless" == true ]]; then
     launch_args+=("gz_gui:=false")
+  elif [[ "$gui_option_seen" == true ]]; then
+    launch_args+=("gz_gui:=$gazebo_gui")
   else
     launch_args+=("gz_gui:=true")
   fi
 fi
+if [[ "$gui_option_seen" == true ]] && has_launch_arg launch_rviz "${launch_input[@]}"; then
+  printf '%s\n' "error: use either --rviz/--no-rviz or launch_rviz:=..., not both." >&2
+  exit 2
+fi
+if [[ "$headless" == true ]] && has_launch_arg launch_rviz "${launch_input[@]}"; then
+  printf '%s\n' "error: --headless cannot be combined with launch_rviz:=...." >&2
+  exit 2
+fi
 if ! has_launch_arg launch_rviz "${launch_input[@]}"; then
   if [[ "$headless" == true ]]; then
     launch_args+=("launch_rviz:=false")
+  elif [[ "$gui_option_seen" == true ]]; then
+    launch_args+=("launch_rviz:=$launch_rviz")
   else
     launch_args+=("launch_rviz:=true")
   fi
+fi
+if ! has_launch_arg launch_visualization_markers "${launch_input[@]}"; then
+  launch_args+=("launch_visualization_markers:=true")
 fi
 launch_args+=("${launch_input[@]}")
 
@@ -897,11 +975,15 @@ if [[ -n "$calibration_csv_path" ]]; then
   printf '%s\n' "Calibration CSV will be recorded to: $calibration_csv_path"
 fi
 
-colcon build --packages-select stereo_ground_sim stereo_ground_sim_overlay
+colcon --log-base "$COLCON_LOG_BASE" build \
+  --symlink-install \
+  --build-base "$COLCON_BUILD_BASE" \
+  --install-base "$COLCON_INSTALL_BASE" \
+  --packages-select stereo_ground_sim stereo_ground_sim_overlay
 
 set +u
 # shellcheck disable=SC1091
-source "$ROOT_DIR/install/setup.bash"
+source "$COLCON_INSTALL_BASE/setup.bash"
 set -u
 RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
 

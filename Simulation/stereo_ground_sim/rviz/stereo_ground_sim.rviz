@@ -5,24 +5,23 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.5
-      Cell Size: 1
-      Class: rviz_default_plugins/Grid
-      Color: 160; 160; 164
+    - Class: rviz_default_plugins/Grid
       Enabled: false
-      Line Style:
-        Line Width: 0.03
-        Value: Lines
-      Name: Ground Grid
-      Normal Cell Count: 0
-      Offset:
-        X: 0
-        Y: 0
-        Z: 0
+      Name: Baseline FRD Grid
       Plane: XY
       Plane Cell Count: 40
-      Reference Frame: map
+      Reference Frame: baseline_center_frd
       Value: false
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Scale: 1
+      Name: Coordinate Frames
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Update Interval: 0
+      Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1
@@ -61,25 +60,72 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /stereo/distance_marker
-      Name: Distance Text
+      Name: Distance Text (legacy)
       Namespaces:
         stereo: true
       Queue Size: 100
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Marker Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/visualization/markers
+      Name: Research Geometry (FRD)
+      Namespaces:
+        baseline_axes: true
+        camera_optical_centers: true
+        closest_points: true
+        corrected_estimate: true
+        diagnostics: true
+        ground_truth: true
+        raw_estimate: true
+        ray_gap: true
+        rays: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Ground Truth Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/visualization/ground_truth_path
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Raw Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/visualization/raw_path
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Enabled: true
+      Name: Corrected Path
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/visualization/corrected_path
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 32; 34; 36
-    Fixed Frame: map
+    Fixed Frame: baseline_center_frd
     Frame Rate: 30
   Name: root
   Tools:
     - Class: rviz_default_plugins/Interact
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select
-  Transformation:
-    Current:
-      Class: rviz_default_plugins/TF
-  Value: true
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
@@ -87,18 +133,18 @@ Visualization Manager:
       Focal Point:
         X: 22
         Y: 0
-        Z: 4
+        Z: 0
       Name: Current View
       Pitch: 0.35
-      Target Frame: map
+      Target Frame: baseline_center_frd
       Yaw: 3.14
     Saved: ~
 Window Geometry:
   Displays:
-    collapsed: true
+    collapsed: false
   Height: 980
-  Hide Left Dock: true
-  Hide Right Dock: true
+  Hide Left Dock: false
+  Hide Right Dock: false
   Width: 1500
   X: 20
   Y: 20

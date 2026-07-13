@@ -464,6 +464,21 @@ def _launch_setup(context, *args, **kwargs):
             output="screen",
         ),
         Node(
+            package="stereo_ground_sim",
+            executable="simulation_visualization_node",
+            name="simulation_visualization_node",
+            parameters=[
+                {
+                    "baseline_m": LaunchConfiguration("baseline_m"),
+                    "camera_image_width_px": LaunchConfiguration("camera_image_width_px"),
+                    "camera_image_height_px": LaunchConfiguration("camera_image_height_px"),
+                    "horizontal_fov_rad": LaunchConfiguration("horizontal_fov_rad"),
+                }
+            ],
+            condition=IfCondition(LaunchConfiguration("launch_visualization_markers")),
+            output="screen",
+        ),
+        Node(
             package="rviz2",
             executable="rviz2",
             arguments=["-d", rviz_config],
@@ -574,6 +589,7 @@ def generate_launch_description():
             DeclareLaunchArgument("disparity_residual_feature_selector_min_samples", default_value="1"),
             DeclareLaunchArgument("gz_gui", default_value="true"),
             DeclareLaunchArgument("launch_rviz", default_value="true"),
+            DeclareLaunchArgument("launch_visualization_markers", default_value="true"),
             DeclareLaunchArgument("record_calibration_csv", default_value="false"),
             DeclareLaunchArgument(
                 "calibration_csv_path",
