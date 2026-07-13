@@ -467,7 +467,7 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
             self.assertEqual(summary["marker_detection_success_rate"], 1.0)
             self.assertTrue(summary["camera_info_valid"])
             self.assertTrue(summary["infrastructure_valid"])
-            self.assertEqual(summary["base_commit"], "981ecba84d8f20493f9dc48d87adcb9f5a8e5ef9")
+            self.assertEqual(summary["base_commit"], "37d48b309779c7ac008579df09a1941711e1f059")
             self.assertEqual(summary["roll_observability_marker"], "right_positive")
             self.assertIsInstance(summary["pre_adapter_evidence_available"], bool)
             self.assertEqual(summary["pre_adapter_evidence_reference"], "/tmp/sasl-phase3c-a-standard-review-fix")
@@ -542,6 +542,43 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
         self.assertIn("os.killpg(process.pid, signal.SIGKILL)", source)
         self.assertNotIn("pkill", source)
         self.assertNotIn("killall", source)
+
+    def test_absolute_offset_radius_and_case_matrix(self) -> None:
+        source = "<sdf version=\"1.9\"><world name=\"w\"/></sdf>"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base, out = Path(tmpdir) / "base.sdf", Path(tmpdir) / "out.sdf"
+            base.write_text(source, encoding="utf-8")
+            probe.write_probe_world(base, out, (0.0, 0.0, 3.0), marker_radius_m=2.0)
+            root = probe.ET.fromstring(out.read_text(encoding="utf-8"))
+            self.assertEqual(root.findtext("world/model/link/visual/geometry/sphere/radius"), "2.000000000")
+            with self.assertRaises(ValueError):
+                probe.write_probe_world(base, out, (0.0, 0.0, 3.0), marker_radius_m=3.0)
+        cases = probe.case_matrix("absolute_offset", ("center",))
+        self.assertEqual(cases[0].name, "absolute_offset")
+        self.assertEqual(cases[0].marker_names, ("center",))
+
+    def test_absolute_offset_csv_validation(self) -> None:
+        self.assertEqual(probe.parse_csv_values("40,80", kind="threshold-sweep"), (40.0, 80.0))
+        with self.assertRaises(ValueError):
+            probe.parse_csv_values("center,center", kind="marker-set")
+        with self.assertRaises(ValueError):
+            probe.parse_csv_values("not_a_marker", kind="marker-set")
+        with self.assertRaises(ValueError):
+            probe.parse_csv_values("bad_mode", kind="centroid-modes")
+
+    def test_centroid_modes_use_same_component_and_core_failure(self) -> None:
+        image = np.zeros((probe.HEIGHT_PX, probe.WIDTH_PX, 3), dtype=np.uint8)
+        image[100:104, 200:204] = (255, 0, 255)
+        binary = probe.detect_marker_variant(image, threshold=80, centroid_mode="binary_component_centroid", min_area_px=3)
+        weighted = probe.detect_marker(image, threshold=80, min_area_px=3)
+        self.assertTrue(binary.valid and weighted.valid)
+        self.assertEqual(binary.bbox, weighted.bbox)
+        self.assertEqual(binary.pixel_count, weighted.pixel_count)
+        core = probe.detect_marker_variant(image, threshold=80, centroid_mode="high_confidence_core", min_area_px=3)
+        self.assertTrue(core.valid)
+        tiny = np.zeros_like(image)
+        tiny[100:102, 200:202] = (160, 100, 160)
+        self.assertEqual(probe.detect_marker_variant(tiny, threshold=40, centroid_mode="high_confidence_core", min_area_px=3).status, "high_confidence_core_too_small")
 
 
 if __name__ == "__main__":

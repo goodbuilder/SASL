@@ -50,7 +50,7 @@ from stereo_ground_sim.gazebo_oracle import make_gazebo_world_to_baseline_transf
 from stereo_ground_sim.stereo_triangulation_adapter import pinhole_intrinsics_from_horizontal_fov
 
 
-BASE_COMMIT = "981ecba84d8f20493f9dc48d87adcb9f5a8e5ef9"
+BASE_COMMIT = "37d48b309779c7ac008579df09a1941711e1f059"
 PRE_ADAPTER_EVIDENCE_REFERENCE = "/tmp/sasl-phase3c-a-standard-review-fix"
 ROLL_OBSERVABILITY_MARKER = "right_positive"
 ATTITUDE_SEMANTICS_CRITERIA = {
@@ -82,6 +82,9 @@ R_M_C_ZERO_CANDIDATE = (
     (0.0, -1.0, 0.0),
 )
 REQUIRED_POSE_CHECKS_PER_MARKER_SAMPLE = 11
+DEFAULT_MARKER_SET = ("center", "right_positive", "down_positive", "nearer", "farther")
+CENTROID_MODES = ("binary_component_centroid", "weighted_rgb_dominance", "high_confidence_core")
+DEFAULT_THRESHOLDS = (40.0, 60.0, 80.0, 100.0, 120.0)
 
 MARKER_POINTS_BASELINE_FRD_M = {
     "center": (1852.0, 20.0, -6.0),
@@ -122,6 +125,7 @@ class MarkerDetection:
     component_count: int
     bbox: tuple[int, int, int, int] | None
     centroid_method: str
+    core_pixel_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -221,6 +225,11 @@ def standard_cases() -> list[AttitudeCase]:
     return cases
 
 
+def absolute_offset_cases(marker_names: tuple[str, ...]) -> list[AttitudeCase]:
+    zero = CameraAttitudeErrorDeg(0.0, 0.0, 0.0)
+    return [AttitudeCase("absolute_offset", zero, zero, marker_names)]
+
+
 def smoke_cases() -> list[AttitudeCase]:
     zero = CameraAttitudeErrorDeg(0.0, 0.0, 0.0)
     return [
@@ -229,11 +238,13 @@ def smoke_cases() -> list[AttitudeCase]:
     ]
 
 
-def case_matrix(name: str) -> list[AttitudeCase]:
+def case_matrix(name: str, marker_names: tuple[str, ...] | None = None) -> list[AttitudeCase]:
     if name == "smoke":
         return smoke_cases()
     if name == "standard":
         return standard_cases()
+    if name == "absolute_offset":
+        return absolute_offset_cases(marker_names or DEFAULT_MARKER_SET)
     raise ValueError(f"unsupported case matrix: {name}")
 
 
@@ -319,10 +330,23 @@ def parse_generated_model_poses(world_path: Path) -> dict[str, dict[str, Any]]:
     return poses
 
 
-def write_probe_world(base_world_path: Path, output_world_path: Path, marker_world_enu_m: tuple[float, float, float]) -> Path:
+def write_probe_world(
+    base_world_path: Path,
+    output_world_path: Path,
+    marker_world_enu_m: tuple[float, float, float],
+    *,
+    marker_radius_m: float = 1.0,
+) -> Path:
+    if isinstance(marker_radius_m, (bool, str)) or not isinstance(marker_radius_m, (int, float)):
+        raise ValueError("marker radius must be a numeric value")
+    radius = float(marker_radius_m)
+    if not math.isfinite(radius) or radius <= 0.0:
+        raise ValueError("marker radius must be finite and positive")
+    if float(marker_world_enu_m[2]) - radius <= 0.012:
+        raise ValueError("marker radius intersects ground")
     output_world_path.parent.mkdir(parents=True, exist_ok=True)
     output_world_path.write_text(
-        add_marker_to_world_xml(base_world_path.read_text(encoding="utf-8"), marker_world_enu_m),
+        add_marker_to_world_xml(base_world_path.read_text(encoding="utf-8"), marker_world_enu_m, radius_m=radius),
         encoding="utf-8",
     )
     return output_world_path
@@ -436,13 +460,22 @@ def connected_components(mask: np.ndarray) -> list[np.ndarray]:
     return components
 
 
-def detect_marker(rgb: np.ndarray | None, *, threshold: float = 80.0, min_area_px: int = 5, max_area_px: int = 200000) -> MarkerDetection:
+def detect_marker_variant(
+    rgb: np.ndarray | None,
+    *,
+    threshold: float = 80.0,
+    centroid_mode: str = "weighted_rgb_dominance",
+    min_area_px: int = 5,
+    max_area_px: int = 200000,
+) -> MarkerDetection:
+    if centroid_mode not in CENTROID_MODES:
+        raise ValueError(f"unsupported centroid mode: {centroid_mode}")
     if rgb is None:
-        return MarkerDetection(False, "encoding_mismatch", None, None, 0, 0, None, "weighted_rgb_dominance")
+        return MarkerDetection(False, "encoding_mismatch", None, None, 0, 0, None, centroid_mode)
     mask = marker_mask(rgb, threshold=threshold)
     components = connected_components(mask)
     if not components:
-        return MarkerDetection(False, "marker_not_found", None, None, 0, 0, None, "weighted_rgb_dominance")
+        return MarkerDetection(False, "marker_not_found", None, None, 0, 0, None, centroid_mode)
     component_infos = []
     for component in components:
         ys = component[:, 0]
@@ -452,22 +485,37 @@ def detect_marker(rgb: np.ndarray | None, *, threshold: float = 80.0, min_area_p
     valid = [info for info in component_infos if min_area_px <= info[0] <= max_area_px]
     if not valid:
         largest = max(component_infos, key=lambda item: item[0])
-        return MarkerDetection(False, "area_out_of_range", None, None, int(largest[0]), len(components), largest[1:5], "weighted_rgb_dominance")
+        return MarkerDetection(False, "area_out_of_range", None, None, int(largest[0]), len(components), largest[1:5], centroid_mode)
     valid.sort(key=lambda item: item[0], reverse=True)
     if len(valid) > 1 and valid[1][0] >= 0.25 * valid[0][0]:
-        return MarkerDetection(False, "multiple_components", None, None, int(valid[0][0]), len(components), valid[0][1:5], "weighted_rgb_dominance")
+        return MarkerDetection(False, "multiple_components", None, None, int(valid[0][0]), len(components), valid[0][1:5], centroid_mode)
     area, min_x, min_y, max_x, max_y, component = valid[0]
     if min_x <= 0 or min_y <= 0 or max_x >= rgb.shape[1] - 1 or max_y >= rgb.shape[0] - 1:
-        return MarkerDetection(False, "marker_clipped", None, None, int(area), len(components), (min_x, min_y, max_x, max_y), "weighted_rgb_dominance")
+        return MarkerDetection(False, "marker_clipped", None, None, int(area), len(components), (min_x, min_y, max_x, max_y), centroid_mode)
     ys = component[:, 0]
     xs = component[:, 1]
     red = rgb[ys, xs, 0].astype(float)
     green = rgb[ys, xs, 1].astype(float)
     blue = rgb[ys, xs, 2].astype(float)
-    weights = np.maximum(1.0, np.minimum(red, blue) - green)
+    score = np.minimum(red, blue) - green
+    core_pixel_count = int(np.count_nonzero(score >= 120.0))
+    if centroid_mode == "binary_component_centroid":
+        weights = np.ones_like(score)
+    elif centroid_mode == "weighted_rgb_dominance":
+        weights = np.maximum(1.0, score)
+    else:
+        core = score >= 120.0
+        if int(np.count_nonzero(core)) < 3:
+            return MarkerDetection(False, "high_confidence_core_too_small", None, None, int(area), len(components), (min_x, min_y, max_x, max_y), centroid_mode, core_pixel_count)
+        xs, ys, weights = xs[core], ys[core], np.ones(int(np.count_nonzero(core)), dtype=float)
+
     u = float(np.average(xs, weights=weights))
     v = float(np.average(ys, weights=weights))
-    return MarkerDetection(True, "ok", u, v, int(area), len(components), (min_x, min_y, max_x, max_y), "weighted_rgb_dominance")
+    return MarkerDetection(True, "ok", u, v, int(area), len(components), (min_x, min_y, max_x, max_y), centroid_mode, core_pixel_count)
+
+
+def detect_marker(rgb: np.ndarray | None, *, threshold: float = 80.0, min_area_px: int = 5, max_area_px: int = 200000) -> MarkerDetection:
+    return detect_marker_variant(rgb, threshold=threshold, centroid_mode="weighted_rgb_dominance", min_area_px=min_area_px, max_area_px=max_area_px)
 
 
 def intrinsic_delta_from_camera_info(camera_info: dict[str, Any], analytic_intrinsics: Any) -> dict[str, float | None]:
@@ -1063,13 +1111,115 @@ def _status_counts(items: list[MarkerDetection]) -> dict[str, int]:
     return counts
 
 
+def parse_csv_values(raw: str, *, kind: str) -> tuple[Any, ...]:
+    values = tuple(item.strip() for item in raw.split(",") if item.strip())
+    if not values or len(set(values)) != len(values):
+        raise ValueError(f"{kind} must be non-empty and contain no duplicates")
+    if kind == "marker-set":
+        unknown = sorted(set(values) - set(DEFAULT_MARKER_SET))
+        if unknown:
+            raise ValueError(f"unsupported marker name: {unknown[0]}")
+        return values
+    if kind == "threshold-sweep":
+        numbers = tuple(float(value) for value in values)
+        if not all(math.isfinite(value) for value in numbers):
+            raise ValueError("thresholds must be finite")
+        return numbers
+    if kind == "centroid-modes":
+        unknown = sorted(set(values) - set(CENTROID_MODES))
+        if unknown:
+            raise ValueError(f"unsupported centroid mode: {unknown[0]}")
+        return values
+    raise ValueError(f"unknown CSV kind: {kind}")
+
+
+def _roi_path(output_dir: Path, radius_m: float, marker: str, camera: str) -> Path:
+    return output_dir / "roi_samples" / f"{radius_m:g}" / marker / f"{camera}.npz"
+
+
+def sample_absolute_offset_from_images(
+    collector: RosImageCollector,
+    *,
+    discard_frames: int,
+    sample_frames: int,
+    thresholds: tuple[float, ...],
+    centroid_modes: tuple[str, ...],
+    output_dir: Path,
+    marker_name: str,
+    radius_m: float,
+    analytic: dict[str, Any],
+) -> dict[str, Any]:
+    topics = ("/left_camera/image", "/right_camera/image")
+    target_counts = {topic: len(collector.images[topic]) + discard_frames + sample_frames for topic in topics}
+    if not collector.spin_until(lambda: all(len(collector.images[t]) >= target_counts[t] for t in topics), timeout_s=20.0):
+        return {"valid": False, "status": "image_topic_timeout", "cells": []}
+    cells: list[dict[str, Any]] = []
+    for topic in topics:
+        camera = "left" if topic.startswith("/left") else "right"
+        frames = list(collector.images[topic])[-sample_frames:]
+        by_cell: dict[tuple[float, str], list[dict[str, Any]]] = {(threshold, mode): [] for threshold in thresholds for mode in centroid_modes}
+        roi_saved = False
+        for received, msg in frames:
+            rgb, decode_status = decode_image_to_rgb_array(msg)
+            for threshold in thresholds:
+                for mode in centroid_modes:
+                    detection = detect_marker_variant(rgb, threshold=threshold, centroid_mode=mode)
+                    if decode_status != "ok":
+                        detection = MarkerDetection(False, decode_status, None, None, 0, 0, None, mode)
+                    record = {
+                        "radius_m": radius_m, "marker": marker_name, "camera": camera,
+                        "threshold": threshold, "centroid_mode": mode,
+                        "valid": detection.valid, "status": detection.status,
+                        "u_px": detection.u_px, "v_px": detection.v_px,
+                        "pixel_count": detection.pixel_count, "core_pixel_count": detection.core_pixel_count,
+                        "component_count": detection.component_count, "bbox": detection.bbox,
+                        "received_monotonic_s": received, "encoding": getattr(msg, "encoding", None),
+                        "width": getattr(msg, "width", None), "height": getattr(msg, "height", None),
+                    }
+                    append_jsonl(output_dir / "absolute_offset_detection_samples.jsonl", record)
+                    by_cell[(threshold, mode)].append(record)
+                if not roi_saved and rgb is not None:
+                    roi_detection = detect_marker_variant(rgb, threshold=40.0, centroid_mode="binary_component_centroid")
+                    if roi_detection.bbox is not None:
+                        min_x, min_y, max_x, max_y = roi_detection.bbox
+                        x0, y0 = max(0, min_x - 4), max(0, min_y - 4)
+                        x1, y1 = min(rgb.shape[1], max_x + 5), min(rgb.shape[0], max_y + 5)
+                        path = _roi_path(output_dir, radius_m, marker_name, camera)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        np.savez_compressed(path, rgb_crop=rgb[y0:y1, x0:x1].astype(np.uint8), crop_origin_u_px=x0, crop_origin_v_px=y0, full_width=rgb.shape[1], full_height=rgb.shape[0], received_monotonic_s=received, radius_m=radius_m, marker=marker_name, camera=camera)
+                        roi_saved = True
+        for (threshold, mode), records in by_cell.items():
+            valid = [record for record in records if record["valid"]]
+            analytic_side = analytic[camera]
+            observation = {
+                "radius_m": radius_m, "marker": marker_name, "camera": camera,
+                "threshold": threshold, "centroid_mode": mode,
+                "requested_frame_count": len(records), "valid_frame_count": len(valid),
+                "invalid_frame_count": len(records) - len(valid),
+                "frame_success_rate": len(valid) / len(records) if records else 0.0,
+                "valid": len(valid) >= max(0, len(records) - 1) and bool(valid),
+                "status_counts": _status_counts([MarkerDetection(bool(r["valid"]), str(r["status"]), r["u_px"], r["v_px"], int(r["pixel_count"]), int(r["component_count"]), tuple(r["bbox"]) if r["bbox"] else None, str(r["centroid_mode"]), int(r["core_pixel_count"])) for r in records]),
+                "analytic_u_px": analytic_side["u_px"], "analytic_v_px": analytic_side["v_px"],
+            }
+            if valid:
+                us, vs = [float(r["u_px"]) for r in valid], [float(r["v_px"]) for r in valid]
+                widths = [int(r["bbox"][2]) - int(r["bbox"][0]) + 1 for r in valid if r.get("bbox")]
+                heights = [int(r["bbox"][3]) - int(r["bbox"][1]) + 1 for r in valid if r.get("bbox")]
+                observation.update({"rendered_u_px": float(np.median(us)), "rendered_v_px": float(np.median(vs)), "stddev_u_px": float(np.std(us)), "stddev_v_px": float(np.std(vs)), "delta_u_px": float(np.median(us) - analytic_side["u_px"]), "delta_v_px": float(np.median(vs) - analytic_side["v_px"]), "residual_norm_px": float(math.hypot(np.median(us) - analytic_side["u_px"], np.median(vs) - analytic_side["v_px"])), "component_area_min_px": min(r["pixel_count"] for r in valid), "component_area_max_px": max(r["pixel_count"] for r in valid), "component_area_median_px": float(np.median([r["pixel_count"] for r in valid])), "bbox_width_median_px": float(np.median(widths)) if widths else None, "bbox_height_median_px": float(np.median(heights)) if heights else None})
+            else:
+                observation.update({"rendered_u_px": None, "rendered_v_px": None, "stddev_u_px": None, "stddev_v_px": None, "delta_u_px": None, "delta_v_px": None, "residual_norm_px": None, "component_area_min_px": None, "component_area_max_px": None, "component_area_median_px": None, "bbox_width_median_px": None, "bbox_height_median_px": None})
+            append_jsonl(output_dir / "absolute_offset_observations.jsonl", observation)
+            cells.append(observation)
+    return {"valid": all(cell["valid"] for cell in cells), "status": "ok" if cells and all(cell["valid"] for cell in cells) else "marker_detection_rate_below_threshold", "cells": cells}
+
+
 def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, package_share: Path) -> list[dict[str, Any]]:
     generated_dir = output_dir / "generated_worlds"
     base_world = generated_dir / f"{case.name}_production.sdf"
     probe_world = generated_dir / f"{case.name}_marker.sdf"
     first_marker = case.marker_names[0]
     production_world = generate_production_world(case, base_world, package_share=package_share)
-    write_probe_world(production_world, probe_world, marker_world_point(first_marker))
+    write_probe_world(production_world, probe_world, marker_world_point(first_marker), marker_radius_m=args.marker_radius_m)
     generated_poses = parse_generated_model_poses(probe_world)
 
     env = os.environ.copy()
@@ -1165,16 +1315,20 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
                     append_jsonl(output_dir / "case_results.jsonl", result)
                     results.append(result)
                     continue
-                sample = sample_marker_from_images(
-                    collector,
-                    discard_frames=args.discard_frames,
-                    sample_frames=args.sample_frames,
-                    marker_threshold=args.marker_threshold,
-                    output_dir=output_dir,
-                    case_name=case.name,
-                    marker_name=marker_name,
-                )
                 analytic = analytic_projection(marker_name, case)
+                if args.case_matrix == "absolute_offset":
+                    sample = sample_absolute_offset_from_images(
+                        collector, discard_frames=args.discard_frames, sample_frames=args.sample_frames,
+                        thresholds=args.threshold_sweep, centroid_modes=args.centroid_modes,
+                        output_dir=output_dir, marker_name=marker_name, radius_m=args.marker_radius_m,
+                        analytic=analytic,
+                    )
+                else:
+                    sample = sample_marker_from_images(
+                        collector, discard_frames=args.discard_frames, sample_frames=args.sample_frames,
+                        marker_threshold=args.marker_threshold, output_dir=output_dir,
+                        case_name=case.name, marker_name=marker_name,
+                    )
                 result = {
                     "case": case.name,
                     "marker": marker_name,
@@ -1202,7 +1356,60 @@ def run_case(case: AttitudeCase, args: argparse.Namespace, output_dir: Path, pac
     return results
 
 
-def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, matrix_name: str, thresholds: dict[str, Any]) -> dict[str, Any]:
+def summarize_absolute_offset_results(results: list[dict[str, Any]], output_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    cells = [cell for result in results for cell in (result.get("sample") or {}).get("cells", [])]
+    required_radii = (float(args.marker_radius_m),)
+    required_markers = tuple(args.marker_set)
+    required = [cell for cell in cells if any(math.isclose(float(cell.get("radius_m", -1)), radius) for radius in required_radii)]
+    reference = [cell for cell in required if float(cell["threshold"]) == 80.0 and cell["centroid_mode"] == "weighted_rgb_dominance"]
+    def cell_key(cell):
+        return (round(float(cell["radius_m"]), 6), cell["marker"], cell["camera"], float(cell["threshold"]), cell["centroid_mode"])
+    reference_keys = {(round(radius, 6), marker, camera) for radius in required_radii for marker in required_markers for camera in ("left", "right")}
+    ref_by_key = {(round(float(c["radius_m"]), 6), c["marker"], c["camera"]): c for c in reference}
+    reference_cell_coverage = sum(bool(ref_by_key.get(key, {}).get("valid")) for key in reference_keys) / max(1, len(reference_keys))
+    reference_frame_success = [float(c.get("frame_success_rate", 0.0)) for c in reference]
+    config_status: dict[tuple[float, str], list[dict[str, Any]]] = {}
+    for cell in cells:
+        if round(float(cell["radius_m"]), 6) in {round(r, 6) for r in required_radii}:
+            config_status.setdefault((float(cell["threshold"]), cell["centroid_mode"]), []).append(cell)
+    eligible = {}
+    for config, config_cells in config_status.items():
+        valid_cells = [c for c in config_cells if c.get("valid")]
+        per_radius = {radius: sum(c.get("valid", False) for c in config_cells if math.isclose(float(c["radius_m"]), radius)) for radius in required_radii}
+        eligible[config] = len(valid_cells) >= 24 and all(count >= 8 for count in per_radius.values())
+    required_configs = {(threshold, "weighted_rgb_dominance") for threshold in DEFAULT_THRESHOLDS} | {(80.0, mode) for mode in CENTROID_MODES}
+    eligible_count = sum(eligible.values())
+    required_eligible = all(eligible.get(config, False) for config in required_configs)
+    pose_coverage = sum(bool((r.get("pose_evidence") or {}).get("valid")) for r in results) / max(1, len(results))
+    camera_info_valid = (output_dir / "camera_info.json").exists() and bool(validate_camera_info(json.loads((output_dir / "camera_info.json").read_text(encoding="utf-8")))["valid"])
+    # Acquisition validity is per-radius/per-requested marker set. The 30-cell
+    # sweep eligibility gate belongs to the offline combined analyzer.
+    evidence_valid = reference_cell_coverage == 1.0 and all(rate >= 0.95 for rate in reference_frame_success) and pose_coverage == 1.0 and camera_info_valid
+    diagnostic_status_counts: dict[str, int] = {}
+    for cell in cells:
+        if math.isclose(float(cell["radius_m"]), 0.25) and not cell.get("valid"):
+            for status, count in (cell.get("status_counts") or {}).items():
+                diagnostic_status_counts[status] = diagnostic_status_counts.get(status, 0) + int(count)
+    summary = {
+        "schema_version": 3, "base_commit": BASE_COMMIT, "case_matrix": "absolute_offset",
+        "marker_set": list(args.marker_set), "thresholds": list(args.threshold_sweep), "centroid_modes": list(args.centroid_modes),
+        "pose_coverage_rate": pose_coverage, "camera_info_valid": camera_info_valid,
+        "reference_cell_coverage": {"required": len(reference_keys), "valid": sum(bool(c.get("valid")) for c in ref_by_key.values()), "rate": reference_cell_coverage},
+        "reference_frame_success_rate": {"median": float(np.median(reference_frame_success)) if reference_frame_success else None, "min": min(reference_frame_success) if reference_frame_success else None},
+        "eligible_configuration_count": eligible_count, "eligible_configurations": {f"{k[0]:g}:{k[1]}": v for k, v in eligible.items()},
+        "required_configurations_eligible": required_eligible, "diagnostic_or_required_radius": "required_0.50_1.00_2.00_diagnostic_0.25",
+        "diagnostic_cell_count": sum(math.isclose(float(c["radius_m"]), 0.25) for c in cells),
+        "diagnostic_valid_cell_count": sum(math.isclose(float(c["radius_m"]), 0.25) and bool(c.get("valid")) for c in cells),
+        "diagnostic_failure_status_counts": diagnostic_status_counts, "evidence_acquisition_valid": evidence_valid,
+        "gazebo_sdf_equivalence_verified": False, "attitude_semantics_verdict": "inconclusive",
+    }
+    write_json(output_dir / "absolute_offset_run_summary.json", summary)
+    return summary
+
+
+def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, matrix_name: str, thresholds: dict[str, Any], *, args: argparse.Namespace | None = None) -> dict[str, Any]:
+    if matrix_name == "absolute_offset":
+        return summarize_absolute_offset_results(results, output_dir, args)
     absolute_errors = []
     single_axis_differential_errors = []
     composite_differential_errors = []
@@ -1447,7 +1654,7 @@ def _git_head() -> str | None:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--case-matrix", choices=("smoke", "standard"), default="smoke")
+    parser.add_argument("--case-matrix", choices=("smoke", "standard", "absolute_offset"), default="smoke")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--headless", action="store_true")
     mode.add_argument("--gui", action="store_true")
@@ -1456,7 +1663,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--discard-frames", type=int, default=10)
     parser.add_argument("--sample-frames", type=int, default=10)
     parser.add_argument("--marker-threshold", type=float, default=80.0)
-    return parser.parse_args(argv)
+    parser.add_argument("--marker-radius-m", type=float, default=1.0)
+    parser.add_argument("--marker-set", default=",".join(DEFAULT_MARKER_SET))
+    parser.add_argument("--threshold-sweep", default=",".join(str(int(v)) for v in DEFAULT_THRESHOLDS))
+    parser.add_argument("--centroid-modes", default=",".join(CENTROID_MODES))
+    args = parser.parse_args(argv)
+    args.marker_set = parse_csv_values(args.marker_set, kind="marker-set")
+    args.threshold_sweep = parse_csv_values(args.threshold_sweep, kind="threshold-sweep")
+    args.centroid_modes = parse_csv_values(args.centroid_modes, kind="centroid-modes")
+    if isinstance(args.marker_radius_m, bool) or not math.isfinite(args.marker_radius_m) or args.marker_radius_m <= 0.0:
+        raise ValueError("marker radius must be finite and positive")
+    return args
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1480,10 +1697,13 @@ def main(argv: list[str] | None = None) -> int:
         "marker_detection_success_min": 0.95,
     }
     all_results = []
-    for case in case_matrix(args.case_matrix):
+    for case in case_matrix(args.case_matrix, args.marker_set):
         all_results.extend(run_case(case, args, output_dir, package_share))
-    summary = summarize_runtime_results(all_results, output_dir, args.case_matrix, thresholds)
+    summary = summarize_runtime_results(all_results, output_dir, args.case_matrix, thresholds, args=args)
     print(json.dumps(json_safe(summary), ensure_ascii=False, sort_keys=True, allow_nan=False))
+    if args.case_matrix == "absolute_offset":
+        evidence_valid = bool(summary.get("evidence_acquisition_valid"))
+        return 0 if evidence_valid else 2
     return 2 if (
         summary["equivalence_verdict"] == "inconclusive"
         or summary["attitude_semantics_verdict"] == "inconclusive"
