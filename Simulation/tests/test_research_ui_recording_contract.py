@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import signal
 import tempfile
 import time
@@ -19,12 +20,28 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.recording_control import (  # noqa: E402
     MODE_OPTIONS,
+    RecordingControlWidget,
     RecordingSessionController,
     build_operator_recorder_command,
     mode_value,
     sanitize_run_name,
     unique_output_dir,
 )
+from stereo_ground_sim.simulation_ui_contract import RecordingReadiness  # noqa: E402
+
+
+def write_success_manifest(controller):
+    output = controller.output_path
+    (output / "manifest.json").write_text(
+        json.dumps(
+            {
+                "recording_state": "complete",
+                "artifact_integrity": True,
+                "formal_experiment_eligible": True,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 class ResearchUiRecordingContractTests(unittest.TestCase):
@@ -142,10 +159,62 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
             controller.poll()
             self.assertEqual(controller.state, "RECORDING")
             self.assertTrue(controller.stop())
+            write_success_manifest(controller)
             processes[0].returncode = 0
             controller.poll()
             self.assertEqual(controller.state, "COMPLETE")
         controller.shutdown()
+        app.processEvents()
+
+    def test_controller_persists_readiness_at_start_snapshot(self):
+        try:
+            from python_qt_binding.QtWidgets import QApplication
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"Qt unavailable: {exc}")
+        app = QApplication.instance() or QApplication([])
+
+        class FakeProcess:
+            pid = 9876541
+
+            def poll(self):
+                return None
+
+            def send_signal(self, _sig):
+                return None
+
+        controller = RecordingSessionController(
+            process_factory=lambda *_args, **_kwargs: FakeProcess(),
+            poll_interval_ms=1000,
+            stop_timeout_s=0.01,
+            terminate_timeout_s=0.01,
+        )
+        controller.set_readiness(RecordingReadiness(True, True, ()))
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertTrue(controller.start(mode="lite", run_name="ready", save_root=directory))
+            payload = json.loads(
+                (controller.output_path / "readiness_at_start.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload, {"start_allowed": True, "formal_eligible": True, "reasons": []})
+        controller.shutdown()
+        if controller._shutdown_thread is not None:
+            controller._shutdown_thread.join(timeout=1.0)
+        app.processEvents()
+
+    def test_widget_blocks_unprovided_research_but_allows_debug(self):
+        try:
+            from python_qt_binding.QtWidgets import QApplication
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"Qt unavailable: {exc}")
+        app = QApplication.instance() or QApplication([])
+        widget = RecordingControlWidget()
+        self.assertFalse(widget.start_button.isEnabled())
+        widget.set_readiness(RecordingReadiness(True, True, ()))
+        self.assertTrue(widget.start_button.isEnabled())
+        widget.mode_combo.setCurrentIndex(2)
+        self.assertTrue(widget.start_button.isEnabled())
+        widget.mode_combo.setCurrentIndex(1)
+        self.assertFalse(widget.start_button.isEnabled())
+        widget.deleteLater()
         app.processEvents()
 
     def test_controller_rejects_duplicate_start_and_uses_nonblocking_stop(self):
@@ -178,6 +247,7 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
             self.assertFalse(controller.start(mode="lite", run_name="duplicate", save_root=directory))
             self.assertTrue(controller.stop())
             self.assertEqual(controller.state, "STOPPING")
+            write_success_manifest(controller)
             process.returncode = 0
             controller.poll()
             self.assertEqual(controller.state, "COMPLETE")
@@ -221,6 +291,7 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
                 [call.args[1] for call in send_signal.call_args_list],
                 [signal.SIGINT, signal.SIGTERM, signal.SIGKILL],
             )
+            write_success_manifest(controller)
             process.returncode = 0
             controller.poll()
             self.assertEqual(controller.state, "COMPLETE")

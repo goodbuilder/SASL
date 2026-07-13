@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import dataclass
 
 STALE_TIMEOUT_S = 2.0
 UNAVAILABLE = "unavailable"
@@ -75,6 +76,22 @@ PROFILE_NOT_CONFIGURED_VALUES = {
 }
 
 
+@dataclass(frozen=True)
+class RecordingReadiness:
+    """Immutable recording gate result shared by the two Simulation UIs."""
+
+    start_allowed: bool
+    formal_eligible: bool
+    reasons: tuple[str, ...]
+
+    def as_dict(self):
+        return {
+            "start_allowed": bool(self.start_allowed),
+            "formal_eligible": bool(self.formal_eligible),
+            "reasons": list(self.reasons),
+        }
+
+
 def finite_float(value):
     if isinstance(value, (bool, str)):
         return None
@@ -92,6 +109,11 @@ def disparity_difference_px(observed_disparity_px, analytic_disparity_px):
     if observed is None or analytic is None:
         return None
     return observed - analytic
+
+
+def latest_unsynchronized_disparity_difference_px(observed_disparity_px, analytic_disparity_px):
+    """Return a receive-time diagnostic, never a formal same-sample error."""
+    return disparity_difference_px(observed_disparity_px, analytic_disparity_px)
 
 
 def intersection_angle_deg(intersection_angle_rad):
@@ -158,6 +180,148 @@ def corrected_measurement_state(corrected_source_state, profile_status) -> str:
         "stale": "STALE",
         "invalid": "INVALID",
     }.get(state, "INVALID")
+
+
+def state_display_value(value, state, *, unit=""):
+    """Format one numeric field without replaying invalid or stale values."""
+    normalized = str(state or "waiting").strip().lower()
+    if normalized != "valid":
+        return "—"
+    number = finite_float(value)
+    return "—" if number is None else f"{number:.3f}{(' ' + unit) if unit else ''}"
+
+
+def _status_payload(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _source_is_fresh_valid(source_states, key):
+    return str((source_states or {}).get(key, "waiting")).strip().lower() == "valid"
+
+
+def _oracle_role(statuses):
+    for status in statuses:
+        payload = _status_payload(status)
+        role = payload.get("oracle_source_role")
+        if role not in (None, ""):
+            return str(role).strip().lower(), payload
+    return "", {}
+
+
+def _is_gazebo_oracle_role(role):
+    normalized = str(role or "").strip().lower()
+    if not normalized or normalized in {"unavailable", "none", "unknown"}:
+        return False
+    return normalized in {
+        "target_reference_link",
+        "gazebo_oracle",
+        "gazebo_target_reference_link",
+    } or ("gazebo" in normalized and "px4" not in normalized)
+
+
+def evaluate_recording_readiness(
+    *,
+    mode,
+    observation_mode,
+    source_states,
+    px4_status,
+    observation_status,
+    attitude_status,
+    profile_status,
+    parameter_snapshot_status=None,
+):
+    """Evaluate the pure start/formal gate for lite, full, and debug runs.
+
+    ``source_states`` must use the panel's ``waiting|valid|invalid|stale``
+    values. The function intentionally does not infer a sample timestamp from
+    receive time; it only gates freshness and validity.
+    """
+    normalized_mode = str(mode or "full").strip().lower()
+    normalized_observation = str(observation_mode or "both").strip().lower()
+    if normalized_observation not in {"bbox", "ideal_projection", "both"}:
+        normalized_observation = "both"
+    reasons = []
+
+    if normalized_mode == "debug":
+        reasons.append("DEBUG — NON-FORMAL")
+        return RecordingReadiness(True, False, tuple(reasons))
+
+    states = source_states or {}
+    px4 = _status_payload(px4_status)
+    observation = _status_payload(observation_status)
+    attitude = _status_payload(attitude_status)
+    profile = _status_payload(profile_status)
+
+    if not _source_is_fresh_valid(states, "px4_status"):
+        reasons.append(f"PX4 status {str(states.get('px4_status', 'waiting')).upper()}")
+    if px4_contract_state(px4) != "safe":
+        reasons.append("flight contract is not SAFE")
+    if px4.get("px4_connected") is not True:
+        reasons.append("PX4 is not connected")
+    if not _source_is_fresh_valid(states, "ground_truth"):
+        reasons.append(f"Ground Truth {str(states.get('ground_truth', 'waiting')).upper()}")
+
+    role, role_payload = _oracle_role((observation, attitude))
+    if not _is_gazebo_oracle_role(role):
+        reasons.append("Ground Truth source is not Gazebo oracle")
+    if role_payload.get("oracle_valid") is not True:
+        reasons.append("Ground Truth oracle is not valid")
+    if role_payload.get("oracle_fallback_used") is not False:
+        reasons.append("Ground Truth fallback is active")
+
+    for key, label in (
+        ("left_image", "left image"),
+        ("right_image", "right image"),
+        ("attitude_status", "attitude status"),
+        ("observation_status", "observation status"),
+        ("profile_status", "profile status"),
+    ):
+        if not _source_is_fresh_valid(states, key):
+            reasons.append(f"{label} {str(states.get(key, 'waiting')).upper()}")
+
+    if normalized_observation in {"bbox", "both"}:
+        if not _source_is_fresh_valid(states, "observed_raw"):
+            reasons.append(f"observed raw {str(states.get('observed_raw', 'waiting')).upper()}")
+        for side in ("left", "right"):
+            if detection_display_state(observation, side) != "VALID":
+                reasons.append(f"{side} detection {detection_display_state(observation, side)}")
+    if normalized_observation in {"ideal_projection", "both"}:
+        if not _source_is_fresh_valid(states, "analytic_raw"):
+            reasons.append(f"analytic raw {str(states.get('analytic_raw', 'waiting')).upper()}")
+
+    if _source_is_fresh_valid(states, "profile_status") and _profile_is_configured(profile) and not _source_is_fresh_valid(
+        states, "corrected"
+    ):
+        reasons.append(f"corrected {str(states.get('corrected', 'waiting')).upper()} for active profile")
+
+    if parameter_snapshot_status is not None and str(parameter_snapshot_status).lower() != "available":
+        reasons.append(f"parameter snapshot {str(parameter_snapshot_status).upper()}")
+
+    unique_reasons = tuple(dict.fromkeys(reasons))
+    start_allowed = not unique_reasons
+    return RecordingReadiness(start_allowed, start_allowed, unique_reasons)
+
+
+def evaluate_recording_outcome(artifact_integrity, formal_eligible, eligibility_events=()):
+    """Keep artifact completion separate from formal research eligibility."""
+    events = tuple(eligibility_events or ())
+    if not artifact_integrity:
+        return {
+            "recording_state": "error",
+            "artifact_integrity": False,
+            "formal_experiment_eligible": False,
+        }
+    formal = bool(formal_eligible) and not events
+    return {
+        "recording_state": "complete",
+        "artifact_integrity": True,
+        "formal_experiment_eligible": formal,
+    }
 
 
 def parse_px4_status(value):
@@ -364,7 +528,7 @@ def stale_marker_action(state):
 
 __all__ = [
     "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "PX4_STATUS_TOPIC", "PX4_PHASES", "TOP_BAR_FIELDS", "FLIGHT_CONTRACT_FIELDS", "EXPECTED_FLIGHT_CONTRACT", "FLIGHT_CONTRACT_SOURCE", "finite_float",
-    "disparity_difference_px", "intersection_angle_deg", "corrected_measurement_state",
+    "RecordingReadiness", "disparity_difference_px", "latest_unsynchronized_disparity_difference_px", "intersection_angle_deg", "corrected_measurement_state", "state_display_value", "evaluate_recording_readiness", "evaluate_recording_outcome",
     "source_valid", "source_state", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
     "plot_series_for_source", "should_append_plot", "stale_marker_action", "parse_px4_status", "px4_contract_state", "px4_overall_status", "mission_phase_display", "status_field", "format_status_vector", "format_receive_age",
 ]

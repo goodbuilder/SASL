@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import copy
 import threading
 import time
 from collections import deque
@@ -39,6 +40,7 @@ from stereo_ground_sim.simulation_ui_contract import (
     corrected_measurement_state,
     detection_display_state,
     disparity_difference_px,
+    evaluate_recording_readiness,
     finite_float as contract_finite_float,
     fallback_transition,
     format_receive_age,
@@ -49,8 +51,8 @@ from stereo_ground_sim.simulation_ui_contract import (
     px4_contract_state,
     px4_overall_status,
     source_state,
+    state_display_value,
     status_field,
-    stale_display,
     synchronized_comparison_errors,
     transition_events,
 )
@@ -289,6 +291,7 @@ class OperatorPanel(Plugin):
         self._ros_node = None
         self._spin_thread = None
         self._stop_event = threading.Event()
+        self._state_lock = threading.RLock()
         self._bridge = PanelBridge()
         self._latest = {key: None for key in SOURCE_KEYS}
         self._latest.update(
@@ -309,6 +312,7 @@ class OperatorPanel(Plugin):
         self._last_px4_status = None
         self._image_times = {"left": deque(maxlen=40), "right": deque(maxlen=40)}
         self._image_meta = {"left": {}, "right": {}}
+        self._recording_readiness = None
 
         self._widget = QWidget()
         self._widget.setWindowTitle("Stereo Simulation Research Operator Panel")
@@ -465,6 +469,7 @@ class OperatorPanel(Plugin):
         self._bridge.event_message.connect(self._append_event)
         self._bridge.status.connect(self._status.setText)
         self._init_ros()
+        self._update_recording_readiness(self._snapshot_copy())
 
     @staticmethod
     def _make_group(title):
@@ -488,8 +493,9 @@ class OperatorPanel(Plugin):
         view = self._left_view if name == "left" else self._right_view
         view.set_image(payload)
         width, height, _encoding, _step, _data, stamp, received = payload
-        self._image_times[name].append(received)
-        self._image_meta[name].update(width=width, height=height, stamp=stamp, received=received)
+        with self._state_lock:
+            self._image_times[name].append(received)
+            self._image_meta[name].update(width=width, height=height, stamp=stamp, received=received)
         self._update_image_meta(name)
 
     def _render_camera_metadata(self, snapshot):
@@ -497,17 +503,23 @@ class OperatorPanel(Plugin):
         self._update_image_meta("right", snapshot)
 
     def _update_image_meta(self, name, snapshot=None):
-        snapshot = snapshot or self._latest
-        data = self._image_meta[name]
+        snapshot = snapshot or self._snapshot_copy()
+        with self._state_lock:
+            data = dict(self._image_meta[name])
+            history = list(self._image_times[name])
+            observation_state = self._source_states.get("observation_status", "waiting")
         observation = snapshot.get("observation_status") or {}
         observed_prefix = "bbox_left" if name == "left" else "bbox_right"
         observed = (observation.get(f"{observed_prefix}_u_px"), observation.get(f"{observed_prefix}_v_px"))
         observed_text = (
-            "unavailable"
-            if any(finite_float(value) is None for value in observed)
+            "—"
+            if (
+                observation_state != "valid"
+                or detection_display_state(observation, name) != "VALID"
+                or any(finite_float(value) is None for value in observed)
+            )
             else f"({float(observed[0]):.2f}, {float(observed[1]):.2f})"
         )
-        history = self._image_times[name]
         fps = 0.0
         if len(history) >= 2 and history[-1] > history[0]:
             fps = (len(history) - 1) / (history[-1] - history[0])
@@ -516,7 +528,8 @@ class OperatorPanel(Plugin):
             "valid": "VALID",
             "stale": "STALE",
             "waiting": "WAITING",
-        }.get(stream_state, "WAITING")
+            "invalid": "INVALID",
+        }.get(stream_state, "INVALID")
         detection_label = detection_display_state(observation, name)
         meta = (
             f"Resolution {data.get('width', 'unavailable')}×{data.get('height', 'unavailable')}\n"
@@ -536,15 +549,22 @@ class OperatorPanel(Plugin):
             cursor.removeSelectedText()
             cursor.deleteChar()
 
+    def _snapshot_copy(self):
+        with self._state_lock:
+            return copy.deepcopy(self._latest)
+
     def _record(self, key, value):
-        self._latest[key] = value
         now = time.monotonic()
-        self._received[key] = now
-        previous = dict(self._source_states)
-        self._source_states[key] = source_state(now, value, now, STALE_TIMEOUT_S)
-        for event in transition_events(previous, self._source_states):
+        with self._state_lock:
+            self._latest[key] = copy.deepcopy(value)
+            self._received[key] = now
+            previous = dict(self._source_states)
+            self._source_states[key] = source_state(now, value, now, STALE_TIMEOUT_S)
+            events = transition_events(previous, self._source_states)
+            snapshot = copy.deepcopy(self._latest)
+        for event in events:
             self._bridge.event_message.emit(event)
-        self._bridge.snapshot.emit(dict(self._latest))
+        self._bridge.snapshot.emit(snapshot)
         if key in {"ground_truth", "observed_raw", "analytic_raw", "corrected"}:
             self._bridge.plot.emit(key, value or [])
 
@@ -660,7 +680,10 @@ class OperatorPanel(Plugin):
 
     def _render_px4_status(self, status):
         status = status if isinstance(status, dict) else {}
-        state = self._source_states.get("px4_status", "waiting")
+        with self._state_lock:
+            state = self._source_states.get("px4_status", "waiting")
+            received_at = self._received.get("px4_status")
+            source_states = dict(self._source_states)
         live = state == "valid"
         contract = px4_contract_state(status) if live else "unavailable"
         connected = status.get("px4_connected") is True and live
@@ -681,11 +704,11 @@ class OperatorPanel(Plugin):
         phase = mission_phase_display(status) if connected else "UNAVAILABLE"
         phase_source = status_field(status, "mission_phase_source") if connected else "unavailable"
         phase_confidence = status_field(status, "mission_phase_confidence") if connected else "unavailable"
-        overall = px4_overall_status(status if live else {}, self._source_states)
+        overall = px4_overall_status(status if live else {}, source_states)
         if state == "stale":
             overall = (
                 "DEGRADED — PX4 status stale; receive age: "
-                + format_receive_age(self._received.get("px4_status"), time.monotonic())
+                + format_receive_age(received_at, time.monotonic())
             )
         contract_values = status.get("flight_contract") if isinstance(status.get("flight_contract"), dict) else {}
         contract_text = (
@@ -739,6 +762,8 @@ class OperatorPanel(Plugin):
         self._last_px4_status = dict(status) if status else None
 
     def _render_snapshot(self, snapshot):
+        with self._state_lock:
+            source_states = dict(self._source_states)
         self._render_px4_status(snapshot.get("px4_status"))
         attitude = snapshot.get("attitude_status") or {}
         observation = snapshot.get("observation_status") or {}
@@ -771,13 +796,19 @@ class OperatorPanel(Plugin):
         }
         for key, name in names.items():
             values = snapshot.get(key) or []
-            state = self._source_states.get(key, "waiting")
+            state = source_states.get(key, "waiting")
             if key == "corrected":
                 display_state = corrected_measurement_state(state, profile)
             else:
                 display_state = state.upper()
             for index, label in enumerate(self._position_labels[name]):
-                label.setText(format_value(values[index] if len(values) > index else None, "m"))
+                label.setText(
+                    state_display_value(
+                        values[index] if len(values) > index else None,
+                        state,
+                        unit="m",
+                    )
+                )
             self._position_state_labels[name].setText(display_state)
 
         ray = snapshot.get("ray_quality") or []
@@ -785,26 +816,33 @@ class OperatorPanel(Plugin):
         self._quality_labels["status"].setText(
             str(attitude.get("raw_triangulation_status") or observation.get("status") or "unavailable")
         )
-        self._quality_labels["observed_disparity"].setText(format_value(snapshot.get("observed_disparity_px"), "px"))
-        self._quality_labels["analytic_disparity"].setText(format_value(snapshot.get("analytic_disparity_px"), "px"))
-        self._quality_labels["difference"].setText(
-            format_value(
-                disparity_difference_px(
-                    snapshot.get("observed_disparity_px"),
-                    snapshot.get("analytic_disparity_px"),
-                ),
-                "px",
-            )
+        observed_disparity_state = source_states.get("observed_disparity_px", "waiting")
+        analytic_disparity_state = source_states.get("analytic_disparity_px", "waiting")
+        pixels_state = source_states.get("pixels", "waiting")
+        ray_state = source_states.get("ray_quality", "waiting")
+        self._quality_labels["observed_disparity"].setText(
+            state_display_value(snapshot.get("observed_disparity_px"), observed_disparity_state, unit="px")
         )
+        self._quality_labels["analytic_disparity"].setText(
+            state_display_value(snapshot.get("analytic_disparity_px"), analytic_disparity_state, unit="px")
+        )
+        self._quality_labels["difference"].setText(UNSYNCHRONIZED)
         self._quality_labels["vertical_disparity"].setText(
-            format_value(pixels[5] if len(pixels) > 5 else None, "px")
+            state_display_value(pixels[5] if len(pixels) > 5 else None, pixels_state, unit="px")
         )
-        self._quality_labels["ray_gap"].setText(format_value(ray[0] if len(ray) > 0 else None, "m"))
+        self._quality_labels["ray_gap"].setText(
+            state_display_value(ray[0] if len(ray) > 0 else None, ray_state, unit="m")
+        )
         self._quality_labels["intersection_angle"].setText(
-            format_value(intersection_angle_deg(ray[1]) if len(ray) > 1 else None, "deg")
+            state_display_value(
+                intersection_angle_deg(ray[1]) if len(ray) > 1 else None,
+                ray_state,
+                unit="deg",
+            )
         )
         self._render_camera_metadata(snapshot)
         self._update_diagnostics(snapshot)
+        self._update_recording_readiness(snapshot)
 
         source = attitude.get("oracle_source_role") or observation.get("oracle_source_role") or "unavailable"
         fallback = attitude.get(
@@ -818,6 +856,26 @@ class OperatorPanel(Plugin):
         if self._last_profile_status is not None and profile_status != self._last_profile_status:
             self._bridge.event_message.emit(f"Profile status changed: {self._last_profile_status} → {profile_status}")
         self._last_profile_status = profile_status
+
+    def _update_recording_readiness(self, snapshot):
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+        with self._state_lock:
+            source_states = dict(self._source_states)
+        mode = str(self._recording_control.mode_combo.currentData() or "full")
+        observation = snapshot.get("observation_status") or {}
+        readiness = evaluate_recording_readiness(
+            mode=mode,
+            observation_mode=observation.get("observation_mode", "both"),
+            source_states=source_states,
+            px4_status=snapshot.get("px4_status") or {},
+            observation_status=observation,
+            attitude_status=snapshot.get("attitude_status") or {},
+            profile_status=snapshot.get("profile_status") or {},
+        )
+        previous = self._recording_readiness
+        if previous != readiness:
+            self._recording_readiness = readiness
+            self._recording_control.set_readiness(readiness)
 
     @staticmethod
     def _vector_text(payload, keys):
@@ -835,6 +893,13 @@ class OperatorPanel(Plugin):
         matched = attitude.get("oracle_matched_entity_name") or observation.get("oracle_matched_entity_name") or "unavailable"
         fallback = attitude.get("oracle_fallback_used", observation.get("oracle_fallback_used", "unavailable"))
         contract = px4.get("flight_contract") or {}
+        latest_delta = disparity_difference_px(
+            snapshot.get("observed_disparity_px"),
+            snapshot.get("analytic_disparity_px"),
+        )
+        with self._state_lock:
+            received = dict(self._received)
+            image_meta = copy.deepcopy(self._image_meta)
         lines = [
             f"Flight contract: {px4.get('contract', 'UNVERIFIED')}",
             f"flight_authority: {contract.get('flight_authority', 'unavailable')}",
@@ -862,12 +927,14 @@ class OperatorPanel(Plugin):
             "Common sample timestamp: unavailable",
             f"Observation source: {observation.get('bbox_observation_source', 'unavailable')}",
             f"Correction profile: {profile.get('profile_id') or profile.get('profile_mode') or 'NOT CONFIGURED'}",
-            f"Image Header stamps: left={self._image_meta['left'].get('stamp', 'unavailable')}, right={self._image_meta['right'].get('stamp', 'unavailable')}",
+            f"Image Header stamps: left={image_meta['left'].get('stamp', 'unavailable')}, right={image_meta['right'].get('stamp', 'unavailable')}",
             "Receive ages (source-local): "
             + ", ".join(
                 f"{key}={format_receive_age(stamp, time.monotonic())}"
-                for key, stamp in sorted(self._received.items())
+                for key, stamp in sorted(received.items())
             ),
+            f"Latest unsynchronized Δd: {format_value(latest_delta, 'px')}",
+            "Formal Δd: N/A — samples not synchronized",
             "Comparisons: " + str(
                 synchronized_comparison_errors(
                     None,
@@ -883,22 +950,26 @@ class OperatorPanel(Plugin):
 
     def _refresh_source_states(self):
         now = time.monotonic()
-        previous = dict(self._source_states)
-        for key in SOURCE_KEYS:
-            self._source_states[key] = source_state(
-                self._received.get(key),
-                self._latest.get(key),
-                now,
-                STALE_TIMEOUT_S,
-            )
-        for event in transition_events(previous, self._source_states):
+        with self._state_lock:
+            previous = dict(self._source_states)
+            for key in SOURCE_KEYS:
+                self._source_states[key] = source_state(
+                    self._received.get(key),
+                    self._latest.get(key),
+                    now,
+                    STALE_TIMEOUT_S,
+                )
+            source_states = dict(self._source_states)
+            received = dict(self._received)
+            latest = copy.deepcopy(self._latest)
+        for event in transition_events(previous, source_states):
             self._bridge.event_message.emit(event)
-        snapshot = dict(self._latest)
+        snapshot = latest
         self._render_snapshot(snapshot)
         for name, view in (("left", self._left_view), ("right", self._right_view)):
             key = f"{name}_image"
-            age = None if key not in self._received else now - self._received[key]
-            view.set_source_state(self._source_states[key], age)
+            age = None if key not in received else now - received[key]
+            view.set_source_state(source_states[key], age)
             self._update_image_meta(name, snapshot)
 
         rows = (
@@ -909,12 +980,11 @@ class OperatorPanel(Plugin):
         )
         profile = snapshot.get("profile_status") or {}
         for source, row_name in rows:
-            values = self._latest.get(source) or []
-            state = self._source_states[source]
-            age = now - self._received[source] if source in self._received else None
+            values = latest.get(source) or []
+            state = source_states[source]
             for index, label in enumerate(self._position_labels[row_name]):
                 label.setText(
-                    stale_display(values[index] if len(values) > index else None, state, unit="m", age=age)
+                    state_display_value(values[index] if len(values) > index else None, state, unit="m")
                 )
             display_state = (
                 corrected_measurement_state(state, profile) if source == "corrected" else state.upper()
@@ -925,44 +995,27 @@ class OperatorPanel(Plugin):
             ("observed_disparity_px", "observed_disparity", "px"),
             ("analytic_disparity_px", "analytic_disparity", "px"),
         ):
-            age = now - self._received[key] if key in self._received else None
             self._quality_labels[label_key].setText(
-                stale_display(self._latest.get(key), self._source_states[key], unit=unit, age=age)
+                state_display_value(latest.get(key), source_states[key], unit=unit)
             )
-        pixels = self._latest.get("pixels") or []
-        pixel_state = self._source_states["pixels"]
-        pixel_age = now - self._received["pixels"] if "pixels" in self._received else None
+        pixels = latest.get("pixels") or []
+        pixel_state = source_states["pixels"]
         self._quality_labels["vertical_disparity"].setText(
-            stale_display(pixels[5] if len(pixels) > 5 else None, pixel_state, unit="px", age=pixel_age)
+            state_display_value(pixels[5] if len(pixels) > 5 else None, pixel_state, unit="px")
         )
-        ray = self._latest.get("ray_quality") or []
-        ray_state = self._source_states["ray_quality"]
-        ray_age = now - self._received["ray_quality"] if "ray_quality" in self._received else None
+        ray = latest.get("ray_quality") or []
+        ray_state = source_states["ray_quality"]
         self._quality_labels["ray_gap"].setText(
-            stale_display(ray[0] if ray else None, ray_state, unit="m", age=ray_age)
+            state_display_value(ray[0] if ray else None, ray_state, unit="m")
         )
         self._quality_labels["intersection_angle"].setText(
-            stale_display(
+            state_display_value(
                 intersection_angle_deg(ray[1]) if len(ray) > 1 else None,
                 ray_state,
                 unit="deg",
-                age=ray_age,
             )
         )
-        observed_state = self._source_states["observed_disparity_px"]
-        analytic_state = self._source_states["analytic_disparity_px"]
-        delta = disparity_difference_px(
-            self._latest.get("observed_disparity_px"),
-            self._latest.get("analytic_disparity_px"),
-        )
-        if observed_state == "valid" and analytic_state == "valid":
-            self._quality_labels["difference"].setText(format_value(delta, "px"))
-        elif "stale" in {observed_state, analytic_state}:
-            self._quality_labels["difference"].setText("STALE")
-        elif "waiting" in {observed_state, analytic_state}:
-            self._quality_labels["difference"].setText("WAITING")
-        else:
-            self._quality_labels["difference"].setText("unavailable")
+        self._quality_labels["difference"].setText(UNSYNCHRONIZED)
 
     def _spin_loop(self):
         while self._ros_node is not None and not self._stop_event.is_set():

@@ -7,11 +7,13 @@ so the embedded OperatorPanel and the standalone RecorderPanel cannot drift.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +29,7 @@ from python_qt_binding.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from stereo_ground_sim.simulation_ui_contract import RecordingReadiness
 
 
 MODE_OPTIONS = (
@@ -35,9 +38,18 @@ MODE_OPTIONS = (
     ("Debug/Reprocess", "debug"),
 )
 MODE_TO_LABEL = {value: label for label, value in MODE_OPTIONS}
-RECORDING_STATES = ("IDLE", "STARTING", "RECORDING", "STOPPING", "COMPLETE", "ERROR")
+RECORDING_STATES = (
+    "IDLE",
+    "STARTING",
+    "RECORDING",
+    "STOPPING",
+    "COMPLETE",
+    "COMPLETE — NON-FORMAL",
+    "ERROR",
+)
 _SAFE_RUN_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 _ACTIVE_ROOT_LOCKS: set[str] = set()
+_ROOT_LOCK_MUTEX = threading.RLock()
 
 
 def mode_value(label: str) -> str:
@@ -121,6 +133,27 @@ def _send_group_signal(process, sig) -> None:
             pass
 
 
+def _wait_and_reap(process, timeout_s: float) -> bool:
+    """Bounded wait that also works with lightweight fake processes in tests."""
+    if process is None:
+        return True
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        if process.poll() is not None:
+            try:
+                process.wait(timeout=0)
+            except (AttributeError, OSError, subprocess.TimeoutExpired):
+                pass
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return process.poll() is not None
+        try:
+            process.wait(timeout=min(0.05, remaining))
+        except (AttributeError, OSError, subprocess.TimeoutExpired):
+            time.sleep(min(0.02, remaining))
+
+
 class RecordingSessionController(QObject):
     """Own one operator_recorder process without blocking the Qt thread."""
 
@@ -157,6 +190,11 @@ class RecordingSessionController(QObject):
         self._stop_deadline = None
         self._lock_key = None
         self._lock_file = None
+        self._state_lock = threading.RLock()
+        self._shutdown_thread = None
+        self._shutdown_complete = threading.Event()
+        self._shutdown_complete.set()
+        self._readiness = None
 
     @property
     def state(self) -> str:
@@ -174,50 +212,62 @@ class RecordingSessionController(QObject):
     def active(self) -> bool:
         return self._process is not None and self._state in {"STARTING", "RECORDING", "STOPPING"}
 
+    @property
+    def shutdown_complete(self) -> bool:
+        return self._shutdown_complete.is_set()
+
+    def set_readiness(self, readiness) -> None:
+        """Store the immutable readiness snapshot used at process start."""
+        self._readiness = readiness
+
     def _set_state(self, state: str) -> None:
         self._state = str(state)
         self.state_changed.emit(self._state)
 
     def _release_lock(self) -> None:
-        if self._lock_key is not None:
-            _ACTIVE_ROOT_LOCKS.discard(self._lock_key)
+        with _ROOT_LOCK_MUTEX:
+            lock_key = self._lock_key
+            lock_file = self._lock_file
             self._lock_key = None
-        if self._lock_file is not None:
+            self._lock_file = None
+            if lock_key is not None:
+                _ACTIVE_ROOT_LOCKS.discard(lock_key)
+        if lock_file is not None:
             try:
                 import fcntl
 
-                fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             except (ImportError, OSError):
                 pass
             try:
-                self._lock_file.close()
+                lock_file.close()
             except OSError:
                 pass
-            self._lock_file = None
 
     def _acquire_lock(self, root: Path) -> bool:
         key = str(root.resolve())
-        if key in _ACTIVE_ROOT_LOCKS:
-            return False
-        root.mkdir(parents=True, exist_ok=True)
-        lock_path = root / ".operator_recording.lock"
-        try:
-            lock_file = lock_path.open("a+", encoding="utf-8")
-            try:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except ImportError:
-                pass
-            except OSError:
-                lock_file.close()
+        with _ROOT_LOCK_MUTEX:
+            if key in _ACTIVE_ROOT_LOCKS:
                 return False
-        except OSError:
-            return False
-        _ACTIVE_ROOT_LOCKS.add(key)
-        self._lock_key = key
-        self._lock_file = lock_file
-        return True
+            root.mkdir(parents=True, exist_ok=True)
+            lock_path = root / ".operator_recording.lock"
+            try:
+                lock_file = lock_path.open("a+", encoding="utf-8")
+                try:
+                    import fcntl
+
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except ImportError:
+                    pass
+                except OSError:
+                    lock_file.close()
+                    return False
+            except OSError:
+                return False
+            _ACTIVE_ROOT_LOCKS.add(key)
+            self._lock_key = key
+            self._lock_file = lock_file
+            return True
 
     def start(self, *, mode: str, run_name: str, save_root: str | os.PathLike[str]) -> bool:
         if self.active:
@@ -249,6 +299,14 @@ class RecordingSessionController(QObject):
             self._set_state("ERROR")
             self.error.emit(f"Recording output directory failed: {exc}")
             return False
+        if self._readiness is not None:
+            try:
+                (output_path / "readiness_at_start.json").write_text(
+                    json.dumps(self._readiness.as_dict(), indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                self.event_message.emit(f"readiness snapshot write failed: {exc}")
         command = self._command_builder(
             python_executable=os.environ.get("OPERATOR_RECORDER_PYTHON", sys.executable),
             mode=mode,
@@ -317,35 +375,122 @@ class RecordingSessionController(QObject):
             _send_group_signal(process, signal.SIGKILL)
             self.event_message.emit("recording stop escalation: SIGKILL")
 
+        elif self._stop_stage == "SIGKILL":
+            # A killed child must still be reaped before the output root lock
+            # is released. Keep this final check bounded for the Qt timer.
+            if _wait_and_reap(process, 0.2):
+                self._finish(process.poll() if process.poll() is not None else -signal.SIGKILL)
+
+    def report_eligibility_violation(self, reasons):
+        """Persist a mid-run readiness violation for recorder finalization."""
+        output = self._output_path
+        if output is None:
+            return
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        event = {
+            "time_monotonic_s": time.monotonic(),
+            "type": "eligibility_violation",
+            "reasons": [str(reason) for reason in (reasons or [])],
+        }
+        try:
+            with (output / "eligibility_events.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+        except OSError as exc:
+            self.event_message.emit(f"eligibility event write failed: {exc}")
+        self.event_message.emit("formal eligibility violation: " + "; ".join(event["reasons"]))
+
+    def _manifest_result(self, output):
+        if output is None:
+            return None
+        path = Path(output) / "manifest.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def _finish(self, return_code) -> None:
+        if self._process is None:
+            return
         output = self._output_path
         was_stopping = self._state == "STOPPING"
-        self._timer.stop()
+        if threading.current_thread() is threading.main_thread():
+            self._timer.stop()
         self._process = None
         self._release_lock()
-        if return_code == 0 and was_stopping:
-            self._set_state("COMPLETE")
-            self.event_message.emit(f"recording complete: {output or 'output unavailable'}")
-        elif return_code == 0 and self._state == "RECORDING":
-            self._set_state("COMPLETE")
-            self.event_message.emit(f"recording exited cleanly: {output or 'output unavailable'}")
+        manifest = self._manifest_result(output)
+        artifact_ok = manifest is not None and manifest.get("artifact_integrity") is True
+        recording_state = manifest.get("recording_state") if manifest else None
+        formal = manifest is not None and manifest.get("formal_experiment_eligible") is True
+        if return_code == 0 and artifact_ok and recording_state == "complete" and was_stopping:
+            self._set_state("COMPLETE" if formal else "COMPLETE — NON-FORMAL")
+            self.event_message.emit(
+                f"recording {'complete' if formal else 'complete — non-formal'}: {output or 'output unavailable'}"
+            )
+        elif return_code == 0 and artifact_ok and recording_state == "complete" and self._state == "RECORDING":
+            self._set_state("COMPLETE" if formal else "COMPLETE — NON-FORMAL")
+            self.event_message.emit(
+                f"recording {'exited cleanly' if formal else 'exited non-formal'}: {output or 'output unavailable'}"
+            )
         else:
             self._set_state("ERROR")
-            self.error.emit(f"Recorder exited with code {return_code}")
-            self.event_message.emit(f"recording error: return code {return_code}")
+            if return_code != 0:
+                message = f"Recorder exited with code {return_code}"
+            elif manifest is None:
+                message = "Recorder exited without a readable manifest"
+            else:
+                message = "Recorder artifact integrity failed"
+            self.error.emit(message)
+            self.event_message.emit(f"recording error: {message}")
         self._mode = None
         self._started_monotonic = None
         self._stop_stage = None
         self._stop_deadline = None
 
     def shutdown(self) -> None:
-        if self.active:
-            self.stop()
-            # Do not wait here: shutdown_plugin must leave the Qt event loop
-            # responsive. The polling timer continues while Qt tears down.
-        else:
+        process = self._process
+        if process is None:
             self._timer.stop()
             self._release_lock()
+            self._shutdown_complete.set()
+            return
+        if self._shutdown_thread is not None and self._shutdown_thread.is_alive():
+            return
+        self._shutdown_complete.clear()
+        self._timer.stop()
+        self._set_state("STOPPING")
+        self._stop_stage = "SIGINT"
+        self.event_message.emit("recording shutdown: SIGINT")
+
+        def cleanup():
+            try:
+                for stage, sig, timeout in (
+                    ("SIGINT", signal.SIGINT, self._stop_timeout_s),
+                    ("SIGTERM", signal.SIGTERM, self._terminate_timeout_s),
+                    ("SIGKILL", signal.SIGKILL, self._terminate_timeout_s),
+                ):
+                    if process.poll() is not None:
+                        break
+                    if stage != "SIGINT":
+                        self.event_message.emit(f"recording shutdown escalation: {stage}")
+                    _send_group_signal(process, sig)
+                    if _wait_and_reap(process, timeout):
+                        break
+                if process.poll() is None:
+                    try:
+                        process.wait(timeout=0.2)
+                    except (AttributeError, OSError, subprocess.TimeoutExpired):
+                        pass
+                return_code = process.poll()
+                if return_code is None:
+                    return_code = -signal.SIGKILL
+                self._finish(return_code)
+            finally:
+                self._shutdown_complete.set()
+
+        self._shutdown_thread = threading.Thread(target=cleanup, name="recording-shutdown", daemon=False)
+        self._shutdown_thread.start()
 
 
 class RecordingControlWidget(QWidget):
@@ -356,6 +501,7 @@ class RecordingControlWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.controller = RecordingSessionController(self)
+        self._readiness = None
         self.mode_combo = QComboBox()
         for label, value in MODE_OPTIONS:
             self.mode_combo.addItem(label, value)
@@ -366,11 +512,14 @@ class RecordingControlWidget(QWidget):
         self.start_button = QPushButton("Start Recording")
         self.stop_button = QPushButton("Stop")
         self.state_label = QLabel("IDLE")
+        self.readiness_label = QLabel("Readiness: BLOCKED — unavailable")
+        self.readiness_label.setWordWrap(True)
+        self.readiness_label.setToolTip("Recording readiness has not been provided")
         self.elapsed_label = QLabel("0.0 s")
         self.output_label = QLabel("—")
         self.output_label.setWordWrap(True)
         self.output_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.start_button.setEnabled(True)
+        self.start_button.setEnabled(False)
         self.stop_button.setEnabled(False)
 
         layout = QVBoxLayout(self)
@@ -388,6 +537,7 @@ class RecordingControlWidget(QWidget):
         row.addWidget(self.stop_button)
         row.addWidget(QLabel("State"))
         row.addWidget(self.state_label)
+        row.addWidget(self.readiness_label, 2)
         row.addWidget(QLabel("Elapsed"))
         row.addWidget(self.elapsed_label)
         layout.addLayout(row)
@@ -398,6 +548,7 @@ class RecordingControlWidget(QWidget):
 
         self.browse_button.clicked.connect(self._browse)
         self.start_button.clicked.connect(self._start)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
         self.stop_button.clicked.connect(self.controller.stop)
         self.controller.state_changed.connect(self._state_changed)
         self.controller.elapsed_changed.connect(self.elapsed_label.setText)
@@ -418,7 +569,10 @@ class RecordingControlWidget(QWidget):
 
     def _start(self):
         mode = str(self.mode_combo.currentData() or "full")
-        self.controller.start(
+        if self._readiness is not None and not self._mode_start_allowed(mode):
+            self.recording_event.emit("recording start blocked: " + "; ".join(self._readiness.reasons))
+            return False
+        return self.controller.start(
             mode=mode,
             run_name=sanitize_run_name(self.run_name_edit.text()),
             save_root=self.save_root_edit.text().strip() or default_record_root(),
@@ -429,7 +583,7 @@ class RecordingControlWidget(QWidget):
         active = state in {"STARTING", "RECORDING", "STOPPING"}
         for widget in (self.mode_combo, self.run_name_edit, self.save_root_edit, self.browse_button):
             widget.setEnabled(not active)
-        self.start_button.setEnabled(state in {"IDLE", "COMPLETE", "ERROR"})
+        self._refresh_start_enabled()
         self.stop_button.setEnabled(state in {"STARTING", "RECORDING", "STOPPING"})
 
     def _error(self, message: str):
@@ -444,6 +598,56 @@ class RecordingControlWidget(QWidget):
         self.run_name_edit.setEnabled(False)
         self.save_root_edit.setEnabled(False)
         self.browse_button.setEnabled(False)
+
+    def _mode_start_allowed(self, mode=None):
+        mode = str(mode or self.mode_combo.currentData() or "full")
+        if mode == "debug":
+            return True
+        return self._readiness is not None and bool(self._readiness.start_allowed)
+
+    def _mode_changed(self, *_args):
+        """Never reuse a readiness result computed for a different mode."""
+        if str(self.mode_combo.currentData() or "full") == "debug":
+            self._readiness = RecordingReadiness(True, False, ("DEBUG — NON-FORMAL",))
+            self.controller.set_readiness(self._readiness)
+            self.readiness_label.setText("Readiness: DEBUG — NON-FORMAL")
+            self.readiness_label.setToolTip("Debug/Reprocess is always non-formal")
+        else:
+            self._readiness = None
+            self.controller.set_readiness(None)
+            self.readiness_label.setText("Readiness: BLOCKED — unavailable")
+            self.readiness_label.setToolTip("Recording readiness has not been provided for this mode")
+        self._refresh_start_enabled()
+
+    def _refresh_start_enabled(self, *_args):
+        state_allowed = self.controller.state in {"IDLE", "COMPLETE", "COMPLETE — NON-FORMAL", "ERROR"}
+        self.start_button.setEnabled(state_allowed and self._mode_start_allowed())
+
+    def set_readiness(self, readiness):
+        """Apply the pure readiness result and expose reasons in the UI."""
+        previous = self._readiness
+        self._readiness = readiness
+        self.controller.set_readiness(readiness)
+        if readiness is None:
+            self.readiness_label.setText("Readiness: BLOCKED — unavailable")
+            self.readiness_label.setToolTip("Recording readiness has not been provided")
+        elif readiness.start_allowed:
+            text = "Readiness: READY"
+            if not readiness.formal_eligible:
+                text = "Readiness: DEBUG — NON-FORMAL"
+            self.readiness_label.setText(text)
+            self.readiness_label.setToolTip("\n".join(readiness.reasons))
+        else:
+            self.readiness_label.setText("Readiness: BLOCKED — " + "; ".join(readiness.reasons))
+            self.readiness_label.setToolTip("\n".join(readiness.reasons))
+            if (
+                previous is not None
+                and previous.formal_eligible
+                and not readiness.formal_eligible
+                and self.controller.active
+            ):
+                self.controller.report_eligibility_violation(readiness.reasons)
+        self._refresh_start_enabled()
 
     def shutdown(self):
         self.controller.shutdown()
