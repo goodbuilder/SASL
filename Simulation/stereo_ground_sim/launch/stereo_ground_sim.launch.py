@@ -11,6 +11,13 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
+from stereo_ground_sim.attitude_error_model import (
+    CameraAttitudeErrorDeg,
+    StereoAttitudeErrorConfig,
+)
+from stereo_ground_sim.gazebo_camera_attitude_adapter import (
+    gazebo_stereo_model_rotations_from_attitude_errors,
+)
 
 
 def _float_config(context, name):
@@ -23,6 +30,10 @@ def _int_config(context, name):
 
 def _bool_config(context, name):
     return LaunchConfiguration(name).perform(context).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _zero_small_angle(value):
+    return 0.0 if abs(value) < 5.0e-15 else value
 
 
 def _param_yaml_value(value):
@@ -292,25 +303,64 @@ def _generate_world(context, generated_world_path=None):
     target_spawn_y_m = _float_config(context, "target_spawn_y_m")
     target_spawn_z_m = _float_config(context, "target_spawn_z_m")
     target_spawn_yaw_deg = _float_config(context, "target_spawn_yaw_deg")
-    left_roll = math.radians(_float_config(context, "left_roll_error_deg"))
-    left_pitch = math.radians(_float_config(context, "left_pitch_error_deg"))
-    left_yaw = math.radians(_float_config(context, "left_yaw_error_deg"))
-    right_roll = math.radians(_float_config(context, "right_roll_error_deg"))
-    right_pitch = math.radians(_float_config(context, "right_pitch_error_deg"))
-    right_yaw = math.radians(_float_config(context, "right_yaw_error_deg"))
+    left_error = CameraAttitudeErrorDeg(
+        roll_deg=_float_config(context, "left_roll_error_deg"),
+        pitch_deg=_float_config(context, "left_pitch_error_deg"),
+        yaw_deg=_float_config(context, "left_yaw_error_deg"),
+    )
+    right_error = CameraAttitudeErrorDeg(
+        roll_deg=_float_config(context, "right_roll_error_deg"),
+        pitch_deg=_float_config(context, "right_pitch_error_deg"),
+        yaw_deg=_float_config(context, "right_yaw_error_deg"),
+    )
+    rotations = gazebo_stereo_model_rotations_from_attitude_errors(
+        StereoAttitudeErrorConfig(
+            left=left_error,
+            right=right_error,
+        )
+    )
 
-    camera_yaw = math.pi / 2.0
+    left_sdf_rpy = rotations.left.sdf_rpy
+    if not left_sdf_rpy.valid or left_sdf_rpy.status != "ok" or left_sdf_rpy.rpy_rad is None:
+        raise RuntimeError(
+            "left Gazebo camera SDF RPY unavailable: "
+            f"{left_sdf_rpy.status}; full rotation adapter result cannot "
+            "be serialized through the current legacy SDF RPY boundary"
+        )
+    right_sdf_rpy = rotations.right.sdf_rpy
+    if not right_sdf_rpy.valid or right_sdf_rpy.status != "ok" or right_sdf_rpy.rpy_rad is None:
+        raise RuntimeError(
+            "right Gazebo camera SDF RPY unavailable: "
+            f"{right_sdf_rpy.status}; full rotation adapter result cannot "
+            "be serialized through the current legacy SDF RPY boundary"
+        )
+
+    left_roll, left_pitch, left_yaw = (
+        _zero_small_angle(value) for value in left_sdf_rpy.rpy_rad
+    )
+    right_roll, right_pitch, right_yaw = (
+        _zero_small_angle(value) for value in right_sdf_rpy.rpy_rad
+    )
     left_pose = (
         f"{-baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{left_roll:.9f} {left_pitch:.9f} {camera_yaw + left_yaw:.9f}"
+        f"{left_roll:.12f} {left_pitch:.12f} {left_yaw:.12f}"
     )
     right_pose = (
         f"{baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{right_roll:.9f} {right_pitch:.9f} {camera_yaw + right_yaw:.9f}"
+        f"{right_roll:.12f} {right_pitch:.12f} {right_yaw:.12f}"
     )
 
-    world = world.replace("<pose>-12.5 0 5.0 0 0 1.570796327</pose>", f"<pose>{left_pose}</pose>", 1)
-    world = world.replace("<pose>12.5 0 5.0 0 0 1.570796327</pose>", f"<pose>{right_pose}</pose>", 1)
+    left_source_pose = "<pose>-12.5 0 5.0 0 0 1.570796327</pose>"
+    right_source_pose = "<pose>12.5 0 5.0 0 0 1.570796327</pose>"
+    for side, source_pose in (("left", left_source_pose), ("right", right_source_pose)):
+        count = world.count(source_pose)
+        if count != 1:
+            raise RuntimeError(
+                f"Expected exactly one {side} source camera pose token "
+                f"{source_pose!r}; found {count}"
+            )
+    world = world.replace(left_source_pose, f"<pose>{left_pose}</pose>", 1)
+    world = world.replace(right_source_pose, f"<pose>{right_pose}</pose>", 1)
     for fov_value in ("1.0471975512", "0.154997710698"):
         world = world.replace(
             f"<horizontal_fov>{fov_value}</horizontal_fov>",

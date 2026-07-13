@@ -50,7 +50,17 @@ from stereo_ground_sim.gazebo_oracle import make_gazebo_world_to_baseline_transf
 from stereo_ground_sim.stereo_triangulation_adapter import pinhole_intrinsics_from_horizontal_fov
 
 
-BASE_COMMIT = "8d24008acd9e61c641963d7cf08682cfaae1b8e1"
+BASE_COMMIT = "981ecba84d8f20493f9dc48d87adcb9f5a8e5ef9"
+PRE_ADAPTER_EVIDENCE_REFERENCE = "/tmp/sasl-phase3c-a-standard-review-fix"
+ROLL_OBSERVABILITY_MARKER = "right_positive"
+ATTITUDE_SEMANTICS_CRITERIA = {
+    "single_axis_required_total": 12,
+    "single_axis_differential_median_px": 0.25,
+    "single_axis_differential_max_px": 0.75,
+    "composite_differential_median_px": 0.5,
+    "composite_differential_max_px": 1.0,
+    "centroid_stddev_max_px": 0.1,
+}
 WORLD_NAME = "stereo_ground_drone"
 MARKER_MODEL_NAME = "phase3c_equivalence_marker"
 WIDTH_PX = 1280
@@ -195,7 +205,8 @@ def standard_cases() -> list[AttitudeCase]:
                 error = CameraAttitudeErrorDeg(values["roll"], values["pitch"], values["yaw"])
                 left = error if side == "left" else zero
                 right = error if side == "right" else zero
-                cases.append(AttitudeCase(f"{side}_{axis}_{label}", left, right, center))
+                marker_names = (ROLL_OBSERVABILITY_MARKER,) if axis == "roll" else center
+                cases.append(AttitudeCase(f"{side}_{axis}_{label}", left, right, marker_names))
     cases.append(AttitudeCase("common_yaw_positive", CameraAttitudeErrorDeg(0.0, 0.0, 0.1), CameraAttitudeErrorDeg(0.0, 0.0, 0.1), center))
     cases.append(AttitudeCase("relative_yaw_symmetric", CameraAttitudeErrorDeg(0.0, 0.0, -0.1), CameraAttitudeErrorDeg(0.0, 0.0, 0.1), center))
     cases.append(
@@ -567,6 +578,42 @@ def determine_verdict(summary: dict[str, Any]) -> str:
         and sign.get("matched") == sign.get("total") == 12
     )
     return "equivalent" if equivalent else "not_equivalent"
+
+
+def determine_attitude_semantics_verdict(summary: dict[str, Any]) -> str:
+    """Judge attitude movement semantics independently of absolute alignment."""
+
+    if not summary.get("infrastructure_valid", False):
+        return "inconclusive"
+
+    sign = summary.get("single_axis_sign_agreement", {})
+    required_total = ATTITUDE_SEMANTICS_CRITERIA["single_axis_required_total"]
+    if sign.get("total") != required_total or (sign.get("evaluable") or 0) < required_total:
+        return "inconclusive"
+
+    differential = summary.get("differential_residual_summary", {})
+    composite = summary.get("composite_differential_residual_summary", {})
+    centroid = summary.get("centroid_stddev_summary", {})
+    required_summary_values = (
+        differential.get("median"),
+        differential.get("max"),
+        composite.get("median"),
+        composite.get("max"),
+        centroid.get("max"),
+        sign.get("matched"),
+    )
+    if any(value is None for value in required_summary_values):
+        return "inconclusive"
+
+    semantics_aligned = (
+        sign.get("matched") == required_total
+        and differential["median"] <= ATTITUDE_SEMANTICS_CRITERIA["single_axis_differential_median_px"]
+        and differential["max"] <= ATTITUDE_SEMANTICS_CRITERIA["single_axis_differential_max_px"]
+        and composite["median"] <= ATTITUDE_SEMANTICS_CRITERIA["composite_differential_median_px"]
+        and composite["max"] <= ATTITUDE_SEMANTICS_CRITERIA["composite_differential_max_px"]
+        and centroid["max"] <= ATTITUDE_SEMANTICS_CRITERIA["centroid_stddev_max_px"]
+    )
+    return "aligned" if semantics_aligned else "not_aligned"
 
 
 def classify_mismatches(summary: dict[str, Any]) -> list[str]:
@@ -1370,6 +1417,10 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
         "camera_info_validation": camera_info_validation["sides"],
         "camera_info_intrinsic_delta": camera_info_validation["camera_info_intrinsic_delta"],
         "case_log_paths": case_log_paths,
+        "roll_observability_marker": ROLL_OBSERVABILITY_MARKER,
+        "pre_adapter_evidence_reference": PRE_ADAPTER_EVIDENCE_REFERENCE,
+        "pre_adapter_evidence_available": Path(PRE_ADAPTER_EVIDENCE_REFERENCE).exists(),
+        "attitude_semantics_criteria": dict(ATTITUDE_SEMANTICS_CRITERIA),
         "current_mapping_hypothesis": {
             "R_M_C_ZERO_CANDIDATE": R_M_C_ZERO_CANDIDATE,
             "roll_sdf_error": "+roll_camera_error",
@@ -1380,6 +1431,7 @@ def summarize_runtime_results(results: list[dict[str, Any]], output_dir: Path, m
         "gazebo_sdf_equivalence_verified": False,
     }
     summary["equivalence_verdict"] = determine_verdict(summary)
+    summary["attitude_semantics_verdict"] = determine_attitude_semantics_verdict(summary)
     summary["mismatch_classifications"] = classify_mismatches(summary)
     write_json(output_dir / "summary.json", summary)
     return summary
@@ -1432,7 +1484,10 @@ def main(argv: list[str] | None = None) -> int:
         all_results.extend(run_case(case, args, output_dir, package_share))
     summary = summarize_runtime_results(all_results, output_dir, args.case_matrix, thresholds)
     print(json.dumps(json_safe(summary), ensure_ascii=False, sort_keys=True, allow_nan=False))
-    return 2 if summary["equivalence_verdict"] == "inconclusive" else 0
+    return 2 if (
+        summary["equivalence_verdict"] == "inconclusive"
+        or summary["attitude_semantics_verdict"] == "inconclusive"
+    ) else 0
 
 
 if __name__ == "__main__":

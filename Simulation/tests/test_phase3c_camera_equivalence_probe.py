@@ -144,6 +144,23 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
                 self.assertGreaterEqual(projection[side]["v_px"], 0.0)
                 self.assertLess(projection[side]["v_px"], probe.HEIGHT_PX)
 
+    def test_standard_cases_use_right_positive_for_roll_observability(self) -> None:
+        cases = probe.standard_cases()
+        self.assertEqual(cases[0].name, "zero")
+        self.assertIn("right_positive", cases[0].marker_names)
+        single_axis = [
+            case
+            for case in cases
+            if case.name.startswith(("left_", "right_"))
+            and case.name.endswith(("_positive", "_negative"))
+        ]
+        self.assertEqual(len(single_axis), 12)
+        for case in single_axis:
+            if "_roll_" in case.name:
+                self.assertEqual(case.marker_names, ("right_positive",))
+            else:
+                self.assertEqual(case.marker_names, ("center",))
+
     def test_known_sensitivity_reference_is_preserved(self) -> None:
         zero = probe.AttitudeCase(
             "zero",
@@ -384,24 +401,78 @@ class Phase3CCameraEquivalenceProbeTests(unittest.TestCase):
         bad["infrastructure_valid"] = False
         self.assertEqual(probe.determine_verdict(bad), "inconclusive")
 
+    def test_attitude_semantics_verdict_is_separate_from_absolute_equivalence(self) -> None:
+        complete = {
+            "infrastructure_valid": True,
+            "single_axis_sign_agreement": {"matched": 12, "total": 12, "evaluable": 12},
+            "differential_residual_summary": {"median": 0.20, "max": 0.70},
+            "composite_differential_residual_summary": {"median": 0.40, "max": 0.90},
+            "centroid_stddev_summary": {"max": 0.09},
+            "absolute_residual_summary": {"median": 0.80, "max": 0.90},
+        }
+        self.assertEqual(probe.determine_attitude_semantics_verdict(complete), "aligned")
+        self.assertEqual(
+            probe.determine_verdict({
+                **complete,
+                "pose_coverage_rate": 1.0,
+                "marker_detection_success_rate": 0.99,
+                "required_case_coverage_rate": 1.0,
+            }),
+            "not_equivalent",
+        )
+
+        direction_mismatch = {
+            **complete,
+            "single_axis_sign_agreement": {"matched": 11, "total": 12, "evaluable": 12},
+        }
+        self.assertEqual(probe.determine_attitude_semantics_verdict(direction_mismatch), "not_aligned")
+
+        nine_evaluable = {
+            **complete,
+            "single_axis_sign_agreement": {"matched": 9, "total": 12, "evaluable": 9},
+        }
+        self.assertEqual(probe.determine_attitude_semantics_verdict(nine_evaluable), "inconclusive")
+
+        invalid_infrastructure = {**complete, "infrastructure_valid": False}
+        self.assertEqual(probe.determine_attitude_semantics_verdict(invalid_infrastructure), "inconclusive")
+
+        differential_failure = {
+            **complete,
+            "differential_residual_summary": {"median": 0.20, "max": 0.80},
+        }
+        self.assertEqual(probe.determine_attitude_semantics_verdict(differential_failure), "not_aligned")
+
+        missing_composite = {
+            **complete,
+            "composite_differential_residual_summary": {"median": None, "max": None},
+        }
+        self.assertEqual(probe.determine_attitude_semantics_verdict(missing_composite), "inconclusive")
+
     def test_summary_uses_frame_detection_pose_camera_info_and_required_case_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             self.write_camera_info(root)
             results = [self.make_result(case="zero", marker=name) for name in probe.MARKER_POINTS_BASELINE_FRD_M]
             for case in probe.standard_cases()[1:]:
+                marker = case.marker_names[0]
                 if case.name.startswith("left_") and case.name.endswith(("_positive", "_negative")):
-                    results.append(self.make_result(case=case.name, marker="center", left_shift=(1.0, 0.0), analytic_left_shift=(1.0, 0.0)))
+                    results.append(self.make_result(case=case.name, marker=marker, left_shift=(1.0, 0.0), analytic_left_shift=(1.0, 0.0)))
                 elif case.name.startswith("right_") and case.name.endswith(("_positive", "_negative")):
-                    results.append(self.make_result(case=case.name, marker="center", right_shift=(1.0, 0.0), analytic_right_shift=(1.0, 0.0)))
+                    results.append(self.make_result(case=case.name, marker=marker, right_shift=(1.0, 0.0), analytic_right_shift=(1.0, 0.0)))
                 else:
-                    results.append(self.make_result(case=case.name, marker="center"))
+                    results.append(self.make_result(case=case.name, marker=marker))
             summary = probe.summarize_runtime_results(results, root, "standard", {"marker_detection_success_min": 0.95})
             self.assertEqual(summary["pose_coverage_rate"], 1.0)
             self.assertEqual(summary["required_case_coverage_rate"], 1.0)
             self.assertEqual(summary["marker_detection_success_rate"], 1.0)
             self.assertTrue(summary["camera_info_valid"])
             self.assertTrue(summary["infrastructure_valid"])
+            self.assertEqual(summary["base_commit"], "981ecba84d8f20493f9dc48d87adcb9f5a8e5ef9")
+            self.assertEqual(summary["roll_observability_marker"], "right_positive")
+            self.assertIsInstance(summary["pre_adapter_evidence_available"], bool)
+            self.assertEqual(summary["pre_adapter_evidence_reference"], "/tmp/sasl-phase3c-a-standard-review-fix")
+            self.assertFalse(summary["gazebo_sdf_equivalence_verified"])
+            self.assertEqual(summary["attitude_semantics_verdict"], "aligned")
 
             root2 = Path(tmpdir) / "bad"
             root2.mkdir()
