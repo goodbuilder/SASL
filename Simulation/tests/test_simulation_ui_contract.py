@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT / "stereo_ground_sim"))
 from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
     UNSYNCHRONIZED,
     corrected_measurement_state,
+    detection_display_state,
     disparity_difference_px,
     fallback_transition,
     intersection_angle_deg,
@@ -48,6 +49,47 @@ class SimulationUiContractTests(unittest.TestCase):
             corrected_measurement_state("valid", {"fallback_level": 0}),
             "VALID",
         )
+        self.assertEqual(
+            corrected_measurement_state("invalid", {"profile_mode": "no_profile"}),
+            "NOT CONFIGURED",
+        )
+        for profile_mode in ("", "none", "disabled", "unavailable"):
+            with self.subTest(profile_mode=profile_mode):
+                self.assertEqual(
+                    corrected_measurement_state("invalid", {"profile_mode": profile_mode}),
+                    "NOT CONFIGURED",
+                )
+
+    def test_detection_state_uses_bbox_validity_before_center_fallback(self):
+        self.assertEqual(
+            detection_display_state(
+                {"bbox_left_valid": True, "bbox_left_u_px": None, "bbox_left_v_px": None},
+                "left",
+            ),
+            "VALID",
+        )
+        self.assertEqual(
+            detection_display_state(
+                {"bbox_right_valid": False, "bbox_right_u_px": 1.0, "bbox_right_v_px": 2.0},
+                "right",
+            ),
+            "INVALID",
+        )
+        self.assertEqual(
+            detection_display_state(
+                {"bbox_left_u_px": 1.0, "bbox_left_v_px": 2.0},
+                "left",
+            ),
+            "VALID",
+        )
+        self.assertEqual(
+            detection_display_state(
+                {"bbox_left_u_px": math.nan, "bbox_left_v_px": 2.0},
+                "left",
+            ),
+            "INVALID",
+        )
+        self.assertEqual(detection_display_state({}, "left"), "WAITING")
     def test_sources_are_distinct_and_plot_append_is_source_local(self):
         self.assertEqual(plot_series_for_source("observed_raw"), "observed_raw")
         self.assertEqual(plot_series_for_source("analytic_raw"), "analytic_raw")

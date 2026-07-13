@@ -66,6 +66,13 @@ EXPECTED_FLIGHT_CONTRACT = {
     "actual_distance_source": "gazebo",
 }
 FLIGHT_CONTRACT_SOURCE = "stereo_distance_node_parameters"
+PROFILE_NOT_CONFIGURED_VALUES = {
+    "",
+    "no_profile",
+    "none",
+    "disabled",
+    "unavailable",
+}
 
 
 def finite_float(value):
@@ -105,11 +112,39 @@ def _profile_is_configured(profile_status):
     profile_mode = str(profile_status.get("profile_mode") or "").strip().lower()
     reason = str(profile_status.get("fallback_reason") or "").strip().lower()
     fallback_level = finite_float(profile_status.get("fallback_level"))
+    if (
+        ("profile_id" in profile_status and profile_id in PROFILE_NOT_CONFIGURED_VALUES)
+        or ("profile_mode" in profile_status and profile_mode in PROFILE_NOT_CONFIGURED_VALUES)
+    ):
+        return False
+    if reason and (reason in PROFILE_NOT_CONFIGURED_VALUES or reason == "init"):
+        return False
     if profile_id or profile_mode:
         return True
     if fallback_level is not None and fallback_level < 3:
         return True
-    return bool(reason and reason not in {"no_profile", "init", "unavailable"})
+    return bool(reason)
+
+
+def detection_display_state(observation_status, side) -> str:
+    """Classify detector validity independently from camera stream freshness.
+
+    ``stereo_distance_node`` publishes ``bbox_<side>_valid`` as the primary
+    detector contract. Older or partial payloads may omit that field, so the
+    finite bbox center is used only as a local fallback. A missing payload or
+    missing center remains WAITING rather than being presented as valid.
+    """
+    if not isinstance(observation_status, dict) or side not in {"left", "right"}:
+        return "WAITING"
+    prefix = f"bbox_{side}"
+    validity = observation_status.get(f"{prefix}_valid")
+    if isinstance(validity, bool):
+        return "VALID" if validity else "INVALID"
+    center_keys = (f"{prefix}_u_px", f"{prefix}_v_px")
+    center_present = any(key in observation_status for key in center_keys)
+    if all(finite_float(observation_status.get(key)) is not None for key in center_keys):
+        return "VALID"
+    return "INVALID" if center_present else "WAITING"
 
 
 def corrected_measurement_state(corrected_source_state, profile_status) -> str:

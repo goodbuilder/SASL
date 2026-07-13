@@ -37,6 +37,7 @@ from stereo_ground_sim.simulation_ui_contract import (
     STALE_TIMEOUT_S,
     UNSYNCHRONIZED,
     corrected_measurement_state,
+    detection_display_state,
     disparity_difference_px,
     finite_float as contract_finite_float,
     fallback_transition,
@@ -331,8 +332,15 @@ class OperatorPanel(Plugin):
         image_layout.setSpacing(6)
         self._left_view = CameraView("LEFT DETECTION")
         self._right_view = CameraView("RIGHT DETECTION")
-        self._left_meta = _label("resolution: unavailable\nFPS: unavailable / target 20.0 Hz\nDetection WAITING\nObserved center: unavailable", size=9)
-        self._right_meta = _label("resolution: unavailable\nFPS: unavailable / target 20.0 Hz\nDetection WAITING\nObserved center: unavailable", size=9)
+        initial_image_meta = (
+            "Resolution unavailable\n"
+            "FPS 0.0 / 20.0 Hz\n"
+            "Stream WAITING\n"
+            "Detection WAITING\n"
+            "Center unavailable px"
+        )
+        self._left_meta = _label(initial_image_meta, size=9)
+        self._right_meta = _label(initial_image_meta, size=9)
         self._left_meta.setMinimumHeight(70)
         self._right_meta.setMinimumHeight(70)
         left_column, right_column = QVBoxLayout(), QVBoxLayout()
@@ -503,12 +511,19 @@ class OperatorPanel(Plugin):
         fps = 0.0
         if len(history) >= 2 and history[-1] > history[0]:
             fps = (len(history) - 1) / (history[-1] - history[0])
-        state = self._source_states.get(f"{name}_image", "waiting").upper()
+        stream_state = self._source_states.get(f"{name}_image", "waiting")
+        stream_label = {
+            "valid": "VALID",
+            "stale": "STALE",
+            "waiting": "WAITING",
+        }.get(stream_state, "WAITING")
+        detection_label = detection_display_state(observation, name)
         meta = (
-            f"resolution: {data.get('width', 'unavailable')}×{data.get('height', 'unavailable')}\n"
-            f"measured FPS: {fps:.1f} / target {TARGET_IMAGE_HZ:.1f} Hz\n"
-            f"Detection {state}\n"
-            f"Observed center: {observed_text} px"
+            f"Resolution {data.get('width', 'unavailable')}×{data.get('height', 'unavailable')}\n"
+            f"FPS {fps:.1f} / {TARGET_IMAGE_HZ:.1f} Hz\n"
+            f"Stream {stream_label}\n"
+            f"Detection {detection_label}\n"
+            f"Center {observed_text} px"
         )
         (self._left_meta if name == "left" else self._right_meta).setText(meta)
 
