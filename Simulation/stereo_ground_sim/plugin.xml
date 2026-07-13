@@ -1,7 +1,7 @@
 <library path="src">
   <class name="stereo_ground_sim/RecorderPanel" type="stereo_ground_sim.recorder_panel.RecorderPanel" base_class_type="rqt_gui_py::Plugin">
     <description>
-      A compact CSV, MP4, and debug rosbag recording panel for the stereo ground simulation operator view.
+      Shared user-controlled CSV, MP4, and debug rosbag recording controls for the Simulation research view.
     </description>
     <qtgui>
       <group>
@@ -16,7 +16,8 @@
   </class>
   <class name="stereo_ground_sim/OperatorPanel" type="stereo_ground_sim.operator_panel.OperatorPanel" base_class_type="rqt_gui_py::Plugin">
     <description>
-      A fixed-layout operator panel with left/right camera images on the left and FRD plots on the right.
+      A responsive research operator panel with left/right detection images, experiment condition,
+      FRD measurement, triangulation quality, diagnostics, and manual recording controls.
     </description>
     <qtgui>
       <group>
@@ -26,7 +27,7 @@
       </group>
       <label>Operator Panel</label>
       <icon type="theme">video-display</icon>
-      <statustip>Show stereo images and Forward/Right/Down trend plots in a fixed layout.</statustip>
+      <statustip>Show research measurements, quality, diagnostics, and receive-time Forward/Right/Down trends.</statustip>
     </qtgui>
   </class>
 </library>

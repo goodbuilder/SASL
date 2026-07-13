@@ -8,7 +8,10 @@ sys.path.insert(0, str(ROOT / "stereo_ground_sim"))
 
 from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
     UNSYNCHRONIZED,
+    corrected_measurement_state,
+    disparity_difference_px,
     fallback_transition,
+    intersection_angle_deg,
     plot_series_for_source,
     should_append_plot,
     source_state,
@@ -20,6 +23,31 @@ from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
 
 
 class SimulationUiContractTests(unittest.TestCase):
+    def test_disparity_difference_accepts_only_finite_numeric_values(self):
+        self.assertEqual(disparity_difference_px(12.5, 10.0), 2.5)
+        for invalid in (None, math.nan, math.inf, True, "12"):
+            with self.subTest(invalid=invalid):
+                self.assertIsNone(disparity_difference_px(invalid, 10.0))
+                self.assertIsNone(disparity_difference_px(10.0, invalid))
+
+    def test_intersection_angle_conversion_stays_at_display_boundary(self):
+        self.assertAlmostEqual(intersection_angle_deg(math.pi), 180.0)
+        self.assertIsNone(intersection_angle_deg("rad"))
+
+    def test_corrected_state_distinguishes_missing_profile_from_invalid_sample(self):
+        self.assertEqual(corrected_measurement_state("waiting", {}), "NOT CONFIGURED")
+        self.assertEqual(
+            corrected_measurement_state("invalid", {"profile_id": "yaw_005"}),
+            "INVALID",
+        )
+        self.assertEqual(
+            corrected_measurement_state("stale", {"profile_mode": "global_affine"}),
+            "STALE",
+        )
+        self.assertEqual(
+            corrected_measurement_state("valid", {"fallback_level": 0}),
+            "VALID",
+        )
     def test_sources_are_distinct_and_plot_append_is_source_local(self):
         self.assertEqual(plot_series_for_source("observed_raw"), "observed_raw")
         self.assertEqual(plot_series_for_source("analytic_raw"), "analytic_raw")

@@ -78,6 +78,53 @@ def finite_float(value):
     return value if math.isfinite(value) else None
 
 
+def disparity_difference_px(observed_disparity_px, analytic_disparity_px):
+    """Return observed minus analytic disparity only for finite numeric inputs."""
+    observed = finite_float(observed_disparity_px)
+    analytic = finite_float(analytic_disparity_px)
+    if observed is None or analytic is None:
+        return None
+    return observed - analytic
+
+
+def intersection_angle_deg(intersection_angle_rad):
+    """Convert the producer's radian ray angle at the display boundary."""
+    angle = finite_float(intersection_angle_rad)
+    return None if angle is None else math.degrees(angle)
+
+
+def _profile_is_configured(profile_status):
+    if isinstance(profile_status, str):
+        try:
+            profile_status = json.loads(profile_status)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+    if not isinstance(profile_status, dict):
+        return False
+    profile_id = str(profile_status.get("profile_id") or "").strip().lower()
+    profile_mode = str(profile_status.get("profile_mode") or "").strip().lower()
+    reason = str(profile_status.get("fallback_reason") or "").strip().lower()
+    fallback_level = finite_float(profile_status.get("fallback_level"))
+    if profile_id or profile_mode:
+        return True
+    if fallback_level is not None and fallback_level < 3:
+        return True
+    return bool(reason and reason not in {"no_profile", "init", "unavailable"})
+
+
+def corrected_measurement_state(corrected_source_state, profile_status) -> str:
+    """Classify corrected output without conflating missing profile with invalid data."""
+    if not _profile_is_configured(profile_status):
+        return "NOT CONFIGURED"
+    state = str(corrected_source_state or "waiting").strip().lower()
+    return {
+        "waiting": "WAITING",
+        "valid": "VALID",
+        "stale": "STALE",
+        "invalid": "INVALID",
+    }.get(state, "INVALID")
+
+
 def parse_px4_status(value):
     """Parse a PX4 status JSON value without inventing unavailable fields."""
     try:
@@ -282,6 +329,7 @@ def stale_marker_action(state):
 
 __all__ = [
     "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "PX4_STATUS_TOPIC", "PX4_PHASES", "TOP_BAR_FIELDS", "FLIGHT_CONTRACT_FIELDS", "EXPECTED_FLIGHT_CONTRACT", "FLIGHT_CONTRACT_SOURCE", "finite_float",
+    "disparity_difference_px", "intersection_angle_deg", "corrected_measurement_state",
     "source_valid", "source_state", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
     "plot_series_for_source", "should_append_plot", "stale_marker_action", "parse_px4_status", "px4_contract_state", "px4_overall_status", "mission_phase_display", "status_field", "format_status_vector", "format_receive_age",
 ]

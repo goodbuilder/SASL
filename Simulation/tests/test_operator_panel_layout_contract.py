@@ -16,14 +16,35 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
         source = PANEL.read_text(encoding="utf-8")
         tree = ast.parse(source)
         self.assertIn("QHBoxLayout", source)
-        for tab in ("Flight Timeline", "FRD", "Geometry", "Attitude", "Event Log"):
+        for tab in ("Live Trends", "Diagnostics", "Event Log"):
             self.assertIn(tab, source)
-        for field in ("truth", "raw", "corrected", "disparity", "vertical_disparity", "ray_gap", "intersection_angle"):
+        for field in (
+            "truth",
+            "raw",
+            "corrected",
+            "disparity",
+            "vertical_disparity",
+            "ray_gap",
+            "intersection_angle",
+        ):
             self.assertIn(field, source)
-        for label in ("Observed/BBox Raw", "Analytic Attitude Raw", "observed_disparity_px", "analytic_disparity_px"):
+        for label in (
+            "EXPERIMENT CONDITION",
+            "CURRENT MEASUREMENT — baseline_center_frd [m]",
+            "TRIANGULATION QUALITY",
+            "Observed/BBox Raw",
+            "Analytic Attitude Raw",
+            "observed_disparity_px",
+            "analytic_disparity_px",
+            "Difference Δd [px]",
+        ):
             self.assertIn(label, source)
-        for label in ("AUTHORITY", "GAZEBO MOTION", "PX4 CONNECTION", "MISSION PHASE", "PX4 LOCAL NED", "AUXILIARY, NOT GROUND TRUTH"):
+        for label in ("PX4 LOCAL NED", "AUXILIARY, NOT GROUND TRUTH"):
             self.assertIn(label, source)
+        self.assertNotIn('QGroupBox("FLIGHT AUTHORITY"', source)
+        self.assertNotIn('QGroupBox("PX4 FLIGHT STATE"', source)
+        self.assertNotIn("_top_status_labels", source)
+        self.assertNotIn("font-size: 8px", source)
         for source_name in ("ground_truth_range", "observed_disparity_px", "analytic_disparity_px", "pixels", "ray_quality"):
             self.assertIn(source_name, source)
         self.assertTrue(any(isinstance(node, ast.ClassDef) and node.name == "OperatorPanel" for node in ast.walk(tree)))
@@ -42,6 +63,11 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
         source = PANEL.read_text(encoding="utf-8")
         self.assertIn("self._bridge.plot.emit(key, value or [])", source)
         self.assertNotIn("for name, _topic in POSITION_TOPICS:\n            self._plot_stack.append", source)
+
+    def test_main_position_contract_has_no_receive_age_column(self):
+        source = PANEL.read_text(encoding="utf-8")
+        self.assertIn('headers = ("Source", "F", "R", "D", "Range", "State")', source)
+        self.assertNotIn('headers = ("Source", "F", "R", "D", "Range", "State", "Receive age")', source)
 
     def test_pure_numeric_helpers_reject_non_finite_values(self):
         sys.path.insert(0, str(ROOT / "stereo_ground_sim"))

@@ -360,7 +360,7 @@ the Bag plugin instead of the distance Plot plugin.
 
 Default launch choices for operator observation:
   - gz_gui:=true
-  - launch_rviz:=true
+  - launch_rviz:=false (use --rviz to enable)
   - launch_visualization_markers:=true
 
 The stereo experiment target is moved by QGroundControl after the PX4 SITL
@@ -445,7 +445,7 @@ Options:
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
   --gazebo-gui           Start Gazebo with its GUI (default).
   --no-gazebo-gui        Start the Gazebo server without its GUI.
-  --rviz                 Start RViz (default).
+  --rviz                 Start RViz explicitly.
   --no-rviz              Do not start RViz.
   --headless             Do not start Gazebo GUI or rqt_gui. Useful for automated
                          record-lite smoke runs.
@@ -473,12 +473,13 @@ start_px4=true
 show_detection_images=true
 headless=false
 gazebo_gui=true
-launch_rviz=true
+launch_rviz=false
 gui_option_seen=false
 headless_option_seen=false
 launch_input=()
 mission_args=()
 selected_yolo_model=""
+recording_managed_externally=0
 
 while (($#)); do
   case "$1" in
@@ -771,6 +772,10 @@ while (($#)); do
   esac
 done
 
+if [[ -n "$record_mode" ]]; then
+  recording_managed_externally=1
+fi
+
 if ! validate_px4_only_launch_args "${launch_input[@]}"; then
   exit 2
 fi
@@ -1033,7 +1038,7 @@ if ! has_launch_arg launch_rviz "${launch_input[@]}"; then
   elif [[ "$gui_option_seen" == true ]]; then
     launch_args+=("launch_rviz:=$launch_rviz")
   else
-    launch_args+=("launch_rviz:=true")
+    launch_args+=("launch_rviz:=false")
   fi
 fi
 if ! has_launch_arg launch_visualization_markers "${launch_input[@]}"; then
@@ -1111,12 +1116,12 @@ fi
 
 if [[ "$headless" != true ]]; then
   if [[ "$bag_view" != true ]]; then
-    setsid env PYTHONPATH="$RQT_PANEL_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+    setsid env PYTHONPATH="$RQT_PANEL_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" OPERATOR_RECORDING_MANAGED_EXTERNALLY="$recording_managed_externally" ros2 run rqt_gui rqt_gui \
       --clear-config \
       --force-discover \
       --standalone stereo_ground_sim.operator_panel.OperatorPanel &
   else
-    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" OPERATOR_RECORDING_MANAGED_EXTERNALLY="$recording_managed_externally" ros2 run rqt_gui rqt_gui \
       --clear-config \
       --force-discover \
       --perspective-file "$perspective_file" &
