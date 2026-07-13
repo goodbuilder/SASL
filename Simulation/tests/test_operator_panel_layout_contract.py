@@ -16,11 +16,13 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
         source = PANEL.read_text(encoding="utf-8")
         tree = ast.parse(source)
         self.assertIn("QHBoxLayout", source)
-        for tab in ("Range & Error", "FRD", "Geometry", "Attitude", "Event Log"):
+        for tab in ("Flight Timeline", "FRD", "Geometry", "Attitude", "Event Log"):
             self.assertIn(tab, source)
         for field in ("truth", "raw", "corrected", "disparity", "vertical_disparity", "ray_gap", "intersection_angle"):
             self.assertIn(field, source)
         for label in ("Observed/BBox Raw", "Analytic Attitude Raw", "observed_disparity_px", "analytic_disparity_px"):
+            self.assertIn(label, source)
+        for label in ("AUTHORITY", "GAZEBO MOTION", "PX4 CONNECTION", "MISSION PHASE", "PX4 LOCAL NED", "AUXILIARY, NOT GROUND TRUTH"):
             self.assertIn(label, source)
         for source_name in ("ground_truth_range", "observed_disparity_px", "analytic_disparity_px", "pixels", "ray_quality"):
             self.assertIn(source_name, source)
@@ -33,6 +35,8 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
         self.assertIn('UNSYNCHRONIZED', source)
         self.assertNotIn('sample_time = time.monotonic()', source)
         self.assertIn("synchronized=False", source)
+        self.assertIn("/simulation/px4/status", source)
+        self.assertNotIn("--reload-import", (ROOT / "run_operator_view.sh").read_text(encoding="utf-8"))
 
     def test_plot_updates_are_source_local(self):
         source = PANEL.read_text(encoding="utf-8")

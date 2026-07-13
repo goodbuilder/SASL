@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 
 STALE_TIMEOUT_S = 2.0
@@ -23,6 +24,33 @@ SOURCE_KEYS = (
     "analytic_disparity_px",
     "pixels",
     "ray_quality",
+    "px4_status",
+)
+
+PX4_STATUS_TOPIC = "/simulation/px4/status"
+PX4_PHASES = (
+    "WAITING",
+    "CONNECTED",
+    "PRESTREAM",
+    "OFFBOARD",
+    "ARMING",
+    "TAKEOFF",
+    "HOVER_1",
+    "APPROACH",
+    "HOVER_2",
+    "LANDING",
+    "COMPLETE",
+    "ERROR",
+)
+TOP_BAR_FIELDS = (
+    "AUTHORITY",
+    "GAZEBO MOTION",
+    "PX4 CONNECTION",
+    "ARM",
+    "MODE",
+    "MISSION PHASE",
+    "GT SOURCE",
+    "OVERALL STATUS",
 )
 
 
@@ -34,6 +62,67 @@ def finite_float(value):
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
+
+
+def parse_px4_status(value):
+    """Parse a PX4 status JSON value without inventing unavailable fields."""
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(parsed, dict) or parsed.get("schema_version") != 1:
+        return {}
+    return parsed
+
+
+def px4_contract_state(status):
+    """Return ``safe``, ``violation``, or ``unavailable`` for UI display."""
+    if not isinstance(status, dict) or not status:
+        return "unavailable"
+    if status.get("flight_authority") != "px4_sitl" or status.get("gazebo_motion_enabled") is not False:
+        return "violation"
+    return "safe"
+
+
+def px4_overall_status(status, source_states=None):
+    """Classify the read-only panel status without process-name guesses."""
+    contract = px4_contract_state(status)
+    if contract == "violation":
+        return "ERROR — FLIGHT AUTHORITY CONTRACT VIOLATION"
+    if contract == "unavailable":
+        return "WAITING — PX4 status unavailable"
+    if not status.get("px4_connected"):
+        return "DEGRADED — PX4 unavailable"
+    if status.get("failsafe"):
+        return "ERROR — PX4 FAILSAFE"
+    states = source_states or {}
+    if any(state in {"invalid", "stale"} for state in states.values()):
+        return "DEGRADED — source stale or invalid"
+    return "VALID — PX4 telemetry connected"
+
+
+def status_field(status, key, unavailable=UNAVAILABLE):
+    """Get a scalar status field while preserving explicit unavailable state."""
+    if not isinstance(status, dict):
+        return unavailable
+    value = status.get(key)
+    return unavailable if value is None or value == "" else value
+
+
+def format_status_vector(vector, keys):
+    if not isinstance(vector, dict):
+        return UNAVAILABLE
+    values = [finite_float(vector.get(key)) for key in keys]
+    if any(value is None for value in values):
+        return UNAVAILABLE
+    return "[" + ", ".join(f"{value:.3f}" for value in values) + "]"
+
+
+def format_receive_age(received_at, now):
+    if received_at is None:
+        return UNAVAILABLE
+    age = finite_float(now) - finite_float(received_at)
+    return UNAVAILABLE if age is None or age < 0.0 else f"{age:.1f} s"
 
 
 def source_valid(value) -> bool:
@@ -137,7 +226,7 @@ def stale_marker_action(state):
 
 
 __all__ = [
-    "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "finite_float",
+    "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "PX4_STATUS_TOPIC", "PX4_PHASES", "TOP_BAR_FIELDS", "finite_float",
     "source_valid", "source_state", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
-    "plot_series_for_source", "should_append_plot", "stale_marker_action",
+    "plot_series_for_source", "should_append_plot", "stale_marker_action", "parse_px4_status", "px4_contract_state", "px4_overall_status", "status_field", "format_status_vector", "format_receive_age",
 ]

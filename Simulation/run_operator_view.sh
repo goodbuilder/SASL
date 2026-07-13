@@ -839,6 +839,7 @@ cleanup_previous_run() {
   terminate_matching TERM "ros2 bag record .* /stereo/distance"
   terminate_matching TERM "run_auto_mission.sh"
   terminate_matching TERM "px4_auto_mission.py"
+  terminate_matching TERM "px4_status_adapter"
   terminate_matching TERM "make px4_sitl gz_x500"
   terminate_matching TERM "$PX4_DIR/build/px4_sitl_default/bin/px4"
 
@@ -863,6 +864,7 @@ cleanup_previous_run() {
   terminate_matching KILL "ros2 bag record .* /stereo/distance"
   terminate_matching KILL "run_auto_mission.sh"
   terminate_matching KILL "px4_auto_mission.py"
+  terminate_matching KILL "px4_status_adapter"
   terminate_matching KILL "make px4_sitl gz_x500"
   terminate_matching KILL "$PX4_DIR/build/px4_sitl_default/bin/px4"
 
@@ -889,6 +891,7 @@ cleanup() {
   terminate_matching KILL "stereo_ground_sim.detection_overlay_node"
   terminate_matching KILL "stereo_ground_sim_overlay/detection_overlay_node"
   terminate_matching KILL "detection_overlay_node --ros-args"
+  terminate_matching KILL "px4_status_adapter"
   terminate_matching KILL "^gz sim server$"
   terminate_matching KILL "^gz sim gui$"
   terminate_gz_sim_processes KILL
@@ -1058,6 +1061,7 @@ set +u
 source "$COLCON_INSTALL_BASE/setup.bash"
 set -u
 RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
+RQT_PANEL_PYTHONPATH="${PYTHONPATH:-}"
 
 setsid ros2 launch stereo_ground_sim stereo_ground_sim.launch.py "${launch_args[@]}" &
 children+=("$!")
@@ -1089,6 +1093,11 @@ if [[ "$start_px4" == true ]]; then
   fi
 fi
 
+PX4_STATUS_CONNECT="${PX4_STATUS_CONNECT:-udpin:0.0.0.0:14550}"
+setsid env PX4_STATUS_CONNECT="$PX4_STATUS_CONNECT" ros2 run stereo_ground_sim px4_status_adapter &
+children+=("$!")
+printf '%s\n' "PX4 status adapter: read-only MAVLink GCS telemetry on $PX4_STATUS_CONNECT"
+
 if [[ "$run_mission" == true ]]; then
   printf '%s\n' "PX4 connection gate: checking heartbeat and LOCAL_POSITION_NED before mission commands."
   if ! timeout --signal=TERM "$PX4_CONNECTION_TIMEOUT_S" "$ROOT_DIR/run_auto_mission.sh" --check-connection; then
@@ -1110,16 +1119,14 @@ fi
 
 if [[ "$headless" != true ]]; then
   if [[ "$bag_view" != true ]]; then
-    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+    setsid env PYTHONPATH="$RQT_PANEL_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
       --clear-config \
       --force-discover \
-      --reload-import \
       --standalone stereo_ground_sim.operator_panel.OperatorPanel &
   else
     setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
       --clear-config \
       --force-discover \
-      --reload-import \
       --perspective-file "$perspective_file" &
   fi
   children+=("$!")
