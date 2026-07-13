@@ -77,13 +77,15 @@ Visualization Manager:
       Namespaces:
         baseline_axes: true
         camera_optical_centers: true
-        closest_points: true
+        closest_points/analytic: true
         corrected_estimate: true
         diagnostics: true
         ground_truth: true
         raw_estimate: true
-        ray_gap: true
-        rays: true
+        ray_gap/analytic: true
+        rays/analytic/left: true
+        rays/analytic/right: true
+        rays/observed: false
       Queue Size: 100
       Value: true
     - Class: rviz_default_plugins/Path

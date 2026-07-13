@@ -24,7 +24,14 @@ MARKER_TOPIC = "/simulation/visualization/markers"
 GROUND_TRUTH_PATH_TOPIC = "/simulation/visualization/ground_truth_path"
 RAW_PATH_TOPIC = "/simulation/visualization/raw_path"
 CORRECTED_PATH_TOPIC = "/simulation/visualization/corrected_path"
-_MARKER_IDS = (1, 2, 10, 11, 20, 21, 22, 30, 31, 32, 40, 41, 50)
+_MARKER_IDENTITIES = (
+    ("camera_optical_centers", 1), ("camera_optical_centers", 2),
+    ("rays/analytic/left", 10), ("rays/analytic/right", 11),
+    ("ground_truth", 20), ("raw_estimate", 21), ("corrected_estimate", 22),
+    ("closest_points/analytic", 30), ("closest_points/analytic", 31),
+    ("ray_gap/analytic", 32), ("baseline_axes", 40), ("baseline_axes", 41),
+    ("diagnostics", 50),
+)
 
 
 def _finite(value: object, *, name: str) -> float:
@@ -163,7 +170,7 @@ class SimulationVisualizationNode(Node):
         return marker
 
     def _delete_markers(self) -> list[Any]:
-        return [self._make_marker(marker_id, "simulation", Marker.SPHERE, action=Marker.DELETE) for marker_id in _MARKER_IDS]
+        return [self._make_marker(marker_id, namespace, Marker.SPHERE, action=Marker.DELETE) for namespace, marker_id in _MARKER_IDENTITIES]
 
     def _point_marker(self, marker_id: int, namespace: str, point: tuple[float, float, float] | None, color: tuple[float, float, float]) -> Any | None:
         if point is None:
@@ -210,17 +217,17 @@ class SimulationVisualizationNode(Node):
                 left_end = tuple(left_ray.origin.xyz_m[i] + ray_length * left_ray.direction.xyz_unit[i] for i in range(3))
                 right_end = tuple(right_ray.origin.xyz_m[i] + ray_length * right_ray.direction.xyz_unit[i] for i in range(3))
                 markers.extend([
-                    self._line_marker(10, "rays", left_ray.origin.xyz_m, left_end, (0.1, 0.7, 1.0)),
-                    self._line_marker(11, "rays", right_ray.origin.xyz_m, right_end, (1.0, 0.5, 0.1)),
+                    self._line_marker(10, "rays/analytic/left", left_ray.origin.xyz_m, left_end, (0.1, 0.7, 1.0)),
+                    self._line_marker(11, "rays/analytic/right", right_ray.origin.xyz_m, right_end, (1.0, 0.5, 0.1)),
                 ])
                 left_closest = _point_on_ray(left_ray.origin.xyz_m, left_ray.direction.xyz_unit, status.get("left_ray_parameter_m"))
                 right_closest = _point_on_ray(right_ray.origin.xyz_m, right_ray.direction.xyz_unit, status.get("right_ray_parameter_m"))
                 for marker_id, point, color in ((30, left_closest, (0.1, 0.7, 1.0)), (31, right_closest, (1.0, 0.5, 0.1))):
-                    marker = self._point_marker(marker_id, "closest_points", point, color)
+                    marker = self._point_marker(marker_id, "closest_points/analytic", point, color)
                     if marker is not None:
                         markers.append(marker)
                 if left_closest is not None and right_closest is not None:
-                    markers.append(self._line_marker(32, "ray_gap", left_closest, right_closest, (1.0, 1.0, 0.1)))
+                    markers.append(self._line_marker(32, "ray_gap/analytic", left_closest, right_closest, (1.0, 1.0, 0.1)))
             for marker_id, namespace, key, color in (
                 (20, "ground_truth", "ground_truth", (0.2, 1.0, 0.2)),
                 (21, "raw_estimate", "raw", (1.0, 0.2, 0.2)),
@@ -240,6 +247,8 @@ class SimulationVisualizationNode(Node):
             f"status: {status.get('attitude_model_status', 'waiting')}",
             f"ray gap: {status.get('ray_gap_m', '--')} m",
             f"angle: {status.get('intersection_angle_rad', '--')} rad",
+            "ray source: analytic attitude-model pixels",
+            "rays/observed: unavailable — no trusted observed ray topic",
             f"stale: {self.last_update_monotonic_s <= 0.0 or time.monotonic() - self.last_update_monotonic_s > self.stale_timeout_s}",
         ])
         markers.append(text)
