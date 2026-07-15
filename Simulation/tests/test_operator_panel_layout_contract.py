@@ -59,6 +59,15 @@ class OperatorPanelLayoutContractTests(unittest.TestCase):
         self.assertIn("/simulation/px4/status", source)
         self.assertNotIn("--reload-import", (ROOT / "run_operator_view.sh").read_text(encoding="utf-8"))
 
+    def test_panel_image_mode_matches_the_requested_camera_topics(self):
+        source = PANEL.read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection")', source)
+        self.assertIn('if IMAGE_MODE == "raw":', source)
+        self.assertIn('("Left Camera", "/left_camera/image")', source)
+        self.assertIn('("Right Camera", "/right_camera/image")', source)
+        self.assertIn('("Left Detection", "/left_camera/detection_image")', source)
+        self.assertIn('("Right Detection", "/right_camera/detection_image")', source)
+
     def test_plot_updates_are_source_local(self):
         source = PANEL.read_text(encoding="utf-8")
         self.assertIn("self._bridge.plot.emit(key, value or [])", source)

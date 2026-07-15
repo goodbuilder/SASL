@@ -7,6 +7,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "stereo_ground_sim"))
 
 from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
+    PROFILE_ACTIVE,
+    PROFILE_NOT_CONFIGURED,
+    PROFILE_UNKNOWN_INVALID,
+    RecordingReadinessModel,
     UNSYNCHRONIZED,
     corrected_measurement_state,
     detection_display_state,
@@ -14,8 +18,10 @@ from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
     fallback_transition,
     intersection_angle_deg,
     plot_series_for_source,
+    profile_contract_state,
     should_append_plot,
     source_state,
+    source_state_from_monotonic_ns,
     stale_display,
     stale_marker_action,
     synchronized_comparison_errors,
@@ -36,7 +42,7 @@ class SimulationUiContractTests(unittest.TestCase):
         self.assertIsNone(intersection_angle_deg("rad"))
 
     def test_corrected_state_distinguishes_missing_profile_from_invalid_sample(self):
-        self.assertEqual(corrected_measurement_state("waiting", {}), "NOT CONFIGURED")
+        self.assertEqual(corrected_measurement_state("waiting", {}), "UNKNOWN_INVALID")
         self.assertEqual(
             corrected_measurement_state("invalid", {"profile_id": "yaw_005"}),
             "INVALID",
@@ -47,7 +53,7 @@ class SimulationUiContractTests(unittest.TestCase):
         )
         self.assertEqual(
             corrected_measurement_state("valid", {"fallback_level": 0}),
-            "VALID",
+            "UNKNOWN_INVALID",
         )
         self.assertEqual(
             corrected_measurement_state("invalid", {"profile_mode": "no_profile"}),
@@ -59,6 +65,51 @@ class SimulationUiContractTests(unittest.TestCase):
                     corrected_measurement_state("invalid", {"profile_mode": profile_mode}),
                     "NOT CONFIGURED",
                 )
+
+    def test_profile_contract_requires_explicit_profile_identity(self):
+        self.assertEqual(profile_contract_state({"profile_mode": "no_profile"}), PROFILE_NOT_CONFIGURED)
+        self.assertEqual(profile_contract_state({"status": "no_profile"}), PROFILE_NOT_CONFIGURED)
+        self.assertEqual(profile_contract_state({"profile_id": "unit"}), PROFILE_ACTIVE)
+        self.assertEqual(profile_contract_state({"mode": "sim3"}), PROFILE_ACTIVE)
+        for payload in (
+            {"fallback_level": 0},
+            {"fallback_reason": "nearest_cell"},
+            {"profile_id": 42},
+            "not-json",
+            [],
+            {},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(profile_contract_state(payload), PROFILE_UNKNOWN_INVALID)
+
+    def test_monotonic_freshness_ignores_sim_time_pause_and_reset(self):
+        received_monotonic_ns = 10_000_000_000
+        value = [1.0, 2.0, 3.0]
+        self.assertEqual(
+            source_state_from_monotonic_ns(received_monotonic_ns, value, received_monotonic_ns + 1_000_000_000),
+            "valid",
+        )
+        # ROS/simulation time may pause while monotonic time advances.
+        self.assertEqual(
+            source_state_from_monotonic_ns(received_monotonic_ns, value, received_monotonic_ns + 3_000_000_000),
+            "stale",
+        )
+        # A reset/rewind must not turn the old receipt into a fresh sample.
+        self.assertEqual(
+            source_state_from_monotonic_ns(received_monotonic_ns, value, received_monotonic_ns - 1),
+            "stale",
+        )
+
+    def test_readiness_model_keeps_ros_provenance_separate_from_monotonic_age(self):
+        model = RecordingReadinessModel(mode="debug")
+        model.update(
+            "ground_truth",
+            [1.0, 2.0, 3.0, 4.0],
+            receive_ros_time_ns=0,
+            receive_monotonic_ns=123,
+        )
+        self.assertEqual(model.receive_ros_time_snapshot()["ground_truth"], 0)
+        self.assertEqual(model.receive_monotonic_snapshot()["ground_truth"], 123)
 
     def test_detection_state_uses_bbox_validity_before_center_fallback(self):
         self.assertEqual(

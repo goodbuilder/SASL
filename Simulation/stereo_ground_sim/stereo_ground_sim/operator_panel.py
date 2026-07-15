@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import copy
+import os
 import threading
 import time
 from collections import deque
@@ -34,6 +35,7 @@ from qt_gui.plugin import Plugin
 
 from stereo_ground_sim.recording_control import RecordingControlWidget
 from stereo_ground_sim.simulation_ui_contract import (
+    RecordingReadinessModel,
     SOURCE_KEYS,
     STALE_TIMEOUT_S,
     UNSYNCHRONIZED,
@@ -48,9 +50,10 @@ from stereo_ground_sim.simulation_ui_contract import (
     intersection_angle_deg,
     mission_phase_display,
     parse_px4_status,
+    profile_contract_state,
     px4_contract_state,
     px4_overall_status,
-    source_state,
+    source_state_from_monotonic_ns,
     state_display_value,
     status_field,
     synchronized_comparison_errors,
@@ -71,10 +74,21 @@ except Exception:  # pragma: no cover - rqt can still load the widget shell.
 CONTRACT_FRAME = "baseline_center_frd"
 CONTRACT_UNIT = "m"
 TARGET_IMAGE_HZ = 20.0
-IMAGE_TOPICS = (
+DETECTION_IMAGE_TOPICS = (
     ("Left Detection", "/left_camera/detection_image"),
     ("Right Detection", "/right_camera/detection_image"),
 )
+RAW_IMAGE_TOPICS = (
+    ("Left Camera", "/left_camera/image"),
+    ("Right Camera", "/right_camera/image"),
+)
+IMAGE_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
+if IMAGE_MODE == "raw":
+    IMAGE_TOPICS = RAW_IMAGE_TOPICS
+    IMAGE_VIEW_LABEL = "CAMERA"
+else:
+    IMAGE_TOPICS = DETECTION_IMAGE_TOPICS
+    IMAGE_VIEW_LABEL = "DETECTION"
 POSITION_TOPICS = (
     ("ground_truth", "/ground_truth_position"),
     ("observed_raw", "/stereo/estimated_position"),
@@ -306,6 +320,8 @@ class OperatorPanel(Plugin):
             }
         )
         self._received = {}
+        self._received_monotonic_ns = {}
+        self._received_ros_ns = {}
         self._source_states = {key: "waiting" for key in SOURCE_KEYS}
         self._last_fallback = None
         self._last_profile_status = None
@@ -313,6 +329,10 @@ class OperatorPanel(Plugin):
         self._image_times = {"left": deque(maxlen=40), "right": deque(maxlen=40)}
         self._image_meta = {"left": {}, "right": {}}
         self._recording_readiness = None
+        self._readiness_model = RecordingReadinessModel(
+            mode="full",
+            parameter_snapshot_status="pending",
+        )
 
         self._widget = QWidget()
         self._widget.setWindowTitle("Stereo Simulation Research Operator Panel")
@@ -334,8 +354,8 @@ class OperatorPanel(Plugin):
         left_layout.setSpacing(4)
         image_layout = QHBoxLayout()
         image_layout.setSpacing(6)
-        self._left_view = CameraView("LEFT DETECTION")
-        self._right_view = CameraView("RIGHT DETECTION")
+        self._left_view = CameraView(f"LEFT {IMAGE_VIEW_LABEL}")
+        self._right_view = CameraView(f"RIGHT {IMAGE_VIEW_LABEL}")
         initial_image_meta = (
             "Resolution unavailable\n"
             "FPS 0.0 / 20.0 Hz\n"
@@ -443,6 +463,7 @@ class OperatorPanel(Plugin):
         QTimer.singleShot(0, self._set_splitter_sizes)
 
         self._recording_control = RecordingControlWidget(self._widget)
+        self._recording_control.set_readiness_model(self._readiness_model)
         self._recording_control.recording_event.connect(self._append_event)
         root.addWidget(self._recording_control, 0)
 
@@ -554,19 +575,42 @@ class OperatorPanel(Plugin):
             return copy.deepcopy(self._latest)
 
     def _record(self, key, value):
-        now = time.monotonic()
+        receive_monotonic_ns = time.monotonic_ns()
+        now = receive_monotonic_ns / 1.0e9
+        receive_ros_ns = self._ros_receive_time_ns()
         with self._state_lock:
             self._latest[key] = copy.deepcopy(value)
             self._received[key] = now
+            self._received_monotonic_ns[key] = receive_monotonic_ns
+            self._received_ros_ns[key] = receive_ros_ns
             previous = dict(self._source_states)
-            self._source_states[key] = source_state(now, value, now, STALE_TIMEOUT_S)
+            self._source_states[key] = source_state_from_monotonic_ns(
+                receive_monotonic_ns,
+                value,
+                receive_monotonic_ns,
+                STALE_TIMEOUT_S,
+            )
             events = transition_events(previous, self._source_states)
             snapshot = copy.deepcopy(self._latest)
+        self._readiness_model.update(
+            key,
+            value,
+            receive_ros_time_ns=receive_ros_ns,
+            receive_monotonic_ns=receive_monotonic_ns,
+        )
         for event in events:
             self._bridge.event_message.emit(event)
         self._bridge.snapshot.emit(snapshot)
         if key in {"ground_truth", "observed_raw", "analytic_raw", "corrected"}:
             self._bridge.plot.emit(key, value or [])
+
+    def _ros_receive_time_ns(self):
+        if self._ros_node is None:
+            return None
+        try:
+            return int(self._ros_node.get_clock().now().nanoseconds)
+        except (AttributeError, TypeError, ValueError):
+            return None
 
     def _position_cb(self, key, msg):
         values = [finite_float(value) for value in list(msg.data)]
@@ -783,10 +827,7 @@ class OperatorPanel(Plugin):
         self._condition_labels["relative_error"].setText(
             self._vector_text(attitude, ("relative_roll_deg", "relative_pitch_deg", "relative_yaw_deg"))
         )
-        profile_text = profile.get("profile_id") or profile.get("profile_mode")
-        if not profile_text:
-            profile_text = "NOT CONFIGURED"
-        self._condition_labels["profile"].setText(str(profile_text))
+        self._condition_labels["profile"].setText(profile_contract_state(profile))
 
         names = {
             "ground_truth": "Ground Truth",
@@ -858,24 +899,17 @@ class OperatorPanel(Plugin):
         self._last_profile_status = profile_status
 
     def _update_recording_readiness(self, snapshot):
-        snapshot = snapshot if isinstance(snapshot, dict) else {}
-        with self._state_lock:
-            source_states = dict(self._source_states)
-        mode = str(self._recording_control.mode_combo.currentData() or "full")
-        observation = snapshot.get("observation_status") or {}
-        readiness = evaluate_recording_readiness(
-            mode=mode,
-            observation_mode=observation.get("observation_mode", "both"),
-            source_states=source_states,
-            px4_status=snapshot.get("px4_status") or {},
-            observation_status=observation,
-            attitude_status=snapshot.get("attitude_status") or {},
-            profile_status=snapshot.get("profile_status") or {},
-        )
+        del snapshot
+        readiness = self._readiness_model.readiness(now_monotonic_ns=time.monotonic_ns())
         previous = self._recording_readiness
         if previous != readiness:
             self._recording_readiness = readiness
             self._recording_control.set_readiness(readiness)
+
+    def set_parameter_snapshot_status(self, status):
+        """Apply a pre-start parameter query result to the shared model."""
+        self._readiness_model.set_parameter_snapshot_status(status)
+        self._update_recording_readiness(self._snapshot_copy())
 
     @staticmethod
     def _vector_text(payload, keys):
@@ -926,7 +960,7 @@ class OperatorPanel(Plugin):
             "Message sample timestamp: unavailable",
             "Common sample timestamp: unavailable",
             f"Observation source: {observation.get('bbox_observation_source', 'unavailable')}",
-            f"Correction profile: {profile.get('profile_id') or profile.get('profile_mode') or 'NOT CONFIGURED'}",
+            f"Correction profile: {profile_contract_state(profile)}",
             f"Image Header stamps: left={image_meta['left'].get('stamp', 'unavailable')}, right={image_meta['right'].get('stamp', 'unavailable')}",
             "Receive ages (source-local): "
             + ", ".join(
@@ -949,14 +983,15 @@ class OperatorPanel(Plugin):
         self._diagnostics.setPlainText("\n".join(lines))
 
     def _refresh_source_states(self):
-        now = time.monotonic()
+        now_monotonic_ns = time.monotonic_ns()
+        now = now_monotonic_ns / 1.0e9
         with self._state_lock:
             previous = dict(self._source_states)
             for key in SOURCE_KEYS:
-                self._source_states[key] = source_state(
-                    self._received.get(key),
+                self._source_states[key] = source_state_from_monotonic_ns(
+                    self._received_monotonic_ns.get(key),
                     self._latest.get(key),
-                    now,
+                    now_monotonic_ns,
                     STALE_TIMEOUT_S,
                 )
             source_states = dict(self._source_states)
@@ -1027,6 +1062,7 @@ class OperatorPanel(Plugin):
 
     def shutdown_plugin(self):
         self._recording_control.shutdown()
+        self._recording_control.wait_for_shutdown(timeout_s=1.0)
         self._stop_event.set()
         if hasattr(self, "_stale_timer"):
             self._stale_timer.stop()

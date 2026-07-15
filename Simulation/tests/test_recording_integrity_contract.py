@@ -5,6 +5,7 @@ import sys
 import signal
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -164,11 +165,13 @@ class RecordingIntegrityContractTests(unittest.TestCase):
             def __init__(self):
                 self.returncode = None
                 self.signals = []
+                self.wait_calls = 0
 
             def poll(self):
                 return self.returncode
 
             def wait(self, timeout=None):
+                self.wait_calls += 1
                 if self.returncode is None:
                     raise TimeoutError(timeout)
                 return self.returncode
@@ -201,6 +204,65 @@ class RecordingIntegrityContractTests(unittest.TestCase):
             self.assertIsNone(controller._lock_key)
             self.assertTrue(controller.shutdown_complete)
             self.assertEqual(controller.state, "ERROR")
+            self.assertGreaterEqual(process.wait_calls, 1)
+        app.processEvents()
+
+    def test_unreaped_child_after_sigkill_keeps_process_and_root_lock(self):
+        try:
+            from python_qt_binding.QtWidgets import QApplication
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"Qt unavailable: {exc}")
+        app = QApplication.instance() or QApplication([])
+
+        class UnreapedProcess:
+            pid = 876544
+
+            def __init__(self):
+                self.returncode = None
+                self.signals = []
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                raise TimeoutError(timeout)
+
+            def send_signal(self, sig):
+                self.signals.append(sig)
+
+        process = UnreapedProcess()
+        controller = RecordingSessionController(
+            process_factory=lambda *_args, **_kwargs: process,
+            poll_interval_ms=1000,
+            stop_timeout_s=0.01,
+            terminate_timeout_s=0.01,
+        )
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "stereo_ground_sim.recording_control._send_group_signal",
+            side_effect=lambda proc, sig: proc.send_signal(sig),
+        ):
+            self.assertTrue(controller.start(mode="lite", run_name="unreaped", save_root=directory))
+            controller.shutdown()
+            self.assertIsNotNone(controller._shutdown_thread)
+            controller._shutdown_thread.join(timeout=1.0)
+            self.assertFalse(controller._shutdown_thread.is_alive())
+            self.assertEqual(process.signals, [signal.SIGINT, signal.SIGTERM, signal.SIGKILL])
+            self.assertIs(controller.process, process)
+            self.assertIsNotNone(controller._lock_key)
+            self.assertFalse(controller.shutdown_complete)
+            self.assertIn("root lock retained", controller.shutdown_fatal_error)
+
+            # Once the child becomes waitable, normal polling may complete the
+            # deferred cleanup; the failed attempt itself never released it.
+            process.returncode = 0
+
+            def wait(timeout=None):
+                return process.returncode
+
+            process.wait = wait
+            controller.poll()
+            self.assertIsNone(controller.process)
+            self.assertIsNone(controller._lock_key)
         app.processEvents()
 
     def test_concurrent_callbacks_and_snapshot_have_no_shared_state_exception(self):
@@ -343,6 +405,11 @@ class RecordingIntegrityContractTests(unittest.TestCase):
             "/left_camera/detection_image": now_ns,
             "/right_camera/detection_image": now_ns,
         }
+        receive_monotonic_ns = time.monotonic_ns()
+        recorder.last_monotonic_stamp = {
+            topic: receive_monotonic_ns
+            for topic in recorder.last_stamp
+        }
         recorder.get_clock = lambda: SimpleNamespace(
             now=lambda: SimpleNamespace(nanoseconds=now_ns)
         )
@@ -394,6 +461,11 @@ class RecordingIntegrityContractTests(unittest.TestCase):
         self.assertTrue(manifest["formal_experiment_eligible"])
         self.assertEqual(manifest["counts"]["left_video_frame_count"], 1)
         self.assertEqual(manifest["readiness_at_end"]["formal_eligible"], True)
+        self.assertEqual(manifest["source_receive_ros_time_ns"]["ground_truth"], now_ns)
+        self.assertEqual(
+            manifest["source_receive_monotonic_ns"]["ground_truth"],
+            receive_monotonic_ns,
+        )
 
 
 if __name__ == "__main__":

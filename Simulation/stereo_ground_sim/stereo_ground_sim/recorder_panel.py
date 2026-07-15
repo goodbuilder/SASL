@@ -19,6 +19,7 @@ from qt_gui.plugin import Plugin
 
 from stereo_ground_sim.recording_control import (
     RecordingControlWidget,
+    RecordingReadinessSubscriber,
     build_operator_recorder_command,
 )
 
@@ -51,7 +52,7 @@ def build_calibration_recorder_command(
 class RecorderPanel(Plugin):
     """rqt compatibility wrapper; process ownership is shared with OperatorPanel."""
 
-    def __init__(self, context):
+    def __init__(self, context, *, readiness_subscriber=None):
         super().__init__(context)
         self.setObjectName("RecorderPanel")
         self._widget = QWidget()
@@ -62,6 +63,11 @@ class RecorderPanel(Plugin):
         layout.addWidget(QLabel("Simulation research recording"))
         self._recording_control = RecordingControlWidget(self._widget)
         self._recording_control.recording_event.connect(self._on_recording_event)
+        self._readiness_subscriber = readiness_subscriber or RecordingReadinessSubscriber(self._widget)
+        self._recording_control.set_readiness_model(self._readiness_subscriber.model)
+        self._readiness_subscriber.readiness_changed.connect(self._recording_control.set_readiness)
+        self._readiness_subscriber.error.connect(self._on_recording_event)
+        self._recording_control.mode_combo.currentIndexChanged.connect(self._update_readiness_mode)
         layout.addWidget(self._recording_control)
         self._status_label = QLabel("IDLE")
         self._status_label.setWordWrap(True)
@@ -76,6 +82,18 @@ class RecorderPanel(Plugin):
         self._calibration_process = None
         self._calibration_timer = QTimer(self._widget)
         self._calibration_timer.timeout.connect(self._poll_calibration)
+        self._readiness_subscriber.start()
+
+    def _update_readiness_mode(self, *_args):
+        mode = str(self._recording_control.mode_combo.currentData() or "full")
+        self._readiness_subscriber.set_mode(mode)
+
+    def set_readiness(self, readiness):
+        """Test/integration hook for applying a fixture or external snapshot."""
+        self._recording_control.set_readiness(readiness)
+
+    def set_parameter_snapshot_status(self, status):
+        self._readiness_subscriber.set_parameter_snapshot_status(status)
 
     def _on_recording_event(self, message):
         self._status_label.setText(str(message))
@@ -131,6 +149,8 @@ class RecorderPanel(Plugin):
 
     def shutdown_plugin(self):
         self._recording_control.shutdown()
+        self._recording_control.wait_for_shutdown(timeout_s=1.0)
+        self._readiness_subscriber.shutdown()
         if self._calibration_process is not None:
             try:
                 os.killpg(self._calibration_process.pid, signal.SIGINT)

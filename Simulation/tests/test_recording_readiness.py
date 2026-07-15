@@ -160,6 +160,46 @@ class RecordingReadinessTests(unittest.TestCase):
         self.assertFalse(result.start_allowed)
         self.assertTrue(any("profile status STALE" in reason for reason in result.reasons))
 
+    def test_fallback_level_only_profile_is_unknown_and_blocks_formal_readiness(self):
+        result = evaluate_recording_readiness(
+            mode="full",
+            observation_mode="both",
+            source_states=all_valid_states(),
+            px4_status=safe_px4(),
+            observation_status=safe_statuses(),
+            attitude_status=safe_statuses(),
+            profile_status={"fallback_level": 0},
+        )
+        self.assertFalse(result.start_allowed)
+        self.assertFalse(result.formal_eligible)
+        self.assertIn("profile contract UNKNOWN_INVALID", result.reasons)
+
+    def test_malformed_profile_payload_is_unknown_and_no_profile_is_configured(self):
+        malformed = evaluate_recording_readiness(
+            mode="full",
+            observation_mode="both",
+            source_states=all_valid_states(),
+            px4_status=safe_px4(),
+            observation_status=safe_statuses(),
+            attitude_status=safe_statuses(),
+            profile_status={"profile_id": 7},
+        )
+        self.assertFalse(malformed.start_allowed)
+        self.assertFalse(malformed.formal_eligible)
+        self.assertIn("profile contract UNKNOWN_INVALID", malformed.reasons)
+
+        no_profile = evaluate_recording_readiness(
+            mode="full",
+            observation_mode="both",
+            source_states=all_valid_states(),
+            px4_status=safe_px4(),
+            observation_status=safe_statuses(),
+            attitude_status=safe_statuses(),
+            profile_status={"profile_mode": "no_profile"},
+        )
+        self.assertTrue(no_profile.start_allowed)
+        self.assertTrue(no_profile.formal_eligible)
+
 
 if __name__ == "__main__":
     unittest.main()

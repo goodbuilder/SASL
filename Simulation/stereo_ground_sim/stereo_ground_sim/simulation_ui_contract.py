@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import math
+import copy
+import threading
+import time
 from dataclasses import dataclass
 
 STALE_TIMEOUT_S = 2.0
@@ -74,6 +77,9 @@ PROFILE_NOT_CONFIGURED_VALUES = {
     "disabled",
     "unavailable",
 }
+PROFILE_NOT_CONFIGURED = "NOT_CONFIGURED"
+PROFILE_ACTIVE = "ACTIVE"
+PROFILE_UNKNOWN_INVALID = "UNKNOWN_INVALID"
 
 
 @dataclass(frozen=True)
@@ -122,30 +128,66 @@ def intersection_angle_deg(intersection_angle_rad):
     return None if angle is None else math.degrees(angle)
 
 
-def _profile_is_configured(profile_status):
+def profile_contract_state(profile_status):
+    """Classify a profile payload without treating fallback metadata as a profile.
+
+    ``fallback_level`` and ``fallback_reason`` describe how a producer
+    arrived at its current state; they are not an active profile contract.
+    Only an explicit string ``profile_id`` or ``profile_mode`` can establish
+    ``ACTIVE``.  Explicit no-profile values remain a valid ``NOT_CONFIGURED``
+    state, while malformed or metadata-only payloads are ``UNKNOWN_INVALID``.
+    """
     if isinstance(profile_status, str):
         try:
             profile_status = json.loads(profile_status)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return False
-    if not isinstance(profile_status, dict):
-        return False
-    profile_id = str(profile_status.get("profile_id") or "").strip().lower()
-    profile_mode = str(profile_status.get("profile_mode") or "").strip().lower()
+            return PROFILE_UNKNOWN_INVALID
+    if not isinstance(profile_status, dict) or not profile_status:
+        return PROFILE_UNKNOWN_INVALID
+
+    explicit_fields = [
+        name for name in ("profile_id", "profile_mode", "mode") if name in profile_status
+    ]
+    normalized_fields = {}
+    for name in explicit_fields:
+        value = profile_status.get(name)
+        if value is None or not isinstance(value, str):
+            return PROFILE_UNKNOWN_INVALID
+        normalized_fields[name] = value.strip().lower()
+
+    active_values = [
+        value
+        for value in normalized_fields.values()
+        if value not in PROFILE_NOT_CONFIGURED_VALUES
+    ]
+    not_configured_values = [
+        value
+        for value in normalized_fields.values()
+        if value in PROFILE_NOT_CONFIGURED_VALUES
+    ]
+    if active_values and not_configured_values:
+        return PROFILE_UNKNOWN_INVALID
+    if active_values:
+        return PROFILE_ACTIVE
+
+    status = profile_status.get("status")
+    if status is not None and not isinstance(status, str):
+        return PROFILE_UNKNOWN_INVALID
+    normalized_status = str(status or "").strip().lower()
     reason = str(profile_status.get("fallback_reason") or "").strip().lower()
-    fallback_level = finite_float(profile_status.get("fallback_level"))
+    if explicit_fields and len(active_values) == 0:
+        return PROFILE_NOT_CONFIGURED
     if (
-        ("profile_id" in profile_status and profile_id in PROFILE_NOT_CONFIGURED_VALUES)
-        or ("profile_mode" in profile_status and profile_mode in PROFILE_NOT_CONFIGURED_VALUES)
+        (normalized_status and normalized_status in PROFILE_NOT_CONFIGURED_VALUES)
+        or (reason and reason in PROFILE_NOT_CONFIGURED_VALUES)
     ):
-        return False
-    if reason and (reason in PROFILE_NOT_CONFIGURED_VALUES or reason == "init"):
-        return False
-    if profile_id or profile_mode:
-        return True
-    if fallback_level is not None and fallback_level < 3:
-        return True
-    return bool(reason)
+        return PROFILE_NOT_CONFIGURED
+    return PROFILE_UNKNOWN_INVALID
+
+
+def _profile_is_configured(profile_status):
+    """Backward-compatible boolean wrapper for the explicit profile contract."""
+    return profile_contract_state(profile_status) == PROFILE_ACTIVE
 
 
 def detection_display_state(observation_status, side) -> str:
@@ -171,8 +213,11 @@ def detection_display_state(observation_status, side) -> str:
 
 def corrected_measurement_state(corrected_source_state, profile_status) -> str:
     """Classify corrected output without conflating missing profile with invalid data."""
-    if not _profile_is_configured(profile_status):
+    profile_state = profile_contract_state(profile_status)
+    if profile_state == PROFILE_NOT_CONFIGURED:
         return "NOT CONFIGURED"
+    if profile_state == PROFILE_UNKNOWN_INVALID:
+        return PROFILE_UNKNOWN_INVALID
     state = str(corrected_source_state or "waiting").strip().lower()
     return {
         "waiting": "WAITING",
@@ -222,6 +267,153 @@ def _is_gazebo_oracle_role(role):
         "gazebo_oracle",
         "gazebo_target_reference_link",
     } or ("gazebo" in normalized and "px4" not in normalized)
+
+
+def source_state_from_monotonic_ns(received_monotonic_ns, value, now_monotonic_ns, threshold_s=STALE_TIMEOUT_S):
+    """Classify a source using only receive-time monotonic nanoseconds.
+
+    ROS/simulation clock pause and reset cannot make an old source appear
+    fresh because neither value participates in this decision.
+    """
+    if received_monotonic_ns in (None, ""):
+        return "waiting"
+    if not source_valid(value):
+        return "invalid"
+    try:
+        received = int(received_monotonic_ns)
+        now = int(now_monotonic_ns)
+        threshold_ns = max(0, int(float(threshold_s) * 1.0e9))
+    except (TypeError, ValueError, OverflowError):
+        return "invalid"
+    if now < received or now - received > threshold_ns:
+        return "stale"
+    return "valid"
+
+
+_READINESS_SOURCE_KEYS = (
+    "ground_truth",
+    "observed_raw",
+    "analytic_raw",
+    "corrected",
+    "attitude_status",
+    "observation_status",
+    "profile_status",
+    "left_image",
+    "right_image",
+    "px4_status",
+)
+
+
+class RecordingReadinessModel:
+    """Thread-independent readiness model shared by both Simulation panels."""
+
+    def __init__(
+        self,
+        *,
+        mode="full",
+        observation_mode="both",
+        parameter_snapshot_status="pending",
+        monotonic_clock_ns=time.monotonic_ns,
+    ):
+        self.mode = str(mode or "full")
+        self.observation_mode = str(observation_mode or "both")
+        self.parameter_snapshot_status = parameter_snapshot_status
+        self._monotonic_clock_ns = monotonic_clock_ns
+        self._lock = threading.RLock()
+        self._payloads = {}
+        self._receive_monotonic_ns = {}
+        self._receive_ros_time_ns = {}
+
+    def set_mode(self, mode, observation_mode=None):
+        with self._lock:
+            self.mode = str(mode or "full")
+            if observation_mode is not None:
+                self.observation_mode = str(observation_mode or "both")
+
+    def set_parameter_snapshot_status(self, status):
+        with self._lock:
+            self.parameter_snapshot_status = status
+
+    @staticmethod
+    def _normalize_ns(value):
+        if value in (None, ""):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def update(self, key, value, *, receive_ros_time_ns=None, receive_monotonic_ns=None):
+        key = str(key)
+        monotonic_ns = self._normalize_ns(
+            self._monotonic_clock_ns() if receive_monotonic_ns is None else receive_monotonic_ns
+        )
+        with self._lock:
+            self._payloads[key] = copy.deepcopy(value)
+            self._receive_monotonic_ns[key] = monotonic_ns
+            self._receive_ros_time_ns[key] = self._normalize_ns(receive_ros_time_ns)
+
+    def set_source_state(
+        self,
+        key,
+        state,
+        value=None,
+        *,
+        receive_ros_time_ns=None,
+        receive_monotonic_ns=None,
+    ):
+        """Test/fixture-friendly update that still stores a monotonic receipt."""
+        key = str(key)
+        receive = self._normalize_ns(
+            self._monotonic_clock_ns() if receive_monotonic_ns is None else receive_monotonic_ns
+        )
+        with self._lock:
+            self._payloads[key] = copy.deepcopy(value)
+            self._receive_monotonic_ns[key] = receive
+            self._receive_ros_time_ns[key] = self._normalize_ns(receive_ros_time_ns)
+            if str(state).lower() == "waiting":
+                self._receive_monotonic_ns.pop(key, None)
+                self._receive_ros_time_ns.pop(key, None)
+
+    def readiness(self, *, now_monotonic_ns=None):
+        now = int(self._monotonic_clock_ns() if now_monotonic_ns is None else now_monotonic_ns)
+        with self._lock:
+            mode = self.mode
+            observation_mode = self.observation_mode
+            parameter_snapshot_status = self.parameter_snapshot_status
+            payloads = copy.deepcopy(self._payloads)
+            receive_monotonic_ns = dict(self._receive_monotonic_ns)
+        states = {
+            key: source_state_from_monotonic_ns(
+                receive_monotonic_ns.get(key),
+                payloads.get(key),
+                now,
+            )
+            for key in _READINESS_SOURCE_KEYS
+        }
+        observation = _status_payload(payloads.get("observation_status"))
+        return evaluate_recording_readiness(
+            mode=mode,
+            observation_mode=observation.get("observation_mode", observation_mode),
+            source_states=states,
+            px4_status=payloads.get("px4_status"),
+            observation_status=payloads.get("observation_status"),
+            attitude_status=payloads.get("attitude_status"),
+            profile_status=payloads.get("profile_status"),
+            parameter_snapshot_status=parameter_snapshot_status,
+        )
+
+    def payload_snapshot(self):
+        with self._lock:
+            return copy.deepcopy(self._payloads)
+
+    def receive_monotonic_snapshot(self):
+        with self._lock:
+            return dict(self._receive_monotonic_ns)
+
+    def receive_ros_time_snapshot(self):
+        with self._lock:
+            return dict(self._receive_ros_time_ns)
 
 
 def evaluate_recording_readiness(
@@ -294,17 +486,30 @@ def evaluate_recording_readiness(
         if not _source_is_fresh_valid(states, "analytic_raw"):
             reasons.append(f"analytic raw {str(states.get('analytic_raw', 'waiting')).upper()}")
 
-    if _source_is_fresh_valid(states, "profile_status") and _profile_is_configured(profile) and not _source_is_fresh_valid(
-        states, "corrected"
-    ):
-        reasons.append(f"corrected {str(states.get('corrected', 'waiting')).upper()} for active profile")
+    profile_state = profile_contract_state(profile)
+    if _source_is_fresh_valid(states, "profile_status"):
+        if profile_state == PROFILE_UNKNOWN_INVALID:
+            reasons.append("profile contract UNKNOWN_INVALID")
+        elif profile_state == PROFILE_ACTIVE and not _source_is_fresh_valid(states, "corrected"):
+            reasons.append(f"corrected {str(states.get('corrected', 'waiting')).upper()} for active profile")
 
-    if parameter_snapshot_status is not None and str(parameter_snapshot_status).lower() != "available":
-        reasons.append(f"parameter snapshot {str(parameter_snapshot_status).upper()}")
+    parameter_pending = False
+    parameter_blocked = False
+    if parameter_snapshot_status is not None:
+        normalized_parameter_status = str(parameter_snapshot_status).strip().lower()
+        if normalized_parameter_status == "pending":
+            parameter_pending = True
+            reasons.append("PARAMETER SNAPSHOT PENDING")
+        elif normalized_parameter_status != "available":
+            parameter_blocked = True
+            reasons.append(f"parameter snapshot {str(parameter_snapshot_status).upper()}")
 
     unique_reasons = tuple(dict.fromkeys(reasons))
-    start_allowed = not unique_reasons
-    return RecordingReadiness(start_allowed, start_allowed, unique_reasons)
+    start_allowed = not parameter_blocked and not any(
+        reason != "PARAMETER SNAPSHOT PENDING" for reason in unique_reasons
+    )
+    formal_eligible = start_allowed and not parameter_pending
+    return RecordingReadiness(start_allowed, formal_eligible, unique_reasons)
 
 
 def evaluate_recording_outcome(artifact_integrity, formal_eligible, eligibility_events=()):
@@ -528,7 +733,7 @@ def stale_marker_action(state):
 
 __all__ = [
     "STALE_TIMEOUT_S", "UNAVAILABLE", "UNSYNCHRONIZED", "SOURCE_KEYS", "PX4_STATUS_TOPIC", "PX4_PHASES", "TOP_BAR_FIELDS", "FLIGHT_CONTRACT_FIELDS", "EXPECTED_FLIGHT_CONTRACT", "FLIGHT_CONTRACT_SOURCE", "finite_float",
-    "RecordingReadiness", "disparity_difference_px", "latest_unsynchronized_disparity_difference_px", "intersection_angle_deg", "corrected_measurement_state", "state_display_value", "evaluate_recording_readiness", "evaluate_recording_outcome",
-    "source_valid", "source_state", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
+    "RecordingReadiness", "RecordingReadinessModel", "PROFILE_NOT_CONFIGURED", "PROFILE_ACTIVE", "PROFILE_UNKNOWN_INVALID", "profile_contract_state", "disparity_difference_px", "latest_unsynchronized_disparity_difference_px", "intersection_angle_deg", "corrected_measurement_state", "state_display_value", "evaluate_recording_readiness", "evaluate_recording_outcome",
+    "source_valid", "source_state", "source_state_from_monotonic_ns", "stale_display", "fallback_transition", "transition_events", "synchronized_comparison_errors",
     "plot_series_for_source", "should_append_plot", "stale_marker_action", "parse_px4_status", "px4_contract_state", "px4_overall_status", "mission_phase_display", "status_field", "format_status_vector", "format_receive_age",
 ]

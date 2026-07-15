@@ -51,6 +51,7 @@ class TimestampPrecisionTests(unittest.TestCase):
                 + module.RESEARCH_FIELDS
                 + module.RECEIVE_TIME_FIELDS
                 + module.RECEIVE_TIME_NS_FIELDS
+                + module.RECEIVE_MONOTONIC_NS_FIELDS
                 + module.SOURCE_STATE_FIELDS
                 + module.SOURCE_RECEIVE_AGE_FIELDS
                 + module.FLIGHT_CONTRACT_FIELDS
@@ -70,6 +71,7 @@ class TimestampPrecisionTests(unittest.TestCase):
 
         self.assertEqual(row["ground_truth_receive_ros_time_ns"], "1700000000123456789")
         self.assertEqual(row["ground_truth_receive_ros_time_sec"], "1700000000.123456789")
+        self.assertNotEqual(row["ground_truth_receive_monotonic_ns"], "")
         self.assertEqual(row["ground_truth_state"], "VALID")
         self.assertNotEqual(row["ground_truth_receive_age_sec"], "")
         self.assertEqual(row["disparity_difference_px"], "")
@@ -125,6 +127,35 @@ class TimestampPrecisionTests(unittest.TestCase):
         self.assertEqual(recorder.latest["left_image_header_time_ns"], 1_700_000_000_987_654_321)
         self.assertEqual(recorder.latest["left_image_header_time_sec"], 1_700_000_000.9876543)
         self.assertEqual(recorder.last_stamp["/left_camera/detection_image"], 1_700_000_000_987_654_321)
+
+    def test_source_age_uses_monotonic_when_sim_time_pauses_or_resets(self):
+        module = operator_recorder
+        recorder = object.__new__(module.OperatorRecorder)
+        recorder.last_monotonic_stamp = {"/ground_truth_position": 10_000_000_000}
+        latest = {"ground_truth": [1.0, 2.0, 3.0, 4.0]}
+        stamps = {"/ground_truth_position": 0}
+
+        states, ages = recorder._source_state_snapshot(
+            latest,
+            stamps,
+            now_ns=0,
+            monotonic_stamps=recorder.last_monotonic_stamp,
+            now_monotonic_ns=13_000_000_000,
+        )
+        self.assertEqual(states["ground_truth"], "stale")
+        self.assertEqual(ages["ground_truth"], 3.0)
+
+        # A ROS/simulation reset cannot make a receipt fresh; monotonic
+        # ordering still rejects a now-before-receipt observation.
+        states, ages = recorder._source_state_snapshot(
+            latest,
+            {"/ground_truth_position": 5_000_000_000},
+            now_ns=5_000_000_000,
+            monotonic_stamps=recorder.last_monotonic_stamp,
+            now_monotonic_ns=9_000_000_000,
+        )
+        self.assertEqual(states["ground_truth"], "stale")
+        self.assertIsNone(ages["ground_truth"])
 
 
 if __name__ == "__main__":

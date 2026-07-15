@@ -28,6 +28,7 @@ from stereo_ground_sim.simulation_ui_contract import (
     evaluate_recording_readiness,
     evaluate_recording_outcome,
     latest_unsynchronized_disparity_difference_px,
+    source_state_from_monotonic_ns,
 )
 
 cv2 = None
@@ -203,6 +204,19 @@ RECEIVE_TIME_FIELDS = [
 
 RECEIVE_TIME_NS_FIELDS = [
     field.replace("_sec", "_ns") for field in RECEIVE_TIME_FIELDS
+]
+
+RECEIVE_MONOTONIC_NS_FIELDS = [
+    "ground_truth_receive_monotonic_ns",
+    "observed_receive_monotonic_ns",
+    "analytic_receive_monotonic_ns",
+    "corrected_receive_monotonic_ns",
+    "attitude_status_receive_monotonic_ns",
+    "observation_status_receive_monotonic_ns",
+    "profile_status_receive_monotonic_ns",
+    "px4_status_receive_monotonic_ns",
+    "left_image_receive_monotonic_ns",
+    "right_image_receive_monotonic_ns",
 ]
 
 SOURCE_STATE_FIELDS = [
@@ -412,16 +426,20 @@ def _wait_process_reaped(process, timeout_s):
         if return_code is not None:
             try:
                 process.wait(timeout=0)
-            except (AttributeError, OSError, subprocess.TimeoutExpired):
-                pass
-            return True
+            except (AttributeError, OSError, subprocess.TimeoutExpired, TimeoutError):
+                return False
+            return process.poll() is not None
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
-            return process.poll() is not None
+            return False
         try:
             process.wait(timeout=min(0.05, remaining))
-        except (AttributeError, OSError, subprocess.TimeoutExpired):
+        except AttributeError:
+            return False
+        except (subprocess.TimeoutExpired, TimeoutError):
             time.sleep(min(0.02, remaining))
+        except OSError:
+            return False
 
 
 def evaluate_artifact_integrity(
@@ -517,6 +535,7 @@ class OperatorRecorder(Node):
         self._lock = threading.RLock()
         self.latest = {}
         self.last_stamp = {}
+        self.last_monotonic_stamp = {}
         self.counts = {field: 0 for field in COUNTER_FIELDS}
         self._video_writer_errors = {}
         self.csv_file = None
@@ -570,6 +589,7 @@ class OperatorRecorder(Node):
             + RESEARCH_FIELDS
             + RECEIVE_TIME_FIELDS
             + RECEIVE_TIME_NS_FIELDS
+            + RECEIVE_MONOTONIC_NS_FIELDS
             + SOURCE_STATE_FIELDS
             + SOURCE_RECEIVE_AGE_FIELDS
             + FLIGHT_CONTRACT_FIELDS
@@ -659,6 +679,8 @@ class OperatorRecorder(Node):
             "eligibility_events": [],
             "counts": {field: 0 for field in COUNTER_FIELDS},
             "source_states": {},
+            "source_receive_ros_time_ns": {},
+            "source_receive_monotonic_ns": {},
             "source_receive_age_sec": {},
             "flight_contract": None,
             "rosbag_return_code": None,
@@ -669,11 +691,13 @@ class OperatorRecorder(Node):
             "parameter_snapshot_error": "",
             "timestamp_source": {
                 "receive_ros_time_ns": "ROS node clock at callback receipt",
+                "receive_monotonic_ns": "monotonic clock at callback receipt; freshness authority",
                 "image_header_time_ns": "sensor_msgs/Image.header.stamp",
                 "time_sec": "elapsed monotonic compatibility field",
             },
             "timestamp_unit": {
                 "receive_ros_time_ns": "ns",
+                "receive_monotonic_ns": "ns",
                 "image_header_time_ns": "ns",
                 "*_time_sec": "s",
             },
@@ -1093,6 +1117,9 @@ class OperatorRecorder(Node):
             if value is not None:
                 self.latest[topic] = value
             self.last_stamp[topic] = self._now_ros_time_ns()
+            if not hasattr(self, "last_monotonic_stamp"):
+                self.last_monotonic_stamp = {}
+            self.last_monotonic_stamp[topic] = time.monotonic_ns()
             if count_field:
                 if not hasattr(self, "counts"):
                     self.counts = {field: 0 for field in COUNTER_FIELDS}
@@ -1312,7 +1339,14 @@ class OperatorRecorder(Node):
                 count_field="px4_status_message_count",
             )
 
-    def _source_state_snapshot(self, latest, stamps, now_ns):
+    def _source_state_snapshot(
+        self,
+        latest,
+        stamps,
+        now_ns,
+        monotonic_stamps=None,
+        now_monotonic_ns=None,
+    ):
         values = {
             "ground_truth": latest.get("ground_truth"),
             "observed_raw": latest.get("observed_raw"),
@@ -1339,32 +1373,47 @@ class OperatorRecorder(Node):
         }
         states = {}
         ages = {}
-        vector_sources = {"ground_truth", "observed_raw", "analytic_raw", "corrected"}
+        monotonic_stamps = (
+            dict(getattr(self, "last_monotonic_stamp", {}))
+            if monotonic_stamps is None
+            else dict(monotonic_stamps)
+        )
+        now_monotonic_ns = time.monotonic_ns() if now_monotonic_ns is None else int(now_monotonic_ns)
         for key, value in values.items():
             receive_ns = stamps.get(topics[key])
-            age = _age_sec(now_ns, receive_ns)
+            receive_monotonic_ns = monotonic_stamps.get(topics[key])
+            age = _age_sec(now_monotonic_ns, receive_monotonic_ns)
             ages[key] = age
-            if receive_ns in (None, ""):
+            if receive_monotonic_ns in (None, ""):
                 states[key] = "waiting"
-            elif isinstance(value, dict):
-                states[key] = "valid" if value else "invalid"
-            elif key in vector_sources:
-                states[key] = "valid" if _finite_vector(value, 4) else "invalid"
-            elif isinstance(value, (list, tuple)):
-                states[key] = "valid" if _finite_vector(value, len(value)) else "invalid"
             else:
-                states[key] = "valid" if _finite_or_empty(value) else "invalid"
-            if states[key] == "valid" and age is not None and age > STALE_TIMEOUT_S:
-                states[key] = "stale"
+                states[key] = source_state_from_monotonic_ns(
+                    receive_monotonic_ns,
+                    value,
+                    now_monotonic_ns,
+                    STALE_TIMEOUT_S,
+                )
+                # A malformed/rewound monotonic receipt cannot be treated as
+                # current merely because the ROS clock moved forward.
+                if states[key] == "valid" and age is None:
+                    states[key] = "stale"
         return states, ages
 
     def _write_csv_row(self):
         now_ns = self._now_ros_time_ns()
+        now_monotonic_ns = time.monotonic_ns()
         with self._state_lock():
             latest = copy.deepcopy(self.latest)
             stamps = dict(self.last_stamp)
+            monotonic_stamps = dict(getattr(self, "last_monotonic_stamp", {}))
             counts = dict(getattr(self, "counts", {}))
-        states, ages = self._source_state_snapshot(latest, stamps, now_ns)
+        states, ages = self._source_state_snapshot(
+            latest,
+            stamps,
+            now_ns,
+            monotonic_stamps,
+            now_monotonic_ns,
+        )
         elapsed = time.monotonic() - self.start_monotonic
         row = {
             "time_sec": f"{elapsed:.9f}",
@@ -1504,6 +1553,10 @@ class OperatorRecorder(Node):
             receive_ns = stamps.get(topic)
             row[f"{prefix}_receive_ros_time_sec"] = _timestamp_sec_from_ns(receive_ns)
             row[f"{prefix}_receive_ros_time_ns"] = "" if receive_ns in (None, "") else str(int(receive_ns))
+            receive_monotonic_ns = monotonic_stamps.get(topic)
+            row[f"{prefix}_receive_monotonic_ns"] = (
+                "" if receive_monotonic_ns in (None, "") else str(int(receive_monotonic_ns))
+            )
             row[f"{prefix}_state"] = states.get(source, "waiting").upper()
             row[f"{prefix}_receive_age_sec"] = _csv_value(ages.get(source))
         for side in ("left", "right"):
@@ -1540,6 +1593,9 @@ class OperatorRecorder(Node):
                 self._touch_topic(topic, count_field=f"{camera_name}_image_received_count")
             else:  # compatibility with the lightweight callback fixture
                 self.last_stamp[topic] = self.get_clock().now().nanoseconds
+                if not hasattr(self, "last_monotonic_stamp"):
+                    self.last_monotonic_stamp = {}
+                self.last_monotonic_stamp[topic] = time.monotonic_ns()
         image = self._msg_to_bgr(msg)
         if image is None:
             return
@@ -1623,10 +1679,18 @@ class OperatorRecorder(Node):
 
     def _final_readiness(self):
         now_ns = self._now_ros_time_ns()
+        now_monotonic_ns = time.monotonic_ns()
         with self._state_lock():
             latest = copy.deepcopy(self.latest)
             stamps = dict(self.last_stamp)
-        states, ages = self._source_state_snapshot(latest, stamps, now_ns)
+            monotonic_stamps = dict(getattr(self, "last_monotonic_stamp", {}))
+        states, ages = self._source_state_snapshot(
+            latest,
+            stamps,
+            now_ns,
+            monotonic_stamps,
+            now_monotonic_ns,
+        )
         observation = latest.get("observation_status") or {}
         readiness = evaluate_recording_readiness(
             mode=self.mode,
@@ -1664,6 +1728,27 @@ class OperatorRecorder(Node):
         self._manifest["counts"] = {field: int(counts.get(field, 0)) for field in COUNTER_FIELDS}
         self._manifest["source_states"] = states
         self._manifest["source_receive_age_sec"] = ages
+        with self._state_lock():
+            receive_ros_stamps = dict(self.last_stamp)
+            receive_monotonic_stamps = dict(getattr(self, "last_monotonic_stamp", {}))
+        source_topics = {
+            "ground_truth": "/ground_truth_position",
+            "observed_raw": "/stereo/estimated_position",
+            "analytic_raw": "/stereo/attitude_model/raw/estimated_position",
+            "corrected": "/stereo/corrected_position",
+            "attitude_status": "/stereo/attitude_model/status",
+            "observation_status": "/stereo/observation_status",
+            "profile_status": "/stereo/profile_status",
+            "px4_status": "/simulation/px4/status",
+            "left_image": "/left_camera/detection_image",
+            "right_image": "/right_camera/detection_image",
+        }
+        self._manifest["source_receive_ros_time_ns"] = {
+            key: receive_ros_stamps.get(topic) for key, topic in source_topics.items()
+        }
+        self._manifest["source_receive_monotonic_ns"] = {
+            key: receive_monotonic_stamps.get(topic) for key, topic in source_topics.items()
+        }
         self._manifest["readiness_at_end"] = readiness.as_dict()
         self._manifest["eligibility_events"] = events
         self._manifest["eligibility_reasons"] = list(readiness.reasons)

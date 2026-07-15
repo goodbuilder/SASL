@@ -8,9 +8,19 @@ from pathlib import Path
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+_MISSING = object()
+_QT_MODULE_NAMES = (
+    "python_qt_binding",
+    "python_qt_binding.QtCore",
+    "python_qt_binding.QtWidgets",
+    "qt_gui",
+    "qt_gui.plugin",
+    "stereo_ground_sim.recording_control",
+)
 
 
-def install_qt_stubs() -> None:
+def install_qt_stubs():
+    previous = {name: sys.modules.get(name, _MISSING) for name in _QT_MODULE_NAMES}
     qt_core = types.ModuleType("python_qt_binding.QtCore")
     qt_widgets = types.ModuleType("python_qt_binding.QtWidgets")
     qt_gui = types.ModuleType("qt_gui.plugin")
@@ -53,20 +63,32 @@ def install_qt_stubs() -> None:
     sys.modules["python_qt_binding.QtWidgets"] = qt_widgets
     sys.modules["qt_gui"] = types.ModuleType("qt_gui")
     sys.modules["qt_gui.plugin"] = qt_gui
+    return previous
+
+
+def restore_qt_modules(previous) -> None:
+    for name, module in previous.items():
+        if module is _MISSING:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
 
 def load_panel_module():
-    install_qt_stubs()
-    spec = importlib.util.spec_from_file_location(
-        "recorder_panel_under_test",
-        ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "recorder_panel.py",
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load recorder_panel.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    previous = install_qt_stubs()
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "recorder_panel_under_test",
+            ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "recorder_panel.py",
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("cannot load recorder_panel.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        restore_qt_modules(previous)
 
 
 class RecorderPanelTruthSourceTests(unittest.TestCase):

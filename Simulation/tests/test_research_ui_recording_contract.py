@@ -27,7 +27,11 @@ from stereo_ground_sim.recording_control import (  # noqa: E402
     sanitize_run_name,
     unique_output_dir,
 )
-from stereo_ground_sim.simulation_ui_contract import RecordingReadiness  # noqa: E402
+from stereo_ground_sim import recording_control  # noqa: E402
+from stereo_ground_sim.recorder_panel import RecorderPanel  # noqa: E402
+from stereo_ground_sim.simulation_ui_contract import (  # noqa: E402
+    RecordingReadiness,
+)
 
 
 def write_success_manifest(controller):
@@ -142,6 +146,11 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
             def send_signal(self, sig):
                 self.signals.append(sig)
 
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise TimeoutError(timeout)
+                return self.returncode
+
         processes = []
 
         def factory(*_args, **_kwargs):
@@ -176,11 +185,19 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
         class FakeProcess:
             pid = 9876541
 
+            def __init__(self):
+                self.returncode = None
+
             def poll(self):
-                return None
+                return self.returncode
 
             def send_signal(self, _sig):
-                return None
+                self.returncode = 0
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise TimeoutError(timeout)
+                return self.returncode
 
         controller = RecordingSessionController(
             process_factory=lambda *_args, **_kwargs: FakeProcess(),
@@ -217,6 +234,95 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
         widget.deleteLater()
         app.processEvents()
 
+    def test_standalone_recorder_panel_uses_shared_readiness_model(self):
+        try:
+            from python_qt_binding.QtWidgets import QApplication
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"Qt unavailable: {exc}")
+        app = QApplication.instance() or QApplication([])
+
+        from python_qt_binding.QtCore import QObject
+
+        class Context(QObject):
+            def __init__(self):
+                super().__init__()
+                self.widget = None
+
+            def add_widget(self, widget):
+                self.widget = widget
+
+        context = Context()
+        # Exercise the standalone panel without requiring a live ROS graph;
+        # its subscriber still owns the same pure model used by OperatorPanel.
+        with patch.object(recording_control, "rclpy", None):
+            panel = RecorderPanel(context)
+        self.assertFalse(panel._recording_control.start_button.isEnabled())
+
+        model = panel._readiness_subscriber.model
+        now = 10_000_000_000
+        safe_px4 = {
+            "px4_connected": True,
+            "flight_contract": {
+                "verified": True,
+                "source": "stereo_distance_node_parameters",
+                "flight_authority": "px4_sitl",
+                "fly_target_in_gazebo": False,
+                "mission_profile": "manual",
+                "actual_distance_source": "gazebo",
+            },
+        }
+        safe_observation = {
+            "observation_mode": "both",
+            "oracle_source_role": "target_reference_link",
+            "oracle_valid": True,
+            "oracle_fallback_used": False,
+            "bbox_left_valid": True,
+            "bbox_right_valid": True,
+        }
+        fixture = {
+            "ground_truth": [10.0, 1.0, 2.0, 10.3],
+            "observed_raw": [10.1, 1.1, 2.1, 10.5],
+            "analytic_raw": [10.2, 1.2, 2.2, 10.6],
+            "corrected": [10.0, 1.0, 2.0, 10.3],
+            "attitude_status": safe_observation,
+            "observation_status": safe_observation,
+            "profile_status": {"profile_mode": "no_profile"},
+            "px4_status": safe_px4,
+            "left_image": {"received": True},
+            "right_image": {"received": True},
+        }
+        for key, value in fixture.items():
+            model.update(key, value, receive_ros_time_ns=now, receive_monotonic_ns=now)
+        panel._recording_control.set_readiness(model.readiness(now_monotonic_ns=now))
+        self.assertTrue(panel._recording_control.start_button.isEnabled())
+        self.assertIn("PARAMETER SNAPSHOT PENDING", panel._recording_control.readiness_label.text())
+        self.assertNotIn("FORMAL READY", panel._recording_control.readiness_label.text())
+
+        panel._recording_control.mode_combo.setCurrentIndex(2)
+        self.assertTrue(panel._recording_control.start_button.isEnabled())
+        self.assertIn("DEBUG", panel._recording_control.readiness_label.text())
+        panel.shutdown_plugin()
+        panel._widget.deleteLater()
+        app.processEvents()
+
+    def test_read_only_save_root_becomes_ui_error(self):
+        try:
+            from python_qt_binding.QtWidgets import QApplication
+        except Exception as exc:  # pragma: no cover
+            self.skipTest(f"Qt unavailable: {exc}")
+        app = QApplication.instance() or QApplication([])
+        widget = RecordingControlWidget()
+        widget.set_readiness(RecordingReadiness(True, True, ()))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "save-root-file"
+            root.write_text("not a directory", encoding="utf-8")
+            widget.save_root_edit.setText(str(root))
+            self.assertFalse(widget._start())
+            self.assertEqual(widget.state_label.text(), "ERROR")
+            self.assertIn("ERROR", widget.state_label.text())
+        widget.deleteLater()
+        app.processEvents()
+
     def test_controller_rejects_duplicate_start_and_uses_nonblocking_stop(self):
         try:
             from python_qt_binding.QtWidgets import QApplication
@@ -236,6 +342,11 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
 
             def send_signal(self, sig):
                 self.signals.append(sig)
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise TimeoutError(timeout)
+                return self.returncode
 
         process = FakeProcess()
         controller = RecordingSessionController(
@@ -268,6 +379,11 @@ class ResearchUiRecordingContractTests(unittest.TestCase):
                 self.returncode = None
 
             def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                if self.returncode is None:
+                    raise TimeoutError(timeout)
                 return self.returncode
 
         process = FakeProcess()
