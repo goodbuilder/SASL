@@ -4,3 +4,4 @@ ultralytics
 av
 pyulog
 pyserial
+pyarrow>=14.0
