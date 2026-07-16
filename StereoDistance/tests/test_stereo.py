@@ -1,4 +1,5 @@
 import struct
+import threading
 import time
 from pathlib import Path
 
@@ -3334,7 +3335,7 @@ def test_ros2_connections_are_split_by_pixhawk_side(monkeypatch) -> None:
     _ = app
 
 
-def test_camera_pane_stop_requests_worker_without_blocking_thread_wait() -> None:
+def test_camera_pane_retains_worker_until_finished() -> None:
     from PyQt5 import QtCore, QtWidgets
 
     from wiris_stereo_distance.camera_pane import CameraPane
@@ -3366,8 +3367,8 @@ def test_camera_pane_stop_requests_worker_without_blocking_thread_wait() -> None
 
     assert elapsed_s < 0.05
     assert calls == ["request_stop"]
-    assert pane.worker is None
-    assert pane.thread is None
+    assert pane.worker is not None
+    assert pane.thread is not None
 
     pane.deleteLater()
     _ = app
@@ -4162,6 +4163,810 @@ def test_camera_pane_ignores_stale_thread_finished_signal() -> None:
     pane.deleteLater()
     old_thread.deleteLater()
     current_thread.deleteLater()
+    _ = app
+
+
+def test_camera_pane_force_stop_cleans_worker_off_gui_without_terminating_qthread() -> None:
+    import threading
+
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.camera_pane import CameraPane
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    gui_thread_id = threading.get_ident()
+    stop_finished = threading.Event()
+    operations = []
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            operations.append(("request_stop", threading.get_ident()))
+
+        def stop(self) -> None:
+            operations.append(("stop", threading.get_ident()))
+            stop_finished.set()
+
+    class FakeThread:
+        def requestInterruption(self) -> None:
+            operations.append(("requestInterruption", threading.get_ident()))
+
+        def quit(self) -> None:
+            operations.append(("quit", threading.get_ident()))
+
+        def terminate(self) -> None:
+            raise AssertionError("force stop must not terminate QThread before child cleanup")
+
+        def wait(self, *_args, **_kwargs) -> None:
+            raise AssertionError("force stop must not wait in the GUI thread")
+
+    pane.worker = FakeWorker()
+    pane.thread = FakeThread()
+
+    pane.force_stop_async()
+
+    assert stop_finished.wait(1.0)
+    assert ("request_stop", gui_thread_id) in operations
+    assert ("requestInterruption", gui_thread_id) in operations
+    assert ("quit", gui_thread_id) in operations
+    stop_thread_ids = [thread_id for name, thread_id in operations if name == "stop"]
+    assert len(stop_thread_ids) == 1
+    assert stop_thread_ids[0] != gui_thread_id
+    pane.worker = None
+    pane.thread = None
+    pane.deleteLater()
+    _ = app
+
+
+def test_camera_pane_force_stop_is_scoped_to_current_worker_generation() -> None:
+    import threading
+
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.camera_pane import CameraPane
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    first_started = threading.Event()
+    first_release = threading.Event()
+    first_finished = threading.Event()
+    second_finished = threading.Event()
+    stop_calls = []
+
+    class FakeWorker:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def request_stop(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            stop_calls.append(self.name)
+            if self.name == "first":
+                first_started.set()
+                first_release.wait(1.0)
+                first_finished.set()
+            else:
+                second_finished.set()
+
+    class FakeThread:
+        def requestInterruption(self) -> None:
+            pass
+
+        def quit(self) -> None:
+            pass
+
+    pane.thread = FakeThread()
+    pane.worker = FakeWorker("first")
+    pane.force_stop_async()
+    assert first_started.wait(1.0)
+
+    pane.worker = FakeWorker("second")
+    pane.force_stop_async()
+
+    assert second_finished.wait(1.0)
+    first_release.set()
+    assert first_finished.wait(1.0)
+    assert stop_calls == ["first", "second"]
+    pane.worker = None
+    pane.thread = None
+    pane.deleteLater()
+    _ = app
+
+
+def _session_widget_with_fake_controller(monkeypatch):
+    from PyQt5 import QtCore, QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    class FakeController(QtCore.QObject):
+        opened = QtCore.pyqtSignal(object)
+        state_changed = QtCore.pyqtSignal(str, object)
+        session_terminal = QtCore.pyqtSignal(object)
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__()
+            self.open_calls = []
+            self.events = []
+            self.terminals = []
+            self.timeout_reasons = []
+            self.shutdown_calls = []
+            self.shutdown_event = threading.Event()
+
+        def open_session(self, config) -> bool:
+            self.open_calls.append(config)
+            return True
+
+        def submit_recording_event(self, event) -> bool:
+            self.events.append(event)
+            return True
+
+        def submit_camera_terminal(self, terminal) -> bool:
+            self.terminals.append(terminal)
+            return True
+
+        def finalize_timeout(self, reason: str) -> bool:
+            self.timeout_reasons.append(reason)
+            return True
+
+        def shutdown(self, timeout_s: float = 5.0) -> bool:
+            self.shutdown_calls.append(timeout_s)
+            self.shutdown_event.set()
+            return True
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "SessionCameraRecordingController", FakeController)
+    monkeypatch.delenv(gui.I_FRAME_ONLY_ENV, raising=False)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    return gui, app, widget, widget.session_camera_recorder
+
+
+def test_session_start_rejects_non_gstreamer_before_recorder_open(monkeypatch) -> None:
+    gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.stream_backend_combo.setCurrentIndex(widget.stream_backend_combo.findData(gui.STREAM_BACKEND_PYAV))
+
+    widget._start_session_recording()
+
+    assert controller.open_calls == []
+    assert widget.session_state == "failed"
+    widget.deleteLater()
+    _ = app
+
+
+def test_session_start_rejects_keyframe_only_before_recorder_open(monkeypatch) -> None:
+    gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    monkeypatch.setenv(gui.I_FRAME_ONLY_ENV, "1")
+
+    widget._start_session_recording()
+
+    assert controller.open_calls == []
+    assert widget.session_state == "failed"
+    widget.deleteLater()
+    _ = app
+
+
+def test_rapid_repeat_sessions_use_unique_phase_a_ids(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+
+    widget._start_session_recording()
+    first_id = controller.open_calls[-1].session_id
+    widget.session_state = "complete"
+    widget._start_session_recording()
+    second_id = controller.open_calls[-1].session_id
+
+    assert first_id != second_id
+    assert first_id.startswith("20") and second_id.startswith("20")
+    widget.deleteLater()
+    _ = app
+
+
+def test_session_start_waits_for_old_preview_workers(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            pass
+
+    class FakeThread:
+        pass
+
+    widget.left_pane.worker = FakeWorker()
+    widget.left_pane.thread = FakeThread()
+    widget.right_pane.worker = FakeWorker()
+    widget.right_pane.thread = FakeThread()
+
+    widget._start_session_recording()
+    assert controller.open_calls == []
+
+    widget.left_pane.worker = None
+    widget.left_pane.thread = None
+    widget._handle_camera_pane_finished("left")
+    assert controller.open_calls == []
+
+    widget.right_pane.worker = None
+    widget.right_pane.thread = None
+    widget._handle_camera_pane_finished("right")
+    assert len(controller.open_calls) == 1
+    widget.deleteLater()
+    _ = app
+
+
+def test_session_start_is_gated_during_camera_stop_transition(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget._camera_stop_transition_active = True
+
+    widget._start_session_recording()
+
+    assert controller.open_calls == []
+    assert widget.session_state == "idle"
+    assert widget.recording_session_id == ""
+    widget._camera_stop_transition_active = False
+    widget.deleteLater()
+    _ = app
+
+
+def test_session_passes_same_id_and_distinct_canonical_mkv_paths(monkeypatch, tmp_path) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    starts = {}
+    widget.left_pane.start_stream = lambda url, **kwargs: starts.setdefault("left", (url, kwargs))
+    widget.right_pane.start_stream = lambda url, **kwargs: starts.setdefault("right", (url, kwargs))
+
+    widget._start_session_recording()
+    session_id = controller.open_calls[0].session_id
+    controller.opened.emit(
+        {
+            "session_id": session_id,
+            "paths": {
+                "session_dir": tmp_path / f"session_{session_id}",
+                "left_video": tmp_path / f"session_{session_id}" / "camera" / "left_video.mkv",
+                "right_video": tmp_path / f"session_{session_id}" / "camera" / "right_video.mkv",
+            },
+        }
+    )
+
+    assert starts["left"][1]["session_id"] == session_id
+    assert starts["right"][1]["session_id"] == session_id
+    assert starts["left"][1]["record_video_path"] != starts["right"][1]["record_video_path"]
+    assert starts["left"][1]["record_video_path"].endswith("left_video.mkv")
+    assert starts["right"][1]["record_video_path"].endswith("right_video.mkv")
+    widget.deleteLater()
+    _ = app
+
+
+def test_session_enters_recording_only_after_both_cameras_ready(monkeypatch, tmp_path) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.left_pane.start_stream = lambda *_args, **_kwargs: None
+    widget.right_pane.start_stream = lambda *_args, **_kwargs: None
+    widget._start_session_recording()
+    session_id = controller.open_calls[0].session_id
+    controller.opened.emit(
+        {
+            "session_id": session_id,
+            "paths": {
+                "left_video": tmp_path / "left_video.mkv",
+                "right_video": tmp_path / "right_video.mkv",
+            },
+        }
+    )
+
+    widget._handle_session_camera_ready({"session_id": session_id, "camera_side": "left"})
+    assert widget.session_state == "starting"
+    widget._handle_session_camera_ready({"session_id": session_id, "camera_side": "right"})
+    assert widget.session_state == "recording"
+    widget.deleteLater()
+    _ = app
+
+
+def test_right_worker_start_failure_rolls_back_session(monkeypatch, tmp_path) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    starts = []
+    stops = []
+    widget.left_pane.start_stream = lambda *_args, **_kwargs: starts.append("left")
+
+    def fail_right(*_args, **_kwargs) -> None:
+        starts.append("right")
+        raise RuntimeError("right start failed")
+
+    widget.right_pane.start_stream = fail_right
+    widget.left_pane.stop = lambda: stops.append("left")
+    widget.right_pane.stop = lambda: stops.append("right")
+    widget._start_session_recording()
+    session_id = controller.open_calls[0].session_id
+    stops.clear()
+
+    controller.opened.emit(
+        {
+            "session_id": session_id,
+            "paths": {
+                "left_video": tmp_path / "left_video.mkv",
+                "right_video": tmp_path / "right_video.mkv",
+            },
+        }
+    )
+
+    assert starts == ["left", "right"]
+    assert stops == ["left", "right"]
+    assert widget.session_state == "stopping"
+    assert widget._session_restart_preview is False
+    assert widget._session_finalize_timer.isActive()
+    assert controller.events[-1]["event_kind"] == "camera_failure"
+    assert controller.events[-1]["camera_side"] == "right"
+    assert controller.events[-1]["failure_stage"] == "camera_worker_start_failed"
+    widget._session_finalize_timer.stop()
+    widget.deleteLater()
+    _ = app
+
+
+def test_local_session_failure_is_normalized_for_adapter_control(monkeypatch, tmp_path) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget._start_session_recording()
+    session_id = controller.open_calls[0].session_id
+    duplicate_path = tmp_path / "same_video.mkv"
+
+    controller.opened.emit(
+        {
+            "session_id": session_id,
+            "paths": {
+                "left_video": duplicate_path,
+                "right_video": duplicate_path,
+            },
+        }
+    )
+
+    failure = controller.events[-1]
+    assert failure["event_kind"] == "camera_failure"
+    assert failure["session_id"] == session_id
+    assert failure["camera_side"] == "left"
+    assert failure["failure_stage"] == "canonical_video_paths_invalid"
+    assert "record_event_sequence" not in failure
+    assert widget.session_state == "stopping"
+    widget._session_finalize_timer.stop()
+    widget.deleteLater()
+    _ = app
+
+
+def test_preview_restart_occurs_only_after_session_terminal(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    starts = []
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            pass
+
+    class FakeThread:
+        pass
+
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-test"
+    widget._session_open_requested = True
+    widget.left_pane.worker = FakeWorker()
+    widget.left_pane.thread = FakeThread()
+    widget.right_pane.worker = FakeWorker()
+    widget.right_pane.thread = FakeThread()
+    widget.left_pane.start_stream = lambda url, **kwargs: starts.append(("left", url, kwargs))
+    widget.right_pane.start_stream = lambda url, **kwargs: starts.append(("right", url, kwargs))
+
+    widget._stop_session_recording()
+    assert widget.session_state == "stopping"
+    assert starts == []
+
+    result = {"session_id": "session-test", "session_state": "complete"}
+    controller.session_terminal.emit(result)
+    controller.session_terminal.emit(result)
+    assert starts == []
+    assert widget._camera_stop_transition_active is True
+
+    widget.left_pane.worker = None
+    widget.left_pane.thread = None
+    widget._handle_camera_pane_finished("left")
+    assert starts == []
+
+    widget.right_pane.worker = None
+    widget.right_pane.thread = None
+    widget._handle_camera_pane_finished("right")
+    assert [side for side, _url, _kwargs in starts] == ["left", "right"]
+    assert all(kwargs["enable_detection"] is False for _side, _url, kwargs in starts)
+    widget.deleteLater()
+    _ = app
+
+
+def test_application_close_is_asynchronous(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-close"
+    widget._session_open_requested = True
+
+    assert widget.request_application_close() is True
+    assert widget.session_state == "stopping"
+    assert widget._close_pending is True
+
+    controller.session_terminal.emit({"session_id": "session-close", "session_state": "incomplete"})
+    assert widget._close_guarded is True
+    widget.deleteLater()
+    _ = app
+
+
+def test_application_close_timeout_waits_for_recorder_terminal_and_worker_barrier(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    operations = []
+    forced_sides = []
+    close_ready = []
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            operations.append("request_stop")
+
+    class HungThread:
+        pass
+
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-close-timeout"
+    widget._session_open_requested = True
+    widget.left_pane.worker = FakeWorker()
+    widget.left_pane.thread = HungThread()
+    widget.right_pane.worker = FakeWorker()
+    widget.right_pane.thread = HungThread()
+    widget.left_pane.force_stop_async = lambda: forced_sides.append("left")
+    widget.right_pane.force_stop_async = lambda: forced_sides.append("right")
+    widget.application_close_ready.connect(lambda: close_ready.append(True))
+
+    assert widget.request_application_close() is True
+    widget._handle_session_finalize_timeout()
+
+    assert controller.timeout_reasons == ["dual_camera_finalize_timeout"]
+    assert forced_sides == ["left", "right"]
+    assert widget._close_pending is True
+    assert widget.request_application_close() is True
+    widget._complete_application_close()
+    assert widget._close_guarded is False
+    assert close_ready == []
+    assert controller.shutdown_calls == []
+
+    controller.session_terminal.emit(
+        {"session_id": "session-close-timeout", "session_state": "incomplete"}
+    )
+    assert widget._close_pending is True
+    assert widget._close_guarded is False
+    assert close_ready == []
+    assert controller.shutdown_calls == []
+
+    widget.left_pane.worker = None
+    widget.left_pane.thread = None
+    widget._handle_camera_pane_finished("left")
+    assert close_ready == []
+
+    widget.right_pane.worker = None
+    widget.right_pane.thread = None
+    widget._handle_camera_pane_finished("right")
+
+    assert widget._close_pending is False
+    assert widget._close_guarded is True
+    assert widget.session_state == "incomplete"
+    assert close_ready == [True]
+    assert controller.shutdown_event.wait(1.0)
+    assert controller.shutdown_calls == [5.0]
+    widget.deleteLater()
+    _ = app
+
+
+def test_manual_stop_aggregate_timeout_force_stops_both_camera_panes(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    forced_sides = []
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-manual-timeout"
+    widget._session_open_requested = True
+    widget.left_pane.force_stop_async = lambda: forced_sides.append("left")
+    widget.right_pane.force_stop_async = lambda: forced_sides.append("right")
+
+    widget._stop_session_recording()
+    widget._handle_session_finalize_timeout()
+
+    assert controller.timeout_reasons == ["dual_camera_finalize_timeout"]
+    assert forced_sides == ["left", "right"]
+    assert widget.session_state == "stopping"
+    assert widget._close_pending is False
+    widget._session_finalize_timer.stop()
+    widget.deleteLater()
+    _ = app
+
+
+def test_stop_waits_for_both_terminal_results(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-terminals"
+    widget._session_open_requested = True
+    widget._start_camera_streams = lambda **_kwargs: None
+    widget._stop_session_recording()
+
+    widget._handle_session_camera_terminal(
+        {"session_id": "session-terminals", "camera_side": "left", "last_emitted_event_sequence": 1}
+    )
+    assert widget.session_state == "stopping"
+    widget._handle_session_camera_terminal(
+        {"session_id": "session-terminals", "camera_side": "right", "last_emitted_event_sequence": 2}
+    )
+    assert widget.session_state == "stopping"
+    assert len(controller.terminals) == 2
+
+    controller.session_terminal.emit({"session_id": "session-terminals", "session_state": "complete"})
+    assert widget.session_state == "complete"
+    widget.deleteLater()
+    _ = app
+
+
+def test_dual_camera_terminal_barrier_stops_timeout_before_recorder_finalization(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-terminal-timeout-barrier"
+    widget._session_open_requested = True
+
+    widget._stop_session_recording()
+    assert widget._session_finalize_timer.isActive()
+
+    widget._handle_session_camera_terminal(
+        {
+            "session_id": "session-terminal-timeout-barrier",
+            "camera_side": "left",
+            "terminal_status": "complete",
+            "last_emitted_event_sequence": 1,
+        }
+    )
+    assert widget._session_finalize_timer.isActive()
+
+    widget._handle_session_camera_terminal(
+        {
+            "session_id": "session-terminal-timeout-barrier",
+            "camera_side": "right",
+            "terminal_status": "complete",
+            "last_emitted_event_sequence": 1,
+        }
+    )
+
+    assert widget._session_finalize_timer.isActive() is False
+    assert widget._session_recorder_terminal_received is False
+    assert widget.session_state == "stopping"
+    assert len(controller.terminals) == 2
+    assert controller.timeout_reasons == []
+    widget.deleteLater()
+    _ = app
+
+
+def test_unilateral_clean_terminal_uses_common_finalize(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    stop_calls = []
+
+    class FakeWorker:
+        def __init__(self, side: str) -> None:
+            self.side = side
+
+        def request_stop(self) -> None:
+            stop_calls.append(self.side)
+
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-clean-eos"
+    widget._session_open_requested = True
+    widget.left_pane.worker = FakeWorker("left")
+    widget.right_pane.worker = FakeWorker("right")
+
+    widget._handle_session_camera_terminal(
+        {
+            "session_id": "session-clean-eos",
+            "camera_side": "left",
+            "terminal_status": "complete",
+            "last_emitted_event_sequence": 3,
+            "eos_ok": True,
+        }
+    )
+
+    assert len(controller.terminals) == 1
+    assert widget.session_state == "stopping"
+    assert widget._session_stop_reason == "left_camera_complete"
+    assert widget._session_restart_preview is False
+    assert stop_calls == ["left", "right"]
+    assert widget._session_finalize_timer.isActive()
+    widget._session_finalize_timer.stop()
+    widget.left_pane.worker = None
+    widget.right_pane.worker = None
+    widget.deleteLater()
+    _ = app
+
+
+def test_stop_waits_for_recorder_sequence_barrier(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-barrier"
+    widget._session_open_requested = True
+    widget._start_camera_streams = lambda **_kwargs: None
+
+    widget._stop_session_recording()
+    widget._handle_session_camera_terminal(
+        {"session_id": "session-barrier", "camera_side": "left", "last_emitted_event_sequence": 4}
+    )
+    widget._handle_session_camera_terminal(
+        {"session_id": "session-barrier", "camera_side": "right", "last_emitted_event_sequence": 7}
+    )
+
+    assert widget.session_state == "stopping"
+    controller.session_terminal.emit({"session_id": "session-barrier", "session_state": "complete"})
+    assert widget.session_state == "complete"
+    widget.deleteLater()
+    _ = app
+
+
+def test_duplicate_stop_is_disabled(monkeypatch) -> None:
+    _gui, app, widget, _controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-stop-once"
+    widget._session_open_requested = True
+
+    widget._stop_session_recording()
+    first_reason = widget._session_stop_reason
+    widget._stop_session_recording()
+
+    assert widget.session_state == "stopping"
+    assert widget.record_button.isEnabled() is False
+    assert widget._session_stop_reason == first_reason == "manual_stop"
+    widget.deleteLater()
+    _ = app
+
+
+def test_duplicate_recorder_terminal_during_application_close_is_idempotent(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    close_ready = []
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            pass
+
+    class FakeThread:
+        pass
+
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-terminal-once"
+    widget._session_open_requested = True
+    widget.left_pane.worker = FakeWorker()
+    widget.left_pane.thread = FakeThread()
+    widget.right_pane.worker = FakeWorker()
+    widget.right_pane.thread = FakeThread()
+    widget.application_close_ready.connect(lambda: close_ready.append(True))
+
+    assert widget.request_application_close() is True
+    result = {"session_id": "session-terminal-once", "session_state": "incomplete"}
+    controller.session_terminal.emit(result)
+    assert widget._camera_stop_transition_active is True
+    controller.session_terminal.emit(result)
+    assert close_ready == []
+
+    widget.left_pane.worker = None
+    widget.left_pane.thread = None
+    widget._handle_camera_pane_finished("left")
+    assert close_ready == []
+    widget.right_pane.worker = None
+    widget.right_pane.thread = None
+    widget._handle_camera_pane_finished("right")
+
+    assert close_ready == [True]
+    assert widget._close_guarded is True
+    assert controller.shutdown_event.wait(1.0)
+    assert controller.shutdown_calls == [5.0]
+    widget.deleteLater()
+    _ = app
+
+
+def test_manual_stop_then_camera_failure_revokes_preview_restart(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    restarts = []
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-manual-then-failure"
+    widget._session_open_requested = True
+    widget._start_camera_streams = lambda **kwargs: restarts.append(kwargs)
+
+    widget._stop_session_recording()
+    assert widget._session_restart_preview is True
+    widget._handle_session_camera_failure(
+        {
+            "session_id": "session-manual-then-failure",
+            "camera_side": "left",
+            "failure_stage": "stream_error",
+            "detail": "late failure during stop",
+        }
+    )
+    assert widget._session_restart_preview is False
+
+    controller.session_terminal.emit(
+        {"session_id": "session-manual-then-failure", "session_state": "incomplete"}
+    )
+
+    assert restarts == []
+    assert widget.camera_connected is False
+    widget.deleteLater()
+    _ = app
+
+
+def test_disconnect_uses_common_finalize_without_restart(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    restarts = []
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-disconnect"
+    widget._session_open_requested = True
+    widget._start_camera_streams = lambda **kwargs: restarts.append(kwargs)
+
+    widget.stop_yolo_streams()
+    assert widget.session_state == "stopping"
+    assert widget._session_stop_reason == "disconnect"
+    controller.session_terminal.emit({"session_id": "session-disconnect", "session_state": "incomplete"})
+    assert restarts == []
+    assert widget.camera_connected is False
+    widget.deleteLater()
+    _ = app
+
+
+def test_stream_error_uses_common_finalize_without_restart(monkeypatch) -> None:
+    _gui, app, widget, controller = _session_widget_with_fake_controller(monkeypatch)
+    restarts = []
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-error"
+    widget._session_open_requested = True
+    widget._start_camera_streams = lambda **kwargs: restarts.append(kwargs)
+
+    widget._handle_session_camera_failure(
+        {"session_id": "session-error", "camera_side": "left", "failure_stage": "stream_error", "detail": "boom"}
+    )
+    assert widget.session_state == "stopping"
+    controller.session_terminal.emit({"session_id": "session-error", "session_state": "incomplete"})
+    assert restarts == []
+    widget.deleteLater()
+    _ = app
+
+
+def test_recording_backpressure_state_uses_common_finalize(monkeypatch) -> None:
+    _gui, app, widget, _controller = _session_widget_with_fake_controller(monkeypatch)
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-backpressure"
+    widget._session_open_requested = True
+
+    widget._handle_session_recorder_state_changed(
+        "stopping",
+        {"failure_stage": "recording_ipc_backpressure", "detail": "full"},
+    )
+
+    assert widget.session_state == "stopping"
+    assert widget._session_stop_reason == "recording_ipc_backpressure"
+    assert widget._session_restart_preview is False
+    widget.deleteLater()
+    _ = app
+
+
+def test_gui_thread_does_not_wait_for_recorder_or_worker(monkeypatch) -> None:
+    _gui, app, widget, _controller = _session_widget_with_fake_controller(monkeypatch)
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            pass
+
+    class FakeThread:
+        def wait(self, *_args, **_kwargs):
+            raise AssertionError("GUI session lifecycle must not wait for camera threads")
+
+    widget.session_state = "recording"
+    widget.recording_session_id = "session-nonblocking"
+    widget._session_open_requested = True
+    widget.left_pane.worker = FakeWorker()
+    widget.left_pane.thread = FakeThread()
+    widget.right_pane.worker = FakeWorker()
+    widget.right_pane.thread = FakeThread()
+
+    widget._stop_session_recording()
+
+    assert widget.session_state == "stopping"
+    assert widget.left_pane.thread is not None
+    assert widget.right_pane.thread is not None
+    widget.left_pane.worker = None
+    widget.left_pane.thread = None
+    widget.right_pane.worker = None
+    widget.right_pane.thread = None
+    widget.deleteLater()
     _ = app
 
 

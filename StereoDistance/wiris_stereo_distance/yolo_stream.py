@@ -61,6 +61,13 @@ UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
 MAX_RECORD_VIDEO_QUEUE_SIZE = 60
+DEFAULT_RECORDING_EVENT_QUEUE_SIZE = 1024
+DEFAULT_RECORDING_EVENT_PUT_TIMEOUT_S = 1.0
+DEFAULT_FIRST_KEYFRAME_TIMEOUT_MS = 10_000
+DEFAULT_RECORDING_EOS_TIMEOUT_MS = 3_000
+GST_NANOSECONDS_TIME_BASE = 1_000_000_000
+INT64_MODULUS = 1 << 64
+INT64_SIGN_BIT = 1 << 63
 
 
 def _positive_int_config(config: dict[str, Any], key: str, default: int, *, allow_zero: bool = False) -> int:
@@ -262,7 +269,10 @@ def _gst_location(value: str) -> str:
 
 
 def _gst_string_literal(value: str) -> str:
-    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    # GstParse accepts literal newlines inside a quoted property value.  A
+    # backslash-n escape is *not* decoded as a newline (it becomes ``n``), so
+    # preserve newline characters and escape only GstParse's quote delimiters.
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
     return f'"{escaped}"'
 
 
@@ -570,11 +580,51 @@ def decoder_element_text(decoder: str) -> str:
 
 
 def ntp64_to_unix_seconds(ntp_timestamp: int) -> float | None:
-    if not ntp_timestamp:
+    unix_ns = ntp64_to_unix_ns(ntp_timestamp)
+    if unix_ns is None:
         return None
-    seconds = int(ntp_timestamp) >> 32
-    fraction = int(ntp_timestamp) & 0xFFFFFFFF
-    return seconds - NTP_UNIX_EPOCH_OFFSET_S + fraction / float(UINT32_MODULUS)
+    return unix_ns / 1_000_000_000.0
+
+
+def ntp64_to_signed_int64(ntp_timestamp: int) -> int:
+    unsigned = int(ntp_timestamp) & (INT64_MODULUS - 1)
+    return unsigned if unsigned < INT64_SIGN_BIT else unsigned - INT64_MODULUS
+
+
+def signed_int64_to_ntp64(stored_value: int) -> int:
+    return int(stored_value) & (INT64_MODULUS - 1)
+
+
+def ntp64_to_unix_ns(ntp_timestamp: int) -> int | None:
+    unsigned = int(ntp_timestamp) & (INT64_MODULUS - 1)
+    if unsigned == 0:
+        return None
+    seconds = unsigned >> 32
+    fraction = unsigned & 0xFFFF_FFFF
+    fraction_ns = (fraction * 1_000_000_000 + (1 << 31)) // UINT32_MODULUS
+    if fraction_ns >= 1_000_000_000:
+        seconds += 1
+        fraction_ns -= 1_000_000_000
+    return (seconds - NTP_UNIX_EPOCH_OFFSET_S) * 1_000_000_000 + fraction_ns
+
+
+def estimate_rtcp_ntp_unix_ns(
+    *,
+    rtp_timestamp: int,
+    sr_rtp_timestamp: int,
+    sr_ntp_raw: int,
+    clock_rate_hz: int,
+) -> int | None:
+    sr_unix_ns = ntp64_to_unix_ns(sr_ntp_raw)
+    if sr_unix_ns is None or clock_rate_hz <= 0:
+        return None
+    delta_ticks = rtp_timestamp_delta(rtp_timestamp, sr_rtp_timestamp)
+    numerator = delta_ticks * 1_000_000_000
+    if numerator >= 0:
+        delta_ns = (numerator + clock_rate_hz // 2) // clock_rate_hz
+    else:
+        delta_ns = -((-numerator + clock_rate_hz // 2) // clock_rate_hz)
+    return sr_unix_ns + delta_ns
 
 
 def rtp_timestamp_delta(timestamp: int, reference: int) -> int:
@@ -627,7 +677,9 @@ class GstRtpTimingTracker:
         self._lock = threading.Lock()
         self._pending_rtp_frames: deque[RtpFrameTiming] = deque(maxlen=MAX_RTP_TIMING_CACHE)
         self._timing_by_pts_ns: dict[int, RtpFrameTiming] = {}
-        self._pts_order: deque[int] = deque(maxlen=MAX_RTP_TIMING_CACHE)
+        self._pts_order: deque[int] = deque()
+        self._preview_metadata_by_pts_ns: dict[int, dict[str, int | float | str]] = {}
+        self._preview_pts_order: deque[int] = deque()
         self._sr_by_ssrc: dict[int, RtcpSenderReportTiming] = {}
         self._manager = None
         self._last_rtcp_poll_s = 0.0
@@ -668,6 +720,21 @@ class GstRtpTimingTracker:
             src_pad.add_probe(self.Gst.PadProbeType.BUFFER, self._map_depay_buffer_pts)
 
     def frame_metadata(self, buffer, now_s: float) -> dict[str, int | float | str] | None:
+        """Legacy single-consumer API used by preview-only pipelines."""
+        return self.consume_authority_metadata(buffer, now_monotonic_ns=int(now_s * 1_000_000_000))
+
+    def consume_authority_metadata(
+        self,
+        buffer,
+        *,
+        now_monotonic_ns: int,
+    ) -> dict[str, int | float | str] | None:
+        """Consume RTP timing once at the encoded-AU authority point.
+
+        A copy is retained in a bounded cache so a lossy decoded preview can
+        look it up without consuming the recording authority's association.
+        """
+        now_s = int(now_monotonic_ns) / 1_000_000_000.0
         self._poll_rtcp_sender_reports(now_s)
         pts_ns = None if buffer.pts == self.Gst.CLOCK_TIME_NONE else int(buffer.pts)
         frame_timing = self._pop_frame_timing(pts_ns)
@@ -680,27 +747,63 @@ class GstRtpTimingTracker:
         }
         if frame_timing.rtp_pts_s is not None:
             metadata["rtp_pts_s"] = frame_timing.rtp_pts_s
-        sr_timing = self._sr_by_ssrc.get(frame_timing.rtp_ssrc)
+        with self._lock:
+            sr_timing = self._sr_by_ssrc.get(frame_timing.rtp_ssrc)
         if sr_timing is None:
+            self._cache_preview_metadata(pts_ns, metadata)
             return metadata
-        frame_ntp_s = estimate_rtcp_ntp_unix_seconds(
+        frame_ntp_ns = estimate_rtcp_ntp_unix_ns(
             rtp_timestamp=frame_timing.rtp_timestamp,
             sr_rtp_timestamp=sr_timing.rtp_timestamp,
-            sr_ntp_unix_s=sr_timing.ntp_unix_s,
+            sr_ntp_raw=sr_timing.ntp_raw,
             clock_rate_hz=sr_timing.clock_rate_hz,
         )
         metadata.update(
             {
-                "rtcp_sr_ntp_raw": sr_timing.ntp_raw,
+                "rtcp_sr_ntp_raw": ntp64_to_signed_int64(sr_timing.ntp_raw),
                 "rtcp_sr_ntp_unix_s": sr_timing.ntp_unix_s,
                 "rtcp_sr_rtp_timestamp": sr_timing.rtp_timestamp,
                 "rtcp_clock_rate_hz": sr_timing.clock_rate_hz,
                 "rtcp_sr_age_s": max(0.0, now_s - sr_timing.received_monotonic_s),
             }
         )
-        if frame_ntp_s is not None:
-            metadata["rtcp_frame_ntp_unix_s"] = frame_ntp_s
+        if frame_ntp_ns is not None:
+            metadata["rtcp_frame_ntp_unix_ns"] = frame_ntp_ns
+            metadata["rtcp_frame_ntp_unix_s"] = frame_ntp_ns / 1_000_000_000.0
+        self._cache_preview_metadata(pts_ns, metadata)
         return metadata
+
+    def preview_metadata(self, buffer) -> dict[str, int | float | str] | None:
+        pts_ns = None if buffer.pts == self.Gst.CLOCK_TIME_NONE else int(buffer.pts)
+        if pts_ns is None:
+            return None
+        with self._lock:
+            metadata = self._preview_metadata_by_pts_ns.get(pts_ns)
+            if metadata is None:
+                nearest_pts = self._nearest_preview_pts_locked(pts_ns)
+                metadata = None if nearest_pts is None else self._preview_metadata_by_pts_ns.get(nearest_pts)
+            return None if metadata is None else dict(metadata)
+
+    def _cache_preview_metadata(
+        self,
+        pts_ns: int | None,
+        metadata: dict[str, int | float | str],
+    ) -> None:
+        if pts_ns is None:
+            return
+        with self._lock:
+            if pts_ns not in self._preview_metadata_by_pts_ns:
+                self._preview_pts_order.append(pts_ns)
+            self._preview_metadata_by_pts_ns[pts_ns] = dict(metadata)
+            while len(self._preview_pts_order) > MAX_RTP_TIMING_CACHE:
+                old_pts = self._preview_pts_order.popleft()
+                self._preview_metadata_by_pts_ns.pop(old_pts, None)
+
+    def _nearest_preview_pts_locked(self, pts_ns: int) -> int | None:
+        if not self._preview_metadata_by_pts_ns:
+            return None
+        nearest_pts = min(self._preview_metadata_by_pts_ns, key=lambda candidate: abs(candidate - pts_ns))
+        return nearest_pts if abs(nearest_pts - pts_ns) <= 5_000_000 else None
 
     def _handle_new_manager(self, _source, manager) -> None:
         with self._lock:
@@ -753,6 +856,7 @@ class GstRtpTimingTracker:
             if pts_ns is not None:
                 timing = self._timing_by_pts_ns.pop(pts_ns, None)
                 if timing is not None:
+                    self._remove_pts_order_locked(pts_ns)
                     return timing
                 timing = self._pop_nearest_timing_locked(pts_ns)
                 if timing is not None:
@@ -760,7 +864,9 @@ class GstRtpTimingTracker:
                 return None
             if self._timing_by_pts_ns:
                 oldest_pts = min(self._timing_by_pts_ns)
-                return self._timing_by_pts_ns.pop(oldest_pts, None)
+                timing = self._timing_by_pts_ns.pop(oldest_pts, None)
+                self._remove_pts_order_locked(oldest_pts)
+                return timing
             return None
 
     def _pop_nearest_timing_locked(self, pts_ns: int) -> RtpFrameTiming | None:
@@ -769,7 +875,15 @@ class GstRtpTimingTracker:
         nearest_pts = min(self._timing_by_pts_ns, key=lambda candidate: abs(candidate - pts_ns))
         if abs(nearest_pts - pts_ns) > 5_000_000:
             return None
-        return self._timing_by_pts_ns.pop(nearest_pts, None)
+        timing = self._timing_by_pts_ns.pop(nearest_pts, None)
+        self._remove_pts_order_locked(nearest_pts)
+        return timing
+
+    def _remove_pts_order_locked(self, pts_ns: int) -> None:
+        try:
+            self._pts_order.remove(pts_ns)
+        except ValueError:
+            pass
 
     def _trim_timing_cache_locked(self) -> None:
         while len(self._timing_by_pts_ns) > MAX_RTP_TIMING_CACHE and self._pts_order:
@@ -820,6 +934,422 @@ class GstRtpTimingTracker:
             self._emit_status(message)
 
 
+def gst_buffer_is_countable_au(Gst, buffer) -> bool:
+    """Return whether a parsed H.264 AU represents one storable frame."""
+    if buffer is None:
+        return False
+    try:
+        flags = buffer.get_flags()
+    except Exception:
+        flags = 0
+    for flag_name in ("GAP", "CORRUPTED"):
+        flag = getattr(getattr(Gst, "BufferFlags", object()), flag_name, 0)
+        if flag and flags & flag:
+            return False
+    try:
+        if int(buffer.get_size()) <= 0:
+            return False
+    except Exception:
+        pass
+
+    nal_types = _gst_buffer_avc_nal_types(Gst, buffer)
+    if nal_types is not None:
+        # Parsed AVC buffers can contain AUD/SPS/PPS/SEI plus a VCL slice in
+        # one access unit.  h264parse may mark such IDR AUs as HEADER, so the
+        # HEADER flag alone cannot distinguish codec config from a frame.
+        return any(nal_type in _H264_VCL_NAL_TYPES for nal_type in nal_types)
+
+    header_flag = getattr(getattr(Gst, "BufferFlags", object()), "HEADER", 0)
+    return not bool(header_flag and flags & header_flag)
+
+
+_H264_VCL_NAL_TYPES = frozenset({1, 2, 3, 4, 5, 19, 20, 21})
+
+
+def _avc_nal_types(payload: bytes, *, nal_length_size: int = 4) -> tuple[int, ...] | None:
+    """Parse one AVC access unit and return its H.264 NAL unit types."""
+
+    if nal_length_size not in {1, 2, 4} or not payload:
+        return None
+    position = 0
+    nal_types: list[int] = []
+    payload_size = len(payload)
+    while position < payload_size:
+        if position + nal_length_size > payload_size:
+            return None
+        nal_size = int.from_bytes(payload[position : position + nal_length_size], "big")
+        position += nal_length_size
+        if nal_size <= 0 or position + nal_size > payload_size:
+            return None
+        nal_types.append(payload[position] & 0x1F)
+        position += nal_size
+    return tuple(nal_types) if nal_types else None
+
+
+def _gst_buffer_avc_nal_types(Gst, buffer) -> tuple[int, ...] | None:
+    try:
+        success, map_info = buffer.map(Gst.MapFlags.READ)
+    except Exception:
+        return None
+    if not success:
+        return None
+    try:
+        payload = bytes(map_info.data)
+    finally:
+        buffer.unmap(map_info)
+    # h264parse's AVC output normally uses four-byte NAL lengths.  Trying the
+    # other legal lengths keeps the classifier correct if upstream codec_data
+    # negotiates a shorter length field.
+    for nal_length_size in (4, 2, 1):
+        nal_types = _avc_nal_types(payload, nal_length_size=nal_length_size)
+        if nal_types is not None:
+            return nal_types
+    return None
+
+
+def gst_buffer_is_delta_unit(Gst, buffer) -> bool:
+    try:
+        flags = buffer.get_flags()
+    except Exception:
+        return False
+    delta_flag = getattr(getattr(Gst, "BufferFlags", object()), "DELTA_UNIT", 0)
+    return bool(delta_flag and flags & delta_flag)
+
+
+def _gst_buffer_timestamp(Gst, buffer, attribute: str) -> int | None:
+    value = getattr(buffer, attribute, Gst.CLOCK_TIME_NONE)
+    return None if value == Gst.CLOCK_TIME_NONE else int(value)
+
+
+def _gst_pad_resolution(pad) -> tuple[int, int]:
+    caps = pad.get_current_caps()
+    if caps is None:
+        return 0, 0
+    try:
+        structure = caps.get_structure(0)
+        return int(structure.get_value("width") or 0), int(structure.get_value("height") or 0)
+    except Exception:
+        return 0, 0
+
+
+class _CanonicalGstRecordingSession:
+    """Owns encoded-AU authority and mux-ingress accounting in one process."""
+
+    def __init__(
+        self,
+        Gst,
+        *,
+        config: dict[str, Any],
+        rtp_timing_tracker: GstRtpTimingTracker,
+        recording_data_queue,
+        recording_control_conn,
+        stop_event,
+        output_queue,
+    ) -> None:
+        self.Gst = Gst
+        self.config = config
+        self.rtp_timing_tracker = rtp_timing_tracker
+        self.recording_data_queue = recording_data_queue
+        self.recording_control_conn = recording_control_conn
+        self.stop_event = stop_event
+        self.output_queue = output_queue
+        self.session_id = str(config.get("session_id") or "")
+        self.camera_side = str(config.get("camera_side") or "")
+        self.camera_stream_id = str(config.get("camera_stream_id") or self.camera_side)
+        self.output_path = _record_video_path(config)
+        self.put_timeout_s = max(
+            0.001,
+            float(config.get("recording_event_put_timeout_s", DEFAULT_RECORDING_EVENT_PUT_TIMEOUT_S)),
+        )
+        self.first_keyframe_deadline_ns = time.monotonic_ns() + max(
+            1,
+            int(config.get("first_keyframe_timeout_ms", DEFAULT_FIRST_KEYFRAME_TIMEOUT_MS)),
+        ) * 1_000_000
+        self._lock = threading.RLock()
+        self._source_fifo: deque[dict[str, Any]] = deque()
+        self._valve = None
+        self._accepting = True
+        self._ready = False
+        self._terminal_sent = False
+        self._failure_stages: list[str] = []
+        self._failure_details: list[str] = []
+        self._record_event_sequence = 0
+        self._camera_sequence = 0
+        self._video_frame_index = 0
+        self._last_pts: int | None = None
+        self._last_dts: int | None = None
+        self.width_px = 0
+        self.height_px = 0
+        self.ipc_backpressure = False
+        self.caps_changed = False
+        self.pts_reordering_observed = False
+        self.pipeline_error = ""
+        self.rtp_association_mismatches = 0
+        self.rtp_association_mismatch_limit = max(
+            0,
+            int(config.get("rtp_association_mismatch_limit", 0)),
+        )
+
+    @property
+    def ready(self) -> bool:
+        with self._lock:
+            return self._ready
+
+    def attach(self, pipeline) -> None:
+        parser = pipeline.get_by_name("au_parser")
+        self._valve = pipeline.get_by_name("record_valve")
+        mux_ingress = pipeline.get_by_name("mux_ingress")
+        if parser is None or self._valve is None or mux_ingress is None:
+            raise RuntimeError("canonical recording pipeline is missing au_parser, record_valve, or mux_ingress")
+        self._valve.set_property("drop", True)
+        authority_pad = parser.get_static_pad("src")
+        mux_pad = mux_ingress.get_static_pad("sink")
+        if authority_pad is None or mux_pad is None:
+            raise RuntimeError("canonical recording pipeline is missing authority or mux-ingress pad")
+        authority_pad.add_probe(self.Gst.PadProbeType.BUFFER, self._authority_probe)
+        mux_pad.add_probe(self.Gst.PadProbeType.BUFFER, self._mux_ingress_probe)
+
+    def check_first_keyframe_timeout(self) -> bool:
+        with self._lock:
+            if self._ready or not self._accepting:
+                return False
+            if time.monotonic_ns() < self.first_keyframe_deadline_ns:
+                return False
+        self.fail("first_keyframe_timeout", "first decodable keyframe was not received before the deadline")
+        return True
+
+    def stop_accepting(self) -> None:
+        with self._lock:
+            self._accepting = False
+
+    def mark_pipeline_error(self, detail: str) -> None:
+        self.pipeline_error = str(detail or "pipeline error")
+        self.fail("gstreamer_pipeline_error", self.pipeline_error)
+
+    def fail(self, failure_stage: str, detail: str, **extra: Any) -> None:
+        with self._lock:
+            if failure_stage not in self._failure_stages:
+                self._failure_stages.append(str(failure_stage))
+                self._failure_details.append(str(detail))
+                payload = {
+                    "control_kind": "recording_failure",
+                    "event_kind": "camera_failure",
+                    "session_id": self.session_id,
+                    "camera_side": self.camera_side,
+                    "failure_stage": str(failure_stage),
+                    "detail": str(detail),
+                }
+                payload.update(extra)
+                self._send_control(payload)
+            try:
+                self.stop_event.set()
+            except Exception:
+                pass
+
+    def send_terminal(self, *, eos_ok: bool, eos_error: str = "") -> dict[str, Any]:
+        with self._lock:
+            if self._terminal_sent:
+                return {}
+            self._terminal_sent = True
+            fifo_residual = len(self._source_fifo)
+            if fifo_residual:
+                self._failure_stages.append("authority_fifo_residual")
+                self._failure_details.append(f"{fifo_residual} source identities were not observed at mux ingress")
+            if not eos_ok and "gstreamer_eos_failed" not in self._failure_stages:
+                self._failure_stages.append("gstreamer_eos_failed")
+                self._failure_details.append(str(eos_error or "EOS did not complete"))
+            status = "complete" if not self._failure_stages else "incomplete"
+            payload = {
+                "control_kind": "recording_terminal",
+                "event_kind": "camera_terminal",
+                "session_id": self.session_id,
+                "camera_side": self.camera_side,
+                "terminal_status": status,
+                "last_emitted_event_sequence": self._record_event_sequence - 1,
+                "last_source_sequence": self._camera_sequence - 1,
+                "last_video_frame_index": self._video_frame_index - 1,
+                "source_count": self._camera_sequence,
+                "mapping_count": self._video_frame_index,
+                "output_path": self.output_path,
+                "eos_ok": bool(eos_ok),
+                "pipeline_error": self.pipeline_error or str(eos_error or ""),
+                "ipc_backpressure": self.ipc_backpressure,
+                "caps_changed": self.caps_changed,
+                "pts_reordering_observed": self.pts_reordering_observed,
+                "authority_fifo_residual": fifo_residual,
+                "failure_stages": tuple(self._failure_stages),
+                "failure_details": tuple(self._failure_details),
+                "rtp_association_mismatches": self.rtp_association_mismatches,
+            }
+            self._send_control(payload)
+            return payload
+
+    def _send_control(self, payload: dict[str, Any]) -> None:
+        if self.recording_control_conn is None:
+            return
+        try:
+            self.recording_control_conn.send(dict(payload))
+        except Exception as exc:
+            _emit_status(self.output_queue, f"recording terminal/control IPC failure: {exc}")
+
+    def _put_data_event(self, payload: dict[str, Any]) -> bool:
+        if self.recording_data_queue is None:
+            self.fail("recording_ipc_unavailable", "recording data queue is unavailable")
+            return False
+        payload = dict(payload)
+        payload["record_event_sequence"] = self._record_event_sequence
+        try:
+            self.recording_data_queue.put(payload, block=True, timeout=self.put_timeout_s)
+        except queue.Full:
+            self.ipc_backpressure = True
+            self.fail(
+                "recording_ipc_backpressure",
+                f"recording event queue remained full for {self.put_timeout_s:.3f}s",
+            )
+            return False
+        except Exception as exc:
+            self.fail("recording_ipc_failure", str(exc))
+            return False
+        self._record_event_sequence += 1
+        return True
+
+    def _authority_probe(self, pad, info):
+        buffer = info.get_buffer()
+        if not gst_buffer_is_countable_au(self.Gst, buffer):
+            return self.Gst.PadProbeReturn.OK
+        with self._lock:
+            if not self._accepting:
+                return self.Gst.PadProbeReturn.DROP
+            if not self._ready and gst_buffer_is_delta_unit(self.Gst, buffer):
+                return self.Gst.PadProbeReturn.OK
+            pts = _gst_buffer_timestamp(self.Gst, buffer, "pts")
+            dts = _gst_buffer_timestamp(self.Gst, buffer, "dts")
+            if pts is None:
+                self.pts_reordering_observed = True
+                self.fail("frame_reordering_detected", "countable AU has no PTS")
+                return self.Gst.PadProbeReturn.OK
+            if self._last_pts is not None and pts <= self._last_pts:
+                self.pts_reordering_observed = True
+                self.fail("frame_reordering_detected", f"PTS is not strictly increasing: {pts} <= {self._last_pts}")
+                return self.Gst.PadProbeReturn.OK
+            if dts is not None and self._last_dts is not None and dts < self._last_dts:
+                self.pts_reordering_observed = True
+                self.fail("frame_reordering_detected", f"DTS decreased: {dts} < {self._last_dts}")
+                return self.Gst.PadProbeReturn.OK
+            width_px, height_px = _gst_pad_resolution(pad)
+            if width_px <= 0 or height_px <= 0:
+                self.fail("camera_caps_missing", "encoded AU caps do not contain a positive width and height")
+                return self.Gst.PadProbeReturn.OK
+            if not self._ready:
+                self.width_px, self.height_px = width_px, height_px
+            elif (width_px, height_px) != (self.width_px, self.height_px):
+                self.caps_changed = True
+                self.fail(
+                    "camera_caps_changed",
+                    f"encoded caps changed from {self.width_px}x{self.height_px} to {width_px}x{height_px}",
+                    expected_width_px=self.width_px,
+                    expected_height_px=self.height_px,
+                    observed_width_px=width_px,
+                    observed_height_px=height_px,
+                )
+                return self.Gst.PadProbeReturn.OK
+            monotonic_ns = time.monotonic_ns()
+            utc_ns = time.time_ns()
+            timing = self.rtp_timing_tracker.consume_authority_metadata(
+                buffer,
+                now_monotonic_ns=monotonic_ns,
+            ) or {}
+            if not timing:
+                self.rtp_association_mismatches += 1
+                if self.rtp_association_mismatches > self.rtp_association_mismatch_limit:
+                    self.fail("rtp_au_association_failed", "encoded AU could not be associated with an RTP marker")
+                    return self.Gst.PadProbeReturn.OK
+            camera_sequence = self._camera_sequence
+            source_record_id = f"{self.session_id}:{self.camera_side}:{camera_sequence}"
+            source_event = {
+                "event_kind": "camera_source",
+                "session_id": self.session_id,
+                "camera_side": self.camera_side,
+                "source_record_id": source_record_id,
+                "camera_stream_id": self.camera_stream_id,
+                "frame_id": camera_sequence,
+                "camera_sequence": camera_sequence,
+                "pc_receive_monotonic_ns": monotonic_ns,
+                "pc_receive_utc_ns": utc_ns,
+                "rtp_timestamp": timing.get("rtp_timestamp"),
+                "rtp_ssrc": timing.get("rtp_ssrc"),
+                "rtp_marker_seq": timing.get("rtp_marker_seq"),
+                "rtcp_sr_ntp_raw": timing.get("rtcp_sr_ntp_raw"),
+                "rtcp_frame_ntp_unix_ns": timing.get("rtcp_frame_ntp_unix_ns"),
+                "pts_ticks": pts,
+                "dts_ticks": dts,
+                "time_base_num": 1,
+                "time_base_den": GST_NANOSECONDS_TIME_BASE,
+                "width_px": width_px,
+                "height_px": height_px,
+                "video_path": self.output_path,
+                "video_mapping_status": "pending",
+                "stored_in_video": False,
+            }
+            if not self._put_data_event(source_event):
+                return self.Gst.PadProbeReturn.OK
+            self._source_fifo.append(
+                {
+                    "source_record_id": source_record_id,
+                    "source_frame_id": camera_sequence,
+                    "camera_side": self.camera_side,
+                    "pts_ticks": pts,
+                    "dts_ticks": dts,
+                }
+            )
+            self._camera_sequence += 1
+            self._last_pts = pts
+            if dts is not None:
+                self._last_dts = dts
+            if not self._ready:
+                self._ready = True
+                if self._valve is not None:
+                    self._valve.set_property("drop", False)
+                self._send_control(
+                    {
+                        "control_kind": "recording_ready",
+                        "event_kind": "camera_ready",
+                        "session_id": self.session_id,
+                        "camera_side": self.camera_side,
+                        "output_path": self.output_path,
+                        "width_px": self.width_px,
+                        "height_px": self.height_px,
+                    }
+                )
+        return self.Gst.PadProbeReturn.OK
+
+    def _mux_ingress_probe(self, _pad, info):
+        buffer = info.get_buffer()
+        if not gst_buffer_is_countable_au(self.Gst, buffer):
+            return self.Gst.PadProbeReturn.OK
+        with self._lock:
+            if not self._source_fifo:
+                self.fail("source_mapping_fifo_underflow", "countable mux AU has no authority identity")
+                return self.Gst.PadProbeReturn.OK
+            source = self._source_fifo.popleft()
+            mapping_event = {
+                "event_kind": "video_mapping",
+                "session_id": self.session_id,
+                "camera_side": self.camera_side,
+                "source_record_id": source["source_record_id"],
+                "source_frame_id": source["source_frame_id"],
+                "stored_in_video": True,
+                "video_mapping_status": "stored",
+                "video_frame_index": self._video_frame_index,
+                "video_packet_pts_ticks": _gst_buffer_timestamp(self.Gst, buffer, "pts"),
+                "video_packet_dts_ticks": _gst_buffer_timestamp(self.Gst, buffer, "dts"),
+            }
+            if not self._put_data_event(mapping_event):
+                return self.Gst.PadProbeReturn.OK
+            self._video_frame_index += 1
+        return self.Gst.PadProbeReturn.OK
+
+
 def build_gst_pipeline_text(
     url: str,
     *,
@@ -832,10 +1362,10 @@ def build_gst_pipeline_text(
     latency_ms = max(0, int(latency_ms))
     rtsp_transport = normalize_rtsp_transport(transport)
     decoder_element = decoder_element_text(decoder)
-    h264parse_element = "h264parse"
+    h264parse_element = "h264parse name=au_parser"
     keyframe_filter = ""
     if keyframe_only:
-        h264parse_element = "h264parse config-interval=-1 disable-passthrough=true"
+        h264parse_element = "h264parse name=au_parser config-interval=-1 disable-passthrough=true"
         keyframe_filter = (
             "! video/x-h264,alignment=au "
             "! identity drop-buffer-flags=delta-unit silent=true "
@@ -847,9 +1377,8 @@ def build_gst_pipeline_text(
             f"rtspsrc name=src location={_gst_string_literal(url)} latency={latency_ms} protocols={rtsp_transport} "
             "drop-on-latency=true do-rtcp=true "
             "! rtph264depay name=depay source-info=true "
-            "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
-            f"! {h264parse_element} "
-            f"{keyframe_filter}"
+            "! h264parse name=au_parser config-interval=-1 disable-passthrough=true "
+            "! video/x-h264,stream-format=avc,alignment=au "
             "! tee name=encoded "
             "encoded. ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
             f"! {decoder_element} "
@@ -857,10 +1386,11 @@ def build_gst_pipeline_text(
             "! videoconvert "
             "! video/x-raw,format=BGR "
             "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true "
-            "encoded. ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 "
-            "! h264parse config-interval=-1 "
-            "! matroskamux "
-            f"! filesink location={_gst_location(record_path)} sync=false"
+            "encoded. ! valve name=record_valve drop=true "
+            "! queue name=record_queue max-size-buffers=0 max-size-bytes=0 max-size-time=0 "
+            "! identity name=mux_ingress silent=true "
+            "! matroskamux name=record_mux "
+            f"! filesink name=record_sink location={_gst_string_literal(record_path)} sync=false async=false"
         )
     return (
         f"rtspsrc name=src location={_gst_string_literal(url)} latency={latency_ms} protocols={rtsp_transport} "
@@ -1095,6 +1625,7 @@ def _launch_gst_pipeline(
     record_video_path: str,
     output_queue,
     rtp_timing_tracker: GstRtpTimingTracker | None = None,
+    recording_session: _CanonicalGstRecordingSession | None = None,
 ):
     last_error: str | None = None
     for decoder in decoder_candidates(decoder_mode):
@@ -1115,6 +1646,8 @@ def _launch_gst_pipeline(
                 raise RuntimeError("pipeline missing appsink or bus")
             if rtp_timing_tracker is not None:
                 rtp_timing_tracker.attach(pipeline)
+            if recording_session is not None:
+                recording_session.attach(pipeline)
             state_result = pipeline.set_state(Gst.State.PLAYING)
             if state_result == Gst.StateChangeReturn.FAILURE:
                 raise RuntimeError(f"{decoder} failed to enter PLAYING state")
@@ -1133,12 +1666,21 @@ def _launch_gst_pipeline(
     raise RuntimeError(last_error or "no usable decoder")
 
 
-def _finalize_gst_recording(Gst, pipeline, bus, output_queue, record_video_path: str) -> None:
+def _finalize_gst_recording(
+    Gst,
+    pipeline,
+    bus,
+    output_queue,
+    record_video_path: str,
+    *,
+    timeout_ms: int = DEFAULT_RECORDING_EOS_TIMEOUT_MS,
+) -> tuple[bool, str]:
     if not record_video_path:
-        return
+        return True, ""
     try:
-        pipeline.send_event(Gst.Event.new_eos())
-        deadline_s = time.monotonic() + 3.0
+        if not pipeline.send_event(Gst.Event.new_eos()):
+            return False, "pipeline rejected EOS"
+        deadline_s = time.monotonic() + max(1, int(timeout_ms)) / 1000.0
         while time.monotonic() < deadline_s:
             message = bus.timed_pop_filtered(
                 200_000_000,
@@ -1150,13 +1692,15 @@ def _finalize_gst_recording(Gst, pipeline, bus, output_queue, record_video_path:
                 error, debug = message.parse_error()
                 detail = error.message if debug is None else f"{error.message} ({debug})"
                 _emit_status(output_queue, f"GStreamer 녹화 종료 오류: {detail}")
-                return
+                return False, detail
             if message.type == Gst.MessageType.EOS:
                 _emit_status(output_queue, f"GStreamer H264 원본 녹화 저장 완료: {record_video_path}")
-                return
+                return True, ""
         _emit_status(output_queue, f"GStreamer 녹화 EOS 대기 시간 초과: {record_video_path}")
+        return False, "EOS timeout"
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 녹화 종료 실패: {exc}")
+        return False, str(exc)
 
 
 def _load_yolo_model(config: dict[str, Any], output_queue, enable_detection: bool):
@@ -1377,7 +1921,16 @@ def _yolo_device_stats(config: dict[str, Any]) -> tuple[str, str, bool]:
     return requested_device, active_device, cpu_fallback
 
 
-def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
+def _run_gstreamer_stream(
+    config: dict[str, Any],
+    output_queue,
+    stop_event,
+    cv2,
+    model,
+    enable_detection: bool,
+    recording_data_queue=None,
+    recording_control_conn=None,
+) -> None:
     try:
         import gi
         import numpy as np
@@ -1398,7 +1951,30 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         status_callback=lambda text: _emit_status(output_queue, text),
     )
     record_video_path = _record_video_path(config)
-    recording_process = _start_ffmpeg_encoded_recording_process(config, output_queue)
+    canonical_recording = bool(
+        record_video_path
+        and str(config.get("session_id") or "")
+        and str(config.get("camera_side") or "")
+    )
+    recording_session = None
+    if canonical_recording:
+        recording_session = _CanonicalGstRecordingSession(
+            Gst,
+            config=config,
+            rtp_timing_tracker=rtp_timing_tracker,
+            recording_data_queue=recording_data_queue,
+            recording_control_conn=recording_control_conn,
+            stop_event=stop_event,
+            output_queue=output_queue,
+        )
+        if keyframe_only:
+            recording_session.fail(
+                "keyframe_only_mode_not_supported",
+                "canonical recording cannot start while keyframe-only diagnostic mode is active",
+            )
+            recording_session.send_terminal(eos_ok=False, eos_error="pipeline was not started")
+            return
+    recording_process = None if canonical_recording else _start_ffmpeg_encoded_recording_process(config, output_queue)
     try:
         pipeline, sink, bus, _decoder = _launch_gst_pipeline(
             Gst,
@@ -1407,12 +1983,16 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             decoder_mode=str(config.get("decoder", DECODER_AUTO)),
             transport=str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)),
             keyframe_only=keyframe_only,
-            record_video_path="",
+            record_video_path=record_video_path if canonical_recording else "",
             output_queue=output_queue,
             rtp_timing_tracker=rtp_timing_tracker,
+            recording_session=recording_session,
         )
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 오류: {exc}")
+        if recording_session is not None:
+            recording_session.mark_pipeline_error(str(exc))
+            recording_session.send_terminal(eos_ok=False, eos_error=str(exc))
         _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
         return
 
@@ -1441,7 +2021,10 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             height = int(caps.get_value("height"))
             buffer = sample.get_buffer()
             source_timestamp_s = None if buffer.pts == Gst.CLOCK_TIME_NONE else buffer.pts / 1e9
-            rtp_timing_metadata = rtp_timing_tracker.frame_metadata(buffer, receive_s) or {}
+            if recording_session is not None:
+                rtp_timing_metadata = rtp_timing_tracker.preview_metadata(buffer) or {}
+            else:
+                rtp_timing_metadata = rtp_timing_tracker.frame_metadata(buffer, receive_s) or {}
             success, map_info = buffer.map(Gst.MapFlags.READ)
             if not success:
                 continue
@@ -1482,16 +2065,25 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
     else:
         _emit_status(output_queue, "GStreamer YOLO 실행 중" if enable_detection else "GStreamer 카메라 스트림 실행 중")
     last_processed_sequence = 0
+    pipeline_error = ""
     try:
         while not stop_event.is_set():
+            if recording_session is not None and recording_session.check_first_keyframe_timeout():
+                break
             message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
             if message is not None:
                 if message.type == Gst.MessageType.ERROR:
                     error, debug = message.parse_error()
                     detail = error.message if debug is None else f"{error.message} ({debug})"
                     _emit_status(output_queue, f"스트림 오류: {detail}")
+                    pipeline_error = detail
+                    if recording_session is not None:
+                        recording_session.mark_pipeline_error(detail)
                 else:
                     _emit_status(output_queue, "스트림 종료")
+                    if recording_session is not None and not stop_event.is_set():
+                        pipeline_error = "unexpected stream EOS"
+                        recording_session.fail("unexpected_stream_eos", pipeline_error)
                 break
 
             now_s = time.monotonic()
@@ -1579,9 +2171,25 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
 
     finally:
         reader_stop.set()
-        pipeline.set_state(Gst.State.NULL)
+        if recording_session is not None:
+            recording_session.stop_accepting()
+            eos_ok, eos_error = _finalize_gst_recording(
+                Gst,
+                pipeline,
+                bus,
+                output_queue,
+                record_video_path,
+                timeout_ms=int(config.get("recording_eos_timeout_ms", DEFAULT_RECORDING_EOS_TIMEOUT_MS)),
+            )
+            if pipeline_error:
+                eos_ok = False
+                eos_error = pipeline_error
+            recording_session.send_terminal(eos_ok=eos_ok, eos_error=eos_error)
+            pipeline.set_state(Gst.State.NULL)
+        else:
+            pipeline.set_state(Gst.State.NULL)
+            _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
         reader.join(timeout=1.0)
-        _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
         _emit_status(output_queue, "중지됨")
 
 
@@ -1927,10 +2535,57 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
         _emit_status(output_queue, "중지됨")
 
 
-def _run_yolo_process(config: dict[str, Any], output_queue, stop_event) -> None:
+def _run_yolo_process(
+    config: dict[str, Any],
+    output_queue,
+    stop_event,
+    recording_data_queue=None,
+    recording_control_conn=None,
+) -> None:
     enable_detection = bool(config.get("enable_detection", True))
     thread_count = _worker_cpu_threads(config)
     _configure_worker_thread_environment(thread_count)
+    backend = normalize_stream_backend(str(config.get("stream_backend", STREAM_BACKEND_GSTREAMER)))
+    canonical_requested = bool(
+        _record_video_path(config)
+        and str(config.get("session_id") or "")
+        and str(config.get("camera_side") or "")
+    )
+    if canonical_requested and backend != STREAM_BACKEND_GSTREAMER:
+        failure = {
+            "control_kind": "recording_failure",
+            "event_kind": "camera_failure",
+            "session_id": str(config["session_id"]),
+            "camera_side": str(config["camera_side"]),
+            "failure_stage": "canonical_backend_not_supported",
+            "detail": f"canonical recording requires GStreamer, got {backend}",
+        }
+        terminal = {
+            "control_kind": "recording_terminal",
+            "event_kind": "camera_terminal",
+            "session_id": str(config["session_id"]),
+            "camera_side": str(config["camera_side"]),
+            "terminal_status": "incomplete",
+            "last_emitted_event_sequence": -1,
+            "last_source_sequence": -1,
+            "last_video_frame_index": -1,
+            "source_count": 0,
+            "mapping_count": 0,
+            "output_path": _record_video_path(config),
+            "eos_ok": False,
+            "pipeline_error": failure["detail"],
+            "ipc_backpressure": False,
+            "caps_changed": False,
+            "pts_reordering_observed": False,
+            "authority_fifo_residual": 0,
+            "failure_stages": (failure["failure_stage"],),
+            "failure_details": (failure["detail"],),
+            "rtp_association_mismatches": 0,
+        }
+        if recording_control_conn is not None:
+            recording_control_conn.send(failure)
+            recording_control_conn.send(terminal)
+        return
     try:
         import cv2
     except Exception as exc:
@@ -1957,13 +2612,21 @@ def _run_yolo_process(config: dict[str, Any], output_queue, stop_event) -> None:
         config["emit_measurement_frames"] = False
         config["adaptive_rate"] = False
 
-    backend = normalize_stream_backend(str(config.get("stream_backend", STREAM_BACKEND_GSTREAMER)))
     if backend in {STREAM_BACKEND_OPENCV, STREAM_BACKEND_OPENCV_AUTO}:
         _run_opencv_stream(config, output_queue, stop_event, cv2, model, enable_detection)
     elif backend == STREAM_BACKEND_PYAV:
         _run_pyav_stream(config, output_queue, stop_event, cv2, model, enable_detection)
     else:
-        _run_gstreamer_stream(config, output_queue, stop_event, cv2, model, enable_detection)
+        _run_gstreamer_stream(
+            config,
+            output_queue,
+            stop_event,
+            cv2,
+            model,
+            enable_detection,
+            recording_data_queue,
+            recording_control_conn,
+        )
 
 
 class _BoundedProcessOutputQueue:
@@ -2016,6 +2679,10 @@ class YoloStreamWorker(QtCore.QObject):
     detection_ready = QtCore.pyqtSignal(dict)
     stats_ready = QtCore.pyqtSignal(dict)
     status_changed = QtCore.pyqtSignal(str)
+    recording_ready = QtCore.pyqtSignal(object)
+    recording_event_ready = QtCore.pyqtSignal(object)
+    recording_failure = QtCore.pyqtSignal(object)
+    recording_terminal = QtCore.pyqtSignal(object)
     finished = QtCore.pyqtSignal()
 
     def __init__(
@@ -2048,6 +2715,13 @@ class YoloStreamWorker(QtCore.QObject):
         record_video_fps: float = 30.0,
         event_queue_size: int = DEFAULT_EVENT_QUEUE_SIZE,
         frame_queue_size: int = DEFAULT_FRAME_QUEUE_SIZE,
+        session_id: str = "",
+        camera_side: str = "",
+        camera_stream_id: str = "",
+        recording_event_queue_size: int = DEFAULT_RECORDING_EVENT_QUEUE_SIZE,
+        recording_event_put_timeout_s: float = DEFAULT_RECORDING_EVENT_PUT_TIMEOUT_S,
+        first_keyframe_timeout_ms: int = DEFAULT_FIRST_KEYFRAME_TIMEOUT_MS,
+        recording_eos_timeout_ms: int = DEFAULT_RECORDING_EOS_TIMEOUT_MS,
     ) -> None:
         super().__init__()
         effective_max_rate = effective_yolo_max_rate_hz(
@@ -2089,11 +2763,27 @@ class YoloStreamWorker(QtCore.QObject):
             "record_video_fps": _record_video_fps({"record_video_fps": record_video_fps}),
             "event_queue_size": max(1, int(event_queue_size)),
             "frame_queue_size": max(1, int(frame_queue_size)),
+            "session_id": str(session_id or ""),
+            "camera_side": str(camera_side or ""),
+            "camera_stream_id": str(camera_stream_id or camera_side or ""),
+            "recording_event_queue_size": max(1, int(recording_event_queue_size)),
+            "recording_event_put_timeout_s": max(0.001, float(recording_event_put_timeout_s)),
+            "first_keyframe_timeout_ms": max(1, int(first_keyframe_timeout_ms)),
+            "recording_eos_timeout_ms": max(1, int(recording_eos_timeout_ms)),
         }
         self._mp_context = multiprocessing.get_context("spawn")
         self._stop_event = None
         self._event_queue = None
         self._frame_queue = None
+        self._recording_data_queue = None
+        self._recording_control_recv = None
+        self._recording_control_send = None
+        self._recording_terminal_payload: dict[str, Any] | None = None
+        self._recording_terminal_emitted = False
+        self._last_recording_event_sequence = -1
+        self._next_recording_event_sequence = 0
+        self._recording_sequence_error_detail = ""
+        self._recording_sequence_failure_emitted = False
         self._process = None
         self._stop_requested = False
         self._finished = False
@@ -2102,26 +2792,49 @@ class YoloStreamWorker(QtCore.QObject):
     def run(self) -> None:
         status = "YOLO worker 시작 중" if self.config["enable_detection"] else "카메라 worker 시작 중"
         self.status_changed.emit(status)
-        self._stop_requested = False
-        self._stop_event = self._mp_context.Event()
-        self._event_queue = self._mp_context.Queue(maxsize=int(self.config["event_queue_size"]))
-        self._frame_queue = self._mp_context.Queue(maxsize=int(self.config["frame_queue_size"]))
-        process = self._mp_context.Process(
-            target=_run_yolo_process,
-            args=(self.config, _BoundedProcessOutputQueue(self._event_queue, self._frame_queue), self._stop_event),
-            daemon=True,
-        )
-        self._process = process
         try:
+            self._stop_event = self._mp_context.Event()
+            if self._stop_requested:
+                # CameraPane may receive an immediate stop/close after the QThread
+                # is started but before this slot gets CPU time. Preserve that
+                # request instead of launching a child the GUI already stopped.
+                if self._canonical_recording_requested():
+                    self._finish_recording_channel_drain()
+                self.status_changed.emit("중지됨")
+                return
+            self._event_queue = self._mp_context.Queue(maxsize=int(self.config["event_queue_size"]))
+            self._frame_queue = self._mp_context.Queue(maxsize=int(self.config["frame_queue_size"]))
+            if self._canonical_recording_requested():
+                self._recording_data_queue = self._mp_context.Queue(
+                    maxsize=int(self.config["recording_event_queue_size"])
+                )
+                self._recording_control_recv, self._recording_control_send = self._mp_context.Pipe(duplex=False)
+            process = self._mp_context.Process(
+                target=_run_yolo_process,
+                args=(
+                    self.config,
+                    _BoundedProcessOutputQueue(self._event_queue, self._frame_queue),
+                    self._stop_event,
+                    self._recording_data_queue,
+                    self._recording_control_send,
+                ),
+                daemon=True,
+            )
+            self._process = process
             process.start()
+            if self._recording_control_send is not None:
+                self._recording_control_send.close()
+                self._recording_control_send = None
             self.status_changed.emit(f"{status}: pid={process.pid}")
             while process.is_alive() or self._queue_has_pending_messages():
                 self._drain_output_queue(timeout_s=0.1)
             process.join(timeout=0.2)
+            self._finish_recording_channel_drain()
             if process.exitcode not in (0, None) and not self._stop_requested:
                 self.status_changed.emit(f"스트림 프로세스 종료 코드: {process.exitcode}")
         except Exception as exc:
             self.status_changed.emit(f"스트림 프로세스 오류: {exc}")
+            self._synthesize_parent_recording_failure(exc)
         finally:
             self._stop_child_process()
             self._emit_finished_once()
@@ -2146,13 +2859,29 @@ class YoloStreamWorker(QtCore.QObject):
     def _queue_has_pending_messages(self) -> bool:
         return _queue_has_pending_messages(self._event_queue) or _queue_has_pending_messages(self._frame_queue)
 
+    def _canonical_recording_enabled(self) -> bool:
+        return bool(
+            self._canonical_recording_requested()
+            and normalize_stream_backend(str(self.config.get("stream_backend"))) == STREAM_BACKEND_GSTREAMER
+        )
+
+    def _canonical_recording_requested(self) -> bool:
+        return bool(
+            self.config.get("record_video_path")
+            and self.config.get("session_id")
+            and self.config.get("camera_side")
+        )
+
     def _drain_output_queue(self, *, timeout_s: float) -> None:
+        self._drain_recording_control()
+        self._drain_recording_data(limit=64)
         try:
             message = _get_queue_message(self._event_queue, timeout_s=0.0)
         except queue.Empty:
             try:
                 message = _get_queue_message(self._frame_queue, timeout_s=timeout_s)
             except queue.Empty:
+                self._maybe_emit_recording_terminal()
                 return
         self._handle_worker_message(message)
         for _ in range(15):
@@ -2167,6 +2896,202 @@ class YoloStreamWorker(QtCore.QObject):
             except queue.Empty:
                 break
             self._handle_worker_message(message)
+        self._drain_recording_control()
+        self._drain_recording_data(limit=64)
+        self._maybe_emit_recording_terminal()
+
+    def _drain_recording_control(self) -> None:
+        connection = self._recording_control_recv
+        if connection is None:
+            return
+        while connection.poll(0.0):
+            try:
+                payload = connection.recv()
+            except (EOFError, OSError):
+                return
+            kind = str(payload.get("control_kind") or "")
+            if kind == "recording_ready":
+                self.recording_ready.emit(payload)
+            elif kind == "recording_failure":
+                self.recording_failure.emit(payload)
+            elif kind == "recording_terminal":
+                self._recording_terminal_payload = payload
+
+    def _drain_recording_data(self, *, limit: int) -> None:
+        for _ in range(max(0, int(limit))):
+            try:
+                payload = _get_queue_message_nowait(self._recording_data_queue)
+            except queue.Empty:
+                break
+            self._handle_recording_data_payload(payload)
+
+    def _handle_recording_data_payload(self, payload: dict[str, Any]) -> None:
+        try:
+            sequence = int(payload.get("record_event_sequence", -1))
+        except (TypeError, ValueError):
+            sequence = -1
+        expected = self._next_recording_event_sequence
+        if sequence != expected and not self._recording_sequence_error_detail:
+            self._recording_sequence_error_detail = (
+                f"recording event sequence is not contiguous: expected {expected}, received {sequence}"
+            )
+            if not self._recording_sequence_failure_emitted:
+                self._recording_sequence_failure_emitted = True
+                self.recording_failure.emit(
+                    {
+                        "session_id": self.config["session_id"],
+                        "camera_side": self.config["camera_side"],
+                        "failure_stage": "recording_event_sequence_gap",
+                        "detail": self._recording_sequence_error_detail,
+                    }
+                )
+        self._next_recording_event_sequence = sequence + 1
+        self._last_recording_event_sequence = sequence
+        self.recording_event_ready.emit(payload)
+
+    def _recording_sequence_barrier_complete(self) -> bool:
+        terminal = self._recording_terminal_payload
+        if terminal is None:
+            return False
+        return (
+            not self._recording_sequence_error_detail
+            and self._last_recording_event_sequence == int(terminal.get("last_emitted_event_sequence", -1))
+        )
+
+    def _maybe_emit_recording_terminal(self, *, force: bool = False) -> None:
+        if self._recording_terminal_emitted:
+            return
+        if not force and not self._recording_sequence_barrier_complete():
+            return
+        self._recording_terminal_emitted = True
+        self.recording_terminal.emit(dict(self._recording_terminal_payload or {}))
+
+    def _synthesize_parent_recording_failure(self, exc: Exception) -> None:
+        """Close the canonical signal protocol when parent-side setup fails."""
+        if not self._canonical_recording_requested() or self._recording_terminal_emitted:
+            return
+        detail = f"camera worker parent exception: {exc}"
+        failure_stage = "recording_worker_parent_failure"
+        self.recording_failure.emit(
+            {
+                "session_id": self.config["session_id"],
+                "camera_side": self.config["camera_side"],
+                "failure_stage": failure_stage,
+                "detail": detail,
+            }
+        )
+        terminal = dict(self._recording_terminal_payload or {})
+        stages = list(terminal.get("failure_stages") or ())
+        details = list(terminal.get("failure_details") or ())
+        if failure_stage not in stages:
+            stages.append(failure_stage)
+        details.append(detail)
+        terminal.update(
+            {
+                "session_id": self.config["session_id"],
+                "camera_side": self.config["camera_side"],
+                "terminal_status": "incomplete",
+                "last_emitted_event_sequence": self._last_recording_event_sequence,
+                "last_source_sequence": int(terminal.get("last_source_sequence", -1)),
+                "last_video_frame_index": int(terminal.get("last_video_frame_index", -1)),
+                "source_count": int(terminal.get("source_count", 0)),
+                "mapping_count": int(terminal.get("mapping_count", 0)),
+                "output_path": self.config["record_video_path"],
+                "eos_ok": False,
+                "pipeline_error": detail,
+                "ipc_backpressure": bool(terminal.get("ipc_backpressure", False)),
+                "caps_changed": bool(terminal.get("caps_changed", False)),
+                "pts_reordering_observed": bool(terminal.get("pts_reordering_observed", False)),
+                "authority_fifo_residual": int(terminal.get("authority_fifo_residual", 0)),
+                "failure_stages": tuple(stages),
+                "failure_details": tuple(details),
+                "rtp_association_mismatches": int(terminal.get("rtp_association_mismatches", 0)),
+            }
+        )
+        self._recording_terminal_payload = terminal
+        self._maybe_emit_recording_terminal(force=True)
+
+    def _finish_recording_channel_drain(self) -> None:
+        if not self._canonical_recording_requested():
+            return
+        self._drain_recording_control()
+        if self._recording_terminal_payload is None:
+            failure = {
+                "session_id": self.config["session_id"],
+                "camera_side": self.config["camera_side"],
+                "failure_stage": "recording_terminal_missing",
+                "detail": "camera process exited without a terminal control payload",
+            }
+            self.recording_failure.emit(failure)
+            self._recording_terminal_payload = {
+                "session_id": self.config["session_id"],
+                "camera_side": self.config["camera_side"],
+                "terminal_status": "incomplete",
+                "last_emitted_event_sequence": self._last_recording_event_sequence,
+                "last_source_sequence": -1,
+                "last_video_frame_index": -1,
+                "source_count": 0,
+                "mapping_count": 0,
+                "output_path": self.config["record_video_path"],
+                "eos_ok": False,
+                "pipeline_error": failure["detail"],
+                "ipc_backpressure": False,
+                "caps_changed": False,
+                "pts_reordering_observed": False,
+                "authority_fifo_residual": 0,
+                "failure_stages": (failure["failure_stage"],),
+                "failure_details": (failure["detail"],),
+                "rtp_association_mismatches": 0,
+            }
+        deadline_ns = time.monotonic_ns() + 2_000_000_000
+        expected = int(self._recording_terminal_payload.get("last_emitted_event_sequence", -1))
+        while self._last_recording_event_sequence < expected and time.monotonic_ns() < deadline_ns:
+            remaining_s = max(0.001, (deadline_ns - time.monotonic_ns()) / 1_000_000_000.0)
+            try:
+                payload = _get_queue_message(
+                    self._recording_data_queue,
+                    timeout_s=min(0.1, remaining_s),
+                )
+            except queue.Empty:
+                continue
+            self._handle_recording_data_payload(payload)
+        # The child has exited before this method runs.  Drain any payloads
+        # beyond the terminal's announced sequence without Queue.empty/qsize;
+        # an extra or duplicate payload is itself a transport contract breach.
+        while True:
+            try:
+                payload = _get_queue_message_nowait(self._recording_data_queue)
+            except queue.Empty:
+                break
+            self._handle_recording_data_payload(payload)
+        if self._recording_sequence_error_detail or self._last_recording_event_sequence != expected:
+            detail = self._recording_sequence_error_detail or (
+                f"terminal announced sequence {expected}, "
+                f"but only {self._last_recording_event_sequence} was received"
+            )
+            failure = {
+                "session_id": self.config["session_id"],
+                "camera_side": self.config["camera_side"],
+                "failure_stage": "recording_event_sequence_gap",
+                "detail": detail,
+            }
+            if not self._recording_sequence_failure_emitted:
+                self._recording_sequence_failure_emitted = True
+                self.recording_failure.emit(failure)
+            self._recording_terminal_payload["terminal_status"] = "incomplete"
+            stages = list(self._recording_terminal_payload.get("failure_stages") or ())
+            if failure["failure_stage"] not in stages:
+                stages.append(failure["failure_stage"])
+            self._recording_terminal_payload["failure_stages"] = tuple(stages)
+            details = list(self._recording_terminal_payload.get("failure_details") or ())
+            details.append(failure["detail"])
+            self._recording_terminal_payload["failure_details"] = tuple(details)
+            # The missing data event can no longer arrive after the child has
+            # exited.  Emit an explicit incomplete terminal before ``finished``
+            # instead of silently withholding the terminal forever.
+            self._maybe_emit_recording_terminal(force=True)
+            return
+        self._maybe_emit_recording_terminal()
 
     def _stop_child_process(self) -> None:
         process = self._process
@@ -2181,6 +3106,13 @@ class YoloStreamWorker(QtCore.QObject):
         self._stop_event = None
         self._event_queue = None
         self._frame_queue = None
+        self._recording_data_queue = None
+        if self._recording_control_recv is not None:
+            self._recording_control_recv.close()
+        if self._recording_control_send is not None:
+            self._recording_control_send.close()
+        self._recording_control_recv = None
+        self._recording_control_send = None
 
     def _handle_worker_message(self, message) -> None:
         kind = message[0]

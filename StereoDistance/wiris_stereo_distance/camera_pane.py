@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -51,6 +52,11 @@ class CameraPane(QtWidgets.QGroupBox):
     frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
     stats_changed = QtCore.pyqtSignal(str, object)
     state_changed = QtCore.pyqtSignal(str, str)
+    recording_ready = QtCore.pyqtSignal(object)
+    recording_event_ready = QtCore.pyqtSignal(object)
+    recording_failure = QtCore.pyqtSignal(object)
+    recording_terminal = QtCore.pyqtSignal(object)
+    stream_finished = QtCore.pyqtSignal(str)
 
     def __init__(self, label: str) -> None:
         super().__init__(label)
@@ -73,6 +79,9 @@ class CameraPane(QtWidgets.QGroupBox):
         self.detection_stream_active = False
         self.bbox_center_adjustment: tuple[tuple[float, float, float, float], tuple[float, float, float, float]] | None = None
         self.stream_generation = 0
+        self.stop_requested = False
+        self._force_stop_thread: threading.Thread | None = None
+        self._force_stop_worker: object | None = None
         self.current_status = "중지됨"
 
         layout = QtWidgets.QVBoxLayout(self)
@@ -91,9 +100,10 @@ class CameraPane(QtWidgets.QGroupBox):
 
     def start_stream(self, url: str, *, enable_detection: bool, **kwargs) -> None:
         if self.worker is not None or self.thread is not None:
-            self.stop(wait=True)
+            raise RuntimeError(f"{self.camera_label} camera worker is still active")
         self.stream_generation += 1
         stream_generation = self.stream_generation
+        self.stop_requested = False
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
@@ -132,6 +142,19 @@ class CameraPane(QtWidgets.QGroupBox):
         self.worker.status_changed.connect(
             lambda status, generation=stream_generation: self._set_status_if_current(generation, status)
         )
+        for worker_signal_name, pane_signal in (
+            ("recording_ready", self.recording_ready),
+            ("recording_event_ready", self.recording_event_ready),
+            ("recording_failure", self.recording_failure),
+            ("recording_terminal", self.recording_terminal),
+        ):
+            worker_signal = getattr(self.worker, worker_signal_name, None)
+            if worker_signal is not None:
+                worker_signal.connect(
+                    lambda payload, signal=pane_signal, generation=stream_generation: self._emit_recording_signal_if_current(
+                        generation, signal, payload
+                    )
+                )
         self.worker.finished.connect(self.thread.quit)
         self.worker.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -145,17 +168,13 @@ class CameraPane(QtWidgets.QGroupBox):
         self.start_stream(url, enable_detection=True, **kwargs)
 
     def stop(self, *, wait: bool = False) -> None:
-        self.stream_generation += 1
         worker = self.worker
-        thread = self.thread
+        self.stop_requested = True
         if worker is not None:
             worker.request_stop()
-        if wait and thread is not None and not thread.wait(1000):
-            thread.requestInterruption()
-            thread.terminate()
-            thread.wait(250)
-        self.worker = None
-        self.thread = None
+        # ``wait`` is retained for source compatibility only.  Camera shutdown
+        # is always asynchronous; references are released by the thread's
+        # actual ``finished`` signal.
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
@@ -172,12 +191,56 @@ class CameraPane(QtWidgets.QGroupBox):
         self._set_detection_label(None)
         self.detection_changed.emit(self.camera_label, None)
 
+    def force_stop_async(self) -> None:
+        """Clean up a hung worker process without blocking the GUI thread."""
+
+        worker = self.worker
+        qt_thread = self.thread
+        if worker is not None:
+            try:
+                worker.request_stop()
+            except Exception:
+                pass
+        if qt_thread is not None:
+            for operation_name in ("requestInterruption", "quit"):
+                operation = getattr(qt_thread, operation_name, None)
+                if operation is None:
+                    continue
+                try:
+                    operation()
+                except Exception:
+                    pass
+        if worker is None:
+            return
+        helper = self._force_stop_thread
+        if helper is not None and helper.is_alive() and self._force_stop_worker is worker:
+            return
+
+        def stop_worker_process() -> None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+            finally:
+                if self._force_stop_thread is helper:
+                    self._force_stop_thread = None
+                    self._force_stop_worker = None
+
+        helper = threading.Thread(
+            target=stop_worker_process,
+            name=f"camera-force-stop-{self.camera_label}",
+            daemon=True,
+        )
+        self._force_stop_thread = helper
+        self._force_stop_worker = worker
+        helper.start()
+
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override.
         self._refresh_pixmap()
         super().resizeEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        self.stop(wait=True)
+        self.stop()
         super().closeEvent(event)
 
     def _show_frame(self, image: QtGui.QImage, metadata: object | None = None) -> None:
@@ -196,7 +259,7 @@ class CameraPane(QtWidgets.QGroupBox):
         self._refresh_pixmap()
 
     def _show_frame_if_current(self, generation: int, image: QtGui.QImage, metadata: object) -> None:
-        if generation != self.stream_generation:
+        if generation != self.stream_generation or self.stop_requested:
             return
         self._show_frame(image, metadata)
 
@@ -246,7 +309,7 @@ class CameraPane(QtWidgets.QGroupBox):
         image: QtGui.QImage,
         metadata: object | None = None,
     ) -> None:
-        if generation != self.stream_generation:
+        if generation != self.stream_generation or self.stop_requested:
             return
         self._store_measurement_frame(timestamp_s, image, frame_id, metadata)
 
@@ -377,7 +440,7 @@ class CameraPane(QtWidgets.QGroupBox):
         self.detection_changed.emit(self.camera_label, observation)
 
     def _handle_detection_payload_if_current(self, generation: int, payload: dict) -> None:
-        if generation != self.stream_generation:
+        if generation != self.stream_generation or self.stop_requested:
             return
         self._handle_detection_payload(payload)
 
@@ -385,7 +448,7 @@ class CameraPane(QtWidgets.QGroupBox):
         self.stats_changed.emit(self.camera_label, payload)
 
     def _handle_stats_payload_if_current(self, generation: int, payload: dict) -> None:
-        if generation != self.stream_generation:
+        if generation != self.stream_generation or self.stop_requested:
             return
         self._handle_stats_payload(payload)
 
@@ -394,9 +457,14 @@ class CameraPane(QtWidgets.QGroupBox):
         self.state_changed.emit(self.camera_label, status)
 
     def _set_status_if_current(self, generation: int, status: str) -> None:
-        if generation != self.stream_generation:
+        if generation != self.stream_generation or self.stop_requested:
             return
         self._set_status(status)
+
+    def _emit_recording_signal_if_current(self, generation: int, signal, payload: object) -> None:
+        if generation != self.stream_generation:
+            return
+        signal.emit(payload)
 
     def _set_detection_label(self, detection: DetectionObservation | None) -> None:
         if detection is None:
@@ -418,3 +486,5 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self.thread = None
         self.worker = None
+        self.stop_requested = False
+        self.stream_finished.emit(self.camera_label)

@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections.abc import Sequence
 from collections import deque
 from dataclasses import dataclass, replace
@@ -158,6 +159,8 @@ from wiris_stereo_distance.recording_session import (
     session_dir,
     session_id_now,
 )
+from wiris_stereo_distance.session_camera_recording import SessionCameraRecordingController
+from wiris_stereo_distance.session_recording_parquet import SessionRecordingConfig
 from wiris_stereo_distance.reprojection_profile import (
     OriginBBoxReprojectionProfile,
     ReprojectionLookupResult,
@@ -255,6 +258,7 @@ from wiris_stereo_distance.yolo_stream import (
     DECODER_SOFTWARE,
     DEFAULT_RTSP_LATENCY_MS,
     DEFAULT_YOLO_WEIGHTS,
+    I_FRAME_ONLY_ENV,
     build_gst_pipeline_text,
     decoder_candidates,
     STREAM_BACKEND_GSTREAMER,
@@ -267,6 +271,7 @@ from wiris_stereo_distance.yolo_stream import (
     normalize_rtsp_transport,
     normalize_stream_backend,
 )
+
 
 from wiris_stereo_distance.wiris_zoom import (
     DEFAULT_ZOOM_CONTROL_PORT,
@@ -287,6 +292,12 @@ from wiris_stereo_distance.wiris_zoom import (
     build_zoom_command,
     send_tcp_line,
 )
+
+
+SESSION_TERMINAL_STATES = frozenset({"complete", "incomplete", "failed"})
+SESSION_STARTABLE_STATES = frozenset({"idle", *SESSION_TERMINAL_STATES})
+SESSION_ACTIVE_STATES = frozenset({"starting", "recording", "stopping"})
+SESSION_FINALIZE_TIMEOUT_MS = 5_000
 
 
 def angle_diff_deg(a_deg: float, b_deg: float) -> float:
@@ -3051,6 +3062,7 @@ class SystemResourceSnapshotRunnable(QtCore.QRunnable):
 
 class WirisStereoDistancePanel(QtWidgets.QWidget):
     calibration_preview_requested = QtCore.pyqtSignal(object)
+    application_close_ready = QtCore.pyqtSignal()
 
     def __init__(self, *, auto_start: bool = False, auto_start_pixhawk: bool = False) -> None:
         super().__init__()
@@ -3172,6 +3184,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.recording_session_started_monotonic_s: float | None = None
         self.video_recording_enabled = False
         self.video_recording_paths: dict[str, Path] = {}
+        self.session_state = "idle"
+        self._session_ready_sides: set[str] = set()
+        self._session_terminal_sides: set[str] = set()
+        self._session_stop_reason = ""
+        self._session_restart_preview = False
+        self._session_detection_enabled = False
+        self._session_open_requested = False
+        self._session_recorder_terminal_received = False
+        self._camera_stop_waiting: set[str] = set()
+        self._camera_stop_completion = None
+        self._camera_stop_transition_active = False
+        self._close_pending = False
+        self._close_guarded = False
+        self._session_finalize_timer = QtCore.QTimer(self)
+        self._session_finalize_timer.setSingleShot(True)
+        self._session_finalize_timer.timeout.connect(self._handle_session_finalize_timeout)
+        self.session_camera_recorder = SessionCameraRecordingController(self)
+        self.session_camera_recorder.opened.connect(self._handle_session_recorder_opened)
+        self.session_camera_recorder.state_changed.connect(self._handle_session_recorder_state_changed)
+        self.session_camera_recorder.session_terminal.connect(self._handle_session_recorder_terminal)
         self._last_distance_history_key: tuple[float, float, str] | None = None
         self._last_tracking_pair_key: tuple[object, ...] | None = None
         self._last_tracking_result: TrackingUpdateResult | None = None
@@ -5145,6 +5177,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.right_pane.stats_changed.connect(self._update_camera_stream_stats)
         self.left_pane.state_changed.connect(self._log_state)
         self.right_pane.state_changed.connect(self._log_state)
+        for pane in (self.left_pane, self.right_pane):
+            pane.recording_ready.connect(self._handle_session_camera_ready)
+            pane.recording_event_ready.connect(self._handle_session_recording_event)
+            pane.recording_failure.connect(self._handle_session_camera_failure)
+            pane.recording_terminal.connect(self._handle_session_camera_terminal)
+            pane.stream_finished.connect(self._handle_camera_pane_finished)
         video_row.addWidget(self.left_pane, 1)
         video_row.addWidget(self.right_pane, 1)
         runtime_controls = QtWidgets.QGridLayout()
@@ -10289,7 +10327,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return format_video_paths(self.video_recording_paths)
 
     def _session_recording_active(self) -> bool:
-        return self.distance_recording_enabled or self.video_recording_enabled
+        return self.session_state in SESSION_ACTIVE_STATES or self.distance_recording_enabled or self.video_recording_enabled
 
     def browse_yolo_weights(self) -> None:
         current_path = Path(self.weights_edit.text().strip() or DEFAULT_YOLO_WEIGHTS).expanduser()
@@ -12928,7 +12966,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log(message)
         if enable_detection and not self.yolo_enabled:
             self._reset_measurement_graphs_for_new_run()
-        self._stop_camera_panes(clear_previews=False)
         self.active_stream_decoders["left"] = None
         self.active_stream_decoders["right"] = None
         self._update_runtime_stream_settings_label()
@@ -12957,7 +12994,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._refresh_session_toggle_buttons()
             self._refresh_operation_header()
 
-        start_both()
+        self._stop_camera_panes(clear_previews=False, completion=start_both)
 
     def _reset_measurement_graphs_for_new_run(self) -> None:
         self.distance_history.clear()
@@ -12970,13 +13007,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log("[Depth] 새 측정 시작으로 거리 그래프와 3D ray 품질 그래프를 초기화했습니다.")
 
     def stop_yolo_streams(self) -> None:
+        if self.session_state in SESSION_ACTIVE_STATES:
+            self._begin_session_finalize(restart_preview=False, reason="disconnect")
+            return
         self._stop_camera_panes(clear_previews=True)
-        if self._session_recording_active():
-            self.distance_recording_enabled = False
-            self.video_recording_enabled = False
-            self.distance_recording_started_monotonic_s = None
-            self.record_button.setText("세션 기록 시작")
-            self._log(f"[저장] 카메라 Preview 해제로 세션 기록을 중지했습니다: {self._format_video_recording_paths()}")
         self._clear_detection_state()
         self.camera_connected = False
         self.yolo_enabled = False
@@ -12987,9 +13021,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_session_toggle_buttons()
         self._refresh_operation_header()
 
-    def _stop_camera_panes(self, *, clear_previews: bool) -> None:
-        self.left_pane.stop(wait=True)
-        self.right_pane.stop(wait=True)
+    def _stop_camera_panes(self, *, clear_previews: bool, completion=None) -> None:
+        if self._camera_stop_transition_active:
+            if completion is not None and completion is not self._camera_stop_completion:
+                raise RuntimeError("camera stop transition is already active")
+            return
+        self._camera_stop_transition_active = True
+        self._camera_stop_completion = completion
+        self._camera_stop_waiting = {
+            side
+            for side, pane in (("left", self.left_pane), ("right", self.right_pane))
+            if pane.worker is not None or pane.thread is not None
+        }
+        self.left_pane.stop()
+        self.right_pane.stop()
         self.camera_frame_times["left"].clear()
         self.camera_frame_times["right"].clear()
         self.camera_frame_metadata["left"] = {}
@@ -13000,9 +13045,33 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.active_stream_decoders["right"] = None
         self._update_runtime_camera_stats_labels()
         self._update_runtime_stream_settings_label()
-        if not clear_previews:
-            return
-        self._clear_calibration_previews("left preview", right_text="right preview")
+        if clear_previews:
+            self._clear_calibration_previews("left preview", right_text="right preview")
+        if not self._camera_stop_waiting:
+            self._finish_camera_stop_transition()
+
+    def _handle_camera_pane_finished(self, camera_side: str) -> None:
+        self._camera_stop_waiting.discard(str(camera_side))
+        if self._camera_stop_transition_active and not self._camera_stop_waiting:
+            if self._session_recorder_terminal_received:
+                self._session_finalize_timer.stop()
+            self._finish_camera_stop_transition()
+        elif self._session_recorder_terminal_received and self._camera_panes_stopped():
+            self._session_finalize_timer.stop()
+
+    def _camera_panes_stopped(self) -> bool:
+        return all(
+            pane.worker is None and pane.thread is None
+            for pane in (self.left_pane, self.right_pane)
+        )
+
+    def _finish_camera_stop_transition(self) -> None:
+        completion = self._camera_stop_completion
+        self._camera_stop_completion = None
+        self._camera_stop_transition_active = False
+        self._camera_stop_waiting.clear()
+        if completion is not None:
+            completion()
 
     def _clear_calibration_previews(self, left_text: str, *, right_text: str | None = None) -> None:
         self.latest_calibration_preview_images.clear()
@@ -13029,6 +13098,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_distance()
 
     def stop_all(self) -> None:
+        if self.session_state in SESSION_ACTIVE_STATES:
+            self._begin_session_finalize(restart_preview=False, reason="application_close")
+            return
         self._stop_system_resource_worker()
         self.stop_yolo_streams()
         self.disconnect_pixhawk()
@@ -13046,6 +13118,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ("rtsp_enable_thread", "rtsp_enable_worker"),
         ):
             self._stop_worker_thread(attr, worker_attr=worker_attr)
+        self._shutdown_session_controller_async()
 
     def _stop_system_resource_worker(self) -> None:
         timer = getattr(self, "system_resource_timer", None)
@@ -13580,49 +13653,389 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def toggle_session_recording(self) -> None:
-        if self._session_recording_active():
+        if self.session_state in {"starting", "stopping"}:
+            return
+        if self.session_state == "recording":
             self._stop_session_recording()
             return
         self._start_session_recording()
 
     def _start_session_recording(self) -> None:
-        self.recording_session_id = session_id_now()
+        if self._camera_stop_transition_active:
+            self._log("[저장] 카메라 worker 종료 전이가 끝날 때까지 세션 시작을 보류합니다.")
+            return
+        if self.session_state not in SESSION_STARTABLE_STATES:
+            return
+        if normalize_stream_backend(str(self.stream_backend_combo.currentData() or "")) != STREAM_BACKEND_GSTREAMER:
+            self._reject_session_start("canonical session recording requires the GStreamer backend")
+            return
+        if self._keyframe_only_mode_enabled():
+            self._reject_session_start("keyframe-only diagnostic mode is incompatible with canonical recording")
+            return
+        left_url = self.left_url_edit.text().strip()
+        right_url = self.right_url_edit.text().strip()
+        if not left_url or not right_url:
+            self._reject_session_start("both left and right RTSP URLs are required")
+            return
+        if self._rtsp_urls_are_same_stream():
+            self._reject_session_start("left and right RTSP URLs must identify distinct streams")
+            return
+
+        # The legacy helper is second-resolution; Phase A refuses to reuse an
+        # existing canonical directory, so add a collision-resistant suffix
+        # for rapid stop/start cycles within the same second.
+        self.recording_session_id = f"{session_id_now()}_{uuid.uuid4().hex[:12]}"
         self.recording_session_started_wall_s = time.time()
         self.recording_session_started_monotonic_s = time.monotonic()
-        self.distance_recording_started_monotonic_s = self.recording_session_started_monotonic_s
-        self.distance_recording_enabled = True
-        self.video_recording_enabled = True
+        self.distance_recording_started_monotonic_s = None
+        self.distance_recording_enabled = False
+        self.video_recording_enabled = False
+        self.video_recording_paths = {}
+        self._session_ready_sides.clear()
+        self._session_terminal_sides.clear()
+        self._session_restart_preview = False
+        self._session_detection_enabled = bool(self.yolo_enabled)
+        self._session_stop_reason = ""
+        self._session_open_requested = False
+        self._session_recorder_terminal_received = False
         self.tracking_filter.reset()
         self._last_distance_history_key = None
         self._last_gps_source_comparison_key = None
         self._last_tracking_pair_key = None
         self._last_tracking_result = None
-        self._prepare_video_recording_paths()
-        self.record_button.setText("세션 기록 중지")
-        self._log(
-            "[저장] 세션 기록을 시작했습니다: "
-            f"session={self.recording_session_id}, {self._format_video_recording_paths()}"
-        )
-        if self.camera_connected:
-            self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
-        else:
-            self._log("[저장] 카메라 스트림을 시작하면 좌/우 영상 녹화가 함께 시작됩니다.")
+        self._set_session_state("starting")
+        self._log(f"[저장] canonical 세션 시작 준비: session={self.recording_session_id}")
+        self._stop_camera_panes(clear_previews=False, completion=self._open_session_recorder)
         self._refresh_recording_status_label()
         self._refresh_operation_header()
 
     def _stop_session_recording(self) -> None:
+        self._begin_session_finalize(restart_preview=True, reason="manual_stop")
+
+    @staticmethod
+    def _payload_value(payload: object, key: str, default=None):
+        if isinstance(payload, dict):
+            return payload.get(key, default)
+        return getattr(payload, key, default)
+
+    def _keyframe_only_mode_enabled(self) -> bool:
+        value = os.environ.get(I_FRAME_ONLY_ENV, "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _reject_session_start(self, reason: str) -> None:
+        self._log(f"[저장] 세션 시작 거부: {reason}")
+        self._set_session_state("failed")
+
+    def _set_session_state(self, state: str) -> None:
+        state = str(state)
+        if state not in {*SESSION_STARTABLE_STATES, *SESSION_ACTIVE_STATES}:
+            state = "failed"
+        self.session_state = state
+        if hasattr(self, "record_button"):
+            self.record_button.setEnabled(state not in {"starting", "stopping"})
+            camera_controls_enabled = state not in SESSION_ACTIVE_STATES
+            self.start_button.setEnabled(camera_controls_enabled)
+            self.camera_connect_button.setEnabled(camera_controls_enabled)
+            self._refresh_session_toggle_buttons()
+
+    def _open_session_recorder(self) -> None:
+        if self.session_state != "starting" or self._session_open_requested:
+            return
+        self._session_open_requested = True
+        self.camera_connected = False
+        self.yolo_enabled = False
+        accepted = self.session_camera_recorder.open_session(
+            SessionRecordingConfig(
+                root=APP_ROOT / "recordings",
+                session_id=self.recording_session_id,
+                recording_scope="camera_only",
+                started_monotonic_ns=time.monotonic_ns(),
+                started_utc_ns=time.time_ns(),
+            )
+        )
+        if not accepted:
+            self._session_open_requested = False
+            self._handle_session_terminal(
+                {
+                    "session_id": self.recording_session_id,
+                    "session_state": "failed",
+                    "clean_shutdown": False,
+                    "failures": [{"failure_stage": "recorder_open_rejected"}],
+                }
+            )
+
+    def _handle_session_recorder_opened(self, payload: object) -> None:
+        if self.session_state != "starting":
+            return
+        session_id = str(self._payload_value(payload, "session_id", ""))
+        if session_id and session_id != self.recording_session_id:
+            self._handle_session_camera_failure(
+                {"failure_stage": "session_id_mismatch", "detail": f"opened {session_id}"}
+            )
+            return
+        paths = self._payload_value(payload, "video_paths", None)
+        if isinstance(paths, dict):
+            left_path = paths.get("left")
+            right_path = paths.get("right")
+        else:
+            result_paths = self._payload_value(payload, "paths", None)
+            left_path = self._payload_value(payload, "left_video_path", None)
+            right_path = self._payload_value(payload, "right_video_path", None)
+            if result_paths is not None:
+                left_path = left_path or self._payload_value(result_paths, "left_video", None)
+                right_path = right_path or self._payload_value(result_paths, "right_video", None)
+        if left_path is None or right_path is None or Path(left_path) == Path(right_path):
+            self._handle_session_camera_failure(
+                {"failure_stage": "canonical_video_paths_invalid", "detail": str(payload)}
+            )
+            return
+        self.video_recording_paths = {"left": Path(left_path), "right": Path(right_path)}
+        self._start_canonical_session_workers()
+
+    def _start_canonical_session_workers(self) -> None:
+        if self.session_state != "starting":
+            return
+        kwargs = self.yolo_kwargs()
+        urls = {
+            "left": self.left_url_edit.text().strip(),
+            "right": self.right_url_edit.text().strip(),
+        }
+        for side, pane in (("left", self.left_pane), ("right", self.right_pane)):
+            try:
+                pane.start_stream(
+                    urls[side],
+                    enable_detection=self._session_detection_enabled,
+                    **kwargs,
+                    session_id=self.recording_session_id,
+                    camera_side=side,
+                    camera_stream_id=f"{self.recording_session_id}:{side}",
+                    record_video_path=str(self.video_recording_paths[side]),
+                )
+            except Exception as exc:
+                self._handle_session_camera_failure(
+                    {
+                        "event_kind": "camera_failure",
+                        "session_id": self.recording_session_id,
+                        "camera_side": side,
+                        "failure_stage": "camera_worker_start_failed",
+                        "detail": str(exc),
+                    }
+                )
+                return
+        self.camera_connected = True
+        self.yolo_enabled = self._session_detection_enabled
+
+    def _handle_session_camera_ready(self, payload: object) -> None:
+        if self.session_state != "starting":
+            return
+        if str(self._payload_value(payload, "session_id", "")) != self.recording_session_id:
+            return
+        side = str(self._payload_value(payload, "camera_side", ""))
+        if side not in {"left", "right"}:
+            return
+        output_path = self._payload_value(payload, "output_path", None)
+        expected_path = self.video_recording_paths.get(side)
+        if output_path is not None and expected_path is not None and Path(output_path) != expected_path:
+            self._handle_session_camera_failure(
+                {
+                    "event_kind": "camera_failure",
+                    "session_id": self.recording_session_id,
+                    "camera_side": side,
+                    "failure_stage": "canonical_video_path_mismatch",
+                    "detail": f"expected={expected_path}, observed={output_path}",
+                }
+            )
+            return
+        self._session_ready_sides.add(side)
+        if self._session_ready_sides != {"left", "right"}:
+            return
+        self.distance_recording_enabled = True
+        self.video_recording_enabled = True
+        self.distance_recording_started_monotonic_s = time.monotonic()
+        self._set_session_state("recording")
+        self._log(f"[저장] 좌우 canonical recording ready: session={self.recording_session_id}")
+
+    def _handle_session_recording_event(self, payload: object) -> None:
+        if self.session_state not in SESSION_ACTIVE_STATES:
+            return
+        if str(self._payload_value(payload, "session_id", "")) != self.recording_session_id:
+            return
+        self.session_camera_recorder.submit_recording_event(payload)
+
+    def _handle_session_camera_failure(self, payload: object) -> None:
+        payload_session_id = str(self._payload_value(payload, "session_id", self.recording_session_id))
+        if payload_session_id != self.recording_session_id:
+            return
+        stage = str(self._payload_value(payload, "failure_stage", "camera_failure"))
+        detail = str(self._payload_value(payload, "detail", ""))
+        camera_side = str(self._payload_value(payload, "camera_side", ""))
+        if camera_side not in {"left", "right"}:
+            camera_side = "left"
+        normalized_failure = dict(payload) if isinstance(payload, dict) else {}
+        normalized_failure.update(
+            {
+                "event_kind": "camera_failure",
+                "session_id": self.recording_session_id,
+                "camera_side": camera_side,
+                "failure_stage": stage,
+                "detail": detail,
+            }
+        )
+        self._log(f"[저장] camera session failure: {stage}: {detail}")
+        if self.session_state in SESSION_ACTIVE_STATES:
+            self.session_camera_recorder.submit_recording_event(normalized_failure)
+            self._begin_session_finalize(restart_preview=False, reason=stage)
+
+    def _handle_session_camera_terminal(self, payload: object) -> None:
+        if str(self._payload_value(payload, "session_id", "")) != self.recording_session_id:
+            return
+        side = str(self._payload_value(payload, "camera_side", ""))
+        if side not in {"left", "right"} or side in self._session_terminal_sides:
+            return
+        self._session_terminal_sides.add(side)
+        if self._session_terminal_sides == {"left", "right"}:
+            self._session_finalize_timer.stop()
+        self.session_camera_recorder.submit_camera_terminal(payload)
+        terminal_status = str(self._payload_value(payload, "terminal_status", "terminal"))
+        if terminal_status != "complete":
+            self._session_restart_preview = False
+        if self.session_state in {"starting", "recording"}:
+            self._begin_session_finalize(
+                restart_preview=False,
+                reason=f"{side}_camera_{terminal_status}",
+            )
+
+    def _begin_session_finalize(self, *, restart_preview: bool, reason: str) -> None:
+        allow_preview_restart = bool(restart_preview and reason == "manual_stop")
+        if self.session_state == "stopping":
+            if not allow_preview_restart:
+                self._session_restart_preview = False
+            return
+        if self.session_state in SESSION_TERMINAL_STATES:
+            return
+        if self.session_state not in {"starting", "recording"}:
+            return
         self.distance_recording_enabled = False
         self.video_recording_enabled = False
         self.distance_recording_started_monotonic_s = None
-        self.record_button.setText("세션 기록 시작")
-        self._log(
-            "[저장] 세션 기록을 중지했습니다: "
-            f"session={self.recording_session_id or 'none'}, {self._format_video_recording_paths()}"
-        )
-        if self.camera_connected:
-            self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
+        self._session_restart_preview = allow_preview_restart
+        self._session_stop_reason = str(reason)
+        self._set_session_state("stopping")
+        self._session_finalize_timer.start(SESSION_FINALIZE_TIMEOUT_MS)
+        self._log(f"[저장] canonical 세션 finalize 요청: reason={reason}")
         self._refresh_recording_status_label()
         self._refresh_operation_header()
+        if not self._session_open_requested:
+            if self._camera_stop_transition_active:
+                self._camera_stop_completion = self._complete_session_stopped_before_open
+            else:
+                self._stop_camera_panes(
+                    clear_previews=False,
+                    completion=self._complete_session_stopped_before_open,
+                )
+            return
+        self.left_pane.stop()
+        self.right_pane.stop()
+
+    def _complete_session_stopped_before_open(self) -> None:
+        self._handle_session_terminal(
+            {
+                "session_id": self.recording_session_id,
+                "session_state": "incomplete",
+                "clean_shutdown": False,
+                "failures": [{"failure_stage": self._session_stop_reason or "stopped_before_open"}],
+            }
+        )
+
+    def _handle_session_finalize_timeout(self) -> None:
+        if self.session_state == "stopping":
+            if self._session_open_requested and not self._session_recorder_terminal_received:
+                self.session_camera_recorder.finalize_timeout("dual_camera_finalize_timeout")
+            elif not self._close_pending:
+                self._complete_session_stopped_before_open()
+        self.left_pane.force_stop_async()
+        self.right_pane.force_stop_async()
+
+    def _handle_session_recorder_state_changed(self, state: object, detail: object = None) -> None:
+        state_text = str(state)
+        detail_text = "" if detail is None else str(detail)
+        if isinstance(detail, dict):
+            detail_session_id = str(detail.get("session_id") or self.recording_session_id)
+            if detail_session_id != self.recording_session_id:
+                return
+        failure_stage = str(detail.get("failure_stage", "")) if isinstance(detail, dict) else ""
+        if failure_stage == "recording_ipc_backpressure" or state_text in {"open_failed", "failed"}:
+            self._session_restart_preview = False
+        if (
+            state_text == "stopping"
+            and failure_stage == "recording_ipc_backpressure"
+            and self.session_state in {"starting", "recording"}
+        ):
+            self._begin_session_finalize(restart_preview=False, reason=failure_stage)
+            return
+        if state_text in {"open_failed", "failed"} and self.session_state in SESSION_ACTIVE_STATES:
+            self._log(f"[저장] recorder failure: {detail_text or state_text}")
+            if self.session_state != "stopping":
+                self._begin_session_finalize(restart_preview=False, reason="recorder_failure")
+
+    def _handle_session_recorder_terminal(self, result: object) -> None:
+        result_session_id = str(self._payload_value(result, "session_id", self.recording_session_id))
+        if result_session_id != self.recording_session_id:
+            return
+        if self._session_recorder_terminal_received:
+            return
+        self._session_recorder_terminal_received = True
+        self._handle_session_terminal(result)
+
+    def _handle_session_terminal(self, result: object) -> None:
+        result_session_id = str(self._payload_value(result, "session_id", self.recording_session_id))
+        if result_session_id != self.recording_session_id:
+            return
+        if self._session_recorder_terminal_received and self._camera_panes_stopped():
+            self._session_finalize_timer.stop()
+        state = str(self._payload_value(result, "session_state", self._payload_value(result, "state", "failed")))
+        if state not in SESSION_TERMINAL_STATES:
+            state = "failed"
+        restart_preview = self._session_restart_preview and state in SESSION_TERMINAL_STATES
+        self.distance_recording_enabled = False
+        self.video_recording_enabled = False
+        self.distance_recording_started_monotonic_s = None
+        self._set_session_state(state)
+        self._log(f"[저장] canonical 세션 terminal: state={state}, session={self.recording_session_id}")
+        self._refresh_recording_status_label()
+        if self._close_pending:
+            self._stop_camera_panes(clear_previews=True, completion=self._complete_application_close)
+            return
+        if restart_preview:
+            self._start_camera_streams(enable_detection=False, switch_to_depth=False)
+        else:
+            self.camera_connected = False
+            self.yolo_enabled = False
+            self._refresh_session_toggle_buttons()
+
+    def _complete_application_close(self) -> None:
+        if self._close_guarded:
+            return
+        if self._session_open_requested and not self._session_recorder_terminal_received:
+            return
+        if not self._camera_panes_stopped():
+            return
+        self._session_finalize_timer.stop()
+        self._camera_stop_completion = None
+        self._camera_stop_transition_active = False
+        self._camera_stop_waiting.clear()
+        self._shutdown_session_controller_async()
+        self._close_pending = False
+        self._close_guarded = True
+        self.application_close_ready.emit()
+
+    def _shutdown_session_controller_async(self) -> None:
+        threading.Thread(
+            target=self.session_camera_recorder.shutdown,
+            kwargs={"timeout_s": 5.0},
+            name="stereo-session-controller-shutdown",
+            daemon=True,
+        ).start()
 
     def toggle_distance_recording(self) -> None:
         self.toggle_session_recording()
@@ -17218,9 +17631,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        if self.request_application_close():
+            event.ignore()
+            return
         self._save_current_settings()
         self.stop_all()
         super().closeEvent(event)
+
+    def request_application_close(self) -> bool:
+        if self._close_guarded:
+            return False
+        if self._close_pending:
+            return True
+        if self.session_state not in SESSION_ACTIVE_STATES:
+            return False
+        self._close_pending = True
+        self._begin_session_finalize(restart_preview=False, reason="application_close")
+        return True
 
     def _stop_calibration_preview_worker(self, *_args) -> None:
         thread = getattr(self, "_calibration_preview_thread", None)
@@ -20333,10 +20760,19 @@ class WirisStereoDistanceGui(QtWidgets.QMainWindow):
         self.resize(1280, 820)
         self.panel = WirisStereoDistancePanel(auto_start=auto_start, auto_start_pixhawk=auto_start_pixhawk)
         self.setCentralWidget(self.panel)
+        self._session_close_guard = False
+        self.panel.application_close_ready.connect(self._resume_close_after_session)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        if not self._session_close_guard and self.panel.request_application_close():
+            event.ignore()
+            return
         self.panel.stop_all()
         super().closeEvent(event)
+
+    def _resume_close_after_session(self) -> None:
+        self._session_close_guard = True
+        self.close()
 
 
 class IntegratedWirisPixhawkConsole(QtWidgets.QMainWindow):
@@ -20352,10 +20788,19 @@ class IntegratedWirisPixhawkConsole(QtWidgets.QMainWindow):
         self.resize(1500, 920)
         self.panel = WirisStereoDistancePanel(auto_start=auto_start_wiris, auto_start_pixhawk=auto_start_pixhawk)
         self.setCentralWidget(self.panel)
+        self._session_close_guard = False
+        self.panel.application_close_ready.connect(self._resume_close_after_session)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        if not self._session_close_guard and self.panel.request_application_close():
+            event.ignore()
+            return
         self.panel.stop_all()
         super().closeEvent(event)
+
+    def _resume_close_after_session(self) -> None:
+        self._session_close_guard = True
+        self.close()
 
 
 QT_EXCEPTION_LOG_ENV = "SASL_QT_EXCEPTION_LOG"
