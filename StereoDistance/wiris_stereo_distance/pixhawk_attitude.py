@@ -13,14 +13,14 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from wiris_stereo_distance.px4_mag_manager import (
-    BOARD_INTERNAL_MAG_ID,
-    GPS1_MAG_ID,
-    GPS2_MAG_ID,
-    RM3100_BACKUP_IDS,
-    RM3100_PRIMARY_IDS,
+from wiris_stereo_distance.rtk_geometry import (
+    GPS_SOURCE_GLOBAL_POSITION,
+    GPS_SOURCE_SENSOR_GPS,
+    GpsPositionState,
+    global_position_topic,
+    gps_state_from_message,
+    gps_topic,
 )
-from wiris_stereo_distance.rtk_geometry import GpsPositionState, gps_state_from_message, gps_topic
 
 from PyQt5 import QtCore
 
@@ -599,6 +599,10 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         self.custom_watch_subscriptions: dict[str, Any] = {}
         self.latest_extrinsics: dict[str, CameraExtrinsicState] = {}
         self.latest_gps: dict[str, GpsPositionState] = {}
+        self.latest_gps_by_source: dict[str, dict[str, GpsPositionState]] = {
+            GPS_SOURCE_SENSOR_GPS: {},
+            GPS_SOURCE_GLOBAL_POSITION: {},
+        }
         self.attitude_buffers: dict[str, deque[CameraExtrinsicState]] = {
             "left": deque(maxlen=1000),
             "right": deque(maxlen=1000),
@@ -606,6 +610,10 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         self.gps_buffers: dict[str, deque[GpsPositionState]] = {
             "left": deque(maxlen=500),
             "right": deque(maxlen=500),
+        }
+        self.gps_buffers_by_source: dict[str, dict[str, deque[GpsPositionState]]] = {
+            GPS_SOURCE_SENSOR_GPS: {"left": deque(maxlen=500), "right": deque(maxlen=500)},
+            GPS_SOURCE_GLOBAL_POSITION: {"left": deque(maxlen=500), "right": deque(maxlen=500)},
         }
         self.mag_device_slots: dict[str, dict[int, str]] = {"left": {}, "right": {}}
         self.gps_device_slots: dict[str, dict[int, str]] = {"left": {}, "right": {}}
@@ -632,6 +640,7 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         sensor_gps_msg_type = self._optional_message_type("px4_msgs/msg/SensorGps")
         gnss_relative_msg_type = self._optional_message_type("px4_msgs/msg/SensorGnssRelative")
         gps_msg_type = self._optional_message_type("px4_msgs/msg/VehicleGpsPosition", quiet=True)
+        global_position_msg_type = self._optional_message_type("px4_msgs/msg/VehicleGlobalPosition", quiet=True)
         side_suffix = "_".join(self.active_sides)
         node_name = f"wiris_stereo_{side_suffix}_pixhawk_attitude"
         if self.context is not None:
@@ -673,6 +682,21 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
                 )
                 self.subscriptions.append(gps_subscription)
                 self.status_changed.emit(f"구독 시작: {camera_label_ko(camera)} {gps_topic(namespace)}")
+            if global_position_msg_type is not None:
+                global_position_subscription = self.node.create_subscription(
+                    global_position_msg_type,
+                    global_position_topic(namespace),
+                    lambda message, camera=camera, namespace=namespace: self._handle_global_position_message(
+                        camera,
+                        namespace,
+                        message,
+                    ),
+                    _qos_for_px4_out(),
+                )
+                self.subscriptions.append(global_position_subscription)
+                self.status_changed.emit(
+                    f"구독 시작: {camera_label_ko(camera)} {global_position_topic(namespace)}"
+                )
             if sensor_mag_msg_type is not None:
                 for topic in sensor_mag_topics(namespace):
                     mag_subscription = self.node.create_subscription(
@@ -860,9 +884,24 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         *,
         emit_sensor_gps: bool,
     ) -> None:
-        self._handle_gps_message(camera, namespace, message)
+        self._handle_gps_message(
+            camera,
+            namespace,
+            message,
+            source=GPS_SOURCE_SENSOR_GPS,
+            topic=gps_topic(namespace),
+        )
         if emit_sensor_gps:
             self._handle_sensor_gps_message(camera, namespace, message, topic=gps_topic(namespace))
+
+    def _handle_global_position_message(self, camera: str, namespace: str, message: Any) -> None:
+        self._handle_gps_message(
+            camera,
+            namespace,
+            message,
+            source=GPS_SOURCE_GLOBAL_POSITION,
+            topic=global_position_topic(namespace),
+        )
 
     def stop(self) -> None:
         self.timer.stop()
@@ -921,16 +960,6 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         return camera_slots[device_id]
 
     def _mag_slot_for_device(self, camera: str, device_id: int | None) -> str:
-        if device_id in RM3100_PRIMARY_IDS:
-            return "CAN1"
-        if device_id in RM3100_BACKUP_IDS:
-            return "CAN2"
-        if device_id == BOARD_INTERNAL_MAG_ID:
-            return "BOARD"
-        if device_id == GPS1_MAG_ID:
-            return "GPS1_MAG"
-        if device_id == GPS2_MAG_ID:
-            return "GPS2_MAG"
         return self._slot_for_device(self.mag_device_slots, camera, device_id, "MAG")
 
     def _handle_mag_message(self, camera: str, namespace: str, message: Any, *, topic: str | None = None) -> None:
@@ -980,12 +1009,13 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         device_id = getattr(message, "device_id", None)
         device_id = int(device_id) if device_id is not None else None
         px4_timestamp = getattr(message, "timestamp", None)
+        resolved_topic = topic or sensor_gps_topic(namespace)
         state = GpsSensorState(
             camera=camera,
             namespace=namespace,
             sensor_slot=self._slot_for_device(self.gps_device_slots, camera, device_id, "GPS"),
             timestamp_s=now_s,
-            topic=topic or sensor_gps_topic(namespace),
+            topic=resolved_topic,
             device_id=device_id,
             fix_type=_optional_int(message, "fix_type"),
             satellites_used=_optional_int(message, "satellites_used", "satellites"),
@@ -994,6 +1024,17 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
             px4_timestamp_s=float(px4_timestamp) * 1e-6 if px4_timestamp is not None else None,
         )
         self.gps_sensor_changed.emit(camera, state)
+        # The canonical selected sensor_gps topic also carries the LLA needed
+        # for a source-separated baseline. Instance topics remain health-only;
+        # GPS1/GPS2 selection is handled by their existing sensor state path.
+        if resolved_topic == sensor_gps_topic(namespace):
+            self._handle_gps_message(
+                camera,
+                namespace,
+                message,
+                source=GPS_SOURCE_SENSOR_GPS,
+                topic=resolved_topic,
+            )
 
     def _handle_gnss_relative_message(self, camera: str, namespace: str, message: Any) -> None:
         now_s = time.monotonic()
@@ -1024,15 +1065,28 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
 
 
 # Keep GPS handling near the class definition while avoiding ROS2 imports in tests.
-def _dual_pixhawk_handle_gps_message(self, camera: str, namespace: str, message: Any) -> None:
+def _dual_pixhawk_handle_gps_message(
+    self,
+    camera: str,
+    namespace: str,
+    message: Any,
+    *,
+    source: str = GPS_SOURCE_SENSOR_GPS,
+    topic: str | None = None,
+) -> None:
     gps_state = gps_state_from_message(
         camera=camera,
         namespace=namespace,
         message=message,
         timestamp_s=time.monotonic(),
+        source=source,
+        topic=topic,
     )
-    self.latest_gps[camera] = gps_state
-    self.gps_buffers.setdefault(camera, deque(maxlen=500)).append(gps_state)
+    self.latest_gps_by_source.setdefault(source, {})[camera] = gps_state
+    self.gps_buffers_by_source.setdefault(source, {}).setdefault(camera, deque(maxlen=500)).append(gps_state)
+    if source == GPS_SOURCE_SENSOR_GPS:
+        self.latest_gps[camera] = gps_state
+        self.gps_buffers.setdefault(camera, deque(maxlen=500)).append(gps_state)
     self.gps_changed.emit(camera, gps_state)
 
 
@@ -1240,10 +1294,12 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             "mavlink status"
         )
         try:
-            _send_mavlink_shell_command(connection, command)
+            result = _send_mavlink_shell_command(connection, command)
         except Exception as exc:
             self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink stream 설정 명령 실패: {exc}")
             return
+        if result.flag_label != "respond+exclusive":
+            self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell fallback 사용: {result.flag_label}")
         self._mavlink_stream_configured.add(camera)
         self.status_changed.emit(
             f"{camera_label_ko(camera)} MAVLink stream 설정 명령 전송: sysid={sysid}, "
@@ -1262,10 +1318,12 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             f"uxrce_dds_client start -t udp -p {int(config['port'])} -h {config['host_ip']}{namespace_arg}"
         )
         try:
-            _send_mavlink_shell_command(connection, command)
+            result = _send_mavlink_shell_command(connection, command)
         except Exception as exc:
             self.status_changed.emit(f"{camera_label_ko(camera)} ROS2 client 실행 명령 실패: {exc}")
             return
+        if result.flag_label != "respond+exclusive":
+            self.status_changed.emit(f"{camera_label_ko(camera)} PX4 shell fallback 사용: {result.flag_label}")
         self._ros2_client_started.add(camera)
         self.status_changed.emit(f"{camera_label_ko(camera)} ROS2 client 실행 명령 전송: {command}")
 
@@ -1405,6 +1463,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 eph_m=_mavlink_scaled_centimetres(getattr(message, "eph", None)),
                 epv_m=_mavlink_scaled_centimetres(getattr(message, "epv", None)),
                 heading_deg=_mavlink_heading_cdeg(getattr(message, "cog", None)),
+                rtcm_injection_rate_hz=_optional_float(message, "rtcm_injection_rate"),
+                source=GPS_SOURCE_SENSOR_GPS,
                 raw=message,
             )
             if message_type == "GPS_RAW_INT":
@@ -1439,6 +1499,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 longitude_deg=_mavlink_scaled_degrees(getattr(message, "lon", None)),
                 altitude_m=_mavlink_scaled_millimetres(getattr(message, "alt", None)),
                 heading_deg=_mavlink_heading_cdeg(getattr(message, "hdg", None)),
+                source=GPS_SOURCE_GLOBAL_POSITION,
                 raw=message,
             )
             self.gps_changed.emit(camera, gps)
@@ -1666,7 +1727,7 @@ def _mag_sensor_state_from_mavlink(
     z = _optional_float(message, "zmag")
     if x is None or y is None or z is None:
         return None
-    slot = {"SCALED_IMU": "CAN1", "SCALED_IMU2": "CAN2", "SCALED_IMU3": "CAN3"}.get(message_type, "CAN?")
+    slot = message_type if message_type in {"SCALED_IMU", "SCALED_IMU2", "SCALED_IMU3"} else "MAVLINK_MAG"
     return MagSensorState(
         camera=camera,
         namespace=namespace,

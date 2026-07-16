@@ -5,6 +5,8 @@ from math import atan2, cos, radians, sin, sqrt
 from typing import Any
 
 EARTH_RADIUS_M = 6_378_137.0
+GPS_SOURCE_SENSOR_GPS = "sensor_gps"
+GPS_SOURCE_GLOBAL_POSITION = "global_position"
 
 
 @dataclass(frozen=True)
@@ -22,8 +24,11 @@ class GpsPositionState:
     epv_m: float | None = None
     heading_deg: float | None = None
     heading_accuracy_deg: float | None = None
+    rtcm_injection_rate_hz: float | None = None
     px4_timestamp_s: float | None = None
     raw: Any | None = None
+    source: str = GPS_SOURCE_SENSOR_GPS
+    px4_sample_timestamp_s: float | None = None
 
     @property
     def has_position(self) -> bool:
@@ -46,6 +51,11 @@ class GpsPositionState:
 def gps_topic(namespace: str) -> str:
     normalized = namespace.strip().strip("/")
     return f"/{normalized}/fmu/out/vehicle_gps_position" if normalized else "/fmu/out/vehicle_gps_position"
+
+
+def global_position_topic(namespace: str) -> str:
+    normalized = namespace.strip().strip("/")
+    return f"/{normalized}/fmu/out/vehicle_global_position" if normalized else "/fmu/out/vehicle_global_position"
 
 
 def _scaled_degrees(value: Any) -> float | None:
@@ -90,23 +100,47 @@ def _heading_degrees(value: Any) -> float | None:
     return number
 
 
-def gps_state_from_message(*, camera: str, namespace: str, message: Any, timestamp_s: float) -> GpsPositionState:
+def gps_state_from_message(
+    *,
+    camera: str,
+    namespace: str,
+    message: Any,
+    timestamp_s: float,
+    source: str = GPS_SOURCE_SENSOR_GPS,
+    topic: str | None = None,
+) -> GpsPositionState:
     px4_timestamp = getattr(message, "timestamp", None)
+    px4_sample_timestamp = getattr(message, "timestamp_sample", None)
+    lat_lon_valid = getattr(message, "lat_lon_valid", True)
+    alt_valid = getattr(message, "alt_valid", True)
+    latitude = _scaled_degrees(getattr(message, "lat", getattr(message, "latitude_deg", None)))
+    longitude = _scaled_degrees(getattr(message, "lon", getattr(message, "longitude_deg", None)))
+    altitude = _scaled_altitude_m(getattr(message, "alt", getattr(message, "altitude_msl_m", None)))
+    if lat_lon_valid is False:
+        latitude = None
+        longitude = None
+    if alt_valid is False:
+        altitude = None
     return GpsPositionState(
         camera=camera,
         namespace=namespace.strip().strip("/"),
         timestamp_s=float(timestamp_s),
-        topic=gps_topic(namespace),
-        latitude_deg=_scaled_degrees(getattr(message, "lat", getattr(message, "latitude_deg", None))),
-        longitude_deg=_scaled_degrees(getattr(message, "lon", getattr(message, "longitude_deg", None))),
-        altitude_m=_scaled_altitude_m(getattr(message, "alt", getattr(message, "altitude_msl_m", None))),
+        topic=topic or gps_topic(namespace),
+        latitude_deg=latitude,
+        longitude_deg=longitude,
+        altitude_m=altitude,
         fix_type=int(getattr(message, "fix_type")) if hasattr(message, "fix_type") else None,
         satellites_used=int(getattr(message, "satellites_used")) if hasattr(message, "satellites_used") else None,
         eph_m=_scaled_accuracy_m(getattr(message, "eph", None)),
         epv_m=_scaled_accuracy_m(getattr(message, "epv", None)),
         heading_deg=_heading_degrees(getattr(message, "heading", getattr(message, "heading_motion", None))),
         heading_accuracy_deg=_heading_degrees(getattr(message, "heading_accuracy", None)),
+        rtcm_injection_rate_hz=_scaled_accuracy_m(getattr(message, "rtcm_injection_rate", None)),
         px4_timestamp_s=float(px4_timestamp) * 1e-6 if px4_timestamp is not None else None,
+        source=str(source or GPS_SOURCE_SENSOR_GPS),
+        px4_sample_timestamp_s=(
+            float(px4_sample_timestamp) * 1e-6 if px4_sample_timestamp is not None else None
+        ),
         raw=message,
     )
 

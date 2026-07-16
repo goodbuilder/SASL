@@ -22,6 +22,7 @@ from wiris_stereo_distance.reprojection_profile import (
     ORIGIN_BBOX_REPROJECTION_METHOD,
     OriginBBoxReprojectionProfile,
     RectifiedStereoCameraModel,
+    calibration_envelope_from_intrinsics,
     load_reprojection_profile,
     residual_samples_from_rows,
     save_reprojection_profile,
@@ -1063,6 +1064,10 @@ def build_origin_bbox_reprojection_profile_from_telemetry(
         screen_u_gain=screen_u_gain,
         screen_v_gain=screen_v_gain,
         output_policy=output_policy,
+        calibration_envelope=calibration_envelope_from_intrinsics(
+            None,
+            profile_source="simulation-origin-telemetry-build",
+        ),
     )
     return profile, rows
 

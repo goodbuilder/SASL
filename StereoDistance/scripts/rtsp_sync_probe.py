@@ -12,9 +12,14 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 
+def gst_string_literal(value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
 def build_pipeline(url: str, latency_ms: int):
     pipeline_text = (
-        f"rtspsrc location={url} latency={latency_ms} protocols=tcp drop-on-latency=true "
+        f"rtspsrc location={gst_string_literal(url)} latency={latency_ms} protocols=tcp drop-on-latency=true "
         "! rtph264depay "
         "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
         "! h264parse "

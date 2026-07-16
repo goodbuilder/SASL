@@ -25,13 +25,34 @@ def test_alignment_profile_manager_payload_contains_required_contracts() -> None
         right_attitude=None,
         coordinate_settings=coordinates.settings,
         gps_mapping={"left_camera": "GPS1", "right_camera": "GPS1"},
-        magnetometer_mapping={"left_can1": "CAN1", "right_can1": "CAN1"},
+        magnetometer_mapping={
+            "left": [
+                {
+                    "slot": "CAL_MAG2",
+                    "user_label": "CAN1",
+                    "device_id": 8944899,
+                    "interface": "DroneCAN",
+                    "priority": 100,
+                }
+            ],
+            "right": [
+                {
+                    "slot": "CAL_MAG3",
+                    "user_label": "CAN1",
+                    "device_id": 8944643,
+                    "interface": "DroneCAN",
+                    "priority": 100,
+                }
+            ],
+        },
     )
     loaded = profile.load(profile.dump(payload))
 
     assert loaded["alignment_profile"]["baseline"]["frame"] == "ENU"
     assert loaded["alignment_profile"]["coordinate_system"]["camera_frame"] == "RDF"
     assert loaded["alignment_profile"]["gps_source_mapping"]["left_camera"] == "GPS1"
+    assert loaded["alignment_profile"]["magnetometer_source_mapping"]["left"][0]["slot"] == "CAL_MAG2"
+    assert loaded["alignment_profile"]["magnetometer_source_mapping"]["left"][0]["user_label"] == "CAN1"
 
 
 def test_alignment_validator_reports_fail_for_large_profile_delta() -> None:

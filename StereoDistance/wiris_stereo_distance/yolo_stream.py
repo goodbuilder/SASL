@@ -22,6 +22,8 @@ SASL_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_YOLO_PYTHON = os.environ.get("PYTHON_BIN") or sys.executable
 DEFAULT_YOLO_WEIGHTS = os.environ.get("YOLO_MODEL_PATH") or str(SASL_ROOT / "models" / "sasl_uav.pt")
 DEFAULT_RTSP_LATENCY_MS = 50
+DEFAULT_FFMPEG_STIMEOUT_US = 2_000_000
+DEFAULT_FFMPEG_MAX_DELAY_US = 500_000
 DEFAULT_CPU_YOLO_MAX_RATE_HZ = 20.0
 DEFAULT_CPU_YOLO_INITIAL_RATE_HZ = 15.0
 DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ = 20.0
@@ -58,6 +60,16 @@ UINT32_MODULUS = 2**32
 UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
+MAX_RECORD_VIDEO_QUEUE_SIZE = 60
+
+
+def _positive_int_config(config: dict[str, Any], key: str, default: int, *, allow_zero: bool = False) -> int:
+    try:
+        value = int(config.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    lower = 0 if allow_zero else 1
+    return max(lower, value)
 
 
 @dataclass(frozen=True)
@@ -108,6 +120,41 @@ def highest_confidence_detection(detections: list[DetectionBox]) -> DetectionBox
     if not detections:
         return None
     return max(detections, key=lambda detection: detection.confidence)
+
+
+def filter_measurement_detections(
+    detections: list[DetectionBox],
+    config: dict[str, Any],
+) -> list[DetectionBox]:
+    """Apply the operator-selected candidate gates before choosing a bbox."""
+    candidates = list(detections)
+    if bool(config.get("gate_class_enabled", False)):
+        requested = {
+            token.strip().lower()
+            for token in str(config.get("gate_class_text") or "").replace(";", ",").split(",")
+            if token.strip()
+        }
+        if not requested:
+            return []
+        candidates = [
+            detection
+            for detection in candidates
+            if str(detection.class_id) in requested
+            or (detection.class_name or "").strip().lower() in requested
+            or f"#{detection.class_id}" in requested
+        ]
+    if bool(config.get("gate_min_bbox_enabled", False)):
+        min_width = max(0.0, float(config.get("gate_min_width_px", 0.0) or 0.0))
+        min_height = max(0.0, float(config.get("gate_min_height_px", 0.0) or 0.0))
+        min_area = max(0.0, float(config.get("gate_min_area_px", 0.0) or 0.0))
+        candidates = [
+            detection
+            for detection in candidates
+            if abs(detection.x2 - detection.x1) >= min_width
+            and abs(detection.y2 - detection.y1) >= min_height
+            and abs(detection.x2 - detection.x1) * abs(detection.y2 - detection.y1) >= min_area
+        ]
+    return candidates
 
 
 def detections_from_ultralytics_result(result, *, names: object | None = None) -> list[DetectionBox]:
@@ -196,15 +243,27 @@ def _record_video_fps(config: dict[str, Any]) -> float:
 
 
 def _record_video_queue_size(config: dict[str, Any]) -> int:
-    try:
-        size = int(config.get("record_video_queue_size") or DEFAULT_RECORD_VIDEO_QUEUE_SIZE)
-    except (TypeError, ValueError):
-        size = DEFAULT_RECORD_VIDEO_QUEUE_SIZE
-    return max(1, size)
+    return min(
+        MAX_RECORD_VIDEO_QUEUE_SIZE,
+        _positive_int_config(config, "record_video_queue_size", DEFAULT_RECORD_VIDEO_QUEUE_SIZE),
+    )
+
+
+def _ffmpeg_stimeout_us(config: dict[str, Any]) -> int:
+    return _positive_int_config(config, "ffmpeg_stimeout_us", DEFAULT_FFMPEG_STIMEOUT_US, allow_zero=True)
+
+
+def _ffmpeg_max_delay_us(config: dict[str, Any]) -> int:
+    return _positive_int_config(config, "ffmpeg_max_delay_us", DEFAULT_FFMPEG_MAX_DELAY_US, allow_zero=True)
 
 
 def _gst_location(value: str) -> str:
     return shlex.quote(str(Path(value).expanduser()))
+
+
+def _gst_string_literal(value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
 
 
 class AsyncVideoWriter:
@@ -785,7 +844,7 @@ def build_gst_pipeline_text(
     record_path = str(record_video_path or "").strip()
     if record_path:
         return (
-            f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
+            f"rtspsrc name=src location={_gst_string_literal(url)} latency={latency_ms} protocols={rtsp_transport} "
             "drop-on-latency=true do-rtcp=true "
             "! rtph264depay name=depay source-info=true "
             "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
@@ -804,7 +863,7 @@ def build_gst_pipeline_text(
             f"! filesink location={_gst_location(record_path)} sync=false"
         )
     return (
-        f"rtspsrc name=src location={url} latency={latency_ms} protocols={rtsp_transport} "
+        f"rtspsrc name=src location={_gst_string_literal(url)} latency={latency_ms} protocols={rtsp_transport} "
         "drop-on-latency=true do-rtcp=true "
         "! rtph264depay name=depay source-info=true "
         "! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 "
@@ -829,7 +888,7 @@ def build_gst_recording_pipeline_text(
     latency_ms = max(0, int(latency_ms))
     rtsp_transport = normalize_rtsp_transport(transport)
     return (
-        f"rtspsrc location={url} latency={latency_ms} protocols={rtsp_transport} "
+        f"rtspsrc location={_gst_string_literal(url)} latency={latency_ms} protocols={rtsp_transport} "
         "drop-on-latency=true do-rtcp=true "
         "! rtph264depay "
         "! h264parse config-interval=-1 "
@@ -1129,11 +1188,15 @@ def _process_frame_for_output(
     enable_detection: bool,
     draw_preview_overlay: bool = False,
     timestamp_metadata: dict[str, Any] | None = None,
+    frame_id: object | None = None,
 ):
     height, width = frame.shape[:2]
     annotated = frame
     best_detection = None
     inferred = False
+    frame_timestamp_metadata = dict(timestamp_metadata or {})
+    if frame_id is not None:
+        frame_timestamp_metadata["frame_id"] = frame_id
     if enable_detection:
         class_names = getattr(model, "names", None)
         configured_device = str(config.get("device") or "")
@@ -1177,18 +1240,27 @@ def _process_frame_for_output(
                         height,
                         None,
                         [],
-                        dict(timestamp_metadata or {}),
+                        frame_timestamp_metadata,
                     )
                 )
                 return frame, None, False
         try:
             detections = detections_from_ultralytics_result(result, names=class_names)
-            best_detection = highest_confidence_detection(detections)
+            gated_detections = filter_measurement_detections(detections, config)
+            best_detection = highest_confidence_detection(gated_detections)
             if draw_preview_overlay and best_detection is not None:
                 annotated = _draw_detections(cv2, frame, [best_detection], best_detection)
             inferred = True
             if best_detection is not None and bool(config.get("emit_measurement_frames", False)):
-                _emit_measurement_frame(cv2, annotated, config, output_queue, timestamp_s=now_s)
+                _emit_measurement_frame(
+                    cv2,
+                    annotated,
+                    config,
+                    output_queue,
+                    timestamp_s=now_s,
+                    frame_id=frame_id,
+                    timestamp_metadata=frame_timestamp_metadata,
+                )
             output_queue.put(
                 (
                     "detection",
@@ -1197,7 +1269,7 @@ def _process_frame_for_output(
                     height,
                     best_detection.as_dict() if best_detection is not None else None,
                     [detection.as_dict() for detection in detections],
-                    dict(timestamp_metadata or {}),
+                    frame_timestamp_metadata,
                 )
             )
         except Exception as exc:
@@ -1252,6 +1324,8 @@ def _emit_measurement_frame(
     output_queue,
     *,
     timestamp_s: float,
+    frame_id: object | None = None,
+    timestamp_metadata: dict[str, Any] | None = None,
 ) -> None:
     display_frame = frame
     max_preview_width = int(config["preview_max_width"])
@@ -1263,7 +1337,17 @@ def _emit_measurement_frame(
             interpolation=cv2.INTER_AREA,
         )
     rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-    output_queue.put(("measurement_frame", float(timestamp_s), rgb.shape[1], rgb.shape[0], rgb.tobytes()))
+    output_queue.put(
+        (
+            "measurement_frame",
+            float(timestamp_s),
+            frame_id,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.tobytes(),
+            dict(timestamp_metadata or {}),
+        )
+    )
 
 
 def _emit_stream_status(output_queue, enable_detection: bool, best_detection, now_s: float, last_status_s: float) -> float:
@@ -1484,6 +1568,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 enable_detection=enable_detection,
                 draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
+                frame_id=int(frame_record["sequence"]),
             )
             if annotated is None:
                 time.sleep(0.2)
@@ -1502,7 +1587,9 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
 
 def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
     transport = normalize_rtsp_transport(str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)))
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{transport}|stimeout;2000000|max_delay;500000"
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+        f"rtsp_transport;{transport}|stimeout;{_ffmpeg_stimeout_us(config)}|max_delay;{_ffmpeg_max_delay_us(config)}"
+    )
     backend = normalize_stream_backend(str(config.get("stream_backend", STREAM_BACKEND_OPENCV)))
     api_preference = cv2.CAP_ANY if backend == STREAM_BACKEND_OPENCV_AUTO else cv2.CAP_FFMPEG
     backend_name = "OpenCV Auto" if backend == STREAM_BACKEND_OPENCV_AUTO else "OpenCV/FFmpeg"
@@ -1636,6 +1723,7 @@ def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, mo
                 enable_detection=enable_detection,
                 draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
+                frame_id=int(frame_record["sequence"]),
             )
             if annotated is None:
                 time.sleep(0.2)
@@ -1662,8 +1750,8 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
     transport = normalize_rtsp_transport(str(config.get("rtsp_transport", RTSP_TRANSPORT_UDP)))
     options = {
         "rtsp_transport": transport,
-        "stimeout": "2000000",
-        "max_delay": "500000",
+        "stimeout": str(_ffmpeg_stimeout_us(config)),
+        "max_delay": str(_ffmpeg_max_delay_us(config)),
         "fflags": "nobuffer",
         "flags": "low_delay",
     }
@@ -1822,6 +1910,7 @@ def _run_pyav_stream(config: dict[str, Any], output_queue, stop_event, cv2, mode
                 enable_detection=enable_detection,
                 draw_preview_overlay=True,
                 timestamp_metadata=detection_timestamp_metadata,
+                frame_id=int(frame_record["sequence"]),
             )
             if annotated is None:
                 time.sleep(0.2)
@@ -1883,13 +1972,21 @@ class _BoundedProcessOutputQueue:
         self.frame_queue = frame_queue
 
     def put(self, message) -> None:
+        if not message:
+            return
         if message and message[0] == "frame":
             try:
                 self.frame_queue.put_nowait(message)
             except queue.Full:
                 return
             return
-        self.event_queue.put(message)
+        # Never let a status/detection burst block the capture process. A full
+        # event queue means the GUI is already behind; the next fresh sample
+        # is more useful than stopping RTSP ingestion here.
+        try:
+            self.event_queue.put_nowait(message)
+        except queue.Full:
+            return
 
 
 def _queue_has_pending_messages(message_queue) -> bool:
@@ -1915,7 +2012,7 @@ def _get_queue_message_nowait(message_queue):
 
 class YoloStreamWorker(QtCore.QObject):
     frame_ready = QtCore.pyqtSignal(QtGui.QImage, object)
-    measurement_frame_ready = QtCore.pyqtSignal(float, QtGui.QImage)
+    measurement_frame_ready = QtCore.pyqtSignal(float, object, QtGui.QImage, object)
     detection_ready = QtCore.pyqtSignal(dict)
     stats_ready = QtCore.pyqtSignal(dict)
     status_changed = QtCore.pyqtSignal(str)
@@ -1931,12 +2028,21 @@ class YoloStreamWorker(QtCore.QObject):
         conf_threshold: float,
         iou_threshold: float,
         max_rate_hz: float,
+        gate_class_enabled: bool = False,
+        gate_class_text: str = "",
+        gate_min_bbox_enabled: bool = False,
+        gate_min_width_px: int = 0,
+        gate_min_height_px: int = 0,
+        gate_min_area_px: int = 0,
         display_rate_hz: float = 0.0,
         preview_max_width: int = 960,
         rtsp_latency_ms: int = DEFAULT_RTSP_LATENCY_MS,
         decoder: str = DECODER_NVIDIA,
         stream_backend: str = STREAM_BACKEND_GSTREAMER,
         rtsp_transport: str = RTSP_TRANSPORT_UDP,
+        record_video_queue_size: int = DEFAULT_RECORD_VIDEO_QUEUE_SIZE,
+        ffmpeg_stimeout_us: int = DEFAULT_FFMPEG_STIMEOUT_US,
+        ffmpeg_max_delay_us: int = DEFAULT_FFMPEG_MAX_DELAY_US,
         enable_detection: bool = True,
         record_video_path: str = "",
         record_video_fps: float = 30.0,
@@ -1958,6 +2064,12 @@ class YoloStreamWorker(QtCore.QObject):
             "input_size": normalize_yolo_input_size(input_size),
             "conf_threshold": conf_threshold,
             "iou_threshold": iou_threshold,
+            "gate_class_enabled": bool(gate_class_enabled),
+            "gate_class_text": str(gate_class_text or ""),
+            "gate_min_bbox_enabled": bool(gate_min_bbox_enabled),
+            "gate_min_width_px": max(0, int(gate_min_width_px)),
+            "gate_min_height_px": max(0, int(gate_min_height_px)),
+            "gate_min_area_px": max(0, int(gate_min_area_px)),
             "max_rate_hz": effective_max_rate,
             "display_rate_hz": display_rate_hz,
             "preview_max_width": preview_max_width,
@@ -1965,6 +2077,9 @@ class YoloStreamWorker(QtCore.QObject):
             "decoder": normalize_decoder_mode(decoder),
             "stream_backend": normalize_stream_backend(stream_backend),
             "rtsp_transport": normalize_rtsp_transport(rtsp_transport),
+            "record_video_queue_size": max(1, int(record_video_queue_size)),
+            "ffmpeg_stimeout_us": max(0, int(ffmpeg_stimeout_us)),
+            "ffmpeg_max_delay_us": max(0, int(ffmpeg_max_delay_us)),
             "enable_detection": enable_detection,
             "emit_measurement_frames": enable_detection,
             "adaptive_rate": adaptive_rate,
@@ -2040,13 +2155,13 @@ class YoloStreamWorker(QtCore.QObject):
             except queue.Empty:
                 return
         self._handle_worker_message(message)
-        while True:
+        for _ in range(15):
             try:
                 message = _get_queue_message_nowait(self._event_queue)
             except queue.Empty:
                 break
             self._handle_worker_message(message)
-        while True:
+        for _ in range(4):
             try:
                 message = _get_queue_message_nowait(self._frame_queue)
             except queue.Empty:
@@ -2099,7 +2214,12 @@ class YoloStreamWorker(QtCore.QObject):
             self.frame_ready.emit(image, metadata)
             return
         if kind == "measurement_frame":
-            _kind, timestamp_s, width, height, data = message
+            if len(message) >= 7:
+                _kind, timestamp_s, frame_id, width, height, data, timestamp_metadata = message
+            else:
+                _kind, timestamp_s, width, height, data = message
+                frame_id = None
+                timestamp_metadata = {}
             image = QtGui.QImage(
                 data,
                 width,
@@ -2107,7 +2227,7 @@ class YoloStreamWorker(QtCore.QObject):
                 width * 3,
                 QtGui.QImage.Format_RGB888,
             ).copy()
-            self.measurement_frame_ready.emit(float(timestamp_s), image)
+            self.measurement_frame_ready.emit(float(timestamp_s), frame_id, image, timestamp_metadata)
             return
         if kind == "detection":
             if len(message) >= 7:

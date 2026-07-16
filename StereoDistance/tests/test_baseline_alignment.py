@@ -19,6 +19,7 @@ def test_baseline_from_gps_outputs_enu_and_ned_contract() -> None:
 
 def test_baseline_quality_and_profile_yaml() -> None:
     from wiris_stereo_distance.baseline_alignment import (
+        BaselineQualityThresholds,
         baseline_from_gps,
         baseline_profile_payload,
         dump_baseline_profile,
@@ -73,3 +74,41 @@ def test_baseline_quality_and_profile_yaml() -> None:
 
     assert loaded["baseline_profile"]["baseline"]["frame"] == "ENU"
     assert loaded["baseline_profile"]["quality"]["grade"] == "GOOD"
+
+    strict_quality = evaluate_baseline_quality(
+        samples,
+        duration_s=5.0,
+        thresholds=BaselineQualityThresholds(max_timestamp_delta_ms=1.0),
+    )
+
+    assert strict_quality is not None
+    assert strict_quality.grade == "BAD"
+    assert "timestamp delta > 1 ms" in strict_quality.reasons
+
+
+def test_compare_baseline_sources_keeps_source_deltas_separate() -> None:
+    from wiris_stereo_distance.baseline_alignment import compare_baseline_sources
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    sensor_left = GpsPositionState(
+        "left", "uav_0", 10.0, "mavlink/GPS_RAW_INT", 37.0, 127.0, 10.0, fix_type=6
+    )
+    sensor_right = GpsPositionState(
+        "right", "uav_1", 10.01, "mavlink/GPS_RAW_INT", 37.0, 127.000003, 10.0, fix_type=6
+    )
+    global_left = GpsPositionState(
+        "left", "uav_0", 10.02, "mavlink/GLOBAL_POSITION_INT", 37.000001, 127.0, 10.0, source="global_position"
+    )
+    global_right = GpsPositionState(
+        "right", "uav_1", 10.03, "mavlink/GLOBAL_POSITION_INT", 37.000001, 127.000004, 10.0, source="global_position"
+    )
+
+    comparison = compare_baseline_sources(sensor_left, sensor_right, global_left, global_right)
+
+    assert comparison.status == "OK"
+    assert comparison.sensor_baseline is not None
+    assert comparison.global_baseline is not None
+    assert comparison.baseline_length_delta_m is not None
+    assert comparison.left_position_delta_ned_m is not None
+    assert comparison.right_position_delta_ned_m is not None
+    assert comparison.baseline_angle_deg is not None

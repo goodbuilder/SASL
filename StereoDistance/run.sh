@@ -70,16 +70,27 @@ case "${1:-}" in
     ;;
   --check)
     export PYTHONPATH="$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    export STEREO_APP_DIR="$APP_DIR"
     "$PYTHON_BIN" - <<'PY'
 from pathlib import Path
+import importlib.util
+import os
 import sys
 
 import sasl_common.truth_coordinates
-import wiris_stereo_distance.gui
+
+main_spec = importlib.util.spec_from_file_location(
+    "stereo_distance_main",
+    Path(os.environ["STEREO_APP_DIR"]) / "main.py",
+)
+main_module = importlib.util.module_from_spec(main_spec)
+main_spec.loader.exec_module(main_module)
+from mpl_toolkits.mplot3d import Axes3D
 
 print("StereoDistance runtime check ok")
 print(f"python={sys.executable}")
 print(f"sasl_root={Path.cwd().resolve()}")
+print(f"axes3d={Axes3D.__module__}")
 PY
     exit 0
     ;;

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from math import isfinite
 from typing import Callable, Generic, Iterable, Protocol, TypeVar
 
 
@@ -62,6 +63,7 @@ def match_nearest_pair(
     *,
     max_delta_s: float,
     timestamp: Callable[[T], float | None] | None = None,
+    pair_timestamp: Callable[[T, T], tuple[float, float] | None] | None = None,
 ) -> MatchedPair[T] | None:
     left_list = list(left_samples)
     right_list = list(right_samples)
@@ -72,13 +74,21 @@ def match_nearest_pair(
     candidates: list[MatchedPair[T]] = []
     for left in left_list:
         for right in right_list:
-            raw_left_timestamp_s = timestamp_fn(left)
-            raw_right_timestamp_s = timestamp_fn(right)
-            if raw_left_timestamp_s is None or raw_right_timestamp_s is None:
-                continue
-            left_timestamp_s = float(raw_left_timestamp_s)
-            right_timestamp_s = float(raw_right_timestamp_s)
+            if pair_timestamp is not None:
+                timestamp_pair = pair_timestamp(left, right)
+                if timestamp_pair is None:
+                    continue
+                left_timestamp_s, right_timestamp_s = (float(timestamp_pair[0]), float(timestamp_pair[1]))
+            else:
+                raw_left_timestamp_s = timestamp_fn(left)
+                raw_right_timestamp_s = timestamp_fn(right)
+                if raw_left_timestamp_s is None or raw_right_timestamp_s is None:
+                    continue
+                left_timestamp_s = float(raw_left_timestamp_s)
+                right_timestamp_s = float(raw_right_timestamp_s)
             delta = abs(left_timestamp_s - right_timestamp_s)
+            if not isfinite(left_timestamp_s) or not isfinite(right_timestamp_s) or not isfinite(delta):
+                continue
             if delta > max_delta_s:
                 continue
             midpoint = (left_timestamp_s + right_timestamp_s) / 2.0

@@ -8,6 +8,7 @@ from wiris_stereo_distance.reprojection_profile import (
     OriginBBoxReprojectionProfile,
     RectifiedStereoCameraModel,
     ReprojectionResidualSample,
+    calibration_envelope_from_intrinsics,
     load_reprojection_profile,
     residual_sample_from_row,
 )
@@ -38,11 +39,19 @@ def intrinsics_result() -> StereoIntrinsicsResult:
         distortion_coefficients=[0.0],
         reprojection_error_px=0.2,
         image_count=20,
+        coverage_summary={"status": "ok", "warnings": []},
     )
     return StereoIntrinsicsResult(
         left=intrinsics,
         right=intrinsics,
         board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.03),
+        stereo_calibration={
+            "method": "cv2.stereoCalibrate",
+            "pair_count": 18,
+            "rms_error_px": 0.22,
+            "epipolar_mean_error_px": 0.08,
+            "epipolar_max_error_px": 0.2,
+        },
     )
 
 
@@ -75,6 +84,26 @@ def test_reprojection_residual_sample_uses_gt_pixel_label() -> None:
     assert sample.dv_left == -3.0
     assert sample.du_right == -4.0
     assert sample.dv_right == 5.0
+
+
+def test_rectified_camera_model_triangulates_centers_with_rays() -> None:
+    camera = RectifiedStereoCameraModel(
+        image_width_px=1280.0,
+        image_height_px=720.0,
+        focal_length_px=900.0,
+        baseline_m=0.3,
+    )
+
+    result = camera.triangulate_centers(
+        left_u=665.0,
+        left_v=360.0,
+        right_u=615.0,
+        right_v=360.0,
+    )
+
+    assert tuple(round(result[key], 6) for key in ("right_m", "down_m", "forward_m")) == (0.0, 0.0, 5.4)
+    assert round(result["range_m"], 6) == 5.4
+    assert result["disparity_px"] == 50.0
 
 
 def test_profile_lookup_uses_raw_disparity_without_range() -> None:
@@ -203,8 +232,44 @@ def test_profile_load_defaults_old_json_to_conservative_component_gain_policy(tm
     result = profile.apply(650.0, 360.0, 620.0, 360.0, raw_disparity_px=30.0)
 
     assert profile.correction_mode == "component_gains"
+    assert profile.calibration_envelope == {}
     assert result.corrected_left_u == 650.25
     assert result.corrected_right_u == 619.75
+
+
+def test_profile_serializes_calibration_envelope() -> None:
+    envelope = calibration_envelope_from_intrinsics(
+        intrinsics_result(),
+        intrinsics_path="intrinsics_zoom_08.json",
+        profile_source="test-profile",
+    )
+    profile = OriginBBoxReprojectionProfile(
+        profile_id="enveloped",
+        image_width_px=1280.0,
+        image_height_px=720.0,
+        u_edges=(0.0, 1280.0),
+        v_edges=(0.0, 720.0),
+        depth_edges=(0.5, 100.0),
+        cells={},
+        bin_axis="disparity",
+        calibration_envelope=envelope,
+    )
+
+    payload = profile.to_dict()
+    loaded = OriginBBoxReprojectionProfile.from_dict(payload)
+
+    assert payload["calibration_envelope"]["schema"] == "reprojection-profile-calibration-envelope-v1"
+    assert payload["calibration_envelope"]["intrinsics_path"] == "intrinsics_zoom_08.json"
+    assert payload["calibration_envelope"]["stereo_calibration"]["epipolar_mean_error_px"] == 0.08
+    assert payload["calibration_envelope"]["warnings"] == []
+    assert loaded.calibration_envelope == payload["calibration_envelope"]
+
+
+def test_calibration_envelope_warns_when_intrinsics_missing() -> None:
+    envelope = calibration_envelope_from_intrinsics(None)
+
+    assert envelope["intrinsics_available"] is False
+    assert envelope["warnings"] == ["no active intrinsics attached to reprojection profile"]
 
 
 def test_profile_loads_and_serializes_range_only_output_policy(tmp_path) -> None:
@@ -301,4 +366,5 @@ def test_measurement_controller_retriangulates_corrected_bbox_center() -> None:
     assert result.reprojection is not None
     assert result.reprojection.lookup.corrected_right_u == 640.0
     assert result.reprojection.triangulated is not None
+    assert result.reprojection.point_center_m is not None
     assert result.reprojection.triangulated.distance_m < result.triangulated.distance_m

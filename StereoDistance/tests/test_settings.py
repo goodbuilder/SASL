@@ -28,10 +28,18 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.preview_width == 1920
     assert settings.yolo_event_queue_size == 128
     assert settings.yolo_frame_queue_size == 2
+    assert settings.record_video_queue_size == 300
+    assert settings.ffmpeg_stimeout_us == 2_000_000
+    assert settings.ffmpeg_max_delay_us == 500_000
     assert settings.rtsp_decoder == "nvidia"
     assert settings.stream_backend == "gstreamer"
     assert settings.rtsp_transport == "udp"
-    assert settings.measurement_display_mode == "detection"
+    assert settings.tracking_process_accel_std_mps2 == 4.0
+    assert settings.tracking_max_normalized_innovation == 12.0
+    assert settings.baseline_bad_std_m == 0.10
+    assert settings.baseline_jump_m == 0.20
+    assert settings.live_attitude_max_age_s == 0.25
+    assert settings.live_attitude_max_pair_delta_s == 0.10
     assert settings.yolo_gate_class_enabled is False
     assert settings.yolo_gate_min_bbox_enabled is False
     assert settings.yolo_gate_matching_enabled is False
@@ -98,9 +106,30 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         rtsp_latency_ms=250,
         yolo_event_queue_size=256,
         yolo_frame_queue_size=4,
+        record_video_queue_size=512,
+        ffmpeg_stimeout_us=3_000_000,
+        ffmpeg_max_delay_us=750_000,
         rtsp_decoder="software",
         stream_backend="opencv",
         rtsp_transport="tcp",
+        tracking_process_accel_std_mps2=5.0,
+        tracking_initial_position_std_m=30.0,
+        tracking_initial_velocity_std_mps=15.0,
+        tracking_reset_after_s=4.0,
+        tracking_max_normalized_innovation=10.0,
+        tracking_min_lateral_std_m=0.2,
+        tracking_min_forward_std_m=1.5,
+        tracking_max_lateral_std_m=40.0,
+        tracking_max_forward_std_m=200.0,
+        baseline_bad_std_m=0.15,
+        baseline_jump_m=0.25,
+        baseline_max_timestamp_delta_ms=250.0,
+        baseline_good_rtk_ratio=0.90,
+        baseline_good_std_m=0.03,
+        baseline_good_h_acc_m=0.04,
+        baseline_good_v_acc_m=0.06,
+        baseline_good_timestamp_delta_ms=60.0,
+        baseline_warning_rtk_ratio=0.65,
         ros_domain_id=7,
         left_namespace="uav_left",
         right_namespace="uav_right",
@@ -122,7 +151,9 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         auto_load_intrinsics=False,
         manual_focal_override=True,
         use_triangulation=False,
-        measurement_display_mode="preview",
+        triangulation_extrinsics_source="checkerboard_stereo_calibration",
+        live_attitude_max_age_s=0.75,
+        live_attitude_max_pair_delta_s=0.20,
         use_rtk_baseline=False,
         require_rtk_fixed=False,
         gnss_base_serial_port="/dev/ttyUSB9",
@@ -171,7 +202,9 @@ def test_load_settings_ignores_unknown_legacy_keys(tmp_path: Path) -> None:
 
     settings = load_settings(path)
 
-    assert settings.measurement_display_mode == "preview"
+    assert settings.live_attitude_max_age_s == 0.25
+    assert settings.live_attitude_max_pair_delta_s == 0.10
+    assert not hasattr(settings, "measurement_display_mode")
     assert not hasattr(settings, "legacy_removed_mount_key")
     assert not hasattr(settings, "legacy_removed_runtime_key")
 

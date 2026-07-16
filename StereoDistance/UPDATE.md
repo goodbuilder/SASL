@@ -1,5 +1,159 @@
 # 업데이트 기록
 
+## v1.7.8 — 2026-07-16 — 거리 그래프 중복 제목 제거
+
+- 변경:
+  - 4분할 거리 그래프의 `Right`, `Down`, `Forward`, `Range` 상단 제목을 제거했다.
+  - 하단 범례가 각 그래프의 축과 최신값을 이미 표시하므로, 상단에는 Y축 상한만 남겨 중복 표시를 줄였다.
+- 확인:
+  - Y축 상하한 전용 여백과 하단 범례 영역을 유지하는 회귀 테스트를 실행한다.
+
+## v1.7.7 — 2026-07-16 — 거리 그래프 Y축 상한 가독성
+
+- 변경:
+  - 4분할 Right/Down/Forward/Range 그래프의 데이터 영역을 패널 제목, Y축 상·하한, 하단 범례 영역과 분리했다.
+  - Y축 상한값이 그래프 제목과 겹쳐 안 보이던 문제를 해결했다.
+- 확인:
+  - 각 패널의 실제 plot rect가 제목 아래, Y축 라벨 오른쪽, 범례 위쪽에 배치되는 회귀 테스트를 추가했다.
+
+## v1.7.6 — 2026-07-16 — UTC 동기화 STUS 전용화
+
+- 변경:
+  - `시간 > WIRIS RTC · PC UTC 동기화`가 선택한 카메라에 `STUS` 명령만 전송하게 했다.
+  - `STUS` 직후의 자동 `GDTI` 조회와 Camera-PC 비교 표를 제거했다.
+- 확인:
+  - 양쪽 대상에 동일한 공유 UTC `STUS` 두 건만 전송되고 `GDTI`가 전송되지 않는 회귀 테스트를 유지한다.
+- 주의:
+  - 동기화 결과는 `저장·분석 > 촬영 시각 검증`의 EXIF `right-left` 차이로 확인해야 한다.
+
+## v1.7.5 — 2026-07-16 — Pixhawk 자세 timestamp 판정값 UI
+
+- 변경:
+  - `측정 > 계산 설정`의 선택지가 하나뿐이던 `영상 표시` 그룹을 제거했다. 측정 영상은 여전히 계산에 선택된 좌/우 exact frame pair만 표시한다.
+  - 같은 위치에 `Pixhawk 자세 timestamp 판정` 그룹을 추가하고 `최대 자세 age`(기본 250 ms)와 `좌/우 timestamp 최대 Δt`(기본 100 ms)를 운용자가 조정하게 했다.
+  - 변경값은 즉시 readiness/BLOCKED 판정과 자세 샘플 검색에 적용되고 설정 JSON과 세션 metadata에 저장된다.
+  - `보정 > 체커보드`의 내부 파라미터 설정, 저장 경로, 캡처, 보정 실행 제어를 두 줄에서 한 줄로 재배치했다.
+  - `run.sh`가 선택한 Matplotlib 본체와 같은 설치 경로의 `mpl_toolkits`를 사용하게 해 사용자 Matplotlib과 Ubuntu 시스템 `Axes3D`가 섞이는 문제를 차단했다.
+  - Qt 이벤트 경계에 `SafeQtApplication.notify()`와 Python exception hook을 추가해 callback 예외를 stderr와 `/tmp/stereo_distance_qt_exceptions.log`에 traceback으로 남기고 Qt 외부로 전파되지 않게 했다.
+- 주의:
+  - 허용값을 늘리면 `pair=BLOCKED`는 줄지만, 오래되거나 비동기인 자세 쌍을 사용해 3D 오차가 커질 수 있다.
+- 좌표/시간 계약:
+  - PX4 local NED, body FRD, camera optical RDF 변환과 축 순서는 변경하지 않았다. 앱 monotonic 수신/매칭 timestamp에 적용하는 허용 한계만 설정화했다.
+
+## v1.7.4 — 2026-07-16 — 촬영 EXIF 검증 분석 탭 이동
+
+- 변경:
+  - `시간` 탭에는 PC UTC `STUS` 설정과 즉시 `GDTI` 비교만 남겼다.
+  - CPTR 촬영, ICPT 확인, FTP 다운로드, 파일/폴더 EXIF 비교와 결과 표를 `저장·분석 > 촬영 시각 검증` 하위 탭으로 이동했다.
+  - 기존 `전체 실행` 버튼은 목적이 분명한 `촬영·EXIF 검증`으로 이름을 바꿨다.
+- 이유:
+  - RTC 설정과 촬영 결과 분석을 분리해 시간 탭의 운용 목적을 명확히 하고, 저장 파일 기반 검증은 다른 분석 기능과 같은 위치에서 수행하게 하기 위해서다.
+- 확인:
+  - 시간 탭 최상단 RTC 그룹 유지, EXIF 버튼 제거, 저장·분석 하위 탭 배치와 기존 CPTR/FTP/EXIF 제어 유지에 대한 offscreen 회귀 테스트를 실행했다.
+- 좌표/시간 계약:
+  - 시간·EXIF 처리 로직과 UTC/right-left 계약은 변경하지 않았고 UI 소유 위치만 이동했다. 좌표 변환과 삼각측량 공식은 변경하지 않았다.
+
+## v1.7.3 — 2026-07-16 — YOLO 측정 frame pair 원자적 표시
+
+- 변경:
+  - YOLO 측정 중 일반 latest preview가 좌/우 측정 패널을 덮어쓰지 않게 하고, 선택된 detection의 양쪽 exact frame이 모두 있을 때만 pair를 동시에 표시한다.
+  - 일반 프레임의 decode/수신 통계와 측정-frame 저장은 계속 유지하되 화면 repaint만 억제한다. YOLO가 아닌 preview 경로는 기존 동작을 유지한다.
+  - 카메라 상태의 timestamp, frame ID, pair Δ는 latest preview가 아니라 원자적으로 선택된 pair metadata에서만 표시하고 `WAITING`/`MATCHED`/`USED`/`BLOCKED`를 구분한다.
+  - matcher와 대기/차단 진단은 동일한 recent detection snapshot을 사용하며, 양쪽 frame ID/metadata를 먼저 검증한 뒤 실제 렌더된 frame metadata로만 pair 시간 기준과 Δ를 결정한다.
+  - 검증된 bilateral frame snapshot을 패널의 단일 선택 권한으로 보존해 상태와 CSV frame timestamp 필드가 동일한 값을 사용한다. YOLO 샘플 기록 시 snapshot이 없거나 estimate와 frame ID가 다르면 detection/pane/latest-preview로 fallback하지 않고 frame 필드를 비우며 `effective_pair_timestamp_basis=blocked`로 남긴다.
+  - Camera RTC 필수 모드에서 current epoch과 1970 epoch처럼 좌/우 시계가 벗어나면 양쪽 화면과 계산을 차단하고 UTC 시각, Δ, limit를 상태에 표시한다.
+- 확인:
+  - YOLO 일반 preview 미표시/수신 유지, current-vs-1970 RTC 불일치 차단, 계산 미호출, 정상 RTC exact-frame pair 원자 복구에 대한 focused offscreen 회귀 테스트를 추가했다.
+- 좌표/시간 계약:
+  - 좌표 변환과 삼각측량 수식은 변경하지 않았다. 비교 시계는 좌/우 `rtcp_frame_ntp_unix_s` Unix epoch로 통일하고, 프레임 신선도는 앱 monotonic 수신 시간으로 분리한다.
+- 남은 위험:
+  - 실제 WIRIS RTCP Sender Report 두 개와 장시간 스트림에서 UI 복구 지연을 현장 검증하지 않았다.
+
+## v1.7.2 — 2026-07-16 — 시간 탭 PC UTC 동기화·비교
+
+- 변경:
+  - 고급 탭의 `PC UTC로 시간 설정`을 시간 탭 최상단 `WIRIS RTC · PC UTC 동기화` 그룹으로 옮기고 양쪽/왼쪽/오른쪽 대상을 명시적으로 선택하게 했다.
+  - `STUS` 전송 직후 각 카메라에 `GDTI`를 요청해 PC 요청 구간 중간 시각 대비 Camera-PC 차이와 왕복 시간을 표로 표시한다.
+  - 같은 그룹에서 기존 CPTR/FTP/EXIF 전체 검증을 바로 실행할 수 있게 `촬영·EXIF 검증` 버튼을 연결했다.
+- 결과 비교:
+  - GDTI는 초 단위 응답이므로 즉시 비교는 명령 경로의 거친 확인으로 사용하고, 최종 좌우 동기 결과는 촬영 이미지의 EXIF `right-left` 차이와 timestamp source/warning으로 판정한다.
+- 확인:
+  - 시간 탭 최상단 그룹 배치, 공유 STUS timestamp, 후속 GDTI 요청, UTC 파서와 결과 표에 대한 offscreen 회귀 테스트를 추가했다.
+- 좌표/시간 계약:
+  - 위치·자세 좌표 프레임과 축 변환은 변경하지 않았다. 시간 기준은 PC UTC로 전송한 Unix epoch, STUS 이후 UTC로 해석하는 WIRIS RTC, 촬영 이미지 EXIF 시각으로 구분한다.
+- 남은 위험:
+  - GDTI 자체가 초 단위이므로 subsecond 동기 정확도는 실제 촬영 파일에 subsecond EXIF가 있을 때만 평가할 수 있다.
+
+## v1.7.1 — 2026-07-16 — 줌 보정 프로파일 날짜별 보존
+
+- 변경:
+  - 보정 결과를 `intrinsics_zoom_##_YYYYMMDD_HHMMSS.json` 형식의 변경하지 않는 원본 파일로 저장한다.
+  - 같은 초에 다시 저장하면 `_02`, `_03` 순번을 붙여 기존 원본을 덮어쓰지 않는다.
+  - 기존 `intrinsics_zoom_##.json`과 `intrinsics.json`은 각각 해당 줌 최신값과 전체 최신값 alias로 계속 갱신해 기존 자동 로드 계약을 유지한다.
+  - 원본 메타데이터에 calibration ID, local/UTC 저장 시각, zoom level과 alias 파일명을 기록하고 저장 파일 비교 목록에는 원본 파일을 추가한다.
+- 이유:
+  - 다른 날짜 또는 같은 날 반복 수행한 동일 줌 보정 결과를 보존해 비교·복원할 수 있어야 하기 때문이다.
+- 확인:
+  - 동일한 저장 시각으로 두 번 저장했을 때 원본과 `_02` 파일이 모두 남고 latest alias가 유지되는 offscreen 회귀 테스트를 추가했다.
+- 좌표/소스 계약:
+  - 좌우 intrinsics와 paired-checkerboard right-in-left stereo R/T를 동일 JSON에 저장하는 기존 계약을 유지하며 좌표 변환 공식은 변경하지 않았다.
+- 남은 위험:
+  - 실제 장비에서 장기간 축적된 프로파일의 정리 정책은 자동화하지 않았으므로 운용자가 비교 목록과 파일을 관리해야 한다.
+
+## v1.7.0 — 2026-07-15 — 스테레오 외부 파라미터 소스 명시 선택
+
+- 변경:
+  - `측정 > 계산 설정`에서 `Pixhawk 자세 + GPS/RTK baseline`과 `Checkerboard stereo calibration`(paired-checkerboard 보정) 중 하나를 운용자가 명시적으로 선택하게 했다.
+  - 선택한 소스만 `READY`/`WAITING`/`INVALID`로 판정하고 근거와 상세 상태를 표시하며, 다른 소스로 자동 전환하지 않는다.
+  - Pixhawk 소스의 좌우 GNSS 수신 경과 시간을 현재 시각 기준으로 다시 계산해 기존 주기 UI 갱신만으로 침묵한 GNSS 상태가 `READY`에서 `INVALID`로 바뀌게 했다. 체커보드 소스는 이 판정과 독립적이며 fallback으로 자동 선택되지 않는다.
+  - 실제 소스 변경 시 라이브 측정 임시 상태만 초기화하고 기존 기록 행과 세션 증거는 보존한다.
+  - 각 측정 행의 `stereo_extrinsics_source`를 유지하고, 세션 메타데이터에 현재 소스와 허용된 소스의 최초 사용 순서를 보존하는 `stereo_extrinsics_sources_used`를 기록한다.
+- 이유:
+  - GNSS를 사용할 수 없는 현장에서도 paired-checkerboard 결과로 카메라 간 외부 파라미터를 사용할 수 있어야 하며, 어떤 기하 소스가 실제 측정에 적용됐는지 운용자와 저장 결과에서 명확히 추적해야 한다.
+- 확인:
+  - 선택 소스별 UI 상태, 자동 fallback 금지, 소스 전환 초기화, 메타데이터 기록에 대한 focused offscreen 테스트 7개 통과.
+  - non-stereo 테스트 suite `182 passed`.
+  - 누적 PyQt offscreen segmentation fault를 피하기 위해 `tests/test_stereo.py`를 새 Qt process 네 개로 나눠 실행했고 `60 + 60 + 60 + 56 = 236 passed`; 전체 자동화 검증은 `418 passed`.
+  - 실제 WIRIS/Pixhawk 장비와 GNSS 차단 환경의 현장 검증은 수행하지 않았다.
+- 좌표/소스 계약:
+  - Pixhawk 경로는 PX4 local NED와 body FRD를 left-camera OpenCV optical RDF로 변환한다.
+  - 체커보드 경로는 right-in-left `R/T`를 `Right/Down/Forward` metre로 사용하며 GNSS가 필요 없지만 world/NED 및 camera-body 정렬은 제공하지 않는다.
+- 남은 위험:
+  - 카메라 또는 고정 리그가 움직이면 paired-checkerboard 보정을 다시 수행해야 하며, 기존 값의 자동 무효화는 지원하지 않는다.
+  - 실제 장비의 GNSS 차단 환경과 리그 재장착 조건에서 현장 정확도를 별도로 검증해야 한다.
+
+## v1.6.20 — 2026-07-13 — 세션 저장 결과에 FFmpeg MP4 포함
+
+- 변경:
+  - 세션 저장 결과가 실제로 존재하고 비어 있지 않은 `video/raw_left.mp4`와 `video/raw_right.mp4`를 함께 보고한다.
+  - 저장 상태 라벨과 로그에 영상 개수, 경로, 파일 크기를 표시하고 MP4가 없으면 FFmpeg/첫 프레임 상태를 경고한다.
+  - FFmpeg H.264 stream-copy 녹화 의존성과 확인 명령을 사용 문서에 추가했다.
+- 이유:
+  - 세션 메타데이터에는 영상 경로가 있었지만 저장 결과에는 실제 MP4 산출물이 포함되지 않아 녹화 성공 여부를 확인하기 어려웠다.
+- 확인:
+  - `ffmpeg -version`으로 FFmpeg 설치 및 실행을 확인한다.
+  - 기록 세션 저장 경로와 영상 산출물 테스트를 추가한다.
+- 남은 위험:
+  - 실제 WIRIS RTSP 입력을 사용한 현장 MP4 재생 검증은 장비 연결 상태에서 별도로 수행해야 한다.
+
+## v1.6.19 — 2026-07-13 — SensorGPS / GlobalPosition source 분리 비교 저장
+
+- 변경:
+  - MAVLink `GPS_RAW_INT`/`GLOBAL_POSITION_INT`와 ROS2 `SensorGps`/`VehicleGlobalPosition`을 `sensor_gps`와 `global_position` source로 구분해 저장한다.
+  - SensorGPS는 기존처럼 거리 계산용 active baseline으로 유지하고, GlobalPosition은 별도 상태와 baseline으로 보존한다.
+  - Baseline 계산 화면에 두 source의 길이, N/E/D 차이, 방향각, 좌/우 위치 차이를 표시한다.
+  - 세션에 `alignment/gps_source_comparison.csv`를 추가하고, `external_parameters.csv`에는 source와 PX4 sample timestamp를 기록한다.
+  - `distance_history.csv`에도 active source와 두 baseline 비교 snapshot을 기록하고, `session_metadata.json`에 source mixing 금지 정책과 pairing 조건을 남긴다.
+- 이유:
+  - 기존에는 서로 다른 위치 source가 하나의 `latest_gps` 슬롯을 덮어써서 마지막 수신 순서에 따라 baseline이 바뀔 수 있었다.
+  - 두 source를 동일한 좌우 위치 쌍으로 비교해 Distance 역전 원인이 GPS source/좌우 매핑인지 검증할 수 있어야 한다.
+- 확인:
+  - `PYTHONPATH=.. QT_QPA_PLATFORM=offscreen python3 -m pytest tests/test_rtk_geometry.py tests/test_baseline_alignment.py tests/test_recording_session.py tests/test_pixhawk_attitude.py tests/test_stereo.py -q` → 246 passed
+  - `python3 -m py_compile` 대상 telemetry/baseline/GUI/recording 모듈 통과
+- 남은 위험:
+  - GlobalPosition은 EKF fused output이며 SensorGPS와 독립적인 ground truth가 아니다.
+  - 실제 현장에서는 PX4 topic publish 상태와 좌우 Pixhawk mapping을 함께 확인해야 한다.
+
 ## v1.6.18 — 2026-06-29 — Pixhawk MAVLink-first 운용 기준
 
 - 변경:

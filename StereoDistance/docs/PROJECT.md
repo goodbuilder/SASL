@@ -1,5 +1,85 @@
 # StereoDistance 프로젝트
 
+## 평가용 요약
+
+StereoDistance는 장거리 UAM/드론 표적의 거리와 3D 위치를 자동으로
+보장하는 단일 알고리즘이 아니다. 이 프로젝트의 핵심 기여는 좌/우
+WIRIS 영상, YOLO 검출, Pixhawk 자세, RTK/GNSS, MAG 상태, 시간 동기,
+카메라 보정값이 함께 필요한 현장 조건에서 측정값을 믿을 수 있는지
+판단하고, 사후 검증 가능한 기록을 남기는 운용 도구를 만드는 것이다.
+
+심사용 핵심 주장은 다음으로 제한한다.
+
+- 장거리 stereo 측정에 필요한 입력 조건을 단계별로 확인한다.
+- NED, PX4 body FRD, OpenCV optical RDF, stereo-center frame을 섞지
+  않도록 좌표계 계약을 문서와 코드에 고정한다.
+- 측정 row마다 영상, YOLO bbox, baseline, attitude, RTK/GNSS, timestamp,
+  source freshness를 세션 단위로 보존한다.
+- Pixhawk 연결은 MAVLink와 ROS2/uXRCE 동시 연결을 최우선 상태로 두되,
+  readiness, 제어, RTCM, 복구 판단은 MAVLink를 우선 authority로 둔다.
+- ULog, live telemetry, recorded-row fallback을 구분해 사후 정확도
+  분석을 수행한다.
+- 보정 profile 또는 reprojection profile을 적용하더라도 runtime truth를
+  입력으로 쓰지 않고, 적용 범위와 fallback reason을 기록한다.
+- OpenCV가 사용 가능한 runtime에서는 저장된 distortion coefficient를
+  `undistortPoints` 기반 ray 생성에 적용하고, OpenCV가 없을 때만 선형
+  pinhole ray로 fallback한다.
+
+다음 주장은 본 프로젝트의 방어 가능한 범위를 넘는다.
+
+- 모든 하드웨어 조건에서 UAM 위치 정확도를 보장한다.
+- Right/Down/Forward 모든 축을 항상 개선한다.
+- Simulation PASS가 hardware PASS를 의미한다.
+- QGC, Pixhawk 보정 절차, 또는 별도 metrology 장비를 대체한다.
+
+따라서 논문/보고서/발표에서의 안전한 표현은
+"StereoDistance는 WIRIS stereo와 Pixhawk/RTK telemetry를 결합해 장거리
+표적 측정의 신뢰 조건을 표시하고, 좌표계가 보존된 기록을 통해 사후
+정확도 검증을 가능하게 하는 현장 계측 workstation이다"로 고정한다.
+
+## 기여점과 차별성
+
+기존 stereo distance 데모와 비교했을 때 StereoDistance의 차별점은 거리
+계산식 자체가 아니라 현장 측정의 전제 조건을 함께 다루는 데 있다.
+
+| 비교 대상 | 한계 | StereoDistance의 차별점 |
+| --- | --- | --- |
+| 단순 stereo/disparity 거리 계산 | 영상 입력과 baseline만 맞는다고 가정한다. | 첫 프레임, sync, intrinsics, baseline, attitude, RTK/GNSS freshness를 함께 본다. |
+| YOLO bbox 기반 거리 추정 | bbox center와 target truth point가 같다고 쉽게 가정한다. | bbox, truth point, frame, timestamp, correction profile의 출처를 row 단위로 남긴다. |
+| ROS2/PX4 telemetry 모니터 | topic 수신 여부와 측정 유효성을 구분하지 못한다. | MAVLink 제어/RTCM 경로와 ROS2 telemetry 경로를 분리해 readiness를 판단한다. |
+| offline simulation correction | runtime에서 truth를 사용할 위험이 있다. | calibration-time truth와 measurement-time runtime input을 분리하고 fallback reason을 기록한다. |
+
+교수 관점의 novelty는 "새로운 삼각측량 공식"보다 "장거리 stereo 감시
+실험을 재현 가능하게 만드는 input provenance, coordinate contract,
+post-flight validation workflow"에 둔다.
+
+## 실험과 검증 구조
+
+최종 보고용 검증은 다음 단계로 분리한다.
+
+1. Hardware readiness smoke: WIRIS first frame, Pixhawk MAVLink heartbeat,
+   ROS2 sample, RTK/GNSS freshness, MAG 상태, session recording 가능 여부를
+   확인한다. MAVLink와 ROS2/uXRCE가 동시에 붙는 상태를 최우선 목표로
+   보되, readiness PASS는 MAVLink heartbeat와 제어 가능성을 기준으로
+   판정한다.
+2. Calibration and geometry evidence: zoom별 intrinsics, accepted/rejected
+   checkerboard image list, image별/전체 reprojection error, distortion
+   coefficient, checkerboard 화면 위치/scale coverage warning,
+   stereoCalibrate RMS와 pair별 epipolar residual, effective baseline,
+   mount assumption을 기록한다. Origin-BBOX reprojection profile은 생성 당시
+   intrinsics/stereo/coverage envelope를 함께 저장한다.
+3. Measurement recording: YOLO stereo pair, triangulation input, source age,
+   quality state를 세션 CSV/JSON에 저장한다.
+4. Post-flight validation: ULog 또는 명시된 CSV truth source와 YOLO row를
+   시간 매칭하고, matched count와 timestamp delta를 보고한다.
+5. Correction comparison: raw와 corrected 결과를 source/frame/metric별로
+   분리해 보고하고, Simulation evidence와 hardware evidence를 합치지 않는다.
+
+성능 표는 최소한 `estimated_range_m`, `truth_range_m`, `range_error_m`,
+`position_error_m`, `error_frd_forward/right/down_m`, truth source, time
+basis, matched sample count를 포함해야 한다. mixed-frame 축 비교는 최종
+정확도 지표가 아니라 진단값으로만 보고한다.
+
 ## 목적
 
 StereoDistance는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데이터를 결합해 현장에서 객체 거리와 3D 위치를 측정하기 위한 PyQt5 데스크톱 운용 도구다.
@@ -61,7 +141,7 @@ StereoDistance는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데
 
 - QGC를 대체하지 않는다. Pixhawk 보정과 최종 파라미터 저장은 QGC 또는 PX4 shell 흐름을 전제로 한다.
 - WIRIS 카메라 연결, RTSP 프레임 수신 확인, WIRIS SDK 명령, still image EXIF 시간 비교를 앱 안에서 다룬다.
-- Pixhawk는 MAVLink와 ROS2/uXRCE 경로를 모두 지원한다. 현장에서는 Rover MAVLink heartbeat, ROS2 publisher/sample, MAG device_id 수신 여부를 분리해서 확인한다.
+- Pixhawk는 MAVLink와 ROS2/uXRCE 경로를 모두 지원한다. 현장에서는 두 경로가 동시에 연결되는 상태를 최우선 목표로 두고, Rover MAVLink heartbeat, ROS2 publisher/sample, MAG device_id 수신 여부를 분리해서 확인한다.
 - Rover RTK 운용의 우선 경로는 MAVLink다. Base RTCM은 Rover Pixhawk MAVLink `GPS_RTCM_DATA`로 주입하며, ROS2가 살아 있어도 MAVLink heartbeat가 없으면 RTCM 주입과 PX4 제어는 준비되지 않은 상태로 본다.
 - ROS2 연결이 막히면 MAVLink를 복구 경로로 사용해 Pixhawk 쪽 MAVLink stream과 `uxrce_dds_client` 설정을 전송한다. 반대로 ROS2는 MAVLink가 제공하지 못하는 namespace 기반 uORB telemetry와 custom field 확인을 보강한다.
 - UAM/드론 ground truth 텔레메트리는 `연결 > UAM`에서 별도로 연결한다. 정상 경로는 ROS2 `vehicle_local_position`이고, ROS2가 막히면 MAVLink `LOCAL_POSITION_NED` 또는 GPS/global-derived 위치 메시지를 실시간 fallback 버퍼로 유지한다.
@@ -70,7 +150,13 @@ StereoDistance는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데
 
 ## Pixhawk 연결 의도
 
-Pixhawk 연결의 우선 의도는 Rover MAVLink 제어 채널을 먼저 확보하는 것이다. MAVLink heartbeat가 있어야 Base RTCM을 Rover Pixhawk에 `GPS_RTCM_DATA`로 주입하고, PX4 parameter read/write, shell/진단, 재부팅, Ethernet MAVLink bootstrap 같은 복구 작업을 앱 안에서 수행할 수 있다. 따라서 Rover RTK 운용에서는 ROS2 topic sample이 들어오더라도 MAVLink heartbeat가 없으면 준비 완료로 보지 않는다.
+Pixhawk 연결의 최우선 운용 상태는 MAVLink와 ROS2/uXRCE가 동시에 살아
+있는 것이다. 다만 우선권은 경로별로 다르다. Rover readiness, 제어,
+RTCM 주입, 복구 authority는 MAVLink가 가진다. MAVLink heartbeat가 있어야
+Base RTCM을 Rover Pixhawk에 `GPS_RTCM_DATA`로 주입하고, PX4 parameter
+read/write, shell/진단, 재부팅, Ethernet MAVLink bootstrap 같은 복구
+작업을 앱 안에서 수행할 수 있다. 따라서 Rover RTK 운용에서는 ROS2 topic
+sample이 들어오더라도 MAVLink heartbeat가 없으면 준비 완료로 보지 않는다.
 
 ROS2/uXRCE는 PX4 uORB 데이터를 namespace와 topic 기준으로 구조화해서 받는 telemetry 경로다. 자세, GPS, MAG, custom field 감시에는 중요하지만 RTCM 주입이나 PX4 제어 채널을 대체하지 않는다.
 
@@ -80,7 +166,7 @@ ROS2/uXRCE는 PX4 uORB 데이터를 namespace와 topic 기준으로 구조화해
 - 복구/제어 경로: Pixhawk 쪽 MAVLink stream 설정, MAVLink `PARAM_SET`/readback 기반 `UXRCE_DDS_*` 설정, PX4 shell, 재부팅, USB를 통한 Ethernet MAVLink bootstrap을 수행한다.
 - telemetry 보조 경로: ROS2가 끝내 붙지 않아도 MAVLink `ATTITUDE`, GPS, GNSS relative, `SCALED_IMU*`로 가능한 자세/GPS/MAG raw telemetry를 계속 받아 정렬과 측정 입력을 최대한 유지한다.
 
-MAVLink-first는 ROS2를 제거한다는 뜻이 아니다. ROS2 전용 `vehicle_magnetometer.device_id`, namespace 기반 topic 식별, arbitrary `/fmu/out/...` custom field, 구조화된 parameter service는 MAVLink만으로 보장하지 않는다. 앱은 제어/RTCM은 MAVLink 기준으로, 고속 uORB telemetry와 source identity는 ROS2 기준으로 분리해서 표시해야 한다.
+MAVLink-first는 ROS2를 제거한다는 뜻이 아니다. ROS2 전용 `vehicle_magnetometer.device_id`, namespace 기반 topic 식별, arbitrary `/fmu/out/...` custom field, 구조화된 parameter service는 MAVLink만으로 보장하지 않는다. 앱은 동시 연결을 우선 시도하고, 제어/RTCM/readiness는 MAVLink 기준으로, 고속 uORB telemetry와 source identity는 ROS2 기준으로 분리해서 표시해야 한다. ROS2가 막히면 MAVLink telemetry fallback을 유지하되, MAVLink 제어 채널이 막힌 상태를 ROS2만으로 정상 readiness로 승격하지 않는다.
 
 ## UAM Ground Truth 분석 방법
 
@@ -167,6 +253,17 @@ Origin-BBOX Profile의 적용 범위는 보수적으로 제한한다. 검증으�
 ## 측정 리그 장착 단순화 결정
 
 측정 리그는 알루미늄 가공 케이스로 WIRIS와 측정용 Pixhawk/GNSS의 축 방향을 맞춘다. 따라서 본 프로젝트의 앱 모델에서는 보어사이트와 레버암을 무시하고, 별도 입력/계산/보정을 제공하지 않는다. 모델 이름은 `nominal-shared-rig-v1`로 둔다.
+
+이 결정은 구현 범위를 줄이기 위한 가정이지, 모든 설치에서 성립하는
+물리적 보장이 아니다. 심사와 실험 보고에서는 아래 표를 함께 제시한다.
+
+| 항목 | 방어 가능한 전제 | 실패 또는 제외 조건 | 보고 원칙 |
+| --- | --- | --- | --- |
+| optical axis | 좌/우 WIRIS optical axis가 케이스 기준으로 같은 방향을 본다. | 카메라 축 정렬 오차가 커서 common FOV와 triangulation bias가 변한다. | 남는 축 정렬 오차는 최종 오차에 포함한다. |
+| baseline | 입력 baseline 또는 RTK/GNSS baseline이 WIRIS optical-center 간 effective stereo scale로 쓸 수 있다. | GNSS antenna baseline과 optical-center baseline의 lever-arm 차이가 무시 불가하다. | baseline source와 측정 방법을 세션에 남긴다. |
+| body origin | Pixhawk/GNSS body 원점이 평가할 target truth point로 정의된다. | truth point가 YOLO bbox가 보는 시각적 중심과 다르거나 움직인다. | truth point 정의를 ULog/CSV 분석 결과에 명시한다. |
+| zoom/intrinsics | WIRIS visible 8x 조건에서 별도 intrinsics를 적용한다. | zoom 변경, optical center 이동, intrinsics 누락. | `intrinsics_zoom_08.json` 없이는 최종 정확도 근거로 쓰지 않는다. |
+| mount stability | 카메라, Pixhawk, GNSS가 같은 rigid rig로 유지된다. | 짐벌, 가변 mount, 좌/우 rig 비대칭, 열화상/가시광 optical center 혼용. | `nominal-shared-rig-v1` 결과로 정확도를 보장하지 않는다. |
 
 이 프로젝트의 기준 좌표계는 PX4 관례에 맞춰 world는 NED, 기체 body는 FRD로 둔다. 즉 body +X는 전방, +Y는 우측, +Z는 아래 방향이다. 카메라는 OpenCV/ROS optical frame으로 해석한다. 즉 camera +X는 영상 우측, +Y는 영상 아래, +Z는 렌즈가 바라보는 전방 깊이 방향이다.
 

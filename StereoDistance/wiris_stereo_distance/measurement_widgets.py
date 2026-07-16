@@ -191,6 +191,15 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
             "distance_m": QtCore.QRect(right, bottom, content.right() - right + 1, content.bottom() - bottom + 1),
         }
 
+    def _series_plot_rect(self, field: str) -> QtCore.QRect | None:
+        panel_rect = self._plot_rects().get(field)
+        if panel_rect is None:
+            return None
+        # Reserve a left gutter for Y bounds and a footer for the latest-value
+        # legend. The legend already names each series, so a duplicate panel
+        # title is unnecessary and the data can use the upper space.
+        return panel_rect.adjusted(58, 6, -6, -22)
+
     def _point_value(self, point: DistanceHistoryPoint, field: str) -> float | None:
         value = getattr(point, field, None)
         if value is None:
@@ -209,7 +218,7 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
     def _plot_metrics(self, field: str = "distance_m") -> tuple[QtCore.QRect, float, float, float, float] | None:
         if not self.points:
             return None
-        rect = self._plot_rects().get(field)
+        rect = self._series_plot_rect(field)
         if rect is None:
             return None
         if rect.width() <= 0 or rect.height() <= 0:
@@ -380,8 +389,6 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         painter.setBrush(QtCore.Qt.NoBrush)
         painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
         painter.drawRect(rect)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.left() + 8, rect.top() + 16, title)
         metrics = self._plot_metrics(field)
         if metrics is None:
             painter.setPen(QtGui.QColor(CHART_MUTED))

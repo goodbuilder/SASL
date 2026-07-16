@@ -60,6 +60,12 @@ def test_measurement_controller_pixhawk_rtk_triangulates_valid_pair() -> None:
     assert result.triangulated is not None
     assert result.estimate is not None
     assert result.estimate.distance_m == result.triangulated.distance_m
+    assert result.point_center_m is not None
+    assert tuple(round(value, 6) for value in result.point_center_m) == (
+        round(result.triangulated.point_left_m[0] - 0.15, 6),
+        round(result.triangulated.point_left_m[1], 6),
+        round(result.triangulated.point_left_m[2], 6),
+    )
     assert result.warnings == ()
 
 
@@ -79,8 +85,47 @@ def test_measurement_controller_reports_pixhawk_geometry_waiting() -> None:
 
     assert result.match is not None
     assert result.triangulated is None
+    assert result.point_center_m is None
     assert result.estimate is None
     assert "triangulation waiting for Pixhawk R" in result.warnings
+
+
+def test_measurement_controller_checkerboard_stereo_triangulates_without_pixhawk() -> None:
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=detection("left", x1=690.0, x2=710.0),
+            right=detection("right", x1=640.0, x2=660.0),
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=intrinsics_result(),
+            triangulation_source="checkerboard_stereo_calibration",
+            rotation_right_to_left=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation_right_in_left_m=(0.3, 0.0, 0.0),
+            sync_quality="GOOD",
+        )
+    )
+
+    assert result.match is not None
+    assert result.triangulated is not None
+    assert result.estimate is not None
+    assert result.point_center_m is not None
+    assert result.warnings == ()
+
+
+def test_measurement_controller_reports_checkerboard_extrinsics_waiting() -> None:
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=detection("left", x1=690.0, x2=710.0),
+            right=detection("right", x1=640.0, x2=660.0),
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=intrinsics_result(),
+            triangulation_source="checkerboard_stereo_calibration",
+            sync_quality="DEGRADED",
+        )
+    )
+
+    assert result.match is not None
+    assert result.triangulated is None
+    assert "triangulation waiting for checkerboard stereo extrinsics" in result.warnings
 
 
 def test_measurement_controller_reports_intrinsics_waiting() -> None:
@@ -100,6 +145,7 @@ def test_measurement_controller_reports_intrinsics_waiting() -> None:
 
     assert result.match is not None
     assert result.triangulated is None
+    assert result.point_center_m is None
     assert result.estimate is None
     assert "triangulation waiting for intrinsics" in result.warnings
 
@@ -121,4 +167,5 @@ def test_measurement_controller_keeps_match_validation_separate_from_triangulati
 
     assert result.match is None
     assert result.triangulated is not None
+    assert result.point_center_m is None
     assert result.estimate is None

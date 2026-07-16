@@ -7,8 +7,13 @@ import statistics
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
+from wiris_stereo_distance.calibration import CameraIntrinsics, StereoIntrinsicsResult
+from wiris_stereo_distance.triangulation import (
+    stereo_center_point_from_left_camera,
+    triangulate_pixels_with_relative_pose,
+)
 from wiris_stereo_distance.uam_telemetry import UamAlignmentProfile
 
 
@@ -61,6 +66,20 @@ class RectifiedStereoCameraModel:
     def right_cy(self) -> float:
         return float(self.right_cy_px if self.right_cy_px is not None else self.image_height_px * 0.5)
 
+    def _intrinsics(self, *, cx: float, cy: float) -> CameraIntrinsics:
+        return CameraIntrinsics(
+            width=max(1, int(round(self.image_width_px))),
+            height=max(1, int(round(self.image_height_px))),
+            camera_matrix=[
+                [self.fx, 0.0, float(cx)],
+                [0.0, self.fy, float(cy)],
+                [0.0, 0.0, 1.0],
+            ],
+            distortion_coefficients=[],
+            reprojection_error_px=0.0,
+            image_count=0,
+        )
+
     def project_truth_center(
         self,
         *,
@@ -92,13 +111,25 @@ class RectifiedStereoCameraModel:
         disparity = abs(float(left_u) - float(right_u))
         if not _finite(disparity) or disparity < 0.5:
             raise ValueError("disparity_px is invalid")
-        forward = self.fx * float(self.baseline_m) / disparity
-        target_u = (float(left_u) + float(right_u)) * 0.5
-        target_v = (float(left_v) + float(right_v)) * 0.5
-        principal_u = (self.left_cx + self.right_cx) * 0.5
-        principal_v = (self.left_cy + self.right_cy) * 0.5
-        right = (target_u - principal_u) * forward / self.fx
-        down = (target_v - principal_v) * forward / self.fy
+        translation = (float(self.baseline_m), 0.0, 0.0)
+        triangulated = triangulate_pixels_with_relative_pose(
+            left_pixel=(float(left_u), float(left_v)),
+            right_pixel=(float(right_u), float(right_v)),
+            left_intrinsics=self._intrinsics(cx=self.left_cx, cy=self.left_cy),
+            right_intrinsics=self._intrinsics(cx=self.right_cx, cy=self.right_cy),
+            rotation_right_to_left=[
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            translation_right_in_left_m=translation,
+        )
+        if triangulated is None:
+            raise ValueError("ray triangulation failed")
+        right, down, forward = stereo_center_point_from_left_camera(
+            triangulated.point_left_m,
+            translation,
+        )
         return {
             "right_m": right,
             "down_m": down,
@@ -306,6 +337,7 @@ class OriginBBoxReprojectionProfile:
         screen_v_gain: float = 1.0,
         output_policy: str = DEFAULT_REPROJECTION_OUTPUT_POLICY,
         created_unix_s: float | None = None,
+        calibration_envelope: Mapping[str, object] | None = None,
     ) -> None:
         if bin_axis not in ("disparity", "range"):
             raise ValueError("bin_axis must be 'disparity' or 'range'")
@@ -331,6 +363,7 @@ class OriginBBoxReprojectionProfile:
         self.screen_v_gain = float(screen_v_gain)
         self.output_policy = str(output_policy)
         self.created_unix_s = time.time() if created_unix_s is None else float(created_unix_s)
+        self.calibration_envelope = dict(calibration_envelope or {})
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "OriginBBoxReprojectionProfile":
@@ -364,6 +397,7 @@ class OriginBBoxReprojectionProfile:
             screen_v_gain=float(data.get("screen_v_gain", DEFAULT_REPROJECTION_SCREEN_V_GAIN)),
             output_policy=str(data.get("output_policy", DEFAULT_REPROJECTION_OUTPUT_POLICY)),
             created_unix_s=float(data.get("created_unix_s", time.time())),
+            calibration_envelope=data.get("calibration_envelope") if isinstance(data.get("calibration_envelope"), Mapping) else {},
         )
 
     @classmethod
@@ -386,6 +420,7 @@ class OriginBBoxReprojectionProfile:
         screen_u_gain: float = DEFAULT_REPROJECTION_SCREEN_U_GAIN,
         screen_v_gain: float = DEFAULT_REPROJECTION_SCREEN_V_GAIN,
         output_policy: str = DEFAULT_REPROJECTION_OUTPUT_POLICY,
+        calibration_envelope: Mapping[str, object] | None = None,
     ) -> "OriginBBoxReprojectionProfile":
         if u_bins <= 0 or v_bins <= 0 or depth_bins <= 0:
             raise ValueError("bin counts must be positive")
@@ -458,6 +493,7 @@ class OriginBBoxReprojectionProfile:
             screen_u_gain=screen_u_gain,
             screen_v_gain=screen_v_gain,
             output_policy=output_policy,
+            calibration_envelope=calibration_envelope,
         )
 
     def _effective_residuals(
@@ -647,6 +683,7 @@ class OriginBBoxReprojectionProfile:
             "screen_v_gain": self.screen_v_gain,
             "output_policy": self.output_policy,
             "created_unix_s": self.created_unix_s,
+            "calibration_envelope": self.calibration_envelope,
             "grid": {
                 "u_edges": self.u_edges,
                 "v_edges": self.v_edges,
@@ -656,6 +693,59 @@ class OriginBBoxReprojectionProfile:
             },
             "cells": self.cells,
         }
+
+
+def calibration_envelope_from_intrinsics(
+    intrinsics: StereoIntrinsicsResult | None,
+    *,
+    intrinsics_path: str | Path | None = None,
+    profile_source: str = "runtime-active-intrinsics",
+) -> dict[str, Any]:
+    if intrinsics is None:
+        return {
+            "schema": "reprojection-profile-calibration-envelope-v1",
+            "profile_source": profile_source,
+            "intrinsics_available": False,
+            "warnings": ["no active intrinsics attached to reprojection profile"],
+        }
+    left_coverage = dict(intrinsics.left.coverage_summary or {})
+    right_coverage = dict(intrinsics.right.coverage_summary or {})
+    stereo = dict(intrinsics.stereo_calibration or {})
+    warnings: list[str] = []
+    for side, coverage in (("left", left_coverage), ("right", right_coverage)):
+        for warning in coverage.get("warnings", []) or []:
+            warnings.append(f"{side}: {warning}")
+    if not stereo:
+        warnings.append("stereo_calibration missing")
+    elif stereo.get("epipolar_mean_error_px") is None:
+        warnings.append("stereo_calibration epipolar residual missing")
+    return {
+        "schema": "reprojection-profile-calibration-envelope-v1",
+        "profile_source": profile_source,
+        "intrinsics_available": True,
+        "intrinsics_path": "" if intrinsics_path is None else str(intrinsics_path),
+        "left": {
+            "image_size": {"width": int(intrinsics.left.width), "height": int(intrinsics.left.height)},
+            "image_count": int(intrinsics.left.image_count),
+            "reprojection_error_px": float(intrinsics.left.reprojection_error_px),
+            "coverage_summary": left_coverage,
+        },
+        "right": {
+            "image_size": {"width": int(intrinsics.right.width), "height": int(intrinsics.right.height)},
+            "image_count": int(intrinsics.right.image_count),
+            "reprojection_error_px": float(intrinsics.right.reprojection_error_px),
+            "coverage_summary": right_coverage,
+        },
+        "stereo_calibration": {
+            "available": bool(stereo),
+            "method": stereo.get("method"),
+            "pair_count": stereo.get("pair_count"),
+            "rms_error_px": stereo.get("rms_error_px"),
+            "epipolar_mean_error_px": stereo.get("epipolar_mean_error_px"),
+            "epipolar_max_error_px": stereo.get("epipolar_max_error_px"),
+        },
+        "warnings": warnings,
+    }
 
 
 def load_reprojection_profile(path: Path) -> OriginBBoxReprojectionProfile:

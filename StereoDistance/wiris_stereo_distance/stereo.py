@@ -96,6 +96,51 @@ def detection_timestamp_for_basis(observation: DetectionObservation, timestamp_b
     return float(observation.timestamp_s)
 
 
+def detection_timestamp_pair_for_basis(
+    left: DetectionObservation,
+    right: DetectionObservation,
+    timestamp_basis: str = "detection",
+) -> tuple[float, float] | None:
+    """Return a pair of timestamps from one shared clock domain.
+
+    A stereo pair must never compare an RTCP/RTC epoch timestamp from one
+    camera with an application monotonic timestamp from the other camera.
+    ``camera_rtcp`` therefore falls back only when both cameras lack RTC.
+    """
+    if timestamp_basis not in {"camera_rtcp", "camera_rtc_required"}:
+        return _application_timestamp_pair(left, right)
+
+    left_rtc = _camera_rtc_timestamp(left)
+    right_rtc = _camera_rtc_timestamp(right)
+    if left_rtc is not None and right_rtc is not None:
+        return left_rtc, right_rtc
+    if timestamp_basis == "camera_rtc_required" or left_rtc is not None or right_rtc is not None:
+        return None
+    return _application_timestamp_pair(left, right)
+
+
+def _application_timestamp_pair(
+    left: DetectionObservation,
+    right: DetectionObservation,
+) -> tuple[float, float] | None:
+    left_timestamp_s = float(left.timestamp_s)
+    right_timestamp_s = float(right.timestamp_s)
+    if not isfinite(left_timestamp_s) or not isfinite(right_timestamp_s):
+        return None
+    return left_timestamp_s, right_timestamp_s
+
+
+def _camera_rtc_timestamp(observation: DetectionObservation) -> float | None:
+    value = observation.timestamp_metadata.get("rtcp_frame_ntp_unix_s")
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isfinite(parsed) else None
+
+
 def match_stereo_observations(
     left: DetectionObservation | None,
     right: DetectionObservation | None,
@@ -119,10 +164,10 @@ def match_stereo_observations(
     disparity = abs(left_center_x - right_center_x)
     if not isfinite(disparity) or disparity <= 1e-6:
         return None
-    left_timestamp_s = detection_timestamp_for_basis(left, calibration.timestamp_basis)
-    right_timestamp_s = detection_timestamp_for_basis(right, calibration.timestamp_basis)
-    if left_timestamp_s is None or right_timestamp_s is None:
+    timestamp_pair = detection_timestamp_pair_for_basis(left, right, calibration.timestamp_basis)
+    if timestamp_pair is None:
         return None
+    left_timestamp_s, right_timestamp_s = timestamp_pair
     time_delta = abs(left_timestamp_s - right_timestamp_s)
     if time_delta > calibration.max_time_delta_s:
         return None
@@ -157,15 +202,6 @@ def match_stereo_observations(
     )
 
 
-def estimate_disparity_distance(match: StereoMatch, calibration: StereoCalibration) -> StereoEstimate | None:
-    if calibration.focal_length_px <= 0.0 or calibration.baseline_m <= 0.0:
-        return None
-    distance = calibration.focal_length_px * calibration.baseline_m / match.disparity_px
-    if not isfinite(distance) or distance <= 0.0:
-        return None
-    return stereo_estimate_from_match(match, distance_m=distance)
-
-
 def stereo_estimate_from_match(match: StereoMatch, *, distance_m: float) -> StereoEstimate | None:
     if not isfinite(distance_m) or distance_m <= 0.0:
         return None
@@ -188,39 +224,3 @@ def stereo_estimate_from_match(match: StereoMatch, *, distance_m: float) -> Ster
         sync_quality=match.sync_quality,
         warnings=match.warnings,
     )
-
-
-def estimate_distance(
-    left: DetectionObservation | None,
-    right: DetectionObservation | None,
-    calibration: StereoCalibration,
-    *,
-    left_extrinsic: Any | None = None,
-    right_extrinsic: Any | None = None,
-    left_attitude_age_s: float | None = None,
-    right_attitude_age_s: float | None = None,
-    attitude_pair_delta_s: float | None = None,
-    relative_roll_deg: float | None = None,
-    relative_pitch_deg: float | None = None,
-    relative_yaw_deg: float | None = None,
-    sync_quality: str = "unknown",
-    warnings: tuple[str, ...] = (),
-) -> StereoEstimate | None:
-    match = match_stereo_observations(
-        left,
-        right,
-        calibration,
-        left_extrinsic=left_extrinsic,
-        right_extrinsic=right_extrinsic,
-        left_attitude_age_s=left_attitude_age_s,
-        right_attitude_age_s=right_attitude_age_s,
-        attitude_pair_delta_s=attitude_pair_delta_s,
-        relative_roll_deg=relative_roll_deg,
-        relative_pitch_deg=relative_pitch_deg,
-        relative_yaw_deg=relative_yaw_deg,
-        sync_quality=sync_quality,
-        warnings=warnings,
-    )
-    if match is None:
-        return None
-    return estimate_disparity_distance(match, calibration)

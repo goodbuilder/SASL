@@ -19,6 +19,7 @@ from wiris_stereo_distance.yolo_stream import (
     NVIDIA_H264_DECODER,
     SOFTWARE_H264_DECODER,
     DEFAULT_RTSP_LATENCY_MS,
+    DetectionBox,
     GstRtpTimingTracker,
     STREAM_BACKEND_OPENCV_AUTO,
     STREAM_BACKEND_PYAV,
@@ -31,6 +32,7 @@ from wiris_stereo_distance.yolo_stream import (
     _release_record_video_writer,
     _run_opencv_stream,
     _write_record_video_frame,
+    filter_measurement_detections,
     build_ffmpeg_recording_command,
     build_gst_pipeline_text,
     build_gst_recording_pipeline_text,
@@ -139,6 +141,35 @@ def test_process_output_queue_drops_preview_frames_without_dropping_detection_ev
     event = event_queue.get_nowait()
     assert event[0] == "detection"
     assert event[4]["confidence"] == 0.9
+
+
+def test_measurement_detection_gates_filter_class_and_bbox_size() -> None:
+    detections = [
+        DetectionBox(0.0, 0.0, 20.0, 20.0, 0.95, 0, "person"),
+        DetectionBox(0.0, 0.0, 80.0, 60.0, 0.80, 1, "vehicle"),
+    ]
+
+    filtered = filter_measurement_detections(
+        detections,
+        {
+            "gate_class_enabled": True,
+            "gate_class_text": "vehicle",
+            "gate_min_bbox_enabled": True,
+            "gate_min_width_px": 40,
+            "gate_min_height_px": 40,
+            "gate_min_area_px": 2_000,
+        },
+    )
+
+    assert filtered == [detections[1]]
+
+
+def test_gstreamer_url_is_quoted_as_one_property_value() -> None:
+    malicious = 'rtsp://camera/stream" ! fakesink name=unexpected'
+
+    pipeline = build_gst_pipeline_text(malicious)
+
+    assert 'location="rtsp://camera/stream\\" ! fakesink name=unexpected"' in pipeline
 
 
 def _predict_config() -> dict:
@@ -380,6 +411,9 @@ def test_yolo_worker_passes_rtsp_latency_to_runtime_config() -> None:
         enable_detection=False,
         record_video_path="/tmp/stereo-left.mp4",
         record_video_fps=24.0,
+        record_video_queue_size=9,
+        ffmpeg_stimeout_us=3_000_000,
+        ffmpeg_max_delay_us=700_000,
     )
 
     assert worker.config["rtsp_latency_ms"] == 25
@@ -390,6 +424,9 @@ def test_yolo_worker_passes_rtsp_latency_to_runtime_config() -> None:
     assert worker.config["worker_cpu_threads"] == DEFAULT_CPU_WORKER_THREADS
     assert worker.config["record_video_path"] == "/tmp/stereo-left.mp4"
     assert worker.config["record_video_fps"] == 24.0
+    assert worker.config["record_video_queue_size"] == 9
+    assert worker.config["ffmpeg_stimeout_us"] == 3_000_000
+    assert worker.config["ffmpeg_max_delay_us"] == 700_000
     pipeline = build_gst_pipeline_text(
         worker.config["url"],
         latency_ms=worker.config["rtsp_latency_ms"],
@@ -664,13 +701,16 @@ def test_yolo_processing_emits_measurement_frame_before_detection_when_enabled()
         now_s=10.0,
         enable_detection=True,
         draw_preview_overlay=False,
+        frame_id=42,
     )
 
     assert annotated is frame
     assert best_detection is not None
     assert inferred is True
-    assert output_queue.messages[0][:4] == ("measurement_frame", 10.0, 5, 4)
+    assert output_queue.messages[0][:5] == ("measurement_frame", 10.0, 42, 5, 4)
+    assert output_queue.messages[0][6]["frame_id"] == 42
     assert output_queue.messages[1][0] == "detection"
+    assert output_queue.messages[1][-1]["frame_id"] == 42
 
 
 def test_yolo_processing_draws_only_best_box_for_preview_overlay() -> None:

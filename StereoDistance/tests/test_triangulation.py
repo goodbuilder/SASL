@@ -1,5 +1,7 @@
 from math import cos, radians, sin
 
+import pytest
+
 from wiris_stereo_distance.calibration import CameraIntrinsics
 from wiris_stereo_distance.triangulation import (
     BODY_FRAME,
@@ -42,6 +44,50 @@ def test_normalized_ray_from_pixel_uses_camera_matrix() -> None:
     ray = normalized_ray_from_pixel(640.0, 360.0, intrinsics())
 
     assert ray == (0.0, 0.0, 1.0)
+
+
+def test_normalized_ray_from_pixel_keeps_linear_path_for_zero_distortion() -> None:
+    camera = CameraIntrinsics(
+        width=1280,
+        height=720,
+        camera_matrix=[[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.0, 0.0, 0.0, 0.0, 0.0],
+        reprojection_error_px=0.1,
+        image_count=20,
+    )
+
+    assert normalized_ray_from_pixel(690.0, 360.0, camera) == normalized_ray_from_pixel(690.0, 360.0, intrinsics())
+
+
+def test_normalized_ray_from_pixel_uses_opencv_undistort_when_distortion_exists() -> None:
+    camera = CameraIntrinsics(
+        width=1280,
+        height=720,
+        camera_matrix=[[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.2, -0.05, 0.001, 0.002, 0.0],
+        reprojection_error_px=0.1,
+        image_count=20,
+    )
+
+    distorted = normalized_ray_from_pixel(1000.0, 520.0, camera)
+    linear = normalized_ray_from_pixel(1000.0, 520.0, intrinsics())
+
+    assert distorted != linear
+    assert abs(sum(component * component for component in distorted) ** 0.5 - 1.0) < 1e-9
+
+
+def test_normalized_ray_from_pixel_blocks_distortion_failure() -> None:
+    camera = CameraIntrinsics(
+        width=1280,
+        height=720,
+        camera_matrix=[[900.0]],
+        distortion_coefficients=[0.2],
+        reprojection_error_px=0.1,
+        image_count=20,
+    )
+
+    with pytest.raises(ValueError, match="distortion undistortion failed"):
+        normalized_ray_from_pixel(690.0, 360.0, camera)
 
 
 def test_triangulate_rays_returns_expected_forward_distance_for_parallel_stereo() -> None:

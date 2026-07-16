@@ -1,23 +1,18 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from wiris_stereo_distance.pixhawk_attitude import DualPixhawkAttitudeSubscriber, _send_mavlink_shell_command
-from wiris_stereo_distance.px4_mag_manager import (
-    RM3100_ALTERNATE_PRIMARY_ID,
-    RM3100_BACKUP_ID,
-    RM3100_PRIMARY_ID,
-)
 
 
-def test_ros2_mag_slots_prioritize_known_rm3100_ids_for_can_labels() -> None:
+def test_ros2_mag_slots_use_discovery_order_without_known_ids() -> None:
     subscriber = DualPixhawkAttitudeSubscriber.__new__(DualPixhawkAttitudeSubscriber)
     subscriber.mag_device_slots = {"left": {}, "right": {}}
 
-    assert subscriber._mag_slot_for_device("left", 4395041) == "BOARD"
-    assert subscriber._mag_slot_for_device("left", 396809) == "GPS1_MAG"
-    assert subscriber._mag_slot_for_device("left", 396817) == "GPS2_MAG"
-    assert subscriber._mag_slot_for_device("left", RM3100_PRIMARY_ID) == "CAN1"
-    assert subscriber._mag_slot_for_device("left", RM3100_ALTERNATE_PRIMARY_ID) == "CAN1"
-    assert subscriber._mag_slot_for_device("left", RM3100_BACKUP_ID) == "CAN2"
+    assert subscriber._mag_slot_for_device("left", 0x00431021) == "MAG1"
+    assert subscriber._mag_slot_for_device("left", 0x00431029) == "MAG2"
+    assert subscriber._mag_slot_for_device("left", 0x00431021) == "MAG1"
+    assert subscriber._mag_slot_for_device("right", 0x00431021) == "MAG1"
 
 
 def test_mavlink_shell_command_falls_back_to_respond_without_exclusive() -> None:
@@ -62,3 +57,31 @@ def test_mavlink_shell_command_falls_back_to_respond_without_exclusive() -> None
     assert payload_flags == [2]
     assert result.flag_label == "respond"
     assert "nsh> OK" in result.output
+
+
+def test_ros2_global_position_is_kept_outside_active_sensor_gps_slot() -> None:
+    subscriber = DualPixhawkAttitudeSubscriber(domain_id=0, left_namespace="uav_0", right_namespace="")
+    states = []
+    subscriber.gps_changed.connect(lambda camera, state: states.append((camera, state)))
+
+    subscriber._handle_global_position_message(
+        "left",
+        "uav_0",
+        SimpleNamespace(
+            timestamp=2_000_000,
+            timestamp_sample=1_900_000,
+            lat=37.0,
+            lon=127.0,
+            alt=10.0,
+            lat_lon_valid=True,
+            alt_valid=True,
+            eph=0.4,
+            epv=0.6,
+        ),
+    )
+
+    assert states[0][0] == "left"
+    assert states[0][1].source == "global_position"
+    assert states[0][1].topic.endswith("vehicle_global_position")
+    assert subscriber.latest_gps_by_source["global_position"]["left"].source == "global_position"
+    assert "left" not in subscriber.latest_gps

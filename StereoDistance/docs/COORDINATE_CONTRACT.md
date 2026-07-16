@@ -13,6 +13,34 @@ This document fixes the coordinate-frame and axis naming contract used by Stereo
 | `stereo_center_frd` | Stereo rig center comparison frame | `Forward/Right/Down` | Simulation and UAM camera-axis comparison |
 | `px4_local_ned` | UAM/Pixhawk local truth frame | `North/East/Down` | Truth and aligned estimated output |
 
+## Stereo Extrinsics Sources
+
+StereoDistance supports two stereo extrinsics sources:
+
+| Source | Input frame | Runtime requirement | Output contract |
+| --- | --- | --- | --- |
+| `pixhawk` | PX4 local NED baseline plus Pixhawk body FRD attitudes | Live left/right Pixhawk attitude and GNSS/RTK baseline | `translation_right_in_left_m` in left-camera RDF |
+| `checkerboard_stereo_calibration` | OpenCV left/right optical frames from paired checkerboard captures | Active intrinsics JSON with `stereo_calibration` | fixed `rotation_right_to_left` and `translation_right_in_left_m` in left-camera RDF |
+
+OpenCV `stereoCalibrate` stores the checkerboard pose as:
+
+```text
+X_R = R_LR X_L + T_LR
+```
+
+The runtime triangulation code does not consume `T_LR` directly. It consumes the
+right camera center expressed in the left camera optical frame:
+
+```text
+rotation_right_to_left = R_LR^T
+translation_right_in_left_m = -R_LR^T T_LR
+```
+
+Do not write OpenCV `translation_left_to_right_m` directly into
+`translation_right_in_left_m`; the sign and frame are different. Saved
+measurement rows must state `stereo_extrinsics_source` so RTK/GNSS and
+checkerboard-derived results can be separated during analysis.
+
 ## Fixed Mount
 
 The nominal front camera mount profile is:

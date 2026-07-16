@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import isfinite, sqrt
 from typing import Iterable
 
 from wiris_stereo_distance.attitude_bias import normalize_quaternion, quaternion_conjugate, quaternion_multiply
@@ -32,6 +32,13 @@ class RayTriangulationResult:
     closest_gap_m: float
     baseline_m: float
     method: str = "ray-triangulation"
+    left_ray_camera: tuple[float, float, float] | None = None
+    right_ray_camera: tuple[float, float, float] | None = None
+    right_ray_in_left: tuple[float, float, float] | None = None
+    closest_point_left_m: tuple[float, float, float] | None = None
+    closest_point_right_m: tuple[float, float, float] | None = None
+    left_ray_parameter_m: float | None = None
+    right_ray_parameter_m: float | None = None
 
 
 def _dot(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
@@ -56,7 +63,7 @@ def _norm(a: tuple[float, float, float]) -> float:
 
 def _normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
     n = _norm(v)
-    if n <= 0.0:
+    if not isfinite(n) or n <= 0.0:
         raise ValueError("zero-length vector")
     return (v[0] / n, v[1] / n, v[2] / n)
 
@@ -164,7 +171,7 @@ def relative_rotation_quaternion(left_q: Iterable[float], right_q: Iterable[floa
     return quaternion_multiply(quaternion_conjugate(left), right)
 
 
-def normalized_ray_from_pixel(u: float, v: float, intrinsics: CameraIntrinsics) -> tuple[float, float, float]:
+def _linear_normalized_ray_from_pixel(u: float, v: float, intrinsics: CameraIntrinsics) -> tuple[float, float, float]:
     matrix = intrinsics.camera_matrix
     fx = float(matrix[0][0])
     fy = float(matrix[1][1])
@@ -172,23 +179,53 @@ def normalized_ray_from_pixel(u: float, v: float, intrinsics: CameraIntrinsics) 
     cy = float(matrix[1][2])
     if fx <= 0.0 or fy <= 0.0:
         raise ValueError("invalid focal length")
-    # Distortion is stored but not numerically inverted here to avoid a hard OpenCV dependency
-    # in the live distance path. Calibration still records D for future undistortPoints use.
     x = (float(u) - cx) / fx
     y = (float(v) - cy) / fy
     return _normalize((x, y, 1.0))
+
+
+def _has_distortion(intrinsics: CameraIntrinsics) -> bool:
+    return any(abs(float(value)) > 1e-12 for value in intrinsics.distortion_coefficients)
+
+
+def _undistorted_normalized_ray_from_pixel(
+    u: float,
+    v: float,
+    intrinsics: CameraIntrinsics,
+) -> tuple[float, float, float]:
+    import cv2
+    import numpy as np
+
+    camera_matrix = np.asarray(intrinsics.camera_matrix, dtype=np.float64)
+    distortion = np.asarray(intrinsics.distortion_coefficients, dtype=np.float64).reshape(-1, 1)
+    points = np.asarray([[[float(u), float(v)]]], dtype=np.float64)
+    undistorted = cv2.undistortPoints(points, camera_matrix, distortion)
+    x = float(undistorted[0, 0, 0])
+    y = float(undistorted[0, 0, 1])
+    return _normalize((x, y, 1.0))
+
+
+def normalized_ray_from_pixel(u: float, v: float, intrinsics: CameraIntrinsics) -> tuple[float, float, float]:
+    if not _has_distortion(intrinsics):
+        return _linear_normalized_ray_from_pixel(u, v, intrinsics)
+    try:
+        return _undistorted_normalized_ray_from_pixel(u, v, intrinsics)
+    except Exception as exc:
+        raise ValueError(f"distortion undistortion failed: {exc}") from exc
 
 
 def triangulate_rays(
     left_ray: tuple[float, float, float],
     right_ray_in_left: tuple[float, float, float],
     translation_right_in_left_m: tuple[float, float, float],
+    *,
+    right_ray_camera: tuple[float, float, float] | None = None,
 ) -> RayTriangulationResult | None:
     d1 = _normalize(left_ray)
     d2 = _normalize(right_ray_in_left)
     t = translation_right_in_left_m
     baseline = _norm(t)
-    if baseline <= 0.0:
+    if not isfinite(baseline) or baseline <= 0.0:
         return None
 
     # Closest points between L(s)=s*d1 and R(u)=t+u*d2.
@@ -210,9 +247,21 @@ def triangulate_rays(
     midpoint = _scale(_add(p1, p2), 0.5)
     gap = _norm(_sub(p1, p2))
     distance = _norm(midpoint)
-    if distance <= 0.0:
+    if not isfinite(gap) or not isfinite(distance) or distance <= 0.0:
         return None
-    return RayTriangulationResult(distance, midpoint, gap, baseline)
+    return RayTriangulationResult(
+        distance,
+        midpoint,
+        gap,
+        baseline,
+        left_ray_camera=d1,
+        right_ray_camera=right_ray_camera,
+        right_ray_in_left=d2,
+        closest_point_left_m=p1,
+        closest_point_right_m=p2,
+        left_ray_parameter_m=s,
+        right_ray_parameter_m=u,
+    )
 
 
 def triangulate_pixels(
@@ -229,7 +278,12 @@ def triangulate_pixels(
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
     right_to_left_q = relative_rotation_quaternion(left_q, right_q)
     right_ray_in_left = _normalize(_rotate(right_to_left_q, right_ray))
-    return triangulate_rays(left_ray, right_ray_in_left, translation_right_in_left_m)
+    return triangulate_rays(
+        left_ray,
+        right_ray_in_left,
+        translation_right_in_left_m,
+        right_ray_camera=right_ray,
+    )
 
 
 def triangulate_pixels_with_pixhawk_mount(
@@ -251,7 +305,12 @@ def triangulate_pixels_with_pixhawk_mount(
             right_body_to_world_q=right_body_to_world_q,
         )
     )
-    return triangulate_rays(left_ray, right_ray_in_left, translation_right_in_left_m)
+    return triangulate_rays(
+        left_ray,
+        right_ray_in_left,
+        translation_right_in_left_m,
+        right_ray_camera=right_ray,
+    )
 
 
 def triangulate_pixels_with_relative_pose(
@@ -266,4 +325,9 @@ def triangulate_pixels_with_relative_pose(
     left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
     right_ray_in_left = _normalize(_rotate_matrix(rotation_right_to_left, right_ray))
-    return triangulate_rays(left_ray, right_ray_in_left, translation_right_in_left_m)
+    return triangulate_rays(
+        left_ray,
+        right_ray_in_left,
+        translation_right_in_left_m,
+        right_ray_camera=right_ray,
+    )

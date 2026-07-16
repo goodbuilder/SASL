@@ -15,6 +15,7 @@ from wiris_stereo_distance.stereo import (
 from wiris_stereo_distance.triangulation import (
     RayTriangulationResult,
     stereo_center_point_from_left_camera,
+    triangulate_pixels_with_relative_pose,
     triangulate_pixels_with_pixhawk_mount,
 )
 
@@ -37,13 +38,16 @@ class MeasurementGeometryInput:
     sync_quality: str = "unknown"
     warnings: tuple[str, ...] = ()
     translation_right_in_left_m: tuple[float, float, float] | None = None
+    rotation_right_to_left: list[list[float]] | None = None
     reprojection_profile: OriginBBoxReprojectionProfile | None = None
+    max_ray_gap_m: float | None = 0.5
 
 
 @dataclass(frozen=True)
 class ReprojectionCorrectionResult:
     lookup: ReprojectionLookupResult
     triangulated: RayTriangulationResult | None
+    point_center_m: tuple[float, float, float] | None
     estimate: StereoEstimate | None
     warnings: tuple[str, ...]
 
@@ -52,6 +56,7 @@ class ReprojectionCorrectionResult:
 class MeasurementGeometryResult:
     match: StereoMatch | None
     triangulated: RayTriangulationResult | None
+    point_center_m: tuple[float, float, float] | None
     estimate: StereoEstimate | None
     warnings: tuple[str, ...]
     reprojection: ReprojectionCorrectionResult | None = None
@@ -77,14 +82,26 @@ def calculate_measurement_geometry(inputs: MeasurementGeometryInput) -> Measurem
         warnings=warnings,
     )
     if match is None or triangulated.result is None:
-        return MeasurementGeometryResult(match=match, triangulated=triangulated.result, estimate=None, warnings=warnings)
+        return MeasurementGeometryResult(
+            match=match,
+            triangulated=triangulated.result,
+            point_center_m=None,
+            estimate=None,
+            warnings=warnings,
+        )
     estimate = stereo_estimate_from_match(match, distance_m=triangulated.result.distance_m)
+    point_center_m = _stereo_center_point_from_triangulation(
+        triangulated.result,
+        inputs.translation_right_in_left_m,
+    )
     reprojection = _apply_reprojection_profile(inputs, match, triangulated.result, warnings)
+    reprojection_warnings = warnings if reprojection is None else reprojection.warnings
     return MeasurementGeometryResult(
         match=match,
         triangulated=triangulated.result,
+        point_center_m=point_center_m,
         estimate=estimate,
-        warnings=warnings,
+        warnings=reprojection_warnings,
         reprojection=reprojection,
     )
 
@@ -103,13 +120,47 @@ def _triangulate(inputs: MeasurementGeometryInput, warnings: tuple[str, ...]) ->
     if inputs.intrinsics is None:
         return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for intrinsics"))
     try:
+        if inputs.triangulation_source == "checkerboard_stereo_calibration":
+            if inputs.translation_right_in_left_m is None or inputs.rotation_right_to_left is None:
+                return _TriangulationAttempt(
+                    None,
+                    _with_warning(warnings, "triangulation waiting for checkerboard stereo extrinsics"),
+                )
+            return _validated_triangulation(
+                inputs,
+                _triangulate_pixels(inputs, inputs.left.center, inputs.right.center),
+                warnings,
+            )
         if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
             return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for Pixhawk R"))
         if inputs.translation_right_in_left_m is None:
             return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for RTK T"))
-        return _TriangulationAttempt(_triangulate_pixels(inputs, inputs.left.center, inputs.right.center), warnings)
+        return _validated_triangulation(
+            inputs,
+            _triangulate_pixels(inputs, inputs.left.center, inputs.right.center),
+            warnings,
+        )
     except Exception as exc:
         return _TriangulationAttempt(None, _with_warning(warnings, f"triangulation error: {exc}"))
+
+
+def _validated_triangulation(
+    inputs: MeasurementGeometryInput,
+    result: RayTriangulationResult | None,
+    warnings: tuple[str, ...],
+) -> _TriangulationAttempt:
+    if result is None:
+        return _TriangulationAttempt(None, warnings)
+    max_gap_m = inputs.max_ray_gap_m
+    if max_gap_m is not None and result.closest_gap_m > float(max_gap_m):
+        return _TriangulationAttempt(
+            None,
+            _with_warning(
+                warnings,
+                f"triangulation ray gap {result.closest_gap_m:.3f}m > {float(max_gap_m):.3f}m",
+            ),
+        )
+    return _TriangulationAttempt(result, warnings)
 
 
 def _triangulate_pixels(
@@ -119,9 +170,20 @@ def _triangulate_pixels(
 ) -> RayTriangulationResult | None:
     if inputs.intrinsics is None:
         return None
-    if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
-        return None
     if inputs.translation_right_in_left_m is None:
+        return None
+    if inputs.triangulation_source == "checkerboard_stereo_calibration":
+        if inputs.rotation_right_to_left is None:
+            return None
+        return triangulate_pixels_with_relative_pose(
+            left_pixel=left_pixel,
+            right_pixel=right_pixel,
+            left_intrinsics=inputs.intrinsics.left,
+            right_intrinsics=inputs.intrinsics.right,
+            rotation_right_to_left=inputs.rotation_right_to_left,
+            translation_right_in_left_m=inputs.translation_right_in_left_m,
+        )
+    if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
         return None
     return triangulate_pixels_with_pixhawk_mount(
         left_pixel=left_pixel,
@@ -134,15 +196,20 @@ def _triangulate_pixels(
     )
 
 
+def _stereo_center_point_from_triangulation(
+    triangulated: RayTriangulationResult,
+    translation_right_in_left_m: tuple[float, float, float] | None,
+) -> tuple[float, float, float]:
+    if translation_right_in_left_m is None:
+        return triangulated.point_left_m
+    return stereo_center_point_from_left_camera(triangulated.point_left_m, translation_right_in_left_m)
+
+
 def _range_for_lookup(
     triangulated: RayTriangulationResult,
     translation_right_in_left_m: tuple[float, float, float] | None,
 ) -> float:
-    point = (
-        stereo_center_point_from_left_camera(triangulated.point_left_m, translation_right_in_left_m)
-        if translation_right_in_left_m is not None
-        else triangulated.point_left_m
-    )
+    point = _stereo_center_point_from_triangulation(triangulated, translation_right_in_left_m)
     return (point[0] * point[0] + point[1] * point[1] + point[2] * point[2]) ** 0.5
 
 
@@ -164,20 +231,31 @@ def _apply_reprojection_profile(
         raw_disparity_px=match.disparity_px,
         raw_range_m=raw_range_m,
     )
-    corrected = _triangulate_pixels(
+    corrected_attempt = _validated_triangulation(
         inputs,
-        (lookup.corrected_left_u, lookup.corrected_left_v),
-        (lookup.corrected_right_u, lookup.corrected_right_v),
+        _triangulate_pixels(
+            inputs,
+            (lookup.corrected_left_u, lookup.corrected_left_v),
+            (lookup.corrected_right_u, lookup.corrected_right_v),
+        ),
+        warnings,
     )
-    corrected_warnings = warnings
-    if corrected is None:
-        corrected_warnings = _with_warning(warnings, "reprojection corrected triangulation failed")
+    corrected = corrected_attempt.result
+    corrected_warnings = corrected_attempt.warnings
+    if corrected is None and "reprojection corrected triangulation failed" not in corrected_warnings:
+        corrected_warnings = _with_warning(corrected_warnings, "reprojection corrected triangulation failed")
     corrected_estimate = None
     if corrected is not None:
         corrected_estimate = stereo_estimate_from_match(match, distance_m=corrected.distance_m)
+    corrected_point_center_m = (
+        None
+        if corrected is None
+        else _stereo_center_point_from_triangulation(corrected, inputs.translation_right_in_left_m)
+    )
     return ReprojectionCorrectionResult(
         lookup=lookup,
         triangulated=corrected,
+        point_center_m=corrected_point_center_m,
         estimate=corrected_estimate,
         warnings=corrected_warnings,
     )

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import time
 from collections import deque
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Mapping
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -28,6 +31,21 @@ def infer_camera_timestamp_reference(metadata: dict) -> str:
     return "app-receive"
 
 
+@dataclass(frozen=True)
+class MeasurementFrameSelection:
+    timestamp_s: float
+    frame_id: object | None
+    image: QtGui.QImage
+    lookup_delta_s: float
+    metadata: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class BilateralMeasurementFrameSelection:
+    left: MeasurementFrameSelection
+    right: MeasurementFrameSelection
+
+
 class CameraPane(QtWidgets.QGroupBox):
     detection_changed = QtCore.pyqtSignal(str, object)
     frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
@@ -44,9 +62,14 @@ class CameraPane(QtWidgets.QGroupBox):
         self.latest_detection: DetectionObservation | None = None
         self.measurement_frame_images: dict[float, QtGui.QImage] = {}
         self.measurement_frame_order: deque[float] = deque(maxlen=120)
+        self.measurement_frame_ids: dict[float, object] = {}
+        self.measurement_frame_metadata: dict[float, dict[str, Any]] = {}
+        self.measurement_frame_timestamps_by_id: dict[str, float] = {}
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s: float | None = None
         self.selected_measurement_frame_lookup_delta_s: float | None = None
+        self.selected_measurement_frame_id: object | None = None
+        self.selected_measurement_frame_metadata: dict[str, Any] = {}
         self.detection_stream_active = False
         self.bbox_center_adjustment: tuple[tuple[float, float, float, float], tuple[float, float, float, float]] | None = None
         self.stream_generation = 0
@@ -68,19 +91,21 @@ class CameraPane(QtWidgets.QGroupBox):
 
     def start_stream(self, url: str, *, enable_detection: bool, **kwargs) -> None:
         if self.worker is not None or self.thread is not None:
-            self.stop()
+            self.stop(wait=True)
         self.stream_generation += 1
         stream_generation = self.stream_generation
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
         self.measurement_frame_order.clear()
+        self.measurement_frame_ids.clear()
+        self.measurement_frame_metadata.clear()
+        self.measurement_frame_timestamps_by_id.clear()
         self.measurement_pair_display_active = False
-        self.selected_measurement_frame_timestamp_s = None
-        self.selected_measurement_frame_lookup_delta_s = None
+        self._clear_selected_measurement_frame_state()
         self.detection_stream_active = bool(enable_detection)
         self.image_label.setPixmap(QtGui.QPixmap())
-        self.image_label.setText("YOLO 시작 중..." if enable_detection else "카메라 연결 중...")
+        self.image_label.setText("동기화 프레임 대기 중" if enable_detection else "카메라 연결 중...")
         self._set_detection_label(None)
         self.thread = QtCore.QThread(self)
         self.worker = YoloStreamWorker(url=url, enable_detection=enable_detection, **kwargs)
@@ -92,8 +117,8 @@ class CameraPane(QtWidgets.QGroupBox):
             )
         )
         self.worker.measurement_frame_ready.connect(
-            lambda timestamp_s, image, generation=stream_generation: self._store_measurement_frame_if_current(
-                generation, timestamp_s, image
+            lambda timestamp_s, frame_id, image, metadata, generation=stream_generation: self._store_measurement_frame_if_current(
+                generation, timestamp_s, frame_id, image, metadata
             )
         )
         self.worker.detection_ready.connect(
@@ -135,9 +160,11 @@ class CameraPane(QtWidgets.QGroupBox):
         self.latest_detection = None
         self.measurement_frame_images.clear()
         self.measurement_frame_order.clear()
+        self.measurement_frame_ids.clear()
+        self.measurement_frame_metadata.clear()
+        self.measurement_frame_timestamps_by_id.clear()
         self.measurement_pair_display_active = False
-        self.selected_measurement_frame_timestamp_s = None
-        self.selected_measurement_frame_lookup_delta_s = None
+        self._clear_selected_measurement_frame_state()
         self.detection_stream_active = False
         self.image_label.setText("중지됨")
         self.image_label.setPixmap(QtGui.QPixmap())
@@ -159,7 +186,8 @@ class CameraPane(QtWidgets.QGroupBox):
         frame_metadata.setdefault("source_timestamp_s", None)
         frame_metadata.setdefault("timestamp_source", "app-receive")
         frame_metadata.setdefault("timestamp_reference", infer_camera_timestamp_reference(frame_metadata))
-        if self.measurement_pair_display_active and self.detection_stream_active:
+        if self.detection_stream_active:
+            # Generic frames update receipt/status; only selected pairs repaint measurement panes.
             self.frame_changed.emit(self.camera_label, image, frame_metadata)
             return
         self.measurement_pair_display_active = False
@@ -172,60 +200,120 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self._show_frame(image, metadata)
 
-    def _store_measurement_frame(self, timestamp_s: float, image: QtGui.QImage) -> None:
+    @staticmethod
+    def _measurement_frame_id_key(frame_id: object | None) -> str | None:
+        return None if frame_id is None else str(frame_id)
+
+    def _store_measurement_frame(
+        self,
+        timestamp_s: float,
+        image: QtGui.QImage,
+        frame_id: object | None = None,
+        metadata: object | None = None,
+    ) -> None:
         key = float(timestamp_s)
         if key not in self.measurement_frame_images:
             if len(self.measurement_frame_order) == self.measurement_frame_order.maxlen:
                 old_key = self.measurement_frame_order.popleft()
                 self.measurement_frame_images.pop(old_key, None)
+                old_frame_id = self.measurement_frame_ids.pop(old_key, None)
+                old_frame_id_key = self._measurement_frame_id_key(old_frame_id)
+                if old_frame_id_key is not None:
+                    self.measurement_frame_timestamps_by_id.pop(old_frame_id_key, None)
+                self.measurement_frame_metadata.pop(old_key, None)
             self.measurement_frame_order.append(key)
         self.measurement_frame_images[key] = image.copy()
+        frame_metadata = dict(metadata or {}) if isinstance(metadata, dict) else {}
+        frame_metadata.setdefault("timestamp_s", key)
+        if frame_id is not None:
+            frame_metadata.setdefault("frame_id", frame_id)
+        self.measurement_frame_metadata[key] = frame_metadata
+        old_frame_id = self.measurement_frame_ids.pop(key, None)
+        old_frame_id_key = self._measurement_frame_id_key(old_frame_id)
+        if old_frame_id_key is not None:
+            self.measurement_frame_timestamps_by_id.pop(old_frame_id_key, None)
+        if frame_id is not None:
+            self.measurement_frame_ids[key] = frame_id
+            frame_id_key = self._measurement_frame_id_key(frame_id)
+            if frame_id_key is not None:
+                self.measurement_frame_timestamps_by_id[frame_id_key] = key
 
-    def _store_measurement_frame_if_current(self, generation: int, timestamp_s: float, image: QtGui.QImage) -> None:
+    def _store_measurement_frame_if_current(
+        self,
+        generation: int,
+        timestamp_s: float,
+        frame_id: object | None,
+        image: QtGui.QImage,
+        metadata: object | None = None,
+    ) -> None:
         if generation != self.stream_generation:
             return
-        self._store_measurement_frame(timestamp_s, image)
+        self._store_measurement_frame(timestamp_s, image, frame_id, metadata)
+
+    def resolve_measurement_frame_for_detection(
+        self,
+        detection: DetectionObservation,
+    ) -> MeasurementFrameSelection | None:
+        detection_timestamp_s = float(detection.timestamp_s)
+        detection_metadata = dict(detection.timestamp_metadata or {})
+        frame_id = detection_metadata.get("frame_id")
+        if frame_id is not None:
+            selected_timestamp_s = self.measurement_frame_timestamps_by_id.get(
+                self._measurement_frame_id_key(frame_id) or ""
+            )
+        elif self.detection_stream_active:
+            return None
+        else:
+            selected_timestamp_s = detection_timestamp_s if detection_timestamp_s in self.measurement_frame_images else None
+        if selected_timestamp_s is None:
+            return None
+        image = self.measurement_frame_images.get(selected_timestamp_s)
+        if image is None:
+            return None
+        return MeasurementFrameSelection(
+            timestamp_s=selected_timestamp_s,
+            frame_id=self.measurement_frame_ids.get(selected_timestamp_s),
+            image=image,
+            lookup_delta_s=selected_timestamp_s - detection_timestamp_s,
+            metadata=MappingProxyType(dict(self.measurement_frame_metadata.get(selected_timestamp_s) or {})),
+        )
 
     def show_measurement_frame_for_detection(self, detection: DetectionObservation) -> bool:
-        detection_timestamp_s = float(detection.timestamp_s)
-        image = self.measurement_frame_images.get(detection_timestamp_s)
-        selected_timestamp_s = detection_timestamp_s if image is not None else None
-        if image is None:
-            nearest = self._nearest_measurement_frame(detection_timestamp_s)
-            if nearest is not None:
-                selected_timestamp_s, image = nearest
-        if image is None:
+        selection = self.resolve_measurement_frame_for_detection(detection)
+        if selection is None:
             self.measurement_pair_display_active = False
-            self.selected_measurement_frame_timestamp_s = None
-            self.selected_measurement_frame_lookup_delta_s = None
+            self._clear_selected_measurement_frame_state()
             return False
-        self.selected_measurement_frame_timestamp_s = selected_timestamp_s
-        self.selected_measurement_frame_lookup_delta_s = (
-            None if selected_timestamp_s is None else selected_timestamp_s - detection_timestamp_s
-        )
-        self.show_selected_measurement_frame(image)
+        self.show_resolved_measurement_frame(selection)
         return True
+
+    def show_resolved_measurement_frame(self, selection: MeasurementFrameSelection) -> None:
+        self.show_selected_measurement_frame(selection.image)
+        self.selected_measurement_frame_timestamp_s = selection.timestamp_s
+        self.selected_measurement_frame_lookup_delta_s = selection.lookup_delta_s
+        self.selected_measurement_frame_id = selection.frame_id
+        self.selected_measurement_frame_metadata = dict(selection.metadata)
 
     def show_selected_measurement_frame(self, image: QtGui.QImage) -> None:
         self.measurement_pair_display_active = True
+        self.selected_measurement_frame_id = None
+        self.selected_measurement_frame_metadata = {}
         self.latest_image = image.copy()
         self._refresh_pixmap()
 
-    def clear_measurement_pair_display(self) -> None:
+    def clear_measurement_pair_display(self, *, clear_image: bool = False) -> None:
         self.measurement_pair_display_active = False
+        self._clear_selected_measurement_frame_state()
+        if clear_image:
+            self.latest_image = None
+            self.image_label.setPixmap(QtGui.QPixmap())
+            self.image_label.setText("동기화 프레임 대기 중")
+
+    def _clear_selected_measurement_frame_state(self) -> None:
         self.selected_measurement_frame_timestamp_s = None
         self.selected_measurement_frame_lookup_delta_s = None
-
-    def _nearest_measurement_frame(self, timestamp_s: float) -> tuple[float, QtGui.QImage] | None:
-        if not self.measurement_frame_images:
-            return None
-        key = min(self.measurement_frame_images, key=lambda candidate: abs(candidate - timestamp_s))
-        if abs(key - timestamp_s) > 0.001:
-            return None
-        image = self.measurement_frame_images.get(key)
-        if image is None:
-            return None
-        return key, image
+        self.selected_measurement_frame_id = None
+        self.selected_measurement_frame_metadata = {}
 
     def _refresh_pixmap(self) -> None:
         if self.latest_image is None:

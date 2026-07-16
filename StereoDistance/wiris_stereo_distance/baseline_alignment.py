@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import atan2, cos, degrees, radians, sqrt
+from math import acos, atan2, cos, degrees, radians, sqrt
 from statistics import mean, pstdev
 from typing import Any
 
 import yaml
 
-from wiris_stereo_distance.rtk_geometry import EARTH_RADIUS_M, GpsPositionState
+from wiris_stereo_distance.rtk_geometry import EARTH_RADIUS_M, GpsPositionState, ned_delta_m
 
 
 @dataclass(frozen=True)
@@ -51,6 +51,104 @@ class BaselineQuality:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class BaselineQualityThresholds:
+    bad_std_m: float = 0.10
+    jump_m: float = 0.20
+    max_timestamp_delta_ms: float = 200.0
+    good_rtk_ratio: float = 0.95
+    good_std_m: float = 0.02
+    good_h_acc_m: float = 0.03
+    good_v_acc_m: float = 0.05
+    good_timestamp_delta_ms: float = 50.0
+    warning_rtk_ratio: float = 0.70
+
+
+@dataclass(frozen=True)
+class BaselineSourceComparison:
+    sensor_baseline: BaselineVector | None
+    global_baseline: BaselineVector | None
+    left_position_delta_ned_m: tuple[float, float, float] | None
+    right_position_delta_ned_m: tuple[float, float, float] | None
+    baseline_delta_ned_m: tuple[float, float, float] | None
+    baseline_length_delta_m: float | None
+    baseline_angle_deg: float | None
+    status: str
+
+
+def _vector_angle_deg(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> float | None:
+    first_length = sqrt(sum(value * value for value in first))
+    second_length = sqrt(sum(value * value for value in second))
+    if first_length <= 1e-9 or second_length <= 1e-9:
+        return None
+    cosine = sum(a * b for a, b in zip(first, second)) / (first_length * second_length)
+    return degrees(acos(max(-1.0, min(1.0, cosine))))
+
+
+def compare_baseline_sources(
+    sensor_left: GpsPositionState | None,
+    sensor_right: GpsPositionState | None,
+    global_left: GpsPositionState | None,
+    global_right: GpsPositionState | None,
+    *,
+    max_timestamp_delta_ms: float = 200.0,
+) -> BaselineSourceComparison:
+    sensor_baseline = (
+        baseline_from_gps(sensor_left, sensor_right)
+        if sensor_left is not None and sensor_right is not None
+        else None
+    )
+    global_baseline = (
+        baseline_from_gps(global_left, global_right)
+        if global_left is not None and global_right is not None
+        else None
+    )
+    left_delta = (
+        ned_delta_m(sensor_left, global_left)
+        if sensor_left is not None and global_left is not None
+        else None
+    )
+    right_delta = (
+        ned_delta_m(sensor_right, global_right)
+        if sensor_right is not None and global_right is not None
+        else None
+    )
+    baseline_delta = None
+    baseline_length_delta = None
+    baseline_angle = None
+    if sensor_baseline is not None and global_baseline is not None:
+        baseline_delta = (
+            global_baseline.north_m - sensor_baseline.north_m,
+            global_baseline.east_m - sensor_baseline.east_m,
+            -global_baseline.up_m + sensor_baseline.up_m,
+        )
+        baseline_length_delta = global_baseline.length_m - sensor_baseline.length_m
+        baseline_angle = _vector_angle_deg(sensor_baseline.ned_m, global_baseline.ned_m)
+
+    if sensor_baseline is None or global_baseline is None:
+        status = "WAITING_SOURCE"
+    elif (
+        sensor_baseline.timestamp_delta_ms > max_timestamp_delta_ms
+        or global_baseline.timestamp_delta_ms > max_timestamp_delta_ms
+    ):
+        status = "TIMESTAMP_SKEW"
+    else:
+        status = "OK"
+    return BaselineSourceComparison(
+        sensor_baseline=sensor_baseline,
+        global_baseline=global_baseline,
+        left_position_delta_ned_m=left_delta,
+        right_position_delta_ned_m=right_delta,
+        baseline_delta_ned_m=baseline_delta,
+        baseline_length_delta_m=baseline_length_delta,
+        baseline_angle_deg=baseline_angle,
+        status=status,
+    )
+
+
 def baseline_from_gps(left: GpsPositionState, right: GpsPositionState) -> BaselineVector | None:
     if not left.has_position or not right.has_position:
         return None
@@ -82,9 +180,11 @@ def evaluate_baseline_quality(
     samples: list[tuple[BaselineVector, GpsPositionState, GpsPositionState]],
     *,
     duration_s: float,
+    thresholds: BaselineQualityThresholds | None = None,
 ) -> BaselineQuality | None:
     if not samples:
         return None
+    limits = thresholds or BaselineQualityThresholds()
     vectors = [sample[0] for sample in samples]
     lengths = [vector.length_m for vector in vectors]
     east_values = [vector.east_m for vector in vectors]
@@ -109,8 +209,8 @@ def evaluate_baseline_quality(
     ]
     length_mean = mean(lengths)
     length_std = pstdev(lengths) if len(lengths) > 1 else 0.0
-    jumps = sum(1 for previous, current in zip(lengths, lengths[1:]) if abs(current - previous) > 0.20)
-    outliers = sum(1 for value in lengths if abs(value - length_mean) > max(0.10, length_std * 3.0))
+    jumps = sum(1 for previous, current in zip(lengths, lengths[1:]) if abs(current - previous) > limits.jump_m)
+    outliers = sum(1 for value in lengths if abs(value - length_mean) > max(limits.bad_std_m, length_std * 3.0))
     rtk_ratio = sum(1 for item in rtk_fixed if item) / len(rtk_fixed)
     mean_h_acc = mean(h_acc_values) if h_acc_values else None
     mean_v_acc = mean(v_acc_values) if v_acc_values else None
@@ -120,24 +220,26 @@ def evaluate_baseline_quality(
     any_low_fix = any((left.fix_type or 0) < 5 or (right.fix_type or 0) < 5 for _vector, left, right in samples)
     if any_low_fix:
         reasons.append("No Fix/3D Fix present")
-    if length_std > 0.10:
-        reasons.append("baseline std > 0.10 m")
-    if max_timestamp_delta > 200.0:
-        reasons.append("timestamp delta > 200 ms")
+    if length_std > limits.bad_std_m:
+        reasons.append(f"baseline std > {limits.bad_std_m:.2f} m")
+    if max_timestamp_delta > limits.max_timestamp_delta_ms:
+        reasons.append(f"timestamp delta > {limits.max_timestamp_delta_ms:.0f} ms")
     if jumps > 0:
-        reasons.append("baseline jump > 0.20 m")
+        reasons.append(f"baseline jump > {limits.jump_m:.2f} m")
 
     if reasons:
         grade = "BAD"
     elif (
-        rtk_ratio >= 0.95
-        and length_std < 0.02
-        and (mean_h_acc is None or mean_h_acc < 0.03)
-        and (mean_v_acc is None or mean_v_acc < 0.05)
-        and max_timestamp_delta < 50.0
+        rtk_ratio >= limits.good_rtk_ratio
+        and length_std < limits.good_std_m
+        and mean_h_acc is not None
+        and mean_h_acc < limits.good_h_acc_m
+        and mean_v_acc is not None
+        and mean_v_acc < limits.good_v_acc_m
+        and max_timestamp_delta < limits.good_timestamp_delta_ms
     ):
         grade = "GOOD"
-    elif rtk_ratio >= 0.70 or length_std <= 0.10 or max_timestamp_delta <= 200.0:
+    elif rtk_ratio >= limits.warning_rtk_ratio or length_std <= limits.bad_std_m or max_timestamp_delta <= limits.max_timestamp_delta_ms:
         grade = "WARNING"
     else:
         grade = "BAD"

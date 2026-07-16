@@ -5,19 +5,14 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
-RM3100_PRIMARY_ID = 8944899
-RM3100_ALTERNATE_PRIMARY_ID = 8944643
-RM3100_PRIMARY_IDS = (RM3100_PRIMARY_ID, RM3100_ALTERNATE_PRIMARY_ID)
-RM3100_BACKUP_ID = 8944387
-RM3100_ALTERNATE_BACKUP_ID = 8944395
-RM3100_BACKUP_IDS = (RM3100_BACKUP_ID, RM3100_ALTERNATE_BACKUP_ID)
-RM3100_IDS = (*RM3100_PRIMARY_IDS, *RM3100_BACKUP_IDS)
-BOARD_INTERNAL_MAG_ID = 4395041
-GPS1_MAG_ID = 396809
-GPS2_MAG_ID = 396817
-GPS_MAG_IDS = (GPS1_MAG_ID, GPS2_MAG_ID)
-INTERNAL_MAG_IDS = (BOARD_INTERNAL_MAG_ID, *GPS_MAG_IDS)
-MAG_SLOTS = tuple(range(5))
+MAG_SLOTS = tuple(range(4))
+PX4_DEVICE_ID_BUS_TYPE_MASK = 0x7
+PX4_DEVICE_ID_BUS_INTERFACES = {
+    1: "I2C",
+    2: "SPI",
+    3: "DroneCAN",
+    4: "SIM",
+}
 MAG_PARAM_NAMES = (
     "UAVCAN_ENABLE",
     "UAVCAN_SUB_MAG",
@@ -73,8 +68,6 @@ class Px4MagStatus:
 
     def to_dict(self) -> dict[str, object]:
         data: dict[str, object] = {
-            "rm3100_primary_id": self.rm3100_primary_id,
-            "rm3100_backup_id": self.rm3100_backup_id,
             "expected_selected_device_id": self.expected_selected_device_id,
             "actual_selected_device_id": self.actual_selected_device_id,
             "is_actual_rm3100": self.is_actual_rm3100,
@@ -106,41 +99,41 @@ class MockParameterStore:
 
 def current_pixhawk_6x_mag_params() -> dict[str, int | float | None]:
     values: dict[str, int | float | None] = {
-        "UAVCAN_ENABLE": 2,
-        "UAVCAN_SUB_MAG": 1,
+        "UAVCAN_ENABLE": None,
+        "UAVCAN_SUB_MAG": None,
         "EKF2_MAG_TYPE": None,
-        "CAL_MAG0_ID": 4395041,
-        "CAL_MAG0_PRIO": 0,
+        "CAL_MAG0_ID": None,
+        "CAL_MAG0_PRIO": None,
         "CAL_MAG0_ROT": None,
-        "CAL_MAG1_ID": 396809,
-        "CAL_MAG1_PRIO": 75,
+        "CAL_MAG1_ID": None,
+        "CAL_MAG1_PRIO": None,
         "CAL_MAG1_ROT": None,
-        "CAL_MAG2_ID": 396817,
-        "CAL_MAG2_PRIO": 75,
+        "CAL_MAG2_ID": None,
+        "CAL_MAG2_PRIO": None,
         "CAL_MAG2_ROT": None,
-        "CAL_MAG3_ID": RM3100_PRIMARY_ID,
-        "CAL_MAG3_PRIO": 75,
+        "CAL_MAG3_ID": None,
+        "CAL_MAG3_PRIO": None,
         "CAL_MAG3_ROT": None,
     }
     return values
 
 
+def px4_device_id_bus_type(device_id: int | None) -> int | None:
+    return None if device_id is None else int(device_id) & PX4_DEVICE_ID_BUS_TYPE_MASK
+
+
+def px4_device_id_interface(device_id: int | None) -> str:
+    bus_type = px4_device_id_bus_type(device_id)
+    if bus_type is None:
+        return "N/A"
+    return PX4_DEVICE_ID_BUS_INTERFACES.get(bus_type, f"PX4 bus type {bus_type}")
+
+
 def identify_mag_device(device_id: int | None) -> MagDeviceInfo:
-    if device_id == RM3100_PRIMARY_ID:
-        return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7D", "DroneCAN", True)
-    if device_id == RM3100_ALTERNATE_PRIMARY_ID:
-        return MagDeviceInfo(device_id, "RM3100 #1 / UAVCAN node 0x7C", "DroneCAN", True)
-    if device_id in RM3100_BACKUP_IDS:
-        return MagDeviceInfo(device_id, "RM3100 #2 / UAVCAN node 0x7B", "DroneCAN", True)
-    if device_id == BOARD_INTERNAL_MAG_ID:
-        return MagDeviceInfo(device_id, "Board internal BMM150", "Pixhawk internal I2C", False)
-    if device_id == GPS1_MAG_ID:
-        return MagDeviceInfo(device_id, "GPS1 integrated IST8310 compass", "GPS1 I2C compass", False)
-    if device_id == GPS2_MAG_ID:
-        return MagDeviceInfo(device_id, "GPS2 integrated IST8310 compass", "GPS2 I2C compass", False)
+    interface = px4_device_id_interface(device_id)
     if device_id is None:
-        return MagDeviceInfo(device_id, "N/A", "N/A", False)
-    return MagDeviceInfo(device_id, "Unknown MAG", "Unknown", False)
+        return MagDeviceInfo(device_id, "N/A", interface, False)
+    return MagDeviceInfo(device_id, "PX4 MAG", interface, False)
 
 
 def read_mag_params(store: ParameterStore) -> dict[str, int | float | None]:
@@ -180,26 +173,19 @@ def build_mag_status(
     if params.get("UAVCAN_SUB_MAG") != 1:
         warnings.append("DroneCAN magnetometer subscription is disabled.")
 
-    registered_rm3100 = [
+    registered_dronecan = [
         _param_int(params, f"CAL_MAG{slot}_ID")
         for slot in MAG_SLOTS
-        if _param_int(params, f"CAL_MAG{slot}_ID") in RM3100_IDS
+        if px4_device_id_interface(_param_int(params, f"CAL_MAG{slot}_ID")) == "DroneCAN"
     ]
-    if not registered_rm3100:
-        warnings.append("No RM3100 registered in CAL_MAG. Run Compass Calibration with RM3100 connected.")
-    elif any(device_id in RM3100_PRIMARY_IDS for device_id in registered_rm3100) and not any(
-        device_id in RM3100_BACKUP_IDS for device_id in registered_rm3100
-    ):
-        warnings.append("Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.")
+    if not registered_dronecan:
+        warnings.append("No DroneCAN magnetometer slot is registered in CAL_MAG.")
 
-    if actual_selected_device_id == BOARD_INTERNAL_MAG_ID:
-        warnings.append("PX4 is still using the board internal magnetometer, not RM3100.")
-    elif actual_selected_device_id in GPS_MAG_IDS:
-        warnings.append("PX4 is still using a GPS integrated magnetometer, not RM3100.")
-    elif actual_selected_device_id in RM3100_IDS:
-        warnings.append("PX4 is using RM3100 as selected magnetometer.")
-    elif actual_selected_device_id is None:
+    if actual_selected_device_id is None:
         warnings.append("Actual selected MAG ID not available via current ROS2 interface.")
+    else:
+        actual_interface = px4_device_id_interface(actual_selected_device_id)
+        warnings.append(f"PX4 selected MAG interface: {actual_interface}.")
 
     slots: list[MagSlotStatus] = []
     for slot in MAG_SLOTS:
@@ -218,10 +204,10 @@ def build_mag_status(
             status = "Expected selected"
         elif not enabled:
             status = "Disabled"
-        elif info.is_rm3100:
-            status = "RM3100 candidate"
+        elif info.interface == "DroneCAN":
+            status = "DroneCAN candidate"
         else:
-            status = "Enabled non-RM3100"
+            status = "Enabled"
         slots.append(
             MagSlotStatus(
                 slot=slot,
@@ -241,11 +227,11 @@ def build_mag_status(
     return Px4MagStatus(
         params=params,
         slots=tuple(slots),
-        rm3100_primary_id=RM3100_PRIMARY_ID,
-        rm3100_backup_id=RM3100_BACKUP_ID,
+        rm3100_primary_id=0,
+        rm3100_backup_id=0,
         expected_selected_device_id=expected_device_id,
         actual_selected_device_id=actual_selected_device_id,
-        is_actual_rm3100=actual_selected_device_id in RM3100_IDS,
+        is_actual_rm3100=False,
         warning_text="\n".join(warnings),
         armed=armed,
     )
@@ -269,18 +255,19 @@ class Px4MagManager:
         if self.armed:
             raise RuntimeError("Disarm required before changing PX4 magnetometer parameters.")
         params = read_mag_params(self.store)
-        rm_slots = [
+        dronecan_slots = [
             slot
             for slot in MAG_SLOTS
-            if _param_int(params, f"CAL_MAG{slot}_ID") in RM3100_IDS and params.get(f"CAL_MAG{slot}_PRIO") is not None
+            if px4_device_id_interface(_param_int(params, f"CAL_MAG{slot}_ID")) == "DroneCAN"
+            and params.get(f"CAL_MAG{slot}_PRIO") is not None
         ]
-        if not rm_slots:
-            raise RuntimeError("No RM3100 registered in CAL_MAG. Run Compass Calibration with RM3100 connected.")
+        if not dronecan_slots:
+            raise RuntimeError("No DroneCAN magnetometer slot is registered in CAL_MAG.")
         before = {f"CAL_MAG{slot}_PRIO": params.get(f"CAL_MAG{slot}_PRIO") for slot in MAG_SLOTS}
         target_priorities = {slot: 0 for slot in MAG_SLOTS}
-        target_priorities[rm_slots[0]] = 100
-        if len(rm_slots) >= 2:
-            target_priorities[rm_slots[1]] = 90
+        target_priorities[dronecan_slots[0]] = 100
+        if len(dronecan_slots) >= 2:
+            target_priorities[dronecan_slots[1]] = 90
         for slot in MAG_SLOTS:
             name = f"CAL_MAG{slot}_PRIO"
             if params.get(name) is None:
@@ -288,10 +275,10 @@ class Px4MagManager:
             self.store.set_param(name, target_priorities[slot])
         after = {f"CAL_MAG{slot}_PRIO": self.store.get_param(f"CAL_MAG{slot}_PRIO") for slot in MAG_SLOTS}
         self.last_change_log = [
-            "Use RM3100 for Yaw",
+            "Use DroneCAN magnetometer slots for Yaw",
             f"before={before}",
             f"after={after}",
-            "GPS1/GPS2 integrated compass priority is set to 0.",
+            "Non-DroneCAN magnetometer priority is set to 0.",
             "Run param save and reboot PX4 if PX4 does not persist changes automatically.",
         ]
         return self.refresh()

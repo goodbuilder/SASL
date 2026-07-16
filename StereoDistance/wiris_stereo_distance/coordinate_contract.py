@@ -5,6 +5,10 @@ BODY_FRAME = "px4_frd"
 CAMERA_FRAME = "opencv_optical"
 CAMERA_MOUNT_PROFILE = "front_camera_z_to_body_x_x_to_body_y"
 
+MOUNT_ASSUMPTION_MODEL = "nominal-shared-rig-v1"
+MOUNT_ASSUMPTION_STATUS = "nominal shared rigid rig"
+MOUNT_ASSUMPTION_DETAIL = "rtk_gnss_baseline_used_as_effective_stereo_translation"
+
 MEASUREMENT_FRAME = "stereo_center_opencv_optical"
 MEASUREMENT_AXIS_CONTRACT = "x/right,y/down,z/forward"
 FRD_COMPARISON_AXIS_CONTRACT = "stereo_center_frd:forward_right_down"
@@ -49,3 +53,19 @@ FINAL_ERROR_NORTH_FIELD = "error_north_m"
 FINAL_ERROR_EAST_FIELD = "error_east_m"
 FINAL_ERROR_DOWN_FIELD = "error_down_m"
 FINAL_POSITION_ERROR_FIELD = "position_error_m"
+
+SYSTEM_CLAIM = (
+    "field stereo measurement workstation that records input provenance, "
+    "coordinate contracts, and post-flight validation evidence"
+)
+CLAIM_BOUNDARY = (
+    "does not guarantee hardware accuracy, all-axis correction improvement, "
+    "or equivalence between simulation PASS and hardware PASS"
+)
+
+CONNECTION_POLICY = (
+    "prefer simultaneous MAVLink and ROS2/uXRCE connections; MAVLink is the "
+    "readiness, control, RTCM, parameter, shell, reboot, and recovery authority"
+)
+MAVLINK_PRIORITY_ROLE = "readiness-control-rtcm-recovery"
+ROS2_PRIORITY_ROLE = "structured-uorb-telemetry-source-identity"

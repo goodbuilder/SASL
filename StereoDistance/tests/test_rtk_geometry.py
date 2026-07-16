@@ -1,8 +1,10 @@
 from types import SimpleNamespace
 
 from wiris_stereo_distance.rtk_geometry import (
+    GPS_SOURCE_GLOBAL_POSITION,
     GpsPositionState,
     estimate_rtk_baseline,
+    global_position_topic,
     gps_state_from_message,
     gps_topic,
     ned_delta_m,
@@ -12,6 +14,7 @@ from wiris_stereo_distance.rtk_geometry import (
 def test_gps_topic_maps_namespace() -> None:
     assert gps_topic("/uav_0/") == "/uav_0/fmu/out/vehicle_gps_position"
     assert gps_topic("") == "/fmu/out/vehicle_gps_position"
+    assert global_position_topic("/uav_0/") == "/uav_0/fmu/out/vehicle_global_position"
 
 
 def test_gps_state_from_px4_scaled_message() -> None:
@@ -35,6 +38,35 @@ def test_gps_state_from_px4_scaled_message() -> None:
     assert state.rtk_label == "RTK_FIXED"
     assert round(state.heading_deg or 0, 1) == 90.0
     assert state.px4_timestamp_s == 1.234
+
+
+def test_global_position_state_preserves_source_and_sample_timestamp() -> None:
+    message = SimpleNamespace(
+        timestamp=2_000_000,
+        timestamp_sample=1_900_000,
+        lat=37.0,
+        lon=127.0,
+        alt=10.5,
+        lat_lon_valid=True,
+        alt_valid=True,
+        eph=0.4,
+        epv=0.7,
+    )
+
+    state = gps_state_from_message(
+        camera="left",
+        namespace="uav_0",
+        message=message,
+        timestamp_s=20.0,
+        source=GPS_SOURCE_GLOBAL_POSITION,
+        topic=global_position_topic("uav_0"),
+    )
+
+    assert state.source == GPS_SOURCE_GLOBAL_POSITION
+    assert state.topic.endswith("vehicle_global_position")
+    assert state.px4_timestamp_s == 2.0
+    assert state.px4_sample_timestamp_s == 1.9
+    assert state.has_position
 
 
 def test_ned_delta_and_baseline_between_two_fixed_rtk_positions() -> None:
