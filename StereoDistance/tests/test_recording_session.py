@@ -30,7 +30,6 @@ def test_save_session_files_writes_metadata_and_available_csvs(tmp_path) -> None
         metadata={"session_id": "20260605_120000", "distance_sample_count": 1},
         distance_rows=[{"timestamp_s": "1.0", "distance_m": "5.4"}],
         external_parameter_rows=[{"timestamp_s": "1.0", "roll_deg": "0.1"}],
-        pixhawk_mag_rows=[],
     )
 
     assert saved.outputs == [saved.metadata, saved.distance_history, saved.external_parameters]
@@ -48,7 +47,6 @@ def test_save_session_files_writes_metadata_and_available_csvs(tmp_path) -> None
     assert saved.external_parameters is not None
     with saved.external_parameters.open("r", newline="", encoding="utf-8") as handle:
         assert list(csv.DictReader(handle)) == [{"timestamp_s": "1.0", "roll_deg": "0.1"}]
-    assert saved.pixhawk_mag_status is None
     assert saved.uam_analysis is None
 
 

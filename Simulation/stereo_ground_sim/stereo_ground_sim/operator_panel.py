@@ -1,23 +1,27 @@
+import json
 import math
+import os
 import threading
 import time
 from collections import deque
 
-from python_qt_binding.QtCore import QObject, Qt, Signal
+from python_qt_binding.QtCore import QObject, Qt, QTimer, Signal
 from python_qt_binding.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from python_qt_binding.QtWidgets import QGridLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
+from python_qt_binding.QtWidgets import QApplication, QGridLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
 from qt_gui.plugin import Plugin
 
 try:
     import rclpy
     from rclpy.qos import qos_profile_sensor_data
     from sensor_msgs.msg import Image
-    from std_msgs.msg import Float32MultiArray
+    from std_msgs.msg import Float32, Float32MultiArray, String
 except Exception:  # pragma: no cover - rqt can still load the widget shell.
     rclpy = None
     qos_profile_sensor_data = None
     Image = None
+    Float32 = None
     Float32MultiArray = None
+    String = None
 
 
 AXES = (
@@ -34,11 +38,18 @@ IMAGE_TOPICS = (
     ("Left Camera", "/left_camera/detection_image"),
     ("Right Camera", "/right_camera/detection_image"),
 )
+try:
+    PLOT_WINDOW_S = max(1.0, float(os.environ.get("RQT_PLOT_WINDOW_S", "30.0")))
+except ValueError:
+    PLOT_WINDOW_S = 30.0
 
 
 class PanelBridge(QObject):
     image = Signal(str, object)
     sample = Signal(str, list)
+    scalar = Signal(str, object)
+    detections = Signal(list)
+    profile = Signal(str)
     status = Signal(str)
 
 
@@ -47,7 +58,7 @@ class CameraView(QLabel):
         super().__init__(parent)
         self._title = title
         self._pixmap = None
-        self.setMinimumSize(560, 300)
+        self.setMinimumSize(480, 270)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background: #202428; color: #d7dee5; font-weight: 600;")
@@ -115,12 +126,287 @@ class CameraView(QLabel):
         return QImage(packed, width, height, min_step, fmt).copy()
 
 
+class ExperimentHud(QWidget):
+    def __init__(self, model_filename, parent=None):
+        super().__init__(parent)
+        self._latest = {
+            "truth": [math.nan, math.nan, math.nan, math.nan],
+            "raw": [math.nan, math.nan, math.nan, math.nan],
+            "corrected": [math.nan, math.nan, math.nan, math.nan],
+        }
+        self._latest_stamp = {}
+        self._error_history = {
+            "raw_forward": deque(),
+            "corrected_forward": deque(),
+            "raw_down": deque(),
+            "corrected_down": deque(),
+        }
+        self._detection_history = deque()
+        self._latest_detection = {
+            "valid": False,
+            "disparity_px": math.nan,
+            "confidence_min": math.nan,
+        }
+        self._latest_scalars = {
+            "yolo_hz": math.nan,
+            "yolo_ms": math.nan,
+        }
+        self._profile_text = "--"
+        self._profile_not_configured = False
+
+        mission = os.environ.get("RQT_MISSION_LABEL", "Mission: --").strip() or "Mission: --"
+        contract = os.environ.get(
+            "RQT_COORD_CONTRACT",
+            "Frame: public FRD [Forward, Right, Down, Range]",
+        ).strip()
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(4)
+
+        self._model_label = QLabel(f"PyTorch model: {model_filename}")
+        self._mission_label = QLabel(mission)
+        self._profile_label = QLabel("Profile: --")
+        self._yolo_label = QLabel("YOLO: --")
+        self._truth_label = QLabel("Truth F/R/D/R: --")
+        self._raw_label = QLabel("Raw F/R/D/R: --")
+        self._corrected_label = QLabel("Corrected F/R/D/R: --")
+        self._forward_error_label = QLabel("Forward Δ raw/corr: --")
+        self._down_error_label = QLabel("Down Δ raw/corr: --")
+        self._detection_label = QLabel("Detections: --")
+        self._contract_label = QLabel(contract)
+
+        strong_labels = (
+            self._model_label,
+            self._mission_label,
+            self._forward_error_label,
+            self._down_error_label,
+            self._detection_label,
+        )
+        for label in strong_labels:
+            label.setStyleSheet("font-weight: 700; color: #101418;")
+        for label in (
+            self._profile_label,
+            self._yolo_label,
+            self._truth_label,
+            self._raw_label,
+            self._corrected_label,
+            self._contract_label,
+        ):
+            label.setStyleSheet("font-weight: 600; color: #263238;")
+        self._contract_label.setStyleSheet("font-weight: 600; color: #455a64;")
+
+        layout.addWidget(self._model_label, 0, 0)
+        layout.addWidget(self._mission_label, 0, 1)
+        layout.addWidget(self._profile_label, 0, 2)
+        layout.addWidget(self._yolo_label, 0, 3)
+        layout.addWidget(self._truth_label, 1, 0)
+        layout.addWidget(self._raw_label, 1, 1)
+        layout.addWidget(self._corrected_label, 1, 2)
+        layout.addWidget(self._detection_label, 1, 3)
+        layout.addWidget(self._forward_error_label, 2, 0, 1, 2)
+        layout.addWidget(self._down_error_label, 2, 2, 1, 2)
+        layout.addWidget(self._contract_label, 3, 0, 1, 4)
+        self.setStyleSheet(
+            "ExperimentHud { background: #eef3f6; border: 1px solid #b0bec5; }"
+            "QLabel { padding: 1px 2px; }"
+        )
+        self._refresh()
+
+    def update_sample(self, series_name, values):
+        now = time.monotonic()
+        frd = []
+        for index in range(4):
+            value = math.nan
+            if len(values) > index:
+                try:
+                    value = float(values[index])
+                except (TypeError, ValueError):
+                    value = math.nan
+            frd.append(value)
+        self._latest[series_name] = frd
+        self._latest_stamp[series_name] = now
+        if series_name in ("raw", "corrected"):
+            self._append_error_sample(series_name, axis_index=0, axis_name="forward", now=now)
+            self._append_error_sample(series_name, axis_index=2, axis_name="down", now=now)
+        self._prune(now)
+        self._refresh()
+
+    def update_scalar(self, key, value):
+        try:
+            self._latest_scalars[key] = float(value)
+            self._latest_stamp[key] = time.monotonic()
+        except (TypeError, ValueError):
+            self._latest_scalars[key] = math.nan
+        self._refresh()
+
+    def update_profile(self, payload):
+        text = str(payload)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = {}
+        if isinstance(parsed, dict) and parsed:
+            profile_id = str(parsed.get("profile_id") or "")
+            mode = str(parsed.get("profile_mode") or parsed.get("mode") or "")
+            fallback_reason = str(parsed.get("fallback_reason") or "")
+            residual = parsed.get("disparity_residual_status") or ""
+            selected = parsed.get("disparity_residual_feature_selected_label") or ""
+            self._profile_not_configured = (
+                not profile_id
+                and not mode
+                and fallback_reason == "no_profile"
+            )
+            if self._profile_not_configured:
+                text = "NOT CONFIGURED — no profile"
+            else:
+                pieces = [f"{profile_id or 'unknown'}/{mode or 'unknown'}"]
+                if fallback_reason:
+                    pieces.append(f"reason={fallback_reason}")
+                if selected:
+                    pieces.append(f"selector={selected}")
+                if residual:
+                    pieces.append(str(residual))
+                text = " ".join(pieces)
+        else:
+            self._profile_not_configured = False
+        self._profile_text = text[:120]
+        self._latest_stamp["profile"] = time.monotonic()
+        self._refresh()
+
+    def update_detections(self, values):
+        now = time.monotonic()
+        valid = False
+        disparity = math.nan
+        confidence_min = math.nan
+        try:
+            data = [float(value) for value in values]
+        except (TypeError, ValueError):
+            data = []
+        if len(data) >= 16:
+            left_valid = data[0] >= 0.5
+            right_valid = data[8] >= 0.5
+            left_conf = data[5]
+            right_conf = data[13]
+            left_cx = data[6]
+            right_cx = data[14]
+            disparity = left_cx - right_cx
+            confidence_min = min(left_conf, right_conf)
+            valid = (
+                left_valid
+                and right_valid
+                and math.isfinite(disparity)
+                and disparity > 0.5
+                and math.isfinite(confidence_min)
+            )
+        self._latest_detection = {
+            "valid": valid,
+            "disparity_px": disparity,
+            "confidence_min": confidence_min,
+        }
+        self._detection_history.append((now, bool(valid)))
+        self._latest_stamp["detections"] = now
+        self._prune(now)
+        self._refresh()
+
+    def _append_error_sample(self, series_name, axis_index, axis_name, now):
+        truth_stamp = self._latest_stamp.get("truth")
+        if truth_stamp is None or now - truth_stamp > 3.0:
+            return
+        truth = self._latest["truth"][axis_index]
+        estimate = self._latest[series_name][axis_index]
+        if not (math.isfinite(truth) and math.isfinite(estimate)):
+            return
+        key = f"{series_name}_{axis_name}"
+        self._error_history[key].append((now, estimate - truth))
+
+    def _prune(self, now):
+        cutoff = now - PLOT_WINDOW_S
+        for history in self._error_history.values():
+            while history and history[0][0] < cutoff:
+                history.popleft()
+        while self._detection_history and self._detection_history[0][0] < cutoff:
+            self._detection_history.popleft()
+
+    def _rmse(self, key):
+        values = [value for _stamp, value in self._error_history[key] if math.isfinite(value)]
+        if not values:
+            return math.nan
+        return math.sqrt(sum(value * value for value in values) / len(values))
+
+    def _latest_error(self, key):
+        history = self._error_history[key]
+        for _stamp, value in reversed(history):
+            if math.isfinite(value):
+                return value
+        return math.nan
+
+    def _valid_ratio(self):
+        if not self._detection_history:
+            return math.nan
+        return sum(1 for _stamp, valid in self._detection_history if valid) / len(self._detection_history)
+
+    def _format_float(self, value, precision=1, signed=False):
+        if value is None or not math.isfinite(float(value)):
+            return "--"
+        sign = "+" if signed else ""
+        return f"{float(value):{sign}.{precision}f}"
+
+    def _format_frd(self, values):
+        return "/".join(self._format_float(value, 1) for value in values[:4])
+
+    def _refresh(self):
+        self._profile_label.setText(f"Profile: {self._profile_text or '--'}")
+        yolo_hz = self._format_float(self._latest_scalars.get("yolo_hz", math.nan), 1)
+        yolo_ms = self._format_float(self._latest_scalars.get("yolo_ms", math.nan), 1)
+        self._yolo_label.setText(f"YOLO: {yolo_hz} Hz / {yolo_ms} ms")
+        self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth'])}")
+        self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw'])}")
+        corrected = self._latest["corrected"]
+        if self._profile_not_configured and not any(math.isfinite(value) for value in corrected):
+            self._corrected_label.setText("Corrected F/R/D/R: NOT CONFIGURED")
+        else:
+            self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(corrected)}")
+        raw_f = self._latest_error("raw_forward")
+        corr_f = self._latest_error("corrected_forward")
+        raw_f_rmse = self._rmse("raw_forward")
+        corr_f_rmse = self._rmse("corrected_forward")
+        self._forward_error_label.setText(
+            "Forward Δ(raw-truth/corr-truth): "
+            f"{self._format_float(raw_f, 2, signed=True)} / "
+            f"{self._format_float(corr_f, 2, signed=True)} m | "
+            f"RMSE{PLOT_WINDOW_S:.0f}s "
+            f"{self._format_float(raw_f_rmse, 2)} / {self._format_float(corr_f_rmse, 2)}"
+        )
+        raw_d = self._latest_error("raw_down")
+        corr_d = self._latest_error("corrected_down")
+        raw_d_rmse = self._rmse("raw_down")
+        corr_d_rmse = self._rmse("corrected_down")
+        self._down_error_label.setText(
+            "Down Δ(raw-truth/corr-truth): "
+            f"{self._format_float(raw_d, 2, signed=True)} / "
+            f"{self._format_float(corr_d, 2, signed=True)} m | "
+            f"RMSE{PLOT_WINDOW_S:.0f}s "
+            f"{self._format_float(raw_d_rmse, 2)} / {self._format_float(corr_d_rmse, 2)}"
+        )
+        ratio = self._valid_ratio()
+        ratio_text = "--" if not math.isfinite(ratio) else f"{ratio * 100.0:.0f}%"
+        disparity = self._format_float(self._latest_detection["disparity_px"], 1)
+        confidence = self._format_float(self._latest_detection["confidence_min"], 2)
+        validity = "valid" if self._latest_detection["valid"] else "invalid"
+        self._detection_label.setText(
+            f"Detections: {validity}, valid{PLOT_WINDOW_S:.0f}s={ratio_text}, "
+            f"disp={disparity}px, conf={confidence}"
+        )
+
+
 class FrdPlotStack(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(760, 900)
+        self.setMinimumSize(660, 720)
         self.samples = {
-            axis_name: {series_name: deque(maxlen=900) for series_name, _, _ in SERIES}
+            axis_name: {series_name: deque() for series_name, _, _ in SERIES}
             for axis_name, _ in AXES
         }
 
@@ -133,7 +419,11 @@ class FrdPlotStack(QWidget):
                     value = float(values[axis_index])
                 except (TypeError, ValueError):
                     value = math.nan
-            self.samples[axis_name][series_name].append((now, value))
+            history = self.samples[axis_name][series_name]
+            history.append((now, value))
+            cutoff = now - PLOT_WINDOW_S
+            while history and history[0][0] < cutoff:
+                history.popleft()
         self.update()
 
     def paintEvent(self, _event):
@@ -149,7 +439,7 @@ class FrdPlotStack(QWidget):
         pane_height = max(1, (self.height() - margin_top - margin_bottom - gap * 2) / 3)
 
         now = time.monotonic()
-        window_s = 30.0
+        window_s = PLOT_WINDOW_S
         for pane_index, (axis_name, _axis_index) in enumerate(AXES):
             top = int(margin_top + pane_index * (pane_height + gap))
             height = int(pane_height)
@@ -239,6 +529,10 @@ class OperatorPanel(Plugin):
         self._widget = QWidget()
         self._widget.setWindowTitle("Stereo Operator Panel")
         root = QVBoxLayout(self._widget)
+        model_path = os.environ.get("RQT_YOLO_MODEL_PATH", "").strip()
+        model_filename = os.path.basename(model_path) if model_path else "not configured"
+        self._hud = ExperimentHud(model_filename)
+        root.addWidget(self._hud)
         self._status = QLabel(
             "Image left: left camera over right camera. Graphs right: Forward, Right, Down. "
             "FRD contract data[0]=Forward, data[1]=Right, data[2]=Down."
@@ -260,8 +554,13 @@ class OperatorPanel(Plugin):
         root.addLayout(grid, 1)
 
         context.add_widget(self._widget)
+        QTimer.singleShot(250, self._maximize_rqt_window)
+        QTimer.singleShot(1500, self._maximize_rqt_window)
         self._bridge.image.connect(self._handle_image)
-        self._bridge.sample.connect(self._plot_stack.append)
+        self._bridge.sample.connect(self._handle_sample)
+        self._bridge.scalar.connect(self._hud.update_scalar)
+        self._bridge.detections.connect(self._hud.update_detections)
+        self._bridge.profile.connect(self._hud.update_profile)
         self._bridge.status.connect(self._status.setText)
         self._init_ros()
 
@@ -271,8 +570,23 @@ class OperatorPanel(Plugin):
         elif name == "right":
             self._right_view.set_image(payload)
 
+    def _handle_sample(self, series_name, values):
+        self._plot_stack.append(series_name, values)
+        self._hud.update_sample(series_name, values)
+
+    def _maximize_rqt_window(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+        for widget in app.topLevelWidgets():
+            title = str(widget.windowTitle() or "").lower()
+            class_name = str(widget.metaObject().className()).lower()
+            if "rqt" in title or "rqt" in class_name:
+                widget.showMaximized()
+                return
+
     def _init_ros(self):
-        if rclpy is None or Image is None or Float32MultiArray is None:
+        if rclpy is None or Image is None or Float32 is None or Float32MultiArray is None or String is None:
             self._status.setText("ROS imports unavailable; operator panel cannot subscribe.")
             return
         try:
@@ -298,6 +612,30 @@ class OperatorPanel(Plugin):
                     lambda msg, name=series_name: self._bridge.sample.emit(name, list(msg.data)),
                     10,
                 )
+            self._ros_node.create_subscription(
+                Float32,
+                "/stereo/yolo_update_hz",
+                lambda msg: self._bridge.scalar.emit("yolo_hz", msg.data),
+                10,
+            )
+            self._ros_node.create_subscription(
+                Float32,
+                "/stereo/yolo_inference_ms",
+                lambda msg: self._bridge.scalar.emit("yolo_ms", msg.data),
+                10,
+            )
+            self._ros_node.create_subscription(
+                Float32MultiArray,
+                "/stereo/detections",
+                lambda msg: self._bridge.detections.emit(list(msg.data)),
+                10,
+            )
+            self._ros_node.create_subscription(
+                String,
+                "/stereo/profile_status",
+                lambda msg: self._bridge.profile.emit(msg.data),
+                10,
+            )
             self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
             self._spin_thread.start()
         except Exception as exc:

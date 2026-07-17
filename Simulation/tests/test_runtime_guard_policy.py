@@ -304,6 +304,33 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         disparity = left_cx - right_cx
         self.assertGreater(disparity, 0.5)
 
+    def test_stereo_distance_node_applies_origin_z_offset_to_gazebo_truth_down(self) -> None:
+        node = StereoDistanceNode.__new__(StereoDistanceNode)
+        node.target_model_name = "x500_15m"
+        node.camera_height_m = 10.0
+        node.target_origin_z_offset_m = -1.021823
+        payload = {
+            "name": "x500_15m",
+            "position": {
+                "x": 0.25,
+                "y": 2000.0,
+                "z": 5.556999,
+            },
+        }
+
+        truth = StereoDistanceNode._ground_truth_from_gazebo_pose_payload(node, payload)
+
+        self.assertIsNotNone(truth)
+        assert truth is not None
+        self.assertAlmostEqual(truth["forward_m"], 2000.0, places=6)
+        self.assertAlmostEqual(truth["right_m"], 0.25, places=6)
+        self.assertAlmostEqual(truth["down_m"], 5.464824, places=6)
+        self.assertAlmostEqual(
+            truth["ground_truth_m"],
+            math.sqrt(2000.0**2 + 0.25**2 + 5.464824**2),
+            places=6,
+        )
+
     def test_stereo_distance_node_external_bbox_callback_publishes_public_frd(self) -> None:
         node = StereoDistanceNode.__new__(StereoDistanceNode)
         node.horizontal_fov_rad = 0.154997710698

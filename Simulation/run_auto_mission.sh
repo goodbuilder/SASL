@@ -4,6 +4,28 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
+resolve_executable() {
+  local candidate resolved
+  for candidate in "$@"; do
+    [[ -n "$candidate" ]] || continue
+    if [[ "$candidate" == */* ]]; then
+      if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      continue
+    fi
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+MISSION_PYTHON="${MISSION_PYTHON:-}"
+
 DRONE_MISSION_CONFIG="${DRONE_MISSION_CONFIG:-$ROOT_DIR/config/drone_mission.env}"
 SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
 
@@ -184,4 +206,15 @@ if [[ -f "$ROOT_DIR/install/setup.bash" ]]; then
 fi
 set -u
 
-exec python3 "$ROOT_DIR/scripts/px4_auto_mission.py" "${mission_args[@]}"
+MISSION_PYTHON="$(resolve_executable \
+  "$MISSION_PYTHON" \
+  "${PYTHON_EXECUTABLE:-}" \
+  "$ROOT_DIR/.venv/bin/python" \
+  python3 || true
+)"
+if [[ -z "$MISSION_PYTHON" ]]; then
+  echo "error: no usable Python interpreter found for px4_auto_mission.py" >&2
+  exit 2
+fi
+
+exec "$MISSION_PYTHON" "$ROOT_DIR/scripts/px4_auto_mission.py" "${mission_args[@]}"

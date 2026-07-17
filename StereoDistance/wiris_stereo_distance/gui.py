@@ -30,6 +30,7 @@ from wiris_stereo_distance.calibration import (
     CheckerboardConfig,
     StereoIntrinsicsResult,
     calibrate_camera_from_images,
+    calibrate_stereo_extrinsics_from_image_pairs,
     detect_checkerboard,
     opencv_available,
     load_intrinsics_json,
@@ -210,8 +211,10 @@ from wiris_stereo_distance.triangulation import (
     RayTriangulationResult,
     body_frd_vector_to_camera,
     camera_translation_right_in_left_camera,
+    invert_left_to_right_camera_transform,
     stereo_center_point_from_left_camera,
     triangulate_pixels_with_pixhawk_mount,
+    triangulate_pixels_with_relative_pose,
     world_ned_vector_to_body_frd,
 )
 from wiris_stereo_distance.uam_telemetry import (
@@ -330,8 +333,13 @@ RTSP_ENABLE_SETTLE_DELAY_MS = 4000
 RTSP_ENABLE_PORT_WAIT_INTERVAL_MS = 1000
 RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS = 12
 DETECTION_PAIR_MAX_AGE_S = 1.0
-RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 60
-RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 100
+CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.050
+CAMERA_RTCP_PAIR_MAX_DELTA_S = 0.050
+CAMERA_RTCP_MAX_PC_OFFSET_S = 0.100
+CAMERA_SYNC_HISTORY_MAX_AGE_S = 2.0
+CAMERA_SYNC_RECEIVE_PAIR_MAX_DELTA_S = 0.200
+RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
+RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
 WIRIS_FTP_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff")
 RECORDED_SAMPLE_TABLE_COLUMNS = (
@@ -347,7 +355,19 @@ RECORDED_SAMPLE_TABLE_COLUMNS = (
     ("relative_roll_deg", "상대 Roll(deg)"),
     ("relative_pitch_deg", "상대 Pitch(deg)"),
     ("relative_yaw_deg", "상대 Yaw(deg)"),
+    ("left_roll_deg", "L Roll(deg)"),
+    ("left_pitch_deg", "L Pitch(deg)"),
+    ("left_yaw_deg", "L Yaw(deg)"),
+    ("right_roll_deg", "R Roll(deg)"),
+    ("right_pitch_deg", "R Pitch(deg)"),
+    ("right_yaw_deg", "R Yaw(deg)"),
     ("rtk_fix_quality", "RTK 품질"),
+    ("left_gps_satellites_used", "L Sats"),
+    ("left_gps_eph_m", "L eph(m)"),
+    ("left_gps_epv_m", "L epv(m)"),
+    ("right_gps_satellites_used", "R Sats"),
+    ("right_gps_eph_m", "R eph(m)"),
+    ("right_gps_epv_m", "R epv(m)"),
     ("intrinsics_zoom_level", "줌"),
     ("intrinsics_path", "Intrinsics"),
     ("x_m", "Cam Right(m)"),
@@ -380,6 +400,9 @@ RECORDED_SAMPLE_TABLE_COLUMNS = (
     ("drone_timestamp_s", "Drone t(s)"),
     ("drone_utc_unix_s", "Drone UTC(s)"),
     ("drone_age_s", "Drone age(s)"),
+    ("camera_time_sync_status", "카메라 시간 상태"),
+    ("rtcp_pair_delta_s", "RTCP 좌우Δt(s)"),
+    ("rtcp_pc_offset_max_ms", "RTCP-PC 최대Δ(ms)"),
 )
 UAM_ANALYSIS_TABLE_COLUMNS = (
     ("row_index", "#"),
@@ -387,6 +410,8 @@ UAM_ANALYSIS_TABLE_COLUMNS = (
     ("truth_timestamp_s", "Truth t(s)"),
     ("truth_dt_s", "Δt(s)"),
     ("truth_time_basis", "Basis"),
+    ("measurement_time_basis", "측정 시간 기준"),
+    ("camera_time_sync_status", "카메라 시간 상태"),
     ("truth_source", "Truth source"),
     ("truth_source_type", "Truth type"),
     ("comparison_frame", "Frame"),
@@ -615,6 +640,8 @@ def infer_runtime_camera_timestamp_reference(metadata: dict) -> str:
     )
     if reference:
         return reference
+    if metadata.get("rtcp_timing_invalid_reason"):
+        return "rtcp-invalid"
     if metadata.get("rtcp_frame_ntp_unix_s") is not None:
         return "rtcp-ntp"
     if metadata.get("source_timestamp_s") is not None:
@@ -625,6 +652,8 @@ def infer_runtime_camera_timestamp_reference(metadata: dict) -> str:
 def format_runtime_camera_timestamp(metadata: dict) -> str:
     frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
     timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
+    if timestamp_reference == "rtcp-invalid":
+        return "RTCP invalid (SR-PC offset)"
     if frame_ntp_unix_s is not None:
         try:
             utc_text = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc).isoformat(timespec="microseconds")
@@ -633,7 +662,7 @@ def format_runtime_camera_timestamp(metadata: dict) -> str:
         if utc_text:
             if timestamp_reference == "gnss-utc":
                 return f"UTC {utc_text.replace('+00:00', 'Z')}"
-            return f"Camera RTC {utc_text.replace('+00:00', 'Z')}"
+            return f"RTCP NTP {utc_text.replace('+00:00', 'Z')}"
     source_timestamp_s = metadata.get("source_timestamp_s")
     if source_timestamp_s is not None:
         source_source = str(metadata.get("timestamp_source") or "source")
@@ -644,19 +673,32 @@ def format_runtime_camera_timestamp(metadata: dict) -> str:
 def format_runtime_camera_timestamp_compact(metadata: dict) -> str:
     frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
     timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
+    if timestamp_reference == "rtcp-invalid":
+        return "RTCP invalid"
     if frame_ntp_unix_s is not None:
         try:
             utc_dt = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc)
         except (TypeError, ValueError, OverflowError, OSError):
             utc_dt = None
         if utc_dt is not None:
-            prefix = "UTC" if timestamp_reference == "gnss-utc" else "RTC"
+            prefix = "UTC" if timestamp_reference == "gnss-utc" else "RTCP"
             return f"{prefix} {utc_dt.strftime('%H:%M:%S.%f')[:-3]}Z"
     source_timestamp_s = metadata.get("source_timestamp_s")
     if source_timestamp_s is not None:
         source_source = str(metadata.get("timestamp_source") or "source")
         return f"src {float(source_timestamp_s):.3f}s [{source_source}]"
     return "missing"
+
+
+def format_runtime_camera_ntp_compact(metadata: dict) -> str:
+    frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
+    if frame_ntp_unix_s is None:
+        return "--"
+    try:
+        utc_dt = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "invalid"
+    return f"{utc_dt.strftime('%H:%M:%S.%f')[:-3]}Z"
 
 
 @dataclass(frozen=True)
@@ -2742,6 +2784,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "left": {},
             "right": {},
         }
+        self.camera_frame_metadata_history: dict[str, deque[dict[str, object]]] = {
+            "left": deque(maxlen=240),
+            "right": deque(maxlen=240),
+        }
         self.selected_runtime_frame_metadata = {
             "left": {},
             "right": {},
@@ -2749,6 +2795,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.selected_runtime_frame_pair_delta_s: float | None = None
         self.selected_runtime_frame_pair_basis = ""
         self.selected_runtime_frame_pair_camera_rtc_delta_s: float | None = None
+        self._runtime_pair_uses_app_fallback = False
         self.camera_stream_stats = {
             "left": {},
             "right": {},
@@ -2952,10 +2999,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         parameter_tabs.setDocumentMode(True)
         parameter_tabs.addTab(intrinsic_parameters_tab, "내부")
         parameter_tabs.addTab(extrinsic_parameters_tab, "외부/기하")
+        parameter_tabs.addTab(stereo_tab, "계산 설정")
         camera_params_layout.addWidget(parameter_tabs, 1)
         self.parameter_tabs = parameter_tabs
         self.intrinsic_parameters_tab_index = parameter_tabs.indexOf(intrinsic_parameters_tab)
         self.extrinsic_parameters_tab_index = parameter_tabs.indexOf(extrinsic_parameters_tab)
+        self.stereo_settings_tab_index = parameter_tabs.indexOf(stereo_tab)
 
         alignment_tabs = QtWidgets.QTabWidget()
         alignment_tabs.setDocumentMode(True)
@@ -2988,12 +3037,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         measurement_tabs = QtWidgets.QTabWidget()
         measurement_tabs.setDocumentMode(True)
         measurement_tabs.addTab(runtime_tab, "실시간")
-        measurement_tabs.addTab(stereo_tab, "계산 설정")
         measurement_tabs.addTab(triangulation_quality_tab, "측정 품질")
         measurement_layout.addWidget(measurement_tabs, 1)
         self.measurement_tabs = measurement_tabs
         self.live_measurement_tab_index = measurement_tabs.indexOf(runtime_tab)
-        self.stereo_settings_tab_index = measurement_tabs.indexOf(stereo_tab)
         self.triangulation_quality_tab_index = measurement_tabs.indexOf(triangulation_quality_tab)
 
         save_tabs = QtWidgets.QTabWidget()
@@ -3142,8 +3189,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.yolo_gate_time_delta_spin.setValue(self.settings.yolo_gate_max_time_delta_s)
         self.yolo_gate_time_delta_spin.setSuffix(" s")
         self.yolo_gate_time_basis_combo = QtWidgets.QComboBox()
-        self.yolo_gate_time_basis_combo.addItem("Camera RTC 필수", "camera_rtc_required")
-        self.yolo_gate_time_basis_combo.addItem("Camera RTC 우선", "camera_rtcp")
+        self.yolo_gate_time_basis_combo.addItem("RTCP/NTP 필수", "camera_rtc_required")
+        self.yolo_gate_time_basis_combo.addItem("RTCP/NTP 우선", "camera_rtcp")
         self.yolo_gate_time_basis_combo.addItem("app 수신 시간", "detection")
         time_basis_index = self.yolo_gate_time_basis_combo.findData(self.settings.yolo_gate_time_basis)
         self.yolo_gate_time_basis_combo.setCurrentIndex(max(0, time_basis_index))
@@ -4009,23 +4056,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_mode_combo.setAccessibleName("외부 파라미터 계산 방식")
         self.distance_mode_combo.setToolTip(
             "3D ray 거리 계산에 사용할 외부 파라미터 출처를 고릅니다.\n"
-            "Pixhawk 자세와 GPS/RTK baseline translation을 사용합니다."
+            "Pixhawk 자세 + GPS/RTK baseline 또는 체커보드 stereo R/T를 사용합니다."
         )
         self.distance_mode_combo.addItem("Pixhawk 자세 + GPS/RTK baseline", "pixhawk")
-        initial_distance_mode = "pixhawk"
+        self.distance_mode_combo.addItem("체커보드 Stereo 외부 파라미터", "checkerboard")
+        initial_distance_mode = str(self.settings.triangulation_extrinsics_source or "pixhawk")
+        if initial_distance_mode == "calibration":
+            initial_distance_mode = "checkerboard"
+        if initial_distance_mode not in {"pixhawk", "checkerboard"}:
+            initial_distance_mode = "pixhawk"
         self.distance_mode_combo.setCurrentIndex(self.distance_mode_combo.findData(initial_distance_mode))
         self._distance_mode_last_source = initial_distance_mode
         self.distance_mode_combo.currentIndexChanged.connect(self._handle_distance_mode_changed)
-        self.measurement_display_combo = QtWidgets.QComboBox()
-        self.measurement_display_combo.setObjectName("measurementDisplayCombo")
-        self.measurement_display_combo.setAccessibleName("측정탭 영상 표시 방식")
-        self.measurement_display_combo.setToolTip(
-            "측정탭 좌/우 영상은 거리 계산에 실제로 선택된 검출 프레임 쌍을 표시합니다."
-        )
-        self.measurement_display_combo.addItem("계산/동기화 프레임", "detection")
-        initial_display_mode = "detection"
-        self.measurement_display_combo.setCurrentIndex(self.measurement_display_combo.findData(initial_display_mode))
-        self.measurement_display_combo.currentIndexChanged.connect(self._handle_measurement_display_mode_changed)
         self.distance_parameters_label = QtWidgets.QLabel("계산 파라미터: 대기 중")
         self.distance_parameters_label.setObjectName("statusStrip")
         self.distance_parameters_label.setWordWrap(True)
@@ -4089,17 +4131,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         stereo_parameter_splitter.setStretchFactor(1, 1)
         stereo_parameter_splitter.setSizes([1, 1])
 
-        display_group = QtWidgets.QGroupBox("영상 표시")
-        display_form = QtWidgets.QGridLayout(display_group)
-        display_form.setHorizontalSpacing(8)
-        display_form.setColumnStretch(1, 1)
-        display_form.addWidget(QtWidgets.QLabel("측정 영상"), 0, 0)
-        display_form.addWidget(self.measurement_display_combo, 0, 1)
-
         stereo_form.addWidget(self.current_parameters_group, 0, 0, 1, 6)
         stereo_form.addWidget(stereo_parameter_splitter, 1, 0, 1, 6)
-        stereo_form.addWidget(display_group, 2, 0, 1, 6)
-        stereo_form.addWidget(self.distance_label, 3, 0, 1, 6)
+        stereo_form.addWidget(self.distance_label, 2, 0, 1, 6)
         stereo_layout.addWidget(stereo)
         stereo_layout.addStretch(1)
 
@@ -4277,8 +4311,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.wiris_command_terminator_combo.addItem("NULL", NUL_TERMINATOR)
         self.wiris_command_send_button = QtWidgets.QPushButton("명령 전송")
         self.wiris_command_send_button.clicked.connect(self.send_selected_wiris_command)
-        self.wiris_set_pc_time_button = QtWidgets.QPushButton("PC UTC로 시간 설정")
-        self.wiris_set_pc_time_button.clicked.connect(self.set_selected_wiris_time_from_pc)
         self.wiris_command_status_label = QtWidgets.QLabel("명령을 선택하면 아래 입력칸에 삽입됩니다.")
         self.wiris_command_status_label.setObjectName("statusStrip")
         self.wiris_command_status_label.setWordWrap(True)
@@ -4294,7 +4326,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         command_form.addWidget(QtWidgets.QLabel("종료 문자"), 3, 0)
         command_form.addWidget(self.wiris_command_terminator_combo, 3, 1)
         command_form.addWidget(self.wiris_command_send_button, 3, 2)
-        command_form.addWidget(self.wiris_set_pc_time_button, 3, 3)
         command_form.addWidget(self.wiris_command_status_label, 4, 0, 1, 4)
         wiris_command_layout.addWidget(command_group)
         wiris_command_layout.addWidget(self.wiris_command_log, 1)
@@ -4494,7 +4525,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         runtime_controls.addWidget(self.clear_history_button, 0, 2)
         for column in range(3):
             runtime_controls.setColumnStretch(column, 1)
-        self.runtime_camera_settings_group = QtWidgets.QGroupBox("카메라 설정 / 상태")
+        self.runtime_camera_settings_group = QtWidgets.QGroupBox("실시간 카메라 / NTP / Pair 상태")
         self.runtime_camera_settings_group.setObjectName("runtimeCameraSettingsGroup")
         runtime_camera_settings_layout = QtWidgets.QVBoxLayout(self.runtime_camera_settings_group)
         runtime_camera_settings_layout.setSpacing(4)
@@ -4502,21 +4533,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.runtime_header_layout.setContentsMargins(0, 0, 0, 0)
         self.runtime_header_layout.setSpacing(8)
         self.runtime_header_layout.addLayout(runtime_controls, 2)
-        self.runtime_stream_settings_label = QtWidgets.QLabel(self._format_runtime_stream_settings())
-        self.runtime_stream_settings_label.setObjectName("statChip")
-        self.runtime_stream_settings_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.runtime_stream_settings_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.runtime_stream_settings_label.setWordWrap(True)
-        for widget in (self.rtsp_transport_combo, self.stream_backend_combo, self.decoder_combo):
-            widget.currentIndexChanged.connect(self._update_runtime_stream_settings_label)
-        self.rtsp_latency_spin.valueChanged.connect(self._update_runtime_stream_settings_label)
-        self.runtime_header_layout.addWidget(self.runtime_stream_settings_label, 3)
-        self.runtime_camera_status_group = QtWidgets.QGroupBox("카메라 상태")
+        self.runtime_camera_status_group = QtWidgets.QGroupBox()
         self.runtime_camera_status_group.setObjectName("runtimeCameraStatusGroup")
         self.runtime_camera_status_group.setFixedHeight(RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX)
-        self.left_runtime_stats_label = QtWidgets.QLabel("왼쪽: -- | -- | 대기 중 | 시각: missing")
-        self.right_runtime_stats_label = QtWidgets.QLabel("오른쪽: -- | -- | 대기 중 | 시각: missing")
-        for column, stats_label in enumerate((self.left_runtime_stats_label, self.right_runtime_stats_label)):
+        self.left_runtime_stats_label = QtWidgets.QLabel(
+            "왼쪽: -- | -- | 대기 중 | live: missing", self
+        )
+        self.right_runtime_stats_label = QtWidgets.QLabel(
+            "오른쪽: -- | -- | 대기 중 | live: missing", self
+        )
+        self.runtime_pair_status_label = QtWidgets.QLabel("Pair: 대기 | pair: missing", self)
+        for stats_label in (self.left_runtime_stats_label, self.right_runtime_stats_label, self.runtime_pair_status_label):
             stats_label.setMinimumWidth(320)
             stats_label.setFixedHeight(RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX)
             stats_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
@@ -4524,17 +4551,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             stats_label.setObjectName("statChip")
             stats_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             stats_label.setWordWrap(True)
-        self.runtime_camera_status_layout = QtWidgets.QGridLayout(self.runtime_camera_status_group)
-        self.runtime_camera_status_layout.setContentsMargins(8, 8, 8, 8)
-        self.runtime_camera_status_layout.setHorizontalSpacing(6)
-        self.runtime_camera_status_layout.setVerticalSpacing(6)
-        for column, stats_label in enumerate((self.left_runtime_stats_label, self.right_runtime_stats_label)):
-            self.runtime_camera_status_layout.addWidget(stats_label, 0, column)
-        self.runtime_camera_status_layout.setColumnStretch(0, 1)
-        self.runtime_camera_status_layout.setColumnStretch(1, 1)
+            stats_label.hide()
+        self.runtime_camera_summary_label = QtWidgets.QLabel("카메라: 좌 NTP -- | 우 NTP -- | Pair 대기")
+        self.runtime_camera_summary_label.setObjectName("runtimeCameraSummary")
+        self.runtime_camera_summary_label.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        self.runtime_camera_summary_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.runtime_camera_summary_label.setWordWrap(False)
+        self.runtime_camera_summary_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed
+        )
+        self.runtime_camera_summary_label.setFixedHeight(RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX)
+        self.runtime_camera_summary_label.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self.runtime_camera_status_layout = QtWidgets.QHBoxLayout(self.runtime_camera_status_group)
+        self.runtime_camera_status_layout.setContentsMargins(8, 2, 8, 6)
+        self.runtime_camera_status_layout.addWidget(self.runtime_camera_summary_label)
         self.runtime_camera_status_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         runtime_camera_settings_layout.addLayout(self.runtime_header_layout)
-        runtime_camera_settings_layout.addWidget(self.runtime_camera_status_group)
+        self.runtime_header_layout.addWidget(self.runtime_camera_status_group, 3)
         self._configure_collapsible_group(self.runtime_camera_settings_group, checked=True)
         runtime_layout.addWidget(self.runtime_camera_settings_group)
         runtime_layout.addLayout(video_row, 10)
@@ -4666,6 +4699,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self.uam_analysis_status_label.setObjectName("statusStrip")
         self.uam_analysis_status_label.setWordWrap(True)
+        self.uam_time_sync_status_label = QtWidgets.QLabel("UAM 시간 기준: RTCP/NTP 미검증")
+        self.uam_time_sync_status_label.setObjectName("statusStrip")
+        self.uam_time_sync_status_label.setWordWrap(True)
         uam_path_actions = QtWidgets.QHBoxLayout()
         uam_path_actions.addWidget(self.uam_ulog_path_edit, 1)
         uam_path_actions.addWidget(self.uam_ulog_browse_button)
@@ -4689,7 +4725,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         uam_analysis_form.addWidget(QtWidgets.QLabel("좌표 보정"), 3, 0)
         uam_analysis_form.addLayout(uam_alignment_actions, 3, 1, 1, 6)
         uam_analysis_form.addWidget(self.uam_alignment_status_label, 4, 0, 1, 7)
-        uam_analysis_form.addWidget(self.uam_analysis_status_label, 5, 0, 1, 7)
+        uam_analysis_form.addWidget(self.uam_time_sync_status_label, 5, 0, 1, 7)
+        uam_analysis_form.addWidget(self.uam_analysis_status_label, 6, 0, 1, 7)
         uam_analysis_layout.addLayout(uam_analysis_form)
         uam_analysis_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         uam_analysis_left = QtWidgets.QWidget()
@@ -5086,7 +5123,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return "detection"
 
     def _yolo_match_timestamp_s(self, observation: DetectionObservation) -> float | None:
-        return detection_timestamp_for_basis(observation, self._yolo_time_basis())
+        return detection_timestamp_for_basis(observation, self._effective_yolo_time_basis())
+
+    def _effective_yolo_time_basis(self) -> str:
+        if self._yolo_time_basis() == "camera_rtcp" and self._runtime_pair_uses_app_fallback:
+            return "detection"
+        return self._yolo_time_basis()
 
     def _camera_rtc_timestamp_s_from_metadata(self, metadata: dict) -> float | None:
         value = metadata.get("rtcp_frame_ntp_unix_s")
@@ -5101,6 +5143,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return parsed
 
     def _selected_pair_sync_summary(self, left: DetectionObservation, right: DetectionObservation) -> tuple[str, float | None]:
+        if self._runtime_pair_uses_app_fallback:
+            return "app fallback", None
         left_rtc_s = self._camera_rtc_timestamp_s_from_metadata(left.timestamp_metadata)
         right_rtc_s = self._camera_rtc_timestamp_s_from_metadata(right.timestamp_metadata)
         camera_rtc_delta_s = None
@@ -5108,9 +5152,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             camera_rtc_delta_s = abs(left_rtc_s - right_rtc_s)
         time_basis = self._yolo_time_basis()
         if time_basis == "camera_rtc_required":
-            basis = "Camera RTC required" if camera_rtc_delta_s is not None else "Camera RTC missing"
+            basis = "RTCP/NTP required" if camera_rtc_delta_s is not None else "RTCP/NTP missing"
         elif time_basis == "camera_rtcp":
-            basis = "Camera RTC preferred" if camera_rtc_delta_s is not None else "app fallback"
+            basis = "RTCP/NTP preferred" if camera_rtc_delta_s is not None else "app fallback"
         else:
             basis = "app"
         return basis, camera_rtc_delta_s
@@ -5271,25 +5315,32 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.left_reboot_pixhawk_button: "활성 MAVLink 연결로 Pixhawk 1에 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN을 보냅니다.",
             self.right_reboot_pixhawk_button: "활성 MAVLink 연결로 Pixhawk 2에 MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN을 보냅니다.",
             self.camera_connection_label: "좌/우 카메라 Preview 연결 상태와 측정된 프레임 속도를 표시합니다.",
-            self.runtime_camera_settings_group: "실시간 카메라 화면 위의 실행 버튼, 스트림 설정, 프레임 상태 표시를 접거나 펼칩니다.",
-            self.runtime_stream_settings_label: "현재 RTSP 전송 방식(TCP/UDP), 수신 백엔드, 디코더, RTP 지연을 표시합니다.",
-            self.runtime_camera_status_group: "해상도/Hz, YOLO Hz, 시각을 한 줄씩 보여주는 상태 그룹입니다.",
+            self.runtime_camera_settings_group: "실시간 카메라 화면 위의 실행 버튼, 카메라별 live 상태, 좌우 pair 상태를 접거나 펼칩니다.",
+            self.runtime_camera_status_group: "좌측/우측 카메라 상태와 좌우 계산 pair 상태를 한 줄로 요약해 보여주는 상태 그룹입니다.",
+            self.runtime_camera_summary_label: "좌측/우측 카메라의 현재 수신 상태와 각 카메라의 RTCP Sender Report 기반 NTP 시각, 계산에 선택된 좌우 pair 동기화 상태입니다. 상세 시각은 상태 툴팁에서 확인할 수 있습니다.",
             self.left_runtime_stats_label: (
-                "측정 탭 왼쪽 카메라의 최신 해상도/Hz, YOLO Hz, 시각입니다.\n"
+                "측정 탭 왼쪽 카메라의 최신 해상도/Hz, YOLO Hz, live 시각입니다.\n"
                 "수신 Hz: 스트림 reader가 디코딩한 프레임 속도입니다. 측정 모드에서도 YOLO 추론 완료 속도와 분리됩니다.\n"
                 "YOLO Hz: 실제 YOLO 추론이 완료된 속도입니다. -- 는 아직 통계가 없고, 0.0 Hz 는 통계는 있으나 최근 추론 완료가 없다는 뜻입니다.\n"
                 "CUDA/CPU: 설정값이 아니라 YOLO worker가 마지막 추론에 실제 사용한 장치입니다. CPU fallback은 CUDA 추론 실패 후 CPU로 전환된 상태입니다.\n"
                 "실시간/지연: 최근 스트림 통계나 프레임이 2초 안에 갱신됐는지 표시합니다.\n"
-                "시각: GNSS로 UTC에 동기된 경우 UTC를 표시하고, 그 외에는 RTCP Sender Report로 환산한 camera RTC 시각을 표시합니다. 없으면 source timestamp를, 그것도 없으면 missing을 표시합니다."
+                "GNSS-UTC: timestamp basis가 명시적으로 GNSS-UTC일 때만 UTC로 표시합니다.\n"
+                "source timestamp: RTCP/NTP가 없을 때만 표시하는 디코더/소스 시각입니다.\n"
+                "missing: RTCP/NTP와 source timestamp 모두 없는 상태입니다.\n"
+                "live: 최신 수신 프레임의 RTCP Sender Report 기반 RTCP/NTP 시각입니다. WIRIS GDTI와의 UTC 일치는 미검증입니다."
             ),
             self.right_runtime_stats_label: (
-                "측정 탭 오른쪽 카메라의 최신 해상도/Hz, YOLO Hz, 시각입니다.\n"
+                "측정 탭 오른쪽 카메라의 최신 해상도/Hz, YOLO Hz, live 시각입니다.\n"
                 "수신 Hz: 스트림 reader가 디코딩한 프레임 속도입니다. 측정 모드에서도 YOLO 추론 완료 속도와 분리됩니다.\n"
                 "YOLO Hz: 실제 YOLO 추론이 완료된 속도입니다. -- 는 아직 통계가 없고, 0.0 Hz 는 통계는 있으나 최근 추론 완료가 없다는 뜻입니다.\n"
                 "CUDA/CPU: 설정값이 아니라 YOLO worker가 마지막 추론에 실제 사용한 장치입니다. CPU fallback은 CUDA 추론 실패 후 CPU로 전환된 상태입니다.\n"
                 "실시간/지연: 최근 스트림 통계나 프레임이 2초 안에 갱신됐는지 표시합니다.\n"
-                "시각: GNSS로 UTC에 동기된 경우 UTC를 표시하고, 그 외에는 RTCP Sender Report로 환산한 camera RTC 시각을 표시합니다. 없으면 source timestamp를, 그것도 없으면 missing을 표시합니다."
+                "GNSS-UTC: timestamp basis가 명시적으로 GNSS-UTC일 때만 UTC로 표시합니다.\n"
+                "source timestamp: RTCP/NTP가 없을 때만 표시하는 디코더/소스 시각입니다.\n"
+                "missing: RTCP/NTP와 source timestamp 모두 없는 상태입니다.\n"
+                "live: 최신 수신 프레임의 RTCP Sender Report 기반 RTCP/NTP 시각입니다. WIRIS GDTI와의 UTC 일치는 미검증입니다."
             ),
+            self.runtime_pair_status_label: "좌우 계산/동기화 frame pair의 time basis, pair 시각, 좌우 delta를 표시합니다.",
             self.pixhawk_connection_label: "Pixhawk 자세 구독 상태와 메시지 수신 속도를 표시합니다.",
             self.domain_spin: "PX4/ROS2 uORB 토픽 탐색에 사용할 ROS_DOMAIN_ID입니다.",
             self.left_namespace_edit: "Pixhawk 1의 ROS2 namespace입니다. 왼쪽 카메라와 매핑됩니다.",
@@ -5328,7 +5379,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.left_zoom_host_edit: "왼쪽 WIRIS의 OSD IP Address입니다. Telnet/SDK 명령과 RTSP URL host의 기준값입니다.",
             self.right_zoom_host_edit: "오른쪽 WIRIS의 OSD IP Address입니다. Telnet/SDK 명령과 RTSP URL host의 기준값입니다.",
             self.zoom_port_spin: "Telnet port 탐색을 시작할 때 먼저 확인하는 스캔 기본 포트입니다. 좌/우 실제 명령은 각 WIRIS의 Telnet port를 사용합니다.",
-            self.zoom_timeout_spin: "WIRIS 줌 명령 TCP 요청 timeout입니다.",
+            self.zoom_timeout_spin: "WIRIS SDK/줌 명령 TCP 요청 timeout입니다. 왼쪽 카메라 SDK 응답 지연을 포함해야 합니다.",
             self.zoom_target_combo: "줌 명령을 보낼 카메라 대상을 선택합니다.",
             self.zoom_in_button: "기본 Zoom In 명령(SZIN)을 보냅니다.",
             self.zoom_out_button: "기본 Zoom Out 명령(SZOT)을 보냅니다.",
@@ -5340,9 +5391,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.wiris_command_edit: "전송할 SDK 명령 텍스트입니다. <IPv4> 같은 placeholder는 전송 전에 바꾸세요.",
             self.wiris_command_terminator_combo: "명령 구분자입니다. 소프트웨어에서는 NULL을, telnet 방식에서는 LINE을 주로 사용합니다.",
             self.wiris_command_send_button: "편집한 SDK 명령을 선택한 WIRIS 대상으로 전송합니다.",
+            self.clock_wiris_time_target_combo: "PC UTC를 설정할 WIRIS RTC 대상을 선택합니다.",
             self.wiris_set_pc_time_button: (
                 "선택한 WIRIS 대상의 RTC를 PC 현재 UTC로 설정합니다. "
                 "양쪽 전송에서는 같은 STUS UTC 값을 만들고 명령 UTC/TCP 호출 시작 차이를 로그에 남깁니다."
+            ),
+            self.clock_sync_check_button: (
+                "최근 스트림 frame의 RTCP/NTP 기반 시각을 PC UTC와 비교합니다. "
+                "프레임 수신 age를 보정해 해당 프레임 시점의 PC UTC offset을 계산하며, WIRIS GDTI와의 일치는 별도 검증 대상입니다."
             ),
             self.wiris_command_log: "카메라 SDK 명령 응답 로그입니다.",
             self.calib_cols_spin: "체커보드 내부 코너의 열 개수입니다.",
@@ -5360,8 +5416,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.zoom_intrinsics_compare_list: "저장된 내부 파라미터 파일들을 스크롤로 비교합니다. 항목은 드래그해서 순서를 바꿀 수 있습니다.",
             self.intrinsics_source_combo: "거리 계산에 사용할 내부 파라미터 출처입니다. 체커보드 보정값 또는 수동 초점거리 fallback 중 하나만 선택합니다.",
             self.intrinsics_status_label: "현재 내부 파라미터 적용 상태와 초점거리 출처를 표시합니다.",
-            self.distance_mode_combo: "3D ray 거리 계산은 Pixhawk 자세와 GPS/RTK baseline translation을 사용합니다.",
-            self.measurement_display_combo: "측정탭 좌/우 영상에 거리 계산에 실제로 선택된 검출 프레임 쌍을 표시합니다.",
+            self.distance_mode_combo: "3D ray 거리 계산은 Pixhawk 자세 + GPS/RTK baseline 또는 체커보드 stereo R/T를 사용합니다.",
             self.distance_parameters_label: "현재 거리 계산에 쓰이는 초점거리, baseline/translation, 위치/자세 출처를 요약합니다.",
             self.calibration_left_preview: "체커보드 검출 overlay가 표시되는 왼쪽 보정 미리보기입니다.",
             self.calibration_right_preview: "체커보드 검출 overlay가 표시되는 오른쪽 보정 미리보기입니다.",
@@ -8045,6 +8100,42 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         workflow_form.addWidget(self.clock_icpt_button, 2, 4)
         workflow_form.addWidget(self.clock_download_latest_button, 2, 5)
 
+        rtc_group = QtWidgets.QGroupBox("WIRIS RTC / 스트림 동기화")
+        rtc_layout = QtWidgets.QGridLayout(rtc_group)
+        rtc_layout.setHorizontalSpacing(8)
+        rtc_layout.setVerticalSpacing(6)
+        rtc_layout.setColumnStretch(1, 1)
+        rtc_layout.setColumnStretch(3, 1)
+        self.clock_wiris_time_target_combo = QtWidgets.QComboBox()
+        self.clock_wiris_time_target_combo.addItem("양쪽 카메라", "both")
+        self.clock_wiris_time_target_combo.addItem("왼쪽 카메라", "left")
+        self.clock_wiris_time_target_combo.addItem("오른쪽 카메라", "right")
+        self.wiris_set_pc_time_button = QtWidgets.QPushButton("PC UTC로 시간 설정")
+        self.wiris_set_pc_time_button.clicked.connect(
+            lambda _checked=False: self.set_selected_wiris_time_from_pc(
+                str(self.clock_wiris_time_target_combo.currentData() or "both")
+            )
+        )
+        self.clock_sync_check_button = QtWidgets.QPushButton("RTCP/NTP 동기화 확인")
+        self.clock_sync_check_button.clicked.connect(self.refresh_clock_sync_status)
+        self.clock_sync_status_label = QtWidgets.QLabel("RTCP/NTP frame timestamp 대기 중")
+        self.clock_sync_status_label.setObjectName("statusStrip")
+        self.clock_sync_status_label.setWordWrap(True)
+        self.clock_sync_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.clock_sync_summary_text = QtWidgets.QPlainTextEdit()
+        self.clock_sync_summary_text.setReadOnly(True)
+        self.clock_sync_summary_text.setMaximumBlockCount(80)
+        self.clock_sync_summary_text.setFixedHeight(104)
+        self.clock_sync_summary_text.setPlaceholderText(
+            "YOLO/preview stream에서 RTCP Sender Report timestamp가 들어오면 좌/우 RTC offset이 표시됩니다."
+        )
+        rtc_layout.addWidget(QtWidgets.QLabel("시간 설정 대상"), 0, 0)
+        rtc_layout.addWidget(self.clock_wiris_time_target_combo, 0, 1)
+        rtc_layout.addWidget(self.wiris_set_pc_time_button, 0, 2)
+        rtc_layout.addWidget(self.clock_sync_check_button, 0, 3)
+        rtc_layout.addWidget(self.clock_sync_status_label, 1, 0, 1, 4)
+        rtc_layout.addWidget(self.clock_sync_summary_text, 2, 0, 1, 4)
+
         source_group = QtWidgets.QGroupBox("EXIF 시계 차이")
         source_form = QtWidgets.QGridLayout(source_group)
         source_form.setColumnStretch(1, 1)
@@ -8102,6 +8193,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.clock_summary_text.setReadOnly(True)
         self.clock_summary_text.setMaximumBlockCount(300)
         self.clock_summary_text.setPlaceholderText("분석 결과가 여기에 표시됩니다.")
+        layout.addWidget(rtc_group)
         layout.addWidget(workflow_group)
         layout.addWidget(source_group)
         layout.addWidget(self.clock_result_table, 2)
@@ -8251,6 +8343,279 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if any(token in text for token in ("FALSE", "IDLE", "DONE", "READY", " 0", "=0")) or text == "0":
             return False
         return any(token in text for token in ("TRUE", "BUSY", "CAPT", " 1", "=1")) or text == "1"
+
+    def _clock_sync_side_summary(self, camera: str, metadata: dict[str, object], now_wall_s: float, now_mono_s: float) -> tuple[str, float | None]:
+        if metadata.get("rtcp_timing_invalid_reason"):
+            return f"{self._camera_name_ko(camera)}: RTCP/NTP 무효(SR-PC offset 초과)", None
+        camera_rtc_s = self._camera_rtc_timestamp_s_from_metadata(metadata)
+        receive_mono_s = metadata.get("timestamp_s")
+        if camera_rtc_s is None:
+            return f"{self._camera_name_ko(camera)}: RTCP/NTP 없음", None
+        try:
+            frame_age_s = max(0.0, now_mono_s - float(receive_mono_s)) if receive_mono_s is not None else 0.0
+        except (TypeError, ValueError):
+            frame_age_s = 0.0
+        frame_receive_delay_s = metadata.get("rtcp_frame_receive_delay_s")
+        try:
+            if frame_receive_delay_s is not None and isfinite(float(frame_receive_delay_s)):
+                return (
+                    f"{self._camera_name_ko(camera)}: transit_delay={float(frame_receive_delay_s) * 1000.0:+.1f} ms, "
+                    f"frame_age={frame_age_s:.2f} s, basis={infer_runtime_camera_timestamp_reference(metadata)}",
+                    float(frame_receive_delay_s) * 1000.0,
+                )
+        except (TypeError, ValueError):
+            pass
+        pc_utc_at_frame_s = now_wall_s - frame_age_s
+        offset_ms = (float(camera_rtc_s) - pc_utc_at_frame_s) * 1000.0
+        reference = infer_runtime_camera_timestamp_reference(metadata)
+        return (
+            f"{self._camera_name_ko(camera)}: offset={offset_ms:+.1f} ms, "
+            f"frame_age={frame_age_s:.2f} s, basis={reference}",
+            offset_ms,
+        )
+
+    def _clock_sync_pair_metadata(self, now_mono_s: float | None = None) -> tuple[dict[str, object], dict[str, object]]:
+        """Select a temporally corresponding recent RTCP frame pair.
+
+        The latest left and latest right frames are not a pair when the
+        cameras decode at different rates. Prefer frames received close
+        together, then minimize their RTCP-derived timestamp delta.
+        """
+        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
+        latest = (
+            dict(self.camera_frame_metadata.get("left") or {}),
+            dict(self.camera_frame_metadata.get("right") or {}),
+        )
+
+        def usable(metadata: dict[str, object]) -> bool:
+            return self._camera_rtc_timestamp_s_from_metadata(metadata) is not None
+
+        def recent(history: deque[dict[str, object]]) -> list[dict[str, object]]:
+            rows: list[dict[str, object]] = []
+            for metadata in history:
+                if not usable(metadata):
+                    continue
+                timestamp_s = metadata.get("timestamp_s")
+                if timestamp_s is None:
+                    rows.append(dict(metadata))
+                    continue
+                try:
+                    age_s = now_mono_s - float(timestamp_s)
+                except (TypeError, ValueError):
+                    continue
+                if -0.1 <= age_s <= CAMERA_SYNC_HISTORY_MAX_AGE_S:
+                    rows.append(dict(metadata))
+            return rows
+
+        left_rows = recent(self.camera_frame_metadata_history["left"])
+        right_rows = recent(self.camera_frame_metadata_history["right"])
+        if not left_rows or not right_rows:
+            return latest
+
+        candidates: list[tuple[float, float, dict[str, object], dict[str, object]]] = []
+        for left in left_rows:
+            left_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(left)
+            left_receive_s = left.get("timestamp_s")
+            for right in right_rows:
+                right_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(right)
+                if left_rtcp_s is None or right_rtcp_s is None:
+                    continue
+                receive_delta_s = float("inf")
+                if left_receive_s is not None and right.get("timestamp_s") is not None:
+                    try:
+                        receive_delta_s = abs(float(right["timestamp_s"]) - float(left_receive_s))
+                    except (TypeError, ValueError):
+                        pass
+                candidates.append(
+                    (
+                        abs(float(right_rtcp_s) - float(left_rtcp_s)),
+                        receive_delta_s,
+                        left,
+                        right,
+                    )
+                )
+        if not candidates:
+            return latest
+        close_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[1] <= CAMERA_SYNC_RECEIVE_PAIR_MAX_DELTA_S
+        ]
+        search_space = close_candidates or candidates
+        _rtcp_delta, _receive_delta, left, right = min(
+            search_space,
+            key=lambda candidate: (candidate[0], candidate[1]),
+        )
+        return left, right
+
+    def _camera_time_sync_metrics(
+        self,
+        left_metadata: dict[str, object] | None = None,
+        right_metadata: dict[str, object] | None = None,
+        *,
+        left_receive_mono_s: float | None = None,
+        right_receive_mono_s: float | None = None,
+        now_wall_s: float | None = None,
+        now_mono_s: float | None = None,
+    ) -> dict[str, object]:
+        """Summarize RTCP/NTP timing without treating it as verified UTC."""
+        now_wall_s = time.time() if now_wall_s is None else float(now_wall_s)
+        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
+        left_metadata = left_metadata or {}
+        right_metadata = right_metadata or {}
+        left_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(left_metadata)
+        right_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(right_metadata)
+        invalid_cameras = [
+            self._camera_name_ko(camera)
+            for camera, metadata in (("left", left_metadata), ("right", right_metadata))
+            if metadata.get("rtcp_timing_invalid_reason")
+        ]
+        offsets_ms: dict[str, float] = {}
+        transit_delays_ms: dict[str, float] = {}
+        for camera, metadata, explicit_receive_s, rtcp_s in (
+            ("left", left_metadata, left_receive_mono_s, left_rtcp_s),
+            ("right", right_metadata, right_receive_mono_s, right_rtcp_s),
+        ):
+            if rtcp_s is None or metadata.get("rtcp_timing_invalid_reason"):
+                continue
+            frame_receive_delay_s = metadata.get("rtcp_frame_receive_delay_s")
+            try:
+                if frame_receive_delay_s is not None and isfinite(float(frame_receive_delay_s)):
+                    transit_delays_ms[camera] = float(frame_receive_delay_s) * 1000.0
+                    continue
+            except (TypeError, ValueError):
+                pass
+            receive_s = explicit_receive_s
+            if receive_s is None:
+                receive_s = metadata.get("timestamp_s")
+            try:
+                frame_age_s = max(0.0, now_mono_s - float(receive_s)) if receive_s is not None else 0.0
+            except (TypeError, ValueError):
+                frame_age_s = 0.0
+            pc_utc_at_frame_s = now_wall_s - frame_age_s
+            offsets_ms[camera] = (float(rtcp_s) - pc_utc_at_frame_s) * 1000.0
+
+        pair_delta_s = None
+        if left_rtcp_s is not None and right_rtcp_s is not None:
+            pair_delta_s = float(right_rtcp_s) - float(left_rtcp_s)
+        max_offset_ms = max((abs(value) for value in offsets_ms.values()), default=None)
+        max_transit_delay_ms = max((abs(value) for value in transit_delays_ms.values()), default=None)
+        if pair_delta_s is None:
+            if invalid_cameras:
+                status = "invalid-rtcp"
+                warning = f"{', '.join(invalid_cameras)} Sender Report NTP가 PC 수신 UTC와 500 ms 이상 어긋났습니다."
+            else:
+                status = "missing-rtcp"
+                warning = "좌우 프레임 중 하나에 RTCP/NTP 시각이 없습니다."
+        elif abs(pair_delta_s) > CAMERA_RTCP_PAIR_MAX_DELTA_S:
+            status = "pair-delta-failed"
+            warning = f"좌우 RTCP/NTP 차이가 {CAMERA_RTCP_PAIR_MAX_DELTA_S * 1000.0:.0f} ms를 초과했습니다."
+        elif invalid_cameras:
+            status = "absolute-rtcp-invalid"
+            warning = (
+                f"좌우 RTCP/NTP pair는 {abs(pair_delta_s) * 1000.0:.1f} ms 이내지만, "
+                f"{', '.join(invalid_cameras)} Sender Report NTP의 PC UTC 기준이 500 ms 이상 어긋났습니다. "
+                "UAM UTC 매칭에는 사용할 수 없습니다."
+            )
+        elif max_offset_ms is not None and max_offset_ms > CAMERA_RTCP_MAX_PC_OFFSET_S * 1000.0:
+            status = "pc-offset-failed"
+            warning = (
+                f"RTCP/NTP와 PC UTC 차이가 {CAMERA_RTCP_MAX_PC_OFFSET_S * 1000.0:.0f} ms를 초과했습니다. "
+                "카메라 GDTI와 RTCP 매핑을 검증해야 합니다."
+            )
+        else:
+            status = "within-threshold-unverified"
+            warning = "좌우/PC 오차는 임계값 이내지만 RTCP/NTP의 UTC 기준은 아직 검증되지 않았습니다."
+        return {
+            "status": status,
+            "basis": "rtcp-sender-report-ntp",
+            "pair_delta_s": pair_delta_s,
+            "max_pc_offset_ms": max_offset_ms,
+            "max_frame_transit_delay_ms": max_transit_delay_ms,
+            "left_frame_transit_delay_ms": transit_delays_ms.get("left"),
+            "right_frame_transit_delay_ms": transit_delays_ms.get("right"),
+            "left_pc_offset_ms": offsets_ms.get("left"),
+            "right_pc_offset_ms": offsets_ms.get("right"),
+            "warning": warning,
+        }
+
+    def _refresh_uam_time_sync_status(self) -> None:
+        if not hasattr(self, "uam_time_sync_status_label"):
+            return
+        left_metadata, right_metadata = self._clock_sync_pair_metadata()
+        metrics = self._camera_time_sync_metrics(
+            left_metadata,
+            right_metadata,
+        )
+        status = str(metrics["status"])
+        if status == "within-threshold-unverified":
+            text = "UAM 시간 기준: RTCP/NTP 조건 충족, UTC 기준은 미검증"
+        elif status == "missing-rtcp":
+            text = "UAM 시간 기준: RTCP/NTP 없음, UTC 매칭 사용 불가"
+        else:
+            text = f"UAM 시간 기준: 사용 불가 ({metrics['warning']})"
+        self.uam_time_sync_status_label.setText(text)
+        self.uam_time_sync_status_label.setToolTip(
+            "UAM 위치는 NED, 카메라 측정점은 stereo-center OpenCV optical RDF입니다. "
+            f"time_basis={metrics['basis']}; status={status}; {metrics['warning']}"
+        )
+
+    def _format_clock_sync_status(self, now_wall_s: float | None = None, now_mono_s: float | None = None) -> tuple[str, str]:
+        now_wall_s = time.time() if now_wall_s is None else float(now_wall_s)
+        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
+        left_metadata, right_metadata = self._clock_sync_pair_metadata(now_mono_s)
+        left_text, left_offset_ms = self._clock_sync_side_summary("left", left_metadata, now_wall_s, now_mono_s)
+        right_text, right_offset_ms = self._clock_sync_side_summary("right", right_metadata, now_wall_s, now_mono_s)
+        left_rtc_s = self._camera_rtc_timestamp_s_from_metadata(left_metadata)
+        right_rtc_s = self._camera_rtc_timestamp_s_from_metadata(right_metadata)
+        invalid_cameras = [
+            self._camera_name_ko(camera)
+            for camera, metadata in (("left", left_metadata), ("right", right_metadata))
+            if metadata.get("rtcp_timing_invalid_reason")
+        ]
+        if left_rtc_s is not None and right_rtc_s is not None:
+            pair_delta_ms = (float(right_rtc_s) - float(left_rtc_s)) * 1000.0
+            pair_text = f"좌우 RTCP/NTPΔ={pair_delta_ms:+.1f} ms"
+        else:
+            pair_text = "좌우 RTCP/NTPΔ=RTCP/NTP 부족"
+        quality_parts = []
+        if left_offset_ms is not None:
+            quality_parts.append(abs(left_offset_ms))
+        if right_offset_ms is not None:
+            quality_parts.append(abs(right_offset_ms))
+        worst_quality_ms = max(quality_parts) if quality_parts else None
+        has_transit_delay = any(
+            metadata.get("rtcp_frame_receive_delay_s") is not None
+            for metadata in (left_metadata, right_metadata)
+        )
+        quality_label = "RTCP frame transit max" if has_transit_delay else "PC UTC 최대 offset"
+        status = (
+            f"스트림 RTCP/NTP 상태: {pair_text}"
+            if worst_quality_ms is None
+            else f"스트림 RTCP/NTP 상태: {pair_text}, {quality_label}={worst_quality_ms:.1f} ms"
+        )
+        if invalid_cameras:
+            status += f", 절대 UTC 검증 실패={','.join(invalid_cameras)}"
+        detail = "\n".join(
+            (
+                "time_basis: RTCP Sender Report NTP-derived stream frame timestamp; WIRIS GDTI/UTC mapping unverified",
+                "pc_utc_at_frame: current PC UTC minus app receive frame age",
+                left_text,
+                right_text,
+                pair_text,
+            )
+        )
+        return status, detail
+
+    def refresh_clock_sync_status(self) -> None:
+        if not hasattr(self, "clock_sync_status_label"):
+            return
+        status, detail = self._format_clock_sync_status()
+        self.clock_sync_status_label.setText(status)
+        self.clock_sync_status_label.setToolTip(detail)
+        self.clock_sync_summary_text.setPlainText(detail)
+        self._log(f"[시계] {status}")
+        self._refresh_uam_time_sync_status()
 
     def _download_latest_clock_photo_pair(self) -> dict[str, Path]:
         output_root = self._clock_download_root()
@@ -9934,19 +10299,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._update_runtime_camera_stats_labels(now_s)
         self._refresh_operation_header()
 
-    def _format_runtime_stream_settings(self) -> str:
-        transport = self.rtsp_transport_combo.currentText().strip().upper() or "--"
-        backend = self.stream_backend_combo.currentText().strip() or "--"
-        decoder = self._runtime_decoder_text()
-        return (
-            f"스트림: RTSP 전송={transport} | 백엔드={backend} | 디코더={decoder} | "
-            f"RTP 지연={self.rtsp_latency_spin.value()} ms"
-        )
-
-    def _update_runtime_stream_settings_label(self, *_args) -> None:
-        if hasattr(self, "runtime_stream_settings_label"):
-            self.runtime_stream_settings_label.setText(self._format_runtime_stream_settings())
-
     def _update_runtime_camera_settings_layout_mode(self, width: int | None = None) -> None:
         if not hasattr(self, "runtime_header_layout") or not hasattr(self, "runtime_camera_settings_group"):
             return
@@ -9958,6 +10310,73 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         if self.runtime_header_layout.direction() != direction:
             self.runtime_header_layout.setDirection(direction)
+
+    def _format_runtime_pair_status(self) -> tuple[str, str]:
+        if self.selected_runtime_frame_pair_delta_s is None:
+            text = "Pair: 대기 | pair: missing"
+            return text, text
+        left_metadata = self.selected_runtime_frame_metadata.get("left") or {}
+        right_metadata = self.selected_runtime_frame_metadata.get("right") or {}
+        left_pair = format_runtime_camera_timestamp_compact(left_metadata)
+        right_pair = format_runtime_camera_timestamp_compact(right_metadata)
+        delta_ms = self.selected_runtime_frame_pair_delta_s * 1000.0
+        parts = [
+            f"Pair: {self.selected_runtime_frame_pair_basis or 'matched'}",
+            f"pair L {left_pair}",
+            f"R {right_pair}",
+            f"Δ {delta_ms:.1f} ms",
+        ]
+        if self.selected_runtime_frame_pair_camera_rtc_delta_s is not None:
+            parts.append(f"RTCP/NTPΔ {self.selected_runtime_frame_pair_camera_rtc_delta_s * 1000.0:.1f} ms")
+        text = " | ".join(parts)
+        tooltip = (
+            f"{text}\n"
+            f"left pair 전체 시각: {format_runtime_camera_timestamp(left_metadata)}\n"
+            f"right pair 전체 시각: {format_runtime_camera_timestamp(right_metadata)}"
+        )
+        return text, tooltip
+
+    def _format_runtime_camera_summary(self) -> tuple[str, str]:
+        def compact_camera_status(camera: str, label: QtWidgets.QLabel) -> str:
+            text = label.text()
+            prefix = "L" if camera == "left" else "R"
+            if "대기" in text:
+                state = "대기"
+            elif "지연" in text:
+                state = "지연"
+            else:
+                state = "연결"
+            stats = self.camera_stream_stats.get(camera) or {}
+            resolution = camera_resolution_text(stats).removeprefix(" @ ") or "--"
+            decoded_hz = float(stats.get("decoded_hz", 0.0)) if stats else 0.0
+            live_metadata = self.camera_frame_metadata.get(camera) or {}
+            ntp_text = format_runtime_camera_ntp_compact(live_metadata)
+            text = f"{prefix} {state:<2} {resolution:>9} {decoded_hz:4.1f}Hz NTP:{ntp_text}"
+            if stats.get("enable_detection"):
+                inferred_hz = float(stats.get("inferred_hz", 0.0))
+                text += f" Y:{inferred_hz:4.1f}Hz"
+            return text
+
+        left_text = compact_camera_status("left", self.left_runtime_stats_label)
+        right_text = compact_camera_status("right", self.right_runtime_stats_label)
+        pair_text, pair_tooltip = self._format_runtime_pair_status()
+        if self.selected_runtime_frame_pair_delta_s is None:
+            pair_summary = "Pair 대기            "
+        else:
+            basis = (self.selected_runtime_frame_pair_basis or "matched")[:18]
+            if self.selected_runtime_frame_pair_camera_rtc_delta_s is not None:
+                delta_ms = self.selected_runtime_frame_pair_camera_rtc_delta_s * 1000.0
+            else:
+                delta_ms = self.selected_runtime_frame_pair_delta_s * 1000.0
+            pair_summary = f"Pair {basis:<18} Δ{delta_ms:+7.1f}ms"
+        summary = f"{left_text} | {right_text} | {pair_summary}"
+        tooltip = (
+            f"{summary}\n"
+            f"{self.left_runtime_stats_label.toolTip()}\n"
+            f"{self.right_runtime_stats_label.toolTip()}\n"
+            f"{pair_tooltip}"
+        )
+        return summary, tooltip
 
     def _update_runtime_camera_stats_labels(self, now_s: float | None = None) -> None:
         now_s = time.monotonic() if now_s is None else now_s
@@ -9971,28 +10390,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             frame_age_s = now_s - timestamps[-1] if timestamps else float("inf")
             has_recent_stats = stats_age_s < 2.0
             has_recent_frame = frame_age_s < 2.0
-            selected_metadata = (
-                self.selected_runtime_frame_metadata.get(camera)
-                if self.selected_runtime_frame_pair_delta_s is not None
-                else {}
+            live_metadata = self.camera_frame_metadata.get(camera) or {}
+            status_text = (
+                f"{format_runtime_camera_stats(camera, stats, self._sample_hz(timestamps), stale=not (has_recent_stats or has_recent_frame))}"
+                f" | live: {format_runtime_camera_timestamp_compact(live_metadata)}"
             )
-            metadata = selected_metadata or self.camera_frame_metadata.get(camera) or {}
-            status_text = format_runtime_camera_status(
-                camera,
-                stats,
-                metadata,
-                self._sample_hz(timestamps),
-                stale=not (has_recent_stats or has_recent_frame),
-            )
-            tooltip_text = status_text
-            if self.selected_runtime_frame_pair_delta_s is not None:
-                status_text = (
-                    f"{format_runtime_camera_stats(camera, stats, self._sample_hz(timestamps), stale=not (has_recent_stats or has_recent_frame))}"
-                    f" | 시각: {format_runtime_camera_timestamp_compact(metadata)}"
-                )
-                tooltip_text = f"{status_text}\n전체 시각: {format_runtime_camera_timestamp(metadata)}"
+            tooltip_text = f"{status_text}\nlive 전체 시각: {format_runtime_camera_timestamp(live_metadata)}"
             label.setText(status_text)
             label.setToolTip(tooltip_text)
+        if hasattr(self, "runtime_pair_status_label"):
+            pair_text, pair_tooltip = self._format_runtime_pair_status()
+            self.runtime_pair_status_label.setText(pair_text)
+            self.runtime_pair_status_label.setToolTip(pair_tooltip)
+        if hasattr(self, "runtime_camera_summary_label"):
+            summary_text, summary_tooltip = self._format_runtime_camera_summary()
+            self.runtime_camera_summary_label.setText(summary_text)
+            self.runtime_camera_summary_label.setToolTip(summary_tooltip)
+        if hasattr(self, "clock_sync_status_label"):
+            status, detail = self._format_clock_sync_status(now_mono_s=now_s)
+            self.clock_sync_status_label.setText(status)
+            self.clock_sync_status_label.setToolTip(detail)
+            self._refresh_uam_time_sync_status()
 
     def _update_camera_stream_stats(self, camera: str, payload: object) -> None:
         stats = dict(payload or {})
@@ -10034,8 +10452,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _handle_distance_mode_changed(self, _index: int) -> None:
         mode = self._distance_mode()
-        if mode == "pixhawk":
-            self._distance_mode_last_source = mode
+        self._distance_mode_last_source = mode
         self._update_distance_settings_visibility()
         self._refresh_camera_parameters_tab()
 
@@ -10063,6 +10480,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             widget.setVisible(True)
         for widget in (self.baseline_label, self.baseline_spin):
             widget.setVisible(False)
+
+        if self._distance_mode() == "checkerboard":
+            self.mount_assumption_label.setText(
+                "장착 가정: 체커보드로 계산한 고정 좌/우 카메라 기하를 사용합니다. "
+                "체커보드 R/T는 좌측 optical RDF에서 우측 optical RDF로 변환해 적용합니다."
+            )
+        else:
+            self.mount_assumption_label.setText(
+                "장착 가정: GPS/RTK baseline only. "
+                "수동 baseline 입력은 사용하지 않고 좌/우 Pixhawk GPS baseline과 자세만 계산에 사용합니다."
+            )
 
         source_text = "수동 fallback" if manual_intrinsics else "체커보드 보정값"
         if self.active_intrinsics is not None:
@@ -10152,20 +10580,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return topic or "unknown"
 
     def _distance_mode(self) -> str:
-        return "pixhawk"
+        if not hasattr(self, "distance_mode_combo"):
+            return "pixhawk"
+        mode = str(self.distance_mode_combo.currentData() or "pixhawk")
+        return mode if mode in {"pixhawk", "checkerboard"} else "pixhawk"
 
     def _measurement_display_mode(self) -> str:
         return "detection"
 
     def _distance_mode_label(self) -> str:
+        if self._distance_mode() == "checkerboard":
+            return "체커보드 Stereo 외부 파라미터"
         return "Pixhawk 자세 + GPS/RTK baseline"
 
     def _triangulation_extrinsics_source(self) -> str:
-        return "pixhawk"
+        return self._distance_mode()
 
     def _measurement_path_label(self) -> str:
         if self.active_intrinsics is None:
             return "3D ray fallback: 내부 파라미터 대기 중"
+        if self._distance_mode() == "checkerboard":
+            if self._checkerboard_translation_right_in_left_m() is None:
+                return "3D ray fallback: 체커보드 stereo 외부 파라미터 대기 중"
+            return "3D ray 거리: 체커보드 Stereo 외부 파라미터 사용"
         left_ext = self.latest_extrinsics.get("left")
         right_ext = self.latest_extrinsics.get("right")
         if left_ext is None or right_ext is None:
@@ -10175,6 +10612,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return "3D ray 거리: Pixhawk 자세 + GPS/RTK baseline 사용"
 
     def _triangulation_extrinsics_source_label(self) -> str:
+        if self._distance_mode() == "checkerboard":
+            return "체커보드 Stereo 외부 파라미터"
         return "Pixhawk 자세 + GPS/RTK baseline"
 
     def _distance_parameters_summary(self) -> str:
@@ -10496,6 +10935,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"baseline_warnings: {warning_text}\n\n"
             f"rtk_baseline: {rtk_text}\n"
             f"translation_right_in_left: {translation_text}\n"
+            f"{self._format_checkerboard_stereo_extrinsics_summary()}\n\n"
             f"{self._format_mount_assumption_summary()}\n\n"
             f"{self._bbox_center_adjustment_summary()}\n\n"
             f"{self._format_uam_telemetry_summary()}\n\n"
@@ -10503,6 +10943,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"max_vertical_delta: {self._yolo_vertical_max_delta_px():.6f} px\n"
             "same_class_required: false\n"
             "attitude_gate: false"
+        )
+
+    def _format_checkerboard_stereo_extrinsics_summary(self) -> str:
+        result = self.active_intrinsics or self.last_calibration_result
+        extrinsics = None if result is None else result.extrinsics
+        if extrinsics is None:
+            return "checkerboard_stereo_extrinsics: not computed"
+        baseline_m = math.sqrt(sum(value * value for value in extrinsics.translation_left_to_right_m))
+        rotation_rows = [
+            "  [" + ", ".join(f"{value: .9f}" for value in row) + "]"
+            for row in extrinsics.rotation_left_to_right
+        ]
+        return (
+            "checkerboard_stereo_extrinsics: computed\n"
+            "checkerboard_stereo_usage: selectable live triangulation source in parameter calculation settings\n"
+            f"checkerboard_frame_contract: {extrinsics.frame_contract}\n"
+            f"checkerboard_pair_count: {extrinsics.pair_count}\n"
+            f"checkerboard_reprojection_error_px: {extrinsics.reprojection_error_px:.6f}\n"
+            f"checkerboard_translation_left_to_right_m: "
+            + ", ".join(f"{value:.9f}" for value in extrinsics.translation_left_to_right_m)
+            + "\n"
+            f"checkerboard_baseline_m: {baseline_m:.9f}\n"
+            "checkerboard_rotation_left_to_right:\n"
+            + "\n".join(rotation_rows)
         )
 
     def _refresh_camera_parameters_tab(self) -> None:
@@ -10540,6 +11004,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_pane.clear_measurement_pair_display()
             self._clear_selected_runtime_measurement_pair(update_labels=False)
         self.camera_frame_metadata[camera] = frame_metadata
+        self.camera_frame_metadata_history[camera].append(dict(frame_metadata))
         self.camera_frame_times[camera].append(frame_timestamp_s)
         self._update_camera_connection_status()
         if self.yolo_enabled:
@@ -10564,12 +11029,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _matched_detection_pair(self):
         now_s = time.monotonic()
-        return match_nearest_pair(
-            self._recent_detection_observations("left", now_s=now_s),
-            self._recent_detection_observations("right", now_s=now_s),
+        left_samples = self._recent_detection_observations("left", now_s=now_s)
+        right_samples = self._recent_detection_observations("right", now_s=now_s)
+        self._runtime_pair_uses_app_fallback = False
+        pair = match_nearest_pair(
+            left_samples,
+            right_samples,
             max_delta_s=self._yolo_pair_max_delta_s(),
             timestamp=self._yolo_match_timestamp_s,
         )
+        if pair is not None or self._yolo_time_basis() != "camera_rtcp":
+            return pair
+
+        # The WIRIS units can emit valid RTCP/NTP fields while their two
+        # camera clocks drift apart. Keep RTCP as the preferred diagnostic
+        # basis, but use the common app receive monotonic clock for live
+        # pairing so a long-running session does not stop producing pairs.
+        pair = match_nearest_pair(
+            left_samples,
+            right_samples,
+            max_delta_s=self._yolo_pair_max_delta_s(),
+            timestamp=lambda sample: float(sample.timestamp_s),
+        )
+        self._runtime_pair_uses_app_fallback = pair is not None
+        return pair
 
     def _recent_detection_pair_available(self) -> bool:
         pair = self._matched_detection_pair()
@@ -10796,7 +11279,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._stop_camera_panes(clear_previews=False)
         self.active_stream_decoders["left"] = None
         self.active_stream_decoders["right"] = None
-        self._update_runtime_stream_settings_label()
         self._clear_detection_state()
         if enable_detection:
             self._clear_calibration_previews("YOLO depth mode")
@@ -10847,12 +11329,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_frame_times["right"].clear()
         self.camera_frame_metadata["left"] = {}
         self.camera_frame_metadata["right"] = {}
+        self.camera_frame_metadata_history["left"].clear()
+        self.camera_frame_metadata_history["right"].clear()
         self.camera_stream_stats["left"] = {}
         self.camera_stream_stats["right"] = {}
         self.active_stream_decoders["left"] = None
         self.active_stream_decoders["right"] = None
         self._update_runtime_camera_stats_labels()
-        self._update_runtime_stream_settings_label()
         if not clear_previews:
             return
         self._clear_calibration_previews("left preview", right_text="right preview")
@@ -11354,6 +11837,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             coverage_text += f", unmatched={unmatched_rows}"
         if not summary:
             return f"UAM 비교: rows=0, {coverage_text}, source={source_text}"
+        time_status_counts: dict[str, int] = {}
+        for row in self.uam_analysis_rows:
+            status = str(row.get("camera_time_sync_status") or "unrecorded")
+            time_status_counts[status] = time_status_counts.get(status, 0) + 1
+        time_sync_text = ", time_sync=" + ";".join(
+            f"{status}:{count}" for status, count in sorted(time_status_counts.items())
+        )
         alignment_text = (
             f", alignment={self.uam_alignment_profile.profile_id}"
             if self.uam_alignment_profile is not None
@@ -11363,7 +11853,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"UAM 비교: rows={matched_rows}, {coverage_text}, source={source_text}, "
             f"median|err_dist|={summary['median_abs_m']:.3f} m, "
             f"p95|err_dist|={summary['p95_abs_m']:.3f} m, "
-            f"rmse={summary['rmse_m']:.3f} m{alignment_text}"
+            f"rmse={summary['rmse_m']:.3f} m{alignment_text}{time_sync_text}"
         )
 
     def _format_uam_telemetry_summary(self) -> str:
@@ -11474,20 +11964,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log("[저장] 현재 StereoDistance 설정을 저장했습니다.")
 
     def discover_pc_camera_ip(self) -> None:
+        self._log("[연결] PC IP 탐색: 카메라망 인터페이스와 PC IP를 함께 탐색합니다.")
+        candidates = discover_host_interface_candidates(
+            host_address=self.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
+            include_unconfigured=True,
+        )
+        if not candidates:
+            self._log("[연결] PC IP 탐색: 사용할 수 있는 유선 인터페이스를 찾지 못했습니다.")
+            self.camera_connection_label.setText("camera host IP: interface not found")
+            self._refresh_operation_header()
+            return
+        self._apply_host_interface_candidates(candidates)
         interface_name = self.interface_edit.text().strip()
-        if not interface_name or not interface_link_exists(interface_name):
-            reason = "비어 있습니다" if not interface_name else f"현재 시스템에 없습니다: {interface_name}"
-            self._log(f"[연결] PC IP 탐색: 카메라망 인터페이스가 {reason}. 유선 어댑터 자동 선택을 시도합니다.")
-            candidates = discover_host_interface_candidates(
-                host_address=self.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
-                include_unconfigured=True,
-            )
-            if not candidates:
-                self.camera_connection_label.setText("camera host IP: interface not found")
-                self._refresh_operation_header()
-                return
-            self._apply_host_interface_candidates(candidates)
-            interface_name = self.interface_edit.text().strip()
         resolved_address = resolve_nm_interface_address(interface_name, self._camera_host_hints())
         if resolved_address is None:
             connection_name = nm_device_connection_name(interface_name)
@@ -11592,13 +12080,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         stamp = self.recording_session_id or session_id_now()
         output_dir = self._recording_session_dir(stamp)
-        mag_rows = self._record_px4_mag_status_rows()
         saved_files = save_session_files(
             output_dir,
-            metadata=self._recording_session_metadata(mag_row_count=len(mag_rows)),
+            metadata=self._recording_session_metadata(),
             distance_rows=self.distance_recording_rows,
             external_parameter_rows=self.external_parameter_recording_rows,
-            pixhawk_mag_rows=mag_rows,
             uam_analysis_rows=self.uam_analysis_rows,
         )
         self._log(f"[저장] 세션 메타데이터를 저장했습니다: {saved_files.metadata}")
@@ -11606,8 +12092,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[저장] 거리 기록 CSV를 저장했습니다: {saved_files.distance_history}")
         if saved_files.external_parameters is not None:
             self._log(f"[저장] 시간축 외부 파라미터 CSV를 저장했습니다: {saved_files.external_parameters}")
-        if saved_files.pixhawk_mag_status is not None:
-            self._log(f"[저장] Pixhawk MAG 상태 CSV를 저장했습니다: {saved_files.pixhawk_mag_status}")
         if saved_files.uam_analysis is not None:
             self._log(f"[저장] UAM 비교 분석 CSV를 저장했습니다: {saved_files.uam_analysis}")
         output_text = ", ".join(str(output) for output in saved_files.outputs)
@@ -11615,7 +12099,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "세션 기록 저장 완료: "
             f"거리={len(self.distance_recording_rows)}개, "
             f"외부={len(self.external_parameter_recording_rows)}개, "
-            f"MAG={len(mag_rows)}개, "
             f"UAM분석={len(self.uam_analysis_rows)}개 - {output_text}"
         )
         self._refresh_operation_header()
@@ -11663,10 +12146,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 )
         return rows
 
-    def _recording_session_metadata(self, *, mag_row_count: int | None = None) -> dict[str, object]:
+    def _recording_session_metadata(self) -> dict[str, object]:
         stamp = self.recording_session_id or time.strftime("%Y%m%d_%H%M%S")
-        if mag_row_count is None:
-            mag_row_count = len(self._record_px4_mag_status_rows())
+        left_clock_metadata, right_clock_metadata = self._clock_sync_pair_metadata()
+        camera_time_metrics = self._camera_time_sync_metrics(
+            left_clock_metadata,
+            right_clock_metadata,
+        )
+        triangulation_source = self._triangulation_extrinsics_source()
+        _baseline_m, baseline_source, _baseline_warnings = self._active_baseline_m()
         return {
             "session_id": self.recording_session_id,
             "session_dir": str(self._recording_session_dir(stamp)),
@@ -11697,22 +12185,37 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "uam_compare_max_dt_s": (
                 self.uam_compare_max_dt_spin.value() if hasattr(self, "uam_compare_max_dt_spin") else None
             ),
+            "camera_time_sync_status": camera_time_metrics["status"],
+            "camera_time_sync_basis": camera_time_metrics["basis"],
+            "camera_time_sync_warning": camera_time_metrics["warning"],
+            "rtcp_pair_delta_s": camera_time_metrics["pair_delta_s"],
+            "rtcp_pc_offset_max_ms": camera_time_metrics["max_pc_offset_ms"],
+            "rtcp_frame_transit_max_ms": camera_time_metrics["max_frame_transit_delay_ms"],
+            "left_rtcp_frame_transit_ms": camera_time_metrics["left_frame_transit_delay_ms"],
+            "right_rtcp_frame_transit_ms": camera_time_metrics["right_frame_transit_delay_ms"],
             "uam_compare_time_offset_s": (
                 self.uam_time_offset_spin.value() if hasattr(self, "uam_time_offset_spin") else None
             ),
-            "pixhawk_mag_status_sample_count": mag_row_count,
-            "pixhawk_mag_actual_selected_device_ids": {
-                "left": self.latest_vehicle_mag_device_ids.get("left"),
-                "right": self.latest_vehicle_mag_device_ids.get("right"),
+            "calculation": {
+                "triangulation_extrinsics_source": triangulation_source,
+                "distance_mode": self._distance_mode_label(),
+                "baseline_source": baseline_source,
+                "measurement_path": self._measurement_path_label(),
+                "mount_assumption_model": (
+                    "checkerboard-stereo-extrinsics-v1"
+                    if triangulation_source == "checkerboard"
+                    else "gps-rtk-baseline-only-v1"
+                ),
             },
+            "checkerboard_stereo_extrinsics": self._record_checkerboard_extrinsics_parameters(),
             "timestamp_contract": {
-                "manufacturer_confirmed": True,
-                "camera_captured_timestamp_clock": "WIRIS camera RTC",
-                "rtp_rtcp_timestamp_clock": "same WIRIS camera RTC as camera_captured timestamp",
-                "rtp_timestamp_note": "RTP timestamp is a 90 kHz media clock counter; absolute camera RTC time is derived through RTCP Sender Report RTP-to-NTP mapping.",
-                "preferred_frame_time_field": "camera_rtc_frame_unix_s",
-                "legacy_equivalent_field": "rtcp_frame_ntp_unix_s",
-                "clock_offset_check": "Use the 시간 tab EXIF comparison to estimate left/right WIRIS camera RTC offset.",
+                "manufacturer_confirmed": False,
+                "camera_captured_timestamp_clock": "WIRIS RTC checked by STUS/GDTI",
+                "rtp_rtcp_timestamp_clock": "RTP relative media counter; RTCP Sender Report NTP-derived stream time",
+                "rtp_timestamp_note": "RTP timestamp is a 90 kHz media clock counter; mapping RTCP NTP to WIRIS GDTI/UTC is unverified.",
+                "preferred_frame_time_field": "rtcp_frame_ntp_unix_s",
+                "legacy_equivalent_field": "camera_rtc_frame_unix_s",
+                "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before UAM UTC claims.",
             },
             "intrinsics": self._record_intrinsic_parameters(),
             "stream": {
@@ -13792,9 +14295,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return spin
 
     def _mount_assumption_status_label(self) -> str:
+        if self._distance_mode() == "checkerboard":
+            return "checkerboard stereo extrinsics"
         return "GPS/RTK baseline only"
 
     def _format_mount_assumption_summary(self) -> str:
+        if self._distance_mode() == "checkerboard":
+            return (
+                "mount_assumption:\n"
+                "  model: checkerboard-stereo-extrinsics-v1\n"
+                "  calculation: fixed_left_to_right_optical_rdf_transform_only"
+            )
         return (
             "mount_assumption:\n"
             "  model: gps-rtk-baseline-only-v1\n"
@@ -13905,14 +14416,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             microseconds -= 1_000_000
         return f"STUS {seconds} {microseconds}"
 
-    def set_selected_wiris_time_from_pc(self) -> None:
-        target = str(self.wiris_command_target_combo.currentData() or "both")
+    def set_selected_wiris_time_from_pc(self, target: str | None = None) -> None:
+        if target is None:
+            if hasattr(self, "clock_wiris_time_target_combo"):
+                target = str(self.clock_wiris_time_target_combo.currentData() or "both")
+            else:
+                target = str(self.wiris_command_target_combo.currentData() or "both")
+        target = str(target or "both")
         target_infos = [
             (label, host, self._control_port_for_camera(label), self.zoom_timeout_spin.value())
             for label, host in self.zoom_hosts(target)
         ]
         if not target_infos:
-            self.wiris_command_status_label.setText("시간을 설정할 WIRIS 대상이 없습니다.")
+            status_text = "시간을 설정할 WIRIS 대상이 없습니다."
+            self.wiris_command_status_label.setText(status_text)
+            if hasattr(self, "clock_sync_status_label"):
+                self.clock_sync_status_label.setText(status_text)
             return
 
         statuses: dict[str, str] = {}
@@ -14008,6 +14527,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             for label, _host, _port, _timeout_s in target_infos
         ) + skew_text
         self.wiris_command_status_label.setText(status_text)
+        if hasattr(self, "clock_sync_status_label"):
+            self.clock_sync_status_label.setText(f"PC UTC 설정 전송: {status_text}")
+            self.clock_sync_summary_text.setPlainText(
+                "STUS command sent from PC UTC.\n"
+                "Run RTCP/NTP 동기화 확인 after stream frames arrive to verify left/right RTC and PC UTC offsets.\n"
+                f"{status_text}"
+            )
         self._log(f"[카메라] WIRIS RTC PC UTC 설정 target={target}: {status_text}")
 
     def send_selected_wiris_command(self) -> None:
@@ -14295,6 +14821,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calibration_capture_index = max_index + 1
         return f"{self.calibration_capture_index:03d}"
 
+    def _checkerboard_capture_pair_timing(self) -> tuple[bool, str, float | None, str]:
+        left_metadata = self.camera_frame_metadata.get("left") or {}
+        right_metadata = self.camera_frame_metadata.get("right") or {}
+        left_timestamp = self._camera_rtc_timestamp_s_from_metadata(left_metadata)
+        right_timestamp = self._camera_rtc_timestamp_s_from_metadata(right_metadata)
+        if left_timestamp is None or right_timestamp is None:
+            return (
+                False,
+                "rtcp-ntp",
+                None,
+                "missing RTCP/NTP camera timestamp for left or right frame",
+            )
+        delta_s = float(right_timestamp) - float(left_timestamp)
+        if abs(delta_s) > CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S:
+            return (
+                False,
+                "rtcp-ntp",
+                delta_s,
+                f"RTCP/NTP pair delta {delta_s * 1000.0:.1f} ms exceeds "
+                f"{CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S * 1000.0:.1f} ms",
+            )
+        return True, "rtcp-ntp", delta_s, "ok"
+
     def capture_calibration_images(self) -> None:
         frames = {
             "left": self.left_pane.current_image(),
@@ -14304,7 +14853,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.calibration_status_label.setText("Start at least one camera stream before capturing calibration images.")
             self._log("[캘리브레이션] 이미지 캡처 실패: 좌/우 카메라 프레임 중 하나 이상이 필요합니다.")
             return
-        _root, left_dir, right_dir = self._calibration_dirs()
+        root, left_dir, right_dir = self._calibration_dirs()
         left_dir.mkdir(parents=True, exist_ok=True)
         right_dir.mkdir(parents=True, exist_ok=True)
         stem = self._next_calibration_capture_stem()
@@ -14313,11 +14862,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         directories = {"left": left_dir, "right": right_dir}
         saved_sides: list[str] = []
         status_parts: list[str] = []
+        pair_candidate = frames["left"] is not None and frames["right"] is not None
+        pair_timing_ok = False
+        pair_time_basis = "rtcp-ntp"
+        pair_delta_s: float | None = None
+        pair_timing_detail = "single-camera capture"
+        if pair_candidate:
+            pair_timing_ok, pair_time_basis, pair_delta_s, pair_timing_detail = self._checkerboard_capture_pair_timing()
+            if not pair_timing_ok:
+                status_parts.append(f"pair=rejected ({pair_timing_detail})")
         for side in ("left", "right"):
             image = frames[side]
             if image is None:
                 status_parts.append(f"{side}=no frame")
                 continue
+            if pair_candidate and not pair_timing_ok:
+                other_side = "right" if side == "left" else "left"
+                other_image = frames[other_side]
+                if other_image is not None:
+                    status_parts.append(f"{side}=not saved as stereo pair ({pair_timing_detail})")
+                    continue
             path = directories[side] / f"{side}_{stem}.png"
             if not image.save(str(path), "PNG"):
                 status_parts.append(f"{side}=save FAIL")
@@ -14343,7 +14907,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[캘리브레이션] 이미지 캡처 실패 {stem}: {', '.join(status_parts)}")
             return
 
+        metadata_dir = root / "capture_metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        metadata_payload = {
+            "capture_id": stem,
+            "saved_sides": saved_sides,
+            "stereo_pair_saved": set(saved_sides) == {"left", "right"},
+            "pair_time_basis": pair_time_basis,
+            "pair_delta_s": pair_delta_s,
+            "pair_max_delta_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
+            "pair_timing_status": pair_timing_detail,
+            "left_rtcp_frame_ntp_unix_s": (self.camera_frame_metadata.get("left") or {}).get("rtcp_frame_ntp_unix_s"),
+            "right_rtcp_frame_ntp_unix_s": (self.camera_frame_metadata.get("right") or {}).get("rtcp_frame_ntp_unix_s"),
+            "frame_contract": "OpenCV image pixels; stereo timing uses RTCP/NTP camera timestamp before saving a left/right pair",
+        }
+        (metadata_dir / f"capture_{stem}.json").write_text(
+            json.dumps(metadata_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
         status = f"Captured {stem}: " + ", ".join(status_parts)
+        if pair_timing_ok and pair_delta_s is not None and set(saved_sides) == {"left", "right"}:
+            status += f"; pair_time_basis={pair_time_basis}, pair_delta_s={pair_delta_s:.6f}"
         self.calibration_status_label.setText(status)
         self._log(f"[캘리브레이션] 이미지 캡처 {stem}: 저장={','.join(saved_sides)}; {', '.join(status_parts)}")
 
@@ -14365,11 +14949,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.calibration_result_text.setPlainText(str(exc))
             self._log(f"[캘리브레이션] intrinsic 계산 실패: {exc}")
             return
-        self.last_calibration_result = StereoIntrinsicsResult(left=left, right=right, board=config)
+        extrinsics = None
+        extrinsics_warning = ""
+        try:
+            extrinsics = calibrate_stereo_extrinsics_from_image_pairs(left_paths, right_paths, config, left, right)
+        except Exception as exc:
+            extrinsics_warning = f"\n\nStereo extrinsics not computed: {exc}"
+            self._log(f"[캘리브레이션] 체커보드 stereo 외부 파라미터 계산 건너뜀: {exc}")
+        self.last_calibration_result = StereoIntrinsicsResult(left=left, right=right, board=config, extrinsics=extrinsics)
         self.last_calibration_zoom_level = self.zoom_level_spin.value()
         warning = ""
         if left.image_count < min_images or right.image_count < min_images:
             warning = f"\nWARNING: valid images below requested minimum {min_images}."
+        extrinsics_text = ""
+        if extrinsics is not None:
+            baseline_m = math.sqrt(sum(value * value for value in extrinsics.translation_left_to_right_m))
+            extrinsics_text = (
+                "\n\nCheckerboard stereo extrinsics "
+                "(OpenCV optical RDF; X_right = R * X_left + T):\n"
+                f"pairs={extrinsics.pair_count}, error={extrinsics.reprojection_error_px:.3f}px, "
+                f"|T|={baseline_m:.6f} m\n"
+                f"T_left_to_right_m={extrinsics.translation_left_to_right_m}\n"
+                f"R_left_to_right={extrinsics.rotation_left_to_right}"
+            )
         text = (
             f"Left: images={left.image_count}, error={left.reprojection_error_px:.3f}px, "
             f"fx={left.camera_matrix[0][0]:.2f}, fy={left.camera_matrix[1][1]:.2f}, "
@@ -14378,13 +14980,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"Right: images={right.image_count}, error={right.reprojection_error_px:.3f}px, "
             f"fx={right.camera_matrix[0][0]:.2f}, fy={right.camera_matrix[1][1]:.2f}, "
             f"cx={right.camera_matrix[0][2]:.2f}, cy={right.camera_matrix[1][2]:.2f}\n"
-            f"D_right={right.distortion_coefficients}{warning}"
+            f"D_right={right.distortion_coefficients}{warning}{extrinsics_text}{extrinsics_warning}"
         )
         self.calibration_result_text.setPlainText(text)
-        self.calibration_status_label.setText("Intrinsic calibration complete.")
+        status = "Intrinsic + checkerboard stereo extrinsics calibration complete." if extrinsics else "Intrinsic calibration complete."
+        self.calibration_status_label.setText(status)
         self._refresh_camera_parameters_tab()
         self._refresh_zoom_intrinsics_tab()
-        self._log("[캘리브레이션] intrinsic 계산을 완료했습니다.")
+        if extrinsics is not None:
+            self._log("[캘리브레이션] intrinsic 및 체커보드 stereo 외부 파라미터 계산을 완료했습니다.")
+        else:
+            self._log("[캘리브레이션] intrinsic 계산을 완료했습니다.")
         self._refresh_operation_header()
 
     def save_intrinsics(self) -> None:
@@ -14489,7 +15095,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.detection_buffers[camera].add(detection)
         self._refresh_distance()
 
+    def _checkerboard_translation_right_in_left_m(self) -> tuple[float, float, float] | None:
+        calibration = self.active_intrinsics
+        extrinsics = None if calibration is None else calibration.extrinsics
+        if extrinsics is None:
+            return None
+        _rotation_right_to_left, translation_right_in_left_m = invert_left_to_right_camera_transform(
+            extrinsics.rotation_left_to_right,
+            extrinsics.translation_left_to_right_m,
+        )
+        return translation_right_in_left_m
+
     def _active_baseline_m(self) -> tuple[float, str, tuple[str, ...]]:
+        if self._distance_mode() == "checkerboard":
+            translation = self._checkerboard_translation_right_in_left_m()
+            if translation is None:
+                return 0.0, "checkerboard-waiting", ("waiting for checkerboard stereo extrinsics",)
+            baseline_m = math.sqrt(sum(value * value for value in translation))
+            if baseline_m <= 0.0:
+                return 0.0, "checkerboard-waiting", ("checkerboard baseline length <= 0",)
+            return baseline_m, "checkerboard", ()
         baseline = self.latest_rtk_baseline
         if baseline is None:
             return 0.0, "gps-rtk-waiting", ("waiting for live GPS baseline",)
@@ -14723,6 +15348,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _translation_right_in_left_m(self) -> tuple[float, float, float] | None:
+        if self._distance_mode() == "checkerboard":
+            return self._checkerboard_translation_right_in_left_m()
         left_ext = self.latest_extrinsics.get("left")
         if left_ext is None:
             return None
@@ -14816,7 +15443,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             max_time_delta_s=self._yolo_pair_max_delta_s(),
             max_vertical_delta_px=self._yolo_vertical_max_delta_px(),
             require_same_class=False,
-            timestamp_basis=self._yolo_time_basis(),
+            timestamp_basis=self._effective_yolo_time_basis(),
         )
         triangulation_source = self._triangulation_extrinsics_source()
         translation_right_in_left_m = self._translation_right_in_left_m()
@@ -14910,6 +15537,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     affine["left_corrected_cy"],
                     affine["right_corrected_cx"],
                     affine["right_corrected_cy"],
+                    triangulation_source=triangulation_source,
                     left_ext=left_ext,
                     right_ext=right_ext,
                     translation_right_in_left_m=translation_right_in_left_m,
@@ -15088,7 +15716,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             if not left_has_rtc or not right_has_rtc:
                 return (
-                    "그래프 미표시: Camera RTC 필수 모드에서 RTCP/RTC timestamp가 없는 검출이 있습니다 "
+                    "그래프 미표시: RTCP/NTP 필수 모드에서 RTCP/NTP timestamp가 없는 검출이 있습니다 "
                     f"(left_rtc={'OK' if left_has_rtc else 'missing'}, "
                     f"right_rtc={'OK' if right_has_rtc else 'missing'})."
                 )
@@ -15144,6 +15772,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if any("waiting for Pixhawk R" in warning for warning in warnings):
             return (
                 "그래프 미표시: bbox 매칭은 됐지만 Pixhawk 자세 샘플이 아직 없어 3D ray 방향을 만들 수 없습니다. "
+                f"{warning_text}"
+            )
+        if any("waiting for checkerboard stereo extrinsics" in warning for warning in warnings):
+            return (
+                "그래프 미표시: bbox 매칭은 됐지만 적용된 체커보드 calibration에 stereo 외부 파라미터가 없습니다. "
+                "좌/우 체커보드 쌍을 최소 3개 이상 보정한 뒤 결과를 계산에 적용하세요. "
                 f"{warning_text}"
             )
         if any("waiting for RTK T" in warning for warning in warnings):
@@ -15261,13 +15895,32 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         right_u: float,
         right_v: float,
         *,
+        triangulation_source: str,
         left_ext: object | None,
         right_ext: object | None,
         translation_right_in_left_m: tuple[float, float, float] | None,
     ) -> RayTriangulationResult | None:
-        if self.active_intrinsics is None or left_ext is None or right_ext is None or translation_right_in_left_m is None:
+        if self.active_intrinsics is None or translation_right_in_left_m is None:
             return None
         try:
+            if triangulation_source == "checkerboard":
+                extrinsics = self.active_intrinsics.extrinsics
+                if extrinsics is None:
+                    return None
+                rotation_right_to_left, checkerboard_translation = invert_left_to_right_camera_transform(
+                    extrinsics.rotation_left_to_right,
+                    extrinsics.translation_left_to_right_m,
+                )
+                return triangulate_pixels_with_relative_pose(
+                    left_pixel=(float(left_u), float(left_v)),
+                    right_pixel=(float(right_u), float(right_v)),
+                    left_intrinsics=self.active_intrinsics.left,
+                    right_intrinsics=self.active_intrinsics.right,
+                    rotation_right_to_left=rotation_right_to_left,
+                    translation_right_in_left_m=checkerboard_translation,
+                )
+            if left_ext is None or right_ext is None:
+                return None
             return triangulate_pixels_with_pixhawk_mount(
                 left_pixel=(float(left_u), float(left_v)),
                 right_pixel=(float(right_u), float(right_v)),
@@ -15574,6 +16227,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         row.update(self._record_bias_sync_timestamp_parameters(estimate))
         row.update(self._record_intrinsic_parameters())
         row.update(self._record_frame_timestamp_parameters())
+        row.update(self._record_live_telemetry_snapshot_parameters())
         row.update(self._record_external_parameters(estimate=estimate))
         self.distance_recording_rows.append(row)
         self.distance_recording_keys.append(key)
@@ -15616,6 +16270,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "recorded_app_timestamp_s": self._fmt_record_float(now_s, 6),
             "camera": camera,
             "sample_type": sample_type,
+            "triangulation_extrinsics_source": self._triangulation_extrinsics_source(),
+            "distance_mode": self._distance_mode_label(),
         }
         row.update(values)
         self.external_parameter_recording_rows.append(row)
@@ -15737,6 +16393,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             else None
         )
         truth_sample = self.latest_drone_truth_sample
+        camera_time_metrics = self._camera_time_sync_metrics(
+            dict(getattr(estimate.left, "timestamp_metadata", None) or {}),
+            dict(getattr(estimate.right, "timestamp_metadata", None) or {}),
+            left_receive_mono_s=left_timestamp_s,
+            right_receive_mono_s=right_timestamp_s,
+        )
         row = {
             "left_bbox_timestamp_s": self._fmt_record_float(left_timestamp_s, 6),
             "right_bbox_timestamp_s": self._fmt_record_float(right_timestamp_s, 6),
@@ -15750,6 +16412,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right_bbox_timestamp_reference": str(
                 (getattr(estimate.right, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
             ),
+            "camera_time_sync_status": str(camera_time_metrics["status"]),
+            "camera_time_sync_basis": str(camera_time_metrics["basis"]),
+            "camera_time_sync_warning": str(camera_time_metrics["warning"]),
+            "rtcp_pair_delta_s": self._fmt_record_float(camera_time_metrics["pair_delta_s"], 6),
+            "rtcp_pc_offset_max_ms": self._fmt_record_float(camera_time_metrics["max_pc_offset_ms"], 3),
+            "rtcp_frame_transit_max_ms": self._fmt_record_float(camera_time_metrics["max_frame_transit_delay_ms"], 3),
+            "left_rtcp_frame_transit_ms": self._fmt_record_float(camera_time_metrics["left_frame_transit_delay_ms"], 3),
+            "right_rtcp_frame_transit_ms": self._fmt_record_float(camera_time_metrics["right_frame_transit_delay_ms"], 3),
+            "left_rtcp_pc_offset_ms": self._fmt_record_float(camera_time_metrics["left_pc_offset_ms"], 3),
+            "right_rtcp_pc_offset_ms": self._fmt_record_float(camera_time_metrics["right_pc_offset_ms"], 3),
             "drone_timestamp_s": self._fmt_record_float(drone_timestamp_s, 6),
             "drone_timestamp_reference": self.latest_drone_position_timestamp_reference,
             "drone_utc_unix_s": self._fmt_record_float(self.latest_drone_position_utc_unix_s, 6),
@@ -15832,6 +16504,55 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         row["camera_rtc_frame_delta_s"] = row["rtcp_frame_ntp_delta_s"]
         return row
 
+    def _latest_gps_quality_state(self, camera: str):
+        gps = self.latest_gps.get(camera)
+        if gps is not None:
+            return gps
+        sensor_slots = self.latest_gps_sensors.get(camera, {})
+        candidates = [sensor_slots.get(slot) for slot in ("GPS1", "GPS2")]
+        candidates = [candidate for candidate in candidates if candidate is not None]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: float(getattr(candidate, "timestamp_s", 0.0) or 0.0))
+
+    def _record_live_telemetry_snapshot_parameters(self) -> dict[str, str]:
+        row: dict[str, str] = {
+            "attitude_frame": BODY_FRAME,
+            "attitude_units": "deg",
+            "gps_quality_frame": "gps_telemetry_metadata",
+            "gps_quality_units": "satellites_count,eph_m,epv_m",
+        }
+        now_s = time.monotonic()
+        for camera in ("left", "right"):
+            attitude = self.latest_extrinsics.get(camera)
+            row[f"{camera}_roll_deg"] = self._fmt_record_float(None if attitude is None else attitude.roll_deg, 6)
+            row[f"{camera}_pitch_deg"] = self._fmt_record_float(None if attitude is None else attitude.pitch_deg, 6)
+            row[f"{camera}_yaw_deg"] = self._fmt_record_float(None if attitude is None else attitude.yaw_deg, 6)
+            row[f"{camera}_attitude_sample_age_s"] = self._fmt_record_float(
+                None if attitude is None else max(0.0, now_s - float(attitude.timestamp_s)),
+                6,
+            )
+            row[f"{camera}_attitude_topic"] = "" if attitude is None else str(attitude.topic)
+            gps = self._latest_gps_quality_state(camera)
+            row[f"{camera}_gps_satellites_used"] = (
+                "" if gps is None or getattr(gps, "satellites_used", None) is None else str(gps.satellites_used)
+            )
+            row[f"{camera}_gps_eph_m"] = self._fmt_record_float(
+                None if gps is None else getattr(gps, "eph_m", None),
+                6,
+            )
+            row[f"{camera}_gps_epv_m"] = self._fmt_record_float(
+                None if gps is None else getattr(gps, "epv_m", None),
+                6,
+            )
+            row[f"{camera}_gps_fix_type"] = "" if gps is None or getattr(gps, "fix_type", None) is None else str(gps.fix_type)
+            row[f"{camera}_gps_sample_age_s"] = self._fmt_record_float(
+                None if gps is None else max(0.0, now_s - float(gps.timestamp_s)),
+                6,
+            )
+            row[f"{camera}_gps_topic"] = "" if gps is None else str(gps.topic)
+        return row
+
     def _record_intrinsic_parameters(self) -> dict[str, str]:
         row: dict[str, str] = {
             "intrinsics_active": "true" if self.active_intrinsics is not None else "false",
@@ -15863,19 +16584,62 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
         return row
 
+    def _record_checkerboard_extrinsics_parameters(self) -> dict[str, object]:
+        calibration = self.active_intrinsics
+        extrinsics = None if calibration is None else calibration.extrinsics
+        row: dict[str, object] = {
+            "active": extrinsics is not None,
+            "source": "applied_intrinsics",
+            "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
+        }
+        if extrinsics is None:
+            return row
+        right_origin = self._checkerboard_translation_right_in_left_m()
+        row.update(
+            {
+                "pair_count": int(extrinsics.pair_count),
+                "reprojection_error_px": float(extrinsics.reprojection_error_px),
+                "rotation_left_to_right": [list(map(float, values)) for values in extrinsics.rotation_left_to_right],
+                "translation_left_to_right_m": [float(value) for value in extrinsics.translation_left_to_right_m],
+                "right_camera_origin_in_left_rdf_m": (
+                    None if right_origin is None else [float(value) for value in right_origin]
+                ),
+            }
+        )
+        return row
+
     def _record_external_parameters(self, *, estimate) -> dict[str, str]:
+        triangulation_source = self._triangulation_extrinsics_source()
+        checkerboard_mode = triangulation_source == "checkerboard"
+        checkerboard = self._record_checkerboard_extrinsics_parameters()
         row: dict[str, str] = {
-            "use_rtk_baseline": self._fmt_record_bool(True),
-            "require_rtk_fixed": self._fmt_record_bool(False),
+            "triangulation_extrinsics_source": triangulation_source,
+            "use_rtk_baseline": self._fmt_record_bool(not checkerboard_mode),
+            "rtk_baseline_applied": self._fmt_record_bool(not checkerboard_mode),
+            "require_rtk_fixed": self._fmt_record_bool(False if checkerboard_mode else self.settings.require_rtk_fixed),
             "use_triangulation": self._fmt_record_bool(True),
             "distance_mode": self._distance_mode_label(),
             "world_frame": WORLD_FRAME,
             "body_frame": BODY_FRAME,
             "camera_frame": CAMERA_FRAME,
             "camera_mount_profile": CAMERA_MOUNT_PROFILE,
-            "mount_assumption_model": "gps-rtk-baseline-only-v1",
+            "mount_assumption_model": (
+                "checkerboard-stereo-extrinsics-v1"
+                if checkerboard_mode
+                else "gps-rtk-baseline-only-v1"
+            ),
             "mount_assumption_status": self._mount_assumption_status_label(),
-            "mount_assumption_detail": "live_gps_rtk_baseline_used_as_stereo_translation",
+            "mount_assumption_detail": (
+                "applied_checkerboard_stereo_extrinsics_used_as_fixed_optical_transform"
+                if checkerboard_mode
+                else "live_gps_rtk_baseline_used_as_stereo_translation"
+            ),
+            "checkerboard_extrinsics_active": self._fmt_record_bool(bool(checkerboard["active"])),
+            "checkerboard_extrinsics_pair_count": str(checkerboard.get("pair_count", "")),
+            "checkerboard_extrinsics_reprojection_error_px": self._fmt_record_float(
+                checkerboard.get("reprojection_error_px"), 6
+            ),
+            "checkerboard_extrinsics_frame_contract": str(checkerboard["frame_contract"]),
             "require_attitude": self._fmt_record_bool(False),
             "left_attitude_age_s": self._fmt_record_float(estimate.left_attitude_age_s, 6),
             "right_attitude_age_s": self._fmt_record_float(estimate.right_attitude_age_s, 6),
@@ -16784,20 +17548,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.active_stream_decoders.get(camera) == normalized:
             return
         self.active_stream_decoders[camera] = normalized
-        self._update_runtime_stream_settings_label()
-
-    def _runtime_decoder_text(self) -> str:
-        active = {
-            camera: decoder
-            for camera, decoder in self.active_stream_decoders.items()
-            if decoder
-        }
-        if not active:
-            return self.decoder_combo.currentText().strip() or "--"
-        unique_decoders = list(dict.fromkeys(active.values()))
-        if len(unique_decoders) == 1:
-            return unique_decoders[0]
-        return " / ".join(f"{self._camera_name_ko(camera)}={decoder}" for camera, decoder in active.items())
 
     def _log(self, text: str) -> None:
         targets: list[QtWidgets.QPlainTextEdit] = []

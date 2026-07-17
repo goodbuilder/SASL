@@ -47,6 +47,7 @@ def _write_distance_node_params(context):
         "final_hover_duration_s",
         "land_duration_s",
         "target_center_z_m",
+        "target_origin_z_offset_m",
         "actual_distance_read_hz",
         "yolo_confidence",
         "yolo_target_hz",
@@ -95,6 +96,7 @@ def _write_distance_node_params(context):
         "final_hover_duration_s",
         "land_duration_s",
         "target_center_z_m",
+        "target_origin_z_offset_m",
         "fly_target_in_gazebo",
         "actual_distance_read_hz",
         "actual_distance_source",
@@ -196,20 +198,6 @@ def _ground_grid_visuals(size_m=4000.0, spacing_m=100.0, thickness_m=0.7):
           </material>
         </visual>"""
         )
-    visuals.append(
-        """        <visual name="camera_to_drone_line">
-          <pose>0 0 0.026 0 0 0</pose>
-          <geometry>
-            <box>
-              <size>6.000 4000.000 0.018</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>0.08 0.10 0.11 1</ambient>
-            <diffuse>0.08 0.10 0.11 1</diffuse>
-          </material>
-        </visual>"""
-    )
     return "\n".join(visuals)
 
 
@@ -303,6 +291,7 @@ def _launch_setup(context, *args, **kwargs):
     overlay_params_file = _write_overlay_node_params(context)
     gui_config = os.path.join(os.getcwd(), "config", "gazebo_operator.gui.config")
     gz_args = f"-r --gui-config {gui_config} {world}" if _bool_config(context, "gz_gui") else f"-r -s {world}"
+    gz_version = LaunchConfiguration("gz_version")
     return [
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
@@ -312,7 +301,7 @@ def _launch_setup(context, *args, **kwargs):
                     )
                 ]
             ),
-            launch_arguments={"gz_args": gz_args}.items(),
+            launch_arguments={"gz_args": gz_args, "gz_version": gz_version}.items(),
         ),
         Node(
             package="ros_gz_bridge",
@@ -410,7 +399,7 @@ def generate_launch_description():
             DeclareLaunchArgument("target_spawn_y_m", default_value="2000.0"),
             DeclareLaunchArgument("target_spawn_z_m", default_value="0.75"),
             DeclareLaunchArgument("target_spawn_yaw_deg", default_value="-90.0"),
-            DeclareLaunchArgument("approach_end_distance_m", default_value="200.0"),
+            DeclareLaunchArgument("approach_end_distance_m", default_value="500.0"),
             DeclareLaunchArgument("approach_duration_s", default_value="120.0"),
             DeclareLaunchArgument("mission_profile", default_value="manual"),
             DeclareLaunchArgument("takeoff_altitude_m", default_value="10.0"),
@@ -419,6 +408,7 @@ def generate_launch_description():
             DeclareLaunchArgument("final_hover_duration_s", default_value="5.0"),
             DeclareLaunchArgument("land_duration_s", default_value="10.0"),
             DeclareLaunchArgument("target_center_z_m", default_value="5.0"),
+            DeclareLaunchArgument("target_origin_z_offset_m", default_value="0.0"),
             DeclareLaunchArgument("fly_target_in_gazebo", default_value="false"),
             DeclareLaunchArgument("actual_distance_source", default_value="gazebo"),
             DeclareLaunchArgument("actual_distance_read_hz", default_value="15.0"),
@@ -453,6 +443,11 @@ def generate_launch_description():
             DeclareLaunchArgument("disparity_residual_feature_selector_window_size", default_value="1"),
             DeclareLaunchArgument("disparity_residual_feature_selector_min_samples", default_value="1"),
             DeclareLaunchArgument("gz_gui", default_value="false"),
+            DeclareLaunchArgument(
+                "gz_version",
+                default_value="8",
+                description="Gazebo Sim major version (8 = Harmonic, 6 = Fortress)",
+            ),
             DeclareLaunchArgument("launch_rviz", default_value="true"),
             DeclareLaunchArgument("record_calibration_csv", default_value="false"),
             DeclareLaunchArgument(

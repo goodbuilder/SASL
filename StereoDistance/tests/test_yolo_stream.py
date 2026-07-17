@@ -181,6 +181,17 @@ def test_rtcp_sender_report_ntp_estimate_handles_rtp_wraparound() -> None:
     )
 
 
+def test_rtcp_sender_report_rejects_large_pc_clock_offset() -> None:
+    from wiris_stereo_distance.yolo_stream import (
+        rtcp_sender_report_is_pc_valid,
+        rtcp_sender_report_pc_offset_s,
+    )
+
+    assert abs(rtcp_sender_report_pc_offset_s(sr_ntp_unix_s=99.9, received_wall_s=100.0) + 0.1) < 1e-9
+    assert rtcp_sender_report_is_pc_valid(sr_ntp_unix_s=99.9, received_wall_s=100.0)
+    assert not rtcp_sender_report_is_pc_valid(sr_ntp_unix_s=98.0, received_wall_s=100.0)
+
+
 def test_rtcp_sender_report_interval_logging_triggers_on_new_sr() -> None:
     messages: list[str] = []
     tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace(), status_callback=messages.append)
@@ -227,6 +238,38 @@ def test_rtp_timing_tracker_does_not_attach_stale_timing_to_known_pts() -> None:
     with tracker._lock:
         assert tracker._timing_by_pts_ns[1_000_000_000] is timing
     assert tracker._pop_frame_timing(None) is timing
+
+
+def test_rtp_timing_tracker_keeps_relative_timestamp_when_pc_utc_is_invalid() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(CLOCK_TIME_NONE=-1), SimpleNamespace())
+    with tracker._lock:
+        tracker._timing_by_pts_ns[1_000_000_000] = RtpFrameTiming(
+            rtp_timestamp=90_000,
+            rtp_ssrc=1234,
+            rtp_marker_seq=10,
+            rtp_pts_s=1.0,
+        )
+        tracker._sr_by_ssrc[1234] = RtcpSenderReportTiming(
+            ssrc=1234,
+            ntp_raw=1,
+            ntp_unix_s=98.0,
+            rtp_timestamp=0,
+            clock_rate_hz=90_000,
+            received_monotonic_s=0.9,
+            received_wall_s=100.0,
+        )
+
+    metadata = tracker.frame_metadata(
+        SimpleNamespace(pts=1_000_000_000),
+        1.0,
+        received_wall_s=100.0,
+    )
+
+    assert metadata is not None
+    assert abs(float(metadata["rtcp_frame_ntp_unix_s"]) - 99.0) < 1e-9
+    assert abs(float(metadata["rtcp_sr_pc_offset_s"]) + 2.0) < 1e-9
+    assert abs(float(metadata["rtcp_frame_receive_delay_s"]) - 1.0) < 1e-9
+    assert "rtcp_timing_invalid_reason" not in metadata
 
 
 def test_gstreamer_pipeline_can_drop_delta_frames_for_keyframe_only_diagnostics() -> None:

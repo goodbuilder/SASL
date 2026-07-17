@@ -1,0 +1,13 @@
+diff --git a/ros_gz_bridge/CMakeLists.txt b/ros_gz_bridge/CMakeLists.txt
+--- a/ros_gz_bridge/CMakeLists.txt
++++ b/ros_gz_bridge/CMakeLists.txt
+@@ -16,5 +16,9 @@
+ find_package(yaml_cpp_vendor REQUIRED)
+ find_package(yaml-cpp REQUIRED)
+
++if(TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
++  add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
++endif()
++
+ find_package(gz_transport_vendor REQUIRED)
+ find_package(gz-transport REQUIRED)

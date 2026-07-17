@@ -23,6 +23,7 @@ DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH="${DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH:-$ROO
 PX4_DIR="${PX4_DIR:-}"
 PX4_GZ_MODEL_NAME="${PX4_GZ_MODEL_NAME:-x500_15m}"
 PX4_GZ_WORLD="${PX4_GZ_WORLD:-stereo_ground_drone}"
+GAZEBO_MAJOR_VERSION="${GAZEBO_MAJOR_VERSION:-8}"
 CAMERA_MODEL_CONFIG="${CAMERA_MODEL_CONFIG:-$ROOT_DIR/config/camera_model.env}"
 YOLO_CONFIG="${YOLO_CONFIG:-$ROOT_DIR/config/yolo.env}"
 ATTITUDE_CONFIG="${ATTITUDE_CONFIG:-$ROOT_DIR/config/camera_attitude.env}"
@@ -52,6 +53,7 @@ CAMERA_CLIP_FAR_M_FROM_ENV="${CAMERA_CLIP_FAR_M+x}"; CAMERA_CLIP_FAR_M_ENV_VALUE
 DRONE_SPAWN_X_M_FROM_ENV="${DRONE_SPAWN_X_M+x}"; DRONE_SPAWN_X_M_ENV_VALUE="${DRONE_SPAWN_X_M:-}"
 DRONE_SPAWN_Y_M_FROM_ENV="${DRONE_SPAWN_Y_M+x}"; DRONE_SPAWN_Y_M_ENV_VALUE="${DRONE_SPAWN_Y_M:-}"
 DRONE_SPAWN_Z_M_FROM_ENV="${DRONE_SPAWN_Z_M+x}"; DRONE_SPAWN_Z_M_ENV_VALUE="${DRONE_SPAWN_Z_M:-}"
+DRONE_ORIGIN_Z_OFFSET_M_FROM_ENV="${DRONE_ORIGIN_Z_OFFSET_M+x}"; DRONE_ORIGIN_Z_OFFSET_M_ENV_VALUE="${DRONE_ORIGIN_Z_OFFSET_M:-}"
 DRONE_SPAWN_YAW_DEG_FROM_ENV="${DRONE_SPAWN_YAW_DEG+x}"; DRONE_SPAWN_YAW_DEG_ENV_VALUE="${DRONE_SPAWN_YAW_DEG:-}"
 DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV="${DRONE_TAKEOFF_ALTITUDE_M+x}"; DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE="${DRONE_TAKEOFF_ALTITUDE_M:-}"
 DRONE_FORWARD_SPEED_MPS_FROM_ENV="${DRONE_FORWARD_SPEED_MPS+x}"; DRONE_FORWARD_SPEED_MPS_ENV_VALUE="${DRONE_FORWARD_SPEED_MPS:-}"
@@ -70,6 +72,7 @@ fi
 [[ -n "$DRONE_SPAWN_X_M_FROM_ENV" ]] && DRONE_SPAWN_X_M="$DRONE_SPAWN_X_M_ENV_VALUE"
 [[ -n "$DRONE_SPAWN_Y_M_FROM_ENV" ]] && DRONE_SPAWN_Y_M="$DRONE_SPAWN_Y_M_ENV_VALUE"
 [[ -n "$DRONE_SPAWN_Z_M_FROM_ENV" ]] && DRONE_SPAWN_Z_M="$DRONE_SPAWN_Z_M_ENV_VALUE"
+[[ -n "$DRONE_ORIGIN_Z_OFFSET_M_FROM_ENV" ]] && DRONE_ORIGIN_Z_OFFSET_M="$DRONE_ORIGIN_Z_OFFSET_M_ENV_VALUE"
 [[ -n "$DRONE_SPAWN_YAW_DEG_FROM_ENV" ]] && DRONE_SPAWN_YAW_DEG="$DRONE_SPAWN_YAW_DEG_ENV_VALUE"
 [[ -n "$DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV" ]] && DRONE_TAKEOFF_ALTITUDE_M="$DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE"
 [[ -n "$DRONE_FORWARD_SPEED_MPS_FROM_ENV" ]] && DRONE_FORWARD_SPEED_MPS="$DRONE_FORWARD_SPEED_MPS_ENV_VALUE"
@@ -136,6 +139,7 @@ if [[ -n "$SIM_SCENARIO_CONFIG" ]]; then
   [[ -n "$DRONE_SPAWN_X_M_FROM_ENV" ]] && DRONE_SPAWN_X_M="$DRONE_SPAWN_X_M_ENV_VALUE"
   [[ -n "$DRONE_SPAWN_Y_M_FROM_ENV" ]] && DRONE_SPAWN_Y_M="$DRONE_SPAWN_Y_M_ENV_VALUE"
   [[ -n "$DRONE_SPAWN_Z_M_FROM_ENV" ]] && DRONE_SPAWN_Z_M="$DRONE_SPAWN_Z_M_ENV_VALUE"
+  [[ -n "$DRONE_ORIGIN_Z_OFFSET_M_FROM_ENV" ]] && DRONE_ORIGIN_Z_OFFSET_M="$DRONE_ORIGIN_Z_OFFSET_M_ENV_VALUE"
   [[ -n "$DRONE_SPAWN_YAW_DEG_FROM_ENV" ]] && DRONE_SPAWN_YAW_DEG="$DRONE_SPAWN_YAW_DEG_ENV_VALUE"
   [[ -n "$DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV" ]] && DRONE_TAKEOFF_ALTITUDE_M="$DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE"
   [[ -n "$DRONE_FORWARD_SPEED_MPS_FROM_ENV" ]] && DRONE_FORWARD_SPEED_MPS="$DRONE_FORWARD_SPEED_MPS_ENV_VALUE"
@@ -204,20 +208,24 @@ resolve_executable() {
 
 if [[ -z "$PX4_DIR" ]]; then
   PX4_DIR="$(resolve_existing_dir \
+    "$ROOT_DIR/PX4-Autopilot" \
     "$ROOT_DIR/../PX4-Autopilot" \
     "$HOME/PX4-Autopilot" \
     "$HOME/source/PX4-Autopilot" || true
   )"
 fi
+PX4_PYTHON_EXECUTABLE="${PX4_PYTHON_EXECUTABLE:-${PYTHON_EXECUTABLE:-$ROOT_DIR/.venv/bin/python}}"
 
-DEFAULT_YOLO_MODEL="${DEFAULT_YOLO_MODEL:-${YOLO_MODEL_PATH:-yolov8n.pt}}"
+DEFAULT_YOLO_MODEL="${DEFAULT_YOLO_MODEL:-${YOLO_MODEL_PATH:-yolov8n_uav.pt}}"
 if ! DEFAULT_YOLO_MODEL="$(resolve_model_spec \
   "$DEFAULT_YOLO_MODEL" \
+  yolov8n_uav.pt \
+  uav1.pt \
   yolov8n.pt
 )"; then
   DEFAULT_YOLO_MODEL="${DEFAULT_YOLO_MODEL:-}"
 fi
-DEFAULT_YOLO_CLASS="${DEFAULT_YOLO_CLASS:-${YOLO_CLASS_NAME:-any}}"
+DEFAULT_YOLO_CLASS="${DEFAULT_YOLO_CLASS:-${YOLO_CLASS_NAME:-UAV}}"
 DEFAULT_YOLO_CONFIDENCE="${DEFAULT_YOLO_CONFIDENCE:-${YOLO_CONFIDENCE:-0.10}}"
 DEFAULT_YOLO_DEVICE="${DEFAULT_YOLO_DEVICE:-${YOLO_DEVICE:-cuda:0}}"
 DEFAULT_YOLO_HZ="${DEFAULT_YOLO_HZ:-${YOLO_TARGET_HZ:-40.0}}"
@@ -316,7 +324,7 @@ Options:
   --calibration-hz VALUE Calibration CSV write rate. Default: 10.0.
   --yolo-model FILE      Use this YOLO .pt file for drone detection.
   --select-yolo-model    Open a file picker for selecting a YOLO .pt file.
-  --yolo-class NAME      Target class name in the .pt model. Default: any.
+  --yolo-class NAME      Target class name in the .pt model. Default: UAV.
   --yolo-conf VALUE      YOLO confidence threshold. Default: 0.10.
   --yolo-device DEVICE   YOLO device. Default: cuda:0, with CPU fallback if unavailable.
   --yolo-hz VALUE        YOLO scheduler target in Hz. Default: 40.0 to keep measured output above 20 Hz.
@@ -357,6 +365,10 @@ Options:
   --px4-dir DIR          PX4-Autopilot directory. Default: $PX4_DIR
   --px4-model-name NAME  Existing Gazebo model to attach PX4 to. Default: x500_15m.
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
+  --gazebo-gui           Explicitly show Gazebo GUI. This is the default unless
+                         --headless or gz_gui:=false is used.
+  --no-gazebo-gui        Do not show Gazebo GUI; rqt_gui still starts unless
+                         --headless is also used.
   --headless             Do not start Gazebo GUI or rqt_gui. Useful for automated
                          record-lite smoke runs.
   --auto-mission         Start PX4 offboard takeoff/approach/land after the app starts.
@@ -578,6 +590,14 @@ while (($#)); do
       bag_view=true
       shift
       ;;
+    --gazebo-gui)
+      launch_input+=("gz_gui:=true")
+      shift
+      ;;
+    --no-gazebo-gui)
+      launch_input+=("gz_gui:=false")
+      shift
+      ;;
     --headless)
       headless=true
       show_detection_images=false
@@ -636,8 +656,15 @@ done
 
 if [[ "$start_px4" == true && ! -d "${PX4_DIR:-}" ]]; then
   printf '%s\n' \
-    "error: PX4 mode was requested, but PX4_Autopilot was not found." \
+    "error: PX4 mode was requested, but PX4-Autopilot was not found." \
     "Set PX4_DIR to your PX4-Autopilot checkout or run with --no-px4." >&2
+  exit 2
+fi
+
+if [[ "$GAZEBO_MAJOR_VERSION" -ge 7 ]] && ! command -v gz >/dev/null 2>&1; then
+  printf '%s\n' \
+    "error: GAZEBO_MAJOR_VERSION=$GAZEBO_MAJOR_VERSION requires Gazebo Sim Harmonic (gz sim), but gz was not found." \
+    "Install gz-harmonic, or run with GAZEBO_MAJOR_VERSION=6 for the legacy Fortress installation." >&2
   exit 2
 fi
 
@@ -815,7 +842,7 @@ add_default_launch_arg camera_clip_far_m "${CAMERA_CLIP_FAR_M:-2500.0}" "${launc
 
 drone_spawn_y_default="${DRONE_SPAWN_Y_M:-2000.0}"
 approach_start_default="$drone_spawn_y_default"
-approach_end_default="${DRONE_TARGET_DISTANCE_M:-200.0}"
+approach_end_default="${DRONE_TARGET_DISTANCE_M:-500.0}"
 if has_launch_arg approach_start_distance_m "${launch_input[@]}" && ! has_launch_arg target_spawn_y_m "${launch_input[@]}"; then
   drone_spawn_y_default="$(get_launch_arg_value approach_start_distance_m "${launch_input[@]}")"
 elif has_launch_arg target_spawn_y_m "${launch_input[@]}" && ! has_launch_arg approach_start_distance_m "${launch_input[@]}"; then
@@ -841,8 +868,10 @@ add_default_launch_arg land_duration_s "${DRONE_LAND_DURATION_S:-10.0}" "${launc
 add_default_launch_arg target_spawn_x_m "${DRONE_SPAWN_X_M:-0.0}" "${launch_input[@]}"
 add_default_launch_arg target_spawn_y_m "$drone_spawn_y_default" "${launch_input[@]}"
 add_default_launch_arg target_spawn_z_m "${DRONE_SPAWN_Z_M:-0.75}" "${launch_input[@]}"
+add_default_launch_arg target_origin_z_offset_m "${DRONE_ORIGIN_Z_OFFSET_M:-0.0}" "${launch_input[@]}"
 add_default_launch_arg target_spawn_yaw_deg "${DRONE_SPAWN_YAW_DEG:--90.0}" "${launch_input[@]}"
 add_default_launch_arg target_model_name "$PX4_GZ_MODEL_NAME" "${launch_input[@]}"
+add_default_launch_arg gz_version "$GAZEBO_MAJOR_VERSION" "${launch_input[@]}"
 if [[ -n "$DEFAULT_YOLO_MODEL" ]]; then
   add_default_launch_arg yolo_model_path "$DEFAULT_YOLO_MODEL" "${launch_input[@]}"
   add_default_launch_arg yolo_class_name "$DEFAULT_YOLO_CLASS" "${launch_input[@]}"
@@ -862,7 +891,7 @@ fi
 add_default_launch_arg plot_publish_hz "$DEFAULT_PLOT_HZ" "${launch_input[@]}"
 add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${launch_input[@]}"
 	add_default_launch_arg enable_bbox_center_adjustment "${BBOX_CENTER_ADJUSTMENT_ENABLE:-false}" "${launch_input[@]}"
-	add_default_launch_arg bbox_center_adjustment_path "${BBOX_CENTER_ADJUSTMENT_PATH:-$DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH}" "${launch_input[@]}"
+  add_default_launch_arg bbox_center_adjustment_path "${BBOX_CENTER_ADJUSTMENT_PATH:-$DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH}" "${launch_input[@]}"
 	add_default_launch_arg enable_observation_fusion "${OBSERVATION_FUSION_ENABLE:-false}" "${launch_input[@]}"
 	add_optional_default_launch_arg observation_fusion_manifest_path "${OBSERVATION_FUSION_MANIFEST_PATH:-}" "${launch_input[@]}"
 	add_optional_default_launch_arg observation_fusion_tier "${OBSERVATION_FUSION_TIER:-}" "${launch_input[@]}"
@@ -882,6 +911,17 @@ if ! has_launch_arg launch_rviz "${launch_input[@]}"; then
   launch_args+=("launch_rviz:=false")
 fi
 launch_args+=("${launch_input[@]}")
+rqt_yolo_model_path="${DEFAULT_YOLO_MODEL:-}"
+explicit_yolo_model_path="$(get_launch_arg_value yolo_model_path "${launch_args[@]}" || true)"
+if [[ -n "$explicit_yolo_model_path" ]]; then
+  rqt_yolo_model_path="$explicit_yolo_model_path"
+fi
+rqt_approach_delta="$(
+  awk -v start="$approach_start_default" -v end="$approach_end_default" \
+    'BEGIN { if (start == start && end == end) printf "%.1f", (start > end ? start - end : end - start); else printf "--" }'
+)"
+rqt_mission_label="Mission: ${approach_start_default} -> ${approach_end_default} m (approach ${rqt_approach_delta} m)"
+rqt_coord_contract="Frame: public FRD [Forward, Right, Down, Range]; Down origin offset ${DRONE_ORIGIN_Z_OFFSET_M:-0.0} m"
 
 printf '%s\n' "Camera attitude source: $ATTITUDE_CONFIG"
 printf '%s\n' "Camera model source: $CAMERA_MODEL_CONFIG"
@@ -914,14 +954,18 @@ if [[ "$start_px4" == true ]]; then
     world="$2"
     model_name="$3"
     display_value="$4"
+    px4_python="$5"
     cd "$px4_dir"
     export DISPLAY="$display_value"
+    if [[ -x "$px4_python" ]]; then
+      export PYTHON_EXECUTABLE="$px4_python"
+    fi
     export PX4_GZ_STANDALONE=1
     export PX4_GZ_WORLD="$world"
     export PX4_GZ_MODEL_NAME="$model_name"
     export PX4_GZ_NO_FOLLOW=1
     exec make px4_sitl gz_x500
-  ' _ "$PX4_DIR" "$PX4_GZ_WORLD" "$PX4_GZ_MODEL_NAME" "${DISPLAY:-:0}" >"$PX4_CONSOLE_LOG" 2>&1 &
+  ' _ "$PX4_DIR" "$PX4_GZ_WORLD" "$PX4_GZ_MODEL_NAME" "${DISPLAY:-:0}" "$PX4_PYTHON_EXECUTABLE" >"$PX4_CONSOLE_LOG" 2>&1 &
   children+=("$!")
   printf '%s\n' "PX4 SITL will attach to Gazebo model: $PX4_GZ_MODEL_NAME"
   printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550."
@@ -943,16 +987,14 @@ fi
 
 if [[ "$headless" != true ]]; then
   if [[ "$bag_view" != true ]]; then
-    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" RQT_YOLO_MODEL_PATH="$rqt_yolo_model_path" RQT_MISSION_LABEL="$rqt_mission_label" RQT_COORD_CONTRACT="$rqt_coord_contract" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
       --clear-config \
       --force-discover \
-      --reload-import \
       --standalone stereo_ground_sim.operator_panel.OperatorPanel &
   else
-    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+    setsid env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" RQT_YOLO_MODEL_PATH="$rqt_yolo_model_path" RQT_MISSION_LABEL="$rqt_mission_label" RQT_COORD_CONTRACT="$rqt_coord_contract" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
       --clear-config \
       --force-discover \
-      --reload-import \
       --perspective-file "$perspective_file" &
   fi
   children+=("$!")
@@ -964,7 +1006,7 @@ if [[ "$headless" != true ]]; then
       for _ in {1..5}; do
         rqt_pid="$(pgrep -n -f '/lib/rqt_gui/rqt_gui --clear-config' || pgrep -n -f 'rqt_gui --clear-config' || true)"
         [[ -n "$rqt_pid" ]] || break
-        env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+        env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" RQT_YOLO_MODEL_PATH="$rqt_yolo_model_path" RQT_MISSION_LABEL="$rqt_mission_label" RQT_COORD_CONTRACT="$rqt_coord_contract" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
           --command-pid "$rqt_pid" \
           --command-start-plugin rqt_reconfigure/Param \
           --args /stereo_distance_node >/dev/null 2>&1 && break
@@ -975,7 +1017,7 @@ if [[ "$headless" != true ]]; then
       for _ in {1..8}; do
         rqt_pid="$(pgrep -n -f '/lib/rqt_gui/rqt_gui --clear-config --perspective-file' || pgrep -n -f 'rqt_gui --clear-config --perspective-file' || true)"
         [[ -n "$rqt_pid" ]] || break
-        env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
+        env PYTHONPATH="$RQT_PYTHONPATH" RQT_IMAGE_TOPIC_MODE="$rqt_image_topic_mode" RQT_PLOT_WINDOW_S="$DEFAULT_PLOT_WINDOW_S" RQT_YOLO_MODEL_PATH="$rqt_yolo_model_path" RQT_MISSION_LABEL="$rqt_mission_label" RQT_COORD_CONTRACT="$rqt_coord_contract" OPERATOR_RECORDER_PYTHON="$OPERATOR_RECORDER_PYTHON" ros2 run rqt_gui rqt_gui \
           --command-pid "$rqt_pid" \
           --command-start-plugin stereo_ground_sim/RecorderPanel >/dev/null 2>&1 && break
         sleep 1

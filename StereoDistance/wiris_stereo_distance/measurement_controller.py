@@ -14,7 +14,9 @@ from wiris_stereo_distance.stereo import (
 )
 from wiris_stereo_distance.triangulation import (
     RayTriangulationResult,
+    invert_left_to_right_camera_transform,
     stereo_center_point_from_left_camera,
+    triangulate_pixels_with_relative_pose,
     triangulate_pixels_with_pixhawk_mount,
 )
 
@@ -102,6 +104,16 @@ def _with_warning(warnings: tuple[str, ...], message: str) -> tuple[str, ...]:
 def _triangulate(inputs: MeasurementGeometryInput, warnings: tuple[str, ...]) -> _TriangulationAttempt:
     if inputs.intrinsics is None:
         return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for intrinsics"))
+    if inputs.triangulation_source == "checkerboard":
+        if inputs.intrinsics.extrinsics is None:
+            return _TriangulationAttempt(
+                None,
+                _with_warning(warnings, "triangulation waiting for checkerboard stereo extrinsics"),
+            )
+        try:
+            return _TriangulationAttempt(_triangulate_pixels(inputs, inputs.left.center, inputs.right.center), warnings)
+        except Exception as exc:
+            return _TriangulationAttempt(None, _with_warning(warnings, f"triangulation error: {exc}"))
     try:
         if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
             return _TriangulationAttempt(None, _with_warning(warnings, "triangulation waiting for Pixhawk R"))
@@ -119,6 +131,22 @@ def _triangulate_pixels(
 ) -> RayTriangulationResult | None:
     if inputs.intrinsics is None:
         return None
+    if inputs.triangulation_source == "checkerboard":
+        extrinsics = inputs.intrinsics.extrinsics
+        if extrinsics is None:
+            return None
+        rotation_right_to_left, translation_right_in_left_m = invert_left_to_right_camera_transform(
+            extrinsics.rotation_left_to_right,
+            extrinsics.translation_left_to_right_m,
+        )
+        return triangulate_pixels_with_relative_pose(
+            left_pixel=left_pixel,
+            right_pixel=right_pixel,
+            left_intrinsics=inputs.intrinsics.left,
+            right_intrinsics=inputs.intrinsics.right,
+            rotation_right_to_left=rotation_right_to_left,
+            translation_right_in_left_m=translation_right_in_left_m,
+        )
     if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
         return None
     if inputs.translation_right_in_left_m is None:

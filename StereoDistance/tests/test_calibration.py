@@ -1,9 +1,9 @@
-import json
 from pathlib import Path
 
 from wiris_stereo_distance.calibration import (
     CameraIntrinsics,
     CheckerboardConfig,
+    StereoExtrinsics,
     StereoIntrinsicsResult,
     load_intrinsics_json,
     opencv_available,
@@ -43,7 +43,7 @@ def test_save_intrinsics_json(tmp_path: Path) -> None:
     assert '"extrinsics"' not in text
 
 
-def test_load_intrinsics_json_ignores_legacy_extrinsics(tmp_path: Path) -> None:
+def test_load_intrinsics_json_preserves_checkerboard_extrinsics(tmp_path: Path) -> None:
     intrinsics = CameraIntrinsics(
         width=1280,
         height=720,
@@ -53,29 +53,29 @@ def test_load_intrinsics_json_ignores_legacy_extrinsics(tmp_path: Path) -> None:
         image_count=20,
     )
     output = tmp_path / "intrinsics.json"
+    extrinsics = StereoExtrinsics(
+        rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 0.999, -0.001], [0.0, 0.001, 0.999]],
+        translation_left_to_right_m=[0.3, 0.0, 0.0],
+        reprojection_error_px=0.22,
+        pair_count=18,
+    )
     result = StereoIntrinsicsResult(
         left=intrinsics,
         right=intrinsics,
         board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.03),
+        extrinsics=extrinsics,
     )
 
     save_intrinsics_json(output, result)
-    payload = json.loads(output.read_text())
-    payload["extrinsics"] = {
-        "rotation_left_to_right": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        "rotation_right_to_left": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        "translation_left_to_right_m": [-0.3, 0.0, 0.0],
-        "translation_right_in_left_m": [0.3, 0.0, 0.0],
-        "reprojection_error_px": 0.22,
-        "pair_count": 18,
-    }
-    output.write_text(json.dumps(payload))
 
     loaded = load_intrinsics_json(output)
 
     assert loaded.left.camera_matrix == intrinsics.camera_matrix
     assert loaded.right.image_count == 20
-    assert not hasattr(loaded, "extrinsics")
+    assert loaded.extrinsics is not None
+    assert loaded.extrinsics.translation_left_to_right_m == [0.3, 0.0, 0.0]
+    assert loaded.extrinsics.pair_count == 18
+    assert "opencv_optical:RDF" in loaded.extrinsics.frame_contract
 
 
 def test_opencv_available_returns_status_tuple() -> None:

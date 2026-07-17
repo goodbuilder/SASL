@@ -316,7 +316,34 @@ def test_compare_measurement_rows_uses_ulog_truth_first() -> None:
     assert comparisons[0]["measurement_frame"] == "stereo_center_opencv_optical"
     assert comparisons[0]["comparison_frame"] == "mixed-frame"
     assert comparisons[0]["error_x_m"] == "0.500000"
+    assert comparisons[0]["camera_time_sync_status"] == "unrecorded"
     assert not any(key.endswith("_eligible") or key.endswith("_blocker") for key in comparisons[0])
+
+
+def test_compare_measurement_rows_preserves_camera_time_sync_status() -> None:
+    rows = [
+        {
+            "timestamp_s": "1.0",
+            "x_m": "1.0",
+            "y_m": "2.0",
+            "z_m": "3.0",
+            "distance_m": "3.741657",
+            "camera_time_sync_status": "pc-offset-failed",
+            "camera_time_sync_basis": "rtcp-sender-report-ntp",
+            "camera_time_sync_warning": "RTCP/NTP와 PC UTC 차이 초과",
+            "rtcp_pair_delta_s": "0.020000",
+            "rtcp_pc_offset_max_ms": "8600.000",
+        }
+    ]
+    samples = [UamTelemetrySample(timestamp_s=1.0, x_m=1.0, y_m=2.0, z_m=3.0, source="ulog")]
+
+    comparisons = compare_measurement_rows(rows, samples, truth_source="ulog", max_dt_s=0.01)
+
+    assert len(comparisons) == 1
+    assert comparisons[0]["camera_time_sync_status"] == "pc-offset-failed"
+    assert comparisons[0]["camera_time_sync_basis"] == "rtcp-sender-report-ntp"
+    assert comparisons[0]["rtcp_pair_delta_s"] == "0.020000"
+    assert comparisons[0]["rtcp_pc_offset_max_ms"] == "8600.000"
 
 
 def test_compare_measurement_rows_prefers_raw_stereo_center_over_live_bias() -> None:

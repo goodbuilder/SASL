@@ -63,6 +63,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("land_duration_s", 10.0)
         self.declare_parameter("target_model_name", "x500_15m")
         self.declare_parameter("target_center_z_m", 5.0)
+        self.declare_parameter("target_origin_z_offset_m", 0.0)
         self.declare_parameter("fly_target_in_gazebo", False)
         self.declare_parameter("actual_distance_source", "gazebo")
         self.declare_parameter(
@@ -127,6 +128,7 @@ class StereoDistanceNode(Node):
         self.land_duration_s = self._float_param("land_duration_s")
         self.target_model_name = self.get_parameter("target_model_name").value
         self.target_center_z_m = self._float_param("target_center_z_m")
+        self.target_origin_z_offset_m = self._float_param("target_origin_z_offset_m")
         self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
         self.actual_distance_source = self.get_parameter("actual_distance_source").value
         self.actual_distance_read_hz = max(0.1, self._float_param("actual_distance_read_hz"))
@@ -214,11 +216,11 @@ class StereoDistanceNode(Node):
         self.cached_actual_distance = self.approach_start_distance_m
         self.cached_ground_truth_position = {
             "right_m": 0.0,
-            "down_m": self.camera_height_m - self.target_center_z_m,
+            "down_m": self._truth_down_from_world_up(self.target_center_z_m),
             "forward_m": self.approach_start_distance_m,
             "ground_truth_m": self._actual_range_m(
                 0.0,
-                self.camera_height_m - self.target_center_z_m,
+                self._truth_down_from_world_up(self.target_center_z_m),
                 self.approach_start_distance_m,
             ),
         }
@@ -388,6 +390,8 @@ class StereoDistanceNode(Node):
                 self.land_duration_s = float(param.value)
             elif param.name == "target_center_z_m":
                 self.target_center_z_m = float(param.value)
+            elif param.name == "target_origin_z_offset_m":
+                self.target_origin_z_offset_m = float(param.value)
             elif param.name == "fly_target_in_gazebo":
                 self.fly_target_in_gazebo = self._coerce_bool(param.value)
             elif param.name == "actual_distance_source":
@@ -846,13 +850,14 @@ class StereoDistanceNode(Node):
                 self.last_published_actual_distance_seq = self.actual_distance_sample_seq
         else:
             self.actual_distance_pub.publish(Float32(data=float(actual)))
+            down_m = self._truth_down_from_world_up(self.target_center_z_m)
             self.cached_ground_truth_position = {
                 "right_m": 0.0,
-                "down_m": self.camera_height_m - self.target_center_z_m,
+                "down_m": down_m,
                 "forward_m": float(actual),
                 "ground_truth_m": self._actual_range_m(
                     0.0,
-                    self.camera_height_m - self.target_center_z_m,
+                    down_m,
                     float(actual),
                 ),
             }
@@ -1030,6 +1035,10 @@ class StereoDistanceNode(Node):
     def _actual_range_m(self, right_m, down_m, forward_m):
         return math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
 
+    def _truth_down_from_world_up(self, model_origin_up_m):
+        reference_up_m = float(model_origin_up_m) + float(self.target_origin_z_offset_m)
+        return float(self.camera_height_m) - reference_up_m
+
     def _ground_truth_from_gazebo_pose_payload(self, payload):
         pose = self._find_pose_by_name(payload, self.target_model_name)
         if pose is None:
@@ -1040,7 +1049,7 @@ class StereoDistanceNode(Node):
             world_forward_m = float(position["y"])
             world_up_m = float(position["z"])
             right_m = world_right_m
-            down_m = self.camera_height_m - world_up_m
+            down_m = self._truth_down_from_world_up(world_up_m)
             forward_m = abs(world_forward_m)
             range_distance = self._actual_range_m(right_m, down_m, forward_m)
             return {
@@ -1769,7 +1778,7 @@ class StereoDistanceNode(Node):
         height = int(self.synthetic_detection_height_px)
         left, right = self._synthetic_detection_pair_from_rdf(
             right_m=float(position.get("right_m", 0.0)),
-            down_m=float(position.get("down_m", self.camera_height_m - self.target_center_z_m)),
+            down_m=float(position.get("down_m", self._truth_down_from_world_up(self.target_center_z_m))),
             forward_m=float(position.get("forward_m", actual)),
             width=width,
             height=height,

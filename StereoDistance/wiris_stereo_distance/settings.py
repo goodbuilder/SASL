@@ -29,7 +29,8 @@ class AppSettings:
     wiris_control_port: int = 2240
     left_control_port: int = 2240
     right_control_port: int = 2240
-    wiris_control_timeout_s: float = 1.0
+    # The left camera's SDK can acknowledge read commands after roughly 2 s.
+    wiris_control_timeout_s: float = 5.0
     yolo_device: str = "cpu"
     yolo_input_size: int = 416
     yolo_conf_threshold: float = 0.5
@@ -45,7 +46,10 @@ class AppSettings:
     yolo_gate_vertical_delta_enabled: bool = False
     yolo_gate_max_vertical_delta_px: float = 80.0
     yolo_gate_max_time_delta_s: float = 0.25
-    yolo_gate_time_basis: str = "camera_rtc_required"
+    # Prefer RTCP/NTP when the two cameras agree, but allow live pairing to
+    # fall back to the app's monotonic receive clock when their camera clocks
+    # are not mutually synchronized.
+    yolo_gate_time_basis: str = "camera_rtcp"
     preview_width: int = 1920
     rtsp_latency_ms: int = 50
     yolo_event_queue_size: int = 128
@@ -115,7 +119,9 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
     triangulation_extrinsics_source = str(
         payload.get("triangulation_extrinsics_source", AppSettings.triangulation_extrinsics_source)
     )
-    if triangulation_extrinsics_source != "pixhawk":
+    if triangulation_extrinsics_source == "calibration":
+        triangulation_extrinsics_source = "checkerboard"
+    if triangulation_extrinsics_source not in {"pixhawk", "checkerboard"}:
         triangulation_extrinsics_source = "pixhawk"
     return AppSettings(
         intrinsics_path=str(payload.get("intrinsics_path", AppSettings.intrinsics_path)),

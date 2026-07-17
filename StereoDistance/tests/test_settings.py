@@ -24,6 +24,7 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.right_rtsp_url == "rtsp://10.0.0.232:8554/visible"
     assert settings.left_control_host == "10.0.0.231"
     assert settings.right_control_host == "10.0.0.232"
+    assert settings.wiris_control_timeout_s == 5.0
     assert settings.yolo_input_size == 416
     assert settings.preview_width == 1920
     assert settings.yolo_event_queue_size == 128
@@ -37,7 +38,7 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.yolo_gate_matching_enabled is False
     assert settings.yolo_gate_time_delta_enabled is False
     assert settings.yolo_gate_vertical_delta_enabled is False
-    assert settings.yolo_gate_time_basis == "camera_rtc_required"
+    assert settings.yolo_gate_time_basis == "camera_rtcp"
     assert settings.ros_domain_id == 0
     assert settings.pixhawk_host_address == "10.0.0.10"
     assert settings.left_pixhawk_eth_ip == "10.0.0.2"
@@ -185,13 +186,13 @@ def test_load_settings_accepts_legacy_mavlink_start_ros2_key(tmp_path: Path) -> 
     assert settings.mavlink_configure_uxrce_agent is False
 
 
-def test_load_settings_normalizes_removed_calibration_extrinsics_source(tmp_path: Path) -> None:
+def test_load_settings_maps_legacy_calibration_extrinsics_source_to_checkerboard(tmp_path: Path) -> None:
     path = tmp_path / "settings.json"
     path.write_text('{"triangulation_extrinsics_source": "calibration"}')
 
     settings = load_settings(path)
 
-    assert settings.triangulation_extrinsics_source == "pixhawk"
+    assert settings.triangulation_extrinsics_source == "checkerboard"
 
 
 def test_resolve_settings_path_uses_base_for_relative_paths(tmp_path: Path) -> None:

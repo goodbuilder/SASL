@@ -34,7 +34,6 @@ class SavedSessionFiles:
     metadata: Path
     distance_history: Path | None
     external_parameters: Path | None
-    pixhawk_mag_status: Path | None
     uam_analysis: Path | None = None
 
     @property
@@ -45,7 +44,6 @@ class SavedSessionFiles:
                 self.metadata,
                 self.distance_history,
                 self.external_parameters,
-                self.pixhawk_mag_status,
                 self.uam_analysis,
             )
             if path is not None
@@ -71,7 +69,6 @@ def save_session_files(
     metadata: dict[str, object],
     distance_rows: list[dict[str, object]] | None = None,
     external_parameter_rows: list[dict[str, object]] | None = None,
-    pixhawk_mag_rows: list[dict[str, object]] | None = None,
     uam_analysis_rows: list[dict[str, object]] | None = None,
 ) -> SavedSessionFiles:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -89,10 +86,6 @@ def save_session_files(
     if external_parameter_rows:
         external_output = output_dir / "alignment" / "external_parameters.csv"
         write_dynamic_csv(external_output, external_parameter_rows)
-    mag_output = None
-    if pixhawk_mag_rows:
-        mag_output = output_dir / "alignment" / "pixhawk_mag_status.csv"
-        write_dynamic_csv(mag_output, pixhawk_mag_rows)
     uam_analysis_output = None
     if uam_analysis_rows:
         uam_analysis_output = output_dir / "measurements" / "uam_analysis.csv"
@@ -101,6 +94,5 @@ def save_session_files(
         metadata=metadata_output,
         distance_history=distance_output,
         external_parameters=external_output,
-        pixhawk_mag_status=mag_output,
         uam_analysis=uam_analysis_output,
     )

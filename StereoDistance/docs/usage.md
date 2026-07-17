@@ -96,12 +96,12 @@ The current top-level tab order follows the field workflow:
 9. `고급`
 
 The `연결` tab contains `WIRIS`, `Pixhawk`, and `UAM`. It keeps only the primary connection workflow.
-The `시간` tab contains WIRIS still-image EXIF timestamp comparison.
+The `시간` tab contains WIRIS RTC setting, live RTCP/NTP stream synchronization checks, and still-image EXIF timestamp comparison.
 The `보정` tab contains a `체커보드` subtab for checkerboard capture/calibration/zoom control and a `줌 내부 파라미터` subtab for per-zoom intrinsics with save/apply controls.
-The `파라미터` tab contains `내부` and `외부/기하` subtabs so intrinsics and live geometry state can be inspected separately.
+The `파라미터` tab contains `내부`, `외부/기하`, and `계산 설정` subtabs so intrinsics, live geometry state, and calculation controls can be inspected separately.
 The `정렬` tab contains `개요`, `GNSS / Baseline`, `Magnetometer / Yaw`, `Attitude`, `Coordinate System`, `Validation`, and `Alignment Profile`.
 The `고급` tab contains `WIRIS SDK`, `필드 감시`, and `Bias 보정`.
-The `측정` tab contains `실시간`, `계산 설정`, and `삼각측량 품질`.
+The `측정` tab contains `실시간` and `측정 품질`; calculation controls live under `파라미터 > 계산 설정`.
 The `저장·분석` tab contains `세션 저장`, `UAM 비교`, and `기록 샘플`.
 
 At startup the GUI only reports the selected network interface and leaves camera/Pixhawk checks in a waiting state. Connect the hardware first, then use `영상 수신 확인`, `카메라 Preview 연결`, `ROS2 연결`, or `MAVLink 연결`; `--start` is the opt-in path for immediately starting YOLO/depth streams. Camera network fields follow the WIRIS OSD names where practical: `IP Address`, `IP Mask`, `RTSP port`, and `Telnet port`.
@@ -214,8 +214,8 @@ Use this top-level tab to define and validate the stereo-camera extrinsic parame
 ROS2 topic subscription is tolerant of missing PX4 message types. Missing GPS or magnetometer topic types should not make the whole Pixhawk connection fail.
 When ROS2 magnetometer topics have no publisher, `MAVLink 연결` can still populate RM3100 CAN fields from `SCALED_IMU*` magnetometer values after the stream request succeeds.
 
-- `측정 > 계산 설정`의 `Baseline` is the shared baseline reference for the Pixhawk 3D path's translation magnitude.
-- `Baseline` keeps the live Pixhawk GPS baseline as the direction source for N/E/D and ENU checks when `실시간 GPS baseline 사용` is enabled; the Pixhawk 3D path still uses the measurement-tab `Baseline` as its scale reference.
+- `파라미터 > 계산 설정`의 `Baseline` is the shared baseline reference for the Pixhawk 3D path's translation magnitude.
+- `Baseline` keeps the live Pixhawk GPS baseline as the direction source for N/E/D and ENU checks when `실시간 GPS baseline 사용` is enabled; the Pixhawk 3D path still uses the parameter-tab `Baseline` as its scale reference.
 - GPS-only operation is allowed when both Pixhawks have at least a 3D GPS fix (`fix_type >= 3`) and `RTK Fixed 품질 확인` is off. This is less accurate than RTK and should be treated as degraded, especially for short camera baselines.
 - `RTK Fixed 품질 확인` shows whether both sides are fixed RTK and blocks GPS-only translation when enabled. Keep it off for base-station-free GPS-only measurements; turn it on when RTK fixed is required.
 - The baseline display shows length, ENU/NED vectors, sample age, quality, and warnings.
@@ -230,10 +230,12 @@ Use this tab after camera connection and WIRIS timestamp verification, before pa
 - Calibration preview uses current camera frames.
 - Checkerboard overlay is only refreshed while `보정` is visible, and live checkerboard detection runs in a background worker so tab entry and resizing do not block the main GUI.
 - When `YOLO 측정 시작` has switched into active measurement mode, Camera Setup preview is intentionally hidden and calibration preview frame copying is skipped. Camera Setup and Depth Measurement are not intended to be used at the same time.
-- `캡처` saves only the current left/right frame(s) where the checkerboard is detected. One visible camera is enough for that camera's intrinsic dataset.
-- `보정 실행` runs OpenCV checkerboard calibration. The default checkerboard is 13 inner columns, 8 inner rows, and 40.0 mm square size.
+- `캡처` saves only the current left/right frame(s) where the checkerboard is detected. One visible camera is enough for that camera's intrinsic dataset. When both cameras have frames and a stereo pair would be saved, both frames must have RTCP/NTP-derived camera timestamps and the left/right timestamp delta must be within 50 ms; raw RTP timestamps and app receive times are not accepted for checkerboard stereo pairing.
+- Each saved calibration capture writes `capture_metadata/capture_##.json` with the saved sides, RTCP/NTP timing fields, pair delta, and the timing contract used for the stereo pair gate.
+- `보정 실행` runs OpenCV checkerboard calibration. The default checkerboard is 13 inner columns, 8 inner rows, and 40.0 mm square size. It first estimates left/right intrinsics independently, then, when at least three matching left/right capture ids contain the checkerboard, estimates checkerboard stereo extrinsics with fixed intrinsics.
+- Checkerboard stereo extrinsics are stored as `extrinsics.rotation_left_to_right` and `extrinsics.translation_left_to_right_m` in the OpenCV optical camera frame contract `RDF(right, down, forward)`, where `X_right = R_left_to_right * X_left + T_left_to_right_m`. In `파라미터 > 계산 설정`, choose `체커보드 Stereo 외부 파라미터` to use the inverted right-camera origin and ray rotation for live stereo triangulation without Pixhawk/GPS runtime inputs. The default remains `Pixhawk 자세 + GPS/RTK baseline`.
 - The `줌 내부 파라미터` subtab shows the currently visible WIRIS zoom's left/right intrinsics like the Parameter tab and puts `저장` / `적용` on the right.
-- `저장` writes the calibration for the current visible WIRIS zoom level under `<STEREO_DISTANCE_APP>/calibration_captures/` as `intrinsics_zoom_##.json` and refreshes the latest `intrinsics.json` alias.
+- `저장` writes the calibration for the current visible WIRIS zoom level under `<STEREO_DISTANCE_APP>/calibration_captures/` as `intrinsics_zoom_##.json` and refreshes the latest `intrinsics.json` alias. If checkerboard stereo extrinsics were computed, they are saved in the same JSON under `extrinsics`.
 - `적용` loads the current visible WIRIS zoom's intrinsics and applies them to distance calculation.
 - The `저장 파일 비교` list lets you add multiple saved intrinsics JSON files, compare their left/right fx/fy/cx/cy/error values in a scrollable list, remove entries from the comparison list without deleting files, drag entries to reorder them, and apply the selected comparison file to distance calculation.
 
@@ -242,7 +244,7 @@ Use this tab after camera connection and WIRIS timestamp verification, before pa
 Use this tab after `보정` to confirm the geometry that will be used by alignment and measurement.
 
 - `내부` shows the currently loaded left/right intrinsics, distortion coefficients, image count, reprojection error, and whether the result is active or only the latest calibration output. Zoom-specific saves are keyed off the visible WIRIS zoom level used when saving or loading calibration.
-- `외부/기하` shows live Pixhawk-derived pose, the source of the effective focal length and baseline, the fixed `nominal-shared-rig-v1` mount assumption, loaded UAM ground truth source/sample counts, and whether a 2D bbox-center adjustment matrix is loaded. The `계산 설정` view still splits `내부 파라미터` and `외부/기하` side by side around the center line. The default measurement mode is 3D ray triangulation with `Pixhawk 자세 + GPS/RTK baseline`; if required intrinsics, attitude, or GPS/RTK baseline translation are unavailable, the app waits instead of recording a simple disparity fallback.
+- `외부/기하` shows live Pixhawk-derived pose, checkerboard stereo extrinsics when available, the source of the effective focal length and baseline, the fixed `nominal-shared-rig-v1` mount assumption, loaded UAM ground truth source/sample counts, and whether a 2D bbox-center adjustment matrix is loaded. The `계산 설정` view under `파라미터` still splits `내부 파라미터` and `외부/기하` side by side around the center line. The default measurement mode is 3D ray triangulation with `Pixhawk 자세 + GPS/RTK baseline`; selecting `체커보드 Stereo 외부 파라미터` uses the saved OpenCV optical RDF stereo transform and only waits for applied intrinsics plus checkerboard stereo extrinsics.
 - `수동 초점거리 사용` allows manual `fx` entry when a checkerboard is unavailable. The focal-length and WIRIS zoom-level tooltips include nominal WIRIS OZ zoom estimates from index `0` to `14`, using the 1280x720 HFOV 63.7 degree estimate where index `0` is about `1,030 px` and index `14` is about `30,906 px`.
 
 ### 고급 > WIRIS SDK
@@ -262,7 +264,7 @@ Use this tab after `보정` to confirm the geometry that will be used by alignme
 Use this tab to start and monitor object distance.
 
 - `실시간` contains live WIRIS views, stream receive/YOLO Hz status, distance status, recording controls, and a split Right/Down/Forward/Range graph. Press `세션 기록 시작` before collecting rows that must later be compared with ULog. The Range pane always plots `YOLO Range`, the stereo baseline-center distance estimated from YOLO/stereo. If a UAM alignment profile is loaded and live UAM N/E/D telemetry is available, it also plots `Telemetry Range`, the baseline-center reference distance computed from live telemetry through the profile origin, and stores `telemetry_range_m`/`telemetry_range_error_m` fields in the sample row. All displayed Range/Distance values are baseline-center distances, so UI and new CSV labels omit `baseline`. This is an operational monitor; final accuracy reporting should use `저장·분석 > UAM 비교` with ULog-based matching.
-- `계산 설정` contains focal length, baseline, sync gates, class matching, and attitude-gating settings for `Pixhawk 자세 + GPS/RTK baseline` 3D ray triangulation. The graph records only successful ray-triangulated samples. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
+- `파라미터 > 계산 설정` contains focal length, external-parameter source, sync gates, class matching, and attitude-gating settings. `Pixhawk 자세 + GPS/RTK baseline` uses live Pixhawk attitude and GPS/RTK translation; `체커보드 Stereo 외부 파라미터` uses the applied checkerboard `R/T` in the OpenCV optical RDF contract and does not require live Pixhawk/GPS inputs. The graph records only successful ray-triangulated samples. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
 - If an Origin-BBOX Reprojection Profile JSON is loaded in `고급 > Bias 보정`, the measurement path applies it before display/recording: raw bbox center and raw triangulation are kept, corrected bbox center is triangulated again, and the CSV stores `left/right_cx`, `left/right_width_px`, `left/right_height_px`, `left/right_confidence`, `raw_disparity_px`, `raw_range_m`, `left/right_corrected_cx/cy`, `left/right_bbox_du/dv_px`, corrected `Right/Down/Forward/Range`, `profile_output_policy`, and profile fallback fields. Missing cells, out-of-range bins, incomplete bbox pairs, and bad disparity are no-op fallbacks. Profiles built without an explicit correction mode now default to conservative `component_gains`; use `full` only as a diagnostic baseline when validation proves it does not regress Right/Down. If `profile_output_policy=range_only_forward_fusion`, the displayed/saved corrected `Right/Down` remain raw values while corrected `Forward` comes from the reprojection-triangulated point.
 - `삼각측량 품질` is a display-only panel for the current 3D ray result. It shows ray gap, distance, baseline, method, raw/corrected 3D point, and a simple left/right ray midpoint sketch; it does not add warning thresholds, automatic decisions, or save-analysis fields.
 - `YOLO 측정 시작` restarts camera streams in YOLO/depth mode; while measuring, the same button changes to `YOLO 측정 중지` and returns to camera preview mode while keeping Pixhawk connections active.
@@ -276,10 +278,9 @@ Use this tab to start and monitor object distance.
 
 Use this tab to review the current recording summary, compare UAM ground truth, inspect recorded samples, and persist data/settings. It is split into `세션 저장`, `UAM 비교`, and `기록 샘플`.
 
-- `세션 저장` contains `세션 파일 저장` and `전체 설정 저장`. `세션 파일 저장` writes the active session under `<STEREO_DISTANCE_APP>/recordings/sessions/<session_id>/`. The session folder is split by artifact type: `metadata/session_metadata.json`, raw camera MP4 files under `video/`, measurement CSVs under `measurements/`, and alignment/MAG CSVs under `alignment/`.
-- Session storage follows a fixed metadata/time-series split. `metadata/session_metadata.json` stores session-level constants and contracts: scenario name, target class/size, stereo baseline, camera height, zoom/FOV or intrinsics ID, image size, selected correction/profile IDs, validated profile envelope, truth source, time basis, and coordinate/axis contracts. `measurements/distance_history.csv` stores timestamped measurement rows: bbox centers/sizes/confidence, raw disparity/range, raw and corrected stereo-center Right/Down/Forward, frame timestamps, active intrinsics/profile IDs, fallback status, and per-row latency/age diagnostics. `alignment/external_parameters.csv`, `alignment/pixhawk_mag_status.csv`, and `measurements/uam_analysis.csv` are lower-rate or post-analysis time-series files and must keep their own timestamps. If a setting can change during a run, record its initial contract in metadata and the active setting/profile/intrinsics identifier on every affected row.
+- `세션 저장` contains `세션 파일 저장` and `전체 설정 저장`. `세션 파일 저장` writes the active session under `<STEREO_DISTANCE_APP>/recordings/sessions/<session_id>/`. The session folder is split by artifact type: `metadata/session_metadata.json`, raw camera MP4 files under `video/`, measurement CSVs under `measurements/`, and alignment CSVs under `alignment/`.
+- Session storage follows a fixed metadata/time-series split. `metadata/session_metadata.json` stores session-level constants and contracts: scenario name, target class/size, stereo baseline, camera height, zoom/FOV or intrinsics ID, image size, selected correction/profile IDs, validated profile envelope, truth source, time basis, and coordinate/axis contracts. It also stores the selected triangulation source and the applied checkerboard stereo `R/T` (including pair count, reprojection error, and the derived right-camera origin in left-camera RDF) when available. `measurements/distance_history.csv` stores timestamped measurement rows: bbox centers/sizes/confidence, raw disparity/range, raw and corrected stereo-center Right/Down/Forward, frame timestamps, active intrinsics/profile IDs, the active triangulation source, checkerboard calibration state, fallback status, and per-row latency/age diagnostics. `alignment/external_parameters.csv` and `measurements/uam_analysis.csv` are lower-rate or post-analysis time-series files and must keep their own timestamps. If a setting can change during a run, record its initial contract in metadata and the active setting/profile/intrinsics identifier on every affected row.
 - `기록 샘플` contains `거리 샘플 실시간 보기`. It appends each newly recorded distance sample to a table with the main CSV columns. Selecting a row shows the full CSV field set for that sample, including raw/corrected stereo-center camera Right/Down/Forward, diagnostic left-camera raw point, drone/UAM North/East/Down telemetry point, provisional mixed-frame residual error, applied bias, left/right bbox center fields, bbox UTC fields, and drone sample age when available.
-- `pixhawk_mag_status.csv` stores a Pixhawk 1/2 snapshot of `CAL_MAG0` through `CAL_MAG4`, selected MAG, RM3100 status, priorities, arm state, warning text, and session elapsed time so MAG state can be checked against distance and video data.
 - `UAM 비교` contains `UAM Ground Truth 비교`, loads a PX4 `.ulg` file, and time-matches recorded YOLO 3D rows with `vehicle_local_position`, `vehicle_odometry`, or `vehicle_visual_odometry` N/E/D samples. PX4 topics still expose these fields as `x/y/z`; the app names them `truth_north_m`, `truth_east_m`, and `truth_down_m`. If local topics are unavailable, the loader can convert `vehicle_global_position`, `vehicle_gps_position`, or `sensor_gps` latitude/longitude/altitude to local N/E/D using the local-position reference, `home_position`, or first valid GPS/global sample fallback origin. When the ULog also contains `vehicle_gps_position.time_utc_usec` or `sensor_gps.time_utc_usec`, the loader maps PX4 local timestamps to UTC and uses `timestamp_sample` before `timestamp` when that field is valid.
 - Profile generation should expose the selected truth source in the output
   profile and comparison CSV. A `local_ned` profile, a `global_position` profile,
@@ -288,7 +289,8 @@ Use this tab to review the current recording summary, compare UAM ground truth, 
 - `ULog 선택/로드` opens a file picker and immediately loads the selected `.ulg`. `현재 경로 다시 로드` reuses the path already typed in the ULog field, which is useful after manually editing the path or replacing the file.
 - Recorded YOLO values use the stereo-rig center optical frame and are displayed as `Right`, `Down`, and `Forward`. Legacy CSV fields `x_m/y_m/z_m` remain as aliases for compatibility. The left-camera triangulation midpoint remains available as `raw_left_x/y/z_m` for diagnostics. A target on the camera centerline should therefore have `Right` close to `0`.
 - If a ULog is loaded, it is the preferred analysis source. If no ULog is loaded, `UAM 비교 실행` uses the live telemetry buffer from `연결 > UAM`; if that is unavailable, it uses `drone_x/y/z` values already embedded in recorded rows. A single comparison run does not mix ULog/live samples with recorded-row fallback. Rows outside the active truth time range are excluded and reported through the matched/unmatched count.
-- `최대 Δt` gates the time match between YOLO row time and ground truth time. `time offset` is added to the YOLO timestamp for post-flight correction before matching. Matching is UTC-first when `bbox_mid_utc_unix_s` and ULog UTC are both available, then falls back to `bbox_mid_timestamp_s`/`timestamp_s`, then to recorded `drone_utc_unix_s` or `drone_timestamp_s` row values.
+- `최대 Δt` gates the time match between YOLO row time and ground truth time. `time offset` is added to the YOLO timestamp for post-flight correction before matching. Matching is UTC-first when `bbox_mid_utc_unix_s` and ULog UTC are both available, then falls back to `bbox_mid_timestamp_s`/`timestamp_s`, then to recorded `drone_utc_unix_s` or `drone_timestamp_s` row values. Every distance row records `camera_time_sync_status`; `within-threshold-unverified` is not a validated UAM UTC result and `pair-delta-failed`, `pc-offset-failed`, or `missing-rtcp` must be excluded from absolute-time claims.
+- Live stereo pairing uses `RTCP/NTP 우선` by default. If the two WIRIS RTCP clocks do not produce a pair inside `최대 Δt`, the app falls back to the common app-receive monotonic clock and labels the pair `app fallback`. This preserves live pairing while keeping the RTCP/NTP/PC-UTC result as a separate diagnostic; an `app fallback` pair must not be treated as an absolute UTC-synchronized pair.
 - `시간 offset 추정` scans candidate offsets against the loaded ULog or live buffer, using UTC basis first when available and timestamp basis otherwise. It applies the best candidate to `time offset` and immediately reruns comparison. Treat the result as a reviewable candidate: confirm the matched count, time basis, timestamp deltas, and error plot before report generation.
 - `좌표 보정 자동 추정` estimates a rigid camera-to-PX4-local transform from the currently matched YOLO raw stereo-center Right/Down/Forward rows and UAM North/East/Down truth rows. It requires at least three non-collinear matched samples; move the UAM/drone across several screen positions before using it. The profile stores the rotation matrix and origin N/E/D offset.
 - `보정 저장` writes the coordinate-alignment profile as JSON, and `보정 불러오기` applies a saved profile to the current UAM comparison. Use a saved profile from a calibration run for the main experiment when the camera/UAM/Pixhawk geometry has not changed.
@@ -318,16 +320,18 @@ The profile path is constrained by the configured `.env` values: `DRONE_SPAWN_Y_
 
 ### 시간
 
-Use this tab to capture WIRIS still images over the Ethernet SDK path, download the latest FTP images, and inspect EXIF clock offset.
+Use this tab to set WIRIS RTC from PC UTC, inspect live RTCP/NTP stream clock offset, capture WIRIS still images over the Ethernet SDK path, download the latest FTP images, and inspect EXIF clock offset.
 The default FTP download directory is `<STEREO_DISTANCE_APP>/clock_captures/`; relative paths in this tab are resolved from the `StereoDistance` app root, not from the shell's current working directory.
 
 - `CPTR 촬영 / FTP 다운로드` sends `CPTR` to both WIRIS cameras, checks `ICPT`, downloads the newest JPG/TIFF from each camera's FTP folder, and can run the pair EXIF analysis in one sequence.
+- `PC UTC로 시간 설정` sends a shared `STUS` UTC value to the selected WIRIS RTC target. When both cameras are selected, the app logs the shared command UTC and TCP call-start skew.
+- `RTCP/NTP 동기화 확인` selects recent left/right frames received close together, compares their stream-frame `rtcp_frame_ntp_unix_s` values, and reports each frame's `rtcp_frame_receive_delay_s` separately. The receive delay includes encoder/network/decoder transit and is not treated as a camera-clock offset. This is a stream-timing diagnostic, not proof that RTCP NTP equals WIRIS `GDTI` or UAM UTC.
 - FTP settings use the current left/right WIRIS control hosts for the FTP host addresses; set the FTP user, password, port, remote image directory, and local download folder before running the sequence.
 - `파일 쌍 비교` reads one left image and one right image and reports `right-left` capture timestamp offset.
 - `폴더 비교` scans left/right folders recursively, pairs images by matching filenames when possible, otherwise by sorted order, and reports per-pair offsets plus median/mean offset.
 - The parser reads JPEG/TIFF EXIF `GPSDateStamp`/`GPSTimeStamp` first, then falls back to `DateTimeOriginal` or `DateTime`.
 - The table shows capture timestamp source, subsecond availability, GPS coordinates when present, and warnings for second-only timestamps or mixed timestamp sources.
-- Manufacturer guidance says WIRIS `camera_captured` timestamps and RTP/RTCP stream timing use the same camera RTC. The `시간` tab therefore checks the left/right WIRIS RTC offset that also applies to stream-derived frame timing.
+- Timing contract: WIRIS `STUS/GDTI` is the camera body-clock check, RTP is a relative stream counter, and RTCP Sender Report NTP is a stream-derived wall-clock estimate. The app pairs frames by close PC receive time, uses RTCP/NTP delta only for the relative stereo gate, and records RTCP frame transit delay as a transport diagnostic. Treat RTCP/NTP as `unverified` for UAM UTC matching until a repeatable GDTI-to-RTCP validation passes. A stereo pair is within the relative timing criterion when its RTCP/NTP delta is at most 50 ms; the UAM absolute-time criterion additionally requires an independently validated camera-to-PC/UAM UTC mapping and a motion-error budget that supports the measurement.
 
 ## Inputs/Outputs and Interfaces
 
@@ -398,7 +402,7 @@ The diagnostic checks host IPs, UDP `8888` / `14550` / `14551`, USB MAVLink cand
 
 - Live camera preview frames.
 - Left/right `수신` Hz and YOLO Hz in the `측정` tab.
-- Left/right camera status lines in the same `카메라 상태` group as stream Hz and YOLO Hz in the `측정` tab, showing UTC only when the timestamp basis is marked GNSS-UTC and camera RTC time derived from RTCP Sender Reports otherwise, with source timestamps as fallback.
+- Left/right camera status lines in the same `카메라 상태` group as stream Hz and YOLO Hz in the `측정` tab, showing UTC only when the timestamp basis is marked GNSS-UTC and RTCP/NTP-derived stream time otherwise, with source timestamps as fallback.
 - Optional recorded CSV fields include GStreamer RTP timestamp, SSRC, RTCP Sender Report based NTP estimates, `camera_rtc_frame_unix_s` aliases, and the frame timestamp reference for later timing analysis.
 - YOLO detections and best bounding boxes.
 - Current distance estimate.
@@ -508,6 +512,11 @@ The bootstrap installs `requirements/calibration.txt` and verifies `import cv2`.
 - Added UAM coordinate-alignment profile estimation, JSON save/load, and application in `저장·분석 > UAM 비교` so final analysis can report estimated N/E/D and position error after origin correction.
 - Added a compact legend and hover tooltip to telemetry graphs, including `Raw NED`, so operators can identify series color and inspect point time/value.
 
+### 2026-07-17
+
+- Added an RTCP timing contract for cameras whose Sender Report NTP arrives later than the encoded frame: preserve the RTCP-derived relative pair timestamp for stereo matching, report frame transit delay separately, and keep UAM UTC claims unverified until an independent clock check passes.
+- Method: `RTCP pair-preserve / transit-delay-separation`. Inputs are RTCP Sender Report NTP, app receive monotonic time, and PC wall UTC. The relative pass criterion is pair delta <= 50 ms; frame transit delay is diagnostic only, while absolute UAM UTC use requires repeatable GDTI-to-RTCP-to-PC validation and the motion-error budget.
+
 ### 2026-06-02
 
 - Added `연결 > UAM` and `저장·분석 > UAM Ground Truth 비교` so ULog-first post-flight analysis can fall back to live ROS2/MAVLink UAM telemetry or embedded recorded drone rows.
@@ -531,7 +540,7 @@ The bootstrap installs `requirements/calibration.txt` and verifies `import cv2`.
 - Unified start/stop style button pairs for camera preview, YOLO measurement, ROS2, and MAVLink into single state-changing buttons.
 - Compressed the `인터페이스`, `PC IP`, `포트`, `타임아웃`, `IP Mask`, and `STIP 후 재부팅` camera network settings into one compact top row.
 - Replaced the free-form YOLO `추론 장치` input with a CPU/CUDA toggle that stores `cpu` or `cuda:0`.
-- Moved the `R/T 삼각측량 사용` toggle from `보정` into `측정 > 계산 설정`.
+- Moved the `R/T 삼각측량 사용` toggle from `보정` into `파라미터 > 계산 설정`.
 - Reorganized tabs for the QGC-first field workflow: `연결`, `시간`, `보정`, `파라미터`, `정렬`, `YOLO`, `측정`, `저장·분석`, and `고급`.
 - Added WIRIS visible zoom ratio estimated `fx px` tooltips and widened manual focal-length input so high zoom ratios can be entered without checkerboard calibration.
 - Added `OpenCV Auto` and optional `PyAV` choices to the YOLO `수신 백엔드` selector.
@@ -551,14 +560,14 @@ The bootstrap installs `requirements/calibration.txt` and verifies `import cv2`.
 - Changed the WIRIS visible zoom tooltip basis from 1920x1080 to 1280x720 so the nominal focal-length estimates match the HD stream configuration.
 - Refined the measurement-tab camera status display to keep receive Hz, YOLO Hz, and frame time on one line per camera, showing UTC only for GNSS-UTC-synced frames and RTCP/NTP otherwise while keeping source timestamps as fallback and exposing the frame timestamp reference in recordings.
 - Compacted the real-time header so the action buttons and camera status share one horizontal strip on wide windows, and fold vertically on compact windows to avoid overlap while leaving more vertical space for the camera views.
-- Added a `계산 설정 저장` button inside the measurement `계산 설정` group so the active stereo calculation settings can be saved without leaving the measurement tab.
+- Added a `계산 설정 저장` button inside the `파라미터 > 계산 설정` group so the active stereo calculation settings can be saved without leaving the parameter tab.
 
 ### 2026-05-18
 
 - Requested MAVLink `GPS_RAW_INT` and `GPS2_RAW` streams automatically on heartbeat so `정렬 > Baseline` can inspect GNSS data even when ROS2 GPS topics are unavailable.
 - Added `--start-pixhawk` / `--connect-pixhawk` startup flags to open MAVLink and show the Baseline alignment view immediately during field checks.
 - Added GStreamer RTP timestamp and RTCP Sender Report based NTP estimate CSV fields for left/right stream timing diagnostics.
-- Removed the measurement-tab live `t`, `age`, `wall`, `src`, display-delta, `srcPTS`, and RTP/RTCP timing readouts so routine monitoring focuses on receive Hz and YOLO Hz.
+- Kept the measurement-tab live timing details in tooltips/record metadata while the real-time summary shows both left/right RTCP-derived NTP times alongside receive Hz, YOLO Hz, and Pair status.
 - Added YOLO Hz next to receive Hz in the measurement-tab live camera status chips.
 - Made NVIDIA the default RTSP decoder and reduced YOLO preview CPU cost by drawing only the best detection box on frames that are actually displayed.
 - Changed WIRIS SDK command defaults to LINE termination and delayed RTSP frame checks after Ethernet Mode activation so cameras have time to open port 8554.

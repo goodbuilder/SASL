@@ -9,6 +9,7 @@ from wiris_stereo_distance.triangulation import (
     body_frd_vector_to_camera,
     camera_translation_right_in_left_camera,
     camera_vector_to_body_frd,
+    invert_left_to_right_camera_transform,
     normalized_ray_from_pixel,
     stereo_center_point_from_left_camera,
     triangulate_pixels,
@@ -125,3 +126,13 @@ def test_pixhawk_mount_triangulation_matches_forward_camera_geometry() -> None:
 
     assert result is not None
     assert round(result.distance_m, 1) == 5.4
+
+
+def test_invert_checkerboard_left_to_right_transform_preserves_right_origin_contract() -> None:
+    rotation_right_to_left, translation_right_in_left = invert_left_to_right_camera_transform(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        [-0.3, 0.0, 0.0],
+    )
+
+    assert rotation_right_to_left == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    assert rounded_tuple(translation_right_in_left) == (0.3, 0.0, 0.0)

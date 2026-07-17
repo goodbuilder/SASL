@@ -1,6 +1,11 @@
 from types import SimpleNamespace
 
-from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
+from wiris_stereo_distance.calibration import (
+    CameraIntrinsics,
+    CheckerboardConfig,
+    StereoExtrinsics,
+    StereoIntrinsicsResult,
+)
 from wiris_stereo_distance.measurement_controller import MeasurementGeometryInput, calculate_measurement_geometry
 from wiris_stereo_distance.stereo import DetectionObservation, StereoCalibration
 
@@ -21,7 +26,7 @@ def detection(camera: str, *, x1: float, x2: float, t: float = 10.0) -> Detectio
     )
 
 
-def intrinsics_result() -> StereoIntrinsicsResult:
+def intrinsics_result(*, extrinsics: StereoExtrinsics | None = None) -> StereoIntrinsicsResult:
     intrinsics = CameraIntrinsics(
         width=1280,
         height=720,
@@ -34,6 +39,7 @@ def intrinsics_result() -> StereoIntrinsicsResult:
         left=intrinsics,
         right=intrinsics,
         board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.03),
+        extrinsics=extrinsics,
     )
 
 
@@ -122,3 +128,46 @@ def test_measurement_controller_keeps_match_validation_separate_from_triangulati
     assert result.match is None
     assert result.triangulated is not None
     assert result.estimate is None
+
+
+def test_measurement_controller_checkerboard_extrinsics_triangulates_without_pixhawk() -> None:
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=detection("left", x1=690.0, x2=710.0),
+            right=detection("right", x1=640.0, x2=660.0),
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=intrinsics_result(
+                extrinsics=StereoExtrinsics(
+                    rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    translation_left_to_right_m=[-0.3, 0.0, 0.0],
+                    reprojection_error_px=0.2,
+                    pair_count=12,
+                )
+            ),
+            triangulation_source="checkerboard",
+            sync_quality="GOOD",
+        )
+    )
+
+    assert result.match is not None
+    assert result.triangulated is not None
+    assert result.estimate is not None
+    assert round(result.triangulated.baseline_m, 1) == 0.3
+    assert result.warnings == ()
+
+
+def test_measurement_controller_checkerboard_mode_waits_for_stereo_extrinsics() -> None:
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=detection("left", x1=690.0, x2=710.0),
+            right=detection("right", x1=640.0, x2=660.0),
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=intrinsics_result(),
+            triangulation_source="checkerboard",
+            sync_quality="GOOD",
+        )
+    )
+
+    assert result.triangulated is None
+    assert result.estimate is None
+    assert "triangulation waiting for checkerboard stereo extrinsics" in result.warnings

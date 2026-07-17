@@ -58,6 +58,7 @@ UINT32_MODULUS = 2**32
 UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
+MAX_RTCP_SR_PC_OFFSET_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -558,6 +559,29 @@ class RtcpSenderReportTiming:
     rtp_timestamp: int
     clock_rate_hz: int
     received_monotonic_s: float
+    received_wall_s: float | None = None
+
+
+def rtcp_sender_report_pc_offset_s(
+    *,
+    sr_ntp_unix_s: float,
+    received_wall_s: float,
+) -> float | None:
+    offset_s = float(sr_ntp_unix_s) - float(received_wall_s)
+    return offset_s if abs(offset_s) <= 60.0 else None
+
+
+def rtcp_sender_report_is_pc_valid(
+    *,
+    sr_ntp_unix_s: float,
+    received_wall_s: float,
+    max_offset_s: float = MAX_RTCP_SR_PC_OFFSET_S,
+) -> bool:
+    offset_s = rtcp_sender_report_pc_offset_s(
+        sr_ntp_unix_s=sr_ntp_unix_s,
+        received_wall_s=received_wall_s,
+    )
+    return offset_s is not None and abs(offset_s) <= float(max_offset_s)
 
 
 class GstRtpTimingTracker:
@@ -608,7 +632,14 @@ class GstRtpTimingTracker:
         if src_pad is not None:
             src_pad.add_probe(self.Gst.PadProbeType.BUFFER, self._map_depay_buffer_pts)
 
-    def frame_metadata(self, buffer, now_s: float) -> dict[str, int | float | str] | None:
+    def frame_metadata(
+        self,
+        buffer,
+        now_s: float,
+        *,
+        received_wall_s: float | None = None,
+    ) -> dict[str, int | float | str] | None:
+        received_wall_s = time.time() if received_wall_s is None else float(received_wall_s)
         self._poll_rtcp_sender_reports(now_s)
         pts_ns = None if buffer.pts == self.Gst.CLOCK_TIME_NONE else int(buffer.pts)
         frame_timing = self._pop_frame_timing(pts_ns)
@@ -637,10 +668,23 @@ class GstRtpTimingTracker:
                 "rtcp_sr_rtp_timestamp": sr_timing.rtp_timestamp,
                 "rtcp_clock_rate_hz": sr_timing.clock_rate_hz,
                 "rtcp_sr_age_s": max(0.0, now_s - sr_timing.received_monotonic_s),
+                "rtcp_sr_received_wall_s": sr_timing.received_wall_s,
             }
         )
+        if sr_timing.received_wall_s is not None:
+            sr_pc_offset_s = rtcp_sender_report_pc_offset_s(
+                sr_ntp_unix_s=sr_timing.ntp_unix_s,
+                received_wall_s=sr_timing.received_wall_s,
+            )
+            if sr_pc_offset_s is not None:
+                metadata["rtcp_sr_pc_offset_s"] = sr_pc_offset_s
         if frame_ntp_s is not None:
+            # An RTCP Sender Report can describe an older encoded frame. Its
+            # arrival delay is a transport/encoder diagnostic, not proof that
+            # the camera clock is wrong, so keep the RTP->NTP mapping intact.
             metadata["rtcp_frame_ntp_unix_s"] = frame_ntp_s
+            metadata["rtcp_frame_received_wall_s"] = received_wall_s
+            metadata["rtcp_frame_receive_delay_s"] = received_wall_s - frame_ntp_s
         return metadata
 
     def _handle_new_manager(self, _source, manager) -> None:
@@ -753,6 +797,7 @@ class GstRtpTimingTracker:
                 rtp_timestamp=sr_rtp_timestamp,
                 clock_rate_hz=clock_rate_hz,
                 received_monotonic_s=now_s,
+                received_wall_s=time.time(),
             )
             message = self._register_sender_report(timing)
             if message is not None:
@@ -1236,7 +1281,9 @@ def _emit_preview_frame(
         metadata.update(extra_metadata)
     metadata.setdefault(
         "timestamp_reference",
-        "rtcp-ntp"
+        "rtcp-invalid"
+        if metadata.get("rtcp_timing_invalid_reason")
+        else "rtcp-ntp"
         if metadata.get("rtcp_frame_ntp_unix_s") is not None
         else "source"
         if metadata.get("source_timestamp_s") is not None
@@ -1352,12 +1399,17 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             if sample is None:
                 continue
             receive_s = time.monotonic()
+            receive_wall_s = time.time()
             caps = sample.get_caps().get_structure(0)
             width = int(caps.get_value("width"))
             height = int(caps.get_value("height"))
             buffer = sample.get_buffer()
             source_timestamp_s = None if buffer.pts == Gst.CLOCK_TIME_NONE else buffer.pts / 1e9
-            rtp_timing_metadata = rtp_timing_tracker.frame_metadata(buffer, receive_s) or {}
+            rtp_timing_metadata = rtp_timing_tracker.frame_metadata(
+                buffer,
+                receive_s,
+                received_wall_s=receive_wall_s,
+            ) or {}
             success, map_info = buffer.map(Gst.MapFlags.READ)
             if not success:
                 continue
@@ -1468,7 +1520,9 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
             detection_timestamp_metadata.update(rtp_timing_metadata)
             detection_timestamp_metadata.setdefault(
                 "timestamp_reference",
-                "rtcp-ntp"
+                "rtcp-invalid"
+                if detection_timestamp_metadata.get("rtcp_timing_invalid_reason")
+                else "rtcp-ntp"
                 if detection_timestamp_metadata.get("rtcp_frame_ntp_unix_s") is not None
                 else "source"
                 if detection_timestamp_metadata.get("source_timestamp_s") is not None

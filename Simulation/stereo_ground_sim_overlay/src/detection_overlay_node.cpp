@@ -20,6 +20,9 @@ struct Detection
   float y1{0.0F};
   float x2{0.0F};
   float y2{0.0F};
+  float confidence{0.0F};
+  float cx{0.0F};
+  float cy{0.0F};
 };
 
 }  // namespace
@@ -94,6 +97,9 @@ private:
     detection.y1 = values[2];
     detection.x2 = values[3];
     detection.y2 = values[4];
+    detection.confidence = std::isfinite(values[5]) ? values[5] : 0.0F;
+    detection.cx = std::isfinite(values[6]) ? values[6] : 0.5F * (values[1] + values[3]);
+    detection.cy = std::isfinite(values[7]) ? values[7] : 0.5F * (values[2] + values[4]);
     return detection;
   }
 
@@ -137,8 +143,13 @@ private:
   {
     sensor_msgs::msg::Image::ConstSharedPtr source;
     Detection detection;
+    bool pair_has_positive_disparity{false};
     {
       std::lock_guard<std::mutex> lock(mutex_);
+      pair_has_positive_disparity =
+        left_detection_.valid && right_detection_.valid &&
+        std::isfinite(left_detection_.cx) && std::isfinite(right_detection_.cx) &&
+        (left_detection_.cx - right_detection_.cx > 0.5F);
       if (std::string(side) == "left") {
         source = last_left_image_;
         detection = left_detection_;
@@ -152,11 +163,14 @@ private:
     }
     (void)side;
     auto output = std::make_unique<sensor_msgs::msg::Image>(*source);
-    drawDetection(*output, detection);
+    drawDetection(*output, detection, pair_has_positive_disparity);
     publisher->publish(std::move(output));
   }
 
-  void drawDetection(sensor_msgs::msg::Image & image, const Detection & detection)
+  void drawDetection(
+    sensor_msgs::msg::Image & image,
+    const Detection & detection,
+    bool pair_has_positive_disparity)
   {
     if (image.height == 0 || image.width == 0 || image.step < image.width * 3 ||
         image.data.size() < static_cast<size_t>(image.step) * image.height) {
@@ -170,6 +184,14 @@ private:
 
     const int width = static_cast<int>(image.width);
     const int height = static_cast<int>(image.height);
+    const bool confidence_ok = detection.confidence >= 0.25F;
+    const std::array<uint8_t, 3> green{0, 255, 0};
+    const std::array<uint8_t, 3> yellow{255, 210, 0};
+    const std::array<uint8_t, 3> orange{255, 96, 0};
+    const auto color =
+      pair_has_positive_disparity && confidence_ok ? green :
+      pair_has_positive_disparity ? yellow : orange;
+
     int x1 = clampInt(std::lround(detection.x1), 0, width - 1);
     int x2 = clampInt(std::lround(detection.x2), 0, width - 1);
     int y1 = clampInt(std::lround(detection.y1), 0, height - 1);
@@ -181,12 +203,15 @@ private:
       std::swap(y1, y2);
     }
 
-    const std::array<uint8_t, 3> green{0, 255, 0};
     constexpr int thickness = 4;
-    fillRect(image, x1, y1, x2, std::min(y1 + thickness - 1, height - 1), green);
-    fillRect(image, x1, std::max(y2 - thickness + 1, 0), x2, y2, green);
-    fillRect(image, x1, y1, std::min(x1 + thickness - 1, width - 1), y2, green);
-    fillRect(image, std::max(x2 - thickness + 1, 0), y1, x2, y2, green);
+    fillRect(image, x1, y1, x2, std::min(y1 + thickness - 1, height - 1), color);
+    fillRect(image, x1, std::max(y2 - thickness + 1, 0), x2, y2, color);
+    fillRect(image, x1, y1, std::min(x1 + thickness - 1, width - 1), y2, color);
+    fillRect(image, std::max(x2 - thickness + 1, 0), y1, x2, y2, color);
+    const int cx = clampInt(std::lround(detection.cx), 0, width - 1);
+    const int cy = clampInt(std::lround(detection.cy), 0, height - 1);
+    drawCross(image, cx, cy, 10, color);
+    fillRect(image, 0, 0, width - 1, std::min(5, height - 1), color);
   }
 
   void drawMissingBorder(sensor_msgs::msg::Image & image)
@@ -221,6 +246,23 @@ private:
         pixel[2] = color[2];
       }
     }
+  }
+
+  void drawCross(
+    sensor_msgs::msg::Image & image,
+    int cx,
+    int cy,
+    int radius,
+    const std::array<uint8_t, 3> & color)
+  {
+    const int width = static_cast<int>(image.width);
+    const int height = static_cast<int>(image.height);
+    const int x1 = clampInt(cx - radius, 0, width - 1);
+    const int x2 = clampInt(cx + radius, 0, width - 1);
+    const int y1 = clampInt(cy - radius, 0, height - 1);
+    const int y2 = clampInt(cy + radius, 0, height - 1);
+    fillRect(image, x1, std::max(cy - 1, 0), x2, std::min(cy + 1, height - 1), color);
+    fillRect(image, std::max(cx - 1, 0), y1, std::min(cx + 1, width - 1), y2, color);
   }
 
   static int clampInt(long value, int lower, int upper)

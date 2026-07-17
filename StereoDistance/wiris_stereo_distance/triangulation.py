@@ -100,6 +100,33 @@ def _rotate_matrix(matrix: list[list[float]], v: tuple[float, float, float]) -> 
     )
 
 
+def invert_left_to_right_camera_transform(
+    rotation_left_to_right: list[list[float]],
+    translation_left_to_right_m: Iterable[float],
+) -> tuple[list[list[float]], tuple[float, float, float]]:
+    """Invert OpenCV's left-to-right camera transform into right-in-left form.
+
+    The checkerboard calibration contract is
+    ``X_right = R_left_to_right * X_left + T_left_to_right_m`` in optical RDF.
+    Triangulation needs the right-camera ray rotation and right-camera origin,
+    both expressed in the left optical RDF frame.
+    """
+    if len(rotation_left_to_right) != 3 or any(len(row) != 3 for row in rotation_left_to_right):
+        raise ValueError("rotation_left_to_right must be a 3x3 matrix")
+    translation = tuple(float(value) for value in translation_left_to_right_m)
+    if len(translation) != 3:
+        raise ValueError("translation_left_to_right_m must contain 3 values")
+    right_to_left = [
+        [float(rotation_left_to_right[row][column]) for row in range(3)]
+        for column in range(3)
+    ]
+    right_origin_in_left = tuple(
+        -sum(right_to_left[row][column] * translation[row] for row in range(3))
+        for column in range(3)
+    )
+    return right_to_left, right_origin_in_left
+
+
 def _rotate_matrix_tuple(
     matrix: tuple[tuple[float, float, float], ...],
     v: tuple[float, float, float],
