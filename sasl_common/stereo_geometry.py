@@ -17,6 +17,8 @@ BASELINE_CENTER_FRD_FRAME = "baseline_center_frd"
 BASELINE_CENTER_FRD_AXIS_CONTRACT = "baseline_center_frd:forward_right_down"
 BASELINE_CENTER_FRD_VECTOR_CONTRACT = "baseline_center_frd:[forward,right,down,range]"
 TRIANGULATION_METHOD = "two_ray_closest_midpoint"
+GEOMETRY_POLICY_LEGACY_FORWARD_ONLY = "legacy_forward_only"
+GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH = "diagnostic_signed_depth"
 
 IDENTITY_ROTATION: Matrix3 = (
     (1.0, 0.0, 0.0),
@@ -206,22 +208,31 @@ def triangulate_rays(
     right_ray_left_rdf: Sequence[float],
     left_origin_left_rdf_m: Sequence[float] = (0.0, 0.0, 0.0),
     parallel_epsilon: float = 1.0e-15,
-    common_frame: str | None = None,
+    common_frame: str = LEFT_CAMERA_RDF_FRAME,
     axis_contract: str = LEFT_CAMERA_RDF_AXIS_CONTRACT,
     vector_contract: str = LEFT_CAMERA_RDF_VECTOR_CONTRACT,
+    geometry_policy: str = GEOMETRY_POLICY_LEGACY_FORWARD_ONLY,
 ) -> RayTriangulationAttempt:
     """Find the closest-ray midpoint in the supplied common frame.
 
     The default left optical center is ``(0, 0, 0)`` for compatibility.  A
     non-zero left origin is accepted for fixed world/rig frames; no baseline
-    center translation or FRD axis reorder is performed here.  Omitting
-    ``common_frame`` retains the legacy StereoDistance invalid-geometry
-    policy; Simulation passes ``baseline_center_frd`` explicitly and receives
-    the current rank/signed-depth policy.
+    center translation or FRD axis reorder is performed here. ``common_frame``
+    records provenance only. Geometry validity is selected independently by
+    ``geometry_policy``; the default preserves the original StereoDistance
+    forward-only behavior.
     """
 
-    legacy_left_camera_defaults = common_frame is None
-    resolved_common_frame = LEFT_CAMERA_RDF_FRAME if common_frame is None else str(common_frame)
+    resolved_common_frame = str(common_frame)
+    if geometry_policy not in {
+        GEOMETRY_POLICY_LEGACY_FORWARD_ONLY,
+        GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
+    }:
+        return RayTriangulationAttempt(
+            None,
+            "invalid_geometry_policy",
+            {"geometry_policy": str(geometry_policy)},
+        )
 
     try:
         left_origin = _vector3(left_origin_left_rdf_m, name="left_origin_left_rdf_m")
@@ -251,7 +262,9 @@ def triangulate_rays(
     if cross_norm <= float(parallel_epsilon):
         return RayTriangulationAttempt(
             None,
-            "near_parallel_rays" if legacy_left_camera_defaults else "rank_deficient",
+            "near_parallel_rays"
+            if geometry_policy == GEOMETRY_POLICY_LEGACY_FORWARD_ONLY
+            else "rank_deficient",
             {
                 "geometry_rank": 1,
                 "condition_number": math.inf,
@@ -271,7 +284,7 @@ def triangulate_rays(
         right_closest = _add(right_origin, _scale(right_ray, right_depth_m))
         midpoint = _scale(_add(left_closest, right_closest), 0.5)
         range_m = _norm(midpoint)
-        ray_angle_deg = math.degrees(math.acos(ray_dot))
+        ray_angle_deg = math.degrees(math.atan2(cross_norm, ray_dot))
     except (ArithmeticError, OverflowError, ValueError) as exc:
         return RayTriangulationAttempt(
             None,
@@ -290,7 +303,10 @@ def triangulate_rays(
             {"geometry_rank": 2, "condition_number": condition_number},
         )
 
-    if legacy_left_camera_defaults and (left_depth_m <= 0.0 or right_depth_m <= 0.0):
+    if (
+        geometry_policy == GEOMETRY_POLICY_LEGACY_FORWARD_ONLY
+        and (left_depth_m <= 0.0 or right_depth_m <= 0.0)
+    ):
         return RayTriangulationAttempt(
             None,
             "non_positive_depth",
@@ -342,9 +358,10 @@ def triangulate_pixels(
     right_origin_left_rdf_m: Sequence[float],
     rotation_left_from_right_rdf: Sequence[Sequence[float]] = IDENTITY_ROTATION,
     left_origin_left_rdf_m: Sequence[float] = (0.0, 0.0, 0.0),
-    common_frame: str | None = None,
+    common_frame: str = LEFT_CAMERA_RDF_FRAME,
     axis_contract: str = LEFT_CAMERA_RDF_AXIS_CONTRACT,
     vector_contract: str = LEFT_CAMERA_RDF_VECTOR_CONTRACT,
+    geometry_policy: str = GEOMETRY_POLICY_LEGACY_FORWARD_ONLY,
 ) -> RayTriangulationAttempt:
     """Triangulate pinhole pixels after expressing the right ray in the left frame."""
 
@@ -364,4 +381,5 @@ def triangulate_pixels(
         common_frame=common_frame,
         axis_contract=axis_contract,
         vector_contract=vector_contract,
+        geometry_policy=geometry_policy,
     )

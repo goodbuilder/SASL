@@ -17,19 +17,15 @@ from rclpy.node import Node
 from std_msgs.msg import Float32, Float32MultiArray
 
 
-DEFAULT_AXES = ("right_roll_error_deg", "right_pitch_error_deg", "right_yaw_error_deg")
+DEFAULT_AXES = ("common_optical_yaw_error_deg", "relative_optical_yaw_error_deg")
 AXIS_CONTRACT = "stereo_center_frd:forward_right_down"
 DEFAULT_YOLO_MODEL = (
     "/home/moontaehyung/영상감시시스템/ref/wiris_stereo (copy)/wiris_stereo/"
     "yolov8n_uav.pt"
 )
 VALID_ATTITUDE_AXES = {
-    "left_roll_error_deg",
-    "left_pitch_error_deg",
-    "left_yaw_error_deg",
-    "right_roll_error_deg",
-    "right_pitch_error_deg",
-    "right_yaw_error_deg",
+    "common_optical_yaw_error_deg",
+    "relative_optical_yaw_error_deg",
 }
 
 
@@ -83,7 +79,7 @@ def parse_args():
         metavar="AXIS:MIN:MAX:STEP",
         help=(
             "Per-axis sweep range in degrees. Repeatable. "
-            "Example: --axis-range right_yaw_error_deg:-2:2:0.25"
+            "Example: --axis-range relative_optical_yaw_error_deg:-2:2:0.25"
         ),
     )
     parser.add_argument("--warmup-s", type=float, default=12.0)
@@ -110,7 +106,7 @@ def parse_args():
     parser.add_argument("--horizontal-fov-rad", type=float, default=0.154997710698)
     parser.add_argument("--image-width-px", type=int, default=1280)
     parser.add_argument("--image-height-px", type=int, default=720)
-    parser.add_argument("--camera-update-rate-hz", type=float, default=60.0)
+    parser.add_argument("--camera-update-rate-hz", type=float, default=20.0)
     parser.add_argument("--camera-clip-near-m", type=float, default=0.1)
     parser.add_argument("--camera-clip-far-m", type=float, default=2500.0)
     parser.add_argument("--target-spawn-x-m", type=float, default=0.0)
@@ -393,15 +389,10 @@ def camera_model_summary(args):
 def attitudes_from_args(attitude_args):
     left = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
     right = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
-    for name, value in attitude_args.items():
-        parts = name.split("_")
-        if len(parts) < 3:
-            continue
-        camera, axis = parts[0], parts[1]
-        if camera == "left" and axis in left:
-            left[axis] = float(value)
-        elif camera == "right" and axis in right:
-            right[axis] = float(value)
+    common = float(attitude_args.get("common_optical_yaw_error_deg", 0.0))
+    relative = float(attitude_args.get("relative_optical_yaw_error_deg", 0.0))
+    left["yaw"] = common - relative / 2.0
+    right["yaw"] = common + relative / 2.0
     return left, right
 
 
@@ -597,7 +588,7 @@ def build_cases(args):
 ATTITUDE_SIM_PATTERNS = (
     "stereo_ground_drone_attitude_error.sdf",
     "ros2 launch stereo_ground_sim stereo_ground_sim.launch.py.*fly_target_in_gazebo:=true",
-    "ros2 launch stereo_ground_sim stereo_ground_sim.launch.py.*right_(roll|pitch|yaw)_error_deg:=",
+    "ros2 launch stereo_ground_sim stereo_ground_sim.launch.py.*(common|relative)_optical_yaw_error_deg:=",
 )
 
 
@@ -750,7 +741,6 @@ def main():
             f"launch_rviz:={'true' if args.keep_gui else 'false'}",
             "mission_profile:=takeoff_forward_land",
             "fly_target_in_gazebo:=true",
-            "actual_distance_source:=gazebo",
             f"approach_start_distance_m:={args.approach_start_distance_m}",
             f"approach_end_distance_m:={args.approach_end_distance_m}",
             f"takeoff_altitude_m:={args.takeoff_altitude_m}",

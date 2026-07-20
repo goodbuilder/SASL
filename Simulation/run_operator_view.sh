@@ -812,10 +812,10 @@ add_optional_default_launch_arg() {
 
 add_default_launch_arg left_roll_error_deg "${LEFT_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg left_pitch_error_deg "${LEFT_PITCH_ERROR_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg left_yaw_error_deg "${LEFT_YAW_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg right_roll_error_deg "${RIGHT_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg right_pitch_error_deg "${RIGHT_PITCH_ERROR_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg right_yaw_error_deg "${RIGHT_YAW_ERROR_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg common_optical_yaw_error_deg "${COMMON_OPTICAL_YAW_ERROR_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg relative_optical_yaw_error_deg "${RELATIVE_OPTICAL_YAW_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg scenario_name "${SIM_SCENARIO_NAME:-unspecified}" "${launch_input[@]}"
 add_default_launch_arg target_class "${SIM_TARGET_CLASS:-unspecified}" "${launch_input[@]}"
 add_default_launch_arg target_size_m "${SIM_TARGET_SIZE_M:-nan}" "${launch_input[@]}"

@@ -139,6 +139,50 @@ class CameraOpticalPose:
         return (_dot(self.right_world_enu, delta), _dot(self.down_world_enu, delta), _dot(self.forward_world_enu, delta))
 
 
+def apply_optical_yaw(
+    nominal_camera_pose: CameraOpticalPose,
+    yaw_error_rad: float,
+) -> CameraOpticalPose:
+    """Rotate an optical RDF pose about +Down using the right-hand rule.
+
+    Positive yaw rotates optical Forward toward optical Right. The camera
+    center and Down axis are unchanged.
+    """
+
+    yaw = float(yaw_error_rad)
+    if not math.isfinite(yaw):
+        raise ValueError("yaw_error_rad must be finite")
+    cosine = math.cos(yaw)
+    sine = math.sin(yaw)
+    nominal_right = nominal_camera_pose.right_world_enu
+    nominal_forward = nominal_camera_pose.forward_world_enu
+    return CameraOpticalPose(
+        center_world_enu_m=nominal_camera_pose.center_world_enu_m,
+        right_world_enu=normalize(
+            _sub(_scale(nominal_right, cosine), _scale(nominal_forward, sine)),
+            "yawed_right_world_enu",
+        ),
+        down_world_enu=nominal_camera_pose.down_world_enu,
+        forward_world_enu=normalize(
+            _add(_scale(nominal_right, sine), _scale(nominal_forward, cosine)),
+            "yawed_forward_world_enu",
+        ),
+    )
+
+
+def effective_optical_yaws_deg(
+    common_optical_yaw_error_deg: float,
+    relative_optical_yaw_error_deg: float,
+) -> tuple[float, float]:
+    """Return effective left/right optical yaw errors in degrees."""
+
+    common = float(common_optical_yaw_error_deg)
+    relative = float(relative_optical_yaw_error_deg)
+    if not math.isfinite(common) or not math.isfinite(relative):
+        raise ValueError("optical yaw errors must be finite")
+    return common - relative * 0.5, common + relative * 0.5
+
+
 def rpy_to_rotation_world_from_link(roll_rad: float, pitch_rad: float, yaw_rad: float) -> Matrix3:
     """Return the SDF ``roll pitch yaw`` rotation, link frame to world."""
 
@@ -287,8 +331,10 @@ __all__ = [
     "VEHICLE_REFERENCE_DEFINITION",
     "VEHICLE_REFERENCE_LINK",
     "WORLD_FRAME",
+    "apply_optical_yaw",
     "build_baseline_center_frd",
     "camera_optical_pose_from_sdf_pose",
+    "effective_optical_yaws_deg",
     "ground_truth_world_to_baseline",
     "nominal_camera_poses",
     "normalize",

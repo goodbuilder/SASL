@@ -57,10 +57,10 @@ def _write_distance_node_params(context):
         "zoom_index",
         "left_roll_error_deg",
         "left_pitch_error_deg",
-        "left_yaw_error_deg",
         "right_roll_error_deg",
         "right_pitch_error_deg",
-        "right_yaw_error_deg",
+        "common_optical_yaw_error_deg",
+        "relative_optical_yaw_error_deg",
     }
     int_params = {
         "yolo_imgsz",
@@ -104,10 +104,10 @@ def _write_distance_node_params(context):
         "target_model_name",
         "left_roll_error_deg",
         "left_pitch_error_deg",
-        "left_yaw_error_deg",
         "right_roll_error_deg",
         "right_pitch_error_deg",
-        "right_yaw_error_deg",
+        "common_optical_yaw_error_deg",
+        "relative_optical_yaw_error_deg",
         "yolo_model_path",
         "yolo_class_name",
         "yolo_confidence",
@@ -229,19 +229,21 @@ def _generate_world(context):
     target_spawn_yaw_deg = _float_config(context, "target_spawn_yaw_deg")
     left_roll = math.radians(_float_config(context, "left_roll_error_deg"))
     left_pitch = math.radians(_float_config(context, "left_pitch_error_deg"))
-    left_yaw = math.radians(_float_config(context, "left_yaw_error_deg"))
     right_roll = math.radians(_float_config(context, "right_roll_error_deg"))
     right_pitch = math.radians(_float_config(context, "right_pitch_error_deg"))
-    right_yaw = math.radians(_float_config(context, "right_yaw_error_deg"))
+    common_yaw_deg = _float_config(context, "common_optical_yaw_error_deg")
+    relative_yaw_deg = _float_config(context, "relative_optical_yaw_error_deg")
+    left_optical_yaw = math.radians(common_yaw_deg - relative_yaw_deg / 2.0)
+    right_optical_yaw = math.radians(common_yaw_deg + relative_yaw_deg / 2.0)
 
     camera_yaw = math.pi / 2.0
     left_pose = (
         f"{-baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{left_roll:.9f} {left_pitch:.9f} {camera_yaw + left_yaw:.9f}"
+        f"{left_roll:.9f} {left_pitch:.9f} {camera_yaw - left_optical_yaw:.9f}"
     )
     right_pose = (
         f"{baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{right_roll:.9f} {right_pitch:.9f} {camera_yaw + right_yaw:.9f}"
+        f"{right_roll:.9f} {right_pitch:.9f} {camera_yaw - right_optical_yaw:.9f}"
     )
 
     world = world.replace("<pose>-12.5 0 5.0 0 0 1.570796327</pose>", f"<pose>{left_pose}</pose>", 1)
@@ -327,6 +329,12 @@ def _launch_setup(context, *args, **kwargs):
         Node(
             package="stereo_ground_sim",
             executable="gazebo_ground_truth_adapter",
+            parameters=[
+                {
+                    "parent_model_name": LaunchConfiguration("target_model_name"),
+                    "source_link_name": "base_link",
+                }
+            ],
             output="screen",
         ),
         ExecuteProcess(
@@ -475,10 +483,10 @@ def generate_launch_description():
             DeclareLaunchArgument("calibration_record_hz", default_value="10.0"),
             DeclareLaunchArgument("left_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("left_pitch_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("left_yaw_error_deg", default_value="0.0"),
             DeclareLaunchArgument("right_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("right_pitch_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("right_yaw_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("common_optical_yaw_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("relative_optical_yaw_error_deg", default_value="0.0"),
             OpaqueFunction(function=_launch_setup),
         ]
     )

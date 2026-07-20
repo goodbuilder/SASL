@@ -14,6 +14,7 @@ from sasl_common.stereo_geometry import (
     BASELINE_CENTER_FRD_AXIS_CONTRACT,
     BASELINE_CENTER_FRD_FRAME,
     BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     triangulate_rays,
 )
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
@@ -35,6 +36,7 @@ def test_known_point_and_skew_ray_midpoint() -> None:
         left_ray_left_rdf=unit(left_origin),
         right_ray_left_rdf=unit(right_origin),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     ).result
     assert result is not None
     assert max(abs(a - b) for a, b in zip(result.midpoint_rdf_m, target)) < 1.0e-9
@@ -49,6 +51,7 @@ def test_camera_swap_preserves_midpoint() -> None:
         left_ray_left_rdf=(0.2, 0.0, 1.0),
         right_ray_left_rdf=(-0.2, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     ).result
     second = triangulate_rays(
         left_origin_left_rdf_m=(2.0, 0.0, 0.0),
@@ -56,6 +59,7 @@ def test_camera_swap_preserves_midpoint() -> None:
         left_ray_left_rdf=(-0.2, 0.0, 1.0),
         right_ray_left_rdf=(0.2, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     ).result
     assert first is not None and second is not None
     assert max(abs(a - b) for a, b in zip(first.midpoint_rdf_m, second.midpoint_rdf_m)) < 1.0e-9
@@ -70,6 +74,7 @@ def test_real_skew_rays_return_known_closest_points_and_swap_invariant() -> None
         common_frame=BASELINE_CENTER_FRD_FRAME,
         axis_contract=BASELINE_CENTER_FRD_AXIS_CONTRACT,
         vector_contract=BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     second = triangulate_rays(
         left_origin_left_rdf_m=(2.0, -3.0, 1.0),
@@ -79,6 +84,7 @@ def test_real_skew_rays_return_known_closest_points_and_swap_invariant() -> None
         common_frame=BASELINE_CENTER_FRD_FRAME,
         axis_contract=BASELINE_CENTER_FRD_AXIS_CONTRACT,
         vector_contract=BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert first.result is not None and second.result is not None
     assert first.result.point_on_left_ray_m == pytest.approx((2.0, 0.0, 0.0), abs=1.0e-9)
@@ -99,6 +105,7 @@ def test_near_parallel_rays_are_stable_and_report_conditioning(angle_rad: float)
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(math.sin(angle_rad), 0.0, math.cos(angle_rad)),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert attempt.reason in ("ok", "invalid_solution", "rank_deficient")
     assert "condition_number" in attempt.diagnostics
@@ -113,12 +120,14 @@ def test_nonfinite_and_zero_ray_fail_without_exceptions() -> None:
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(float("nan"), 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     zero = triangulate_rays(
         right_origin_left_rdf_m=(1.0, 0.0, 0.0),
         left_ray_left_rdf=(0.0, 0.0, 0.0),
         right_ray_left_rdf=(0.0, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert nonfinite.result is None and nonfinite.reason == "invalid_input"
     assert zero.result is None and zero.reason == "invalid_input"
@@ -130,6 +139,7 @@ def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(0.0, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert zero.result is None and zero.reason == "zero_baseline"
     parallel = triangulate_rays(
@@ -137,6 +147,7 @@ def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(0.0, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert parallel.result is None and parallel.reason == "rank_deficient"
     near = triangulate_rays(
@@ -144,6 +155,7 @@ def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(1.0e-7, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert near.result is not None
     assert near.result.computation_status == "computed"
@@ -153,6 +165,7 @@ def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -
         left_ray_left_rdf=(-0.1, 0.0, 1.0),
         right_ray_left_rdf=(0.1, 0.0, 1.0),
         common_frame=BASELINE_CENTER_FRD_FRAME,
+        geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     )
     assert negative.result is not None
     assert negative.result.left_depth_m < 0.0

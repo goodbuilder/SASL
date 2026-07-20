@@ -23,8 +23,8 @@ def _node_with_camera_error(left_yaw_deg: float = 0.0, right_yaw_deg: float = 0.
     node.camera_height_m = 5.0
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
-    node.left_camera_error_rpy_rad = (0.0, 0.0, math.radians(left_yaw_deg))
-    node.right_camera_error_rpy_rad = (0.0, 0.0, math.radians(right_yaw_deg))
+    node.common_optical_yaw_error_deg = (left_yaw_deg + right_yaw_deg) / 2.0
+    node.relative_optical_yaw_error_deg = right_yaw_deg - left_yaw_deg
     node._ensure_camera_frames()
     return node
 

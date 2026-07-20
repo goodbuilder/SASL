@@ -304,6 +304,7 @@ class GazeboGroundTruthAdapter:
         output_topic: str = OUTPUT_TOPIC,
         command: tuple[str, ...] | None = None,
         parent_model_name: str = "x500_15m",
+        source_link_name: str = SOURCE_GAZEBO_ENTITY,
     ) -> None:
         try:
             import rclpy
@@ -317,22 +318,25 @@ class GazeboGroundTruthAdapter:
 
         self._rclpy = rclpy
         self._node = _Node("gazebo_ground_truth_adapter")
+        self._node.declare_parameter("parent_model_name", str(parent_model_name))
+        self._node.declare_parameter("source_link_name", str(source_link_name))
         self._publisher = self._node.create_publisher(PoseStamped, output_topic, 10)
         self._topic = str(topic)
-        self._parent_model_name = str(parent_model_name)
+        self._parent_model_name = str(self._node.get_parameter("parent_model_name").value)
+        self._source_link_name = str(self._node.get_parameter("source_link_name").value)
         self._command = (
             tuple(command)
             if command is not None
             else ("gz", "topic", "-e", "-t", self._topic, "--json-output")
         )
-        self._state = PoseVState(SOURCE_GAZEBO_ENTITY)
+        self._state = PoseVState(self._source_link_name)
         self._shutdown = threading.Event()
         self._process: subprocess.Popen[str] | None = None
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
         self._node.get_logger().info(
             "Gazebo Ground Truth adapter: "
-            f"source_gazebo_entity={SOURCE_GAZEBO_ENTITY}, "
+            f"source_gazebo_entity={self._source_link_name}, "
             f"parent_model_name={self._parent_model_name}, "
             f"published_reference_name={VEHICLE_REFERENCE_LINK}, "
             f"reference_definition={VEHICLE_REFERENCE_DEFINITION}, "

@@ -13,7 +13,7 @@ try:  # ROS is present in production; pure geometry tests may run without it.
     from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
     from rclpy.node import Node
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from geometry_msgs.msg import PoseStamped
+    from geometry_msgs.msg import PointStamped, PoseStamped
     from sensor_msgs.msg import Image as ImageMsg
     from std_msgs.msg import Float32, Float32MultiArray, String
     from visualization_msgs.msg import Marker
@@ -67,6 +67,9 @@ except ImportError:  # pragma: no cover - exercised only outside ROS
     class PoseStamped(_Message):  # type: ignore[no-redef]
         pass
 
+    class PointStamped(_Message):  # type: ignore[no-redef]
+        pass
+
     class Marker(_Message):  # type: ignore[no-redef]
         TEXT_VIEW_FACING = 9
         ADD = 0
@@ -96,6 +99,7 @@ from sasl_common.stereo_geometry import (
     BASELINE_CENTER_FRD_AXIS_CONTRACT,
     BASELINE_CENTER_FRD_FRAME,
     BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
     PinholeIntrinsics,
     ray_from_pixel,
     triangulate_rays,
@@ -105,11 +109,17 @@ from stereo_ground_sim.coordinate_frames import (
     VEHICLE_REFERENCE_DEFINITION,
     VEHICLE_REFERENCE_LINK,
     WORLD_FRAME,
+    apply_optical_yaw,
     build_baseline_center_frd,
     ground_truth_world_to_baseline,
     nominal_camera_poses,
     project_world_point_to_pixel,
-    camera_optical_pose_from_sdf_pose,
+    effective_optical_yaws_deg,
+)
+from stereo_ground_sim.time_alignment import (
+    GroundTruthPositionBuffer,
+    PendingPairGroundTruthAligner,
+    StereoImagePairer,
 )
 
 
@@ -175,10 +185,10 @@ class StereoDistanceNode(Node):
         self.declare_parameter("disparity_residual_feature_selector_min_samples", 1)
         self.declare_parameter("left_roll_error_deg", 0.0)
         self.declare_parameter("left_pitch_error_deg", 0.0)
-        self.declare_parameter("left_yaw_error_deg", 0.0)
         self.declare_parameter("right_roll_error_deg", 0.0)
         self.declare_parameter("right_pitch_error_deg", 0.0)
-        self.declare_parameter("right_yaw_error_deg", 0.0)
+        self.declare_parameter("common_optical_yaw_error_deg", 0.0)
+        self.declare_parameter("relative_optical_yaw_error_deg", 0.0)
 
         self.scenario_name = str(self.get_parameter("scenario_name").value)
         self.target_class = str(self.get_parameter("target_class").value)
@@ -251,13 +261,25 @@ class StereoDistanceNode(Node):
             1,
             int(self.get_parameter("disparity_residual_feature_selector_min_samples").value),
         )
-        self.left_camera_error_rpy_rad = tuple(
-            math.radians(self._float_param(name))
-            for name in ("left_roll_error_deg", "left_pitch_error_deg", "left_yaw_error_deg")
+        unsupported_tilt = tuple(
+            self._float_param(name)
+            for name in (
+                "left_roll_error_deg",
+                "left_pitch_error_deg",
+                "right_roll_error_deg",
+                "right_pitch_error_deg",
+            )
         )
-        self.right_camera_error_rpy_rad = tuple(
-            math.radians(self._float_param(name))
-            for name in ("right_roll_error_deg", "right_pitch_error_deg", "right_yaw_error_deg")
+        if any(value != 0.0 for value in unsupported_tilt):
+            raise ValueError("S2 supports yaw-only injection; roll/pitch must remain zero")
+        self.common_optical_yaw_error_deg = self._float_param("common_optical_yaw_error_deg")
+        self.relative_optical_yaw_error_deg = self._float_param("relative_optical_yaw_error_deg")
+        (
+            self.effective_left_optical_yaw_error_deg,
+            self.effective_right_optical_yaw_error_deg,
+        ) = effective_optical_yaws_deg(
+            self.common_optical_yaw_error_deg,
+            self.relative_optical_yaw_error_deg,
         )
         self._configure_camera_frames()
         self.disparity_residual_feature_selector_window = deque(
@@ -291,8 +313,23 @@ class StereoDistanceNode(Node):
         self.ground_truth_entity_id = None
         self.shutdown_event = threading.Event()
 
-        self.left_msg = None
-        self.right_msg = None
+        self.image_pairer = StereoImagePairer(max_buffer_size=64)
+        self.gt_position_buffer = GroundTruthPositionBuffer(max_buffer_size=512)
+        self.pending_gt_aligner = PendingPairGroundTruthAligner(
+            self.gt_position_buffer,
+            max_pending_pairs=64,
+        )
+        self.pair_queue = deque()
+        self.last_pair_result = None
+        self.gt_alignment_counts = {
+            "exact": 0,
+            "interpolated": 0,
+            "nearest_before": 0,
+            "nearest_after": 0,
+            "unavailable": 0,
+        }
+        self.raw_computed_count = 0
+        self.corrected_computed_count = 0
         self.metrics = {
             "distance_m": None,
             "disparity_px": None,
@@ -328,6 +365,13 @@ class StereoDistanceNode(Node):
         self.actual_distance_pub = self.create_publisher(Float32, "/ground_truth", 10)
         self.ground_truth_position_pub = self.create_publisher(
             Float32MultiArray, "/ground_truth_position", 10
+        )
+        self.raw_position_pub = self.create_publisher(PointStamped, "/stereo/raw_position", 10)
+        self.attitude_corrected_position_pub = self.create_publisher(
+            PointStamped, "/stereo/attitude_corrected_position", 10
+        )
+        self.canonical_ground_truth_position_pub = self.create_publisher(
+            PointStamped, "/stereo/ground_truth_position", 10
         )
         self.ground_truth_pose_sub = self.create_subscription(
             PoseStamped,
@@ -443,24 +487,25 @@ class StereoDistanceNode(Node):
             nominal_left.forward_world_enu,
             nominal_right.forward_world_enu,
         )
-        left_rpy = self.left_camera_error_rpy_rad
-        right_rpy = self.right_camera_error_rpy_rad
-        self.actual_left_camera = camera_optical_pose_from_sdf_pose(
-            nominal_left.center_world_enu_m,
-            (left_rpy[0], left_rpy[1], math.pi / 2.0 + left_rpy[2]),
-        )
-        self.actual_right_camera = camera_optical_pose_from_sdf_pose(
-            nominal_right.center_world_enu_m,
-            (right_rpy[0], right_rpy[1], math.pi / 2.0 + right_rpy[2]),
-        )
+        left_yaw_rad = math.radians(self.effective_left_optical_yaw_error_deg)
+        right_yaw_rad = math.radians(self.effective_right_optical_yaw_error_deg)
+        self.actual_left_camera = apply_optical_yaw(nominal_left, left_yaw_rad)
+        self.actual_right_camera = apply_optical_yaw(nominal_right, right_yaw_rad)
 
     def _ensure_camera_frames(self):
         if hasattr(self, "baseline_center_frd"):
             return
         self.baseline_m = float(getattr(self, "baseline_m", 25.0))
         self.camera_height_m = float(getattr(self, "camera_height_m", 5.0))
-        self.left_camera_error_rpy_rad = tuple(getattr(self, "left_camera_error_rpy_rad", (0.0, 0.0, 0.0)))
-        self.right_camera_error_rpy_rad = tuple(getattr(self, "right_camera_error_rpy_rad", (0.0, 0.0, 0.0)))
+        self.common_optical_yaw_error_deg = float(getattr(self, "common_optical_yaw_error_deg", 0.0))
+        self.relative_optical_yaw_error_deg = float(getattr(self, "relative_optical_yaw_error_deg", 0.0))
+        (
+            self.effective_left_optical_yaw_error_deg,
+            self.effective_right_optical_yaw_error_deg,
+        ) = effective_optical_yaws_deg(
+            self.common_optical_yaw_error_deg,
+            self.relative_optical_yaw_error_deg,
+        )
         self._configure_camera_frames()
 
     def _camera_intrinsics(self, width, height):
@@ -481,8 +526,22 @@ class StereoDistanceNode(Node):
             float(msg.pose.position.y),
             float(msg.pose.position.z),
         )
+        stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+        orientation_xyzw = (
+            float(msg.pose.orientation.x),
+            float(msg.pose.orientation.y),
+            float(msg.pose.orientation.z),
+            float(msg.pose.orientation.w),
+        )
         try:
             position = ground_truth_world_to_baseline(point_world, self.baseline_center_frd)
+            if hasattr(self, "gt_position_buffer"):
+                with self.yolo_condition:
+                    self.gt_position_buffer.add(stamp_ns, point_world, orientation_xyzw)
+                    aligned_pairs = self.pending_gt_aligner.pop_watermarked()
+                    self.pair_queue.extend(aligned_pairs)
+                    if aligned_pairs:
+                        self.yolo_condition.notify_all()
         except (TypeError, ValueError) as exc:
             self.get_logger().warning(f"Ground Truth ignored: {exc}")
             return
@@ -493,8 +552,7 @@ class StereoDistanceNode(Node):
                 "published_reference_name": VEHICLE_REFERENCE_LINK,
                 "reference_definition": VEHICLE_REFERENCE_DEFINITION,
                 "ground_truth_world_enu_m": point_world,
-                "ground_truth_stamp_ns": int(msg.header.stamp.sec) * 1_000_000_000
-                + int(msg.header.stamp.nanosec),
+                "ground_truth_stamp_ns": stamp_ns,
             }
         )
         self.cached_ground_truth_position = position
@@ -562,6 +620,7 @@ class StereoDistanceNode(Node):
                 common_frame=BASELINE_CENTER_FRD_FRAME,
                 axis_contract=BASELINE_CENTER_FRD_AXIS_CONTRACT,
                 vector_contract=BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+                geometry_policy=GEOMETRY_POLICY_DIAGNOSTIC_SIGNED_DEPTH,
             )
         except (TypeError, ValueError, ArithmeticError) as exc:
             base["computation_status"] = "invalid_input"
@@ -636,12 +695,13 @@ class StereoDistanceNode(Node):
             "baseline_m",
             "camera_height_m",
             "horizontal_fov_rad",
+            "target_model_name",
             "left_roll_error_deg",
             "left_pitch_error_deg",
-            "left_yaw_error_deg",
             "right_roll_error_deg",
             "right_pitch_error_deg",
-            "right_yaw_error_deg",
+            "common_optical_yaw_error_deg",
+            "relative_optical_yaw_error_deg",
         }
         if any(param.name in geometry_parameter_names for param in params):
             return SetParametersResult(
@@ -1215,6 +1275,10 @@ class StereoDistanceNode(Node):
         return self.cached_actual_distance
 
     def shutdown(self):
+        if hasattr(self, "image_pairer") and hasattr(self, "pending_gt_aligner"):
+            for pair in self.image_pairer.flush():
+                self.pending_gt_aligner.add_pair(pair)
+            self.pending_gt_aligner.flush()
         self.shutdown_event.set()
 
     def _command_gazebo_target_pose(self, state):
@@ -1259,11 +1323,28 @@ class StereoDistanceNode(Node):
 
     def _store_image(self, side, msg):
         with self.yolo_condition:
-            if side == "left":
-                self.left_msg = msg
-            else:
-                self.right_msg = msg
-            self.yolo_condition.notify()
+            previous_epoch = self.image_pairer.epoch
+            try:
+                pairs = self.image_pairer.add_message(side, msg)
+            except ValueError as exc:
+                self.get_logger().warning(f"Invalid {side} image simulation timestamp: {exc}")
+                return
+            dropped = 0
+            if self.image_pairer.epoch != previous_epoch:
+                dropped = self.pending_gt_aligner.clear()
+                dropped += len(self.pair_queue)
+                self.pair_queue.clear()
+            aligned_pairs = []
+            for pair in pairs:
+                aligned_pairs.extend(self.pending_gt_aligner.add_pair(pair))
+            self.pair_queue.extend(aligned_pairs)
+            if aligned_pairs:
+                self.yolo_condition.notify_all()
+        if self.image_pairer.epoch != previous_epoch:
+            self.get_logger().warning(
+                "Image simulation stamp decreased; advanced epoch and cleared "
+                f"{dropped} pending pair(s)"
+            )
 
     def _yolo_worker_loop(self):
         self._warm_yolo_model()
@@ -1271,7 +1352,7 @@ class StereoDistanceNode(Node):
         while not self.shutdown_event.is_set():
             with self.yolo_condition:
                 while (
-                    (self.left_msg is None or self.right_msg is None or self.yolo_target_hz <= 0.0)
+                    (not self.pair_queue or self.yolo_target_hz <= 0.0)
                     and not self.shutdown_event.is_set()
                 ):
                     self.yolo_condition.wait(timeout=0.1)
@@ -1282,16 +1363,37 @@ class StereoDistanceNode(Node):
                 if wait_s > 0.0:
                     self.yolo_condition.wait(timeout=wait_s)
                     continue
-                left_msg = self.left_msg
-                right_msg = self.right_msg
-                actual = self._actual_distance()
+                pair, gt_alignment = self.pair_queue.popleft()
+                left_msg = pair.left_message
+                right_msg = pair.right_message
+                gt_baseline = self._ground_truth_alignment_to_baseline(gt_alignment)
+                actual = None if gt_baseline is None else float(gt_baseline["forward_m"])
                 phase = self._mission_state()["phase"]
                 self.yolo_inference_in_progress = True
                 self.last_yolo_update = time.monotonic()
                 next_tick = self.last_yolo_update + 1.0 / target_hz
-            self._update_metrics_from_messages(left_msg, right_msg, actual, phase)
+            self._update_metrics_from_messages(
+                left_msg,
+                right_msg,
+                actual,
+                phase,
+                pair=pair,
+                gt_alignment=gt_alignment,
+                gt_baseline=gt_baseline,
+            )
 
-    def _update_metrics_from_messages(self, left_msg, right_msg, actual, phase, device=None):
+    def _update_metrics_from_messages(
+        self,
+        left_msg,
+        right_msg,
+        actual,
+        phase,
+        device=None,
+        *,
+        pair=None,
+        gt_alignment=None,
+        gt_baseline=None,
+    ):
         started = time.monotonic()
         try:
             left_image = self._msg_to_rgb(left_msg)
@@ -1302,6 +1404,18 @@ class StereoDistanceNode(Node):
                 device = self.resolved_yolo_device or self._resolve_yolo_device()
             left, right = self._detect_drone_pair(left_image, right_image, device=device)
             metrics = self._calculate_metrics(left_image, left, right, actual, phase)
+            corrected = None
+            if left is not None and right is not None:
+                corrected = self._triangulate_pixel_centers_oracle(
+                    left["cx"],
+                    left["cy"],
+                    right["cx"],
+                    right["cy"],
+                    left_image.shape[1],
+                    left_image.shape[0],
+                )
+            metrics.update(self._pair_result_metadata(pair, gt_alignment, gt_baseline, corrected))
+            self.last_pair_result = dict(metrics)
             with self.lock:
                 self.left_detection = left
                 self.right_detection = right
@@ -1318,6 +1432,7 @@ class StereoDistanceNode(Node):
             if disparity is not None:
                 self.disparity_pub.publish(Float32(data=float(disparity)))
             self._publish_estimated_position(metrics)
+            self._publish_canonical_pair_positions(metrics)
             if distance is not None and error is not None and disparity is not None:
                 self.comparison_pub.publish(
                     Float32MultiArray(
@@ -1340,6 +1455,128 @@ class StereoDistanceNode(Node):
             self.last_yolo_completion = finished
             with self.yolo_condition:
                 self.yolo_inference_in_progress = False
+
+    def _ground_truth_alignment_to_baseline(self, alignment):
+        if alignment is None or alignment.position_world_enu_m is None:
+            return None
+        try:
+            return ground_truth_world_to_baseline(
+                alignment.position_world_enu_m,
+                self.baseline_center_frd,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _pair_result_metadata(self, pair, alignment, gt_baseline, corrected):
+        alignment_mode = "unavailable" if alignment is None else alignment.gt_alignment_mode
+        if hasattr(self, "gt_alignment_counts"):
+            self.gt_alignment_counts[alignment_mode] += 1
+        metadata = {
+            "pair_id": None if pair is None else pair.pair_id,
+            "epoch": None if pair is None else pair.epoch,
+            "left_stamp_ns": None if pair is None else pair.left_stamp_ns,
+            "right_stamp_ns": None if pair is None else pair.right_stamp_ns,
+            "pair_midpoint_stamp_ns": None if pair is None else pair.pair_midpoint_stamp_ns,
+            "pair_delta_ns": None if pair is None else pair.pair_delta_ns,
+            "pairing_mode": None if pair is None else pair.pairing_mode,
+            "gt_alignment_mode": alignment_mode,
+            "gt_before_stamp_ns": None if alignment is None else alignment.gt_before_stamp_ns,
+            "gt_after_stamp_ns": None if alignment is None else alignment.gt_after_stamp_ns,
+            "gt_interpolation_alpha": None if alignment is None else alignment.gt_interpolation_alpha,
+            "gt_nearest_delta_ns": None if alignment is None else alignment.gt_nearest_delta_ns,
+            "gt_forward_m": None if gt_baseline is None else gt_baseline["forward_m"],
+            "gt_right_m": None if gt_baseline is None else gt_baseline["right_m"],
+            "gt_down_m": None if gt_baseline is None else gt_baseline["down_m"],
+            "gt_range_m": None if gt_baseline is None else gt_baseline["range_m"],
+            "common_optical_yaw_error_deg": self.common_optical_yaw_error_deg,
+            "relative_optical_yaw_error_deg": self.relative_optical_yaw_error_deg,
+            "effective_left_optical_yaw_error_deg": self.effective_left_optical_yaw_error_deg,
+            "effective_right_optical_yaw_error_deg": self.effective_right_optical_yaw_error_deg,
+            "correction_source": "injected_attitude_oracle",
+            "attitude_corrected_computation_status": (
+                "invalid_input" if corrected is None else corrected.get("computation_status")
+            ),
+            "attitude_corrected_forward_m": None if corrected is None else corrected.get("forward_m"),
+            "attitude_corrected_right_m": None if corrected is None else corrected.get("right_m"),
+            "attitude_corrected_down_m": None if corrected is None else corrected.get("down_m"),
+            "attitude_corrected_range_m": None if corrected is None else corrected.get("range_m"),
+            "attitude_corrected_ray_gap_m": None if corrected is None else corrected.get("ray_gap_m"),
+            "attitude_corrected_intersection_angle_deg": (
+                None if corrected is None else corrected.get("intersection_angle_deg")
+            ),
+            "attitude_corrected_left_depth_m": None if corrected is None else corrected.get("left_depth_m"),
+            "attitude_corrected_right_depth_m": None if corrected is None else corrected.get("right_depth_m"),
+            "output_frame": BASELINE_CENTER_FRD_FRAME,
+        }
+        if pair is not None and pair.pair_id % 100 == 0:
+            self.get_logger().info(f"Simulation-time alignment counters: {self._time_alignment_counters()}")
+        return metadata
+
+    def _time_alignment_counters(self):
+        pairer = self.image_pairer
+        return {
+            "left_received_count": pairer.left_received_count,
+            "right_received_count": pairer.right_received_count,
+            "paired_count": pairer.paired_count,
+            "exact_pair_count": pairer.exact_pair_count,
+            "nearest_pair_count": pairer.nearest_pair_count,
+            "unmatched_left_count": pairer.unmatched_left_count,
+            "unmatched_right_count": pairer.unmatched_right_count,
+            "image_reset_count": pairer.image_reset_count,
+            "gt_reset_count": self.gt_position_buffer.reset_count,
+            "gt_exact_count": self.gt_alignment_counts["exact"],
+            "gt_interpolated_count": self.gt_alignment_counts["interpolated"],
+            "gt_nearest_before_count": self.gt_alignment_counts["nearest_before"],
+            "gt_nearest_after_count": self.gt_alignment_counts["nearest_after"],
+            "gt_unavailable_count": self.gt_alignment_counts["unavailable"],
+            "raw_computed_count": self.raw_computed_count,
+            "corrected_computed_count": self.corrected_computed_count,
+        }
+
+    @staticmethod
+    def _point_stamped(stamp_ns, forward_m, right_m, down_m):
+        message = PointStamped()
+        message.header.stamp.sec = int(stamp_ns) // 1_000_000_000
+        message.header.stamp.nanosec = int(stamp_ns) % 1_000_000_000
+        message.header.frame_id = BASELINE_CENTER_FRD_FRAME
+        message.point.x = float(forward_m)
+        message.point.y = float(right_m)
+        message.point.z = float(down_m)
+        return message
+
+    def _publish_canonical_pair_positions(self, metrics):
+        stamp_ns = metrics.get("pair_midpoint_stamp_ns")
+        if stamp_ns is None:
+            return
+        if metrics.get("computation_status") == "computed":
+            self.raw_computed_count += 1
+            self.raw_position_pub.publish(
+                self._point_stamped(
+                    stamp_ns,
+                    metrics["estimated_forward_m"],
+                    metrics["estimated_right_m"],
+                    metrics["estimated_down_m"],
+                )
+            )
+        if metrics.get("attitude_corrected_computation_status") == "computed":
+            self.corrected_computed_count += 1
+            self.attitude_corrected_position_pub.publish(
+                self._point_stamped(
+                    stamp_ns,
+                    metrics["attitude_corrected_forward_m"],
+                    metrics["attitude_corrected_right_m"],
+                    metrics["attitude_corrected_down_m"],
+                )
+            )
+        if metrics.get("gt_alignment_mode") != "unavailable":
+            self.canonical_ground_truth_position_pub.publish(
+                self._point_stamped(
+                    stamp_ns,
+                    metrics["gt_forward_m"],
+                    metrics["gt_right_m"],
+                    metrics["gt_down_m"],
+                )
+            )
 
     def _publish_estimated_position(self, metrics):
         self.estimated_position_pub.publish(
@@ -2487,12 +2724,25 @@ class StereoDistanceNode(Node):
             else raw["distance_m"] - actual
         )
         return {
+            "left_u_px": raw.get("left_u_px"),
+            "left_v_px": raw.get("left_v_px"),
+            "right_u_px": raw.get("right_u_px"),
+            "right_v_px": raw.get("right_v_px"),
             "distance_m": raw["distance_m"],
             "disparity_px": raw["disparity_px"],
             "estimated_right_m": raw["right_m"],
             "estimated_down_m": raw["down_m"],
             "estimated_forward_m": raw["forward_m"],
             "estimated_range_m": raw["range_m"],
+            "raw_forward_m": raw["forward_m"],
+            "raw_right_m": raw["right_m"],
+            "raw_down_m": raw["down_m"],
+            "raw_range_m": raw["range_m"],
+            "raw_computation_status": raw.get("computation_status", "computed"),
+            "raw_ray_gap_m": raw.get("ray_gap_m"),
+            "raw_intersection_angle_deg": raw.get("intersection_angle_deg"),
+            "raw_left_depth_m": raw.get("left_depth_m"),
+            "raw_right_depth_m": raw.get("right_depth_m"),
             "point_on_left_ray_baseline_center_frd_m": raw.get("point_on_left_ray_baseline_center_frd_m"),
             "point_on_right_ray_baseline_center_frd_m": raw.get("point_on_right_ray_baseline_center_frd_m"),
             "midpoint_baseline_center_frd_m": raw.get("midpoint_baseline_center_frd_m"),

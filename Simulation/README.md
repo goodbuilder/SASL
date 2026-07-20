@@ -99,15 +99,46 @@ Ground Truth의 보조 정보일 뿐이다.
 
 Rendered/ideal observation pixel은 actual optical pose에서 투영하고,
 canonical Raw는 nominal zero-error optical pose로 같은 pixel을 해석한다.
-공통 kernel을 호출할 때는 `common_frame=baseline_center_frd`와
-`axis_contract=forward_right_down`를 명시한다. 한 run의 baseline, camera
-height, FOV, 좌우 roll/pitch/yaw는 geometry를 정의하므로 실행 중 parameter
+공통 kernel을 호출할 때는 `common_frame=baseline_center_frd`,
+`geometry_policy=diagnostic_signed_depth`, `axis_contract=forward_right_down`를
+명시한다. 한 run의 baseline, camera height, FOV, target model identity,
+common/relative optical yaw는 geometry를 정의하므로 실행 중 parameter
 변경을 거부하고 launch restart로만 바꿀 수 있다. Observation fusion 결과는
 legacy/corrected 후보로 보존되며 canonical Raw를 덮어쓰지 않는다.
 
-S1에서 timestamp pairing, Ground Truth interpolation, common/relative yaw,
-attitude-corrected 결과, PX4-only 이동 정리, post-hoc correction 삭제,
-pair recorder, speed 계산은 아직 구현 대상이 아니다.
+## S2 simulation-time alignment and injected-attitude oracle
+
+좌우 `sensor_msgs/msg/Image`는 각 `header.stamp.sec/nanosec`를 int64 ns로
+변환해 one-to-one pair를 구성한다. Exact timestamp를 우선하고, exact가
+없으면 simulation-time watermark 또는 명시적 flush에서 deterministic nearest
+pair를 만든다. 한 frame은 한 pair에서만 사용하며 `pair_delta_ns`는
+`right-left`, pair midpoint는 `left + (right-left)//2`이다. Simulation reset으로
+stamp가 감소하면 epoch를 증가시키고 pending image/GT를 이전 epoch와 결합하지
+않는다.
+
+Ground Truth history는 pair midpoint를 exact 또는 선형 position interpolation으로
+정렬한다. 미래 GT가 아직 없으면 pair를 pending으로 유지하고 bounded overflow,
+explicit flush, shutdown에서만 `nearest_before`, `nearest_after`, `unavailable`을
+명시한다. Quaternion은 ROS/Gazebo `x,y,z,w` 순서로 보존하며 위치 보간에 Euler
+보간을 섞지 않는다.
+
+자세 연구 입력은 `common_optical_yaw_error_deg`와
+`relative_optical_yaw_error_deg`이다. Effective yaw는 left=`common-relative/2`,
+right=`common+relative/2`이며 optical RDF의 +Down 축 오른손 회전이다. Positive
+yaw는 Forward를 Right 방향으로 회전시킨다. 동일 pair와 동일 bbox pixel에 대해
+Raw는 nominal pose, `/stereo/attitude_corrected_position`은 injected actual pose로
+ray를 다시 생성해 같은 two-ray midpoint kernel을 호출한다. correction source는
+`injected_attitude_oracle`이고 Ground Truth는 correction 입력이 아니다.
+
+Canonical `geometry_msgs/msg/PointStamped` topic은 `/stereo/raw_position`,
+`/stereo/attitude_corrected_position`, `/stereo/ground_truth_position`이다. 모두
+pair midpoint simulation stamp, `frame_id=baseline_center_frd`, point x/y/z =
+Forward/Right/Down metres를 사용한다. 기존 `/stereo/estimated_position`,
+`/ground_truth_position`, `/stereo/corrected_position`은 S3 전까지 legacy migration
+topic이며 `/stereo/corrected_position`은 injected oracle 의미가 아니다.
+
+아직 구현하지 않은 범위는 post-hoc 삭제, PX4-only movement cleanup, pair recorder,
+typed aggregate message, speed, roll/pitch 연구, BBox observation error correction이다.
 
 ## 시뮬레이션 목적
 
