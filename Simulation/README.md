@@ -150,6 +150,25 @@ topic이며 `/stereo/corrected_position`은 injected oracle 의미가 아니다.
 Raw와 attitude-corrected는 measurement 완료 직후 발행하고, Ground Truth는 같은
 pair midpoint의 exact/interpolated/explicit nearest alignment가 준비된 뒤 발행한다.
 
+YOLO pair 계산은 compute와 commit으로 나뉜다. Inference 완료 뒤 `/clock` epoch를
+같은 state lock에서 다시 확인하는 commit이 reset과의 선형화 지점이다. 따라서
+reset 전에 시작했지만 reset 뒤 끝난 old-epoch detection/Raw/attitude-corrected는
+어떤 canonical topic이나 result map에도 commit하지 않는다. GT는 live callback
+순서 probe에서 node 내부 기준 steady state는 최대 20 ms, reset 직후 executor
+transient는 최대 108 ms 먼저 도착할 수 있어 64-sample bounded
+simulation-time reorder buffer를 사용한다. Clock이 stamp에 도달하면 수용하고,
+200 ms보다 먼 future GT와 reset 전 pending GT는 stale
+pre-reset data로 폐기한다.
+
+Measurement queue 기본 capacity는 32 pair다. 1280x720 CUDA 실측 p99 pair
+inference 약 27 ms와 20 Hz 입력에서 약 1.6초의 일시 stall을 흡수한다. Overflow는
+silent drop하지 않고 `measurement_overrun_invalid` run 상태로 전환하며 rejected
+pair ID와 counter를 남기는 strict research policy다. Raw/Corrected dedupe는 단조
+pair-id watermark, late GT/evaluation dedupe는 128-entry bounded history를 사용해
+장시간 pair 수에 비례한 set 증가를 막는다. Shutdown drain은 5초 안에 queue,
+GT alignment, in-flight inference가 모두 끝날 때만 `SUCCESS`이며, timeout은
+`INCOMPLETE`와 remaining/in-flight/dropped pair 수 및 ID 범위를 기록한다.
+
 아직 구현하지 않은 범위는 post-hoc 삭제, PX4-only movement cleanup, pair recorder,
 typed aggregate message, speed, roll/pitch 연구, BBox observation error correction이다.
 

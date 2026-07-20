@@ -70,6 +70,7 @@ def _write_distance_node_params(context):
         "external_bbox_detection_height_px",
         "disparity_residual_feature_selector_window_size",
         "disparity_residual_feature_selector_min_samples",
+        "measurement_queue_capacity",
     }
     bool_params = {
         "fly_target_in_gazebo",
@@ -113,6 +114,7 @@ def _write_distance_node_params(context):
         "yolo_confidence",
         "yolo_device",
         "yolo_target_hz",
+        "measurement_queue_capacity",
         "yolo_imgsz",
         "enable_synthetic_detections",
         "synthetic_detection_width_px",
@@ -438,6 +440,7 @@ def generate_launch_description():
             DeclareLaunchArgument("yolo_device", default_value="cuda:0"),
             DeclareLaunchArgument("yolo_target_hz", default_value="40.0"),
             DeclareLaunchArgument("yolo_imgsz", default_value="1280"),
+            DeclareLaunchArgument("measurement_queue_capacity", default_value="32"),
             DeclareLaunchArgument("enable_synthetic_detections", default_value="false"),
             DeclareLaunchArgument("synthetic_detection_width_px", default_value="1280"),
             DeclareLaunchArgument("synthetic_detection_height_px", default_value="720"),

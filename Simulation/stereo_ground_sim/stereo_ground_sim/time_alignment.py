@@ -12,6 +12,44 @@ from typing import Any, Iterable
 NANOSECONDS_PER_SECOND = 1_000_000_000
 
 
+class BoundedIdHistory:
+    """Bounded membership history for non-monotonic late pair completion."""
+
+    def __init__(self, capacity: int) -> None:
+        if int(capacity) < 1:
+            raise ValueError("capacity must be positive")
+        self.capacity = int(capacity)
+        self._order: deque[int] = deque()
+        self._ids: set[int] = set()
+
+    def __contains__(self, pair_id: object) -> bool:
+        return pair_id in self._ids
+
+    def __len__(self) -> int:
+        return len(self._ids)
+
+    def add(self, pair_id: int) -> bool:
+        value = int(pair_id)
+        if value in self._ids:
+            return False
+        self._order.append(value)
+        self._ids.add(value)
+        while len(self._order) > self.capacity:
+            self._ids.discard(self._order.popleft())
+        return True
+
+    def discard(self, pair_id: int) -> None:
+        value = int(pair_id)
+        if value not in self._ids:
+            return
+        self._ids.discard(value)
+        self._order = deque(item for item in self._order if item != value)
+
+    def clear(self) -> None:
+        self._order.clear()
+        self._ids.clear()
+
+
 def stamp_ns_from_sec_nanosec(sec: Any, nanosec: Any) -> int:
     """Convert a ROS simulation stamp to signed int64-style nanoseconds."""
 
@@ -543,6 +581,11 @@ class PendingPairGroundTruthAligner:
         self._pending.clear()
         return count
 
+    def remove_pair(self, pair_id: int) -> bool:
+        before = len(self._pending)
+        self._pending = deque(pair for pair in self._pending if pair.pair_id != int(pair_id))
+        return len(self._pending) != before
+
     def reset_for_epoch(self, epoch: int) -> int:
         """Clear pending pairs; epoch ownership remains with the shared GT buffer."""
 
@@ -552,6 +595,7 @@ class PendingPairGroundTruthAligner:
 
 
 __all__ = [
+    "BoundedIdHistory",
     "GroundTruthAlignment",
     "GroundTruthPositionBuffer",
     "GroundTruthPositionRecord",

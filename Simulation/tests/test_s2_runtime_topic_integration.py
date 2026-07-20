@@ -9,6 +9,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
 from Simulation.stereo_ground_sim.stereo_ground_sim.time_alignment import (
+    BoundedIdHistory,
     GroundTruthAlignment,
     StereoImagePair,
 )
@@ -27,12 +28,12 @@ def _node_harness():
     node.raw_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.canonical_ground_truth_position_pub = CapturePublisher()
-    node.raw_published_pair_ids = set()
-    node.corrected_published_pair_ids = set()
-    node.gt_published_pair_ids = set()
+    node.last_raw_published_pair_id = 0
+    node.last_corrected_published_pair_id = 0
+    node.gt_published_pair_ids = BoundedIdHistory(128)
     node.raw_computed_count = 0
     node.corrected_computed_count = 0
-    node.evaluated_pair_ids = set()
+    node.evaluated_pair_ids = BoundedIdHistory(128)
     node.measurement_results_by_pair_id = {}
     node.gt_alignments_by_pair_id = {}
     node.pairs_by_pair_id = {}

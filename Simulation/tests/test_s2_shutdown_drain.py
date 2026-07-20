@@ -11,6 +11,7 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
 from Simulation.stereo_ground_sim.stereo_ground_sim.time_alignment import (
+    BoundedIdHistory,
     GroundTruthPositionBuffer,
     PendingPairGroundTruthAligner,
     SimulationEpochTracker,
@@ -36,6 +37,9 @@ def test_shutdown_flush_routes_exact_nearest_and_unavailable_pairs() -> None:
 
 
 class Logger:
+    def info(self, _message):
+        pass
+
     def warning(self, _message):
         pass
 
@@ -65,16 +69,43 @@ def test_production_worker_drains_ten_gt_unavailable_measurements() -> None:
     node.measurement_results_by_pair_id = {}
     node.gt_alignments_by_pair_id = {}
     node.pairs_by_pair_id = {}
-    node.evaluated_pair_ids = set()
-    node.raw_published_pair_ids = set()
-    node.corrected_published_pair_ids = set()
-    node.gt_published_pair_ids = set()
+    node.evaluated_pair_ids = BoundedIdHistory(128)
+    node.last_raw_published_pair_id = 0
+    node.last_corrected_published_pair_id = 0
+    node.gt_published_pair_ids = BoundedIdHistory(128)
     node.raw_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.canonical_ground_truth_position_pub = CapturePublisher()
     node.raw_computed_count = 0
     node.corrected_computed_count = 0
     node.max_pair_result_history = 128
+    node.measurement_queue_capacity = 32
+    node.measurement_queue_overflow_count = 0
+    node.measurement_overrun_invalid = False
+    node.measurement_rejected_pair_ids = BoundedIdHistory(128)
+    node.measurement_accepted_count = 0
+    node.measurement_processed_count = 0
+    node.accepted_pair_discard_count = 0
+    node.measurement_processing_error_count = 0
+    node.measurement_queue_depth_sample_count = 0
+    node.measurement_queue_depth_sum = 0
+    node.measurement_queue_depth_min = None
+    node.measurement_queue_depth_max = 0
+    node.inflight_pair_id = None
+    node.inflight_pair_epoch = None
+    node.old_epoch_result_discard_count = 0
+    node.discard_measurement_commits = False
+    node.shutdown_drain_status = "not_requested"
+    node.shutdown_drain_duration_s = 0.0
+    node.shutdown_remaining_measurement_count = 0
+    node.shutdown_remaining_gt_alignment_count = 0
+    node.shutdown_inflight_pair_id = None
+    node.shutdown_initial_measurement_count = 0
+    node.shutdown_initial_gt_alignment_count = 0
+    node.shutdown_initial_inflight_pair_id = None
+    node.dropped_on_shutdown_count = 0
+    node.dropped_on_shutdown_pair_id_min = None
+    node.dropped_on_shutdown_pair_id_max = None
     node.gt_alignment_counts = {name: 0 for name in ("exact", "interpolated", "nearest_before", "nearest_after", "unavailable")}
     node.old_epoch_frame_count = 0
     node.cached_ground_truth_position = None
@@ -89,8 +120,11 @@ def test_production_worker_drains_ten_gt_unavailable_measurements() -> None:
     node.get_logger = lambda: Logger()
     node._ground_truth_alignment_to_baseline = lambda alignment: None
 
-    def update(self, _left, _right, _actual, _phase, **kwargs):
-        pair = kwargs["pair"]
+    def compute(self, pair, _phase, device=None):
+        del device
+        return {"pair": pair}
+
+    def commit(self, pair, _computed):
         processed.append(pair.pair_id)
         metrics = {
             "pair_id": pair.pair_id,
@@ -105,9 +139,17 @@ def test_production_worker_drains_ten_gt_unavailable_measurements() -> None:
             "attitude_corrected_down_m": 0.0,
         }
         self._publish_canonical_pair_positions(metrics)
+        self.measurement_processed_count += 1
+        self.measurement_results_by_pair_id[pair.pair_id] = metrics
+        self._try_evaluate_pair_locked(pair.pair_id)
+        self.inflight_pair_id = None
+        self.inflight_pair_epoch = None
+        self.yolo_inference_in_progress = False
+        self.yolo_condition.notify_all()
         return metrics
 
-    node._update_metrics_from_messages = MethodType(update, node)
+    node._compute_pair_measurement = MethodType(compute, node)
+    node._commit_pair_measurement_if_current = MethodType(commit, node)
     pairs = []
     for stamp in range(10):
         node.image_pairer.add("left", stamp, SimpleNamespace(side="left"))
@@ -118,6 +160,7 @@ def test_production_worker_drains_ten_gt_unavailable_measurements() -> None:
     node.yolo_thread.start()
     node.shutdown()
     assert node.drain_complete
+    assert node.shutdown_drain_status == "SUCCESS"
     assert sorted(processed) == list(range(1, 11))
     assert node.gt_alignment_counts["unavailable"] == 10
     assert len(node.raw_position_pub.messages) == 10
