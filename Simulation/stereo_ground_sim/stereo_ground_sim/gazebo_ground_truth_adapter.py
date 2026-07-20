@@ -309,6 +309,7 @@ class GazeboGroundTruthAdapter:
         try:
             import rclpy
             from geometry_msgs.msg import PoseStamped
+            from rcl_interfaces.msg import SetParametersResult
             from rclpy.node import Node
         except ImportError as exc:  # pragma: no cover - depends on ROS installation
             raise RuntimeError("rclpy and geometry_msgs are required for the adapter") from exc
@@ -324,6 +325,9 @@ class GazeboGroundTruthAdapter:
         self._topic = str(topic)
         self._parent_model_name = str(self._node.get_parameter("parent_model_name").value)
         self._source_link_name = str(self._node.get_parameter("source_link_name").value)
+
+        self._set_parameters_result_type = SetParametersResult
+        self._node.add_on_set_parameters_callback(self._reject_identity_parameter_update)
         self._command = (
             tuple(command)
             if command is not None
@@ -347,6 +351,15 @@ class GazeboGroundTruthAdapter:
     @property
     def node(self) -> Any:
         return self._node
+
+    def _reject_identity_parameter_update(self, parameters: Iterable[Any]) -> Any:
+        immutable = {"parent_model_name", "source_link_name"}
+        if any(parameter.name in immutable for parameter in parameters):
+            return self._set_parameters_result_type(
+                successful=False,
+                reason="Ground Truth entity identity parameters are immutable for one run",
+            )
+        return self._set_parameters_result_type(successful=True)
 
     def _run(self) -> None:
         while not self._shutdown.is_set():
@@ -400,7 +413,14 @@ class GazeboGroundTruthAdapter:
                             self._node.get_logger().warning(
                                 "Gazebo simulation stamp decreased; treating the sample as a reset/restart"
                             )
-                        self._publisher.publish(pose_record_to_ros_message(record))
+                        try:
+                            self._publisher.publish(pose_record_to_ros_message(record))
+                        except Exception as exc:
+                            if self._shutdown.is_set() or not self._rclpy.ok():
+                                break
+                            self._node.get_logger().error(
+                                f"Ground Truth publish failure: {exc}"
+                            )
             finally:
                 if process.poll() is None:
                     process.terminate()

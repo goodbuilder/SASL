@@ -113,14 +113,25 @@ legacy/corrected 후보로 보존되며 canonical Raw를 덮어쓰지 않는다.
 없으면 simulation-time watermark 또는 명시적 flush에서 deterministic nearest
 pair를 만든다. 한 frame은 한 pair에서만 사용하며 `pair_delta_ns`는
 `right-left`, pair midpoint는 `left + (right-left)//2`이다. Simulation reset으로
-stamp가 감소하면 epoch를 증가시키고 pending image/GT를 이전 epoch와 결합하지
-않는다.
+인한 epoch는 ROS `/clock` 감소만을 authoritative source로 사용해 정확히 한 번
+증가시킨다. Image pairer와 GT buffer는 이 epoch를 주입받으며 자체 timestamp
+감소로 별도 epoch를 만들지 않는다. Reset 후 현재 `/clock`보다 미래인 이전 epoch
+image는 stale pre-reset frame으로 격리해 새 반대쪽 frame과 pair하지 않는다.
 
 Ground Truth history는 pair midpoint를 exact 또는 선형 position interpolation으로
 정렬한다. 미래 GT가 아직 없으면 pair를 pending으로 유지하고 bounded overflow,
 explicit flush, shutdown에서만 `nearest_before`, `nearest_after`, `unavailable`을
 명시한다. Quaternion은 ROS/Gazebo `x,y,z,w` 순서로 보존하며 위치 보간에 Euler
 보간을 섞지 않는다.
+
+Measurement와 GT evaluation은 분리된다. Image pair가 생기면 GT availability와
+무관하게 measurement queue에서 YOLO/detection, Raw, attitude-corrected를 즉시
+계산하고 canonical Raw/Corrected topic을 발행한다. 같은 pair metadata는 별도로
+GT aligner에 등록하며, late GT가 준비되면 `pair_id`로 기존 measurement와 한 번만
+결합해 GT topic과 error를 계산한다. GT unavailable이면 Raw/Corrected와 해당
+diagnostic은 유지하고 GT/error만 unavailable이다. Shutdown은 새 입력을 막은 뒤
+image pairer, GT pending alignment, measurement queue, evaluation queue 순서로
+drain하므로 마지막 exact/nearest pair의 measurement를 버리지 않는다.
 
 자세 연구 입력은 `common_optical_yaw_error_deg`와
 `relative_optical_yaw_error_deg`이다. Effective yaw는 left=`common-relative/2`,
@@ -136,6 +147,8 @@ pair midpoint simulation stamp, `frame_id=baseline_center_frd`, point x/y/z =
 Forward/Right/Down metres를 사용한다. 기존 `/stereo/estimated_position`,
 `/ground_truth_position`, `/stereo/corrected_position`은 S3 전까지 legacy migration
 topic이며 `/stereo/corrected_position`은 injected oracle 의미가 아니다.
+Raw와 attitude-corrected는 measurement 완료 직후 발행하고, Ground Truth는 같은
+pair midpoint의 exact/interpolated/explicit nearest alignment가 준비된 뒤 발행한다.
 
 아직 구현하지 않은 범위는 post-hoc 삭제, PX4-only movement cleanup, pair recorder,
 typed aggregate message, speed, roll/pitch 연구, BBox observation error correction이다.

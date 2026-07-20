@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from types import MethodType
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
+sys.path.insert(0, str(PACKAGE_ROOT))
+
+from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from Simulation.stereo_ground_sim.stereo_ground_sim.time_alignment import (
+    GroundTruthAlignment,
+    StereoImagePair,
+)
+
+
+class CapturePublisher:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, message):
+        self.messages.append(message)
+
+
+def _node_harness():
+    node = StereoDistanceNode.__new__(StereoDistanceNode)
+    node.raw_position_pub = CapturePublisher()
+    node.attitude_corrected_position_pub = CapturePublisher()
+    node.canonical_ground_truth_position_pub = CapturePublisher()
+    node.raw_published_pair_ids = set()
+    node.corrected_published_pair_ids = set()
+    node.gt_published_pair_ids = set()
+    node.raw_computed_count = 0
+    node.corrected_computed_count = 0
+    node.evaluated_pair_ids = set()
+    node.measurement_results_by_pair_id = {}
+    node.gt_alignments_by_pair_id = {}
+    node.pairs_by_pair_id = {}
+    node.gt_alignment_counts = {
+        "exact": 0,
+        "interpolated": 0,
+        "nearest_before": 0,
+        "nearest_after": 0,
+        "unavailable": 0,
+    }
+    node.last_pair_result = None
+    node._ground_truth_alignment_to_baseline = MethodType(
+        lambda self, alignment: None
+        if alignment.position_world_enu_m is None
+        else {
+            "forward_m": alignment.position_world_enu_m[0],
+            "right_m": alignment.position_world_enu_m[1],
+            "down_m": alignment.position_world_enu_m[2],
+            "range_m": sum(value * value for value in alignment.position_world_enu_m) ** 0.5,
+        },
+        node,
+    )
+    return node
+
+
+def test_raw_and_corrected_publish_before_late_gt_on_same_pair_stamp() -> None:
+    node = _node_harness()
+    pair = StereoImagePair(5, 100, 102, 101, 2, "nearest", object(), object(), 0)
+    metrics = {
+        "pair_id": 5,
+        "pair_midpoint_stamp_ns": 101,
+        "computation_status": "computed",
+        "estimated_forward_m": 10.0,
+        "estimated_right_m": 2.0,
+        "estimated_down_m": -1.0,
+        "attitude_corrected_computation_status": "computed",
+        "attitude_corrected_forward_m": 9.5,
+        "attitude_corrected_right_m": 2.0,
+        "attitude_corrected_down_m": -1.0,
+    }
+    node._publish_canonical_pair_positions(metrics)
+    node._publish_canonical_pair_positions(metrics)
+    assert len(node.raw_position_pub.messages) == 1
+    assert len(node.attitude_corrected_position_pub.messages) == 1
+    assert node.canonical_ground_truth_position_pub.messages == []
+
+    node.pairs_by_pair_id[5] = pair
+    node.measurement_results_by_pair_id[5] = metrics
+    node.gt_alignments_by_pair_id[5] = GroundTruthAlignment(
+        (9.0, 2.0, -1.0),
+        None,
+        "interpolated",
+        50,
+        152,
+        0.5,
+        None,
+    )
+    assert node._try_evaluate_pair_locked(5)
+    assert not node._try_evaluate_pair_locked(5)
+    assert len(node.canonical_ground_truth_position_pub.messages) == 1
+    messages = [
+        node.raw_position_pub.messages[0],
+        node.attitude_corrected_position_pub.messages[0],
+        node.canonical_ground_truth_position_pub.messages[0],
+    ]
+    assert [(msg.header.stamp.sec, msg.header.stamp.nanosec) for msg in messages] == [(0, 101)] * 3
+    assert {msg.header.frame_id for msg in messages} == {"baseline_center_frd"}
+    assert (messages[0].point.x, messages[0].point.y, messages[0].point.z) == (10.0, 2.0, -1.0)
+    assert node.last_pair_result["raw_position_error_m"] > 0.0
+    assert node.last_pair_result["corrected_position_error_m"] > 0.0

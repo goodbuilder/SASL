@@ -3,21 +3,27 @@ from __future__ import annotations
 from Simulation.stereo_ground_sim.stereo_ground_sim.time_alignment import (
     GroundTruthPositionBuffer,
     PendingPairGroundTruthAligner,
+    SimulationEpochTracker,
     StereoImagePair,
     StereoImagePairer,
 )
 from Simulation.stereo_ground_sim.stereo_ground_sim.gazebo_ground_truth_adapter import PoseVState
 from pathlib import Path
+import pytest
 
 
 Q = (0.0, 0.0, 0.0, 1.0)
 
 
-def test_image_reset_clears_pending_and_never_cross_pairs_epochs() -> None:
+def test_clock_reset_clears_pending_and_never_cross_pairs_epochs() -> None:
+    tracker = SimulationEpochTracker()
     pairer = StereoImagePairer()
-    pairer.add("left", 100, "old-left")
-    pairer.add("left", 10, "new-left")
-    pairs = pairer.add("right", 10, "new-right")
+    tracker.observe_clock(100)
+    pairer.add("left", 100, "old-left", epoch=tracker.epoch)
+    event = tracker.observe_clock(10)
+    pairer.reset_for_epoch(event.epoch)
+    pairer.add("left", 10, "new-left", epoch=tracker.epoch)
+    pairs = pairer.add("right", 10, "new-right", epoch=tracker.epoch)
     pairs.extend(pairer.flush())
     assert pairer.image_reset_count == 1
     assert pairer.unmatched_left_count == 1
@@ -26,10 +32,13 @@ def test_image_reset_clears_pending_and_never_cross_pairs_epochs() -> None:
     assert pairs[0].left_message == "new-left"
 
 
-def test_gt_reset_clears_history_and_rejects_old_pair_epoch() -> None:
+def test_gt_reset_is_externally_driven_and_rejects_old_pair_epoch() -> None:
     buffer = GroundTruthPositionBuffer()
     buffer.add(100, (1.0, 0.0, 0.0), Q)
-    buffer.add(10, (2.0, 0.0, 0.0), Q)
+    with pytest.raises(ValueError, match="without a /clock reset"):
+        buffer.add(10, (2.0, 0.0, 0.0), Q)
+    buffer.reset_for_epoch(1)
+    buffer.add(10, (2.0, 0.0, 0.0), Q, epoch=1)
     assert buffer.reset_count == 1
     assert buffer.align(10, 0).gt_alignment_mode == "unavailable"
     assert buffer.align(10, 1).position_world_enu_m == (2.0, 0.0, 0.0)

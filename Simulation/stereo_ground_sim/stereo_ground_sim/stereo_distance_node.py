@@ -14,6 +14,7 @@ try:  # ROS is present in production; pure geometry tests may run without it.
     from rclpy.node import Node
     from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
     from geometry_msgs.msg import PointStamped, PoseStamped
+    from rosgraph_msgs.msg import Clock
     from sensor_msgs.msg import Image as ImageMsg
     from std_msgs.msg import Float32, Float32MultiArray, String
     from visualization_msgs.msg import Marker
@@ -70,6 +71,9 @@ except ImportError:  # pragma: no cover - exercised only outside ROS
     class PointStamped(_Message):  # type: ignore[no-redef]
         pass
 
+    class Clock(_Message):  # type: ignore[no-redef]
+        pass
+
     class Marker(_Message):  # type: ignore[no-redef]
         TEXT_VIEW_FACING = 9
         ADD = 0
@@ -119,7 +123,9 @@ from stereo_ground_sim.coordinate_frames import (
 from stereo_ground_sim.time_alignment import (
     GroundTruthPositionBuffer,
     PendingPairGroundTruthAligner,
+    SimulationEpochTracker,
     StereoImagePairer,
+    image_stamp_ns,
 )
 
 
@@ -312,14 +318,30 @@ class StereoDistanceNode(Node):
         self.ground_truth_stamp_ns = None
         self.ground_truth_entity_id = None
         self.shutdown_event = threading.Event()
+        self.accepting_input = True
+        self.drain_requested = False
+        self.drain_complete = False
 
+        self.simulation_epoch = SimulationEpochTracker()
         self.image_pairer = StereoImagePairer(max_buffer_size=64)
         self.gt_position_buffer = GroundTruthPositionBuffer(max_buffer_size=512)
         self.pending_gt_aligner = PendingPairGroundTruthAligner(
             self.gt_position_buffer,
             max_pending_pairs=64,
         )
-        self.pair_queue = deque()
+        self.measurement_pair_queue = deque()
+        self.gt_alignment_ready_queue = deque()
+        self.measurement_results_by_pair_id = {}
+        self.gt_alignments_by_pair_id = {}
+        self.pairs_by_pair_id = {}
+        self.evaluated_pair_ids = set()
+        self.raw_published_pair_ids = set()
+        self.corrected_published_pair_ids = set()
+        self.gt_published_pair_ids = set()
+        self.max_pair_result_history = 128
+        self.stale_pre_reset_count = 0
+        self.inconsistent_clock_count = 0
+        self.old_epoch_frame_count = 0
         self.last_pair_result = None
         self.gt_alignment_counts = {
             "exact": 0,
@@ -379,6 +401,7 @@ class StereoDistanceNode(Node):
             self._ground_truth_pose_cb,
             10,
         )
+        self.clock_sub = self.create_subscription(Clock, "/clock", self._clock_cb, 10)
         self.disparity_pub = self.create_publisher(Float32, "/stereo/disparity", 10)
         self.error_pub = self.create_publisher(Float32, "/stereo/distance_error", 10)
         self.comparison_pub = self.create_publisher(Float32MultiArray, "/stereo/distance_comparison", 10)
@@ -514,6 +537,61 @@ class StereoDistanceNode(Node):
         fx = (width * 0.5) / math.tan(float(self.horizontal_fov_rad) * 0.5)
         return PinholeIntrinsics(fx_px=fx, fy_px=fx, cx_px=width * 0.5, cy_px=height * 0.5)
 
+    def _clock_cb(self, msg):
+        try:
+            stamp_ns = int(msg.clock.sec) * 1_000_000_000 + int(msg.clock.nanosec)
+        except (AttributeError, TypeError, ValueError):
+            self.get_logger().warning("Invalid /clock message ignored")
+            return
+        with self.yolo_condition:
+            event = self.simulation_epoch.observe_clock(stamp_ns)
+            if event.reset:
+                self._reset_for_simulation_epoch_locked(event.epoch)
+                self.get_logger().warning(
+                    f"Simulation /clock decreased; entered epoch {event.epoch}"
+                )
+
+    def _reset_for_simulation_epoch_locked(self, epoch):
+        dropped = self.image_pairer.reset_for_epoch(epoch)
+        dropped += self.pending_gt_aligner.clear()
+        dropped += len(self.measurement_pair_queue)
+        dropped += len(self.gt_alignment_ready_queue)
+        self.measurement_pair_queue.clear()
+        self.gt_alignment_ready_queue.clear()
+        self.gt_position_buffer.reset_for_epoch(epoch)
+        self.measurement_results_by_pair_id.clear()
+        self.gt_alignments_by_pair_id.clear()
+        self.pairs_by_pair_id.clear()
+        self.evaluated_pair_ids.clear()
+        self.cached_ground_truth_position = None
+        self.cached_actual_distance = None
+        self.ground_truth_stamp_ns = None
+        self.old_epoch_frame_count += dropped
+
+    def _register_measurement_pairs_locked(self, pairs):
+        ready_count = 0
+        for pair in pairs:
+            if pair.epoch != self.simulation_epoch.epoch:
+                self.old_epoch_frame_count += 1
+                continue
+            self.pairs_by_pair_id[pair.pair_id] = pair
+            self.measurement_pair_queue.append(pair)
+            alignments = self.pending_gt_aligner.add_pair(pair)
+            self.gt_alignment_ready_queue.extend(alignments)
+            ready_count += 1
+        if ready_count:
+            self.yolo_condition.notify_all()
+        self._bound_pair_state_locked()
+        return ready_count
+
+    def _bound_pair_state_locked(self):
+        while len(self.pairs_by_pair_id) > self.max_pair_result_history:
+            oldest = min(self.pairs_by_pair_id)
+            self.pairs_by_pair_id.pop(oldest, None)
+            self.measurement_results_by_pair_id.pop(oldest, None)
+            self.gt_alignments_by_pair_id.pop(oldest, None)
+            self.evaluated_pair_ids.discard(oldest)
+
     def _ground_truth_pose_cb(self, msg):
         if str(msg.header.frame_id) != WORLD_FRAME:
             self.get_logger().warning(
@@ -537,12 +615,21 @@ class StereoDistanceNode(Node):
             position = ground_truth_world_to_baseline(point_world, self.baseline_center_frd)
             if hasattr(self, "gt_position_buffer"):
                 with self.yolo_condition:
-                    self.gt_position_buffer.add(stamp_ns, point_world, orientation_xyzw)
+                    if not self.accepting_input:
+                        return
+                    epoch = self.simulation_epoch.epoch
+                    self.gt_position_buffer.add(
+                        stamp_ns,
+                        point_world,
+                        orientation_xyzw,
+                        epoch=epoch,
+                    )
                     aligned_pairs = self.pending_gt_aligner.pop_watermarked()
-                    self.pair_queue.extend(aligned_pairs)
+                    self.gt_alignment_ready_queue.extend(aligned_pairs)
                     if aligned_pairs:
                         self.yolo_condition.notify_all()
         except (TypeError, ValueError) as exc:
+            self.inconsistent_clock_count += 1
             self.get_logger().warning(f"Ground Truth ignored: {exc}")
             return
         position.update(
@@ -1275,11 +1362,30 @@ class StereoDistanceNode(Node):
         return self.cached_actual_distance
 
     def shutdown(self):
-        if hasattr(self, "image_pairer") and hasattr(self, "pending_gt_aligner"):
-            for pair in self.image_pairer.flush():
-                self.pending_gt_aligner.add_pair(pair)
-            self.pending_gt_aligner.flush()
+        if not hasattr(self, "yolo_condition"):
+            self.shutdown_event.set()
+            return
+        with self.yolo_condition:
+            self.accepting_input = False
+            flushed_pairs = self.image_pairer.flush()
+            self._register_measurement_pairs_locked(flushed_pairs)
+            self.gt_alignment_ready_queue.extend(self.pending_gt_aligner.flush())
+            self.drain_requested = True
+            self.yolo_condition.notify_all()
+            if self.yolo_thread is None:
+                self.drain_complete = (
+                    not self.measurement_pair_queue and not self.gt_alignment_ready_queue
+                )
+            deadline = time.monotonic() + 5.0
+            while not self.drain_complete and time.monotonic() < deadline:
+                self.yolo_condition.wait(timeout=min(0.1, deadline - time.monotonic()))
+        if not self.drain_complete and self.yolo_thread is not None:
+            self.get_logger().warning("S2 shutdown drain timed out with pending pair work")
         self.shutdown_event.set()
+        with self.yolo_condition:
+            self.yolo_condition.notify_all()
+        if self.yolo_thread is not None and self.yolo_thread.is_alive():
+            self.yolo_thread.join(timeout=2.0)
 
     def _command_gazebo_target_pose(self, state):
         now = time.monotonic()
@@ -1322,65 +1428,83 @@ class StereoDistanceNode(Node):
         self._store_image("right", msg)
 
     def _store_image(self, side, msg):
+        if not self.accepting_input:
+            return
+        try:
+            stamp_ns = image_stamp_ns(msg)
+        except ValueError as exc:
+            self.image_pairer.invalid_timestamp_count += 1
+            self.get_logger().warning(f"Invalid {side} image simulation timestamp: {exc}")
+            return
         with self.yolo_condition:
-            previous_epoch = self.image_pairer.epoch
+            latest_clock = self.simulation_epoch.last_clock_stamp_ns
+            if not self.simulation_epoch.accepts_stamp(stamp_ns):
+                self.stale_pre_reset_count += 1
+                self.get_logger().warning(
+                    f"{side} image stamp {stamp_ns} is ahead of current /clock {latest_clock}; ignored"
+                )
+                return
             try:
-                pairs = self.image_pairer.add_message(side, msg)
+                pairs = self.image_pairer.add(
+                    side,
+                    stamp_ns,
+                    msg,
+                    epoch=self.simulation_epoch.epoch,
+                )
             except ValueError as exc:
                 self.get_logger().warning(f"Invalid {side} image simulation timestamp: {exc}")
                 return
-            dropped = 0
-            if self.image_pairer.epoch != previous_epoch:
-                dropped = self.pending_gt_aligner.clear()
-                dropped += len(self.pair_queue)
-                self.pair_queue.clear()
-            aligned_pairs = []
-            for pair in pairs:
-                aligned_pairs.extend(self.pending_gt_aligner.add_pair(pair))
-            self.pair_queue.extend(aligned_pairs)
-            if aligned_pairs:
-                self.yolo_condition.notify_all()
-        if self.image_pairer.epoch != previous_epoch:
-            self.get_logger().warning(
-                "Image simulation stamp decreased; advanced epoch and cleared "
-                f"{dropped} pending pair(s)"
-            )
+            self._register_measurement_pairs_locked(pairs)
 
     def _yolo_worker_loop(self):
         self._warm_yolo_model()
         next_tick = time.monotonic()
-        while not self.shutdown_event.is_set():
+        while True:
+            pair = None
+            alignment_work = None
             with self.yolo_condition:
-                while (
-                    (not self.pair_queue or self.yolo_target_hz <= 0.0)
-                    and not self.shutdown_event.is_set()
-                ):
+                while not self.measurement_pair_queue and not self.gt_alignment_ready_queue:
+                    if self.drain_requested:
+                        self.drain_complete = True
+                        self.yolo_condition.notify_all()
+                        return
+                    if self.shutdown_event.is_set():
+                        return
                     self.yolo_condition.wait(timeout=0.1)
-                if self.shutdown_event.is_set():
-                    return
-                target_hz = max(0.1, float(self.yolo_target_hz))
-                wait_s = next_tick - time.monotonic()
-                if wait_s > 0.0:
-                    self.yolo_condition.wait(timeout=wait_s)
+                if self.gt_alignment_ready_queue:
+                    alignment_work = self.gt_alignment_ready_queue.popleft()
+                elif self.measurement_pair_queue:
+                    target_hz = max(0.1, float(self.yolo_target_hz))
+                    wait_s = next_tick - time.monotonic()
+                    if wait_s > 0.0 and not self.drain_requested:
+                        self.yolo_condition.wait(timeout=wait_s)
+                        continue
+                    pair = self.measurement_pair_queue.popleft()
+                if alignment_work is not None:
+                    self._store_gt_alignment_locked(*alignment_work)
                     continue
-                pair, gt_alignment = self.pair_queue.popleft()
+                if pair is None:
+                    continue
                 left_msg = pair.left_message
                 right_msg = pair.right_message
-                gt_baseline = self._ground_truth_alignment_to_baseline(gt_alignment)
-                actual = None if gt_baseline is None else float(gt_baseline["forward_m"])
                 phase = self._mission_state()["phase"]
                 self.yolo_inference_in_progress = True
                 self.last_yolo_update = time.monotonic()
                 next_tick = self.last_yolo_update + 1.0 / target_hz
-            self._update_metrics_from_messages(
+            metrics = self._update_metrics_from_messages(
                 left_msg,
                 right_msg,
-                actual,
+                None,
                 phase,
                 pair=pair,
-                gt_alignment=gt_alignment,
-                gt_baseline=gt_baseline,
+                gt_alignment=None,
+                gt_baseline=None,
             )
+            if metrics is not None:
+                with self.yolo_condition:
+                    self.measurement_results_by_pair_id[pair.pair_id] = metrics
+                    self._try_evaluate_pair_locked(pair.pair_id)
+                    self._bound_pair_state_locked()
 
     def _update_metrics_from_messages(
         self,
@@ -1414,7 +1538,15 @@ class StereoDistanceNode(Node):
                     left_image.shape[1],
                     left_image.shape[0],
                 )
-            metrics.update(self._pair_result_metadata(pair, gt_alignment, gt_baseline, corrected))
+            metrics.update(
+                self._pair_result_metadata(
+                    pair,
+                    gt_alignment,
+                    gt_baseline,
+                    corrected,
+                    count_alignment=gt_alignment is not None,
+                )
+            )
             self.last_pair_result = dict(metrics)
             with self.lock:
                 self.left_detection = left
@@ -1444,6 +1576,7 @@ class StereoDistanceNode(Node):
                         ]
                     )
                 )
+            return metrics
         finally:
             finished = time.monotonic()
             elapsed_ms = (finished - started) * 1000.0
@@ -1467,9 +1600,94 @@ class StereoDistanceNode(Node):
         except (TypeError, ValueError):
             return None
 
-    def _pair_result_metadata(self, pair, alignment, gt_baseline, corrected):
+    def _store_gt_alignment_locked(self, pair, alignment):
+        if pair.epoch != self.simulation_epoch.epoch:
+            self.old_epoch_frame_count += 1
+            return
+        self.gt_alignments_by_pair_id[pair.pair_id] = alignment
+        self.pairs_by_pair_id.setdefault(pair.pair_id, pair)
+        self._try_evaluate_pair_locked(pair.pair_id)
+
+    def _try_evaluate_pair_locked(self, pair_id):
+        if pair_id in self.evaluated_pair_ids:
+            return False
+        metrics = self.measurement_results_by_pair_id.get(pair_id)
+        alignment = self.gt_alignments_by_pair_id.get(pair_id)
+        pair = self.pairs_by_pair_id.get(pair_id)
+        if metrics is None or alignment is None or pair is None:
+            return False
+        gt_baseline = self._ground_truth_alignment_to_baseline(alignment)
+        evaluation = self._evaluation_metadata(pair, alignment, gt_baseline, metrics)
+        metrics.update(evaluation)
+        self.last_pair_result = dict(metrics)
+        self.gt_alignment_counts[alignment.gt_alignment_mode] += 1
+        if gt_baseline is not None and pair_id not in self.gt_published_pair_ids:
+            self.canonical_ground_truth_position_pub.publish(
+                self._point_stamped(
+                    pair.pair_midpoint_stamp_ns,
+                    gt_baseline["forward_m"],
+                    gt_baseline["right_m"],
+                    gt_baseline["down_m"],
+                )
+            )
+            self.gt_published_pair_ids.add(pair_id)
+        self.evaluated_pair_ids.add(pair_id)
+        self.measurement_results_by_pair_id.pop(pair_id, None)
+        self.gt_alignments_by_pair_id.pop(pair_id, None)
+        return True
+
+    @staticmethod
+    def _vector_error(metrics, prefix, gt_baseline):
+        if gt_baseline is None:
+            return None, None
+        values = (
+            metrics.get(f"{prefix}forward_m"),
+            metrics.get(f"{prefix}right_m"),
+            metrics.get(f"{prefix}down_m"),
+        )
+        if any(value is None for value in values):
+            return None, None
+        errors = tuple(
+            float(values[index]) - float(gt_baseline[name])
+            for index, name in enumerate(("forward_m", "right_m", "down_m"))
+        )
+        return math.sqrt(sum(value * value for value in errors)), errors[0]
+
+    def _evaluation_metadata(self, pair, alignment, gt_baseline, metrics):
+        raw_error, raw_forward_error = self._vector_error(metrics, "estimated_", gt_baseline)
+        corrected_error, corrected_forward_error = self._vector_error(
+            metrics,
+            "attitude_corrected_",
+            gt_baseline,
+        )
+        return {
+            "pair_id": pair.pair_id,
+            "gt_alignment_mode": alignment.gt_alignment_mode,
+            "gt_before_stamp_ns": alignment.gt_before_stamp_ns,
+            "gt_after_stamp_ns": alignment.gt_after_stamp_ns,
+            "gt_interpolation_alpha": alignment.gt_interpolation_alpha,
+            "gt_nearest_delta_ns": alignment.gt_nearest_delta_ns,
+            "gt_forward_m": None if gt_baseline is None else gt_baseline["forward_m"],
+            "gt_right_m": None if gt_baseline is None else gt_baseline["right_m"],
+            "gt_down_m": None if gt_baseline is None else gt_baseline["down_m"],
+            "gt_range_m": None if gt_baseline is None else gt_baseline["range_m"],
+            "raw_position_error_m": raw_error,
+            "corrected_position_error_m": corrected_error,
+            "raw_forward_error_m": raw_forward_error,
+            "corrected_forward_error_m": corrected_forward_error,
+        }
+
+    def _pair_result_metadata(
+        self,
+        pair,
+        alignment,
+        gt_baseline,
+        corrected,
+        *,
+        count_alignment=True,
+    ):
         alignment_mode = "unavailable" if alignment is None else alignment.gt_alignment_mode
-        if hasattr(self, "gt_alignment_counts"):
+        if count_alignment and hasattr(self, "gt_alignment_counts"):
             self.gt_alignment_counts[alignment_mode] += 1
         metadata = {
             "pair_id": None if pair is None else pair.pair_id,
@@ -1524,6 +1742,12 @@ class StereoDistanceNode(Node):
             "unmatched_right_count": pairer.unmatched_right_count,
             "image_reset_count": pairer.image_reset_count,
             "gt_reset_count": self.gt_position_buffer.reset_count,
+            "simulation_reset_count": self.simulation_epoch.reset_count,
+            "simulation_epoch": self.simulation_epoch.epoch,
+            "stale_pre_reset_count": self.stale_pre_reset_count,
+            "invalid_timestamp_count": pairer.invalid_timestamp_count,
+            "inconsistent_clock_count": self.inconsistent_clock_count
+            + self.gt_position_buffer.inconsistent_clock_count,
             "gt_exact_count": self.gt_alignment_counts["exact"],
             "gt_interpolated_count": self.gt_alignment_counts["interpolated"],
             "gt_nearest_before_count": self.gt_alignment_counts["nearest_before"],
@@ -1546,9 +1770,13 @@ class StereoDistanceNode(Node):
 
     def _publish_canonical_pair_positions(self, metrics):
         stamp_ns = metrics.get("pair_midpoint_stamp_ns")
+        pair_id = metrics.get("pair_id")
         if stamp_ns is None:
             return
-        if metrics.get("computation_status") == "computed":
+        if (
+            metrics.get("computation_status") == "computed"
+            and pair_id not in self.raw_published_pair_ids
+        ):
             self.raw_computed_count += 1
             self.raw_position_pub.publish(
                 self._point_stamped(
@@ -1558,7 +1786,11 @@ class StereoDistanceNode(Node):
                     metrics["estimated_down_m"],
                 )
             )
-        if metrics.get("attitude_corrected_computation_status") == "computed":
+            self.raw_published_pair_ids.add(pair_id)
+        if (
+            metrics.get("attitude_corrected_computation_status") == "computed"
+            and pair_id not in self.corrected_published_pair_ids
+        ):
             self.corrected_computed_count += 1
             self.attitude_corrected_position_pub.publish(
                 self._point_stamped(
@@ -1568,15 +1800,7 @@ class StereoDistanceNode(Node):
                     metrics["attitude_corrected_down_m"],
                 )
             )
-        if metrics.get("gt_alignment_mode") != "unavailable":
-            self.canonical_ground_truth_position_pub.publish(
-                self._point_stamped(
-                    stamp_ns,
-                    metrics["gt_forward_m"],
-                    metrics["gt_right_m"],
-                    metrics["gt_down_m"],
-                )
-            )
+            self.corrected_published_pair_ids.add(pair_id)
 
     def _publish_estimated_position(self, metrics):
         self.estimated_position_pub.publish(

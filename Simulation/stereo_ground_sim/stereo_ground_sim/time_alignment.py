@@ -60,6 +60,36 @@ class StereoImagePair:
     epoch: int
 
 
+@dataclass(frozen=True)
+class SimulationEpochEvent:
+    epoch: int
+    reset: bool
+    stamp_ns: int
+
+
+class SimulationEpochTracker:
+    """Single authoritative simulation epoch derived only from ``/clock``."""
+
+    def __init__(self) -> None:
+        self.epoch = 0
+        self.last_clock_stamp_ns: int | None = None
+        self.reset_count = 0
+
+    def observe_clock(self, stamp_ns: int) -> SimulationEpochEvent:
+        stamp = int(stamp_ns)
+        reset = self.last_clock_stamp_ns is not None and stamp < self.last_clock_stamp_ns
+        if reset:
+            self.epoch += 1
+            self.reset_count += 1
+        self.last_clock_stamp_ns = stamp
+        return SimulationEpochEvent(self.epoch, reset, stamp)
+
+    def accepts_stamp(self, stamp_ns: int) -> bool:
+        """Reject a pre-reset future stamp from the current clock epoch."""
+
+        return self.last_clock_stamp_ns is None or int(stamp_ns) <= self.last_clock_stamp_ns
+
+
 class StereoImagePairer:
     """Deterministic, bounded, one-to-one pairing of stamped image records.
 
@@ -87,12 +117,31 @@ class StereoImagePairer:
         self.unmatched_left_count = 0
         self.unmatched_right_count = 0
         self.image_reset_count = 0
+        self.out_of_order_count = 0
         self.invalid_timestamp_count = 0
 
-    def add_message(self, side: str, message: Any) -> list[StereoImagePair]:
-        return self.add(side, image_stamp_ns(message), message)
+    def add_message(
+        self,
+        side: str,
+        message: Any,
+        *,
+        epoch: int | None = None,
+    ) -> list[StereoImagePair]:
+        try:
+            stamp_ns = image_stamp_ns(message)
+        except ValueError:
+            self.invalid_timestamp_count += 1
+            raise
+        return self.add(side, stamp_ns, message, epoch=epoch)
 
-    def add(self, side: str, stamp_ns: int, message: Any) -> list[StereoImagePair]:
+    def add(
+        self,
+        side: str,
+        stamp_ns: int,
+        message: Any,
+        *,
+        epoch: int | None = None,
+    ) -> list[StereoImagePair]:
         side = str(side)
         if side not in self._pending:
             raise ValueError("side must be 'left' or 'right'")
@@ -101,22 +150,25 @@ class StereoImagePairer:
         except (TypeError, ValueError):
             self.invalid_timestamp_count += 1
             raise ValueError("image timestamp must be an integer nanosecond value") from None
+        record_epoch = self.epoch if epoch is None else int(epoch)
+        if record_epoch != self.epoch:
+            raise ValueError(
+                f"image epoch {record_epoch} does not match active epoch {self.epoch}"
+            )
         previous = self._last_stamp[side]
         if previous is not None and stamp < previous:
-            self._reset_epoch()
+            self.out_of_order_count += 1
+            return []
         self._last_stamp[side] = stamp
         self._sequence[side] += 1
-        record = ImageRecord(side, stamp, message, self._sequence[side], self.epoch)
+        record = ImageRecord(side, stamp, message, self._sequence[side], record_epoch)
         self._pending[side].append(record)
         self._pending[side].sort(key=lambda item: (item.stamp_ns, item.sequence_in_side))
         if side == "left":
             self.left_received_count += 1
         else:
             self.right_received_count += 1
-        watermark = None
-        if self._last_stamp["left"] is not None and self._last_stamp["right"] is not None:
-            watermark = min(int(self._last_stamp["left"]), int(self._last_stamp["right"]))
-        self._pair_exact(max_stamp_exclusive=watermark)
+        self._pair_exact()
         self._pair_watermarked_nearest()
         self._enforce_bound(side)
         return self.pop_ready()
@@ -152,11 +204,21 @@ class StereoImagePairer:
     def pending_right_count(self) -> int:
         return len(self._pending["right"])
 
-    def _reset_epoch(self) -> None:
+    def reset_for_epoch(self, epoch: int) -> int:
+        """Clear pending frames and adopt an externally supplied clock epoch."""
+
+        requested = int(epoch)
+        if requested < self.epoch:
+            raise ValueError("image pairer epoch cannot move backwards")
+        if requested == self.epoch:
+            return 0
+        dropped = len(self._pending["left"]) + len(self._pending["right"])
         self._count_and_clear_unmatched()
-        self.epoch += 1
+        self.epoch = requested
         self.image_reset_count += 1
         self._last_stamp = {"left": None, "right": None}
+        self._ready.clear()
+        return dropped
 
     def _count_and_clear_unmatched(self) -> None:
         self.unmatched_left_count += len(self._pending["left"])
@@ -293,6 +355,7 @@ class GroundTruthPositionBuffer:
         self.max_buffer_size = int(max_buffer_size)
         self.epoch = 0
         self.reset_count = 0
+        self.inconsistent_clock_count = 0
         self._last_stamp_ns: int | None = None
         self._records: list[GroundTruthPositionRecord] = []
 
@@ -305,6 +368,8 @@ class GroundTruthPositionBuffer:
         stamp_ns: int,
         position_world_enu_m: Iterable[float],
         orientation_world_from_reference_xyzw: Iterable[float],
+        *,
+        epoch: int | None = None,
     ) -> GroundTruthPositionRecord:
         stamp = int(stamp_ns)
         position = tuple(float(value) for value in position_world_enu_m)
@@ -313,12 +378,16 @@ class GroundTruthPositionBuffer:
             raise ValueError("Ground Truth position must contain three finite metres")
         if len(orientation) != 4 or not all(math.isfinite(value) for value in orientation):
             raise ValueError("Ground Truth orientation must contain finite x,y,z,w")
+        record_epoch = self.epoch if epoch is None else int(epoch)
+        if record_epoch != self.epoch:
+            raise ValueError(
+                f"Ground Truth epoch {record_epoch} does not match active epoch {self.epoch}"
+            )
         if self._last_stamp_ns is not None and stamp < self._last_stamp_ns:
-            self.epoch += 1
-            self.reset_count += 1
-            self._records.clear()
+            self.inconsistent_clock_count += 1
+            raise ValueError("Ground Truth stamp decreased without a /clock reset")
         self._last_stamp_ns = stamp
-        record = GroundTruthPositionRecord(stamp, position, orientation, self.epoch)  # type: ignore[arg-type]
+        record = GroundTruthPositionRecord(stamp, position, orientation, record_epoch)  # type: ignore[arg-type]
         index = bisect_left([item.stamp_ns for item in self._records], stamp)
         if index < len(self._records) and self._records[index].stamp_ns == stamp:
             self._records[index] = record
@@ -327,6 +396,19 @@ class GroundTruthPositionBuffer:
         if len(self._records) > self.max_buffer_size:
             del self._records[: len(self._records) - self.max_buffer_size]
         return record
+
+    def reset_for_epoch(self, epoch: int) -> int:
+        requested = int(epoch)
+        if requested < self.epoch:
+            raise ValueError("Ground Truth epoch cannot move backwards")
+        if requested == self.epoch:
+            return 0
+        dropped = len(self._records)
+        self._records.clear()
+        self._last_stamp_ns = None
+        self.epoch = requested
+        self.reset_count += 1
+        return dropped
 
     def align(self, pair_stamp_ns: int, epoch: int, *, allow_nearest: bool = False) -> GroundTruthAlignment:
         if int(epoch) != self.epoch or not self._records:
@@ -461,6 +543,13 @@ class PendingPairGroundTruthAligner:
         self._pending.clear()
         return count
 
+    def reset_for_epoch(self, epoch: int) -> int:
+        """Clear pending pairs; epoch ownership remains with the shared GT buffer."""
+
+        if int(epoch) != self.gt_buffer.epoch:
+            raise ValueError("GT aligner epoch must match the Ground Truth buffer")
+        return self.clear()
+
 
 __all__ = [
     "GroundTruthAlignment",
@@ -468,6 +557,8 @@ __all__ = [
     "GroundTruthPositionRecord",
     "ImageRecord",
     "PendingPairGroundTruthAligner",
+    "SimulationEpochEvent",
+    "SimulationEpochTracker",
     "StereoImagePair",
     "StereoImagePairer",
     "image_stamp_ns",
