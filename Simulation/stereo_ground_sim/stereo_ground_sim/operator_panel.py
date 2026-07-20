@@ -32,7 +32,6 @@ AXES = (
 SERIES = (
     ("truth", "/ground_truth_position", QColor(32, 86, 255)),
     ("raw", "/stereo/estimated_position", QColor(220, 32, 32)),
-    ("corrected", "/stereo/corrected_position", QColor(0, 170, 170)),
 )
 IMAGE_TOPICS = (
     ("Left Camera", "/left_camera/detection_image"),
@@ -49,7 +48,7 @@ class PanelBridge(QObject):
     sample = Signal(str, list)
     scalar = Signal(str, object)
     detections = Signal(list)
-    profile = Signal(str)
+    triangulation = Signal(str)
     status = Signal(str)
 
 
@@ -132,27 +131,22 @@ class ExperimentHud(QWidget):
         self._latest = {
             "truth": [math.nan, math.nan, math.nan, math.nan],
             "raw": [math.nan, math.nan, math.nan, math.nan],
-            "corrected": [math.nan, math.nan, math.nan, math.nan],
         }
         self._latest_stamp = {}
         self._error_history = {
             "raw_forward": deque(),
-            "corrected_forward": deque(),
             "raw_down": deque(),
-            "corrected_down": deque(),
         }
         self._detection_history = deque()
         self._latest_detection = {
             "valid": False,
-            "disparity_px": math.nan,
             "confidence_min": math.nan,
         }
         self._latest_scalars = {
             "yolo_hz": math.nan,
             "yolo_ms": math.nan,
         }
-        self._profile_text = "--"
-        self._profile_not_configured = False
+        self._triangulation_text = "--"
 
         mission = os.environ.get("RQT_MISSION_LABEL", "Mission: --").strip() or "Mission: --"
         contract = os.environ.get(
@@ -167,13 +161,12 @@ class ExperimentHud(QWidget):
 
         self._model_label = QLabel(f"PyTorch model: {model_filename}")
         self._mission_label = QLabel(mission)
-        self._profile_label = QLabel("Profile: --")
+        self._triangulation_label = QLabel("Ray: --")
         self._yolo_label = QLabel("YOLO: --")
         self._truth_label = QLabel("Truth F/R/D/R: --")
         self._raw_label = QLabel("Raw F/R/D/R: --")
-        self._corrected_label = QLabel("Corrected F/R/D/R: --")
-        self._forward_error_label = QLabel("Forward Δ raw/corr: --")
-        self._down_error_label = QLabel("Down Δ raw/corr: --")
+        self._forward_error_label = QLabel("Forward Δ raw: --")
+        self._down_error_label = QLabel("Down Δ raw: --")
         self._detection_label = QLabel("Detections: --")
         self._contract_label = QLabel(contract)
 
@@ -187,11 +180,10 @@ class ExperimentHud(QWidget):
         for label in strong_labels:
             label.setStyleSheet("font-weight: 700; color: #101418;")
         for label in (
-            self._profile_label,
+            self._triangulation_label,
             self._yolo_label,
             self._truth_label,
             self._raw_label,
-            self._corrected_label,
             self._contract_label,
         ):
             label.setStyleSheet("font-weight: 600; color: #263238;")
@@ -199,12 +191,11 @@ class ExperimentHud(QWidget):
 
         layout.addWidget(self._model_label, 0, 0)
         layout.addWidget(self._mission_label, 0, 1)
-        layout.addWidget(self._profile_label, 0, 2)
+        layout.addWidget(self._triangulation_label, 0, 2)
         layout.addWidget(self._yolo_label, 0, 3)
         layout.addWidget(self._truth_label, 1, 0)
         layout.addWidget(self._raw_label, 1, 1)
-        layout.addWidget(self._corrected_label, 1, 2)
-        layout.addWidget(self._detection_label, 1, 3)
+        layout.addWidget(self._detection_label, 1, 2, 1, 2)
         layout.addWidget(self._forward_error_label, 2, 0, 1, 2)
         layout.addWidget(self._down_error_label, 2, 2, 1, 2)
         layout.addWidget(self._contract_label, 3, 0, 1, 4)
@@ -227,7 +218,7 @@ class ExperimentHud(QWidget):
             frd.append(value)
         self._latest[series_name] = frd
         self._latest_stamp[series_name] = now
-        if series_name in ("raw", "corrected"):
+        if series_name == "raw":
             self._append_error_sample(series_name, axis_index=0, axis_name="forward", now=now)
             self._append_error_sample(series_name, axis_index=2, axis_name="down", now=now)
         self._prune(now)
@@ -241,44 +232,25 @@ class ExperimentHud(QWidget):
             self._latest_scalars[key] = math.nan
         self._refresh()
 
-    def update_profile(self, payload):
+    def update_triangulation(self, payload):
         text = str(payload)
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
             parsed = {}
         if isinstance(parsed, dict) and parsed:
-            profile_id = str(parsed.get("profile_id") or "")
-            mode = str(parsed.get("profile_mode") or parsed.get("mode") or "")
-            fallback_reason = str(parsed.get("fallback_reason") or "")
-            residual = parsed.get("disparity_residual_status") or ""
-            selected = parsed.get("disparity_residual_feature_selected_label") or ""
-            self._profile_not_configured = (
-                not profile_id
-                and not mode
-                and fallback_reason == "no_profile"
-            )
-            if self._profile_not_configured:
-                text = "NOT CONFIGURED — no profile"
-            else:
-                pieces = [f"{profile_id or 'unknown'}/{mode or 'unknown'}"]
-                if fallback_reason:
-                    pieces.append(f"reason={fallback_reason}")
-                if selected:
-                    pieces.append(f"selector={selected}")
-                if residual:
-                    pieces.append(str(residual))
-                text = " ".join(pieces)
-        else:
-            self._profile_not_configured = False
-        self._profile_text = text[:120]
-        self._latest_stamp["profile"] = time.monotonic()
+            valid = bool(parsed.get("valid", False))
+            reason = str(parsed.get("reason") or "unknown")
+            angle = self._format_float(parsed.get("ray_angle_deg"), 3)
+            gap = self._format_float(parsed.get("closest_gap_m"), 4)
+            text = f"{'valid' if valid else 'invalid'} reason={reason} angle={angle}deg gap={gap}m"
+        self._triangulation_text = text[:120]
+        self._latest_stamp["triangulation"] = time.monotonic()
         self._refresh()
 
     def update_detections(self, values):
         now = time.monotonic()
         valid = False
-        disparity = math.nan
         confidence_min = math.nan
         try:
             data = [float(value) for value in values]
@@ -289,20 +261,14 @@ class ExperimentHud(QWidget):
             right_valid = data[8] >= 0.5
             left_conf = data[5]
             right_conf = data[13]
-            left_cx = data[6]
-            right_cx = data[14]
-            disparity = left_cx - right_cx
             confidence_min = min(left_conf, right_conf)
             valid = (
                 left_valid
                 and right_valid
-                and math.isfinite(disparity)
-                and disparity > 0.5
                 and math.isfinite(confidence_min)
             )
         self._latest_detection = {
             "valid": valid,
-            "disparity_px": disparity,
             "confidence_min": confidence_min,
         }
         self._detection_history.append((now, bool(valid)))
@@ -357,47 +323,34 @@ class ExperimentHud(QWidget):
         return "/".join(self._format_float(value, 1) for value in values[:4])
 
     def _refresh(self):
-        self._profile_label.setText(f"Profile: {self._profile_text or '--'}")
+        self._triangulation_label.setText(f"Ray: {self._triangulation_text or '--'}")
         yolo_hz = self._format_float(self._latest_scalars.get("yolo_hz", math.nan), 1)
         yolo_ms = self._format_float(self._latest_scalars.get("yolo_ms", math.nan), 1)
         self._yolo_label.setText(f"YOLO: {yolo_hz} Hz / {yolo_ms} ms")
         self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth'])}")
         self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw'])}")
-        corrected = self._latest["corrected"]
-        if self._profile_not_configured and not any(math.isfinite(value) for value in corrected):
-            self._corrected_label.setText("Corrected F/R/D/R: NOT CONFIGURED")
-        else:
-            self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(corrected)}")
         raw_f = self._latest_error("raw_forward")
-        corr_f = self._latest_error("corrected_forward")
         raw_f_rmse = self._rmse("raw_forward")
-        corr_f_rmse = self._rmse("corrected_forward")
         self._forward_error_label.setText(
-            "Forward Δ(raw-truth/corr-truth): "
-            f"{self._format_float(raw_f, 2, signed=True)} / "
-            f"{self._format_float(corr_f, 2, signed=True)} m | "
+            "Forward Δ(raw-truth): "
+            f"{self._format_float(raw_f, 2, signed=True)} m | "
             f"RMSE{PLOT_WINDOW_S:.0f}s "
-            f"{self._format_float(raw_f_rmse, 2)} / {self._format_float(corr_f_rmse, 2)}"
+            f"{self._format_float(raw_f_rmse, 2)}"
         )
         raw_d = self._latest_error("raw_down")
-        corr_d = self._latest_error("corrected_down")
         raw_d_rmse = self._rmse("raw_down")
-        corr_d_rmse = self._rmse("corrected_down")
         self._down_error_label.setText(
-            "Down Δ(raw-truth/corr-truth): "
-            f"{self._format_float(raw_d, 2, signed=True)} / "
-            f"{self._format_float(corr_d, 2, signed=True)} m | "
+            "Down Δ(raw-truth): "
+            f"{self._format_float(raw_d, 2, signed=True)} m | "
             f"RMSE{PLOT_WINDOW_S:.0f}s "
-            f"{self._format_float(raw_d_rmse, 2)} / {self._format_float(corr_d_rmse, 2)}"
+            f"{self._format_float(raw_d_rmse, 2)}"
         )
         ratio = self._valid_ratio()
         ratio_text = "--" if not math.isfinite(ratio) else f"{ratio * 100.0:.0f}%"
-        disparity = self._format_float(self._latest_detection["disparity_px"], 1)
         confidence = self._format_float(self._latest_detection["confidence_min"], 2)
         validity = "valid" if self._latest_detection["valid"] else "invalid"
         self._detection_label.setText(
-            f"Detections: {validity}, valid{PLOT_WINDOW_S:.0f}s={ratio_text}, "
-            f"disp={disparity}px, conf={confidence}"
+            f"Detections: {validity}, valid{PLOT_WINDOW_S:.0f}s={ratio_text}, conf={confidence}"
         )
 
 
@@ -560,7 +513,7 @@ class OperatorPanel(Plugin):
         self._bridge.sample.connect(self._handle_sample)
         self._bridge.scalar.connect(self._hud.update_scalar)
         self._bridge.detections.connect(self._hud.update_detections)
-        self._bridge.profile.connect(self._hud.update_profile)
+        self._bridge.triangulation.connect(self._hud.update_triangulation)
         self._bridge.status.connect(self._status.setText)
         self._init_ros()
 
@@ -632,8 +585,8 @@ class OperatorPanel(Plugin):
             )
             self._ros_node.create_subscription(
                 String,
-                "/stereo/profile_status",
-                lambda msg: self._bridge.profile.emit(msg.data),
+                "/stereo/triangulation_status",
+                lambda msg: self._bridge.triangulation.emit(msg.data),
                 10,
             )
             self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)

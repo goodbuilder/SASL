@@ -1,5 +1,10 @@
 # Experiment Gates
 
+> Historical/future-correction protocol. It does not describe an active
+> correction runtime in the current ray-only build. New evidence must start a
+> fresh Calibration/Validation/sealed-evaluation/Test cycle; the operator UI
+> that displays Truth/RMSE is not a sealed/Test surface.
+
 This document defines gates for StereoDistance correction experiments. Use it
 together with `docs/experiment-workflow.md`.
 

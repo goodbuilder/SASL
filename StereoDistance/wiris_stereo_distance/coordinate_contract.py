@@ -1,13 +1,20 @@
 """Canonical coordinate-frame and axis contracts for StereoDistance."""
 
+from sasl_common.stereo_geometry import (
+    BASELINE_CENTER_FRD_FRAME,
+    CAMERA_OPTICAL_FRAME,
+    STEREO_CENTER_OPTICAL_FRAME,
+)
+
 WORLD_FRAME = "ned"
 BODY_FRAME = "px4_frd"
-CAMERA_FRAME = "opencv_optical"
+CAMERA_FRAME = CAMERA_OPTICAL_FRAME
 CAMERA_MOUNT_PROFILE = "front_camera_z_to_body_x_x_to_body_y"
 
-MEASUREMENT_FRAME = "stereo_center_opencv_optical"
+MEASUREMENT_FRAME = STEREO_CENTER_OPTICAL_FRAME
 MEASUREMENT_AXIS_CONTRACT = "x/right,y/down,z/forward"
-FRD_COMPARISON_AXIS_CONTRACT = "stereo_center_frd:forward_right_down"
+PUBLIC_MEASUREMENT_FRAME = BASELINE_CENTER_FRD_FRAME
+FRD_COMPARISON_AXIS_CONTRACT = "baseline_center_frd:forward_right_down"
 
 TRUTH_FRAME = "px4_local_ned"
 TRUTH_AXIS_CONTRACT = "n/north,e/east,d/down"

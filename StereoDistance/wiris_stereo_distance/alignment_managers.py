@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from wiris_stereo_distance.attitude_bias import relative_attitude
+from wiris_stereo_distance.orientation_geometry import relative_attitude
 from wiris_stereo_distance.baseline_alignment import (
     BaselineQuality,
     BaselineVector,

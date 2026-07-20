@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from dataclasses import field
+from dataclasses import dataclass, field
 from math import isfinite
-from typing import Mapping, Any
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -48,8 +47,8 @@ class DetectionObservation:
 
 @dataclass(frozen=True)
 class StereoCalibration:
-    focal_length_px: float
-    baseline_m: float
+    """Pairing limits only; metric geometry comes exclusively from calibrated rays."""
+
     max_time_delta_s: float = 0.25
     max_vertical_delta_px: float = 80.0
     require_same_class: bool = True
@@ -58,7 +57,6 @@ class StereoCalibration:
 
 @dataclass(frozen=True)
 class StereoMatch:
-    disparity_px: float
     time_delta_s: float
     vertical_delta_px: float
     left: DetectionObservation
@@ -78,7 +76,7 @@ class StereoMatch:
 
 @dataclass(frozen=True)
 class StereoEstimate(StereoMatch):
-    distance_m: float = 0.0
+    range_m: float = 0.0
 
 
 def detection_timestamp_for_basis(observation: DetectionObservation, timestamp_basis: str = "detection") -> float | None:
@@ -114,11 +112,8 @@ def match_stereo_observations(
 ) -> StereoMatch | None:
     if left is None or right is None:
         return None
-    left_center_x, left_center_y = left.center
-    right_center_x, right_center_y = right.center
-    disparity = abs(left_center_x - right_center_x)
-    if not isfinite(disparity) or disparity <= 1e-6:
-        return None
+    _, left_center_y = left.center
+    _, right_center_y = right.center
     left_timestamp_s = detection_timestamp_for_basis(left, calibration.timestamp_basis)
     right_timestamp_s = detection_timestamp_for_basis(right, calibration.timestamp_basis)
     if left_timestamp_s is None or right_timestamp_s is None:
@@ -138,7 +133,6 @@ def match_stereo_observations(
         if left_ts is not None and right_ts is not None:
             extrinsic_time_delta_s = abs(float(left_ts) - float(right_ts))
     return StereoMatch(
-        disparity_px=disparity,
         time_delta_s=time_delta,
         vertical_delta_px=vertical_delta,
         left=left,
@@ -157,21 +151,11 @@ def match_stereo_observations(
     )
 
 
-def estimate_disparity_distance(match: StereoMatch, calibration: StereoCalibration) -> StereoEstimate | None:
-    if calibration.focal_length_px <= 0.0 or calibration.baseline_m <= 0.0:
-        return None
-    distance = calibration.focal_length_px * calibration.baseline_m / match.disparity_px
-    if not isfinite(distance) or distance <= 0.0:
-        return None
-    return stereo_estimate_from_match(match, distance_m=distance)
-
-
-def stereo_estimate_from_match(match: StereoMatch, *, distance_m: float) -> StereoEstimate | None:
-    if not isfinite(distance_m) or distance_m <= 0.0:
+def stereo_estimate_from_match(match: StereoMatch, *, range_m: float) -> StereoEstimate | None:
+    if not isfinite(range_m) or range_m <= 0.0:
         return None
     return StereoEstimate(
-        distance_m=distance_m,
-        disparity_px=match.disparity_px,
+        range_m=range_m,
         time_delta_s=match.time_delta_s,
         vertical_delta_px=match.vertical_delta_px,
         left=match.left,
@@ -188,39 +172,3 @@ def stereo_estimate_from_match(match: StereoMatch, *, distance_m: float) -> Ster
         sync_quality=match.sync_quality,
         warnings=match.warnings,
     )
-
-
-def estimate_distance(
-    left: DetectionObservation | None,
-    right: DetectionObservation | None,
-    calibration: StereoCalibration,
-    *,
-    left_extrinsic: Any | None = None,
-    right_extrinsic: Any | None = None,
-    left_attitude_age_s: float | None = None,
-    right_attitude_age_s: float | None = None,
-    attitude_pair_delta_s: float | None = None,
-    relative_roll_deg: float | None = None,
-    relative_pitch_deg: float | None = None,
-    relative_yaw_deg: float | None = None,
-    sync_quality: str = "unknown",
-    warnings: tuple[str, ...] = (),
-) -> StereoEstimate | None:
-    match = match_stereo_observations(
-        left,
-        right,
-        calibration,
-        left_extrinsic=left_extrinsic,
-        right_extrinsic=right_extrinsic,
-        left_attitude_age_s=left_attitude_age_s,
-        right_attitude_age_s=right_attitude_age_s,
-        attitude_pair_delta_s=attitude_pair_delta_s,
-        relative_roll_deg=relative_roll_deg,
-        relative_pitch_deg=relative_pitch_deg,
-        relative_yaw_deg=relative_yaw_deg,
-        sync_quality=sync_quality,
-        warnings=warnings,
-    )
-    if match is None:
-        return None
-    return estimate_disparity_distance(match, calibration)

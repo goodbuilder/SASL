@@ -715,6 +715,12 @@ def _row_measurement(
     explicit_axis = str(row.get("measurement_axis_contract") or "").strip()
     field_sets = (
         (
+            ("raw_right_m", "raw_down_m", "raw_forward_m"),
+            MEASUREMENT_FRAME,
+            MEASUREMENT_AXIS_CONTRACT,
+            "raw-stereo-center",
+        ),
+        (
             ("corrected_north_m", "corrected_east_m", "corrected_down_m"),
             TRUTH_FRAME,
             TRUTH_AXIS_CONTRACT,
@@ -771,6 +777,9 @@ def _row_xyz(row: dict[str, object]) -> tuple[float, float, float] | None:
 
 def _row_distance_m(row: dict[str, object], xyz: tuple[float, float, float], value_kind: str = "") -> float:
     if value_kind.startswith("raw"):
+        parsed = _coerce_float(row.get("raw_range_m"))
+        if parsed is not None:
+            return parsed
         parsed = _coerce_float(row.get("raw_distance_m"))
         if parsed is not None:
             return parsed

@@ -93,8 +93,7 @@ class RecorderPanel(Plugin):
             "yolo_hz": math.nan,
             "truth_frd": None,
             "raw_frd": None,
-            "corrected_frd": None,
-            "profile_status": "",
+            "ray_status": "",
         }
         self._latest_stamp = {}
 
@@ -121,15 +120,13 @@ class RecorderPanel(Plugin):
         self._yolo_hz_label = QLabel("YOLO Hz: --")
         self._truth_label = QLabel("Truth F/R/D/R: --")
         self._raw_label = QLabel("Raw F/R/D/R: --")
-        self._corrected_label = QLabel("Corrected F/R/D/R: --")
-        self._profile_label = QLabel("Profile: --")
+        self._ray_label = QLabel("Ray: --")
         for label in (
             self._yolo_ms_label,
             self._yolo_hz_label,
             self._truth_label,
             self._raw_label,
-            self._corrected_label,
-            self._profile_label,
+            self._ray_label,
         ):
             label.setMinimumWidth(180)
             label.setStyleSheet("font-family: monospace;")
@@ -182,10 +179,9 @@ class RecorderPanel(Plugin):
         telemetry_layout.addWidget(self._axis_contract_label, 0, 0, 1, 3)
         telemetry_layout.addWidget(self._yolo_ms_label, 1, 0)
         telemetry_layout.addWidget(self._yolo_hz_label, 1, 1)
-        telemetry_layout.addWidget(self._profile_label, 1, 2)
+        telemetry_layout.addWidget(self._ray_label, 1, 2)
         telemetry_layout.addWidget(self._truth_label, 2, 0)
         telemetry_layout.addWidget(self._raw_label, 2, 1)
-        telemetry_layout.addWidget(self._corrected_label, 2, 2)
         root_layout.addLayout(control_layout)
         root_layout.addLayout(telemetry_layout)
 
@@ -243,7 +239,7 @@ class RecorderPanel(Plugin):
 
     def _init_status_subscriptions(self):
         if rclpy is None or Float32 is None or Float32MultiArray is None or String is None:
-            self._profile_label.setText("Profile: ROS imports unavailable")
+            self._ray_label.setText("Ray: ROS imports unavailable")
             return
 
         try:
@@ -276,21 +272,15 @@ class RecorderPanel(Plugin):
                     10,
                 ),
                 self._ros_node.create_subscription(
-                    Float32MultiArray,
-                    "/stereo/corrected_position",
-                    lambda msg: self._set_frd("corrected_frd", msg.data),
-                    10,
-                ),
-                self._ros_node.create_subscription(
                     String,
-                    "/stereo/profile_status",
-                    lambda msg: self._set_profile_status(msg.data),
+                    "/stereo/triangulation_status",
+                    lambda msg: self._set_ray_status(msg.data),
                     10,
                 ),
             ]
         except Exception as exc:
             self._ros_node = None
-            self._profile_label.setText(f"Profile: status subscribe failed: {exc}")
+            self._ray_label.setText(f"Ray: status subscribe failed: {exc}")
 
     def _spin_status_node(self):
         if self._ros_node is None or rclpy is None:
@@ -298,7 +288,7 @@ class RecorderPanel(Plugin):
         try:
             rclpy.spin_once(self._ros_node, timeout_sec=0.0)
         except Exception as exc:
-            self._profile_label.setText(f"Profile: spin failed: {exc}")
+            self._ray_label.setText(f"Ray: spin failed: {exc}")
 
     def _set_scalar(self, key, value):
         self._latest[key] = float(value)
@@ -311,19 +301,19 @@ class RecorderPanel(Plugin):
         self._latest[key] = tuple(float(value) for value in values[:4])
         self._latest_stamp[key] = time.monotonic()
 
-    def _set_profile_status(self, value):
+    def _set_ray_status(self, value):
         text = str(value)
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError:
             parsed = {}
         if isinstance(parsed, dict):
-            profile_id = parsed.get("profile_id") or "none"
-            mode = parsed.get("profile_mode") or parsed.get("mode") or "none"
-            fallback = parsed.get("fallback_reason") or ""
-            text = f"{profile_id}/{mode} {fallback}".strip()
-        self._latest["profile_status"] = text[:80]
-        self._latest_stamp["profile_status"] = time.monotonic()
+            validity = "valid" if parsed.get("valid", False) else "invalid"
+            reason = parsed.get("reason") or "unknown"
+            gap = self._format_float(parsed.get("closest_gap_m"), 4)
+            text = f"{validity} {reason} gap={gap}m"
+        self._latest["ray_status"] = text[:80]
+        self._latest_stamp["ray_status"] = time.monotonic()
 
     def _format_float(self, value, precision=1):
         if value is None or not math.isfinite(float(value)):
@@ -346,9 +336,8 @@ class RecorderPanel(Plugin):
         self._yolo_hz_label.setText(f"YOLO Hz: {yolo_hz}{' stale' if self._is_stale('yolo_hz') else ''}")
         self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth_frd'])}")
         self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw_frd'])}")
-        self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(self._latest['corrected_frd'])}")
-        profile = self._latest["profile_status"] or "--"
-        self._profile_label.setText(f"Profile: {profile}")
+        ray_status = self._latest["ray_status"] or "--"
+        self._ray_label.setText(f"Ray: {ray_status}")
 
     def _choose_directory(self):
         directory = QFileDialog.getExistingDirectory(

@@ -1,27 +1,25 @@
 # Coordinate Contract
 
-This document fixes the coordinate-frame and axis naming contract used by StereoDistance. The code source of truth is `wiris_stereo_distance/coordinate_contract.py`; this document is the human-readable version for experiments, reports, and CSV interpretation.
+StereoDistance와 Simulation의 ray 측정 좌표 계약이다. 기하 상수와 변환의
+코드 source of truth는 `sasl_common/stereo_geometry.py`이고,
+`wiris_stereo_distance/coordinate_contract.py`는 PX4/UAM 계약과 함께 이를
+재사용한다.
 
-## Frames
+## Frame과 축
 
-| Frame id | Meaning | Axis contract | Use |
-| --- | --- | --- | --- |
-| `ned` | PX4 world/local frame | `N/E/D = North/East/Down` | ULog and PX4 local-position truth |
-| `px4_frd` | PX4 body frame | `Forward/Right/Down` | Pixhawk attitude/body geometry |
-| `opencv_optical` | Camera optical frame | `Right/Down/Forward` | Camera rays and per-camera optical vectors |
-| `stereo_center_opencv_optical` | Stereo rig center optical frame | `Right/Down/Forward` | YOLO 3D measurement rows before UAM alignment |
-| `stereo_center_frd` | Stereo rig center comparison frame | `Forward/Right/Down` | Simulation and UAM camera-axis comparison |
-| `px4_local_ned` | UAM/Pixhawk local truth frame | `North/East/Down` | Truth and aligned estimated output |
+| Frame id | Axis order | 의미 |
+| --- | --- | --- |
+| `ned` | `North, East, Down` | PX4 world/local |
+| `px4_frd` | `Forward, Right, Down` | PX4 body |
+| `opencv_optical_rdf` | `Right, Down, Forward` | 개별 카메라 광학 ray |
+| `stereo_center_opencv_optical_rdf` | `Right, Down, Forward` | stereo baseline 중심 내부 측정점 |
+| `baseline_center_frd` | `Forward, Right, Down` | 공개 위치 배열 |
+| `px4_local_ned` | `North, East, Down` | ULog/PX4 truth |
 
-## Fixed Mount
+배열이나 CSV의 `x/y/z`는 주변에 `axis_contract`가 없으면 사용하지 않는다.
+현재 raw 측정 schema는 의미가 드러나는 `right/down/forward` 필드만 쓴다.
 
-The nominal front camera mount profile is:
-
-```text
-front_camera_z_to_body_x_x_to_body_y
-```
-
-This means:
+## 카메라와 body 고정 mount
 
 ```text
 camera +X Right   -> body +Y Right
@@ -29,116 +27,119 @@ camera +Y Down    -> body +Z Down
 camera +Z Forward -> body +X Forward
 ```
 
-Do not swap axes ad hoc in analysis code. Convert through the declared frame contract or through a saved UAM alignment profile.
+mount profile id는
+`front_camera_z_to_body_x_x_to_body_y`이다. Pixhawk quaternion은 body FRD의
+orientation이고, pixel ray는 camera optical RDF이므로 두 값을 직접 같은
+축으로 취급하지 않는다.
 
-## Measurement Fields
+## Pixel에서 ray
 
-Raw YOLO stereo-center measurements are camera-frame values:
+입력 bbox 중심 `(u,v)`와 K의 `fx,fy,cx,cy` 단위는 pixel이다.
+각 observation의 `width/height`가 해당 camera intrinsic의 calibration
+`width/height`와 정확히 같을 때만 이 K를 적용한다. 현재 runtime은 pixel/K
+grid를 암묵적으로 rescale하지 않는다. StereoDistance는 불일치한 쪽에 따라
+`left_pixel_grid_mismatch`, `right_pixel_grid_mismatch` 또는
+`stereo_pixel_grid_mismatch`로 거부하고, Simulation은
+`pixel_grid_mismatch`로 거부한다.
 
-| Field | Meaning |
-| --- | --- |
-| `measurement_right_m`, `stereo_center_right_m`, legacy `x_m` | Camera/stereo-center Right |
-| `measurement_down_m`, `stereo_center_down_m`, legacy `y_m` | Camera/stereo-center Down |
-| `measurement_forward_m`, `stereo_center_forward_m`, legacy `z_m` | Camera/stereo-center Forward |
+```text
+d_camera = normalize([(u-cx)/fx, (v-cy)/fy, 1])
+frame(d_camera) = opencv_optical_rdf
+```
 
-Legacy `x_m/y_m/z_m` fields remain for CSV compatibility only. In current UI and reports, describe them as `Right/Down/Forward`.
+StereoDistance calibration에 lens distortion 계수가 있으면
+`cv2.undistortPoints`로 raw pixel을 normalized point로 바꾼 뒤 ray를 만든다.
+Simulation은 distortion이 꺼진 `CameraInfo.K`를 사용한다.
 
-When an alignment profile is active, PX4 local truth can be transformed back
-into the camera-center frame for per-axis FRD comparison:
+## 두 ray의 3차원 교차
 
-| Field | Meaning |
-| --- | --- |
-| `measurement_frd_forward_m` | YOLO measurement in camera-center Forward |
-| `measurement_frd_right_m` | YOLO measurement in camera-center Right |
-| `measurement_frd_down_m` | YOLO measurement in camera-center Down |
-| `truth_frd_forward_m` | Ground truth transformed to camera-center Forward |
-| `truth_frd_right_m` | Ground truth transformed to camera-center Right |
-| `truth_frd_down_m` | Ground truth transformed to camera-center Down |
-| `error_frd_forward_m` | `measurement_frd_forward_m - truth_frd_forward_m` |
-| `error_frd_right_m` | `measurement_frd_right_m - truth_frd_right_m` |
-| `error_frd_down_m` | `measurement_frd_down_m - truth_frd_down_m` |
-| `truth_rdf_right_m` | Ground truth transformed to camera-center Right |
-| `truth_rdf_down_m` | Ground truth transformed to camera-center Down |
-| `truth_rdf_forward_m` | Ground truth transformed to camera-center Forward |
-| `error_rdf_right_m` | `measurement_right_m - truth_rdf_right_m` |
-| `error_rdf_down_m` | `measurement_down_m - truth_rdf_down_m` |
-| `error_rdf_forward_m` | `measurement_forward_m - truth_rdf_forward_m` |
+두 카메라 원점과 ray를 동일한
+`stereo_center_opencv_optical_rdf`로 변환한다.
 
-Use the FRD fields for camera-frame axis-level error. The RDF fields remain
-compatibility aliases for older analysis code. The scalar range metric remains
-`estimated_range_m - truth_range_m`.
+```text
+L(s) = O_l + s d_l
+R(t) = O_r + t d_r
+P_l, P_r = argmin ||L(s)-R(t)||²
+point_center_rdf_m = (P_l + P_r)/2
+Range = ||point_center_rdf_m||
+```
 
-## Truth Fields
+`point_center_rdf_m`은 `[Right,Down,Forward]`이고
+`point_frame=stereo_center_opencv_optical_rdf`이다. 공개 배열은 순서만
+명시적으로 바꾼다.
 
-PX4 ULog, ROS2 `vehicle_local_position`, and MAVLink `LOCAL_POSITION_NED` expose local-position values as `x/y/z`, but StereoDistance interprets and displays them as:
+여기서 `stereo_center`는 원점 계약이다. StereoDistance에서는 frame의
+orientation을 left camera optical RDF와 같게 유지하고 원점만 좌/우 카메라
+원점의 중점으로 옮긴다. Simulation에서는 두 명목 카메라가 같은 optical
+orientation을 사용한다. 따라서 `baseline_center_frd`도 이 center optical
+orientation을 FRD 순서로 바꾼 것이며, world NED 또는 baseline vector 방향을
+축으로 삼는 frame이 아니다.
 
-| Field | Meaning |
-| --- | --- |
-| `truth_north_m`, legacy `truth_x_m` | PX4 local North |
-| `truth_east_m`, legacy `truth_y_m` | PX4 local East |
-| `truth_down_m`, legacy `truth_z_m` | PX4 local Down |
+```text
+point_center_frd_m = [Forward,Right,Down]
+estimated_position = [Forward,Right,Down,Range]
+output_frame = baseline_center_frd
+```
 
-For recorded rows, `drone_north/east/down_m` are preferred over legacy `drone_x/y/z_m`.
+RDF 점을 FRD field에 복사하거나, center 점을 left/right camera field로
+기록하지 않는다.
 
-Truth source collection and profile-source selection are separate:
+## 카메라 pose 출처
 
-- Collect every available source when possible: PX4 local NED,
-  PX4/global LLA, and GPS LLA.
-- Build or evaluate one profile with exactly one selected truth source contract:
-  `local_ned`, `global_position`, or `gps_position`.
-- Do not mix local/global/GPS truth rows inside one calibration profile.
+### Checkerboard 경로
 
-Default analysis-source priority is:
+OpenCV extrinsic은 다음 계약이다.
 
-1. ULog local NED: `vehicle_local_position`, then `vehicle_odometry`, then `vehicle_visual_odometry`.
-2. ULog global/GPS LLA converted to local NED: `vehicle_global_position`,
-   `vehicle_gps_position`, then `sensor_gps`.
-3. Live local/global/GPS telemetry converted to local NED.
-4. Recorded-row local NED fallback: `drone_north/east/down_m`.
+```text
+X_right = R_left_to_right * X_left + T_left_to_right_m
+right_origin_in_left = -R_left_to_right^T * T_left_to_right_m
+```
 
-GPS `lat/lon/alt` must never be compared directly with camera-frame data. It
-must first be converted to local NED using an explicit reference origin. The
-reference priority is PX4 local-position reference (`ref_lat/ref_lon/ref_alt`),
-then `home_position`, then the first valid GPS/global sample. Rows produced
-from GPS/global-derived truth must retain the reference metadata:
+baseline center는 left/right origin의 중점이다.
 
-| Field | Meaning |
-| --- | --- |
-| `truth_gps_reference_lat_deg` | GPS-to-NED reference latitude |
-| `truth_gps_reference_lon_deg` | GPS-to-NED reference longitude |
-| `truth_gps_reference_alt_m` | GPS-to-NED reference altitude |
-| `truth_gps_reference_kind` | `vehicle_local_position_ref`, `home_position`, `first_valid_gps_sample`, or `first_valid_global_sample` |
-| `truth_gps_altitude_reference` | Altitude datum when known; otherwise `unknown` |
+### Pixhawk/RTK 경로
 
-## UAM Comparison Metrics
+- GNSS/RTK baseline vector: world NED
+- left/right attitude: PX4 body FRD orientation
+- camera ray: optical RDF
 
-Before coordinate alignment, YOLO `Right/Down/Forward` and truth `North/East/Down` are a `mixed-frame` comparison. Mixed-frame axis errors are diagnostic only.
+baseline은 left attitude와 fixed mount를 통해 left optical RDF로 옮긴다.
+right attitude는 right ray의 orientation에만 적용하며 right origin을 다시
+회전시키지 않는다. 측정 경로에서는 두 ray에 사용한 detection-time attitude
+sample과 동일한 left/right sample로 baseline을 변환한다. UI 표시용 최신
+attitude와 측정 시각 attitude를 섞지 않는다.
 
-After loading or estimating a UAM coordinate-alignment profile, final comparison fields are:
+### Simulation 경로
 
-| Field | Meaning |
-| --- | --- |
-| `estimated_north_m` | YOLO point transformed into PX4 local North |
-| `estimated_east_m` | YOLO point transformed into PX4 local East |
-| `estimated_down_m` | YOLO point transformed into PX4 local Down |
-| `error_north_m` | `estimated_north_m - truth_north_m` |
-| `error_east_m` | `estimated_east_m - truth_east_m` |
-| `error_down_m` | `estimated_down_m - truth_down_m` |
-| `position_error_m` | Euclidean position error |
-| `alignment_profile_id` | Applied axis/origin correction profile |
+raw estimator는 명목 pose만 사용한다.
 
-For PX4 local-frame reporting, use aligned `estimated_north/east/down_m` versus
-`truth_north/east/down_m`. For camera-frame reporting, use
-`error_frd_forward/right/down_m`.
+```text
+O_l = [-B/2,0,0]
+O_r = [+B/2,0,0]
+R_center_from_left = I
+R_center_from_right = I
+```
 
-## Alignment Profile Rules
+launch 자세오차는 SDF의 물리 카메라 pose에만 들어간다. 이 값을 estimator에
+전달하면 runtime truth leakage가 되므로 금지한다.
 
-A UAM alignment profile stores:
+## Invalid와 품질
 
-- rotation matrix: `camera Right/Down/Forward -> PX4 local North/East/Down`
-- origin offset: `origin_offset_north/east/down_m`
-- sample count, RMSE, max error, method, frame ids
+- `zero_baseline`: 원점이 동일함
+- `near_parallel_rays`: 해가 수치적으로 불안정함
+- `non_positive_depth`: 한쪽 이상 교차 depth가 카메라 뒤쪽임
+- `invalid_range`: range가 유한한 양수가 아님
+- `*_pixel_grid_mismatch`: bbox pixel grid와 K calibration grid가 다름
 
-Use a saved profile in the main experiment only when camera, zoom/intrinsics, Pixhawk/GNSS position, and UAM mounting geometry are unchanged. If any of those change, create a new profile.
+유효 결과에는 `closest_gap_m`, `left_depth_m`, `right_depth_m`,
+`ray_angle_deg`, `point_frame`, `output_frame`, `method`를 남긴다.
 
-At least three non-collinear matched samples are required. A line-only motion is degenerate and must not be used to lock a final axis/origin profile.
+## Truth 비교
+
+PX4 NED, GPS/RTK, Gazebo world와 camera RDF는 서로 다른 frame이다. truth를
+camera-frame axis와 비교하려면 origin, rotation, target reference point를
+포함한 명시적 transform이 필요하다. scalar range만 비교할 때도 두 producer가
+같은 기준점까지의 Euclidean range를 뜻하는지 확인한다.
+
+Truth는 offline calibration/validation에만 사용할 수 있고 raw runtime
+estimator의 입력으로 사용할 수 없다.

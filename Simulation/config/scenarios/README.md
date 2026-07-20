@@ -24,5 +24,8 @@ Required metadata for new scenarios:
 - `CAMERA_HORIZONTAL_FOV_RAD`
 
 Coordinate contract: PX4 mission inputs remain local NED
-`north/east/altitude`; stereo measurement and correction internals remain
-stereo-center RDF `right/down/forward`.
+`north/east/altitude`. Raw measurement uses
+`stereo_center_opencv_optical_rdf:[right,down,forward]` internally and
+`baseline_center_frd:[forward,right,down,range]` publicly. Camera attitude
+error parameters modify only the rendered SDF camera poses; the nominal raw
+estimator does not receive those truth values.

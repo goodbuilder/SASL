@@ -1,5 +1,10 @@
 # Experiment Workflow
 
+> Historical/future-correction workflow. The current runtime publishes raw
+> two-ray midpoint measurements only. The 2026-07-20 method/UI/topic/CSV
+> change invalidated the previous formal cycle, so this workflow may be reused
+> only by starting a new experiment at Calibration.
+
 This document is the operating contract for StereoDistance correction-method
 experiments in this workspace. The goal is to make every attempt reproducible,
 rankable, and understandable even when it fails.

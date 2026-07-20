@@ -7,6 +7,12 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 
+from sasl_common.stereo_geometry import (
+    IDENTITY_ROTATION,
+    PinholeIntrinsics,
+    project_center_point_to_pixel,
+)
+
 
 def detection_values_from_rdf(
     *,
@@ -22,20 +28,31 @@ def detection_values_from_rdf(
     if forward_m <= 0.0:
         raise ValueError("forward_m must be positive")
     fx = (float(width_px) * 0.5) / math.tan(float(horizontal_fov_rad) * 0.5)
-    fy = fx
-    image_cx = float(width_px) * 0.5
-    image_cy = float(height_px) * 0.5
-    disparity = fx * float(baseline_m) / float(forward_m)
-    if not math.isfinite(disparity) or disparity < 0.5:
-        raise ValueError("computed disparity is invalid")
-    center_u = image_cx + float(right_m) * fx / float(forward_m)
-    center_v = image_cy + float(down_m) * fy / float(forward_m)
-    half_disparity = disparity * 0.5
+    intrinsics = PinholeIntrinsics(
+        fx_px=fx,
+        fy_px=fx,
+        cx_px=float(width_px) * 0.5,
+        cy_px=float(height_px) * 0.5,
+    )
+    point_center_rdf_m = (float(right_m), float(down_m), float(forward_m))
+    half_baseline_m = float(baseline_m) * 0.5
+    left_pixel = project_center_point_to_pixel(
+        point_center_rdf_m,
+        camera_origin_center_rdf_m=(-half_baseline_m, 0.0, 0.0),
+        rotation_center_from_camera_rdf=IDENTITY_ROTATION,
+        intrinsics=intrinsics,
+    )
+    right_pixel = project_center_point_to_pixel(
+        point_center_rdf_m,
+        camera_origin_center_rdf_m=(half_baseline_m, 0.0, 0.0),
+        rotation_center_from_camera_rdf=IDENTITY_ROTATION,
+        intrinsics=intrinsics,
+    )
+    if left_pixel is None or right_pixel is None:
+        raise ValueError("point is outside the positive camera depth half-space")
     half_bbox = float(bbox_size_px) * 0.5
-    left_cx = center_u + half_disparity
-    right_cx = center_u - half_disparity
-    left_cy = center_v
-    right_cy = center_v
+    left_cx, left_cy = left_pixel
+    right_cx, right_cy = right_pixel
 
     def one_detection(cx: float, cy: float) -> list[float]:
         return [

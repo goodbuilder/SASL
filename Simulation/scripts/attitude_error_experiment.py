@@ -18,11 +18,8 @@ from std_msgs.msg import Float32, Float32MultiArray
 
 
 DEFAULT_AXES = ("right_roll_error_deg", "right_pitch_error_deg", "right_yaw_error_deg")
-AXIS_CONTRACT = "stereo_center_frd:forward_right_down"
-DEFAULT_YOLO_MODEL = (
-    "/home/moontaehyung/영상감시시스템/ref/wiris_stereo (copy)/wiris_stereo/"
-    "yolov8n_uav.pt"
-)
+AXIS_CONTRACT = "baseline_center_frd:forward_right_down"
+DEFAULT_YOLO_MODEL = "yolov8n.pt"
 VALID_ATTITUDE_AXES = {
     "left_roll_error_deg",
     "left_pitch_error_deg",

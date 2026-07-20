@@ -1,5 +1,10 @@
 # Method Taxonomy
 
+> Historical/future-correction document. The current ray-only runtime does not
+> ship these method families or profiles. The 2026-07-20 measurement/topic/CSV
+> break invalidated the earlier formal cycle; any resumed correction search
+> starts again at Calibration.
+
 This taxonomy keeps correction-method names stable across experiments.
 
 ## Method Families
@@ -69,4 +74,3 @@ Examples:
 - Any method proposed from papers should record the source in
   `references.md` and use `L3/R3` only when the source directly supports the
   method.
-

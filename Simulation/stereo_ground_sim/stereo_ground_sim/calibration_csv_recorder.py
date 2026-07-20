@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import time
 from pathlib import Path
@@ -16,12 +17,13 @@ from sasl_common.truth_coordinates import (
     local_ned_from_lla,
     local_ned_from_xyz,
 )
+from sasl_common.stereo_geometry import BASELINE_CENTER_FRD_FRAME, STEREO_CENTER_OPTICAL_FRAME
 
 
 PX4_NED_AXIS_CONTRACT = "px4_local_position_ned:north,east,down"
 PX4_GLOBAL_AXIS_CONTRACT = "px4_global_lla:lat,lon,alt"
-STEREODISTANCE_TOPIC_CONTRACT = "stereodistance_position_topics:FRD_range(forward,right,down,range)"
-CALIBRATION_RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
+STEREODISTANCE_TOPIC_CONTRACT = f"{BASELINE_CENTER_FRD_FRAME}:FRD_range(forward,right,down,range)"
+CALIBRATION_RDF_AXIS_CONTRACT = f"{STEREO_CENTER_OPTICAL_FRAME}:RDF(right,down,forward)"
 TRUTH_RDF_TRANSFORM_CONTRACT = (
     "explicit_transform_required: truth RDF must come from a declared T_source_to_stereo_rdf "
     "or a stereo-frame truth producer; direct source-frame axis aliasing is forbidden"
@@ -100,11 +102,15 @@ CSV_FIELDS = [
     "raw_right_m",
     "raw_down_m",
     "raw_range_m",
-    "estimated_forward_m",
-    "estimated_right_m",
-    "estimated_down_m",
-    "estimated_range_m",
-    "measured_disparity_px",
+    "triangulation_valid",
+    "triangulation_reason",
+    "ray_closest_gap_m",
+    "ray_left_depth_m",
+    "ray_right_depth_m",
+    "ray_angle_deg",
+    "triangulation_point_frame",
+    "triangulation_frame",
+    "triangulation_method",
     "left_valid",
     "left_x1",
     "left_y1",
@@ -127,8 +133,8 @@ CSV_FIELDS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Record ROS2 PX4 truth and StereoDistance estimates to a calibration CSV. "
-            "The CSV is directly consumable by rtk_stereo_calibration_pipeline.py --mode csv."
+            "Record raw ROS2 PX4 truth, StereoDistance ray estimates, detections, "
+            "and triangulation quality to CSV without applying a runtime correction."
         )
     )
     parser.add_argument("--output-csv", type=Path, required=True)
@@ -145,7 +151,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--estimated-topic", default="/stereo/estimated_position")
     parser.add_argument("--detections-topic", default="/stereo/detections")
-    parser.add_argument("--disparity-topic", default="/stereo/disparity")
+    parser.add_argument(
+        "--triangulation-status-topic",
+        default="/stereo/triangulation_status",
+    )
     parser.add_argument(
         "--sim-truth-topic",
         default="",
@@ -296,7 +305,6 @@ def frd_array_to_fields(
     data: Sequence[float],
     *,
     prefix: str,
-    include_raw_alias: bool = False,
 ) -> dict[str, float]:
     values = list(data[:4])
     while len(values) < 4:
@@ -309,15 +317,6 @@ def frd_array_to_fields(
         f"{prefix}_down_m": rdf["down_m"],
         f"{prefix}_range_m": rdf["range_m"],
     }
-    if include_raw_alias:
-        fields.update(
-            {
-                "raw_forward_m": rdf["forward_m"],
-                "raw_right_m": rdf["right_m"],
-                "raw_down_m": rdf["down_m"],
-                "raw_range_m": rdf["range_m"],
-            }
-        )
     return fields
 
 
@@ -346,7 +345,7 @@ def detections_array_to_fields(data: Sequence[float]) -> dict[str, float]:
 def write_manifest(path: Path, args: argparse.Namespace) -> None:
     truth_source = str(getattr(args, "truth_source", "local_ned") or "local_ned")
     lines = [
-        "purpose=PX4/StereoDistance calibration CSV recorder",
+        "purpose=PX4/StereoDistance raw ray-measurement CSV recorder",
         f"csv={path.name}",
         f"truth_topic={args.truth_topic}",
         f"local_truth_topic={getattr(args, 'local_truth_topic', '/fmu/out/vehicle_local_position')}",
@@ -357,7 +356,7 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
         f"sim_truth_role={getattr(args, 'sim_truth_role', 'oracle')}",
         f"estimated_topic={args.estimated_topic}",
         f"detections_topic={args.detections_topic}",
-        f"disparity_topic={args.disparity_topic}",
+        f"triangulation_status_topic={args.triangulation_status_topic}",
         f"ned_axis_contract={PX4_NED_AXIS_CONTRACT}",
         f"global_axis_contract={PX4_GLOBAL_AXIS_CONTRACT}",
         f"rdf_axis_contract={CALIBRATION_RDF_AXIS_CONTRACT}",
@@ -365,7 +364,7 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
         f"truth_rdf_transform_contract={TRUTH_RDF_TRANSFORM_CONTRACT}",
         f"truth_rdf_contract={NED_TO_RDF_CONTRACT}",
         "runtime_truth_contract=truth is recorded for offline calibration and validation only",
-        "pipeline_command=provide explicit truth_right_m/truth_down_m/truth_forward_m first, then run Simulation/.venv/bin/python Simulation/scripts/rtk_stereo_calibration_pipeline.py --mode csv --input-csv <this csv> --output-dir Simulation/results/rtk_stereo_calibration_from_csv",
+        "postprocessing=none; this manifest records raw inputs and outputs only",
     ]
     (path.parent / "manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -375,13 +374,13 @@ class CalibrationCsvRecorder:
         try:
             import rclpy
             from rclpy.node import Node
-            from std_msgs.msg import Float32, Float32MultiArray
+            from std_msgs.msg import Float32MultiArray, String
         except Exception as exc:  # pragma: no cover - exercised only without ROS
             raise SystemExit(f"ROS2 Python packages are required to record live topics: {exc}") from exc
 
         self.rclpy = rclpy
-        self.Float32 = Float32
         self.Float32MultiArray = Float32MultiArray
+        self.String = String
         self.args = args
         self.output_csv = args.output_csv.expanduser().resolve()
         self.output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -476,9 +475,9 @@ class CalibrationCsvRecorder:
             10,
         )
         self.node.create_subscription(
-            self.Float32,
-            self.args.disparity_topic,
-            self._disparity_cb,
+            self.String,
+            self.args.triangulation_status_topic,
+            self._triangulation_status_cb,
             10,
         )
 
@@ -530,8 +529,8 @@ class CalibrationCsvRecorder:
         self.latest.update(
             {
                 "sim_truth_role": getattr(self.args, "sim_truth_role", "oracle"),
-                "sim_truth_source_frame": "gazebo_stereo_center_frd",
-                "sim_truth_axis_contract": "stereo_center_frd:forward,right,down,range",
+                "sim_truth_source_frame": "gazebo_baseline_center_frd",
+                "sim_truth_axis_contract": "baseline_center_frd:forward,right,down,range",
                 "sim_truth_forward_m": rdf["forward_m"],
                 "sim_truth_right_m": rdf["right_m"],
                 "sim_truth_down_m": rdf["down_m"],
@@ -553,26 +552,34 @@ class CalibrationCsvRecorder:
         self.latest.update(
             frd_array_to_fields(
                 list(getattr(msg, "data", [])),
-                prefix="estimated",
-                include_raw_alias=True,
+                prefix="raw",
             )
         )
         self.last_stamp[self.args.estimated_topic] = self._now_sec()
 
     def _detections_cb(self, msg: object) -> None:
         self.latest.update(detections_array_to_fields(list(getattr(msg, "data", []))))
-        left_cx = self.latest.get("left_cx_px")
-        right_cx = self.latest.get("right_cx_px")
-        if left_cx is not None and right_cx is not None:
-            try:
-                self.latest["measured_disparity_px"] = abs(float(left_cx) - float(right_cx))
-            except (TypeError, ValueError):
-                pass
         self.last_stamp[self.args.detections_topic] = self._now_sec()
 
-    def _disparity_cb(self, msg: object) -> None:
-        self.latest["measured_disparity_px"] = float(getattr(msg, "data"))
-        self.last_stamp[self.args.disparity_topic] = self._now_sec()
+    def _triangulation_status_cb(self, msg: object) -> None:
+        try:
+            status = json.loads(str(getattr(msg, "data")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        self.latest.update(
+            {
+                "triangulation_valid": bool(status.get("valid", False)),
+                "triangulation_reason": str(status.get("reason", "")),
+                "ray_closest_gap_m": status.get("closest_gap_m"),
+                "ray_left_depth_m": status.get("left_depth_m"),
+                "ray_right_depth_m": status.get("right_depth_m"),
+                "ray_angle_deg": status.get("ray_angle_deg"),
+                "triangulation_point_frame": str(status.get("point_frame", "")),
+                "triangulation_frame": str(status.get("frame", "")),
+                "triangulation_method": str(status.get("method", "")),
+            }
+        )
+        self.last_stamp[self.args.triangulation_status_topic] = self._now_sec()
 
     def write_row(self) -> None:
         row: dict[str, str] = {

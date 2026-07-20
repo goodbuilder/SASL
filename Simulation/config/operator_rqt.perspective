@@ -106,7 +106,7 @@
           "type": "repr"
         },
         "topics": {
-          "repr": "['/ground_truth_position/data[0]', '/stereo/estimated_position/data[0]', '/stereo/corrected_position/data[0]']",
+          "repr": "['/ground_truth_position/data[0]', '/stereo/estimated_position/data[0]']",
           "type": "repr"
         }
       },
@@ -119,7 +119,7 @@
           "type": "repr"
         },
         "topics": {
-          "repr": "['/ground_truth_position/data[1]', '/stereo/estimated_position/data[1]', '/stereo/corrected_position/data[1]']",
+          "repr": "['/ground_truth_position/data[1]', '/stereo/estimated_position/data[1]']",
           "type": "repr"
         }
       },
@@ -132,7 +132,7 @@
           "type": "repr"
         },
         "topics": {
-          "repr": "['/ground_truth_position/data[2]', '/stereo/estimated_position/data[2]', '/stereo/corrected_position/data[2]']",
+          "repr": "['/ground_truth_position/data[2]', '/stereo/estimated_position/data[2]']",
           "type": "repr"
         }
       },

@@ -143,13 +143,13 @@ private:
   {
     sensor_msgs::msg::Image::ConstSharedPtr source;
     Detection detection;
-    bool pair_has_positive_disparity{false};
+    bool pair_has_finite_ray_inputs{false};
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      pair_has_positive_disparity =
+      pair_has_finite_ray_inputs =
         left_detection_.valid && right_detection_.valid &&
         std::isfinite(left_detection_.cx) && std::isfinite(right_detection_.cx) &&
-        (left_detection_.cx - right_detection_.cx > 0.5F);
+        std::isfinite(left_detection_.cy) && std::isfinite(right_detection_.cy);
       if (std::string(side) == "left") {
         source = last_left_image_;
         detection = left_detection_;
@@ -163,14 +163,14 @@ private:
     }
     (void)side;
     auto output = std::make_unique<sensor_msgs::msg::Image>(*source);
-    drawDetection(*output, detection, pair_has_positive_disparity);
+    drawDetection(*output, detection, pair_has_finite_ray_inputs);
     publisher->publish(std::move(output));
   }
 
   void drawDetection(
     sensor_msgs::msg::Image & image,
     const Detection & detection,
-    bool pair_has_positive_disparity)
+    bool pair_has_finite_ray_inputs)
   {
     if (image.height == 0 || image.width == 0 || image.step < image.width * 3 ||
         image.data.size() < static_cast<size_t>(image.step) * image.height) {
@@ -189,8 +189,8 @@ private:
     const std::array<uint8_t, 3> yellow{255, 210, 0};
     const std::array<uint8_t, 3> orange{255, 96, 0};
     const auto color =
-      pair_has_positive_disparity && confidence_ok ? green :
-      pair_has_positive_disparity ? yellow : orange;
+      pair_has_finite_ray_inputs && confidence_ok ? green :
+      pair_has_finite_ray_inputs ? yellow : orange;
 
     int x1 = clampInt(std::lround(detection.x1), 0, width - 1);
     int x2 = clampInt(std::lround(detection.x2), 0, width - 1);

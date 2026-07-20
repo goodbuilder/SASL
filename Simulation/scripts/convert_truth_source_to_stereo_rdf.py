@@ -13,7 +13,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,forward)"
+RDF_AXIS_CONTRACT = "stereo_center_opencv_optical_rdf:RDF(right,down,forward)"
 TRANSFORM_CONTRACT = (
     "T_source_to_stereo_rdf: truth_rdf = R_source_to_stereo_rdf * "
     "(truth_source - origin_source) + translation_rdf; "

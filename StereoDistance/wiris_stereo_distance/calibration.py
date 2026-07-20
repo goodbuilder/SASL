@@ -42,7 +42,7 @@ class StereoExtrinsics:
     translation_left_to_right_m: list[float]
     reprojection_error_px: float
     pair_count: int
-    frame_contract: str = "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m"
+    frame_contract: str = "opencv_optical_rdf:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m"
 
 
 @dataclass(frozen=True)
@@ -269,7 +269,7 @@ def stereo_extrinsics_from_dict(payload: dict[str, Any]) -> StereoExtrinsics:
         frame_contract=str(
             payload.get(
                 "frame_contract",
-                "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
+                "opencv_optical_rdf:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
             )
         ),
     )

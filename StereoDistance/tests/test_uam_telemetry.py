@@ -313,7 +313,7 @@ def test_compare_measurement_rows_uses_ulog_truth_first() -> None:
     assert comparisons[0]["truth_time_basis"] == "px4-boot"
     assert comparisons[0]["truth_x_m"] == "1.000000"
     assert comparisons[0]["truth_north_m"] == "1.000000"
-    assert comparisons[0]["measurement_frame"] == "stereo_center_opencv_optical"
+    assert comparisons[0]["measurement_frame"] == "stereo_center_opencv_optical_rdf"
     assert comparisons[0]["comparison_frame"] == "mixed-frame"
     assert comparisons[0]["error_x_m"] == "0.500000"
     assert comparisons[0]["camera_time_sync_status"] == "unrecorded"
@@ -619,6 +619,34 @@ def test_compare_measurement_rows_falls_back_to_recorded_drone_position() -> Non
     assert comparisons[0]["truth_timestamp_s"] == "19.750000"
     assert comparisons[0]["truth_east_m"] == "1.500000"
     assert comparisons[0]["error_y_m"] == "-0.500000"
+
+
+def test_compare_measurement_rows_reads_current_raw_rdf_schema() -> None:
+    rows = [
+        {
+            "timestamp_s": "20.0",
+            "raw_right_m": "1.2",
+            "raw_down_m": "-0.4",
+            "raw_forward_m": "12.0",
+            "raw_range_m": "12.066482",
+            "drone_north_m": "12.0",
+            "drone_east_m": "1.2",
+            "drone_down_m": "-0.4",
+            "drone_timestamp_s": "20.0",
+        }
+    ]
+
+    comparisons = compare_measurement_rows(
+        rows,
+        [],
+        truth_source="embedded-recorded-row",
+        max_dt_s=0.25,
+    )
+
+    assert len(comparisons) == 1
+    assert comparisons[0]["measurement_frame"] == "stereo_center_opencv_optical_rdf"
+    assert comparisons[0]["measurement_right_m"] == "1.200000"
+    assert comparisons[0]["estimated_range_m"] == "12.066482"
 
 
 def test_compare_measurement_rows_prefers_recorded_truth_ned_aliases() -> None:

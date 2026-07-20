@@ -18,23 +18,21 @@ from std_msgs.msg import Float32, Float32MultiArray, String
 
 cv2 = None
 _CLOSING = False
-AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
+AXIS_CONTRACT = "baseline_center_frd:forward,right,down,range"
 
 
 NUMERIC_TOPICS = {
-    "/ground_truth": "actual_distance_m",
-    "/target_distance": "target_distance_m",
-    "/stereo/distance_error": "distance_error_m",
-    "/stereo/disparity": "disparity_px",
+    "/ground_truth": "truth_range_m",
+    "/target_distance": "raw_range_topic_m",
+    "/stereo/distance_error": "range_error_m",
     "/stereo/yolo_inference_ms": "yolo_inference_ms",
     "/stereo/yolo_update_hz": "yolo_update_hz",
 }
 
 COMPARISON_FIELDS = [
-    "comparison_actual_distance_m",
-    "comparison_target_distance_m",
-    "comparison_distance_error_m",
-    "comparison_disparity_px",
+    "comparison_truth_range_m",
+    "comparison_raw_range_m",
+    "comparison_range_error_m",
 ]
 
 GROUND_TRUTH_POSITION_FIELDS = [
@@ -49,33 +47,6 @@ ESTIMATED_POSITION_FIELDS = [
     "raw_right_m",
     "raw_down_m",
     "raw_range_m",
-    "estimated_forward_m",
-    "estimated_right_m",
-    "estimated_down_m",
-    "estimated_range_m",
-]
-
-CORRECTED_POSITION_FIELDS = [
-    "corrected_forward_m",
-    "corrected_right_m",
-    "corrected_down_m",
-    "corrected_range_m",
-]
-
-BBOX_ADJUSTMENT_FIELDS = [
-    "left_corrected_cx",
-    "left_corrected_cy",
-    "right_corrected_cx",
-    "right_corrected_cy",
-    "left_bbox_du_px",
-    "left_bbox_dv_px",
-    "right_bbox_du_px",
-    "right_bbox_dv_px",
-    "profile_id_hash",
-    "fallback_level",
-    "profile_cell_sample_count",
-    "bbox_adjustment_raw_disparity_px",
-    "bbox_adjustment_raw_range_m",
 ]
 
 DETECTION_FIELDS = [
@@ -99,8 +70,6 @@ DETECTION_FIELDS = [
     "right_cy",
     "right_width_px",
     "right_height_px",
-    "raw_disparity_px",
-    "yolo_measurement_raw_range_m",
 ]
 
 DETECTION_MESSAGE_FIELDS = [
@@ -122,12 +91,27 @@ DETECTION_MESSAGE_FIELDS = [
     "right_cy",
 ]
 
-PROFILE_STATUS_FIELDS = [
-    "profile_id",
-    "profile_mode",
-    "profile_fallback_level",
-    "profile_fallback_reason",
+RAY_STATUS_FIELDS = [
+    "triangulation_valid",
+    "triangulation_reason",
+    "ray_closest_gap_m",
+    "ray_left_depth_m",
+    "ray_right_depth_m",
+    "ray_angle_deg",
+    "triangulation_point_frame",
+    "triangulation_frame",
+    "triangulation_method",
 ]
+
+CSV_FIELDS = (
+    ["time_sec", "ros_time_sec", "axis_contract"]
+    + list(NUMERIC_TOPICS.values())
+    + COMPARISON_FIELDS
+    + GROUND_TRUTH_POSITION_FIELDS
+    + ESTIMATED_POSITION_FIELDS
+    + DETECTION_FIELDS
+    + RAY_STATUS_FIELDS
+)
 
 DEBUG_BAG_TOPICS = [
     "/left_camera/image",
@@ -137,15 +121,12 @@ DEBUG_BAG_TOPICS = [
     "/left_camera/camera_info",
     "/right_camera/camera_info",
     "/stereo/detections",
-    "/stereo/disparity",
     "/ground_truth",
     "/stereo/distance_error",
     "/stereo/distance_comparison",
     "/ground_truth_position",
     "/stereo/estimated_position",
-    "/stereo/corrected_position",
-    "/stereo/bbox_adjustment",
-    "/stereo/profile_status",
+    "/stereo/triangulation_status",
     "/stereo/distance_marker",
     "/target_distance",
     "/stereo/yolo_inference_ms",
@@ -199,19 +180,8 @@ class OperatorRecorder(Node):
 
     def _open_csv(self):
         path = self.session_dir / "telemetry.csv"
-        fields = (
-            ["time_sec", "ros_time_sec", "axis_contract"]
-            + list(NUMERIC_TOPICS.values())
-            + COMPARISON_FIELDS
-            + GROUND_TRUTH_POSITION_FIELDS
-            + ESTIMATED_POSITION_FIELDS
-            + CORRECTED_POSITION_FIELDS
-            + BBOX_ADJUSTMENT_FIELDS
-            + DETECTION_FIELDS
-            + PROFILE_STATUS_FIELDS
-        )
         self.csv_file = path.open("w", newline="", encoding="utf-8")
-        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=fields)
+        self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=CSV_FIELDS)
         self.csv_writer.writeheader()
         self.csv_file.flush()
 
@@ -221,12 +191,10 @@ class OperatorRecorder(Node):
             f"csv=telemetry.csv",
             f"csv_hz={self.csv_hz:g}",
             f"axis_contract={AXIS_CONTRACT}",
-            "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, raw_forward_m/raw_right_m/raw_down_m, estimated_forward_m/estimated_right_m/estimated_down_m, corrected_forward_m/corrected_right_m/corrected_down_m",
+            "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, raw_forward_m/raw_right_m/raw_down_m/raw_range_m",
             "axis_aliases=public CSV uses forward/right/down; legacy x/y/z is intentionally not emitted",
             "estimated_position_topic=/stereo/estimated_position publishes raw forward/right/down/range",
-            "corrected_position_topic=/stereo/corrected_position publishes bbox-adjusted forward/right/down/range",
-            "bbox_adjustment_topic=/stereo/bbox_adjustment publishes corrected centers, center deltas, profile hash, fallback, sample count, raw disparity/range",
-            "profile_status_topic=/stereo/profile_status publishes profile_id, mode, fallback_level, fallback_reason",
+            "triangulation_status_topic=/stereo/triangulation_status publishes valid/reason/gap/depths/angle/point_frame/frame/method",
         ]
         if self.mode in ("full", "debug"):
             lines.extend(
@@ -282,26 +250,14 @@ class OperatorRecorder(Node):
         )
         self.create_subscription(
             Float32MultiArray,
-            "/stereo/corrected_position",
-            self._corrected_position_cb,
-            10,
-        )
-        self.create_subscription(
-            Float32MultiArray,
-            "/stereo/bbox_adjustment",
-            self._bbox_adjustment_cb,
-            10,
-        )
-        self.create_subscription(
-            Float32MultiArray,
             "/stereo/detections",
             self._detections_cb,
             10,
         )
         self.create_subscription(
             String,
-            "/stereo/profile_status",
-            self._profile_status_cb,
+            "/stereo/triangulation_status",
+            self._triangulation_status_cb,
             10,
         )
 
@@ -373,27 +329,7 @@ class OperatorRecorder(Node):
         self.latest["raw_right_m"] = float(values[1])
         self.latest["raw_down_m"] = float(values[2])
         self.latest["raw_range_m"] = float(values[3])
-        self.latest["estimated_forward_m"] = float(values[0])
-        self.latest["estimated_right_m"] = float(values[1])
-        self.latest["estimated_down_m"] = float(values[2])
-        self.latest["estimated_range_m"] = float(values[3])
         self.last_stamp["/stereo/estimated_position"] = self.get_clock().now().nanoseconds * 1e-9
-
-    def _corrected_position_cb(self, msg):
-        values = list(msg.data[:4])
-        while len(values) < 4:
-            values.append(math.nan)
-        for field, value in zip(CORRECTED_POSITION_FIELDS, values):
-            self.latest[field] = float(value)
-        self.last_stamp["/stereo/corrected_position"] = self.get_clock().now().nanoseconds * 1e-9
-
-    def _bbox_adjustment_cb(self, msg):
-        values = list(msg.data[: len(BBOX_ADJUSTMENT_FIELDS)])
-        while len(values) < len(BBOX_ADJUSTMENT_FIELDS):
-            values.append(math.nan)
-        for field, value in zip(BBOX_ADJUSTMENT_FIELDS, values):
-            self.latest[field] = float(value)
-        self.last_stamp["/stereo/bbox_adjustment"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _detections_cb(self, msg):
         values = list(msg.data[: len(DETECTION_MESSAGE_FIELDS)])
@@ -409,25 +345,23 @@ class OperatorRecorder(Node):
         self.latest["left_height_px"] = left_height
         self.latest["right_width_px"] = right_width
         self.latest["right_height_px"] = right_height
-        left_cx = self.latest.get("left_cx", math.nan)
-        right_cx = self.latest.get("right_cx", math.nan)
-        if math.isfinite(left_cx) and math.isfinite(right_cx):
-            self.latest["raw_disparity_px"] = left_cx - right_cx
-        else:
-            self.latest["raw_disparity_px"] = self.latest.get("disparity_px", math.nan)
-        self.latest["yolo_measurement_raw_range_m"] = self.latest.get("raw_range_m", math.nan)
         self.last_stamp["/stereo/detections"] = self.get_clock().now().nanoseconds * 1e-9
 
-    def _profile_status_cb(self, msg):
+    def _triangulation_status_cb(self, msg):
         try:
             payload = json.loads(msg.data)
         except Exception:
             payload = {}
-        self.latest["profile_id"] = str(payload.get("profile_id", ""))
-        self.latest["profile_mode"] = str(payload.get("profile_mode", ""))
-        self.latest["profile_fallback_level"] = payload.get("fallback_level", math.nan)
-        self.latest["profile_fallback_reason"] = str(payload.get("fallback_reason", ""))
-        self.last_stamp["/stereo/profile_status"] = self.get_clock().now().nanoseconds * 1e-9
+        self.latest["triangulation_valid"] = 1.0 if payload.get("valid", False) else 0.0
+        self.latest["triangulation_reason"] = str(payload.get("reason", ""))
+        self.latest["ray_closest_gap_m"] = payload.get("closest_gap_m", math.nan)
+        self.latest["ray_left_depth_m"] = payload.get("left_depth_m", math.nan)
+        self.latest["ray_right_depth_m"] = payload.get("right_depth_m", math.nan)
+        self.latest["ray_angle_deg"] = payload.get("ray_angle_deg", math.nan)
+        self.latest["triangulation_point_frame"] = str(payload.get("point_frame", ""))
+        self.latest["triangulation_frame"] = str(payload.get("frame", ""))
+        self.latest["triangulation_method"] = str(payload.get("method", ""))
+        self.last_stamp["/stereo/triangulation_status"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _write_csv_row(self):
         now = self.get_clock().now().nanoseconds * 1e-9
@@ -441,12 +375,15 @@ class OperatorRecorder(Node):
             + COMPARISON_FIELDS
             + GROUND_TRUTH_POSITION_FIELDS
             + ESTIMATED_POSITION_FIELDS
-            + CORRECTED_POSITION_FIELDS
-            + BBOX_ADJUSTMENT_FIELDS
             + DETECTION_FIELDS
-            + PROFILE_STATUS_FIELDS
+            + RAY_STATUS_FIELDS
         ):
-            if field in ("profile_id", "profile_mode", "profile_fallback_reason"):
+            if field in (
+                "triangulation_reason",
+                "triangulation_point_frame",
+                "triangulation_frame",
+                "triangulation_method",
+            ):
                 row[field] = self.latest.get(field, "")
             else:
                 row[field] = _finite_or_empty(self.latest.get(field))

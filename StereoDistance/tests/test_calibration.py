@@ -75,7 +75,7 @@ def test_load_intrinsics_json_preserves_checkerboard_extrinsics(tmp_path: Path) 
     assert loaded.extrinsics is not None
     assert loaded.extrinsics.translation_left_to_right_m == [0.3, 0.0, 0.0]
     assert loaded.extrinsics.pair_count == 18
-    assert "opencv_optical:RDF" in loaded.extrinsics.frame_contract
+    assert "opencv_optical_rdf:RDF" in loaded.extrinsics.frame_contract
 
 
 def test_opencv_available_returns_status_tuple() -> None:

@@ -1,5 +1,10 @@
 # Experiments
 
+> Archive notice: these records preserve pre-ray-only correction research and
+> provenance. They are not active runtime features or current formal evidence.
+> Any new correction study must start a fresh Calibration cycle against the
+> current `baseline_center_frd` public contract.
+
 This directory stores structured experiment records for StereoDistance
 correction-method work.
 

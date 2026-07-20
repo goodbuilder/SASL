@@ -1,5 +1,58 @@
 # 업데이트 기록
 
+## v2.0.0 — 2026-07-20 — DKL식 3차원 ray 위치 측정 전환
+
+- 변경:
+  - `sasl_common/stereo_geometry.py`에 두 3차원 광선의 최근접점 중점을
+    구하는 `two_ray_closest_midpoint` 공통 기하 코어를 추가했다.
+  - StereoDistance의 bbox pair 이후 거리식을 카메라 K, distortion 제거,
+    checkerboard R/T 또는 Pixhawk/RTK pose를 사용하는 ray triangulation으로
+    교체했다.
+  - Simulation도 양쪽 `CameraInfo.K`와 명목 `±baseline/2` 카메라 원점을
+    사용하는 같은 공통 core로 전환했다. synthetic 입력도 full pinhole
+    projection으로 생성한다.
+  - 내부 점 frame을 `stereo_center_opencv_optical_rdf:[Right,Down,Forward]`,
+    공개 배열을 `baseline_center_frd:[Forward,Right,Down,Range]`로 분리했다.
+  - ray gap, 좌/우 depth, ray angle, invalid reason, point/output frame을
+    status와 raw CSV에 추가했다.
+  - StereoDistance의 RTK translation을 ray와 동일한 detection-time 자세
+    sample로 변환하고, bbox grid와 camera calibration grid가 다르면
+    `*_pixel_grid_mismatch`로 측정을 차단한다.
+  - Simulation은 `CameraInfo.width/height`와 bbox/image grid를 정확히
+    대조하고, distortion-off 계약에 어긋나는 `D`는
+    `unsupported_camera_distortion`으로 차단한다. Gazebo world Y의 부호는
+    공개 FRD Forward에 그대로 보존한다.
+  - 기존 결과 보정, bbox 이동, runtime profile, 결과 융합, tracking filter와
+    관련 active topic/script/config/test/UI 경로를 제거했다.
+- 이유:
+  - 회전되거나 비정렬된 카메라에서는 수평 픽셀 간격 하나로 3차원 geometry를
+    표현할 수 없으며, DKL 방식처럼 K와 전체 ray pose를 사용해야 각 축 위치와
+    range를 같은 계약으로 계산할 수 있기 때문이다.
+  - 이번 단계는 raw 위치 추정 알고리즘만 고정하고 보정 연구는 후속 formal
+    cycle로 분리하기 위함이다.
+- 확인:
+  - `StereoDistance/tests`와 `Simulation/tests` 전체: `182 passed`.
+  - 비대칭 K/full projection 왕복, 회전 camera의 동일 수평 pixel,
+    평행/뒤쪽 ray invalid, checkerboard `-R^T*T`, RDF→FRD 순서,
+    detection-time 자세 결합, pixel/K grid, distortion, signed Forward를
+    검증했다.
+  - `StereoDistance/run.sh --check`와 offscreen GUI 생성/종료를 확인했다.
+  - `stereo_ground_sim`, `stereo_ground_sim_overlay`를 `/tmp` build/install
+    경로로 colcon build해 Python package와 C++ overlay를 함께 확인했다.
+  - 활성 source/test/script/config/launch 금지어 scan, Python AST,
+    launch AST, shell `bash -n`, `git diff --check`를 통과했다.
+- 남은 위험:
+  - 실제 WIRIS/Pixhawk/RTK hardware와 Gazebo 장시간 mission smoke는 아직
+    실행하지 않았다.
+  - Simulation 자세오차는 SDF 영상에만 주입되며 raw estimator에는 전달하지
+    않는다. 실제 YOLO 영상 경로에서의 새 성능 평가는 새 Calibration부터
+    다시 시작해야 한다.
+  - 기본 operator UI는 truth를 표시하므로 sealed evaluation/Test evidence로
+    사용할 수 없다.
+  - truth transform utility test에서 system SciPy가 NumPy 1.26.4를 지원 범위
+    밖으로 경고했지만 테스트는 통과했다. runtime environment 의존성 정합성은
+    별도 정리가 필요하다.
+
 ## v1.6.18 — 2026-06-29 — Pixhawk MAVLink-first 운용 기준
 
 - 변경:

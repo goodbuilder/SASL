@@ -24,6 +24,13 @@ Email: TBD}
 \begin{document}
 \maketitle
 
+\begin{quote}
+\textbf{문서 상태 (2026-07-20):} 본 초안의 ray triangulation 측정 수식은
+현행 v2 측정 경로와 대응하지만, 이후의 재투영 보정 및 fusion 절은 pre-v2
+역사 초안이다. 현행 runtime은 raw two-ray midpoint 결과만 출력하며 새 보정
+주장은 별도 Calibration/Validation cycle 이후에 갱신해야 한다.
+\end{quote}
+
 \begin{abstract}
 본 논문은 좌우 WIRIS 카메라 영상, YOLO 객체 검출, Pixhawk 자세, RTK/GNSS baseline 및 비행 후 ULog 기준 위치를 결합하여 장거리 UAM 또는 드론 표적의 거리와 3차원 위치를 추정하는 좌표계 일관 수식 모델을 제안한다.
 제안 방법은 단순 disparity 기반 거리 산출을 최종 출력으로 사용하지 않고, 각 카메라의 bounding box 중심을 optical ray로 변환한 뒤 Pixhawk body FRD 및 world NED 좌표계 계약에 따라 회전시켜 두 ray 사이의 최단 선분 중점을 3차원 측정값으로 정의한다.

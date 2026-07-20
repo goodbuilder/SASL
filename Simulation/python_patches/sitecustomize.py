@@ -107,21 +107,18 @@ def _patch_rqt_plot_default_topics():
             topics = [
                 "/ground_truth_position/data[0]",
                 "/stereo/estimated_position/data[0]",
-                "/stereo/corrected_position/data[0]",
             ]
         elif serial == 2:
             axis_label = "Right"
             topics = [
                 "/ground_truth_position/data[1]",
                 "/stereo/estimated_position/data[1]",
-                "/stereo/corrected_position/data[1]",
             ]
         elif serial == 3:
             axis_label = "Down"
             topics = [
                 "/ground_truth_position/data[2]",
                 "/stereo/estimated_position/data[2]",
-                "/stereo/corrected_position/data[2]",
             ]
         else:
             return
@@ -140,7 +137,7 @@ def _patch_rqt_plot_default_topics():
                 self._widget.data_plot.set_xlim([0.0, window_s])
                 try:
                     plot_widget = self._widget.data_plot._data_plot_widget._plot_widget
-                    plot_widget.getPlotItem().setTitle(f"{axis_label} axis: truth vs raw vs corrected")
+                    plot_widget.getPlotItem().setTitle(f"{axis_label} axis: truth vs raw")
                     plot_widget.getPlotItem().setLabel("left", f"{axis_label} (m)")
                 except Exception:
                     pass

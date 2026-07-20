@@ -19,7 +19,6 @@ DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-20.0}"
 DEFAULT_PLOT_HZ="${DEFAULT_PLOT_HZ:-30.0}"
 DEFAULT_ACTUAL_DISTANCE_HZ="${DEFAULT_ACTUAL_DISTANCE_HZ:-15.0}"
 DEFAULT_PLOT_WINDOW_S="${DEFAULT_PLOT_WINDOW_S:-30.0}"
-DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH="${DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH:-$ROOT_DIR/../ref/Stereo_Camera_3D_Position_DKL/Cent_Bbox_Adj_Mtrx.csv}"
 PX4_DIR="${PX4_DIR:-}"
 PX4_GZ_MODEL_NAME="${PX4_GZ_MODEL_NAME:-x500_15m}"
 PX4_GZ_WORLD="${PX4_GZ_WORLD:-stereo_ground_drone}"
@@ -38,8 +37,6 @@ YOLO_TARGET_HZ_FROM_ENV="${YOLO_TARGET_HZ+x}"; YOLO_TARGET_HZ_ENV_VALUE="${YOLO_
 YOLO_IMGSZ_FROM_ENV="${YOLO_IMGSZ+x}"; YOLO_IMGSZ_ENV_VALUE="${YOLO_IMGSZ:-}"
 YOLO_PYTHON_FROM_ENV="${YOLO_PYTHON+x}"; YOLO_PYTHON_ENV_VALUE="${YOLO_PYTHON:-}"
 YOLO_PYTHONPATH_FROM_ENV="${YOLO_PYTHONPATH+x}"; YOLO_PYTHONPATH_ENV_VALUE="${YOLO_PYTHONPATH:-}"
-BBOX_CENTER_ADJUSTMENT_ENABLE_FROM_ENV="${BBOX_CENTER_ADJUSTMENT_ENABLE+x}"; BBOX_CENTER_ADJUSTMENT_ENABLE_ENV_VALUE="${BBOX_CENTER_ADJUSTMENT_ENABLE:-}"
-BBOX_CENTER_ADJUSTMENT_PATH_FROM_ENV="${BBOX_CENTER_ADJUSTMENT_PATH+x}"; BBOX_CENTER_ADJUSTMENT_PATH_ENV_VALUE="${BBOX_CENTER_ADJUSTMENT_PATH:-}"
 
 CAMERA_BASELINE_M_FROM_ENV="${CAMERA_BASELINE_M+x}"; CAMERA_BASELINE_M_ENV_VALUE="${CAMERA_BASELINE_M:-}"
 CAMERA_HEIGHT_M_FROM_ENV="${CAMERA_HEIGHT_M+x}"; CAMERA_HEIGHT_M_ENV_VALUE="${CAMERA_HEIGHT_M:-}"
@@ -111,8 +108,6 @@ fi
 [[ -n "$YOLO_IMGSZ_FROM_ENV" ]] && YOLO_IMGSZ="$YOLO_IMGSZ_ENV_VALUE"
 [[ -n "$YOLO_PYTHON_FROM_ENV" ]] && YOLO_PYTHON="$YOLO_PYTHON_ENV_VALUE"
 [[ -n "$YOLO_PYTHONPATH_FROM_ENV" ]] && YOLO_PYTHONPATH="$YOLO_PYTHONPATH_ENV_VALUE"
-[[ -n "$BBOX_CENTER_ADJUSTMENT_ENABLE_FROM_ENV" ]] && BBOX_CENTER_ADJUSTMENT_ENABLE="$BBOX_CENTER_ADJUSTMENT_ENABLE_ENV_VALUE"
-[[ -n "$BBOX_CENTER_ADJUSTMENT_PATH_FROM_ENV" ]] && BBOX_CENTER_ADJUSTMENT_PATH="$BBOX_CENTER_ADJUSTMENT_PATH_ENV_VALUE"
 
 if [[ -n "$SIM_SCENARIO_CONFIG" ]]; then
   if [[ "$SIM_SCENARIO_CONFIG" != /* && -f "$CALLER_CWD/$SIM_SCENARIO_CONFIG" ]]; then
@@ -278,6 +273,9 @@ Starts the simulation plus standard ROS UI tools for observation:
   - three Plot plugins comparing actual vs estimated Forward/Right/Down
   - optional Dynamic Reconfigure plugin for changing YOLO parameters
 
+This operator view exposes truth and is for calibration/validation observation;
+it is not a sealed evaluation or Test surface.
+
 Use --bag-view when the single rqt_gui window should contain Image View plus
 the Bag plugin instead of the distance Plot plugin.
 
@@ -304,8 +302,8 @@ Options:
   --record-full [DIR]    Record telemetry CSV plus left/right overlay MP4.
   --record-debug [DIR]   Record CSV, overlay MP4, and debug MCAP rosbag.
   --record-calibration-csv [FILE]
-                         Record pipeline-ready calibration CSV from PX4 NED truth,
-                         StereoDistance estimates, detections, and disparity.
+                         Record future-calibration raw CSV from PX4 NED truth,
+                         raw ray estimates, detections, and ray quality.
   --calibration-sim-truth
                          Use /ground_truth_position as fallback calibration truth.
   --calibration-truth-topic TOPIC
@@ -330,29 +328,6 @@ Options:
   --yolo-hz VALUE        YOLO scheduler target in Hz. Default: 40.0 to keep measured output above 20 Hz.
   --yolo-imgsz PIXELS    YOLO inference image size. Default from config/yolo.env.
   --yolo-python FILE     Python used for the YOLO distance node. Default: local .venv or python3.
-  --bbox-adjustment FILE Use a 6x4 bbox-center CSV or JSON runtime profile and publish corrected_position.
-  --no-bbox-adjustment   Disable bbox-center adjustment even if env defaults are set.
-  --observation-fusion-manifest FILE
-                         Fuse runtime image observations before raw RDF/profile apply.
-  --observation-fusion-tier TIER
-                         Select a tier from the observation-fusion manifest.
-  --no-observation-fusion
-                         Disable observation fusion even if env defaults are set.
-  --disparity-residual-profile FILE
-                         Apply a runtime residual disparity profile after bbox/profile correction.
-  --disparity-residual-feature-selector FILE
-                         Let StereoDistanceNode select a residual disparity profile from runtime
-                         image/disparity/RDF summary features.
-  --disparity-residual-feature-catalog FILE
-                         Residual profile catalog JSON for --disparity-residual-feature-selector.
-  --disparity-residual-feature-window-size N
-                         Rolling runtime feature window size for node-side residual selection.
-  --disparity-residual-feature-min-samples N
-                         Minimum samples before node-side residual selection is allowed.
-  --no-disparity-residual
-                         Disable residual disparity correction even if env defaults are set.
-  --no-disparity-residual-feature-selector
-                         Disable node-side residual feature selection.
   --plot-hz VALUE        Distance graph topic publish rate in Hz. Default: 30.0.
   --actual-hz VALUE      Gazebo actual-distance pose read rate in Hz. Default: 15.0.
   --plot-window S        Visible rqt_plot X-axis window in seconds. Default: 30.0.
@@ -513,58 +488,6 @@ while (($#)); do
     --yolo-python)
       launch_input+=("yolo_python:=${2:?missing value for --yolo-python}")
       shift 2
-      ;;
-    --bbox-adjustment)
-      launch_input+=("enable_bbox_center_adjustment:=true")
-      launch_input+=("bbox_center_adjustment_path:=${2:?missing value for --bbox-adjustment}")
-      shift 2
-      ;;
-    --no-bbox-adjustment)
-      launch_input+=("enable_bbox_center_adjustment:=false")
-      shift
-      ;;
-    --observation-fusion-manifest)
-      launch_input+=("enable_observation_fusion:=true")
-      launch_input+=("observation_fusion_manifest_path:=${2:?missing value for --observation-fusion-manifest}")
-      shift 2
-      ;;
-    --observation-fusion-tier)
-      launch_input+=("observation_fusion_tier:=${2:?missing value for --observation-fusion-tier}")
-      shift 2
-      ;;
-    --no-observation-fusion)
-      launch_input+=("enable_observation_fusion:=false")
-      shift
-      ;;
-    --disparity-residual-profile)
-      launch_input+=("enable_disparity_residual_profile:=true")
-      launch_input+=("disparity_residual_profile_path:=${2:?missing value for --disparity-residual-profile}")
-      shift 2
-      ;;
-    --disparity-residual-feature-selector)
-      launch_input+=("enable_disparity_residual_feature_selector:=true")
-      launch_input+=("disparity_residual_feature_selector_model_path:=${2:?missing value for --disparity-residual-feature-selector}")
-      shift 2
-      ;;
-    --disparity-residual-feature-catalog)
-      launch_input+=("disparity_residual_feature_selector_catalog_path:=${2:?missing value for --disparity-residual-feature-catalog}")
-      shift 2
-      ;;
-    --disparity-residual-feature-window-size)
-      launch_input+=("disparity_residual_feature_selector_window_size:=${2:?missing value for --disparity-residual-feature-window-size}")
-      shift 2
-      ;;
-    --disparity-residual-feature-min-samples)
-      launch_input+=("disparity_residual_feature_selector_min_samples:=${2:?missing value for --disparity-residual-feature-min-samples}")
-      shift 2
-      ;;
-    --no-disparity-residual)
-      launch_input+=("enable_disparity_residual_profile:=false")
-      shift
-      ;;
-    --no-disparity-residual-feature-selector)
-      launch_input+=("enable_disparity_residual_feature_selector:=false")
-      shift
       ;;
     --plot-hz)
       launch_input+=("plot_publish_hz:=${2:?missing value for --plot-hz}")
@@ -890,16 +813,6 @@ if [[ -x "$DEFAULT_YOLO_PYTHON" ]]; then
 fi
 add_default_launch_arg plot_publish_hz "$DEFAULT_PLOT_HZ" "${launch_input[@]}"
 add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${launch_input[@]}"
-	add_default_launch_arg enable_bbox_center_adjustment "${BBOX_CENTER_ADJUSTMENT_ENABLE:-false}" "${launch_input[@]}"
-  add_default_launch_arg bbox_center_adjustment_path "${BBOX_CENTER_ADJUSTMENT_PATH:-$DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH}" "${launch_input[@]}"
-	add_default_launch_arg enable_observation_fusion "${OBSERVATION_FUSION_ENABLE:-false}" "${launch_input[@]}"
-	add_optional_default_launch_arg observation_fusion_manifest_path "${OBSERVATION_FUSION_MANIFEST_PATH:-}" "${launch_input[@]}"
-	add_optional_default_launch_arg observation_fusion_tier "${OBSERVATION_FUSION_TIER:-}" "${launch_input[@]}"
-	add_default_launch_arg enable_disparity_residual_feature_selector "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_ENABLE:-false}" "${launch_input[@]}"
-	add_optional_default_launch_arg disparity_residual_feature_selector_model_path "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MODEL_PATH:-}" "${launch_input[@]}"
-	add_optional_default_launch_arg disparity_residual_feature_selector_catalog_path "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_CATALOG_PATH:-}" "${launch_input[@]}"
-	add_default_launch_arg disparity_residual_feature_selector_window_size "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_WINDOW_SIZE:-1}" "${launch_input[@]}"
-	add_default_launch_arg disparity_residual_feature_selector_min_samples "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MIN_SAMPLES:-1}" "${launch_input[@]}"
 	if ! has_launch_arg gz_gui "${launch_input[@]}"; then
   if [[ "$headless" == true ]]; then
     launch_args+=("gz_gui:=false")
