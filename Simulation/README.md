@@ -59,12 +59,40 @@ PX4 local position은 `north/east/down` 순서의 NED이고, Gazebo world/model 
 - baseline: 25 m
 - camera height: 10 m
 - stereo type: parallel stereo
-- resolution / FPS: 1280x720 @ 30 Hz
+- resolution / FPS: visible 1280x720 @ 20 Hz (50,000,000 ns frame interval)
 - horizontal FOV: 0.154997710698 rad, WIRIS Enterprise optical zoom 8x 기준 약 8.88 deg
 - distortion: off
 - target drone: 약 폭 15 m, 높이 10 m 대형 쿼드콥터 형상
 - target motion: QGC/PX4 조종 관찰용. 시작 위치는 카메라 전방 +Y 약 2000 m입니다.
 - viewer: 단일 `rqt_gui` 운용 창, 선택적으로 RViz2
+
+## S1 Simulation ground-truth/ray contract
+
+현재 Simulation S1의 절대 Ground Truth는 Gazebo
+`/world/stereo_ground_drone/pose/info`의 `gz.msgs.Pose_V`에서 읽은
+`base_link` pose이다. 전용 adapter가 원본 `header.stamp.sec/nsec`를 보존해
+`/simulation/ground_truth/vehicle_reference_link`
+(`geometry_msgs/msg/PoseStamped`, `header.frame_id=gazebo_world_enu`)로
+발행한다. 공개 semantic reference 이름은 `vehicle_reference_link`이고 정의는
+`project_defined_vehicle_reference_at_base_link_origin`이며, parent는
+`base_link`, parent-relative translation은 `[0, 0, 0] m`, rotation은
+identity이다. 이 frame은 mass-bearing link가 아니다.
+
+nominal zero-error 좌우 optical pose에서 한 번 만든
+`baseline_center_frd`가 고정 출력 frame이다. World ENU point는
+`p_B = R_B_W @ (p_W - O_W)`로 변환하며, `R_B_W`의 행은 Forward, Right,
+Down world 방향이다. World 축을 직접 FRD 별칭으로 사용하지 않는다.
+
+Raw 위치는 좌우 optical RDF pixel을 각각 ray로 만든 뒤 동일한
+`sasl_common.stereo_geometry` closest-ray kernel에 넣고 두 최근접점의
+midpoint를 저장한다. 결과에는 각 ray 점, midpoint, Forward/Right/Down/Range,
+ray gap, 교차각, signed depths, geometry rank, conditioning metric,
+`computation_status`가 포함된다. PX4 Local/Global/GPS/Odometry는 이 절대
+Ground Truth의 보조 정보일 뿐이다.
+
+S1에서 timestamp pairing, Ground Truth interpolation, common/relative yaw,
+attitude-corrected 결과, PX4-only 이동 정리, post-hoc correction 삭제,
+pair recorder, speed 계산은 아직 구현 대상이 아니다.
 
 ## 시뮬레이션 목적
 
@@ -5308,7 +5336,7 @@ Replay 출력:
 Gazebo 3D GUI에서는 카메라 뒤에서 전방 +Y를 바라보는 운용자 기준으로 왼쪽 카메라는 world X 음수 위치의 파란색 본체, 오른쪽 카메라는 world X 양수 위치의 빨간색 본체로 표시됩니다. 카메라 모델 원점은 실제 sensor optical center이며, 렌즈 visual의 앞면이 이 원점에 맞춰집니다.
 `rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, truth/raw/corrected FRD, Forward/Down `estimate-truth` 오차와 최근 시간창 RMSE, detection valid ratio, 좌표 계약을 표시합니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
 Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), raw YOLO 추정값(`/stereo/estimated_position`), bbox 중심 보정 추정값(`/stereo/corrected_position`)을 비교합니다. 축 계약은 StereoDistance와 같은 비교 계약으로 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다.
-Gazebo 카메라 센서는 기본 30Hz(`CAMERA_UPDATE_RATE_HZ=30.0`)로 설정하고, 거리/오차 그래프 토픽도 기본 30Hz(`plot_publish_hz:=30.0`)로 발행합니다. 실제 거리 ground truth와 드론 위치 FRD는 Gazebo pose 스트림을 기본 15Hz(`actual_distance_read_hz:=15.0`)로 샘플링한 뒤 카메라 중앙 기준 `Forward/Right/Down`으로 변환합니다. `DRONE_ORIGIN_Z_OFFSET_M`은 Gazebo model origin에서 비교 기준점까지의 world Z offset이며, 양수는 위쪽입니다. 기본값 `-1.021823`은 x500_15m 모델에서 YOLO bbox 중심으로 복원되는 raw Down과 `/ground_truth_position` Down을 맞추기 위한 시뮬레이션 truth 기준점 보정입니다. `gz topic` pose 조회와 overlay 발행은 YOLO worker를 지연시킬 수 있습니다. 기본 실행은 Gazebo 3D GUI도 함께 엽니다(`gz_gui:=true`). 카메라/그래프 Hz를 우선해 headless로 돌리려면 `gz_gui:=false`를 붙입니다.
+Gazebo visible 카메라 센서는 기본 20 Hz(`CAMERA_UPDATE_RATE_HZ=20.0`), 1280x720이며 frame interval은 50,000,000 ns입니다. Ground Truth는 별도 adapter가 raw `Pose_V`의 simulation stamp를 보존해 발행하고, S1의 비교 frame은 고정 `baseline_center_frd`입니다. 이전 model-origin/Down offset 설명은 폐기된 historical 기록이며 active 경로에서 사용하지 않습니다. 거리/오차 그래프 및 overlay timer는 이 Phase의 camera-rate contract와 별개입니다. 기본 실행은 Gazebo 3D GUI도 함께 엽니다(`gz_gui:=true`). 카메라/그래프 Hz를 우선해 headless로 돌리려면 `gz_gui:=false`를 붙입니다.
 각 Plot의 시간축은 최근 30초 창으로 autoscroll되며, 값 축은 현재 보이는 데이터 범위에 맞춰 자동으로 다시 잡히도록 실행 시 rqt_plot 패치를 적용합니다. 시간 창 길이는 `--plot-window 30`처럼 바꿀 수 있습니다.
 기본 YOLO 설정은 `config/yolo.env`에서 읽습니다. 기본 모델은 `yolov8n_uav.pt`, class는 `UAV`, confidence는 `0.10`입니다. `.pt` 파일은 git에 넣지 않는 machine-local 입력이므로, 다른 PC에서는 `Simulation/yolov8n_uav.pt`를 같은 위치에 두거나 `YOLO_MODEL_PATH`/`--yolo-model`로 다른 파일을 명시합니다. 이 설정은 left/right image pixel bbox detector만 바꾸며, `/ground_truth_position`과 거리 토픽의 stereo-center FRD 축 계약은 바꾸지 않습니다.
 기본 실행은 YOLO 거리 계산을 `yolo_target_hz:=40.0`, `yolo_device:=cuda:0`, `yolo_imgsz:=1280`으로 요청합니다. 2 km 부근의 작은 드론 bbox를 양쪽 카메라에서 유지하고 YOLO stride 32 경고를 피하기 위해 카메라 가로 해상도와 같은 1280 입력 크기를 기본으로 사용합니다. 거리 노드는 `config/yolo.env`의 `YOLO_PYTHON` 또는 로컬 `.venv`, 없으면 `python3`로 실행합니다. CUDA가 실제로 잡히면 CUDA/FP16으로 좌/우 이미지를 batch 추론하고, CUDA가 잡히지 않으면 CPU로 fallback하더라도 YOLO 이미지 구독과 거리 계산을 계속 시도합니다. CPU fallback은 느릴 수 있으므로 필요하면 `--yolo-hz`나 `yolo_imgsz`를 낮춥니다.
@@ -5378,7 +5406,7 @@ raw RDF ray scale을 보정합니다. 세 profile 모두 보정 비행 truth로 
 ./run_operator_view.sh --params
 ```
 
-거리 계산 주기를 높이고 싶으면 `--yolo-hz` 또는 launch 인자 `yolo_target_hz`를 조정합니다. 이 값은 화면 표시 Hz가 아니라 YOLO 추론 Hz입니다. 그래프 토픽 발행 Hz는 `--plot-hz` 또는 `plot_publish_hz`로 조정합니다. Ground truth pose 재조회 Hz는 `--actual-hz` 또는 `actual_distance_read_hz`로 조정합니다.
+거리 계산 주기를 높이고 싶으면 `--yolo-hz` 또는 launch 인자 `yolo_target_hz`를 조정합니다. 이 값은 화면 표시 Hz가 아니라 YOLO 추론 Hz입니다. 그래프 토픽 발행 Hz는 `--plot-hz` 또는 `plot_publish_hz`로 조정합니다. Ground Truth 원본 시각은 Gazebo `Pose_V` adapter가 보존하며, `actual_distance_read_hz`는 이 authoritative simulation timestamp를 대체하지 않습니다.
 
 ```bash
 ./run_operator_view.sh yolo_target_hz:=40.0
@@ -5406,7 +5434,6 @@ CUDA/CPU 장치를 명시하거나, 부하가 부족하면 추론 Hz 또는 입�
 DRONE_SPAWN_X_M=0.0
 DRONE_SPAWN_Y_M=2000.0
 DRONE_SPAWN_Z_M=5.56
-DRONE_ORIGIN_Z_OFFSET_M=-1.021823
 DRONE_SPAWN_YAW_DEG=-90.0
 
 DRONE_TAKEOFF_ALTITUDE_M=10.0
@@ -5418,7 +5445,7 @@ DRONE_LAND_DURATION_S=10.0
 DRONE_LAND_TIMEOUT_S=90.0
 ```
 
-`DRONE_SPAWN_*` 값은 `./run_operator_view.sh`와 자세각 실험이 Gazebo 월드를 만들 때 적용합니다. 기본값은 카메라 전방 2000 m에서 스폰한 뒤 1500 m 접근해 `/ground_truth` 기준 500 m에서 멈추고, ground truth를 읽지 못하는 fallback에서도 1500 m만 이동하도록 맞춥니다. `DRONE_TAKEOFF_ALTITUDE_M`, `DRONE_FORWARD_SPEED_MPS`, `DRONE_MOVE_DISTANCE_M`, `DRONE_TARGET_DISTANCE_M` 값은 자동 미션, waypoint 미션, 자세각 실험에서 공통 기본값으로 사용합니다. 명령줄 옵션과 launch 인자를 같이 주면 명령줄 값이 우선합니다.
+`DRONE_SPAWN_*` 값은 `./run_operator_view.sh`와 자세각 실험이 Gazebo 월드를 만들 때 적용합니다. 기본값은 카메라 전방 2000 m에서 스폰한 뒤 1500 m 접근해 계획 임무를 수행하도록 맞춥니다. Ground Truth를 읽지 못하면 `vehicle_reference_link` 상태를 unavailable로 기록하며 model-origin, PX4 pose, 계획 거리값으로 대체하지 않습니다. `DRONE_TAKEOFF_ALTITUDE_M`, `DRONE_FORWARD_SPEED_MPS`, `DRONE_MOVE_DISTANCE_M`, `DRONE_TARGET_DISTANCE_M` 값은 자동 미션, waypoint 미션, 자세각 실험에서 공통 기본값으로 사용합니다. 명령줄 옵션과 launch 인자를 같이 주면 명령줄 값이 우선합니다.
 
 Gazebo, rqt, PX4 실행 후 자동 이륙-접근-착륙까지 한 번에 시작하려면:
 
@@ -5695,7 +5722,7 @@ CAMERA_HEIGHT_M=5.0
 CAMERA_HORIZONTAL_FOV_RAD=0.154997710698
 CAMERA_IMAGE_WIDTH_PX=1280
 CAMERA_IMAGE_HEIGHT_PX=720
-CAMERA_UPDATE_RATE_HZ=60.0
+CAMERA_UPDATE_RATE_HZ=20.0
 CAMERA_CLIP_NEAR_M=0.1
 CAMERA_CLIP_FAR_M=2500.0
 ```
@@ -5762,7 +5789,6 @@ takeoff_duration_s
 first_hover_duration_s
 final_hover_duration_s
 land_duration_s
-target_center_z_m
 left_roll_error_deg
 left_pitch_error_deg
 left_yaw_error_deg
@@ -5791,7 +5817,7 @@ X500 또는 IRIS 모델로 시각 형상을 바꾸는 것은 가능하지만, �
 2000 m 장거리 카메라 영상에서는 얇은 텍스처 면이나 큰 배율의 얇은 프로펠러 메시가 픽셀 경계에서 깜빡이는 것처럼 보일 수 있습니다.
 `x500_15m` 모델은 이 영향을 줄이기 위해 본체 위 로고 텍스처 plane을 제거하고, 네 개의 얇은 프로펠러 STL 시각 요소를 어두운 원통형 로터 디스크로 바꿨습니다.
 본체, 암, 모터 형상은 유지하므로 타겟은 여전히 X500 기반 드론 형상입니다.
-Z축 비교에서는 Gazebo pose 기반 ground truth와 YOLO bbox 중심 기반 추정값의 기준점을 맞추기 위해 `DRONE_ORIGIN_Z_OFFSET_M=-1.021823`을 적용합니다. 이 값은 x500_15m Gazebo model origin보다 1.021823 m 아래의 비교 기준점을 `/ground_truth_position`에 사용한다는 뜻입니다. 다리 collision은 같은 기준에서 지면에 닿도록 아래쪽에 배치하고, 기본 `DRONE_SPAWN_Z_M=5.56`은 이 다리 collision 높이를 반영합니다.
+Z축 비교의 Ground Truth 기준점은 `vehicle_reference_link`이며, `base_link` 원점에 project-defined zero offset(`[0, 0, 0]` m, identity RPY)으로 정의합니다. 이 semantic reference는 mesh centroid, mass center, visual/collision AABB center가 아니며 이전 estimator-derived Z offset을 사용하지 않습니다. 출력 비교 frame은 nominal zero-error rig에서 한 번 구성한 `baseline_center_frd`입니다. 기본 `DRONE_SPAWN_Z_M=5.56`은 PX4/Gazebo mission spawn 설정이며 reference offset을 의미하지 않습니다.
 
 ## QGroundControl
 
@@ -5805,7 +5831,7 @@ PX4를 끄고 카메라/거리 계산만 실행하려면:
 ```
 
 PX4/QGC 제어가 필요하면 `./run_operator_view.sh`를 기본값으로 다시 실행합니다.
-Ground truth는 기본적으로 Gazebo pose 토픽(`/world/stereo_ground_drone/pose/info`)에서 `x500_15m`의 실제 pose를 읽고, 이를 카메라 기준 `Forward/Right/Down`으로 변환해 `/ground_truth_position`으로 발행합니다. `/ground_truth` 전방거리는 변환된 `forward_m`입니다. pose 토픽을 읽지 못하면 계획 거리값으로 fallback합니다.
+Ground Truth adapter는 Gazebo `gz.msgs.Pose_V` 토픽(`/world/stereo_ground_drone/pose/info`)에서 `name == "base_link"`인 entity의 simulation stamp와 world ENU pose를 읽어 `/simulation/ground_truth/vehicle_reference_link` (`geometry_msgs/msg/PoseStamped`, `frame_id=gazebo_world_enu`)로 발행합니다. `base_link` pose에 zero transform을 적용한 semantic reference가 `vehicle_reference_link`이며, distance node가 이를 고정 `baseline_center_frd`로 변환합니다. pose 토픽을 읽지 못하면 GT unavailable로 표시하고 model-origin, PX4, 계획 거리값으로 fallback하지 않습니다.
 반복 가능한 접근 실험이 필요하면 QGC mission 또는 PX4용 MAVLink/offboard 명령을 사용합니다.
 
 ## 기록 프리셋

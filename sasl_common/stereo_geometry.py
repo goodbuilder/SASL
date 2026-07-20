@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Sequence
+from dataclasses import dataclass, field
+from typing import Any, Sequence
 
 
 Vector3 = tuple[float, float, float]
@@ -45,12 +45,16 @@ class PinholeIntrinsics:
 
 @dataclass(frozen=True)
 class RayTriangulationResult:
-    """Closest-ray midpoint expressed from the left optical center.
+    """Closest-ray midpoint expressed in the supplied common frame.
 
-    ``point_left_rdf_m`` is ordered ``(Right, Down, Forward)`` in metres.
-    ``range_m`` is its Euclidean norm from the left camera optical center.
-    Both camera rays and the right-camera origin are expressed in the same
-    ``left_camera_rdf`` frame before this result is constructed.
+    ``point_left_rdf_m`` is ordered ``(Right, Down, Forward)`` in metres for
+    the legacy field name.  ``range_m`` is the Euclidean norm of the midpoint
+    in the supplied common frame; callers that need a different origin should
+    transform the point before invoking this kernel.
+    Both camera origins and rays are expressed in the same common frame before
+    this result is constructed.  The legacy ``point_left_rdf_m`` field remains
+    as an alias-compatible midpoint field for callers that use a left-camera
+    RDF frame.
     """
 
     point_left_rdf_m: Vector3
@@ -60,6 +64,12 @@ class RayTriangulationResult:
     right_depth_m: float
     ray_angle_deg: float
     baseline_m: float
+    point_on_left_ray_rdf_m: Vector3 | None = None
+    point_on_right_ray_rdf_m: Vector3 | None = None
+    midpoint_rdf_m: Vector3 | None = None
+    geometry_rank: int = 2
+    condition_number: float = 1.0
+    computation_status: str = "computed"
     method: str = TRIANGULATION_METHOD
     point_frame: str = LEFT_CAMERA_RDF_FRAME
     output_frame: str = LEFT_CAMERA_RDF_FRAME
@@ -83,6 +93,7 @@ class RayTriangulationResult:
 class RayTriangulationAttempt:
     result: RayTriangulationResult | None
     reason: str
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
     @property
     def valid(self) -> bool:
@@ -172,43 +183,65 @@ def triangulate_rays(
     right_origin_left_rdf_m: Sequence[float],
     left_ray_left_rdf: Sequence[float],
     right_ray_left_rdf: Sequence[float],
-    parallel_epsilon: float = 1.0e-12,
+    left_origin_left_rdf_m: Sequence[float] = (0.0, 0.0, 0.0),
+    parallel_epsilon: float = 1.0e-15,
 ) -> RayTriangulationAttempt:
-    """Find the closest-ray midpoint in ``left_camera_rdf``.
+    """Find the closest-ray midpoint in the supplied common frame.
 
-    The left optical center is always ``(0, 0, 0)``.  The right optical
-    center and both unit-ray directions are expressed in left-camera RDF.
-    No baseline-center translation or FRD axis reorder is performed.
+    The default left optical center is ``(0, 0, 0)`` for compatibility.  A
+    non-zero left origin is accepted for fixed world/rig frames; no baseline
+    center translation or FRD axis reorder is performed here.
     """
 
-    left_origin: Vector3 = (0.0, 0.0, 0.0)
-    right_origin = _vector3(right_origin_left_rdf_m, name="right_origin_left_rdf_m")
-    left_ray = normalize_vector(left_ray_left_rdf)
-    right_ray = normalize_vector(right_ray_left_rdf)
+    try:
+        left_origin = _vector3(left_origin_left_rdf_m, name="left_origin_left_rdf_m")
+        right_origin = _vector3(right_origin_left_rdf_m, name="right_origin_left_rdf_m")
+        left_ray = normalize_vector(left_ray_left_rdf)
+        right_ray = normalize_vector(right_ray_left_rdf)
+    except (TypeError, ValueError) as exc:
+        return RayTriangulationAttempt(None, "invalid_input", {"error": str(exc)})
     baseline_vector = _subtract(right_origin, left_origin)
     baseline_m = _norm(baseline_vector)
     if baseline_m <= 0.0:
-        return RayTriangulationAttempt(None, "zero_baseline")
+        return RayTriangulationAttempt(None, "zero_baseline", {"geometry_rank": 0})
 
     ray_dot = max(-1.0, min(1.0, _dot(left_ray, right_ray)))
     denominator = 1.0 - ray_dot * ray_dot
-    if denominator <= float(parallel_epsilon):
-        return RayTriangulationAttempt(None, "near_parallel_rays")
+    cross_norm = _norm(
+        (
+            left_ray[1] * right_ray[2] - left_ray[2] * right_ray[1],
+            left_ray[2] * right_ray[0] - left_ray[0] * right_ray[2],
+            left_ray[0] * right_ray[1] - left_ray[1] * right_ray[0],
+        )
+    )
+    if cross_norm <= float(parallel_epsilon):
+        return RayTriangulationAttempt(
+            None,
+            "rank_deficient",
+            {
+                "geometry_rank": 1,
+                "condition_number": math.inf,
+                "ray_dot": ray_dot,
+            },
+        )
+
+    condition_number = math.sqrt((1.0 + abs(ray_dot)) / (1.0 - abs(ray_dot)))
 
     origin_delta = _subtract(left_origin, right_origin)
     left_projection = _dot(left_ray, origin_delta)
     right_projection = _dot(right_ray, origin_delta)
     left_depth_m = (ray_dot * right_projection - left_projection) / denominator
     right_depth_m = (right_projection - ray_dot * left_projection) / denominator
-    if left_depth_m <= 0.0 or right_depth_m <= 0.0:
-        return RayTriangulationAttempt(None, "non_positive_depth")
-
     left_closest = _add(left_origin, _scale(left_ray, left_depth_m))
     right_closest = _add(right_origin, _scale(right_ray, right_depth_m))
     midpoint = _scale(_add(left_closest, right_closest), 0.5)
     range_m = _norm(midpoint)
-    if not math.isfinite(range_m) or range_m <= 0.0:
-        return RayTriangulationAttempt(None, "invalid_range")
+    if not all(math.isfinite(value) for value in (*left_closest, *right_closest, *midpoint, range_m)):
+        return RayTriangulationAttempt(
+            None,
+            "invalid_solution",
+            {"geometry_rank": 2, "condition_number": condition_number},
+        )
 
     result = RayTriangulationResult(
         point_left_rdf_m=midpoint,
@@ -218,8 +251,22 @@ def triangulate_rays(
         right_depth_m=right_depth_m,
         ray_angle_deg=math.degrees(math.acos(ray_dot)),
         baseline_m=baseline_m,
+        point_on_left_ray_rdf_m=left_closest,
+        point_on_right_ray_rdf_m=right_closest,
+        midpoint_rdf_m=midpoint,
+        geometry_rank=2,
+        condition_number=condition_number,
+        computation_status="computed",
     )
-    return RayTriangulationAttempt(result, "ok")
+    return RayTriangulationAttempt(
+        result,
+        "ok",
+        {
+            "geometry_rank": 2,
+            "condition_number": condition_number,
+            "ray_dot": ray_dot,
+        },
+    )
 
 
 def triangulate_pixels(
@@ -230,16 +277,21 @@ def triangulate_pixels(
     right_intrinsics: PinholeIntrinsics,
     right_origin_left_rdf_m: Sequence[float],
     rotation_left_from_right_rdf: Sequence[Sequence[float]] = IDENTITY_ROTATION,
+    left_origin_left_rdf_m: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> RayTriangulationAttempt:
     """Triangulate pinhole pixels after expressing the right ray in the left frame."""
 
-    left_ray = ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
-    right_ray = rotate_vector(
-        rotation_left_from_right_rdf,
-        ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics),
-    )
+    try:
+        left_ray = ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
+        right_ray = rotate_vector(
+            rotation_left_from_right_rdf,
+            ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics),
+        )
+    except (TypeError, ValueError) as exc:
+        return RayTriangulationAttempt(None, "invalid_input", {"error": str(exc)})
     return triangulate_rays(
         right_origin_left_rdf_m=right_origin_left_rdf_m,
         left_ray_left_rdf=left_ray,
         right_ray_left_rdf=right_ray,
+        left_origin_left_rdf_m=left_origin_left_rdf_m,
     )

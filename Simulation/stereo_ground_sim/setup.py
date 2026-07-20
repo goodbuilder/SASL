@@ -36,6 +36,7 @@ setup(
     entry_points={
         "console_scripts": [
             "stereo_distance_node = stereo_ground_sim.stereo_distance_node:main",
+            "gazebo_ground_truth_adapter = stereo_ground_sim.gazebo_ground_truth_adapter:main",
             "detection_overlay_node = stereo_ground_sim.detection_overlay_node:main",
             "external_bbox_publisher = stereo_ground_sim.external_bbox_publisher:main",
             "operator_recorder = stereo_ground_sim.operator_recorder:main",

@@ -46,8 +46,7 @@ def _write_distance_node_params(context):
         "first_hover_duration_s",
         "final_hover_duration_s",
         "land_duration_s",
-        "target_center_z_m",
-        "target_origin_z_offset_m",
+        "target_spawn_z_m",
         "actual_distance_read_hz",
         "yolo_confidence",
         "yolo_target_hz",
@@ -57,6 +56,12 @@ def _write_distance_node_params(context):
         "scenario_range_min_m",
         "scenario_range_max_m",
         "zoom_index",
+        "left_roll_error_deg",
+        "left_pitch_error_deg",
+        "left_yaw_error_deg",
+        "right_roll_error_deg",
+        "right_pitch_error_deg",
+        "right_yaw_error_deg",
     }
     int_params = {
         "yolo_imgsz",
@@ -95,12 +100,17 @@ def _write_distance_node_params(context):
         "first_hover_duration_s",
         "final_hover_duration_s",
         "land_duration_s",
-        "target_center_z_m",
-        "target_origin_z_offset_m",
+        "target_spawn_z_m",
         "fly_target_in_gazebo",
         "actual_distance_read_hz",
         "actual_distance_source",
         "target_model_name",
+        "left_roll_error_deg",
+        "left_pitch_error_deg",
+        "left_yaw_error_deg",
+        "right_roll_error_deg",
+        "right_pitch_error_deg",
+        "right_yaw_error_deg",
         "yolo_model_path",
         "yolo_class_name",
         "yolo_confidence",
@@ -244,7 +254,7 @@ def _generate_world(context):
             f"<horizontal_fov>{fov_value}</horizontal_fov>",
             f"<horizontal_fov>{horizontal_fov_rad:.12f}</horizontal_fov>",
         )
-    world = world.replace("<update_rate>60</update_rate>", f"<update_rate>{camera_update_rate_hz:.6f}</update_rate>")
+    world = world.replace("<update_rate>20</update_rate>", f"<update_rate>{camera_update_rate_hz:.6f}</update_rate>")
     world = world.replace("<width>1280</width>", f"<width>{camera_image_width_px}</width>")
     world = world.replace("<height>720</height>", f"<height>{camera_image_height_px}</height>")
     world = world.replace("<near>0.1</near>", f"<near>{camera_clip_near_m:.6f}</near>")
@@ -315,6 +325,11 @@ def _launch_setup(context, *args, **kwargs):
                 "-r",
                 "__node:=operator_camera_bridge",
             ],
+            output="screen",
+        ),
+        Node(
+            package="stereo_ground_sim",
+            executable="gazebo_ground_truth_adapter",
             output="screen",
         ),
         ExecuteProcess(
@@ -391,7 +406,7 @@ def generate_launch_description():
             DeclareLaunchArgument("horizontal_fov_rad", default_value="0.154997710698"),
             DeclareLaunchArgument("camera_image_width_px", default_value="1280"),
             DeclareLaunchArgument("camera_image_height_px", default_value="720"),
-            DeclareLaunchArgument("camera_update_rate_hz", default_value="60.0"),
+            DeclareLaunchArgument("camera_update_rate_hz", default_value="20.0"),
             DeclareLaunchArgument("camera_clip_near_m", default_value="0.1"),
             DeclareLaunchArgument("camera_clip_far_m", default_value="2500.0"),
             DeclareLaunchArgument("approach_start_distance_m", default_value="2000.0"),
@@ -407,8 +422,6 @@ def generate_launch_description():
             DeclareLaunchArgument("first_hover_duration_s", default_value="5.0"),
             DeclareLaunchArgument("final_hover_duration_s", default_value="5.0"),
             DeclareLaunchArgument("land_duration_s", default_value="10.0"),
-            DeclareLaunchArgument("target_center_z_m", default_value="5.0"),
-            DeclareLaunchArgument("target_origin_z_offset_m", default_value="0.0"),
             DeclareLaunchArgument("fly_target_in_gazebo", default_value="false"),
             DeclareLaunchArgument("actual_distance_source", default_value="gazebo"),
             DeclareLaunchArgument("actual_distance_read_hz", default_value="15.0"),

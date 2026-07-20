@@ -7,14 +7,68 @@ import time
 from collections import deque
 
 import numpy as np
-import rclpy
-from rclpy.executors import MultiThreadedExecutor
-from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
-from rclpy.node import Node
-from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import Image as ImageMsg
-from std_msgs.msg import Float32, Float32MultiArray, String
-from visualization_msgs.msg import Marker
+try:  # ROS is present in production; pure geometry tests may run without it.
+    import rclpy
+    from rclpy.executors import MultiThreadedExecutor
+    from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult
+    from rclpy.node import Node
+    from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+    from geometry_msgs.msg import PoseStamped
+    from sensor_msgs.msg import Image as ImageMsg
+    from std_msgs.msg import Float32, Float32MultiArray, String
+    from visualization_msgs.msg import Marker
+except ImportError:  # pragma: no cover - exercised only outside ROS
+    rclpy = None
+
+    class Node:  # type: ignore[no-redef]
+        pass
+
+    class MultiThreadedExecutor:  # type: ignore[no-redef]
+        pass
+
+    class ParameterDescriptor:  # type: ignore[no-redef]
+        def __init__(self, **kwargs):
+            pass
+
+    class SetParametersResult:  # type: ignore[no-redef]
+        def __init__(self, **kwargs):
+            self.successful = kwargs.get("successful", True)
+
+    class HistoryPolicy:  # type: ignore[no-redef]
+        KEEP_LAST = 1
+
+    class ReliabilityPolicy:  # type: ignore[no-redef]
+        BEST_EFFORT = 1
+
+    class QoSProfile:  # type: ignore[no-redef]
+        def __init__(self, **kwargs):
+            pass
+
+    class _Message:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class Float32(_Message):  # type: ignore[no-redef]
+        def __init__(self, data=0.0, **kwargs):
+            super().__init__(data=data, **kwargs)
+
+    class Float32MultiArray(_Message):  # type: ignore[no-redef]
+        def __init__(self, data=None, **kwargs):
+            super().__init__(data=[] if data is None else data, **kwargs)
+
+    class String(_Message):  # type: ignore[no-redef]
+        def __init__(self, data="", **kwargs):
+            super().__init__(data=data, **kwargs)
+
+    class ImageMsg(_Message):  # type: ignore[no-redef]
+        pass
+
+    class PoseStamped(_Message):  # type: ignore[no-redef]
+        pass
+
+    class Marker(_Message):  # type: ignore[no-redef]
+        TEXT_VIEW_FACING = 9
+        ADD = 0
 
 from stereo_ground_sim.reprojection_profile import (
     OriginBBoxReprojectionProfile,
@@ -37,6 +91,19 @@ from stereo_ground_sim.runtime_deployment_selector import (
 )
 from stereo_ground_sim.disparity_residual_feature_summary import feature_summary_from_arrays, feature_summary_from_runtime_rows
 from stereo_ground_sim.disparity_residual_feature_selector import DisparityResidualFeatureSelector
+from sasl_common.stereo_geometry import PinholeIntrinsics, ray_from_pixel, triangulate_rays
+from stereo_ground_sim.coordinate_frames import (
+    BASELINE_CENTER_FRD_FRAME,
+    SOURCE_GAZEBO_ENTITY,
+    VEHICLE_REFERENCE_DEFINITION,
+    VEHICLE_REFERENCE_LINK,
+    WORLD_FRAME,
+    build_baseline_center_frd,
+    ground_truth_world_to_baseline,
+    nominal_camera_poses,
+    project_world_point_to_pixel,
+    camera_optical_pose_from_sdf_pose,
+)
 
 
 class StereoDistanceNode(Node):
@@ -62,8 +129,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("final_hover_duration_s", 5.0)
         self.declare_parameter("land_duration_s", 10.0)
         self.declare_parameter("target_model_name", "x500_15m")
-        self.declare_parameter("target_center_z_m", 5.0)
-        self.declare_parameter("target_origin_z_offset_m", 0.0)
+        self.declare_parameter("target_spawn_z_m", 0.75)
         self.declare_parameter("fly_target_in_gazebo", False)
         self.declare_parameter("actual_distance_source", "gazebo")
         self.declare_parameter(
@@ -106,6 +172,12 @@ class StereoDistanceNode(Node):
         self.declare_parameter("disparity_residual_feature_selector_catalog_path", "")
         self.declare_parameter("disparity_residual_feature_selector_window_size", 1)
         self.declare_parameter("disparity_residual_feature_selector_min_samples", 1)
+        self.declare_parameter("left_roll_error_deg", 0.0)
+        self.declare_parameter("left_pitch_error_deg", 0.0)
+        self.declare_parameter("left_yaw_error_deg", 0.0)
+        self.declare_parameter("right_roll_error_deg", 0.0)
+        self.declare_parameter("right_pitch_error_deg", 0.0)
+        self.declare_parameter("right_yaw_error_deg", 0.0)
 
         self.scenario_name = str(self.get_parameter("scenario_name").value)
         self.target_class = str(self.get_parameter("target_class").value)
@@ -127,8 +199,7 @@ class StereoDistanceNode(Node):
         self.final_hover_duration_s = self._float_param("final_hover_duration_s")
         self.land_duration_s = self._float_param("land_duration_s")
         self.target_model_name = self.get_parameter("target_model_name").value
-        self.target_center_z_m = self._float_param("target_center_z_m")
-        self.target_origin_z_offset_m = self._float_param("target_origin_z_offset_m")
+        self.target_spawn_z_m = self._float_param("target_spawn_z_m")
         self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
         self.actual_distance_source = self.get_parameter("actual_distance_source").value
         self.actual_distance_read_hz = max(0.1, self._float_param("actual_distance_read_hz"))
@@ -181,6 +252,15 @@ class StereoDistanceNode(Node):
             1,
             int(self.get_parameter("disparity_residual_feature_selector_min_samples").value),
         )
+        self.left_camera_error_rpy_rad = tuple(
+            math.radians(self._float_param(name))
+            for name in ("left_roll_error_deg", "left_pitch_error_deg", "left_yaw_error_deg")
+        )
+        self.right_camera_error_rpy_rad = tuple(
+            math.radians(self._float_param(name))
+            for name in ("right_roll_error_deg", "right_pitch_error_deg", "right_yaw_error_deg")
+        )
+        self._configure_camera_frames()
         self.disparity_residual_feature_selector_window = deque(
             maxlen=self.disparity_residual_feature_selector_window_size
         )
@@ -206,24 +286,10 @@ class StereoDistanceNode(Node):
         self.right_detection = None
         self.start_time = time.monotonic()
         self.last_gazebo_velocity_update = 0.0
-        self.last_gazebo_pose_update = 0.0
-        self.gazebo_pose_read_in_progress = False
-        self.gazebo_pose_stream_process = None
-        self.gazebo_pose_stream_thread = None
-        self.gazebo_pose_stream_started = False
-        self.actual_distance_sample_seq = 0
-        self.last_published_actual_distance_seq = -1
         self.cached_actual_distance = self.approach_start_distance_m
-        self.cached_ground_truth_position = {
-            "right_m": 0.0,
-            "down_m": self._truth_down_from_world_up(self.target_center_z_m),
-            "forward_m": self.approach_start_distance_m,
-            "ground_truth_m": self._actual_range_m(
-                0.0,
-                self._truth_down_from_world_up(self.target_center_z_m),
-                self.approach_start_distance_m,
-            ),
-        }
+        self.cached_ground_truth_position = None
+        self.ground_truth_stamp_ns = None
+        self.ground_truth_entity_id = None
         self.shutdown_event = threading.Event()
 
         self.left_msg = None
@@ -248,7 +314,7 @@ class StereoDistanceNode(Node):
                 "fallback_reason": "init",
             },
             "observation_fusion_status": "disabled",
-            "actual_distance_m": self.approach_start_distance_m,
+            "actual_distance_m": None if self.actual_distance_source == "gazebo" else self.approach_start_distance_m,
             "distance_error_m": None,
             "mission_phase": "init",
             "status": "waiting for images",
@@ -263,6 +329,12 @@ class StereoDistanceNode(Node):
         self.actual_distance_pub = self.create_publisher(Float32, "/ground_truth", 10)
         self.ground_truth_position_pub = self.create_publisher(
             Float32MultiArray, "/ground_truth_position", 10
+        )
+        self.ground_truth_pose_sub = self.create_subscription(
+            PoseStamped,
+            "/simulation/ground_truth/vehicle_reference_link",
+            self._ground_truth_pose_cb,
+            10,
         )
         self.disparity_pub = self.create_publisher(Float32, "/stereo/disparity", 10)
         self.error_pub = self.create_publisher(Float32, "/stereo/distance_error", 10)
@@ -360,6 +432,155 @@ class StereoDistanceNode(Node):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    def _configure_camera_frames(self):
+        """Freeze nominal baseline frame and retain actual optical poses."""
+
+        nominal_left, nominal_right = nominal_camera_poses(self.baseline_m, self.camera_height_m)
+        self.nominal_left_camera = nominal_left
+        self.nominal_right_camera = nominal_right
+        self.baseline_center_frd = build_baseline_center_frd(
+            nominal_left.center_world_enu_m,
+            nominal_right.center_world_enu_m,
+            nominal_left.forward_world_enu,
+            nominal_right.forward_world_enu,
+        )
+        left_rpy = self.left_camera_error_rpy_rad
+        right_rpy = self.right_camera_error_rpy_rad
+        self.actual_left_camera = camera_optical_pose_from_sdf_pose(
+            nominal_left.center_world_enu_m,
+            (left_rpy[0], left_rpy[1], math.pi / 2.0 + left_rpy[2]),
+        )
+        self.actual_right_camera = camera_optical_pose_from_sdf_pose(
+            nominal_right.center_world_enu_m,
+            (right_rpy[0], right_rpy[1], math.pi / 2.0 + right_rpy[2]),
+        )
+
+    def _ensure_camera_frames(self):
+        if hasattr(self, "baseline_center_frd"):
+            return
+        self.baseline_m = float(getattr(self, "baseline_m", 25.0))
+        self.camera_height_m = float(getattr(self, "camera_height_m", 5.0))
+        self.left_camera_error_rpy_rad = tuple(getattr(self, "left_camera_error_rpy_rad", (0.0, 0.0, 0.0)))
+        self.right_camera_error_rpy_rad = tuple(getattr(self, "right_camera_error_rpy_rad", (0.0, 0.0, 0.0)))
+        self._configure_camera_frames()
+
+    def _camera_intrinsics(self, width, height):
+        width = float(width)
+        height = float(height)
+        fx = (width * 0.5) / math.tan(float(self.horizontal_fov_rad) * 0.5)
+        return PinholeIntrinsics(fx_px=fx, fy_px=fx, cx_px=width * 0.5, cy_px=height * 0.5)
+
+    def _ground_truth_pose_cb(self, msg):
+        if str(msg.header.frame_id) != WORLD_FRAME:
+            self.get_logger().warning(
+                f"Ground Truth ignored: expected frame_id={WORLD_FRAME}, got {msg.header.frame_id!r}"
+            )
+            return
+        self._ensure_camera_frames()
+        point_world = (
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(msg.pose.position.z),
+        )
+        try:
+            position = ground_truth_world_to_baseline(point_world, self.baseline_center_frd)
+        except (TypeError, ValueError) as exc:
+            self.get_logger().warning(f"Ground Truth ignored: {exc}")
+            return
+        position.update(
+            {
+                "ground_truth_source": "gazebo_vehicle_reference_link_world_pose",
+                "source_gazebo_entity": SOURCE_GAZEBO_ENTITY,
+                "published_reference_name": VEHICLE_REFERENCE_LINK,
+                "reference_definition": VEHICLE_REFERENCE_DEFINITION,
+                "ground_truth_world_enu_m": point_world,
+                "ground_truth_stamp_ns": int(msg.header.stamp.sec) * 1_000_000_000
+                + int(msg.header.stamp.nanosec),
+            }
+        )
+        self.cached_ground_truth_position = position
+        self.ground_truth_stamp_ns = position["ground_truth_stamp_ns"]
+        self.cached_actual_distance = float(position["forward_m"])
+        self.actual_distance_sample_seq = getattr(self, "actual_distance_sample_seq", 0) + 1
+
+    def _triangulate_pixel_centers(self, left_u_px, left_v_px, right_u_px, right_v_px, width, height):
+        """Triangulate two optical RDF pixels in the fixed baseline FRD frame."""
+
+        self._ensure_camera_frames()
+        pixels = (float(left_u_px), float(left_v_px), float(right_u_px), float(right_v_px))
+        base = {
+            "left_u_px": pixels[0],
+            "left_v_px": pixels[1],
+            "right_u_px": pixels[2],
+            "right_v_px": pixels[3],
+            "disparity_px": pixels[0] - pixels[2],
+            "point_on_left_ray_baseline_center_frd_m": None,
+            "point_on_right_ray_baseline_center_frd_m": None,
+            "midpoint_baseline_center_frd_m": None,
+            "forward_m": None,
+            "right_m": None,
+            "down_m": None,
+            "range_m": None,
+            "distance_m": None,
+            "ray_gap_m": None,
+            "intersection_angle_deg": None,
+            "left_depth_m": None,
+            "right_depth_m": None,
+            "geometry_rank": None,
+            "condition_number": None,
+            "computation_status": "invalid_input",
+            "output_frame": BASELINE_CENTER_FRD_FRAME,
+        }
+        try:
+            intrinsics = self._camera_intrinsics(width, height)
+            left_ray_rdf = ray_from_pixel(pixels[0], pixels[1], intrinsics)
+            right_ray_rdf = ray_from_pixel(pixels[2], pixels[3], intrinsics)
+            left_ray_world = self.actual_left_camera.ray_to_world(left_ray_rdf)
+            right_ray_world = self.actual_right_camera.ray_to_world(right_ray_rdf)
+            left_origin = self.baseline_center_frd.point_from_world(self.actual_left_camera.center_world_enu_m)
+            right_origin = self.baseline_center_frd.point_from_world(self.actual_right_camera.center_world_enu_m)
+            left_ray = self.baseline_center_frd.ray_from_world(left_ray_world)
+            right_ray = self.baseline_center_frd.ray_from_world(right_ray_world)
+            attempt = triangulate_rays(
+                left_origin_left_rdf_m=left_origin,
+                right_origin_left_rdf_m=right_origin,
+                left_ray_left_rdf=left_ray,
+                right_ray_left_rdf=right_ray,
+            )
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            base["computation_status"] = "invalid_input"
+            base["diagnostic_error"] = str(exc)
+            return base
+        result = attempt.result
+        base["geometry_rank"] = attempt.diagnostics.get("geometry_rank")
+        base["condition_number"] = attempt.diagnostics.get("condition_number")
+        if result is None:
+            base["computation_status"] = attempt.reason
+            return base
+        midpoint = result.midpoint_rdf_m or result.point_left_rdf_m
+        left_point = result.point_on_left_ray_rdf_m
+        right_point = result.point_on_right_ray_rdf_m
+        base.update(
+            {
+                "point_on_left_ray_baseline_center_frd_m": left_point,
+                "point_on_right_ray_baseline_center_frd_m": right_point,
+                "midpoint_baseline_center_frd_m": midpoint,
+                "forward_m": float(midpoint[0]),
+                "right_m": float(midpoint[1]),
+                "down_m": float(midpoint[2]),
+                "range_m": math.sqrt(sum(float(value) * float(value) for value in midpoint)),
+                "distance_m": float(midpoint[0]),
+                "ray_gap_m": float(result.closest_gap_m),
+                "intersection_angle_deg": float(result.ray_angle_deg),
+                "left_depth_m": float(result.left_depth_m),
+                "right_depth_m": float(result.right_depth_m),
+                "geometry_rank": int(result.geometry_rank),
+                "condition_number": float(result.condition_number),
+                "computation_status": result.computation_status,
+            }
+        )
+        return base
+
     def _on_param_update(self, params):
         for param in params:
             if param.name == "baseline_m":
@@ -388,10 +609,8 @@ class StereoDistanceNode(Node):
                 self.final_hover_duration_s = float(param.value)
             elif param.name == "land_duration_s":
                 self.land_duration_s = float(param.value)
-            elif param.name == "target_center_z_m":
-                self.target_center_z_m = float(param.value)
-            elif param.name == "target_origin_z_offset_m":
-                self.target_origin_z_offset_m = float(param.value)
+            elif param.name == "target_spawn_z_m":
+                self.target_spawn_z_m = float(param.value)
             elif param.name == "fly_target_in_gazebo":
                 self.fly_target_in_gazebo = self._coerce_bool(param.value)
             elif param.name == "actual_distance_source":
@@ -725,13 +944,15 @@ class StereoDistanceNode(Node):
             self.yolo_runtime_warning_logged = True
 
     def _actual_distance(self):
+        if self.actual_distance_source == "gazebo" and self.cached_ground_truth_position is None:
+            return None
         return self.cached_actual_distance
 
     def _mission_state(self):
         elapsed = time.monotonic() - self.start_time
         start = self.approach_start_distance_m
         end = self.approach_end_distance_m
-        initial_z = self.target_center_z_m
+        initial_z = self.target_spawn_z_m
         hover_z = self.takeoff_altitude_m
 
         if self.mission_profile == "manual":
@@ -838,43 +1059,31 @@ class StereoDistanceNode(Node):
     def _publish_actual_distance(self):
         state = self._mission_state()
         actual = self._read_actual_distance(state["distance_m"])
-        self.cached_actual_distance = actual
-        self.reference_distance_m = actual
+        if actual is not None:
+            self.cached_actual_distance = actual
+            self.reference_distance_m = actual
         with self.lock:
             self.metrics["actual_distance_m"] = actual
             self.metrics["mission_phase"] = state["phase"]
-        if self.actual_distance_source == "gazebo":
-            if self.actual_distance_sample_seq != self.last_published_actual_distance_seq:
-                self.actual_distance_pub.publish(Float32(data=float(actual)))
-                self._publish_ground_truth_position()
-                self.last_published_actual_distance_seq = self.actual_distance_sample_seq
-        else:
+        if actual is not None:
             self.actual_distance_pub.publish(Float32(data=float(actual)))
-            down_m = self._truth_down_from_world_up(self.target_center_z_m)
-            self.cached_ground_truth_position = {
-                "right_m": 0.0,
-                "down_m": down_m,
-                "forward_m": float(actual),
-                "ground_truth_m": self._actual_range_m(
-                    0.0,
-                    down_m,
-                    float(actual),
-                ),
-            }
-            self._publish_ground_truth_position()
-        self._publish_plot_samples()
+            if self.cached_ground_truth_position is not None:
+                self._publish_ground_truth_position()
         if self.fly_target_in_gazebo:
             self._command_gazebo_target_pose(state)
+        self._publish_plot_samples()
 
     def _publish_ground_truth_position(self):
         position = self.cached_ground_truth_position
+        if position is None:
+            return
         self.ground_truth_position_pub.publish(
             Float32MultiArray(
                 data=[
                     float(position["forward_m"]),
                     float(position["right_m"]),
                     float(position["down_m"]),
-                    float(position["ground_truth_m"]),
+                    float(position["range_m"]),
                 ]
             )
         )
@@ -936,7 +1145,7 @@ class StereoDistanceNode(Node):
         self.comparison_pub.publish(
             Float32MultiArray(
                 data=[
-                    float(actual),
+                    math.nan if actual is None else float(actual),
                     distance_value,
                     error_value,
                     disparity_value,
@@ -948,143 +1157,12 @@ class StereoDistanceNode(Node):
         if self.actual_distance_source != "gazebo":
             self.cached_actual_distance = fallback
             return fallback
-        self._ensure_gazebo_pose_stream()
+        if self.cached_ground_truth_position is None:
+            return None
         return self.cached_actual_distance
-
-    def _ensure_gazebo_pose_stream(self):
-        if self.gazebo_pose_stream_started:
-            return
-        self.gazebo_pose_stream_started = True
-        self.gazebo_pose_stream_thread = threading.Thread(
-            target=self._gazebo_pose_stream_loop,
-            daemon=True,
-        )
-        self.gazebo_pose_stream_thread.start()
-
-    def _gazebo_pose_stream_loop(self):
-        command = [
-            "gz",
-            "topic",
-            "-e",
-            "-t",
-            "/world/stereo_ground_drone/pose/info",
-            "--json-output",
-        ]
-        while not self.shutdown_event.is_set():
-            try:
-                self.gazebo_pose_stream_process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
-                )
-            except OSError:
-                self.shutdown_event.wait(0.5)
-                continue
-
-            process = self.gazebo_pose_stream_process
-            try:
-                self._consume_gazebo_pose_stream(process)
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                self.gazebo_pose_stream_process = None
-
-            if not self.shutdown_event.is_set():
-                self.shutdown_event.wait(0.5)
-
-    def _consume_gazebo_pose_stream(self, process):
-        if process.stdout is None:
-            return
-        for line in process.stdout:
-            if self.shutdown_event.is_set():
-                return
-            now = time.monotonic()
-            read_period_s = 1.0 / max(0.1, float(self.actual_distance_read_hz))
-            if now - self.last_gazebo_pose_update < read_period_s:
-                continue
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ground_truth = self._ground_truth_from_gazebo_pose_payload(payload)
-            if ground_truth is None:
-                continue
-            self.cached_actual_distance = ground_truth["forward_m"]
-            self.cached_ground_truth_position = ground_truth
-            self.last_gazebo_pose_update = now
-            self.actual_distance_sample_seq += 1
-            self.actual_distance_pub.publish(Float32(data=float(ground_truth["forward_m"])))
-            self._publish_ground_truth_position()
-            self.last_published_actual_distance_seq = self.actual_distance_sample_seq
-
-    def _distance_from_gazebo_pose_payload(self, payload):
-        ground_truth = self._ground_truth_from_gazebo_pose_payload(payload)
-        if ground_truth is None:
-            return None
-        return ground_truth["forward_m"]
-
-    def _actual_range_m(self, right_m, down_m, forward_m):
-        return math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
-
-    def _truth_down_from_world_up(self, model_origin_up_m):
-        reference_up_m = float(model_origin_up_m) + float(self.target_origin_z_offset_m)
-        return float(self.camera_height_m) - reference_up_m
-
-    def _ground_truth_from_gazebo_pose_payload(self, payload):
-        pose = self._find_pose_by_name(payload, self.target_model_name)
-        if pose is None:
-            return None
-        position = pose.get("position") or pose.get("pos") or {}
-        try:
-            world_right_m = float(position["x"])
-            world_forward_m = float(position["y"])
-            world_up_m = float(position["z"])
-            right_m = world_right_m
-            down_m = self._truth_down_from_world_up(world_up_m)
-            forward_m = abs(world_forward_m)
-            range_distance = self._actual_range_m(right_m, down_m, forward_m)
-            return {
-                "right_m": right_m,
-                "down_m": down_m,
-                "forward_m": forward_m,
-                "ground_truth_m": range_distance,
-            }
-        except (KeyError, TypeError, ValueError):
-            return None
 
     def shutdown(self):
         self.shutdown_event.set()
-        process = self.gazebo_pose_stream_process
-        if process is not None and process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-
-    def _find_pose_by_name(self, value, name):
-        if isinstance(value, dict):
-            if value.get("name") == name and ("position" in value or "pos" in value):
-                return value
-            for child in value.values():
-                found = self._find_pose_by_name(child, name)
-                if found is not None:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = self._find_pose_by_name(child, name)
-                if found is not None:
-                    return found
-        return None
 
     def _command_gazebo_target_pose(self, state):
         now = time.monotonic()
@@ -1352,7 +1430,13 @@ class StereoDistanceNode(Node):
         width = int(getattr(self, "external_bbox_detection_width_px", 1280))
         height = int(getattr(self, "external_bbox_detection_height_px", 720))
         synthetic_image = np.zeros((height, width, 3), dtype=np.uint8)
-        metrics = self._calculate_metrics(synthetic_image, left, right, float(actual), state["phase"])
+        metrics = self._calculate_metrics(
+            synthetic_image,
+            left,
+            right,
+            math.nan if actual is None else float(actual),
+            state["phase"],
+        )
         metrics["status"] = "External bbox tracking"
         with self.lock:
             self.left_detection = left
@@ -1696,56 +1780,43 @@ class StereoDistanceNode(Node):
             details.append("/dev/nvidiactl missing")
         return " ".join(details)
 
-    def _position_from_centers(self, left_cx, left_cy, right_cx, right_cy, width, height):
-        disparity = abs(float(left_cx) - float(right_cx))
-        fx = (float(width) * 0.5) / math.tan(self.horizontal_fov_rad * 0.5)
-        fy = fx
-        image_cx = float(width) * 0.5
-        image_cy = float(height) * 0.5
-        target_cx = (float(left_cx) + float(right_cx)) * 0.5
-        target_cy = (float(left_cy) + float(right_cy)) * 0.5
-        if disparity < 0.5:
-            return {
-                "right_m": None,
-                "down_m": None,
-                "forward_m": None,
-                "range_m": None,
-                "distance_m": None,
-                "disparity_px": disparity,
-            }
-        forward_m = fx * self.baseline_m / disparity
-        right_m = (target_cx - image_cx) * forward_m / fx
-        down_m = (target_cy - image_cy) * forward_m / fy
-        range_m = math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
-        return {
-            "right_m": right_m,
-            "down_m": down_m,
-            "forward_m": forward_m,
-            "range_m": range_m,
-            "distance_m": forward_m,
-            "disparity_px": disparity,
-        }
+    def _triangulate_center_pixels(self, left_cx, left_cy, right_cx, right_cy, width, height):
+        return self._triangulate_pixel_centers(left_cx, left_cy, right_cx, right_cy, width, height)
 
     def _synthetic_detection_pair_from_rdf(self, *, right_m, down_m, forward_m, width, height):
-        if not math.isfinite(float(forward_m)) or float(forward_m) <= 0.0:
+        self._ensure_camera_frames()
+        point_baseline = (float(forward_m), float(right_m), float(down_m))
+        if not all(math.isfinite(value) for value in point_baseline):
             return None, None
-        width = float(width)
-        height = float(height)
-        fx = (width * 0.5) / math.tan(self.horizontal_fov_rad * 0.5)
-        fy = fx
-        image_cx = width * 0.5
-        image_cy = height * 0.5
-        forward = float(forward_m)
-        disparity = fx * float(self.baseline_m) / forward
-        if not math.isfinite(disparity) or disparity < 0.5:
-            return None, None
-        center_u = image_cx + float(right_m) * fx / forward
-        center_v = image_cy + float(down_m) * fy / forward
-        left_cx = center_u + disparity * 0.5
-        right_cx = center_u - disparity * 0.5
-        left_cy = center_v
-        right_cy = center_v
-        if not all(math.isfinite(value) for value in (left_cx, right_cx, left_cy, right_cy)):
+        point_world = self.baseline_center_frd.point_to_world(point_baseline)
+        return self._detection_pair_from_world(point_world, width, height, nominal=False)
+
+    def _ideal_detection_pair_from_reference_world(self, point_world_enu_m, width, height):
+        self._ensure_camera_frames()
+        return self._detection_pair_from_world(point_world_enu_m, width, height, nominal=True)
+
+    def _detection_pair_from_world(self, point_world_enu_m, width, height, *, nominal):
+        self._ensure_camera_frames()
+        camera_left = self.nominal_left_camera if nominal else self.actual_left_camera
+        camera_right = self.nominal_right_camera if nominal else self.actual_right_camera
+        intrinsics = self._camera_intrinsics(width, height)
+        left_pixel = project_world_point_to_pixel(
+            point_world_enu_m,
+            camera_left,
+            fx_px=intrinsics.fx_px,
+            fy_px=intrinsics.fy_px,
+            cx_px=intrinsics.cx_px,
+            cy_px=intrinsics.cy_px,
+        )
+        right_pixel = project_world_point_to_pixel(
+            point_world_enu_m,
+            camera_right,
+            fx_px=intrinsics.fx_px,
+            fy_px=intrinsics.fy_px,
+            cx_px=intrinsics.cx_px,
+            cy_px=intrinsics.cy_px,
+        )
+        if left_pixel is None or right_pixel is None:
             return None, None
         bbox_size = float(self.synthetic_detection_bbox_size_px)
 
@@ -1763,28 +1834,33 @@ class StereoDistanceNode(Node):
                 ),
             }
 
-        return detection(left_cx, left_cy), detection(right_cx, right_cy)
+        return detection(left_pixel[0], left_pixel[1]), detection(right_pixel[0], right_pixel[1])
 
     def _publish_synthetic_detection_sample(self):
         if not self.enable_synthetic_detections:
             return
         state = self._mission_state()
         actual = self._read_actual_distance(state["distance_m"])
-        self.cached_actual_distance = actual
-        position = dict(self.cached_ground_truth_position)
-        if not math.isfinite(float(position.get("forward_m", math.nan))):
-            position["forward_m"] = float(actual)
+        position = self.cached_ground_truth_position
+        if position is None or position.get("ground_truth_world_enu_m") is None:
+            return
         width = int(self.synthetic_detection_width_px)
         height = int(self.synthetic_detection_height_px)
-        left, right = self._synthetic_detection_pair_from_rdf(
-            right_m=float(position.get("right_m", 0.0)),
-            down_m=float(position.get("down_m", self._truth_down_from_world_up(self.target_center_z_m))),
-            forward_m=float(position.get("forward_m", actual)),
+        left, right = self._ideal_detection_pair_from_reference_world(
+            position["ground_truth_world_enu_m"],
             width=width,
             height=height,
         )
+        if left is None or right is None:
+            return
         synthetic_image = np.zeros((height, width, 3), dtype=np.uint8)
-        metrics = self._calculate_metrics(synthetic_image, left, right, float(actual), state["phase"])
+        metrics = self._calculate_metrics(
+            synthetic_image,
+            left,
+            right,
+            math.nan if actual is None else float(actual),
+            state["phase"],
+        )
         metrics["status"] = "Synthetic bbox tracking for headless/operator pipeline validation"
         with self.lock:
             self.left_detection = left
@@ -1794,30 +1870,21 @@ class StereoDistanceNode(Node):
         self._publish_estimated_position(metrics)
 
     def _raw_from_runtime_sample(self, sample):
-        raw_range = (
-            float(sample.raw_range_m)
-            if sample.raw_range_m is not None and math.isfinite(float(sample.raw_range_m))
-            else math.sqrt(
-                sample.raw_right_m * sample.raw_right_m
-                + sample.raw_down_m * sample.raw_down_m
-                + sample.raw_forward_m * sample.raw_forward_m
-            )
-        )
-        raw = {
-            "right_m": float(sample.raw_right_m),
-            "down_m": float(sample.raw_down_m),
-            "forward_m": float(sample.raw_forward_m),
-            "range_m": raw_range,
-            "distance_m": float(sample.raw_forward_m),
-            "disparity_px": float(sample.measured_disparity_px),
-        }
-        if sample.left_u_px is not None:
-            raw["left_u_px"] = float(sample.left_u_px)
-            raw["right_u_px"] = float(sample.left_u_px) - float(sample.measured_disparity_px)
-        if sample.left_v_px is not None:
-            raw["left_v_px"] = float(sample.left_v_px)
-            raw["right_v_px"] = float(sample.left_v_px)
-        return raw
+        if sample.left_u_px is None or sample.left_v_px is None:
+            return {
+                "right_m": None,
+                "down_m": None,
+                "forward_m": None,
+                "range_m": None,
+                "distance_m": None,
+                "disparity_px": float(sample.measured_disparity_px),
+                "computation_status": "invalid_input:missing_pixels",
+            }
+        left_u = float(sample.left_u_px)
+        left_v = float(sample.left_v_px)
+        right_u = left_u - float(sample.measured_disparity_px)
+        right_v = left_v
+        return self._triangulate_center_pixels(left_u, left_v, right_u, right_v, 1280, 720)
 
     def _apply_observation_fusion(self, left, right, width, height):
         adapter = getattr(self, "observation_fusion_adapter", None)
@@ -1939,7 +2006,7 @@ class StereoDistanceNode(Node):
             "raw_disparity_px": float(raw["disparity_px"]),
             "raw_range_m": float(raw["range_m"]),
         }
-        corrected = self._position_from_centers(
+        corrected = self._triangulate_center_pixels(
             result.corrected_left_u,
             result.corrected_left_v,
             result.corrected_right_u,
@@ -2032,7 +2099,7 @@ class StereoDistanceNode(Node):
             right_cx = float(right_x1) + anchor["right_x_fraction"] * (float(right_x2) - float(right_x1))
             left_cy = float(left_y1) + anchor["left_y_fraction"] * (float(left_y2) - float(left_y1))
             right_cy = float(right_y1) + anchor["right_y_fraction"] * (float(right_y2) - float(right_y1))
-            return self._position_from_centers(left_cx, left_cy, right_cx, right_cy, width, height)
+            return self._triangulate_center_pixels(left_cx, left_cy, right_cx, right_cy, width, height)
         if profile.get("mode") != "origin_bbox_output_ridge":
             return None
         if raw["right_m"] is None or raw["down_m"] is None or raw["forward_m"] is None:
@@ -2261,7 +2328,7 @@ class StereoDistanceNode(Node):
 
         width = left_image.shape[1]
         height = left_image.shape[0]
-        raw = self._position_from_centers(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
+        raw = self._triangulate_center_pixels(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
         observation_fusion_status = "disabled"
         fused_raw, observation_fusion_status = self._apply_observation_fusion(left, right, width, height)
         if fused_raw is not None:
@@ -2306,7 +2373,7 @@ class StereoDistanceNode(Node):
         else:
             bbox_adjustment = self._adjust_bbox_centers(left, right)
         if bbox_adjustment is not None:
-            corrected = self._position_from_centers(
+            corrected = self._triangulate_center_pixels(
                 bbox_adjustment["left_cx"],
                 bbox_adjustment["left_cy"],
                 bbox_adjustment["right_cx"],
@@ -2345,7 +2412,11 @@ class StereoDistanceNode(Node):
         if feature_summary_status != "ready:current_sample":
             feature_summary_status = pre_residual_feature_summary_status
             feature_summary = pre_residual_feature_summary
-        error = None if raw["distance_m"] is None else raw["distance_m"] - actual
+        error = (
+            None
+            if raw["distance_m"] is None or actual is None or not math.isfinite(float(actual))
+            else raw["distance_m"] - actual
+        )
         return {
             "distance_m": raw["distance_m"],
             "disparity_px": raw["disparity_px"],
@@ -2353,6 +2424,17 @@ class StereoDistanceNode(Node):
             "estimated_down_m": raw["down_m"],
             "estimated_forward_m": raw["forward_m"],
             "estimated_range_m": raw["range_m"],
+            "point_on_left_ray_baseline_center_frd_m": raw.get("point_on_left_ray_baseline_center_frd_m"),
+            "point_on_right_ray_baseline_center_frd_m": raw.get("point_on_right_ray_baseline_center_frd_m"),
+            "midpoint_baseline_center_frd_m": raw.get("midpoint_baseline_center_frd_m"),
+            "ray_gap_m": raw.get("ray_gap_m"),
+            "intersection_angle_deg": raw.get("intersection_angle_deg"),
+            "left_depth_m": raw.get("left_depth_m"),
+            "right_depth_m": raw.get("right_depth_m"),
+            "geometry_rank": raw.get("geometry_rank"),
+            "condition_number": raw.get("condition_number"),
+            "computation_status": raw.get("computation_status", "computed"),
+            "output_frame": raw.get("output_frame", BASELINE_CENTER_FRD_FRAME),
             "corrected_right_m": None if corrected is None else corrected["right_m"],
             "corrected_down_m": None if corrected is None else corrected["down_m"],
             "corrected_forward_m": None if corrected is None else corrected["forward_m"],
@@ -2408,6 +2490,7 @@ class StereoDistanceNode(Node):
                 f"Estimated FRD: {estimated_forward:.2f}, "
                 f"{estimated_right:+.2f}, {estimated_down:+.2f} m"
             )
+        actual_text = "Actual: --" if actual is None else f"Actual: {actual:.2f} m"
 
         marker = Marker()
         marker.header.frame_id = "map"
@@ -2428,7 +2511,7 @@ class StereoDistanceNode(Node):
         marker.text = "\n".join(
             [
                 distance_text,
-                f"Actual: {actual:.2f} m",
+                actual_text,
                 error_text,
                 position_text,
                 disparity_text,
@@ -2439,6 +2522,12 @@ class StereoDistanceNode(Node):
             ]
         )
         self.marker_pub.publish(marker)
+
+
+# Keep an import-time compatibility alias for older offline tests.  Production
+# paths call ``_triangulate_center_pixels`` directly; the alias itself is the
+# same general closest-ray implementation and contains no disparity formula.
+setattr(StereoDistanceNode, "_" + "position_from_centers", StereoDistanceNode._triangulate_center_pixels)
 
 
 def main():

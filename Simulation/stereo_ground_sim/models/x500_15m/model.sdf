@@ -212,6 +212,18 @@
         <update_rate>30</update_rate>
       </sensor>
     </link>
+    <!--
+      Semantic Ground Truth reference only.  This is an SDF frame, not a
+      mass-bearing link: source_gazebo_entity=base_link,
+      published_reference_name=vehicle_reference_link,
+      reference_definition=project_defined_vehicle_reference_at_base_link_origin,
+      reference_offset_parent_m=[0.0, 0.0, 0.0],
+      reference_offset_parent_rpy_rad=[0.0, 0.0, 0.0].
+      The adapter still reads base_link when SceneBroadcaster omits frames.
+    -->
+    <frame name="vehicle_reference_link" attached_to="base_link">
+      <pose>0 0 0 0 0 0</pose>
+    </frame>
     <link name="rotor_0">
       <gravity>false</gravity>
       <self_collide>false</self_collide>
