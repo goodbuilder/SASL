@@ -24,6 +24,7 @@ from stereo_ground_sim.gazebo_ground_truth_adapter import (
     PosePayloadError,
     PoseVState,
     parse_pose_v_payload,
+    pose_record_world_from_payload,
 )
 
 
@@ -76,13 +77,76 @@ def test_pose_v_parser_preserves_top_level_stamp_and_entity_identity() -> None:
     assert record.position_world_enu_m == (1.25, -2.5, 3.75)
 
 
-def test_pose_v_state_requires_name_and_id_and_records_reset() -> None:
+def test_pose_v_parser_accepts_gazebo_sparse_zero_scalar_json() -> None:
+    record = parse_pose_v_payload(
+        {
+            "header": {"stamp": {"nsec": 12_000_000}},
+            "pose": [
+                {
+                    "name": "base_link",
+                    "id": 17,
+                    "position": {"y": 2000.0},
+                    "orientation": {"z": -0.707106781, "w": 0.707106781},
+                }
+            ],
+        }
+    )
+    assert record.stamp_ns == 12_000_000
+    assert record.position_world_enu_m == (0.0, 2000.0, 0.0)
+    assert record.orientation_world_from_entity_xyzw == (0.0, 0.0, -0.707106781, 0.707106781)
+
+
+def test_pose_v_world_resolution_composes_scene_model_and_base_link() -> None:
+    payload = {
+        "header": {"stamp": {"sec": 2, "nsec": 3}},
+        "pose": [
+            {
+                "name": "x500_15m",
+                "id": 16,
+                "position": {"y": 2000.0, "z": 0.75},
+                "orientation": {"z": -0.707106781, "w": 0.707106781},
+            },
+            {
+                "name": "base_link",
+                "id": 17,
+                "position": {},
+                "orientation": {"w": 1.0},
+            },
+        ],
+    }
+    record = parse_pose_v_payload(payload)
+    world = pose_record_world_from_payload(payload, record)
+    assert world.entity_name == "base_link"
+    assert world.entity_id == 17
+    assert world.position_world_enu_m == pytest.approx((0.0, 2000.0, 0.75), abs=1.0e-9)
+    assert world.orientation_world_from_entity_xyzw == pytest.approx(
+        (0.0, 0.0, -0.707106781, 0.707106781), abs=1.0e-9
+    )
+
+
+def test_pose_v_world_resolution_does_not_fallback_without_parent_model() -> None:
+    payload = _payload(3, 0)
+    record = parse_pose_v_payload(payload)
+    with pytest.raises(PosePayloadError, match="parent model"):
+        pose_record_world_from_payload(payload, record)
+
+
+def test_pose_v_state_relocks_id_only_after_stamp_reset() -> None:
     state = PoseVState()
     assert state.consume(_payload(5, 0)) is not None
-    assert state.consume(_payload(4, 999)) is not None
+    assert state.consume(_payload(5, 999, entity_id=18)) is None
+    assert state.entity_id == 17
+    assert state.consume(_payload(4, 999, entity_id=18)) is not None
     assert state.reset_count == 1
-    assert state.consume(_payload(5, 0, entity_id=18)) is None
-    assert "changed" in state.unavailable_reason
+    assert state.entity_id == 18
+    assert state.consume(_payload(5, 0, entity_id=18)) is not None
+
+
+def test_pose_v_state_reset_with_same_id_is_accepted() -> None:
+    state = PoseVState()
+    assert state.consume(_payload(8, 0, entity_id=17)) is not None
+    assert state.consume(_payload(7, 0, entity_id=17)) is not None
+    assert state.reset_count == 1
 
 
 def test_duplicate_authoritative_name_is_unavailable() -> None:

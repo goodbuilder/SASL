@@ -4,11 +4,18 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
+
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from sasl_common.stereo_geometry import triangulate_rays
+from sasl_common.stereo_geometry import (
+    BASELINE_CENTER_FRD_AXIS_CONTRACT,
+    BASELINE_CENTER_FRD_FRAME,
+    BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    triangulate_rays,
+)
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
 
 
@@ -27,6 +34,7 @@ def test_known_point_and_skew_ray_midpoint() -> None:
         right_origin_left_rdf_m=right_origin,
         left_ray_left_rdf=unit(left_origin),
         right_ray_left_rdf=unit(right_origin),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     ).result
     assert result is not None
     assert max(abs(a - b) for a, b in zip(result.midpoint_rdf_m, target)) < 1.0e-9
@@ -40,15 +48,80 @@ def test_camera_swap_preserves_midpoint() -> None:
         right_origin_left_rdf_m=(2.0, 0.0, 0.0),
         left_ray_left_rdf=(0.2, 0.0, 1.0),
         right_ray_left_rdf=(-0.2, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     ).result
     second = triangulate_rays(
         left_origin_left_rdf_m=(2.0, 0.0, 0.0),
         right_origin_left_rdf_m=(0.0, 0.0, 0.0),
         left_ray_left_rdf=(-0.2, 0.0, 1.0),
         right_ray_left_rdf=(0.2, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     ).result
     assert first is not None and second is not None
     assert max(abs(a - b) for a, b in zip(first.midpoint_rdf_m, second.midpoint_rdf_m)) < 1.0e-9
+
+
+def test_real_skew_rays_return_known_closest_points_and_swap_invariant() -> None:
+    first = triangulate_rays(
+        left_origin_left_rdf_m=(0.0, 0.0, 0.0),
+        right_origin_left_rdf_m=(2.0, -3.0, 1.0),
+        left_ray_left_rdf=(1.0, 0.0, 0.0),
+        right_ray_left_rdf=(0.0, 1.0, 0.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
+        axis_contract=BASELINE_CENTER_FRD_AXIS_CONTRACT,
+        vector_contract=BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    )
+    second = triangulate_rays(
+        left_origin_left_rdf_m=(2.0, -3.0, 1.0),
+        right_origin_left_rdf_m=(0.0, 0.0, 0.0),
+        left_ray_left_rdf=(0.0, 1.0, 0.0),
+        right_ray_left_rdf=(1.0, 0.0, 0.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
+        axis_contract=BASELINE_CENTER_FRD_AXIS_CONTRACT,
+        vector_contract=BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    )
+    assert first.result is not None and second.result is not None
+    assert first.result.point_on_left_ray_m == pytest.approx((2.0, 0.0, 0.0), abs=1.0e-9)
+    assert first.result.point_on_right_ray_m == pytest.approx((2.0, 0.0, 1.0), abs=1.0e-9)
+    assert first.result.midpoint_m == pytest.approx((2.0, 0.0, 0.5), abs=1.0e-9)
+    assert first.result.closest_gap_m == pytest.approx(1.0, abs=1.0e-9)
+    assert first.result.left_depth_m == pytest.approx(2.0, abs=1.0e-9)
+    assert first.result.right_depth_m == pytest.approx(3.0, abs=1.0e-9)
+    assert second.result.midpoint_m == pytest.approx(first.result.midpoint_m, abs=1.0e-9)
+    assert first.result.point_frame == BASELINE_CENTER_FRD_FRAME
+    assert first.result.output_frame == BASELINE_CENTER_FRD_FRAME
+
+
+@pytest.mark.parametrize("angle_rad", (1.0e-7, 1.0e-8, 1.0e-9, 1.0e-12))
+def test_near_parallel_rays_are_stable_and_report_conditioning(angle_rad: float) -> None:
+    attempt = triangulate_rays(
+        right_origin_left_rdf_m=(1.0, 0.0, 0.0),
+        left_ray_left_rdf=(0.0, 0.0, 1.0),
+        right_ray_left_rdf=(math.sin(angle_rad), 0.0, math.cos(angle_rad)),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
+    )
+    assert attempt.reason in ("ok", "invalid_solution", "rank_deficient")
+    assert "condition_number" in attempt.diagnostics
+    if attempt.result is not None:
+        assert attempt.result.computation_status == "computed"
+        assert math.isfinite(attempt.result.condition_number)
+
+
+def test_nonfinite_and_zero_ray_fail_without_exceptions() -> None:
+    nonfinite = triangulate_rays(
+        right_origin_left_rdf_m=(1.0, 0.0, 0.0),
+        left_ray_left_rdf=(0.0, 0.0, 1.0),
+        right_ray_left_rdf=(float("nan"), 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
+    )
+    zero = triangulate_rays(
+        right_origin_left_rdf_m=(1.0, 0.0, 0.0),
+        left_ray_left_rdf=(0.0, 0.0, 0.0),
+        right_ray_left_rdf=(0.0, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
+    )
+    assert nonfinite.result is None and nonfinite.reason == "invalid_input"
+    assert zero.result is None and zero.reason == "invalid_input"
 
 
 def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -> None:
@@ -56,18 +129,21 @@ def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -
         right_origin_left_rdf_m=(0.0, 0.0, 0.0),
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(0.0, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     )
     assert zero.result is None and zero.reason == "zero_baseline"
     parallel = triangulate_rays(
         right_origin_left_rdf_m=(1.0, 0.0, 0.0),
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(0.0, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     )
     assert parallel.result is None and parallel.reason == "rank_deficient"
     near = triangulate_rays(
         right_origin_left_rdf_m=(1.0, 0.0, 0.0),
         left_ray_left_rdf=(0.0, 0.0, 1.0),
         right_ray_left_rdf=(1.0e-7, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     )
     assert near.result is not None
     assert near.result.computation_status == "computed"
@@ -76,6 +152,7 @@ def test_status_policy_for_invalid_parallel_near_parallel_and_negative_depth() -
         right_origin_left_rdf_m=(0.3, 0.0, 0.0),
         left_ray_left_rdf=(-0.1, 0.0, 1.0),
         right_ray_left_rdf=(0.1, 0.0, 1.0),
+        common_frame=BASELINE_CENTER_FRD_FRAME,
     )
     assert negative.result is not None
     assert negative.result.left_depth_m < 0.0

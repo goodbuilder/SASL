@@ -17,7 +17,6 @@ export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/install/stereo_ground_sim/share/stereo_gr
 RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
 DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-20.0}"
 DEFAULT_PLOT_HZ="${DEFAULT_PLOT_HZ:-30.0}"
-DEFAULT_ACTUAL_DISTANCE_HZ="${DEFAULT_ACTUAL_DISTANCE_HZ:-15.0}"
 DEFAULT_PLOT_WINDOW_S="${DEFAULT_PLOT_WINDOW_S:-30.0}"
 DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH="${DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH:-$ROOT_DIR/../ref/Stereo_Camera_3D_Position_DKL/Cent_Bbox_Adj_Mtrx.csv}"
 PX4_DIR="${PX4_DIR:-}"
@@ -351,7 +350,6 @@ Options:
   --no-disparity-residual-feature-selector
                          Disable node-side residual feature selection.
   --plot-hz VALUE        Distance graph topic publish rate in Hz. Default: 30.0.
-  --actual-hz VALUE      Gazebo actual-distance pose read rate in Hz. Default: 15.0.
   --plot-window S        Visible rqt_plot X-axis window in seconds. Default: 30.0.
   --detection-view       Show YOLO overlay image topics. This is the default.
   --raw-view             Show raw camera topics instead of YOLO overlay topics.
@@ -565,10 +563,6 @@ while (($#)); do
       ;;
     --plot-hz)
       launch_input+=("plot_publish_hz:=${2:?missing value for --plot-hz}")
-      shift 2
-      ;;
-    --actual-hz)
-      launch_input+=("actual_distance_read_hz:=${2:?missing value for --actual-hz}")
       shift 2
       ;;
     --plot-window)
@@ -885,7 +879,6 @@ if [[ -x "$DEFAULT_YOLO_PYTHON" ]]; then
   add_default_launch_arg yolo_python "$DEFAULT_YOLO_PYTHON" "${launch_input[@]}"
 fi
 add_default_launch_arg plot_publish_hz "$DEFAULT_PLOT_HZ" "${launch_input[@]}"
-add_default_launch_arg actual_distance_read_hz "$DEFAULT_ACTUAL_DISTANCE_HZ" "${launch_input[@]}"
 	add_default_launch_arg enable_bbox_center_adjustment "${BBOX_CENTER_ADJUSTMENT_ENABLE:-false}" "${launch_input[@]}"
   add_default_launch_arg bbox_center_adjustment_path "${BBOX_CENTER_ADJUSTMENT_PATH:-$DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH}" "${launch_input[@]}"
 	add_default_launch_arg enable_observation_fusion "${OBSERVATION_FUSION_ENABLE:-false}" "${launch_input[@]}"

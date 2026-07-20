@@ -78,6 +78,13 @@ PX4 local position은 `north/east/down` 순서의 NED이고, Gazebo world/model 
 `base_link`, parent-relative translation은 `[0, 0, 0] m`, rotation은
 identity이다. 이 frame은 mass-bearing link가 아니다.
 
+현재 SceneBroadcaster의 `Pose_V` JSON에서는 root `base_link` pose가 모델
+relative로 생략될 수 있으므로, adapter는 같은 payload의 `x500_15m` model
+world pose와 `base_link` relative pose를 compose해 world ENU로 만든다. 이
+parent transform은 world 표현을 위한 것이며 semantic reference를 model
+origin으로 대체하는 fallback이 아니다. parent model pose가 payload에
+없으면 해당 Ground Truth sample은 unavailable로 남긴다.
+
 nominal zero-error 좌우 optical pose에서 한 번 만든
 `baseline_center_frd`가 고정 출력 frame이다. World ENU point는
 `p_B = R_B_W @ (p_W - O_W)`로 변환하며, `R_B_W`의 행은 Forward, Right,
@@ -89,6 +96,14 @@ midpoint를 저장한다. 결과에는 각 ray 점, midpoint, Forward/Right/Down
 ray gap, 교차각, signed depths, geometry rank, conditioning metric,
 `computation_status`가 포함된다. PX4 Local/Global/GPS/Odometry는 이 절대
 Ground Truth의 보조 정보일 뿐이다.
+
+Rendered/ideal observation pixel은 actual optical pose에서 투영하고,
+canonical Raw는 nominal zero-error optical pose로 같은 pixel을 해석한다.
+공통 kernel을 호출할 때는 `common_frame=baseline_center_frd`와
+`axis_contract=forward_right_down`를 명시한다. 한 run의 baseline, camera
+height, FOV, 좌우 roll/pitch/yaw는 geometry를 정의하므로 실행 중 parameter
+변경을 거부하고 launch restart로만 바꿀 수 있다. Observation fusion 결과는
+legacy/corrected 후보로 보존되며 canonical Raw를 덮어쓰지 않는다.
 
 S1에서 timestamp pairing, Ground Truth interpolation, common/relative yaw,
 attitude-corrected 결과, PX4-only 이동 정리, post-hoc correction 삭제,
@@ -5406,12 +5421,11 @@ raw RDF ray scale을 보정합니다. 세 profile 모두 보정 비행 truth로 
 ./run_operator_view.sh --params
 ```
 
-거리 계산 주기를 높이고 싶으면 `--yolo-hz` 또는 launch 인자 `yolo_target_hz`를 조정합니다. 이 값은 화면 표시 Hz가 아니라 YOLO 추론 Hz입니다. 그래프 토픽 발행 Hz는 `--plot-hz` 또는 `plot_publish_hz`로 조정합니다. Ground Truth 원본 시각은 Gazebo `Pose_V` adapter가 보존하며, `actual_distance_read_hz`는 이 authoritative simulation timestamp를 대체하지 않습니다.
+거리 계산 주기를 높이고 싶으면 `--yolo-hz` 또는 launch 인자 `yolo_target_hz`를 조정합니다. 이 값은 화면 표시 Hz가 아니라 YOLO 추론 Hz입니다. 그래프 토픽 발행 Hz는 `--plot-hz` 또는 `plot_publish_hz`로 조정합니다. Ground Truth 원본 시각은 Gazebo `Pose_V` adapter가 보존합니다.
 
 ```bash
 ./run_operator_view.sh yolo_target_hz:=40.0
 ./run_operator_view.sh --plot-hz 30
-./run_operator_view.sh --actual-hz 15
 ./run_operator_view.sh --plot-window 30
 ```
 
@@ -5469,7 +5483,7 @@ Gazebo, rqt, PX4 실행 후 자동 이륙-접근-착륙까지 한 번에 시작�
 venv를 별도로 activate하지 않아도 `pymavlink`를 찾는다. 다른 Python을 써야
 할 때만 `MISSION_PYTHON=/path/to/python ./run_auto_mission.sh`처럼 지정한다.
 
-기본 동작은 `config/drone_mission.env` 기준으로 이륙, 호버, PX4 local `north` 음수 방향 접근, `/ground_truth`가 목표 거리 이하가 되면 호버, 착륙입니다. 현재 월드에서는 이 축이 Gazebo Y 거리를 줄이는 카메라 방향 접근입니다. `/ground_truth`를 읽지 못하면 fallback으로 `DRONE_MOVE_DISTANCE_M` local displacement까지 이동합니다. PX4 기본 `MPC_XY_CRUISE`/`MPC_XY_VEL_MAX` 제한 때문에 명령 속도보다 실제 접근 속도가 낮을 수 있습니다. 한 번만 목표 거리나 속도를 바꾸려면:
+기본 동작은 `config/drone_mission.env` 기준으로 이륙, 호버, PX4 local `north` 음수 방향 접근, Gazebo Ground Truth가 목표 거리 이하가 되면 호버, 착륙입니다. 현재 월드에서는 이 축이 Gazebo Y 거리를 줄이는 카메라 방향 접근입니다. Ground Truth가 unavailable인 경우에도 임무 명령은 `DRONE_MOVE_DISTANCE_M` local displacement를 상한으로 계속할 수 있지만, 그 계획값은 `/ground_truth`, actual distance, distance error에 절대 사용하지 않습니다. PX4 기본 `MPC_XY_CRUISE`/`MPC_XY_VEL_MAX` 제한 때문에 명령 속도보다 실제 접근 속도가 낮을 수 있습니다. 한 번만 목표 거리나 속도를 바꾸려면:
 
 ```bash
 ./run_auto_mission.sh --target-distance-m 200 --altitude-m 10 --speed-mps 15
@@ -5606,7 +5620,6 @@ ros2 param get /stereo_distance_node approach_duration_s
 ros2 param get /stereo_distance_node mission_profile
 ros2 param get /stereo_distance_node takeoff_altitude_m
 ros2 param get /stereo_distance_node fly_target_in_gazebo
-ros2 param get /stereo_distance_node actual_distance_source
 ros2 param get /stereo_distance_node yolo_model_path
 ros2 param get /stereo_distance_node yolo_class_name
 ros2 param get /stereo_distance_node yolo_confidence
@@ -5780,8 +5793,6 @@ target_spawn_z_m
 target_spawn_yaw_deg
 mission_profile
 fly_target_in_gazebo
-actual_distance_source
-actual_distance_read_hz
 gz_gui
 launch_rviz
 takeoff_altitude_m

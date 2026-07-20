@@ -61,8 +61,8 @@ def stamp_ns_from_header(header: Any) -> int:
     if not isinstance(stamp, dict):
         raise PosePayloadError("Pose_V header.stamp is missing")
     try:
-        sec = int(stamp.get("sec", stamp.get("seconds")))
-        nsec = int(stamp.get("nsec", stamp.get("nanosec", stamp.get("nanoseconds"))))
+        sec = int(stamp.get("sec", stamp.get("seconds", 0)))
+        nsec = int(stamp.get("nsec", stamp.get("nanosec", stamp.get("nanoseconds", 0))))
     except (TypeError, ValueError):
         raise PosePayloadError("Pose_V header.stamp sec/nsec is invalid") from None
     if nsec < 0 or nsec >= 1_000_000_000:
@@ -82,7 +82,8 @@ def _iter_dicts(value: Any) -> Iterable[dict[str, Any]]:
 
 def _number(mapping: dict[str, Any], key: str) -> float:
     try:
-        value = float(mapping[key])
+        # Gazebo protobuf JSON omits scalar fields whose value is zero.
+        value = float(mapping.get(key, 0.0))
     except (KeyError, TypeError, ValueError):
         raise PosePayloadError(f"pose field {key} is invalid") from None
     if not math.isfinite(value):
@@ -120,6 +121,97 @@ def _pose_record_from_mapping(mapping: dict[str, Any], stamp_ns: int) -> PoseRec
     )
 
 
+def _named_pose_mappings(payload: dict[str, Any], entity_name: str) -> list[dict[str, Any]]:
+    mappings = []
+    for mapping in _iter_dicts(payload):
+        if mapping.get("name") != entity_name:
+            continue
+        if "position" not in mapping and "pos" not in mapping:
+            continue
+        mappings.append(mapping)
+    return mappings
+
+
+def _quaternion_normalize(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+    norm = math.sqrt(sum(float(value) * float(value) for value in quaternion))
+    if not math.isfinite(norm) or norm <= 0.0:
+        raise PosePayloadError("pose orientation quaternion is invalid")
+    return tuple(float(value) / norm for value in quaternion)  # type: ignore[return-value]
+
+
+def _quaternion_multiply(
+    parent_xyzw: tuple[float, float, float, float],
+    child_xyzw: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    px, py, pz, pw = parent_xyzw
+    cx, cy, cz, cw = child_xyzw
+    return (
+        pw * cx + px * cw + py * cz - pz * cy,
+        pw * cy - px * cz + py * cw + pz * cx,
+        pw * cz + px * cy - py * cx + pz * cw,
+        pw * cw - px * cx - py * cy - pz * cz,
+    )
+
+
+def _rotate_vector_by_quaternion(
+    quaternion_xyzw: tuple[float, float, float, float],
+    vector: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    qx, qy, qz, qw = quaternion_xyzw
+    vx, vy, vz = vector
+    tx = 2.0 * (qy * vz - qz * vy)
+    ty = 2.0 * (qz * vx - qx * vz)
+    tz = 2.0 * (qx * vy - qy * vx)
+    return (
+        vx + qw * tx + qy * tz - qz * ty,
+        vy + qw * ty + qz * tx - qx * tz,
+        vz + qw * tz + qx * ty - qy * tx,
+    )
+
+
+def pose_record_world_from_payload(
+    payload: dict[str, Any],
+    record: PoseRecord,
+    *,
+    parent_model_name: str = "x500_15m",
+) -> PoseRecord:
+    """Resolve a base-link record against its matching model world pose.
+
+    Gazebo's current SceneBroadcaster emits the model pose in world ENU while
+    the root ``base_link`` pose is relative to that model.  The matching
+    model record is therefore required to publish an absolute world pose.
+    """
+
+    model_mappings = _named_pose_mappings(payload, parent_model_name)
+    if not model_mappings:
+        raise PosePayloadError(
+            f"parent model {parent_model_name!r} is unavailable for world pose resolution"
+        )
+    if len(model_mappings) != 1:
+        raise PosePayloadError(
+            f"parent model {parent_model_name!r} has duplicate name/id entries"
+        )
+    model_record = _pose_record_from_mapping(model_mappings[0], record.stamp_ns)
+    model_quaternion = _quaternion_normalize(model_record.orientation_world_from_entity_xyzw)
+    link_quaternion = _quaternion_normalize(record.orientation_world_from_entity_xyzw)
+    rotated_link_position = _rotate_vector_by_quaternion(
+        model_quaternion,
+        record.position_world_enu_m,
+    )
+    world_orientation = _quaternion_normalize(_quaternion_multiply(model_quaternion, link_quaternion))
+    world_position = tuple(
+        float(model_record.position_world_enu_m[index]) + float(rotated_link_position[index])
+        for index in range(3)
+    )
+    return PoseRecord(
+        stamp_ns=record.stamp_ns,
+        entity_name=record.entity_name,
+        entity_id=record.entity_id,
+        position_world_enu_m=world_position,  # type: ignore[arg-type]
+        orientation_world_from_entity_xyzw=world_orientation,
+    )
+
+
 def parse_pose_v_payload(
     payload: dict[str, Any],
     *,
@@ -131,13 +223,7 @@ def parse_pose_v_payload(
     if not isinstance(payload, dict):
         raise PosePayloadError("Pose_V payload is not an object")
     stamp_ns = stamp_ns_from_header(payload.get("header"))
-    mappings = []
-    for mapping in _iter_dicts(payload):
-        if mapping.get("name") != entity_name:
-            continue
-        if "position" not in mapping and "pos" not in mapping:
-            continue
-        mappings.append(mapping)
+    mappings = _named_pose_mappings(payload, entity_name)
     if not mappings:
         raise PosePayloadError(f"authoritative entity {entity_name!r} is unavailable")
     if len(mappings) != 1:
@@ -165,15 +251,21 @@ class PoseVState:
             record = parse_pose_v_payload(
                 payload,
                 entity_name=self.entity_name,
-                expected_entity_id=self.entity_id,
             )
         except PosePayloadError as exc:
             self.unavailable_reason = str(exc)
             return None
-        if self.entity_id is None:
-            self.entity_id = record.entity_id
-        if self.last_stamp_ns is not None and record.stamp_ns < self.last_stamp_ns:
+        is_reset = self.last_stamp_ns is not None and record.stamp_ns < self.last_stamp_ns
+        if is_reset:
             self.reset_count += 1
+            self.entity_id = record.entity_id
+        elif self.entity_id is None:
+            self.entity_id = record.entity_id
+        elif record.entity_id != self.entity_id:
+            self.unavailable_reason = (
+                f"authoritative entity id changed from {self.entity_id} to {record.entity_id}"
+            )
+            return None
         self.last_stamp_ns = record.stamp_ns
         self.unavailable_reason = ""
         return record
@@ -211,6 +303,7 @@ class GazeboGroundTruthAdapter:
         topic: str = POSE_TOPIC,
         output_topic: str = OUTPUT_TOPIC,
         command: tuple[str, ...] | None = None,
+        parent_model_name: str = "x500_15m",
     ) -> None:
         try:
             import rclpy
@@ -226,6 +319,7 @@ class GazeboGroundTruthAdapter:
         self._node = _Node("gazebo_ground_truth_adapter")
         self._publisher = self._node.create_publisher(PoseStamped, output_topic, 10)
         self._topic = str(topic)
+        self._parent_model_name = str(parent_model_name)
         self._command = (
             tuple(command)
             if command is not None
@@ -239,6 +333,7 @@ class GazeboGroundTruthAdapter:
         self._node.get_logger().info(
             "Gazebo Ground Truth adapter: "
             f"source_gazebo_entity={SOURCE_GAZEBO_ENTITY}, "
+            f"parent_model_name={self._parent_model_name}, "
             f"published_reference_name={VEHICLE_REFERENCE_LINK}, "
             f"reference_definition={VEHICLE_REFERENCE_DEFINITION}, "
             f"reference_offset_parent_m={REFERENCE_OFFSET_PARENT_M}, "
@@ -284,6 +379,17 @@ class GazeboGroundTruthAdapter:
                         if record is None:
                             self._node.get_logger().warning(
                                 f"Ground Truth unavailable: {self._state.unavailable_reason}"
+                            )
+                            continue
+                        try:
+                            record = pose_record_world_from_payload(
+                                payload,
+                                record,
+                                parent_model_name=self._parent_model_name,
+                            )
+                        except PosePayloadError as exc:
+                            self._node.get_logger().warning(
+                                f"Ground Truth unavailable: {exc}"
                             )
                             continue
                         if self._state.reset_count > reset_count:
@@ -356,6 +462,7 @@ __all__ = [
     "GazeboGroundTruthAdapter",
     "main",
     "parse_pose_v_payload",
+    "pose_record_world_from_payload",
     "pose_record_to_ros_message",
     "stamp_ns_from_header",
 ]

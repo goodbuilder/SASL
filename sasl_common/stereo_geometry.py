@@ -13,6 +13,9 @@ LEFT_CAMERA_RDF_FRAME = "left_camera_rdf"
 LEFT_CAMERA_RDF_AXIS_CONTRACT = "left_camera_rdf:right_down_forward"
 LEFT_CAMERA_RDF_VECTOR_CONTRACT = "left_camera_rdf:[right,down,forward,range]"
 LEFT_CAMERA_FRD_AXIS_CONTRACT = "left_camera_frd:forward_right_down"
+BASELINE_CENTER_FRD_FRAME = "baseline_center_frd"
+BASELINE_CENTER_FRD_AXIS_CONTRACT = "baseline_center_frd:forward_right_down"
+BASELINE_CENTER_FRD_VECTOR_CONTRACT = "baseline_center_frd:[forward,right,down,range]"
 TRIANGULATION_METHOD = "two_ray_closest_midpoint"
 
 IDENTITY_ROTATION: Matrix3 = (
@@ -52,9 +55,9 @@ class RayTriangulationResult:
     in the supplied common frame; callers that need a different origin should
     transform the point before invoking this kernel.
     Both camera origins and rays are expressed in the same common frame before
-    this result is constructed.  The legacy ``point_left_rdf_m`` field remains
-    as an alias-compatible midpoint field for callers that use a left-camera
-    RDF frame.
+    this result is constructed.  The ``*_rdf_m`` fields are retained for
+    compatibility with the original left-camera RDF API; their actual frame is
+    always given by ``point_frame``/``output_frame``.
     """
 
     point_left_rdf_m: Vector3
@@ -78,9 +81,27 @@ class RayTriangulationResult:
 
     @property
     def point_left_m(self) -> Vector3:
-        """Compatibility alias with an explicit left-camera RDF contract."""
+        """Legacy midpoint alias; inspect ``point_frame`` for the real frame."""
 
         return self.point_left_rdf_m
+
+    @property
+    def point_on_left_ray_m(self) -> Vector3 | None:
+        """Frame-neutral left-ray point in ``point_frame``."""
+
+        return self.point_on_left_ray_rdf_m
+
+    @property
+    def point_on_right_ray_m(self) -> Vector3 | None:
+        """Frame-neutral right-ray point in ``point_frame``."""
+
+        return self.point_on_right_ray_rdf_m
+
+    @property
+    def midpoint_m(self) -> Vector3 | None:
+        """Frame-neutral midpoint in ``output_frame``."""
+
+        return self.midpoint_rdf_m
 
     @property
     def distance_m(self) -> float:
@@ -185,13 +206,22 @@ def triangulate_rays(
     right_ray_left_rdf: Sequence[float],
     left_origin_left_rdf_m: Sequence[float] = (0.0, 0.0, 0.0),
     parallel_epsilon: float = 1.0e-15,
+    common_frame: str | None = None,
+    axis_contract: str = LEFT_CAMERA_RDF_AXIS_CONTRACT,
+    vector_contract: str = LEFT_CAMERA_RDF_VECTOR_CONTRACT,
 ) -> RayTriangulationAttempt:
     """Find the closest-ray midpoint in the supplied common frame.
 
     The default left optical center is ``(0, 0, 0)`` for compatibility.  A
     non-zero left origin is accepted for fixed world/rig frames; no baseline
-    center translation or FRD axis reorder is performed here.
+    center translation or FRD axis reorder is performed here.  Omitting
+    ``common_frame`` retains the legacy StereoDistance invalid-geometry
+    policy; Simulation passes ``baseline_center_frd`` explicitly and receives
+    the current rank/signed-depth policy.
     """
+
+    legacy_left_camera_defaults = common_frame is None
+    resolved_common_frame = LEFT_CAMERA_RDF_FRAME if common_frame is None else str(common_frame)
 
     try:
         left_origin = _vector3(left_origin_left_rdf_m, name="left_origin_left_rdf_m")
@@ -206,18 +236,22 @@ def triangulate_rays(
         return RayTriangulationAttempt(None, "zero_baseline", {"geometry_rank": 0})
 
     ray_dot = max(-1.0, min(1.0, _dot(left_ray, right_ray)))
-    denominator = 1.0 - ray_dot * ray_dot
-    cross_norm = _norm(
-        (
-            left_ray[1] * right_ray[2] - left_ray[2] * right_ray[1],
-            left_ray[2] * right_ray[0] - left_ray[0] * right_ray[2],
-            left_ray[0] * right_ray[1] - left_ray[1] * right_ray[0],
-        )
+    cross = (
+        left_ray[1] * right_ray[2] - left_ray[2] * right_ray[1],
+        left_ray[2] * right_ray[0] - left_ray[0] * right_ray[2],
+        left_ray[0] * right_ray[1] - left_ray[1] * right_ray[0],
     )
+    cross_norm = _norm(cross)
+    if not math.isfinite(cross_norm):
+        return RayTriangulationAttempt(
+            None,
+            "invalid_solution",
+            {"geometry_rank": 2, "condition_number": math.inf, "ray_dot": ray_dot},
+        )
     if cross_norm <= float(parallel_epsilon):
         return RayTriangulationAttempt(
             None,
-            "rank_deficient",
+            "near_parallel_rays" if legacy_left_camera_defaults else "rank_deficient",
             {
                 "geometry_rank": 1,
                 "condition_number": math.inf,
@@ -225,22 +259,48 @@ def triangulate_rays(
             },
         )
 
-    condition_number = math.sqrt((1.0 + abs(ray_dot)) / (1.0 - abs(ray_dot)))
-
-    origin_delta = _subtract(left_origin, right_origin)
-    left_projection = _dot(left_ray, origin_delta)
-    right_projection = _dot(right_ray, origin_delta)
-    left_depth_m = (ray_dot * right_projection - left_projection) / denominator
-    right_depth_m = (right_projection - ray_dot * left_projection) / denominator
-    left_closest = _add(left_origin, _scale(left_ray, left_depth_m))
-    right_closest = _add(right_origin, _scale(right_ray, right_depth_m))
-    midpoint = _scale(_add(left_closest, right_closest), 0.5)
-    range_m = _norm(midpoint)
+    try:
+        denominator = cross_norm * cross_norm
+        condition_number = (1.0 + abs(ray_dot)) / cross_norm
+        origin_delta = _subtract(left_origin, right_origin)
+        left_projection = _dot(left_ray, origin_delta)
+        right_projection = _dot(right_ray, origin_delta)
+        left_depth_m = (ray_dot * right_projection - left_projection) / denominator
+        right_depth_m = (right_projection - ray_dot * left_projection) / denominator
+        left_closest = _add(left_origin, _scale(left_ray, left_depth_m))
+        right_closest = _add(right_origin, _scale(right_ray, right_depth_m))
+        midpoint = _scale(_add(left_closest, right_closest), 0.5)
+        range_m = _norm(midpoint)
+        ray_angle_deg = math.degrees(math.acos(ray_dot))
+    except (ArithmeticError, OverflowError, ValueError) as exc:
+        return RayTriangulationAttempt(
+            None,
+            "invalid_solution",
+            {
+                "geometry_rank": 2,
+                "condition_number": math.inf,
+                "ray_dot": ray_dot,
+                "error": str(exc),
+            },
+        )
     if not all(math.isfinite(value) for value in (*left_closest, *right_closest, *midpoint, range_m)):
         return RayTriangulationAttempt(
             None,
             "invalid_solution",
             {"geometry_rank": 2, "condition_number": condition_number},
+        )
+
+    if legacy_left_camera_defaults and (left_depth_m <= 0.0 or right_depth_m <= 0.0):
+        return RayTriangulationAttempt(
+            None,
+            "non_positive_depth",
+            {
+                "geometry_rank": 2,
+                "condition_number": condition_number,
+                "ray_dot": ray_dot,
+                "left_depth_m": left_depth_m,
+                "right_depth_m": right_depth_m,
+            },
         )
 
     result = RayTriangulationResult(
@@ -249,7 +309,7 @@ def triangulate_rays(
         closest_gap_m=_norm(_subtract(left_closest, right_closest)),
         left_depth_m=left_depth_m,
         right_depth_m=right_depth_m,
-        ray_angle_deg=math.degrees(math.acos(ray_dot)),
+        ray_angle_deg=ray_angle_deg,
         baseline_m=baseline_m,
         point_on_left_ray_rdf_m=left_closest,
         point_on_right_ray_rdf_m=right_closest,
@@ -257,6 +317,10 @@ def triangulate_rays(
         geometry_rank=2,
         condition_number=condition_number,
         computation_status="computed",
+        point_frame=resolved_common_frame,
+        output_frame=resolved_common_frame,
+        axis_contract=str(axis_contract),
+        vector_contract=str(vector_contract),
     )
     return RayTriangulationAttempt(
         result,
@@ -278,6 +342,9 @@ def triangulate_pixels(
     right_origin_left_rdf_m: Sequence[float],
     rotation_left_from_right_rdf: Sequence[Sequence[float]] = IDENTITY_ROTATION,
     left_origin_left_rdf_m: Sequence[float] = (0.0, 0.0, 0.0),
+    common_frame: str | None = None,
+    axis_contract: str = LEFT_CAMERA_RDF_AXIS_CONTRACT,
+    vector_contract: str = LEFT_CAMERA_RDF_VECTOR_CONTRACT,
 ) -> RayTriangulationAttempt:
     """Triangulate pinhole pixels after expressing the right ray in the left frame."""
 
@@ -294,4 +361,7 @@ def triangulate_pixels(
         left_ray_left_rdf=left_ray,
         right_ray_left_rdf=right_ray,
         left_origin_left_rdf_m=left_origin_left_rdf_m,
+        common_frame=common_frame,
+        axis_contract=axis_contract,
+        vector_contract=vector_contract,
     )

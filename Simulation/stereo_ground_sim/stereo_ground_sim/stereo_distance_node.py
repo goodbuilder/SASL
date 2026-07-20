@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - exercised only outside ROS
     class SetParametersResult:  # type: ignore[no-redef]
         def __init__(self, **kwargs):
             self.successful = kwargs.get("successful", True)
+            self.reason = kwargs.get("reason", "")
 
     class HistoryPolicy:  # type: ignore[no-redef]
         KEEP_LAST = 1
@@ -91,9 +92,15 @@ from stereo_ground_sim.runtime_deployment_selector import (
 )
 from stereo_ground_sim.disparity_residual_feature_summary import feature_summary_from_arrays, feature_summary_from_runtime_rows
 from stereo_ground_sim.disparity_residual_feature_selector import DisparityResidualFeatureSelector
-from sasl_common.stereo_geometry import PinholeIntrinsics, ray_from_pixel, triangulate_rays
-from stereo_ground_sim.coordinate_frames import (
+from sasl_common.stereo_geometry import (
+    BASELINE_CENTER_FRD_AXIS_CONTRACT,
     BASELINE_CENTER_FRD_FRAME,
+    BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    PinholeIntrinsics,
+    ray_from_pixel,
+    triangulate_rays,
+)
+from stereo_ground_sim.coordinate_frames import (
     SOURCE_GAZEBO_ENTITY,
     VEHICLE_REFERENCE_DEFINITION,
     VEHICLE_REFERENCE_LINK,
@@ -131,12 +138,6 @@ class StereoDistanceNode(Node):
         self.declare_parameter("target_model_name", "x500_15m")
         self.declare_parameter("target_spawn_z_m", 0.75)
         self.declare_parameter("fly_target_in_gazebo", False)
-        self.declare_parameter("actual_distance_source", "gazebo")
-        self.declare_parameter(
-            "actual_distance_read_hz",
-            15.0,
-            ParameterDescriptor(dynamic_typing=True),
-        )
         self.declare_parameter("yolo_model_path", "")
         self.declare_parameter("yolo_class_name", "drone")
         self.declare_parameter("yolo_confidence", 0.25)
@@ -201,8 +202,6 @@ class StereoDistanceNode(Node):
         self.target_model_name = self.get_parameter("target_model_name").value
         self.target_spawn_z_m = self._float_param("target_spawn_z_m")
         self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
-        self.actual_distance_source = self.get_parameter("actual_distance_source").value
-        self.actual_distance_read_hz = max(0.1, self._float_param("actual_distance_read_hz"))
         self.yolo_model_path = str(self.get_parameter("yolo_model_path").value)
         self.yolo_class_name = str(self.get_parameter("yolo_class_name").value)
         self.yolo_confidence = self._float_param("yolo_confidence")
@@ -286,7 +285,7 @@ class StereoDistanceNode(Node):
         self.right_detection = None
         self.start_time = time.monotonic()
         self.last_gazebo_velocity_update = 0.0
-        self.cached_actual_distance = self.approach_start_distance_m
+        self.cached_actual_distance = None
         self.cached_ground_truth_position = None
         self.ground_truth_stamp_ns = None
         self.ground_truth_entity_id = None
@@ -314,7 +313,7 @@ class StereoDistanceNode(Node):
                 "fallback_reason": "init",
             },
             "observation_fusion_status": "disabled",
-            "actual_distance_m": None if self.actual_distance_source == "gazebo" else self.approach_start_distance_m,
+            "actual_distance_m": None,
             "distance_error_m": None,
             "mission_phase": "init",
             "status": "waiting for images",
@@ -503,8 +502,19 @@ class StereoDistanceNode(Node):
         self.cached_actual_distance = float(position["forward_m"])
         self.actual_distance_sample_seq = getattr(self, "actual_distance_sample_seq", 0) + 1
 
-    def _triangulate_pixel_centers(self, left_u_px, left_v_px, right_u_px, right_v_px, width, height):
-        """Triangulate two optical RDF pixels in the fixed baseline FRD frame."""
+    def _triangulate_pixel_centers_with_cameras(
+        self,
+        left_u_px,
+        left_v_px,
+        right_u_px,
+        right_v_px,
+        width,
+        height,
+        *,
+        left_camera_pose,
+        right_camera_pose,
+    ):
+        """Triangulate pixels using explicitly supplied optical camera poses."""
 
         self._ensure_camera_frames()
         pixels = (float(left_u_px), float(left_v_px), float(right_u_px), float(right_v_px))
@@ -530,15 +540,18 @@ class StereoDistanceNode(Node):
             "condition_number": None,
             "computation_status": "invalid_input",
             "output_frame": BASELINE_CENTER_FRD_FRAME,
+            "point_frame": BASELINE_CENTER_FRD_FRAME,
+            "axis_contract": BASELINE_CENTER_FRD_AXIS_CONTRACT,
+            "vector_contract": BASELINE_CENTER_FRD_VECTOR_CONTRACT,
         }
         try:
             intrinsics = self._camera_intrinsics(width, height)
             left_ray_rdf = ray_from_pixel(pixels[0], pixels[1], intrinsics)
             right_ray_rdf = ray_from_pixel(pixels[2], pixels[3], intrinsics)
-            left_ray_world = self.actual_left_camera.ray_to_world(left_ray_rdf)
-            right_ray_world = self.actual_right_camera.ray_to_world(right_ray_rdf)
-            left_origin = self.baseline_center_frd.point_from_world(self.actual_left_camera.center_world_enu_m)
-            right_origin = self.baseline_center_frd.point_from_world(self.actual_right_camera.center_world_enu_m)
+            left_ray_world = left_camera_pose.ray_to_world(left_ray_rdf)
+            right_ray_world = right_camera_pose.ray_to_world(right_ray_rdf)
+            left_origin = self.baseline_center_frd.point_from_world(left_camera_pose.center_world_enu_m)
+            right_origin = self.baseline_center_frd.point_from_world(right_camera_pose.center_world_enu_m)
             left_ray = self.baseline_center_frd.ray_from_world(left_ray_world)
             right_ray = self.baseline_center_frd.ray_from_world(right_ray_world)
             attempt = triangulate_rays(
@@ -546,6 +559,9 @@ class StereoDistanceNode(Node):
                 right_origin_left_rdf_m=right_origin,
                 left_ray_left_rdf=left_ray,
                 right_ray_left_rdf=right_ray,
+                common_frame=BASELINE_CENTER_FRD_FRAME,
+                axis_contract=BASELINE_CENTER_FRD_AXIS_CONTRACT,
+                vector_contract=BASELINE_CENTER_FRD_VECTOR_CONTRACT,
             )
         except (TypeError, ValueError, ArithmeticError) as exc:
             base["computation_status"] = "invalid_input"
@@ -577,19 +593,63 @@ class StereoDistanceNode(Node):
                 "geometry_rank": int(result.geometry_rank),
                 "condition_number": float(result.condition_number),
                 "computation_status": result.computation_status,
+                "point_frame": result.point_frame,
+                "output_frame": result.output_frame,
+                "axis_contract": result.axis_contract,
+                "vector_contract": result.vector_contract,
             }
         )
         return base
 
+    def _triangulate_pixel_centers(self, left_u_px, left_v_px, right_u_px, right_v_px, width, height):
+        """Canonical Raw: interpret pixels with nominal zero-error camera poses."""
+
+        self._ensure_camera_frames()
+        return self._triangulate_pixel_centers_with_cameras(
+            left_u_px,
+            left_v_px,
+            right_u_px,
+            right_v_px,
+            width,
+            height,
+            left_camera_pose=self.nominal_left_camera,
+            right_camera_pose=self.nominal_right_camera,
+        )
+
+    def _triangulate_pixel_centers_oracle(self, left_u_px, left_v_px, right_u_px, right_v_px, width, height):
+        """Explicit test/oracle path: interpret pixels with actual camera poses."""
+
+        self._ensure_camera_frames()
+        return self._triangulate_pixel_centers_with_cameras(
+            left_u_px,
+            left_v_px,
+            right_u_px,
+            right_v_px,
+            width,
+            height,
+            left_camera_pose=self.actual_left_camera,
+            right_camera_pose=self.actual_right_camera,
+        )
+
     def _on_param_update(self, params):
+        geometry_parameter_names = {
+            "baseline_m",
+            "camera_height_m",
+            "horizontal_fov_rad",
+            "left_roll_error_deg",
+            "left_pitch_error_deg",
+            "left_yaw_error_deg",
+            "right_roll_error_deg",
+            "right_pitch_error_deg",
+            "right_yaw_error_deg",
+        }
+        if any(param.name in geometry_parameter_names for param in params):
+            return SetParametersResult(
+                successful=False,
+                reason="geometry-defining parameters are immutable for one run",
+            )
         for param in params:
-            if param.name == "baseline_m":
-                self.baseline_m = float(param.value)
-            elif param.name == "camera_height_m":
-                self.camera_height_m = float(param.value)
-            elif param.name == "horizontal_fov_rad":
-                self.horizontal_fov_rad = float(param.value)
-            elif param.name == "reference_distance_m":
+            if param.name == "reference_distance_m":
                 self.reference_distance_m = float(param.value)
             elif param.name == "approach_start_distance_m":
                 self.approach_start_distance_m = float(param.value)
@@ -613,10 +673,6 @@ class StereoDistanceNode(Node):
                 self.target_spawn_z_m = float(param.value)
             elif param.name == "fly_target_in_gazebo":
                 self.fly_target_in_gazebo = self._coerce_bool(param.value)
-            elif param.name == "actual_distance_source":
-                self.actual_distance_source = str(param.value)
-            elif param.name == "actual_distance_read_hz":
-                self.actual_distance_read_hz = max(0.1, float(param.value))
             elif param.name == "yolo_model_path":
                 self.yolo_model_path = str(param.value)
                 self._reset_yolo_model()
@@ -944,7 +1000,7 @@ class StereoDistanceNode(Node):
             self.yolo_runtime_warning_logged = True
 
     def _actual_distance(self):
-        if self.actual_distance_source == "gazebo" and self.cached_ground_truth_position is None:
+        if self.cached_ground_truth_position is None:
             return None
         return self.cached_actual_distance
 
@@ -1058,7 +1114,7 @@ class StereoDistanceNode(Node):
 
     def _publish_actual_distance(self):
         state = self._mission_state()
-        actual = self._read_actual_distance(state["distance_m"])
+        actual = self._read_actual_distance()
         if actual is not None:
             self.cached_actual_distance = actual
             self.reference_distance_m = actual
@@ -1153,10 +1209,7 @@ class StereoDistanceNode(Node):
             )
         )
 
-    def _read_actual_distance(self, fallback):
-        if self.actual_distance_source != "gazebo":
-            self.cached_actual_distance = fallback
-            return fallback
+    def _read_actual_distance(self):
         if self.cached_ground_truth_position is None:
             return None
         return self.cached_actual_distance
@@ -1426,7 +1479,7 @@ class StereoDistanceNode(Node):
         left = self._detection_from_values(values[:8])
         right = self._detection_from_values(values[8:16])
         state = self._mission_state()
-        actual = self._read_actual_distance(state["distance_m"])
+        actual = self._read_actual_distance()
         width = int(getattr(self, "external_bbox_detection_width_px", 1280))
         height = int(getattr(self, "external_bbox_detection_height_px", 720))
         synthetic_image = np.zeros((height, width, 3), dtype=np.uint8)
@@ -1789,16 +1842,32 @@ class StereoDistanceNode(Node):
         if not all(math.isfinite(value) for value in point_baseline):
             return None, None
         point_world = self.baseline_center_frd.point_to_world(point_baseline)
-        return self._detection_pair_from_world(point_world, width, height, nominal=False)
+        return self._detection_pair_from_world(
+            point_world,
+            width,
+            height,
+            projection_camera_mode="actual",
+        )
 
     def _ideal_detection_pair_from_reference_world(self, point_world_enu_m, width, height):
         self._ensure_camera_frames()
-        return self._detection_pair_from_world(point_world_enu_m, width, height, nominal=True)
+        return self._detection_pair_from_world(
+            point_world_enu_m,
+            width,
+            height,
+            projection_camera_mode="actual",
+        )
 
-    def _detection_pair_from_world(self, point_world_enu_m, width, height, *, nominal):
+    def _detection_pair_from_world(self, point_world_enu_m, width, height, *, projection_camera_mode="actual"):
         self._ensure_camera_frames()
-        camera_left = self.nominal_left_camera if nominal else self.actual_left_camera
-        camera_right = self.nominal_right_camera if nominal else self.actual_right_camera
+        if projection_camera_mode == "actual":
+            camera_left = self.actual_left_camera
+            camera_right = self.actual_right_camera
+        elif projection_camera_mode == "nominal":
+            camera_left = self.nominal_left_camera
+            camera_right = self.nominal_right_camera
+        else:
+            raise ValueError(f"unsupported projection_camera_mode={projection_camera_mode!r}")
         intrinsics = self._camera_intrinsics(width, height)
         left_pixel = project_world_point_to_pixel(
             point_world_enu_m,
@@ -1840,7 +1909,7 @@ class StereoDistanceNode(Node):
         if not self.enable_synthetic_detections:
             return
         state = self._mission_state()
-        actual = self._read_actual_distance(state["distance_m"])
+        actual = self._read_actual_distance()
         position = self.cached_ground_truth_position
         if position is None or position.get("ground_truth_world_enu_m") is None:
             return
@@ -2312,6 +2381,7 @@ class StereoDistanceNode(Node):
                 "corrected_forward_m": None,
                 "corrected_range_m": None,
                 "corrected_disparity_px": None,
+                "legacy_fused_raw": None,
                 "bbox_adjustment": None,
                 "profile_status": self._profile_status(
                     getattr(self.bbox_center_adjustment, "profile_id", ""),
@@ -2331,13 +2401,12 @@ class StereoDistanceNode(Node):
         raw = self._triangulate_center_pixels(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
         observation_fusion_status = "disabled"
         fused_raw, observation_fusion_status = self._apply_observation_fusion(left, right, width, height)
-        if fused_raw is not None:
-            raw = fused_raw
+        legacy_fused_observation = fused_raw
         raw.setdefault("left_u_px", float(left["cx"]))
         raw.setdefault("left_v_px", float(left["cy"]))
         raw.setdefault("right_u_px", float(right["cx"]))
         raw.setdefault("right_v_px", float(right["cy"]))
-        corrected = None
+        corrected = fused_raw
         bbox_adjustment = None
         profile_status = self._profile_status()
         if isinstance(self.bbox_center_adjustment, OriginBBoxReprojectionProfile):
@@ -2440,6 +2509,7 @@ class StereoDistanceNode(Node):
             "corrected_forward_m": None if corrected is None else corrected["forward_m"],
             "corrected_range_m": None if corrected is None else corrected["range_m"],
             "corrected_disparity_px": None if corrected is None else corrected["disparity_px"],
+            "legacy_fused_raw": legacy_fused_observation,
             "bbox_adjustment": bbox_adjustment,
             "profile_status": profile_status,
             "observation_fusion_status": observation_fusion_status,
