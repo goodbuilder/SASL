@@ -1,27 +1,91 @@
 # Coordinate Contract
 
-This document fixes the coordinate-frame and axis naming contract used by StereoDistance. The code source of truth is `wiris_stereo_distance/coordinate_contract.py`; this document is the human-readable version for experiments, reports, and CSV interpretation.
+This document fixes the coordinate-frame and axis naming contract used by
+StereoDistance. The code source of truth is
+`wiris_stereo_distance/coordinate_contract.py`.
 
-## Frames
+## Active frames
 
-| Frame id | Meaning | Axis contract | Use |
+| Frame id | Meaning | Axis contract | Active use |
 | --- | --- | --- | --- |
-| `ned` | PX4 world/local frame | `N/E/D = North/East/Down` | ULog and PX4 local-position truth |
-| `px4_frd` | PX4 body frame | `Forward/Right/Down` | Pixhawk attitude/body geometry |
-| `opencv_optical` | Camera optical frame | `Right/Down/Forward` | Camera rays and per-camera optical vectors |
-| `stereo_center_opencv_optical` | Stereo rig center optical frame | `Right/Down/Forward` | YOLO 3D measurement rows before UAM alignment |
-| `stereo_center_frd` | Stereo rig center comparison frame | `Forward/Right/Down` | Simulation and UAM camera-axis comparison |
-| `px4_local_ned` | UAM/Pixhawk local truth frame | `North/East/Down` | Truth and aligned estimated output |
+| `ned` | PX4/GNSS navigation frame | `North/East/Down` | P1/P2 attitude and antenna-baseline geometry |
+| `px4_frd` | PX4 body frame | `Forward/Right/Down` | P1/P2 body attitude and nominal camera mount |
+| `camera_optical_rdf` | Each camera optical frame | `Right/Down/Forward` | Pixel rays before conversion into the left frame |
+| `left_camera_rdf` | Left optical-center frame | `Right/Down/Forward` | Raw/public StereoDistance point and range |
 
-## Fixed Mount
+`NED`, `FRD`, and optical `RDF` are not aliases. Values cross these frames
+only through the explicit attitude, mount, and baseline transforms used by the
+triangulation path.
 
-The nominal front camera mount profile is:
+## Active measurement method
+
+The only runtime measurement method is `two_ray_closest_midpoint`.
+
+- Purpose: estimate a 3-D target point from synchronized left/right detector
+  pixels without Ground Truth or target telemetry.
+- Pixel input: bbox-center pixels on the same pixel grids as the selected
+  intrinsics, with distortion-aware ray construction when distortion is
+  configured.
+- Pose input: either checkerboard stereo `R/T`, or P1/P2 Pixhawk attitudes plus
+  a GPS/RTK antenna baseline transformed through the nominal camera mount.
+- Accepted approximation: the GPS/RTK antenna baseline may stand in for the
+  optical-center baseline. Its source and quality remain recorded; this is not
+  an exact lever-arm calibration claim.
+- Algorithm: express the right ray and right optical-center origin in
+  `left_camera_rdf`, find the closest points on the two positive rays, and
+  return their midpoint.
+- Output: `[Right, Down, Forward, Range]` in `left_camera_rdf`, with the left
+  optical center at `(0, 0, 0)` and
+  `Range = norm([Right, Down, Forward])`.
+- No baseline-midpoint translation or public FRD reorder is applied.
+- Missing or mismatched intrinsics grids, missing pose/translation, zero
+  baseline, near-parallel rays, non-positive depth, and non-finite range fail
+  closed and retain a rejection reason.
+
+StereoDistance has no measurement-correction or tracking-filter layer. The
+former BBox reprojection, affine bbox-center, distance-binned 3-D bias, and
+Kalman paths were removed. Runtime and newly saved measurement rows contain
+the Raw `left_camera_rdf` result only.
+
+## P1/P2 Pixhawk data boundary
+
+P1/P2 Pixhawk data describes the stereo measurement rig. It may provide:
+
+- body orientation in `px4_frd` relative to `ned`;
+- GPS/RTK antenna positions used to form the left-to-right baseline;
+- GNSS, magnetometer, connection, and timing quality diagnostics.
+
+It does not provide target/UAM Ground Truth in the active StereoDistance
+application. The application does not ingest a target PX4 local position,
+load a target ULog, build a `left_camera_rdf -> px4_local_ned` comparison
+profile, or calculate target truth/error fields.
+
+### Attitude timing
+
+For the Pixhawk geometry path, `left_attitude_age_s` and
+`right_attitude_age_s` are absolute offsets between the bbox-pair midpoint on
+the application monotonic receive-time axis and the nearest attitude samples.
+`attitude_pair_delta_s` is the absolute left/right attitude-sample difference
+on that same axis.
+
+- `FRESH`: sample age at most 2 s and pair delta at most 1 s.
+- `STALE`: either limit is exceeded.
+- `VERY_STALE`: sample age exceeds 10 s or pair delta exceeds 5 s.
+
+This `display_only_non_blocking` state is provenance. It does not rotate,
+translate, reject, or otherwise alter the `left_camera_rdf` result.
+Checkerboard `R/T` does not consume Pixhawk attitude and is recorded as
+`NOT_USED` (shown as `N/A` in the UI).
+
+## Fixed mount
+
+The nominal front-camera mount profile is:
 
 ```text
 front_camera_z_to_body_x_x_to_body_y
 ```
 
-This means:
+Its axis mapping is:
 
 ```text
 camera +X Right   -> body +Y Right
@@ -29,116 +93,42 @@ camera +Y Down    -> body +Z Down
 camera +Z Forward -> body +X Forward
 ```
 
-Do not swap axes ad hoc in analysis code. Convert through the declared frame contract or through a saved UAM alignment profile.
+Do not swap axes ad hoc. Convert through the declared mount, attitude, and
+baseline transforms.
 
-## Measurement Fields
+## Measurement fields
 
-Raw YOLO stereo-center measurements are camera-frame values:
-
-| Field | Meaning |
-| --- | --- |
-| `measurement_right_m`, `stereo_center_right_m`, legacy `x_m` | Camera/stereo-center Right |
-| `measurement_down_m`, `stereo_center_down_m`, legacy `y_m` | Camera/stereo-center Down |
-| `measurement_forward_m`, `stereo_center_forward_m`, legacy `z_m` | Camera/stereo-center Forward |
-
-Legacy `x_m/y_m/z_m` fields remain for CSV compatibility only. In current UI and reports, describe them as `Right/Down/Forward`.
-
-When an alignment profile is active, PX4 local truth can be transformed back
-into the camera-center frame for per-axis FRD comparison:
+Current Raw measurements use the following meanings:
 
 | Field | Meaning |
 | --- | --- |
-| `measurement_frd_forward_m` | YOLO measurement in camera-center Forward |
-| `measurement_frd_right_m` | YOLO measurement in camera-center Right |
-| `measurement_frd_down_m` | YOLO measurement in camera-center Down |
-| `truth_frd_forward_m` | Ground truth transformed to camera-center Forward |
-| `truth_frd_right_m` | Ground truth transformed to camera-center Right |
-| `truth_frd_down_m` | Ground truth transformed to camera-center Down |
-| `error_frd_forward_m` | `measurement_frd_forward_m - truth_frd_forward_m` |
-| `error_frd_right_m` | `measurement_frd_right_m - truth_frd_right_m` |
-| `error_frd_down_m` | `measurement_frd_down_m - truth_frd_down_m` |
-| `truth_rdf_right_m` | Ground truth transformed to camera-center Right |
-| `truth_rdf_down_m` | Ground truth transformed to camera-center Down |
-| `truth_rdf_forward_m` | Ground truth transformed to camera-center Forward |
-| `error_rdf_right_m` | `measurement_right_m - truth_rdf_right_m` |
-| `error_rdf_down_m` | `measurement_down_m - truth_rdf_down_m` |
-| `error_rdf_forward_m` | `measurement_forward_m - truth_rdf_forward_m` |
+| `left_camera_right_m`, `raw_left_camera_right_m`, legacy `x_m`/`raw_x_m` | Right from the left optical center |
+| `left_camera_down_m`, `raw_left_camera_down_m`, legacy `y_m`/`raw_y_m` | Down from the left optical center |
+| `left_camera_forward_m`, `raw_left_camera_forward_m`, legacy `z_m`/`raw_z_m` | Forward from the left optical center |
+| `distance_m`, `raw_range_m` | Euclidean range from the left optical center |
 
-Use the FRD fields for camera-frame axis-level error. The RDF fields remain
-compatibility aliases for older analysis code. The scalar range metric remains
-`estimated_range_m - truth_range_m`.
+New rows include:
 
-## Truth Fields
+```text
+measurement_frame=left_camera_rdf
+measurement_axis_contract=left_camera_rdf:right_down_forward
+public_vector_contract=left_camera_rdf:[right,down,forward,range]
+legacy_xyz_alias_contract=x=right,y=down,z=forward
+```
 
-PX4 ULog, ROS2 `vehicle_local_position`, and MAVLink `LOCAL_POSITION_NED` expose local-position values as `x/y/z`, but StereoDistance interprets and displays them as:
+Legacy `x_m/y_m/z_m` fields remain only as explicit aliases. New rows leave
+`stereo_center_*` and `raw_stereo_center_*` empty instead of placing
+left-origin values in midpoint-named fields. They do not emit target truth,
+aligned NED estimate, per-axis error, range error, position error, or UAM
+alignment-profile fields.
 
-| Field | Meaning |
-| --- | --- |
-| `truth_north_m`, legacy `truth_x_m` | PX4 local North |
-| `truth_east_m`, legacy `truth_y_m` | PX4 local East |
-| `truth_down_m`, legacy `truth_z_m` | PX4 local Down |
+Attitude timing fields are temporal provenance, not coordinates. Their values
+do not change the public frame or axis order.
 
-For recorded rows, `drone_north/east/down_m` are preferred over legacy `drone_x/y/z_m`.
+## Historical artifacts
 
-Truth source collection and profile-source selection are separate:
-
-- Collect every available source when possible: PX4 local NED,
-  PX4/global LLA, and GPS LLA.
-- Build or evaluate one profile with exactly one selected truth source contract:
-  `local_ned`, `global_position`, or `gps_position`.
-- Do not mix local/global/GPS truth rows inside one calibration profile.
-
-Default analysis-source priority is:
-
-1. ULog local NED: `vehicle_local_position`, then `vehicle_odometry`, then `vehicle_visual_odometry`.
-2. ULog global/GPS LLA converted to local NED: `vehicle_global_position`,
-   `vehicle_gps_position`, then `sensor_gps`.
-3. Live local/global/GPS telemetry converted to local NED.
-4. Recorded-row local NED fallback: `drone_north/east/down_m`.
-
-GPS `lat/lon/alt` must never be compared directly with camera-frame data. It
-must first be converted to local NED using an explicit reference origin. The
-reference priority is PX4 local-position reference (`ref_lat/ref_lon/ref_alt`),
-then `home_position`, then the first valid GPS/global sample. Rows produced
-from GPS/global-derived truth must retain the reference metadata:
-
-| Field | Meaning |
-| --- | --- |
-| `truth_gps_reference_lat_deg` | GPS-to-NED reference latitude |
-| `truth_gps_reference_lon_deg` | GPS-to-NED reference longitude |
-| `truth_gps_reference_alt_m` | GPS-to-NED reference altitude |
-| `truth_gps_reference_kind` | `vehicle_local_position_ref`, `home_position`, `first_valid_gps_sample`, or `first_valid_global_sample` |
-| `truth_gps_altitude_reference` | Altitude datum when known; otherwise `unknown` |
-
-## UAM Comparison Metrics
-
-Before coordinate alignment, YOLO `Right/Down/Forward` and truth `North/East/Down` are a `mixed-frame` comparison. Mixed-frame axis errors are diagnostic only.
-
-After loading or estimating a UAM coordinate-alignment profile, final comparison fields are:
-
-| Field | Meaning |
-| --- | --- |
-| `estimated_north_m` | YOLO point transformed into PX4 local North |
-| `estimated_east_m` | YOLO point transformed into PX4 local East |
-| `estimated_down_m` | YOLO point transformed into PX4 local Down |
-| `error_north_m` | `estimated_north_m - truth_north_m` |
-| `error_east_m` | `estimated_east_m - truth_east_m` |
-| `error_down_m` | `estimated_down_m - truth_down_m` |
-| `position_error_m` | Euclidean position error |
-| `alignment_profile_id` | Applied axis/origin correction profile |
-
-For PX4 local-frame reporting, use aligned `estimated_north/east/down_m` versus
-`truth_north/east/down_m`. For camera-frame reporting, use
-`error_frd_forward/right/down_m`.
-
-## Alignment Profile Rules
-
-A UAM alignment profile stores:
-
-- rotation matrix: `camera Right/Down/Forward -> PX4 local North/East/Down`
-- origin offset: `origin_offset_north/east/down_m`
-- sample count, RMSE, max error, method, frame ids
-
-Use a saved profile in the main experiment only when camera, zoom/intrinsics, Pixhawk/GNSS position, and UAM mounting geometry are unchanged. If any of those change, create a new profile.
-
-At least three non-collinear matched samples are required. A line-only motion is degenerate and must not be used to lock a final axis/origin profile.
+Recordings created by older versions may contain target telemetry, ULog
+comparison, `px4_local_ned`, stereo-center, correction, or alignment fields.
+Those files describe their historical producer and are not an active schema or
+an implicit conversion rule for new measurements. StereoDistance does not
+load those values into the current Raw measurement path.

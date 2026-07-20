@@ -6,13 +6,17 @@ rankable, and understandable even when it fails.
 
 ## Scope
 
-Use this workflow for any new method that changes, selects, gates, fuses, or
+Use this workflow for any active method that changes, selects, gates, fuses, or
 validates StereoDistance correction behavior, including bbox-anchor,
-Origin-BBOX, ROI/silhouette, extrinsic, tracking, residual, and range-fusion
-branches.
+extrinsic, residual, and range-fusion branches.
 
 Legacy reports already under `reports/` may stay where they are. New method
 attempts must create an experiment record under `reports/experiments/`.
+
+The former direct-Gazebo Origin-BBOX, ROI/silhouette, and Kalman tracking
+search tools were retired on 2026-07-20. Their method names and metrics may
+appear in archived reports, but they are not current baselines or executable
+workflow steps.
 
 ## Non-Negotiable Rules
 
@@ -260,7 +264,8 @@ Every correction experiment should compare against:
 2. `range_only_forward_fusion`
 3. current bbox-anchor all-family axis guard
 4. current best family-local Down candidate, when the method claims Down
-5. current ROI/silhouette branch, when the method uses image observations
+5. any newly implemented image-observation baseline declared by the experiment;
+   the retired ROI/silhouette branch is not an active baseline
 
 ## Stop Conditions
 

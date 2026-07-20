@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan2, asin, copysign, degrees, pi, sqrt
+from math import asin, atan2, copysign, degrees, pi, sqrt
 from typing import Iterable
 
 
@@ -13,15 +13,6 @@ class RelativeAttitude:
     roll_deg: float
     pitch_deg: float
     yaw_deg: float
-
-
-@dataclass(frozen=True)
-class RelativeAttitudeBias:
-    roll_deg: float
-    pitch_deg: float
-    yaw_deg: float
-    sample_count: int
-    captured_timestamp_s: float
 
 
 def normalize_quaternion(q: Iterable[float]) -> Quaternion:
@@ -73,42 +64,3 @@ def relative_attitude(left_q: Iterable[float], right_q: Iterable[float]) -> Rela
     right = normalize_quaternion(right_q)
     relative_q = quaternion_multiply(right, quaternion_conjugate(left))
     return quaternion_to_euler_deg(relative_q)
-
-
-def apply_relative_bias(relative: RelativeAttitude, bias: RelativeAttitudeBias | None) -> RelativeAttitude:
-    if bias is None:
-        return relative
-    return RelativeAttitude(
-        roll_deg=relative.roll_deg - bias.roll_deg,
-        pitch_deg=relative.pitch_deg - bias.pitch_deg,
-        yaw_deg=relative.yaw_deg - bias.yaw_deg,
-    )
-
-
-class RelativeAttitudeBiasCapture:
-    def __init__(self, *, start_timestamp_s: float, duration_s: float) -> None:
-        self.start_timestamp_s = float(start_timestamp_s)
-        self.duration_s = float(duration_s)
-        self.samples: list[RelativeAttitude] = []
-
-    @property
-    def deadline_s(self) -> float:
-        return self.start_timestamp_s + self.duration_s
-
-    def add(self, left_q: Iterable[float], right_q: Iterable[float]) -> None:
-        self.samples.append(relative_attitude(left_q, right_q))
-
-    def ready(self, now_s: float) -> bool:
-        return now_s >= self.deadline_s
-
-    def finish(self, *, captured_timestamp_s: float) -> RelativeAttitudeBias | None:
-        if not self.samples:
-            return None
-        count = len(self.samples)
-        return RelativeAttitudeBias(
-            roll_deg=sum(sample.roll_deg for sample in self.samples) / count,
-            pitch_deg=sum(sample.pitch_deg for sample in self.samples) / count,
-            yaw_deg=sum(sample.yaw_deg for sample in self.samples) / count,
-            sample_count=count,
-            captured_timestamp_s=captured_timestamp_s,
-        )

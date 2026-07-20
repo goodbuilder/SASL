@@ -36,10 +36,6 @@ class DistanceHistoryPoint:
     x_m: float | None = None
     y_m: float | None = None
     z_m: float | None = None
-    live_truth_range_m: float | None = None
-    live_range_error_m: float | None = None
-    live_truth_timestamp_s: float | None = None
-    alignment_profile_id: str | None = None
     class_name: str | None = None
     sample_key: tuple[float, float, str] | None = None
     recording_elapsed_s: float | None = None
@@ -162,12 +158,6 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
                 )
             if point.class_name:
                 parts.append(f"클래스: {point.class_name}")
-            if point.live_truth_range_m is not None:
-                parts.append(f"Telemetry range: {point.live_truth_range_m:.2f} m")
-            if point.live_range_error_m is not None:
-                parts.append(f"YOLO-Telemetry error: {point.live_range_error_m:+.2f} m")
-            if point.alignment_profile_id:
-                parts.append(f"Origin profile: {point.alignment_profile_id}")
             if point.recording_elapsed_s is not None:
                 parts.append(f"기록+{point.recording_elapsed_s:.2f}s")
             lines.append(" | ".join(parts))
@@ -199,11 +189,6 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         return value if isfinite(value) else None
 
     def _panel_series(self, field: str, title: str, unit: str, color: str) -> tuple[tuple[str, str, str, str], ...]:
-        if field == "distance_m":
-            return (
-                ("distance_m", "YOLO Range", unit, SERIES_DISTANCE),
-                ("live_truth_range_m", "Telemetry Range", unit, SERIES_HIGHLIGHT),
-            )
         return ((field, title, unit, color),)
 
     def _plot_metrics(self, field: str = "distance_m") -> tuple[QtCore.QRect, float, float, float, float] | None:
@@ -431,6 +416,3 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
             text = series_title if latest_value is None else f"{series_title} {latest_value:.2f} {series_unit}"
             painter.drawText(legend_x, legend_y, text)
             legend_x += max(110, painter.fontMetrics().horizontalAdvance(text) + 14)
-        if field == "distance_m" and self.points[-1].live_range_error_m is not None:
-            painter.setPen(QtGui.QColor(WARNING))
-            painter.drawText(rect.right() - 130, rect.top() + 16, f"Err {self.points[-1].live_range_error_m:+.2f} m")

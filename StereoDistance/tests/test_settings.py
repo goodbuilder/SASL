@@ -54,18 +54,6 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.gnss_base_survey_in_min_duration_s == 300
     assert settings.gnss_base_survey_in_accuracy_m == 1.0
     assert settings.gnss_base_rtcm_injection_target == "both"
-    assert settings.uam_telemetry_source == "mavlink"
-    assert settings.uam_ros2_topic == "/uav_0/fmu/out/vehicle_local_position"
-    assert settings.uam_ros2_x_field == "x"
-    assert settings.uam_ros2_y_field == "y"
-    assert settings.uam_ros2_z_field == "z"
-    assert settings.uam_mavlink_side == "left"
-    assert settings.uam_mavlink_message == "LOCAL_POSITION_NED"
-    assert settings.uam_mavlink_x_field == "x"
-    assert settings.uam_mavlink_y_field == "y"
-    assert settings.uam_mavlink_z_field == "z"
-    assert settings.uam_compare_max_dt_s == 0.25
-    assert settings.uam_compare_time_offset_s == 0.0
     assert settings.clock_ftp_user == "anonymous"
     assert settings.clock_ftp_port == 21
     assert settings.clock_ftp_remote_dir == "/"
@@ -131,18 +119,6 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         gnss_base_survey_in_min_duration_s=600,
         gnss_base_survey_in_accuracy_m=0.25,
         gnss_base_rtcm_injection_target="left",
-        uam_telemetry_source="mavlink",
-        uam_ros2_topic="/vehicle/local",
-        uam_ros2_x_field="position[0]",
-        uam_ros2_y_field="position[1]",
-        uam_ros2_z_field="position[2]",
-        uam_mavlink_side="right",
-        uam_mavlink_message="LOCAL_POSITION_NED",
-        uam_mavlink_x_field="x",
-        uam_mavlink_y_field="y",
-        uam_mavlink_z_field="z",
-        uam_compare_max_dt_s=0.5,
-        uam_compare_time_offset_s=-0.012345,
         clock_ftp_user="operator",
         clock_ftp_password="secret",
         clock_ftp_port=2121,
@@ -165,6 +141,8 @@ def test_load_settings_ignores_unknown_legacy_keys(tmp_path: Path) -> None:
         {
           "legacy_removed_mount_key": 1.0,
           "legacy_removed_runtime_key": -2.0,
+          "uam_telemetry_source": "mavlink",
+          "uam_compare_max_dt_s": 0.25,
           "measurement_display_mode": "preview"
         }
         """
@@ -175,6 +153,8 @@ def test_load_settings_ignores_unknown_legacy_keys(tmp_path: Path) -> None:
     assert settings.measurement_display_mode == "preview"
     assert not hasattr(settings, "legacy_removed_mount_key")
     assert not hasattr(settings, "legacy_removed_runtime_key")
+    assert not hasattr(settings, "uam_telemetry_source")
+    assert not hasattr(settings, "uam_compare_max_dt_s")
 
 
 def test_load_settings_accepts_legacy_mavlink_start_ros2_key(tmp_path: Path) -> None:

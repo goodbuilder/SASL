@@ -74,12 +74,17 @@ case "${1:-}" in
 from pathlib import Path
 import sys
 
-import sasl_common.truth_coordinates
+import cv2
+import numpy as np
+import yaml
+
+import sasl_common.stereo_geometry
 import wiris_stereo_distance.gui
 
 print("StereoDistance runtime check ok")
 print(f"python={sys.executable}")
 print(f"sasl_root={Path.cwd().resolve()}")
+print(f"opencv={cv2.__version__}, numpy={np.__version__}, yaml={yaml.__version__}")
 PY
     exit 0
     ;;

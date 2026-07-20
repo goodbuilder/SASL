@@ -24,6 +24,10 @@ Email: TBD}
 \begin{document}
 \maketitle
 
+\begin{center}
+\fbox{\parbox{0.92\linewidth}{\textbf{ARCHIVED DRAFT.} This document preserves an earlier stereo-center, reprojection-correction, and target-telemetry comparison proposal. It does not describe the current StereoDistance runtime. The current implementation emits Raw \texttt{left\_camera\_rdf} measurements only and has no measurement-correction or target ULog/telemetry comparison layer; use \texttt{docs/COORDINATE\_CONTRACT.md} as the authoritative contract.}}
+\end{center}
+
 \begin{abstract}
 본 논문은 좌우 WIRIS 카메라 영상, YOLO 객체 검출, Pixhawk 자세, RTK/GNSS baseline 및 비행 후 ULog 기준 위치를 결합하여 장거리 UAM 또는 드론 표적의 거리와 3차원 위치를 추정하는 좌표계 일관 수식 모델을 제안한다.
 제안 방법은 단순 disparity 기반 거리 산출을 최종 출력으로 사용하지 않고, 각 카메라의 bounding box 중심을 optical ray로 변환한 뒤 Pixhawk body FRD 및 world NED 좌표계 계약에 따라 회전시켜 두 ray 사이의 최단 선분 중점을 3차원 측정값으로 정의한다.

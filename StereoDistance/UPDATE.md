@@ -1,5 +1,98 @@
 # 업데이트 기록
 
+## v2.2.0 — 2026-07-20 — UAM Telemetry 비교 기능 제거
+
+- 변경:
+  - target/UAM PX4 ROS2·MAVLink 수신, ULog 로드, GPS/global-to-local fallback, 시간 offset 추정, `left_camera_rdf -> px4_local_ned` 비교 profile과 truth/error 계산을 담당하던 `uam_telemetry.py`와 전용 테스트를 제거했다.
+  - `연결 > UAM`, `저장·분석 > UAM 비교`, `Telemetry Range`, target truth/error 표시와 관련 UI 상태·callback을 제거했다.
+  - UAM 설정 키, `pyulog` runtime 의존성, 새 session의 `uam_analysis.csv`와 UAM metadata, 거리 row의 target/drone truth 필드를 제거했다. 과거 설정의 UAM 키는 알 수 없는 legacy key로 안전하게 무시한다.
+  - P1/P2 Pixhawk ROS2/MAVLink 자세·GNSS·MAG·상태 데이터는 stereo rig 기하와 진단용으로 유지했다. 표적 Ground Truth로는 사용하지 않는다.
+  - 현재 문서와 runtime check를 Raw `left_camera_rdf:[Right,Down,Forward,Range]` 단일 출력 계약에 맞췄다.
+- 이유:
+  - StereoDistance를 검증되지 않은 target truth 정렬·비교 도구로 보이게 하는 경로를 없애고, 현재 검증 대상인 Raw DKL ray 측정과 측정 리그 provenance만 남기기 위해서다.
+- 확인:
+  - PyQt 외 StereoDistance 전체 회귀 → `132 passed`.
+  - 탭 구성, 거리 그래프, Raw 기록 schema, 세션 저장, 카메라 시간 표시를 포함한 PyQt 집중 회귀 → `8 passed`; 유효 Pixhawk/checkerboard triangulation에서 Telemetry Range가 없는 상태·row 확인 → `2 passed`.
+  - 설정·세션 저장·좌표 계약 집중 회귀 → `12 passed`.
+  - `bash StereoDistance/run.sh --check`, 변경 Python 파일 `py_compile`, `git diff --check` 통과.
+  - 활성 source/settings/requirements에서 UAM/ULog/Telemetry Range runtime symbol 검색 결과 없음.
+- 남은 위험:
+  - 실제 WIRIS/P1/P2 Pixhawk 장비를 연결한 live smoke test는 아직 수행하지 않았다.
+  - 전체 PyQt 묶음은 기존 baseline 정책 test `test_pixhawk_translation_scales_to_measurement_baseline` 실패 보고 중 QThread 정리 문제로 중단됐다. 이번 제거 범위의 집중 회귀는 별도로 통과했다.
+  - 과거 recording metadata와 `docs/paper/`의 명시적으로 archived 처리된 논문 초안에는 역사적 UAM/ULog 항목이 남아 있으며 현재 runtime 계약으로 사용하지 않는다.
+- 좌표/소스 계약:
+  - detector ray는 각 `camera_optical_rdf`, Raw/public point와 range 원점은 왼쪽 optical center의 `left_camera_rdf`, P1/P2 body attitude는 `px4_frd`, P1/P2 GPS baseline은 `ned` source다.
+  - 신규 row는 target `px4_local_ned`, truth/error, target alignment-profile 값을 생성하지 않는다.
+
+## v2.1.1 — 2026-07-20 — Pixhawk 자세 시각 상태 비차단 노출
+
+- 변경:
+  - `측정 > 측정 품질 > 현재 측정 품질`에 Pixhawk 자세의 좌·우 sample age와 pair Δt를 색상 상태로 추가했다.
+  - sample age 2 s 또는 pair Δt 1 s 초과는 `STALE`, sample age 10 s 또는 pair Δt 5 s 초과는 `VERY_STALE`로 표시한다. 주 거리 상태에는 `ATT:*` badge만 표시한다.
+  - 오래된 자세도 측정 계산과 기록을 차단하지 않는다. 대신 주 거리 UI 품질을 `DEGRADED`로 표시하고, 상태·age·정책·임계값을 거리 CSV와 session metadata에 보존한다.
+  - 체커보드 외부 파라미터 경로는 Pixhawk 자세를 사용하지 않으므로 UI에 `N/A — PIXHAWK ATTITUDE NOT USED`, CSV에 `NOT_USED`로 기록한다.
+- 이유:
+  - 실험 중 자세 변화가 크지 않은 운용 조건에서 측정을 버리기보다 오래된 자세의 영향 여부를 사후 분석할 수 있도록 provenance를 명확히 남기기 위해서다.
+- 확인:
+  - 자세 timing 분류 경계값 unit test → `8 passed` (`test_sync.py` 전체).
+  - 11초 오래된 자세가 측정을 계속 생성하면서 `VERY_STALE`/`DEGRADED`와 CSV 기준값을 남기는 PyQt test, 체커보드 `N/A/NOT_USED` PyQt test → `2 passed`.
+  - PyQt 외 StereoDistance 전체 회귀 → `155 passed`.
+  - 전체 PyQt 실행의 첫 실패인 MAVLink shell flag test는 기준 작업트리에서도 동일하게 실패함을 확인했다. 해당 환경 의존 회귀 묶음은 이번 변경의 통과 근거로 사용하지 않았다.
+- 남은 위험:
+  - 실제 WIRIS/Pixhawk 연결에서 장시간 stale 전환과 색상 표시를 육안 확인하는 live smoke test는 아직 수행하지 않았다.
+  - 비차단 정책이므로 `STALE`/`VERY_STALE` row를 최종 정확도 분석에 포함할지는 분석 단계에서 명시적으로 결정해야 한다.
+- 좌표/소스 계약:
+  - 자세는 `px4_frd` orientation이고 측정은 `left_camera_rdf:[Right,Down,Forward,Range]`다. age/pair Δt와 상태 필드는 시간 provenance일 뿐 좌표 변환이나 출력 frame을 바꾸지 않는다.
+
+## v2.1.0 — 2026-07-20 — StereoDistance 측정 보정 코드 제거
+
+- 변경:
+  - Origin-BBOX reprojection/affine center adjustment, distance-binned 3-D bias, Kalman tracking filter의 runtime 모듈과 UI, 설정, 신규 기록 schema, 전용 테스트를 제거했다.
+  - Simulation-origin profile 생성·평가 helper와 shell entrypoint를 StereoDistance에서 제거했다. `Simulation/**`은 수정하지 않았다.
+  - 상대 자세 bias 캡처·차감 기능을 제거하고, 삼각측량에 필요한 quaternion 및 좌·우 상대 자세 계산만 `attitude_geometry.py`에 남겼다.
+  - 측정 출력은 `two_ray_closest_midpoint` Raw `[Right, Down, Forward, Range]` in `left_camera_rdf` 하나만 생성·표시·저장한다. Corrected/filtered/bias/profile 필드는 신규 row에 생성하지 않는다.
+  - Raw 기록의 모호한 `estimated_right/down/forward/range_m` alias를 제거하고, `estimated_north/east/down_m`은 `px4_local_ned`로 정렬된 UAM 비교 결과에만 사용하도록 분리했다.
+  - non-zero distortion의 live ray와 alignment가 clean clone에서도 동작하도록 OpenCV·NumPy·PyYAML을 runtime 의존성으로 명시하고 `run.sh --check`에서 실제 import/version을 검증한다.
+  - 체커보드 intrinsics/extrinsics calibration과 명시적 `left_camera_rdf -> px4_local_ned` UAM coordinate alignment는 서로 다른 frame을 구성·비교하기 위한 계약이므로 유지했다.
+- 이유:
+  - StereoDistance에는 아직 검증된 측정 보정법이 없으므로, 과거 실험용 보정 경로가 현재 측정 결과나 UI/CSV 계약으로 오인되는 것을 막고 Raw ray 측정만을 기준선으로 유지하기 위해서다.
+- 확인:
+  - `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 -m pytest -q StereoDistance/tests --ignore=StereoDistance/tests/test_stereo.py -p no:cacheprovider` → `153 passed`.
+  - 보정 제거·Raw 기록·좌표 계약 관련 PyQt 집중 회귀 → `5 passed`.
+  - 수정 전 작업트리에서도 동일하게 실패하는 9개 환경 의존 PyQt test를 제외한 `StereoDistance/tests/test_stereo.py` → `208 passed, 9 deselected`.
+  - 활성 source/config에서 제거 대상 module, symbol, field 검색 결과 없음. 체커보드 `reprojection_error_px`와 UAM coordinate alignment만 의도대로 유지했다.
+- 남은 위험:
+  - 실제 WIRIS/Pixhawk/GNSS 장비를 연결한 live smoke test는 아직 수행하지 않았다.
+  - 이전 세션과 archived paper에는 historical Corrected/filtered/bias field 또는 보정 연구 설명이 남을 수 있으나 현재 runtime은 이를 읽어 측정을 보정하지 않는다.
+- 좌표/소스 계약:
+  - detector ray는 각 `camera_optical_rdf`, Raw/public point와 range origin은 왼쪽 optical center의 `left_camera_rdf`, Pixhawk body attitude는 `px4_frd`, UAM 비교 truth는 `px4_local_ned`다.
+  - `left_camera_rdf` 측정값을 PX4 NED 값과 직접 빼지 않으며, exact-frame alignment profile이 있을 때만 비교한다.
+
+## v2.0.0 — 2026-07-20 — DKL ray core와 left-camera 출력 계약 도입
+
+- 변경:
+  - DKL 브랜치의 closest-two-ray midpoint 기하만 `sasl_common/stereo_geometry.py`로 선택 이식하고, StereoDistance Raw/public 출력을 `left_camera_rdf:[right,down,forward,range]`로 고정했다.
+  - 왼쪽 optical center를 원점으로 유지하고, 오른쪽 ray와 오른쪽 optical-center origin을 왼쪽 frame으로 변환한 뒤 삼각측량한다. baseline-center 이동과 public FRD reorder는 제거했다.
+  - detector pixel grid와 intrinsics grid가 다르거나, baseline/ray/depth/range가 유효하지 않으면 이유를 남기고 측정을 생성하지 않도록 했다.
+  - 과거 Origin-BBOX reprojection, affine bbox-center, 3-D bias, Kalman display 경로는 코드/과거 artifact 호환용으로 보존하되 runtime 측정과 live overlay 적용을 비활성화했다. 새 기록의 `Corrected`/`filtered` 값은 미설정 상태에서 비워 둔다.
+  - UAM 비교는 `left_camera_rdf`와 PX4 local NED를 직접 빼지 않는다. exact-frame alignment profile이 있을 때만 축/range/position 오차를 만들고, frame 없는 과거 profile은 legacy stereo-center artifact로 분류한다.
+  - 시간 offset 추정은 frame-compatible 위치 metric이 없을 때 matched count와 timestamp delta만 사용한다.
+- 이유:
+  - 전체 DKL 브랜치 merge로 기존 운영 기능과 테스트를 교체하지 않고, 검증 가능한 ray 측정 핵심만 도입하면서 사용자가 선택한 왼쪽 카메라 원점 출력 계약을 지키기 위해서다.
+- 확인:
+  - `PYTHONPATH=. python3 -m pytest -q StereoDistance/tests --ignore=StereoDistance/tests/test_stereo.py` → `179 passed`.
+  - 좌표/기록/UAM 관련 PyQt 집중 회귀 → `13 passed`.
+  - 현재 checkout 설정에 의존해 기준 branch에서도 실패하는 9개 기존 PyQt test를 제외한 전체 `test_stereo.py` → `212 passed, 9 deselected`.
+  - `python3 -m compileall -q sasl_common StereoDistance/wiris_stereo_distance`와 `git diff --check` 통과.
+  - `bash StereoDistance/run.sh --check` → `StereoDistance runtime check ok`.
+- 남은 위험:
+  - 실제 WIRIS/Pixhawk/GNSS 장비를 연결한 live smoke test는 아직 수행하지 않았다.
+  - GPS/RTK antenna baseline을 optical baseline으로 대용하고 nominal mount/느슨한 attitude timing을 쓰는 단순화와 장거리 near-parallel 민감도는 허용된 실험 한계로 남는다.
+  - 과거 stereo-center correction profile은 새 frame으로 변환하지 않았으며, 새 보정법은 `left_camera_rdf`에서 다시 calibration/validation해야 한다.
+- 좌표/소스 계약:
+  - pixel/ray는 `camera_optical_rdf`, Raw/public point와 range origin은 `left_camera_rdf`, Pixhawk attitude/body는 `px4_frd`, baseline/truth world source는 NED, aligned truth는 `px4_local_ned`다.
+  - checkerboard는 `X_right = R_left_to_right X_left + T_left_to_right`를 `R_right_to_left = R^T`, `C_right_left = -R^T T`로 역변환한다.
+
 ## v1.6.18 — 2026-06-29 — Pixhawk MAVLink-first 운용 기준
 
 - 변경:

@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from math import sqrt
 from typing import Iterable
 
-from wiris_stereo_distance.attitude_bias import normalize_quaternion, quaternion_conjugate, quaternion_multiply
+from sasl_common.stereo_geometry import (
+    PinholeIntrinsics,
+    RayTriangulationAttempt,
+    RayTriangulationResult,
+    normalize_vector,
+    ray_from_pixel,
+    triangulate_rays as triangulate_common_rays,
+)
+from wiris_stereo_distance.attitude_geometry import normalize_quaternion, quaternion_conjugate, quaternion_multiply
 from wiris_stereo_distance.calibration import CameraIntrinsics
 from wiris_stereo_distance.coordinate_contract import (
     BODY_FRAME,
@@ -24,16 +31,6 @@ BODY_TO_CAMERA_ROTATION: tuple[tuple[float, float, float], ...] = (
     (1.0, 0.0, 0.0),
 )
 
-
-@dataclass(frozen=True)
-class RayTriangulationResult:
-    distance_m: float
-    point_left_m: tuple[float, float, float]
-    closest_gap_m: float
-    baseline_m: float
-    method: str = "ray-triangulation"
-
-
 def _dot(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
@@ -42,23 +39,12 @@ def _sub(a, b):
     return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
 
 
-def _add(a, b):
-    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
-
-
 def _scale(a, s: float):
     return (a[0] * s, a[1] * s, a[2] * s)
 
 
 def _norm(a: tuple[float, float, float]) -> float:
     return sqrt(_dot(a, a))
-
-
-def _normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
-    n = _norm(v)
-    if n <= 0.0:
-        raise ValueError("zero-length vector")
-    return (v[0] / n, v[1] / n, v[2] / n)
 
 
 def stereo_center_point_from_left_camera(
@@ -121,8 +107,8 @@ def invert_left_to_right_camera_transform(
         for column in range(3)
     ]
     right_origin_in_left = tuple(
-        -sum(right_to_left[row][column] * translation[row] for row in range(3))
-        for column in range(3)
+        -sum(right_to_left[row][column] * translation[column] for column in range(3))
+        for row in range(3)
     )
     return right_to_left, right_origin_in_left
 
@@ -192,18 +178,45 @@ def relative_rotation_quaternion(left_q: Iterable[float], right_q: Iterable[floa
 
 
 def normalized_ray_from_pixel(u: float, v: float, intrinsics: CameraIntrinsics) -> tuple[float, float, float]:
+    """Convert a detector pixel to an undistorted optical RDF unit ray."""
+
     matrix = intrinsics.camera_matrix
     fx = float(matrix[0][0])
     fy = float(matrix[1][1])
     cx = float(matrix[0][2])
     cy = float(matrix[1][2])
-    if fx <= 0.0 or fy <= 0.0:
-        raise ValueError("invalid focal length")
-    # Distortion is stored but not numerically inverted here to avoid a hard OpenCV dependency
-    # in the live distance path. Calibration still records D for future undistortPoints use.
-    x = (float(u) - cx) / fx
-    y = (float(v) - cy) / fy
-    return _normalize((x, y, 1.0))
+    pinhole = PinholeIntrinsics(fx_px=fx, fy_px=fy, cx_px=cx, cy_px=cy)
+    distortion = tuple(float(value) for value in intrinsics.distortion_coefficients)
+    if distortion and any(abs(value) > 1.0e-15 for value in distortion):
+        import cv2
+        import numpy as np
+
+        normalized = cv2.undistortPoints(
+            np.asarray([[[float(u), float(v)]]], dtype=np.float64),
+            np.asarray(intrinsics.camera_matrix, dtype=np.float64),
+            np.asarray(distortion, dtype=np.float64),
+        )[0, 0]
+        return normalize_vector((float(normalized[0]), float(normalized[1]), 1.0))
+    return ray_from_pixel(u, v, pinhole)
+
+
+def triangulate_rays_attempt(
+    left_ray: tuple[float, float, float],
+    right_ray_in_left: tuple[float, float, float],
+    translation_right_in_left_m: tuple[float, float, float],
+) -> RayTriangulationAttempt:
+    """Run DKL closest-ray geometry in ``left_camera_rdf``.
+
+    Input order is optical RDF.  The left optical center is the fixed origin,
+    and ``translation_right_in_left_m`` is the right optical center expressed
+    in the left-camera frame.
+    """
+
+    return triangulate_common_rays(
+        right_origin_left_rdf_m=translation_right_in_left_m,
+        left_ray_left_rdf=left_ray,
+        right_ray_left_rdf=right_ray_in_left,
+    )
 
 
 def triangulate_rays(
@@ -211,35 +224,24 @@ def triangulate_rays(
     right_ray_in_left: tuple[float, float, float],
     translation_right_in_left_m: tuple[float, float, float],
 ) -> RayTriangulationResult | None:
-    d1 = _normalize(left_ray)
-    d2 = _normalize(right_ray_in_left)
-    t = translation_right_in_left_m
-    baseline = _norm(t)
-    if baseline <= 0.0:
-        return None
+    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m).result
 
-    # Closest points between L(s)=s*d1 and R(u)=t+u*d2.
-    a = _dot(d1, d1)
-    b = _dot(d1, d2)
-    c = _dot(d2, d2)
-    w0 = _scale(t, -1.0)
-    d = _dot(d1, w0)
-    e = _dot(d2, w0)
-    denom = a * c - b * b
-    if abs(denom) <= 1e-9:
-        return None
-    s = (b * e - c * d) / denom
-    u = (a * e - b * d) / denom
-    if s <= 0.0 or u <= 0.0:
-        return None
-    p1 = _scale(d1, s)
-    p2 = _add(t, _scale(d2, u))
-    midpoint = _scale(_add(p1, p2), 0.5)
-    gap = _norm(_sub(p1, p2))
-    distance = _norm(midpoint)
-    if distance <= 0.0:
-        return None
-    return RayTriangulationResult(distance, midpoint, gap, baseline)
+
+def triangulate_pixels_attempt(
+    *,
+    left_pixel: tuple[float, float],
+    right_pixel: tuple[float, float],
+    left_intrinsics: CameraIntrinsics,
+    right_intrinsics: CameraIntrinsics,
+    left_q: Iterable[float],
+    right_q: Iterable[float],
+    translation_right_in_left_m: tuple[float, float, float],
+) -> RayTriangulationAttempt:
+    left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
+    right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
+    right_to_left_q = relative_rotation_quaternion(left_q, right_q)
+    right_ray_in_left = normalize_vector(_rotate(right_to_left_q, right_ray))
+    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m)
 
 
 def triangulate_pixels(
@@ -252,11 +254,37 @@ def triangulate_pixels(
     right_q: Iterable[float],
     translation_right_in_left_m: tuple[float, float, float],
 ) -> RayTriangulationResult | None:
+    return triangulate_pixels_attempt(
+        left_pixel=left_pixel,
+        right_pixel=right_pixel,
+        left_intrinsics=left_intrinsics,
+        right_intrinsics=right_intrinsics,
+        left_q=left_q,
+        right_q=right_q,
+        translation_right_in_left_m=translation_right_in_left_m,
+    ).result
+
+
+def triangulate_pixels_with_pixhawk_mount_attempt(
+    *,
+    left_pixel: tuple[float, float],
+    right_pixel: tuple[float, float],
+    left_intrinsics: CameraIntrinsics,
+    right_intrinsics: CameraIntrinsics,
+    left_body_to_world_q: Iterable[float],
+    right_body_to_world_q: Iterable[float],
+    translation_right_in_left_m: tuple[float, float, float],
+) -> RayTriangulationAttempt:
     left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
-    right_to_left_q = relative_rotation_quaternion(left_q, right_q)
-    right_ray_in_left = _normalize(_rotate(right_to_left_q, right_ray))
-    return triangulate_rays(left_ray, right_ray_in_left, translation_right_in_left_m)
+    right_ray_in_left = normalize_vector(
+        right_camera_ray_to_left_camera(
+            right_ray,
+            left_body_to_world_q=left_body_to_world_q,
+            right_body_to_world_q=right_body_to_world_q,
+        )
+    )
+    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m)
 
 
 def triangulate_pixels_with_pixhawk_mount(
@@ -269,16 +297,30 @@ def triangulate_pixels_with_pixhawk_mount(
     right_body_to_world_q: Iterable[float],
     translation_right_in_left_m: tuple[float, float, float],
 ) -> RayTriangulationResult | None:
+    return triangulate_pixels_with_pixhawk_mount_attempt(
+        left_pixel=left_pixel,
+        right_pixel=right_pixel,
+        left_intrinsics=left_intrinsics,
+        right_intrinsics=right_intrinsics,
+        left_body_to_world_q=left_body_to_world_q,
+        right_body_to_world_q=right_body_to_world_q,
+        translation_right_in_left_m=translation_right_in_left_m,
+    ).result
+
+
+def triangulate_pixels_with_relative_pose_attempt(
+    *,
+    left_pixel: tuple[float, float],
+    right_pixel: tuple[float, float],
+    left_intrinsics: CameraIntrinsics,
+    right_intrinsics: CameraIntrinsics,
+    rotation_right_to_left: list[list[float]],
+    translation_right_in_left_m: tuple[float, float, float],
+) -> RayTriangulationAttempt:
     left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
-    right_ray_in_left = _normalize(
-        right_camera_ray_to_left_camera(
-            right_ray,
-            left_body_to_world_q=left_body_to_world_q,
-            right_body_to_world_q=right_body_to_world_q,
-        )
-    )
-    return triangulate_rays(left_ray, right_ray_in_left, translation_right_in_left_m)
+    right_ray_in_left = normalize_vector(_rotate_matrix(rotation_right_to_left, right_ray))
+    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m)
 
 
 def triangulate_pixels_with_relative_pose(
@@ -290,7 +332,11 @@ def triangulate_pixels_with_relative_pose(
     rotation_right_to_left: list[list[float]],
     translation_right_in_left_m: tuple[float, float, float],
 ) -> RayTriangulationResult | None:
-    left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
-    right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
-    right_ray_in_left = _normalize(_rotate_matrix(rotation_right_to_left, right_ray))
-    return triangulate_rays(left_ray, right_ray_in_left, translation_right_in_left_m)
+    return triangulate_pixels_with_relative_pose_attempt(
+        left_pixel=left_pixel,
+        right_pixel=right_pixel,
+        left_intrinsics=left_intrinsics,
+        right_intrinsics=right_intrinsics,
+        rotation_right_to_left=rotation_right_to_left,
+        translation_right_in_left_m=translation_right_in_left_m,
+    ).result

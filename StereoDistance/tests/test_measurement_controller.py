@@ -1,4 +1,7 @@
+from dataclasses import replace
 from types import SimpleNamespace
+
+import pytest
 
 from wiris_stereo_distance.calibration import (
     CameraIntrinsics,
@@ -66,6 +69,9 @@ def test_measurement_controller_pixhawk_rtk_triangulates_valid_pair() -> None:
     assert result.triangulated is not None
     assert result.estimate is not None
     assert result.estimate.distance_m == result.triangulated.distance_m
+    assert result.triangulated.point_frame == "left_camera_rdf"
+    assert result.triangulated.output_frame == "left_camera_rdf"
+    assert result.triangulation_reason == "ok"
     assert result.warnings == ()
 
 
@@ -87,6 +93,7 @@ def test_measurement_controller_reports_pixhawk_geometry_waiting() -> None:
     assert result.triangulated is None
     assert result.estimate is None
     assert "triangulation waiting for Pixhawk R" in result.warnings
+    assert result.triangulation_reason == "missing_pixhawk_rotation"
 
 
 def test_measurement_controller_reports_intrinsics_waiting() -> None:
@@ -108,6 +115,69 @@ def test_measurement_controller_reports_intrinsics_waiting() -> None:
     assert result.triangulated is None
     assert result.estimate is None
     assert "triangulation waiting for intrinsics" in result.warnings
+    assert result.triangulation_reason == "missing_intrinsics"
+
+
+def test_measurement_controller_preserves_ray_rejection_reason() -> None:
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=detection("left", x1=640.0, x2=660.0),
+            right=detection("right", x1=640.0, x2=660.0),
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=intrinsics_result(),
+            triangulation_source="pixhawk",
+            left_extrinsic=pixhawk_attitude(),
+            right_extrinsic=pixhawk_attitude(),
+            translation_right_in_left_m=(0.3, 0.0, 0.0),
+            sync_quality="GOOD",
+        )
+    )
+
+    assert result.triangulated is None
+    assert result.estimate is None
+    assert result.triangulation_reason == "near_parallel_rays"
+    assert "two-ray geometry rejected: near_parallel_rays" in result.warnings
+
+
+@pytest.mark.parametrize(
+    ("camera", "expected_reason"),
+    (
+        ("left", "left_pixel_grid_mismatch"),
+        ("right", "right_pixel_grid_mismatch"),
+    ),
+)
+def test_measurement_controller_fails_closed_on_detection_intrinsics_grid_mismatch(
+    camera: str,
+    expected_reason: str,
+) -> None:
+    left = detection("left", x1=690.0, x2=710.0)
+    right = detection("right", x1=640.0, x2=660.0)
+    if camera == "left":
+        left = replace(left, width=1920, height=1080)
+    else:
+        right = replace(right, width=1920, height=1080)
+
+    result = calculate_measurement_geometry(
+        MeasurementGeometryInput(
+            left=left,
+            right=right,
+            calibration=StereoCalibration(focal_length_px=900.0, baseline_m=0.3),
+            intrinsics=intrinsics_result(),
+            triangulation_source="pixhawk",
+            left_extrinsic=pixhawk_attitude(),
+            right_extrinsic=pixhawk_attitude(),
+            translation_right_in_left_m=(0.3, 0.0, 0.0),
+            sync_quality="GOOD",
+        )
+    )
+
+    assert result.triangulated is None
+    assert result.estimate is None
+    assert result.triangulation_reason == expected_reason
+    assert result.warnings == (
+        f"{camera} detection pixel grid 1920x1080 "
+        f"does not match {camera} intrinsics grid 1280x720",
+    )
 
 
 def test_measurement_controller_keeps_match_validation_separate_from_triangulation() -> None:

@@ -528,63 +528,6 @@ def test_camera_pane_preview_stream_updates_after_measurement_pair_display() -> 
     _ = app
 
 
-def test_bbox_center_adjustment_csv_updates_yolo_overlay_and_parameters(tmp_path, monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    matrix_path = tmp_path / "Cent_Bbox_Adj_Mtrx.csv"
-    matrix_path.write_text(
-        "\n".join(
-            (
-                "0.9,0,0,10",
-                "0,0.8,0,20",
-                "0,0,1,0",
-                "0.7,0,0,30",
-                "0,0.6,0,40",
-                "0,0,1,0",
-            )
-        ),
-        encoding="utf-8",
-    )
-
-    widget._load_bbox_center_adjustment_path(matrix_path)
-    widget.left_pane._set_detection_label(detection("left", x1=90, y1=80, x2=110, y2=120))
-    widget._refresh_camera_parameters_tab()
-
-    assert "corrected=(100.00, 100.00) px" in widget.left_pane.detection_label.text()
-    assert "bbox_center_adjustment: active" in widget.stereo_geometry_text.toPlainText()
-    assert "left: u'=0.900000u" in widget.stereo_geometry_text.toPlainText()
-    assert "right: u'=0.700000u" in widget.stereo_geometry_text.toPlainText()
-
-    widget.clear_bbox_center_adjustment()
-    assert "2D bbox 보정: 없음" in widget.bbox_adjust_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_range_only_reprojection_output_policy_preserves_raw_lateral() -> None:
-    from types import SimpleNamespace
-
-    import wiris_stereo_distance.gui as gui
-
-    panel = SimpleNamespace(
-        bbox_reprojection_profile=SimpleNamespace(output_policy="range_only_forward_fusion")
-    )
-
-    fused = gui.WirisStereoDistancePanel._apply_reprojection_output_policy(
-        panel,
-        raw_point_center_m=(3.0, -2.0, 800.0),
-        corrected_point_center_m=(10.0, 5.0, 760.0),
-    )
-
-    assert fused == (3.0, -2.0, 760.0)
-
-
 def test_identity_quaternion_is_zero_euler() -> None:
     attitude = quaternion_to_euler_deg([1, 0, 0, 0])
 
@@ -4527,7 +4470,6 @@ def test_px4_mag_manager_applies_manual_role_priorities(monkeypatch) -> None:
 
 
 def test_session_save_omits_pixhawk_mag_csv(tmp_path, monkeypatch) -> None:
-    import csv
     import json
 
     from PyQt5 import QtWidgets
@@ -4545,24 +4487,17 @@ def test_session_save_omits_pixhawk_mag_csv(tmp_path, monkeypatch) -> None:
     widget.recording_session_started_monotonic_s = time.monotonic() - 3.0
     widget.latest_vehicle_mag_device_ids["left"] = RM3100_PRIMARY_ID
     widget.latest_vehicle_mag_device_ids["right"] = 396809
-    widget.uam_analysis_rows = [{"row_index": "1", "error_distance_m": "0.25"}]
-
     widget.save_distance_history_csv()
 
     session_dir = tmp_path / "recordings" / "sessions" / "20260605_153012"
     metadata_path = session_dir / "metadata" / "session_metadata.json"
     mag_path = session_dir / "alignment" / "pixhawk_mag_status.csv"
-    uam_path = session_dir / "measurements" / "uam_analysis.csv"
     assert metadata_path.exists()
     assert not mag_path.exists()
-    assert uam_path.exists()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["session_dir"] == str(session_dir)
-    assert metadata["uam_analysis_sample_count"] == 1
     assert "pixhawk_mag_status_sample_count" not in metadata
     assert "pixhawk_mag_actual_selected_device_ids" not in metadata
-    uam_rows = list(csv.DictReader(uam_path.open(newline="", encoding="utf-8")))
-    assert uam_rows == [{"row_index": "1", "error_distance_m": "0.25"}]
 
     widget.deleteLater()
     _ = app
@@ -5633,7 +5568,6 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert [widget.setup_tabs.tabText(index) for index in range(widget.setup_tabs.count())] == [
         "WIRIS",
         "Pixhawk",
-        "UAM",
     ]
     assert [widget.calibration_tabs.tabText(index) for index in range(widget.calibration_tabs.count())] == [
         "체커보드",
@@ -5656,7 +5590,6 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
         "WIRIS SDK",
         "필드 감시",
         "Baseline 필드",
-        "Bias 보정",
     ]
     assert [widget.parameter_tabs.tabText(index) for index in range(widget.parameter_tabs.count())] == [
         "내부",
@@ -5669,20 +5602,16 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     ]
     assert [widget.save_tabs.tabText(index) for index in range(widget.save_tabs.count())] == [
         "세션 저장",
-        "UAM 비교",
         "기록 샘플",
     ]
     assert widget.advanced_tabs.tabText(widget.wiris_command_tab_index) == "WIRIS SDK"
     assert widget.advanced_tabs.tabText(widget.advanced_baseline_field_tab_index) == "Baseline 필드"
-    assert widget.advanced_tabs.tabText(widget.center_bias_tab_index) == "Bias 보정"
     assert widget.setup_tabs.tabText(widget.pixhawk_connection_tab_index) == "Pixhawk"
-    assert widget.setup_tabs.tabText(widget.uam_connection_tab_index) == "UAM"
     assert widget.tabs.tabText(widget.camera_parameters_tab_index) == "파라미터"
     assert widget.parameter_tabs.tabText(widget.intrinsic_parameters_tab_index) == "내부"
     assert widget.parameter_tabs.tabText(widget.extrinsic_parameters_tab_index) == "외부/기하"
     assert widget.parameter_tabs.tabText(widget.stereo_settings_tab_index) == "계산 설정"
     assert widget.save_tabs.tabText(widget.save_session_tab_index) == "세션 저장"
-    assert widget.save_tabs.tabText(widget.uam_analysis_tab_index) == "UAM 비교"
     assert widget.save_tabs.tabText(widget.recording_samples_tab_index) == "기록 샘플"
     assert widget.calibration_tabs.tabText(widget.checkerboard_calibration_tab_index) == "체커보드"
     assert widget.calibration_tabs.tabText(widget.zoom_intrinsics_tab_index) == "줌 내부 파라미터"
@@ -6044,13 +5973,16 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
                 roll_deg=0.0,
                 pitch_deg=0.0,
                 yaw_deg=0.0,
-                timestamp_s=10.0,
+                # Deliberately old relative to the t=10 detection pair.  The
+                # UI must expose this without blocking ray triangulation.
+                timestamp_s=-1.0,
                 topic="mavlink/ATTITUDE",
                 q=(1.0, 0.0, 0.0, 0.0),
             ),
         )
     widget.apply_intrinsics_to_distance()
     widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
+    widget.distance_recording_enabled = True
     widget._update_detection(
         "left",
         detection(
@@ -6076,13 +6008,95 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
         ),
     )
 
-    assert "triangulated-pixhawk" in widget.distance_label.text()
+    assert "two_ray_closest_midpoint-pixhawk" in widget.distance_label.text()
     assert "baseline=gps-rtk:0.300m" in widget.distance_label.text()
+    assert "ATT:VERY_STALE" in widget.distance_label.text()
+    assert "quality=DEGRADED" in widget.distance_label.text()
+    assert "telemetryRange" not in widget.distance_label.text()
     assert "gap:" in widget.triangulation_quality_gap_label.text()
-    assert "mode: triangulated-pixhawk" in widget.triangulation_quality_mode_label.text()
-    assert "Raw center 3D point:" in widget.triangulation_quality_raw_point_label.text()
+    assert "mode: two_ray_closest_midpoint-pixhawk" in widget.triangulation_quality_mode_label.text()
+    assert "Attitude timing [VERY_STALE]" in widget.triangulation_quality_attitude_label.text()
+    assert "Left age 11.000 s" in widget.triangulation_quality_attitude_label.text()
+    assert widget.triangulation_quality_attitude_label.property("healthLevel") == "bad"
+    assert "Raw left_camera_rdf point:" in widget.triangulation_quality_raw_point_label.text()
     assert "3D ray 거리: Pixhawk 자세 + GPS/RTK baseline 사용" in widget.stereo_geometry_text.toPlainText()
     assert "위치/자세 출처=Pixhawk 자세 + GPS/RTK baseline" in widget.distance_parameters_label.text()
+    row = widget.distance_recording_rows[-1]
+    assert row["method"] == "two_ray_closest_midpoint-pixhawk"
+    assert row["measurement_frame"] == "left_camera_rdf"
+    assert row["left_camera_right_m"] == row["raw_left_camera_right_m"]
+    assert row["stereo_center_right_m"] == ""
+    assert row["attitude_timing_status"] == "VERY_STALE"
+    assert row["attitude_timing_policy"] == "display_only_non_blocking"
+    assert row["attitude_timing_blocks_measurement"] == "false"
+    assert row["attitude_stale_age_threshold_s"] == "2.000"
+    assert row["attitude_very_stale_age_threshold_s"] == "10.000"
+    assert row["attitude_stale_pair_delta_threshold_s"] == "1.000"
+    assert row["attitude_very_stale_pair_delta_threshold_s"] == "5.000"
+    assert "telemetry_range_m" not in row
+    assert "live_truth_range_m" not in row
+    assert "corrected_range_m" not in row
+    assert "filtered_range_m" not in row
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_checkerboard_triangulation_marks_pixhawk_attitude_not_used() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.calibration import (
+        CameraIntrinsics,
+        CheckerboardConfig,
+        StereoExtrinsics,
+        StereoIntrinsicsResult,
+    )
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+    intrinsics = CameraIntrinsics(
+        width=1280,
+        height=720,
+        camera_matrix=[[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.0],
+        reprojection_error_px=0.2,
+        image_count=20,
+    )
+    widget.last_calibration_result = StereoIntrinsicsResult(
+        left=intrinsics,
+        right=intrinsics,
+        board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.03),
+        extrinsics=StereoExtrinsics(
+            rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation_left_to_right_m=[-0.3, 0.0, 0.0],
+            reprojection_error_px=0.2,
+            pair_count=20,
+        ),
+    )
+    widget.apply_intrinsics_to_distance()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("checkerboard"))
+    widget.distance_recording_enabled = True
+    timestamp_metadata = {"rtcp_frame_ntp_unix_s": 1_800_000_000.000}
+    widget._update_detection(
+        "left",
+        detection("left", x1=630, y1=350, x2=650, y2=370, t=10.0, timestamp_metadata=timestamp_metadata),
+    )
+    widget._update_detection(
+        "right",
+        detection("right", x1=576, y1=350, x2=596, y2=370, t=10.0, timestamp_metadata=timestamp_metadata),
+    )
+
+    assert "two_ray_closest_midpoint-checkerboard" in widget.distance_label.text()
+    assert "ATT:N/A" in widget.distance_label.text()
+    assert "Attitude timing [N/A]" in widget.triangulation_quality_attitude_label.text()
+    assert "PIXHAWK ATTITUDE NOT USED" in widget.triangulation_quality_attitude_label.text()
+    assert widget.triangulation_quality_attitude_label.property("healthLevel") == "idle"
+    row = widget.distance_recording_rows[-1]
+    assert row["attitude_used_for_triangulation"] == "false"
+    assert row["attitude_timing_status"] == "NOT_USED"
+    assert row["left_attitude_age_s"] == ""
+    assert row["right_attitude_age_s"] == ""
 
     widget.deleteLater()
     _ = app
@@ -6784,7 +6798,6 @@ def test_time_tab_stream_sync_status_reports_rtcp_pc_offsets(monkeypatch) -> Non
     assert "불량" not in status
     assert "주의" not in detail
     assert "time_basis: RTCP Sender Report" in detail
-    assert "UAM 시간 기준: RTCP/NTP 조건 충족, UTC 기준은 미검증" == widget.uam_time_sync_status_label.text()
 
     widget.deleteLater()
     _ = app
@@ -6850,7 +6863,7 @@ def test_camera_time_sync_metrics_separate_relative_pair_from_absolute_pc_qualit
     assert absolute_invalid["status"] == "absolute-rtcp-invalid"
     assert absolute_invalid["pair_delta_s"] == pytest.approx(0.020)
     assert absolute_invalid["max_pc_offset_ms"] is None
-    assert "UAM UTC" in absolute_invalid["warning"]
+    assert "절대 UTC" in absolute_invalid["warning"]
 
     widget.deleteLater()
     _ = app
@@ -6957,7 +6970,7 @@ def test_recorded_distance_row_keeps_camera_time_sync_contract(monkeypatch) -> N
     )
     estimate = type("Estimate", (), {"left": left, "right": right})()
 
-    row = widget._record_bias_sync_timestamp_parameters(estimate)
+    row = widget._record_measurement_sync_timestamp_parameters(estimate)
 
     assert row["camera_time_sync_status"] in {"within-threshold-unverified", "pc-offset-failed"}
     assert row["camera_time_sync_basis"] == "rtcp-sender-report-ntp"
@@ -7432,9 +7445,6 @@ def test_distance_history_plot_tracks_xyz_and_distance_panels(monkeypatch) -> No
         x_m=1.0,
         y_m=5.2,
         z_m=-0.4,
-        live_truth_range_m=6.4,
-        live_range_error_m=-1.0,
-        alignment_profile_id="live_profile",
         sample_key=(1.0, 2.0, "triangulated-pixhawk"),
     )
     plot.add_point(point)
@@ -7446,15 +7456,14 @@ def test_distance_history_plot_tracks_xyz_and_distance_panels(monkeypatch) -> No
     assert plot._plot_metrics("z_m") is not None
     distance_metrics = plot._plot_metrics("distance_m")
     assert distance_metrics is not None
-    assert distance_metrics[3] == 5.4
-    assert distance_metrics[4] == 6.4
+    assert distance_metrics[3] < 5.4 < distance_metrics[4]
 
     plot._selected_point_keys.add(plot._point_key(point))
     selected_text = plot._selected_point_text() or ""
     assert "Right/Down/Forward: +1.00, +5.20, -0.40 m" in selected_text
-    assert "Telemetry range: 6.40 m" in selected_text
-    assert "YOLO-Telemetry error: -1.00 m" in selected_text
-    assert "Telemetry Range" in plot._panel_series("distance_m", "Range", "m", "")[1][1]
+    assert plot._panel_series("distance_m", "Range", "m", "") == (
+        ("distance_m", "Range", "m", ""),
+    )
 
     plot.deleteLater()
     _ = app
@@ -7605,7 +7614,11 @@ def test_recording_sample_table_shows_live_csv_fields(monkeypatch) -> None:
     assert widget.recording_sample_table.rowCount() == 1
     assert widget.recording_sample_table.item(0, 1).text() == "6.000000"
     assert widget.recording_sample_table.item(0, 3).text() == "GOOD"
-    assert widget.recording_sample_table.item(0, 11).text() == "3.000000"
+    relative_yaw_column = next(
+        index for index, (field, _label) in enumerate(gui.RECORDED_SAMPLE_TABLE_COLUMNS)
+        if field == "relative_yaw_deg"
+    )
+    assert widget.recording_sample_table.item(0, relative_yaw_column).text() == "3.000000"
     assert "distance_m: 6.000000" in widget.recording_sample_detail.toPlainText()
     assert "warnings: low baseline confidence" in widget.recording_sample_detail.toPlainText()
 
@@ -7618,114 +7631,7 @@ def test_recording_sample_table_shows_live_csv_fields(monkeypatch) -> None:
     _ = app
 
 
-def test_distance_recording_saves_filtered_and_corrected_tracking_fields(monkeypatch) -> None:
-    from types import SimpleNamespace
-
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.tracking_filter import TrackingUpdateResult
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.distance_recording_enabled = True
-
-    estimate = SimpleNamespace(
-        left=SimpleNamespace(timestamp_s=2.0, class_name="UAV"),
-        right=SimpleNamespace(timestamp_s=2.05, class_name="UAV"),
-        sync_quality="GOOD",
-        disparity_px=111.0,
-        time_delta_s=0.05,
-        vertical_delta_px=1.5,
-        warnings=[],
-        left_attitude_age_s=None,
-        right_attitude_age_s=None,
-        attitude_pair_delta_s=None,
-        relative_roll_deg=None,
-        relative_pitch_deg=None,
-        relative_yaw_deg=None,
-    )
-    tracking_result = TrackingUpdateResult(
-        point_m=(1.0, 2.0, 9.0),
-        velocity_mps=(0.1, 0.2, 0.3),
-        covariance_diag_m2=(0.01, 0.02, 0.03),
-        measurement_std_m=(0.4, 0.4, 6.0),
-        accepted=True,
-        initialized=True,
-        reset=False,
-        normalized_innovation=1.25,
-        timestamp_s=2.05,
-    )
-
-    assert widget._append_distance_history(
-        estimate=estimate,
-        distance_m=9.273618,
-        method="triangulated-pixhawk+kf",
-        baseline_source="manual",
-        baseline_m=25.0,
-        point_m=tracking_result.point_m,
-        raw_point_m=(4.0, 5.0, 12.0),
-        corrected_point_m=(2.0, 3.0, 10.0),
-        tracking_result=tracking_result,
-    )
-
-    row = widget.distance_recording_rows[-1]
-    assert row["distance_m"] == "9.273618"
-    assert row["filtered_forward_m"] == "9.000000"
-    assert row["corrected_forward_m"] == "10.000000"
-    assert row["raw_forward_m"] == "12.000000"
-    assert row["tracking_filter_id"] == "constant_velocity_kalman_v1"
-    assert row["tracking_accepted"] == "true"
-    assert row["tracking_velocity_forward_mps"] == "0.300000"
-    assert widget.distance_history[-1].z_m == 9.0
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_bias_profile_uses_raw_minus_drone_error_bins(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    profile = widget._bias_profile_from_rows(
-        [
-            {
-                "raw_distance_m": "12.0",
-                "raw_x_m": "0.0",
-                "raw_y_m": "2.0",
-                "raw_z_m": "6.0",
-                "drone_x_m": "-1.0",
-                "drone_y_m": "1.5",
-                "drone_z_m": "5.0",
-            },
-            {
-                "raw_distance_m": "18.0",
-                "raw_x_m": "2.0",
-                "raw_y_m": "3.0",
-                "raw_z_m": "8.0",
-                "drone_x_m": "1.0",
-                "drone_y_m": "1.5",
-                "drone_z_m": "5.0",
-            },
-        ],
-        bin_size_m=20.0,
-    )
-
-    assert profile is not None
-    assert len(profile.bins) == 1
-    assert profile.correction(15.0) == (1.0, 1.0, 2.0)
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_bias_recording_saves_bbox_drone_raw_corrected_and_error_fields(monkeypatch) -> None:
+def test_raw_recording_saves_bbox_geometry_and_pixhawk_status_fields(monkeypatch) -> None:
     from types import SimpleNamespace
 
     from PyQt5 import QtWidgets
@@ -7733,11 +7639,11 @@ def test_bias_recording_saves_bbox_drone_raw_corrected_and_error_fields(monkeypa
     import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
     from wiris_stereo_distance.rtk_geometry import GpsPositionState
-    from wiris_stereo_distance.uam_telemetry import UamAlignmentProfile
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
     widget.distance_recording_enabled = True
     now_s = time.monotonic()
     widget.latest_extrinsics["left"] = CameraExtrinsicState(
@@ -7780,32 +7686,6 @@ def test_bias_recording_saves_bbox_drone_raw_corrected_and_error_fields(monkeypa
         eph_m=0.22,
         epv_m=0.44,
     )
-    widget.latest_drone_position_m = (9.0, 1.5, 3.0)
-    widget.uam_alignment_profile = UamAlignmentProfile(
-        profile_id="live_alignment",
-        rotation_matrix=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
-        origin_offset_m=(7.0, 1.5, 3.0),
-        sample_count=4,
-        rmse_m=0.0,
-        max_error_m=0.0,
-        created_unix_s=1.0,
-    )
-    widget.active_bias_profile = gui.BBoxBiasProfile(
-        profile_id="test_profile",
-        bins=(
-            gui.BBoxBiasBin(
-                min_m=0.0,
-                max_m=100.0,
-                bias_x_m=1.0,
-                bias_y_m=0.5,
-                bias_z_m=-2.0,
-                sample_count=3,
-            ),
-        ),
-        created_unix_s=1.0,
-    )
-
-    widget.latest_drone_position_timestamp_s = 3.02
     estimate = SimpleNamespace(
         left=detection(
             "left",
@@ -7850,40 +7730,34 @@ def test_bias_recording_saves_bbox_drone_raw_corrected_and_error_fields(monkeypa
         raw_point_m=(10.0, 2.5, 2.0),
         raw_point_left_m=(10.15, 2.5, 2.0),
         translation_right_in_left_m=(0.3, 0.0, 0.0),
-        bias_correction_m=(1.0, 0.5, -2.0),
     )
 
     row = widget.distance_recording_rows[-1]
-    assert row["measurement_frame"] == "stereo_center_opencv_optical"
-    assert row["measurement_axis_contract"] == "x/right,y/down,z/forward"
+    assert row["measurement_frame"] == "left_camera_rdf"
+    assert row["measurement_axis_contract"] == "left_camera_rdf:right_down_forward"
+    assert row["public_vector_contract"] == "left_camera_rdf:[right,down,forward,range]"
+    assert row["legacy_xyz_alias_contract"] == "x=right,y=down,z=forward"
+    assert row["measurement_method"] == "two_ray_closest_midpoint"
     assert row["raw_x_m"] == "10.000000"
+    assert row["raw_left_camera_right_m"] == "10.000000"
+    assert row["raw_stereo_center_right_m"] == ""
+    assert "estimated_right_m" not in row
+    assert "estimated_down_m" not in row
+    assert "estimated_forward_m" not in row
+    assert "estimated_range_m" not in row
     assert row["raw_left_x_m"] == "10.150000"
     assert row["translation_right_in_left_x_m"] == "0.300000"
-    assert row["corrected_z_m"] == "4.000000"
-    assert row["live_truth_range_m"] == "2.000000"
-    assert row["live_range_error_m"] == "7.250000"
-    assert row["live_range_error_basis"] == "baseline_center"
-    assert row["live_range_alignment_profile_id"] == "live_alignment"
-    assert row["telemetry_range_m"] == "2.000000"
-    assert row["telemetry_range_error_m"] == "7.250000"
-    assert row["telemetry_range_basis"] == "baseline_center"
-    assert row["telemetry_range_profile_id"] == "live_alignment"
-    assert "telemetry_baseline_center_distance_m" not in row
-    assert "telemetry_baseline_range_error_m" not in row
-    assert "origin_baseline_center_distance_m" not in row
-    assert "origin_baseline_range_error_m" not in row
-    assert widget.distance_history[-1].live_truth_range_m == 2.0
-    assert widget.distance_history[-1].live_range_error_m == 7.25
-    assert row["drone_north_m"] == "9.000000"
-    assert row["drone_y_m"] == "1.500000"
-    assert row["error_x_m"] == "0.000000"
-    assert row["error_frame"] == "mixed-stereo-center-vs-px4-local-ned"
-    assert row["error_y_m"] == "0.500000"
-    assert row["error_z_m"] == "1.000000"
-    assert row["bias_profile_id"] == "test_profile"
+    assert "corrected_z_m" not in row
+    assert "filtered_distance_m" not in row
+    assert "tracking_filter_id" not in row
+    assert "live_truth_range_m" not in row
+    assert "telemetry_range_m" not in row
+    assert "drone_north_m" not in row
+    assert "error_x_m" not in row
+    assert "bias_profile_id" not in row
     assert row["world_frame"] == "ned"
     assert row["body_frame"] == "px4_frd"
-    assert row["camera_frame"] == "opencv_optical"
+    assert row["camera_frame"] == "camera_optical_rdf"
     assert row["attitude_frame"] == "px4_frd"
     assert row["attitude_units"] == "deg"
     assert row["left_roll_deg"] == "1.000000"
@@ -7909,540 +7783,7 @@ def test_bias_recording_saves_bbox_drone_raw_corrected_and_error_fields(monkeypa
     assert row["right_bbox_confidence"] == "0.900000"
     assert row["bbox_mid_timestamp_s"] == "3.025000"
     assert row["bbox_mid_utc_unix_s"] == "1800000000.025000"
-    assert row["drone_timestamp_s"] == "3.020000"
-    assert row["drone_age_s"] == "0.005000"
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_drone_position_watch_updates_latest_drone_position(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.pixhawk_attitude import CustomTopicSample
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    for key, value in (("drone_x", 1.0), ("drone_y", -2.0), ("drone_z", 3.5)):
-        widget._update_custom_watch(
-            CustomTopicSample(
-                key=key,
-                topic="/pose",
-                field_path=key,
-                value_text=str(value),
-                numeric_value=value,
-                timestamp_s=1.0,
-            )
-        )
-
-    assert widget.latest_drone_position_m == (1.0, -2.0, 3.5)
-    assert len(widget.uam_live_telemetry_samples) == 1
-    assert widget.uam_live_telemetry_samples[-1].source == "live-ros2"
-    assert widget.custom_watch_remove_combo.findData("drone_x") < 0
-    assert "N=+1.000" in widget.bias_drone_status_label.text()
-    assert widget.bias_drone_status_label.text().startswith("UAM 중심 위치:")
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_mavlink_watch_updates_live_buffer(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.pixhawk_attitude import CustomTopicSample
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    for key, value in (("left:uam_x", 10.0), ("left:uam_y", -2.0), ("left:uam_z", -1.0)):
-        widget._update_custom_watch(
-            CustomTopicSample(
-                key=key,
-                topic="mavlink/LOCAL_POSITION_NED",
-                field_path=key,
-                value_text=str(value),
-                numeric_value=value,
-                timestamp_s=3.0,
-            )
-        )
-
-    assert widget.latest_drone_position_m == (10.0, -2.0, -1.0)
-    assert len(widget.uam_live_telemetry_samples) == 1
-    assert widget.uam_live_telemetry_samples[-1].source == "live-mavlink:left"
-    assert "source=live-mavlink:left" in widget.uam_latest_label.text()
-    assert any(point.series == "truth_north_m" and point.value == 10.0 for point in widget.uam_raw_plot.points)
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_usb_mavlink_uses_separate_subscriber(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    class FakeSignal:
-        def __init__(self) -> None:
-            self.slots = []
-
-        def connect(self, slot) -> None:
-            self.slots.append(slot)
-
-    class FakeMavlinkSubscriber:
-        instances = []
-
-        def __init__(self, *, left_url, right_url, left_baud=57600, right_baud=57600, custom_watches=()) -> None:
-            self.urls = {"left": left_url, "right": right_url}
-            self.baudrates = {"left": left_baud, "right": right_baud}
-            self.custom_watches = list(custom_watches)
-            self.connections = {}
-            self.gps_changed = FakeSignal()
-            self.custom_watch_changed = FakeSignal()
-            self.status_changed = FakeSignal()
-            self.extrinsic_changed = FakeSignal()
-            self.mag_sensor_changed = FakeSignal()
-            self.gps_sensor_changed = FakeSignal()
-            self.gnss_relative_changed = FakeSignal()
-            self.shell_output = FakeSignal()
-            self.started_camera = None
-            self.instances.append(self)
-
-        def start(self, camera=None) -> None:
-            self.started_camera = camera
-            if camera == "left" and self.urls["left"]:
-                self.connections["left"] = object()
-
-        def stop(self, camera=None) -> None:
-            self.connections.clear()
-
-        def add_custom_watch(self, spec) -> None:
-            self.custom_watches.append(spec)
-
-        def remove_custom_watch(self, key) -> None:
-            self.custom_watches = [spec for spec in self.custom_watches if spec.get("key") != key]
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    monkeypatch.setattr(gui, "DualPixhawkMavlinkSubscriber", FakeMavlinkSubscriber)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget._set_combo_data(widget.uam_source_combo, "mavlink")
-    widget.uam_mavlink_url_edit.setText("/dev/ttyACM7")
-    widget.uam_mavlink_baud_spin.setValue(921600)
-
-    widget.connect_uam_telemetry_from_ui()
-
-    subscriber = widget.uam_mavlink_pixhawk
-    assert subscriber is not None
-    assert widget.mavlink_pixhawk is None
-    assert subscriber.urls == {"left": "/dev/ttyACM7", "right": ""}
-    assert subscriber.baudrates["left"] == 921600
-    assert subscriber.started_camera == "left"
-    assert all(spec["source"] == "uam_mavlink" for spec in subscriber.custom_watches)
-    assert {spec["key"] for spec in subscriber.custom_watches} == {"uam_x", "uam_y", "uam_z"}
-    assert "MAVLink watch 등록" in widget.uam_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_usb_mavlink_gps_converts_to_local_ned(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.rtk_geometry import GpsPositionState
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget._set_combo_data(widget.uam_source_combo, "mavlink_gps")
-
-    widget._update_uam_live_telemetry_from_gps(
-        "left",
-        GpsPositionState(
-            camera="left",
-            namespace="uam_usb",
-            timestamp_s=10.0,
-            topic="mavlink/GPS_RAW_INT",
-            latitude_deg=37.0,
-            longitude_deg=127.0,
-            altitude_m=100.0,
-        ),
-    )
-    widget._update_uam_live_telemetry_from_gps(
-        "left",
-        GpsPositionState(
-            camera="left",
-            namespace="uam_usb",
-            timestamp_s=11.0,
-            topic="mavlink/GPS_RAW_INT",
-            latitude_deg=37.00001,
-            longitude_deg=127.00002,
-            altitude_m=98.5,
-        ),
-    )
-
-    assert widget.latest_drone_position_m is not None
-    north_m, east_m, down_m = widget.latest_drone_position_m
-    assert north_m > 0.0
-    assert east_m > 0.0
-    assert down_m == 1.5
-    assert widget.latest_drone_truth_sample is not None
-    assert widget.latest_drone_truth_sample.source_frame == "global_lla"
-    assert widget.latest_drone_truth_sample.source_axis_contract == "lat_deg,lon_deg,alt_m"
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_disconnect_uam_telemetry_removes_uam_watches(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    for axis in ("x", "y", "z"):
-        widget._add_custom_topic_watch(
-            key=f"uam_{axis}",
-            topic="/uav_0/fmu/out/vehicle_local_position",
-            field=axis,
-            source="ros2",
-        )
-    widget.latest_drone_position_m = (1.0, 2.0, 3.0)
-    widget.latest_drone_position_timestamp_reference = "live-ros2"
-    widget.latest_drone_position_utc_unix_s = 1_800_000_000.0
-
-    widget.disconnect_uam_telemetry_from_ui()
-
-    assert all(widget.custom_watch_remove_combo.findData(f"uam_{axis}") < 0 for axis in ("x", "y", "z"))
-    assert not any(str(spec.get("key", "")).startswith("uam_") for spec in widget.custom_watch_specs)
-    assert widget.latest_drone_position_m is None
-    assert widget.latest_drone_position_timestamp_reference == "app-receive"
-    assert widget.latest_drone_position_utc_unix_s is None
-    assert "해제됨" in widget.uam_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_time_offset_estimate_applies_and_runs_analysis(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.uam_telemetry import UamTelemetrySample
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.distance_recording_rows = [
-        {"timestamp_s": "1.0", "x_m": "0.0", "y_m": "0.0", "z_m": "0.0", "distance_m": "0.0"},
-        {"timestamp_s": "2.0", "x_m": "1.0", "y_m": "0.0", "z_m": "0.0", "distance_m": "1.0"},
-        {"timestamp_s": "3.0", "x_m": "2.0", "y_m": "0.0", "z_m": "0.0", "distance_m": "2.0"},
-    ]
-    widget.uam_ulog_samples = [
-        UamTelemetrySample(timestamp_s=11.0, x_m=0.0, y_m=0.0, z_m=0.0, source="ulog:test"),
-        UamTelemetrySample(timestamp_s=12.0, x_m=1.0, y_m=0.0, z_m=0.0, source="ulog:test"),
-        UamTelemetrySample(timestamp_s=13.0, x_m=2.0, y_m=0.0, z_m=0.0, source="ulog:test"),
-    ]
-    widget.uam_compare_max_dt_spin.setValue(0.2)
-    widget.uam_time_offset_spin.setValue(0.0)
-
-    widget.estimate_uam_time_offset_from_ui()
-
-    assert widget.uam_time_offset_spin.value() == 10.0
-    assert len(widget.uam_analysis_rows) == 3
-    assert widget.uam_analysis_rows[0]["truth_source"] == "ulog:test"
-    assert widget.uam_plot_stack.currentWidget() is widget.uam_error_plot
-    assert "rows=3" in widget.uam_analysis_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_alignment_estimate_applies_ned_origin_correction(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.uam_telemetry import UamTelemetrySample
-
-    def camera_to_ned(point: tuple[float, float, float]) -> tuple[float, float, float]:
-        right, down, forward = point
-        return (10.0 + forward, 20.0 + right, 30.0 + down)
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    camera_points = [
-        (1.0, 0.0, 0.0),
-        (0.0, 1.0, 0.0),
-        (0.0, 0.0, 1.0),
-        (2.0, 1.0, 3.0),
-    ]
-    widget.distance_recording_rows = [
-        {
-            "timestamp_s": f"{index + 1}.0",
-            "x_m": f"{point[0]}",
-            "y_m": f"{point[1]}",
-            "z_m": f"{point[2]}",
-            "distance_m": "1.0",
-        }
-        for index, point in enumerate(camera_points)
-    ]
-    widget.uam_ulog_samples = [
-        UamTelemetrySample(
-            timestamp_s=float(index + 1),
-            x_m=camera_to_ned(point)[0],
-            y_m=camera_to_ned(point)[1],
-            z_m=camera_to_ned(point)[2],
-            source="ulog:test",
-        )
-        for index, point in enumerate(camera_points)
-    ]
-    widget.uam_compare_max_dt_spin.setValue(0.01)
-
-    widget.estimate_uam_alignment_from_ui()
-
-    assert widget.uam_alignment_profile is not None
-    assert widget.uam_alignment_profile.sample_count == 4
-    assert len(widget.uam_analysis_rows) == 4
-    assert widget.uam_analysis_rows[0]["comparison_frame"] == "px4_local_ned"
-    assert widget.uam_analysis_rows[0]["estimated_north_m"] == "10.000000"
-    assert widget.uam_analysis_rows[0]["estimated_east_m"] == "21.000000"
-    assert widget.uam_analysis_rows[0]["estimated_down_m"] == "30.000000"
-    assert widget.uam_analysis_rows[0]["truth_rdf_right_m"] == "1.000000"
-    assert widget.uam_analysis_rows[0]["truth_rdf_down_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["truth_rdf_forward_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["error_rdf_right_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["error_rdf_down_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["error_rdf_forward_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["measurement_frd_forward_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["measurement_frd_right_m"] == "1.000000"
-    assert widget.uam_analysis_rows[0]["measurement_frd_down_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["truth_frd_forward_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["truth_frd_right_m"] == "1.000000"
-    assert widget.uam_analysis_rows[0]["truth_frd_down_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["error_frd_forward_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["error_frd_right_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["error_frd_down_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["estimated_range_m"] == "1.000000"
-    assert widget.uam_analysis_rows[0]["truth_range_m"] == "1.000000"
-    assert "estimated_baseline_center_distance_m" not in widget.uam_analysis_rows[0]
-    assert "truth_baseline_center_distance_m" not in widget.uam_analysis_rows[0]
-    assert widget.uam_analysis_rows[0]["range_error_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["range_error_basis"] == "baseline_center"
-    assert widget.uam_analysis_rows[0]["error_distance_kind"] == "position_error_m"
-    assert "alignment=" in widget.uam_analysis_status_label.text()
-    assert "rmse=" in widget.uam_alignment_status_label.text()
-    assert any(point.series == "error_frd_forward_m" for point in widget.uam_error_plot.points)
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_alignment_profile_save_and_load(monkeypatch, tmp_path) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.uam_telemetry import UamAlignmentProfile
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    profile = UamAlignmentProfile(
-        profile_id="saved_alignment",
-        rotation_matrix=((0.0, 0.0, 1.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
-        origin_offset_m=(10.0, 20.0, 30.0),
-        sample_count=4,
-        rmse_m=0.01,
-        max_error_m=0.02,
-        created_unix_s=1_800_000_000.0,
-    )
-    path = tmp_path / "alignment.json"
-    widget.uam_alignment_profile = profile
-
-    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName", lambda *args, **kwargs: (str(path), ""))
-    widget.save_uam_alignment_profile()
-
-    assert path.exists()
-    assert widget.uam_alignment_profile_path == path
-
-    widget.uam_alignment_profile = None
-    widget.uam_alignment_profile_path = None
-    monkeypatch.setattr(QtWidgets.QFileDialog, "getOpenFileName", lambda *args, **kwargs: (str(path), ""))
-    widget.load_uam_alignment_profile()
-
-    assert widget.uam_alignment_profile == profile
-    assert widget.uam_alignment_profile_path == path
-    assert "saved_alignment" in widget.uam_alignment_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_truth_plot_refreshes_raw_plot(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.uam_telemetry import UamTelemetrySample
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-
-    widget._refresh_uam_truth_plot(
-        [UamTelemetrySample(timestamp_s=5.0, x_m=4.0, y_m=-1.0, z_m=2.0, source="ulog:test")]
-    )
-
-    raw_points = list(widget.uam_raw_plot.points)
-    assert [(point.series, point.value) for point in raw_points] == [
-        ("truth_north_m", 4.0),
-        ("truth_east_m", -1.0),
-        ("truth_down_m", 2.0),
-    ]
-    assert widget.uam_raw_plot._series_names() == ["truth_north_m", "truth_east_m", "truth_down_m"]
-    assert widget.uam_raw_plot._series_label("truth_north_m") == "N"
-    assert widget.uam_raw_plot._series_label("truth_east_m") == "E"
-    assert widget.uam_raw_plot._series_label("truth_down_m") == "D"
-    assert widget.uam_raw_plot._time_bounds() == (5.0, 6.0)
-    assert widget.uam_raw_plot._format_hover_text(raw_points[0]) == "N\nt=5.000s\nvalue=4.000 m"
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_analysis_uses_recorded_truth_fallback(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.distance_recording_rows = [
-        {
-            "timestamp_s": "5.0",
-            "x_m": "11.0",
-            "y_m": "0.5",
-            "z_m": "-2.0",
-            "distance_m": "11.191514",
-            "drone_x_m": "10.0",
-            "drone_y_m": "0.0",
-            "drone_z_m": "-2.0",
-            "drone_timestamp_s": "4.9",
-        }
-    ]
-
-    widget.run_uam_analysis()
-
-    assert len(widget.uam_analysis_rows) == 1
-    assert widget.uam_analysis_table.rowCount() == 1
-    assert widget.uam_analysis_rows[0]["truth_source"] == "live-recorded-row"
-    assert widget.uam_analysis_rows[0]["error_x_m"] == "1.000000"
-    assert "rows=1" in widget.uam_analysis_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_analysis_uses_live_telemetry_for_metrics(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.uam_telemetry import UamAlignmentProfile, UamTelemetrySample
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.distance_recording_rows = [
-        {"timestamp_s": "1.0", "x_m": "1.0", "y_m": "0.0", "z_m": "0.0", "distance_m": "1.0"},
-        {"timestamp_s": "2.0", "x_m": "0.0", "y_m": "2.0", "z_m": "0.0", "distance_m": "2.0"},
-    ]
-    widget.uam_live_telemetry_samples = [
-        UamTelemetrySample(timestamp_s=1.0, x_m=1.0, y_m=0.0, z_m=0.0, source="live:test"),
-        UamTelemetrySample(timestamp_s=2.0, x_m=0.0, y_m=2.0, z_m=0.0, source="live:test"),
-    ]
-    widget.uam_alignment_profile = UamAlignmentProfile(
-        profile_id="live_alignment",
-        rotation_matrix=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
-        origin_offset_m=(0.0, 0.0, 0.0),
-        sample_count=4,
-        rmse_m=0.0,
-        max_error_m=0.0,
-        created_unix_s=1_800_000_000.0,
-    )
-    widget.uam_compare_max_dt_spin.setValue(0.01)
-
-    widget.run_uam_analysis()
-
-    assert len(widget.uam_analysis_rows) == 2
-    assert widget.uam_analysis_rows[0]["truth_source"] == "live:test"
-    assert widget.uam_analysis_rows[0]["error_distance_kind"] == "position_error_m"
-    assert widget.uam_analysis_rows[0]["position_error_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["truth_rdf_right_m"] == "1.000000"
-    assert widget.uam_analysis_rows[0]["error_rdf_right_m"] == "0.000000"
-    assert widget.uam_analysis_rows[0]["truth_frd_right_m"] == "1.000000"
-    assert widget.uam_analysis_rows[0]["error_frd_right_m"] == "0.000000"
-    assert not any(key.endswith("_eligible") or key.endswith("_blocker") for key in widget.uam_analysis_rows[0])
-    assert widget.uam_analysis_table.rowCount() == 2
-    assert "source=live-buffer:2 samples" in widget.uam_analysis_status_label.text()
-    assert "rmse=0.000 m" in widget.uam_analysis_status_label.text()
-
-    widget.deleteLater()
-    _ = app
-
-
-def test_uam_analysis_does_not_mix_ulog_with_recorded_row_fallback(monkeypatch) -> None:
-    from PyQt5 import QtWidgets
-
-    import wiris_stereo_distance.gui as gui
-    from wiris_stereo_distance.uam_telemetry import UamTelemetrySample
-
-    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = gui.WirisStereoDistancePanel()
-    widget.distance_recording_rows = [
-        {
-            "timestamp_s": "1.0",
-            "x_m": "1.0",
-            "y_m": "0.0",
-            "z_m": "0.0",
-            "distance_m": "1.0",
-            "drone_x_m": "100.0",
-            "drone_y_m": "100.0",
-            "drone_z_m": "100.0",
-            "drone_timestamp_s": "1.0",
-        },
-        {
-            "timestamp_s": "100.0",
-            "x_m": "2.0",
-            "y_m": "0.0",
-            "z_m": "0.0",
-            "distance_m": "2.0",
-            "drone_x_m": "2.0",
-            "drone_y_m": "0.0",
-            "drone_z_m": "0.0",
-            "drone_timestamp_s": "100.0",
-        },
-    ]
-    widget.uam_ulog_samples = [
-        UamTelemetrySample(timestamp_s=1.0, x_m=1.0, y_m=0.0, z_m=0.0, source="ulog:test")
-    ]
-    widget.uam_compare_max_dt_spin.setValue(0.01)
-
-    widget.run_uam_analysis()
-
-    assert len(widget.uam_analysis_rows) == 1
-    assert widget.uam_analysis_rows[0]["truth_source"] == "ulog:test"
-    assert "live-recorded-row" not in {row["truth_source"] for row in widget.uam_analysis_rows}
-    assert "matched=1/2" in widget.uam_analysis_status_label.text()
-    assert "unmatched=1" in widget.uam_analysis_status_label.text()
+    assert "drone_timestamp_s" not in row
 
     widget.deleteLater()
     _ = app

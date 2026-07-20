@@ -1,5 +1,21 @@
 # Ground Stereo Drone Simulation
 
+## Retired legacy correction tools
+
+As of 2026-07-20, the standalone
+`legacy_origin_bbox_roi_tracking_search` tool chain has been removed. That
+chain moved the target through Gazebo `set_pose`, fitted Ground-Truth-labelled
+Origin-BBOX reprojection profiles, searched ROI/silhouette gains, and evaluated
+a constant-velocity Kalman post-filter in the historical stereo-center RDF
+contract. Its pass criterion was per-axis and position RMSE improvement on the
+saved validation trials.
+
+The retired chain is not part of the PX4-only mission path or the current
+Simulation runtime. Historical reports remain under `reports/` as immutable
+evidence, but their retired script commands are not runnable from the current
+checkout. PX4 missions, Gazebo camera simulation, Raw measurement, and the
+current runtime modules remain available.
+
 Gazebo Sim + ROS 2 Humble 기반 지상 고정 스테레오 카메라 시뮬레이션입니다.
 PyQt와 브라우저 대시보드는 사용하지 않고, 표준 ROS 2 도구인 `rqt_gui`, RViz2, rosbag을 사용합니다.
 

@@ -6,7 +6,7 @@
 
 - `usage.md`: 실행과 운용 안내.
 - `PROJECT.md`: 프로젝트 목적, 현재 구조, 측정 흐름, 현장 워크플로, 분리 계획.
-- `COORDINATE_CONTRACT.md`: 좌표계, 축 이름, CSV 필드, UAM 보정 profile 계약.
+- `COORDINATE_CONTRACT.md`: 좌표계, 축 이름과 Raw CSV 필드 계약.
 - `DESIGN.md`: UI/스타일 기준.
 - `DESIGN-ibm.md`: IBM/Carbon 계열 원본 디자인 레퍼런스.
 - `AGENTS.md`: 코딩 에이전트 작업 규칙.
@@ -18,5 +18,5 @@
 
 기타 프로젝트 파일:
 
-- `../requirements/runtime.txt`: 앱 기본 실행 의존성.
-- `../requirements/calibration.txt`: OpenCV 보정 의존성.
+- `../requirements/runtime.txt`: 앱 기본 실행 의존성. Live undistortion/ray 계산용 OpenCV·NumPy와 rig alignment용 PyYAML을 포함한다.
+- `../requirements/calibration.txt`: calibration bootstrap이 단독으로 설치할 수 있는 OpenCV·NumPy·PyYAML 부분집합.

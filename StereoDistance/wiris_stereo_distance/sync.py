@@ -2,7 +2,15 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from math import isfinite
 from typing import Callable, Generic, Iterable, Protocol, TypeVar
+
+
+ATTITUDE_STALE_AGE_S = 2.0
+ATTITUDE_VERY_STALE_AGE_S = 10.0
+ATTITUDE_STALE_PAIR_DELTA_S = 1.0
+ATTITUDE_VERY_STALE_PAIR_DELTA_S = 5.0
+ATTITUDE_TIMING_POLICY = "display_only_non_blocking"
 
 
 class Timestamped(Protocol):
@@ -102,7 +110,6 @@ def classify_sync_quality(
     attitude_pair_delta_s: float | None,
     max_attitude_pair_delta_s: float,
     require_attitude: bool,
-    bias_captured: bool,
 ) -> tuple[str, tuple[str, ...]]:
     warnings: list[str] = []
     if camera_delta_s is None:
@@ -123,9 +130,6 @@ def classify_sync_quality(
                 f"attitude Δt {attitude_pair_delta_s * 1000:.0f}ms > {max_attitude_pair_delta_s * 1000:.0f}ms"
             )
 
-    if not bias_captured:
-        warnings.append("bias not captured")
-
     hard_fail = camera_delta_s is None or (require_attitude and missing_attitude)
     stale_attitude = any("attitude age" in warning or "attitude Δt" in warning for warning in warnings)
     if hard_fail or (require_attitude and stale_attitude):
@@ -133,3 +137,34 @@ def classify_sync_quality(
     if warnings:
         return "DEGRADED", tuple(warnings)
     return "GOOD", tuple()
+
+
+def classify_attitude_timing(
+    *,
+    uses_pixhawk_attitude: bool,
+    left_age_s: float | None,
+    right_age_s: float | None,
+    pair_delta_s: float | None,
+) -> str:
+    """Classify Pixhawk attitude timing for display and recording only.
+
+    This status never accepts or rejects a measurement.  Camera-independent
+    checkerboard geometry reports ``NOT_USED`` because Pixhawk attitude is not
+    an input to that triangulation path.
+    """
+
+    if not uses_pixhawk_attitude:
+        return "NOT_USED"
+    values = (left_age_s, right_age_s, pair_delta_s)
+    if any(value is None for value in values):
+        return "WAITING"
+    numeric_values = tuple(float(value) for value in values if value is not None)
+    if any(not isfinite(value) or value < 0.0 for value in numeric_values):
+        return "WAITING"
+    left_age, right_age, pair_delta = numeric_values
+    max_age = max(left_age, right_age)
+    if max_age > ATTITUDE_VERY_STALE_AGE_S or pair_delta > ATTITUDE_VERY_STALE_PAIR_DELTA_S:
+        return "VERY_STALE"
+    if max_age > ATTITUDE_STALE_AGE_S or pair_delta > ATTITUDE_STALE_PAIR_DELTA_S:
+        return "STALE"
+    return "FRESH"

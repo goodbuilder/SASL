@@ -6,7 +6,6 @@ from collections import deque
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from wiris_stereo_distance.stereo import DetectionObservation
-from wiris_stereo_distance.theme import ACCENT, SERIES_HIGHLIGHT
 from wiris_stereo_distance.yolo_stream import YoloStreamWorker
 
 
@@ -48,7 +47,6 @@ class CameraPane(QtWidgets.QGroupBox):
         self.selected_measurement_frame_timestamp_s: float | None = None
         self.selected_measurement_frame_lookup_delta_s: float | None = None
         self.detection_stream_active = False
-        self.bbox_center_adjustment: tuple[tuple[float, float, float, float], tuple[float, float, float, float]] | None = None
         self.stream_generation = 0
         self.current_status = "중지됨"
 
@@ -231,56 +229,12 @@ class CameraPane(QtWidgets.QGroupBox):
         if self.latest_image is None:
             return
         pixmap = QtGui.QPixmap.fromImage(self.latest_image)
-        self._draw_bbox_center_adjustment_overlay(pixmap)
         self.image_label.setPixmap(
             pixmap.scaled(self.image_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         )
 
     def current_image(self) -> QtGui.QImage | None:
         return self.latest_image.copy() if self.latest_image is not None else None
-
-    def set_bbox_center_adjustment(
-        self,
-        adjustment: tuple[tuple[float, float, float, float], tuple[float, float, float, float]] | None,
-    ) -> None:
-        self.bbox_center_adjustment = adjustment
-        self._set_detection_label(self.latest_detection)
-        self._refresh_pixmap()
-
-    def adjusted_detection_center(self, detection: DetectionObservation | None = None) -> tuple[float, float] | None:
-        observation = detection or self.latest_detection
-        if observation is None or self.bbox_center_adjustment is None:
-            return None
-        u, v = observation.center
-        row_u, row_v = self.bbox_center_adjustment
-        return (
-            row_u[0] * u + row_u[1] * v + row_u[2] + row_u[3],
-            row_v[0] * u + row_v[1] * v + row_v[2] + row_v[3],
-        )
-
-    def _draw_bbox_center_adjustment_overlay(self, pixmap: QtGui.QPixmap) -> None:
-        if self.latest_detection is None or self.bbox_center_adjustment is None:
-            return
-        raw_x, raw_y = self.latest_detection.center
-        corrected = self.adjusted_detection_center(self.latest_detection)
-        if corrected is None:
-            return
-        corrected_x, corrected_y = corrected
-        painter = QtGui.QPainter(pixmap)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.setPen(QtGui.QPen(QtGui.QColor(ACCENT), 2))
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.drawEllipse(QtCore.QPointF(raw_x, raw_y), 6, 6)
-        painter.setPen(QtGui.QPen(QtGui.QColor(SERIES_HIGHLIGHT), 2))
-        painter.drawLine(QtCore.QPointF(raw_x, raw_y), QtCore.QPointF(corrected_x, corrected_y))
-        painter.setBrush(QtGui.QColor(SERIES_HIGHLIGHT))
-        painter.drawEllipse(QtCore.QPointF(corrected_x, corrected_y), 4, 4)
-        painter.setPen(QtGui.QColor(SERIES_HIGHLIGHT))
-        painter.drawText(
-            QtCore.QPointF(corrected_x + 8, corrected_y - 8),
-            "bbox 보정",
-        )
-        painter.end()
 
     def _handle_detection_payload(self, payload: dict) -> None:
         observation = DetectionObservation.from_payload(self.camera_label, payload)
@@ -320,9 +274,6 @@ class CameraPane(QtWidgets.QGroupBox):
             f"최고 bbox: class={class_label} conf={detection.confidence:.2f} "
             f"center=({cx:.2f}, {cy:.2f}) px"
         )
-        adjusted = self.adjusted_detection_center(detection)
-        if adjusted is not None:
-            text += f" → corrected=({adjusted[0]:.2f}, {adjusted[1]:.2f}) px"
         self.detection_label.setText(text)
 
     def _clear_thread_if_current(self, generation: int, thread: QtCore.QThread) -> None:

@@ -5,26 +5,30 @@
 Python 문법 컴파일:
 
 ```bash
-python3 -m compileall main.py wiris_stereo_distance
+cd <SASL_ROOT>
+python3 -m compileall sasl_common StereoDistance/wiris_stereo_distance
 ```
 
 ## 의존성 파일
 
-- `requirements/runtime.txt`: 앱 기본 실행 의존성.
-- `requirements/calibration.txt`: OpenCV 카메라 보정 의존성.
+- `requirements/runtime.txt`: 앱 기본 실행 의존성. Live undistortion/ray 계산용 OpenCV·NumPy와 rig alignment용 PyYAML을 포함한다.
+- `requirements/calibration.txt`: calibration bootstrap이 단독 복구할 수 있도록 runtime의 OpenCV·NumPy·PyYAML 항목을 의도적으로 반복한 부분집합.
 
 ## 빠른 로직 테스트
 
 하드웨어 없이 실행 가능한 핵심 계산/저장 테스트:
 
 ```bash
-python3 -m pytest \
-  tests/test_measurement_controller.py \
-  tests/test_triangulation.py \
-  tests/test_settings.py \
-  tests/test_recording_session.py \
+cd <SASL_ROOT>
+PYTHONPATH=. python3 -m pytest \
+  StereoDistance/tests/test_stereo_geometry_common.py \
+  StereoDistance/tests/test_coordinate_contract.py \
+  StereoDistance/tests/test_measurement_controller.py \
+  StereoDistance/tests/test_triangulation.py \
   -q
 ```
+
+이 묶음은 `camera_optical_rdf -> left_camera_rdf`, checkerboard `X_right = R X_left + T` 역변환, Pixhawk body FRD/NED 변환, 왼쪽 optical-center 원점 유지와 invalid-ray fail-closed를 확인한다.
 
 ## 대표 PyQt 테스트
 

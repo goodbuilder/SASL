@@ -1,6 +1,11 @@
 from dataclasses import dataclass
 
-from wiris_stereo_distance.sync import TimedSampleBuffer, classify_sync_quality, match_nearest_pair
+from wiris_stereo_distance.sync import (
+    TimedSampleBuffer,
+    classify_attitude_timing,
+    classify_sync_quality,
+    match_nearest_pair,
+)
 
 
 @dataclass(frozen=True)
@@ -53,7 +58,7 @@ def test_timed_sample_buffer_nearest_reports_age_and_applies_max_age() -> None:
     assert buffer.nearest(2.2, max_age_s=0.1) is None
 
 
-def test_sync_quality_marks_missing_bias_as_degraded_not_bad_without_attitude_gate() -> None:
+def test_sync_quality_marks_missing_attitude_as_degraded_without_attitude_gate() -> None:
     quality, warnings = classify_sync_quality(
         camera_delta_s=0.02,
         max_camera_delta_s=0.05,
@@ -63,12 +68,10 @@ def test_sync_quality_marks_missing_bias_as_degraded_not_bad_without_attitude_ga
         attitude_pair_delta_s=None,
         max_attitude_pair_delta_s=0.05,
         require_attitude=False,
-        bias_captured=False,
     )
 
     assert quality == "DEGRADED"
     assert "attitude waiting" in warnings
-    assert "bias not captured" in warnings
 
 
 def test_sync_quality_blocks_when_attitude_gate_requires_missing_attitude() -> None:
@@ -81,8 +84,55 @@ def test_sync_quality_blocks_when_attitude_gate_requires_missing_attitude() -> N
         attitude_pair_delta_s=None,
         max_attitude_pair_delta_s=0.05,
         require_attitude=True,
-        bias_captured=True,
     )
 
     assert quality == "BAD"
     assert "attitude waiting" in warnings
+
+
+def test_attitude_timing_status_uses_nonblocking_display_thresholds() -> None:
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=True,
+        left_age_s=2.0,
+        right_age_s=1.0,
+        pair_delta_s=1.0,
+    ) == "FRESH"
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=True,
+        left_age_s=2.001,
+        right_age_s=1.0,
+        pair_delta_s=0.0,
+    ) == "STALE"
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=True,
+        left_age_s=1.0,
+        right_age_s=1.0,
+        pair_delta_s=1.001,
+    ) == "STALE"
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=True,
+        left_age_s=10.001,
+        right_age_s=1.0,
+        pair_delta_s=0.0,
+    ) == "VERY_STALE"
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=True,
+        left_age_s=1.0,
+        right_age_s=1.0,
+        pair_delta_s=5.001,
+    ) == "VERY_STALE"
+
+
+def test_attitude_timing_status_marks_unused_and_missing_inputs() -> None:
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=False,
+        left_age_s=None,
+        right_age_s=None,
+        pair_delta_s=None,
+    ) == "NOT_USED"
+    assert classify_attitude_timing(
+        uses_pixhawk_attitude=True,
+        left_age_s=None,
+        right_age_s=0.1,
+        pair_delta_s=0.0,
+    ) == "WAITING"

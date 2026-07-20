@@ -1473,7 +1473,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             return
         for spec in self.custom_watches:
             source = str(spec.get("source", "")).strip().lower()
-            if source and source not in {"mavlink", "uam_mavlink"}:
+            if source and source != "mavlink":
                 continue
             target_message = str(spec.get("message", "") or spec.get("topic", "")).strip().upper()
             if target_message and target_message != message_type.upper():

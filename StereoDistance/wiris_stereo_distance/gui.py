@@ -25,7 +25,6 @@ from urllib.parse import urlparse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from sasl_common.truth_coordinates import local_ned_from_lla
 from wiris_stereo_distance.calibration import (
     CheckerboardConfig,
     StereoIntrinsicsResult,
@@ -37,16 +36,16 @@ from wiris_stereo_distance.calibration import (
     save_intrinsics_json,
 )
 
-from wiris_stereo_distance.attitude_bias import relative_attitude
+from wiris_stereo_distance.attitude_geometry import relative_attitude
 from wiris_stereo_distance.camera_pane import CameraPane
 from wiris_stereo_distance.coordinate_contract import (
     BODY_FRAME,
     CAMERA_FRAME,
     CAMERA_MOUNT_PROFILE,
+    LEGACY_XYZ_ALIAS_CONTRACT,
     MEASUREMENT_AXIS_CONTRACT,
     MEASUREMENT_FRAME,
-    TRUTH_AXIS_CONTRACT,
-    TRUTH_FRAME,
+    PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
     WORLD_FRAME,
 )
 from wiris_stereo_distance.measurement_widgets import (
@@ -143,11 +142,6 @@ from wiris_stereo_distance.recording_session import (
     session_dir,
     session_id_now,
 )
-from wiris_stereo_distance.reprojection_profile import (
-    OriginBBoxReprojectionProfile,
-    ReprojectionLookupResult,
-    load_reprojection_profile,
-)
 from wiris_stereo_distance.settings import (
     APP_ROOT,
     DEFAULT_CLOCK_DOWNLOAD_DIR,
@@ -161,11 +155,6 @@ from wiris_stereo_distance.stereo import (
     DetectionObservation,
     StereoCalibration,
     detection_timestamp_for_basis,
-)
-from wiris_stereo_distance.tracking_filter import (
-    ConstantVelocityKalmanFilter,
-    TrackingUpdateResult,
-    measurement_variance_from_stereo,
 )
 from wiris_stereo_distance.theme import (
     ACCENT,
@@ -206,31 +195,22 @@ from wiris_stereo_distance.theme import (
     WARNING_BG,
     WARNING_TEXT,
 )
-from wiris_stereo_distance.sync import TimedSampleBuffer, match_nearest_pair
+from wiris_stereo_distance.sync import (
+    ATTITUDE_STALE_AGE_S,
+    ATTITUDE_STALE_PAIR_DELTA_S,
+    ATTITUDE_TIMING_POLICY,
+    ATTITUDE_VERY_STALE_AGE_S,
+    ATTITUDE_VERY_STALE_PAIR_DELTA_S,
+    TimedSampleBuffer,
+    classify_attitude_timing,
+    match_nearest_pair,
+)
 from wiris_stereo_distance.triangulation import (
     RayTriangulationResult,
     body_frd_vector_to_camera,
     camera_translation_right_in_left_camera,
     invert_left_to_right_camera_transform,
-    stereo_center_point_from_left_camera,
-    triangulate_pixels_with_pixhawk_mount,
-    triangulate_pixels_with_relative_pose,
     world_ned_vector_to_body_frd,
-)
-from wiris_stereo_distance.uam_telemetry import (
-    TRUTH_SOURCE_AUTO,
-    TRUTH_SOURCE_GLOBAL_POSITION,
-    TRUTH_SOURCE_GPS_POSITION,
-    TRUTH_SOURCE_LOCAL_NED,
-    UamAlignmentError,
-    UamAlignmentProfile,
-    ULogTelemetryError,
-    UamTelemetrySample,
-    compare_measurement_rows,
-    comparison_summary,
-    estimate_alignment_profile_from_rows,
-    estimate_time_offset_s,
-    load_ulog_local_position_samples,
 )
 from wiris_stereo_distance.xrce_agent import ensure_micro_xrce_agent
 from wiris_stereo_distance.yolo_stream import (
@@ -347,6 +327,7 @@ RECORDED_SAMPLE_TABLE_COLUMNS = (
     ("distance_m", "YOLO Range(m)"),
     ("method", "방식"),
     ("quality", "품질"),
+    ("attitude_timing_status", "자세 시각"),
     ("disparity_px", "Disparity(px)"),
     ("camera_delta_s", "좌우Δt(s)"),
     ("vertical_delta_px", "세로Δ(px)"),
@@ -374,74 +355,16 @@ RECORDED_SAMPLE_TABLE_COLUMNS = (
     ("y_m", "Cam Down(m)"),
     ("z_m", "Cam Forward(m)"),
     ("raw_distance_m", "Raw 거리(m)"),
-    ("telemetry_range_m", "Telemetry Range(m)"),
-    ("telemetry_range_error_m", "YOLO-Telemetry Err(m)"),
     ("raw_x_m", "Raw Right(m)"),
     ("raw_y_m", "Raw Down(m)"),
     ("raw_z_m", "Raw Forward(m)"),
-    ("drone_north_m", "Truth N(m)"),
-    ("drone_east_m", "Truth E(m)"),
-    ("drone_down_m", "Truth D(m)"),
-    ("error_x_m", "Mixed Err Right-North(m)"),
-    ("error_y_m", "Mixed Err Down-East(m)"),
-    ("error_z_m", "Mixed Err Forward-Down(m)"),
-    ("bias_x_m", "Bias Right(m)"),
-    ("bias_y_m", "Bias Down(m)"),
-    ("bias_z_m", "Bias Forward(m)"),
-    ("bias_profile_id", "Bias Profile"),
-    ("profile_id", "BBox Profile"),
-    ("profile_fallback_level", "Fallback"),
     ("left_cx", "L cx(px)"),
     ("right_cx", "R cx(px)"),
-    ("left_corrected_cx", "L corr cx(px)"),
-    ("right_corrected_cx", "R corr cx(px)"),
     ("bbox_mid_timestamp_s", "BBox mid t(s)"),
     ("bbox_mid_utc_unix_s", "BBox UTC(s)"),
-    ("drone_timestamp_s", "Drone t(s)"),
-    ("drone_utc_unix_s", "Drone UTC(s)"),
-    ("drone_age_s", "Drone age(s)"),
     ("camera_time_sync_status", "카메라 시간 상태"),
     ("rtcp_pair_delta_s", "RTCP 좌우Δt(s)"),
     ("rtcp_pc_offset_max_ms", "RTCP-PC 최대Δ(ms)"),
-)
-UAM_ANALYSIS_TABLE_COLUMNS = (
-    ("row_index", "#"),
-    ("measurement_timestamp_s", "YOLO t(s)"),
-    ("truth_timestamp_s", "Truth t(s)"),
-    ("truth_dt_s", "Δt(s)"),
-    ("truth_time_basis", "Basis"),
-    ("measurement_time_basis", "측정 시간 기준"),
-    ("camera_time_sync_status", "카메라 시간 상태"),
-    ("truth_source", "Truth source"),
-    ("truth_source_type", "Truth type"),
-    ("comparison_frame", "Frame"),
-    ("measurement_right_m", "YOLO Right"),
-    ("measurement_down_m", "YOLO Down"),
-    ("measurement_forward_m", "YOLO Forward"),
-    ("estimated_range_m", "YOLO Range"),
-    ("measurement_frd_forward_m", "YOLO Forward"),
-    ("measurement_frd_right_m", "YOLO Right"),
-    ("measurement_frd_down_m", "YOLO Down"),
-    ("truth_frd_forward_m", "Truth Forward"),
-    ("truth_frd_right_m", "Truth Right"),
-    ("truth_frd_down_m", "Truth Down"),
-    ("truth_frd_range_m", "Truth FRD Range"),
-    ("error_frd_forward_m", "Err Forward"),
-    ("error_frd_right_m", "Err Right"),
-    ("error_frd_down_m", "Err Down"),
-    ("estimated_north_m", "Est N"),
-    ("estimated_east_m", "Est E"),
-    ("estimated_down_m", "Est D"),
-    ("truth_north_m", "Truth N"),
-    ("truth_east_m", "Truth E"),
-    ("truth_down_m", "Truth D"),
-    ("truth_range_m", "Truth Range"),
-    ("error_north_m", "Err N"),
-    ("error_east_m", "Err E"),
-    ("error_down_m", "Err D"),
-    ("range_error_m", "Range Err"),
-    ("error_distance_m", "Err Dist"),
-    ("alignment_profile_id", "Align Profile"),
 )
 
 
@@ -702,68 +625,6 @@ def format_runtime_camera_ntp_compact(metadata: dict) -> str:
 
 
 @dataclass(frozen=True)
-class BBoxBiasBin:
-    min_m: float
-    max_m: float
-    bias_x_m: float
-    bias_y_m: float
-    bias_z_m: float
-    sample_count: int
-
-    def contains(self, distance_m: float) -> bool:
-        return self.min_m <= distance_m < self.max_m
-
-
-@dataclass(frozen=True)
-class BBoxBiasProfile:
-    profile_id: str
-    bins: tuple[BBoxBiasBin, ...]
-    created_unix_s: float
-
-    def correction(self, distance_m: float) -> tuple[float, float, float] | None:
-        if not self.bins:
-            return None
-        for bias_bin in self.bins:
-            if bias_bin.contains(distance_m):
-                return bias_bin.bias_x_m, bias_bin.bias_y_m, bias_bin.bias_z_m
-        if distance_m < self.bins[0].min_m:
-            first = self.bins[0]
-            return first.bias_x_m, first.bias_y_m, first.bias_z_m
-        last = self.bins[-1]
-        return last.bias_x_m, last.bias_y_m, last.bias_z_m
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "profile_id": self.profile_id,
-            "model": "distance_bins_mean_error",
-            "created_unix_s": self.created_unix_s,
-            "bins": [bias_bin.__dict__ for bias_bin in self.bins],
-        }
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, object]) -> "BBoxBiasProfile":
-        bins = []
-        for item in payload.get("bins", []):
-            if not isinstance(item, dict):
-                continue
-            bins.append(
-                BBoxBiasBin(
-                    min_m=float(item["min_m"]),
-                    max_m=float(item["max_m"]),
-                    bias_x_m=float(item["bias_x_m"]),
-                    bias_y_m=float(item.get("bias_y_m", 0.0)),
-                    bias_z_m=float(item["bias_z_m"]),
-                    sample_count=int(item.get("sample_count", 0)),
-                )
-            )
-        return cls(
-            profile_id=str(payload.get("profile_id") or f"bbox_bias_{int(time.time())}"),
-            bins=tuple(sorted(bins, key=lambda item: item.min_m)),
-            created_unix_s=float(payload.get("created_unix_s") or time.time()),
-        )
-
-
-@dataclass(frozen=True)
 class AttitudeHistoryPoint:
     timestamp_s: float
     left_deg: float | None = None
@@ -926,44 +787,10 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
         self.y_unit = y_unit
         self.points: deque[TelemetryHistoryPoint] = deque(maxlen=600)
         self.series_labels: dict[str, str] = {
-            "truth_north_m": "N",
-            "truth_east_m": "E",
-            "truth_down_m": "D",
-            "error_north_m": "Err N",
-            "error_east_m": "Err E",
-            "error_down_m": "Err D",
-            "error_rdf_right_m": "Err Right",
-            "error_rdf_down_m": "Err Down",
-            "error_rdf_forward_m": "Err Forward",
-            "error_frd_forward_m": "Err Forward",
-            "error_frd_right_m": "Err Right",
-            "error_frd_down_m": "Err Down",
-            "error_x_m": "Err X",
-            "error_y_m": "Err Y",
-            "error_z_m": "Err Z",
-            "error_distance_m": "Err Dist",
-            "position_error_m": "Pos Err",
             "Δnorm": "Delta Norm",
             "angle": "Angle",
         }
         self.series_order: dict[str, int] = {
-            "truth_north_m": 10,
-            "truth_east_m": 11,
-            "truth_down_m": 12,
-            "error_north_m": 20,
-            "error_east_m": 21,
-            "error_down_m": 22,
-            "error_frd_forward_m": 23,
-            "error_frd_right_m": 24,
-            "error_frd_down_m": 25,
-            "error_rdf_right_m": 23,
-            "error_rdf_down_m": 24,
-            "error_rdf_forward_m": 25,
-            "error_x_m": 30,
-            "error_y_m": 31,
-            "error_z_m": 32,
-            "error_distance_m": 40,
-            "position_error_m": 41,
             "Δnorm": 50,
             "angle": 51,
         }
@@ -2729,7 +2556,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right": None,
         }
         self.mavlink_pixhawk: DualPixhawkMavlinkSubscriber | None = None
-        self.uam_mavlink_pixhawk: DualPixhawkMavlinkSubscriber | None = None
         self._ros2_retry_after_uxrce_agent_setup = False
         self._eth0_probe_buffers: dict[str, str] = {}
         self._eth0_probe_tokens: dict[str, int] = {}
@@ -2756,18 +2582,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.auto_start_pixhawk = auto_start_pixhawk
         self.settings = load_settings()
         self.distance_history: deque[DistanceHistoryPoint] = deque(maxlen=600)
-        self.tracking_filter = ConstantVelocityKalmanFilter()
         self.distance_recording_rows: list[dict[str, object]] = []
         self.distance_recording_keys: list[tuple[float, float, str]] = []
         self.external_parameter_recording_rows: list[dict[str, object]] = []
-        self.uam_live_telemetry_samples: deque[UamTelemetrySample] = deque(maxlen=5000)
-        self.uam_ulog_samples: list[UamTelemetrySample] = []
-        self.uam_ulog_path: Path | None = None
-        self.uam_ulog_truth_source_type = TRUTH_SOURCE_AUTO
-        self.uam_analysis_rows: list[dict[str, object]] = []
-        self.uam_alignment_profile: UamAlignmentProfile | None = None
-        self.uam_alignment_profile_path: Path | None = None
-        self._last_uam_live_sample_signature: tuple[float, float, float, float] | None = None
         self.distance_recording_enabled = False
         self.distance_recording_started_monotonic_s: float | None = None
         self.recording_session_id = ""
@@ -2834,22 +2651,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.last_rtsp_check_status: dict[str, str] = {"left": "unchecked", "right": "unchecked"}
         self.last_distance_quality = "BAD"
         self.last_distance_status = "거리: 좌/우 검출 매칭 대기 중"
-        self.latest_drone_position_m: tuple[float, float, float] | None = None
-        self.latest_drone_position_components_m: dict[str, float] = {}
-        self.latest_drone_position_component_timestamps_s: dict[str, float] = {}
-        self.latest_drone_position_timestamp_s: float | None = None
-        self.latest_drone_position_timestamp_reference = "app-receive"
-        self.latest_drone_position_utc_unix_s: float | None = None
-        self.latest_drone_truth_sample: UamTelemetrySample | None = None
-        self.uam_gps_reference_lla: tuple[float, float, float] | None = None
-        self.uam_gps_reference_kind = ""
-        self.active_bias_profile: BBoxBiasProfile | None = None
-        self.bias_profile_applied = False
-        self.bias_candidate_rows: list[dict[str, str]] = []
-        self.bbox_center_adjustment_path: Path | None = None
-        self.bbox_center_adjustments: dict[str, tuple[tuple[float, float, float, float], tuple[float, float, float, float]]] = {}
-        self.bbox_reprojection_profile_path: Path | None = None
-        self.bbox_reprojection_profile: OriginBBoxReprojectionProfile | None = None
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -2901,8 +2702,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         intrinsic_parameters_layout = QtWidgets.QVBoxLayout(intrinsic_parameters_tab)
         extrinsic_parameters_tab = QtWidgets.QWidget()
         extrinsic_parameters_layout = QtWidgets.QVBoxLayout(extrinsic_parameters_tab)
-        center_bias_tab = QtWidgets.QWidget()
-        center_bias_layout = QtWidgets.QVBoxLayout(center_bias_tab)
         triangulation_quality_tab = QtWidgets.QWidget()
         triangulation_quality_layout = QtWidgets.QVBoxLayout(triangulation_quality_tab)
         yolo_tab = QtWidgets.QWidget()
@@ -2917,8 +2716,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         save_layout = QtWidgets.QVBoxLayout(save_tab)
         save_session_tab = QtWidgets.QWidget()
         save_session_layout = QtWidgets.QVBoxLayout(save_session_tab)
-        uam_analysis_tab = QtWidgets.QWidget()
-        uam_analysis_tab_layout = QtWidgets.QVBoxLayout(uam_analysis_tab)
         recording_samples_tab = QtWidgets.QWidget()
         recording_samples_layout = QtWidgets.QVBoxLayout(recording_samples_tab)
         advanced_tab = QtWidgets.QWidget()
@@ -2948,14 +2745,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             camera_params_layout,
             intrinsic_parameters_layout,
             extrinsic_parameters_layout,
-            center_bias_layout,
             yolo_layout_outer,
             measurement_layout,
             stereo_layout,
             runtime_layout,
             save_layout,
             save_session_layout,
-            uam_analysis_tab_layout,
             recording_samples_layout,
             advanced_layout,
             wiris_command_layout,
@@ -3046,12 +2841,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         save_tabs = QtWidgets.QTabWidget()
         save_tabs.setDocumentMode(True)
         save_tabs.addTab(save_session_tab, "세션 저장")
-        save_tabs.addTab(uam_analysis_tab, "UAM 비교")
         save_tabs.addTab(recording_samples_tab, "기록 샘플")
         save_layout.addWidget(save_tabs, 1)
         self.save_tabs = save_tabs
         self.save_session_tab_index = save_tabs.indexOf(save_session_tab)
-        self.uam_analysis_tab_index = save_tabs.indexOf(uam_analysis_tab)
         self.recording_samples_tab_index = save_tabs.indexOf(recording_samples_tab)
 
         connection_tabs = QtWidgets.QTabWidget()
@@ -3060,17 +2853,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         camera_layout_outer = QtWidgets.QVBoxLayout(camera_tab)
         pixhawk_connection_tab = QtWidgets.QWidget()
         pixhawk_connection_layout = QtWidgets.QVBoxLayout(pixhawk_connection_tab)
-        uam_connection_tab = QtWidgets.QWidget()
-        uam_connection_layout = QtWidgets.QVBoxLayout(uam_connection_tab)
-        for layout in (camera_layout_outer, yolo_layout_outer, pixhawk_connection_layout, uam_connection_layout):
+        for layout in (camera_layout_outer, yolo_layout_outer, pixhawk_connection_layout):
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(6)
         connection_tabs.addTab(camera_tab, "WIRIS")
         connection_tabs.addTab(pixhawk_connection_tab, "Pixhawk")
-        connection_tabs.addTab(uam_connection_tab, "UAM")
         self.setup_tabs = connection_tabs
         self.pixhawk_connection_tab_index = connection_tabs.indexOf(pixhawk_connection_tab)
-        self.uam_connection_tab_index = connection_tabs.indexOf(uam_connection_tab)
         camera_group = QtWidgets.QGroupBox("카메라 / WIRIS")
         camera_layout = QtWidgets.QVBoxLayout(camera_group)
         camera_layout.setSpacing(10)
@@ -4007,7 +3796,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         pixhawk_splitter.setSizes([620, 120])
         self.pixhawk_log_splitter = pixhawk_splitter
         pixhawk_connection_layout.addWidget(pixhawk_splitter, 1)
-        self._build_uam_connection_tab(uam_connection_layout)
 
         stereo = QtWidgets.QGroupBox("3D 거리 계산 설정")
         stereo_form = QtWidgets.QGridLayout(stereo)
@@ -4173,14 +3961,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         advanced_tabs.addTab(wiris_command_panel, "WIRIS SDK")
         advanced_tabs.addTab(custom_watch_tab, "필드 감시")
         advanced_tabs.addTab(baseline_field_browser_tab, "Baseline 필드")
-        advanced_tabs.addTab(center_bias_tab, "Bias 보정")
         self._handle_alignment_step_changed(alignment_tabs.currentIndex())
         self.advanced_wiris_command_tab_index = advanced_tabs.indexOf(wiris_command_panel)
         self.advanced_custom_watch_tab_index = advanced_tabs.indexOf(custom_watch_tab)
         self.advanced_baseline_field_tab_index = advanced_tabs.indexOf(baseline_field_browser_tab)
-        self.advanced_center_bias_tab_index = advanced_tabs.indexOf(center_bias_tab)
         self.wiris_command_tab_index = self.advanced_wiris_command_tab_index
-        self.center_bias_tab_index = self.advanced_center_bias_tab_index
 
         custom_watch_group = QtWidgets.QGroupBox("사용자 지정 ROS2/uORB 또는 MAVLink 감시")
         custom_watch_group_layout = QtWidgets.QVBoxLayout(custom_watch_group)
@@ -4593,6 +4378,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.triangulation_quality_gap_label = QtWidgets.QLabel("gap: --")
         self.triangulation_quality_distance_label = QtWidgets.QLabel("distance: --")
         self.triangulation_quality_mode_label = QtWidgets.QLabel("mode: --")
+        self.triangulation_quality_attitude_label = QtWidgets.QLabel("Attitude timing: --")
+        self.triangulation_quality_attitude_label.setObjectName("statusStrip")
+        self.triangulation_quality_attitude_label.setWordWrap(True)
+        self.triangulation_quality_attitude_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.triangulation_quality_attitude_label.setToolTip(
+            "표시 전용 비차단 진단: sample age > 2 s 또는 pair Δt > 1 s이면 STALE, "
+            "sample age > 10 s 또는 pair Δt > 5 s이면 VERY_STALE입니다."
+        )
         for label in (
             self.triangulation_quality_gap_label,
             self.triangulation_quality_distance_label,
@@ -4605,26 +4398,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         quality_summary_form.addWidget(self.triangulation_quality_gap_label, 1, 0)
         quality_summary_form.addWidget(self.triangulation_quality_distance_label, 1, 1)
         quality_summary_form.addWidget(self.triangulation_quality_mode_label, 1, 2, 1, 2)
+        quality_summary_form.addWidget(self.triangulation_quality_attitude_label, 2, 0, 1, 4)
         triangulation_quality_layout.addWidget(quality_summary_group)
 
         self.triangulation_quality_plot = TriangulationQualityPlot()
         triangulation_quality_layout.addWidget(self.triangulation_quality_plot, 1)
-        point_group = QtWidgets.QGroupBox("3D point 비교")
+        point_group = QtWidgets.QGroupBox("3D point")
         point_layout = QtWidgets.QGridLayout(point_group)
         point_layout.setColumnStretch(1, 1)
-        self.triangulation_quality_raw_point_label = QtWidgets.QLabel("Raw 3D point: --")
-        self.triangulation_quality_corrected_point_label = QtWidgets.QLabel("Corrected 3D point: --")
-        self.triangulation_quality_correction_label = QtWidgets.QLabel("Correction vector: --")
-        for row, label in enumerate(
-            (
-                self.triangulation_quality_raw_point_label,
-                self.triangulation_quality_corrected_point_label,
-                self.triangulation_quality_correction_label,
-            )
-        ):
-            label.setObjectName("statusStrip")
-            label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            point_layout.addWidget(label, row, 0, 1, 2)
+        self.triangulation_quality_raw_point_label = QtWidgets.QLabel("Raw left_camera_rdf point: --")
+        self.triangulation_quality_raw_point_label.setObjectName("statusStrip")
+        self.triangulation_quality_raw_point_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        point_layout.addWidget(self.triangulation_quality_raw_point_label, 0, 0, 1, 2)
         triangulation_quality_layout.addWidget(point_group)
         self._clear_triangulation_quality("3D ray triangulation 대기 중")
 
@@ -4648,132 +4433,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         save_form.addWidget(self.recording_status_label, 2, 0, 1, 2)
         save_session_layout.addWidget(save_group)
         save_session_layout.addStretch(1)
-
-        uam_analysis_group = QtWidgets.QGroupBox("UAM Ground Truth 비교")
-        uam_analysis_layout = QtWidgets.QVBoxLayout(uam_analysis_group)
-        uam_analysis_form = QtWidgets.QGridLayout()
-        uam_analysis_form.setHorizontalSpacing(8)
-        uam_analysis_form.setVerticalSpacing(8)
-        uam_analysis_form.setColumnStretch(1, 1)
-        self.uam_ulog_path_edit = QtWidgets.QLineEdit()
-        self.uam_ulog_path_edit.setPlaceholderText("비행 후 분석용 .ulg 파일")
-        self.uam_ulog_browse_button = QtWidgets.QPushButton("ULog 선택/로드")
-        self.uam_ulog_browse_button.clicked.connect(self.browse_uam_ulog_file)
-        self.uam_load_ulog_button = QtWidgets.QPushButton("현재 경로 다시 로드")
-        self.uam_load_ulog_button.clicked.connect(self.load_uam_ulog_file)
-        self.uam_truth_source_combo = QtWidgets.QComboBox()
-        self.uam_truth_source_combo.addItem("Auto", TRUTH_SOURCE_AUTO)
-        self.uam_truth_source_combo.addItem("Local NED", TRUTH_SOURCE_LOCAL_NED)
-        self.uam_truth_source_combo.addItem("Global Position", TRUTH_SOURCE_GLOBAL_POSITION)
-        self.uam_truth_source_combo.addItem("GPS Position", TRUTH_SOURCE_GPS_POSITION)
-        self.uam_truth_source_combo.currentIndexChanged.connect(self._on_uam_truth_source_changed)
-        self.uam_compare_max_dt_spin = QtWidgets.QDoubleSpinBox()
-        self.uam_compare_max_dt_spin.setRange(0.001, 60.0)
-        self.uam_compare_max_dt_spin.setDecimals(3)
-        self.uam_compare_max_dt_spin.setSingleStep(0.05)
-        self.uam_compare_max_dt_spin.setValue(self.settings.uam_compare_max_dt_s)
-        self.uam_compare_max_dt_spin.setSuffix(" s")
-        self.uam_time_offset_spin = QtWidgets.QDoubleSpinBox()
-        self.uam_time_offset_spin.setRange(-3600.0, 3600.0)
-        self.uam_time_offset_spin.setDecimals(6)
-        self.uam_time_offset_spin.setSingleStep(0.001)
-        self.uam_time_offset_spin.setValue(self.settings.uam_compare_time_offset_s)
-        self.uam_time_offset_spin.setSuffix(" s")
-        self.uam_run_analysis_button = QtWidgets.QPushButton("UAM 비교 실행")
-        self.uam_run_analysis_button.clicked.connect(self.run_uam_analysis)
-        self.uam_estimate_offset_button = QtWidgets.QPushButton("시간 offset 추정")
-        self.uam_estimate_offset_button.clicked.connect(self.estimate_uam_time_offset_from_ui)
-        self.uam_estimate_alignment_button = QtWidgets.QPushButton("좌표 보정 자동 추정")
-        self.uam_estimate_alignment_button.clicked.connect(self.estimate_uam_alignment_from_ui)
-        self.uam_save_alignment_button = QtWidgets.QPushButton("보정 저장")
-        self.uam_save_alignment_button.clicked.connect(self.save_uam_alignment_profile)
-        self.uam_load_alignment_button = QtWidgets.QPushButton("보정 불러오기")
-        self.uam_load_alignment_button.clicked.connect(self.load_uam_alignment_profile)
-        self.uam_clear_alignment_button = QtWidgets.QPushButton("보정 해제")
-        self.uam_clear_alignment_button.clicked.connect(self.clear_uam_alignment_profile)
-        self.uam_alignment_status_label = QtWidgets.QLabel("좌표 보정: 없음")
-        self.uam_alignment_status_label.setObjectName("statusStrip")
-        self.uam_alignment_status_label.setWordWrap(True)
-        self.uam_analysis_status_label = QtWidgets.QLabel(
-            "UAM 비교: ULog 최종 평가 또는 live/recorded-row 백업 비교 대기"
-        )
-        self.uam_analysis_status_label.setObjectName("statusStrip")
-        self.uam_analysis_status_label.setWordWrap(True)
-        self.uam_time_sync_status_label = QtWidgets.QLabel("UAM 시간 기준: RTCP/NTP 미검증")
-        self.uam_time_sync_status_label.setObjectName("statusStrip")
-        self.uam_time_sync_status_label.setWordWrap(True)
-        uam_path_actions = QtWidgets.QHBoxLayout()
-        uam_path_actions.addWidget(self.uam_ulog_path_edit, 1)
-        uam_path_actions.addWidget(self.uam_ulog_browse_button)
-        uam_path_actions.addWidget(self.uam_load_ulog_button)
-        uam_alignment_actions = QtWidgets.QHBoxLayout()
-        uam_alignment_actions.addWidget(self.uam_estimate_alignment_button)
-        uam_alignment_actions.addWidget(self.uam_save_alignment_button)
-        uam_alignment_actions.addWidget(self.uam_load_alignment_button)
-        uam_alignment_actions.addWidget(self.uam_clear_alignment_button)
-        uam_alignment_actions.addStretch(1)
-        uam_analysis_form.addWidget(QtWidgets.QLabel("ULog"), 0, 0)
-        uam_analysis_form.addLayout(uam_path_actions, 0, 1, 1, 6)
-        uam_analysis_form.addWidget(QtWidgets.QLabel("truth source"), 1, 0)
-        uam_analysis_form.addWidget(self.uam_truth_source_combo, 1, 1)
-        uam_analysis_form.addWidget(QtWidgets.QLabel("최대 Δt"), 1, 2)
-        uam_analysis_form.addWidget(self.uam_compare_max_dt_spin, 1, 3)
-        uam_analysis_form.addWidget(QtWidgets.QLabel("time offset"), 1, 4)
-        uam_analysis_form.addWidget(self.uam_time_offset_spin, 1, 5)
-        uam_analysis_form.addWidget(self.uam_run_analysis_button, 1, 6)
-        uam_analysis_form.addWidget(self.uam_estimate_offset_button, 2, 1)
-        uam_analysis_form.addWidget(QtWidgets.QLabel("좌표 보정"), 3, 0)
-        uam_analysis_form.addLayout(uam_alignment_actions, 3, 1, 1, 6)
-        uam_analysis_form.addWidget(self.uam_alignment_status_label, 4, 0, 1, 7)
-        uam_analysis_form.addWidget(self.uam_time_sync_status_label, 5, 0, 1, 7)
-        uam_analysis_form.addWidget(self.uam_analysis_status_label, 6, 0, 1, 7)
-        uam_analysis_layout.addLayout(uam_analysis_form)
-        uam_analysis_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        uam_analysis_left = QtWidgets.QWidget()
-        uam_analysis_left_layout = QtWidgets.QVBoxLayout(uam_analysis_left)
-        uam_analysis_left_layout.setContentsMargins(0, 0, 0, 0)
-        self.uam_analysis_table = QtWidgets.QTableWidget(0, len(UAM_ANALYSIS_TABLE_COLUMNS))
-        self.uam_analysis_table.setObjectName("uamAnalysisTable")
-        self.uam_analysis_table.setHorizontalHeaderLabels([label for _field, label in UAM_ANALYSIS_TABLE_COLUMNS])
-        self.uam_analysis_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.uam_analysis_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.uam_analysis_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.uam_analysis_table.setAlternatingRowColors(True)
-        self.uam_analysis_table.verticalHeader().setVisible(False)
-        self.uam_analysis_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.uam_analysis_table.itemSelectionChanged.connect(self._refresh_uam_analysis_detail)
-        self.uam_analysis_detail = QtWidgets.QPlainTextEdit()
-        self.uam_analysis_detail.setReadOnly(True)
-        self.uam_analysis_detail.setMaximumBlockCount(200)
-        self.uam_analysis_detail.setPlaceholderText("비교 행을 선택하면 YOLO와 Ground Truth의 전체 오차 필드가 표시됩니다.")
-        uam_analysis_left_layout.addWidget(self.uam_analysis_table, 2)
-        uam_analysis_left_layout.addWidget(self.uam_analysis_detail, 1)
-        uam_plot_panel = QtWidgets.QWidget()
-        uam_plot_panel_layout = QtWidgets.QVBoxLayout(uam_plot_panel)
-        uam_plot_panel_layout.setContentsMargins(0, 0, 0, 0)
-        uam_plot_button_row = QtWidgets.QHBoxLayout()
-        self.uam_show_error_button = QtWidgets.QPushButton("오차 그래프")
-        self.uam_show_error_button.clicked.connect(self.show_uam_error_plot)
-        self.uam_show_raw_button = QtWidgets.QPushButton("Raw NED")
-        self.uam_show_raw_button.clicked.connect(self.show_uam_raw_plot)
-        uam_plot_button_row.addWidget(self.uam_show_error_button)
-        uam_plot_button_row.addWidget(self.uam_show_raw_button)
-        uam_plot_button_row.addStretch(1)
-        self.uam_error_plot = TelemetryHistoryPlot("UAM 비교 오차", "m")
-        self.uam_error_plot.setMinimumHeight(240)
-        self.uam_raw_plot = TelemetryHistoryPlot("UAM Ground Truth Raw N/E/D", "m")
-        self.uam_raw_plot.setMinimumHeight(240)
-        self.uam_plot_stack = QtWidgets.QStackedWidget()
-        self.uam_plot_stack.addWidget(self.uam_error_plot)
-        self.uam_plot_stack.addWidget(self.uam_raw_plot)
-        uam_plot_panel_layout.addLayout(uam_plot_button_row)
-        uam_plot_panel_layout.addWidget(self.uam_plot_stack, 1)
-        uam_analysis_splitter.addWidget(uam_analysis_left)
-        uam_analysis_splitter.addWidget(uam_plot_panel)
-        uam_analysis_splitter.setStretchFactor(0, 3)
-        uam_analysis_splitter.setStretchFactor(1, 2)
-        uam_analysis_layout.addWidget(uam_analysis_splitter, 1)
-        uam_analysis_tab_layout.addWidget(uam_analysis_group, 1)
 
         self.recording_table_group = QtWidgets.QGroupBox("거리 샘플 실시간 보기")
         recording_table_layout = QtWidgets.QVBoxLayout(self.recording_table_group)
@@ -4802,83 +4461,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         recording_table_layout.addWidget(self.recording_sample_detail, 1)
         recording_samples_layout.addWidget(self.recording_table_group, 1)
 
-        bias_status_group = QtWidgets.QGroupBox("운용 Bias Profile 상태 (최종 UAM 평가 제외)")
-        bias_status_layout = QtWidgets.QGridLayout(bias_status_group)
-        self.bias_profile_status_label = QtWidgets.QLabel("Profile: 없음")
-        self.bias_profile_status_label.setObjectName("statusStrip")
-        self.bias_profile_status_label.setWordWrap(True)
-        self.bias_apply_checkbox = self._build_toggle_button("실시간 보정 적용(최종 평가 제외)", False)
-        self.bias_apply_checkbox.toggled.connect(self.set_bias_profile_applied)
-        self.bias_bin_size_spin = QtWidgets.QDoubleSpinBox()
-        self.bias_bin_size_spin.setRange(10.0, 5000.0)
-        self.bias_bin_size_spin.setDecimals(1)
-        self.bias_bin_size_spin.setValue(200.0)
-        self.bias_bin_size_spin.setSuffix(" m")
-        bias_status_layout.addWidget(self.bias_profile_status_label, 0, 0, 1, 4)
-        bias_status_layout.addWidget(self.bias_apply_checkbox, 1, 0)
-        bias_status_layout.addWidget(QtWidgets.QLabel("거리 bin"), 1, 1)
-        bias_status_layout.addWidget(self.bias_bin_size_spin, 1, 2)
-        bias_status_layout.setColumnStretch(3, 1)
-
-        bbox_adjust_group = QtWidgets.QGroupBox("2D bbox 중심 보정 / Reprojection Profile")
-        bbox_adjust_layout = QtWidgets.QGridLayout(bbox_adjust_group)
-        self.bbox_adjust_status_label = QtWidgets.QLabel("2D bbox 보정: 없음")
-        self.bbox_adjust_status_label.setObjectName("statusStrip")
-        self.bbox_adjust_status_label.setWordWrap(True)
-        self.bbox_adjust_load_button = QtWidgets.QPushButton("CSV/JSON profile 불러오기")
-        self.bbox_adjust_load_button.clicked.connect(self.load_bbox_center_adjustment_csv)
-        self.bbox_adjust_clear_button = QtWidgets.QPushButton("2D 보정 해제")
-        self.bbox_adjust_clear_button.clicked.connect(self.clear_bbox_center_adjustment)
-        bbox_adjust_layout.addWidget(self.bbox_adjust_status_label, 0, 0, 1, 3)
-        bbox_adjust_layout.addWidget(self.bbox_adjust_load_button, 1, 0)
-        bbox_adjust_layout.addWidget(self.bbox_adjust_clear_button, 1, 1)
-        bbox_adjust_layout.setColumnStretch(2, 1)
-
-        bias_drone_group = QtWidgets.QGroupBox("UAM 중심 위치 상태")
-        bias_drone_layout = QtWidgets.QVBoxLayout(bias_drone_group)
-        self.bias_drone_status_label = QtWidgets.QLabel("UAM 중심 위치: 연결 > UAM 수신 대기")
-        self.bias_drone_status_label.setObjectName("statusStrip")
-        self.bias_drone_status_label.setWordWrap(True)
-        bias_drone_layout.addWidget(self.bias_drone_status_label)
-
-        bias_actions = QtWidgets.QHBoxLayout()
-        self.bias_build_session_button = QtWidgets.QPushButton("현재 세션에서 Profile 생성")
-        self.bias_build_session_button.clicked.connect(self.build_bias_profile_from_current_session)
-        self.bias_load_csv_button = QtWidgets.QPushButton("CSV 불러와 후보정")
-        self.bias_load_csv_button.clicked.connect(self.load_bias_candidates_csv)
-        self.bias_save_profile_button = QtWidgets.QPushButton("Profile 저장")
-        self.bias_save_profile_button.clicked.connect(self.save_bias_profile)
-        self.bias_load_profile_button = QtWidgets.QPushButton("Profile 불러오기")
-        self.bias_load_profile_button.clicked.connect(self.load_bias_profile)
-        for button in (
-            self.bias_build_session_button,
-            self.bias_load_csv_button,
-            self.bias_save_profile_button,
-            self.bias_load_profile_button,
-        ):
-            bias_actions.addWidget(button)
-        bias_actions.addStretch(1)
-
-        self.bias_profile_table = QtWidgets.QTableWidget(0, 6)
-        self.bias_profile_table.setHorizontalHeaderLabels(
-            ["min(m)", "max(m)", "bias Right", "bias Down", "bias Forward", "samples"]
-        )
-        self.bias_profile_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.bias_profile_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.bias_profile_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
-
-        self.bias_profile_detail = QtWidgets.QPlainTextEdit()
-        self.bias_profile_detail.setReadOnly(True)
-        self.bias_profile_detail.setPlaceholderText(
-            "CSV 또는 현재 세션 기록에서 UAM 중심 N/E/D와 raw Right/Down/Forward 차이를 거리 bin별 평균으로 profile화합니다. "
-            "주 텔레메트리 연결은 연결 > UAM을 사용하세요."
-        )
-        center_bias_layout.addWidget(bias_status_group)
-        center_bias_layout.addWidget(bbox_adjust_group)
-        center_bias_layout.addWidget(bias_drone_group)
-        center_bias_layout.addLayout(bias_actions)
-        center_bias_layout.addWidget(self.bias_profile_table, 2)
-        center_bias_layout.addWidget(self.bias_profile_detail, 1)
         self._build_clock_sync_tab(time_layout)
         self._polish_controls()
         self._refresh_session_toggle_buttons()
@@ -4897,146 +4479,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         button.setProperty("role", "toggle")
         button.setAccessibleName(text)
         return button
-
-    def _build_uam_connection_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
-        group = QtWidgets.QGroupBox("UAM Telemetry Source")
-        group_layout = QtWidgets.QVBoxLayout(group)
-
-        self.uam_source_combo = QtWidgets.QComboBox()
-        self.uam_source_combo.addItem("MAVLink Local NED", "mavlink")
-        self.uam_source_combo.addItem("MAVLink GPS-derived", "mavlink_gps")
-        self.uam_source_combo.addItem("MAVLink Global-derived", "mavlink_global")
-        self.uam_source_combo.addItem("ROS2 Topic", "ros2")
-        self.uam_source_combo.addItem("Off", "off")
-        self._set_combo_data(self.uam_source_combo, self.settings.uam_telemetry_source)
-
-        self.uam_ros2_topic_edit = QtWidgets.QLineEdit(self.settings.uam_ros2_topic)
-        self.uam_ros2_x_field_edit = QtWidgets.QLineEdit(self.settings.uam_ros2_x_field)
-        self.uam_ros2_y_field_edit = QtWidgets.QLineEdit(self.settings.uam_ros2_y_field)
-        self.uam_ros2_z_field_edit = QtWidgets.QLineEdit(self.settings.uam_ros2_z_field)
-
-        self.uam_mavlink_url_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_url)
-        self.uam_mavlink_baud_spin = self._build_mavlink_baud_spin()
-        self.uam_mavlink_baud_spin.setValue(self.settings.uam_mavlink_baud)
-        self.uam_mavlink_side_combo = QtWidgets.QComboBox()
-        self.uam_mavlink_side_combo.addItem("UAM MAVLink", "left")
-        self._set_combo_data(self.uam_mavlink_side_combo, self.settings.uam_mavlink_side)
-        self.uam_mavlink_message_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_message)
-        self.uam_mavlink_x_field_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_x_field)
-        self.uam_mavlink_y_field_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_y_field)
-        self.uam_mavlink_z_field_edit = QtWidgets.QLineEdit(self.settings.uam_mavlink_z_field)
-
-        self.uam_connect_button = QtWidgets.QPushButton("Telemetry 연결")
-        self.uam_connect_button.clicked.connect(self.connect_uam_telemetry_from_ui)
-        self.uam_disconnect_button = QtWidgets.QPushButton("Telemetry 해제")
-        self.uam_disconnect_button.clicked.connect(self.disconnect_uam_telemetry_from_ui)
-        self.uam_clear_live_button = QtWidgets.QPushButton("실시간 버퍼 초기화")
-        self.uam_clear_live_button.clicked.connect(self.clear_uam_live_telemetry)
-        self.uam_source_contract_label = QtWidgets.QLabel("Source contract: 대기")
-        self.uam_source_contract_label.setObjectName("statusStrip")
-        self.uam_source_contract_label.setWordWrap(True)
-        self.uam_source_contract_label.setMinimumHeight(32)
-        self.uam_status_label = QtWidgets.QLabel("UAM telemetry source: 대기")
-        self.uam_status_label.setObjectName("statusStrip")
-        self.uam_status_label.setWordWrap(True)
-        self.uam_status_label.setMinimumHeight(30)
-        self.uam_mount_reference_label = QtWidgets.QLabel(
-            "기준 위치: GPS 안테나와 Pixhawk를 UAM/드론 중앙에 둔 body origin N/E/D"
-        )
-        self.uam_mount_reference_label.setObjectName("statusStrip")
-        self.uam_mount_reference_label.setWordWrap(True)
-        self.uam_mount_reference_label.setMinimumHeight(30)
-        self.uam_latest_label = QtWidgets.QLabel("latest: --")
-        self.uam_latest_label.setObjectName("statusStrip")
-        self.uam_latest_label.setWordWrap(True)
-        self.uam_latest_label.setMinimumHeight(30)
-
-        source_group = QtWidgets.QGroupBox("1 Source")
-        source_form = QtWidgets.QGridLayout(source_group)
-        source_form.setHorizontalSpacing(8)
-        source_form.setVerticalSpacing(8)
-        source_form.setColumnStretch(1, 1)
-        source_form.addWidget(QtWidgets.QLabel("Telemetry source"), 0, 0)
-        source_form.addWidget(self.uam_source_combo, 0, 1)
-        source_form.addWidget(self.uam_connect_button, 0, 2)
-        source_form.addWidget(self.uam_disconnect_button, 0, 3)
-        source_form.addWidget(self.uam_clear_live_button, 0, 4)
-        source_form.addWidget(self.uam_source_contract_label, 1, 0, 1, 5)
-
-        mavlink_mapping_group = QtWidgets.QGroupBox("2 MAVLink Telemetry")
-        mavlink_mapping_group.setMinimumHeight(142)
-        mavlink_mapping_form = QtWidgets.QGridLayout(mavlink_mapping_group)
-        mavlink_mapping_form.setHorizontalSpacing(8)
-        mavlink_mapping_form.setVerticalSpacing(8)
-        mavlink_mapping_form.setColumnStretch(1, 1)
-        mavlink_mapping_form.addWidget(QtWidgets.QLabel("Link URL"), 0, 0)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_url_edit, 0, 1)
-        mavlink_mapping_form.addWidget(QtWidgets.QLabel("Baud"), 0, 2)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_baud_spin, 0, 3)
-        mavlink_mapping_form.addWidget(QtWidgets.QLabel("Link role"), 1, 0)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_side_combo, 1, 1)
-        mavlink_mapping_form.addWidget(QtWidgets.QLabel("Local msg"), 1, 2)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_message_edit, 1, 3)
-        mavlink_mapping_form.addWidget(QtWidgets.QLabel("N / E / D"), 2, 0)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_x_field_edit, 2, 1)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_y_field_edit, 2, 2)
-        mavlink_mapping_form.addWidget(self.uam_mavlink_z_field_edit, 2, 3)
-
-        ros2_mapping_group = QtWidgets.QGroupBox("3 ROS2 Mapping")
-        ros2_mapping_group.setMinimumHeight(124)
-        ros2_mapping_form = QtWidgets.QGridLayout(ros2_mapping_group)
-        ros2_mapping_form.setHorizontalSpacing(8)
-        ros2_mapping_form.setVerticalSpacing(8)
-        ros2_mapping_form.setColumnStretch(1, 1)
-        ros2_mapping_form.addWidget(QtWidgets.QLabel("Topic"), 0, 0)
-        ros2_mapping_form.addWidget(self.uam_ros2_topic_edit, 0, 1, 1, 3)
-        ros2_mapping_form.addWidget(QtWidgets.QLabel("N / E / D"), 1, 0)
-        ros2_mapping_form.addWidget(self.uam_ros2_x_field_edit, 1, 1)
-        ros2_mapping_form.addWidget(self.uam_ros2_y_field_edit, 1, 2)
-        ros2_mapping_form.addWidget(self.uam_ros2_z_field_edit, 1, 3)
-
-        status_group = QtWidgets.QGroupBox("4 Status")
-        status_group.setMinimumHeight(132)
-        status_layout = QtWidgets.QVBoxLayout(status_group)
-        status_layout.setSpacing(4)
-        status_layout.addWidget(self.uam_status_label)
-        status_layout.addWidget(self.uam_mount_reference_label)
-        status_layout.addWidget(self.uam_latest_label)
-
-        self.uam_live_plot = TelemetryHistoryPlot("UAM Ground Truth N/E/D", "m")
-        self.uam_live_plot.setMinimumHeight(260)
-        group_layout.addWidget(source_group)
-        group_layout.addWidget(mavlink_mapping_group)
-        group_layout.addWidget(ros2_mapping_group)
-        group_layout.addWidget(status_group)
-        group_layout.addWidget(self.uam_live_plot, 1)
-        layout.addWidget(group, 1)
-        self.uam_source_combo.currentIndexChanged.connect(lambda _index: self._refresh_uam_source_contract())
-        self._refresh_uam_source_contract()
-
-    def _refresh_uam_source_contract(self) -> None:
-        if not hasattr(self, "uam_source_contract_label"):
-            return
-        source = str(self.uam_source_combo.currentData() or "mavlink")
-        contracts = {
-            "mavlink": (
-                "Source contract: MAVLink LOCAL_POSITION_NED x/y/z를 UAM body origin의 "
-                "North/East/Down으로 사용합니다."
-            ),
-            "mavlink_gps": (
-                "Source contract: MAVLink GPS_RAW_INT/GPS2_RAW lat/lon/alt를 첫 유효 샘플 origin 기준 "
-                "local N/E/D로 변환합니다."
-            ),
-            "mavlink_global": (
-                "Source contract: MAVLink GLOBAL_POSITION_INT lat/lon/alt를 첫 유효 샘플 origin 기준 "
-                "local N/E/D로 변환합니다."
-            ),
-            "ros2": (
-                "Source contract: ROS2 topic field x/y/z를 UAM body origin의 North/East/Down으로 사용합니다."
-            ),
-            "off": "Source contract: UAM live telemetry를 사용하지 않습니다.",
-        }
-        self.uam_source_contract_label.setText(contracts.get(source, contracts["mavlink"]))
 
     def _set_yolo_device_combo(self, device: str) -> None:
         index = self.device_combo.findData(self._normalized_yolo_device(device))
@@ -5272,42 +4714,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_mavlink_button: "Pixhawk 2 MAVLink 세션을 연결하거나, 연결 중이면 P2 MAVLink 링크만 중지합니다.",
             self.left_uxrce_param_button: "활성 P1 MAVLink 연결로 PX4 UXRCE_DDS_* 파라미터를 Pixhawk Host IP에 맞게 설정하고 확인합니다.",
             self.right_uxrce_param_button: "활성 P2 MAVLink 연결로 PX4 UXRCE_DDS_* 파라미터를 Pixhawk Host IP에 맞게 설정하고 확인합니다.",
-            self.uam_source_combo: "UAM/드론 ground truth 위치를 받을 telemetry source contract를 선택합니다.",
-            self.uam_ros2_topic_edit: "ROS2 ground truth 위치 topic입니다. 기본값은 PX4 vehicle_local_position입니다.",
-            self.uam_ros2_x_field_edit: "ROS2 ground truth North field입니다. PX4 local position에서는 보통 x입니다.",
-            self.uam_ros2_y_field_edit: "ROS2 ground truth East field입니다. PX4 local position에서는 보통 y입니다.",
-            self.uam_ros2_z_field_edit: "ROS2 ground truth Down field입니다. PX4 local position에서는 보통 z입니다.",
-            self.uam_mavlink_url_edit: "UAM/드론 PX4 telemetry를 받을 MAVLink URL입니다. 예: /dev/ttyACM0, udpin:0.0.0.0:14550",
-            self.uam_mavlink_baud_spin: "UAM MAVLink telemetry URL이 시리얼 장치일 때 사용할 baud rate입니다.",
-            self.uam_mavlink_side_combo: "P1/P2 Rover Pixhawk와 별개인 UAM Telemetry MAVLink 링크입니다.",
-            self.uam_mavlink_message_edit: "UAM MAVLink local 위치 메시지입니다. LOCAL_POSITION_NED는 x=north, y=east, z=down입니다.",
-            self.uam_mavlink_x_field_edit: "MAVLink ground truth North field입니다. LOCAL_POSITION_NED에서는 x입니다.",
-            self.uam_mavlink_y_field_edit: "MAVLink ground truth East field입니다. LOCAL_POSITION_NED에서는 y입니다.",
-            self.uam_mavlink_z_field_edit: "MAVLink ground truth Down field입니다. LOCAL_POSITION_NED에서는 z입니다.",
-            self.uam_connect_button: "선택한 telemetry source에 uam_x/y/z 감시를 등록하고 실시간 ground truth 버퍼를 채웁니다.",
-            self.uam_disconnect_button: "UAM ground truth uam_x/y/z 감시만 해제합니다. Pixhawk ROS2/MAVLink 연결과 기존 live buffer는 유지합니다.",
-            self.uam_clear_live_button: "실시간 UAM ground truth 버퍼와 N/E/D 그래프를 초기화합니다.",
-            self.uam_status_label: "UAM ground truth 텔레메트리 연결 및 버퍼 상태입니다.",
-            self.uam_mount_reference_label: "UAM/드론의 GPS 안테나와 Pixhawk가 기체 중앙에 배치된다는 실험 기준입니다.",
-            self.uam_latest_label: "최근 수신한 UAM/드론 중심 좌표입니다.",
-            self.uam_live_plot: "ULog 또는 실시간 텔레메트리의 N/E/D ground truth 이력입니다.",
-            self.uam_ulog_path_edit: "비행 후 비교 분석에 사용할 PX4 ULog(.ulg) 파일 경로입니다.",
-            self.uam_ulog_browse_button: "PX4 ULog(.ulg) 파일을 선택하고 즉시 로드합니다.",
-            self.uam_load_ulog_button: "입력칸의 현재 .ulg 경로를 다시 로드합니다. 직접 경로를 수정한 뒤 사용합니다.",
-            self.uam_truth_source_combo: "Profile 생성/비교에 사용할 truth source를 선택합니다. Auto는 local NED, global position, GPS position 순서로 사용합니다.",
-            self.uam_compare_max_dt_spin: "YOLO 측정 timestamp와 ground truth timestamp를 매칭할 때 허용할 최대 시간 차이입니다.",
-            self.uam_time_offset_spin: "YOLO 측정 timestamp에 더할 post-flight 시간 보정값입니다.",
-            self.uam_run_analysis_button: "ULog, 실시간 UAM buffer, 기록 row fallback 순서로 YOLO 3D 측정값과 ground truth를 비교합니다. ULog/live와 기록 row fallback은 한 결과 안에서 섞지 않습니다. 좌표 보정 profile이 있으면 ground truth를 camera FRD로 역변환해 FRD 축별 오차도 계산합니다.",
-            self.uam_estimate_offset_button: "현재 기록 row와 ULog/live buffer의 거리 차이가 가장 작아지는 시간 offset 후보를 추정하고 적용합니다.",
-            self.uam_estimate_alignment_button: "현재 매칭된 YOLO Right/Down/Forward와 UAM N/E/D로 축 일치화와 origin offset profile을 자동 추정합니다.",
-            self.uam_save_alignment_button: "현재 좌표 보정 profile을 JSON으로 저장합니다. 본 실험 재사용과 결과 재현성 확인에 필요합니다.",
-            self.uam_load_alignment_button: "저장된 좌표 보정 profile JSON을 불러와 UAM 비교에 적용합니다.",
-            self.uam_clear_alignment_button: "좌표 보정 profile 적용을 해제하고 mixed-frame 비교로 되돌립니다.",
-            self.uam_alignment_status_label: "적용 중인 좌표 보정 profile의 샘플 수, RMSE, origin N/E/D offset입니다.",
-            self.uam_show_error_button: "UAM 비교 오차 그래프를 표시합니다.",
-            self.uam_show_raw_button: "ULog 또는 실시간 UAM ground truth Raw N/E/D 그래프를 표시합니다.",
-            self.uam_error_plot: "좌표 보정 profile이 있으면 YOLO Forward/Right/Down과 ground truth를 역변환한 camera FRD의 축별 오차 이력입니다. profile이 없으면 mixed-frame 또는 N/E/D 보조 오차를 표시합니다.",
-            self.uam_raw_plot: "ULog 또는 실시간 UAM ground truth Raw N/E/D 이력입니다.",
             self.left_px4_shell_button: "활성 MAVLink 연결을 통해 Pixhawk 1 PX4 shell 창을 엽니다.",
             self.right_px4_shell_button: "활성 MAVLink 연결을 통해 Pixhawk 2 PX4 shell 창을 엽니다.",
             self.left_persist_eth_button: "왼쪽 Pixhawk eth0/MAVLink UDP 설정을 즉시 적용하고 extras.txt에 저장합니다.",
@@ -5364,13 +4770,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.custom_watch_remove_combo: "제거할 기존 사용자 지정 감시를 선택합니다.",
             self.custom_watch_remove_button: "선택한 사용자 지정 감시를 제거하고 그래프 series를 지웁니다.",
             self.custom_watch_plot: "사용자 지정 숫자 감시값의 이력 그래프입니다.",
-            self.bias_drone_status_label: "연결 > UAM 또는 legacy row에서 합쳐진 최신 UAM/드론 중심 위치 상태입니다.",
-            self.bias_apply_checkbox: "로드된 중심점 bias profile을 실시간 표시/기록값에만 적용합니다. 저장·분석 > UAM 비교는 최종 평가 충돌을 피하기 위해 raw stereo-center 값을 우선 사용합니다.",
-            self.bias_bin_size_spin: "후보정 profile을 만들 때 raw 거리 기준으로 묶을 bin 크기입니다.",
-            self.bias_build_session_button: "현재 기록된 raw Right/Down/Forward 점과 UAM 중심 N/E/D 차이로 legacy profile을 생성합니다.",
-            self.bias_load_csv_button: "저장된 거리 CSV를 불러와 후보정 profile을 생성합니다.",
-            self.bias_save_profile_button: "현재 bias profile을 JSON 파일로 저장합니다.",
-            self.bias_load_profile_button: "저장된 bias profile JSON을 불러옵니다.",
             self.rtk_baseline_label: "실시간 baseline 길이, N/E/D 벡터, 샘플 age, GPS/RTK 품질 경고를 표시합니다.",
             self.rtk_alignment_detail_label: "안테나 baseline과 카메라 기준 Right/Down/Forward 성분을 분리해 표시합니다.",
             self.rtk_alignment_plot: "GPS 안테나 baseline과 카메라 기준 baseline 성분을 시각화합니다.",
@@ -5447,17 +4846,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             self.save_history_button: "현재 세션의 metadata, 거리 샘플, 외부 파라미터, MAG 상태 파일을 디스크에 저장합니다.",
             self.save_settings_button: "현재 내부 파라미터 경로와 전체 런타임 설정을 저장합니다.",
-            self.uam_ulog_path_edit: "비행 후 기준 위치를 읽을 PX4 .ulg 파일입니다. ULog가 로드되면 실시간 버퍼보다 우선합니다.",
-            self.uam_ulog_browse_button: "PX4 .ulg 파일을 선택하고 즉시 로드합니다.",
-            self.uam_load_ulog_button: "입력칸의 현재 .ulg 경로를 다시 로드합니다. 직접 경로를 수정한 뒤 사용합니다.",
-            self.uam_truth_source_combo: "ULog/profile 분석에 사용할 source입니다. local/global/GPS는 한 profile 안에서 섞지 않습니다.",
-            self.uam_compare_max_dt_spin: "YOLO 샘플과 ground truth 샘플을 같은 시각으로 볼 최대 시간 차이입니다.",
-            self.uam_time_offset_spin: "YOLO timestamp에 더할 보정 offset입니다. 비행 후 시간축 보정값을 여기에 입력합니다.",
-            self.uam_run_analysis_button: "거리 기록을 ULog, 실시간 버퍼, 기록 행 fallback 순서로 ground truth와 비교합니다. ULog/live 결과에는 기록 행 fallback을 섞지 않습니다. 좌표 보정 profile이 있으면 estimated N/E/D와 truth camera FRD, FRD 축별 오차를 함께 계산합니다.",
-            self.uam_analysis_status_label: "UAM 비교 결과 요약입니다.",
-            self.uam_analysis_table: "YOLO stereo-center Forward/Right/Down과 ground truth North/East/Down을 시간 기준으로 1:1 매칭한 행별 비교표입니다. profile이 있으면 ground truth를 camera FRD로 역변환한 축별 비교도 표시합니다.",
-            self.uam_analysis_detail: "선택한 UAM 비교 행의 전체 필드입니다.",
-            self.uam_error_plot: "좌표 보정 profile이 있으면 camera FRD 축별 오차를 표시하고, 없으면 mixed-frame 임시 축별 차이 및 거리 오차를 표시합니다.",
             self.recording_status_label: "메모리 내 거리 기록 상태와 샘플 수입니다.",
             self.recording_sample_table: "저장될 거리 기록 CSV의 주요 컬럼을 새 샘플이 생길 때마다 한 줄씩 표시합니다.",
             self.recording_sample_detail: "선택한 거리 샘플의 전체 CSV 필드를 표시합니다.",
@@ -5535,14 +4923,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         latest = distances[-1] if distances else 0.0
         average = sum(distances) / len(distances) if distances else 0.0
         quality_text = ", ".join(f"{name} {count}" for name, count in sorted(qualities.items()))
-        uam_text = ""
-        if self.uam_analysis_rows:
-            uam_text = f"\n{self._format_uam_analysis_summary()}"
         self.session_summary_label.setText(
             f"기록 샘플: {len(rows)}개\n"
             f"품질 분포: {quality_text or '없음'}\n"
             f"최신 거리: {latest:.2f} m | 평균 거리: {average:.2f} m"
-            f"{uam_text}"
         )
 
     def _apply_visual_style(self) -> None:
@@ -5758,21 +5142,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.clock_download_latest_button,
             self.clock_workflow_button,
             self.save_settings_button,
-            self.uam_connect_button,
-            self.uam_ulog_browse_button,
-            self.uam_load_ulog_button,
-            self.uam_run_analysis_button,
-            self.uam_estimate_offset_button,
-            self.uam_estimate_alignment_button,
-            self.uam_save_alignment_button,
-            self.uam_load_alignment_button,
-            self.uam_clear_alignment_button,
-            self.uam_show_error_button,
-            self.uam_show_raw_button,
         )
-        danger_buttons = (
-            self.uam_disconnect_button,
-        )
+        danger_buttons = ()
         success_buttons = (
             self.save_history_button,
             self.record_button,
@@ -8515,7 +7886,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             warning = (
                 f"좌우 RTCP/NTP pair는 {abs(pair_delta_s) * 1000.0:.1f} ms 이내지만, "
                 f"{', '.join(invalid_cameras)} Sender Report NTP의 PC UTC 기준이 500 ms 이상 어긋났습니다. "
-                "UAM UTC 매칭에는 사용할 수 없습니다."
+                "절대 UTC 기준으로 사용할 수 없습니다."
             )
         elif max_offset_ms is not None and max_offset_ms > CAMERA_RTCP_MAX_PC_OFFSET_S * 1000.0:
             status = "pc-offset-failed"
@@ -8539,28 +7910,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "warning": warning,
         }
 
-    def _refresh_uam_time_sync_status(self) -> None:
-        if not hasattr(self, "uam_time_sync_status_label"):
-            return
-        left_metadata, right_metadata = self._clock_sync_pair_metadata()
-        metrics = self._camera_time_sync_metrics(
-            left_metadata,
-            right_metadata,
-        )
-        status = str(metrics["status"])
-        if status == "within-threshold-unverified":
-            text = "UAM 시간 기준: RTCP/NTP 조건 충족, UTC 기준은 미검증"
-        elif status == "missing-rtcp":
-            text = "UAM 시간 기준: RTCP/NTP 없음, UTC 매칭 사용 불가"
-        else:
-            text = f"UAM 시간 기준: 사용 불가 ({metrics['warning']})"
-        self.uam_time_sync_status_label.setText(text)
-        self.uam_time_sync_status_label.setToolTip(
-            "UAM 위치는 NED, 카메라 측정점은 stereo-center OpenCV optical RDF입니다. "
-            f"time_basis={metrics['basis']}; status={status}; {metrics['warning']}"
-        )
-
-    def _format_clock_sync_status(self, now_wall_s: float | None = None, now_mono_s: float | None = None) -> tuple[str, str]:
+    def _format_clock_sync_status(
+        self,
+        now_wall_s: float | None = None,
+        now_mono_s: float | None = None,
+    ) -> tuple[str, str]:
         now_wall_s = time.time() if now_wall_s is None else float(now_wall_s)
         now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
         left_metadata, right_metadata = self._clock_sync_pair_metadata(now_mono_s)
@@ -8615,7 +7969,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.clock_sync_status_label.setToolTip(detail)
         self.clock_sync_summary_text.setPlainText(detail)
         self._log(f"[시계] {status}")
-        self._refresh_uam_time_sync_status()
 
     def _download_latest_clock_photo_pair(self) -> dict[str, Path]:
         output_root = self._clock_download_root()
@@ -10410,7 +9763,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             status, detail = self._format_clock_sync_status(now_mono_s=now_s)
             self.clock_sync_status_label.setText(status)
             self.clock_sync_status_label.setToolTip(detail)
-            self._refresh_uam_time_sync_status()
 
     def _update_camera_stream_stats(self, camera: str, payload: object) -> None:
         stats = dict(payload or {})
@@ -10937,12 +10289,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"translation_right_in_left: {translation_text}\n"
             f"{self._format_checkerboard_stereo_extrinsics_summary()}\n\n"
             f"{self._format_mount_assumption_summary()}\n\n"
-            f"{self._bbox_center_adjustment_summary()}\n\n"
-            f"{self._format_uam_telemetry_summary()}\n\n"
             f"max_detection_dt: {self._yolo_pair_max_delta_s():.6f} s\n"
             f"max_vertical_delta: {self._yolo_vertical_max_delta_px():.6f} px\n"
             "same_class_required: false\n"
-            "attitude_gate: false"
+            "attitude_gate: false\n"
+            f"attitude_timing_policy: {ATTITUDE_TIMING_POLICY}\n"
+            f"attitude_stale_age_threshold_s: {ATTITUDE_STALE_AGE_S:.3f}\n"
+            f"attitude_very_stale_age_threshold_s: {ATTITUDE_VERY_STALE_AGE_S:.3f}\n"
+            f"attitude_stale_pair_delta_threshold_s: {ATTITUDE_STALE_PAIR_DELTA_S:.3f}\n"
+            f"attitude_very_stale_pair_delta_threshold_s: {ATTITUDE_VERY_STALE_PAIR_DELTA_S:.3f}"
         )
 
     def _format_checkerboard_stereo_extrinsics_summary(self) -> str:
@@ -11395,12 +10750,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _recording_table_value(self, row: dict[str, object], field: str) -> str:
-        fallback_fields = {
-            "telemetry_range_m": "telemetry_baseline_center_distance_m",
-            "telemetry_range_error_m": "telemetry_baseline_range_error_m",
-        }
-        if field not in row and field in fallback_fields:
-            field = fallback_fields[field]
         value = row.get(field, "")
         if value is None:
             return ""
@@ -11444,453 +10793,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         lines = [f"{key}: {value}" for key, value in row.items()]
         self.recording_sample_detail.setPlainText("\n".join(lines))
 
-    def browse_uam_ulog_file(self) -> None:
-        start_path = self._calibration_dirs()[0]
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select PX4 ULog",
-            str(start_path),
-            "PX4 ULog (*.ulg);;All files (*)",
-        )
-        if not selected:
-            return
-        self.uam_ulog_path_edit.setText(selected)
-        self.load_uam_ulog_file()
-
-    def _selected_uam_truth_source_type(self) -> str:
-        if not hasattr(self, "uam_truth_source_combo"):
-            return TRUTH_SOURCE_AUTO
-        return str(self.uam_truth_source_combo.currentData() or TRUTH_SOURCE_AUTO)
-
-    def _on_uam_truth_source_changed(self) -> None:
-        self.uam_ulog_samples = []
-        self.uam_ulog_path = None
-        self.uam_ulog_truth_source_type = TRUTH_SOURCE_AUTO
-        self.uam_analysis_rows = []
-        self._refresh_uam_analysis_table()
-        self._refresh_uam_error_plot()
-        source = self._selected_uam_truth_source_type()
-        self.uam_analysis_status_label.setText(
-            f"UAM 비교: truth source={source}. ULog를 다시 로드하거나 비교를 실행하세요."
-        )
-
-    def load_uam_ulog_file(self) -> bool:
-        path_text = self.uam_ulog_path_edit.text().strip()
-        if not path_text:
-            self.uam_analysis_status_label.setText("UAM 비교: ULog 경로가 비어 있습니다.")
-            return False
-        try:
-            truth_source_type = self._selected_uam_truth_source_type()
-            samples, topic_name = load_ulog_local_position_samples(
-                path_text,
-                truth_source_type=truth_source_type,
-            )
-        except ULogTelemetryError as exc:
-            self.uam_ulog_samples = []
-            self.uam_ulog_path = None
-            self.uam_ulog_truth_source_type = TRUTH_SOURCE_AUTO
-            self.uam_analysis_status_label.setText(f"UAM 비교: ULog 로드 실패 - {exc}")
-            self._log(f"[UAM] ULog ground truth 로드 실패: {exc}")
-            return False
-        self.uam_ulog_samples = samples
-        self.uam_ulog_path = Path(path_text).expanduser()
-        self.uam_ulog_truth_source_type = truth_source_type
-        self._refresh_uam_truth_plot(samples)
-        first_s = samples[0].timestamp_s
-        last_s = samples[-1].timestamp_s
-        utc_count = sum(1 for sample in samples if sample.utc_unix_s is not None)
-        utc_text = f", utc={utc_count}" if utc_count else ", utc=none"
-        self.uam_analysis_status_label.setText(
-            f"UAM 비교: ULog 로드 완료 topic={topic_name}, samples={len(samples)}, "
-            f"truth_source={truth_source_type}, t={first_s:.3f}..{last_s:.3f}s{utc_text}"
-        )
-        self._log(
-            f"[UAM] ULog ground truth 로드 완료: {self.uam_ulog_path} "
-            f"topic={topic_name} truth_source={truth_source_type} samples={len(samples)} utc={utc_count}"
-        )
-        self.show_uam_raw_plot()
-        self._refresh_camera_parameters_tab()
-        return True
-
-    def _uam_analysis_truth_samples(self) -> tuple[list[UamTelemetrySample], str]:
-        if self.uam_ulog_samples:
-            return list(self.uam_ulog_samples), "ulog"
-        if self.uam_live_telemetry_samples:
-            return list(self.uam_live_telemetry_samples), "live-buffer"
-        return [], "embedded-recorded-row"
-
-    def _ensure_uam_ulog_loaded_from_path(self) -> None:
-        path_text = self.uam_ulog_path_edit.text().strip()
-        if not path_text:
-            return
-        path = Path(path_text).expanduser()
-        truth_source_type = self._selected_uam_truth_source_type()
-        if (
-            self.uam_ulog_path != path
-            or self.uam_ulog_truth_source_type != truth_source_type
-            or not self.uam_ulog_samples
-        ):
-            self.load_uam_ulog_file()
-
-    def _compare_uam_rows(self, *, alignment_profile: UamAlignmentProfile | None) -> list[dict[str, object]]:
-        truth_samples, truth_source = self._uam_analysis_truth_samples()
-        return compare_measurement_rows(
-            self.distance_recording_rows,
-            truth_samples,
-            truth_source=truth_source,
-            max_dt_s=self.uam_compare_max_dt_spin.value(),
-            time_offset_s=self.uam_time_offset_spin.value(),
-            allow_embedded_truth=truth_source == "embedded-recorded-row",
-            alignment_profile=alignment_profile,
-        )
-
-    def run_uam_analysis(self) -> None:
-        if not self.distance_recording_rows:
-            self.uam_analysis_rows = []
-            self._refresh_uam_analysis_table()
-            self._refresh_uam_error_plot()
-            self.uam_analysis_status_label.setText("UAM 비교: 거리 기록 샘플이 없습니다.")
-            self._refresh_operation_header()
-            return
-        self._ensure_uam_ulog_loaded_from_path()
-        self.uam_analysis_rows = self._compare_uam_rows(alignment_profile=self.uam_alignment_profile)
-        self._refresh_uam_analysis_table()
-        self._refresh_uam_error_plot()
-        self.show_uam_error_plot()
-        summary = self._format_uam_analysis_summary()
-        if self.uam_analysis_rows:
-            self.uam_analysis_status_label.setText(summary)
-            self._log(f"[UAM] YOLO 측정값과 ground truth 비교 완료: {summary}")
-        else:
-            total_rows = len(self.distance_recording_rows)
-            self.uam_analysis_status_label.setText(
-                f"UAM 비교: matched=0/{total_rows}. ULog/실시간 버퍼 시간축, 최대 Δt, "
-                "Pixhawk 부팅 전 기록 구간을 확인하세요."
-            )
-            self._log("[UAM] YOLO 측정값과 ground truth 비교 결과가 비어 있습니다.")
-        self._refresh_operation_header()
-        self._refresh_camera_parameters_tab()
-
-    def estimate_uam_alignment_from_ui(self) -> None:
-        if not self.distance_recording_rows:
-            self.uam_alignment_status_label.setText("좌표 보정: 거리 기록 샘플이 없습니다.")
-            return
-        self._ensure_uam_ulog_loaded_from_path()
-        raw_rows = self._compare_uam_rows(alignment_profile=None)
-        if not raw_rows:
-            self.uam_alignment_status_label.setText(
-                "좌표 보정: 매칭된 샘플이 없습니다. ULog/실시간 버퍼 시간축과 최대 Δt를 확인하세요."
-            )
-            return
-        try:
-            profile = estimate_alignment_profile_from_rows(raw_rows)
-        except UamAlignmentError as exc:
-            self.uam_alignment_status_label.setText(f"좌표 보정 추정 실패: {exc}")
-            self._log(f"[UAM] 좌표 보정 추정 실패: {exc}")
-            return
-        self.uam_alignment_profile = profile
-        self.uam_alignment_profile_path = None
-        self._refresh_uam_alignment_status()
-        self._log(
-            "[UAM] 좌표 보정 profile 자동 추정: "
-            f"{profile.profile_id}, samples={profile.sample_count}, rmse={profile.rmse_m:.4f}m"
-        )
-        self.run_uam_analysis()
-
-    def save_uam_alignment_profile(self) -> None:
-        if self.uam_alignment_profile is None:
-            self.uam_alignment_status_label.setText("좌표 보정: 저장할 profile이 없습니다.")
-            return
-        default_path = self._calibration_dirs()[0] / f"{self.uam_alignment_profile.profile_id}.json"
-        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save UAM alignment profile",
-            str(default_path),
-            "UAM alignment JSON (*.json);;All files (*)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            path.write_text(
-                json.dumps(self.uam_alignment_profile.to_dict(), indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            self.uam_alignment_status_label.setText(f"좌표 보정 저장 실패: {exc}")
-            return
-        self.uam_alignment_profile_path = path
-        self._refresh_uam_alignment_status()
-        self._log(f"[UAM] 좌표 보정 profile 저장: {path}")
-
-    def load_uam_alignment_profile(self) -> None:
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Load UAM alignment profile",
-            str(self._calibration_dirs()[0]),
-            "UAM alignment JSON (*.json);;All files (*)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("profile JSON root must be an object")
-            profile = UamAlignmentProfile.from_dict(payload)
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-            self.uam_alignment_status_label.setText(f"좌표 보정 로드 실패: {exc}")
-            return
-        self.uam_alignment_profile = profile
-        self.uam_alignment_profile_path = path
-        self._refresh_uam_alignment_status()
-        self._log(f"[UAM] 좌표 보정 profile 로드: {path}")
-        if self.distance_recording_rows:
-            self.run_uam_analysis()
-
-    def clear_uam_alignment_profile(self) -> None:
-        self.uam_alignment_profile = None
-        self.uam_alignment_profile_path = None
-        self._refresh_uam_alignment_status()
-        self._log("[UAM] 좌표 보정 profile을 해제했습니다.")
-        if self.distance_recording_rows:
-            self.run_uam_analysis()
-
-    def _refresh_uam_alignment_status(self) -> None:
-        if not hasattr(self, "uam_alignment_status_label"):
-            return
-        profile = self.uam_alignment_profile
-        if profile is None:
-            self.uam_alignment_status_label.setText("좌표 보정: 없음")
-            return
-        path_text = f" | file={self.uam_alignment_profile_path.name}" if self.uam_alignment_profile_path else ""
-        offset = profile.origin_offset_m
-        source_text = f" | truth={profile.truth_source_type}" if profile.truth_source_type else ""
-        self.uam_alignment_status_label.setText(
-            f"좌표 보정: {profile.profile_id} | samples={profile.sample_count} | "
-            f"rmse={profile.rmse_m:.3f}m | max={profile.max_error_m:.3f}m | "
-            f"origin N/E/D={offset[0]:+.3f}/{offset[1]:+.3f}/{offset[2]:+.3f}m{source_text}{path_text}"
-        )
-
-    def estimate_uam_time_offset_from_ui(self) -> None:
-        if not self.distance_recording_rows:
-            self.uam_analysis_status_label.setText("UAM offset 추정: 거리 기록 샘플이 없습니다.")
-            return
-        path_text = self.uam_ulog_path_edit.text().strip()
-        if path_text:
-            path = Path(path_text).expanduser()
-            truth_source_type = self._selected_uam_truth_source_type()
-            if (
-                self.uam_ulog_path != path
-                or self.uam_ulog_truth_source_type != truth_source_type
-                or not self.uam_ulog_samples
-            ):
-                self.load_uam_ulog_file()
-        truth_samples, truth_source = self._uam_analysis_truth_samples()
-        if not truth_samples:
-            self.uam_analysis_status_label.setText("UAM offset 추정: ULog 또는 실시간 ground truth 샘플이 없습니다.")
-            return
-        estimate = estimate_time_offset_s(
-            self.distance_recording_rows,
-            truth_samples,
-            max_dt_s=self.uam_compare_max_dt_spin.value(),
-            initial_offset_s=self.uam_time_offset_spin.value(),
-        )
-        if estimate is None:
-            self.uam_analysis_status_label.setText("UAM offset 추정: 매칭 가능한 후보를 찾지 못했습니다.")
-            return
-        offset_s = float(estimate["time_offset_s"])
-        self.uam_time_offset_spin.setValue(offset_s)
-        self.uam_analysis_status_label.setText(
-            "UAM offset 추정: "
-            f"offset={offset_s:+.6f}s, source={truth_source}, "
-            f"matches={int(estimate['matched_count'])}, "
-            f"rmse={estimate['rmse_m']:.3f}m, mean|dt|={estimate['mean_abs_dt_s']:.6f}s"
-        )
-        self._log(f"[UAM] 시간 offset 추정 완료: {self.uam_analysis_status_label.text()}")
-        self.run_uam_analysis()
-
-    def show_uam_error_plot(self) -> None:
-        if hasattr(self, "uam_plot_stack"):
-            self.uam_plot_stack.setCurrentWidget(self.uam_error_plot)
-
-    def show_uam_raw_plot(self) -> None:
-        if hasattr(self, "uam_plot_stack"):
-            self.uam_plot_stack.setCurrentWidget(self.uam_raw_plot)
-
-    def _uam_analysis_table_value(self, row: dict[str, object], field: str) -> str:
-        fallback_fields = {
-            "estimated_range_m": "estimated_baseline_center_distance_m",
-            "truth_range_m": "truth_baseline_center_distance_m",
-        }
-        if field not in row and field in fallback_fields:
-            field = fallback_fields[field]
-        value = row.get(field, "")
-        if value is None:
-            return ""
-        return str(value)
-
-    def _refresh_uam_analysis_table(self) -> None:
-        if not hasattr(self, "uam_analysis_table"):
-            return
-        table = self.uam_analysis_table
-        table.setRowCount(0)
-        for row in self.uam_analysis_rows:
-            row_index = table.rowCount()
-            table.insertRow(row_index)
-            for column_index, (field, _label) in enumerate(UAM_ANALYSIS_TABLE_COLUMNS):
-                item = QtWidgets.QTableWidgetItem(self._uam_analysis_table_value(row, field))
-                item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-                table.setItem(row_index, column_index, item)
-        if self.uam_analysis_rows:
-            table.selectRow(table.rowCount() - 1)
-            table.scrollToBottom()
-        elif hasattr(self, "uam_analysis_detail"):
-            self.uam_analysis_detail.clear()
-
-    def _refresh_uam_analysis_detail(self) -> None:
-        if not hasattr(self, "uam_analysis_table"):
-            return
-        selected_rows = self.uam_analysis_table.selectionModel().selectedRows()
-        if not selected_rows:
-            self.uam_analysis_detail.clear()
-            return
-        row_index = selected_rows[0].row()
-        if row_index < 0 or row_index >= len(self.uam_analysis_rows):
-            self.uam_analysis_detail.clear()
-            return
-        row = self.uam_analysis_rows[row_index]
-        self.uam_analysis_detail.setPlainText("\n".join(f"{key}: {value}" for key, value in row.items()))
-
-    def _analysis_float(self, row: dict[str, object], field: str) -> float | None:
-        try:
-            value = float(row.get(field, ""))
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
-
-    def _refresh_uam_error_plot(self) -> None:
-        if not hasattr(self, "uam_error_plot"):
-            return
-        self.uam_error_plot.points.clear()
-        has_frd_errors = any(
-            self._analysis_float(row, "error_frd_forward_m") is not None for row in self.uam_analysis_rows
-        )
-        has_rdf_errors = any(
-            self._analysis_float(row, "error_rdf_right_m") is not None for row in self.uam_analysis_rows
-        )
-        has_aligned_errors = any(
-            self._analysis_float(row, "error_north_m") is not None for row in self.uam_analysis_rows
-        )
-        axis_fields = (
-            (
-                ("error_frd_forward_m", "error_frd_forward_m"),
-                ("error_frd_right_m", "error_frd_right_m"),
-                ("error_frd_down_m", "error_frd_down_m"),
-            )
-            if has_frd_errors
-            else
-            (
-                ("error_rdf_right_m", "error_rdf_right_m"),
-                ("error_rdf_down_m", "error_rdf_down_m"),
-                ("error_rdf_forward_m", "error_rdf_forward_m"),
-            )
-            if has_rdf_errors
-            else
-            (
-                ("error_north_m", "error_north_m"),
-                ("error_east_m", "error_east_m"),
-                ("error_down_m", "error_down_m"),
-            )
-            if has_aligned_errors
-            else (
-                ("error_x_m", "error_x_m"),
-                ("error_y_m", "error_y_m"),
-                ("error_z_m", "error_z_m"),
-            )
-        )
-        for row in self.uam_analysis_rows:
-            timestamp_s = self._analysis_float(row, "measurement_timestamp_s")
-            if timestamp_s is None:
-                continue
-            for series, field in (*axis_fields, ("error_distance_m", "error_distance_m")):
-                value = self._analysis_float(row, field)
-                if value is not None:
-                    self.uam_error_plot.add_point(TelemetryHistoryPoint(timestamp_s, series, value))
-        self.uam_error_plot.update()
-
-    def _format_uam_analysis_summary(self) -> str:
-        summary = comparison_summary(self.uam_analysis_rows)
-        total_rows = len(self.distance_recording_rows)
-        matched_rows = len(self.uam_analysis_rows)
-        unmatched_rows = max(0, total_rows - matched_rows)
-        source_samples, truth_source = self._uam_analysis_truth_samples()
-        source_text = truth_source
-        if self.uam_ulog_path is not None and self.uam_ulog_samples:
-            source_text = f"ulog:{self.uam_ulog_path.name}"
-        elif source_samples:
-            source_text = f"{truth_source}:{len(source_samples)} samples"
-        else:
-            source_text = "recorded-row fallback"
-        coverage_text = f"matched={matched_rows}/{total_rows}"
-        if unmatched_rows:
-            coverage_text += f", unmatched={unmatched_rows}"
-        if not summary:
-            return f"UAM 비교: rows=0, {coverage_text}, source={source_text}"
-        time_status_counts: dict[str, int] = {}
-        for row in self.uam_analysis_rows:
-            status = str(row.get("camera_time_sync_status") or "unrecorded")
-            time_status_counts[status] = time_status_counts.get(status, 0) + 1
-        time_sync_text = ", time_sync=" + ";".join(
-            f"{status}:{count}" for status, count in sorted(time_status_counts.items())
-        )
-        alignment_text = (
-            f", alignment={self.uam_alignment_profile.profile_id}"
-            if self.uam_alignment_profile is not None
-            else ", alignment=none"
-        )
-        return (
-            f"UAM 비교: rows={matched_rows}, {coverage_text}, source={source_text}, "
-            f"median|err_dist|={summary['median_abs_m']:.3f} m, "
-            f"p95|err_dist|={summary['p95_abs_m']:.3f} m, "
-            f"rmse={summary['rmse_m']:.3f} m{alignment_text}{time_sync_text}"
-        )
-
-    def _format_uam_telemetry_summary(self) -> str:
-        source = str(self.uam_source_combo.currentData() or "ros2") if hasattr(self, "uam_source_combo") else "ros2"
-        ulog_text = str(self.uam_ulog_path) if self.uam_ulog_path is not None else "none"
-        latest = "none"
-        if self.latest_drone_position_m is not None:
-            latest = (
-                f"N={self.latest_drone_position_m[0]:+.3f}, "
-                f"E={self.latest_drone_position_m[1]:+.3f}, "
-                f"D={self.latest_drone_position_m[2]:+.3f}, "
-                f"t={self.latest_drone_position_timestamp_s}"
-            )
-        alignment = "none"
-        if self.uam_alignment_profile is not None:
-            alignment = (
-                f"{self.uam_alignment_profile.profile_id}, "
-                f"rmse={self.uam_alignment_profile.rmse_m:.3f}m, "
-                f"samples={self.uam_alignment_profile.sample_count}, "
-                f"truth_source={self.uam_alignment_profile.truth_source_type or 'unknown'}"
-            )
-        return (
-            "uam_ground_truth:\n"
-            f"  preferred_analysis_source: ULog if loaded, live telemetry buffer otherwise, recorded row fallback last\n"
-            f"  selected_truth_source: {self._selected_uam_truth_source_type()}\n"
-            f"  source_mixing_policy: do not mix ULog/live with recorded-row fallback inside one comparison run\n"
-            f"  metric_policy: summarize every matched row; separate ULog/live/recorded-row results by truth_source in reports\n"
-            f"  time_match_order: bbox UTC -> timestamp + offset -> recorded row fallback\n"
-            f"  live_source: {source}\n"
-            f"  live_samples: {len(self.uam_live_telemetry_samples)}\n"
-            f"  ulog: {ulog_text}\n"
-            f"  ulog_samples: {len(self.uam_ulog_samples)}\n"
-            f"  alignment_profile: {alignment}\n"
-            f"  analysis_rows: {len(self.uam_analysis_rows)}\n"
-            f"  latest_live: {latest}"
-        )
-
     def toggle_session_recording(self) -> None:
         if self._session_recording_active():
             self._stop_session_recording()
@@ -11904,7 +10806,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_recording_started_monotonic_s = self.recording_session_started_monotonic_s
         self.distance_recording_enabled = True
         self.video_recording_enabled = True
-        self.tracking_filter.reset()
         self._last_distance_history_key = None
         self._prepare_video_recording_paths()
         self.record_button.setText("세션 기록 중지")
@@ -11944,17 +10845,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_recording_rows.clear()
         self.distance_recording_keys.clear()
         self.external_parameter_recording_rows.clear()
-        self.uam_analysis_rows.clear()
         if not self.distance_recording_enabled:
             self.distance_recording_started_monotonic_s = None
         self._last_distance_history_key = None
-        self.tracking_filter.reset()
         self.distance_plot.clear()
         self._refresh_recording_table()
-        self._refresh_uam_analysis_table()
-        self._refresh_uam_error_plot()
-        if hasattr(self, "uam_analysis_status_label"):
-            self.uam_analysis_status_label.setText("UAM 비교: 거리 기록 초기화로 분석 결과를 비웠습니다.")
         self._refresh_recording_status_label()
         self._log("[Depth] 거리 그래프와 미저장 기록을 초기화했습니다.")
         self._refresh_operation_header()
@@ -12085,21 +10980,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             metadata=self._recording_session_metadata(),
             distance_rows=self.distance_recording_rows,
             external_parameter_rows=self.external_parameter_recording_rows,
-            uam_analysis_rows=self.uam_analysis_rows,
         )
         self._log(f"[저장] 세션 메타데이터를 저장했습니다: {saved_files.metadata}")
         if saved_files.distance_history is not None:
             self._log(f"[저장] 거리 기록 CSV를 저장했습니다: {saved_files.distance_history}")
         if saved_files.external_parameters is not None:
             self._log(f"[저장] 시간축 외부 파라미터 CSV를 저장했습니다: {saved_files.external_parameters}")
-        if saved_files.uam_analysis is not None:
-            self._log(f"[저장] UAM 비교 분석 CSV를 저장했습니다: {saved_files.uam_analysis}")
         output_text = ", ".join(str(output) for output in saved_files.outputs)
         self.recording_status_label.setText(
             "세션 기록 저장 완료: "
             f"거리={len(self.distance_recording_rows)}개, "
-            f"외부={len(self.external_parameter_recording_rows)}개, "
-            f"UAM분석={len(self.uam_analysis_rows)}개 - {output_text}"
+            f"외부={len(self.external_parameter_recording_rows)}개 - {output_text}"
         )
         self._refresh_operation_header()
 
@@ -12163,28 +11054,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right_video_path": str(self.video_recording_paths.get("right", "")),
             "distance_sample_count": len(self.distance_recording_rows),
             "external_parameter_sample_count": len(self.external_parameter_recording_rows),
-            "uam_analysis_sample_count": len(self.uam_analysis_rows),
-            "uam_analysis_matched_distance_sample_count": len(self.uam_analysis_rows),
-            "uam_analysis_unmatched_distance_sample_count": max(
-                0, len(self.distance_recording_rows) - len(self.uam_analysis_rows)
-            ),
-            "uam_live_telemetry_sample_count": len(self.uam_live_telemetry_samples),
-            "uam_ulog_sample_count": len(self.uam_ulog_samples),
-            "uam_ulog_path": str(self.uam_ulog_path or ""),
-            "uam_selected_truth_source_type": self._selected_uam_truth_source_type(),
-            "uam_loaded_ulog_truth_source_type": self.uam_ulog_truth_source_type,
-            "uam_alignment_profile": (
-                None if self.uam_alignment_profile is None else self.uam_alignment_profile.to_dict()
-            ),
-            "uam_alignment_profile_path": str(self.uam_alignment_profile_path or ""),
-            "bbox_reprojection_profile": (
-                None if self.bbox_reprojection_profile is None else self.bbox_reprojection_profile.to_dict()
-            ),
-            "bbox_reprojection_profile_path": str(self.bbox_reprojection_profile_path or ""),
-            "bbox_center_adjustment_path": str(self.bbox_center_adjustment_path or ""),
-            "uam_compare_max_dt_s": (
-                self.uam_compare_max_dt_spin.value() if hasattr(self, "uam_compare_max_dt_spin") else None
-            ),
             "camera_time_sync_status": camera_time_metrics["status"],
             "camera_time_sync_basis": camera_time_metrics["basis"],
             "camera_time_sync_warning": camera_time_metrics["warning"],
@@ -12193,14 +11062,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "rtcp_frame_transit_max_ms": camera_time_metrics["max_frame_transit_delay_ms"],
             "left_rtcp_frame_transit_ms": camera_time_metrics["left_frame_transit_delay_ms"],
             "right_rtcp_frame_transit_ms": camera_time_metrics["right_frame_transit_delay_ms"],
-            "uam_compare_time_offset_s": (
-                self.uam_time_offset_spin.value() if hasattr(self, "uam_time_offset_spin") else None
-            ),
             "calculation": {
                 "triangulation_extrinsics_source": triangulation_source,
                 "distance_mode": self._distance_mode_label(),
                 "baseline_source": baseline_source,
                 "measurement_path": self._measurement_path_label(),
+                "method": "two_ray_closest_midpoint",
+                "measurement_frame": MEASUREMENT_FRAME,
+                "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+                "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+                "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+                "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
+                "attitude_timing_blocks_measurement": False,
+                "attitude_stale_age_threshold_s": ATTITUDE_STALE_AGE_S,
+                "attitude_very_stale_age_threshold_s": ATTITUDE_VERY_STALE_AGE_S,
+                "attitude_stale_pair_delta_threshold_s": ATTITUDE_STALE_PAIR_DELTA_S,
+                "attitude_very_stale_pair_delta_threshold_s": ATTITUDE_VERY_STALE_PAIR_DELTA_S,
                 "mount_assumption_model": (
                     "checkerboard-stereo-extrinsics-v1"
                     if triangulation_source == "checkerboard"
@@ -12215,7 +11092,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "rtp_timestamp_note": "RTP timestamp is a 90 kHz media clock counter; mapping RTCP NTP to WIRIS GDTI/UTC is unverified.",
                 "preferred_frame_time_field": "rtcp_frame_ntp_unix_s",
                 "legacy_equivalent_field": "camera_rtc_frame_unix_s",
-                "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before UAM UTC claims.",
+                "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before absolute UTC claims.",
             },
             "intrinsics": self._record_intrinsic_parameters(),
             "stream": {
@@ -12227,287 +11104,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "rtsp_latency_ms": self.rtsp_latency_spin.value(),
             },
         }
-
-    def set_bias_profile_applied(self, checked: bool) -> None:
-        self.bias_profile_applied = bool(checked)
-        self._refresh_bias_profile_view()
-        self._log(f"[Bias] 실시간 보정 적용: {'ON' if self.bias_profile_applied else 'OFF'}")
-
-    def load_bbox_center_adjustment_csv(self) -> None:
-        start_path = self._calibration_dirs()[0]
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Load bbox center adjustment matrix",
-            str(start_path),
-            "Profile (*.json *.csv);;JSON (*.json);;CSV (*.csv);;All files (*)",
-        )
-        if not selected:
-            return
-        try:
-            self._load_bbox_center_adjustment_path(Path(selected))
-        except Exception as exc:
-            self.bbox_adjust_status_label.setText(f"2D bbox 보정 로드 실패: {exc}")
-            self._log(f"[Bias] 2D bbox 보정 행렬 로드 실패: {exc}")
-            return
-        self._log(f"[Bias] 2D bbox 보정 행렬을 로드했습니다: {selected}")
-
-    def _load_bbox_center_adjustment_path(self, path: Path) -> None:
-        if path.suffix.lower() == ".json":
-            profile = load_reprojection_profile(path)
-            self.bbox_reprojection_profile = profile
-            self.bbox_reprojection_profile_path = path
-            self.bbox_center_adjustment_path = None
-            self.bbox_center_adjustments.clear()
-            self._apply_bbox_center_adjustments_to_panes()
-            self._refresh_bbox_center_adjustment_view()
-            self._refresh_camera_parameters_tab()
-            return
-        rows: list[list[float]] = []
-        with path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.reader(handle)
-            for raw_row in reader:
-                if not raw_row:
-                    continue
-                rows.append([float(value) for value in raw_row[:4]])
-        if len(rows) < 6 or any(len(row) < 4 for row in rows[:6]):
-            raise ValueError("6x4 CSV 행렬이 필요합니다.")
-        self.bbox_center_adjustment_path = path
-        self.bbox_reprojection_profile = None
-        self.bbox_reprojection_profile_path = None
-        self.bbox_center_adjustments = {
-            "left": (tuple(rows[0][:4]), tuple(rows[1][:4])),
-            "right": (tuple(rows[3][:4]), tuple(rows[4][:4])),
-        }
-        self._apply_bbox_center_adjustments_to_panes()
-        self._refresh_bbox_center_adjustment_view()
-        self._refresh_camera_parameters_tab()
-
-    def clear_bbox_center_adjustment(self) -> None:
-        self.bbox_center_adjustment_path = None
-        self.bbox_reprojection_profile_path = None
-        self.bbox_reprojection_profile = None
-        self.bbox_center_adjustments.clear()
-        self._apply_bbox_center_adjustments_to_panes()
-        self._refresh_bbox_center_adjustment_view()
-        self._refresh_camera_parameters_tab()
-        self._log("[Bias] 2D bbox 보정/profile을 해제했습니다.")
-
-    def _apply_bbox_center_adjustments_to_panes(self) -> None:
-        if hasattr(self, "left_pane"):
-            self.left_pane.set_bbox_center_adjustment(self.bbox_center_adjustments.get("left"))
-        if hasattr(self, "right_pane"):
-            self.right_pane.set_bbox_center_adjustment(self.bbox_center_adjustments.get("right"))
-
-    def _bbox_center_adjustment_equation(self, camera: str) -> str:
-        adjustment = self.bbox_center_adjustments.get(camera)
-        if adjustment is None:
-            return f"{camera}: inactive"
-        row_u, row_v = adjustment
-        return (
-            f"{camera}: u'={row_u[0]:.6f}u + {row_u[1]:.6f}v + {row_u[2] + row_u[3]:.6f}, "
-            f"v'={row_v[0]:.6f}u + {row_v[1]:.6f}v + {row_v[2] + row_v[3]:.6f}"
-        )
-
-    def _bbox_center_adjustment_summary(self) -> str:
-        if self.bbox_reprojection_profile is not None:
-            profile = self.bbox_reprojection_profile
-            source = str(self.bbox_reprojection_profile_path or "")
-            return (
-                "bbox_reprojection_profile: active\n"
-                f"profile_id: {profile.profile_id}\n"
-                f"profile_method: {profile.method}\n"
-                f"bin_axis: {profile.bin_axis}, lookup_policy: {profile.lookup_policy}, "
-                f"output_policy: {profile.output_policy}\n"
-                f"cells: {len(profile.cells)}, source: {source}"
-            )
-        if not self.bbox_center_adjustments:
-            return "bbox_center_adjustment: inactive"
-        source = str(self.bbox_center_adjustment_path or "")
-        return (
-            "bbox_center_adjustment: active\n"
-            f"bbox_center_adjustment_source: {source}\n"
-            f"{self._bbox_center_adjustment_equation('left')}\n"
-            f"{self._bbox_center_adjustment_equation('right')}"
-        )
-
-    def _refresh_bbox_center_adjustment_view(self) -> None:
-        if not hasattr(self, "bbox_adjust_status_label"):
-            return
-        if not self.bbox_center_adjustments:
-            self.bbox_adjust_status_label.setText("2D bbox 보정: 없음")
-            return
-        self.bbox_adjust_status_label.setText(self._bbox_center_adjustment_summary())
-
-    def _parse_float_field(self, row: dict[str, object], name: str) -> float | None:
-        value = row.get(name)
-        if value is None or value == "":
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return None
-        return parsed if isfinite(parsed) else None
-
-    def _first_float_field(self, row: dict[str, object], names: tuple[str, ...]) -> float | None:
-        for name in names:
-            value = self._parse_float_field(row, name)
-            if value is not None:
-                return value
-        return None
-
-    def _bias_profile_from_rows(self, rows: list[dict[str, object]], *, bin_size_m: float) -> BBoxBiasProfile | None:
-        if bin_size_m <= 0.0:
-            return None
-        buckets: dict[int, list[tuple[float, float, float]]] = {}
-        for row in rows:
-            distance = self._first_float_field(row, ("raw_distance_m", "distance_m"))
-            raw_x = self._first_float_field(row, ("raw_x_m", "x_m"))
-            raw_y = self._first_float_field(row, ("raw_y_m", "y_m"))
-            raw_z = self._first_float_field(row, ("raw_z_m", "z_m"))
-            drone_x = self._first_float_field(row, ("drone_north_m", "drone_x_m"))
-            drone_y = self._first_float_field(row, ("drone_east_m", "drone_y_m"))
-            drone_z = self._first_float_field(row, ("drone_down_m", "drone_z_m"))
-            if None in (distance, raw_x, raw_y, raw_z, drone_x, drone_y, drone_z):
-                continue
-            bucket = int(max(0.0, distance) // bin_size_m)
-            buckets.setdefault(bucket, []).append((raw_x - drone_x, raw_y - drone_y, raw_z - drone_z))
-        bins = []
-        for bucket, errors in sorted(buckets.items()):
-            if not errors:
-                continue
-            count = len(errors)
-            bins.append(
-                BBoxBiasBin(
-                    min_m=bucket * bin_size_m,
-                    max_m=(bucket + 1) * bin_size_m,
-                    bias_x_m=sum(item[0] for item in errors) / count,
-                    bias_y_m=sum(item[1] for item in errors) / count,
-                    bias_z_m=sum(item[2] for item in errors) / count,
-                    sample_count=count,
-                )
-            )
-        if not bins:
-            return None
-        return BBoxBiasProfile(
-            profile_id=f"bbox_bias_{time.strftime('%Y%m%d_%H%M%S')}",
-            bins=tuple(bins),
-            created_unix_s=time.time(),
-        )
-
-    def build_bias_profile_from_current_session(self) -> None:
-        profile = self._bias_profile_from_rows(
-            [dict(row) for row in self.distance_recording_rows],
-            bin_size_m=self.bias_bin_size_spin.value(),
-        )
-        if profile is None:
-            self.bias_profile_detail.setPlainText(
-                "현재 세션 기록에서 profile을 만들 수 없습니다.\n"
-                "drone_north/east/down 또는 drone_x/y/z와 raw_x/y/z가 있는 샘플이 필요합니다."
-            )
-            return
-        self.active_bias_profile = profile
-        self.bias_candidate_rows = [dict(row) for row in self.distance_recording_rows]
-        self._refresh_bias_profile_view()
-        self._log(f"[Bias] 현재 세션에서 profile 생성: {profile.profile_id}")
-
-    def load_bias_candidates_csv(self) -> None:
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Load bias candidate CSV",
-            str(self._calibration_dirs()[0]),
-            "CSV files (*.csv);;All files (*)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            with path.open("r", newline="", encoding="utf-8") as handle:
-                rows = list(csv.DictReader(handle))
-        except OSError as exc:
-            self.bias_profile_detail.setPlainText(f"CSV 로드 실패: {exc}")
-            return
-        profile = self._bias_profile_from_rows(rows, bin_size_m=self.bias_bin_size_spin.value())
-        self.bias_candidate_rows = rows
-        if profile is None:
-            self.bias_profile_detail.setPlainText(
-                f"CSV에서 profile을 만들 수 없습니다: {path}\n"
-                "drone_x/y/z와 raw_x/y/z 필드를 확인하세요."
-            )
-            return
-        self.active_bias_profile = profile
-        self._refresh_bias_profile_view()
-        self._log(f"[Bias] CSV 후보정 profile 생성: {path}")
-
-    def save_bias_profile(self) -> None:
-        if self.active_bias_profile is None:
-            self.bias_profile_detail.setPlainText("저장할 bias profile이 없습니다.")
-            return
-        default_path = self._calibration_dirs()[0] / f"{self.active_bias_profile.profile_id}.json"
-        selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
-            self,
-            "Save bias profile",
-            str(default_path),
-            "Bias profile JSON (*.json);;All files (*)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        path.write_text(json.dumps(self.active_bias_profile.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-        self._log(f"[Bias] profile 저장: {path}")
-
-    def load_bias_profile(self) -> None:
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Load bias profile",
-            str(self._calibration_dirs()[0]),
-            "Bias profile JSON (*.json);;All files (*)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("profile JSON root must be an object")
-            self.active_bias_profile = BBoxBiasProfile.from_dict(payload)
-        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-            self.bias_profile_detail.setPlainText(f"Profile 로드 실패: {exc}")
-            return
-        self._refresh_bias_profile_view()
-        self._log(f"[Bias] profile 로드: {path}")
-
-    def _refresh_bias_profile_view(self) -> None:
-        if not hasattr(self, "bias_profile_status_label"):
-            return
-        profile = self.active_bias_profile
-        applied = self.bias_profile_applied and profile is not None
-        status = "적용 중" if applied else "대기"
-        if profile is None:
-            self.bias_profile_status_label.setText("Profile: 없음")
-            self.bias_profile_table.setRowCount(0)
-            return
-        total_samples = sum(bias_bin.sample_count for bias_bin in profile.bins)
-        self.bias_profile_status_label.setText(
-            f"Profile: {profile.profile_id} | bins={len(profile.bins)} | samples={total_samples} | {status}"
-        )
-        self.bias_profile_table.setRowCount(0)
-        for bias_bin in profile.bins:
-            row_index = self.bias_profile_table.rowCount()
-            self.bias_profile_table.insertRow(row_index)
-            values = (
-                f"{bias_bin.min_m:.1f}",
-                f"{bias_bin.max_m:.1f}",
-                f"{bias_bin.bias_x_m:+.4f}",
-                f"{bias_bin.bias_y_m:+.4f}",
-                f"{bias_bin.bias_z_m:+.4f}",
-                str(bias_bin.sample_count),
-            )
-            for column, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-                self.bias_profile_table.setItem(row_index, column, item)
-        detail = json.dumps(profile.to_dict(), indent=2, ensure_ascii=False)
-        self.bias_profile_detail.setPlainText(detail)
 
     def _remove_distance_history_point(self, point: DistanceHistoryPoint) -> None:
         point_key = self._distance_history_key(point)
@@ -12634,8 +11230,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     subscriber.add_custom_watch(spec)
         if source == "mavlink" and self.mavlink_pixhawk is not None:
             self.mavlink_pixhawk.add_custom_watch(spec)
-        if source == "uam_mavlink" and self.uam_mavlink_pixhawk is not None:
-            self.uam_mavlink_pixhawk.add_custom_watch(spec)
 
     def remove_custom_topic_watch(self, key: str) -> None:
         removed_specs = [spec for spec in self.custom_watch_specs if str(spec.get("key", "")) == key]
@@ -12654,8 +11248,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 subscriber.remove_custom_watch(key)
         if self.mavlink_pixhawk is not None:
             self.mavlink_pixhawk.remove_custom_watch(key)
-        if self.uam_mavlink_pixhawk is not None:
-            self.uam_mavlink_pixhawk.remove_custom_watch(key)
         self._log(f"[픽스호크] Custom watch 제거: {key}")
 
     def remove_selected_custom_topic_watch(self) -> None:
@@ -12680,250 +11272,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.custom_watch_plot.add_point(
                 TelemetryHistoryPoint(sample.timestamp_s, sample.key, sample.numeric_value)
             )
-            self._update_uam_live_telemetry_from_custom_watch(sample)
-
-    def _custom_watch_uam_axis(self, key: str) -> str | None:
-        tail = key.rsplit(":", 1)[-1]
-        if tail in {"drone_x", "drone_y", "drone_z", "uam_x", "uam_y", "uam_z"}:
-            return tail[-1]
-        return None
-
-    def _custom_watch_uam_source(self, sample: CustomTopicSample) -> str:
-        if sample.key.startswith(("left:", "right:")) or sample.topic.startswith("mavlink/"):
-            side = sample.key.split(":", 1)[0] if ":" in sample.key else "mavlink"
-            return f"live-mavlink:{side}"
-        return "live-ros2"
-
-    def _update_uam_live_telemetry_from_custom_watch(self, sample: CustomTopicSample) -> None:
-        if sample.numeric_value is None:
-            return
-        axis = self._custom_watch_uam_axis(sample.key)
-        if axis is None:
-            return
-        self.latest_drone_position_components_m[axis] = float(sample.numeric_value)
-        self.latest_drone_position_component_timestamps_s[axis] = float(sample.timestamp_s)
-        if not all(key in self.latest_drone_position_components_m for key in ("x", "y", "z")):
-            return
-        self.latest_drone_position_m = (
-            self.latest_drone_position_components_m["x"],
-            self.latest_drone_position_components_m["y"],
-            self.latest_drone_position_components_m["z"],
-        )
-        self.latest_drone_position_timestamp_s = max(
-            self.latest_drone_position_component_timestamps_s.get(key, sample.timestamp_s)
-            for key in ("x", "y", "z")
-        )
-        self.latest_drone_position_timestamp_reference = self._custom_watch_uam_source(sample)
-        self.latest_drone_position_utc_unix_s = None
-        signature = (
-            round(float(self.latest_drone_position_timestamp_s), 6),
-            round(float(self.latest_drone_position_m[0]), 6),
-            round(float(self.latest_drone_position_m[1]), 6),
-            round(float(self.latest_drone_position_m[2]), 6),
-        )
-        if signature != self._last_uam_live_sample_signature:
-            self._last_uam_live_sample_signature = signature
-            uam_sample = UamTelemetrySample(
-                timestamp_s=float(self.latest_drone_position_timestamp_s),
-                x_m=float(self.latest_drone_position_m[0]),
-                y_m=float(self.latest_drone_position_m[1]),
-                z_m=float(self.latest_drone_position_m[2]),
-                source=self.latest_drone_position_timestamp_reference,
-                timestamp_reference="app-receive",
-            )
-            self.latest_drone_truth_sample = uam_sample
-            self.uam_live_telemetry_samples.append(uam_sample)
-            self._append_uam_truth_plot_sample(uam_sample)
-        latest_text = (
-            f"N={self.latest_drone_position_m[0]:+.3f} "
-            f"E={self.latest_drone_position_m[1]:+.3f} "
-            f"D={self.latest_drone_position_m[2]:+.3f} m "
-            f"t={self.latest_drone_position_timestamp_s:.3f}s "
-            f"source={self.latest_drone_position_timestamp_reference}"
-        )
-        if hasattr(self, "bias_drone_status_label"):
-            self.bias_drone_status_label.setText(f"UAM 중심 위치: {latest_text}")
-        if hasattr(self, "uam_latest_label"):
-            self.uam_latest_label.setText(f"latest: {latest_text}")
-        if hasattr(self, "uam_status_label"):
-            self.uam_status_label.setText(f"UAM telemetry: 실시간 수신 중, buffer={len(self.uam_live_telemetry_samples)}")
-        self._refresh_camera_parameters_tab()
-
-    def _remove_uam_axis_watches(self) -> None:
-        for key in ("uam_x", "uam_y", "uam_z"):
-            if any(str(spec.get("key", "")) == key for spec in self.custom_watch_specs):
-                self.remove_custom_topic_watch(key)
-
-    def disconnect_uam_telemetry_from_ui(self) -> None:
-        self._remove_uam_axis_watches()
-        if self.uam_mavlink_pixhawk is not None:
-            self.uam_mavlink_pixhawk.stop()
-            self.uam_mavlink_pixhawk = None
-        self.uam_status_label.setText(
-            f"UAM telemetry: 해제됨, 실시간 buffer={len(self.uam_live_telemetry_samples)}개 유지"
-        )
-        self.uam_latest_label.setText("latest: --")
-        self.latest_drone_position_m = None
-        self.latest_drone_position_components_m.clear()
-        self.latest_drone_position_component_timestamps_s.clear()
-        self.latest_drone_position_timestamp_s = None
-        self.latest_drone_position_timestamp_reference = "app-receive"
-        self.latest_drone_position_utc_unix_s = None
-        self.latest_drone_truth_sample = None
-        self.uam_gps_reference_lla = None
-        self.uam_gps_reference_kind = ""
-        self._last_uam_live_sample_signature = None
-        self._log("[UAM] ground truth 텔레메트리 watch를 해제했습니다. Pixhawk ROS2/MAVLink 링크는 유지합니다.")
-        self._refresh_camera_parameters_tab()
-
-    def _ensure_uam_mavlink_subscriber(self) -> DualPixhawkMavlinkSubscriber:
-        url = self.uam_mavlink_url_edit.text().strip()
-        baud = self.uam_mavlink_baud_spin.value()
-        if not url:
-            raise RuntimeError("UAM MAVLink telemetry URL이 비어 있습니다.")
-        if self.uam_mavlink_pixhawk is None:
-            self.uam_mavlink_pixhawk = DualPixhawkMavlinkSubscriber(
-                left_url=url,
-                right_url="",
-                left_baud=baud,
-                right_baud=baud,
-                custom_watches=tuple(self.custom_watch_specs),
-            )
-            self.uam_mavlink_pixhawk.gps_changed.connect(self._update_uam_live_telemetry_from_gps)
-            self.uam_mavlink_pixhawk.custom_watch_changed.connect(self._update_custom_watch)
-            self.uam_mavlink_pixhawk.status_changed.connect(
-                lambda text: self._log(f"[UAM] MAVLink telemetry {text}")
-            )
-        else:
-            if hasattr(self.uam_mavlink_pixhawk, "urls"):
-                self.uam_mavlink_pixhawk.urls["left"] = url
-                self.uam_mavlink_pixhawk.urls["right"] = ""
-            if hasattr(self.uam_mavlink_pixhawk, "baudrates"):
-                self.uam_mavlink_pixhawk.baudrates["left"] = baud
-                self.uam_mavlink_pixhawk.baudrates["right"] = baud
-        return self.uam_mavlink_pixhawk
-
-    def connect_uam_mavlink_usb(self) -> bool:
-        try:
-            subscriber = self._ensure_uam_mavlink_subscriber()
-            subscriber.start("left")
-        except Exception as exc:
-            if self.uam_mavlink_pixhawk is not None:
-                try:
-                    self.uam_mavlink_pixhawk.stop()
-                except Exception:
-                    pass
-                self.uam_mavlink_pixhawk = None
-            self._log(f"[UAM] MAVLink telemetry 연결 실패: {exc}")
-            return False
-        return bool(getattr(subscriber, "connections", {}).get("left"))
-
-    def connect_uam_telemetry_from_ui(self) -> None:
-        source = str(self.uam_source_combo.currentData() or "ros2")
-        self._remove_uam_axis_watches()
-        if source == "off":
-            self.disconnect_uam_telemetry_from_ui()
-            self._save_current_settings()
-            return
-        if source == "ros2":
-            topic = self.uam_ros2_topic_edit.text().strip()
-            fields = {
-                "x": self.uam_ros2_x_field_edit.text().strip(),
-                "y": self.uam_ros2_y_field_edit.text().strip(),
-                "z": self.uam_ros2_z_field_edit.text().strip(),
-            }
-            if not topic or any(not field for field in fields.values()):
-                self.uam_status_label.setText("UAM telemetry: ROS2 topic 또는 N/E/D field가 비어 있습니다.")
-                return
-            for axis, field in fields.items():
-                self._add_custom_topic_watch(key=f"uam_{axis}", topic=topic, field=field, source="ros2")
-            connected = self.connect_pixhawk()
-            state = "ROS2 연결됨" if connected else "ROS2 연결 실패, MAVLink fallback 상태 확인 필요"
-            self.uam_status_label.setText(
-                f"UAM telemetry: ROS2 watch 등록 {topic} "
-                f"({fields['x']}, {fields['y']}, {fields['z']}) - {state}"
-            )
-            self._log(f"[UAM] ROS2 ground truth 텔레메트리 watch 등록: {topic} {fields} ({state})")
-            self._save_current_settings()
-            return
-        if source in {"mavlink_gps", "mavlink_global"}:
-            connected = self.connect_uam_mavlink_usb()
-            label = "GPS Position" if source == "mavlink_gps" else "Global Position"
-            state = "MAVLink 연결됨" if connected else "MAVLink 연결 대기/실패"
-            self.uam_status_label.setText(
-                f"UAM telemetry source: MAVLink {label} 수신 후 lat/lon/alt -> local NED 변환 - {state}"
-            )
-            self._log(f"[UAM] MAVLink {label} ground truth 변환 대기 ({state})")
-            self._save_current_settings()
-            return
-        message = self.uam_mavlink_message_edit.text().strip().upper()
-        fields = {
-            "x": self.uam_mavlink_x_field_edit.text().strip(),
-            "y": self.uam_mavlink_y_field_edit.text().strip(),
-            "z": self.uam_mavlink_z_field_edit.text().strip(),
-        }
-        if not message or any(not field for field in fields.values()):
-            self.uam_status_label.setText("UAM telemetry: MAVLink message 또는 N/E/D field가 비어 있습니다.")
-            return
-        for axis, field in fields.items():
-            self._add_custom_topic_watch(
-                key=f"uam_{axis}",
-                topic=message,
-                field=field,
-                source="uam_mavlink",
-                message=message,
-            )
-        connected = self.connect_uam_mavlink_usb()
-        state = "MAVLink 연결됨" if connected else "MAVLink 연결 대기/실패"
-        self.uam_status_label.setText(
-            f"UAM telemetry source: MAVLink watch 등록 {message} "
-            f"({fields['x']}, {fields['y']}, {fields['z']}) - {state}"
-        )
-        self._log(f"[UAM] MAVLink ground truth 텔레메트리 watch 등록: {message} {fields} ({state})")
-        self._save_current_settings()
-
-    def clear_uam_live_telemetry(self) -> None:
-        self.uam_live_telemetry_samples.clear()
-        self._last_uam_live_sample_signature = None
-        if hasattr(self, "uam_live_plot"):
-            self.uam_live_plot.points.clear()
-            self.uam_live_plot.update()
-        if hasattr(self, "uam_raw_plot") and not self.uam_ulog_samples:
-            self.uam_raw_plot.points.clear()
-            self.uam_raw_plot.update()
-        if hasattr(self, "uam_status_label"):
-            self.uam_status_label.setText("UAM telemetry: 실시간 버퍼 초기화됨")
-        if hasattr(self, "uam_latest_label"):
-            self.uam_latest_label.setText("latest: --")
-        self._log("[UAM] 실시간 ground truth 텔레메트리 버퍼를 초기화했습니다.")
-
-    def _append_uam_truth_plot_sample(self, sample: UamTelemetrySample) -> None:
-        plots = []
-        if hasattr(self, "uam_live_plot"):
-            plots.append(self.uam_live_plot)
-        if hasattr(self, "uam_raw_plot"):
-            plots.append(self.uam_raw_plot)
-        for plot in plots:
-            plot.add_point(TelemetryHistoryPoint(sample.timestamp_s, "truth_north_m", sample.x_m))
-            plot.add_point(TelemetryHistoryPoint(sample.timestamp_s, "truth_east_m", sample.y_m))
-            plot.add_point(TelemetryHistoryPoint(sample.timestamp_s, "truth_down_m", sample.z_m))
-
-    def _refresh_uam_truth_plot(self, samples: Sequence[UamTelemetrySample]) -> None:
-        plots = []
-        if hasattr(self, "uam_live_plot"):
-            plots.append(self.uam_live_plot)
-        if hasattr(self, "uam_raw_plot"):
-            plots.append(self.uam_raw_plot)
-        if not plots:
-            return
-        for plot in plots:
-            plot.points.clear()
-        if samples:
-            step = max(1, math.ceil(len(samples) / 200))
-            for sample in samples[::step]:
-                self._append_uam_truth_plot_sample(sample)
-        for plot in plots:
-            plot.update()
 
     def _ros2_target_sides(self, camera: str | None) -> tuple[str, ...]:
         if camera is None:
@@ -14736,20 +13084,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             gnss_base_survey_in_min_duration_s=self.gnss_base_survey_duration_spin.value(),
             gnss_base_survey_in_accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
             gnss_base_rtcm_injection_target=str(self.gnss_base_rtcm_target_combo.currentData() or "disabled"),
-            uam_telemetry_source=str(self.uam_source_combo.currentData() or "ros2"),
-            uam_ros2_topic=self.uam_ros2_topic_edit.text().strip(),
-            uam_ros2_x_field=self.uam_ros2_x_field_edit.text().strip(),
-            uam_ros2_y_field=self.uam_ros2_y_field_edit.text().strip(),
-            uam_ros2_z_field=self.uam_ros2_z_field_edit.text().strip(),
-            uam_mavlink_side=str(self.uam_mavlink_side_combo.currentData() or "left"),
-            uam_mavlink_url=self.uam_mavlink_url_edit.text().strip(),
-            uam_mavlink_baud=self.uam_mavlink_baud_spin.value(),
-            uam_mavlink_message=self.uam_mavlink_message_edit.text().strip().upper(),
-            uam_mavlink_x_field=self.uam_mavlink_x_field_edit.text().strip(),
-            uam_mavlink_y_field=self.uam_mavlink_y_field_edit.text().strip(),
-            uam_mavlink_z_field=self.uam_mavlink_z_field_edit.text().strip(),
-            uam_compare_max_dt_s=self.uam_compare_max_dt_spin.value(),
-            uam_compare_time_offset_s=self.uam_time_offset_spin.value(),
             clock_ftp_user=self.clock_ftp_user_edit.text().strip() or "anonymous",
             clock_ftp_password=self.clock_ftp_password_edit.text(),
             clock_ftp_port=self.clock_ftp_port_spin.value(),
@@ -15465,7 +13799,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 sync_quality=quality,
                 warnings=combined_warnings,
                 translation_right_in_left_m=translation_right_in_left_m,
-                reprojection_profile=self.bbox_reprojection_profile,
             )
         )
         match = geometry_result.match
@@ -15498,106 +13831,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             return
 
-        raw_point_left_m = triangulated.point_left_m
-        raw_point_center_m = (
-            stereo_center_point_from_left_camera(raw_point_left_m, translation_right_in_left_m)
-            if translation_right_in_left_m is not None
-            else raw_point_left_m
-        )
-        reprojection_result = geometry_result.reprojection
-        bbox_correction: dict[str, object] | None = None
-        profile_status = self._inactive_profile_status()
-        corrected_point_center_m = raw_point_center_m
-        corrected_point_left_m = raw_point_left_m
-        raw_center_distance_m = math.sqrt(
-            raw_point_center_m[0] * raw_point_center_m[0]
-            + raw_point_center_m[1] * raw_point_center_m[1]
-            + raw_point_center_m[2] * raw_point_center_m[2]
-        )
-        bias_correction = None
-        if reprojection_result is not None:
-            bbox_correction = self._bbox_correction_from_reprojection_lookup(reprojection_result.lookup)
-            profile_status = self._profile_status_from_reprojection_lookup(reprojection_result.lookup)
-            if reprojection_result.triangulated is not None:
-                corrected_point_left_m = reprojection_result.triangulated.point_left_m
-                corrected_point_center_m = (
-                    stereo_center_point_from_left_camera(corrected_point_left_m, translation_right_in_left_m)
-                    if translation_right_in_left_m is not None
-                    else corrected_point_left_m
-                )
-                corrected_point_center_m = self._apply_reprojection_output_policy(
-                    raw_point_center_m=raw_point_center_m,
-                    corrected_point_center_m=corrected_point_center_m,
-                )
-        elif self.bbox_center_adjustments:
-            affine = self._affine_bbox_correction(pair.left, pair.right)
-            if affine is not None:
-                affine_triangulated = self._triangulate_bbox_centers(
-                    affine["left_corrected_cx"],
-                    affine["left_corrected_cy"],
-                    affine["right_corrected_cx"],
-                    affine["right_corrected_cy"],
-                    triangulation_source=triangulation_source,
-                    left_ext=left_ext,
-                    right_ext=right_ext,
-                    translation_right_in_left_m=translation_right_in_left_m,
-                )
-                if affine_triangulated is not None:
-                    bbox_correction = affine
-                    profile_status = {
-                        "profile_id": "global_affine_csv",
-                        "profile_mode": "global_affine_csv",
-                        "profile_fallback_level": "0",
-                        "profile_fallback_reason": "csv_affine",
-                    }
-                    corrected_point_left_m = affine_triangulated.point_left_m
-                    corrected_point_center_m = (
-                        stereo_center_point_from_left_camera(corrected_point_left_m, translation_right_in_left_m)
-                        if translation_right_in_left_m is not None
-                        else corrected_point_left_m
-                    )
-        if bbox_correction is None and self.bias_profile_applied and self.active_bias_profile is not None:
-            bias_correction = self.active_bias_profile.correction(raw_center_distance_m)
-            if bias_correction is not None:
-                corrected_point_center_m = (
-                    raw_point_center_m[0] - bias_correction[0],
-                    raw_point_center_m[1] - bias_correction[1],
-                    raw_point_center_m[2] - bias_correction[2],
-                )
-        tracking_result = self._apply_tracking_filter(
-            timestamp_s=max(pair.left.timestamp_s, pair.right.timestamp_s),
-            point_m=corrected_point_center_m,
-            estimate=estimate,
-            baseline_m=baseline_m,
-        )
-        filtered_point_center_m = tracking_result.point_m if tracking_result is not None else corrected_point_center_m
-        display_distance_m = math.sqrt(
-            filtered_point_center_m[0] * filtered_point_center_m[0]
-            + filtered_point_center_m[1] * filtered_point_center_m[1]
-            + filtered_point_center_m[2] * filtered_point_center_m[2]
-        )
-        method_text = f"triangulated-{triangulation_source}"
-        if profile_status.get("profile_id"):
-            profile_suffix = profile_status.get("profile_mode") or "bbox-profile"
-            if profile_status.get("profile_output_policy") == "range_only_forward_fusion":
-                profile_suffix = f"{profile_suffix}:range-only-forward"
-            method_text = f"{method_text}+{profile_suffix}"
-        elif bias_correction is not None:
-            method_text = f"{method_text}+legacy-3d-bias"
-        if tracking_result is not None:
-            method_text = f"{method_text}+kf"
+        raw_point_left_m = triangulated.point_left_rdf_m
+        raw_point_m = raw_point_left_m
+        display_point_m = raw_point_m
+        display_distance_m = triangulated.range_m
+        method_text = f"{triangulated.method}-{triangulation_source}"
         gap_text = f" gap={triangulated.closest_gap_m:.3f}m"
-        bias_text = ""
-        if bias_correction is not None:
-            bias_text = f" bias={bias_correction[0]:+.2f}/{bias_correction[1]:+.2f}/{bias_correction[2]:+.2f}m"
-        tracking_text = ""
-        if tracking_result is not None:
-            tracking_state = "reset" if tracking_result.reset else "update"
-            if not tracking_result.accepted:
-                tracking_state = "predict"
-            tracking_text = f" kf={tracking_state} ni={tracking_result.normalized_innovation:.1f}"
         display_baseline_source = baseline_source
         display_baseline_m = baseline_m
+        attitude_timing_status = classify_attitude_timing(
+            uses_pixhawk_attitude=triangulation_source != "checkerboard",
+            left_age_s=estimate.left_attitude_age_s,
+            right_age_s=estimate.right_attitude_age_s,
+            pair_delta_s=estimate.attitude_pair_delta_s,
+        )
         self._update_triangulation_quality(
             triangulated=triangulated,
             method_text=method_text,
@@ -15605,34 +13852,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             display_baseline_source=display_baseline_source,
             display_baseline_m=display_baseline_m,
             raw_point_left_m=raw_point_left_m,
-            raw_point_center_m=raw_point_center_m,
-            corrected_point_center_m=filtered_point_center_m,
-            bias_correction=bias_correction,
+            raw_point_m=raw_point_m,
+            attitude_timing_status=attitude_timing_status,
+            left_attitude_age_s=estimate.left_attitude_age_s,
+            right_attitude_age_s=estimate.right_attitude_age_s,
+            attitude_pair_delta_s=estimate.attitude_pair_delta_s,
         )
 
-        attitude_text = "att=대기"
-        if estimate.left_attitude_age_s is not None and estimate.right_attitude_age_s is not None:
-            attitude_text = (
-                f"attAge={estimate.left_attitude_age_s * 1000:.0f}/{estimate.right_attitude_age_s * 1000:.0f}ms"
-            )
+        attitude_badge = "N/A" if attitude_timing_status == "NOT_USED" else attitude_timing_status
+        display_quality = estimate.sync_quality
+        if attitude_timing_status in {"STALE", "VERY_STALE"} and display_quality == "GOOD":
+            display_quality = "DEGRADED"
         relative_text = "relRPY=대기"
         if estimate.relative_roll_deg is not None:
             relative_text = (
                 f"relRPY={estimate.relative_roll_deg:.2f}/"
                 f"{estimate.relative_pitch_deg:.2f}/{estimate.relative_yaw_deg:.2f}°"
             )
-        telemetry_range_m, origin_profile_id = self._live_telemetry_range()
-        telemetry_text = ""
-        if telemetry_range_m is not None:
-            profile_text = f", profile={origin_profile_id}" if origin_profile_id else ""
-            telemetry_text = f" telemetryRange={telemetry_range_m:.2f}m{profile_text}"
         warning_text = f" | {'; '.join(estimate.warnings)}" if estimate.warnings else ""
         self._set_distance_text(
-            f"거리: {display_distance_m:.2f} m ({method_text}{gap_text}{bias_text}{tracking_text}) | bboxΔx={estimate.disparity_px:.1f}px "
+            f"거리: {display_distance_m:.2f} m ({method_text}{gap_text}) | bboxΔx={estimate.disparity_px:.1f}px "
             f"camΔt={estimate.time_delta_s * 1000:.0f}ms Δy={estimate.vertical_delta_px:.1f}px "
             f"baseline={display_baseline_source}:{display_baseline_m:.3f}m "
-            f"{attitude_text} {relative_text}{telemetry_text} quality={estimate.sync_quality}{warning_text}",
-            quality=estimate.sync_quality,
+            f"ATT:{attitude_badge} {relative_text} quality={display_quality}{warning_text}",
+            quality=display_quality,
         )
         appended = self._append_distance_history(
             estimate=estimate,
@@ -15640,21 +13883,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             method=method_text,
             baseline_source=display_baseline_source,
             baseline_m=display_baseline_m,
-            point_m=filtered_point_center_m,
-            raw_point_m=raw_point_center_m,
+            point_m=display_point_m,
+            raw_point_m=raw_point_m,
             raw_point_left_m=raw_point_left_m,
             translation_right_in_left_m=translation_right_in_left_m,
-            bias_correction_m=bias_correction,
-            corrected_point_m=corrected_point_center_m,
-            corrected_point_left_m=corrected_point_left_m,
-            bbox_correction=bbox_correction,
-            profile_status=profile_status,
-            tracking_result=tracking_result,
         )
         if not appended:
             self._set_distance_text(
                 self.last_distance_status,
-                quality=estimate.sync_quality,
+                quality=display_quality,
                 detail="그래프 미표시: 직전과 동일한 샘플이라 중복 추가를 건너뛰었습니다.",
             )
 
@@ -15791,198 +14028,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return f"그래프 미표시: 3D ray triangulation 결과가 아직 없습니다. {warning_text}"
         return "그래프 미표시: bbox 매칭은 됐지만 3D ray triangulation 결과가 아직 없습니다."
 
-    def _inactive_profile_status(self) -> dict[str, str]:
-        return {
-            "profile_id": "",
-            "profile_mode": "",
-            "profile_output_policy": "",
-            "profile_fallback_level": "",
-            "profile_fallback_reason": "no_profile",
-        }
-
-    def _profile_status_from_reprojection_lookup(self, lookup: ReprojectionLookupResult) -> dict[str, str]:
-        mode = self.bbox_reprojection_profile.mode if self.bbox_reprojection_profile is not None else ""
-        output_policy = (
-            self.bbox_reprojection_profile.output_policy if self.bbox_reprojection_profile is not None else ""
-        )
-        return {
-            "profile_id": lookup.profile_id,
-            "profile_mode": mode,
-            "profile_output_policy": output_policy,
-            "profile_fallback_level": str(lookup.fallback_level),
-            "profile_fallback_reason": lookup.fallback_reason,
-        }
-
-    def _apply_reprojection_output_policy(
-        self,
-        *,
-        raw_point_center_m: tuple[float, float, float],
-        corrected_point_center_m: tuple[float, float, float],
-    ) -> tuple[float, float, float]:
-        profile = self.bbox_reprojection_profile
-        if profile is None or profile.output_policy != "range_only_forward_fusion":
-            return corrected_point_center_m
-        return (raw_point_center_m[0], raw_point_center_m[1], corrected_point_center_m[2])
-
-    def _bbox_correction_from_reprojection_lookup(self, lookup: ReprojectionLookupResult) -> dict[str, object]:
-        return {
-            "left_corrected_cx": lookup.corrected_left_u,
-            "left_corrected_cy": lookup.corrected_left_v,
-            "right_corrected_cx": lookup.corrected_right_u,
-            "right_corrected_cy": lookup.corrected_right_v,
-            "left_bbox_du_px": lookup.du_left,
-            "left_bbox_dv_px": lookup.dv_left,
-            "right_bbox_du_px": lookup.du_right,
-            "right_bbox_dv_px": lookup.dv_right,
-            "profile_id": lookup.profile_id,
-            "profile_id_hash": (
-                self.bbox_reprojection_profile.profile_id_hash
-                if self.bbox_reprojection_profile is not None
-                else 0
-            ),
-            "fallback_level": lookup.fallback_level,
-            "fallback_reason": lookup.fallback_reason,
-            "profile_cell_key": lookup.cell_key,
-            "profile_cell_sample_count": lookup.sample_count,
-        }
-
-    def _affine_bbox_correction(
-        self,
-        left: DetectionObservation,
-        right: DetectionObservation,
-    ) -> dict[str, object] | None:
-        left_adjustment = self.bbox_center_adjustments.get("left")
-        right_adjustment = self.bbox_center_adjustments.get("right")
-        if left_adjustment is None or right_adjustment is None:
-            return None
-        left_u, left_v = left.center
-        right_u, right_v = right.center
-        left_corrected = self._apply_bbox_affine(left_adjustment, left_u, left_v)
-        right_corrected = self._apply_bbox_affine(right_adjustment, right_u, right_v)
-        return {
-            "left_corrected_cx": left_corrected[0],
-            "left_corrected_cy": left_corrected[1],
-            "right_corrected_cx": right_corrected[0],
-            "right_corrected_cy": right_corrected[1],
-            "left_bbox_du_px": left_corrected[0] - left_u,
-            "left_bbox_dv_px": left_corrected[1] - left_v,
-            "right_bbox_du_px": right_corrected[0] - right_u,
-            "right_bbox_dv_px": right_corrected[1] - right_v,
-            "profile_id": "global_affine_csv",
-            "profile_id_hash": 0,
-            "fallback_level": 0,
-            "fallback_reason": "csv_affine",
-            "profile_cell_key": "",
-            "profile_cell_sample_count": 0,
-        }
-
-    @staticmethod
-    def _apply_bbox_affine(
-        adjustment: tuple[tuple[float, float, float, float], tuple[float, float, float, float]],
-        u: float,
-        v: float,
-    ) -> tuple[float, float]:
-        row_u, row_v = adjustment
-        return (
-            row_u[0] * u + row_u[1] * v + row_u[2] + row_u[3],
-            row_v[0] * u + row_v[1] * v + row_v[2] + row_v[3],
-        )
-
-    def _triangulate_bbox_centers(
-        self,
-        left_u: float,
-        left_v: float,
-        right_u: float,
-        right_v: float,
-        *,
-        triangulation_source: str,
-        left_ext: object | None,
-        right_ext: object | None,
-        translation_right_in_left_m: tuple[float, float, float] | None,
-    ) -> RayTriangulationResult | None:
-        if self.active_intrinsics is None or translation_right_in_left_m is None:
-            return None
-        try:
-            if triangulation_source == "checkerboard":
-                extrinsics = self.active_intrinsics.extrinsics
-                if extrinsics is None:
-                    return None
-                rotation_right_to_left, checkerboard_translation = invert_left_to_right_camera_transform(
-                    extrinsics.rotation_left_to_right,
-                    extrinsics.translation_left_to_right_m,
-                )
-                return triangulate_pixels_with_relative_pose(
-                    left_pixel=(float(left_u), float(left_v)),
-                    right_pixel=(float(right_u), float(right_v)),
-                    left_intrinsics=self.active_intrinsics.left,
-                    right_intrinsics=self.active_intrinsics.right,
-                    rotation_right_to_left=rotation_right_to_left,
-                    translation_right_in_left_m=checkerboard_translation,
-                )
-            if left_ext is None or right_ext is None:
-                return None
-            return triangulate_pixels_with_pixhawk_mount(
-                left_pixel=(float(left_u), float(left_v)),
-                right_pixel=(float(right_u), float(right_v)),
-                left_intrinsics=self.active_intrinsics.left,
-                right_intrinsics=self.active_intrinsics.right,
-                left_body_to_world_q=left_ext.q,
-                right_body_to_world_q=right_ext.q,
-                translation_right_in_left_m=translation_right_in_left_m,
-            )
-        except Exception:
-            return None
-
-    def _live_telemetry_range(self) -> tuple[float | None, str | None]:
-        drone_position_m = self.latest_drone_position_m
-        if self.uam_alignment_profile is None or drone_position_m is None:
-            return None, None
-        baseline_center_ned = self.uam_alignment_profile.origin_offset_m
-        range_m = math.sqrt(
-            (drone_position_m[0] - baseline_center_ned[0]) ** 2
-            + (drone_position_m[1] - baseline_center_ned[1]) ** 2
-            + (drone_position_m[2] - baseline_center_ned[2]) ** 2
-        )
-        return range_m, self.uam_alignment_profile.profile_id
-
-    def _tracking_focal_px(self) -> float:
-        if self.active_intrinsics is not None:
-            try:
-                matrix = self.active_intrinsics.left.camera_matrix
-                fx = float(matrix[0][0])
-                if isfinite(fx) and fx > 0.0:
-                    return fx
-            except Exception:
-                pass
-        return float(self.focal_spin.value())
-
-    def _apply_tracking_filter(
-        self,
-        *,
-        timestamp_s: float,
-        point_m: tuple[float, float, float],
-        estimate,
-        baseline_m: float,
-    ) -> TrackingUpdateResult | None:
-        try:
-            variance_m2 = measurement_variance_from_stereo(
-                point_m=point_m,
-                focal_length_px=self._tracking_focal_px(),
-                baseline_m=baseline_m,
-                disparity_px=float(estimate.disparity_px),
-                left_confidence=getattr(estimate.left, "confidence", None),
-                right_confidence=getattr(estimate.right, "confidence", None),
-                config=self.tracking_filter.config,
-            )
-            return self.tracking_filter.update(
-                timestamp_s=float(timestamp_s),
-                point_m=point_m,
-                measurement_variance_m2=variance_m2,
-            )
-        except Exception as exc:
-            self._log(f"[Tracking] Kalman update skipped: {exc}")
-            return None
-
     def _append_distance_history(
         self,
         *,
@@ -15995,12 +14040,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         raw_point_m: tuple[float, float, float] | None = None,
         raw_point_left_m: tuple[float, float, float] | None = None,
         translation_right_in_left_m: tuple[float, float, float] | None = None,
-        bias_correction_m: tuple[float, float, float] | None = None,
-        corrected_point_m: tuple[float, float, float] | None = None,
-        corrected_point_left_m: tuple[float, float, float] | None = None,
-        bbox_correction: dict[str, object] | None = None,
-        profile_status: dict[str, str] | None = None,
-        tracking_result: TrackingUpdateResult | None = None,
         point_left_m: tuple[float, float, float] | None = None,
     ) -> bool:
         key = (estimate.left.timestamp_s, estimate.right.timestamp_s, method)
@@ -16011,12 +14050,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             point_m = point_left_m
         if raw_point_m is None:
             raw_point_m = raw_point_left_m
-        if corrected_point_m is None:
-            corrected_point_m = point_m
-        if corrected_point_left_m is None:
-            corrected_point_left_m = point_left_m
-        if profile_status is None:
-            profile_status = self._inactive_profile_status()
         timestamp_s = max(estimate.left.timestamp_s, estimate.right.timestamp_s)
         class_name = self._distance_history_class_name(estimate)
         recording_elapsed_s = None
@@ -16024,13 +14057,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if self.distance_recording_started_monotonic_s is None:
                 self.distance_recording_started_monotonic_s = time.monotonic()
             recording_elapsed_s = max(0.0, time.monotonic() - self.distance_recording_started_monotonic_s)
-        drone_position_m = self.latest_drone_position_m
-        live_truth_range_m = None
-        live_range_error_m = None
-        live_alignment_profile_id = None
-        live_truth_range_m, live_alignment_profile_id = self._live_telemetry_range()
-        if live_truth_range_m is not None:
-            live_range_error_m = distance_m - live_truth_range_m
         point = DistanceHistoryPoint(
             timestamp_s=timestamp_s,
             distance_m=distance_m,
@@ -16039,10 +14065,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             x_m=None if point_m is None else float(point_m[0]),
             y_m=None if point_m is None else float(point_m[1]),
             z_m=None if point_m is None else float(point_m[2]),
-            live_truth_range_m=live_truth_range_m,
-            live_range_error_m=live_range_error_m,
-            live_truth_timestamp_s=self.latest_drone_position_timestamp_s,
-            alignment_profile_id=live_alignment_profile_id,
             class_name=class_name,
             sample_key=key,
             recording_elapsed_s=recording_elapsed_s,
@@ -16058,24 +14080,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 + raw_point_m[1] * raw_point_m[1]
                 + raw_point_m[2] * raw_point_m[2]
             )
-        corrected_distance_m = None
-        if corrected_point_m is not None:
-            corrected_distance_m = math.sqrt(
-                corrected_point_m[0] * corrected_point_m[0]
-                + corrected_point_m[1] * corrected_point_m[1]
-                + corrected_point_m[2] * corrected_point_m[2]
-            )
-        error_m = None
-        if point_m is not None and drone_position_m is not None:
-            error_m = (
-                point_m[0] - drone_position_m[0],
-                point_m[1] - drone_position_m[1],
-                point_m[2] - drone_position_m[2],
-            )
-        error_basis_warning = (
-            "measurement stereo_center_opencv_optical vs truth px4_local_ned; "
-            "alignment profile required for final axis error"
-        )
         row = {
             "session_id": self.recording_session_id,
             "session_started_unix_s": self._fmt_record_float(self.recording_session_started_wall_s, 6),
@@ -16093,30 +14097,34 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "baseline_m": f"{baseline_m:.6f}",
             "measurement_frame": MEASUREMENT_FRAME,
             "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
-            "truth_frame": TRUTH_FRAME,
-            "truth_axis_contract": TRUTH_AXIS_CONTRACT,
-            "comparison_frame": "mixed-frame",
+            "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+            "point_frame": MEASUREMENT_FRAME,
+            "output_frame": MEASUREMENT_FRAME,
+            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "measurement_method": "two_ray_closest_midpoint",
             "x_m": self._fmt_record_float(point.x_m, 6),
             "y_m": self._fmt_record_float(point.y_m, 6),
             "z_m": self._fmt_record_float(point.z_m, 6),
-            "stereo_center_right_m": self._fmt_record_float(point.x_m, 6),
-            "stereo_center_down_m": self._fmt_record_float(point.y_m, 6),
-            "stereo_center_forward_m": self._fmt_record_float(point.z_m, 6),
+            "left_camera_right_m": self._fmt_record_float(point.x_m, 6),
+            "left_camera_down_m": self._fmt_record_float(point.y_m, 6),
+            "left_camera_forward_m": self._fmt_record_float(point.z_m, 6),
+            "stereo_center_right_m": "",
+            "stereo_center_down_m": "",
+            "stereo_center_forward_m": "",
             "raw_distance_m": self._fmt_record_float(raw_distance_m, 6),
             "raw_x_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
             "raw_y_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
             "raw_z_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
-            "raw_stereo_center_right_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
-            "raw_stereo_center_down_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
-            "raw_stereo_center_forward_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
+            "raw_left_camera_right_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
+            "raw_left_camera_down_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
+            "raw_left_camera_forward_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
+            "raw_stereo_center_right_m": "",
+            "raw_stereo_center_down_m": "",
+            "raw_stereo_center_forward_m": "",
             "raw_right_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
             "raw_down_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
             "raw_forward_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
             "raw_range_m": self._fmt_record_float(raw_distance_m, 6),
-            "estimated_right_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
-            "estimated_down_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
-            "estimated_forward_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
-            "estimated_range_m": self._fmt_record_float(raw_distance_m, 6),
             "raw_left_x_m": self._fmt_record_float(None if raw_point_left_m is None else raw_point_left_m[0], 6),
             "raw_left_y_m": self._fmt_record_float(None if raw_point_left_m is None else raw_point_left_m[1], 6),
             "raw_left_z_m": self._fmt_record_float(None if raw_point_left_m is None else raw_point_left_m[2], 6),
@@ -16129,102 +14137,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "translation_right_in_left_z_m": self._fmt_record_float(
                 None if translation_right_in_left_m is None else translation_right_in_left_m[2], 6
             ),
-            "live_truth_range_m": self._fmt_record_float(live_truth_range_m, 6),
-            "live_range_error_m": self._fmt_record_float(live_range_error_m, 6),
-            "live_range_error_basis": "baseline_center" if live_truth_range_m is not None else "",
-            "live_range_alignment_profile_id": live_alignment_profile_id or "",
-            "telemetry_range_m": self._fmt_record_float(live_truth_range_m, 6),
-            "telemetry_range_error_m": self._fmt_record_float(live_range_error_m, 6),
-            "telemetry_range_basis": "baseline_center" if live_truth_range_m is not None else "",
-            "telemetry_range_profile_id": live_alignment_profile_id or "",
-            "live_truth_timestamp_s": self._fmt_record_float(self.latest_drone_position_timestamp_s, 6),
-            "corrected_distance_m": self._fmt_record_float(corrected_distance_m, 6),
-            "corrected_range_m": self._fmt_record_float(corrected_distance_m, 6),
-            "corrected_x_m": self._fmt_record_float(None if corrected_point_m is None else corrected_point_m[0], 6),
-            "corrected_y_m": self._fmt_record_float(None if corrected_point_m is None else corrected_point_m[1], 6),
-            "corrected_z_m": self._fmt_record_float(None if corrected_point_m is None else corrected_point_m[2], 6),
-            "corrected_right_m": self._fmt_record_float(None if corrected_point_m is None else corrected_point_m[0], 6),
-            "corrected_down_m": self._fmt_record_float(None if corrected_point_m is None else corrected_point_m[1], 6),
-            "corrected_forward_m": self._fmt_record_float(None if corrected_point_m is None else corrected_point_m[2], 6),
-            "filtered_distance_m": f"{distance_m:.6f}",
-            "filtered_range_m": f"{distance_m:.6f}",
-            "filtered_x_m": self._fmt_record_float(point.x_m, 6),
-            "filtered_y_m": self._fmt_record_float(point.y_m, 6),
-            "filtered_z_m": self._fmt_record_float(point.z_m, 6),
-            "filtered_right_m": self._fmt_record_float(point.x_m, 6),
-            "filtered_down_m": self._fmt_record_float(point.y_m, 6),
-            "filtered_forward_m": self._fmt_record_float(point.z_m, 6),
-            "tracking_filter_id": "" if tracking_result is None else tracking_result.filter_id,
-            "tracking_initialized": self._fmt_record_bool(None if tracking_result is None else tracking_result.initialized),
-            "tracking_accepted": self._fmt_record_bool(None if tracking_result is None else tracking_result.accepted),
-            "tracking_reset": self._fmt_record_bool(None if tracking_result is None else tracking_result.reset),
-            "tracking_normalized_innovation": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.normalized_innovation, 6
-            ),
-            "tracking_measurement_std_right_m": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.measurement_std_m[0], 6
-            ),
-            "tracking_measurement_std_down_m": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.measurement_std_m[1], 6
-            ),
-            "tracking_measurement_std_forward_m": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.measurement_std_m[2], 6
-            ),
-            "tracking_cov_right_m2": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.covariance_diag_m2[0], 6
-            ),
-            "tracking_cov_down_m2": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.covariance_diag_m2[1], 6
-            ),
-            "tracking_cov_forward_m2": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.covariance_diag_m2[2], 6
-            ),
-            "tracking_velocity_right_mps": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.velocity_mps[0], 6
-            ),
-            "tracking_velocity_down_mps": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.velocity_mps[1], 6
-            ),
-            "tracking_velocity_forward_mps": self._fmt_record_float(
-                None if tracking_result is None else tracking_result.velocity_mps[2], 6
-            ),
-            "corrected_left_x_m": self._fmt_record_float(
-                None if corrected_point_left_m is None else corrected_point_left_m[0], 6
-            ),
-            "corrected_left_y_m": self._fmt_record_float(
-                None if corrected_point_left_m is None else corrected_point_left_m[1], 6
-            ),
-            "corrected_left_z_m": self._fmt_record_float(
-                None if corrected_point_left_m is None else corrected_point_left_m[2], 6
-            ),
-            "drone_x_m": self._fmt_record_float(None if drone_position_m is None else drone_position_m[0], 6),
-            "drone_y_m": self._fmt_record_float(None if drone_position_m is None else drone_position_m[1], 6),
-            "drone_z_m": self._fmt_record_float(None if drone_position_m is None else drone_position_m[2], 6),
-            "drone_north_m": self._fmt_record_float(None if drone_position_m is None else drone_position_m[0], 6),
-            "drone_east_m": self._fmt_record_float(None if drone_position_m is None else drone_position_m[1], 6),
-            "drone_down_m": self._fmt_record_float(None if drone_position_m is None else drone_position_m[2], 6),
-            "error_x_m": self._fmt_record_float(None if error_m is None else error_m[0], 6),
-            "error_y_m": self._fmt_record_float(None if error_m is None else error_m[1], 6),
-            "error_z_m": self._fmt_record_float(None if error_m is None else error_m[2], 6),
-            "error_frame": "mixed-stereo-center-vs-px4-local-ned",
-            "error_basis_warning": error_basis_warning if error_m is not None else "",
-            "bias_x_m": self._fmt_record_float(None if bias_correction_m is None else bias_correction_m[0], 6),
-            "bias_y_m": self._fmt_record_float(None if bias_correction_m is None else bias_correction_m[1], 6),
-            "bias_z_m": self._fmt_record_float(None if bias_correction_m is None else bias_correction_m[2], 6),
-            "bias_profile_id": ""
-            if bias_correction_m is None or self.active_bias_profile is None
-            else self.active_bias_profile.profile_id,
-            "profile_id": profile_status.get("profile_id", ""),
-            "profile_mode": profile_status.get("profile_mode", ""),
-            "profile_output_policy": profile_status.get("profile_output_policy", ""),
-            "profile_fallback_level": profile_status.get("profile_fallback_level", ""),
-            "profile_fallback_reason": profile_status.get("profile_fallback_reason", ""),
             "recording_elapsed_s": self._fmt_record_float(recording_elapsed_s, 6),
             "warnings": "; ".join(estimate.warnings),
         }
-        row.update(self._record_bbox_correction_parameters(bbox_correction, estimate, raw_distance_m))
         row.update(self._record_bbox_parameters(estimate))
-        row.update(self._record_bias_sync_timestamp_parameters(estimate))
+        row.update(self._record_measurement_sync_timestamp_parameters(estimate))
         row.update(self._record_intrinsic_parameters())
         row.update(self._record_frame_timestamp_parameters())
         row.update(self._record_live_telemetry_snapshot_parameters())
@@ -16276,52 +14193,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         row.update(values)
         self.external_parameter_recording_rows.append(row)
         self._refresh_recording_status_label()
-
-    def _record_bbox_correction_parameters(
-        self,
-        bbox_correction: dict[str, object] | None,
-        estimate,
-        raw_range_m: float | None,
-    ) -> dict[str, str]:
-        row: dict[str, str] = {
-            "left_corrected_cx": "",
-            "left_corrected_cy": "",
-            "right_corrected_cx": "",
-            "right_corrected_cy": "",
-            "left_bbox_du_px": "",
-            "left_bbox_dv_px": "",
-            "right_bbox_du_px": "",
-            "right_bbox_dv_px": "",
-            "profile_id_hash": "",
-            "fallback_level": "",
-            "fallback_reason": "",
-            "profile_cell_key": "",
-            "profile_cell_sample_count": "",
-            "bbox_adjustment_raw_disparity_px": self._fmt_record_float(getattr(estimate, "disparity_px", None), 6),
-            "bbox_adjustment_raw_range_m": self._fmt_record_float(raw_range_m, 6),
-        }
-        if bbox_correction is None:
-            return row
-        float_fields = (
-            "left_corrected_cx",
-            "left_corrected_cy",
-            "right_corrected_cx",
-            "right_corrected_cy",
-            "left_bbox_du_px",
-            "left_bbox_dv_px",
-            "right_bbox_du_px",
-            "right_bbox_dv_px",
-        )
-        for field in float_fields:
-            row[field] = self._fmt_record_float(
-                None if bbox_correction.get(field) is None else float(bbox_correction[field]), 6
-            )
-        row["profile_id_hash"] = str(bbox_correction.get("profile_id_hash", ""))
-        row["fallback_level"] = str(bbox_correction.get("fallback_level", ""))
-        row["fallback_reason"] = str(bbox_correction.get("fallback_reason", ""))
-        row["profile_cell_key"] = str(bbox_correction.get("profile_cell_key", ""))
-        row["profile_cell_sample_count"] = str(bbox_correction.get("profile_cell_sample_count", ""))
-        return row
 
     def _record_bbox_parameters(self, estimate) -> dict[str, str]:
         row: dict[str, str] = {}
@@ -16375,7 +14246,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return None
         return parsed if isfinite(parsed) else None
 
-    def _record_bias_sync_timestamp_parameters(self, estimate) -> dict[str, str]:
+    def _record_measurement_sync_timestamp_parameters(self, estimate) -> dict[str, str]:
         left_timestamp_s = float(getattr(estimate.left, "timestamp_s", 0.0))
         right_timestamp_s = float(getattr(estimate.right, "timestamp_s", 0.0))
         bbox_mid_timestamp_s = (left_timestamp_s + right_timestamp_s) / 2.0
@@ -16386,13 +14257,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if left_utc_unix_s is not None and right_utc_unix_s is not None
             else None
         )
-        drone_timestamp_s = self.latest_drone_position_timestamp_s
-        drone_age_s = (
-            bbox_mid_timestamp_s - drone_timestamp_s
-            if drone_timestamp_s is not None
-            else None
-        )
-        truth_sample = self.latest_drone_truth_sample
         camera_time_metrics = self._camera_time_sync_metrics(
             dict(getattr(estimate.left, "timestamp_metadata", None) or {}),
             dict(getattr(estimate.right, "timestamp_metadata", None) or {}),
@@ -16422,26 +14286,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right_rtcp_frame_transit_ms": self._fmt_record_float(camera_time_metrics["right_frame_transit_delay_ms"], 3),
             "left_rtcp_pc_offset_ms": self._fmt_record_float(camera_time_metrics["left_pc_offset_ms"], 3),
             "right_rtcp_pc_offset_ms": self._fmt_record_float(camera_time_metrics["right_pc_offset_ms"], 3),
-            "drone_timestamp_s": self._fmt_record_float(drone_timestamp_s, 6),
-            "drone_timestamp_reference": self.latest_drone_position_timestamp_reference,
-            "drone_utc_unix_s": self._fmt_record_float(self.latest_drone_position_utc_unix_s, 6),
-            "drone_age_s": self._fmt_record_float(drone_age_s, 6),
-            "drone_source_frame": "" if truth_sample is None else truth_sample.source_frame,
-            "drone_source_axis_contract": "" if truth_sample is None else truth_sample.source_axis_contract,
-            "drone_conversion_status": "" if truth_sample is None else truth_sample.conversion_status,
-            "drone_raw_lat_deg": self._fmt_record_float(None if truth_sample is None else truth_sample.raw_lat_deg, 9),
-            "drone_raw_lon_deg": self._fmt_record_float(None if truth_sample is None else truth_sample.raw_lon_deg, 9),
-            "drone_raw_alt_m": self._fmt_record_float(None if truth_sample is None else truth_sample.raw_alt_m, 6),
-            "drone_gps_reference_lat_deg": self._fmt_record_float(
-                None if truth_sample is None else truth_sample.gps_reference_lat_deg, 9
-            ),
-            "drone_gps_reference_lon_deg": self._fmt_record_float(
-                None if truth_sample is None else truth_sample.gps_reference_lon_deg, 9
-            ),
-            "drone_gps_reference_alt_m": self._fmt_record_float(
-                None if truth_sample is None else truth_sample.gps_reference_alt_m, 6
-            ),
-            "drone_gps_reference_kind": "" if truth_sample is None else truth_sample.gps_reference_kind,
         }
         return row
 
@@ -16611,6 +14455,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _record_external_parameters(self, *, estimate) -> dict[str, str]:
         triangulation_source = self._triangulation_extrinsics_source()
         checkerboard_mode = triangulation_source == "checkerboard"
+        attitude_timing_status = classify_attitude_timing(
+            uses_pixhawk_attitude=not checkerboard_mode,
+            left_age_s=estimate.left_attitude_age_s,
+            right_age_s=estimate.right_attitude_age_s,
+            pair_delta_s=estimate.attitude_pair_delta_s,
+        )
         checkerboard = self._record_checkerboard_extrinsics_parameters()
         row: dict[str, str] = {
             "triangulation_extrinsics_source": triangulation_source,
@@ -16641,6 +14491,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             "checkerboard_extrinsics_frame_contract": str(checkerboard["frame_contract"]),
             "require_attitude": self._fmt_record_bool(False),
+            "attitude_used_for_triangulation": self._fmt_record_bool(not checkerboard_mode),
+            "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
+            "attitude_timing_status": attitude_timing_status,
+            "attitude_timing_blocks_measurement": self._fmt_record_bool(False),
+            "attitude_stale_age_threshold_s": self._fmt_record_float(ATTITUDE_STALE_AGE_S, 3),
+            "attitude_very_stale_age_threshold_s": self._fmt_record_float(
+                ATTITUDE_VERY_STALE_AGE_S, 3
+            ),
+            "attitude_stale_pair_delta_threshold_s": self._fmt_record_float(
+                ATTITUDE_STALE_PAIR_DELTA_S, 3
+            ),
+            "attitude_very_stale_pair_delta_threshold_s": self._fmt_record_float(
+                ATTITUDE_VERY_STALE_PAIR_DELTA_S, 3
+            ),
             "left_attitude_age_s": self._fmt_record_float(estimate.left_attitude_age_s, 6),
             "right_attitude_age_s": self._fmt_record_float(estimate.right_attitude_age_s, 6),
             "attitude_pair_delta_s": self._fmt_record_float(estimate.attitude_pair_delta_s, 6),
@@ -16770,6 +14634,39 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return "--"
         return f"Right={point[0]:+.3f} m, Down={point[1]:+.3f} m, Forward={point[2]:+.3f} m"
 
+    def _format_attitude_timing_age(self, value_s: float | None) -> str:
+        return "--" if value_s is None else f"{value_s:.3f} s"
+
+    def _attitude_timing_health_level(self, status: str) -> str:
+        return {
+            "FRESH": "good",
+            "STALE": "warn",
+            "VERY_STALE": "bad",
+            "WAITING": "warn",
+            "NOT_USED": "idle",
+        }.get(status, "idle")
+
+    def _format_attitude_timing_text(
+        self,
+        *,
+        status: str,
+        left_age_s: float | None,
+        right_age_s: float | None,
+        pair_delta_s: float | None,
+        baseline_source: str,
+        baseline_m: float,
+    ) -> str:
+        baseline_text = f"Baseline {baseline_source}:{baseline_m:.3f} m"
+        if status == "NOT_USED":
+            return f"Attitude timing [N/A] | {baseline_text} | PIXHAWK ATTITUDE NOT USED (checkerboard)"
+        return (
+            f"Attitude timing [{status}] | {baseline_text} | "
+            f"Left age {self._format_attitude_timing_age(left_age_s)} | "
+            f"Right age {self._format_attitude_timing_age(right_age_s)} | "
+            f"Pair Δt {self._format_attitude_timing_age(pair_delta_s)} | "
+            "display-only; measurement continues"
+        )
+
     def _clear_triangulation_quality(self, reason: str) -> None:
         if not hasattr(self, "triangulation_quality_status_label"):
             return
@@ -16777,9 +14674,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.triangulation_quality_gap_label.setText("gap: --")
         self.triangulation_quality_distance_label.setText("distance: --")
         self.triangulation_quality_mode_label.setText("mode: --")
-        self.triangulation_quality_raw_point_label.setText("Raw center 3D point: --")
-        self.triangulation_quality_corrected_point_label.setText("Corrected center 3D point: --")
-        self.triangulation_quality_correction_label.setText("Correction vector: --")
+        self._set_health_label(self.triangulation_quality_attitude_label, "Attitude timing: --", "idle")
+        self.triangulation_quality_raw_point_label.setText("Raw left_camera_rdf point: --")
         self.triangulation_quality_plot.set_quality(None)
 
     def _update_triangulation_quality(
@@ -16791,9 +14687,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         display_baseline_source: str,
         display_baseline_m: float,
         raw_point_left_m: tuple[float, float, float] | None,
-        raw_point_center_m: tuple[float, float, float] | None,
-        corrected_point_center_m: tuple[float, float, float] | None,
-        bias_correction: tuple[float, float, float] | None,
+        raw_point_m: tuple[float, float, float] | None,
+        attitude_timing_status: str,
+        left_attitude_age_s: float | None,
+        right_attitude_age_s: float | None,
+        attitude_pair_delta_s: float | None,
     ) -> None:
         if not hasattr(self, "triangulation_quality_status_label"):
             return
@@ -16803,15 +14701,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.triangulation_quality_gap_label.setText(f"gap: {triangulated.closest_gap_m:.3f} m")
         self.triangulation_quality_distance_label.setText(f"distance: {display_distance_m:.3f} m")
         self.triangulation_quality_mode_label.setText(f"mode: {method_text}")
+        self._set_health_label(
+            self.triangulation_quality_attitude_label,
+            self._format_attitude_timing_text(
+                status=attitude_timing_status,
+                left_age_s=left_attitude_age_s,
+                right_age_s=right_attitude_age_s,
+                pair_delta_s=attitude_pair_delta_s,
+                baseline_source=display_baseline_source,
+                baseline_m=display_baseline_m,
+            ),
+            self._attitude_timing_health_level(attitude_timing_status),
+        )
         self.triangulation_quality_raw_point_label.setText(
-            f"Raw center 3D point: {self._format_quality_point(raw_point_center_m)} "
-            f"| left raw: {self._format_quality_point(raw_point_left_m)}"
-        )
-        self.triangulation_quality_corrected_point_label.setText(
-            f"Corrected center 3D point: {self._format_quality_point(corrected_point_center_m)}"
-        )
-        self.triangulation_quality_correction_label.setText(
-            f"Correction vector: {self._format_quality_point(bias_correction)}"
+            f"Raw left_camera_rdf point: {self._format_quality_point(raw_point_m)} "
+            f"| origin=left optical center | raw alias: {self._format_quality_point(raw_point_left_m)}"
         )
         self.triangulation_quality_plot.set_quality(
             {
@@ -16899,9 +14803,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.gnss_monitor.update_position(camera, gps)
         if hasattr(self, "baseline_gps_rate_history") and camera in self.baseline_gps_rate_history:
             self.baseline_gps_rate_history[camera].append(time.monotonic())
-        uam_source = str(self.uam_source_combo.currentData() or "") if hasattr(self, "uam_source_combo") else ""
-        if uam_source not in {"mavlink_gps", "mavlink_global"}:
-            self._update_uam_live_telemetry_from_gps(camera, gps)
         self._record_external_timeline_row(
             camera,
             "gps_rtk",
@@ -16951,83 +14852,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._append_baseline_sample_if_active()
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
-
-    def _update_uam_live_telemetry_from_gps(self, camera: str, gps: GpsPositionState) -> None:
-        if not hasattr(self, "uam_source_combo"):
-            return
-        source = str(self.uam_source_combo.currentData() or "")
-        if source not in {"mavlink_gps", "mavlink_global"}:
-            return
-        if camera not in {"left", "uam"} or not gps.has_position:
-            return
-        topic = str(gps.topic or "")
-        if source == "mavlink_global" and "GLOBAL_POSITION_INT" not in topic:
-            return
-        if source == "mavlink_gps" and not any(
-            name in topic for name in ("GPS_RAW_INT", "GPS2_RAW", "VehicleGpsPosition", "SensorGps", "sensor_gps")
-        ):
-            return
-        if self.uam_gps_reference_lla is None:
-            self.uam_gps_reference_lla = (float(gps.latitude_deg), float(gps.longitude_deg), float(gps.altitude_m))
-            self.uam_gps_reference_kind = "first_valid_global_sample" if source == "mavlink_global" else "first_valid_gps_sample"
-        ref_lat, ref_lon, ref_alt = self.uam_gps_reference_lla
-        converted = local_ned_from_lla(
-            lat=gps.latitude_deg,
-            lon=gps.longitude_deg,
-            alt=gps.altitude_m,
-            reference_lat_deg=ref_lat,
-            reference_lon_deg=ref_lon,
-            reference_alt_m=ref_alt,
-            source=f"live-{source}:{camera}:{topic}",
-            origin_kind=self.uam_gps_reference_kind,
-            altitude_reference="unknown",
-        )
-        if converted is None:
-            return
-        self.latest_drone_position_m = (converted.north_m, converted.east_m, converted.down_m)
-        self.latest_drone_position_timestamp_s = float(gps.timestamp_s)
-        self.latest_drone_position_timestamp_reference = converted.source
-        self.latest_drone_position_utc_unix_s = None
-        signature = (
-            round(float(self.latest_drone_position_timestamp_s), 6),
-            round(float(converted.north_m), 6),
-            round(float(converted.east_m), 6),
-            round(float(converted.down_m), 6),
-        )
-        if signature != self._last_uam_live_sample_signature:
-            self._last_uam_live_sample_signature = signature
-            uam_sample = UamTelemetrySample(
-                timestamp_s=float(gps.timestamp_s),
-                x_m=converted.north_m,
-                y_m=converted.east_m,
-                z_m=converted.down_m,
-                source=converted.source,
-                timestamp_reference="app-receive",
-                gps_reference_lat_deg=converted.origin_lat_deg,
-                gps_reference_lon_deg=converted.origin_lon_deg,
-                gps_reference_alt_m=converted.origin_alt_m,
-                gps_reference_kind=converted.origin_kind,
-                gps_altitude_reference=converted.altitude_reference,
-                source_frame=converted.source_frame,
-                source_axis_contract=converted.source_axis_contract,
-                raw_lat_deg=converted.raw_lat_deg,
-                raw_lon_deg=converted.raw_lon_deg,
-                raw_alt_m=converted.raw_alt_m,
-                conversion_status=converted.conversion_status,
-            )
-            self.latest_drone_truth_sample = uam_sample
-            self.uam_live_telemetry_samples.append(uam_sample)
-            self._append_uam_truth_plot_sample(uam_sample)
-        latest_text = (
-            f"N={converted.north_m:+.3f} E={converted.east_m:+.3f} D={converted.down_m:+.3f} m "
-            f"origin={converted.origin_kind} source={converted.source}"
-        )
-        if hasattr(self, "uam_latest_label"):
-            self.uam_latest_label.setText(f"latest: {latest_text}")
-        if hasattr(self, "uam_status_label"):
-            self.uam_status_label.setText(
-                f"UAM telemetry: {source} 변환 수신 중, buffer={len(self.uam_live_telemetry_samples)}"
-            )
 
     def _update_mag_sensor(self, camera: str, state) -> None:
         topic = str(getattr(state, "topic", ""))

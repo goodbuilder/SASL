@@ -87,20 +87,6 @@ class AppSettings:
     gnss_base_survey_in_min_duration_s: int = 300
     gnss_base_survey_in_accuracy_m: float = 1.0
     gnss_base_rtcm_injection_target: str = "both"
-    uam_telemetry_source: str = "mavlink"
-    uam_ros2_topic: str = "/uav_0/fmu/out/vehicle_local_position"
-    uam_ros2_x_field: str = "x"
-    uam_ros2_y_field: str = "y"
-    uam_ros2_z_field: str = "z"
-    uam_mavlink_side: str = "left"
-    uam_mavlink_url: str = "/dev/ttyACM0"
-    uam_mavlink_baud: int = 57600
-    uam_mavlink_message: str = "LOCAL_POSITION_NED"
-    uam_mavlink_x_field: str = "x"
-    uam_mavlink_y_field: str = "y"
-    uam_mavlink_z_field: str = "z"
-    uam_compare_max_dt_s: float = 0.25
-    uam_compare_time_offset_s: float = 0.0
     clock_ftp_user: str = "anonymous"
     clock_ftp_password: str = ""
     clock_ftp_port: int = 21
@@ -238,22 +224,6 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         ),
         gnss_base_rtcm_injection_target=str(
             payload.get("gnss_base_rtcm_injection_target", AppSettings.gnss_base_rtcm_injection_target)
-        ),
-        uam_telemetry_source=str(payload.get("uam_telemetry_source", AppSettings.uam_telemetry_source)),
-        uam_ros2_topic=str(payload.get("uam_ros2_topic", AppSettings.uam_ros2_topic)),
-        uam_ros2_x_field=str(payload.get("uam_ros2_x_field", AppSettings.uam_ros2_x_field)),
-        uam_ros2_y_field=str(payload.get("uam_ros2_y_field", AppSettings.uam_ros2_y_field)),
-        uam_ros2_z_field=str(payload.get("uam_ros2_z_field", AppSettings.uam_ros2_z_field)),
-        uam_mavlink_side=str(payload.get("uam_mavlink_side", AppSettings.uam_mavlink_side)),
-        uam_mavlink_url=str(payload.get("uam_mavlink_url", AppSettings.uam_mavlink_url)),
-        uam_mavlink_baud=int(payload.get("uam_mavlink_baud", AppSettings.uam_mavlink_baud)),
-        uam_mavlink_message=str(payload.get("uam_mavlink_message", AppSettings.uam_mavlink_message)),
-        uam_mavlink_x_field=str(payload.get("uam_mavlink_x_field", AppSettings.uam_mavlink_x_field)),
-        uam_mavlink_y_field=str(payload.get("uam_mavlink_y_field", AppSettings.uam_mavlink_y_field)),
-        uam_mavlink_z_field=str(payload.get("uam_mavlink_z_field", AppSettings.uam_mavlink_z_field)),
-        uam_compare_max_dt_s=float(payload.get("uam_compare_max_dt_s", AppSettings.uam_compare_max_dt_s)),
-        uam_compare_time_offset_s=float(
-            payload.get("uam_compare_time_offset_s", AppSettings.uam_compare_time_offset_s)
         ),
         clock_ftp_user=str(payload.get("clock_ftp_user", AppSettings.clock_ftp_user)),
         clock_ftp_password=str(payload.get("clock_ftp_password", AppSettings.clock_ftp_password)),

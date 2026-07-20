@@ -1,5 +1,10 @@
 # Candidate Method Validation Summary - 2026-06-09
 
+> **Archived result.** The direct-Gazebo Origin-BBOX, ROI/silhouette, and
+> Kalman tracking scripts referenced below were retired on 2026-07-20. This
+> report preserves historical evidence only; its commands are not expected to
+> run from the current checkout.
+
 This file records the tested StereoDistance correction candidates so the next
 session can resume without re-running already rejected branches.
 

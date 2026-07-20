@@ -54,9 +54,12 @@ def test_triangulate_rays_returns_expected_forward_distance_for_parallel_stereo(
     assert result is not None
     assert round(result.distance_m, 1) == 5.4
     assert round(result.baseline_m, 1) == 0.3
+    assert result.method == "two_ray_closest_midpoint"
+    assert result.point_frame == "left_camera_rdf"
+    assert result.output_frame == "left_camera_rdf"
 
 
-def test_stereo_center_point_sets_centerline_estimated_x_to_zero() -> None:
+def test_left_camera_output_does_not_shift_result_to_baseline_center() -> None:
     left_ray = normalized_ray_from_pixel(665.0, 360.0, intrinsics())
     right_ray = normalized_ray_from_pixel(615.0, 360.0, intrinsics())
 
@@ -66,6 +69,8 @@ def test_stereo_center_point_sets_centerline_estimated_x_to_zero() -> None:
     center_point = stereo_center_point_from_left_camera(result.point_left_m, (0.3, 0.0, 0.0))
     assert rounded_tuple(result.point_left_m) == (0.15, 0.0, 5.4)
     assert rounded_tuple(center_point) == (0.0, 0.0, 5.4)
+    assert rounded_tuple(result.point_left_rdf_m) == (0.15, 0.0, 5.4)
+    assert result.range_m == result.distance_m
 
 
 def test_triangulate_pixels_uses_intrinsics_attitude_and_translation() -> None:
@@ -86,7 +91,7 @@ def test_triangulate_pixels_uses_intrinsics_attitude_and_translation() -> None:
 def test_fixed_camera_mount_maps_optical_axes_to_px4_frd() -> None:
     assert WORLD_FRAME == "ned"
     assert BODY_FRAME == "px4_frd"
-    assert CAMERA_FRAME == "opencv_optical"
+    assert CAMERA_FRAME == "camera_optical_rdf"
     assert CAMERA_MOUNT_PROFILE == "front_camera_z_to_body_x_x_to_body_y"
     assert camera_vector_to_body_frd((1.0, 0.0, 0.0)) == (0.0, 1.0, 0.0)
     assert camera_vector_to_body_frd((0.0, 1.0, 0.0)) == (0.0, 0.0, 1.0)
@@ -136,3 +141,13 @@ def test_invert_checkerboard_left_to_right_transform_preserves_right_origin_cont
 
     assert rotation_right_to_left == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     assert rounded_tuple(translation_right_in_left) == (0.3, 0.0, 0.0)
+
+
+def test_invert_checkerboard_transform_uses_minus_transposed_rotation_times_translation() -> None:
+    rotation_right_to_left, translation_right_in_left = invert_left_to_right_camera_transform(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        [1.0, 2.0, 3.0],
+    )
+
+    assert rotation_right_to_left == [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    assert rounded_tuple(translation_right_in_left) == (-2.0, 1.0, -3.0)
