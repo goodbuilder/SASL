@@ -160,8 +160,16 @@ class OwnedProcess:
     def wait(self, timeout: float):
         return self.process.wait(timeout=timeout)
 
-    def signal_group(self, signal_number: signal.Signals) -> None:
-        os.killpg(self.process.pid, signal_number)
+    def signal_owned(self, signal_number: signal.Signals) -> None:
+        # Let ros2 launch deliver the first graceful interrupt exactly once.
+        # Broadcasting SIGINT to the whole group makes Python children receive
+        # it directly and then receive launch's forwarded SIGINT a second time,
+        # which can interrupt recorder finalization.  Escalations still target
+        # the complete runner-owned process group.
+        if signal_number == signal.SIGINT:
+            os.kill(self.process.pid, signal_number)
+        else:
+            os.killpg(self.process.pid, signal_number)
         self.events.append({"signal": signal_number.name, "utc": utc_now()})
 
     def close_log(self) -> None:
@@ -195,7 +203,7 @@ def stop_owned_process(process: Any, *, shutdown_timeout_s: float) -> list[dict[
         return list(getattr(process, "events", ()))
     for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
         try:
-            process.signal_group(signal_number)
+            process.signal_owned(signal_number)
         except ProcessLookupError:
             break
         try:

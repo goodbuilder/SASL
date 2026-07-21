@@ -7,6 +7,8 @@ import signal
 import subprocess
 import sys
 
+import pytest
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 sys.path.insert(0, str(PACKAGE_ROOT))
@@ -41,7 +43,7 @@ class FakeProcess:
     def poll(self):
         return self.return_code
 
-    def signal_group(self, signal_number):
+    def signal_owned(self, signal_number):
         self.events.append({"signal": signal_number.name})
 
     def wait(self, timeout):
@@ -80,6 +82,28 @@ def test_owned_process_stops_with_sigint_only() -> None:
     process = FakeProcess((0,))
     events = module.stop_owned_process(process, shutdown_timeout_s=1)
     assert [event["signal"] for event in events] == [signal.SIGINT.name]
+
+
+def test_owned_process_delivers_one_graceful_interrupt_then_group_escalation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _cli_module()
+    delivered = []
+    monkeypatch.setattr(module.os, "kill", lambda pid, value: delivered.append(("pid", pid, value)))
+    monkeypatch.setattr(
+        module.os, "killpg", lambda pid, value: delivered.append(("group", pid, value))
+    )
+
+    class PopenLike:
+        pid = 91
+
+    owned = module.OwnedProcess(PopenLike(), None)
+    owned.signal_owned(signal.SIGINT)
+    owned.signal_owned(signal.SIGTERM)
+    assert delivered == [
+        ("pid", 91, signal.SIGINT),
+        ("group", 91, signal.SIGTERM),
+    ]
 
 
 def test_owned_process_escalates_int_term_kill_without_unrelated_pid() -> None:
