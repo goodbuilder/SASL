@@ -85,6 +85,37 @@ motion, correction fitting, or train/validation/Test splits. It is a
 non-formal static Gazebo qualification tool, not the 72-hour formal correction
 search or R4 qualification.
 
+## Sealed Simulation profile qualification (S2-R4-A)
+
+`scripts/run_sealed_correction_qualification.py` prepares the Calibration,
+Validation, and sealed-Evaluation plans before any dataset is collected. The
+split unit is a complete spatial cell `(range, bearing, elevation)`, so all 25
+attitude profiles for one cell stay in one role. R4-A executes only the
+Calibration and Validation R3 sweeps. The sealed plan and its ordered case,
+profile, and spatial hashes are committed before fitting; no sealed process,
+pair record, statistic, or metric may exist until the separate R4-B phase.
+
+The bounded candidate families are nominal Raw, one shared Wahba SO(3)
+rotation, and independent left/right Wahba SO(3) rotations. Calibration uses
+one median pixel/GT representative per valid static case with equal case
+weight. Validation evaluates all 30 analysis records per case and selects one
+global family for every attitude profile. Solver inputs are optical RDF pixel
+rays and Gazebo GT directions derived through `baseline_center_frd` to World
+ENU and nominal camera RDF. Injected attitude values group profiles only;
+injected rotations and the R2 oracle Corrected position are not solver inputs.
+The fitted matrix direction is
+`R_Cnominal_Cactual @ ray_actual_rdf = ray_nominal_gt_rdf`.
+
+The frozen catalog is Simulation method-qualification evidence only. It binds
+the exact clean branch/SHA, Calibration and Validation plans, sealed
+commitment, candidate code hash, validation score, fitted matrices, access
+ledger, and artifact hashes. It records
+`runtime_selection_source=not_implemented` and `deployment_ready=false`.
+`QUALIFICATION_PROFILE_FROZEN` together with
+`SEALED_EVALUATION_NOT_EXECUTED` is the required R4-A terminal state. R4-B may
+open that commitment exactly once at the same SHA; R4-A is neither sealed
+evaluation nor the formal 72-hour/PX4 correction-search qualification.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone
