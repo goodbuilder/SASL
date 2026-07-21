@@ -74,3 +74,98 @@ def test_valid_completed_case_does_not_allocate_new_attempt(tmp_path: Path) -> N
     assert latest_valid_attempt(case) is not None
     after = sorted(path.name for path in case.iterdir())
     assert after == before
+
+
+def test_resume_validates_r2_artifacts_and_stored_statistics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _cli_module()
+    case = {"case_id": "case-1", "case_hash": "hash", "payload": {}}
+    attempt = tmp_path / "case-1" / "attempt-0001"
+    _state(attempt, valid=True, attempt=1)
+    state_path = attempt / "attempt_state.json"
+    state = json.loads(state_path.read_text())
+    state["case_id"] = "case-1"
+    state["case_hash"] = "hash"
+    state["statistics"] = {"analysis_sample_count": 2}
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    (attempt / "recording").mkdir()
+    (attempt / "recording" / "RUN_FINALIZED_VALID").touch()
+    monkeypatch.setattr(module, "validate_r2_artifacts", lambda *args, **kwargs: ([{}], {}))
+    monkeypatch.setattr(
+        module,
+        "compute_case_statistics",
+        lambda *args, **kwargs: {"analysis_sample_count": 2},
+    )
+    monkeypatch.setattr(module, "_attempt_spatial_validation", lambda *args, **kwargs: {})
+    provenance = {"commit_sha": "a" * 40, "branch": "sim/test"}
+    validated = module.validated_latest_attempt(
+        case=case,
+        case_dir=attempt.parent,
+        provenance=provenance,
+        sweep_id="sweep",
+        warmup_count=1,
+        analysis_count=2,
+    )
+    assert validated is not None and validated[0] == attempt
+
+    monkeypatch.setattr(
+        module,
+        "validate_r2_artifacts",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("corrupt")),
+    )
+    assert module.validated_latest_attempt(
+        case=case,
+        case_dir=attempt.parent,
+        provenance=provenance,
+        sweep_id="sweep",
+        warmup_count=1,
+        analysis_count=2,
+    ) is None
+
+
+def test_latest_incomplete_attempt_prevents_fallback_to_older_valid(tmp_path: Path) -> None:
+    module = _cli_module()
+    case = {"case_id": "case-1", "case_hash": "hash", "payload": {}}
+    older = tmp_path / "case-1" / "attempt-0001"
+    _state(older, valid=True, attempt=1)
+    (older / "recording").mkdir()
+    (older / "recording" / "RUN_FINALIZED_VALID").touch()
+    latest = tmp_path / "case-1" / "attempt-0007"
+    _state(latest, valid=False, attempt=7)
+    (latest / "recording").mkdir()
+    (latest / "recording" / "RUN_INCOMPLETE").touch()
+    inspection = module.inspect_latest_attempt(
+        case=case,
+        case_dir=latest.parent,
+        provenance={"commit_sha": "a" * 40, "branch": "sim/test"},
+        sweep_id="sweep",
+        warmup_count=1,
+        analysis_count=2,
+    )
+    assert inspection["classification"] == "INCOMPLETE"
+    assert inspection["path"] == latest
+    assert module.next_attempt_directory(latest.parent)[0] == 8
+
+
+def test_contradictory_recording_markers_classify_latest_attempt_unknown(
+    tmp_path: Path,
+) -> None:
+    module = _cli_module()
+    case = {"case_id": "case-1", "case_hash": "hash", "payload": {}}
+    attempt = tmp_path / "case-1" / "attempt-0001"
+    _state(attempt, valid=True, attempt=1)
+    recording = attempt / "recording"
+    recording.mkdir()
+    (recording / "RUN_FINALIZED_VALID").touch()
+    (recording / "RUN_INCOMPLETE").touch()
+    inspection = module.inspect_latest_attempt(
+        case=case,
+        case_dir=attempt.parent,
+        provenance={"commit_sha": "a" * 40, "branch": "sim/test"},
+        sweep_id="sweep",
+        warmup_count=0,
+        analysis_count=1,
+    )
+    assert inspection["classification"] == "UNKNOWN"
+    assert "contradictory" in inspection["reason"]

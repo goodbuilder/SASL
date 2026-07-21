@@ -92,6 +92,7 @@ def test_command_builder_passes_camera_static_target_and_disables_ui(tmp_path: P
     assert args["camera_update_rate_hz"] == args["yolo_target_hz"] == "20.0"
     assert args["mission_profile"] == "manual"
     assert args["fly_target_in_gazebo"] == "false"
+    assert args["target_static_for_research"] == "true"
     assert args["gz_gui"] == args["launch_rviz"] == "false"
     assert args["record_calibration_csv"] == "false"
     assert float(args["target_spawn_x_m"]) == _case()["payload"]["spatial"]["target_world_east_m"]

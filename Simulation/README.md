@@ -61,15 +61,23 @@ canonical or seeded execution order, pre-launch actual-camera FOV checks, and
 stable case IDs bound to a canonical plan hash. Target cells are authored in
 the fixed `baseline_center_frd` frame (Forward, Right, Down) and converted to
 Gazebo World ENU through the production coordinate helpers; World axes are not
-treated as FRD aliases.
+treated as FRD aliases. R3 explicitly launches the generated research target
+as a static Gazebo model while the ordinary launch default remains dynamic and
+world gravity remains enabled. The source world and target model are unchanged.
 
 Each case launches from the verified clean repository root and enables the S2
 atomic recorder with the exact branch/SHA. The runner stops only its owned
 process group, waits for a fixed eligible-sample window, independently checks
 R2 schema/status/hash/accounting semantics, and writes case statistics plus a
 sweep-level VALID/INVALID marker outside the repository. Resume never deletes
-an attempt: valid cases are skipped and invalid/incomplete cases receive the
-next `attempt-NNNN` directory. Plan-only files contain no time, host, output
+an attempt: only the latest attempt can be skipped, and only after its R2
+markers, metadata, hashes, rows, accounting, fixed sample window, stored
+statistics, and per-sample GT range/bearing/elevation are revalidated. Invalid,
+incomplete, unknown, or spatially moved attempts receive the next numeric
+`attempt-NNNN` directory. The requested static physics mode and strict spatial
+tolerances are part of the plan and case hashes. Sweep markers form exclusive
+PLAN_READY, RUNNING, FINAL_VALID, or FINAL_INVALID states; failed finalization
+retains `SWEEP_INCOMPLETE`. Plan-only files contain no time, host, output
 path, PID, or attempt data and are byte-reproducible for identical inputs.
 
 This runner does not use the legacy latest-topic recorder, YOLO, dynamic PX4

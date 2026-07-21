@@ -15,9 +15,11 @@ from stereo_ground_sim.correction_sweep import (
     ATTITUDE_AXES,
     CameraContract,
     build_sweep_plan,
+    compute_spatial_validation,
     fov_preflight,
     spatial_frd,
     spatial_from_frd,
+    wrapped_angle_error_deg,
 )
 
 
@@ -135,3 +137,95 @@ def test_attitude_does_not_move_canonical_baseline_frame() -> None:
     nonzero = fov_preflight(contract=CameraContract(), attitude=changed, point_frd=(500, 1, 1))
     assert zero["baseline_origin_world_enu_m"] == nonzero["baseline_origin_world_enu_m"]
     assert zero["baseline_rotation_baseline_from_world"] == nonzero["baseline_rotation_baseline_from_world"]
+
+
+def _spatial_records(points):
+    return [
+        {
+            "record_sequence": index,
+            "sample_eligible": True,
+            "gt_forward_m": point[0],
+            "gt_right_m": point[1],
+            "gt_down_m": point[2],
+        }
+        for index, point in enumerate(points, start=1)
+    ]
+
+
+def test_per_sample_spatial_validation_uses_max_not_only_median() -> None:
+    exact = spatial_frd(500.0, 1.0, 0.5)
+    moved = spatial_frd(500.001, 1.0, 0.5)
+    result = compute_spatial_validation(
+        _spatial_records((exact, exact, moved)),
+        warmup_count=0,
+        analysis_count=3,
+        requested_range_m=500.0,
+        requested_bearing_deg=1.0,
+        requested_elevation_deg=0.5,
+        range_tolerance_m=0.0001,
+        angle_tolerance_deg=0.00001,
+    )
+    assert result["actual_range_m_median"] == pytest.approx(500.0, abs=1e-12)
+    assert result["spatial_range_error_abs_max_m"] > 0.0001
+    assert result["spatial_validation_pass"] is False
+    assert result["spatial_validation_sample_count"] == 3
+
+
+def test_spatial_validation_exact_point_wrap_and_strict_boundary() -> None:
+    point = spatial_frd(500.0, 179.999999, -0.5)
+    result = compute_spatial_validation(
+        _spatial_records((point,)),
+        warmup_count=0,
+        analysis_count=1,
+        requested_range_m=500.0,
+        requested_bearing_deg=179.999999,
+        requested_elevation_deg=-0.5,
+        range_tolerance_m=0.0001,
+        angle_tolerance_deg=0.00001,
+    )
+    assert result["spatial_validation_pass"] is True
+    assert abs(wrapped_angle_error_deg(-179.999999, 179.999999)) < 0.00001
+
+
+@pytest.mark.parametrize("bad", (None, float("nan"), float("inf")))
+def test_spatial_validation_rejects_null_and_nonfinite_gt(bad) -> None:
+    point = list(spatial_frd(500.0, 0.0, 0.0))
+    point[2] = bad
+    with pytest.raises(ValueError, match="gt_down_m"):
+        compute_spatial_validation(
+            _spatial_records((point,)),
+            warmup_count=0,
+            analysis_count=1,
+            requested_range_m=500.0,
+            requested_bearing_deg=0.0,
+            requested_elevation_deg=0.0,
+            range_tolerance_m=0.0001,
+            angle_tolerance_deg=0.00001,
+        )
+
+
+def test_spatial_tolerances_change_plan_identity() -> None:
+    kwargs = dict(
+        sweep_id="s",
+        commit_sha="a" * 40,
+        branch="sim/test",
+        repository_name="repo",
+        attitude_mode="ofat",
+        axis_ranges=(),
+        range_values=(Decimal("500"),),
+        bearing_values=(Decimal("0"),),
+        elevation_values=(Decimal("0"),),
+        repetitions=1,
+        seed=1,
+        case_order="canonical",
+        invalid_spatial_policy="fail",
+        max_cases=2,
+        contract=CameraContract(),
+    )
+    first, cases = build_sweep_plan(**kwargs)
+    second, second_cases = build_sweep_plan(
+        **kwargs, spatial_range_tolerance_m=0.0002
+    )
+    assert first["plan_hash"] != second["plan_hash"]
+    assert cases[0]["case_hash"] != second_cases[0]["case_hash"]
+    assert cases[0]["payload"]["target_static_for_research"] is True

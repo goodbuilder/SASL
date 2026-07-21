@@ -105,6 +105,25 @@ CASE_CSV_COLUMNS = (
     "corrected_intersection_angle_min_deg",
     "corrected_raw_median_ratio",
     "corrected_improvement_percent",
+    "requested_range_m",
+    "requested_bearing_deg",
+    "requested_elevation_deg",
+    "actual_range_m_median",
+    "actual_bearing_deg_median",
+    "actual_elevation_deg_median",
+    "actual_range_m_min",
+    "actual_range_m_max",
+    "actual_bearing_deg_min",
+    "actual_bearing_deg_max",
+    "actual_elevation_deg_min",
+    "actual_elevation_deg_max",
+    "spatial_range_error_abs_max_m",
+    "spatial_bearing_error_abs_max_deg",
+    "spatial_elevation_error_abs_max_deg",
+    "spatial_range_tolerance_m",
+    "spatial_angle_tolerance_deg",
+    "spatial_validation_pass",
+    "spatial_validation_sample_count",
 )
 
 
@@ -296,8 +315,25 @@ def spatial_from_frd(point: Sequence[float]) -> tuple[float, float, float]:
     return (
         radius,
         math.degrees(math.atan2(right, forward)),
-        math.degrees(math.asin(-down / radius)),
+        math.degrees(math.atan2(-down, math.hypot(forward, right))),
     )
+
+
+def wrapped_angle_error_deg(actual_deg: float, requested_deg: float) -> float:
+    if not math.isfinite(actual_deg) or not math.isfinite(requested_deg):
+        raise ValueError("angles must be finite")
+    return (actual_deg - requested_deg + 180.0) % 360.0 - 180.0
+
+
+def validate_spatial_tolerances(
+    range_tolerance_m: float, angle_tolerance_deg: float
+) -> None:
+    if not all(math.isfinite(value) for value in (range_tolerance_m, angle_tolerance_deg)):
+        raise ValueError("spatial tolerances must be finite")
+    if not 0.0 < range_tolerance_m <= 0.01:
+        raise ValueError("spatial range tolerance must be within (0, 0.01] m")
+    if not 0.0 < angle_tolerance_deg <= 0.001:
+        raise ValueError("spatial angle tolerance must be within (0, 0.001] deg")
 
 
 @dataclass(frozen=True)
@@ -427,6 +463,8 @@ def _case_payload(
     repetition_index: int,
     seed: int,
     contract: CameraContract,
+    spatial_range_tolerance_m: float,
+    spatial_angle_tolerance_deg: float,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     point_frd = spatial_frd(float(range_value), float(bearing_value), float(elevation_value))
     preflight = fov_preflight(contract=contract, attitude=attitude, point_frd=point_frd)
@@ -437,6 +475,10 @@ def _case_payload(
         "schema_version": S2_SWEEP_SCHEMA_VERSION,
         "observation_mode": "ideal_reference_point",
         "trajectory_mode": "static_gazebo_reference_point",
+        "target_physics_mode": "static_model",
+        "target_static_for_research": True,
+        "spatial_range_tolerance_m": spatial_range_tolerance_m,
+        "spatial_angle_tolerance_deg": spatial_angle_tolerance_deg,
         "attitude_source_deg": {
             name: {"decimal": decimal_text(attitude[name]), "value": float(attitude[name])}
             for name in ATTITUDE_AXES
@@ -478,6 +520,8 @@ def build_sweep_plan(
     invalid_spatial_policy: str,
     max_cases: int,
     contract: CameraContract,
+    spatial_range_tolerance_m: float = 0.0001,
+    spatial_angle_tolerance_deg: float = 0.00001,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if not str(sweep_id).strip() or not str(repository_name).strip():
         raise ValueError("sweep_id and repository_name must be non-empty")
@@ -490,6 +534,9 @@ def build_sweep_plan(
     if max_cases <= 0:
         raise ValueError("max_cases must be positive")
     contract.validate()
+    validate_spatial_tolerances(
+        spatial_range_tolerance_m, spatial_angle_tolerance_deg
+    )
     for value in range_values:
         if value <= 0:
             raise ValueError("range values must be positive")
@@ -515,6 +562,8 @@ def build_sweep_plan(
                             repetition_index=repetition_index,
                             seed=seed,
                             contract=contract,
+                            spatial_range_tolerance_m=spatial_range_tolerance_m,
+                            spatial_angle_tolerance_deg=spatial_angle_tolerance_deg,
                         )
                         digest = sha256_bytes(canonical_json(payload).encode("utf-8"))[:16]
                         item = {
@@ -560,6 +609,10 @@ def build_sweep_plan(
         "camera_contract": contract.payload(),
         "observation_mode": "ideal_reference_point",
         "trajectory_mode": "static_gazebo_reference_point",
+        "target_physics_mode": "static_model",
+        "target_static_for_research": True,
+        "spatial_range_tolerance_m": spatial_range_tolerance_m,
+        "spatial_angle_tolerance_deg": spatial_angle_tolerance_deg,
         "attitude_case_count": len(attitudes),
         "spatial_cell_count": spatial_count,
         "total_planned": total_requested,
@@ -620,23 +673,31 @@ def _finite_column(records: Sequence[Mapping[str, Any]], name: str, *, absolute:
     return values
 
 
-def compute_case_statistics(
+def analysis_window(
     records: Sequence[Mapping[str, Any]], *, warmup_count: int, analysis_count: int
-) -> dict[str, Any]:
+) -> tuple[list[Mapping[str, Any]], int]:
     if warmup_count < 0 or analysis_count <= 0:
         raise ValueError("sample window counts are invalid")
     eligible = sorted(
-        (record for record in records if record["sample_eligible"] is True),
+        (record for record in records if record.get("sample_eligible") is True),
         key=lambda record: int(record["record_sequence"]),
     )
     if len(eligible) < warmup_count + analysis_count:
         raise ValueError("insufficient eligible samples")
-    window = eligible[warmup_count : warmup_count + analysis_count]
+    return eligible[warmup_count : warmup_count + analysis_count], len(eligible)
+
+
+def compute_case_statistics(
+    records: Sequence[Mapping[str, Any]], *, warmup_count: int, analysis_count: int
+) -> dict[str, Any]:
+    window, eligible_count = analysis_window(
+        records, warmup_count=warmup_count, analysis_count=analysis_count
+    )
     result: dict[str, Any] = {
         "analysis_sample_count": len(window),
-        "total_eligible_count": len(eligible),
+        "total_eligible_count": eligible_count,
         "warmup_excluded_count": warmup_count,
-        "invalid_record_count": len(records) - len(eligible),
+        "invalid_record_count": len(records) - eligible_count,
     }
     for prefix in ("raw", "corrected"):
         position = _finite_column(window, f"{prefix}_position_error_m")
@@ -663,6 +724,82 @@ def compute_case_statistics(
         (raw - corrected) * 100.0 / raw if raw != 0.0 else 0.0
     )
     return result
+
+
+def compute_spatial_validation(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    warmup_count: int,
+    analysis_count: int,
+    requested_range_m: float,
+    requested_bearing_deg: float,
+    requested_elevation_deg: float,
+    range_tolerance_m: float,
+    angle_tolerance_deg: float,
+) -> dict[str, Any]:
+    validate_spatial_tolerances(range_tolerance_m, angle_tolerance_deg)
+    requested = (
+        float(requested_range_m),
+        float(requested_bearing_deg),
+        float(requested_elevation_deg),
+    )
+    if not all(math.isfinite(value) for value in requested) or requested[0] <= 0.0:
+        raise ValueError("requested spatial cell must be finite with positive range")
+    window, _eligible_count = analysis_window(
+        records, warmup_count=warmup_count, analysis_count=analysis_count
+    )
+    actual_ranges: list[float] = []
+    actual_bearings: list[float] = []
+    actual_elevations: list[float] = []
+    range_errors: list[float] = []
+    bearing_errors: list[float] = []
+    elevation_errors: list[float] = []
+    for record in window:
+        point = []
+        for field in ("gt_forward_m", "gt_right_m", "gt_down_m"):
+            value = record.get(field)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(f"spatial validation field {field} must be finite")
+            value = float(value)
+            if not math.isfinite(value):
+                raise ValueError(f"spatial validation field {field} must be finite")
+            point.append(value)
+        actual_range, actual_bearing, actual_elevation = spatial_from_frd(point)
+        actual_ranges.append(actual_range)
+        actual_bearings.append(actual_bearing)
+        actual_elevations.append(actual_elevation)
+        range_errors.append(abs(actual_range - requested[0]))
+        bearing_errors.append(abs(wrapped_angle_error_deg(actual_bearing, requested[1])))
+        elevation_errors.append(abs(actual_elevation - requested[2]))
+    range_max = max(range_errors)
+    bearing_max = max(bearing_errors)
+    elevation_max = max(elevation_errors)
+    return {
+        "requested_range_m": requested[0],
+        "requested_bearing_deg": requested[1],
+        "requested_elevation_deg": requested[2],
+        "actual_range_m_median": _median(actual_ranges),
+        "actual_bearing_deg_median": _median(actual_bearings),
+        "actual_elevation_deg_median": _median(actual_elevations),
+        "actual_range_m_min": min(actual_ranges),
+        "actual_range_m_max": max(actual_ranges),
+        "actual_bearing_deg_min": min(actual_bearings),
+        "actual_bearing_deg_max": max(actual_bearings),
+        "actual_elevation_deg_min": min(actual_elevations),
+        "actual_elevation_deg_max": max(actual_elevations),
+        "spatial_range_error_abs_max_m": range_max,
+        "spatial_bearing_error_abs_max_deg": bearing_max,
+        "spatial_elevation_error_abs_max_deg": elevation_max,
+        "spatial_range_tolerance_m": range_tolerance_m,
+        "spatial_angle_tolerance_deg": angle_tolerance_deg,
+        "spatial_validation_pass": (
+            len(window) == analysis_count
+            and range_max <= range_tolerance_m
+            and bearing_max <= angle_tolerance_deg
+            and elevation_max <= angle_tolerance_deg
+        ),
+        "spatial_validation_sample_count": len(window),
+    }
 
 
 def _load_json(path: Path) -> dict[str, Any]:
@@ -694,6 +831,8 @@ def validate_r2_artifacts(
         raise ValueError("R2 artifact is incomplete: " + ", ".join(missing))
     if (directory / "RUN_INCOMPLETE").exists():
         raise ValueError("R2 RUN_INCOMPLETE marker remains")
+    if (directory / "RUN_FINALIZED_INVALID").exists():
+        raise ValueError("R2 VALID and INVALID markers conflict")
     metadata = _load_json(directory / "run_metadata.json")
     summary = _load_json(directory / "run_summary.json")
     expected_metadata = {
@@ -709,6 +848,13 @@ def validate_r2_artifacts(
             raise ValueError(f"R2 metadata mismatch: {key}")
     if summary.get("run_valid") is not True:
         raise ValueError("R2 run is invalid")
+    for key, value in (
+        ("schema_version", RESEARCH_SCHEMA_VERSION),
+        ("run_id", expected_run_id),
+        ("case_id", expected_case_id),
+    ):
+        if summary.get(key) != value:
+            raise ValueError(f"R2 summary mismatch: {key}")
     if summary.get("shutdown_drain_status") != "SUCCESS":
         raise ValueError("R2 shutdown did not drain successfully")
     lines = (directory / "pair_records.jsonl").read_text(encoding="utf-8").splitlines()
@@ -758,6 +904,14 @@ def validate_r2_artifacts(
     discarded = int(summary.get("discarded", -1))
     if not (accepted == processed + discarded == len(records)):
         raise ValueError("R2 terminal accounting mismatch")
+    for field in (
+        "terminal_record_count",
+        "jsonl_line_count",
+        "csv_data_row_count",
+        "unique_pair_key_count",
+    ):
+        if int(summary.get(field, -1)) != len(records):
+            raise ValueError(f"R2 summary count mismatch: {field}")
     eligible_count = sum(record["sample_eligible"] for record in records)
     if eligible_count < minimum_eligible:
         raise ValueError("insufficient eligible samples")
@@ -788,6 +942,7 @@ def build_launch_command(
         "stereo_ground_sim.launch.py",
         "observation_mode:=ideal_reference_point",
         "enable_research_recording:=true",
+        "target_static_for_research:=true",
         f"research_output_dir:={Path(attempt_dir).resolve() / 'recording'}",
         f"research_run_id:={sweep_id}",
         f"research_case_id:={case['case_id']}",
@@ -872,11 +1027,13 @@ __all__ = [
     "S2_SWEEP_SCHEMA_VERSION",
     "TERMINAL_STATUSES",
     "atomic_write_json",
+    "analysis_window",
     "build_attitude_cases",
     "build_launch_command",
     "build_sweep_plan",
     "canonical_json",
     "compute_case_statistics",
+    "compute_spatial_validation",
     "decimal_range",
     "decimal_text",
     "effective_rpy",
@@ -890,6 +1047,8 @@ __all__ = [
     "sha256_file",
     "spatial_frd",
     "spatial_from_frd",
+    "validate_spatial_tolerances",
+    "wrapped_angle_error_deg",
     "validate_r2_artifacts",
     "write_case_csv",
     "write_plan",

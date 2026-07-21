@@ -34,7 +34,7 @@ from stereo_ground_sim.correction_sweep import (  # noqa: E402
     build_sweep_plan,
     canonical_json,
     compute_case_statistics,
-    latest_valid_attempt,
+    compute_spatial_validation,
     next_attempt_directory,
     parse_attitude_axis_range,
     parse_numeric_values,
@@ -277,6 +277,251 @@ def validate_resume_plan(
             raise ValueError(f"resume plan mismatch: {field}")
 
 
+def _numeric_attempts(case_dir: Path) -> list[tuple[int, Path]]:
+    attempts = []
+    for child in Path(case_dir).glob("attempt-*"):
+        try:
+            number = int(child.name.removeprefix("attempt-"))
+        except ValueError:
+            continue
+        if child.is_dir():
+            attempts.append((number, child))
+    return sorted(attempts)
+
+
+def inspect_sweep_marker_state(output_dir: Path) -> str:
+    output = Path(output_dir)
+    present = {
+        name
+        for name in (
+            "SWEEP_PLAN_READY",
+            "SWEEP_INCOMPLETE",
+            "SWEEP_FINALIZED_VALID",
+            "SWEEP_FINALIZED_INVALID",
+        )
+        if (output / name).exists()
+    }
+    if len(present) > 1:
+        raise ValueError("contradictory sweep markers: " + ", ".join(sorted(present)))
+    if not present:
+        return "EMPTY"
+    return {
+        "SWEEP_PLAN_READY": "PLAN_READY",
+        "SWEEP_INCOMPLETE": "RUNNING",
+        "SWEEP_FINALIZED_VALID": "FINAL_VALID",
+        "SWEEP_FINALIZED_INVALID": "FINAL_INVALID",
+    }[next(iter(present))]
+
+
+def enter_running_state(output_dir: Path) -> None:
+    output = Path(output_dir)
+    state = inspect_sweep_marker_state(output)
+    incomplete = output / "SWEEP_INCOMPLETE"
+    if state == "RUNNING":
+        return
+    if state == "EMPTY":
+        with incomplete.open("x", encoding="utf-8"):
+            pass
+        return
+    source = {
+        "PLAN_READY": output / "SWEEP_PLAN_READY",
+        "FINAL_VALID": output / "SWEEP_FINALIZED_VALID",
+        "FINAL_INVALID": output / "SWEEP_FINALIZED_INVALID",
+    }[state]
+    os.replace(source, incomplete)
+
+
+def validate_sweep_summary_marker(output_dir: Path, marker_state: str) -> dict[str, Any] | None:
+    if marker_state not in {"FINAL_VALID", "FINAL_INVALID"}:
+        return None
+    summary_path = Path(output_dir) / "sweep_summary.json"
+    if not summary_path.is_file():
+        raise ValueError("final sweep marker exists without sweep_summary.json")
+    summary = load_json(summary_path)
+    expected_valid = marker_state == "FINAL_VALID"
+    if summary.get("run_valid") is not expected_valid:
+        raise ValueError("sweep marker contradicts summary run_valid")
+    if summary.get("finalization_status") != ("VALID" if expected_valid else "INVALID"):
+        raise ValueError("sweep marker contradicts summary finalization_status")
+    return summary
+
+
+def _attempt_spatial_validation(
+    case: Mapping[str, Any],
+    records: Sequence[Mapping[str, Any]],
+    *,
+    warmup_count: int,
+    analysis_count: int,
+) -> dict[str, Any]:
+    payload = case["payload"]
+    spatial = payload["spatial"]
+    if payload.get("trajectory_mode") != "static_gazebo_reference_point":
+        raise ValueError("case trajectory mode is not static")
+    if payload.get("target_physics_mode") != "static_model":
+        raise ValueError("case target physics mode is not static_model")
+    if payload.get("target_static_for_research") is not True:
+        raise ValueError("case target_static_for_research must be true")
+    result = compute_spatial_validation(
+        records,
+        warmup_count=warmup_count,
+        analysis_count=analysis_count,
+        requested_range_m=spatial["range_m"]["value"],
+        requested_bearing_deg=spatial["bearing_deg"]["value"],
+        requested_elevation_deg=spatial["elevation_deg"]["value"],
+        range_tolerance_m=payload["spatial_range_tolerance_m"],
+        angle_tolerance_deg=payload["spatial_angle_tolerance_deg"],
+    )
+    if not result["spatial_validation_pass"]:
+        raise ValueError(
+            "spatial_cell_mismatch:"
+            f"range_max_abs_error_m={result['spatial_range_error_abs_max_m']},"
+            f"bearing_max_abs_error_deg={result['spatial_bearing_error_abs_max_deg']},"
+            f"elevation_max_abs_error_deg={result['spatial_elevation_error_abs_max_deg']},"
+            f"range_tolerance_m={result['spatial_range_tolerance_m']},"
+            f"angle_tolerance_deg={result['spatial_angle_tolerance_deg']}"
+        )
+    return result
+
+
+def validated_latest_attempt(
+    *,
+    case: Mapping[str, Any],
+    case_dir: Path,
+    provenance: Mapping[str, str],
+    sweep_id: str,
+    warmup_count: int,
+    analysis_count: int,
+    plan_hash: str | None = None,
+) -> tuple[Path, dict[str, Any]] | None:
+    inspection = inspect_latest_attempt(
+        case=case,
+        case_dir=case_dir,
+        provenance=provenance,
+        sweep_id=sweep_id,
+        warmup_count=warmup_count,
+        analysis_count=analysis_count,
+        plan_hash=plan_hash,
+    )
+    if inspection["classification"] != "VALID":
+        return None
+    return inspection["path"], inspection["state"]
+
+
+def inspect_latest_attempt(
+    *,
+    case: Mapping[str, Any],
+    case_dir: Path,
+    provenance: Mapping[str, str],
+    sweep_id: str,
+    warmup_count: int,
+    analysis_count: int,
+    plan_hash: str | None = None,
+) -> dict[str, Any]:
+    attempts = _numeric_attempts(case_dir)
+    if not attempts:
+        return {"classification": "MISSING", "path": None, "state": None, "reason": "no_attempt"}
+    _number, attempt = attempts[-1]
+    state_path = attempt / "attempt_state.json"
+    if not state_path.is_file():
+        return {
+            "classification": "INCOMPLETE",
+            "path": attempt,
+            "state": None,
+            "reason": "attempt_state_missing",
+        }
+    try:
+        state = load_json(state_path)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return {
+            "classification": "UNKNOWN",
+            "path": attempt,
+            "state": None,
+            "reason": f"attempt_state_unreadable:{type(exc).__name__}:{exc}",
+        }
+    recording = attempt / "recording"
+    marker_names = {
+        name
+        for name in ("RUN_INCOMPLETE", "RUN_FINALIZED_VALID", "RUN_FINALIZED_INVALID")
+        if (recording / name).exists()
+    }
+    if len(marker_names) > 1:
+        return {
+            "classification": "UNKNOWN",
+            "path": attempt,
+            "state": state,
+            "reason": "contradictory_recording_markers:" + ",".join(sorted(marker_names)),
+        }
+    attempt_status = state.get("attempt_status")
+    if attempt_status == "RUNNING":
+        return {
+            "classification": "INCOMPLETE",
+            "path": attempt,
+            "state": state,
+            "reason": "attempt_state_running",
+        }
+    if attempt_status not in {None, "FINALIZED"}:
+        return {
+            "classification": "UNKNOWN",
+            "path": attempt,
+            "state": state,
+            "reason": f"unknown_attempt_status:{attempt_status}",
+        }
+    if "RUN_INCOMPLETE" in marker_names or not marker_names:
+        return {
+            "classification": "INCOMPLETE",
+            "path": attempt,
+            "state": state,
+            "reason": "recording_not_finalized",
+        }
+    if "RUN_FINALIZED_INVALID" in marker_names or state.get("case_valid") is False:
+        return {
+            "classification": "INVALID",
+            "path": attempt,
+            "state": state,
+            "reason": state.get("failure_reason") or "attempt_marked_invalid",
+        }
+    try:
+        if state.get("case_valid") is not True:
+            raise ValueError("attempt state is not finalized valid")
+        if state.get("case_id") != case["case_id"]:
+            raise ValueError("stored attempt case ID mismatch")
+        if state.get("case_hash") != case["case_hash"]:
+            raise ValueError("stored attempt case hash mismatch")
+        if plan_hash is not None and state.get("plan_hash") != plan_hash:
+            raise ValueError("stored attempt plan hash mismatch")
+        records, _summary = validate_r2_artifacts(
+            recording,
+            expected_sha=provenance["commit_sha"],
+            expected_branch=provenance["branch"],
+            expected_run_id=sweep_id,
+            expected_case_id=case["case_id"],
+            minimum_eligible=warmup_count + analysis_count,
+        )
+        statistics = compute_case_statistics(
+            records,
+            warmup_count=warmup_count,
+            analysis_count=analysis_count,
+        )
+        statistics.update(
+            _attempt_spatial_validation(
+                case,
+                records,
+                warmup_count=warmup_count,
+                analysis_count=analysis_count,
+            )
+        )
+        if state.get("statistics") != statistics:
+            raise ValueError("stored case statistics do not match R2 records")
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        return {
+            "classification": "INVALID",
+            "path": attempt,
+            "state": state,
+            "reason": f"semantic_or_spatial_validation_failed:{type(exc).__name__}:{exc}",
+        }
+    return {"classification": "VALID", "path": attempt, "state": state, "reason": ""}
+
+
 def _case_row(case: Mapping[str, Any], attempt: int, state: Mapping[str, Any]) -> dict[str, Any]:
     payload = case["payload"]
     row = {
@@ -313,6 +558,8 @@ def execute_case_attempt(
     case_timeout_s: float,
     shutdown_timeout_s: float,
     launcher: Any,
+    plan_hash: str | None = None,
+    predecessor_inspection: Mapping[str, Any] | None = None,
     monotonic=time.monotonic,
     sleeper=time.sleep,
 ) -> dict[str, Any]:
@@ -337,8 +584,11 @@ def execute_case_attempt(
     state: dict[str, Any] = {
         "schema_version": S2_SWEEP_SCHEMA_VERSION,
         "case_id": case["case_id"],
+        "case_hash": case["case_hash"],
+        "plan_hash": plan_hash,
         "attempt": attempt_number,
         "attempt_started_utc": utc_now(),
+        "attempt_status": "RUNNING",
         "command": command,
         "command_sha256": sha256_bytes(canonical_json(command).encode("utf-8")),
         "cwd": str(Path(repository_root).resolve()),
@@ -347,6 +597,15 @@ def execute_case_attempt(
         "case_valid": False,
         "failure_reason": "",
         "signal_escalation": [],
+        "resume_predecessor": (
+            {
+                "classification": predecessor_inspection.get("classification"),
+                "path": str(predecessor_inspection.get("path")),
+                "reason": predecessor_inspection.get("reason"),
+            }
+            if predecessor_inspection and predecessor_inspection.get("path") is not None
+            else None
+        ),
     }
     atomic_write_json(attempt_dir / "attempt_state.json", state)
     process = None
@@ -387,6 +646,14 @@ def execute_case_attempt(
         statistics = compute_case_statistics(
             records, warmup_count=warmup_count, analysis_count=analysis_count
         )
+        statistics.update(
+            _attempt_spatial_validation(
+                case,
+                records,
+                warmup_count=warmup_count,
+                analysis_count=analysis_count,
+            )
+        )
         state.update(
             {
                 "case_valid": True,
@@ -394,6 +661,7 @@ def execute_case_attempt(
                 "r2_summary_sha256": sha256_file(recording_dir / "run_summary.json"),
                 "r2_terminal_record_count": summary["terminal_record_count"],
                 "attempt_finished_utc": utc_now(),
+                "attempt_status": "FINALIZED",
             }
         )
     except Exception as exc:
@@ -407,6 +675,7 @@ def execute_case_attempt(
                 "failure_reason": f"{type(exc).__name__}: {exc}",
                 "failure_traceback": traceback.format_exc(),
                 "attempt_finished_utc": utc_now(),
+                "attempt_status": "FINALIZED",
             }
         )
     finally:
@@ -423,15 +692,29 @@ def finalize_sweep(
     cases: Sequence[Mapping[str, Any]],
     rows: Sequence[Mapping[str, Any]],
     counters: Mapping[str, int],
+    case_csv_writer=write_case_csv,
+    json_writer=atomic_write_json,
+    hash_file=sha256_file,
+    marker_replace=os.replace,
 ) -> dict[str, Any]:
     output = Path(output_dir)
-    write_case_csv(output / "sweep_cases.csv", rows)
+    if inspect_sweep_marker_state(output) != "RUNNING":
+        raise ValueError("sweep must be RUNNING before finalization")
+    case_csv_writer(output / "sweep_cases.csv", rows)
     valid_ids = {row["case_id"] for row in rows if row.get("case_valid") is True}
     planned_ids = {case["case_id"] for case in cases}
-    active_incomplete = [
-        str(path)
-        for path in (output / "cases").glob("*/attempt-*/recording/RUN_INCOMPLETE")
-    ] if (output / "cases").exists() else []
+    active_incomplete = []
+    for row in rows:
+        marker = (
+            output
+            / "cases"
+            / str(row["case_id"])
+            / f"attempt-{int(row['attempt']):04d}"
+            / "recording"
+            / "RUN_INCOMPLETE"
+        )
+        if marker.is_file():
+            active_incomplete.append(str(marker))
     invalid_reasons = []
     if valid_ids != planned_ids:
         invalid_reasons.append("not_all_runnable_cases_have_valid_attempt")
@@ -439,6 +722,11 @@ def finalize_sweep(
         invalid_reasons.append("active_incomplete_attempt")
     if len(planned_ids) != len(cases):
         invalid_reasons.append("duplicate_case_id")
+    row_ids = [row["case_id"] for row in rows]
+    if len(rows) != len(cases):
+        invalid_reasons.append("case_summary_row_count_mismatch")
+    if len(set(row_ids)) != len(row_ids):
+        invalid_reasons.append("duplicate_case_summary_row")
     run_valid = not invalid_reasons
     summary = {
         "schema_version": S2_SWEEP_SCHEMA_VERSION,
@@ -455,16 +743,21 @@ def finalize_sweep(
         "case_summary_row_count": len(rows),
         "active_incomplete_attempts": active_incomplete,
         **dict(counters),
-        "sweep_plan_sha256": sha256_file(output / "sweep_plan.json"),
-        "sweep_cases_jsonl_sha256": sha256_file(output / "sweep_cases.jsonl"),
-        "sweep_cases_csv_sha256": sha256_file(output / "sweep_cases.csv"),
+        "target_physics_mode": plan["target_physics_mode"],
+        "target_static_for_research": plan["target_static_for_research"],
+        "spatial_range_tolerance_m": plan["spatial_range_tolerance_m"],
+        "spatial_angle_tolerance_deg": plan["spatial_angle_tolerance_deg"],
+        "sweep_plan_sha256": hash_file(output / "sweep_plan.json"),
+        "sweep_cases_jsonl_sha256": hash_file(output / "sweep_cases.jsonl"),
+        "sweep_cases_csv_sha256": hash_file(output / "sweep_cases.csv"),
     }
-    atomic_write_json(output / "sweep_summary.json", summary)
+    json_writer(output / "sweep_summary.json", summary)
     marker = output / ("SWEEP_FINALIZED_VALID" if run_valid else "SWEEP_FINALIZED_INVALID")
-    marker.touch(exist_ok=False)
+    opposite = output / ("SWEEP_FINALIZED_INVALID" if run_valid else "SWEEP_FINALIZED_VALID")
+    if opposite.exists():
+        raise ValueError("opposite final marker exists during finalization")
     incomplete = output / "SWEEP_INCOMPLETE"
-    if incomplete.exists():
-        incomplete.unlink()
+    marker_replace(incomplete, marker)
     return summary
 
 
@@ -493,6 +786,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--camera-update-rate-hz", type=float, default=20.0)
     parser.add_argument("--camera-clip-near-m", type=float, default=0.1)
     parser.add_argument("--camera-clip-far-m", type=float, default=2500.0)
+    parser.add_argument("--spatial-range-tolerance-m", type=float, default=0.0001)
+    parser.add_argument("--spatial-angle-tolerance-deg", type=float, default=0.00001)
     parser.add_argument("--warmup-eligible-samples", type=int, default=20)
     parser.add_argument("--analysis-eligible-samples", type=int, default=60)
     parser.add_argument("--case-timeout-s", type=float, default=60.0)
@@ -531,6 +826,8 @@ def _build_from_args(args: argparse.Namespace):
         invalid_spatial_policy=args.invalid_spatial_policy,
         max_cases=args.max_cases,
         contract=contract,
+        spatial_range_tolerance_m=args.spatial_range_tolerance_m,
+        spatial_angle_tolerance_deg=args.spatial_angle_tolerance_deg,
     )
 
 
@@ -546,11 +843,40 @@ def main(argv: Sequence[str] | None = None, *, launcher: Any | None = None) -> i
         args.output_dir, repository_root=REPOSITORY_ROOT, resume=args.resume
     )
     plan, cases = _build_from_args(args)
+    if args.warmup_eligible_samples < 0 or args.analysis_eligible_samples <= 0:
+        raise ValueError("eligible sample window must be nonnegative/positive")
+    if args.case_timeout_s <= 0 or args.shutdown_timeout_s <= 0:
+        raise ValueError("timeouts must be positive")
     existing_plan = output / "sweep_plan.json"
     if args.resume:
+        marker_state = inspect_sweep_marker_state(output)
+        marker_summary = validate_sweep_summary_marker(output, marker_state)
         stored = load_json(existing_plan)
         validate_resume_plan(stored, plan)
-        if (output / "SWEEP_FINALIZED_VALID").is_file():
+        completed = []
+        if marker_state == "FINAL_VALID":
+            completed = [
+                validated_latest_attempt(
+                    case=case,
+                    case_dir=output / "cases" / case["case_id"],
+                    provenance=provenance,
+                    sweep_id=args.sweep_id,
+                    warmup_count=args.warmup_eligible_samples,
+                    analysis_count=args.analysis_eligible_samples,
+                    plan_hash=plan["plan_hash"],
+                )
+                for case in cases
+            ]
+            stored_summary = marker_summary or load_json(output / "sweep_summary.json")
+            summary_valid = (
+                stored_summary.get("run_valid") is True
+                and stored_summary.get("plan_hash") == plan["plan_hash"]
+                and stored_summary.get("case_summary_row_count") == len(cases)
+                and stored_summary.get("target_static_for_research") is True
+            )
+        else:
+            summary_valid = False
+        if completed and all(item is not None for item in completed) and summary_valid:
             response = {
                 "schema_version": S2_SWEEP_SCHEMA_VERSION,
                 "sweep_id": args.sweep_id,
@@ -568,20 +894,16 @@ def main(argv: Sequence[str] | None = None, *, launcher: Any | None = None) -> i
     if args.plan_only:
         if args.resume:
             write_plan(output, plan, cases)
-        (output / "SWEEP_PLAN_READY").touch(exist_ok=False)
+        if inspect_sweep_marker_state(output) == "EMPTY":
+            (output / "SWEEP_PLAN_READY").touch(exist_ok=False)
+        elif inspect_sweep_marker_state(output) != "PLAN_READY":
+            raise ValueError("plan-only output has incompatible marker state")
         print(canonical_json({"plan_hash": plan["plan_hash"], "total_runnable": len(cases)}, indent=2))
         return 0
     conflicts = conflicting_simulation_processes()
     if conflicts:
         raise RuntimeError("conflicting Simulation processes detected: " + canonical_json(conflicts))
-    if args.warmup_eligible_samples < 0 or args.analysis_eligible_samples <= 0:
-        raise ValueError("eligible sample window must be nonnegative/positive")
-    if args.case_timeout_s <= 0 or args.shutdown_timeout_s <= 0:
-        raise ValueError("timeouts must be positive")
-    if not args.resume:
-        (output / "SWEEP_INCOMPLETE").touch(exist_ok=False)
-    elif not (output / "SWEEP_INCOMPLETE").exists():
-        (output / "SWEEP_INCOMPLETE").touch(exist_ok=False)
+    enter_running_state(output)
     state = {
         "schema_version": S2_SWEEP_SCHEMA_VERSION,
         "sweep_id": args.sweep_id,
@@ -593,6 +915,10 @@ def main(argv: Sequence[str] | None = None, *, launcher: Any | None = None) -> i
         "analysis_eligible_samples": args.analysis_eligible_samples,
         "case_timeout_s": args.case_timeout_s,
         "shutdown_timeout_s": args.shutdown_timeout_s,
+        "target_physics_mode": plan["target_physics_mode"],
+        "target_static_for_research": plan["target_static_for_research"],
+        "spatial_range_tolerance_m": plan["spatial_range_tolerance_m"],
+        "spatial_angle_tolerance_deg": plan["spatial_angle_tolerance_deg"],
     }
     atomic_write_json(output / "sweep_state.json", state)
     gazebo_version = args.gazebo_version or resolve_gazebo_version()
@@ -607,10 +933,19 @@ def main(argv: Sequence[str] | None = None, *, launcher: Any | None = None) -> i
     execution_cases = sorted(cases, key=lambda item: item["execution_ordinal"])
     for case in execution_cases:
         case_dir = output / "cases" / case["case_id"]
-        valid_attempt = latest_valid_attempt(case_dir)
-        if valid_attempt is not None:
+        attempt_inspection = inspect_latest_attempt(
+            case=case,
+            case_dir=case_dir,
+            provenance=provenance,
+            sweep_id=args.sweep_id,
+            warmup_count=args.warmup_eligible_samples,
+            analysis_count=args.analysis_eligible_samples,
+            plan_hash=plan["plan_hash"],
+        )
+        if attempt_inspection["classification"] == "VALID":
+            valid_attempt = attempt_inspection["path"]
+            attempt_state = attempt_inspection["state"]
             counters["skipped_valid_count"] += 1
-            attempt_state = load_json(valid_attempt / "attempt_state.json")
             rows.append(_case_row(case, int(attempt_state["attempt"]), attempt_state))
             continue
         had_attempt = case_dir.exists() and any(case_dir.glob("attempt-*"))
@@ -630,6 +965,8 @@ def main(argv: Sequence[str] | None = None, *, launcher: Any | None = None) -> i
             case_timeout_s=args.case_timeout_s,
             shutdown_timeout_s=args.shutdown_timeout_s,
             launcher=launcher,
+            plan_hash=plan["plan_hash"],
+            predecessor_inspection=attempt_inspection,
         )
         rows.append(_case_row(case, int(attempt_state["attempt"]), attempt_state))
         if not should_launch_next(

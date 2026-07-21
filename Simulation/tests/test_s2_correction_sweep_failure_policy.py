@@ -220,3 +220,46 @@ def test_missing_case_row_finalizes_sweep_invalid(tmp_path: Path) -> None:
     assert summary["run_valid"] is False
     assert (tmp_path / "SWEEP_FINALIZED_INVALID").is_file()
     assert not (tmp_path / "SWEEP_FINALIZED_VALID").exists()
+
+
+def test_successful_retry_ignores_preserved_historical_incomplete_attempt(
+    tmp_path: Path,
+) -> None:
+    module = _cli_module()
+    plan, cases = _plan()
+    write_plan(tmp_path, plan, cases)
+    historical = tmp_path / "cases" / cases[0]["case_id"] / "attempt-0001" / "recording"
+    historical.mkdir(parents=True)
+    (historical / "RUN_INCOMPLETE").touch()
+    (tmp_path / "SWEEP_INCOMPLETE").touch()
+    rows = [{"case_id": cases[0]["case_id"], "attempt": 2, "case_valid": True}]
+    summary = module.finalize_sweep(
+        output_dir=tmp_path,
+        plan=plan,
+        cases=cases,
+        rows=rows,
+        counters={"launch_count": 1},
+    )
+    assert summary["run_valid"] is True
+    assert summary["active_incomplete_attempts"] == []
+    assert (historical / "RUN_INCOMPLETE").is_file()
+    assert (tmp_path / "SWEEP_FINALIZED_VALID").is_file()
+    assert not (tmp_path / "SWEEP_FINALIZED_INVALID").exists()
+
+
+def test_repeated_invalid_finalization_is_idempotent(tmp_path: Path) -> None:
+    module = _cli_module()
+    plan, cases = _plan()
+    write_plan(tmp_path, plan, cases)
+    for _ in range(2):
+        module.enter_running_state(tmp_path)
+        summary = module.finalize_sweep(
+            output_dir=tmp_path,
+            plan=plan,
+            cases=cases,
+            rows=[],
+            counters={"launch_count": 0},
+        )
+        assert summary["run_valid"] is False
+    assert (tmp_path / "SWEEP_FINALIZED_INVALID").is_file()
+    assert not (tmp_path / "SWEEP_FINALIZED_VALID").exists()

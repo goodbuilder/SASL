@@ -2,6 +2,7 @@ import json
 import math
 import os
 import tempfile
+import xml.etree.ElementTree as ET
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, OpaqueFunction
@@ -27,6 +28,50 @@ def _int_config(context, name):
 
 def _bool_config(context, name):
     return LaunchConfiguration(name).perform(context).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bool_config_default(context, name, default):
+    return LaunchConfiguration(name, default="true" if default else "false").perform(context).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _set_target_include_static(world_xml, *, target_model_name, static_enabled):
+    """Set only the configured research target include's Gazebo static flag."""
+    root = ET.fromstring(world_xml)
+    expected_uri = f"model://{target_model_name}"
+    matches = [
+        include
+        for include in root.findall("./world/include")
+        if (include.findtext("uri") or "").strip() == expected_uri
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"expected exactly one target include for {expected_uri}, found {len(matches)}"
+        )
+    static_fields = matches[0].findall("static")
+    if len(static_fields) != 1:
+        raise ValueError(
+            f"target include {expected_uri} must contain exactly one static field"
+        )
+    current = (static_fields[0].text or "").strip().lower()
+    if current not in {"true", "false"}:
+        raise ValueError(f"target include {expected_uri} has invalid static value: {current}")
+    requested = "true" if static_enabled else "false"
+    static_fields[0].text = requested
+    generated = ET.tostring(root, encoding="unicode")
+    verified = ET.fromstring(generated)
+    verified_matches = [
+        include
+        for include in verified.findall("./world/include")
+        if (include.findtext("uri") or "").strip() == expected_uri
+    ]
+    if len(verified_matches) != 1 or (verified_matches[0].findtext("static") or "").strip().lower() != requested:
+        raise ValueError("generated target static contract verification failed")
+    return generated
 
 
 def _param_yaml_value(value):
@@ -265,6 +310,10 @@ def _generate_world(context):
     target_spawn_y_m = _float_config(context, "target_spawn_y_m")
     target_spawn_z_m = _float_config(context, "target_spawn_z_m")
     target_spawn_yaw_deg = _float_config(context, "target_spawn_yaw_deg")
+    target_model_name = LaunchConfiguration("target_model_name", default="x500_15m").perform(context)
+    target_static_for_research = _bool_config_default(
+        context, "target_static_for_research", False
+    )
     left_effective_rpy_deg, right_effective_rpy_deg = effective_optical_rpy_errors_deg(
         (
             _float_config(context, "left_roll_error_deg"),
@@ -335,6 +384,11 @@ def _generate_world(context):
             break
 
     world = world.replace("        <!-- GROUND_GRID_VISUALS -->", _ground_grid_visuals(), 1)
+    world = _set_target_include_static(
+        world,
+        target_model_name=target_model_name,
+        static_enabled=target_static_for_research,
+    )
 
     generated = os.path.join(tempfile.gettempdir(), "stereo_ground_drone_attitude_error.sdf")
     with open(generated, "w", encoding="utf-8") as handle:
@@ -491,6 +545,7 @@ def generate_launch_description():
             DeclareLaunchArgument("land_duration_s", default_value="10.0"),
             DeclareLaunchArgument("fly_target_in_gazebo", default_value="false"),
             DeclareLaunchArgument("target_model_name", default_value="x500_15m"),
+            DeclareLaunchArgument("target_static_for_research", default_value="false"),
             DeclareLaunchArgument("yolo_model_path", default_value=""),
             DeclareLaunchArgument("yolo_class_name", default_value="drone"),
             DeclareLaunchArgument("yolo_confidence", default_value="0.25"),

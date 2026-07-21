@@ -97,12 +97,18 @@ def _write_artifact(root: Path, records=None) -> Path:
         writer.writeheader()
         writer.writerows(records)
     summary = {
+        "schema_version": RESEARCH_SCHEMA_VERSION,
+        "run_id": RUN,
+        "case_id": CASE,
         "run_valid": True,
         "shutdown_drain_status": "SUCCESS",
         "accepted": len(records),
         "processed": len(records),
         "discarded": 0,
         "terminal_record_count": len(records),
+        "jsonl_line_count": len(records),
+        "csv_data_row_count": len(records),
+        "unique_pair_key_count": len(records),
         "pair_records_jsonl_sha256": _sha(root / "pair_records.jsonl"),
         "pair_records_csv_sha256": _sha(root / "pair_records.csv"),
         "run_metadata_sha256": _sha(root / "run_metadata.json"),
