@@ -159,6 +159,22 @@ def test_valid_r2_artifact_and_fixed_window_statistics(tmp_path: Path) -> None:
     assert statistics["corrected_improvement_percent"] == pytest.approx(90.0)
 
 
+def test_r2_artifact_rejects_extra_csv_column_even_with_updated_hash(tmp_path: Path) -> None:
+    path = _write_artifact(tmp_path / "recording")
+    records = [json.loads(line) for line in (path / "pair_records.jsonl").read_text().splitlines()]
+    with (path / "pair_records.csv").open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[*PAIR_RECORD_COLUMNS, "tampered"])
+        writer.writeheader()
+        for record in records:
+            writer.writerow({**record, "tampered": "adversarial"})
+    summary = json.loads((path / "run_summary.json").read_text())
+    summary["pair_records_csv_sha256"] = _sha(path / "pair_records.csv")
+    (path / "run_summary.json").write_text(json.dumps(summary) + "\n")
+
+    with pytest.raises(ValueError, match="R2 CSV schema mismatch"):
+        _validate(path)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     (

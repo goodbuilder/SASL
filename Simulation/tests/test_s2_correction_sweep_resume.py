@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import importlib.util
 from pathlib import Path
@@ -250,7 +251,12 @@ def test_completed_resume_revalidates_top_level_csv_hash_and_semantics(tmp_path:
         plan=plan,
         cases=cases,
         rows=[row],
-        counters={"launch_count": 1},
+        counters={
+            "skipped_valid_count": 0,
+            "retried_invalid_count": 0,
+            "newly_executed_count": 1,
+            "launch_count": 1,
+        },
     )
     completed = [(tmp_path / "cases" / cases[0]["case_id"] / "attempt-0001", state)]
     module.validate_final_sweep_artifacts(
@@ -263,6 +269,78 @@ def test_completed_resume_revalidates_top_level_csv_hash_and_semantics(tmp_path:
     with (tmp_path / "sweep_cases.csv").open("a", encoding="utf-8") as handle:
         handle.write("tampered\n")
     with pytest.raises(ValueError, match="hash mismatch"):
+        module.validate_final_sweep_artifacts(
+            output_dir=tmp_path,
+            plan=plan,
+            cases=cases,
+            completed=completed,
+            summary=summary,
+        )
+
+
+def test_completed_resume_rejects_extra_csv_column_and_summary_field(tmp_path: Path) -> None:
+    module = _cli_module()
+    plan, cases = build_sweep_plan(
+        sweep_id="sweep-strict-schema",
+        commit_sha="a" * 40,
+        branch="sim/test",
+        repository_name="repo",
+        attitude_mode="ofat",
+        axis_ranges=(),
+        range_values=(Decimal("500"),),
+        bearing_values=(Decimal("0"),),
+        elevation_values=(Decimal("0"),),
+        repetitions=1,
+        seed=0,
+        case_order="canonical",
+        invalid_spatial_policy="fail",
+        max_cases=2,
+        contract=CameraContract(),
+    )
+    write_plan(tmp_path, plan, cases)
+    module.enter_running_state(tmp_path)
+    state = {
+        "attempt": 1,
+        "case_id": cases[0]["case_id"],
+        "case_hash": cases[0]["case_hash"],
+        "plan_hash": plan["plan_hash"],
+        "case_valid": True,
+        "failure_reason": "",
+        "statistics": {},
+    }
+    summary = module.finalize_sweep(
+        output_dir=tmp_path,
+        plan=plan,
+        cases=cases,
+        rows=[module._case_row(cases[0], 1, state)],
+        counters={
+            "skipped_valid_count": 0,
+            "retried_invalid_count": 0,
+            "newly_executed_count": 1,
+            "launch_count": 1,
+        },
+    )
+    completed = [(tmp_path / "cases" / cases[0]["case_id"] / "attempt-0001", state)]
+    csv_path = tmp_path / "sweep_cases.csv"
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        original_rows = list(csv.DictReader(handle))
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=[*module.CASE_CSV_COLUMNS, "tampered"])
+        writer.writeheader()
+        for original in original_rows:
+            writer.writerow({**original, "tampered": "adversarial"})
+    summary["sweep_cases_csv_sha256"] = module.sha256_file(csv_path)
+    with pytest.raises(ValueError, match="CSV schema mismatch"):
+        module.validate_final_sweep_artifacts(
+            output_dir=tmp_path,
+            plan=plan,
+            cases=cases,
+            completed=completed,
+            summary=summary,
+        )
+
+    summary["tampered"] = True
+    with pytest.raises(ValueError, match="summary schema mismatch"):
         module.validate_final_sweep_artifacts(
             output_dir=tmp_path,
             plan=plan,

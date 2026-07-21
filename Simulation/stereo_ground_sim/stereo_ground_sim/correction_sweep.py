@@ -24,7 +24,7 @@ from .coordinate_frames import (
     nominal_camera_poses,
     project_world_point_to_pixel,
 )
-from .research_recording import RESEARCH_SCHEMA_VERSION
+from .research_recording import PAIR_RECORD_COLUMNS, RESEARCH_SCHEMA_VERSION
 
 
 S2_SWEEP_SCHEMA_VERSION = "s2_correction_sweep_v1"
@@ -890,7 +890,10 @@ def validate_r2_artifacts(
             raise ValueError("duplicate R2 pair key")
         keys.add(key)
     with (directory / "pair_records.csv").open("r", encoding="utf-8", newline="") as handle:
-        csv_rows = list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != PAIR_RECORD_COLUMNS:
+            raise ValueError("R2 CSV schema mismatch")
+        csv_rows = list(reader)
     if len(csv_rows) != len(records):
         raise ValueError("R2 JSONL and CSV row counts differ")
     if summary.get("pair_records_jsonl_sha256") != sha256_file(directory / "pair_records.jsonl"):

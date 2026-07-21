@@ -48,6 +48,36 @@ from stereo_ground_sim.correction_sweep import (  # noqa: E402
 )
 
 
+FINAL_SWEEP_SUMMARY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "sweep_id",
+        "plan_hash",
+        "commit_sha",
+        "branch",
+        "finalized_utc",
+        "run_valid",
+        "finalization_status",
+        "invalid_reasons",
+        "total_runnable",
+        "valid_case_count",
+        "case_summary_row_count",
+        "active_incomplete_attempts",
+        "skipped_valid_count",
+        "retried_invalid_count",
+        "newly_executed_count",
+        "launch_count",
+        "target_physics_mode",
+        "target_static_for_research",
+        "spatial_range_tolerance_m",
+        "spatial_angle_tolerance_deg",
+        "sweep_plan_sha256",
+        "sweep_cases_jsonl_sha256",
+        "sweep_cases_csv_sha256",
+    }
+)
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -294,6 +324,8 @@ def validate_final_sweep_artifacts(
     summary: Mapping[str, Any],
 ) -> None:
     output = Path(output_dir)
+    if set(summary) != FINAL_SWEEP_SUMMARY_FIELDS:
+        raise ValueError("completed sweep summary schema mismatch")
     expected_hashes = {
         "sweep_plan_sha256": sha256_file(output / "sweep_plan.json"),
         "sweep_cases_jsonl_sha256": sha256_file(output / "sweep_cases.jsonl"),
@@ -313,7 +345,10 @@ def validate_final_sweep_artifacts(
     if canonical_json(stored_cases) != canonical_json(expected_cases):
         raise ValueError("completed sweep case payload differs from regenerated cases")
     with (output / "sweep_cases.csv").open("r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+        if tuple(reader.fieldnames or ()) != CASE_CSV_COLUMNS:
+            raise ValueError("completed sweep CSV schema mismatch")
+        rows = list(reader)
     if len(rows) != len(cases) or len(completed) != len(cases):
         raise ValueError("completed sweep row or attempt count mismatch")
     expected_rows = {
