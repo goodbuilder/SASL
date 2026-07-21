@@ -51,6 +51,32 @@ accounting mismatch, duplicate pair key, or artifact failure invalidates the
 whole run.  This recorder is qualification infrastructure, not a correction
 search, train/validation split, or proof of detector performance.
 
+## Deterministic Ideal correction sweep (S2-R3)
+
+`scripts/run_correction_search_sweep.py` plans and executes deterministic,
+static-target `ideal_reference_point` qualification grids. It supports all
+twelve direct/common/relative optical RDF attitude source parameters, OFAT or
+Cartesian attitude cases, Decimal range/bearing/elevation inputs, repetitions,
+canonical or seeded execution order, pre-launch actual-camera FOV checks, and
+stable case IDs bound to a canonical plan hash. Target cells are authored in
+the fixed `baseline_center_frd` frame (Forward, Right, Down) and converted to
+Gazebo World ENU through the production coordinate helpers; World axes are not
+treated as FRD aliases.
+
+Each case launches from the verified clean repository root and enables the S2
+atomic recorder with the exact branch/SHA. The runner stops only its owned
+process group, waits for a fixed eligible-sample window, independently checks
+R2 schema/status/hash/accounting semantics, and writes case statistics plus a
+sweep-level VALID/INVALID marker outside the repository. Resume never deletes
+an attempt: valid cases are skipped and invalid/incomplete cases receive the
+next `attempt-NNNN` directory. Plan-only files contain no time, host, output
+path, PID, or attempt data and are byte-reproducible for identical inputs.
+
+This runner does not use the legacy latest-topic recorder, YOLO, dynamic PX4
+motion, correction fitting, or train/validation/Test splits. It is a
+non-formal static Gazebo qualification tool, not the 72-hour formal correction
+search or R4 qualification.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone
