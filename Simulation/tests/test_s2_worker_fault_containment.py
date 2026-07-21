@@ -56,6 +56,7 @@ def _node() -> StereoDistanceNode:
     node.gt_alignments_by_pair_id = {}
     node.pairs_by_pair_id = {}
     node.evaluated_pair_ids = BoundedIdHistory(16)
+    node.gt_evaluation_failed_pair_ids = BoundedIdHistory(16)
     node.gt_published_pair_ids = BoundedIdHistory(16)
     node.measurement_rejected_pair_ids = BoundedIdHistory(16)
     node.measurement_queue_capacity = 8
@@ -67,6 +68,11 @@ def _node() -> StereoDistanceNode:
     node.measurement_processing_error_count = 0
     node.last_measurement_error_type = ""
     node.last_measurement_error_message = ""
+    node.gt_evaluation_error_count = 0
+    node.gt_evaluation_success_count = 0
+    node.last_gt_evaluation_error_type = ""
+    node.last_gt_evaluation_error_message = ""
+    node.last_gt_evaluation_error_trigger = ""
     node.measurement_queue_depth_sample_count = 0
     node.measurement_queue_depth_sum = 0
     node.measurement_queue_depth_min = None
@@ -83,6 +89,7 @@ def _node() -> StereoDistanceNode:
     node.shutdown_initial_measurement_count = 0
     node.shutdown_initial_gt_alignment_count = 0
     node.shutdown_initial_inflight_pair_id = None
+    node.shutdown_gt_evaluation_error_count = 0
     node.dropped_on_shutdown_count = 0
     node.dropped_on_shutdown_pair_id_min = None
     node.dropped_on_shutdown_pair_id_max = None
@@ -168,7 +175,7 @@ def test_compute_failure_is_contained_and_same_worker_processes_next_pair() -> N
     assert not node.yolo_thread.is_alive()
 
 
-def test_commit_evaluation_failure_has_one_terminal_discard_and_worker_continues() -> None:
+def test_commit_evaluation_failure_preserves_measurement_and_worker_continues() -> None:
     node = _node()
     second_committed = threading.Event()
 
@@ -197,8 +204,12 @@ def test_commit_evaluation_failure_has_one_terminal_discard_and_worker_continues
             "attitude_corrected_right_m": 0.0,
             "attitude_corrected_down_m": 0.0,
         }
-        self._complete_pair_measurement_locked(pair.pair_id, metrics)
         self._publish_canonical_pair_positions(metrics)
+        self._complete_pair_measurement_locked(pair.pair_id, metrics)
+        self._evaluate_pair_with_fault_containment_locked(
+            pair.pair_id,
+            trigger="measurement_complete",
+        )
         self.pending_gt_aligner.remove_pair(pair.pair_id)
         self.pairs_by_pair_id.pop(pair.pair_id, None)
         second_committed.set()
@@ -220,9 +231,10 @@ def test_commit_evaluation_failure_has_one_terminal_discard_and_worker_continues
     assert second_committed.wait(timeout=2.0)
     assert node.yolo_thread.is_alive()
     assert node.measurement_accepted_count == 2
-    assert node.measurement_processed_count == 1
-    assert node.accepted_pair_discard_count == 1
-    assert node.measurement_processing_error_count == 1
+    assert node.measurement_processed_count == 2
+    assert node.accepted_pair_discard_count == 0
+    assert node.measurement_processing_error_count == 0
+    assert node.gt_evaluation_error_count == 1
     assert node.measurement_processed_count + node.accepted_pair_discard_count == 2
     assert 1 not in node.measurement_results_by_pair_id
     assert node.inflight_pair_id is None

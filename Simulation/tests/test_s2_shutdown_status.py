@@ -50,6 +50,10 @@ def test_shutdown_timeout_reports_incomplete_and_remaining_pair(monkeypatch) -> 
     node.discard_measurement_commits = False
     node.measurement_accepted_count = 1
     node.measurement_processed_count = 0
+    node.measurement_processing_error_count = 0
+    node.accepted_pair_discard_count = 0
+    node.gt_evaluation_error_count = 0
+    node.shutdown_gt_evaluation_error_count = 0
     node.shutdown_drain_status = "not_requested"
     node.shutdown_drain_duration_s = 0.0
     node.shutdown_remaining_measurement_count = 0

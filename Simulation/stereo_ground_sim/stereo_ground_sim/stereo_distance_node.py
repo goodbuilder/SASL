@@ -171,8 +171,8 @@ class StereoDistanceNode(Node):
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("yolo_imgsz", 1280)
-        # The measured 1280px CUDA pair p99 is about 27 ms and warm-up is
-        # about 0.7 s. 32 pairs cover 1.6 s at the 20 Hz camera rate.
+        # This is a bounded burst buffer, not a sustained-rate guarantee.
+        # Strict overflow accounting invalidates a run instead of dropping silently.
         self.declare_parameter("measurement_queue_capacity", 32)
         self.declare_parameter("enable_synthetic_detections", False)
         self.declare_parameter("synthetic_detection_width_px", 1280)
@@ -350,6 +350,9 @@ class StereoDistanceNode(Node):
         self.pairs_by_pair_id = {}
         self.max_pair_result_history = 128
         self.evaluated_pair_ids = BoundedIdHistory(self.max_pair_result_history)
+        self.gt_evaluation_failed_pair_ids = BoundedIdHistory(
+            self.max_pair_result_history
+        )
         self.gt_published_pair_ids = BoundedIdHistory(self.max_pair_result_history)
         self.last_raw_published_pair_id = 0
         self.last_corrected_published_pair_id = 0
@@ -363,6 +366,11 @@ class StereoDistanceNode(Node):
         self.input_rejected_after_shutdown_count = 0
         self.last_measurement_error_type = ""
         self.last_measurement_error_message = ""
+        self.gt_evaluation_error_count = 0
+        self.gt_evaluation_success_count = 0
+        self.last_gt_evaluation_error_type = ""
+        self.last_gt_evaluation_error_message = ""
+        self.last_gt_evaluation_error_trigger = ""
         self.measurement_queue_depth_sample_count = 0
         self.measurement_queue_depth_sum = 0
         self.measurement_queue_depth_min = None
@@ -408,6 +416,7 @@ class StereoDistanceNode(Node):
         self.shutdown_initial_measurement_count = 0
         self.shutdown_initial_gt_alignment_count = 0
         self.shutdown_initial_inflight_pair_id = None
+        self.shutdown_gt_evaluation_error_count = 0
         self.dropped_on_shutdown_count = 0
         self.dropped_on_shutdown_pair_id_min = None
         self.dropped_on_shutdown_pair_id_max = None
@@ -614,6 +623,7 @@ class StereoDistanceNode(Node):
                 self._drain_future_ground_truth_locked(stamp_ns)
 
     def _reset_for_simulation_epoch_locked(self, epoch, reset_stamp_ns=None):
+        self._ensure_gt_evaluation_state_locked()
         accepted_pending = len(self.measurement_pair_queue)
         dropped = self.image_pairer.reset_for_epoch(epoch)
         dropped += self.pending_gt_aligner.clear()
@@ -641,6 +651,7 @@ class StereoDistanceNode(Node):
         self.gt_alignments_by_pair_id.clear()
         self.pairs_by_pair_id.clear()
         self.evaluated_pair_ids.clear()
+        self.gt_evaluation_failed_pair_ids.clear()
         self.gt_published_pair_ids.clear()
         self.cached_ground_truth_position = None
         self.cached_actual_distance = None
@@ -1625,6 +1636,9 @@ class StereoDistanceNode(Node):
             self.shutdown_remaining_measurement_count = len(self.measurement_pair_queue)
             self.shutdown_remaining_gt_alignment_count = len(self.gt_alignment_ready_queue)
             self.shutdown_inflight_pair_id = self.inflight_pair_id
+            self.shutdown_gt_evaluation_error_count = getattr(
+                self, "gt_evaluation_error_count", 0
+            )
             if self.drain_complete:
                 accounted = (
                     self.measurement_processed_count + self.accepted_pair_discard_count
@@ -1633,6 +1647,7 @@ class StereoDistanceNode(Node):
                     "SUCCESS"
                     if accounted == self.measurement_accepted_count
                     and self.measurement_processing_error_count == 0
+                    and self.shutdown_gt_evaluation_error_count == 0
                     else "INCOMPLETE"
                 )
             else:
@@ -1655,7 +1670,9 @@ class StereoDistanceNode(Node):
                 f"remaining_measurements={self.shutdown_remaining_measurement_count}, "
                 f"remaining_gt={self.shutdown_remaining_gt_alignment_count}, "
                 f"inflight_pair_id={self.shutdown_inflight_pair_id}, "
-                f"dropped={self.dropped_on_shutdown_count}"
+                f"dropped={self.dropped_on_shutdown_count}, "
+                f"measurement_errors={self.measurement_processing_error_count}, "
+                f"evaluation_errors={self.shutdown_gt_evaluation_error_count}"
             )
         else:
             self.get_logger().info(
@@ -1665,7 +1682,9 @@ class StereoDistanceNode(Node):
                 f"initial_gt={self.shutdown_initial_gt_alignment_count}, "
                 f"initial_inflight={self.shutdown_initial_inflight_pair_id}, "
                 f"accepted={self.measurement_accepted_count}, "
-                f"processed={self.measurement_processed_count}"
+                f"processed={self.measurement_processed_count}, "
+                f"evaluation_successes={getattr(self, 'gt_evaluation_success_count', 0)}, "
+                f"evaluation_errors={self.shutdown_gt_evaluation_error_count}"
             )
         self.shutdown_event.set()
         with self.yolo_condition:
@@ -1768,7 +1787,15 @@ class StereoDistanceNode(Node):
                         continue
                     pair = self.measurement_pair_queue.popleft()
                 if alignment_work is not None:
-                    self._store_gt_alignment_locked(*alignment_work)
+                    pair, alignment = alignment_work
+                    try:
+                        self._store_gt_alignment_locked(pair, alignment)
+                    except Exception as exc:
+                        self._finalize_gt_evaluation_failure_locked(
+                            pair.pair_id,
+                            exc,
+                            trigger="late_gt_alignment",
+                        )
                     continue
                 if pair is None:
                     continue
@@ -1934,14 +1961,19 @@ class StereoDistanceNode(Node):
                 self.yolo_update_hz_pub.publish(Float32(data=float(1.0 / period_s)))
         self.last_yolo_completion = finished
         self._complete_pair_measurement_locked(pair.pair_id, metrics)
+        self._evaluate_pair_with_fault_containment_locked(
+            pair.pair_id,
+            trigger="measurement_complete",
+        )
         self.yolo_condition.notify_all()
         return metrics
 
     def _complete_pair_measurement_locked(self, pair_id, metrics):
-        """Record one successful terminal outcome after evaluation cannot fail."""
+        """Record measurement success independently of Ground Truth evaluation."""
 
+        metrics["measurement_status"] = "processed"
+        metrics.setdefault("evaluation_status", "pending")
         self.measurement_results_by_pair_id[pair_id] = metrics
-        self._try_evaluate_pair_locked(pair_id)
         self.measurement_processed_count += 1
 
     def _update_metrics_from_messages(
@@ -1994,15 +2026,90 @@ class StereoDistanceNode(Node):
             return None
 
     def _store_gt_alignment_locked(self, pair, alignment):
+        self._ensure_gt_evaluation_state_locked()
         if pair.epoch != self.simulation_epoch.epoch:
             self.old_epoch_frame_count += 1
             return
+        # A legitimate alignment is created only for a pair registered in the
+        # active pair map.  Do not resurrect terminal state after its bounded
+        # evaluated/failed tombstone has eventually been evicted.
+        if pair.pair_id not in self.pairs_by_pair_id:
+            return
+        if (
+            pair.pair_id in self.evaluated_pair_ids
+            or pair.pair_id in self.gt_evaluation_failed_pair_ids
+        ):
+            return
         self.gt_alignments_by_pair_id[pair.pair_id] = alignment
-        self.pairs_by_pair_id.setdefault(pair.pair_id, pair)
-        self._try_evaluate_pair_locked(pair.pair_id)
+        self._evaluate_pair_with_fault_containment_locked(
+            pair.pair_id,
+            trigger="late_gt_alignment",
+        )
+
+    def _evaluate_pair_with_fault_containment_locked(self, pair_id, *, trigger):
+        """Attempt one GT evaluation without invalidating measurement success."""
+
+        self._ensure_gt_evaluation_state_locked()
+        try:
+            return self._try_evaluate_pair_locked(pair_id)
+        except Exception as exc:
+            self._finalize_gt_evaluation_failure_locked(
+                pair_id,
+                exc,
+                trigger=trigger,
+            )
+            return False
+
+    def _finalize_gt_evaluation_failure_locked(self, pair_id, exc, *, trigger):
+        self._ensure_gt_evaluation_state_locked()
+        pair_id = int(pair_id)
+        if (
+            pair_id in self.evaluated_pair_ids
+            or pair_id in self.gt_evaluation_failed_pair_ids
+        ):
+            return False
+        self.gt_evaluation_failed_pair_ids.add(pair_id)
+        self.gt_evaluation_error_count += 1
+        self.last_gt_evaluation_error_type = type(exc).__name__
+        self.last_gt_evaluation_error_message = str(exc)
+        self.last_gt_evaluation_error_trigger = str(trigger)
+        metrics = self.measurement_results_by_pair_id.get(pair_id)
+        if metrics is not None:
+            metrics["evaluation_status"] = "evaluation_error"
+            self.last_pair_result = dict(metrics)
+        self.gt_alignments_by_pair_id.pop(pair_id, None)
+        self.measurement_results_by_pair_id.pop(pair_id, None)
+        self.pairs_by_pair_id.pop(pair_id, None)
+        self.yolo_condition.notify_all()
+        try:
+            self.get_logger().error(
+                "Ground Truth evaluation failed for "
+                f"pair_id={pair_id}, trigger={trigger}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
+        return True
+
+    def _ensure_gt_evaluation_state_locked(self):
+        if not hasattr(self, "gt_evaluation_failed_pair_ids"):
+            capacity = int(getattr(self, "max_pair_result_history", 128))
+            self.gt_evaluation_failed_pair_ids = BoundedIdHistory(capacity)
+        if not hasattr(self, "gt_evaluation_error_count"):
+            self.gt_evaluation_error_count = 0
+        if not hasattr(self, "gt_evaluation_success_count"):
+            self.gt_evaluation_success_count = 0
+        if not hasattr(self, "last_gt_evaluation_error_type"):
+            self.last_gt_evaluation_error_type = ""
+            self.last_gt_evaluation_error_message = ""
+            self.last_gt_evaluation_error_trigger = ""
 
     def _try_evaluate_pair_locked(self, pair_id):
-        if pair_id in self.evaluated_pair_ids:
+        self._ensure_gt_evaluation_state_locked()
+        if (
+            pair_id in self.evaluated_pair_ids
+            or pair_id in self.gt_evaluation_failed_pair_ids
+        ):
             return False
         metrics = self.measurement_results_by_pair_id.get(pair_id)
         alignment = self.gt_alignments_by_pair_id.get(pair_id)
@@ -2012,8 +2119,7 @@ class StereoDistanceNode(Node):
         gt_baseline = self._ground_truth_alignment_to_baseline(alignment)
         evaluation = self._evaluation_metadata(pair, alignment, gt_baseline, metrics)
         metrics.update(evaluation)
-        self.last_pair_result = dict(metrics)
-        self.gt_alignment_counts[alignment.gt_alignment_mode] += 1
+        unavailable = alignment.gt_alignment_mode == "unavailable"
         if gt_baseline is not None and pair_id not in self.gt_published_pair_ids:
             self.canonical_ground_truth_position_pub.publish(
                 self._point_stamped(
@@ -2024,6 +2130,13 @@ class StereoDistanceNode(Node):
                 )
             )
             self.gt_published_pair_ids.add(pair_id)
+        metrics["evaluation_status"] = (
+            "unavailable" if unavailable else "evaluated"
+        )
+        self.last_pair_result = dict(metrics)
+        self.gt_alignment_counts[alignment.gt_alignment_mode] += 1
+        if not unavailable:
+            self.gt_evaluation_success_count += 1
         self.evaluated_pair_ids.add(pair_id)
         self.measurement_results_by_pair_id.pop(pair_id, None)
         self.gt_alignments_by_pair_id.pop(pair_id, None)
@@ -2153,6 +2266,14 @@ class StereoDistanceNode(Node):
             "old_epoch_result_discard_count": self.old_epoch_result_discard_count,
             "accepted_pair_discard_count": self.accepted_pair_discard_count,
             "measurement_processing_error_count": self.measurement_processing_error_count,
+            "gt_evaluation_success_count": self.gt_evaluation_success_count,
+            "gt_evaluation_error_count": self.gt_evaluation_error_count,
+            "gt_evaluation_failed_pair_count": len(
+                self.gt_evaluation_failed_pair_ids
+            ),
+            "last_gt_evaluation_error_type": self.last_gt_evaluation_error_type,
+            "last_gt_evaluation_error_message": self.last_gt_evaluation_error_message,
+            "last_gt_evaluation_error_trigger": self.last_gt_evaluation_error_trigger,
             "input_rejected_after_shutdown_count": self.input_rejected_after_shutdown_count,
             "last_measurement_error_type": self.last_measurement_error_type,
             "last_measurement_error_message": self.last_measurement_error_message,

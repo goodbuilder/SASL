@@ -173,18 +173,40 @@ buffer로 이동하며 position만 선형 보간한다. 따라서 reset마다 �
 continuity 확인 전 sample은 false-stale이 될 수 있지만, wall-clock sleep 없이
 old GT 200 ms-window 오염을 차단하고 이후 alignment를 복구한다.
 
-Measurement queue 기본 capacity는 32 pair다. 1280x720 CUDA 실측 p99 pair
-inference 약 27 ms와 20 Hz 입력에서 약 1.6초의 일시 stall을 흡수한다. Overflow는
-silent drop하지 않고 `measurement_overrun_invalid` run 상태로 전환하며 rejected
-pair ID와 counter를 남기는 strict research policy다. Raw/Corrected dedupe는 단조
-pair-id watermark, late GT/evaluation dedupe는 128-entry bounded history를 사용해
-장시간 pair 수에 비례한 set 증가를 막는다. Shutdown drain은 5초 안에 queue,
-GT alignment, in-flight inference가 모두 끝날 때만 `SUCCESS`이며, timeout은
-`INCOMPLETE`와 remaining/in-flight/dropped pair 수 및 ID 범위를 기록한다.
-Pair compute 또는 commit 예외는 pair 단위 failure boundary에서 error/discard를
-각 한 번 기록하고 관련 state와 in-flight flag를 정리한다. 오류 pair는 processed로
-세지 않으며 같은 worker는 다음 pair를 계속 처리한다. Processing error가 한 건이라도
-있으면 queue가 모두 비워져도 shutdown 결과는 `INCOMPLETE`다.
+Measurement queue 기본 capacity는 32 pair인 bounded burst buffer이며 20 Hz 지속
+처리 보장이 아니다. S2-C2 production-node audit의 CPU 측정은 20 stereo pair
+sample에서 image decode, 좌우 순차 YOLO inference와 triangulation을 포함한
+`yolo_inference_ms`가 mean 65.53 ms, observed p99/max 74.17 ms였고, 관측된 최대
+update rate는 10.76 Hz였다. 이는 project camera input contract 20 Hz보다 낮다.
+이전 약 27 ms 수치는 model-only인지 one-image inference인지, decode를 포함하는지,
+device와 sample 수가 확인되지 않아 capacity 근거에서 제거했다. Overflow는 silent
+drop하지 않고 `measurement_overrun_invalid` run 상태로 전환하며 rejected pair ID와
+counter를 남긴다. 따라서 지속 backlog는 strict overrun으로 run-invalid가 된다.
+
+Raw/Corrected dedupe는 단조 pair-id watermark, late GT/evaluation dedupe는 128-entry
+bounded history를 사용해 장시간 pair 수에 비례한 set 증가를 막는다. Measurement
+terminal은 decode/detection과 detection/Raw/attitude-corrected publication 및 result
+저장을 완료한 뒤 `measurement_status=processed`와
+`measurement_processed_count`를 확정한다. 이후 GT transform, error 계산과 canonical
+GT publication은 별도 evaluation terminal이다. 성공은
+`evaluation_status=evaluated`와 `gt_evaluation_success_count`, 실패는
+`evaluation_status=evaluation_error`와 `gt_evaluation_error_count` 및 bounded failed
+pair history에 한 번만 기록한다. Late GT 또는 measurement-complete trigger의
+evaluation 예외는 worker 밖으로 전파되지 않으며 이미 성공한 measurement를
+processing error/discard로 재분류하지 않는다.
+
+Shutdown drain은 5초 안에 measurement/GT queue와 in-flight inference가 모두 끝나고
+measurement accounting이 일치하며 measurement/evaluation error가 모두 0일 때만
+`SUCCESS`다. Timeout, processing error 또는 GT evaluation error는 각각 구분된
+진단을 남기고 `INCOMPLETE`다. Pair compute 또는 measurement commit 예외는 pair
+단위 failure boundary에서 error/discard를 각 한 번 기록하고 관련 state와 in-flight
+flag를 정리하며, 같은 worker는 다음 pair를 계속 처리한다.
+
+ROS publisher 여러 개는 cross-topic transaction이 아니다. Detection, Raw,
+attitude-corrected 또는 GT publish 중 예외가 발생하면 일부 topic만 외부에 전달될 수
+있다. 현재 보장은 worker 생존, bounded cleanup과 terminal accounting이며 publish
+rollback은 제공하지 않는다. 이 제한의 구조적 해결에는 향후 atomic pair recorder
+또는 typed aggregate message가 필요하다.
 
 아직 구현하지 않은 범위는 post-hoc 삭제, PX4-only movement cleanup, pair recorder,
 typed aggregate message, speed, roll/pitch 연구, BBox observation error correction이다.
