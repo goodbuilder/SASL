@@ -54,6 +54,8 @@ def test_geometry_parameter_batch_is_rejected_before_any_mutation() -> None:
         [
             _parameter("reference_distance_m", 999.0),
             _parameter("baseline_m", 40.0),
+            _parameter("left_yaw_error_deg", -0.25),
+            _parameter("common_optical_pitch_error_deg", 0.1),
             _parameter("relative_optical_yaw_error_deg", 0.5),
         ]
     )
@@ -77,8 +79,14 @@ def test_each_geometry_parameter_is_rejected_and_unrelated_parameter_remains_all
         "target_model_name",
         "left_roll_error_deg",
         "left_pitch_error_deg",
+        "left_yaw_error_deg",
         "right_roll_error_deg",
         "right_pitch_error_deg",
+        "right_yaw_error_deg",
+        "common_optical_roll_error_deg",
+        "relative_optical_roll_error_deg",
+        "common_optical_pitch_error_deg",
+        "relative_optical_pitch_error_deg",
         "common_optical_yaw_error_deg",
         "relative_optical_yaw_error_deg",
     )

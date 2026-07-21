@@ -160,10 +160,14 @@ drain한다. Image callback admission은 shutdown과 같은 condition lock 안�
 닫은 뒤 lock을 얻은 callback은 pairer, pair ID, queue 또는 GT aligner를 변경하지
 않고 `input_rejected_after_shutdown_count`만 증가시킨다.
 
-자세 연구 입력은 `common_optical_yaw_error_deg`와
-`relative_optical_yaw_error_deg`이다. Effective yaw는 left=`common-relative/2`,
-right=`common+relative/2`이며 optical RDF의 +Down 축 오른손 회전이다. Positive
-yaw는 Forward를 Right 방향으로 회전시킨다. 동일 pair와 동일 bbox pixel에 대해
+자세 연구 입력은 optical RDF local axes 기준 direct left/right roll·pitch·yaw와
+각 축의 common/relative 성분이다. 각 축에서 effective left는
+`left_direct+common-relative/2`, effective right는
+`right_direct+common+relative/2`이다. 단위는 degree이며 내부 회전은
+`R_Down(yaw) @ R_Right(pitch) @ R_Forward(roll)` 순서의 full SO(3) 행렬을 사용한다.
+Positive roll은 Right를 Down으로, positive pitch는 Forward를 Up(-Down)으로,
+positive yaw는 Forward를 Right로 회전시킨다. 기존 yaw-only common/relative 계약은
+direct yaw가 0일 때 동일하다. 동일 pair와 동일 bbox pixel에 대해
 Raw는 nominal pose, `/stereo/attitude_corrected_position`은 injected actual pose로
 ray를 다시 생성해 같은 two-ray midpoint kernel을 호출한다. correction source는
 `injected_attitude_oracle`이고 Ground Truth는 correction 입력이 아니다.

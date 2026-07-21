@@ -118,12 +118,12 @@ from stereo_ground_sim.coordinate_frames import (
     VEHICLE_REFERENCE_DEFINITION,
     VEHICLE_REFERENCE_LINK,
     WORLD_FRAME,
-    apply_optical_yaw,
+    apply_optical_rpy_error,
     build_baseline_center_frd,
     ground_truth_world_to_baseline,
     nominal_camera_poses,
     project_world_point_to_pixel,
-    effective_optical_yaws_deg,
+    effective_optical_rpy_errors_deg,
 )
 from stereo_ground_sim.time_alignment import (
     BoundedIdHistory,
@@ -202,8 +202,14 @@ class StereoDistanceNode(Node):
         self.declare_parameter("disparity_residual_feature_selector_min_samples", 1)
         self.declare_parameter("left_roll_error_deg", 0.0)
         self.declare_parameter("left_pitch_error_deg", 0.0)
+        self.declare_parameter("left_yaw_error_deg", 0.0)
         self.declare_parameter("right_roll_error_deg", 0.0)
         self.declare_parameter("right_pitch_error_deg", 0.0)
+        self.declare_parameter("right_yaw_error_deg", 0.0)
+        self.declare_parameter("common_optical_roll_error_deg", 0.0)
+        self.declare_parameter("relative_optical_roll_error_deg", 0.0)
+        self.declare_parameter("common_optical_pitch_error_deg", 0.0)
+        self.declare_parameter("relative_optical_pitch_error_deg", 0.0)
         self.declare_parameter("common_optical_yaw_error_deg", 0.0)
         self.declare_parameter("relative_optical_yaw_error_deg", 0.0)
 
@@ -281,26 +287,9 @@ class StereoDistanceNode(Node):
             1,
             int(self.get_parameter("disparity_residual_feature_selector_min_samples").value),
         )
-        unsupported_tilt = tuple(
-            self._float_param(name)
-            for name in (
-                "left_roll_error_deg",
-                "left_pitch_error_deg",
-                "right_roll_error_deg",
-                "right_pitch_error_deg",
-            )
-        )
-        if any(value != 0.0 for value in unsupported_tilt):
-            raise ValueError("S2 supports yaw-only injection; roll/pitch must remain zero")
-        self.common_optical_yaw_error_deg = self._float_param("common_optical_yaw_error_deg")
-        self.relative_optical_yaw_error_deg = self._float_param("relative_optical_yaw_error_deg")
-        (
-            self.effective_left_optical_yaw_error_deg,
-            self.effective_right_optical_yaw_error_deg,
-        ) = effective_optical_yaws_deg(
-            self.common_optical_yaw_error_deg,
-            self.relative_optical_yaw_error_deg,
-        )
+        for name in self._attitude_parameter_names():
+            setattr(self, name, self._float_param(name))
+        self._configure_attitude_error_state()
         self._configure_camera_frames()
         self.disparity_residual_feature_selector_window = deque(
             maxlen=self.disparity_residual_feature_selector_window_size
@@ -579,26 +568,89 @@ class StereoDistanceNode(Node):
             nominal_left.forward_world_enu,
             nominal_right.forward_world_enu,
         )
-        left_yaw_rad = math.radians(self.effective_left_optical_yaw_error_deg)
-        right_yaw_rad = math.radians(self.effective_right_optical_yaw_error_deg)
-        self.actual_left_camera = apply_optical_yaw(nominal_left, left_yaw_rad)
-        self.actual_right_camera = apply_optical_yaw(nominal_right, right_yaw_rad)
+        self.actual_left_camera = apply_optical_rpy_error(
+            nominal_left,
+            math.radians(self.effective_left_optical_roll_error_deg),
+            math.radians(self.effective_left_optical_pitch_error_deg),
+            math.radians(self.effective_left_optical_yaw_error_deg),
+        )
+        self.actual_right_camera = apply_optical_rpy_error(
+            nominal_right,
+            math.radians(self.effective_right_optical_roll_error_deg),
+            math.radians(self.effective_right_optical_pitch_error_deg),
+            math.radians(self.effective_right_optical_yaw_error_deg),
+        )
+
+    @staticmethod
+    def _attitude_parameter_names():
+        return (
+            "left_roll_error_deg",
+            "left_pitch_error_deg",
+            "left_yaw_error_deg",
+            "right_roll_error_deg",
+            "right_pitch_error_deg",
+            "right_yaw_error_deg",
+            "common_optical_roll_error_deg",
+            "relative_optical_roll_error_deg",
+            "common_optical_pitch_error_deg",
+            "relative_optical_pitch_error_deg",
+            "common_optical_yaw_error_deg",
+            "relative_optical_yaw_error_deg",
+        )
+
+    def _configure_attitude_error_state(self):
+        left, right = effective_optical_rpy_errors_deg(
+            (
+                self.left_roll_error_deg,
+                self.left_pitch_error_deg,
+                self.left_yaw_error_deg,
+            ),
+            (
+                self.right_roll_error_deg,
+                self.right_pitch_error_deg,
+                self.right_yaw_error_deg,
+            ),
+            (
+                self.common_optical_roll_error_deg,
+                self.common_optical_pitch_error_deg,
+                self.common_optical_yaw_error_deg,
+            ),
+            (
+                self.relative_optical_roll_error_deg,
+                self.relative_optical_pitch_error_deg,
+                self.relative_optical_yaw_error_deg,
+            ),
+        )
+        (
+            self.effective_left_optical_roll_error_deg,
+            self.effective_left_optical_pitch_error_deg,
+            self.effective_left_optical_yaw_error_deg,
+        ) = left
+        (
+            self.effective_right_optical_roll_error_deg,
+            self.effective_right_optical_pitch_error_deg,
+            self.effective_right_optical_yaw_error_deg,
+        ) = right
+        self.attitude_error_frame = "camera_optical_rdf"
+        self.attitude_angle_unit = "deg"
+        self.attitude_parameterization = "direct_plus_common_relative"
+        self.attitude_rotation_composition = (
+            "R_Cnominal_Cactual=R_Down(yaw)@R_Right(pitch)@R_Forward(roll)"
+        )
 
     def _ensure_camera_frames(self):
+        self._ensure_attitude_error_state()
         if hasattr(self, "baseline_center_frd"):
             return
         self.baseline_m = float(getattr(self, "baseline_m", 25.0))
         self.camera_height_m = float(getattr(self, "camera_height_m", 5.0))
-        self.common_optical_yaw_error_deg = float(getattr(self, "common_optical_yaw_error_deg", 0.0))
-        self.relative_optical_yaw_error_deg = float(getattr(self, "relative_optical_yaw_error_deg", 0.0))
-        (
-            self.effective_left_optical_yaw_error_deg,
-            self.effective_right_optical_yaw_error_deg,
-        ) = effective_optical_yaws_deg(
-            self.common_optical_yaw_error_deg,
-            self.relative_optical_yaw_error_deg,
-        )
+
         self._configure_camera_frames()
+
+    def _ensure_attitude_error_state(self):
+        for name in self._attitude_parameter_names():
+            setattr(self, name, float(getattr(self, name, 0.0)))
+        self._configure_attitude_error_state()
 
     def _camera_intrinsics(self, width, height):
         width = float(width)
@@ -1065,8 +1117,14 @@ class StereoDistanceNode(Node):
             "target_model_name",
             "left_roll_error_deg",
             "left_pitch_error_deg",
+            "left_yaw_error_deg",
             "right_roll_error_deg",
             "right_pitch_error_deg",
+            "right_yaw_error_deg",
+            "common_optical_roll_error_deg",
+            "relative_optical_roll_error_deg",
+            "common_optical_pitch_error_deg",
+            "relative_optical_pitch_error_deg",
             "common_optical_yaw_error_deg",
             "relative_optical_yaw_error_deg",
         }
@@ -2351,6 +2409,7 @@ class StereoDistanceNode(Node):
         *,
         count_alignment=True,
     ):
+        self._ensure_attitude_error_state()
         alignment_mode = "unavailable" if alignment is None else alignment.gt_alignment_mode
         if count_alignment and hasattr(self, "gt_alignment_counts"):
             self.gt_alignment_counts[alignment_mode] += 1
@@ -2371,10 +2430,28 @@ class StereoDistanceNode(Node):
             "gt_right_m": None if gt_baseline is None else gt_baseline["right_m"],
             "gt_down_m": None if gt_baseline is None else gt_baseline["down_m"],
             "gt_range_m": None if gt_baseline is None else gt_baseline["range_m"],
+            "left_roll_error_deg": self.left_roll_error_deg,
+            "left_pitch_error_deg": self.left_pitch_error_deg,
+            "left_yaw_error_deg": self.left_yaw_error_deg,
+            "right_roll_error_deg": self.right_roll_error_deg,
+            "right_pitch_error_deg": self.right_pitch_error_deg,
+            "right_yaw_error_deg": self.right_yaw_error_deg,
+            "common_optical_roll_error_deg": self.common_optical_roll_error_deg,
+            "relative_optical_roll_error_deg": self.relative_optical_roll_error_deg,
+            "common_optical_pitch_error_deg": self.common_optical_pitch_error_deg,
+            "relative_optical_pitch_error_deg": self.relative_optical_pitch_error_deg,
             "common_optical_yaw_error_deg": self.common_optical_yaw_error_deg,
             "relative_optical_yaw_error_deg": self.relative_optical_yaw_error_deg,
+            "effective_left_optical_roll_error_deg": self.effective_left_optical_roll_error_deg,
+            "effective_left_optical_pitch_error_deg": self.effective_left_optical_pitch_error_deg,
             "effective_left_optical_yaw_error_deg": self.effective_left_optical_yaw_error_deg,
+            "effective_right_optical_roll_error_deg": self.effective_right_optical_roll_error_deg,
+            "effective_right_optical_pitch_error_deg": self.effective_right_optical_pitch_error_deg,
             "effective_right_optical_yaw_error_deg": self.effective_right_optical_yaw_error_deg,
+            "attitude_error_frame": self.attitude_error_frame,
+            "attitude_angle_unit": self.attitude_angle_unit,
+            "attitude_parameterization": self.attitude_parameterization,
+            "attitude_rotation_composition": self.attitude_rotation_composition,
             "correction_source": "injected_attitude_oracle",
             "attitude_corrected_computation_status": (
                 "invalid_input" if corrected is None else corrected.get("computation_status")

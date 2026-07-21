@@ -75,6 +75,14 @@ def _mat_vec(matrix: Matrix3, vector: Vector3) -> Vector3:
     return (_dot(matrix[0], vector), _dot(matrix[1], vector), _dot(matrix[2], vector))
 
 
+def _mat_mul(left: Matrix3, right: Matrix3) -> Matrix3:
+    right_columns = _transpose(right)
+    return tuple(
+        tuple(_dot(left[row], right_columns[column]) for column in range(3))
+        for row in range(3)
+    )  # type: ignore[return-value]
+
+
 def _transpose(matrix: Matrix3) -> Matrix3:
     return tuple(tuple(matrix[row][column] for row in range(3)) for column in range(3))  # type: ignore[return-value]
 
@@ -139,6 +147,93 @@ class CameraOpticalPose:
         return (_dot(self.right_world_enu, delta), _dot(self.down_world_enu, delta), _dot(self.forward_world_enu, delta))
 
 
+def _validated_camera_basis(camera_pose: CameraOpticalPose) -> Matrix3:
+    right = _finite_vector(camera_pose.right_world_enu, "right_world_enu")
+    down = _finite_vector(camera_pose.down_world_enu, "down_world_enu")
+    forward = _finite_vector(camera_pose.forward_world_enu, "forward_world_enu")
+    basis_columns = (right, down, forward)
+    if any(abs(_norm(axis) - 1.0) > 1.0e-12 for axis in basis_columns):
+        raise ValueError("camera optical basis axes must have unit norm")
+    if any(
+        abs(_dot(basis_columns[first], basis_columns[second])) > 1.0e-12
+        for first, second in ((0, 1), (0, 2), (1, 2))
+    ):
+        raise ValueError("camera optical basis axes must be orthogonal")
+    basis_rows = _transpose(basis_columns)
+    if abs(_det(basis_rows) - 1.0) > 1.0e-12:
+        raise ValueError("camera optical basis must be right-handed")
+    return basis_rows
+
+
+def optical_rpy_error_rotation(
+    roll_error_rad: float,
+    pitch_error_rad: float,
+    yaw_error_rad: float,
+) -> Matrix3:
+    """Return ``R_Cnominal_Cactual`` for local optical RDF attitude error.
+
+    Optical axes are Right, Down, Forward. Positive roll is about +Forward,
+    positive pitch is about +Right, and positive yaw is about +Down. The
+    composition is ``R_Down(yaw) @ R_Right(pitch) @ R_Forward(roll)``;
+    column-vector application order is roll, then pitch, then yaw.
+    """
+
+    roll, pitch, yaw = _finite_vector(
+        (roll_error_rad, pitch_error_rad, yaw_error_rad),
+        "optical_rpy_error_rad",
+    )
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    rotation_forward: Matrix3 = (
+        (cr, -sr, 0.0),
+        (sr, cr, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+    rotation_right: Matrix3 = (
+        (1.0, 0.0, 0.0),
+        (0.0, cp, -sp),
+        (0.0, sp, cp),
+    )
+    rotation_down: Matrix3 = (
+        (cy, 0.0, sy),
+        (0.0, 1.0, 0.0),
+        (-sy, 0.0, cy),
+    )
+    rotation = _mat_mul(rotation_down, _mat_mul(rotation_right, rotation_forward))
+    if abs(_det(rotation) - 1.0) > 1.0e-12:
+        raise ValueError("optical RPY rotation must have determinant +1")
+    return rotation
+
+
+def apply_optical_rpy_error(
+    nominal_camera_pose: CameraOpticalPose,
+    roll_error_rad: float,
+    pitch_error_rad: float,
+    yaw_error_rad: float,
+) -> CameraOpticalPose:
+    """Apply a local optical RDF RPY error without moving the camera center."""
+
+    nominal_basis = _validated_camera_basis(nominal_camera_pose)
+    rotation_nominal_from_actual = optical_rpy_error_rotation(
+        roll_error_rad,
+        pitch_error_rad,
+        yaw_error_rad,
+    )
+    actual_basis = _mat_mul(nominal_basis, rotation_nominal_from_actual)
+    actual = CameraOpticalPose(
+        center_world_enu_m=_finite_vector(
+            nominal_camera_pose.center_world_enu_m,
+            "center_world_enu_m",
+        ),
+        right_world_enu=tuple(row[0] for row in actual_basis),  # type: ignore[arg-type]
+        down_world_enu=tuple(row[1] for row in actual_basis),  # type: ignore[arg-type]
+        forward_world_enu=tuple(row[2] for row in actual_basis),  # type: ignore[arg-type]
+    )
+    _validated_camera_basis(actual)
+    return actual
+
+
 def apply_optical_yaw(
     nominal_camera_pose: CameraOpticalPose,
     yaw_error_rad: float,
@@ -149,25 +244,35 @@ def apply_optical_yaw(
     center and Down axis are unchanged.
     """
 
-    yaw = float(yaw_error_rad)
-    if not math.isfinite(yaw):
-        raise ValueError("yaw_error_rad must be finite")
-    cosine = math.cos(yaw)
-    sine = math.sin(yaw)
-    nominal_right = nominal_camera_pose.right_world_enu
-    nominal_forward = nominal_camera_pose.forward_world_enu
-    return CameraOpticalPose(
-        center_world_enu_m=nominal_camera_pose.center_world_enu_m,
-        right_world_enu=normalize(
-            _sub(_scale(nominal_right, cosine), _scale(nominal_forward, sine)),
-            "yawed_right_world_enu",
-        ),
-        down_world_enu=nominal_camera_pose.down_world_enu,
-        forward_world_enu=normalize(
-            _add(_scale(nominal_right, sine), _scale(nominal_forward, cosine)),
-            "yawed_forward_world_enu",
-        ),
+    return apply_optical_rpy_error(nominal_camera_pose, 0.0, 0.0, yaw_error_rad)
+
+
+def effective_optical_rpy_errors_deg(
+    left_direct_rpy_deg: Sequence[float],
+    right_direct_rpy_deg: Sequence[float],
+    common_rpy_deg: Sequence[float],
+    relative_rpy_deg: Sequence[float],
+) -> tuple[Vector3, Vector3]:
+    """Combine direct and common/relative optical RDF RPY components.
+
+    Each input and output is ``(roll, pitch, yaw)`` in degrees. For every
+    component, left is ``direct + common - relative/2`` and right is
+    ``direct + common + relative/2``.
+    """
+
+    left_direct = _finite_vector(left_direct_rpy_deg, "left_direct_rpy_deg")
+    right_direct = _finite_vector(right_direct_rpy_deg, "right_direct_rpy_deg")
+    common = _finite_vector(common_rpy_deg, "common_rpy_deg")
+    relative = _finite_vector(relative_rpy_deg, "relative_rpy_deg")
+    left = tuple(
+        left_direct[index] + common[index] - relative[index] * 0.5
+        for index in range(3)
     )
+    right = tuple(
+        right_direct[index] + common[index] + relative[index] * 0.5
+        for index in range(3)
+    )
+    return left, right  # type: ignore[return-value]
 
 
 def effective_optical_yaws_deg(
@@ -176,11 +281,37 @@ def effective_optical_yaws_deg(
 ) -> tuple[float, float]:
     """Return effective left/right optical yaw errors in degrees."""
 
-    common = float(common_optical_yaw_error_deg)
-    relative = float(relative_optical_yaw_error_deg)
-    if not math.isfinite(common) or not math.isfinite(relative):
-        raise ValueError("optical yaw errors must be finite")
-    return common - relative * 0.5, common + relative * 0.5
+    left, right = effective_optical_rpy_errors_deg(
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, common_optical_yaw_error_deg),
+        (0.0, 0.0, relative_optical_yaw_error_deg),
+    )
+    return left[2], right[2]
+
+
+def sdf_link_rpy_from_optical_error(
+    nominal_link_yaw_rad: float,
+    optical_roll_error_rad: float,
+    optical_pitch_error_rad: float,
+    optical_yaw_error_rad: float,
+) -> Vector3:
+    """Map optical RDF error RPY to this world's generated SDF link RPY.
+
+    Link +X is Optical +Forward, link +Y is Optical -Right, and link +Z is
+    Optical -Down. Therefore link RPY is ``(roll, -pitch, nominal_yaw-yaw)``.
+    This is equivalent to the full optical composition for composite RPY.
+    """
+
+    nominal_yaw, roll, pitch, yaw = (
+        float(nominal_link_yaw_rad),
+        float(optical_roll_error_rad),
+        float(optical_pitch_error_rad),
+        float(optical_yaw_error_rad),
+    )
+    if not all(math.isfinite(value) for value in (nominal_yaw, roll, pitch, yaw)):
+        raise ValueError("SDF link and optical RPY values must be finite")
+    return roll, -pitch, nominal_yaw - yaw
 
 
 def rpy_to_rotation_world_from_link(roll_rad: float, pitch_rad: float, yaw_rad: float) -> Matrix3:
@@ -331,13 +462,17 @@ __all__ = [
     "VEHICLE_REFERENCE_DEFINITION",
     "VEHICLE_REFERENCE_LINK",
     "WORLD_FRAME",
+    "apply_optical_rpy_error",
     "apply_optical_yaw",
     "build_baseline_center_frd",
     "camera_optical_pose_from_sdf_pose",
+    "effective_optical_rpy_errors_deg",
     "effective_optical_yaws_deg",
     "ground_truth_world_to_baseline",
     "nominal_camera_poses",
     "normalize",
+    "optical_rpy_error_rotation",
     "project_world_point_to_pixel",
     "rpy_to_rotation_world_from_link",
+    "sdf_link_rpy_from_optical_error",
 ]

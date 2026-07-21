@@ -3,9 +3,9 @@ from __future__ import annotations
 import math
 
 import pytest
-from pathlib import Path
 
 from Simulation.stereo_ground_sim.stereo_ground_sim.coordinate_frames import (
+    apply_optical_rpy_error,
     apply_optical_yaw,
     camera_optical_pose_from_sdf_pose,
     effective_optical_yaws_deg,
@@ -45,11 +45,7 @@ def test_sdf_yaw_sign_matches_optical_basis_and_projection() -> None:
     yawed_pixel = project_world_point_to_pixel(target, yawed, fx_px=1000, fy_px=1000, cx_px=640, cy_px=360)
     assert nominal_pixel is not None and yawed_pixel is not None
     assert yawed_pixel[0] < nominal_pixel[0]
-    launch = (
-        Path(__file__).resolve().parents[1]
-        / "stereo_ground_sim"
-        / "launch"
-        / "stereo_ground_sim.launch.py"
-    ).read_text(encoding="utf-8")
-    assert "camera_yaw - left_optical_yaw" in launch
-    assert "camera_yaw - right_optical_yaw" in launch
+    full_rpy = apply_optical_rpy_error(nominal, 0.0, 0.0, optical_yaw)
+    assert full_rpy.right_world_enu == pytest.approx(yawed.right_world_enu, abs=1e-12)
+    assert full_rpy.down_world_enu == pytest.approx(yawed.down_world_enu, abs=1e-12)
+    assert full_rpy.forward_world_enu == pytest.approx(yawed.forward_world_enu, abs=1e-12)

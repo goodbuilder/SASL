@@ -11,6 +11,10 @@ from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
+from stereo_ground_sim.coordinate_frames import (
+    effective_optical_rpy_errors_deg,
+    sdf_link_rpy_from_optical_error,
+)
 
 
 def _float_config(context, name):
@@ -57,8 +61,14 @@ def _write_distance_node_params(context):
         "zoom_index",
         "left_roll_error_deg",
         "left_pitch_error_deg",
+        "left_yaw_error_deg",
         "right_roll_error_deg",
         "right_pitch_error_deg",
+        "right_yaw_error_deg",
+        "common_optical_roll_error_deg",
+        "relative_optical_roll_error_deg",
+        "common_optical_pitch_error_deg",
+        "relative_optical_pitch_error_deg",
         "common_optical_yaw_error_deg",
         "relative_optical_yaw_error_deg",
     }
@@ -105,8 +115,14 @@ def _write_distance_node_params(context):
         "target_model_name",
         "left_roll_error_deg",
         "left_pitch_error_deg",
+        "left_yaw_error_deg",
         "right_roll_error_deg",
         "right_pitch_error_deg",
+        "right_yaw_error_deg",
+        "common_optical_roll_error_deg",
+        "relative_optical_roll_error_deg",
+        "common_optical_pitch_error_deg",
+        "relative_optical_pitch_error_deg",
         "common_optical_yaw_error_deg",
         "relative_optical_yaw_error_deg",
         "yolo_model_path",
@@ -230,23 +246,44 @@ def _generate_world(context):
     target_spawn_y_m = _float_config(context, "target_spawn_y_m")
     target_spawn_z_m = _float_config(context, "target_spawn_z_m")
     target_spawn_yaw_deg = _float_config(context, "target_spawn_yaw_deg")
-    left_roll = math.radians(_float_config(context, "left_roll_error_deg"))
-    left_pitch = math.radians(_float_config(context, "left_pitch_error_deg"))
-    right_roll = math.radians(_float_config(context, "right_roll_error_deg"))
-    right_pitch = math.radians(_float_config(context, "right_pitch_error_deg"))
-    common_yaw_deg = _float_config(context, "common_optical_yaw_error_deg")
-    relative_yaw_deg = _float_config(context, "relative_optical_yaw_error_deg")
-    left_optical_yaw = math.radians(common_yaw_deg - relative_yaw_deg / 2.0)
-    right_optical_yaw = math.radians(common_yaw_deg + relative_yaw_deg / 2.0)
-
-    camera_yaw = math.pi / 2.0
+    left_effective_rpy_deg, right_effective_rpy_deg = effective_optical_rpy_errors_deg(
+        (
+            _float_config(context, "left_roll_error_deg"),
+            _float_config(context, "left_pitch_error_deg"),
+            _float_config(context, "left_yaw_error_deg"),
+        ),
+        (
+            _float_config(context, "right_roll_error_deg"),
+            _float_config(context, "right_pitch_error_deg"),
+            _float_config(context, "right_yaw_error_deg"),
+        ),
+        (
+            _float_config(context, "common_optical_roll_error_deg"),
+            _float_config(context, "common_optical_pitch_error_deg"),
+            _float_config(context, "common_optical_yaw_error_deg"),
+        ),
+        (
+            _float_config(context, "relative_optical_roll_error_deg"),
+            _float_config(context, "relative_optical_pitch_error_deg"),
+            _float_config(context, "relative_optical_yaw_error_deg"),
+        ),
+    )
+    nominal_link_yaw = math.pi / 2.0
+    left_link_rpy = sdf_link_rpy_from_optical_error(
+        nominal_link_yaw,
+        *(math.radians(value) for value in left_effective_rpy_deg),
+    )
+    right_link_rpy = sdf_link_rpy_from_optical_error(
+        nominal_link_yaw,
+        *(math.radians(value) for value in right_effective_rpy_deg),
+    )
     left_pose = (
         f"{-baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{left_roll:.9f} {left_pitch:.9f} {camera_yaw - left_optical_yaw:.9f}"
+        f"{left_link_rpy[0]:.9f} {left_link_rpy[1]:.9f} {left_link_rpy[2]:.9f}"
     )
     right_pose = (
         f"{baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{right_roll:.9f} {right_pitch:.9f} {camera_yaw - right_optical_yaw:.9f}"
+        f"{right_link_rpy[0]:.9f} {right_link_rpy[1]:.9f} {right_link_rpy[2]:.9f}"
     )
 
     world = world.replace("<pose>-12.5 0 5.0 0 0 1.570796327</pose>", f"<pose>{left_pose}</pose>", 1)
@@ -491,8 +528,14 @@ def generate_launch_description():
             DeclareLaunchArgument("calibration_record_hz", default_value="10.0"),
             DeclareLaunchArgument("left_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("left_pitch_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("left_yaw_error_deg", default_value="0.0"),
             DeclareLaunchArgument("right_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("right_pitch_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("right_yaw_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("common_optical_roll_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("relative_optical_roll_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("common_optical_pitch_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("relative_optical_pitch_error_deg", default_value="0.0"),
             DeclareLaunchArgument("common_optical_yaw_error_deg", default_value="0.0"),
             DeclareLaunchArgument("relative_optical_yaw_error_deg", default_value="0.0"),
             OpaqueFunction(function=_launch_setup),
