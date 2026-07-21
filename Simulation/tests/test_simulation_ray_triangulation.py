@@ -199,10 +199,10 @@ def test_ideal_reference_projection_raw_matches_same_baseline_ground_truth() -> 
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
     node._ensure_camera_frames()
-    world_point = node.baseline_center_frd.point_to_world((120.0, -3.0, 2.0))
+    world_point = node.baseline_center_frd.point_to_world((500.0, -3.0, 2.0))
     left, right = node._ideal_detection_pair_from_reference_world(world_point, 1280, 720)
     raw = node._triangulate_center_pixels(left["cx"], left["cy"], right["cx"], right["cy"], 1280, 720)
     assert raw["computation_status"] == "computed"
     assert max(
-        abs(raw[key] - expected) for key, expected in (("forward_m", 120.0), ("right_m", -3.0), ("down_m", 2.0))
+        abs(raw[key] - expected) for key, expected in (("forward_m", 500.0), ("right_m", -3.0), ("down_m", 2.0))
     ) < 1.0e-6

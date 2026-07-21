@@ -363,6 +363,7 @@ class StereoDistanceNode(Node):
         self.measurement_queue_overflow_count = 0
         self.measurement_overrun_invalid = False
         self.measurement_rejected_pair_ids = BoundedIdHistory(self.max_pair_result_history)
+        self.last_measurement_rejection_reason = ""
         self.measurement_accepted_count = 0
         self.measurement_processed_count = 0
         self.accepted_pair_discard_count = 0
@@ -679,6 +680,7 @@ class StereoDistanceNode(Node):
                 self.measurement_queue_overflow_count += 1
                 self.measurement_overrun_invalid = True
                 self.measurement_rejected_pair_ids.add(pair.pair_id)
+                self.last_measurement_rejection_reason = "measurement_queue_overflow"
                 self._drop_pair_state_locked(pair.pair_id, "measurement_queue_overflow")
                 if self.measurement_queue_overflow_count == 1 or (
                     self.measurement_queue_overflow_count % 100 == 0
@@ -727,6 +729,19 @@ class StereoDistanceNode(Node):
         self.evaluated_pair_ids.discard(pair_id)
         self.gt_published_pair_ids.discard(pair_id)
         return reason
+
+    def _finalize_measurement_queue_overflow_locked(self, pair_id):
+        """Terminally reject one already-accepted pair on queue overflow."""
+        pair_id = int(pair_id)
+        if pair_id not in self.pairs_by_pair_id:
+            return False
+        self.measurement_queue_overflow_count += 1
+        self.measurement_overrun_invalid = True
+        self.measurement_rejected_pair_ids.add(pair_id)
+        self.accepted_pair_discard_count += 1
+        self.last_measurement_rejection_reason = "measurement_queue_overflow"
+        self._drop_pair_state_locked(pair_id, "measurement_queue_overflow")
+        return True
 
     def _ground_truth_pose_cb(self, msg):
         if str(msg.header.frame_id) != WORLD_FRAME:
@@ -1394,10 +1409,21 @@ class StereoDistanceNode(Node):
     def _should_subscribe_camera_images(self):
         if self.yolo_target_hz <= 0.0:
             return False
-        return self.observation_mode in ("bbox_yolo", "ideal_reference_point")
+        if self.observation_mode == "ideal_reference_point":
+            return True
+        return (
+            self.observation_mode == "bbox_yolo"
+            and bool(self.yolo_model_path.strip())
+            and not self.yolo_runtime_disabled
+        )
 
     def _should_load_yolo_model(self):
-        return self.observation_mode == "bbox_yolo"
+        return (
+            self.observation_mode == "bbox_yolo"
+            and self.yolo_target_hz > 0.0
+            and bool(self.yolo_model_path.strip())
+            and not self.yolo_runtime_disabled
+        )
 
     def _disable_yolo_runtime(self, reason):
         self.yolo_runtime_disabled = True
@@ -1998,18 +2024,17 @@ class StereoDistanceNode(Node):
                 pair, None, None, computed.get("corrected"), count_alignment=False
             )
         )
+        ideal_mode = getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point"
         metrics.update({
-            "observation_mode": getattr(self, "observation_mode", "bbox_yolo"),
-            "observation_source": (
-                "gazebo_reference_point_projection"
-                if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point" else "yolo_bbox_center"
-            ),
-            "measurement_gt_independent": getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo",
-            "reference_source": VEHICLE_REFERENCE_LINK,
-            "projection_camera_pose_source": "actual",
+            "observation_mode": "ideal_reference_point" if ideal_mode else "bbox_yolo",
+            "observation_source": "gazebo_reference_point_projection" if ideal_mode else "yolo_bbox_center",
+            "measurement_gt_independent": not ideal_mode,
+            "reference_source": VEHICLE_REFERENCE_LINK if ideal_mode else "not_applicable",
+            "projection_camera_pose_source": "actual" if ideal_mode else "rendered_image_observation",
             "raw_interpretation_pose_source": "nominal",
             "corrected_interpretation_pose_source": "actual",
             "correction_source": "injected_attitude_oracle",
+            "evaluation_gt_source": "gazebo_reference_link_world_pose",
         })
         self.last_pair_result = dict(metrics)
         self.left_detection = left
@@ -2120,10 +2145,7 @@ class StereoDistanceNode(Node):
         if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
             if pair.pair_id not in {item.pair_id for item in self.measurement_pair_queue}:
                 if len(self.measurement_pair_queue) >= self.measurement_queue_capacity:
-                    self.measurement_queue_overflow_count += 1
-                    self.measurement_overrun_invalid = True
-                    self.measurement_rejected_pair_ids.add(pair.pair_id)
-                    self._drop_pair_state_locked(pair.pair_id, "measurement_queue_overflow")
+                    self._finalize_measurement_queue_overflow_locked(pair.pair_id)
                     return
                 self.measurement_pair_queue.append(pair)
                 self._record_measurement_queue_depth_locked()
@@ -2954,9 +2976,12 @@ class StereoDistanceNode(Node):
             width,
             height,
             projection_camera_mode="actual",
+            enforce_fov_bounds=True,
         )
 
-    def _detection_pair_from_world(self, point_world_enu_m, width, height, *, projection_camera_mode="actual"):
+    def _detection_pair_from_world(
+        self, point_world_enu_m, width, height, *, projection_camera_mode="actual", enforce_fov_bounds=False
+    ):
         self._ensure_camera_frames()
         if projection_camera_mode == "actual":
             camera_left = self.actual_left_camera
@@ -2980,7 +3005,7 @@ class StereoDistanceNode(Node):
             return None, None
         if left_pixel is None or right_pixel is None:
             return None, None
-        if any(
+        if enforce_fov_bounds and any(
             not (0.0 <= float(pixel[0]) < float(width) and 0.0 <= float(pixel[1]) < float(height))
             for pixel in (left_pixel, right_pixel)
         ):

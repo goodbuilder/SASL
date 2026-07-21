@@ -2,6 +2,13 @@
 
 ## Observation modes (S2-I1)
 
+In `bbox_yolo`, camera subscription and model loading require a positive
+`yolo_target_hz`, a non-empty `yolo_model_path`, and a runtime that has not
+been disabled. In `ideal_reference_point`, image stamp/size subscription stays
+active without a model or CUDA runtime; no YOLO load or warm-up is attempted.
+An ideal-mode queue overflow invalidates the run while preserving the accepted
+pair terminal accounting (`processed + discarded == accepted`).
+
 `observation_mode` is immutable for a run and defaults to `bbox_yolo`.
 `bbox_yolo` uses image content and YOLO BBox centers; its measurement is
 Ground-Truth independent. `ideal_reference_point` is a Simulation-only oracle
