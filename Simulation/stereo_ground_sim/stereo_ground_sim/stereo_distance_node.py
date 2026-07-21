@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 try:  # ROS is present in production; pure geometry tests may run without it.
@@ -101,6 +102,13 @@ from stereo_ground_sim.runtime_deployment_selector import (
     RuntimeMeasurementSample,
     RuntimeStereoCameraContract,
     load_observation_fusion_adapter_from_manifest,
+)
+from stereo_ground_sim.research_recording import (
+    RESEARCH_SCHEMA_VERSION,
+    ResearchRecorder,
+    discover_repository_root,
+    empty_pair_record,
+    validate_recording_configuration,
 )
 from stereo_ground_sim.disparity_residual_feature_summary import feature_summary_from_arrays, feature_summary_from_runtime_rows
 from stereo_ground_sim.disparity_residual_feature_selector import DisparityResidualFeatureSelector
@@ -212,6 +220,20 @@ class StereoDistanceNode(Node):
         self.declare_parameter("relative_optical_pitch_error_deg", 0.0)
         self.declare_parameter("common_optical_yaw_error_deg", 0.0)
         self.declare_parameter("relative_optical_yaw_error_deg", 0.0)
+        self.declare_parameter("enable_research_recording", False)
+        self.declare_parameter("research_output_dir", "")
+        self.declare_parameter("research_run_id", "")
+        self.declare_parameter("research_case_id", "")
+        self.declare_parameter("research_repository", "")
+        self.declare_parameter("research_branch", "")
+        self.declare_parameter("research_commit_sha", "")
+        self.declare_parameter("research_git_status", "")
+        self.declare_parameter("research_gazebo_version", "")
+        self.declare_parameter("research_px4_version", "not_applicable")
+        self.declare_parameter("research_record_queue_capacity", 1024)
+        self.declare_parameter("camera_image_width_px", 1280)
+        self.declare_parameter("camera_image_height_px", 720)
+        self.declare_parameter("camera_update_rate_hz", 20.0)
 
         self.scenario_name = str(self.get_parameter("scenario_name").value)
         self.target_class = str(self.get_parameter("target_class").value)
@@ -291,6 +313,22 @@ class StereoDistanceNode(Node):
             setattr(self, name, self._float_param(name))
         self._configure_attitude_error_state()
         self._configure_camera_frames()
+        self.enable_research_recording = self._bool_param("enable_research_recording")
+        self.research_output_dir = str(self.get_parameter("research_output_dir").value)
+        self.research_run_id = str(self.get_parameter("research_run_id").value)
+        self.research_case_id = str(self.get_parameter("research_case_id").value)
+        self.research_repository = str(self.get_parameter("research_repository").value)
+        self.research_branch = str(self.get_parameter("research_branch").value)
+        self.research_commit_sha = str(self.get_parameter("research_commit_sha").value)
+        self.research_git_status = str(self.get_parameter("research_git_status").value)
+        self.research_gazebo_version = str(self.get_parameter("research_gazebo_version").value)
+        self.research_px4_version = str(self.get_parameter("research_px4_version").value)
+        self.research_record_queue_capacity = int(
+            self.get_parameter("research_record_queue_capacity").value
+        )
+        self.camera_image_width_px = int(self.get_parameter("camera_image_width_px").value)
+        self.camera_image_height_px = int(self.get_parameter("camera_image_height_px").value)
+        self.camera_update_rate_hz = self._float_param("camera_update_rate_hz")
         self.disparity_residual_feature_selector_window = deque(
             maxlen=self.disparity_residual_feature_selector_window_size
         )
@@ -420,6 +458,13 @@ class StereoDistanceNode(Node):
         self.dropped_on_shutdown_pair_id_min = None
         self.dropped_on_shutdown_pair_id_max = None
         self.discard_measurement_commits = False
+        self.research_recorder = None
+        self.research_terminal_pair_keys = set()
+        self.research_terminal_record_count = 0
+        self.research_recording_overrun_invalid = False
+        self.research_recording_error_count = 0
+        self.research_recording_first_error_type = ""
+        self.research_recording_first_error_message = ""
         self.metrics = {
             "distance_m": None,
             "disparity_px": None,
@@ -447,6 +492,7 @@ class StereoDistanceNode(Node):
         }
         self.lock = threading.Lock()
         self.yolo_condition = threading.Condition(self.lock)
+        self._initialize_research_recording()
         self._initialize_yolo_runtime_if_enabled()
 
         self.distance_pub = self.create_publisher(Float32, "/target_distance", 10)
@@ -547,6 +593,136 @@ class StereoDistanceNode(Node):
         if mode not in ("bbox_yolo", "ideal_reference_point"):
             raise ValueError("observation_mode must be bbox_yolo or ideal_reference_point")
         return mode
+
+    @staticmethod
+    def _finite_or_none(value):
+        if value is None:
+            return None
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else None
+
+    @staticmethod
+    def _recording_parameter_names():
+        return {
+            "enable_research_recording",
+            "research_output_dir",
+            "research_run_id",
+            "research_case_id",
+            "research_repository",
+            "research_branch",
+            "research_commit_sha",
+            "research_git_status",
+            "research_gazebo_version",
+            "research_px4_version",
+            "research_record_queue_capacity",
+            "camera_image_width_px",
+            "camera_image_height_px",
+            "camera_update_rate_hz",
+        }
+
+    def _research_run_metadata(self):
+        observation = self._observation_metadata()
+        attitude = {
+            name: getattr(self, name) for name in self._attitude_parameter_names()
+        }
+        attitude.update(
+            {
+                "effective_left_optical_roll_error_deg": self.effective_left_optical_roll_error_deg,
+                "effective_left_optical_pitch_error_deg": self.effective_left_optical_pitch_error_deg,
+                "effective_left_optical_yaw_error_deg": self.effective_left_optical_yaw_error_deg,
+                "effective_right_optical_roll_error_deg": self.effective_right_optical_roll_error_deg,
+                "effective_right_optical_pitch_error_deg": self.effective_right_optical_pitch_error_deg,
+                "effective_right_optical_yaw_error_deg": self.effective_right_optical_yaw_error_deg,
+                "attitude_error_frame": self.attitude_error_frame,
+                "attitude_angle_unit": self.attitude_angle_unit,
+                "attitude_parameterization": self.attitude_parameterization,
+                "attitude_rotation_composition": self.attitude_rotation_composition,
+            }
+        )
+        return {
+            "schema_version": RESEARCH_SCHEMA_VERSION,
+            "run_id": self.research_run_id,
+            "case_id": self.research_case_id,
+            "repository": self.research_repository,
+            "branch": self.research_branch,
+            "commit_sha": self.research_commit_sha,
+            "git_status": self.research_git_status,
+            "ros_distro": os.environ.get("ROS_DISTRO", ""),
+            "rmw_implementation": os.environ.get("RMW_IMPLEMENTATION", "default"),
+            "gazebo_version": self.research_gazebo_version,
+            "px4_version": self.research_px4_version,
+            "observation_mode": observation["observation_mode"],
+            "observation_source": observation["observation_source"],
+            "measurement_gt_independent": observation["measurement_gt_independent"],
+            "reference_source": observation["reference_source"],
+            "projection_camera_pose_source": observation["projection_camera_pose_source"],
+            "evaluation_gt_source": observation["evaluation_gt_source"],
+            "gazebo_world_frame": "gazebo_world_enu",
+            "gazebo_world_axes": "east_north_up",
+            "camera_optical_frame": "camera_optical_rdf",
+            "camera_optical_axes": "right_down_forward",
+            "output_frame": BASELINE_CENTER_FRD_FRAME,
+            "output_axes": "forward_right_down",
+            "position_unit": "m",
+            "pixel_unit": "px",
+            "angle_unit": "deg",
+            "timestamp_unit": "ns",
+            "quaternion_order": "xyzw",
+            "baseline_m": self.baseline_m,
+            "camera_height_m": self.camera_height_m,
+            "horizontal_fov_rad": self.horizontal_fov_rad,
+            "image_width_px": self.camera_image_width_px,
+            "image_height_px": self.camera_image_height_px,
+            "camera_update_rate_hz": self.camera_update_rate_hz,
+            **attitude,
+            "scenario_name": self.scenario_name,
+            "target_class": self.target_class,
+            "target_size_m": self._finite_or_none(self.target_size_m),
+            "mission_profile": self.mission_profile,
+            "target_model_name": self.target_model_name,
+            "target_spawn_z_m": self.target_spawn_z_m,
+            "scenario_range_min_m": self._finite_or_none(self.scenario_range_min_m),
+            "scenario_range_max_m": self._finite_or_none(self.scenario_range_max_m),
+            "approach_start_distance_m": self.approach_start_distance_m,
+            "approach_end_distance_m": self.approach_end_distance_m,
+            "zoom_index": self._finite_or_none(self.zoom_index),
+            "measurement_queue_capacity": self.measurement_queue_capacity,
+            "research_record_queue_capacity": self.research_record_queue_capacity,
+            "strict_measurement_overrun_policy": True,
+            "recorder_queue_policy": "invalidate_run_no_silent_drop",
+            "yolo_model_status": (
+                "not_applicable"
+                if self.observation_mode == "ideal_reference_point"
+                else "configured" if self.yolo_model_path.strip() else "not_configured"
+            ),
+        }
+
+    def _initialize_research_recording(self):
+        if not self.enable_research_recording:
+            return
+        if self.camera_image_width_px <= 0 or self.camera_image_height_px <= 0:
+            raise ValueError("recording camera image dimensions must be positive")
+        if not math.isfinite(self.camera_update_rate_hz) or self.camera_update_rate_hz <= 0.0:
+            raise ValueError("recording camera update rate must be positive and finite")
+        repository_root = discover_repository_root(Path.cwd())
+        output_dir = validate_recording_configuration(
+            output_dir=self.research_output_dir,
+            run_id=self.research_run_id,
+            case_id=self.research_case_id,
+            repository=self.research_repository,
+            branch=self.research_branch,
+            commit_sha=self.research_commit_sha,
+            git_status=self.research_git_status,
+            gazebo_version=self.research_gazebo_version,
+            px4_version=self.research_px4_version,
+            queue_capacity=self.research_record_queue_capacity,
+            repository_root=repository_root,
+        )
+        self.research_recorder = ResearchRecorder(
+            output_dir=output_dir,
+            run_metadata=self._research_run_metadata(),
+            queue_capacity=self.research_record_queue_capacity,
+        )
 
     def _bool_param(self, name):
         return self._coerce_bool(self.get_parameter(name).value)
@@ -658,6 +834,236 @@ class StereoDistanceNode(Node):
         fx = (width * 0.5) / math.tan(float(self.horizontal_fov_rad) * 0.5)
         return PinholeIntrinsics(fx_px=fx, fy_px=fx, cx_px=width * 0.5, cy_px=height * 0.5)
 
+    def _research_recording_enabled(self):
+        return getattr(self, "research_recorder", None) is not None
+
+    @staticmethod
+    def _all_finite(values):
+        return all(value is not None and math.isfinite(float(value)) for value in values)
+
+    def _submit_research_terminal_locked(
+        self,
+        pair,
+        *,
+        terminal_status,
+        terminal_reason,
+        measurement_status,
+        evaluation_status,
+        metrics=None,
+        alignment=None,
+    ):
+        """Submit one immutable terminal snapshot while holding the node lock.
+
+        The recorder performs only validation plus ``put_nowait`` here.  File
+        I/O, JSONL validation, CSV export, hashes, and final summary all run
+        outside ``yolo_condition``.
+        """
+
+        recorder = getattr(self, "research_recorder", None)
+        if recorder is None or pair is None:
+            return False
+        key = (int(pair.epoch), int(pair.pair_id))
+        terminal_keys = getattr(self, "research_terminal_pair_keys", None)
+        if terminal_keys is None:
+            terminal_keys = set()
+            self.research_terminal_pair_keys = terminal_keys
+        if key in terminal_keys:
+            return False
+        terminal_keys.add(key)
+
+        metrics = {} if metrics is None else dict(metrics)
+        observation = self._observation_metadata()
+        alignment = alignment or getattr(self, "gt_alignments_by_pair_id", {}).get(
+            pair.pair_id
+        )
+        record = empty_pair_record()
+        record.update(
+            {
+                "schema_version": RESEARCH_SCHEMA_VERSION,
+                "run_id": self.research_run_id,
+                "case_id": self.research_case_id,
+                "record_sequence": None,
+                "record_type": "pair_terminal",
+                "pair_id": int(pair.pair_id),
+                "epoch": int(pair.epoch),
+                "left_stamp_ns": int(pair.left_stamp_ns),
+                "right_stamp_ns": int(pair.right_stamp_ns),
+                "pair_midpoint_stamp_ns": int(pair.pair_midpoint_stamp_ns),
+                "pair_delta_ns": int(pair.pair_delta_ns),
+                "pairing_mode": str(pair.pairing_mode),
+                "terminal_status": str(terminal_status),
+                "terminal_reason": str(terminal_reason),
+                "measurement_status": str(measurement_status),
+                "evaluation_status": str(evaluation_status),
+                "gt_alignment_mode": (
+                    "unavailable" if alignment is None else alignment.gt_alignment_mode
+                ),
+                "gt_before_stamp_ns": None if alignment is None else alignment.gt_before_stamp_ns,
+                "gt_after_stamp_ns": None if alignment is None else alignment.gt_after_stamp_ns,
+                "gt_interpolation_alpha": None if alignment is None else alignment.gt_interpolation_alpha,
+                "gt_nearest_delta_ns": None if alignment is None else alignment.gt_nearest_delta_ns,
+                "observation_mode": metrics.get(
+                    "observation_mode", observation["observation_mode"]
+                ),
+                "observation_source": metrics.get(
+                    "observation_source", observation["observation_source"]
+                ),
+                "measurement_gt_independent": metrics.get(
+                    "measurement_gt_independent",
+                    observation["measurement_gt_independent"],
+                ),
+                "reference_source": metrics.get(
+                    "reference_source", observation["reference_source"]
+                ),
+                "projection_camera_pose_source": metrics.get(
+                    "projection_camera_pose_source",
+                    observation["projection_camera_pose_source"],
+                ),
+                "left_u_px": metrics.get("left_u_px"),
+                "left_v_px": metrics.get("left_v_px"),
+                "right_u_px": metrics.get("right_u_px"),
+                "right_v_px": metrics.get("right_v_px"),
+                "left_confidence": metrics.get("left_confidence"),
+                "right_confidence": metrics.get("right_confidence"),
+                "raw_computation_status": metrics.get(
+                    "raw_computation_status", metrics.get("computation_status")
+                ),
+                "raw_forward_m": metrics.get("raw_forward_m", metrics.get("estimated_forward_m")),
+                "raw_right_m": metrics.get("raw_right_m", metrics.get("estimated_right_m")),
+                "raw_down_m": metrics.get("raw_down_m", metrics.get("estimated_down_m")),
+                "raw_range_m": metrics.get("raw_range_m", metrics.get("estimated_range_m")),
+                "raw_ray_gap_m": metrics.get("raw_ray_gap_m", metrics.get("ray_gap_m")),
+                "raw_intersection_angle_deg": metrics.get(
+                    "raw_intersection_angle_deg", metrics.get("intersection_angle_deg")
+                ),
+                "raw_left_depth_m": metrics.get("raw_left_depth_m", metrics.get("left_depth_m")),
+                "raw_right_depth_m": metrics.get("raw_right_depth_m", metrics.get("right_depth_m")),
+                "raw_geometry_rank": metrics.get("raw_geometry_rank", metrics.get("geometry_rank")),
+                "raw_condition_number": metrics.get(
+                    "raw_condition_number", metrics.get("condition_number")
+                ),
+                "corrected_computation_status": metrics.get(
+                    "attitude_corrected_computation_status"
+                ),
+                "corrected_forward_m": metrics.get("attitude_corrected_forward_m"),
+                "corrected_right_m": metrics.get("attitude_corrected_right_m"),
+                "corrected_down_m": metrics.get("attitude_corrected_down_m"),
+                "corrected_range_m": metrics.get("attitude_corrected_range_m"),
+                "corrected_ray_gap_m": metrics.get("attitude_corrected_ray_gap_m"),
+                "corrected_intersection_angle_deg": metrics.get(
+                    "attitude_corrected_intersection_angle_deg"
+                ),
+                "corrected_left_depth_m": metrics.get("attitude_corrected_left_depth_m"),
+                "corrected_right_depth_m": metrics.get("attitude_corrected_right_depth_m"),
+                "corrected_geometry_rank": metrics.get("attitude_corrected_geometry_rank"),
+                "corrected_condition_number": metrics.get(
+                    "attitude_corrected_condition_number"
+                ),
+                "gt_source": "gazebo_reference_link_world_pose",
+                "gt_source_entity": SOURCE_GAZEBO_ENTITY,
+                "gt_reference_name": VEHICLE_REFERENCE_LINK,
+                "gt_reference_definition": VEHICLE_REFERENCE_DEFINITION,
+                "gt_fallback_used": False,
+                "gt_forward_m": metrics.get("gt_forward_m"),
+                "gt_right_m": metrics.get("gt_right_m"),
+                "gt_down_m": metrics.get("gt_down_m"),
+                "gt_range_m": metrics.get("gt_range_m"),
+                "raw_position_error_m": metrics.get("raw_position_error_m"),
+                "raw_forward_error_m": metrics.get("raw_forward_error_m"),
+                "raw_right_error_m": metrics.get("raw_right_error_m"),
+                "raw_down_error_m": metrics.get("raw_down_error_m"),
+                "raw_range_error_m": metrics.get("raw_range_error_m"),
+                "corrected_position_error_m": metrics.get("corrected_position_error_m"),
+                "corrected_forward_error_m": metrics.get("corrected_forward_error_m"),
+                "corrected_right_error_m": metrics.get("corrected_right_error_m"),
+                "corrected_down_error_m": metrics.get("corrected_down_error_m"),
+                "corrected_range_error_m": metrics.get("corrected_range_error_m"),
+                "measurement_queue_depth": len(getattr(self, "measurement_pair_queue", ())),
+                "measurement_queue_depth_max": getattr(self, "measurement_queue_depth_max", 0),
+                "measurement_queue_capacity": getattr(self, "measurement_queue_capacity", 0),
+                "measurement_queue_overflow_count": getattr(
+                    self, "measurement_queue_overflow_count", 0
+                ),
+                "measurement_overrun_invalid": getattr(
+                    self, "measurement_overrun_invalid", False
+                ),
+                "measurement_rejected_after_overrun_count": getattr(
+                    self, "measurement_rejected_after_overrun_count", 0
+                ),
+                "measurement_accepted_count": getattr(self, "measurement_accepted_count", 0),
+                "measurement_processed_count": getattr(self, "measurement_processed_count", 0),
+                "accepted_pair_discard_count": getattr(
+                    self, "accepted_pair_discard_count", 0
+                ),
+                "measurement_processing_error_count": getattr(
+                    self, "measurement_processing_error_count", 0
+                ),
+                "gt_evaluation_success_count": getattr(
+                    self, "gt_evaluation_success_count", 0
+                ),
+                "gt_evaluation_error_count": getattr(self, "gt_evaluation_error_count", 0),
+                "research_record_queue_depth": recorder.queue_depth,
+                "research_record_queue_depth_max": recorder.queue_depth_max,
+                "research_record_queue_capacity": recorder.queue_capacity,
+                "research_recording_overrun_invalid": recorder.overrun_invalid,
+                "research_recording_error_count": recorder.error_count,
+                "output_frame": BASELINE_CENTER_FRD_FRAME,
+                "output_axes": "forward_right_down",
+                "position_unit": "m",
+                "pixel_unit": "px",
+                "angle_unit": "deg",
+                "timestamp_unit": "ns",
+                "correction_source": "injected_attitude_oracle",
+            }
+        )
+        for name in self._attitude_parameter_names():
+            record[name] = getattr(self, name)
+        for name in (
+            "effective_left_optical_roll_error_deg",
+            "effective_left_optical_pitch_error_deg",
+            "effective_left_optical_yaw_error_deg",
+            "effective_right_optical_roll_error_deg",
+            "effective_right_optical_pitch_error_deg",
+            "effective_right_optical_yaw_error_deg",
+        ):
+            record[name] = getattr(self, name)
+
+        record["sample_eligible"] = bool(
+            terminal_status == "evaluated"
+            and measurement_status == "processed"
+            and evaluation_status == "evaluated"
+            and self._all_finite(
+                record[name]
+                for name in ("left_u_px", "left_v_px", "right_u_px", "right_v_px")
+            )
+            and record["raw_computation_status"] == "computed"
+            and record["corrected_computation_status"] == "computed"
+            and self._all_finite(
+                record[name]
+                for name in (
+                    "raw_forward_m", "raw_right_m", "raw_down_m", "raw_range_m",
+                    "corrected_forward_m", "corrected_right_m", "corrected_down_m",
+                    "corrected_range_m", "gt_forward_m", "gt_right_m", "gt_down_m",
+                    "gt_range_m",
+                )
+            )
+            and record["output_frame"] == BASELINE_CENTER_FRD_FRAME
+        )
+        submitted = recorder.submit(record)
+        if submitted:
+            self.research_terminal_record_count = getattr(
+                self, "research_terminal_record_count", 0
+            ) + 1
+        else:
+            self.research_recording_error_count = getattr(
+                self, "research_recording_error_count", 0
+            ) + 1
+            self.research_recording_overrun_invalid = recorder.overrun_invalid
+            if not getattr(self, "research_recording_first_error_type", ""):
+                self.research_recording_first_error_type = recorder.first_error_type
+                self.research_recording_first_error_message = recorder.first_error_message
+        return submitted
+
     def _clock_cb(self, msg):
         try:
             stamp_ns = int(msg.clock.sec) * 1_000_000_000 + int(msg.clock.nanosec)
@@ -676,7 +1082,26 @@ class StereoDistanceNode(Node):
 
     def _reset_for_simulation_epoch_locked(self, epoch, reset_stamp_ns=None):
         self._ensure_gt_evaluation_state_locked()
-        accepted_pending = len(self.pairs_by_pair_id)
+        pending_pairs = tuple(self.pairs_by_pair_id.values())
+        discarded_pending = sum(
+            pair.pair_id not in self.measurement_results_by_pair_id
+            for pair in pending_pairs
+        )
+        self.accepted_pair_discard_count += discarded_pending
+        for pair in pending_pairs:
+            self._submit_research_terminal_locked(
+                pair,
+                terminal_status="simulation_reset_discarded",
+                terminal_reason="simulation_clock_reset",
+                measurement_status=(
+                    "processed"
+                    if pair.pair_id in self.measurement_results_by_pair_id
+                    else "discarded"
+                ),
+                evaluation_status="not_evaluated",
+                metrics=self.measurement_results_by_pair_id.get(pair.pair_id),
+                alignment=self.gt_alignments_by_pair_id.get(pair.pair_id),
+            )
         dropped = self.image_pairer.reset_for_epoch(epoch)
         dropped += self.pending_gt_aligner.clear()
         dropped += len(self.measurement_pair_queue)
@@ -709,7 +1134,6 @@ class StereoDistanceNode(Node):
         self.cached_actual_distance = None
         self.ground_truth_stamp_ns = None
         self.old_epoch_frame_count += dropped
-        self.accepted_pair_discard_count += accepted_pending
 
     def _register_measurement_pairs_locked(self, pairs):
         ready_count = 0
@@ -795,6 +1219,15 @@ class StereoDistanceNode(Node):
         self.measurement_rejected_pair_ids.add(pair_id)
         self.accepted_pair_discard_count += 1
         self.last_measurement_rejection_reason = "measurement_queue_overflow"
+        self._submit_research_terminal_locked(
+            self.pairs_by_pair_id.get(pair_id),
+            terminal_status="measurement_queue_overflow",
+            terminal_reason="measurement_queue_overflow",
+            measurement_status="discarded",
+            evaluation_status="not_evaluated",
+            metrics=self.measurement_results_by_pair_id.get(pair_id),
+            alignment=self.gt_alignments_by_pair_id.get(pair_id),
+        )
         self._drop_pair_state_locked(pair_id, "measurement_queue_overflow")
         return True
 
@@ -1100,6 +1533,11 @@ class StereoDistanceNode(Node):
         )
 
     def _on_param_update(self, params):
+        if any(param.name in self._recording_parameter_names() for param in params):
+            return SetParametersResult(
+                successful=False,
+                reason="research recording and camera sampling parameters are immutable for one run",
+            )
         if any(param.name == "observation_mode" for param in params):
             return SetParametersResult(
                 successful=False,
@@ -1743,9 +2181,59 @@ class StereoDistanceNode(Node):
             return None
         return self.cached_actual_distance
 
+    def _finalize_research_recording(self):
+        recorder = getattr(self, "research_recorder", None)
+        if recorder is None:
+            return None
+        try:
+            summary = recorder.close(
+                {
+                    "run_id": self.research_run_id,
+                    "case_id": self.research_case_id,
+                    "shutdown_drain_status": self.shutdown_drain_status,
+                    "accepted": self.measurement_accepted_count,
+                    "processed": self.measurement_processed_count,
+                    "discarded": self.accepted_pair_discard_count,
+                    "measurement_queue_overflow_count": self.measurement_queue_overflow_count,
+                    "measurement_overrun_invalid": self.measurement_overrun_invalid,
+                    "measurement_rejected_after_overrun_count": self.measurement_rejected_after_overrun_count,
+                    "measurement_processing_error_count": self.measurement_processing_error_count,
+                    "gt_evaluation_success_count": self.gt_evaluation_success_count,
+                    "gt_evaluation_error_count": self.gt_evaluation_error_count,
+                    "simulation_reset_count": self.simulation_epoch.reset_count,
+                    "input_rejected_after_shutdown_count": self.input_rejected_after_shutdown_count,
+                    "dropped_on_shutdown_count": self.dropped_on_shutdown_count,
+                    "remaining_measurement_queue": len(self.measurement_pair_queue),
+                    "remaining_gt_queue": len(self.gt_alignment_ready_queue),
+                    "inflight_pair": self.inflight_pair_id,
+                }
+            )
+            self.research_run_summary = summary
+            self.research_recording_overrun_invalid = recorder.overrun_invalid
+            self.research_recording_error_count = recorder.error_count
+            self.research_recording_first_error_type = recorder.first_error_type
+            self.research_recording_first_error_message = recorder.first_error_message
+            return summary
+        except Exception as exc:
+            self.research_recording_error_count = getattr(
+                self, "research_recording_error_count", 0
+            ) + 1
+            if not getattr(self, "research_recording_first_error_type", ""):
+                self.research_recording_first_error_type = type(exc).__name__
+                self.research_recording_first_error_message = str(exc)
+            try:
+                self.get_logger().error(
+                    "Research recorder finalization failed; RUN_INCOMPLETE retained: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            except Exception:
+                pass
+            return None
+
     def shutdown(self):
         if not hasattr(self, "yolo_condition"):
             self.shutdown_event.set()
+            self._finalize_research_recording()
             return
         started = time.monotonic()
         drain_timeout_s = 5.0
@@ -1795,7 +2283,27 @@ class StereoDistanceNode(Node):
                 if remaining_ids:
                     self.dropped_on_shutdown_pair_id_min = min(remaining_ids)
                     self.dropped_on_shutdown_pair_id_max = max(remaining_ids)
+                newly_discarded_ids = tuple(
+                    pair_id
+                    for pair_id in remaining_ids
+                    if pair_id in self.pairs_by_pair_id
+                    and pair_id not in self.measurement_results_by_pair_id
+                )
+                self.accepted_pair_discard_count += len(newly_discarded_ids)
                 for pair_id in tuple(remaining_ids):
+                    pair = self.pairs_by_pair_id.get(pair_id)
+                    metrics = self.measurement_results_by_pair_id.get(pair_id)
+                    self._submit_research_terminal_locked(
+                        pair,
+                        terminal_status="shutdown_discarded",
+                        terminal_reason="shutdown_timeout",
+                        measurement_status=(
+                            "processed" if metrics is not None else "discarded"
+                        ),
+                        evaluation_status="not_evaluated",
+                        metrics=metrics,
+                        alignment=self.gt_alignments_by_pair_id.get(pair_id),
+                    )
                     self._drop_pair_state_locked(pair_id, "shutdown_timeout")
         if self.shutdown_drain_status == "INCOMPLETE":
             self.get_logger().warning(
@@ -1825,6 +2333,7 @@ class StereoDistanceNode(Node):
             self.yolo_condition.notify_all()
         if self.yolo_thread is not None and self.yolo_thread.is_alive():
             self.yolo_thread.join(timeout=2.0)
+        self._finalize_research_recording()
 
     def _command_gazebo_target_pose(self, state):
         now = time.monotonic()
@@ -1966,6 +2475,15 @@ class StereoDistanceNode(Node):
         self.accepted_pair_discard_count += 1
         self.last_measurement_error_type = type(exc).__name__
         self.last_measurement_error_message = str(exc)
+        self._submit_research_terminal_locked(
+            pair,
+            terminal_status="measurement_processing_error",
+            terminal_reason=f"{type(exc).__name__}: {exc}",
+            measurement_status="discarded",
+            evaluation_status="not_evaluated",
+            metrics=self.measurement_results_by_pair_id.get(pair.pair_id),
+            alignment=self.gt_alignments_by_pair_id.get(pair.pair_id),
+        )
         self._drop_pair_state_locked(pair.pair_id, "measurement_processing_error")
         if self.inflight_pair_id == pair.pair_id:
             self.inflight_pair_id = None
@@ -2067,33 +2585,75 @@ class StereoDistanceNode(Node):
             return None
         if pair.epoch != self.simulation_epoch.epoch:
             self.old_epoch_result_discard_count += 1
-            self.accepted_pair_discard_count += 1
+            pair_still_pending = (
+                not hasattr(self, "pairs_by_pair_id")
+                or pair.pair_id in self.pairs_by_pair_id
+            )
+            if pair_still_pending:
+                self.accepted_pair_discard_count += 1
+                self._submit_research_terminal_locked(
+                    pair,
+                    terminal_status="old_epoch_result_discarded",
+                    terminal_reason="completed_result_from_old_simulation_epoch",
+                    measurement_status="discarded",
+                    evaluation_status="not_evaluated",
+                    metrics=getattr(self, "measurement_results_by_pair_id", {}).get(
+                        pair.pair_id
+                    ),
+                    alignment=getattr(self, "gt_alignments_by_pair_id", {}).get(
+                        pair.pair_id
+                    ),
+                )
             self.get_logger().warning(
                 "Discarded completed YOLO result from old simulation epoch: "
                 f"pair_id={pair.pair_id}, pair_epoch={pair.epoch}, "
                 f"current_epoch={self.simulation_epoch.epoch}"
             )
+            if pair_still_pending and hasattr(self, "pairs_by_pair_id"):
+                self._drop_pair_state_locked(
+                    pair.pair_id, "old_epoch_result_discarded"
+                )
             self.yolo_condition.notify_all()
             return None
         left_image = computed.get("left_image")
         right_image = computed.get("right_image")
         if left_image is None or right_image is None:
-            self._drop_pair_state_locked(pair.pair_id, "image_decode_failure")
             self.accepted_pair_discard_count += 1
             if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
                 self.ideal_projection_rejected_count += 1
                 self.last_ideal_projection_error = computed.get("ideal_error", "invalid_image")
                 self.last_ideal_projection_pair_id = pair.pair_id
+            self._submit_research_terminal_locked(
+                pair,
+                terminal_status="image_decode_failure",
+                terminal_reason=computed.get("ideal_error", "image_decode_failure"),
+                measurement_status="discarded",
+                evaluation_status="not_evaluated",
+                alignment=getattr(self, "gt_alignments_by_pair_id", {}).get(
+                    pair.pair_id
+                ),
+            )
+            self._drop_pair_state_locked(pair.pair_id, "image_decode_failure")
             self.yolo_condition.notify_all()
             return None
         left = computed.get("left")
         right = computed.get("right")
         if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point" and (left is None or right is None):
-            self._drop_pair_state_locked(pair.pair_id, "ideal_projection_rejected")
             self.accepted_pair_discard_count += 1
             self.ideal_projection_rejected_count += 1
             self.last_ideal_projection_error = computed.get("ideal_error", "projection_invalid_or_out_of_fov")
             self.last_ideal_projection_pair_id = pair.pair_id
+            self._submit_research_terminal_locked(
+                pair,
+                terminal_status="ideal_projection_rejected",
+                terminal_reason=self.last_ideal_projection_error,
+                measurement_status="discarded",
+                evaluation_status="not_evaluated",
+                alignment=getattr(self, "gt_alignments_by_pair_id", {}).get(
+                    pair.pair_id
+                ),
+            )
+            self._drop_pair_state_locked(pair.pair_id, "ideal_projection_rejected")
             self.yolo_condition.notify_all()
             return None
         if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
@@ -2120,6 +2680,8 @@ class StereoDistanceNode(Node):
             )
         )
         metrics.update(self._observation_metadata())
+        metrics["left_confidence"] = None if left is None else left.get("confidence")
+        metrics["right_confidence"] = None if right is None else right.get("confidence")
         self.last_pair_result = dict(metrics)
         self.left_detection = left
         self.right_detection = right
@@ -2289,10 +2851,24 @@ class StereoDistanceNode(Node):
         self.last_gt_evaluation_error_type = type(exc).__name__
         self.last_gt_evaluation_error_message = str(exc)
         self.last_gt_evaluation_error_trigger = str(trigger)
+        pair = self.pairs_by_pair_id.get(pair_id)
         metrics = self.measurement_results_by_pair_id.get(pair_id)
         if metrics is not None:
             metrics["evaluation_status"] = "evaluation_error"
             self.last_pair_result = dict(metrics)
+            measurement_status = "processed"
+        else:
+            self.accepted_pair_discard_count += 1
+            measurement_status = "discarded"
+        self._submit_research_terminal_locked(
+            pair,
+            terminal_status="evaluation_error",
+            terminal_reason=f"{trigger}:{type(exc).__name__}: {exc}",
+            measurement_status=measurement_status,
+            evaluation_status="evaluation_error",
+            metrics=metrics,
+            alignment=self.gt_alignments_by_pair_id.get(pair_id),
+        )
         self.gt_alignments_by_pair_id.pop(pair_id, None)
         self.measurement_results_by_pair_id.pop(pair_id, None)
         self.pairs_by_pair_id.pop(pair_id, None)
@@ -2354,6 +2930,15 @@ class StereoDistanceNode(Node):
         if not unavailable:
             self.gt_evaluation_success_count += 1
         self.evaluated_pair_ids.add(pair_id)
+        self._submit_research_terminal_locked(
+            pair,
+            terminal_status="gt_unavailable" if unavailable else "evaluated",
+            terminal_reason="gt_unavailable" if unavailable else "evaluated",
+            measurement_status="processed",
+            evaluation_status="unavailable" if unavailable else "evaluated",
+            metrics=metrics,
+            alignment=alignment,
+        )
         self.measurement_results_by_pair_id.pop(pair_id, None)
         self.gt_alignments_by_pair_id.pop(pair_id, None)
         self.pairs_by_pair_id.pop(pair_id, None)
@@ -2377,12 +2962,39 @@ class StereoDistanceNode(Node):
         return math.sqrt(sum(value * value for value in errors)), errors[0]
 
     def _evaluation_metadata(self, pair, alignment, gt_baseline, metrics):
-        raw_error, raw_forward_error = self._vector_error(metrics, "estimated_", gt_baseline)
-        corrected_error, corrected_forward_error = self._vector_error(
-            metrics,
-            "attitude_corrected_",
-            gt_baseline,
-        )
+        def errors(prefix):
+            if gt_baseline is None:
+                return (None, None, None, None, None)
+            estimate_xyz = tuple(
+                metrics.get(f"{prefix}{axis}_m")
+                for axis in ("forward", "right", "down")
+            )
+            if not self._all_finite(estimate_xyz):
+                return (None, None, None, None, None)
+            forward_error = float(estimate_xyz[0]) - float(gt_baseline["forward_m"])
+            right_error = float(estimate_xyz[1]) - float(gt_baseline["right_m"])
+            down_error = float(estimate_xyz[2]) - float(gt_baseline["down_m"])
+            estimated_range = metrics.get(f"{prefix}range_m")
+            range_error = (
+                float(estimated_range) - float(gt_baseline["range_m"])
+                if self._all_finite((estimated_range, gt_baseline["range_m"]))
+                else None
+            )
+            position_error = math.sqrt(
+                forward_error * forward_error
+                + right_error * right_error
+                + down_error * down_error
+            )
+            return (
+                position_error,
+                forward_error,
+                right_error,
+                down_error,
+                range_error,
+            )
+
+        raw_errors = errors("estimated_")
+        corrected_errors = errors("attitude_corrected_")
         return {
             "pair_id": pair.pair_id,
             "gt_alignment_mode": alignment.gt_alignment_mode,
@@ -2394,10 +3006,16 @@ class StereoDistanceNode(Node):
             "gt_right_m": None if gt_baseline is None else gt_baseline["right_m"],
             "gt_down_m": None if gt_baseline is None else gt_baseline["down_m"],
             "gt_range_m": None if gt_baseline is None else gt_baseline["range_m"],
-            "raw_position_error_m": raw_error,
-            "corrected_position_error_m": corrected_error,
-            "raw_forward_error_m": raw_forward_error,
-            "corrected_forward_error_m": corrected_forward_error,
+            "raw_position_error_m": raw_errors[0],
+            "raw_forward_error_m": raw_errors[1],
+            "raw_right_error_m": raw_errors[2],
+            "raw_down_error_m": raw_errors[3],
+            "raw_range_error_m": raw_errors[4],
+            "corrected_position_error_m": corrected_errors[0],
+            "corrected_forward_error_m": corrected_errors[1],
+            "corrected_right_error_m": corrected_errors[2],
+            "corrected_down_error_m": corrected_errors[3],
+            "corrected_range_error_m": corrected_errors[4],
         }
 
     def _pair_result_metadata(
@@ -2466,6 +3084,8 @@ class StereoDistanceNode(Node):
             ),
             "attitude_corrected_left_depth_m": None if corrected is None else corrected.get("left_depth_m"),
             "attitude_corrected_right_depth_m": None if corrected is None else corrected.get("right_depth_m"),
+            "attitude_corrected_geometry_rank": None if corrected is None else corrected.get("geometry_rank"),
+            "attitude_corrected_condition_number": None if corrected is None else corrected.get("condition_number"),
             "output_frame": BASELINE_CENTER_FRD_FRAME,
         }
         if pair is not None and pair.pair_id % 100 == 0:
@@ -2530,6 +3150,27 @@ class StereoDistanceNode(Node):
             "ideal_projection_rejected_count": self.ideal_projection_rejected_count,
             "last_ideal_projection_error": self.last_ideal_projection_error,
             "last_ideal_projection_pair_id": self.last_ideal_projection_pair_id,
+            "research_recording_enabled": self._research_recording_enabled(),
+            "research_terminal_record_count": getattr(
+                self, "research_terminal_record_count", 0
+            ),
+            "research_record_queue_depth": (
+                0 if not self._research_recording_enabled()
+                else self.research_recorder.queue_depth
+            ),
+            "research_record_queue_depth_max": (
+                0 if not self._research_recording_enabled()
+                else self.research_recorder.queue_depth_max
+            ),
+            "research_record_queue_capacity": getattr(
+                self, "research_record_queue_capacity", 0
+            ),
+            "research_recording_overrun_invalid": getattr(
+                self, "research_recording_overrun_invalid", False
+            ),
+            "research_recording_error_count": getattr(
+                self, "research_recording_error_count", 0
+            ),
         }
 
     @staticmethod

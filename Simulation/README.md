@@ -24,6 +24,33 @@ The existing Gazebo target/model domain mismatch for `bbox_yolo` remains a
 separate limitation; ideal correspondence is not evidence that YOLO detects
 the target.
 
+## Atomic pair-level research recording (S2-R2)
+
+`enable_research_recording` defaults to `false`, so the normal launch creates
+no recorder thread or files.  When enabled, the distance node snapshots each
+accepted pair exactly once at its terminal state and submits the flat record
+to a bounded nonblocking writer queue.  Raw, injected-attitude Corrected,
+Gazebo reference-link Ground Truth, four observation pixels, pair/epoch/stamp
+identity, attitude inputs, errors, and runtime counters therefore come from
+one in-process pair state rather than a latest-value topic join.
+
+The authoritative artifact is UTF-8 `pair_records.jsonl` with schema
+`s2_atomic_pair_v1`; deterministic `pair_records.csv` is exported only during
+clean finalization.  `run_metadata.json`, `run_summary.json`, SHA-256 hashes,
+and `RUN_FINALIZED_VALID` or `RUN_FINALIZED_INVALID` bind provenance and run
+validity to the rows.  `RUN_INCOMPLETE` remains after an abnormal termination.
+Recorder queue overflow or writer failure invalidates the run and is never a
+silent drop.  File I/O, CSV conversion, validation, and hashing execute outside
+the measurement condition lock.
+
+`sample_eligible=true` identifies a successfully evaluated, finite,
+`baseline_center_frd` pair, but it does not make the dataset valid by itself.
+Analysis must use samples only when `run_summary.json` also contains
+`run_valid=true`; a later measurement/recorder overrun, reset, drain failure,
+accounting mismatch, duplicate pair key, or artifact failure invalidates the
+whole run.  This recorder is qualification infrastructure, not a correction
+search, train/validation split, or proof of detector performance.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone

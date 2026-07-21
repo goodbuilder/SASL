@@ -71,6 +71,7 @@ def _write_distance_node_params(context):
         "relative_optical_pitch_error_deg",
         "common_optical_yaw_error_deg",
         "relative_optical_yaw_error_deg",
+        "camera_update_rate_hz",
     }
     int_params = {
         "yolo_imgsz",
@@ -81,6 +82,9 @@ def _write_distance_node_params(context):
         "disparity_residual_feature_selector_window_size",
         "disparity_residual_feature_selector_min_samples",
         "measurement_queue_capacity",
+        "research_record_queue_capacity",
+        "camera_image_width_px",
+        "camera_image_height_px",
     }
     bool_params = {
         "fly_target_in_gazebo",
@@ -90,6 +94,7 @@ def _write_distance_node_params(context):
         "enable_observation_fusion",
         "enable_disparity_residual_profile",
         "enable_disparity_residual_feature_selector",
+        "enable_research_recording",
     }
     names = [
         "scenario_name",
@@ -125,6 +130,20 @@ def _write_distance_node_params(context):
         "relative_optical_pitch_error_deg",
         "common_optical_yaw_error_deg",
         "relative_optical_yaw_error_deg",
+        "camera_image_width_px",
+        "camera_image_height_px",
+        "camera_update_rate_hz",
+        "enable_research_recording",
+        "research_output_dir",
+        "research_run_id",
+        "research_case_id",
+        "research_repository",
+        "research_branch",
+        "research_commit_sha",
+        "research_git_status",
+        "research_gazebo_version",
+        "research_px4_version",
+        "research_record_queue_capacity",
         "yolo_model_path",
         "yolo_class_name",
         "yolo_confidence",
@@ -538,6 +557,17 @@ def generate_launch_description():
             DeclareLaunchArgument("relative_optical_pitch_error_deg", default_value="0.0"),
             DeclareLaunchArgument("common_optical_yaw_error_deg", default_value="0.0"),
             DeclareLaunchArgument("relative_optical_yaw_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("enable_research_recording", default_value="false"),
+            DeclareLaunchArgument("research_output_dir", default_value=""),
+            DeclareLaunchArgument("research_run_id", default_value=""),
+            DeclareLaunchArgument("research_case_id", default_value=""),
+            DeclareLaunchArgument("research_repository", default_value=""),
+            DeclareLaunchArgument("research_branch", default_value=""),
+            DeclareLaunchArgument("research_commit_sha", default_value=""),
+            DeclareLaunchArgument("research_git_status", default_value=""),
+            DeclareLaunchArgument("research_gazebo_version", default_value=""),
+            DeclareLaunchArgument("research_px4_version", default_value="not_applicable"),
+            DeclareLaunchArgument("research_record_queue_capacity", default_value="1024"),
             OpaqueFunction(function=_launch_setup),
         ]
     )
