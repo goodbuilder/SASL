@@ -17,6 +17,10 @@ if str(PACKAGE_DIR) not in sys.path:
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
 from stereo_ground_sim.external_bbox_publisher import detection_values_from_rdf
+from stereo_ground_sim.gazebo_ground_truth_adapter import (
+    parse_pose_v_payload,
+    pose_record_world_from_payload,
+)
 from stereo_ground_sim.runtime_guard_policy import (
     BoundedGainForwardCellGuardPolicy,
     EstimatedToTruthAffineProfile,
@@ -304,32 +308,31 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         disparity = left_cx - right_cx
         self.assertGreater(disparity, 0.5)
 
-    def test_stereo_distance_node_applies_origin_z_offset_to_gazebo_truth_down(self) -> None:
-        node = StereoDistanceNode.__new__(StereoDistanceNode)
-        node.target_model_name = "x500_15m"
-        node.camera_height_m = 10.0
-        node.target_origin_z_offset_m = -1.021823
+    def test_gazebo_truth_uses_authoritative_base_link_world_pose_without_legacy_z_offset(self) -> None:
         payload = {
-            "name": "x500_15m",
-            "position": {
-                "x": 0.25,
-                "y": 2000.0,
-                "z": 5.556999,
-            },
+            "header": {"stamp": {"sec": 12, "nsec": 34}},
+            "pose": [
+                {
+                    "name": "x500_15m",
+                    "id": 16,
+                    "position": {"x": 0.25, "y": 2000.0, "z": 5.556999},
+                    "orientation": {"w": 1.0},
+                },
+                {
+                    "name": "base_link",
+                    "id": 17,
+                    "position": {},
+                    "orientation": {"w": 1.0},
+                },
+            ],
         }
 
-        truth = StereoDistanceNode._ground_truth_from_gazebo_pose_payload(node, payload)
+        link_record = parse_pose_v_payload(payload)
+        truth = pose_record_world_from_payload(payload, link_record)
 
-        self.assertIsNotNone(truth)
-        assert truth is not None
-        self.assertAlmostEqual(truth["forward_m"], 2000.0, places=6)
-        self.assertAlmostEqual(truth["right_m"], 0.25, places=6)
-        self.assertAlmostEqual(truth["down_m"], 5.464824, places=6)
-        self.assertAlmostEqual(
-            truth["ground_truth_m"],
-            math.sqrt(2000.0**2 + 0.25**2 + 5.464824**2),
-            places=6,
-        )
+        self.assertEqual(truth.entity_name, "base_link")
+        self.assertEqual(truth.stamp_ns, 12_000_000_034)
+        self.assertEqual(truth.position_world_enu_m, (0.25, 2000.0, 5.556999))
 
     def test_stereo_distance_node_external_bbox_callback_publishes_public_frd(self) -> None:
         node = StereoDistanceNode.__new__(StereoDistanceNode)
@@ -337,6 +340,7 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         node.baseline_m = 25.0
         node.camera_height_m = 5.0
         node.target_center_z_m = 5.0
+        node.target_spawn_z_m = 5.0
         node.approach_start_distance_m = 1000.0
         node.approach_end_distance_m = 1000.0
         node.approach_duration_s = 1.0
@@ -428,7 +432,7 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         self.assertIsInstance(loaded, RepeatedObservationFusion)
         self.assertEqual(loaded.min_observations, 3)
 
-    def test_stereo_distance_node_applies_observation_fusion_before_profile(self) -> None:
+    def test_stereo_distance_node_preserves_canonical_raw_and_reports_fused_corrected_position(self) -> None:
         node = StereoDistanceNode.__new__(StereoDistanceNode)
         node.horizontal_fov_rad = 0.154997710698
         node.baseline_m = 25.0
@@ -455,13 +459,26 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
             1280,
             720,
         )
+        raw_expected = StereoDistanceNode._position_from_centers(
+            node,
+            outlier_left["cx"],
+            outlier_left["cy"],
+            outlier_right["cx"],
+            outlier_right["cy"],
+            1280,
+            720,
+        )
 
         self.assertIn("observation_fusion=fused:RepeatedObservationFusion:3", metrics["status"])
-        self.assertAlmostEqual(metrics["estimated_right_m"], expected["right_m"])
-        self.assertAlmostEqual(metrics["estimated_down_m"], expected["down_m"])
-        self.assertAlmostEqual(metrics["estimated_forward_m"], expected["forward_m"])
+        self.assertAlmostEqual(metrics["estimated_right_m"], raw_expected["right_m"])
+        self.assertAlmostEqual(metrics["estimated_down_m"], raw_expected["down_m"])
+        self.assertAlmostEqual(metrics["estimated_forward_m"], raw_expected["forward_m"])
+        self.assertAlmostEqual(metrics["corrected_right_m"], expected["right_m"])
+        self.assertAlmostEqual(metrics["corrected_down_m"], expected["down_m"])
+        self.assertAlmostEqual(metrics["corrected_forward_m"], expected["forward_m"])
+        self.assertAlmostEqual(metrics["legacy_fused_raw"]["right_m"], expected["right_m"])
 
-    def test_stereo_distance_node_applies_multiburst_observation_fusion_before_profile(self) -> None:
+    def test_stereo_distance_node_preserves_raw_with_multiburst_fused_corrected_position(self) -> None:
         node = StereoDistanceNode.__new__(StereoDistanceNode)
         node.horizontal_fov_rad = 0.154997710698
         node.baseline_m = 25.0
@@ -503,11 +520,24 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
             1280,
             720,
         )
+        raw_expected = StereoDistanceNode._position_from_centers(
+            node,
+            outlier_left["cx"],
+            outlier_left["cy"],
+            outlier_right["cx"],
+            outlier_right["cy"],
+            1280,
+            720,
+        )
 
         self.assertIn("observation_fusion=fused:MultiBurstObservationFusion:6", metrics["status"])
-        self.assertAlmostEqual(metrics["estimated_right_m"], expected["right_m"])
-        self.assertAlmostEqual(metrics["estimated_down_m"], expected["down_m"])
-        self.assertAlmostEqual(metrics["estimated_forward_m"], expected["forward_m"])
+        self.assertAlmostEqual(metrics["estimated_right_m"], raw_expected["right_m"])
+        self.assertAlmostEqual(metrics["estimated_down_m"], raw_expected["down_m"])
+        self.assertAlmostEqual(metrics["estimated_forward_m"], raw_expected["forward_m"])
+        self.assertAlmostEqual(metrics["corrected_right_m"], expected["right_m"])
+        self.assertAlmostEqual(metrics["corrected_down_m"], expected["down_m"])
+        self.assertAlmostEqual(metrics["corrected_forward_m"], expected["forward_m"])
+        self.assertAlmostEqual(metrics["legacy_fused_raw"]["right_m"], expected["right_m"])
 
     def test_stereo_distance_node_profile_status_reports_observation_fusion_state(self) -> None:
         node = StereoDistanceNode.__new__(StereoDistanceNode)

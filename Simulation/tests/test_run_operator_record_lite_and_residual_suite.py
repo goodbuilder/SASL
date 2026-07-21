@@ -9,6 +9,9 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -25,7 +28,28 @@ def load_module():
     return module
 
 
+@pytest.mark.usefixtures("isolated_operator_overlay_root")
 class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
+    def run_with_isolated_overlay(self, module, argv):
+        suite = module.enablement_suite
+        original_readiness = suite.install_overlay_readiness.check_readiness
+        original_smoke = suite.installed_csv_smoke.run
+
+        def check_isolated_overlay(_root):
+            return original_readiness(self.isolated_operator_overlay_root)
+
+        def run_isolated_smoke(smoke_argv):
+            return original_smoke(
+                ["--root-dir", str(self.isolated_operator_overlay_root), *smoke_argv]
+            )
+
+        with patch.object(
+            suite.install_overlay_readiness,
+            "check_readiness",
+            side_effect=check_isolated_overlay,
+        ), patch.object(suite.installed_csv_smoke, "run", side_effect=run_isolated_smoke):
+            return module.run(argv)
+
     def write_profile(self, path: Path) -> None:
         path.write_text(
             json.dumps(
@@ -153,7 +177,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             self.write_profile(profile)
             model, catalog = self.write_selector(root)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -193,7 +218,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             self.write_profile(profile)
             model, catalog = self.write_selector(root)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -230,7 +256,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             model, catalog = self.write_selector(root)
             self.write_current_schema_telemetry(telemetry)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -272,7 +299,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             model, catalog = self.write_selector(root)
             self.write_current_schema_telemetry(telemetry)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -319,7 +347,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             self.write_profile(profile)
             model, catalog = self.write_selector(root)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -368,7 +397,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             model, catalog = self.write_selector(root)
             self.write_external_bbox_samples(sample_csv, valid_disparity=True)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -418,7 +448,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             model, catalog = self.write_selector(root)
             self.write_external_bbox_samples(sample_csv, valid_disparity=True)
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),
@@ -519,7 +550,8 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
             stale_time = time.time() - 1000.0
             os.utime(telemetry, (stale_time, stale_time))
 
-            result = module.run(
+            result = self.run_with_isolated_overlay(
+                module,
                 [
                     "--profile-json",
                     str(profile),

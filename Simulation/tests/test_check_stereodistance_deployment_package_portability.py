@@ -56,7 +56,9 @@ class CheckStereoDistanceDeploymentPackagePortabilityTests(unittest.TestCase):
         final = root / "rtk_stereo_acceptance_matrix_summary.json"
         final.write_text(
             '{"overall_pass": true, "matrix_item_count": 28, "runtime_truth_used": false, '
-            '"stage_status": {"standalone_profile_promotion": true}}\n',
+            '"stage_status": {"standalone_profile_promotion": true}, '
+            '"matrix_rows": [{"stage": "single_run_output_audit", '
+            '"item": "rdf_axis_rmse_nonregression", "status": "PASS"}]}\n',
             encoding="utf-8",
         )
         manifest = root / "active_profile_deployment_manifest.json"
@@ -75,6 +77,7 @@ class CheckStereoDistanceDeploymentPackagePortabilityTests(unittest.TestCase):
                     "promotion_check_json": str(promotion),
                     "final_acceptance_summary": str(final),
                     "runtime_truth_used": False,
+                    "final_rdf_axis_nonregression_status": "PASS",
                     "coordinate_contract": (
                         "runtime consumes stereo-center RDF(right,down,forward) plus measured disparity; "
                         "PX4/RTK/NED truth is calibration/evaluation only; public StereoDistance topics use FRD+range"
