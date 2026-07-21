@@ -8,6 +8,7 @@ vehicle, fit a correction profile, or implement train/validation/Test splits.
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime, timezone
 import json
 import os
@@ -27,6 +28,7 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from stereo_ground_sim.correction_sweep import (  # noqa: E402
     ATTITUDE_AXES,
+    CASE_CSV_COLUMNS,
     CameraContract,
     S2_SWEEP_SCHEMA_VERSION,
     atomic_write_json,
@@ -272,9 +274,82 @@ def load_json(path: Path) -> dict[str, Any]:
 def validate_resume_plan(
     stored: Mapping[str, Any], regenerated: Mapping[str, Any]
 ) -> None:
+    stored_core = dict(stored)
+    stored_hash = stored_core.pop("plan_hash", None)
+    if stored_hash != sha256_bytes(canonical_json(stored_core).encode("utf-8")):
+        raise ValueError("resume stored plan hash is internally inconsistent")
     for field in ("schema_version", "plan_hash", "commit_sha", "branch"):
         if stored.get(field) != regenerated.get(field):
             raise ValueError(f"resume plan mismatch: {field}")
+    if canonical_json(stored) != canonical_json(regenerated):
+        raise ValueError("resume stored plan payload differs from regenerated plan")
+
+
+def validate_final_sweep_artifacts(
+    *,
+    output_dir: Path,
+    plan: Mapping[str, Any],
+    cases: Sequence[Mapping[str, Any]],
+    completed: Sequence[tuple[Path, Mapping[str, Any]]],
+    summary: Mapping[str, Any],
+) -> None:
+    output = Path(output_dir)
+    expected_hashes = {
+        "sweep_plan_sha256": sha256_file(output / "sweep_plan.json"),
+        "sweep_cases_jsonl_sha256": sha256_file(output / "sweep_cases.jsonl"),
+        "sweep_cases_csv_sha256": sha256_file(output / "sweep_cases.csv"),
+    }
+    for field, value in expected_hashes.items():
+        if summary.get(field) != value:
+            raise ValueError(f"completed sweep artifact hash mismatch: {field}")
+    stored_cases = [
+        json.loads(
+            line,
+            parse_constant=lambda token: (_ for _ in ()).throw(ValueError(token)),
+        )
+        for line in (output / "sweep_cases.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    expected_cases = sorted(cases, key=lambda item: item["canonical_ordinal"])
+    if canonical_json(stored_cases) != canonical_json(expected_cases):
+        raise ValueError("completed sweep case payload differs from regenerated cases")
+    with (output / "sweep_cases.csv").open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    if len(rows) != len(cases) or len(completed) != len(cases):
+        raise ValueError("completed sweep row or attempt count mismatch")
+    expected_rows = {
+        case["case_id"]: _case_row(case, int(state["attempt"]), state)
+        for case, (_attempt, state) in zip(cases, completed)
+    }
+    if len(expected_rows) != len(cases):
+        raise ValueError("completed sweep contains duplicate case IDs")
+    actual_ids = [row.get("case_id") for row in rows]
+    if len(set(actual_ids)) != len(actual_ids) or set(actual_ids) != set(expected_rows):
+        raise ValueError("completed sweep CSV case IDs mismatch")
+    for row in rows:
+        expected = expected_rows[row["case_id"]]
+        for column in CASE_CSV_COLUMNS:
+            expected_text = "" if expected.get(column, "") is None else str(expected.get(column, ""))
+            if row.get(column, "") != expected_text:
+                raise ValueError(
+                    f"completed sweep CSV semantic mismatch: {row['case_id']}:{column}"
+                )
+    expected_summary = {
+        "schema_version": S2_SWEEP_SCHEMA_VERSION,
+        "sweep_id": plan["sweep_id"],
+        "plan_hash": plan["plan_hash"],
+        "commit_sha": plan["commit_sha"],
+        "branch": plan["branch"],
+        "run_valid": True,
+        "finalization_status": "VALID",
+        "case_summary_row_count": len(cases),
+        "valid_case_count": len(cases),
+        "total_runnable": len(cases),
+        "target_physics_mode": "static_model",
+        "target_static_for_research": True,
+    }
+    for field, value in expected_summary.items():
+        if summary.get(field) != value:
+            raise ValueError(f"completed sweep summary mismatch: {field}")
 
 
 def _numeric_attempts(case_dir: Path) -> list[tuple[int, Path]]:
@@ -877,6 +952,13 @@ def main(argv: Sequence[str] | None = None, *, launcher: Any | None = None) -> i
         else:
             summary_valid = False
         if completed and all(item is not None for item in completed) and summary_valid:
+            validate_final_sweep_artifacts(
+                output_dir=output,
+                plan=plan,
+                cases=cases,
+                completed=completed,
+                summary=stored_summary,
+            )
             response = {
                 "schema_version": S2_SWEEP_SCHEMA_VERSION,
                 "sweep_id": args.sweep_id,

@@ -4,13 +4,19 @@ import json
 import importlib.util
 from pathlib import Path
 import sys
+from decimal import Decimal
 
 import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
-from stereo_ground_sim.correction_sweep import latest_valid_attempt, next_attempt_directory
+from stereo_ground_sim.correction_sweep import (
+    CameraContract,
+    build_sweep_plan,
+    next_attempt_directory,
+    write_plan,
+)
 
 
 def _cli_module():
@@ -41,15 +47,6 @@ def test_attempt_numbering_preserves_previous_attempts(tmp_path: Path) -> None:
     assert (path / "attempt_state.json").read_bytes() == original
 
 
-def test_latest_valid_attempt_skips_invalid_and_incomplete(tmp_path: Path) -> None:
-    case = tmp_path / "case"
-    _state(case / "attempt-0001", valid=False, attempt=1)
-    (case / "attempt-0002").mkdir()
-    assert latest_valid_attempt(case) is None
-    _state(case / "attempt-0003", valid=True, attempt=3)
-    assert latest_valid_attempt(case).name == "attempt-0003"
-
-
 def test_attempt_allocator_ignores_unrelated_directories(tmp_path: Path) -> None:
     case = tmp_path / "case"
     (case / "notes").mkdir(parents=True)
@@ -57,23 +54,69 @@ def test_attempt_allocator_ignores_unrelated_directories(tmp_path: Path) -> None
     assert next_attempt_directory(case)[0] == 1
 
 
+def test_state_only_case_valid_is_not_accepted_without_r2_final_marker(
+    tmp_path: Path,
+) -> None:
+    module = _cli_module()
+    case = {"case_id": "case-1", "case_hash": "hash", "payload": {}}
+    attempt = tmp_path / "case-1" / "attempt-0001"
+    _state(attempt, valid=True, attempt=1)
+    inspection = module.inspect_latest_attempt(
+        case=case,
+        case_dir=attempt.parent,
+        provenance={"commit_sha": "a" * 40, "branch": "sim/test"},
+        sweep_id="sweep",
+        warmup_count=0,
+        analysis_count=1,
+    )
+    assert inspection["classification"] == "INCOMPLETE"
+
+
+def test_validated_attempt_inspection_does_not_allocate_new_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _cli_module()
+    case = {"case_id": "case-1", "case_hash": "hash", "payload": {}}
+    attempt = tmp_path / "case-1" / "attempt-0001"
+    _state(attempt, valid=True, attempt=1)
+    state = json.loads((attempt / "attempt_state.json").read_text())
+    state.update(
+        {
+            "case_id": "case-1",
+            "case_hash": "hash",
+            "statistics": {},
+        }
+    )
+    (attempt / "attempt_state.json").write_text(json.dumps(state), encoding="utf-8")
+    (attempt / "recording").mkdir()
+    (attempt / "recording" / "RUN_FINALIZED_VALID").touch()
+    monkeypatch.setattr(module, "validate_r2_artifacts", lambda *args, **kwargs: ([], {}))
+    monkeypatch.setattr(module, "compute_case_statistics", lambda *args, **kwargs: {})
+    monkeypatch.setattr(module, "_attempt_spatial_validation", lambda *args, **kwargs: {})
+    before = sorted(path.name for path in attempt.parent.iterdir())
+    validated = module.validated_latest_attempt(
+        case=case,
+        case_dir=attempt.parent,
+        provenance={"commit_sha": "a" * 40, "branch": "sim/test"},
+        sweep_id="sweep",
+        warmup_count=0,
+        analysis_count=1,
+    )
+    assert validated is not None and validated[0] == attempt
+    assert sorted(path.name for path in attempt.parent.iterdir()) == before
+
+
 def test_resume_plan_identity_fields_must_match() -> None:
     module = _cli_module()
-    stored = {"schema_version": "v", "plan_hash": "h", "commit_sha": "a", "branch": "b"}
-    for field in stored:
+    stored = {"schema_version": "v", "commit_sha": "a", "branch": "b"}
+    stored["plan_hash"] = module.sha256_bytes(
+        module.canonical_json(stored).encode("utf-8")
+    )
+    for field in ("schema_version", "plan_hash", "commit_sha", "branch"):
         regenerated = dict(stored)
         regenerated[field] += "x"
         with pytest.raises(ValueError, match=field):
             module.validate_resume_plan(stored, regenerated)
-
-
-def test_valid_completed_case_does_not_allocate_new_attempt(tmp_path: Path) -> None:
-    case = tmp_path / "case"
-    _state(case / "attempt-0001", valid=True, attempt=1)
-    before = sorted(path.name for path in case.iterdir())
-    assert latest_valid_attempt(case) is not None
-    after = sorted(path.name for path in case.iterdir())
-    assert after == before
 
 
 def test_resume_validates_r2_artifacts_and_stored_statistics(
@@ -169,3 +212,61 @@ def test_contradictory_recording_markers_classify_latest_attempt_unknown(
     )
     assert inspection["classification"] == "UNKNOWN"
     assert "contradictory" in inspection["reason"]
+
+
+def test_completed_resume_revalidates_top_level_csv_hash_and_semantics(tmp_path: Path) -> None:
+    module = _cli_module()
+    plan, cases = build_sweep_plan(
+        sweep_id="sweep",
+        commit_sha="a" * 40,
+        branch="sim/test",
+        repository_name="repo",
+        attitude_mode="ofat",
+        axis_ranges=(),
+        range_values=(Decimal("500"),),
+        bearing_values=(Decimal("0"),),
+        elevation_values=(Decimal("0"),),
+        repetitions=1,
+        seed=0,
+        case_order="canonical",
+        invalid_spatial_policy="fail",
+        max_cases=2,
+        contract=CameraContract(),
+    )
+    write_plan(tmp_path, plan, cases)
+    module.enter_running_state(tmp_path)
+    state = {
+        "attempt": 1,
+        "case_id": cases[0]["case_id"],
+        "case_hash": cases[0]["case_hash"],
+        "plan_hash": plan["plan_hash"],
+        "case_valid": True,
+        "failure_reason": "",
+        "statistics": {},
+    }
+    row = module._case_row(cases[0], 1, state)
+    summary = module.finalize_sweep(
+        output_dir=tmp_path,
+        plan=plan,
+        cases=cases,
+        rows=[row],
+        counters={"launch_count": 1},
+    )
+    completed = [(tmp_path / "cases" / cases[0]["case_id"] / "attempt-0001", state)]
+    module.validate_final_sweep_artifacts(
+        output_dir=tmp_path,
+        plan=plan,
+        cases=cases,
+        completed=completed,
+        summary=summary,
+    )
+    with (tmp_path / "sweep_cases.csv").open("a", encoding="utf-8") as handle:
+        handle.write("tampered\n")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        module.validate_final_sweep_artifacts(
+            output_dir=tmp_path,
+            plan=plan,
+            cases=cases,
+            completed=completed,
+            summary=summary,
+        )

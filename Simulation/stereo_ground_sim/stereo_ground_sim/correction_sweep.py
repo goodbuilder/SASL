@@ -997,17 +997,6 @@ def next_attempt_directory(case_dir: Path) -> tuple[int, Path]:
     return number, case_dir / f"attempt-{number:04d}"
 
 
-def latest_valid_attempt(case_dir: Path) -> Path | None:
-    candidates = sorted(Path(case_dir).glob("attempt-*"), reverse=True)
-    for attempt in candidates:
-        state_path = attempt / "attempt_state.json"
-        if state_path.is_file():
-            state = _load_json(state_path)
-            if state.get("case_valid") is True:
-                return attempt
-    return None
-
-
 def write_case_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     temporary = Path(path).with_name(Path(path).name + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="") as handle:
@@ -1038,7 +1027,6 @@ __all__ = [
     "decimal_text",
     "effective_rpy",
     "fov_preflight",
-    "latest_valid_attempt",
     "next_attempt_directory",
     "parse_attitude_axis_range",
     "parse_numeric_values",
