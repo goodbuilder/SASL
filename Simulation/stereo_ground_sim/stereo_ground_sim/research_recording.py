@@ -294,8 +294,6 @@ class ResearchRecorder:
             try:
                 if item is self._sentinel:
                     return
-                if self.first_error_type:
-                    continue
                 item = validate_pair_record(item)
                 encoded = json.dumps(
                     item, ensure_ascii=False, sort_keys=True, allow_nan=False
