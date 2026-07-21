@@ -131,7 +131,10 @@ GT aligner에 등록하며, late GT가 준비되면 `pair_id`로 기존 measurem
 결합해 GT topic과 error를 계산한다. GT unavailable이면 Raw/Corrected와 해당
 diagnostic은 유지하고 GT/error만 unavailable이다. Shutdown은 새 입력을 막은 뒤
 image pairer, GT pending alignment, measurement queue, evaluation queue 순서로
-drain하므로 마지막 exact/nearest pair의 measurement를 버리지 않는다.
+drain한다. Image callback admission은 shutdown과 같은 condition lock 안에서
+`accepting_input`을 다시 확인하는 지점에서 선형화된다. 따라서 shutdown이 입력을
+닫은 뒤 lock을 얻은 callback은 pairer, pair ID, queue 또는 GT aligner를 변경하지
+않고 `input_rejected_after_shutdown_count`만 증가시킨다.
 
 자세 연구 입력은 `common_optical_yaw_error_deg`와
 `relative_optical_yaw_error_deg`이다. Effective yaw는 left=`common-relative/2`,
@@ -158,7 +161,17 @@ reset 전에 시작했지만 reset 뒤 끝난 old-epoch detection/Raw/attitude-c
 transient는 최대 108 ms 먼저 도착할 수 있어 64-sample bounded
 simulation-time reorder buffer를 사용한다. Clock이 stamp에 도달하면 수용하고,
 200 ms보다 먼 future GT와 reset 전 pending GT는 stale
-pre-reset data로 폐기한다.
+pre-reset data로 폐기한다. Pending GT record에는 callback 수신 당시 epoch를
+보존하며 drain 시 current epoch를 다시 부여하지 않는다.
+
+`PoseStamped` 자체에는 epoch ID가 없으므로 reset 후 지연 도착한 old sample을
+메시지만으로 완전히 판별할 수 없다. 이 제한에는 conservative simulation-time
+quarantine을 적용한다. Reset stamp부터 200 ms까지의 GT는 폐기하며, 이 floor 뒤
+단조 증가하는 GT 두 sample이 관측되고 `/clock`이 floor를 통과해야 quarantine을
+해제한다. 해제된 sample은 receive-time epoch를 유지한 채 기존 bounded reorder
+buffer로 이동하며 position만 선형 보간한다. 따라서 reset마다 초기 200 ms와
+continuity 확인 전 sample은 false-stale이 될 수 있지만, wall-clock sleep 없이
+old GT 200 ms-window 오염을 차단하고 이후 alignment를 복구한다.
 
 Measurement queue 기본 capacity는 32 pair다. 1280x720 CUDA 실측 p99 pair
 inference 약 27 ms와 20 Hz 입력에서 약 1.6초의 일시 stall을 흡수한다. Overflow는
@@ -168,6 +181,10 @@ pair-id watermark, late GT/evaluation dedupe는 128-entry bounded history를 사
 장시간 pair 수에 비례한 set 증가를 막는다. Shutdown drain은 5초 안에 queue,
 GT alignment, in-flight inference가 모두 끝날 때만 `SUCCESS`이며, timeout은
 `INCOMPLETE`와 remaining/in-flight/dropped pair 수 및 ID 범위를 기록한다.
+Pair compute 또는 commit 예외는 pair 단위 failure boundary에서 error/discard를
+각 한 번 기록하고 관련 state와 in-flight flag를 정리한다. 오류 pair는 processed로
+세지 않으며 같은 worker는 다음 pair를 계속 처리한다. Processing error가 한 건이라도
+있으면 queue가 모두 비워져도 shutdown 결과는 `INCOMPLETE`다.
 
 아직 구현하지 않은 범위는 post-hoc 삭제, PX4-only movement cleanup, pair recorder,
 typed aggregate message, speed, roll/pitch 연구, BBox observation error correction이다.

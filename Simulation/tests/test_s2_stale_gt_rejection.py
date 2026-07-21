@@ -59,6 +59,14 @@ def _node():
     node.gt_reorder_lead_limit_ns = 4
     node.future_gt_overflow_count = 0
     node.stale_pre_reset_gt_count = 0
+    node.gt_reset_quarantine_duration_ns = 4
+    node.gt_quarantine_required_contiguous_samples = 2
+    node.gt_quarantine_active = False
+    node.gt_quarantine_floor_stamp_ns = None
+    node.gt_quarantine_candidates = deque()
+    node.gt_quarantine_last_stamp_ns = None
+    node.gt_quarantine_rejected_count = 0
+    node.gt_quarantine_release_count = 0
     node.inconsistent_clock_count = 0
     node.old_epoch_frame_count = 0
     node.accepted_pair_discard_count = 0
@@ -94,9 +102,15 @@ def test_future_gt_reorders_but_stale_pre_reset_gt_is_rejected() -> None:
     assert node.stale_pre_reset_gt_count == 1
     assert node.gt_position_buffer.latest_stamp_ns is None
     node._ground_truth_pose_cb(_pose(1))
-    assert node.gt_position_buffer.latest_stamp_ns == 1
+    assert node.gt_position_buffer.latest_stamp_ns is None
     with node.yolo_condition:
-        node.simulation_epoch.observe_clock(2)
-    node._ground_truth_pose_cb(_pose(2))
-    assert node.gt_position_buffer.latest_stamp_ns == 2
+        node.simulation_epoch.observe_clock(5)
+    node._ground_truth_pose_cb(_pose(6))
+    node._ground_truth_pose_cb(_pose(7))
+    with node.yolo_condition:
+        node.simulation_epoch.observe_clock(7)
+        node._drain_future_ground_truth_locked(7)
+    assert node.gt_position_buffer.latest_stamp_ns == 7
+    assert node.gt_quarantine_release_count == 1
+    assert node.stale_pre_reset_gt_count == 2
     assert node.simulation_epoch.reset_count == node.gt_position_buffer.reset_count == 1

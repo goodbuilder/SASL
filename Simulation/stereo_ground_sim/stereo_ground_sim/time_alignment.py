@@ -374,6 +374,16 @@ class GroundTruthPositionRecord:
 
 
 @dataclass(frozen=True)
+class PendingGroundTruthRecord:
+    """Immutable GT callback payload tagged with its receive-time epoch."""
+
+    stamp_ns: int
+    epoch: int
+    position_world_enu_m: tuple[float, float, float]
+    orientation_world_from_reference_xyzw: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
 class GroundTruthAlignment:
     position_world_enu_m: tuple[float, float, float] | None
     orientation_world_from_reference_xyzw: tuple[float, float, float, float] | None
@@ -600,6 +610,7 @@ __all__ = [
     "GroundTruthPositionBuffer",
     "GroundTruthPositionRecord",
     "ImageRecord",
+    "PendingGroundTruthRecord",
     "PendingPairGroundTruthAligner",
     "SimulationEpochEvent",
     "SimulationEpochTracker",

@@ -128,6 +128,7 @@ from stereo_ground_sim.coordinate_frames import (
 from stereo_ground_sim.time_alignment import (
     BoundedIdHistory,
     GroundTruthPositionBuffer,
+    PendingGroundTruthRecord,
     PendingPairGroundTruthAligner,
     SimulationEpochTracker,
     StereoImagePairer,
@@ -359,6 +360,9 @@ class StereoDistanceNode(Node):
         self.measurement_processed_count = 0
         self.accepted_pair_discard_count = 0
         self.measurement_processing_error_count = 0
+        self.input_rejected_after_shutdown_count = 0
+        self.last_measurement_error_type = ""
+        self.last_measurement_error_message = ""
         self.measurement_queue_depth_sample_count = 0
         self.measurement_queue_depth_sum = 0
         self.measurement_queue_depth_min = None
@@ -375,6 +379,14 @@ class StereoDistanceNode(Node):
         self.gt_reorder_lead_limit_ns = 200_000_000
         self.future_gt_overflow_count = 0
         self.stale_pre_reset_gt_count = 0
+        self.gt_reset_quarantine_duration_ns = 200_000_000
+        self.gt_quarantine_required_contiguous_samples = 2
+        self.gt_quarantine_active = False
+        self.gt_quarantine_floor_stamp_ns = None
+        self.gt_quarantine_candidates = deque()
+        self.gt_quarantine_last_stamp_ns = None
+        self.gt_quarantine_rejected_count = 0
+        self.gt_quarantine_release_count = 0
         self.stale_pre_reset_count = 0
         self.inconsistent_clock_count = 0
         self.old_epoch_frame_count = 0
@@ -594,14 +606,14 @@ class StereoDistanceNode(Node):
         with self.yolo_condition:
             event = self.simulation_epoch.observe_clock(stamp_ns)
             if event.reset:
-                self._reset_for_simulation_epoch_locked(event.epoch)
+                self._reset_for_simulation_epoch_locked(event.epoch, event.stamp_ns)
                 self.get_logger().warning(
                     f"Simulation /clock decreased; entered epoch {event.epoch}"
                 )
             else:
                 self._drain_future_ground_truth_locked(stamp_ns)
 
-    def _reset_for_simulation_epoch_locked(self, epoch):
+    def _reset_for_simulation_epoch_locked(self, epoch, reset_stamp_ns=None):
         accepted_pending = len(self.measurement_pair_queue)
         dropped = self.image_pairer.reset_for_epoch(epoch)
         dropped += self.pending_gt_aligner.clear()
@@ -611,7 +623,20 @@ class StereoDistanceNode(Node):
         self.gt_alignment_ready_queue.clear()
         self.gt_position_buffer.reset_for_epoch(epoch)
         self.stale_pre_reset_gt_count += len(self.future_gt_pending)
+        self.stale_pre_reset_gt_count += len(
+            getattr(self, "gt_quarantine_candidates", ())
+        )
         self.future_gt_pending.clear()
+        self.gt_quarantine_candidates = deque()
+        self.gt_quarantine_last_stamp_ns = None
+        self.gt_quarantine_active = True
+        if reset_stamp_ns is None:
+            reset_stamp_ns = self.simulation_epoch.last_clock_stamp_ns
+        reset_stamp_ns = 0 if reset_stamp_ns is None else int(reset_stamp_ns)
+        duration_ns = int(
+            getattr(self, "gt_reset_quarantine_duration_ns", 200_000_000)
+        )
+        self.gt_quarantine_floor_stamp_ns = reset_stamp_ns + duration_ns
         self.measurement_results_by_pair_id.clear()
         self.gt_alignments_by_pair_id.clear()
         self.pairs_by_pair_id.clear()
@@ -708,38 +733,114 @@ class StereoDistanceNode(Node):
                 with self.yolo_condition:
                     if not self.accepting_input:
                         return
-                    latest_clock = self.simulation_epoch.last_clock_stamp_ns
-                    if latest_clock is not None and stamp_ns > latest_clock:
-                        lead_ns = stamp_ns - latest_clock
-                        if lead_ns > self.gt_reorder_lead_limit_ns:
-                            self.stale_pre_reset_gt_count += 1
-                            self.get_logger().warning(
-                                "Ground Truth future stamp rejected as stale pre-reset data: "
-                                f"stamp={stamp_ns}, clock={latest_clock}, lead_ns={lead_ns}"
-                            )
-                            return
-                        if len(self.future_gt_pending) >= self.future_gt_capacity:
-                            self.future_gt_pending.popleft()
-                            self.future_gt_overflow_count += 1
-                        self.future_gt_pending.append(
-                            (stamp_ns, point_world, orientation_xyzw, position)
-                        )
-                        return
-                    self._accept_ground_truth_locked(
-                        stamp_ns, point_world, orientation_xyzw, position
+                    record = PendingGroundTruthRecord(
+                        stamp_ns=stamp_ns,
+                        epoch=self.simulation_epoch.epoch,
+                        position_world_enu_m=point_world,
+                        orientation_world_from_reference_xyzw=orientation_xyzw,
                     )
+                    self._route_ground_truth_record_locked(record, position)
         except (TypeError, ValueError) as exc:
             self.inconsistent_clock_count += 1
             self.get_logger().warning(f"Ground Truth ignored: {exc}")
             return
-    def _accept_ground_truth_locked(
-        self, stamp_ns, point_world, orientation_xyzw, position
-    ):
+
+    def _reject_ground_truth_record_locked(self, *, quarantine=False):
+        self.stale_pre_reset_gt_count += 1
+        if quarantine:
+            self.gt_quarantine_rejected_count = getattr(
+                self, "gt_quarantine_rejected_count", 0
+            ) + 1
+
+    def _route_ground_truth_record_locked(self, record, position=None):
+        if record.epoch != self.simulation_epoch.epoch:
+            self._reject_ground_truth_record_locked(quarantine=True)
+            return False
+        floor_stamp_ns = getattr(self, "gt_quarantine_floor_stamp_ns", None)
+        if floor_stamp_ns is not None and record.stamp_ns <= floor_stamp_ns:
+            self._reject_ground_truth_record_locked(quarantine=True)
+            return False
+        if getattr(self, "gt_quarantine_active", False):
+            latest_clock = self.simulation_epoch.last_clock_stamp_ns
+            if (
+                latest_clock is not None
+                and record.stamp_ns - latest_clock > self.gt_reorder_lead_limit_ns
+            ):
+                self._reject_ground_truth_record_locked(quarantine=True)
+                return False
+            candidates = getattr(self, "gt_quarantine_candidates", deque())
+            last_stamp_ns = getattr(self, "gt_quarantine_last_stamp_ns", None)
+            if last_stamp_ns is not None and record.stamp_ns <= last_stamp_ns:
+                self.stale_pre_reset_gt_count += len(candidates)
+                self.gt_quarantine_rejected_count += len(candidates)
+                candidates.clear()
+            if len(candidates) >= self.future_gt_capacity:
+                candidates.popleft()
+                self.future_gt_overflow_count += 1
+            candidates.append(record)
+            self.gt_quarantine_candidates = candidates
+            self.gt_quarantine_last_stamp_ns = record.stamp_ns
+            self._try_release_gt_quarantine_locked()
+            return False
+        return self._queue_or_accept_ground_truth_record_locked(record, position)
+
+    def _try_release_gt_quarantine_locked(self):
+        if not getattr(self, "gt_quarantine_active", False):
+            return False
+        latest_clock = self.simulation_epoch.last_clock_stamp_ns
+        floor_stamp_ns = getattr(self, "gt_quarantine_floor_stamp_ns", None)
+        required = int(
+            getattr(self, "gt_quarantine_required_contiguous_samples", 2)
+        )
+        candidates = getattr(self, "gt_quarantine_candidates", deque())
+        if (
+            latest_clock is None
+            or floor_stamp_ns is None
+            or latest_clock < floor_stamp_ns
+            or len(candidates) < required
+        ):
+            return False
+        self.gt_quarantine_active = False
+        self.gt_quarantine_release_count = getattr(
+            self, "gt_quarantine_release_count", 0
+        ) + 1
+        self.gt_quarantine_candidates = deque()
+        self.gt_quarantine_last_stamp_ns = None
+        for record in tuple(candidates):
+            self._queue_or_accept_ground_truth_record_locked(record)
+        return True
+
+    def _queue_or_accept_ground_truth_record_locked(self, record, position=None):
+        latest_clock = self.simulation_epoch.last_clock_stamp_ns
+        if latest_clock is not None and record.stamp_ns > latest_clock:
+            lead_ns = record.stamp_ns - latest_clock
+            if lead_ns > self.gt_reorder_lead_limit_ns:
+                self._reject_ground_truth_record_locked()
+                self.get_logger().warning(
+                    "Ground Truth future stamp rejected as stale pre-reset data: "
+                    f"stamp={record.stamp_ns}, clock={latest_clock}, lead_ns={lead_ns}"
+                )
+                return False
+            if len(self.future_gt_pending) >= self.future_gt_capacity:
+                self.future_gt_pending.popleft()
+                self.future_gt_overflow_count += 1
+            self.future_gt_pending.append(record)
+            return False
+        return self._accept_ground_truth_locked(record, position)
+
+    def _accept_ground_truth_locked(self, record, position=None):
+        if record.epoch != self.simulation_epoch.epoch:
+            self._reject_ground_truth_record_locked(quarantine=True)
+            return False
+        if position is None:
+            position = ground_truth_world_to_baseline(
+                record.position_world_enu_m, self.baseline_center_frd
+            )
         self.gt_position_buffer.add(
-            stamp_ns,
-            point_world,
-            orientation_xyzw,
-            epoch=self.simulation_epoch.epoch,
+            record.stamp_ns,
+            record.position_world_enu_m,
+            record.orientation_world_from_reference_xyzw,
+            epoch=record.epoch,
         )
         aligned_pairs = self.pending_gt_aligner.pop_watermarked()
         self.gt_alignment_ready_queue.extend(aligned_pairs)
@@ -752,31 +853,31 @@ class StereoDistanceNode(Node):
                 "source_gazebo_entity": SOURCE_GAZEBO_ENTITY,
                 "published_reference_name": VEHICLE_REFERENCE_LINK,
                 "reference_definition": VEHICLE_REFERENCE_DEFINITION,
-                "ground_truth_world_enu_m": point_world,
-                "ground_truth_stamp_ns": stamp_ns,
+                "ground_truth_world_enu_m": record.position_world_enu_m,
+                "ground_truth_stamp_ns": record.stamp_ns,
             }
         )
         self.cached_ground_truth_position = position
         self.ground_truth_stamp_ns = position["ground_truth_stamp_ns"]
         self.cached_actual_distance = float(position["forward_m"])
         self.actual_distance_sample_seq = getattr(self, "actual_distance_sample_seq", 0) + 1
+        return True
 
     def _drain_future_ground_truth_locked(self, clock_stamp_ns):
+        self._try_release_gt_quarantine_locked()
         ready = []
         pending = deque()
         while self.future_gt_pending:
             item = self.future_gt_pending.popleft()
-            if item[0] <= clock_stamp_ns:
+            if item.epoch != self.simulation_epoch.epoch:
+                self._reject_ground_truth_record_locked(quarantine=True)
+            elif item.stamp_ns <= clock_stamp_ns:
                 ready.append(item)
             else:
                 pending.append(item)
         self.future_gt_pending = pending
-        for stamp_ns, point_world, orientation_xyzw, position in sorted(
-            ready, key=lambda item: item[0]
-        ):
-            self._accept_ground_truth_locked(
-                stamp_ns, point_world, orientation_xyzw, position
-            )
+        for record in sorted(ready, key=lambda item: item.stamp_ns):
+            self._accept_ground_truth_locked(record)
 
     def _triangulate_pixel_centers_with_cameras(
         self,
@@ -1613,8 +1714,6 @@ class StereoDistanceNode(Node):
         self._store_image("right", msg)
 
     def _store_image(self, side, msg):
-        if not self.accepting_input:
-            return
         try:
             stamp_ns = image_stamp_ns(msg)
         except ValueError as exc:
@@ -1622,6 +1721,9 @@ class StereoDistanceNode(Node):
             self.get_logger().warning(f"Invalid {side} image simulation timestamp: {exc}")
             return
         with self.yolo_condition:
+            if not self.accepting_input:
+                self.input_rejected_after_shutdown_count += 1
+                return
             latest_clock = self.simulation_epoch.last_clock_stamp_ns
             if not self.simulation_epoch.accepts_stamp(stamp_ns):
                 self.stale_pre_reset_count += 1
@@ -1676,22 +1778,38 @@ class StereoDistanceNode(Node):
                 self.inflight_pair_epoch = pair.epoch
                 self.last_yolo_update = time.monotonic()
                 next_tick = self.last_yolo_update + 1.0 / target_hz
-            computed = self._compute_pair_measurement(pair, phase)
-            with self.yolo_condition:
-                try:
+            failure = None
+            try:
+                computed = self._compute_pair_measurement(pair, phase)
+                with self.yolo_condition:
                     self._commit_pair_measurement_if_current(pair, computed)
-                except Exception as exc:
-                    self.measurement_processing_error_count += 1
-                    self.accepted_pair_discard_count += 1
-                    self.inflight_pair_id = None
-                    self.inflight_pair_epoch = None
-                    self.yolo_inference_in_progress = False
-                    self._drop_pair_state_locked(pair.pair_id, "measurement_processing_error")
+            except Exception as exc:
+                failure = exc
+                with self.yolo_condition:
+                    self._finalize_pair_failure_locked(pair, exc)
+            if failure is not None:
+                try:
                     self.get_logger().error(
                         "Measurement processing failed for "
-                        f"pair_id={pair.pair_id}: {type(exc).__name__}: {exc}"
+                        f"pair_id={pair.pair_id}: "
+                        f"{type(failure).__name__}: {failure}"
                     )
-                    self.yolo_condition.notify_all()
+                except Exception:
+                    pass
+
+    def _finalize_pair_failure_locked(self, pair, exc):
+        """Contain one pair failure and leave the worker ready for the next pair."""
+
+        self.measurement_processing_error_count += 1
+        self.accepted_pair_discard_count += 1
+        self.last_measurement_error_type = type(exc).__name__
+        self.last_measurement_error_message = str(exc)
+        self._drop_pair_state_locked(pair.pair_id, "measurement_processing_error")
+        if self.inflight_pair_id == pair.pair_id:
+            self.inflight_pair_id = None
+            self.inflight_pair_epoch = None
+        self.yolo_inference_in_progress = False
+        self.yolo_condition.notify_all()
 
     def _compute_pair_measurement(self, pair, phase, device=None):
         """Compute one pair without publishing or mutating pair result state."""
@@ -1815,11 +1933,16 @@ class StereoDistanceNode(Node):
             if period_s > 0.0:
                 self.yolo_update_hz_pub.publish(Float32(data=float(1.0 / period_s)))
         self.last_yolo_completion = finished
-        self.measurement_processed_count += 1
-        self.measurement_results_by_pair_id[pair.pair_id] = metrics
-        self._try_evaluate_pair_locked(pair.pair_id)
+        self._complete_pair_measurement_locked(pair.pair_id, metrics)
         self.yolo_condition.notify_all()
         return metrics
+
+    def _complete_pair_measurement_locked(self, pair_id, metrics):
+        """Record one successful terminal outcome after evaluation cannot fail."""
+
+        self.measurement_results_by_pair_id[pair_id] = metrics
+        self._try_evaluate_pair_locked(pair_id)
+        self.measurement_processed_count += 1
 
     def _update_metrics_from_messages(
         self,
@@ -2017,6 +2140,9 @@ class StereoDistanceNode(Node):
             "simulation_epoch": self.simulation_epoch.epoch,
             "stale_pre_reset_count": self.stale_pre_reset_count,
             "stale_pre_reset_gt_count": self.stale_pre_reset_gt_count,
+            "gt_quarantine_active": self.gt_quarantine_active,
+            "gt_quarantine_rejected_count": self.gt_quarantine_rejected_count,
+            "gt_quarantine_release_count": self.gt_quarantine_release_count,
             "future_gt_pending_count": len(self.future_gt_pending),
             "future_gt_overflow_count": self.future_gt_overflow_count,
             "measurement_queue_capacity": self.measurement_queue_capacity,
@@ -2027,6 +2153,9 @@ class StereoDistanceNode(Node):
             "old_epoch_result_discard_count": self.old_epoch_result_discard_count,
             "accepted_pair_discard_count": self.accepted_pair_discard_count,
             "measurement_processing_error_count": self.measurement_processing_error_count,
+            "input_rejected_after_shutdown_count": self.input_rejected_after_shutdown_count,
+            "last_measurement_error_type": self.last_measurement_error_type,
+            "last_measurement_error_message": self.last_measurement_error_message,
             "invalid_timestamp_count": pairer.invalid_timestamp_count,
             "inconsistent_clock_count": self.inconsistent_clock_count
             + self.gt_position_buffer.inconsistent_clock_count,
