@@ -172,6 +172,13 @@ class OwnedProcess:
             os.killpg(self.process.pid, signal_number)
         self.events.append({"signal": signal_number.name, "utc": utc_now()})
 
+    def process_group_exists(self) -> bool:
+        try:
+            os.killpg(self.process.pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
     def close_log(self) -> None:
         self.log_handle.close()
 
@@ -199,18 +206,35 @@ class ProcessLauncher:
 
 
 def stop_owned_process(process: Any, *, shutdown_timeout_s: float) -> list[dict[str, Any]]:
-    if process.poll() is not None:
-        return list(getattr(process, "events", ()))
-    for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+    if process.poll() is None:
+        for signal_number in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
+            try:
+                process.signal_owned(signal_number)
+            except ProcessLookupError:
+                break
+            try:
+                process.wait(timeout=shutdown_timeout_s)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+
+    # Some Gazebo launch wrappers exit while leaving their server child in the
+    # same runner-owned process group.  Recorder finalization is complete once
+    # launch has exited, so clean only that residual group before the next case.
+    group_exists = getattr(process, "process_group_exists", lambda: False)
+    if group_exists():
         try:
-            process.signal_owned(signal_number)
+            process.signal_owned(signal.SIGTERM)
         except ProcessLookupError:
-            break
-        try:
-            process.wait(timeout=shutdown_timeout_s)
-            break
-        except subprocess.TimeoutExpired:
-            continue
+            pass
+        deadline = time.monotonic() + shutdown_timeout_s
+        while group_exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if group_exists():
+            try:
+                process.signal_owned(signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     return list(getattr(process, "events", ()))
 
 

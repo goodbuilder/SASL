@@ -56,6 +56,9 @@ class FakeProcess:
     def close_log(self):
         self.closed = True
 
+    def process_group_exists(self):
+        return False
+
 
 def _plan():
     return build_sweep_plan(
@@ -116,6 +119,15 @@ def test_owned_process_escalates_int_term_kill_without_unrelated_pid() -> None:
         signal.SIGKILL.name,
     ]
     assert process.pid == 77
+
+
+def test_owned_process_cleans_residual_gazebo_group_after_launch_exit() -> None:
+    module = _cli_module()
+    process = FakeProcess((0,))
+    group_states = iter((True, False, False))
+    process.process_group_exists = lambda: next(group_states)
+    events = module.stop_owned_process(process, shutdown_timeout_s=1)
+    assert [event["signal"] for event in events] == ["SIGINT", "SIGTERM"]
 
 
 def test_failure_policy_stop_and_continue_are_explicit() -> None:
