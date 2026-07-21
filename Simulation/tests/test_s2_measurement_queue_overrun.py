@@ -22,6 +22,9 @@ class Logger:
     def error(self, _message):
         pass
 
+    def warning(self, _message):
+        pass
+
 
 def test_strict_research_queue_overrun_is_bounded_and_observable() -> None:
     node = StereoDistanceNode.__new__(StereoDistanceNode)
@@ -41,6 +44,7 @@ def test_strict_research_queue_overrun_is_bounded_and_observable() -> None:
     node.measurement_rejected_pair_ids = BoundedIdHistory(8)
     node.measurement_queue_overflow_count = 0
     node.measurement_overrun_invalid = False
+    node.measurement_rejected_after_overrun_count = 0
     node.measurement_accepted_count = 0
     node.measurement_queue_depth_sample_count = 0
     node.measurement_queue_depth_sum = 0
@@ -57,7 +61,12 @@ def test_strict_research_queue_overrun_is_bounded_and_observable() -> None:
     assert accepted == 2
     assert [pair.pair_id for pair in node.measurement_pair_queue] == [1, 2]
     assert node.measurement_queue_depth_max == 2
-    assert node.measurement_queue_overflow_count == 2
+    assert node.measurement_queue_overflow_count == 1
     assert node.measurement_overrun_invalid
+    assert node.measurement_rejected_after_overrun_count == 1
+    assert node.last_measurement_rejection_reason == (
+        "measurement_run_invalid_after_queue_overrun"
+    )
+    assert node.measurement_accepted_count == 2
     assert all(pair_id in node.measurement_rejected_pair_ids for pair_id in (3, 4))
     assert not any(pair.pair_id in (3, 4) for pair in node.pending_gt_aligner._pending)

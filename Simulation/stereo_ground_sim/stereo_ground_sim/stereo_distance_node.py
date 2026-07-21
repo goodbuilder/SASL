@@ -235,9 +235,9 @@ class StereoDistanceNode(Node):
         self.yolo_device = str(self.get_parameter("yolo_device").value)
         self.yolo_target_hz = self._float_param("yolo_target_hz")
         self.yolo_imgsz = int(self.get_parameter("yolo_imgsz").value)
-        self.observation_mode = str(self.get_parameter("observation_mode").value)
-        if self.observation_mode not in ("bbox_yolo", "ideal_reference_point"):
-            raise ValueError("observation_mode must be bbox_yolo or ideal_reference_point")
+        self.observation_mode = self._validate_observation_mode(
+            self.get_parameter("observation_mode").value
+        )
         self.enable_synthetic_detections = self._bool_param("enable_synthetic_detections")
         self.synthetic_detection_width_px = max(1, int(self.get_parameter("synthetic_detection_width_px").value))
         self.synthetic_detection_height_px = max(1, int(self.get_parameter("synthetic_detection_height_px").value))
@@ -362,6 +362,7 @@ class StereoDistanceNode(Node):
         self.last_corrected_published_pair_id = 0
         self.measurement_queue_overflow_count = 0
         self.measurement_overrun_invalid = False
+        self.measurement_rejected_after_overrun_count = 0
         self.measurement_rejected_pair_ids = BoundedIdHistory(self.max_pair_result_history)
         self.last_measurement_rejection_reason = ""
         self.measurement_accepted_count = 0
@@ -457,9 +458,7 @@ class StereoDistanceNode(Node):
         }
         self.lock = threading.Lock()
         self.yolo_condition = threading.Condition(self.lock)
-        if self._should_load_yolo_model():
-            self.resolved_yolo_device = self._resolve_yolo_device()
-            self._load_yolo_model()
+        self._initialize_yolo_runtime_if_enabled()
 
         self.distance_pub = self.create_publisher(Float32, "/target_distance", 10)
         self.actual_distance_pub = self.create_publisher(Float32, "/ground_truth", 10)
@@ -522,19 +521,7 @@ class StereoDistanceNode(Node):
             reliability=ReliabilityPolicy.BEST_EFFORT,
         )
 
-        self.image_subscriptions = []
-        if self._should_subscribe_camera_images():
-            self.image_subscriptions.extend(
-                [
-                    self.create_subscription(
-                        ImageMsg, "/left_camera/image", self._left_cb, camera_qos
-                    ),
-                    self.create_subscription(
-                        ImageMsg, "/right_camera/image", self._right_cb, camera_qos
-                    ),
-                ]
-            )
-        else:
+        if not self._create_camera_image_subscriptions_if_enabled(camera_qos):
             disabled_reason = self.yolo_runtime_disable_reason or self.yolo_load_error
             if self.enable_synthetic_detections:
                 self.get_logger().info(
@@ -554,10 +541,7 @@ class StereoDistanceNode(Node):
         self.add_on_set_parameters_callback(self._on_param_update)
         self.plot_thread = threading.Thread(target=self._plot_publish_loop, daemon=True)
         self.plot_thread.start()
-        self.yolo_thread = None
-        if self._should_subscribe_camera_images():
-            self.yolo_thread = threading.Thread(target=self._yolo_worker_loop, daemon=True)
-            self.yolo_thread.start()
+        self._start_yolo_worker_if_enabled()
 
         self.get_logger().info(
             "Stereo distance node started "
@@ -567,6 +551,13 @@ class StereoDistanceNode(Node):
 
     def _float_param(self, name):
         return float(self.get_parameter(name).value)
+
+    @staticmethod
+    def _validate_observation_mode(value):
+        mode = str(value)
+        if mode not in ("bbox_yolo", "ideal_reference_point"):
+            raise ValueError("observation_mode must be bbox_yolo or ideal_reference_point")
+        return mode
 
     def _bool_param(self, name):
         return self._coerce_bool(self.get_parameter(name).value)
@@ -674,9 +665,21 @@ class StereoDistanceNode(Node):
             if pair.epoch != self.simulation_epoch.epoch:
                 self.old_epoch_frame_count += 1
                 continue
-            if self.measurement_overrun_invalid or (
-                len(self.measurement_pair_queue) >= self.measurement_queue_capacity
-            ):
+            if self.measurement_overrun_invalid:
+                self.measurement_rejected_after_overrun_count += 1
+                self.measurement_rejected_pair_ids.add(pair.pair_id)
+                self.last_measurement_rejection_reason = (
+                    "measurement_run_invalid_after_queue_overrun"
+                )
+                if self.measurement_rejected_after_overrun_count == 1 or (
+                    self.measurement_rejected_after_overrun_count % 100 == 0
+                ):
+                    self.get_logger().warning(
+                        "Measurement input rejected after queue overrun invalidated "
+                        f"the run: rejected_pair_id={pair.pair_id}"
+                    )
+                continue
+            if len(self.measurement_pair_queue) >= self.measurement_queue_capacity:
                 self.measurement_queue_overflow_count += 1
                 self.measurement_overrun_invalid = True
                 self.measurement_rejected_pair_ids.add(pair.pair_id)
@@ -1425,6 +1428,40 @@ class StereoDistanceNode(Node):
             and not self.yolo_runtime_disabled
         )
 
+    def _initialize_yolo_runtime_if_enabled(self):
+        if not self._should_load_yolo_model():
+            return False
+        self.resolved_yolo_device = self._resolve_yolo_device()
+        self._load_yolo_model()
+        return True
+
+    def _create_camera_image_subscriptions_if_enabled(self, camera_qos):
+        self.image_subscriptions = []
+        if not self._should_subscribe_camera_images():
+            return False
+        self.image_subscriptions.extend(
+            [
+                self.create_subscription(
+                    ImageMsg, "/left_camera/image", self._left_cb, camera_qos
+                ),
+                self.create_subscription(
+                    ImageMsg, "/right_camera/image", self._right_cb, camera_qos
+                ),
+            ]
+        )
+        return True
+
+    def _start_yolo_worker_if_enabled(self):
+        self.yolo_thread = None
+        if not self._should_subscribe_camera_images():
+            return False
+        self.yolo_thread = threading.Thread(
+            target=self._yolo_worker_loop,
+            daemon=True,
+        )
+        self.yolo_thread.start()
+        return True
+
     def _disable_yolo_runtime(self, reason):
         self.yolo_runtime_disabled = True
         self.yolo_runtime_disable_reason = str(reason)
@@ -2024,18 +2061,7 @@ class StereoDistanceNode(Node):
                 pair, None, None, computed.get("corrected"), count_alignment=False
             )
         )
-        ideal_mode = getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point"
-        metrics.update({
-            "observation_mode": "ideal_reference_point" if ideal_mode else "bbox_yolo",
-            "observation_source": "gazebo_reference_point_projection" if ideal_mode else "yolo_bbox_center",
-            "measurement_gt_independent": not ideal_mode,
-            "reference_source": VEHICLE_REFERENCE_LINK if ideal_mode else "not_applicable",
-            "projection_camera_pose_source": "actual" if ideal_mode else "rendered_image_observation",
-            "raw_interpretation_pose_source": "nominal",
-            "corrected_interpretation_pose_source": "actual",
-            "correction_source": "injected_attitude_oracle",
-            "evaluation_gt_source": "gazebo_reference_link_world_pose",
-        })
+        metrics.update(self._observation_metadata())
         self.last_pair_result = dict(metrics)
         self.left_detection = left
         self.right_detection = right
@@ -2076,6 +2102,30 @@ class StereoDistanceNode(Node):
         metrics.setdefault("evaluation_status", "pending")
         self.measurement_results_by_pair_id[pair_id] = metrics
         self.measurement_processed_count += 1
+
+    def _observation_metadata(self):
+        mode = self._validate_observation_mode(
+            getattr(self, "observation_mode", "bbox_yolo")
+        )
+        ideal_mode = mode == "ideal_reference_point"
+        return {
+            "observation_mode": mode,
+            "observation_source": (
+                "gazebo_reference_point_projection"
+                if ideal_mode
+                else "yolo_bbox_center"
+            ),
+            "measurement_gt_independent": not ideal_mode,
+            "reference_source": VEHICLE_REFERENCE_LINK if ideal_mode else "not_applicable",
+            "projection_camera_pose_source": (
+                "actual" if ideal_mode else "rendered_image_observation"
+            ),
+            "raw_interpretation_pose_source": "nominal",
+            "corrected_interpretation_pose_source": "actual",
+            "correction_source": "injected_attitude_oracle",
+            "evaluation_gt_source": "gazebo_reference_link_world_pose",
+            "output_frame": BASELINE_CENTER_FRD_FRAME,
+        }
 
     def _update_metrics_from_messages(
         self,
@@ -2371,6 +2421,9 @@ class StereoDistanceNode(Node):
             "measurement_queue_depth_max": self.measurement_queue_depth_max,
             "measurement_queue_overflow_count": self.measurement_queue_overflow_count,
             "measurement_overrun_invalid": self.measurement_overrun_invalid,
+            "measurement_rejected_after_overrun_count": (
+                self.measurement_rejected_after_overrun_count
+            ),
             "old_epoch_result_discard_count": self.old_epoch_result_discard_count,
             "accepted_pair_discard_count": self.accepted_pair_discard_count,
             "measurement_processing_error_count": self.measurement_processing_error_count,
@@ -2967,6 +3020,7 @@ class StereoDistanceNode(Node):
             width,
             height,
             projection_camera_mode="actual",
+            enforce_fov_bounds=False,
         )
 
     def _ideal_detection_pair_from_reference_world(self, point_world_enu_m, width, height):
