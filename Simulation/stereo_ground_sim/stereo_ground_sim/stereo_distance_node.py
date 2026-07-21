@@ -171,6 +171,7 @@ class StereoDistanceNode(Node):
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("yolo_imgsz", 1280)
+        self.declare_parameter("observation_mode", "bbox_yolo")
         # This is a bounded burst buffer, not a sustained-rate guarantee.
         # Strict overflow accounting invalidates a run instead of dropping silently.
         self.declare_parameter("measurement_queue_capacity", 32)
@@ -234,6 +235,9 @@ class StereoDistanceNode(Node):
         self.yolo_device = str(self.get_parameter("yolo_device").value)
         self.yolo_target_hz = self._float_param("yolo_target_hz")
         self.yolo_imgsz = int(self.get_parameter("yolo_imgsz").value)
+        self.observation_mode = str(self.get_parameter("observation_mode").value)
+        if self.observation_mode not in ("bbox_yolo", "ideal_reference_point"):
+            raise ValueError("observation_mode must be bbox_yolo or ideal_reference_point")
         self.enable_synthetic_detections = self._bool_param("enable_synthetic_detections")
         self.synthetic_detection_width_px = max(1, int(self.get_parameter("synthetic_detection_width_px").value))
         self.synthetic_detection_height_px = max(1, int(self.get_parameter("synthetic_detection_height_px").value))
@@ -408,6 +412,10 @@ class StereoDistanceNode(Node):
         }
         self.raw_computed_count = 0
         self.corrected_computed_count = 0
+        self.ideal_projection_success_count = 0
+        self.ideal_projection_rejected_count = 0
+        self.last_ideal_projection_error = ""
+        self.last_ideal_projection_pair_id = None
         self.shutdown_drain_status = "not_requested"
         self.shutdown_drain_duration_s = 0.0
         self.shutdown_remaining_measurement_count = 0
@@ -448,7 +456,7 @@ class StereoDistanceNode(Node):
         }
         self.lock = threading.Lock()
         self.yolo_condition = threading.Condition(self.lock)
-        if self._should_subscribe_camera_images():
+        if self._should_load_yolo_model():
             self.resolved_yolo_device = self._resolve_yolo_device()
             self._load_yolo_model()
 
@@ -624,7 +632,7 @@ class StereoDistanceNode(Node):
 
     def _reset_for_simulation_epoch_locked(self, epoch, reset_stamp_ns=None):
         self._ensure_gt_evaluation_state_locked()
-        accepted_pending = len(self.measurement_pair_queue)
+        accepted_pending = len(self.pairs_by_pair_id)
         dropped = self.image_pairer.reset_for_epoch(epoch)
         dropped += self.pending_gt_aligner.clear()
         dropped += len(self.measurement_pair_queue)
@@ -681,7 +689,8 @@ class StereoDistanceNode(Node):
                     )
                 continue
             self.pairs_by_pair_id[pair.pair_id] = pair
-            self.measurement_pair_queue.append(pair)
+            if getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo":
+                self.measurement_pair_queue.append(pair)
             alignments = self.pending_gt_aligner.add_pair(pair)
             self.gt_alignment_ready_queue.extend(alignments)
             self.measurement_accepted_count += 1
@@ -1021,6 +1030,11 @@ class StereoDistanceNode(Node):
         )
 
     def _on_param_update(self, params):
+        if any(param.name == "observation_mode" for param in params):
+            return SetParametersResult(
+                successful=False,
+                reason="observation_mode is immutable for one run",
+            )
         if any(param.name == "measurement_queue_capacity" for param in params):
             return SetParametersResult(
                 successful=False,
@@ -1380,11 +1394,10 @@ class StereoDistanceNode(Node):
     def _should_subscribe_camera_images(self):
         if self.yolo_target_hz <= 0.0:
             return False
-        if not self.yolo_model_path.strip():
-            return False
-        if self.yolo_runtime_disabled:
-            return False
-        return True
+        return self.observation_mode in ("bbox_yolo", "ideal_reference_point")
+
+    def _should_load_yolo_model(self):
+        return self.observation_mode == "bbox_yolo"
 
     def _disable_yolo_runtime(self, reason):
         self.yolo_runtime_disabled = True
@@ -1763,7 +1776,8 @@ class StereoDistanceNode(Node):
             self._register_measurement_pairs_locked(pairs)
 
     def _yolo_worker_loop(self):
-        self._warm_yolo_model()
+        if getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo":
+            self._warm_yolo_model()
         next_tick = time.monotonic()
         while True:
             pair = None
@@ -1842,6 +1856,40 @@ class StereoDistanceNode(Node):
         """Compute one pair without publishing or mutating pair result state."""
 
         started = time.monotonic()
+        if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
+            width = int(getattr(pair.left_message, "width", 0))
+            height = int(getattr(pair.left_message, "height", 0))
+            with self.yolo_condition:
+                alignment = self.gt_alignments_by_pair_id.get(pair.pair_id)
+            if width <= 0 or height <= 0:
+                return {
+                    "started": started, "finished": time.monotonic(), "phase": phase,
+                    "left_image": None, "right_image": None, "left": None, "right": None,
+                    "raw": None, "corrected": None, "ideal_error": "invalid_image_dimensions",
+                }
+            point = None if alignment is None else alignment.position_world_enu_m
+            left, right = (None, None) if point is None else self._ideal_detection_pair_from_reference_world(
+                point, width, height
+            )
+            if left is None or right is None:
+                return {
+                    "started": started, "finished": time.monotonic(), "phase": phase,
+                    "left_image": np.zeros((height, width, 3), dtype=np.uint8),
+                    "right_image": np.zeros((height, width, 3), dtype=np.uint8),
+                    "left": None, "right": None, "raw": None, "corrected": None,
+                    "ideal_error": "projection_invalid_or_out_of_fov",
+                }
+            raw = self._triangulate_center_pixels(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
+            corrected = self._triangulate_pixel_centers_oracle(
+                left["cx"], left["cy"], right["cx"], right["cy"], width, height
+            )
+            return {
+                "started": started, "finished": time.monotonic(), "phase": phase,
+                "left_image": np.zeros((height, width, 3), dtype=np.uint8),
+                "right_image": np.zeros((height, width, 3), dtype=np.uint8),
+                "left": left, "right": right, "raw": raw, "corrected": corrected,
+                "ideal_error": None,
+            }
         left_image = self._msg_to_rgb(pair.left_message)
         right_image = self._msg_to_rgb(pair.right_message)
         if left_image is None or right_image is None:
@@ -1911,10 +1959,24 @@ class StereoDistanceNode(Node):
         if left_image is None or right_image is None:
             self._drop_pair_state_locked(pair.pair_id, "image_decode_failure")
             self.accepted_pair_discard_count += 1
+            if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
+                self.ideal_projection_rejected_count += 1
+                self.last_ideal_projection_error = computed.get("ideal_error", "invalid_image")
+                self.last_ideal_projection_pair_id = pair.pair_id
             self.yolo_condition.notify_all()
             return None
         left = computed.get("left")
         right = computed.get("right")
+        if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point" and (left is None or right is None):
+            self._drop_pair_state_locked(pair.pair_id, "ideal_projection_rejected")
+            self.accepted_pair_discard_count += 1
+            self.ideal_projection_rejected_count += 1
+            self.last_ideal_projection_error = computed.get("ideal_error", "projection_invalid_or_out_of_fov")
+            self.last_ideal_projection_pair_id = pair.pair_id
+            self.yolo_condition.notify_all()
+            return None
+        if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
+            self.ideal_projection_success_count += 1
         metrics = self._calculate_metrics(
             left_image, left, right, None, computed.get("phase")
         )
@@ -1936,11 +1998,25 @@ class StereoDistanceNode(Node):
                 pair, None, None, computed.get("corrected"), count_alignment=False
             )
         )
+        metrics.update({
+            "observation_mode": getattr(self, "observation_mode", "bbox_yolo"),
+            "observation_source": (
+                "gazebo_reference_point_projection"
+                if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point" else "yolo_bbox_center"
+            ),
+            "measurement_gt_independent": getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo",
+            "reference_source": VEHICLE_REFERENCE_LINK,
+            "projection_camera_pose_source": "actual",
+            "raw_interpretation_pose_source": "nominal",
+            "corrected_interpretation_pose_source": "actual",
+            "correction_source": "injected_attitude_oracle",
+        })
         self.last_pair_result = dict(metrics)
         self.left_detection = left
         self.right_detection = right
         self.metrics = metrics
-        self.detections_pub.publish(self._detections_to_msg(left, right))
+        if getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo":
+            self.detections_pub.publish(self._detections_to_msg(left, right))
         disparity = metrics.get("disparity_px")
         distance = metrics.get("distance_m")
         error = metrics.get("distance_error_m")
@@ -2041,6 +2117,16 @@ class StereoDistanceNode(Node):
         ):
             return
         self.gt_alignments_by_pair_id[pair.pair_id] = alignment
+        if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
+            if pair.pair_id not in {item.pair_id for item in self.measurement_pair_queue}:
+                if len(self.measurement_pair_queue) >= self.measurement_queue_capacity:
+                    self.measurement_queue_overflow_count += 1
+                    self.measurement_overrun_invalid = True
+                    self.measurement_rejected_pair_ids.add(pair.pair_id)
+                    self._drop_pair_state_locked(pair.pair_id, "measurement_queue_overflow")
+                    return
+                self.measurement_pair_queue.append(pair)
+                self._record_measurement_queue_depth_locked()
         self._evaluate_pair_with_fault_containment_locked(
             pair.pair_id,
             trigger="late_gt_alignment",
@@ -2287,6 +2373,11 @@ class StereoDistanceNode(Node):
             "gt_unavailable_count": self.gt_alignment_counts["unavailable"],
             "raw_computed_count": self.raw_computed_count,
             "corrected_computed_count": self.corrected_computed_count,
+            "observation_mode": self.observation_mode,
+            "ideal_projection_success_count": self.ideal_projection_success_count,
+            "ideal_projection_rejected_count": self.ideal_projection_rejected_count,
+            "last_ideal_projection_error": self.last_ideal_projection_error,
+            "last_ideal_projection_pair_id": self.last_ideal_projection_pair_id,
         }
 
     @staticmethod
@@ -2876,23 +2967,23 @@ class StereoDistanceNode(Node):
         else:
             raise ValueError(f"unsupported projection_camera_mode={projection_camera_mode!r}")
         intrinsics = self._camera_intrinsics(width, height)
-        left_pixel = project_world_point_to_pixel(
-            point_world_enu_m,
-            camera_left,
-            fx_px=intrinsics.fx_px,
-            fy_px=intrinsics.fy_px,
-            cx_px=intrinsics.cx_px,
-            cy_px=intrinsics.cy_px,
-        )
-        right_pixel = project_world_point_to_pixel(
-            point_world_enu_m,
-            camera_right,
-            fx_px=intrinsics.fx_px,
-            fy_px=intrinsics.fy_px,
-            cx_px=intrinsics.cx_px,
-            cy_px=intrinsics.cy_px,
-        )
+        try:
+            left_pixel = project_world_point_to_pixel(
+                point_world_enu_m, camera_left, fx_px=intrinsics.fx_px,
+                fy_px=intrinsics.fy_px, cx_px=intrinsics.cx_px, cy_px=intrinsics.cy_px,
+            )
+            right_pixel = project_world_point_to_pixel(
+                point_world_enu_m, camera_right, fx_px=intrinsics.fx_px,
+                fy_px=intrinsics.fy_px, cx_px=intrinsics.cx_px, cy_px=intrinsics.cy_px,
+            )
+        except (TypeError, ValueError, ArithmeticError):
+            return None, None
         if left_pixel is None or right_pixel is None:
+            return None, None
+        if any(
+            not (0.0 <= float(pixel[0]) < float(width) and 0.0 <= float(pixel[1]) < float(height))
+            for pixel in (left_pixel, right_pixel)
+        ):
             return None, None
         bbox_size = float(self.synthetic_detection_bbox_size_px)
 

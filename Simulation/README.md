@@ -1,5 +1,22 @@
 # Ground Stereo Drone Simulation
 
+## Observation modes (S2-I1)
+
+`observation_mode` is immutable for a run and defaults to `bbox_yolo`.
+`bbox_yolo` uses image content and YOLO BBox centers; its measurement is
+Ground-Truth independent. `ideal_reference_point` is a Simulation-only oracle
+mode: the authoritative `vehicle_reference_link` point from Gazebo World ENU
+is projected through the actual left/right optical poses to float pixels, then
+the same pixels are triangulated with nominal poses (Raw) and injected actual
+poses (attitude-corrected). GT is used to create and evaluate the observation,
+not as the correction input. Outputs remain `baseline_center_frd` (Forward,
+Right, Down, metres). Ideal mode does not measure detector performance and does
+not publish fake YOLO detections. Invalid projection is explicitly rejected.
+
+The existing Gazebo target/model domain mismatch for `bbox_yolo` remains a
+separate limitation; ideal correspondence is not evidence that YOLO detects
+the target.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone
