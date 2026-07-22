@@ -11,6 +11,7 @@ Forward).
 from __future__ import annotations
 
 import csv
+import io
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -1728,7 +1729,7 @@ def _external_ledger_file(
 def _verify_ledger_referenced_artifacts(
     ledger: Sequence[Mapping[str, Any]],
     dataset: Mapping[str, Any],
-    planned_cases: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
+    planned_cases: Mapping[str, Sequence[Mapping[str, Any]]],
 ) -> tuple[dict[str, int], dict[str, VerifiedFileBytes]]:
     entries = validate_access_ledger(ledger)
     operation_counts = {operation: 0 for operation in _FROZEN_LEDGER_OPERATIONS}
@@ -1843,14 +1844,14 @@ def _verify_ledger_referenced_artifacts(
         if len(bundles) != expected_case_count:
             raise ValueError("qualification_case_evidence_bundle_mismatch")
         bound_case_ids: set[str] = set()
-        planned_ids = (
-            {
-                _require_exact_str(item.get("case_id"), f"{role}_planned:case_id")
-                for item in planned_cases[role]
-            }
-            if planned_cases is not None
-            else None
-        )
+        if set(planned_cases) != {"calibration", "validation"}:
+            raise ValueError("qualification_planned_case_roles_mismatch")
+        planned_ids = {
+            _require_exact_str(item.get("case_id"), f"{role}_planned:case_id")
+            for item in planned_cases[role]
+        }
+        if len(planned_ids) != len(planned_cases[role]):
+            raise ValueError("qualification_planned_case_duplicate")
         for case_dir, bundle in bundles.items():
             if set(bundle) != expected_names:
                 raise ValueError("qualification_case_evidence_bundle_mismatch")
@@ -1883,16 +1884,46 @@ def _verify_ledger_referenced_artifacts(
                 raise ValueError("qualification_case_metadata_identity_mismatch")
             pair_snapshot = snapshots[bundle["pair_records.jsonl"]["canonical_path"]]
             pair_records = _parse_verified_jsonl(pair_snapshot, name="qualification_pair_records")
-            if pair_records and pair_records[0].get("case_id") != case_id:
-                raise ValueError("qualification_case_metadata_identity_mismatch")
-        if planned_ids is not None and bound_case_ids != planned_ids:
+            if not pair_records:
+                raise ValueError("qualification_pair_records_empty")
+            for index, record in enumerate(pair_records):
+                record_case_id = _require_exact_str(
+                    record.get("case_id"),
+                    f"qualification_pair_record:{index}:case_id",
+                )
+                if record_case_id != case_id:
+                    raise ValueError("qualification_pair_record_case_identity_mismatch")
+            csv_snapshot = snapshots[bundle["pair_records.csv"]["canonical_path"]]
+            try:
+                csv_text = csv_snapshot.raw_bytes.decode("utf-8")
+                csv_reader = csv.DictReader(io.StringIO(csv_text, newline=""))
+                if csv_reader.fieldnames and "case_id" in csv_reader.fieldnames:
+                    csv_rows = list(csv_reader)
+                    for row in csv_rows:
+                        csv_case_id = _require_exact_str(
+                            row.get("case_id"), "qualification_csv:case_id"
+                        )
+                        if csv_case_id != case_id:
+                            raise ValueError("qualification_case_metadata_identity_mismatch")
+                else:
+                    csv_rows = None
+            except (UnicodeDecodeError, csv.Error) as exc:
+                raise ValueError("qualification_csv_schema_invalid") from exc
+            if summary.get("jsonl_line_count") is not None and _require_exact_int(
+                summary["jsonl_line_count"], "qualification_summary:jsonl_line_count"
+            ) != len(pair_records):
+                raise ValueError("qualification_pair_record_count_mismatch")
+            if summary.get("csv_data_row_count") is not None and csv_rows is not None and _require_exact_int(
+                summary["csv_data_row_count"], "qualification_summary:csv_data_row_count"
+            ) != len(csv_rows):
+                raise ValueError("qualification_pair_record_count_mismatch")
+        if bound_case_ids != planned_ids:
             raise ValueError("qualification_case_metadata_identity_mismatch")
     # Evidence paths and bundles are immutable identities, not aliases.  A
     # hardlink would permit two case paths to share the same underlying bytes.
     inode_identities: dict[tuple[int, int], str] = {}
-    for path in snapshots:
-        stat_value = Path(path).stat(follow_symlinks=False)
-        identity = (stat_value.st_dev, stat_value.st_ino)
+    for path, snapshot in snapshots.items():
+        identity = snapshot.stat_identity[:2]
         prior = inode_identities.setdefault(identity, path)
         if prior != path:
             raise ValueError("qualification_evidence_hardlink_reuse")
