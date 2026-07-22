@@ -70,10 +70,17 @@ when the snapshot is created. Each metadata item must be an exact two-element
 never interpreted as pairs. Direct construction accepts only `None`, a tuple,
 or a list as the outer container, while the observation factory materializes a
 runtime `Mapping.items()` sequence before applying the same pair validation.
-Metadata is stored in allowlist order. The attempt canonical SHA-256 is an
-integrity hash of one serialized attempt instance, including its generation,
-sequence, timestamps, and profile path; it is not a physical detection-pair
-identity.
+The active payload adapter first validates `None`, `Mapping`, or exact
+tuple/list outer containers and exact two-element tuple/list items, then
+materializes a detached plain dictionary; it never passes an unchecked
+iterable to `dict()`. The snapshot canonicalizer independently revalidates the
+allowlist and scalar contract and stores metadata in allowlist order.
+`MeasurementAttempt` accepts only exact base `DetectionSnapshot` instances, and
+the snapshot factory explicitly rejects subclasses so an overridden
+`__post_init__()` cannot bypass provenance validation. The attempt canonical
+SHA-256 is an integrity hash of one serialized attempt instance, including its
+generation, sequence, timestamps, and profile path; it is not a physical
+detection-pair identity.
 
 Correspondence is fail-closed before attempt construction: left/right classes
 must match, and either side with multiple candidates of that selected class is

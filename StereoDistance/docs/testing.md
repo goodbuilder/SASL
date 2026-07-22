@@ -38,7 +38,10 @@ PYTHONPATH=. python3 -m pytest \
 snapshot 생성 시점에 거부되는지, source·`asdict()` mutation이 attempt
 canonical SHA-256을 바꾸지 않는지도 확인한다. 또한 outer container와 각
 pair item을 명시적인 `None`/tuple/list 계약으로 제한하고 Mapping·set·문자열
-·bytes·임의 iterable이 two-element pair로 오인되지 않는지 검증한다.
+·bytes·임의 iterable이 two-element pair로 오인되지 않는지 검증한다. 실제
+`DetectionObservation.from_payload()` 경로도 같은 shape 계약으로 먼저
+검증하며, `DetectionSnapshot` subclass가 factory·`replace()`를 통해 attempt와
+canonical SHA 경계에 진입하지 못하는지도 확인한다.
 
 ## 대표 PyQt 테스트
 

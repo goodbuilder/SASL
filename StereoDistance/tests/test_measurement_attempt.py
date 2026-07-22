@@ -199,8 +199,330 @@ class MetadataListSubclass(list):
     pass
 
 
+class BypassDetectionSnapshot(DetectionSnapshot):
+    def __post_init__(self) -> None:
+        pass
+
+
 def malformed_mapping_item():
     return {"rtp_timestamp": 999, "timestamp_source": "rtcp"}
+
+
+def detection_payload(metadata) -> dict:
+    return {
+        "timestamp_s": 10.0,
+        "width": 1280,
+        "height": 720,
+        "best_detection": {
+            "x1": 600.0,
+            "y1": 300.0,
+            "x2": 680.0,
+            "y2": 380.0,
+            "confidence": 0.9,
+            "class_id": 1,
+            "class_name": "target",
+        },
+        "detections": [],
+        "timestamp_metadata": metadata,
+    }
+
+
+def bypass_detection_snapshot(metadata_items) -> BypassDetectionSnapshot:
+    return BypassDetectionSnapshot(
+        camera="left",
+        app_receive_monotonic_s=10.0,
+        width_px=1280,
+        height_px=720,
+        bbox_xyxy_px=(630.0, 350.0, 650.0, 370.0),
+        center_px=(640.0, 360.0),
+        confidence=0.95,
+        class_id=2,
+        class_name="drone",
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+        timestamp_metadata_items=metadata_items,
+        candidate_class_ids=(2,),
+    )
+
+
+def test_from_payload_rejects_malformed_mapping_item_before_dict_coercion() -> None:
+    with pytest.raises((TypeError, ValueError)):
+        DetectionObservation.from_payload(
+            "left",
+            detection_payload((malformed_mapping_item(),)),
+        )
+
+
+def test_from_payload_malformed_metadata_cannot_reach_snapshot_attempt_or_sha() -> None:
+    observation_created = False
+    snapshot_created = False
+    attempt_created = False
+    canonical_sha_called = False
+
+    with pytest.raises((TypeError, ValueError)):
+        observation = DetectionObservation.from_payload(
+            "left",
+            detection_payload((malformed_mapping_item(),)),
+        )
+        observation_created = True
+        snapshot = DetectionSnapshot.from_observation(
+            observation,
+            pairing_timestamp_basis="detection",
+            pairing_timestamp_s=10.0,
+        )
+        snapshot_created = True
+        attempt = replace(pixhawk_attempt(), left_detection=snapshot)
+        attempt_created = True
+        canonical_sha_called = True
+        attempt.canonical_sha256()
+
+    assert observation_created is False
+    assert snapshot_created is False
+    assert attempt_created is False
+    assert canonical_sha_called is False
+
+
+def test_from_payload_normal_mapping_is_detached_and_hash_stable() -> None:
+    source_metadata = {
+        "rtp_timestamp": 123,
+        "timestamp_source": "rtcp",
+        "unknown_vendor_field": [1, 2],
+    }
+    payload = detection_payload(source_metadata)
+    observation = DetectionObservation.from_payload("left", payload)
+    assert observation is not None
+    snapshot = DetectionSnapshot.from_observation(
+        observation,
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+    )
+    attempt = replace(pixhawk_attempt(), left_detection=snapshot)
+    before_snapshot_metadata = snapshot.timestamp_metadata_items
+    before_sha = attempt.canonical_sha256()
+
+    source_metadata["rtp_timestamp"] = 999
+    source_metadata["unknown_vendor_field"].append(3)
+    payload["timestamp_metadata"] = {"rtp_timestamp": 456}
+
+    assert observation.timestamp_metadata["rtp_timestamp"] == 123
+    assert observation.timestamp_metadata is not source_metadata
+    assert snapshot.timestamp_metadata_items == (
+        ("timestamp_source", "rtcp"),
+        ("rtp_timestamp", 123),
+    )
+    assert snapshot.timestamp_metadata_items == before_snapshot_metadata
+    assert attempt.canonical_sha256() == before_sha
+
+
+def test_from_payload_accepts_explicit_tuple_and_list_pairs() -> None:
+    observation = DetectionObservation.from_payload(
+        "left",
+        detection_payload(
+            (
+                ("rtp_timestamp", 123),
+                ["timestamp_source", "rtcp"],
+            )
+        ),
+    )
+    assert observation is not None
+    assert observation.timestamp_metadata == {
+        "rtp_timestamp": 123,
+        "timestamp_source": "rtcp",
+    }
+
+    snapshot = DetectionSnapshot.from_observation(
+        observation,
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+    )
+
+    assert snapshot.timestamp_metadata_items == (
+        ("timestamp_source", "rtcp"),
+        ("rtp_timestamp", 123),
+    )
+
+
+@pytest.mark.parametrize("empty_metadata", (None, (), []), ids=("none", "tuple", "list"))
+def test_payload_adapter_allows_explicit_empty_values(empty_metadata) -> None:
+    observation = DetectionObservation.from_payload(
+        "left",
+        detection_payload(empty_metadata),
+    )
+
+    assert observation is not None
+    assert observation.timestamp_metadata == {}
+
+
+@pytest.mark.parametrize(
+    "invalid_metadata_factory",
+    (
+        lambda: "",
+        lambda: b"",
+        bytearray,
+        lambda: memoryview(b""),
+        set,
+        frozenset,
+        lambda: (item for item in ()),
+        MetadataCustomIterable,
+        MetadataTupleSubclass,
+        MetadataListSubclass,
+        lambda: 0,
+        lambda: 1,
+        lambda: False,
+        lambda: True,
+    ),
+    ids=(
+        "empty-str",
+        "empty-bytes",
+        "empty-bytearray",
+        "empty-memoryview",
+        "empty-set",
+        "empty-frozenset",
+        "generator",
+        "custom-iterable",
+        "tuple-subclass",
+        "list-subclass",
+        "zero-int",
+        "int",
+        "false-bool",
+        "bool",
+    ),
+)
+def test_payload_adapter_rejects_malformed_outer_types(invalid_metadata_factory) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        DetectionObservation.from_payload(
+            "left",
+            detection_payload(invalid_metadata_factory()),
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_item_factory",
+    (
+        malformed_mapping_item,
+        lambda: MetadataMappingSubclass(malformed_mapping_item()),
+        lambda: {"rtp_timestamp", 123},
+        lambda: frozenset(("rtp_timestamp", 123)),
+        lambda: "ab",
+        lambda: b"ab",
+        lambda: bytearray(b"ab"),
+        lambda: memoryview(b"ab"),
+        lambda: (value for value in ("rtp_timestamp", 123)),
+        MetadataCustomIterable,
+        lambda: MetadataTupleSubclass(("rtp_timestamp", 123)),
+        lambda: MetadataListSubclass(("rtp_timestamp", 123)),
+    ),
+    ids=(
+        "mapping",
+        "mapping-subclass",
+        "set",
+        "frozenset",
+        "str",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "generator",
+        "custom-iterable",
+        "tuple-subclass",
+        "list-subclass",
+    ),
+)
+def test_payload_adapter_rejects_malformed_pair_items(invalid_item_factory) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        DetectionObservation.from_payload(
+            "left",
+            detection_payload((invalid_item_factory(),)),
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_metadata",
+    (
+        ((),),
+        (("rtp_timestamp",),),
+        (("rtp_timestamp", 1, 2),),
+        ([],),
+        (["rtp_timestamp"],),
+        (["rtp_timestamp", 1, 2],),
+        (("rtp_timestamp", 1), ("rtp_timestamp", 2)),
+        ((1, 123),),
+    ),
+    ids=(
+        "empty-tuple",
+        "one-tuple",
+        "three-tuple",
+        "empty-list",
+        "one-list",
+        "three-list",
+        "duplicate",
+        "non-string-key",
+    ),
+)
+def test_payload_adapter_rejects_invalid_pair_lengths_and_keys(invalid_metadata) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        DetectionObservation.from_payload(
+            "left",
+            detection_payload(invalid_metadata),
+        )
+
+
+def test_snapshot_subclass_cannot_enter_measurement_attempt() -> None:
+    bypass = bypass_detection_snapshot((malformed_mapping_item(),))
+
+    with pytest.raises(TypeError, match="DetectionSnapshot"):
+        replace(pixhawk_attempt(), left_detection=bypass)
+
+
+def test_snapshot_subclass_factory_is_rejected() -> None:
+    observation = detection("left", 640.0, metadata={"rtp_timestamp": 123})
+
+    with pytest.raises(TypeError, match="subclass"):
+        BypassDetectionSnapshot.from_observation(
+            observation,
+            pairing_timestamp_basis="detection",
+            pairing_timestamp_s=10.0,
+        )
+
+
+def test_snapshot_subclass_replace_cannot_reach_attempt_or_sha() -> None:
+    bypass = bypass_detection_snapshot((("rtp_timestamp", 123),))
+    replaced_bypass = replace(
+        bypass,
+        timestamp_metadata_items=(malformed_mapping_item(),),
+    )
+    attempt_created = False
+    canonical_sha_called = False
+
+    with pytest.raises(TypeError, match="DetectionSnapshot"):
+        attempt = replace(pixhawk_attempt(), left_detection=replaced_bypass)
+        attempt_created = True
+        canonical_sha_called = True
+        attempt.canonical_sha256()
+
+    assert attempt_created is False
+    assert canonical_sha_called is False
+
+
+def test_base_snapshot_factory_replace_attempt_and_sha_remain_supported() -> None:
+    observation = DetectionObservation.from_payload(
+        "left",
+        detection_payload({"rtp_timestamp": 123, "timestamp_source": "rtcp"}),
+    )
+    assert observation is not None
+    snapshot = DetectionSnapshot.from_observation(
+        observation,
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+    )
+    replaced_snapshot = replace(
+        snapshot,
+        timestamp_metadata_items=(("timestamp_source", "rtcp"), ("rtp_timestamp", 123)),
+    )
+    attempt = replace(pixhawk_attempt(), left_detection=replaced_snapshot)
+
+    assert type(snapshot) is DetectionSnapshot
+    assert type(replaced_snapshot) is DetectionSnapshot
+    assert len(attempt.canonical_sha256()) == 64
 
 
 @pytest.mark.parametrize(

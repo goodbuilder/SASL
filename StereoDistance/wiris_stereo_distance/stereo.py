@@ -6,6 +6,33 @@ from math import isfinite
 from typing import Mapping, Any
 
 
+def _materialize_timestamp_metadata(metadata: Any) -> dict[str, Any]:
+    """Detach payload metadata after validating its explicit pair shape."""
+
+    if metadata is None:
+        return {}
+    if isinstance(metadata, Mapping):
+        raw_items = tuple(metadata.items())
+    elif type(metadata) in (tuple, list):
+        raw_items = metadata
+    else:
+        raise TypeError("timestamp metadata must be a Mapping, tuple, or list")
+
+    materialized: dict[str, Any] = {}
+    for raw_item in raw_items:
+        if type(raw_item) not in (tuple, list):
+            raise TypeError("each timestamp metadata item must be a tuple or list")
+        if len(raw_item) != 2:
+            raise ValueError("each timestamp metadata item must contain exactly two values")
+        key, value = raw_item
+        if type(key) is not str:
+            raise TypeError("timestamp metadata keys must be strings")
+        if key in materialized:
+            raise ValueError(f"duplicate timestamp metadata key: {key}")
+        materialized[key] = value
+    return materialized
+
+
 @dataclass(frozen=True)
 class DetectionObservation:
     camera: str
@@ -61,7 +88,9 @@ class DetectionObservation:
             confidence=float(best["confidence"]),
             class_id=int(best["class_id"]),
             class_name=str(best["class_name"]) if best.get("class_name") is not None else None,
-            timestamp_metadata=dict(payload.get("timestamp_metadata") or {}),
+            timestamp_metadata=_materialize_timestamp_metadata(
+                payload.get("timestamp_metadata")
+            ),
             candidate_class_ids=candidate_class_ids,
         )
 

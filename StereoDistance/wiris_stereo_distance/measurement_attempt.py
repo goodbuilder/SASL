@@ -243,6 +243,8 @@ class DetectionSnapshot:
         pairing_timestamp_basis: str,
         pairing_timestamp_s: float,
     ) -> "DetectionSnapshot":
+        if cls is not DetectionSnapshot:
+            raise TypeError("DetectionSnapshot.from_observation does not support subclasses")
         x1 = _finite_float(observation.x1, name="x1")
         y1 = _finite_float(observation.y1, name="y1")
         x2 = _finite_float(observation.x2, name="x2")
@@ -854,10 +856,10 @@ class MeasurementAttempt:
         ):
             object.__setattr__(self, name, str(getattr(self, name)))
         object.__setattr__(self, "warnings", tuple(str(value) for value in self.warnings))
-        if not isinstance(self.left_detection, DetectionSnapshot) or not isinstance(
-            self.right_detection, DetectionSnapshot
-        ):
-            raise TypeError("detections must be immutable DetectionSnapshot values")
+        if type(self.left_detection) is not DetectionSnapshot or type(
+            self.right_detection
+        ) is not DetectionSnapshot:
+            raise TypeError("detections must be exact immutable DetectionSnapshot values")
         for value in (self.left_attitude, self.right_attitude):
             if value is not None and not isinstance(value, AttitudeSnapshot):
                 raise TypeError("attitudes must be immutable AttitudeSnapshot values")
