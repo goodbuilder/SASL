@@ -157,6 +157,22 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
     with pytest.raises(ValueError, match="proper orthonormal rotation"):
         validate_frozen_catalog(reflected)
     atomic_write_json(root / "frozen_correction_catalog.json", catalog)
+    commitment_path = root / "sealed_evaluation_commitment.json"
+    catalog_path = root / "frozen_correction_catalog.json"
+    catalog_hash = sha256_file(catalog_path)
+    commitment_hash = sha256_file(commitment_path)
+    manifest_path = root / "frozen_selection_manifest.json"
+    atomic_write_json(
+        manifest_path,
+        {
+            "schema_version": "s2_sealed_qualification_v1",
+            "qualification_id": "sealed-test",
+            "branch": BRANCH,
+            "commit_sha": SHA,
+            "frozen_correction_catalog_sha256": catalog_hash,
+            "sealed_commitment_sha256": commitment_hash,
+        },
+    )
     atomic_write_json(
         root / "qualification_state.json",
         {
@@ -165,10 +181,11 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
             "state": "PROFILE_FROZEN",
             "branch": BRANCH,
             "commit_sha": SHA,
+            "frozen_catalog_sha256": catalog_hash,
+            "sealed_commitment_sha256": commitment_hash,
+            "frozen_selection_manifest_sha256": sha256_file(manifest_path),
         },
     )
-    commitment_path = root / "sealed_evaluation_commitment.json"
-    catalog_path = root / "frozen_correction_catalog.json"
     with pytest.raises(ValueError, match="hash mismatch"):
         authorize_unseal(
             root,
@@ -177,6 +194,18 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
             expected_branch=BRANCH,
             expected_commit_sha=SHA,
         )
+    tampered_catalog = {**catalog, "candidate_search_code_sha256": "5" * 64}
+    atomic_write_json(catalog_path, tampered_catalog)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        authorize_unseal(
+            root,
+            frozen_catalog_sha256=sha256_file(catalog_path),
+            sealed_commitment_sha256=commitment_hash,
+            expected_branch=BRANCH,
+            expected_commit_sha=SHA,
+        )
+    atomic_write_json(catalog_path, catalog)
+    assert sha256_file(catalog_path) == catalog_hash
     result = authorize_unseal(
         root,
         frozen_catalog_sha256=sha256_file(catalog_path),

@@ -1065,7 +1065,26 @@ def authorize_unseal(
         raise ValueError("sealed Evaluation is not in the unopened state")
     catalog = directory / "frozen_correction_catalog.json"
     commitment_path = directory / "sealed_evaluation_commitment.json"
-    if sha256_file(catalog) != frozen_catalog_sha256 or sha256_file(commitment_path) != sealed_commitment_sha256:
+    manifest_path = directory / "frozen_selection_manifest.json"
+    state = status["state_payload"]
+    manifest_hash = sha256_file(manifest_path)
+    if state.get("frozen_selection_manifest_sha256") != manifest_hash:
+        raise ValueError("frozen selection manifest hash mismatch")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+    if manifest.get("schema_version") != S2_QUALIFICATION_SCHEMA_VERSION:
+        raise ValueError("frozen selection manifest schema mismatch")
+    if manifest.get("branch") != expected_branch or manifest.get("commit_sha") != expected_commit_sha:
+        raise ValueError("frozen selection manifest provenance mismatch")
+    expected_catalog_hash = state.get("frozen_catalog_sha256")
+    expected_commitment_hash = state.get("sealed_commitment_sha256")
+    if (
+        frozen_catalog_sha256 != expected_catalog_hash
+        or manifest.get("frozen_correction_catalog_sha256") != expected_catalog_hash
+        or sha256_file(catalog) != expected_catalog_hash
+        or sealed_commitment_sha256 != expected_commitment_hash
+        or manifest.get("sealed_commitment_sha256") != expected_commitment_hash
+        or sha256_file(commitment_path) != expected_commitment_hash
+    ):
         raise ValueError("frozen catalog or sealed commitment hash mismatch")
     catalog_value = json.loads(catalog.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
     validate_frozen_catalog(catalog_value, expected_branch=expected_branch, expected_commit_sha=expected_commit_sha)
@@ -1074,7 +1093,7 @@ def authorize_unseal(
     ledger = DataAccessLedger(directory / "data_access_ledger.jsonl")
     ledger.record(stage="unseal", role="sealed_evaluation", path=commitment_path, operation="authorize_unseal")
     os.replace(source, directory / "SEALED_EVALUATION_OPENED")
-    state = dict(status["state_payload"])
+    state = dict(state)
     state["state"] = "SEALED_OPENED"
     atomic_write_json(directory / "qualification_state.json", state)
     return {"state": "SEALED_OPENED", "selected_family": catalog_value["selected_method_family"]}
@@ -1115,12 +1134,16 @@ def _load_role_dataset(
     stage = "fit" if role == "calibration" else "validation_score"
     for path in (root / "sweep_plan.json", root / "sweep_cases.jsonl", root / "sweep_summary.json"):
         ledger.record(stage=stage, role=role, path=path, operation="read_sweep_artifact")
+    for path in (planned_dir / "sweep_plan.json", planned_dir / "sweep_cases.jsonl"):
+        ledger.record(stage=stage, role=role, path=path, operation="read_precommitted_role_plan")
     actual_plan = json.loads((root / "sweep_plan.json").read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
     planned_plan = json.loads((planned_dir / "sweep_plan.json").read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
     if actual_plan != planned_plan:
         raise ValueError(f"{role} sweep plan differs from precommitted plan")
     summary = json.loads((root / "sweep_summary.json").read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
-    if not (root / "SWEEP_FINALIZED_VALID").is_file():
+    valid_marker = root / "SWEEP_FINALIZED_VALID"
+    ledger.record(stage=stage, role=role, path=valid_marker, operation="check_sweep_valid_marker")
+    if not valid_marker.is_file():
         raise ValueError(f"{role} sweep VALID marker is missing")
     if (root / "SWEEP_FINALIZED_INVALID").exists() or (root / "SWEEP_INCOMPLETE").exists():
         raise ValueError(f"{role} sweep markers are contradictory")
@@ -1396,6 +1419,7 @@ def fit_select_freeze(
         "selected_method_family": selected_family,
         "frozen_catalog_sha256": sha256_file(catalog_path),
         "sealed_commitment_sha256": sha256_file(commitment_path),
+        "frozen_selection_manifest_sha256": sha256_file(manifest_path),
     }
     atomic_write_json(root / "qualification_state.json", state)
     os.replace(source_marker, root / "QUALIFICATION_PROFILE_FROZEN")
