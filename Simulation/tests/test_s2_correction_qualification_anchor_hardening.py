@@ -127,11 +127,53 @@ def test_ledger_referenced_case_artifact_tamper_is_rejected(
     _write_jsonl(ledger_path, ledger)
     _refresh_anchor_chain(root, anchor, "data_access_ledger.jsonl")
 
-    verify_freeze_anchor_artifacts(root, anchor, repository_root=REPOSITORY_ROOT)
-    copied_evidence.write_bytes(copied_evidence.read_bytes() + b"x")
-    with pytest.raises(
-        ValueError, match="ledger_referenced_artifact_sha256_mismatch"
-    ):
+    with pytest.raises(ValueError, match="qualification_evidence_root_mismatch"):
+        verify_freeze_anchor_artifacts(root, anchor, repository_root=REPOSITORY_ROOT)
+
+
+def test_duplicate_ledger_path_is_rejected(tmp_path: Path) -> None:
+    root = _copy_qualification(tmp_path)
+    anchor = copy.deepcopy(_anchor())
+    ledger_path = root / "data_access_ledger.jsonl"
+    ledger = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    first = next(
+        item for item in ledger
+        if item["operation"] == "read_r2_artifact"
+        and Path(item["canonical_path"]).name == "pair_records.jsonl"
+    )
+    second = next(
+        item for item in ledger
+        if item["operation"] == "read_r2_artifact"
+        and Path(item["canonical_path"]).name == "pair_records.jsonl"
+        and item["canonical_path"] != first["canonical_path"]
+    )
+    second["canonical_path"] = first["canonical_path"]
+    second["artifact_hash"] = first["artifact_hash"]
+    _write_jsonl(ledger_path, ledger)
+    _refresh_anchor_chain(root, anchor, "data_access_ledger.jsonl")
+    with pytest.raises(ValueError, match="access_ledger_duplicate_canonical_path"):
+        verify_freeze_anchor_artifacts(root, anchor, repository_root=REPOSITORY_ROOT)
+
+
+def test_case_bundle_identity_reuse_is_rejected(
+    tmp_path: Path,
+) -> None:
+    root = _copy_qualification(tmp_path)
+    anchor = copy.deepcopy(_anchor())
+    ledger_path = root / "data_access_ledger.jsonl"
+    ledger = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    pairs = [
+        item for item in ledger
+        if item["role"] == "calibration"
+        and item["operation"] == "read_r2_artifact"
+        and Path(item["canonical_path"]).name == "run_metadata.json"
+    ]
+    first, second = pairs[:2]
+    first_path, first_hash = first["canonical_path"], first["artifact_hash"]
+    second["canonical_path"], second["artifact_hash"] = first_path, first_hash
+    _write_jsonl(ledger_path, ledger)
+    _refresh_anchor_chain(root, anchor, "data_access_ledger.jsonl")
+    with pytest.raises(ValueError, match="access_ledger_duplicate_canonical_path"):
         verify_freeze_anchor_artifacts(root, anchor, repository_root=REPOSITORY_ROOT)
 
 

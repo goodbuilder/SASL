@@ -167,6 +167,15 @@ later mutation, exclusive locking, atomic ledger/marker/state transitions,
 interrupted-run recovery, the sealed runner, the frozen Corrected runtime
 adapter, or the sealed metric/result schema. Those remain R4-B requirements.
 
+#### Qualification evidence binding (S2-R4A-F1-D1-D1)
+
+Calibration and Validation evidence referenced by the Git-anchored ledger must
+remain below their role-specific sweep roots. Each planned case must bind to
+exactly one five-file R2 bundle; duplicate paths, reused bundles, mixed case
+directories, and unknown or missing planned cases are rejected. Existing
+sidecar and R4-A artifact bytes remain unchanged. Atomic unseal and copied-root
+identity remain R4-B concerns; this phase does not execute sealed evaluation.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone

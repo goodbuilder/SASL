@@ -1728,6 +1728,7 @@ def _external_ledger_file(
 def _verify_ledger_referenced_artifacts(
     ledger: Sequence[Mapping[str, Any]],
     dataset: Mapping[str, Any],
+    planned_cases: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[dict[str, int], dict[str, VerifiedFileBytes]]:
     entries = validate_access_ledger(ledger)
     operation_counts = {operation: 0 for operation in _FROZEN_LEDGER_OPERATIONS}
@@ -1792,6 +1793,109 @@ def _verify_ledger_referenced_artifacts(
         snapshots[canonical_path] = _external_ledger_file(
             entry, name="ledger_referenced_artifact"
         )
+    if len(snapshots) != len(entries):
+        raise ValueError("access_ledger_duplicate_canonical_path")
+
+    # The sweep summaries are the immutable role-specific roots.  Do not infer
+    # a root from a broad common ancestor such as the user's Desktop.
+    evidence_roots: dict[str, Path] = {}
+    for role in ("calibration", "validation"):
+        summary_entries = [
+            entry for entry in entries
+            if entry["role"] == role
+            and entry["operation"] == "read_sweep_artifact"
+            and PurePosixPath(entry["canonical_path"]).name == "sweep_summary.json"
+        ]
+        if len(summary_entries) != 1:
+            raise ValueError(f"qualification_{role}_evidence_root_missing")
+        summary_path = Path(summary_entries[0]["canonical_path"])
+        root = summary_path.parent
+        evidence_roots[role] = root
+        for entry in entries:
+            if entry["role"] != role or entry["operation"] != "read_r2_artifact":
+                continue
+            path = Path(entry["canonical_path"])
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError("qualification_evidence_root_mismatch") from exc
+            if path.parent == root:
+                raise ValueError("qualification_case_evidence_bundle_mismatch")
+
+    if evidence_roots["calibration"] == evidence_roots["validation"]:
+        raise ValueError("qualification_cross_role_evidence_root_reuse")
+
+    expected_names = set(_R2_ARTIFACT_NAMES)
+    for role, root in evidence_roots.items():
+        role_entries = [
+            entry for entry in entries
+            if entry["role"] == role and entry["operation"] == "read_r2_artifact"
+        ]
+        bundles: dict[Path, dict[str, Mapping[str, Any]]] = {}
+        for entry in role_entries:
+            path = Path(entry["canonical_path"])
+            bundle = bundles.setdefault(path.parent, {})
+            name = path.name
+            if name not in expected_names or name in bundle:
+                raise ValueError("qualification_case_evidence_bundle_mismatch")
+            bundle[name] = entry
+        expected_case_count = expected_role_cases[role]
+        if len(bundles) != expected_case_count:
+            raise ValueError("qualification_case_evidence_bundle_mismatch")
+        bound_case_ids: set[str] = set()
+        planned_ids = (
+            {
+                _require_exact_str(item.get("case_id"), f"{role}_planned:case_id")
+                for item in planned_cases[role]
+            }
+            if planned_cases is not None
+            else None
+        )
+        for case_dir, bundle in bundles.items():
+            if set(bundle) != expected_names:
+                raise ValueError("qualification_case_evidence_bundle_mismatch")
+            try:
+                relative_dir = case_dir.relative_to(root)
+                parts = relative_dir.parts
+                if (
+                    len(parts) != 4
+                    or parts[0] != "cases"
+                    or not parts[2].startswith("attempt-")
+                    or parts[3] != "recording"
+                ):
+                    raise ValueError
+                directory_case_id = parts[1]
+            except ValueError as exc:
+                raise ValueError("qualification_case_evidence_bundle_mismatch") from exc
+            metadata_snapshot = snapshots[bundle["run_metadata.json"]["canonical_path"]]
+            metadata = _parse_verified_json(
+                metadata_snapshot, name="qualification_run_metadata"
+            )
+            case_id = _require_exact_str(metadata.get("case_id"), "run_metadata:case_id")
+            if case_id != directory_case_id or case_id in bound_case_ids:
+                raise ValueError("qualification_case_metadata_identity_mismatch")
+            bound_case_ids.add(case_id)
+            if planned_ids is not None and case_id not in planned_ids:
+                raise ValueError("qualification_case_metadata_identity_mismatch")
+            summary_snapshot = snapshots[bundle["run_summary.json"]["canonical_path"]]
+            summary = _parse_verified_json(summary_snapshot, name="qualification_run_summary")
+            if summary.get("case_id") != case_id:
+                raise ValueError("qualification_case_metadata_identity_mismatch")
+            pair_snapshot = snapshots[bundle["pair_records.jsonl"]["canonical_path"]]
+            pair_records = _parse_verified_jsonl(pair_snapshot, name="qualification_pair_records")
+            if pair_records and pair_records[0].get("case_id") != case_id:
+                raise ValueError("qualification_case_metadata_identity_mismatch")
+        if planned_ids is not None and bound_case_ids != planned_ids:
+            raise ValueError("qualification_case_metadata_identity_mismatch")
+    # Evidence paths and bundles are immutable identities, not aliases.  A
+    # hardlink would permit two case paths to share the same underlying bytes.
+    inode_identities: dict[tuple[int, int], str] = {}
+    for path in snapshots:
+        stat_value = Path(path).stat(follow_symlinks=False)
+        identity = (stat_value.st_dev, stat_value.st_ino)
+        prior = inode_identities.setdefault(identity, path)
+        if prior != path:
+            raise ValueError("qualification_evidence_hardlink_reuse")
     r2_reference_count = operation_counts["read_r2_artifact"]
     case_level_reference_count = sum(
         entry["operation"] == "read_r2_artifact"
@@ -2152,7 +2256,12 @@ def verify_freeze_anchor_artifacts(
         raise ValueError("qualification_run_metadata_count_mismatch")
 
     ledger_verification, ledger_snapshots = _verify_ledger_referenced_artifacts(
-        ledger, dataset
+        ledger,
+        dataset,
+        {
+            "calibration": role_records["calibration"],
+            "validation": role_records["validation"],
+        },
     )
     _validate_qualification_inputs_and_gt_metadata(
         anchor,
