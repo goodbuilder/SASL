@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import shutil
 import sys
 
 import pytest
@@ -13,6 +14,10 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 
 SHA = "b" * 40
 BRANCH = "sim/s2-r4a-test"
+AUTHORITATIVE_ROOT = Path(
+    "/home/moon/Desktop/영상감시시스템-audit-results/s2-r4a/qualification/"
+    "exact-profile-freeze-88a360f"
+)
 
 
 def _cli_module():
@@ -171,22 +176,17 @@ def test_unseal_requires_both_frozen_hashes() -> None:
         )
 
 
-def test_verify_anchor_cli_is_read_only_and_needs_no_caller_supplied_sha(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_verify_anchor_cli_uses_production_validator_before_any_mutation(
+    tmp_path: Path,
 ) -> None:
     module = _cli_module()
-    repository = tmp_path / "repository"
     qualification = tmp_path / "qualification"
-    repository.mkdir()
-    qualification.mkdir()
-    captured = {}
-
-    def fake_verify(root, anchor, *, repository_root):
-        captured.update(root=root, anchor=anchor, repository_root=repository_root)
-        return {"sealed_state": "SEALED_UNOPENED"}
-
-    monkeypatch.setattr(module, "REPOSITORY_ROOT", repository)
-    monkeypatch.setattr(module, "verify_freeze_anchor", fake_verify)
+    shutil.copytree(AUTHORITATIVE_ROOT, qualification)
+    unexpected = qualification / "SEALED_RUNNING"
+    unexpected.write_bytes(b"")
+    ledger_before = (qualification / "data_access_ledger.jsonl").read_bytes()
+    state_before = (qualification / "qualification_state.json").read_bytes()
+    markers_before = sorted(path.name for path in qualification.iterdir() if path.name.isupper())
     args = module.parse_args(
         [
             "verify-freeze-anchor",
@@ -195,12 +195,11 @@ def test_verify_anchor_cli_is_read_only_and_needs_no_caller_supplied_sha(
             "--freeze-anchor",
             "Simulation/config/s2_r4a_freeze_anchor.json",
             "--repository-root",
-            str(repository),
+            str(module.REPOSITORY_ROOT),
         ]
     )
-    assert module.execute(args) == {"sealed_state": "SEALED_UNOPENED"}
-    assert captured == {
-        "root": qualification.resolve(),
-        "anchor": repository / "Simulation/config/s2_r4a_freeze_anchor.json",
-        "repository_root": repository.resolve(),
-    }
+    with pytest.raises(ValueError, match="unexpected_sealed_runtime_artifact"):
+        module.execute(args)
+    assert (qualification / "data_access_ledger.jsonl").read_bytes() == ledger_before
+    assert (qualification / "qualification_state.json").read_bytes() == state_before
+    assert sorted(path.name for path in qualification.iterdir() if path.name.isupper()) == markers_before

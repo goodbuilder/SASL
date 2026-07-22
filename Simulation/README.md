@@ -146,6 +146,27 @@ copied-root one-shot bypass, implement an R4-B sealed runner, add atomic sealed
 completion, or provide the sealed execution state machine. Those remain
 requirements of the later R4-B runner phase.
 
+#### Freeze-anchor verifier hardening (S2-R4A-F1-D1)
+
+F1-D1 keeps the Git sidecar and every existing R4-A artifact byte unchanged.
+The verifier now rehashes every qualification evidence file referenced by the
+Git-anchored access ledger, and JSON/JSONL contract checks consume the same
+immutable byte snapshot used for SHA-256 verification. The Calibration,
+Validation, and sealed roles are checked independently for case-ID overlap and
+for `(range_m, bearing_deg, elevation_deg)` spatial-cell overlap.
+
+A frozen/unopened verdict now requires the exact qualification-root allowlist;
+hidden, partial, or sealed-runtime output causes a fail-closed result. The CLI
+also rejects a qualification root containing any symlink component, a
+noncanonical freeze-anchor path, and a `--repository-root` that differs from
+the checkout containing the executing CLI.
+
+F1-D1 is not sealed evaluation. It does not solve byte-identical copied-root
+machine-global one-shot bypass, the race between completed verification and a
+later mutation, exclusive locking, atomic ledger/marker/state transitions,
+interrupted-run recovery, the sealed runner, the frozen Corrected runtime
+adapter, or the sealed metric/result schema. Those remain R4-B requirements.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone

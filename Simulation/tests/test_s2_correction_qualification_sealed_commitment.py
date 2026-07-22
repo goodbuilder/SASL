@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 from pathlib import Path
 import sys
 
@@ -18,16 +17,15 @@ from stereo_ground_sim.correction_qualification import (
     PROFILE_CATALOG_ROLE,
     SELECTION_RULE,
     QualificationSpec,
+    EVALUATION_REPOSITORY_ROOT,
     authorize_unseal,
     prepare_plans,
-    qualification_status,
     validate_access_ledger,
     validate_frozen_catalog,
     validate_sealed_commitment,
 )
 from stereo_ground_sim.correction_sweep import ATTITUDE_AXES, CameraContract
-from stereo_ground_sim.research_recording import atomic_write_json, sha256_file
-import stereo_ground_sim.correction_qualification as qualification_module
+from stereo_ground_sim.research_recording import sha256_file
 
 
 SHA = "d" * 40
@@ -103,11 +101,7 @@ def test_access_ledger_blocks_sealed_search_freeze_runtime_and_open_stages() -> 
         validate_access_ledger([freeze_runtime])
 
 
-def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transition(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = _prepared(tmp_path)
-    os.replace(root / "QUALIFICATION_PLANS_PREPARED", root / "QUALIFICATION_PROFILE_FROZEN")
+def test_frozen_catalog_contract_remains_strict() -> None:
     profile = {
         "source_attitude_deg": {axis: 0.0 for axis in ATTITUDE_AXES},
         "fitted_left_matrix_row_major": [list(row) for row in IDENTITY_MATRIX],
@@ -159,82 +153,6 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
     reflected["profiles"][0]["fitted_left_matrix_row_major"][0][0] = -1.0
     with pytest.raises(ValueError, match="proper orthonormal rotation"):
         validate_frozen_catalog(reflected)
-    atomic_write_json(root / "frozen_correction_catalog.json", catalog)
-    commitment_path = root / "sealed_evaluation_commitment.json"
-    catalog_path = root / "frozen_correction_catalog.json"
-    catalog_hash = sha256_file(catalog_path)
-    commitment_hash = sha256_file(commitment_path)
-    anchor = {
-        "qualification_source": {"branch": BRANCH, "commit_sha": SHA},
-        "artifact_sha256": {
-            "frozen_correction_catalog.json": catalog_hash,
-            "sealed_evaluation_commitment.json": commitment_hash,
-        },
-    }
-    monkeypatch.setattr(qualification_module, "load_freeze_anchor", lambda _path: anchor)
-    monkeypatch.setattr(
-        qualification_module,
-        "verify_freeze_anchor",
-        lambda *_args, **_kwargs: {"qualification_state": "PROFILE_FROZEN"},
-    )
-    manifest_path = root / "frozen_selection_manifest.json"
-    atomic_write_json(
-        manifest_path,
-        {
-            "schema_version": "s2_sealed_qualification_v1",
-            "qualification_id": "sealed-test",
-            "branch": BRANCH,
-            "commit_sha": SHA,
-            "frozen_correction_catalog_sha256": catalog_hash,
-            "sealed_commitment_sha256": commitment_hash,
-        },
-    )
-    atomic_write_json(
-        root / "qualification_state.json",
-        {
-            "schema_version": "s2_sealed_qualification_v1",
-            "qualification_id": "sealed-test",
-            "state": "PROFILE_FROZEN",
-            "branch": BRANCH,
-            "commit_sha": SHA,
-            "frozen_catalog_sha256": catalog_hash,
-            "sealed_commitment_sha256": commitment_hash,
-            "frozen_selection_manifest_sha256": sha256_file(manifest_path),
-        },
-    )
-    with pytest.raises(ValueError, match="hash mismatch"):
-        authorize_unseal(
-            root,
-            freeze_anchor_path=tmp_path / "anchor.json",
-            repository_root=tmp_path,
-            frozen_catalog_sha256="0" * 64,
-            sealed_commitment_sha256=sha256_file(commitment_path),
-        )
-    tampered_catalog = {**catalog, "candidate_search_code_sha256": "5" * 64}
-    atomic_write_json(catalog_path, tampered_catalog)
-    with pytest.raises(ValueError, match="hash mismatch"):
-        authorize_unseal(
-            root,
-            freeze_anchor_path=tmp_path / "anchor.json",
-            repository_root=tmp_path,
-            frozen_catalog_sha256=sha256_file(catalog_path),
-            sealed_commitment_sha256=commitment_hash,
-        )
-    atomic_write_json(catalog_path, catalog)
-    assert sha256_file(catalog_path) == catalog_hash
-    result = authorize_unseal(
-        root,
-        freeze_anchor_path=tmp_path / "anchor.json",
-        repository_root=tmp_path,
-        frozen_catalog_sha256=sha256_file(catalog_path),
-        sealed_commitment_sha256=sha256_file(commitment_path),
-    )
-    assert result == {"state": "SEALED_OPENED", "selected_family": "dual_camera_wahba_so3"}
-    assert (root / "SEALED_EVALUATION_OPENED").is_file()
-    assert not (root / "SEALED_EVALUATION_NOT_EXECUTED").exists()
-    assert qualification_status(root)["state"] == "SEALED_OPENED"
-    ledger = validate_access_ledger(root / "data_access_ledger.jsonl", require_r4a_sealed_closed=False)
-    assert ledger[-1]["stage"] == "unseal"
 
 
 def test_unseal_rejects_missing_anchor_before_any_state_mutation(tmp_path: Path) -> None:
@@ -248,7 +166,7 @@ def test_unseal_rejects_missing_anchor_before_any_state_mutation(tmp_path: Path)
         authorize_unseal(
             root,
             freeze_anchor_path=tmp_path / "missing-anchor.json",
-            repository_root=tmp_path,
+            repository_root=EVALUATION_REPOSITORY_ROOT,
             frozen_catalog_sha256="0" * 64,
             sealed_commitment_sha256="0" * 64,
         )

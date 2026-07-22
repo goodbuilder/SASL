@@ -111,6 +111,16 @@ def test_exact_existing_artifact_set_passes_read_only_verification() -> None:
         "ground_truth_provenance_verdict": "validated",
         "qualification_state": "PROFILE_FROZEN",
         "sealed_state": "SEALED_UNOPENED",
+        "case_id_overlap_count": 0,
+        "spatial_group_overlap_count": 0,
+        "ledger_row_count": 3391,
+        "ledger_r2_artifact_reference_count": 3375,
+        "ledger_case_level_artifact_reference_count": 2700,
+        "ledger_unique_file_count": 3391,
+        "ledger_rehashed_file_count": 3391,
+        "ledger_skipped_file_count": 0,
+        "ledger_hash_mismatch_count": 0,
+        "ledger_path_hash_conflict_count": 0,
     }
     for relative, digest in KNOWN_HASHES.items():
         assert anchor["artifact_sha256"][relative] == digest

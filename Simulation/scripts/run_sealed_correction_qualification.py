@@ -78,6 +78,20 @@ def _absolute_external_path(path: Path, *, name: str, must_exist: bool) -> Path:
     candidate = Path(path)
     if not candidate.is_absolute():
         raise ValueError(f"{name} must be an absolute path")
+    current = Path(candidate.anchor)
+    for part in candidate.parts[1:]:
+        current /= part
+        try:
+            is_symlink = current.is_symlink()
+            exists = current.exists()
+        except OSError as exc:
+            raise ValueError(f"{name} path inspection failed") from exc
+        if is_symlink:
+            raise ValueError(f"{name} symlink path is rejected")
+        if not exists:
+            if must_exist:
+                raise ValueError(f"{name} does not exist")
+            break
     resolved = candidate.resolve(strict=must_exist)
     repository = REPOSITORY_ROOT.resolve(strict=True)
     if resolved == repository or repository in resolved.parents:
@@ -98,6 +112,29 @@ def _existing_external_directory(path: Path, *, name: str) -> Path:
     if not resolved.is_dir():
         raise ValueError(f"{name} must be a directory")
     return resolved
+
+
+def _execution_repository(path: Path, *, command: str) -> Path:
+    supplied = Path(path).resolve(strict=True)
+    actual = REPOSITORY_ROOT.resolve(strict=True)
+    if supplied != actual:
+        raise ValueError(f"{command} repository root must be the CLI repository")
+    if _command_output(("git", "rev-parse", "--show-toplevel"), cwd=supplied) != str(actual):
+        raise ValueError(f"{command} repository root does not match Git toplevel")
+    return supplied
+
+
+def _canonical_anchor_path(repository_root: Path, path: Path, *, command: str) -> Path:
+    anchor_path = Path(path)
+    if not anchor_path.is_absolute():
+        anchor_path = repository_root / anchor_path
+    try:
+        relative = anchor_path.relative_to(repository_root).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"{command} freeze anchor path mismatch") from exc
+    if relative != FREEZE_ANCHOR_REPOSITORY_PATH:
+        raise ValueError(f"{command} freeze anchor path mismatch")
+    return anchor_path
 
 
 def _add_exact_revision_arguments(parser: argparse.ArgumentParser) -> None:
@@ -160,10 +197,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def execute(args: argparse.Namespace) -> Mapping[str, Any]:
     if args.command == "verify-freeze-anchor":
-        repository_root = Path(args.repository_root).resolve(strict=True)
-        anchor_path = Path(args.freeze_anchor)
-        if not anchor_path.is_absolute():
-            anchor_path = repository_root / anchor_path
+        repository_root = _execution_repository(
+            args.repository_root, command="verify"
+        )
+        anchor_path = _canonical_anchor_path(
+            repository_root, args.freeze_anchor, command="verify"
+        )
         return verify_freeze_anchor(
             _existing_external_directory(
                 args.qualification_root, name="qualification root"
@@ -211,14 +250,12 @@ def execute(args: argparse.Namespace) -> Mapping[str, Any]:
             )
         )
     if args.command == "unseal-evaluate":
-        repository_root = Path(args.repository_root).resolve(strict=True)
-        if repository_root != REPOSITORY_ROOT.resolve(strict=True):
-            raise ValueError("unseal repository root must be the CLI repository")
-        anchor_path = Path(args.freeze_anchor)
-        if not anchor_path.is_absolute():
-            anchor_path = repository_root / anchor_path
-        if anchor_path.relative_to(repository_root).as_posix() != FREEZE_ANCHOR_REPOSITORY_PATH:
-            raise ValueError("unseal freeze anchor path mismatch")
+        repository_root = _execution_repository(
+            args.repository_root, command="unseal"
+        )
+        anchor_path = _canonical_anchor_path(
+            repository_root, args.freeze_anchor, command="unseal"
+        )
         return authorize_unseal(
             _existing_external_directory(
                 args.qualification_root, name="qualification root"
