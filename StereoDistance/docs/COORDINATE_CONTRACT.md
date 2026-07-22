@@ -60,6 +60,16 @@ geometry-ready attempt. An incomplete attempt is replaced only when the same
 pair gains strictly more required inputs, after which the ready snapshot is
 frozen.
 
+Detection timestamp metadata is projected to
+`DETECTION_METADATA_ALLOWLIST` and both the observation factory and direct
+snapshot constructor use the same canonicalization. Stored values are limited
+to immutable `None`, `str`, `bool`, `int`, or finite `float` scalars; unknown or
+duplicate direct-constructor keys, mutable values, and NaN/Inf are rejected
+when the snapshot is created. Metadata is stored in allowlist order. The
+attempt canonical SHA-256 is an integrity hash of one serialized attempt
+instance, including its generation, sequence, timestamps, and profile path; it
+is not a physical detection-pair identity.
+
 Correspondence is fail-closed before attempt construction: left/right classes
 must match, and either side with multiple candidates of that selected class is
 rejected because this phase does not introduce a validated multi-object

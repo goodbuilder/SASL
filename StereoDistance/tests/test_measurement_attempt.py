@@ -1,4 +1,4 @@
-from dataclasses import replace
+from dataclasses import asdict, replace
 from math import cos, degrees, radians, sin
 from types import SimpleNamespace
 
@@ -161,6 +161,188 @@ def pixhawk_attempt(*, intrinsics_source=None) -> MeasurementAttempt:
         source_quality="GOOD",
         warnings=(),
     )
+
+
+def direct_detection_snapshot(metadata_items) -> DetectionSnapshot:
+    return DetectionSnapshot(
+        camera="left",
+        app_receive_monotonic_s=10.0,
+        width_px=1280,
+        height_px=720,
+        bbox_xyxy_px=(630.0, 350.0, 650.0, 370.0),
+        center_px=(640.0, 360.0),
+        confidence=0.95,
+        class_id=2,
+        class_name="drone",
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+        timestamp_metadata_items=metadata_items,
+        candidate_class_ids=(2,),
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid_value_factory",
+    (
+        lambda: [123],
+        lambda: {"value": 123},
+        lambda: {123},
+        lambda: (123,),
+        lambda: b"123",
+        lambda: bytearray(b"123"),
+        lambda: SimpleNamespace(value=123),
+        lambda: (value for value in (123,)),
+    ),
+    ids=("list", "dict", "set", "tuple", "bytes", "bytearray", "custom-object", "generator"),
+)
+def test_direct_detection_metadata_rejects_non_scalar_values(invalid_value_factory) -> None:
+    with pytest.raises((TypeError, ValueError), match="scalar"):
+        direct_detection_snapshot((("rtp_timestamp", invalid_value_factory()),))
+
+
+@pytest.mark.parametrize("invalid_value", (float("nan"), float("inf"), float("-inf")))
+def test_direct_detection_metadata_rejects_nonfinite_float_at_construction(invalid_value: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        direct_detection_snapshot((("rtcp_sr_age_s", invalid_value),))
+
+
+def test_direct_detection_metadata_rejects_duplicate_keys() -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        direct_detection_snapshot((("rtp_timestamp", 1), ("rtp_timestamp", 2)))
+
+
+def test_factory_detection_metadata_rejects_duplicate_allowlisted_keys() -> None:
+    observation = detection(
+        "left",
+        640.0,
+        metadata=(("rtp_timestamp", 1), ("rtp_timestamp", 2)),
+    )
+
+    with pytest.raises(ValueError, match="duplicate"):
+        DetectionSnapshot.from_observation(
+            observation,
+            pairing_timestamp_basis="detection",
+            pairing_timestamp_s=10.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_items",
+    (
+        ((1, 123),),
+        (("not_allowlisted", 123),),
+        (("rtp_timestamp", 1, 2),),
+        ("rtp_timestamp", 1),
+        123,
+    ),
+    ids=("non-string-key", "unknown-key", "three-item-pair", "flat-pair", "non-iterable"),
+)
+def test_direct_detection_metadata_rejects_invalid_keys_and_container_shape(invalid_items) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        direct_detection_snapshot(invalid_items)
+
+
+def test_direct_detection_metadata_has_canonical_allowlist_order_and_hash() -> None:
+    first = direct_detection_snapshot(
+        (
+            ("rtp_timestamp", 123),
+            ("timestamp_source", "rtcp"),
+            ("rtcp_sr_age_s", 0.1),
+            ("source_timestamp_s", None),
+            ("rtp_marker_seq", True),
+        )
+    )
+    second = direct_detection_snapshot(
+        (
+            ("rtp_marker_seq", True),
+            ("source_timestamp_s", None),
+            ("rtcp_sr_age_s", 0.1),
+            ("rtp_timestamp", 123),
+            ("timestamp_source", "rtcp"),
+        )
+    )
+    expected = (
+        ("source_timestamp_s", None),
+        ("timestamp_source", "rtcp"),
+        ("rtp_timestamp", 123),
+        ("rtp_marker_seq", True),
+        ("rtcp_sr_age_s", 0.1),
+    )
+    template = pixhawk_attempt()
+    first_attempt = replace(template, left_detection=first)
+    second_attempt = replace(template, left_detection=second)
+
+    assert first.timestamp_metadata_items == expected
+    assert second.timestamp_metadata_items == expected
+    assert type(dict(first.timestamp_metadata_items)["rtp_timestamp"]) is int
+    assert type(dict(first.timestamp_metadata_items)["rtp_marker_seq"]) is bool
+    assert first_attempt.canonical_payload() == second_attempt.canonical_payload()
+    assert first_attempt.canonical_sha256() == second_attempt.canonical_sha256()
+
+
+def test_direct_detection_metadata_is_stable_after_source_container_mutation() -> None:
+    source = [("rtp_timestamp", 123), ("timestamp_source", "rtcp")]
+    snapshot = direct_detection_snapshot(source)
+    attempt = replace(pixhawk_attempt(), left_detection=snapshot)
+    before_items = snapshot.timestamp_metadata_items
+    before_payload = attempt.canonical_payload()
+    before_sha = attempt.canonical_sha256()
+
+    source[0] = ("rtp_timestamp", 999)
+    source.append(("rtcp_sr_age_s", 99.0))
+
+    assert snapshot.timestamp_metadata_items == before_items
+    assert attempt.canonical_payload() == before_payload
+    assert attempt.canonical_sha256() == before_sha
+
+
+@pytest.mark.parametrize(
+    "invalid_items",
+    (
+        (("rtp_timestamp", [123]),),
+        (("rtcp_sr_age_s", float("nan")),),
+        (("rtp_timestamp", 1), ("rtp_timestamp", 2)),
+    ),
+    ids=("list", "nan", "duplicate"),
+)
+def test_replace_revalidates_invalid_detection_metadata(invalid_items) -> None:
+    snapshot = direct_detection_snapshot((("rtp_timestamp", 123),))
+
+    with pytest.raises((TypeError, ValueError)):
+        replace(snapshot, timestamp_metadata_items=invalid_items)
+
+
+def test_asdict_mutation_does_not_change_snapshot_or_attempt_hash() -> None:
+    snapshot = direct_detection_snapshot(
+        (("timestamp_source", "rtcp"), ("rtp_timestamp", 123))
+    )
+    attempt = replace(pixhawk_attempt(), left_detection=snapshot)
+    before_items = snapshot.timestamp_metadata_items
+    before_sha = attempt.canonical_sha256()
+    snapshot_payload = asdict(snapshot)
+    attempt_payload = attempt.canonical_payload()
+
+    snapshot_payload["timestamp_metadata_items"] = (("rtp_timestamp", 999),)
+    attempt_payload["left_detection"]["timestamp_metadata_items"] = (("rtp_timestamp", 999),)
+
+    assert snapshot.timestamp_metadata_items == before_items
+    assert attempt.canonical_sha256() == before_sha
+
+
+def test_factory_and_direct_detection_metadata_canonicalization_match() -> None:
+    metadata = {
+        "rtp_timestamp": 123,
+        "timestamp_source": "rtcp",
+        "rtcp_sr_age_s": 0.1,
+    }
+    factory = DetectionSnapshot.from_observation(
+        detection("left", 640.0, metadata=metadata),
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+    )
+    direct = direct_detection_snapshot(tuple(reversed(tuple(metadata.items()))))
+
+    assert factory.timestamp_metadata_items == direct.timestamp_metadata_items
 
 
 def test_snapshots_are_deeply_immutable_and_hash_stable_after_source_mutation() -> None:

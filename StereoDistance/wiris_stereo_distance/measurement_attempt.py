@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import json
 import math
@@ -116,21 +117,59 @@ def _sha256_payload(payload: Any) -> str:
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
+def _canonical_detection_metadata_items(
+    metadata_items: Any,
+    *,
+    project_allowlisted_keys: bool = False,
+) -> tuple[tuple[str, MetadataScalar], ...]:
+    """Validate and order immutable detection timestamp metadata."""
+
+    if metadata_items is None:
+        return ()
+    try:
+        raw_items = iter(metadata_items)
+    except TypeError as exc:
+        raise TypeError("timestamp metadata must be an iterable of key/value pairs") from exc
+
+    values_by_key: dict[str, MetadataScalar] = {}
+    for raw_item in raw_items:
+        try:
+            pair = tuple(raw_item)
+        except TypeError as exc:
+            raise TypeError("each timestamp metadata item must be a key/value pair") from exc
+        if len(pair) != 2:
+            raise ValueError("each timestamp metadata item must contain exactly two values")
+        key, value = pair
+        if type(key) is not str:
+            raise TypeError("timestamp metadata keys must be strings")
+        if key not in DETECTION_METADATA_ALLOWLIST:
+            if project_allowlisted_keys:
+                continue
+            raise ValueError(f"timestamp metadata key is not allowed: {key}")
+        if key in values_by_key:
+            raise ValueError(f"duplicate timestamp metadata key: {key}")
+        if value is None or type(value) in (str, bool, int):
+            values_by_key[key] = value
+        elif type(value) is float:
+            values_by_key[key] = _finite_float(value, name=f"timestamp_metadata.{key}")
+        else:
+            raise TypeError(f"timestamp_metadata.{key} must be an immutable scalar")
+
+    return tuple(
+        (key, values_by_key[key])
+        for key in DETECTION_METADATA_ALLOWLIST
+        if key in values_by_key
+    )
+
+
 def _metadata_items(metadata: Any) -> tuple[tuple[str, MetadataScalar], ...]:
-    source = dict(metadata or {})
-    items: list[tuple[str, MetadataScalar]] = []
-    for key in DETECTION_METADATA_ALLOWLIST:
-        if key not in source:
-            continue
-        value = source[key]
-        if value is None or isinstance(value, (str, bool, int)):
-            items.append((key, value))
-            continue
-        if isinstance(value, float):
-            items.append((key, _finite_float(value, name=f"timestamp_metadata.{key}")))
-            continue
-        raise ValueError(f"timestamp_metadata.{key} must be a scalar")
-    return tuple(items)
+    if metadata is None:
+        return ()
+    raw_items = metadata.items() if isinstance(metadata, Mapping) else metadata
+    return _canonical_detection_metadata_items(
+        raw_items,
+        project_allowlisted_keys=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -166,7 +205,7 @@ class DetectionSnapshot:
         object.__setattr__(
             self,
             "timestamp_metadata_items",
-            tuple((str(key), value) for key, value in self.timestamp_metadata_items),
+            _canonical_detection_metadata_items(self.timestamp_metadata_items),
         )
         object.__setattr__(
             self,
@@ -195,12 +234,6 @@ class DetectionSnapshot:
             raise ValueError("class IDs must be non-negative")
         if self.pixel_frame != CAMERA_FRAME or self.pixel_unit != "px":
             raise ValueError("detection pixels must use camera_optical_rdf pixel coordinates")
-        for key, value in self.timestamp_metadata_items:
-            if key not in DETECTION_METADATA_ALLOWLIST:
-                raise ValueError(f"timestamp metadata key is not allowed: {key}")
-            if isinstance(value, float) and not math.isfinite(value):
-                raise ValueError(f"timestamp_metadata.{key} must be finite")
-
     @classmethod
     def from_observation(
         cls,
