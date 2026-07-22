@@ -116,6 +116,36 @@ ledger, and artifact hashes. It records
 open that commitment exactly once at the same SHA; R4-A is neither sealed
 evaluation nor the formal 72-hour/PX4 correction-search qualification.
 
+### R4-A freeze anchor and Ground-Truth provenance (S2-R4A-F1)
+
+`config/s2_r4a_freeze_anchor.json` is the Git-tracked trust anchor for the
+existing external R4-A artifacts. F1 preserves those Calibration, Validation,
+frozen-catalog, access-ledger, and sealed-plan bytes exactly; the sidecar binds
+their SHA-256 values without copying them into the repository. The read-only
+`verify-freeze-anchor` command checks those bytes, the frozen/unopened state,
+the strict catalog and commitment contracts, the plan/cases identities, and
+the coordinate-source hashes without appending to the ledger or changing a
+marker.
+
+The three Git identities have distinct meanings. `qualification_source_sha`
+is the revision that produced Calibration/Validation results and the frozen
+profile. `freeze_anchor_sha` is resolved from Git history as the one commit
+that first added the sidecar; it is deliberately not stored inside the
+sidecar, which avoids commit self-reference. `evaluation_code_sha` is the
+current clean HEAD and must be a descendant of that immutable anchor commit.
+
+Ground Truth uses the project-defined alternative semantic reference
+`vehicle_reference_link`: a zero translation and zero RPY offset from the
+`x500_15m` model's `base_link`, sourced only from Gazebo World ENU. Missing
+Gazebo data fails closed; PX4 poses are not a fallback. Comparison output is
+meters in the fixed `baseline_center_frd` frame whose origin is the nominal
+left/right optical-center midpoint and whose axes are Forward, Right, Down.
+
+F1 does not unseal or evaluate data. It also does not solve byte-identical
+copied-root one-shot bypass, implement an R4-B sealed runner, add atomic sealed
+completion, or provide the sealed execution state machine. Those remain
+requirements of the later R4-B runner phase.
+
 ## Retired legacy correction tools
 
 As of 2026-07-20, the standalone

@@ -30,7 +30,7 @@ def _exact_args() -> list[str]:
     return ["--expected-commit-sha", SHA, "--expected-branch", BRANCH]
 
 
-def test_parser_exposes_exact_four_phase_commands_without_selection_overrides() -> None:
+def test_parser_exposes_read_only_anchor_command_without_selection_overrides() -> None:
     module = _cli_module()
     parser = module.build_parser()
     prepare = parser.parse_args(
@@ -46,7 +46,12 @@ def test_parser_exposes_exact_four_phase_commands_without_selection_overrides() 
         ]
     )
     assert prepare.command == "prepare-plans"
-    for command in ("fit-select-freeze", "status", "unseal-evaluate"):
+    for command in (
+        "fit-select-freeze",
+        "status",
+        "verify-freeze-anchor",
+        "unseal-evaluate",
+    ):
         assert command in parser.format_help()
     for forbidden in (
         "sealed-runtime-root",
@@ -155,8 +160,47 @@ def test_unseal_requires_both_frozen_hashes() -> None:
                 "unseal-evaluate",
                 "--qualification-root",
                 "/tmp/q",
+                "--freeze-anchor",
+                "Simulation/config/s2_r4a_freeze_anchor.json",
+                "--repository-root",
+                "/tmp/repo",
                 "--frozen-catalog-sha256",
                 "c" * 64,
                 *_exact_args(),
             ]
         )
+
+
+def test_verify_anchor_cli_is_read_only_and_needs_no_caller_supplied_sha(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    module = _cli_module()
+    repository = tmp_path / "repository"
+    qualification = tmp_path / "qualification"
+    repository.mkdir()
+    qualification.mkdir()
+    captured = {}
+
+    def fake_verify(root, anchor, *, repository_root):
+        captured.update(root=root, anchor=anchor, repository_root=repository_root)
+        return {"sealed_state": "SEALED_UNOPENED"}
+
+    monkeypatch.setattr(module, "REPOSITORY_ROOT", repository)
+    monkeypatch.setattr(module, "verify_freeze_anchor", fake_verify)
+    args = module.parse_args(
+        [
+            "verify-freeze-anchor",
+            "--qualification-root",
+            str(qualification),
+            "--freeze-anchor",
+            "Simulation/config/s2_r4a_freeze_anchor.json",
+            "--repository-root",
+            str(repository),
+        ]
+    )
+    assert module.execute(args) == {"sealed_state": "SEALED_UNOPENED"}
+    assert captured == {
+        "root": qualification.resolve(),
+        "anchor": repository / "Simulation/config/s2_r4a_freeze_anchor.json",
+        "repository_root": repository.resolve(),
+    }

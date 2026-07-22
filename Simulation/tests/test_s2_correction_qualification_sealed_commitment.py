@@ -27,6 +27,7 @@ from stereo_ground_sim.correction_qualification import (
 )
 from stereo_ground_sim.correction_sweep import ATTITUDE_AXES, CameraContract
 from stereo_ground_sim.research_recording import atomic_write_json, sha256_file
+import stereo_ground_sim.correction_qualification as qualification_module
 
 
 SHA = "d" * 40
@@ -102,7 +103,9 @@ def test_access_ledger_blocks_sealed_search_freeze_runtime_and_open_stages() -> 
         validate_access_ledger([freeze_runtime])
 
 
-def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transition(tmp_path: Path) -> None:
+def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     root = _prepared(tmp_path)
     os.replace(root / "QUALIFICATION_PLANS_PREPARED", root / "QUALIFICATION_PROFILE_FROZEN")
     profile = {
@@ -161,6 +164,19 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
     catalog_path = root / "frozen_correction_catalog.json"
     catalog_hash = sha256_file(catalog_path)
     commitment_hash = sha256_file(commitment_path)
+    anchor = {
+        "qualification_source": {"branch": BRANCH, "commit_sha": SHA},
+        "artifact_sha256": {
+            "frozen_correction_catalog.json": catalog_hash,
+            "sealed_evaluation_commitment.json": commitment_hash,
+        },
+    }
+    monkeypatch.setattr(qualification_module, "load_freeze_anchor", lambda _path: anchor)
+    monkeypatch.setattr(
+        qualification_module,
+        "verify_freeze_anchor",
+        lambda *_args, **_kwargs: {"qualification_state": "PROFILE_FROZEN"},
+    )
     manifest_path = root / "frozen_selection_manifest.json"
     atomic_write_json(
         manifest_path,
@@ -189,29 +205,29 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
     with pytest.raises(ValueError, match="hash mismatch"):
         authorize_unseal(
             root,
+            freeze_anchor_path=tmp_path / "anchor.json",
+            repository_root=tmp_path,
             frozen_catalog_sha256="0" * 64,
             sealed_commitment_sha256=sha256_file(commitment_path),
-            expected_branch=BRANCH,
-            expected_commit_sha=SHA,
         )
     tampered_catalog = {**catalog, "candidate_search_code_sha256": "5" * 64}
     atomic_write_json(catalog_path, tampered_catalog)
     with pytest.raises(ValueError, match="hash mismatch"):
         authorize_unseal(
             root,
+            freeze_anchor_path=tmp_path / "anchor.json",
+            repository_root=tmp_path,
             frozen_catalog_sha256=sha256_file(catalog_path),
             sealed_commitment_sha256=commitment_hash,
-            expected_branch=BRANCH,
-            expected_commit_sha=SHA,
         )
     atomic_write_json(catalog_path, catalog)
     assert sha256_file(catalog_path) == catalog_hash
     result = authorize_unseal(
         root,
+        freeze_anchor_path=tmp_path / "anchor.json",
+        repository_root=tmp_path,
         frozen_catalog_sha256=sha256_file(catalog_path),
         sealed_commitment_sha256=sha256_file(commitment_path),
-        expected_branch=BRANCH,
-        expected_commit_sha=SHA,
     )
     assert result == {"state": "SEALED_OPENED", "selected_family": "dual_camera_wahba_so3"}
     assert (root / "SEALED_EVALUATION_OPENED").is_file()
@@ -219,3 +235,26 @@ def test_unseal_requires_exact_frozen_hashes_then_performs_one_way_marker_transi
     assert qualification_status(root)["state"] == "SEALED_OPENED"
     ledger = validate_access_ledger(root / "data_access_ledger.jsonl", require_r4a_sealed_closed=False)
     assert ledger[-1]["stage"] == "unseal"
+
+
+def test_unseal_rejects_missing_anchor_before_any_state_mutation(tmp_path: Path) -> None:
+    root = _prepared(tmp_path)
+    before = {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    with pytest.raises(ValueError, match="freeze_anchor_missing"):
+        authorize_unseal(
+            root,
+            freeze_anchor_path=tmp_path / "missing-anchor.json",
+            repository_root=tmp_path,
+            frozen_catalog_sha256="0" * 64,
+            sealed_commitment_sha256="0" * 64,
+        )
+    after = {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+    assert after == before

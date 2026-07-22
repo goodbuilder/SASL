@@ -24,11 +24,13 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.correction_qualification import (  # noqa: E402
+    FREEZE_ANCHOR_REPOSITORY_PATH,
     QualificationSpec,
     authorize_unseal,
     fit_select_freeze,
     prepare_plans,
     qualification_status,
+    verify_freeze_anchor,
 )
 
 
@@ -131,11 +133,21 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--qualification-root", type=Path, required=True)
     _add_exact_revision_arguments(status)
 
+    verify_anchor = subparsers.add_parser(
+        "verify-freeze-anchor",
+        help="Verify the Git freeze anchor and external R4-A artifacts read-only.",
+    )
+    verify_anchor.add_argument("--qualification-root", type=Path, required=True)
+    verify_anchor.add_argument("--freeze-anchor", type=Path, required=True)
+    verify_anchor.add_argument("--repository-root", type=Path, required=True)
+
     unseal = subparsers.add_parser(
         "unseal-evaluate",
         help="Authorize R4-B sealed execution using exact frozen artifact hashes.",
     )
     unseal.add_argument("--qualification-root", type=Path, required=True)
+    unseal.add_argument("--freeze-anchor", type=Path, required=True)
+    unseal.add_argument("--repository-root", type=Path, required=True)
     unseal.add_argument("--frozen-catalog-sha256", required=True)
     unseal.add_argument("--sealed-commitment-sha256", required=True)
     _add_exact_revision_arguments(unseal)
@@ -147,6 +159,19 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def execute(args: argparse.Namespace) -> Mapping[str, Any]:
+    if args.command == "verify-freeze-anchor":
+        repository_root = Path(args.repository_root).resolve(strict=True)
+        anchor_path = Path(args.freeze_anchor)
+        if not anchor_path.is_absolute():
+            anchor_path = repository_root / anchor_path
+        return verify_freeze_anchor(
+            _existing_external_directory(
+                args.qualification_root, name="qualification root"
+            ),
+            anchor_path,
+            repository_root=repository_root,
+        )
+
     provenance = verify_git_provenance(
         REPOSITORY_ROOT,
         expected_commit_sha=args.expected_commit_sha,
@@ -186,14 +211,22 @@ def execute(args: argparse.Namespace) -> Mapping[str, Any]:
             )
         )
     if args.command == "unseal-evaluate":
+        repository_root = Path(args.repository_root).resolve(strict=True)
+        if repository_root != REPOSITORY_ROOT.resolve(strict=True):
+            raise ValueError("unseal repository root must be the CLI repository")
+        anchor_path = Path(args.freeze_anchor)
+        if not anchor_path.is_absolute():
+            anchor_path = repository_root / anchor_path
+        if anchor_path.relative_to(repository_root).as_posix() != FREEZE_ANCHOR_REPOSITORY_PATH:
+            raise ValueError("unseal freeze anchor path mismatch")
         return authorize_unseal(
             _existing_external_directory(
                 args.qualification_root, name="qualification root"
             ),
+            freeze_anchor_path=anchor_path,
+            repository_root=repository_root,
             frozen_catalog_sha256=args.frozen_catalog_sha256,
             sealed_commitment_sha256=args.sealed_commitment_sha256,
-            expected_branch=provenance["branch"],
-            expected_commit_sha=provenance["commit_sha"],
         )
     raise ValueError(f"unsupported command: {args.command}")
 

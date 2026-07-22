@@ -1,0 +1,94 @@
+{
+  "artifact_sha256": {
+    "calibration_plan/sweep_cases.jsonl": "051262d282b67fcd4195638bd253bef65ab5289d162aa000dc1318a825c8f317",
+    "calibration_plan/sweep_plan.json": "3c168293cb1c2d5ab409d5138eccf4bcc44f03b5486a39254c4dcaddde0c0357",
+    "candidate_family_results.json": "234765e2b7da6a8f6c72609bf7a3639baaedb36d24b04fa59839bb63fbdd9a09",
+    "candidate_search_plan.json": "bbc438e2f7d612f2dbb3dddcd9d9d8c53da7f084b167cd8257afe561a5429bc9",
+    "data_access_ledger.jsonl": "0720d70a6323568c5c54c176f997087842c9f5625e7c0043c335446e3b502872",
+    "frozen_correction_catalog.json": "e3e828a9e014803ad450188ec95ddccce55a0f4bbaeec0060d58c49c221eadf6",
+    "frozen_selection_manifest.json": "0efdf01df58e9ae7874c6416542d640411895e1b110b741f80fb427bc6d73c21",
+    "qualification_plan.json": "19352c3c628e3abe603d9e8ce0bfce5be3702ef3d53dd1e5309378cbf071cf94",
+    "qualification_state.json": "9e36febaa64c9d87db6dc8157af52f9864a88900c2dd71df4e3430a1b1bcc63b",
+    "sealed_evaluation_commitment.json": "2a5478020361f3719ac0735f2a1ca61c8fce5273022394dd29c7d7f3cdb0e82c",
+    "sealed_plan/sealed_sweep_cases.jsonl": "6b1dda197bef34f85f7ed346debcc5951d925110803a34a6ee26a5d96a1d5ade",
+    "sealed_plan/sealed_sweep_plan.json": "c7f008b77c2e311d73a373e830bb024a03e5c7b5a936d2b5483a0928423e298a",
+    "validation_plan/sweep_cases.jsonl": "e9d5fa65ae28f89f4eb98ca271b082ae0b043ecb759ee439fdd8d00d5c7a3755",
+    "validation_plan/sweep_plan.json": "167b03df9004cfa184e63f125526bd4274ac81827aa4d0e932f6440eb9deb910",
+    "validation_scorecard.csv": "12678f0157a2d74e2d4db9bf491dae90ae8a79d2bf21a6bd290d443bde0dbf27"
+  },
+  "coordinate_contract_sources": {
+    "files": {
+      "Simulation/stereo_ground_sim/launch/stereo_ground_sim.launch.py": "ecfb4b12f668fa2b19af499eb9d89f9440c5c074a286070da6206a5e1c27f8b8",
+      "Simulation/stereo_ground_sim/models/x500_15m/model.sdf": "98d67c2199daa939d3ae6cef89fb96b94b0e7fe419f0f82046566ab75dcfcb8b",
+      "Simulation/stereo_ground_sim/stereo_ground_sim/coordinate_frames.py": "501a7094c2b66f596a5337eabab0dd0cb9dee34e3fa7db7345562c49ba1c192a",
+      "Simulation/stereo_ground_sim/stereo_ground_sim/gazebo_ground_truth_adapter.py": "3fdbe66eee6bc15d6ea242cdbe1fbf5fb65460872ffe424228dd32986f991f31",
+      "Simulation/stereo_ground_sim/stereo_ground_sim/research_recording.py": "aee8c3e80db7ed4b658bb71eca9707d7c4201e3f544e64fcaaa17c9a50d9b4f5",
+      "Simulation/stereo_ground_sim/stereo_ground_sim/stereo_distance_node.py": "52ed02633952c5a393f47e3b7815e19466265c295e033b6d3463d24109531d6c"
+    },
+    "hash_algorithm": "sha256"
+  },
+  "dataset_contract": {
+    "analysis_eligible_samples": 30,
+    "calibration_case_count": 450,
+    "calibration_run_metadata_count": 450,
+    "dataset_role_overlap_count": 0,
+    "sealed_case_count": 225,
+    "sealed_metrics_present_at_freeze": false,
+    "sealed_runtime_access_count_at_freeze": 0,
+    "split_unit": "spatial_cell_group",
+    "validation_case_count": 225,
+    "validation_run_metadata_count": 225,
+    "warmup_eligible_samples": 10
+  },
+  "ground_truth_provenance": {
+    "fallback_policy": "fail_closed",
+    "fallback_used_for_qualification": false,
+    "gazebo_source_entity": "base_link",
+    "output_axes": "forward_right_down",
+    "output_frame": "baseline_center_frd",
+    "output_gt_topic": "/simulation/ground_truth/vehicle_reference_link",
+    "output_origin": "nominal_left_right_optical_center_midpoint",
+    "parent_link": "base_link",
+    "parent_model": "x500_15m",
+    "position_unit": "m",
+    "px4_fallback_used": false,
+    "quaternion_order": "xyzw",
+    "raw_pose_topic": "/world/stereo_ground_drone/pose/info",
+    "reference_rotation_offset_rpy_rad": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "reference_translation_offset_m": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "semantic_reference_definition": "project_defined_vehicle_reference_at_base_link_origin",
+    "semantic_reference_kind": "project_defined_alternative_reference",
+    "semantic_reference_name": "vehicle_reference_link",
+    "target_reference_link_present": false,
+    "world_frame": "gazebo_world_enu"
+  },
+  "qualification_id": "s2-r4a-ofat-12axis-v1",
+  "qualification_input_sha256": {
+    "calibration_sweep_summary": "b0abe77fc4c22ecfb64d1b2cb23838b792b8cceb854c91ba4467fbf0356b926c",
+    "candidate_search_code": "b83ca2b3ddbd0b274e6183c82ad53c1a6f9fe549ec207c43ee36859bf5abfc1a",
+    "validation_sweep_summary": "5cd6e528a35c8651b1b36ed0a2b4675f6eba475b3baf0a187bf8818f98b78700"
+  },
+  "qualification_source": {
+    "branch": "sim/s2-r4a-sealed-profile-freeze",
+    "commit_sha": "88a360f6023f00517106b9f9915116b10fd5c311",
+    "repository_name": "goodbuilder/SASL"
+  },
+  "schema_version": "s2_r4a_freeze_anchor_v1",
+  "selected_profile": {
+    "matrix_direction_convention": "R_Cnominal_Cactual maps actual optical RDF rays to nominal optical RDF",
+    "method_family": "dual_camera_wahba_so3",
+    "output_axes": "forward_right_down",
+    "output_frame": "baseline_center_frd",
+    "position_unit": "m",
+    "profile_count": 25,
+    "quaternion_order": "xyzw"
+  }
+}

@@ -17,8 +17,11 @@ from decimal import Decimal
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+import stat
+import subprocess
 from typing import Any, Mapping, Sequence
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -35,7 +38,17 @@ from sasl_common.stereo_geometry import (
     triangulate_rays,
 )
 
-from .coordinate_frames import build_baseline_center_frd, nominal_camera_poses
+from .coordinate_frames import (
+    BASELINE_CENTER_FRD_FRAME as COORDINATE_BASELINE_CENTER_FRD_FRAME,
+    REFERENCE_OFFSET_PARENT_M,
+    REFERENCE_OFFSET_PARENT_RPY_RAD,
+    SOURCE_GAZEBO_ENTITY,
+    VEHICLE_REFERENCE_DEFINITION,
+    VEHICLE_REFERENCE_LINK,
+    WORLD_FRAME,
+    build_baseline_center_frd,
+    nominal_camera_poses,
+)
 from .correction_sweep import (
     ATTITUDE_AXES,
     CameraContract,
@@ -52,6 +65,8 @@ from .correction_sweep import (
     validate_r2_artifacts,
     write_plan,
 )
+from .gazebo_ground_truth_adapter import OUTPUT_TOPIC, POSE_TOPIC
+from .research_recording import PAIR_RECORD_COLUMNS
 
 
 S2_QUALIFICATION_SCHEMA_VERSION = "s2_sealed_qualification_v1"
@@ -91,6 +106,94 @@ LEDGER_STAGES = (
     "unseal",
     "sealed_evaluation",
 )
+FREEZE_ANCHOR_SCHEMA_VERSION = "s2_r4a_freeze_anchor_v1"
+FREEZE_ANCHOR_REPOSITORY_PATH = "Simulation/config/s2_r4a_freeze_anchor.json"
+_FREEZE_ANCHOR_KEYS = {
+    "schema_version",
+    "qualification_id",
+    "qualification_source",
+    "selected_profile",
+    "dataset_contract",
+    "artifact_sha256",
+    "qualification_input_sha256",
+    "ground_truth_provenance",
+    "coordinate_contract_sources",
+}
+_QUALIFICATION_SOURCE_KEYS = {"repository_name", "branch", "commit_sha"}
+_SELECTED_PROFILE_KEYS = {
+    "method_family",
+    "profile_count",
+    "output_frame",
+    "output_axes",
+    "position_unit",
+    "matrix_direction_convention",
+    "quaternion_order",
+}
+_DATASET_CONTRACT_KEYS = {
+    "calibration_case_count",
+    "validation_case_count",
+    "sealed_case_count",
+    "calibration_run_metadata_count",
+    "validation_run_metadata_count",
+    "warmup_eligible_samples",
+    "analysis_eligible_samples",
+    "split_unit",
+    "dataset_role_overlap_count",
+    "sealed_runtime_access_count_at_freeze",
+    "sealed_metrics_present_at_freeze",
+}
+_ARTIFACT_PATHS = {
+    "qualification_state.json",
+    "frozen_selection_manifest.json",
+    "frozen_correction_catalog.json",
+    "sealed_evaluation_commitment.json",
+    "sealed_plan/sealed_sweep_plan.json",
+    "sealed_plan/sealed_sweep_cases.jsonl",
+    "data_access_ledger.jsonl",
+    "qualification_plan.json",
+    "candidate_family_results.json",
+    "candidate_search_plan.json",
+    "validation_scorecard.csv",
+    "calibration_plan/sweep_plan.json",
+    "calibration_plan/sweep_cases.jsonl",
+    "validation_plan/sweep_plan.json",
+    "validation_plan/sweep_cases.jsonl",
+}
+_QUALIFICATION_INPUT_KEYS = {
+    "calibration_sweep_summary",
+    "validation_sweep_summary",
+    "candidate_search_code",
+}
+_GROUND_TRUTH_PROVENANCE_KEYS = {
+    "semantic_reference_name",
+    "semantic_reference_definition",
+    "semantic_reference_kind",
+    "target_reference_link_present",
+    "gazebo_source_entity",
+    "parent_model",
+    "parent_link",
+    "reference_translation_offset_m",
+    "reference_rotation_offset_rpy_rad",
+    "raw_pose_topic",
+    "output_gt_topic",
+    "world_frame",
+    "fallback_policy",
+    "fallback_used_for_qualification",
+    "px4_fallback_used",
+    "output_frame",
+    "output_origin",
+    "output_axes",
+    "position_unit",
+    "quaternion_order",
+}
+_COORDINATE_CONTRACT_SOURCE_PATHS = {
+    "Simulation/stereo_ground_sim/stereo_ground_sim/coordinate_frames.py",
+    "Simulation/stereo_ground_sim/stereo_ground_sim/gazebo_ground_truth_adapter.py",
+    "Simulation/stereo_ground_sim/models/x500_15m/model.sdf",
+    "Simulation/stereo_ground_sim/launch/stereo_ground_sim.launch.py",
+    "Simulation/stereo_ground_sim/stereo_ground_sim/research_recording.py",
+    "Simulation/stereo_ground_sim/stereo_ground_sim/stereo_distance_node.py",
+}
 
 
 def _utc_now() -> str:
@@ -310,6 +413,187 @@ class DataAccessLedger:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
+
+
+def _strict_json_object(pairs: Sequence[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate_json_key: {key}")
+        value[key] = item
+    return value
+
+
+def _load_strict_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(
+            Path(path).read_text(encoding="utf-8"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_strict_json_object,
+        )
+    except UnicodeDecodeError as exc:
+        raise ValueError("freeze_anchor_utf8_invalid") from exc
+    if not isinstance(value, dict):
+        raise ValueError("freeze_anchor_json_object_required")
+    return value
+
+
+def _require_exact_keys(value: Any, expected: set[str], name: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError(f"{name}_schema_mismatch")
+    return value
+
+
+def _require_sha256(value: Any, name: str) -> str:
+    result = str(value)
+    if len(result) != 64 or any(char not in "0123456789abcdef" for char in result):
+        raise ValueError(f"{name}_sha256_invalid")
+    return result
+
+
+def _canonical_relative_path(value: str, *, name: str) -> str:
+    text = str(value)
+    path = PurePosixPath(text)
+    if not text or "\\" in text or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"{name}_path_invalid")
+    canonical = path.as_posix()
+    if canonical != text:
+        raise ValueError(f"{name}_path_not_canonical")
+    return canonical
+
+
+def load_freeze_anchor(path: Path) -> dict[str, Any]:
+    anchor_path = Path(path)
+    if anchor_path.is_symlink():
+        raise ValueError("freeze_anchor_symlink_rejected")
+    try:
+        mode = anchor_path.stat(follow_symlinks=False).st_mode
+    except FileNotFoundError as exc:
+        raise ValueError("freeze_anchor_missing") from exc
+    if not stat.S_ISREG(mode):
+        raise ValueError("freeze_anchor_nonregular_file")
+    return validate_freeze_anchor(_load_strict_json(anchor_path))
+
+
+def validate_freeze_anchor(anchor: Mapping[str, Any]) -> dict[str, Any]:
+    value = _require_exact_keys(dict(anchor), _FREEZE_ANCHOR_KEYS, "freeze_anchor")
+    if value["schema_version"] != FREEZE_ANCHOR_SCHEMA_VERSION:
+        raise ValueError("freeze_anchor_schema_version_unknown")
+    if value["qualification_id"] != "s2-r4a-ofat-12axis-v1":
+        raise ValueError("freeze_anchor_qualification_id_mismatch")
+
+    source = _require_exact_keys(
+        value["qualification_source"], _QUALIFICATION_SOURCE_KEYS, "qualification_source"
+    )
+    if source != {
+        "repository_name": "goodbuilder/SASL",
+        "branch": "sim/s2-r4a-sealed-profile-freeze",
+        "commit_sha": "88a360f6023f00517106b9f9915116b10fd5c311",
+    }:
+        raise ValueError("qualification_source_mismatch")
+    _require_sha(source["commit_sha"])
+
+    selected = _require_exact_keys(
+        value["selected_profile"], _SELECTED_PROFILE_KEYS, "selected_profile"
+    )
+    expected_selected = {
+        "method_family": "dual_camera_wahba_so3",
+        "profile_count": 25,
+        "output_frame": BASELINE_CENTER_FRD_FRAME,
+        "output_axes": "forward_right_down",
+        "position_unit": "m",
+        "matrix_direction_convention": MATRIX_DIRECTION,
+        "quaternion_order": "xyzw",
+    }
+    if selected != expected_selected:
+        raise ValueError("selected_profile_contract_mismatch")
+
+    dataset = _require_exact_keys(
+        value["dataset_contract"], _DATASET_CONTRACT_KEYS, "dataset_contract"
+    )
+    expected_dataset = {
+        "calibration_case_count": 450,
+        "validation_case_count": 225,
+        "sealed_case_count": 225,
+        "calibration_run_metadata_count": 450,
+        "validation_run_metadata_count": 225,
+        "warmup_eligible_samples": 10,
+        "analysis_eligible_samples": 30,
+        "split_unit": "spatial_cell_group",
+        "dataset_role_overlap_count": 0,
+        "sealed_runtime_access_count_at_freeze": 0,
+        "sealed_metrics_present_at_freeze": False,
+    }
+    if dataset != expected_dataset:
+        raise ValueError("dataset_contract_mismatch")
+
+    artifact_hashes = value["artifact_sha256"]
+    if not isinstance(artifact_hashes, dict) or set(artifact_hashes) != _ARTIFACT_PATHS:
+        raise ValueError("artifact_sha256_schema_mismatch")
+    canonical_paths = []
+    for path, digest in artifact_hashes.items():
+        canonical_paths.append(_canonical_relative_path(path, name="artifact"))
+        _require_sha256(digest, f"artifact:{path}")
+    if len(canonical_paths) != len(set(canonical_paths)):
+        raise ValueError("artifact_path_duplicate")
+
+    inputs = _require_exact_keys(
+        value["qualification_input_sha256"],
+        _QUALIFICATION_INPUT_KEYS,
+        "qualification_input_sha256",
+    )
+    for name, digest in inputs.items():
+        _require_sha256(digest, f"qualification_input:{name}")
+
+    ground_truth = _require_exact_keys(
+        value["ground_truth_provenance"],
+        _GROUND_TRUTH_PROVENANCE_KEYS,
+        "ground_truth_provenance",
+    )
+    expected_ground_truth = {
+        "semantic_reference_name": "vehicle_reference_link",
+        "semantic_reference_definition": "project_defined_vehicle_reference_at_base_link_origin",
+        "semantic_reference_kind": "project_defined_alternative_reference",
+        "target_reference_link_present": False,
+        "gazebo_source_entity": "base_link",
+        "parent_model": "x500_15m",
+        "parent_link": "base_link",
+        "reference_translation_offset_m": [0.0, 0.0, 0.0],
+        "reference_rotation_offset_rpy_rad": [0.0, 0.0, 0.0],
+        "raw_pose_topic": "/world/stereo_ground_drone/pose/info",
+        "output_gt_topic": "/simulation/ground_truth/vehicle_reference_link",
+        "world_frame": "gazebo_world_enu",
+        "fallback_policy": "fail_closed",
+        "fallback_used_for_qualification": False,
+        "px4_fallback_used": False,
+        "output_frame": BASELINE_CENTER_FRD_FRAME,
+        "output_origin": "nominal_left_right_optical_center_midpoint",
+        "output_axes": "forward_right_down",
+        "position_unit": "m",
+        "quaternion_order": "xyzw",
+    }
+    if ground_truth != expected_ground_truth:
+        raise ValueError("ground_truth_provenance_mismatch")
+    _vector3(ground_truth["reference_translation_offset_m"], "reference translation")
+    _vector3(ground_truth["reference_rotation_offset_rpy_rad"], "reference rotation")
+
+    sources = _require_exact_keys(
+        value["coordinate_contract_sources"],
+        {"hash_algorithm", "files"},
+        "coordinate_contract_sources",
+    )
+    if sources["hash_algorithm"] != "sha256":
+        raise ValueError("coordinate_contract_hash_algorithm_mismatch")
+    files = sources["files"]
+    if not isinstance(files, dict) or set(files) != _COORDINATE_CONTRACT_SOURCE_PATHS:
+        raise ValueError("coordinate_contract_sources_schema_mismatch")
+    source_paths = []
+    for path, digest in files.items():
+        source_paths.append(_canonical_relative_path(path, name="coordinate_source"))
+        _require_sha256(digest, f"coordinate_source:{path}")
+    if len(source_paths) != len(set(source_paths)):
+        raise ValueError("coordinate_source_path_duplicate")
+    return value
 
 
 def _attitude_values(value: Mapping[str, Any]) -> tuple[float, ...]:
@@ -1016,6 +1300,508 @@ def validate_frozen_catalog(
     return value
 
 
+def _regular_file_beneath(root: Path, relative_path: str, *, name: str) -> Path:
+    canonical = _canonical_relative_path(relative_path, name=name)
+    candidate = root
+    for part in PurePosixPath(canonical).parts:
+        candidate = candidate / part
+        if candidate.is_symlink():
+            raise ValueError(f"{name}_symlink_rejected: {canonical}")
+    try:
+        mode = candidate.stat(follow_symlinks=False).st_mode
+    except FileNotFoundError as exc:
+        raise ValueError(f"{name}_missing: {canonical}") from exc
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"{name}_nonregular_file: {canonical}")
+    resolved = candidate.resolve(strict=True)
+    if root not in resolved.parents:
+        raise ValueError(f"{name}_outside_root: {canonical}")
+    return resolved
+
+
+def _load_strict_jsonl(path: Path) -> list[dict[str, Any]]:
+    records = []
+    for line_number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), start=1):
+        if not line:
+            continue
+        value = json.loads(
+            line,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_strict_json_object,
+        )
+        if not isinstance(value, dict):
+            raise ValueError(f"jsonl_object_required: {path.name}:{line_number}")
+        records.append(value)
+    return records
+
+
+def _git_output(repository_root: Path, *arguments: str) -> str:
+    try:
+        return subprocess.check_output(
+            ("git", *arguments), cwd=repository_root, text=True, stderr=subprocess.STDOUT
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise ValueError(f"git_anchor_validation_failed: {' '.join(arguments)}") from exc
+
+
+def resolve_freeze_anchor_commit(
+    repository_root: Path,
+    freeze_anchor_path: Path,
+    *,
+    qualification_source_sha: str,
+    evaluation_code_sha: str | None = None,
+) -> dict[str, str]:
+    root = Path(repository_root).resolve(strict=True)
+    if _git_output(root, "rev-parse", "--show-toplevel") != str(root):
+        raise ValueError("freeze_anchor_repository_toplevel_mismatch")
+    if _git_output(root, "status", "--short"):
+        raise ValueError("freeze_anchor_repository_not_clean")
+    anchor_file = Path(freeze_anchor_path)
+    if not anchor_file.is_absolute():
+        anchor_file = root / anchor_file
+    anchor_file = anchor_file.resolve(strict=True)
+    try:
+        relative = anchor_file.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("freeze_anchor_outside_repository") from exc
+    if relative != FREEZE_ANCHOR_REPOSITORY_PATH:
+        raise ValueError("freeze_anchor_repository_path_mismatch")
+    source_sha = _require_sha(qualification_source_sha)
+    head = _require_sha(evaluation_code_sha or _git_output(root, "rev-parse", "HEAD"))
+    if _git_output(root, "rev-parse", "HEAD") != head:
+        raise ValueError("evaluation_code_sha_mismatch")
+    _git_output(root, "cat-file", "-e", f"{source_sha}^{{commit}}")
+    additions = [
+        line
+        for line in _git_output(
+            root, "log", "--diff-filter=A", "--format=%H", head, "--", relative
+        ).splitlines()
+        if line
+    ]
+    if len(additions) != 1:
+        raise ValueError("freeze_anchor_add_commit_count_mismatch")
+    anchor_sha = _require_sha(additions[0])
+    for older, newer, reason in (
+        (source_sha, anchor_sha, "freeze_anchor_not_descendant_of_source"),
+        (anchor_sha, head, "evaluation_head_not_descendant_of_anchor"),
+    ):
+        result = subprocess.run(
+            ("git", "merge-base", "--is-ancestor", older, newer),
+            cwd=root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(reason)
+    modifications = _git_output(root, "log", "--format=%H", f"{anchor_sha}..{head}", "--", relative)
+    if modifications:
+        raise ValueError("freeze_anchor_modified_after_addition")
+    anchor_blob = _git_output(root, "rev-parse", f"{anchor_sha}:{relative}")
+    head_blob = _git_output(root, "rev-parse", f"{head}:{relative}")
+    working_blob = _git_output(root, "hash-object", str(anchor_file))
+    if anchor_blob != head_blob or anchor_blob != working_blob:
+        raise ValueError("freeze_anchor_blob_mismatch")
+    return {
+        "qualification_source_sha": source_sha,
+        "freeze_anchor_sha": anchor_sha,
+        "evaluation_code_sha": head,
+        "freeze_anchor_blob_sha": anchor_blob,
+    }
+
+
+def _validate_coordinate_contract_sources(anchor: Mapping[str, Any], repository_root: Path) -> None:
+    root = Path(repository_root).resolve(strict=True)
+    files = anchor["coordinate_contract_sources"]["files"]
+    for relative, expected in files.items():
+        source = _regular_file_beneath(root, relative, name="coordinate_source")
+        if sha256_file(source) != expected:
+            raise ValueError(f"coordinate_source_sha256_mismatch: {relative}")
+
+    ground_truth = anchor["ground_truth_provenance"]
+    actual = {
+        "semantic_reference_name": VEHICLE_REFERENCE_LINK,
+        "semantic_reference_definition": VEHICLE_REFERENCE_DEFINITION,
+        "gazebo_source_entity": SOURCE_GAZEBO_ENTITY,
+        "reference_translation_offset_m": list(REFERENCE_OFFSET_PARENT_M),
+        "reference_rotation_offset_rpy_rad": list(REFERENCE_OFFSET_PARENT_RPY_RAD),
+        "raw_pose_topic": POSE_TOPIC,
+        "output_gt_topic": OUTPUT_TOPIC,
+        "world_frame": WORLD_FRAME,
+        "output_frame": COORDINATE_BASELINE_CENTER_FRD_FRAME,
+    }
+    if any(ground_truth[name] != value for name, value in actual.items()):
+        raise ValueError("ground_truth_source_constant_mismatch")
+
+    model_path = _regular_file_beneath(
+        root,
+        "Simulation/stereo_ground_sim/models/x500_15m/model.sdf",
+        name="coordinate_source",
+    )
+    model = ET.parse(model_path).getroot().find("model")
+    if model is None or model.attrib.get("name") != ground_truth["parent_model"]:
+        raise ValueError("ground_truth_parent_model_mismatch")
+    frames = model.findall(f"frame[@name='{ground_truth['semantic_reference_name']}']")
+    if len(frames) != 1:
+        raise ValueError("ground_truth_semantic_frame_count_mismatch")
+    frame = frames[0]
+    if frame.attrib.get("attached_to") != ground_truth["parent_link"]:
+        raise ValueError("ground_truth_parent_link_mismatch")
+    pose_values = tuple(float(value) for value in (frame.findtext("pose") or "").split())
+    if pose_values != (0.0, 0.0, 0.0, 0.0, 0.0, 0.0):
+        raise ValueError("ground_truth_reference_offset_mismatch")
+
+    launch_path = _regular_file_beneath(
+        root,
+        "Simulation/stereo_ground_sim/launch/stereo_ground_sim.launch.py",
+        name="coordinate_source",
+    )
+    launch_source = launch_path.read_text(encoding="utf-8")
+    required_launch_contracts = (
+        '"parent_model_name": LaunchConfiguration("target_model_name")',
+        '"source_link_name": "base_link"',
+        'DeclareLaunchArgument("target_model_name", default_value="x500_15m")',
+    )
+    if any(contract not in launch_source for contract in required_launch_contracts):
+        raise ValueError("ground_truth_launch_binding_mismatch")
+    required_pair_fields = {
+        "gt_source",
+        "gt_source_entity",
+        "gt_reference_name",
+        "gt_reference_definition",
+        "gt_fallback_used",
+        "output_frame",
+    }
+    if not required_pair_fields.issubset(PAIR_RECORD_COLUMNS):
+        raise ValueError("ground_truth_pair_schema_mismatch")
+
+
+def _external_ledger_file(entry: Mapping[str, Any], *, name: str) -> Path:
+    path = Path(str(entry.get("canonical_path", "")))
+    if not path.is_absolute() or path.is_symlink():
+        raise ValueError(f"{name}_path_invalid")
+    try:
+        mode = path.stat(follow_symlinks=False).st_mode
+    except FileNotFoundError as exc:
+        raise ValueError(f"{name}_missing") from exc
+    if not stat.S_ISREG(mode):
+        raise ValueError(f"{name}_nonregular_file")
+    expected = _require_sha256(entry.get("artifact_hash"), f"{name}:ledger")
+    if sha256_file(path) != expected:
+        raise ValueError(f"{name}_ledger_sha256_mismatch")
+    return path
+
+
+def _validate_qualification_inputs_and_gt_metadata(
+    anchor: Mapping[str, Any],
+    ledger: Sequence[Mapping[str, Any]],
+    repository_root: Path,
+) -> None:
+    source = anchor["qualification_source"]
+    inputs = anchor["qualification_input_sha256"]
+    repository = Path(repository_root).resolve(strict=True)
+    candidate_bytes = subprocess.check_output(
+        (
+            "git",
+            "show",
+            f"{source['commit_sha']}:Simulation/stereo_ground_sim/"
+            "stereo_ground_sim/correction_qualification.py",
+        ),
+        cwd=repository,
+    )
+    if sha256_bytes(candidate_bytes) != inputs["candidate_search_code"]:
+        raise ValueError("candidate_search_source_blob_sha256_mismatch")
+
+    summary_contracts = {
+        "calibration": inputs["calibration_sweep_summary"],
+        "validation": inputs["validation_sweep_summary"],
+    }
+    for role, expected_hash in summary_contracts.items():
+        matches = [
+            entry
+            for entry in ledger
+            if entry.get("role") == role
+            and entry.get("operation") == "read_sweep_artifact"
+            and Path(str(entry.get("canonical_path", ""))).name == "sweep_summary.json"
+        ]
+        if len(matches) != 1 or matches[0].get("artifact_hash") != expected_hash:
+            raise ValueError(f"{role}_sweep_summary_ledger_identity_mismatch")
+        summary_path = _external_ledger_file(matches[0], name=f"{role}_sweep_summary")
+        summary = _load_strict_json(summary_path)
+        if (
+            summary.get("branch") != source["branch"]
+            or summary.get("commit_sha") != source["commit_sha"]
+            or summary.get("run_valid") is not True
+            or summary.get("finalization_status") != "VALID"
+        ):
+            raise ValueError(f"{role}_sweep_summary_contract_mismatch")
+
+    ground_truth = anchor["ground_truth_provenance"]
+    expected_metadata = {
+        "branch": source["branch"],
+        "commit_sha": source["commit_sha"],
+        "evaluation_gt_source": "gazebo_reference_link_world_pose",
+        "gazebo_world_frame": ground_truth["world_frame"],
+        "reference_source": ground_truth["semantic_reference_name"],
+        "target_model_name": ground_truth["parent_model"],
+        "output_frame": ground_truth["output_frame"],
+        "output_axes": ground_truth["output_axes"],
+        "position_unit": ground_truth["position_unit"],
+        "quaternion_order": ground_truth["quaternion_order"],
+        "observation_source": "gazebo_reference_point_projection",
+    }
+    metadata_entries = [
+        entry
+        for entry in ledger
+        if entry.get("role") in {"calibration", "validation"}
+        and entry.get("operation") == "read_r2_artifact"
+        and Path(str(entry.get("canonical_path", ""))).name == "run_metadata.json"
+    ]
+    if len({entry.get("canonical_path") for entry in metadata_entries}) != len(metadata_entries):
+        raise ValueError("qualification_run_metadata_path_duplicate")
+    for entry in metadata_entries:
+        path = _external_ledger_file(entry, name="qualification_run_metadata")
+        metadata = _load_strict_json(path)
+        if any(metadata.get(field) != value for field, value in expected_metadata.items()):
+            raise ValueError("qualification_run_metadata_gt_provenance_mismatch")
+
+
+def verify_freeze_anchor_artifacts(
+    qualification_root: Path,
+    freeze_anchor: Mapping[str, Any],
+    *,
+    repository_root: Path,
+) -> dict[str, Any]:
+    anchor = validate_freeze_anchor(freeze_anchor)
+    root_path = Path(qualification_root)
+    if root_path.is_symlink():
+        raise ValueError("qualification_root_symlink_rejected")
+    root = root_path.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("qualification_root_not_directory")
+
+    artifact_paths: dict[str, Path] = {}
+    for relative, expected in anchor["artifact_sha256"].items():
+        path = _regular_file_beneath(root, relative, name="artifact")
+        artifact_paths[relative] = path
+        if sha256_file(path) != expected:
+            raise ValueError(f"artifact_sha256_mismatch: {relative}")
+
+    state = _load_strict_json(artifact_paths["qualification_state.json"])
+    manifest = _load_strict_json(artifact_paths["frozen_selection_manifest.json"])
+    catalog = _load_strict_json(artifact_paths["frozen_correction_catalog.json"])
+    commitment = _load_strict_json(artifact_paths["sealed_evaluation_commitment.json"])
+    qualification_plan = _load_strict_json(artifact_paths["qualification_plan.json"])
+    calibration_plan = _load_strict_json(artifact_paths["calibration_plan/sweep_plan.json"])
+    validation_plan = _load_strict_json(artifact_paths["validation_plan/sweep_plan.json"])
+    sealed_plan = _load_strict_json(artifact_paths["sealed_plan/sealed_sweep_plan.json"])
+    source = anchor["qualification_source"]
+    selected = anchor["selected_profile"]
+    dataset = anchor["dataset_contract"]
+    qid = anchor["qualification_id"]
+
+    validate_frozen_catalog(
+        catalog,
+        expected_branch=source["branch"],
+        expected_commit_sha=source["commit_sha"],
+    )
+    validate_sealed_commitment(
+        commitment,
+        expected_branch=source["branch"],
+        expected_commit_sha=source["commit_sha"],
+        expected_qualification_id=qid,
+    )
+    if catalog["qualification_id"] != qid or catalog["selected_method_family"] != selected["method_family"]:
+        raise ValueError("catalog_anchor_identity_mismatch")
+    for field in (
+        "profile_count",
+        "output_frame",
+        "output_axes",
+        "position_unit",
+        "matrix_direction_convention",
+        "quaternion_order",
+    ):
+        if catalog[field] != selected[field]:
+            raise ValueError(f"catalog_anchor_contract_mismatch: {field}")
+
+    expected_source_fields = {
+        "qualification_id": qid,
+        "repository_name": source["repository_name"],
+        "branch": source["branch"],
+        "commit_sha": source["commit_sha"],
+    }
+    if any(qualification_plan.get(name) != value for name, value in expected_source_fields.items()):
+        raise ValueError("qualification_plan_source_mismatch")
+    plan_core = {name: value for name, value in qualification_plan.items() if name != "plan_hash"}
+    if qualification_plan.get("plan_hash") != sha256_bytes(canonical_json(plan_core).encode("utf-8")):
+        raise ValueError("qualification_plan_hash_mismatch")
+    if qualification_plan.get("role_case_counts") != {
+        "calibration": dataset["calibration_case_count"],
+        "validation": dataset["validation_case_count"],
+        "sealed_evaluation": dataset["sealed_case_count"],
+    }:
+        raise ValueError("qualification_case_count_mismatch")
+    for field in ("warmup_eligible_samples", "analysis_eligible_samples", "split_unit"):
+        if qualification_plan.get(field) != dataset[field]:
+            raise ValueError(f"qualification_dataset_contract_mismatch: {field}")
+    role_plans = {
+        "calibration": calibration_plan,
+        "validation": validation_plan,
+        "sealed_evaluation": sealed_plan,
+    }
+    for role, role_plan in role_plans.items():
+        plan_core = {name: value for name, value in role_plan.items() if name != "plan_hash"}
+        if role_plan.get("plan_hash") != sha256_bytes(canonical_json(plan_core).encode("utf-8")):
+            raise ValueError(f"role_plan_hash_mismatch: {role}")
+        if qualification_plan["role_plan_hashes"].get(role) != role_plan["plan_hash"]:
+            raise ValueError(f"qualification_role_plan_identity_mismatch: {role}")
+
+    manifest_expected = {
+        "qualification_id": qid,
+        "branch": source["branch"],
+        "commit_sha": source["commit_sha"],
+        "selected_method_family": selected["method_family"],
+        "qualification_plan_sha256": anchor["artifact_sha256"]["qualification_plan.json"],
+        "candidate_family_results_sha256": anchor["artifact_sha256"]["candidate_family_results.json"],
+        "validation_scorecard_sha256": anchor["artifact_sha256"]["validation_scorecard.csv"],
+        "frozen_correction_catalog_sha256": anchor["artifact_sha256"]["frozen_correction_catalog.json"],
+        "sealed_commitment_sha256": anchor["artifact_sha256"]["sealed_evaluation_commitment.json"],
+        "data_access_ledger_sha256": anchor["artifact_sha256"]["data_access_ledger.jsonl"],
+        "calibration_sweep_summary_sha256": anchor["qualification_input_sha256"]["calibration_sweep_summary"],
+        "validation_sweep_summary_sha256": anchor["qualification_input_sha256"]["validation_sweep_summary"],
+        "sealed_runtime_access_count": dataset["sealed_runtime_access_count_at_freeze"],
+        "sealed_metrics_present": dataset["sealed_metrics_present_at_freeze"],
+    }
+    if any(manifest.get(name) != value for name, value in manifest_expected.items()):
+        raise ValueError("frozen_manifest_anchor_mismatch")
+    state_expected = {
+        "qualification_id": qid,
+        "state": "PROFILE_FROZEN",
+        "branch": source["branch"],
+        "commit_sha": source["commit_sha"],
+        "selected_method_family": selected["method_family"],
+        "frozen_catalog_sha256": anchor["artifact_sha256"]["frozen_correction_catalog.json"],
+        "sealed_commitment_sha256": anchor["artifact_sha256"]["sealed_evaluation_commitment.json"],
+        "frozen_selection_manifest_sha256": anchor["artifact_sha256"]["frozen_selection_manifest.json"],
+    }
+    if any(state.get(name) != value for name, value in state_expected.items()):
+        raise ValueError("qualification_state_anchor_mismatch")
+    if catalog["candidate_search_code_sha256"] != anchor["qualification_input_sha256"]["candidate_search_code"]:
+        raise ValueError("candidate_search_code_anchor_mismatch")
+
+    role_records = {
+        "calibration": _load_strict_jsonl(artifact_paths["calibration_plan/sweep_cases.jsonl"]),
+        "validation": _load_strict_jsonl(artifact_paths["validation_plan/sweep_cases.jsonl"]),
+        "sealed_evaluation": _load_strict_jsonl(artifact_paths["sealed_plan/sealed_sweep_cases.jsonl"]),
+    }
+    expected_counts = {
+        "calibration": dataset["calibration_case_count"],
+        "validation": dataset["validation_case_count"],
+        "sealed_evaluation": dataset["sealed_case_count"],
+    }
+    case_sets: dict[str, set[str]] = {}
+    for role, records in role_records.items():
+        case_ids = [record.get("case_id") for record in records]
+        if len(records) != expected_counts[role] or len(set(case_ids)) != expected_counts[role]:
+            raise ValueError(f"qualification_role_case_identity_mismatch: {role}")
+        if len({profile_key(record["payload"]) for record in records}) != selected["profile_count"]:
+            raise ValueError(f"qualification_role_profile_count_mismatch: {role}")
+        case_sets[role] = set(case_ids)
+    overlap_count = sum(
+        len(case_sets[left] & case_sets[right])
+        for index, left in enumerate(DATASET_ROLES)
+        for right in DATASET_ROLES[index + 1 :]
+    )
+    if overlap_count != dataset["dataset_role_overlap_count"]:
+        raise ValueError("qualification_role_overlap_mismatch")
+
+    sealed_records = role_records["sealed_evaluation"]
+    sealed_case_ids = [record["case_id"] for record in sealed_records]
+    if sealed_plan.get("plan_hash") != commitment["sealed_plan_hash"]:
+        raise ValueError("sealed_plan_identity_mismatch")
+    if sealed_plan.get("case_ids_in_execution_order") != sealed_case_ids:
+        raise ValueError("sealed_plan_case_order_mismatch")
+    if sha256_file(artifact_paths["sealed_plan/sealed_sweep_cases.jsonl"]) != commitment["sealed_cases_file_sha256"]:
+        raise ValueError("sealed_cases_commitment_mismatch")
+    ordered_hashes = {
+        "case_id_ordered_hash": sha256_bytes(canonical_json(sealed_case_ids).encode("utf-8")),
+        "profile_key_ordered_hash": sha256_bytes(
+            canonical_json([profile_key(record["payload"]) for record in sealed_records]).encode("utf-8")
+        ),
+        "spatial_group_ordered_hash": sha256_bytes(
+            canonical_json([spatial_group_key(record["payload"]) for record in sealed_records]).encode("utf-8")
+        ),
+    }
+    if any(commitment.get(name) != value for name, value in ordered_hashes.items()):
+        raise ValueError("sealed_commitment_ordered_identity_mismatch")
+
+    ledger = _load_strict_jsonl(artifact_paths["data_access_ledger.jsonl"])
+    validate_access_ledger(ledger)
+    run_metadata_counts = {
+        role: sum(
+            1
+            for entry in ledger
+            if entry.get("role") == role
+            and entry.get("operation") == "read_r2_artifact"
+            and PurePosixPath(str(entry.get("canonical_path", ""))).name == "run_metadata.json"
+        )
+        for role in ("calibration", "validation")
+    }
+    if run_metadata_counts != {
+        "calibration": dataset["calibration_run_metadata_count"],
+        "validation": dataset["validation_run_metadata_count"],
+    }:
+        raise ValueError("qualification_run_metadata_count_mismatch")
+
+    _validate_qualification_inputs_and_gt_metadata(
+        anchor,
+        ledger,
+        repository_root,
+    )
+
+    status = qualification_status(root)
+    if (
+        status["state"] != "PROFILE_FROZEN"
+        or not status["markers"]["QUALIFICATION_PROFILE_FROZEN"]
+        or not status["markers"]["SEALED_EVALUATION_NOT_EXECUTED"]
+        or status["markers"]["SEALED_EVALUATION_OPENED"]
+        or status["markers"]["SEALED_EVALUATION_COMPLETED"]
+    ):
+        raise ValueError("qualification_frozen_unopened_state_mismatch")
+
+    _validate_coordinate_contract_sources(anchor, repository_root)
+    return {
+        "qualification_id": qid,
+        "selected_family": selected["method_family"],
+        "profile_count": selected["profile_count"],
+        "qualification_source_sha": source["commit_sha"],
+        "artifact_verification_count": len(artifact_paths),
+        "ground_truth_provenance_verdict": "validated",
+        "qualification_state": "PROFILE_FROZEN",
+        "sealed_state": "SEALED_UNOPENED",
+    }
+
+
+def verify_freeze_anchor(
+    qualification_root: Path,
+    freeze_anchor_path: Path,
+    *,
+    repository_root: Path,
+) -> dict[str, Any]:
+    anchor = load_freeze_anchor(freeze_anchor_path)
+    result = verify_freeze_anchor_artifacts(
+        qualification_root,
+        anchor,
+        repository_root=repository_root,
+    )
+    history = resolve_freeze_anchor_commit(
+        repository_root,
+        freeze_anchor_path,
+        qualification_source_sha=anchor["qualification_source"]["commit_sha"],
+    )
+    return {**result, **history}
+
+
 def _assert_no_sealed_runtime(root: Path) -> None:
     sealed = Path(root) / "sealed_plan"
     if not sealed.is_dir():
@@ -1051,12 +1837,26 @@ def qualification_status(root: Path) -> dict[str, Any]:
 def authorize_unseal(
     root: Path,
     *,
+    freeze_anchor_path: Path,
+    repository_root: Path,
     frozen_catalog_sha256: str,
     sealed_commitment_sha256: str,
-    expected_branch: str,
-    expected_commit_sha: str,
 ) -> dict[str, Any]:
     directory = Path(root)
+    verification = verify_freeze_anchor(
+        directory,
+        freeze_anchor_path,
+        repository_root=repository_root,
+    )
+    anchor = load_freeze_anchor(freeze_anchor_path)
+    expected_catalog_hash = anchor["artifact_sha256"]["frozen_correction_catalog.json"]
+    expected_commitment_hash = anchor["artifact_sha256"]["sealed_evaluation_commitment.json"]
+    if (
+        frozen_catalog_sha256 != expected_catalog_hash
+        or sealed_commitment_sha256 != expected_commitment_hash
+    ):
+        raise ValueError("caller artifact hash mismatch with Git freeze anchor")
+
     status = qualification_status(directory)
     if status["state"] != "PROFILE_FROZEN" or not status["markers"]["QUALIFICATION_PROFILE_FROZEN"]:
         raise ValueError("qualification profile is not frozen")
@@ -1070,26 +1870,27 @@ def authorize_unseal(
     manifest_hash = sha256_file(manifest_path)
     if state.get("frozen_selection_manifest_sha256") != manifest_hash:
         raise ValueError("frozen selection manifest hash mismatch")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+    manifest = _load_strict_json(manifest_path)
     if manifest.get("schema_version") != S2_QUALIFICATION_SCHEMA_VERSION:
         raise ValueError("frozen selection manifest schema mismatch")
-    if manifest.get("branch") != expected_branch or manifest.get("commit_sha") != expected_commit_sha:
-        raise ValueError("frozen selection manifest provenance mismatch")
-    expected_catalog_hash = state.get("frozen_catalog_sha256")
-    expected_commitment_hash = state.get("sealed_commitment_sha256")
+    qualification_source = anchor["qualification_source"]
     if (
-        frozen_catalog_sha256 != expected_catalog_hash
+        manifest.get("branch") != qualification_source["branch"]
+        or manifest.get("commit_sha") != qualification_source["commit_sha"]
+    ):
+        raise ValueError("frozen selection manifest provenance mismatch")
+    if verification["qualification_state"] != "PROFILE_FROZEN":
+        raise ValueError("freeze anchor verification did not confirm PROFILE_FROZEN")
+    if (
+        state.get("frozen_catalog_sha256") != expected_catalog_hash
         or manifest.get("frozen_correction_catalog_sha256") != expected_catalog_hash
         or sha256_file(catalog) != expected_catalog_hash
-        or sealed_commitment_sha256 != expected_commitment_hash
+        or state.get("sealed_commitment_sha256") != expected_commitment_hash
         or manifest.get("sealed_commitment_sha256") != expected_commitment_hash
         or sha256_file(commitment_path) != expected_commitment_hash
     ):
         raise ValueError("frozen catalog or sealed commitment hash mismatch")
-    catalog_value = json.loads(catalog.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
-    validate_frozen_catalog(catalog_value, expected_branch=expected_branch, expected_commit_sha=expected_commit_sha)
-    commitment = json.loads(commitment_path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
-    validate_sealed_commitment(commitment, expected_branch=expected_branch, expected_commit_sha=expected_commit_sha)
+    catalog_value = _load_strict_json(catalog)
     ledger = DataAccessLedger(directory / "data_access_ledger.jsonl")
     ledger.record(stage="unseal", role="sealed_evaluation", path=commitment_path, operation="authorize_unseal")
     os.replace(source, directory / "SEALED_EVALUATION_OPENED")
@@ -1430,7 +2231,8 @@ def fit_select_freeze(
 
 __all__ = [
     "ANGLE_TIE_TOLERANCE", "CANDIDATE_FAMILIES", "COMPLEXITY_RANK",
-    "DATASET_ROLES", "IDENTITY_MATRIX", "LEDGER_STAGES", "MATRIX_DIRECTION",
+    "DATASET_ROLES", "FREEZE_ANCHOR_REPOSITORY_PATH", "FREEZE_ANCHOR_SCHEMA_VERSION",
+    "IDENTITY_MATRIX", "LEDGER_STAGES", "MATRIX_DIRECTION",
     "PROFILE_CATALOG_ROLE", "QUALIFICATION_STATES", "S2_QUALIFICATION_SCHEMA_VERSION",
     "SELECTION_RULE", "CalibrationRepresentative", "CandidatePrediction",
     "CandidateProfile", "DataAccessLedger", "QualificationSpec", "ValidationCase",
@@ -1439,7 +2241,9 @@ __all__ = [
     "build_validation_case", "build_wahba_observations", "evaluate_candidate",
     "evaluate_candidate_families", "fit_candidate_families", "fit_select_freeze",
     "fit_wahba", "predict_candidate", "prepare_plans", "profile_key",
-    "qualification_status", "score_prediction", "select_candidate_family",
+    "qualification_status", "resolve_freeze_anchor_commit", "score_prediction",
+    "select_candidate_family",
     "spatial_group_key", "validate_access_ledger", "validate_sealed_commitment",
-    "validate_frozen_catalog", "validation_gate_contract",
+    "validate_freeze_anchor", "validate_frozen_catalog", "validation_gate_contract",
+    "load_freeze_anchor", "verify_freeze_anchor", "verify_freeze_anchor_artifacts",
 ]
