@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from math import isfinite
@@ -30,7 +31,7 @@ def _materialize_timestamp_metadata(metadata: Any) -> dict[str, Any]:
         if key in materialized:
             raise ValueError(f"duplicate timestamp metadata key: {key}")
         materialized[key] = value
-    return materialized
+    return deepcopy(materialized)
 
 
 @dataclass(frozen=True)

@@ -305,6 +305,9 @@ def test_from_payload_normal_mapping_is_detached_and_hash_stable() -> None:
     payload["timestamp_metadata"] = {"rtp_timestamp": 456}
 
     assert observation.timestamp_metadata["rtp_timestamp"] == 123
+    assert observation.timestamp_metadata["unknown_vendor_field"] == [1, 2], (
+        "S3-B1 nested observation metadata must remain deeply detached from source mutation"
+    )
     assert observation.timestamp_metadata is not source_metadata
     assert snapshot.timestamp_metadata_items == (
         ("timestamp_source", "rtcp"),

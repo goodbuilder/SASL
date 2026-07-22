@@ -73,8 +73,12 @@ runtime `Mapping.items()` sequence before applying the same pair validation.
 The active payload adapter first validates `None`, `Mapping`, or exact
 tuple/list outer containers and exact two-element tuple/list items, then
 materializes a detached plain dictionary; it never passes an unchecked
-iterable to `dict()`. The snapshot canonicalizer independently revalidates the
-allowlist and scalar contract and stores metadata in allowlist order.
+iterable to `dict()`. A single whole-dictionary `deepcopy` deeply detaches
+ordinary deepcopy-compatible/plain metadata graphs before snapshot projection.
+Copy exceptions propagate fail-closed with no shallow fallback; arbitrary
+custom `__deepcopy__` behavior is not an unconditional trust guarantee. The
+snapshot canonicalizer independently revalidates the allowlist and scalar
+contract and stores metadata in allowlist order.
 `MeasurementAttempt` accepts only exact base `DetectionSnapshot` instances, and
 the snapshot factory explicitly rejects subclasses so an overridden
 `__post_init__()` cannot bypass provenance validation. The attempt canonical
