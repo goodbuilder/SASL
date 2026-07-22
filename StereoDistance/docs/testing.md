@@ -36,7 +36,9 @@ PYTHONPATH=. python3 -m pytest \
 `test_measurement_attempt.py`는 factory/direct-constructor timestamp metadata가
 같은 allowlist 순서로 canonicalize되는지, mutable/nonfinite/duplicate 입력이
 snapshot 생성 시점에 거부되는지, source·`asdict()` mutation이 attempt
-canonical SHA-256을 바꾸지 않는지도 확인한다.
+canonical SHA-256을 바꾸지 않는지도 확인한다. 또한 outer container와 각
+pair item을 명시적인 `None`/tuple/list 계약으로 제한하고 Mapping·set·문자열
+·bytes·임의 iterable이 two-element pair로 오인되지 않는지 검증한다.
 
 ## 대표 PyQt 테스트
 

@@ -181,6 +181,237 @@ def direct_detection_snapshot(metadata_items) -> DetectionSnapshot:
     )
 
 
+class MetadataMappingSubclass(dict):
+    pass
+
+
+class MetadataCustomIterable:
+    def __iter__(self):
+        yield "rtp_timestamp"
+        yield 123
+
+
+class MetadataTupleSubclass(tuple):
+    pass
+
+
+class MetadataListSubclass(list):
+    pass
+
+
+def malformed_mapping_item():
+    return {"rtp_timestamp": 999, "timestamp_source": "rtcp"}
+
+
+@pytest.mark.parametrize(
+    "invalid_item_factory",
+    (
+        malformed_mapping_item,
+        lambda: MetadataMappingSubclass(
+            {"rtp_timestamp": 999, "timestamp_source": "rtcp"}
+        ),
+        lambda: {"rtp_timestamp", 123},
+        lambda: frozenset(("rtp_timestamp", 123)),
+        lambda: "ab",
+        lambda: b"ab",
+        lambda: bytearray(b"ab"),
+        lambda: memoryview(b"ab"),
+        lambda: (value for value in ("rtp_timestamp", 123)),
+        MetadataCustomIterable,
+        lambda: MetadataTupleSubclass(("rtp_timestamp", 123)),
+        lambda: MetadataListSubclass(("rtp_timestamp", 123)),
+    ),
+    ids=(
+        "mapping-item",
+        "mapping-subclass-item",
+        "set-item",
+        "frozenset-item",
+        "str-item",
+        "bytes-item",
+        "bytearray-item",
+        "memoryview-item",
+        "generator-item",
+        "custom-iterable-item",
+        "tuple-subclass-item",
+        "list-subclass-item",
+    ),
+)
+def test_detection_metadata_pair_shape_rejects_non_explicit_pair_items(
+    invalid_item_factory,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="tuple or list"):
+        direct_detection_snapshot((invalid_item_factory(),))
+
+
+@pytest.mark.parametrize(
+    "invalid_item",
+    (
+        (),
+        ("rtp_timestamp",),
+        ("rtp_timestamp", 1, 2),
+        [],
+        ["rtp_timestamp"],
+        ["rtp_timestamp", 1, 2],
+    ),
+    ids=(
+        "empty-tuple",
+        "one-tuple",
+        "three-tuple",
+        "empty-list",
+        "one-list",
+        "three-list",
+    ),
+)
+def test_detection_metadata_pair_shape_rejects_invalid_lengths(invalid_item) -> None:
+    with pytest.raises(ValueError, match="exactly two"):
+        direct_detection_snapshot((invalid_item,))
+
+
+@pytest.mark.parametrize(
+    "invalid_outer_factory",
+    (
+        lambda: "",
+        lambda: "ab",
+        lambda: b"",
+        lambda: b"ab",
+        bytearray,
+        dict,
+        lambda: {"rtp_timestamp": 123},
+        set,
+        lambda: (item for item in (("rtp_timestamp", 123),)),
+        MetadataCustomIterable,
+        lambda: memoryview(b""),
+    ),
+    ids=(
+        "empty-str",
+        "str",
+        "empty-bytes",
+        "bytes",
+        "bytearray",
+        "empty-mapping",
+        "mapping",
+        "set",
+        "generator",
+        "custom-iterable",
+        "memoryview",
+    ),
+)
+def test_direct_detection_metadata_outer_container_rejects_malformed_types(
+    invalid_outer_factory,
+) -> None:
+    with pytest.raises((TypeError, ValueError), match="tuple or list"):
+        direct_detection_snapshot(invalid_outer_factory())
+
+
+@pytest.mark.parametrize("empty_metadata", (None, (), []), ids=("none", "tuple", "list"))
+def test_direct_detection_metadata_outer_container_allows_explicit_empty_values(
+    empty_metadata,
+) -> None:
+    assert direct_detection_snapshot(empty_metadata).timestamp_metadata_items == ()
+
+
+def test_detection_metadata_pair_shape_accepts_explicit_tuple_and_list_pairs() -> None:
+    snapshot = direct_detection_snapshot(
+        (
+            ("rtp_timestamp", 123),
+            ["timestamp_source", "rtcp"],
+        )
+    )
+
+    assert snapshot.timestamp_metadata_items == (
+        ("timestamp_source", "rtcp"),
+        ("rtp_timestamp", 123),
+    )
+    assert all(type(item) is tuple for item in snapshot.timestamp_metadata_items)
+
+
+def test_factory_detection_metadata_mapping_item_is_rejected() -> None:
+    observation = detection(
+        "left",
+        640.0,
+        metadata=(malformed_mapping_item(),),
+    )
+
+    with pytest.raises((TypeError, ValueError), match="tuple or list"):
+        DetectionSnapshot.from_observation(
+            observation,
+            pairing_timestamp_basis="detection",
+            pairing_timestamp_s=10.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_outer_factory",
+    (
+        lambda: "ab",
+        lambda: b"ab",
+        lambda: {"rtp_timestamp", 123},
+        lambda: (item for item in (("rtp_timestamp", 123),)),
+        MetadataCustomIterable,
+    ),
+    ids=("str", "bytes", "set", "generator", "custom-iterable"),
+)
+def test_factory_detection_metadata_outer_container_rejects_arbitrary_iterables(
+    invalid_outer_factory,
+) -> None:
+    observation = detection(
+        "left",
+        640.0,
+        metadata=invalid_outer_factory(),
+    )
+
+    with pytest.raises((TypeError, ValueError), match="Mapping, tuple, or list"):
+        DetectionSnapshot.from_observation(
+            observation,
+            pairing_timestamp_basis="detection",
+            pairing_timestamp_s=10.0,
+        )
+
+
+def test_factory_detection_metadata_normal_mapping_is_projected() -> None:
+    snapshot = DetectionSnapshot.from_observation(
+        detection(
+            "left",
+            640.0,
+            metadata={
+                "rtp_timestamp": 123,
+                "timestamp_source": "rtcp",
+                "unknown_vendor_field": [1, 2],
+            },
+        ),
+        pairing_timestamp_basis="detection",
+        pairing_timestamp_s=10.0,
+    )
+
+    assert snapshot.timestamp_metadata_items == (
+        ("timestamp_source", "rtcp"),
+        ("rtp_timestamp", 123),
+    )
+    assert type(snapshot.timestamp_metadata["rtp_timestamp"]) is int
+    assert type(snapshot.timestamp_metadata["timestamp_source"]) is str
+
+
+def test_replace_rejects_malformed_detection_metadata_mapping_item() -> None:
+    snapshot = direct_detection_snapshot((("rtp_timestamp", 123),))
+
+    with pytest.raises((TypeError, ValueError), match="tuple or list"):
+        replace(
+            snapshot,
+            timestamp_metadata_items=(malformed_mapping_item(),),
+        )
+
+
+def test_malformed_mapping_item_cannot_reach_attempt_canonical_sha() -> None:
+    canonical_sha_called = False
+    with pytest.raises((TypeError, ValueError), match="tuple or list"):
+        snapshot = direct_detection_snapshot((malformed_mapping_item(),))
+        attempt = replace(pixhawk_attempt(), left_detection=snapshot)
+        canonical_sha_called = True
+        attempt.canonical_sha256()
+
+    assert canonical_sha_called is False
+
+
 @pytest.mark.parametrize(
     "invalid_value_factory",
     (

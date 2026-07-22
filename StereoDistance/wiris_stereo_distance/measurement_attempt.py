@@ -126,20 +126,16 @@ def _canonical_detection_metadata_items(
 
     if metadata_items is None:
         return ()
-    try:
-        raw_items = iter(metadata_items)
-    except TypeError as exc:
-        raise TypeError("timestamp metadata must be an iterable of key/value pairs") from exc
+    if type(metadata_items) not in (tuple, list):
+        raise TypeError("timestamp metadata must be a tuple or list of key/value pairs")
 
     values_by_key: dict[str, MetadataScalar] = {}
-    for raw_item in raw_items:
-        try:
-            pair = tuple(raw_item)
-        except TypeError as exc:
-            raise TypeError("each timestamp metadata item must be a key/value pair") from exc
-        if len(pair) != 2:
+    for raw_item in metadata_items:
+        if type(raw_item) not in (tuple, list):
+            raise TypeError("each timestamp metadata item must be a tuple or list")
+        if len(raw_item) != 2:
             raise ValueError("each timestamp metadata item must contain exactly two values")
-        key, value = pair
+        key, value = raw_item
         if type(key) is not str:
             raise TypeError("timestamp metadata keys must be strings")
         if key not in DETECTION_METADATA_ALLOWLIST:
@@ -165,7 +161,12 @@ def _canonical_detection_metadata_items(
 def _metadata_items(metadata: Any) -> tuple[tuple[str, MetadataScalar], ...]:
     if metadata is None:
         return ()
-    raw_items = metadata.items() if isinstance(metadata, Mapping) else metadata
+    if isinstance(metadata, Mapping):
+        raw_items = tuple(metadata.items())
+    elif type(metadata) in (tuple, list):
+        raw_items = metadata
+    else:
+        raise TypeError("observation timestamp metadata must be a Mapping, tuple, or list")
     return _canonical_detection_metadata_items(
         raw_items,
         project_allowlisted_keys=True,

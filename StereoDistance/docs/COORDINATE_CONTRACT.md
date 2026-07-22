@@ -65,10 +65,15 @@ Detection timestamp metadata is projected to
 snapshot constructor use the same canonicalization. Stored values are limited
 to immutable `None`, `str`, `bool`, `int`, or finite `float` scalars; unknown or
 duplicate direct-constructor keys, mutable values, and NaN/Inf are rejected
-when the snapshot is created. Metadata is stored in allowlist order. The
-attempt canonical SHA-256 is an integrity hash of one serialized attempt
-instance, including its generation, sequence, timestamps, and profile path; it
-is not a physical detection-pair identity.
+when the snapshot is created. Each metadata item must be an exact two-element
+`tuple` or `list`; mappings, sets, strings, bytes, and arbitrary iterables are
+never interpreted as pairs. Direct construction accepts only `None`, a tuple,
+or a list as the outer container, while the observation factory materializes a
+runtime `Mapping.items()` sequence before applying the same pair validation.
+Metadata is stored in allowlist order. The attempt canonical SHA-256 is an
+integrity hash of one serialized attempt instance, including its generation,
+sequence, timestamps, and profile path; it is not a physical detection-pair
+identity.
 
 Correspondence is fail-closed before attempt construction: left/right classes
 must match, and either side with multiple candidates of that selected class is
