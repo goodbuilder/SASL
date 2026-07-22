@@ -129,6 +129,9 @@ def geometry_attempt(
             right_age_at_capture_s=0.0,
             left_age_from_detection_midpoint_s=0.0,
             right_age_from_detection_midpoint_s=0.0,
+            left_basis_attitude_monotonic_s=(
+                None if left_attitude is None or translation_right_in_left_m is None else left_attitude.timestamp_s
+            ),
         )
     key = detection_pair_key(
         triangulation_source=triangulation_source,
@@ -248,7 +251,7 @@ def test_measurement_controller_reports_intrinsics_waiting() -> None:
     assert result.triangulation_reason == "missing_intrinsics"
 
 
-def test_measurement_controller_preserves_ray_rejection_reason() -> None:
+def test_measurement_controller_rejects_zero_disparity_before_ray_geometry() -> None:
     result = calculate_measurement_geometry(
         geometry_attempt(
             left=detection("left", x1=640.0, x2=660.0),
@@ -265,8 +268,7 @@ def test_measurement_controller_preserves_ray_rejection_reason() -> None:
 
     assert result.triangulated is None
     assert result.estimate is None
-    assert result.triangulation_reason == "near_parallel_rays"
-    assert "two-ray geometry rejected: near_parallel_rays" in result.warnings
+    assert result.triangulation_reason == "correspondence_rejected"
 
 
 @pytest.mark.parametrize(
@@ -310,7 +312,7 @@ def test_measurement_controller_fails_closed_on_detection_intrinsics_grid_mismat
     )
 
 
-def test_measurement_controller_keeps_match_validation_separate_from_triangulation() -> None:
+def test_measurement_controller_rejects_correspondence_before_triangulation() -> None:
     result = calculate_measurement_geometry(
         geometry_attempt(
             left=detection("left", x1=690.0, x2=710.0, t=10.0),
@@ -326,8 +328,9 @@ def test_measurement_controller_keeps_match_validation_separate_from_triangulati
     )
 
     assert result.match is None
-    assert result.triangulated is not None
+    assert result.triangulated is None
     assert result.estimate is None
+    assert result.triangulation_reason == "correspondence_rejected"
 
 
 def test_measurement_controller_checkerboard_extrinsics_triangulates_without_pixhawk() -> None:

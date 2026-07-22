@@ -42,6 +42,19 @@ def detection(
     )
 
 
+def test_measurement_attempt_generation_identity_is_unique_with_same_session_id() -> None:
+    from wiris_stereo_distance.gui import _new_measurement_attempt_generation_id
+
+    session_id = "20260722_120000"
+
+    first = _new_measurement_attempt_generation_id(session_id)
+    second = _new_measurement_attempt_generation_id(session_id)
+
+    assert first != second
+    assert first.startswith(f"{session_id}-")
+    assert second.startswith(f"{session_id}-")
+
+
 def recording_attempt(widget, estimate, *, baseline_m: float = 0.3, translation=None):
     """Build the immutable selected-input fixture consumed by valid-row recording."""
 
@@ -95,7 +108,7 @@ def recording_attempt(widget, estimate, *, baseline_m: float = 0.3, translation=
     )
     basis = None if translation is None or left_attitude is None else left_attitude.q
     baseline = BaselineSnapshot(
-        source="test-fixture",
+        source="gps-rtk",
         baseline_m=baseline_m,
         ned_right_from_left_m=(0.0, baseline_m, 0.0),
         translation_right_in_left_rdf_m=translation,
@@ -111,6 +124,9 @@ def recording_attempt(widget, estimate, *, baseline_m: float = 0.3, translation=
         right_age_at_capture_s=0.2 if right_gps is not None else None,
         left_age_from_detection_midpoint_s=None,
         right_age_from_detection_midpoint_s=None,
+        left_basis_attitude_monotonic_s=(
+            None if left_attitude is None or translation is None else left_attitude.timestamp_s
+        ),
     )
     key = detection_pair_key(
         triangulation_source="pixhawk",
@@ -6324,6 +6340,119 @@ def test_measurement_attempt_identity_is_monotonic_across_failed_geometry(monkey
     )
     second = widget._build_measurement_attempt(second_pair)
     assert second.attempt_id == first.attempt_id + 1
+
+    widget._stop_calibration_preview_worker()
+    widget.deleteLater()
+    app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("left_class", "right_class", "left_candidates", "right_candidates", "expected_reason"),
+    (
+        (1, 2, (1,), (2,), "correspondence_class_mismatch"),
+        (1, 1, (1, 1), (1,), "ambiguous_left_candidates"),
+        (1, 1, (1,), (1, 1), "ambiguous_right_candidates"),
+    ),
+)
+def test_measurement_correspondence_rejects_class_mismatch_and_ambiguity(
+    monkeypatch,
+    left_class,
+    right_class,
+    left_candidates,
+    right_candidates,
+    expected_reason,
+) -> None:
+    from dataclasses import replace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    left = replace(
+        detection("left", x1=630, y1=350, x2=650, y2=370, t=10.0),
+        class_id=left_class,
+        candidate_class_ids=left_candidates,
+    )
+    right = replace(
+        detection("right", x1=600, y1=350, x2=620, y2=370, t=10.0),
+        class_id=right_class,
+        candidate_class_ids=right_candidates,
+    )
+    widget.detection_buffers["left"].add(left)
+    widget.detection_buffers["right"].add(right)
+
+    assert widget._matched_detection_pair() is None
+    assert widget._last_correspondence_rejection_reason == expected_reason
+    widget._refresh_distance()
+    assert len(widget.distance_history) == 0
+    assert len(widget.distance_recording_rows) == 0
+
+    widget._stop_calibration_preview_worker()
+    widget.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_attempt_recovers_same_pair_when_required_inputs_arrive(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
+    from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
+    left = detection("left", x1=630, y1=350, x2=650, y2=370, t=10.0)
+    right = detection("right", x1=603, y1=350, x2=623, y2=370, t=10.0)
+    widget.detection_buffers["left"].add(left)
+    widget.detection_buffers["right"].add(right)
+    pair = widget._matched_detection_pair()
+    assert pair is not None
+
+    incomplete = widget._build_measurement_attempt(pair)
+    assert not incomplete.is_geometry_ready
+    assert widget._build_measurement_attempt(pair) is incomplete
+
+    intrinsics = CameraIntrinsics(
+        1280,
+        720,
+        [[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+        [0.0],
+        0.2,
+        20,
+    )
+    widget.active_intrinsics = StereoIntrinsicsResult(
+        intrinsics, intrinsics, CheckerboardConfig(9, 6, 0.03)
+    )
+    set_selected_gps_baseline(widget, timestamp_s=10.0, baseline_m=0.3)
+    for camera in ("left", "right"):
+        state = CameraExtrinsicState(
+            camera,
+            camera,
+            0.0,
+            0.0,
+            0.0,
+            10.0,
+            f"/{camera}/attitude-a",
+            (1.0, 0.0, 0.0, 0.0),
+            9.0,
+        )
+        widget.latest_extrinsics[camera] = state
+        widget.attitude_buffers[camera].add(state)
+
+    recovered = widget._build_measurement_attempt(pair)
+    assert recovered is not incomplete
+    assert recovered.attempt_id == incomplete.attempt_id + 1
+    assert recovered.is_geometry_ready
+    assert calculate_measurement_geometry(recovered).triangulated is not None
+    assert widget._build_measurement_attempt(pair) is recovered
 
     widget._stop_calibration_preview_worker()
     widget.deleteLater()

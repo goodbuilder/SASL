@@ -14,6 +14,7 @@ import struct
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from collections import deque
 from dataclasses import dataclass
@@ -161,6 +162,7 @@ from wiris_stereo_distance.settings import (
 )
 from wiris_stereo_distance.stereo import (
     DetectionObservation,
+    correspondence_rejection_reason,
     detection_timestamp_for_basis,
 )
 from wiris_stereo_distance.theme import (
@@ -258,6 +260,12 @@ from wiris_stereo_distance.wiris_zoom import (
     build_zoom_command,
     send_tcp_line,
 )
+
+
+def _new_measurement_attempt_generation_id(session_id: str = "") -> str:
+    """Return a collision-resistant generation identity independent of wall-clock resolution."""
+
+    return f"{session_id or 'runtime'}-{uuid.uuid4().hex}"
 
 
 def angle_diff_deg(a_deg: float, b_deg: float) -> float:
@@ -2596,6 +2604,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_recording_enabled = False
         self.distance_recording_started_monotonic_s: float | None = None
         self.recording_session_id = ""
+        self._measurement_attempt_generation_id = _new_measurement_attempt_generation_id()
         self.recording_session_started_wall_s: float | None = None
         self.recording_session_started_monotonic_s: float | None = None
         self.video_recording_enabled = False
@@ -2604,6 +2613,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._measurement_attempt_counter = 0
         self._last_measurement_attempt_key: tuple[object, ...] | None = None
         self._last_measurement_attempt: MeasurementAttempt | None = None
+        self._last_correspondence_rejection_reason = ""
         self.camera_frame_times = {
             "left": deque(maxlen=120),
             "right": deque(maxlen=120),
@@ -10406,7 +10416,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             timestamp=self._yolo_match_timestamp_s,
         )
         if pair is not None or self._yolo_time_basis() != "camera_rtcp":
-            return pair
+            return self._validated_correspondence_pair(pair, left_samples, right_samples)
 
         # The WIRIS units can emit valid RTCP/NTP fields while their two
         # camera clocks drift apart. Keep RTCP as the preferred diagnostic
@@ -10419,7 +10429,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             timestamp=lambda sample: float(sample.timestamp_s),
         )
         self._runtime_pair_uses_app_fallback = pair is not None
-        return pair
+        return self._validated_correspondence_pair(pair, left_samples, right_samples)
+
+    def _validated_correspondence_pair(self, pair, left_samples, right_samples):
+        if pair is None:
+            if not left_samples:
+                self._last_correspondence_rejection_reason = "missing_left_detection"
+            elif not right_samples:
+                self._last_correspondence_rejection_reason = "missing_right_detection"
+            else:
+                self._last_correspondence_rejection_reason = ""
+            return None
+        reason = correspondence_rejection_reason(pair.left, pair.right)
+        self._last_correspondence_rejection_reason = "" if reason is None else reason
+        return pair if reason is None else None
 
     def _recent_detection_pair_available(self) -> bool:
         pair = self._matched_detection_pair()
@@ -10813,6 +10836,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _start_session_recording(self) -> None:
         self.recording_session_id = session_id_now()
+        self._measurement_attempt_generation_id = _new_measurement_attempt_generation_id(
+            self.recording_session_id
+        )
         self.recording_session_started_wall_s = time.time()
         self.recording_session_started_monotonic_s = time.monotonic()
         self.distance_recording_started_monotonic_s = self.recording_session_started_monotonic_s
@@ -13724,8 +13750,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             left_pairing_timestamp_s=left_pairing_timestamp_s,
             right_pairing_timestamp_s=right_pairing_timestamp_s,
         )
-        if key == self._last_measurement_attempt_key and self._last_measurement_attempt is not None:
-            return self._last_measurement_attempt
+        cached_attempt = (
+            self._last_measurement_attempt
+            if key == self._last_measurement_attempt_key
+            else None
+        )
+        if cached_attempt is not None and cached_attempt.is_geometry_ready:
+            return cached_attempt
 
         created_monotonic_s = time.monotonic()
         detection_midpoint_s = (float(pair.left.timestamp_s) + float(pair.right.timestamp_s)) / 2.0
@@ -13757,7 +13788,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             max_vertical_delta_px=(
                 max_vertical_delta_px if math.isfinite(max_vertical_delta_px) else None
             ),
-            require_same_class=False,
+            require_same_class=True,
             timestamp_basis=timestamp_basis,
             manual_focal_override=self.manual_focal_checkbox.isChecked(),
             require_rtk_fixed_setting=bool(self.settings.require_rtk_fixed),
@@ -13817,6 +13848,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                         if right_attitude_snapshot is None
                         else right_attitude_snapshot.quaternion_wxyz
                     ),
+                    selected_left_attitude_monotonic_s=(
+                        None
+                        if left_attitude_snapshot is None
+                        else left_attitude_snapshot.timestamp_s
+                    ),
                     created_monotonic_s=created_monotonic_s,
                     detection_midpoint_monotonic_s=detection_midpoint_s,
                 )
@@ -13826,10 +13862,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             else:
                 warnings = ("waiting for live GPS baseline",)
 
-        self._measurement_attempt_counter += 1
+        candidate_attempt_id = self._measurement_attempt_counter + 1
         attempt = MeasurementAttempt(
-            attempt_id=self._measurement_attempt_counter,
-            attempt_session_id=self.recording_session_id or "runtime",
+            attempt_id=candidate_attempt_id,
+            attempt_session_id=self._measurement_attempt_generation_id,
             detection_pair_key=key,
             created_monotonic_s=created_monotonic_s,
             created_wall_s=time.time(),
@@ -13851,9 +13887,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             relative_roll_deg=None if relative is None else relative.roll_deg,
             relative_pitch_deg=None if relative is None else relative.pitch_deg,
             relative_yaw_deg=None if relative is None else relative.yaw_deg,
-            source_quality="GOOD",
+            source_quality=(
+                "GOOD"
+                if baseline is None or baseline.fix_quality == "NOT_USED"
+                else baseline.fix_quality
+            ),
             warnings=warnings,
         )
+        if cached_attempt is not None:
+            previous_missing = set(cached_attempt.missing_geometry_inputs)
+            candidate_missing = set(attempt.missing_geometry_inputs)
+            if not candidate_missing < previous_missing:
+                return cached_attempt
+        self._measurement_attempt_counter = candidate_attempt_id
         self._last_measurement_attempt_key = key
         self._last_measurement_attempt = attempt
         return attempt
@@ -14087,6 +14133,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         right_stats = self.camera_stream_stats.get("right") or {}
         left_yolo_hz = float(left_stats.get("inferred_hz", 0.0))
         right_yolo_hz = float(right_stats.get("inferred_hz", 0.0))
+        if self._last_correspondence_rejection_reason and not self._last_correspondence_rejection_reason.startswith(
+            "missing_"
+        ):
+            return (
+                "그래프 미표시: correspondence 검증 실패 "
+                f"({self._last_correspondence_rejection_reason})."
+            )
         if left_count == 0 or right_count == 0:
             if left_yolo_hz <= 0.0 or right_yolo_hz <= 0.0:
                 return (
@@ -14117,6 +14170,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _detection_wait_status(self) -> str:
+        if self._last_correspondence_rejection_reason and not self._last_correspondence_rejection_reason.startswith(
+            "missing_"
+        ):
+            return f"거리: 검출 대응 거부 ({self._last_correspondence_rejection_reason})"
         if self._yolo_time_delta_gate_enabled() or self._yolo_time_basis() != "detection":
             return "거리: timestamp가 맞는 좌/우 검출 대기 중"
         return "거리: 좌/우 검출 쌍 대기 중"
@@ -14880,8 +14937,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"{prefix}_satellites": "" if state.satellites_used is None else str(state.satellites_used),
             f"{prefix}_eph_m": self._fmt_record_float(state.eph_m, 6),
             f"{prefix}_epv_m": self._fmt_record_float(state.epv_m, 6),
-            f"{prefix}_heading_deg": "",
-            f"{prefix}_heading_accuracy_deg": "",
+            f"{prefix}_heading_deg": self._fmt_record_float(state.heading_deg, 6),
+            f"{prefix}_heading_accuracy_deg": self._fmt_record_float(state.heading_accuracy_deg, 6),
             f"{prefix}_rtk_label": state.rtk_label,
             f"{prefix}_age_s": self._fmt_record_float(age_s, 6),
             f"{prefix}_app_receive_timestamp_s": self._fmt_record_float(state.timestamp_s, 6),

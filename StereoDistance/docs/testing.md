@@ -23,12 +23,16 @@ cd <SASL_ROOT>
 PYTHONPATH=. python3 -m pytest \
   StereoDistance/tests/test_stereo_geometry_common.py \
   StereoDistance/tests/test_coordinate_contract.py \
+  StereoDistance/tests/test_measurement_attempt.py \
   StereoDistance/tests/test_measurement_controller.py \
   StereoDistance/tests/test_triangulation.py \
   -q
 ```
 
-이 묶음은 `camera_optical_rdf -> left_camera_rdf`, checkerboard `X_right = R X_left + T` 역변환, Pixhawk body FRD/NED 변환, 왼쪽 optical-center 원점 유지와 invalid-ray fail-closed를 확인한다.
+이 묶음은 immutable attempt/pair identity, class·ambiguity fail-closed,
+`camera_optical_rdf -> left_camera_rdf`, checkerboard `X_right = R X_left + T`
+역변환, Pixhawk body FRD/NED 변환, selected-left quaternion/timestamp 공유,
+왼쪽 optical-center 원점 유지와 invalid-ray fail-closed를 확인한다.
 
 ## 대표 PyQt 테스트
 

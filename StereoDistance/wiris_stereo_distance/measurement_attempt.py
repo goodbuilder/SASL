@@ -25,6 +25,16 @@ from wiris_stereo_distance.triangulation import (
 
 MetadataScalar = str | int | float | bool | None
 
+QUATERNION_NORM_EPSILON = 1.0e-12
+CAMERA_MATRIX_TOLERANCE = 1.0e-12
+# Runtime calibration validation allows serialization noise; 1e-9 remains a
+# synthetic geometry test tolerance, not a hardware/calibration acceptance gate.
+ROTATION_MATRIX_TOLERANCE = 1.0e-6
+CHECKERBOARD_FRAME_CONTRACT = (
+    "opencv_optical:RDF(right,down,forward); "
+    "X_right = R_left_to_right * X_left + T_left_to_right_m"
+)
+
 DETECTION_METADATA_ALLOWLIST = (
     "source_timestamp_s",
     "timestamp_source",
@@ -63,6 +73,33 @@ def _finite_tuple(values: Iterable[Any], *, name: str, length: int | None = None
     if length is not None and len(parsed) != length:
         raise ValueError(f"{name} must contain {length} values")
     return parsed
+
+
+def _determinant_3x3(matrix: tuple[tuple[float, float, float], ...]) -> float:
+    return (
+        matrix[0][0] * (matrix[1][1] * matrix[2][2] - matrix[1][2] * matrix[2][1])
+        - matrix[0][1] * (matrix[1][0] * matrix[2][2] - matrix[1][2] * matrix[2][0])
+        + matrix[0][2] * (matrix[1][0] * matrix[2][1] - matrix[1][1] * matrix[2][0])
+    )
+
+
+def _validate_rotation_matrix(
+    matrix: tuple[tuple[float, float, float], ...],
+    *,
+    name: str,
+) -> None:
+    max_orthogonality_error = max(
+        abs(
+            sum(matrix[row][left] * matrix[row][right] for row in range(3))
+            - (1.0 if left == right else 0.0)
+        )
+        for left in range(3)
+        for right in range(3)
+    )
+    if max_orthogonality_error > ROTATION_MATRIX_TOLERANCE:
+        raise ValueError(f"{name} must be orthonormal within 1e-6")
+    if abs(_determinant_3x3(matrix) - 1.0) > ROTATION_MATRIX_TOLERANCE:
+        raise ValueError(f"{name} determinant must equal +1 within 1e-6")
 
 
 def _canonical_json_bytes(payload: Any) -> bytes:
@@ -110,6 +147,7 @@ class DetectionSnapshot:
     pairing_timestamp_basis: str
     pairing_timestamp_s: float
     timestamp_metadata_items: tuple[tuple[str, MetadataScalar], ...] = ()
+    candidate_class_ids: tuple[int, ...] = ()
     pixel_frame: str = CAMERA_FRAME
     pixel_unit: str = "px"
 
@@ -130,6 +168,11 @@ class DetectionSnapshot:
             "timestamp_metadata_items",
             tuple((str(key), value) for key, value in self.timestamp_metadata_items),
         )
+        object.__setattr__(
+            self,
+            "candidate_class_ids",
+            tuple(int(class_id) for class_id in self.candidate_class_ids),
+        )
         object.__setattr__(self, "pixel_frame", str(self.pixel_frame))
         object.__setattr__(self, "pixel_unit", str(self.pixel_unit))
         _finite_float(self.app_receive_monotonic_s, name="app_receive_monotonic_s")
@@ -139,6 +182,19 @@ class DetectionSnapshot:
         _finite_float(self.confidence, name="confidence")
         if self.width_px <= 0 or self.height_px <= 0:
             raise ValueError("detection image dimensions must be positive")
+        if self.camera not in {"left", "right"}:
+            raise ValueError("detection camera must be left or right")
+        x1, y1, x2, y2 = self.bbox_xyxy_px
+        if not (0.0 <= x1 < x2 <= float(self.width_px)):
+            raise ValueError("bbox_xyxy_px must satisfy 0 <= x1 < x2 <= width")
+        if not (0.0 <= y1 < y2 <= float(self.height_px)):
+            raise ValueError("bbox_xyxy_px must satisfy 0 <= y1 < y2 <= height")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+        if self.class_id < 0 or any(class_id < 0 for class_id in self.candidate_class_ids):
+            raise ValueError("class IDs must be non-negative")
+        if self.pixel_frame != CAMERA_FRAME or self.pixel_unit != "px":
+            raise ValueError("detection pixels must use camera_optical_rdf pixel coordinates")
         for key, value in self.timestamp_metadata_items:
             if key not in DETECTION_METADATA_ALLOWLIST:
                 raise ValueError(f"timestamp metadata key is not allowed: {key}")
@@ -170,6 +226,7 @@ class DetectionSnapshot:
             pairing_timestamp_basis=str(pairing_timestamp_basis),
             pairing_timestamp_s=_finite_float(pairing_timestamp_s, name="pairing_timestamp_s"),
             timestamp_metadata_items=_metadata_items(getattr(observation, "timestamp_metadata", None)),
+            candidate_class_ids=tuple(getattr(observation, "candidate_class_ids", ()) or ()),
         )
 
     @property
@@ -210,6 +267,11 @@ class DetectionSnapshot:
 
         return dict(self.timestamp_metadata_items)
 
+    @property
+    def same_class_candidate_count(self) -> int:
+        candidates = self.candidate_class_ids or (self.class_id,)
+        return sum(class_id == self.class_id for class_id in candidates)
+
 
 @dataclass(frozen=True)
 class AttitudeSnapshot:
@@ -245,13 +307,17 @@ class AttitudeSnapshot:
         object.__setattr__(self, "orientation_to_frame", str(self.orientation_to_frame))
         _finite_float(self.app_receive_monotonic_s, name="attitude timestamp")
         q = _finite_tuple(self.quaternion_wxyz, name="quaternion_wxyz", length=4)
-        if math.sqrt(sum(value * value for value in q)) <= 0.0:
-            raise ValueError("quaternion_wxyz must have non-zero length")
+        if math.sqrt(sum(value * value for value in q)) <= QUATERNION_NORM_EPSILON:
+            raise ValueError("quaternion_wxyz norm must be greater than 1e-12")
         _optional_finite_float(self.px4_timestamp_s, name="px4_timestamp_s")
         for name, value in (("roll_deg", self.roll_deg), ("pitch_deg", self.pitch_deg), ("yaw_deg", self.yaw_deg)):
             _finite_float(value, name=name)
         if self.quaternion_order != "wxyz":
             raise ValueError("quaternion order must be wxyz")
+        if self.camera not in {"left", "right"}:
+            raise ValueError("attitude camera must be left or right")
+        if self.orientation_from_frame != BODY_FRAME or self.orientation_to_frame != WORLD_FRAME:
+            raise ValueError("attitude must rotate PX4 body FRD components into world NED")
 
     @classmethod
     def from_state(cls, state: Any) -> "AttitudeSnapshot":
@@ -291,6 +357,8 @@ class GpsSnapshot:
     namespace: str
     topic: str
     px4_timestamp_s: float | None
+    heading_deg: float | None = None
+    heading_accuracy_deg: float | None = None
     position_frame: str = "wgs84_geodetic"
     angle_unit: str = "deg"
     altitude_unit: str = "m"
@@ -298,7 +366,16 @@ class GpsSnapshot:
     def __post_init__(self) -> None:
         object.__setattr__(self, "camera", str(self.camera))
         object.__setattr__(self, "app_receive_monotonic_s", _finite_float(self.app_receive_monotonic_s, name="GPS timestamp"))
-        for name in ("latitude_deg", "longitude_deg", "altitude_m", "eph_m", "epv_m", "px4_timestamp_s"):
+        for name in (
+            "latitude_deg",
+            "longitude_deg",
+            "altitude_m",
+            "eph_m",
+            "epv_m",
+            "px4_timestamp_s",
+            "heading_deg",
+            "heading_accuracy_deg",
+        ):
             object.__setattr__(self, name, _optional_finite_float(getattr(self, name), name=name))
         object.__setattr__(self, "fix_type", None if self.fix_type is None else int(self.fix_type))
         object.__setattr__(self, "satellites_used", None if self.satellites_used is None else int(self.satellites_used))
@@ -312,8 +389,22 @@ class GpsSnapshot:
             ("eph_m", self.eph_m),
             ("epv_m", self.epv_m),
             ("px4_timestamp_s", self.px4_timestamp_s),
+            ("heading_deg", self.heading_deg),
+            ("heading_accuracy_deg", self.heading_accuracy_deg),
         ):
             _optional_finite_float(value, name=name)
+        if self.camera not in {"left", "right"}:
+            raise ValueError("GPS camera must be left or right")
+        if self.latitude_deg is not None and not -90.0 <= self.latitude_deg <= 90.0:
+            raise ValueError("latitude_deg must be between -90 and 90")
+        if self.longitude_deg is not None and not -180.0 <= self.longitude_deg <= 180.0:
+            raise ValueError("longitude_deg must be between -180 and 180")
+        if self.eph_m is not None and self.eph_m < 0.0:
+            raise ValueError("eph_m must be non-negative")
+        if self.epv_m is not None and self.epv_m < 0.0:
+            raise ValueError("epv_m must be non-negative")
+        if self.position_frame != "wgs84_geodetic" or self.angle_unit != "deg" or self.altitude_unit != "m":
+            raise ValueError("GPS snapshot frame/unit contract mismatch")
 
     @classmethod
     def from_state(cls, state: Any) -> "GpsSnapshot":
@@ -331,6 +422,10 @@ class GpsSnapshot:
             namespace=str(state.namespace),
             topic=str(state.topic),
             px4_timestamp_s=_optional_finite_float(getattr(state, "px4_timestamp_s", None), name="px4_timestamp_s"),
+            heading_deg=_optional_finite_float(getattr(state, "heading_deg", None), name="heading_deg"),
+            heading_accuracy_deg=_optional_finite_float(
+                getattr(state, "heading_accuracy_deg", None), name="heading_accuracy_deg"
+            ),
         )
 
     @property
@@ -377,6 +472,14 @@ class CameraIntrinsicsSnapshot:
         _finite_float(self.reprojection_error_px, name="reprojection_error_px")
         if self.image_count < 0:
             raise ValueError("image_count must be non-negative")
+        if not self.distortion_coefficients:
+            raise ValueError("distortion_coefficients must not be empty")
+        if self.camera_matrix[0][0] <= 0.0 or self.camera_matrix[1][1] <= 0.0:
+            raise ValueError("camera_matrix focal lengths must be positive")
+        if any(abs(self.camera_matrix[2][index] - expected) > CAMERA_MATRIX_TOLERANCE for index, expected in enumerate((0.0, 0.0, 1.0))):
+            raise ValueError("camera_matrix last row must be [0, 0, 1]")
+        if self.pixel_unit != "px" or self.camera_frame != CAMERA_FRAME:
+            raise ValueError("intrinsics frame/unit contract mismatch")
 
     @classmethod
     def from_intrinsics(cls, intrinsics: Any) -> "CameraIntrinsicsSnapshot":
@@ -431,6 +534,9 @@ class CheckerboardExtrinsicsSnapshot:
         _finite_float(self.reprojection_error_px, name="checkerboard reprojection_error_px")
         if self.pair_count < 0:
             raise ValueError("pair_count must be non-negative")
+        _validate_rotation_matrix(self.rotation_left_to_right, name="rotation_left_to_right")
+        if self.frame_contract != CHECKERBOARD_FRAME_CONTRACT:
+            raise ValueError("checkerboard frame_contract does not match the active RDF transform contract")
 
     @classmethod
     def from_extrinsics(cls, extrinsics: Any) -> "CheckerboardExtrinsicsSnapshot":
@@ -530,6 +636,9 @@ class BaselineSnapshot:
     baseline_frame: str = WORLD_FRAME
     translation_frame: str = MEASUREMENT_FRAME
     unit: str = "m"
+    left_basis_attitude_monotonic_s: float | None = None
+    gps_selection_basis: str = "latest_app_monotonic_at_attempt_capture"
+    gps_clock_domain: str = "app_monotonic_receive"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source", str(self.source))
@@ -575,6 +684,16 @@ class BaselineSnapshot:
         object.__setattr__(self, "baseline_frame", str(self.baseline_frame))
         object.__setattr__(self, "translation_frame", str(self.translation_frame))
         object.__setattr__(self, "unit", str(self.unit))
+        object.__setattr__(
+            self,
+            "left_basis_attitude_monotonic_s",
+            _optional_finite_float(
+                self.left_basis_attitude_monotonic_s,
+                name="left_basis_attitude_monotonic_s",
+            ),
+        )
+        object.__setattr__(self, "gps_selection_basis", str(self.gps_selection_basis))
+        object.__setattr__(self, "gps_clock_domain", str(self.gps_clock_domain))
         _finite_float(self.baseline_m, name="baseline_m")
         if self.ned_right_from_left_m is not None:
             _finite_tuple(self.ned_right_from_left_m, name="ned_right_from_left_m", length=3)
@@ -594,6 +713,10 @@ class BaselineSnapshot:
             ("right_age_from_detection_midpoint_s", self.right_age_from_detection_midpoint_s),
         ):
             _optional_finite_float(value, name=name)
+        if self.baseline_m < 0.0:
+            raise ValueError("baseline_m must be non-negative")
+        if self.baseline_frame != WORLD_FRAME or self.translation_frame != MEASUREMENT_FRAME or self.unit != "m":
+            raise ValueError("baseline frame/unit contract mismatch")
 
 
 @dataclass(frozen=True)
@@ -715,6 +838,8 @@ class MeasurementAttempt:
             raise TypeError("geometry_config must be an immutable GeometryConfigSnapshot")
         if self.attempt_id <= 0:
             raise ValueError("attempt_id must be positive")
+        if not self.attempt_session_id:
+            raise ValueError("attempt_session_id must not be empty")
         for name, value in (
             ("created_monotonic_s", self.created_monotonic_s),
             ("created_wall_s", self.created_wall_s),
@@ -736,14 +861,43 @@ class MeasurementAttempt:
                 raise ValueError("detection_pair_key values must be scalar")
         if self.triangulation_source not in {"pixhawk", "checkerboard"}:
             raise ValueError("triangulation_source must be pixhawk or checkerboard")
+        expected_contracts = {
+            "world_frame": WORLD_FRAME,
+            "body_frame": BODY_FRAME,
+            "camera_frame": CAMERA_FRAME,
+            "camera_mount_profile": CAMERA_MOUNT_PROFILE,
+            "measurement_frame": MEASUREMENT_FRAME,
+            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "measurement_unit": "m",
+        }
+        for field_name, expected in expected_contracts.items():
+            if getattr(self, field_name) != expected:
+                raise ValueError(f"{field_name} must be {expected}")
+        if self.left_detection.camera != "left" or self.right_detection.camera != "right":
+            raise ValueError("attempt detections must preserve left/right camera identity")
+        for field_name, value, expected_camera in (
+            ("left_attitude", self.left_attitude, "left"),
+            ("right_attitude", self.right_attitude, "right"),
+            ("left_gps", self.left_gps, "left"),
+            ("right_gps", self.right_gps, "right"),
+        ):
+            if value is not None and value.camera != expected_camera:
+                raise ValueError(f"{field_name} must preserve {expected_camera} camera identity")
         if self.triangulation_source == "checkerboard":
             if any(value is not None for value in (self.left_attitude, self.right_attitude, self.left_gps, self.right_gps)):
                 raise ValueError("checkerboard attempts must not consume Pixhawk attitude or GPS")
+            if self.baseline is not None and not self.baseline.source.startswith("checkerboard"):
+                raise ValueError("checkerboard attempts must use checkerboard baseline provenance")
         if self.triangulation_source == "pixhawk" and self.baseline is not None:
+            if not self.baseline.source.startswith("gps-rtk"):
+                raise ValueError("Pixhawk attempts must use GPS/RTK baseline provenance")
             basis = self.baseline.left_basis_quaternion_wxyz
             if self.baseline.translation_right_in_left_rdf_m is not None:
                 if self.left_attitude is None or basis != self.left_attitude.quaternion_wxyz:
                     raise ValueError("baseline translation and right-ray target must use the same selected left quaternion")
+                if self.baseline.left_basis_attitude_monotonic_s != self.left_attitude.timestamp_s:
+                    raise ValueError("baseline translation and right-ray target must use the same selected left attitude timestamp")
 
     @property
     def left(self) -> DetectionSnapshot:
@@ -766,6 +920,42 @@ class MeasurementAttempt:
     @property
     def translation_right_in_left_m(self) -> tuple[float, float, float] | None:
         return None if self.baseline is None else self.baseline.translation_right_in_left_rdf_m
+
+    @property
+    def pair_sequence(self) -> int:
+        return self.attempt_id
+
+    @property
+    def pair_id(self) -> str:
+        return f"{self.attempt_session_id}:{self.attempt_id:020d}"
+
+    @property
+    def missing_geometry_inputs(self) -> tuple[str, ...]:
+        missing: list[str] = []
+        if self.intrinsics is None:
+            missing.append("intrinsics")
+        if self.triangulation_source == "checkerboard":
+            extrinsics = None if self.intrinsics is None else self.intrinsics.checkerboard_extrinsics
+            if extrinsics is None:
+                missing.extend(("checkerboard_rotation", "checkerboard_translation"))
+            return tuple(missing)
+        if self.left_attitude is None:
+            missing.append("left_attitude")
+        if self.right_attitude is None:
+            missing.append("right_attitude")
+        if self.left_gps is None:
+            missing.append("left_gps")
+        if self.right_gps is None:
+            missing.append("right_gps")
+        if self.baseline is None or self.baseline.ned_right_from_left_m is None:
+            missing.append("ned_baseline")
+        if self.translation_right_in_left_m is None:
+            missing.append("translation_right_in_left_m")
+        return tuple(missing)
+
+    @property
+    def is_geometry_ready(self) -> bool:
+        return not self.missing_geometry_inputs
 
     def stereo_calibration(self) -> StereoCalibration:
         return self.geometry_config.to_stereo_calibration(baseline_m=self.baseline_m)
@@ -808,6 +998,7 @@ def build_pixhawk_baseline_snapshot(
     right_gps: GpsSnapshot,
     selected_left_quaternion_wxyz: tuple[float, float, float, float] | None,
     selected_right_quaternion_wxyz: tuple[float, float, float, float] | None,
+    selected_left_attitude_monotonic_s: float | None,
     created_monotonic_s: float,
     detection_midpoint_monotonic_s: float,
 ) -> BaselineSnapshot:
@@ -860,6 +1051,7 @@ def build_pixhawk_baseline_snapshot(
         right_age_at_capture_s=max(0.0, created_monotonic_s - right_gps.timestamp_s),
         left_age_from_detection_midpoint_s=abs(detection_midpoint_monotonic_s - left_gps.timestamp_s),
         right_age_from_detection_midpoint_s=abs(detection_midpoint_monotonic_s - right_gps.timestamp_s),
+        left_basis_attitude_monotonic_s=selected_left_attitude_monotonic_s if translation is not None else None,
     )
 
 
@@ -890,4 +1082,7 @@ def build_checkerboard_baseline_snapshot(
         right_age_at_capture_s=None,
         left_age_from_detection_midpoint_s=None,
         right_age_from_detection_midpoint_s=None,
+        left_basis_attitude_monotonic_s=None,
+        gps_selection_basis="NOT_USED",
+        gps_clock_domain="NOT_USED",
     )

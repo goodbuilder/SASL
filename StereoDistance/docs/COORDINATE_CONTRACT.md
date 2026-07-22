@@ -49,17 +49,28 @@ the Raw `left_camera_rdf` result only.
 
 ### Coherent measurement input
 
-Each newly selected detection pair receives a session-local monotonically
-increasing `measurement_attempt_id`. Before geometry runs, StereoDistance
+Each newly selected detection pair receives a generation/session-scoped,
+monotonically increasing `measurement_attempt_id`; `MeasurementAttempt.pair_id`
+combines that generation identity and sequence instead of using a timestamp
+alone. Before geometry runs, StereoDistance
 copies the pair, nearest left/right attitude samples, selected left/right GPS
 samples, applied left/right K/D, zoom/profile identity, and geometry settings
-into one immutable `MeasurementAttempt`. Repeated GUI refreshes of the same
-pair reuse that attempt.
+into one immutable `MeasurementAttempt`. Repeated GUI refreshes reuse a
+geometry-ready attempt. An incomplete attempt is replaced only when the same
+pair gains strictly more required inputs, after which the ready snapshot is
+frozen.
+
+Correspondence is fail-closed before attempt construction: left/right classes
+must match, and either side with multiple candidates of that selected class is
+rejected because this phase does not introduce a validated multi-object
+matcher. Independent highest-confidence detections are not triangulated when
+that correspondence is ambiguous.
 
 For the Pixhawk path, the right ray is rotated into the selected left-camera
 basis with the attempt's left quaternion, and the selected GPS pair's NED
 baseline is transformed into `left_camera_rdf` with that exact same left
-quaternion. Geometry and valid-row recording do not re-read GUI latest
+quaternion and selected app-monotonic attitude timestamp. The quaternion order
+is `(w,x,y,z)`. Geometry and valid-row recording do not re-read GUI latest
 attitude, GPS baseline, or intrinsics after the attempt exists. Checkerboard
 attempts instead copy the applied stereo `R/T` and do not consume Pixhawk or
 GPS values.
@@ -67,6 +78,11 @@ GPS values.
 This coherence rule does not change validity policy: stale attitude remains
 display-only and non-blocking, RTK Fixed is not newly required, and no ray-gap
 or intersection-angle acceptance threshold is added in this phase.
+
+S3-B1 does not approve hardware reliability. GPS age/skew and stale/RTK
+acceptance policy remain for S3-B2; atomic recorder/session isolation remains
+for S3-B3; and the public `baseline_center_frd` origin/axis migration remains
+for S3-B4. The current public output stays `left_camera_rdf`.
 
 ## P1/P2 Pixhawk data boundary
 

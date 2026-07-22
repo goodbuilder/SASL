@@ -6,6 +6,7 @@ from wiris_stereo_distance.measurement_attempt import MeasurementAttempt
 from wiris_stereo_distance.stereo import (
     StereoEstimate,
     StereoMatch,
+    correspondence_rejection_reason,
     match_stereo_observations,
     stereo_estimate_from_match,
 )
@@ -28,7 +29,10 @@ class MeasurementGeometryResult:
 
 
 def calculate_measurement_geometry(inputs: MeasurementAttempt) -> MeasurementGeometryResult:
-    triangulation = _triangulate(inputs, tuple(inputs.warnings))
+    correspondence_reason = correspondence_rejection_reason(
+        inputs.left_detection,
+        inputs.right_detection,
+    )
     match = match_stereo_observations(
         inputs.left_detection,
         inputs.right_detection,
@@ -42,10 +46,19 @@ def calculate_measurement_geometry(inputs: MeasurementAttempt) -> MeasurementGeo
         relative_pitch_deg=inputs.relative_pitch_deg,
         relative_yaw_deg=inputs.relative_yaw_deg,
         sync_quality=inputs.source_quality,
-        warnings=triangulation.warnings,
+        warnings=tuple(inputs.warnings),
     )
+    if match is None:
+        return MeasurementGeometryResult(
+            match=None,
+            triangulated=None,
+            estimate=None,
+            warnings=tuple(inputs.warnings),
+            triangulation_reason=correspondence_reason or "correspondence_rejected",
+        )
+    triangulation = _triangulate(inputs, tuple(inputs.warnings))
     estimate = None
-    if match is not None and triangulation.result is not None:
+    if triangulation.result is not None:
         estimate = stereo_estimate_from_match(match, distance_m=triangulation.result.range_m)
     return MeasurementGeometryResult(
         match=match,
