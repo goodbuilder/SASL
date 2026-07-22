@@ -1,23 +1,21 @@
 from stereo_ground_sim.operator_diagnostics import build_pair_diagnostics
 
+def src():
+    return {"epoch": 1, "pair_id": "p1", "pair_midpoint_stamp_ns": 2,
+            "terminal_status": "evaluated", "measurement_status": "processed",
+            "evaluation_status": "evaluated", "output_frame": "baseline_center_frd",
+            "position_unit": "m", "angle_unit": "deg", "raw_range_error_m": 1.0}
 
-def _final():
-    return {"terminal_status":"evaluated", "epoch":1, "pair_id":"p1", "pair_midpoint_stamp_ns":2,
-            "output_frame":"baseline_center_frd", "position_unit":"m", "angle_unit":"deg",
-            **{k: 1.0 for k in ("raw_position_error_m","corrected_position_error_m","raw_forward_error_m","corrected_forward_error_m","raw_right_error_m","corrected_right_error_m","raw_down_error_m","corrected_down_error_m","raw_range_error_m","corrected_range_error_m","raw_ray_gap_m","corrected_ray_gap_m","raw_intersection_angle_deg","corrected_intersection_angle_deg")}}
+def test_identity_status_and_missing_metrics():
+    x = src(); d = build_pair_diagnostics(pair=x, measurement=x, alignment=x)
+    assert d and d.values == (("raw_range_error_m", 1.0),)
+    assert build_pair_diagnostics(pair={**x, "pair_id": ""}, measurement=x, alignment=x) is None
+    assert build_pair_diagnostics(pair={**x, "terminal_status": "valid"}, measurement=x, alignment=x) is None
 
-
-def test_pair_snapshot_requires_identity_and_finite_values():
-    result = build_pair_diagnostics(_final())
-    assert result is not None and result.pair_id == "p1"
-    bad = _final(); bad["pair_id"] = ""
-    assert build_pair_diagnostics(bad) is not None
-    bad = _final(); bad["raw_ray_gap_m"] = float("nan")
-    assert build_pair_diagnostics(bad) is None
-
-
-def test_pair_snapshot_rejects_mixed_or_invalid_status():
-    bad = _final(); bad["terminal_status"] = "gt_unavailable"
-    assert build_pair_diagnostics(bad) is None
-    bad = _final(); bad["output_frame"] = "world"
-    assert build_pair_diagnostics(bad) is None
+def test_identity_mismatch_and_immutable_values():
+    x = src(); d = build_pair_diagnostics(pair=x, measurement={**x, "epoch": 2}, alignment=x)
+    assert d is None
+    d = build_pair_diagnostics(pair=x, measurement=x, alignment=x)
+    assert d.value_map() == {"raw_range_error_m": 1.0}
+    d.value_map()["raw_range_error_m"] = 99.0
+    assert d.value_map()["raw_range_error_m"] == 1.0

@@ -13,3 +13,10 @@ the nominal optical-center midpoint and quaternion metadata `xyzw`.
 Do not use interactive operator parameters as deterministic sweep, freeze, or
 sealed-evaluation inputs. Atomic sealed execution and the sealed runner remain
 R4-B work.
+
+This commit closes only the pure diagnostic contract. Runtime publishers,
+DiagnosticArray, panel integration, launcher flags, and parameter safety are
+not connected yet. `build_pair_diagnostics` independently compares pair,
+measurement, and alignment identities; accepts only evaluated/processed/
+evaluated status; stores immutable tuple values; and omits missing or
+non-finite individual metrics. A snapshot with no finite metrics is omitted.
