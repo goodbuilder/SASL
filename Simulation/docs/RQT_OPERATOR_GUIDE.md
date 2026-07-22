@@ -14,9 +14,13 @@ Do not use interactive operator parameters as deterministic sweep, freeze, or
 sealed-evaluation inputs. Atomic sealed execution and the sealed runner remain
 R4-B work.
 
-This commit closes only the pure diagnostic contract. Runtime publishers,
+This phase provides only a pure terminal-record adapter. Runtime publishers,
 DiagnosticArray, panel integration, launcher flags, and parameter safety are
-not connected yet. `build_pair_diagnostics` independently compares pair,
-measurement, and alignment identities; accepts only evaluated/processed/
-evaluated status; stores immutable tuple values; and omits missing or
-non-finite individual metrics. A snapshot with no finite metrics is omitted.
+not connected yet. Runtime pair IDs are positive integers. The adapter
+compares the `StereoImagePair` identity with the identity copied into the
+assembled terminal record; `GroundTruthAlignment` itself does not carry that
+identity. Only evaluated/processed/evaluated records are accepted. Missing or
+non-finite individual metrics are omitted, but a snapshot with no finite
+metrics is not allowed. Values are immutable tuple-of-tuples. Operator
+diagnostics are not qualification evidence. The prior force-with-lease Git
+procedure violation remains recorded separately.
