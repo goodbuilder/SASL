@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import importlib.util
 import json
 from pathlib import Path
@@ -175,6 +176,13 @@ def test_case_bundle_identity_reuse_is_rejected(
     _refresh_anchor_chain(root, anchor, "data_access_ledger.jsonl")
     with pytest.raises(ValueError, match="access_ledger_duplicate_canonical_path"):
         verify_freeze_anchor_artifacts(root, anchor, repository_root=REPOSITORY_ROOT)
+
+
+def test_ledger_binding_requires_planned_cases() -> None:
+    parameter = inspect.signature(
+        qualification_module._verify_ledger_referenced_artifacts
+    ).parameters["planned_cases"]
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_coordinated_ledger_and_case_file_tamper_is_rejected_by_sidecar(

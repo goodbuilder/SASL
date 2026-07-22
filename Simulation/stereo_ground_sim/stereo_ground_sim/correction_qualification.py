@@ -1876,7 +1876,7 @@ def _verify_ledger_referenced_artifacts(
             if case_id != directory_case_id or case_id in bound_case_ids:
                 raise ValueError("qualification_case_metadata_identity_mismatch")
             bound_case_ids.add(case_id)
-            if planned_ids is not None and case_id not in planned_ids:
+            if case_id not in planned_ids:
                 raise ValueError("qualification_case_metadata_identity_mismatch")
             summary_snapshot = snapshots[bundle["run_summary.json"]["canonical_path"]]
             summary = _parse_verified_json(summary_snapshot, name="qualification_run_summary")
@@ -1897,25 +1897,37 @@ def _verify_ledger_referenced_artifacts(
             try:
                 csv_text = csv_snapshot.raw_bytes.decode("utf-8")
                 csv_reader = csv.DictReader(io.StringIO(csv_text, newline=""))
-                if csv_reader.fieldnames and "case_id" in csv_reader.fieldnames:
-                    csv_rows = list(csv_reader)
-                    for row in csv_rows:
-                        csv_case_id = _require_exact_str(
-                            row.get("case_id"), "qualification_csv:case_id"
-                        )
-                        if csv_case_id != case_id:
-                            raise ValueError("qualification_case_metadata_identity_mismatch")
-                else:
-                    csv_rows = None
+                fieldnames = csv_reader.fieldnames
+                if fieldnames is None or "case_id" not in fieldnames:
+                    raise ValueError("qualification_csv_case_id_column_missing")
+                if len(fieldnames) != len(set(fieldnames)) or None in fieldnames:
+                    raise ValueError("qualification_csv_schema_invalid")
+                csv_rows = list(csv_reader)
+                if not csv_rows:
+                    raise ValueError("qualification_csv_rows_empty")
+                for row in csv_rows:
+                    csv_case_id = _require_exact_str(
+                        row.get("case_id"), "qualification_csv:case_id"
+                    )
+                    if csv_case_id != case_id:
+                        raise ValueError("qualification_csv_case_identity_mismatch")
             except (UnicodeDecodeError, csv.Error) as exc:
                 raise ValueError("qualification_csv_schema_invalid") from exc
-            if summary.get("jsonl_line_count") is not None and _require_exact_int(
+            if "jsonl_line_count" not in summary:
+                raise ValueError("qualification_summary_jsonl_line_count_missing")
+            if "csv_data_row_count" not in summary:
+                raise ValueError("qualification_summary_csv_data_row_count_missing")
+            jsonl_count = _require_exact_int(
                 summary["jsonl_line_count"], "qualification_summary:jsonl_line_count"
-            ) != len(pair_records):
-                raise ValueError("qualification_pair_record_count_mismatch")
-            if summary.get("csv_data_row_count") is not None and csv_rows is not None and _require_exact_int(
+            )
+            csv_count = _require_exact_int(
                 summary["csv_data_row_count"], "qualification_summary:csv_data_row_count"
-            ) != len(csv_rows):
+            )
+            if jsonl_count < 1 or csv_count < 1:
+                raise ValueError("qualification_pair_record_count_mismatch")
+            if jsonl_count != len(pair_records):
+                raise ValueError("qualification_pair_record_count_mismatch")
+            if csv_count != len(csv_rows) or jsonl_count != csv_count:
                 raise ValueError("qualification_pair_record_count_mismatch")
         if bound_case_ids != planned_ids:
             raise ValueError("qualification_case_metadata_identity_mismatch")
