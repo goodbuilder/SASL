@@ -625,6 +625,28 @@ if ! is_px4_checkout "${PX4_DIR:-}"; then
     "Set PX4_DIR or pass --px4-dir DIR; the checkout must contain Makefile, Tools/, and src/." >&2
   exit 2
 fi
+PX4_DIR="$(cd "$PX4_DIR" && pwd -P)"
+
+ensure_no_px4_build_in_progress() {
+  local pid cwd args
+  while read -r pid; do
+    [[ -n "${pid:-}" ]] || continue
+    cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+    [[ "$cwd" == "$PX4_DIR" ]] || continue
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ "$args" == *"px4_sitl_default"* ]]; then
+      printf '%s\n' \
+        "error: PX4 SITL build is already running in this checkout (PID $pid)." \
+        "Stop or wait for that build before starting operator view." >&2
+      return 1
+    fi
+  done < <(pgrep -x make || true)
+  return 0
+}
+
+if ! ensure_no_px4_build_in_progress; then
+  exit 2
+fi
 
 DEFAULT_YOLO_PYTHON="${DEFAULT_YOLO_PYTHON:-${YOLO_PYTHON:-}}"
 YOLO_BOOTSTRAP_PREFERRED_PYTHON="${DEFAULT_YOLO_PYTHON:-python3}"
@@ -942,6 +964,7 @@ if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
   mkdir -p "$(dirname "$PX4_CONSOLE_LOG")"
 fi
 setsid bash -c '
+    set -euo pipefail
     px4_dir="$1"
     world="$2"
     model_name="$3"
@@ -956,7 +979,19 @@ setsid bash -c '
     export PX4_GZ_WORLD="$world"
     export PX4_GZ_MODEL_NAME="$model_name"
     export PX4_GZ_NO_FOLLOW=1
-    exec make px4_sitl gz_x500
+    export PX4_SIM_MODEL=gz_x500
+    export GZ_IP=127.0.0.1
+
+    make px4_sitl_default
+
+    px4_binary="$px4_dir/build/px4_sitl_default/bin/px4"
+    gz_bridge_dir="$px4_dir/build/px4_sitl_default/src/modules/simulation/gz_bridge"
+    if [[ ! -x "$px4_binary" || ! -d "$gz_bridge_dir" ]]; then
+      printf "%s\n" "error: PX4 SITL build did not produce the expected px4 binary and gz_bridge directory." >&2
+      exit 2
+    fi
+    cd "$gz_bridge_dir"
+    exec "$px4_binary" -d
   ' _ "$PX4_DIR" "$PX4_GZ_WORLD" "$PX4_GZ_MODEL_NAME" "${DISPLAY:-:0}" "$PX4_PYTHON_EXECUTABLE" >"$PX4_CONSOLE_LOG" 2>&1 &
 children+=("$!")
 printf '%s\n' "PX4 SITL will attach to Gazebo model: $PX4_GZ_MODEL_NAME"
