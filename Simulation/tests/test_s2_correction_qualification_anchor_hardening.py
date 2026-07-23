@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 import pytest
@@ -31,7 +32,6 @@ AUTHORITATIVE_ROOT = Path(
     "exact-profile-freeze-88a360f"
 )
 ANCHOR_PATH = REPOSITORY_ROOT / FREEZE_ANCHOR_REPOSITORY_PATH
-SOURCE_REPOSITORY = Path("/home/moon/Desktop/영상감시시스템-s2-r4a-f1")
 
 
 def _anchor() -> dict:
@@ -42,6 +42,34 @@ def _copy_qualification(tmp_path: Path) -> Path:
     destination = tmp_path / "qualification"
     shutil.copytree(AUTHORITATIVE_ROOT, destination)
     return destination
+
+
+def _temporary_git_checkout(tmp_path: Path) -> Path:
+    root = tmp_path / "different-repository"
+    root.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=root, check=True)
+    (root / "README.md").write_text("temporary test checkout\n", encoding="utf-8")
+    subprocess.run(("git", "add", "README.md"), cwd=root, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Qualification Test",
+            "-c",
+            "user.email=qualification@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-q",
+            "-m",
+            "initial",
+        ),
+        cwd=root,
+        check=True,
+    )
+    return root
 
 
 def _write_json(path: Path, value: dict) -> None:
@@ -97,6 +125,72 @@ def _cli_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _verify_single_case_bundles(
+    monkeypatch: pytest.MonkeyPatch,
+    mutate_calibration_artifact,
+) -> None:
+    ledger_path = AUTHORITATIVE_ROOT / "data_access_ledger.jsonl"
+    ledger = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+    case_directories = {
+        role: next(
+            Path(entry["canonical_path"]).parent
+            for entry in ledger
+            if entry["role"] == role
+            and entry["operation"] == "read_r2_artifact"
+        )
+        for role in ("calibration", "validation")
+    }
+    reduced_ledger = [
+        entry
+        for entry in ledger
+        if entry["operation"] != "read_r2_artifact"
+        or Path(entry["canonical_path"]).parent == case_directories[entry["role"]]
+    ]
+    for sequence, entry in enumerate(reduced_ledger, start=1):
+        entry["sequence"] = sequence
+    planned_cases = {
+        role: [
+            {
+                "case_id": json.loads(
+                    (directory / "run_metadata.json").read_text(encoding="utf-8")
+                )["case_id"]
+            }
+        ]
+        for role, directory in case_directories.items()
+    }
+    original_external_file = qualification_module._external_ledger_file
+
+    def mutated_external_file(entry, *, name):
+        snapshot = original_external_file(entry, name=name)
+        path = Path(entry["canonical_path"])
+        if path.parent != case_directories["calibration"]:
+            return snapshot
+        raw_bytes = mutate_calibration_artifact(path.name, snapshot.raw_bytes)
+        return qualification_module.VerifiedFileBytes(
+            canonical_path=snapshot.canonical_path,
+            raw_bytes=raw_bytes,
+            sha256=snapshot.sha256,
+            stat_identity=snapshot.stat_identity,
+        )
+
+    monkeypatch.setattr(
+        qualification_module, "_external_ledger_file", mutated_external_file
+    )
+    qualification_module._verify_ledger_referenced_artifacts(
+        reduced_ledger,
+        {"calibration_case_count": 1, "validation_case_count": 1},
+        planned_cases,
+    )
+
+
+def _mutate_json_artifact(name: str, raw_bytes: bytes, artifact: str, mutate) -> bytes:
+    if name != artifact:
+        return raw_bytes
+    value = json.loads(raw_bytes)
+    mutate(value)
+    return (canonical_json(value) + "\n").encode("utf-8")
 
 
 @pytest.mark.parametrize(
@@ -183,6 +277,143 @@ def test_ledger_binding_requires_planned_cases() -> None:
         qualification_module._verify_ledger_referenced_artifacts
     ).parameters["planned_cases"]
     assert parameter.default is inspect.Parameter.empty
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    (
+        ("duplicate_header", "qualification_csv_schema_invalid"),
+        ("no_header", "qualification_csv_case_id_column_missing"),
+        ("missing_case_id", "qualification_csv_case_id_column_missing"),
+        ("no_data_rows", "qualification_csv_rows_empty"),
+        ("wrong_case_id", "qualification_csv_case_identity_mismatch"),
+    ),
+)
+def test_frozen_case_csv_schema_and_identity_are_required(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, expected_error: str
+) -> None:
+    def mutate_csv(name: str, raw_bytes: bytes) -> bytes:
+        if name != "pair_records.csv":
+            return raw_bytes
+        lines = raw_bytes.decode("utf-8").splitlines()
+        header = lines[0].split(",")
+        case_index = header.index("case_id")
+        if mutation == "duplicate_header":
+            header[(case_index + 1) % len(header)] = "case_id"
+            lines[0] = ",".join(header)
+        elif mutation == "no_header":
+            lines = []
+        elif mutation == "missing_case_id":
+            header[case_index] = "not_case_id"
+            lines[0] = ",".join(header)
+        elif mutation == "no_data_rows":
+            lines = [lines[0]]
+        else:
+            lines[1] = lines[1].replace(
+                lines[1].split(",")[case_index], "wrong-case-id", 1
+            )
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    with pytest.raises(ValueError, match=expected_error):
+        _verify_single_case_bundles(monkeypatch, mutate_csv)
+
+
+@pytest.mark.parametrize(
+    ("field", "mutation", "expected_error"),
+    (
+        (
+            "jsonl_line_count",
+            "missing",
+            "qualification_summary_jsonl_line_count_missing",
+        ),
+        (
+            "csv_data_row_count",
+            "missing",
+            "qualification_summary_csv_data_row_count_missing",
+        ),
+        (
+            "jsonl_line_count",
+            "non_int",
+            "qualification_summary:jsonl_line_count_exact_int_required",
+        ),
+        (
+            "csv_data_row_count",
+            "non_int",
+            "qualification_summary:csv_data_row_count_exact_int_required",
+        ),
+        ("jsonl_line_count", "zero", "qualification_pair_record_count_mismatch"),
+        ("csv_data_row_count", "zero", "qualification_pair_record_count_mismatch"),
+        (
+            "jsonl_line_count",
+            "mismatched",
+            "qualification_pair_record_count_mismatch",
+        ),
+        (
+            "csv_data_row_count",
+            "mismatched",
+            "qualification_pair_record_count_mismatch",
+        ),
+    ),
+)
+def test_frozen_summary_requires_exact_positive_artifact_counts(
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    def mutate_summary(value: dict) -> None:
+        if mutation == "missing":
+            del value[field]
+        elif mutation == "non_int":
+            value[field] = float(value[field])
+        elif mutation == "zero":
+            value[field] = 0
+        else:
+            value[field] += 1
+
+    with pytest.raises(ValueError, match=expected_error):
+        _verify_single_case_bundles(
+            monkeypatch,
+            lambda name, raw_bytes: _mutate_json_artifact(
+                name, raw_bytes, "run_summary.json", mutate_summary
+            ),
+        )
+
+
+@pytest.mark.parametrize("artifact", ("pair_records.jsonl", "pair_records.csv"))
+def test_frozen_summary_count_must_match_physical_artifact_rows(
+    monkeypatch: pytest.MonkeyPatch, artifact: str
+) -> None:
+    def remove_last_row(name: str, raw_bytes: bytes) -> bytes:
+        if name != artifact:
+            return raw_bytes
+        return ("\n".join(raw_bytes.decode("utf-8").splitlines()[:-1]) + "\n").encode(
+            "utf-8"
+        )
+
+    with pytest.raises(ValueError, match="qualification_pair_record_count_mismatch"):
+        _verify_single_case_bundles(monkeypatch, remove_last_row)
+
+
+def test_frozen_jsonl_and_csv_counts_must_be_equal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def shorten_csv_and_summary(name: str, raw_bytes: bytes) -> bytes:
+        if name == "pair_records.csv":
+            return (
+                "\n".join(raw_bytes.decode("utf-8").splitlines()[:-1]) + "\n"
+            ).encode("utf-8")
+        return _mutate_json_artifact(
+            name,
+            raw_bytes,
+            "run_summary.json",
+            lambda value: value.__setitem__(
+                "csv_data_row_count", value["csv_data_row_count"] - 1
+            ),
+        )
+
+    with pytest.raises(ValueError, match="qualification_pair_record_count_mismatch"):
+        _verify_single_case_bundles(monkeypatch, shorten_csv_and_summary)
 
 
 def test_coordinated_ledger_and_case_file_tamper_is_rejected_by_sidecar(
@@ -368,8 +599,9 @@ def test_cli_rejects_qualification_root_symlink_before_resolution(
         module._existing_external_directory(supplied, name="qualification root")
 
 
-def test_verify_cli_rejects_a_different_execution_checkout() -> None:
+def test_verify_cli_rejects_a_different_execution_checkout(tmp_path: Path) -> None:
     module = _cli_module()
+    different_repository = _temporary_git_checkout(tmp_path)
     args = module.parse_args(
         [
             "verify-freeze-anchor",
@@ -378,7 +610,7 @@ def test_verify_cli_rejects_a_different_execution_checkout() -> None:
             "--freeze-anchor",
             FREEZE_ANCHOR_REPOSITORY_PATH,
             "--repository-root",
-            str(SOURCE_REPOSITORY),
+            str(different_repository),
         ]
     )
     with pytest.raises(ValueError, match="verify repository root must be the CLI repository"):
@@ -533,13 +765,16 @@ def test_production_unseal_rejects_repository_identity_before_mutation(
     tmp_path: Path,
 ) -> None:
     root = _copy_qualification(tmp_path)
+    different_repository = _temporary_git_checkout(tmp_path)
     anchor = _anchor()
     before = _tree_snapshot(root)
     with pytest.raises(ValueError, match="evaluation_repository_identity_mismatch"):
         authorize_unseal(
             root,
-            freeze_anchor_path=SOURCE_REPOSITORY / FREEZE_ANCHOR_REPOSITORY_PATH,
-            repository_root=SOURCE_REPOSITORY,
+            freeze_anchor_path=(
+                different_repository / FREEZE_ANCHOR_REPOSITORY_PATH
+            ),
+            repository_root=different_repository,
             frozen_catalog_sha256=anchor["artifact_sha256"][
                 "frozen_correction_catalog.json"
             ],
