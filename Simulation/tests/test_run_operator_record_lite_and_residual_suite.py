@@ -192,7 +192,6 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
                     str(catalog),
                     "--output-dir",
                     str(output_dir),
-                    "--operator-arg=--no-px4",
                     "--print-only",
                 ]
             )
@@ -201,7 +200,7 @@ class RunOperatorRecordLiteAndResidualSuiteTests(unittest.TestCase):
         self.assertEqual(result["record_status"], "PRINT_ONLY")
         self.assertIn("--record-lite", result["record_command"])
         self.assertIn(str(record_dir), result["record_command"])
-        self.assertIn("--no-px4", result["record_command"])
+        self.assertNotIn("--no-px4", result["record_command"])
         self.assertIn("--latest-telemetry-root", result["suite_args"])
         self.assertEqual(result["record_telemetry_csv"], str(record_dir / "telemetry.csv"))
         self.assertFalse(result["record_telemetry_fresh"])

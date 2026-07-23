@@ -5,10 +5,14 @@ CALLER_CWD="$(pwd)"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-SHOW_HELP=false
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  SHOW_HELP=true
-fi
+for arg in "$@"; do
+  if [[ "$arg" == "--no-px4" ]]; then
+    printf '%s\n' \
+      "error: --no-px4 has been removed; PX4 SITL is required for operator view." \
+      "Configure a valid PX4-Autopilot checkout with --px4-dir DIR or PX4_DIR." >&2
+    exit 2
+  fi
+done
 
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/ros2-launch-log}"
 export GZ_CONFIG_HOME="${GZ_CONFIG_HOME:-/tmp/gz-config}"
@@ -154,11 +158,16 @@ if [[ -n "$SIM_SCENARIO_CONFIG" ]]; then
   [[ -n "$YOLO_PYTHONPATH_FROM_ENV" ]] && YOLO_PYTHONPATH="$YOLO_PYTHONPATH_ENV_VALUE"
 fi
 
-resolve_existing_dir() {
+is_px4_checkout() {
+  local candidate="${1:-}"
+  [[ -d "$candidate" && -f "$candidate/Makefile" && -d "$candidate/Tools" && -d "$candidate/src" ]]
+}
+
+resolve_px4_checkout() {
   local candidate
   for candidate in "$@"; do
     [[ -n "$candidate" ]] || continue
-    if [[ -d "$candidate" ]]; then
+    if is_px4_checkout "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -203,7 +212,7 @@ resolve_executable() {
 }
 
 if [[ -z "$PX4_DIR" ]]; then
-  PX4_DIR="$(resolve_existing_dir \
+  PX4_DIR="$(resolve_px4_checkout \
     "$ROOT_DIR/PX4-Autopilot" \
     "$ROOT_DIR/../PX4-Autopilot" \
     "$HOME/PX4-Autopilot" \
@@ -226,35 +235,6 @@ DEFAULT_YOLO_CONFIDENCE="${DEFAULT_YOLO_CONFIDENCE:-${YOLO_CONFIDENCE:-0.10}}"
 DEFAULT_YOLO_DEVICE="${DEFAULT_YOLO_DEVICE:-${YOLO_DEVICE:-cuda:0}}"
 DEFAULT_YOLO_HZ="${DEFAULT_YOLO_HZ:-${YOLO_TARGET_HZ:-40.0}}"
 DEFAULT_YOLO_IMGSZ="${DEFAULT_YOLO_IMGSZ:-${YOLO_IMGSZ:-1280}}"
-DEFAULT_YOLO_PYTHON="${DEFAULT_YOLO_PYTHON:-${YOLO_PYTHON:-}}"
-YOLO_BOOTSTRAP_PREFERRED_PYTHON="${DEFAULT_YOLO_PYTHON:-python3}"
-if [[ -n "$DEFAULT_YOLO_PYTHON" && "$DEFAULT_YOLO_PYTHON" == */* ]]; then
-  DEFAULT_YOLO_PYTHON="$(resolve_executable "$DEFAULT_YOLO_PYTHON" || true)"
-fi
-if [[ -n "${YOLO_PYTHONPATH:-}" && -d "$YOLO_PYTHONPATH" ]]; then
-  export PYTHONPATH="$YOLO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
-fi
-if [[ "$SHOW_HELP" != true && -z "$DEFAULT_YOLO_MODEL" ]]; then
-  printf '%s\n' "warning: YOLO model is not configured; stereo YOLO distance estimation will stay disabled." >&2
-fi
-if [[ "$SHOW_HELP" != true && -n "$DEFAULT_YOLO_MODEL" ]]; then
-  if DEFAULT_YOLO_PYTHON="$(bash "$ROOT_DIR/scripts/ensure_yolo_runtime.sh" \
-    --venv-dir "$ROOT_DIR/.venv" \
-    --preferred-python "$YOLO_BOOTSTRAP_PREFERRED_PYTHON"
-  )"; then
-    local_site_packages="$(find "$ROOT_DIR/.venv" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1 || true)"
-    if [[ -n "$local_site_packages" && -d "$local_site_packages" ]]; then
-      export PYTHONPATH="$local_site_packages${PYTHONPATH:+:$PYTHONPATH}"
-    fi
-  else
-    printf '%s\n' "warning: failed to prepare YOLO Python runtime; stereo YOLO distance estimation may stay disabled." >&2
-    DEFAULT_YOLO_PYTHON="$(resolve_executable "$DEFAULT_YOLO_PYTHON" python3 || true)"
-  fi
-fi
-if [[ "$SHOW_HELP" != true && -z "$DEFAULT_YOLO_PYTHON" ]]; then
-  printf '%s\n' "warning: no executable Python found for YOLO node; using ROS launch defaults." >&2
-fi
-OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-${DEFAULT_YOLO_PYTHON:-$(command -v python3 2>/dev/null || true)}}"
 
 if [[ -f "$ATTITUDE_CONFIG" ]]; then
   set -a
@@ -356,7 +336,6 @@ Options:
   YOLO_PYTHONPATH can point at a Python site-packages directory containing
                          cv2, torch, and ultralytics.
   --params               Also open Dynamic Reconfigure in rqt_gui.
-  --no-px4               Do not start PX4 SITL / MAVLink for QGC.
   --px4-dir DIR          PX4-Autopilot directory. Default: $PX4_DIR
   --px4-model-name NAME  Existing Gazebo model to attach PX4 to. Default: x500_15m.
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
@@ -386,7 +365,6 @@ run_mission=false
 mission_delay_s=25
 bag_view=false
 open_params=false
-start_px4=true
 show_detection_images=true
 headless=false
 launch_input=()
@@ -598,10 +576,6 @@ while (($#)); do
       open_params=true
       shift
       ;;
-    --no-px4)
-      start_px4=false
-      shift
-      ;;
     --px4-dir)
       PX4_DIR="${2:?missing value for --px4-dir}"
       shift 2
@@ -645,12 +619,42 @@ while (($#)); do
   esac
 done
 
-if [[ "$start_px4" == true && ! -d "${PX4_DIR:-}" ]]; then
+if ! is_px4_checkout "${PX4_DIR:-}"; then
   printf '%s\n' \
-    "error: PX4 mode was requested, but PX4-Autopilot was not found." \
-    "Set PX4_DIR to your PX4-Autopilot checkout or run with --no-px4." >&2
+    "error: PX4 SITL requires a valid PX4-Autopilot checkout." \
+    "Set PX4_DIR or pass --px4-dir DIR; the checkout must contain Makefile, Tools/, and src/." >&2
   exit 2
 fi
+
+DEFAULT_YOLO_PYTHON="${DEFAULT_YOLO_PYTHON:-${YOLO_PYTHON:-}}"
+YOLO_BOOTSTRAP_PREFERRED_PYTHON="${DEFAULT_YOLO_PYTHON:-python3}"
+if [[ -n "$DEFAULT_YOLO_PYTHON" && "$DEFAULT_YOLO_PYTHON" == */* ]]; then
+  DEFAULT_YOLO_PYTHON="$(resolve_executable "$DEFAULT_YOLO_PYTHON" || true)"
+fi
+if [[ -n "${YOLO_PYTHONPATH:-}" && -d "$YOLO_PYTHONPATH" ]]; then
+  export PYTHONPATH="$YOLO_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
+fi
+if [[ -z "$DEFAULT_YOLO_MODEL" ]]; then
+  printf '%s\n' "warning: YOLO model is not configured; stereo YOLO distance estimation will stay disabled." >&2
+fi
+if [[ -n "$DEFAULT_YOLO_MODEL" ]]; then
+  if DEFAULT_YOLO_PYTHON="$(bash "$ROOT_DIR/scripts/ensure_yolo_runtime.sh" \
+    --venv-dir "$ROOT_DIR/.venv" \
+    --preferred-python "$YOLO_BOOTSTRAP_PREFERRED_PYTHON"
+  )"; then
+    local_site_packages="$(find "$ROOT_DIR/.venv" -maxdepth 3 -type d -name site-packages 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$local_site_packages" && -d "$local_site_packages" ]]; then
+      export PYTHONPATH="$local_site_packages${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+  else
+    printf '%s\n' "warning: failed to prepare YOLO Python runtime; stereo YOLO distance estimation may stay disabled." >&2
+    DEFAULT_YOLO_PYTHON="$(resolve_executable "$DEFAULT_YOLO_PYTHON" python3 || true)"
+  fi
+fi
+if [[ -z "$DEFAULT_YOLO_PYTHON" ]]; then
+  printf '%s\n' "warning: no executable Python found for YOLO node; using ROS launch defaults." >&2
+fi
+OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-${DEFAULT_YOLO_PYTHON:-$(command -v python3 2>/dev/null || true)}}"
 
 if [[ "$GAZEBO_MAJOR_VERSION" -ge 7 ]] && ! command -v gz >/dev/null 2>&1; then
   printf '%s\n' \
@@ -934,11 +938,10 @@ children+=("$!")
 
 sleep 8
 
-if [[ "$start_px4" == true ]]; then
-  if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
-    mkdir -p "$(dirname "$PX4_CONSOLE_LOG")"
-  fi
-  setsid bash -c '
+if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
+  mkdir -p "$(dirname "$PX4_CONSOLE_LOG")"
+fi
+setsid bash -c '
     px4_dir="$1"
     world="$2"
     model_name="$3"
@@ -955,12 +958,11 @@ if [[ "$start_px4" == true ]]; then
     export PX4_GZ_NO_FOLLOW=1
     exec make px4_sitl gz_x500
   ' _ "$PX4_DIR" "$PX4_GZ_WORLD" "$PX4_GZ_MODEL_NAME" "${DISPLAY:-:0}" "$PX4_PYTHON_EXECUTABLE" >"$PX4_CONSOLE_LOG" 2>&1 &
-  children+=("$!")
-  printf '%s\n' "PX4 SITL will attach to Gazebo model: $PX4_GZ_MODEL_NAME"
-  printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550."
-  if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
-    printf '%s\n' "PX4 console log: $PX4_CONSOLE_LOG"
-  fi
+children+=("$!")
+printf '%s\n' "PX4 SITL will attach to Gazebo model: $PX4_GZ_MODEL_NAME"
+printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550."
+if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
+  printf '%s\n' "PX4 console log: $PX4_CONSOLE_LOG"
 fi
 
 perspective_file="$ROOT_DIR/config/operator_rqt.perspective"
@@ -1030,19 +1032,13 @@ if [[ -n "$record_mode" ]]; then
 fi
 
 if [[ "$run_mission" == true ]]; then
-  if [[ "$start_px4" != true ]]; then
-    printf '%s\n' "warning: --auto-mission ignored because --no-px4 was set." >&2
-  else
-    setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_auto_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
-    children+=("$!")
-    printf '%s\n' "PX4 auto mission will start after ${mission_delay_s}s."
-  fi
+  setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_auto_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
+  children+=("$!")
+  printf '%s\n' "PX4 auto mission will start after ${mission_delay_s}s."
 fi
 
 printf '%s\n' "Operator view started."
-if [[ "$start_px4" == true ]]; then
-  printf '%s\n' "PX4/QGC mode: QGC controls the existing Gazebo model $PX4_GZ_MODEL_NAME."
-fi
+printf '%s\n' "PX4/QGC mode: QGC controls the existing Gazebo model $PX4_GZ_MODEL_NAME."
 if [[ "$bag_view" == true ]]; then
   printf '%s\n' "The single rqt_gui window contains left/right camera views and rqt_bag."
 elif [[ "$headless" == true ]]; then
@@ -1051,7 +1047,7 @@ else
   printf '%s\n' "The single rqt_gui window contains left/right camera views and Forward/Right/Down plots."
 fi
 printf '%s\n' "Use QGC for normal control of the existing x500_15m target."
-if [[ "$run_mission" == true && "$start_px4" == true ]]; then
+if [[ "$run_mission" == true ]]; then
   printf '%s\n' "Auto mission command: ./run_auto_mission.sh ${mission_args[*]}"
 fi
 

@@ -218,8 +218,8 @@ PYTHON_EXECUTABLE="$PWD/Simulation/.venv/bin/python" \
 ```
 
 현재 `run_operator_view.sh`는 `Simulation/PX4-Autopilot`을 자동으로 찾고,
-PX4 빌드에는 `Simulation/.venv/bin/python`을 사용한다. 따라서 아래 실행은
-`--no-px4` 없이 PX4 SITL을 함께 시작한다.
+PX4 빌드에는 `Simulation/.venv/bin/python`을 사용한다. PX4 SITL은 필수이며
+아래 실행에서 항상 함께 시작한다.
 
 ```bash
 ./Simulation/run_operator_view.sh
@@ -3575,7 +3575,7 @@ runtime 관측 외란 조건처럼 profile을 여러 개 보관해야 하는 경
 ./run_operator_view_with_calibration_profile.sh \
   --selector-json Simulation/results/rtk_stereo_runtime_observation_stress_EXP_20260617/runtime_profile_label_selector.json \
   --deployment-label runtime_observation_stress \
-  -- --no-px4 yolo_target_hz:=0.0
+  -- yolo_target_hz:=0.0
 ```
 
 wrapper는 selector 검사를 먼저 수행한 뒤 선택된 label의 `package_paths` 또는
@@ -4551,7 +4551,7 @@ python3 Simulation/scripts/check_stereodistance_operator_view_launch.py \
 ```bash
 ./Simulation/run_operator_view_with_calibration_profile.sh \
   --package-dir Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_selection/range_priority_candidate_package \
-  -- --no-px4 yolo_target_hz:=0.0
+  -- yolo_target_hz:=0.0
 ```
 
 다른 policy winner도 같은 candidate package/operator-view gate를 통과하는지 비교하려면
@@ -5434,7 +5434,7 @@ ROS2/Gazebo operator view에서 검증된 배포 패키지를 바로 적용하�
 ./run_operator_view_with_calibration_profile.sh \
   --package-dir Simulation/results/rtk_stereo_acceptance_matrix_summary/deployment_package \
   --print-only \
-  -- --no-px4 yolo_target_hz:=0.0
+  -- yolo_target_hz:=0.0
 ```
 
 같은 조건을 JSON/TXT evidence로 남기려면 다음 checker를 실행한다.
@@ -6114,16 +6114,11 @@ Z축 비교의 Ground Truth 기준점은 `vehicle_reference_link`이며, `base_l
 
 ## QGroundControl
 
-`./run_operator_view.sh` 기본 실행은 PX4 SITL을 standalone Gazebo attach 모드로 시작합니다.
+`./run_operator_view.sh`는 PX4 SITL을 필수로 standalone Gazebo attach 모드에서 시작합니다.
 PX4는 이미 world 안에 있는 15 m급 `x500_15m` 타겟에 붙고, QGC는 PX4의 MAVLink UDP 14550 heartbeat를 받아 자동 연결됩니다. PX4 콘솔 출력은 기본적으로 버립니다. 디버깅 로그가 필요하면 `PX4_CONSOLE_LOG=/tmp/px4_qgc.log ./run_operator_view.sh`처럼 실행합니다.
 
-PX4를 끄고 카메라/거리 계산만 실행하려면:
-
-```bash
-./run_operator_view.sh --no-px4
-```
-
-PX4/QGC 제어가 필요하면 `./run_operator_view.sh`를 기본값으로 다시 실행합니다.
+PX4 없는 operator-view 실행은 지원하지 않습니다. `PX4_DIR` 또는 `--px4-dir DIR`로
+유효한 PX4-Autopilot checkout을 지정해야 하며, 찾지 못하면 실행 전에 종료합니다.
 Ground Truth adapter는 Gazebo `gz.msgs.Pose_V` 토픽(`/world/stereo_ground_drone/pose/info`)에서 `name == "base_link"`인 entity의 simulation stamp와 world ENU pose를 읽어 `/simulation/ground_truth/vehicle_reference_link` (`geometry_msgs/msg/PoseStamped`, `frame_id=gazebo_world_enu`)로 발행합니다. `base_link` pose에 zero transform을 적용한 semantic reference가 `vehicle_reference_link`이며, distance node가 이를 고정 `baseline_center_frd`로 변환합니다. pose 토픽을 읽지 못하면 GT unavailable로 표시하고 model-origin, PX4, 계획 거리값으로 fallback하지 않습니다.
 반복 가능한 접근 실험이 필요하면 QGC mission 또는 PX4용 MAVLink/offboard 명령을 사용합니다.
 
@@ -6165,8 +6160,7 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 ```bash
 ./run_operator_view_with_calibration_profile.sh \
   --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/fresh_guard_profile_sweep_followup/away_w100_a0p75/active_runtime_profile.json \
-  --observation-fusion-manifest Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json \
-  -- --no-px4
+  --observation-fusion-manifest Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json
 ```
 
 runtime 입력은 영상 기반 `left_u_px/left_v_px/measured_disparity_px`와 그로부터 계산된 raw stereo-center RDF뿐입니다. PX4/RTK/NED truth는 calibration/evaluation evidence로만 사용하고 runtime path에는 들어가지 않습니다. `/stereo/estimated_position` 및 `/stereo/corrected_position` 공개 topic은 기존 FRD+range(`forward,right,down,range`) 순서를 유지합니다.
@@ -6186,8 +6180,7 @@ runtime 입력은 영상 기반 `left_u_px/left_v_px/measured_disparity_px`와 �
   --profile-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/common_csv_pooled_profile_matrix_all248_no_active/deployable_profile_policy_package_suite/range_priority/scenario_loso_selector_package_rmse/packages/run_bbox_quantization_stress_seed_20260618/active_runtime_profile.json \
   --observation-fusion-manifest Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_deployment_package/observation_fusion_runtime_manifest.json \
   --disparity-residual-selector-json Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_disparity_residual_probe/scenario_residual_catalog/disparity_residual_profile_label_selector.json \
-  --deployment-label disparity_noise_stress \
-  -- --no-px4
+  --deployment-label disparity_noise_stress
 ```
 
 이 명령의 residual selector는 명시 label만 사용합니다. 실제 자동 selector를 만들기 전까지는 운영자가 deployment label을 고르거나, 별도 truth-free 관측 stress classifier가 label을 제공해야 합니다.
@@ -6252,7 +6245,6 @@ Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_resi
   --require-stable-label \
   --min-distance-margin 0.5 \
   --operator-arg=--headless \
-  --operator-arg=--no-px4 \
   --operator-arg=yolo_target_hz:=0.0 \
   --operator-arg=gz_gui:=false \
   --operator-arg=enable_synthetic_detections:=true
@@ -6265,7 +6257,6 @@ Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_resi
   --profile-json <active_runtime_profile.json> \
   -- \
   --headless \
-  --no-px4 \
   yolo_target_hz:=0.0 \
   enable_external_bbox_detections:=true \
   external_bbox_detections_topic:=/yolo/stereo_bbox \
@@ -6291,7 +6282,6 @@ Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_resi
   --require-stable-label \
   --min-distance-margin 0.5 \
   --operator-arg=--headless \
-  --operator-arg=--no-px4 \
   --operator-arg=yolo_target_hz:=0.0 \
   --operator-arg=gz_gui:=false \
   --operator-arg=enable_external_bbox_detections:=true \
@@ -6325,7 +6315,6 @@ Simulation/.venv/bin/python Simulation/scripts/run_operator_record_lite_and_resi
   --external-bbox-preflight-sample-seconds 5 \
   --external-bbox-preflight-min-valid-pairs 5 \
   --operator-arg=--headless \
-  --operator-arg=--no-px4 \
   --operator-arg=yolo_target_hz:=0.0 \
   --operator-arg=gz_gui:=false \
   --operator-arg=enable_external_bbox_detections:=true \
