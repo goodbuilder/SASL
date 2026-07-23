@@ -1,9 +1,37 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from math import isfinite
 from typing import Mapping, Any
+
+
+def _materialize_timestamp_metadata(metadata: Any) -> dict[str, Any]:
+    """Detach payload metadata after validating its explicit pair shape."""
+
+    if metadata is None:
+        return {}
+    if isinstance(metadata, Mapping):
+        raw_items = tuple(metadata.items())
+    elif type(metadata) in (tuple, list):
+        raw_items = metadata
+    else:
+        raise TypeError("timestamp metadata must be a Mapping, tuple, or list")
+
+    materialized: dict[str, Any] = {}
+    for raw_item in raw_items:
+        if type(raw_item) not in (tuple, list):
+            raise TypeError("each timestamp metadata item must be a tuple or list")
+        if len(raw_item) != 2:
+            raise ValueError("each timestamp metadata item must contain exactly two values")
+        key, value = raw_item
+        if type(key) is not str:
+            raise TypeError("timestamp metadata keys must be strings")
+        if key in materialized:
+            raise ValueError(f"duplicate timestamp metadata key: {key}")
+        materialized[key] = value
+    return deepcopy(materialized)
 
 
 @dataclass(frozen=True)
@@ -20,16 +48,35 @@ class DetectionObservation:
     class_id: int
     class_name: str | None = None
     timestamp_metadata: dict[str, Any] = field(default_factory=dict)
+    candidate_class_ids: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "candidate_class_ids",
+            tuple(int(class_id) for class_id in self.candidate_class_ids),
+        )
 
     @property
     def center(self) -> tuple[float, float]:
         return ((self.x1 + self.x2) / 2.0, (self.y1 + self.y2) / 2.0)
+
+    @property
+    def same_class_candidate_count(self) -> int:
+        candidates = self.candidate_class_ids or (self.class_id,)
+        return sum(class_id == self.class_id for class_id in candidates)
 
     @classmethod
     def from_payload(cls, camera: str, payload: Mapping[str, object]) -> "DetectionObservation | None":
         best = payload.get("best_detection")
         if not isinstance(best, Mapping):
             return None
+        candidates = payload.get("detections")
+        candidate_class_ids = tuple(
+            int(candidate["class_id"])
+            for candidate in candidates
+            if isinstance(candidate, Mapping) and candidate.get("class_id") is not None
+        ) if isinstance(candidates, (list, tuple)) else ()
         return cls(
             camera=camera,
             timestamp_s=float(payload["timestamp_s"]),
@@ -42,8 +89,32 @@ class DetectionObservation:
             confidence=float(best["confidence"]),
             class_id=int(best["class_id"]),
             class_name=str(best["class_name"]) if best.get("class_name") is not None else None,
-            timestamp_metadata=dict(payload.get("timestamp_metadata") or {}),
+            timestamp_metadata=_materialize_timestamp_metadata(
+                payload.get("timestamp_metadata")
+            ),
+            candidate_class_ids=candidate_class_ids,
         )
+
+
+def correspondence_rejection_reason(
+    left: DetectionObservation | None,
+    right: DetectionObservation | None,
+) -> str | None:
+    """Return a deterministic fail-closed reason for the minimal B1 matcher."""
+
+    if left is None:
+        return "missing_left_detection"
+    if right is None:
+        return "missing_right_detection"
+    if left.same_class_candidate_count > 1:
+        return "ambiguous_left_candidates"
+    if right.same_class_candidate_count > 1:
+        return "ambiguous_right_candidates"
+    if left.same_class_candidate_count != 1 or right.same_class_candidate_count != 1:
+        return "ambiguous_correspondence"
+    if left.class_id != right.class_id:
+        return "correspondence_class_mismatch"
+    return None
 
 
 @dataclass(frozen=True)
@@ -112,7 +183,7 @@ def match_stereo_observations(
     sync_quality: str = "unknown",
     warnings: tuple[str, ...] = (),
 ) -> StereoMatch | None:
-    if left is None or right is None:
+    if correspondence_rejection_reason(left, right) is not None:
         return None
     left_center_x, left_center_y = left.center
     right_center_x, right_center_y = right.center

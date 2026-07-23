@@ -1,5 +1,6 @@
 import struct
 import time
+from math import degrees
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,148 @@ def detection(
         class_id=cls,
         class_name=f"class {cls}",
         timestamp_metadata=dict(timestamp_metadata or {}),
+    )
+
+
+def test_measurement_attempt_generation_identity_is_unique_with_same_session_id() -> None:
+    from wiris_stereo_distance.gui import _new_measurement_attempt_generation_id
+
+    session_id = "20260722_120000"
+
+    first = _new_measurement_attempt_generation_id(session_id)
+    second = _new_measurement_attempt_generation_id(session_id)
+
+    assert first != second
+    assert first.startswith(f"{session_id}-")
+    assert second.startswith(f"{session_id}-")
+
+
+def recording_attempt(widget, estimate, *, baseline_m: float = 0.3, translation=None):
+    """Build the immutable selected-input fixture consumed by valid-row recording."""
+
+    from wiris_stereo_distance.measurement_attempt import (
+        AttitudeSnapshot,
+        BaselineSnapshot,
+        DetectionSnapshot,
+        GeometryConfigSnapshot,
+        GpsSnapshot,
+        MeasurementAttempt,
+        StereoIntrinsicsSnapshot,
+        detection_pair_key,
+    )
+    def selected_detection(camera: str):
+        candidate = getattr(estimate, camera)
+        if not all(hasattr(candidate, name) for name in ("x1", "y1", "x2", "y2", "width", "height")):
+            candidate = detection(
+                camera,
+                x1=0.0,
+                y1=0.0,
+                x2=20.0,
+                y2=20.0,
+                t=float(candidate.timestamp_s),
+            )
+        return candidate
+
+    left_source = selected_detection("left")
+    right_source = selected_detection("right")
+    left_detection = DetectionSnapshot.from_observation(
+        left_source, pairing_timestamp_basis="detection", pairing_timestamp_s=left_source.timestamp_s
+    )
+    right_detection = DetectionSnapshot.from_observation(
+        right_source, pairing_timestamp_basis="detection", pairing_timestamp_s=right_source.timestamp_s
+    )
+    left_state = widget.latest_extrinsics.get("left")
+    right_state = widget.latest_extrinsics.get("right")
+    left_attitude = None if left_state is None else AttitudeSnapshot.from_state(left_state)
+    right_attitude = None if right_state is None else AttitudeSnapshot.from_state(right_state)
+    left_gps_state = widget.latest_gps.get("left")
+    right_gps_state = widget.latest_gps.get("right")
+    left_gps = None if left_gps_state is None else GpsSnapshot.from_state(left_gps_state)
+    right_gps = None if right_gps_state is None else GpsSnapshot.from_state(right_gps_state)
+    intrinsics = (
+        None
+        if widget.active_intrinsics is None
+        else StereoIntrinsicsSnapshot.from_result(
+            widget.active_intrinsics,
+            active_zoom_level=widget.zoom_level_spin.value(),
+            selected_profile_path="test-fixture.json",
+        )
+    )
+    basis = None if translation is None or left_attitude is None else left_attitude.q
+    baseline = BaselineSnapshot(
+        source="gps-rtk",
+        baseline_m=baseline_m,
+        ned_right_from_left_m=(0.0, baseline_m, 0.0),
+        translation_right_in_left_rdf_m=translation,
+        left_basis_quaternion_wxyz=basis,
+        fix_quality="GOOD",
+        warnings=(),
+        usable_for_translation=translation is not None,
+        unusable_reason="" if translation is not None else "test fixture has no translation",
+        gps_pair_delta_s=(
+            None if left_gps is None or right_gps is None else abs(left_gps.timestamp_s - right_gps.timestamp_s)
+        ),
+        left_age_at_capture_s=0.1 if left_gps is not None else None,
+        right_age_at_capture_s=0.2 if right_gps is not None else None,
+        left_age_from_detection_midpoint_s=None,
+        right_age_from_detection_midpoint_s=None,
+        left_basis_attitude_monotonic_s=(
+            None if left_attitude is None or translation is None else left_attitude.timestamp_s
+        ),
+    )
+    key = detection_pair_key(
+        triangulation_source="pixhawk",
+        timestamp_basis="detection",
+        left=left_source,
+        right=right_source,
+        left_pairing_timestamp_s=left_source.timestamp_s,
+        right_pairing_timestamp_s=right_source.timestamp_s,
+    )
+    return MeasurementAttempt(
+        attempt_id=1,
+        attempt_session_id=widget.recording_session_id or "test",
+        detection_pair_key=key,
+        created_monotonic_s=max(left_source.timestamp_s, right_source.timestamp_s),
+        created_wall_s=1000.0,
+        detection_midpoint_monotonic_s=(left_source.timestamp_s + right_source.timestamp_s) / 2.0,
+        timestamp_basis="detection",
+        triangulation_source="pixhawk",
+        left_detection=left_detection,
+        right_detection=right_detection,
+        left_attitude=left_attitude,
+        right_attitude=right_attitude,
+        left_gps=left_gps,
+        right_gps=right_gps,
+        intrinsics=intrinsics,
+        baseline=baseline,
+        geometry_config=GeometryConfigSnapshot(
+            focal_length_px=widget.focal_spin.value(),
+            max_time_delta_s=None,
+            max_vertical_delta_px=None,
+            require_same_class=False,
+            timestamp_basis="detection",
+            manual_focal_override=widget.manual_focal_checkbox.isChecked(),
+        ),
+        left_attitude_age_s=getattr(estimate, "left_attitude_age_s", None),
+        right_attitude_age_s=getattr(estimate, "right_attitude_age_s", None),
+        attitude_pair_delta_s=getattr(estimate, "attitude_pair_delta_s", None),
+        relative_roll_deg=getattr(estimate, "relative_roll_deg", None),
+        relative_pitch_deg=getattr(estimate, "relative_pitch_deg", None),
+        relative_yaw_deg=getattr(estimate, "relative_yaw_deg", None),
+        source_quality=estimate.sync_quality,
+        warnings=tuple(estimate.warnings),
+    )
+
+
+def set_selected_gps_baseline(widget, *, timestamp_s: float = 10.0, baseline_m: float = 0.3) -> None:
+    from wiris_stereo_distance.rtk_geometry import EARTH_RADIUS_M, GpsPositionState
+
+    longitude_delta_deg = degrees(baseline_m / EARTH_RADIUS_M)
+    widget.latest_gps["left"] = GpsPositionState(
+        "left", "/uav_0", timestamp_s, "gps", 0.0, 127.0, 10.0, fix_type=6
+    )
+    widget.latest_gps["right"] = GpsPositionState(
+        "right", "/uav_1", timestamp_s, "gps", 0.0, 127.0 + longitude_delta_deg, 10.0, fix_type=6
     )
 
 
@@ -3513,6 +3656,7 @@ def test_gps_only_baseline_can_drive_pixhawk_translation_when_fixed_not_required
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
 
     now_s = time.monotonic()
     widget._update_gps(
@@ -3544,7 +3688,7 @@ def test_gps_only_baseline_can_drive_pixhawk_translation_when_fixed_not_required
         q=(1.0, 0.0, 0.0, 0.0),
     )
 
-    translation = widget._translation_right_in_left_m()
+    translation = widget._latest_translation_right_in_left_m_for_diagnostics()
 
     assert translation is not None
     assert widget.latest_rtk_baseline is not None
@@ -3621,6 +3765,7 @@ def test_non_rtk_fixed_gps_can_drive_translation(monkeypatch) -> None:
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
 
     now_s = time.monotonic()
     widget._update_gps(
@@ -3642,7 +3787,7 @@ def test_non_rtk_fixed_gps_can_drive_translation(monkeypatch) -> None:
         q=(1.0, 0.0, 0.0, 0.0),
     )
 
-    assert widget._translation_right_in_left_m() is not None
+    assert widget._latest_translation_right_in_left_m_for_diagnostics() is not None
     assert "RTK Fixed: NO" in widget.rtk_fixed_status_label.text()
     assert "사용 가능" in widget.rtk_fixed_status_label.text()
     assert widget._active_baseline_m()[1] == "gps-rtk"
@@ -3663,6 +3808,7 @@ def test_pixhawk_translation_scales_to_measurement_baseline(monkeypatch) -> None
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
 
     widget.latest_rtk_baseline = RtkBaselineEstimate(
         baseline_m=0.374,
@@ -3687,7 +3833,7 @@ def test_pixhawk_translation_scales_to_measurement_baseline(monkeypatch) -> None
         q=(1.0, 0.0, 0.0, 0.0),
     )
 
-    translation = widget._translation_right_in_left_m()
+    translation = widget._latest_translation_right_in_left_m_for_diagnostics()
     assert translation is not None
     assert abs(sqrt(sum(component * component for component in translation)) - 0.3) < 1e-6
     assert translation == (0.3, 0.0, 0.0)
@@ -3706,6 +3852,7 @@ def test_pixhawk_translation_uses_nominal_shared_rig_without_mount_correction_ui
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
 
     widget.latest_rtk_baseline = RtkBaselineEstimate(
         baseline_m=1.0,
@@ -3730,7 +3877,7 @@ def test_pixhawk_translation_uses_nominal_shared_rig_without_mount_correction_ui
         q=(1.0, 0.0, 0.0, 0.0),
     )
 
-    translation = widget._translation_right_in_left_m()
+    translation = widget._latest_translation_right_in_left_m_for_diagnostics()
 
     assert translation is not None
     assert tuple(round(component, 6) for component in translation) == (1.0, 0.0, 0.0)
@@ -3750,6 +3897,7 @@ def test_pixhawk_translation_waits_without_gps_baseline(monkeypatch) -> None:
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
 
     widget.latest_rtk_baseline = None
     now_s = time.monotonic()
@@ -3764,7 +3912,7 @@ def test_pixhawk_translation_waits_without_gps_baseline(monkeypatch) -> None:
         q=(1.0, 0.0, 0.0, 0.0),
     )
 
-    assert widget._translation_right_in_left_m() is None
+    assert widget._latest_translation_right_in_left_m_for_diagnostics() is None
 
     widget.deleteLater()
     _ = app
@@ -5337,6 +5485,7 @@ def test_baseline_input_selection_drives_live_rtk_baseline(monkeypatch) -> None:
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
     now_s = time.monotonic()
     left_gps1 = GpsPositionState("left", "/uav_0", now_s, "gps1", 37.0, 127.0, 10.0, fix_type=6)
     right_gps1 = GpsPositionState("right", "/uav_1", now_s, "gps1", 37.0, 127.000050, 10.0, fix_type=6)
@@ -5888,14 +6037,15 @@ def test_calibration_capture_rejects_stereo_pair_when_rtcp_delta_is_large(tmp_pa
     _ = app
 
 
-def test_camera_parameters_tab_shows_sources_without_pixhawk() -> None:
+def test_camera_parameters_tab_shows_sources_without_pixhawk(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
-    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+    import wiris_stereo_distance.gui as gui
 
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = WirisStereoDistancePanel()
+    widget = gui.WirisStereoDistancePanel()
     widget.last_calibration_result = StereoIntrinsicsResult(
         left=CameraIntrinsics(
             width=1280,
@@ -5930,16 +6080,17 @@ def test_camera_parameters_tab_shows_sources_without_pixhawk() -> None:
     _ = app
 
 
-def test_pixhawk_rtk_can_drive_triangulation() -> None:
+def test_pixhawk_rtk_can_drive_triangulation(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
-    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+    import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
     from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
 
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = WirisStereoDistancePanel()
+    widget = gui.WirisStereoDistancePanel()
     intrinsics = CameraIntrinsics(
         width=1280,
         height=720,
@@ -5962,8 +6113,7 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
         right_age_s=0.0,
         fix_quality="GOOD",
     )
-    widget.latest_gps["left"] = GpsPositionState("left", "/uav_0", 10.0, "gps", 37.0, 127.0, 10.0, fix_type=6)
-    widget.latest_gps["right"] = GpsPositionState("right", "/uav_1", 10.0, "gps", 37.0, 127.000003, 10.0, fix_type=6)
+    set_selected_gps_baseline(widget, timestamp_s=10.0, baseline_m=0.3)
     for camera in ("left", "right"):
         widget._update_extrinsic(
             camera,
@@ -6042,7 +6192,274 @@ def test_pixhawk_rtk_can_drive_triangulation() -> None:
     _ = app
 
 
-def test_checkerboard_triangulation_marks_pixhawk_attitude_not_used() -> None:
+def test_measurement_attempt_freezes_gui_geometry_and_valid_row_provenance(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
+    from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
+    intrinsics_a = CameraIntrinsics(
+        1280,
+        720,
+        [[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+        [0.0],
+        0.2,
+        20,
+    )
+    widget.last_calibration_result = StereoIntrinsicsResult(
+        intrinsics_a, intrinsics_a, CheckerboardConfig(9, 6, 0.03)
+    )
+    widget.apply_intrinsics_to_distance()
+    set_selected_gps_baseline(widget, timestamp_s=10.0, baseline_m=0.3)
+    widget.latest_rtk_baseline = RtkBaselineEstimate(0.3, 0.0, 0.3, 0.0, 0.0, 0.0, "GOOD")
+    for camera in ("left", "right"):
+        widget._update_extrinsic(
+            camera,
+            CameraExtrinsicState(
+                camera,
+                camera,
+                0.0,
+                0.0,
+                0.0,
+                10.0,
+                f"/{camera}/attitude-a",
+                (1.0, 0.0, 0.0, 0.0),
+                9.0,
+            ),
+        )
+    left = detection("left", x1=630, y1=350, x2=650, y2=370, t=10.0)
+    right = detection("right", x1=603, y1=350, x2=623, y2=370, t=10.0)
+    widget.detection_buffers["left"].add(left)
+    widget.detection_buffers["right"].add(right)
+    pair = widget._matched_detection_pair()
+    assert pair is not None
+    attempt_a = widget._build_measurement_attempt(pair)
+    geometry_a = calculate_measurement_geometry(attempt_a)
+    assert geometry_a.triangulated is not None
+    hash_a = attempt_a.canonical_sha256()
+
+    intrinsics_b = CameraIntrinsics(
+        1280,
+        720,
+        [[1200.0, 0.0, 620.0], [0.0, 1200.0, 350.0], [0.0, 0.0, 1.0]],
+        [0.1, 0.0, 0.0, 0.0, 0.0],
+        9.0,
+        1,
+    )
+    widget.active_intrinsics = StereoIntrinsicsResult(
+        intrinsics_b, intrinsics_b, CheckerboardConfig(9, 6, 0.03)
+    )
+    widget.zoom_level_spin.blockSignals(True)
+    widget.zoom_level_spin.setValue(3)
+    widget.zoom_level_spin.blockSignals(False)
+    widget.attitude_buffers["left"].clear()
+    widget.attitude_buffers["right"].clear()
+    for camera in ("left", "right"):
+        state_b = CameraExtrinsicState(
+            camera,
+            camera,
+            0.0,
+            0.0,
+            180.0,
+            10.0,
+            f"/{camera}/attitude-b",
+            (0.0, 0.0, 0.0, 1.0),
+            99.0,
+        )
+        widget.latest_extrinsics[camera] = state_b
+        widget.attitude_buffers[camera].add(state_b)
+    widget.latest_gps["left"] = GpsPositionState(
+        "left", "left", 20.0, "/left/gps-b", 1.0, 1.0, 1.0, fix_type=3
+    )
+    widget.latest_gps["right"] = GpsPositionState(
+        "right", "right", 21.0, "/right/gps-b", 2.0, 2.0, 2.0, fix_type=3
+    )
+    widget.latest_rtk_baseline = RtkBaselineEstimate(99.0, 99.0, 0.0, 0.0, 0.0, 0.0, "DEGRADED")
+
+    assert widget._build_measurement_attempt(pair) is attempt_a
+    assert widget._translation_right_in_left_m(attempt_a) == attempt_a.translation_right_in_left_m
+    geometry_after = calculate_measurement_geometry(attempt_a)
+    assert geometry_after.triangulated is not None
+    assert geometry_after.triangulated.point_left_rdf_m == pytest.approx(
+        geometry_a.triangulated.point_left_rdf_m, abs=1e-9
+    )
+    assert geometry_after.triangulated.range_m == pytest.approx(geometry_a.triangulated.range_m, abs=1e-9)
+    assert attempt_a.canonical_sha256() == hash_a
+
+    widget.distance_recording_enabled = True
+    widget._refresh_distance()
+    row = widget.distance_recording_rows[-1]
+    assert row["measurement_attempt_id"] == str(attempt_a.attempt_id)
+    assert row["measurement_attempt_sha256"] == hash_a
+    assert row["left_pixhawk_q"] == "[1.0,0.0,0.0,0.0]"
+    assert row["left_pixhawk_topic"] == "/left/attitude-a"
+    assert row["left_gps_lon_deg"] == "127.000000000"
+    assert row["left_intr_fx"] == "900.000000"
+    assert row["intrinsics_zoom_level"] != "3"
+    assert row["translation_right_in_left_x_m"] == "0.300000"
+    assert row["rtk_baseline_east_m"] == "0.300000"
+    assert row["measurement_frame"] == "left_camera_rdf"
+
+    widget._stop_calibration_preview_worker()
+    widget.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_attempt_identity_is_monotonic_across_failed_geometry(monkeypatch) -> None:
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
+    first_pair = SimpleNamespace(
+        left=detection("left", x1=630, y1=350, x2=650, y2=370, t=1.0),
+        right=detection("right", x1=600, y1=350, x2=620, y2=370, t=1.0),
+    )
+    first = widget._build_measurement_attempt(first_pair)
+    assert widget._build_measurement_attempt(first_pair) is first
+    assert calculate_measurement_geometry(first).triangulated is None
+
+    second_pair = SimpleNamespace(
+        left=detection("left", x1=630, y1=350, x2=650, y2=370, t=2.0),
+        right=detection("right", x1=600, y1=350, x2=620, y2=370, t=2.0),
+    )
+    second = widget._build_measurement_attempt(second_pair)
+    assert second.attempt_id == first.attempt_id + 1
+
+    widget._stop_calibration_preview_worker()
+    widget.deleteLater()
+    app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("left_class", "right_class", "left_candidates", "right_candidates", "expected_reason"),
+    (
+        (1, 2, (1,), (2,), "correspondence_class_mismatch"),
+        (1, 1, (1, 1), (1,), "ambiguous_left_candidates"),
+        (1, 1, (1,), (1, 1), "ambiguous_right_candidates"),
+    ),
+)
+def test_measurement_correspondence_rejects_class_mismatch_and_ambiguity(
+    monkeypatch,
+    left_class,
+    right_class,
+    left_candidates,
+    right_candidates,
+    expected_reason,
+) -> None:
+    from dataclasses import replace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    left = replace(
+        detection("left", x1=630, y1=350, x2=650, y2=370, t=10.0),
+        class_id=left_class,
+        candidate_class_ids=left_candidates,
+    )
+    right = replace(
+        detection("right", x1=600, y1=350, x2=620, y2=370, t=10.0),
+        class_id=right_class,
+        candidate_class_ids=right_candidates,
+    )
+    widget.detection_buffers["left"].add(left)
+    widget.detection_buffers["right"].add(right)
+
+    assert widget._matched_detection_pair() is None
+    assert widget._last_correspondence_rejection_reason == expected_reason
+    widget._refresh_distance()
+    assert len(widget.distance_history) == 0
+    assert len(widget.distance_recording_rows) == 0
+
+    widget._stop_calibration_preview_worker()
+    widget.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_attempt_recovers_same_pair_when_required_inputs_arrive(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
+    from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
+    left = detection("left", x1=630, y1=350, x2=650, y2=370, t=10.0)
+    right = detection("right", x1=603, y1=350, x2=623, y2=370, t=10.0)
+    widget.detection_buffers["left"].add(left)
+    widget.detection_buffers["right"].add(right)
+    pair = widget._matched_detection_pair()
+    assert pair is not None
+
+    incomplete = widget._build_measurement_attempt(pair)
+    assert not incomplete.is_geometry_ready
+    assert widget._build_measurement_attempt(pair) is incomplete
+
+    intrinsics = CameraIntrinsics(
+        1280,
+        720,
+        [[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+        [0.0],
+        0.2,
+        20,
+    )
+    widget.active_intrinsics = StereoIntrinsicsResult(
+        intrinsics, intrinsics, CheckerboardConfig(9, 6, 0.03)
+    )
+    set_selected_gps_baseline(widget, timestamp_s=10.0, baseline_m=0.3)
+    for camera in ("left", "right"):
+        state = CameraExtrinsicState(
+            camera,
+            camera,
+            0.0,
+            0.0,
+            0.0,
+            10.0,
+            f"/{camera}/attitude-a",
+            (1.0, 0.0, 0.0, 0.0),
+            9.0,
+        )
+        widget.latest_extrinsics[camera] = state
+        widget.attitude_buffers[camera].add(state)
+
+    recovered = widget._build_measurement_attempt(pair)
+    assert recovered is not incomplete
+    assert recovered.attempt_id == incomplete.attempt_id + 1
+    assert recovered.is_geometry_ready
+    assert calculate_measurement_geometry(recovered).triangulated is not None
+    assert widget._build_measurement_attempt(pair) is recovered
+
+    widget._stop_calibration_preview_worker()
+    widget.deleteLater()
+    app.processEvents()
+
+
+def test_checkerboard_triangulation_marks_pixhawk_attitude_not_used(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     from wiris_stereo_distance.calibration import (
@@ -6051,10 +6468,11 @@ def test_checkerboard_triangulation_marks_pixhawk_attitude_not_used() -> None:
         StereoExtrinsics,
         StereoIntrinsicsResult,
     )
-    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+    import wiris_stereo_distance.gui as gui
 
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    widget = WirisStereoDistancePanel()
+    widget = gui.WirisStereoDistancePanel()
     intrinsics = CameraIntrinsics(
         width=1280,
         height=720,
@@ -6097,6 +6515,11 @@ def test_checkerboard_triangulation_marks_pixhawk_attitude_not_used() -> None:
     assert row["attitude_timing_status"] == "NOT_USED"
     assert row["left_attitude_age_s"] == ""
     assert row["right_attitude_age_s"] == ""
+    pair = widget._matched_detection_pair()
+    attempt = widget._build_measurement_attempt(pair)
+    assert attempt.left_attitude is None and attempt.right_attitude is None
+    assert attempt.left_gps is None and attempt.right_gps is None
+    assert attempt.measurement_frame == "left_camera_rdf"
 
     widget.deleteLater()
     _ = app
@@ -6194,6 +6617,7 @@ def test_no_detection_event_does_not_clear_recent_measurement_match(monkeypatch)
         right_age_s=0.0,
         fix_quality="GOOD",
     )
+    set_selected_gps_baseline(widget, timestamp_s=10.01, baseline_m=0.3)
     for camera in ("left", "right"):
         widget._update_extrinsic(
             camera,
@@ -6256,6 +6680,7 @@ def test_yolo_matching_gate_limits_time_and_vertical_delta(monkeypatch) -> None:
     from wiris_stereo_distance.rtk_geometry import RtkBaselineEstimate
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
     intrinsics = CameraIntrinsics(
@@ -6280,6 +6705,7 @@ def test_yolo_matching_gate_limits_time_and_vertical_delta(monkeypatch) -> None:
         right_age_s=0.0,
         fix_quality="GOOD",
     )
+    set_selected_gps_baseline(widget, timestamp_s=10.05, baseline_m=0.3)
     for camera in ("left", "right"):
         widget._update_extrinsic(
             camera,
@@ -6297,6 +6723,8 @@ def test_yolo_matching_gate_limits_time_and_vertical_delta(monkeypatch) -> None:
     widget.apply_intrinsics_to_distance()
     widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("pixhawk"))
     widget.yolo_gate_matching_checkbox.setChecked(True)
+    widget.yolo_gate_time_delta_checkbox.setChecked(True)
+    widget.yolo_gate_vertical_delta_checkbox.setChecked(True)
     widget.yolo_gate_time_delta_spin.setValue(0.05)
     widget.yolo_gate_vertical_delta_spin.setValue(100.0)
     widget.yolo_gate_time_basis_combo.setCurrentIndex(widget.yolo_gate_time_basis_combo.findData("detection"))
@@ -6316,7 +6744,8 @@ def test_yolo_matching_gate_limits_time_and_vertical_delta(monkeypatch) -> None:
     assert "거리: 유효한 스테레오 기하 대기 중" in widget.distance_label.text()
 
     widget.yolo_gate_vertical_delta_spin.setValue(100.0)
-    widget._refresh_distance()
+    widget._update_detection("left", detection("left", x1=690, y1=340, x2=710, y2=380, t=11.0))
+    widget._update_detection("right", detection("right", x1=640, y1=400, x2=660, y2=440, t=11.1))
 
     assert "거리:" in widget.distance_label.text()
     assert "m (" in widget.distance_label.text()
@@ -6360,6 +6789,7 @@ def test_yolo_matching_gate_prefers_camera_rtcp_time(monkeypatch) -> None:
         right_age_s=0.0,
         fix_quality="GOOD",
     )
+    set_selected_gps_baseline(widget, timestamp_s=10.05, baseline_m=0.3)
     for camera in ("left", "right"):
         widget._update_extrinsic(
             camera,
@@ -7276,6 +7706,7 @@ def test_start_yolo_blocks_identical_left_right_rtsp_urls(monkeypatch) -> None:
 
 def test_measurement_tab_shows_camera_ntp_in_summary_and_keeps_record_metadata() -> None:
     import time
+    from types import SimpleNamespace
 
     from PyQt5 import QtGui, QtWidgets
 
@@ -7326,7 +7757,20 @@ def test_measurement_tab_shows_camera_ntp_in_summary_and_keeps_record_metadata()
     assert "NTP:22:13:20.118Z" in summary
     assert "Pair" in summary
 
-    row = widget._record_frame_timestamp_parameters()
+    estimate = SimpleNamespace(
+        left=detection(
+            "left", x1=100, y1=100, x2=120, y2=120, t=base_s,
+            timestamp_metadata=widget.camera_frame_metadata["left"],
+        ),
+        right=detection(
+            "right", x1=90, y1=100, x2=110, y2=120, t=base_s + 0.015,
+            timestamp_metadata=widget.camera_frame_metadata["right"],
+        ),
+        sync_quality="GOOD",
+        warnings=(),
+    )
+    attempt = recording_attempt(widget, estimate)
+    row = widget._record_frame_timestamp_parameters(attempt)
     assert row["left_rtp_timestamp"] == "90000"
     assert row["left_rtp_ssrc"] == "11"
     assert row["left_frame_timestamp_reference"] == "rtcp-ntp"
@@ -7538,12 +7982,14 @@ def test_distance_history_plot_delete_removes_recorded_sample_from_panel(monkeyp
         relative_yaw_deg=None,
     )
 
+    attempt = recording_attempt(widget, estimate, baseline_m=0.3)
     widget._append_distance_history(
         estimate=estimate,
         distance_m=5.4,
         method="stereo",
         baseline_source="manual",
         baseline_m=0.3,
+        measurement_attempt=attempt,
     )
 
     assert len(widget.distance_history) == 1
@@ -7603,12 +8049,14 @@ def test_recording_sample_table_shows_live_csv_fields(monkeypatch) -> None:
         relative_yaw_deg=3.0,
     )
 
+    attempt = recording_attempt(widget, estimate, baseline_m=0.25)
     assert widget._append_distance_history(
         estimate=estimate,
         distance_m=6.0,
         method="stereo",
         baseline_source="manual",
         baseline_m=0.25,
+        measurement_attempt=attempt,
     )
 
     assert widget.recording_sample_table.rowCount() == 1
@@ -7720,6 +8168,7 @@ def test_raw_recording_saves_bbox_geometry_and_pixhawk_status_fields(monkeypatch
         relative_yaw_deg=None,
     )
 
+    attempt = recording_attempt(widget, estimate, baseline_m=0.3, translation=(0.3, 0.0, 0.0))
     assert widget._append_distance_history(
         estimate=estimate,
         distance_m=9.25,
@@ -7730,6 +8179,7 @@ def test_raw_recording_saves_bbox_geometry_and_pixhawk_status_fields(monkeypatch
         raw_point_m=(10.0, 2.5, 2.0),
         raw_point_left_m=(10.15, 2.5, 2.0),
         translation_right_in_left_m=(0.3, 0.0, 0.0),
+        measurement_attempt=attempt,
     )
 
     row = widget.distance_recording_rows[-1]
@@ -7810,12 +8260,14 @@ def test_distance_label_shows_graph_reason_in_smaller_text(monkeypatch) -> None:
         warnings=[],
     )
 
+    attempt = recording_attempt(widget, estimate, baseline_m=0.3)
     assert widget._append_distance_history(
         estimate=estimate,
         distance_m=5.4,
         method="stereo",
         baseline_source="manual",
         baseline_m=0.3,
+        measurement_attempt=attempt,
     )
     assert not widget._append_distance_history(
         estimate=estimate,
@@ -7823,6 +8275,7 @@ def test_distance_label_shows_graph_reason_in_smaller_text(monkeypatch) -> None:
         method="stereo",
         baseline_source="manual",
         baseline_m=0.3,
+        measurement_attempt=attempt,
     )
 
     widget._set_distance_text(

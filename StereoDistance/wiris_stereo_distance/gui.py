@@ -14,6 +14,7 @@ import struct
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Sequence
 from collections import deque
 from dataclasses import dataclass
@@ -53,10 +54,18 @@ from wiris_stereo_distance.measurement_widgets import (
     DistanceHistoryPoint,
     TriangulationQualityPlot,
 )
-from wiris_stereo_distance.measurement_controller import (
-    MeasurementGeometryInput,
-    calculate_measurement_geometry,
+from wiris_stereo_distance.measurement_attempt import (
+    AttitudeSnapshot,
+    DetectionSnapshot,
+    GeometryConfigSnapshot,
+    GpsSnapshot,
+    MeasurementAttempt,
+    StereoIntrinsicsSnapshot,
+    build_checkerboard_baseline_snapshot,
+    build_pixhawk_baseline_snapshot,
+    detection_pair_key,
 )
+from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
 from wiris_stereo_distance.network import (
     DEFAULT_CAMERA_URLS,
     DEFAULT_HOST_ADDRESS,
@@ -153,7 +162,7 @@ from wiris_stereo_distance.settings import (
 )
 from wiris_stereo_distance.stereo import (
     DetectionObservation,
-    StereoCalibration,
+    correspondence_rejection_reason,
     detection_timestamp_for_basis,
 )
 from wiris_stereo_distance.theme import (
@@ -251,6 +260,12 @@ from wiris_stereo_distance.wiris_zoom import (
     build_zoom_command,
     send_tcp_line,
 )
+
+
+def _new_measurement_attempt_generation_id(session_id: str = "") -> str:
+    """Return a collision-resistant generation identity independent of wall-clock resolution."""
+
+    return f"{session_id or 'runtime'}-{uuid.uuid4().hex}"
 
 
 def angle_diff_deg(a_deg: float, b_deg: float) -> float:
@@ -2545,6 +2560,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.last_calibration_result: StereoIntrinsicsResult | None = None
         self.last_calibration_zoom_level: int | None = None
         self.active_intrinsics: StereoIntrinsicsResult | None = None
+        self._active_intrinsics_profile_path = ""
         self.zoom_intrinsics_compare_paths: list[Path] = []
         self.attitude_buffers = {
             "left": TimedSampleBuffer[CameraExtrinsicState](maxlen=1000),
@@ -2588,11 +2604,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_recording_enabled = False
         self.distance_recording_started_monotonic_s: float | None = None
         self.recording_session_id = ""
+        self._measurement_attempt_generation_id = _new_measurement_attempt_generation_id()
         self.recording_session_started_wall_s: float | None = None
         self.recording_session_started_monotonic_s: float | None = None
         self.video_recording_enabled = False
         self.video_recording_paths: dict[str, Path] = {}
         self._last_distance_history_key: tuple[float, float, str] | None = None
+        self._measurement_attempt_counter = 0
+        self._last_measurement_attempt_key: tuple[object, ...] | None = None
+        self._last_measurement_attempt: MeasurementAttempt | None = None
+        self._last_correspondence_rejection_reason = ""
         self.camera_frame_times = {
             "left": deque(maxlen=120),
             "right": deque(maxlen=120),
@@ -9959,7 +9980,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         right_ext = self.latest_extrinsics.get("right")
         if left_ext is None or right_ext is None:
             return "3D ray fallback: Pixhawk 자세 대기 중"
-        if self._translation_right_in_left_m() is None:
+        if self._latest_translation_right_in_left_m_for_diagnostics() is None:
             return "3D ray fallback: GPS/RTK baseline 대기 중"
         return "3D ray 거리: Pixhawk 자세 + GPS/RTK baseline 사용"
 
@@ -10166,6 +10187,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         zoom_level = self._intrinsics_file_zoom_level(path)
         self.last_calibration_result = result
         self.last_calibration_zoom_level = zoom_level
+        self._active_intrinsics_profile_path = str(path)
         self.apply_intrinsics_to_distance()
         if zoom_level is not None:
             self.zoom_level_spin.setValue(int(zoom_level))
@@ -10252,7 +10274,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             intrinsics_state = "not loaded"
         baseline_m, baseline_source, warnings = self._active_baseline_m()
-        translation = self._translation_right_in_left_m()
+        translation = self._latest_translation_right_in_left_m_for_diagnostics()
         translation_text = "대기 중"
         if translation is not None:
             translation_text = f"{translation[0]:.6f}, {translation[1]:.6f}, {translation[2]:.6f} m"
@@ -10394,7 +10416,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             timestamp=self._yolo_match_timestamp_s,
         )
         if pair is not None or self._yolo_time_basis() != "camera_rtcp":
-            return pair
+            return self._validated_correspondence_pair(pair, left_samples, right_samples)
 
         # The WIRIS units can emit valid RTCP/NTP fields while their two
         # camera clocks drift apart. Keep RTCP as the preferred diagnostic
@@ -10407,7 +10429,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             timestamp=lambda sample: float(sample.timestamp_s),
         )
         self._runtime_pair_uses_app_fallback = pair is not None
-        return pair
+        return self._validated_correspondence_pair(pair, left_samples, right_samples)
+
+    def _validated_correspondence_pair(self, pair, left_samples, right_samples):
+        if pair is None:
+            if not left_samples:
+                self._last_correspondence_rejection_reason = "missing_left_detection"
+            elif not right_samples:
+                self._last_correspondence_rejection_reason = "missing_right_detection"
+            else:
+                self._last_correspondence_rejection_reason = ""
+            return None
+        reason = correspondence_rejection_reason(pair.left, pair.right)
+        self._last_correspondence_rejection_reason = "" if reason is None else reason
+        return pair if reason is None else None
 
     def _recent_detection_pair_available(self) -> bool:
         pair = self._matched_detection_pair()
@@ -10801,12 +10836,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _start_session_recording(self) -> None:
         self.recording_session_id = session_id_now()
+        self._measurement_attempt_generation_id = _new_measurement_attempt_generation_id(
+            self.recording_session_id
+        )
         self.recording_session_started_wall_s = time.time()
         self.recording_session_started_monotonic_s = time.monotonic()
         self.distance_recording_started_monotonic_s = self.recording_session_started_monotonic_s
         self.distance_recording_enabled = True
         self.video_recording_enabled = True
         self._last_distance_history_key = None
+        self._measurement_attempt_counter = 0
+        self._last_measurement_attempt_key = None
+        self._last_measurement_attempt = None
         self._prepare_video_recording_paths()
         self.record_button.setText("세션 기록 중지")
         self._log(
@@ -11084,7 +11125,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     else "gps-rtk-baseline-only-v1"
                 ),
             },
-            "checkerboard_stereo_extrinsics": self._record_checkerboard_extrinsics_parameters(),
+            "checkerboard_stereo_extrinsics": self._record_current_checkerboard_extrinsics_parameters(),
             "timestamp_contract": {
                 "manufacturer_confirmed": False,
                 "camera_captured_timestamp_clock": "WIRIS RTC checked by STUS/GDTI",
@@ -11094,7 +11135,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "legacy_equivalent_field": "camera_rtc_frame_unix_s",
                 "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before absolute UTC claims.",
             },
-            "intrinsics": self._record_intrinsic_parameters(),
+            "intrinsics": self._record_current_intrinsic_parameters(),
             "stream": {
                 "left_rtsp_url": self.left_url_edit.text().strip(),
                 "right_rtsp_url": self.right_url_edit.text().strip(),
@@ -12999,6 +13040,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         try:
             self.last_calibration_result = result
             self.last_calibration_zoom_level = zoom_level
+            zoom_path = self._intrinsics_storage_path(zoom_level)
+            self._active_intrinsics_profile_path = str(
+                zoom_path if zoom_path.exists() else self._intrinsics_storage_base_path()
+            )
             self.apply_intrinsics_to_distance()
             self.calibration_status_label.setText(f"Auto-loaded intrinsics for zoom {zoom_level:02d}")
             self._log(f"[캘리브레이션] intrinsic을 자동으로 불러왔습니다 (zoom={zoom_level:02d})")
@@ -13292,6 +13337,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[캘리브레이션] 체커보드 stereo 외부 파라미터 계산 건너뜀: {exc}")
         self.last_calibration_result = StereoIntrinsicsResult(left=left, right=right, board=config, extrinsics=extrinsics)
         self.last_calibration_zoom_level = self.zoom_level_spin.value()
+        self._active_intrinsics_profile_path = (
+            f"memory:checkerboard-calibration:zoom-{self.last_calibration_zoom_level:02d}"
+        )
         warning = ""
         if left.image_count < min_images or right.image_count < min_images:
             warning = f"\nWARNING: valid images below requested minimum {min_images}."
@@ -13368,6 +13416,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         self.last_calibration_result = result
         self.last_calibration_zoom_level = zoom_level
+        zoom_path = self._intrinsics_storage_path(zoom_level)
+        self._active_intrinsics_profile_path = str(
+            zoom_path if zoom_path.exists() else self._intrinsics_storage_base_path()
+        )
         self.apply_intrinsics_to_distance()
         self._save_current_settings()
         self.calibration_status_label.setText(f"Applied intrinsics for zoom {zoom_level:02d}")
@@ -13681,7 +13733,185 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}.{attitude_text}"
         )
 
-    def _translation_right_in_left_m(self) -> tuple[float, float, float] | None:
+    def _build_measurement_attempt(self, pair) -> MeasurementAttempt:
+        """Freeze every input selected for one detection pair before geometry runs."""
+
+        triangulation_source = self._triangulation_extrinsics_source()
+        timestamp_basis = self._effective_yolo_time_basis()
+        left_pairing_timestamp_s = self._yolo_match_timestamp_s(pair.left)
+        right_pairing_timestamp_s = self._yolo_match_timestamp_s(pair.right)
+        if left_pairing_timestamp_s is None or right_pairing_timestamp_s is None:
+            raise ValueError("matched detection pair has no timestamp on its selected basis")
+        key = detection_pair_key(
+            triangulation_source=triangulation_source,
+            timestamp_basis=timestamp_basis,
+            left=pair.left,
+            right=pair.right,
+            left_pairing_timestamp_s=left_pairing_timestamp_s,
+            right_pairing_timestamp_s=right_pairing_timestamp_s,
+        )
+        cached_attempt = (
+            self._last_measurement_attempt
+            if key == self._last_measurement_attempt_key
+            else None
+        )
+        if cached_attempt is not None and cached_attempt.is_geometry_ready:
+            return cached_attempt
+
+        created_monotonic_s = time.monotonic()
+        detection_midpoint_s = (float(pair.left.timestamp_s) + float(pair.right.timestamp_s)) / 2.0
+        left_detection = DetectionSnapshot.from_observation(
+            pair.left,
+            pairing_timestamp_basis=timestamp_basis,
+            pairing_timestamp_s=left_pairing_timestamp_s,
+        )
+        right_detection = DetectionSnapshot.from_observation(
+            pair.right,
+            pairing_timestamp_basis=timestamp_basis,
+            pairing_timestamp_s=right_pairing_timestamp_s,
+        )
+        intrinsics = None
+        if self.active_intrinsics is not None:
+            profile_path = self._active_intrinsics_profile_path or (
+                f"memory:active-calibration:zoom-{self.zoom_level_spin.value():02d}"
+            )
+            intrinsics = StereoIntrinsicsSnapshot.from_result(
+                self.active_intrinsics,
+                active_zoom_level=self.zoom_level_spin.value(),
+                selected_profile_path=profile_path,
+            )
+        max_time_delta_s = self._yolo_pair_max_delta_s()
+        max_vertical_delta_px = self._yolo_vertical_max_delta_px()
+        geometry_config = GeometryConfigSnapshot(
+            focal_length_px=self.focal_spin.value(),
+            max_time_delta_s=max_time_delta_s if math.isfinite(max_time_delta_s) else None,
+            max_vertical_delta_px=(
+                max_vertical_delta_px if math.isfinite(max_vertical_delta_px) else None
+            ),
+            require_same_class=True,
+            timestamp_basis=timestamp_basis,
+            manual_focal_override=self.manual_focal_checkbox.isChecked(),
+            require_rtk_fixed_setting=bool(self.settings.require_rtk_fixed),
+        )
+
+        left_attitude_snapshot = None
+        right_attitude_snapshot = None
+        left_gps_snapshot = None
+        right_gps_snapshot = None
+        left_attitude_age_s = None
+        right_attitude_age_s = None
+        attitude_pair_delta_s = None
+        relative = None
+        warnings: tuple[str, ...] = ()
+        if triangulation_source == "checkerboard":
+            baseline = build_checkerboard_baseline_snapshot(intrinsics)
+            if baseline is None:
+                warnings = ("waiting for checkerboard stereo extrinsics",)
+            elif baseline.warnings:
+                warnings = baseline.warnings
+        else:
+            left_nearest = self.attitude_buffers["left"].nearest(detection_midpoint_s)
+            right_nearest = self.attitude_buffers["right"].nearest(detection_midpoint_s)
+            if left_nearest is not None:
+                left_attitude_snapshot = AttitudeSnapshot.from_state(left_nearest.sample)
+                left_attitude_age_s = left_nearest.age_s
+            if right_nearest is not None:
+                right_attitude_snapshot = AttitudeSnapshot.from_state(right_nearest.sample)
+                right_attitude_age_s = right_nearest.age_s
+            if left_attitude_snapshot is not None and right_attitude_snapshot is not None:
+                attitude_pair_delta_s = abs(
+                    left_attitude_snapshot.timestamp_s - right_attitude_snapshot.timestamp_s
+                )
+                relative = relative_attitude(
+                    left_attitude_snapshot.quaternion_wxyz,
+                    right_attitude_snapshot.quaternion_wxyz,
+                )
+
+            # These two reads are the one consecutive snapshot of the selected GPS pair.
+            selected_left_gps, selected_right_gps = self._selected_baseline_gps_states()
+            if selected_left_gps is not None:
+                left_gps_snapshot = GpsSnapshot.from_state(selected_left_gps)
+            if selected_right_gps is not None:
+                right_gps_snapshot = GpsSnapshot.from_state(selected_right_gps)
+            baseline = None
+            if left_gps_snapshot is not None and right_gps_snapshot is not None:
+                baseline = build_pixhawk_baseline_snapshot(
+                    left_gps=left_gps_snapshot,
+                    right_gps=right_gps_snapshot,
+                    selected_left_quaternion_wxyz=(
+                        None
+                        if left_attitude_snapshot is None
+                        else left_attitude_snapshot.quaternion_wxyz
+                    ),
+                    selected_right_quaternion_wxyz=(
+                        None
+                        if right_attitude_snapshot is None
+                        else right_attitude_snapshot.quaternion_wxyz
+                    ),
+                    selected_left_attitude_monotonic_s=(
+                        None
+                        if left_attitude_snapshot is None
+                        else left_attitude_snapshot.timestamp_s
+                    ),
+                    created_monotonic_s=created_monotonic_s,
+                    detection_midpoint_monotonic_s=detection_midpoint_s,
+                )
+                warnings = baseline.warnings
+                if baseline.unusable_reason:
+                    warnings = tuple(dict.fromkeys((*warnings, baseline.unusable_reason)))
+            else:
+                warnings = ("waiting for live GPS baseline",)
+
+        candidate_attempt_id = self._measurement_attempt_counter + 1
+        attempt = MeasurementAttempt(
+            attempt_id=candidate_attempt_id,
+            attempt_session_id=self._measurement_attempt_generation_id,
+            detection_pair_key=key,
+            created_monotonic_s=created_monotonic_s,
+            created_wall_s=time.time(),
+            detection_midpoint_monotonic_s=detection_midpoint_s,
+            timestamp_basis=timestamp_basis,
+            triangulation_source=triangulation_source,
+            left_detection=left_detection,
+            right_detection=right_detection,
+            left_attitude=left_attitude_snapshot,
+            right_attitude=right_attitude_snapshot,
+            left_gps=left_gps_snapshot,
+            right_gps=right_gps_snapshot,
+            intrinsics=intrinsics,
+            baseline=baseline,
+            geometry_config=geometry_config,
+            left_attitude_age_s=left_attitude_age_s,
+            right_attitude_age_s=right_attitude_age_s,
+            attitude_pair_delta_s=attitude_pair_delta_s,
+            relative_roll_deg=None if relative is None else relative.roll_deg,
+            relative_pitch_deg=None if relative is None else relative.pitch_deg,
+            relative_yaw_deg=None if relative is None else relative.yaw_deg,
+            source_quality=(
+                "GOOD"
+                if baseline is None or baseline.fix_quality == "NOT_USED"
+                else baseline.fix_quality
+            ),
+            warnings=warnings,
+        )
+        if cached_attempt is not None:
+            previous_missing = set(cached_attempt.missing_geometry_inputs)
+            candidate_missing = set(attempt.missing_geometry_inputs)
+            if not candidate_missing < previous_missing:
+                return cached_attempt
+        self._measurement_attempt_counter = candidate_attempt_id
+        self._last_measurement_attempt_key = key
+        self._last_measurement_attempt = attempt
+        return attempt
+
+    def _translation_right_in_left_m(
+        self, attempt: MeasurementAttempt
+    ) -> tuple[float, float, float] | None:
+        """Return the immutable attempt translation without consulting latest state."""
+
+        return attempt.translation_right_in_left_m
+
+    def _latest_translation_right_in_left_m_for_diagnostics(self) -> tuple[float, float, float] | None:
         if self._distance_mode() == "checkerboard":
             return self._checkerboard_translation_right_in_left_m()
         left_ext = self.latest_extrinsics.get("left")
@@ -13744,63 +13974,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             self._clear_measurement_pair_display()
 
-        detection_midpoint_s = (float(pair.left.timestamp_s) + float(pair.right.timestamp_s)) / 2.0
-        left_attitude = self.attitude_buffers["left"].nearest(detection_midpoint_s)
-        right_attitude = self.attitude_buffers["right"].nearest(detection_midpoint_s)
-        left_ext = left_attitude.sample if left_attitude is not None else None
-        right_ext = right_attitude.sample if right_attitude is not None else None
-        attitude_pair_delta_s = None
-        relative = None
-        if left_ext is not None and right_ext is not None:
-            attitude_pair_delta_s = abs(left_ext.timestamp_s - right_ext.timestamp_s)
-            relative = relative_attitude(left_ext.q, right_ext.q)
+        try:
+            attempt = self._build_measurement_attempt(pair)
+        except (TypeError, ValueError) as exc:
+            self._clear_triangulation_quality("측정 입력 snapshot 생성 실패")
+            self._set_distance_text(
+                f"거리: 측정 입력 snapshot 생성 실패 | {exc}",
+                quality="BAD",
+                detail="그래프 미표시: 동일 입력 provenance를 고정할 수 없습니다.",
+            )
+            return
 
-        quality = "GOOD"
-        warnings: tuple[str, ...] = ()
-
-        baseline_m, baseline_source, baseline_warnings = self._active_baseline_m()
+        baseline_m = attempt.baseline_m
+        baseline_source = attempt.baseline_source
         if baseline_source in {"rtk-blocked", "gps-rtk-blocked"}:
             self._clear_triangulation_quality("GPS baseline 조건 미충족")
             self._set_distance_text(
-                "거리: GPS baseline 조건 미충족 | " + "; ".join(baseline_warnings),
+                "거리: GPS baseline 조건 미충족 | " + "; ".join(attempt.warnings),
                 quality="BAD",
                 detail="그래프 미표시: GPS baseline 조건을 만족하지 못했습니다.",
             )
             return
-        combined_warnings = tuple(dict.fromkeys((*warnings, *baseline_warnings)))
-        if baseline_source.startswith("RTK") and quality == "GOOD" and self.latest_rtk_baseline is not None:
-            quality = self.latest_rtk_baseline.fix_quality
-
-        calibration = StereoCalibration(
-            focal_length_px=self.focal_spin.value(),
-            baseline_m=baseline_m,
-            max_time_delta_s=self._yolo_pair_max_delta_s(),
-            max_vertical_delta_px=self._yolo_vertical_max_delta_px(),
-            require_same_class=False,
-            timestamp_basis=self._effective_yolo_time_basis(),
-        )
-        triangulation_source = self._triangulation_extrinsics_source()
-        translation_right_in_left_m = self._translation_right_in_left_m()
-        geometry_result = calculate_measurement_geometry(
-            MeasurementGeometryInput(
-                left=pair.left,
-                right=pair.right,
-                calibration=calibration,
-                intrinsics=self.active_intrinsics,
-                triangulation_source=triangulation_source,
-                left_extrinsic=left_ext,
-                right_extrinsic=right_ext,
-                left_attitude_age_s=left_attitude.age_s if left_attitude is not None else None,
-                right_attitude_age_s=right_attitude.age_s if right_attitude is not None else None,
-                attitude_pair_delta_s=attitude_pair_delta_s,
-                relative_roll_deg=relative.roll_deg if relative is not None else None,
-                relative_pitch_deg=relative.pitch_deg if relative is not None else None,
-                relative_yaw_deg=relative.yaw_deg if relative is not None else None,
-                sync_quality=quality,
-                warnings=combined_warnings,
-                translation_right_in_left_m=translation_right_in_left_m,
-            )
-        )
+        triangulation_source = attempt.triangulation_source
+        translation_right_in_left_m = self._translation_right_in_left_m(attempt)
+        geometry_result = calculate_measurement_geometry(attempt)
         match = geometry_result.match
         triangulated = geometry_result.triangulated
         estimate = geometry_result.estimate
@@ -13887,6 +14084,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             raw_point_m=raw_point_m,
             raw_point_left_m=raw_point_left_m,
             translation_right_in_left_m=translation_right_in_left_m,
+            measurement_attempt=attempt,
         )
         if not appended:
             self._set_distance_text(
@@ -13935,6 +14133,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         right_stats = self.camera_stream_stats.get("right") or {}
         left_yolo_hz = float(left_stats.get("inferred_hz", 0.0))
         right_yolo_hz = float(right_stats.get("inferred_hz", 0.0))
+        if self._last_correspondence_rejection_reason and not self._last_correspondence_rejection_reason.startswith(
+            "missing_"
+        ):
+            return (
+                "그래프 미표시: correspondence 검증 실패 "
+                f"({self._last_correspondence_rejection_reason})."
+            )
         if left_count == 0 or right_count == 0:
             if left_yolo_hz <= 0.0 or right_yolo_hz <= 0.0:
                 return (
@@ -13965,6 +14170,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _detection_wait_status(self) -> str:
+        if self._last_correspondence_rejection_reason and not self._last_correspondence_rejection_reason.startswith(
+            "missing_"
+        ):
+            return f"거리: 검출 대응 거부 ({self._last_correspondence_rejection_reason})"
         if self._yolo_time_delta_gate_enabled() or self._yolo_time_basis() != "detection":
             return "거리: timestamp가 맞는 좌/우 검출 대기 중"
         return "거리: 좌/우 검출 쌍 대기 중"
@@ -14041,7 +14250,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         raw_point_left_m: tuple[float, float, float] | None = None,
         translation_right_in_left_m: tuple[float, float, float] | None = None,
         point_left_m: tuple[float, float, float] | None = None,
+        measurement_attempt: MeasurementAttempt,
     ) -> bool:
+        baseline_source = measurement_attempt.baseline_source
+        baseline_m = measurement_attempt.baseline_m
+        translation_right_in_left_m = measurement_attempt.translation_right_in_left_m
         key = (estimate.left.timestamp_s, estimate.right.timestamp_s, method)
         if key == self._last_distance_history_key:
             return False
@@ -14082,6 +14295,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
         row = {
             "session_id": self.recording_session_id,
+            "measurement_attempt_id": str(measurement_attempt.attempt_id),
+            "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
+            "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
+            "measurement_detection_pair_key": json.dumps(
+                measurement_attempt.detection_pair_key, separators=(",", ":")
+            ),
+            "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
+            "selected_left_pairing_timestamp_s": self._fmt_record_float(
+                measurement_attempt.left_detection.pairing_timestamp_s, 6
+            ),
+            "selected_right_pairing_timestamp_s": self._fmt_record_float(
+                measurement_attempt.right_detection.pairing_timestamp_s, 6
+            ),
+            "measurement_attempt_source_quality": measurement_attempt.source_quality,
+            "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
             "session_started_unix_s": self._fmt_record_float(self.recording_session_started_wall_s, 6),
             "left_video_path": str(self.video_recording_paths.get("left", "")),
             "right_video_path": str(self.video_recording_paths.get("right", "")),
@@ -14142,10 +14370,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         row.update(self._record_bbox_parameters(estimate))
         row.update(self._record_measurement_sync_timestamp_parameters(estimate))
-        row.update(self._record_intrinsic_parameters())
-        row.update(self._record_frame_timestamp_parameters())
-        row.update(self._record_live_telemetry_snapshot_parameters())
-        row.update(self._record_external_parameters(estimate=estimate))
+        row.update(self._record_intrinsic_parameters(measurement_attempt))
+        row.update(self._record_frame_timestamp_parameters(measurement_attempt))
+        row.update(self._record_live_telemetry_snapshot_parameters(measurement_attempt))
+        row.update(self._record_external_parameters(estimate=estimate, measurement_attempt=measurement_attempt))
         self.distance_recording_rows.append(row)
         self.distance_recording_keys.append(key)
         self._append_recording_table_row(row)
@@ -14289,12 +14517,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         return row
 
-    def _record_frame_timestamp_parameters(self) -> dict[str, str]:
+    def _record_frame_timestamp_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, str]:
         row: dict[str, str] = {}
-        for camera in ("left", "right"):
-            timestamps = self.camera_frame_times[camera]
-            metadata = self.camera_frame_metadata.get(camera) or {}
-            timestamp_s = float(timestamps[-1]) if timestamps else None
+        detections = {
+            "left": measurement_attempt.left_detection,
+            "right": measurement_attempt.right_detection,
+        }
+        for camera, detection in detections.items():
+            metadata = detection.timestamp_metadata
+            timestamp_s = detection.app_receive_monotonic_s
             source_timestamp = metadata.get("source_timestamp_s")
             timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
             row[f"{camera}_display_frame_timestamp_s"] = self._fmt_record_float(timestamp_s, 6)
@@ -14324,19 +14557,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 if metadata.get("rtcp_frame_ntp_unix_s") is not None
                 else timestamp_reference
             )
-        if self.camera_frame_times["left"] and self.camera_frame_times["right"]:
-            display_delta_s = float(self.camera_frame_times["right"][-1]) - float(self.camera_frame_times["left"][-1])
-        else:
-            display_delta_s = None
-        left_source = (self.camera_frame_metadata.get("left") or {}).get("source_timestamp_s")
-        right_source = (self.camera_frame_metadata.get("right") or {}).get("source_timestamp_s")
+        display_delta_s = (
+            measurement_attempt.right_detection.app_receive_monotonic_s
+            - measurement_attempt.left_detection.app_receive_monotonic_s
+        )
+        left_metadata = measurement_attempt.left_detection.timestamp_metadata
+        right_metadata = measurement_attempt.right_detection.timestamp_metadata
+        left_source = left_metadata.get("source_timestamp_s")
+        right_source = right_metadata.get("source_timestamp_s")
         source_delta_s = (
             float(right_source) - float(left_source)
             if left_source is not None and right_source is not None
             else None
         )
-        left_rtcp_ntp = (self.camera_frame_metadata.get("left") or {}).get("rtcp_frame_ntp_unix_s")
-        right_rtcp_ntp = (self.camera_frame_metadata.get("right") or {}).get("rtcp_frame_ntp_unix_s")
+        left_rtcp_ntp = left_metadata.get("rtcp_frame_ntp_unix_s")
+        right_rtcp_ntp = right_metadata.get("rtcp_frame_ntp_unix_s")
         rtcp_ntp_delta_s = (
             float(right_rtcp_ntp) - float(left_rtcp_ntp)
             if left_rtcp_ntp is not None and right_rtcp_ntp is not None
@@ -14348,36 +14583,35 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         row["camera_rtc_frame_delta_s"] = row["rtcp_frame_ntp_delta_s"]
         return row
 
-    def _latest_gps_quality_state(self, camera: str):
-        gps = self.latest_gps.get(camera)
-        if gps is not None:
-            return gps
-        sensor_slots = self.latest_gps_sensors.get(camera, {})
-        candidates = [sensor_slots.get(slot) for slot in ("GPS1", "GPS2")]
-        candidates = [candidate for candidate in candidates if candidate is not None]
-        if not candidates:
-            return None
-        return max(candidates, key=lambda candidate: float(getattr(candidate, "timestamp_s", 0.0) or 0.0))
-
-    def _record_live_telemetry_snapshot_parameters(self) -> dict[str, str]:
+    def _record_live_telemetry_snapshot_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, str]:
         row: dict[str, str] = {
             "attitude_frame": BODY_FRAME,
             "attitude_units": "deg",
             "gps_quality_frame": "gps_telemetry_metadata",
             "gps_quality_units": "satellites_count,eph_m,epv_m",
         }
-        now_s = time.monotonic()
         for camera in ("left", "right"):
-            attitude = self.latest_extrinsics.get(camera)
+            attitude = (
+                measurement_attempt.left_attitude
+                if camera == "left"
+                else measurement_attempt.right_attitude
+            )
+            attitude_age_s = (
+                measurement_attempt.left_attitude_age_s
+                if camera == "left"
+                else measurement_attempt.right_attitude_age_s
+            )
             row[f"{camera}_roll_deg"] = self._fmt_record_float(None if attitude is None else attitude.roll_deg, 6)
             row[f"{camera}_pitch_deg"] = self._fmt_record_float(None if attitude is None else attitude.pitch_deg, 6)
             row[f"{camera}_yaw_deg"] = self._fmt_record_float(None if attitude is None else attitude.yaw_deg, 6)
             row[f"{camera}_attitude_sample_age_s"] = self._fmt_record_float(
-                None if attitude is None else max(0.0, now_s - float(attitude.timestamp_s)),
+                attitude_age_s,
                 6,
             )
             row[f"{camera}_attitude_topic"] = "" if attitude is None else str(attitude.topic)
-            gps = self._latest_gps_quality_state(camera)
+            gps = measurement_attempt.left_gps if camera == "left" else measurement_attempt.right_gps
             row[f"{camera}_gps_satellites_used"] = (
                 "" if gps is None or getattr(gps, "satellites_used", None) is None else str(gps.satellites_used)
             )
@@ -14391,13 +14625,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             row[f"{camera}_gps_fix_type"] = "" if gps is None or getattr(gps, "fix_type", None) is None else str(gps.fix_type)
             row[f"{camera}_gps_sample_age_s"] = self._fmt_record_float(
-                None if gps is None else max(0.0, now_s - float(gps.timestamp_s)),
+                None
+                if measurement_attempt.baseline is None
+                else (
+                    measurement_attempt.baseline.left_age_at_capture_s
+                    if camera == "left"
+                    else measurement_attempt.baseline.right_age_at_capture_s
+                ),
                 6,
             )
             row[f"{camera}_gps_topic"] = "" if gps is None else str(gps.topic)
         return row
 
-    def _record_intrinsic_parameters(self) -> dict[str, str]:
+    def _record_current_intrinsic_parameters(self) -> dict[str, str]:
         row: dict[str, str] = {
             "intrinsics_active": "true" if self.active_intrinsics is not None else "false",
             "intrinsics_path": self.settings.intrinsics_path,
@@ -14428,7 +14668,51 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
         return row
 
-    def _record_checkerboard_extrinsics_parameters(self) -> dict[str, object]:
+    def _record_intrinsic_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, str]:
+        intrinsics_snapshot = measurement_attempt.intrinsics
+        row: dict[str, str] = {
+            "intrinsics_active": self._fmt_record_bool(intrinsics_snapshot is not None),
+            "intrinsics_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
+            "intrinsics_zoom_level": "" if intrinsics_snapshot is None else str(intrinsics_snapshot.active_zoom_level),
+            "intrinsics_zoom_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
+            "intrinsics_latest_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
+            "intrinsics_content_sha256": "" if intrinsics_snapshot is None else intrinsics_snapshot.content_sha256,
+            "manual_focal_override": self._fmt_record_bool(
+                measurement_attempt.geometry_config.manual_focal_override
+            ),
+            "runtime_focal_px": self._fmt_record_float(
+                measurement_attempt.geometry_config.focal_length_px, 3
+            ),
+        }
+        if intrinsics_snapshot is None:
+            return row
+        for prefix, intrinsics in (
+            ("left", intrinsics_snapshot.left),
+            ("right", intrinsics_snapshot.right),
+        ):
+            matrix = intrinsics.camera_matrix
+            row.update(
+                {
+                    f"{prefix}_intr_width": str(intrinsics.width),
+                    f"{prefix}_intr_height": str(intrinsics.height),
+                    f"{prefix}_intr_fx": self._fmt_record_float(matrix[0][0], 6),
+                    f"{prefix}_intr_fy": self._fmt_record_float(matrix[1][1], 6),
+                    f"{prefix}_intr_cx": self._fmt_record_float(matrix[0][2], 6),
+                    f"{prefix}_intr_cy": self._fmt_record_float(matrix[1][2], 6),
+                    f"{prefix}_intr_distortion": json.dumps(
+                        intrinsics.distortion_coefficients, separators=(",", ":")
+                    ),
+                    f"{prefix}_intr_reprojection_error_px": self._fmt_record_float(
+                        intrinsics.reprojection_error_px, 6
+                    ),
+                    f"{prefix}_intr_image_count": str(intrinsics.image_count),
+                }
+            )
+        return row
+
+    def _record_current_checkerboard_extrinsics_parameters(self) -> dict[str, object]:
         calibration = self.active_intrinsics
         extrinsics = None if calibration is None else calibration.extrinsics
         row: dict[str, object] = {
@@ -14452,8 +14736,36 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         return row
 
-    def _record_external_parameters(self, *, estimate) -> dict[str, str]:
-        triangulation_source = self._triangulation_extrinsics_source()
+    def _record_checkerboard_extrinsics_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, object]:
+        calibration = measurement_attempt.intrinsics
+        extrinsics = None if calibration is None else calibration.checkerboard_extrinsics
+        row: dict[str, object] = {
+            "active": extrinsics is not None,
+            "source": "measurement_attempt",
+            "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
+        }
+        if extrinsics is None:
+            return row
+        right_origin = measurement_attempt.translation_right_in_left_m
+        row.update(
+            {
+                "pair_count": extrinsics.pair_count,
+                "reprojection_error_px": extrinsics.reprojection_error_px,
+                "rotation_left_to_right": [list(values) for values in extrinsics.rotation_left_to_right],
+                "translation_left_to_right_m": list(extrinsics.translation_left_to_right_m),
+                "right_camera_origin_in_left_rdf_m": (
+                    None if right_origin is None else list(right_origin)
+                ),
+            }
+        )
+        return row
+
+    def _record_external_parameters(
+        self, *, estimate, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, str]:
+        triangulation_source = measurement_attempt.triangulation_source
         checkerboard_mode = triangulation_source == "checkerboard"
         attitude_timing_status = classify_attitude_timing(
             uses_pixhawk_attitude=not checkerboard_mode,
@@ -14461,14 +14773,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             right_age_s=estimate.right_attitude_age_s,
             pair_delta_s=estimate.attitude_pair_delta_s,
         )
-        checkerboard = self._record_checkerboard_extrinsics_parameters()
+        checkerboard = self._record_checkerboard_extrinsics_parameters(measurement_attempt)
         row: dict[str, str] = {
             "triangulation_extrinsics_source": triangulation_source,
             "use_rtk_baseline": self._fmt_record_bool(not checkerboard_mode),
             "rtk_baseline_applied": self._fmt_record_bool(not checkerboard_mode),
-            "require_rtk_fixed": self._fmt_record_bool(False if checkerboard_mode else self.settings.require_rtk_fixed),
+            "require_rtk_fixed": self._fmt_record_bool(
+                False if checkerboard_mode else measurement_attempt.geometry_config.require_rtk_fixed_setting
+            ),
             "use_triangulation": self._fmt_record_bool(True),
-            "distance_mode": self._distance_mode_label(),
+            "distance_mode": (
+                "체커보드 Stereo 외부 파라미터"
+                if checkerboard_mode
+                else "Pixhawk 자세 + GPS/RTK baseline"
+            ),
             "world_frame": WORLD_FRAME,
             "body_frame": BODY_FRAME,
             "camera_frame": CAMERA_FRAME,
@@ -14478,7 +14796,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 if checkerboard_mode
                 else "gps-rtk-baseline-only-v1"
             ),
-            "mount_assumption_status": self._mount_assumption_status_label(),
+            "mount_assumption_status": (
+                "checkerboard stereo extrinsics" if checkerboard_mode else "GPS/RTK baseline only"
+            ),
             "mount_assumption_detail": (
                 "applied_checkerboard_stereo_extrinsics_used_as_fixed_optical_transform"
                 if checkerboard_mode
@@ -14512,19 +14832,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "relative_pitch_deg": self._fmt_record_float(estimate.relative_pitch_deg, 6),
             "relative_yaw_deg": self._fmt_record_float(estimate.relative_yaw_deg, 6),
         }
-        baseline = self.latest_rtk_baseline
+        baseline = measurement_attempt.baseline
         if baseline is not None:
-            camera_translation = self._alignment_view_camera_translation_right_in_left_m(baseline)
+            camera_translation = baseline.translation_right_in_left_rdf_m
             baseline_forward_geometry = self._baseline_forward_geometry_from_camera_translation(camera_translation)
+            ned = baseline.ned_right_from_left_m
             row.update(
                 {
-                    "rtk_baseline_north_m": self._fmt_record_float(baseline.north_m, 6),
-                    "rtk_baseline_east_m": self._fmt_record_float(baseline.east_m, 6),
-                    "rtk_baseline_down_m": self._fmt_record_float(baseline.down_m, 6),
-                    "rtk_left_age_s": self._fmt_record_float(baseline.left_age_s, 6),
-                    "rtk_right_age_s": self._fmt_record_float(baseline.right_age_s, 6),
+                    "rtk_baseline_north_m": self._fmt_record_float(None if ned is None else ned[0], 6),
+                    "rtk_baseline_east_m": self._fmt_record_float(None if ned is None else ned[1], 6),
+                    "rtk_baseline_down_m": self._fmt_record_float(None if ned is None else ned[2], 6),
+                    "rtk_left_age_s": self._fmt_record_float(baseline.left_age_at_capture_s, 6),
+                    "rtk_right_age_s": self._fmt_record_float(baseline.right_age_at_capture_s, 6),
                     "rtk_fix_quality": baseline.fix_quality,
                     "rtk_warnings": "; ".join(baseline.warnings),
+                    "selected_gps_pair_delta_s": self._fmt_record_float(baseline.gps_pair_delta_s, 6),
+                    "selected_left_gps_detection_age_s": self._fmt_record_float(
+                        baseline.left_age_from_detection_midpoint_s, 6
+                    ),
+                    "selected_right_gps_detection_age_s": self._fmt_record_float(
+                        baseline.right_age_from_detection_midpoint_s, 6
+                    ),
                 }
             )
             if camera_translation is not None:
@@ -14546,34 +14874,59 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     }
                 )
         for camera in ("left", "right"):
-            row.update(self._record_extrinsic_state(camera))
-            row.update(self._record_gps_state(camera))
+            attitude = (
+                measurement_attempt.left_attitude
+                if camera == "left"
+                else measurement_attempt.right_attitude
+            )
+            attitude_age_s = (
+                measurement_attempt.left_attitude_age_s
+                if camera == "left"
+                else measurement_attempt.right_attitude_age_s
+            )
+            gps = measurement_attempt.left_gps if camera == "left" else measurement_attempt.right_gps
+            gps_age_s = None
+            if measurement_attempt.baseline is not None:
+                gps_age_s = (
+                    measurement_attempt.baseline.left_age_at_capture_s
+                    if camera == "left"
+                    else measurement_attempt.baseline.right_age_at_capture_s
+                )
+            row.update(self._record_extrinsic_state(camera, attitude, attitude_age_s))
+            row.update(self._record_gps_state(camera, gps, gps_age_s))
             row.update(self._record_gnss_relative_state(camera))
         return row
 
-    def _record_extrinsic_state(self, camera: str) -> dict[str, str]:
-        state = self.latest_extrinsics.get(camera)
+    def _record_extrinsic_state(
+        self,
+        camera: str,
+        state: AttitudeSnapshot | None,
+        age_s: float | None,
+    ) -> dict[str, str]:
         prefix = f"{camera}_pixhawk"
         if state is None:
             return {}
-        age_s = max(0.0, time.monotonic() - state.timestamp_s)
         return {
             f"{prefix}_namespace": state.namespace,
             f"{prefix}_topic": state.topic,
             f"{prefix}_roll_deg": self._fmt_record_float(state.roll_deg, 6),
             f"{prefix}_pitch_deg": self._fmt_record_float(state.pitch_deg, 6),
             f"{prefix}_yaw_deg": self._fmt_record_float(state.yaw_deg, 6),
-            f"{prefix}_q": json.dumps(list(state.q), separators=(",", ":")),
+            f"{prefix}_q": json.dumps(list(state.quaternion_wxyz), separators=(",", ":")),
             f"{prefix}_age_s": self._fmt_record_float(age_s, 6),
+            f"{prefix}_app_receive_timestamp_s": self._fmt_record_float(state.timestamp_s, 6),
             f"{prefix}_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
         }
 
-    def _record_gps_state(self, camera: str) -> dict[str, str]:
-        state = self.latest_gps.get(camera)
+    def _record_gps_state(
+        self,
+        camera: str,
+        state: GpsSnapshot | None,
+        age_s: float | None,
+    ) -> dict[str, str]:
         prefix = f"{camera}_gps"
         if state is None:
             return {}
-        age_s = max(0.0, time.monotonic() - state.timestamp_s)
         return {
             f"{prefix}_namespace": state.namespace,
             f"{prefix}_topic": state.topic,
@@ -14588,6 +14941,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"{prefix}_heading_accuracy_deg": self._fmt_record_float(state.heading_accuracy_deg, 6),
             f"{prefix}_rtk_label": state.rtk_label,
             f"{prefix}_age_s": self._fmt_record_float(age_s, 6),
+            f"{prefix}_app_receive_timestamp_s": self._fmt_record_float(state.timestamp_s, 6),
             f"{prefix}_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
         }
 

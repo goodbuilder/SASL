@@ -2,12 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from wiris_stereo_distance.calibration import StereoIntrinsicsResult
+from wiris_stereo_distance.measurement_attempt import MeasurementAttempt
 from wiris_stereo_distance.stereo import (
-    DetectionObservation,
-    StereoCalibration,
     StereoEstimate,
     StereoMatch,
+    correspondence_rejection_reason,
     match_stereo_observations,
     stereo_estimate_from_match,
 )
@@ -21,26 +20,6 @@ from wiris_stereo_distance.triangulation import (
 
 
 @dataclass(frozen=True)
-class MeasurementGeometryInput:
-    left: DetectionObservation
-    right: DetectionObservation
-    calibration: StereoCalibration
-    intrinsics: StereoIntrinsicsResult | None
-    triangulation_source: str
-    left_extrinsic: object | None = None
-    right_extrinsic: object | None = None
-    left_attitude_age_s: float | None = None
-    right_attitude_age_s: float | None = None
-    attitude_pair_delta_s: float | None = None
-    relative_roll_deg: float | None = None
-    relative_pitch_deg: float | None = None
-    relative_yaw_deg: float | None = None
-    sync_quality: str = "unknown"
-    warnings: tuple[str, ...] = ()
-    translation_right_in_left_m: tuple[float, float, float] | None = None
-
-
-@dataclass(frozen=True)
 class MeasurementGeometryResult:
     match: StereoMatch | None
     triangulated: RayTriangulationResult | None
@@ -49,32 +28,44 @@ class MeasurementGeometryResult:
     triangulation_reason: str = "not_attempted"
 
 
-def calculate_measurement_geometry(inputs: MeasurementGeometryInput) -> MeasurementGeometryResult:
-    attempt = _triangulate(inputs, tuple(inputs.warnings))
+def calculate_measurement_geometry(inputs: MeasurementAttempt) -> MeasurementGeometryResult:
+    correspondence_reason = correspondence_rejection_reason(
+        inputs.left_detection,
+        inputs.right_detection,
+    )
     match = match_stereo_observations(
-        inputs.left,
-        inputs.right,
-        inputs.calibration,
-        left_extrinsic=inputs.left_extrinsic,
-        right_extrinsic=inputs.right_extrinsic,
+        inputs.left_detection,
+        inputs.right_detection,
+        inputs.stereo_calibration(),
+        left_extrinsic=inputs.left_attitude,
+        right_extrinsic=inputs.right_attitude,
         left_attitude_age_s=inputs.left_attitude_age_s,
         right_attitude_age_s=inputs.right_attitude_age_s,
         attitude_pair_delta_s=inputs.attitude_pair_delta_s,
         relative_roll_deg=inputs.relative_roll_deg,
         relative_pitch_deg=inputs.relative_pitch_deg,
         relative_yaw_deg=inputs.relative_yaw_deg,
-        sync_quality=inputs.sync_quality,
-        warnings=attempt.warnings,
+        sync_quality=inputs.source_quality,
+        warnings=tuple(inputs.warnings),
     )
+    if match is None:
+        return MeasurementGeometryResult(
+            match=None,
+            triangulated=None,
+            estimate=None,
+            warnings=tuple(inputs.warnings),
+            triangulation_reason=correspondence_reason or "correspondence_rejected",
+        )
+    triangulation = _triangulate(inputs, tuple(inputs.warnings))
     estimate = None
-    if match is not None and attempt.result is not None:
-        estimate = stereo_estimate_from_match(match, distance_m=attempt.result.range_m)
+    if triangulation.result is not None:
+        estimate = stereo_estimate_from_match(match, distance_m=triangulation.result.range_m)
     return MeasurementGeometryResult(
         match=match,
-        triangulated=attempt.result,
+        triangulated=triangulation.result,
         estimate=estimate,
-        warnings=attempt.warnings,
-        triangulation_reason=attempt.reason,
+        warnings=triangulation.warnings,
+        triangulation_reason=triangulation.reason,
     )
 
 
@@ -89,7 +80,7 @@ def _with_warning(warnings: tuple[str, ...], message: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys((*warnings, message)))
 
 
-def _triangulate(inputs: MeasurementGeometryInput, warnings: tuple[str, ...]) -> _TriangulationAttempt:
+def _triangulate(inputs: MeasurementAttempt, warnings: tuple[str, ...]) -> _TriangulationAttempt:
     if inputs.intrinsics is None:
         return _TriangulationAttempt(
             None,
@@ -116,7 +107,7 @@ def _triangulate(inputs: MeasurementGeometryInput, warnings: tuple[str, ...]) ->
                 _with_warning(warnings, "triangulation waiting for checkerboard stereo extrinsics"),
                 "missing_checkerboard_extrinsics",
             )
-    elif inputs.left_extrinsic is None or inputs.right_extrinsic is None:
+    elif inputs.left_attitude is None or inputs.right_attitude is None:
         return _TriangulationAttempt(
             None,
             _with_warning(warnings, "triangulation waiting for Pixhawk R"),
@@ -146,15 +137,15 @@ def _triangulate(inputs: MeasurementGeometryInput, warnings: tuple[str, ...]) ->
     return _TriangulationAttempt(ray_attempt.result, warnings, ray_attempt.reason)
 
 
-def _pixel_grid_mismatches(inputs: MeasurementGeometryInput) -> tuple[tuple[str, str], ...]:
+def _pixel_grid_mismatches(inputs: MeasurementAttempt) -> tuple[tuple[str, str], ...]:
     """Reject bbox pixels that are not on the image grid used by each camera K."""
 
     if inputs.intrinsics is None:
         return ()
     mismatches: list[tuple[str, str]] = []
     for camera, observation, intrinsics in (
-        ("left", inputs.left, inputs.intrinsics.left),
-        ("right", inputs.right, inputs.intrinsics.right),
+        ("left", inputs.left_detection, inputs.intrinsics.left),
+        ("right", inputs.right_detection, inputs.intrinsics.right),
     ):
         observed_grid = (int(observation.width), int(observation.height))
         calibrated_grid = (int(intrinsics.width), int(intrinsics.height))
@@ -171,7 +162,7 @@ def _pixel_grid_mismatches(inputs: MeasurementGeometryInput) -> tuple[tuple[str,
 
 
 def _triangulate_pixels_attempt(
-    inputs: MeasurementGeometryInput,
+    inputs: MeasurementAttempt,
     left_pixel: tuple[float, float],
     right_pixel: tuple[float, float],
 ) -> RayTriangulationAttempt:
@@ -193,7 +184,7 @@ def _triangulate_pixels_attempt(
             rotation_right_to_left=rotation_right_to_left,
             translation_right_in_left_m=translation_right_in_left_m,
         )
-    if inputs.left_extrinsic is None or inputs.right_extrinsic is None:
+    if inputs.left_attitude is None or inputs.right_attitude is None:
         return RayTriangulationAttempt(None, "missing_pixhawk_rotation")
     if inputs.translation_right_in_left_m is None:
         return RayTriangulationAttempt(None, "missing_rtk_translation")
@@ -202,7 +193,7 @@ def _triangulate_pixels_attempt(
         right_pixel=right_pixel,
         left_intrinsics=inputs.intrinsics.left,
         right_intrinsics=inputs.intrinsics.right,
-        left_body_to_world_q=inputs.left_extrinsic.q,
-        right_body_to_world_q=inputs.right_extrinsic.q,
+        left_body_to_world_q=inputs.left_attitude.quaternion_wxyz,
+        right_body_to_world_q=inputs.right_attitude.quaternion_wxyz,
         translation_right_in_left_m=inputs.translation_right_in_left_m,
     )

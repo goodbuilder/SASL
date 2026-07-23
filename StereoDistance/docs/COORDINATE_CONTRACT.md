@@ -47,6 +47,69 @@ former BBox reprojection, affine bbox-center, distance-binned 3-D bias, and
 Kalman paths were removed. Runtime and newly saved measurement rows contain
 the Raw `left_camera_rdf` result only.
 
+### Coherent measurement input
+
+Each newly selected detection pair receives a generation/session-scoped,
+monotonically increasing `measurement_attempt_id`; `MeasurementAttempt.pair_id`
+combines that generation identity and sequence instead of using a timestamp
+alone. Before geometry runs, StereoDistance
+copies the pair, nearest left/right attitude samples, selected left/right GPS
+samples, applied left/right K/D, zoom/profile identity, and geometry settings
+into one immutable `MeasurementAttempt`. Repeated GUI refreshes reuse a
+geometry-ready attempt. An incomplete attempt is replaced only when the same
+pair gains strictly more required inputs, after which the ready snapshot is
+frozen.
+
+Detection timestamp metadata is projected to
+`DETECTION_METADATA_ALLOWLIST` and both the observation factory and direct
+snapshot constructor use the same canonicalization. Stored values are limited
+to immutable `None`, `str`, `bool`, `int`, or finite `float` scalars; unknown or
+duplicate direct-constructor keys, mutable values, and NaN/Inf are rejected
+when the snapshot is created. Each metadata item must be an exact two-element
+`tuple` or `list`; mappings, sets, strings, bytes, and arbitrary iterables are
+never interpreted as pairs. Direct construction accepts only `None`, a tuple,
+or a list as the outer container, while the observation factory materializes a
+runtime `Mapping.items()` sequence before applying the same pair validation.
+The active payload adapter first validates `None`, `Mapping`, or exact
+tuple/list outer containers and exact two-element tuple/list items, then
+materializes a detached plain dictionary; it never passes an unchecked
+iterable to `dict()`. A single whole-dictionary `deepcopy` deeply detaches
+ordinary deepcopy-compatible/plain metadata graphs before snapshot projection.
+Copy exceptions propagate fail-closed with no shallow fallback; arbitrary
+custom `__deepcopy__` behavior is not an unconditional trust guarantee. The
+snapshot canonicalizer independently revalidates the allowlist and scalar
+contract and stores metadata in allowlist order.
+`MeasurementAttempt` accepts only exact base `DetectionSnapshot` instances, and
+the snapshot factory explicitly rejects subclasses so an overridden
+`__post_init__()` cannot bypass provenance validation. The attempt canonical
+SHA-256 is an integrity hash of one serialized attempt instance, including its
+generation, sequence, timestamps, and profile path; it is not a physical
+detection-pair identity.
+
+Correspondence is fail-closed before attempt construction: left/right classes
+must match, and either side with multiple candidates of that selected class is
+rejected because this phase does not introduce a validated multi-object
+matcher. Independent highest-confidence detections are not triangulated when
+that correspondence is ambiguous.
+
+For the Pixhawk path, the right ray is rotated into the selected left-camera
+basis with the attempt's left quaternion, and the selected GPS pair's NED
+baseline is transformed into `left_camera_rdf` with that exact same left
+quaternion and selected app-monotonic attitude timestamp. The quaternion order
+is `(w,x,y,z)`. Geometry and valid-row recording do not re-read GUI latest
+attitude, GPS baseline, or intrinsics after the attempt exists. Checkerboard
+attempts instead copy the applied stereo `R/T` and do not consume Pixhawk or
+GPS values.
+
+This coherence rule does not change validity policy: stale attitude remains
+display-only and non-blocking, RTK Fixed is not newly required, and no ray-gap
+or intersection-angle acceptance threshold is added in this phase.
+
+S3-B1 does not approve hardware reliability. GPS age/skew and stale/RTK
+acceptance policy remain for S3-B2; atomic recorder/session isolation remains
+for S3-B3; and the public `baseline_center_frd` origin/axis migration remains
+for S3-B4. The current public output stays `left_camera_rdf`.
+
 ## P1/P2 Pixhawk data boundary
 
 P1/P2 Pixhawk data describes the stereo measurement rig. It may provide:
@@ -115,6 +178,12 @@ measurement_axis_contract=left_camera_rdf:right_down_forward
 public_vector_contract=left_camera_rdf:[right,down,forward,range]
 legacy_xyz_alias_contract=x=right,y=down,z=forward
 ```
+
+Valid rows also include the attempt identity and canonical SHA-256 plus the
+selected detection timestamps, quaternion/GPS sample identities, selected NED
+baseline and right-origin translation, K/D profile/content hash, and captured
+source quality/warnings. These fields describe the same immutable inputs used
+for that row's geometry.
 
 Legacy `x_m/y_m/z_m` fields remain only as explicit aliases. New rows leave
 `stereo_center_*` and `raw_stereo_center_*` empty instead of placing

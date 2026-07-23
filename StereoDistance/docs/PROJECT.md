@@ -171,6 +171,7 @@ StereoDistance는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스�
 ### 스트림과 측정 계산
 
 - `wiris_stereo_distance/yolo_stream.py`: RTSP 수신, 디코딩, YOLO 추론, 프레임/검출 이벤트.
+- `wiris_stereo_distance/measurement_attempt.py`: detection pair마다 선택한 자세, GPS, K/D, checkerboard R/T와 geometry 설정을 immutable snapshot으로 고정하고 generation/session-scoped pair identity를 부여한다.
 - `wiris_stereo_distance/measurement_controller.py`: 좌/우 검출 매칭과 3D 측정 계산 연결.
 - `wiris_stereo_distance/stereo.py`: 검출 observation, stereo match, disparity 기반 진단 계산.
 - `wiris_stereo_distance/triangulation.py`: ray triangulation과 좌표계 변환.
@@ -199,10 +200,16 @@ StereoDistance는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스�
 1. 좌/우 WIRIS RTSP 스트림을 연결한다.
 2. `YoloStreamWorker`가 프레임과 검출 결과를 GUI로 전달한다.
 3. `CameraPane`이 최신 프레임과 bbox 상태를 보관한다.
-4. `gui.py`가 좌/우 검출 후보와 Pixhawk/RTK 상태를 모은다.
-5. `measurement_controller.py`가 stereo match와 triangulation 결과를 계산한다.
-6. 결과는 거리 상태, 그래프, 세션 기록 테이블에 반영된다.
-7. 저장 시 `recording_session.py`가 CSV/JSON/영상 경로를 세션 단위로 정리한다.
+4. `gui.py`가 class mismatch와 동일 class 다중 후보를 fail-closed한 뒤 detection pair의 midpoint를 기준으로 nearest 좌/우 자세를 고르고, 연속해서 복사한 좌/우 GPS pair, 적용 K/D, checkerboard R/T 또는 GPS baseline을 하나의 immutable `MeasurementAttempt`로 고정한다.
+5. Pixhawk 경로는 selected GPS pair에서 NED baseline을 다시 계산하고, right ray와 baseline translation 모두 동일 attempt의 동일 selected left `(w,x,y,z)` quaternion과 app-monotonic sample timestamp basis로 `left_camera_rdf`에 놓는다.
+6. `measurement_controller.py`가 attempt만 받아 correspondence를 먼저 검증한 후 triangulation 결과를 계산한다. attempt 생성 뒤 GUI latest state를 조회하지 않는다.
+7. 결과는 거리 상태와 그래프에 반영되고, valid row는 계산에 사용한 attempt의 selected-input provenance와 canonical hash를 기록한다.
+8. 저장 시 `recording_session.py`가 CSV/JSON/영상 경로를 세션 단위로 정리한다.
+
+S3-B1은 하드웨어 신뢰성을 승인하지 않는다. GPS age/skew 및 stale/RTK
+acceptance policy는 S3-B2, atomic recorder/session isolation은 S3-B3,
+`baseline_center_frd` public migration은 S3-B4 범위다. 현재 public output은
+계속 왼쪽 optical-center 원점의 `left_camera_rdf:[Right,Down,Forward,Range]`다.
 
 ## 주요 워크플로
 

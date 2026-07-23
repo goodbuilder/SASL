@@ -23,12 +23,25 @@ cd <SASL_ROOT>
 PYTHONPATH=. python3 -m pytest \
   StereoDistance/tests/test_stereo_geometry_common.py \
   StereoDistance/tests/test_coordinate_contract.py \
+  StereoDistance/tests/test_measurement_attempt.py \
   StereoDistance/tests/test_measurement_controller.py \
   StereoDistance/tests/test_triangulation.py \
   -q
 ```
 
-이 묶음은 `camera_optical_rdf -> left_camera_rdf`, checkerboard `X_right = R X_left + T` 역변환, Pixhawk body FRD/NED 변환, 왼쪽 optical-center 원점 유지와 invalid-ray fail-closed를 확인한다.
+이 묶음은 immutable attempt/pair identity, class·ambiguity fail-closed,
+`camera_optical_rdf -> left_camera_rdf`, checkerboard `X_right = R X_left + T`
+역변환, Pixhawk body FRD/NED 변환, selected-left quaternion/timestamp 공유,
+왼쪽 optical-center 원점 유지와 invalid-ray fail-closed를 확인한다.
+`test_measurement_attempt.py`는 factory/direct-constructor timestamp metadata가
+같은 allowlist 순서로 canonicalize되는지, mutable/nonfinite/duplicate 입력이
+snapshot 생성 시점에 거부되는지, source·`asdict()` mutation이 attempt
+canonical SHA-256을 바꾸지 않는지도 확인한다. 또한 outer container와 각
+pair item을 명시적인 `None`/tuple/list 계약으로 제한하고 Mapping·set·문자열
+·bytes·임의 iterable이 two-element pair로 오인되지 않는지 검증한다. 실제
+`DetectionObservation.from_payload()` 경로도 같은 shape 계약으로 먼저
+검증하며, `DetectionSnapshot` subclass가 factory·`replace()`를 통해 attempt와
+canonical SHA 경계에 진입하지 못하는지도 확인한다.
 
 ## 대표 PyQt 테스트
 
