@@ -1,3 +1,4 @@
+import csv
 import struct
 import time
 from math import degrees
@@ -6192,13 +6193,14 @@ def test_pixhawk_rtk_can_drive_triangulation(monkeypatch) -> None:
     _ = app
 
 
-def test_measurement_attempt_freezes_gui_geometry_and_valid_row_provenance(monkeypatch) -> None:
+def test_measurement_attempt_freezes_gui_geometry_and_valid_row_provenance(monkeypatch, tmp_path) -> None:
     from PyQt5 import QtWidgets
 
     import wiris_stereo_distance.gui as gui
     from wiris_stereo_distance.calibration import CameraIntrinsics, CheckerboardConfig, StereoIntrinsicsResult
     from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
     from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+    from wiris_stereo_distance.recording_session import write_dynamic_csv
     from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
@@ -6299,6 +6301,19 @@ def test_measurement_attempt_freezes_gui_geometry_and_valid_row_provenance(monke
     row = widget.distance_recording_rows[-1]
     assert row["measurement_attempt_id"] == str(attempt_a.attempt_id)
     assert row["measurement_attempt_sha256"] == hash_a
+    assert row["measurement_attempt_content_sha256"] == attempt_a.content_sha256()
+    assert row["measurement_attempt_instance_sha256"] == attempt_a.instance_sha256()
+    assert list(row)[:5] == [
+        "session_id",
+        "measurement_attempt_id",
+        "measurement_attempt_session_id",
+        "measurement_attempt_sha256",
+        "measurement_detection_pair_key",
+    ]
+    assert list(row)[-2:] == [
+        "measurement_attempt_content_sha256",
+        "measurement_attempt_instance_sha256",
+    ]
     assert row["left_pixhawk_q"] == "[1.0,0.0,0.0,0.0]"
     assert row["left_pixhawk_topic"] == "/left/attitude-a"
     assert row["left_gps_lon_deg"] == "127.000000000"
@@ -6307,6 +6322,18 @@ def test_measurement_attempt_freezes_gui_geometry_and_valid_row_provenance(monke
     assert row["translation_right_in_left_x_m"] == "0.300000"
     assert row["rtk_baseline_east_m"] == "0.300000"
     assert row["measurement_frame"] == "left_camera_rdf"
+
+    output = tmp_path / "distance_history.csv"
+    write_dynamic_csv(output, [row])
+    with output.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        persisted = next(reader)
+        assert reader.fieldnames == list(row)
+    assert list(persisted)[:5] == list(row)[:5]
+    assert list(persisted)[-2:] == list(row)[-2:]
+    assert persisted["measurement_attempt_sha256"] == hash_a
+    assert persisted["measurement_attempt_content_sha256"] == attempt_a.content_sha256()
+    assert persisted["measurement_attempt_instance_sha256"] == attempt_a.instance_sha256()
 
     widget._stop_calibration_preview_worker()
     widget.deleteLater()

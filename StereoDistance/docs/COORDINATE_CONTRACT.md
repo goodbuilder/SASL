@@ -81,10 +81,13 @@ snapshot canonicalizer independently revalidates the allowlist and scalar
 contract and stores metadata in allowlist order.
 `MeasurementAttempt` accepts only exact base `DetectionSnapshot` instances, and
 the snapshot factory explicitly rejects subclasses so an overridden
-`__post_init__()` cannot bypass provenance validation. The attempt canonical
-SHA-256 is an integrity hash of one serialized attempt instance, including its
-generation, sequence, timestamps, and profile path; it is not a physical
-detection-pair identity.
+`__post_init__()` cannot bypass provenance validation. The legacy attempt
+canonical SHA-256 remains a full, profile-path-sensitive integrity hash of one
+serialized attempt instance. The content SHA-256 excludes exactly the top-level
+`attempt_id`, `attempt_session_id`, `created_monotonic_s`, and `created_wall_s`
+values plus nested `intrinsics.selected_profile_path`; it is a path-portable
+semantic hash, not a privacy boundary or physical detection-pair identity. The
+instance SHA-256 binds that content hash to the full serialized instance.
 
 Correspondence is fail-closed before attempt construction: left/right classes
 must match, and either side with multiple candidates of that selected class is
@@ -179,11 +182,13 @@ public_vector_contract=left_camera_rdf:[right,down,forward,range]
 legacy_xyz_alias_contract=x=right,y=down,z=forward
 ```
 
-Valid rows also include the attempt identity and canonical SHA-256 plus the
-selected detection timestamps, quaternion/GPS sample identities, selected NED
-baseline and right-origin translation, K/D profile/content hash, and captured
-source quality/warnings. These fields describe the same immutable inputs used
-for that row's geometry.
+Valid rows also include the attempt identity, legacy full/path-sensitive
+canonical SHA-256, path-portable semantic content SHA-256, and instance SHA-256
+that binds the content hash to the full serialized instance, plus the selected
+detection timestamps, quaternion/GPS sample identities, selected NED baseline
+and right-origin translation, K/D profile/content hash, and captured source
+quality/warnings. These fields describe the same immutable inputs used for that
+row's geometry.
 
 Legacy `x_m/y_m/z_m` fields remain only as explicit aliases. New rows leave
 `stereo_center_*` and `raw_stereo_center_*` empty instead of placing

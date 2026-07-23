@@ -1002,6 +1002,31 @@ class MeasurementAttempt:
     def canonical_sha256(self) -> str:
         return _sha256_payload(self.canonical_payload())
 
+    def content_canonical_payload(self) -> dict[str, Any]:
+        payload = asdict(self)
+        for field_name in (
+            "attempt_id",
+            "attempt_session_id",
+            "created_monotonic_s",
+            "created_wall_s",
+        ):
+            payload.pop(field_name)
+        if payload["intrinsics"] is not None:
+            payload["intrinsics"].pop("selected_profile_path")
+        return payload
+
+    def content_sha256(self) -> str:
+        return _sha256_payload(self.content_canonical_payload())
+
+    def instance_canonical_payload(self) -> dict[str, Any]:
+        return {
+            "measurement_attempt_content_sha256": self.content_sha256(),
+            "instance": asdict(self),
+        }
+
+    def instance_sha256(self) -> str:
+        return _sha256_payload(self.instance_canonical_payload())
+
 
 def detection_pair_key(
     *,

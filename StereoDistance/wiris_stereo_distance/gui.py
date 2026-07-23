@@ -14293,6 +14293,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 + raw_point_m[1] * raw_point_m[1]
                 + raw_point_m[2] * raw_point_m[2]
             )
+        measurement_attempt_content_sha256 = measurement_attempt.content_sha256()
+        measurement_attempt_instance_sha256 = measurement_attempt.instance_sha256()
         row = {
             "session_id": self.recording_session_id,
             "measurement_attempt_id": str(measurement_attempt.attempt_id),
@@ -14374,6 +14376,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         row.update(self._record_frame_timestamp_parameters(measurement_attempt))
         row.update(self._record_live_telemetry_snapshot_parameters(measurement_attempt))
         row.update(self._record_external_parameters(estimate=estimate, measurement_attempt=measurement_attempt))
+        row["measurement_attempt_content_sha256"] = measurement_attempt_content_sha256
+        row["measurement_attempt_instance_sha256"] = measurement_attempt_instance_sha256
         self.distance_recording_rows.append(row)
         self.distance_recording_keys.append(key)
         self._append_recording_table_row(row)

@@ -203,7 +203,7 @@ StereoDistance는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스�
 4. `gui.py`가 class mismatch와 동일 class 다중 후보를 fail-closed한 뒤 detection pair의 midpoint를 기준으로 nearest 좌/우 자세를 고르고, 연속해서 복사한 좌/우 GPS pair, 적용 K/D, checkerboard R/T 또는 GPS baseline을 하나의 immutable `MeasurementAttempt`로 고정한다.
 5. Pixhawk 경로는 selected GPS pair에서 NED baseline을 다시 계산하고, right ray와 baseline translation 모두 동일 attempt의 동일 selected left `(w,x,y,z)` quaternion과 app-monotonic sample timestamp basis로 `left_camera_rdf`에 놓는다.
 6. `measurement_controller.py`가 attempt만 받아 correspondence를 먼저 검증한 후 triangulation 결과를 계산한다. attempt 생성 뒤 GUI latest state를 조회하지 않는다.
-7. 결과는 거리 상태와 그래프에 반영되고, valid row는 계산에 사용한 attempt의 selected-input provenance와 canonical hash를 기록한다.
+7. 결과는 거리 상태와 그래프에 반영되고, valid row는 계산에 사용한 attempt의 selected-input provenance와 legacy full/path-sensitive canonical hash, 정확히 top-level `attempt_id`/`attempt_session_id`/`created_monotonic_s`/`created_wall_s` 및 nested `intrinsics.selected_profile_path`만 제외하는 path-portable semantic content hash(privacy 또는 pair identity가 아님), 그리고 content hash를 full instance에 결합하는 instance hash를 기록한다.
 8. 저장 시 `recording_session.py`가 CSV/JSON/영상 경로를 세션 단위로 정리한다.
 
 S3-B1은 하드웨어 신뢰성을 승인하지 않는다. GPS age/skew 및 stale/RTK

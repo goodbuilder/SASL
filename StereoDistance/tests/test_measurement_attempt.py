@@ -163,6 +163,87 @@ def pixhawk_attempt(*, intrinsics_source=None) -> MeasurementAttempt:
     )
 
 
+def test_measurement_attempt_hash_contract_golden_values() -> None:
+    attempt = pixhawk_attempt()
+
+    assert attempt.canonical_sha256() == (
+        "3e211a4b3a078a5d0ecc1f544781f8b7adc58d4ee1e60ed540f4419e9782d91f"
+    )
+    assert attempt.content_sha256() == (
+        "82d4345323ed04a95c9ea6148a1cf883a7950b1456446b120372bbd20a426529"
+    )
+    assert attempt.instance_sha256() == (
+        "2fb47a7ed246c973ca26678b7f409474a14eb0fc8b529e08defb891c03e43e15"
+    )
+    assert attempt.canonical_payload() == asdict(attempt)
+    assert attempt.instance_canonical_payload() == {
+        "measurement_attempt_content_sha256": attempt.content_sha256(),
+        "instance": asdict(attempt),
+    }
+
+
+def test_measurement_attempt_content_hash_excludes_only_instance_and_profile_location() -> None:
+    attempt = pixhawk_attempt()
+    assert attempt.intrinsics is not None
+    relocated = replace(
+        attempt,
+        attempt_id=99,
+        attempt_session_id="session-b",
+        created_monotonic_s=999.0,
+        created_wall_s=2000.0,
+        intrinsics=replace(attempt.intrinsics, selected_profile_path="/portable/zoom_08.json"),
+    )
+
+    excluded = {
+        "attempt_id",
+        "attempt_session_id",
+        "created_monotonic_s",
+        "created_wall_s",
+    }
+    expected = asdict(attempt)
+    for field_name in excluded:
+        expected.pop(field_name)
+    expected["intrinsics"].pop("selected_profile_path")
+
+    assert attempt.content_canonical_payload() == expected
+    assert relocated.content_canonical_payload() == expected
+    assert relocated.content_sha256() == attempt.content_sha256()
+    assert relocated.canonical_sha256() != attempt.canonical_sha256()
+    assert relocated.instance_sha256() != attempt.instance_sha256()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "new_value"),
+    (
+        ("detection_midpoint_monotonic_s", 11.0),
+        ("timestamp_basis", "app-receive-monotonic"),
+        ("source_quality", "DEGRADED"),
+        ("warnings", ("retained warning",)),
+    ),
+)
+def test_measurement_attempt_content_hash_retains_non_excluded_fields(field_name, new_value) -> None:
+    attempt = pixhawk_attempt()
+    changed = replace(attempt, **{field_name: new_value})
+
+    assert changed.content_sha256() != attempt.content_sha256()
+
+
+def test_measurement_attempt_new_hash_payloads_are_deterministic_and_mutation_isolated() -> None:
+    attempt = pixhawk_attempt()
+    content_hash = attempt.content_sha256()
+    instance_hash = attempt.instance_sha256()
+    content_payload = attempt.content_canonical_payload()
+    instance_payload = attempt.instance_canonical_payload()
+
+    content_payload["left_detection"]["bbox_xyxy_px"] = (0.0, 0.0, 0.0, 0.0)
+    instance_payload["instance"]["left_detection"]["bbox_xyxy_px"] = (0.0, 0.0, 0.0, 0.0)
+
+    assert attempt.content_sha256() == content_hash
+    assert attempt.instance_sha256() == instance_hash
+    assert attempt.content_canonical_payload() == pixhawk_attempt().content_canonical_payload()
+    assert attempt.instance_canonical_payload() == pixhawk_attempt().instance_canonical_payload()
+
+
 def direct_detection_snapshot(metadata_items) -> DetectionSnapshot:
     return DetectionSnapshot(
         camera="left",
