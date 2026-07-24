@@ -5,6 +5,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from camera_oracle_test_support import seed_observed_camera_oracle
 
 
 def _node():
@@ -14,6 +15,7 @@ def _node():
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
     node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     return node
 
 

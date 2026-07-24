@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v1"
+RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v3"
 
 PAIR_RECORD_COLUMNS = (
     "schema_version", "run_id", "case_id", "record_sequence", "record_type",
@@ -35,8 +35,23 @@ PAIR_RECORD_COLUMNS = (
     "measurement_gt_independent", "reference_source",
     "projection_camera_pose_source", "left_u_px", "left_v_px", "right_u_px",
     "right_v_px", "left_confidence", "right_confidence",
-    "left_roll_error_deg", "left_pitch_error_deg", "left_yaw_error_deg",
-    "right_roll_error_deg", "right_pitch_error_deg", "right_yaw_error_deg",
+    "camera_oracle_source", "camera_oracle_expected_sdf_sha256",
+    "left_camera_oracle_gazebo_stamp_ns", "left_camera_oracle_base_entity_name",
+    "left_camera_oracle_base_entity_id", "left_camera_oracle_optical_entity_name",
+    "left_camera_oracle_optical_entity_id", "left_camera_oracle_optical_x_m",
+    "left_camera_oracle_optical_y_m", "left_camera_oracle_optical_z_m",
+    "left_camera_oracle_optical_qx", "left_camera_oracle_optical_qy",
+    "left_camera_oracle_optical_qz", "left_camera_oracle_optical_qw",
+    "right_camera_oracle_gazebo_stamp_ns", "right_camera_oracle_base_entity_name",
+    "right_camera_oracle_base_entity_id", "right_camera_oracle_optical_entity_name",
+    "right_camera_oracle_optical_entity_id", "right_camera_oracle_optical_x_m",
+    "right_camera_oracle_optical_y_m", "right_camera_oracle_optical_z_m",
+    "right_camera_oracle_optical_qx", "right_camera_oracle_optical_qy",
+    "right_camera_oracle_optical_qz", "right_camera_oracle_optical_qw",
+    "cam_l_optical_roll_deg", "cam_l_optical_pitch_deg", "cam_l_optical_yaw_deg",
+    "cam_r_optical_roll_deg", "cam_r_optical_pitch_deg", "cam_r_optical_yaw_deg",
+    "cam_l_px4_roll_deg", "cam_l_px4_pitch_deg", "cam_l_px4_yaw_deg",
+    "cam_r_px4_roll_deg", "cam_r_px4_pitch_deg", "cam_r_px4_yaw_deg",
     "common_optical_roll_error_deg", "relative_optical_roll_error_deg",
     "common_optical_pitch_error_deg", "relative_optical_pitch_error_deg",
     "common_optical_yaw_error_deg", "relative_optical_yaw_error_deg",

@@ -1,3 +1,4 @@
+import csv
 import json
 import math
 import os
@@ -9,11 +10,8 @@ from pathlib import Path
 from python_qt_binding.QtCore import QTimer
 from python_qt_binding.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
     QDockWidget,
     QFileDialog,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -34,11 +32,74 @@ except Exception:  # pragma: no cover - rqt can still show recorder controls wit
     String = None
 
 
-TRUTH_SOURCE_OPTIONS = (
-    ("Local NED", "local_ned"),
-    ("Global Position", "global_position"),
-    ("GPS Position", "gps_position"),
+PRIMARY_RECORD_BUTTON_TEXT = "Save CSV"
+RECORDING_MODE_BUTTONS = (
+    ("lite", PRIMARY_RECORD_BUTTON_TEXT),
+    ("full", "Save MP4"),
+    ("debug", "Save Debug"),
 )
+ANALYSIS_CSV_FIELDS = (
+    "time_sec",
+    "raw_range_m",
+    "left_x1",
+    "right_x1",
+    "raw_gps_baseline_forward_m",
+    "global_position_baseline_forward_m",
+    "raw_minus_global_baseline_delta_m",
+)
+
+
+def _read_csv_tail(path, data_row_count):
+    """Return the header and complete persisted data lines from a small file tail."""
+    target = Path(path)
+    if data_row_count < 1:
+        raise ValueError("data_row_count must be positive")
+    with target.open("rb") as handle:
+        header = handle.readline().decode("utf-8", errors="replace").rstrip("\r\n")
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        chunks = []
+        newline_count = 0
+        while position > 0 and newline_count <= data_row_count:
+            chunk_size = min(8192, position)
+            position -= chunk_size
+            handle.seek(position)
+            chunk = handle.read(chunk_size)
+            chunks.append(chunk)
+            newline_count += chunk.count(b"\n")
+    tail = b"".join(reversed(chunks))
+    if tail and not tail.endswith(b"\n"):
+        tail = tail.rsplit(b"\n", 1)[0] if b"\n" in tail else b""
+    decoded_rows = [line.decode("utf-8", errors="replace") for line in tail.splitlines()]
+    data_rows = [line for line in decoded_rows if line and line != header]
+    return header, data_rows[-data_row_count:]
+
+
+def read_recent_csv_lines(path, data_row_count=3):
+    """Return the CSV header plus the latest persisted rows without rereading the file."""
+    header, data_rows = _read_csv_tail(path, data_row_count)
+    return "\n".join([header, *data_rows[-data_row_count:]]) if header else ""
+
+
+def read_recent_csv_rows(path, data_row_count=3):
+    """Return only complete persisted rows, keyed by the original CSV header."""
+    header, data_rows = _read_csv_tail(path, data_row_count)
+    if not header or not data_rows:
+        return []
+    return list(csv.DictReader([header, *data_rows]))
+
+
+def export_analysis_csv(source_path, output_path):
+    """Create a compact analysis copy without modifying the immutable raw CSV."""
+    source = Path(source_path)
+    output = Path(output_path)
+    with source.open(newline="", encoding="utf-8") as source_file:
+        reader = csv.DictReader(source_file)
+        with output.open("w", newline="", encoding="utf-8") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=ANALYSIS_CSV_FIELDS)
+            writer.writeheader()
+            for row in reader:
+                writer.writerow({field: row.get(field, "") for field in ANALYSIS_CSV_FIELDS})
 
 
 def build_operator_recorder_command(*, python_executable, mode, output_dir):
@@ -77,6 +138,190 @@ def build_calibration_recorder_command(
     return cmd
 
 
+class RecordingControls(QWidget):
+    """Reusable recorder controls for the tabbed operator UI."""
+
+    def __init__(self, parent=None, lock_widgets=()):
+        super().__init__(parent)
+        self._process = None
+        self._record_mode = None
+        self._record_path = None
+        self._last_record_path = None
+        self._lock_widgets = tuple(lock_widgets)
+
+        default_dir = Path(os.environ.get("OPERATOR_BAG_DIR", Path.cwd() / "bags"))
+        self._dir_edit = QLineEdit(str(default_dir))
+        self._dir_edit.setMinimumWidth(320)
+        self._browse_button = QPushButton("Browse…")
+        self._record_buttons = {
+            mode: QPushButton(button_text) for mode, button_text in RECORDING_MODE_BUTTONS
+        }
+        self._stop_button = QPushButton("Stop")
+        self._stop_button.setEnabled(False)
+        self._status_label = QLabel("Idle")
+        self._status_label.setMinimumWidth(180)
+        self._status_label.setStyleSheet("font-weight: 600;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("Flight recording"))
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        for button in self._record_buttons.values():
+            controls.addWidget(button)
+        controls.addWidget(self._stop_button)
+        controls.addWidget(QLabel("Save to"))
+        controls.addWidget(self._dir_edit, 1)
+        controls.addWidget(self._browse_button)
+        controls.addWidget(self._status_label)
+        layout.addLayout(controls)
+        layout.addWidget(
+            QLabel(
+                "Save CSV records telemetry and detections. Save MP4 adds left/right "
+                "overlay videos. Save Debug also adds a rosbag. Each detection stores "
+                "left/right bbox x1,y1,x2,y2 plus derived centers; vectors use FRD metres."
+            )
+        )
+        self.setToolTip(
+            "CSV: telemetry. MP4: CSV plus overlay video. Debug: MP4 plus rosbag. "
+            "Stop first to change the output directory."
+        )
+
+        self._browse_button.clicked.connect(self._choose_directory)
+        for mode, button in self._record_buttons.items():
+            button.clicked.connect(
+                lambda _checked=False, record_mode=mode: self._start_recording(record_mode)
+            )
+        self._stop_button.clicked.connect(self._stop_recording)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._poll_process)
+        self._timer.start(500)
+
+    def _choose_directory(self):
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select recording save root",
+            self._dir_edit.text().strip() or str(Path.cwd() / "bags"),
+        )
+        if directory:
+            self._dir_edit.setText(directory)
+
+    def _start_recording(self, mode):
+        if self._process is not None:
+            return
+        save_root = Path(self._dir_edit.text().strip() or Path.cwd() / "bags").expanduser()
+        try:
+            save_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self._set_status(f"Save directory failed: {exc}", error=True)
+            return
+        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        output_path = save_root / f"operator_{timestamp}_{mode}"
+        cmd = build_operator_recorder_command(
+            python_executable=os.environ.get("OPERATOR_RECORDER_PYTHON", "python3"),
+            mode=mode,
+            output_dir=output_path,
+        )
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+        except OSError as exc:
+            self._set_status(f"Start failed: {exc}", error=True)
+            return
+        self._record_mode = mode
+        self._record_path = output_path
+        self._last_record_path = output_path
+        self._set_record_buttons_enabled(False)
+        self._stop_button.setEnabled(True)
+        self._dir_edit.setEnabled(False)
+        self._browse_button.setEnabled(False)
+        self._set_locked_widgets_enabled(False)
+        self._set_status(f"Recording: {output_path.name}")
+
+    def _stop_recording(self):
+        if self._process is None:
+            return
+        process = self._process
+        self._set_status("Stopping…")
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=10.0)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5.0)
+        path = self._record_path
+        self._reset_controls()
+        self._set_status(f"Saved: {path.name}" if path else "Stopped")
+
+    def _poll_process(self):
+        if self._process is None:
+            return
+        return_code = self._process.poll()
+        if return_code is None:
+            return
+        path = self._record_path
+        self._reset_controls()
+        self._set_status(
+            f"Saved: {path.name if path else 'recording'}"
+            if return_code == 0
+            else f"Recorder exited: {return_code}",
+            error=return_code != 0,
+        )
+
+    def _reset_controls(self):
+        self._process = None
+        self._record_mode = None
+        self._record_path = None
+        self._set_record_buttons_enabled(True)
+        self._stop_button.setEnabled(False)
+        self._dir_edit.setEnabled(True)
+        self._browse_button.setEnabled(True)
+        self._set_locked_widgets_enabled(True)
+
+    def _set_locked_widgets_enabled(self, enabled):
+        for widget in self._lock_widgets:
+            widget.setEnabled(enabled)
+
+    def _set_record_buttons_enabled(self, enabled):
+        for button in self._record_buttons.values():
+            button.setEnabled(enabled)
+
+    def add_lock_widgets(self, *widgets):
+        self._lock_widgets += tuple(widgets)
+
+    def recording_csv_path(self):
+        if self._last_record_path is None:
+            return None
+        return self._last_record_path / "telemetry.csv"
+
+    def recording_session_path(self):
+        return self._last_record_path
+
+    def is_recording(self):
+        return self._process is not None and self._process.poll() is None
+
+    def _set_status(self, text, error=False):
+        self._status_label.setText(text)
+        color = "#b00020" if error else "#1b5e20"
+        self._status_label.setStyleSheet(f"font-weight: 600; color: {color};")
+
+    def shutdown(self):
+        self._timer.stop()
+        if self._process is not None:
+            self._stop_recording()
+
+
 class RecorderPanel(Plugin):
     def __init__(self, context):
         super().__init__(context)
@@ -84,8 +329,6 @@ class RecorderPanel(Plugin):
         self._process = None
         self._record_mode = None
         self._record_path = None
-        self._calibration_process = None
-        self._calibration_path = None
         self._ros_node = None
         self._ros_subscriptions = []
         self._latest = {
@@ -101,8 +344,10 @@ class RecorderPanel(Plugin):
         self._widget = QWidget()
         self._widget.setObjectName("RecorderPanelWidget")
         self._widget.setWindowTitle("Recorder")
-        self._widget.setMinimumHeight(104)
-        self._widget.setMaximumHeight(116)
+        # Keep this plugin as a compact recording toolbar. The primary display
+        # is standard rqt Image View plus Plot, so this panel must not consume
+        # their vertical workspace.
+        self._widget.setFixedHeight(42)
         self._widget.setAutoFillBackground(True)
         self._widget.setStyleSheet(
             "#RecorderPanelWidget {"
@@ -140,19 +385,11 @@ class RecorderPanel(Plugin):
 
         self._browse_button = QPushButton("...")
         self._browse_button.setFixedWidth(34)
-        self._lite_button = QPushButton("Start Lite")
-        self._full_button = QPushButton("Start Full")
-        self._debug_button = QPushButton("Start Debug")
+        self._record_buttons = {
+            mode: QPushButton(button_text) for mode, button_text in RECORDING_MODE_BUTTONS
+        }
         self._stop_button = QPushButton("Stop")
         self._stop_button.setEnabled(False)
-        self._truth_source_combo = QComboBox()
-        for label, value in TRUTH_SOURCE_OPTIONS:
-            self._truth_source_combo.addItem(label, value)
-        self._sim_oracle_check = QCheckBox("Gazebo oracle")
-        self._sim_oracle_check.setChecked(True)
-        self._calibration_start_button = QPushButton("Start Cal CSV")
-        self._calibration_stop_button = QPushButton("Stop Cal")
-        self._calibration_stop_button.setEnabled(False)
 
         root_layout = QVBoxLayout(self._widget)
         root_layout.setContentsMargins(8, 4, 8, 4)
@@ -160,42 +397,28 @@ class RecorderPanel(Plugin):
 
         control_layout = QHBoxLayout()
         control_layout.setSpacing(6)
-        control_layout.addWidget(QLabel("Record"))
-        control_layout.addWidget(self._lite_button)
-        control_layout.addWidget(self._full_button)
-        control_layout.addWidget(self._debug_button)
+        control_layout.addWidget(QLabel("Flight recording"))
+        for button in self._record_buttons.values():
+            control_layout.addWidget(button)
         control_layout.addWidget(self._stop_button)
-        control_layout.addWidget(QLabel("Save root"))
+        control_layout.addWidget(QLabel("Save to"))
         control_layout.addWidget(self._dir_edit, 1)
         control_layout.addWidget(self._browse_button)
-        control_layout.addWidget(QLabel("Truth"))
-        control_layout.addWidget(self._truth_source_combo)
-        control_layout.addWidget(self._sim_oracle_check)
-        control_layout.addWidget(self._calibration_start_button)
-        control_layout.addWidget(self._calibration_stop_button)
         control_layout.addWidget(self._status_label)
 
-        telemetry_layout = QGridLayout()
-        telemetry_layout.setContentsMargins(0, 0, 0, 0)
-        telemetry_layout.setHorizontalSpacing(18)
-        telemetry_layout.setVerticalSpacing(2)
-        telemetry_layout.addWidget(self._axis_contract_label, 0, 0, 1, 3)
-        telemetry_layout.addWidget(self._yolo_ms_label, 1, 0)
-        telemetry_layout.addWidget(self._yolo_hz_label, 1, 1)
-        telemetry_layout.addWidget(self._profile_label, 1, 2)
-        telemetry_layout.addWidget(self._truth_label, 2, 0)
-        telemetry_layout.addWidget(self._raw_label, 2, 1)
-        telemetry_layout.addWidget(self._corrected_label, 2, 2)
         root_layout.addLayout(control_layout)
-        root_layout.addLayout(telemetry_layout)
+        self._widget.setToolTip(
+            "CSV/bag recording controls. Saved detections include both image "
+            "bounding boxes (left/right x1,y1,x2,y2) and derived centers. "
+            "Plot data uses public FRD metres: Forward, Right, Down."
+        )
 
         self._browse_button.clicked.connect(self._choose_directory)
-        self._lite_button.clicked.connect(lambda: self._start_recording("lite"))
-        self._full_button.clicked.connect(lambda: self._start_recording("full"))
-        self._debug_button.clicked.connect(lambda: self._start_recording("debug"))
+        for mode, button in self._record_buttons.items():
+            button.clicked.connect(
+                lambda _checked=False, record_mode=mode: self._start_recording(record_mode)
+            )
         self._stop_button.clicked.connect(self._stop_recording)
-        self._calibration_start_button.clicked.connect(self._start_calibration_csv)
-        self._calibration_stop_button.clicked.connect(self._stop_calibration_csv)
 
         self._timer = QTimer(self._widget)
         self._timer.timeout.connect(self._poll_process)
@@ -389,81 +612,11 @@ class RecorderPanel(Plugin):
 
         self._record_mode = mode
         self._record_path = output_path
-        self._lite_button.setEnabled(False)
-        self._full_button.setEnabled(False)
-        self._debug_button.setEnabled(False)
+        self._set_record_buttons_enabled(False)
         self._stop_button.setEnabled(True)
         self._dir_edit.setEnabled(False)
         self._browse_button.setEnabled(False)
         self._set_status(f"REC {mode}: {output_path.name}")
-
-    def _selected_truth_source(self):
-        return str(self._truth_source_combo.currentData() or "local_ned")
-
-    def _start_calibration_csv(self):
-        if self._calibration_process is not None:
-            self._set_status("Calibration CSV already recording", error=True)
-            return
-
-        save_root = Path(self._dir_edit.text().strip() or Path.cwd() / "bags").expanduser()
-        save_root.mkdir(parents=True, exist_ok=True)
-        timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-        truth_source = self._selected_truth_source()
-        output_path = save_root / f"calibration_{timestamp}_{truth_source}.csv"
-        recorder_python = os.environ.get("OPERATOR_RECORDER_PYTHON", "python3")
-        sim_truth_topic = "/ground_truth_position" if self._sim_oracle_check.isChecked() else ""
-        cmd = build_calibration_recorder_command(
-            python_executable=recorder_python,
-            output_csv=output_path,
-            truth_source=truth_source,
-            sim_truth_topic=sim_truth_topic,
-            sim_truth_role="oracle",
-        )
-        try:
-            self._calibration_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=os.setsid,
-            )
-        except OSError as exc:
-            self._set_status(f"Cal start failed: {exc}", error=True)
-            self._calibration_process = None
-            return
-
-        self._calibration_path = output_path
-        self._truth_source_combo.setEnabled(False)
-        self._sim_oracle_check.setEnabled(False)
-        self._calibration_start_button.setEnabled(False)
-        self._calibration_stop_button.setEnabled(True)
-        self._set_status(f"CAL {truth_source}: {output_path.name}")
-
-    def _stop_calibration_csv(self):
-        if self._calibration_process is None:
-            return
-
-        process = self._calibration_process
-        self._set_status("Stopping calibration...")
-        try:
-            os.killpg(process.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
-
-        try:
-            process.wait(timeout=10.0)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            process.wait(timeout=5.0)
-
-        stopped_path = self._calibration_path
-        self._reset_calibration_controls()
-        if stopped_path is not None:
-            self._set_status(f"Cal saved: {stopped_path.name}")
-        else:
-            self._set_status("Calibration stopped")
 
     def _stop_recording(self):
         if self._process is None:
@@ -493,7 +646,6 @@ class RecorderPanel(Plugin):
             self._set_status("Stopped")
 
     def _poll_process(self):
-        self._poll_calibration_process()
         if self._process is None:
             return
 
@@ -508,37 +660,14 @@ class RecorderPanel(Plugin):
         else:
             self._set_status(f"Recorder exited: {return_code}", error=True)
 
-    def _poll_calibration_process(self):
-        if self._calibration_process is None:
-            return
-        return_code = self._calibration_process.poll()
-        if return_code is None:
-            return
-        path = self._calibration_path
-        self._reset_calibration_controls()
-        if return_code == 0:
-            self._set_status(f"Cal saved: {path.name if path else 'calibration.csv'}")
-        else:
-            self._set_status(f"Cal recorder exited: {return_code}", error=True)
-
     def _reset_controls(self):
         self._process = None
         self._record_mode = None
         self._record_path = None
-        self._lite_button.setEnabled(True)
-        self._full_button.setEnabled(True)
-        self._debug_button.setEnabled(True)
+        self._set_record_buttons_enabled(True)
         self._stop_button.setEnabled(False)
         self._dir_edit.setEnabled(True)
         self._browse_button.setEnabled(True)
-
-    def _reset_calibration_controls(self):
-        self._calibration_process = None
-        self._calibration_path = None
-        self._truth_source_combo.setEnabled(True)
-        self._sim_oracle_check.setEnabled(True)
-        self._calibration_start_button.setEnabled(True)
-        self._calibration_stop_button.setEnabled(False)
 
     def _set_status(self, text, error=False):
         self._status_label.setText(text)
@@ -547,6 +676,10 @@ class RecorderPanel(Plugin):
         else:
             self._status_label.setStyleSheet("font-weight: 600; color: #1b5e20;")
 
+    def _set_record_buttons_enabled(self, enabled):
+        for button in self._record_buttons.values():
+            button.setEnabled(enabled)
+
     def shutdown_plugin(self):
         if self._ros_node is not None:
             try:
@@ -554,7 +687,5 @@ class RecorderPanel(Plugin):
             except Exception:
                 pass
             self._ros_node = None
-        if self._calibration_process is not None:
-            self._stop_calibration_csv()
         if self._process is not None:
             self._stop_recording()

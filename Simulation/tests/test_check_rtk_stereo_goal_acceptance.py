@@ -155,7 +155,7 @@ def make_fixture(root: Path) -> tuple[Path, Path, Path, Path]:
         "px4_local_position_ned:north,east,down\n"
         "T_source_to_stereo_rdf\n"
         "synthetic mode\n"
-        "right_yaw_error_deg\n"
+        "cam_r_optical_yaw_deg\n"
         "measured_disparity_px\n"
         "/fmu/out/vehicle_local_position\n"
         "camera image topic\n"

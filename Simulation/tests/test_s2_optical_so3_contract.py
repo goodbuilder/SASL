@@ -24,9 +24,12 @@ from stereo_ground_sim.coordinate_frames import (
     nominal_camera_poses,
     optical_rpy_error_rotation,
     project_world_point_to_pixel,
+    rotation_to_sdf_rpy,
+    rpy_to_rotation_world_from_link,
     sdf_link_rpy_from_optical_error,
 )
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from camera_oracle_test_support import seed_observed_camera_oracle
 
 
 AXES = ("right_world_enu", "down_world_enu", "forward_world_enu")
@@ -69,10 +72,14 @@ def _node(left=(0.0, 0.0, 0.0), right=(0.0, 0.0, 0.0), common=(0.0, 0.0, 0.0), r
     node.camera_height_m = 5.0
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
-    for prefix, values in (("left", left), ("right", right)):
-        setattr(node, f"{prefix}_roll_error_deg", values[0])
-        setattr(node, f"{prefix}_pitch_error_deg", values[1])
-        setattr(node, f"{prefix}_yaw_error_deg", values[2])
+    for prefix, values in (("cam_l_optical", left), ("cam_r_optical", right)):
+        setattr(node, f"{prefix}_roll_deg", values[0])
+        setattr(node, f"{prefix}_pitch_deg", values[1])
+        setattr(node, f"{prefix}_yaw_deg", values[2])
+    for prefix in ("cam_l_px4", "cam_r_px4"):
+        setattr(node, f"{prefix}_roll_deg", 0.0)
+        setattr(node, f"{prefix}_pitch_deg", 0.0)
+        setattr(node, f"{prefix}_yaw_deg", 0.0)
     for prefix, values in (("common_optical", common), ("relative_optical", relative)):
         setattr(node, f"{prefix}_roll_error_deg", values[0])
         setattr(node, f"{prefix}_pitch_error_deg", values[1])
@@ -247,10 +254,14 @@ def _world_context(left_direct, right_direct, common, relative):
         "target_spawn_z_m": 0.75,
         "target_spawn_yaw_deg": -90.0,
     }
-    for prefix, rpy in (("left", left_direct), ("right", right_direct)):
-        values[f"{prefix}_roll_error_deg"] = rpy[0]
-        values[f"{prefix}_pitch_error_deg"] = rpy[1]
-        values[f"{prefix}_yaw_error_deg"] = rpy[2]
+    for prefix, rpy in (("cam_l_optical", left_direct), ("cam_r_optical", right_direct)):
+        values[f"{prefix}_roll_deg"] = rpy[0]
+        values[f"{prefix}_pitch_deg"] = rpy[1]
+        values[f"{prefix}_yaw_deg"] = rpy[2]
+    for prefix in ("cam_l_px4", "cam_r_px4"):
+        values[f"{prefix}_roll_deg"] = 0.0
+        values[f"{prefix}_pitch_deg"] = 0.0
+        values[f"{prefix}_yaw_deg"] = 0.0
     for prefix, rpy in (("common_optical", common), ("relative_optical", relative)):
         values[f"{prefix}_roll_error_deg"] = rpy[0]
         values[f"{prefix}_pitch_error_deg"] = rpy[1]
@@ -262,33 +273,49 @@ def _world_context(left_direct, right_direct, common, relative):
 
 
 @pytest.mark.parametrize(("left_direct", "right_direct", "common", "relative"), SO3_CASES)
-def test_generated_world_pose_round_trip_matches_node_actual_pose(monkeypatch, left_direct, right_direct, common, relative) -> None:
+def test_generated_world_pose_round_trip_matches_node_desired_pose(monkeypatch, left_direct, right_direct, common, relative) -> None:
     launch_module = _launch_module()
     monkeypatch.setattr(launch_module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
     world_path = launch_module._generate_world(_world_context(left_direct, right_direct, common, relative))
     root = ET.parse(world_path).getroot()
-    poses = {
-        model.attrib["name"]: tuple(float(value) for value in model.findtext("pose").split())
+    models = {
+        model.attrib["name"]: model
         for model in root.findall("./world/model")
         if model.attrib.get("name") in {"left_stereo_camera", "right_stereo_camera"}
     }
     node = _node(left_direct, right_direct, common, relative)
-    for name, actual in (
-        ("left_stereo_camera", node.actual_left_camera),
-        ("right_stereo_camera", node.actual_right_camera),
+    for name, desired in (
+        ("left_stereo_camera", node.desired_left_camera),
+        ("right_stereo_camera", node.desired_right_camera),
     ):
-        pose = poses[name]
-        from_world = camera_optical_pose_from_sdf_pose(pose[:3], pose[3:])
-        assert _max_pose_error(actual, from_world) <= 1.0e-8
-        assert from_world.center_world_enu_m == pytest.approx(actual.center_world_enu_m, abs=1.0e-12)
+        model = models[name]
+        pose = tuple(float(value) for value in model.findtext("pose").split())
+        optical = model.find("./link[@name='optical_link']")
+        assert optical is not None
+        optical_pose = tuple(float(value) for value in optical.findtext("pose").split())
+        parent_rotation = rpy_to_rotation_world_from_link(*pose[3:])
+        relative_rotation = rpy_to_rotation_world_from_link(*optical_pose[3:])
+        world_rotation = tuple(
+            tuple(
+                sum(parent_rotation[row][k] * relative_rotation[k][column] for k in range(3))
+                for column in range(3)
+            )
+            for row in range(3)
+        )
+        from_world = camera_optical_pose_from_sdf_pose(
+            pose[:3], rotation_to_sdf_rpy(world_rotation)
+        )
+        assert _max_pose_error(desired, from_world) <= 1.0e-8
+        assert from_world.center_world_enu_m == pytest.approx(desired.center_world_enu_m, abs=1.0e-12)
     assert node.baseline_center_frd.origin_world_enu_m == pytest.approx((0.0, 0.0, 5.0), abs=1.0e-12)
-    assert math.dist(node.actual_left_camera.center_world_enu_m, node.actual_right_camera.center_world_enu_m) == pytest.approx(25.0, abs=1.0e-12)
+    assert math.dist(node.desired_left_camera.center_world_enu_m, node.desired_right_camera.center_world_enu_m) == pytest.approx(25.0, abs=1.0e-12)
 
 
 @pytest.mark.parametrize(("left_direct", "right_direct", "common", "relative"), SO3_CASES)
-def test_same_pixel_actual_projection_raw_and_corrected_contract(left_direct, right_direct, common, relative) -> None:
+def test_same_pixel_observed_projection_raw_and_corrected_contract(left_direct, right_direct, common, relative) -> None:
     expected = (1000.0, 50.0, -5.0)
     node = _node(left_direct, right_direct, common, relative)
+    seed_observed_camera_oracle(node)
     point_world = node.baseline_center_frd.point_to_world(expected)
     left, right = node._ideal_detection_pair_from_reference_world(point_world, 1280, 720)
     assert left is not None and right is not None
@@ -316,18 +343,24 @@ def test_node_effective_state_metadata_and_nominal_baseline_are_complete() -> No
     assert mixed.baseline_center_frd == zero.baseline_center_frd
     metadata = mixed._pair_result_metadata(None, None, None, {"computation_status": "computed"}, count_alignment=False)
     expected_sources = {
-        "left_roll_error_deg": 0.03,
-        "left_pitch_error_deg": 0.01,
-        "left_yaw_error_deg": -0.02,
-        "right_roll_error_deg": -0.02,
-        "right_pitch_error_deg": 0.04,
-        "right_yaw_error_deg": 0.01,
+        "cam_l_optical_roll_deg": 0.03,
+        "cam_l_optical_pitch_deg": 0.01,
+        "cam_l_optical_yaw_deg": -0.02,
+        "cam_r_optical_roll_deg": -0.02,
+        "cam_r_optical_pitch_deg": 0.04,
+        "cam_r_optical_yaw_deg": 0.01,
         "common_optical_roll_error_deg": 0.02,
         "relative_optical_roll_error_deg": 0.01,
         "common_optical_pitch_error_deg": -0.04,
         "relative_optical_pitch_error_deg": 0.02,
         "common_optical_yaw_error_deg": 0.10,
         "relative_optical_yaw_error_deg": 0.04,
+        "cam_l_px4_roll_deg": 0.0,
+        "cam_l_px4_pitch_deg": 0.0,
+        "cam_l_px4_yaw_deg": 0.0,
+        "cam_r_px4_roll_deg": 0.0,
+        "cam_r_px4_pitch_deg": 0.0,
+        "cam_r_px4_yaw_deg": 0.0,
     }
     for name, value in expected_sources.items():
         assert metadata[name] == pytest.approx(value)
@@ -337,5 +370,5 @@ def test_node_effective_state_metadata_and_nominal_baseline_are_complete() -> No
     assert metadata["attitude_angle_unit"] == "deg"
     assert metadata["attitude_parameterization"] == "direct_plus_common_relative"
     assert metadata["attitude_rotation_composition"] == "R_Cnominal_Cactual=R_Down(yaw)@R_Right(pitch)@R_Forward(roll)"
-    assert metadata["correction_source"] == "injected_attitude_oracle"
+    assert metadata["correction_source"] == "gazebo_observed_optical_pose"
     assert metadata["output_frame"] == "baseline_center_frd"

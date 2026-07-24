@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -14,7 +15,9 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
 from stereo_ground_sim.coordinate_frames import (
     effective_optical_rpy_errors_deg,
+    relative_sdf_rpy,
     sdf_link_rpy_from_optical_error,
+    sdf_link_rpy_from_px4_frd_error,
 )
 
 
@@ -82,7 +85,7 @@ def _param_yaml_value(value):
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def _write_distance_node_params(context):
+def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256=""):
     float_params = {
         "baseline_m",
         "camera_height_m",
@@ -104,12 +107,18 @@ def _write_distance_node_params(context):
         "scenario_range_min_m",
         "scenario_range_max_m",
         "zoom_index",
-        "left_roll_error_deg",
-        "left_pitch_error_deg",
-        "left_yaw_error_deg",
-        "right_roll_error_deg",
-        "right_pitch_error_deg",
-        "right_yaw_error_deg",
+        "cam_l_optical_roll_deg",
+        "cam_l_optical_pitch_deg",
+        "cam_l_optical_yaw_deg",
+        "cam_r_optical_roll_deg",
+        "cam_r_optical_pitch_deg",
+        "cam_r_optical_yaw_deg",
+        "cam_l_px4_roll_deg",
+        "cam_l_px4_pitch_deg",
+        "cam_l_px4_yaw_deg",
+        "cam_r_px4_roll_deg",
+        "cam_r_px4_pitch_deg",
+        "cam_r_px4_yaw_deg",
         "common_optical_roll_error_deg",
         "relative_optical_roll_error_deg",
         "common_optical_pitch_error_deg",
@@ -117,6 +126,7 @@ def _write_distance_node_params(context):
         "common_optical_yaw_error_deg",
         "relative_optical_yaw_error_deg",
         "camera_update_rate_hz",
+        "gps_baseline_max_age_s",
     }
     int_params = {
         "yolo_imgsz",
@@ -140,6 +150,8 @@ def _write_distance_node_params(context):
         "enable_disparity_residual_profile",
         "enable_disparity_residual_feature_selector",
         "enable_research_recording",
+        "enable_gps_baseline_triangulation",
+        "enable_rviz_rays",
     }
     names = [
         "scenario_name",
@@ -163,12 +175,18 @@ def _write_distance_node_params(context):
         "target_spawn_z_m",
         "fly_target_in_gazebo",
         "target_model_name",
-        "left_roll_error_deg",
-        "left_pitch_error_deg",
-        "left_yaw_error_deg",
-        "right_roll_error_deg",
-        "right_pitch_error_deg",
-        "right_yaw_error_deg",
+        "cam_l_optical_roll_deg",
+        "cam_l_optical_pitch_deg",
+        "cam_l_optical_yaw_deg",
+        "cam_r_optical_roll_deg",
+        "cam_r_optical_pitch_deg",
+        "cam_r_optical_yaw_deg",
+        "cam_l_px4_roll_deg",
+        "cam_l_px4_pitch_deg",
+        "cam_l_px4_yaw_deg",
+        "cam_r_px4_roll_deg",
+        "cam_r_px4_pitch_deg",
+        "cam_r_px4_yaw_deg",
         "common_optical_roll_error_deg",
         "relative_optical_roll_error_deg",
         "common_optical_pitch_error_deg",
@@ -218,6 +236,14 @@ def _write_distance_node_params(context):
         "disparity_residual_feature_selector_catalog_path",
         "disparity_residual_feature_selector_window_size",
         "disparity_residual_feature_selector_min_samples",
+        "enable_gps_baseline_triangulation",
+        "gps_baseline_source",
+        "gps_baseline_left_topic",
+        "gps_baseline_right_topic",
+        "global_baseline_left_topic",
+        "global_baseline_right_topic",
+        "gps_baseline_max_age_s",
+        "enable_rviz_rays",
     ]
 
     params = {}
@@ -231,9 +257,14 @@ def _write_distance_node_params(context):
             params[name] = raw.strip().lower() in ("1", "true", "yes", "on")
         else:
             params[name] = raw
+    params["camera_oracle_generated_sdf_sha256"] = str(camera_oracle_generated_sdf_sha256)
 
-    params_file = os.path.join(tempfile.gettempdir(), "stereo_distance_node_params.yaml")
-    with open(params_file, "w", encoding="utf-8") as handle:
+    descriptor, params_file = tempfile.mkstemp(
+        prefix="stereo_distance_node_params_",
+        suffix=".yaml",
+        text=True,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write("/stereo_distance_node:\n")
         handle.write("  ros__parameters:\n")
         for name, value in params.items():
@@ -242,9 +273,13 @@ def _write_distance_node_params(context):
 
 
 def _write_overlay_node_params(context):
-    params_file = os.path.join(tempfile.gettempdir(), "detection_overlay_node_params.yaml")
+    descriptor, params_file = tempfile.mkstemp(
+        prefix="detection_overlay_node_params_",
+        suffix=".yaml",
+        text=True,
+    )
     overlay_publish_hz = float(LaunchConfiguration("overlay_publish_hz").perform(context))
-    with open(params_file, "w", encoding="utf-8") as handle:
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write("/detection_overlay_node:\n")
         handle.write("  ros__parameters:\n")
         handle.write(f"    overlay_publish_hz: {overlay_publish_hz}\n")
@@ -316,14 +351,14 @@ def _generate_world(context):
     )
     left_effective_rpy_deg, right_effective_rpy_deg = effective_optical_rpy_errors_deg(
         (
-            _float_config(context, "left_roll_error_deg"),
-            _float_config(context, "left_pitch_error_deg"),
-            _float_config(context, "left_yaw_error_deg"),
+            _float_config(context, "cam_l_optical_roll_deg"),
+            _float_config(context, "cam_l_optical_pitch_deg"),
+            _float_config(context, "cam_l_optical_yaw_deg"),
         ),
         (
-            _float_config(context, "right_roll_error_deg"),
-            _float_config(context, "right_pitch_error_deg"),
-            _float_config(context, "right_yaw_error_deg"),
+            _float_config(context, "cam_r_optical_roll_deg"),
+            _float_config(context, "cam_r_optical_pitch_deg"),
+            _float_config(context, "cam_r_optical_yaw_deg"),
         ),
         (
             _float_config(context, "common_optical_roll_error_deg"),
@@ -337,25 +372,67 @@ def _generate_world(context):
         ),
     )
     nominal_link_yaw = math.pi / 2.0
-    left_link_rpy = sdf_link_rpy_from_optical_error(
+    left_optical_world_rpy = sdf_link_rpy_from_optical_error(
         nominal_link_yaw,
         *(math.radians(value) for value in left_effective_rpy_deg),
     )
-    right_link_rpy = sdf_link_rpy_from_optical_error(
+    right_optical_world_rpy = sdf_link_rpy_from_optical_error(
         nominal_link_yaw,
         *(math.radians(value) for value in right_effective_rpy_deg),
     )
+    left_px4_world_rpy = sdf_link_rpy_from_px4_frd_error(
+        nominal_link_yaw,
+        *(
+            math.radians(_float_config(context, name))
+            for name in (
+                "cam_l_px4_roll_deg",
+                "cam_l_px4_pitch_deg",
+                "cam_l_px4_yaw_deg",
+            )
+        ),
+    )
+    right_px4_world_rpy = sdf_link_rpy_from_px4_frd_error(
+        nominal_link_yaw,
+        *(
+            math.radians(_float_config(context, name))
+            for name in (
+                "cam_r_px4_roll_deg",
+                "cam_r_px4_pitch_deg",
+                "cam_r_px4_yaw_deg",
+            )
+        ),
+    )
+    left_optical_relative_rpy = relative_sdf_rpy(
+        left_px4_world_rpy,
+        left_optical_world_rpy,
+    )
+    right_optical_relative_rpy = relative_sdf_rpy(
+        right_px4_world_rpy,
+        right_optical_world_rpy,
+    )
     left_pose = (
         f"{-baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{left_link_rpy[0]:.9f} {left_link_rpy[1]:.9f} {left_link_rpy[2]:.9f}"
+        f"{left_px4_world_rpy[0]:.9f} {left_px4_world_rpy[1]:.9f} {left_px4_world_rpy[2]:.9f}"
     )
     right_pose = (
         f"{baseline_m / 2.0:.6f} 0 {camera_height_m:.6f} "
-        f"{right_link_rpy[0]:.9f} {right_link_rpy[1]:.9f} {right_link_rpy[2]:.9f}"
+        f"{right_px4_world_rpy[0]:.9f} {right_px4_world_rpy[1]:.9f} {right_px4_world_rpy[2]:.9f}"
     )
+    left_optical_pose = "0 0 0 " + " ".join(f"{value:.9f}" for value in left_optical_relative_rpy)
+    right_optical_pose = "0 0 0 " + " ".join(f"{value:.9f}" for value in right_optical_relative_rpy)
 
     world = world.replace("<pose>-12.5 0 5.0 0 0 1.570796327</pose>", f"<pose>{left_pose}</pose>", 1)
     world = world.replace("<pose>12.5 0 5.0 0 0 1.570796327</pose>", f"<pose>{right_pose}</pose>", 1)
+    world = world.replace(
+        '<pose relative_to="base_link">0 0 0 0 0 0</pose>',
+        f'<pose relative_to="base_link">{left_optical_pose}</pose>',
+        1,
+    )
+    world = world.replace(
+        '<pose relative_to="base_link">0 0 0 0 0 0</pose>',
+        f'<pose relative_to="base_link">{right_optical_pose}</pose>',
+        1,
+    )
     for fov_value in ("1.0471975512", "0.154997710698"):
         world = world.replace(
             f"<horizontal_fov>{fov_value}</horizontal_fov>",
@@ -390,14 +467,79 @@ def _generate_world(context):
         static_enabled=target_static_for_research,
     )
 
-    generated = os.path.join(tempfile.gettempdir(), "stereo_ground_drone_attitude_error.sdf")
-    with open(generated, "w", encoding="utf-8") as handle:
+    descriptor, generated = tempfile.mkstemp(
+        prefix="stereo_ground_drone_attitude_error_",
+        suffix=".sdf",
+        text=True,
+    )
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(world)
     return generated
 
 
+def _camera_pose_diagnostic_parameters(context, generated_world):
+    """Freeze desired optical poses beside the exact generated SDF hash."""
+
+    baseline_m = _float_config(context, "baseline_m")
+    camera_height_m = _float_config(context, "camera_height_m")
+    left_effective_rpy_deg, right_effective_rpy_deg = effective_optical_rpy_errors_deg(
+        (
+            _float_config(context, "cam_l_optical_roll_deg"),
+            _float_config(context, "cam_l_optical_pitch_deg"),
+            _float_config(context, "cam_l_optical_yaw_deg"),
+        ),
+        (
+            _float_config(context, "cam_r_optical_roll_deg"),
+            _float_config(context, "cam_r_optical_pitch_deg"),
+            _float_config(context, "cam_r_optical_yaw_deg"),
+        ),
+        (
+            _float_config(context, "common_optical_roll_error_deg"),
+            _float_config(context, "common_optical_pitch_error_deg"),
+            _float_config(context, "common_optical_yaw_error_deg"),
+        ),
+        (
+            _float_config(context, "relative_optical_roll_error_deg"),
+            _float_config(context, "relative_optical_pitch_error_deg"),
+            _float_config(context, "relative_optical_yaw_error_deg"),
+        ),
+    )
+    nominal_link_yaw = math.pi / 2.0
+    optical_rpys = (
+        sdf_link_rpy_from_optical_error(
+            nominal_link_yaw, *(math.radians(value) for value in left_effective_rpy_deg)
+        ),
+        sdf_link_rpy_from_optical_error(
+            nominal_link_yaw, *(math.radians(value) for value in right_effective_rpy_deg)
+        ),
+    )
+    with open(generated_world, "rb") as handle:
+        generated_sdf_sha256 = hashlib.sha256(handle.read()).hexdigest()
+    return (
+        {
+            "camera_label": "left",
+            "parent_model_name": "left_stereo_camera",
+            "output_topic": "/simulation/camera_pose_diagnostics/left",
+            "desired_optical_position_world_enu_m": [-baseline_m / 2.0, 0.0, camera_height_m],
+            "desired_optical_rpy_world_rad": list(optical_rpys[0]),
+            "generated_sdf_sha256": generated_sdf_sha256,
+        },
+        {
+            "camera_label": "right",
+            "parent_model_name": "right_stereo_camera",
+            "output_topic": "/simulation/camera_pose_diagnostics/right",
+            "desired_optical_position_world_enu_m": [baseline_m / 2.0, 0.0, camera_height_m],
+            "desired_optical_rpy_world_rad": list(optical_rpys[1]),
+            "generated_sdf_sha256": generated_sdf_sha256,
+        },
+    )
+
+
 def _launch_setup(context, *args, **kwargs):
     world = _generate_world(context)
+    left_camera_pose_diagnostic, right_camera_pose_diagnostic = _camera_pose_diagnostic_parameters(
+        context, world
+    )
     share_dir = get_package_share_directory("stereo_ground_sim")
     models_dir = os.path.join(share_dir, "models")
     existing_resource_path = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
@@ -409,7 +551,10 @@ def _launch_setup(context, *args, **kwargs):
     )
 
     yolo_python = LaunchConfiguration("yolo_python")
-    distance_params_file = _write_distance_node_params(context)
+    distance_params_file = _write_distance_node_params(
+        context,
+        camera_oracle_generated_sdf_sha256=left_camera_pose_diagnostic["generated_sdf_sha256"],
+    )
     overlay_params_file = _write_overlay_node_params(context)
     gui_config = os.path.join(os.getcwd(), "config", "gazebo_operator.gui.config")
     gz_args = f"-r --gui-config {gui_config} {world}" if _bool_config(context, "gz_gui") else f"-r -s {world}"
@@ -448,7 +593,49 @@ def _launch_setup(context, *args, **kwargs):
             parameters=[
                 {
                     "parent_model_name": LaunchConfiguration("target_model_name"),
-                    "source_link_name": "base_link",
+                    "source_link_name": "",
+                }
+            ],
+            output="screen",
+        ),
+        Node(
+            package="stereo_ground_sim",
+            executable="gazebo_camera_pose_diagnostics",
+            name="gazebo_camera_pose_diagnostics_left",
+            parameters=[left_camera_pose_diagnostic],
+            output="screen",
+        ),
+        Node(
+            package="stereo_ground_sim",
+            executable="gazebo_camera_pose_diagnostics",
+            name="gazebo_camera_pose_diagnostics_right",
+            parameters=[right_camera_pose_diagnostic],
+            output="screen",
+        ),
+        Node(
+            package="stereo_ground_sim",
+            executable="camera_px4_pose_diagnostics",
+            name="camera_px4_pose_diagnostics_left",
+            parameters=[
+                {
+                    "camera_label": "left",
+                    "px4_odometry_topic": "/camera_left/fmu/out/vehicle_odometry",
+                    "gazebo_camera_diagnostic_topic": "/simulation/camera_pose_diagnostics/left",
+                    "output_topic": "/simulation/camera_px4_pose_diagnostics/left",
+                }
+            ],
+            output="screen",
+        ),
+        Node(
+            package="stereo_ground_sim",
+            executable="camera_px4_pose_diagnostics",
+            name="camera_px4_pose_diagnostics_right",
+            parameters=[
+                {
+                    "camera_label": "right",
+                    "px4_odometry_topic": "/camera_right/fmu/out/vehicle_odometry",
+                    "gazebo_camera_diagnostic_topic": "/simulation/camera_pose_diagnostics/right",
+                    "output_topic": "/simulation/camera_px4_pose_diagnostics/right",
                 }
             ],
             output="screen",
@@ -469,6 +656,17 @@ def _launch_setup(context, *args, **kwargs):
             package="stereo_ground_sim_overlay",
             executable="detection_overlay_node",
             parameters=[overlay_params_file],
+            output="screen",
+        ),
+        # Gazebo poses and RViz markers use World ENU directly. Gazebo does
+        # not publish that visualization frame into /tf, so register its
+        # identity relation to the ROS world root when RViz is enabled.
+        Node(
+            package="tf2_ros",
+            executable="static_transform_publisher",
+            name="gazebo_world_enu_tf",
+            arguments=["0", "0", "0", "0", "0", "0", "1", "world", "gazebo_world_enu"],
+            condition=IfCondition(LaunchConfiguration("launch_rviz")),
             output="screen",
         ),
         Node(
@@ -547,6 +745,7 @@ def generate_launch_description():
             DeclareLaunchArgument("target_model_name", default_value="x500_15m"),
             DeclareLaunchArgument("target_static_for_research", default_value="false"),
             DeclareLaunchArgument("yolo_model_path", default_value=""),
+            DeclareLaunchArgument("enable_yolo", default_value="true"),
             DeclareLaunchArgument("yolo_class_name", default_value="drone"),
             DeclareLaunchArgument("yolo_confidence", default_value="0.25"),
             DeclareLaunchArgument("yolo_device", default_value="cuda:0"),
@@ -555,6 +754,14 @@ def generate_launch_description():
             DeclareLaunchArgument("observation_mode", default_value="bbox_yolo"),
             DeclareLaunchArgument("measurement_queue_capacity", default_value="32"),
             DeclareLaunchArgument("enable_synthetic_detections", default_value="false"),
+            DeclareLaunchArgument("enable_gps_baseline_triangulation", default_value="false"),
+            DeclareLaunchArgument("gps_baseline_source", default_value="raw_gps"),
+            DeclareLaunchArgument("gps_baseline_left_topic", default_value="/camera_left/fmu/out/vehicle_gps_position"),
+            DeclareLaunchArgument("gps_baseline_right_topic", default_value="/camera_right/fmu/out/vehicle_gps_position"),
+            DeclareLaunchArgument("global_baseline_left_topic", default_value="/camera_left/fmu/out/vehicle_global_position"),
+            DeclareLaunchArgument("global_baseline_right_topic", default_value="/camera_right/fmu/out/vehicle_global_position"),
+            DeclareLaunchArgument("gps_baseline_max_age_s", default_value="2.5"),
+            DeclareLaunchArgument("enable_rviz_rays", default_value="true"),
             DeclareLaunchArgument("synthetic_detection_width_px", default_value="1280"),
             DeclareLaunchArgument("synthetic_detection_height_px", default_value="720"),
             DeclareLaunchArgument("synthetic_detection_bbox_size_px", default_value="32.0"),
@@ -600,12 +807,18 @@ def generate_launch_description():
             DeclareLaunchArgument("calibration_sim_truth_topic", default_value=""),
             DeclareLaunchArgument("calibration_sim_truth_role", default_value="oracle"),
             DeclareLaunchArgument("calibration_record_hz", default_value="10.0"),
-            DeclareLaunchArgument("left_roll_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("left_pitch_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("left_yaw_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("right_roll_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("right_pitch_error_deg", default_value="0.0"),
-            DeclareLaunchArgument("right_yaw_error_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_optical_roll_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_optical_pitch_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_optical_yaw_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_optical_roll_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_optical_pitch_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_optical_yaw_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_px4_roll_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_px4_pitch_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_px4_yaw_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_px4_roll_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_px4_pitch_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_px4_yaw_deg", default_value="0.0"),
             DeclareLaunchArgument("common_optical_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("relative_optical_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("common_optical_pitch_error_deg", default_value="0.0"),

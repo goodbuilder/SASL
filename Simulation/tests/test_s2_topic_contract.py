@@ -16,6 +16,6 @@ def test_canonical_point_stamped_topics_and_pair_stamp_contract() -> None:
     assert '"/stereo/ground_truth_position"' in source
     assert "message.header.frame_id = BASELINE_CENTER_FRD_FRAME" in source
     assert "pair_midpoint_stamp_ns" in source
-    assert '"correction_source": "injected_attitude_oracle"' in source
+    assert '"correction_source": "gazebo_observed_optical_pose"' in source
     assert "self.corrected_position_pub.publish" in source
     assert "self.attitude_corrected_position_pub.publish" in source

@@ -10,7 +10,7 @@ usage() {
 Usage:
   ./run_operator_view_with_calibration_profile.sh [options] [-- run_operator_view args...]
 
-Starts operator view with an exported estimated-to-truth StereoDistance runtime profile.
+Starts StereoCAM operator view with an exported estimated-to-truth runtime profile.
 
 Options:
   --profile-json FILE    Runtime profile JSON. Default: newest active_runtime_profile.json
@@ -43,7 +43,7 @@ Options:
 	  --disparity-residual-feature-catalog-json FILE
 	                         Residual profile catalog JSON for feature selector.
 	  --node-disparity-residual-feature-selector-json FILE
-	                         Enable StereoDistanceNode runtime residual feature selection.
+	                         Enable StereoCAM runtime residual feature selection.
 	  --node-disparity-residual-feature-catalog-json FILE
 	                         Residual profile catalog JSON for node-side feature selection.
 	  --node-disparity-residual-feature-window-size N

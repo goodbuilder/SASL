@@ -17,6 +17,8 @@ htmlcov/
 
 # Virtual environments and dependency installs
 .venv/
+.venv-px4/
+.venv-px4-*/
 venv/
 env/
 node_modules/
@@ -30,6 +32,10 @@ log/
 **/log/
 workspace/main/src/px4_msgs/
 workspace/live_measurement_check/
+
+# px4_msgs has one canonical reproducible checkout under workspace/main.
+# Do not vendor a second machine-local source tree into Simulation.
+Simulation/px4_msgs/
 
 # Local PX4 firmware checkout/build tree. Commit patches/docs instead.
 firmware/PX4-Autopilot/

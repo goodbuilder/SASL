@@ -29,8 +29,8 @@ def _node_for_parameter_test() -> StereoDistanceNode:
     node.baseline_center_frd = object()
     node.nominal_left_camera = object()
     node.nominal_right_camera = object()
-    node.actual_left_camera = object()
-    node.actual_right_camera = object()
+    node.desired_left_camera = object()
+    node.desired_right_camera = object()
     return node
 
 
@@ -45,8 +45,8 @@ def test_geometry_parameter_batch_is_rejected_before_any_mutation() -> None:
             "baseline_center_frd",
             "nominal_left_camera",
             "nominal_right_camera",
-            "actual_left_camera",
-            "actual_right_camera",
+            "desired_left_camera",
+            "desired_right_camera",
         )
     }
 
@@ -54,7 +54,7 @@ def test_geometry_parameter_batch_is_rejected_before_any_mutation() -> None:
         [
             _parameter("reference_distance_m", 999.0),
             _parameter("baseline_m", 40.0),
-            _parameter("left_yaw_error_deg", -0.25),
+            _parameter("cam_l_optical_yaw_deg", -0.25),
             _parameter("common_optical_pitch_error_deg", 0.1),
             _parameter("relative_optical_yaw_error_deg", 0.5),
         ]
@@ -77,12 +77,18 @@ def test_each_geometry_parameter_is_rejected_and_unrelated_parameter_remains_all
         "camera_height_m",
         "horizontal_fov_rad",
         "target_model_name",
-        "left_roll_error_deg",
-        "left_pitch_error_deg",
-        "left_yaw_error_deg",
-        "right_roll_error_deg",
-        "right_pitch_error_deg",
-        "right_yaw_error_deg",
+        "cam_l_optical_roll_deg",
+        "cam_l_optical_pitch_deg",
+        "cam_l_optical_yaw_deg",
+        "cam_r_optical_roll_deg",
+        "cam_r_optical_pitch_deg",
+        "cam_r_optical_yaw_deg",
+        "cam_l_px4_roll_deg",
+        "cam_l_px4_pitch_deg",
+        "cam_l_px4_yaw_deg",
+        "cam_r_px4_roll_deg",
+        "cam_r_px4_pitch_deg",
+        "cam_r_px4_yaw_deg",
         "common_optical_roll_error_deg",
         "relative_optical_roll_error_deg",
         "common_optical_pitch_error_deg",

@@ -579,6 +579,11 @@ def test_hash_and_json_parse_use_one_byte_snapshot(
         return digest
 
     monkeypatch.setattr(qualification_module, "sha256_file", replace_after_hash)
+    monkeypatch.setattr(
+        qualification_module,
+        "_validate_coordinate_contract_sources",
+        lambda *_args, **_kwargs: None,
+    )
     verify_freeze_anchor_artifacts(root, _anchor(), repository_root=REPOSITORY_ROOT)
     assert state_path.read_bytes() == initial_bytes
 

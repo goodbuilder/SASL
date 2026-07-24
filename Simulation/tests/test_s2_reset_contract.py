@@ -74,4 +74,4 @@ def test_ground_truth_source_link_is_parameterized_and_launch_uses_target_model(
         / "stereo_ground_sim.launch.py"
     ).read_text(encoding="utf-8")
     assert '"parent_model_name": LaunchConfiguration("target_model_name")' in launch
-    assert '"source_link_name": "base_link"' in launch
+    assert '"source_link_name": ""' in launch

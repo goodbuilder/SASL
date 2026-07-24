@@ -16,6 +16,7 @@ if str(PACKAGE_DIR) not in sys.path:
     sys.path.insert(0, str(PACKAGE_DIR))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from camera_oracle_test_support import seed_observed_camera_oracle
 from stereo_ground_sim.external_bbox_publisher import detection_values_from_rdf
 from stereo_ground_sim.gazebo_ground_truth_adapter import (
     parse_pose_v_payload,
@@ -247,6 +248,8 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         node.disparity_residual_profile = None
         node.disparity_residual_feature_selector = None
         node.disparity_residual_feature_selector_window = deque(maxlen=1)
+        node._ensure_camera_frames()
+        seed_observed_camera_oracle(node)
 
         left, right = StereoDistanceNode._synthetic_detection_pair_from_rdf(
             node,
@@ -376,6 +379,8 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         node.corrected_position_pub = FakePublisher()
         node.bbox_adjustment_pub = FakePublisher()
         node.profile_status_pub = FakePublisher()
+        node._ensure_camera_frames()
+        seed_observed_camera_oracle(node)
 
         left, right = StereoDistanceNode._synthetic_detection_pair_from_rdf(
             node,

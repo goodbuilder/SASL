@@ -12,6 +12,7 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from camera_oracle_test_support import seed_observed_camera_oracle
 
 
 def _node_for_metrics_test() -> StereoDistanceNode:
@@ -23,6 +24,7 @@ def _node_for_metrics_test() -> StereoDistanceNode:
     node.left_camera_error_rpy_rad = (0.0, 0.0, 0.0)
     node.right_camera_error_rpy_rad = (0.0, 0.0, 0.0)
     node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     node.bbox_center_adjustment = None
     node.disparity_residual_profile = None
     node.disparity_residual_feature_selector = None

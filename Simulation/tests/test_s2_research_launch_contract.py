@@ -84,10 +84,13 @@ def test_launch_writes_all_recording_parameters_with_native_types(tmp_path: Path
             "research_record_queue_capacity": "2048",
         }
     )
-    params_path = tmp_path / "params.yaml"
     monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
     actual_path = Path(module._write_distance_node_params(context))
-    assert actual_path == params_path.with_name("stereo_distance_node_params.yaml")
+    assert actual_path.parent == tmp_path
+    assert actual_path.name.startswith("stereo_distance_node_params_")
+    assert actual_path.suffix == ".yaml"
+    second_path = Path(module._write_distance_node_params(context))
+    assert second_path != actual_path
     params = yaml.safe_load(actual_path.read_text(encoding="utf-8"))[
         "/stereo_distance_node"
     ]["ros__parameters"]

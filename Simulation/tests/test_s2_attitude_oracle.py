@@ -8,6 +8,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from camera_oracle_test_support import seed_observed_camera_oracle
 
 
 def _node(common: float, relative: float):
@@ -19,6 +20,7 @@ def _node(common: float, relative: float):
     node.common_optical_yaw_error_deg = common
     node.relative_optical_yaw_error_deg = relative
     node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     return node
 
 
@@ -28,7 +30,9 @@ def _error(result, expected):
 
 def _observe_and_reconstruct(node, expected):
     point_world = node.baseline_center_frd.point_to_world(expected)
-    left, right = node._detection_pair_from_world(point_world, 1280, 720, projection_camera_mode="actual")
+    left, right = node._detection_pair_from_world(
+        point_world, 1280, 720, projection_camera_mode="gazebo_observed_optical"
+    )
     pixels = (left["cx"], left["cy"], right["cx"], right["cy"], 1280, 720)
     return node._triangulate_pixel_centers(*pixels), node._triangulate_pixel_centers_oracle(*pixels)
 

@@ -1,23 +1,52 @@
 import json
 import math
 import os
+import signal
+import subprocess
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
-from python_qt_binding.QtCore import QObject, Qt, QTimer, Signal
-from python_qt_binding.QtGui import QColor, QFont, QImage, QPainter, QPen, QPixmap
-from python_qt_binding.QtWidgets import QApplication, QGridLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
+from python_qt_binding.QtCore import QObject, Qt, QTimer, QUrl, Signal
+from python_qt_binding.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap
+from python_qt_binding.QtWidgets import (
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+    QSizePolicy,
+    QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 from qt_gui.plugin import Plugin
+
+from .recorder_panel import (
+    RecordingControls,
+    export_analysis_csv,
+    read_recent_csv_lines,
+    read_recent_csv_rows,
+)
 
 try:
     import rclpy
+    from rcl_interfaces.msg import ParameterType
+    from rcl_interfaces.srv import GetParameters, ListParameters
     from rclpy.qos import qos_profile_sensor_data
+    from geometry_msgs.msg import PointStamped
     from sensor_msgs.msg import Image
     from std_msgs.msg import Float32, Float32MultiArray, String
 except Exception:  # pragma: no cover - rqt can still load the widget shell.
     rclpy = None
+    ParameterType = None
+    GetParameters = None
+    ListParameters = None
     qos_profile_sensor_data = None
+    PointStamped = None
     Image = None
     Float32 = None
     Float32MultiArray = None
@@ -28,21 +57,37 @@ AXES = (
     ("Forward", 0),
     ("Right", 1),
     ("Down", 2),
+    ("Range", 3),
 )
 SERIES = (
-    ("truth", "/ground_truth_position", QColor(32, 86, 255)),
+    ("truth", "/ground_truth_position", QColor(55, 71, 79)),
     ("raw", "/stereo/estimated_position", QColor(220, 32, 32)),
-    ("corrected", "/stereo/corrected_position", QColor(0, 170, 170)),
+    ("optical", "/stereo/optical_position", QColor(0, 170, 170)),
+    ("ideal", "/stereo/ideal_position", QColor(32, 86, 255)),
+    ("raw_gps_baseline", "/stereo/raw_gps_baseline_position", QColor(235, 135, 0)),
 )
+SERIES_LABELS = {
+    "truth": "truth",
+    "raw": "Nominal stereo",
+    "optical": "Optical stereo",
+    "ideal": "Ideal reference",
+    "raw_gps_baseline": "raw GPS",
+}
+_IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
 IMAGE_TOPICS = (
-    ("Left Camera", "/left_camera/detection_image"),
-    ("Right Camera", "/right_camera/detection_image"),
+    (
+        "Left Camera",
+        "/left_camera/image" if _IMAGE_TOPIC_MODE == "raw" else "/left_camera/detection_image",
+    ),
+    (
+        "Right Camera",
+        "/right_camera/image" if _IMAGE_TOPIC_MODE == "raw" else "/right_camera/detection_image",
+    ),
 )
 try:
     PLOT_WINDOW_S = max(1.0, float(os.environ.get("RQT_PLOT_WINDOW_S", "30.0")))
 except ValueError:
     PLOT_WINDOW_S = 30.0
-
 
 class PanelBridge(QObject):
     image = Signal(str, object)
@@ -51,15 +96,20 @@ class PanelBridge(QObject):
     detections = Signal(list)
     profile = Signal(str)
     status = Signal(str)
+    runtime_parameters = Signal(str)
 
 
 class CameraView(QLabel):
+    _ASPECT_HEIGHT_PER_WIDTH = 9.0 / 16.0
+
     def __init__(self, title, parent=None):
         super().__init__(parent)
         self._title = title
         self._pixmap = None
-        self.setMinimumSize(480, 270)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMinimumSize(480, 480)
+        # The source pixmap must not dictate a column width: both stereo panes
+        # receive the same horizontal share, then request their 16:9 height.
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.MinimumExpanding)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background: #202428; color: #d7dee5; font-weight: 600;")
         self.setText(f"{title}\nwaiting for image")
@@ -76,6 +126,12 @@ class CameraView(QLabel):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._refresh_pixmap()
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return max(480, int(width * self._ASPECT_HEIGHT_PER_WIDTH))
 
     def _refresh_pixmap(self):
         if self._pixmap is None:
@@ -126,6 +182,139 @@ class CameraView(QLabel):
         return QImage(packed, width, height, min_step, fmt).copy()
 
 
+class TelemetryFacts(QWidget):
+    """Direct telemetry values only; the operator makes any quality judgment."""
+
+    def __init__(self, model_filename, parent=None):
+        super().__init__(parent)
+        self._latest = {
+            "truth": [math.nan] * 4,
+            "raw": [math.nan] * 4,
+            "optical": [math.nan] * 4,
+            "ideal": [math.nan] * 4,
+            "raw_gps_baseline": [math.nan] * 4,
+        }
+        self._latest_scalars = {"yolo_hz": math.nan, "yolo_ms": math.nan}
+        self._profile_text = "--"
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setHorizontalSpacing(18)
+        layout.setVerticalSpacing(4)
+        self._model_label = QLabel(f"Model: {model_filename}")
+        self._profile_label = QLabel("Profile: --")
+        self._yolo_label = QLabel("YOLO: --")
+        self._truth_label = QLabel("Truth F/R/D/R: --")
+        self._raw_label = QLabel("Nominal stereo F/R/D/R: --")
+        self._corrected_label = QLabel("Optical stereo F/R/D/R: --")
+        self._ideal_label = QLabel("Ideal reference F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("Raw GPS baseline F/R/D/R: --")
+        self._detection_label = QLabel("BBox L/R: --")
+        labels = (
+            self._model_label,
+            self._profile_label,
+            self._yolo_label,
+            self._truth_label,
+            self._raw_label,
+            self._corrected_label,
+            self._ideal_label,
+            self._raw_gps_baseline_label,
+            self._detection_label,
+        )
+        for label in labels:
+            label.setStyleSheet("font-weight: 600; color: #263238;")
+        layout.addWidget(self._model_label, 0, 0)
+        layout.addWidget(self._profile_label, 0, 1)
+        layout.addWidget(self._yolo_label, 0, 2)
+        layout.addWidget(self._truth_label, 1, 0)
+        layout.addWidget(self._raw_label, 1, 1)
+        layout.addWidget(self._corrected_label, 1, 2)
+        layout.addWidget(self._ideal_label, 2, 0)
+        layout.addWidget(self._raw_gps_baseline_label, 2, 1)
+        layout.addWidget(self._detection_label, 3, 0, 1, 3)
+        self.setStyleSheet(
+            "TelemetryFacts { background: #eef3f6; border: 1px solid #b0bec5; }"
+            "QLabel { padding: 1px 2px; }"
+        )
+
+    @staticmethod
+    def _format_float(value, precision=1):
+        if value is None or not math.isfinite(float(value)):
+            return "--"
+        return f"{float(value):.{precision}f}"
+
+    def _format_frd(self, values):
+        return "/".join(self._format_float(value, 1) for value in values[:4])
+
+    def update_sample(self, series_name, values):
+        parsed = []
+        for index in range(4):
+            try:
+                parsed.append(float(values[index]))
+            except (IndexError, TypeError, ValueError):
+                parsed.append(math.nan)
+        self._latest[series_name] = parsed
+        self._refresh()
+
+    def update_scalar(self, key, value):
+        try:
+            self._latest_scalars[key] = float(value)
+        except (TypeError, ValueError):
+            self._latest_scalars[key] = math.nan
+        self._refresh()
+
+    def update_profile(self, payload):
+        try:
+            parsed = json.loads(str(payload))
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            profile_id = str(parsed.get("profile_id") or "--")
+            mode = str(parsed.get("profile_mode") or parsed.get("mode") or "--")
+            fallback = str(parsed.get("fallback_reason") or "")
+            self._profile_text = f"{profile_id}/{mode}" + (f" {fallback}" if fallback else "")
+        else:
+            self._profile_text = str(payload)[:120] or "--"
+        self._refresh()
+
+    def update_detections(self, values):
+        try:
+            data = [float(value) for value in values]
+        except (TypeError, ValueError):
+            data = []
+        if len(data) < 16:
+            self._detection_label.setText("BBox L/R: --")
+            return
+        left = ",".join(self._format_float(value, 0) for value in data[1:5])
+        right = ",".join(self._format_float(value, 0) for value in data[9:13])
+        disparity = self._format_float(data[6] - data[14], 1)
+        confidence = "/".join(self._format_float(value, 2) for value in (data[5], data[13]))
+        self._detection_label.setText(
+            f"BBox L[x1,y1,x2,y2]={left}  R[x1,y1,x2,y2]={right}  "
+            f"disparity={disparity}px  conf L/R={confidence}"
+        )
+
+    def _refresh(self):
+        self._profile_label.setText(f"Profile: {self._profile_text}")
+        self._yolo_label.setText(
+            "YOLO: "
+            f"{self._format_float(self._latest_scalars['yolo_hz'])} Hz / "
+            f"{self._format_float(self._latest_scalars['yolo_ms'])} ms"
+        )
+        self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth'])}")
+        self._raw_label.setText(f"Nominal stereo F/R/D/R: {self._format_frd(self._latest['raw'])}")
+        self._corrected_label.setText(
+            f"Optical stereo F/R/D/R: {self._format_frd(self._latest['optical'])}"
+        )
+        self._ideal_label.setText(
+            f"Ideal reference F/R/D/R: {self._format_frd(self._latest['ideal'])}"
+        )
+        self._raw_gps_baseline_label.setText(
+            "Raw GPS baseline F/R/D/R: "
+            f"{self._format_frd(self._latest['raw_gps_baseline'])}"
+        )
+
+
 class ExperimentHud(QWidget):
     def __init__(self, model_filename, parent=None):
         super().__init__(parent)
@@ -133,6 +322,8 @@ class ExperimentHud(QWidget):
             "truth": [math.nan, math.nan, math.nan, math.nan],
             "raw": [math.nan, math.nan, math.nan, math.nan],
             "corrected": [math.nan, math.nan, math.nan, math.nan],
+            "raw_gps_baseline": [math.nan, math.nan, math.nan, math.nan],
+            "global_position_baseline": [math.nan, math.nan, math.nan, math.nan],
         }
         self._latest_stamp = {}
         self._error_history = {
@@ -140,6 +331,10 @@ class ExperimentHud(QWidget):
             "corrected_forward": deque(),
             "raw_down": deque(),
             "corrected_down": deque(),
+            "raw_gps_baseline_forward": deque(),
+            "raw_gps_baseline_down": deque(),
+            "global_position_baseline_forward": deque(),
+            "global_position_baseline_down": deque(),
         }
         self._detection_history = deque()
         self._latest_detection = {
@@ -172,8 +367,11 @@ class ExperimentHud(QWidget):
         self._truth_label = QLabel("Truth F/R/D/R: --")
         self._raw_label = QLabel("Raw F/R/D/R: --")
         self._corrected_label = QLabel("Corrected F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("Raw GPS baseline F/R/D/R: --")
+        self._global_baseline_label = QLabel("GlobalPosition baseline F/R/D/R: --")
         self._forward_error_label = QLabel("Forward Δ raw/corr: --")
         self._down_error_label = QLabel("Down Δ raw/corr: --")
+        self._gps_baseline_error_label = QLabel("PX4 baseline ΔF raw/global: --")
         self._detection_label = QLabel("Detections: --")
         self._contract_label = QLabel(contract)
 
@@ -192,6 +390,8 @@ class ExperimentHud(QWidget):
             self._truth_label,
             self._raw_label,
             self._corrected_label,
+            self._raw_gps_baseline_label,
+            self._global_baseline_label,
             self._contract_label,
         ):
             label.setStyleSheet("font-weight: 600; color: #263238;")
@@ -207,12 +407,295 @@ class ExperimentHud(QWidget):
         layout.addWidget(self._detection_label, 1, 3)
         layout.addWidget(self._forward_error_label, 2, 0, 1, 2)
         layout.addWidget(self._down_error_label, 2, 2, 1, 2)
-        layout.addWidget(self._contract_label, 3, 0, 1, 4)
+        layout.addWidget(self._raw_gps_baseline_label, 3, 0, 1, 2)
+        layout.addWidget(self._global_baseline_label, 3, 2, 1, 2)
+        layout.addWidget(self._gps_baseline_error_label, 4, 0, 1, 2)
+        layout.addWidget(self._contract_label, 5, 0, 1, 4)
         self.setStyleSheet(
             "ExperimentHud { background: #eef3f6; border: 1px solid #b0bec5; }"
             "QLabel { padding: 1px 2px; }"
         )
         self._refresh()
+
+
+class LiveSavedCsvPreview(QWidget):
+    """Read-only view of complete persisted CSV rows from the active session."""
+
+    _TABLE_VIEWS = (
+        (
+            "Summary",
+            (
+                ("time_sec", "Time (s)"),
+                ("ground_truth_m", "Truth range (m)"),
+                ("raw_range_m", "Nominal range (m)"),
+                ("raw_gps_baseline_forward_m", "Raw GPS F (m)"),
+            ),
+        ),
+        (
+            "Raw GPS",
+            (
+                ("time_sec", "Time (s)"),
+                ("raw_gps_baseline_forward_m", "Raw GPS F (m)"),
+                ("raw_gps_baseline_right_m", "Raw GPS R (m)"),
+                ("raw_gps_baseline_down_m", "Raw GPS D (m)"),
+                ("raw_gps_baseline_position_error_m", "Raw GPS position error (m)"),
+            ),
+        ),
+        (
+            "BBox",
+            (
+                ("time_sec", "Time (s)"),
+                ("left_bbox", "Left bbox (x1,y1,x2,y2)"),
+                ("left_confidence", "Left confidence"),
+                ("right_bbox", "Right bbox (x1,y1,x2,y2)"),
+                ("right_confidence", "Right confidence"),
+                ("raw_disparity_px", "Raw disparity (px)"),
+                ("yolo_measurement_raw_range_m", "YOLO range (m)"),
+            ),
+        ),
+        (
+            "PX4 / Camera",
+            tuple(
+                [
+                    ("time_sec", "Time (s)"),
+                ]
+                + [
+                    column
+                    for label in ("left", "right")
+                    for column in (
+                        (f"{label}_raw_gps_lat_deg", f"{label.title()} Raw GPS lat"),
+                        (f"{label}_raw_gps_lon_deg", f"{label.title()} Raw GPS lon"),
+                        (f"{label}_raw_gps_alt_msl_m", f"{label.title()} Raw GPS alt"),
+                        (f"{label}_px4_position_n_m", f"{label.title()} PX4 N"),
+                        (f"{label}_px4_position_e_m", f"{label.title()} PX4 E"),
+                        (f"{label}_px4_position_d_m", f"{label.title()} PX4 D"),
+                        (f"{label}_px4_attitude_world_enu_roll_deg", f"{label.title()} R ENU"),
+                        (f"{label}_px4_attitude_world_enu_pitch_deg", f"{label.title()} P ENU"),
+                        (f"{label}_px4_attitude_world_enu_yaw_deg", f"{label.title()} Y ENU"),
+                        (f"{label}_px4_velocity_n_m_s", f"{label.title()} Vn"),
+                        (f"{label}_px4_velocity_e_m_s", f"{label.title()} Ve"),
+                        (f"{label}_px4_velocity_d_m_s", f"{label.title()} Vd"),
+                        (f"{label}_px4_estimated_optical_world_enu_x_m", f"{label.title()} Cam X"),
+                        (f"{label}_px4_estimated_optical_world_enu_y_m", f"{label.title()} Cam Y"),
+                        (f"{label}_px4_estimated_optical_world_enu_z_m", f"{label.title()} Cam Z"),
+                        (f"{label}_px4_estimated_optical_world_enu_roll_deg", f"{label.title()} Cam R"),
+                        (f"{label}_px4_estimated_optical_world_enu_pitch_deg", f"{label.title()} Cam P"),
+                        (f"{label}_px4_estimated_optical_world_enu_yaw_deg", f"{label.title()} Cam Yaw"),
+                    )
+                ]
+            ),
+        ),
+    )
+
+    def __init__(self, recording_controls, parent=None):
+        super().__init__(parent)
+        self._recording_controls = recording_controls
+        self._stopped = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        layout.addWidget(QLabel("Live saved CSV preview"))
+        self._state_label = QLabel("No CSV session has been started.")
+        self._state_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self._state_label)
+        self._coverage_label = QLabel("Coverage: --")
+        self._coverage_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self._coverage_label)
+        self._views = QTabWidget()
+        self._tables = {}
+        for view_name, columns in self._TABLE_VIEWS:
+            table = self._create_table(columns)
+            self._tables[view_name] = (table, columns)
+            self._views.addTab(table, view_name)
+        raw_tab = QWidget()
+        raw_layout = QVBoxLayout(raw_tab)
+        raw_layout.setContentsMargins(8, 8, 8, 8)
+        raw_layout.addWidget(QLabel("Raw CSV tail (header + latest complete rows)"))
+        self._raw_preview = QPlainTextEdit()
+        self._raw_preview.setReadOnly(True)
+        self._raw_preview.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self._raw_preview.setStyleSheet("font-family: monospace;")
+        self._raw_preview.setPlainText("Save CSV, Save MP4, or Save Debug in Setup to display persisted telemetry rows here.")
+        raw_layout.addWidget(self._raw_preview, 1)
+        self._views.addTab(raw_tab, "Raw CSV")
+        layout.addWidget(self._views, 1)
+        actions = QHBoxLayout()
+        self._open_session_button = QPushButton("Open session")
+        self._open_csv_button = QPushButton("Open CSV")
+        self._open_xlsx_button = QPushButton("Open XLSX")
+        self._export_button = QPushButton("Export analysis CSV")
+        actions.addWidget(self._open_session_button)
+        actions.addWidget(self._open_csv_button)
+        actions.addWidget(self._open_xlsx_button)
+        actions.addWidget(self._export_button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self._refresh_button = QPushButton("Refresh saved CSV preview")
+        self._refresh_button.clicked.connect(self.refresh)
+        layout.addWidget(self._refresh_button)
+        self._open_session_button.clicked.connect(self._open_session)
+        self._open_csv_button.clicked.connect(self._open_csv)
+        self._open_xlsx_button.clicked.connect(self._open_xlsx)
+        self._export_button.clicked.connect(self._export_analysis_csv)
+        self._last_signature = None
+        QTimer.singleShot(500, self._refresh_periodically)
+
+    @staticmethod
+    def _file_signature(path):
+        try:
+            stat = Path(path).stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    @staticmethod
+    def _format_bbox(row, side):
+        values = [row.get(f"{side}_{axis}", "") for axis in ("x1", "y1", "x2", "y2")]
+        return ", ".join(values) if any(values) else ""
+
+    @staticmethod
+    def _create_table(columns):
+        table = QTableWidget(0, len(columns))
+        table.setHorizontalHeaderLabels([label for _field, label in columns])
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setStretchLastSection(True)
+        return table
+
+    def _set_action_state(self, csv_path):
+        session_path = self._recording_controls.recording_session_path()
+        ready = (
+            csv_path is not None
+            and Path(csv_path).is_file()
+            and session_path is not None
+            and not self._recording_controls.is_recording()
+        )
+        self._open_session_button.setEnabled(ready)
+        self._open_csv_button.setEnabled(ready)
+        self._open_xlsx_button.setEnabled(
+            ready and Path(session_path, "session.xlsx").is_file()
+        )
+        self._export_button.setEnabled(ready)
+
+    def _update_tables(self, rows):
+        for table, columns in self._tables.values():
+            table.setRowCount(len(rows))
+            for row_index, row in enumerate(rows):
+                values = {
+                    "left_bbox": self._format_bbox(row, "left"),
+                    "right_bbox": self._format_bbox(row, "right"),
+                    **row,
+                }
+                for column_index, (field, _label) in enumerate(columns):
+                    table.setItem(row_index, column_index, QTableWidgetItem(values.get(field, "")))
+            table.resizeColumnsToContents()
+
+    def _set_progress_text(self, csv_path, progress):
+        recording = self._recording_controls.is_recording()
+        state = "Writing" if recording else "Last saved"
+        if progress:
+            state = "Writing" if progress.get("state") == "writing" else "Finalized"
+            mode = progress.get("mode", "--")
+            rows = progress.get("row_count", "--")
+            elapsed = progress.get("elapsed_sec", "--")
+            xlsx_status = progress.get("xlsx_status", "unavailable")
+            self._state_label.setText(
+                f"{state} · {mode} · {rows} rows · {elapsed} s · XLSX {xlsx_status} · {csv_path}"
+            )
+            valid = progress.get("valid_row_counts", {})
+            pair_count = min(valid.get("left_x1", 0), valid.get("right_x1", 0))
+            self._coverage_label.setText(
+                "Coverage (facts only): "
+                f"Ground truth {valid.get('ground_truth_m', 0)}/{rows} · "
+                f"Stereo {valid.get('raw_range_m', 0)}/{rows} · "
+                f"Raw GPS baseline {valid.get('raw_gps_baseline_forward_m', 0)}/{rows} · "
+                f"bbox pair {pair_count}/{rows}"
+            )
+            return
+        self._state_label.setText(f"{state}: {csv_path}")
+        self._coverage_label.setText("Coverage: progress.json is unavailable for this older session.")
+
+    def refresh(self, force=False):
+        csv_path = self._recording_controls.recording_csv_path()
+        if csv_path is None:
+            self._state_label.setText("No CSV session has been started.")
+            self._coverage_label.setText("Coverage: --")
+            self._update_tables([])
+            self._raw_preview.setPlainText(
+                "Save CSV, Save MP4, or Save Debug in Setup to display persisted telemetry rows here."
+            )
+            self._set_action_state(None)
+            return
+        progress_path = Path(csv_path).with_name("progress.json")
+        signature = (self._file_signature(csv_path), self._file_signature(progress_path))
+        if not force and signature == self._last_signature:
+            self._set_action_state(csv_path)
+            return
+        self._last_signature = signature
+        try:
+            preview = read_recent_csv_lines(csv_path, data_row_count=3)
+            rows = read_recent_csv_rows(csv_path, data_row_count=5)
+        except FileNotFoundError:
+            preview = "Waiting for recorder to create telemetry.csv…"
+            rows = []
+        except OSError as exc:
+            preview = f"CSV preview unavailable: {exc}"
+            rows = []
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            progress = None
+        self._set_progress_text(csv_path, progress)
+        self._update_tables(rows)
+        self._raw_preview.setPlainText(preview)
+        self._set_action_state(csv_path)
+
+    def _refresh_periodically(self):
+        if self._stopped:
+            return
+        self.refresh()
+        QTimer.singleShot(
+            500 if self._recording_controls.is_recording() else 2000,
+            self._refresh_periodically,
+        )
+
+    def _open_path(self, path):
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).resolve()))):
+            self._state_label.setText(f"Could not open: {path}")
+
+    def _open_session(self):
+        session_path = self._recording_controls.recording_session_path()
+        if session_path is not None:
+            self._open_path(session_path)
+
+    def _open_csv(self):
+        csv_path = self._recording_controls.recording_csv_path()
+        if csv_path is not None and Path(csv_path).is_file():
+            self._open_path(csv_path)
+
+    def _open_xlsx(self):
+        session_path = self._recording_controls.recording_session_path()
+        if session_path is None:
+            return
+        xlsx_path = Path(session_path) / "session.xlsx"
+        if xlsx_path.is_file():
+            self._open_path(xlsx_path)
+
+    def _export_analysis_csv(self):
+        csv_path = self._recording_controls.recording_csv_path()
+        if csv_path is None or self._recording_controls.is_recording():
+            return
+        output_path = Path(csv_path).with_name("analysis.csv")
+        try:
+            export_analysis_csv(csv_path, output_path)
+        except OSError as exc:
+            self._state_label.setText(f"Analysis export failed: {exc}")
+            return
+        self._state_label.setText(f"Analysis export saved: {output_path}")
+
+    def shutdown(self):
+        self._stopped = True
 
     def update_sample(self, series_name, values):
         now = time.monotonic()
@@ -227,7 +710,9 @@ class ExperimentHud(QWidget):
             frd.append(value)
         self._latest[series_name] = frd
         self._latest_stamp[series_name] = now
-        if series_name in ("raw", "corrected"):
+        if series_name in (
+            "raw", "corrected", "raw_gps_baseline", "global_position_baseline"
+        ):
             self._append_error_sample(series_name, axis_index=0, axis_name="forward", now=now)
             self._append_error_sample(series_name, axis_index=2, axis_name="down", now=now)
         self._prune(now)
@@ -368,6 +853,14 @@ class ExperimentHud(QWidget):
             self._corrected_label.setText("Corrected F/R/D/R: NOT CONFIGURED")
         else:
             self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(corrected)}")
+        self._raw_gps_baseline_label.setText(
+            "Raw GPS baseline F/R/D/R: "
+            f"{self._format_frd(self._latest['raw_gps_baseline'])}"
+        )
+        self._global_baseline_label.setText(
+            "GlobalPosition baseline F/R/D/R: "
+            f"{self._format_frd(self._latest['global_position_baseline'])}"
+        )
         raw_f = self._latest_error("raw_forward")
         corr_f = self._latest_error("corrected_forward")
         raw_f_rmse = self._rmse("raw_forward")
@@ -390,6 +883,13 @@ class ExperimentHud(QWidget):
             f"RMSE{PLOT_WINDOW_S:.0f}s "
             f"{self._format_float(raw_d_rmse, 2)} / {self._format_float(corr_d_rmse, 2)}"
         )
+        raw_gps_f = self._latest_error("raw_gps_baseline_forward")
+        global_f = self._latest_error("global_position_baseline_forward")
+        self._gps_baseline_error_label.setText(
+            "PX4 baseline ΔF raw/global: "
+            f"{self._format_float(raw_gps_f, 2, signed=True)} / "
+            f"{self._format_float(global_f, 2, signed=True)} m"
+        )
         ratio = self._valid_ratio()
         ratio_text = "--" if not math.isfinite(ratio) else f"{ratio * 100.0:.0f}%"
         disparity = self._format_float(self._latest_detection["disparity_px"], 1)
@@ -404,7 +904,7 @@ class ExperimentHud(QWidget):
 class FrdPlotStack(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(660, 720)
+        self.setMinimumSize(660, 880)
         self.samples = {
             axis_name: {series_name: deque() for series_name, _, _ in SERIES}
             for axis_name, _ in AXES
@@ -431,12 +931,16 @@ class FrdPlotStack(QWidget):
         painter.fillRect(self.rect(), QColor(250, 250, 250))
         painter.setRenderHint(QPainter.Antialiasing, True)
         margin_left = 68
-        margin_right = 18
+        margin_right = 190
         margin_top = 34
         margin_bottom = 28
-        gap = 26
+        gap = 22
         width = max(1, self.width() - margin_left - margin_right)
-        pane_height = max(1, (self.height() - margin_top - margin_bottom - gap * 2) / 3)
+        pane_height = max(
+            1,
+            (self.height() - margin_top - margin_bottom - gap * (len(AXES) - 1))
+            / len(AXES),
+        )
 
         now = time.monotonic()
         window_s = PLOT_WINDOW_S
@@ -476,19 +980,20 @@ class FrdPlotStack(QWidget):
 
             painter.setPen(QPen(QColor(32, 32, 32), 1))
             painter.setFont(QFont("Sans", 11, QFont.Bold))
-            painter.drawText(left, top - 10, f"{axis_name} axis, stereo-center FRD meters")
+            painter.drawText(left, top - 10, f"{axis_name} (FRD m)")
             painter.setFont(QFont("Sans", 9))
             painter.drawText(8, top + 14, f"{ymax:.1f}")
             painter.drawText(8, bottom, f"{ymin:.1f}")
 
-            legend_x = left + 310
+            legend_x = right + 12
+            legend_y = top + 16
             painter.setFont(QFont("Sans", 10))
             for series_name, _topic, color in SERIES:
                 painter.setPen(QPen(color, 3))
-                painter.drawLine(legend_x, top - 14, legend_x + 24, top - 14)
+                painter.drawLine(legend_x, legend_y, legend_x + 20, legend_y)
                 painter.setPen(QPen(QColor(32, 32, 32), 1))
-                painter.drawText(legend_x + 30, top - 9, series_name)
-                legend_x += 116
+                painter.drawText(legend_x + 26, legend_y + 5, SERIES_LABELS[series_name])
+                legend_y += 20
 
             for series_name, _topic, color in SERIES:
                 points = [
@@ -522,47 +1027,178 @@ class OperatorPanel(Plugin):
         super().__init__(context)
         self.setObjectName("OperatorPanel")
         self._ros_node = None
+        self._parameter_get_client = None
+        self._parameter_list_client = None
+        self._ros_graph_process = None
         self._spin_thread = None
         self._stop_event = threading.Event()
         self._bridge = PanelBridge()
 
         self._widget = QWidget()
-        self._widget.setWindowTitle("Stereo Operator Panel")
+        self._widget.setWindowTitle("StereoCAM Operator Panel")
         root = QVBoxLayout(self._widget)
+        root.setContentsMargins(6, 6, 6, 6)
         model_path = os.environ.get("RQT_YOLO_MODEL_PATH", "").strip()
         model_filename = os.path.basename(model_path) if model_path else "not configured"
-        self._hud = ExperimentHud(model_filename)
-        root.addWidget(self._hud)
         self._status = QLabel(
-            "Image left: left camera over right camera. Graphs right: Forward, Right, Down. "
-            "FRD contract data[0]=Forward, data[1]=Right, data[2]=Down."
+            "FRD: Forward, Right, Down. Select a tab for setup, live facts, analysis, or raw diagnostics."
         )
         self._status.setStyleSheet("font-weight: 600;")
-        root.addWidget(self._status)
-
-        grid = QGridLayout()
-        grid.setColumnStretch(0, 5)
-        grid.setColumnStretch(1, 7)
-        grid.setRowStretch(0, 1)
-        grid.setRowStretch(1, 1)
+        self._debug_label = QLabel()
+        self._debug_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._debug_label.setStyleSheet("font-family: monospace;")
+        self._facts = TelemetryFacts(model_filename)
         self._left_view = CameraView("Left Camera")
         self._right_view = CameraView("Right Camera")
         self._plot_stack = FrdPlotStack()
-        grid.addWidget(self._left_view, 0, 0)
-        grid.addWidget(self._right_view, 1, 0)
-        grid.addWidget(self._plot_stack, 0, 1, 2, 1)
-        root.addLayout(grid, 1)
+        self._recording_controls = RecordingControls()
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_setup_tab(model_filename), "Setup")
+        tabs.addTab(self._build_flight_tab(), "Flight")
+        tabs.addTab(self._build_analysis_tab(), "Analysis")
+        tabs.addTab(self._build_record_tab(), "Record")
+        tabs.addTab(self._build_debug_tab(), "Debug")
+        tabs.setCurrentIndex(0)
+        self._tabs = tabs
+        root.addWidget(tabs, 1)
 
         context.add_widget(self._widget)
-        QTimer.singleShot(250, self._maximize_rqt_window)
-        QTimer.singleShot(1500, self._maximize_rqt_window)
         self._bridge.image.connect(self._handle_image)
         self._bridge.sample.connect(self._handle_sample)
-        self._bridge.scalar.connect(self._hud.update_scalar)
-        self._bridge.detections.connect(self._hud.update_detections)
-        self._bridge.profile.connect(self._hud.update_profile)
-        self._bridge.status.connect(self._status.setText)
+        self._bridge.scalar.connect(self._facts.update_scalar)
+        self._bridge.detections.connect(self._facts.update_detections)
+        self._bridge.profile.connect(self._facts.update_profile)
+        self._bridge.status.connect(self._set_status)
+        self._bridge.runtime_parameters.connect(self._set_runtime_parameters)
         self._init_ros()
+        # A perspective can restore its previously active tab after the plugin
+        # constructor returns. Defer the pre-flight default until that restore
+        # has completed so a new operator window always opens on Setup.
+        QTimer.singleShot(250, lambda: self._tabs.setCurrentIndex(0))
+
+    def restore_settings(self, plugin_settings, instance_settings):
+        super().restore_settings(plugin_settings, instance_settings)
+        self._tabs.setCurrentIndex(0)
+
+    def _build_setup_tab(self, model_filename):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+        layout.addWidget(QLabel("Pre-flight setup and recording"))
+        summary = QLabel(
+            f"Model: {model_filename}\n"
+            f"{os.environ.get('RQT_MISSION_LABEL', 'Mission: --').strip() or 'Mission: --'}\n"
+            "Coordinate contract: public FRD [Forward, Right, Down, Range]."
+        )
+        summary.setStyleSheet("font-weight: 600; color: #263238;")
+        layout.addWidget(summary)
+        layout.addWidget(
+            QLabel("Raw GPS and GlobalPosition are recorded together for offline comparison."),
+        )
+        layout.addWidget(QLabel("StereoCAM run parameters (/stereo_distance_node, read-only)"))
+        self._runtime_parameters = QPlainTextEdit()
+        self._runtime_parameters.setReadOnly(True)
+        self._runtime_parameters.setMinimumHeight(260)
+        self._runtime_parameters.setPlainText("Waiting for /stereo_distance_node parameters…")
+        self._runtime_parameters.setStyleSheet("font-family: monospace;")
+        layout.addWidget(self._runtime_parameters, 1)
+        self._refresh_parameters_button = QPushButton("Refresh run parameters")
+        self._refresh_parameters_button.clicked.connect(self._request_runtime_parameters)
+        layout.addWidget(self._refresh_parameters_button)
+        layout.addWidget(self._recording_controls)
+        return tab
+
+    def _build_flight_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        cameras = QGridLayout()
+        cameras.setHorizontalSpacing(8)
+        cameras.setColumnStretch(0, 1)
+        cameras.setColumnStretch(1, 1)
+        cameras.addWidget(self._left_view, 0, 0)
+        cameras.addWidget(self._right_view, 0, 1)
+        layout.addLayout(cameras)
+        layout.addWidget(self._facts)
+        layout.addWidget(self._status)
+        layout.addStretch(1)
+        return tab
+
+    def _build_analysis_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(
+            QLabel(
+                "FRDR comparison: truth, Nominal stereo, Optical stereo, Ideal reference "
+                "(simulation-only), and PX4 Raw GPS baseline. "
+                "Range is the 3D vector magnitude when a source "
+                "publishes F/R/D only."
+            )
+        )
+        layout.addWidget(self._plot_stack, 1)
+        return tab
+
+    def _build_record_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._record_preview = LiveSavedCsvPreview(self._recording_controls)
+        layout.addWidget(self._record_preview)
+        return tab
+
+    def _build_debug_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addWidget(QLabel("Raw runtime status (informational; no automated judgment)"))
+        self._open_ros_graph_button = QPushButton("Open ROS graph")
+        self._open_ros_graph_button.clicked.connect(self._open_ros_graph)
+        layout.addWidget(self._open_ros_graph_button)
+        layout.addWidget(
+            QLabel(
+                "Opens rqt_graph in a separate diagnostic window so Flight and "
+                "Analysis keep the full operator workspace."
+            )
+        )
+        layout.addWidget(self._debug_label)
+        layout.addStretch(1)
+        self._set_status("Waiting for ROS topics.")
+        return tab
+
+    def _open_ros_graph(self):
+        if self._ros_graph_process is not None and self._ros_graph_process.poll() is None:
+            self._bridge.status.emit("ROS graph is already open in a separate window.")
+            return
+        try:
+            self._ros_graph_process = subprocess.Popen(
+                ["ros2", "run", "rqt_graph", "rqt_graph"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                preexec_fn=os.setsid,
+            )
+        except OSError as exc:
+            self._ros_graph_process = None
+            self._bridge.status.emit(f"ROS graph could not start: {exc}")
+            return
+        self._bridge.status.emit("ROS graph opened in a separate diagnostic window.")
+
+    def _set_status(self, text):
+        self._status.setText(str(text))
+        self._debug_label.setText(
+            f"Status: {text}\n"
+            f"Images: {IMAGE_TOPICS[0][1]}, {IMAGE_TOPICS[1][1]}\n"
+            "Series: /ground_truth_position, /stereo/estimated_position (Nominal), "
+            "/stereo/optical_position (Optical), /stereo/ideal_position (Ideal reference), "
+            "/stereo/raw_gps_baseline_position\n"
+            "Detection format: left/right bbox x1,y1,x2,y2, confidence, center."
+        )
+
+    def _set_runtime_parameters(self, text):
+        self._runtime_parameters.setPlainText(str(text))
 
     def _handle_image(self, name, payload):
         if name == "left":
@@ -571,28 +1207,33 @@ class OperatorPanel(Plugin):
             self._right_view.set_image(payload)
 
     def _handle_sample(self, series_name, values):
-        self._plot_stack.append(series_name, values)
-        self._hud.update_sample(series_name, values)
-
-    def _maximize_rqt_window(self):
-        app = QApplication.instance()
-        if app is None:
-            return
-        for widget in app.topLevelWidgets():
-            title = str(widget.windowTitle() or "").lower()
-            class_name = str(widget.metaObject().className()).lower()
-            if "rqt" in title or "rqt" in class_name:
-                widget.showMaximized()
-                return
+        frdr = list(values[:4])
+        while len(frdr) < 4:
+            frdr.append(math.nan)
+        if not math.isfinite(frdr[3]) and all(math.isfinite(value) for value in frdr[:3]):
+            frdr[3] = math.sqrt(sum(value * value for value in frdr[:3]))
+        self._plot_stack.append(series_name, frdr)
+        self._facts.update_sample(series_name, frdr)
 
     def _init_ros(self):
-        if rclpy is None or Image is None or Float32 is None or Float32MultiArray is None or String is None:
+        if (
+            rclpy is None or ParameterType is None or GetParameters is None
+            or ListParameters is None
+            or Image is None or PointStamped is None or Float32 is None
+            or Float32MultiArray is None or String is None
+        ):
             self._status.setText("ROS imports unavailable; operator panel cannot subscribe.")
             return
         try:
             if not rclpy.ok():
                 rclpy.init(args=None)
             self._ros_node = rclpy.create_node("operator_panel")
+            self._parameter_get_client = self._ros_node.create_client(
+                GetParameters, "/stereo_distance_node/get_parameters"
+            )
+            self._parameter_list_client = self._ros_node.create_client(
+                ListParameters, "/stereo_distance_node/list_parameters"
+            )
             self._ros_node.create_subscription(
                 Image,
                 IMAGE_TOPICS[0][1],
@@ -606,12 +1247,22 @@ class OperatorPanel(Plugin):
                 qos_profile_sensor_data,
             )
             for series_name, topic, _color in SERIES:
+                if series_name == "raw_gps_baseline":
+                    continue
                 self._ros_node.create_subscription(
                     Float32MultiArray,
                     topic,
                     lambda msg, name=series_name: self._bridge.sample.emit(name, list(msg.data)),
                     10,
                 )
+            self._ros_node.create_subscription(
+                PointStamped,
+                "/stereo/raw_gps_baseline_position",
+                lambda msg: self._bridge.sample.emit(
+                    "raw_gps_baseline", [msg.point.x, msg.point.y, msg.point.z, math.nan]
+                ),
+                10,
+            )
             self._ros_node.create_subscription(
                 Float32,
                 "/stereo/yolo_update_hz",
@@ -638,9 +1289,86 @@ class OperatorPanel(Plugin):
             )
             self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
             self._spin_thread.start()
+            self._request_runtime_parameters()
         except Exception as exc:
             self._ros_node = None
+            self._parameter_get_client = None
+            self._parameter_list_client = None
             self._status.setText(f"Operator panel subscribe failed: {exc}")
+
+    def _request_runtime_parameters(self):
+        if self._parameter_list_client is None or ListParameters is None:
+            self._bridge.runtime_parameters.emit(
+                "Runtime parameter service is unavailable."
+            )
+            return
+        request = ListParameters.Request()
+        request.depth = 0
+        future = self._parameter_list_client.call_async(request)
+        future.add_done_callback(self._finish_runtime_parameter_names)
+
+    def _finish_runtime_parameter_names(self, future):
+        try:
+            names = sorted(
+                name for name in future.result().result.names if name != "use_sim_time"
+            )
+        except Exception as exc:
+            self._bridge.runtime_parameters.emit(f"Run parameters unavailable: {exc}")
+            return
+        if not names or self._parameter_get_client is None:
+            self._bridge.runtime_parameters.emit("No runtime parameters returned.")
+            return
+        request = GetParameters.Request()
+        request.names = names
+        values_future = self._parameter_get_client.call_async(request)
+        values_future.add_done_callback(
+            lambda result, parameter_names=names: self._finish_runtime_parameters(
+                parameter_names, result
+            )
+        )
+
+    def _finish_runtime_parameters(self, names, future):
+        try:
+            values = future.result().values
+            lines = ["Source: /stereo_distance_node (live ROS parameters)", ""]
+            for name, value in zip(names, values):
+                lines.append(f"{name}: {self._format_parameter_value(value)}")
+        except Exception as exc:
+            self._bridge.runtime_parameters.emit(f"Run parameters unavailable: {exc}")
+            return
+        self._bridge.runtime_parameters.emit("\n".join(lines))
+
+    @staticmethod
+    def _parameter_value(value):
+        value_type = int(getattr(value, "type", 0))
+        if value_type == ParameterType.PARAMETER_BOOL:
+            return bool(value.bool_value)
+        if value_type == ParameterType.PARAMETER_INTEGER:
+            return int(value.integer_value)
+        if value_type == ParameterType.PARAMETER_DOUBLE:
+            return float(value.double_value)
+        if value_type == ParameterType.PARAMETER_STRING:
+            return str(value.string_value)
+        if value_type == ParameterType.PARAMETER_BYTE_ARRAY:
+            return list(value.byte_array_value)
+        if value_type == ParameterType.PARAMETER_BOOL_ARRAY:
+            return list(value.bool_array_value)
+        if value_type == ParameterType.PARAMETER_INTEGER_ARRAY:
+            return list(value.integer_array_value)
+        if value_type == ParameterType.PARAMETER_DOUBLE_ARRAY:
+            return list(value.double_array_value)
+        if value_type == ParameterType.PARAMETER_STRING_ARRAY:
+            return list(value.string_array_value)
+        return None
+
+    @staticmethod
+    def _format_parameter_value(value):
+        parsed = OperatorPanel._parameter_value(value)
+        if isinstance(parsed, bool):
+            return "true" if parsed else "false"
+        if isinstance(parsed, float):
+            return f"{parsed:g}"
+        return "<not set>" if parsed is None else str(parsed)
 
     def _image_payload(self, msg):
         return (int(msg.width), int(msg.height), str(msg.encoding), int(msg.step), bytes(msg.data))
@@ -657,6 +1385,14 @@ class OperatorPanel(Plugin):
 
     def shutdown_plugin(self):
         self._stop_event.set()
+        self._recording_controls.shutdown()
+        self._record_preview.shutdown()
+        if self._ros_graph_process is not None and self._ros_graph_process.poll() is None:
+            try:
+                os.killpg(self._ros_graph_process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self._ros_graph_process = None
         if self._spin_thread is not None:
             self._spin_thread.join(timeout=1.0)
             self._spin_thread = None

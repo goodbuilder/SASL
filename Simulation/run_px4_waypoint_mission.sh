@@ -4,8 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-WAYPOINT_CONFIG="${WAYPOINT_CONFIG:-$ROOT_DIR/config/waypoints.env}"
-DRONE_MISSION_CONFIG="${DRONE_MISSION_CONFIG:-$ROOT_DIR/config/drone_mission.env}"
+SIM_CONFIG="${SIM_CONFIG:-$ROOT_DIR/config/simulation.env}"
 OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-}"
 
 resolve_executable() {
@@ -48,10 +47,14 @@ DRONE_FINAL_HOVER_S_FROM_ENV="${DRONE_FINAL_HOVER_S+x}"; DRONE_FINAL_HOVER_S_ENV
 DRONE_LAND_TIMEOUT_S_FROM_ENV="${DRONE_LAND_TIMEOUT_S+x}"; DRONE_LAND_TIMEOUT_S_ENV_VALUE="${DRONE_LAND_TIMEOUT_S:-}"
 DRONE_SETPOINT_HZ_FROM_ENV="${DRONE_SETPOINT_HZ+x}"; DRONE_SETPOINT_HZ_ENV_VALUE="${DRONE_SETPOINT_HZ:-}"
 
-if [[ -f "$DRONE_MISSION_CONFIG" ]]; then
+if [[ ! -f "$SIM_CONFIG" ]]; then
+  echo "error: SIM_CONFIG not found: $SIM_CONFIG" >&2
+  exit 2
+fi
+if [[ -f "$SIM_CONFIG" ]]; then
   set -a
   # shellcheck disable=SC1090
-  source "$DRONE_MISSION_CONFIG"
+  source "$SIM_CONFIG"
   set +a
 fi
 [[ -n "$DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV" ]] && DRONE_TAKEOFF_ALTITUDE_M="$DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE"
@@ -65,13 +68,6 @@ fi
 [[ -n "$DRONE_LAND_TIMEOUT_S_FROM_ENV" ]] && DRONE_LAND_TIMEOUT_S="$DRONE_LAND_TIMEOUT_S_ENV_VALUE"
 [[ -n "$DRONE_SETPOINT_HZ_FROM_ENV" ]] && DRONE_SETPOINT_HZ="$DRONE_SETPOINT_HZ_ENV_VALUE"
 
-if [[ -f "$WAYPOINT_CONFIG" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "$WAYPOINT_CONFIG"
-  set +a
-fi
-
 usage() {
   cat <<'USAGE'
 Usage:
@@ -80,8 +76,7 @@ Usage:
 Sends a PX4 offboard waypoint mission to an already running PX4 SITL.
 Start Gazebo/rqt/PX4 first with ./run_operator_view.sh.
 
-Defaults are read from config/waypoints.env.
-Shared drone defaults are read from config/drone_mission.env.
+Defaults are read from config/simulation.env.
 Command-line options override the config file for one run.
 
 Waypoint format:
@@ -110,7 +105,7 @@ Options:
 Examples:
   ./run_px4_waypoint_mission.sh
   ./run_px4_waypoint_mission.sh --waypoint -300,0,10 --waypoint -600,0,10
-  WAYPOINT_CONFIG=config/my_path.env ./run_px4_waypoint_mission.sh
+  SIM_CONFIG=config/my_simulation.env ./run_px4_waypoint_mission.sh
 USAGE
 }
 
@@ -202,8 +197,7 @@ if [[ -f "$ROOT_DIR/install/setup.bash" ]]; then
 fi
 set -u
 
-printf '%s\n' "Drone mission source: $DRONE_MISSION_CONFIG"
-printf '%s\n' "Waypoint source: $WAYPOINT_CONFIG"
+printf '%s\n' "Simulation config source: $SIM_CONFIG"
 
 record_pid=""
 cleanup_recording() {

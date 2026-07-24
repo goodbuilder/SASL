@@ -22,6 +22,7 @@ SHA = "a" * 40
 BRANCH = "sim/test"
 RUN = "sweep"
 CASE = "case-000001-deadbeefdeadbeef"
+ORACLE_SDF_SHA256 = "b" * 64
 
 
 def _sha(path: Path) -> str:
@@ -69,8 +70,32 @@ def _record(sequence: int) -> dict:
             "pixel_unit": "px",
             "angle_unit": "deg",
             "timestamp_unit": "ns",
+            "camera_oracle_source": "gazebo_observed_optical",
+            "camera_oracle_expected_sdf_sha256": ORACLE_SDF_SHA256,
+            "correction_source": "gazebo_observed_optical_pose",
         }
     )
+    for label, center_x, stamp_ns in (
+        ("left", -12.5, 100 + sequence),
+        ("right", 12.5, 200 + sequence),
+    ):
+        prefix = f"{label}_camera_oracle_"
+        record.update(
+            {
+                prefix + "gazebo_stamp_ns": stamp_ns,
+                prefix + "base_entity_name": f"{label}_stereo_camera::base_link",
+                prefix + "base_entity_id": -1,
+                prefix + "optical_entity_name": f"{label}_stereo_camera::optical_link",
+                prefix + "optical_entity_id": -1,
+                prefix + "optical_x_m": center_x,
+                prefix + "optical_y_m": 0.0,
+                prefix + "optical_z_m": 5.0,
+                prefix + "optical_qx": 0.0,
+                prefix + "optical_qy": 0.0,
+                prefix + "optical_qz": 0.7071067811865476,
+                prefix + "optical_qw": 0.7071067811865476,
+            }
+        )
     return record
 
 
@@ -84,6 +109,9 @@ def _write_artifact(root: Path, records=None) -> Path:
         "run_id": RUN,
         "case_id": CASE,
         "output_frame": "baseline_center_frd",
+        "camera_oracle_source": "gazebo_observed_optical",
+        "camera_oracle_expected_sdf_sha256": ORACLE_SDF_SHA256,
+        "desired_camera_poses_from_env": {"left": {}, "right": {}},
     }
     (root / "run_metadata.json").write_text(
         json.dumps(metadata, sort_keys=True) + "\n", encoding="utf-8"

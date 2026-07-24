@@ -106,7 +106,7 @@ class Ros2CalibrationCsvRecorderTests(unittest.TestCase):
         self.assertEqual(fields["raw_down_m"], 4.0)
         self.assertEqual(fields["raw_range_m"], 1000.04)
 
-    def test_detections_array_exports_bbox_centers_and_disparity_inputs(self) -> None:
+    def test_detections_array_exports_bbox_corners_with_derived_centers(self) -> None:
         module = load_recorder_module()
         values = [
             1.0,
@@ -130,9 +130,17 @@ class Ros2CalibrationCsvRecorderTests(unittest.TestCase):
         fields = module.detections_array_to_fields(values)
 
         self.assertEqual(fields["left_valid"], 1.0)
+        self.assertEqual(fields["left_x1"], 10.0)
+        self.assertEqual(fields["left_y1"], 20.0)
+        self.assertEqual(fields["left_x2"], 30.0)
+        self.assertEqual(fields["left_y2"], 40.0)
         self.assertEqual(fields["left_cx_px"], 20.0)
         self.assertEqual(fields["left_cy_px"], 30.0)
         self.assertEqual(fields["right_valid"], 1.0)
+        self.assertEqual(fields["right_x1"], 5.0)
+        self.assertEqual(fields["right_y1"], 22.0)
+        self.assertEqual(fields["right_x2"], 25.0)
+        self.assertEqual(fields["right_y2"], 42.0)
         self.assertEqual(fields["right_cx_px"], 15.0)
         self.assertEqual(fields["right_cy_px"], 32.0)
 
@@ -161,6 +169,7 @@ class Ros2CalibrationCsvRecorderTests(unittest.TestCase):
         self.assertIn("T_source_to_stereo_rdf", manifest)
         self.assertIn("axis aliasing is forbidden", manifest)
         self.assertIn("sim_truth_role=oracle", manifest)
+        self.assertIn("detection_bbox_contract=", manifest)
         self.assertNotIn("T_ned_to_stereo_rdf", manifest)
 
     def test_sim_truth_is_oracle_by_default_not_training_truth(self) -> None:

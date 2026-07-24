@@ -107,21 +107,27 @@ def _patch_rqt_plot_default_topics():
             topics = [
                 "/ground_truth_position/data[0]",
                 "/stereo/estimated_position/data[0]",
-                "/stereo/corrected_position/data[0]",
+                "/stereo/optical_position/data[0]",
+                "/stereo/ideal_position/data[0]",
+                "/stereo/raw_gps_baseline_plot/data[0]",
             ]
         elif serial == 2:
             axis_label = "Right"
             topics = [
                 "/ground_truth_position/data[1]",
                 "/stereo/estimated_position/data[1]",
-                "/stereo/corrected_position/data[1]",
+                "/stereo/optical_position/data[1]",
+                "/stereo/ideal_position/data[1]",
+                "/stereo/raw_gps_baseline_plot/data[1]",
             ]
         elif serial == 3:
             axis_label = "Down"
             topics = [
                 "/ground_truth_position/data[2]",
                 "/stereo/estimated_position/data[2]",
-                "/stereo/corrected_position/data[2]",
+                "/stereo/optical_position/data[2]",
+                "/stereo/ideal_position/data[2]",
+                "/stereo/raw_gps_baseline_plot/data[2]",
             ]
         else:
             return
@@ -140,7 +146,9 @@ def _patch_rqt_plot_default_topics():
                 self._widget.data_plot.set_xlim([0.0, window_s])
                 try:
                     plot_widget = self._widget.data_plot._data_plot_widget._plot_widget
-                    plot_widget.getPlotItem().setTitle(f"{axis_label} axis: truth vs raw vs corrected")
+                    plot_widget.getPlotItem().setTitle(
+                        f"{axis_label} axis: truth, Nominal, Optical, Ideal, Raw GPS"
+                    )
                     plot_widget.getPlotItem().setLabel("left", f"{axis_label} (m)")
                 except Exception:
                     pass
@@ -176,7 +184,7 @@ def _patch_rqt_plot_default_topics():
 def _patch_rqt_image_view_default_topics():
     try:
         from python_qt_binding.QtCore import QTimer, Qt
-        from python_qt_binding.QtWidgets import QApplication, QComboBox, QDockWidget, QLayout, QWidget
+        from python_qt_binding.QtWidgets import QApplication, QComboBox, QDockWidget, QLayout, QMainWindow, QWidget
     except Exception:
         return
 
@@ -254,9 +262,40 @@ def _patch_rqt_image_view_default_topics():
         if applied < 2 and attempt < 40:
             QTimer.singleShot(500, lambda: apply_topics(attempt + 1))
 
+    def compact_flight_layout(attempt=0):
+        app = QApplication.instance()
+        if app is None:
+            if attempt < 20:
+                QTimer.singleShot(500, lambda: compact_flight_layout(attempt + 1))
+            return
+        main_window = next((widget for widget in app.allWidgets() if isinstance(widget, QMainWindow)), None)
+        if main_window is None:
+            if attempt < 20:
+                QTimer.singleShot(500, lambda: compact_flight_layout(attempt + 1))
+            return
+        docks = [widget for widget in app.allWidgets() if isinstance(widget, QDockWidget)]
+        image_docks = [dock for dock in docks if dock.windowTitle() in ("Image View", "Image View (2)")]
+        plot_docks = [dock for dock in docks if dock.windowTitle() in ("Forward Axis Plot", "Right Axis Plot", "Down Axis Plot")]
+        if len(image_docks) != 2 or len(plot_docks) != 3:
+            if attempt < 20:
+                QTimer.singleShot(500, lambda: compact_flight_layout(attempt + 1))
+            return
+        for dock in image_docks:
+            # The saved rqt state gives images half the window. Constrain the
+            # shared image row so the three decision plots remain readable.
+            dock.setMaximumHeight(440)
+        for dock in plot_docks:
+            dock.setMinimumHeight(440)
+        # The two image docks share one horizontal row: resizing either dock
+        # vertically resizes that row. Supplying both is ignored by Qt.
+        main_window.resizeDocks([image_docks[0]], [420], Qt.Vertical)
+        main_window.resizeDocks(plot_docks, [440, 440, 440], Qt.Vertical)
+
     globals()["_apply_rqt_image_view_default_topics"] = apply_topics
     QTimer.singleShot(1500, center_image_frames)
     QTimer.singleShot(3500, center_image_frames)
+    QTimer.singleShot(4000, compact_flight_layout)
+    QTimer.singleShot(7000, compact_flight_layout)
 
 
 def _patch_rqt_plot_visible_y_autoscale():

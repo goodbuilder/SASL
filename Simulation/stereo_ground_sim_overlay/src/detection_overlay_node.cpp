@@ -143,13 +143,8 @@ private:
   {
     sensor_msgs::msg::Image::ConstSharedPtr source;
     Detection detection;
-    bool pair_has_positive_disparity{false};
     {
       std::lock_guard<std::mutex> lock(mutex_);
-      pair_has_positive_disparity =
-        left_detection_.valid && right_detection_.valid &&
-        std::isfinite(left_detection_.cx) && std::isfinite(right_detection_.cx) &&
-        (left_detection_.cx - right_detection_.cx > 0.5F);
       if (std::string(side) == "left") {
         source = last_left_image_;
         detection = left_detection_;
@@ -163,14 +158,13 @@ private:
     }
     (void)side;
     auto output = std::make_unique<sensor_msgs::msg::Image>(*source);
-    drawDetection(*output, detection, pair_has_positive_disparity);
+    drawDetection(*output, detection);
     publisher->publish(std::move(output));
   }
 
   void drawDetection(
     sensor_msgs::msg::Image & image,
-    const Detection & detection,
-    bool pair_has_positive_disparity)
+    const Detection & detection)
   {
     if (image.height == 0 || image.width == 0 || image.step < image.width * 3 ||
         image.data.size() < static_cast<size_t>(image.step) * image.height) {
@@ -178,19 +172,15 @@ private:
     }
 
     if (!detection.valid) {
-      drawMissingBorder(image);
       return;
     }
 
     const int width = static_cast<int>(image.width);
     const int height = static_cast<int>(image.height);
-    const bool confidence_ok = detection.confidence >= 0.25F;
-    const std::array<uint8_t, 3> green{0, 255, 0};
-    const std::array<uint8_t, 3> yellow{255, 210, 0};
-    const std::array<uint8_t, 3> orange{255, 96, 0};
-    const auto color =
-      pair_has_positive_disparity && confidence_ok ? green :
-      pair_has_positive_disparity ? yellow : orange;
+    // The Flight image is an observation view, not a quality judgement.
+    // Confidence and disparity remain available as numeric telemetry, while
+    // every detected bounding box uses this one neutral display colour.
+    const std::array<uint8_t, 3> color{230, 230, 230};
 
     int x1 = clampInt(std::lround(detection.x1), 0, width - 1);
     int x2 = clampInt(std::lround(detection.x2), 0, width - 1);
@@ -212,18 +202,6 @@ private:
     const int cy = clampInt(std::lround(detection.cy), 0, height - 1);
     drawCross(image, cx, cy, 10, color);
     fillRect(image, 0, 0, width - 1, std::min(5, height - 1), color);
-  }
-
-  void drawMissingBorder(sensor_msgs::msg::Image & image)
-  {
-    const int width = static_cast<int>(image.width);
-    const int height = static_cast<int>(image.height);
-    const std::array<uint8_t, 3> red{255, 0, 0};
-    constexpr int thickness = 6;
-    fillRect(image, 0, 0, width - 1, std::min(thickness - 1, height - 1), red);
-    fillRect(image, 0, std::max(height - thickness, 0), width - 1, height - 1, red);
-    fillRect(image, 0, 0, std::min(thickness - 1, width - 1), height - 1, red);
-    fillRect(image, std::max(width - thickness, 0), 0, width - 1, height - 1, red);
   }
 
   void fillRect(

@@ -71,6 +71,21 @@ from .research_recording import PAIR_RECORD_COLUMNS
 
 
 S2_QUALIFICATION_SCHEMA_VERSION = "s2_sealed_qualification_v1"
+LEGACY_S2_SWEEP_SCHEMA_VERSION = "s2_correction_sweep_v1"
+LEGACY_ATTITUDE_AXES = (
+        "left_roll_error_deg",
+        "left_pitch_error_deg",
+        "left_yaw_error_deg",
+        "right_roll_error_deg",
+        "right_pitch_error_deg",
+        "right_yaw_error_deg",
+        "common_optical_roll_error_deg",
+        "relative_optical_roll_error_deg",
+        "common_optical_pitch_error_deg",
+        "relative_optical_pitch_error_deg",
+        "common_optical_yaw_error_deg",
+        "relative_optical_yaw_error_deg",
+)
 DATASET_ROLES = ("calibration", "validation", "sealed_evaluation")
 QUALIFICATION_STATES = (
     "PLANS_PREPARED",
@@ -802,10 +817,19 @@ def validate_freeze_anchor(anchor: Mapping[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _attitude_axes(value: Mapping[str, Any]) -> tuple[str, ...]:
+    source = value.get("attitude_source_deg", value)
+    if all(axis in source for axis in ATTITUDE_AXES):
+        return ATTITUDE_AXES
+    if all(axis in source for axis in LEGACY_ATTITUDE_AXES):
+        return LEGACY_ATTITUDE_AXES
+    raise ValueError("attitude source schema mismatch")
+
+
 def _attitude_values(value: Mapping[str, Any]) -> tuple[float, ...]:
     source = value.get("attitude_source_deg", value)
     parsed = []
-    for axis in ATTITUDE_AXES:
+    for axis in _attitude_axes(value):
         item = source[axis]
         if isinstance(item, Mapping):
             item = item.get("decimal", item.get("value"))
@@ -817,9 +841,10 @@ def profile_key(attitude: Mapping[str, Any] | Sequence[float]) -> str:
     values = _attitude_values(attitude) if isinstance(attitude, Mapping) else tuple(_finite(v, "attitude") for v in attitude)
     if len(values) != len(ATTITUDE_AXES):
         raise ValueError("attitude profile must contain 12 values")
+    axes = _attitude_axes(attitude) if isinstance(attitude, Mapping) else ATTITUDE_AXES
     payload = {
         axis: "0" if value == 0.0 else format(Decimal(str(value)).normalize(), "f")
-        for axis, value in zip(ATTITUDE_AXES, values)
+        for axis, value in zip(axes, values)
     }
     return "profile-" + sha256_bytes(canonical_json(payload).encode("utf-8"))[:16]
 
@@ -1441,7 +1466,11 @@ def validate_sealed_commitment(
     value = dict(commitment)
     if set(value) != _SEALED_COMMITMENT_KEYS:
         raise ValueError("sealed commitment schema mismatch")
-    if value["schema_version"] != S2_QUALIFICATION_SCHEMA_VERSION or value["sweep_schema_version"] != S2_SWEEP_SCHEMA_VERSION:
+    if (
+        value["schema_version"] != S2_QUALIFICATION_SCHEMA_VERSION
+        or value["sweep_schema_version"]
+        not in {LEGACY_S2_SWEEP_SCHEMA_VERSION, S2_SWEEP_SCHEMA_VERSION}
+    ):
         raise ValueError("sealed commitment version mismatch")
     if expected_branch is not None and value["branch"] != expected_branch:
         raise ValueError("sealed commitment branch mismatch")
@@ -1509,7 +1538,8 @@ def validate_frozen_catalog(
         if profile["profile_key"] in keys:
             raise ValueError("duplicate frozen profile key")
         keys.add(profile["profile_key"])
-        if set(profile["source_attitude_deg"]) != set(ATTITUDE_AXES):
+        source_axes = frozenset(profile["source_attitude_deg"])
+        if source_axes not in {frozenset(LEGACY_ATTITUDE_AXES), frozenset(ATTITUDE_AXES)}:
             raise ValueError("frozen source attitude schema mismatch")
         for name in ("fitted_left_matrix_row_major", "fitted_right_matrix_row_major"):
             _matrix3(profile[name], name)

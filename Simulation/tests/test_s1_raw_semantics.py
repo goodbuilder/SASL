@@ -15,6 +15,7 @@ from sasl_common.stereo_geometry import (  # noqa: E402
     BASELINE_CENTER_FRD_VECTOR_CONTRACT,
 )
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode  # noqa: E402
+from camera_oracle_test_support import seed_observed_camera_oracle  # noqa: E402
 
 
 def _node_with_camera_error(left_yaw_deg: float = 0.0, right_yaw_deg: float = 0.0):
@@ -26,6 +27,7 @@ def _node_with_camera_error(left_yaw_deg: float = 0.0, right_yaw_deg: float = 0.
     node.common_optical_yaw_error_deg = (left_yaw_deg + right_yaw_deg) / 2.0
     node.relative_optical_yaw_error_deg = right_yaw_deg - left_yaw_deg
     node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     return node
 
 
@@ -42,7 +44,7 @@ def test_nonzero_attitude_observation_uses_actual_but_raw_uses_nominal() -> None
         world_point,
         1280,
         720,
-        projection_camera_mode="actual",
+        projection_camera_mode="gazebo_observed_optical",
     )
     raw = node._triangulate_pixel_centers(
         left["cx"],

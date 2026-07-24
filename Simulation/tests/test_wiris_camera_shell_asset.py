@@ -17,7 +17,7 @@ ASSET_PATH = (
 )
 
 
-def test_wiris_shell_asset_is_packaged_and_sensor_pose_is_unchanged() -> None:
+def test_wiris_shell_asset_is_packaged_and_visual_yaw_does_not_change_sensor_pose() -> None:
     assert ASSET_PATH.is_file()
     assert ASSET_PATH.stat().st_size > 1_000_000
     with ASSET_PATH.open("rb") as handle:
@@ -35,13 +35,19 @@ def test_wiris_shell_asset_is_packaged_and_sensor_pose_is_unchanged() -> None:
     assert set(camera_models) == {"left_stereo_camera", "right_stereo_camera"}
 
     for model in camera_models.values():
-        shell = model.find("./link/visual[@name='wiris_shell']")
+        optical_link = model.find("./link[@name='optical_link']")
+        assert optical_link is not None
+        shell = optical_link.find("./visual[@name='wiris_shell']")
         assert shell is not None
         assert shell.findtext("./geometry/mesh/uri") == "model://wiris_camera/meshes/WIRIS.stl"
         assert shell.findtext("./geometry/mesh/scale") == "0.001 0.001 0.001"
-        assert shell.findtext("./pose") == "-0.5185 0.051 -0.038103205 0 0 0"
+        # This keeps the mesh origin at the optical-frame origin and compensates
+        # only the STL's authored +Y forward axis.  The camera sensor remains at
+        # that same origin, so its image geometry and PX4/body attachment are
+        # unaffected by the visual correction.
+        assert shell.findtext("./pose") == "0 0 0 0 0 1.570796327"
 
-        sensor = model.find("./link/sensor[@name='camera']")
+        sensor = optical_link.find("./sensor[@name='camera']")
         assert sensor is not None
         assert sensor.findtext("./pose") == "0 0 0 0 0 0"
         assert sensor.findtext("./topic") in {"/left_camera/image", "/right_camera/image"}

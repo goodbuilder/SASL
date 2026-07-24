@@ -20,7 +20,7 @@ from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
                 "observation_source": "gazebo_reference_point_projection",
                 "measurement_gt_independent": False,
                 "reference_source": VEHICLE_REFERENCE_LINK,
-                "projection_camera_pose_source": "actual",
+                "projection_camera_pose_source": "gazebo_observed_optical",
             },
         ),
         (
@@ -46,8 +46,8 @@ def test_actual_observation_metadata_dict_is_isolated_by_mode(mode, expected):
     assert metadata["reference_source"] == expected["reference_source"]
     assert metadata["projection_camera_pose_source"] == expected["projection_camera_pose_source"]
     assert metadata["raw_interpretation_pose_source"] == "nominal"
-    assert metadata["corrected_interpretation_pose_source"] == "actual"
-    assert metadata["correction_source"] == "injected_attitude_oracle"
+    assert metadata["corrected_interpretation_pose_source"] == "gazebo_observed_optical"
+    assert metadata["correction_source"] == "gazebo_observed_optical_pose"
     assert metadata["evaluation_gt_source"] == "gazebo_reference_link_world_pose"
     assert metadata["output_frame"] == BASELINE_CENTER_FRD_FRAME
 

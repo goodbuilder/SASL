@@ -1,5 +1,13 @@
 # Ground Stereo Drone Simulation
 
+## Product name
+
+This Simulation runtime is named **StereoCAM**. It is distinct from the
+field WIRIS application named **StereoWIRIS**. ROS package, node, topic, and
+profile identifiers such as `stereo_ground_sim`, `stereo_distance_node`, and
+`/stereo/*` remain compatibility identifiers; historical experiment records
+may retain the former StereoDistance wording.
+
 ## Observation modes (S2-I1)
 
 In `bbox_yolo`, camera subscription and model loading require a positive
@@ -393,17 +401,17 @@ typed aggregate message, speed, roll/pitch 연구, BBox observation error correc
 
 ## 시뮬레이션 목적
 
-이 시뮬레이션의 목적은 StereoDistance로 실제 본 실험에 가까운 조건의
+이 시뮬레이션의 목적은 StereoCAM으로 실제 본 실험에 가까운 조건의
 거리/축별 위치 측정과 보정 방법을 검증하는 것이다. 기준 운용 조건은
 25 m stereo baseline, WIRIS visible 8배줌, 약 15 m급 드론/UAM 표적이다.
-StereoDistance는 이 조건에서 Stereo WIRIS 영상과 YOLO bbox를 사용해
+StereoCAM은 이 조건에서 Stereo WIRIS 영상과 YOLO bbox를 사용해
 `estimated_distance`와 카메라 중앙 기준 `Forward/Right/Down` 축 데이터를
 산출한다.
 
 측정 수준을 벗어나는 자세각 오차는 단순한 raw stereo 계산만으로 안정적으로
 제거하기 어렵다. 따라서 드론/UAM에 Pixhawk와 GPS를 사용해 보정용 비행을
 수행하고, 이때 얻은 위치 기준값을 ground truth로 사용한다. 시뮬레이션은
-보정용 비행에서 만든 ground truth와 Stereo WIRIS로 측정한 데이터를 비교해
+보정용 비행에서 만든 ground truth와 StereoCAM으로 측정한 데이터를 비교해
 자세각 오차가 거리와 각 축에 만드는 편향을 분석하고, 이를 줄일 보정값과
 보정 정책을 찾는 역할을 한다.
 
@@ -5627,16 +5635,16 @@ Replay 출력:
 ./run_operator_view.sh
 ```
 
-이 단일 명령이 build, Gazebo Sim 서버, ROS-Gazebo bridge, 거리 계산 노드, PX4 SITL, 단일 `rqt_gui` 운용 창을 모두 실행합니다. 커스텀 앱을 만들지 않고 표준 ROS 도구만 실행합니다.
-기본 실행은 자동 이동을 켜지 않고, PX4가 실험 타겟 `x500_15m`에 attach되므로 QGroundControl이 MAVLink UDP 14550으로 같은 드론을 조종할 수 있습니다. 실행만으로 이륙-접근-착륙까지 시작하려면 `--auto-mission`을 붙입니다.
+이 단일 명령이 build, Gazebo Sim 서버, ROS-Gazebo bridge, 거리 계산 노드, PX4 SITL 3개, 단일 `rqt_gui` 운용 창을 모두 실행합니다. 커스텀 앱을 만들지 않고 표준 ROS 도구만 실행합니다.
+기본 실행은 target PX4(instance 0)를 `x500_15m`에, Camera_Left PX4(instance 1)를 `left_stereo_camera`에, Camera_Right PX4(instance 2)를 `right_stereo_camera`에 각각 attach합니다. target PX4는 기존 `/fmu`와 QGroundControl MAVLink UDP 14550 계약을 유지하고, 카메라 PX4는 `/camera_left/fmu`, `/camera_right/fmu` namespace로 격리됩니다. target의 이륙-접근-착륙을 자동 시작하려면 `--auto-mission`을 붙입니다.
 `x500_15m`는 카메라 전방 +Y 약 2000 m 지점에서 yaw -90도로 스폰되어, QGC/PX4에서 전진 명령을 주면 카메라 방향으로 접근합니다. 스테레오 베이스라인은 X축 방향입니다.
 Gazebo 3D GUI에서는 카메라 뒤에서 전방 +Y를 바라보는 운용자 기준으로 왼쪽 카메라는 world X 음수 위치의 파란색 본체, 오른쪽 카메라는 world X 양수 위치의 빨간색 본체로 표시됩니다. 카메라 모델 원점은 실제 sensor optical center이며, 렌즈 visual의 앞면이 이 원점에 맞춰집니다.
 `rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, truth/raw/corrected FRD, Forward/Down `estimate-truth` 오차와 최근 시간창 RMSE, detection valid ratio, 좌표 계약을 표시합니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
 Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), raw YOLO 추정값(`/stereo/estimated_position`), bbox 중심 보정 추정값(`/stereo/corrected_position`)을 비교합니다. 축 계약은 StereoDistance와 같은 비교 계약으로 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다.
 Gazebo visible 카메라 센서는 기본 20 Hz(`CAMERA_UPDATE_RATE_HZ=20.0`), 1280x720이며 frame interval은 50,000,000 ns입니다. Ground Truth는 별도 adapter가 raw `Pose_V`의 simulation stamp를 보존해 발행하고, S1의 비교 frame은 고정 `baseline_center_frd`입니다. 이전 model-origin/Down offset 설명은 폐기된 historical 기록이며 active 경로에서 사용하지 않습니다. 거리/오차 그래프 및 overlay timer는 이 Phase의 camera-rate contract와 별개입니다. 기본 실행은 Gazebo 3D GUI도 함께 엽니다(`gz_gui:=true`). 카메라/그래프 Hz를 우선해 headless로 돌리려면 `gz_gui:=false`를 붙입니다.
 각 Plot의 시간축은 최근 30초 창으로 autoscroll되며, 값 축은 현재 보이는 데이터 범위에 맞춰 자동으로 다시 잡히도록 실행 시 rqt_plot 패치를 적용합니다. 시간 창 길이는 `--plot-window 30`처럼 바꿀 수 있습니다.
-기본 YOLO 설정은 `config/yolo.env`에서 읽습니다. 기본 모델은 `yolov8n_uav.pt`, class는 `UAV`, confidence는 `0.10`입니다. `.pt` 파일은 git에 넣지 않는 machine-local 입력이므로, 다른 PC에서는 `Simulation/yolov8n_uav.pt`를 같은 위치에 두거나 `YOLO_MODEL_PATH`/`--yolo-model`로 다른 파일을 명시합니다. 이 설정은 left/right image pixel bbox detector만 바꾸며, `/ground_truth_position`과 거리 토픽의 stereo-center FRD 축 계약은 바꾸지 않습니다.
-기본 실행은 YOLO 거리 계산을 `yolo_target_hz:=40.0`, `yolo_device:=cuda:0`, `yolo_imgsz:=1280`으로 요청합니다. 2 km 부근의 작은 드론 bbox를 양쪽 카메라에서 유지하고 YOLO stride 32 경고를 피하기 위해 카메라 가로 해상도와 같은 1280 입력 크기를 기본으로 사용합니다. 거리 노드는 `config/yolo.env`의 `YOLO_PYTHON` 또는 로컬 `.venv`, 없으면 `python3`로 실행합니다. CUDA가 실제로 잡히면 CUDA/FP16으로 좌/우 이미지를 batch 추론하고, CUDA가 잡히지 않으면 CPU로 fallback하더라도 YOLO 이미지 구독과 거리 계산을 계속 시도합니다. CPU fallback은 느릴 수 있으므로 필요하면 `--yolo-hz`나 `yolo_imgsz`를 낮춥니다.
+기본 YOLO 설정은 `config/simulation.env`에서 읽습니다. 기본 모델은 `yolov8n_uav.pt`, class는 `UAV`, confidence는 `0.10`입니다. `.pt` 파일은 git에 넣지 않는 machine-local 입력이므로 runner는 `Simulation/`, 상위 workspace, `~/Downloads/`, `~/다운로드/` 순서로 같은 파일명을 찾습니다. 다른 PC에서는 `Simulation/yolov8n_uav.pt`를 같은 위치에 두거나 `YOLO_MODEL_PATH`/`--yolo-model`로 다른 파일을 명시합니다. 이 설정은 left/right image pixel bbox detector만 바꾸며, `/ground_truth_position`과 거리 토픽의 stereo-center FRD 축 계약은 바꾸지 않습니다.
+기본 실행은 YOLO 거리 계산을 `yolo_target_hz:=40.0`, `yolo_device:=cuda:0`, `yolo_imgsz:=1280`으로 요청합니다. 2 km 부근의 작은 드론 bbox를 양쪽 카메라에서 유지하고 YOLO stride 32 경고를 피하기 위해 카메라 가로 해상도와 같은 1280 입력 크기를 기본으로 사용합니다. 거리 노드는 `config/simulation.env`의 `YOLO_PYTHON` 또는 로컬 `.venv`, 없으면 `python3`로 실행합니다. CUDA가 실제로 잡히면 CUDA/FP16으로 좌/우 이미지를 batch 추론하고, CUDA가 잡히지 않으면 CPU로 fallback하더라도 YOLO 이미지 구독과 거리 계산을 계속 시도합니다. CPU fallback은 느릴 수 있으므로 필요하면 `--yolo-hz`나 `yolo_imgsz`를 낮춥니다.
 YOLO runtime bootstrap은 기본적으로 CUDA PyTorch wheel을 요구합니다(`YOLO_TORCH_BACKEND=cuda`, `YOLO_TORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu126`). CPU-only 환경을 의도적으로 쓰려면 `YOLO_TORCH_BACKEND=cpu ./run_operator_view.sh ...`처럼 실행합니다. CUDA wheel이 설치되어도 OS에서 NVIDIA driver와 `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm` 장치 노드가 정상이어야 `torch.cuda.is_available()`이 true가 됩니다.
 YOLO bbox overlay 화면은 기본으로 켜집니다(`overlay_publish_hz:=20.0`). Overlay 이미지는 전용 `detection_overlay_node`가 raw HD 카메라와 `/stereo/detections` bbox 결과를 결합해 발행하므로, YOLO 거리 계산 루프와 이미지 그리기/rqt 표시 부하를 분리합니다. Overlay 노드는 최신 카메라 프레임을 캐시하고 좌/우 이미지를 교차 발행해 부하 피크를 줄입니다. 이 값은 목표 발행률이며, Gazebo/rqt/PX4 부하에 따라 실측 Hz는 낮아질 수 있습니다. YOLO 거리 계산에 자원을 우선 배정하려면 `--raw-view`를 붙여 overlay 발행을 끕니다.
 YOLO 실제 추론 Hz는 `/stereo/yolo_update_hz`를 기준으로 확인합니다. `/target_distance`는 그래프 표시를 위해 마지막 거리값도 `plot_publish_hz`로 재발행하므로, 이 토픽 Hz가 곧 YOLO 추론 Hz를 의미하지는 않습니다.
@@ -5724,7 +5732,7 @@ CUDA/CPU 장치를 명시하거나, 부하가 부족하면 추론 Hz 또는 입�
 거리 노드의 Python 자체를 바꾸려면 `--yolo-python` 또는 launch 인자 `yolo_python:=/path/to/python`을 사용합니다. 기본 실행은 로컬 `.venv`를 우선 찾고, 없으면 `python3`를 사용합니다. 별도 site-packages를 써야 하면 `YOLO_PYTHONPATH=/path/to/site-packages ./run_operator_view.sh ...`처럼 지정합니다.
 
 자동 접근은 QGC/PX4 제어 경로로 수행합니다. 기존 Gazebo `cmd_vel` 미션 옵션은 QGC 조종과 충돌하므로 사용하지 않습니다.
-드론 스폰 위치와 PX4 자동 미션 기본값은 `config/drone_mission.env`에서 수정할 수 있습니다.
+드론 스폰 위치와 PX4 자동 미션 기본값은 `config/simulation.env`에서 수정할 수 있습니다.
 
 ```bash
 DRONE_SPAWN_X_M=0.0
@@ -5761,11 +5769,12 @@ Gazebo, rqt, PX4 실행 후 자동 이륙-접근-착륙까지 한 번에 시작�
 ./run_auto_mission.sh
 ```
 
-`run_auto_mission.sh`는 기본적으로 `Simulation/.venv/bin/python`을 사용하므로
-venv를 별도로 activate하지 않아도 `pymavlink`를 찾는다. 다른 Python을 써야
-할 때만 `MISSION_PYTHON=/path/to/python ./run_auto_mission.sh`처럼 지정한다.
+`run_auto_mission.sh`는 `pymavlink`를 import할 수 있는 Python을 자동으로 고릅니다.
+`Simulation/.venv`에 없으면 로컬 PX4 가상환경도 검사하므로 venv를 별도로
+activate할 필요가 없습니다. 다른 Python을 강제할 때는
+`MISSION_PYTHON=/path/to/python ./run_auto_mission.sh`처럼 지정합니다.
 
-기본 동작은 `config/drone_mission.env` 기준으로 이륙, 호버, PX4 local `north` 음수 방향 접근, Gazebo Ground Truth가 목표 거리 이하가 되면 호버, 착륙입니다. 현재 월드에서는 이 축이 Gazebo Y 거리를 줄이는 카메라 방향 접근입니다. Ground Truth가 unavailable인 경우에도 임무 명령은 `DRONE_MOVE_DISTANCE_M` local displacement를 상한으로 계속할 수 있지만, 그 계획값은 `/ground_truth`, actual distance, distance error에 절대 사용하지 않습니다. PX4 기본 `MPC_XY_CRUISE`/`MPC_XY_VEL_MAX` 제한 때문에 명령 속도보다 실제 접근 속도가 낮을 수 있습니다. 한 번만 목표 거리나 속도를 바꾸려면:
+기본 동작은 `config/simulation.env` 기준으로 이륙, 호버, PX4 local `north` 음수 방향 접근, Gazebo Ground Truth가 목표 거리 이하가 되면 호버, 착륙입니다. 현재 월드에서는 이 축이 Gazebo Y 거리를 줄이는 카메라 방향 접근입니다. Ground Truth가 unavailable인 경우에도 임무 명령은 `DRONE_MOVE_DISTANCE_M` local displacement를 상한으로 계속할 수 있지만, 그 계획값은 `/ground_truth`, actual distance, distance error에 절대 사용하지 않습니다. PX4 기본 `MPC_XY_CRUISE`/`MPC_XY_VEL_MAX` 제한 때문에 명령 속도보다 실제 접근 속도가 낮을 수 있습니다. 한 번만 목표 거리나 속도를 바꾸려면:
 
 ```bash
 ./run_auto_mission.sh --target-distance-m 200 --altitude-m 10 --speed-mps 15
@@ -5778,16 +5787,23 @@ venv를 별도로 activate하지 않아도 `pymavlink`를 찾는다. 다른 Pyth
 ./run_auto_mission.sh --check-connection
 ```
 
-`./run_operator_view.sh`의 기본값은 `gz_gui:=true`, `launch_rviz:=false`입니다. 기본 실행에서 Gazebo 3D GUI와 rqt 카메라/그래프 창이 함께 뜹니다. RViz Marker/3D도 같이 보고 싶으면 아래처럼 켭니다.
+`./run_operator_view.sh`의 기본값은 `gz_gui:=true`, `launch_rviz:=true`입니다. 기본 실행에서 Gazebo 3D GUI, rqt 카메라/그래프 창, RViz가 함께 뜹니다.
 
-```bash
-./run_operator_view.sh launch_rviz:=true
-```
+Raw stereo ray와 삼각측량 geometry도 기본으로 표시합니다. 명목 optical pose의
+raw ray는 파랑/주황이고, Gazebo가 관측한 optical pose를 사용하는 ideal-oracle ray는
+초록/노랑입니다. 각 색상 쌍에는 독립적인 ray gap과 midpoint가 있어 자세 오차에 따른
+교차점 변화를 비교할 수 있습니다. RViz의 `Raw Stereo Rays (World ENU)` 아래에서
+`stereo_rays_raw`와 `stereo_rays_ideal_oracle`를 각각 켜거나 꺼서 비교할 수 있습니다.
+RViz의 `/stereo/ray_markers`는 Gazebo World ENU (`gazebo_world_enu`)에서 좌·우
+명목 광선, 최근접점 사이의 ray gap, 그리고 midpoint를 표시합니다. 이 표시는
+진단 전용이며, CSV와 rqt의 `baseline_center_frd` [Forward, Right, Down] 계약은
+변경하지 않습니다.
+RViz를 끄려면 `launch_rviz:=false`를 명시합니다.
 
 인자를 넘길 수도 있습니다.
 
 ```bash
-./run_operator_view.sh right_yaw_error_deg:=0.5
+./run_operator_view.sh cam_r_optical_yaw_deg:=0.5
 ./run_operator_view.sh approach_duration_s:=20.0
 ```
 
@@ -5917,15 +5933,25 @@ ros2 param set /stereo_distance_node yolo_class_name drone
 `stereo_ground_sim/worlds/stereo_ground_drone.sdf`에서 수정합니다.
 기본 ground는 `4000 m x 4000 m`이고 월드 기준 x=0..4000, y=-2000..2000 범위를 덮습니다. 실행 시 `stereo_ground_sim.launch.py`가 같은 범위에 100 m 간격 grid line visual을 생성합니다. 카메라 모델 원점은 sensor optical center이고, Gazebo GUI 확인용 본체와 렌즈 visual은 그 기준점 뒤쪽에 배치됩니다.
 
-카메라 자세각은 자주 바꾸는 값이므로 `config/camera_attitude.env`에서 수정할 수 있습니다.
+카메라 optical 자세와 카메라 PX4 자세는 `config/simulation.env`에서 독립적으로 설정합니다. `CAM_L/R_OPTICAL_*`은 image sensor가 실제로 바라보는 방향이고, `CAM_L/R_PX4_*`은 각 카메라 PX4의 `base_link`와 IMU가 인식하는 방향입니다.
 
 ```bash
-RIGHT_YAW_ERROR_DEG=0.25
+CAM_L_OPTICAL_ROLL_DEG=0.0
+CAM_L_OPTICAL_PITCH_DEG=0.0
+CAM_L_OPTICAL_YAW_DEG=0.0
+CAM_R_OPTICAL_YAW_DEG=0.25
+
+CAM_L_PX4_ROLL_DEG=0.0
+CAM_L_PX4_PITCH_DEG=0.0
+CAM_L_PX4_YAW_DEG=0.0
+CAM_R_PX4_ROLL_DEG=0.0
+CAM_R_PX4_PITCH_DEG=0.0
+CAM_R_PX4_YAW_DEG=0.0
 ```
 
-파일을 저장한 뒤 `./run_operator_view.sh`를 다시 실행하면 적용됩니다. 명령줄 인자를 함께 주면 명령줄 인자가 우선합니다.
+`CAM_L_OPTICAL_*`만 변경하면 실제 left optical frame만 회전하고 left PX4 attitude는 nominal로 유지됩니다. 반대로 `CAM_L_PX4_*`만 변경하면 left PX4 body/IMU가 회전하지만 generated fixed transform이 optical sensor의 world attitude를 보존합니다. 파일을 저장한 뒤 `./run_operator_view.sh`를 다시 실행하면 적용되며, 명령줄 인자가 우선합니다.
 
-PX4 waypoint 경로도 같은 방식으로 `config/waypoints.env`에서 밖으로 뺄 수 있습니다.
+PX4 waypoint 경로도 같은 `config/simulation.env`에서 설정합니다.
 
 ```bash
 WAYPOINTS_XY_ALT_M="-300,0,10;-600,0,10;-900,0,10"
@@ -5935,7 +5961,7 @@ WAYPOINT_LAND_AFTER=true
 WAYPOINT_RECORD_LITE=true
 ```
 
-`WAYPOINTS_XY_ALT_M`의 각 항목은 `north,east,altitude_agl_m` 순서이며, 항목은 세미콜론으로 구분합니다. PX4 내부 `LOCAL_NED` 좌표계에서 north/east는 x/y이고, 고도는 사람이 보기 쉽게 양수 AGL 값으로 적습니다. 기본 waypoint는 `config/drone_mission.env`의 `DRONE_MOVE_DISTANCE_M`와 `DRONE_TAKEOFF_ALTITUDE_M`를 참조합니다. 파일을 수정한 뒤 `./run_operator_view.sh`로 Gazebo/PX4를 먼저 띄우고 별도 터미널에서 실행합니다.
+`WAYPOINTS_XY_ALT_M`의 각 항목은 `north,east,altitude_agl_m` 순서이며, 항목은 세미콜론으로 구분합니다. PX4 내부 `LOCAL_NED` 좌표계에서 north/east는 x/y이고, 고도는 사람이 보기 쉽게 양수 AGL 값으로 적습니다. 기본 waypoint는 `config/simulation.env`의 `DRONE_MOVE_DISTANCE_M`와 `DRONE_TAKEOFF_ALTITUDE_M`를 참조합니다. 파일을 수정한 뒤 `./run_operator_view.sh`로 Gazebo/PX4를 먼저 띄우고 별도 터미널에서 실행합니다.
 현재 시뮬레이션 축 기준에서는 카메라 방향 접근이 `north` 음수 방향이고, `east`는 카메라 베이스라인과 같은 횡방향입니다. 예를 들어 시작 거리 2000 m에서 카메라까지 415 m 지점으로 가려면 local north는 `-(2000 - 415) = -1585`입니다.
 
 ```bash
@@ -5980,7 +6006,7 @@ launch 인자로 좌/우 카메라 roll, pitch, yaw 오차를 도 단위로 줄 
 ./run_attitude_error_experiment.sh --include-negative
 ```
 
-각도 오차 범위는 `config/attitude_error.env`에서 조절합니다. 예를 들어 `-1.0도`부터 `+1.0도`까지 `0.25도` 간격으로 테스트하려면:
+각도 오차 범위는 `config/simulation.env`에서 조절합니다. 예를 들어 `-1.0도`부터 `+1.0도`까지 `0.25도` 간격으로 테스트하려면:
 
 ```bash
 ATTITUDE_EXPERIMENT_ANGLE_MIN_DEG=-1.0
@@ -5994,22 +6020,22 @@ ATTITUDE_EXPERIMENT_ANGLE_STEP_DEG=0.25
 
 ```bash
 ./run_attitude_error_experiment.sh \
-  --axis-range right_roll_error_deg:-5:5:0.5 \
-  --axis-range right_pitch_error_deg:-2:2:0.25 \
-  --axis-range right_yaw_error_deg:-10:10:1
+  --axis-range cam_r_optical_roll_deg:-5:5:0.5 \
+  --axis-range cam_r_optical_pitch_deg:-2:2:0.25 \
+  --axis-range cam_r_optical_yaw_deg:-10:10:1
 ```
 
 설정 파일에서는 공백으로 구분합니다.
 
 ```bash
-ATTITUDE_EXPERIMENT_AXIS_RANGES="right_roll_error_deg:-5:5:0.5 right_pitch_error_deg:-2:2:0.25 right_yaw_error_deg:-10:10:1"
+ATTITUDE_EXPERIMENT_AXIS_RANGES="cam_r_optical_roll_deg:-5:5:0.5 cam_r_optical_pitch_deg:-2:2:0.25 cam_r_optical_yaw_deg:-10:10:1"
 ```
 
 축별 범위가 지정된 축은 전역 `ATTITUDE_EXPERIMENT_ANGLE_MIN_DEG`, `ATTITUDE_EXPERIMENT_ANGLE_MAX_DEG`, `ATTITUDE_EXPERIMENT_ANGLE_STEP_DEG` 대신 해당 축별 값을 사용합니다.
 
 Gazebo/YOLO 실험 결과는 `reports/attitude_error_*/summary.csv`와 케이스별 CSV/log로 저장됩니다. `summary.csv`에는 케이스별 좌/우 roll/pitch/yaw, 마지막 실제 Forward/Right/Down/GroundTruth, 마지막 3D 추정값, baseline, 카메라 높이, FOV, 해상도 같은 카메라 모델 정보도 함께 들어가며, 공통 실행 조건은 `metadata.txt`에도 저장됩니다.
 
-카메라 모델 기본값은 `config/camera_model.env`에서 공통으로 바꿉니다. YOLO 기본값은 `config/yolo.env`에서 공통으로 바꿉니다. 두 파일 값은 operator view와 자세각 실험에 같이 적용됩니다.
+카메라 모델, optical/PX4 자세, target mission, waypoint, YOLO와 자세각 실험 기본값은 모두 `config/simulation.env`에서 바꿉니다. 같은 값이 operator view와 각 보조 runner에 적용됩니다.
 
 ```bash
 CAMERA_BASELINE_M=25.0
@@ -6032,10 +6058,10 @@ YOLO_IMGSZ=1280
 YOLO_PYTHON=python3
 ```
 
-자세각 실험 범위 기본값은 `config/attitude_error.env`에서 바꿀 수 있습니다. 각도 단위는 도(deg)입니다.
+자세각 실험 범위 기본값은 `config/simulation.env`에서 바꿀 수 있습니다. 각도 단위는 도(deg)입니다.
 
 ```bash
-ATTITUDE_EXPERIMENT_AXES="right_roll_error_deg right_pitch_error_deg right_yaw_error_deg"
+ATTITUDE_EXPERIMENT_AXES="cam_r_optical_roll_deg cam_r_optical_pitch_deg cam_r_optical_yaw_deg"
 ATTITUDE_EXPERIMENT_AXIS_RANGES=""
 ATTITUDE_EXPERIMENT_ANGLE_MIN_DEG=0.25
 ATTITUDE_EXPERIMENT_ANGLE_MAX_DEG=0.25
@@ -6044,21 +6070,20 @@ ATTITUDE_EXPERIMENT_INCLUDE_NEGATIVE=false
 ATTITUDE_EXPERIMENT_QUICK=false
 ```
 
-다른 설정 파일을 임시로 쓰려면 `CAMERA_MODEL_CONFIG=config/my_camera.env ./run_operator_view.sh`, `YOLO_CONFIG=config/my_yolo.env ./run_operator_view.sh`, 또는 `ATTITUDE_EXPERIMENT_CONFIG=config/my_attitude.env ./run_attitude_error_experiment.sh`처럼 실행합니다.
-드론 스폰/미션 설정도 같은 방식으로 `DRONE_MISSION_CONFIG=config/my_drone_mission.env ./run_operator_view.sh`, `DRONE_MISSION_CONFIG=config/my_drone_mission.env ./run_auto_mission.sh`, `DRONE_MISSION_CONFIG=config/my_drone_mission.env ./run_px4_waypoint_mission.sh`, `DRONE_MISSION_CONFIG=config/my_drone_mission.env ./run_attitude_error_experiment.sh`처럼 바꿀 수 있습니다.
+전체 기본값 묶음을 임시로 교체하려면 `SIM_CONFIG=config/my_simulation.env ./run_operator_view.sh`처럼 실행합니다. 같은 `SIM_CONFIG` 계약을 `run_auto_mission.sh`, `run_px4_waypoint_mission.sh`, `run_attitude_error_experiment.sh`에서도 사용합니다.
 
 예: 오른쪽 카메라 yaw를 1도 틀기
 
 ```bash
-./run_operator_view.sh right_yaw_error_deg:=1.0
+./run_operator_view.sh cam_r_optical_yaw_deg:=1.0
 ```
 
 예: 양쪽 카메라 pitch 오차를 다르게 주기
 
 ```bash
 ./run_operator_view.sh \
-  left_pitch_error_deg:=0.5 \
-  right_pitch_error_deg:=-0.5
+  cam_l_optical_pitch_deg:=0.5 \
+  cam_r_optical_pitch_deg:=-0.5
 ```
 
 사용 가능한 인자:
@@ -6082,12 +6107,12 @@ takeoff_duration_s
 first_hover_duration_s
 final_hover_duration_s
 land_duration_s
-left_roll_error_deg
-left_pitch_error_deg
-left_yaw_error_deg
-right_roll_error_deg
-right_pitch_error_deg
-right_yaw_error_deg
+cam_l_optical_roll_deg
+cam_l_optical_pitch_deg
+cam_l_optical_yaw_deg
+cam_r_optical_roll_deg
+cam_r_optical_pitch_deg
+cam_r_optical_yaw_deg
 yolo_model_path
 yolo_class_name
 yolo_confidence

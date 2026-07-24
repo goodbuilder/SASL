@@ -1,13 +1,13 @@
 # Experiment Workflow
 
-This document is the operating contract for StereoDistance correction-method
+This document is the operating contract for StereoCAM correction-method
 experiments in this workspace. The goal is to make every attempt reproducible,
 rankable, and understandable even when it fails.
 
 ## Scope
 
 Use this workflow for any active method that changes, selects, gates, fuses, or
-validates StereoDistance correction behavior, including bbox-anchor,
+validates StereoCAM correction behavior, including bbox-anchor,
 extrinsic, residual, and range-fusion branches.
 
 Legacy reports already under `reports/` may stay where they are. New method
@@ -27,7 +27,7 @@ workflow steps.
 4. Record the truth point, runtime-observable feature/reference point,
    calibration-time truth use, measurement-time runtime inputs, and coordinate
    contracts before execution. Distinguish PX4 NED, internal correction RDF,
-   and any public StereoDistance FRD+range topic arrays.
+   and any public StereoCAM FRD+range topic arrays.
    Evaluation is in `stereo_center_RDF`: compare `corrected_rdf` with
    `truth_rdf`. `truth_rdf` must come from an explicit
    `T_source_to_stereo_rdf` transform or an already stereo-frame truth producer.
@@ -94,14 +94,14 @@ Use `reports/experiments/templates/` as the starting point.
 
 ## Storage Contract
 
-Experiment records use the same split as StereoDistance session storage:
+Experiment records use the same split as StereoCAM session storage:
 
 - Fixed scenario/session parameters belong in `README.md`, `metrics.json`, or a
   profile/deployment manifest. This includes scenario name, target class/size,
   baseline, camera height, zoom/FOV, image size, intrinsics basis, validated
   envelope, truth source, time basis, units, and coordinate/axis contracts.
 - Time-varying observations belong in timestamped artifacts listed from
-  `artifacts.txt`. This includes raw and corrected StereoDistance RDF/FRD
+  `artifacts.txt`. This includes raw and corrected StereoCAM RDF/FRD
   samples, truth N/E/D samples, bbox geometry/confidence, disparity/range,
   frame timestamps, latency/sample age, outlier flags, and active profile or
   intrinsics IDs.
@@ -109,7 +109,7 @@ Experiment records use the same split as StereoDistance session storage:
   Local NED is the primary calibration/evaluation source. GPS/global
   `lat/lon/alt` must be preserved as raw source data and converted to local NED
   with an explicit origin before any comparison. Live GPS/global conversion in
-  StereoDistance is an operational monitor; final calibration/PASS evidence must
+  StereoCAM is an operational monitor; final calibration/PASS evidence must
   be regenerated offline from saved rows or ULog with the selected origin, time
   basis, and `T_source_to_stereo_rdf` or alignment profile.
 - When a Simulation experiment is intended to compare truth-source choices, use

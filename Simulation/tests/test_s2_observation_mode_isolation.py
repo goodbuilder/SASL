@@ -18,6 +18,7 @@ def _node(mode, hz, path, disabled):
     node.yolo_target_hz = hz
     node.yolo_model_path = path
     node.yolo_runtime_disabled = disabled
+    node.camera_update_rate_hz = 20.0
     node.resolved_yolo_device = None
     node._left_cb = lambda _message: None
     node._right_cb = lambda _message: None
@@ -38,6 +39,17 @@ def test_observation_mode_validation_rejects_aliases_and_silent_fallbacks(mode):
         StereoDistanceNode._validate_observation_mode(mode)
 
 
+@pytest.mark.parametrize("source", ("raw_gps", "global_position", "both"))
+def test_gps_baseline_source_validation_accepts_supported_sources(source):
+    assert StereoDistanceNode._validate_gps_baseline_source(source) == source
+
+
+@pytest.mark.parametrize("source", ("", "SensorGps", "global"))
+def test_gps_baseline_source_validation_rejects_unsupported_sources(source):
+    with pytest.raises(ValueError, match="gps_baseline_source"):
+        StereoDistanceNode._validate_gps_baseline_source(source)
+
+
 @pytest.mark.parametrize(
     ("mode", "hz", "path", "disabled", "load", "subscribe"),
     (
@@ -46,6 +58,7 @@ def test_observation_mode_validation_rejects_aliases_and_silent_fallbacks(mode):
         ("bbox_yolo", 0.0, "/tmp/model.pt", False, False, False),
         ("bbox_yolo", 40.0, "/tmp/model.pt", True, False, False),
         ("ideal_reference_point", 40.0, "", False, False, True),
+        ("ideal_reference_point", 0.0, "", False, False, True),
     ),
 )
 def test_loader_and_subscription_preconditions_by_mode(
@@ -54,6 +67,23 @@ def test_loader_and_subscription_preconditions_by_mode(
     node = _node(mode, hz, path, disabled)
     assert node._should_load_yolo_model() is load
     assert node._should_subscribe_camera_images() is subscribe
+
+
+@pytest.mark.parametrize(
+    ("mode", "yolo_hz", "camera_hz", "expected_hz"),
+    (
+        ("bbox_yolo", 40.0, 20.0, 40.0),
+        ("bbox_yolo", 0.0, 20.0, 0.1),
+        ("ideal_reference_point", 0.0, 20.0, 20.0),
+        ("ideal_reference_point", 40.0, 12.5, 12.5),
+    ),
+)
+def test_measurement_processing_rate_is_camera_rate_for_ideal_mode(
+    mode, yolo_hz, camera_hz, expected_hz
+):
+    node = _node(mode, yolo_hz, "", False)
+    node.camera_update_rate_hz = camera_hz
+    assert node._measurement_processing_hz() == expected_hz
 
 
 @pytest.mark.parametrize(
@@ -95,6 +125,7 @@ def test_yolo_runtime_initialization_call_counts(
         ("bbox_yolo", 0.0, "/tmp/model.pt", False, 0),
         ("bbox_yolo", 40.0, "/tmp/model.pt", True, 0),
         ("ideal_reference_point", 40.0, "", False, 2),
+        ("ideal_reference_point", 0.0, "", False, 2),
     ),
 )
 def test_image_subscription_creation_call_counts(
@@ -124,6 +155,7 @@ def test_image_subscription_creation_call_counts(
         ("bbox_yolo", 0.0, "/tmp/model.pt", False, 0),
         ("bbox_yolo", 40.0, "/tmp/model.pt", True, 0),
         ("ideal_reference_point", 40.0, "", False, 1),
+        ("ideal_reference_point", 0.0, "", False, 1),
     ),
 )
 def test_worker_start_call_counts(

@@ -27,14 +27,14 @@ from .coordinate_frames import (
 from .research_recording import PAIR_RECORD_COLUMNS, RESEARCH_SCHEMA_VERSION
 
 
-S2_SWEEP_SCHEMA_VERSION = "s2_correction_sweep_v1"
+S2_SWEEP_SCHEMA_VERSION = "s2_correction_sweep_v2"
 ATTITUDE_AXES = (
-    "left_roll_error_deg",
-    "left_pitch_error_deg",
-    "left_yaw_error_deg",
-    "right_roll_error_deg",
-    "right_pitch_error_deg",
-    "right_yaw_error_deg",
+    "cam_l_optical_roll_deg",
+    "cam_l_optical_pitch_deg",
+    "cam_l_optical_yaw_deg",
+    "cam_r_optical_roll_deg",
+    "cam_r_optical_pitch_deg",
+    "cam_r_optical_yaw_deg",
     "common_optical_roll_error_deg",
     "relative_optical_roll_error_deg",
     "common_optical_pitch_error_deg",
@@ -846,6 +846,17 @@ def validate_r2_artifacts(
     for key, value in expected_metadata.items():
         if metadata.get(key) != value:
             raise ValueError(f"R2 metadata mismatch: {key}")
+    oracle_hash = metadata.get("camera_oracle_expected_sdf_sha256")
+    if (
+        metadata.get("camera_oracle_source") != "gazebo_observed_optical"
+        or not isinstance(oracle_hash, str)
+        or len(oracle_hash) != 64
+        or any(character not in "0123456789abcdef" for character in oracle_hash)
+    ):
+        raise ValueError("R2 camera oracle metadata provenance is invalid")
+    desired_poses = metadata.get("desired_camera_poses_from_env")
+    if not isinstance(desired_poses, dict) or set(desired_poses) != {"left", "right"}:
+        raise ValueError("R2 desired camera metadata is incomplete")
     if summary.get("run_valid") is not True:
         raise ValueError("R2 run is invalid")
     for key, value in (
@@ -889,6 +900,38 @@ def validate_r2_artifacts(
         if key in keys:
             raise ValueError("duplicate R2 pair key")
         keys.add(key)
+        if record["sample_eligible"]:
+            if (
+                record.get("camera_oracle_source") != "gazebo_observed_optical"
+                or record.get("correction_source") != "gazebo_observed_optical_pose"
+                or record.get("camera_oracle_expected_sdf_sha256") != oracle_hash
+            ):
+                raise ValueError("eligible R2 record camera oracle provenance mismatch")
+            for label in ("left", "right"):
+                prefix = f"{label}_camera_oracle_"
+                if (
+                    not isinstance(record.get(prefix + "gazebo_stamp_ns"), int)
+                    or isinstance(record.get(prefix + "gazebo_stamp_ns"), bool)
+                    or record[prefix + "gazebo_stamp_ns"] <= 0
+                    or record.get(prefix + "base_entity_name") != f"{label}_stereo_camera::base_link"
+                    or record.get(prefix + "optical_entity_name") != f"{label}_stereo_camera::optical_link"
+                ):
+                    raise ValueError("eligible R2 record camera oracle entity/stamp mismatch")
+                for field in ("base_entity_id", "optical_entity_id"):
+                    if isinstance(record.get(prefix + field), bool) or not isinstance(record.get(prefix + field), int):
+                        raise ValueError("eligible R2 record camera oracle entity ID mismatch")
+                vector = tuple(
+                    record.get(prefix + field)
+                    for field in ("optical_x_m", "optical_y_m", "optical_z_m")
+                )
+                quaternion = tuple(
+                    record.get(prefix + field)
+                    for field in ("optical_qx", "optical_qy", "optical_qz", "optical_qw")
+                )
+                if not all(isinstance(value, (int, float)) and math.isfinite(float(value)) for value in (*vector, *quaternion)):
+                    raise ValueError("eligible R2 record camera oracle pose is invalid")
+                if sum(float(value) * float(value) for value in quaternion) <= 0.0:
+                    raise ValueError("eligible R2 record camera oracle quaternion is invalid")
     with (directory / "pair_records.csv").open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         if tuple(reader.fieldnames or ()) != PAIR_RECORD_COLUMNS:

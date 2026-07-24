@@ -5,11 +5,11 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.5
-      Cell Size: 1
+    - Alpha: 0.35
+      Cell Size: 100
       Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
-      Enabled: false
+      Enabled: true
       Line Style:
         Line Width: 0.03
         Value: Lines
@@ -21,7 +21,7 @@ Visualization Manager:
         Z: 0
       Plane: XY
       Plane Cell Count: 40
-      Reference Frame: map
+      Reference Frame: gazebo_world_enu
       Value: false
     - Class: rviz_default_plugins/Image
       Enabled: true
@@ -54,8 +54,8 @@ Visualization Manager:
         Value: /right_camera/image
       Value: true
     - Class: rviz_default_plugins/Marker
-      Enabled: true
-      Marker Topic:
+      Enabled: false
+      Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
@@ -66,10 +66,27 @@ Visualization Manager:
         stereo: true
       Queue Size: 100
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/ray_markers
+      Name: Stereo Rays — Nominal / Optical / Ideal (World ENU)
+      Namespaces:
+        stereo_actual_drone: true
+        stereo_cameras: true
+        stereo_rays_nominal: true
+        stereo_rays_optical: true
+        stereo_rays_ideal: true
+      Queue Size: 100
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 32; 34; 36
-    Fixed Frame: map
+    Fixed Frame: gazebo_world_enu
     Frame Rate: 30
   Name: root
   Tools:
@@ -83,15 +100,17 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 55
+      Distance: 2800
       Focal Point:
-        X: 22
-        Y: 0
-        Z: 4
+        X: 0
+        Y: 1000
+        Z: 5
       Name: Current View
-      Pitch: 0.35
-      Target Frame: map
-      Yaw: 3.14
+      Pitch: 0.6
+      Target Frame: gazebo_world_enu
+      # View across the +Y flight/ray direction, rather than down it, so the
+      # nominal and Gazebo-oracle rays remain visually distinguishable.
+      Yaw: 1.57
     Saved: ~
 Window Geometry:
   Displays:

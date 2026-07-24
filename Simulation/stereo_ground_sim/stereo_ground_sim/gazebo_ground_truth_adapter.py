@@ -25,7 +25,9 @@ from .coordinate_frames import (
 )
 
 
-POSE_TOPIC = "/world/stereo_ground_drone/pose/info"
+# The target model owns a PosePublisher, so its scoped model/link identities
+# never collide with the camera carriers' own ``base_link`` names.
+POSE_TOPIC = "/model/x500_15m/pose"
 OUTPUT_TOPIC = "/simulation/ground_truth/vehicle_reference_link"
 GAZEBO_MESSAGE_TYPE = "gz.msgs.Pose_V"
 ROS_MESSAGE_TYPE = "geometry_msgs/msg/PoseStamped"
@@ -92,6 +94,10 @@ def _number(mapping: dict[str, Any], key: str) -> float:
 
 
 def _entity_id(value: Any) -> int:
+    # Model-scoped PosePublisher messages omit numeric ECM ids.  The scoped
+    # topic and fully-qualified entity name already provide run identity.
+    if value is None:
+        return -1
     try:
         parsed = int(value)
     except (TypeError, ValueError):
@@ -130,6 +136,15 @@ def _named_pose_mappings(payload: dict[str, Any], entity_name: str) -> list[dict
             continue
         mappings.append(mapping)
     return mappings
+
+
+def _pose_v_stamp_ns(payload: dict[str, Any], mappings: list[dict[str, Any]]) -> int:
+    if isinstance(payload.get("header"), dict):
+        return stamp_ns_from_header(payload["header"])
+    stamps = {stamp_ns_from_header(mapping.get("header")) for mapping in mappings}
+    if len(stamps) != 1:
+        raise PosePayloadError("Pose_V entity stamps are missing or inconsistent")
+    return stamps.pop()
 
 
 def _quaternion_normalize(quaternion: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
@@ -222,12 +237,12 @@ def parse_pose_v_payload(
 
     if not isinstance(payload, dict):
         raise PosePayloadError("Pose_V payload is not an object")
-    stamp_ns = stamp_ns_from_header(payload.get("header"))
     mappings = _named_pose_mappings(payload, entity_name)
     if not mappings:
         raise PosePayloadError(f"authoritative entity {entity_name!r} is unavailable")
     if len(mappings) != 1:
         raise PosePayloadError(f"authoritative entity {entity_name!r} has duplicate name/id entries")
+    stamp_ns = _pose_v_stamp_ns(payload, mappings)
     record = _pose_record_from_mapping(mappings[0], stamp_ns)
     if expected_entity_id is not None and record.entity_id != int(expected_entity_id):
         raise PosePayloadError(
@@ -300,11 +315,11 @@ class GazeboGroundTruthAdapter:
     def __init__(
         self,
         *,
-        topic: str = POSE_TOPIC,
+        topic: str | None = None,
         output_topic: str = OUTPUT_TOPIC,
         command: tuple[str, ...] | None = None,
         parent_model_name: str = "x500_15m",
-        source_link_name: str = SOURCE_GAZEBO_ENTITY,
+        source_link_name: str = "",
     ) -> None:
         try:
             import rclpy
@@ -322,9 +337,10 @@ class GazeboGroundTruthAdapter:
         self._node.declare_parameter("parent_model_name", str(parent_model_name))
         self._node.declare_parameter("source_link_name", str(source_link_name))
         self._publisher = self._node.create_publisher(PoseStamped, output_topic, 10)
-        self._topic = str(topic)
         self._parent_model_name = str(self._node.get_parameter("parent_model_name").value)
-        self._source_link_name = str(self._node.get_parameter("source_link_name").value)
+        configured_source_link = str(self._node.get_parameter("source_link_name").value)
+        self._source_link_name = configured_source_link or f"{self._parent_model_name}::{SOURCE_GAZEBO_ENTITY}"
+        self._topic = str(topic or f"/model/{self._parent_model_name}/pose")
 
         self._set_parameters_result_type = SetParametersResult
         self._node.add_on_set_parameters_callback(self._reject_identity_parameter_update)

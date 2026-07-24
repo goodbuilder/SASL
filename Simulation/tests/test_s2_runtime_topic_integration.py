@@ -28,8 +28,17 @@ def _node_harness():
     node.raw_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.canonical_ground_truth_position_pub = CapturePublisher()
+    node.raw_gps_baseline_position_pub = CapturePublisher()
+    node.global_position_baseline_position_pub = CapturePublisher()
+    node.raw_gps_baseline_plot_pub = CapturePublisher()
+    node.global_position_baseline_plot_pub = CapturePublisher()
     node.last_raw_published_pair_id = 0
     node.last_corrected_published_pair_id = 0
+    node.last_gps_baseline_published_pair_id = 0
+    node.last_gps_baseline_published_pair_id_by_source = {
+        "raw_gps": 0,
+        "global_position": 0,
+    }
     node.gt_published_pair_ids = BoundedIdHistory(128)
     node.raw_computed_count = 0
     node.corrected_computed_count = 0
@@ -104,3 +113,28 @@ def test_raw_and_corrected_publish_before_late_gt_on_same_pair_stamp() -> None:
     assert (messages[0].point.x, messages[0].point.y, messages[0].point.z) == (10.0, 2.0, -1.0)
     assert node.last_pair_result["raw_position_error_m"] > 0.0
     assert node.last_pair_result["corrected_position_error_m"] > 0.0
+
+
+def test_gps_baseline_plot_arrays_preserve_public_frd_order_without_header_time() -> None:
+    node = _node_harness()
+    metrics = {
+        "pair_id": 6,
+        "pair_midpoint_stamp_ns": 200,
+        "gps_baseline_computation_status": "unavailable",
+        "raw_gps_baseline_computation_status": "computed",
+        "raw_gps_baseline_forward_m": 1002.0,
+        "raw_gps_baseline_right_m": 6.0,
+        "raw_gps_baseline_down_m": 5.0,
+        "global_position_baseline_computation_status": "computed",
+        "global_position_baseline_forward_m": 1000.0,
+        "global_position_baseline_right_m": 5.5,
+        "global_position_baseline_down_m": 4.5,
+    }
+
+    node._publish_canonical_pair_positions(metrics)
+    node._publish_canonical_pair_positions(metrics)
+
+    assert len(node.raw_gps_baseline_position_pub.messages) == 1
+    assert len(node.global_position_baseline_position_pub.messages) == 1
+    assert node.raw_gps_baseline_plot_pub.messages[0].data == [1002.0, 6.0, 5.0]
+    assert node.global_position_baseline_plot_pub.messages[0].data == [1000.0, 5.5, 4.5]

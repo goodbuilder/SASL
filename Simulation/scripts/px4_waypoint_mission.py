@@ -147,7 +147,7 @@ def collect_waypoints(args):
     waypoints.extend(args.waypoint)
     if not waypoints and not args.check_connection:
         raise RuntimeError(
-            "No waypoints configured. Edit config/waypoints.env or pass --waypoint."
+            "No waypoints configured. Edit config/simulation.env or pass --waypoint."
         )
     return waypoints
 

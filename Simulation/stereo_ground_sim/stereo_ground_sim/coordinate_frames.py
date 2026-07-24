@@ -314,6 +314,30 @@ def sdf_link_rpy_from_optical_error(
     return roll, -pitch, nominal_yaw - yaw
 
 
+def sdf_link_rpy_from_px4_frd_error(
+    nominal_link_yaw_rad: float,
+    px4_roll_error_rad: float,
+    px4_pitch_error_rad: float,
+    px4_yaw_error_rad: float,
+) -> Vector3:
+    """Map a PX4 FRD body attitude error to Gazebo's FLU link RPY.
+
+    PX4 body +X/+Y/+Z are Forward/Right/Down while the Gazebo model link is
+    Forward/Left/Up.  The equivalent SDF error is therefore
+    ``(roll, -pitch, -yaw)`` about the nominal model heading.
+    """
+
+    nominal_yaw, roll, pitch, yaw = (
+        float(nominal_link_yaw_rad),
+        float(px4_roll_error_rad),
+        float(px4_pitch_error_rad),
+        float(px4_yaw_error_rad),
+    )
+    if not all(math.isfinite(value) for value in (nominal_yaw, roll, pitch, yaw)):
+        raise ValueError("SDF link and PX4 FRD RPY values must be finite")
+    return roll, -pitch, nominal_yaw - yaw
+
+
 def rpy_to_rotation_world_from_link(roll_rad: float, pitch_rad: float, yaw_rad: float) -> Matrix3:
     """Return the SDF ``roll pitch yaw`` rotation, link frame to world."""
 
@@ -332,6 +356,59 @@ def rpy_to_rotation_world_from_link(roll_rad: float, pitch_rad: float, yaw_rad: 
     )
 
 
+def rotation_to_sdf_rpy(rotation: Matrix3) -> Vector3:
+    """Return SDF ZYX roll/pitch/yaw for a proper rotation matrix."""
+
+    if not all(math.isfinite(value) for row in rotation for value in row):
+        raise ValueError("rotation must be finite")
+    if abs(_det(rotation) - 1.0) > 1.0e-9:
+        raise ValueError("rotation must have determinant +1")
+    pitch = math.asin(max(-1.0, min(1.0, -rotation[2][0])))
+    if abs(math.cos(pitch)) > 1.0e-12:
+        roll = math.atan2(rotation[2][1], rotation[2][2])
+        yaw = math.atan2(rotation[1][0], rotation[0][0])
+    else:
+        roll = math.atan2(-rotation[1][2], rotation[1][1])
+        yaw = 0.0
+    return roll, pitch, yaw
+
+
+def rotation_world_from_quaternion_xyzw(quaternion_xyzw: Sequence[float]) -> Matrix3:
+    """Return a world-from-link rotation from a finite, non-zero XYZW quaternion."""
+
+    if len(quaternion_xyzw) != 4:
+        raise ValueError("quaternion_xyzw must contain four values")
+    x, y, z, w = (float(value) for value in quaternion_xyzw)
+    if not all(math.isfinite(value) for value in (x, y, z, w)):
+        raise ValueError("quaternion_xyzw must be finite")
+    magnitude = math.sqrt(x * x + y * y + z * z + w * w)
+    if magnitude <= 0.0:
+        raise ValueError("quaternion_xyzw must have non-zero length")
+    x, y, z, w = (value / magnitude for value in (x, y, z, w))
+    return (
+        (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)),
+        (2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)),
+        (2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)),
+    )
+
+
+def relative_sdf_rpy(
+    parent_world_rpy_rad: Sequence[float],
+    child_world_rpy_rad: Sequence[float],
+) -> Vector3:
+    """Return child RPY relative to parent while preserving its world attitude."""
+
+    parent = _finite_vector(parent_world_rpy_rad, "parent_world_rpy_rad")
+    child = _finite_vector(child_world_rpy_rad, "child_world_rpy_rad")
+    rotation_world_from_parent = rpy_to_rotation_world_from_link(*parent)
+    rotation_world_from_child = rpy_to_rotation_world_from_link(*child)
+    rotation_parent_from_child = _mat_mul(
+        _transpose(rotation_world_from_parent),
+        rotation_world_from_child,
+    )
+    return rotation_to_sdf_rpy(rotation_parent_from_child)
+
+
 def camera_optical_pose_from_sdf_pose(
     center_world_enu_m: Sequence[float],
     rpy_rad: Sequence[float],
@@ -346,6 +423,25 @@ def camera_optical_pose_from_sdf_pose(
     center = _finite_vector(center_world_enu_m, "center_world_enu_m")
     rpy = _finite_vector(rpy_rad, "rpy_rad")
     rotation = rpy_to_rotation_world_from_link(*rpy)
+    forward = _mat_vec(rotation, (1.0, 0.0, 0.0))
+    right = _mat_vec(rotation, (0.0, -1.0, 0.0))
+    down = _mat_vec(rotation, (0.0, 0.0, -1.0))
+    return CameraOpticalPose(
+        center_world_enu_m=center,
+        right_world_enu=normalize(right, "right_world_enu"),
+        down_world_enu=normalize(down, "down_world_enu"),
+        forward_world_enu=normalize(forward, "forward_world_enu"),
+    )
+
+
+def camera_optical_pose_from_quaternion(
+    center_world_enu_m: Sequence[float],
+    orientation_world_from_link_xyzw: Sequence[float],
+) -> CameraOpticalPose:
+    """Map a Gazebo world-from-link quaternion to optical RDF axes."""
+
+    center = _finite_vector(center_world_enu_m, "center_world_enu_m")
+    rotation = rotation_world_from_quaternion_xyzw(orientation_world_from_link_xyzw)
     forward = _mat_vec(rotation, (1.0, 0.0, 0.0))
     right = _mat_vec(rotation, (0.0, -1.0, 0.0))
     down = _mat_vec(rotation, (0.0, 0.0, -1.0))
@@ -465,6 +561,7 @@ __all__ = [
     "apply_optical_rpy_error",
     "apply_optical_yaw",
     "build_baseline_center_frd",
+    "camera_optical_pose_from_quaternion",
     "camera_optical_pose_from_sdf_pose",
     "effective_optical_rpy_errors_deg",
     "effective_optical_yaws_deg",
@@ -474,5 +571,9 @@ __all__ = [
     "optical_rpy_error_rotation",
     "project_world_point_to_pixel",
     "rpy_to_rotation_world_from_link",
+    "rotation_to_sdf_rpy",
+    "relative_sdf_rpy",
+    "rotation_world_from_quaternion_xyzw",
     "sdf_link_rpy_from_optical_error",
+    "sdf_link_rpy_from_px4_frd_error",
 ]

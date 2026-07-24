@@ -72,8 +72,8 @@ def test_decimal_invalid_ranges_rejected(spec: str) -> None:
 def test_ofat_has_one_baseline_and_one_nonzero_source_per_case() -> None:
     cases = build_attitude_cases(
         (
-            parse_attitude_axis_range("left_roll_error_deg:-0.1:0.1:0.1"),
-            parse_attitude_axis_range("right_pitch_error_deg:0:0.2:0.2"),
+            parse_attitude_axis_range("cam_l_optical_roll_deg:-0.1:0.1:0.1"),
+            parse_attitude_axis_range("cam_r_optical_pitch_deg:0:0.2:0.2"),
         ),
         mode="ofat",
     )
@@ -85,8 +85,8 @@ def test_ofat_has_one_baseline_and_one_nonzero_source_per_case() -> None:
 def test_cartesian_product_includes_baseline_once() -> None:
     cases = build_attitude_cases(
         (
-            ("left_roll_error_deg", (Decimal("0.1"), Decimal("0.2"))),
-            ("right_yaw_error_deg", (Decimal("-0.1"), Decimal("0.1"))),
+            ("cam_l_optical_roll_deg", (Decimal("0.1"), Decimal("0.2"))),
+            ("cam_r_optical_yaw_deg", (Decimal("-0.1"), Decimal("0.1"))),
         ),
         mode="cartesian",
     )
@@ -96,7 +96,7 @@ def test_cartesian_product_includes_baseline_once() -> None:
 
 
 def test_duplicate_axis_and_max_case_guard_rejected() -> None:
-    duplicate = parse_attitude_axis_range("left_roll_error_deg:0:0:1")
+    duplicate = parse_attitude_axis_range("cam_l_optical_roll_deg:0:0:1")
     with pytest.raises(ValueError, match="duplicate"):
         build_attitude_cases((duplicate, duplicate), mode="ofat")
     with pytest.raises(ValueError, match="exceeds max_cases"):

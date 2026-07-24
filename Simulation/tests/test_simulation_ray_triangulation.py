@@ -18,6 +18,7 @@ from sasl_common.stereo_geometry import (
     triangulate_rays,
 )
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from camera_oracle_test_support import seed_observed_camera_oracle
 
 
 def test_known_point_and_skew_ray_midpoint() -> None:
@@ -178,6 +179,8 @@ def test_simulation_pixel_path_reconstructs_known_baseline_point() -> None:
     node.camera_height_m = 5.0
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
+    node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     left, right = node._synthetic_detection_pair_from_rdf(
         right_m=7.0,
         down_m=4.0,
@@ -199,6 +202,7 @@ def test_ideal_reference_projection_raw_matches_same_baseline_ground_truth() -> 
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
     node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     world_point = node.baseline_center_frd.point_to_world((500.0, -3.0, 2.0))
     left, right = node._ideal_detection_pair_from_reference_world(world_point, 1280, 720)
     raw = node._triangulate_center_pixels(left["cx"], left["cy"], right["cx"], right["cy"], 1280, 720)
@@ -215,13 +219,14 @@ def test_ideal_reference_projection_rejects_120m_when_either_camera_is_out_of_fo
     node.horizontal_fov_rad = 0.154997710698
     node.synthetic_detection_bbox_size_px = 32.0
     node._ensure_camera_frames()
+    seed_observed_camera_oracle(node)
     world_point = node.baseline_center_frd.point_to_world((120.0, -3.0, 2.0))
 
     unbounded_left, unbounded_right = node._detection_pair_from_world(
         world_point,
         1280,
         720,
-        projection_camera_mode="actual",
+        projection_camera_mode="gazebo_observed_optical",
         enforce_fov_bounds=False,
     )
     ideal_left, ideal_right = node._ideal_detection_pair_from_reference_world(

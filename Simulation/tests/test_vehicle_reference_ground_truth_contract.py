@@ -51,7 +51,7 @@ def test_reference_metadata_contract() -> None:
     assert REFERENCE_OFFSET_PARENT_M == (0.0, 0.0, 0.0)
     assert REFERENCE_OFFSET_PARENT_RPY_RAD == (0.0, 0.0, 0.0)
     assert WORLD_FRAME == "gazebo_world_enu"
-    assert POSE_TOPIC == "/world/stereo_ground_drone/pose/info"
+    assert POSE_TOPIC == "/model/x500_15m/pose"
     assert OUTPUT_TOPIC == "/simulation/ground_truth/vehicle_reference_link"
 
 
@@ -94,6 +94,40 @@ def test_pose_v_parser_accepts_gazebo_sparse_zero_scalar_json() -> None:
     assert record.stamp_ns == 12_000_000
     assert record.position_world_enu_m == (0.0, 2000.0, 0.0)
     assert record.orientation_world_from_entity_xyzw == (0.0, 0.0, -0.707106781, 0.707106781)
+
+
+def test_model_scoped_pose_publisher_payload_uses_entity_stamp() -> None:
+    payload = {
+        "pose": [
+            {
+                "header": {"stamp": {"sec": 4, "nsec": 5}},
+                "name": "x500_15m::base_link",
+                "position": {},
+                "orientation": {"w": 1.0},
+            },
+            {
+                "header": {"stamp": {"sec": 4, "nsec": 5}},
+                "name": "x500_15m",
+                "position": {"y": 2000.0, "z": 0.75},
+                "orientation": {"w": 1.0},
+            },
+        ]
+    }
+    link = parse_pose_v_payload(payload, entity_name="x500_15m::base_link")
+    world = pose_record_world_from_payload(payload, link, parent_model_name="x500_15m")
+    assert world.stamp_ns == 4_000_000_005
+    assert world.entity_id == -1
+    assert world.position_world_enu_m == (0.0, 2000.0, 0.75)
+
+
+def test_target_model_owns_scoped_pose_publisher() -> None:
+    root = ET.parse(MODEL).getroot()
+    plugin = root.find("./model/plugin[@name='gz::sim::systems::PosePublisher']")
+    assert plugin is not None
+    assert plugin.findtext("publish_model_pose") == "true"
+    assert plugin.findtext("publish_link_pose") == "true"
+    assert plugin.findtext("use_pose_vector_msg") == "true"
+    assert plugin.findtext("static_publisher") == "false"
 
 
 def test_pose_v_world_resolution_composes_scene_model_and_base_link() -> None:
