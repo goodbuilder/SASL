@@ -229,9 +229,38 @@ class CameraPane(QtWidgets.QGroupBox):
         if self.latest_image is None:
             return
         pixmap = QtGui.QPixmap.fromImage(self.latest_image)
-        self.image_label.setPixmap(
-            pixmap.scaled(self.image_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-        )
+        scaled = pixmap.scaled(self.image_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        if self.latest_detection is not None and not self.measurement_pair_display_active:
+            scaled = self._draw_detection_overlay(scaled, self.latest_detection)
+        self.image_label.setPixmap(scaled)
+
+    def _draw_detection_overlay(
+        self, pixmap: QtGui.QPixmap, detection: DetectionObservation
+    ) -> QtGui.QPixmap:
+        if detection.width <= 0 or detection.height <= 0:
+            return pixmap
+        scale_x = pixmap.width() / detection.width
+        scale_y = pixmap.height() / detection.height
+        painter = QtGui.QPainter(pixmap)
+        try:
+            painter.setRenderHint(QtGui.QPainter.Antialiasing)
+            color = QtGui.QColor(60, 220, 90)
+            rect = QtCore.QRectF(
+                detection.x1 * scale_x,
+                detection.y1 * scale_y,
+                (detection.x2 - detection.x1) * scale_x,
+                (detection.y2 - detection.y1) * scale_y,
+            )
+            painter.setPen(QtGui.QPen(color, 2))
+            painter.drawRect(rect)
+            label = detection.class_name or f"#{detection.class_id}"
+            painter.drawText(
+                QtCore.QPointF(rect.left(), max(10.0, rect.top() - 4.0)),
+                f"{label} {detection.confidence:.2f}",
+            )
+        finally:
+            painter.end()
+        return pixmap
 
     def current_image(self) -> QtGui.QImage | None:
         return self.latest_image.copy() if self.latest_image is not None else None
@@ -240,6 +269,8 @@ class CameraPane(QtWidgets.QGroupBox):
         observation = DetectionObservation.from_payload(self.camera_label, payload)
         self.latest_detection = observation
         self._set_detection_label(observation)
+        if not self.measurement_pair_display_active:
+            self._refresh_pixmap()
         self.detection_changed.emit(self.camera_label, observation)
 
     def _handle_detection_payload_if_current(self, generation: int, payload: dict) -> None:

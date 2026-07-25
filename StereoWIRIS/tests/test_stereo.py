@@ -709,6 +709,87 @@ def test_camera_pane_detection_label_shows_center_with_two_decimals() -> None:
     _ = app
 
 
+def test_camera_pane_overlays_latest_detection_bbox_on_live_preview() -> None:
+    from PyQt5 import QtGui, QtWidgets
+
+    from wiris_stereo_distance.camera_pane import CameraPane
+    from wiris_stereo_distance.stereo import DetectionObservation
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.resize(400, 300)
+    image = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    image.fill(QtGui.QColor("black"))
+    pane.latest_image = image
+    pane._refresh_pixmap()
+    without_box = pane.image_label.pixmap().toImage().copy()
+
+    pane.latest_detection = DetectionObservation(
+        camera="left",
+        timestamp_s=1.0,
+        width=640,
+        height=480,
+        x1=100.0,
+        y1=100.0,
+        x2=300.0,
+        y2=300.0,
+        confidence=0.9,
+        class_id=0,
+        class_name="person",
+    )
+    pane._refresh_pixmap()
+    with_box = pane.image_label.pixmap().toImage().copy()
+
+    assert with_box != without_box
+
+    pane.stop()
+    pane.deleteLater()
+    _ = app
+
+
+def test_camera_pane_does_not_overlay_bbox_while_reviewing_measurement_snapshot() -> None:
+    from PyQt5 import QtGui, QtWidgets
+
+    from wiris_stereo_distance.camera_pane import CameraPane
+    from wiris_stereo_distance.stereo import DetectionObservation
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    pane.resize(400, 300)
+    snapshot = QtGui.QImage(640, 480, QtGui.QImage.Format_RGB888)
+    snapshot.fill(QtGui.QColor("black"))
+    stale_detection = DetectionObservation(
+        camera="left",
+        timestamp_s=1.0,
+        width=640,
+        height=480,
+        x1=100.0,
+        y1=100.0,
+        x2=300.0,
+        y2=300.0,
+        confidence=0.9,
+        class_id=0,
+        class_name="person",
+    )
+
+    pane.latest_image = snapshot.copy()
+    pane.latest_detection = None
+    pane.measurement_pair_display_active = False
+    pane._refresh_pixmap()
+    plain_snapshot = pane.image_label.pixmap().toImage().copy()
+
+    pane.latest_detection = stale_detection
+    pane.measurement_pair_display_active = True
+    pane._refresh_pixmap()
+    reviewed_with_stale_detection_set = pane.image_label.pixmap().toImage().copy()
+
+    assert reviewed_with_stale_detection_set == plain_snapshot
+
+    pane.stop()
+    pane.deleteLater()
+    _ = app
+
+
 def test_camera_pane_preview_stream_updates_after_measurement_pair_display() -> None:
     from PyQt5 import QtGui, QtWidgets
 
