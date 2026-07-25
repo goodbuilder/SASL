@@ -639,15 +639,28 @@ def format_runtime_camera_timestamp_compact(metadata: dict) -> str:
     return "missing"
 
 
-def format_runtime_camera_ntp_compact(metadata: dict) -> str:
-    frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
-    if frame_ntp_unix_s is None:
+def format_unix_timestamp_compact(value: float | None) -> str:
+    if value is None:
         return "--"
     try:
-        utc_dt = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc)
+        utc_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
     except (TypeError, ValueError, OverflowError, OSError):
         return "invalid"
     return f"{utc_dt.strftime('%H:%M:%S.%f')[:-3]}Z"
+
+
+def format_runtime_camera_ntp_compact(metadata: dict) -> str:
+    return format_unix_timestamp_compact(metadata.get("rtcp_frame_ntp_unix_s"))
+
+
+def format_signed_ms_compact(value_s: object) -> str:
+    try:
+        value_s = float(value_s)
+    except (TypeError, ValueError):
+        return "--"
+    if not isfinite(value_s):
+        return "--"
+    return f"{value_s * 1000.0:+.1f} ms"
 
 
 @dataclass(frozen=True)
@@ -9838,11 +9851,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 delta_ms = self.selected_runtime_frame_pair_delta_s * 1000.0
             pair_summary = f"Pair {basis:<18} Δ{delta_ms:+7.1f}ms"
         summary = f"{left_text} | {right_text} | {pair_summary}"
+
+        clock_lines = []
+        left_metadata = self.camera_frame_metadata.get("left") or {}
+        right_metadata = self.camera_frame_metadata.get("right") or {}
+        for camera_prefix, metadata in (("L", left_metadata), ("R", right_metadata)):
+            ntp_text = format_unix_timestamp_compact(metadata.get("rtcp_frame_ntp_unix_s"))
+            pc_utc_text = format_unix_timestamp_compact(metadata.get("rtcp_frame_received_wall_s"))
+            delta_text = format_signed_ms_compact(metadata.get("rtcp_frame_receive_delay_s"))
+            clock_lines.append(f"{camera_prefix} NTP: {ntp_text} | PC UTC: {pc_utc_text} | Δt(PC-NTP): {delta_text}")
+        left_ntp_s = left_metadata.get("rtcp_frame_ntp_unix_s")
+        right_ntp_s = right_metadata.get("rtcp_frame_ntp_unix_s")
+        if isinstance(left_ntp_s, (int, float)) and isinstance(right_ntp_s, (int, float)):
+            ntp_delta_text = format_signed_ms_compact(float(right_ntp_s) - float(left_ntp_s))
+        else:
+            ntp_delta_text = "--"
+        clock_lines.append(f"NTP Δt(R-L): {ntp_delta_text}")
+
         tooltip = (
             f"{summary}\n"
             f"{self.left_runtime_stats_label.toolTip()}\n"
             f"{self.right_runtime_stats_label.toolTip()}\n"
-            f"{pair_tooltip}"
+            f"{pair_tooltip}\n"
+            + "\n".join(clock_lines)
         )
         return summary, tooltip
 

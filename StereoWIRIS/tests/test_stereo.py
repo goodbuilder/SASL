@@ -7989,6 +7989,52 @@ def test_clock_sync_display_only_auto_refreshes_while_time_tab_is_visible() -> N
     _ = app
 
 
+def test_runtime_camera_summary_tooltip_shows_per_camera_ntp_pc_utc_and_deltas() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+    widget.camera_frame_metadata["left"] = {
+        "rtcp_frame_ntp_unix_s": 1_700_000_000.100,
+        "rtcp_frame_received_wall_s": 1_700_000_000.350,
+        "rtcp_frame_receive_delay_s": 0.250,
+    }
+    widget.camera_frame_metadata["right"] = {
+        "rtcp_frame_ntp_unix_s": 1_700_000_000.130,
+        "rtcp_frame_received_wall_s": 1_700_000_000.360,
+        "rtcp_frame_receive_delay_s": 0.230,
+    }
+
+    _summary, tooltip = widget._format_runtime_camera_summary()
+
+    assert "L NTP: 22:13:20.100Z | PC UTC: 22:13:20.350Z | Δt(PC-NTP): +250.0 ms" in tooltip
+    assert "R NTP: 22:13:20.130Z | PC UTC: 22:13:20.360Z | Δt(PC-NTP): +230.0 ms" in tooltip
+    assert "NTP Δt(R-L): +30.0 ms" in tooltip
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_runtime_camera_summary_tooltip_handles_missing_rtcp_data() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+
+    _summary, tooltip = widget._format_runtime_camera_summary()
+
+    assert "L NTP: -- | PC UTC: -- | Δt(PC-NTP): --" in tooltip
+    assert "R NTP: -- | PC UTC: -- | Δt(PC-NTP): --" in tooltip
+    assert "NTP Δt(R-L): --" in tooltip
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_measurement_tab_runtime_stats_tooltips_explain_yolo_hz() -> None:
     from PyQt5 import QtWidgets
 
