@@ -7956,6 +7956,39 @@ def test_measurement_tab_shows_camera_ntp_in_summary_and_keeps_record_metadata()
     _ = app
 
 
+def test_clock_sync_display_only_auto_refreshes_while_time_tab_is_visible() -> None:
+    from PyQt5 import QtGui, QtWidgets
+
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+    image = QtGui.QImage(16, 9, QtGui.QImage.Format_RGB888)
+
+    widget.tabs.setCurrentIndex(widget.depth_tab_index)
+    assert widget._is_clock_sync_tab_visible() is False
+    placeholder_text = widget.clock_sync_status_label.text()
+
+    frame_metadata = {
+        "timestamp_s": 100.0,
+        "rtcp_frame_ntp_unix_s": 1_700_000_000.0,
+        "timestamp_reference": "rtcp-ntp",
+    }
+    widget._update_calibration_preview("left", image, dict(frame_metadata))
+    widget._update_calibration_preview("right", image, dict(frame_metadata))
+    assert widget.clock_sync_status_label.text() == placeholder_text
+
+    widget.tabs.setCurrentIndex(widget.time_tab_index)
+    assert widget._is_clock_sync_tab_visible() is True
+    widget._update_calibration_preview("left", image, dict(frame_metadata))
+    widget._update_calibration_preview("right", image, dict(frame_metadata))
+    assert widget.clock_sync_status_label.text() != placeholder_text
+    assert "스트림 RTCP/NTP 상태" in widget.clock_sync_status_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_measurement_tab_runtime_stats_tooltips_explain_yolo_hz() -> None:
     from PyQt5 import QtWidgets
 

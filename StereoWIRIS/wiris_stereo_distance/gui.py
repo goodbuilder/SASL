@@ -8062,14 +8062,28 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         return status, detail
 
-    def refresh_clock_sync_status(self) -> None:
+    def _update_clock_sync_display(self) -> str | None:
+        """Refresh the RTCP/NTP status label/detail text without logging.
+
+        Called continuously from the frame-arrival path while the 시간 tab is
+        visible; the manual button below still logs a snapshot on click.
+        """
+
         if not hasattr(self, "clock_sync_status_label"):
-            return
+            return None
         status, detail = self._format_clock_sync_status()
         self.clock_sync_status_label.setText(status)
         self.clock_sync_status_label.setToolTip(detail)
         self.clock_sync_summary_text.setPlainText(detail)
-        self._log(f"[시계] {status}")
+        return status
+
+    def _is_clock_sync_tab_visible(self) -> bool:
+        return hasattr(self, "time_tab_index") and self.tabs.currentIndex() == self.time_tab_index
+
+    def refresh_clock_sync_status(self) -> None:
+        status = self._update_clock_sync_display()
+        if status is not None:
+            self._log(f"[시계] {status}")
 
     def _download_latest_clock_photo_pair(self) -> dict[str, Path]:
         output_root = self._clock_download_root()
@@ -9860,10 +9874,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             summary_text, summary_tooltip = self._format_runtime_camera_summary()
             self.runtime_camera_summary_label.setText(summary_text)
             self.runtime_camera_summary_label.setToolTip(summary_tooltip)
-        if hasattr(self, "clock_sync_status_label"):
-            status, detail = self._format_clock_sync_status(now_mono_s=now_s)
-            self.clock_sync_status_label.setText(status)
-            self.clock_sync_status_label.setToolTip(detail)
 
     def _update_camera_stream_stats(self, camera: str, payload: object) -> None:
         stats = dict(payload or {})
@@ -10465,6 +10475,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_frame_metadata_history[camera].append(dict(frame_metadata))
         self.camera_frame_times[camera].append(frame_timestamp_s)
         self._update_camera_connection_status()
+        if self._is_clock_sync_tab_visible():
+            self._update_clock_sync_display()
         if self.yolo_enabled:
             return
         self.latest_calibration_preview_images[camera] = image.copy()
@@ -10569,6 +10581,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._refresh_all_calibration_previews()
         if hasattr(self, "triangulation_quality_plot"):
             self.triangulation_quality_plot.set_tab_visible(self._is_triangulation_quality_visible())
+        if index == self.time_tab_index:
+            self._update_clock_sync_display()
 
     def _is_triangulation_quality_visible(self) -> bool:
         return (
