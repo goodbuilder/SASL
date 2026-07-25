@@ -11,7 +11,8 @@ StereoWIRIS. The code source of truth is
 | `ned` | PX4/GNSS navigation frame | `North/East/Down` | P1/P2 attitude and antenna-baseline geometry |
 | `px4_frd` | PX4 body frame | `Forward/Right/Down` | P1/P2 body attitude and nominal camera mount |
 | `camera_optical_rdf` | Each camera optical frame | `Right/Down/Forward` | Pixel rays before conversion into the left frame |
-| `left_camera_rdf` | Left optical-center frame | `Right/Down/Forward` | Raw/public StereoWIRIS point and range |
+| `left_camera_rdf` | Left optical-center frame | `Right/Down/Forward` | Internal common geometry and explicit source-point diagnostics |
+| `baseline_center_frd` | Midpoint of the left optical origin and selected right-origin estimate | `Forward/Right/Down` | Raw/public StereoWIRIS point and range |
 
 `NED`, `FRD`, and optical `RDF` are not aliases. Values cross these frames
 only through the explicit attitude, mount, and baseline transforms used by the
@@ -31,13 +32,21 @@ The only runtime measurement method is `two_ray_closest_midpoint`.
 - Accepted approximation: the GPS/RTK antenna baseline may stand in for the
   optical-center baseline. Its source and quality remain recorded; this is not
   an exact lever-arm calibration claim.
-- Algorithm: express the right ray and right optical-center origin in
-  `left_camera_rdf`, find the closest points on the two positive rays, and
-  return their midpoint.
-- Output: `[Right, Down, Forward, Range]` in `left_camera_rdf`, with the left
-  optical center at `(0, 0, 0)` and
-  `Range = norm([Right, Down, Forward])`.
-- No baseline-midpoint translation or public FRD reorder is applied.
+- Algorithm: express the right ray and right optical-center origin, or its
+  recorded GPS/RTK antenna-baseline proxy, in `left_camera_rdf`, find the
+  closest points on the two positive rays, then transform the result into the
+  attempt-frozen baseline-center frame.
+- Baseline-center origin: midpoint of the left optical origin and selected
+  right-origin estimate. Checkerboard `R/T` supplies the optical-center
+  estimate; Pixhawk uses the explicitly recorded antenna-baseline proxy without
+  claiming a calibrated lever arm.
+- Baseline-center axes: `Right` is the normalized left-to-right center vector;
+  `Forward` is the normalized mean of both optical-forward vectors projected
+  orthogonal to `Right`; `Down = normalize(Forward × Right)`.
+- Output: `[Forward, Right, Down, Range]` in `baseline_center_frd`, with
+  `Range = norm([Forward, Right, Down])` from the midpoint origin.
+- The transform uses metres, preserves ray gap/depth/angle geometry, and
+  recomputes range after the origin change.
 - Missing or mismatched intrinsics grids, missing pose/translation, zero
   baseline, near-parallel rays, non-positive depth, and non-finite range fail
   closed and retain a rejection reason.
@@ -45,7 +54,20 @@ The only runtime measurement method is `two_ray_closest_midpoint`.
 StereoWIRIS has no measurement-correction or tracking-filter layer. The
 former BBox reprojection, affine bbox-center, distance-binned 3-D bias, and
 Kalman paths were removed. Runtime and newly saved measurement rows contain
-the Raw `left_camera_rdf` result only.
+the Raw `baseline_center_frd` result only. The corresponding
+`source_left_camera_rdf_*` values may be retained as diagnostics; they are not
+public output aliases.
+
+### Frame instance scope
+
+StereoWIRIS freezes one `baseline_center_frd` instance per immutable
+`MeasurementAttempt`. This is necessary because the Pixhawk path selects a
+left/right GPS baseline and two attitudes for the detection pair. Each v2 row
+therefore records `baseline_frame_scope=measurement_attempt` and a
+`baseline_frame_instance_id`. Coordinates from different rows must not be
+subtracted as if they shared one world-fixed origin. Simulation uses the same
+origin/axis construction formula but may keep one nominal frame for a whole
+static-rig run.
 
 ### Coherent measurement input
 
@@ -99,7 +121,9 @@ For the Pixhawk path, the right ray is rotated into the selected left-camera
 basis with the attempt's left quaternion, and the selected GPS pair's NED
 baseline is transformed into `left_camera_rdf` with that exact same left
 quaternion and selected app-monotonic attitude timestamp. The quaternion order
-is `(w,x,y,z)`. Geometry and valid-row recording do not re-read GUI latest
+is `(w,x,y,z)`. The selected right attitude also places the right optical
+forward axis in the same left-camera basis before the baseline-center FRD axes
+are built. Geometry and valid-row recording do not re-read GUI latest
 attitude, GPS baseline, or intrinsics after the attempt exists. Checkerboard
 attempts instead use the applied stereo `R/T`; available Pixhawk attitude and
 GPS antenna snapshots are retained only as recording provenance and are not
@@ -109,10 +133,10 @@ This coherence rule does not change validity policy: stale attitude remains
 display-only and non-blocking, RTK Fixed is not newly required, and no ray-gap
 or intersection-angle acceptance threshold is added in this phase.
 
-S3-B1 does not approve hardware reliability. GPS age/skew and stale/RTK
-acceptance policy remain for S3-B2; atomic recorder/session isolation remains
-for S3-B3; and the public `baseline_center_frd` origin/axis migration remains
-for S3-B4. The current public output stays `left_camera_rdf`.
+S3-B4 migrates the public origin/axis contract to `baseline_center_frd` and the
+paired-row schema to v2. This does not approve hardware reliability or exact
+camera/GNSS lever arms. GPS age/skew, stale/RTK acceptance, recorder/session
+isolation, and live hardware validation remain separate qualification gates.
 
 ## P1/P2 Pixhawk data boundary
 
@@ -139,8 +163,9 @@ on that same axis.
 - `STALE`: either limit is exceeded.
 - `VERY_STALE`: sample age exceeds 10 s or pair delta exceeds 5 s.
 
-This `display_only_non_blocking` state is provenance. It does not rotate,
-translate, reject, or otherwise alter the `left_camera_rdf` result.
+This `display_only_non_blocking` classification is provenance. The selected
+attitudes are still geometry inputs, but the stale-status classification does
+not add another rotation, translation, correction, or rejection step.
 Checkerboard `R/T` does not consume Pixhawk attitude and is recorded as
 `NOT_USED` (shown as `N/A` in the UI).
 
@@ -165,22 +190,27 @@ baseline transforms.
 
 ## Measurement fields
 
-Current Raw measurements use the following meanings:
+Current v2 Raw measurements use the following meanings:
 
 | Field | Meaning |
 | --- | --- |
-| `left_camera_right_m`, `raw_left_camera_right_m`, legacy `x_m`/`raw_x_m` | Right from the left optical center |
-| `left_camera_down_m`, `raw_left_camera_down_m`, legacy `y_m`/`raw_y_m` | Down from the left optical center |
-| `left_camera_forward_m`, `raw_left_camera_forward_m`, legacy `z_m`/`raw_z_m` | Forward from the left optical center |
-| `distance_m`, `raw_range_m` | Euclidean range from the left optical center |
+| `baseline_center_forward_m`, `raw_baseline_center_forward_m` | Forward from the selected baseline-frame midpoint |
+| `baseline_center_right_m`, `raw_baseline_center_right_m` | Right from the selected baseline-frame midpoint |
+| `baseline_center_down_m`, `raw_baseline_center_down_m` | Down from the selected baseline-frame midpoint |
+| `range_m`, `baseline_center_range_m`, `raw_baseline_center_range_m` | Euclidean range from the selected baseline-frame midpoint |
+| `source_left_camera_rdf_right_m/down_m/forward_m` | Diagnostic source point in the left optical RDF frame |
 
 New rows include:
 
 ```text
-measurement_frame=left_camera_rdf
-measurement_axis_contract=left_camera_rdf:right_down_forward
-public_vector_contract=left_camera_rdf:[right,down,forward,range]
-legacy_xyz_alias_contract=x=right,y=down,z=forward
+schema_version=stereowiris-paired-frame-v2
+measurement_frame=baseline_center_frd
+measurement_axis_contract=baseline_center_frd:forward_right_down
+public_vector_contract=baseline_center_frd:[forward,right,down,range]
+legacy_xyz_alias_contract=not_emitted
+baseline_frame_scope=measurement_attempt
+baseline_frame_origin_model=checkerboard_stereo_rt_optical_centers
+  or gps_rtk_antenna_baseline_proxy_no_lever_arm
 ```
 
 Valid rows also include the attempt identity, legacy full/path-sensitive
@@ -191,9 +221,10 @@ and right-origin translation, K/D profile/content hash, and captured source
 quality/warnings. These fields describe the same immutable inputs used for that
 row's geometry.
 
-Legacy `x_m/y_m/z_m` fields remain only as explicit aliases. New rows leave
-`stereo_center_*` and `raw_stereo_center_*` empty instead of placing
-left-origin values in midpoint-named fields. They do not emit target truth,
+V2 rows do not emit ambiguous `x_m/y_m/z_m`, old `left_camera_*`, or
+`stereo_center_*` public aliases. V1 rows remain historical
+`left_camera_rdf` records and are interpreted by their `schema_version` and
+`measurement_frame`; they are not rewritten in place. New rows do not emit target truth,
 aligned NED estimate, per-axis error, range error, position error, or UAM
 alignment-profile fields.
 
@@ -205,7 +236,7 @@ do not change the public frame or axis order.
 - WGS84 latitude/longitude/MSL altitude and optional ellipsoid altitude describe each P1/P2 GPS antenna.
 - Session-local antenna positions and the left-to-right baseline use `ned` (`North, East, Down`) in metres, with the session-start left GPS antenna as the common origin.
 - P1/P2 attitude quaternions rotate `px4_frd` into `ned` and use `(w,x,y,z)` order. Session-start attitude deltas are reported as RPY plus the shortest SO(3) rotation angle.
-- Detector bbox corners and triangulated rays remain in each camera's optical RDF convention; a successful public point remains `left_camera_rdf`.
+- Detector bbox corners and source rays remain in each camera's optical RDF convention; a successful public point is `baseline_center_frd`.
 - `session_elapsed_s` is an app-monotonic ordering/presentation axis based on the matched frame-pair midpoint. Left/right RTCP/NTP Unix seconds/nanoseconds, PX4 boot/sample timestamps, SensorGps UTC, and app receive monotonic timestamps remain separate provenance clocks and are not coordinate values.
 - Device timeline CSVs keep the clocks separate: `sample_monotonic_*` is the source/app receive monotonic clock, `session_utc_*` is derived only from the session host Unix/monotonic anchor, `source_utc_*` is populated only by valid RTCP/NTP or GNSS UTC, and `host_receive_*` is captured at the GUI callback. Camera timeline rows use image pixels with top-left origin, `u` right and `v` down. PX4 attitude rows explicitly retain the `px4_frd -> ned` quaternion contract; GPS velocity remains world NED.
 

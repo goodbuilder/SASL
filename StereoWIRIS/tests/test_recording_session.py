@@ -93,13 +93,47 @@ def _xlsx_dynamic_axis_values(path: Path) -> list[list[tuple[str, str]]]:
     return axes
 
 
+def _xlsx_sheet_headers(path: Path, sheet_index: int) -> list[str]:
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    with ZipFile(path) as archive:
+        shared_strings = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+        strings = [
+            "".join(
+                node.text or ""
+                for node in item.iter(f"{{{spreadsheet_namespace}}}t")
+            )
+            for item in shared_strings.findall(f"{{{spreadsheet_namespace}}}si")
+        ]
+        worksheet = ElementTree.fromstring(
+            archive.read(f"xl/worksheets/sheet{sheet_index}.xml")
+        )
+        sheet_data = worksheet.find(f"{{{spreadsheet_namespace}}}sheetData")
+        assert sheet_data is not None
+        header_row = sheet_data.find(f"{{{spreadsheet_namespace}}}row")
+        assert header_row is not None
+        headers: list[str] = []
+        for cell in header_row.findall(f"{{{spreadsheet_namespace}}}c"):
+            value = cell.find(f"{{{spreadsheet_namespace}}}v")
+            assert value is not None and value.text is not None
+            headers.append(strings[int(value.text)] if cell.attrib.get("t") == "s" else value.text)
+    return headers
+
+
 def test_save_session_files_writes_wide_csv_and_projected_xlsx(tmp_path) -> None:
     output_dir = tmp_path / "sessions" / "20260605_120000"
     pair_rows = [
         {
             "sample_index": 7,
             "session_elapsed_s": 1.25,
+            "measurement_frame": "baseline_center_frd",
             "distance_m": 5.4,
+            "range_m": 5.4,
+            "baseline_center_forward_m": 5.4,
+            "baseline_center_right_m": 0.0,
+            "baseline_center_down_m": 0.0,
+            "source_left_camera_rdf_right_m": 0.15,
+            "source_left_camera_rdf_down_m": 0.0,
+            "source_left_camera_rdf_forward_m": 5.4,
             "left_gps_latitude_deg": 37.1,
             "left_roll_deg": 0.1,
             "baseline_m": 1.8,
@@ -108,7 +142,15 @@ def test_save_session_files_writes_wide_csv_and_projected_xlsx(tmp_path) -> None
         {
             "sample_index": 8,
             "session_elapsed_s": 1.30,
+            "measurement_frame": "baseline_center_frd",
             "distance_m": 5.3,
+            "range_m": 5.3,
+            "baseline_center_forward_m": 5.3,
+            "baseline_center_right_m": 0.0,
+            "baseline_center_down_m": 0.0,
+            "source_left_camera_rdf_right_m": 0.15,
+            "source_left_camera_rdf_down_m": 0.0,
+            "source_left_camera_rdf_forward_m": 5.3,
             "left_gps_latitude_deg": 37.2,
             "left_roll_deg": 0.2,
             "baseline_m": 1.8,
@@ -191,6 +233,18 @@ def test_save_session_files_writes_wide_csv_and_projected_xlsx(tmp_path) -> None
     assert {dynamic_counts[name] for name in sheet_names[1:6]} == {len(pair_rows) + 1}
     axes = _xlsx_dynamic_axis_values(saved.xlsx)
     assert axes == [[("7", "1.25"), ("8", "1.3")]] * 5
+    measurement_headers = set(_xlsx_sheet_headers(saved.xlsx, 2))
+    assert {
+        "measurement_frame",
+        "distance_m",
+        "range_m",
+        "baseline_center_forward_m",
+        "baseline_center_right_m",
+        "baseline_center_down_m",
+        "source_left_camera_rdf_right_m",
+        "source_left_camera_rdf_down_m",
+        "source_left_camera_rdf_forward_m",
+    } <= measurement_headers
     with saved.camera_left_csv.open("r", newline="", encoding="utf-8") as handle:
         camera_rows = list(csv.DictReader(handle))
     assert camera_rows[0]["sample_type"] == "gui_camera_frame"

@@ -55,21 +55,27 @@ def test_triangulate_rays_returns_expected_forward_distance_for_parallel_stereo(
     assert round(result.distance_m, 1) == 5.4
     assert round(result.baseline_m, 1) == 0.3
     assert result.method == "two_ray_closest_midpoint"
+    assert rounded_tuple(result.point_m) == (5.4, 0.15, 0.0)
+    assert rounded_tuple(result.point_left_m) == (0.3, 0.0, 5.4)
+    assert rounded_tuple(result.source_point_left_rdf_m) == (0.3, 0.0, 5.4)
     assert result.point_frame == "left_camera_rdf"
-    assert result.output_frame == "left_camera_rdf"
+    assert result.output_frame == "baseline_center_frd"
+    assert result.output_axis_contract == "baseline_center_frd:forward_right_down"
+    assert result.output_vector_contract == "baseline_center_frd:[forward,right,down,range]"
 
 
-def test_left_camera_output_does_not_shift_result_to_baseline_center() -> None:
+def test_public_output_shifts_result_to_baseline_center_frd() -> None:
     left_ray = normalized_ray_from_pixel(665.0, 360.0, intrinsics())
     right_ray = normalized_ray_from_pixel(615.0, 360.0, intrinsics())
 
     result = triangulate_rays(left_ray, right_ray, (0.3, 0.0, 0.0))
 
     assert result is not None
-    center_point = stereo_center_point_from_left_camera(result.point_left_m, (0.3, 0.0, 0.0))
+    center_point = stereo_center_point_from_left_camera(result.source_point_left_rdf_m, (0.3, 0.0, 0.0))
+    assert rounded_tuple(result.point_m) == (5.4, 0.0, 0.0)
     assert rounded_tuple(result.point_left_m) == (0.15, 0.0, 5.4)
     assert rounded_tuple(center_point) == (0.0, 0.0, 5.4)
-    assert rounded_tuple(result.point_left_rdf_m) == (0.15, 0.0, 5.4)
+    assert rounded_tuple(result.source_point_left_rdf_m) == (0.15, 0.0, 5.4)
     assert result.range_m == result.distance_m
 
 
@@ -86,6 +92,7 @@ def test_triangulate_pixels_uses_intrinsics_attitude_and_translation() -> None:
 
     assert result is not None
     assert round(result.distance_m, 1) == 5.4
+    assert result.output_frame == "baseline_center_frd"
 
 
 def test_fixed_camera_mount_maps_optical_axes_to_px4_frd() -> None:
@@ -131,6 +138,7 @@ def test_pixhawk_mount_triangulation_matches_forward_camera_geometry() -> None:
 
     assert result is not None
     assert round(result.distance_m, 1) == 5.4
+    assert result.output_frame == "baseline_center_frd"
 
 
 def test_invert_checkerboard_left_to_right_transform_preserves_right_origin_contract() -> None:

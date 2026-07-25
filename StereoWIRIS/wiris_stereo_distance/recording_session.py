@@ -42,6 +42,9 @@ DYNAMIC_SHEET_RULES: dict[str, tuple[str, ...]] = {
     "Measurements": (
         "measurement",
         "distance",
+        "range_m",
+        "baseline_center",
+        "source_left_camera_rdf",
         "object",
         "class",
         "track",

@@ -9,6 +9,7 @@ from sasl_common.stereo_geometry import (
     RayTriangulationResult,
     normalize_vector,
     ray_from_pixel,
+    result_as_baseline_center_frd,
     triangulate_rays as triangulate_common_rays,
 )
 from wiris_stereo_distance.attitude_geometry import normalize_quaternion, quaternion_conjugate, quaternion_multiply
@@ -204,19 +205,40 @@ def triangulate_rays_attempt(
     left_ray: tuple[float, float, float],
     right_ray_in_left: tuple[float, float, float],
     translation_right_in_left_m: tuple[float, float, float],
+    *,
+    right_forward_in_left: tuple[float, float, float] = (0.0, 0.0, 1.0),
 ) -> RayTriangulationAttempt:
-    """Run DKL closest-ray geometry in ``left_camera_rdf``.
+    """Run DKL closest-ray geometry and publish ``baseline_center_frd``.
 
-    Input order is optical RDF.  The left optical center is the fixed origin,
-    and ``translation_right_in_left_m`` is the right optical center expressed
-    in the left-camera frame.
+    Inputs are ordered optical RDF in the left-camera frame. The internal
+    closest-ray solution remains left-camera RDF for diagnostics, then the
+    public result is transformed to attempt-frozen baseline-center FRD:
+    origin is the midpoint of the left optical origin and selected right-origin
+    estimate, output order is ``(Forward, Right, Down)``, and range is measured
+    from that midpoint. The Pixhawk path records its GPS/RTK antenna baseline
+    as an optical-baseline proxy rather than claiming a calibrated lever arm.
     """
 
-    return triangulate_common_rays(
+    attempt = triangulate_common_rays(
         right_origin_left_rdf_m=translation_right_in_left_m,
         left_ray_left_rdf=left_ray,
         right_ray_left_rdf=right_ray_in_left,
     )
+    if attempt.result is None:
+        return attempt
+    try:
+        converted = result_as_baseline_center_frd(
+            attempt.result,
+            right_origin_left_rdf_m=translation_right_in_left_m,
+            right_forward_left_rdf=right_forward_in_left,
+        )
+    except (TypeError, ValueError) as exc:
+        return RayTriangulationAttempt(
+            None,
+            "baseline_center_transform_error",
+            {**attempt.diagnostics, "error": str(exc)},
+        )
+    return RayTriangulationAttempt(converted, attempt.reason, attempt.diagnostics)
 
 
 def triangulate_rays(
@@ -241,7 +263,13 @@ def triangulate_pixels_attempt(
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
     right_to_left_q = relative_rotation_quaternion(left_q, right_q)
     right_ray_in_left = normalize_vector(_rotate(right_to_left_q, right_ray))
-    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m)
+    right_forward_in_left = normalize_vector(_rotate(right_to_left_q, (0.0, 0.0, 1.0)))
+    return triangulate_rays_attempt(
+        left_ray,
+        right_ray_in_left,
+        translation_right_in_left_m,
+        right_forward_in_left=right_forward_in_left,
+    )
 
 
 def triangulate_pixels(
@@ -284,7 +312,19 @@ def triangulate_pixels_with_pixhawk_mount_attempt(
             right_body_to_world_q=right_body_to_world_q,
         )
     )
-    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m)
+    right_forward_in_left = normalize_vector(
+        right_camera_ray_to_left_camera(
+            (0.0, 0.0, 1.0),
+            left_body_to_world_q=left_body_to_world_q,
+            right_body_to_world_q=right_body_to_world_q,
+        )
+    )
+    return triangulate_rays_attempt(
+        left_ray,
+        right_ray_in_left,
+        translation_right_in_left_m,
+        right_forward_in_left=right_forward_in_left,
+    )
 
 
 def triangulate_pixels_with_pixhawk_mount(
@@ -320,7 +360,13 @@ def triangulate_pixels_with_relative_pose_attempt(
     left_ray = normalized_ray_from_pixel(left_pixel[0], left_pixel[1], left_intrinsics)
     right_ray = normalized_ray_from_pixel(right_pixel[0], right_pixel[1], right_intrinsics)
     right_ray_in_left = normalize_vector(_rotate_matrix(rotation_right_to_left, right_ray))
-    return triangulate_rays_attempt(left_ray, right_ray_in_left, translation_right_in_left_m)
+    right_forward_in_left = normalize_vector(_rotate_matrix(rotation_right_to_left, (0.0, 0.0, 1.0)))
+    return triangulate_rays_attempt(
+        left_ray,
+        right_ray_in_left,
+        translation_right_in_left_m,
+        right_forward_in_left=right_forward_in_left,
+    )
 
 
 def triangulate_pixels_with_relative_pose(

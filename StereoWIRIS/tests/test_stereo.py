@@ -5825,8 +5825,15 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert widget._measurement_path_label() == "3D ray 거리: 체커보드 Stereo 외부 파라미터 사용"
     assert widget.mount_assumption_label.text().startswith("장착 가정: 체커보드")
     session_metadata = widget._recording_session_metadata()
+    assert session_metadata["schema_version"] == "stereowiris-paired-frame-v2"
     assert session_metadata["calculation"]["triangulation_extrinsics_source"] == "checkerboard"
     assert session_metadata["calculation"]["baseline_source"] == "checkerboard"
+    assert session_metadata["calculation"]["measurement_frame"] == "baseline_center_frd"
+    assert session_metadata["calculation"]["legacy_xyz_alias_contract"] == "not_emitted"
+    assert session_metadata["calculation"]["baseline_frame_scope"] == "measurement_attempt"
+    assert session_metadata["calculation"]["baseline_frame_origin_model"] == (
+        "checkerboard_stereo_rt_optical_centers"
+    )
     checkerboard_metadata = session_metadata["checkerboard_stereo_extrinsics"]
     assert checkerboard_metadata["active"] is True
     assert checkerboard_metadata["pair_count"] == 12
@@ -6185,14 +6192,22 @@ def test_pixhawk_rtk_can_drive_triangulation(monkeypatch) -> None:
     assert "Attitude timing [VERY_STALE]" in widget.triangulation_quality_attitude_label.text()
     assert "Left age 11.000 s" in widget.triangulation_quality_attitude_label.text()
     assert widget.triangulation_quality_attitude_label.property("healthLevel") == "bad"
-    assert "Raw left_camera_rdf point:" in widget.triangulation_quality_raw_point_label.text()
+    assert "Raw baseline_center_frd point [F/R/D]:" in widget.triangulation_quality_raw_point_label.text()
+    assert "source left_camera_rdf [R/D/F]:" in widget.triangulation_quality_raw_point_label.text()
     assert "3D ray 거리: Pixhawk 자세 + GPS/RTK baseline 사용" in widget.stereo_geometry_text.toPlainText()
     assert "위치/자세 출처=Pixhawk 자세 + GPS/RTK baseline" in widget.distance_parameters_label.text()
     row = widget.distance_recording_rows[-1]
     assert row["method"] == "two_ray_closest_midpoint-pixhawk"
-    assert row["measurement_frame"] == "left_camera_rdf"
-    assert row["left_camera_right_m"] == row["raw_left_camera_right_m"]
-    assert row["stereo_center_right_m"] == ""
+    assert row["schema_version"] == "stereowiris-paired-frame-v2"
+    assert row["measurement_frame"] == "baseline_center_frd"
+    assert row["baseline_frame_scope"] == "measurement_attempt"
+    assert row["baseline_frame_origin_model"] == "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+    assert row["baseline_center_forward_m"] == row["raw_baseline_center_forward_m"]
+    assert row["baseline_center_right_m"] == row["raw_baseline_center_right_m"]
+    assert row["baseline_center_down_m"] == row["raw_baseline_center_down_m"]
+    assert row["baseline_center_range_m"] == row["range_m"]
+    assert "left_camera_right_m" not in row
+    assert "stereo_center_right_m" not in row
     assert row["attitude_timing_status"] == "VERY_STALE"
     assert row["attitude_timing_policy"] == "display_only_non_blocking"
     assert row["attitude_timing_blocks_measurement"] == "false"
@@ -6335,9 +6350,9 @@ def test_measurement_attempt_freezes_gui_geometry_and_valid_row_provenance(monke
     assert row["left_gps_lon_deg"] == "127.000000000"
     assert row["left_intr_fx"] == "900.000000"
     assert row["intrinsics_zoom_level"] != "3"
-    assert row["translation_right_in_left_x_m"] == "0.300000"
+    assert row["baseline_left_camera_rdf_right_m"] == "0.300000"
     assert row["rtk_baseline_east_m"] == "0.300000"
-    assert row["measurement_frame"] == "left_camera_rdf"
+    assert row["measurement_frame"] == "baseline_center_frd"
 
     output = tmp_path / "distance_history.csv"
     write_dynamic_csv(output, [row])
@@ -6566,7 +6581,7 @@ def test_checkerboard_triangulation_marks_pixhawk_attitude_not_used(monkeypatch)
     attempt = widget._build_measurement_attempt(pair)
     assert attempt.left_attitude is None and attempt.right_attitude is None
     assert attempt.left_gps is None and attempt.right_gps is None
-    assert attempt.measurement_frame == "left_camera_rdf"
+    assert attempt.measurement_frame == "baseline_center_frd"
 
     widget.deleteLater()
     _ = app
@@ -7917,7 +7932,7 @@ def test_distance_history_plot_left_click_selects_and_right_click_deletes_point(
     _ = app
 
 
-def test_distance_history_plot_tracks_xyz_and_distance_panels(monkeypatch) -> None:
+def test_distance_history_plot_tracks_frd_and_range_panels(monkeypatch) -> None:
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 
     from PyQt5 import QtWidgets
@@ -7933,25 +7948,25 @@ def test_distance_history_plot_tracks_xyz_and_distance_panels(monkeypatch) -> No
         5.40,
         "GOOD",
         "triangulated-pixhawk",
-        x_m=1.0,
-        y_m=5.2,
-        z_m=-0.4,
+        forward_m=1.0,
+        right_m=5.2,
+        down_m=-0.4,
         sample_key=(1.0, 2.0, "triangulated-pixhawk"),
     )
     plot.add_point(point)
     app.processEvents()
 
-    assert set(plot._plot_rects()) == {"x_m", "y_m", "z_m", "distance_m"}
-    assert plot._plot_metrics("x_m") is not None
-    assert plot._plot_metrics("y_m") is not None
-    assert plot._plot_metrics("z_m") is not None
+    assert set(plot._plot_rects()) == {"forward_m", "right_m", "down_m", "distance_m"}
+    assert plot._plot_metrics("forward_m") is not None
+    assert plot._plot_metrics("right_m") is not None
+    assert plot._plot_metrics("down_m") is not None
     distance_metrics = plot._plot_metrics("distance_m")
     assert distance_metrics is not None
     assert distance_metrics[3] < 5.4 < distance_metrics[4]
 
     plot._selected_point_keys.add(plot._point_key(point))
     selected_text = plot._selected_point_text() or ""
-    assert "Right/Down/Forward: +1.00, +5.20, -0.40 m" in selected_text
+    assert "baseline_center_frd Forward/Right/Down: +1.00, +5.20, -0.40 m" in selected_text
     assert plot._panel_series("distance_m", "Range", "m", "") == (
         ("distance_m", "Range", "m", ""),
     )
@@ -7979,15 +7994,15 @@ def test_distance_history_plot_does_not_fill_panels_with_previous_point_brush(mo
                 value,
                 "GOOD",
                 "triangulated-pixhawk",
-                x_m=1.0 + index * 0.1,
-                y_m=2.0 + index * 0.1,
-                z_m=4.0 + index * 0.2,
+                forward_m=1.0 + index * 0.1,
+                right_m=2.0 + index * 0.1,
+                down_m=4.0 + index * 0.2,
             )
         )
     app.processEvents()
 
     image = plot.grab().toImage()
-    down_rect = plot._plot_rects()["y_m"]
+    down_rect = plot._plot_rects()["down_m"]
     background_pixel = image.pixelColor(down_rect.left() + 20, down_rect.top() + 30)
 
     assert background_pixel == QtGui.QColor(CHART_BG)
@@ -8175,8 +8190,8 @@ def test_matched_pair_row_is_upserted_when_geometry_becomes_valid(monkeypatch) -
         method="triangulated-pixhawk",
         baseline_source="gps-rtk",
         baseline_m=0.3,
-        point_m=(0.0, 0.0, 6.0),
-        raw_point_m=(0.0, 0.0, 6.0),
+        point_m=(6.0, 0.0, 0.0),
+        raw_point_m=(6.0, 0.0, 0.0),
         measurement_attempt=attempt,
     )
 
@@ -8202,8 +8217,8 @@ def test_matched_pair_row_is_upserted_when_geometry_becomes_valid(monkeypatch) -
         method="triangulated-pixhawk",
         baseline_source="gps-rtk",
         baseline_m=0.3,
-        point_m=(0.0, 0.0, 6.1),
-        raw_point_m=(0.0, 0.0, 6.1),
+        point_m=(6.1, 0.0, 0.0),
+        raw_point_m=(6.1, 0.0, 0.0),
         measurement_attempt=second_attempt,
     )
     assert len(widget.distance_recording_rows) == 2
@@ -8906,25 +8921,39 @@ def test_raw_recording_saves_bbox_geometry_and_pixhawk_status_fields(monkeypatch
         point_m=(9.0, 2.0, 4.0),
         raw_point_m=(10.0, 2.5, 2.0),
         raw_point_left_m=(10.15, 2.5, 2.0),
-        translation_right_in_left_m=(0.3, 0.0, 0.0),
         measurement_attempt=attempt,
     )
 
     row = widget.distance_recording_rows[-1]
-    assert row["measurement_frame"] == "left_camera_rdf"
-    assert row["measurement_axis_contract"] == "left_camera_rdf:right_down_forward"
-    assert row["public_vector_contract"] == "left_camera_rdf:[right,down,forward,range]"
-    assert row["legacy_xyz_alias_contract"] == "x=right,y=down,z=forward"
+    assert row["schema_version"] == "stereowiris-paired-frame-v2"
+    assert row["measurement_frame"] == "baseline_center_frd"
+    assert row["measurement_axis_contract"] == "baseline_center_frd:forward_right_down"
+    assert row["public_vector_contract"] == "baseline_center_frd:[forward,right,down,range]"
+    assert row["legacy_xyz_alias_contract"] == "not_emitted"
+    assert row["baseline_frame_scope"] == "measurement_attempt"
+    assert row["baseline_frame_instance_id"] == attempt.instance_sha256()
+    assert row["baseline_frame_origin_model"] == "gps_rtk_antenna_baseline_proxy_no_lever_arm"
     assert row["measurement_method"] == "two_ray_closest_midpoint"
-    assert row["raw_x_m"] == "10.000000"
-    assert row["raw_left_camera_right_m"] == "10.000000"
-    assert row["raw_stereo_center_right_m"] == ""
+    assert row["baseline_center_forward_m"] == "9.000000"
+    assert row["baseline_center_right_m"] == "2.000000"
+    assert row["baseline_center_down_m"] == "4.000000"
+    assert row["baseline_center_range_m"] == "9.250000"
+    assert row["raw_baseline_center_forward_m"] == "10.000000"
+    assert row["raw_baseline_center_right_m"] == "2.500000"
+    assert row["raw_baseline_center_down_m"] == "2.000000"
+    assert row["raw_baseline_center_range_m"] == "10.500000"
+    assert row["source_left_camera_rdf_right_m"] == "10.150000"
+    assert row["source_left_camera_rdf_down_m"] == "2.500000"
+    assert row["source_left_camera_rdf_forward_m"] == "2.000000"
     assert "estimated_right_m" not in row
     assert "estimated_down_m" not in row
     assert "estimated_forward_m" not in row
     assert "estimated_range_m" not in row
-    assert row["raw_left_x_m"] == "10.150000"
-    assert row["translation_right_in_left_x_m"] == "0.300000"
+    assert row["baseline_left_camera_rdf_right_m"] == "0.300000"
+    assert "x_m" not in row
+    assert "raw_x_m" not in row
+    assert "left_camera_right_m" not in row
+    assert "stereo_center_right_m" not in row
     assert "corrected_z_m" not in row
     assert "filtered_distance_m" not in row
     assert "tracking_filter_id" not in row

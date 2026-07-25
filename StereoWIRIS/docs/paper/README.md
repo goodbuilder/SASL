@@ -1,6 +1,6 @@
 # StereoWIRIS math paper draft
 
-> Archived draft: this document preserves an earlier stereo-center/reprojection-correction and target-telemetry comparison proposal. The product was renamed from StereoDistance to StereoWIRIS; this draft does not describe the current StereoWIRIS implementation, whose Raw/public output is `left_camera_rdf` and which has no measurement-correction or target ULog/telemetry comparison layer. Do not use this draft as the current coordinate or runtime contract; use `../COORDINATE_CONTRACT.md`.
+> Archived draft: this document preserves an earlier stereo-center/reprojection-correction and target-telemetry comparison proposal. The product was renamed from StereoDistance to StereoWIRIS; this draft does not describe the current StereoWIRIS implementation, whose Raw/public output is attempt-scoped `baseline_center_frd` and which has no measurement-correction or target ULog/telemetry comparison layer. Do not use this draft as the current coordinate or runtime contract; use `../COORDINATE_CONTRACT.md`.
 
 This directory contains a LaTeX draft for a formula-first paper based on
 StereoWIRIS.

@@ -1,5 +1,27 @@
 # 업데이트 기록
 
+## v3.0.0 — 2026-07-24 — baseline_center_frd 공개 좌표 전환
+
+- 변경:
+  - StereoWIRIS의 Raw/public 삼각측량 출력을 `left_camera_rdf:[Right,Down,Forward,Range]`에서 attempt-scoped `baseline_center_frd:[Forward,Right,Down,Range]`로 전환했다.
+  - 내부 closest-ray 계산은 `left_camera_rdf`를 유지하고, left/right origin 중점과 `Right=left→right`, baseline에 직교 투영한 두 optical-forward 평균, `Down=Forward×Right`로 공개 프레임을 만든 뒤 midpoint 기준 Range를 다시 계산한다.
+  - 결과 객체에서 source `point_left_rdf_m`의 프레임/축 계약과 public `point_m`의 `output_frame`/`output_*_contract`를 분리해 서로 다른 프레임이 같은 메타데이터로 해석되지 않게 했다.
+  - GUI 그래프·품질 표시·기록 표를 Forward/Right/Down/Range로 바꾸고 paired-row schema를 `stereowiris-paired-frame-v2`로 올렸다. 신규 CSV/XLSX는 `baseline_center_*`, `raw_baseline_center_*`, 명시적 `source_left_camera_rdf_*` 진단 필드를 사용하며 모호한 `x/y/z`, 기존 public `left_camera_*`, `stereo_center_*` alias를 생성하지 않는다.
+  - 각 행에 `baseline_frame_scope=measurement_attempt`, frame instance id, origin/axis 계약과 origin model을 저장한다. Checkerboard는 stereo `R/T` optical-center 모델이고, Pixhawk는 GPS/RTK 안테나 baseline을 lever-arm 보정 없는 optical-baseline proxy로 명시한다.
+- 이유:
+  - Simulation과 같은 baseline-center FRD 수식·축 순서로 StereoWIRIS 공개 결과를 해석하면서도, Pixhawk의 attempt별 GPS/자세 선택과 source left-RDF 진단값을 프레임 혼용 없이 보존하기 위해서다.
+- 확인:
+  - `StereoWIRIS/tests` 전체 → `514 passed`.
+  - 공통 geometry와 Simulation 호환 집중 회귀 → `21 passed`; source/public 계약 분리 포함 집중 회귀 → `189 passed`.
+  - `python3 -m compileall -q sasl_common StereoWIRIS/wiris_stereo_distance`, `git diff --check` 통과.
+  - 저장소 루트 전체 `pytest`는 현재 환경에 ROS 2 Python `launch.LaunchContext`와 `rclpy`가 없어 Simulation 테스트 5개가 collection 단계에서 중단됐다.
+- 남은 위험:
+  - Pixhawk origin은 광학 중심의 정확한 lever-arm 보정값이 아니라 기록된 GPS/RTK 안테나 baseline proxy다.
+  - 실제 WIRIS/P1/P2 장비를 연결한 live 좌표 검증은 수행하지 않았다.
+  - `StereoWIRIS/run.sh --check`는 현재 checkout에 canonical `workspace/main/src/px4_msgs` overlay가 없어 실행 전 조건에서 중단됐다.
+- 좌표 계약:
+  - detector/ray 및 source diagnostic은 optical/left-camera RDF, public point/range는 attempt-scoped baseline-center FRD, GPS baseline은 NED, 자세는 `px4_frd -> ned`, 단위는 m다. 서로 다른 attempt의 baseline-center 좌표를 동일한 world-fixed 원점처럼 직접 빼지 않는다.
+
 ## v2.3.0 — 2026-07-24 — 카메라·PX4 개별 타임라인 CSV
 
 - 변경:

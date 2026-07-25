@@ -167,13 +167,13 @@ def test_measurement_attempt_hash_contract_golden_values() -> None:
     attempt = pixhawk_attempt()
 
     assert attempt.canonical_sha256() == (
-        "60f372bf92e56525311d2819ff0c241c33394e9ce676eda523fd08139a66901a"
+        "7d0b199d8350a524695605d427edf2626d76d0ec595e0f8309a4131cd5bff85c"
     )
     assert attempt.content_sha256() == (
-        "370bd0e2ee93c6697b60a6cfea3741b8d214e2fd251354ad2695aed86cd7fb9f"
+        "5cde91d5a324117b030ace6467ead59880c86423e28a531c1f0ad9887260d647"
     )
     assert attempt.instance_sha256() == (
-        "060d304542846b6e13279909c0cd6cc40a0051da55bcd364f3bab162b297e0d3"
+        "f2fe34b43d49663a4fbf01edce3233151b09a9429cca6f2793e4b042425f0eac"
     )
     assert attempt.canonical_payload() == asdict(attempt)
     assert attempt.instance_canonical_payload() == {
@@ -1075,12 +1075,14 @@ def test_pixhawk_attempt_uses_one_left_quaternion_basis_and_reconstructs_known_p
     geometry = calculate_measurement_geometry(attempt)
 
     assert geometry.triangulated is not None
-    reconstructed = geometry.triangulated.point_left_rdf_m
+    reconstructed = geometry.triangulated.source_point_left_rdf_m
     expected = (0.0, 0.0, 10.0)
     error_m = sum((actual - target) ** 2 for actual, target in zip(reconstructed, expected)) ** 0.5
     assert error_m <= 1e-9
-    assert geometry.triangulated.range_m == 10.0
-    assert geometry.triangulated.output_frame == "left_camera_rdf"
+    assert geometry.triangulated.point_m == pytest.approx((10.0, -0.15, 0.0), abs=1e-9)
+    assert geometry.triangulated.point_left_rdf_m == pytest.approx(expected, abs=1e-9)
+    assert geometry.triangulated.range_m == pytest.approx((10.0**2 + 0.15**2) ** 0.5, abs=1e-9)
+    assert geometry.triangulated.output_frame == "baseline_center_frd"
 
 
 def test_selected_gps_pair_and_intrinsics_content_are_stable_and_independent() -> None:
@@ -1285,10 +1287,10 @@ def test_nonidentity_selected_left_attitude_is_shared_by_ray_and_origin() -> Non
     assert geometry.triangulated is not None
     error_m = sum(
         (actual - expected) ** 2
-        for actual, expected in zip(geometry.triangulated.point_left_rdf_m, expected_point)
+        for actual, expected in zip(geometry.triangulated.source_point_left_rdf_m, expected_point)
     ) ** 0.5
     assert error_m <= 1e-9
-    assert geometry.triangulated.output_frame == "left_camera_rdf"
+    assert geometry.triangulated.output_frame == "baseline_center_frd"
     assert attempt.measurement_unit == "m"
 
 
@@ -1320,8 +1322,10 @@ def test_checkerboard_attempt_keeps_not_used_inputs_and_golden_point() -> None:
     assert checkerboard.right_gps is template.right_gps
     assert checkerboard.baseline.fix_quality == "NOT_USED"
     assert geometry.triangulated is not None
+    assert geometry.triangulated.source_point_left_rdf_m == pytest.approx((0.0, 0.0, 10.0), abs=1e-9)
     assert geometry.triangulated.point_left_rdf_m == pytest.approx((0.0, 0.0, 10.0), abs=1e-9)
-    assert geometry.triangulated.range_m == pytest.approx(10.0, abs=1e-9)
+    assert geometry.triangulated.point_m == pytest.approx((10.0, -0.15, 0.0), abs=1e-9)
+    assert geometry.triangulated.range_m == pytest.approx((10.0**2 + 0.15**2) ** 0.5, abs=1e-9)
 
 
 @pytest.mark.parametrize(
@@ -1356,7 +1360,7 @@ def test_checkerboard_attempt_keeps_not_used_inputs_and_golden_point() -> None:
         ),
         lambda: replace(
             pixhawk_attempt(),
-            measurement_frame="baseline_center_frd",
+            measurement_frame="left_camera_rdf",
         ),
         lambda: replace(
             pixhawk_attempt(),

@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 from wiris_stereo_distance.coordinate_contract import (
+    BASELINE_TRANSLATION_FRAME,
     BODY_FRAME,
     CAMERA_FRAME,
     CAMERA_MOUNT_PROFILE,
@@ -751,7 +752,7 @@ class BaselineSnapshot:
     left_age_from_detection_midpoint_s: float | None
     right_age_from_detection_midpoint_s: float | None
     baseline_frame: str = WORLD_FRAME
-    translation_frame: str = MEASUREMENT_FRAME
+    translation_frame: str = BASELINE_TRANSLATION_FRAME
     unit: str = "m"
     left_basis_attitude_monotonic_s: float | None = None
     gps_selection_basis: str = "latest_app_monotonic_at_attempt_capture"
@@ -832,7 +833,11 @@ class BaselineSnapshot:
             _optional_finite_float(value, name=name)
         if self.baseline_m < 0.0:
             raise ValueError("baseline_m must be non-negative")
-        if self.baseline_frame != WORLD_FRAME or self.translation_frame != MEASUREMENT_FRAME or self.unit != "m":
+        if (
+            self.baseline_frame != WORLD_FRAME
+            or self.translation_frame != BASELINE_TRANSLATION_FRAME
+            or self.unit != "m"
+        ):
             raise ValueError("baseline frame/unit contract mismatch")
 
 

@@ -52,7 +52,7 @@ StereoWIRIS는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데이
    - 최종 표적은 가로폭 15 m급 UAM이지만, StereoWIRIS는 표적 PX4/ULog 위치나 별도 UAM telemetry를 수신해 Ground Truth 오차를 계산하지 않는다.
    - 15 m급이라는 정보는 표적 규모 설명일 뿐 bbox 폭 기반 거리식이나 정확도 gate로 사용하지 않는다. 실제 YOLO bbox가 기체 전체 폭을 항상 포함한다고 보장할 수 없기 때문이다.
    - 본 실험 카메라 조건은 WIRIS visible 8배줌, 즉 앱의 명목 `zoom index 8 / 8.0x`를 기준으로 잡는다. 측정에는 명목 `fx` 추정값이 아니라 해당 줌에서 체커보드로 만든 `intrinsics_zoom_08.json`을 적용한다.
-   - 앱이 생성·표시·저장하는 결과는 왼쪽 optical center 기준 Raw `left_camera_rdf:[Right,Down,Forward,Range]`뿐이다.
+   - 앱이 생성·표시·저장하는 결과는 selected baseline-frame 중점 기준 Raw `baseline_center_frd:[Forward,Right,Down,Range]`뿐이다. Checkerboard는 `R/T` optical-center 모델을, Pixhawk는 lever-arm 보정 없는 GPS/RTK antenna-baseline proxy를 사용한다.
    - P1/P2 Pixhawk 자세와 GPS/RTK는 stereo rig의 ray/baseline 기하와 상태 진단에만 사용한다. 표적 궤적이나 정답 위치로 해석하지 않는다.
 
 ## 현재 범위
@@ -84,14 +84,16 @@ MAVLink-first는 ROS2를 제거한다는 뜻이 아니다. ROS2 전용 `vehicle_
 좌표계와 축 이름의 기준 계약은 `docs/COORDINATE_CONTRACT.md`와
 `wiris_stereo_distance/coordinate_contract.py`에 고정한다.
 
-StereoWIRIS의 Raw/public 출력은 `left_camera_rdf`다. 원점은 왼쪽
-optical center이고 배열과 CSV 의미는 `[Right, Down, Forward, Range]`다.
-왼쪽 ray와 오른쪽 ray/origin을 모두 이 frame으로 변환한 뒤
-`two_ray_closest_midpoint`로 삼각측량한다. baseline 중앙점 이동이나 public
-FRD reorder를 하지 않는다.
+StereoWIRIS의 Raw/public 출력은 `baseline_center_frd`다. 원점은 left optical
+origin과 selected right-origin estimate의 중점이고 배열과 CSV 의미는
+`[Forward, Right, Down, Range]`다. 두 ray는 내부 `left_camera_rdf`에서
+`two_ray_closest_midpoint`로 삼각측량한 뒤, 같은 immutable attempt의
+baseline과 좌·우 optical-forward 축으로 만든 FRD 기저에 옮긴다. Range는
+중점 원점에서 다시 계산한다.
 
-Pixhawk attitude는 오른쪽 ray와 GNSS baseline을 `left_camera_rdf`로
-변환하는 리그 기하 입력으로만 사용한다. 자세 시각은 측정을 차단하지 않고
+Pixhawk attitude는 오른쪽 ray, 오른쪽 optical-forward 축과 GNSS baseline을
+공통 `left_camera_rdf`에 놓고 attempt-scoped `baseline_center_frd`를 만드는
+리그 기하 입력으로만 사용한다. 자세 시각은 측정을 차단하지 않고
 `FRESH/STALE/VERY_STALE` 상태와 좌·우 sample age, pair Δt를 UI와 CSV에
 노출한다. 오래된 자세로 생성된 측정도 보존하되 UI 품질을 `DEGRADED`로
 표시해 사후 분석에서 제외 여부를 결정할 수 있게 한다.
@@ -201,15 +203,15 @@ StereoWIRIS는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스트�
 2. `YoloStreamWorker`가 프레임과 검출 결과를 GUI로 전달한다.
 3. `CameraPane`이 최신 프레임과 bbox 상태를 보관한다.
 4. `gui.py`가 class mismatch와 동일 class 다중 후보를 fail-closed한 뒤 각 detection frame의 app-monotonic time에 nearest 좌/우 자세를 고르고, 연속해서 복사한 좌/우 GPS pair, 적용 K/D, checkerboard R/T 또는 GPS baseline을 하나의 immutable `MeasurementAttempt`로 고정한다. Checkerboard 경로에서도 자세/GPS snapshot은 안정성 분석 provenance로 보존하지만 계산에는 사용하지 않는다.
-5. Pixhawk 경로는 selected GPS pair에서 NED baseline을 다시 계산하고, right ray와 baseline translation 모두 동일 attempt의 동일 selected left `(w,x,y,z)` quaternion과 app-monotonic sample timestamp basis로 `left_camera_rdf`에 놓는다.
-6. `measurement_controller.py`가 attempt만 받아 correspondence를 먼저 검증한 후 triangulation 결과를 계산한다. attempt 생성 뒤 GUI latest state를 조회하지 않는다.
+5. Pixhawk 경로는 selected GPS pair에서 NED baseline을 다시 계산하고, right ray, right optical-forward 축과 baseline translation을 동일 attempt의 selected `(w,x,y,z)` quaternion 및 app-monotonic sample timestamp basis로 `left_camera_rdf`에 놓는다.
+6. `measurement_controller.py`가 attempt만 받아 correspondence를 먼저 검증한 후 triangulation을 계산하고, selected baseline-frame 중점과 `Right=left→right`, projected mean `Forward`, `Down=Forward×Right` 계약으로 `baseline_center_frd` 결과와 midpoint Range를 만든다. Checkerboard는 `R/T` optical-center 모델, Pixhawk는 기록된 GPS/RTK antenna-baseline proxy를 사용하며, attempt 생성 뒤 GUI latest state를 조회하지 않는다.
 7. accepted matched pair마다 먼저 한 행을 만들고, 같은 pair가 나중에 valid geometry를 얻으면 새 행을 추가하지 않고 해당 행을 갱신한다. 행은 selected-input provenance와 canonical/content/instance hash를 기록한다.
 8. Stop 또는 수동 저장 시 `recording_session.py`가 `<session_id>.csv`, `<session_id>.xlsx`, 좌우 `camera_*.csv`, 좌우 `px4_*.csv`를 함께 생성한다. XLSX의 Measurements/GPS/Attitude/Baseline/Quality는 동일한 `sample_index`와 `session_elapsed_s` 행축을 공유한다. 카메라 개별 CSV의 한 행은 세션 중 GUI `frame_changed` 콜백에 실제 전달된 프레임이며 MP4 전체 프레임 인덱스가 아니다.
 
-S3-B1은 하드웨어 신뢰성을 승인하지 않는다. GPS age/skew 및 stale/RTK
-acceptance policy는 S3-B2, atomic recorder/session isolation은 S3-B3,
-`baseline_center_frd` public migration은 S3-B4 범위다. 현재 public output은
-계속 왼쪽 optical-center 원점의 `left_camera_rdf:[Right,Down,Forward,Range]`다.
+S3-B4에서 `baseline_center_frd` public migration과 paired-row v2 schema를
+적용했다. 이 변경은 하드웨어 신뢰성, 정확한 camera/GNSS lever arm,
+GPS age/skew 및 stale/RTK acceptance, recorder/session isolation을 승인하지
+않으며 각 항목은 별도 검증 대상으로 유지한다.
 
 ## 주요 워크플로
 
@@ -222,7 +224,7 @@ acceptance policy는 S3-B2, atomic recorder/session isolation은 S3-B3,
 7. `정렬` 탭에서 Baseline, MAG, Pixhawk 자세 상태 확인.
 8. `YOLO` 탭에서 모델, 장치, 스트림 설정 조정.
 9. `측정` 탭에서 `세션 기록 시작`을 누른 뒤 YOLO/depth 측정을 시작한다.
-10. `기록 샘플`에서 Raw `left_camera_rdf` 값과 입력·품질 provenance를 확인한다.
+10. `기록 샘플`에서 Raw `baseline_center_frd` 값, source `left_camera_rdf` 진단값과 입력·품질 provenance를 확인한다.
 11. `세션 저장`에서 거리 기록, 설정과 메타데이터를 저장한다.
 12. 필요하면 `고급 > WIRIS SDK` 또는 `고급 > 필드 감시`에서 저수준 명령/ROS2/MAVLink field를 직접 확인한다.
 

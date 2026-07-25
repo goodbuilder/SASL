@@ -42,7 +42,7 @@ cd <STEREO_WIRIS_APP>
 4. 체커보드로 WIRIS 내부 파라미터를 보정한다.
 5. GPS baseline, RM3100, 자세 정렬을 확인한다.
 6. YOLO 설정 후 `세션 기록 시작`과 측정을 시작한다.
-7. Raw `left_camera_rdf` 기록, 설정과 로그를 저장한다.
+7. Raw `baseline_center_frd` 기록, 설정과 로그를 저장한다.
 
 아래 내용은 기존 상세 운용 매뉴얼입니다.
 
@@ -59,7 +59,7 @@ The app is designed for this operating sequence:
 5. Align GPS baseline, compare RM3100 CAN1/CAN2 data, and align camera attitude.
 6. Configure YOLO.
 7. Start session recording, then start YOLO/depth measurement.
-8. Save the Raw `left_camera_rdf` distance history, settings, and review logs.
+8. Save the Raw `baseline_center_frd` distance history, settings, and review logs.
 
 ## Current Run Flow
 
@@ -227,13 +227,13 @@ Use this tab after `보정` to confirm the geometry that will be used by alignme
 
 Use this tab to start and monitor object distance.
 
-- `실시간` contains live WIRIS views, stream receive/YOLO Hz status, distance status, recording controls, and a split Right/Down/Forward/Range graph. Press `세션 기록 시작` before collecting rows that must be persisted. `YOLO Range` is the Euclidean range from the left optical center; no target-telemetry range or truth/error series is produced.
+- `실시간` contains live WIRIS views, stream receive/YOLO Hz status, distance status, recording controls, and a split baseline-center Forward/Right/Down/Range graph. Press `세션 기록 시작` before collecting rows that must be persisted. `YOLO Range` is the Euclidean range from the selected baseline-frame midpoint; no target-telemetry range or truth/error series is produced.
 - `파라미터 > 계산 설정` contains focal length, external-parameter source, camera-pair sync gates, class matching, and the attitude timing policy. `Pixhawk 자세 + GPS/RTK baseline` uses live Pixhawk attitude and GPS/RTK translation; `체커보드 Stereo 외부 파라미터` uses the applied checkerboard `R/T` in the OpenCV optical RDF contract and does not require live Pixhawk/GPS inputs. Pixhawk attitude timing is a display-only, non-blocking diagnostic: sample age above 2 s or pair Δt above 1 s is `STALE`, and sample age above 10 s or pair Δt above 5 s is `VERY_STALE`. The graph records successful ray-triangulated samples even when that status is stale. Matching keeps recent candidates first, then chooses the smaller timestamp delta for accuracy; `disparity_px` remains a bbox horizontal-delta diagnostic in saved rows, not a distance mode. The `내부 파라미터` block uses a collapsible group, while the external-parameter block stays visible and the two blocks are split left/right around the center. Runtime settings are saved from `저장·분석 > 전체 설정 저장`.
-- The active and only measurement method is `two_ray_closest_midpoint`; it undistorts bbox-center pixels, expresses both rays and the right optical-center origin in `left_camera_rdf`, and records Raw `[Right, Down, Forward, Range]`. There is no BBox, 3-D bias, or tracking-filter correction path. Missing pose/intrinsics, pixel-grid mismatch, zero baseline, near-parallel rays, non-positive depth, and non-finite range fail closed with no point.
-- Each validated detection pair creates one immutable, generation/session-scoped `MeasurementAttempt`. A stable `pair_id` combines the generation identity and monotonic sequence. It freezes the selected detections, nearest attitude samples, consecutive GPS pair, applied K/D and zoom/profile content hash, and checkerboard R/T or selected GPS baseline. Class mismatch and unresolved multiple candidates of the selected class are rejected before geometry. Repeated refreshes reuse the same ready attempt; an incomplete attempt can be replaced only when required inputs arrive. In Pixhawk mode, both the right-ray rotation and NED-to-left-RDF translation use the same selected left `(w,x,y,z)` quaternion and app-monotonic sample timestamp; valid rows serialize that attempt instead of querying latest GUI values again.
-- `측정 품질 > 현재 측정 품질` is a display-only panel for the current 3-D ray result. It shows ray gap, left-origin range, baseline, method, the Raw `left_camera_rdf` point, and a colored Pixhawk attitude timing row with left/right sample age and pair Δt. `FRESH` is green, `STALE` is yellow, and `VERY_STALE` is red. Checkerboard geometry shows `N/A — PIXHAWK ATTITUDE NOT USED`. The main distance line carries only the short `ATT:*` badge; stale timing degrades its display status but does not reject or alter the measurement.
+- The active and only measurement method is `two_ray_closest_midpoint`; it undistorts bbox-center pixels, solves both rays in internal `left_camera_rdf`, then records Raw `[Forward, Right, Down, Range]` in `baseline_center_frd`. The origin is the midpoint of the left optical origin and selected right-origin estimate; checkerboard `R/T` supplies the optical-center estimate, while Pixhawk records that the GPS/RTK antenna baseline is an optical-baseline proxy without a calibrated lever arm. Axes use the left-to-right baseline, projected mean optical forward, and `Forward × Right`; Range is recomputed from that midpoint. There is no BBox, 3-D bias, or tracking-filter correction path. Missing pose/intrinsics, pixel-grid mismatch, zero baseline, degenerate frame basis, near-parallel rays, non-positive depth, and non-finite range fail closed with no point.
+- Each validated detection pair creates one immutable, generation/session-scoped `MeasurementAttempt`. A stable `pair_id` combines the generation identity and monotonic sequence. It freezes the selected detections, nearest attitude samples, consecutive GPS pair, applied K/D and zoom/profile content hash, and checkerboard R/T or selected GPS baseline. Class mismatch and unresolved multiple candidates of the selected class are rejected before geometry. Repeated refreshes reuse the same ready attempt; an incomplete attempt can be replaced only when required inputs arrive. In Pixhawk mode, the right-ray rotation, right optical-forward axis, and NED-to-left-RDF translation use the same selected attitude/GPS snapshot; the resulting `baseline_center_frd` instance is scoped to that attempt. Valid rows serialize it instead of querying latest GUI values again.
+- `측정 품질 > 현재 측정 품질` is a display-only panel for the current 3-D ray result. It shows ray gap, midpoint Range, baseline, method, the Raw `baseline_center_frd` point, an explicit source `left_camera_rdf` diagnostic, and a colored Pixhawk attitude timing row with left/right sample age and pair Δt. `FRESH` is green, `STALE` is yellow, and `VERY_STALE` is red. Checkerboard geometry shows `N/A — PIXHAWK ATTITUDE NOT USED`. The main distance line carries only the short `ATT:*` badge; stale timing degrades its display status but does not reject or add a correction to the measurement.
 - `YOLO 측정 시작` restarts camera streams in YOLO/depth mode; while measuring, the same button changes to `YOLO 측정 중지` and returns to camera preview mode while keeping Pixhawk connections active.
-- The tab shows left/right camera views, current distance status, sync quality, why a sample is not added to the graph when applicable, and Right/Down/Forward/Distance history over time.
+- The tab shows left/right camera views, current distance status, sync quality, why a sample is not added to the graph when applicable, and baseline-center Forward/Right/Down/Range history over time.
 - The live camera status chips show `수신` Hz and YOLO Hz in measurement mode. `수신` Hz counts frames decoded by the stream reader, while YOLO Hz counts frames whose inference completed successfully.
 - Recording controls keep one live row for every accepted left/right matched detection frame pair. A pair that is initially missing geometry is retained with its status and is updated in place if the same pair later produces a valid distance.
 
@@ -253,9 +253,9 @@ Use this tab to review the current recording summary, inspect Raw recorded sampl
 - `camera_left.csv` and `camera_right.csv` contain one row per frame actually delivered to the GUI `frame_changed` callback while the session is active. They are GUI-delivery logs, not complete decoded-stream logs and not one-to-one MP4 frame indexes. Each row preserves producer/app monotonic time, GUI receive monotonic/UTC, session-anchor-derived UTC and its bracket uncertainty, and RTCP/NTP source UTC when valid.
 - `px4_left.csv` and `px4_right.csv` contain one row per PX4 attitude, vehicle GPS, SensorGps, or GNSS-relative callback received by the GUI. `sample_type`, topic, namespace, raw PX4 `timestamp`/`timestamp_sample`, GNSS UTC validity/method, and host receive times distinguish mixed sources. A source UTC value is never synthesized into the `source_utc_*` fields; attitude rows without GNSS UTC retain an empty source UTC and use PX4 sample time for later ULog matching.
 - `session_elapsed_s` is computed from the app-monotonic midpoint of the matched frames and is the common presentation/order axis. Each row separately preserves left/right `rtcp_frame_ntp_unix_s`, exact integer nanosecond conversions, pair midpoint/delta, per-frame app receive monotonic time, raw PX4 `timestamp`/`timestamp_sample`, SensorGps UTC/time-relative fields, and app receive time. `gps_utc_us=0` is saved as invalid/missing. Attitude uses the nearest app-monotonic sample for each camera frame; GPS records the latest selected antenna sample. The alignment method and sample age are explicit fields, so neither is presented as interpolation.
-- Each row includes both cameras' bbox four corners, raw WGS84 GPS antenna position, NED velocity/quality, raw PX4 body attitude quaternion/RPY/reset provenance, session-start attitude and GPS displacement, left-to-right antenna baseline and changes, selected K/D and geometry provenance, and the Raw `left_camera_rdf` result when available. Checkerboard mode still records available P1/P2 telemetry for later stability checks, but that telemetry is not consumed by checkerboard `R/T` geometry.
-- `기록 샘플` contains `매칭 프레임쌍 실시간 보기`. Selecting a row shows Raw left-camera Right/Down/Forward/Range, detector pixels, P1/P2 camera/Pixhawk/GNSS geometry provenance, and timing. It does not show target NED truth, axis/range error, or a UAM alignment profile.
-- Recorded YOLO values use `left_camera_rdf`: origin at the left optical center, axes `Right/Down/Forward`, public vector `[Right, Down, Forward, Range]`. `x_m/y_m/z_m` remain explicit aliases for `Right/Down/Forward`; `raw_left_x/y/z_m` are compatibility aliases of the same Raw point. A target on the rig midpoint centerline may have a nonzero `Right` value (approximately half the baseline for a parallel horizontal rig), which must not be shifted to zero.
+- Each row includes both cameras' bbox four corners, raw WGS84 GPS antenna position, NED velocity/quality, raw PX4 body attitude quaternion/RPY/reset provenance, session-start attitude and GPS displacement, left-to-right antenna baseline and changes, selected K/D and geometry provenance, and the Raw `baseline_center_frd` result when available. Checkerboard mode still records available P1/P2 telemetry for later stability checks, but that telemetry is not consumed by checkerboard `R/T` geometry.
+- `기록 샘플` contains `매칭 프레임쌍 실시간 보기`. Selecting a row shows Raw baseline-center Forward/Right/Down/Range, source left-camera RDF diagnostics, detector pixels, P1/P2 camera/Pixhawk/GNSS geometry provenance, and timing. It does not show target NED truth, axis/range error, or a UAM alignment profile.
+- Recorded YOLO values use `baseline_center_frd`: origin at the midpoint of the left optical origin and selected right-origin estimate, axes `Forward/Right/Down`, public vector `[Forward, Right, Down, Range]`. Checkerboard records the `R/T` optical-center model; Pixhawk records its GPS/RTK antenna baseline as an optical-baseline proxy without a calibrated lever arm. V2 rows use `baseline_center_*` and `raw_baseline_center_*`; they do not emit `x_m/y_m/z_m`, old `left_camera_*`, or `stereo_center_*` public aliases. `source_left_camera_rdf_*` is diagnostic provenance only. Each row records an attempt-scoped frame instance id because Pixhawk/GPS geometry can differ between measurement attempts.
 - Live stereo pairing uses `RTCP/NTP 우선` by default. If the two WIRIS RTCP clocks do not produce a pair inside `최대 Δt`, the app falls back to the common app-receive monotonic clock and labels the pair `app fallback`. This preserves live pairing while keeping the RTCP/NTP/PC-UTC result as a separate diagnostic; an `app fallback` pair must not be treated as an absolute UTC-synchronized pair.
 - The original session files do not contain `drone_*`, `ulg_*`, or target truth/error fields. A future user-selected drone ULog comparison must be emitted as a separate derived `<session_id>_ulg_comparison.csv/.xlsx` pair without modifying the original session data.
 - `전체 설정 저장` persists current runtime settings to `<STEREO_WIRIS_APP>/stereo_distance_settings.json`, including setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and time-tab FTP/download fields.
@@ -445,10 +445,18 @@ The bootstrap installs the self-contained OpenCV/NumPy/PyYAML subset in `require
 ## Change Log
 
 Entries below describe the state at their original dates. The current contract
-is authoritative: as of 2026-07-20, target/UAM telemetry, ULog comparison,
+is authoritative: as of 2026-07-24, public measurement is
+`baseline_center_frd:[Forward,Right,Down,Range]`; target/UAM telemetry, ULog comparison,
 Telemetry Range, target truth/error fields, and the target coordinate-profile
 workflow have been removed from StereoWIRIS. P1/P2 Pixhawk telemetry remains
 only for stereo-rig geometry and diagnostics.
+
+### 2026-07-24
+
+- Migrated Raw/public measurement from left optical-center RDF to
+  attempt-scoped `baseline_center_frd` with midpoint Range recomputation.
+- Bumped paired rows to `stereowiris-paired-frame-v2`, added explicit
+  `baseline_center_*` fields, and stopped emitting ambiguous coordinate aliases.
 
 ### 2026-07-20
 

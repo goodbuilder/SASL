@@ -203,7 +203,11 @@ def test_measurement_controller_pixhawk_rtk_triangulates_valid_pair() -> None:
     assert result.estimate is not None
     assert result.estimate.distance_m == result.triangulated.distance_m
     assert result.triangulated.point_frame == "left_camera_rdf"
-    assert result.triangulated.output_frame == "left_camera_rdf"
+    assert result.triangulated.output_frame == "baseline_center_frd"
+    assert result.triangulated.output_axis_contract == "baseline_center_frd:forward_right_down"
+    assert result.triangulated.output_vector_contract == "baseline_center_frd:[forward,right,down,range]"
+    assert result.triangulated.point_m == result.triangulated.output_point_m
+    assert result.triangulated.source_point_left_rdf_m is not None
     assert result.triangulation_reason == "ok"
     assert result.warnings == ()
 

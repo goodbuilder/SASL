@@ -30,9 +30,14 @@ PYTHONPATH=. python3 -m pytest \
 ```
 
 이 묶음은 immutable attempt/pair identity, class·ambiguity fail-closed,
-`camera_optical_rdf -> left_camera_rdf`, checkerboard `X_right = R X_left + T`
-역변환, Pixhawk body FRD/NED 변환, selected-left quaternion/timestamp 공유,
-왼쪽 optical-center 원점 유지와 invalid-ray fail-closed를 확인한다.
+`camera_optical_rdf -> left_camera_rdf -> baseline_center_frd`, checkerboard
+`X_right = R X_left + T` 역변환, Pixhawk body FRD/NED 변환,
+selected attitude/GPS snapshot 공유, selected baseline-frame midpoint 원점 이동,
+FRD 축 구성과 midpoint Range 재계산, invalid-ray/frame-basis fail-closed를
+확인한다. 평행 0.30 m baseline의 중심선 표적은
+`left_camera_rdf=(0.15,0,5.4)`에서
+`baseline_center_frd=(5.4,0,0)`으로 변환돼야 하며, 비평행 optical-forward
+case에서도 Right/Forward 직교성과 `Down=Forward×Right`를 만족해야 한다.
 `test_measurement_attempt.py`는 factory/direct-constructor timestamp metadata가
 같은 allowlist 순서로 canonicalize되는지, mutable/nonfinite/duplicate 입력이
 snapshot 생성 시점에 거부되는지, source·`asdict()` mutation이 attempt
@@ -49,11 +54,20 @@ canonical SHA 경계에 진입하지 못하는지도 확인한다.
 
 ```bash
 QT_QPA_PLATFORM=offscreen python3 -m pytest \
+  tests/test_stereo.py::test_pixhawk_rtk_can_drive_triangulation \
+  tests/test_stereo.py::test_checkerboard_triangulation_marks_pixhawk_attitude_not_used \
+  tests/test_stereo.py::test_raw_recording_saves_bbox_geometry_and_pixhawk_status_fields \
   tests/test_stereo.py::test_session_buttons_toggle_labels_and_roles \
   tests/test_stereo.py::test_camera_network_settings_are_single_compact_row \
   tests/test_stereo.py::test_measurement_settings_save_button_triggers_current_settings_save \
   -q
 ```
+
+좌표/기록 테스트의 PASS 기준은 v2 row가
+`measurement_frame=baseline_center_frd`, 명시적
+`baseline_center_forward/right/down/range_m`, attempt-scoped frame instance를
+포함하고 `x/y/z`, public `left_camera_*`, `stereo_center_*` alias를 생성하지
+않는 것이다. `source_left_camera_rdf_*`는 source diagnostic으로만 허용한다.
 
 ## 전체 PyQt 테스트 주의점
 

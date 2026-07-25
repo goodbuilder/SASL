@@ -377,13 +377,10 @@ RECORDED_SAMPLE_TABLE_COLUMNS = (
     ("right_gps_epv_m", "R epv(m)"),
     ("intrinsics_zoom_level", "줌"),
     ("intrinsics_path", "Intrinsics"),
-    ("x_m", "Cam Right(m)"),
-    ("y_m", "Cam Down(m)"),
-    ("z_m", "Cam Forward(m)"),
-    ("raw_distance_m", "Raw 거리(m)"),
-    ("raw_x_m", "Raw Right(m)"),
-    ("raw_y_m", "Raw Down(m)"),
-    ("raw_z_m", "Raw Forward(m)"),
+    ("baseline_center_forward_m", "Center Forward(m)"),
+    ("baseline_center_right_m", "Center Right(m)"),
+    ("baseline_center_down_m", "Center Down(m)"),
+    ("baseline_center_range_m", "Center Range(m)"),
     ("left_cx", "L cx(px)"),
     ("right_cx", "R cx(px)"),
     ("bbox_mid_timestamp_s", "BBox mid t(s)"),
@@ -4503,7 +4500,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         point_group = QtWidgets.QGroupBox("3D point")
         point_layout = QtWidgets.QGridLayout(point_group)
         point_layout.setColumnStretch(1, 1)
-        self.triangulation_quality_raw_point_label = QtWidgets.QLabel("Raw left_camera_rdf point: --")
+        self.triangulation_quality_raw_point_label = QtWidgets.QLabel("Raw baseline_center_frd point: --")
         self.triangulation_quality_raw_point_label.setObjectName("statusStrip")
         self.triangulation_quality_raw_point_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         point_layout.addWidget(self.triangulation_quality_raw_point_label, 0, 0, 1, 2)
@@ -4938,10 +4935,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "시간축 외부 파라미터 CSV를 같은 session id로 묶어 저장합니다."
             ),
             self.clear_history_button: "거리 그래프와 아직 저장하지 않은 메모리 기록을 지웁니다.",
-            self.runtime_distance_graph_group: "Right/Down/Forward/Distance 이력 그래프 영역을 접거나 펼칩니다.",
+            self.runtime_distance_graph_group: "baseline_center_frd Forward/Right/Down/Range 이력 그래프 영역을 접거나 펼칩니다.",
             self.distance_plot: (
-                "3D ray 샘플의 Right/Down/Forward/Distance 이력 그래프입니다. 점 색상은 동기화 품질을 따릅니다.\n"
-                "왼쪽 클릭: 점의 Right/Down/Forward와 거리값을 표시합니다.\n"
+                "3D ray 샘플의 baseline_center_frd Forward/Right/Down/Range 이력 그래프입니다. "
+                "점 색상은 동기화 품질을 따릅니다.\n"
+                "왼쪽 클릭: 점의 Forward/Right/Down과 midpoint 기준 Range를 표시합니다.\n"
                 "오른쪽 클릭: 해당 점을 삭제합니다."
             ),
             self.save_history_button: "현재 매칭 프레임쌍 전체를 wide CSV와 목적별 탭 XLSX로 함께 저장합니다.",
@@ -11369,7 +11367,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "session_started_unix_ns": self.recording_session_started_unix_ns,
             "session_started_monotonic_ns": self.recording_session_started_monotonic_ns,
             "session_time_anchor_uncertainty_ns": self.recording_session_anchor_uncertainty_ns,
-            "schema_version": "stereowiris-paired-frame-v1",
+            "schema_version": "stereowiris-paired-frame-v2",
             "row_contract": "one row per accepted left/right matched detection frame pair",
             "left_video_path": str(self.video_recording_paths.get("left", "")),
             "right_video_path": str(self.video_recording_paths.get("right", "")),
@@ -11404,6 +11402,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
                 "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
                 "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+                "baseline_frame_scope": "measurement_attempt",
+                "baseline_frame_origin_contract": (
+                    "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
+                ),
+                "baseline_frame_origin_model": (
+                    "checkerboard_stereo_rt_optical_centers"
+                    if triangulation_source == "checkerboard"
+                    else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+                ),
+                "baseline_frame_axis_contract": (
+                    "right=left_to_right_center; forward=projected_average_optical_forward; "
+                    "down=forward_cross_right"
+                ),
                 "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
                 "attitude_timing_blocks_measurement": False,
                 "attitude_stale_age_threshold_s": ATTITUDE_STALE_AGE_S,
@@ -14303,7 +14314,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             return
         triangulation_source = attempt.triangulation_source
-        translation_right_in_left_m = self._translation_right_in_left_m(attempt)
         geometry_result = calculate_measurement_geometry(attempt)
         match = geometry_result.match
         triangulated = geometry_result.triangulated
@@ -14350,9 +14360,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
             return
 
-        raw_point_left_m = triangulated.point_left_rdf_m
-        raw_point_m = raw_point_left_m
-        display_point_m = raw_point_m
+        public_point_m = triangulated.point_m
+        source_point_left_rdf_m = getattr(triangulated, "source_point_left_rdf_m", None)
+        display_point_m = public_point_m
         display_distance_m = triangulated.range_m
         method_text = f"{triangulated.method}-{triangulation_source}"
         gap_text = f" gap={triangulated.closest_gap_m:.3f}m"
@@ -14370,8 +14380,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             display_distance_m=display_distance_m,
             display_baseline_source=display_baseline_source,
             display_baseline_m=display_baseline_m,
-            raw_point_left_m=raw_point_left_m,
-            raw_point_m=raw_point_m,
+            public_point_m=public_point_m,
+            source_point_left_rdf_m=source_point_left_rdf_m,
             attitude_timing_status=attitude_timing_status,
             left_attitude_age_s=estimate.left_attitude_age_s,
             right_attitude_age_s=estimate.right_attitude_age_s,
@@ -14403,9 +14413,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             baseline_source=display_baseline_source,
             baseline_m=display_baseline_m,
             point_m=display_point_m,
-            raw_point_m=raw_point_m,
-            raw_point_left_m=raw_point_left_m,
-            translation_right_in_left_m=translation_right_in_left_m,
+            raw_point_m=public_point_m,
+            raw_point_left_m=source_point_left_rdf_m,
             measurement_attempt=attempt,
         )
         if not appended:
@@ -14575,12 +14584,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "measurement_detection_pair_key": json.dumps(
                 measurement_attempt.detection_pair_key, separators=(",", ":")
             ),
-            "schema_version": "stereowiris-paired-frame-v1",
+            "schema_version": "stereowiris-paired-frame-v2",
             "measurement_attempt_content_sha256": measurement_attempt.content_sha256(),
             "measurement_attempt_instance_sha256": measurement_attempt.instance_sha256(),
             "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
             "measurement_attempt_source_quality": measurement_attempt.source_quality,
             "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
+            "measurement_frame": MEASUREMENT_FRAME,
+            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+            "baseline_frame_scope": "measurement_attempt",
+            "baseline_frame_instance_id": measurement_attempt.instance_sha256(),
+            "baseline_frame_origin_contract": (
+                "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
+            ),
+            "baseline_frame_origin_model": (
+                "checkerboard_stereo_rt_optical_centers"
+                if measurement_attempt.triangulation_source == "checkerboard"
+                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+            ),
+            "baseline_frame_axis_construction": (
+                "right=left_to_right_center;forward=projected_average_optical_forward;"
+                "down=forward_cross_right"
+            ),
             "measurement_valid": "false",
             "pair_status": "matched_geometry_pending",
             "session_started_unix_ns": self.recording_session_started_unix_ns,
@@ -14686,13 +14713,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         point_m: tuple[float, float, float] | None = None,
         raw_point_m: tuple[float, float, float] | None = None,
         raw_point_left_m: tuple[float, float, float] | None = None,
-        translation_right_in_left_m: tuple[float, float, float] | None = None,
         point_left_m: tuple[float, float, float] | None = None,
         measurement_attempt: MeasurementAttempt,
     ) -> bool:
         baseline_source = measurement_attempt.baseline_source
         baseline_m = measurement_attempt.baseline_m
-        translation_right_in_left_m = measurement_attempt.translation_right_in_left_m
         key = tuple(measurement_attempt.detection_pair_key)
         if key == self._last_distance_history_key:
             return False
@@ -14713,9 +14738,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             distance_m=distance_m,
             quality=estimate.sync_quality,
             method=method,
-            x_m=None if point_m is None else float(point_m[0]),
-            y_m=None if point_m is None else float(point_m[1]),
-            z_m=None if point_m is None else float(point_m[2]),
+            forward_m=None if point_m is None else float(point_m[0]),
+            right_m=None if point_m is None else float(point_m[1]),
+            down_m=None if point_m is None else float(point_m[2]),
             class_name=class_name,
             sample_key=tuple(measurement_attempt.detection_pair_key),
             recording_elapsed_s=recording_elapsed_s,
@@ -14770,41 +14795,40 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "point_frame": MEASUREMENT_FRAME,
             "output_frame": MEASUREMENT_FRAME,
             "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "baseline_frame_scope": "measurement_attempt",
+            "baseline_frame_instance_id": measurement_attempt.instance_sha256(),
+            "baseline_frame_origin_contract": (
+                "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
+            ),
+            "baseline_frame_origin_model": (
+                "checkerboard_stereo_rt_optical_centers"
+                if measurement_attempt.triangulation_source == "checkerboard"
+                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+            ),
             "measurement_method": "two_ray_closest_midpoint",
-            "x_m": self._fmt_record_float(point.x_m, 6),
-            "y_m": self._fmt_record_float(point.y_m, 6),
-            "z_m": self._fmt_record_float(point.z_m, 6),
-            "left_camera_right_m": self._fmt_record_float(point.x_m, 6),
-            "left_camera_down_m": self._fmt_record_float(point.y_m, 6),
-            "left_camera_forward_m": self._fmt_record_float(point.z_m, 6),
-            "stereo_center_right_m": "",
-            "stereo_center_down_m": "",
-            "stereo_center_forward_m": "",
-            "raw_distance_m": self._fmt_record_float(raw_distance_m, 6),
-            "raw_x_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
-            "raw_y_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
-            "raw_z_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
-            "raw_left_camera_right_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
-            "raw_left_camera_down_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
-            "raw_left_camera_forward_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
-            "raw_stereo_center_right_m": "",
-            "raw_stereo_center_down_m": "",
-            "raw_stereo_center_forward_m": "",
-            "raw_right_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[0], 6),
-            "raw_down_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[1], 6),
-            "raw_forward_m": self._fmt_record_float(None if raw_point_m is None else raw_point_m[2], 6),
-            "raw_range_m": self._fmt_record_float(raw_distance_m, 6),
-            "raw_left_x_m": self._fmt_record_float(None if raw_point_left_m is None else raw_point_left_m[0], 6),
-            "raw_left_y_m": self._fmt_record_float(None if raw_point_left_m is None else raw_point_left_m[1], 6),
-            "raw_left_z_m": self._fmt_record_float(None if raw_point_left_m is None else raw_point_left_m[2], 6),
-            "translation_right_in_left_x_m": self._fmt_record_float(
-                None if translation_right_in_left_m is None else translation_right_in_left_m[0], 6
+            "range_m": self._fmt_record_float(distance_m, 6),
+            "baseline_center_forward_m": self._fmt_record_float(point.forward_m, 6),
+            "baseline_center_right_m": self._fmt_record_float(point.right_m, 6),
+            "baseline_center_down_m": self._fmt_record_float(point.down_m, 6),
+            "baseline_center_range_m": self._fmt_record_float(distance_m, 6),
+            "raw_baseline_center_forward_m": self._fmt_record_float(
+                None if raw_point_m is None else raw_point_m[0], 6
             ),
-            "translation_right_in_left_y_m": self._fmt_record_float(
-                None if translation_right_in_left_m is None else translation_right_in_left_m[1], 6
+            "raw_baseline_center_right_m": self._fmt_record_float(
+                None if raw_point_m is None else raw_point_m[1], 6
             ),
-            "translation_right_in_left_z_m": self._fmt_record_float(
-                None if translation_right_in_left_m is None else translation_right_in_left_m[2], 6
+            "raw_baseline_center_down_m": self._fmt_record_float(
+                None if raw_point_m is None else raw_point_m[2], 6
+            ),
+            "raw_baseline_center_range_m": self._fmt_record_float(raw_distance_m, 6),
+            "source_left_camera_rdf_right_m": self._fmt_record_float(
+                None if raw_point_left_m is None else raw_point_left_m[0], 6
+            ),
+            "source_left_camera_rdf_down_m": self._fmt_record_float(
+                None if raw_point_left_m is None else raw_point_left_m[1], 6
+            ),
+            "source_left_camera_rdf_forward_m": self._fmt_record_float(
+                None if raw_point_left_m is None else raw_point_left_m[2], 6
             ),
             "recording_elapsed_s": self._fmt_record_float(recording_elapsed_s, 6),
             "warnings": "; ".join(estimate.warnings),
@@ -15900,7 +15924,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.triangulation_quality_distance_label.setText("distance: --")
         self.triangulation_quality_mode_label.setText("mode: --")
         self._set_health_label(self.triangulation_quality_attitude_label, "Attitude timing: --", "idle")
-        self.triangulation_quality_raw_point_label.setText("Raw left_camera_rdf point: --")
+        self.triangulation_quality_raw_point_label.setText("Raw baseline_center_frd point: --")
         self.triangulation_quality_plot.set_quality(None)
 
     def _update_triangulation_quality(
@@ -15911,8 +15935,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         display_distance_m: float,
         display_baseline_source: str,
         display_baseline_m: float,
-        raw_point_left_m: tuple[float, float, float] | None,
-        raw_point_m: tuple[float, float, float] | None,
+        public_point_m: tuple[float, float, float] | None,
+        source_point_left_rdf_m: tuple[float, float, float] | None,
         attitude_timing_status: str,
         left_attitude_age_s: float | None,
         right_attitude_age_s: float | None,
@@ -15939,8 +15963,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._attitude_timing_health_level(attitude_timing_status),
         )
         self.triangulation_quality_raw_point_label.setText(
-            f"Raw left_camera_rdf point: {self._format_quality_point(raw_point_m)} "
-            f"| origin=left optical center | raw alias: {self._format_quality_point(raw_point_left_m)}"
+            "Raw baseline_center_frd point [F/R/D]: "
+            f"{self._format_quality_point(public_point_m)} | origin=baseline midpoint "
+            "| source left_camera_rdf [R/D/F]: "
+            f"{self._format_quality_point(source_point_left_rdf_m)}"
         )
         self.triangulation_quality_plot.set_quality(
             {

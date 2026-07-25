@@ -29,13 +29,19 @@ from wiris_stereo_distance.theme import (
 
 @dataclass(frozen=True)
 class DistanceHistoryPoint:
+    """One public point in ``baseline_center_frd``.
+
+    Coordinate fields are ordered and named ``Forward/Right/Down`` in metres;
+    ``distance_m`` is the Euclidean range from the stereo-baseline midpoint.
+    """
+
     timestamp_s: float
     distance_m: float
     quality: str
     method: str
-    x_m: float | None = None
-    y_m: float | None = None
-    z_m: float | None = None
+    forward_m: float | None = None
+    right_m: float | None = None
+    down_m: float | None = None
     class_name: str | None = None
     sample_key: tuple[object, ...] | None = None
     recording_elapsed_s: float | None = None
@@ -103,9 +109,9 @@ class TriangulationQualityPlot(QtWidgets.QWidget):
 class DistanceHistoryPlot(QtWidgets.QWidget):
     point_deleted = QtCore.pyqtSignal(object)
     SERIES = (
-        ("x_m", "Right", "m", SERIES_LEFT),
-        ("y_m", "Down", "m", SERIES_RIGHT),
-        ("z_m", "Forward", "m", SERIES_Z),
+        ("forward_m", "Forward", "m", SERIES_LEFT),
+        ("right_m", "Right", "m", SERIES_RIGHT),
+        ("down_m", "Down", "m", SERIES_Z),
         ("distance_m", "Range", "m", SERIES_DISTANCE),
     )
 
@@ -152,9 +158,10 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         lines = []
         for index, point in enumerate(selected, start=1):
             parts = [f"{index}. YOLO range: {point.distance_m:.2f} m"]
-            if point.x_m is not None and point.y_m is not None and point.z_m is not None:
+            if point.forward_m is not None and point.right_m is not None and point.down_m is not None:
                 parts.append(
-                    f"Right/Down/Forward: {point.x_m:+.2f}, {point.y_m:+.2f}, {point.z_m:+.2f} m"
+                    "baseline_center_frd Forward/Right/Down: "
+                    f"{point.forward_m:+.2f}, {point.right_m:+.2f}, {point.down_m:+.2f} m"
                 )
             if point.class_name:
                 parts.append(f"클래스: {point.class_name}")
@@ -175,9 +182,9 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
         top = content.top()
         bottom = top + pane_h + gap
         return {
-            "x_m": QtCore.QRect(left, top, pane_w, pane_h),
-            "y_m": QtCore.QRect(right, top, content.right() - right + 1, pane_h),
-            "z_m": QtCore.QRect(left, bottom, pane_w, content.bottom() - bottom + 1),
+            "forward_m": QtCore.QRect(left, top, pane_w, pane_h),
+            "right_m": QtCore.QRect(right, top, content.right() - right + 1, pane_h),
+            "down_m": QtCore.QRect(left, bottom, pane_w, content.bottom() - bottom + 1),
             "distance_m": QtCore.QRect(right, bottom, content.right() - right + 1, content.bottom() - bottom + 1),
         }
 
