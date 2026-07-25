@@ -11762,8 +11762,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_ros2_only_alignment_availability()
         if any(ok for _side, _topic, ok in checks):
             ok_topics = ", ".join(topic for _side, topic, ok in checks if ok)
-            self.pixhawk_connection_label.setText(f"픽스호크 ROS2: publisher 확인됨 ({ok_topics})")
-            self._log(f"[픽스호크] ROS2 publisher 확인: {ok_topics}")
+            receiving_sides = [
+                side for side, _topic, ok in checks if ok and self._ros2_attitude_sample_age_s(side) is not None
+            ]
+            if receiving_sides:
+                labels = ", ".join(self._px4_mag_camera_label(side) for side in receiving_sides)
+                self.pixhawk_connection_label.setText(
+                    f"픽스호크 ROS2: {labels} 자세 데이터 수신 확인됨 ({ok_topics})"
+                )
+                self._log(f"[픽스호크] ROS2 자세 데이터 수신 확인: {ok_topics}")
+            else:
+                self.pixhawk_connection_label.setText(
+                    f"픽스호크 ROS2: publisher만 확인됨, 자세 데이터 미수신 ({ok_topics})"
+                )
+                self._log(f"[픽스호크] ROS2 publisher는 있으나 자세 데이터 미수신: {ok_topics}")
             missing = []
             for side, topics in self.ros2_sensor_topic_publishers.items():
                 for key in ("sensor_gps", "sensor_mag", "vehicle_magnetometer"):
@@ -11779,6 +11791,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "[픽스호크] ROS2 publisher 없음: topic 이름은 앱 subscription 때문에 보일 수 있습니다. "
             f"확인 topic={topics}. MicroXRCEAgent, Pixhawk Host IP, PX4 uXRCE client 재부팅/재시작을 확인하세요."
         )
+
+    def _ros2_attitude_sample_age_s(self, side: str, *, max_age_s: float = 2.0) -> float | None:
+        """Seconds since the last real ``vehicle_attitude`` sample for ``side``, or None if none/stale.
+
+        A DDS publisher count > 0 only proves something advertised the topic
+        name; it says nothing about whether it is actually sending usable
+        data. This checks the subscriber's own received-message state instead.
+        """
+
+        subscriber = self.pixhawk_ros2_subscribers.get(side)
+        if subscriber is None:
+            return None
+        state = subscriber.latest_extrinsics.get(side)
+        if state is None:
+            return None
+        age_s = time.monotonic() - state.timestamp_s
+        return age_s if 0.0 <= age_s <= max_age_s else None
 
     def _refresh_ros2_only_alignment_availability(self) -> None:
         self._refresh_baseline_gps_cards()

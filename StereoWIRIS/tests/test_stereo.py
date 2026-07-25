@@ -353,6 +353,66 @@ def test_nmea_gga_satellite_count_parser_reads_base_fallback() -> None:
     assert gui.parse_nmea_gga_satellite_count(line.replace("*49", "*00")) is None
 
 
+def test_ros2_attitude_sample_age_s_requires_a_fresh_received_sample(monkeypatch) -> None:
+    import time
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    assert widget._ros2_attitude_sample_age_s("left") is None
+
+    widget.pixhawk_ros2_subscribers["left"] = SimpleNamespace(latest_extrinsics={})
+    assert widget._ros2_attitude_sample_age_s("left") is None
+
+    now_s = time.monotonic()
+    widget.pixhawk_ros2_subscribers["left"] = SimpleNamespace(
+        latest_extrinsics={"left": SimpleNamespace(timestamp_s=now_s - 0.5)}
+    )
+    age_s = widget._ros2_attitude_sample_age_s("left")
+    assert age_s is not None
+    assert 0.0 <= age_s < 2.0
+
+    widget.pixhawk_ros2_subscribers["left"] = SimpleNamespace(
+        latest_extrinsics={"left": SimpleNamespace(timestamp_s=now_s - 10.0)}
+    )
+    assert widget._ros2_attitude_sample_age_s("left") is None
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_verify_ros2_pixhawk_publishers_distinguishes_publisher_from_live_data(monkeypatch) -> None:
+    import time
+    from types import SimpleNamespace
+
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    monkeypatch.setattr(gui, "_ros2_topic_has_publisher", lambda *args, **kwargs: True)
+    widget.pixhawk_ros2_subscribers["left"] = SimpleNamespace(latest_extrinsics={})
+
+    widget._verify_ros2_pixhawk_publishers(("left",))
+    assert "publisher만 확인됨" in widget.pixhawk_connection_label.text()
+    assert "자세 데이터 미수신" in widget.pixhawk_connection_label.text()
+
+    widget.pixhawk_ros2_subscribers["left"] = SimpleNamespace(
+        latest_extrinsics={"left": SimpleNamespace(timestamp_s=time.monotonic())}
+    )
+    widget._verify_ros2_pixhawk_publishers(("left",))
+    assert "자세 데이터 수신 확인됨" in widget.pixhawk_connection_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_gnss_base_candidate_rows_apply_selected_port(monkeypatch) -> None:
     from PyQt5 import QtCore, QtWidgets
 
