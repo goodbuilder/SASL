@@ -81,3 +81,11 @@ def test_rtk_baseline_blocks_when_fixed_required_but_float() -> None:
     assert baseline is not None
     assert baseline.fix_quality == "BAD"
     assert "left RTK_FLOAT" in baseline.warnings
+
+
+def test_ned_delta_and_baseline_are_none_when_position_missing() -> None:
+    left = GpsPositionState("left", "uav_0", 1.0, "topic", latitude_deg=None, longitude_deg=None, altitude_m=None)
+    right = GpsPositionState("right", "uav_1", 1.0, "topic", 37.0, 127.0, 10.0, fix_type=6)
+
+    assert ned_delta_m(left, right) is None
+    assert estimate_rtk_baseline(left, right, now_s=1.1, require_fixed=True) is None
