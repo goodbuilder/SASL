@@ -5956,9 +5956,8 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
         "측정 품질",
     ]
     assert not hasattr(widget, "save_tabs")
-    runtime_tab = widget.measurement_tabs.widget(widget.live_measurement_tab_index)
     save_tab = widget.tabs.widget(widget.results_tab_index)
-    assert runtime_tab.isAncestorOf(widget.recording_status_label)
+    assert save_tab.isAncestorOf(widget.recording_status_label)
     assert save_tab.isAncestorOf(widget.save_history_button)
     assert save_tab.isAncestorOf(widget.session_summary_label)
     assert save_tab.isAncestorOf(widget.recording_table_group)

@@ -4402,14 +4402,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             button.setFixedWidth(runtime_action_width)
         runtime_controls.addWidget(self.record_button, 0, 1)
         runtime_controls.addWidget(self.clear_history_button, 0, 2)
-        self.recording_status_label = QtWidgets.QLabel("세션 기록: 중지")
-        self.recording_status_label.setObjectName("statusStrip")
-        self.recording_status_label.setWordWrap(True)
-        self.recording_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        self.recording_status_label.setToolTip(
-            "세션 기록 진행 상태와 저장 결과입니다. 저장 실패 시 저장·분석 탭에서 재시도할 수 있습니다."
-        )
-        runtime_controls.addWidget(self.recording_status_label, 1, 0, 1, 3)
         for column in range(3):
             runtime_controls.setColumnStretch(column, 1)
         self.runtime_camera_settings_group = QtWidgets.QGroupBox("실시간 카메라 / NTP / Pair 상태")
@@ -4530,9 +4522,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.session_summary_label.setObjectName("statusStrip")
         self.session_summary_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.session_summary_label.setWordWrap(True)
+        self.recording_status_label = QtWidgets.QLabel("세션 기록: 중지")
+        self.recording_status_label.setObjectName("statusStrip")
+        self.recording_status_label.setWordWrap(True)
+        self.recording_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         save_form.addWidget(self.save_history_button, 0, 0)
         save_form.addWidget(self.save_settings_button, 0, 1)
         save_form.addWidget(self.session_summary_label, 1, 0, 1, 2)
+        save_form.addWidget(self.recording_status_label, 2, 0, 1, 2)
         save_layout.addWidget(save_group)
 
         self.recording_table_group = QtWidgets.QGroupBox("매칭 프레임쌍 실시간 보기")
