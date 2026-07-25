@@ -161,6 +161,7 @@ from wiris_stereo_distance.recording_session import (
     save_session_files,
     session_dir,
     session_id_now,
+    session_sheet_previews,
     write_recovery_metadata,
 )
 from wiris_stereo_distance.settings import (
@@ -349,47 +350,6 @@ RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
 RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
 WIRIS_FTP_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff")
-RECORDED_SAMPLE_TABLE_COLUMNS = (
-    ("timestamp_s", "시간(s)"),
-    ("distance_m", "YOLO Range(m)"),
-    ("method", "방식"),
-    ("quality", "품질"),
-    ("attitude_timing_status", "자세 시각"),
-    ("disparity_px", "Disparity(px)"),
-    ("camera_delta_s", "좌우Δt(s)"),
-    ("vertical_delta_px", "세로Δ(px)"),
-    ("baseline_source", "Baseline 출처"),
-    ("baseline_m", "Baseline(m)"),
-    ("relative_roll_deg", "상대 Roll(deg)"),
-    ("relative_pitch_deg", "상대 Pitch(deg)"),
-    ("relative_yaw_deg", "상대 Yaw(deg)"),
-    ("left_roll_deg", "L Roll(deg)"),
-    ("left_pitch_deg", "L Pitch(deg)"),
-    ("left_yaw_deg", "L Yaw(deg)"),
-    ("right_roll_deg", "R Roll(deg)"),
-    ("right_pitch_deg", "R Pitch(deg)"),
-    ("right_yaw_deg", "R Yaw(deg)"),
-    ("rtk_fix_quality", "RTK 품질"),
-    ("left_gps_satellites_used", "L Sats"),
-    ("left_gps_eph_m", "L eph(m)"),
-    ("left_gps_epv_m", "L epv(m)"),
-    ("right_gps_satellites_used", "R Sats"),
-    ("right_gps_eph_m", "R eph(m)"),
-    ("right_gps_epv_m", "R epv(m)"),
-    ("intrinsics_zoom_level", "줌"),
-    ("intrinsics_path", "Intrinsics"),
-    ("baseline_center_forward_m", "Center Forward(m)"),
-    ("baseline_center_right_m", "Center Right(m)"),
-    ("baseline_center_down_m", "Center Down(m)"),
-    ("baseline_center_range_m", "Center Range(m)"),
-    ("left_cx", "L cx(px)"),
-    ("right_cx", "R cx(px)"),
-    ("bbox_mid_timestamp_s", "BBox mid t(s)"),
-    ("bbox_mid_utc_unix_s", "BBox UTC(s)"),
-    ("camera_time_sync_status", "카메라 시간 상태"),
-    ("rtcp_pair_delta_s", "RTCP 좌우Δt(s)"),
-    ("rtcp_pc_offset_max_ms", "RTCP-PC 최대Δ(ms)"),
-)
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
 
@@ -4532,25 +4492,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         save_form.addWidget(self.recording_status_label, 2, 0, 1, 2)
         save_layout.addWidget(save_group)
 
-        self.recording_table_group = QtWidgets.QGroupBox("매칭 프레임쌍 실시간 보기")
+        self.recording_table_group = QtWidgets.QGroupBox("저장될 세션 XLSX 미리보기")
         recording_table_layout = QtWidgets.QVBoxLayout(self.recording_table_group)
-        self.recording_sample_table = QtWidgets.QTableWidget(0, len(RECORDED_SAMPLE_TABLE_COLUMNS))
-        self.recording_sample_table.setObjectName("recordingSampleTable")
-        self.recording_sample_table.setHorizontalHeaderLabels(
-            [label for _field, label in RECORDED_SAMPLE_TABLE_COLUMNS]
+        self.recording_sheet_tabs = QtWidgets.QTabWidget()
+        self.recording_sheet_tabs.setDocumentMode(True)
+        self.recording_sheet_tables: dict[str, QtWidgets.QTableWidget] = {}
+        for sheet_name in self._recording_sheet_names():
+            table = QtWidgets.QTableWidget(0, 0)
+            table.setObjectName("recordingSampleTable")
+            table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+            table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+            table.setAlternatingRowColors(True)
+            table.verticalHeader().setVisible(False)
+            table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+            table.itemSelectionChanged.connect(self._refresh_recording_sample_detail)
+            self.recording_sheet_tables[sheet_name] = table
+            self.recording_sheet_tabs.addTab(table, sheet_name)
+        self.recording_sheet_tabs.currentChanged.connect(
+            lambda _index: self._refresh_active_recording_sheet()
         )
-        self.recording_sample_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.recording_sample_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.recording_sample_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
-        self.recording_sample_table.setAlternatingRowColors(True)
-        self.recording_sample_table.verticalHeader().setVisible(False)
-        self.recording_sample_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.recording_sample_table.horizontalHeader().setSectionResizeMode(
-            len(RECORDED_SAMPLE_TABLE_COLUMNS) - 1,
-            QtWidgets.QHeaderView.Stretch,
-        )
-        self.recording_sample_table.itemSelectionChanged.connect(self._refresh_recording_sample_detail)
-        recording_table_layout.addWidget(self.recording_sample_table, 2)
+        recording_table_layout.addWidget(self.recording_sheet_tabs, 2)
         self.recording_sample_detail = QtWidgets.QPlainTextEdit()
         self.recording_sample_detail.setObjectName("recordingSampleDetail")
         self.recording_sample_detail.setReadOnly(True)
@@ -4946,7 +4908,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.save_history_button: "현재 매칭 프레임쌍 전체를 wide CSV와 목적별 탭 XLSX로 함께 저장합니다.",
             self.save_settings_button: "현재 내부 파라미터 경로와 전체 런타임 설정을 저장합니다.",
             self.recording_status_label: "메모리 내 세션 기록 상태와 매칭 프레임쌍 수입니다.",
-            self.recording_sample_table: "저장될 frame-pair row의 주요 컬럼을 매칭 쌍마다 한 줄씩 표시합니다.",
+            self.recording_sheet_tabs: "저장될 세션 XLSX와 같은 시트 구성으로 현재 기록을 미리 보여줍니다.",
             self.recording_sample_detail: "선택한 매칭 프레임쌍의 전체 wide CSV 필드를 표시합니다.",
             self.clock_ftp_user_edit: "WIRIS FTP 로그인 사용자 이름입니다. 장비 설정에 맞게 입력하세요.",
             self.clock_ftp_password_edit: "WIRIS FTP 로그인 비밀번호입니다. 비어 있으면 빈 비밀번호로 로그인합니다.",
@@ -10600,6 +10562,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.triangulation_quality_plot.set_tab_visible(self._is_triangulation_quality_visible())
         if index == self.time_tab_index:
             self._update_clock_sync_display()
+        if index == self.results_tab_index:
+            self._refresh_active_recording_sheet()
 
     def _is_triangulation_quality_visible(self) -> bool:
         return (
@@ -10923,40 +10887,107 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return rows.preview_rows
         return list(rows[-RECORDING_PREVIEW_LIMIT:])
 
-    def _append_recording_table_row(self, row: dict[str, object]) -> None:
-        if not hasattr(self, "recording_sample_table"):
+    def _recording_sheet_names(self) -> tuple[str, ...]:
+        """Workbook sheet names, in write order, without needing session rows."""
+
+        return tuple(sheet.name for sheet in session_sheet_previews({}, []))
+
+    def _active_recording_sheet_name(self) -> str | None:
+        if not hasattr(self, "recording_sheet_tabs"):
+            return None
+        index = self.recording_sheet_tabs.currentIndex()
+        if index < 0:
+            return None
+        return self.recording_sheet_tabs.tabText(index)
+
+    def _append_recording_table_row(self, _row: dict[str, object]) -> None:
+        """Refresh the visible sheet after one accepted pair was recorded.
+
+        Sheet columns are projected from every recorded row, so a new sample
+        can widen them; rebuilding the visible sheet is simpler than patching
+        one row into each of the seven sheets.
+        """
+
+        self._refresh_active_recording_sheet(scroll_to_bottom=True)
+
+    def _refresh_active_recording_sheet(self, *, scroll_to_bottom: bool = False) -> None:
+        sheet_name = self._active_recording_sheet_name()
+        if sheet_name is None:
             return
-        table = self.recording_sample_table
-        if table.rowCount() >= RECORDING_PREVIEW_LIMIT:
-            table.removeRow(0)
-        row_index = table.rowCount()
-        table.insertRow(row_index)
-        for column_index, (field, _label) in enumerate(RECORDED_SAMPLE_TABLE_COLUMNS):
-            item = QtWidgets.QTableWidgetItem(self._recording_table_value(row, field))
-            item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-            table.setItem(row_index, column_index, item)
-        table.scrollToBottom()
-        table.selectRow(row_index)
+        table = self.recording_sheet_tables.get(sheet_name)
+        if table is None:
+            return
+        rows = self._recording_preview_rows()
+        # Only the key/value sheets read metadata, and building it runs the
+        # clock-sync and camera-timing probes — skip it on the sample sheets,
+        # which are refreshed once per recorded pair.
+        needs_metadata = sheet_name in {"Summary", "Calibration"}
+        metadata = self._recording_session_metadata() if needs_metadata else {}
+        preview = next(
+            (sheet for sheet in session_sheet_previews(metadata, rows) if sheet.name == sheet_name),
+            None,
+        )
+        if preview is None:
+            return
+        table.blockSignals(True)
+        try:
+            if preview.kind == "key_value":
+                self._fill_recording_sheet(table, ("key", "value"), [
+                    (str(key), "" if value is None else str(value)) for key, value in preview.entries
+                ])
+            else:
+                self._fill_recording_sheet(
+                    table,
+                    preview.columns,
+                    [
+                        tuple(self._recording_table_value(row, field) for field in preview.columns)
+                        for row in rows
+                    ],
+                )
+        finally:
+            table.blockSignals(False)
+        if scroll_to_bottom and table.rowCount():
+            table.scrollToBottom()
+            table.selectRow(table.rowCount() - 1)
+        self._refresh_recording_sample_detail()
+
+    def _fill_recording_sheet(
+        self,
+        table: QtWidgets.QTableWidget,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[str]],
+    ) -> None:
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(list(headers))
+        table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column_index, value in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(value)
+                item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                table.setItem(row_index, column_index, item)
 
     def _refresh_recording_table(self) -> None:
-        if not hasattr(self, "recording_sample_table"):
+        if not hasattr(self, "recording_sheet_tabs"):
             return
-        table = self.recording_sample_table
-        table.setRowCount(0)
-        for row in self._recording_preview_rows():
-            self._append_recording_table_row(row)
+        self._refresh_active_recording_sheet()
         if not self.distance_recording_rows:
             self.recording_sample_detail.clear()
 
     def _refresh_recording_sample_detail(self) -> None:
-        if not hasattr(self, "recording_sample_table"):
+        if not hasattr(self, "recording_sheet_tabs"):
             return
-        selected_rows = self.recording_sample_table.selectionModel().selectedRows()
+        sheet_name = self._active_recording_sheet_name()
+        table = self.recording_sheet_tables.get(sheet_name) if sheet_name else None
+        if table is None:
+            return
+        selected_rows = table.selectionModel().selectedRows()
+        preview_rows = self._recording_preview_rows()
         if not selected_rows:
             self.recording_sample_detail.clear()
             return
         row_index = selected_rows[0].row()
-        preview_rows = self._recording_preview_rows()
+        # Key/value sheets hold metadata, not samples, so there is no row to expand.
         if row_index < 0 or row_index >= len(preview_rows):
             self.recording_sample_detail.clear()
             return

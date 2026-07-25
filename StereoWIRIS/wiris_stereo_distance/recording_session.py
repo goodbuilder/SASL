@@ -388,6 +388,57 @@ def _projected_columns(fieldnames: list[str], keywords: tuple[str, ...]) -> list
     return selected
 
 
+@dataclass(frozen=True)
+class SessionSheetPreview:
+    """One sheet of the session workbook, in the order it is written.
+
+    ``kind`` is ``"table"`` (row-per-sample, ``columns`` applies) or
+    ``"key_value"`` (flattened metadata, ``entries`` applies).
+    """
+
+    name: str
+    kind: str
+    columns: tuple[str, ...] = ()
+    entries: tuple[tuple[str, object], ...] = ()
+
+
+def session_sheet_previews(
+    metadata: dict[str, object],
+    rows: Sequence[dict[str, object]],
+) -> list[SessionSheetPreview]:
+    """Describe the sheets ``write_session_workbook`` would produce.
+
+    The workbook writer consumes this same description, so an on-screen
+    preview cannot drift from the saved file's sheet names or columns.
+    """
+
+    fieldnames = _ordered_fieldnames(rows)
+    metadata_entries = _flatten_metadata(metadata)
+    previews = [
+        SessionSheetPreview(name="Summary", kind="key_value", entries=tuple(metadata_entries))
+    ]
+    previews.extend(
+        SessionSheetPreview(
+            name=sheet_name,
+            kind="table",
+            columns=tuple(_projected_columns(fieldnames, keywords)),
+        )
+        for sheet_name, keywords in DYNAMIC_SHEET_RULES.items()
+    )
+    previews.append(
+        SessionSheetPreview(
+            name="Calibration",
+            kind="key_value",
+            entries=tuple(
+                entry
+                for entry in metadata_entries
+                if any(keyword in entry[0].lower() for keyword in CALIBRATION_KEYWORDS)
+            ),
+        )
+    )
+    return previews
+
+
 def _flatten_metadata(
     metadata: dict[str, object], prefix: str = ""
 ) -> list[tuple[str, object]]:
@@ -468,8 +519,7 @@ def _write_xlsx(
     metadata: dict[str, object],
     rows: list[dict[str, object]],
 ) -> None:
-    fieldnames = _ordered_fieldnames(rows)
-    metadata_entries = _flatten_metadata(metadata)
+    previews = session_sheet_previews(metadata, rows)
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(dir=output.parent, prefix=f".{output.name}.", suffix=".tmp")
     os.close(fd)
@@ -477,22 +527,12 @@ def _write_xlsx(
     try:
         with xlsxwriter.Workbook(temp_path) as workbook:
             header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7"})
-            _write_key_value_sheet(
-                workbook.add_worksheet("Summary"), metadata_entries, header_format
-            )
-            for sheet_name, keywords in DYNAMIC_SHEET_RULES.items():
-                columns = _projected_columns(fieldnames, keywords)
-                _write_table(workbook.add_worksheet(sheet_name), columns, rows, header_format)
-            calibration_entries = [
-                entry
-                for entry in metadata_entries
-                if any(keyword in entry[0].lower() for keyword in CALIBRATION_KEYWORDS)
-            ]
-            _write_key_value_sheet(
-                workbook.add_worksheet("Calibration"),
-                calibration_entries,
-                header_format,
-            )
+            for preview in previews:
+                worksheet = workbook.add_worksheet(preview.name)
+                if preview.kind == "key_value":
+                    _write_key_value_sheet(worksheet, list(preview.entries), header_format)
+                else:
+                    _write_table(worksheet, list(preview.columns), rows, header_format)
         os.replace(temp_path, output)
     finally:
         temp_path.unlink(missing_ok=True)

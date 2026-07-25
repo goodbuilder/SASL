@@ -13,6 +13,7 @@ from wiris_stereo_distance.recording_session import (
     save_session_files,
     session_dir,
     session_id_now,
+    session_sheet_previews,
     write_recovery_metadata,
 )
 
@@ -468,6 +469,44 @@ def test_retry_cleans_finalize_and_preparing_orphans(tmp_path) -> None:
 
     assert not (output_dir / ".finalize-old").exists()
     assert not (output_dir / ".generations" / "old.preparing").exists()
+
+
+def test_session_sheet_previews_match_the_written_workbook(tmp_path) -> None:
+    metadata = {
+        "session_id": "preview-session",
+        "calibration": {"left_fx": 1234.5},
+    }
+    pair_rows = [
+        {
+            "sample_index": 0,
+            "session_elapsed_s": 0.0,
+            "distance_m": 5.0,
+            "gps_latitude_deg": 37.1,
+            "attitude_roll_deg": 1.0,
+            "baseline_length_m": 0.3,
+            "quality": "GOOD",
+        },
+        {
+            "sample_index": 1,
+            "session_elapsed_s": 0.5,
+            "distance_m": 5.2,
+            "gps_latitude_deg": 37.2,
+            "attitude_roll_deg": 1.1,
+            "baseline_length_m": 0.3,
+            "quality": "BAD",
+        },
+    ]
+    output_dir = tmp_path / "session"
+
+    saved = save_session_files(output_dir, metadata=metadata, pair_rows=pair_rows)
+    previews = session_sheet_previews(metadata, pair_rows)
+    names, row_counts = _xlsx_sheet_names_and_row_counts(saved.xlsx)
+
+    assert names == [preview.name for preview in previews]
+    for preview, row_count in zip(previews, row_counts):
+        expected = len(preview.entries) if preview.kind == "key_value" else len(pair_rows)
+        # Every sheet carries one header row on top of its body rows.
+        assert row_count == expected + 1, preview.name
 
 
 def test_legacy_regular_outputs_are_migrated_to_stable_generation_links(tmp_path) -> None:

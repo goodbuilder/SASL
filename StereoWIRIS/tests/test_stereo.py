@@ -56,6 +56,33 @@ def test_measurement_attempt_generation_identity_is_unique_with_same_session_id(
     assert second.startswith(f"{session_id}-")
 
 
+def recording_sheet(widget, name: str):
+    """Activate one 저장·분석 workbook sheet and return its populated table.
+
+    Sheets refresh lazily, and only the visible one refreshes, so the tab has
+    to be selected before its contents can be asserted on.
+    """
+
+    tabs = widget.recording_sheet_tabs
+    for index in range(tabs.count()):
+        if tabs.tabText(index) == name:
+            tabs.setCurrentIndex(index)
+            widget._refresh_active_recording_sheet()
+            return widget.recording_sheet_tables[name]
+    raise AssertionError(f"no workbook sheet named {name!r}")
+
+
+def sheet_cell(table, row: int, column_name: str) -> str | None:
+    """Read one cell by column name, since sheet columns are data-dependent."""
+
+    for column in range(table.columnCount()):
+        header = table.horizontalHeaderItem(column)
+        if header is not None and header.text() == column_name:
+            item = table.item(row, column)
+            return None if item is None else item.text()
+    raise AssertionError(f"no column named {column_name!r}")
+
+
 def recording_attempt(widget, estimate, *, baseline_m: float = 0.3, translation=None):
     """Build the immutable selected-input fixture consumed by valid-row recording."""
 
@@ -8445,8 +8472,9 @@ def test_distance_history_plot_delete_removes_recorded_sample_from_panel(monkeyp
     assert len(widget.distance_recording_keys) == 1
     assert float(widget.distance_recording_rows[0]["recording_elapsed_s"]) >= 2.0
     assert widget.distance_history[-1].recording_elapsed_s is not None
-    assert widget.recording_sample_table.rowCount() == 1
-    assert widget.recording_sample_table.item(0, 1).text() == "5.400000"
+    measurements = recording_sheet(widget, "Measurements")
+    assert measurements.rowCount() == 1
+    assert sheet_cell(measurements, 0, "distance_m") == "5.400000"
 
     point = widget.distance_history[-1]
     assert point.class_name == "person"
@@ -8461,9 +8489,75 @@ def test_distance_history_plot_delete_removes_recorded_sample_from_panel(monkeyp
     assert len(widget.distance_history) == 0
     assert len(widget.distance_recording_rows) == 0
     assert len(widget.distance_recording_keys) == 0
-    assert widget.recording_sample_table.rowCount() == 0
+    assert recording_sheet(widget, "Measurements").rowCount() == 0
     assert widget.distance_plot._selected_point_text() is None
     assert widget.recording_status_label.text() == "세션 기록: 진행 중, 매칭 프레임쌍=0"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_recording_sheet_tabs_mirror_the_session_workbook_sheets() -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.recording_session import session_sheet_previews
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    tab_names = [
+        widget.recording_sheet_tabs.tabText(index)
+        for index in range(widget.recording_sheet_tabs.count())
+    ]
+
+    assert tab_names == [preview.name for preview in session_sheet_previews({}, [])]
+    assert tab_names == [
+        "Summary",
+        "Measurements",
+        "GPS",
+        "Attitude",
+        "Baseline",
+        "Quality",
+        "Calibration",
+    ]
+    assert not hasattr(widget, "recording_sample_table")
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_recording_sheet_columns_follow_the_recorded_rows() -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.distance_recording_rows = [
+        {
+            "sample_index": 0,
+            "session_elapsed_s": 0.0,
+            "distance_m": 5.0,
+            "gps_latitude_deg": 37.1,
+            "baseline_length_m": 0.3,
+        }
+    ]
+
+    gps = recording_sheet(widget, "GPS")
+    assert sheet_cell(gps, 0, "gps_latitude_deg") == "37.1"
+    baseline = recording_sheet(widget, "Baseline")
+    assert sheet_cell(baseline, 0, "baseline_length_m") == "0.3"
+    # A GPS-only field must not leak into the Baseline projection.
+    with pytest.raises(AssertionError):
+        sheet_cell(baseline, 0, "gps_latitude_deg")
+
+    summary = recording_sheet(widget, "Summary")
+    assert [summary.horizontalHeaderItem(c).text() for c in range(summary.columnCount())] == [
+        "key",
+        "value",
+    ]
+    assert summary.rowCount() > 0
 
     widget.deleteLater()
     _ = app
@@ -8507,20 +8601,20 @@ def test_recording_sample_table_shows_live_csv_fields(monkeypatch) -> None:
         measurement_attempt=attempt,
     )
 
-    assert widget.recording_sample_table.rowCount() == 1
-    assert widget.recording_sample_table.item(0, 1).text() == "6.000000"
-    assert widget.recording_sample_table.item(0, 3).text() == "GOOD"
-    relative_yaw_column = next(
-        index for index, (field, _label) in enumerate(gui.RECORDED_SAMPLE_TABLE_COLUMNS)
-        if field == "relative_yaw_deg"
-    )
-    assert widget.recording_sample_table.item(0, relative_yaw_column).text() == "3.000000"
+    measurements = recording_sheet(widget, "Measurements")
+    assert measurements.rowCount() == 1
+    assert sheet_cell(measurements, 0, "distance_m") == "6.000000"
+    assert sheet_cell(recording_sheet(widget, "Quality"), 0, "quality") == "GOOD"
+    # "yaw" routes this field to Attitude, not Quality.
+    assert sheet_cell(recording_sheet(widget, "Attitude"), 0, "relative_yaw_deg") == "3.000000"
+    measurements = recording_sheet(widget, "Measurements")
+    measurements.selectRow(0)
     assert "distance_m: 6.000000" in widget.recording_sample_detail.toPlainText()
     assert "warnings: low baseline confidence" in widget.recording_sample_detail.toPlainText()
 
     widget.clear_distance_history()
 
-    assert widget.recording_sample_table.rowCount() == 0
+    assert recording_sheet(widget, "Measurements").rowCount() == 0
     assert widget.recording_sample_detail.toPlainText() == ""
 
     widget.deleteLater()
@@ -8777,8 +8871,9 @@ def test_pair_spool_and_record_table_stay_bounded_for_long_session(tmp_path, mon
 
     assert len(rows) == 1000
     assert rows.preview_count == gui.RECORDING_PREVIEW_LIMIT
-    assert widget.recording_sample_table.rowCount() == gui.RECORDING_PREVIEW_LIMIT
-    assert int(widget.recording_sample_table.item(0, 0).text() or 0) >= 0
+    measurements = recording_sheet(widget, "Measurements")
+    assert measurements.rowCount() == gui.RECORDING_PREVIEW_LIMIT
+    assert int(sheet_cell(measurements, 0, "sample_index") or 0) >= 0
     rows.close()
     recovered = SpoolRows(preview_limit=gui.RECORDING_PREVIEW_LIMIT, supports_updates=True)
     recovered.open_existing(tmp_path / "pair_rows.jsonl")
@@ -8879,7 +8974,7 @@ def test_gui_discovers_and_loads_retryable_pair_spool_after_restart(tmp_path, mo
     assert widget._recover_retryable_recording_session() is True
     assert widget.recording_session_id == "restart-session"
     assert len(widget.distance_recording_rows) == 6
-    assert widget.recording_sample_table.rowCount() == 6
+    assert recording_sheet(widget, "Measurements").rowCount() == 6
     assert widget.record_button.isEnabled() is False
     assert widget.save_history_button.isEnabled() is True
     widget.left_url_edit.setText("rtsp://changed-after-restart/live")
