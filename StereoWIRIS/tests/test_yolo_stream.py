@@ -4,6 +4,7 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
 from wiris_stereo_distance.yolo_stream import (
     AdaptiveYoloRateLimiter,
@@ -220,6 +221,79 @@ def test_rtcp_sender_report_interval_logging_triggers_on_new_sr() -> None:
     )
     tracker._emit_status(message)
     assert messages == [message]
+
+
+def test_repeated_sender_report_keeps_its_original_arrival_timestamps() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+    first = RtcpSenderReportTiming(
+        ssrc=1234,
+        ntp_raw=1,
+        ntp_unix_s=100.0,
+        rtp_timestamp=10,
+        clock_rate_hz=90_000,
+        received_monotonic_s=1.0,
+        received_wall_s=1_000.0,
+    )
+    # The 250 ms poll re-reads the same report from the session stats, so it
+    # arrives again stamped with the current time.
+    same_report_polled_later = RtcpSenderReportTiming(
+        ssrc=1234,
+        ntp_raw=1,
+        ntp_unix_s=100.0,
+        rtp_timestamp=10,
+        clock_rate_hz=90_000,
+        received_monotonic_s=61.0,
+        received_wall_s=1_060.0,
+    )
+
+    tracker._register_sender_report(first)
+    assert tracker._register_sender_report(same_report_polled_later) is None
+
+    stored = tracker._sr_by_ssrc[1234]
+    # Otherwise rtcp_sr_age_s would report ~0 s forever and could never expose
+    # an anchor that stopped refreshing.
+    assert stored.received_monotonic_s == 1.0
+    assert stored.received_wall_s == 1_000.0
+
+
+def test_frame_transport_delay_cancels_camera_clock_offset() -> None:
+    from wiris_stereo_distance.yolo_stream import (
+        estimate_rtcp_ntp_unix_seconds,
+        rtcp_sender_report_pc_offset_s,
+    )
+
+    clock_rate_hz = 90_000
+    transport_delay_s = 0.05
+    measured: list[tuple[float, float]] = []
+
+    for elapsed_s, camera_clock_error_s in ((0.0, 1.0), (600.0, 1.6), (1800.0, 2.8)):
+        sr_received_wall_s = 1_000.0 + elapsed_s
+        sr_ntp_unix_s = sr_received_wall_s - camera_clock_error_s
+        sr_rtp_timestamp = int(elapsed_s * clock_rate_hz)
+        frame_rtp_timestamp = sr_rtp_timestamp + int(0.08 * clock_rate_hz)
+        frame_received_wall_s = sr_received_wall_s + 0.08 + transport_delay_s
+
+        frame_ntp_s = estimate_rtcp_ntp_unix_seconds(
+            rtp_timestamp=frame_rtp_timestamp,
+            sr_rtp_timestamp=sr_rtp_timestamp,
+            sr_ntp_unix_s=sr_ntp_unix_s,
+            clock_rate_hz=clock_rate_hz,
+        )
+        receive_delay_s = frame_received_wall_s - frame_ntp_s
+        sr_pc_offset_s = rtcp_sender_report_pc_offset_s(
+            sr_ntp_unix_s=sr_ntp_unix_s,
+            received_wall_s=sr_received_wall_s,
+        )
+        measured.append((receive_delay_s, receive_delay_s + sr_pc_offset_s))
+
+    receive_delays = [receive_delay_s for receive_delay_s, _ in measured]
+    transport_delays = [transport_delay for _, transport_delay in measured]
+
+    # receive_delay tracks the growing camera clock error ...
+    assert receive_delays[0] < receive_delays[1] < receive_delays[2]
+    # ... while the compensated transport delay stays at the real value.
+    for value in transport_delays:
+        assert value == pytest.approx(transport_delay_s, abs=1e-6)
 
 
 def test_rtp_timing_tracker_does_not_attach_stale_timing_to_known_pts() -> None:

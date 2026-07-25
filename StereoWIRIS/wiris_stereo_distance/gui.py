@@ -8076,6 +8076,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 timestamp_s=now_s,
                 left_transit_delay_ms=metric("left", "rtcp_frame_receive_delay_s", 1000.0),
                 right_transit_delay_ms=metric("right", "rtcp_frame_receive_delay_s", 1000.0),
+                left_transport_delay_ms=metric("left", "rtcp_frame_transport_delay_s", 1000.0),
+                right_transport_delay_ms=metric("right", "rtcp_frame_transport_delay_s", 1000.0),
                 left_sr_age_s=metric("left", "rtcp_sr_age_s", 1.0),
                 right_sr_age_s=metric("right", "rtcp_sr_age_s", 1.0),
             )

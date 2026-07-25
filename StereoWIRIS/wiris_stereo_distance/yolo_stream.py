@@ -604,10 +604,14 @@ class GstRtpTimingTracker:
     def _register_sender_report(self, timing: RtcpSenderReportTiming) -> str | None:
         with self._lock:
             previous = self._sr_by_ssrc.get(timing.ssrc)
+            if previous is not None and previous.ntp_raw == timing.ntp_raw:
+                # The poll re-reads the same report from the GStreamer session
+                # stats every 250 ms. Keep the timestamps from when this report
+                # first appeared, so rtcp_sr_age_s measures how stale the anchor
+                # is instead of how recently we polled.
+                return None
             self._sr_by_ssrc[timing.ssrc] = timing
         if previous is None:
-            return None
-        if previous.ntp_raw == timing.ntp_raw:
             return None
         interval_s = timing.received_monotonic_s - previous.received_monotonic_s
         if interval_s <= 0.0:
@@ -671,6 +675,7 @@ class GstRtpTimingTracker:
                 "rtcp_sr_received_wall_s": sr_timing.received_wall_s,
             }
         )
+        sr_pc_offset_s = None
         if sr_timing.received_wall_s is not None:
             sr_pc_offset_s = rtcp_sender_report_pc_offset_s(
                 sr_ntp_unix_s=sr_timing.ntp_unix_s,
@@ -684,7 +689,15 @@ class GstRtpTimingTracker:
             # the camera clock is wrong, so keep the RTP->NTP mapping intact.
             metadata["rtcp_frame_ntp_unix_s"] = frame_ntp_s
             metadata["rtcp_frame_received_wall_s"] = received_wall_s
-            metadata["rtcp_frame_receive_delay_s"] = received_wall_s - frame_ntp_s
+            receive_delay_s = received_wall_s - frame_ntp_s
+            metadata["rtcp_frame_receive_delay_s"] = receive_delay_s
+            if sr_pc_offset_s is not None:
+                # receive_delay carries the camera's absolute clock error, so it
+                # grows without bound as that clock drifts. Adding the report's
+                # own PC offset cancels the sr_ntp term, leaving
+                #   (frame arrival - SR arrival) - (media time between them),
+                # a transport/encoder figure that stays flat under clock drift.
+                metadata["rtcp_frame_transport_delay_s"] = receive_delay_s + sr_pc_offset_s
         return metadata
 
     def _handle_new_manager(self, _source, manager) -> None:

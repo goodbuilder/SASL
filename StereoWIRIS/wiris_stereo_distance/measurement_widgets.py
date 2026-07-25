@@ -513,14 +513,18 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
 class ClockOffsetPoint:
     """One sampled RTCP timing state for both cameras.
 
-    ``transit_delay_ms`` is ``rtcp_frame_receive_delay_s`` scaled to
-    milliseconds; ``sr_age_s`` is ``rtcp_sr_age_s``, how stale the Sender
-    Report anchor those frame timestamps extrapolate from has become.
+    ``transit_delay_ms`` is ``rtcp_frame_receive_delay_s``, which carries the
+    camera's absolute clock error and so grows as that clock drifts.
+    ``transport_delay_ms`` is ``rtcp_frame_transport_delay_s``, the same figure
+    with the Sender Report's own PC offset added back so the clock term
+    cancels — that one should stay flat.
     """
 
     timestamp_s: float
     left_transit_delay_ms: float | None = None
     right_transit_delay_ms: float | None = None
+    left_transport_delay_ms: float | None = None
+    right_transport_delay_ms: float | None = None
     left_sr_age_s: float | None = None
     right_sr_age_s: float | None = None
 
@@ -535,9 +539,17 @@ class ClockOffsetHistoryPlot(QtWidgets.QWidget):
 
     PANELS = (
         (
-            "RTCP transit delay",
+            "transit delay (카메라 클럭 오차 포함)",
             "ms",
             (("left_transit_delay_ms", "L", SERIES_LEFT), ("right_transit_delay_ms", "R", SERIES_RIGHT)),
+        ),
+        (
+            "transport delay (클럭 보정됨)",
+            "ms",
+            (
+                ("left_transport_delay_ms", "L", SERIES_LEFT),
+                ("right_transport_delay_ms", "R", SERIES_RIGHT),
+            ),
         ),
         (
             "Sender Report anchor age",
@@ -552,9 +564,11 @@ class ClockOffsetHistoryPlot(QtWidgets.QWidget):
         self.setMinimumHeight(220)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
         self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
+        self.setMinimumHeight(300)
         self.setToolTip(
-            "좌/우 RTCP transit delay와 Sender Report 앵커 나이입니다.\n"
-            "앵커 나이가 계속 커지면 transit delay 증가는 실제 드리프트가 아니라 앵커 고착입니다."
+            "transit delay: 카메라 절대 시각 오차가 포함되어 클럭이 드리프트하면 계속 커집니다.\n"
+            "transport delay: 그 오차를 상쇄한 값으로, 실제 전송 지연만 남아 평평해야 합니다.\n"
+            "anchor age: Sender Report 앵커가 갱신되지 않고 고착되면 커집니다."
         )
 
     def add_point(self, point: ClockOffsetPoint) -> None:
