@@ -5955,10 +5955,13 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
         "실시간",
         "측정 품질",
     ]
-    assert [widget.save_tabs.tabText(index) for index in range(widget.save_tabs.count())] == [
-        "세션 저장",
-        "기록 샘플",
-    ]
+    assert not hasattr(widget, "save_tabs")
+    runtime_tab = widget.measurement_tabs.widget(widget.live_measurement_tab_index)
+    save_tab = widget.tabs.widget(widget.results_tab_index)
+    assert runtime_tab.isAncestorOf(widget.recording_status_label)
+    assert save_tab.isAncestorOf(widget.save_history_button)
+    assert save_tab.isAncestorOf(widget.session_summary_label)
+    assert save_tab.isAncestorOf(widget.recording_table_group)
     assert widget.advanced_tabs.tabText(widget.wiris_command_tab_index) == "WIRIS SDK"
     assert widget.advanced_tabs.tabText(widget.advanced_baseline_field_tab_index) == "Baseline 필드"
     assert widget.setup_tabs.tabText(widget.pixhawk_connection_tab_index) == "Pixhawk"
@@ -5966,8 +5969,6 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert widget.parameter_tabs.tabText(widget.intrinsic_parameters_tab_index) == "내부"
     assert widget.parameter_tabs.tabText(widget.extrinsic_parameters_tab_index) == "외부/기하"
     assert widget.parameter_tabs.tabText(widget.stereo_settings_tab_index) == "계산 설정"
-    assert widget.save_tabs.tabText(widget.save_session_tab_index) == "세션 저장"
-    assert widget.save_tabs.tabText(widget.recording_samples_tab_index) == "기록 샘플"
     assert widget.calibration_tabs.tabText(widget.checkerboard_calibration_tab_index) == "체커보드"
     assert widget.calibration_tabs.tabText(widget.zoom_intrinsics_tab_index) == "줌 내부 파라미터"
     assert widget.intrinsics_settings_group.isCheckable()

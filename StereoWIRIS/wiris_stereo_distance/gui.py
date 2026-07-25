@@ -2822,10 +2822,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         runtime_layout = QtWidgets.QVBoxLayout(runtime_tab)
         save_tab = QtWidgets.QWidget()
         save_layout = QtWidgets.QVBoxLayout(save_tab)
-        save_session_tab = QtWidgets.QWidget()
-        save_session_layout = QtWidgets.QVBoxLayout(save_session_tab)
-        recording_samples_tab = QtWidgets.QWidget()
-        recording_samples_layout = QtWidgets.QVBoxLayout(recording_samples_tab)
         advanced_tab = QtWidgets.QWidget()
         advanced_layout = QtWidgets.QVBoxLayout(advanced_tab)
         wiris_command_panel = QtWidgets.QWidget()
@@ -2858,8 +2854,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             stereo_layout,
             runtime_layout,
             save_layout,
-            save_session_layout,
-            recording_samples_layout,
             advanced_layout,
             wiris_command_layout,
             baseline_field_browser_layout,
@@ -2946,15 +2940,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.live_measurement_tab_index = measurement_tabs.indexOf(runtime_tab)
         self.triangulation_quality_tab_index = measurement_tabs.indexOf(triangulation_quality_tab)
         measurement_tabs.currentChanged.connect(lambda _index: self._handle_tab_changed(self.tabs.currentIndex()))
-
-        save_tabs = QtWidgets.QTabWidget()
-        save_tabs.setDocumentMode(True)
-        save_tabs.addTab(save_session_tab, "세션 저장")
-        save_tabs.addTab(recording_samples_tab, "기록 샘플")
-        save_layout.addWidget(save_tabs, 1)
-        self.save_tabs = save_tabs
-        self.save_session_tab_index = save_tabs.indexOf(save_session_tab)
-        self.recording_samples_tab_index = save_tabs.indexOf(recording_samples_tab)
 
         connection_tabs = QtWidgets.QTabWidget()
         connection_tabs.setDocumentMode(True)
@@ -4417,6 +4402,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             button.setFixedWidth(runtime_action_width)
         runtime_controls.addWidget(self.record_button, 0, 1)
         runtime_controls.addWidget(self.clear_history_button, 0, 2)
+        self.recording_status_label = QtWidgets.QLabel("세션 기록: 중지")
+        self.recording_status_label.setObjectName("statusStrip")
+        self.recording_status_label.setWordWrap(True)
+        self.recording_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.recording_status_label.setToolTip(
+            "세션 기록 진행 상태와 저장 결과입니다. 저장 실패 시 저장·분석 탭에서 재시도할 수 있습니다."
+        )
+        runtime_controls.addWidget(self.recording_status_label, 1, 0, 1, 3)
         for column in range(3):
             runtime_controls.setColumnStretch(column, 1)
         self.runtime_camera_settings_group = QtWidgets.QGroupBox("실시간 카메라 / NTP / Pair 상태")
@@ -4537,14 +4530,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.session_summary_label.setObjectName("statusStrip")
         self.session_summary_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.session_summary_label.setWordWrap(True)
-        self.recording_status_label = QtWidgets.QLabel("세션 기록: 중지")
-        self.recording_status_label.setObjectName("statusStrip")
         save_form.addWidget(self.save_history_button, 0, 0)
         save_form.addWidget(self.save_settings_button, 0, 1)
         save_form.addWidget(self.session_summary_label, 1, 0, 1, 2)
-        save_form.addWidget(self.recording_status_label, 2, 0, 1, 2)
-        save_session_layout.addWidget(save_group)
-        save_session_layout.addStretch(1)
+        save_layout.addWidget(save_group)
 
         self.recording_table_group = QtWidgets.QGroupBox("매칭 프레임쌍 실시간 보기")
         recording_table_layout = QtWidgets.QVBoxLayout(self.recording_table_group)
@@ -4571,7 +4560,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.recording_sample_detail.setMaximumBlockCount(300)
         self.recording_sample_detail.setPlaceholderText("테이블에서 샘플을 선택하면 전체 CSV 필드가 표시됩니다.")
         recording_table_layout.addWidget(self.recording_sample_detail, 1)
-        recording_samples_layout.addWidget(self.recording_table_group, 1)
+        save_layout.addWidget(self.recording_table_group, 1)
 
         self._build_clock_sync_tab(time_layout)
         self._polish_controls()
