@@ -218,6 +218,7 @@ def test_rtcp_sender_report_interval_logging_triggers_on_new_sr() -> None:
     message = tracker._register_sender_report(second)
     assert message == (
         "[RTCP] Sender Report 갱신: ssrc=1234, interval=2.50s, ntp=102.000000"
+        ", ntp_rate=0.800000, media_rate=0.000044"
     )
     tracker._emit_status(message)
     assert messages == [message]
@@ -294,6 +295,41 @@ def test_frame_transport_delay_cancels_camera_clock_offset() -> None:
     # ... while the compensated transport delay stays at the real value.
     for value in transport_delays:
         assert value == pytest.approx(transport_delay_s, abs=1e-6)
+
+
+def test_sender_report_clock_rates_separate_ntp_drift_from_media_clock_drift() -> None:
+    from wiris_stereo_distance.yolo_stream import sender_report_clock_rates
+
+    clock_rate_hz = 90_000
+
+    def report(pc_s: float, ntp_s: float, media_s: float) -> RtcpSenderReportTiming:
+        return RtcpSenderReportTiming(
+            ssrc=1,
+            ntp_raw=int(ntp_s * 1000),
+            ntp_unix_s=ntp_s,
+            rtp_timestamp=int(media_s * clock_rate_hz),
+            clock_rate_hz=clock_rate_hz,
+            received_monotonic_s=pc_s,
+            received_wall_s=pc_s,
+        )
+
+    first = report(0.0, 1_000.0, 0.0)
+
+    healthy = sender_report_clock_rates(first, report(5.0, 1_005.0, 5.0))
+    assert healthy["ntp_rate"] == pytest.approx(1.0)
+    assert healthy["media_rate"] == pytest.approx(1.0)
+
+    # Wall clock losing time inflates transit delay only.
+    ntp_drift = sender_report_clock_rates(first, report(5.0, 1_004.99, 5.0))
+    assert ntp_drift["ntp_rate"] < 1.0
+    assert ntp_drift["media_rate"] == pytest.approx(1.0)
+
+    # A slow RTP clock undercounts media time, which inflates transport delay.
+    media_drift = sender_report_clock_rates(first, report(5.0, 1_005.0, 4.99))
+    assert media_drift["ntp_rate"] == pytest.approx(1.0)
+    assert media_drift["media_rate"] < 1.0
+
+    assert sender_report_clock_rates(first, report(0.0, 1_000.0, 0.0)) is None
 
 
 def test_rtp_timing_tracker_does_not_attach_stale_timing_to_known_pts() -> None:

@@ -584,6 +584,35 @@ def rtcp_sender_report_is_pc_valid(
     return offset_s is not None and abs(offset_s) <= float(max_offset_s)
 
 
+def sender_report_clock_rates(
+    previous: RtcpSenderReportTiming,
+    current: RtcpSenderReportTiming,
+) -> dict[str, float] | None:
+    """Compare the camera's NTP and media clocks against the PC clock.
+
+    Both rates are "camera seconds advanced per PC second" between two Sender
+    Reports, so 1.0 means agreement. ``ntp_rate`` below 1.0 means the camera's
+    wall clock is losing time (the drift that inflates transit delay);
+    ``media_rate`` below 1.0 means its RTP clock ticks slower than the declared
+    rate, which inflates transport delay because the media time between two
+    reports is then undercounted.
+    """
+
+    pc_elapsed_s = current.received_monotonic_s - previous.received_monotonic_s
+    if pc_elapsed_s <= 0.0 or current.clock_rate_hz <= 0:
+        return None
+    ntp_elapsed_s = current.ntp_unix_s - previous.ntp_unix_s
+    media_ticks = rtp_timestamp_delta(current.rtp_timestamp, previous.rtp_timestamp)
+    media_elapsed_s = media_ticks / float(current.clock_rate_hz)
+    return {
+        "pc_elapsed_s": pc_elapsed_s,
+        "ntp_elapsed_s": ntp_elapsed_s,
+        "media_elapsed_s": media_elapsed_s,
+        "ntp_rate": ntp_elapsed_s / pc_elapsed_s,
+        "media_rate": media_elapsed_s / pc_elapsed_s,
+    }
+
+
 class GstRtpTimingTracker:
     def __init__(self, Gst, GstRtp, *, status_callback: Callable[[str], None] | None = None) -> None:
         self.Gst = Gst
@@ -596,6 +625,7 @@ class GstRtpTimingTracker:
         self._sr_by_ssrc: dict[int, RtcpSenderReportTiming] = {}
         self._manager = None
         self._last_rtcp_poll_s = 0.0
+        self._last_clock_rates: dict[str, float] | None = None
 
     def _emit_status(self, text: str) -> None:
         if self._status_callback is not None:
@@ -616,10 +646,18 @@ class GstRtpTimingTracker:
         interval_s = timing.received_monotonic_s - previous.received_monotonic_s
         if interval_s <= 0.0:
             return None
+        rates = sender_report_clock_rates(previous, timing)
+        self._last_clock_rates = rates
+        rate_text = ""
+        if rates is not None:
+            rate_text = (
+                f", ntp_rate={rates['ntp_rate']:.6f}"
+                f", media_rate={rates['media_rate']:.6f}"
+            )
         return (
             "[RTCP] Sender Report 갱신: "
             f"ssrc={timing.ssrc}, interval={interval_s:.2f}s, "
-            f"ntp={timing.ntp_unix_s:.6f}"
+            f"ntp={timing.ntp_unix_s:.6f}{rate_text}"
         )
 
     def attach(self, pipeline) -> None:
@@ -675,6 +713,9 @@ class GstRtpTimingTracker:
                 "rtcp_sr_received_wall_s": sr_timing.received_wall_s,
             }
         )
+        if self._last_clock_rates is not None:
+            metadata["rtcp_camera_ntp_rate"] = self._last_clock_rates["ntp_rate"]
+            metadata["rtcp_camera_media_rate"] = self._last_clock_rates["media_rate"]
         sr_pc_offset_s = None
         if sr_timing.received_wall_s is not None:
             sr_pc_offset_s = rtcp_sender_report_pc_offset_s(
