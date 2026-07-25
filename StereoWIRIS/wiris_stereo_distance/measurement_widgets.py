@@ -7,8 +7,8 @@ from math import isfinite
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from sasl_common.stereo_geometry import BASELINE_CENTER_FRD_FRAME, RayTriangulationResult
 from wiris_stereo_distance.theme import (
-    ACCENT,
     CHART_AXIS,
     CHART_BG,
     CHART_GRID,
@@ -47,57 +47,141 @@ class DistanceHistoryPoint:
     recording_elapsed_s: float | None = None
 
 
-class TriangulationQualityPlot(QtWidgets.QWidget):
+def triangulation_3d_scene_points(
+    triangulated: RayTriangulationResult | None,
+    *,
+    baseline_m: float | None,
+) -> dict[str, tuple[float, float, float]] | None:
+    """Camera and ray points for the 3D quality view, in baseline_center_frd metres.
+
+    Returns ``None`` when the result isn't expressed in ``baseline_center_frd``
+    (the only frame whose Right axis this function uses to place CAM_L/CAM_R) or
+    when any required point is missing, so callers can fall back to a
+    placeholder rather than plot a point in the wrong frame.
+    """
+
+    if triangulated is None or baseline_m is None or not isfinite(float(baseline_m)):
+        return None
+    if triangulated.output_frame != BASELINE_CENTER_FRD_FRAME:
+        return None
+    midpoint = triangulated.midpoint_m
+    point_on_left = triangulated.point_on_left_ray_m
+    point_on_right = triangulated.point_on_right_ray_m
+    detected_point = triangulated.point_m
+    if midpoint is None or point_on_left is None or point_on_right is None or detected_point is None:
+        return None
+    half_baseline_m = float(baseline_m) / 2.0
+    return {
+        "cam_l": (0.0, -half_baseline_m, 0.0),
+        "cam_r": (0.0, half_baseline_m, 0.0),
+        "point_on_left_ray": tuple(point_on_left),
+        "point_on_right_ray": tuple(point_on_right),
+        "midpoint": tuple(midpoint),
+        "detected_point": tuple(detected_point),
+    }
+
+
+def _frd_to_gl(point: tuple[float, float, float]) -> tuple[float, float, float]:
+    """Map (Forward, Right, Down) metres to a GL (X=Right, Y=Forward, Z=Up) scene."""
+
+    forward_m, right_m, down_m = point
+    return (right_m, forward_m, -down_m)
+
+
+class Triangulation3DView(QtWidgets.QWidget):
+    """Rotatable 3D view of CAM_L/CAM_R and the triangulated ray geometry.
+
+    Falls back to a static placeholder label if pyqtgraph's OpenGL view can't
+    be constructed (missing PyOpenGL, no usable GL context) so a broken driver
+    can't crash the rest of the GUI.
+    """
+
     def __init__(self) -> None:
         super().__init__()
         self.setMinimumHeight(260)
         self.state: dict[str, object] = {}
+        self._is_tab_visible = False
+        self._dirty = False
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._summary_label = QtWidgets.QLabel("측정 ray / gap")
+        self._summary_label.setStyleSheet(f"color: {CHART_TEXT}; background: {CHART_BG}; padding: 4px 6px;")
+        layout.addWidget(self._summary_label)
+        self._placeholder_label = QtWidgets.QLabel("3D ray triangulation 대기 중")
+        self._placeholder_label.setAlignment(QtCore.Qt.AlignCenter)
+        self._placeholder_label.setStyleSheet(f"color: {CHART_MUTED}; background: {CHART_BG};")
+        layout.addWidget(self._placeholder_label, 1)
+        self._gl_view = self._build_gl_view()
+        if self._gl_view is not None:
+            layout.addWidget(self._gl_view, 1)
+            self._gl_view.hide()
+
+    def _build_gl_view(self):
+        try:
+            import numpy as np
+            import pyqtgraph.opengl as gl
+        except Exception:
+            return None
+        try:
+            view = gl.GLViewWidget()
+            view.setBackgroundColor(QtGui.QColor(CHART_BG))
+            view.setCameraPosition(distance=6.0, elevation=20.0, azimuth=-60.0)
+            grid = gl.GLGridItem()
+            grid.setSize(10, 10)
+            grid.setSpacing(1, 1)
+            view.addItem(grid)
+            self._cam_scatter = gl.GLScatterPlotItem(size=14.0)
+            self._point_scatter = gl.GLScatterPlotItem(size=16.0)
+            self._left_ray = gl.GLLinePlotItem(width=2.0, antialias=True)
+            self._right_ray = gl.GLLinePlotItem(width=2.0, antialias=True)
+            self._gap_line = gl.GLLinePlotItem(width=1.0, antialias=True)
+            for item in (self._left_ray, self._right_ray, self._gap_line, self._cam_scatter, self._point_scatter):
+                view.addItem(item)
+            self._np = np
+        except Exception:
+            return None
+        return view
+
+    def set_tab_visible(self, visible: bool) -> None:
+        self._is_tab_visible = visible
+        if visible and self._dirty:
+            self._repaint()
 
     def set_quality(self, state: dict[str, object] | None) -> None:
         self.state = dict(state or {})
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
-        rect = self.rect().adjusted(12, 12, -12, -12)
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_TEXT), 1))
-        painter.drawText(rect.x(), rect.y() + 16, "측정 ray / gap")
-        content = rect.adjusted(0, 30, 0, 0)
-        if not self.state:
-            painter.setPen(QtGui.QColor(CHART_MUTED))
-            painter.drawText(content, QtCore.Qt.AlignCenter, "3D ray triangulation 대기 중")
-            return
-
-        left_origin = QtCore.QPointF(content.left() + 34, content.bottom() - 42)
-        right_origin = QtCore.QPointF(content.left() + 34, content.top() + 42)
-        mid_x = content.left() + content.width() * 0.68
-        left_end = QtCore.QPointF(mid_x, content.center().y() + 12)
-        right_end = QtCore.QPointF(mid_x, content.center().y() - 12)
-        midpoint = QtCore.QPointF(mid_x + 28, content.center().y())
-
-        painter.setPen(QtGui.QPen(QtGui.QColor(ACCENT), 3))
-        painter.drawLine(left_origin, left_end)
-        painter.setPen(QtGui.QPen(QtGui.QColor(SERIES_Z), 3))
-        painter.drawLine(right_origin, right_end)
-        painter.setPen(QtGui.QPen(QtGui.QColor(SERIES_HIGHLIGHT), 2, QtCore.Qt.DashLine))
-        painter.drawLine(left_end, right_end)
-        painter.setBrush(QtGui.QColor(SERIES_HIGHLIGHT))
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.drawEllipse(midpoint, 5, 5)
-
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(left_origin + QtCore.QPointF(-12, 22), "Left ray")
-        painter.drawText(right_origin + QtCore.QPointF(-12, -10), "Right ray")
-        painter.drawText(midpoint + QtCore.QPointF(10, 4), "midpoint")
         summary = (
             f"gap={self._fmt(self.state.get('closest_gap_m'))} m   "
             f"distance={self._fmt(self.state.get('distance_m'))} m   "
             f"{self.state.get('method', '')}"
         )
-        painter.drawText(content.adjusted(0, 0, 0, -4), QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom, summary)
+        self._summary_label.setText(summary if self.state else "측정 ray / gap")
+        has_scene = bool(self.state.get("scene")) and self._gl_view is not None
+        self._placeholder_label.setVisible(not has_scene)
+        if self._gl_view is not None:
+            self._gl_view.setVisible(has_scene)
+        self._dirty = True
+        if self._is_tab_visible:
+            self._repaint()
+
+    def _repaint(self) -> None:
+        self._dirty = False
+        scene = self.state.get("scene")
+        if not scene or self._gl_view is None:
+            return
+        np = self._np
+        cam_l = np.array(_frd_to_gl(scene["cam_l"]))
+        cam_r = np.array(_frd_to_gl(scene["cam_r"]))
+        left_pt = np.array(_frd_to_gl(scene["point_on_left_ray"]))
+        right_pt = np.array(_frd_to_gl(scene["point_on_right_ray"]))
+        detected_pt = np.array(_frd_to_gl(scene["detected_point"]))
+        self._cam_scatter.setData(
+            pos=np.array([cam_l, cam_r]),
+            color=np.array([[0.3, 0.7, 1.0, 1.0], [1.0, 0.55, 0.2, 1.0]]),
+        )
+        self._point_scatter.setData(pos=np.array([detected_pt]), color=np.array([[1.0, 0.25, 0.3, 1.0]]))
+        self._left_ray.setData(pos=np.array([cam_l, left_pt]), color=(0.3, 0.7, 1.0, 1.0))
+        self._right_ray.setData(pos=np.array([cam_r, right_pt]), color=(1.0, 0.55, 0.2, 1.0))
+        self._gap_line.setData(pos=np.array([left_pt, right_pt]), color=(1.0, 1.0, 1.0, 0.5))
 
     def _fmt(self, value: object) -> str:
         try:

@@ -7980,6 +7980,81 @@ def test_distance_history_plot_left_click_selects_and_right_click_deletes_point(
     _ = app
 
 
+def test_triangulation_3d_scene_points_places_cameras_symmetrically_on_right_axis() -> None:
+    from sasl_common.stereo_geometry import BASELINE_CENTER_FRD_FRAME, RayTriangulationResult
+    from wiris_stereo_distance.measurement_widgets import triangulation_3d_scene_points
+
+    result = RayTriangulationResult(
+        point_left_rdf_m=(0.1, 0.2, 5.0),
+        range_m=5.0,
+        closest_gap_m=0.01,
+        left_depth_m=5.0,
+        right_depth_m=5.1,
+        ray_angle_deg=1.2,
+        baseline_m=0.3,
+        output_frame=BASELINE_CENTER_FRD_FRAME,
+        output_point_m=(5.0, 0.05, 0.1),
+        output_point_on_left_ray_m=(4.98, 0.0, 0.1),
+        output_point_on_right_ray_m=(5.02, 0.1, 0.1),
+        output_midpoint_m=(5.0, 0.05, 0.1),
+    )
+
+    scene = triangulation_3d_scene_points(result, baseline_m=0.3)
+
+    assert scene is not None
+    assert scene["cam_l"] == (0.0, -0.15, 0.0)
+    assert scene["cam_r"] == (0.0, 0.15, 0.0)
+    assert scene["point_on_left_ray"] == (4.98, 0.0, 0.1)
+    assert scene["point_on_right_ray"] == (5.02, 0.1, 0.1)
+    assert scene["detected_point"] == (5.0, 0.05, 0.1)
+
+
+def test_triangulation_3d_scene_points_returns_none_outside_baseline_center_frd() -> None:
+    from sasl_common.stereo_geometry import LEFT_CAMERA_RDF_FRAME, RayTriangulationResult
+    from wiris_stereo_distance.measurement_widgets import triangulation_3d_scene_points
+
+    result = RayTriangulationResult(
+        point_left_rdf_m=(0.1, 0.2, 5.0),
+        range_m=5.0,
+        closest_gap_m=0.01,
+        left_depth_m=5.0,
+        right_depth_m=5.1,
+        ray_angle_deg=1.2,
+        baseline_m=0.3,
+        output_frame=LEFT_CAMERA_RDF_FRAME,
+    )
+
+    assert triangulation_3d_scene_points(result, baseline_m=0.3) is None
+    assert triangulation_3d_scene_points(None, baseline_m=0.3) is None
+
+
+def test_triangulation_3d_view_falls_back_to_placeholder_without_gl(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.measurement_widgets as measurement_widgets_module
+
+    monkeypatch.setattr(measurement_widgets_module.Triangulation3DView, "_build_gl_view", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = measurement_widgets_module.Triangulation3DView()
+    widget.show()
+    app.processEvents()
+
+    assert widget._gl_view is None
+    widget.set_quality(
+        {
+            "closest_gap_m": 0.01,
+            "distance_m": 5.0,
+            "method": "test",
+            "scene": {"cam_l": (0.0, -0.15, 0.0)},
+        }
+    )
+    assert widget._placeholder_label.isVisible()
+    widget.set_quality(None)
+    assert widget._placeholder_label.isVisible()
+    widget.deleteLater()
+    _ = app
+
+
 def test_distance_history_plot_tracks_frd_and_range_panels(monkeypatch) -> None:
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
 

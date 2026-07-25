@@ -58,7 +58,8 @@ from wiris_stereo_distance.coordinate_contract import (
 from wiris_stereo_distance.measurement_widgets import (
     DistanceHistoryPlot,
     DistanceHistoryPoint,
-    TriangulationQualityPlot,
+    Triangulation3DView,
+    triangulation_3d_scene_points,
 )
 from wiris_stereo_distance.measurement_attempt import (
     AttitudeSnapshot,
@@ -2931,6 +2932,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.measurement_tabs = measurement_tabs
         self.live_measurement_tab_index = measurement_tabs.indexOf(runtime_tab)
         self.triangulation_quality_tab_index = measurement_tabs.indexOf(triangulation_quality_tab)
+        measurement_tabs.currentChanged.connect(lambda _index: self._handle_tab_changed(self.tabs.currentIndex()))
 
         save_tabs = QtWidgets.QTabWidget()
         save_tabs.setDocumentMode(True)
@@ -4495,7 +4497,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         quality_summary_form.addWidget(self.triangulation_quality_attitude_label, 2, 0, 1, 4)
         triangulation_quality_layout.addWidget(quality_summary_group)
 
-        self.triangulation_quality_plot = TriangulationQualityPlot()
+        self.triangulation_quality_plot = Triangulation3DView()
         triangulation_quality_layout.addWidget(self.triangulation_quality_plot, 1)
         point_group = QtWidgets.QGroupBox("3D point")
         point_layout = QtWidgets.QGridLayout(point_group)
@@ -10565,6 +10567,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.calibration_preview_times["left"] = 0.0
             self.calibration_preview_times["right"] = 0.0
             self._refresh_all_calibration_previews()
+        if hasattr(self, "triangulation_quality_plot"):
+            self.triangulation_quality_plot.set_tab_visible(self._is_triangulation_quality_visible())
+
+    def _is_triangulation_quality_visible(self) -> bool:
+        return (
+            self.tabs.currentIndex() == self.depth_tab_index
+            and hasattr(self, "measurement_tabs")
+            and self.measurement_tabs.currentIndex() == self.triangulation_quality_tab_index
+        )
 
     def _is_checkerboard_calibration_visible(self) -> bool:
         return (
@@ -15973,6 +15984,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "closest_gap_m": triangulated.closest_gap_m,
                 "distance_m": display_distance_m,
                 "method": method_text,
+                "scene": triangulation_3d_scene_points(triangulated, baseline_m=display_baseline_m),
             }
         )
 
@@ -16828,6 +16840,30 @@ class IntegratedWirisPixhawkConsole(QtWidgets.QMainWindow):
             return
         super().closeEvent(event)
 
+
+def _configure_gl_surface_format() -> None:
+    """Request a Compatibility-profile GL 2.1 context before QApplication exists.
+
+    pyqtgraph's opengl.GLViewWidget misparses some Mesa version strings (e.g.
+    ``4.6 (Compatibility Profile) Mesa ...``) and refuses to initialize unless
+    the default surface format is pinned explicitly first. Skipped entirely if
+    PyOpenGL isn't installed, so this stays a no-op when the 3D quality view
+    will fall back to its placeholder anyway.
+    """
+
+    try:
+        import OpenGL  # noqa: F401
+    except Exception:
+        return
+    try:
+        surface_format = QtGui.QSurfaceFormat()
+        surface_format.setVersion(2, 1)
+        surface_format.setProfile(QtGui.QSurfaceFormat.CompatibilityProfile)
+        QtGui.QSurfaceFormat.setDefaultFormat(surface_format)
+    except Exception:
+        pass
+
+
 def main() -> int:
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     try:
@@ -16848,6 +16884,7 @@ def main() -> int:
     wiris_only = "--wiris-only" in sys.argv
     if wiris_only:
         sys.argv.remove("--wiris-only")
+    _configure_gl_surface_format()
     app = QtWidgets.QApplication(sys.argv)
     if wiris_only:
         window = WirisStereoDistanceGui(auto_start=auto_start, auto_start_pixhawk=auto_start_pixhawk)

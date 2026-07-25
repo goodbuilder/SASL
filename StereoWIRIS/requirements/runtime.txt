@@ -9,3 +9,7 @@ numpy<2
 opencv-python<4.10
 PyYAML
 XlsxWriter
+# 3D triangulation-quality view (measurement_widgets.Triangulation3DView). The
+# widget falls back to a placeholder label if either import fails at runtime.
+pyqtgraph
+PyOpenGL
