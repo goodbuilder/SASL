@@ -4,7 +4,42 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-DRONE_MISSION_CONFIG="${DRONE_MISSION_CONFIG:-$ROOT_DIR/config/drone_mission.env}"
+resolve_executable() {
+  local candidate resolved
+  for candidate in "$@"; do
+    [[ -n "$candidate" ]] || continue
+    if [[ "$candidate" == */* ]]; then
+      if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      continue
+    fi
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_pymavlink_python() {
+  local candidate executable
+  for candidate in "$@"; do
+    executable="$(resolve_executable "$candidate" || true)"
+    [[ -n "$executable" ]] || continue
+    if "$executable" -c 'import pymavlink' >/dev/null 2>&1; then
+      printf '%s\n' "$executable"
+      return 0
+    fi
+  done
+  return 1
+}
+
+MISSION_PYTHON="${MISSION_PYTHON:-}"
+
+SIM_CONFIG="${SIM_CONFIG:-$ROOT_DIR/config/simulation.env}"
 SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
 
 DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV="${DRONE_TAKEOFF_ALTITUDE_M+x}"; DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE="${DRONE_TAKEOFF_ALTITUDE_M:-}"
@@ -18,10 +53,14 @@ DRONE_FINAL_HOVER_S_FROM_ENV="${DRONE_FINAL_HOVER_S+x}"; DRONE_FINAL_HOVER_S_ENV
 DRONE_LAND_TIMEOUT_S_FROM_ENV="${DRONE_LAND_TIMEOUT_S+x}"; DRONE_LAND_TIMEOUT_S_ENV_VALUE="${DRONE_LAND_TIMEOUT_S:-}"
 DRONE_SETPOINT_HZ_FROM_ENV="${DRONE_SETPOINT_HZ+x}"; DRONE_SETPOINT_HZ_ENV_VALUE="${DRONE_SETPOINT_HZ:-}"
 
-if [[ -f "$DRONE_MISSION_CONFIG" ]]; then
+if [[ ! -f "$SIM_CONFIG" ]]; then
+  echo "error: SIM_CONFIG not found: $SIM_CONFIG" >&2
+  exit 2
+fi
+if [[ -f "$SIM_CONFIG" ]]; then
   set -a
   # shellcheck disable=SC1090
-  source "$DRONE_MISSION_CONFIG"
+  source "$SIM_CONFIG"
   set +a
 fi
 [[ -n "$DRONE_TAKEOFF_ALTITUDE_M_FROM_ENV" ]] && DRONE_TAKEOFF_ALTITUDE_M="$DRONE_TAKEOFF_ALTITUDE_M_ENV_VALUE"
@@ -184,4 +223,18 @@ if [[ -f "$ROOT_DIR/install/setup.bash" ]]; then
 fi
 set -u
 
-exec python3 "$ROOT_DIR/scripts/px4_auto_mission.py" "${mission_args[@]}"
+MISSION_PYTHON="$(resolve_pymavlink_python \
+  "$MISSION_PYTHON" \
+  "${PYTHON_EXECUTABLE:-}" \
+  "$ROOT_DIR/.venv/bin/python" \
+  "$ROOT_DIR/.venv-px4-local/bin/python" \
+  "$ROOT_DIR/.venv-px4-v1.17.0/bin/python" \
+  python3 || true
+)"
+if [[ -z "$MISSION_PYTHON" ]]; then
+  echo "error: px4_auto_mission.py requires a Python interpreter with pymavlink." >&2
+  echo "Set MISSION_PYTHON or install pymavlink in Simulation/.venv." >&2
+  exit 2
+fi
+
+exec "$MISSION_PYTHON" "$ROOT_DIR/scripts/px4_auto_mission.py" "${mission_args[@]}"

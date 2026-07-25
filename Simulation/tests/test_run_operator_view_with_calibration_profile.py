@@ -35,13 +35,13 @@ class RunOperatorViewWithCalibrationProfileTests(unittest.TestCase):
             os.utime(older, (1000, 1000))
             os.utime(newer, (2000, 2000))
 
-            result = self.run_script("--results-root", str(root), "--print-only", "--", "--no-px4")
+            result = self.run_script("--results-root", str(root), "--print-only")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"Runtime profile: {newer}", result.stdout)
         self.assertIn("--bbox-adjustment", result.stdout)
         self.assertIn(str(newer), result.stdout)
-        self.assertIn("--no-px4", result.stdout)
+        self.assertNotIn("--no-px4", result.stdout)
 
     def test_print_only_accepts_deployment_package_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -67,12 +67,11 @@ class RunOperatorViewWithCalibrationProfileTests(unittest.TestCase):
                 "--print-only",
                 "--",
                 "--headless",
-                "--no-px4",
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--headless", result.stdout)
-        self.assertIn("--no-px4", result.stdout)
+        self.assertNotIn("--no-px4", result.stdout)
 
     def test_print_only_accepts_observation_fusion_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -189,8 +188,6 @@ class RunOperatorViewWithCalibrationProfileTests(unittest.TestCase):
                 "--deployment-label",
                 "runtime_observation_stress",
                 "--print-only",
-                "--",
-                "--no-px4",
             )
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -199,7 +196,7 @@ class RunOperatorViewWithCalibrationProfileTests(unittest.TestCase):
         self.assertIn(f"Runtime profile: {profile}", result.stdout)
         self.assertIn(f"Deployment package: {package_dir}", result.stdout)
         self.assertIn("--bbox-adjustment", result.stdout)
-        self.assertIn("--no-px4", result.stdout)
+        self.assertNotIn("--no-px4", result.stdout)
 
 
 if __name__ == "__main__":

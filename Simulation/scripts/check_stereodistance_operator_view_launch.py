@@ -201,7 +201,7 @@ def run_print_only(
                 str(node_disparity_residual_feature_min_samples),
             ]
         )
-    command.extend(["--print-only", "--", "--no-px4", "yolo_target_hz:=0.0"])
+    command.extend(["--print-only", "--", "yolo_target_hz:=0.0"])
     return subprocess.run(
         command,
         cwd=ROOT_DIR,
@@ -621,7 +621,7 @@ def check_operator_view_launch(
                 failures,
                 "operator_wrapper:node_residual_feature_min_samples_arg",
             )
-    require("--no-px4" in result.stdout, failures, "operator_wrapper:dry_run_arg")
+    require("--no-px4" not in result.stdout, failures, "operator_wrapper:px4_opt_out_absent")
     require("yolo_target_hz:=0.0" in result.stdout, failures, "operator_wrapper:yolo_disabled_arg")
 
     passed = not failures

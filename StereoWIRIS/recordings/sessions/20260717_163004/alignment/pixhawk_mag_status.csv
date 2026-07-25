@@ -1,0 +1,26 @@
+session_id,session_started_unix_s,recording_elapsed_s,recorded_app_timestamp_s,pixhawk_side,pixhawk_label,cal_mag_slot,device_id,device_type,interface,is_rm3100,priority,enabled,expected_selected,actual_selected,expected_selected_device_id,actual_selected_device_id,is_actual_rm3100,armed,status,warning_text
+20260717_163004,1784273404.372161,53.419818,1407366.278554,left,Pixhawk 1,CAL_MAG0,4395041,Board internal BMM150,Pixhawk internal I2C,false,0,false,false,false,396809,,false,false,Disabled,"DroneCAN is not configured for sensor auto config.
+DroneCAN magnetometer subscription is disabled.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,left,Pixhawk 1,CAL_MAG1,396809,GPS1 integrated IST8310 compass,GPS1 I2C compass,false,100,true,true,false,396809,,false,false,Expected selected,"DroneCAN is not configured for sensor auto config.
+DroneCAN magnetometer subscription is disabled.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,left,Pixhawk 1,CAL_MAG2,8944899,RM3100 #1 / UAVCAN node 0x7D,DroneCAN,true,0,false,false,false,396809,,false,false,Disabled,"DroneCAN is not configured for sensor auto config.
+DroneCAN magnetometer subscription is disabled.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,left,Pixhawk 1,CAL_MAG3,8944387,RM3100 #2 / UAVCAN node 0x7B,DroneCAN,true,0,false,false,false,396809,,false,false,Disabled,"DroneCAN is not configured for sensor auto config.
+DroneCAN magnetometer subscription is disabled.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,left,Pixhawk 1,CAL_MAG4,,N/A,N/A,false,,false,false,false,396809,,false,false,N/A,"DroneCAN is not configured for sensor auto config.
+DroneCAN magnetometer subscription is disabled.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,right,Pixhawk 2,CAL_MAG0,4395041,Board internal BMM150,Pixhawk internal I2C,false,0,false,false,false,396809,,false,false,Disabled,"Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,right,Pixhawk 2,CAL_MAG1,396809,GPS1 integrated IST8310 compass,GPS1 I2C compass,false,75,true,true,false,396809,,false,false,Expected selected,"Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,right,Pixhawk 2,CAL_MAG2,396817,GPS2 integrated IST8310 compass,GPS2 I2C compass,false,75,true,false,false,396809,,false,false,Enabled non-RM3100,"Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,right,Pixhawk 2,CAL_MAG3,8944899,RM3100 #1 / UAVCAN node 0x7D,DroneCAN,true,75,true,false,false,396809,,false,false,RM3100 candidate,"Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.
+Actual selected MAG ID not available via current ROS2 interface."
+20260717_163004,1784273404.372161,53.419818,1407366.278554,right,Pixhawk 2,CAL_MAG4,,N/A,N/A,false,,false,false,false,396809,,false,false,N/A,"Second RM3100 is not registered in CAL_MAG. Run Compass Calibration again with both RM3100 connected.
+Actual selected MAG ID not available via current ROS2 interface."

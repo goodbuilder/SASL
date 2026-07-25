@@ -493,7 +493,7 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
     optional_candidates = [row for row in candidates if row.get("checker_included_by_default") is False]
 
     assert manifest["hardware_validated_complete_all_axis"] is False
-    assert len(default_candidates) == 23
+    assert len(default_candidates) == 26
     assert len(optional_candidates) == 1
     assert {row["id"] for row in default_candidates} == {
         "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
@@ -517,6 +517,9 @@ def test_promoted_manifest_declares_checker_candidate_sets() -> None:
         "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
         "multiburst_disparity_residual_aggregate_best",
         "scenario_labeled_disparity_residual_profile_catalog_exp281",
+        "multiburst_b7x3_disparity_ray_scale_residual_all_scenario_fresh50",
+        "scenario_pooled_disparity_residual_catalog_exp289",
+        "universal_product_disparity_forward_residual_exp292",
         "fresh_common_mode_b7x3_aggregate_best",
         "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
     }

@@ -510,6 +510,7 @@ class CheckStereoDistanceOperatorViewLaunchTests(unittest.TestCase):
         self.assertEqual(result["resolved_runtime_profile"], str((package / "active_runtime_profile.json").resolve()))
         self.assertEqual(result["resolved_runtime_profile_sha256"], expected_sha)
         self.assertIn("--bbox-adjustment", result["operator_command_stdout"])
+        self.assertNotIn("--no-px4", result["operator_command_stdout"])
 
     def test_candidate_package_dir_runs_candidate_package_check_and_resolves_command(self) -> None:
         module = load_module("check_stereodistance_operator_view_launch_under_test_candidate_package", SCRIPT_PATH)

@@ -58,7 +58,7 @@ The working handoff model is:
 3. Recreate local ROS build outputs from tracked scripts instead of
    copying machine-local workspaces.
 
-For the PX4 ROS message overlay used by `StereoDistance`, run:
+For the PX4 ROS message overlay used by `StereoWIRIS`, run:
 
 ```bash
 cd SASL
@@ -71,8 +71,13 @@ The source clone and generated overlay are intentionally not tracked by
 this repository; they are reproducible local state. The script keeps the
 ROS build/log cache under `~/.cache/sasl_ros_workspace/...` so ROS message
 generation does not depend on the checkout path being ASCII-only.
-`StereoDistance/run.sh` automatically sources
-`workspace/main/install/setup.bash` when it exists.
+`StereoWIRIS/run.sh` and `Simulation/run_operator_view.sh` consume this
+single canonical overlay. The Simulation runner validates both the pinned
+source revision and the bootstrap-generated overlay commit stamp before
+starting; StereoWIRIS applies the same validation. Both print the bootstrap
+command when the dependency is missing or stale. Do not create a second
+`Simulation/px4_msgs` or `px4_msgs_ws` checkout; those machine-local fallback
+workspaces are not runtime inputs.
 
 If a future task requires PX4 firmware/DDS export changes, keep the
 patch, submodule, fork reference, or setup script inside `SASL` so the

@@ -3,13 +3,16 @@ from __future__ import annotations
 import csv
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT_DIR.parent
 SCRIPT_PATH = ROOT_DIR / "scripts" / "export_robustness_scenario_catalog_selector.py"
 SELECT_SCRIPT_PATH = ROOT_DIR / "scripts" / "select_stereodistance_runtime_profile_by_label.py"
 
@@ -207,15 +210,20 @@ class ExportRobustnessScenarioCatalogSelectorTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            summary = module.export_selector_package(
-                robustness_dir=robustness,
-                output_dir=output_dir,
-                baseline_scenario="nominal",
-                with_deployment_frontier=True,
-                with_operator_launch_checks=True,
-                with_readiness_check=True,
-                readme=readme,
+            inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+            absolute_pythonpath = os.pathsep.join(
+                value for value in (str(REPOSITORY_ROOT), inherited_pythonpath) if value
             )
+            with patch.dict(os.environ, {"PYTHONPATH": absolute_pythonpath}):
+                summary = module.export_selector_package(
+                    robustness_dir=robustness,
+                    output_dir=output_dir,
+                    baseline_scenario="nominal",
+                    with_deployment_frontier=True,
+                    with_operator_launch_checks=True,
+                    with_readiness_check=True,
+                    readme=readme,
+                )
             frontier_json = output_dir / "runtime_deployment_frontier" / "runtime_deployment_frontier.json"
             launch_json = output_dir / "operator_view_launch_checks" / "operator_view_launch_checks.json"
             readiness_json = output_dir / "non_alias_selector_deployment_readiness.json"
@@ -231,6 +239,7 @@ class ExportRobustnessScenarioCatalogSelectorTests(unittest.TestCase):
             self.assertTrue(frontier_json.is_file())
             self.assertTrue(launch_json.is_file())
             self.assertTrue(readiness_json.is_file())
+            self.assertEqual(os.environ.get("PYTHONPATH", ""), inherited_pythonpath)
 
 
 if __name__ == "__main__":

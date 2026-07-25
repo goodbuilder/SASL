@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -101,27 +102,82 @@ class RecorderPanelTruthSourceTests(unittest.TestCase):
         self.assertNotIn("--sim-truth-topic", cmd)
         self.assertEqual(cmd[cmd.index("--truth-source") + 1], "gps_position")
 
-    def test_operator_command_is_unchanged_for_lite_recording(self) -> None:
+    def test_recording_buttons_keep_csv_mp4_and_debug_presets_mapped_to_recorder_modes(self) -> None:
         module = load_panel_module()
 
-        cmd = module.build_operator_recorder_command(
-            python_executable="python3",
-            mode="lite",
-            output_dir="/tmp/operator_lite",
+        self.assertEqual(module.PRIMARY_RECORD_BUTTON_TEXT, "Save CSV")
+        self.assertEqual(
+            module.RECORDING_MODE_BUTTONS,
+            (
+                ("lite", "Save CSV"),
+                ("full", "Save MP4"),
+                ("debug", "Save Debug"),
+            ),
         )
 
-        self.assertEqual(
-            cmd,
-            [
-                "python3",
-                "-m",
-                "stereo_ground_sim.operator_recorder",
-                "--mode",
-                "lite",
-                "--output-dir",
-                "/tmp/operator_lite",
-            ],
-        )
+        for mode, _button_text in module.RECORDING_MODE_BUTTONS:
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    module.build_operator_recorder_command(
+                        python_executable="python3",
+                        mode=mode,
+                        output_dir=f"/tmp/operator_{mode}",
+                    ),
+                    [
+                        "python3",
+                        "-m",
+                        "stereo_ground_sim.operator_recorder",
+                        "--mode",
+                        mode,
+                        "--output-dir",
+                        f"/tmp/operator_{mode}",
+                    ],
+                )
+
+    def test_csv_tail_preview_keeps_header_and_latest_persisted_rows(self) -> None:
+        module = load_panel_module()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "telemetry.csv"
+            path.write_text("time_sec,value\n0.0,first\n0.1,second\n0.2,third\n", encoding="utf-8")
+
+            preview = module.read_recent_csv_lines(path, data_row_count=2)
+
+        self.assertEqual(preview.splitlines(), ["time_sec,value", "0.1,second", "0.2,third"])
+
+    def test_csv_tail_preview_discards_an_incomplete_trailing_row(self) -> None:
+        module = load_panel_module()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "telemetry.csv"
+            path.write_text(
+                "time_sec,value\n0.0,first\n0.1,second\n0.2,partial",
+                encoding="utf-8",
+            )
+
+            preview = module.read_recent_csv_lines(path, data_row_count=3)
+
+        self.assertEqual(preview.splitlines(), ["time_sec,value", "0.0,first", "0.1,second"])
+
+    def test_analysis_export_preserves_empty_values_and_keeps_the_raw_csv_unchanged(self) -> None:
+        module = load_panel_module()
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "telemetry.csv"
+            output = Path(directory) / "analysis.csv"
+            source.write_text(
+                "time_sec,raw_range_m,left_x1,right_x1,raw_gps_baseline_forward_m,"
+                "global_position_baseline_forward_m,raw_minus_global_baseline_delta_m,extra\n"
+                "1.0,2000.0,10,20,1999.0,1998.0,1.0,retain-only-in-raw\n"
+                "2.0,,,,,,,\n",
+                encoding="utf-8",
+            )
+            raw_before = source.read_text(encoding="utf-8")
+
+            module.export_analysis_csv(source, output)
+
+            self.assertEqual(source.read_text(encoding="utf-8"), raw_before)
+            lines = output.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(lines[0], ",".join(module.ANALYSIS_CSV_FIELDS))
+            self.assertEqual(lines[1], "1.0,2000.0,10,20,1999.0,1998.0,1.0")
+            self.assertEqual(lines[2], "2.0,,,,,,")
 
 
 if __name__ == "__main__":

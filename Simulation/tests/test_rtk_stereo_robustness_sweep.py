@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+REPOSITORY_ROOT = ROOT_DIR.parent
 
 
 def load_sweep_module():
@@ -136,11 +138,16 @@ class RtkStereoRobustnessSweepTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            summary = module.export_runtime_label_selector_package(
-                output_dir=output_dir,
-                scenario_catalog_summary=scenario_catalog_summary,
-                baseline_scenario="nominal",
+            inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+            absolute_pythonpath = os.pathsep.join(
+                value for value in (str(REPOSITORY_ROOT), inherited_pythonpath) if value
             )
+            with patch.dict(os.environ, {"PYTHONPATH": absolute_pythonpath}):
+                summary = module.export_runtime_label_selector_package(
+                    output_dir=output_dir,
+                    scenario_catalog_summary=scenario_catalog_summary,
+                    baseline_scenario="nominal",
+                )
 
             self.assertEqual(summary["status"], "PASS")
             self.assertEqual(summary["selector_export_status"], "PASS")
@@ -148,6 +155,7 @@ class RtkStereoRobustnessSweepTests(unittest.TestCase):
             self.assertEqual(summary["profile_count"], 2)
             self.assertFalse(summary["runtime_truth_used"])
             self.assertTrue(Path(summary["selector_json"]).is_file())
+            self.assertEqual(os.environ.get("PYTHONPATH", ""), inherited_pythonpath)
 
     def test_custom_scenario_config_extends_scenario_registry(self) -> None:
         module = load_sweep_module()

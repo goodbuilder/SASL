@@ -1,6 +1,6 @@
 # Experiment Gates
 
-This document defines gates for StereoDistance correction experiments. Use it
+This document defines gates for StereoCAM correction experiments. Use it
 together with `docs/experiment-workflow.md`.
 
 ## Current Scenario Model
@@ -24,7 +24,7 @@ The historical primary scenario is `uam_far_25m_8x`:
 - zoom: WIRIS visible 8x, HFOV `0.154997710698 rad`
 - right camera attitude error: roll/pitch/yaw each increased by `0.1 deg`
 - internal correction axes: RDF, meaning Right, Down, Forward
-- legacy StereoDistance position topic order: FRD+range, meaning Forward,
+- public StereoCAM position topic order: FRD+range, meaning Forward,
   Right, Down, Range
 - metric: `raw RMSE - corrected RMSE` in meters
 - positive delta means corrected is better than raw
@@ -63,7 +63,7 @@ Required:
 - calibration-time truth use is separated from measurement-time runtime inputs
 - runtime correction does not require PX4/RTK truth, true disparity, or true
   image feature location
-- PX4 local NED, internal stereo-center RDF, and any public StereoDistance
+- PX4 local NED, internal stereo-center RDF, and any public StereoCAM
   FRD+range topic contracts are explicit
 - validation compares `corrected_rdf` against `truth_rdf` in
   `stereo_center_RDF`; `truth_rdf` is produced by an explicit
@@ -137,7 +137,7 @@ Required:
   target-range behavior, RDF axis behavior, runtime feasibility, and stability
 - runtime inputs are limited to measurement-time observable signals and
   calibration-fixed parameters
-- selected results are either exportable as StereoDistance runtime profiles or
+- selected results are either exportable as StereoCAM runtime profiles or
   explicitly marked offline-only
 - the truth point and runtime feature/reference point are stated in the README
   and verdict

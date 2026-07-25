@@ -1,6 +1,0 @@
-PyQt5
-PyGObject
-ultralytics
-av
-pyulog
-pyserial

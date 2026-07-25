@@ -195,7 +195,7 @@ def check_acceptance(
             "REQ-04-error-injection-synthetic-mode",
             "Synthetic mode and injected observation/camera/disparity stress are documented and represented in the run root.",
             "synthetic mode" in readme_text.lower()
-            and "right_yaw_error_deg" in readme_text
+            and "cam_r_optical_yaw_deg" in readme_text
             and "measured_disparity_px" in readme_text,
             str(readme),
             "synthetic mode, camera attitude/focal/baseline/disparity stress documentation",

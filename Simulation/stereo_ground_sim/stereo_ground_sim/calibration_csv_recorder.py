@@ -127,7 +127,7 @@ CSV_FIELDS = [
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Record ROS2 PX4 truth and StereoDistance estimates to a calibration CSV. "
+            "Record ROS2 PX4 truth and StereoCAM estimates to a calibration CSV. "
             "The CSV is directly consumable by rtk_stereo_calibration_pipeline.py --mode csv."
         )
     )
@@ -346,7 +346,7 @@ def detections_array_to_fields(data: Sequence[float]) -> dict[str, float]:
 def write_manifest(path: Path, args: argparse.Namespace) -> None:
     truth_source = str(getattr(args, "truth_source", "local_ned") or "local_ned")
     lines = [
-        "purpose=PX4/StereoDistance calibration CSV recorder",
+        "purpose=PX4/StereoCAM calibration CSV recorder",
         f"csv={path.name}",
         f"truth_topic={args.truth_topic}",
         f"local_truth_topic={getattr(args, 'local_truth_topic', '/fmu/out/vehicle_local_position')}",
@@ -365,6 +365,7 @@ def write_manifest(path: Path, args: argparse.Namespace) -> None:
         f"truth_rdf_transform_contract={TRUTH_RDF_TRANSFORM_CONTRACT}",
         f"truth_rdf_contract={NED_TO_RDF_CONTRACT}",
         "runtime_truth_contract=truth is recorded for offline calibration and validation only",
+        "detection_bbox_contract=left/right bbox source fields are x1,y1,x2,y2 in image pixels; cx/cy are retained only as derived compatibility fields",
         "pipeline_command=provide explicit truth_right_m/truth_down_m/truth_forward_m first, then run Simulation/.venv/bin/python Simulation/scripts/rtk_stereo_calibration_pipeline.py --mode csv --input-csv <this csv> --output-dir Simulation/results/rtk_stereo_calibration_from_csv",
     ]
     (path.parent / "manifest.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")

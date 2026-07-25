@@ -25,7 +25,7 @@ Coordinate contract:
   - input correction fields are left/right image bbox center u/v pixels
   - the CSV is a 2D pixel affine correction for bbox centers
   - corrected bbox centers are passed to the existing simulation triangulation path
-  - downstream position topics keep the current StereoDistance simulation contract
+  - downstream position topics keep the current StereoCAM simulation contract
 
 Options:
   --scenario FILE_OR_NAME   Set SIM_SCENARIO_CONFIG. A bare name is resolved

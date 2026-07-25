@@ -99,7 +99,7 @@ class RuntimeMeasurementSample:
         left_u_px: object | None = None,
         left_v_px: object | None = None,
     ) -> "RuntimeMeasurementSample | None":
-        """Build a runtime sample from the public StereoDistance FRD topic.
+        """Build a runtime sample from the public StereoCAM FRD topic.
 
         The public topic contract is ``[forward, right, down, range]`` in meters.
         Selector features are computed in stereo-center optical RDF
@@ -198,7 +198,7 @@ class RuntimeStereoCameraContract:
     Output frame is stereo-center OpenCV optical RDF:
     ``right_m = +image right``, ``down_m = +image down``,
     ``forward_m = +optical forward``. Baseline is along RDF right, and the
-    public StereoDistance FRD+range topic is not used in this conversion.
+    public StereoCAM FRD+range topic is not used in this conversion.
     """
 
     width_px: float = DEFAULT_CAMERA_WIDTH_PX

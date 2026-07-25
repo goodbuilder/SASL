@@ -92,7 +92,7 @@ ROS2 checks:
 
 ```sh
 source /opt/ros/humble/setup.bash
-source /home/moon/px4_msgs_ws/install/setup.bash
+source workspace/main/install/setup.bash
 ros2 topic list | rg 'sensor_gps|sensor_mag|vehicle_magnetometer'
 ros2 topic echo --once /uav_1/fmu/out/sensor_gps_1
 ros2 topic echo --once /uav_1/fmu/out/sensor_mag_4
@@ -158,7 +158,7 @@ Runtime checks after flashing:
   `device_id=396817`
 
 Pixhawk 2 uses RM3100 device ID `8944643` for the primary RM3100 where
-Pixhawk 1 used `8944899`. The StereoDistance app treats both as known RM3100
+Pixhawk 1 used `8944899`. The StereoWIRIS app treats both as known RM3100
 primary IDs and maps them to alignment `CAN1`; `8944387` maps to `CAN2`.
 
 ## Coordinate Contract
@@ -179,7 +179,7 @@ firmware/patches/px4-v1.17-uxrce-sensor-gps-mag-instances.patch
 
 This is the v1.17-alpha/local-main equivalent of the 1.16 GPS2/MAG DDS
 export patch. PX4 v1.17 already carries an `instance` path in the uXRCE-DDS
-generator, but StereoDistance needs stable DDS names such as
+generator, but StereoWIRIS needs stable DDS names such as
 `/fmu/out/sensor_gps_0` while subscribing to the underlying `sensor_gps`
 uORB instance. The patch adds `uorb_topic` and `uorb_instance` aliases so DDS
 topic names and uORB source names can differ.
