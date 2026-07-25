@@ -741,6 +741,54 @@ def test_mavlink_gps_raw_int_maps_to_gps_state() -> None:
     assert gps.heading_deg == 90.12
 
 
+def test_mavlink_global_position_int_does_not_clobber_gps_fix_state() -> None:
+    from types import SimpleNamespace
+
+    from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    class FakeMavlinkMessage(SimpleNamespace):
+        def get_type(self):
+            return self._type
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="udpin:0.0.0.0:14550", right_url="")
+    captured = []
+    subscriber.gps_changed.connect(lambda camera, gps: captured.append((camera, gps)))
+    subscriber._handle_mavlink_message(
+        "left",
+        FakeMavlinkMessage(
+            _type="GPS_RAW_INT",
+            lat=370000000,
+            lon=1270000000,
+            alt=123450,
+            fix_type=6,
+            satellites_visible=18,
+            eph=4,
+            epv=5,
+            cog=9012,
+        ),
+    )
+    subscriber._handle_mavlink_message(
+        "left",
+        FakeMavlinkMessage(
+            _type="GLOBAL_POSITION_INT",
+            lat=370000100,
+            lon=1270000100,
+            alt=123460,
+            relative_alt=100000,
+            vx=0,
+            vy=0,
+            vz=0,
+            hdg=9020,
+            time_boot_ms=1000,
+        ),
+    )
+
+    assert len(captured) == 1
+    _, gps = captured[0]
+    assert gps.topic == "mavlink/GPS_RAW_INT"
+    assert gps.fix_type == 6
+
+
 def test_mavlink_start_px4_uxrce_client_shell_sends_px4_shell_command() -> None:
     from types import SimpleNamespace
 

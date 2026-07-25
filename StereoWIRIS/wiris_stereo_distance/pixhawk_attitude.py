@@ -1488,20 +1488,6 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             if gnss_relative is not None:
                 self._emit_mavlink_gnss_relative(camera, gnss_relative)
             return
-        if message_type == "GLOBAL_POSITION_INT":
-            gps = GpsPositionState(
-                camera=camera,
-                namespace=namespace,
-                timestamp_s=now_s,
-                topic="mavlink/GLOBAL_POSITION_INT",
-                latitude_deg=_mavlink_scaled_degrees(getattr(message, "lat", None)),
-                longitude_deg=_mavlink_scaled_degrees(getattr(message, "lon", None)),
-                altitude_m=_mavlink_scaled_millimetres(getattr(message, "alt", None)),
-                heading_deg=_mavlink_heading_cdeg(getattr(message, "hdg", None)),
-                raw=message,
-            )
-            self.gps_changed.emit(camera, gps)
-            return
         if message_type in {"SCALED_IMU", "SCALED_IMU2", "SCALED_IMU3"}:
             mag = _mag_sensor_state_from_mavlink(camera, namespace, message, message_type, now_s)
             if mag is not None:
