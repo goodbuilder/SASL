@@ -8173,6 +8173,35 @@ def test_clock_offset_samples_are_recorded_regardless_of_visible_tab() -> None:
     _ = app
 
 
+def test_clock_offset_history_resets_when_streams_restart(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.left_url_edit.setText("rtsp://left-camera/live")
+    widget.right_url_edit.setText("rtsp://right-camera/live")
+    monkeypatch.setattr(widget.left_pane, "start_stream", lambda *args, **kwargs: None)
+    monkeypatch.setattr(widget.right_pane, "start_stream", lambda *args, **kwargs: None)
+
+    widget.camera_frame_metadata["left"] = {"rtcp_frame_receive_delay_s": 12.0}
+    # 1 s apart, so none are dropped by the sampler's rate limit.
+    for timestamp_s in (1.0, 2.0, 3.0, 4.0):
+        widget._record_clock_offset_sample(timestamp_s)
+    assert len(widget.clock_offset_plot.points) == 4
+
+    widget._start_camera_streams(enable_detection=False, switch_to_depth=False)
+
+    # A restart re-anchors the Sender Report, so pre-restart samples describe a
+    # different series and must not hold the y axis at the old scale.
+    assert len(widget.clock_offset_plot.points) == 0
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_clock_offset_plot_time_axis_ticks_are_seconds_ago() -> None:
     from PyQt5 import QtWidgets
 

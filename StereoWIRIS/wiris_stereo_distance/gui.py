@@ -10816,6 +10816,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.active_stream_decoders["left"] = None
         self.active_stream_decoders["right"] = None
         self._clear_detection_state()
+        # Restarting the stream re-establishes the RTCP Sender Report anchor, so
+        # samples taken against the previous anchor are a different series and
+        # would also hold the y axis at the pre-resync scale.
+        if hasattr(self, "clock_offset_plot"):
+            self.clock_offset_plot.clear()
+            self._last_clock_offset_sample_s = 0.0
         if enable_detection:
             self._clear_calibration_previews("YOLO depth mode")
 
