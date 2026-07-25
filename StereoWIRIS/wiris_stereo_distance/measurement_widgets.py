@@ -590,10 +590,23 @@ class ClockOffsetHistoryPlot(QtWidgets.QWidget):
         for rect, (title, unit, series) in zip(self._panel_rects(), self.PANELS):
             self._draw_panel(painter, rect, title, unit, series)
 
+    def time_axis_ticks(self, tick_count: int = 4) -> list[float]:
+        """Age-in-seconds tick values, newest (0) last.
+
+        Negative because the right edge is the most recent sample, so a tick
+        reads as "this many seconds ago".
+        """
+
+        if not self.points:
+            return []
+        span_s = max(0.0, float(self.points[-1].timestamp_s) - float(self.points[0].timestamp_s))
+        steps = max(1, int(tick_count))
+        return [-span_s * (steps - index) / steps for index in range(steps)] + [0.0]
+
     def _draw_panel(self, painter, rect, title: str, unit: str, series) -> None:
         painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
         painter.drawRect(rect)
-        plot_rect = rect.adjusted(56, 18, -8, -14)
+        plot_rect = rect.adjusted(56, 18, -10, -22)
         values = [
             value
             for field, _label, _color in series
@@ -630,16 +643,34 @@ class ClockOffsetHistoryPlot(QtWidgets.QWidget):
             f"{minimum:.1f}",
         )
 
-        def to_point(index: int, value: float) -> QtCore.QPointF:
-            span = max(1, len(self.points) - 1)
-            x = plot_rect.left() + plot_rect.width() * index / span
-            ratio = (value - minimum) / (maximum - minimum)
-            return QtCore.QPointF(x, plot_rect.bottom() - plot_rect.height() * ratio)
+        newest_s = float(self.points[-1].timestamp_s)
+        oldest_s = float(self.points[0].timestamp_s)
+        span_s = max(1e-6, newest_s - oldest_s)
+
+        def x_for_age(age_s: float) -> float:
+            # age_s is <= 0; 0 is the newest sample at the right edge.
+            return plot_rect.right() + plot_rect.width() * age_s / span_s
+
+        for age_s in self.time_axis_ticks():
+            x = x_for_age(age_s)
+            painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1))
+            painter.drawLine(QtCore.QPointF(x, plot_rect.top()), QtCore.QPointF(x, plot_rect.bottom()))
+            painter.setPen(QtGui.QColor(CHART_MUTED))
+            painter.drawText(
+                QtCore.QRectF(x - 30, plot_rect.bottom() + 2, 60, 14),
+                QtCore.Qt.AlignCenter,
+                f"{age_s:.0f}s",
+            )
 
         for field, _label, color in series:
+            # Time-based x, so a sampling gap shows as a gap instead of being
+            # compressed away by index-based spacing.
             path_points = [
-                to_point(index, value)
-                for index, point in enumerate(self.points)
+                QtCore.QPointF(
+                    x_for_age(float(point.timestamp_s) - newest_s),
+                    plot_rect.bottom() - plot_rect.height() * (value - minimum) / (maximum - minimum),
+                )
+                for point in self.points
                 for value in (getattr(point, field),)
                 if value is not None and isfinite(value)
             ]

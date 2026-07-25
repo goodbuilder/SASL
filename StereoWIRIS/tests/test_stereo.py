@@ -8173,6 +8173,57 @@ def test_clock_offset_samples_are_recorded_regardless_of_visible_tab() -> None:
     _ = app
 
 
+def test_clock_offset_plot_time_axis_ticks_are_seconds_ago() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.measurement_widgets import ClockOffsetHistoryPlot, ClockOffsetPoint
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    plot = ClockOffsetHistoryPlot()
+    plot.resize(640, 260)
+
+    assert plot.time_axis_ticks() == []
+
+    for index in range(41):
+        plot.add_point(
+            ClockOffsetPoint(timestamp_s=index * 1.0, left_transit_delay_ms=1000.0 + index)
+        )
+
+    # 40 s of samples, newest at 0 s ago.
+    assert plot.time_axis_ticks() == [-40.0, -30.0, -20.0, -10.0, 0.0]
+    assert plot.time_axis_ticks(tick_count=2) == [-40.0, -20.0, 0.0]
+
+    plot.grab()
+
+    plot.deleteLater()
+    _ = app
+
+
+def test_clock_offset_plot_spaces_points_by_time_not_sample_index() -> None:
+    from PyQt5 import QtGui, QtWidgets
+
+    from wiris_stereo_distance.measurement_widgets import ClockOffsetHistoryPlot, ClockOffsetPoint
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    evenly_spaced = ClockOffsetHistoryPlot()
+    with_gap = ClockOffsetHistoryPlot()
+    for plot in (evenly_spaced, with_gap):
+        plot.resize(640, 260)
+
+    values = [1000.0, 1100.0, 1200.0, 1300.0]
+    for index, value in enumerate(values):
+        evenly_spaced.add_point(ClockOffsetPoint(timestamp_s=index * 1.0, left_transit_delay_ms=value))
+    # Same samples, but a stalled stream between the 2nd and 3rd.
+    for timestamp_s, value in zip((0.0, 1.0, 31.0, 32.0), values):
+        with_gap.add_point(ClockOffsetPoint(timestamp_s=timestamp_s, left_transit_delay_ms=value))
+
+    assert evenly_spaced.grab().toImage() != with_gap.grab().toImage()
+
+    for plot in (evenly_spaced, with_gap):
+        plot.deleteLater()
+    _ = app
+
+
 def test_clock_offset_plot_ignores_missing_rtcp_fields() -> None:
     from PyQt5 import QtWidgets
 
