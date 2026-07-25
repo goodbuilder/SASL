@@ -7589,6 +7589,49 @@ def test_clock_sync_status_selects_corresponding_history_frames(monkeypatch) -> 
     _ = app
 
 
+def test_clock_sync_pair_metadata_rejects_history_frames_older_than_one_second(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    assert gui.CAMERA_SYNC_HISTORY_MAX_AGE_S == 1.0
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.camera_frame_metadata["left"] = {
+        "timestamp_s": 109.9,
+        "rtcp_frame_ntp_unix_s": 1_800_000_200.000,
+    }
+    widget.camera_frame_metadata["right"] = {
+        "timestamp_s": 109.9,
+        "rtcp_frame_ntp_unix_s": 1_800_000_200.050,
+    }
+
+    def set_history(age_s: float) -> None:
+        for camera, ntp_s in (("left", 1_800_000_100.000), ("right", 1_800_000_100.010)):
+            widget.camera_frame_metadata_history[camera].clear()
+            widget.camera_frame_metadata_history[camera].append(
+                {"timestamp_s": 110.0 - age_s, "rtcp_frame_ntp_unix_s": ntp_s}
+            )
+
+    # 0.5 s old: inside the window, so the history pair is selected.
+    set_history(0.5)
+    left, right = widget._clock_sync_pair_metadata(now_mono_s=110.0)
+    assert left["rtcp_frame_ntp_unix_s"] == 1_800_000_100.000
+    assert right["rtcp_frame_ntp_unix_s"] == 1_800_000_100.010
+
+    # 1.5 s old: outside the window (was inside under the previous 2.0 s
+    # limit), so it falls back to the latest frame instead.
+    set_history(1.5)
+    left, right = widget._clock_sync_pair_metadata(now_mono_s=110.0)
+    assert left["rtcp_frame_ntp_unix_s"] == 1_800_000_200.000
+    assert right["rtcp_frame_ntp_unix_s"] == 1_800_000_200.050
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_camera_time_sync_metrics_reports_frame_transit_separately(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
