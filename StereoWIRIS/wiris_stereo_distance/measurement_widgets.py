@@ -507,3 +507,143 @@ class DistanceHistoryPlot(QtWidgets.QWidget):
             text = series_title if latest_value is None else f"{series_title} {latest_value:.2f} {series_unit}"
             painter.drawText(legend_x, legend_y, text)
             legend_x += max(110, painter.fontMetrics().horizontalAdvance(text) + 14)
+
+
+@dataclass(frozen=True)
+class ClockOffsetPoint:
+    """One sampled RTCP timing state for both cameras.
+
+    ``transit_delay_ms`` is ``rtcp_frame_receive_delay_s`` scaled to
+    milliseconds; ``sr_age_s`` is ``rtcp_sr_age_s``, how stale the Sender
+    Report anchor those frame timestamps extrapolate from has become.
+    """
+
+    timestamp_s: float
+    left_transit_delay_ms: float | None = None
+    right_transit_delay_ms: float | None = None
+    left_sr_age_s: float | None = None
+    right_sr_age_s: float | None = None
+
+
+class ClockOffsetHistoryPlot(QtWidgets.QWidget):
+    """Two stacked panels: RTCP transit delay, and Sender Report anchor age.
+
+    They are separated because a growing transit delay caused by a frozen SR
+    anchor looks identical to real clock drift until the anchor age is read
+    next to it.
+    """
+
+    PANELS = (
+        (
+            "RTCP transit delay",
+            "ms",
+            (("left_transit_delay_ms", "L", SERIES_LEFT), ("right_transit_delay_ms", "R", SERIES_RIGHT)),
+        ),
+        (
+            "Sender Report anchor age",
+            "s",
+            (("left_sr_age_s", "L", SERIES_LEFT), ("right_sr_age_s", "R", SERIES_RIGHT)),
+        ),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.points: deque[ClockOffsetPoint] = deque(maxlen=900)
+        self.setMinimumHeight(220)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
+        self.setToolTip(
+            "좌/우 RTCP transit delay와 Sender Report 앵커 나이입니다.\n"
+            "앵커 나이가 계속 커지면 transit delay 증가는 실제 드리프트가 아니라 앵커 고착입니다."
+        )
+
+    def add_point(self, point: ClockOffsetPoint) -> None:
+        self.points.append(point)
+        self.update()
+
+    def clear(self) -> None:
+        self.points.clear()
+        self.update()
+
+    def _panel_rects(self) -> list[QtCore.QRectF]:
+        content = QtCore.QRectF(self.rect().adjusted(8, 8, -8, -8))
+        panel_height = content.height() / len(self.PANELS)
+        return [
+            QtCore.QRectF(
+                content.left(),
+                content.top() + index * panel_height,
+                content.width(),
+                panel_height - 6,
+            )
+            for index in range(len(self.PANELS))
+        ]
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        super().paintEvent(event)
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
+        if not self.points:
+            painter.setPen(QtGui.QColor(CHART_MUTED))
+            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "RTCP/NTP 샘플 대기 중")
+            return
+        for rect, (title, unit, series) in zip(self._panel_rects(), self.PANELS):
+            self._draw_panel(painter, rect, title, unit, series)
+
+    def _draw_panel(self, painter, rect, title: str, unit: str, series) -> None:
+        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
+        painter.drawRect(rect)
+        plot_rect = rect.adjusted(56, 18, -8, -14)
+        values = [
+            value
+            for field, _label, _color in series
+            for value in (getattr(point, field) for point in self.points)
+            if value is not None and isfinite(value)
+        ]
+        painter.setPen(QtGui.QColor(CHART_TEXT))
+        if not values:
+            painter.drawText(rect.adjusted(6, 2, 0, 0), QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft, f"{title}: --")
+            return
+        minimum = min(0.0, min(values))
+        maximum = max(values)
+        if maximum - minimum < 1e-9:
+            maximum = minimum + 1.0
+        latest = {field: getattr(self.points[-1], field) for field, _label, _color in series}
+        legend = "  ".join(
+            f"{label} {'--' if latest[field] is None else f'{latest[field]:.1f}'}"
+            for field, label, _color in series
+        )
+        painter.drawText(
+            rect.adjusted(6, 2, 0, 0),
+            QtCore.Qt.AlignTop | QtCore.Qt.AlignLeft,
+            f"{title} ({unit})   {legend}",
+        )
+        painter.setPen(QtGui.QColor(CHART_MUTED))
+        painter.drawText(
+            QtCore.QRectF(rect.left() + 4, plot_rect.top() - 6, 50, 14),
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+            f"{maximum:.1f}",
+        )
+        painter.drawText(
+            QtCore.QRectF(rect.left() + 4, plot_rect.bottom() - 8, 50, 14),
+            QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter,
+            f"{minimum:.1f}",
+        )
+
+        def to_point(index: int, value: float) -> QtCore.QPointF:
+            span = max(1, len(self.points) - 1)
+            x = plot_rect.left() + plot_rect.width() * index / span
+            ratio = (value - minimum) / (maximum - minimum)
+            return QtCore.QPointF(x, plot_rect.bottom() - plot_rect.height() * ratio)
+
+        for field, _label, color in series:
+            path_points = [
+                to_point(index, value)
+                for index, point in enumerate(self.points)
+                for value in (getattr(point, field),)
+                if value is not None and isfinite(value)
+            ]
+            if len(path_points) < 2:
+                continue
+            painter.setPen(QtGui.QPen(QtGui.QColor(color), 2))
+            painter.drawPolyline(QtGui.QPolygonF(path_points))

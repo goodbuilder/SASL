@@ -5939,6 +5939,7 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert tab_names == [
         "연결",
         "시간",
+        "이미지",
         "보정",
         "파라미터",
         "정렬",
@@ -8102,6 +8103,94 @@ def test_measurement_tab_shows_camera_ntp_in_summary_and_keeps_record_metadata()
     assert row["camera_rtc_frame_delta_s"] == "0.018000"
     assert row["left_camera_rtc_frame_unix_s"] == "1700000000.100000"
     assert row["right_camera_rtc_basis"] == "rtcp-sender-report"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_time_tab_keeps_only_stus_sync_and_image_tab_takes_capture_and_exif() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+    time_tab = widget.tabs.widget(widget.time_tab_index)
+    image_tab = widget.tabs.widget(widget.image_tab_index)
+
+    assert widget.tabs.tabText(widget.image_tab_index) == "이미지"
+    # STUS sync + its visualization stay on 시간.
+    for widget_name in ("wiris_set_pc_time_button", "clock_sync_status_label", "clock_offset_plot"):
+        assert time_tab.isAncestorOf(getattr(widget, widget_name)), widget_name
+    # Capture / FTP / EXIF move to 이미지.
+    for widget_name in (
+        "clock_cptr_button",
+        "clock_workflow_button",
+        "clock_download_latest_button",
+        "clock_analyze_pair_button",
+        "clock_result_table",
+        "clock_summary_text",
+    ):
+        assert image_tab.isAncestorOf(getattr(widget, widget_name)), widget_name
+        assert not time_tab.isAncestorOf(getattr(widget, widget_name)), widget_name
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_clock_offset_samples_are_recorded_regardless_of_visible_tab() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+    widget.tabs.setCurrentIndex(widget.depth_tab_index)
+    widget.camera_frame_metadata["left"] = {
+        "rtcp_frame_receive_delay_s": 1.25,
+        "rtcp_sr_age_s": 42.0,
+    }
+    widget.camera_frame_metadata["right"] = {
+        "rtcp_frame_receive_delay_s": 0.12,
+        "rtcp_sr_age_s": 1.5,
+    }
+
+    widget._record_clock_offset_sample(100.0)
+
+    assert len(widget.clock_offset_plot.points) == 1
+    point = widget.clock_offset_plot.points[-1]
+    assert point.left_transit_delay_ms == 1250.0
+    assert point.right_transit_delay_ms == 120.0
+    assert point.left_sr_age_s == 42.0
+
+    # Rate limited, so a sample right behind the previous one is dropped.
+    widget._record_clock_offset_sample(100.1)
+    assert len(widget.clock_offset_plot.points) == 1
+    widget._record_clock_offset_sample(101.0)
+    assert len(widget.clock_offset_plot.points) == 2
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_clock_offset_plot_ignores_missing_rtcp_fields() -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = WirisStereoDistancePanel()
+    widget.camera_frame_metadata["left"] = {"timestamp_s": 1.0}
+    widget.camera_frame_metadata["right"] = {}
+
+    widget._record_clock_offset_sample(100.0)
+
+    point = widget.clock_offset_plot.points[-1]
+    assert point.left_transit_delay_ms is None
+    assert point.right_transit_delay_ms is None
+    assert point.left_sr_age_s is None
+    widget.clock_offset_plot.resize(400, 200)
+    widget.clock_offset_plot.grab()  # must not raise with all-None series
 
     widget.deleteLater()
     _ = app

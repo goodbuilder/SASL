@@ -258,23 +258,30 @@ Use this tab to review the current recording summary, inspect Raw recorded sampl
 - Recorded YOLO values use `baseline_center_frd`: origin at the midpoint of the left optical origin and selected right-origin estimate, axes `Forward/Right/Down`, public vector `[Forward, Right, Down, Range]`. Checkerboard records the `R/T` optical-center model; Pixhawk records its GPS/RTK antenna baseline as an optical-baseline proxy without a calibrated lever arm. V2 rows use `baseline_center_*` and `raw_baseline_center_*`; they do not emit `x_m/y_m/z_m`, old `left_camera_*`, or `stereo_center_*` public aliases. `source_left_camera_rdf_*` is diagnostic provenance only. Each row records an attempt-scoped frame instance id because Pixhawk/GPS geometry can differ between measurement attempts.
 - Live stereo pairing uses `RTCP/NTP 우선` by default. If the two WIRIS RTCP clocks do not produce a pair inside `최대 Δt`, the app falls back to the common app-receive monotonic clock and labels the pair `app fallback`. This preserves live pairing while keeping the RTCP/NTP/PC-UTC result as a separate diagnostic; an `app fallback` pair must not be treated as an absolute UTC-synchronized pair.
 - The original session files do not contain `drone_*`, `ulg_*`, or target truth/error fields. A future user-selected drone ULog comparison must be emitted as a separate derived `<session_id>_ulg_comparison.csv/.xlsx` pair without modifying the original session data.
-- `전체 설정 저장` persists current runtime settings to `<STEREO_WIRIS_APP>/stereo_distance_settings.json`, including setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and time-tab FTP/download fields.
+- `전체 설정 저장` persists current runtime settings to `<STEREO_WIRIS_APP>/stereo_distance_settings.json`, including setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and 이미지-tab FTP/download fields.
 - Closing the GUI also saves the current settings automatically.
 
 ### 시간
 
-Use this tab to set WIRIS RTC from PC UTC, inspect live RTCP/NTP stream clock offset, capture WIRIS still images over the Ethernet SDK path, download the latest FTP images, and inspect EXIF clock offset.
+Use this tab for WIRIS RTC synchronization from PC UTC and for watching the resulting stream clock offset over time. Still-image capture and EXIF comparison live in the 이미지 tab.
+
+- `PC UTC로 시간 설정` sends a shared `STUS` UTC value to the selected WIRIS RTC target. When both cameras are selected, the app logs the shared command UTC and TCP call-start skew.
+- `RTCP/NTP 동기화 확인` selects recent left/right frames received close together, compares their stream-frame `rtcp_frame_ntp_unix_s` values, and reports each frame's `rtcp_frame_receive_delay_s` separately. The receive delay includes encoder/network/decoder transit and is not treated as a camera-clock offset. This is a stream-timing diagnostic, not proof that RTCP NTP equals WIRIS `GDTI` or an external absolute UTC reference. The status line refreshes on its own while this tab is visible; the button also writes a snapshot to the log.
+- `RTCP/NTP 오프셋 추이` plots left/right `rtcp_frame_receive_delay_s` and `rtcp_sr_age_s` against time. Samples are collected regardless of which tab is showing, so the trend is not broken by tab switches. Read the two panels together: a transit delay that climbs while the Sender Report anchor age also climbs means the anchor has stopped refreshing, not that the camera clock is drifting.
+- The RTP/RTCP timestamp anchor is taken when the stream starts, so an `STUS` correction only reaches the stream timestamps after the RTSP stream is reconnected. Run `PC UTC로 시간 설정` first, then restart the streams.
+- Timing contract: WIRIS `STUS/GDTI` is the camera body-clock check, RTP is a relative stream counter, and RTCP Sender Report NTP is a stream-derived wall-clock estimate. The app pairs frames by close PC receive time, uses RTCP/NTP delta only for the relative stereo gate, and records RTCP frame transit delay as a transport diagnostic. A stereo pair is within the relative timing criterion when its RTCP/NTP delta is at most 50 ms. Do not use this relative result as proof of synchronization to an external absolute UTC source.
+
+### 이미지
+
+Use this tab to capture WIRIS still images over the Ethernet SDK path, download the latest FTP images, and inspect EXIF clock offset.
 The default FTP download directory is `<STEREO_WIRIS_APP>/clock_captures/`; relative paths in this tab are resolved from the StereoWIRIS app root, not from the shell's current working directory.
 
 - `CPTR 촬영 / FTP 다운로드` sends `CPTR` to both WIRIS cameras, checks `ICPT`, downloads the newest JPG/TIFF from each camera's FTP folder, and can run the pair EXIF analysis in one sequence.
-- `PC UTC로 시간 설정` sends a shared `STUS` UTC value to the selected WIRIS RTC target. When both cameras are selected, the app logs the shared command UTC and TCP call-start skew.
-- `RTCP/NTP 동기화 확인` selects recent left/right frames received close together, compares their stream-frame `rtcp_frame_ntp_unix_s` values, and reports each frame's `rtcp_frame_receive_delay_s` separately. The receive delay includes encoder/network/decoder transit and is not treated as a camera-clock offset. This is a stream-timing diagnostic, not proof that RTCP NTP equals WIRIS `GDTI` or an external absolute UTC reference.
 - FTP settings use the current left/right WIRIS control hosts for the FTP host addresses; set the FTP user, password, port, remote image directory, and local download folder before running the sequence.
 - `파일 쌍 비교` reads one left image and one right image and reports `right-left` capture timestamp offset.
 - `폴더 비교` scans left/right folders recursively, pairs images by matching filenames when possible, otherwise by sorted order, and reports per-pair offsets plus median/mean offset.
 - The parser reads JPEG/TIFF EXIF `GPSDateStamp`/`GPSTimeStamp` first, then falls back to `DateTimeOriginal` or `DateTime`.
 - The table shows capture timestamp source, subsecond availability, GPS coordinates when present, and warnings for second-only timestamps or mixed timestamp sources.
-- Timing contract: WIRIS `STUS/GDTI` is the camera body-clock check, RTP is a relative stream counter, and RTCP Sender Report NTP is a stream-derived wall-clock estimate. The app pairs frames by close PC receive time, uses RTCP/NTP delta only for the relative stereo gate, and records RTCP frame transit delay as a transport diagnostic. A stereo pair is within the relative timing criterion when its RTCP/NTP delta is at most 50 ms. Do not use this relative result as proof of synchronization to an external absolute UTC source.
 
 ## Inputs/Outputs and Interfaces
 

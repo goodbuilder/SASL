@@ -56,6 +56,8 @@ from wiris_stereo_distance.coordinate_contract import (
     WORLD_FRAME,
 )
 from wiris_stereo_distance.measurement_widgets import (
+    ClockOffsetHistoryPlot,
+    ClockOffsetPoint,
     DistanceHistoryPlot,
     DistanceHistoryPoint,
     Triangulation3DView,
@@ -2673,6 +2675,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "left": deque(maxlen=240),
             "right": deque(maxlen=240),
         }
+        self._last_clock_offset_sample_s = 0.0
         self.selected_runtime_frame_metadata = {
             "left": {},
             "right": {},
@@ -2732,6 +2735,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         setup_layout = QtWidgets.QVBoxLayout(setup_tab)
         time_tab = QtWidgets.QWidget()
         time_layout = QtWidgets.QVBoxLayout(time_tab)
+        image_tab = QtWidgets.QWidget()
+        image_layout = QtWidgets.QVBoxLayout(image_tab)
         alignment_tab = QtWidgets.QWidget()
         alignment_layout = QtWidgets.QVBoxLayout(alignment_tab)
         alignment_overview_tab = QtWidgets.QWidget()
@@ -2791,6 +2796,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for layout in (
             setup_layout,
             time_layout,
+            image_layout,
             alignment_layout,
             alignment_overview_layout,
             rtk_layout,
@@ -2823,6 +2829,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         self.tabs.addTab(setup_tab, "연결")
         self.tabs.addTab(time_tab, "시간")
+        self.tabs.addTab(image_tab, "이미지")
         self.tabs.addTab(calibration_tab, "보정")
         self.tabs.addTab(camera_params_tab, "파라미터")
         self.tabs.addTab(alignment_tab, "정렬")
@@ -2831,6 +2838,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.tabs.addTab(save_tab, "저장·분석")
         self.tabs.addTab(advanced_tab, "고급")
         self.time_tab_index = self.tabs.indexOf(time_tab)
+        self.image_tab_index = self.tabs.indexOf(image_tab)
         self.alignment_tab_index = self.tabs.indexOf(alignment_tab)
         self.calibration_tab_index = self.tabs.indexOf(calibration_tab)
         self.parameter_tab_index = self.tabs.indexOf(camera_params_tab)
@@ -4521,7 +4529,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         recording_table_layout.addWidget(self.recording_sample_detail, 1)
         save_layout.addWidget(self.recording_table_group, 1)
 
-        self._build_clock_sync_tab(time_layout)
+        self._build_clock_sync_tab(time_layout, image_layout)
         self._polish_controls()
         self._refresh_session_toggle_buttons()
         self._install_tooltips()
@@ -7481,8 +7489,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._configure_collapsible_group(f9p_detail_group, checked=False)
         layout.addWidget(f9p_detail_group)
 
-    def _build_clock_sync_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+    def _build_clock_sync_tab(
+        self,
+        layout: QtWidgets.QVBoxLayout,
+        image_layout: QtWidgets.QVBoxLayout,
+    ) -> None:
+        """Build the 시간 (STUS sync) and 이미지 (capture/EXIF) tabs.
+
+        Both tabs are built here because their widgets share the clock_* command
+        helpers; ``layout`` receives only the RTC sync group and its history
+        plot, and everything capture/EXIF related goes to ``image_layout``.
+        """
+
         layout.setSpacing(8)
+        image_layout.setSpacing(8)
         workflow_group = QtWidgets.QGroupBox("CPTR 촬영 / FTP 다운로드")
         workflow_form = QtWidgets.QGridLayout(workflow_group)
         workflow_form.setColumnStretch(1, 1)
@@ -7626,11 +7646,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.clock_summary_text.setReadOnly(True)
         self.clock_summary_text.setMaximumBlockCount(300)
         self.clock_summary_text.setPlaceholderText("분석 결과가 여기에 표시됩니다.")
+        self.clock_offset_plot = ClockOffsetHistoryPlot()
+        history_group = QtWidgets.QGroupBox("RTCP/NTP 오프셋 추이")
+        history_layout = QtWidgets.QVBoxLayout(history_group)
+        history_layout.addWidget(self.clock_offset_plot)
         layout.addWidget(rtc_group)
-        layout.addWidget(workflow_group)
-        layout.addWidget(source_group)
-        layout.addWidget(self.clock_result_table, 2)
-        layout.addWidget(self.clock_summary_text, 1)
+        layout.addWidget(history_group, 1)
+
+        image_layout.addWidget(workflow_group)
+        image_layout.addWidget(source_group)
+        image_layout.addWidget(self.clock_result_table, 2)
+        image_layout.addWidget(self.clock_summary_text, 1)
 
     def browse_clock_photo(self, camera: str) -> None:
         edit = self.clock_left_file_edit if camera == "left" else self.clock_right_file_edit
@@ -8022,6 +8048,38 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
         )
         return status, detail
+
+    def _record_clock_offset_sample(self, now_s: float, *, min_interval_s: float = 0.5) -> None:
+        """Append one RTCP timing sample for the 시간 tab history plot.
+
+        Sampled from the frame path regardless of which tab is showing: the
+        plot exists to expose slow drift, which a history with holes in it
+        cannot show. Only the painting is gated on visibility.
+        """
+
+        if not hasattr(self, "clock_offset_plot"):
+            return
+        if now_s - self._last_clock_offset_sample_s < min_interval_s:
+            return
+        self._last_clock_offset_sample_s = now_s
+
+        def metric(camera: str, key: str, scale: float) -> float | None:
+            value = (self.camera_frame_metadata.get(camera) or {}).get(key)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return None
+            return value * scale if isfinite(value) else None
+
+        self.clock_offset_plot.add_point(
+            ClockOffsetPoint(
+                timestamp_s=now_s,
+                left_transit_delay_ms=metric("left", "rtcp_frame_receive_delay_s", 1000.0),
+                right_transit_delay_ms=metric("right", "rtcp_frame_receive_delay_s", 1000.0),
+                left_sr_age_s=metric("left", "rtcp_sr_age_s", 1.0),
+                right_sr_age_s=metric("right", "rtcp_sr_age_s", 1.0),
+            )
+        )
 
     def _update_clock_sync_display(self) -> str | None:
         """Refresh the RTCP/NTP status label/detail text without logging.
@@ -10454,6 +10512,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_frame_metadata_history[camera].append(dict(frame_metadata))
         self.camera_frame_times[camera].append(frame_timestamp_s)
         self._update_camera_connection_status()
+        self._record_clock_offset_sample(now_s)
         if self._is_clock_sync_tab_visible():
             self._update_clock_sync_display()
         if self.yolo_enabled:
