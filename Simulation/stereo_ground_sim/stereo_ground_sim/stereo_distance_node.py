@@ -3415,9 +3415,11 @@ class StereoDistanceNode(Node):
                 computed = self._compute_pair_measurement(pair, phase)
                 raw = computed.get("raw")
                 if raw is not None:
+                    ideal = self._latest_rviz_ideal_ray(pair)
                     self._publish_ray_markers(
                         nominal=raw,
                         optical=computed.get("corrected"),
+                        ideal=ideal,
                     )
                     self.rviz_live_publish_count += 1
             except Exception as exc:
@@ -3427,6 +3429,25 @@ class StereoDistanceNode(Node):
                         "Latest-only RViz ray publish failed: "
                         f"{type(exc).__name__}: {exc}"
                     )
+
+    def _latest_rviz_ideal_ray(self, pair):
+        """Compute a display-only ideal ray from the latest GT cache."""
+
+        position = getattr(self, "cached_ground_truth_position", None)
+        point_world_enu_m = None
+        if isinstance(position, dict):
+            point_world_enu_m = position.get("ground_truth_world_enu_m")
+        if point_world_enu_m is None:
+            return None
+        width = int(getattr(pair.left_message, "width", 0))
+        height = int(getattr(pair.left_message, "height", 0))
+        if width <= 0 or height <= 0:
+            return None
+        return self._triangulate_dkl_ideal_from_reference_world(
+            point_world_enu_m,
+            width,
+            height,
+        )
 
     def _commit_pair_measurement_if_current(self, pair, computed):
         """Linearization point for reset versus measurement publication.

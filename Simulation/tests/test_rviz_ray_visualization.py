@@ -106,6 +106,7 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
 
     assert "_rviz_live_worker_loop" in source
+    assert "_latest_rviz_ideal_ray" in source
     assert "rviz_live_latest_only" in source
     assert "rviz_live_ray_hz" in source
     assert "self._publish_ray_metrics(nominal=raw, optical=optical)" in source
@@ -113,6 +114,7 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     assert 'self.create_publisher(MarkerArray, "/stereo/ray_markers", ray_marker_qos)' in source
     assert "durability=DurabilityPolicy.TRANSIENT_LOCAL" in source
     assert 'self._publish_ray_metrics(ideal=ideal)' in source
+    assert "ideal=ideal" in source
     assert 'label="nominal"' in source
     assert 'label="optical"' in source
     assert 'label="ideal"' in source
