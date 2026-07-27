@@ -312,6 +312,12 @@ class StereoDistanceNode(Node):
         # This is a bounded burst buffer, not a sustained-rate guarantee.
         # Strict overflow accounting invalidates a run instead of dropping silently.
         self.declare_parameter("measurement_queue_capacity", 32)
+        self.declare_parameter("rviz_live_latest_only", True)
+        self.declare_parameter(
+            "rviz_live_ray_hz",
+            2.0,
+            ParameterDescriptor(dynamic_typing=True),
+        )
         self.declare_parameter("enable_synthetic_detections", False)
         self.declare_parameter("synthetic_detection_width_px", 1280)
         self.declare_parameter("synthetic_detection_height_px", 720)
@@ -413,6 +419,8 @@ class StereoDistanceNode(Node):
         self.observation_mode = self._validate_observation_mode(
             self.get_parameter("observation_mode").value
         )
+        self.rviz_live_latest_only = self._bool_param("rviz_live_latest_only")
+        self.rviz_live_ray_hz = max(0.1, self._float_param("rviz_live_ray_hz"))
         self.enable_synthetic_detections = self._bool_param("enable_synthetic_detections")
         self.synthetic_detection_width_px = max(1, int(self.get_parameter("synthetic_detection_width_px").value))
         self.synthetic_detection_height_px = max(1, int(self.get_parameter("synthetic_detection_height_px").value))
@@ -513,6 +521,7 @@ class StereoDistanceNode(Node):
         self.yolo_model = None
         self.yolo_model_device = None
         self.yolo_model_loaded_path = None
+        self.yolo_model_lock = threading.RLock()
         self.yolo_load_error = ""
         self.resolved_yolo_device = None
         self.yolo_device_warning_logged = False
@@ -551,6 +560,10 @@ class StereoDistanceNode(Node):
             int(self.get_parameter("measurement_queue_capacity").value),
         )
         self.measurement_pair_queue = deque()
+        self.rviz_live_latest_pair = None
+        self.rviz_live_latest_processed_pair_id = 0
+        self.rviz_live_publish_count = 0
+        self.rviz_live_error_count = 0
         self.gt_alignment_ready_queue = deque()
         self.measurement_results_by_pair_id = {}
         self.gt_alignments_by_pair_id = {}
@@ -840,6 +853,7 @@ class StereoDistanceNode(Node):
         self.plot_thread = threading.Thread(target=self._plot_publish_loop, daemon=True)
         self.plot_thread.start()
         self._start_yolo_worker_if_enabled()
+        self._start_rviz_live_worker_if_enabled()
 
         self.get_logger().info(
             "Stereo distance node started "
@@ -1734,6 +1748,12 @@ class StereoDistanceNode(Node):
             if pair.epoch != self.simulation_epoch.epoch:
                 self.old_epoch_frame_count += 1
                 continue
+            if (
+                getattr(self, "rviz_live_latest_only", False)
+                and getattr(self, "enable_rviz_rays", False)
+                and getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo"
+            ):
+                self.rviz_live_latest_pair = pair
             if self.measurement_overrun_invalid:
                 self.measurement_rejected_after_overrun_count += 1
                 self.measurement_rejected_pair_ids.add(pair.pair_id)
@@ -2318,6 +2338,12 @@ class StereoDistanceNode(Node):
                 self.yolo_target_hz = max(0.0, float(param.value))
             elif param.name == "yolo_imgsz":
                 self.yolo_imgsz = max(64, int(param.value))
+            elif param.name == "rviz_live_latest_only":
+                self.rviz_live_latest_only = self._coerce_bool(param.value)
+                self.yolo_condition.notify_all()
+            elif param.name == "rviz_live_ray_hz":
+                self.rviz_live_ray_hz = max(0.1, float(param.value))
+                self.yolo_condition.notify_all()
             elif param.name == "enable_synthetic_detections":
                 self.enable_synthetic_detections = self._coerce_bool(param.value)
             elif param.name == "synthetic_detection_width_px":
@@ -2676,6 +2702,22 @@ class StereoDistanceNode(Node):
             daemon=True,
         )
         self.yolo_thread.start()
+        return True
+
+    def _start_rviz_live_worker_if_enabled(self):
+        self.rviz_live_thread = None
+        if not (
+            self._should_subscribe_camera_images()
+            and getattr(self, "enable_rviz_rays", False)
+            and getattr(self, "rviz_live_latest_only", False)
+            and getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo"
+        ):
+            return False
+        self.rviz_live_thread = threading.Thread(
+            target=self._rviz_live_worker_loop,
+            daemon=True,
+        )
+        self.rviz_live_thread.start()
         return True
 
     def _disable_yolo_runtime(self, reason):
@@ -3079,6 +3121,11 @@ class StereoDistanceNode(Node):
             self.yolo_condition.notify_all()
         if self.yolo_thread is not None and self.yolo_thread.is_alive():
             self.yolo_thread.join(timeout=2.0)
+        if (
+            getattr(self, "rviz_live_thread", None) is not None
+            and self.rviz_live_thread.is_alive()
+        ):
+            self.rviz_live_thread.join(timeout=2.0)
         self._finalize_research_recording()
 
     def _command_gazebo_target_pose(self, state):
@@ -3332,6 +3379,55 @@ class StereoDistanceNode(Node):
             "camera_oracle_snapshot": camera_oracle_snapshot,
         }
 
+    def _rviz_live_worker_loop(self):
+        """Publish RViz rays from the newest camera pair, independent of recording FIFO."""
+
+        if getattr(self, "observation_mode", "bbox_yolo") != "bbox_yolo":
+            return
+        self._warm_yolo_model()
+        next_tick = time.monotonic()
+        while not self.shutdown_event.is_set():
+            pair = None
+            phase = None
+            with self.yolo_condition:
+                while not self.shutdown_event.is_set():
+                    latest = getattr(self, "rviz_live_latest_pair", None)
+                    if (
+                        latest is not None
+                        and latest.pair_id
+                        > getattr(self, "rviz_live_latest_processed_pair_id", 0)
+                    ):
+                        break
+                    self.yolo_condition.wait(timeout=0.1)
+                if self.shutdown_event.is_set():
+                    return
+                wait_s = next_tick - time.monotonic()
+                if wait_s > 0.0:
+                    self.yolo_condition.wait(timeout=wait_s)
+                    continue
+                pair = self.rviz_live_latest_pair
+                phase = self._mission_state()["phase"]
+                self.rviz_live_latest_processed_pair_id = pair.pair_id
+                next_tick = time.monotonic() + 1.0 / max(
+                    0.1, float(getattr(self, "rviz_live_ray_hz", 2.0))
+                )
+            try:
+                computed = self._compute_pair_measurement(pair, phase)
+                raw = computed.get("raw")
+                if raw is not None:
+                    self._publish_ray_markers(
+                        nominal=raw,
+                        optical=computed.get("corrected"),
+                    )
+                    self.rviz_live_publish_count += 1
+            except Exception as exc:
+                self.rviz_live_error_count += 1
+                if self.rviz_live_error_count == 1 or self.rviz_live_error_count % 50 == 0:
+                    self.get_logger().warning(
+                        "Latest-only RViz ray publish failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
     def _commit_pair_measurement_if_current(self, pair, computed):
         """Linearization point for reset versus measurement publication.
 
@@ -3439,7 +3535,8 @@ class StereoDistanceNode(Node):
                 }
             )
             self._publish_ray_metrics(nominal=raw, optical=optical)
-            self._publish_ray_markers(nominal=raw, optical=optical)
+            if not self._rviz_latest_only_markers_enabled():
+                self._publish_ray_markers(nominal=raw, optical=optical)
         metrics.update(
             {
                 "optical_computation_status": (
@@ -3773,7 +3870,8 @@ class StereoDistanceNode(Node):
         metrics.update(evaluation)
         if ideal is not None:
             self._publish_ray_metrics(ideal=ideal)
-            self._publish_ray_markers(ideal=ideal)
+            if not self._rviz_latest_only_markers_enabled():
+                self._publish_ray_markers(ideal=ideal)
         # The initial publish happens before GT alignment exists.  Republish
         # after the DKL reference has been evaluated so rqt receives it without
         # waiting for the periodic plot sampler.
@@ -4390,14 +4488,15 @@ class StereoDistanceNode(Node):
         return np.repeat(pixels, 3, axis=2).copy()
 
     def _reset_yolo_model(self):
-        self.yolo_model = None
-        self.yolo_model_device = None
-        self.yolo_model_loaded_path = None
-        self.yolo_load_error = ""
-        self.yolo_runtime_disabled = False
-        self.yolo_runtime_disable_reason = ""
-        self.yolo_runtime_warning_logged = False
-        self.yolo_class_warning_logged = False
+        with self.yolo_model_lock:
+            self.yolo_model = None
+            self.yolo_model_device = None
+            self.yolo_model_loaded_path = None
+            self.yolo_load_error = ""
+            self.yolo_runtime_disabled = False
+            self.yolo_runtime_disable_reason = ""
+            self.yolo_runtime_warning_logged = False
+            self.yolo_class_warning_logged = False
 
     def _load_yolo_model(self):
         if self.yolo_runtime_disabled:
@@ -4435,29 +4534,32 @@ class StereoDistanceNode(Node):
     def _warm_yolo_model(self):
         if self.yolo_warmed_up:
             return
-        model = self._load_yolo_model()
-        if model is None:
-            return
-        try:
-            device = self._move_yolo_model(model, self.resolved_yolo_device or self._resolve_yolo_device())
-            warmup_image = np.zeros((self.yolo_imgsz, self.yolo_imgsz, 3), dtype=np.uint8)
-            predict_kwargs = {
-                "source": warmup_image,
-                "conf": float(self.yolo_confidence),
-                "device": device,
-                "imgsz": int(self.yolo_imgsz),
-                "verbose": False,
-            }
-            if device.startswith("cuda"):
-                predict_kwargs["quantize"] = 16
-            started = time.monotonic()
-            model.predict(**predict_kwargs)
-            elapsed_ms = (time.monotonic() - started) * 1000.0
-            self.yolo_warmed_up = True
-            self.get_logger().info(f"YOLO warmup completed in {elapsed_ms:.1f} ms.")
-        except Exception as exc:
-            self.yolo_load_error = f"YOLO warmup failed: {exc}"
-            self.get_logger().warning(self.yolo_load_error)
+        with self.yolo_model_lock:
+            if self.yolo_warmed_up:
+                return
+            model = self._load_yolo_model()
+            if model is None:
+                return
+            try:
+                device = self._move_yolo_model(model, self.resolved_yolo_device or self._resolve_yolo_device())
+                warmup_image = np.zeros((self.yolo_imgsz, self.yolo_imgsz, 3), dtype=np.uint8)
+                predict_kwargs = {
+                    "source": warmup_image,
+                    "conf": float(self.yolo_confidence),
+                    "device": device,
+                    "imgsz": int(self.yolo_imgsz),
+                    "verbose": False,
+                }
+                if device.startswith("cuda"):
+                    predict_kwargs["quantize"] = 16
+                started = time.monotonic()
+                model.predict(**predict_kwargs)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                self.yolo_warmed_up = True
+                self.get_logger().info(f"YOLO warmup completed in {elapsed_ms:.1f} ms.")
+            except Exception as exc:
+                self.yolo_load_error = f"YOLO warmup failed: {exc}"
+                self.get_logger().warning(self.yolo_load_error)
 
     def _target_class_ids(self, model):
         class_name = self.yolo_class_name.strip().lower()
@@ -4478,29 +4580,30 @@ class StereoDistanceNode(Node):
         return target_ids
 
     def _detect_drone(self, image, device=None):
-        model = self._load_yolo_model()
-        if model is None:
-            return None
-        target_ids = self._target_class_ids(model)
-        if target_ids == []:
-            return None
-        if device is None:
-            device = self._resolve_yolo_device()
-        device = self._move_yolo_model(model, device)
-        predict_kwargs = {
-            "source": image,
-            "conf": float(self.yolo_confidence),
-            "device": device,
-            "imgsz": int(self.yolo_imgsz),
-            "verbose": False,
-        }
-        if device.startswith("cuda"):
-            predict_kwargs["quantize"] = 16
-        try:
-            results = model.predict(**predict_kwargs)
-        except Exception as exc:
-            self.yolo_load_error = f"YOLO predict failed: {exc}"
-            return None
+        with self.yolo_model_lock:
+            model = self._load_yolo_model()
+            if model is None:
+                return None
+            target_ids = self._target_class_ids(model)
+            if target_ids == []:
+                return None
+            if device is None:
+                device = self._resolve_yolo_device()
+            device = self._move_yolo_model(model, device)
+            predict_kwargs = {
+                "source": image,
+                "conf": float(self.yolo_confidence),
+                "device": device,
+                "imgsz": int(self.yolo_imgsz),
+                "verbose": False,
+            }
+            if device.startswith("cuda"):
+                predict_kwargs["quantize"] = 16
+            try:
+                results = model.predict(**predict_kwargs)
+            except Exception as exc:
+                self.yolo_load_error = f"YOLO predict failed: {exc}"
+                return None
         if not results:
             return None
         boxes = getattr(results[0], "boxes", None)
@@ -4529,29 +4632,30 @@ class StereoDistanceNode(Node):
         return best
 
     def _detect_drone_pair(self, left_image, right_image, device=None):
-        model = self._load_yolo_model()
-        if model is None:
-            return None, None
-        target_ids = self._target_class_ids(model)
-        if target_ids == []:
-            return None, None
-        if device is None:
-            device = self._resolve_yolo_device()
-        device = self._move_yolo_model(model, device)
-        predict_kwargs = {
-            "source": [left_image, right_image],
-            "conf": float(self.yolo_confidence),
-            "device": device,
-            "imgsz": int(self.yolo_imgsz),
-            "verbose": False,
-        }
-        if device.startswith("cuda"):
-            predict_kwargs["quantize"] = 16
-        try:
-            results = model.predict(**predict_kwargs)
-        except Exception as exc:
-            self.yolo_load_error = f"YOLO predict failed: {exc}"
-            return None, None
+        with self.yolo_model_lock:
+            model = self._load_yolo_model()
+            if model is None:
+                return None, None
+            target_ids = self._target_class_ids(model)
+            if target_ids == []:
+                return None, None
+            if device is None:
+                device = self._resolve_yolo_device()
+            device = self._move_yolo_model(model, device)
+            predict_kwargs = {
+                "source": [left_image, right_image],
+                "conf": float(self.yolo_confidence),
+                "device": device,
+                "imgsz": int(self.yolo_imgsz),
+                "verbose": False,
+            }
+            if device.startswith("cuda"):
+                predict_kwargs["quantize"] = 16
+            try:
+                results = model.predict(**predict_kwargs)
+            except Exception as exc:
+                self.yolo_load_error = f"YOLO predict failed: {exc}"
+                return None, None
         detections = [self._best_detection_from_result(result, target_ids) for result in results[:2]]
         while len(detections) < 2:
             detections.append(None)
@@ -5548,6 +5652,13 @@ class StereoDistanceNode(Node):
             payload["ideal_pixel_source"] = "ground_truth_world_enu_quantized_nominal_projection"
         if payload:
             publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
+
+    def _rviz_latest_only_markers_enabled(self):
+        return (
+            bool(getattr(self, "rviz_live_latest_only", False))
+            and bool(getattr(self, "enable_rviz_rays", False))
+            and getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo"
+        )
 
     def _publish_actual_drone_marker(self, position_world_enu_m, orientation_xyzw, stamp_ns):
         """Render the authoritative Gazebo vehicle-reference pose as a drone mesh."""

@@ -105,10 +105,14 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
 def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> None:
     source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
 
-    assert "self._publish_ray_markers(nominal=raw, optical=optical)" in source
+    assert "_rviz_live_worker_loop" in source
+    assert "rviz_live_latest_only" in source
+    assert "rviz_live_ray_hz" in source
+    assert "self._publish_ray_metrics(nominal=raw, optical=optical)" in source
+    assert "if not self._rviz_latest_only_markers_enabled()" in source
     assert 'self.create_publisher(MarkerArray, "/stereo/ray_markers", ray_marker_qos)' in source
     assert "durability=DurabilityPolicy.TRANSIENT_LOCAL" in source
-    assert 'self._publish_ray_markers(ideal=ideal)' in source
+    assert 'self._publish_ray_metrics(ideal=ideal)' in source
     assert 'label="nominal"' in source
     assert 'label="optical"' in source
     assert 'label="ideal"' in source
@@ -124,6 +128,15 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     assert 'left_target, 2.0)' in source
     assert 'right_target, 2.0)' in source
     assert 'left_target, right_target, 1.5)' in source
+
+
+def test_launch_exposes_latest_only_rviz_ray_controls() -> None:
+    launch = (ROOT_DIR / "stereo_ground_sim" / "launch" / "stereo_ground_sim.launch.py").read_text(encoding="utf-8")
+
+    assert 'DeclareLaunchArgument("rviz_live_latest_only", default_value="true")' in launch
+    assert 'DeclareLaunchArgument("rviz_live_ray_hz", default_value="5.0")' in launch
+    assert '"rviz_live_latest_only"' in launch
+    assert '"rviz_live_ray_hz"' in launch
 
 
 def test_rviz_ray_colors_match_the_nominal_optical_and_ideal_rqt_series() -> None:
