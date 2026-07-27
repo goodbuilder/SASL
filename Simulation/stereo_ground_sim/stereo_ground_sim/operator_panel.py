@@ -99,6 +99,18 @@ CSV_PREVIEW_TABLE_ROWS = 40
 CSV_PREVIEW_RAW_ROWS = 20
 
 
+def _env_float(name, default, minimum):
+    try:
+        return max(float(minimum), float(os.environ.get(name, str(default))))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+RQT_IMAGE_RENDER_HZ = _env_float("RQT_IMAGE_RENDER_HZ", 5.0, 0.5)
+RQT_FACTS_RENDER_HZ = _env_float("RQT_FACTS_RENDER_HZ", 5.0, 0.5)
+RQT_PREVIEW_RENDER_HZ = _env_float("RQT_PREVIEW_RENDER_HZ", 2.0, 0.5)
+
+
 def _finite_tuple(values, size):
     result = tuple(float(value) for value in values)
     if len(result) != size or not all(math.isfinite(value) for value in result):
@@ -244,6 +256,8 @@ class TelemetryFacts(QWidget):
         }
         self._latest_scalars = {"yolo_hz": math.nan, "yolo_ms": math.nan}
         self._profile_text = "--"
+        self._detection_text = "BBox L/R: --"
+        self._refresh_pending = True
 
         layout = QGridLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
@@ -284,6 +298,10 @@ class TelemetryFacts(QWidget):
             "TelemetryFacts { background: #eef3f6; border: 1px solid #b0bec5; }"
             "QLabel { padding: 1px 2px; }"
         )
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(int(1000.0 / RQT_FACTS_RENDER_HZ))
+        self._refresh_timer.timeout.connect(self._refresh_if_pending)
+        self._refresh_timer.start()
 
     @staticmethod
     def _format_float(value, precision=1):
@@ -302,14 +320,14 @@ class TelemetryFacts(QWidget):
             except (IndexError, TypeError, ValueError):
                 parsed.append(math.nan)
         self._latest[series_name] = parsed
-        self._refresh()
+        self._request_refresh()
 
     def update_scalar(self, key, value):
         try:
             self._latest_scalars[key] = float(value)
         except (TypeError, ValueError):
             self._latest_scalars[key] = math.nan
-        self._refresh()
+        self._request_refresh()
 
     def update_profile(self, payload):
         try:
@@ -323,7 +341,7 @@ class TelemetryFacts(QWidget):
             self._profile_text = f"{profile_id}/{mode}" + (f" {fallback}" if fallback else "")
         else:
             self._profile_text = str(payload)[:120] or "--"
-        self._refresh()
+        self._request_refresh()
 
     def update_detections(self, values):
         try:
@@ -331,16 +349,27 @@ class TelemetryFacts(QWidget):
         except (TypeError, ValueError):
             data = []
         if len(data) < 16:
-            self._detection_label.setText("BBox L/R: --")
+            self._detection_text = "BBox L/R: --"
+            self._request_refresh()
             return
         left = ",".join(self._format_float(value, 0) for value in data[1:5])
         right = ",".join(self._format_float(value, 0) for value in data[9:13])
         disparity = self._format_float(data[6] - data[14], 1)
         confidence = "/".join(self._format_float(value, 2) for value in (data[5], data[13]))
-        self._detection_label.setText(
+        self._detection_text = (
             f"BBox L[x1,y1,x2,y2]={left}  R[x1,y1,x2,y2]={right}  "
             f"disparity={disparity}px  conf L/R={confidence}"
         )
+        self._request_refresh()
+
+    def _request_refresh(self):
+        self._refresh_pending = True
+
+    def _refresh_if_pending(self):
+        if not self._refresh_pending:
+            return
+        self._refresh_pending = False
+        self._refresh()
 
     def _refresh(self):
         self._profile_label.setText(f"Profile: {self._profile_text}")
@@ -361,6 +390,7 @@ class TelemetryFacts(QWidget):
             "Raw GPS baseline F/R/D/R: "
             f"{self._format_frd(self._latest['raw_gps_baseline'])}"
         )
+        self._detection_label.setText(self._detection_text)
 
 
 class ExperimentHud(QWidget):
@@ -396,6 +426,7 @@ class ExperimentHud(QWidget):
         }
         self._profile_text = "--"
         self._profile_not_configured = False
+        self._refresh_pending = True
 
         mission = os.environ.get("RQT_MISSION_LABEL", "Mission: --").strip() or "Mission: --"
         contract = os.environ.get(
@@ -463,6 +494,10 @@ class ExperimentHud(QWidget):
             "ExperimentHud { background: #eef3f6; border: 1px solid #b0bec5; }"
             "QLabel { padding: 1px 2px; }"
         )
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(int(1000.0 / RQT_FACTS_RENDER_HZ))
+        self._refresh_timer.timeout.connect(self._refresh_if_pending)
+        self._refresh_timer.start()
         self._refresh()
 
 
@@ -476,7 +511,7 @@ class LiveSavedCsvPreview(QWidget):
                 ("time_sec", "Time (s)"),
                 ("ground_truth_m", "Truth range (m)"),
                 ("raw_range_m", "Nominal range (m)"),
-                ("raw_gps_baseline_forward_m", "Raw GPS F (m)"),
+                ("raw_gps_baseline_range_m", "Raw GPS range (m)"),
             ),
         ),
         (
@@ -575,6 +610,7 @@ class LiveSavedCsvPreview(QWidget):
         self._stopped = False
         self._live_started_monotonic = time.monotonic()
         self._live_latest = {}
+        self._live_preview_dirty = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -622,6 +658,10 @@ class LiveSavedCsvPreview(QWidget):
         self._open_xlsx_button.clicked.connect(self._open_xlsx)
         self._export_button.clicked.connect(self._export_analysis_csv)
         self._last_signature = None
+        self._live_preview_timer = QTimer(self)
+        self._live_preview_timer.setInterval(int(1000.0 / RQT_PREVIEW_RENDER_HZ))
+        self._live_preview_timer.timeout.connect(self._flush_live_preview)
+        self._live_preview_timer.start()
         QTimer.singleShot(500, self._refresh_periodically)
 
     @staticmethod
@@ -714,6 +754,13 @@ class LiveSavedCsvPreview(QWidget):
         self._set_action_state(None)
 
     def _refresh_live_preview(self):
+        if self._recording_controls.recording_csv_path() is None:
+            self._live_preview_dirty = True
+
+    def _flush_live_preview(self):
+        if not self._live_preview_dirty:
+            return
+        self._live_preview_dirty = False
         if self._recording_controls.recording_csv_path() is None:
             self._show_live_preview()
 
@@ -1016,7 +1063,7 @@ class LiveSavedCsvPreview(QWidget):
             self._append_error_sample(series_name, axis_index=0, axis_name="forward", now=now)
             self._append_error_sample(series_name, axis_index=2, axis_name="down", now=now)
         self._prune(now)
-        self._refresh()
+        self._request_refresh()
 
     def update_scalar(self, key, value):
         try:
@@ -1024,7 +1071,7 @@ class LiveSavedCsvPreview(QWidget):
             self._latest_stamp[key] = time.monotonic()
         except (TypeError, ValueError):
             self._latest_scalars[key] = math.nan
-        self._refresh()
+        self._request_refresh()
 
     def update_profile(self, payload):
         text = str(payload)
@@ -1058,7 +1105,7 @@ class LiveSavedCsvPreview(QWidget):
             self._profile_not_configured = False
         self._profile_text = text[:120]
         self._latest_stamp["profile"] = time.monotonic()
-        self._refresh()
+        self._request_refresh()
 
     def update_detections(self, values):
         now = time.monotonic()
@@ -1093,6 +1140,15 @@ class LiveSavedCsvPreview(QWidget):
         self._detection_history.append((now, bool(valid)))
         self._latest_stamp["detections"] = now
         self._prune(now)
+        self._request_refresh()
+
+    def _request_refresh(self):
+        self._refresh_pending = True
+
+    def _refresh_if_pending(self):
+        if not self._refresh_pending:
+            return
+        self._refresh_pending = False
         self._refresh()
 
     def _append_error_sample(self, series_name, axis_index, axis_name, now):
@@ -1205,10 +1261,15 @@ class FrdPlotStack(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(660, 880)
+        self._repaint_pending = False
         self.samples = {
             axis_name: {series_name: deque() for series_name, _, _ in SERIES}
             for axis_name, _ in AXES
         }
+        self._repaint_timer = QTimer(self)
+        self._repaint_timer.setInterval(int(1000.0 / RQT_FACTS_RENDER_HZ))
+        self._repaint_timer.timeout.connect(self._flush_repaint)
+        self._repaint_timer.start()
 
     def append(self, series_name, values):
         now = time.monotonic()
@@ -1224,6 +1285,12 @@ class FrdPlotStack(QWidget):
             cutoff = now - PLOT_WINDOW_S
             while history and history[0][0] < cutoff:
                 history.popleft()
+        self._repaint_pending = True
+
+    def _flush_repaint(self):
+        if not self._repaint_pending:
+            return
+        self._repaint_pending = False
         self.update()
 
     def paintEvent(self, _event):
@@ -1292,7 +1359,7 @@ class FrdPlotStack(QWidget):
                 painter.setPen(QPen(color, 3))
                 painter.drawLine(legend_x, legend_y, legend_x + 20, legend_y)
                 painter.setPen(QPen(QColor(32, 32, 32), 1))
-                painter.drawText(legend_x + 26, legend_y + 5, SERIES_LABELS[series_name])
+                painter.drawText(legend_x + 35, legend_y + 5, SERIES_LABELS[series_name])
                 legend_y += 20
 
             for series_name, _topic, color in SERIES:
@@ -1332,6 +1399,8 @@ class OperatorPanel(Plugin):
         self._ros_graph_process = None
         self._spin_thread = None
         self._stop_event = threading.Event()
+        self._image_emit_lock = threading.Lock()
+        self._last_image_emit_monotonic = {}
         self._bridge = PanelBridge()
 
         self._widget = QWidget()
@@ -1562,13 +1631,13 @@ class OperatorPanel(Plugin):
             self._ros_node.create_subscription(
                 Image,
                 IMAGE_TOPICS[0][1],
-                lambda msg: self._bridge.image.emit("left", self._image_payload(msg)),
+                lambda msg: self._emit_image_sample("left", msg),
                 qos_profile_sensor_data,
             )
             self._ros_node.create_subscription(
                 Image,
                 IMAGE_TOPICS[1][1],
-                lambda msg: self._bridge.image.emit("right", self._image_payload(msg)),
+                lambda msg: self._emit_image_sample("right", msg),
                 qos_profile_sensor_data,
             )
             for series_name, topic, _color in SERIES:
@@ -1722,6 +1791,16 @@ class OperatorPanel(Plugin):
 
     def _image_payload(self, msg):
         return (int(msg.width), int(msg.height), str(msg.encoding), int(msg.step), bytes(msg.data))
+
+    def _emit_image_sample(self, name, msg):
+        now = time.monotonic()
+        min_period_s = 1.0 / RQT_IMAGE_RENDER_HZ
+        with self._image_emit_lock:
+            last = self._last_image_emit_monotonic.get(name, 0.0)
+            if now - last < min_period_s:
+                return
+            self._last_image_emit_monotonic[name] = now
+        self._bridge.image.emit(name, self._image_payload(msg))
 
     def _spin_loop(self):
         if self._ros_node is None or rclpy is None:

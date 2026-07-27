@@ -67,6 +67,7 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert '("Range", 3)' in source
     assert "FRDR comparison" in source
     assert "legend_x = right + 12" in source
+    assert "legend_x + 35" in source
     assert "_ASPECT_HEIGHT_PER_WIDTH = 9.0 / 16.0" in source
     assert "QSizePolicy.Ignored, QSizePolicy.MinimumExpanding" in source
     assert "layout.addLayout(cameras)" in source
@@ -90,12 +91,21 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert "persisted telemetry rows here" not in source
     assert "CSV_PREVIEW_TABLE_ROWS = 40" in source
     assert "CSV_PREVIEW_RAW_ROWS = 20" in source
+    assert 'RQT_IMAGE_RENDER_HZ = _env_float("RQT_IMAGE_RENDER_HZ", 5.0, 0.5)' in source
+    assert 'RQT_FACTS_RENDER_HZ = _env_float("RQT_FACTS_RENDER_HZ", 5.0, 0.5)' in source
+    assert 'RQT_PREVIEW_RENDER_HZ = _env_float("RQT_PREVIEW_RENDER_HZ", 2.0, 0.5)' in source
+    assert "_emit_image_sample" in source
+    assert "_flush_live_preview" in source
+    assert "_flush_repaint" in source
+    assert "_refresh_if_pending" in source
     assert "read_recent_csv_lines(csv_path, data_row_count=CSV_PREVIEW_RAW_ROWS)" in source
     assert 'QPushButton("Open session")' in source
     assert 'QPushButton("Open CSV")' in source
     assert 'QPushButton("Open XLSX")' in source
     assert 'QPushButton("Export analysis CSV")' in source
     assert "read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)" in source
+    assert '("raw_gps_baseline_range_m", "Raw GPS range (m)")' in source
+    assert '("raw_gps_baseline_forward_m", "Raw GPS F (m)")' in source
     for record_view in ("Summary", "Raw GPS", "BBox", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
         assert f'"{record_view}"' in source
 

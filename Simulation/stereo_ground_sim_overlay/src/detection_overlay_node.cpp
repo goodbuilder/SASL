@@ -53,7 +53,7 @@ public:
         updateCachedOverlay("right", msg);
       });
     detections_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
-      "/stereo/detections", 10,
+      "/stereo/live_detections", 10,
       [this](std_msgs::msg::Float32MultiArray::ConstSharedPtr msg) {
         if (msg->data.size() < 16) {
           return;

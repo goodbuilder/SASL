@@ -10,5 +10,7 @@ def test_flight_overlay_uses_red_bbox_observations() -> None:
 
     assert "pair_has_positive_disparity" not in source
     assert "drawMissingBorder" not in source
+    assert '"/stereo/live_detections"' in source
+    assert '"/stereo/detections"' not in source
     assert "const std::array<uint8_t, 3> color{255, 0, 0};" in source
     assert "high-contrast display colour" in source

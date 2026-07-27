@@ -813,6 +813,9 @@ class StereoDistanceNode(Node):
         self.detections_pub = self.create_publisher(
             Float32MultiArray, "/stereo/detections", 10
         )
+        self.live_detections_pub = self.create_publisher(
+            Float32MultiArray, "/stereo/live_detections", 10
+        )
         if self.enable_external_bbox_detections:
             self.create_subscription(
                 Float32MultiArray,
@@ -3415,6 +3418,10 @@ class StereoDistanceNode(Node):
                 computed = self._compute_pair_measurement(pair, phase)
                 raw = computed.get("raw")
                 if raw is not None:
+                    left = computed.get("left")
+                    right = computed.get("right")
+                    if left is not None or right is not None:
+                        self.live_detections_pub.publish(self._detections_to_msg(left, right))
                     ideal = self._latest_rviz_ideal_ray(pair)
                     self._publish_ray_markers(
                         nominal=raw,

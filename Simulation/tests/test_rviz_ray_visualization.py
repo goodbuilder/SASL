@@ -107,6 +107,8 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
 
     assert "_rviz_live_worker_loop" in source
     assert "_latest_rviz_ideal_ray" in source
+    assert '"/stereo/live_detections"' in source
+    assert "self.live_detections_pub.publish(self._detections_to_msg(left, right))" in source
     assert "rviz_live_latest_only" in source
     assert "rviz_live_ray_hz" in source
     assert "self._publish_ray_metrics(nominal=raw, optical=optical)" in source

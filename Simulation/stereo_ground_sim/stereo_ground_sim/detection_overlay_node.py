@@ -39,7 +39,7 @@ class DetectionOverlayNode(Node):
         )
         self.create_subscription(ImageMsg, "/left_camera/image", self._left_cb, camera_qos)
         self.create_subscription(ImageMsg, "/right_camera/image", self._right_cb, camera_qos)
-        self.create_subscription(Float32MultiArray, "/stereo/detections", self._detections_cb, 10)
+        self.create_subscription(Float32MultiArray, "/stereo/live_detections", self._detections_cb, 10)
 
         self.left_pub = self.create_publisher(
             ImageMsg, "/left_camera/detection_image", qos_profile_sensor_data
