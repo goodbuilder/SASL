@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - allows recorder shell/tests without PX
 cv2 = None
 _CLOSING = False
 AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
-XLSX_SCHEMA_VERSION = "1"
+XLSX_SCHEMA_VERSION = "2"
 
 
 NUMERIC_TOPICS = {
@@ -71,6 +71,20 @@ CORRECTED_POSITION_FIELDS = [
     "corrected_right_m",
     "corrected_down_m",
     "corrected_range_m",
+]
+
+OPTICAL_POSITION_FIELDS = [
+    "optical_forward_m",
+    "optical_right_m",
+    "optical_down_m",
+    "optical_range_m",
+]
+
+IDEAL_POSITION_FIELDS = [
+    "ideal_forward_m",
+    "ideal_right_m",
+    "ideal_down_m",
+    "ideal_range_m",
 ]
 
 GPS_BASELINE_POSITION_FIELDS = [
@@ -149,12 +163,62 @@ DETECTION_MESSAGE_FIELDS = [
     "right_cy",
 ]
 
+IDEAL_OBSERVATION_FIELDS = [
+    "ideal_left_u_px",
+    "ideal_left_v_px",
+    "ideal_right_u_px",
+    "ideal_right_v_px",
+    "ideal_disparity_px",
+    "ideal_pixel_source",
+]
+
+RAY_TYPES = ("nominal", "optical", "ideal")
+
+
+def _ray_fields():
+    fields = []
+    for prefix in RAY_TYPES:
+        fields.extend(
+            (
+                f"{prefix}_ray_computation_status",
+                f"{prefix}_ray_forward_m",
+                f"{prefix}_ray_right_m",
+                f"{prefix}_ray_down_m",
+                f"{prefix}_ray_range_m",
+                f"{prefix}_ray_gap_m",
+                f"{prefix}_ray_intersection_angle_deg",
+                f"{prefix}_ray_left_depth_m",
+                f"{prefix}_ray_right_depth_m",
+                f"{prefix}_ray_left_point_forward_m",
+                f"{prefix}_ray_left_point_right_m",
+                f"{prefix}_ray_left_point_down_m",
+                f"{prefix}_ray_right_point_forward_m",
+                f"{prefix}_ray_right_point_right_m",
+                f"{prefix}_ray_right_point_down_m",
+                f"{prefix}_ray_midpoint_forward_m",
+                f"{prefix}_ray_midpoint_right_m",
+                f"{prefix}_ray_midpoint_down_m",
+            )
+        )
+    return fields
+
+
+RAY_FIELDS = _ray_fields()
+
 PROFILE_STATUS_FIELDS = [
     "profile_id",
     "profile_mode",
     "profile_fallback_level",
     "profile_fallback_reason",
 ]
+
+TEXT_TELEMETRY_FIELDS = {
+    "profile_id",
+    "profile_mode",
+    "profile_fallback_reason",
+    "ideal_pixel_source",
+    *(f"{prefix}_ray_computation_status" for prefix in RAY_TYPES),
+}
 
 
 def _camera_px4_fields():
@@ -196,6 +260,36 @@ def _camera_px4_fields():
                 f"{label}_px4_estimated_optical_world_enu_yaw_deg",
             )
         )
+    fields.extend(
+        (
+            "uam_raw_gps_timestamp_us",
+            "uam_raw_gps_lat_deg",
+            "uam_raw_gps_lon_deg",
+            "uam_raw_gps_alt_msl_m",
+            "uam_raw_gps_eph_m",
+            "uam_raw_gps_epv_m",
+            "uam_raw_gps_vel_n_m_s",
+            "uam_raw_gps_vel_e_m_s",
+            "uam_raw_gps_vel_d_m_s",
+            "uam_global_position_timestamp_us",
+            "uam_global_position_lat_deg",
+            "uam_global_position_lon_deg",
+            "uam_global_position_alt_msl_m",
+            "uam_global_position_eph_m",
+            "uam_global_position_epv_m",
+            "uam_px4_odometry_timestamp_us",
+            "uam_px4_position_n_m",
+            "uam_px4_position_e_m",
+            "uam_px4_position_d_m",
+            "uam_px4_attitude_world_enu_roll_deg",
+            "uam_px4_attitude_world_enu_pitch_deg",
+            "uam_px4_attitude_world_enu_yaw_deg",
+            "uam_px4_velocity_n_m_s",
+            "uam_px4_velocity_e_m_s",
+            "uam_px4_velocity_d_m_s",
+            "uam_px4_odometry_reset_counter",
+        )
+    )
     return fields
 
 
@@ -214,6 +308,10 @@ TELEMETRY_FIELDS = (
     + DETECTION_FIELDS
     + PROFILE_STATUS_FIELDS
     + CAMERA_PX4_FIELDS
+    + OPTICAL_POSITION_FIELDS
+    + IDEAL_POSITION_FIELDS
+    + IDEAL_OBSERVATION_FIELDS
+    + RAY_FIELDS
 )
 
 PROGRESS_VALIDITY_FIELDS = (
@@ -226,7 +324,53 @@ PROGRESS_VALIDITY_FIELDS = (
     "right_x1",
 )
 
-XLSX_SHEET_FIELDS = (
+def _px4_sheet_fields(label):
+    prefix = "uam" if label == "uam" else label
+    fields = [
+        "time_sec",
+        "ros_time_sec",
+        f"{prefix}_raw_gps_timestamp_us",
+        f"{prefix}_raw_gps_lat_deg",
+        f"{prefix}_raw_gps_lon_deg",
+        f"{prefix}_raw_gps_alt_msl_m",
+        f"{prefix}_raw_gps_eph_m",
+        f"{prefix}_raw_gps_epv_m",
+        f"{prefix}_raw_gps_vel_n_m_s",
+        f"{prefix}_raw_gps_vel_e_m_s",
+        f"{prefix}_raw_gps_vel_d_m_s",
+        f"{prefix}_global_position_timestamp_us",
+        f"{prefix}_global_position_lat_deg",
+        f"{prefix}_global_position_lon_deg",
+        f"{prefix}_global_position_alt_msl_m",
+        f"{prefix}_global_position_eph_m",
+        f"{prefix}_global_position_epv_m",
+        f"{prefix}_px4_odometry_timestamp_us",
+        f"{prefix}_px4_position_n_m",
+        f"{prefix}_px4_position_e_m",
+        f"{prefix}_px4_position_d_m",
+        f"{prefix}_px4_attitude_world_enu_roll_deg",
+        f"{prefix}_px4_attitude_world_enu_pitch_deg",
+        f"{prefix}_px4_attitude_world_enu_yaw_deg",
+        f"{prefix}_px4_velocity_n_m_s",
+        f"{prefix}_px4_velocity_e_m_s",
+        f"{prefix}_px4_velocity_d_m_s",
+        f"{prefix}_px4_odometry_reset_counter",
+    ]
+    if label in ("left", "right"):
+        fields.extend(
+            [
+                f"{prefix}_px4_estimated_optical_world_enu_x_m",
+                f"{prefix}_px4_estimated_optical_world_enu_y_m",
+                f"{prefix}_px4_estimated_optical_world_enu_z_m",
+                f"{prefix}_px4_estimated_optical_world_enu_roll_deg",
+                f"{prefix}_px4_estimated_optical_world_enu_pitch_deg",
+                f"{prefix}_px4_estimated_optical_world_enu_yaw_deg",
+            ]
+        )
+    return tuple(fields)
+
+
+XLSX_DIRECT_SHEET_FIELDS = (
     (
         "Summary",
         (
@@ -236,33 +380,30 @@ XLSX_SHEET_FIELDS = (
             "ground_truth_m",
             "raw_range_m",
             "corrected_range_m",
+            "optical_range_m",
+            "ideal_range_m",
             "target_distance_m",
             "distance_error_m",
             "disparity_px",
+            "raw_disparity_px",
+            "yolo_update_hz",
+            "yolo_inference_ms",
         ),
     ),
     (
-        "Baseline",
-        (
-            "time_sec",
-            "ros_time_sec",
-            "axis_contract",
-            "raw_gps_baseline_forward_m",
-            "raw_gps_baseline_right_m",
-            "raw_gps_baseline_down_m",
-            "raw_gps_baseline_position_error_m",
-            "global_position_baseline_forward_m",
-            "global_position_baseline_right_m",
-            "global_position_baseline_down_m",
-            "global_position_baseline_position_error_m",
-            "raw_minus_global_baseline_forward_m",
-            "raw_minus_global_baseline_right_m",
-            "raw_minus_global_baseline_down_m",
-            "raw_minus_global_baseline_delta_m",
-        ),
+        "UAV PX4",
+        _px4_sheet_fields("uam"),
     ),
     (
-        "BBox",
+        "Left PX4",
+        _px4_sheet_fields("left"),
+    ),
+    (
+        "Right PX4",
+        _px4_sheet_fields("right"),
+    ),
+    (
+        "Camera Observations",
         (
             "time_sec",
             "ros_time_sec",
@@ -278,8 +419,30 @@ XLSX_SHEET_FIELDS = (
             "right_x2",
             "right_y2",
             "right_confidence",
+            "left_cx",
+            "left_cy",
+            "right_cx",
+            "right_cy",
+            "left_width_px",
+            "left_height_px",
+            "right_width_px",
+            "right_height_px",
             "raw_disparity_px",
             "yolo_measurement_raw_range_m",
+            "ideal_left_u_px",
+            "ideal_left_v_px",
+            "ideal_right_u_px",
+            "ideal_right_v_px",
+            "ideal_disparity_px",
+            "ideal_pixel_source",
+            "left_corrected_cx",
+            "left_corrected_cy",
+            "right_corrected_cx",
+            "right_corrected_cy",
+            "left_bbox_du_px",
+            "left_bbox_dv_px",
+            "right_bbox_du_px",
+            "right_bbox_dv_px",
             "profile_id",
             "profile_mode",
             "profile_fallback_level",
@@ -287,39 +450,97 @@ XLSX_SHEET_FIELDS = (
         ),
     ),
     (
-        "Camera Pose",
-        tuple(
-            ["time_sec", "ros_time_sec"]
-            + [
-                field
-                for label in ("left", "right")
-                for field in (
-                    f"{label}_raw_gps_lat_deg",
-                    f"{label}_raw_gps_lon_deg",
-                    f"{label}_raw_gps_alt_msl_m",
-                    f"{label}_global_position_lat_deg",
-                    f"{label}_global_position_lon_deg",
-                    f"{label}_global_position_alt_msl_m",
-                    f"{label}_px4_position_n_m",
-                    f"{label}_px4_position_e_m",
-                    f"{label}_px4_position_d_m",
-                    f"{label}_px4_attitude_world_enu_roll_deg",
-                    f"{label}_px4_attitude_world_enu_pitch_deg",
-                    f"{label}_px4_attitude_world_enu_yaw_deg",
-                    f"{label}_px4_velocity_n_m_s",
-                    f"{label}_px4_velocity_e_m_s",
-                    f"{label}_px4_velocity_d_m_s",
-                    f"{label}_px4_estimated_optical_world_enu_x_m",
-                    f"{label}_px4_estimated_optical_world_enu_y_m",
-                    f"{label}_px4_estimated_optical_world_enu_z_m",
-                    f"{label}_px4_estimated_optical_world_enu_roll_deg",
-                    f"{label}_px4_estimated_optical_world_enu_pitch_deg",
-                    f"{label}_px4_estimated_optical_world_enu_yaw_deg",
-                )
-            ]
+        "Stereo Estimates",
+        (
+            "time_sec",
+            "ros_time_sec",
+            "axis_contract",
+            "drone_forward_m",
+            "drone_right_m",
+            "drone_down_m",
+            "ground_truth_m",
+            "raw_forward_m",
+            "raw_right_m",
+            "raw_down_m",
+            "raw_range_m",
+            "corrected_forward_m",
+            "corrected_right_m",
+            "corrected_down_m",
+            "corrected_range_m",
+            "optical_forward_m",
+            "optical_right_m",
+            "optical_down_m",
+            "optical_range_m",
+            "ideal_forward_m",
+            "ideal_right_m",
+            "ideal_down_m",
+            "ideal_range_m",
+            "raw_gps_baseline_forward_m",
+            "raw_gps_baseline_right_m",
+            "raw_gps_baseline_down_m",
+            "raw_gps_baseline_position_error_m",
+            "global_position_baseline_forward_m",
+            "global_position_baseline_right_m",
+            "global_position_baseline_down_m",
+            "global_position_baseline_position_error_m",
+            "raw_minus_global_baseline_forward_m",
+            "raw_minus_global_baseline_right_m",
+            "raw_minus_global_baseline_down_m",
+            "raw_minus_global_baseline_delta_m",
+        ),
+    ),
+    (
+        "Quality Events",
+        (
+            "time_sec",
+            "ros_time_sec",
+            "yolo_update_hz",
+            "yolo_inference_ms",
+            "disparity_px",
+            "distance_error_m",
+            "comparison_distance_error_m",
+            "profile_id",
+            "profile_mode",
+            "profile_fallback_level",
+            "profile_fallback_reason",
+            "nominal_ray_computation_status",
+            "optical_ray_computation_status",
+            "ideal_ray_computation_status",
+            "nominal_ray_gap_m",
+            "optical_ray_gap_m",
+            "ideal_ray_gap_m",
+            "nominal_ray_intersection_angle_deg",
+            "optical_ray_intersection_angle_deg",
+            "ideal_ray_intersection_angle_deg",
         ),
     ),
 )
+
+RAYS_SHEET_FIELDS = (
+    "time_sec",
+    "ros_time_sec",
+    "ray_type",
+    "computation_status",
+    "forward_m",
+    "right_m",
+    "down_m",
+    "range_m",
+    "ray_gap_m",
+    "intersection_angle_deg",
+    "left_depth_m",
+    "right_depth_m",
+    "left_point_forward_m",
+    "left_point_right_m",
+    "left_point_down_m",
+    "right_point_forward_m",
+    "right_point_right_m",
+    "right_point_down_m",
+    "midpoint_forward_m",
+    "midpoint_right_m",
+    "midpoint_down_m",
+)
+
+XLSX_SHEET_FIELDS = XLSX_DIRECT_SHEET_FIELDS + (("Rays", RAYS_SHEET_FIELDS),)
 
 DEBUG_BAG_TOPICS = [
     "/left_camera/image",
@@ -336,6 +557,9 @@ DEBUG_BAG_TOPICS = [
     "/ground_truth_position",
     "/stereo/estimated_position",
     "/stereo/corrected_position",
+    "/stereo/optical_position",
+    "/stereo/ideal_position",
+    "/stereo/ray_metrics",
     "/stereo/bbox_adjustment",
     "/stereo/profile_status",
     "/stereo/raw_gps_baseline_position",
@@ -346,10 +570,13 @@ DEBUG_BAG_TOPICS = [
     "/stereo/yolo_update_hz",
     "/camera_left/fmu/out/vehicle_gps_position",
     "/camera_right/fmu/out/vehicle_gps_position",
+    "/fmu/out/vehicle_gps_position",
     "/camera_left/fmu/out/vehicle_global_position",
     "/camera_right/fmu/out/vehicle_global_position",
+    "/fmu/out/vehicle_global_position",
     "/camera_left/fmu/out/vehicle_odometry",
     "/camera_right/fmu/out/vehicle_odometry",
+    "/fmu/out/vehicle_odometry",
     "/simulation/camera_pose_diagnostics/left",
     "/simulation/camera_pose_diagnostics/right",
 ]
@@ -422,6 +649,38 @@ def _sha256(path):
     return digest.hexdigest()
 
 
+def _ray_sheet_values(source_row, ray_type):
+    prefix = ray_type
+    values = [
+        source_row.get("time_sec", ""),
+        source_row.get("ros_time_sec", ""),
+        ray_type,
+        source_row.get(f"{prefix}_ray_computation_status", ""),
+        source_row.get(f"{prefix}_ray_forward_m", ""),
+        source_row.get(f"{prefix}_ray_right_m", ""),
+        source_row.get(f"{prefix}_ray_down_m", ""),
+        source_row.get(f"{prefix}_ray_range_m", ""),
+        source_row.get(f"{prefix}_ray_gap_m", ""),
+        source_row.get(f"{prefix}_ray_intersection_angle_deg", ""),
+        source_row.get(f"{prefix}_ray_left_depth_m", ""),
+        source_row.get(f"{prefix}_ray_right_depth_m", ""),
+        source_row.get(f"{prefix}_ray_left_point_forward_m", ""),
+        source_row.get(f"{prefix}_ray_left_point_right_m", ""),
+        source_row.get(f"{prefix}_ray_left_point_down_m", ""),
+        source_row.get(f"{prefix}_ray_right_point_forward_m", ""),
+        source_row.get(f"{prefix}_ray_right_point_right_m", ""),
+        source_row.get(f"{prefix}_ray_right_point_down_m", ""),
+        source_row.get(f"{prefix}_ray_midpoint_forward_m", ""),
+        source_row.get(f"{prefix}_ray_midpoint_right_m", ""),
+        source_row.get(f"{prefix}_ray_midpoint_down_m", ""),
+    ]
+    return values
+
+
+def _ray_sheet_has_data(values):
+    return any(str(value).strip() for value in values[3:])
+
+
 def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
     """Create an atomic, purpose-tab XLSX mirror of finalized telemetry.csv."""
     try:
@@ -445,11 +704,15 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
         )
         header_format = workbook.add_format({"bold": True})
         sheets = []
-        for sheet_name, fields in XLSX_SHEET_FIELDS:
+        for sheet_name, fields in XLSX_DIRECT_SHEET_FIELDS:
             worksheet = workbook.add_worksheet(sheet_name)
             worksheet.freeze_panes(1, 0)
             worksheet.write_row(0, 0, fields, header_format)
             sheets.append((worksheet, fields))
+        rays_worksheet = workbook.add_worksheet("Rays")
+        rays_worksheet.freeze_panes(1, 0)
+        rays_worksheet.write_row(0, 0, RAYS_SHEET_FIELDS, header_format)
+        rays_row_count = 0
 
         row_count = 0
         axis_contract = AXIS_CONTRACT
@@ -462,12 +725,18 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                         0,
                         [row.get(field, "") for field in fields],
                     )
+                for ray_type in RAY_TYPES:
+                    ray_values = _ray_sheet_values(row, ray_type)
+                    if not _ray_sheet_has_data(ray_values):
+                        continue
+                    rays_worksheet.write_row(rays_row_count + 1, 0, ray_values)
+                    rays_row_count += 1
                 if row_count == 0 and row.get("axis_contract"):
                     axis_contract = row["axis_contract"]
                 row_count += 1
 
         csv_sha256 = _sha256(source)
-        manifest = workbook.add_worksheet("Manifest")
+        manifest = workbook.add_worksheet("Config")
         manifest.freeze_panes(1, 0)
         manifest.write_row(0, 0, ("key", "value"), header_format)
         manifest_rows = (
@@ -475,9 +744,10 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                 ("source_csv", source.name),
                 ("source_csv_sha256", csv_sha256),
                 ("source_csv_row_count", row_count),
+                ("rays_sheet_row_count", rays_row_count),
                 ("mode", mode),
                 ("axis_contract", axis_contract),
-                ("sheet_order", ",".join([name for name, _fields in XLSX_SHEET_FIELDS] + ["Manifest"])),
+                ("sheet_order", ",".join([name for name, _fields in XLSX_SHEET_FIELDS] + ["Config"])),
             ) + tuple(manifest_rows)
         for index, row in enumerate(
             manifest_rows,
@@ -561,6 +831,9 @@ class OperatorRecorder(Node):
             "axis_aliases=public CSV uses forward/right/down; legacy x/y/z is intentionally not emitted",
             "estimated_position_topic=/stereo/estimated_position publishes raw forward/right/down/range",
             "corrected_position_topic=/stereo/corrected_position publishes bbox-adjusted forward/right/down/range",
+            "optical_position_topic=/stereo/optical_position publishes YOLO pixels triangulated with Gazebo-observed optical camera poses",
+            "ideal_position_topic=/stereo/ideal_position publishes GT-projected nominal-pixel triangulation for simulation reference only",
+            "ray_metrics_topic=/stereo/ray_metrics publishes numeric nominal/optical/ideal ray diagnostics for the XLSX Rays sheet",
             "raw_gps_baseline_topic=/stereo/raw_gps_baseline_position publishes raw-GPS-baseline forward/right/down",
             "global_position_baseline_topic=/stereo/global_position_baseline_position publishes fused-PX4-global-baseline forward/right/down",
             "gps_baseline_errors=3D FRD error versus /ground_truth_position; truth_range_bin_100m is floor(truth forward / 100) * 100",
@@ -568,7 +841,7 @@ class OperatorRecorder(Node):
             "detection_bbox_contract=left/right bbox source fields are x1,y1,x2,y2 in image pixels; cx/cy and width/height are retained only as derived compatibility fields",
             "bbox_adjustment_topic=/stereo/bbox_adjustment publishes corrected centers, center deltas, profile hash, fallback, sample count, raw disparity/range",
             "profile_status_topic=/stereo/profile_status publishes profile_id, mode, fallback_level, fallback_reason",
-            "camera_px4_recording=raw GPS and GlobalPosition are WGS84 samples; PX4 odometry is local NED; estimated optical exterior pose is world ENU and bootstrapped from Gazebo camera diagnostics",
+            "px4_recording=UAM target and left/right camera raw GPS and GlobalPosition are WGS84 samples; PX4 odometry is local NED; camera estimated optical exterior pose is world ENU and bootstrapped from Gazebo camera diagnostics",
         ]
         for label, runtime in self.camera_runtime.items():
             translation = runtime["mount_translation_body_m"]
@@ -680,6 +953,24 @@ class OperatorRecorder(Node):
         )
         self.create_subscription(
             Float32MultiArray,
+            "/stereo/optical_position",
+            self._optical_position_cb,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
+            "/stereo/ideal_position",
+            self._ideal_position_cb,
+            10,
+        )
+        self.create_subscription(
+            String,
+            "/stereo/ray_metrics",
+            self._ray_metrics_cb,
+            10,
+        )
+        self.create_subscription(
+            Float32MultiArray,
             "/stereo/bbox_adjustment",
             self._bbox_adjustment_cb,
             10,
@@ -706,8 +997,12 @@ class OperatorRecorder(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
-        for label in ("left", "right"):
-            topic_prefix = f"/camera_{label}/fmu/out"
+        px4_sources = (
+            ("left", "/camera_left/fmu/out"),
+            ("right", "/camera_right/fmu/out"),
+            ("uam", "/fmu/out"),
+        )
+        for label, topic_prefix in px4_sources:
             self.create_subscription(
                 SensorGps,
                 f"{topic_prefix}/vehicle_gps_position",
@@ -726,6 +1021,8 @@ class OperatorRecorder(Node):
                 lambda msg, label=label: self._camera_odometry_cb(label, msg),
                 px4_qos,
             )
+            if label == "uam":
+                continue
             self.create_subscription(
                 String,
                 f"/simulation/camera_pose_diagnostics/{label}",
@@ -817,6 +1114,22 @@ class OperatorRecorder(Node):
             self.latest[field] = float(value)
         self.last_stamp["/stereo/corrected_position"] = self.get_clock().now().nanoseconds * 1e-9
 
+    def _optical_position_cb(self, msg):
+        values = list(msg.data[:4])
+        while len(values) < 4:
+            values.append(math.nan)
+        for field, value in zip(OPTICAL_POSITION_FIELDS, values):
+            self.latest[field] = float(value)
+        self.last_stamp["/stereo/optical_position"] = self.get_clock().now().nanoseconds * 1e-9
+
+    def _ideal_position_cb(self, msg):
+        values = list(msg.data[:4])
+        while len(values) < 4:
+            values.append(math.nan)
+        for field, value in zip(IDEAL_POSITION_FIELDS, values):
+            self.latest[field] = float(value)
+        self.last_stamp["/stereo/ideal_position"] = self.get_clock().now().nanoseconds * 1e-9
+
     def _gps_baseline_position_cb(self, source, msg):
         self.latest[f"{source}_forward_m"] = float(msg.point.x)
         self.latest[f"{source}_right_m"] = float(msg.point.y)
@@ -841,7 +1154,8 @@ class OperatorRecorder(Node):
         else:
             for axis in ("n", "e", "d"):
                 self.latest[f"{prefix}_vel_{axis}_m_s"] = math.nan
-        self.last_stamp[f"/camera_{label}/fmu/out/vehicle_gps_position"] = timestamp_us * 1e-6
+        topic_prefix = "/fmu/out" if label == "uam" else f"/camera_{label}/fmu/out"
+        self.last_stamp[f"{topic_prefix}/vehicle_gps_position"] = timestamp_us * 1e-6
 
     def _camera_global_position_cb(self, label, msg):
         prefix = f"{label}_global_position"
@@ -852,7 +1166,8 @@ class OperatorRecorder(Node):
         self.latest[f"{prefix}_alt_msl_m"] = float(msg.alt)
         self.latest[f"{prefix}_eph_m"] = float(msg.eph)
         self.latest[f"{prefix}_epv_m"] = float(msg.epv)
-        self.last_stamp[f"/camera_{label}/fmu/out/vehicle_global_position"] = timestamp_us * 1e-6
+        topic_prefix = "/fmu/out" if label == "uam" else f"/camera_{label}/fmu/out"
+        self.last_stamp[f"{topic_prefix}/vehicle_global_position"] = timestamp_us * 1e-6
 
     def _camera_odometry_cb(self, label, msg):
         if int(msg.pose_frame) != int(msg.POSE_FRAME_NED):
@@ -881,10 +1196,13 @@ class OperatorRecorder(Node):
         for axis, value in zip(("n", "e", "d"), velocity_ned):
             self.latest[f"{label}_px4_velocity_{axis}_m_s"] = value
         self.latest[f"{label}_px4_odometry_reset_counter"] = int(msg.reset_counter)
-        runtime = self.camera_runtime[label]
+        topic_prefix = "/fmu/out" if label == "uam" else f"/camera_{label}/fmu/out"
+        self.last_stamp[f"{topic_prefix}/vehicle_odometry"] = timestamp_us * 1e-6
+        runtime = self.camera_runtime.get(label)
+        if runtime is None:
+            return
         runtime["px4_position_ned_m"] = position_ned
         runtime["px4_rotation_ned_from_body"] = rotation_ned_from_body
-        self.last_stamp[f"/camera_{label}/fmu/out/vehicle_odometry"] = timestamp_us * 1e-6
         self._update_px4_estimated_optical_extrinsic(label)
 
     def _camera_pose_diagnostic_cb(self, label, msg):
@@ -1025,6 +1343,46 @@ class OperatorRecorder(Node):
         self.latest["profile_fallback_reason"] = str(payload.get("fallback_reason", ""))
         self.last_stamp["/stereo/profile_status"] = self.get_clock().now().nanoseconds * 1e-9
 
+    def _ray_metrics_cb(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except Exception:
+            return
+        for field in IDEAL_OBSERVATION_FIELDS:
+            if field in payload:
+                if field == "ideal_pixel_source":
+                    self.latest[field] = str(payload[field])
+                else:
+                    self.latest[field] = payload[field]
+        for ray_type in RAY_TYPES:
+            ray = payload.get(ray_type)
+            if not isinstance(ray, dict):
+                continue
+            prefix = f"{ray_type}_ray"
+            self.latest[f"{prefix}_computation_status"] = str(ray.get("computation_status", ""))
+            for key in (
+                "forward_m",
+                "right_m",
+                "down_m",
+                "range_m",
+                "gap_m",
+                "intersection_angle_deg",
+                "left_depth_m",
+                "right_depth_m",
+            ):
+                self.latest[f"{prefix}_{key}"] = ray.get(key, math.nan)
+            for source_key, field_middle in (
+                ("left_point_frd_m", "left_point"),
+                ("right_point_frd_m", "right_point"),
+                ("midpoint_frd_m", "midpoint"),
+            ):
+                values = ray.get(source_key)
+                if not isinstance(values, (list, tuple)) or len(values) < 3:
+                    continue
+                for axis, value in zip(("forward", "right", "down"), values[:3]):
+                    self.latest[f"{prefix}_{field_middle}_{axis}_m"] = value
+        self.last_stamp["/stereo/ray_metrics"] = self.get_clock().now().nanoseconds * 1e-9
+
     def _write_csv_row(self):
         now = self.get_clock().now().nanoseconds * 1e-9
         row = {
@@ -1033,7 +1391,7 @@ class OperatorRecorder(Node):
             "axis_contract": AXIS_CONTRACT,
         }
         for field in TELEMETRY_FIELDS[3:]:
-            if field in ("profile_id", "profile_mode", "profile_fallback_reason"):
+            if field in TEXT_TELEMETRY_FIELDS:
                 row[field] = self.latest.get(field, "")
             else:
                 row[field] = _finite_or_empty(self.latest.get(field))

@@ -52,6 +52,13 @@ except Exception:  # pragma: no cover - rqt can still load the widget shell.
     Float32MultiArray = None
     String = None
 
+try:
+    from px4_msgs.msg import SensorGps, VehicleGlobalPosition, VehicleOdometry
+except Exception:  # pragma: no cover - PX4 messages are optional for the rqt shell.
+    SensorGps = None
+    VehicleGlobalPosition = None
+    VehicleOdometry = None
+
 
 AXES = (
     ("Forward", 0),
@@ -88,6 +95,44 @@ try:
     PLOT_WINDOW_S = max(1.0, float(os.environ.get("RQT_PLOT_WINDOW_S", "30.0")))
 except ValueError:
     PLOT_WINDOW_S = 30.0
+CSV_PREVIEW_TABLE_ROWS = 40
+CSV_PREVIEW_RAW_ROWS = 20
+
+
+def _finite_tuple(values, size):
+    result = tuple(float(value) for value in values)
+    if len(result) != size or not all(math.isfinite(value) for value in result):
+        raise ValueError(f"expected {size} finite values")
+    return result
+
+
+def _rotation_from_wxyz(quaternion_wxyz):
+    w, x, y, z = _finite_tuple(quaternion_wxyz, 4)
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm <= 0.0:
+        raise ValueError("quaternion norm must be positive")
+    w, x, y, z = (value / norm for value in (w, x, y, z))
+    return (
+        (1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)),
+        (2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)),
+        (2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)),
+    )
+
+
+def _ned_to_enu_rotation(rotation):
+    return (
+        (rotation[1][0], rotation[1][1], rotation[1][2]),
+        (rotation[0][0], rotation[0][1], rotation[0][2]),
+        (-rotation[2][0], -rotation[2][1], -rotation[2][2]),
+    )
+
+
+def _rpy_deg_from_rotation(rotation):
+    pitch = math.asin(max(-1.0, min(1.0, -float(rotation[2][0]))))
+    roll = math.atan2(float(rotation[2][1]), float(rotation[2][2]))
+    yaw = math.atan2(float(rotation[1][0]), float(rotation[0][0]))
+    return tuple(math.degrees(value) for value in (roll, pitch, yaw))
+
 
 class PanelBridge(QObject):
     image = Signal(str, object)
@@ -95,6 +140,9 @@ class PanelBridge(QObject):
     scalar = Signal(str, object)
     detections = Signal(list)
     profile = Signal(str)
+    px4_raw_gps = Signal(str, object)
+    px4_global_position = Signal(str, object)
+    px4_odometry = Signal(str, object)
     status = Signal(str)
     runtime_parameters = Signal(str)
 
@@ -419,7 +467,7 @@ class ExperimentHud(QWidget):
 
 
 class LiveSavedCsvPreview(QWidget):
-    """Read-only view of complete persisted CSV rows from the active session."""
+    """Read-only preview of live telemetry or complete persisted CSV rows."""
 
     _TABLE_VIEWS = (
         (
@@ -454,35 +502,69 @@ class LiveSavedCsvPreview(QWidget):
             ),
         ),
         (
-            "PX4 / Camera",
-            tuple(
-                [
-                    ("time_sec", "Time (s)"),
-                ]
-                + [
-                    column
-                    for label in ("left", "right")
-                    for column in (
-                        (f"{label}_raw_gps_lat_deg", f"{label.title()} Raw GPS lat"),
-                        (f"{label}_raw_gps_lon_deg", f"{label.title()} Raw GPS lon"),
-                        (f"{label}_raw_gps_alt_msl_m", f"{label.title()} Raw GPS alt"),
-                        (f"{label}_px4_position_n_m", f"{label.title()} PX4 N"),
-                        (f"{label}_px4_position_e_m", f"{label.title()} PX4 E"),
-                        (f"{label}_px4_position_d_m", f"{label.title()} PX4 D"),
-                        (f"{label}_px4_attitude_world_enu_roll_deg", f"{label.title()} R ENU"),
-                        (f"{label}_px4_attitude_world_enu_pitch_deg", f"{label.title()} P ENU"),
-                        (f"{label}_px4_attitude_world_enu_yaw_deg", f"{label.title()} Y ENU"),
-                        (f"{label}_px4_velocity_n_m_s", f"{label.title()} Vn"),
-                        (f"{label}_px4_velocity_e_m_s", f"{label.title()} Ve"),
-                        (f"{label}_px4_velocity_d_m_s", f"{label.title()} Vd"),
-                        (f"{label}_px4_estimated_optical_world_enu_x_m", f"{label.title()} Cam X"),
-                        (f"{label}_px4_estimated_optical_world_enu_y_m", f"{label.title()} Cam Y"),
-                        (f"{label}_px4_estimated_optical_world_enu_z_m", f"{label.title()} Cam Z"),
-                        (f"{label}_px4_estimated_optical_world_enu_roll_deg", f"{label.title()} Cam R"),
-                        (f"{label}_px4_estimated_optical_world_enu_pitch_deg", f"{label.title()} Cam P"),
-                        (f"{label}_px4_estimated_optical_world_enu_yaw_deg", f"{label.title()} Cam Yaw"),
-                    )
-                ]
+            "Left PX4",
+            (
+                ("time_sec", "Time (s)"),
+                ("left_raw_gps_lat_deg", "Raw GPS lat"),
+                ("left_raw_gps_lon_deg", "Raw GPS lon"),
+                ("left_raw_gps_alt_msl_m", "Raw GPS alt"),
+                ("left_px4_position_n_m", "PX4 N"),
+                ("left_px4_position_e_m", "PX4 E"),
+                ("left_px4_position_d_m", "PX4 D"),
+                ("left_px4_attitude_world_enu_roll_deg", "R ENU"),
+                ("left_px4_attitude_world_enu_pitch_deg", "P ENU"),
+                ("left_px4_attitude_world_enu_yaw_deg", "Y ENU"),
+                ("left_px4_velocity_n_m_s", "Vn"),
+                ("left_px4_velocity_e_m_s", "Ve"),
+                ("left_px4_velocity_d_m_s", "Vd"),
+                ("left_px4_estimated_optical_world_enu_x_m", "Cam X"),
+                ("left_px4_estimated_optical_world_enu_y_m", "Cam Y"),
+                ("left_px4_estimated_optical_world_enu_z_m", "Cam Z"),
+                ("left_px4_estimated_optical_world_enu_roll_deg", "Cam R"),
+                ("left_px4_estimated_optical_world_enu_pitch_deg", "Cam P"),
+                ("left_px4_estimated_optical_world_enu_yaw_deg", "Cam Yaw"),
+            ),
+        ),
+        (
+            "Right PX4",
+            (
+                ("time_sec", "Time (s)"),
+                ("right_raw_gps_lat_deg", "Raw GPS lat"),
+                ("right_raw_gps_lon_deg", "Raw GPS lon"),
+                ("right_raw_gps_alt_msl_m", "Raw GPS alt"),
+                ("right_px4_position_n_m", "PX4 N"),
+                ("right_px4_position_e_m", "PX4 E"),
+                ("right_px4_position_d_m", "PX4 D"),
+                ("right_px4_attitude_world_enu_roll_deg", "R ENU"),
+                ("right_px4_attitude_world_enu_pitch_deg", "P ENU"),
+                ("right_px4_attitude_world_enu_yaw_deg", "Y ENU"),
+                ("right_px4_velocity_n_m_s", "Vn"),
+                ("right_px4_velocity_e_m_s", "Ve"),
+                ("right_px4_velocity_d_m_s", "Vd"),
+                ("right_px4_estimated_optical_world_enu_x_m", "Cam X"),
+                ("right_px4_estimated_optical_world_enu_y_m", "Cam Y"),
+                ("right_px4_estimated_optical_world_enu_z_m", "Cam Z"),
+                ("right_px4_estimated_optical_world_enu_roll_deg", "Cam R"),
+                ("right_px4_estimated_optical_world_enu_pitch_deg", "Cam P"),
+                ("right_px4_estimated_optical_world_enu_yaw_deg", "Cam Yaw"),
+            ),
+        ),
+        (
+            "UAM PX4",
+            (
+                ("time_sec", "Time (s)"),
+                ("uam_raw_gps_lat_deg", "Raw GPS lat"),
+                ("uam_raw_gps_lon_deg", "Raw GPS lon"),
+                ("uam_raw_gps_alt_msl_m", "Raw GPS alt"),
+                ("uam_px4_position_n_m", "PX4 N"),
+                ("uam_px4_position_e_m", "PX4 E"),
+                ("uam_px4_position_d_m", "PX4 D"),
+                ("uam_px4_attitude_world_enu_roll_deg", "R ENU"),
+                ("uam_px4_attitude_world_enu_pitch_deg", "P ENU"),
+                ("uam_px4_attitude_world_enu_yaw_deg", "Y ENU"),
+                ("uam_px4_velocity_n_m_s", "Vn"),
+                ("uam_px4_velocity_e_m_s", "Ve"),
+                ("uam_px4_velocity_d_m_s", "Vd"),
             ),
         ),
     )
@@ -491,11 +573,13 @@ class LiveSavedCsvPreview(QWidget):
         super().__init__(parent)
         self._recording_controls = recording_controls
         self._stopped = False
+        self._live_started_monotonic = time.monotonic()
+        self._live_latest = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
-        layout.addWidget(QLabel("Live saved CSV preview"))
-        self._state_label = QLabel("No CSV session has been started.")
+        layout.addWidget(QLabel("CSV preview"))
+        self._state_label = QLabel("Waiting for telemetry.")
         self._state_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         layout.addWidget(self._state_label)
         self._coverage_label = QLabel("Coverage: --")
@@ -510,12 +594,12 @@ class LiveSavedCsvPreview(QWidget):
         raw_tab = QWidget()
         raw_layout = QVBoxLayout(raw_tab)
         raw_layout.setContentsMargins(8, 8, 8, 8)
-        raw_layout.addWidget(QLabel("Raw CSV tail (header + latest complete rows)"))
+        raw_layout.addWidget(QLabel("Raw CSV preview"))
         self._raw_preview = QPlainTextEdit()
         self._raw_preview.setReadOnly(True)
         self._raw_preview.setLineWrapMode(QPlainTextEdit.NoWrap)
         self._raw_preview.setStyleSheet("font-family: monospace;")
-        self._raw_preview.setPlainText("Save CSV, Save MP4, or Save Debug in Setup to display persisted telemetry rows here.")
+        self._raw_preview.setPlainText("Waiting for telemetry.")
         raw_layout.addWidget(self._raw_preview, 1)
         self._views.addTab(raw_tab, "Raw CSV")
         layout.addWidget(self._views, 1)
@@ -530,7 +614,7 @@ class LiveSavedCsvPreview(QWidget):
         actions.addWidget(self._export_button)
         actions.addStretch(1)
         layout.addLayout(actions)
-        self._refresh_button = QPushButton("Refresh saved CSV preview")
+        self._refresh_button = QPushButton("Refresh CSV preview")
         self._refresh_button.clicked.connect(self.refresh)
         layout.addWidget(self._refresh_button)
         self._open_session_button.clicked.connect(self._open_session)
@@ -552,6 +636,20 @@ class LiveSavedCsvPreview(QWidget):
     def _format_bbox(row, side):
         values = [row.get(f"{side}_{axis}", "") for axis in ("x1", "y1", "x2", "y2")]
         return ", ".join(values) if any(values) else ""
+
+    @staticmethod
+    def _format_csv_value(value):
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if not math.isfinite(number):
+            return ""
+        return f"{number:.9g}"
 
     @staticmethod
     def _create_table(columns):
@@ -591,6 +689,214 @@ class LiveSavedCsvPreview(QWidget):
                     table.setItem(row_index, column_index, QTableWidgetItem(values.get(field, "")))
             table.resizeColumnsToContents()
 
+    def _live_rows(self):
+        if not self._live_latest:
+            return []
+        row = {
+            "time_sec": self._format_csv_value(time.monotonic() - self._live_started_monotonic),
+            **self._live_latest,
+        }
+        return [row]
+
+    def _format_live_raw_preview(self, rows):
+        if not rows:
+            return "Waiting for telemetry."
+        row = rows[-1]
+        fields = ["time_sec"] + sorted(field for field in row if field != "time_sec")
+        return ",".join(fields) + "\n" + ",".join(row.get(field, "") for field in fields)
+
+    def _show_live_preview(self):
+        rows = self._live_rows()
+        self._state_label.setText("Latest telemetry")
+        self._coverage_label.setText("Coverage: live topics")
+        self._update_tables(rows)
+        self._raw_preview.setPlainText(self._format_live_raw_preview(rows))
+        self._set_action_state(None)
+
+    def _refresh_live_preview(self):
+        if self._recording_controls.recording_csv_path() is None:
+            self._show_live_preview()
+
+    def update_live_sample(self, series_name, values):
+        try:
+            parsed = [float(value) for value in list(values)[:4]]
+        except (TypeError, ValueError):
+            parsed = []
+        while len(parsed) < 4:
+            parsed.append(math.nan)
+        if not math.isfinite(parsed[3]) and all(math.isfinite(value) for value in parsed[:3]):
+            parsed[3] = math.sqrt(sum(value * value for value in parsed[:3]))
+        field_prefixes = {
+            "truth": ("drone_forward_m", "drone_right_m", "drone_down_m", "ground_truth_m"),
+            "raw": ("raw_forward_m", "raw_right_m", "raw_down_m", "raw_range_m"),
+            "optical": (
+                "optical_forward_m",
+                "optical_right_m",
+                "optical_down_m",
+                "optical_range_m",
+            ),
+            "ideal": ("ideal_forward_m", "ideal_right_m", "ideal_down_m", "ideal_range_m"),
+            "raw_gps_baseline": (
+                "raw_gps_baseline_forward_m",
+                "raw_gps_baseline_right_m",
+                "raw_gps_baseline_down_m",
+                "raw_gps_baseline_range_m",
+            ),
+        }.get(series_name)
+        if field_prefixes is None:
+            return
+        for field, value in zip(field_prefixes, parsed):
+            self._live_latest[field] = self._format_csv_value(value)
+        truth = [
+            self._live_latest.get("drone_forward_m"),
+            self._live_latest.get("drone_right_m"),
+            self._live_latest.get("drone_down_m"),
+        ]
+        baseline = [
+            self._live_latest.get("raw_gps_baseline_forward_m"),
+            self._live_latest.get("raw_gps_baseline_right_m"),
+            self._live_latest.get("raw_gps_baseline_down_m"),
+        ]
+        try:
+            truth_values = [float(value) for value in truth]
+            baseline_values = [float(value) for value in baseline]
+        except (TypeError, ValueError):
+            truth_values = []
+            baseline_values = []
+        if len(truth_values) == 3 and len(baseline_values) == 3:
+            error = math.sqrt(
+                sum((estimate - actual) ** 2 for estimate, actual in zip(baseline_values, truth_values))
+            )
+            self._live_latest["raw_gps_baseline_position_error_m"] = self._format_csv_value(error)
+        self._refresh_live_preview()
+
+    def update_live_scalar(self, key, value):
+        field = {
+            "yolo_hz": "yolo_update_hz",
+            "yolo_ms": "yolo_inference_ms",
+        }.get(key)
+        if field is not None:
+            self._live_latest[field] = self._format_csv_value(value)
+            self._refresh_live_preview()
+
+    def update_live_detections(self, values):
+        try:
+            data = [float(value) for value in values]
+        except (TypeError, ValueError):
+            return
+        if len(data) < 16:
+            return
+        fields = (
+            "left_valid",
+            "left_x1",
+            "left_y1",
+            "left_x2",
+            "left_y2",
+            "left_confidence",
+            "left_cx",
+            "left_cy",
+            "right_valid",
+            "right_x1",
+            "right_y1",
+            "right_x2",
+            "right_y2",
+            "right_confidence",
+            "right_cx",
+            "right_cy",
+        )
+        for field, value in zip(fields, data):
+            self._live_latest[field] = self._format_csv_value(value)
+        self._live_latest["left_width_px"] = self._format_csv_value(data[3] - data[1])
+        self._live_latest["left_height_px"] = self._format_csv_value(data[4] - data[2])
+        self._live_latest["right_width_px"] = self._format_csv_value(data[11] - data[9])
+        self._live_latest["right_height_px"] = self._format_csv_value(data[12] - data[10])
+        self._live_latest["raw_disparity_px"] = self._format_csv_value(data[6] - data[14])
+        self._refresh_live_preview()
+
+    def update_live_profile(self, payload):
+        try:
+            parsed = json.loads(str(payload))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(parsed, dict):
+            return
+        field_map = {
+            "profile_id": "profile_id",
+            "profile_mode": "profile_mode",
+            "mode": "profile_mode",
+            "fallback_level": "profile_fallback_level",
+            "fallback_reason": "profile_fallback_reason",
+        }
+        for source, field in field_map.items():
+            if source in parsed:
+                self._live_latest[field] = self._format_csv_value(parsed.get(source))
+        self._refresh_live_preview()
+
+    def update_live_px4_raw_gps(self, label, msg):
+        prefix = f"{label}_raw_gps"
+        timestamp_us = int(getattr(msg, "timestamp_sample", 0) or getattr(msg, "timestamp", 0) or 0)
+        self._live_latest[f"{prefix}_timestamp_us"] = self._format_csv_value(timestamp_us)
+        for attr, suffix in (
+            ("latitude_deg", "lat_deg"),
+            ("longitude_deg", "lon_deg"),
+            ("altitude_msl_m", "alt_msl_m"),
+            ("eph", "eph_m"),
+            ("epv", "epv_m"),
+        ):
+            self._live_latest[f"{prefix}_{suffix}"] = self._format_csv_value(getattr(msg, attr, None))
+        if bool(getattr(msg, "vel_ned_valid", False)):
+            for attr, suffix in (
+                ("vel_n_m_s", "vel_n_m_s"),
+                ("vel_e_m_s", "vel_e_m_s"),
+                ("vel_d_m_s", "vel_d_m_s"),
+            ):
+                self._live_latest[f"{prefix}_{suffix}"] = self._format_csv_value(getattr(msg, attr, None))
+        else:
+            for axis in ("n", "e", "d"):
+                self._live_latest[f"{prefix}_vel_{axis}_m_s"] = ""
+        self._refresh_live_preview()
+
+    def update_live_px4_global_position(self, label, msg):
+        prefix = f"{label}_global_position"
+        timestamp_us = int(getattr(msg, "timestamp_sample", 0) or getattr(msg, "timestamp", 0) or 0)
+        self._live_latest[f"{prefix}_timestamp_us"] = self._format_csv_value(timestamp_us)
+        for attr, suffix in (
+            ("lat", "lat_deg"),
+            ("lon", "lon_deg"),
+            ("alt", "alt_msl_m"),
+            ("eph", "eph_m"),
+            ("epv", "epv_m"),
+        ):
+            self._live_latest[f"{prefix}_{suffix}"] = self._format_csv_value(getattr(msg, attr, None))
+        self._refresh_live_preview()
+
+    def update_live_px4_odometry(self, label, msg):
+        if int(getattr(msg, "pose_frame", -1)) != int(getattr(msg, "POSE_FRAME_NED", -2)):
+            return
+        prefix = f"{label}_px4"
+        timestamp_us = int(getattr(msg, "timestamp_sample", 0) or getattr(msg, "timestamp", 0) or 0)
+        self._live_latest[f"{prefix}_odometry_timestamp_us"] = self._format_csv_value(timestamp_us)
+        for axis, value in zip(("n", "e", "d"), list(getattr(msg, "position", []))[:3]):
+            self._live_latest[f"{prefix}_position_{axis}_m"] = self._format_csv_value(value)
+        try:
+            rotation_world_enu_from_body = _ned_to_enu_rotation(
+                _rotation_from_wxyz(getattr(msg, "q", ()))
+            )
+            attitude = _rpy_deg_from_rotation(rotation_world_enu_from_body)
+        except (TypeError, ValueError):
+            attitude = ()
+        for axis, value in zip(("roll", "pitch", "yaw"), attitude):
+            self._live_latest[f"{prefix}_attitude_world_enu_{axis}_deg"] = self._format_csv_value(
+                value
+            )
+        if int(getattr(msg, "velocity_frame", -1)) == int(getattr(msg, "VELOCITY_FRAME_NED", -2)):
+            for axis, value in zip(("n", "e", "d"), list(getattr(msg, "velocity", []))[:3]):
+                self._live_latest[f"{prefix}_velocity_{axis}_m_s"] = self._format_csv_value(value)
+        self._live_latest[f"{prefix}_odometry_reset_counter"] = self._format_csv_value(
+            getattr(msg, "reset_counter", None)
+        )
+        self._refresh_live_preview()
+
     def _set_progress_text(self, csv_path, progress):
         recording = self._recording_controls.is_recording()
         state = "Writing" if recording else "Last saved"
@@ -619,13 +925,7 @@ class LiveSavedCsvPreview(QWidget):
     def refresh(self, force=False):
         csv_path = self._recording_controls.recording_csv_path()
         if csv_path is None:
-            self._state_label.setText("No CSV session has been started.")
-            self._coverage_label.setText("Coverage: --")
-            self._update_tables([])
-            self._raw_preview.setPlainText(
-                "Save CSV, Save MP4, or Save Debug in Setup to display persisted telemetry rows here."
-            )
-            self._set_action_state(None)
+            self._show_live_preview()
             return
         progress_path = Path(csv_path).with_name("progress.json")
         signature = (self._file_signature(csv_path), self._file_signature(progress_path))
@@ -634,8 +934,8 @@ class LiveSavedCsvPreview(QWidget):
             return
         self._last_signature = signature
         try:
-            preview = read_recent_csv_lines(csv_path, data_row_count=3)
-            rows = read_recent_csv_rows(csv_path, data_row_count=5)
+            preview = read_recent_csv_lines(csv_path, data_row_count=CSV_PREVIEW_RAW_ROWS)
+            rows = read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)
         except FileNotFoundError:
             preview = "Waiting for recorder to create telemetry.csv…"
             rows = []
@@ -1066,9 +1366,12 @@ class OperatorPanel(Plugin):
         context.add_widget(self._widget)
         self._bridge.image.connect(self._handle_image)
         self._bridge.sample.connect(self._handle_sample)
-        self._bridge.scalar.connect(self._facts.update_scalar)
-        self._bridge.detections.connect(self._facts.update_detections)
-        self._bridge.profile.connect(self._facts.update_profile)
+        self._bridge.scalar.connect(self._handle_scalar)
+        self._bridge.detections.connect(self._handle_detections)
+        self._bridge.profile.connect(self._handle_profile)
+        self._bridge.px4_raw_gps.connect(self._handle_px4_raw_gps)
+        self._bridge.px4_global_position.connect(self._handle_px4_global_position)
+        self._bridge.px4_odometry.connect(self._handle_px4_odometry)
         self._bridge.status.connect(self._set_status)
         self._bridge.runtime_parameters.connect(self._set_runtime_parameters)
         self._init_ros()
@@ -1214,6 +1517,28 @@ class OperatorPanel(Plugin):
             frdr[3] = math.sqrt(sum(value * value for value in frdr[:3]))
         self._plot_stack.append(series_name, frdr)
         self._facts.update_sample(series_name, frdr)
+        self._record_preview.update_live_sample(series_name, frdr)
+
+    def _handle_scalar(self, key, value):
+        self._facts.update_scalar(key, value)
+        self._record_preview.update_live_scalar(key, value)
+
+    def _handle_detections(self, values):
+        self._facts.update_detections(values)
+        self._record_preview.update_live_detections(values)
+
+    def _handle_profile(self, payload):
+        self._facts.update_profile(payload)
+        self._record_preview.update_live_profile(payload)
+
+    def _handle_px4_raw_gps(self, label, msg):
+        self._record_preview.update_live_px4_raw_gps(label, msg)
+
+    def _handle_px4_global_position(self, label, msg):
+        self._record_preview.update_live_px4_global_position(label, msg)
+
+    def _handle_px4_odometry(self, label, msg):
+        self._record_preview.update_live_px4_odometry(label, msg)
 
     def _init_ros(self):
         if (
@@ -1287,6 +1612,31 @@ class OperatorPanel(Plugin):
                 lambda msg: self._bridge.profile.emit(msg.data),
                 10,
             )
+            if SensorGps is not None and VehicleGlobalPosition is not None and VehicleOdometry is not None:
+                px4_sources = (
+                    ("left", "/camera_left/fmu/out"),
+                    ("right", "/camera_right/fmu/out"),
+                    ("uam", "/fmu/out"),
+                )
+                for label, topic_prefix in px4_sources:
+                    self._ros_node.create_subscription(
+                        SensorGps,
+                        f"{topic_prefix}/vehicle_gps_position",
+                        lambda msg, label=label: self._bridge.px4_raw_gps.emit(label, msg),
+                        qos_profile_sensor_data,
+                    )
+                    self._ros_node.create_subscription(
+                        VehicleGlobalPosition,
+                        f"{topic_prefix}/vehicle_global_position",
+                        lambda msg, label=label: self._bridge.px4_global_position.emit(label, msg),
+                        qos_profile_sensor_data,
+                    )
+                    self._ros_node.create_subscription(
+                        VehicleOdometry,
+                        f"{topic_prefix}/vehicle_odometry",
+                        lambda msg, label=label: self._bridge.px4_odometry.emit(label, msg),
+                        qos_profile_sensor_data,
+                    )
             self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
             self._spin_thread.start()
             self._request_runtime_parameters()

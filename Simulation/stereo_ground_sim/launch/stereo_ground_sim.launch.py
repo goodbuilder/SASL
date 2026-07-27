@@ -286,46 +286,6 @@ def _write_overlay_node_params(context):
     return params_file
 
 
-def _ground_grid_visuals(size_m=4000.0, spacing_m=100.0, thickness_m=0.7):
-    line_count = int(size_m / spacing_m)
-    start = -line_count // 2
-    end = line_count // 2
-    visuals = []
-    for index, grid_index in enumerate(range(start, end + 1)):
-        offset = grid_index * spacing_m
-        is_axis = abs(offset) < 1e-6
-        color = "0.32 0.36 0.38 1" if is_axis else "0.50 0.54 0.56 1"
-        width = thickness_m * (2.0 if is_axis else 1.0)
-        z = 0.018 if is_axis else 0.016
-        visuals.append(
-            f"""        <visual name="grid_x_{index}">
-          <pose>{offset:.3f} 0 {z:.3f} 0 0 0</pose>
-          <geometry>
-            <box>
-              <size>{width:.3f} {size_m:.3f} 0.010</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>{color}</ambient>
-            <diffuse>{color}</diffuse>
-          </material>
-        </visual>
-        <visual name="grid_y_{index}">
-          <pose>0 {offset:.3f} {z:.3f} 0 0 0</pose>
-          <geometry>
-            <box>
-              <size>{size_m:.3f} {width:.3f} 0.010</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>{color}</ambient>
-            <diffuse>{color}</diffuse>
-          </material>
-        </visual>"""
-        )
-    return "\n".join(visuals)
-
-
 def _generate_world(context):
     share_dir = get_package_share_directory("stereo_ground_sim")
     source_world = os.path.join(share_dir, "worlds", "stereo_ground_drone.sdf")
@@ -460,7 +420,7 @@ def _generate_world(context):
             )
             break
 
-    world = world.replace("        <!-- GROUND_GRID_VISUALS -->", _ground_grid_visuals(), 1)
+    world = world.replace("        <!-- GROUND_GRID_VISUALS -->", "", 1)
     world = _set_target_include_static(
         world,
         target_model_name=target_model_name,
@@ -752,7 +712,7 @@ def generate_launch_description():
             DeclareLaunchArgument("yolo_target_hz", default_value="40.0"),
             DeclareLaunchArgument("yolo_imgsz", default_value="1280"),
             DeclareLaunchArgument("observation_mode", default_value="bbox_yolo"),
-            DeclareLaunchArgument("measurement_queue_capacity", default_value="32"),
+            DeclareLaunchArgument("measurement_queue_capacity", default_value="4096"),
             DeclareLaunchArgument("enable_synthetic_detections", default_value="false"),
             DeclareLaunchArgument("enable_gps_baseline_triangulation", default_value="false"),
             DeclareLaunchArgument("gps_baseline_source", default_value="raw_gps"),

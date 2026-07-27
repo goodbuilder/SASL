@@ -41,3 +41,17 @@ def test_active_camera_rate_has_no_30_or_60_default() -> None:
     )
     assert "CAMERA_UPDATE_RATE_HZ=30" not in defaults
     assert 'DeclareLaunchArgument("camera_update_rate_hz", default_value="60.0")' not in defaults
+
+
+def test_generated_world_does_not_insert_ground_grid_visuals() -> None:
+    root = ET.parse(WORLD).getroot()
+    visual_names = [
+        visual.attrib.get("name", "")
+        for visual in root.findall(".//model[@name='ground']/link/visual")
+    ]
+    assert not any(name.startswith(("grid_x_", "grid_y_")) for name in visual_names)
+
+    launch = LAUNCH.read_text(encoding="utf-8")
+    assert "grid_x_" not in launch
+    assert "grid_y_" not in launch
+    assert 'world.replace("        <!-- GROUND_GRID_VISUALS -->", "", 1)' in launch

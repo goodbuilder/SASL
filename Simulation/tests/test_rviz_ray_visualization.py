@@ -88,6 +88,8 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     ray_display = rviz.split("Name: Stereo Rays — Nominal / Optical / Ideal (World ENU)", 1)[0].rsplit("Class: rviz_default_plugins/MarkerArray", 1)[1]
     assert "Topic:" in ray_display
     assert "Marker Topic:" not in ray_display
+    assert "Durability Policy: Transient Local" in ray_display
+    assert "Reliability Policy: Reliable" in ray_display
     assert "gazebo_world_enu" in rviz
     assert "Cell Size: 100" in rviz
     assert "Distance: 2800" in rviz
@@ -104,6 +106,8 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
 
     assert "self._publish_ray_markers(nominal=raw, optical=optical)" in source
+    assert 'self.create_publisher(MarkerArray, "/stereo/ray_markers", ray_marker_qos)' in source
+    assert "durability=DurabilityPolicy.TRANSIENT_LOCAL" in source
     assert 'self._publish_ray_markers(ideal=ideal)' in source
     assert 'label="nominal"' in source
     assert 'label="optical"' in source

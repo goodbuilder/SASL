@@ -32,6 +32,7 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         marker = root / "side-effects.log"
         scripts_dir = root / "scripts"
         scripts_dir.mkdir()
+        shutil.copy2(ROOT_DIR / "scripts" / "load_sim_config.sh", scripts_dir / "load_sim_config.sh")
         ensure_yolo = scripts_dir / "ensure_yolo_runtime.sh"
         ensure_yolo.write_text(
             f"#!/usr/bin/env bash\nprintf '%s\\n' yolo-bootstrap >> {str(marker)!r}\nprintf '%s\\n' /usr/bin/python3\n",

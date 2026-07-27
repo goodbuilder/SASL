@@ -60,54 +60,12 @@ SIM_EXPLICIT_NAMES=(
   DRONE_FIRST_HOVER_S DRONE_FINAL_HOVER_S DRONE_LAND_DURATION_S
   DRONE_LAND_TIMEOUT_S DRONE_SETPOINT_HZ
   YOLO_MODEL_PATH YOLO_CLASS_NAME YOLO_CONFIDENCE YOLO_DEVICE YOLO_TARGET_HZ
-  YOLO_IMGSZ YOLO_PYTHON YOLO_PYTHONPATH
+  YOLO_IMGSZ MEASUREMENT_QUEUE_CAPACITY YOLO_PYTHON YOLO_PYTHONPATH
   BBOX_CENTER_ADJUSTMENT_ENABLE BBOX_CENTER_ADJUSTMENT_PATH
 )
-declare -A SIM_EXPLICIT_SET=()
-declare -A SIM_EXPLICIT_VALUE=()
-for name in "${SIM_EXPLICIT_NAMES[@]}"; do
-  if [[ -v "$name" ]]; then
-    SIM_EXPLICIT_SET["$name"]=1
-    SIM_EXPLICIT_VALUE["$name"]="${!name}"
-  fi
-done
-
-restore_explicit_sim_env() {
-  local name
-  for name in "${SIM_EXPLICIT_NAMES[@]}"; do
-    if [[ -n "${SIM_EXPLICIT_SET[$name]:-}" ]]; then
-      printf -v "$name" '%s' "${SIM_EXPLICIT_VALUE[$name]}"
-      export "$name"
-    fi
-  done
-}
-
-if [[ ! -f "$SIM_CONFIG" ]]; then
-  echo "error: SIM_CONFIG not found: $SIM_CONFIG" >&2
-  exit 2
-fi
-set -a
-# shellcheck disable=SC1090
-source "$SIM_CONFIG"
-set +a
-restore_explicit_sim_env
-
-if [[ -n "$SIM_SCENARIO_CONFIG" ]]; then
-  if [[ "$SIM_SCENARIO_CONFIG" != /* && -f "$CALLER_CWD/$SIM_SCENARIO_CONFIG" ]]; then
-    SIM_SCENARIO_CONFIG="$CALLER_CWD/$SIM_SCENARIO_CONFIG"
-  elif [[ "$SIM_SCENARIO_CONFIG" != /* && -f "$ROOT_DIR/config/scenarios/$SIM_SCENARIO_CONFIG" ]]; then
-    SIM_SCENARIO_CONFIG="$ROOT_DIR/config/scenarios/$SIM_SCENARIO_CONFIG"
-  fi
-  if [[ ! -f "$SIM_SCENARIO_CONFIG" ]]; then
-    echo "error: SIM_SCENARIO_CONFIG not found: $SIM_SCENARIO_CONFIG" >&2
-    exit 2
-  fi
-  set -a
-  # shellcheck disable=SC1090
-  source "$SIM_SCENARIO_CONFIG"
-  set +a
-  restore_explicit_sim_env
-fi
+# shellcheck disable=SC1091
+source "$ROOT_DIR/scripts/load_sim_config.sh"
+load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
 
 is_px4_checkout() {
   local candidate="${1:-}"
@@ -1033,6 +991,7 @@ if [[ -n "$DEFAULT_YOLO_MODEL" ]]; then
   add_default_launch_arg yolo_device "$DEFAULT_YOLO_DEVICE" "${launch_input[@]}"
   add_default_launch_arg yolo_target_hz "$DEFAULT_YOLO_HZ" "${launch_input[@]}"
   add_default_launch_arg yolo_imgsz "$DEFAULT_YOLO_IMGSZ" "${launch_input[@]}"
+  add_default_launch_arg measurement_queue_capacity "${MEASUREMENT_QUEUE_CAPACITY:-4096}" "${launch_input[@]}"
   if [[ "$show_detection_images" == true ]]; then
     add_default_launch_arg overlay_publish_hz "$DEFAULT_OVERLAY_HZ" "${launch_input[@]}"
   else

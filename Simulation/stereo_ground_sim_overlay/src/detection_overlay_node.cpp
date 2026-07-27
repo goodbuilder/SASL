@@ -177,10 +177,9 @@ private:
 
     const int width = static_cast<int>(image.width);
     const int height = static_cast<int>(image.height);
-    // The Flight image is an observation view, not a quality judgement.
-    // Confidence and disparity remain available as numeric telemetry, while
-    // every detected bounding box uses this one neutral display colour.
-    const std::array<uint8_t, 3> color{230, 230, 230};
+    // Confidence and disparity remain available as numeric telemetry; the
+    // overlay keeps one high-contrast display colour for detected boxes.
+    const std::array<uint8_t, 3> color{255, 0, 0};
 
     int x1 = clampInt(std::lround(detection.x1), 0, width - 1);
     int x2 = clampInt(std::lround(detection.x2), 0, width - 1);

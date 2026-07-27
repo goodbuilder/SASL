@@ -65,7 +65,7 @@
             <diffuse>0.22 0.24 0.25 1</diffuse>
           </material>
         </visual>
-        <!-- Ground grid line visuals are generated in stereo_ground_sim.launch.py. -->
+        <!-- Ground grid line visuals are intentionally omitted. -->
         <!-- GROUND_GRID_VISUALS -->
       </link>
     </model>

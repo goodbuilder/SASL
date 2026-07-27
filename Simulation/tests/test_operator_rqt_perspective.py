@@ -82,14 +82,21 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert "QLineEdit" not in source
     assert 'QPushButton("Open ROS graph")' in source
     assert '["ros2", "run", "rqt_graph", "rqt_graph"]' in source
-    assert "Live saved CSV preview" in source
-    assert "read_recent_csv_lines(csv_path, data_row_count=3)" in source
+    assert "CSV preview" in source
+    assert "update_live_sample" in source
+    assert "update_live_px4_raw_gps" in source
+    assert "_show_live_preview()" in source
+    assert "No CSV session has been started." not in source
+    assert "persisted telemetry rows here" not in source
+    assert "CSV_PREVIEW_TABLE_ROWS = 40" in source
+    assert "CSV_PREVIEW_RAW_ROWS = 20" in source
+    assert "read_recent_csv_lines(csv_path, data_row_count=CSV_PREVIEW_RAW_ROWS)" in source
     assert 'QPushButton("Open session")' in source
     assert 'QPushButton("Open CSV")' in source
     assert 'QPushButton("Open XLSX")' in source
     assert 'QPushButton("Export analysis CSV")' in source
-    assert "read_recent_csv_rows" in source
-    for record_view in ("Summary", "Raw GPS", "BBox", "PX4 / Camera", "Raw CSV"):
+    assert "read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)" in source
+    for record_view in ("Summary", "Raw GPS", "BBox", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
         assert f'"{record_view}"' in source
 
 

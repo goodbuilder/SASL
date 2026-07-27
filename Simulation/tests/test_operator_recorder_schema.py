@@ -129,6 +129,8 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
 
         recorder._estimated_position_cb(FakeMsg([1000.0, 7.0, 4.0, 1000.0325]))
         recorder._corrected_position_cb(FakeMsg([999.0, 6.5, 3.5, 999.0274]))
+        recorder._optical_position_cb(FakeMsg([1001.0, 7.5, 4.5, 1001.038]))
+        recorder._ideal_position_cb(FakeMsg([1000.5, 7.1, 4.1, 1000.533]))
         recorder._float_cb(FakeMsg(200.0), "disparity_px", "/stereo/disparity")
         recorder._ground_truth_position_cb(FakeMsg([1000.0, 7.0, 4.0, 1000.0325]))
         recorder._gps_baseline_position_cb(
@@ -140,6 +142,34 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         recorder._detections_cb(FakeMsg([1, 690, 380, 710, 400, 0.9, 700, 390, 1, 490, 380, 510, 400, 0.8, 500, 390]))
         recorder._profile_status_cb(
             FakeMsg(json.dumps({"profile_id": "unit", "profile_mode": "sim3", "fallback_level": 2}))
+        )
+        recorder._ray_metrics_cb(
+            FakeMsg(
+                json.dumps(
+                    {
+                        "ideal_left_u_px": 701.0,
+                        "ideal_left_v_px": 391.0,
+                        "ideal_right_u_px": 501.0,
+                        "ideal_right_v_px": 391.0,
+                        "ideal_disparity_px": 200.0,
+                        "ideal_pixel_source": "unit_test_projection",
+                        "nominal": {
+                            "computation_status": "computed",
+                            "forward_m": 1000.0,
+                            "right_m": 7.0,
+                            "down_m": 4.0,
+                            "range_m": 1000.0325,
+                            "gap_m": 0.1,
+                            "intersection_angle_deg": 1.2,
+                            "left_depth_m": 1000.0,
+                            "right_depth_m": 1000.1,
+                            "left_point_frd_m": [1000.0, 7.0, 4.0],
+                            "right_point_frd_m": [1000.0, 7.1, 4.0],
+                            "midpoint_frd_m": [1000.0, 7.05, 4.0],
+                        },
+                    }
+                )
+            )
         )
         recorder._write_csv_row()
         rows = list(csv.DictReader(io.StringIO(output.getvalue())))
@@ -154,7 +184,15 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         self.assertEqual(row["corrected_forward_m"], "999")
         self.assertEqual(row["corrected_right_m"], "6.5")
         self.assertEqual(row["corrected_down_m"], "3.5")
+        self.assertEqual(row["optical_forward_m"], "1001")
+        self.assertEqual(row["ideal_forward_m"], "1000.5")
         self.assertEqual(row["raw_disparity_px"], "200")
+        self.assertEqual(row["ideal_left_u_px"], "701")
+        self.assertEqual(row["ideal_right_u_px"], "501")
+        self.assertEqual(row["ideal_pixel_source"], "unit_test_projection")
+        self.assertEqual(row["nominal_ray_computation_status"], "computed")
+        self.assertEqual(row["nominal_ray_gap_m"], "0.1")
+        self.assertEqual(row["nominal_ray_midpoint_right_m"], "7.05")
         self.assertEqual(row["left_x1"], "690")
         self.assertEqual(row["left_y1"], "380")
         self.assertEqual(row["left_x2"], "710")
@@ -235,6 +273,13 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                         "right_y1": "60",
                         "right_x2": "70",
                         "right_y2": "80",
+                        "nominal_ray_computation_status": "computed",
+                        "nominal_ray_forward_m": "2000",
+                        "nominal_ray_right_m": "1",
+                        "nominal_ray_down_m": "2",
+                        "nominal_ray_range_m": "2000.00125",
+                        "nominal_ray_gap_m": "0.05",
+                        "nominal_ray_intersection_angle_deg": "1.5",
                     }
                 )
 
@@ -251,9 +296,20 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                     for name in archive.namelist()
                     if name.startswith("xl/worksheets/")
                 )
-            for sheet_name in ("Summary", "Baseline", "BBox", "Camera Pose", "Manifest"):
+            for sheet_name in (
+                "Summary",
+                "UAV PX4",
+                "Left PX4",
+                "Right PX4",
+                "Camera Observations",
+                "Stereo Estimates",
+                "Quality Events",
+                "Rays",
+                "Config",
+            ):
                 self.assertIn(f'name="{sheet_name}"', workbook_xml)
             self.assertIn(result["csv_sha256"], worksheets_xml)
+            self.assertIn("nominal", worksheets_xml)
 
     def test_camera_px4_samples_and_estimated_optical_extrinsic_are_recorded(self) -> None:
         module = load_module()
@@ -286,10 +342,16 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         recorder._camera_global_position_cb("left", FakeVehicleGlobalPosition())
         recorder._camera_pose_diagnostic_cb("left", FakeMsg(json.dumps(diagnostic)))
         recorder._camera_odometry_cb("left", FakeVehicleOdometry())
+        recorder._camera_raw_gps_cb("uam", FakeSensorGps())
+        recorder._camera_global_position_cb("uam", FakeVehicleGlobalPosition())
+        recorder._camera_odometry_cb("uam", FakeVehicleOdometry())
 
         self.assertEqual(recorder.latest["left_raw_gps_lat_deg"], 37.1)
         self.assertEqual(recorder.latest["left_global_position_lon_deg"], 127.21)
         self.assertEqual(recorder.latest["left_px4_velocity_e_m_s"], 2.0)
+        self.assertEqual(recorder.latest["uam_raw_gps_lat_deg"], 37.1)
+        self.assertEqual(recorder.latest["uam_global_position_lon_deg"], 127.21)
+        self.assertEqual(recorder.latest["uam_px4_velocity_e_m_s"], 2.0)
         self.assertEqual(recorder.latest["left_px4_estimated_optical_world_enu_x_m"], -12.5)
         self.assertEqual(recorder.latest["left_px4_estimated_optical_world_enu_y_m"], 0.0)
         self.assertEqual(recorder.latest["left_px4_estimated_optical_world_enu_z_m"], 10.0)
@@ -300,6 +362,9 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             "left_px4_velocity_n_m_s",
             "left_px4_estimated_optical_world_enu_x_m",
             "right_px4_estimated_optical_world_enu_yaw_deg",
+            "uam_raw_gps_lat_deg",
+            "uam_global_position_lat_deg",
+            "uam_px4_velocity_n_m_s",
         ):
             self.assertIn(field, module.TELEMETRY_FIELDS)
         manifest_rows = dict(recorder._camera_xlsx_manifest_rows())

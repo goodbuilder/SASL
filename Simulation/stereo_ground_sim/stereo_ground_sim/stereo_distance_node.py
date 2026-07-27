@@ -779,11 +779,18 @@ class StereoDistanceNode(Node):
         )
         self.profile_status_pub = self.create_publisher(String, "/stereo/profile_status", 10)
         self.marker_pub = self.create_publisher(Marker, "/stereo/distance_marker", 10)
+        ray_marker_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
         self.ray_marker_pub = (
-            self.create_publisher(MarkerArray, "/stereo/ray_markers", 10)
+            self.create_publisher(MarkerArray, "/stereo/ray_markers", ray_marker_qos)
             if self.enable_rviz_rays
             else None
         )
+        self.ray_metrics_pub = self.create_publisher(String, "/stereo/ray_metrics", 10)
         self.yolo_inference_ms_pub = self.create_publisher(
             Float32, "/stereo/yolo_inference_ms", 10
         )
@@ -2136,7 +2143,16 @@ class StereoDistanceNode(Node):
             return None
         if pixels is None:
             return None
-        return self._triangulate_pixel_centers(*pixels, width, height)
+        result = self._triangulate_pixel_centers(*pixels, width, height)
+        result.update(
+            {
+                "left_u_px": float(pixels[0]),
+                "left_v_px": float(pixels[1]),
+                "right_u_px": float(pixels[2]),
+                "right_v_px": float(pixels[3]),
+            }
+        )
+        return result
 
     def _triangulate_pixel_centers_oracle(
         self, left_u_px, left_v_px, right_u_px, right_v_px, width, height, *, camera_oracle_snapshot=_CAMERA_ORACLE_UNSET
@@ -3422,6 +3438,7 @@ class StereoDistanceNode(Node):
                     "intersection_angle_deg": raw.get("intersection_angle_deg"),
                 }
             )
+            self._publish_ray_metrics(nominal=raw, optical=optical)
             self._publish_ray_markers(nominal=raw, optical=optical)
         metrics.update(
             {
@@ -3738,12 +3755,24 @@ class StereoDistanceNode(Node):
                 "ideal_intersection_angle_deg": (
                     None if ideal is None else ideal.get("intersection_angle_deg")
                 ),
+                "ideal_left_u_px": None if ideal is None else ideal.get("left_u_px"),
+                "ideal_left_v_px": None if ideal is None else ideal.get("left_v_px"),
+                "ideal_right_u_px": None if ideal is None else ideal.get("right_u_px"),
+                "ideal_right_v_px": None if ideal is None else ideal.get("right_v_px"),
+                "ideal_disparity_px": (
+                    None
+                    if ideal is None
+                    or ideal.get("left_u_px") is None
+                    or ideal.get("right_u_px") is None
+                    else float(ideal["left_u_px"]) - float(ideal["right_u_px"])
+                ),
                 "ideal_pixel_source": "ground_truth_world_enu_quantized_nominal_projection",
             }
         )
         evaluation = self._evaluation_metadata(pair, alignment, gt_baseline, metrics)
         metrics.update(evaluation)
         if ideal is not None:
+            self._publish_ray_metrics(ideal=ideal)
             self._publish_ray_markers(ideal=ideal)
         # The initial publish happens before GT alignment exists.  Republish
         # after the DKL reference has been evaluated so rqt receives it without
@@ -5454,6 +5483,71 @@ class StereoDistanceNode(Node):
     @staticmethod
     def _marker_point(vector):
         return Point(x=float(vector[0]), y=float(vector[1]), z=float(vector[2]))
+
+    @staticmethod
+    def _json_number(value):
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @classmethod
+    def _json_vector(cls, values):
+        if values is None:
+            return None
+        try:
+            result = [cls._json_number(value) for value in values[:3]]
+        except (TypeError, ValueError):
+            return None
+        return result if len(result) == 3 and all(value is not None for value in result) else None
+
+    @classmethod
+    def _ray_metrics_payload(cls, result):
+        if result is None:
+            return None
+        return {
+            "computation_status": str(result.get("computation_status", "")),
+            "forward_m": cls._json_number(result.get("forward_m")),
+            "right_m": cls._json_number(result.get("right_m")),
+            "down_m": cls._json_number(result.get("down_m")),
+            "range_m": cls._json_number(result.get("range_m")),
+            "gap_m": cls._json_number(result.get("ray_gap_m")),
+            "intersection_angle_deg": cls._json_number(result.get("intersection_angle_deg")),
+            "left_depth_m": cls._json_number(result.get("left_depth_m")),
+            "right_depth_m": cls._json_number(result.get("right_depth_m")),
+            "left_point_frd_m": cls._json_vector(result.get("point_on_left_ray_baseline_center_frd_m")),
+            "right_point_frd_m": cls._json_vector(result.get("point_on_right_ray_baseline_center_frd_m")),
+            "midpoint_frd_m": cls._json_vector(result.get("midpoint_baseline_center_frd_m")),
+        }
+
+    def _publish_ray_metrics(self, *, nominal=None, optical=None, ideal=None):
+        publisher = getattr(self, "ray_metrics_pub", None)
+        if publisher is None:
+            return
+        payload = {}
+        for key, result in (("nominal", nominal), ("optical", optical), ("ideal", ideal)):
+            ray_payload = self._ray_metrics_payload(result)
+            if ray_payload is not None:
+                payload[key] = ray_payload
+        if ideal is not None:
+            for source, target in (
+                ("left_u_px", "ideal_left_u_px"),
+                ("left_v_px", "ideal_left_v_px"),
+                ("right_u_px", "ideal_right_u_px"),
+                ("right_v_px", "ideal_right_v_px"),
+            ):
+                payload[target] = self._json_number(ideal.get(source))
+            left_u = payload.get("ideal_left_u_px")
+            right_u = payload.get("ideal_right_u_px")
+            payload["ideal_disparity_px"] = (
+                None if left_u is None or right_u is None else float(left_u) - float(right_u)
+            )
+            payload["ideal_pixel_source"] = "ground_truth_world_enu_quantized_nominal_projection"
+        if payload:
+            publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
 
     def _publish_actual_drone_marker(self, position_world_enu_m, orientation_xyzw, stamp_ns):
         """Render the authoritative Gazebo vehicle-reference pose as a drone mesh."""
