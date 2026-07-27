@@ -100,6 +100,11 @@ GPS_BASELINE_POSITION_FIELDS = [
     "raw_minus_global_baseline_right_m",
     "raw_minus_global_baseline_down_m",
     "raw_minus_global_baseline_delta_m",
+    "uam_raw_gps_reference_forward_m",
+    "uam_raw_gps_reference_right_m",
+    "uam_raw_gps_reference_down_m",
+    "uam_raw_gps_reference_range_m",
+    "uam_raw_gps_reference_position_error_m",
     "truth_range_bin_100m",
 ]
 
@@ -479,6 +484,11 @@ XLSX_DIRECT_SHEET_FIELDS = (
             "raw_gps_baseline_right_m",
             "raw_gps_baseline_down_m",
             "raw_gps_baseline_position_error_m",
+            "uam_raw_gps_reference_forward_m",
+            "uam_raw_gps_reference_right_m",
+            "uam_raw_gps_reference_down_m",
+            "uam_raw_gps_reference_range_m",
+            "uam_raw_gps_reference_position_error_m",
             "global_position_baseline_forward_m",
             "global_position_baseline_right_m",
             "global_position_baseline_down_m",
@@ -564,6 +574,7 @@ DEBUG_BAG_TOPICS = [
     "/stereo/profile_status",
     "/stereo/raw_gps_baseline_position",
     "/stereo/global_position_baseline_position",
+    "/stereo/uam_raw_gps_reference_position",
     "/stereo/distance_marker",
     "/target_distance",
     "/stereo/yolo_inference_ms",
@@ -838,6 +849,7 @@ class OperatorRecorder(Node):
             "global_position_baseline_topic=/stereo/global_position_baseline_position publishes fused-PX4-global-baseline forward/right/down",
             "gps_baseline_errors=3D FRD error versus /ground_truth_position; truth_range_bin_100m is floor(truth forward / 100) * 100",
             "gps_baseline_comparison=raw_minus_global_baseline_{forward,right,down}_m and raw_minus_global_baseline_delta_m are raw GPS minus PX4 GlobalPosition in public FRD metres",
+            "uam_raw_gps_reference_position=/stereo/uam_raw_gps_reference_position publishes the UAM raw-GPS target reference in public FRD metres; it is not simulator truth",
             "detection_bbox_contract=left/right bbox source fields are x1,y1,x2,y2 in image pixels; cx/cy and width/height are retained only as derived compatibility fields",
             "bbox_adjustment_topic=/stereo/bbox_adjustment publishes corrected centers, center deltas, profile hash, fallback, sample count, raw disparity/range",
             "profile_status_topic=/stereo/profile_status publishes profile_id, mode, fallback_level, fallback_reason",
@@ -931,6 +943,12 @@ class OperatorRecorder(Node):
             PointStamped,
             "/stereo/global_position_baseline_position",
             lambda msg: self._gps_baseline_position_cb("global_position_baseline", msg),
+            10,
+        )
+        self.create_subscription(
+            PointStamped,
+            "/stereo/uam_raw_gps_reference_position",
+            lambda msg: self._gps_baseline_position_cb("uam_raw_gps_reference", msg),
             10,
         )
         self.create_subscription(

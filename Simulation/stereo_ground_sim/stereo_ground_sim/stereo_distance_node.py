@@ -158,7 +158,12 @@ from stereo_ground_sim.coordinate_frames import (
     project_world_point_to_pixel,
     effective_optical_rpy_errors_deg,
 )
-from stereo_ground_sim.gps_baseline import RawGpsFix, gps_baseline_enu_m, norm_m
+from stereo_ground_sim.gps_baseline import (
+    RawGpsFix,
+    gps_baseline_enu_m,
+    gps_relative_enu_m,
+    norm_m,
+)
 from stereo_ground_sim.time_alignment import (
     BoundedIdHistory,
     GroundTruthPositionBuffer,
@@ -383,6 +388,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("gps_baseline_source", "raw_gps")
         self.declare_parameter("gps_baseline_left_topic", "/camera_left/fmu/out/vehicle_gps_position")
         self.declare_parameter("gps_baseline_right_topic", "/camera_right/fmu/out/vehicle_gps_position")
+        self.declare_parameter("uam_raw_gps_topic", "/fmu/out/vehicle_gps_position")
         self.declare_parameter("global_baseline_left_topic", "/camera_left/fmu/out/vehicle_global_position")
         self.declare_parameter("global_baseline_right_topic", "/camera_right/fmu/out/vehicle_global_position")
         self.declare_parameter("gps_baseline_max_age_s", 2.5)
@@ -487,13 +493,14 @@ class StereoDistanceNode(Node):
         )
         self.gps_baseline_left_topic = str(self.get_parameter("gps_baseline_left_topic").value)
         self.gps_baseline_right_topic = str(self.get_parameter("gps_baseline_right_topic").value)
+        self.uam_raw_gps_topic = str(self.get_parameter("uam_raw_gps_topic").value)
         self.global_baseline_left_topic = str(self.get_parameter("global_baseline_left_topic").value)
         self.global_baseline_right_topic = str(self.get_parameter("global_baseline_right_topic").value)
         self.gps_baseline_max_age_s = float(self.get_parameter("gps_baseline_max_age_s").value)
         if not math.isfinite(self.gps_baseline_max_age_s) or self.gps_baseline_max_age_s <= 0.0:
             raise ValueError("gps_baseline_max_age_s must be positive and finite")
         self.enable_rviz_rays = self._bool_param("enable_rviz_rays")
-        self.gps_baseline_fixes = {"left": None, "right": None}
+        self.gps_baseline_fixes = {"left": None, "right": None, "uam": None}
         self.global_baseline_fixes = {"left": None, "right": None}
         self.camera_oracle_rejection_count = 0
         self.last_camera_oracle_rejection_reason = "unavailable"
@@ -581,6 +588,7 @@ class StereoDistanceNode(Node):
             "raw_gps": 0,
             "global_position": 0,
         }
+        self.last_uam_raw_gps_reference_published_pair_id = 0
         self.measurement_queue_overflow_count = 0
         self.measurement_overrun_invalid = False
         self.measurement_rejected_after_overrun_count = 0
@@ -716,6 +724,12 @@ class StereoDistanceNode(Node):
         self.global_position_baseline_plot_pub = self.create_publisher(
             Float32MultiArray, "/stereo/global_position_baseline_plot", 10
         )
+        self.uam_raw_gps_reference_position_pub = self.create_publisher(
+            PointStamped, "/stereo/uam_raw_gps_reference_position", 10
+        )
+        self.uam_raw_gps_reference_plot_pub = self.create_publisher(
+            Float32MultiArray, "/stereo/uam_raw_gps_reference_plot", 10
+        )
         self.canonical_ground_truth_position_pub = self.create_publisher(
             PointStamped, "/stereo/ground_truth_position", 10
         )
@@ -766,6 +780,12 @@ class StereoDistanceNode(Node):
                 SensorGps,
                 self.gps_baseline_right_topic,
                 lambda msg: self._gps_baseline_callback("right", msg),
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+            )
+            self.create_subscription(
+                SensorGps,
+                self.uam_raw_gps_topic,
+                lambda msg: self._gps_baseline_callback("uam", msg),
                 QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
             )
         self.clock_sub = self.create_subscription(Clock, "/clock", self._clock_cb, 10)
@@ -1384,6 +1404,58 @@ class StereoDistanceNode(Node):
             "gps_right_eph_m": right_fix.eph_m,
             "gps_left_timestamp_us": left_fix.timestamp_us,
             "gps_right_timestamp_us": right_fix.timestamp_us,
+        }
+
+    def _uam_raw_gps_reference(self):
+        """Project the UAM raw-GPS point into the fixed public FRD frame.
+
+        The left-camera raw GPS is the local ENU origin.  Its nominal world-ENU
+        optical center anchors that local tangent plane to Simulation's frozen
+        ``baseline_center_frd`` output contract.  This is a GPS reference, not
+        simulator ground truth.
+        """
+
+        if not getattr(self, "enable_gps_baseline_triangulation", False):
+            return {"computation_status": "disabled"}
+        with self.lock:
+            left_entry = self.gps_baseline_fixes.get("left")
+            uam_entry = self.gps_baseline_fixes.get("uam")
+        if left_entry is None or uam_entry is None:
+            return {"computation_status": "unavailable_raw_gps_fix"}
+        left_fix, left_received_s = left_entry
+        uam_fix, uam_received_s = uam_entry
+        if (
+            time.monotonic() - min(left_received_s, uam_received_s)
+            > self.gps_baseline_max_age_s
+        ):
+            return {"computation_status": "stale_raw_gps_fix"}
+        if (
+            abs(left_fix.timestamp_us - uam_fix.timestamp_us)
+            > self.gps_baseline_max_age_s * 1_000_000
+        ):
+            return {"computation_status": "unsynchronized_raw_gps_fix"}
+        try:
+            uam_from_left_enu = gps_relative_enu_m(left_fix, uam_fix)
+        except ValueError:
+            return {"computation_status": "invalid_raw_gps_fix"}
+        uam_world_enu = tuple(
+            self.nominal_left_camera.center_world_enu_m[index] + uam_from_left_enu[index]
+            for index in range(3)
+        )
+        forward_m, right_m, down_m = self.baseline_center_frd.point_from_world(
+            uam_world_enu
+        )
+        return {
+            "computation_status": "computed",
+            "forward_m": forward_m,
+            "right_m": right_m,
+            "down_m": down_m,
+            "range_m": norm_m((forward_m, right_m, down_m)),
+            "world_enu_m": uam_world_enu,
+            "left_timestamp_us": left_fix.timestamp_us,
+            "uam_timestamp_us": uam_fix.timestamp_us,
+            "left_eph_m": left_fix.eph_m,
+            "uam_eph_m": uam_fix.eph_m,
         }
 
     def _camera_oracle_record_fields(self, snapshot=_CAMERA_ORACLE_UNSET):
@@ -3613,6 +3685,21 @@ class StereoDistanceNode(Node):
                     "gps_baseline_down_m": gps_baseline.get("down_m"),
                 }
             )
+        uam_reference = self._uam_raw_gps_reference()
+        metrics.update(
+            {
+                "uam_raw_gps_reference_computation_status": uam_reference.get(
+                    "computation_status"
+                ),
+                "uam_raw_gps_reference_forward_m": uam_reference.get("forward_m"),
+                "uam_raw_gps_reference_right_m": uam_reference.get("right_m"),
+                "uam_raw_gps_reference_down_m": uam_reference.get("down_m"),
+                "uam_raw_gps_reference_range_m": uam_reference.get("range_m"),
+                "uam_raw_gps_reference_world_enu_m": uam_reference.get("world_enu_m"),
+                "uam_raw_gps_reference_left_timestamp_us": uam_reference.get("left_timestamp_us"),
+                "uam_raw_gps_reference_timestamp_us": uam_reference.get("uam_timestamp_us"),
+            }
+        )
         metrics.update(
             self._pair_result_metadata(
                 pair, None, None, computed.get("corrected"), count_alignment=False
@@ -4285,6 +4372,21 @@ class StereoDistanceNode(Node):
                     )
                 )
                 last_published_by_source[source] = pair_id
+        if (
+            metrics.get("uam_raw_gps_reference_computation_status") == "computed"
+            and pair_id is not None
+            and pair_id > getattr(self, "last_uam_raw_gps_reference_published_pair_id", 0)
+        ):
+            forward_m = metrics["uam_raw_gps_reference_forward_m"]
+            right_m = metrics["uam_raw_gps_reference_right_m"]
+            down_m = metrics["uam_raw_gps_reference_down_m"]
+            self.uam_raw_gps_reference_position_pub.publish(
+                self._point_stamped(stamp_ns, forward_m, right_m, down_m)
+            )
+            self.uam_raw_gps_reference_plot_pub.publish(
+                Float32MultiArray(data=[float(forward_m), float(right_m), float(down_m)])
+            )
+            self.last_uam_raw_gps_reference_published_pair_id = pair_id
 
     def _publish_estimated_position(self, metrics):
         estimated_publisher = getattr(self, "estimated_position_pub", None)

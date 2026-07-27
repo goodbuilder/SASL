@@ -38,14 +38,18 @@ def _ecef_from_wgs84(latitude_deg: float, longitude_deg: float, altitude_m: floa
     )
 
 
-def gps_baseline_enu_m(left: RawGpsFix, right: RawGpsFix) -> tuple[float, float, float]:
-    """Return the right-minus-left raw-GPS baseline in the left local ENU frame."""
+def gps_relative_enu_m(origin: RawGpsFix, target: RawGpsFix) -> tuple[float, float, float]:
+    """Return ``target - origin`` in the origin's local ENU frame, in metres."""
 
-    left_ecef = _ecef_from_wgs84(left.latitude_deg, left.longitude_deg, left.altitude_msl_m)
-    right_ecef = _ecef_from_wgs84(right.latitude_deg, right.longitude_deg, right.altitude_msl_m)
-    dx, dy, dz = tuple(right_ecef[index] - left_ecef[index] for index in range(3))
-    latitude = math.radians(left.latitude_deg)
-    longitude = math.radians(left.longitude_deg)
+    origin_ecef = _ecef_from_wgs84(
+        origin.latitude_deg, origin.longitude_deg, origin.altitude_msl_m
+    )
+    target_ecef = _ecef_from_wgs84(
+        target.latitude_deg, target.longitude_deg, target.altitude_msl_m
+    )
+    dx, dy, dz = tuple(target_ecef[index] - origin_ecef[index] for index in range(3))
+    latitude = math.radians(origin.latitude_deg)
+    longitude = math.radians(origin.longitude_deg)
     east = -math.sin(longitude) * dx + math.cos(longitude) * dy
     north = (
         -math.sin(latitude) * math.cos(longitude) * dx
@@ -58,6 +62,12 @@ def gps_baseline_enu_m(left: RawGpsFix, right: RawGpsFix) -> tuple[float, float,
         + math.sin(latitude) * dz
     )
     return float(east), float(north), float(up)
+
+
+def gps_baseline_enu_m(left: RawGpsFix, right: RawGpsFix) -> tuple[float, float, float]:
+    """Return the right-minus-left raw-GPS baseline in the left local ENU frame."""
+
+    return gps_relative_enu_m(left, right)
 
 
 def norm_m(vector: tuple[float, float, float]) -> float:

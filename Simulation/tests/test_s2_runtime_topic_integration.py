@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 from pathlib import Path
 from types import MethodType
 
@@ -8,6 +10,8 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from stereo_ground_sim.coordinate_frames import build_baseline_center_frd, nominal_camera_poses
+from stereo_ground_sim.gps_baseline import RawGpsFix
 from Simulation.stereo_ground_sim.stereo_ground_sim.time_alignment import (
     BoundedIdHistory,
     GroundTruthAlignment,
@@ -32,6 +36,8 @@ def _node_harness():
     node.global_position_baseline_position_pub = CapturePublisher()
     node.raw_gps_baseline_plot_pub = CapturePublisher()
     node.global_position_baseline_plot_pub = CapturePublisher()
+    node.uam_raw_gps_reference_position_pub = CapturePublisher()
+    node.uam_raw_gps_reference_plot_pub = CapturePublisher()
     node.last_raw_published_pair_id = 0
     node.last_corrected_published_pair_id = 0
     node.last_gps_baseline_published_pair_id = 0
@@ -39,6 +45,7 @@ def _node_harness():
         "raw_gps": 0,
         "global_position": 0,
     }
+    node.last_uam_raw_gps_reference_published_pair_id = 0
     node.gt_published_pair_ids = BoundedIdHistory(128)
     node.raw_computed_count = 0
     node.corrected_computed_count = 0
@@ -129,6 +136,10 @@ def test_gps_baseline_plot_arrays_preserve_public_frd_order_without_header_time(
         "global_position_baseline_forward_m": 1000.0,
         "global_position_baseline_right_m": 5.5,
         "global_position_baseline_down_m": 4.5,
+        "uam_raw_gps_reference_computation_status": "computed",
+        "uam_raw_gps_reference_forward_m": 1001.0,
+        "uam_raw_gps_reference_right_m": 5.0,
+        "uam_raw_gps_reference_down_m": 4.0,
     }
 
     node._publish_canonical_pair_positions(metrics)
@@ -136,5 +147,35 @@ def test_gps_baseline_plot_arrays_preserve_public_frd_order_without_header_time(
 
     assert len(node.raw_gps_baseline_position_pub.messages) == 1
     assert len(node.global_position_baseline_position_pub.messages) == 1
+    assert len(node.uam_raw_gps_reference_position_pub.messages) == 1
     assert node.raw_gps_baseline_plot_pub.messages[0].data == [1002.0, 6.0, 5.0]
+    assert node.uam_raw_gps_reference_plot_pub.messages[0].data == [1001.0, 5.0, 4.0]
     assert node.global_position_baseline_plot_pub.messages[0].data == [1000.0, 5.5, 4.5]
+
+
+def test_uam_raw_gps_reference_uses_left_local_enu_then_public_frd() -> None:
+    node = _node_harness()
+    left, right = nominal_camera_poses(25.0, 10.0)
+    node.enable_gps_baseline_triangulation = True
+    node.lock = threading.RLock()
+    node.gps_baseline_max_age_s = 2.5
+    node.nominal_left_camera = left
+    node.baseline_center_frd = build_baseline_center_frd(
+        left.center_world_enu_m,
+        right.center_world_enu_m,
+        left.forward_world_enu,
+        right.forward_world_enu,
+    )
+    left_fix = RawGpsFix(1, 47.3979712, 8.5459985, 10.0, 0.9, 1.8)
+    uam_fix = RawGpsFix(1, 47.3979712, 8.5463293, 22.0, 0.9, 1.8)
+    node.gps_baseline_fixes = {
+        "left": (left_fix, time.monotonic()),
+        "uam": (uam_fix, time.monotonic()),
+    }
+
+    reference = node._uam_raw_gps_reference()
+
+    assert reference["computation_status"] == "computed"
+    assert abs(reference["forward_m"]) < 0.02
+    assert abs(reference["right_m"] - 12.47) < 0.2
+    assert abs(reference["down_m"] + 12.0) < 0.02

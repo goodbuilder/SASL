@@ -8,6 +8,13 @@ diagnostics are operator visualization only, not qualification evidence, and use
 `baseline_center_frd` (metres; angles in degrees). Missing values are omitted
 rather than replaced by zero.
 
+`/stereo/uam_raw_gps_reference_position` is a distinct GPS-based target
+reference in the same public FRD frame. It converts simultaneous UAM and
+left-camera raw WGS-84 fixes through ECEF and left-local ENU, then anchors the
+result at the nominal left optical center before applying the fixed rig FRD
+transform. It is shown beside Stereo measurements in rqt and recorded in CSV,
+but is not simulator ground truth.
+
 Simulation World uses ENU; camera optical vectors use RDF; public measurement
 vectors use fixed `baseline_center_frd` (Forward, Right, Down), with origin at
 the nominal optical-center midpoint and quaternion metadata `xyzw`.

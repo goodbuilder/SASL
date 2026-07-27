@@ -72,6 +72,7 @@ SERIES = (
     ("optical", "/stereo/optical_position", QColor(0, 170, 170)),
     ("ideal", "/stereo/ideal_position", QColor(32, 86, 255)),
     ("raw_gps_baseline", "/stereo/raw_gps_baseline_position", QColor(235, 135, 0)),
+    ("uam_raw_gps_reference", "/stereo/uam_raw_gps_reference_position", QColor(134, 89, 45)),
 )
 SERIES_LABELS = {
     "truth": "truth",
@@ -79,6 +80,7 @@ SERIES_LABELS = {
     "optical": "Optical stereo",
     "ideal": "Ideal reference",
     "raw_gps_baseline": "raw GPS",
+    "uam_raw_gps_reference": "UAM raw GPS reference",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
 IMAGE_TOPICS = (
@@ -788,6 +790,12 @@ class LiveSavedCsvPreview(QWidget):
                 "raw_gps_baseline_right_m",
                 "raw_gps_baseline_down_m",
                 "raw_gps_baseline_range_m",
+            ),
+            "uam_raw_gps_reference": (
+                "uam_raw_gps_reference_forward_m",
+                "uam_raw_gps_reference_right_m",
+                "uam_raw_gps_reference_down_m",
+                "uam_raw_gps_reference_range_m",
             ),
         }.get(series_name)
         if field_prefixes is None:
@@ -1641,7 +1649,7 @@ class OperatorPanel(Plugin):
                 qos_profile_sensor_data,
             )
             for series_name, topic, _color in SERIES:
-                if series_name == "raw_gps_baseline":
+                if series_name in ("raw_gps_baseline", "uam_raw_gps_reference"):
                     continue
                 self._ros_node.create_subscription(
                     Float32MultiArray,
@@ -1654,6 +1662,14 @@ class OperatorPanel(Plugin):
                 "/stereo/raw_gps_baseline_position",
                 lambda msg: self._bridge.sample.emit(
                     "raw_gps_baseline", [msg.point.x, msg.point.y, msg.point.z, math.nan]
+                ),
+                10,
+            )
+            self._ros_node.create_subscription(
+                PointStamped,
+                "/stereo/uam_raw_gps_reference_position",
+                lambda msg: self._bridge.sample.emit(
+                    "uam_raw_gps_reference", [msg.point.x, msg.point.y, msg.point.z, math.nan]
                 ),
                 10,
             )

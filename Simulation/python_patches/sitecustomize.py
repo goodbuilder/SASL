@@ -110,6 +110,7 @@ def _patch_rqt_plot_default_topics():
                 "/stereo/optical_position/data[0]",
                 "/stereo/ideal_position/data[0]",
                 "/stereo/raw_gps_baseline_plot/data[0]",
+                "/stereo/uam_raw_gps_reference_plot/data[0]",
             ]
         elif serial == 2:
             axis_label = "Right"
@@ -119,6 +120,7 @@ def _patch_rqt_plot_default_topics():
                 "/stereo/optical_position/data[1]",
                 "/stereo/ideal_position/data[1]",
                 "/stereo/raw_gps_baseline_plot/data[1]",
+                "/stereo/uam_raw_gps_reference_plot/data[1]",
             ]
         elif serial == 3:
             axis_label = "Down"
@@ -128,6 +130,7 @@ def _patch_rqt_plot_default_topics():
                 "/stereo/optical_position/data[2]",
                 "/stereo/ideal_position/data[2]",
                 "/stereo/raw_gps_baseline_plot/data[2]",
+                "/stereo/uam_raw_gps_reference_plot/data[2]",
             ]
         else:
             return

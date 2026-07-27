@@ -58,6 +58,7 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
         assert f'"{tab_name}"' in source
     assert "RecordingControls" in source
     assert "/stereo/raw_gps_baseline_position" in source
+    assert "/stereo/uam_raw_gps_reference_position" in source
     assert "/stereo/global_position_baseline_position" not in source
     assert "/stereo/ideal_position" in source
     assert '"raw": "Nominal stereo"' in source
@@ -110,12 +111,13 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
         assert f'"{record_view}"' in source
 
 
-def test_rqt_runtime_patch_keeps_only_raw_gps_baseline_in_axis_plots() -> None:
+def test_rqt_runtime_patch_keeps_gps_position_series_in_axis_plots() -> None:
     source = RQT_PATCH_PATH.read_text(encoding="utf-8")
 
     for index in range(3):
         assert f"/stereo/ideal_position/data[{index}]" in source
         assert f"/stereo/raw_gps_baseline_plot/data[{index}]" in source
+        assert f"/stereo/uam_raw_gps_reference_plot/data[{index}]" in source
         assert f"/stereo/global_position_baseline_plot/data[{index}]" not in source
 
 
