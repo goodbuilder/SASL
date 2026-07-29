@@ -107,6 +107,7 @@ import sys
 
 import cv2
 import numpy as np
+import pyarrow
 import xlsxwriter
 import yaml
 
@@ -118,7 +119,7 @@ print(f"python={sys.executable}")
 print(f"sasl_root={Path.cwd().resolve()}")
 print(
     f"opencv={cv2.__version__}, numpy={np.__version__}, yaml={yaml.__version__}, "
-    f"xlsxwriter={xlsxwriter.__version__}"
+    f"xlsxwriter={xlsxwriter.__version__}, pyarrow={pyarrow.__version__}"
 )
 PY
     exit 0

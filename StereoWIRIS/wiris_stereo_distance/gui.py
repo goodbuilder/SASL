@@ -8,6 +8,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import signal
 import struct
@@ -156,6 +157,7 @@ from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEsti
 from wiris_stereo_distance.recording_session import (
     SavedSessionFiles,
     SpoolRows,
+    compact_distance_measurement_rows,
     discover_retryable_sessions,
     format_video_paths,
     load_retryable_session,
@@ -348,6 +350,20 @@ CAMERA_RTCP_PAIR_MAX_DELTA_S = 0.050
 CAMERA_RTCP_MAX_PC_OFFSET_S = 0.100
 CAMERA_SYNC_HISTORY_MAX_AGE_S = 1.0
 CAMERA_SYNC_RECEIVE_PAIR_MAX_DELTA_S = 0.200
+GNSS_BASE_SURVEY_TREND_WINDOW_S = 60.0
+GNSS_BASE_SURVEY_STAGNANT_DELTA_M = 0.01
+GNSS_BASE_SURVEY_IMPROVING_DELTA_M = 0.05
+GNSS_BASE_LOW_CNO_DBHZ = 30
+GNSS_BASE_LOW_ELEVATION_DEG = 15
+GNSS_ID_LABELS = {
+    0: "GPS",
+    1: "SBAS",
+    2: "Galileo",
+    3: "BeiDou",
+    5: "QZSS",
+    6: "GLONASS",
+    7: "NavIC",
+}
 RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
 RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
@@ -2046,6 +2062,53 @@ def parse_ubx_base_satellite_count(message_class: int, message_id: int, payload:
     return None
 
 
+def parse_ubx_nav_sat_quality(message_class: int, message_id: int, payload: bytes) -> dict[str, object] | None:
+    if message_class != 0x01 or message_id != 0x35 or len(payload) < 8:
+        return None
+    reported_count = int(payload[5])
+    available_count = max(0, (len(payload) - 8) // 12)
+    record_count = min(reported_count, available_count)
+    if record_count <= 0:
+        return {
+            "tracked": 0,
+            "used": 0,
+            "avg_cno_dbhz": None,
+            "low_cno": 0,
+            "low_elevation": 0,
+            "constellations": {},
+        }
+    cno_values: list[int] = []
+    used = 0
+    low_cno = 0
+    low_elevation = 0
+    constellations: dict[str, int] = {}
+    for index in range(record_count):
+        offset = 8 + index * 12
+        gnss_id = int(payload[offset])
+        cno = int(payload[offset + 2])
+        elevation = struct.unpack_from("<b", payload, offset + 3)[0]
+        flags = struct.unpack_from("<I", payload, offset + 8)[0]
+        label = GNSS_ID_LABELS.get(gnss_id, f"GNSS{gnss_id}")
+        constellations[label] = constellations.get(label, 0) + 1
+        if flags & 0x01:
+            used += 1
+        if cno > 0:
+            cno_values.append(cno)
+            if cno < GNSS_BASE_LOW_CNO_DBHZ:
+                low_cno += 1
+        if elevation < GNSS_BASE_LOW_ELEVATION_DEG:
+            low_elevation += 1
+    avg_cno = sum(cno_values) / len(cno_values) if cno_values else None
+    return {
+        "tracked": record_count,
+        "used": used,
+        "avg_cno_dbhz": avg_cno,
+        "low_cno": low_cno,
+        "low_elevation": low_elevation,
+        "constellations": constellations,
+    }
+
+
 def parse_nmea_gga_satellite_count(line: str) -> tuple[int, int] | None:
     text = line.strip()
     if not text.startswith(("$GNGGA", "$GPGGA", "$GAGGA", "$GLGGA", "$GBGGA")):
@@ -2072,6 +2135,15 @@ def parse_nmea_gga_satellite_count(line: str) -> tuple[int, int] | None:
     except ValueError:
         return None
     return satellites, fix_quality
+
+
+def parse_rtcm3_message_type(frame: bytes) -> int | None:
+    if len(frame) < 6 or frame[0] != 0xD3:
+        return None
+    payload_len = ((frame[1] & 0x03) << 8) | frame[2]
+    if payload_len < 2 or len(frame) < 3 + payload_len + 3:
+        return None
+    return ((int(frame[3]) << 4) | (int(frame[4]) >> 4)) & 0x0FFF
 
 
 def gnss_base_serial_port_candidates() -> list[str]:
@@ -2221,6 +2293,7 @@ class GnssBaseSerialWorker(QtCore.QObject):
     stats_changed = QtCore.pyqtSignal(int, float, float)
     survey_in_changed = QtCore.pyqtSignal(object)
     satellite_count_changed = QtCore.pyqtSignal(int, str)
+    satellite_quality_changed = QtCore.pyqtSignal(object)
     rtcm_frame_received = QtCore.pyqtSignal(object)
     command_sent = QtCore.pyqtSignal(str, int)
     failed = QtCore.pyqtSignal(str)
@@ -2287,6 +2360,9 @@ class GnssBaseSerialWorker(QtCore.QObject):
                         if satellite_count is not None:
                             source = "NAV-PVT" if message_id == 0x07 else "NAV-SAT"
                             self.satellite_count_changed.emit(satellite_count, source)
+                        satellite_quality = parse_ubx_nav_sat_quality(message_class, message_id, payload)
+                        if satellite_quality is not None:
+                            self.satellite_quality_changed.emit(satellite_quality)
                 if now_s - last_emit_s >= 0.5:
                     elapsed_s = max(1e-6, now_s - started_s)
                     rate_bps = total_bytes / elapsed_s
@@ -2583,6 +2659,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.latest_rtk_baseline: RtkBaselineEstimate | None = None
         self.calibration_capture_index = 0
         self.last_calibration_result: StereoIntrinsicsResult | None = None
+        self.checkerboard_validation_result: StereoIntrinsicsResult | None = None
+        self.checkerboard_validation_result_mode = "pixhawk"
+        self.checkerboard_validation_summary: dict[str, object] = {}
+        self.checkerboard_validation_result_saved = False
         self.last_calibration_zoom_level: int | None = None
         self.active_intrinsics: StereoIntrinsicsResult | None = None
         self._active_intrinsics_profile_path = ""
@@ -2618,6 +2698,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_detect_thread: QtCore.QThread | None = None
         self.gnss_base_detect_worker: GnssBaseSerialDetectWorker | None = None
         self._gnss_base_candidate_rows: list[dict[str, object]] = []
+        self.gnss_base_survey_samples: deque[tuple[float, int, float, bool, bool]] = deque(maxlen=240)
+        self.gnss_base_rtcm_stats = self._new_gnss_base_rtcm_stats()
         self.auto_wiris_connect_pending = False
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
@@ -2749,6 +2831,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         alignment_mag_layout = QtWidgets.QVBoxLayout(alignment_mag_tab)
         alignment_attitude_tab = QtWidgets.QWidget()
         alignment_attitude_layout = QtWidgets.QVBoxLayout(alignment_attitude_tab)
+        optical_alignment_tab = QtWidgets.QWidget()
+        optical_alignment_layout = QtWidgets.QVBoxLayout(optical_alignment_tab)
         alignment_coordinate_tab = QtWidgets.QWidget()
         alignment_coordinate_layout = QtWidgets.QVBoxLayout(alignment_coordinate_tab)
         alignment_validation_tab = QtWidgets.QWidget()
@@ -2767,6 +2851,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calibration_layout = QtWidgets.QVBoxLayout(calibration_tab)
         checkerboard_calibration_tab = QtWidgets.QWidget()
         checkerboard_calibration_layout = QtWidgets.QVBoxLayout(checkerboard_calibration_tab)
+        checkerboard_validation_tab = QtWidgets.QWidget()
+        checkerboard_validation_layout = QtWidgets.QVBoxLayout(checkerboard_validation_tab)
         zoom_intrinsics_tab = QtWidgets.QWidget()
         zoom_intrinsics_layout = QtWidgets.QVBoxLayout(zoom_intrinsics_tab)
         camera_params_tab = QtWidgets.QWidget()
@@ -2803,6 +2889,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             mag_management_layout,
             alignment_mag_layout,
             alignment_attitude_layout,
+            optical_alignment_layout,
             alignment_coordinate_layout,
             alignment_validation_layout,
             alignment_profile_layout,
@@ -2811,6 +2898,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             yaw_alignment_layout,
             calibration_layout,
             checkerboard_calibration_layout,
+            checkerboard_validation_layout,
             zoom_intrinsics_layout,
             camera_params_layout,
             intrinsic_parameters_layout,
@@ -2854,10 +2942,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calibration_tabs = QtWidgets.QTabWidget()
         calibration_tabs.setDocumentMode(True)
         calibration_tabs.addTab(checkerboard_calibration_tab, "체커보드")
+        calibration_tabs.addTab(checkerboard_validation_tab, "체커보드 검증/계산")
         calibration_tabs.addTab(zoom_intrinsics_tab, "줌 내부 파라미터")
         calibration_layout.addWidget(calibration_tabs, 1)
         self.calibration_tabs = calibration_tabs
         self.checkerboard_calibration_tab_index = calibration_tabs.indexOf(checkerboard_calibration_tab)
+        self.checkerboard_validation_tab_index = calibration_tabs.indexOf(checkerboard_validation_tab)
         self.zoom_intrinsics_tab_index = calibration_tabs.indexOf(zoom_intrinsics_tab)
 
         parameter_tabs = QtWidgets.QTabWidget()
@@ -2879,6 +2969,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         alignment_tabs.addTab(mag_management_tab, "MAG 관리")
         alignment_tabs.addTab(alignment_mag_tab, "Baseline 계산")
         alignment_tabs.addTab(alignment_attitude_tab, "Baseline / 자세 정렬")
+        alignment_tabs.addTab(optical_alignment_tab, "Optical 정렬")
         alignment_layout.addWidget(alignment_tabs, 1)
         self.alignment_tabs = alignment_tabs
         self.alignment_overview_tab_index = alignment_tabs.indexOf(alignment_overview_tab)
@@ -2889,6 +2980,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.baseline_alignment_tab_index = alignment_tabs.indexOf(alignment_mag_tab)
         self.yaw_alignment_tab_index = alignment_tabs.indexOf(alignment_attitude_tab)
         self.baseline_attitude_alignment_tab_index = self.yaw_alignment_tab_index
+        self.optical_alignment_tab_index = alignment_tabs.indexOf(optical_alignment_tab)
         self.coordinate_alignment_tab_index = -1
         self.validation_alignment_tab_index = -1
         self.alignment_profile_tab_index = -1
@@ -4092,6 +4184,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self._build_baseline_calculation_view(alignment_mag_layout, include_source_controls=False, include_alignment_plot=False)
         self._build_baseline_attitude_alignment_tab(alignment_attitude_layout)
+        self._build_optical_alignment_tab(optical_alignment_layout)
         self.refresh_baseline_field_browser()
         self._refresh_baseline_alignment_ui()
 
@@ -4178,13 +4271,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         wiris_command_layout.addWidget(self.wiris_command_log, 1)
         self._apply_selected_wiris_command()
 
-        calibration_group = QtWidgets.QGroupBox("체커보드 내부 파라미터 보정")
+        calibration_group = QtWidgets.QGroupBox("체커보드 캡처")
         calibration_group.setObjectName("checkerboardIntrinsicCalibrationGroup")
         calib_form = QtWidgets.QGridLayout(calibration_group)
         calib_form.setHorizontalSpacing(6)
         calib_form.setVerticalSpacing(6)
         calib_form.setColumnStretch(5, 1)
-        calib_form.setColumnStretch(7, 0)
         self.calib_cols_spin = QtWidgets.QSpinBox()
         self.calib_cols_spin.setRange(2, 30)
         self.calib_cols_spin.setValue(13)
@@ -4204,7 +4296,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             (self.calib_cols_spin, 72),
             (self.calib_rows_spin, 72),
             (self.calib_square_spin, 96),
-            (self.calib_min_images_spin, 72),
         ):
             spin.setProperty("compactFormField", True)
             spin.setMinimumWidth(width)
@@ -4215,8 +4306,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calib_dir_edit.setMinimumWidth(260)
         self.capture_calibration_button = QtWidgets.QPushButton("캡처")
         self.capture_calibration_button.clicked.connect(self.capture_calibration_images)
-        self.run_calibration_button = QtWidgets.QPushButton("보정 실행")
-        self.run_calibration_button.clicked.connect(self.run_intrinsic_calibration)
         self.save_intrinsics_button = QtWidgets.QPushButton("저장")
         self.save_intrinsics_button.clicked.connect(self.save_intrinsics)
         self.apply_intrinsics_button = QtWidgets.QPushButton("계산에 적용")
@@ -4225,7 +4314,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calibration_status_label.setObjectName("statusStrip")
         self.calibration_status_label.setWordWrap(True)
         self.capture_calibration_button.setText("캡처")
-        self.run_calibration_button.setText("보정 실행")
         self.save_intrinsics_button.setText("저장")
         self.apply_intrinsics_button.setText("계산에 적용")
         self.calibration_result_text = QtWidgets.QPlainTextEdit()
@@ -4239,11 +4327,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         compact_calibration_labels = [
             QtWidgets.QLabel(text)
-            for text in ("내부 열", "내부 행", "격자 크기", "최소 이미지", "저장 경로")
+            for text in ("내부 열", "내부 행", "격자 크기", "저장 경로")
         ]
         for label in compact_calibration_labels:
             label.setProperty("compactFormLabel", True)
-        cols_label, rows_label, square_label, min_images_label, dir_label = compact_calibration_labels
+        cols_label, rows_label, square_label, dir_label = compact_calibration_labels
 
         calib_form.addWidget(cols_label, 0, 0)
         calib_form.addWidget(self.calib_cols_spin, 0, 1)
@@ -4251,12 +4339,96 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calib_form.addWidget(self.calib_rows_spin, 0, 3)
         calib_form.addWidget(square_label, 0, 4)
         calib_form.addWidget(self.calib_square_spin, 0, 5)
-        calib_form.addWidget(min_images_label, 0, 6)
-        calib_form.addWidget(self.calib_min_images_spin, 0, 7)
         calib_form.addWidget(dir_label, 1, 0)
         calib_form.addWidget(self.calib_dir_edit, 1, 1, 1, 5)
         calib_form.addWidget(self.capture_calibration_button, 1, 6)
-        calib_form.addWidget(self.run_calibration_button, 1, 7)
+
+        validation_source_group = QtWidgets.QGroupBox("입력 / 계산 목적")
+        validation_source_form = QtWidgets.QGridLayout(validation_source_group)
+        validation_source_form.setHorizontalSpacing(6)
+        validation_source_form.setVerticalSpacing(6)
+        validation_source_form.setColumnStretch(1, 1)
+        validation_source_form.setColumnStretch(4, 1)
+        self.checkerboard_validation_mode_combo = QtWidgets.QComboBox()
+        self.checkerboard_validation_mode_combo.addItem("Pixhawk 자세 + GPS/RTK baseline", "pixhawk")
+        self.checkerboard_validation_mode_combo.addItem("체커보드 Stereo 외부 파라미터", "checkerboard")
+        self.checkerboard_validation_mode_combo.setToolTip(
+            "Pixhawk 모드는 내부 파라미터만 계산하고, 체커보드 모드는 내부 파라미터와 stereo R/T를 함께 계산합니다."
+        )
+        self.checkerboard_validation_root_edit = QtWidgets.QLineEdit(self.calib_dir_edit.text())
+        self.checkerboard_validation_root_edit.setMinimumWidth(260)
+        self.checkerboard_validation_choose_root_button = QtWidgets.QPushButton("폴더 선택")
+        self.checkerboard_validation_choose_root_button.clicked.connect(self.choose_checkerboard_validation_root)
+        self.checkerboard_validation_scan_button = QtWidgets.QPushButton("스캔")
+        self.checkerboard_validation_scan_button.clicked.connect(self.scan_checkerboard_validation_files)
+        self.checkerboard_validation_json_edit = QtWidgets.QLineEdit(str(self._intrinsics_storage_path()))
+        self.checkerboard_validation_json_edit.setMinimumWidth(260)
+        self.checkerboard_validation_choose_json_button = QtWidgets.QPushButton("JSON 선택")
+        self.checkerboard_validation_choose_json_button.clicked.connect(self.choose_checkerboard_validation_json)
+        self.checkerboard_validation_load_json_button = QtWidgets.QPushButton("기존 JSON 불러오기")
+        self.checkerboard_validation_load_json_button.clicked.connect(self.load_checkerboard_validation_json)
+        validation_source_form.addWidget(QtWidgets.QLabel("계산 방식"), 0, 0)
+        validation_source_form.addWidget(self.checkerboard_validation_mode_combo, 0, 1, 1, 2)
+        validation_source_form.addWidget(QtWidgets.QLabel("사진셋 root"), 1, 0)
+        validation_source_form.addWidget(self.checkerboard_validation_root_edit, 1, 1, 1, 3)
+        validation_source_form.addWidget(self.checkerboard_validation_choose_root_button, 1, 4)
+        validation_source_form.addWidget(self.checkerboard_validation_scan_button, 1, 5)
+        validation_source_form.addWidget(QtWidgets.QLabel("기존 intrinsics JSON"), 2, 0)
+        validation_source_form.addWidget(self.checkerboard_validation_json_edit, 2, 1, 1, 3)
+        validation_source_form.addWidget(self.checkerboard_validation_choose_json_button, 2, 4)
+        validation_source_form.addWidget(self.checkerboard_validation_load_json_button, 2, 5)
+        self.checkerboard_validation_scan_label = QtWidgets.QLabel("스캔 대기 중")
+        self.checkerboard_validation_scan_label.setObjectName("statusStrip")
+        self.checkerboard_validation_scan_label.setWordWrap(True)
+        validation_source_form.addWidget(self.checkerboard_validation_scan_label, 3, 0, 1, 6)
+        self.checkerboard_validation_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.scan_checkerboard_validation_files()
+        )
+        self.checkerboard_validation_root_edit.editingFinished.connect(self.scan_checkerboard_validation_files)
+
+        validation_action_group = QtWidgets.QGroupBox("계산 / 검증")
+        validation_action_form = QtWidgets.QGridLayout(validation_action_group)
+        validation_action_form.setHorizontalSpacing(6)
+        validation_action_form.setVerticalSpacing(6)
+        validation_action_form.setColumnStretch(9, 1)
+        self.calib_min_images_spin.setProperty("compactFormField", True)
+        self.calib_min_images_spin.setMinimumWidth(72)
+        self.calib_min_images_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.checkerboard_validation_random_runs_spin = QtWidgets.QSpinBox()
+        self.checkerboard_validation_random_runs_spin.setRange(1, 20)
+        self.checkerboard_validation_random_runs_spin.setValue(3)
+        self.checkerboard_validation_random_pair_count_spin = QtWidgets.QSpinBox()
+        self.checkerboard_validation_random_pair_count_spin.setRange(0, 10000)
+        self.checkerboard_validation_random_pair_count_spin.setValue(0)
+        self.checkerboard_validation_random_pair_count_spin.setSpecialValueText("자동")
+        self.checkerboard_validation_seed_spin = QtWidgets.QSpinBox()
+        self.checkerboard_validation_seed_spin.setRange(0, 2_147_483_647)
+        self.checkerboard_validation_seed_spin.setValue(0)
+        self.checkerboard_validation_seed_spin.setSpecialValueText("자동")
+        self.run_calibration_button = QtWidgets.QPushButton("전체 사진으로 계산")
+        self.run_calibration_button.clicked.connect(self.run_intrinsic_calibration)
+        self.checkerboard_validation_random_button = QtWidgets.QPushButton("랜덤 검증")
+        self.checkerboard_validation_random_button.clicked.connect(self.run_checkerboard_random_validation)
+        self.checkerboard_validation_save_button = QtWidgets.QPushButton("계산 결과 저장")
+        self.checkerboard_validation_save_button.clicked.connect(self.save_checkerboard_validation_result)
+        self.checkerboard_validation_apply_button = QtWidgets.QPushButton("계산에 적용")
+        self.checkerboard_validation_apply_button.clicked.connect(self.apply_checkerboard_validation_result)
+        validation_action_form.addWidget(QtWidgets.QLabel("최소 이미지"), 0, 0)
+        validation_action_form.addWidget(self.calib_min_images_spin, 0, 1)
+        validation_action_form.addWidget(QtWidgets.QLabel("반복"), 0, 2)
+        validation_action_form.addWidget(self.checkerboard_validation_random_runs_spin, 0, 3)
+        validation_action_form.addWidget(QtWidgets.QLabel("회당 pair"), 0, 4)
+        validation_action_form.addWidget(self.checkerboard_validation_random_pair_count_spin, 0, 5)
+        validation_action_form.addWidget(QtWidgets.QLabel("seed"), 0, 6)
+        validation_action_form.addWidget(self.checkerboard_validation_seed_spin, 0, 7)
+        validation_action_form.addWidget(self.run_calibration_button, 1, 0, 1, 2)
+        validation_action_form.addWidget(self.checkerboard_validation_random_button, 1, 2, 1, 2)
+        validation_action_form.addWidget(self.checkerboard_validation_save_button, 1, 4, 1, 2)
+        validation_action_form.addWidget(self.checkerboard_validation_apply_button, 1, 6, 1, 2)
+        self.checkerboard_validation_status_label = QtWidgets.QLabel("계산 결과 없음")
+        self.checkerboard_validation_status_label.setObjectName("statusStrip")
+        self.checkerboard_validation_status_label.setWordWrap(True)
+        validation_action_form.addWidget(self.checkerboard_validation_status_label, 2, 0, 1, 10)
 
         calibration_top_stack = QtWidgets.QVBoxLayout()
         calibration_top_stack.setSpacing(6)
@@ -4265,7 +4437,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calibration_top_stack.addWidget(self.calibration_status_label)
         checkerboard_calibration_layout.addLayout(calibration_top_stack)
         checkerboard_calibration_layout.addLayout(calibration_preview_row, 2)
-        checkerboard_calibration_layout.addWidget(self.calibration_result_text, 1)
+        checkerboard_validation_layout.addWidget(validation_source_group)
+        checkerboard_validation_layout.addWidget(validation_action_group)
+        checkerboard_validation_layout.addWidget(self.calibration_result_text, 1)
 
         zoom_intrinsics_split = QtWidgets.QHBoxLayout()
         zoom_intrinsics_split.setSpacing(8)
@@ -4913,11 +5087,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "왼쪽 클릭: 점의 Forward/Right/Down과 midpoint 기준 Range를 표시합니다.\n"
                 "오른쪽 클릭: 해당 점을 삭제합니다."
             ),
-            self.save_history_button: "현재 매칭 프레임쌍 전체를 wide CSV와 목적별 탭 XLSX로 함께 저장합니다.",
+            self.save_history_button: "현재 세션을 고정 JSON, 리소스별 compact CSV/Parquet, 통합 XLSX로 저장합니다.",
             self.save_settings_button: "현재 내부 파라미터 경로와 전체 런타임 설정을 저장합니다.",
             self.recording_status_label: "메모리 내 세션 기록 상태와 매칭 프레임쌍 수입니다.",
             self.recording_sheet_tabs: "저장될 세션 XLSX와 같은 시트 구성으로 현재 기록을 미리 보여줍니다.",
-            self.recording_sample_detail: "선택한 매칭 프레임쌍의 전체 wide CSV 필드를 표시합니다.",
+            self.recording_sample_detail: "선택한 매칭 프레임쌍의 전체 내부 기록 필드를 표시합니다.",
             self.clock_ftp_user_edit: "WIRIS FTP 로그인 사용자 이름입니다. 장비 설정에 맞게 입력하세요.",
             self.clock_ftp_password_edit: "WIRIS FTP 로그인 비밀번호입니다. 비어 있으면 빈 비밀번호로 로그인합니다.",
             self.clock_ftp_port_spin: "WIRIS FTP 포트입니다. 일반 FTP는 21번을 사용합니다.",
@@ -5659,6 +5833,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _build_gnss_base_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         layout.setSpacing(8)
         self.gnss_base_status_labels: dict[str, QtWidgets.QLabel] = {}
+        self.gnss_base_quality_labels: dict[str, QtWidgets.QLabel] = {}
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setObjectName("gnssBaseScrollArea")
         scroll_area.setWidgetResizable(True)
@@ -5756,6 +5931,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.gnss_base_status_labels[key] = label
             self._set_health_label(label, text, level)
 
+        rtcm_group = QtWidgets.QGroupBox("RTCM 보정 데이터")
+        rtcm_grid = QtWidgets.QGridLayout(rtcm_group)
+        rtcm_items = (
+            ("rtcm_receive", "수신", "RTCM 대기 중", "idle"),
+            ("rtcm_messages", "메시지", "type 대기 중", "idle"),
+            ("rtcm_injection_stats", "주입", "대상 대기 중", "idle"),
+            ("rtcm_bandwidth", "대역폭", "packet 대기 중", "idle"),
+        )
+        for row, (key, title, text, level) in enumerate(rtcm_items):
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            rtcm_grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            rtcm_grid.addWidget(label, row, 1)
+            self.gnss_base_status_labels[key] = label
+            self._set_health_label(label, text, level)
+
         rover_group = QtWidgets.QGroupBox("Rover RTK 상태")
         rover_grid = QtWidgets.QGridLayout(rover_group)
         rover_items = (
@@ -5780,7 +5972,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_survey_progress_bar = QtWidgets.QProgressBar()
         self.gnss_base_survey_progress_bar.setRange(0, 100)
         self.gnss_base_survey_progress_bar.setValue(0)
-        self.gnss_base_survey_progress_bar.setFormat("duration 0%")
+        self.gnss_base_survey_progress_bar.setFormat("not running | time 0% | accuracy --")
         self.gnss_base_survey_progress_bar.setMinimumHeight(24)
         self.gnss_base_survey_progress_bar.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.gnss_base_survey_accuracy_label = QtWidgets.QLabel("accuracy 대기 중")
@@ -5789,6 +5981,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         survey_summary_row.addWidget(self.gnss_base_survey_progress_bar, 2)
         survey_summary_row.addWidget(self.gnss_base_survey_accuracy_label, 1)
         survey_layout.addLayout(survey_summary_row)
+        self.gnss_base_survey_convergence_label = QtWidgets.QLabel("수렴: 대기 중 | ETA: -- | 최근 개선: --")
+        self.gnss_base_survey_convergence_label.setObjectName("statusStrip")
+        self.gnss_base_survey_convergence_label.setWordWrap(True)
+        survey_layout.addWidget(self.gnss_base_survey_convergence_label)
 
         survey_plot_row = QtWidgets.QHBoxLayout()
         self.gnss_base_survey_accuracy_plot = TelemetryHistoryPlot("Survey-in accuracy", "m")
@@ -5799,6 +5995,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         survey_plot_row.addWidget(self.gnss_base_survey_observation_plot, 1)
         survey_layout.addLayout(survey_plot_row)
 
+        quality_group = QtWidgets.QGroupBox("Survey-in 품질 진단")
+        quality_grid = QtWidgets.QGridLayout(quality_group)
+        quality_items = (
+            ("satellites", "위성", "NAV-SAT 대기 중"),
+            ("signal", "신호", "C/N0 대기 중"),
+            ("elevation", "고도각", "elevation 대기 중"),
+            ("constellations", "구성", "constellation 대기 중"),
+        )
+        for row, (key, title, text) in enumerate(quality_items):
+            label = QtWidgets.QLabel(text)
+            label.setObjectName("statusStrip")
+            label.setWordWrap(True)
+            quality_grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            quality_grid.addWidget(label, row, 1)
+            self.gnss_base_quality_labels[key] = label
+            self._set_health_label(label, text, "idle")
+
         note = QtWidgets.QLabel(
             "Base serial raw 수신, UBX NAV-SVIN 상태 polling, Survey-in 시작/중지 명령을 지원합니다."
         )
@@ -5807,13 +6020,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         content_layout.addWidget(settings_group)
         content_layout.addWidget(base_group)
-        content_layout.addWidget(survey_group)
+        content_layout.addWidget(rtcm_group)
         content_layout.addWidget(rover_group)
+        content_layout.addWidget(survey_group)
+        content_layout.addWidget(quality_group)
         content_layout.addWidget(note)
         content_layout.addStretch(1)
         scroll_area.setWidget(content)
         layout.addWidget(scroll_area, 1)
         self._refresh_gnss_base_tab()
+
+    def _new_gnss_base_rtcm_stats(self) -> dict[str, object]:
+        return {
+            "start_s": time.monotonic(),
+            "last_frame_s": None,
+            "frames": 0,
+            "bytes": 0,
+            "max_frame_bytes": 0,
+            "message_types": {},
+            "injection": {
+                "left": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
+                "right": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
+            },
+        }
 
     def _build_baseline_alignment_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         layout.setSpacing(8)
@@ -6360,6 +6589,138 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         layout.addWidget(self.rtk_alignment_detail_label)
         layout.addWidget(self.rtk_alignment_plot, 1)
 
+    def _build_optical_alignment_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        header_group = QtWidgets.QGroupBox("Optical 정렬 상태")
+        header_layout = QtWidgets.QGridLayout(header_group)
+        header_layout.setColumnStretch(1, 1)
+        self.optical_alignment_status_label = QtWidgets.QLabel("Optical alignment: YOLO target pair 대기 중")
+        self.optical_alignment_status_label.setObjectName("statusStrip")
+        self.optical_alignment_status_label.setWordWrap(True)
+        self.optical_alignment_status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.optical_alignment_note_label = QtWidgets.QLabel(
+            "Alignment preview only: 계산 파라미터를 변경하지 않습니다. 30x에서 물리 R을 조절하고 8x에서 재확인하세요."
+        )
+        self.optical_alignment_note_label.setObjectName("statusStrip")
+        self.optical_alignment_note_label.setWordWrap(True)
+        header_layout.addWidget(self.optical_alignment_status_label, 0, 0, 1, 4)
+        header_layout.addWidget(self.optical_alignment_note_label, 1, 0, 1, 4)
+        layout.addWidget(header_group)
+
+        controls_group = QtWidgets.QGroupBox("기대값 기준")
+        controls_layout = QtWidgets.QGridLayout(controls_group)
+        controls_layout.setColumnStretch(5, 1)
+        self.optical_expected_dy_combo = QtWidgets.QComboBox()
+        self.optical_expected_dy_combo.addItem("Rectified 0 px", "rectified")
+        self.optical_expected_dy_combo.addItem("Raw intrinsics cy 차이", "raw_intrinsics")
+        self.optical_expected_dy_combo.addItem("Manual", "manual")
+        self.optical_expected_dy_combo.setToolTip(
+            "dy residual 기준입니다. Rectified는 0 px, Raw는 left cy - right cy, Manual은 입력값을 사용합니다."
+        )
+        self.optical_expected_dy_spin = QtWidgets.QDoubleSpinBox()
+        self.optical_expected_dy_spin.setRange(-5000.0, 5000.0)
+        self.optical_expected_dy_spin.setDecimals(3)
+        self.optical_expected_dy_spin.setSuffix(" px")
+        self.optical_expected_dy_spin.setValue(0.0)
+        self.optical_target_distance_spin = QtWidgets.QDoubleSpinBox()
+        self.optical_target_distance_spin.setRange(0.1, 100000.0)
+        self.optical_target_distance_spin.setDecimals(2)
+        self.optical_target_distance_spin.setValue(100.0)
+        self.optical_target_distance_spin.setSuffix(" m")
+        self.optical_target_distance_spin.setToolTip(
+            "Yaw residual 계산용 target 거리입니다. expected disparity = fx * baseline / target distance입니다."
+        )
+        controls_layout.addWidget(QtWidgets.QLabel("expected dy"), 0, 0)
+        controls_layout.addWidget(self.optical_expected_dy_combo, 0, 1)
+        controls_layout.addWidget(QtWidgets.QLabel("manual dy"), 0, 2)
+        controls_layout.addWidget(self.optical_expected_dy_spin, 0, 3)
+        controls_layout.addWidget(QtWidgets.QLabel("target distance"), 0, 4)
+        controls_layout.addWidget(self.optical_target_distance_spin, 0, 5)
+        layout.addWidget(controls_group)
+
+        self.optical_alignment_labels: dict[str, QtWidgets.QLabel] = {}
+        top_row = QtWidgets.QHBoxLayout()
+        top_row.setSpacing(8)
+        observation_group = QtWidgets.QGroupBox("좌/우 Target 관측")
+        observation_form = QtWidgets.QGridLayout(observation_group)
+        for row, (key, title) in enumerate(
+            (
+                ("left_center", "L center"),
+                ("right_center", "R center"),
+                ("bbox_delta", "bbox dx / dy"),
+                ("bbox_quality", "bbox conf / class"),
+                ("camera_time", "camera pair Δt"),
+            )
+        ):
+            self._add_optical_alignment_label(observation_form, row, key, title)
+        top_row.addWidget(observation_group, 1)
+
+        vertical_group = QtWidgets.QGroupBox("Vertical / Pitch 정렬")
+        vertical_form = QtWidgets.QGridLayout(vertical_group)
+        for row, (key, title) in enumerate(
+            (
+                ("expected_dy", "expected dy"),
+                ("observed_dy", "observed dy"),
+                ("dy_residual", "dy residual"),
+                ("vertical_error", "vertical error"),
+            )
+        ):
+            self._add_optical_alignment_label(vertical_form, row, key, title)
+        top_row.addWidget(vertical_group, 1)
+        layout.addLayout(top_row)
+
+        bottom_row = QtWidgets.QHBoxLayout()
+        bottom_row.setSpacing(8)
+        yaw_group = QtWidgets.QGroupBox("Horizontal / Yaw 정렬")
+        yaw_form = QtWidgets.QGridLayout(yaw_group)
+        for row, (key, title) in enumerate(
+            (
+                ("observed_dx", "observed dx"),
+                ("expected_disparity", "expected disparity"),
+                ("yaw_residual", "yaw residual"),
+                ("yaw_error", "yaw error"),
+            )
+        ):
+            self._add_optical_alignment_label(yaw_form, row, key, title)
+        bottom_row.addWidget(yaw_group, 1)
+
+        distance_group = QtWidgets.QGroupBox("Live 거리 영향")
+        distance_form = QtWidgets.QGridLayout(distance_group)
+        for row, (key, title) in enumerate(
+            (
+                ("range", "YOLO Range"),
+                ("ray_gap", "ray gap"),
+                ("baseline", "baseline"),
+                ("triangulation", "triangulation"),
+                ("attitude", "attitude status"),
+            )
+        ):
+            self._add_optical_alignment_label(distance_form, row, key, title)
+        bottom_row.addWidget(distance_group, 1)
+        layout.addLayout(bottom_row)
+        layout.addStretch(1)
+
+        self.optical_expected_dy_combo.currentIndexChanged.connect(
+            lambda _index: self._refresh_optical_alignment_view()
+        )
+        self.optical_expected_dy_spin.valueChanged.connect(lambda _value: self._refresh_optical_alignment_view())
+        self.optical_target_distance_spin.valueChanged.connect(lambda _value: self._refresh_optical_alignment_view())
+        self._refresh_optical_alignment_view()
+
+    def _add_optical_alignment_label(
+        self,
+        form: QtWidgets.QGridLayout,
+        row: int,
+        key: str,
+        title: str,
+    ) -> None:
+        label = QtWidgets.QLabel("대기 중")
+        label.setObjectName("statusStrip")
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        form.addWidget(QtWidgets.QLabel(title), row, 0)
+        form.addWidget(label, row, 1)
+        self.optical_alignment_labels[key] = label
+
     def _build_baseline_quality_view(self, layout: QtWidgets.QVBoxLayout) -> None:
         actions = QtWidgets.QHBoxLayout()
         self.baseline_sample_duration_spin = QtWidgets.QDoubleSpinBox()
@@ -6697,6 +7058,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         baud = int(self.gnss_base_baud_spin.value())
         self._set_health_label(self.gnss_base_status_labels["connection"], f"connecting {port} @ {baud}", "warn")
         self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "raw bytes 대기 중", "idle")
+        self._reset_gnss_base_rtcm_stats()
         self.gnss_base_connect_button.setEnabled(False)
         self.gnss_base_disconnect_button.setEnabled(True)
         thread = QtCore.QThread(self)
@@ -6707,6 +7069,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         worker.stats_changed.connect(self._handle_gnss_base_serial_stats)
         worker.survey_in_changed.connect(self._handle_gnss_base_survey_in)
         worker.satellite_count_changed.connect(self._handle_gnss_base_satellite_count)
+        worker.satellite_quality_changed.connect(self._handle_gnss_base_satellite_quality)
         worker.rtcm_frame_received.connect(self._handle_gnss_base_rtcm_frame)
         worker.command_sent.connect(self._handle_gnss_base_command_sent)
         worker.failed.connect(self._handle_gnss_base_serial_failed)
@@ -6736,6 +7099,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             min_duration_s=self.gnss_base_survey_duration_spin.value(),
             accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
         )
+        self.gnss_base_survey_samples.clear()
         worker.send_bytes("CFG-TMODE3 survey-in start", frame)
         worker.send_bytes("NAV-SVIN poll after survey-in start", ubx_nav_svin_poll_frame())
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "survey-in 시작 명령 전송 대기", "warn")
@@ -6831,6 +7195,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_health_label(self.gnss_base_status_labels["connection"], f"connected {port} @ {baud}", "good")
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "UBX NAV-SVIN 대기 중", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "UBX NAV-PVT/NAV-SAT 대기 중", "idle")
+        self._set_gnss_base_quality_waiting("NAV-SAT 대기 중")
         self.gnss_base_survey_start_button.setEnabled(True)
         self.gnss_base_survey_stop_button.setEnabled(True)
 
@@ -6849,6 +7214,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
         self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "없음", "idle")
+        self._set_gnss_base_quality_waiting("미연결")
+        self._reset_gnss_base_rtcm_stats()
         self.gnss_base_survey_start_button.setEnabled(False)
         self.gnss_base_survey_stop_button.setEnabled(False)
 
@@ -6857,6 +7224,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_health_label(self.gnss_base_status_labels["connection"], message, "idle")
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
+        self._set_gnss_base_quality_waiting("미연결")
+        self._reset_gnss_base_rtcm_stats()
         self.gnss_base_survey_start_button.setEnabled(False)
         self.gnss_base_survey_stop_button.setEnabled(False)
 
@@ -6868,6 +7237,155 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             level,
         )
 
+    def _set_gnss_base_quality_waiting(self, text: str) -> None:
+        if not hasattr(self, "gnss_base_quality_labels"):
+            return
+        waiting_text = {
+            "satellites": text,
+            "signal": "C/N0 대기 중" if text != "미연결" else text,
+            "elevation": "elevation 대기 중" if text != "미연결" else text,
+            "constellations": "constellation 대기 중" if text != "미연결" else text,
+        }
+        for key, label in self.gnss_base_quality_labels.items():
+            self._set_health_label(label, waiting_text.get(key, text), "idle")
+
+    def _reset_gnss_base_rtcm_stats(self) -> None:
+        self.gnss_base_rtcm_stats = self._new_gnss_base_rtcm_stats()
+        self._refresh_gnss_base_rtcm_stats()
+
+    def _format_rtcm_message_types(self, message_types: dict[int, int]) -> str:
+        if not message_types:
+            return "type 대기 중"
+        ordered = sorted(message_types.items(), key=lambda item: (-item[1], item[0]))[:8]
+        return " | ".join(f"{message_type}:{count}" for message_type, count in ordered)
+
+    def _refresh_gnss_base_rtcm_stats(self) -> None:
+        if not hasattr(self, "gnss_base_status_labels"):
+            return
+        labels = self.gnss_base_status_labels
+        if not all(key in labels for key in ("rtcm_receive", "rtcm_messages", "rtcm_injection_stats", "rtcm_bandwidth")):
+            return
+        stats = self.gnss_base_rtcm_stats
+        now_s = time.monotonic()
+        frames = int(stats.get("frames") or 0)
+        total_bytes = int(stats.get("bytes") or 0)
+        start_s = float(stats.get("start_s") or now_s)
+        elapsed_s = max(1e-6, now_s - start_s)
+        fps = frames / elapsed_s
+        byte_rate = total_bytes / elapsed_s
+        last_frame_s = stats.get("last_frame_s")
+        age_s = None
+        if last_frame_s is not None:
+            try:
+                age_s = max(0.0, now_s - float(last_frame_s))
+            except (TypeError, ValueError):
+                age_s = None
+        if frames <= 0:
+            receive_text = "RTCM 대기 중"
+            receive_level = "idle"
+        else:
+            age_text = "--" if age_s is None else f"{age_s:.1f}s"
+            receive_text = f"frames={frames} | {fps:.2f} fps | {byte_rate / 1000.0:.2f} kB/s | age={age_text}"
+            receive_level = "good" if age_s is not None and age_s <= 2.0 else "warn" if age_s is not None and age_s <= 5.0 else "bad"
+        message_types = stats.get("message_types")
+        message_type_counts = message_types if isinstance(message_types, dict) else {}
+        base_position_present = any(int(key) in {1005, 1006} for key in message_type_counts)
+        msm_present = any(1070 <= int(key) <= 1129 for key in message_type_counts)
+        message_level = "good" if base_position_present and msm_present else "warn" if frames else "idle"
+        injection = stats.get("injection") if isinstance(stats.get("injection"), dict) else {}
+        injection_parts: list[str] = []
+        total_packets = 0
+        total_fail = 0
+        for side, label in (("left", "L"), ("right", "R")):
+            side_stats = injection.get(side) if isinstance(injection, dict) else None
+            if not isinstance(side_stats, dict):
+                side_stats = {}
+            side_frames = int(side_stats.get("frames") or 0)
+            side_bytes = int(side_stats.get("bytes") or 0)
+            side_packets = int(side_stats.get("packets") or 0)
+            side_fail = int(side_stats.get("fail") or 0)
+            total_packets += side_packets
+            total_fail += side_fail
+            injection_parts.append(f"{label} frames={side_frames} bytes={side_bytes} fail={side_fail}")
+        target_sides = self._gnss_base_rtcm_target_sides() if hasattr(self, "gnss_base_rtcm_target_combo") else ()
+        if not target_sides:
+            injection_text = "비활성"
+            injection_level = "idle"
+        else:
+            injection_text = " | ".join(injection_parts)
+            injection_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
+        avg_frame = (total_bytes / frames) if frames else 0.0
+        bandwidth_text = (
+            "packet 대기 중"
+            if frames <= 0
+            else f"MAVLink packets={total_packets} | avg frame={avg_frame:.0f}B | max frame={int(stats.get('max_frame_bytes') or 0)}B"
+        )
+        bandwidth_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
+        self._set_health_label(labels["rtcm_receive"], receive_text, receive_level)
+        self._set_health_label(labels["rtcm_messages"], self._format_rtcm_message_types(message_type_counts), message_level)
+        self._set_health_label(labels["rtcm_injection_stats"], injection_text, injection_level)
+        self._set_health_label(labels["rtcm_bandwidth"], bandwidth_text, bandwidth_level)
+
+    def _handle_gnss_base_satellite_quality(self, quality: object) -> None:
+        if not isinstance(quality, dict) or not hasattr(self, "gnss_base_quality_labels"):
+            return
+        try:
+            tracked = int(quality.get("tracked") or 0)
+            used = int(quality.get("used") or 0)
+            low_cno = int(quality.get("low_cno") or 0)
+            low_elevation = int(quality.get("low_elevation") or 0)
+        except (TypeError, ValueError):
+            return
+        avg_cno = quality.get("avg_cno_dbhz")
+        try:
+            avg_cno_value = float(avg_cno) if avg_cno is not None else None
+        except (TypeError, ValueError):
+            avg_cno_value = None
+        constellations = quality.get("constellations")
+        constellation_items: list[tuple[str, int]] = []
+        if isinstance(constellations, dict):
+            for name, count in constellations.items():
+                try:
+                    constellation_items.append((str(name), int(count)))
+                except (TypeError, ValueError):
+                    continue
+        constellation_text = " / ".join(
+            f"{name} {count}" for name, count in sorted(constellation_items)
+        ) or "--"
+        satellite_level = "good" if used >= 12 else "warn" if used >= 6 or tracked >= 12 else "bad"
+        signal_level = (
+            "idle"
+            if avg_cno_value is None
+            else "good"
+            if avg_cno_value >= 35.0 and low_cno == 0
+            else "warn"
+            if avg_cno_value >= 30.0
+            else "bad"
+        )
+        elevation_level = "good" if low_elevation == 0 else "warn" if low_elevation <= max(1, tracked // 4) else "bad"
+        constellation_level = "good" if len(constellation_items) >= 3 else "warn" if len(constellation_items) >= 2 else "bad"
+        avg_cno_text = "--" if avg_cno_value is None else f"{avg_cno_value:.1f} dBHz"
+        self._set_health_label(
+            self.gnss_base_quality_labels["satellites"],
+            f"used={used} tracked={tracked}",
+            satellite_level,
+        )
+        self._set_health_label(
+            self.gnss_base_quality_labels["signal"],
+            f"avg C/N0={avg_cno_text} | low<{GNSS_BASE_LOW_CNO_DBHZ}={low_cno}",
+            signal_level,
+        )
+        self._set_health_label(
+            self.gnss_base_quality_labels["elevation"],
+            f"low<{GNSS_BASE_LOW_ELEVATION_DEG}deg={low_elevation}",
+            elevation_level,
+        )
+        self._set_health_label(
+            self.gnss_base_quality_labels["constellations"],
+            constellation_text,
+            constellation_level,
+        )
+
     def _gnss_base_rtcm_target_sides(self) -> tuple[str, ...]:
         target = str(self.gnss_base_rtcm_target_combo.currentData() or "disabled")
         if target == "both":
@@ -6876,28 +7394,74 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return (target,)
         return ()
 
+    def _record_gnss_base_rtcm_frame(self, payload: bytes) -> None:
+        stats = self.gnss_base_rtcm_stats
+        stats["frames"] = int(stats.get("frames") or 0) + 1
+        stats["bytes"] = int(stats.get("bytes") or 0) + len(payload)
+        stats["max_frame_bytes"] = max(int(stats.get("max_frame_bytes") or 0), len(payload))
+        stats["last_frame_s"] = time.monotonic()
+        message_type = parse_rtcm3_message_type(payload)
+        if message_type is not None:
+            message_types = stats.get("message_types")
+            if not isinstance(message_types, dict):
+                message_types = {}
+                stats["message_types"] = message_types
+            message_types[message_type] = int(message_types.get(message_type, 0)) + 1
+
+    def _record_gnss_base_rtcm_injection(
+        self,
+        side: str,
+        *,
+        payload_bytes: int,
+        packet_count: int = 0,
+        failed: bool = False,
+    ) -> None:
+        injection = self.gnss_base_rtcm_stats.get("injection")
+        if not isinstance(injection, dict):
+            return
+        side_stats = injection.get(side)
+        if not isinstance(side_stats, dict):
+            return
+        if failed:
+            side_stats["fail"] = int(side_stats.get("fail") or 0) + 1
+            return
+        side_stats["frames"] = int(side_stats.get("frames") or 0) + 1
+        side_stats["bytes"] = int(side_stats.get("bytes") or 0) + int(payload_bytes)
+        side_stats["packets"] = int(side_stats.get("packets") or 0) + int(packet_count)
+
     def _handle_gnss_base_rtcm_frame(self, frame: object) -> None:
         if not isinstance(frame, (bytes, bytearray)):
             return
         payload = bytes(frame)
+        self._record_gnss_base_rtcm_frame(payload)
         target_sides = self._gnss_base_rtcm_target_sides()
         if not target_sides:
             self._set_health_label(self.gnss_base_status_labels["rtcm_injection"], "비활성", "idle")
+            self._refresh_gnss_base_rtcm_stats()
             return
         if self.mavlink_pixhawk is None:
+            for side in target_sides:
+                self._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
             self._set_health_label(
                 self.gnss_base_status_labels["rtcm_injection"],
                 f"RTCM {len(payload)} bytes 수신 | MAVLink rover 미연결",
                 "warn",
             )
+            self._refresh_gnss_base_rtcm_stats()
             return
         sent_sides: list[str] = []
         failed: list[str] = []
         for side in target_sides:
             try:
-                self.mavlink_pixhawk.send_rtcm_data(side, payload)
+                packet_count = self.mavlink_pixhawk.send_rtcm_data(side, payload)
+                self._record_gnss_base_rtcm_injection(
+                    side,
+                    payload_bytes=len(payload),
+                    packet_count=int(packet_count or 0),
+                )
                 sent_sides.append(self._px4_mag_camera_label(side))
             except Exception as exc:
+                self._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
                 failed.append(f"{self._px4_mag_camera_label(side)}:{exc}")
         if sent_sides and not failed:
             self._set_health_label(
@@ -6917,6 +7481,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"RTCM 주입 실패: {', '.join(failed)}",
                 "bad",
             )
+        self._refresh_gnss_base_rtcm_stats()
 
     def _handle_gnss_base_command_sent(self, label: str, byte_count: int) -> None:
         self._set_health_label(
@@ -6979,8 +7544,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         progress = min(100, int(round(duration_s * 100.0 / target_duration_s)))
         self.gnss_base_survey_progress_bar.setValue(progress)
         state_text = "valid" if valid else "active" if active else "not running"
-        self.gnss_base_survey_progress_bar.setFormat(f"{state_text} {progress}%")
         accuracy_delta_m = accuracy_m - target_accuracy_m
+        time_text = "time ok" if progress >= 100 else f"time {progress}%"
+        accuracy_text = "accuracy ok" if valid or accuracy_delta_m <= 0.0 else "accuracy pending"
+        if not active and not valid:
+            accuracy_text = "accuracy --"
+        self.gnss_base_survey_progress_bar.setFormat(f"{state_text} | {time_text} | {accuracy_text}")
         level = "good" if valid or accuracy_delta_m <= 0.0 else "warn" if active else "idle"
         self._set_health_label(
             self.gnss_base_survey_accuracy_label,
@@ -6988,9 +7557,98 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             level,
         )
         now_s = time.monotonic()
+        self.gnss_base_survey_samples.append((now_s, duration_s, accuracy_m, active, valid))
         self.gnss_base_survey_accuracy_plot.add_point(TelemetryHistoryPoint(now_s, "accuracy", accuracy_m))
         self.gnss_base_survey_accuracy_plot.add_point(TelemetryHistoryPoint(now_s, "target", target_accuracy_m))
         self.gnss_base_survey_observation_plot.add_point(TelemetryHistoryPoint(now_s, "observations", float(observations)))
+        self._update_gnss_base_survey_convergence(
+            active=active,
+            valid=valid,
+            duration_s=duration_s,
+            accuracy_m=accuracy_m,
+            target_accuracy_m=target_accuracy_m,
+            target_duration_s=target_duration_s,
+            now_s=now_s,
+        )
+
+    def _format_eta_seconds(self, seconds: float | None) -> str:
+        if seconds is None or not isfinite(float(seconds)):
+            return "--"
+        seconds = max(0.0, float(seconds))
+        if seconds < 60.0:
+            return f"~{seconds:.0f}s"
+        return f"~{seconds / 60.0:.1f}m"
+
+    def _update_gnss_base_survey_convergence(
+        self,
+        *,
+        active: bool,
+        valid: bool,
+        duration_s: int,
+        accuracy_m: float,
+        target_accuracy_m: float,
+        target_duration_s: int,
+        now_s: float,
+    ) -> None:
+        if not hasattr(self, "gnss_base_survey_convergence_label"):
+            return
+        if valid:
+            self._set_health_label(
+                self.gnss_base_survey_convergence_label,
+                "수렴: complete | ETA: done | 최근 개선: --",
+                "good",
+            )
+            return
+        if not active:
+            self._set_health_label(
+                self.gnss_base_survey_convergence_label,
+                "수렴: not running | ETA: -- | 최근 개선: --",
+                "idle",
+            )
+            return
+
+        trend_samples = [
+            sample
+            for sample in self.gnss_base_survey_samples
+            if 0.0 <= now_s - sample[0] <= GNSS_BASE_SURVEY_TREND_WINDOW_S
+        ]
+        if len(trend_samples) < 2:
+            self._set_health_label(
+                self.gnss_base_survey_convergence_label,
+                "수렴: collecting trend | ETA: -- | 최근 개선: --",
+                "warn",
+            )
+            return
+
+        first = trend_samples[0]
+        elapsed_s = max(0.0, now_s - first[0])
+        improvement_m = max(0.0, float(first[2]) - float(accuracy_m))
+        time_remaining_s = max(0.0, float(target_duration_s) - float(duration_s))
+        accuracy_remaining_m = max(0.0, float(accuracy_m) - float(target_accuracy_m))
+        eta_s: float | None
+        if accuracy_remaining_m <= 0.0:
+            eta_s = time_remaining_s
+        elif elapsed_s > 0.0 and improvement_m > 0.0:
+            eta_s = max(time_remaining_s, accuracy_remaining_m / (improvement_m / elapsed_s))
+        else:
+            eta_s = None
+        if elapsed_s >= GNSS_BASE_SURVEY_TREND_WINDOW_S and improvement_m < GNSS_BASE_SURVEY_STAGNANT_DELTA_M:
+            convergence = f"stagnant {elapsed_s:.0f}s"
+            level = "bad"
+        elif improvement_m >= GNSS_BASE_SURVEY_IMPROVING_DELTA_M:
+            convergence = "improving"
+            level = "warn"
+        elif improvement_m > 0.0:
+            convergence = "slow"
+            level = "warn"
+        else:
+            convergence = "waiting for improvement"
+            level = "warn"
+        self._set_health_label(
+            self.gnss_base_survey_convergence_label,
+            f"수렴: {convergence} | ETA: {self._format_eta_seconds(eta_s)} | 최근 개선: -{improvement_m:.4f}m/{elapsed_s:.0f}s",
+            level,
+        )
 
     def _clear_gnss_base_serial_worker(self, thread: QtCore.QThread) -> None:
         if self.gnss_base_serial_thread is thread:
@@ -7833,6 +8491,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             offset_ms,
         )
 
+    def _rtcp_sender_report_count(self, metadata: dict[str, object]) -> int | None:
+        value = metadata.get("rtcp_sr_received_count")
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return None
+        return count if count >= 0 else None
+
     def _clock_sync_pair_metadata(self, now_mono_s: float | None = None) -> tuple[dict[str, object], dict[str, object]]:
         """Select a temporally corresponding recent RTCP frame pair.
 
@@ -8030,18 +8696,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             metadata.get("rtcp_frame_receive_delay_s") is not None
             for metadata in (left_metadata, right_metadata)
         )
+        left_sr_count = self._rtcp_sender_report_count(left_metadata)
+        right_sr_count = self._rtcp_sender_report_count(right_metadata)
+        sr_count_text = (
+            "RTCP SR 수신: "
+            f"L={'--' if left_sr_count is None else left_sr_count} "
+            f"R={'--' if right_sr_count is None else right_sr_count}"
+        )
         quality_label = "RTCP frame transit max" if has_transit_delay else "PC UTC 최대 offset"
         status = (
             f"스트림 RTCP/NTP 상태: {pair_text}"
             if worst_quality_ms is None
             else f"스트림 RTCP/NTP 상태: {pair_text}, {quality_label}={worst_quality_ms:.1f} ms"
         )
+        status += f", {sr_count_text}"
         if invalid_cameras:
             status += f", 절대 UTC 검증 실패={','.join(invalid_cameras)}"
         detail = "\n".join(
             (
                 "time_basis: RTCP Sender Report NTP-derived stream frame timestamp; WIRIS GDTI/UTC mapping unverified",
                 "pc_utc_at_frame: current PC UTC minus app receive frame age",
+                sr_count_text,
                 left_text,
                 right_text,
                 pair_text,
@@ -9957,6 +10632,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._distance_mode_last_source = mode
         self._update_distance_settings_visibility()
         self._refresh_camera_parameters_tab()
+        self._refresh_optical_alignment_view()
 
     def _handle_measurement_display_mode_changed(self, _index: int) -> None:
         if self._measurement_display_mode() == "preview":
@@ -10368,8 +11044,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._format_intrinsics_text("right", None if result is None else result.right, status, source_label)
         )
 
-    def _format_extrinsics_text(self, camera: str, extrinsic: CameraExtrinsicState | None) -> str:
-        title = "Left Live Extrinsic" if camera == "left" else "Right Live Extrinsic"
+    def _format_live_pixhawk_extrinsic_text(
+        self,
+        camera: str,
+        extrinsic: CameraExtrinsicState | None,
+        *,
+        title_prefix: str = "",
+    ) -> str:
+        title = f"{title_prefix}{'Left Live Extrinsic' if camera == 'left' else 'Right Live Extrinsic'}"
         if extrinsic is None:
             return (
                 f"{title}\n"
@@ -10393,6 +11075,68 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "quaternion q(w,x,y,z):\n"
             + ", ".join(f"{value:.9g}" for value in extrinsic.q)
         )
+
+    def _format_checkerboard_effective_extrinsics_text(
+        self,
+        camera: str,
+        live_extrinsic: CameraExtrinsicState | None,
+    ) -> str:
+        result = self.active_intrinsics
+        extrinsics = None if result is None else result.extrinsics
+        title = "Left Effective Extrinsic" if camera == "left" else "Right Effective Extrinsic"
+        live_source = self._extrinsics_source_label(live_extrinsic)
+        diagnostic = (
+            "\n\nLive Pixhawk diagnostic only\n"
+            f"source: {live_source}\n"
+            "used_for_triangulation: false"
+        )
+        if extrinsics is None:
+            return (
+                f"{title}\n"
+                "mode: checkerboard stereo R/T\n"
+                "status: waiting for applied checkerboard stereo extrinsics\n"
+                "used_for_triangulation: pending\n"
+                f"frame_contract: {CAMERA_FRAME}\n"
+                f"{diagnostic}"
+            )
+        rotation_right_to_left, translation_right_in_left_m = invert_left_to_right_camera_transform(
+            extrinsics.rotation_left_to_right,
+            extrinsics.translation_left_to_right_m,
+        )
+        if camera == "left":
+            return (
+                f"{title}\n"
+                "mode: checkerboard stereo R/T\n"
+                "status: effective reference camera\n"
+                "source: applied checkerboard stereo extrinsics\n"
+                "used_for_triangulation: true\n"
+                f"frame_contract: {extrinsics.frame_contract}\n"
+                "origin_in_left_rdf_m: 0.000000000, 0.000000000, 0.000000000\n"
+                "rotation_left_to_left:\n"
+                + self._format_matrix([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+                + diagnostic
+            )
+        baseline_m = math.sqrt(sum(value * value for value in translation_right_in_left_m))
+        return (
+            f"{title}\n"
+            "mode: checkerboard stereo R/T\n"
+            "status: effective right camera in left RDF\n"
+            "source: applied checkerboard stereo extrinsics\n"
+            "used_for_triangulation: true\n"
+            f"frame_contract: {extrinsics.frame_contract}\n"
+            f"baseline_m: {baseline_m:.9f}\n"
+            "translation_right_in_left_m: "
+            + ", ".join(f"{value:.9f}" for value in translation_right_in_left_m)
+            + "\n"
+            "rotation_right_to_left:\n"
+            + self._format_matrix(rotation_right_to_left)
+            + diagnostic
+        )
+
+    def _format_extrinsics_text(self, camera: str, extrinsic: CameraExtrinsicState | None) -> str:
+        if self._distance_mode() == "checkerboard":
+            return self._format_checkerboard_effective_extrinsics_text(camera, extrinsic)
+        return self._format_live_pixhawk_extrinsic_text(camera, extrinsic)
 
     def _format_stereo_geometry_text(self) -> str:
         active = self.active_intrinsics
@@ -10988,7 +11732,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         # Only the key/value sheets read metadata, and building it runs the
         # clock-sync and camera-timing probes — skip it on the sample sheets,
         # which are refreshed once per recorded pair.
-        needs_metadata = sheet_name in {"Summary", "Calibration"}
+        needs_metadata = sheet_name in {"Summary", "CalibrationStatic"}
         metadata = self._recording_session_metadata() if needs_metadata else {}
         preview = next(
             (sheet for sheet in session_sheet_previews(metadata, rows) if sheet.name == sheet_name),
@@ -11003,12 +11747,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     (str(key), "" if value is None else str(value)) for key, value in preview.entries
                 ])
             else:
+                display_rows = (
+                    compact_distance_measurement_rows(
+                        rows,
+                        {
+                            "session_started_unix_ns": self.recording_session_started_unix_ns,
+                            "session_started_monotonic_ns": self.recording_session_started_monotonic_ns,
+                        },
+                    )
+                    if sheet_name == "DistanceMeasurements"
+                    else []
+                )
                 self._fill_recording_sheet(
                     table,
                     preview.columns,
                     [
                         tuple(self._recording_table_value(row, field) for field in preview.columns)
-                        for row in rows
+                        for row in display_rows
                     ],
                 )
         finally:
@@ -11390,14 +12145,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     @QtCore.pyqtSlot(object)
     def _handle_session_saved(self, saved_files: SavedSessionFiles) -> None:
-        self._log(f"[저장] 프레임쌍 기준 CSV를 저장했습니다: {saved_files.csv}")
         self._log(
-            "[저장] GUI 전달 카메라 프레임 CSV를 저장했습니다: "
-            f"left={saved_files.camera_left_csv}, right={saved_files.camera_right_csv}"
+            "[저장] 거리 측정 compact CSV/Parquet을 저장했습니다: "
+            f"csv={saved_files.distance_measurements_csv}, "
+            f"parquet={saved_files.distance_measurements_parquet}"
+        )
+        self._log(f"[저장] 세션 고정 JSON을 저장했습니다: {saved_files.session_static_json}")
+        self._log(
+            "[저장] GUI 전달 카메라 프레임 CSV/Parquet을 저장했습니다: "
+            f"left={saved_files.camera_left_csv}/{saved_files.camera_left_parquet}, "
+            f"right={saved_files.camera_right_csv}/{saved_files.camera_right_parquet}"
         )
         self._log(
-            "[저장] PX4 원시 타임라인 CSV를 저장했습니다: "
-            f"left={saved_files.px4_left_csv}, right={saved_files.px4_right_csv}"
+            "[저장] PX4 타임라인 CSV/Parquet을 저장했습니다: "
+            f"left={saved_files.px4_left_csv}/{saved_files.px4_left_parquet}, "
+            f"right={saved_files.px4_right_csv}/{saved_files.px4_right_parquet}"
         )
         self._log(f"[저장] 세션 manifest를 저장했습니다: {saved_files.manifest}")
         if saved_files.finalized:
@@ -13627,6 +14389,419 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         except ValueError:
             return str(resolved)
 
+    def _checkerboard_validation_mode(self) -> str:
+        if not hasattr(self, "checkerboard_validation_mode_combo"):
+            return "pixhawk"
+        mode = str(self.checkerboard_validation_mode_combo.currentData() or "pixhawk")
+        return mode if mode in {"pixhawk", "checkerboard"} else "pixhawk"
+
+    def _checkerboard_validation_root(self) -> Path:
+        text = self.checkerboard_validation_root_edit.text().strip() if hasattr(self, "checkerboard_validation_root_edit") else ""
+        if text:
+            return resolve_settings_path(text, base_dir=APP_ROOT)
+        root, _left_dir, _right_dir = self._calibration_dirs()
+        return root
+
+    def _calibration_image_paths_for_root(self, root: Path, side: str) -> list[Path]:
+        return sorted((root / side).glob(f"{side}_*.png"))
+
+    def _calibration_stereo_pair_paths_for_root(self, root: Path) -> list[tuple[str, Path, Path]]:
+        def indexed(paths: list[Path], side: str) -> dict[str, Path]:
+            result: dict[str, Path] = {}
+            for path in paths:
+                suffix = path.stem.replace(f"{side}_", "", 1)
+                result[suffix] = path
+            return result
+
+        left_by_id = indexed(self._calibration_image_paths_for_root(root, "left"), "left")
+        right_by_id = indexed(self._calibration_image_paths_for_root(root, "right"), "right")
+        return [(key, left_by_id[key], right_by_id[key]) for key in sorted(set(left_by_id) & set(right_by_id))]
+
+    def _checkerboard_validation_scan_counts(self) -> tuple[Path, list[Path], list[Path], list[tuple[str, Path, Path]]]:
+        root = self._checkerboard_validation_root()
+        left_paths = self._calibration_image_paths_for_root(root, "left")
+        right_paths = self._calibration_image_paths_for_root(root, "right")
+        pairs = self._calibration_stereo_pair_paths_for_root(root)
+        return root, left_paths, right_paths, pairs
+
+    def scan_checkerboard_validation_files(self) -> None:
+        root, left_paths, right_paths, pairs = self._checkerboard_validation_scan_counts()
+        mode = self._checkerboard_validation_mode()
+        requirement = (
+            "필수: left/right 이미지"
+            if mode == "pixhawk"
+            else "필수: matching stereo pair"
+        )
+        level = "good" if (pairs if mode == "checkerboard" else left_paths and right_paths) else "warn"
+        text = (
+            f"root={root} | left={len(left_paths)} right={len(right_paths)} "
+            f"stereo_pair={len(pairs)} | {requirement}"
+        )
+        self._set_health_label(self.checkerboard_validation_scan_label, text, level)
+
+    def choose_checkerboard_validation_root(self) -> None:
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "체커보드 사진셋 root 선택",
+            str(self._checkerboard_validation_root()),
+        )
+        if not directory:
+            return
+        self.checkerboard_validation_root_edit.setText(directory)
+        self.scan_checkerboard_validation_files()
+
+    def choose_checkerboard_validation_json(self) -> None:
+        path, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "기존 intrinsics JSON 선택",
+            str(self._intrinsics_storage_path()),
+            "Intrinsics JSON (*.json);;All Files (*)",
+        )
+        if path:
+            self.checkerboard_validation_json_edit.setText(path)
+
+    def _checkerboard_validation_set_result(
+        self,
+        result: StereoIntrinsicsResult,
+        *,
+        mode: str,
+        summary: dict[str, object],
+        text: str,
+    ) -> None:
+        self.checkerboard_validation_result = result
+        self.checkerboard_validation_result_mode = mode
+        self.checkerboard_validation_summary = dict(summary)
+        self.checkerboard_validation_result_saved = False
+        self.last_calibration_result = result
+        self.last_calibration_zoom_level = self.zoom_level_spin.value()
+        self._active_intrinsics_profile_path = (
+            f"memory:checkerboard-validation:{mode}:zoom-{self.last_calibration_zoom_level:02d}"
+        )
+        self.calibration_result_text.setPlainText(text)
+        extrinsics_state = "with checkerboard stereo R/T" if result.extrinsics is not None else "intrinsics only"
+        self._set_health_label(
+            self.checkerboard_validation_status_label,
+            f"계산 결과 있음: {mode} | {extrinsics_state} | 저장 전",
+            "good",
+        )
+        self._refresh_camera_parameters_tab()
+        self._refresh_zoom_intrinsics_tab()
+
+    def _calibrate_checkerboard_selection(
+        self,
+        *,
+        mode: str,
+        left_paths: list[Path],
+        right_paths: list[Path],
+        pair_count: int | None,
+    ) -> StereoIntrinsicsResult:
+        config = self._checkerboard_config()
+        left = calibrate_camera_from_images(left_paths, config)
+        right = calibrate_camera_from_images(right_paths, config)
+        extrinsics = None
+        if mode == "checkerboard":
+            extrinsics = calibrate_stereo_extrinsics_from_image_pairs(left_paths, right_paths, config, left, right)
+        return StereoIntrinsicsResult(left=left, right=right, board=config, extrinsics=extrinsics)
+
+    def _checkerboard_result_baseline_m(self, result: StereoIntrinsicsResult) -> float | None:
+        extrinsics = result.extrinsics
+        if extrinsics is None:
+            return None
+        return math.sqrt(sum(value * value for value in extrinsics.translation_left_to_right_m))
+
+    def _rotation_delta_deg_from_matrices(
+        self,
+        reference: list[list[float]] | None,
+        current: list[list[float]] | None,
+    ) -> float | None:
+        if reference is None or current is None:
+            return None
+        try:
+            trace = sum(
+                float(current[row][col]) * float(reference[row][col])
+                for row in range(3)
+                for col in range(3)
+            )
+        except (TypeError, ValueError, IndexError):
+            return None
+        ratio = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+        return math.degrees(math.acos(ratio))
+
+    def _format_checkerboard_validation_result_summary(
+        self,
+        result: StereoIntrinsicsResult,
+        *,
+        mode: str,
+        title: str,
+        root: Path | None = None,
+        pair_count: int | None = None,
+    ) -> str:
+        baseline_m = self._checkerboard_result_baseline_m(result)
+        extrinsics = result.extrinsics
+        lines = [
+            title,
+            f"mode: {mode}",
+            f"root: {root}" if root is not None else "",
+            f"Left: images={result.left.image_count}, error={result.left.reprojection_error_px:.3f}px, "
+            f"fx={result.left.camera_matrix[0][0]:.3f}, fy={result.left.camera_matrix[1][1]:.3f}, "
+            f"cx={result.left.camera_matrix[0][2]:.3f}, cy={result.left.camera_matrix[1][2]:.3f}",
+            f"Right: images={result.right.image_count}, error={result.right.reprojection_error_px:.3f}px, "
+            f"fx={result.right.camera_matrix[0][0]:.3f}, fy={result.right.camera_matrix[1][1]:.3f}, "
+            f"cx={result.right.camera_matrix[0][2]:.3f}, cy={result.right.camera_matrix[1][2]:.3f}",
+        ]
+        if extrinsics is None:
+            lines.append("Extrinsics: not computed (Pixhawk mode uses live attitude + GPS/RTK baseline)")
+        else:
+            lines.extend(
+                [
+                    f"Stereo: pairs={extrinsics.pair_count}, error={extrinsics.reprojection_error_px:.3f}px, "
+                    f"|T|={baseline_m:.6f} m",
+                    f"T_left_to_right_m={extrinsics.translation_left_to_right_m}",
+                    f"R_left_to_right={extrinsics.rotation_left_to_right}",
+                ]
+            )
+        if pair_count is not None:
+            lines.append(f"selected stereo pairs: {pair_count}")
+        return "\n".join(line for line in lines if line)
+
+    def load_checkerboard_validation_json(self) -> None:
+        path_text = self.checkerboard_validation_json_edit.text().strip()
+        if not path_text:
+            self._set_health_label(self.checkerboard_validation_status_label, "JSON 경로가 비어 있습니다", "bad")
+            return
+        path = resolve_settings_path(path_text, base_dir=APP_ROOT)
+        try:
+            result = load_intrinsics_json(path)
+        except Exception as exc:
+            self._set_health_label(self.checkerboard_validation_status_label, f"JSON 불러오기 실패: {exc}", "bad")
+            return
+        mode = "checkerboard" if result.extrinsics is not None else "pixhawk"
+        if hasattr(self, "checkerboard_validation_mode_combo"):
+            self._set_combo_data(self.checkerboard_validation_mode_combo, mode)
+        text = self._format_checkerboard_validation_result_summary(
+            result,
+            mode=mode,
+            title=f"Loaded intrinsics JSON: {path}",
+        )
+        self._checkerboard_validation_set_result(
+            result,
+            mode=mode,
+            summary={"source": "json", "path": str(path)},
+            text=text,
+        )
+        self.checkerboard_validation_result_saved = True
+        self._set_health_label(
+            self.checkerboard_validation_status_label,
+            f"기존 JSON 불러옴: {mode} | {path}",
+            "good",
+        )
+
+    def _checkerboard_random_subset_count(self, total_pairs: int) -> int:
+        configured = self.checkerboard_validation_random_pair_count_spin.value()
+        if configured > 0:
+            return min(total_pairs, max(3, configured))
+        min_images = self.calib_min_images_spin.value()
+        return min(total_pairs, max(3, min_images, int(math.ceil(total_pairs * 0.7))))
+
+    def _checkerboard_intrinsic_delta_px(self, result: StereoIntrinsicsResult, reference: StereoIntrinsicsResult) -> tuple[float, float]:
+        left_delta = max(
+            abs(float(result.left.camera_matrix[row][col]) - float(reference.left.camera_matrix[row][col]))
+            for row, col in ((0, 0), (1, 1), (0, 2), (1, 2))
+        )
+        right_delta = max(
+            abs(float(result.right.camera_matrix[row][col]) - float(reference.right.camera_matrix[row][col]))
+            for row, col in ((0, 0), (1, 1), (0, 2), (1, 2))
+        )
+        return left_delta, right_delta
+
+    def _checkerboard_validation_stddev(self, values: list[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        mean = sum(values) / len(values)
+        return math.sqrt(sum((value - mean) ** 2 for value in values) / (len(values) - 1))
+
+    def run_checkerboard_random_validation(self) -> None:
+        available, error = opencv_available()
+        if not available:
+            self._set_health_label(self.checkerboard_validation_status_label, f"OpenCV unavailable: {error}", "bad")
+            return
+        reference = self.checkerboard_validation_result
+        if reference is None:
+            self._set_health_label(
+                self.checkerboard_validation_status_label,
+                "랜덤 검증 전에 전체 사진으로 계산을 먼저 실행하세요.",
+                "warn",
+            )
+            return
+        mode = self._checkerboard_validation_mode()
+        root, _left_paths, _right_paths, pairs = self._checkerboard_validation_scan_counts()
+        if len(pairs) < 3:
+            self._set_health_label(
+                self.checkerboard_validation_status_label,
+                f"랜덤 검증 실패: stereo pair가 부족합니다 (pair={len(pairs)}, need>=3)",
+                "bad",
+            )
+            return
+        subset_count = self._checkerboard_random_subset_count(len(pairs))
+        runs = self.checkerboard_validation_random_runs_spin.value()
+        seed = self.checkerboard_validation_seed_spin.value()
+        rng = random.Random(seed if seed > 0 else None)
+        rows: list[str] = []
+        baselines: list[float] = []
+        rotations: list[float] = []
+        left_deltas: list[float] = []
+        right_deltas: list[float] = []
+        reference_baseline = self._checkerboard_result_baseline_m(reference)
+        reference_rotation = None if reference.extrinsics is None else reference.extrinsics.rotation_left_to_right
+        rows.append(
+            "Run       Pairs  Lerr   Rerr   Serr   Baseline(m)  dB(mm)   dR(deg)  max_dK_L(px)  max_dK_R(px)"
+        )
+        rows.append(self._checkerboard_validation_result_row("Full", reference, reference, len(pairs)))
+        for index in range(1, runs + 1):
+            subset = rng.sample(pairs, subset_count)
+            left_subset = [left for _key, left, _right in subset]
+            right_subset = [right for _key, _left, right in subset]
+            try:
+                result = self._calibrate_checkerboard_selection(
+                    mode=mode,
+                    left_paths=left_subset,
+                    right_paths=right_subset,
+                    pair_count=len(subset),
+                )
+            except Exception as exc:
+                rows.append(f"Random {index:<2} FAILED: {exc}")
+                continue
+            rows.append(self._checkerboard_validation_result_row(f"Random {index}", result, reference, len(subset)))
+            left_delta, right_delta = self._checkerboard_intrinsic_delta_px(result, reference)
+            left_deltas.append(left_delta)
+            right_deltas.append(right_delta)
+            baseline = self._checkerboard_result_baseline_m(result)
+            if baseline is not None:
+                baselines.append(baseline)
+            rotation = self._rotation_delta_deg_from_matrices(
+                reference_rotation,
+                None if result.extrinsics is None else result.extrinsics.rotation_left_to_right,
+            )
+            if rotation is not None:
+                rotations.append(rotation)
+        baseline_std = self._checkerboard_validation_stddev(baselines)
+        rotation_std = self._checkerboard_validation_stddev(rotations)
+        rows.extend(
+            [
+                "",
+                "Stability:",
+                f"max_dK_L std={self._checkerboard_validation_stddev(left_deltas):.3f} px",
+                f"max_dK_R std={self._checkerboard_validation_stddev(right_deltas):.3f} px",
+                f"baseline std={baseline_std * 1000.0:.3f} mm" if baselines else "baseline std=n/a",
+                f"rotation delta std={rotation_std:.6f} deg" if rotations else "rotation delta std=n/a",
+            ]
+        )
+        summary = dict(self.checkerboard_validation_summary)
+        summary["random_validation"] = {
+            "runs": runs,
+            "subset_pair_count": subset_count,
+            "seed": None if seed == 0 else seed,
+            "baseline_std_m": baseline_std if baselines else None,
+            "rotation_delta_std_deg": rotation_std if rotations else None,
+            "left_intrinsics_delta_std_px": self._checkerboard_validation_stddev(left_deltas),
+            "right_intrinsics_delta_std_px": self._checkerboard_validation_stddev(right_deltas),
+        }
+        self.checkerboard_validation_summary = summary
+        full_text = self.calibration_result_text.toPlainText().rstrip()
+        self.calibration_result_text.setPlainText(full_text + "\n\nRandom stereo-pair validation:\n" + "\n".join(rows))
+        self._set_health_label(
+            self.checkerboard_validation_status_label,
+            f"랜덤 검증 완료: runs={runs}, subset_pairs={subset_count}, mode={mode}",
+            "good",
+        )
+
+    def _checkerboard_validation_result_row(
+        self,
+        name: str,
+        result: StereoIntrinsicsResult,
+        reference: StereoIntrinsicsResult,
+        pairs: int,
+    ) -> str:
+        baseline = self._checkerboard_result_baseline_m(result)
+        reference_baseline = self._checkerboard_result_baseline_m(reference)
+        baseline_text = "n/a" if baseline is None else f"{baseline:.6f}"
+        baseline_delta_text = (
+            "n/a"
+            if baseline is None or reference_baseline is None
+            else f"{(baseline - reference_baseline) * 1000.0:+.3f}"
+        )
+        rotation_delta = self._rotation_delta_deg_from_matrices(
+            None if reference.extrinsics is None else reference.extrinsics.rotation_left_to_right,
+            None if result.extrinsics is None else result.extrinsics.rotation_left_to_right,
+        )
+        rotation_text = "n/a" if rotation_delta is None else f"{rotation_delta:.6f}"
+        stereo_error = "n/a" if result.extrinsics is None else f"{result.extrinsics.reprojection_error_px:.3f}"
+        left_delta, right_delta = self._checkerboard_intrinsic_delta_px(result, reference)
+        return (
+            f"{name:<10} {pairs:>5}  {result.left.reprojection_error_px:>5.3f}  "
+            f"{result.right.reprojection_error_px:>5.3f}  {stereo_error:>5}  "
+            f"{baseline_text:>11}  {baseline_delta_text:>7}  {rotation_text:>8}  "
+            f"{left_delta:>11.3f}  {right_delta:>11.3f}"
+        )
+
+    def save_checkerboard_validation_result(self) -> None:
+        result = self.checkerboard_validation_result
+        if result is None:
+            self._set_health_label(self.checkerboard_validation_status_label, "저장할 계산 결과가 없습니다", "warn")
+            return
+        root, _left_dir, _right_dir = self._calibration_dirs()
+        root.mkdir(parents=True, exist_ok=True)
+        zoom_level = self.zoom_level_spin.value()
+        zoom_output = self._intrinsics_storage_path(zoom_level)
+        latest_output = self._intrinsics_storage_base_path()
+        metadata = {
+            "note": "Generated by StereoWIRIS checkerboard validation/calculation tab",
+            "timestamp_s": time.time(),
+            "zoom_level": zoom_level,
+            "zoom_target": str(self.zoom_target_combo.currentData() or "both"),
+            "calculation_mode": self.checkerboard_validation_result_mode,
+            "validation": self.checkerboard_validation_summary,
+        }
+        save_intrinsics_json(zoom_output, result, metadata=metadata)
+        if zoom_output != latest_output:
+            save_intrinsics_json(latest_output, result, metadata=metadata)
+        self.checkerboard_validation_result_saved = True
+        self.last_calibration_zoom_level = zoom_level
+        self._add_zoom_intrinsics_comparison_path(zoom_output)
+        self._save_current_settings()
+        self._set_health_label(
+            self.checkerboard_validation_status_label,
+            f"계산 결과 저장 완료: zoom {zoom_level:02d} | {zoom_output}",
+            "good",
+        )
+        self._refresh_operation_header()
+        self._refresh_zoom_intrinsics_tab()
+
+    def apply_checkerboard_validation_result(self) -> None:
+        result = self.checkerboard_validation_result
+        if result is None:
+            self._set_health_label(self.checkerboard_validation_status_label, "적용할 계산 결과가 없습니다", "warn")
+            return
+        mode = self.checkerboard_validation_result_mode
+        if mode == "checkerboard" and result.extrinsics is None:
+            self._set_health_label(
+                self.checkerboard_validation_status_label,
+                "체커보드 Stereo 모드는 stereo R/T가 있는 결과만 적용할 수 있습니다",
+                "bad",
+            )
+            return
+        self.last_calibration_result = result
+        self.last_calibration_zoom_level = self.zoom_level_spin.value()
+        self._set_combo_data(self.distance_mode_combo, mode)
+        self.apply_intrinsics_to_distance()
+        self._save_current_settings()
+        saved_text = "저장됨" if self.checkerboard_validation_result_saved else "저장 전"
+        self._set_health_label(
+            self.checkerboard_validation_status_label,
+            f"계산에 적용 완료: mode={mode} | {saved_text}",
+            "good",
+        )
+
     def _checkerboard_config(self) -> CheckerboardConfig:
         return CheckerboardConfig(
             inner_cols=self.calib_cols_spin.value(),
@@ -13790,66 +14965,73 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def run_intrinsic_calibration(self) -> None:
         available, error = opencv_available()
         if not available:
-            self.calibration_status_label.setText(f"OpenCV unavailable: {error}")
+            self._set_health_label(self.checkerboard_validation_status_label, f"OpenCV unavailable: {error}", "bad")
             self.calibration_result_text.setPlainText(f"OpenCV unavailable:\n{error}")
             return
-        config = self._checkerboard_config()
-        left_paths = self._calibration_image_paths("left")
-        right_paths = self._calibration_image_paths("right")
+        mode = self._checkerboard_validation_mode()
+        root, left_paths, right_paths, pairs = self._checkerboard_validation_scan_counts()
+        if mode == "checkerboard":
+            left_paths = [left for _key, left, _right in pairs]
+            right_paths = [right for _key, _left, right in pairs]
+        pair_count = len(pairs)
         min_images = self.calib_min_images_spin.value()
-        try:
-            left = calibrate_camera_from_images(left_paths, config)
-            right = calibrate_camera_from_images(right_paths, config)
-        except Exception as exc:
-            self.calibration_status_label.setText(f"Calibration failed: {exc}")
-            self.calibration_result_text.setPlainText(str(exc))
-            self._log(f"[캘리브레이션] intrinsic 계산 실패: {exc}")
-            return
-        extrinsics = None
-        extrinsics_warning = ""
-        try:
-            extrinsics = calibrate_stereo_extrinsics_from_image_pairs(left_paths, right_paths, config, left, right)
-        except Exception as exc:
-            extrinsics_warning = f"\n\nStereo extrinsics not computed: {exc}"
-            self._log(f"[캘리브레이션] 체커보드 stereo 외부 파라미터 계산 건너뜀: {exc}")
-        self.last_calibration_result = StereoIntrinsicsResult(left=left, right=right, board=config, extrinsics=extrinsics)
-        self.last_calibration_zoom_level = self.zoom_level_spin.value()
-        self._active_intrinsics_profile_path = (
-            f"memory:checkerboard-calibration:zoom-{self.last_calibration_zoom_level:02d}"
-        )
-        warning = ""
-        if left.image_count < min_images or right.image_count < min_images:
-            warning = f"\nWARNING: valid images below requested minimum {min_images}."
-        extrinsics_text = ""
-        if extrinsics is not None:
-            baseline_m = math.sqrt(sum(value * value for value in extrinsics.translation_left_to_right_m))
-            extrinsics_text = (
-                "\n\nCheckerboard stereo extrinsics "
-                "(OpenCV optical RDF; X_right = R * X_left + T):\n"
-                f"pairs={extrinsics.pair_count}, error={extrinsics.reprojection_error_px:.3f}px, "
-                f"|T|={baseline_m:.6f} m\n"
-                f"T_left_to_right_m={extrinsics.translation_left_to_right_m}\n"
-                f"R_left_to_right={extrinsics.rotation_left_to_right}"
+        if not left_paths or not right_paths:
+            self._set_health_label(
+                self.checkerboard_validation_status_label,
+                f"계산 실패: left/right 이미지가 부족합니다 (left={len(left_paths)}, right={len(right_paths)})",
+                "bad",
             )
-        text = (
-            f"Left: images={left.image_count}, error={left.reprojection_error_px:.3f}px, "
-            f"fx={left.camera_matrix[0][0]:.2f}, fy={left.camera_matrix[1][1]:.2f}, "
-            f"cx={left.camera_matrix[0][2]:.2f}, cy={left.camera_matrix[1][2]:.2f}\n"
-            f"D_left={left.distortion_coefficients}\n\n"
-            f"Right: images={right.image_count}, error={right.reprojection_error_px:.3f}px, "
-            f"fx={right.camera_matrix[0][0]:.2f}, fy={right.camera_matrix[1][1]:.2f}, "
-            f"cx={right.camera_matrix[0][2]:.2f}, cy={right.camera_matrix[1][2]:.2f}\n"
-            f"D_right={right.distortion_coefficients}{warning}{extrinsics_text}{extrinsics_warning}"
+            return
+        if mode == "checkerboard" and pair_count < 3:
+            self._set_health_label(
+                self.checkerboard_validation_status_label,
+                f"계산 실패: stereo pair가 부족합니다 (pair={pair_count}, need>=3)",
+                "bad",
+            )
+            return
+        self.scan_checkerboard_validation_files()
+        try:
+            result = self._calibrate_checkerboard_selection(
+                mode=mode,
+                left_paths=left_paths,
+                right_paths=right_paths,
+                pair_count=pair_count,
+            )
+        except Exception as exc:
+            self._set_health_label(self.checkerboard_validation_status_label, f"Calibration failed: {exc}", "bad")
+            self.calibration_result_text.setPlainText(str(exc))
+            self._log(f"[캘리브레이션] 검증/계산 실패: {exc}")
+            return
+        warning = (
+            f"\nWARNING: valid images below requested minimum {min_images}."
+            if result.left.image_count < min_images or result.right.image_count < min_images
+            else ""
         )
-        self.calibration_result_text.setPlainText(text)
-        status = "Intrinsic + checkerboard stereo extrinsics calibration complete." if extrinsics else "Intrinsic calibration complete."
-        self.calibration_status_label.setText(status)
-        self._refresh_camera_parameters_tab()
-        self._refresh_zoom_intrinsics_tab()
-        if extrinsics is not None:
-            self._log("[캘리브레이션] intrinsic 및 체커보드 stereo 외부 파라미터 계산을 완료했습니다.")
+        text = self._format_checkerboard_validation_result_summary(
+            result,
+            mode=mode,
+            title="Full checkerboard calibration result",
+            root=root,
+            pair_count=pair_count if mode == "checkerboard" else None,
+        ) + warning
+        self._checkerboard_validation_set_result(
+            result,
+            mode=mode,
+            summary={
+                "source": "full",
+                "root": str(root),
+                "mode": mode,
+                "left_image_count": len(left_paths),
+                "right_image_count": len(right_paths),
+                "stereo_pair_count": pair_count,
+                "min_images": min_images,
+            },
+            text=text,
+        )
+        if mode == "checkerboard":
+            self._log("[캘리브레이션] 전체 사진 기반 intrinsic 및 체커보드 stereo 외부 파라미터 계산을 완료했습니다.")
         else:
-            self._log("[캘리브레이션] intrinsic 계산을 완료했습니다.")
+            self._log("[캘리브레이션] 전체 사진 기반 Pixhawk 모드용 intrinsic 계산을 완료했습니다.")
         self._refresh_operation_header()
 
     def save_intrinsics(self) -> None:
@@ -13916,6 +15098,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calibration_status_label.setText("Applied intrinsics and average fx to StereoWIRIS.")
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
+        self._refresh_optical_alignment_view()
         self._refresh_operation_header()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
@@ -13961,6 +15144,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if detection is not None:
             self.detection_buffers[camera].add(detection)
         self._refresh_distance()
+        self._refresh_optical_alignment_view()
 
     def _checkerboard_translation_right_in_left_m(self) -> tuple[float, float, float] | None:
         calibration = self.active_intrinsics
@@ -14212,6 +15396,229 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"P1 RDF Right={x_m:.3f} m, Down={y_m:.3f} m, Forward={z_m:.3f} m. "
             f"P1 RDF 좌우 성분 |Right|={abs(x_m):.3f} m입니다. "
             f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}.{attitude_text}"
+        )
+
+    def _optical_alignment_intrinsics_result(self) -> tuple[StereoIntrinsicsResult | None, str]:
+        if self.active_intrinsics is not None:
+            return self.active_intrinsics, "active calibration result"
+        if self.last_calibration_result is not None:
+            return self.last_calibration_result, "latest calibration result, not applied"
+        return None, "intrinsics waiting"
+
+    def _optical_alignment_mean_focal_px(self, axis: str) -> tuple[float | None, str]:
+        result, source = self._optical_alignment_intrinsics_result()
+        if result is None:
+            return None, source
+        try:
+            if axis == "x":
+                left_value = float(result.left.camera_matrix[0][0])
+                right_value = float(result.right.camera_matrix[0][0])
+            else:
+                left_value = float(result.left.camera_matrix[1][1])
+                right_value = float(result.right.camera_matrix[1][1])
+        except (TypeError, ValueError, IndexError):
+            return None, "intrinsics focal invalid"
+        mean_value = (left_value + right_value) / 2.0
+        if not isfinite(mean_value) or mean_value <= 0.0:
+            return None, "intrinsics focal invalid"
+        return mean_value, source
+
+    def _optical_alignment_expected_dy_px(self) -> tuple[float | None, str, str]:
+        mode = str(self.optical_expected_dy_combo.currentData() or "rectified")
+        if mode == "rectified":
+            return 0.0, "Rectified 0 px", "good"
+        if mode == "manual":
+            return self.optical_expected_dy_spin.value(), "Manual", "good"
+        result, source = self._optical_alignment_intrinsics_result()
+        if result is None:
+            return None, source, "warn"
+        try:
+            left_cy = float(result.left.camera_matrix[1][2])
+            right_cy = float(result.right.camera_matrix[1][2])
+        except (TypeError, ValueError, IndexError):
+            return None, "intrinsics cy invalid", "bad"
+        expected = left_cy - right_cy
+        return expected, f"Raw intrinsics cy diff ({source})", "warn" if result is not self.active_intrinsics else "good"
+
+    def _optical_alignment_level_from_mrad(self, value_mrad: float | None) -> str:
+        if value_mrad is None or not isfinite(value_mrad):
+            return "idle"
+        magnitude = abs(value_mrad)
+        if magnitude <= 0.2:
+            return "good"
+        if magnitude <= 0.6:
+            return "warn"
+        return "bad"
+
+    def _optical_alignment_overall_level(self, levels: Sequence[str]) -> str:
+        if any(level == "bad" for level in levels):
+            return "bad"
+        if any(level == "warn" for level in levels):
+            return "warn"
+        if any(level == "good" for level in levels):
+            return "good"
+        return "idle"
+
+    def _optical_alignment_level_text(self, level: str) -> str:
+        return {"good": "GOOD", "warn": "WARN", "bad": "BAD", "idle": "WAITING"}.get(level, "WAITING")
+
+    def _format_optical_px(self, value: float | None) -> str:
+        return "--" if value is None or not isfinite(value) else f"{value:+.3f} px"
+
+    def _format_optical_mrad(self, value: float | None) -> str:
+        return "--" if value is None or not isfinite(value) else f"{value:+.3f} mrad"
+
+    def _refresh_optical_alignment_view(self) -> None:
+        if not hasattr(self, "optical_alignment_labels"):
+            return
+        labels = self.optical_alignment_labels
+        pair = self._matched_detection_pair()
+        if pair is None:
+            self._set_health_label(
+                self.optical_alignment_status_label,
+                "Optical alignment: YOLO target pair 대기 중",
+                "idle",
+            )
+            for label in labels.values():
+                self._set_health_label(label, "대기 중", "idle")
+            expected_dy, expected_source, expected_level = self._optical_alignment_expected_dy_px()
+            self._set_health_label(
+                labels["expected_dy"],
+                f"{self._format_optical_px(expected_dy)} | {expected_source}",
+                expected_level,
+            )
+            return
+
+        left_center_x, left_center_y = pair.left.center
+        right_center_x, right_center_y = pair.right.center
+        observed_dx_px = float(left_center_x) - float(right_center_x)
+        observed_dy_px = float(left_center_y) - float(right_center_y)
+        expected_dy_px, expected_dy_source, expected_dy_level = self._optical_alignment_expected_dy_px()
+        dy_residual_px = None if expected_dy_px is None else observed_dy_px - expected_dy_px
+        mean_fy_px, fy_source = self._optical_alignment_mean_focal_px("y")
+        mean_fx_px, fx_source = self._optical_alignment_mean_focal_px("x")
+        vertical_error_mrad = None if dy_residual_px is None or mean_fy_px is None else dy_residual_px / mean_fy_px * 1000.0
+        vertical_level = self._optical_alignment_level_from_mrad(vertical_error_mrad)
+
+        left_timestamp_s = self._yolo_match_timestamp_s(pair.left)
+        right_timestamp_s = self._yolo_match_timestamp_s(pair.right)
+        camera_delta_s = (
+            None if left_timestamp_s is None or right_timestamp_s is None else abs(left_timestamp_s - right_timestamp_s)
+        )
+        try:
+            attempt = self._build_measurement_attempt(pair)
+            geometry_result = calculate_measurement_geometry(attempt)
+        except (TypeError, ValueError) as exc:
+            attempt = None
+            geometry_result = None
+            geometry_error = str(exc)
+        else:
+            geometry_error = ""
+
+        baseline_m = 0.0 if attempt is None else attempt.baseline_m
+        baseline_source = "waiting" if attempt is None else attempt.baseline_source
+        target_distance_m = self.optical_target_distance_spin.value()
+        expected_disparity_px = None
+        yaw_residual_px = None
+        yaw_error_mrad = None
+        if mean_fx_px is not None and baseline_m > 0.0 and target_distance_m > 0.0:
+            expected_disparity_mag_px = mean_fx_px * baseline_m / target_distance_m
+            expected_disparity_px = expected_disparity_mag_px if observed_dx_px >= 0.0 else -expected_disparity_mag_px
+            yaw_residual_px = observed_dx_px - expected_disparity_px
+            yaw_error_mrad = yaw_residual_px / mean_fx_px * 1000.0
+        yaw_level = self._optical_alignment_level_from_mrad(yaw_error_mrad)
+        overall_level = self._optical_alignment_overall_level((vertical_level, yaw_level))
+
+        class_text = pair.left.class_name or str(pair.left.class_id)
+        confidence_text = f"L={pair.left.confidence:.2f}, R={pair.right.confidence:.2f}"
+        self._set_health_label(
+            labels["left_center"],
+            f"x={left_center_x:.1f}, y={left_center_y:.1f} | {pair.left.width}x{pair.left.height}",
+            "good",
+        )
+        self._set_health_label(
+            labels["right_center"],
+            f"x={right_center_x:.1f}, y={right_center_y:.1f} | {pair.right.width}x{pair.right.height}",
+            "good",
+        )
+        self._set_health_label(
+            labels["bbox_delta"],
+            f"dx={observed_dx_px:+.3f} px, dy={observed_dy_px:+.3f} px",
+            "good",
+        )
+        self._set_health_label(labels["bbox_quality"], f"class={class_text} | conf {confidence_text}", "good")
+        camera_delta_text = "--" if camera_delta_s is None else f"{camera_delta_s * 1000.0:.1f} ms"
+        self._set_health_label(labels["camera_time"], camera_delta_text, "good" if camera_delta_s is not None else "warn")
+
+        self._set_health_label(
+            labels["expected_dy"],
+            f"{self._format_optical_px(expected_dy_px)} | {expected_dy_source}",
+            expected_dy_level,
+        )
+        self._set_health_label(labels["observed_dy"], self._format_optical_px(observed_dy_px), "good")
+        self._set_health_label(labels["dy_residual"], self._format_optical_px(dy_residual_px), vertical_level)
+        self._set_health_label(
+            labels["vertical_error"],
+            f"{self._format_optical_mrad(vertical_error_mrad)} | fy={mean_fy_px:.1f}px"
+            if mean_fy_px is not None
+            else f"-- | {fy_source}",
+            vertical_level,
+        )
+
+        self._set_health_label(labels["observed_dx"], self._format_optical_px(observed_dx_px), "good")
+        self._set_health_label(
+            labels["expected_disparity"],
+            f"{self._format_optical_px(expected_disparity_px)} | target={target_distance_m:.2f} m",
+            "good" if expected_disparity_px is not None else "warn",
+        )
+        self._set_health_label(labels["yaw_residual"], self._format_optical_px(yaw_residual_px), yaw_level)
+        self._set_health_label(
+            labels["yaw_error"],
+            f"{self._format_optical_mrad(yaw_error_mrad)} | fx={mean_fx_px:.1f}px"
+            if mean_fx_px is not None
+            else f"-- | {fx_source}",
+            yaw_level,
+        )
+
+        triangulated = None if geometry_result is None else geometry_result.triangulated
+        estimate = None if geometry_result is None else geometry_result.estimate
+        if triangulated is None:
+            reason = geometry_error or ("" if geometry_result is None else geometry_result.triangulation_reason)
+            self._set_health_label(labels["range"], "대기 중", "idle")
+            self._set_health_label(labels["ray_gap"], reason or "geometry 대기 중", "warn")
+        else:
+            self._set_health_label(labels["range"], f"{triangulated.range_m:.3f} m", "good")
+            self._set_health_label(labels["ray_gap"], f"{triangulated.closest_gap_m:.3f} m", "good")
+        self._set_health_label(labels["baseline"], f"{baseline_source}:{baseline_m:.3f} m", "good" if baseline_m > 0.0 else "warn")
+        triangulation_text = (
+            "대기 중"
+            if attempt is None
+            else f"{attempt.triangulation_source} | {geometry_result.triangulation_reason if geometry_result else geometry_error}"
+        )
+        self._set_health_label(labels["triangulation"], triangulation_text, "good" if triangulated is not None else "warn")
+        attitude_status = "WAITING"
+        if attempt is not None:
+            attitude_status = classify_attitude_timing(
+                uses_pixhawk_attitude=attempt.triangulation_source != "checkerboard",
+                left_age_s=None if estimate is None else estimate.left_attitude_age_s,
+                right_age_s=None if estimate is None else estimate.right_attitude_age_s,
+                pair_delta_s=attempt.attitude_pair_delta_s,
+            )
+        self._set_health_label(
+            labels["attitude"],
+            attitude_status,
+            self._attitude_timing_health_level(attitude_status),
+        )
+
+        self._set_health_label(
+            self.optical_alignment_status_label,
+            (
+                f"Optical alignment: {self._optical_alignment_level_text(overall_level)} | "
+                f"vertical={self._format_optical_mrad(vertical_error_mrad)} | "
+                f"yaw={self._format_optical_mrad(yaw_error_mrad)} | "
+                f"mode={self._distance_mode_label()}"
+            ),
+            overall_level,
         )
 
     def _build_measurement_attempt(self, pair) -> MeasurementAttempt:
@@ -15163,6 +16570,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     if metadata.get("source_timestamp_s") is None
                     else float(metadata["source_timestamp_s"]),
                     9,
+                ),
+                "rtp_timestamp": (
+                    "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
+                ),
+                "rtcp_sr_received_count": (
+                    ""
+                    if metadata.get("rtcp_sr_received_count") is None
+                    else str(int(metadata["rtcp_sr_received_count"]))
                 ),
                 "rtcp_frame_ntp_unix_s": self._fmt_record_float(
                     None if rtcp_ntp_s is None else float(rtcp_ntp_s),

@@ -11,7 +11,7 @@ python3 -m compileall sasl_common StereoWIRIS/wiris_stereo_distance
 
 ## 의존성 파일
 
-- `requirements/runtime.txt`: 앱 기본 실행 의존성. Live undistortion/ray 계산용 OpenCV·NumPy와 rig alignment용 PyYAML을 포함한다.
+- `requirements/runtime.txt`: 앱 기본 실행 의존성. Live undistortion/ray 계산용 OpenCV·NumPy, rig alignment용 PyYAML, 세션 Parquet 저장용 PyArrow를 포함한다.
 - `requirements/calibration.txt`: calibration bootstrap이 단독 복구할 수 있도록 runtime의 OpenCV·NumPy·PyYAML 항목을 의도적으로 반복한 부분집합.
 
 ## 빠른 로직 테스트

@@ -45,7 +45,7 @@ StereoWIRIS는 좌/우 WIRIS RTSP 영상, YOLO 검출, Pixhawk 자세/RTK 데이
    - ROS2/uXRCE는 자세/GPS/MAG/custom field를 구조화해 받는 고속 telemetry 경로로 유지하되, MAVLink 제어 채널이 없으면 Rover RTK 운용 준비 완료로 보지 않는다.
 
 6. 검증 가능한 저장
-   - 매칭 프레임쌍 단일 wide CSV와 목적별 탭 XLSX, 영상 파일을 같은 세션 단위로 묶는다.
+   - 고정 세션 조건 JSON, 리소스별 compact CSV/Parquet, 통합 검토용 XLSX, 영상 파일을 같은 세션 단위로 묶는다.
    - 사후 분석에서 측정값 자체뿐 아니라 당시 입력 조건과 품질 상태를 함께 확인할 수 있게 한다.
 
 7. Raw 측정 경계
@@ -111,6 +111,8 @@ StereoWIRIS에는 target PX4/ULog truth 수집, UAM 실시간 telemetry,
 StereoWIRIS에는 측정값 보정 계층도 없다. 과거 Origin-BBOX reprojection,
 affine bbox-center, distance-binned 3-D bias, Kalman 후처리와 이를 만들던
 Simulation-origin helper는 코드·UI·신규 기록 schema에서 제거했다.
+향후 보정법 탐색은 `docs/Calibration.md`의 truth/reference, two-flight
+검증, 좌표계 계약을 따른 별도 실험으로만 다룬다.
 
 ## 측정 리그 장착 단순화 결정
 
@@ -150,7 +152,7 @@ Simulation-origin helper는 코드·UI·신규 기록 schema에서 제거했다.
 - 좌/우 WIRIS RTSP 스트림을 연결하고, 포트 open이 아니라 실제 첫 프레임 수신까지 확인한다.
 - 카메라 preview와 YOLO/depth 측정을 분리해 스트림 상태 확인과 실제 측정을 구분한다.
 - WIRIS still image EXIF 시간 차이를 확인해 좌/우 카메라 시간 오차를 파악한다.
-- 체커보드 캡처와 줌별 intrinsics 저장/적용으로 WIRIS 내부 파라미터를 관리한다.
+- 체커보드 촬영과 파일셋 기반 검증/계산을 분리하고, 줌별 intrinsics 저장/적용으로 WIRIS 내부 파라미터를 관리한다.
 - YOLO 검출 결과를 좌/우 카메라에서 시간, 클래스, geometry gate 기준으로 매칭한다.
 - 카메라 내부 파라미터, Pixhawk 자세, GPS baseline을 사용해 3D ray triangulation을 수행한다.
 - 측정 결과, 외부 파라미터, Pixhawk MAG 상태, 영상 파일, 설정을 세션 단위로 저장한다.
@@ -194,7 +196,7 @@ StereoWIRIS는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스트�
 
 ### 저장과 설정
 
-- `wiris_stereo_distance/recording_session.py`: 세션 폴더와 wide CSV/목적별 XLSX 저장.
+- `wiris_stereo_distance/recording_session.py`: 세션 폴더와 리소스별 compact CSV/Parquet, 고정 JSON, 통합 XLSX 저장.
 - `wiris_stereo_distance/settings.py`: 설정 로드/저장.
 
 ## 측정 데이터 흐름
@@ -206,7 +208,7 @@ StereoWIRIS는 PyQt5 GUI가 현장 워크플로를 조율하고, 계산/스트�
 5. Pixhawk 경로는 selected GPS pair에서 NED baseline을 다시 계산하고, right ray, right optical-forward 축과 baseline translation을 동일 attempt의 selected `(w,x,y,z)` quaternion 및 app-monotonic sample timestamp basis로 `left_camera_rdf`에 놓는다.
 6. `measurement_controller.py`가 attempt만 받아 correspondence를 먼저 검증한 후 triangulation을 계산하고, selected baseline-frame 중점과 `Right=left→right`, projected mean `Forward`, `Down=Forward×Right` 계약으로 `baseline_center_frd` 결과와 midpoint Range를 만든다. Checkerboard는 `R/T` optical-center 모델, Pixhawk는 기록된 GPS/RTK antenna-baseline proxy를 사용하며, attempt 생성 뒤 GUI latest state를 조회하지 않는다.
 7. accepted matched pair마다 먼저 한 행을 만들고, 같은 pair가 나중에 valid geometry를 얻으면 새 행을 추가하지 않고 해당 행을 갱신한다. 행은 selected-input provenance와 canonical/content/instance hash를 기록한다.
-8. Stop 또는 수동 저장 시 `recording_session.py`가 `<session_id>.csv`, `<session_id>.xlsx`, 좌우 `camera_*.csv`, 좌우 `px4_*.csv`를 함께 생성한다. XLSX의 Measurements/GPS/Attitude/Baseline/Quality는 동일한 `sample_index`와 `session_elapsed_s` 행축을 공유한다. 카메라 개별 CSV의 한 행은 세션 중 GUI `frame_changed` 콜백에 실제 전달된 프레임이며 MP4 전체 프레임 인덱스가 아니다.
+8. Stop 또는 수동 저장 시 `recording_session.py`가 `<session_id>_session_static.json`, 리소스별 compact CSV/Parquet, 통합 `<session_id>.xlsx`를 함께 생성한다. `recording_time_ns`는 `세션 기록 시작` 기준 int64 ns 공통 시간축이다. XLSX는 Summary, DistanceMeasurements, CameraLeft/Right, Px4Left/Right, CalibrationStatic sheet로 리소스별 CSV를 한 파일에서 검토하는 용도다. 카메라 개별 CSV의 한 행은 세션 중 GUI `frame_changed` 콜백에 실제 전달된 프레임이며 MP4 전체 프레임 인덱스가 아니다.
 
 S3-B4에서 `baseline_center_frd` public migration과 paired-row v2 schema를
 적용했다. 이 변경은 하드웨어 신뢰성, 정확한 camera/GNSS lever arm,
@@ -219,7 +221,7 @@ GPS age/skew 및 stale/RTK acceptance, recorder/session isolation을 승인하�
 2. `./run.sh`로 앱 실행.
 3. `연결` 탭에서 WIRIS, RTSP, P1/P2 Pixhawk를 확인하고, 수동 SDK/필드 감시는 `고급` 탭에서 수행한다.
 4. `시간` 탭에서 WIRIS 사진 EXIF 시간 차이 확인.
-5. `보정` 탭에서 체커보드 캡처와 내부 파라미터 보정.
+5. `보정` 탭에서 체커보드를 캡처하고, `체커보드 검증/계산`에서 파일셋 기반 계산·검증·저장·적용을 수행한다.
 6. `파라미터` 탭의 `내부`, `외부/기하` 세부탭에서 현재 내부/외부 파라미터 확인.
 7. `정렬` 탭에서 Baseline, MAG, Pixhawk 자세 상태 확인.
 8. `YOLO` 탭에서 모델, 장치, 스트림 설정 조정.
@@ -240,8 +242,8 @@ GPS age/skew 및 stale/RTK acceptance, recorder/session isolation을 승인하�
 ## 저장 기준
 
 - accepted 좌/우 matched detection frame pair마다 한 행을 기록하고 geometry 상태를 함께 보존한다.
-- 세션 저장은 단일 wide CSV, 동일 행축의 목적별 탭 XLSX, raw MP4를 같은 세션 폴더에 묶는다.
-- CSV/XLSX의 공통 시간축은 pair app-monotonic midpoint 기반 `session_elapsed_s`이고, 카메라 RTCP/NTP, PX4 timestamp/sample, GPS UTC는 별도 원시 provenance로 보존한다.
+- 세션 저장은 고정 조건 JSON, 리소스별 compact CSV/Parquet, 통합 검토용 XLSX, raw MP4를 같은 세션 폴더에 묶는다.
+- CSV/Parquet/XLSX의 공통 시간축은 `세션 기록 시작` 기준 int64 ns인 `recording_time_ns`이고, 카메라 RTCP/NTP와 PX4/GPS UTC는 별도 device UTC 필드로 보존한다.
 
 ## 설계 방향
 

@@ -77,6 +77,7 @@ Visualization Manager:
       Name: Stereo Rays — Nominal / Optical / Ideal (World ENU)
       Namespaces:
         stereo_actual_drone: true
+        stereo_camera_fov: false
         stereo_cameras: true
         stereo_rays_nominal: true
         stereo_rays_optical: true

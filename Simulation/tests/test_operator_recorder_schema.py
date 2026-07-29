@@ -311,6 +311,76 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             self.assertIn(result["csv_sha256"], worksheets_xml)
             self.assertIn("nominal", worksheets_xml)
 
+    def test_compact_session_export_separates_static_json_and_minimal_time_csvs(self) -> None:
+        module = load_module()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "telemetry.csv"
+            with source.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=module.TELEMETRY_FIELDS)
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "time_sec": "1.0",
+                        "ros_time_sec": "2.0",
+                        "axis_contract": module.AXIS_CONTRACT,
+                        "ground_truth_m": "1000.1",
+                        "drone_forward_m": "1000",
+                        "drone_right_m": "7",
+                        "drone_down_m": "4",
+                        "raw_forward_m": "999",
+                        "raw_right_m": "8",
+                        "raw_down_m": "5",
+                        "raw_range_m": "999.04",
+                        "left_x1": "10",
+                        "left_y1": "20",
+                        "left_x2": "30",
+                        "left_y2": "40",
+                        "left_confidence": "0.9",
+                        "right_x1": "50",
+                        "right_y1": "60",
+                        "right_x2": "70",
+                        "right_y2": "80",
+                        "right_confidence": "0.8",
+                        "nominal_ray_midpoint_forward_m": "998",
+                        "nominal_ray_midpoint_right_m": "6",
+                        "nominal_ray_midpoint_down_m": "3",
+                        "nominal_ray_range_m": "998.02",
+                        "nominal_ray_gap_m": "0.05",
+                        "nominal_ray_intersection_angle_deg": "1.5",
+                        "uam_px4_position_n_m": "1",
+                        "uam_px4_position_e_m": "2",
+                        "uam_px4_position_d_m": "-3",
+                    }
+                )
+
+            result = module.export_compact_session_files(
+                source,
+                Path(tmpdir),
+                mode="lite",
+                csv_hz=30.0,
+                video_fps=20.0,
+                manifest_rows=(("camera_baseline_m", "25.0"),),
+            )
+
+            static_payload = json.loads((Path(tmpdir) / "session_static.json").read_text(encoding="utf-8"))
+            manifest = json.loads((Path(tmpdir) / "session_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(static_payload["static_values"]["camera_baseline_m"], "25.0")
+            self.assertEqual(static_payload["axis_contract"], module.AXIS_CONTRACT)
+            self.assertEqual(manifest["artifact_roles"]["telemetry.csv"], "legacy_wide_telemetry_csv")
+            self.assertEqual(result["row_counts"]["distance_measurements"], 1)
+            self.assertEqual(result["row_counts"]["ray_summary"], 1)
+            self.assertEqual(result["row_counts"]["detections"], 1)
+            self.assertEqual(result["row_counts"]["px4_uam"], 1)
+            with (Path(tmpdir) / "ray_summary.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["truth_Rg_m"], "1000.1")
+            self.assertEqual(rows[0]["nominal_forward_m"], "998")
+            self.assertEqual(tuple(rows[0].keys()), module.COMPACT_RAY_SUMMARY_FIELDS)
+            with (Path(tmpdir) / "distance_measurements.csv").open(newline="", encoding="utf-8") as handle:
+                distance_rows = list(csv.DictReader(handle))
+            self.assertEqual(tuple(distance_rows[0].keys()), module.COMPACT_DISTANCE_FIELDS)
+            self.assertNotIn("left_x1", distance_rows[0])
+
     def test_camera_px4_samples_and_estimated_optical_extrinsic_are_recorded(self) -> None:
         module = load_module()
         recorder = object.__new__(module.OperatorRecorder)

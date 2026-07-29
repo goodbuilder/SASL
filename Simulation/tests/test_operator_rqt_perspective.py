@@ -69,6 +69,7 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert "FRDR comparison" in source
     assert "legend_x = right + 12" in source
     assert "legend_x + 35" in source
+    assert "legend_y += 24" in source
     assert "_ASPECT_HEIGHT_PER_WIDTH = 9.0 / 16.0" in source
     assert "QSizePolicy.Ignored, QSizePolicy.MinimumExpanding" in source
     assert "layout.addLayout(cameras)" in source
@@ -107,7 +108,14 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert "read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)" in source
     assert '("raw_gps_baseline_range_m", "Raw GPS range (m)")' in source
     assert '("raw_gps_baseline_forward_m", "Raw GPS F (m)")' in source
-    for record_view in ("Summary", "Raw GPS", "BBox", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
+    assert '("nominal_ray_midpoint_forward_m", "F nominal")' in source
+    assert '("optical_ray_midpoint_right_m", "Rt optical")' in source
+    assert '("ideal_ray_range_m", "Rg ideal")' in source
+    assert 'ray_metrics = Signal(str)' in source
+    assert '"/stereo/ray_metrics"' in source
+    assert "update_live_ray_metrics" in source
+    assert '("midpoint_frd_m", "midpoint")' in source
+    for record_view in ("Summary", "Raw GPS", "BBox", "Ray summary", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
         assert f'"{record_view}"' in source
 
 
@@ -128,7 +136,13 @@ def test_flight_toolbar_exposes_csv_mp4_and_debug_recording_actions() -> None:
     assert '("lite", PRIMARY_RECORD_BUTTON_TEXT)' in source
     assert '("full", "Save MP4")' in source
     assert '("debug", "Save Debug")' in source
+    assert 'QPushButton("Auto Mission")' in source
+    assert 'QPushButton("Waypoint")' in source
+    assert '"run_auto_mission.sh"' in source
+    assert '"run_px4_waypoint_mission.sh"' in source
+    assert "build_mission_command(kind" in source
     assert 'self._start_recording(record_mode)' in source
+    assert "self._start_mission(mission_kind)" in source
     assert 'QPushButton("Start Cal CSV")' not in source
 
 

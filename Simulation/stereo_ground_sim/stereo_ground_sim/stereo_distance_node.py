@@ -98,6 +98,7 @@ except ImportError:  # pragma: no cover - exercised only outside ROS
     class Marker(_Message):  # type: ignore[no-redef]
         TEXT_VIEW_FACING = 9
         LINE_LIST = 5
+        TRIANGLE_LIST = 11
         SPHERE = 2
         CUBE = 1
         MESH_RESOURCE = 10
@@ -236,6 +237,53 @@ def ray_visualization_world_enu_from_triangulation(
         "midpoint_world_enu_m": tuple(
             baseline_center_frd.point_to_world(midpoint_baseline_center_frd_m)
         ),
+    }
+
+
+def reference_ray_world_enu_from_point(
+    baseline_center_frd,
+    left_camera_pose,
+    right_camera_pose,
+    point_world_enu_m,
+):
+    """Return display-only ideal rays from both cameras to one World ENU point."""
+
+    try:
+        point_world = tuple(float(value) for value in point_world_enu_m[:3])
+    except (TypeError, ValueError):
+        return None
+    if len(point_world) != 3 or not all(math.isfinite(value) for value in point_world):
+        return None
+    point_frd = tuple(baseline_center_frd.point_from_world(point_world))
+    left_rdf = left_camera_pose.world_to_rdf(point_world)
+    right_rdf = right_camera_pose.world_to_rdf(point_world)
+    return {
+        "point_on_left_ray_baseline_center_frd_m": point_frd,
+        "point_on_right_ray_baseline_center_frd_m": point_frd,
+        "midpoint_baseline_center_frd_m": point_frd,
+        "forward_m": float(point_frd[0]),
+        "right_m": float(point_frd[1]),
+        "down_m": float(point_frd[2]),
+        "range_m": math.sqrt(sum(float(value) * float(value) for value in point_frd)),
+        "distance_m": float(point_frd[0]),
+        "ray_gap_m": 0.0,
+        "intersection_angle_deg": None,
+        "left_depth_m": float(left_rdf[2]),
+        "right_depth_m": float(right_rdf[2]),
+        "geometry_rank": 3,
+        "condition_number": 1.0,
+        "computation_status": "computed",
+        "output_frame": BASELINE_CENTER_FRD_FRAME,
+        "point_frame": BASELINE_CENTER_FRD_FRAME,
+        "axis_contract": BASELINE_CENTER_FRD_AXIS_CONTRACT,
+        "vector_contract": BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+        "ray_visualization_world_enu": {
+            "left_origin_world_enu_m": tuple(left_camera_pose.center_world_enu_m),
+            "left_target_world_enu_m": point_world,
+            "right_origin_world_enu_m": tuple(right_camera_pose.center_world_enu_m),
+            "right_target_world_enu_m": point_world,
+            "midpoint_world_enu_m": point_world,
+        },
     }
 
 
@@ -620,6 +668,10 @@ class StereoDistanceNode(Node):
         # while rejecting the multi-second old-epoch stamps seen after reset.
         self.future_gt_capacity = 64
         self.gt_reorder_lead_limit_ns = 200_000_000
+        # Image callbacks can arrive one executor tick before the matching
+        # /clock callback. Keep the tolerance much tighter than GT quarantine so
+        # old-epoch images after reset are still rejected.
+        self.image_reorder_lead_limit_ns = 20_000_000
         self.future_gt_overflow_count = 0
         self.stale_pre_reset_gt_count = 0
         self.gt_reset_quarantine_duration_ns = 200_000_000
@@ -3255,7 +3307,18 @@ class StereoDistanceNode(Node):
                 self.input_rejected_after_shutdown_count += 1
                 return
             latest_clock = self.simulation_epoch.last_clock_stamp_ns
-            if not self.simulation_epoch.accepts_stamp(stamp_ns):
+            if latest_clock is not None and stamp_ns > latest_clock:
+                lead_ns = stamp_ns - latest_clock
+                if lead_ns <= getattr(self, "image_reorder_lead_limit_ns", 0):
+                    pass
+                else:
+                    self.stale_pre_reset_count += 1
+                    self.get_logger().warning(
+                        f"{side} image stamp {stamp_ns} is ahead of current "
+                        f"/clock {latest_clock} by {lead_ns} ns; ignored"
+                    )
+                    return
+            elif not self.simulation_epoch.accepts_stamp(stamp_ns):
                 self.stale_pre_reset_count += 1
                 self.get_logger().warning(
                     f"{side} image stamp {stamp_ns} is ahead of current /clock {latest_clock}; ignored"
@@ -3495,6 +3558,11 @@ class StereoDistanceNode(Node):
                     if left is not None or right is not None:
                         self.live_detections_pub.publish(self._detections_to_msg(left, right))
                     ideal = self._latest_rviz_ideal_ray(pair)
+                    self._publish_ray_metrics(
+                        nominal=raw,
+                        optical=computed.get("corrected"),
+                        ideal=ideal,
+                    )
                     self._publish_ray_markers(
                         nominal=raw,
                         optical=computed.get("corrected"),
@@ -3522,10 +3590,19 @@ class StereoDistanceNode(Node):
         height = int(getattr(pair.left_message, "height", 0))
         if width <= 0 or height <= 0:
             return None
-        return self._triangulate_dkl_ideal_from_reference_world(
+        ideal = self._triangulate_dkl_ideal_from_reference_world(
             point_world_enu_m,
             width,
             height,
+        )
+        if ideal is not None:
+            return ideal
+        self._ensure_camera_frames()
+        return reference_ray_world_enu_from_point(
+            self.baseline_center_frd,
+            self.nominal_left_camera,
+            self.nominal_right_camera,
+            point_world_enu_m,
         )
 
     def _commit_pair_measurement_if_current(self, pair, computed):
@@ -5719,6 +5796,112 @@ class StereoDistanceNode(Node):
         return Point(x=float(vector[0]), y=float(vector[1]), z=float(vector[2]))
 
     @staticmethod
+    def _point_add(a, b):
+        return (
+            float(a[0]) + float(b[0]),
+            float(a[1]) + float(b[1]),
+            float(a[2]) + float(b[2]),
+        )
+
+    @staticmethod
+    def _point_scale(vector, scalar):
+        return (float(vector[0]) * scalar, float(vector[1]) * scalar, float(vector[2]) * scalar)
+
+    def _camera_fov_markers(self, stamp):
+        """Render camera frustums as translucent faces plus visible corner edges."""
+
+        try:
+            width = max(1.0, float(getattr(self, "camera_image_width_px", 1280)))
+            height = max(1.0, float(getattr(self, "camera_image_height_px", 720)))
+            horizontal_fov = float(getattr(self, "horizontal_fov_rad", 0.154997710698))
+        except (TypeError, ValueError):
+            return []
+        if not math.isfinite(horizontal_fov) or horizontal_fov <= 0.0:
+            return []
+        depth_m = min(max(1.0, float(getattr(self, "camera_clip_far_m", 2500.0))), 2500.0)
+        half_width = depth_m * math.tan(horizontal_fov * 0.5)
+        half_height = half_width * height / width
+
+        def world_point(camera, right_m, down_m, forward_m):
+            return self._point_add(
+                camera.center_world_enu_m,
+                self._point_add(
+                    self._point_add(
+                        self._point_scale(camera.right_world_enu, right_m),
+                        self._point_scale(camera.down_world_enu, down_m),
+                    ),
+                    self._point_scale(camera.forward_world_enu, forward_m),
+                ),
+            )
+
+        def markers_for_camera(label, marker_id, camera, color):
+            origin = tuple(camera.center_world_enu_m)
+            far_tl = world_point(camera, -half_width, -half_height, depth_m)
+            far_tr = world_point(camera, half_width, -half_height, depth_m)
+            far_br = world_point(camera, half_width, half_height, depth_m)
+            far_bl = world_point(camera, -half_width, half_height, depth_m)
+
+            faces = Marker()
+            faces.header.frame_id = WORLD_FRAME
+            faces.header.stamp = stamp
+            faces.ns = "stereo_camera_fov"
+            faces.id = marker_id
+            faces.type = Marker.TRIANGLE_LIST
+            faces.action = Marker.ADD
+            faces.scale.x = faces.scale.y = faces.scale.z = 1.0
+            faces.color.r, faces.color.g, faces.color.b = color
+            faces.color.a = 0.12
+            faces.points = [
+                self._marker_point(point)
+                for point in (
+                    origin, far_tl, far_tr,
+                    origin, far_tr, far_br,
+                    origin, far_br, far_bl,
+                    origin, far_bl, far_tl,
+                    far_tl, far_bl, far_br,
+                    far_tl, far_br, far_tr,
+                )
+            ]
+            faces.text = f"{label}_camera_fov_faces"
+
+            edges = Marker()
+            edges.header.frame_id = WORLD_FRAME
+            edges.header.stamp = stamp
+            edges.ns = "stereo_camera_fov"
+            edges.id = marker_id + 1
+            edges.type = Marker.LINE_LIST
+            edges.action = Marker.ADD
+            edges.scale.x = 1.0
+            edges.color.r, edges.color.g, edges.color.b = color
+            edges.color.a = 0.9
+            edges.points = [
+                self._marker_point(point)
+                for point in (
+                    origin, far_tl,
+                    origin, far_tr,
+                    origin, far_br,
+                    origin, far_bl,
+                    far_tl, far_tr,
+                    far_tr, far_br,
+                    far_br, far_bl,
+                    far_bl, far_tl,
+                )
+            ]
+            edges.text = f"{label}_camera_fov_edges"
+            return [faces, edges]
+
+        snapshot = self._camera_oracle_snapshot()
+        if snapshot is not None:
+            left_camera, right_camera = (snapshot[0].pose, snapshot[1].pose)
+        else:
+            self._ensure_camera_frames()
+            left_camera, right_camera = self.nominal_left_camera, self.nominal_right_camera
+        return (
+            markers_for_camera("left", 50, left_camera, (0.95, 0.95, 0.95))
+            + markers_for_camera("right", 60, right_camera, (0.55, 0.72, 0.85))
+        )
+
+    @staticmethod
     def _json_number(value):
         if value is None:
             return None
@@ -5819,7 +6002,9 @@ class StereoDistanceNode(Node):
         # Keep the mesh readable against RViz's dark background; the source
         # geometry remains the actual Gazebo X500 asset.
         marker.mesh_use_embedded_materials = False
-        publisher.publish(MarkerArray(markers=[marker]))
+        publisher.publish(
+            MarkerArray(markers=[marker] + self._camera_fov_markers(marker.header.stamp))
+        )
 
     def _publish_ray_markers(self, nominal=None, optical=None, ideal=None):
         """Publish Nominal, Optical, and DKL Ideal stereo rays in World ENU."""
@@ -5938,6 +6123,7 @@ class StereoDistanceNode(Node):
                 camera.scale.x = camera.scale.y = camera.scale.z = 12.0
                 camera.color.r, camera.color.g, camera.color.b, camera.color.a = (*color, 1.0)
                 markers.append(camera)
+        markers.extend(self._camera_fov_markers(stamp))
         if markers:
             publisher.publish(MarkerArray(markers=markers))
 

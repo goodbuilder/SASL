@@ -623,6 +623,7 @@ class GstRtpTimingTracker:
         self._timing_by_pts_ns: dict[int, RtpFrameTiming] = {}
         self._pts_order: deque[int] = deque(maxlen=MAX_RTP_TIMING_CACHE)
         self._sr_by_ssrc: dict[int, RtcpSenderReportTiming] = {}
+        self._sr_count_by_ssrc: dict[int, int] = {}
         self._manager = None
         self._last_rtcp_poll_s = 0.0
         self._last_clock_rates: dict[str, float] | None = None
@@ -640,6 +641,7 @@ class GstRtpTimingTracker:
                 # first appeared, so rtcp_sr_age_s measures how stale the anchor
                 # is instead of how recently we polled.
                 return None
+            self._sr_count_by_ssrc[timing.ssrc] = self._sr_count_by_ssrc.get(timing.ssrc, 0) + 1
             self._sr_by_ssrc[timing.ssrc] = timing
         if previous is None:
             return None
@@ -697,6 +699,7 @@ class GstRtpTimingTracker:
         sr_timing = self._sr_by_ssrc.get(frame_timing.rtp_ssrc)
         if sr_timing is None:
             return metadata
+        sr_received_count = self._sr_count_by_ssrc.get(frame_timing.rtp_ssrc, 0)
         frame_ntp_s = estimate_rtcp_ntp_unix_seconds(
             rtp_timestamp=frame_timing.rtp_timestamp,
             sr_rtp_timestamp=sr_timing.rtp_timestamp,
@@ -711,6 +714,7 @@ class GstRtpTimingTracker:
                 "rtcp_clock_rate_hz": sr_timing.clock_rate_hz,
                 "rtcp_sr_age_s": max(0.0, now_s - sr_timing.received_monotonic_s),
                 "rtcp_sr_received_wall_s": sr_timing.received_wall_s,
+                "rtcp_sr_received_count": sr_received_count,
             }
         )
         if self._last_clock_rates is not None:

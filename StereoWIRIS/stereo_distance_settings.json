@@ -1,7 +1,7 @@
 {
   "intrinsics_path": "calibration_captures/intrinsics.json",
   "yolo_weights_path": "yolov8n.pt",
-  "interface_name": "enp46s0",
+  "interface_name": "enx588694fce07e",
   "camera_host_address": "10.0.0.10/24",
   "left_rtsp_url": "rtsp://10.0.0.231:8554/visible",
   "right_rtsp_url": "rtsp://10.0.0.232:8554/visible",
@@ -29,7 +29,7 @@
   "yolo_gate_time_delta_enabled": true,
   "yolo_gate_vertical_delta_enabled": false,
   "yolo_gate_max_vertical_delta_px": 80.0,
-  "yolo_gate_max_time_delta_s": 0.05,
+  "yolo_gate_max_time_delta_s": 0.1,
   "yolo_gate_time_basis": "camera_rtcp",
   "preview_width": 1280,
   "rtsp_latency_ms": 100,

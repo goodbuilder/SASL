@@ -304,6 +304,39 @@ def test_ubx_base_satellite_count_uses_nav_pvt_or_nav_sat() -> None:
     assert gui.parse_ubx_base_satellite_count(0x01, 0x3B, b"\x00" * 40) is None
 
 
+def test_ubx_nav_sat_quality_parser_summarizes_signal_and_constellations() -> None:
+    import struct
+
+    import wiris_stereo_distance.gui as gui
+
+    payload = bytearray(8 + 3 * 12)
+    payload[5] = 3
+    records = (
+        (0, 1, 42, 45, 0x01),
+        (2, 11, 28, 10, 0x00),
+        (3, 21, 35, 20, 0x01),
+    )
+    for index, (gnss_id, sv_id, cno, elevation, flags) in enumerate(records):
+        offset = 8 + index * 12
+        payload[offset] = gnss_id
+        payload[offset + 1] = sv_id
+        payload[offset + 2] = cno
+        struct.pack_into("<b", payload, offset + 3, elevation)
+        struct.pack_into("<I", payload, offset + 8, flags)
+
+    quality = gui.parse_ubx_nav_sat_quality(0x01, 0x35, bytes(payload))
+
+    assert quality == {
+        "tracked": 3,
+        "used": 2,
+        "avg_cno_dbhz": pytest.approx(35.0),
+        "low_cno": 1,
+        "low_elevation": 1,
+        "constellations": {"GPS": 1, "Galileo": 1, "BeiDou": 1},
+    }
+    assert gui.parse_ubx_nav_sat_quality(0x01, 0x07, bytes(payload)) is None
+
+
 def test_rtcm3_stream_parser_extracts_complete_frames() -> None:
     import wiris_stereo_distance.gui as gui
 
@@ -312,6 +345,17 @@ def test_rtcm3_stream_parser_extracts_complete_frames() -> None:
 
     assert parser.feed(b"noise" + frame[:4]) == []
     assert parser.feed(frame[4:] + b"tail") == [frame]
+
+
+def test_rtcm3_message_type_parser_reads_payload_header() -> None:
+    import wiris_stereo_distance.gui as gui
+
+    message_type = 1077
+    payload = bytes((message_type >> 4, (message_type & 0x0F) << 4, 0x00))
+    frame = b"\xd3\x00\x03" + payload + b"\x00\x00\x00"
+
+    assert gui.parse_rtcm3_message_type(frame) == 1077
+    assert gui.parse_rtcm3_message_type(b"\xd3\x00\x01x\x00\x00\x00") is None
 
 
 def test_mavlink_rtcm_data_chunks_to_gps_rtcm_packets() -> None:
@@ -359,12 +403,48 @@ def test_gnss_base_rtcm_frame_routes_to_selected_rovers(monkeypatch) -> None:
     widget = gui.WirisStereoDistancePanel()
     widget.mavlink_pixhawk = FakeMavlink()
     widget._set_combo_data(widget.gnss_base_rtcm_target_combo, "both")
-    frame = b"\xd3\x00\x03abc\x00\x00\x00"
+    frame = b"\xd3\x00\x03" + bytes((1005 >> 4, (1005 & 0x0F) << 4, 0x00)) + b"\x00\x00\x00"
 
     widget._handle_gnss_base_rtcm_frame(frame)
 
     assert widget.mavlink_pixhawk.sent == [("left", frame), ("right", frame)]
     assert "RTCM 9 bytes" in widget.gnss_base_status_labels["rtcm_injection"].text()
+    assert "frames=1" in widget.gnss_base_status_labels["rtcm_receive"].text()
+    assert "1005:1" in widget.gnss_base_status_labels["rtcm_messages"].text()
+    assert "L frames=1 bytes=9 fail=0" in widget.gnss_base_status_labels["rtcm_injection_stats"].text()
+    assert "R frames=1 bytes=9 fail=0" in widget.gnss_base_status_labels["rtcm_injection_stats"].text()
+    assert "MAVLink packets=2" in widget.gnss_base_status_labels["rtcm_bandwidth"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_gnss_base_satellite_quality_updates_diagnostic_labels(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget._handle_gnss_base_satellite_quality(
+        {
+            "tracked": 19,
+            "used": 12,
+            "avg_cno_dbhz": 36.5,
+            "low_cno": 2,
+            "low_elevation": 3,
+            "constellations": {"GPS": 6, "Galileo": 5, "BeiDou": 4, "GLONASS": 4},
+        }
+    )
+
+    assert widget.gnss_base_quality_labels["satellites"].text() == "used=12 tracked=19"
+    assert "avg C/N0=36.5 dBHz" in widget.gnss_base_quality_labels["signal"].text()
+    assert "low<30=2" in widget.gnss_base_quality_labels["signal"].text()
+    assert widget.gnss_base_quality_labels["elevation"].text() == "low<15deg=3"
+    assert "GPS 6" in widget.gnss_base_quality_labels["constellations"].text()
+    assert "GLONASS 4" in widget.gnss_base_quality_labels["constellations"].text()
 
     widget.deleteLater()
     _ = app
@@ -534,6 +614,8 @@ def test_gnss_base_survey_in_visualization_updates_from_nav_svin(monkeypatch) ->
     assert connection_group.minimumHeight() >= 190
     widget.gnss_base_survey_duration_spin.setValue(100)
     widget.gnss_base_survey_accuracy_spin.setValue(0.25)
+    monotonic_times = iter((100.0, 160.0, 220.0))
+    monkeypatch.setattr(gui.time, "monotonic", lambda: next(monotonic_times))
 
     widget._handle_gnss_base_survey_in(
         {
@@ -549,7 +631,8 @@ def test_gnss_base_survey_in_visualization_updates_from_nav_svin(monkeypatch) ->
     )
 
     assert widget.gnss_base_survey_progress_bar.value() == 25
-    assert "active 25%" in widget.gnss_base_survey_progress_bar.text()
+    assert widget.gnss_base_survey_progress_bar.text() == "active | time 25% | accuracy pending"
+    assert "수렴: collecting trend" in widget.gnss_base_survey_convergence_label.text()
     assert "current=0.5000m" in widget.gnss_base_survey_accuracy_label.text()
     assert "obs=42" in widget.gnss_base_survey_accuracy_label.text()
     assert any(point.series == "accuracy" and point.value == 0.5 for point in widget.gnss_base_survey_accuracy_plot.points)
@@ -558,6 +641,20 @@ def test_gnss_base_survey_in_visualization_updates_from_nav_svin(monkeypatch) ->
         point.series == "observations" and point.value == 42.0
         for point in widget.gnss_base_survey_observation_plot.points
     )
+
+    widget._handle_gnss_base_survey_in(
+        {
+            "active": True,
+            "valid": False,
+            "duration_s": 150,
+            "mean_accuracy_m": 0.5,
+            "observations": 60,
+        }
+    )
+
+    assert widget.gnss_base_survey_progress_bar.value() == 100
+    assert widget.gnss_base_survey_progress_bar.text() == "active | time ok | accuracy pending"
+    assert "수렴: stagnant 60s" in widget.gnss_base_survey_convergence_label.text()
 
     widget._handle_gnss_base_survey_in(
         {
@@ -570,7 +667,8 @@ def test_gnss_base_survey_in_visualization_updates_from_nav_svin(monkeypatch) ->
     )
 
     assert widget.gnss_base_survey_progress_bar.value() == 100
-    assert "valid 100%" in widget.gnss_base_survey_progress_bar.text()
+    assert widget.gnss_base_survey_progress_bar.text() == "valid | time ok | accuracy ok"
+    assert "수렴: complete" in widget.gnss_base_survey_convergence_label.text()
 
     widget.deleteLater()
     _ = app
@@ -4862,7 +4960,7 @@ def test_session_save_omits_pixhawk_mag_csv(tmp_path, monkeypatch) -> None:
         time.sleep(0.01)
 
     session_dir = tmp_path / "recordings" / "sessions" / "20260605_153012"
-    csv_path = session_dir / "20260605_153012.csv"
+    csv_path = session_dir / "20260605_153012_distance_measurements.csv"
     xlsx_path = session_dir / "20260605_153012.xlsx"
     mag_path = session_dir / "alignment" / "pixhawk_mag_status.csv"
     assert csv_path.exists()
@@ -4870,13 +4968,19 @@ def test_session_save_omits_pixhawk_mag_csv(tmp_path, monkeypatch) -> None:
     assert not mag_path.exists()
     assert sorted(path.name for path in session_dir.iterdir()) == [
         ".generations",
-        "20260605_153012.csv",
         "20260605_153012.xlsx",
-        "camera_left.csv",
-        "camera_right.csv",
+        "20260605_153012_camera_left.csv",
+        "20260605_153012_camera_left.parquet",
+        "20260605_153012_camera_right.csv",
+        "20260605_153012_camera_right.parquet",
+        "20260605_153012_distance_measurements.csv",
+        "20260605_153012_distance_measurements.parquet",
+        "20260605_153012_px4_left.csv",
+        "20260605_153012_px4_left.parquet",
+        "20260605_153012_px4_right.csv",
+        "20260605_153012_px4_right.parquet",
+        "20260605_153012_session_static.json",
         "published",
-        "px4_left.csv",
-        "px4_right.csv",
         "session_manifest.json",
     ]
 
@@ -5659,6 +5763,7 @@ def test_baseline_alignment_tab_collects_gps_and_computes_baseline(monkeypatch) 
         "MAG 관리",
         "Baseline 계산",
         "Baseline / 자세 정렬",
+        "Optical 정렬",
     ]
     assert widget.alignment_tabs.tabText(widget.baseline_alignment_tab_index) == "Baseline 계산"
     assert widget.advanced_tabs.tabText(widget.advanced_baseline_field_tab_index) == "Baseline 필드"
@@ -5954,6 +6059,7 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     ]
     assert [widget.calibration_tabs.tabText(index) for index in range(widget.calibration_tabs.count())] == [
         "체커보드",
+        "체커보드 검증/계산",
         "줌 내부 파라미터",
     ]
     assert [widget.alignment_tabs.tabText(index) for index in range(widget.alignment_tabs.count())] == [
@@ -5963,6 +6069,7 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
         "MAG 관리",
         "Baseline 계산",
         "Baseline / 자세 정렬",
+        "Optical 정렬",
     ]
     assert [widget.pixhawk_tabs.tabText(index) for index in range(widget.pixhawk_tabs.count())] == [
         "요약",
@@ -5997,7 +6104,9 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert widget.parameter_tabs.tabText(widget.extrinsic_parameters_tab_index) == "외부/기하"
     assert widget.parameter_tabs.tabText(widget.stereo_settings_tab_index) == "계산 설정"
     assert widget.calibration_tabs.tabText(widget.checkerboard_calibration_tab_index) == "체커보드"
+    assert widget.calibration_tabs.tabText(widget.checkerboard_validation_tab_index) == "체커보드 검증/계산"
     assert widget.calibration_tabs.tabText(widget.zoom_intrinsics_tab_index) == "줌 내부 파라미터"
+    assert widget.alignment_tabs.tabText(widget.optical_alignment_tab_index) == "Optical 정렬"
     assert widget.intrinsics_settings_group.isCheckable()
     assert widget.intrinsics_settings_group.isChecked()
     assert widget.extrinsics_settings_group.title() == "기본: 외부 파라미터 / Baseline"
@@ -6036,11 +6145,26 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     assert "source: active calibration result for zoom" in widget.zoom_right_intrinsics_text.toPlainText()
 
     widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("checkerboard"))
+    left_effective_extrinsic_text = widget.left_extrinsics_text.toPlainText()
+    right_effective_extrinsic_text = widget.right_extrinsics_text.toPlainText()
     assert widget._distance_mode() == "checkerboard"
     assert widget._triangulation_extrinsics_source_label() == "체커보드 Stereo 외부 파라미터"
     assert widget._active_baseline_m()[1] == "checkerboard"
     assert widget._measurement_path_label() == "3D ray 거리: 체커보드 Stereo 외부 파라미터 사용"
     assert widget.mount_assumption_label.text().startswith("장착 가정: 체커보드")
+    assert "Left Effective Extrinsic" in left_effective_extrinsic_text
+    assert "Right Effective Extrinsic" in right_effective_extrinsic_text
+    assert "mode: checkerboard stereo R/T" in left_effective_extrinsic_text
+    assert "mode: checkerboard stereo R/T" in right_effective_extrinsic_text
+    assert "source: applied checkerboard stereo extrinsics" in left_effective_extrinsic_text
+    assert "source: applied checkerboard stereo extrinsics" in right_effective_extrinsic_text
+    assert "used_for_triangulation: true" in left_effective_extrinsic_text
+    assert "used_for_triangulation: true" in right_effective_extrinsic_text
+    assert "origin_in_left_rdf_m: 0.000000000, 0.000000000, 0.000000000" in left_effective_extrinsic_text
+    assert "translation_right_in_left_m: -0.300000000, -0.000997000, 0.001999000" in right_effective_extrinsic_text
+    assert "Live Pixhawk diagnostic only" in left_effective_extrinsic_text
+    assert "source: MAVLink (mavlink/ATTITUDE)" in left_effective_extrinsic_text
+    assert "used_for_triangulation: false" in left_effective_extrinsic_text
     session_metadata = widget._recording_session_metadata()
     assert session_metadata["schema_version"] == "stereowiris-paired-frame-v2"
     assert session_metadata["calculation"]["triangulation_extrinsics_source"] == "checkerboard"
@@ -6061,6 +6185,69 @@ def test_camera_parameters_tab_shows_intrinsics_and_live_extrinsics() -> None:
     _ = app
 
 
+def test_optical_alignment_tab_reports_live_bbox_residuals(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.calibration import (
+        CameraIntrinsics,
+        CheckerboardConfig,
+        StereoExtrinsics,
+        StereoIntrinsicsResult,
+    )
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setattr(gui, "load_settings", lambda: gui.AppSettings(auto_load_intrinsics=False))
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.last_calibration_result = StereoIntrinsicsResult(
+        left=CameraIntrinsics(
+            width=1280,
+            height=720,
+            camera_matrix=[[900.0, 0.0, 640.0], [0.0, 900.0, 360.0], [0.0, 0.0, 1.0]],
+            distortion_coefficients=[0.0],
+            reprojection_error_px=0.2,
+            image_count=20,
+        ),
+        right=CameraIntrinsics(
+            width=1280,
+            height=720,
+            camera_matrix=[[900.0, 0.0, 640.0], [0.0, 900.0, 365.0], [0.0, 0.0, 1.0]],
+            distortion_coefficients=[0.0],
+            reprojection_error_px=0.2,
+            image_count=20,
+        ),
+        board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.03),
+        extrinsics=StereoExtrinsics(
+            rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation_left_to_right_m=[-0.3, 0.0, 0.0],
+            reprojection_error_px=0.2,
+            pair_count=20,
+        ),
+    )
+    widget.apply_intrinsics_to_distance()
+    widget.distance_mode_combo.setCurrentIndex(widget.distance_mode_combo.findData("checkerboard"))
+    widget.optical_expected_dy_combo.setCurrentIndex(widget.optical_expected_dy_combo.findData("raw_intrinsics"))
+    widget.optical_target_distance_spin.setValue(10.0)
+
+    widget._update_detection("left", detection("left", x1=630, y1=340, x2=650, y2=360, t=10.0))
+    widget._update_detection("right", detection("right", x1=576, y1=347, x2=596, y2=367, t=10.0))
+
+    assert widget.alignment_tabs.tabText(widget.optical_alignment_tab_index) == "Optical 정렬"
+    assert "Optical alignment:" in widget.optical_alignment_status_label.text()
+    assert "x=640.0, y=350.0" in widget.optical_alignment_labels["left_center"].text()
+    assert "x=586.0, y=357.0" in widget.optical_alignment_labels["right_center"].text()
+    assert "dx=+54.000 px, dy=-7.000 px" in widget.optical_alignment_labels["bbox_delta"].text()
+    assert "-5.000 px" in widget.optical_alignment_labels["expected_dy"].text()
+    assert "-2.000 px" in widget.optical_alignment_labels["dy_residual"].text()
+    assert "target=10.00 m" in widget.optical_alignment_labels["expected_disparity"].text()
+    assert "checkerboard:" in widget.optical_alignment_labels["baseline"].text()
+    assert widget.optical_alignment_labels["range"].text() != "대기 중"
+    assert widget.optical_alignment_note_label.text().startswith("Alignment preview only")
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_checkerboard_zoom_controls_are_above_calibration_and_collapsible(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
@@ -6076,9 +6263,7 @@ def test_checkerboard_zoom_controls_are_above_calibration_and_collapsible(monkey
     app.processEvents()
 
     zoom_group = widget.findChild(QtWidgets.QGroupBox, "checkerboardZoomControlGroup")
-    calibration_group = next(
-        group for group in widget.findChildren(QtWidgets.QGroupBox) if group.title() == "체커보드 내부 파라미터 보정"
-    )
+    calibration_group = next(group for group in widget.findChildren(QtWidgets.QGroupBox) if group.title() == "체커보드 캡처")
 
     assert zoom_group is not None
     assert zoom_group.isCheckable()
@@ -6089,6 +6274,7 @@ def test_checkerboard_zoom_controls_are_above_calibration_and_collapsible(monkey
     assert widget.calib_rows_spin.value() == 8
     assert widget.calib_square_spin.value() == 40.0
     assert widget.calib_min_images_spin.value() == 20
+    assert widget.calibration_tabs.tabText(widget.checkerboard_validation_tab_index) == "체커보드 검증/계산"
 
     calib_form = calibration_group.layout()
     assert isinstance(calib_form, QtWidgets.QGridLayout)
@@ -6098,19 +6284,17 @@ def test_checkerboard_zoom_controls_are_above_calibration_and_collapsible(monkey
         assert index >= 0
         return calib_form.getItemPosition(index)
 
-    assert calib_form.rowCount() == 2
     assert form_position(widget.calib_cols_spin) == (0, 1, 1, 1)
     assert form_position(widget.calib_rows_spin) == (0, 3, 1, 1)
     assert form_position(widget.calib_square_spin) == (0, 5, 1, 1)
-    assert form_position(widget.calib_min_images_spin) == (0, 7, 1, 1)
     assert form_position(widget.calib_dir_edit) == (1, 1, 1, 5)
     assert form_position(widget.capture_calibration_button) == (1, 6, 1, 1)
-    assert form_position(widget.run_calibration_button) == (1, 7, 1, 1)
+    assert calib_form.indexOf(widget.run_calibration_button) == -1
     assert widget.calibration_status_label.objectName() == "statusStrip"
     assert calib_form.indexOf(widget.calibration_status_label) == -1
     assert widget.calibration_status_label.geometry().top() > calibration_group.geometry().bottom()
 
-    for column, label_text in ((0, "내부 열"), (2, "내부 행"), (4, "격자 크기"), (6, "최소 이미지")):
+    for column, label_text in ((0, "내부 열"), (2, "내부 행"), (4, "격자 크기")):
         label = calib_form.itemAtPosition(0, column).widget()
         assert label.text() == label_text
         assert label.property("compactFormLabel") is True
@@ -6121,10 +6305,13 @@ def test_checkerboard_zoom_controls_are_above_calibration_and_collapsible(monkey
         widget.calib_cols_spin,
         widget.calib_rows_spin,
         widget.calib_square_spin,
-        widget.calib_min_images_spin,
         widget.calib_dir_edit,
     ):
         assert field.property("compactFormField") is True
+    assert widget.calib_min_images_spin.parentWidget().title() == "계산 / 검증"
+    assert widget.run_calibration_button.text() == "전체 사진으로 계산"
+    assert widget.checkerboard_validation_save_button.text() == "계산 결과 저장"
+    assert widget.checkerboard_validation_apply_button.text() == "계산에 적용"
 
     zoom_group.setChecked(False)
     app.processEvents()
@@ -6273,6 +6460,150 @@ def test_calibration_capture_rejects_stereo_pair_when_rtcp_delta_is_large(tmp_pa
     assert not (root / "right" / "right_001.png").exists()
     assert "pair=rejected" in widget.calibration_status_label.text()
     assert "exceeds 50.0 ms" in widget.calibration_status_label.text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_checkerboard_validation_pixhawk_mode_uses_intrinsics_only_and_applies_mode(tmp_path, monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.calibration import CameraIntrinsics, StereoExtrinsics
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "save_settings", lambda settings: None)
+    monkeypatch.setattr(gui, "opencv_available", lambda: (True, None))
+    root = tmp_path / "calibration_captures"
+    for side in ("left", "right"):
+        directory = root / side
+        directory.mkdir(parents=True)
+        for index in range(1, 5):
+            (directory / f"{side}_{index:03d}.png").write_text("fake")
+
+    stereo_calls = []
+
+    def fake_calibrate(paths, _config):
+        first = paths[0].name
+        fx = 900.0 if first.startswith("left_") else 910.0
+        return CameraIntrinsics(
+            width=1280,
+            height=720,
+            camera_matrix=[[fx, 0.0, 640.0], [0.0, fx + 1.0, 360.0], [0.0, 0.0, 1.0]],
+            distortion_coefficients=[0.0],
+            reprojection_error_px=0.4,
+            image_count=len(paths),
+        )
+
+    def fake_stereo(*args, **kwargs):
+        stereo_calls.append((args, kwargs))
+        return StereoExtrinsics(
+            rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation_left_to_right_m=[-0.3, 0.0, 0.0],
+            reprojection_error_px=0.2,
+            pair_count=4,
+        )
+
+    monkeypatch.setattr(gui, "calibrate_camera_from_images", fake_calibrate)
+    monkeypatch.setattr(gui, "calibrate_stereo_extrinsics_from_image_pairs", fake_stereo)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.calib_dir_edit.setText(str(root))
+    widget.checkerboard_validation_root_edit.setText(str(root))
+    widget.checkerboard_validation_mode_combo.setCurrentIndex(
+        widget.checkerboard_validation_mode_combo.findData("pixhawk")
+    )
+
+    widget.run_intrinsic_calibration()
+
+    assert widget.checkerboard_validation_result is not None
+    assert widget.checkerboard_validation_result.extrinsics is None
+    assert stereo_calls == []
+    assert "Extrinsics: not computed" in widget.calibration_result_text.toPlainText()
+
+    widget.save_checkerboard_validation_result()
+    assert (root / "intrinsics_zoom_10.json").exists()
+    widget.apply_checkerboard_validation_result()
+
+    assert widget.active_intrinsics is widget.checkerboard_validation_result
+    assert widget.distance_mode_combo.currentData() == "pixhawk"
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_checkerboard_validation_checkerboard_mode_uses_stereo_pairs_and_random_validation(tmp_path, monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    from wiris_stereo_distance.calibration import CameraIntrinsics, StereoExtrinsics
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "save_settings", lambda settings: None)
+    monkeypatch.setattr(gui, "opencv_available", lambda: (True, None))
+    root = tmp_path / "calibration_captures"
+    (root / "left").mkdir(parents=True)
+    (root / "right").mkdir(parents=True)
+    for index in range(1, 7):
+        (root / "left" / f"left_{index:03d}.png").write_text("fake")
+        if index <= 5:
+            (root / "right" / f"right_{index:03d}.png").write_text("fake")
+    calls = {"calibrate": [], "stereo": []}
+
+    def fake_calibrate(paths, _config):
+        calls["calibrate"].append([path.name for path in paths])
+        first = paths[0].name
+        fx = 900.0 if first.startswith("left_") else 910.0
+        return CameraIntrinsics(
+            width=1280,
+            height=720,
+            camera_matrix=[[fx + len(paths), 0.0, 640.0], [0.0, fx + len(paths), 360.0], [0.0, 0.0, 1.0]],
+            distortion_coefficients=[0.0],
+            reprojection_error_px=0.3 + len(paths) * 0.01,
+            image_count=len(paths),
+        )
+
+    def fake_stereo(left_paths, right_paths, _config, _left, _right):
+        calls["stereo"].append(([path.name for path in left_paths], [path.name for path in right_paths]))
+        return StereoExtrinsics(
+            rotation_left_to_right=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            translation_left_to_right_m=[-0.3 - len(left_paths) * 0.001, 0.0, 0.0],
+            reprojection_error_px=0.2 + len(left_paths) * 0.01,
+            pair_count=len(left_paths),
+        )
+
+    monkeypatch.setattr(gui, "calibrate_camera_from_images", fake_calibrate)
+    monkeypatch.setattr(gui, "calibrate_stereo_extrinsics_from_image_pairs", fake_stereo)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.calib_dir_edit.setText(str(root))
+    widget.checkerboard_validation_root_edit.setText(str(root))
+    widget.checkerboard_validation_mode_combo.setCurrentIndex(
+        widget.checkerboard_validation_mode_combo.findData("checkerboard")
+    )
+    widget.checkerboard_validation_random_runs_spin.setValue(3)
+    widget.checkerboard_validation_random_pair_count_spin.setValue(3)
+    widget.checkerboard_validation_seed_spin.setValue(123)
+
+    widget.scan_checkerboard_validation_files()
+    widget.run_intrinsic_calibration()
+    widget.run_checkerboard_random_validation()
+
+    assert "stereo_pair=5" in widget.checkerboard_validation_scan_label.text()
+    assert widget.checkerboard_validation_result is not None
+    assert widget.checkerboard_validation_result.extrinsics is not None
+    assert widget.checkerboard_validation_result.extrinsics.pair_count == 5
+    assert all("left_006.png" not in names for names in calls["calibrate"])
+    assert len(calls["stereo"]) == 4
+    assert "Random stereo-pair validation" in widget.calibration_result_text.toPlainText()
+    assert "Random 1" in widget.calibration_result_text.toPlainText()
+
+    widget.apply_checkerboard_validation_result()
+
+    assert widget.active_intrinsics is widget.checkerboard_validation_result
+    assert widget.distance_mode_combo.currentData() == "checkerboard"
 
     widget.deleteLater()
     _ = app
@@ -7488,11 +7819,13 @@ def test_time_tab_stream_sync_status_reports_rtcp_pc_offsets(monkeypatch) -> Non
     widget.camera_frame_metadata["left"] = {
         "timestamp_s": 109.5,
         "rtcp_frame_ntp_unix_s": 1_800_000_009.510,
+        "rtcp_sr_received_count": 4,
         "timestamp_reference": "rtcp-ntp",
     }
     widget.camera_frame_metadata["right"] = {
         "timestamp_s": 109.5,
         "rtcp_frame_ntp_unix_s": 1_800_000_009.530,
+        "rtcp_sr_received_count": 5,
         "timestamp_reference": "rtcp-ntp",
     }
 
@@ -7502,6 +7835,8 @@ def test_time_tab_stream_sync_status_reports_rtcp_pc_offsets(monkeypatch) -> Non
     detail = widget.clock_sync_summary_text.toPlainText()
     assert "좌우 RTCP/NTPΔ=+20.0 ms" in status
     assert "PC UTC 최대 offset=30.0 ms" in status
+    assert "RTCP SR 수신: L=4 R=5" in status
+    assert "RTCP SR 수신: L=4 R=5" in detail
     assert "왼쪽: offset=+10.0 ms" in detail
     assert "오른쪽: offset=+30.0 ms" in detail
     assert "불량" not in status
@@ -8641,9 +8976,9 @@ def test_distance_history_plot_delete_removes_recorded_sample_from_panel(monkeyp
     assert len(widget.distance_recording_keys) == 1
     assert float(widget.distance_recording_rows[0]["recording_elapsed_s"]) >= 2.0
     assert widget.distance_history[-1].recording_elapsed_s is not None
-    measurements = recording_sheet(widget, "Measurements")
+    measurements = recording_sheet(widget, "DistanceMeasurements")
     assert measurements.rowCount() == 1
-    assert sheet_cell(measurements, 0, "distance_m") == "5.400000"
+    assert sheet_cell(measurements, 0, "distance_m") == "5.4"
 
     point = widget.distance_history[-1]
     assert point.class_name == "person"
@@ -8658,7 +8993,7 @@ def test_distance_history_plot_delete_removes_recorded_sample_from_panel(monkeyp
     assert len(widget.distance_history) == 0
     assert len(widget.distance_recording_rows) == 0
     assert len(widget.distance_recording_keys) == 0
-    assert recording_sheet(widget, "Measurements").rowCount() == 0
+    assert recording_sheet(widget, "DistanceMeasurements").rowCount() == 0
     assert widget.distance_plot._selected_point_text() is None
     assert widget.recording_status_label.text() == "세션 기록: 진행 중, 매칭 프레임쌍=0"
 
@@ -8683,12 +9018,12 @@ def test_recording_sheet_tabs_mirror_the_session_workbook_sheets() -> None:
     assert tab_names == [preview.name for preview in session_sheet_previews({}, [])]
     assert tab_names == [
         "Summary",
-        "Measurements",
-        "GPS",
-        "Attitude",
-        "Baseline",
-        "Quality",
-        "Calibration",
+        "DistanceMeasurements",
+        "CameraLeft",
+        "CameraRight",
+        "Px4Left",
+        "Px4Right",
+        "CalibrationStatic",
     ]
     assert not hasattr(widget, "recording_sample_table")
 
@@ -8713,13 +9048,11 @@ def test_recording_sheet_columns_follow_the_recorded_rows() -> None:
         }
     ]
 
-    gps = recording_sheet(widget, "GPS")
-    assert sheet_cell(gps, 0, "gps_latitude_deg") == "37.1"
-    baseline = recording_sheet(widget, "Baseline")
-    assert sheet_cell(baseline, 0, "baseline_length_m") == "0.3"
-    # A GPS-only field must not leak into the Baseline projection.
+    measurements = recording_sheet(widget, "DistanceMeasurements")
+    assert sheet_cell(measurements, 0, "distance_m") == "5.0"
+    assert sheet_cell(measurements, 0, "baseline_m") == "0.3"
     with pytest.raises(AssertionError):
-        sheet_cell(baseline, 0, "gps_latitude_deg")
+        sheet_cell(measurements, 0, "gps_latitude_deg")
 
     summary = recording_sheet(widget, "Summary")
     assert [summary.horizontalHeaderItem(c).text() for c in range(summary.columnCount())] == [
@@ -8770,20 +9103,20 @@ def test_recording_sample_table_shows_live_csv_fields(monkeypatch) -> None:
         measurement_attempt=attempt,
     )
 
-    measurements = recording_sheet(widget, "Measurements")
+    measurements = recording_sheet(widget, "DistanceMeasurements")
     assert measurements.rowCount() == 1
-    assert sheet_cell(measurements, 0, "distance_m") == "6.000000"
-    assert sheet_cell(recording_sheet(widget, "Quality"), 0, "quality") == "GOOD"
-    # "yaw" routes this field to Attitude, not Quality.
-    assert sheet_cell(recording_sheet(widget, "Attitude"), 0, "relative_yaw_deg") == "3.000000"
-    measurements = recording_sheet(widget, "Measurements")
+    assert sheet_cell(measurements, 0, "distance_m") == "6.0"
+    assert sheet_cell(measurements, 0, "quality") == "GOOD"
+    with pytest.raises(AssertionError):
+        sheet_cell(measurements, 0, "relative_yaw_deg")
+    measurements = recording_sheet(widget, "DistanceMeasurements")
     measurements.selectRow(0)
     assert "distance_m: 6.000000" in widget.recording_sample_detail.toPlainText()
     assert "warnings: low baseline confidence" in widget.recording_sample_detail.toPlainText()
 
     widget.clear_distance_history()
 
-    assert recording_sheet(widget, "Measurements").rowCount() == 0
+    assert recording_sheet(widget, "DistanceMeasurements").rowCount() == 0
     assert widget.recording_sample_detail.toPlainText() == ""
 
     widget.deleteLater()
@@ -8914,17 +9247,23 @@ def test_stop_session_writes_pair_workbook_and_device_timeline_csvs(tmp_path, mo
     assert widget._session_save_thread is None
     assert widget.distance_recording_enabled is False
     assert widget.video_recording_enabled is False
-    assert (output_dir / f"{session_id}.csv").is_file()
+    assert (output_dir / f"{session_id}_distance_measurements.csv").is_file()
     assert (output_dir / f"{session_id}.xlsx").is_file()
     assert sorted(path.name for path in output_dir.iterdir()) == [
         ".generations",
-        f"{session_id}.csv",
         f"{session_id}.xlsx",
-        "camera_left.csv",
-        "camera_right.csv",
+        f"{session_id}_camera_left.csv",
+        f"{session_id}_camera_left.parquet",
+        f"{session_id}_camera_right.csv",
+        f"{session_id}_camera_right.parquet",
+        f"{session_id}_distance_measurements.csv",
+        f"{session_id}_distance_measurements.parquet",
+        f"{session_id}_px4_left.csv",
+        f"{session_id}_px4_left.parquet",
+        f"{session_id}_px4_right.csv",
+        f"{session_id}_px4_right.parquet",
+        f"{session_id}_session_static.json",
         "published",
-        "px4_left.csv",
-        "px4_right.csv",
         "session_manifest.json",
     ]
 
@@ -8980,7 +9319,7 @@ def test_stop_save_is_async_and_spooled_device_rows_are_not_lost(tmp_path, monke
         app.processEvents()
         time.sleep(0.01)
     assert widget._session_save_thread is None
-    with (output_dir / "camera_left.csv").open(newline="", encoding="utf-8") as handle:
+    with (output_dir / f"{session_id}_camera_left.csv").open(newline="", encoding="utf-8") as handle:
         assert [int(row["sequence"]) for row in csv.DictReader(handle)] == list(range(50))
     assert not (output_dir / ".spool").exists()
 
@@ -9040,7 +9379,7 @@ def test_pair_spool_and_record_table_stay_bounded_for_long_session(tmp_path, mon
 
     assert len(rows) == 1000
     assert rows.preview_count == gui.RECORDING_PREVIEW_LIMIT
-    measurements = recording_sheet(widget, "Measurements")
+    measurements = recording_sheet(widget, "DistanceMeasurements")
     assert measurements.rowCount() == gui.RECORDING_PREVIEW_LIMIT
     assert int(sheet_cell(measurements, 0, "sample_index") or 0) >= 0
     rows.close()
@@ -9088,7 +9427,7 @@ def test_live_save_worker_finishes_before_panel_close_is_accepted(tmp_path, monk
     widget.closeEvent(event)
 
     assert event.isAccepted() is True
-    assert (tmp_path / session_id / f"{session_id}.csv").is_file()
+    assert (tmp_path / session_id / f"{session_id}_distance_measurements.csv").is_file()
     deadline = time.monotonic() + 2.0
     while widget._session_save_thread is not None and time.monotonic() < deadline:
         app.processEvents()
@@ -9143,7 +9482,7 @@ def test_gui_discovers_and_loads_retryable_pair_spool_after_restart(tmp_path, mo
     assert widget._recover_retryable_recording_session() is True
     assert widget.recording_session_id == "restart-session"
     assert len(widget.distance_recording_rows) == 6
-    assert recording_sheet(widget, "Measurements").rowCount() == 6
+    assert recording_sheet(widget, "DistanceMeasurements").rowCount() == 6
     assert widget.record_button.isEnabled() is False
     assert widget.save_history_button.isEnabled() is True
     widget.left_url_edit.setText("rtsp://changed-after-restart/live")

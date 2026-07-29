@@ -7,6 +7,7 @@
 - `usage.md`: 실행과 운용 안내.
 - `PROJECT.md`: 프로젝트 목적, 현재 구조, 측정 흐름, 현장 워크플로, 분리 계획.
 - `COORDINATE_CONTRACT.md`: 좌표계, 축 이름과 Raw CSV 필드 계약.
+- `Calibration.md`: nominal/corrected nominal 보정 탐색과 truth/reference 사용 계약.
 - `DESIGN.md`: UI/스타일 기준.
 - `DESIGN-ibm.md`: IBM/Carbon 계열 원본 디자인 레퍼런스.
 - `AGENTS.md`: 코딩 에이전트 작업 규칙.

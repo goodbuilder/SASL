@@ -134,6 +134,11 @@ def rmse(values: Sequence[float]) -> float:
     return float(math.sqrt(np.mean(arr * arr))) if arr.size else float("nan")
 
 
+def percentile(values: Sequence[float], q: float) -> float:
+    arr = np.asarray(values, dtype=float)
+    return float(np.percentile(arr, q)) if arr.size else float("nan")
+
+
 def load_profile(path: Path) -> EstimatedToTruthSim3Profile | EstimatedToTruthDisparityProfile | EstimatedToTruthAffineProfile:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("mode") == EstimatedToTruthSim3Profile.mode:
@@ -261,8 +266,16 @@ def replay_rows(
         "public_topic_contract": PUBLIC_TOPIC_CONTRACT,
         "validation_range_rmse_raw_m": rmse(raw_range_errors),
         "validation_range_rmse_corrected_m": rmse(corrected_range_errors),
+        "validation_range_median_abs_raw_m": percentile([abs(value) for value in raw_range_errors], 50),
+        "validation_range_median_abs_corrected_m": percentile([abs(value) for value in corrected_range_errors], 50),
+        "validation_range_p90_abs_raw_m": percentile([abs(value) for value in raw_range_errors], 90),
+        "validation_range_p90_abs_corrected_m": percentile([abs(value) for value in corrected_range_errors], 90),
         "validation_position_rmse_raw_m": rmse([np.linalg.norm(value) for value in raw_axis]),
         "validation_position_rmse_corrected_m": rmse([np.linalg.norm(value) for value in corrected_axis]),
+        "validation_position_median_raw_m": percentile([np.linalg.norm(value) for value in raw_axis], 50),
+        "validation_position_median_corrected_m": percentile([np.linalg.norm(value) for value in corrected_axis], 50),
+        "validation_position_p90_raw_m": percentile([np.linalg.norm(value) for value in raw_axis], 90),
+        "validation_position_p90_corrected_m": percentile([np.linalg.norm(value) for value in corrected_axis], 90),
         "validation_right_rmse_raw_m": rmse(raw_axis[:, 0]) if raw_axis.size else float("nan"),
         "validation_right_rmse_corrected_m": rmse(corrected_axis[:, 0]) if corrected_axis.size else float("nan"),
         "validation_down_rmse_raw_m": rmse(raw_axis[:, 1]) if raw_axis.size else float("nan"),

@@ -15,6 +15,7 @@ from stereo_ground_sim.coordinate_frames import build_baseline_center_frd, nomin
 from sasl_common.stereo_geometry import PinholeIntrinsics
 from stereo_ground_sim.stereo_distance_node import (
     dkl_ideal_pixels_from_world,
+    reference_ray_world_enu_from_point,
     ray_visualization_world_enu_from_triangulation,
 )
 
@@ -64,6 +65,30 @@ def test_dkl_ideal_pixels_project_world_enu_reference_through_nominal_cameras() 
     assert 0.0 <= pixels[3] < 720.0
 
 
+def test_rviz_reference_ray_can_display_points_outside_dkl_pixel_bounds() -> None:
+    left, right = nominal_camera_poses(25.0, 5.0)
+    frame = build_baseline_center_frd(
+        left.center_world_enu_m,
+        right.center_world_enu_m,
+        left.forward_world_enu,
+        right.forward_world_enu,
+    )
+    point_world = frame.point_to_world((1000.0, 0.0, -120.0))
+    intrinsics = PinholeIntrinsics(fx_px=6400.0, fy_px=6400.0, cx_px=640.0, cy_px=360.0)
+
+    assert dkl_ideal_pixels_from_world(point_world, left, right, intrinsics, 1280, 720) is None
+    geometry = reference_ray_world_enu_from_point(frame, left, right, point_world)
+
+    assert geometry is not None
+    assert geometry["computation_status"] == "computed"
+    assert geometry["ray_visualization_world_enu"]["left_target_world_enu_m"] == pytest.approx(
+        point_world
+    )
+    assert geometry["ray_visualization_world_enu"]["right_target_world_enu_m"] == pytest.approx(
+        point_world
+    )
+
+
 def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> None:
     launcher = (ROOT_DIR / "run_operator_view.sh").read_text(encoding="utf-8")
     launch = (ROOT_DIR / "stereo_ground_sim" / "launch" / "stereo_ground_sim.launch.py").read_text(
@@ -99,6 +124,7 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     assert "stereo_rays_optical: true" in rviz
     assert "stereo_rays_ideal: true" in rviz
     assert "stereo_cameras: true" in rviz
+    assert "stereo_camera_fov: false" in rviz
     assert "stereo_actual_drone: true" in rviz
 
 
@@ -112,6 +138,7 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     assert "rviz_live_latest_only" in source
     assert "rviz_live_ray_hz" in source
     assert "self._publish_ray_metrics(nominal=raw, optical=optical)" in source
+    assert "self._publish_ray_metrics(\n                        nominal=raw," in source
     assert "if not self._rviz_latest_only_markers_enabled()" in source
     assert 'self.create_publisher(MarkerArray, "/stereo/ray_markers", ray_marker_qos)' in source
     assert "durability=DurabilityPolicy.TRANSIENT_LOCAL" in source
@@ -123,6 +150,10 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     assert 'camera.ns = "stereo_cameras"' in source
     assert "camera.type = Marker.CUBE" in source
     assert "camera_result = optical if optical is not None else nominal" in source
+    assert "faces.type = Marker.TRIANGLE_LIST" in source
+    assert "edges.type = Marker.LINE_LIST" in source
+    assert 'faces.ns = "stereo_camera_fov"' in source
+    assert "faces.color.a = 0.12" in source
     assert 'marker.ns = "stereo_actual_drone"' in source
     assert "marker.type = Marker.MESH_RESOURCE" in source
     assert "marker.mesh_use_embedded_materials = False" in source

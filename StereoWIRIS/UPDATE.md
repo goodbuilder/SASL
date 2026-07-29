@@ -1,5 +1,104 @@
 # 업데이트 기록
 
+## 2026-07-28 — 세션 저장 파일 리소스별 compact CSV/Parquet 분리
+
+- 변경:
+  - 세션 저장 산출물을 `<session_id>_session_static.json`, `<session_id>_distance_measurements.csv/.parquet`, `<session_id>_camera_left/right.csv/.parquet`, `<session_id>_px4_left/right.csv/.parquet`, `<session_id>.xlsx`로 재구성했다.
+  - 공통 시간축은 `recording_time_ns` 하나로 정리했다. 이 값은 `세션 기록 시작` 기준 경과 시간이며 int64 ns로 저장한다.
+  - CSV/XLSX는 사람이 확인하기 쉬운 compact 컬럼만 저장하고, 고정된 세션 조건은 `session_static.json`에 한 번만 저장한다.
+  - XLSX sheet를 `Summary`, `DistanceMeasurements`, `CameraLeft`, `CameraRight`, `Px4Left`, `Px4Right`, `CalibrationStatic` 구성으로 바꿨다.
+  - Parquet 저장을 위해 runtime dependency에 `pyarrow`를 추가하고 `run.sh --check`에서 import/version을 확인한다.
+- 이유:
+  - 기존 wide CSV는 고정값, 계약 설명, 중복 alias, 디버그 provenance가 매 row마다 반복되어 분석 파일이 지나치게 넓고 시간 precision도 CSV/Excel 경로에서 흔들릴 수 있었기 때문이다.
+- 확인:
+  - `recording_session.py` 단위 테스트와 GUI 세션 저장/미리보기 집중 테스트를 새 파일 구조 기준으로 갱신해 통과시켰다.
+
+## 2026-07-28 — 체커보드 검증/계산 탭 분리
+
+- 변경:
+  - `보정`에 `체커보드 검증/계산` 세부탭을 추가하고, `체커보드` 세부탭은 줌 제어·pattern 설정·캡처·preview 중심의 촬영 전용 화면으로 정리했다.
+  - 새 탭에서 사진셋 root 스캔, 기존 intrinsics JSON 불러오기, `Pixhawk 자세 + GPS/RTK baseline`용 intrinsics-only 계산, `체커보드 Stereo 외부 파라미터`용 intrinsics+stereo R/T 계산을 분리했다.
+  - `랜덤 검증`은 matching stereo pair subset만 사용해 3회 기본 반복하고 Full 대비 intrinsics delta, baseline delta, rotation delta, 표준편차를 결과 텍스트에 표시한다.
+  - `계산 결과 저장`과 `계산에 적용` 버튼을 새 탭에 별도로 추가했다. 적용 시 선택한 계산 방식에 따라 거리 계산 모드를 Pixhawk 또는 checkerboard로 전환한다.
+- 이유:
+  - Pixhawk 모드에서는 새 stereo R/T가 필요 없고 기존/새 intrinsics만으로 충분하므로, 촬영·계산·적용 단계를 분리해 잘못된 외부 파라미터 적용을 피하기 위해서다.
+- 확인:
+  - Pixhawk intrinsics-only 계산/저장/적용, checkerboard stereo-pair 계산, 랜덤 검증 결과 표시 회귀 테스트를 추가했다.
+
+## 2026-07-28 — Optical 정렬 preview 탭 추가
+
+- 변경:
+  - `정렬` 탭 마지막에 `Optical 정렬` 세부탭을 추가했다.
+  - 현재 YOLO matched target의 좌/우 bbox 중심, signed `dx/dy`, expected `dy`, dy residual, vertical mrad, expected disparity, yaw residual, yaw mrad, YOLO Range, ray gap, baseline/triangulation/attitude 상태를 표시한다.
+  - expected `dy` 기준은 `Rectified 0 px`, raw intrinsics `left_cy - right_cy`, manual 입력 중 선택할 수 있고, yaw residual 계산용 target distance 입력을 제공한다.
+- 이유:
+  - 30x에서 같은 target을 보며 물리적으로 카메라 pitch/roll/yaw를 조절할 때, bbox residual과 거리 계산 영향을 한 화면에서 확인하기 위해서다.
+- 확인:
+  - Optical 정렬 탭 생성 및 live bbox residual 표시 회귀 테스트를 추가했다.
+
+## 2026-07-28 — Live Extrinsic 계산 모드 연동 표시
+
+- 변경:
+  - `파라미터 > 외부/기하`의 Left/Right extrinsic 표시를 `계산 설정`의 외부 파라미터 소스와 연동했다.
+  - Pixhawk 모드에서는 기존처럼 live Pixhawk 자세를 보여주고, 체커보드 모드에서는 실제 삼각측량에 쓰는 applied checkerboard stereo `R/T` 기준의 left reference/right-in-left RDF 값을 보여준다.
+  - 체커보드 모드에서 Pixhawk telemetry는 같은 패널 안에 `diagnostic only` 및 `used_for_triangulation: false`로 명시한다.
+- 이유:
+  - 체커보드 stereo R/T를 계산에 쓰는 상황에서 `Live Extrinsic` 패널이 Pixhawk 자세만 보여주면 실제 사용 중인 외부 파라미터를 오해할 수 있기 때문이다.
+- 확인:
+  - 파라미터 탭 회귀 테스트로 Pixhawk 모드 표시와 체커보드 모드 effective extrinsic 표시 전환을 검증했다.
+
+## 2026-07-28 — GNSS Base RTCM 보정 데이터 관찰 UI
+
+- 변경:
+  - `정렬 > GNSS Base`에 `RTCM 보정 데이터` 그룹을 추가해 RTCM frame 수/fps/kB/s/age, message type 누적 수, Left/Right 주입 frame/byte/fail, MAVLink packet/평균 frame/max frame을 표시한다.
+  - RTCM3 frame payload의 message type을 파싱해 `1005:1`, `1077:3` 같은 요약으로 보여준다.
+  - RTCM 수신/주입 통계는 Base serial 연결 시 초기화되고, frame 수신 및 Rover 주입 결과마다 갱신된다.
+- 이유:
+  - PC가 RTCM을 직접 위치 계산에 쓰지는 않지만 Base correction 생성과 Rover transport가 정상인지 같은 탭에서 확인하기 위해서다.
+- 확인:
+  - RTCM3 message type parser와 RTCM 수신/주입 통계 라벨 회귀 테스트로 표시 경로를 검증했다.
+
+## 2026-07-28 — GNSS Base Survey-in 진단 UI 확장
+
+- 변경:
+  - `정렬 > GNSS Base`에 Survey-in 수렴 진단 라벨을 추가해 최근 accuracy 개선량, ETA, improving/slow/stagnant 상태를 표시한다.
+  - `Survey-in 품질 진단` 그룹을 추가해 UBX `NAV-SAT` 기반 used/tracked 위성 수, 평균 C/N0, 낮은 C/N0 수, 낮은 고도각 수, constellation 요약을 표시한다.
+  - GNSS Base 화면 배치 기준을 `docs/DESIGN.md`와 `docs/usage.md`에 반영했다.
+- 이유:
+  - Survey-in이 느릴 때 단순히 더 기다리는 대신, 수렴 정체인지 수신 품질 문제인지 현장에서 빠르게 판단할 수 있게 하기 위해서다.
+- 확인:
+  - NAV-SAT 품질 parser, 품질 진단 라벨, Survey-in 수렴 진단 회귀 테스트로 표시 경로를 검증했다.
+
+## 2026-07-28 — WIRIS RTCP Sender Report 누적 수 표시
+
+- 변경:
+  - GStreamer RTCP Sender Report가 새로 갱신될 때마다 SSRC별 누적 수신 수를 증가시켜 프레임 metadata에 `rtcp_sr_received_count`로 싣는다.
+  - `시간 > RTCP/NTP 동기화 확인` 상태 라벨과 상세 텍스트에 `RTCP SR 수신: L=... R=...`를 함께 표시한다.
+- 이유:
+  - RTCP/NTP 값이 보이지 않거나 오래된 것처럼 보일 때, 실제 Sender Report가 계속 들어오는지 시간 탭에서 바로 확인하기 위해서다.
+- 확인:
+  - RTCP metadata count 전달 테스트와 시간 탭 상태 표시 회귀 테스트로 좌/우 누적 수 표시를 검증했다.
+
+## 2026-07-28 — 최대 Δt 기본값 100 ms 적용
+
+- 변경:
+  - YOLO 좌/우 매칭 게이트의 `최대 Δt` 기본값을 0.1 s로 변경했다.
+  - 새 설정 파일 생성 시의 `AppSettings` 기본값과 현재 `stereo_distance_settings.json`의 저장값을 0.1 s로 맞췄다.
+  - live stereo relative gate 문서의 기본 기준을 100 ms로 갱신했다.
+- 이유:
+  - 기본 50 ms 운용보다 프레임쌍 매칭 허용 폭을 넓혀 sparse detection 상황에서 좌/우 매칭 실패를 줄이기 위해서다.
+- 확인:
+  - 설정 기본값 회귀 테스트로 missing-settings 생성 시 `yolo_gate_max_time_delta_s == 0.1`을 검증했다.
+
+## 2026-07-28 — GNSS Base Survey-in 진행률 문구 명확화
+
+- 변경:
+  - Survey-in 진행 막대 문구를 `active 100%`처럼 전체 완료율로 오해될 수 있는 형식에서 `active | time ok | accuracy pending`처럼 시간 조건과 정확도 조건을 분리한 형식으로 바꿨다.
+- 이유:
+  - Survey-in 완료는 최소 시간과 목표 정확도 조건이 모두 만족되어야 하므로, 시간 진행률 100%만으로 완료 상태처럼 보이지 않게 하기 위해서다.
+- 확인:
+  - Survey-in 시각화 집중 회귀 테스트로 active/time-ok/accuracy-pending 및 valid/time-ok/accuracy-ok 표시를 검증했다.
+
 ## v3.0.0 — 2026-07-24 — baseline_center_frd 공개 좌표 전환
 
 - 변경:

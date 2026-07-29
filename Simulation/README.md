@@ -237,6 +237,27 @@ PX4 local position은 `north/east/down` 순서의 NED이고, Gazebo world/model 
 스테레오 중심 카메라의 `right/down/forward` RDF는 서로 다른 frame이다. SITL
 설치 자체는 이 좌표 변환을 변경하지 않는다.
 
+## Operator recording outputs
+
+rqt operator panel의 `Save CSV`는 `bags/operator_YYYYMMDD_HHMMSS_lite/` 아래에
+세션을 저장한다. 기존 호환 원본인 `telemetry.csv`는 계속 생성하지만, 후처리는
+고정값과 시간 변동값을 분리한 compact 산출물을 우선 사용한다.
+
+고정 세션 데이터는 `session_static.json`에 한 번만 저장한다. 여기에는
+`axis_contract`, recorder mode, CSV/video rate, 카메라 장착 진단에서 온 static
+mount 값, mission/config 관련 환경 snapshot, compact output schema가 포함된다.
+
+시간에 따라 변하는 최소 데이터는 다음 CSV로 분리된다.
+
+- `distance_measurements.csv`: truth FRDR, raw/corrected/optical/ideal FRDR, raw GPS baseline 핵심 값.
+- `ray_summary.csv`: 시간축 row에 대해 `F`, `Rt`, `D`, `Rg` 순서로 truth/nominal/optical/ideal ray midpoint와 gap을 배치한다.
+- `detections.csv`: left/right bbox, confidence, center, disparity, YOLO raw range.
+- `px4_uam.csv`, `px4_left.csv`, `px4_right.csv`: PX4 GPS/global position/local NED odometry와 World ENU attitude의 compact timeline.
+
+`session_manifest.json`은 각 artifact role, source `telemetry.csv` SHA-256, row count를
+machine-readable하게 기록한다. `session.xlsx`, `progress.json`, `manifest.txt`도 기존
+운용 호환을 위해 계속 생성된다.
+
 ## 구성
 
 - 카메라: 지상 고정 2대
@@ -6408,5 +6429,6 @@ python3 Simulation/scripts/check_non_alias_selector_deployment_readiness.py \
 2026-06-18 이후 `run_rtk_stereo_robustness_sweep.py`는 scenario catalog가 PASS이면 위 selector package와 deployment frontier를 자동으로 생성한다. 별도 export 명령 없이 단일 robustness sweep 결과의 `robustness_summary.json|txt`에 `runtime_label_selector_package` 섹션이 기록된다. 이 산출물은 robustness acceptance matrix의 `runtime_label_selector_package` 항목에도 포함되며, selector export `PASS`, frontier `PASS`, operator-view launch dry-run `PASS`, profile/label count 양수, runtime truth `false`를 모두 만족해야 전체 robustness acceptance가 PASS다. Smoke evidence는 `Simulation/results/non_alias_robustness_auto_selector_operator_gate_smoke`이며, 2개 non-alias synthetic scenario에서 direct NED-to-RDF alias 금지 `2/2`, selector export `PASS`, frontier `PASS`, operator launch `7/7 PASS`, runtime truth `false`, final robustness acceptance `PASS`를 확인했다.
 
 중요: synthetic mode에서도 카메라 optical frame이 local NED에 대해 `forward=north`, `right=east`, `down=down`으로 정렬되어 있다고 가정하면 안 된다. `truth_rdf`는 explicit `T_source_to_stereo_rdf` 또는 이미 stereo-frame truth를 내는 producer에서만 와야 하며, 직접 alias `rdf_right=east`, `rdf_down=down`, `rdf_forward=north`는 현재 gate에서 금지된다. 평가는 계속 stereo-center RDF(right,down,forward)에서 수행하고, StereoDistance public topic은 별도 FRD+range(forward,right,down,range) 계약으로 변환된다.
+- 2026-07-28: operator `Save CSV` 세션이 기존 `telemetry.csv` 호환 원본에 더해 `session_static.json`, compact `distance_measurements.csv`, `ray_summary.csv`, `detections.csv`, `px4_uam.csv`, `px4_left.csv`, `px4_right.csv`, `session_manifest.json`을 Stop 시 생성하도록 했다. 고정 config/static mount 값은 JSON에 한 번만 저장하고, 후처리용 시간축 CSV는 최소 동적 컬럼만 담는다.
 - 2026-06-11: EXP009 `bounded_gain_forward_cell_guard` JSON profile을 StereoDistance runtime loader에서 지원하도록 추가했습니다. 보수 Down guard를 적용한 EXP013은 5-trial Simulation Runtime 검증 `PASS`이며, 아직 hardware/WIRIS 검증은 아닙니다.
 - 2026-06-09: YOLO inference 기본 입력 크기를 `1280`으로 통일했습니다.

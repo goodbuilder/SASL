@@ -153,6 +153,7 @@ class PanelBridge(QObject):
     sample = Signal(str, list)
     scalar = Signal(str, object)
     detections = Signal(list)
+    ray_metrics = Signal(str)
     profile = Signal(str)
     px4_raw_gps = Signal(str, object)
     px4_global_position = Signal(str, object)
@@ -539,6 +540,31 @@ class LiveSavedCsvPreview(QWidget):
             ),
         ),
         (
+            "Ray summary",
+            (
+                ("time_sec", "Time (s)"),
+                ("drone_forward_m", "F truth"),
+                ("nominal_ray_midpoint_forward_m", "F nominal"),
+                ("optical_ray_midpoint_forward_m", "F optical"),
+                ("ideal_ray_midpoint_forward_m", "F ideal"),
+                ("drone_right_m", "Rt truth"),
+                ("nominal_ray_midpoint_right_m", "Rt nominal"),
+                ("optical_ray_midpoint_right_m", "Rt optical"),
+                ("ideal_ray_midpoint_right_m", "Rt ideal"),
+                ("drone_down_m", "D truth"),
+                ("nominal_ray_midpoint_down_m", "D nominal"),
+                ("optical_ray_midpoint_down_m", "D optical"),
+                ("ideal_ray_midpoint_down_m", "D ideal"),
+                ("ground_truth_m", "Rg truth"),
+                ("nominal_ray_range_m", "Rg nominal"),
+                ("optical_ray_range_m", "Rg optical"),
+                ("ideal_ray_range_m", "Rg ideal"),
+                ("nominal_ray_gap_m", "Gap nominal"),
+                ("optical_ray_gap_m", "Gap optical"),
+                ("ideal_ray_gap_m", "Gap ideal"),
+            ),
+        ),
+        (
             "Left PX4",
             (
                 ("time_sec", "Time (s)"),
@@ -885,6 +911,57 @@ class LiveSavedCsvPreview(QWidget):
         for source, field in field_map.items():
             if source in parsed:
                 self._live_latest[field] = self._format_csv_value(parsed.get(source))
+        self._refresh_live_preview()
+
+    def update_live_ray_metrics(self, payload):
+        try:
+            parsed = json.loads(str(payload))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(parsed, dict):
+            return
+        for field in (
+            "ideal_left_u_px",
+            "ideal_left_v_px",
+            "ideal_right_u_px",
+            "ideal_right_v_px",
+            "ideal_disparity_px",
+            "ideal_pixel_source",
+        ):
+            if field in parsed:
+                self._live_latest[field] = self._format_csv_value(parsed.get(field))
+        for ray_type in ("nominal", "optical", "ideal"):
+            ray = parsed.get(ray_type)
+            if not isinstance(ray, dict):
+                continue
+            prefix = f"{ray_type}_ray"
+            self._live_latest[f"{prefix}_computation_status"] = self._format_csv_value(
+                ray.get("computation_status", "")
+            )
+            for key in (
+                "forward_m",
+                "right_m",
+                "down_m",
+                "range_m",
+                "gap_m",
+                "intersection_angle_deg",
+                "left_depth_m",
+                "right_depth_m",
+            ):
+                if key in ray:
+                    self._live_latest[f"{prefix}_{key}"] = self._format_csv_value(ray.get(key))
+            for source_key, field_middle in (
+                ("left_point_frd_m", "left_point"),
+                ("right_point_frd_m", "right_point"),
+                ("midpoint_frd_m", "midpoint"),
+            ):
+                values = ray.get(source_key)
+                if not isinstance(values, (list, tuple)) or len(values) < 3:
+                    continue
+                for axis, value in zip(("forward", "right", "down"), values[:3]):
+                    self._live_latest[f"{prefix}_{field_middle}_{axis}_m"] = (
+                        self._format_csv_value(value)
+                    )
         self._refresh_live_preview()
 
     def update_live_px4_raw_gps(self, label, msg):
@@ -1368,7 +1445,7 @@ class FrdPlotStack(QWidget):
                 painter.drawLine(legend_x, legend_y, legend_x + 20, legend_y)
                 painter.setPen(QPen(QColor(32, 32, 32), 1))
                 painter.drawText(legend_x + 35, legend_y + 5, SERIES_LABELS[series_name])
-                legend_y += 20
+                legend_y += 24
 
             for series_name, _topic, color in SERIES:
                 points = [
@@ -1445,6 +1522,7 @@ class OperatorPanel(Plugin):
         self._bridge.sample.connect(self._handle_sample)
         self._bridge.scalar.connect(self._handle_scalar)
         self._bridge.detections.connect(self._handle_detections)
+        self._bridge.ray_metrics.connect(self._handle_ray_metrics)
         self._bridge.profile.connect(self._handle_profile)
         self._bridge.px4_raw_gps.connect(self._handle_px4_raw_gps)
         self._bridge.px4_global_position.connect(self._handle_px4_global_position)
@@ -1608,6 +1686,9 @@ class OperatorPanel(Plugin):
         self._facts.update_profile(payload)
         self._record_preview.update_live_profile(payload)
 
+    def _handle_ray_metrics(self, payload):
+        self._record_preview.update_live_ray_metrics(payload)
+
     def _handle_px4_raw_gps(self, label, msg):
         self._record_preview.update_live_px4_raw_gps(label, msg)
 
@@ -1695,6 +1776,12 @@ class OperatorPanel(Plugin):
                 String,
                 "/stereo/profile_status",
                 lambda msg: self._bridge.profile.emit(msg.data),
+                10,
+            )
+            self._ros_node.create_subscription(
+                String,
+                "/stereo/ray_metrics",
+                lambda msg: self._bridge.ray_metrics.emit(msg.data),
                 10,
             )
             if SensorGps is not None and VehicleGlobalPosition is not None and VehicleOdometry is not None:

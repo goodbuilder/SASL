@@ -22,8 +22,11 @@ from stereo_ground_sim.time_alignment import (
 
 
 class Logger:
+    def __init__(self):
+        self.warnings = []
+
     def warning(self, _message):
-        pass
+        self.warnings.append(str(_message))
 
 
 def _node() -> StereoDistanceNode:
@@ -49,8 +52,17 @@ def _node() -> StereoDistanceNode:
     node.measurement_queue_depth_min = None
     node.measurement_queue_depth_max = 0
     node.stale_pre_reset_count = 0
-    node.get_logger = lambda: Logger()
+    node.image_reorder_lead_limit_ns = 20_000_000
+    node.logger = Logger()
+    node.get_logger = lambda: node.logger
     return node
+
+
+def _image_message(stamp_ns: int):
+    sec, nanosec = divmod(int(stamp_ns), 1_000_000_000)
+    return SimpleNamespace(
+        header=SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=nanosec))
+    )
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
@@ -82,3 +94,23 @@ def test_callback_parsed_before_shutdown_is_rejected_inside_condition(monkeypatc
     assert node.measurement_pair_queue == deque()
     assert node.pending_gt_aligner._pending == deque()
     assert node.input_rejected_after_shutdown_count == 1
+
+
+def test_image_one_clock_tick_ahead_is_accepted() -> None:
+    node = _node()
+
+    node._left_cb(_image_message(10 + 16_000_000))
+
+    assert node.image_pairer.left_received_count == 1
+    assert node.stale_pre_reset_count == 0
+    assert node.logger.warnings == []
+
+
+def test_image_beyond_reorder_tolerance_is_rejected() -> None:
+    node = _node()
+
+    node._left_cb(_image_message(10 + 21_000_000))
+
+    assert node.image_pairer.left_received_count == 0
+    assert node.stale_pre_reset_count == 1
+    assert "by 21000000 ns; ignored" in node.logger.warnings[-1]

@@ -216,6 +216,7 @@ def test_rtcp_sender_report_interval_logging_triggers_on_new_sr() -> None:
 
     assert tracker._register_sender_report(first) is None
     message = tracker._register_sender_report(second)
+    assert tracker._sr_count_by_ssrc[1234] == 2
     assert message == (
         "[RTCP] Sender Report 갱신: ssrc=1234, interval=2.50s, ntp=102.000000"
         ", ntp_rate=0.800000, media_rate=0.000044"
@@ -249,6 +250,7 @@ def test_repeated_sender_report_keeps_its_original_arrival_timestamps() -> None:
 
     tracker._register_sender_report(first)
     assert tracker._register_sender_report(same_report_polled_later) is None
+    assert tracker._sr_count_by_ssrc[1234] == 1
 
     stored = tracker._sr_by_ssrc[1234]
     # Otherwise rtcp_sr_age_s would report ~0 s forever and could never expose
@@ -368,6 +370,7 @@ def test_rtp_timing_tracker_keeps_relative_timestamp_when_pc_utc_is_invalid() ->
             received_monotonic_s=0.9,
             received_wall_s=100.0,
         )
+        tracker._sr_count_by_ssrc[1234] = 7
 
     metadata = tracker.frame_metadata(
         SimpleNamespace(pts=1_000_000_000),
@@ -379,6 +382,7 @@ def test_rtp_timing_tracker_keeps_relative_timestamp_when_pc_utc_is_invalid() ->
     assert abs(float(metadata["rtcp_frame_ntp_unix_s"]) - 99.0) < 1e-9
     assert abs(float(metadata["rtcp_sr_pc_offset_s"]) + 2.0) < 1e-9
     assert abs(float(metadata["rtcp_frame_receive_delay_s"]) - 1.0) < 1e-9
+    assert metadata["rtcp_sr_received_count"] == 7
     assert "rtcp_timing_invalid_reason" not in metadata
 
 

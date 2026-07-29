@@ -59,6 +59,13 @@ StereoWIRIS의 UI는 IBM/Carbon 계열을 참고한 현장 운용 대시보드�
 - `wiris_stereo_distance/measurement_widgets.py`: 거리/삼각측량 그래프.
 - `wiris_stereo_distance/camera_pane.py`: 영상 오버레이 강조색.
 
+## 화면별 정보 배치
+
+- `정렬 > GNSS Base`는 설정, Base 연결 상태, RTCM 보정 데이터, Rover RTK 상태, Survey-in 진행, Survey-in 품질 진단 순서로 배치한다. RTCM 보정 데이터는 Base correction이 생성되고 Rover로 주입되는 transport 상태를 보여주며, Survey-in 진행은 완료 여부와 수렴 추세를 보여주고, 품질 진단은 NAV-SAT 기반 used/tracked 위성 수, C/N0, 고도각, constellation 요약처럼 "왜 안 끝나는지" 판단하는 보조 정보를 둔다.
+- `보정 > 체커보드`는 줌 제어, 체커보드 pattern 설정, 저장 경로, 캡처, 좌/우 preview만 둔 촬영 전용 화면으로 유지한다. 사진셋 기반 계산, 기존 JSON 불러오기, random stability validation, 저장, 적용은 `보정 > 체커보드 검증/계산`에서만 수행해 현장 캡처와 파라미터 적용 단계를 혼동하지 않게 한다.
+- `정렬 > Optical 정렬`은 물리적 카메라 R 조절용 preview-only 화면으로 둔다. 상단에는 계산 파라미터를 변경하지 않는다는 상태를 표시하고, 본문은 좌/우 target 관측값, vertical/pitch residual, horizontal/yaw residual, live 거리 영향 순서로 배치한다. 영상 미리보기보다 `dx/dy`, expected `dy`, expected disparity, residual px/mrad, YOLO Range, ray gap, baseline/triangulation source 같은 판단 수치를 우선한다.
+- `파라미터 > 외부/기하`의 좌/우 extrinsic 패널은 `계산 설정`의 외부 파라미터 소스와 같은 의미를 표시한다. Pixhawk 모드에서는 live Pixhawk 자세를 보여주고, 체커보드 모드에서는 실제 삼각측량에 쓰는 applied checkerboard stereo `R/T`의 left reference/right-in-left RDF 값을 보여준다. 체커보드 모드의 Pixhawk telemetry는 같은 패널 안에 diagnostic-only로만 표시한다.
+
 ## 금지 또는 제한
 
 - 보라/파랑 그라데이션 중심의 장식 테마는 사용하지 않는다.

@@ -157,6 +157,15 @@ def test_camera_px4_sensors_include_nonzero_noise_for_px4_freshness() -> None:
         assert all(float(base.findtext(path)) > 0.0 for path in noise_paths)
 
 
+def test_camera_px4_sensors_use_sdf_defined_elements_only() -> None:
+    root = ET.parse(PACKAGE_ROOT / "worlds" / "stereo_ground_drone.sdf").getroot()
+    for model_name in ("left_stereo_camera", "right_stereo_camera"):
+        model = _camera_model(root, model_name)
+        base = model.find("./link[@name='base_link']")
+        assert base is not None
+        assert base.findall(".//gz_frame_id") == []
+
+
 def test_px4_frd_errors_are_explicitly_converted_to_gazebo_flu() -> None:
     nominal_yaw = math.pi / 2.0
     roll, pitch, yaw = sdf_link_rpy_from_px4_frd_error(

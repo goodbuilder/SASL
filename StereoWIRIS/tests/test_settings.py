@@ -38,6 +38,7 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.yolo_gate_matching_enabled is False
     assert settings.yolo_gate_time_delta_enabled is False
     assert settings.yolo_gate_vertical_delta_enabled is False
+    assert settings.yolo_gate_max_time_delta_s == 0.1
     assert settings.yolo_gate_time_basis == "camera_rtcp"
     assert settings.ros_domain_id == 0
     assert settings.pixhawk_host_address == "10.0.0.10"

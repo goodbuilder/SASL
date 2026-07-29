@@ -550,6 +550,127 @@ RAYS_SHEET_FIELDS = (
     "midpoint_down_m",
 )
 
+COMPACT_DISTANCE_FIELDS = (
+    "time_sec",
+    "ros_time_sec",
+    "ground_truth_m",
+    "drone_forward_m",
+    "drone_right_m",
+    "drone_down_m",
+    "raw_forward_m",
+    "raw_right_m",
+    "raw_down_m",
+    "raw_range_m",
+    "corrected_forward_m",
+    "corrected_right_m",
+    "corrected_down_m",
+    "corrected_range_m",
+    "optical_forward_m",
+    "optical_right_m",
+    "optical_down_m",
+    "optical_range_m",
+    "ideal_forward_m",
+    "ideal_right_m",
+    "ideal_down_m",
+    "ideal_range_m",
+    "raw_gps_baseline_forward_m",
+    "raw_gps_baseline_right_m",
+    "raw_gps_baseline_down_m",
+    "raw_gps_baseline_position_error_m",
+)
+
+COMPACT_RAY_SUMMARY_FIELDS = (
+    "time_sec",
+    "ros_time_sec",
+    "truth_forward_m",
+    "nominal_forward_m",
+    "optical_forward_m",
+    "ideal_forward_m",
+    "truth_right_m",
+    "nominal_right_m",
+    "optical_right_m",
+    "ideal_right_m",
+    "truth_down_m",
+    "nominal_down_m",
+    "optical_down_m",
+    "ideal_down_m",
+    "truth_Rg_m",
+    "nominal_Rg_m",
+    "optical_Rg_m",
+    "ideal_Rg_m",
+    "nominal_ray_gap_m",
+    "optical_ray_gap_m",
+    "ideal_ray_gap_m",
+    "nominal_ray_intersection_angle_deg",
+    "optical_ray_intersection_angle_deg",
+    "ideal_ray_intersection_angle_deg",
+)
+
+COMPACT_DETECTION_FIELDS = (
+    "time_sec",
+    "ros_time_sec",
+    "left_valid",
+    "left_x1",
+    "left_y1",
+    "left_x2",
+    "left_y2",
+    "left_confidence",
+    "left_cx",
+    "left_cy",
+    "right_valid",
+    "right_x1",
+    "right_y1",
+    "right_x2",
+    "right_y2",
+    "right_confidence",
+    "right_cx",
+    "right_cy",
+    "raw_disparity_px",
+    "yolo_measurement_raw_range_m",
+)
+
+
+def _compact_px4_fields(label):
+    prefix = "uam" if label == "uam" else label
+    fields = [
+        "time_sec",
+        "ros_time_sec",
+        f"{prefix}_raw_gps_timestamp_us",
+        f"{prefix}_raw_gps_lat_deg",
+        f"{prefix}_raw_gps_lon_deg",
+        f"{prefix}_raw_gps_alt_msl_m",
+        f"{prefix}_global_position_timestamp_us",
+        f"{prefix}_global_position_lat_deg",
+        f"{prefix}_global_position_lon_deg",
+        f"{prefix}_global_position_alt_msl_m",
+        f"{prefix}_px4_odometry_timestamp_us",
+        f"{prefix}_px4_position_n_m",
+        f"{prefix}_px4_position_e_m",
+        f"{prefix}_px4_position_d_m",
+        f"{prefix}_px4_attitude_world_enu_roll_deg",
+        f"{prefix}_px4_attitude_world_enu_pitch_deg",
+        f"{prefix}_px4_attitude_world_enu_yaw_deg",
+    ]
+    if label in ("left", "right"):
+        fields.extend(
+            [
+                f"{prefix}_px4_estimated_optical_world_enu_x_m",
+                f"{prefix}_px4_estimated_optical_world_enu_y_m",
+                f"{prefix}_px4_estimated_optical_world_enu_z_m",
+                f"{prefix}_px4_estimated_optical_world_enu_roll_deg",
+                f"{prefix}_px4_estimated_optical_world_enu_pitch_deg",
+                f"{prefix}_px4_estimated_optical_world_enu_yaw_deg",
+            ]
+        )
+    return tuple(fields)
+
+
+COMPACT_PX4_FIELDS = {
+    "uam": _compact_px4_fields("uam"),
+    "left": _compact_px4_fields("left"),
+    "right": _compact_px4_fields("right"),
+}
+
 XLSX_SHEET_FIELDS = XLSX_DIRECT_SHEET_FIELDS + (("Rays", RAYS_SHEET_FIELDS),)
 
 DEBUG_BAG_TOPICS = [
@@ -692,6 +813,195 @@ def _ray_sheet_has_data(values):
     return any(str(value).strip() for value in values[3:])
 
 
+def _write_json_atomic(path, payload):
+    output = Path(path)
+    temporary = output.with_name(f"{output.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(output)
+
+
+def _write_csv_atomic(path, rows, fields):
+    output = Path(path)
+    temporary = output.with_name(f"{output.name}.tmp")
+    row_count = 0
+    with temporary.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fields})
+            row_count += 1
+    temporary.replace(output)
+    return row_count
+
+
+def _has_any_compact_data(row, fields):
+    return any(str(row.get(field, "")).strip() for field in fields[2:])
+
+
+def _compact_distance_row(row):
+    return {field: row.get(field, "") for field in COMPACT_DISTANCE_FIELDS}
+
+
+def _compact_detection_row(row):
+    return {field: row.get(field, "") for field in COMPACT_DETECTION_FIELDS}
+
+
+def _compact_px4_row(row, label):
+    return {field: row.get(field, "") for field in COMPACT_PX4_FIELDS[label]}
+
+
+def _compact_ray_summary_row(row):
+    compact = {
+        "time_sec": row.get("time_sec", ""),
+        "ros_time_sec": row.get("ros_time_sec", ""),
+        "truth_forward_m": row.get("drone_forward_m", ""),
+        "truth_right_m": row.get("drone_right_m", ""),
+        "truth_down_m": row.get("drone_down_m", ""),
+        "truth_Rg_m": row.get("ground_truth_m", ""),
+    }
+    for ray_type in RAY_TYPES:
+        compact[f"{ray_type}_forward_m"] = row.get(f"{ray_type}_ray_midpoint_forward_m", "")
+        compact[f"{ray_type}_right_m"] = row.get(f"{ray_type}_ray_midpoint_right_m", "")
+        compact[f"{ray_type}_down_m"] = row.get(f"{ray_type}_ray_midpoint_down_m", "")
+        compact[f"{ray_type}_Rg_m"] = row.get(f"{ray_type}_ray_range_m", "")
+        compact[f"{ray_type}_ray_gap_m"] = row.get(f"{ray_type}_ray_gap_m", "")
+        compact[f"{ray_type}_ray_intersection_angle_deg"] = row.get(
+            f"{ray_type}_ray_intersection_angle_deg", ""
+        )
+    return compact
+
+
+def _session_static_payload(*, mode, csv_hz=None, video_fps=None, manifest_rows=()):
+    static_values = {str(key): value for key, value in manifest_rows}
+    env_keys = (
+        "SIM_CONFIG",
+        "SIM_SCENARIO_CONFIG",
+        "DRONE_SPAWN_X_M",
+        "DRONE_SPAWN_Y_M",
+        "DRONE_SPAWN_Z_M",
+        "DRONE_SPAWN_YAW_DEG",
+        "DRONE_TAKEOFF_ALTITUDE_M",
+        "DRONE_FORWARD_SPEED_MPS",
+        "WAYPOINTS_XY_ALT_M",
+        "WAYPOINT_SPEED_MPS",
+        "WAYPOINT_ACCEPTANCE_RADIUS_M",
+        "RQT_MISSION_LABEL",
+        "RQT_COORD_CONTRACT",
+    )
+    env_snapshot = {
+        key: os.environ.get(key, "")
+        for key in env_keys
+        if os.environ.get(key, "") != ""
+    }
+    return {
+        "file_type": "simulation_operator_session_static",
+        "schema_version": "1",
+        "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "mode": mode,
+        "axis_contract": AXIS_CONTRACT,
+        "csv_hz": csv_hz,
+        "video_fps": video_fps,
+        "static_values": static_values,
+        "environment": env_snapshot,
+        "compact_outputs": {
+            "distance_measurements": list(COMPACT_DISTANCE_FIELDS),
+            "ray_summary": list(COMPACT_RAY_SUMMARY_FIELDS),
+            "detections": list(COMPACT_DETECTION_FIELDS),
+            "px4_uam": list(COMPACT_PX4_FIELDS["uam"]),
+            "px4_left": list(COMPACT_PX4_FIELDS["left"]),
+            "px4_right": list(COMPACT_PX4_FIELDS["right"]),
+        },
+    }
+
+
+def export_compact_session_files(csv_path, session_dir, *, mode, csv_hz=None, video_fps=None, manifest_rows=()):
+    """Export minimal time-varying CSVs plus one static JSON from telemetry.csv."""
+    source = Path(csv_path)
+    output_dir = Path(session_dir)
+    outputs = {
+        "session_static": output_dir / "session_static.json",
+        "distance_measurements": output_dir / "distance_measurements.csv",
+        "ray_summary": output_dir / "ray_summary.csv",
+        "detections": output_dir / "detections.csv",
+        "px4_uam": output_dir / "px4_uam.csv",
+        "px4_left": output_dir / "px4_left.csv",
+        "px4_right": output_dir / "px4_right.csv",
+        "manifest": output_dir / "session_manifest.json",
+    }
+    with source.open(newline="", encoding="utf-8") as handle:
+        source_rows = list(csv.DictReader(handle))
+
+    distance_rows = [_compact_distance_row(row) for row in source_rows]
+    ray_rows = [
+        compact
+        for compact in (_compact_ray_summary_row(row) for row in source_rows)
+        if _has_any_compact_data(compact, COMPACT_RAY_SUMMARY_FIELDS)
+    ]
+    detection_rows = [
+        compact
+        for compact in (_compact_detection_row(row) for row in source_rows)
+        if _has_any_compact_data(compact, COMPACT_DETECTION_FIELDS)
+    ]
+    px4_rows = {
+        label: [
+            compact
+            for compact in (_compact_px4_row(row, label) for row in source_rows)
+            if _has_any_compact_data(compact, COMPACT_PX4_FIELDS[label])
+        ]
+        for label in ("uam", "left", "right")
+    }
+
+    _write_json_atomic(
+        outputs["session_static"],
+        _session_static_payload(
+            mode=mode,
+            csv_hz=csv_hz,
+            video_fps=video_fps,
+            manifest_rows=manifest_rows,
+        ),
+    )
+    row_counts = {
+        "source_telemetry": len(source_rows),
+        "distance_measurements": _write_csv_atomic(
+            outputs["distance_measurements"], distance_rows, COMPACT_DISTANCE_FIELDS
+        ),
+        "ray_summary": _write_csv_atomic(outputs["ray_summary"], ray_rows, COMPACT_RAY_SUMMARY_FIELDS),
+        "detections": _write_csv_atomic(outputs["detections"], detection_rows, COMPACT_DETECTION_FIELDS),
+        "px4_uam": _write_csv_atomic(outputs["px4_uam"], px4_rows["uam"], COMPACT_PX4_FIELDS["uam"]),
+        "px4_left": _write_csv_atomic(outputs["px4_left"], px4_rows["left"], COMPACT_PX4_FIELDS["left"]),
+        "px4_right": _write_csv_atomic(outputs["px4_right"], px4_rows["right"], COMPACT_PX4_FIELDS["right"]),
+    }
+    artifact_roles = {
+        outputs["session_static"].name: "session_static_json",
+        outputs["distance_measurements"].name: "compact_distance_measurements_csv",
+        outputs["ray_summary"].name: "compact_ray_summary_csv",
+        outputs["detections"].name: "compact_detections_csv",
+        outputs["px4_uam"].name: "compact_px4_uam_csv",
+        outputs["px4_left"].name: "compact_px4_left_csv",
+        outputs["px4_right"].name: "compact_px4_right_csv",
+        source.name: "legacy_wide_telemetry_csv",
+    }
+    manifest = {
+        "status": "finalized",
+        "schema_version": "1",
+        "mode": mode,
+        "axis_contract": AXIS_CONTRACT,
+        "source_csv": source.name,
+        "source_csv_sha256": _sha256(source),
+        "row_counts": row_counts,
+        "artifact_roles": artifact_roles,
+    }
+    _write_json_atomic(outputs["manifest"], manifest)
+    return {
+        "outputs": outputs,
+        "row_counts": row_counts,
+        "manifest": manifest,
+    }
+
+
 def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
     """Create an atomic, purpose-tab XLSX mirror of finalized telemetry.csv."""
     try:
@@ -803,6 +1113,8 @@ class OperatorRecorder(Node):
         self.last_elapsed_sec = 0.0
         self.xlsx_status = "pending"
         self.xlsx_error = ""
+        self.compact_status = "pending"
+        self.compact_error = ""
         self.csv_file = None
         self.csv_writer = None
         self.video_writers = {}
@@ -835,6 +1147,9 @@ class OperatorRecorder(Node):
             f"csv=telemetry.csv",
             f"csv_hz={self.csv_hz:g}",
             "progress=progress.json",
+            "session_static=session_static.json (fixed session/config facts written once at Stop)",
+            "compact_csvs=distance_measurements.csv,ray_summary.csv,detections.csv,px4_uam.csv,px4_left.csv,px4_right.csv",
+            "session_manifest=session_manifest.json",
             "xlsx=session.xlsx (generated from finalized telemetry.csv at Stop)",
             "analysis_export=analysis.csv (optional compact user export; telemetry.csv remains raw)",
             f"axis_contract={AXIS_CONTRACT}",
@@ -1440,6 +1755,8 @@ class OperatorRecorder(Node):
             "valid_row_counts": self.valid_row_counts,
             "xlsx_status": getattr(self, "xlsx_status", "unavailable"),
             "xlsx_error": getattr(self, "xlsx_error", ""),
+            "compact_status": getattr(self, "compact_status", "unavailable"),
+            "compact_error": getattr(self, "compact_error", ""),
         }
         progress_path = self.session_dir / "progress.json"
         temporary_path = self.session_dir / "progress.json.tmp"
@@ -1522,12 +1839,13 @@ class OperatorRecorder(Node):
             self.csv_file.close()
             self.csv_file = None
             self._write_manifest()
+            manifest_rows = self._camera_xlsx_manifest_rows()
             try:
                 export_session_xlsx(
                     self.session_dir / "telemetry.csv",
                     self.session_dir / "session.xlsx",
                     mode=self.mode,
-                    manifest_rows=self._camera_xlsx_manifest_rows(),
+                    manifest_rows=manifest_rows,
                 )
             except RuntimeError as exc:
                 self.xlsx_status = "failed"
@@ -1536,6 +1854,22 @@ class OperatorRecorder(Node):
             else:
                 self.xlsx_status = "saved"
                 self.xlsx_error = ""
+            try:
+                export_compact_session_files(
+                    self.session_dir / "telemetry.csv",
+                    self.session_dir,
+                    mode=self.mode,
+                    csv_hz=self.csv_hz,
+                    video_fps=self.video_fps,
+                    manifest_rows=manifest_rows,
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                self.compact_status = "failed"
+                self.compact_error = str(exc)
+                self.get_logger().error(f"CSV saved; compact export failed: {exc}")
+            else:
+                self.compact_status = "saved"
+                self.compact_error = ""
             self._write_progress(state="finalized")
 
 

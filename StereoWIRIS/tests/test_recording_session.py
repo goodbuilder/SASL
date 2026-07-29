@@ -5,6 +5,9 @@ from xml.etree import ElementTree
 from zipfile import ZipFile
 
 from wiris_stereo_distance.recording_session import (
+    CAMERA_TIMELINE_COMPACT_COLUMNS,
+    DISTANCE_MEASUREMENT_COLUMNS,
+    PX4_TIMELINE_COMPACT_COLUMNS,
     SpoolRows,
     discover_retryable_sessions,
     format_video_paths,
@@ -120,7 +123,72 @@ def _xlsx_sheet_headers(path: Path, sheet_index: int) -> list[str]:
     return headers
 
 
-def test_save_session_files_writes_wide_csv_and_projected_xlsx(tmp_path) -> None:
+def _xlsx_table_rows(path: Path, sheet_index: int) -> list[dict[str, object]]:
+    spreadsheet_namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+
+    def column_index(cell_ref: str) -> int:
+        letters = "".join(ch for ch in cell_ref if ch.isalpha())
+        index = 0
+        for ch in letters:
+            index = index * 26 + (ord(ch.upper()) - ord("A") + 1)
+        return index - 1
+
+    with ZipFile(path) as archive:
+        shared_strings = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+        strings = [
+            "".join(
+                node.text or ""
+                for node in item.iter(f"{{{spreadsheet_namespace}}}t")
+            )
+            for item in shared_strings.findall(f"{{{spreadsheet_namespace}}}si")
+        ]
+        worksheet = ElementTree.fromstring(
+            archive.read(f"xl/worksheets/sheet{sheet_index}.xml")
+        )
+        sheet_data = worksheet.find(f"{{{spreadsheet_namespace}}}sheetData")
+        assert sheet_data is not None
+        xml_rows = sheet_data.findall(f"{{{spreadsheet_namespace}}}row")
+        assert xml_rows
+
+        def cell_value(cell):
+            value = cell.find(f"{{{spreadsheet_namespace}}}v")
+            if value is None or value.text is None:
+                return ""
+            if cell.attrib.get("t") == "s":
+                return strings[int(value.text)]
+            text = value.text
+            try:
+                number = float(text)
+            except ValueError:
+                return text
+            return int(number) if number.is_integer() else number
+
+        header_cells = xml_rows[0].findall(f"{{{spreadsheet_namespace}}}c")
+        header_by_index = {
+            column_index(cell.attrib["r"]): str(cell_value(cell))
+            for cell in header_cells
+        }
+        headers = [
+            header_by_index.get(index, "")
+            for index in range(max(header_by_index) + 1)
+        ]
+        rows: list[dict[str, object]] = []
+        for row in xml_rows[1:]:
+            values = {
+                column_index(cell.attrib["r"]): cell_value(cell)
+                for cell in row.findall(f"{{{spreadsheet_namespace}}}c")
+            }
+            rows.append(
+                {
+                    header: values.get(index, "")
+                    for index, header in enumerate(headers)
+                    if header
+                }
+            )
+        return rows
+
+
+def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_xlsx(tmp_path) -> None:
     output_dir = tmp_path / "sessions" / "20260605_120000"
     pair_rows = [
         {
@@ -184,77 +252,139 @@ def test_save_session_files_writes_wide_csv_and_projected_xlsx(tmp_path) -> None
                     "sequence": 0,
                     "session_id": "20260605_120000",
                     "side": "right",
-                    "sample_type": "pixhawk_attitude",
+                    "sample_type": "gps_rtk",
                     "sample_monotonic_ns": 1_100_000_000,
                     "px4_timestamp_sample_us": 900_000,
+                    "topic": "/uav_1/fmu/out/vehicle_gps_position",
+                    "lat_deg": 37.123456789,
+                    "lon_deg": 127.987654321,
+                    "alt_m": 42.25,
+                    "altitude_ellipsoid_m": 47.5,
+                    "fix_type": 6,
+                    "satellites": 18,
+                    "eph_m": 0.012,
+                    "epv_m": 0.034,
+                    "rtk_label": "RTK Fixed",
+                    "gps_utc_us": 1_800_000_000_123_456,
+                    "heading_deg": 91.5,
+                    "heading_accuracy_deg": 0.2,
+                    "velocity_n_m_s": 1.25,
+                    "velocity_e_m_s": -0.5,
+                    "velocity_d_m_s": 0.125,
+                    "velocity_ned_valid": "true",
                 }
             ]
         },
     )
 
     assert saved.outputs == [
-        saved.csv,
+        saved.session_static_json,
+        saved.distance_measurements_csv,
+        saved.distance_measurements_parquet,
         saved.xlsx,
         saved.camera_left_csv,
+        saved.camera_left_parquet,
         saved.camera_right_csv,
+        saved.camera_right_parquet,
         saved.px4_left_csv,
+        saved.px4_left_parquet,
         saved.px4_right_csv,
+        saved.px4_right_parquet,
     ]
-    assert saved.csv == output_dir / "20260605_120000.csv"
+    assert saved.csv == output_dir / "20260605_120000_distance_measurements.csv"
     assert saved.xlsx == output_dir / "20260605_120000.xlsx"
     assert sorted(path.name for path in output_dir.iterdir()) == [
         ".generations",
-        "20260605_120000.csv",
         "20260605_120000.xlsx",
-        "camera_left.csv",
-        "camera_right.csv",
+        "20260605_120000_camera_left.csv",
+        "20260605_120000_camera_left.parquet",
+        "20260605_120000_camera_right.csv",
+        "20260605_120000_camera_right.parquet",
+        "20260605_120000_distance_measurements.csv",
+        "20260605_120000_distance_measurements.parquet",
+        "20260605_120000_px4_left.csv",
+        "20260605_120000_px4_left.parquet",
+        "20260605_120000_px4_right.csv",
+        "20260605_120000_px4_right.parquet",
+        "20260605_120000_session_static.json",
         "published",
-        "px4_left.csv",
-        "px4_right.csv",
         "session_manifest.json",
     ]
     with saved.csv.open("r", newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 2
     assert rows[0]["sample_index"] == "7"
-    assert rows[1]["session_elapsed_s"] == "1.3"
-    assert set(rows[0]) == set(pair_rows[0])
+    assert rows[0]["recording_time_ns"] == "1250000000"
+    assert rows[1]["recording_time_ns"] == "1300000000"
+    assert rows[0]["distance_m"] == "5.4"
+    assert set(rows[0]) == set(DISTANCE_MEASUREMENT_COLUMNS)
+
+    import pyarrow.parquet as pq
+
+    parquet_table = pq.read_table(saved.distance_measurements_parquet)
+    assert parquet_table.column_names == list(DISTANCE_MEASUREMENT_COLUMNS)
+    assert parquet_table["recording_time_ns"].to_pylist() == [1_250_000_000, 1_300_000_000]
+    static_payload = json.loads(saved.session_static_json.read_text(encoding="utf-8"))
+    assert static_payload["time_axis"]["primary"] == "recording_time_ns"
+    assert static_payload["metadata"]["calibration"]["profile"] == "night"
 
     sheet_names, sheet_row_counts = _xlsx_sheet_names_and_row_counts(saved.xlsx)
     assert sheet_names == [
         "Summary",
-        "Measurements",
-        "GPS",
-        "Attitude",
-        "Baseline",
-        "Quality",
-        "Calibration",
+        "DistanceMeasurements",
+        "CameraLeft",
+        "CameraRight",
+        "Px4Left",
+        "Px4Right",
+        "CalibrationStatic",
     ]
     dynamic_counts = dict(zip(sheet_names, sheet_row_counts, strict=True))
-    assert {dynamic_counts[name] for name in sheet_names[1:6]} == {len(pair_rows) + 1}
-    axes = _xlsx_dynamic_axis_values(saved.xlsx)
-    assert axes == [[("7", "1.25"), ("8", "1.3")]] * 5
+    assert dynamic_counts["DistanceMeasurements"] == len(pair_rows) + 1
+    assert dynamic_counts["CameraLeft"] == 2
+    assert dynamic_counts["CameraRight"] == 1
+    assert dynamic_counts["Px4Left"] == 1
+    assert dynamic_counts["Px4Right"] == 2
     measurement_headers = set(_xlsx_sheet_headers(saved.xlsx, 2))
+    assert set(DISTANCE_MEASUREMENT_COLUMNS) == measurement_headers
     assert {
-        "measurement_frame",
+        "recording_time_ns",
         "distance_m",
-        "range_m",
         "baseline_center_forward_m",
         "baseline_center_right_m",
         "baseline_center_down_m",
-        "source_left_camera_rdf_right_m",
-        "source_left_camera_rdf_down_m",
-        "source_left_camera_rdf_forward_m",
     } <= measurement_headers
     with saved.camera_left_csv.open("r", newline="", encoding="utf-8") as handle:
         camera_rows = list(csv.DictReader(handle))
-    assert camera_rows[0]["sample_type"] == "gui_camera_frame"
-    assert camera_rows[0]["sample_monotonic_ns"] == "1000000000"
+    assert set(camera_rows[0]) == set(CAMERA_TIMELINE_COMPACT_COLUMNS)
+    assert camera_rows[0]["recording_time_ns"] == ""
+    assert camera_rows[0]["device_utc_time_ns"] == "1800000000000000000"
     with saved.px4_right_csv.open("r", newline="", encoding="utf-8") as handle:
         px4_rows = list(csv.DictReader(handle))
-    assert px4_rows[0]["sample_type"] == "pixhawk_attitude"
-    assert px4_rows[0]["px4_timestamp_sample_us"] == "900000"
-    assert json.loads(saved.manifest.read_text(encoding="utf-8"))["status"] == "finalized"
+    assert set(px4_rows[0]) == set(PX4_TIMELINE_COMPACT_COLUMNS)
+    assert px4_rows[0]["sample_type"] == "gps_rtk"
+    assert px4_rows[0]["topic"] == "/uav_1/fmu/out/vehicle_gps_position"
+    assert px4_rows[0]["device_utc_time_ns"] == "1800000000123456000"
+    assert px4_rows[0]["latitude_deg"] == "37.123456789"
+    assert px4_rows[0]["longitude_deg"] == "127.987654321"
+    assert px4_rows[0]["altitude_m"] == "42.25"
+    assert px4_rows[0]["altitude_ellipsoid_m"] == "47.5"
+    assert px4_rows[0]["fix_type"] == "6"
+    assert px4_rows[0]["satellites_used"] == "18"
+    assert px4_rows[0]["rtk_label"] == "RTK Fixed"
+    assert px4_rows[0]["gps_utc_us"] == "1800000000123456"
+    assert px4_rows[0]["velocity_ned_valid"] == "True"
+    px4_xlsx_rows = _xlsx_table_rows(saved.xlsx, 6)
+    assert px4_xlsx_rows[0]["sample_type"] == "gps_rtk"
+    assert px4_xlsx_rows[0]["rtk_label"] == "RTK Fixed"
+    assert px4_xlsx_rows[0]["fix_type"] == 6
+    assert px4_xlsx_rows[0]["satellites_used"] == 18
+    assert px4_xlsx_rows[0]["gps_utc_us"] == 1800000000123456
+    assert px4_xlsx_rows[0]["latitude_deg"] == 37.123456789
+    assert px4_xlsx_rows[0]["longitude_deg"] == 127.987654321
+    assert px4_xlsx_rows[0]["velocity_n_m_s"] == 1.25
+    manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
+    assert manifest["status"] == "finalized"
+    assert manifest["artifact_roles"][saved.distance_measurements_parquet.name] == "distance_measurements_parquet"
 
 
 def test_save_session_files_creates_headers_for_empty_pair_rows(tmp_path) -> None:
@@ -267,20 +397,24 @@ def test_save_session_files_creates_headers_for_empty_pair_rows(tmp_path) -> Non
     )
 
     with saved.csv.open("r", newline="", encoding="utf-8") as handle:
-        assert next(csv.reader(handle)) == ["sample_index", "session_elapsed_s"]
+        assert next(csv.reader(handle)) == list(DISTANCE_MEASUREMENT_COLUMNS)
     for path in (
         saved.camera_left_csv,
         saved.camera_right_csv,
+        saved.camera_left_parquet,
+        saved.camera_right_parquet,
         saved.px4_left_csv,
+        saved.px4_left_parquet,
         saved.px4_right_csv,
+        saved.px4_right_parquet,
     ):
+        assert path.is_file()
+    for path in (saved.camera_left_csv, saved.camera_right_csv):
         with path.open("r", newline="", encoding="utf-8") as handle:
-            assert next(csv.reader(handle))[:4] == [
-                "sequence",
-                "session_id",
-                "side",
-                "sample_type",
-            ]
+            assert next(csv.reader(handle)) == list(CAMERA_TIMELINE_COMPACT_COLUMNS)
+    for path in (saved.px4_left_csv, saved.px4_right_csv):
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            assert next(csv.reader(handle)) == list(PX4_TIMELINE_COMPACT_COLUMNS)
     sheet_names, sheet_row_counts = _xlsx_sheet_names_and_row_counts(saved.xlsx)
     dynamic_counts = dict(zip(sheet_names, sheet_row_counts, strict=True))
     assert {dynamic_counts[name] for name in sheet_names[1:6]} == {1}
@@ -304,8 +438,17 @@ def test_xlsx_failure_keeps_all_authoritative_csvs_and_retry_manifest(tmp_path, 
     assert saved.finalized is False
     assert "workbook locked" in saved.error
     assert all(path.is_file() for path in (
-        saved.csv, saved.camera_left_csv, saved.camera_right_csv,
-        saved.px4_left_csv, saved.px4_right_csv,
+        saved.session_static_json,
+        saved.csv,
+        saved.distance_measurements_parquet,
+        saved.camera_left_csv,
+        saved.camera_left_parquet,
+        saved.camera_right_csv,
+        saved.camera_right_parquet,
+        saved.px4_left_csv,
+        saved.px4_left_parquet,
+        saved.px4_right_csv,
+        saved.px4_right_parquet,
     ))
     manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
     assert manifest["status"] == "failed"
@@ -318,13 +461,25 @@ def test_csv_prepare_failure_does_not_replace_any_authoritative_csv(tmp_path, mo
 
     output_dir = tmp_path / "session"
     output_dir.mkdir()
-    names = ["session.csv", "camera_left.csv", "camera_right.csv", "px4_left.csv", "px4_right.csv"]
+    names = [
+        "session_session_static.json",
+        "session_distance_measurements.csv",
+        "session_distance_measurements.parquet",
+        "session_camera_left.csv",
+        "session_camera_left.parquet",
+        "session_camera_right.csv",
+        "session_camera_right.parquet",
+        "session_px4_left.csv",
+        "session_px4_left.parquet",
+        "session_px4_right.csv",
+        "session_px4_right.parquet",
+    ]
     for name in names:
         (output_dir / name).write_text(f"old-{name}\n", encoding="utf-8")
     original_write = recording_session.write_dynamic_csv
 
     def fail_third(output, rows, **kwargs):
-        if output.name == "camera_right.csv":
+        if output.name == "session_camera_right.csv":
             raise OSError("disk full")
         return original_write(output, rows, **kwargs)
 
@@ -344,7 +499,7 @@ def test_csv_prepare_failure_does_not_replace_any_authoritative_csv(tmp_path, mo
         assert (output_dir / name).read_text(encoding="utf-8") == f"old-{name}\n"
     manifest = json.loads((output_dir / "session_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "failed"
-    assert manifest["phase"] == "prepare_csv"
+    assert manifest["phase"] == "prepare_resource_files"
     assert all(state == "prepared" for state in manifest["artifacts"].values())
 
 
@@ -504,7 +659,11 @@ def test_session_sheet_previews_match_the_written_workbook(tmp_path) -> None:
 
     assert names == [preview.name for preview in previews]
     for preview, row_count in zip(previews, row_counts):
-        expected = len(preview.entries) if preview.kind == "key_value" else len(pair_rows)
+        expected = (
+            len(preview.entries)
+            if preview.kind == "key_value"
+            else (len(pair_rows) if preview.name == "DistanceMeasurements" else 0)
+        )
         # Every sheet carries one header row on top of its body rows.
         assert row_count == expected + 1, preview.name
 

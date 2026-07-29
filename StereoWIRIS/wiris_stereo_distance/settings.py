@@ -45,7 +45,7 @@ class AppSettings:
     yolo_gate_time_delta_enabled: bool = False
     yolo_gate_vertical_delta_enabled: bool = False
     yolo_gate_max_vertical_delta_px: float = 80.0
-    yolo_gate_max_time_delta_s: float = 0.25
+    yolo_gate_max_time_delta_s: float = 0.1
     # Prefer RTCP/NTP when the two cameras agree, but allow live pairing to
     # fall back to the app's monotonic receive clock when their camera clocks
     # are not mutually synchronized.
