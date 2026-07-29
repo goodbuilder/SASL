@@ -74,14 +74,54 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /stereo/ray_markers
-      Name: Stereo Rays — Nominal / Optical / Ideal (World ENU)
+      Name: Stereo Rays — Nominal / Optical / Ideal / GPS Baseline (World ENU)
       Namespaces:
         stereo_actual_drone: true
-        stereo_camera_fov: false
         stereo_cameras: true
         stereo_rays_nominal: true
         stereo_rays_optical: true
         stereo_rays_ideal: true
+        stereo_rays_gps_raw: true
+        stereo_rays_gps_global: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/camera_markers
+      Name: Stereo Cameras (World ENU)
+      Namespaces:
+        stereo_cameras: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/ground_truth_markers
+      Name: Gazebo Ground-Truth Drone (World ENU)
+      Namespaces:
+        stereo_actual_drone: true
+      Queue Size: 100
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: false
+      Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /stereo/fov_markers
+      Name: Stereo Camera FOV (World ENU)
+      Namespaces:
+        stereo_camera_fov: true
       Queue Size: 100
       Value: true
   Enabled: true

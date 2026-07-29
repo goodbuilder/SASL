@@ -373,9 +373,28 @@ class RecordingControls(QWidget):
         self._lock_widgets += tuple(widgets)
 
     def recording_csv_path(self):
+        return self._recording_artifact_path("csv", "telemetry*.csv")
+
+    def recording_xlsx_path(self):
+        return self._recording_artifact_path("xlsx", "session*.xlsx")
+
+    def _recording_artifact_path(self, progress_key, pattern):
         if self._last_record_path is None:
             return None
-        return self._last_record_path / "telemetry.csv"
+        progress_path = self._last_record_path / "progress.json"
+        try:
+            progress = json.loads(progress_path.read_text(encoding="utf-8"))
+            artifact_name = progress.get(progress_key, "")
+        except (OSError, json.JSONDecodeError):
+            artifact_name = ""
+        if isinstance(artifact_name, str) and artifact_name:
+            candidate = self._last_record_path / Path(artifact_name).name
+            if candidate.is_file():
+                return candidate
+        candidates = sorted(self._last_record_path.glob(pattern), reverse=True)
+        if candidates:
+            return candidates[0]
+        return self._last_record_path / ("telemetry.csv" if progress_key == "csv" else "session.xlsx")
 
     def recording_session_path(self):
         return self._last_record_path

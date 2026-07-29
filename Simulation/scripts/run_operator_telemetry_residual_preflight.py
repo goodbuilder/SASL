@@ -36,7 +36,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     telemetry = parser.add_mutually_exclusive_group(required=True)
     telemetry.add_argument("--input-telemetry-csv", type=Path)
     telemetry.add_argument("--latest-telemetry-root", type=Path)
-    parser.add_argument("--latest-telemetry-pattern", default="**/telemetry.csv")
+    parser.add_argument("--latest-telemetry-pattern", default="**/telemetry*.csv")
     parser.add_argument("--selector-model-json", type=Path, required=True)
     parser.add_argument("--catalog-json", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

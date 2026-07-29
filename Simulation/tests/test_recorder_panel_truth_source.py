@@ -144,6 +144,24 @@ class RecorderPanelTruthSourceTests(unittest.TestCase):
 
         self.assertEqual(preview.splitlines(), ["time_sec,value", "0.1,second", "0.2,third"])
 
+    def test_recording_artifact_paths_follow_timestamped_progress_metadata(self) -> None:
+        module = load_panel_module()
+        controls = object.__new__(module.RecordingControls)
+        with tempfile.TemporaryDirectory() as directory:
+            session = Path(directory)
+            csv_path = session / "telemetry_20260729_143015.csv"
+            xlsx_path = session / "session_20260729_143015.xlsx"
+            csv_path.write_text("time_sec\n", encoding="utf-8")
+            xlsx_path.write_bytes(b"xlsx")
+            (session / "progress.json").write_text(
+                '{"csv":"telemetry_20260729_143015.csv","xlsx":"session_20260729_143015.xlsx"}',
+                encoding="utf-8",
+            )
+            controls._last_record_path = session
+
+            self.assertEqual(controls.recording_csv_path(), csv_path)
+            self.assertEqual(controls.recording_xlsx_path(), xlsx_path)
+
     def test_csv_tail_preview_discards_an_incomplete_trailing_row(self) -> None:
         module = load_panel_module()
         with tempfile.TemporaryDirectory() as directory:

@@ -29,7 +29,7 @@ except ImportError:  # pragma: no cover - allows recorder shell/tests without PX
 cv2 = None
 _CLOSING = False
 AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
-XLSX_SCHEMA_VERSION = "2"
+XLSX_SCHEMA_VERSION = "3"
 
 
 NUMERIC_TOPICS = {
@@ -730,6 +730,14 @@ def _finite_or_empty(value):
     return f"{number:.9g}"
 
 
+def _finite_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _finite_vector(values, size):
     result = tuple(float(value) for value in values)
     if len(result) != size or not all(math.isfinite(value) for value in result):
@@ -1003,12 +1011,12 @@ def export_compact_session_files(csv_path, session_dir, *, mode, csv_hz=None, vi
 
 
 def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
-    """Create an atomic, purpose-tab XLSX mirror of finalized telemetry.csv."""
+    """Create an atomic, purpose-tab XLSX mirror of finalized telemetry CSV."""
     try:
         import xlsxwriter
         from xlsxwriter.exceptions import FileCreateError, FileSizeError
     except ModuleNotFoundError as exc:
-        raise RuntimeError("XlsxWriter is required to generate session.xlsx") from exc
+        raise RuntimeError("XlsxWriter is required to generate the session XLSX") from exc
 
     source = Path(csv_path)
     output = Path(xlsx_path)
@@ -1019,7 +1027,7 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
             {
                 "title": "Stereo operator recording",
                 "subject": "Finalized telemetry CSV mirror",
-                "comments": "Generated from the authoritative telemetry.csv at Stop.",
+                "comments": "Generated from the authoritative telemetry CSV at Stop.",
                 "created": datetime(1980, 1, 1),
             }
         )
@@ -1034,6 +1042,25 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
         rays_worksheet.freeze_panes(1, 0)
         rays_worksheet.write_row(0, 0, RAYS_SHEET_FIELDS, header_format)
         rays_row_count = 0
+        performance = workbook.add_worksheet("Performance")
+        performance.freeze_panes(1, 0)
+        performance_fields = (
+            "time_sec",
+            "yolo_update_hz",
+            "yolo_inference_ms",
+            "within_target_period",
+        )
+        performance.write_row(0, 0, performance_fields, header_format)
+        manifest_values = {str(key): str(value) for key, value in manifest_rows}
+        try:
+            target_hz = float(manifest_values.get("yolo_target_hz", "20.0"))
+        except ValueError:
+            target_hz = 20.0
+        target_hz = target_hz if target_hz > 0.0 else 20.0
+        target_period_ms = 1000.0 / target_hz
+        performance_row_count = 0
+        inference_ms_samples = []
+        update_hz_samples = []
 
         row_count = 0
         axis_contract = AXIS_CONTRACT
@@ -1052,9 +1079,48 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                         continue
                     rays_worksheet.write_row(rays_row_count + 1, 0, ray_values)
                     rays_row_count += 1
+                inference_ms = _finite_float(row.get("yolo_inference_ms"))
+                update_hz = _finite_float(row.get("yolo_update_hz"))
+                if inference_ms is not None or update_hz is not None:
+                    within_target = "" if inference_ms is None else inference_ms <= target_period_ms
+                    performance.write_row(
+                        performance_row_count + 1,
+                        0,
+                        (row.get("time_sec", ""), update_hz if update_hz is not None else "", inference_ms if inference_ms is not None else "", within_target),
+                    )
+                    performance_row_count += 1
+                    if inference_ms is not None:
+                        inference_ms_samples.append(inference_ms)
+                    if update_hz is not None:
+                        update_hz_samples.append(update_hz)
                 if row_count == 0 and row.get("axis_contract"):
                     axis_contract = row["axis_contract"]
                 row_count += 1
+
+        def percentile(samples, fraction):
+            if not samples:
+                return ""
+            ordered = sorted(samples)
+            index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * fraction)))
+            return ordered[index]
+
+        within_budget_count = sum(value <= target_period_ms for value in inference_ms_samples)
+        performance_summary = (
+            ("target_hz", target_hz),
+            ("target_period_ms", target_period_ms),
+            ("inference_samples", len(inference_ms_samples)),
+            ("inference_within_target_samples", within_budget_count),
+            ("inference_within_target_ratio", (within_budget_count / len(inference_ms_samples)) if inference_ms_samples else ""),
+            ("inference_ms_p50", percentile(inference_ms_samples, 0.50)),
+            ("inference_ms_p95", percentile(inference_ms_samples, 0.95)),
+            ("inference_ms_max", max(inference_ms_samples) if inference_ms_samples else ""),
+            ("update_hz_samples", len(update_hz_samples)),
+            ("update_hz_p50", percentile(update_hz_samples, 0.50)),
+            ("update_hz_p05", percentile(update_hz_samples, 0.05)),
+        )
+        performance.write_row(performance_row_count + 3, 0, ("metric", "value"), header_format)
+        for index, summary_row in enumerate(performance_summary, start=performance_row_count + 4):
+            performance.write_row(index, 0, summary_row)
 
         csv_sha256 = _sha256(source)
         manifest = workbook.add_worksheet("Config")
@@ -1068,7 +1134,7 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                 ("rays_sheet_row_count", rays_row_count),
                 ("mode", mode),
                 ("axis_contract", axis_contract),
-                ("sheet_order", ",".join([name for name, _fields in XLSX_SHEET_FIELDS] + ["Config"])),
+                ("sheet_order", ",".join([name for name, _fields in XLSX_SHEET_FIELDS] + ["Performance", "Config"])),
             ) + tuple(manifest_rows)
         for index, row in enumerate(
             manifest_rows,
@@ -1089,6 +1155,10 @@ class OperatorRecorder(Node):
         self.mode = args.mode
         self.session_dir = Path(args.output_dir).expanduser().resolve()
         self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.recording_started_local = datetime.now().astimezone()
+        self.recording_timestamp = self.recording_started_local.strftime("%Y%m%d_%H%M%S")
+        self.csv_path = self.session_dir / f"telemetry_{self.recording_timestamp}.csv"
+        self.xlsx_path = self.session_dir / f"session_{self.recording_timestamp}.xlsx"
         self.csv_hz = max(0.5, float(args.csv_hz))
         self.video_fps = max(1.0, float(args.video_fps))
         self.start_monotonic = time.monotonic()
@@ -1135,8 +1205,7 @@ class OperatorRecorder(Node):
         self.get_logger().info(f"Recording {self.mode} session to {self.session_dir}")
 
     def _open_csv(self):
-        path = self.session_dir / "telemetry.csv"
-        self.csv_file = path.open("w", newline="", encoding="utf-8")
+        self.csv_file = self.csv_path.open("w", newline="", encoding="utf-8")
         self.csv_writer = csv.DictWriter(self.csv_file, fieldnames=TELEMETRY_FIELDS)
         self.csv_writer.writeheader()
         self.csv_file.flush()
@@ -1144,14 +1213,15 @@ class OperatorRecorder(Node):
     def _write_manifest(self):
         lines = [
             f"mode={self.mode}",
-            f"csv=telemetry.csv",
+            f"recording_started_local={self.recording_started_local.isoformat(timespec='seconds')}",
+            f"csv={self.csv_path.name}",
             f"csv_hz={self.csv_hz:g}",
             "progress=progress.json",
             "session_static=session_static.json (fixed session/config facts written once at Stop)",
             "compact_csvs=distance_measurements.csv,ray_summary.csv,detections.csv,px4_uam.csv,px4_left.csv,px4_right.csv",
             "session_manifest=session_manifest.json",
-            "xlsx=session.xlsx (generated from finalized telemetry.csv at Stop)",
-            "analysis_export=analysis.csv (optional compact user export; telemetry.csv remains raw)",
+            f"xlsx={self.xlsx_path.name} (generated from finalized CSV at Stop)",
+            f"analysis_export=analysis_{self.recording_timestamp}.csv (optional compact user export; CSV remains raw)",
             f"axis_contract={AXIS_CONTRACT}",
             "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, raw_forward_m/raw_right_m/raw_down_m, estimated_forward_m/estimated_right_m/estimated_down_m, corrected_forward_m/corrected_right_m/corrected_down_m",
             "axis_aliases=public CSV uses forward/right/down; legacy x/y/z is intentionally not emitted",
@@ -1218,6 +1288,15 @@ class OperatorRecorder(Node):
                     (f"{label}_camera_mount_source", "gazebo_camera_pose_diagnostics"),
                 )
             )
+        rows.extend(
+            (
+                ("yolo_backend", os.environ.get("YOLO_BACKEND", "unknown")),
+                ("yolo_model", os.environ.get("YOLO_MODEL_PATH", "unknown")),
+                ("yolo_imgsz", os.environ.get("YOLO_IMGSZ", "unknown")),
+                ("yolo_target_hz", os.environ.get("YOLO_TARGET_HZ", "20.0")),
+                ("camera_pair_target_hz", os.environ.get("CAMERA_UPDATE_RATE_HZ", "20.0")),
+            )
+        )
         return tuple(rows)
 
     def _resolve_bag_storage(self, requested):
@@ -1757,6 +1836,9 @@ class OperatorRecorder(Node):
             "xlsx_error": getattr(self, "xlsx_error", ""),
             "compact_status": getattr(self, "compact_status", "unavailable"),
             "compact_error": getattr(self, "compact_error", ""),
+            "recording_timestamp": getattr(self, "recording_timestamp", ""),
+            "csv": getattr(getattr(self, "csv_path", None), "name", "telemetry.csv"),
+            "xlsx": getattr(getattr(self, "xlsx_path", None), "name", "session.xlsx"),
         }
         progress_path = self.session_dir / "progress.json"
         temporary_path = self.session_dir / "progress.json.tmp"
@@ -1842,8 +1924,8 @@ class OperatorRecorder(Node):
             manifest_rows = self._camera_xlsx_manifest_rows()
             try:
                 export_session_xlsx(
-                    self.session_dir / "telemetry.csv",
-                    self.session_dir / "session.xlsx",
+                    self.csv_path,
+                    self.xlsx_path,
                     mode=self.mode,
                     manifest_rows=manifest_rows,
                 )
@@ -1856,7 +1938,7 @@ class OperatorRecorder(Node):
                 self.xlsx_error = ""
             try:
                 export_compact_session_files(
-                    self.session_dir / "telemetry.csv",
+                    self.csv_path,
                     self.session_dir,
                     mode=self.mode,
                     csv_hz=self.csv_hz,

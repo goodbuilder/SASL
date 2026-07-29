@@ -106,8 +106,8 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert 'QPushButton("Open XLSX")' in source
     assert 'QPushButton("Export analysis CSV")' in source
     assert "read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)" in source
-    assert '("raw_gps_baseline_range_m", "Raw GPS range (m)")' in source
-    assert '("raw_gps_baseline_forward_m", "Raw GPS F (m)")' in source
+    assert '("raw_gps_baseline_range_m", "Raw GPS Baseline range (m)")' in source
+    assert '("raw_gps_baseline_forward_m", "Raw GPS Baseline F (m)")' in source
     assert '("nominal_ray_midpoint_forward_m", "F nominal")' in source
     assert '("optical_ray_midpoint_right_m", "Rt optical")' in source
     assert '("ideal_ray_range_m", "Rg ideal")' in source
@@ -115,7 +115,7 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert '"/stereo/ray_metrics"' in source
     assert "update_live_ray_metrics" in source
     assert '("midpoint_frd_m", "midpoint")' in source
-    for record_view in ("Summary", "Raw GPS", "BBox", "Ray summary", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
+    for record_view in ("Summary", "Raw GPS Baseline", "BBox", "Ray summary", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
         assert f'"{record_view}"' in source
 
 

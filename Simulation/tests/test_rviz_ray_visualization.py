@@ -105,12 +105,17 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     assert 'executable="static_transform_publisher"' in launch
     assert '"world", "gazebo_world_enu"' in launch
     assert "/stereo/ray_markers" in rviz
+    assert "/stereo/fov_markers" in rviz
+    assert "/stereo/camera_markers" in rviz
+    assert "Name: Stereo Cameras (World ENU)" in rviz
+    assert "/stereo/ground_truth_markers" in rviz
+    assert "Name: Gazebo Ground-Truth Drone (World ENU)" in rviz
     distance_display = rviz.split("Name: Distance Text", 1)[0].rsplit("Class: rviz_default_plugins/Marker", 1)[1]
     assert "Topic:" in distance_display
     assert "Marker Topic:" not in distance_display
     assert "/stereo/distance_marker" in distance_display
     assert "Enabled: false" in distance_display
-    ray_display = rviz.split("Name: Stereo Rays — Nominal / Optical / Ideal (World ENU)", 1)[0].rsplit("Class: rviz_default_plugins/MarkerArray", 1)[1]
+    ray_display = rviz.split("Name: Stereo Rays — Nominal / Optical / Ideal / GPS Baseline (World ENU)", 1)[0].rsplit("Class: rviz_default_plugins/MarkerArray", 1)[1]
     assert "Topic:" in ray_display
     assert "Marker Topic:" not in ray_display
     assert "Durability Policy: Transient Local" in ray_display
@@ -123,12 +128,16 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     assert "stereo_rays_nominal: true" in rviz
     assert "stereo_rays_optical: true" in rviz
     assert "stereo_rays_ideal: true" in rviz
+    assert "stereo_rays_gps_raw: true" in rviz
+    assert "stereo_rays_gps_global: true" in rviz
     assert "stereo_cameras: true" in rviz
-    assert "stereo_camera_fov: false" in rviz
+    assert "Name: Stereo Camera FOV (World ENU)" in rviz
+    assert "- Class: rviz_default_plugins/MarkerArray\n      Enabled: false" in rviz
+    assert "Name: Stereo Camera FOV (World ENU)\n      Namespaces:\n        stereo_camera_fov: true" in rviz
     assert "stereo_actual_drone: true" in rviz
 
 
-def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> None:
+def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_groups() -> None:
     source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
 
     assert "_rviz_live_worker_loop" in source
@@ -140,23 +149,44 @@ def test_marker_source_contains_nominal_optical_and_dkl_ideal_ray_groups() -> No
     assert "self._publish_ray_metrics(nominal=raw, optical=optical)" in source
     assert "self._publish_ray_metrics(\n                        nominal=raw," in source
     assert "if not self._rviz_latest_only_markers_enabled()" in source
+    assert 'worker = getattr(self, "rviz_live_thread", None)' in source
+    assert "and worker is not None" in source
+    assert "and worker.is_alive()" in source
     assert 'self.create_publisher(MarkerArray, "/stereo/ray_markers", ray_marker_qos)' in source
+    assert 'self.create_publisher(MarkerArray, "/stereo/fov_markers", ray_marker_qos)' in source
+    assert 'self.create_publisher(MarkerArray, "/stereo/camera_markers", ray_marker_qos)' in source
     assert "durability=DurabilityPolicy.TRANSIENT_LOCAL" in source
     assert 'self._publish_ray_metrics(ideal=ideal)' in source
+    assert "self.lock = threading.RLock()" in source
+    assert "self.live_detections_pub.publish(detection_message)" in source
     assert "ideal=ideal" in source
     assert 'label="nominal"' in source
     assert 'label="optical"' in source
     assert 'label="ideal"' in source
+    assert 'label="gps_raw"' in source
+    assert 'label="gps_global"' in source
+    assert 'gps_raw=computed.get("gps_baselines", {}).get("raw_gps")' in source
+    assert 'gps_global=computed.get("gps_baselines", {}).get("global_position")' in source
     assert 'camera.ns = "stereo_cameras"' in source
     assert "camera.type = Marker.CUBE" in source
-    assert "camera_result = optical if optical is not None else nominal" in source
+    assert "Keep configuration-only FOV geometry separate from live ray results." in source
     assert "faces.type = Marker.TRIANGLE_LIST" in source
     assert "edges.type = Marker.LINE_LIST" in source
     assert 'faces.ns = "stereo_camera_fov"' in source
-    assert "faces.color.a = 0.12" in source
+    assert "self.create_timer(1.0, self._publish_camera_fov_markers)" in source
+    assert "def _publish_camera_fov_markers(self):" in source
+    assert "Publish the configured camera frustums without requiring a ray result." in source
+    assert "def _camera_position_markers(self, stamp):" in source
+    assert "Render the two configured camera origins in ``gazebo_world_enu`` metres." in source
+    assert 'publisher = getattr(self, "fov_marker_pub", None)' in source
+    assert "markers = self._camera_fov_markers(stamp)" in source
+    assert "depth_m = min(max(1.0, float(getattr(self, \"camera_clip_far_m\", 2500.0))), 2500.0)" in source
+    assert "faces.color.a = 0.20" in source
+    assert "edges.scale.x = 3.0" in source
     assert 'marker.ns = "stereo_actual_drone"' in source
     assert "marker.type = Marker.MESH_RESOURCE" in source
     assert "marker.mesh_use_embedded_materials = False" in source
+    assert "RViz vehicle rendering is published directly by" in source
     assert 'DRONE_MESH_RESOURCE = "package://stereo_ground_sim/models/x500_15m/meshes/NXP-HGD-CF.dae"' in source
     assert 'namespace = f"stereo_rays_{label}"' in source
     assert 'f"left_{label}_ray"' in source

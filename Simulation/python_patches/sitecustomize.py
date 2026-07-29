@@ -150,7 +150,7 @@ def _patch_rqt_plot_default_topics():
                 try:
                     plot_widget = self._widget.data_plot._data_plot_widget._plot_widget
                     plot_widget.getPlotItem().setTitle(
-                        f"{axis_label} axis: truth, Nominal, Optical, Ideal, Raw GPS"
+                        f"{axis_label} axis: truth, Nominal, Optical, Ideal, Raw GPS Baseline"
                     )
                     plot_widget.getPlotItem().setLabel("left", f"{axis_label} (m)")
                 except Exception:

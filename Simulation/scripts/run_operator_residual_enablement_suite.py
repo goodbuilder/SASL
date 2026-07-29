@@ -37,7 +37,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--observation-fusion-manifest", type=Path)
     parser.add_argument("--observation-fusion-tier", default="")
     parser.add_argument("--latest-telemetry-root", type=Path, required=True)
-    parser.add_argument("--latest-telemetry-pattern", default="**/telemetry.csv")
+    parser.add_argument("--latest-telemetry-pattern", default="**/telemetry*.csv")
     parser.add_argument("--selector-model-json", type=Path, required=True)
     parser.add_argument("--catalog-json", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)

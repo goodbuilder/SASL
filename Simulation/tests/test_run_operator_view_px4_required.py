@@ -39,6 +39,16 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             encoding="utf-8",
         )
         ensure_yolo.chmod(0o755)
+        prepare_tensorrt = scripts_dir / "prepare_yolo_tensorrt_engine.py"
+        prepare_tensorrt.write_text(
+            "#!/usr/bin/env python3\n"
+            "import pathlib, sys\n"
+            "output = pathlib.Path(sys.argv[sys.argv.index('--engine') + 1])\n"
+            "output.touch()\n"
+            "print(output)\n",
+            encoding="utf-8",
+        )
+        prepare_tensorrt.chmod(0o755)
 
         install_dir = root / "install"
         install_dir.mkdir()

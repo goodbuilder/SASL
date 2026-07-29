@@ -250,6 +250,26 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         self.assertEqual(payload["row_count"], 25)
         self.assertEqual(payload["valid_row_counts"]["ground_truth_m"], 20)
 
+    def test_progress_sidecar_identifies_timestamped_primary_artifacts(self) -> None:
+        module = load_module()
+        recorder = object.__new__(module.OperatorRecorder)
+        recorder.mode = "lite"
+        recorder.row_count = 0
+        recorder.last_elapsed_sec = 0.0
+        recorder.valid_row_counts = {field: 0 for field in module.PROGRESS_VALIDITY_FIELDS}
+        recorder.recording_timestamp = "20260729_143015"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            recorder.session_dir = Path(tmpdir)
+            recorder.csv_path = recorder.session_dir / "telemetry_20260729_143015.csv"
+            recorder.xlsx_path = recorder.session_dir / "session_20260729_143015.xlsx"
+
+            recorder._write_progress()
+
+            payload = json.loads((recorder.session_dir / "progress.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["recording_timestamp"], "20260729_143015")
+        self.assertEqual(payload["csv"], "telemetry_20260729_143015.csv")
+        self.assertEqual(payload["xlsx"], "session_20260729_143015.xlsx")
+
     def test_final_xlsx_mirrors_one_authoritative_csv_into_purpose_sheets(self) -> None:
         module = load_module()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -263,6 +283,8 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                         "time_sec": "1.0",
                         "axis_contract": module.AXIS_CONTRACT,
                         "raw_range_m": "2000.0",
+                        "yolo_inference_ms": "45.0",
+                        "yolo_update_hz": "20.5",
                         "raw_gps_baseline_forward_m": "1999.0",
                         "global_position_baseline_forward_m": "1998.0",
                         "left_x1": "10",
@@ -283,7 +305,12 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                     }
                 )
 
-            result = module.export_session_xlsx(source, workbook, mode="full")
+            result = module.export_session_xlsx(
+                source,
+                workbook,
+                mode="full",
+                manifest_rows=(("yolo_target_hz", "20.0"),),
+            )
 
             self.assertEqual(result["row_count"], 1)
             self.assertEqual(result["csv_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
@@ -305,6 +332,7 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                 "Stereo Estimates",
                 "Quality Events",
                 "Rays",
+                "Performance",
                 "Config",
             ):
                 self.assertIn(f'name="{sheet_name}"', workbook_xml)

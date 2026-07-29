@@ -1,5 +1,24 @@
 # 업데이트 기록
 
+## 2026-07-29 — CSV 기반 보정 프로파일 배포 계약 명시
+
+- 변경:
+  - `docs/Calibration.md`에 CSV fitting 결과를 `runtime-deployable profile`과
+    `offline-only analysis`로 분리하는 기준을 추가했다.
+  - runtime에서 금지되는 truth/ideal/validation/future-sample 입력과,
+    UAM/PX4 GPS를 쓰는 GPS-assisted 보정의 별도 표기 기준을 문서화했다.
+  - 1회차 fitting과 2회차 고정-profile 검증에서 GPS reference 및 Gazebo truth를
+    함께 비교하는 판정 기준을 추가했다.
+- 이유:
+  - CSV replay에서 개선된 후보를 runtime에 그대로 적용할 수 있다고 오해하거나,
+    2회차 검증 데이터를 재학습에 섞는 것을 막기 위해서다.
+- 확인:
+  - Calibration 문서의 runtime 입력, FRD 출력, two-flight 검증 계약을
+    기존 Coordinate Contract와 대조했다.
+- 남은 위험:
+  - 실제 적용 전에는 후보 JSON이 StereoDistance runtime loader의 schema와
+    runtime apply smoke test를 통과하는지 별도로 확인해야 한다.
+
 ## 2026-07-28 — 세션 저장 파일 리소스별 compact CSV/Parquet 분리
 
 - 변경:

@@ -561,6 +561,8 @@ def _launch_setup(context, *args, **kwargs):
                 }
             ],
             output="screen",
+            respawn=True,
+            respawn_delay=1.0,
         ),
         Node(
             package="stereo_ground_sim",
@@ -717,6 +719,10 @@ def generate_launch_description():
             DeclareLaunchArgument("yolo_imgsz", default_value="1280"),
             DeclareLaunchArgument("observation_mode", default_value="bbox_yolo"),
             DeclareLaunchArgument("measurement_queue_capacity", default_value="4096"),
+            # Keep every ray family (nominal, optical, ideal, and GPS
+            # baseline) on one newest-pair RViz cadence.  This uses a separate
+            # display-only YOLO stream; callers can still disable it for a
+            # measurement-only run with ``rviz_live_latest_only:=false``.
             DeclareLaunchArgument("rviz_live_latest_only", default_value="true"),
             DeclareLaunchArgument("rviz_live_ray_hz", default_value="5.0"),
             DeclareLaunchArgument("enable_synthetic_detections", default_value="false"),

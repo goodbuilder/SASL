@@ -60,7 +60,8 @@ SIM_EXPLICIT_NAMES=(
   DRONE_FIRST_HOVER_S DRONE_FINAL_HOVER_S DRONE_LAND_DURATION_S
   DRONE_LAND_TIMEOUT_S DRONE_SETPOINT_HZ
   YOLO_MODEL_PATH YOLO_CLASS_NAME YOLO_CONFIDENCE YOLO_DEVICE YOLO_TARGET_HZ
-  YOLO_IMGSZ MEASUREMENT_QUEUE_CAPACITY YOLO_PYTHON YOLO_PYTHONPATH
+  YOLO_IMGSZ YOLO_BACKEND YOLO_TENSORRT_ENGINE_PATH MEASUREMENT_QUEUE_CAPACITY
+  YOLO_PYTHON YOLO_PYTHONPATH
   BBOX_CENTER_ADJUSTMENT_ENABLE BBOX_CENTER_ADJUSTMENT_PATH
 )
 # shellcheck disable=SC1091
@@ -169,6 +170,8 @@ DEFAULT_YOLO_CONFIDENCE="${DEFAULT_YOLO_CONFIDENCE:-${YOLO_CONFIDENCE:-0.10}}"
 DEFAULT_YOLO_DEVICE="${DEFAULT_YOLO_DEVICE:-${YOLO_DEVICE:-cuda:0}}"
 DEFAULT_YOLO_HZ="${DEFAULT_YOLO_HZ:-${YOLO_TARGET_HZ:-40.0}}"
 DEFAULT_YOLO_IMGSZ="${DEFAULT_YOLO_IMGSZ:-${YOLO_IMGSZ:-1280}}"
+DEFAULT_YOLO_BACKEND="${DEFAULT_YOLO_BACKEND:-${YOLO_BACKEND:-tensorrt}}"
+DEFAULT_YOLO_TENSORRT_ENGINE_PATH="${DEFAULT_YOLO_TENSORRT_ENGINE_PATH:-${YOLO_TENSORRT_ENGINE_PATH:-}}"
 
 usage() {
   cat <<'USAGE'
@@ -232,6 +235,7 @@ Options:
   --yolo-device DEVICE   YOLO device. Default: cuda:0, with CPU fallback if unavailable.
   --yolo-hz VALUE        YOLO scheduler target in Hz. Default: 40.0 to keep measured output above 20 Hz.
   --yolo-imgsz PIXELS    YOLO inference image size. Default from config/simulation.env.
+  --yolo-backend NAME    tensorrt (default) or pytorch. TensorRT uses a local FP16 engine.
   --yolo-python FILE     Python used for the YOLO distance node. Default: local .venv or python3.
   --bbox-adjustment FILE Use a 6x4 bbox-center CSV or JSON runtime profile and publish corrected_position.
   --no-bbox-adjustment   Disable bbox-center adjustment even if env defaults are set.
@@ -267,10 +271,9 @@ Options:
   --px4-dir DIR          PX4-Autopilot directory. Default: $PX4_DIR
   --px4-model-name NAME  Existing Gazebo model to attach PX4 to. Default: x500_15m.
   --bag-view             Show Image View plus Bag plugin in one rqt_gui window.
-  --gazebo-gui           Explicitly show Gazebo GUI. This is the default unless
-                         --headless or gz_gui:=false is used.
-  --no-gazebo-gui        Do not show Gazebo GUI; rqt_gui still starts unless
-                         --headless is also used.
+  --gazebo-gui           Show Gazebo GUI. Default keeps Gazebo server-only while
+                         RViz and rqt_gui remain open.
+  --no-gazebo-gui        Keep Gazebo server-only; this is the default.
   --headless             Do not start Gazebo GUI or rqt_gui. Useful for automated
                          record-lite smoke runs.
   --auto-mission         Start PX4 offboard takeoff/approach/land after the app starts.
@@ -465,6 +468,10 @@ while (($#)); do
       ;;
     --yolo-imgsz)
       launch_input+=("yolo_imgsz:=${2:?missing value for --yolo-imgsz}")
+      shift 2
+      ;;
+    --yolo-backend)
+      DEFAULT_YOLO_BACKEND="${2:?missing value for --yolo-backend}"
       shift 2
       ;;
     --yolo-python)
@@ -706,8 +713,43 @@ if [[ "$yolo_enabled" == true && -n "$DEFAULT_YOLO_MODEL" ]]; then
   fi
 fi
 if [[ "$yolo_enabled" == true && -z "$DEFAULT_YOLO_PYTHON" ]]; then
-  printf '%s\n' "warning: no executable Python found for YOLO node; using ROS launch defaults." >&2
+  printf '%s\n' "error: YOLO is enabled but no Python runtime is available." >&2
+  exit 2
 fi
+if [[ "$yolo_enabled" == true ]]; then
+  case "$DEFAULT_YOLO_BACKEND" in
+    tensorrt)
+      if [[ -z "$DEFAULT_YOLO_TENSORRT_ENGINE_PATH" ]]; then
+        if [[ "$DEFAULT_YOLO_MODEL" != *.pt ]]; then
+          printf '%s\n' "error: TensorRT requires a .pt source model or YOLO_TENSORRT_ENGINE_PATH." >&2
+          exit 2
+        fi
+        DEFAULT_YOLO_TENSORRT_ENGINE_PATH="${DEFAULT_YOLO_MODEL%.pt}.engine"
+      fi
+      if [[ ! -f "$DEFAULT_YOLO_TENSORRT_ENGINE_PATH" ]]; then
+        printf '%s\n' "Preparing TensorRT FP16 engine: $DEFAULT_YOLO_TENSORRT_ENGINE_PATH"
+        if ! "$DEFAULT_YOLO_PYTHON" "$ROOT_DIR/scripts/prepare_yolo_tensorrt_engine.py" \
+          --model "$DEFAULT_YOLO_MODEL" \
+          --engine "$DEFAULT_YOLO_TENSORRT_ENGINE_PATH" \
+          --imgsz "$DEFAULT_YOLO_IMGSZ" \
+          --batch 2 \
+          --device "$DEFAULT_YOLO_DEVICE"; then
+          printf '%s\n' "error: TensorRT FP16 engine preparation failed; refusing an unverified PyTorch/CPU fallback." >&2
+          exit 2
+        fi
+      fi
+      DEFAULT_YOLO_MODEL="$DEFAULT_YOLO_TENSORRT_ENGINE_PATH"
+      ;;
+    pytorch)
+      ;;
+    *)
+      printf '%s\n' "error: --yolo-backend must be tensorrt or pytorch, got: $DEFAULT_YOLO_BACKEND" >&2
+      exit 2
+      ;;
+  esac
+fi
+export YOLO_BACKEND="$DEFAULT_YOLO_BACKEND"
+export YOLO_MODEL_PATH="$DEFAULT_YOLO_MODEL"
 OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-${DEFAULT_YOLO_PYTHON:-$(command -v python3 2>/dev/null || true)}}"
 
 if [[ "$GAZEBO_MAJOR_VERSION" -ge 7 ]] && ! command -v gz >/dev/null 2>&1; then
@@ -1013,11 +1055,7 @@ add_default_launch_arg plot_publish_hz "$DEFAULT_PLOT_HZ" "${launch_input[@]}"
 	add_default_launch_arg disparity_residual_feature_selector_window_size "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_WINDOW_SIZE:-1}" "${launch_input[@]}"
 	add_default_launch_arg disparity_residual_feature_selector_min_samples "${DISPARITY_RESIDUAL_FEATURE_SELECTOR_MIN_SAMPLES:-1}" "${launch_input[@]}"
 	if ! has_launch_arg gz_gui "${launch_input[@]}"; then
-  if [[ "$headless" == true ]]; then
-    launch_args+=("gz_gui:=false")
-  else
-    launch_args+=("gz_gui:=true")
-  fi
+  launch_args+=("gz_gui:=false")
 fi
 if ! has_launch_arg launch_rviz "${launch_input[@]}"; then
   if [[ "$headless" == true ]]; then

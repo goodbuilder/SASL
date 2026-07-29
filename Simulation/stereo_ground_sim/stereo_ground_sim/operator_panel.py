@@ -79,7 +79,7 @@ SERIES_LABELS = {
     "raw": "Nominal stereo",
     "optical": "Optical stereo",
     "ideal": "Ideal reference",
-    "raw_gps_baseline": "raw GPS",
+    "raw_gps_baseline": "Raw GPS Baseline",
     "uam_raw_gps_reference": "UAM raw GPS reference",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -273,7 +273,7 @@ class TelemetryFacts(QWidget):
         self._raw_label = QLabel("Nominal stereo F/R/D/R: --")
         self._corrected_label = QLabel("Optical stereo F/R/D/R: --")
         self._ideal_label = QLabel("Ideal reference F/R/D/R: --")
-        self._raw_gps_baseline_label = QLabel("Raw GPS baseline F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("Raw GPS Baseline F/R/D/R: --")
         self._detection_label = QLabel("BBox L/R: --")
         labels = (
             self._model_label,
@@ -390,7 +390,7 @@ class TelemetryFacts(QWidget):
             f"Ideal reference F/R/D/R: {self._format_frd(self._latest['ideal'])}"
         )
         self._raw_gps_baseline_label.setText(
-            "Raw GPS baseline F/R/D/R: "
+            "Raw GPS Baseline F/R/D/R: "
             f"{self._format_frd(self._latest['raw_gps_baseline'])}"
         )
         self._detection_label.setText(self._detection_text)
@@ -449,11 +449,11 @@ class ExperimentHud(QWidget):
         self._truth_label = QLabel("Truth F/R/D/R: --")
         self._raw_label = QLabel("Raw F/R/D/R: --")
         self._corrected_label = QLabel("Corrected F/R/D/R: --")
-        self._raw_gps_baseline_label = QLabel("Raw GPS baseline F/R/D/R: --")
-        self._global_baseline_label = QLabel("GlobalPosition baseline F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("Raw GPS Baseline F/R/D/R: --")
+        self._global_baseline_label = QLabel("Global Position Baseline F/R/D/R: --")
         self._forward_error_label = QLabel("Forward Δ raw/corr: --")
         self._down_error_label = QLabel("Down Δ raw/corr: --")
-        self._gps_baseline_error_label = QLabel("PX4 baseline ΔF raw/global: --")
+        self._gps_baseline_error_label = QLabel("Baseline ΔF Raw GPS/Global Position: --")
         self._detection_label = QLabel("Detections: --")
         self._contract_label = QLabel(contract)
 
@@ -514,17 +514,17 @@ class LiveSavedCsvPreview(QWidget):
                 ("time_sec", "Time (s)"),
                 ("ground_truth_m", "Truth range (m)"),
                 ("raw_range_m", "Nominal range (m)"),
-                ("raw_gps_baseline_range_m", "Raw GPS range (m)"),
+                ("raw_gps_baseline_range_m", "Raw GPS Baseline range (m)"),
             ),
         ),
         (
-            "Raw GPS",
+            "Raw GPS Baseline",
             (
                 ("time_sec", "Time (s)"),
-                ("raw_gps_baseline_forward_m", "Raw GPS F (m)"),
-                ("raw_gps_baseline_right_m", "Raw GPS R (m)"),
-                ("raw_gps_baseline_down_m", "Raw GPS D (m)"),
-                ("raw_gps_baseline_position_error_m", "Raw GPS position error (m)"),
+                ("raw_gps_baseline_forward_m", "Raw GPS Baseline F (m)"),
+                ("raw_gps_baseline_right_m", "Raw GPS Baseline R (m)"),
+                ("raw_gps_baseline_down_m", "Raw GPS Baseline D (m)"),
+                ("raw_gps_baseline_position_error_m", "Raw GPS Baseline position error (m)"),
             ),
         ),
         (
@@ -739,8 +739,9 @@ class LiveSavedCsvPreview(QWidget):
         )
         self._open_session_button.setEnabled(ready)
         self._open_csv_button.setEnabled(ready)
+        xlsx_path = self._recording_controls.recording_xlsx_path()
         self._open_xlsx_button.setEnabled(
-            ready and Path(session_path, "session.xlsx").is_file()
+            ready and xlsx_path is not None and xlsx_path.is_file()
         )
         self._export_button.setEnabled(ready)
 
@@ -1047,7 +1048,7 @@ class LiveSavedCsvPreview(QWidget):
                 "Coverage (facts only): "
                 f"Ground truth {valid.get('ground_truth_m', 0)}/{rows} · "
                 f"Stereo {valid.get('raw_range_m', 0)}/{rows} · "
-                f"Raw GPS baseline {valid.get('raw_gps_baseline_forward_m', 0)}/{rows} · "
+                f"Raw GPS Baseline {valid.get('raw_gps_baseline_forward_m', 0)}/{rows} · "
                 f"bbox pair {pair_count}/{rows}"
             )
             return
@@ -1069,7 +1070,7 @@ class LiveSavedCsvPreview(QWidget):
             preview = read_recent_csv_lines(csv_path, data_row_count=CSV_PREVIEW_RAW_ROWS)
             rows = read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)
         except FileNotFoundError:
-            preview = "Waiting for recorder to create telemetry.csv…"
+            preview = "Waiting for recorder to create telemetry CSV…"
             rows = []
         except OSError as exc:
             preview = f"CSV preview unavailable: {exc}"
@@ -1110,15 +1111,16 @@ class LiveSavedCsvPreview(QWidget):
         session_path = self._recording_controls.recording_session_path()
         if session_path is None:
             return
-        xlsx_path = Path(session_path) / "session.xlsx"
-        if xlsx_path.is_file():
+        xlsx_path = self._recording_controls.recording_xlsx_path()
+        if xlsx_path is not None and xlsx_path.is_file():
             self._open_path(xlsx_path)
 
     def _export_analysis_csv(self):
         csv_path = self._recording_controls.recording_csv_path()
         if csv_path is None or self._recording_controls.is_recording():
             return
-        output_path = Path(csv_path).with_name("analysis.csv")
+        timestamp = Path(csv_path).stem.removeprefix("telemetry_")
+        output_path = Path(csv_path).with_name(f"analysis_{timestamp}.csv")
         try:
             export_analysis_csv(csv_path, output_path)
         except OSError as exc:
@@ -1295,11 +1297,11 @@ class LiveSavedCsvPreview(QWidget):
         else:
             self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(corrected)}")
         self._raw_gps_baseline_label.setText(
-            "Raw GPS baseline F/R/D/R: "
+            "Raw GPS Baseline F/R/D/R: "
             f"{self._format_frd(self._latest['raw_gps_baseline'])}"
         )
         self._global_baseline_label.setText(
-            "GlobalPosition baseline F/R/D/R: "
+            "Global Position Baseline F/R/D/R: "
             f"{self._format_frd(self._latest['global_position_baseline'])}"
         )
         raw_f = self._latest_error("raw_forward")
@@ -1592,7 +1594,7 @@ class OperatorPanel(Plugin):
         layout.addWidget(
             QLabel(
                 "FRDR comparison: truth, Nominal stereo, Optical stereo, Ideal reference "
-                "(simulation-only), and PX4 Raw GPS baseline. "
+                "(simulation-only), and PX4 Raw GPS Baseline. "
                 "Range is the 3D vector magnitude when a source "
                 "publishes F/R/D only."
             )

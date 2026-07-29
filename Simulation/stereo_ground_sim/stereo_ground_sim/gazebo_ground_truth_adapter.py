@@ -29,8 +29,10 @@ from .coordinate_frames import (
 # never collide with the camera carriers' own ``base_link`` names.
 POSE_TOPIC = "/model/x500_15m/pose"
 OUTPUT_TOPIC = "/simulation/ground_truth/vehicle_reference_link"
+RVIZ_MARKER_TOPIC = "/stereo/ground_truth_markers"
 GAZEBO_MESSAGE_TYPE = "gz.msgs.Pose_V"
 ROS_MESSAGE_TYPE = "geometry_msgs/msg/PoseStamped"
+DRONE_MESH_RESOURCE = "package://stereo_ground_sim/models/x500_15m/meshes/NXP-HGD-CF.dae"
 
 
 class PosePayloadError(ValueError):
@@ -326,6 +328,8 @@ class GazeboGroundTruthAdapter:
             from geometry_msgs.msg import PoseStamped
             from rcl_interfaces.msg import SetParametersResult
             from rclpy.node import Node
+            from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+            from visualization_msgs.msg import Marker, MarkerArray
         except ImportError as exc:  # pragma: no cover - depends on ROS installation
             raise RuntimeError("rclpy and geometry_msgs are required for the adapter") from exc
 
@@ -337,6 +341,17 @@ class GazeboGroundTruthAdapter:
         self._node.declare_parameter("parent_model_name", str(parent_model_name))
         self._node.declare_parameter("source_link_name", str(source_link_name))
         self._publisher = self._node.create_publisher(PoseStamped, output_topic, 10)
+        marker_qos = QoSProfile(
+            depth=1,
+            history=HistoryPolicy.KEEP_LAST,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._marker_publisher = self._node.create_publisher(
+            MarkerArray, RVIZ_MARKER_TOPIC, marker_qos
+        )
+        self._marker_type = Marker
+        self._marker_array_type = MarkerArray
         self._parent_model_name = str(self._node.get_parameter("parent_model_name").value)
         configured_source_link = str(self._node.get_parameter("source_link_name").value)
         self._source_link_name = configured_source_link or f"{self._parent_model_name}::{SOURCE_GAZEBO_ENTITY}"
@@ -376,6 +391,38 @@ class GazeboGroundTruthAdapter:
                 reason="Ground Truth entity identity parameters are immutable for one run",
             )
         return self._set_parameters_result_type(successful=True)
+
+    def _publish_rviz_marker(self, record: PoseRecord) -> None:
+        """Publish the authoritative vehicle pose directly for RViz.
+
+        Contract: pose and marker frame are ``gazebo_world_enu`` in metres.
+        This path is intentionally independent of stereo inference and ray
+        generation, so visualization follows Gazebo even without detections.
+        """
+
+        marker = self._marker_type()
+        marker.header.frame_id = WORLD_FRAME
+        marker.header.stamp.sec = record.stamp_sec
+        marker.header.stamp.nanosec = record.stamp_nsec
+        marker.ns = "stereo_actual_drone"
+        marker.id = 40
+        marker.type = self._marker_type.MESH_RESOURCE
+        marker.action = self._marker_type.ADD
+        marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = (
+            record.position_world_enu_m
+        )
+        (
+            marker.pose.orientation.x,
+            marker.pose.orientation.y,
+            marker.pose.orientation.z,
+            marker.pose.orientation.w,
+        ) = record.orientation_world_from_entity_xyzw
+        marker.scale.x = marker.scale.y = marker.scale.z = 22.0
+        marker.color.r = marker.color.g = marker.color.b = 0.72
+        marker.color.a = 1.0
+        marker.mesh_resource = DRONE_MESH_RESOURCE
+        marker.mesh_use_embedded_materials = False
+        self._marker_publisher.publish(self._marker_array_type(markers=[marker]))
 
     def _run(self) -> None:
         while not self._shutdown.is_set():
@@ -431,6 +478,7 @@ class GazeboGroundTruthAdapter:
                             )
                         try:
                             self._publisher.publish(pose_record_to_ros_message(record))
+                            self._publish_rviz_marker(record)
                         except Exception as exc:
                             if self._shutdown.is_set() or not self._rclpy.ok():
                                 break
@@ -494,6 +542,7 @@ def main() -> None:  # pragma: no cover - requires a live ROS/Gazebo runtime
 __all__ = [
     "GAZEBO_MESSAGE_TYPE",
     "OUTPUT_TOPIC",
+    "RVIZ_MARKER_TOPIC",
     "POSE_TOPIC",
     "PosePayloadError",
     "PoseRecord",

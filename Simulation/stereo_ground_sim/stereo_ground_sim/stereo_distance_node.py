@@ -620,6 +620,11 @@ class StereoDistanceNode(Node):
         self.rviz_live_publish_count = 0
         self.rviz_live_error_count = 0
         self.gt_alignment_ready_queue = deque()
+        # A continuous camera stream keeps the measurement queue non-empty,
+        # while ground-truth alignments are required to evaluate and render
+        # the Ideal ray.  Alternate the two ready-work classes so neither
+        # one can starve the other.
+        self._prefer_gt_alignment_next = False
         self.measurement_results_by_pair_id = {}
         self.gt_alignments_by_pair_id = {}
         self.pairs_by_pair_id = {}
@@ -744,7 +749,11 @@ class StereoDistanceNode(Node):
             "mission_phase": "init",
             "status": "waiting for images",
         }
-        self.lock = threading.Lock()
+        # Measurement commits intentionally call helpers that read shared GPS
+        # state.  Those helpers also synchronize on this lock, so the owning
+        # worker must be able to re-enter it without deadlocking after the
+        # first Ray publication.
+        self.lock = threading.RLock()
         self.yolo_condition = threading.Condition(self.lock)
         self._initialize_research_recording()
         self._initialize_yolo_runtime_if_enabled()
@@ -875,6 +884,19 @@ class StereoDistanceNode(Node):
             if self.enable_rviz_rays
             else None
         )
+        # Keep configuration-only FOV geometry separate from live ray results.
+        # Both topics use reliable transient-local delivery so an RViz display
+        # enabled after startup receives the latest frustum immediately.
+        self.fov_marker_pub = (
+            self.create_publisher(MarkerArray, "/stereo/fov_markers", ray_marker_qos)
+            if self.enable_rviz_rays
+            else None
+        )
+        self.camera_marker_pub = (
+            self.create_publisher(MarkerArray, "/stereo/camera_markers", ray_marker_qos)
+            if self.enable_rviz_rays
+            else None
+        )
         self.ray_metrics_pub = self.create_publisher(String, "/stereo/ray_metrics", 10)
         self.yolo_inference_ms_pub = self.create_publisher(
             Float32, "/stereo/yolo_inference_ms", 10
@@ -921,6 +943,10 @@ class StereoDistanceNode(Node):
                     + (f" ({disabled_reason})" if disabled_reason else "")
                 )
         self.create_timer(0.2, self._publish_marker)
+        # The camera FOV is configuration geometry in ``WORLD_FRAME`` (ENU),
+        # not a result of YOLO matching.  Publish it independently so RViz
+        # remains useful while the detector is warming up or has no target.
+        self.create_timer(1.0, self._publish_camera_fov_markers)
         if self.enable_synthetic_detections:
             synthetic_hz = self.yolo_target_hz if self.yolo_target_hz > 0.0 else self.plot_publish_hz
             self.create_timer(1.0 / max(1.0, float(synthetic_hz)), self._publish_synthetic_detection_sample)
@@ -1990,7 +2016,10 @@ class StereoDistanceNode(Node):
             float(msg.pose.orientation.z),
             float(msg.pose.orientation.w),
         )
-        self._publish_actual_drone_marker(point_world, orientation_xyzw, stamp_ns)
+        # RViz vehicle rendering is published directly by
+        # ``gazebo_ground_truth_adapter`` on ``/stereo/ground_truth_markers``.
+        # Keeping it out of the ray stream prevents the initial marker from
+        # lingering when image-pair or inference work is unavailable.
         try:
             position = ground_truth_world_to_baseline(point_world, self.baseline_center_frd)
             if hasattr(self, "gt_position_buffer"):
@@ -2811,10 +2840,16 @@ class StereoDistanceNode(Node):
         self.image_subscriptions.extend(
             [
                 self.create_subscription(
-                    ImageMsg, "/left_camera/image", self._left_cb, camera_qos
+                    ImageMsg,
+                    "/left_camera/image",
+                    self._left_cb,
+                    camera_qos,
                 ),
                 self.create_subscription(
-                    ImageMsg, "/right_camera/image", self._right_cb, camera_qos
+                    ImageMsg,
+                    "/right_camera/image",
+                    self._right_cb,
+                    camera_qos,
                 ),
             ]
         )
@@ -3352,8 +3387,12 @@ class StereoDistanceNode(Node):
                     if self.shutdown_event.is_set():
                         return
                     self.yolo_condition.wait(timeout=0.1)
-                if self.gt_alignment_ready_queue:
+                prefer_alignment = bool(
+                    getattr(self, "_prefer_gt_alignment_next", False)
+                )
+                if prefer_alignment and self.gt_alignment_ready_queue:
                     alignment_work = self.gt_alignment_ready_queue.popleft()
+                    self._prefer_gt_alignment_next = False
                 elif self.measurement_pair_queue:
                     target_hz = self._measurement_processing_hz()
                     wait_s = next_tick - time.monotonic()
@@ -3361,6 +3400,10 @@ class StereoDistanceNode(Node):
                         self.yolo_condition.wait(timeout=wait_s)
                         continue
                     pair = self.measurement_pair_queue.popleft()
+                    self._prefer_gt_alignment_next = True
+                elif self.gt_alignment_ready_queue:
+                    alignment_work = self.gt_alignment_ready_queue.popleft()
+                    self._prefer_gt_alignment_next = False
                 if alignment_work is not None:
                     pair, alignment = alignment_work
                     try:
@@ -3567,6 +3610,8 @@ class StereoDistanceNode(Node):
                         nominal=raw,
                         optical=computed.get("corrected"),
                         ideal=ideal,
+                        gps_raw=computed.get("gps_baselines", {}).get("raw_gps"),
+                        gps_global=computed.get("gps_baselines", {}).get("global_position"),
                     )
                     self.rviz_live_publish_count += 1
             except Exception as exc:
@@ -3699,6 +3744,7 @@ class StereoDistanceNode(Node):
         )
         raw = computed.get("raw")
         optical = computed.get("corrected")
+        gps_baselines = computed.get("gps_baselines", {})
         if raw is not None:
             metrics.update(
                 {
@@ -3713,7 +3759,12 @@ class StereoDistanceNode(Node):
             )
             self._publish_ray_metrics(nominal=raw, optical=optical)
             if not self._rviz_latest_only_markers_enabled():
-                self._publish_ray_markers(nominal=raw, optical=optical)
+                self._publish_ray_markers(
+                    nominal=raw,
+                    optical=optical,
+                    gps_raw=gps_baselines.get("raw_gps"),
+                    gps_global=gps_baselines.get("global_position"),
+                )
         metrics.update(
             {
                 "optical_computation_status": (
@@ -3729,7 +3780,6 @@ class StereoDistanceNode(Node):
                 ),
             }
         )
-        gps_baselines = computed.get("gps_baselines", {})
         for source, gps_baseline in gps_baselines.items():
             prefix = f"{source}_baseline"
             metrics.update(
@@ -3793,7 +3843,13 @@ class StereoDistanceNode(Node):
         self.right_detection = right
         self.metrics = metrics
         if getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo":
-            self.detections_pub.publish(self._detections_to_msg(left, right))
+            detection_message = self._detections_to_msg(left, right)
+            # ``/stereo/detections`` is the ordered measurement stream for
+            # recording, while rqt overlays consume the display-only latest
+            # stream. Publish both from the completed measurement so a normal
+            # worker run shows the same bbox that produced its Nominal ray.
+            self.detections_pub.publish(detection_message)
+            self.live_detections_pub.publish(detection_message)
         disparity = metrics.get("disparity_px")
         distance = metrics.get("distance_m")
         error = metrics.get("distance_error_m")
@@ -5818,6 +5874,9 @@ class StereoDistanceNode(Node):
             return []
         if not math.isfinite(horizontal_fov) or horizontal_fov <= 0.0:
             return []
+        # This is display-only geometry.  Its depth follows the camera's far
+        # clipping distance; it does not alter image clipping or the camera
+        # FOV used by triangulation.
         depth_m = min(max(1.0, float(getattr(self, "camera_clip_far_m", 2500.0))), 2500.0)
         half_width = depth_m * math.tan(horizontal_fov * 0.5)
         half_height = half_width * height / width
@@ -5850,7 +5909,7 @@ class StereoDistanceNode(Node):
             faces.action = Marker.ADD
             faces.scale.x = faces.scale.y = faces.scale.z = 1.0
             faces.color.r, faces.color.g, faces.color.b = color
-            faces.color.a = 0.12
+            faces.color.a = 0.20
             faces.points = [
                 self._marker_point(point)
                 for point in (
@@ -5871,7 +5930,7 @@ class StereoDistanceNode(Node):
             edges.id = marker_id + 1
             edges.type = Marker.LINE_LIST
             edges.action = Marker.ADD
-            edges.scale.x = 1.0
+            edges.scale.x = 3.0
             edges.color.r, edges.color.g, edges.color.b = color
             edges.color.a = 0.9
             edges.points = [
@@ -5900,6 +5959,54 @@ class StereoDistanceNode(Node):
             markers_for_camera("left", 50, left_camera, (0.95, 0.95, 0.95))
             + markers_for_camera("right", 60, right_camera, (0.55, 0.72, 0.85))
         )
+
+    def _publish_camera_fov_markers(self):
+        """Publish the configured camera frustums without requiring a ray result.
+
+        Contract: marker points are in ``gazebo_world_enu`` metres.  Camera
+        poses supply ENU basis vectors; ``right/down/forward`` are used only
+        to construct points before they are serialized into that world frame.
+        """
+
+        publisher = getattr(self, "fov_marker_pub", None)
+        if publisher is None:
+            return
+        stamp = self.get_clock().now().to_msg()
+        markers = self._camera_fov_markers(stamp)
+        if markers:
+            publisher.publish(MarkerArray(markers=markers))
+        camera_publisher = getattr(self, "camera_marker_pub", None)
+        if camera_publisher is not None:
+            camera_publisher.publish(MarkerArray(markers=self._camera_position_markers(stamp)))
+
+    def _camera_position_markers(self, stamp):
+        """Render the two configured camera origins in ``gazebo_world_enu`` metres."""
+
+        snapshot = self._camera_oracle_snapshot()
+        if snapshot is not None:
+            left_camera, right_camera = (snapshot[0].pose, snapshot[1].pose)
+        else:
+            self._ensure_camera_frames()
+            left_camera, right_camera = self.nominal_left_camera, self.nominal_right_camera
+        markers = []
+        for marker_id, camera_pose, color in (
+            (30, left_camera, (0.95, 0.95, 0.95)),
+            (31, right_camera, (0.55, 0.65, 0.70)),
+        ):
+            camera = Marker()
+            camera.header.frame_id = WORLD_FRAME
+            camera.header.stamp = stamp
+            camera.ns = "stereo_cameras"
+            camera.id = marker_id
+            camera.type = Marker.CUBE
+            camera.action = Marker.ADD
+            camera.pose.position = self._marker_point(camera_pose.center_world_enu_m)
+            camera.pose.orientation.w = 1.0
+            # Scale affects only overview visibility; coordinates remain ENU metres.
+            camera.scale.x = camera.scale.y = camera.scale.z = 12.0
+            camera.color.r, camera.color.g, camera.color.b, camera.color.a = (*color, 1.0)
+            markers.append(camera)
+        return markers
 
     @staticmethod
     def _json_number(value):
@@ -5967,10 +6074,13 @@ class StereoDistanceNode(Node):
             publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
 
     def _rviz_latest_only_markers_enabled(self):
-        return (
-            bool(getattr(self, "rviz_live_latest_only", False))
+        worker = getattr(self, "rviz_live_thread", None)
+        return bool(
+            getattr(self, "rviz_live_latest_only", False)
             and bool(getattr(self, "enable_rviz_rays", False))
             and getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo"
+            and worker is not None
+            and worker.is_alive()
         )
 
     def _publish_actual_drone_marker(self, position_world_enu_m, orientation_xyzw, stamp_ns):
@@ -6002,12 +6112,17 @@ class StereoDistanceNode(Node):
         # Keep the mesh readable against RViz's dark background; the source
         # geometry remains the actual Gazebo X500 asset.
         marker.mesh_use_embedded_materials = False
-        publisher.publish(
-            MarkerArray(markers=[marker] + self._camera_fov_markers(marker.header.stamp))
-        )
+        publisher.publish(MarkerArray(markers=[marker]))
 
-    def _publish_ray_markers(self, nominal=None, optical=None, ideal=None):
-        """Publish Nominal, Optical, and DKL Ideal stereo rays in World ENU."""
+    def _publish_ray_markers(
+        self, nominal=None, optical=None, ideal=None, gps_raw=None, gps_global=None
+    ):
+        """Publish stereo rays in World ENU, including GPS-baseline variants.
+
+        ``gps_raw`` and ``gps_global`` retain the World ENU camera origins
+        used by their baseline-only triangulations.  They are visualization
+        only; public measurement topics remain baseline-center FRD.
+        """
 
         publisher = getattr(self, "ray_marker_pub", None)
         if publisher is None:
@@ -6097,33 +6212,30 @@ class StereoDistanceNode(Node):
                 midpoint_color=(32.0 / 255.0, 86.0 / 255.0, 1.0),
             )
         )
-        # Camera locations are deliberately position-only markers.  Optical
-        # pose is preferred because it is the observed Gazebo camera state;
-        # nominal geometry is a visual fallback while the oracle is absent.
-        camera_result = optical if optical is not None else nominal
-        camera_geometry = (
-            camera_result.get("ray_visualization_world_enu")
-            if camera_result is not None and camera_result.get("computation_status") == "computed"
-            else None
+        markers.extend(
+            marker_group(
+                gps_raw,
+                label="gps_raw",
+                marker_id=30,
+                # Purple distinguishes raw PX4 GPS baseline from optical rays.
+                left_color=(0.65, 0.25, 0.95),
+                right_color=(0.65, 0.25, 0.95),
+                gap_color=(0.82, 0.62, 1.0),
+                midpoint_color=(0.65, 0.25, 0.95),
+            )
         )
-        if camera_geometry is not None:
-            for marker_id, position, color in (
-                (30, camera_geometry["left_origin_world_enu_m"], (0.95, 0.95, 0.95)),
-                (31, camera_geometry["right_origin_world_enu_m"], (0.55, 0.65, 0.70)),
-            ):
-                camera = Marker()
-                camera.header.frame_id = WORLD_FRAME
-                camera.header.stamp = stamp
-                camera.ns = "stereo_cameras"
-                camera.id = marker_id
-                camera.type = Marker.CUBE
-                camera.action = Marker.ADD
-                camera.pose.position = self._marker_point(position)
-                camera.pose.orientation.w = 1.0
-                camera.scale.x = camera.scale.y = camera.scale.z = 12.0
-                camera.color.r, camera.color.g, camera.color.b, camera.color.a = (*color, 1.0)
-                markers.append(camera)
-        markers.extend(self._camera_fov_markers(stamp))
+        markers.extend(
+            marker_group(
+                gps_global,
+                label="gps_global",
+                marker_id=40,
+                # Amber distinguishes global-position baseline from raw GPS.
+                left_color=(1.0, 0.62, 0.0),
+                right_color=(1.0, 0.62, 0.0),
+                gap_color=(1.0, 0.82, 0.35),
+                midpoint_color=(1.0, 0.62, 0.0),
+            )
+        )
         if markers:
             publisher.publish(MarkerArray(markers=markers))
 
