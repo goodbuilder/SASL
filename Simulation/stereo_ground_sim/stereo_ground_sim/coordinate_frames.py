@@ -17,6 +17,21 @@ from typing import Sequence
 Vector3 = tuple[float, float, float]
 Matrix3 = tuple[Vector3, Vector3, Vector3]
 
+# The generated stereo-camera SDF fixes ``optical_link`` to ``base_link`` at
+# identity pose.  Its optical RDF axes are link (-Y, -Z, +X); PX4 body FRD
+# axes are the same physical (Forward, Right, Down) directions.  Therefore
+# this maps optical [Right, Down, Forward] components to PX4 body [F,R,D].
+PX4_BODY_FRD_FROM_OPTICAL_RDF: Matrix3 = (
+    (0.0, 0.0, 1.0),
+    (1.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0),
+)
+R_ENU_FROM_NED: Matrix3 = (
+    (0.0, 1.0, 0.0),
+    (1.0, 0.0, 0.0),
+    (0.0, 0.0, -1.0),
+)
+
 WORLD_FRAME = "gazebo_world_enu"
 BASELINE_CENTER_FRD_FRAME = "baseline_center_frd"
 VEHICLE_REFERENCE_LINK = "vehicle_reference_link"
@@ -94,6 +109,45 @@ def _det(matrix: Matrix3) -> float:
         - a[1] * (b[0] * c[2] - b[2] * c[0])
         + a[2] * (b[0] * c[1] - b[1] * c[0])
     )
+
+
+def validate_rotation_matrix(
+    matrix: Sequence[Sequence[float]], *, tolerance: float = 1.0e-12
+) -> dict[str, float]:
+    """Validate one explicit 3-D frame rotation and return audit metrics.
+
+    The matrix follows the module convention ``R_B_A``: it maps components
+    expressed in frame A into frame B.  Reflections are rejected even when
+    they are otherwise orthogonal.
+    """
+
+    if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
+        raise ValueError("rotation matrix must be 3x3")
+    parsed: Matrix3 = tuple(
+        tuple(float(value) for value in row) for row in matrix
+    )  # type: ignore[assignment]
+    if not all(math.isfinite(value) for row in parsed for value in row):
+        raise ValueError("rotation matrix must be finite")
+    tolerance = float(tolerance)
+    if not math.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("rotation tolerance must be finite and non-negative")
+    identity_candidate = _mat_mul(_transpose(parsed), parsed)
+    orthogonality_error = max(
+        abs(identity_candidate[row][column] - (1.0 if row == column else 0.0))
+        for row in range(3)
+        for column in range(3)
+    )
+    determinant = _det(parsed)
+    determinant_error = abs(determinant - 1.0)
+    if orthogonality_error > tolerance:
+        raise ValueError("rotation matrix must be orthogonal")
+    if determinant_error > tolerance:
+        raise ValueError("rotation matrix must have determinant +1")
+    return {
+        "orthogonality_error": orthogonality_error,
+        "determinant": determinant,
+        "determinant_error": determinant_error,
+    }
 
 
 @dataclass(frozen=True)
@@ -453,6 +507,38 @@ def camera_optical_pose_from_quaternion(
     )
 
 
+def camera_optical_pose_from_px4_attitude_wxyz(
+    center_world_enu_m: Sequence[float],
+    quaternion_wxyz: Sequence[float],
+    *,
+    rotation_body_from_optical: Sequence[Sequence[float]] = PX4_BODY_FRD_FROM_OPTICAL_RDF,
+) -> CameraOpticalPose:
+    """Build World-ENU optical RDF pose from PX4 FRD-to-NED attitude.
+
+    ``quaternion_wxyz`` is PX4 VehicleAttitude.q, explicitly converted to the
+    XYZW convention used by the existing quaternion rotation helper.
+    """
+
+    if len(quaternion_wxyz) != 4:
+        raise ValueError("quaternion_wxyz must contain four values")
+    w, x, y, z = (float(value) for value in quaternion_wxyz)
+    validate_rotation_matrix(rotation_body_from_optical)
+    parsed_body_from_optical: Matrix3 = tuple(
+        tuple(float(value) for value in row) for row in rotation_body_from_optical
+    )  # type: ignore[assignment]
+    rotation_ned_from_body = rotation_world_from_quaternion_xyzw((x, y, z, w))
+    rotation_enu_from_optical = _mat_mul(
+        _mat_mul(R_ENU_FROM_NED, rotation_ned_from_body),
+        parsed_body_from_optical,
+    )
+    return CameraOpticalPose(
+        center_world_enu_m=_finite_vector(center_world_enu_m, "center_world_enu_m"),
+        right_world_enu=normalize(_mat_vec(rotation_enu_from_optical, (1.0, 0.0, 0.0)), "right_world_enu"),
+        down_world_enu=normalize(_mat_vec(rotation_enu_from_optical, (0.0, 1.0, 0.0)), "down_world_enu"),
+        forward_world_enu=normalize(_mat_vec(rotation_enu_from_optical, (0.0, 0.0, 1.0)), "forward_world_enu"),
+    )
+
+
 def build_baseline_center_frd(
     left_center_world_enu_m: Sequence[float],
     right_center_world_enu_m: Sequence[float],
@@ -552,6 +638,8 @@ __all__ = [
     "BASELINE_CENTER_FRD_FRAME",
     "BaselineCenterFRD",
     "CameraOpticalPose",
+    "PX4_BODY_FRD_FROM_OPTICAL_RDF",
+    "R_ENU_FROM_NED",
     "REFERENCE_OFFSET_PARENT_M",
     "REFERENCE_OFFSET_PARENT_RPY_RAD",
     "SOURCE_GAZEBO_ENTITY",
@@ -562,6 +650,7 @@ __all__ = [
     "apply_optical_yaw",
     "build_baseline_center_frd",
     "camera_optical_pose_from_quaternion",
+    "camera_optical_pose_from_px4_attitude_wxyz",
     "camera_optical_pose_from_sdf_pose",
     "effective_optical_rpy_errors_deg",
     "effective_optical_yaws_deg",
@@ -576,4 +665,5 @@ __all__ = [
     "rotation_world_from_quaternion_xyzw",
     "sdf_link_rpy_from_optical_error",
     "sdf_link_rpy_from_px4_frd_error",
+    "validate_rotation_matrix",
 ]

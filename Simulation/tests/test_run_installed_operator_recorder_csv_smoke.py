@@ -43,7 +43,7 @@ class RunInstalledOperatorRecorderCsvSmokeTests(unittest.TestCase):
         self.assertEqual(result["installed_axis_contract"], module.PUBLIC_AXIS_CONTRACT)
         self.assertEqual(result["schema_audit_status"], "PASS")
         self.assertEqual(result["schema_audit_valid_row_count"], 1)
-        self.assertEqual(result["first_row_axis_contract"], module.PUBLIC_AXIS_CONTRACT)
+        self.assertFalse(result["first_row_has_axis_contract"])
         self.assertEqual(result["first_row_raw_forward_m"], "1000")
         self.assertEqual(result["first_row_corrected_forward_m"], "999")
         self.assertEqual(result["first_row_raw_gps_baseline_forward_m"], "1002")

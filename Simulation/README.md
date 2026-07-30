@@ -5810,15 +5810,22 @@ activate할 필요가 없습니다. 다른 Python을 강제할 때는
 
 `./run_operator_view.sh`의 기본값은 `gz_gui:=true`, `launch_rviz:=true`입니다. 기본 실행에서 Gazebo 3D GUI, rqt 카메라/그래프 창, RViz가 함께 뜹니다.
 
-Raw stereo ray와 삼각측량 geometry도 기본으로 표시합니다. 명목 optical pose의
-raw ray는 파랑/주황이고, Gazebo가 관측한 optical pose를 사용하는 ideal-oracle ray는
-초록/노랑입니다. 각 색상 쌍에는 독립적인 ray gap과 midpoint가 있어 자세 오차에 따른
-교차점 변화를 비교할 수 있습니다. RViz의 `Raw Stereo Rays (World ENU)` 아래에서
-`stereo_rays_raw`와 `stereo_rays_ideal_oracle`를 각각 켜거나 꺼서 비교할 수 있습니다.
-RViz의 `/stereo/ray_markers`는 Gazebo World ENU (`gazebo_world_enu`)에서 좌·우
-명목 광선, 최근접점 사이의 ray gap, 그리고 midpoint를 표시합니다. 이 표시는
-진단 전용이며, CSV와 rqt의 `baseline_center_frd` [Forward, Right, Down] 계약은
-변경하지 않습니다.
+RViz와 ray metrics의 사용자 표시 이름은 `Raw`, `Truth`, `Ideal`, `GPS`,
+`Global`, `Attitude`, `Baseline`, `Full`입니다. `Truth`는 target Ground
+Truth 점 자체가 아니라, 동일한 observed pixel에 Gazebo observed optical
+pose를 적용한 oracle 삼각측량입니다. `Attitude`는 PX4
+`VehicleAttitude`로 생성한 optical 자세와 Gazebo optical center를,
+`Baseline`은 Gazebo optical 자세와 raw `SensorGps` baseline을, `Full`은
+두 PX4 입력을 동시에 적용해 각각 독립적으로 재삼각측량합니다.
+
+`/stereo/ray_markers`는 모든 좌·우 ray, closest-ray gap, midpoint를 Gazebo
+World ENU (`gazebo_world_enu`, metre)로 표시합니다. 측정값·delta·interaction·
+Gazebo GT 오차는 고정 `baseline_center_frd` [Forward, Right, Down]에
+저장됩니다. raw GPS baseline은 기존 정책대로 nominal left optical center를
+anchor로 유지하고 PX4 상대 ENU separation만 right center에 적용하며,
+GNSS antenna–optical-center lever arm을 보정하지 않습니다. attitude 신선도와
+좌우 skew는 `PX4_ATTITUDE_MAX_AGE_S`, `PX4_ATTITUDE_PAIR_SKEW_S`로
+조정하며, invalid/stale 입력은 nominal로 fallback하지 않습니다.
 RViz를 끄려면 `launch_rviz:=false`를 명시합니다.
 
 인자를 넘길 수도 있습니다.

@@ -14,10 +14,30 @@ if str(PACKAGE_ROOT) not in sys.path:
 from stereo_ground_sim.coordinate_frames import build_baseline_center_frd, nominal_camera_poses
 from sasl_common.stereo_geometry import PinholeIntrinsics
 from stereo_ground_sim.stereo_distance_node import (
+    RAY_DISPLAY_NAMES,
     dkl_ideal_pixels_from_world,
     reference_ray_world_enu_from_point,
     ray_visualization_world_enu_from_triangulation,
 )
+
+
+def test_ray_display_names_keep_internal_keys_and_use_contract_labels() -> None:
+    assert {key: RAY_DISPLAY_NAMES[key] for key in (
+        "nominal", "optical", "ideal", "gps_raw", "gps_global"
+    )} == {
+        "nominal": "Raw",
+        "optical": "Truth",
+        "ideal": "Ideal",
+        "gps_raw": "GPS",
+        "gps_global": "Global",
+    }
+
+    source = (PACKAGE_ROOT / "stereo_ground_sim" / "operator_panel.py").read_text(encoding="utf-8")
+    assert '"raw": "Raw"' in source
+    assert '"optical": "Truth"' in source
+    assert '"ideal": "Ideal"' in source
+    assert '"raw_gps_baseline": "GPS"' in source
+    assert '"global_position_baseline": "Global"' in source or '"Global F/R/D/R:' in source
 
 
 def test_raw_ray_visualization_converts_solver_frd_endpoints_back_to_world_enu() -> None:
@@ -146,7 +166,8 @@ def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_group
     assert "self.live_detections_pub.publish(self._detections_to_msg(left, right))" in source
     assert "rviz_live_latest_only" in source
     assert "rviz_live_ray_hz" in source
-    assert "self._publish_ray_metrics(nominal=raw, optical=optical)" in source
+    assert 'diagnostic_rays = computed.get("diagnostic_rays", {})' in source
+    assert 'interaction=diagnostic_analysis["interaction"]' in source
     assert "self._publish_ray_metrics(\n                        nominal=raw," in source
     assert "if not self._rviz_latest_only_markers_enabled()" in source
     assert 'worker = getattr(self, "rviz_live_thread", None)' in source
@@ -156,7 +177,8 @@ def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_group
     assert 'self.create_publisher(MarkerArray, "/stereo/fov_markers", ray_marker_qos)' in source
     assert 'self.create_publisher(MarkerArray, "/stereo/camera_markers", ray_marker_qos)' in source
     assert "durability=DurabilityPolicy.TRANSIENT_LOCAL" in source
-    assert 'self._publish_ray_metrics(ideal=ideal)' in source
+    assert "nominal=metrics.get(\"_raw_ray\")" in source
+    assert "ideal=ideal" in source
     assert "self.lock = threading.RLock()" in source
     assert "self.live_detections_pub.publish(detection_message)" in source
     assert "ideal=ideal" in source
@@ -165,6 +187,11 @@ def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_group
     assert 'label="ideal"' in source
     assert 'label="gps_raw"' in source
     assert 'label="gps_global"' in source
+    assert 'display_name = RAY_DISPLAY_NAMES[label]' in source
+    assert 'f"left_{display_name}_ray"' in source
+    assert 'f"right_{display_name}_ray"' in source
+    assert 'f"{display_name}_closest_ray_gap"' in source
+    assert "gazebo_optical_pose_oracle" in source
     assert 'gps_raw=computed.get("gps_baselines", {}).get("raw_gps")' in source
     assert 'gps_global=computed.get("gps_baselines", {}).get("global_position")' in source
     assert 'camera.ns = "stereo_cameras"' in source
@@ -189,7 +216,7 @@ def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_group
     assert "RViz vehicle rendering is published directly by" in source
     assert 'DRONE_MESH_RESOURCE = "package://stereo_ground_sim/models/x500_15m/meshes/NXP-HGD-CF.dae"' in source
     assert 'namespace = f"stereo_rays_{label}"' in source
-    assert 'f"left_{label}_ray"' in source
+    assert 'f"left_{display_name}_ray"' in source
     assert 'left_target, 2.0)' in source
     assert 'right_target, 2.0)' in source
     assert 'left_target, right_target, 1.5)' in source
@@ -216,3 +243,23 @@ def test_rviz_ray_colors_match_the_nominal_optical_and_ideal_rqt_series() -> Non
     assert source.count('left_color=(32.0 / 255.0, 86.0 / 255.0, 1.0)') == 1
     assert source.count('right_color=(32.0 / 255.0, 86.0 / 255.0, 1.0)') == 1
     assert source.count('midpoint_color=(32.0 / 255.0, 86.0 / 255.0, 1.0)') == 1
+    for marker_id, label in (
+        (0, "nominal"),
+        (10, "optical"),
+        (20, "ideal"),
+        (30, "gps_raw"),
+        (40, "gps_global"),
+        (50, "attitude"),
+        (60, "baseline"),
+        (70, "full"),
+    ):
+        assert f'label="{label}",' in source
+        assert f"marker_id={marker_id}," in source
+    for color in (
+        "(0.65, 0.25, 0.95)",
+        "(1.0, 0.62, 0.0)",
+        "(1.0, 0.1, 0.75)",
+        "(0.35, 0.9, 0.1)",
+        "(0.95, 0.95, 0.95)",
+    ):
+        assert f"left_color={color}" in source

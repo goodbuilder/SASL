@@ -18,7 +18,15 @@ from sasl_common.stereo_geometry import (
     triangulate_rays,
 )
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode
+from stereo_ground_sim.coordinate_frames import camera_optical_pose_from_px4_attitude_wxyz
 from camera_oracle_test_support import seed_observed_camera_oracle
+
+
+def test_px4_identity_attitude_maps_fixed_body_to_optical_extrinsic() -> None:
+    pose = camera_optical_pose_from_px4_attitude_wxyz((1.0, 2.0, 3.0), (1.0, 0.0, 0.0, 0.0))
+    assert pose.right_world_enu == pytest.approx((1.0, 0.0, 0.0), abs=1e-12)
+    assert pose.down_world_enu == pytest.approx((0.0, 0.0, -1.0), abs=1e-12)
+    assert pose.forward_world_enu == pytest.approx((0.0, 1.0, 0.0), abs=1e-12)
 
 
 def test_known_point_and_skew_ray_midpoint() -> None:

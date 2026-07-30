@@ -128,6 +128,8 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "relative_optical_yaw_error_deg",
         "camera_update_rate_hz",
         "gps_baseline_max_age_s",
+        "px4_attitude_max_age_s",
+        "px4_attitude_pair_skew_s",
     }
     int_params = {
         "yolo_imgsz",
@@ -247,6 +249,10 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "global_baseline_left_topic",
         "global_baseline_right_topic",
         "gps_baseline_max_age_s",
+        "px4_attitude_left_topic",
+        "px4_attitude_right_topic",
+        "px4_attitude_max_age_s",
+        "px4_attitude_pair_skew_s",
         "enable_rviz_rays",
     ]
 
@@ -733,6 +739,12 @@ def generate_launch_description():
             DeclareLaunchArgument("global_baseline_left_topic", default_value="/camera_left/fmu/out/vehicle_global_position"),
             DeclareLaunchArgument("global_baseline_right_topic", default_value="/camera_right/fmu/out/vehicle_global_position"),
             DeclareLaunchArgument("gps_baseline_max_age_s", default_value="2.5"),
+            DeclareLaunchArgument("px4_attitude_left_topic", default_value="/camera_left/fmu/out/vehicle_attitude"),
+            DeclareLaunchArgument("px4_attitude_right_topic", default_value="/camera_right/fmu/out/vehicle_attitude"),
+            # Seconds: 2.5 matches the existing camera/GPS diagnostic freshness
+            # envelope; pair skew uses the same simulation-data contract.
+            DeclareLaunchArgument("px4_attitude_max_age_s", default_value="2.5"),
+            DeclareLaunchArgument("px4_attitude_pair_skew_s", default_value="2.5"),
             DeclareLaunchArgument("enable_rviz_rays", default_value="true"),
             DeclareLaunchArgument("synthetic_detection_width_px", default_value="1280"),
             DeclareLaunchArgument("synthetic_detection_height_px", default_value="720"),

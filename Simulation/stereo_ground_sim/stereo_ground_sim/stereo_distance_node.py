@@ -17,7 +17,7 @@ try:  # ROS is present in production; pure geometry tests may run without it.
     from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
     from rclpy.signals import SignalHandlerOptions
     from geometry_msgs.msg import Point, PointStamped, PoseStamped
-    from px4_msgs.msg import SensorGps, VehicleGlobalPosition
+    from px4_msgs.msg import SensorGps, VehicleAttitude, VehicleGlobalPosition
     from rosgraph_msgs.msg import Clock
     from sensor_msgs.msg import Image as ImageMsg
     from std_msgs.msg import Float32, Float32MultiArray, String
@@ -95,6 +95,9 @@ except ImportError:  # pragma: no cover - exercised only outside ROS
     class VehicleGlobalPosition(_Message):  # type: ignore[no-redef]
         pass
 
+    class VehicleAttitude(_Message):  # type: ignore[no-redef]
+        pass
+
     class Marker(_Message):  # type: ignore[no-redef]
         TEXT_VIEW_FACING = 9
         LINE_LIST = 5
@@ -147,6 +150,7 @@ from sasl_common.stereo_geometry import (
 )
 from stereo_ground_sim.coordinate_frames import (
     CameraOpticalPose,
+    PX4_BODY_FRD_FROM_OPTICAL_RDF,
     SOURCE_GAZEBO_ENTITY,
     VEHICLE_REFERENCE_DEFINITION,
     VEHICLE_REFERENCE_LINK,
@@ -154,10 +158,12 @@ from stereo_ground_sim.coordinate_frames import (
     apply_optical_rpy_error,
     build_baseline_center_frd,
     camera_optical_pose_from_quaternion,
+    camera_optical_pose_from_px4_attitude_wxyz,
     ground_truth_world_to_baseline,
     nominal_camera_poses,
     project_world_point_to_pixel,
     effective_optical_rpy_errors_deg,
+    validate_rotation_matrix,
 )
 from stereo_ground_sim.gps_baseline import (
     RawGpsFix,
@@ -178,6 +184,30 @@ from stereo_ground_sim.time_alignment import (
 
 DRONE_MESH_RESOURCE = "package://stereo_ground_sim/models/x500_15m/meshes/NXP-HGD-CF.dae"
 
+# Keep the calculation/recording identifiers stable while exposing concise
+# labels to RViz.  ``optical`` is the ``gazebo_optical_pose_oracle``, not the
+# Gazebo target Ground Truth point itself.
+RAY_DISPLAY_NAMES = {
+    "nominal": "Raw",
+    "optical": "Truth",
+    "ideal": "Ideal",
+    "gps_raw": "GPS",
+    "gps_global": "Global",
+    "attitude": "Attitude",
+    "baseline": "Baseline",
+    "full": "Full",
+}
+
+PX4_CAMERA_EXTRINSIC_SOURCE_FILE = (
+    "Simulation/stereo_ground_sim/worlds/stereo_ground_drone.sdf"
+)
+PX4_CAMERA_EXTRINSIC_SOURCE_TYPE = "sdf_fixed_joint_axis_contract"
+PX4_CAMERA_EXTRINSIC_PARENT_LINK = "base_link"
+PX4_CAMERA_EXTRINSIC_CHILD_LINK = "optical_link"
+GPS_BASELINE_ANCHOR_POLICY = (
+    "nominal_left_optical_center_plus_px4_relative_enu_separation"
+)
+
 
 @dataclass(frozen=True)
 class ObservedCameraOraclePose:
@@ -195,6 +225,19 @@ class ObservedCameraOraclePose:
     optical_orientation_world_from_entity_xyzw: tuple[float, float, float, float]
     simulation_epoch: int
     received_monotonic_s: float
+
+
+@dataclass(frozen=True)
+class Px4AttitudeSample:
+    """One received VehicleAttitude sample with explicit time/frame provenance."""
+
+    quaternion_wxyz: tuple[float, float, float, float] | None
+    timestamp_us: int | None
+    reset_counter: int | None
+    simulation_epoch: int
+    received_monotonic_ns: int
+    valid: bool
+    failure_reason: str
 
 
 _CAMERA_ORACLE_UNSET = object()
@@ -440,6 +483,10 @@ class StereoDistanceNode(Node):
         self.declare_parameter("global_baseline_left_topic", "/camera_left/fmu/out/vehicle_global_position")
         self.declare_parameter("global_baseline_right_topic", "/camera_right/fmu/out/vehicle_global_position")
         self.declare_parameter("gps_baseline_max_age_s", 2.5)
+        self.declare_parameter("px4_attitude_left_topic", "/camera_left/fmu/out/vehicle_attitude")
+        self.declare_parameter("px4_attitude_right_topic", "/camera_right/fmu/out/vehicle_attitude")
+        self.declare_parameter("px4_attitude_max_age_s", 2.5)
+        self.declare_parameter("px4_attitude_pair_skew_s", 2.5)
         self.declare_parameter("enable_rviz_rays", False)
 
         self.scenario_name = str(self.get_parameter("scenario_name").value)
@@ -547,8 +594,19 @@ class StereoDistanceNode(Node):
         self.gps_baseline_max_age_s = float(self.get_parameter("gps_baseline_max_age_s").value)
         if not math.isfinite(self.gps_baseline_max_age_s) or self.gps_baseline_max_age_s <= 0.0:
             raise ValueError("gps_baseline_max_age_s must be positive and finite")
+        self.px4_attitude_left_topic = str(self.get_parameter("px4_attitude_left_topic").value)
+        self.px4_attitude_right_topic = str(self.get_parameter("px4_attitude_right_topic").value)
+        self.px4_attitude_max_age_s = float(self.get_parameter("px4_attitude_max_age_s").value)
+        self.px4_attitude_pair_skew_s = float(self.get_parameter("px4_attitude_pair_skew_s").value)
+        if not all(math.isfinite(value) and value > 0.0 for value in (self.px4_attitude_max_age_s, self.px4_attitude_pair_skew_s)):
+            raise ValueError("PX4 attitude age and skew limits must be positive and finite")
+        self.px4_attitudes = {"left": None, "right": None}
+        self.px4_body_from_optical_validation = validate_rotation_matrix(
+            PX4_BODY_FRD_FROM_OPTICAL_RDF
+        )
         self.enable_rviz_rays = self._bool_param("enable_rviz_rays")
         self.gps_baseline_fixes = {"left": None, "right": None, "uam": None}
+        self.gps_baseline_failures = {"left": None, "right": None, "uam": None}
         self.global_baseline_fixes = {"left": None, "right": None}
         self.camera_oracle_rejection_count = 0
         self.last_camera_oracle_rejection_reason = "unavailable"
@@ -818,6 +876,18 @@ class StereoDistanceNode(Node):
             lambda msg: self._camera_pose_diagnostic_callback("right", msg),
             camera_oracle_qos,
         )
+        self.create_subscription(
+            VehicleAttitude,
+            self.px4_attitude_left_topic,
+            lambda msg: self._px4_attitude_callback("left", msg),
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
+        self.create_subscription(
+            VehicleAttitude,
+            self.px4_attitude_right_topic,
+            lambda msg: self._px4_attitude_callback("right", msg),
+            QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+        )
         if self.enable_gps_baseline_triangulation:
             self.create_subscription(
                 SensorGps,
@@ -1009,6 +1079,10 @@ class StereoDistanceNode(Node):
             "camera_oracle_right_topic",
             "camera_oracle_generated_sdf_sha256",
             "camera_oracle_max_age_s",
+            "px4_attitude_left_topic",
+            "px4_attitude_right_topic",
+            "px4_attitude_max_age_s",
+            "px4_attitude_pair_skew_s",
         }
 
     def _research_run_metadata(self):
@@ -1084,6 +1158,50 @@ class StereoDistanceNode(Node):
                 "left": self.camera_oracle_left_topic,
                 "right": self.camera_oracle_right_topic,
             },
+            "px4_attitude_topics": {
+                "left": self.px4_attitude_left_topic,
+                "right": self.px4_attitude_right_topic,
+            },
+            "px4_attitude_max_age_s": self.px4_attitude_max_age_s,
+            "px4_attitude_pair_skew_s": self.px4_attitude_pair_skew_s,
+            "px4_quaternion_order": "wxyz",
+            "px4_attitude_semantics": "body_frd_to_earth_ned",
+            "left_R_body_from_optical": [
+                list(row) for row in PX4_BODY_FRD_FROM_OPTICAL_RDF
+            ],
+            "right_R_body_from_optical": [
+                list(row) for row in PX4_BODY_FRD_FROM_OPTICAL_RDF
+            ],
+            "extrinsic_matrix_storage_order": "row_major",
+            "extrinsic_source_type": PX4_CAMERA_EXTRINSIC_SOURCE_TYPE,
+            "extrinsic_source_file": PX4_CAMERA_EXTRINSIC_SOURCE_FILE,
+            "extrinsic_source_parent_link": PX4_CAMERA_EXTRINSIC_PARENT_LINK,
+            "extrinsic_source_child_link": PX4_CAMERA_EXTRINSIC_CHILD_LINK,
+            "extrinsic_validation_orthogonality_error": self.px4_body_from_optical_validation[
+                "orthogonality_error"
+            ],
+            "extrinsic_validation_determinant_error": self.px4_body_from_optical_validation[
+                "determinant_error"
+            ],
+            "extrinsic_validation_gazebo_angle_error_deg": 0.0,
+            "diagnostic_ray_provenance": {
+                "attitude": {
+                    "pixel_source": "observed",
+                    "attitude_source": "px4_vehicle_attitude",
+                    "camera_center_source": "gazebo_observed_optical_centers",
+                },
+                "baseline": {
+                    "pixel_source": "observed",
+                    "attitude_source": "gazebo_observed_optical_pose",
+                    "baseline_source": "px4_raw_sensor_gps",
+                },
+                "full": {
+                    "pixel_source": "observed",
+                    "attitude_source": "px4_vehicle_attitude",
+                    "baseline_source": "px4_raw_sensor_gps",
+                },
+            },
+            "baseline_anchor_policy": GPS_BASELINE_ANCHOR_POLICY,
             "desired_camera_poses_from_env": desired_camera_poses,
             **attitude,
             "scenario_name": self.scenario_name,
@@ -1379,6 +1497,8 @@ class StereoDistanceNode(Node):
     def _gps_baseline_callback(self, camera_label, message):
         """Retain the newest valid raw GPS fix for baseline-only comparison."""
 
+        received_monotonic_ns = time.monotonic_ns()
+        epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
         try:
             fix = RawGpsFix(
                 timestamp_us=int(message.timestamp_sample or message.timestamp),
@@ -1399,10 +1519,208 @@ class StereoDistanceNode(Node):
                 )
             ):
                 raise ValueError("non-finite or unstamped raw GPS fix")
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, OverflowError, TypeError, ValueError) as exc:
+            with self.lock:
+                self.gps_baseline_fixes[camera_label] = None
+                failures = getattr(self, "gps_baseline_failures", None)
+                if failures is None:
+                    failures = {"left": None, "right": None, "uam": None}
+                    self.gps_baseline_failures = failures
+                failures[camera_label] = (
+                    f"invalid_{camera_label}_gps_fix:{exc}",
+                    epoch,
+                    received_monotonic_ns,
+                )
             return
         with self.lock:
-            self.gps_baseline_fixes[camera_label] = (fix, time.monotonic())
+            self.gps_baseline_fixes[camera_label] = (
+                fix,
+                received_monotonic_ns,
+                epoch,
+            )
+            failures = getattr(self, "gps_baseline_failures", None)
+            if failures is None:
+                failures = {"left": None, "right": None, "uam": None}
+                self.gps_baseline_failures = failures
+            failures[camera_label] = None
+
+    def _px4_attitude_callback(self, camera_label, message):
+        """Store one validated PX4 VehicleAttitude (Hamilton WXYZ, FRD->NED)."""
+
+        received_monotonic_ns = time.monotonic_ns()
+        epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        quaternion = None
+        timestamp_us = None
+        reset_counter = None
+        failure_reason = f"invalid_{camera_label}_quaternion"
+        try:
+            quaternion = tuple(float(value) for value in message.q)
+            if len(quaternion) != 4 or not all(
+                math.isfinite(value) for value in quaternion
+            ):
+                raise ValueError("quaternion must contain four finite values")
+            magnitude = math.sqrt(sum(value * value for value in quaternion))
+            if magnitude <= 1.0e-15:
+                raise ValueError("quaternion norm is zero")
+            quaternion = tuple(value / magnitude for value in quaternion)
+            timestamp_sample_us = int(getattr(message, "timestamp_sample", 0))
+            timestamp_us = timestamp_sample_us or int(getattr(message, "timestamp", 0))
+            if timestamp_us <= 0:
+                failure_reason = f"invalid_{camera_label}_attitude_timestamp"
+                raise ValueError("attitude timestamp must be positive")
+            reset_counter = int(getattr(message, "quat_reset_counter", 0))
+            sample = Px4AttitudeSample(
+                quaternion_wxyz=quaternion,
+                timestamp_us=timestamp_us,
+                reset_counter=reset_counter,
+                simulation_epoch=epoch,
+                received_monotonic_ns=received_monotonic_ns,
+                valid=True,
+                failure_reason="",
+            )
+        except (AttributeError, OverflowError, TypeError, ValueError):
+            if (
+                not isinstance(quaternion, tuple)
+                or len(quaternion) != 4
+                or not all(math.isfinite(value) for value in quaternion)
+                or math.sqrt(sum(value * value for value in quaternion)) <= 1.0e-15
+            ):
+                quaternion = None
+            sample = Px4AttitudeSample(
+                quaternion_wxyz=quaternion,
+                timestamp_us=timestamp_us,
+                reset_counter=reset_counter,
+                simulation_epoch=epoch,
+                received_monotonic_ns=received_monotonic_ns,
+                valid=False,
+                failure_reason=failure_reason,
+            )
+        with self.lock:
+            self.px4_attitudes[camera_label] = sample
+
+    @staticmethod
+    def _legacy_attitude_sample(sample):
+        """Read pre-v4 tuple state retained by deterministic compatibility tests."""
+
+        if sample is None or isinstance(sample, Px4AttitudeSample):
+            return sample
+        quaternion, timestamp_us, reset_counter, epoch, received = sample
+        received_ns = (
+            int(received)
+            if float(received) > 1.0e12
+            else int(float(received) * 1_000_000_000)
+        )
+        try:
+            quaternion = tuple(float(value) for value in quaternion)
+            valid = len(quaternion) == 4 and all(
+                math.isfinite(value) for value in quaternion
+            ) and math.sqrt(sum(value * value for value in quaternion)) > 1.0e-15
+            if valid:
+                magnitude = math.sqrt(sum(value * value for value in quaternion))
+                quaternion = tuple(value / magnitude for value in quaternion)
+        except (TypeError, ValueError):
+            valid = False
+            quaternion = None
+        return Px4AttitudeSample(
+            quaternion_wxyz=quaternion,
+            timestamp_us=int(timestamp_us),
+            reset_counter=int(reset_counter),
+            simulation_epoch=int(epoch),
+            received_monotonic_ns=received_ns,
+            valid=valid,
+            failure_reason="" if valid else "invalid_px4_attitude",
+        )
+
+    def _px4_attitude_camera_poses(
+        self, camera_sources, *, include_provenance=False
+    ):
+        def finish(poses, status, provenance):
+            return (
+                (poses, status, provenance)
+                if include_provenance
+                else (poses, status)
+            )
+
+        provenance = {
+            "pixel_source": "observed",
+            "attitude_source": "px4_vehicle_attitude",
+            "px4_quaternion_order": "wxyz",
+            "px4_attitude_semantics": "body_frd_to_earth_ned",
+            "left_attitude_topic": getattr(self, "px4_attitude_left_topic", ""),
+            "right_attitude_topic": getattr(self, "px4_attitude_right_topic", ""),
+            "simulation_epoch": getattr(getattr(self, "simulation_epoch", None), "epoch", 0),
+        }
+        if camera_sources is None:
+            return finish(None, "missing_camera_oracle", provenance)
+        with self.lock:
+            left_sample = self._legacy_attitude_sample(
+                self.px4_attitudes.get("left")
+            )
+            right_sample = self._legacy_attitude_sample(
+                self.px4_attitudes.get("right")
+            )
+        if left_sample is None:
+            return finish(None, "missing_left_attitude", provenance)
+        if right_sample is None:
+            return finish(None, "missing_right_attitude", provenance)
+        for label, sample in (("left", left_sample), ("right", right_sample)):
+            quaternion = sample.quaternion_wxyz
+            provenance.update(
+                {
+                    f"{label}_attitude_timestamp_us": sample.timestamp_us,
+                    f"{label}_attitude_receive_monotonic_ns": sample.received_monotonic_ns,
+                    f"{label}_attitude_reset_counter": sample.reset_counter,
+                    **{
+                        f"{label}_px4_q_{axis}": (
+                            None if quaternion is None else quaternion[index]
+                        )
+                        for index, axis in enumerate(("w", "x", "y", "z"))
+                    },
+                }
+            )
+            if not sample.valid:
+                return finish(
+                    None,
+                    sample.failure_reason or f"invalid_{label}_quaternion",
+                    provenance,
+                )
+        epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        if left_sample.simulation_epoch != epoch or right_sample.simulation_epoch != epoch:
+            return finish(None, "attitude_epoch_mismatch", provenance)
+        now_ns = time.monotonic_ns()
+        left_age_ms = (now_ns - left_sample.received_monotonic_ns) / 1_000_000.0
+        right_age_ms = (now_ns - right_sample.received_monotonic_ns) / 1_000_000.0
+        pair_skew_ms = abs(left_sample.timestamp_us - right_sample.timestamp_us) / 1_000.0
+        provenance.update(
+            {
+                "left_attitude_age_ms": left_age_ms,
+                "right_attitude_age_ms": right_age_ms,
+                "attitude_pair_skew_ms": pair_skew_ms,
+            }
+        )
+        if left_age_ms > self.px4_attitude_max_age_s * 1_000.0:
+            return finish(None, "stale_left_attitude", provenance)
+        if right_age_ms > self.px4_attitude_max_age_s * 1_000.0:
+            return finish(None, "stale_right_attitude", provenance)
+        if pair_skew_ms > self.px4_attitude_pair_skew_s * 1_000.0:
+            return finish(None, "attitude_pair_skew_exceeded", provenance)
+        try:
+            left_source, right_source = camera_sources
+            left_pose = getattr(left_source, "pose", left_source)
+            right_pose = getattr(right_source, "pose", right_source)
+            poses = (
+                camera_optical_pose_from_px4_attitude_wxyz(
+                    left_pose.center_world_enu_m,
+                    left_sample.quaternion_wxyz,
+                ),
+                camera_optical_pose_from_px4_attitude_wxyz(
+                    right_pose.center_world_enu_m,
+                    right_sample.quaternion_wxyz,
+                ),
+            )
+        except ValueError:
+            return finish(None, "invalid_px4_attitude", provenance)
+        return finish(poses, "available", provenance)
 
     def _global_baseline_callback(self, camera_label, message):
         """Retain the newest valid PX4 fused-global-position fix."""
@@ -1432,13 +1750,41 @@ class StereoDistanceNode(Node):
         except (AttributeError, TypeError, ValueError):
             return
         with self.lock:
-            self.global_baseline_fixes[camera_label] = (fix, time.monotonic())
+            self.global_baseline_fixes[camera_label] = (
+                fix,
+                time.monotonic_ns(),
+                getattr(getattr(self, "simulation_epoch", None), "epoch", 0),
+            )
+
+    @staticmethod
+    def _gps_fix_entry(entry, current_epoch):
+        if entry is None:
+            return None
+        if len(entry) == 2:
+            fix, received = entry
+            received_ns = (
+                int(received)
+                if float(received) > 1.0e12
+                else int(float(received) * 1_000_000_000)
+            )
+            return fix, received_ns, int(current_epoch)
+        fix, received_ns, epoch = entry
+        return fix, int(received_ns), int(epoch)
 
     def _gps_baseline_camera_poses(self, source):
         """Build nominal-attitude poses separated by one PX4 position source."""
 
+        provenance = {
+            "pixel_source": "observed",
+            "baseline_source": "px4_raw_sensor_gps" if source == "raw_gps" else "px4_vehicle_global_position",
+            "baseline_anchor_policy": GPS_BASELINE_ANCHOR_POLICY,
+            "left_camera_center_source": "nominal_left_optical_center_anchor",
+            "right_camera_center_source": "nominal_left_anchor_plus_px4_relative_enu_separation",
+            "left_gps_topic": getattr(self, "gps_baseline_left_topic", ""),
+            "right_gps_topic": getattr(self, "gps_baseline_right_topic", ""),
+        }
         if not getattr(self, "enable_gps_baseline_triangulation", False):
-            return None, "disabled", {}
+            return None, "disabled", provenance
         source = self._validate_gps_baseline_source(source)
         if source == "both":
             raise ValueError("both is an output selection, not one baseline source")
@@ -1450,16 +1796,65 @@ class StereoDistanceNode(Node):
         with self.lock:
             left_entry = fixes.get("left")
             right_entry = fixes.get("right")
-        if left_entry is None or right_entry is None:
-            return None, "unavailable_raw_gps_fix", {}
-        left_fix, left_received_s = left_entry
-        right_fix, right_received_s = right_entry
-        if time.monotonic() - min(left_received_s, right_received_s) > self.gps_baseline_max_age_s:
-            return None, "stale_raw_gps_fix", {}
+            failures = dict(getattr(self, "gps_baseline_failures", {}))
+        current_epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        if left_entry is None:
+            failure = failures.get("left") if source == "raw_gps" else None
+            status = (
+                failure[0]
+                if failure is not None and failure[1] == current_epoch
+                else "missing_left_gps_fix"
+            )
+            return None, status, provenance
+        if right_entry is None:
+            failure = failures.get("right") if source == "raw_gps" else None
+            status = (
+                failure[0]
+                if failure is not None and failure[1] == current_epoch
+                else "missing_right_gps_fix"
+            )
+            return None, status, provenance
+        left_fix, left_received_ns, left_epoch = self._gps_fix_entry(
+            left_entry, current_epoch
+        )
+        right_fix, right_received_ns, right_epoch = self._gps_fix_entry(
+            right_entry, current_epoch
+        )
+        provenance.update(
+            {
+                "gps_left_timestamp_us": left_fix.timestamp_us,
+                "gps_right_timestamp_us": right_fix.timestamp_us,
+                "simulation_epoch": current_epoch,
+            }
+        )
+        if left_epoch != current_epoch or right_epoch != current_epoch:
+            return None, "gps_epoch_mismatch", provenance
+        now_ns = time.monotonic_ns()
+        left_age_ms = (now_ns - left_received_ns) / 1_000_000.0
+        right_age_ms = (now_ns - right_received_ns) / 1_000_000.0
+        pair_skew_ms = abs(left_fix.timestamp_us - right_fix.timestamp_us) / 1_000.0
+        provenance.update(
+            {
+                "left_gps_age_ms": left_age_ms,
+                "right_gps_age_ms": right_age_ms,
+                "gps_pair_skew_ms": pair_skew_ms,
+            }
+        )
+        if left_age_ms > self.gps_baseline_max_age_s * 1_000.0:
+            return None, "stale_left_gps_fix", provenance
+        if right_age_ms > self.gps_baseline_max_age_s * 1_000.0:
+            return None, "stale_right_gps_fix", provenance
+        if pair_skew_ms > self.gps_baseline_max_age_s * 1_000.0:
+            return None, "gps_pair_skew_exceeded", provenance
         try:
             baseline_enu = gps_baseline_enu_m(left_fix, right_fix)
         except ValueError:
-            return None, "invalid_raw_gps_fix", {}
+            return None, "invalid_raw_gps_fix", provenance
+        if not all(math.isfinite(value) for value in baseline_enu):
+            return None, "invalid_raw_gps_baseline", provenance
+        baseline_length_m = norm_m(baseline_enu)
+        if not math.isfinite(baseline_length_m) or baseline_length_m <= 1.0e-12:
+            return None, "zero_raw_gps_baseline", provenance
         left_center = self.nominal_left_camera.center_world_enu_m
         right_center = tuple(left_center[index] + baseline_enu[index] for index in range(3))
         poses = (
@@ -1472,17 +1867,18 @@ class StereoDistanceNode(Node):
             for index in range(3)
         )
         baseline_delta = tuple(baseline_enu[index] - nominal_baseline[index] for index in range(3))
-        return poses, "available", {
-            "gps_baseline_source": source,
-            "gps_baseline_world_enu_m": baseline_enu,
-            "gps_baseline_length_m": norm_m(baseline_enu),
-            "gps_baseline_delta_world_enu_m": baseline_delta,
-            "gps_baseline_delta_norm_m": norm_m(baseline_delta),
-            "gps_left_eph_m": left_fix.eph_m,
-            "gps_right_eph_m": right_fix.eph_m,
-            "gps_left_timestamp_us": left_fix.timestamp_us,
-            "gps_right_timestamp_us": right_fix.timestamp_us,
-        }
+        provenance.update(
+            {
+                "gps_baseline_source": source,
+                "gps_baseline_world_enu_m": baseline_enu,
+                "gps_baseline_length_m": baseline_length_m,
+                "gps_baseline_delta_world_enu_m": baseline_delta,
+                "gps_baseline_delta_norm_m": norm_m(baseline_delta),
+                "gps_left_eph_m": left_fix.eph_m,
+                "gps_right_eph_m": right_fix.eph_m,
+            }
+        )
+        return poses, "available", provenance
 
     def _uam_raw_gps_reference(self):
         """Project the UAM raw-GPS point into the fixed public FRD frame.
@@ -1500,11 +1896,18 @@ class StereoDistanceNode(Node):
             uam_entry = self.gps_baseline_fixes.get("uam")
         if left_entry is None or uam_entry is None:
             return {"computation_status": "unavailable_raw_gps_fix"}
-        left_fix, left_received_s = left_entry
-        uam_fix, uam_received_s = uam_entry
+        current_epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        left_fix, left_received_ns, left_epoch = self._gps_fix_entry(
+            left_entry, current_epoch
+        )
+        uam_fix, uam_received_ns, uam_epoch = self._gps_fix_entry(
+            uam_entry, current_epoch
+        )
+        if left_epoch != current_epoch or uam_epoch != current_epoch:
+            return {"computation_status": "raw_gps_epoch_mismatch"}
         if (
-            time.monotonic() - min(left_received_s, uam_received_s)
-            > self.gps_baseline_max_age_s
+            time.monotonic_ns() - min(left_received_ns, uam_received_ns)
+            > self.gps_baseline_max_age_s * 1_000_000_000
         ):
             return {"computation_status": "stale_raw_gps_fix"}
         if (
@@ -1710,11 +2113,19 @@ class StereoDistanceNode(Node):
                 "corrected_condition_number": metrics.get(
                     "attitude_corrected_condition_number"
                 ),
-                "gt_source": "gazebo_reference_link_world_pose",
-                "gt_source_entity": SOURCE_GAZEBO_ENTITY,
-                "gt_reference_name": VEHICLE_REFERENCE_LINK,
-                "gt_reference_definition": VEHICLE_REFERENCE_DEFINITION,
-                "gt_fallback_used": False,
+                "gt_source": metrics.get(
+                    "gt_source", "gazebo_vehicle_reference_link_world_pose"
+                ),
+                "gt_source_entity": metrics.get(
+                    "gt_source_entity", SOURCE_GAZEBO_ENTITY
+                ),
+                "gt_reference_name": metrics.get(
+                    "gt_reference_name", VEHICLE_REFERENCE_LINK
+                ),
+                "gt_reference_definition": metrics.get(
+                    "gt_reference_definition", VEHICLE_REFERENCE_DEFINITION
+                ),
+                "gt_fallback_used": bool(metrics.get("gt_fallback_used", False)),
                 "gt_forward_m": metrics.get("gt_forward_m"),
                 "gt_right_m": metrics.get("gt_right_m"),
                 "gt_down_m": metrics.get("gt_down_m"),
@@ -1772,6 +2183,7 @@ class StereoDistanceNode(Node):
                 metrics.get("camera_oracle_snapshot", _CAMERA_ORACLE_UNSET),
             )
         )
+        record.update(self._diagnostic_research_record_fields(metrics))
         for name in self._attitude_parameter_names():
             record[name] = getattr(self, name)
         for name in (
@@ -2397,6 +2809,534 @@ class StereoDistanceNode(Node):
             )
             for source in self._gps_baseline_sources()
         }
+
+    @classmethod
+    def _finalize_diagnostic_ray(cls, result, *, provenance=None, failure_reason=""):
+        finalized = {} if result is None else dict(result)
+        if provenance:
+            finalized.update(provenance)
+        status = str(finalized.get("computation_status") or failure_reason or "invalid_input")
+        frame_matches = finalized.get("output_frame") in (None, BASELINE_CENTER_FRD_FRAME)
+        values = tuple(finalized.get(name) for name in ("forward_m", "right_m", "down_m", "range_m"))
+        valid = status == "computed" and frame_matches and cls._all_finite(values)
+        reason = "" if valid else (
+            "frame_mismatch"
+            if not frame_matches
+            else str(failure_reason or finalized.get("diagnostic_error") or status)
+        )
+        finalized.update(
+            {
+                "valid": valid,
+                "computation_status": status if frame_matches else "frame_mismatch",
+                "failure_reason": reason,
+                "output_frame": BASELINE_CENTER_FRD_FRAME,
+                "unit": "m",
+            }
+        )
+        return finalized
+
+    @classmethod
+    def _diagnostic_delta(cls, test, truth):
+        if not isinstance(truth, dict) or truth.get("computation_status") != "computed":
+            return {
+                "valid": False,
+                "failure_reason": "truth_invalid",
+                "delta_forward_m": None,
+                "delta_right_m": None,
+                "delta_down_m": None,
+                "delta_range_m": None,
+                "position_difference_m": None,
+            }
+        if not isinstance(test, dict) or not bool(test.get("valid")):
+            reason = "test_ray_invalid" if not isinstance(test, dict) else test.get("failure_reason")
+            return {
+                "valid": False,
+                "failure_reason": str(reason or "test_ray_invalid"),
+                "delta_forward_m": None,
+                "delta_right_m": None,
+                "delta_down_m": None,
+                "delta_range_m": None,
+                "position_difference_m": None,
+            }
+        if test.get("output_frame") != truth.get("output_frame"):
+            return {
+                "valid": False,
+                "failure_reason": "frame_mismatch",
+                "delta_forward_m": None,
+                "delta_right_m": None,
+                "delta_down_m": None,
+                "delta_range_m": None,
+                "position_difference_m": None,
+            }
+        try:
+            vector = tuple(
+                float(test[key]) - float(truth[key])
+                for key in ("forward_m", "right_m", "down_m")
+            )
+            delta_range_m = float(test["range_m"]) - float(truth["range_m"])
+            if not cls._all_finite((*vector, delta_range_m)):
+                raise ValueError("non-finite diagnostic delta")
+            return {
+                "valid": True,
+                "failure_reason": "",
+                "delta_forward_m": vector[0],
+                "delta_right_m": vector[1],
+                "delta_down_m": vector[2],
+                "delta_range_m": delta_range_m,
+                "position_difference_m": math.sqrt(
+                    sum(value * value for value in vector)
+                ),
+            }
+        except (KeyError, TypeError, ValueError):
+            return {
+                "valid": False,
+                "failure_reason": "invalid_delta_input",
+                "delta_forward_m": None,
+                "delta_right_m": None,
+                "delta_down_m": None,
+                "delta_range_m": None,
+                "position_difference_m": None,
+            }
+
+    @classmethod
+    def _diagnostic_analysis(cls, truth, diagnostic_rays):
+        comparisons = {}
+        flat = {}
+        for name in ("attitude", "baseline", "full"):
+            comparison = cls._diagnostic_delta(diagnostic_rays.get(name), truth)
+            comparisons[name] = comparison
+            flat[f"{name}_delta_valid"] = comparison["valid"]
+            flat[f"{name}_delta_failure_reason"] = comparison["failure_reason"]
+            for field in (
+                "delta_forward_m",
+                "delta_right_m",
+                "delta_down_m",
+                "delta_range_m",
+                "position_difference_m",
+            ):
+                flat[f"{name}_{field}"] = comparison[field]
+
+        interaction = {
+            "valid": False,
+            "failure_reason": "diagnostic_ray_invalid",
+            "forward_m": None,
+            "right_m": None,
+            "down_m": None,
+            "position_m": None,
+        }
+        inputs = {
+            "truth": truth,
+            **{name: diagnostic_rays.get(name) for name in ("attitude", "baseline", "full")},
+        }
+        invalid = [
+            name
+            for name, result in inputs.items()
+            if not isinstance(result, dict)
+            or result.get("computation_status") != "computed"
+            or (name != "truth" and not bool(result.get("valid")))
+        ]
+        frames = {
+            result.get("output_frame")
+            for result in inputs.values()
+            if isinstance(result, dict)
+        }
+        if invalid:
+            interaction["failure_reason"] = "invalid:" + ",".join(invalid)
+        elif frames != {BASELINE_CENTER_FRD_FRAME}:
+            interaction["failure_reason"] = "frame_mismatch"
+        else:
+            try:
+                vector = tuple(
+                    float(inputs["full"][axis])
+                    - float(inputs["attitude"][axis])
+                    - float(inputs["baseline"][axis])
+                    + float(inputs["truth"][axis])
+                    for axis in ("forward_m", "right_m", "down_m")
+                )
+                if not cls._all_finite(vector):
+                    raise ValueError("non-finite interaction")
+                interaction.update(
+                    {
+                        "valid": True,
+                        "failure_reason": "",
+                        "forward_m": vector[0],
+                        "right_m": vector[1],
+                        "down_m": vector[2],
+                        "position_m": math.sqrt(sum(value * value for value in vector)),
+                    }
+                )
+            except (KeyError, TypeError, ValueError):
+                interaction["failure_reason"] = "invalid_interaction_input"
+        flat.update(
+            {
+                "interaction_valid": interaction["valid"],
+                "interaction_failure_reason": interaction["failure_reason"],
+                "interaction_forward_m": interaction["forward_m"],
+                "interaction_right_m": interaction["right_m"],
+                "interaction_down_m": interaction["down_m"],
+                "interaction_position_m": interaction["position_m"],
+            }
+        )
+        return {"comparisons": comparisons, "interaction": interaction, "flat": flat}
+
+    @staticmethod
+    def _diagnostic_ray_record_fields(name, result):
+        result = {} if result is None else result
+        fields = {
+            f"{name}_valid": bool(result.get("valid", False)),
+            f"{name}_computation_status": result.get("computation_status", "invalid_input"),
+            f"{name}_failure_reason": result.get("failure_reason", "invalid_input"),
+        }
+        for field in (
+            "forward_m",
+            "right_m",
+            "down_m",
+            "range_m",
+            "ray_gap_m",
+            "intersection_angle_deg",
+            "left_depth_m",
+            "right_depth_m",
+            "geometry_rank",
+            "condition_number",
+        ):
+            fields[f"{name}_{field}"] = result.get(field)
+        for source, target in (
+            ("midpoint_baseline_center_frd_m", "midpoint"),
+            ("point_on_left_ray_baseline_center_frd_m", "left_closest"),
+            ("point_on_right_ray_baseline_center_frd_m", "right_closest"),
+        ):
+            values = result.get(source)
+            for index, axis in enumerate(("x", "y", "z")):
+                fields[f"{name}_{target}_{axis}_m"] = (
+                    values[index]
+                    if isinstance(values, (tuple, list)) and len(values) >= 3
+                    else None
+                )
+        for field in (
+            "pixel_source",
+            "attitude_source",
+            "baseline_source",
+            "baseline_anchor_policy",
+            "left_camera_center_source",
+            "right_camera_center_source",
+            "left_attitude_timestamp_us",
+            "right_attitude_timestamp_us",
+            "left_attitude_receive_monotonic_ns",
+            "right_attitude_receive_monotonic_ns",
+            "left_attitude_reset_counter",
+            "right_attitude_reset_counter",
+            "left_attitude_age_ms",
+            "right_attitude_age_ms",
+            "attitude_pair_skew_ms",
+            "left_gps_age_ms",
+            "right_gps_age_ms",
+            "gps_pair_skew_ms",
+            "gps_left_timestamp_us",
+            "gps_right_timestamp_us",
+            "simulation_epoch",
+            "px4_quaternion_order",
+            "px4_attitude_semantics",
+        ):
+            fields[f"{name}_{field}"] = result.get(field)
+        for label in ("left", "right"):
+            for axis in ("w", "x", "y", "z"):
+                fields[f"{name}_{label}_px4_q_{axis}"] = result.get(
+                    f"{label}_px4_q_{axis}"
+                )
+        return fields
+
+    @staticmethod
+    def _diagnostic_research_record_fields(metrics):
+        diagnostic_rays = metrics.get("_diagnostic_rays")
+        if not isinstance(diagnostic_rays, dict):
+            return {}
+        fields = {}
+        for name in ("attitude", "baseline", "full"):
+            result = diagnostic_rays.get(name)
+            if not isinstance(result, dict):
+                continue
+            record_prefix = f"{name}_ray"
+            fields.update(
+                {
+                    f"{record_prefix}_valid": bool(result.get("valid", False)),
+                    f"{record_prefix}_computation_status": result.get(
+                        "computation_status"
+                    ),
+                    f"{record_prefix}_failure_reason": result.get(
+                        "failure_reason"
+                    ),
+                    f"{record_prefix}_source": ";".join(
+                        str(result.get(key, ""))
+                        for key in ("pixel_source", "attitude_source", "baseline_source")
+                    ),
+                    f"{record_prefix}_baseline_source": result.get(
+                        "baseline_source"
+                    ),
+                    f"{record_prefix}_gps_baseline_source": result.get(
+                        "gps_baseline_source"
+                    ),
+                    f"{record_prefix}_pixel_source": result.get("pixel_source"),
+                    f"{record_prefix}_attitude_source": result.get(
+                        "attitude_source"
+                    ),
+                    f"{record_prefix}_camera_center_source": ";".join(
+                        str(result.get(key, ""))
+                        for key in (
+                            "left_camera_center_source",
+                            "right_camera_center_source",
+                        )
+                    ),
+                }
+            )
+            for field in (
+                "forward_m",
+                "right_m",
+                "down_m",
+                "range_m",
+                "intersection_angle_deg",
+                "left_depth_m",
+                "right_depth_m",
+                "geometry_rank",
+                "condition_number",
+            ):
+                fields[f"{record_prefix}_{field}"] = result.get(field)
+            fields[f"{record_prefix}_gap_m"] = result.get("ray_gap_m")
+            for source, target in (
+                ("midpoint_baseline_center_frd_m", "midpoint"),
+                ("point_on_left_ray_baseline_center_frd_m", "left_closest"),
+                ("point_on_right_ray_baseline_center_frd_m", "right_closest"),
+            ):
+                values = result.get(source)
+                for index, axis in enumerate(("x", "y", "z")):
+                    fields[f"{record_prefix}_{target}_{axis}_m"] = (
+                        values[index]
+                        if isinstance(values, (tuple, list)) and len(values) >= 3
+                        else None
+                    )
+            fields[f"{record_prefix}_delta_valid"] = metrics.get(
+                f"{name}_delta_valid"
+            )
+            fields[f"{record_prefix}_delta_failure_reason"] = metrics.get(
+                f"{name}_delta_failure_reason"
+            )
+            for field in (
+                "delta_forward_m",
+                "delta_right_m",
+                "delta_down_m",
+                "delta_range_m",
+                "position_difference_m",
+            ):
+                fields[f"{record_prefix}_{field}"] = metrics.get(f"{name}_{field}")
+            fields[f"{record_prefix}_gt_valid"] = metrics.get(f"{name}_gt_valid")
+            fields[f"{record_prefix}_gt_failure_reason"] = metrics.get(
+                f"{name}_gt_failure_reason"
+            )
+            for field in (
+                "gt_forward_error_m",
+                "gt_right_error_m",
+                "gt_down_error_m",
+                "gt_range_error_m",
+                "gt_position_error_m",
+            ):
+                fields[f"{record_prefix}_{field}"] = metrics.get(f"{name}_{field}")
+            for source in (
+                "gps_baseline_world_enu_m",
+                "gps_baseline_delta_world_enu_m",
+            ):
+                values = result.get(source)
+                target = source.removesuffix("_m")
+                for index, axis in enumerate(("x", "y", "z")):
+                    fields[f"{record_prefix}_{target}_{axis}_m"] = (
+                        values[index]
+                        if isinstance(values, (tuple, list)) and len(values) >= 3
+                        else None
+                    )
+            fields[f"{record_prefix}_gps_baseline_length_m"] = result.get(
+                "gps_baseline_length_m"
+            )
+            fields[f"{record_prefix}_gps_baseline_delta_norm_m"] = result.get(
+                "gps_baseline_delta_norm_m"
+            )
+
+        attitude = diagnostic_rays.get("attitude", {})
+        full = diagnostic_rays.get("full", {})
+        baseline = diagnostic_rays.get("baseline", {})
+        attitude_candidates = tuple(
+            candidate
+            for candidate in (attitude, full)
+            if isinstance(candidate, dict)
+        )
+        gps_candidates = tuple(
+            candidate
+            for candidate in (baseline, full)
+            if isinstance(candidate, dict)
+        )
+        attitude_source = next(
+            (
+                candidate
+                for candidate in attitude_candidates
+                if candidate.get("left_attitude_timestamp_us") is not None
+                or candidate.get("right_attitude_timestamp_us") is not None
+            ),
+            attitude_candidates[0] if attitude_candidates else {},
+        )
+        gps_source = next(
+            (
+                candidate
+                for candidate in gps_candidates
+                if candidate.get("gps_left_timestamp_us") is not None
+                or candidate.get("gps_right_timestamp_us") is not None
+            ),
+            gps_candidates[0] if gps_candidates else {},
+        )
+        for label in ("left", "right"):
+            for axis in ("w", "x", "y", "z"):
+                fields[f"{label}_px4_q_{axis}"] = attitude_source.get(
+                    f"{label}_px4_q_{axis}"
+                )
+            fields[f"{label}_attitude_timestamp_us"] = attitude_source.get(
+                f"{label}_attitude_timestamp_us"
+            )
+            fields[f"{label}_attitude_receive_monotonic_ns"] = attitude_source.get(
+                f"{label}_attitude_receive_monotonic_ns"
+            )
+            fields[f"{label}_attitude_reset_counter"] = attitude_source.get(
+                f"{label}_attitude_reset_counter"
+            )
+            fields[f"{label}_attitude_age_ms"] = attitude_source.get(
+                f"{label}_attitude_age_ms"
+            )
+            fields[f"{label}_gps_timestamp_us"] = gps_source.get(
+                f"gps_{label}_timestamp_us"
+            )
+            fields[f"{label}_gps_age_ms"] = gps_source.get(f"{label}_gps_age_ms")
+        fields.update(
+            {
+                "px4_quaternion_order": attitude_source.get("px4_quaternion_order"),
+                "px4_attitude_semantics": attitude_source.get("px4_attitude_semantics"),
+                "attitude_pair_skew_ms": attitude_source.get("attitude_pair_skew_ms"),
+                "gps_pair_skew_ms": gps_source.get("gps_pair_skew_ms"),
+                "simulation_epoch": metrics.get("epoch"),
+                "baseline_anchor_policy": gps_source.get("baseline_anchor_policy"),
+                "interaction_valid": metrics.get("interaction_valid"),
+                "interaction_failure_reason": metrics.get(
+                    "interaction_failure_reason"
+                ),
+                "interaction_forward_m": metrics.get("interaction_forward_m"),
+                "interaction_right_m": metrics.get("interaction_right_m"),
+                "interaction_down_m": metrics.get("interaction_down_m"),
+                "interaction_position_m": metrics.get("interaction_position_m"),
+            }
+        )
+        return fields
+
+    def _diagnostic_rays(self, left_u, left_v, right_u, right_v, width, height, snapshot):
+        """Re-triangulate observed pixels with independently selected inputs."""
+        attitude_poses, attitude_status, attitude_provenance = (
+            self._px4_attitude_camera_poses(snapshot, include_provenance=True)
+        )
+        attitude_provenance.update(
+            {
+                "baseline_source": "gazebo_observed_optical_centers",
+                "left_camera_center_source": "gazebo_observed_left_optical_center",
+                "right_camera_center_source": "gazebo_observed_right_optical_center",
+            }
+        )
+        if attitude_poses is None:
+            attitude = self._finalize_diagnostic_ray(
+                {"computation_status": attitude_status},
+                provenance=attitude_provenance,
+                failure_reason=attitude_status,
+            )
+        else:
+            attitude = self._triangulate_pixel_centers_with_cameras(
+                left_u, left_v, right_u, right_v, width, height,
+                left_camera_pose=attitude_poses[0], right_camera_pose=attitude_poses[1],
+            )
+            attitude = self._finalize_diagnostic_ray(
+                attitude, provenance=attitude_provenance
+            )
+        gps_poses, gps_status, gps_provenance = self._gps_baseline_camera_poses("raw_gps")
+        if snapshot is None or gps_poses is None:
+            status = "missing_camera_oracle" if snapshot is None else gps_status
+            baseline = self._finalize_diagnostic_ray(
+                {"computation_status": status},
+                provenance={
+                    **gps_provenance,
+                    "attitude_source": "gazebo_observed_optical_pose",
+                },
+                failure_reason=status,
+            )
+        else:
+            baseline = self._triangulate_pixel_centers_with_cameras(
+                left_u, left_v, right_u, right_v, width, height,
+                left_camera_pose=replace(snapshot[0].pose, center_world_enu_m=gps_poses[0].center_world_enu_m),
+                right_camera_pose=replace(snapshot[1].pose, center_world_enu_m=gps_poses[1].center_world_enu_m),
+            )
+            baseline = self._finalize_diagnostic_ray(
+                baseline,
+                provenance={
+                    **gps_provenance,
+                    "attitude_source": "gazebo_observed_optical_pose",
+                },
+            )
+
+        full_attitude_poses = None
+        full_attitude_status = attitude_status
+        full_attitude_provenance = attitude_provenance
+        if gps_poses is not None:
+            (
+                full_attitude_poses,
+                full_attitude_status,
+                full_attitude_provenance,
+            ) = self._px4_attitude_camera_poses(
+                gps_poses, include_provenance=True
+            )
+        if gps_poses is None or full_attitude_poses is None:
+            status = gps_status if gps_poses is None else full_attitude_status
+            reasons = []
+            if gps_poses is None:
+                reasons.append(f"gps:{gps_status}")
+            if full_attitude_poses is None:
+                reasons.append(f"attitude:{full_attitude_status}")
+            full = self._finalize_diagnostic_ray(
+                {"computation_status": status},
+                provenance={
+                    **gps_provenance,
+                    **full_attitude_provenance,
+                    "pixel_source": "observed",
+                    "attitude_source": "px4_vehicle_attitude",
+                    "baseline_source": "px4_raw_sensor_gps",
+                    "baseline_anchor_policy": GPS_BASELINE_ANCHOR_POLICY,
+                    "left_camera_center_source": "nominal_left_optical_center_anchor",
+                    "right_camera_center_source": (
+                        "nominal_left_anchor_plus_px4_relative_enu_separation"
+                    ),
+                },
+                failure_reason=";".join(reasons),
+            )
+        else:
+            full = self._triangulate_pixel_centers_with_cameras(
+                left_u, left_v, right_u, right_v, width, height,
+                left_camera_pose=full_attitude_poses[0],
+                right_camera_pose=full_attitude_poses[1],
+            )
+            full = self._finalize_diagnostic_ray(
+                full,
+                provenance={
+                    **gps_provenance,
+                    **full_attitude_provenance,
+                    "pixel_source": "observed",
+                    "attitude_source": "px4_vehicle_attitude",
+                    "baseline_source": "px4_raw_sensor_gps",
+                    "baseline_anchor_policy": GPS_BASELINE_ANCHOR_POLICY,
+                    "left_camera_center_source": "nominal_left_optical_center_anchor",
+                    "right_camera_center_source": (
+                        "nominal_left_anchor_plus_px4_relative_enu_separation"
+                    ),
+                },
+            )
+        return {"attitude": attitude, "baseline": baseline, "full": full}
 
     def _on_param_update(self, params):
         if any(param.name in self._recording_parameter_names() for param in params):
@@ -3503,12 +4443,14 @@ class StereoDistanceNode(Node):
             gps_baselines = self._triangulate_gps_baselines(
                 left["cx"], left["cy"], right["cx"], right["cy"], width, height
             )
+            diagnostic_rays = self._diagnostic_rays(left["cx"], left["cy"], right["cx"], right["cy"], width, height, camera_oracle_snapshot)
             return {
                 "started": started, "finished": time.monotonic(), "phase": phase,
                 "left_image": np.zeros((height, width, 3), dtype=np.uint8),
                 "right_image": np.zeros((height, width, 3), dtype=np.uint8),
                 "left": left, "right": right, "raw": raw, "corrected": corrected,
                 "gps_baselines": gps_baselines,
+                "diagnostic_rays": diagnostic_rays,
                 "ideal_error": None, "camera_oracle_snapshot": camera_oracle_snapshot,
             }
         left_image = self._msg_to_rgb(pair.left_message)
@@ -3532,6 +4474,7 @@ class StereoDistanceNode(Node):
         raw = None
         corrected = None
         gps_baselines = {}
+        diagnostic_rays = {}
         if left is not None and right is not None:
             raw = self._triangulate_center_pixels(
                 left["cx"], left["cy"], right["cx"], right["cy"],
@@ -3546,6 +4489,10 @@ class StereoDistanceNode(Node):
                 left["cx"], left["cy"], right["cx"], right["cy"],
                 left_image.shape[1], left_image.shape[0],
             )
+            diagnostic_rays = self._diagnostic_rays(
+                left["cx"], left["cy"], right["cx"], right["cy"],
+                left_image.shape[1], left_image.shape[0], camera_oracle_snapshot,
+            )
         return {
             "started": started,
             "finished": time.monotonic(),
@@ -3557,6 +4504,7 @@ class StereoDistanceNode(Node):
             "raw": raw,
             "corrected": corrected,
             "gps_baselines": gps_baselines,
+            "diagnostic_rays": diagnostic_rays,
             "camera_oracle_snapshot": camera_oracle_snapshot,
         }
 
@@ -3601,10 +4549,31 @@ class StereoDistanceNode(Node):
                     if left is not None or right is not None:
                         self.live_detections_pub.publish(self._detections_to_msg(left, right))
                     ideal = self._latest_rviz_ideal_ray(pair)
+                    diagnostic_rays = computed.get("diagnostic_rays", {})
+                    diagnostic_analysis = self._diagnostic_analysis(
+                        computed.get("corrected"), diagnostic_rays
+                    )
+                    for name, comparison in diagnostic_analysis["comparisons"].items():
+                        if isinstance(diagnostic_rays.get(name), dict):
+                            diagnostic_rays[name].update(
+                                {
+                                    "delta_valid": comparison["valid"],
+                                    "delta_failure_reason": comparison[
+                                        "failure_reason"
+                                    ],
+                                    **{
+                                        key: value
+                                        for key, value in comparison.items()
+                                        if key not in ("valid", "failure_reason")
+                                    },
+                                }
+                            )
                     self._publish_ray_metrics(
                         nominal=raw,
                         optical=computed.get("corrected"),
                         ideal=ideal,
+                        interaction=diagnostic_analysis["interaction"],
+                        **diagnostic_rays,
                     )
                     self._publish_ray_markers(
                         nominal=raw,
@@ -3612,6 +4581,7 @@ class StereoDistanceNode(Node):
                         ideal=ideal,
                         gps_raw=computed.get("gps_baselines", {}).get("raw_gps"),
                         gps_global=computed.get("gps_baselines", {}).get("global_position"),
+                        **diagnostic_rays,
                     )
                     self.rviz_live_publish_count += 1
             except Exception as exc:
@@ -3745,6 +4715,30 @@ class StereoDistanceNode(Node):
         raw = computed.get("raw")
         optical = computed.get("corrected")
         gps_baselines = computed.get("gps_baselines", {})
+        diagnostic_rays = computed.get("diagnostic_rays", {})
+        diagnostic_analysis = self._diagnostic_analysis(optical, diagnostic_rays)
+        for name, comparison in diagnostic_analysis["comparisons"].items():
+            if isinstance(diagnostic_rays.get(name), dict):
+                diagnostic_rays[name].update(
+                    {
+                        "delta_valid": comparison["valid"],
+                        "delta_failure_reason": comparison["failure_reason"],
+                        **{
+                            key: value
+                            for key, value in comparison.items()
+                            if key not in ("valid", "failure_reason")
+                        },
+                    }
+                )
+        metrics.update(diagnostic_analysis["flat"])
+        for name in ("attitude", "baseline", "full"):
+            metrics.update(
+                self._diagnostic_ray_record_fields(name, diagnostic_rays.get(name))
+            )
+        metrics["_diagnostic_rays"] = diagnostic_rays
+        metrics["_diagnostic_interaction"] = diagnostic_analysis["interaction"]
+        metrics["_truth_ray"] = optical
+        metrics["_raw_ray"] = raw
         if raw is not None:
             metrics.update(
                 {
@@ -3757,13 +4751,19 @@ class StereoDistanceNode(Node):
                     "intersection_angle_deg": raw.get("intersection_angle_deg"),
                 }
             )
-            self._publish_ray_metrics(nominal=raw, optical=optical)
+            self._publish_ray_metrics(
+                nominal=raw,
+                optical=optical,
+                interaction=diagnostic_analysis["interaction"],
+                **diagnostic_rays,
+            )
             if not self._rviz_latest_only_markers_enabled():
                 self._publish_ray_markers(
                     nominal=raw,
                     optical=optical,
                     gps_raw=gps_baselines.get("raw_gps"),
                     gps_global=gps_baselines.get("global_position"),
+                    **diagnostic_rays,
                 )
         metrics.update(
             {
@@ -4116,8 +5116,41 @@ class StereoDistanceNode(Node):
         )
         evaluation = self._evaluation_metadata(pair, alignment, gt_baseline, metrics)
         metrics.update(evaluation)
+        diagnostic_rays = metrics.get("_diagnostic_rays", {})
+        for name in ("attitude", "baseline", "full"):
+            result = diagnostic_rays.get(name)
+            if isinstance(result, dict):
+                result.update(
+                    {
+                        "gt_valid": evaluation.get(f"{name}_gt_valid"),
+                        "gt_failure_reason": evaluation.get(
+                            f"{name}_gt_failure_reason"
+                        ),
+                        "gt_forward_error_m": evaluation.get(
+                            f"{name}_gt_forward_error_m"
+                        ),
+                        "gt_right_error_m": evaluation.get(
+                            f"{name}_gt_right_error_m"
+                        ),
+                        "gt_down_error_m": evaluation.get(
+                            f"{name}_gt_down_error_m"
+                        ),
+                        "gt_range_error_m": evaluation.get(
+                            f"{name}_gt_range_error_m"
+                        ),
+                        "gt_position_error_m": evaluation.get(
+                            f"{name}_gt_position_error_m"
+                        ),
+                    }
+                )
+        self._publish_ray_metrics(
+            nominal=metrics.get("_raw_ray"),
+            optical=metrics.get("_truth_ray"),
+            ideal=ideal,
+            interaction=metrics.get("_diagnostic_interaction"),
+            **diagnostic_rays,
+        )
         if ideal is not None:
-            self._publish_ray_metrics(ideal=ideal)
             if not self._rviz_latest_only_markers_enabled():
                 self._publish_ray_markers(ideal=ideal)
         # The initial publish happens before GT alignment exists.  Republish
@@ -4210,6 +5243,23 @@ class StereoDistanceNode(Node):
         raw_errors = errors("estimated_")
         corrected_errors = errors("attitude_corrected_")
         ideal_errors = errors("ideal_")
+        diagnostic_errors = {
+            name: errors(f"{name}_") for name in ("attitude", "baseline", "full")
+        }
+        diagnostic_metadata = {}
+        for name, values in diagnostic_errors.items():
+            valid = values[0] is not None
+            diagnostic_metadata.update(
+                {
+                    f"{name}_gt_valid": valid,
+                    f"{name}_gt_failure_reason": "" if valid else "gt_or_ray_invalid",
+                    f"{name}_gt_position_error_m": values[0],
+                    f"{name}_gt_forward_error_m": values[1],
+                    f"{name}_gt_right_error_m": values[2],
+                    f"{name}_gt_down_error_m": values[3],
+                    f"{name}_gt_range_error_m": values[4],
+                }
+            )
         return {
             "pair_id": pair.pair_id,
             "gt_alignment_mode": alignment.gt_alignment_mode,
@@ -4236,6 +5286,12 @@ class StereoDistanceNode(Node):
             "ideal_right_error_m": ideal_errors[2],
             "ideal_down_error_m": ideal_errors[3],
             "ideal_range_error_m": ideal_errors[4],
+            "gt_source": "gazebo_vehicle_reference_link_world_pose",
+            "gt_source_entity": SOURCE_GAZEBO_ENTITY,
+            "gt_reference_name": VEHICLE_REFERENCE_LINK,
+            "gt_reference_definition": VEHICLE_REFERENCE_DEFINITION,
+            "gt_fallback_used": False,
+            **diagnostic_metadata,
         }
 
     def _pair_result_metadata(
@@ -6032,8 +7088,20 @@ class StereoDistanceNode(Node):
     def _ray_metrics_payload(cls, result):
         if result is None:
             return None
-        return {
+        payload = {
+            "valid": bool(
+                result.get(
+                    "valid", result.get("computation_status") == "computed"
+                )
+            ),
             "computation_status": str(result.get("computation_status", "")),
+            "failure_reason": str(result.get("failure_reason", "")),
+            "delta_valid": bool(result.get("delta_valid", False)),
+            "delta_failure_reason": str(
+                result.get("delta_failure_reason", "")
+            ),
+            "gt_valid": bool(result.get("gt_valid", False)),
+            "gt_failure_reason": str(result.get("gt_failure_reason", "")),
             "forward_m": cls._json_number(result.get("forward_m")),
             "right_m": cls._json_number(result.get("right_m")),
             "down_m": cls._json_number(result.get("down_m")),
@@ -6042,20 +7110,113 @@ class StereoDistanceNode(Node):
             "intersection_angle_deg": cls._json_number(result.get("intersection_angle_deg")),
             "left_depth_m": cls._json_number(result.get("left_depth_m")),
             "right_depth_m": cls._json_number(result.get("right_depth_m")),
+            "geometry_rank": cls._json_number(result.get("geometry_rank")),
+            "condition_number": cls._json_number(result.get("condition_number")),
             "left_point_frd_m": cls._json_vector(result.get("point_on_left_ray_baseline_center_frd_m")),
             "right_point_frd_m": cls._json_vector(result.get("point_on_right_ray_baseline_center_frd_m")),
             "midpoint_frd_m": cls._json_vector(result.get("midpoint_baseline_center_frd_m")),
         }
+        for name in (
+            "delta_forward_m",
+            "delta_right_m",
+            "delta_down_m",
+            "delta_range_m",
+            "position_difference_m",
+            "gt_forward_error_m",
+            "gt_right_error_m",
+            "gt_down_error_m",
+            "gt_range_error_m",
+            "gt_position_error_m",
+            "left_attitude_age_ms",
+            "right_attitude_age_ms",
+            "attitude_pair_skew_ms",
+            "left_gps_age_ms",
+            "right_gps_age_ms",
+            "gps_pair_skew_ms",
+            "gps_baseline_length_m",
+            "gps_baseline_delta_norm_m",
+            "gps_left_eph_m",
+            "gps_right_eph_m",
+        ):
+            if name in result:
+                payload[name] = cls._json_number(result.get(name))
+        for name in (
+            "left_attitude_timestamp_us",
+            "right_attitude_timestamp_us",
+            "left_attitude_receive_monotonic_ns",
+            "right_attitude_receive_monotonic_ns",
+            "left_attitude_reset_counter",
+            "right_attitude_reset_counter",
+            "gps_left_timestamp_us",
+            "gps_right_timestamp_us",
+            "simulation_epoch",
+        ):
+            if result.get(name) is not None:
+                payload[name] = int(result[name])
+        for label in ("left", "right"):
+            for axis in ("w", "x", "y", "z"):
+                name = f"{label}_px4_q_{axis}"
+                if name in result:
+                    payload[name] = cls._json_number(result.get(name))
+        for name in (
+            "pixel_source",
+            "attitude_source",
+            "baseline_source",
+            "baseline_anchor_policy",
+            "left_camera_center_source",
+            "right_camera_center_source",
+            "px4_quaternion_order",
+            "px4_attitude_semantics",
+            "left_attitude_topic",
+            "right_attitude_topic",
+            "left_gps_topic",
+            "right_gps_topic",
+            "output_frame",
+            "unit",
+        ):
+            if name in result:
+                payload[name] = str(result.get(name, ""))
+        for name in (
+            "gps_baseline_world_enu_m",
+            "gps_baseline_delta_world_enu_m",
+        ):
+            if name in result:
+                payload[name] = cls._json_vector(result.get(name))
+        payload["provenance"] = ";".join(
+            f"{name}={payload[name]}"
+            for name in ("pixel_source", "attitude_source", "baseline_source")
+            if name in payload
+        )
+        return payload
 
-    def _publish_ray_metrics(self, *, nominal=None, optical=None, ideal=None):
+    def _publish_ray_metrics(
+        self,
+        *,
+        nominal=None,
+        optical=None,
+        ideal=None,
+        attitude=None,
+        baseline=None,
+        full=None,
+        interaction=None,
+    ):
         publisher = getattr(self, "ray_metrics_pub", None)
         if publisher is None:
             return
         payload = {}
-        for key, result in (("nominal", nominal), ("optical", optical), ("ideal", ideal)):
+        for key, result in (("nominal", nominal), ("optical", optical), ("ideal", ideal), ("attitude", attitude), ("baseline", baseline), ("full", full)):
             ray_payload = self._ray_metrics_payload(result)
             if ray_payload is not None:
                 payload[key] = ray_payload
+                if key in ("attitude", "baseline", "full"):
+                    for field in (
+                        "delta_forward_m",
+                        "delta_right_m",
+                        "delta_down_m",
+                        "delta_range_m",
+                        "position_difference_m",
+                    ):
+                        payload[f"{key}_{field}"] = ray_payload.get(field)
         if ideal is not None:
             for source, target in (
                 ("left_u_px", "ideal_left_u_px"),
@@ -6070,6 +7231,30 @@ class StereoDistanceNode(Node):
                 None if left_u is None or right_u is None else float(left_u) - float(right_u)
             )
             payload["ideal_pixel_source"] = "ground_truth_world_enu_quantized_nominal_projection"
+        if interaction is not None:
+            interaction_payload = {
+                "valid": bool(interaction.get("valid", False)),
+                "failure_reason": str(interaction.get("failure_reason", "")),
+                "forward_m": self._json_number(interaction.get("forward_m")),
+                "right_m": self._json_number(interaction.get("right_m")),
+                "down_m": self._json_number(interaction.get("down_m")),
+                "position_m": self._json_number(interaction.get("position_m")),
+                "output_frame": BASELINE_CENTER_FRD_FRAME,
+                "unit": "m",
+            }
+            payload["interaction"] = interaction_payload
+            payload.update(
+                {
+                    "interaction_valid": interaction_payload["valid"],
+                    "interaction_failure_reason": interaction_payload[
+                        "failure_reason"
+                    ],
+                    "interaction_forward_m": interaction_payload["forward_m"],
+                    "interaction_right_m": interaction_payload["right_m"],
+                    "interaction_down_m": interaction_payload["down_m"],
+                    "interaction_position_m": interaction_payload["position_m"],
+                }
+            )
         if payload:
             publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
 
@@ -6115,7 +7300,8 @@ class StereoDistanceNode(Node):
         publisher.publish(MarkerArray(markers=[marker]))
 
     def _publish_ray_markers(
-        self, nominal=None, optical=None, ideal=None, gps_raw=None, gps_global=None
+        self, nominal=None, optical=None, ideal=None, gps_raw=None, gps_global=None,
+        attitude=None, baseline=None, full=None,
     ):
         """Publish stereo rays in World ENU, including GPS-baseline variants.
 
@@ -6152,6 +7338,7 @@ class StereoDistanceNode(Node):
             if geometry is None:
                 return []
             namespace = f"stereo_rays_{label}"
+            display_name = RAY_DISPLAY_NAMES[label]
             left_origin = geometry["left_origin_world_enu_m"]
             left_target = geometry["left_target_world_enu_m"]
             right_origin = geometry["right_origin_world_enu_m"]
@@ -6172,9 +7359,9 @@ class StereoDistanceNode(Node):
             target.scale.x = target.scale.y = target.scale.z = 12.0
             target.color.r, target.color.g, target.color.b, target.color.a = (*midpoint_color, 1.0)
             return [
-                line(marker_id, namespace, f"left_{label}_ray", left_color, left_origin, left_target, 2.0),
-                line(marker_id + 1, namespace, f"right_{label}_ray", right_color, right_origin, right_target, 2.0),
-                line(marker_id + 2, namespace, f"{label}_closest_ray_gap", gap_color, left_target, right_target, 1.5),
+                line(marker_id, namespace, f"left_{display_name}_ray", left_color, left_origin, left_target, 2.0),
+                line(marker_id + 1, namespace, f"right_{display_name}_ray", right_color, right_origin, right_target, 2.0),
+                line(marker_id + 2, namespace, f"{display_name}_closest_ray_gap", gap_color, left_target, right_target, 1.5),
                 target,
             ]
 
@@ -6198,6 +7385,42 @@ class StereoDistanceNode(Node):
                 right_color=(0.0, 170.0 / 255.0, 170.0 / 255.0),
                 gap_color=(0.3, 0.9, 0.9),
                 midpoint_color=(0.0, 170.0 / 255.0, 170.0 / 255.0),
+            )
+        )
+        markers.extend(
+            marker_group(
+                attitude,
+                label="attitude",
+                marker_id=50,
+                # Hot pink denotes PX4 attitude with Gazebo optical centers.
+                left_color=(1.0, 0.1, 0.75),
+                right_color=(1.0, 0.1, 0.75),
+                gap_color=(1.0, 0.55, 0.9),
+                midpoint_color=(1.0, 0.1, 0.75),
+            )
+        )
+        markers.extend(
+            marker_group(
+                baseline,
+                label="baseline",
+                marker_id=60,
+                # Lime denotes Gazebo attitude with PX4 raw-GPS separation.
+                left_color=(0.35, 0.9, 0.1),
+                right_color=(0.35, 0.9, 0.1),
+                gap_color=(0.65, 1.0, 0.45),
+                midpoint_color=(0.35, 0.9, 0.1),
+            )
+        )
+        markers.extend(
+            marker_group(
+                full,
+                label="full",
+                marker_id=70,
+                # White denotes the combined PX4 attitude/raw-GPS geometry.
+                left_color=(0.95, 0.95, 0.95),
+                right_color=(0.95, 0.95, 0.95),
+                gap_color=(0.7, 0.7, 0.7),
+                midpoint_color=(0.95, 0.95, 0.95),
             )
         )
         markers.extend(

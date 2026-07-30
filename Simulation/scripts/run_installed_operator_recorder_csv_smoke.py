@@ -202,7 +202,7 @@ def run(argv: Sequence[str] | None = None) -> dict[str, object]:
         "schema_audit_json": str(output_dir / "operator_telemetry_schema_audit.json"),
         "schema_audit_status": audit_payload.get("status", ""),
         "schema_audit_valid_row_count": audit_payload.get("valid_row_count", 0),
-        "first_row_axis_contract": first_row.get("axis_contract", ""),
+        "first_row_has_axis_contract": "axis_contract" in first_row,
         "first_row_raw_forward_m": first_row.get("raw_forward_m", ""),
         "first_row_corrected_forward_m": first_row.get("corrected_forward_m", ""),
         "first_row_raw_disparity_px": first_row.get("raw_disparity_px", ""),

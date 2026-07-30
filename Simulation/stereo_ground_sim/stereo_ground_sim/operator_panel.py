@@ -76,10 +76,10 @@ SERIES = (
 )
 SERIES_LABELS = {
     "truth": "truth",
-    "raw": "Nominal stereo",
-    "optical": "Optical stereo",
-    "ideal": "Ideal reference",
-    "raw_gps_baseline": "Raw GPS Baseline",
+    "raw": "Raw",
+    "optical": "Truth",
+    "ideal": "Ideal",
+    "raw_gps_baseline": "GPS",
     "uam_raw_gps_reference": "UAM raw GPS reference",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -270,10 +270,10 @@ class TelemetryFacts(QWidget):
         self._profile_label = QLabel("Profile: --")
         self._yolo_label = QLabel("YOLO: --")
         self._truth_label = QLabel("Truth F/R/D/R: --")
-        self._raw_label = QLabel("Nominal stereo F/R/D/R: --")
-        self._corrected_label = QLabel("Optical stereo F/R/D/R: --")
-        self._ideal_label = QLabel("Ideal reference F/R/D/R: --")
-        self._raw_gps_baseline_label = QLabel("Raw GPS Baseline F/R/D/R: --")
+        self._raw_label = QLabel("Raw F/R/D/R: --")
+        self._corrected_label = QLabel("Truth F/R/D/R: --")
+        self._ideal_label = QLabel("Ideal F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("GPS F/R/D/R: --")
         self._detection_label = QLabel("BBox L/R: --")
         labels = (
             self._model_label,
@@ -382,15 +382,15 @@ class TelemetryFacts(QWidget):
             f"{self._format_float(self._latest_scalars['yolo_ms'])} ms"
         )
         self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth'])}")
-        self._raw_label.setText(f"Nominal stereo F/R/D/R: {self._format_frd(self._latest['raw'])}")
+        self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw'])}")
         self._corrected_label.setText(
-            f"Optical stereo F/R/D/R: {self._format_frd(self._latest['optical'])}"
+            f"Truth F/R/D/R: {self._format_frd(self._latest['optical'])}"
         )
         self._ideal_label.setText(
-            f"Ideal reference F/R/D/R: {self._format_frd(self._latest['ideal'])}"
+            f"Ideal F/R/D/R: {self._format_frd(self._latest['ideal'])}"
         )
         self._raw_gps_baseline_label.setText(
-            "Raw GPS Baseline F/R/D/R: "
+            "GPS F/R/D/R: "
             f"{self._format_frd(self._latest['raw_gps_baseline'])}"
         )
         self._detection_label.setText(self._detection_text)
@@ -448,12 +448,12 @@ class ExperimentHud(QWidget):
         self._yolo_label = QLabel("YOLO: --")
         self._truth_label = QLabel("Truth F/R/D/R: --")
         self._raw_label = QLabel("Raw F/R/D/R: --")
-        self._corrected_label = QLabel("Corrected F/R/D/R: --")
-        self._raw_gps_baseline_label = QLabel("Raw GPS Baseline F/R/D/R: --")
-        self._global_baseline_label = QLabel("Global Position Baseline F/R/D/R: --")
+        self._corrected_label = QLabel("Truth F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("GPS F/R/D/R: --")
+        self._global_baseline_label = QLabel("Global F/R/D/R: --")
         self._forward_error_label = QLabel("Forward Δ raw/corr: --")
         self._down_error_label = QLabel("Down Δ raw/corr: --")
-        self._gps_baseline_error_label = QLabel("Baseline ΔF Raw GPS/Global Position: --")
+        self._gps_baseline_error_label = QLabel("Baseline ΔF GPS/Global: --")
         self._detection_label = QLabel("Detections: --")
         self._contract_label = QLabel(contract)
 
@@ -513,18 +513,18 @@ class LiveSavedCsvPreview(QWidget):
             (
                 ("time_sec", "Time (s)"),
                 ("ground_truth_m", "Truth range (m)"),
-                ("raw_range_m", "Nominal range (m)"),
-                ("raw_gps_baseline_range_m", "Raw GPS Baseline range (m)"),
+                ("raw_range_m", "Raw range (m)"),
+                ("raw_gps_baseline_range_m", "GPS range (m)"),
             ),
         ),
         (
-            "Raw GPS Baseline",
+            "GPS",
             (
                 ("time_sec", "Time (s)"),
-                ("raw_gps_baseline_forward_m", "Raw GPS Baseline F (m)"),
-                ("raw_gps_baseline_right_m", "Raw GPS Baseline R (m)"),
-                ("raw_gps_baseline_down_m", "Raw GPS Baseline D (m)"),
-                ("raw_gps_baseline_position_error_m", "Raw GPS Baseline position error (m)"),
+                ("raw_gps_baseline_forward_m", "GPS F (m)"),
+                ("raw_gps_baseline_right_m", "GPS R (m)"),
+                ("raw_gps_baseline_down_m", "GPS D (m)"),
+                ("raw_gps_baseline_position_error_m", "GPS position error (m)"),
             ),
         ),
         (
@@ -543,25 +543,25 @@ class LiveSavedCsvPreview(QWidget):
             "Ray summary",
             (
                 ("time_sec", "Time (s)"),
+                ("nominal_ray_midpoint_forward_m", "F Raw"),
+                ("nominal_ray_midpoint_right_m", "Rt Raw"),
+                ("nominal_ray_midpoint_down_m", "D Raw"),
+                ("nominal_ray_range_m", "Rg Raw"),
+                ("nominal_ray_gap_m", "Gap Raw"),
+                ("optical_ray_midpoint_forward_m", "F Truth"),
+                ("optical_ray_midpoint_right_m", "Rt Truth"),
+                ("optical_ray_midpoint_down_m", "D Truth"),
+                ("optical_ray_range_m", "Rg Truth"),
+                ("optical_ray_gap_m", "Gap Truth"),
+                ("ideal_ray_midpoint_forward_m", "F Ideal"),
+                ("ideal_ray_midpoint_right_m", "Rt Ideal"),
+                ("ideal_ray_midpoint_down_m", "D Ideal"),
+                ("ideal_ray_range_m", "Rg Ideal"),
+                ("ideal_ray_gap_m", "Gap Ideal"),
                 ("drone_forward_m", "F truth"),
-                ("nominal_ray_midpoint_forward_m", "F nominal"),
-                ("optical_ray_midpoint_forward_m", "F optical"),
-                ("ideal_ray_midpoint_forward_m", "F ideal"),
                 ("drone_right_m", "Rt truth"),
-                ("nominal_ray_midpoint_right_m", "Rt nominal"),
-                ("optical_ray_midpoint_right_m", "Rt optical"),
-                ("ideal_ray_midpoint_right_m", "Rt ideal"),
                 ("drone_down_m", "D truth"),
-                ("nominal_ray_midpoint_down_m", "D nominal"),
-                ("optical_ray_midpoint_down_m", "D optical"),
-                ("ideal_ray_midpoint_down_m", "D ideal"),
                 ("ground_truth_m", "Rg truth"),
-                ("nominal_ray_range_m", "Rg nominal"),
-                ("optical_ray_range_m", "Rg optical"),
-                ("ideal_ray_range_m", "Rg ideal"),
-                ("nominal_ray_gap_m", "Gap nominal"),
-                ("optical_ray_gap_m", "Gap optical"),
-                ("ideal_ray_gap_m", "Gap ideal"),
             ),
         ),
         (
@@ -1048,7 +1048,7 @@ class LiveSavedCsvPreview(QWidget):
                 "Coverage (facts only): "
                 f"Ground truth {valid.get('ground_truth_m', 0)}/{rows} · "
                 f"Stereo {valid.get('raw_range_m', 0)}/{rows} · "
-                f"Raw GPS Baseline {valid.get('raw_gps_baseline_forward_m', 0)}/{rows} · "
+                f"GPS {valid.get('raw_gps_baseline_forward_m', 0)}/{rows} · "
                 f"bbox pair {pair_count}/{rows}"
             )
             return
@@ -1293,15 +1293,15 @@ class LiveSavedCsvPreview(QWidget):
         self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw'])}")
         corrected = self._latest["corrected"]
         if self._profile_not_configured and not any(math.isfinite(value) for value in corrected):
-            self._corrected_label.setText("Corrected F/R/D/R: NOT CONFIGURED")
+            self._corrected_label.setText("Truth F/R/D/R: NOT CONFIGURED")
         else:
-            self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(corrected)}")
+            self._corrected_label.setText(f"Truth F/R/D/R: {self._format_frd(corrected)}")
         self._raw_gps_baseline_label.setText(
-            "Raw GPS Baseline F/R/D/R: "
+            "GPS F/R/D/R: "
             f"{self._format_frd(self._latest['raw_gps_baseline'])}"
         )
         self._global_baseline_label.setText(
-            "Global Position Baseline F/R/D/R: "
+            "Global F/R/D/R: "
             f"{self._format_frd(self._latest['global_position_baseline'])}"
         )
         raw_f = self._latest_error("raw_forward")
@@ -1593,8 +1593,8 @@ class OperatorPanel(Plugin):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(
             QLabel(
-                "FRDR comparison: truth, Nominal stereo, Optical stereo, Ideal reference "
-                "(simulation-only), and PX4 Raw GPS Baseline. "
+                "FRDR comparison: truth, Raw, Truth, Ideal (simulation-only), GPS, "
+                "and Global. "
                 "Range is the 3D vector magnitude when a source "
                 "publishes F/R/D only."
             )
@@ -1651,9 +1651,9 @@ class OperatorPanel(Plugin):
         self._debug_label.setText(
             f"Status: {text}\n"
             f"Images: {IMAGE_TOPICS[0][1]}, {IMAGE_TOPICS[1][1]}\n"
-            "Series: /ground_truth_position, /stereo/estimated_position (Nominal), "
-            "/stereo/optical_position (Optical), /stereo/ideal_position (Ideal reference), "
-            "/stereo/raw_gps_baseline_position\n"
+            "Series: /ground_truth_position, /stereo/estimated_position (Raw), "
+            "/stereo/optical_position (Truth), /stereo/ideal_position (Ideal), "
+            "/stereo/raw_gps_baseline_position (GPS)\n"
             "Detection format: left/right bbox x1,y1,x2,y2, confidence, center."
         )
 

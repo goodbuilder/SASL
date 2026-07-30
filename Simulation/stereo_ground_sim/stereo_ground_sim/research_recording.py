@@ -22,7 +22,99 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v3"
+RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v4"
+LEGACY_RESEARCH_SCHEMA_VERSIONS = frozenset({"s2_atomic_pair_v3"})
+
+
+def _diagnostic_record_extension_columns() -> tuple[str, ...]:
+    columns: list[str] = []
+    for prefix in ("attitude", "baseline", "full"):
+        columns.extend(
+            (
+                f"{prefix}_ray_valid",
+                f"{prefix}_ray_left_depth_m",
+                f"{prefix}_ray_right_depth_m",
+                f"{prefix}_ray_geometry_rank",
+                f"{prefix}_ray_condition_number",
+                f"{prefix}_ray_midpoint_x_m",
+                f"{prefix}_ray_midpoint_y_m",
+                f"{prefix}_ray_midpoint_z_m",
+                f"{prefix}_ray_left_closest_x_m",
+                f"{prefix}_ray_left_closest_y_m",
+                f"{prefix}_ray_left_closest_z_m",
+                f"{prefix}_ray_right_closest_x_m",
+                f"{prefix}_ray_right_closest_y_m",
+                f"{prefix}_ray_right_closest_z_m",
+                f"{prefix}_ray_delta_valid",
+                f"{prefix}_ray_delta_failure_reason",
+                f"{prefix}_ray_gt_valid",
+                f"{prefix}_ray_gt_failure_reason",
+                f"{prefix}_ray_gt_forward_error_m",
+                f"{prefix}_ray_gt_right_error_m",
+                f"{prefix}_ray_gt_down_error_m",
+                f"{prefix}_ray_gt_range_error_m",
+                f"{prefix}_ray_gt_position_error_m",
+                f"{prefix}_ray_pixel_source",
+                f"{prefix}_ray_attitude_source",
+                f"{prefix}_ray_camera_center_source",
+            )
+        )
+        if prefix == "attitude":
+            columns.extend(
+                (
+                    "attitude_ray_source",
+                    "attitude_ray_baseline_source",
+                    "attitude_ray_gps_baseline_source",
+                    "attitude_ray_gps_baseline_world_enu_x_m",
+                    "attitude_ray_gps_baseline_world_enu_y_m",
+                    "attitude_ray_gps_baseline_world_enu_z_m",
+                    "attitude_ray_gps_baseline_length_m",
+                    "attitude_ray_gps_baseline_delta_world_enu_x_m",
+                    "attitude_ray_gps_baseline_delta_world_enu_y_m",
+                    "attitude_ray_gps_baseline_delta_world_enu_z_m",
+                    "attitude_ray_gps_baseline_delta_norm_m",
+                )
+            )
+    columns.extend(
+        (
+            "interaction_valid",
+            "interaction_failure_reason",
+            "interaction_forward_m",
+            "interaction_right_m",
+            "interaction_down_m",
+            "interaction_position_m",
+            "left_px4_q_w",
+            "left_px4_q_x",
+            "left_px4_q_y",
+            "left_px4_q_z",
+            "right_px4_q_w",
+            "right_px4_q_x",
+            "right_px4_q_y",
+            "right_px4_q_z",
+            "px4_quaternion_order",
+            "px4_attitude_semantics",
+            "left_attitude_timestamp_us",
+            "right_attitude_timestamp_us",
+            "left_attitude_receive_monotonic_ns",
+            "right_attitude_receive_monotonic_ns",
+            "left_attitude_reset_counter",
+            "right_attitude_reset_counter",
+            "left_attitude_age_ms",
+            "right_attitude_age_ms",
+            "attitude_pair_skew_ms",
+            "left_gps_timestamp_us",
+            "right_gps_timestamp_us",
+            "left_gps_age_ms",
+            "right_gps_age_ms",
+            "gps_pair_skew_ms",
+            "simulation_epoch",
+            "baseline_anchor_policy",
+        )
+    )
+    return tuple(columns)
+
+
+DIAGNOSTIC_RECORD_EXTENSION_COLUMNS = _diagnostic_record_extension_columns()
 
 PAIR_RECORD_COLUMNS = (
     "schema_version", "run_id", "case_id", "record_sequence", "record_type",
@@ -68,13 +160,50 @@ PAIR_RECORD_COLUMNS = (
     "corrected_down_m", "corrected_range_m", "corrected_ray_gap_m",
     "corrected_intersection_angle_deg", "corrected_left_depth_m",
     "corrected_right_depth_m", "corrected_geometry_rank",
-    "corrected_condition_number", "gt_source", "gt_source_entity",
+    "corrected_condition_number", "attitude_ray_computation_status",
+    "attitude_ray_failure_reason", "attitude_ray_forward_m",
+    "attitude_ray_right_m", "attitude_ray_down_m", "attitude_ray_range_m",
+    "attitude_ray_gap_m", "attitude_ray_intersection_angle_deg",
+    "attitude_ray_delta_forward_m", "attitude_ray_delta_right_m",
+    "attitude_ray_delta_down_m", "attitude_ray_delta_range_m",
+    "attitude_ray_position_difference_m", "baseline_ray_computation_status",
+    "baseline_ray_failure_reason", "baseline_ray_source",
+    "baseline_ray_baseline_source", "baseline_ray_gps_baseline_source",
+    "baseline_ray_forward_m", "baseline_ray_right_m", "baseline_ray_down_m",
+    "baseline_ray_range_m", "baseline_ray_gap_m",
+    "baseline_ray_intersection_angle_deg", "baseline_ray_delta_forward_m",
+    "baseline_ray_delta_right_m", "baseline_ray_delta_down_m",
+    "baseline_ray_delta_range_m", "baseline_ray_position_difference_m",
+    "baseline_ray_gps_baseline_world_enu_x_m",
+    "baseline_ray_gps_baseline_world_enu_y_m",
+    "baseline_ray_gps_baseline_world_enu_z_m",
+    "baseline_ray_gps_baseline_length_m",
+    "baseline_ray_gps_baseline_delta_world_enu_x_m",
+    "baseline_ray_gps_baseline_delta_world_enu_y_m",
+    "baseline_ray_gps_baseline_delta_world_enu_z_m",
+    "baseline_ray_gps_baseline_delta_norm_m", "full_ray_computation_status",
+    "full_ray_failure_reason", "full_ray_source", "full_ray_baseline_source",
+    "full_ray_gps_baseline_source", "full_ray_forward_m", "full_ray_right_m",
+    "full_ray_down_m", "full_ray_range_m", "full_ray_gap_m",
+    "full_ray_intersection_angle_deg", "full_ray_delta_forward_m",
+    "full_ray_delta_right_m", "full_ray_delta_down_m",
+    "full_ray_delta_range_m", "full_ray_position_difference_m",
+    "full_ray_gps_baseline_world_enu_x_m",
+    "full_ray_gps_baseline_world_enu_y_m",
+    "full_ray_gps_baseline_world_enu_z_m",
+    "full_ray_gps_baseline_length_m",
+    "full_ray_gps_baseline_delta_world_enu_x_m",
+    "full_ray_gps_baseline_delta_world_enu_y_m",
+    "full_ray_gps_baseline_delta_world_enu_z_m",
+    "full_ray_gps_baseline_delta_norm_m", "gt_source", "gt_source_entity",
     "gt_reference_name", "gt_reference_definition", "gt_fallback_used",
     "gt_forward_m", "gt_right_m", "gt_down_m", "gt_range_m",
     "raw_position_error_m", "raw_forward_error_m", "raw_right_error_m",
     "raw_down_error_m", "raw_range_error_m", "corrected_position_error_m",
     "corrected_forward_error_m", "corrected_right_error_m",
     "corrected_down_error_m", "corrected_range_error_m",
+    "ideal_position_error_m", "ideal_forward_error_m", "ideal_right_error_m",
+    "ideal_down_error_m", "ideal_range_error_m",
     "measurement_queue_depth", "measurement_queue_depth_max",
     "measurement_queue_capacity", "measurement_queue_overflow_count",
     "measurement_overrun_invalid", "measurement_rejected_after_overrun_count",
@@ -85,7 +214,7 @@ PAIR_RECORD_COLUMNS = (
     "research_record_queue_capacity", "research_recording_overrun_invalid",
     "research_recording_error_count", "output_frame", "output_axes",
     "position_unit", "pixel_unit", "angle_unit", "timestamp_unit",
-    "correction_source",
+    "correction_source", *DIAGNOSTIC_RECORD_EXTENSION_COLUMNS,
 )
 
 IDENTITY_FIELDS = (
@@ -188,11 +317,18 @@ def _validate_scalar(value: Any, field: str) -> None:
 
 
 def validate_pair_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    if set(record.keys()) != set(PAIR_RECORD_COLUMNS):
+    source_version = record.get("schema_version")
+    legacy = source_version in LEGACY_RESEARCH_SCHEMA_VERSIONS
+    if legacy and set(record).issubset(PAIR_RECORD_COLUMNS):
+        normalized = empty_pair_record()
+        normalized.update(record)
+        normalized["schema_version"] = RESEARCH_SCHEMA_VERSION
+    elif set(record.keys()) == set(PAIR_RECORD_COLUMNS):
+        normalized = {name: record[name] for name in PAIR_RECORD_COLUMNS}
+    else:
         missing = [name for name in PAIR_RECORD_COLUMNS if name not in record]
         extra = [name for name in record if name not in PAIR_RECORD_COLUMNS]
         raise ValueError(f"pair record columns differ: missing={missing}, extra={extra}")
-    normalized = {name: record[name] for name in PAIR_RECORD_COLUMNS}
     for field, value in normalized.items():
         _validate_scalar(value, field)
     for field in IDENTITY_FIELDS:
