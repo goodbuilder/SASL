@@ -4569,9 +4569,12 @@ class StereoDistanceNode(Node):
                                 }
                             )
                     self._publish_ray_metrics(
+                        pair_id=pair.pair_id,
                         nominal=raw,
                         optical=computed.get("corrected"),
                         ideal=ideal,
+                        gps_raw=computed.get("gps_baselines", {}).get("raw_gps"),
+                        gps_global=computed.get("gps_baselines", {}).get("global_position"),
                         interaction=diagnostic_analysis["interaction"],
                         **diagnostic_rays,
                     )
@@ -4739,6 +4742,7 @@ class StereoDistanceNode(Node):
         metrics["_diagnostic_interaction"] = diagnostic_analysis["interaction"]
         metrics["_truth_ray"] = optical
         metrics["_raw_ray"] = raw
+        metrics["_gps_baselines"] = gps_baselines
         if raw is not None:
             metrics.update(
                 {
@@ -4752,8 +4756,11 @@ class StereoDistanceNode(Node):
                 }
             )
             self._publish_ray_metrics(
+                pair_id=pair.pair_id,
                 nominal=raw,
                 optical=optical,
+                gps_raw=gps_baselines.get("raw_gps"),
+                gps_global=gps_baselines.get("global_position"),
                 interaction=diagnostic_analysis["interaction"],
                 **diagnostic_rays,
             )
@@ -5144,10 +5151,15 @@ class StereoDistanceNode(Node):
                     }
                 )
         self._publish_ray_metrics(
+            pair_id=pair_id,
             nominal=metrics.get("_raw_ray"),
             optical=metrics.get("_truth_ray"),
             ideal=ideal,
+            gps_raw=metrics.get("_gps_baselines", {}).get("raw_gps"),
+            gps_global=metrics.get("_gps_baselines", {}).get("global_position"),
             interaction=metrics.get("_diagnostic_interaction"),
+            gt_source=evaluation.get("gt_source"),
+            gt_fallback_used=evaluation.get("gt_fallback_used"),
             **diagnostic_rays,
         )
         if ideal is not None:
@@ -7192,19 +7204,30 @@ class StereoDistanceNode(Node):
     def _publish_ray_metrics(
         self,
         *,
+        pair_id=None,
         nominal=None,
         optical=None,
         ideal=None,
+        gps_raw=None,
+        gps_global=None,
         attitude=None,
         baseline=None,
         full=None,
         interaction=None,
+        gt_source=None,
+        gt_fallback_used=None,
     ):
         publisher = getattr(self, "ray_metrics_pub", None)
         if publisher is None:
             return
         payload = {}
-        for key, result in (("nominal", nominal), ("optical", optical), ("ideal", ideal), ("attitude", attitude), ("baseline", baseline), ("full", full)):
+        if pair_id is not None:
+            payload["pair_id"] = int(pair_id)
+        if gt_source is not None:
+            payload["gt_source"] = str(gt_source)
+        if gt_fallback_used is not None:
+            payload["gt_fallback_used"] = bool(gt_fallback_used)
+        for key, result in (("nominal", nominal), ("optical", optical), ("ideal", ideal), ("gps_raw", gps_raw), ("gps_global", gps_global), ("attitude", attitude), ("baseline", baseline), ("full", full)):
             ray_payload = self._ray_metrics_payload(result)
             if ray_payload is not None:
                 payload[key] = ray_payload

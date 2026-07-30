@@ -168,7 +168,7 @@ def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_group
     assert "rviz_live_ray_hz" in source
     assert 'diagnostic_rays = computed.get("diagnostic_rays", {})' in source
     assert 'interaction=diagnostic_analysis["interaction"]' in source
-    assert "self._publish_ray_metrics(\n                        nominal=raw," in source
+    assert "self._publish_ray_metrics(\n                        pair_id=pair.pair_id,\n                        nominal=raw," in source
     assert "if not self._rviz_latest_only_markers_enabled()" in source
     assert 'worker = getattr(self, "rviz_live_thread", None)' in source
     assert "and worker is not None" in source

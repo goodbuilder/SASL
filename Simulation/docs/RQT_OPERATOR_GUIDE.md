@@ -34,6 +34,28 @@ GlobalPosition remains in the CSV/XLSX evidence only, not the rqt display.
 status without turning it into an automated warning or qualification result.
 Calibration recording remains a CLI workflow.
 
+`Flight` also has a collapsible `Ray Diagnostics` group below the direct
+telemetry line. It reads the existing `/stereo/ray_metrics` snapshot only; it
+adds no triangulation, GT, or GPS-anchor logic of its own. `Geometry` lists
+all eight rays (`Raw`, `Truth`, `Ideal`, `GPS`, `Global`, `Attitude`,
+`Baseline`, `Full`) with a state chip, Forward/Right/Down/Range/Gap/Angle in
+`baseline_center_frd`, and a tooltip carrying the underlying
+`computation_status`/`failure_reason`. `Truth Δ / Interaction` shows how much
+`Attitude`, `Baseline`, and `Full` moved relative to `Truth`, plus the
+`interaction` composite-effect indicator; interaction is explicitly labelled
+"not a Ray" since it is `Full − Attitude − Baseline + Truth`, not a
+triangulated result. `GT Error` shows the absolute position error of
+`Attitude`/`Baseline`/`Full` against the Gazebo `target_reference_link`
+Ground Truth, which is a different comparison from the `Truth` Ray (an
+oracle triangulation of the observed pixels, not the target GT point itself).
+`Sensors` shows PX4 attitude and GPS baseline input health (age, pair skew,
+reset counters, quaternion order/semantics, baseline length and anchor
+policy) read from the same snapshot, with quaternion components and baseline
+ENU vectors in hover tooltips to keep the default view compact. Every numeric
+cell shows `—` for a missing or invalid value instead of `0.000`, and a new
+`/stereo/ray_metrics` snapshot fully replaces the previous one so an invalid
+pair cannot leave a prior pair's numbers on screen.
+
 `Record` shows the path, mode, persisted row count, elapsed time, and factual
 coverage counts from the active session's atomic `progress.json`. It refreshes
 the exact persisted CSV tail twice per second while writing and shows only

@@ -747,3 +747,41 @@ def test_runtime_metrics_publish_named_deltas_interaction_and_invalid_reason() -
     assert payload["baseline"]["failure_reason"] == "missing_left_gps_fix"
     assert payload["interaction_valid"] is False
     assert payload["interaction_failure_reason"] == "invalid:baseline"
+
+
+def test_runtime_metrics_publish_pair_id_and_gps_raw_gps_global_rows() -> None:
+    node = StereoDistanceNode.__new__(StereoDistanceNode)
+    messages = []
+    node.ray_metrics_pub = SimpleNamespace(
+        publish=lambda message: messages.append(json.loads(message.data))
+    )
+    truth = {
+        "computation_status": "computed",
+        "forward_m": 10.0,
+        "right_m": 0.0,
+        "down_m": 0.0,
+        "range_m": 10.0,
+        "output_frame": "baseline_center_frd",
+    }
+    gps_raw = {
+        **truth,
+        "forward_m": 10.1,
+        "valid": True,
+        "failure_reason": "",
+    }
+    node._publish_ray_metrics(
+        pair_id=42,
+        optical=truth,
+        gps_raw=gps_raw,
+        gps_global=None,
+        gt_source="gazebo_vehicle_reference_link_world_pose",
+        gt_fallback_used=False,
+    )
+
+    payload = messages[-1]
+    assert payload["pair_id"] == 42
+    assert payload["gps_raw"]["forward_m"] == pytest.approx(10.1, abs=1.0e-9)
+    assert payload["gps_raw"]["valid"] is True
+    assert "gps_global" not in payload
+    assert payload["gt_source"] == "gazebo_vehicle_reference_link_world_pose"
+    assert payload["gt_fallback_used"] is False

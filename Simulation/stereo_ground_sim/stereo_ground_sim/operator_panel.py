@@ -12,6 +12,7 @@ from python_qt_binding.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from python_qt_binding.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPen, QPixmap
 from python_qt_binding.QtWidgets import (
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -394,6 +395,422 @@ class TelemetryFacts(QWidget):
             f"{self._format_frd(self._latest['raw_gps_baseline'])}"
         )
         self._detection_label.setText(self._detection_text)
+
+
+# Display labels only; mirrors stereo_distance_node.RAY_DISPLAY_NAMES without
+# importing the ROS node module into this rqt plugin process.
+RAY_DIAGNOSTICS_ROWS = (
+    ("nominal", "Raw"),
+    ("optical", "Truth"),
+    ("ideal", "Ideal"),
+    ("gps_raw", "GPS"),
+    ("gps_global", "Global"),
+    ("attitude", "Attitude"),
+    ("baseline", "Baseline"),
+    ("full", "Full"),
+)
+DIAGNOSTIC_DELTA_ROWS = (("attitude", "Attitude"), ("baseline", "Baseline"), ("full", "Full"))
+
+# Coarse state buckets derived from the existing computation_status/failure_reason
+# strings already produced by stereo_distance_node.  This only classifies the
+# runtime string for a compact state chip; the literal string is preserved
+# verbatim in the cell tooltip.
+_RAY_STATE_BUCKET_RULES = (
+    ("stale", "STALE"),
+    ("skew", "SKEW"),
+    ("epoch_mismatch", "EPOCH_MISMATCH"),
+    ("quaternion", "INVALID_QUATERNION"),
+    ("invalid_px4_attitude", "INVALID_QUATERNION"),
+    ("gps", "INVALID_BASELINE"),
+    ("baseline", "INVALID_BASELINE"),
+)
+_STATE_COLORS = {
+    "VALID": "#1b5e20",
+    "MISSING": "#616161",
+    "STALE": "#e65100",
+    "SKEW": "#e65100",
+    "WARNING": "#e65100",
+}
+
+
+def _ray_state(ray):
+    """Return (state_chip, tooltip_detail) without inventing new runtime meaning."""
+
+    if not isinstance(ray, dict):
+        return "MISSING", "No ray in the latest /stereo/ray_metrics snapshot."
+    if bool(ray.get("valid")):
+        status = str(ray.get("computation_status", "") or "")
+        return "VALID", f"computation_status: {status}" if status else "VALID"
+    status = str(ray.get("computation_status", "") or "")
+    reason = str(ray.get("failure_reason", "") or status or "invalid")
+    haystack = f"{status} {reason}".lower()
+    for needle, bucket in _RAY_STATE_BUCKET_RULES:
+        if needle in haystack:
+            return bucket, reason
+    return (status.upper() if status else "INVALID"), reason
+
+
+def _fmt_num(value, precision=3):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(parsed):
+        return "—"
+    return f"{parsed:.{precision}f}"
+
+
+def _fmt_int(value):
+    try:
+        if value is None:
+            return "—"
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fmt_bool(value):
+    if value is None:
+        return "—"
+    return "yes" if bool(value) else "no"
+
+
+class RayDiagnosticsPanel(QWidget):
+    """Read-only Flight-tab view of the existing /stereo/ray_metrics snapshot.
+
+    Every value here is read from the payload already published by
+    stereo_distance_node; no triangulation, GT, or GPS-anchor logic lives in
+    this widget. All fields use the public ``baseline_center_frd`` output
+    contract (Forward, Right, Down, metres; angles in degrees).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._last_pair_id = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        group = QGroupBox("Ray Diagnostics")
+        group.setCheckable(True)
+        group.setChecked(True)
+        group_layout = QVBoxLayout(group)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(4, 4, 4, 4)
+        content_layout.setSpacing(4)
+        group_layout.addWidget(content)
+        group.toggled.connect(content.setVisible)
+        layout.addWidget(group)
+
+        self._frame_label = QLabel(
+            "Output frame: baseline_center_frd  |  Axes: Forward / Right / Down  |  "
+            "Position/Range: m  |  Angle: deg  |  Pair: —"
+        )
+        self._frame_label.setStyleSheet("font-weight: 600; color: #263238;")
+        content_layout.addWidget(self._frame_label)
+
+        tabs = QTabWidget()
+        tabs.addTab(self._build_geometry_tab(), "Geometry")
+        tabs.addTab(self._build_delta_tab(), "Truth Δ / Interaction")
+        tabs.addTab(self._build_gt_tab(), "GT Error")
+        tabs.addTab(self._build_sensors_tab(), "Sensors")
+        content_layout.addWidget(tabs)
+
+    # -- tab construction -------------------------------------------------
+
+    @staticmethod
+    def _make_table(headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.horizontalHeader().setStretchLastSection(True)
+        return table
+
+    def _build_geometry_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        headers = (
+            "Ray", "State", "Forward [m]", "Right [m]", "Down [m]",
+            "Range [m]", "Gap [m]", "Angle [deg]",
+        )
+        table = self._make_table(headers)
+        table.setRowCount(len(RAY_DIAGNOSTICS_ROWS))
+        for row_index, (_key, label) in enumerate(RAY_DIAGNOSTICS_ROWS):
+            table.setItem(row_index, 0, QTableWidgetItem(label))
+        layout.addWidget(table)
+        self._geometry_table = table
+        return tab
+
+    def _build_delta_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addWidget(QLabel("Truth-relative delta: how much the input geometry source changed the triangulated result."))
+        headers = (
+            "Ray", "Valid", "ΔForward [m]", "ΔRight [m]", "ΔDown [m]",
+            "ΔRange [m]", "Position Diff [m]", "Failure Reason",
+        )
+        table = self._make_table(headers)
+        table.setRowCount(len(DIAGNOSTIC_DELTA_ROWS))
+        for row_index, (_key, label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
+            table.setItem(row_index, 0, QTableWidgetItem(label))
+        layout.addWidget(table)
+        self._delta_table = table
+
+        interaction_box = QGroupBox("Interaction (composite effect, not a Ray)")
+        interaction_box.setToolTip(
+            "interaction = Full - Attitude - Baseline + Truth\n"
+            "Non-zero only when Attitude and Baseline errors combine non-linearly."
+        )
+        self._interaction_box = interaction_box
+        interaction_layout = QGridLayout(interaction_box)
+        self._interaction_labels = {}
+        for column, name in enumerate(("Valid", "Forward [m]", "Right [m]", "Down [m]", "Magnitude [m]")):
+            header = QLabel(name)
+            header.setStyleSheet("font-weight: 600;")
+            interaction_layout.addWidget(header, 0, column)
+            value_label = QLabel("—")
+            interaction_layout.addWidget(value_label, 1, column)
+            self._interaction_labels[name] = value_label
+        self._interaction_reason_label = QLabel("Failure reason: —")
+        interaction_layout.addWidget(self._interaction_reason_label, 2, 0, 1, 5)
+        layout.addWidget(interaction_box)
+        return tab
+
+    def _build_gt_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+        self._gt_source_label = QLabel("GT source: —   |   GT fallback used: —")
+        layout.addWidget(self._gt_source_label)
+        layout.addWidget(
+            QLabel(
+                "Absolute position error against the Gazebo target_reference_link "
+                "Ground Truth (not the Truth Ray)."
+            )
+        )
+        headers = (
+            "Ray", "Valid", "Fwd Error [m]", "Right Error [m]", "Down Error [m]",
+            "Range Error [m]", "Position Error [m]", "Failure Reason",
+        )
+        table = self._make_table(headers)
+        table.setRowCount(len(DIAGNOSTIC_DELTA_ROWS))
+        for row_index, (_key, label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
+            table.setItem(row_index, 0, QTableWidgetItem(label))
+        layout.addWidget(table)
+        self._gt_table = table
+        return tab
+
+    def _build_sensors_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 4, 4, 4)
+
+        warning = QLabel(
+            "Attitude age/skew does not prove alignment to the image observation timestamp."
+        )
+        warning.setStyleSheet("color: #e65100; font-style: italic;")
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+
+        attitude_box = QGroupBox("PX4 Attitude")
+        attitude_grid = QGridLayout(attitude_box)
+        self._attitude_fields = {}
+        attitude_rows = (
+            "Overall status", "Left age [ms]", "Right age [ms]", "Pair skew [ms]",
+            "Left reset counter", "Right reset counter", "Simulation epoch",
+            "Quaternion order", "Semantics",
+        )
+        for row_index, name in enumerate(attitude_rows):
+            attitude_grid.addWidget(QLabel(name), row_index, 0)
+            value_label = QLabel("—")
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            attitude_grid.addWidget(value_label, row_index, 1)
+            self._attitude_fields[name] = value_label
+        self._attitude_quaternion_label = QLabel("Quaternion detail (hover)")
+        self._attitude_quaternion_label.setStyleSheet("color: #455a64;")
+        attitude_grid.addWidget(self._attitude_quaternion_label, len(attitude_rows), 0, 1, 2)
+        layout.addWidget(attitude_box)
+
+        gps_box = QGroupBox("GPS Baseline")
+        gps_grid = QGridLayout(gps_box)
+        self._gps_fields = {}
+        gps_rows = (
+            "Overall status", "Left age [ms]", "Right age [ms]", "Pair skew [ms]",
+            "Baseline length [m]", "Baseline delta norm [m]", "Anchor policy",
+        )
+        for row_index, name in enumerate(gps_rows):
+            gps_grid.addWidget(QLabel(name), row_index, 0)
+            value_label = QLabel("—")
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            gps_grid.addWidget(value_label, row_index, 1)
+            self._gps_fields[name] = value_label
+        self._gps_vector_label = QLabel("Baseline vectors (hover)")
+        self._gps_vector_label.setStyleSheet("color: #455a64;")
+        gps_grid.addWidget(self._gps_vector_label, len(gps_rows), 0, 1, 2)
+        layout.addWidget(gps_box)
+        layout.addStretch(1)
+        return tab
+
+    # -- data ingestion -----------------------------------------------------
+
+    def update_ray_metrics(self, payload):
+        try:
+            data = json.loads(str(payload))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict):
+            return
+        self._refresh(data)
+
+    # -- rendering ------------------------------------------------------
+
+    def _refresh(self, data):
+        pair_id = data.get("pair_id")
+        if pair_id is not None:
+            self._last_pair_id = pair_id
+        self._frame_label.setText(
+            "Output frame: baseline_center_frd  |  Axes: Forward / Right / Down  |  "
+            "Position/Range: m  |  Angle: deg  |  Pair: "
+            f"{_fmt_int(pair_id) if pair_id is not None else _fmt_int(self._last_pair_id)}"
+        )
+        self._refresh_geometry(data)
+        self._refresh_delta(data)
+        self._refresh_interaction(data)
+        self._refresh_gt(data)
+        self._refresh_sensors(data)
+
+    def _refresh_geometry(self, data):
+        table = self._geometry_table
+        for row_index, (key, _label) in enumerate(RAY_DIAGNOSTICS_ROWS):
+            ray = data.get(key)
+            state, detail = _ray_state(ray)
+            state_item = QTableWidgetItem(state)
+            state_item.setToolTip(detail)
+            color = _STATE_COLORS.get(state, "#b00020" if state != "VALID" else "#1b5e20")
+            state_item.setForeground(QColor(color))
+            table.setItem(row_index, 1, state_item)
+            values = ray if isinstance(ray, dict) else {}
+            table.setItem(row_index, 2, QTableWidgetItem(_fmt_num(values.get("forward_m"), 3)))
+            table.setItem(row_index, 3, QTableWidgetItem(_fmt_num(values.get("right_m"), 3)))
+            table.setItem(row_index, 4, QTableWidgetItem(_fmt_num(values.get("down_m"), 3)))
+            table.setItem(row_index, 5, QTableWidgetItem(_fmt_num(values.get("range_m"), 3)))
+            table.setItem(row_index, 6, QTableWidgetItem(_fmt_num(values.get("gap_m"), 6)))
+            table.setItem(
+                row_index, 7,
+                QTableWidgetItem(_fmt_num(values.get("intersection_angle_deg"), 3)),
+            )
+        table.resizeColumnsToContents()
+
+    def _refresh_delta(self, data):
+        table = self._delta_table
+        for row_index, (key, _label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
+            ray = data.get(key)
+            values = ray if isinstance(ray, dict) else {}
+            valid = bool(values.get("delta_valid", False))
+            valid_item = QTableWidgetItem("yes" if valid else "no")
+            valid_item.setForeground(QColor("#1b5e20" if valid else "#b00020"))
+            table.setItem(row_index, 1, valid_item)
+            table.setItem(row_index, 2, QTableWidgetItem(_fmt_num(values.get("delta_forward_m"), 3)))
+            table.setItem(row_index, 3, QTableWidgetItem(_fmt_num(values.get("delta_right_m"), 3)))
+            table.setItem(row_index, 4, QTableWidgetItem(_fmt_num(values.get("delta_down_m"), 3)))
+            table.setItem(row_index, 5, QTableWidgetItem(_fmt_num(values.get("delta_range_m"), 3)))
+            table.setItem(row_index, 6, QTableWidgetItem(_fmt_num(values.get("position_difference_m"), 3)))
+            reason = str(values.get("delta_failure_reason", "") or "")
+            reason_item = QTableWidgetItem(reason)
+            reason_item.setToolTip(reason)
+            table.setItem(row_index, 7, reason_item)
+        table.resizeColumnsToContents()
+
+    def _refresh_interaction(self, data):
+        interaction = data.get("interaction")
+        values = interaction if isinstance(interaction, dict) else {}
+        valid = bool(values.get("valid", False))
+        self._interaction_labels["Valid"].setText("yes" if valid else "no")
+        self._interaction_labels["Forward [m]"].setText(_fmt_num(values.get("forward_m"), 3))
+        self._interaction_labels["Right [m]"].setText(_fmt_num(values.get("right_m"), 3))
+        self._interaction_labels["Down [m]"].setText(_fmt_num(values.get("down_m"), 3))
+        self._interaction_labels["Magnitude [m]"].setText(_fmt_num(values.get("position_m"), 3))
+        reason = str(values.get("failure_reason", "") or "")
+        self._interaction_reason_label.setText(f"Failure reason: {reason or '—'}")
+
+    def _refresh_gt(self, data):
+        source = data.get("gt_source")
+        fallback = data.get("gt_fallback_used")
+        self._gt_source_label.setText(
+            f"GT source: {source or '—'}   |   GT fallback used: {_fmt_bool(fallback)}"
+        )
+        table = self._gt_table
+        for row_index, (key, _label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
+            ray = data.get(key)
+            values = ray if isinstance(ray, dict) else {}
+            valid = bool(values.get("gt_valid", False))
+            valid_item = QTableWidgetItem("yes" if valid else "no")
+            valid_item.setForeground(QColor("#1b5e20" if valid else "#b00020"))
+            table.setItem(row_index, 1, valid_item)
+            table.setItem(row_index, 2, QTableWidgetItem(_fmt_num(values.get("gt_forward_error_m"), 3)))
+            table.setItem(row_index, 3, QTableWidgetItem(_fmt_num(values.get("gt_right_error_m"), 3)))
+            table.setItem(row_index, 4, QTableWidgetItem(_fmt_num(values.get("gt_down_error_m"), 3)))
+            table.setItem(row_index, 5, QTableWidgetItem(_fmt_num(values.get("gt_range_error_m"), 3)))
+            table.setItem(row_index, 6, QTableWidgetItem(_fmt_num(values.get("gt_position_error_m"), 3)))
+            reason = str(values.get("gt_failure_reason", "") or "")
+            reason_item = QTableWidgetItem(reason)
+            reason_item.setToolTip(reason)
+            table.setItem(row_index, 7, reason_item)
+        table.resizeColumnsToContents()
+
+    def _refresh_sensors(self, data):
+        full = data.get("full") if isinstance(data.get("full"), dict) else {}
+        attitude = data.get("attitude") if isinstance(data.get("attitude"), dict) else {}
+        attitude_source = full if full.get("left_attitude_age_ms") is not None else attitude
+        attitude_status, attitude_detail = _ray_state(attitude if attitude else None)
+        self._attitude_fields["Overall status"].setText(attitude_status)
+        self._attitude_fields["Overall status"].setToolTip(attitude_detail)
+        self._attitude_fields["Left age [ms]"].setText(_fmt_num(attitude_source.get("left_attitude_age_ms"), 1))
+        self._attitude_fields["Right age [ms]"].setText(_fmt_num(attitude_source.get("right_attitude_age_ms"), 1))
+        self._attitude_fields["Pair skew [ms]"].setText(_fmt_num(attitude_source.get("attitude_pair_skew_ms"), 1))
+        self._attitude_fields["Left reset counter"].setText(_fmt_int(attitude_source.get("left_attitude_reset_counter")))
+        self._attitude_fields["Right reset counter"].setText(_fmt_int(attitude_source.get("right_attitude_reset_counter")))
+        self._attitude_fields["Simulation epoch"].setText(_fmt_int(attitude_source.get("simulation_epoch")))
+        self._attitude_fields["Quaternion order"].setText(str(attitude_source.get("px4_quaternion_order") or "—"))
+        self._attitude_fields["Semantics"].setText(str(attitude_source.get("px4_attitude_semantics") or "—"))
+        left_q = tuple(_fmt_num(attitude_source.get(f"left_px4_q_{axis}"), 6) for axis in ("w", "x", "y", "z"))
+        right_q = tuple(_fmt_num(attitude_source.get(f"right_px4_q_{axis}"), 6) for axis in ("w", "x", "y", "z"))
+        self._attitude_quaternion_label.setToolTip(
+            f"Left q [w,x,y,z] = {left_q}\nRight q [w,x,y,z] = {right_q}\n"
+            f"Left topic: {attitude_source.get('left_attitude_topic', '—')}\n"
+            f"Right topic: {attitude_source.get('right_attitude_topic', '—')}\n"
+            f"Left timestamp_us: {attitude_source.get('left_attitude_timestamp_us', '—')}\n"
+            f"Right timestamp_us: {attitude_source.get('right_attitude_timestamp_us', '—')}\n"
+            f"Left receive_monotonic_ns: {attitude_source.get('left_attitude_receive_monotonic_ns', '—')}\n"
+            f"Right receive_monotonic_ns: {attitude_source.get('right_attitude_receive_monotonic_ns', '—')}"
+        )
+
+        baseline = data.get("baseline") if isinstance(data.get("baseline"), dict) else {}
+        gps_source = full if full.get("gps_baseline_length_m") is not None else baseline
+        gps_status, gps_detail = _ray_state(baseline if baseline else None)
+        self._gps_fields["Overall status"].setText(gps_status)
+        self._gps_fields["Overall status"].setToolTip(gps_detail)
+        self._gps_fields["Left age [ms]"].setText(_fmt_num(gps_source.get("left_gps_age_ms"), 1))
+        self._gps_fields["Right age [ms]"].setText(_fmt_num(gps_source.get("right_gps_age_ms"), 1))
+        self._gps_fields["Pair skew [ms]"].setText(_fmt_num(gps_source.get("gps_pair_skew_ms"), 1))
+        self._gps_fields["Baseline length [m]"].setText(_fmt_num(gps_source.get("gps_baseline_length_m"), 3))
+        self._gps_fields["Baseline delta norm [m]"].setText(_fmt_num(gps_source.get("gps_baseline_delta_norm_m"), 3))
+        self._gps_fields["Anchor policy"].setText(str(gps_source.get("baseline_anchor_policy") or "—"))
+        enu = gps_source.get("gps_baseline_world_enu_m")
+        delta_enu = gps_source.get("gps_baseline_delta_world_enu_m")
+        self._gps_vector_label.setToolTip(
+            f"World ENU baseline [m] = {enu if enu else '—'}\n"
+            f"World ENU delta vs nominal [m] = {delta_enu if delta_enu else '—'}\n"
+            f"Left eph [m]: {_fmt_num(gps_source.get('gps_left_eph_m'), 3)}\n"
+            f"Right eph [m]: {_fmt_num(gps_source.get('gps_right_eph_m'), 3)}\n"
+            f"Left topic: {gps_source.get('left_gps_topic', '—')}\n"
+            f"Right topic: {gps_source.get('right_gps_topic', '—')}"
+        )
 
 
 class ExperimentHud(QWidget):
@@ -1508,6 +1925,7 @@ class OperatorPanel(Plugin):
         self._right_view = CameraView("Right Camera")
         self._plot_stack = FrdPlotStack()
         self._recording_controls = RecordingControls()
+        self._ray_diagnostics = RayDiagnosticsPanel()
 
         tabs = QTabWidget()
         tabs.addTab(self._build_setup_tab(model_filename), "Setup")
@@ -1584,6 +2002,7 @@ class OperatorPanel(Plugin):
         layout.addLayout(cameras)
         layout.addWidget(self._facts)
         layout.addWidget(self._status)
+        layout.addWidget(self._ray_diagnostics)
         layout.addStretch(1)
         return tab
 
@@ -1690,6 +2109,7 @@ class OperatorPanel(Plugin):
 
     def _handle_ray_metrics(self, payload):
         self._record_preview.update_live_ray_metrics(payload)
+        self._ray_diagnostics.update_ray_metrics(payload)
 
     def _handle_px4_raw_gps(self, label, msg):
         self._record_preview.update_live_px4_raw_gps(label, msg)
