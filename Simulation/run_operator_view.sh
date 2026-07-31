@@ -1052,6 +1052,7 @@ if [[ -n "$DEFAULT_YOLO_MODEL" ]]; then
   add_default_launch_arg yolo_target_hz "$DEFAULT_YOLO_HZ" "${launch_input[@]}"
   add_default_launch_arg yolo_imgsz "$DEFAULT_YOLO_IMGSZ" "${launch_input[@]}"
   add_default_launch_arg measurement_queue_capacity "${MEASUREMENT_QUEUE_CAPACITY:-4096}" "${launch_input[@]}"
+  add_default_launch_arg measurement_latest_only "${MEASUREMENT_LATEST_ONLY:-true}" "${launch_input[@]}"
   if [[ "$show_detection_images" == true ]]; then
     add_default_launch_arg overlay_publish_hz "$DEFAULT_OVERLAY_HZ" "${launch_input[@]}"
   else
@@ -1108,6 +1109,14 @@ fi
 colcon build \
   --base-paths "$ROOT_DIR/stereo_ground_sim" "$ROOT_DIR/stereo_ground_sim_overlay" \
   --packages-select stereo_ground_sim stereo_ground_sim_overlay
+
+# Builds (if needed) a local drop-in replacement for gz-sim's installed
+# magnetometer plugin whose built-in geomagnetic table disagrees with PX4's
+# own WMM table at this world's lat/lon (see vendor dir README/comments).
+# The system gz-sim package is never modified; _generate_world() points the
+# world SDF's magnetometer plugin at this .so by absolute path when set.
+"$ROOT_DIR/stereo_ground_sim/vendor/gz_magnetometer_wmm_patch/build.sh"
+export STEREO_GROUND_SIM_MAGNETOMETER_PLUGIN_PATH="$ROOT_DIR/stereo_ground_sim/vendor/gz_magnetometer_wmm_patch/build/libgz-sim-magnetometer-system.so"
 
 set +u
 # shellcheck disable=SC1091

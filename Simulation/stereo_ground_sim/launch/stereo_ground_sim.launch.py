@@ -158,6 +158,7 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "enable_gps_baseline_triangulation",
         "enable_rviz_rays",
         "rviz_live_latest_only",
+        "measurement_latest_only",
     }
     names = [
         "scenario_name",
@@ -219,6 +220,7 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "yolo_device",
         "yolo_target_hz",
         "measurement_queue_capacity",
+        "measurement_latest_only",
         "rviz_live_latest_only",
         "rviz_live_ray_hz",
         "yolo_imgsz",
@@ -454,6 +456,23 @@ def _generate_world(context):
                 1,
             )
             break
+
+    # Point the magnetometer plugin at a local build whose geomagnetic table
+    # is replaced with PX4's own WMM table (see
+    # stereo_ground_sim/vendor/gz_magnetometer_wmm_patch/), so the simulated
+    # magnetometer signal agrees with PX4's independently-computed
+    # EKF2_MAG_DECL for this world's lat/lon. Falls back to gz-sim's stock,
+    # installed plugin if the patched build isn't available.
+    magnetometer_plugin_path = os.environ.get(
+        "STEREO_GROUND_SIM_MAGNETOMETER_PLUGIN_PATH")
+    if magnetometer_plugin_path and os.path.isfile(magnetometer_plugin_path):
+        world = world.replace(
+            '<plugin filename="gz-sim-magnetometer-system" '
+            'name="gz::sim::systems::Magnetometer" />',
+            f'<plugin filename="{magnetometer_plugin_path}" '
+            'name="gz::sim::systems::Magnetometer" />',
+            1,
+        )
 
     world = world.replace("        <!-- GROUND_GRID_VISUALS -->", "", 1)
     world = _set_target_include_static(
@@ -750,6 +769,7 @@ def generate_launch_description():
             DeclareLaunchArgument("yolo_imgsz", default_value="1280"),
             DeclareLaunchArgument("observation_mode", default_value="bbox_yolo"),
             DeclareLaunchArgument("measurement_queue_capacity", default_value="4096"),
+            DeclareLaunchArgument("measurement_latest_only", default_value="false"),
             # Keep every ray family (nominal, optical, ideal, and GPS
             # baseline) on one newest-pair RViz cadence.  This uses a separate
             # display-only YOLO stream; callers can still disable it for a
