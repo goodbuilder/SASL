@@ -1,9 +1,18 @@
 import os
+from glob import glob
 
 from setuptools import find_packages, setup
 
 
 package_name = "pose_simulation"
+
+model_files_by_dir = {}
+for path in glob("models/**/*", recursive=True):
+    if os.path.isdir(path):
+        continue
+    target_dir = os.path.join("share", package_name, os.path.dirname(path))
+    model_files_by_dir.setdefault(target_dir, []).append(path)
+model_files = list(model_files_by_dir.items())
 
 setup(
     name=package_name,
@@ -18,7 +27,8 @@ setup(
         (os.path.join("share", package_name, "launch"), ["launch/pose_simulation.launch.py"]),
         (os.path.join("share", package_name, "config"), ["config/pose_simulation.yaml"]),
         (os.path.join("share", package_name, "rviz"), ["config/pose_simulation.rviz"]),
-    ],
+        (os.path.join("share", package_name, "worlds"), ["worlds/stereo_ground_drone.sdf"]),
+    ] + model_files,
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="moontaehyung",

@@ -29,6 +29,14 @@ verified fixed `R_link_from_optical` transform is therefore applied before an
 actual pose is labeled `camera_optical_rdf`; the entity quaternion is not
 treated as an RDF quaternion by identity assumption.
 
+The launcher carries an independent copy of the reference world under
+`worlds/` and the required `wiris_camera` and `x500_15m` model assets under
+`models/`. These are copied inputs, not runtime imports from `Simulation`.
+The copied world has no `target_reference_link`; standalone evaluation
+therefore reports the `x500_15m` model as `MODEL_POSE_FALLBACK`, preserving the
+Ground Truth hierarchy instead of relabeling the model as an authoritative
+link.
+
 The node can also read raw Gazebo `Pose_V` streams directly with
 `enable_gazebo_raw_pose_streams: true`. Configure the exact target reference
 entity, parent model, and both optical entities before enabling that path; the
@@ -90,10 +98,11 @@ independent launcher from this directory:
 
 It builds only `PoseSimulation`, sources `/opt/ros/${ROS_DISTRO:-humble}` and
 the optional `POSE_SIMULATION_ROS_WORKSPACE` overlay, then starts the node,
-`rqt_gui`, RViz, and the Gazebo GUI client. Use `--no-build` when the local
-install is already current, or `--node-only` for the diagnostic node without
-GUIs. The launcher never starts, imports, modifies, or sends pose commands to
-`Simulation`; the Gazebo process is GUI-only and does not start a server/world.
+`rqt_gui`, RViz, and the copied Gazebo world with server + GUI. Use
+`--no-build` when the local install is already current, or `--node-only` for
+the diagnostic node without GUIs. `--gazebo-gui-only` opens only the client
+against an already running server. The launcher never starts, imports,
+modifies, or sends pose commands to `Simulation`.
 
 Before a real evaluation, set the WGS84 reference origin, altitude datum, and
 nominal stereo extrinsics in `config/pose_simulation.yaml`. The checked-in

@@ -1,0 +1,294 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<sdf version="1.9">
+  <world name="stereo_ground_drone">
+    <physics type="ode">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>250</real_time_update_rate>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics" />
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands" />
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster" />
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact" />
+    <plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu" />
+    <plugin filename="gz-sim-magnetometer-system" name="gz::sim::systems::Magnetometer" />
+    <plugin filename="gz-sim-air-pressure-system" name="gz::sim::systems::AirPressure" />
+    <plugin filename="gz-sim-navsat-system" name="ignition::gazebo::systems::NavSat" />
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <gravity>0 0 -9.8</gravity>
+    <!-- ENU Tesla, generated to match PX4 WMM (src/lib/world_magnetic_model)
+         at this world's spherical_coordinates lat/lon. PX4 SHA d6f12ad1c4f70ad3230afd7d86e971421e02fef4. -->
+    <magnetic_field>1.293984869535e-06 2.174328662843e-05 -4.304112611929e-05</magnetic_field>
+    <atmosphere type="adiabatic" />
+    <spherical_coordinates>
+      <surface_model>EARTH_WGS84</surface_model>
+      <world_frame_orientation>ENU</world_frame_orientation>
+      <latitude_deg>47.397971057728974</latitude_deg>
+      <longitude_deg>8.546163739800146</longitude_deg>
+      <elevation>0</elevation>
+    </spherical_coordinates>
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 20 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+    <model name="ground">
+      <static>true</static>
+      <pose>0 2000 0 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <pose>0 0 -0.05 0 0 0</pose>
+          <geometry>
+            <box>
+              <size>4000 4000 0.1</size>
+            </box>
+          </geometry>
+        </collision>
+        <visual name="ground_base">
+          <pose>0 0 0.012 0 0 0</pose>
+          <geometry>
+            <plane>
+              <normal>0 0 1</normal>
+              <size>4000 4000</size>
+            </plane>
+          </geometry>
+          <material>
+            <ambient>0.24 0.26 0.27 1</ambient>
+            <diffuse>0.22 0.24 0.25 1</diffuse>
+          </material>
+        </visual>
+        <!-- Ground grid line visuals are intentionally omitted. -->
+        <!-- GROUND_GRID_VISUALS -->
+      </link>
+    </model>
+    <model name="left_stereo_camera">
+      <static>true</static>
+      <pose>-12.5 0 5.0 0 0 1.570796327</pose>
+      <link name="base_link">
+        <sensor name="air_pressure_sensor" type="air_pressure">
+          <always_on>true</always_on>
+          <update_rate>50</update_rate>
+          <air_pressure>
+            <pressure>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>3</stddev>
+              </noise>
+            </pressure>
+          </air_pressure>
+        </sensor>
+        <sensor name="magnetometer_sensor" type="magnetometer">
+          <always_on>true</always_on>
+          <update_rate>100</update_rate>
+          <!-- Per-axis magnetometer noise (Tesla stddev). Drives PX4's
+               EKF heading estimate for this camera's Pixhawk, which feeds
+               the Attitude/Full Ray triangulation. -->
+          <magnetometer>
+            <x><noise type="gaussian"><stddev>0.0001</stddev></noise></x>
+            <y><noise type="gaussian"><stddev>0.0001</stddev></noise></y>
+            <z><noise type="gaussian"><stddev>0.0001</stddev></noise></z>
+          </magnetometer>
+        </sensor>
+        <sensor name="navsat_sensor" type="navsat">
+          <always_on>true</always_on>
+          <update_rate>30</update_rate>
+        </sensor>
+        <sensor name="imu_sensor" type="imu">
+          <always_on>true</always_on>
+          <update_rate>250</update_rate>
+          <imu>
+            <angular_velocity>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></z>
+            </angular_velocity>
+            <linear_acceleration>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.00637</stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.00637</stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.00686</stddev></noise></z>
+            </linear_acceleration>
+          </imu>
+        </sensor>
+      </link>
+      <link name="optical_link">
+        <pose relative_to="base_link">0 0 0 0 0 0</pose>
+        <!-- WIRIS shell and image sensor follow only the optical attitude. -->
+        <visual name="wiris_shell">
+          <!-- Visual-only alignment: place the mesh origin at the optical-frame origin and compensate its authored +Y forward axis. -->
+          <!-- Do not change base_link, optical_link, or sensor poses here: PX4 and image geometry use those frames. -->
+          <pose>0 0 0 0 0 1.570796327</pose>
+          <geometry>
+            <mesh>
+              <scale>0.001 0.001 0.001</scale>
+              <uri>model://wiris_camera/meshes/WIRIS.stl</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <ambient>0.08 0.08 0.09 1</ambient>
+            <diffuse>0.30 0.31 0.33 1</diffuse>
+            <specular>0.35 0.35 0.38 1</specular>
+          </material>
+        </visual>
+        <sensor name="camera" type="camera">
+          <pose>0 0 0 0 0 0</pose>
+          <always_on>true</always_on>
+          <update_rate>20</update_rate>
+          <topic>/left_camera/image</topic>
+          <camera>
+            <horizontal_fov>0.154997710698</horizontal_fov>
+            <image>
+              <width>1280</width>
+              <height>720</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>2500</far>
+            </clip>
+            <distortion>
+              <k1>0</k1>
+              <k2>0</k2>
+              <k3>0</k3>
+              <p1>0</p1>
+              <p2>0</p2>
+              <center>0.5 0.5</center>
+            </distortion>
+          </camera>
+        </sensor>
+      </link>
+      <joint name="optical_mount" type="fixed">
+        <parent>base_link</parent>
+        <child>optical_link</child>
+      </joint>
+      <!-- Camera oracle source: scoped Pose_V with model and both link identities. -->
+      <plugin filename="gz-sim-pose-publisher-system" name="gz::sim::systems::PosePublisher">
+        <publish_model_pose>true</publish_model_pose>
+        <publish_link_pose>true</publish_link_pose>
+        <use_pose_vector_msg>true</use_pose_vector_msg>
+        <static_publisher>true</static_publisher>
+      </plugin>
+    </model>
+    <model name="right_stereo_camera">
+      <static>true</static>
+      <pose>12.5 0 5.0 0 0 1.570796327</pose>
+      <link name="base_link">
+        <sensor name="air_pressure_sensor" type="air_pressure">
+          <always_on>true</always_on>
+          <update_rate>50</update_rate>
+          <air_pressure>
+            <pressure>
+              <noise type="gaussian">
+                <mean>0</mean>
+                <stddev>3</stddev>
+              </noise>
+            </pressure>
+          </air_pressure>
+        </sensor>
+        <sensor name="magnetometer_sensor" type="magnetometer">
+          <always_on>true</always_on>
+          <update_rate>100</update_rate>
+          <!-- Per-axis magnetometer noise (Tesla stddev). Drives PX4's
+               EKF heading estimate for this camera's Pixhawk, which feeds
+               the Attitude/Full Ray triangulation. -->
+          <magnetometer>
+            <x><noise type="gaussian"><stddev>0.0001</stddev></noise></x>
+            <y><noise type="gaussian"><stddev>0.0001</stddev></noise></y>
+            <z><noise type="gaussian"><stddev>0.0001</stddev></noise></z>
+          </magnetometer>
+        </sensor>
+        <sensor name="navsat_sensor" type="navsat">
+          <always_on>true</always_on>
+          <update_rate>30</update_rate>
+        </sensor>
+        <sensor name="imu_sensor" type="imu">
+          <always_on>true</always_on>
+          <update_rate>250</update_rate>
+          <imu>
+            <angular_velocity>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></z>
+            </angular_velocity>
+            <linear_acceleration>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.00637</stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.00637</stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.00686</stddev></noise></z>
+            </linear_acceleration>
+          </imu>
+        </sensor>
+      </link>
+      <link name="optical_link">
+        <pose relative_to="base_link">0 0 0 0 0 0</pose>
+        <!-- WIRIS shell and image sensor follow only the optical attitude. -->
+        <visual name="wiris_shell">
+          <!-- Visual-only alignment: place the mesh origin at the optical-frame origin and compensate its authored +Y forward axis. -->
+          <!-- Do not change base_link, optical_link, or sensor poses here: PX4 and image geometry use those frames. -->
+          <pose>0 0 0 0 0 1.570796327</pose>
+          <geometry>
+            <mesh>
+              <scale>0.001 0.001 0.001</scale>
+              <uri>model://wiris_camera/meshes/WIRIS.stl</uri>
+            </mesh>
+          </geometry>
+          <material>
+            <ambient>0.08 0.08 0.09 1</ambient>
+            <diffuse>0.30 0.31 0.33 1</diffuse>
+            <specular>0.35 0.35 0.38 1</specular>
+          </material>
+        </visual>
+        <sensor name="camera" type="camera">
+          <pose>0 0 0 0 0 0</pose>
+          <always_on>true</always_on>
+          <update_rate>20</update_rate>
+          <topic>/right_camera/image</topic>
+          <camera>
+            <horizontal_fov>0.154997710698</horizontal_fov>
+            <image>
+              <width>1280</width>
+              <height>720</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>2500</far>
+            </clip>
+            <distortion>
+              <k1>0</k1>
+              <k2>0</k2>
+              <k3>0</k3>
+              <p1>0</p1>
+              <p2>0</p2>
+              <center>0.5 0.5</center>
+            </distortion>
+          </camera>
+        </sensor>
+      </link>
+      <joint name="optical_mount" type="fixed">
+        <parent>base_link</parent>
+        <child>optical_link</child>
+      </joint>
+      <!-- Camera oracle source: scoped Pose_V with model and both link identities. -->
+      <plugin filename="gz-sim-pose-publisher-system" name="gz::sim::systems::PosePublisher">
+        <publish_model_pose>true</publish_model_pose>
+        <publish_link_pose>true</publish_link_pose>
+        <use_pose_vector_msg>true</use_pose_vector_msg>
+        <static_publisher>true</static_publisher>
+      </plugin>
+    </model>
+    <include>
+      <uri>model://x500_15m</uri>
+      <static>false</static>
+      <pose>0 2000 0.75 0 0 -1.570796327</pose>
+    </include>
+  </world>
+</sdf>

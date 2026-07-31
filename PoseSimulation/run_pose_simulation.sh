@@ -9,11 +9,12 @@ ROS_SETUP="/opt/ros/$ROS_DISTRO_NAME/setup.bash"
 ROS_WORKSPACE_SETUP="$POSE_SIMULATION_ROS_WORKSPACE/install/setup.bash"
 LOCAL_SETUP="$ROOT_DIR/install/setup.bash"
 RVIZ_CONFIG="${POSE_SIMULATION_RVIZ_CONFIG:-$ROOT_DIR/config/pose_simulation.rviz}"
-GAZEBO_WORLD="${POSE_SIMULATION_GAZEBO_WORLD:-}"
+GAZEBO_WORLD="${POSE_SIMULATION_GAZEBO_WORLD:-$ROOT_DIR/worlds/stereo_ground_drone.sdf}"
 build_local=true
 start_rqt=true
 start_rviz=true
 start_gazebo_gui=true
+gazebo_gui_only=false
 launch_args=()
 children=()
 
@@ -32,9 +33,10 @@ Options:
   --node-only            Alias for --no-gui.
   --no-rqt                Do not start rqt_gui.
   --no-rviz               Do not start RViz.
-  --no-gazebo-gui        Do not start the Gazebo GUI client.
+  --no-gazebo-gui        Do not start the Gazebo server or GUI.
+  --gazebo-gui-only      Open the GUI client without starting the server.
   --rviz-config FILE     RViz config. Default: config/pose_simulation.rviz.
-  --gazebo-world FILE    Optional world passed to the GUI-only Gazebo client.
+  --gazebo-world FILE    Gazebo world. Default: worlds/stereo_ground_drone.sdf.
   --help, -h             Show this help.
 
 Environment:
@@ -46,8 +48,7 @@ Environment:
   POSE_SIMULATION_RVIZ_CONFIG
                  Override the RViz config path.
   POSE_SIMULATION_GAZEBO_WORLD
-                 Optional Gazebo world path. By default only the GUI client
-                 is opened and it connects to an already running server.
+                 Override the independent copied Gazebo world path.
 
 Examples:
   ./run_pose_simulation.sh
@@ -86,6 +87,10 @@ while (($# > 0)); do
       start_gazebo_gui=false
       shift
       ;;
+    --gazebo-gui-only)
+      gazebo_gui_only=true
+      shift
+      ;;
     --rviz-config)
       if (($# < 2)); then
         printf '%s\n' "error: --rviz-config requires a file path." >&2
@@ -122,6 +127,8 @@ esac
 
 cd "$ROOT_DIR"
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/pose-simulation-ros-log}"
+export GZ_CONFIG_HOME="${GZ_CONFIG_HOME:-/tmp/pose-simulation-gz-config}"
+export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/models${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
 
 if [[ -f "$ROS_SETUP" ]]; then
   # shellcheck disable=SC1091
@@ -208,16 +215,29 @@ if [[ -n "$GAZEBO_WORLD" && ! -f "$GAZEBO_WORLD" ]]; then
 fi
 
 cleanup() {
-  local pid
+  local pid child
+  local -a owned_children=()
   trap - EXIT INT TERM
+  for pid in "${children[@]}"; do
+    while read -r child; do
+      [[ -n "$child" ]] || continue
+      owned_children+=("$child")
+    done < <(pgrep -P "$pid" || true)
+  done
   for pid in "${children[@]}"; do
     if kill -0 "$pid" >/dev/null 2>&1; then
       kill -TERM "-$pid" >/dev/null 2>&1 || kill -TERM "$pid" >/dev/null 2>&1 || true
     fi
   done
   sleep 1
+  for child in "${owned_children[@]}"; do
+    kill -TERM "$child" >/dev/null 2>&1 || true
+  done
   for pid in "${children[@]}"; do
     kill -KILL "-$pid" >/dev/null 2>&1 || kill -KILL "$pid" >/dev/null 2>&1 || true
+  done
+  for child in "${owned_children[@]}"; do
+    kill -KILL "$child" >/dev/null 2>&1 || true
   done
 }
 
@@ -245,9 +265,17 @@ fi
 
 if [[ "$start_gazebo_gui" == true ]]; then
   if [[ -n "$GAZEBO_WORLD" ]]; then
-    start_child "Gazebo GUI client" gz sim -g "$GAZEBO_WORLD"
+    if [[ "$gazebo_gui_only" == true ]]; then
+      start_child "Gazebo GUI client" gz sim -g "$GAZEBO_WORLD"
+    else
+      start_child "Gazebo server + GUI" gz sim -r "$GAZEBO_WORLD"
+    fi
   else
-    start_child "Gazebo GUI client" gz sim -g
+    if [[ "$gazebo_gui_only" == true ]]; then
+      start_child "Gazebo GUI client" gz sim -g
+    else
+      start_child "Gazebo server + GUI" gz sim -r
+    fi
   fi
 fi
 
@@ -257,6 +285,10 @@ else
   printf '%s\n' "PoseSimulation is running without observation GUIs."
 fi
 if [[ "$start_gazebo_gui" == true ]]; then
-  printf '%s\n' "Gazebo GUI is client-only; no Gazebo server or world is started by this app."
+  if [[ "$gazebo_gui_only" == true ]]; then
+    printf '%s\n' "Gazebo GUI is client-only; no Gazebo server is started by this app."
+  else
+    printf '%s\n' "Gazebo world: $GAZEBO_WORLD"
+  fi
 fi
 wait "${children[0]}"

@@ -11,13 +11,14 @@
     # link=[Forward, -Right, -Down]. This is the verified SDF extrinsic.
     gazebo_link_rotation_from_optical_flat: [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]
 
-    # Optional direct Gazebo Pose_V observation. Keep disabled when the
-    # existing Simulation adapters already publish the ROS input topics.
-    enable_gazebo_raw_pose_streams: false
+    # This independent app observes its copied Gazebo world directly. The
+    # x500 model is a configured fallback because this world does not rename
+    # the model to target_reference_link.
+    enable_gazebo_raw_pose_streams: true
     gazebo_executable: gz
-    gazebo_target_pose_topic: /model/target/pose
-    gazebo_target_entity_name: target_reference_link
-    gazebo_target_parent_model_name: target
+    gazebo_target_pose_topic: /model/x500_15m/pose
+    gazebo_target_entity_name: x500_15m
+    gazebo_target_parent_model_name: x500_15m
     gazebo_left_pose_topic: /model/left_stereo_camera/pose_static
     gazebo_left_entity_name: left_stereo_camera::optical_link
     gazebo_left_parent_model_name: left_stereo_camera
