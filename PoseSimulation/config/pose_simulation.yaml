@@ -1,0 +1,79 @@
+/simulation/pose_simulation/pose_simulation:
+  ros__parameters:
+    # The authoritative target input is deliberately separate from the
+    # existing Simulation fallback topic.  A publisher for this topic may be
+    # provided by a future Gazebo target-reference adapter.
+    ground_truth_primary_topic: /simulation/ground_truth/target_reference_link
+    ground_truth_fallback_topic: /simulation/ground_truth/vehicle_reference_link
+    ground_truth_model_fallback_topic: ""
+    target_entity_name: target_reference_link
+    # Gazebo optical_link is an FLU link. R_link_from_optical_RDF, row-major:
+    # link=[Forward, -Right, -Down]. This is the verified SDF extrinsic.
+    gazebo_link_rotation_from_optical_flat: [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+
+    # Optional direct Gazebo Pose_V observation. Keep disabled when the
+    # existing Simulation adapters already publish the ROS input topics.
+    enable_gazebo_raw_pose_streams: false
+    gazebo_executable: gz
+    gazebo_target_pose_topic: /model/target/pose
+    gazebo_target_entity_name: target_reference_link
+    gazebo_target_parent_model_name: target
+    gazebo_left_pose_topic: /model/left_stereo_camera/pose_static
+    gazebo_left_entity_name: left_stereo_camera::optical_link
+    gazebo_left_parent_model_name: left_stereo_camera
+    gazebo_right_pose_topic: /model/right_stereo_camera/pose_static
+    gazebo_right_entity_name: right_stereo_camera::optical_link
+    gazebo_right_parent_model_name: right_stereo_camera
+
+    # Current Simulation camera diagnostics publish observed optical RDF world
+    # poses as JSON.  Desired fields in those payloads are not consumed.
+    actual_left_camera_topic: /simulation/camera_pose_diagnostics/left
+    actual_right_camera_topic: /simulation/camera_pose_diagnostics/right
+    expected_left_optical_entity_name: left_stereo_camera::optical_link
+    expected_right_optical_entity_name: right_stereo_camera::optical_link
+
+    # On the current px4_msgs contract this topic uses SensorGps.  The node
+    # also accepts VehicleGpsPosition when that message exists.
+    rtk_topic: /fmu/out/vehicle_gps_position
+
+    evaluation_rate_hz: 10.0
+    history_size: 100
+    max_source_age_s: 1.0
+    max_interpolation_gap_s: 0.25
+    max_gazebo_pair_skew_s: 0.25
+    rtk_max_age_s: 1.0
+
+    # SensorGps supplies both altitude_msl_m and altitude_ellipsoid_m.
+    rtk_altitude_field: altitude_ellipsoid_m
+    minimum_rtk_fix_type: 5
+    require_rtk_fixed: false
+    max_rtk_horizontal_accuracy_m: 5.0
+    max_rtk_vertical_accuracy_m: 5.0
+    max_rtk_jump_m: 50.0
+
+    # Replace these with the WGS84 origin associated with gazebo_world_enu.
+    # No implicit Gazebo/WGS84 origin equality is assumed by the code.
+    reference_origin_latitude_deg: 0.0
+    reference_origin_longitude_deg: 0.0
+    reference_origin_altitude_m: 0.0
+    reference_origin_altitude_datum: ellipsoid
+    gazebo_origin_east_m: 0.0
+    gazebo_origin_north_m: 0.0
+    gazebo_origin_up_m: 0.0
+
+    # baseline_center_frd: X Front, Y Right, Z Down; metres.
+    left_translation_rig_m: [0.0, -12.5, 0.0]
+    right_translation_rig_m: [0.0, 12.5, 0.0]
+
+    # R_rig_from_optical, row-major.  Optical RDF [Right, Down, Forward]
+    # maps to rig FRD [Front, Right, Down].
+    left_rotation_rig_from_optical_flat: [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    right_rotation_rig_from_optical_flat: [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+
+    world_up_world_enu: [0.0, 0.0, 1.0]
+    fallback_horizontal_axis_world_enu: [1.0, 0.0, 0.0]
+    near_vertical_threshold: 1.0e-9
+
+    ground_truth_source_frame: gazebo_world_enu
+    target_point_alignment_mode: zero_lever_arm_assumption
+    lever_arm_applied: false
