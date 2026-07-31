@@ -35,6 +35,7 @@ setup(
                 "config/pose_simulation_ui.yaml",
                 "config/pose_simulation_visualization.yaml",
                 "config/pose_simulation.rviz",
+                "config/posesimulation.env",
             ],
         ),
         (os.path.join("share", package_name, "worlds"), ["worlds/stereo_ground_drone.sdf"]),

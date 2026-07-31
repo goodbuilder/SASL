@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover - depends on the runtime environment
 from pose_simulation.ui_snapshot import PoseSimulationSnapshot, build_ui_snapshot
 
 
-WORLD_NAMESPACE = "/simulation/pose_simulation"
+WORLD_NAMESPACE = "/pose_simulation"
 
 
 def _load_ui_config(path: str | None) -> Mapping[str, Any]:

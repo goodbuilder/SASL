@@ -81,7 +81,7 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "namespace",
-                default_value="simulation/pose_simulation",
+                default_value="pose_simulation",
                 description="Common ROS namespace for core, visualization, and UI topics.",
             ),
             DeclareLaunchArgument(

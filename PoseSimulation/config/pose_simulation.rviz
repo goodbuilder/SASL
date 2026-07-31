@@ -30,7 +30,7 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Marker Topic: /simulation/pose_simulation/visualization/markers
+      Marker Topic: /pose_simulation/visualization/markers
       Name: PoseSimulation Diagnostics
       Namespaces:
         pose_sim/actual/left: true

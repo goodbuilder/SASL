@@ -11,6 +11,22 @@ runtime import from `stereo_ground_sim`; existing Simulation topics and source
 formats are only input contracts. `PoseSimulation` does not call `/set_pose`,
 publish attitude commands, or apply a correction.
 
+## Configuration phase
+
+`PoseSimulation/config/posesimulation.env` is the independent application
+configuration contract. It is parsed as data by `pose_simulation.config`; it
+is never used to source Simulation-owned settings. The precedence is:
+
+1. the checked-in `posesimulation.env`;
+2. an optional `POSESIM_PROFILE_CONFIG` profile;
+3. explicit caller `POSESIM_*` environment values;
+4. `--set POSESIM_KEY=VALUE` command-line overrides.
+
+The loader validates the read-only boundary, input/output topic ownership,
+coordinate-frame contract, time policy, and RTK altitude-datum policy without
+importing ROS or starting a source process. Empty metric thresholds mean
+`UNSPECIFIED`, not `PASS`.
+
 ## Source hierarchy
 
 - `target_reference_link` is the only absolute Ground Truth source.
@@ -29,7 +45,7 @@ verified fixed `R_link_from_optical` transform is therefore applied before an
 actual pose is labeled `camera_optical_rdf`; the entity quaternion is not
 treated as an RDF quaternion by identity assumption.
 
-The launcher carries an independent copy of the reference world under
+The repository carries an independent copy of the reference world under
 `worlds/` and the required `wiris_camera` and `x500_15m` model assets under
 `models/`. These are copied inputs, not runtime imports from `Simulation`.
 The copied world has no `target_reference_link`; standalone evaluation
@@ -64,7 +80,7 @@ configuration. The default target alignment records the explicit
 
 ## Topics
 
-All outputs are under `/simulation/pose_simulation`:
+All PoseSimulation outputs are under `/pose_simulation`:
 
 - `pose_error` — actual-vs-GT, actual-vs-RTK, and RTK-ideal-vs-GT-ideal pose and
   optical-axis diagnostics as self-describing JSON.
@@ -93,6 +109,22 @@ outputs or the actual pose timestamps cannot be paired, rqt shows
 
 ## Run
 
+The configuration-only runner is the supported entrypoint for this phase:
+
+```bash
+cd PoseSimulation
+./run_pose_simulation.sh --check-config
+./run_pose_simulation.sh --print-config
+```
+
+The runner preserves the caller's working directory, resolves the optional
+profile path, validates the resolved snapshot, and exits without starting
+ROS, Gazebo, PX4, rqt, RViz, or any Simulation process. For a two-application
+workflow, start Simulation in its own terminal using its own entrypoint, then
+run the PoseSimulation configuration check in a separate terminal.
+
+### Existing ROS runtime components
+
 Build this package in a ROS 2 workspace that contains `px4_msgs`, source that
 workspace, and run:
 
@@ -113,7 +145,7 @@ The UI roles are intentionally separate:
   tabs `Overview`, `Pose Error`, `Stereo Geometry`, `Reference & Time`, and
   `Trends`.
 - RViz uses `gazebo_world_enu` as Fixed Frame and consumes
-  `/simulation/pose_simulation/visualization/markers` for actual optical poses,
+  `/pose_simulation/visualization/markers` for actual optical poses,
   GT/RTK ideal poses, target/LOS rays, baseline geometry, and error labels.
   The checked-in display config is `config/pose_simulation.rviz`; marker
   namespaces separate `actual`, `ideal_gt`, `ideal_rtk`, `rays`, `error`,
@@ -131,22 +163,6 @@ UI launch arguments include `start_pose_simulation`, `start_visualization`,
 thresholds unspecified, so values are never labeled PASS by assumption. If a
 project-approved warning/failure value is added under `ui_thresholds`, rqt
 shows the configured policy without changing PoseSimulation calculations.
-
-For the same build-and-run workflow as the Simulation entrypoints, use the
-independent launcher from this directory:
-
-```bash
-./run_pose_simulation.sh
-```
-
-It builds only `PoseSimulation`, sources `/opt/ros/${ROS_DISTRO:-humble}` and
-the optional `POSE_SIMULATION_ROS_WORKSPACE` overlay, then starts the node,
-PoseSimulation visualization, the `PoseSimulation` rqt plugin, RViz, and the
-copied Gazebo world with server + GUI. Use
-`--no-build` when the local install is already current, or `--node-only` for
-the diagnostic node without GUIs. `--gazebo-gui-only` opens only the client
-against an already running server. The launcher never starts, imports,
-modifies, or sends pose commands to `Simulation`.
 
 Before a real evaluation, set the WGS84 reference origin, altitude datum, and
 nominal stereo extrinsics in `config/pose_simulation.yaml`. The checked-in

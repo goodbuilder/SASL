@@ -13,7 +13,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "namespace",
-                default_value="simulation/pose_simulation",
+                default_value="pose_simulation",
                 description="ROS namespace for the diagnostic-only core node.",
             ),
             Node(

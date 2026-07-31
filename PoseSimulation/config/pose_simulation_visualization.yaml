@@ -1,4 +1,4 @@
-/simulation/pose_simulation/pose_visualization:
+/pose_simulation/pose_visualization:
   ros__parameters:
     pose_error_topic: pose_error
     stereo_geometry_topic: stereo_geometry

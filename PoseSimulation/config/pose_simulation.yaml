@@ -1,4 +1,4 @@
-/simulation/pose_simulation/pose_simulation:
+/pose_simulation/pose_simulation:
   ros__parameters:
     # The authoritative target input is deliberately separate from the
     # existing Simulation fallback topic.  A publisher for this topic may be

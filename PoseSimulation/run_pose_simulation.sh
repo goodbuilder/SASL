@@ -1,62 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# This phase intentionally provides a configuration-only entrypoint.  It does
+# not source, start, stop, or include the independent Simulation application.
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-INTEGRATION_ROOT="$(cd -- "$ROOT_DIR/.." && pwd)"
-ROS_DISTRO_NAME="${ROS_DISTRO:-humble}"
-POSE_SIMULATION_ROS_WORKSPACE="${POSE_SIMULATION_ROS_WORKSPACE:-$INTEGRATION_ROOT/workspace/main}"
-ROS_SETUP="/opt/ros/$ROS_DISTRO_NAME/setup.bash"
-ROS_WORKSPACE_SETUP="$POSE_SIMULATION_ROS_WORKSPACE/install/setup.bash"
-LOCAL_SETUP="$ROOT_DIR/install/setup.bash"
-RVIZ_CONFIG="${POSE_SIMULATION_RVIZ_CONFIG:-$ROOT_DIR/config/pose_simulation.rviz}"
-GAZEBO_WORLD="${POSE_SIMULATION_GAZEBO_WORLD:-$ROOT_DIR/worlds/stereo_ground_drone.sdf}"
-build_local=true
-start_rqt=true
-start_rviz=true
-start_visualization=true
-start_gazebo_gui=true
-gazebo_gui_only=false
-launch_args=()
-children=()
+config_path="${POSESIM_CONFIG:-$ROOT_DIR/config/posesimulation.env}"
+profile_path="${POSESIM_PROFILE_CONFIG:-}"
+mode="check"
+cli_overrides=()
 
 usage() {
   cat <<'USAGE'
 Usage:
-  ./run_pose_simulation.sh [options] [ros2 launch args...]
+  ./run_pose_simulation.sh [--check-config | --print-config] [options]
 
-Builds and starts the independent PoseSimulation diagnostic node with the
-standard observation GUIs. This entrypoint does not start or modify the
-Simulation application.
+Validates the independent PoseSimulation configuration contract.  This
+phase does not start ROS, Gazebo, PX4, rqt, RViz, or any source application.
 
 Options:
-  --no-build             Use the existing PoseSimulation install without rebuilding.
-  --no-gui               Start only the PoseSimulation node.
-  --node-only            Alias for --no-gui.
-  --no-rqt                Do not start rqt_gui.
-  --no-rviz               Do not start RViz.
-  --no-gazebo-gui        Do not start the Gazebo server or GUI.
-  --gazebo-gui-only      Open the GUI client without starting the server.
-  --rviz-config FILE     RViz config. Default: config/pose_simulation.rviz.
-  --gazebo-world FILE    Gazebo world. Default: worlds/stereo_ground_drone.sdf.
-  --help, -h             Show this help.
+  --check-config          Validate the resolved configuration (default).
+  --print-config          Print the deterministic resolved configuration.
+  --config FILE           Use FILE as the PoseSimulation base env file.
+  --profile FILE          Apply an optional profile env file.
+  --set KEY=VALUE         Apply a highest-precedence POSESIM_* override.
+                          May be repeated.
+  --help, -h              Show this help.
 
 Environment:
-  POSE_SIMULATION_ROS_WORKSPACE
-                 ROS 2 overlay containing px4_msgs. Default:
-                 ../workspace/main
-  POSE_SIMULATION_BUILD
-                 Set to 0 or false to disable the local build.
-  POSE_SIMULATION_RVIZ_CONFIG
-                 Override the RViz config path.
-  POSE_SIMULATION_GAZEBO_WORLD
-                 Override the independent copied Gazebo world path.
+  POSESIM_CONFIG           Base env path when --config is not supplied.
+  POSESIM_PROFILE_CONFIG   Optional profile path when --profile is absent.
+  POSESIM_*                Explicit configuration overrides.
 
 Examples:
-  ./run_pose_simulation.sh
-  ./run_pose_simulation.sh --no-build evaluation_rate_hz:=5.0
-  ./run_pose_simulation.sh --no-gazebo-gui
-  ./run_pose_simulation.sh --node-only
-  POSE_SIMULATION_ROS_WORKSPACE=/path/to/ros_ws ./run_pose_simulation.sh
+  ./run_pose_simulation.sh --check-config
+  ./run_pose_simulation.sh --print-config
+  POSESIM_EVALUATION_HZ=10 ./run_pose_simulation.sh --check-config
+  ./run_pose_simulation.sh --check-config --set POSESIM_EVALUATION_HZ=2
 USAGE
 }
 
@@ -66,237 +45,67 @@ while (($# > 0)); do
       usage
       exit 0
       ;;
-    --no-build)
-      build_local=false
+    --check-config)
+      mode="check"
       shift
       ;;
-    --no-gui|--node-only)
-      start_rqt=false
-      start_rviz=false
-      start_visualization=false
-      start_gazebo_gui=false
+    --print-config)
+      mode="print"
       shift
       ;;
-    --no-rqt)
-      start_rqt=false
-      shift
-      ;;
-    --no-rviz)
-      start_rviz=false
-      shift
-      ;;
-    --no-gazebo-gui)
-      start_gazebo_gui=false
-      shift
-      ;;
-    --gazebo-gui-only)
-      gazebo_gui_only=true
-      shift
-      ;;
-    --rviz-config)
+    --config)
       if (($# < 2)); then
-        printf '%s\n' "error: --rviz-config requires a file path." >&2
+        printf '%s\n' "error: --config requires a file path." >&2
         exit 2
       fi
-      RVIZ_CONFIG="$2"
+      config_path="$2"
       shift 2
       ;;
-    --gazebo-world)
+    --profile)
       if (($# < 2)); then
-        printf '%s\n' "error: --gazebo-world requires a file path." >&2
+        printf '%s\n' "error: --profile requires a file path." >&2
         exit 2
       fi
-      GAZEBO_WORLD="$2"
+      profile_path="$2"
       shift 2
       ;;
-    --)
-      shift
-      launch_args+=("$@")
-      break
+    --set)
+      if (($# < 2)); then
+        printf '%s\n' "error: --set requires POSESIM_KEY=VALUE." >&2
+        exit 2
+      fi
+      cli_overrides+=("$2")
+      shift 2
       ;;
     *)
-      launch_args+=("$1")
-      shift
+      printf '%s\n' "error: unknown argument: $1" >&2
+      usage >&2
+      exit 2
       ;;
   esac
 done
 
-case "${POSE_SIMULATION_BUILD:-1}" in
-  0|false|False|FALSE|no|No|NO)
-    build_local=false
-    ;;
-esac
+# Keep the caller's working directory unchanged.  The Python loader resolves
+# relative profile paths using that directory, then its documented fallbacks.
+export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
-cd "$ROOT_DIR"
-export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/pose-simulation-ros-log}"
-export GZ_CONFIG_HOME="${GZ_CONFIG_HOME:-/tmp/pose-simulation-gz-config}"
-export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/models${GZ_SIM_RESOURCE_PATH:+:$GZ_SIM_RESOURCE_PATH}"
-
-if [[ -f "$ROS_SETUP" ]]; then
-  # shellcheck disable=SC1091
-  set +u
-  source "$ROS_SETUP"
-  set -u
-elif ! command -v ros2 >/dev/null 2>&1; then
-  printf '%s\n' \
-    "error: ROS 2 was not found." \
-    "Expected setup file: $ROS_SETUP" >&2
-  exit 2
-fi
-
-if [[ -f "$ROS_WORKSPACE_SETUP" ]]; then
-  # shellcheck disable=SC1091
-  set +u
-  source "$ROS_WORKSPACE_SETUP"
-  set -u
-fi
-
-if [[ "$build_local" == true ]]; then
-  if ! command -v colcon >/dev/null 2>&1; then
-    printf '%s\n' \
-      "error: colcon is required to build PoseSimulation." \
-      "Install ROS 2 colcon tools or run with --no-build after building the package." >&2
-    exit 2
-  fi
-  printf '%s\n' "Building PoseSimulation from $ROOT_DIR"
-  colcon build \
-    --base-paths "$ROOT_DIR" \
-    --packages-select pose_simulation
-fi
-
-if [[ ! -f "$LOCAL_SETUP" ]]; then
-  printf '%s\n' \
-    "error: PoseSimulation is not installed: $LOCAL_SETUP" \
-    "Run without --no-build, or build this package with colcon first." >&2
-  exit 2
-fi
-
-# shellcheck disable=SC1091
-set +u
-source "$LOCAL_SETUP"
-set -u
-
-if ! ros2 pkg prefix pose_simulation >/dev/null 2>&1; then
-  printf '%s\n' \
-    "error: the pose_simulation ROS 2 package is unavailable after setup." \
-    "Check the ROS overlay at: $POSE_SIMULATION_ROS_WORKSPACE" >&2
-  exit 2
-fi
-
-if [[ "$start_rqt" == true ]] && ! ros2 pkg prefix rqt_gui >/dev/null 2>&1; then
-  printf '%s\n' \
-    "error: rqt_gui is not installed in the sourced ROS 2 environment." \
-    "Install the ROS 2 rqt GUI package or use --no-rqt/--no-gui." >&2
-  exit 2
-fi
-
-if [[ "$start_rviz" == true ]] && ! command -v rviz2 >/dev/null 2>&1; then
-  printf '%s\n' \
-    "error: rviz2 was not found in the sourced ROS 2 environment." \
-    "Install RViz or use --no-rviz/--no-gui." >&2
-  exit 2
-fi
-
-if [[ "$start_gazebo_gui" == true ]] && ! command -v gz >/dev/null 2>&1; then
-  printf '%s\n' \
-    "error: gz was not found in PATH." \
-    "Install Gazebo Sim or use --no-gazebo-gui/--no-gui." >&2
-  exit 2
-fi
-
-if [[ "$start_rviz" == true && ! -f "$RVIZ_CONFIG" ]]; then
-  printf '%s\n' \
-    "error: RViz config was not found: $RVIZ_CONFIG" \
-    "Use --rviz-config FILE or set POSE_SIMULATION_RVIZ_CONFIG." >&2
-  exit 2
-fi
-
-if [[ -n "$GAZEBO_WORLD" && ! -f "$GAZEBO_WORLD" ]]; then
-  printf '%s\n' "error: Gazebo world was not found: $GAZEBO_WORLD" >&2
-  exit 2
-fi
-
-cleanup() {
-  local pid child
-  local -a owned_children=()
-  trap - EXIT INT TERM
-  for pid in "${children[@]}"; do
-    while read -r child; do
-      [[ -n "$child" ]] || continue
-      owned_children+=("$child")
-    done < <(pgrep -P "$pid" || true)
-  done
-  for pid in "${children[@]}"; do
-    if kill -0 "$pid" >/dev/null 2>&1; then
-      kill -TERM "-$pid" >/dev/null 2>&1 || kill -TERM "$pid" >/dev/null 2>&1 || true
-    fi
-  done
-  sleep 1
-  for child in "${owned_children[@]}"; do
-    kill -TERM "$child" >/dev/null 2>&1 || true
-  done
-  for pid in "${children[@]}"; do
-    kill -KILL "-$pid" >/dev/null 2>&1 || kill -KILL "$pid" >/dev/null 2>&1 || true
-  done
-  for child in "${owned_children[@]}"; do
-    kill -KILL "$child" >/dev/null 2>&1 || true
-  done
-}
-
-trap cleanup EXIT INT TERM
-
-start_child() {
-  local label="$1"
-  shift
-  printf '%s\n' "Starting $label: $*"
-  setsid "$@" &
-  children+=("$!")
-}
-
-printf '%s\n' "Starting PoseSimulation (diagnostic-only; no pose command path)."
-setsid ros2 launch pose_simulation pose_simulation.launch.py "${launch_args[@]}" &
-children+=("$!")
-
-if [[ "$start_visualization" == true || "$start_rqt" == true || "$start_rviz" == true ]]; then
-  ui_launch_args=(
-    "start_pose_simulation:=false"
-    "start_visualization:=$start_visualization"
-    "start_rqt:=$start_rqt"
-    "start_rviz:=$start_rviz"
-    "namespace:=simulation/pose_simulation"
-    "rviz_config:=$RVIZ_CONFIG"
-    "ui_config:=$ROOT_DIR/config/pose_simulation_ui.yaml"
-    "visualization_config:=$ROOT_DIR/config/pose_simulation_visualization.yaml"
-  )
-  start_child "PoseSimulation UI" ros2 launch pose_simulation pose_simulation_ui.launch.py "${ui_launch_args[@]}"
-fi
-
-if [[ "$start_gazebo_gui" == true ]]; then
-  if [[ -n "$GAZEBO_WORLD" ]]; then
-    if [[ "$gazebo_gui_only" == true ]]; then
-      start_child "Gazebo GUI client" gz sim -g "$GAZEBO_WORLD"
-    else
-      start_child "Gazebo server + GUI" gz sim -r "$GAZEBO_WORLD"
-    fi
-  else
-    if [[ "$gazebo_gui_only" == true ]]; then
-      start_child "Gazebo GUI client" gz sim -g
-    else
-      start_child "Gazebo server + GUI" gz sim -r
-    fi
-  fi
-fi
-
-if [[ "$start_visualization" == true || "$start_rqt" == true || "$start_rviz" == true || "$start_gazebo_gui" == true ]]; then
-  printf '%s\n' "PoseSimulation and requested observation GUIs are running."
+command=(python3 -m pose_simulation.config --config "$config_path")
+# Always pass the selected profile value so an explicit empty --profile can
+# disable an inherited POSESIM_PROFILE_CONFIG without ambiguity.
+command+=(--profile "$profile_path")
+for override in "${cli_overrides[@]}"; do
+  command+=(--set "$override")
+done
+if [[ "$mode" == "print" ]]; then
+  command+=(--print-config)
 else
-  printf '%s\n' "PoseSimulation is running without observation GUIs."
+  command+=(--check-config)
 fi
-if [[ "$start_gazebo_gui" == true ]]; then
-  if [[ "$gazebo_gui_only" == true ]]; then
-    printf '%s\n' "Gazebo GUI is client-only; no Gazebo server is started by this app."
-  else
-    printf '%s\n' "Gazebo world: $GAZEBO_WORLD"
-  fi
+
+"${command[@]}"
+
+if [[ "$mode" == "check" ]]; then
+  printf '%s\n' \
+    "PoseSimulation runtime not implemented in this configuration phase;" \
+    "the configuration check passed and no source process was started."
 fi
-wait "${children[0]}"
