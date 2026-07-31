@@ -18,7 +18,9 @@
       <render_engine>ogre2</render_engine>
     </plugin>
     <gravity>0 0 -9.8</gravity>
-    <magnetic_field>6e-06 2.3e-05 -4.2e-05</magnetic_field>
+    <!-- ENU Tesla, generated to match PX4 WMM (src/lib/world_magnetic_model)
+         at this world's spherical_coordinates lat/lon. PX4 SHA d6f12ad1c4f70ad3230afd7d86e971421e02fef4. -->
+    <magnetic_field>1.293984869535e-06 2.174328662843e-05 -4.304112611929e-05</magnetic_field>
     <atmosphere type="adiabatic" />
     <spherical_coordinates>
       <surface_model>EARTH_WGS84</surface_model>
