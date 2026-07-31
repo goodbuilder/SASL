@@ -10,7 +10,9 @@ from .coordinate_adapter import Wgs84ReferenceOrigin
 from .pose_math import (
     BaselineGeometryResult,
     CameraPoseError,
+    FRD_RPY_CONVENTION,
     Matrix3,
+    OPTICAL_RPY_CONVENTION,
     Pose3D,
     RotationError,
     StereoRelativePoseError,
@@ -23,9 +25,12 @@ from .pose_math import (
     compute_look_at_rig_rotation,
     compute_relative_camera_pose_error,
     compute_rotation_error,
+    decompose_frd_error,
+    decompose_optical_rdf_error,
     derive_camera_optical_pose,
     matrix_to_quaternion_xyzw,
     matrix_vector,
+    RIG_FRAME,
 )
 from .sources import PoseSourceSample
 
@@ -108,6 +113,9 @@ def _rotation_error_dict(error: RotationError | None) -> dict[str, Any]:
             "yaw_error_deg": None,
             "rotation_error_deg": None,
             "relative_rotation": None,
+            "euler_convention": None,
+            "gimbal_lock": False,
+            "euler_status": "INVALID",
             "valid": False,
         }
     return {
@@ -116,6 +124,9 @@ def _rotation_error_dict(error: RotationError | None) -> dict[str, Any]:
         "yaw_error_deg": error.yaw_error_deg,
         "rotation_error_deg": error.rotation_error_deg,
         "relative_rotation": _matrix_dict(error.relative_rotation),
+        "euler_convention": error.euler_convention,
+        "gimbal_lock": error.gimbal_lock,
+        "euler_status": error.euler_status,
         "valid": error.valid,
     }
 
@@ -142,16 +153,22 @@ def _ideal_pose_dict(ideal: IdealStereoPoses) -> dict[str, Any]:
         if pose is None:
             return None
         quaternion = matrix_to_quaternion_xyzw(pose.rotation_world_from_frame)
-        from .pose_math import rotation_to_euler_zyx_rad
-
-        roll, pitch, yaw = rotation_to_euler_zyx_rad(pose.rotation_world_from_frame)
+        if pose.frame_id == RIG_FRAME:
+            rpy = decompose_frd_error(pose.rotation_world_from_frame)
+        else:
+            rpy = decompose_optical_rdf_error(pose.rotation_world_from_frame)
         return {
             "frame_id": pose.frame_id,
             "position_world_enu_m": _vector_dict(pose.position_world_enu_m),
             "orientation_xyzw": _vector_dict(quaternion),
-            "roll_deg": math.degrees(roll),
-            "pitch_deg": math.degrees(pitch),
-            "yaw_deg": math.degrees(yaw),
+            "roll_deg": rpy.roll_error_deg,
+            "pitch_deg": rpy.pitch_error_deg,
+            "yaw_deg": rpy.yaw_error_deg,
+            "euler_convention": (
+                FRD_RPY_CONVENTION if pose.frame_id == RIG_FRAME else OPTICAL_RPY_CONVENTION
+            ),
+            "gimbal_lock": rpy.gimbal_lock,
+            "euler_status": rpy.status,
             "source_timestamp_ns": pose.source_timestamp_ns,
             "valid": True,
         }
@@ -380,6 +397,7 @@ def evaluate_pose_snapshot(
         rtk_gt_rotation_error = compute_rotation_error(
             ideal_gt.rig_pose.rotation_world_from_frame,
             ideal_rtk.rig_pose.rotation_world_from_frame,
+            decomposition="frd",
         )
         front_gt = matrix_vector(ideal_gt.rig_pose.rotation_world_from_frame, (1.0, 0.0, 0.0))
         front_rtk = matrix_vector(ideal_rtk.rig_pose.rotation_world_from_frame, (1.0, 0.0, 0.0))
@@ -419,7 +437,7 @@ def evaluate_pose_snapshot(
         "evaluation_timestamp_ns": int(evaluation_timestamp_ns),
         "frame_id": "gazebo_world_enu",
         "angle_unit": "deg",
-        "euler_convention": "fixed_extrinsic_ZYX_RzRyRx_equivalent_intrinsic_XYZ",
+        "euler_convention": "optical_rdf_RdownYaw_RrightPitch_RforwardRoll; rig_frd_RdownYaw_RrightPitch_RfrontRoll",
         "quaternion_order": "xyzw",
         "left_actual_vs_gt_ideal": {
             **_camera_error_dict(left_gt_error, reason="GT ideal or actual left pose unavailable"),
@@ -521,7 +539,7 @@ def evaluate_pose_snapshot(
         "time_residuals": dict(time_residuals or {}),
         "fallback_used": bool(fallback_used),
         "quaternion_order": "xyzw",
-        "euler_convention": "fixed_extrinsic_ZYX_RzRyRx_equivalent_intrinsic_XYZ",
+        "euler_convention": "optical_rdf_RdownYaw_RrightPitch_RforwardRoll; rig_frd_RdownYaw_RrightPitch_RfrontRoll",
         "validity": {
             "required_pose_inputs": required_samples_valid,
             "ground_truth_ideal": ideal_gt.valid,

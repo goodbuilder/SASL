@@ -35,6 +35,7 @@ setup(
                 "config/pose_simulation_ui.yaml",
                 "config/pose_simulation_visualization.yaml",
                 "config/pose_simulation.rviz",
+                "config/pose_contract.yaml",
                 "config/posesimulation.env",
             ],
         ),

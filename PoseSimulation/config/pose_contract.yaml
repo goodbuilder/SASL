@@ -1,0 +1,47 @@
+schema: pose_simulation_contract/v1
+
+frames:
+  world: gazebo_world_enu
+  rig: baseline_center_frd
+  left_camera: left_camera_optical_rdf
+  right_camera: right_camera_optical_rdf
+
+units:
+  position: m
+  angle_internal: rad
+  angle_output: deg
+
+world_up_world_enu:
+  - 0.0
+  - 0.0
+  - 1.0
+
+nominal_geometry:
+  baseline_m: 25.0
+
+  left_center_rig_frd_m:
+    - 0.0
+    - -12.5
+    - 0.0
+
+  right_center_rig_frd_m:
+    - 0.0
+    - 12.5
+    - 0.0
+
+  rotation_rig_from_left_optical:
+    - [0.0, 0.0, 1.0]
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+
+  rotation_rig_from_right_optical:
+    - [0.0, 0.0, 1.0]
+    - [1.0, 0.0, 0.0]
+    - [0.0, 1.0, 0.0]
+
+optical_error_convention:
+  axes: right_down_forward
+  roll_axis: positive_forward
+  pitch_axis: positive_right
+  yaw_axis: positive_down
+  composition: R_down_yaw @ R_right_pitch @ R_forward_roll

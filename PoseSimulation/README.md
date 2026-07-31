@@ -66,11 +66,14 @@ NED, the stereo rig is `baseline_center_frd` (Front, Right, Down), and camera
 optical frames are RDF (Right, Down, Forward). Rotations are named `R_B_A` and
 map components from A into B. Quaternion boundaries use `xyzw`.
 
-The reported Euler angles use fixed extrinsic Z-Y-X (`Rz(yaw) Ry(pitch)
-Rx(roll)`, equivalent to intrinsic X-Y-Z) in degrees. Rotation-angle results
-come from the clamped trace formula; Euler values are reporting fields only.
+The M1 pose contract is checked in at `config/pose_contract.yaml`. Optical RDF
+error angles use `R_down(yaw) R_right(pitch) R_forward(roll)` in degrees;
+rig-level FRD reporting uses `R_down(yaw) R_right(pitch) R_front(roll)`.
+Rotation-angle results come from the clamped trace formula; Euler values are
+reporting fields only and carry their convention and gimbal-lock status.
 World Up defines the look-at roll reference. Near-vertical lines of sight use
-the configured projected fallback axis and record the selected policy.
+only a projected previous Right axis; without one the ideal pose is invalid,
+and no arbitrary fallback axis is selected.
 
 The default rig center is the midpoint of the two observed optical centers.
 Consequently, an independent midpoint position error is reported as
