@@ -1150,11 +1150,21 @@ setsid bash -c '
     px4_python="${11}"
     uxrce_dds_port="${12}"
     console_log="${13}"
+    camera_airframe_src="${14}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
       export PYTHON_EXECUTABLE="$px4_python"
     fi
+
+    # The left/right camera Pixhawks are static mounts that never fly; they
+    # boot on a dedicated airframe (see vendor/px4_camera_airframe/README.md)
+    # instead of the target drone airframe 4001_gz_x500, so EKF2_MAG_TYPE can
+    # be set for them without affecting the target. Copied into
+    # PX4-Autopilot ROMFS (untracked by SASL git) before every build so it
+    # stays in sync.
+    cp "$camera_airframe_src" \
+      "$px4_dir/ROMFS/px4fmu_common/init.d-posix/airframes/4090_camera_px4"
 
     make px4_sitl_default
 
@@ -1164,6 +1174,17 @@ setsid bash -c '
       printf "%s\n" "error: PX4 SITL build did not produce the expected px4 binary and gz_bridge directory." >&2
       exit 2
     fi
+
+    # `make px4_sitl_default` only re-syncs ROMFS -> build/px4_sitl_default/etc
+    # (which build/px4_sitl_default/rootfs/N/etc symlinks to, and is what a
+    # running instance actually reads airframe files from) when ninja
+    # considers that step out of date; a newly-added ROMFS file is not
+    # reliably picked up by an incremental build ("ninja: no work to do"
+    # even though the file was never copied). Copy directly into the build
+    # output too so the airframe is guaranteed present regardless.
+    mkdir -p "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes"
+    cp "$camera_airframe_src" \
+      "$px4_dir/build/px4_sitl_default/etc/init.d-posix/airframes/4090_camera_px4"
     if [[ "$left_instance" == "0" || "$right_instance" == "0" || "$left_instance" == "$right_instance" ]]; then
       printf "%s\n" "error: Camera PX4 instances must be distinct non-zero integers." >&2
       exit 2
@@ -1184,6 +1205,7 @@ setsid bash -c '
       local model_name="$2"
       local dds_namespace="$3"
       local label="$4"
+      local sys_autostart="$5"
       local instance_log="$console_log"
       if [[ "$console_log" != "/dev/null" ]]; then
         instance_log="${console_log}.${label}"
@@ -1193,7 +1215,7 @@ setsid bash -c '
         export PX4_GZ_WORLD="$world"
         export PX4_GZ_MODEL_NAME="$model_name"
         export PX4_GZ_NO_FOLLOW=1
-        export PX4_SYS_AUTOSTART=4001
+        export PX4_SYS_AUTOSTART="$sys_autostart"
         export GZ_IP=127.0.0.1
         export PX4_UXRCE_DDS_PORT="$uxrce_dds_port"
         if [[ -n "$dds_namespace" ]]; then
@@ -1207,9 +1229,9 @@ setsid bash -c '
       pids+=("$!")
     }
 
-    start_px4_instance 0 "$target_model" "" target
-    start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left
-    start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right
+    start_px4_instance 0 "$target_model" "" target 4001
+    start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left 4090
+    start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right 4090
     wait -n "${pids[@]}"
   ' _ \
     "$PX4_DIR" \
@@ -1224,7 +1246,8 @@ setsid bash -c '
     "${DISPLAY:-:0}" \
     "$PX4_PYTHON_EXECUTABLE" \
     "$PX4_UXRCE_DDS_PORT" \
-    "$PX4_CONSOLE_LOG" &
+    "$PX4_CONSOLE_LOG" \
+    "$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
 printf '%s\n' \

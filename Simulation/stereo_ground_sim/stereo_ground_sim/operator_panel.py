@@ -75,6 +75,14 @@ SERIES = (
     ("ideal", "/stereo/ideal_position", QColor(32, 86, 255)),
     ("raw_gps_baseline", "/stereo/raw_gps_baseline_position", QColor(235, 135, 0)),
     ("uam_raw_gps_reference", "/stereo/uam_raw_gps_reference_position", QColor(134, 89, 45)),
+    # No dedicated position topic -- fed from /stereo/ray_metrics (see
+    # _handle_ray_metrics), which is the only place these four Rays are
+    # published. topic is None so _init_ros skips the per-topic subscription
+    # loop for them.
+    ("gps_global", None, QColor(0, 150, 60)),
+    ("attitude", None, QColor(156, 39, 176)),
+    ("baseline", None, QColor(255, 193, 7)),
+    ("full", None, QColor(0, 0, 0)),
 )
 SERIES_LABELS = {
     # "truth" subscribes to /ground_truth_position, the literal Gazebo
@@ -89,6 +97,10 @@ SERIES_LABELS = {
     "optical": "Truth",
     "ideal": "Ideal",
     "raw_gps_baseline": "GPS",
+    "gps_global": "Global",
+    "attitude": "Attitude",
+    "baseline": "Baseline",
+    "full": "Full",
     "uam_raw_gps_reference": "UAM raw GPS reference",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -1446,7 +1458,11 @@ class LiveSavedCsvPreview(QWidget):
         ):
             if field in parsed:
                 self._live_latest[field] = self._format_csv_value(parsed.get(field))
-        for ray_type in ("nominal", "optical", "ideal"):
+        # "gps_raw" is recorded separately under the "raw_gps_baseline_*"
+        # columns (see update_live_sample), fed from its own PointStamped
+        # topic rather than this JSON payload -- omitted here to avoid a
+        # second, differently-named set of columns for the same Ray.
+        for ray_type in ("nominal", "optical", "ideal", "gps_global", "attitude", "baseline", "full"):
             ray = parsed.get(ray_type)
             if not isinstance(ray, dict):
                 continue
@@ -2018,6 +2034,7 @@ class OperatorPanel(Plugin):
         self._debug_label = QLabel()
         self._debug_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._debug_label.setStyleSheet("font-family: monospace;")
+        self._debug_label.setWordWrap(True)
         self._facts = TelemetryFacts(model_filename)
         self._left_view = CameraView("Left Camera")
         self._right_view = CameraView("Right Camera")
@@ -2139,14 +2156,22 @@ class OperatorPanel(Plugin):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(
-            QLabel(
-                "FRDR comparison: Gazebo Target GT, Raw, Truth, Ideal (simulation-only), "
-                "and GPS. "
-                "Range is the 3D vector magnitude when a source "
-                "publishes F/R/D only."
-            )
+        description = QLabel(
+            "FRDR comparison: Gazebo Target GT plus all eight recorded Rays "
+            "(Raw, Truth, Ideal [simulation-only], GPS, Global, Attitude, "
+            "Baseline, Full). "
+            "Range is the 3D vector magnitude when a source "
+            "publishes F/R/D only. Attitude/Full can be far larger than the "
+            "others at long range (shallow stereo intersection angle "
+            "amplifying attitude error) and will dominate the axis scale "
+            "when they diverge."
         )
+        # Unwrapped, this single-line label's sizeHint is wide enough (~3200px)
+        # to force the whole window's minimum width past most screens,
+        # blocking maximize -- the same union-of-pages sizeHint failure mode
+        # fixed for the Ray Diagnostics tabs.
+        description.setWordWrap(True)
+        layout.addWidget(description)
         layout.addWidget(self._plot_stack, 1)
         return tab
 
@@ -2201,7 +2226,8 @@ class OperatorPanel(Plugin):
             f"Images: {IMAGE_TOPICS[0][1]}, {IMAGE_TOPICS[1][1]}\n"
             "Series: /ground_truth_position, /stereo/estimated_position (Raw), "
             "/stereo/optical_position (Truth), /stereo/ideal_position (Ideal), "
-            "/stereo/raw_gps_baseline_position (GPS)\n"
+            "/stereo/raw_gps_baseline_position (GPS); Global/Attitude/Baseline/Full "
+            "from /stereo/ray_metrics\n"
             "Detection format: left/right bbox x1,y1,x2,y2, confidence, center."
         )
 
@@ -2215,7 +2241,18 @@ class OperatorPanel(Plugin):
             self._right_view.set_image(payload)
 
     def _handle_sample(self, series_name, values):
-        frdr = list(values[:4])
+        # All ROS/JSON-sourced callers funnel through here before reaching
+        # the plot/facts/record widgets; a non-float slipping through (e.g.
+        # a JSON null) would raise inside math.isfinite() below and take
+        # down the whole panel, so coerce defensively rather than trust
+        # callers to have already sanitized every value.
+        frdr = []
+        for value in list(values[:4]):
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                value = math.nan
+            frdr.append(value)
         while len(frdr) < 4:
             frdr.append(math.nan)
         if not math.isfinite(frdr[3]) and all(math.isfinite(value) for value in frdr[:3]):
@@ -2239,6 +2276,42 @@ class OperatorPanel(Plugin):
     def _handle_ray_metrics(self, payload):
         self._record_preview.update_live_ray_metrics(payload)
         self._ray_diagnostics.update_ray_metrics(payload)
+        try:
+            parsed = json.loads(str(payload))
+        except json.JSONDecodeError:
+            return
+        if not isinstance(parsed, dict):
+            return
+        # "gps_global"/"attitude"/"baseline"/"full" have no dedicated
+        # position topic of their own (unlike raw/optical/ideal/GPS above);
+        # /stereo/ray_metrics is their only source, so plot/facts/CSV get
+        # them from here instead of the SERIES topic-subscription loop.
+        for ray_key in ("gps_global", "attitude", "baseline", "full"):
+            ray = parsed.get(ray_key)
+            if not isinstance(ray, dict):
+                continue
+            # ray_metrics can carry these keys with a JSON null (-> None)
+            # rather than omitting them (e.g. an invalid/failed ray still
+            # reports gt_-prefixed fields as null); .get(key, math.nan) only
+            # substitutes when the key is absent, not when it's present and
+            # None, so convert explicitly to avoid feeding None into
+            # _handle_sample's math.isfinite() calls.
+            def _finite_or_nan(value):
+                try:
+                    value = float(value)
+                except (TypeError, ValueError):
+                    return math.nan
+                return value if math.isfinite(value) else math.nan
+
+            self._handle_sample(
+                ray_key,
+                [
+                    _finite_or_nan(ray.get("forward_m")),
+                    _finite_or_nan(ray.get("right_m")),
+                    _finite_or_nan(ray.get("down_m")),
+                    _finite_or_nan(ray.get("range_m")),
+                ],
+            )
 
     def _handle_px4_raw_gps(self, label, msg):
         self._record_preview.update_live_px4_raw_gps(label, msg)
@@ -2281,7 +2354,7 @@ class OperatorPanel(Plugin):
                 qos_profile_sensor_data,
             )
             for series_name, topic, _color in SERIES:
-                if series_name in ("raw_gps_baseline", "uam_raw_gps_reference"):
+                if topic is None or series_name in ("raw_gps_baseline", "uam_raw_gps_reference"):
                     continue
                 self._ros_node.create_subscription(
                     Float32MultiArray,

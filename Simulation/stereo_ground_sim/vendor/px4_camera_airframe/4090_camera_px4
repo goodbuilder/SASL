@@ -1,0 +1,72 @@
+#!/bin/sh
+#
+# @name Gazebo x500 (static stereo camera Pixhawk)
+#
+# @type Quadrotor
+#
+
+# Copied from PX4-Autopilot's stock ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500
+# (same params PX4_SYS_AUTOSTART=4001 sets for the target drone) so the two
+# stereo camera Pixhawks boot with a valid PX4 parameter set even though they
+# never actually fly -- see run_operator_view.sh/build.sh, which copies this
+# file into PX4-Autopilot's ROMFS before each build, and stereo_ground_sim's
+# launch, which sets PX4_SYS_AUTOSTART=4090 only for the left/right camera
+# instances (target instance 0 stays on 4001).
+
+. ${R}etc/init.d/rc.mc_defaults
+
+PX4_SIMULATOR=${PX4_SIMULATOR:=gz}
+PX4_GZ_WORLD=${PX4_GZ_WORLD:=default}
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=x500}
+
+param set-default SIM_GZ_EN 1
+
+param set-default CA_AIRFRAME 0
+param set-default CA_ROTOR_COUNT 4
+
+param set-default CA_ROTOR0_PX 0.13
+param set-default CA_ROTOR0_PY 0.22
+param set-default CA_ROTOR0_KM  0.05
+
+param set-default CA_ROTOR1_PX -0.13
+param set-default CA_ROTOR1_PY -0.20
+param set-default CA_ROTOR1_KM  0.05
+
+param set-default CA_ROTOR2_PX 0.13
+param set-default CA_ROTOR2_PY -0.22
+param set-default CA_ROTOR2_KM -0.05
+
+param set-default CA_ROTOR3_PX -0.13
+param set-default CA_ROTOR3_PY 0.20
+param set-default CA_ROTOR3_KM -0.05
+
+param set-default SIM_GZ_EC_FUNC1 101
+param set-default SIM_GZ_EC_FUNC2 102
+param set-default SIM_GZ_EC_FUNC3 103
+param set-default SIM_GZ_EC_FUNC4 104
+
+param set-default SIM_GZ_EC_MIN1 150
+param set-default SIM_GZ_EC_MIN2 150
+param set-default SIM_GZ_EC_MIN3 150
+param set-default SIM_GZ_EC_MIN4 150
+
+param set-default SIM_GZ_EC_MAX1 1000
+param set-default SIM_GZ_EC_MAX2 1000
+param set-default SIM_GZ_EC_MAX3 1000
+param set-default SIM_GZ_EC_MAX4 1000
+
+param set-default MPC_THR_HOVER 0.60
+param set-default NAV_DLL_ACT 2
+
+# This camera Pixhawk is a fixed mount that never maneuvers (see
+# stereo_ground_sim.launch.py's static left/right camera poses). EKF2's
+# default MAG_TYPE=Automatic switches to 3-axis magnetometer fusion once
+# considered in-flight, which also estimates a body-fixed hard-iron bias
+# state -- but that bias state is only observable if the vehicle's attitude
+# actually changes. A camera that never maneuvers leaves it stuck wherever
+# it happened to be after the brief startup transient (confirmed via
+# estimator_sensor_bias: mag_bias_stable=0, non-zero mag_bias[0..2]), which
+# was the source of a steady, camera-specific heading bias feeding the
+# Attitude/Full Ray triangulation. MAG_TYPE=1 (Magnetic heading) fuses only
+# 2D heading and never attempts hard-iron bias learning, avoiding this.
+param set-default EKF2_MAG_TYPE 1

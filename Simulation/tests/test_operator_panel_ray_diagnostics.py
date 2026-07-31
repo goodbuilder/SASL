@@ -384,6 +384,24 @@ def test_toggling_ray_diagnostics_off_and_on_keeps_minimum_height_bounded(qt_app
     assert panel.minimumSizeHint().height() < 400
 
 
+def test_analysis_tab_description_does_not_force_a_wide_minimum_window(qt_app):
+    """Regression test: an unwrapped single-line QLabel's sizeHint is as wide
+    as its text needs to render on one line -- the Analysis tab's Ray-list
+    description is long enough (~3260px unwrapped) to push the whole
+    top-level window's minimum width past most screens, the same
+    union-of-pages-sizeHint failure mode as
+    test_ray_diagnostics_tabs_do_not_force_a_tall_minimum_window, just on the
+    width axis instead of height."""
+
+    panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
+    panel._plot_stack = operator_panel.FrdPlotStack()
+    tab = operator_panel.OperatorPanel._build_analysis_tab(panel)
+    tab.show()
+    qt_app.processEvents()
+
+    assert tab.minimumSizeHint().width() < 1000
+
+
 def test_analysis_graph_legend_matches_the_saved_ray_names():
     # These four series ARE recorded Rays; their legend text must exactly
     # match RAY_DIAGNOSTICS_ROWS / the CSV-XLSX Ray display names.
@@ -401,3 +419,128 @@ def test_analysis_graph_legend_does_not_collide_gt_with_the_truth_ray():
     assert operator_panel.SERIES_LABELS["truth"] != "truth"
     assert operator_panel.SERIES_LABELS["truth"].lower() != "truth"
     assert operator_panel.SERIES_LABELS["truth"] != operator_panel.SERIES_LABELS["optical"]
+
+
+def test_analysis_tab_series_covers_all_eight_recorded_rays():
+    # RAY_DIAGNOSTICS_ROWS is the canonical list of the eight recorded Rays.
+    # The Analysis tab's SERIES must plot every one of them, under the same
+    # display name it uses elsewhere (the Ray Diagnostics panel, CSV/XLSX).
+    ray_display_names = dict(operator_panel.RAY_DIAGNOSTICS_ROWS)
+    series_key_by_ray_key = {
+        "nominal": "raw",
+        "optical": "optical",
+        "ideal": "ideal",
+        "gps_raw": "raw_gps_baseline",
+        "gps_global": "gps_global",
+        "attitude": "attitude",
+        "baseline": "baseline",
+        "full": "full",
+    }
+    series_names = {name for name, _topic, _color in operator_panel.SERIES}
+    assert set(series_key_by_ray_key.values()) <= series_names
+    for ray_key, display_name in ray_display_names.items():
+        series_key = series_key_by_ray_key[ray_key]
+        assert operator_panel.SERIES_LABELS[series_key] == display_name
+
+
+def test_analysis_tab_series_without_a_dedicated_topic_are_skipped_in_ros_init():
+    # gps_global/attitude/baseline/full have no PointStamped/Float32MultiArray
+    # position topic of their own -- _init_ros's per-topic subscription loop
+    # must skip them (topic is None) rather than crash trying to subscribe to
+    # a None topic name; they are fed from /stereo/ray_metrics instead.
+    for series_name in ("gps_global", "attitude", "baseline", "full"):
+        matches = [entry for entry in operator_panel.SERIES if entry[0] == series_name]
+        assert len(matches) == 1
+        assert matches[0][1] is None
+
+
+def test_plot_stack_accepts_ray_metrics_only_series(qt_app):
+    stack = operator_panel.FrdPlotStack()
+    for series_name in ("gps_global", "attitude", "baseline", "full"):
+        stack.append(series_name, [900.0, 3.0, -2.0, 900.01])
+        axis_name, _axis_index = operator_panel.AXES[0]
+        assert stack.samples[axis_name][series_name][-1][1] == pytest.approx(900.0)
+
+
+def test_handle_ray_metrics_feeds_the_plot_stack_for_the_four_json_only_rays(qt_app, monkeypatch):
+    panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
+    panel._plot_stack = operator_panel.FrdPlotStack()
+    panel._facts = None
+    panel._record_preview = None
+    panel._ray_diagnostics = None
+    monkeypatch.setattr(panel, "_facts", type("_F", (), {"update_sample": lambda *a, **k: None})())
+    monkeypatch.setattr(
+        panel,
+        "_record_preview",
+        type(
+            "_R",
+            (),
+            {
+                "update_live_ray_metrics": lambda *a, **k: None,
+                "update_live_sample": lambda *a, **k: None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        panel, "_ray_diagnostics", type("_D", (), {"update_ray_metrics": lambda *a, **k: None})()
+    )
+    payload = json.dumps(
+        {
+            "gps_global": _valid_ray(forward_m=1.0),
+            "attitude": _valid_ray(forward_m=2.0),
+            "baseline": _valid_ray(forward_m=3.0),
+            "full": _valid_ray(forward_m=4.0),
+        }
+    )
+    operator_panel.OperatorPanel._handle_ray_metrics(panel, payload)
+    axis_name, _axis_index = operator_panel.AXES[0]
+    assert panel._plot_stack.samples[axis_name]["gps_global"][-1][1] == pytest.approx(1.0)
+    assert panel._plot_stack.samples[axis_name]["attitude"][-1][1] == pytest.approx(2.0)
+    assert panel._plot_stack.samples[axis_name]["baseline"][-1][1] == pytest.approx(3.0)
+    assert panel._plot_stack.samples[axis_name]["full"][-1][1] == pytest.approx(4.0)
+
+
+def test_handle_ray_metrics_does_not_crash_on_null_valued_fields(qt_app, monkeypatch):
+    # Regression test: an invalid/failed ray still reports its forward_m/
+    # right_m/down_m/range_m keys, just with a JSON null (-> None) rather
+    # than omitting them. dict.get(key, math.nan) only substitutes when the
+    # key is *absent*, not when it's present and None, so a naive .get(key,
+    # math.nan) let None reach math.isfinite() in _handle_sample and crashed
+    # the whole panel (and, transitively, run_operator_view.sh's process
+    # supervisor) the first time a live ray actually went invalid.
+    panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
+    panel._plot_stack = operator_panel.FrdPlotStack()
+    panel._facts = None
+    panel._record_preview = None
+    panel._ray_diagnostics = None
+    monkeypatch.setattr(panel, "_facts", type("_F", (), {"update_sample": lambda *a, **k: None})())
+    monkeypatch.setattr(
+        panel,
+        "_record_preview",
+        type(
+            "_R",
+            (),
+            {
+                "update_live_ray_metrics": lambda *a, **k: None,
+                "update_live_sample": lambda *a, **k: None,
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        panel, "_ray_diagnostics", type("_D", (), {"update_ray_metrics": lambda *a, **k: None})()
+    )
+    payload = json.dumps(
+        {
+            "gps_global": _valid_ray(
+                forward_m=None, right_m=None, down_m=None, range_m=None
+            ),
+            "attitude": _valid_ray(forward_m=5.0),
+            "baseline": _valid_ray(forward_m=None),
+            "full": _valid_ray(forward_m=None, range_m=None),
+        }
+    )
+    operator_panel.OperatorPanel._handle_ray_metrics(panel, payload)  # must not raise
+    axis_name, _axis_index = operator_panel.AXES[0]
+    assert math.isnan(panel._plot_stack.samples[axis_name]["gps_global"][-1][1])
+    assert panel._plot_stack.samples[axis_name]["attitude"][-1][1] == pytest.approx(5.0)
+    assert math.isnan(panel._plot_stack.samples[axis_name]["baseline"][-1][1])
