@@ -72,6 +72,9 @@ TYPE_BY_KEY: dict[str, str] = {
     "POSESIM_RIGHT_CAMERA_POSE_TOPIC": "topic",
     "POSESIM_CAMERA_POSE_MESSAGE_TYPE": "string",
     "POSESIM_CAMERA_POSE_SCHEMA": "string",
+    "POSESIM_CAMERA_POSE_MODE": "enum",
+    "POSESIM_LEFT_CAMERA_ENTITY_NAME": "string",
+    "POSESIM_RIGHT_CAMERA_ENTITY_NAME": "string",
     "POSESIM_RTK_TOPIC": "topic",
     "POSESIM_RTK_MESSAGE_TYPE": "string",
     "POSESIM_ENABLE_FUSED_GLOBAL_DIAGNOSTIC": "bool",
@@ -124,6 +127,7 @@ TYPE_BY_KEY: dict[str, str] = {
     "POSESIM_MAX_RIGHT_POSE_TIME_RESIDUAL_MS": "float",
     "POSESIM_MAX_RTK_TIME_RESIDUAL_MS": "float",
     "POSESIM_MAX_INTERPOLATION_GAP_MS": "float",
+    "POSESIM_MAX_GT_SOURCE_AGE_MS": "float",
     "POSESIM_STALE_AFTER_MS": "float",
     "POSESIM_ALLOW_FUTURE_EXTRAPOLATION": "bool",
     "POSESIM_REJECT_OUT_OF_ORDER": "bool",
@@ -185,6 +189,7 @@ SELECTION_KEYS = {"POSESIM_CONFIG", "POSESIM_PROFILE_CONFIG"}
 ENUM_VALUES: dict[str, set[str]] = {
     "POSESIM_MODE": {"diagnostic_only"},
     "POSESIM_GT_FALLBACK_POLICY": {"fail_closed"},
+    "POSESIM_CAMERA_POSE_MODE": {"static_snapshot", "dynamic_stream"},
     "POSESIM_EXPECTED_WORLD_FRAME": {"gazebo_world_enu"},
     "POSESIM_EXPECTED_CAMERA_FRAME": {"camera_optical_rdf"},
     "POSESIM_EXPECTED_CAMERA_FORWARD_AXIS": {"positive_z"},
@@ -435,6 +440,18 @@ def _validate(values: Mapping[str, object]) -> tuple[str, ...]:
             raise ConfigError(f"{key} must be false; Ground Truth fallback is fail-closed")
     if values["POSESIM_GT_FALLBACK_POLICY"] != "fail_closed":
         raise ConfigError("POSESIM_GT_FALLBACK_POLICY must be fail_closed")
+    if values["POSESIM_GT_MESSAGE_TYPE"] != "geometry_msgs/msg/PoseStamped":
+        raise ConfigError(
+            "POSESIM_GT_MESSAGE_TYPE must be geometry_msgs/msg/PoseStamped for the M2 adapter"
+        )
+    if values["POSESIM_CAMERA_POSE_MESSAGE_TYPE"] != "std_msgs/msg/String":
+        raise ConfigError(
+            "POSESIM_CAMERA_POSE_MESSAGE_TYPE must be std_msgs/msg/String for the M2 adapter"
+        )
+    if values["POSESIM_CAMERA_POSE_SCHEMA"] != "camera_pose_comparison/v1":
+        raise ConfigError(
+            "POSESIM_CAMERA_POSE_SCHEMA must be camera_pose_comparison/v1 for the M2 adapter"
+        )
 
     if values["POSESIM_EXPECTED_WORLD_FRAME"] != "gazebo_world_enu":
         raise ConfigError("POSESIM_EXPECTED_WORLD_FRAME must be gazebo_world_enu")
@@ -444,6 +461,8 @@ def _validate(values: Mapping[str, object]) -> tuple[str, ...]:
         raise ConfigError("POSESIM_OUTPUT_FRAME must be baseline_center_frd")
     if values["POSESIM_EXPECTED_CAMERA_FORWARD_AXIS"] != "positive_z":
         raise ConfigError("POSESIM_EXPECTED_CAMERA_FORWARD_AXIS must be positive_z")
+    if values["POSESIM_CAMERA_POSE_MODE"] not in {"static_snapshot", "dynamic_stream"}:
+        raise ConfigError("POSESIM_CAMERA_POSE_MODE must be static_snapshot or dynamic_stream")
 
     if not -90.0 <= float(values["POSESIM_SOURCE_ORIGIN_LATITUDE_DEG"]) <= 90.0:
         raise ConfigError("POSESIM_SOURCE_ORIGIN_LATITUDE_DEG must be within [-90, 90]")

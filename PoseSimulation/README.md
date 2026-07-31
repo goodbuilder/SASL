@@ -112,19 +112,59 @@ outputs or the actual pose timestamps cannot be paired, rqt shows
 
 ## Run
 
-The configuration-only runner is the supported entrypoint for this phase:
+### M2 external-input probe
+
+M2 adds a read-only input adapter and evaluation-time alignment probe.  It
+does not calculate attitude errors, baseline metrics, RTK results, rqt/RViz
+results, or any final measurement output.  It only validates and aligns the
+following external interfaces:
+
+- `/simulation/ground_truth/vehicle_reference_link` as
+  `geometry_msgs/msg/PoseStamped`, using `header.stamp` and the
+  `gazebo_world_enu` frame;
+- `/simulation/camera_pose_diagnostics/left` and `/right` as
+  `std_msgs/msg/String` with schema `camera_pose_comparison/v1`.
+
+The current camera publisher reads Gazebo `pose_static` and publishes a
+reliable, transient-local, depth-one snapshot.  PoseSimulation therefore
+uses `POSESIM_CAMERA_POSE_MODE=static_snapshot`: the first valid left/right
+optical pose is immutable for the run.  Repeated snapshots must keep the
+same entity identity and generated SDF hash; a changed pose, entity, or hash
+closes that camera input with an explicit invalid status.  The camera JSON's
+observed entity quaternion is converted with the checked-in FLU-to-RDF
+extrinsic; desired-pose fields are never used as measurements.
+
+Source timestamps are authoritative measurement times.  ROS receive time is
+monotonic bookkeeping only.  Static alignment is triggered by each valid GT
+sample, uses that GT timestamp as the evaluation timestamp, and reports
+camera time residuals as not applicable.  If the source clock cannot be
+established as `gazebo_sim_time`, the sample is invalidated with
+`CLOCK_DOMAIN_UNRESOLVED` rather than silently mixing clock domains.
+GT receive freshness is checked separately against
+`POSESIM_MAX_GT_SOURCE_AGE_MS`; static camera snapshots are not aged out by
+this policy.
+
+The supported input-probe entrypoint is:
 
 ```bash
 cd PoseSimulation
 ./run_pose_simulation.sh --check-config
 ./run_pose_simulation.sh --print-config
+./run_pose_simulation.sh --check-inputs --timeout-s 5
 ```
 
 The runner preserves the caller's working directory, resolves the optional
-profile path, validates the resolved snapshot, and exits without starting
-ROS, Gazebo, PX4, rqt, RViz, or any Simulation process. For a two-application
+profile path, validates the resolved snapshot, and never starts or stops
+Gazebo, PX4, rqt, RViz, or any Simulation process. `--check-inputs` only
+subscribes to external ROS 2 topics and returns `SOURCE_UNAVAILABLE` when the
+ROS runtime or source application is not present. For a two-application
 workflow, start Simulation in its own terminal using its own entrypoint, then
-run the PoseSimulation configuration check in a separate terminal.
+run the PoseSimulation probe in a separate terminal.
+
+The probe uses a reliable/volatile depth-ten subscription for the GT topic and
+a reliable/transient-local depth-one subscription for each camera snapshot,
+matching the current source publishers.  It has no publisher and no
+`/set_pose`, attitude-command, or correction path.
 
 ### Existing ROS runtime components
 

@@ -30,6 +30,12 @@ class PoseSimulationConfigTests(unittest.TestCase):
         self.assertFalse(config.values["POSESIM_START_SOURCE_APPLICATION"])
         self.assertFalse(config.values["POSESIM_OWN_SOURCE_PROCESSES"])
         self.assertFalse(config.values["POSESIM_ENABLE_VERTICAL_RTK_COMPARISON"])
+        self.assertEqual(config.values["POSESIM_CAMERA_POSE_MODE"], "static_snapshot")
+        self.assertEqual(
+            config.values["POSESIM_LEFT_CAMERA_ENTITY_NAME"],
+            "left_stereo_camera::optical_link",
+        )
+        self.assertEqual(config.values["POSESIM_MAX_GT_SOURCE_AGE_MS"], 500.0)
         for key in (
             "POSESIM_POSE_ERROR_TOPIC",
             "POSESIM_STEREO_GEOMETRY_TOPIC",
@@ -102,6 +108,26 @@ class PoseSimulationConfigTests(unittest.TestCase):
         self.assertIn("POSESIM_EVALUATION_HZ=2", printed.stdout)
         self.assertIn("provenance.explicit_override_names=POSESIM_EVALUATION_HZ", printed.stdout)
 
+    def test_runner_input_probe_mode_is_separate_from_configuration_check(self):
+        env = {key: value for key, value in os.environ.items() if not key.startswith("POSESIM_")}
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env["ROS_LOG_DIR"] = tempfile.gettempdir()
+        probed = subprocess.run(
+            ["bash", str(RUNNER), "--check-inputs", "--timeout-s", "0"],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertIn("PoseSimulation configuration valid.", probed.stdout)
+        self.assertTrue(
+            "Overall input status:" in probed.stdout
+            or "SOURCE_UNAVAILABLE" in probed.stdout
+            or "SOURCE_UNAVAILABLE" in probed.stderr
+        )
+        self.assertIn(probed.returncode, {0, 1, 2})
+
     def assert_config_error(self, **overrides):
         with self.assertRaises(ConfigError):
             resolve_config(
@@ -124,6 +150,9 @@ class PoseSimulationConfigTests(unittest.TestCase):
         self.assert_config_error(POSESIM_ALLOW_GT_FALLBACK="true")
         self.assert_config_error(POSESIM_ALLOW_PX4_AS_GROUND_TRUTH="true")
         self.assert_config_error(POSESIM_ALLOW_PLANNED_POSITION_AS_GROUND_TRUTH="true")
+        self.assert_config_error(POSESIM_GT_MESSAGE_TYPE="px4_msgs/msg/VehicleGlobalPosition")
+        self.assert_config_error(POSESIM_CAMERA_POSE_MESSAGE_TYPE="geometry_msgs/msg/PoseStamped")
+        self.assert_config_error(POSESIM_CAMERA_POSE_SCHEMA="other/v1")
 
     def test_coordinate_and_vertical_datum_guards(self):
         self.assert_config_error(POSESIM_EXPECTED_WORLD_FRAME="px4_local_ned")
@@ -145,6 +174,8 @@ class PoseSimulationConfigTests(unittest.TestCase):
         self.assert_config_error(POSESIM_EVALUATION_HZ="inf")
         self.assert_config_error(POSESIM_EVALUATION_HZ="0")
         self.assert_config_error(POSESIM_STALE_AFTER_MS="-1")
+        self.assert_config_error(POSESIM_MAX_GT_SOURCE_AGE_MS="-1")
+        self.assert_config_error(POSESIM_CAMERA_POSE_MODE="unknown")
         self.assert_config_error(POSESIM_RVIZ_RAY_MODE="unknown")
         self.assert_config_error(POSESIM_GT_MESSAGE_TYPE="")
 
