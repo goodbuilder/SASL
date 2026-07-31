@@ -81,6 +81,18 @@ workspace, and run:
 ros2 launch pose_simulation pose_simulation.launch.py
 ```
 
+For the same build-and-run workflow as the Simulation entrypoints, use the
+independent launcher from this directory:
+
+```bash
+./run_pose_simulation.sh
+```
+
+It builds only `PoseSimulation`, sources `/opt/ros/${ROS_DISTRO:-humble}` and
+the optional `POSE_SIMULATION_ROS_WORKSPACE` overlay, then launches the node.
+Use `--no-build` when the local install is already current. The launcher never
+starts, imports, modifies, or sends pose commands to `Simulation`.
+
 Before a real evaluation, set the WGS84 reference origin, altitude datum, and
 nominal stereo extrinsics in `config/pose_simulation.yaml`. The checked-in
 zero origin is a placeholder and is not a physical survey result.
