@@ -21,6 +21,7 @@ from stereo_ground_sim.coordinate_frames import (
     sdf_link_rpy_from_optical_error,
     sdf_pose_rpy_from_camera_pose,
 )
+from stereo_ground_sim.experiment_context import camera_pose_quaternion_xyzw
 
 
 def _float_config(context, name):
@@ -549,6 +550,75 @@ def _camera_pose_diagnostic_parameters(context, generated_world):
     )
 
 
+def _experiment_context_parameters(context, generated_sdf_sha256):
+    """Resolve final Simulation values for the immutable context publisher."""
+
+    baseline_m = _float_config(context, "baseline_m")
+    camera_height_m = _float_config(context, "camera_height_m")
+    nominal_left, nominal_right = nominal_camera_poses(baseline_m, camera_height_m)
+    direct_left = (
+        _float_config(context, "cam_l_optical_roll_deg"),
+        _float_config(context, "cam_l_optical_pitch_deg"),
+        _float_config(context, "cam_l_optical_yaw_deg"),
+    )
+    direct_right = (
+        _float_config(context, "cam_r_optical_roll_deg"),
+        _float_config(context, "cam_r_optical_pitch_deg"),
+        _float_config(context, "cam_r_optical_yaw_deg"),
+    )
+    common = (
+        _float_config(context, "common_optical_roll_error_deg"),
+        _float_config(context, "common_optical_pitch_error_deg"),
+        _float_config(context, "common_optical_yaw_error_deg"),
+    )
+    relative = (
+        _float_config(context, "relative_optical_roll_error_deg"),
+        _float_config(context, "relative_optical_pitch_error_deg"),
+        _float_config(context, "relative_optical_yaw_error_deg"),
+    )
+    zoom_raw = LaunchConfiguration("zoom_index").perform(context).strip()
+    try:
+        zoom_index = float(zoom_raw)
+        zoom_index_valid = math.isfinite(zoom_index)
+    except ValueError:
+        zoom_index = 0.0
+        zoom_index_valid = False
+    if not zoom_index_valid:
+        zoom_index = 0.0
+    return {
+        "context_topic": LaunchConfiguration("experiment_context_topic").perform(context),
+        "source_application": "Simulation",
+        "run_id": LaunchConfiguration("research_run_id").perform(context),
+        "case_id": LaunchConfiguration("research_case_id").perform(context),
+        "scenario_name": LaunchConfiguration("scenario_name").perform(context),
+        "simulation_epoch": 0,
+        "simulation_epoch_valid": False,
+        "simulation_epoch_source": "not_published_by_simulation_launch",
+        "repository": LaunchConfiguration("research_repository").perform(context),
+        "branch": LaunchConfiguration("research_branch").perform(context),
+        "commit_sha": LaunchConfiguration("research_commit_sha").perform(context),
+        "git_status": LaunchConfiguration("research_git_status").perform(context),
+        "generated_sdf_sha256": str(generated_sdf_sha256),
+        "nominal_baseline_m": baseline_m,
+        "zoom_index": zoom_index,
+        "zoom_index_valid": zoom_index_valid,
+        "zoom_index_source": "launch_argument" if zoom_index_valid else "unresolved_launch_default",
+        "camera_image_width_px": _int_config(context, "camera_image_width_px"),
+        "camera_image_height_px": _int_config(context, "camera_image_height_px"),
+        "camera_update_rate_hz": _float_config(context, "camera_update_rate_hz"),
+        "camera_horizontal_fov_rad": _float_config(context, "horizontal_fov_rad"),
+        "observation_mode": LaunchConfiguration("observation_mode").perform(context),
+        "nominal_left_position_world_enu_m": list(nominal_left.center_world_enu_m),
+        "nominal_left_orientation_xyzw": list(camera_pose_quaternion_xyzw(nominal_left)),
+        "nominal_right_position_world_enu_m": list(nominal_right.center_world_enu_m),
+        "nominal_right_orientation_xyzw": list(camera_pose_quaternion_xyzw(nominal_right)),
+        "left_direct_rpy_deg": list(direct_left),
+        "right_direct_rpy_deg": list(direct_right),
+        "common_rpy_deg": list(common),
+        "relative_rpy_deg": list(relative),
+    }
+
+
 def _launch_setup(context, *args, **kwargs):
     world = _generate_world(context)
     left_camera_pose_diagnostic, right_camera_pose_diagnostic = _camera_pose_diagnostic_parameters(
@@ -599,6 +669,16 @@ def _launch_setup(context, *args, **kwargs):
                 "-r",
                 "__node:=operator_camera_bridge",
             ],
+            output="screen",
+        ),
+        Node(
+            package="stereo_ground_sim",
+            executable="simulation_experiment_context",
+            name="simulation_experiment_context",
+            parameters=[_experiment_context_parameters(
+                context,
+                left_camera_pose_diagnostic["generated_sdf_sha256"],
+            )],
             output="screen",
         ),
         Node(
@@ -731,6 +811,10 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("scenario_name", default_value="unspecified"),
+            DeclareLaunchArgument(
+                "experiment_context_topic",
+                default_value="/simulation/experiment_context",
+            ),
             DeclareLaunchArgument("target_class", default_value="unspecified"),
             DeclareLaunchArgument("target_size_m", default_value="nan"),
             DeclareLaunchArgument("scenario_range_min_m", default_value="nan"),

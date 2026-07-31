@@ -7,10 +7,38 @@ derives the GT ideal rigid-parallel rig, and publishes typed attitude,
 optical-axis, relative-stereo, and baseline measurements. RTK, correction, UI,
 and pose-command paths are not part of this node.
 
-The application does not modify the `Simulation/` application. It has no
-runtime import from `stereo_ground_sim`; existing Simulation topics and source
-formats are only input contracts. `PoseSimulation` does not call `/set_pose`,
-publish attitude commands, or apply a correction.
+PoseSimulation does not control or modify Simulation at runtime. The single
+producer-side `simulation_interfaces` package and its launch-wired publisher
+are the explicit ROS boundary for this provenance phase; PoseSimulation has no
+runtime import from `stereo_ground_sim`, and existing Simulation topics/source
+formats remain external input contracts. PoseSimulation does not call
+`/set_pose`, publish attitude commands, or apply a correction.
+
+## Simulation attitude provenance
+
+Simulation publishes one immutable, transient-local
+`simulation_interfaces/msg/SimulationExperimentContext` on
+`/simulation/experiment_context`. The context contains the resolved nominal
+left/right Camera Optical RDF poses, direct/common/relative and recomputed
+effective optical RPY inputs, generated-SDF identity, and run provenance.
+PoseSimulation validates the schema, canonical SHA-256 identity, frame and
+quaternion contracts, and rejects context mutation within a run. It never
+reads `Simulation/config/simulation.env`, imports Simulation Python modules, or
+parses the generated SDF.
+
+When a valid M3 evaluation and matching context are available, the node also
+publishes `pose_simulation_interfaces/msg/AttitudeInjectionValidation` on
+`/pose_simulation/attitude_injection_validation`. Its SO(3) results keep three
+poses separate: Simulation nominal (`N`), Gazebo observed actual (`A`), and
+the current GT-target ideal pose (`I`). In particular, `R_N_A` is observed
+nominal-to-actual injection, `R_I_N` is target geometry, and
+`R_I_A = R_I_N @ R_N_A` is total GT-ideal error; configured injected RPY is
+never subtracted directly from GT-ideal error.
+
+The context publisher uses a zero-valued, explicitly invalid
+`simulation_epoch` provenance field because the current Simulation launch has
+no public epoch interface. The nominal launch `zoom_index` default is also
+reported as unresolved rather than publishing NaN.
 
 ## Configuration phase
 
@@ -99,8 +127,9 @@ source <workspace>/install/setup.bash
 ros2 launch pose_simulation pose_simulation.launch.py
 ```
 
-The node subscribes only to the three configured `/simulation/...` inputs. A
-valid GT sample triggers one monotonic `evaluation_id`; the GT source stamp is
+The node subscribes only to the four configured `/simulation/...` inputs: GT,
+left/right camera snapshots, and the immutable experiment context. A valid GT
+sample triggers one monotonic `evaluation_id`; the GT source stamp is
 the common output stamp and static camera residuals are not treated as
 time-varying measurements. `PoseSimulationStatus` always reports
 `read_only=true`, `pose_command_enabled=false`, and
@@ -120,6 +149,10 @@ following external interfaces:
   `gazebo_world_enu` frame;
 - `/simulation/camera_pose_diagnostics/left` and `/right` as
   `std_msgs/msg/String` with schema `camera_pose_comparison/v1`.
+- `/simulation/experiment_context` as
+  `simulation_interfaces/msg/SimulationExperimentContext`; the context hash,
+  generated-SDF identity, and effective RPY contract are validated before it
+  can support provenance output.
 
 The current camera publisher reads Gazebo `pose_static` and publishes a
 reliable, transient-local, depth-one snapshot.  PoseSimulation therefore

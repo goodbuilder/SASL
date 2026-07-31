@@ -36,6 +36,15 @@ class PoseSimulationConfigTests(unittest.TestCase):
             "left_stereo_camera::optical_link",
         )
         self.assertEqual(config.values["POSESIM_MAX_GT_SOURCE_AGE_MS"], 500.0)
+        self.assertEqual(
+            config.values["POSESIM_EXPERIMENT_CONTEXT_TOPIC"],
+            "/simulation/experiment_context",
+        )
+        self.assertEqual(
+            config.values["POSESIM_ATTITUDE_INJECTION_VALIDATION_TOPIC"],
+            "/pose_simulation/attitude_injection_validation",
+        )
+        self.assertTrue(config.values["POSESIM_REQUIRE_CONTEXT_HASH_MATCH"])
         for key in (
             "POSESIM_POSE_ERROR_TOPIC",
             "POSESIM_STEREO_GEOMETRY_TOPIC",
@@ -141,6 +150,12 @@ class PoseSimulationConfigTests(unittest.TestCase):
         self.assert_config_error(POSESIM_STATUS_TOPIC="/simulation/pose_simulation/status")
         self.assert_config_error(POSESIM_GT_TOPIC="pose_simulation/input")
         self.assert_config_error(POSESIM_GT_TOPIC="/pose_simulation/input")
+        self.assert_config_error(
+            POSESIM_ATTITUDE_INJECTION_VALIDATION_TOPIC="/simulation/validation"
+        )
+        self.assert_config_error(
+            POSESIM_EXPERIMENT_CONTEXT_TOPIC="/pose_simulation/context"
+        )
 
     def test_read_only_and_ground_truth_guards(self):
         self.assert_config_error(POSESIM_READ_ONLY="false")
@@ -178,6 +193,7 @@ class PoseSimulationConfigTests(unittest.TestCase):
         self.assert_config_error(POSESIM_CAMERA_POSE_MODE="unknown")
         self.assert_config_error(POSESIM_RVIZ_RAY_MODE="unknown")
         self.assert_config_error(POSESIM_GT_MESSAGE_TYPE="")
+        self.assert_config_error(POSESIM_MAX_INJECTION_RESIDUAL_DEG="-1")
 
     def test_unknown_environment_override_is_rejected(self):
         with self.assertRaises(ConfigError):

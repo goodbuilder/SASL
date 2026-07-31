@@ -1,6 +1,7 @@
-"""Read-only ROS 2 probe for the external PoseSimulation M2 inputs.
+"""Read-only ROS 2 probe for the external PoseSimulation inputs.
 
-The probe subscribes to the three source interfaces only.  It does not create
+The probe subscribes to the GT, camera, and immutable context source
+interfaces only.  It does not create
 publishers, start a source process, calculate an attitude error, or send a
 pose command.  The pure adapters and alignment functions remain usable on
 machines without ROS 2; ROS imports are intentionally optional here.
@@ -16,6 +17,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 from .config import ConfigError, ResolvedConfig, _parse_cli_overrides, resolve_config
+from .experiment_context import SimulationContextStore
 from .input_adapters import (
     GroundTruthStreamValidator,
     StaticCameraSnapshotStore,
@@ -51,6 +53,7 @@ try:  # Keep this module importable for pure adapter tests outside a ROS host.
         QoSProfile,
         ReliabilityPolicy,
     )
+    from simulation_interfaces.msg import SimulationExperimentContext
     from std_msgs.msg import String
 except ImportError:  # pragma: no cover - depends on the execution host
     rclpy = None  # type: ignore[assignment]
@@ -61,6 +64,7 @@ except ImportError:  # pragma: no cover - depends on the execution host
     HistoryPolicy = None  # type: ignore[assignment,misc]
     QoSProfile = None  # type: ignore[assignment,misc]
     ReliabilityPolicy = None  # type: ignore[assignment,misc]
+    SimulationExperimentContext = None  # type: ignore[assignment,misc]
 
 
 @dataclass(frozen=True)
@@ -82,6 +86,11 @@ class ProbeSnapshot:
     qos_issues: tuple[str, ...] = ()
     gt_receive_age_ms: float | None = None
     gt_max_source_age_ms: float | None = None
+    context_topic: str = ""
+    context_topic_discovered: bool = True
+    context_valid: bool = True
+    context_status: str = "CONTEXT_VALID"
+    context_reason: str = ""
 
 
 def _yes_no(value: bool) -> str:
@@ -129,6 +138,8 @@ def _sample_hash(sample: CameraOpticalPoseSample | None) -> str:
 def _overall_status(snapshot: ProbeSnapshot) -> str:
     if snapshot.qos_issues:
         return QOS_INCOMPATIBLE
+    if snapshot.context_topic and not snapshot.context_valid:
+        return snapshot.context_status or SOURCE_UNAVAILABLE
     if snapshot.alignment.valid:
         return VALID
     if not (
@@ -174,6 +185,10 @@ def format_probe_report(snapshot: ProbeSnapshot) -> str:
         f"Right camera SDF hash: {_sample_hash(snapshot.right_camera)}",
         f"Right camera source stamp ns: {_sample_stamp(snapshot.right_camera)}",
         f"Right camera status: {_sample_status(snapshot.right_camera, WAITING_FOR_RIGHT_CAMERA)}",
+        f"Experiment context topic: {snapshot.context_topic or '<not configured in fixture>'}",
+        f"Experiment context discovered: {_yes_no(snapshot.context_topic_discovered)}",
+        f"Experiment context status: {snapshot.context_status}",
+        f"Experiment context reason: {snapshot.context_reason or '<none>'}",
         f"Camera source mode: {snapshot.camera_source_mode}",
         f"Clock domain: {snapshot.expected_clock_domain or 'UNRESOLVED'}",
         f"Evaluation stamp ns: {alignment.evaluation_stamp_ns if alignment.evaluation_stamp_ns is not None else '<none>'}",
@@ -231,7 +246,7 @@ class InputProbeNode(_RosNode):
     """Subscribe to and validate the external source interfaces only."""
 
     def __init__(self, config: ResolvedConfig) -> None:  # pragma: no cover - ROS wiring
-        if rclpy is None or PoseStamped is None or String is None:
+        if rclpy is None or PoseStamped is None or String is None or SimulationExperimentContext is None:
             raise RuntimeError("InputProbeNode requires an installed ROS 2 runtime")
         values = config.values
         super().__init__(
@@ -243,6 +258,7 @@ class InputProbeNode(_RosNode):
         self._gt_topic = str(values["POSESIM_GT_TOPIC"])
         self._left_topic = str(values["POSESIM_LEFT_CAMERA_POSE_TOPIC"])
         self._right_topic = str(values["POSESIM_RIGHT_CAMERA_POSE_TOPIC"])
+        self._context_topic = str(values["POSESIM_EXPERIMENT_CONTEXT_TOPIC"])
         self._camera_mode = str(values["POSESIM_CAMERA_POSE_MODE"])
         self._expected_clock_domain = (
             GAZEBO_SIM_CLOCK
@@ -253,6 +269,10 @@ class InputProbeNode(_RosNode):
         self._gt_latest: GroundTruthPoseSample | None = None
         self._left_latest: CameraOpticalPoseSample | None = None
         self._right_latest: CameraOpticalPoseSample | None = None
+        self._context_store = SimulationContextStore(
+            expected_schema=str(values["POSESIM_EXPECTED_CONTEXT_SCHEMA"]),
+            require_hash_match=bool(values["POSESIM_REQUIRE_CONTEXT_HASH_MATCH"]),
+        )
         self._alignment = align_static_snapshot(
             None,
             None,
@@ -291,6 +311,12 @@ class InputProbeNode(_RosNode):
         )
         self._right_subscription = self.create_subscription(
             String, self._right_topic, self._on_right_camera, camera_qos
+        )
+        self._context_subscription = self.create_subscription(
+            SimulationExperimentContext,
+            self._context_topic,
+            self._on_experiment_context,
+            camera_qos,
         )
         self.get_logger().info(
             "PoseSimulation input probe started; subscriptions are read-only and no output publisher is created"
@@ -343,6 +369,9 @@ class InputProbeNode(_RosNode):
         if self._right_latest.valid and self._camera_mode == DYNAMIC_STREAM_MODE:
             self._right_buffer.append(self._right_latest)
         self._update_alignment()
+
+    def _on_experiment_context(self, message: Any) -> None:
+        self._context_store.accept(message)
 
     def _update_alignment(self) -> None:
         if self._camera_mode == STATIC_SNAPSHOT_MODE:
@@ -410,6 +439,12 @@ class InputProbeNode(_RosNode):
                 expected_reliability="RELIABLE",
                 expected_durability="TRANSIENT_LOCAL",
             )
+        self._refresh_topic_state(
+            "context",
+            self._context_topic,
+            expected_reliability="RELIABLE",
+            expected_durability="TRANSIENT_LOCAL",
+        )
 
     def snapshot(self) -> ProbeSnapshot:
         self.refresh_topic_state()
@@ -447,6 +482,11 @@ class InputProbeNode(_RosNode):
             qos_issues=tuple(self._qos_issues),
             gt_receive_age_ms=gt_receive_age_ms,
             gt_max_source_age_ms=gt_max_age_ms,
+            context_topic=self._context_topic,
+            context_topic_discovered=self._discovered.get("context", False),
+            context_valid=self._context_store.context is not None,
+            context_status=self._context_store.status,
+            context_reason=self._context_store.reason,
         )
 
 

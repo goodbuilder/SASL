@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/PoseError.msg"
   "msg/StereoGeometry.msg"
   "msg/PoseSimulationStatus.msg"
+  "msg/AttitudeInjectionValidation.msg"
   DEPENDENCIES geometry_msgs std_msgs
 )
 

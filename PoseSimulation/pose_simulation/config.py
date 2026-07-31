@@ -64,6 +64,13 @@ TYPE_BY_KEY: dict[str, str] = {
     "POSESIM_OWN_SOURCE_PROCESSES": "bool",
     # Source interface profile.
     "POSESIM_SOURCE_PROFILE_ID": "string",
+    "POSESIM_EXPERIMENT_CONTEXT_TOPIC": "topic",
+    "POSESIM_ATTITUDE_INJECTION_VALIDATION_TOPIC": "topic",
+    "POSESIM_EXPECTED_CONTEXT_SCHEMA": "string",
+    "POSESIM_REQUIRE_CONTEXT_SDF_MATCH": "bool",
+    "POSESIM_REQUIRE_CONTEXT_HASH_MATCH": "bool",
+    "POSESIM_MAX_INJECTION_RESIDUAL_DEG": "float",
+    "POSESIM_MAX_COMPOSITION_CLOSURE_DEG": "float",
     "POSESIM_GT_TOPIC": "topic",
     "POSESIM_GT_MESSAGE_TYPE": "string",
     "POSESIM_GT_REFERENCE_NAME": "string",
@@ -242,6 +249,7 @@ OUTPUT_TOPIC_KEYS = {
     "POSESIM_RTK_IDEAL_POSE_TOPIC",
     "POSESIM_DIAGNOSTICS_TOPIC",
     "POSESIM_MARKER_TOPIC",
+    "POSESIM_ATTITUDE_INJECTION_VALIDATION_TOPIC",
 }
 INPUT_TOPIC_KEYS = TOPIC_KEYS - OUTPUT_TOPIC_KEYS
 
@@ -423,6 +431,14 @@ def _validate(values: Mapping[str, object]) -> tuple[str, ...]:
         raise ConfigError("PoseSimulation cannot start the source application")
     if values["POSESIM_OWN_SOURCE_PROCESSES"] is True:
         raise ConfigError("PoseSimulation cannot own source application processes")
+    if values["POSESIM_EXPECTED_CONTEXT_SCHEMA"] != "simulation_experiment_context/v1":
+        raise ConfigError(
+            "POSESIM_EXPECTED_CONTEXT_SCHEMA must be simulation_experiment_context/v1"
+        )
+    if values["POSESIM_REQUIRE_CONTEXT_SDF_MATCH"] is not True:
+        raise ConfigError("PoseSimulation must require Simulation SDF identity matching")
+    if values["POSESIM_REQUIRE_CONTEXT_HASH_MATCH"] is not True:
+        raise ConfigError("PoseSimulation must require context hash matching")
 
     for key in TOPIC_KEYS:
         _require_absolute_topic(values, key)
@@ -440,6 +456,7 @@ def _validate(values: Mapping[str, object]) -> tuple[str, ...]:
             "POSESIM_GT_TOPIC",
             "POSESIM_LEFT_CAMERA_POSE_TOPIC",
             "POSESIM_RIGHT_CAMERA_POSE_TOPIC",
+            "POSESIM_EXPERIMENT_CONTEXT_TOPIC",
         ):
             if not str(values[key]).startswith("/simulation/"):
                 raise ConfigError(f"{key} must remain a /simulation input for the Simulation source")

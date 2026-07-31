@@ -17,19 +17,27 @@ try:  # Keep pure imports usable when ROS 2 or generated interfaces are absent.
     import rclpy
     from ament_index_python.packages import get_package_share_directory
     from geometry_msgs.msg import PoseStamped
-    from pose_simulation_interfaces.msg import PoseError, PoseSimulationStatus, StereoGeometry
+    from pose_simulation_interfaces.msg import (
+        AttitudeInjectionValidation,
+        PoseError,
+        PoseSimulationStatus,
+        StereoGeometry,
+    )
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from std_msgs.msg import String
+    from simulation_interfaces.msg import SimulationExperimentContext
 except ImportError:  # pragma: no cover - exercised on non-ROS test machines
     rclpy = None  # type: ignore[assignment]
     get_package_share_directory = None  # type: ignore[assignment]
     PoseStamped = None  # type: ignore[assignment,misc]
     PoseError = None  # type: ignore[assignment,misc]
+    AttitudeInjectionValidation = None  # type: ignore[assignment,misc]
     PoseSimulationStatus = None  # type: ignore[assignment,misc]
     StereoGeometry = None  # type: ignore[assignment,misc]
     Node = object  # type: ignore[assignment,misc]
     String = None  # type: ignore[assignment,misc]
+    SimulationExperimentContext = None  # type: ignore[assignment,misc]
     DurabilityPolicy = None  # type: ignore[assignment,misc]
     QoSProfile = None  # type: ignore[assignment,misc]
     ReliabilityPolicy = None  # type: ignore[assignment,misc]
@@ -40,6 +48,12 @@ except ImportError:  # pragma: no cover - ROS distributions normally provide PyY
     yaml = None  # type: ignore[assignment]
 
 from .config import ConfigError, resolve_config
+from .attitude_provenance import validate_attitude_provenance
+from .experiment_context import (
+    CONTEXT_CAMERA_SDF_MISMATCH,
+    SimulationContextStore,
+    WAITING_FOR_EXPERIMENT_CONTEXT,
+)
 from .input_adapters import (
     GroundTruthStreamValidator,
     StaticCameraSnapshotStore,
@@ -138,6 +152,90 @@ def _pose_stamped(pose: Pose3D, stamp_ns: int | None, frame_id: str) -> Any:
         message.pose.orientation.z,
         message.pose.orientation.w,
     ) = quaternion
+    return message
+
+
+_VALIDATION_VECTOR_FIELDS = (
+    "left_commanded_effective_rpy_deg",
+    "right_commanded_effective_rpy_deg",
+    "left_observed_nominal_to_actual_rpy_deg",
+    "right_observed_nominal_to_actual_rpy_deg",
+    "left_component_delta_rpy_deg",
+    "right_component_delta_rpy_deg",
+    "left_injection_residual_rpy_deg",
+    "right_injection_residual_rpy_deg",
+    "left_gt_ideal_to_nominal_rpy_deg",
+    "right_gt_ideal_to_nominal_rpy_deg",
+    "left_gt_ideal_to_actual_rpy_deg",
+    "right_gt_ideal_to_actual_rpy_deg",
+    "relative_commanded_rpy_deg",
+    "relative_observed_rpy_deg",
+    "relative_residual_rpy_deg",
+)
+_VALIDATION_SCALAR_FIELDS = (
+    "left_injection_residual_rotation_deg",
+    "right_injection_residual_rotation_deg",
+    "left_composition_closure_rotation_deg",
+    "right_composition_closure_rotation_deg",
+    "relative_residual_rotation_deg",
+)
+
+
+def _set_vector3_message(message: Any, values: tuple[float, float, float]) -> None:
+    message.x, message.y, message.z = values
+
+
+def _set_validation_nan(message: Any) -> None:
+    for field in _VALIDATION_VECTOR_FIELDS:
+        _set_vector3_message(getattr(message, field), (INVALID_METRIC,) * 3)
+    for field in _VALIDATION_SCALAR_FIELDS:
+        setattr(message, field, INVALID_METRIC)
+
+
+def attitude_validation_message(
+    result: GtMeasurementResult,
+    *,
+    context: Any = None,
+    validation: Any = None,
+    status: str | None = None,
+    reason: str = "",
+) -> Any:
+    """Convert one provenance result to the typed read-only output message."""
+
+    if AttitudeInjectionValidation is None:
+        raise RuntimeError("pose_simulation_interfaces is not available")
+    message = AttitudeInjectionValidation()
+    _set_header(message, result.evaluation_stamp_ns, WORLD_FRAME)
+    message.evaluation_id = int(result.evaluation_id)
+    message.valid = bool(validation is not None and validation.valid and result.valid)
+    message.status = status or (validation.status if validation is not None else "WAITING_FOR_EXPERIMENT_CONTEXT")
+    message.invalid_reason = reason or (validation.reason if validation is not None else "")
+    if context is not None:
+        message.context_id_sha256 = context.context_id_sha256
+        message.run_id = context.run_id
+        message.case_id = context.case_id
+        message.scenario_name = context.scenario_name
+        message.generated_sdf_sha256 = context.generated_sdf_sha256
+        message.world_frame = context.world_frame
+        message.camera_error_frame = context.camera_error_frame
+        message.rotation_composition = context.rotation_composition
+    else:
+        message.context_id_sha256 = ""
+        message.run_id = ""
+        message.case_id = ""
+        message.scenario_name = ""
+        message.generated_sdf_sha256 = ""
+        message.world_frame = WORLD_FRAME
+        message.camera_error_frame = CAMERA_OPTICAL_FRAME
+        message.rotation_composition = OPTICAL_RPY_CONVENTION
+
+    _set_validation_nan(message)
+    if not message.valid:
+        return message
+    for field in _VALIDATION_VECTOR_FIELDS:
+        _set_vector3_message(getattr(message, field), tuple(getattr(validation, field)))
+    for field in _VALIDATION_SCALAR_FIELDS:
+        setattr(message, field, float(getattr(validation, field)))
     return message
 
 
@@ -274,9 +372,9 @@ class PoseSimulationNode(Node):
     """Read-only GT-triggered PoseSimulation M3 node."""
 
     def __init__(self) -> None:  # pragma: no cover - ROS wiring is smoke-tested
-        if rclpy is None or PoseError is None:
+        if rclpy is None or PoseError is None or AttitudeInjectionValidation is None or SimulationExperimentContext is None:
             raise RuntimeError(
-                "PoseSimulation M3 requires ROS 2 and the built pose_simulation_interfaces package"
+                "PoseSimulation M3 requires ROS 2 and the built PoseSimulation/Simulation interfaces"
             )
         super().__init__("pose_simulation")
         self._config = self._load_config()
@@ -294,12 +392,17 @@ class PoseSimulationNode(Node):
         self._latest_gt = None
         self._latest_left = None
         self._latest_right = None
+        self._latest_result: GtMeasurementResult | None = None
         self._gt_validator = GroundTruthStreamValidator(
             reject_duplicate_stamps=bool(self._values["POSESIM_REJECT_DUPLICATE_STAMPS"]),
             reject_out_of_order=bool(self._values["POSESIM_REJECT_OUT_OF_ORDER"]),
         )
         self._left_store = StaticCameraSnapshotStore("left")
         self._right_store = StaticCameraSnapshotStore("right")
+        self._context_store = SimulationContextStore(
+            expected_schema=str(self._values["POSESIM_EXPECTED_CONTEXT_SCHEMA"]),
+            require_hash_match=bool(self._values["POSESIM_REQUIRE_CONTEXT_HASH_MATCH"]),
+        )
         self._engine = GtMeasurementEngine(self._contract)
         self._publishers = self._create_publishers()
         self._create_subscriptions()
@@ -351,6 +454,11 @@ class PoseSimulationNode(Node):
             "actual_right": self.create_publisher(
                 PoseStamped, str(self._values["POSESIM_ACTUAL_RIGHT_POSE_TOPIC"]), 10
             ),
+            "attitude_validation": self.create_publisher(
+                AttitudeInjectionValidation,
+                str(self._values["POSESIM_ATTITUDE_INJECTION_VALIDATION_TOPIC"]),
+                10,
+            ),
         }
 
     def _create_subscriptions(self) -> None:
@@ -360,6 +468,11 @@ class PoseSimulationNode(Node):
             durability=DurabilityPolicy.VOLATILE,
         )
         camera_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        context_qos = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -382,6 +495,23 @@ class PoseSimulationNode(Node):
             self._right_camera_callback,
             camera_qos,
         )
+        self.create_subscription(
+            SimulationExperimentContext,
+            str(self._values["POSESIM_EXPERIMENT_CONTEXT_TOPIC"]),
+            self._experiment_context_callback,
+            context_qos,
+        )
+
+    def _experiment_context_callback(self, message: Any) -> None:
+        result = self._context_store.accept(message)
+        if not result.valid:
+            self.get_logger().warning(
+                f"Simulation experiment context rejected: {result.status}: {result.reason}"
+            )
+        if self._latest_result is not None:
+            # Context is a static run snapshot.  Revalidate the already
+            # evaluated sample without allocating a second evaluation_id.
+            self._publish_attitude_validation(self._latest_result)
 
     def _ground_truth_callback(self, message: Any) -> None:
         sample = adapt_ground_truth_pose(
@@ -442,7 +572,9 @@ class PoseSimulationNode(Node):
             expected_clock_domain=GAZEBO_SIM_CLOCK,
         )
         result = self._engine.evaluate(aligned)
+        self._latest_result = result
         self._publish_status(result)
+        self._publish_attitude_validation(result)
         if result.evaluation_stamp_ns is None:
             return
         self._publishers["pose_error"].publish(
@@ -481,6 +613,107 @@ class PoseSimulationNode(Node):
             self._publishers["actual_right"].publish(
                 _pose_stamped(aligned_right.pose, result.evaluation_stamp_ns, self._contract.world_frame)
             )
+
+    def _publish_attitude_validation(self, result: GtMeasurementResult) -> None:
+        """Publish provenance only for the same M3 evaluation identity."""
+
+        if result.evaluation_stamp_ns is None:
+            return
+        context = self._context_store.context
+        if context is None:
+            self._publishers["attitude_validation"].publish(
+                attitude_validation_message(
+                    result,
+                    status=self._context_store.status or WAITING_FOR_EXPERIMENT_CONTEXT,
+                    reason=self._context_store.reason,
+                )
+            )
+            return
+        if not result.valid or result.ideal_ground_truth is None:
+            self._publishers["attitude_validation"].publish(
+                attitude_validation_message(
+                    result,
+                    context=context,
+                    status="POSE_EVALUATION_INVALID",
+                    reason=result.reason or "GT pose evaluation is invalid",
+                )
+            )
+            return
+
+        aligned_left = result.ground_truth.left_actual_camera
+        aligned_right = result.ground_truth.right_actual_camera
+        ideal = result.ideal_ground_truth
+        if (
+            aligned_left is None
+            or aligned_right is None
+            or aligned_left.position_world_enu_m is None
+            or aligned_right.position_world_enu_m is None
+            or aligned_left.rotation_world_from_optical is None
+            or aligned_right.rotation_world_from_optical is None
+            or ideal.left_pose is None
+            or ideal.right_pose is None
+        ):
+            self._publishers["attitude_validation"].publish(
+                attitude_validation_message(
+                    result,
+                    context=context,
+                    status="POSE_EVALUATION_INVALID",
+                    reason="validated M3 result is missing a required pose",
+                )
+            )
+            return
+        if bool(self._values["POSESIM_REQUIRE_CONTEXT_SDF_MATCH"]):
+            sdf_hashes = {
+                aligned_left.generated_sdf_sha256,
+                aligned_right.generated_sdf_sha256,
+            }
+            if (
+                not context.generated_sdf_sha256
+                or any(not value for value in sdf_hashes)
+                or sdf_hashes != {context.generated_sdf_sha256}
+            ):
+                self._publishers["attitude_validation"].publish(
+                    attitude_validation_message(
+                        result,
+                        context=context,
+                        status=CONTEXT_CAMERA_SDF_MISMATCH,
+                        reason="camera diagnostic SDF identity does not match the Simulation context",
+                    )
+                )
+                return
+        try:
+            validation = validate_attitude_provenance(
+                context,
+                ideal_left_pose_world=ideal.left_pose,
+                ideal_right_pose_world=ideal.right_pose,
+                actual_left_pose_world=Pose3D(
+                    aligned_left.position_world_enu_m,
+                    aligned_left.rotation_world_from_optical,
+                    CAMERA_OPTICAL_FRAME,
+                    aligned_left.gazebo_stamp_ns,
+                ),
+                actual_right_pose_world=Pose3D(
+                    aligned_right.position_world_enu_m,
+                    aligned_right.rotation_world_from_optical,
+                    CAMERA_OPTICAL_FRAME,
+                    aligned_right.gazebo_stamp_ns,
+                ),
+                max_injection_residual_deg=float(self._values["POSESIM_MAX_INJECTION_RESIDUAL_DEG"]),
+                max_composition_closure_deg=float(self._values["POSESIM_MAX_COMPOSITION_CLOSURE_DEG"]),
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            self._publishers["attitude_validation"].publish(
+                attitude_validation_message(
+                    result,
+                    context=context,
+                    status="POSE_EVALUATION_INVALID",
+                    reason=str(exc),
+                )
+            )
+            return
+        self._publishers["attitude_validation"].publish(
+            attitude_validation_message(result, context=context, validation=validation)
+        )
 
     def _publish_waiting_status(
         self,
@@ -562,6 +795,7 @@ def main(args: list[str] | None = None) -> int:
 
 __all__ = [
     "PoseSimulationNode",
+    "attitude_validation_message",
     "load_pose_contract",
     "main",
     "pose_error_message",

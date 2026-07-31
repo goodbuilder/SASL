@@ -43,6 +43,7 @@ setup(
             "external_bbox_publisher = stereo_ground_sim.external_bbox_publisher:main",
             "operator_recorder = stereo_ground_sim.operator_recorder:main",
             "calibration_csv_recorder = stereo_ground_sim.calibration_csv_recorder:main",
+            "simulation_experiment_context = stereo_ground_sim.experiment_context_publisher:main",
         ],
     },
 )
