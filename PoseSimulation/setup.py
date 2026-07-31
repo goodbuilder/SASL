@@ -49,7 +49,7 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
-            "pose_simulation = pose_simulation.pose_simulation_node:main",
+            "pose_simulation = pose_simulation.gt_attitude_measurement_node:main",
             "pose_visualization = pose_simulation.pose_visualization_node:main",
             "pose_input_probe = pose_simulation.input_probe_node:main",
         ],

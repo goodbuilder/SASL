@@ -1,10 +1,11 @@
 # PoseSimulation
 
-`PoseSimulation` is an independent ROS 2 application for Phase 1 stereo-pose
-diagnostics. It observes Gazebo poses and a PX4 raw GNSS position, converts the
-inputs into an explicit coordinate contract, derives ideal rigid-parallel
-stereo poses, and reports pose, optical-axis, relative-camera, and baseline
-errors.
+`PoseSimulation` is an independent ROS 2 application for read-only stereo-pose
+diagnostics. In M3, its primary `pose_simulation` node consumes the external
+Ground Truth `PoseStamped` and immutable left/right optical-pose snapshots,
+derives the GT ideal rigid-parallel rig, and publishes typed attitude,
+optical-axis, relative-stereo, and baseline measurements. RTK, correction, UI,
+and pose-command paths are not part of this node.
 
 The application does not modify the `Simulation/` application. It has no
 runtime import from `stereo_ground_sim`; existing Simulation topics and source
@@ -27,16 +28,11 @@ coordinate-frame contract, time policy, and RTK altitude-datum policy without
 importing ROS or starting a source process. Empty metric thresholds mean
 `UNSPECIFIED`, not `PASS`.
 
-## Source hierarchy
+## M3 source contract
 
-- `target_reference_link` is the only absolute Ground Truth source.
-- `vehicle_reference_link` is a configured fallback and is reported as such.
-- A configured model-pose fallback is diagnostic only and is not equivalent to
-  the target reference link.
-- `/fmu/out/vehicle_gps_position` is an RTK operational reference candidate.
-  Current `px4_msgs` exposes this topic as `SensorGps`; the node also accepts
-  `VehicleGpsPosition` when available. `VehicleGlobalPosition` is not used as
-  the RTK position input.
+- `/simulation/ground_truth/vehicle_reference_link` is the configured M3
+  Ground Truth input. M3 has no model-pose, PX4-pose, or planned-position
+  fallback.
 - Actual camera poses are observed optical RDF world poses from the camera
   diagnostic JSON fields, never the payload's desired pose fields.
 
@@ -45,19 +41,13 @@ verified fixed `R_link_from_optical` transform is therefore applied before an
 actual pose is labeled `camera_optical_rdf`; the entity quaternion is not
 treated as an RDF quaternion by identity assumption.
 
-The repository carries an independent copy of the reference world under
-`worlds/` and the required `wiris_camera` and `x500_15m` model assets under
-`models/`. These are copied inputs, not runtime imports from `Simulation`.
-The copied world has no `target_reference_link`; standalone evaluation
-therefore reports the `x500_15m` model as `MODEL_POSE_FALLBACK`, preserving the
-Ground Truth hierarchy instead of relabeling the model as an authoritative
-link.
+The repository may carry copied world/model assets for other read-only tools,
+but the M3 node does not launch Gazebo, parse SDF, or derive a fallback pose
+from them. Missing or invalid external GT remains invalid.
 
-The node can also read raw Gazebo `Pose_V` streams directly with
-`enable_gazebo_raw_pose_streams: true`. Configure the exact target reference
-entity, parent model, and both optical entities before enabling that path; the
-parser composes scoped link poses with the parent model world pose and retains
-the Gazebo source stamp.
+Camera snapshots are immutable for one run. An entity identity, SDF hash, or
+pose change invalidates that side; the first valid snapshot is never silently
+replaced.
 
 ## Coordinate and reporting contract
 
@@ -81,34 +71,40 @@ Consequently, an independent midpoint position error is reported as
 configuration. The default target alignment records the explicit
 `zero_lever_arm_assumption`.
 
-## Topics
+## M3 topics
 
-All PoseSimulation outputs are under `/pose_simulation`:
+All M3 PoseSimulation outputs are under `/pose_simulation`:
 
-- `pose_error` — actual-vs-GT, actual-vs-RTK, and RTK-ideal-vs-GT-ideal pose and
-  optical-axis diagnostics as self-describing JSON.
-- `stereo_geometry` — relative stereo attitude and baseline diagnostics as
-  self-describing JSON.
-- `status` — source provenance, validity, timestamp policy, frame contract,
-  and RTK state as self-describing JSON.
-- `ideal_pose/ground_truth/{left,right}` and `ideal_pose/rtk/{left,right}` —
-  ideal camera optical `PoseStamped` messages when the corresponding input is
-  valid.
-- `ideal_pose/{ground_truth,rtk}/rig` — ideal `baseline_center_frd` pose
-  messages for the same two sources.
-- `actual_pose/{left,right}` — observed optical `PoseStamped` re-publication
-  for inspection only.
-- `visualization/markers` — atomic `visualization_msgs/MarkerArray` for the
-  read-only RViz scene.
-- `diagnostics` — standard `diagnostic_msgs/DiagnosticArray` generated from the
-  same validated evaluation sample.
+- `pose_error` — `pose_simulation_interfaces/msg/PoseError`, containing both
+  camera actual-vs-GT-ideal RPY/rotation and optical-axis errors.
+- `stereo_geometry` — `pose_simulation_interfaces/msg/StereoGeometry`,
+  containing relative attitude and baseline geometry.
+- `status` — `pose_simulation_interfaces/msg/PoseSimulationStatus`, including
+  source identity, contract hash, validity, and the read-only guard.
+- `ideal_pose/ground_truth/{rig,left,right}` — standard `PoseStamped` ideal
+  poses, all stamped with the same GT evaluation time.
 
-The UI adapter consumes the existing JSON and `PoseStamped` outputs. It does
-not recalculate pose errors, perform WGS84 conversion, or issue pose commands.
-The core has no independent sequence ID in this Phase, so
-`evaluation_timestamp_ns` is used as the sample identity. If the three JSON
-outputs or the actual pose timestamps cannot be paired, rqt shows
-`PAIR ID MISMATCH`/`TIMESTAMP MISMATCH` and RViz deletes the prior marker set.
+The typed definitions are in the independent `pose_simulation_interfaces`
+package. Invalid evaluations publish `valid=false` with NaN metric fields; the
+node does not keep a previous valid metric as the current result. M3 does not
+publish RTK ideal poses, markers, or `DiagnosticArray` messages.
+
+## M3 runtime
+
+Start Simulation separately, then run PoseSimulation:
+
+```bash
+source /opt/ros/humble/setup.bash
+source <workspace>/install/setup.bash
+ros2 launch pose_simulation pose_simulation.launch.py
+```
+
+The node subscribes only to the three configured `/simulation/...` inputs. A
+valid GT sample triggers one monotonic `evaluation_id`; the GT source stamp is
+the common output stamp and static camera residuals are not treated as
+time-varying measurements. `PoseSimulationStatus` always reports
+`read_only=true`, `pose_command_enabled=false`, and
+`rtk_comparison_implemented=false`.
 
 ## Run
 

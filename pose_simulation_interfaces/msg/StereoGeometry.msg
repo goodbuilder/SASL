@@ -1,0 +1,20 @@
+std_msgs/Header header
+uint64 evaluation_id
+
+bool valid
+string status
+string world_frame
+string rig_frame
+
+float64 relative_roll_error_deg
+float64 relative_pitch_error_deg
+float64 relative_yaw_error_deg
+float64 relative_rotation_error_deg
+float64 optical_axis_angle_deg
+
+geometry_msgs/Vector3 actual_baseline_vector_world_enu_m
+float64 actual_baseline_length_m
+float64 nominal_baseline_length_m
+float64 baseline_length_error_m
+float64 baseline_direction_error_deg
+geometry_msgs/Point actual_midpoint_world_enu_m

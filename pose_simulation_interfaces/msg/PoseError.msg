@@ -1,0 +1,27 @@
+std_msgs/Header header
+uint64 evaluation_id
+
+bool valid
+string status
+string reference_type
+string world_frame
+string error_frame
+string euler_convention
+
+uint64 gt_stamp_ns
+uint64 left_camera_source_stamp_ns
+uint64 right_camera_source_stamp_ns
+
+float64 left_roll_error_deg
+float64 left_pitch_error_deg
+float64 left_yaw_error_deg
+float64 left_rotation_error_deg
+float64 left_optical_axis_error_deg
+bool left_gimbal_lock
+
+float64 right_roll_error_deg
+float64 right_pitch_error_deg
+float64 right_yaw_error_deg
+float64 right_rotation_error_deg
+float64 right_optical_axis_error_deg
+bool right_gimbal_lock
