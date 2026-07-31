@@ -17,6 +17,7 @@ setup(
         (os.path.join("share", package_name), ["package.xml", "README.md"]),
         (os.path.join("share", package_name, "launch"), ["launch/pose_simulation.launch.py"]),
         (os.path.join("share", package_name, "config"), ["config/pose_simulation.yaml"]),
+        (os.path.join("share", package_name, "rviz"), ["config/pose_simulation.rviz"]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

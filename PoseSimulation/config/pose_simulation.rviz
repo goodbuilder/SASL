@@ -1,0 +1,103 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Name: World Grid
+      Normal Cell Count: 0
+      Offset: 0
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Color: 255; 25; 0
+      Head Length: 0.3
+      Head Radius: 0.1
+      Name: Actual Left Optical Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/pose_simulation/actual_pose/left
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Color: 25; 255; 0
+      Head Length: 0.3
+      Head Radius: 0.1
+      Name: Actual Right Optical Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/pose_simulation/actual_pose/right
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Color: 25; 100; 255
+      Head Length: 0.3
+      Head Radius: 0.1
+      Name: GT Ideal Left Optical Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/pose_simulation/ideal_pose/ground_truth/left
+      Value: true
+    - Class: rviz_default_plugins/Pose
+      Color: 255; 150; 25
+      Head Length: 0.3
+      Head Radius: 0.1
+      Name: RTK Ideal Left Optical Pose
+      Shaft Length: 1
+      Shaft Radius: 0.05
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /simulation/pose_simulation/ideal_pose/rtk/left
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: gazebo_world_enu
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 100
+      Focal Point: 0; 0; 0
+      Name: Current View
+      Pitch: 0.5
+      Target Frame: <Fixed Frame>
+      Yaw: 0.5
+Window Geometry:
+  Height: 900
+  Width: 1400

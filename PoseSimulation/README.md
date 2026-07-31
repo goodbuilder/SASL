@@ -89,9 +89,11 @@ independent launcher from this directory:
 ```
 
 It builds only `PoseSimulation`, sources `/opt/ros/${ROS_DISTRO:-humble}` and
-the optional `POSE_SIMULATION_ROS_WORKSPACE` overlay, then launches the node.
-Use `--no-build` when the local install is already current. The launcher never
-starts, imports, modifies, or sends pose commands to `Simulation`.
+the optional `POSE_SIMULATION_ROS_WORKSPACE` overlay, then starts the node,
+`rqt_gui`, RViz, and the Gazebo GUI client. Use `--no-build` when the local
+install is already current, or `--node-only` for the diagnostic node without
+GUIs. The launcher never starts, imports, modifies, or sends pose commands to
+`Simulation`; the Gazebo process is GUI-only and does not start a server/world.
 
 Before a real evaluation, set the WGS84 reference origin, altitude datum, and
 nominal stereo extrinsics in `config/pose_simulation.yaml`. The checked-in
