@@ -232,3 +232,116 @@ def test_panel_pair_label_updates_from_payload(qt_app):
     panel.update_ray_metrics(json.dumps({"pair_id": 123, "nominal": _valid_ray()}))
 
     assert "Pair: 123" in panel._frame_label.text()
+
+
+def test_px4_attitude_error_env_values_read_from_environment(monkeypatch):
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0")
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0")
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0")
+    monkeypatch.setenv("CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0")
+    monkeypatch.setenv("CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0")
+    monkeypatch.setenv("CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG", "0.05")
+
+    values = operator_panel._px4_attitude_error_env_values()
+
+    assert values["left"] == ("0.0", "0.0", "0.0")
+    assert values["right"] == ("0.0", "0.0", "0.05")
+
+
+def test_px4_attitude_error_env_values_default_to_zero(monkeypatch):
+    for name in (
+        "CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG",
+        "CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG",
+        "CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG",
+        "CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG",
+        "CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG",
+        "CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    values = operator_panel._px4_attitude_error_env_values()
+
+    assert values["left"] == ("0.0", "0.0", "0.0")
+    assert values["right"] == ("0.0", "0.0", "0.0")
+
+
+def test_setup_group_shows_px4_attitude_error_injection_values(qt_app, monkeypatch):
+    monkeypatch.setenv("CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG", "0.05")
+
+    panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
+    group = operator_panel.OperatorPanel._build_px4_attitude_error_injection_group(panel)
+
+    assert group.title() == "PX4 Attitude Error Injection"
+    assert "Gazebo actual camera optical pose" in group.toolTip()
+    assert "body-local" in group.toolTip().lower()
+
+
+def test_sensors_tab_shows_residual_within_tolerance_without_warning(qt_app, monkeypatch):
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0")
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0")
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0")
+    panel = operator_panel.RayDiagnosticsPanel()
+
+    panel.update_ray_metrics(
+        json.dumps(
+            {
+                "attitude": {
+                    "valid": True,
+                    "computation_status": "computed",
+                    "left_attitude_truth_residual_deg": 1.0e-7,
+                    "right_attitude_truth_residual_deg": 1.0e-7,
+                }
+            }
+        )
+    )
+
+    assert panel._attitude_fields["Left residual [deg]"].text() != "—"
+    assert panel._attitude_fields["Left residual [deg]"].toolTip() == ""
+
+
+def test_sensors_tab_flags_reference_mismatch_when_error_is_zero_but_residual_is_large(
+    qt_app, monkeypatch
+):
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0")
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0")
+    monkeypatch.setenv("CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0")
+    panel = operator_panel.RayDiagnosticsPanel()
+
+    panel.update_ray_metrics(
+        json.dumps(
+            {
+                "attitude": {
+                    "valid": True,
+                    "computation_status": "computed",
+                    "left_attitude_truth_residual_deg": 1.5,
+                    "right_attitude_truth_residual_deg": 0.0,
+                }
+            }
+        )
+    )
+
+    assert "REFERENCE_MISMATCH" in panel._attitude_fields["Left residual [deg]"].toolTip()
+    # The runtime computation_status is untouched by this UI-only flag.
+    assert panel._attitude_fields["Overall status"].text() == "VALID"
+
+
+def test_sensors_tab_does_not_flag_reference_mismatch_when_error_is_injected(
+    qt_app, monkeypatch
+):
+    monkeypatch.setenv("CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG", "1.5")
+    panel = operator_panel.RayDiagnosticsPanel()
+
+    panel.update_ray_metrics(
+        json.dumps(
+            {
+                "attitude": {
+                    "valid": True,
+                    "computation_status": "computed",
+                    "left_attitude_truth_residual_deg": 0.0,
+                    "right_attitude_truth_residual_deg": 1.5,
+                }
+            }
+        )
+    )
+
+    assert panel._attitude_fields["Right residual [deg]"].toolTip() == ""

@@ -18,6 +18,7 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from stereo_ground_sim.coordinate_frames import (
     rpy_to_rotation_world_from_link,
+    sdf_link_rpy_from_optical_error,
     sdf_link_rpy_from_px4_frd_error,
 )
 
@@ -82,11 +83,18 @@ def test_one_canonical_default_env_and_no_legacy_attitude_names() -> None:
     assert root_env_files == ["simulation.env"]
     config = (ROOT / "config" / "simulation.env").read_text(encoding="utf-8")
     for side in ("L", "R"):
-        for frame in ("OPTICAL", "PX4"):
-            for axis in ("ROLL", "PITCH", "YAW"):
-                assert f"CAM_{side}_{frame}_{axis}_DEG=" in config
+        for axis in ("ROLL", "PITCH", "YAW"):
+            assert f"CAM_{side}_OPTICAL_{axis}_DEG=" in config
+            assert f"CAM_{side}_PX4_ATTITUDE_ERROR_{axis}_DEG=" in config
     assert "LEFT_ROLL_ERROR_DEG" not in config
     assert "RIGHT_ROLL_ERROR_DEG" not in config
+
+
+def test_legacy_independent_px4_absolute_attitude_names_are_removed() -> None:
+    config = (ROOT / "config" / "simulation.env").read_text(encoding="utf-8")
+    for side in ("L", "R"):
+        for axis in ("ROLL", "PITCH", "YAW"):
+            assert f"CAM_{side}_PX4_{axis}_DEG=" not in config
 
 
 def test_every_runner_uses_the_unified_config() -> None:
@@ -179,24 +187,36 @@ def test_px4_frd_errors_are_explicitly_converted_to_gazebo_flu() -> None:
     assert yaw == pytest.approx(nominal_yaw - math.radians(5.0))
 
 
-def test_optical_only_attitude_does_not_rotate_px4_body(tmp_path: Path, monkeypatch) -> None:
+def test_optical_only_attitude_rotates_px4_true_body_to_match(tmp_path: Path, monkeypatch) -> None:
+    """PX4's true body attitude is derived from the optical pose (no PX4
+    error injected here), so an optical-only change now also rotates
+    base_link's physical world pose -- while optical_link stays at identity
+    relative to base_link, and the sensor's actual global orientation still
+    matches a pure optical-RDF rotation by that yaw."""
+
     module = _launch_module()
     monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
     monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
     generated = module._generate_world(_context(module, cam_l_optical_yaw_deg=7.0))
     model = _camera_model(ET.parse(generated).getroot(), "left_stereo_camera")
-    assert _pose_rpy(model) == pytest.approx((0.0, 0.0, math.pi / 2.0), abs=1.0e-9)
-    nominal = rpy_to_rotation_world_from_link(0.0, 0.0, math.pi / 2.0)
-    actual = _global_optical_rotation(model)
-    with pytest.raises(AssertionError):
-        _assert_matrix_close(actual, nominal)
+    assert _pose_rpy(model) != pytest.approx((0.0, 0.0, math.pi / 2.0), abs=1.0e-9)
+    optical = model.find("./link[@name='optical_link']")
+    assert optical is not None
+    assert _pose_rpy(optical) == pytest.approx((0.0, 0.0, 0.0), abs=1.0e-9)
+    expected_world_rpy = sdf_link_rpy_from_optical_error(math.pi / 2.0, 0.0, 0.0, math.radians(7.0))
+    expected = rpy_to_rotation_world_from_link(*expected_world_rpy)
+    _assert_matrix_close(_global_optical_rotation(model), expected)
 
 
-def test_px4_only_attitude_does_not_rotate_optical_sensor(tmp_path: Path, monkeypatch) -> None:
+def test_px4_attitude_error_only_does_not_rotate_optical_sensor(tmp_path: Path, monkeypatch) -> None:
+    """Injecting a PX4 attitude error rotates base_link's physical pose (what
+    PX4 SITL reports as VehicleAttitude), but optical_link's compensating
+    mount offset keeps the camera's true physical optical pose unaffected."""
+
     module = _launch_module()
     monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
     monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
-    generated = module._generate_world(_context(module, cam_l_px4_roll_deg=5.0))
+    generated = module._generate_world(_context(module, cam_l_px4_attitude_error_roll_deg=5.0))
     model = _camera_model(ET.parse(generated).getroot(), "left_stereo_camera")
     assert _pose_rpy(model) != pytest.approx((0.0, 0.0, math.pi / 2.0), abs=1.0e-9)
     nominal = rpy_to_rotation_world_from_link(0.0, 0.0, math.pi / 2.0)

@@ -163,6 +163,7 @@ from stereo_ground_sim.coordinate_frames import (
     nominal_camera_poses,
     project_world_point_to_pixel,
     effective_optical_rpy_errors_deg,
+    relative_rotation_angle_deg,
     validate_rotation_matrix,
 )
 from stereo_ground_sim.gps_baseline import (
@@ -204,6 +205,25 @@ PX4_CAMERA_EXTRINSIC_SOURCE_FILE = (
 PX4_CAMERA_EXTRINSIC_SOURCE_TYPE = "sdf_fixed_joint_axis_contract"
 PX4_CAMERA_EXTRINSIC_PARENT_LINK = "base_link"
 PX4_CAMERA_EXTRINSIC_CHILD_LINK = "optical_link"
+# PX4's true body attitude is derived from the Gazebo actual optical pose
+# (not configured as an independent absolute attitude); a deterministic
+# body-local fixed-bias error is then right-multiplied on top of that true
+# attitude to produce what PX4 SITL spawns at and reports as VehicleAttitude.
+PX4_ATTITUDE_MODEL_VERSION = "optical_derived_body_attitude_v1"
+PX4_ATTITUDE_REFERENCE_SOURCE = "gazebo_actual_optical_pose"
+PX4_ATTITUDE_ERROR_FRAME = "body_frd_local"
+PX4_ATTITUDE_ERROR_COMPOSITION = "right_multiply"
+# research_recording.PAIR_RECORD_COLUMNS keeps its pre-existing
+# cam_l_px4_roll_deg-style column names for schema-migration compatibility;
+# map this node's renamed *_attitude_error_* parameter names onto them.
+PX4_ATTITUDE_ERROR_TO_LEGACY_RESEARCH_COLUMN = {
+    "cam_l_px4_attitude_error_roll_deg": "cam_l_px4_roll_deg",
+    "cam_l_px4_attitude_error_pitch_deg": "cam_l_px4_pitch_deg",
+    "cam_l_px4_attitude_error_yaw_deg": "cam_l_px4_yaw_deg",
+    "cam_r_px4_attitude_error_roll_deg": "cam_r_px4_roll_deg",
+    "cam_r_px4_attitude_error_pitch_deg": "cam_r_px4_pitch_deg",
+    "cam_r_px4_attitude_error_yaw_deg": "cam_r_px4_yaw_deg",
+}
 GPS_BASELINE_ANCHOR_POLICY = (
     "nominal_left_optical_center_plus_px4_relative_enu_separation"
 )
@@ -445,12 +465,12 @@ class StereoDistanceNode(Node):
         self.declare_parameter("cam_r_optical_roll_deg", 0.0)
         self.declare_parameter("cam_r_optical_pitch_deg", 0.0)
         self.declare_parameter("cam_r_optical_yaw_deg", 0.0)
-        self.declare_parameter("cam_l_px4_roll_deg", 0.0)
-        self.declare_parameter("cam_l_px4_pitch_deg", 0.0)
-        self.declare_parameter("cam_l_px4_yaw_deg", 0.0)
-        self.declare_parameter("cam_r_px4_roll_deg", 0.0)
-        self.declare_parameter("cam_r_px4_pitch_deg", 0.0)
-        self.declare_parameter("cam_r_px4_yaw_deg", 0.0)
+        self.declare_parameter("cam_l_px4_attitude_error_roll_deg", 0.0)
+        self.declare_parameter("cam_l_px4_attitude_error_pitch_deg", 0.0)
+        self.declare_parameter("cam_l_px4_attitude_error_yaw_deg", 0.0)
+        self.declare_parameter("cam_r_px4_attitude_error_roll_deg", 0.0)
+        self.declare_parameter("cam_r_px4_attitude_error_pitch_deg", 0.0)
+        self.declare_parameter("cam_r_px4_attitude_error_yaw_deg", 0.0)
         self.declare_parameter("common_optical_roll_error_deg", 0.0)
         self.declare_parameter("relative_optical_roll_error_deg", 0.0)
         self.declare_parameter("common_optical_pitch_error_deg", 0.0)
@@ -1166,6 +1186,11 @@ class StereoDistanceNode(Node):
             "px4_attitude_pair_skew_s": self.px4_attitude_pair_skew_s,
             "px4_quaternion_order": "wxyz",
             "px4_attitude_semantics": "body_frd_to_earth_ned",
+            "px4_attitude_model_version": PX4_ATTITUDE_MODEL_VERSION,
+            "px4_attitude_reference_source": PX4_ATTITUDE_REFERENCE_SOURCE,
+            "px4_attitude_error_frame": PX4_ATTITUDE_ERROR_FRAME,
+            "px4_attitude_error_composition": PX4_ATTITUDE_ERROR_COMPOSITION,
+            "legacy_px4_absolute_attitude_used": False,
             "left_R_body_from_optical": [
                 list(row) for row in PX4_BODY_FRD_FROM_OPTICAL_RDF
             ],
@@ -1295,12 +1320,12 @@ class StereoDistanceNode(Node):
             "cam_r_optical_roll_deg",
             "cam_r_optical_pitch_deg",
             "cam_r_optical_yaw_deg",
-            "cam_l_px4_roll_deg",
-            "cam_l_px4_pitch_deg",
-            "cam_l_px4_yaw_deg",
-            "cam_r_px4_roll_deg",
-            "cam_r_px4_pitch_deg",
-            "cam_r_px4_yaw_deg",
+            "cam_l_px4_attitude_error_roll_deg",
+            "cam_l_px4_attitude_error_pitch_deg",
+            "cam_l_px4_attitude_error_yaw_deg",
+            "cam_r_px4_attitude_error_roll_deg",
+            "cam_r_px4_attitude_error_pitch_deg",
+            "cam_r_px4_attitude_error_yaw_deg",
             "common_optical_roll_error_deg",
             "relative_optical_roll_error_deg",
             "common_optical_pitch_error_deg",
@@ -1720,6 +1745,16 @@ class StereoDistanceNode(Node):
             )
         except ValueError:
             return finish(None, "invalid_px4_attitude", provenance)
+        try:
+            provenance["left_attitude_truth_residual_deg"] = relative_rotation_angle_deg(
+                left_pose, poses[0]
+            )
+            provenance["right_attitude_truth_residual_deg"] = relative_rotation_angle_deg(
+                right_pose, poses[1]
+            )
+        except ValueError:
+            provenance["left_attitude_truth_residual_deg"] = None
+            provenance["right_attitude_truth_residual_deg"] = None
         return finish(poses, "available", provenance)
 
     def _global_baseline_callback(self, camera_label, message):
@@ -2176,6 +2211,12 @@ class StereoDistanceNode(Node):
                 "angle_unit": "deg",
                 "timestamp_unit": "ns",
                 "correction_source": "gazebo_observed_optical_pose",
+                "px4_attitude_model_version": PX4_ATTITUDE_MODEL_VERSION,
+                "px4_attitude_reference_source": PX4_ATTITUDE_REFERENCE_SOURCE,
+                "px4_attitude_error_frame": PX4_ATTITUDE_ERROR_FRAME,
+                "px4_attitude_error_composition": PX4_ATTITUDE_ERROR_COMPOSITION,
+                "px4_attitude_quaternion_order": "wxyz",
+                "legacy_px4_absolute_attitude_used": False,
             }
         )
         record.update(
@@ -2185,7 +2226,9 @@ class StereoDistanceNode(Node):
         )
         record.update(self._diagnostic_research_record_fields(metrics))
         for name in self._attitude_parameter_names():
-            record[name] = getattr(self, name)
+            record[
+                PX4_ATTITUDE_ERROR_TO_LEGACY_RESEARCH_COLUMN.get(name, name)
+            ] = getattr(self, name)
         for name in (
             "effective_left_optical_roll_error_deg",
             "effective_left_optical_pitch_error_deg",
@@ -3101,6 +3144,12 @@ class StereoDistanceNode(Node):
             ):
                 fields[f"{record_prefix}_{field}"] = result.get(field)
             fields[f"{record_prefix}_gap_m"] = result.get("ray_gap_m")
+            fields[f"{record_prefix}_left_attitude_truth_residual_deg"] = result.get(
+                "left_attitude_truth_residual_deg"
+            )
+            fields[f"{record_prefix}_right_attitude_truth_residual_deg"] = result.get(
+                "right_attitude_truth_residual_deg"
+            )
             for source, target in (
                 ("midpoint_baseline_center_frd_m", "midpoint"),
                 ("point_on_left_ray_baseline_center_frd_m", "left_closest"),
@@ -3371,12 +3420,12 @@ class StereoDistanceNode(Node):
             "cam_r_optical_roll_deg",
             "cam_r_optical_pitch_deg",
             "cam_r_optical_yaw_deg",
-            "cam_l_px4_roll_deg",
-            "cam_l_px4_pitch_deg",
-            "cam_l_px4_yaw_deg",
-            "cam_r_px4_roll_deg",
-            "cam_r_px4_pitch_deg",
-            "cam_r_px4_yaw_deg",
+            "cam_l_px4_attitude_error_roll_deg",
+            "cam_l_px4_attitude_error_pitch_deg",
+            "cam_l_px4_attitude_error_yaw_deg",
+            "cam_r_px4_attitude_error_roll_deg",
+            "cam_r_px4_attitude_error_pitch_deg",
+            "cam_r_px4_attitude_error_yaw_deg",
             "common_optical_roll_error_deg",
             "relative_optical_roll_error_deg",
             "common_optical_pitch_error_deg",
@@ -5342,12 +5391,18 @@ class StereoDistanceNode(Node):
             "cam_r_optical_roll_deg": self.cam_r_optical_roll_deg,
             "cam_r_optical_pitch_deg": self.cam_r_optical_pitch_deg,
             "cam_r_optical_yaw_deg": self.cam_r_optical_yaw_deg,
-            "cam_l_px4_roll_deg": self.cam_l_px4_roll_deg,
-            "cam_l_px4_pitch_deg": self.cam_l_px4_pitch_deg,
-            "cam_l_px4_yaw_deg": self.cam_l_px4_yaw_deg,
-            "cam_r_px4_roll_deg": self.cam_r_px4_roll_deg,
-            "cam_r_px4_pitch_deg": self.cam_r_px4_pitch_deg,
-            "cam_r_px4_yaw_deg": self.cam_r_px4_yaw_deg,
+            "cam_l_px4_attitude_error_roll_deg": self.cam_l_px4_attitude_error_roll_deg,
+            "cam_l_px4_attitude_error_pitch_deg": self.cam_l_px4_attitude_error_pitch_deg,
+            "cam_l_px4_attitude_error_yaw_deg": self.cam_l_px4_attitude_error_yaw_deg,
+            "cam_r_px4_attitude_error_roll_deg": self.cam_r_px4_attitude_error_roll_deg,
+            "cam_r_px4_attitude_error_pitch_deg": self.cam_r_px4_attitude_error_pitch_deg,
+            "cam_r_px4_attitude_error_yaw_deg": self.cam_r_px4_attitude_error_yaw_deg,
+            "px4_attitude_model_version": PX4_ATTITUDE_MODEL_VERSION,
+            "px4_attitude_reference_source": PX4_ATTITUDE_REFERENCE_SOURCE,
+            "px4_attitude_error_frame": PX4_ATTITUDE_ERROR_FRAME,
+            "px4_attitude_error_composition": PX4_ATTITUDE_ERROR_COMPOSITION,
+            "px4_attitude_quaternion_order": "wxyz",
+            "legacy_px4_absolute_attitude_used": False,
             "common_optical_roll_error_deg": self.common_optical_roll_error_deg,
             "relative_optical_roll_error_deg": self.relative_optical_roll_error_deg,
             "common_optical_pitch_error_deg": self.common_optical_pitch_error_deg,
@@ -7149,6 +7204,8 @@ class StereoDistanceNode(Node):
             "gps_baseline_delta_norm_m",
             "gps_left_eph_m",
             "gps_right_eph_m",
+            "left_attitude_truth_residual_deg",
+            "right_attitude_truth_residual_deg",
         ):
             if name in result:
                 payload[name] = cls._json_number(result.get(name))

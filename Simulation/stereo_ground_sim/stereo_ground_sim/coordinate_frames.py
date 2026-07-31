@@ -463,6 +463,42 @@ def relative_sdf_rpy(
     return rotation_to_sdf_rpy(rotation_parent_from_child)
 
 
+def sdf_pose_rpy_from_camera_pose(camera_pose: "CameraOpticalPose") -> Vector3:
+    """Inverse of ``camera_optical_pose_from_sdf_pose``.
+
+    Given a camera's Right/Down/Forward world-ENU basis, return the SDF world
+    ``roll pitch yaw`` for a link whose local ``+X, +Y, +Z`` are Optical
+    ``Forward, -Right, -Down`` (the same convention already used for
+    ``optical_link`` and, by the fixed zero-relative-pose mount, for
+    ``base_link``). Round-trips exactly through
+    ``camera_optical_pose_from_sdf_pose``.
+    """
+
+    forward = _finite_vector(camera_pose.forward_world_enu, "forward_world_enu")
+    right = _finite_vector(camera_pose.right_world_enu, "right_world_enu")
+    down = _finite_vector(camera_pose.down_world_enu, "down_world_enu")
+    rotation = _transpose((forward, _scale(right, -1.0), _scale(down, -1.0)))
+    return rotation_to_sdf_rpy(rotation)
+
+
+def relative_rotation_angle_deg(pose_a: "CameraOpticalPose", pose_b: "CameraOpticalPose") -> float:
+    """Return the angular magnitude, in degrees, of the rotation relating two
+    optical bases (e.g. a PX4-reported reconstruction versus the Gazebo
+    actual/true optical pose for the same camera).
+
+    Uses the full 3-DOF relative rotation (``arccos((trace(R)-1)/2)``), not a
+    per-axis Euler difference, so a pure-roll or pure-yaw residual is not
+    missed by comparing only the Forward axis.
+    """
+
+    basis_a = _validated_camera_basis(pose_a)
+    basis_b = _validated_camera_basis(pose_b)
+    relative = _mat_mul(_transpose(basis_a), basis_b)
+    trace = relative[0][0] + relative[1][1] + relative[2][2]
+    cos_angle = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+    return math.degrees(math.acos(cos_angle))
+
+
 def camera_optical_pose_from_sdf_pose(
     center_world_enu_m: Sequence[float],
     rpy_rad: Sequence[float],
@@ -659,11 +695,13 @@ __all__ = [
     "normalize",
     "optical_rpy_error_rotation",
     "project_world_point_to_pixel",
+    "relative_rotation_angle_deg",
     "rpy_to_rotation_world_from_link",
     "rotation_to_sdf_rpy",
     "relative_sdf_rpy",
     "rotation_world_from_quaternion_xyzw",
     "sdf_link_rpy_from_optical_error",
     "sdf_link_rpy_from_px4_frd_error",
+    "sdf_pose_rpy_from_camera_pose",
     "validate_rotation_matrix",
 ]

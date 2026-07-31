@@ -5961,7 +5961,7 @@ ros2 param set /stereo_distance_node yolo_class_name drone
 `stereo_ground_sim/worlds/stereo_ground_drone.sdf`에서 수정합니다.
 기본 ground는 `4000 m x 4000 m`이고 월드 기준 x=0..4000, y=-2000..2000 범위를 덮습니다. 실행 시 `stereo_ground_sim.launch.py`가 같은 범위에 100 m 간격 grid line visual을 생성합니다. 카메라 모델 원점은 sensor optical center이고, Gazebo GUI 확인용 본체와 렌즈 visual은 그 기준점 뒤쪽에 배치됩니다.
 
-카메라 optical 자세와 카메라 PX4 자세는 `config/simulation.env`에서 독립적으로 설정합니다. `CAM_L/R_OPTICAL_*`은 image sensor가 실제로 바라보는 방향이고, `CAM_L/R_PX4_*`은 각 카메라 PX4의 `base_link`와 IMU가 인식하는 방향입니다.
+카메라 optical 자세는 `config/simulation.env`의 `CAM_L/R_OPTICAL_*`로 설정하며, 이것이 image sensor가 실제로 바라보는 물리적 방향(Gazebo actual optical pose)입니다. PX4 attitude는 더 이상 독립적인 절대각이 아닙니다. 각 카메라 PX4의 true body attitude는 고정된 zero-relative-pose body↔optical extrinsic을 통해 바로 그 optical pose에서 유도되며, `CAM_L/R_PX4_ATTITUDE_ERROR_*`는 그 위에 합성하는 deterministic body-local(PX4 FRD) fixed-bias 오차입니다. 오차가 0이면 PX4가 보고하는 attitude에서 재구성한 optical orientation은 Gazebo actual optical orientation과 (수치오차 내에서) 같습니다.
 
 ```bash
 CAM_L_OPTICAL_ROLL_DEG=0.0
@@ -5969,15 +5969,15 @@ CAM_L_OPTICAL_PITCH_DEG=0.0
 CAM_L_OPTICAL_YAW_DEG=0.0
 CAM_R_OPTICAL_YAW_DEG=0.25
 
-CAM_L_PX4_ROLL_DEG=0.0
-CAM_L_PX4_PITCH_DEG=0.0
-CAM_L_PX4_YAW_DEG=0.0
-CAM_R_PX4_ROLL_DEG=0.0
-CAM_R_PX4_PITCH_DEG=0.0
-CAM_R_PX4_YAW_DEG=0.0
+CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG=0.0
+CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG=0.0
+CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG=0.0
+CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG=0.0
+CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG=0.0
+CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG=0.0
 ```
 
-`CAM_L_OPTICAL_*`만 변경하면 실제 left optical frame만 회전하고 left PX4 attitude는 nominal로 유지됩니다. 반대로 `CAM_L_PX4_*`만 변경하면 left PX4 body/IMU가 회전하지만 generated fixed transform이 optical sensor의 world attitude를 보존합니다. 파일을 저장한 뒤 `./run_operator_view.sh`를 다시 실행하면 적용되며, 명령줄 인자가 우선합니다.
+`CAM_L_OPTICAL_*`를 변경하면 left optical frame이 회전하고, PX4 attitude error가 0인 한 left PX4 true body attitude도 같은 물리적 방향으로 함께 회전합니다(둘이 독립이 아님). `CAM_L_PX4_ATTITUDE_ERROR_*`만 변경하면 left PX4 body/IMU가 그 오차만큼 회전해 PX4 SITL이 보고하는 VehicleAttitude가 바뀌지만, generated SDF의 `optical_link` 장착 오프셋이 그 오차를 보정하므로 optical sensor의 실제 world attitude는 그대로 유지됩니다. 옛 `CAM_L/R_PX4_ROLL/PITCH/YAW_DEG` 이름은 더 이상 존재하지 않으며, 남아 있으면 `./run_operator_view.sh`가 시작 전에 즉시 실패합니다. 파일을 저장한 뒤 `./run_operator_view.sh`를 다시 실행하면 적용되며, 명령줄 인자가 우선합니다.
 
 PX4 waypoint 경로도 같은 `config/simulation.env`에서 설정합니다.
 

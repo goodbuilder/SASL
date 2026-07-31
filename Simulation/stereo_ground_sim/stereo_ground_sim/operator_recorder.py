@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - allows recorder shell/tests without PX
 cv2 = None
 _CLOSING = False
 AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
-XLSX_SCHEMA_VERSION = "5"
+XLSX_SCHEMA_VERSION = "6"
 
 
 NUMERIC_TOPICS = {
@@ -226,6 +226,8 @@ RAY_NUMERIC_KEYS = (
     ("gps_baseline_delta_norm_m", "gps_baseline_delta_norm_m"),
     ("gps_left_eph_m", "gps_left_eph_m"),
     ("gps_right_eph_m", "gps_right_eph_m"),
+    ("left_attitude_truth_residual_deg", "left_attitude_truth_residual_deg"),
+    ("right_attitude_truth_residual_deg", "right_attitude_truth_residual_deg"),
     ("left_attitude_timestamp_us", "left_attitude_timestamp_us"),
     ("right_attitude_timestamp_us", "right_attitude_timestamp_us"),
     ("left_attitude_receive_monotonic_ns", "left_attitude_receive_monotonic_ns"),
@@ -1679,6 +1681,36 @@ class OperatorRecorder(Node):
                 ("yolo_imgsz", os.environ.get("YOLO_IMGSZ", "unknown")),
                 ("yolo_target_hz", os.environ.get("YOLO_TARGET_HZ", "20.0")),
                 ("camera_pair_target_hz", os.environ.get("CAMERA_UPDATE_RATE_HZ", "20.0")),
+                ("px4_attitude_model_version", "optical_derived_body_attitude_v1"),
+                ("px4_attitude_reference_source", "gazebo_actual_optical_pose"),
+                ("px4_attitude_error_frame", "body_frd_local"),
+                ("px4_attitude_error_composition", "right_multiply"),
+                ("px4_attitude_quaternion_order", "wxyz"),
+                ("legacy_px4_absolute_attitude_used", "false"),
+                (
+                    "left_px4_attitude_error_roll_deg",
+                    os.environ.get("CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0"),
+                ),
+                (
+                    "left_px4_attitude_error_pitch_deg",
+                    os.environ.get("CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0"),
+                ),
+                (
+                    "left_px4_attitude_error_yaw_deg",
+                    os.environ.get("CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0"),
+                ),
+                (
+                    "right_px4_attitude_error_roll_deg",
+                    os.environ.get("CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0"),
+                ),
+                (
+                    "right_px4_attitude_error_pitch_deg",
+                    os.environ.get("CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0"),
+                ),
+                (
+                    "right_px4_attitude_error_yaw_deg",
+                    os.environ.get("CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0"),
+                ),
             )
         )
         return tuple(rows)

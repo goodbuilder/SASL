@@ -14,10 +14,12 @@ from launch_ros.substitutions import FindPackageShare
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
 from stereo_ground_sim.coordinate_frames import (
+    apply_optical_rpy_error,
     effective_optical_rpy_errors_deg,
+    nominal_camera_poses,
     relative_sdf_rpy,
     sdf_link_rpy_from_optical_error,
-    sdf_link_rpy_from_px4_frd_error,
+    sdf_pose_rpy_from_camera_pose,
 )
 
 
@@ -114,12 +116,12 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "cam_r_optical_roll_deg",
         "cam_r_optical_pitch_deg",
         "cam_r_optical_yaw_deg",
-        "cam_l_px4_roll_deg",
-        "cam_l_px4_pitch_deg",
-        "cam_l_px4_yaw_deg",
-        "cam_r_px4_roll_deg",
-        "cam_r_px4_pitch_deg",
-        "cam_r_px4_yaw_deg",
+        "cam_l_px4_attitude_error_roll_deg",
+        "cam_l_px4_attitude_error_pitch_deg",
+        "cam_l_px4_attitude_error_yaw_deg",
+        "cam_r_px4_attitude_error_roll_deg",
+        "cam_r_px4_attitude_error_pitch_deg",
+        "cam_r_px4_attitude_error_yaw_deg",
         "common_optical_roll_error_deg",
         "relative_optical_roll_error_deg",
         "common_optical_pitch_error_deg",
@@ -185,12 +187,12 @@ def _write_distance_node_params(context, *, camera_oracle_generated_sdf_sha256="
         "cam_r_optical_roll_deg",
         "cam_r_optical_pitch_deg",
         "cam_r_optical_yaw_deg",
-        "cam_l_px4_roll_deg",
-        "cam_l_px4_pitch_deg",
-        "cam_l_px4_yaw_deg",
-        "cam_r_px4_roll_deg",
-        "cam_r_px4_pitch_deg",
-        "cam_r_px4_yaw_deg",
+        "cam_l_px4_attitude_error_roll_deg",
+        "cam_l_px4_attitude_error_pitch_deg",
+        "cam_l_px4_attitude_error_yaw_deg",
+        "cam_r_px4_attitude_error_roll_deg",
+        "cam_r_px4_attitude_error_pitch_deg",
+        "cam_r_px4_attitude_error_yaw_deg",
         "common_optical_roll_error_deg",
         "relative_optical_roll_error_deg",
         "common_optical_pitch_error_deg",
@@ -350,28 +352,51 @@ def _generate_world(context):
         nominal_link_yaw,
         *(math.radians(value) for value in right_effective_rpy_deg),
     )
-    left_px4_world_rpy = sdf_link_rpy_from_px4_frd_error(
-        nominal_link_yaw,
+    # PX4's *true* body attitude is derived from the Gazebo actual optical
+    # pose through the fixed zero-relative-pose body<->optical extrinsic
+    # (nominal_left_camera/nominal_right_camera at the same effective RPY
+    # used for optical_link above), not configured independently. The
+    # deterministic PX4 attitude error is then injected body-locally, on top
+    # of that true attitude, using the same right-multiply RDF/FRD RPY
+    # convention as the optical error above (roll about Forward, pitch about
+    # Right, yaw about Down -- see coordinate_frames.optical_rpy_error_rotation).
+    # optical_link's pose stays relative to base_link's *reported* (post-error)
+    # world attitude, so injecting a PX4 error rotates the physical body (and
+    # therefore what PX4 SITL reports as VehicleAttitude) without moving the
+    # camera's true physical optical pose.
+    nominal_left_camera, nominal_right_camera = nominal_camera_poses(baseline_m, camera_height_m)
+    left_true_optical_pose = apply_optical_rpy_error(
+        nominal_left_camera,
+        *(math.radians(value) for value in left_effective_rpy_deg),
+    )
+    right_true_optical_pose = apply_optical_rpy_error(
+        nominal_right_camera,
+        *(math.radians(value) for value in right_effective_rpy_deg),
+    )
+    left_px4_reported_pose = apply_optical_rpy_error(
+        left_true_optical_pose,
         *(
             math.radians(_float_config(context, name))
             for name in (
-                "cam_l_px4_roll_deg",
-                "cam_l_px4_pitch_deg",
-                "cam_l_px4_yaw_deg",
+                "cam_l_px4_attitude_error_roll_deg",
+                "cam_l_px4_attitude_error_pitch_deg",
+                "cam_l_px4_attitude_error_yaw_deg",
             )
         ),
     )
-    right_px4_world_rpy = sdf_link_rpy_from_px4_frd_error(
-        nominal_link_yaw,
+    right_px4_reported_pose = apply_optical_rpy_error(
+        right_true_optical_pose,
         *(
             math.radians(_float_config(context, name))
             for name in (
-                "cam_r_px4_roll_deg",
-                "cam_r_px4_pitch_deg",
-                "cam_r_px4_yaw_deg",
+                "cam_r_px4_attitude_error_roll_deg",
+                "cam_r_px4_attitude_error_pitch_deg",
+                "cam_r_px4_attitude_error_yaw_deg",
             )
         ),
     )
+    left_px4_world_rpy = sdf_pose_rpy_from_camera_pose(left_px4_reported_pose)
+    right_px4_world_rpy = sdf_pose_rpy_from_camera_pose(right_px4_reported_pose)
     left_optical_relative_rpy = relative_sdf_rpy(
         left_px4_world_rpy,
         left_optical_world_rpy,
@@ -797,12 +822,12 @@ def generate_launch_description():
             DeclareLaunchArgument("cam_r_optical_roll_deg", default_value="0.0"),
             DeclareLaunchArgument("cam_r_optical_pitch_deg", default_value="0.0"),
             DeclareLaunchArgument("cam_r_optical_yaw_deg", default_value="0.0"),
-            DeclareLaunchArgument("cam_l_px4_roll_deg", default_value="0.0"),
-            DeclareLaunchArgument("cam_l_px4_pitch_deg", default_value="0.0"),
-            DeclareLaunchArgument("cam_l_px4_yaw_deg", default_value="0.0"),
-            DeclareLaunchArgument("cam_r_px4_roll_deg", default_value="0.0"),
-            DeclareLaunchArgument("cam_r_px4_pitch_deg", default_value="0.0"),
-            DeclareLaunchArgument("cam_r_px4_yaw_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_px4_attitude_error_roll_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_px4_attitude_error_pitch_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_px4_attitude_error_yaw_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_px4_attitude_error_roll_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_px4_attitude_error_pitch_deg", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_px4_attitude_error_yaw_deg", default_value="0.0"),
             DeclareLaunchArgument("common_optical_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("relative_optical_roll_error_deg", default_value="0.0"),
             DeclareLaunchArgument("common_optical_pitch_error_deg", default_value="0.0"),

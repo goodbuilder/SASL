@@ -46,8 +46,8 @@ SIM_EXPLICIT_NAMES=(
   CAMERA_CLIP_NEAR_M CAMERA_CLIP_FAR_M
   CAM_L_OPTICAL_ROLL_DEG CAM_L_OPTICAL_PITCH_DEG CAM_L_OPTICAL_YAW_DEG
   CAM_R_OPTICAL_ROLL_DEG CAM_R_OPTICAL_PITCH_DEG CAM_R_OPTICAL_YAW_DEG
-  CAM_L_PX4_ROLL_DEG CAM_L_PX4_PITCH_DEG CAM_L_PX4_YAW_DEG
-  CAM_R_PX4_ROLL_DEG CAM_R_PX4_PITCH_DEG CAM_R_PX4_YAW_DEG
+  CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG
+  CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG
   CAM_L_PX4_MODEL_NAME CAM_R_PX4_MODEL_NAME CAM_L_PX4_INSTANCE CAM_R_PX4_INSTANCE
   CAM_L_PX4_DDS_NAMESPACE CAM_R_PX4_DDS_NAMESPACE
   PX4_REQUIRED_VERSION
@@ -67,6 +67,20 @@ SIM_EXPLICIT_NAMES=(
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
 load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
+
+for legacy_px4_attitude_var in \
+  CAM_L_PX4_ROLL_DEG CAM_L_PX4_PITCH_DEG CAM_L_PX4_YAW_DEG \
+  CAM_R_PX4_ROLL_DEG CAM_R_PX4_PITCH_DEG CAM_R_PX4_YAW_DEG
+do
+  if [[ -v "$legacy_px4_attitude_var" ]]; then
+    printf '%s\n' \
+      "error: $legacy_px4_attitude_var is obsolete; it used to set an independent absolute PX4 body attitude." \
+      "PX4's true body attitude is now derived from CAM_*_OPTICAL_*_DEG. Use" \
+      "CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG / CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG / CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG" \
+      "and the matching CAM_R_PX4_ATTITUDE_ERROR_* variables to inject a deterministic body-local attitude error instead." >&2
+    exit 2
+  fi
+done
 
 is_px4_checkout() {
   local candidate="${1:-}"
@@ -964,12 +978,12 @@ add_default_launch_arg cam_l_optical_yaw_deg "${CAM_L_OPTICAL_YAW_DEG:-0.0}" "${
 add_default_launch_arg cam_r_optical_roll_deg "${CAM_R_OPTICAL_ROLL_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg cam_r_optical_pitch_deg "${CAM_R_OPTICAL_PITCH_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg cam_r_optical_yaw_deg "${CAM_R_OPTICAL_YAW_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg cam_l_px4_roll_deg "${CAM_L_PX4_ROLL_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg cam_l_px4_pitch_deg "${CAM_L_PX4_PITCH_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg cam_l_px4_yaw_deg "${CAM_L_PX4_YAW_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg cam_r_px4_roll_deg "${CAM_R_PX4_ROLL_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg cam_r_px4_pitch_deg "${CAM_R_PX4_PITCH_DEG:-0.0}" "${launch_input[@]}"
-add_default_launch_arg cam_r_px4_yaw_deg "${CAM_R_PX4_YAW_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_px4_attitude_error_roll_deg "${CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_px4_attitude_error_pitch_deg "${CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_px4_attitude_error_yaw_deg "${CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_px4_attitude_error_roll_deg "${CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_px4_attitude_error_pitch_deg "${CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_px4_attitude_error_yaw_deg "${CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg common_optical_roll_error_deg "${COMMON_OPTICAL_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg relative_optical_roll_error_deg "${RELATIVE_OPTICAL_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg common_optical_pitch_error_deg "${COMMON_OPTICAL_PITCH_ERROR_DEG:-0.0}" "${launch_input[@]}"

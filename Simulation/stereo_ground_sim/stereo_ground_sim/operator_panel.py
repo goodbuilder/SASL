@@ -397,6 +397,26 @@ class TelemetryFacts(QWidget):
         self._detection_label.setText(self._detection_text)
 
 
+def _px4_attitude_error_env_values():
+    """Launch-time PX4 attitude error configuration for this run.
+
+    Fixed once at launch (baked into the generated SDF); relaunching is
+    required to change it, so a static os.environ read at construction time
+    always matches what was actually recorded for the run.
+    """
+
+    return {
+        "left": tuple(
+            os.environ.get(f"CAM_L_PX4_ATTITUDE_ERROR_{axis}_DEG", "0.0")
+            for axis in ("ROLL", "PITCH", "YAW")
+        ),
+        "right": tuple(
+            os.environ.get(f"CAM_R_PX4_ATTITUDE_ERROR_{axis}_DEG", "0.0")
+            for axis in ("ROLL", "PITCH", "YAW")
+        ),
+    }
+
+
 # Display labels only; mirrors stereo_distance_node.RAY_DISPLAY_NAMES without
 # importing the ROS node module into this rqt plugin process.
 RAY_DIAGNOSTICS_ROWS = (
@@ -621,9 +641,11 @@ class RayDiagnosticsPanel(QWidget):
         attitude_grid = QGridLayout(attitude_box)
         self._attitude_fields = {}
         attitude_rows = (
-            "Overall status", "Left age [ms]", "Right age [ms]", "Pair skew [ms]",
+            "Model", "Overall status", "Left age [ms]", "Right age [ms]", "Pair skew [ms]",
             "Left reset counter", "Right reset counter", "Simulation epoch",
             "Quaternion order", "Semantics",
+            "Left injected R/P/Y [deg]", "Right injected R/P/Y [deg]",
+            "Left residual [deg]", "Right residual [deg]",
         )
         for row_index, name in enumerate(attitude_rows):
             attitude_grid.addWidget(QLabel(name), row_index, 0)
@@ -635,6 +657,13 @@ class RayDiagnosticsPanel(QWidget):
         self._attitude_quaternion_label.setStyleSheet("color: #455a64;")
         attitude_grid.addWidget(self._attitude_quaternion_label, len(attitude_rows), 0, 1, 2)
         layout.addWidget(attitude_box)
+
+        # Fixed for the whole run (see the Setup tab's PX4 Attitude Error
+        # Injection group for the full tooltip / how to change it).
+        self._attitude_fields["Model"].setText("optical_derived_body_attitude_v1")
+        env_values = _px4_attitude_error_env_values()
+        self._attitude_fields["Left injected R/P/Y [deg]"].setText("/".join(env_values["left"]))
+        self._attitude_fields["Right injected R/P/Y [deg]"].setText("/".join(env_values["right"]))
 
         gps_box = QGroupBox("GPS Baseline")
         gps_grid = QGridLayout(gps_box)
@@ -763,6 +792,40 @@ class RayDiagnosticsPanel(QWidget):
             table.setItem(row_index, 7, reason_item)
         table.resizeColumnsToContents()
 
+    # Injected error near zero but residual above this is flagged
+    # REFERENCE_MISMATCH; this is a UI-only annotation, it never rewrites
+    # the runtime computation_status.
+    _REFERENCE_MISMATCH_TOLERANCE_DEG = 0.05
+    _INJECTED_ZERO_TOLERANCE_DEG = 1.0e-6
+
+    def _refresh_attitude_residual(self, side, residual_deg):
+        label = self._attitude_fields[f"{side} residual [deg]"]
+        label.setText(_fmt_num(residual_deg, 3))
+        env_values = _px4_attitude_error_env_values()
+        try:
+            injected = [float(value) for value in env_values[side.lower()]]
+        except (TypeError, ValueError):
+            injected = None
+        injected_is_zero = injected is not None and all(
+            abs(value) <= self._INJECTED_ZERO_TOLERANCE_DEG for value in injected
+        )
+        if (
+            injected_is_zero
+            and residual_deg is not None
+            and math.isfinite(residual_deg)
+            and residual_deg > self._REFERENCE_MISMATCH_TOLERANCE_DEG
+        ):
+            label.setStyleSheet("color: #b00020; font-weight: 600;")
+            label.setToolTip(
+                "REFERENCE_MISMATCH: injected error is 0 but the residual "
+                f"({residual_deg:.3f} deg) exceeds the "
+                f"{self._REFERENCE_MISMATCH_TOLERANCE_DEG} deg display tolerance. "
+                "This UI-only flag does not change computation_status."
+            )
+        else:
+            label.setStyleSheet("")
+            label.setToolTip("")
+
     def _refresh_sensors(self, data):
         full = data.get("full") if isinstance(data.get("full"), dict) else {}
         attitude = data.get("attitude") if isinstance(data.get("attitude"), dict) else {}
@@ -778,6 +841,8 @@ class RayDiagnosticsPanel(QWidget):
         self._attitude_fields["Simulation epoch"].setText(_fmt_int(attitude_source.get("simulation_epoch")))
         self._attitude_fields["Quaternion order"].setText(str(attitude_source.get("px4_quaternion_order") or "—"))
         self._attitude_fields["Semantics"].setText(str(attitude_source.get("px4_attitude_semantics") or "—"))
+        self._refresh_attitude_residual("Left", attitude_source.get("left_attitude_truth_residual_deg"))
+        self._refresh_attitude_residual("Right", attitude_source.get("right_attitude_truth_residual_deg"))
         left_q = tuple(_fmt_num(attitude_source.get(f"left_px4_q_{axis}"), 6) for axis in ("w", "x", "y", "z"))
         right_q = tuple(_fmt_num(attitude_source.get(f"right_px4_q_{axis}"), 6) for axis in ("w", "x", "y", "z"))
         self._attitude_quaternion_label.setToolTip(
@@ -1975,6 +2040,7 @@ class OperatorPanel(Plugin):
         layout.addWidget(
             QLabel("Raw GPS and GlobalPosition are recorded together for offline comparison."),
         )
+        layout.addWidget(self._build_px4_attitude_error_injection_group())
         layout.addWidget(QLabel("StereoCAM run parameters (/stereo_distance_node, read-only)"))
         self._runtime_parameters = QPlainTextEdit()
         self._runtime_parameters.setReadOnly(True)
@@ -1987,6 +2053,36 @@ class OperatorPanel(Plugin):
         layout.addWidget(self._refresh_parameters_button)
         layout.addWidget(self._recording_controls)
         return tab
+
+    def _build_px4_attitude_error_injection_group(self):
+        group = QGroupBox("PX4 Attitude Error Injection")
+        group.setToolTip(
+            "True attitude source:\n"
+            "  Gazebo actual camera optical pose\n"
+            "Conversion:\n"
+            "  Optical RDF / Gazebo ENU -> Body FRD / PX4 NED\n"
+            "Error frame:\n"
+            "  PX4 body-local FRD\n"
+            "Composition:\n"
+            "  true body attitude x error rotation (right-multiply)\n"
+            "Recorded model: optical_derived_body_attitude_v1\n"
+            "This is fixed for the whole run: set CAM_L/R_PX4_ATTITUDE_ERROR_{ROLL,PITCH,YAW}_DEG "
+            "in config/simulation.env before launching, then relaunch to change it."
+        )
+        layout = QGridLayout(group)
+        env_values = _px4_attitude_error_env_values()
+        headers = ("Roll error [deg]", "Pitch error [deg]", "Yaw error [deg]")
+        for column, header in enumerate(headers, start=1):
+            header_label = QLabel(header)
+            header_label.setStyleSheet("font-weight: 600;")
+            layout.addWidget(header_label, 0, column)
+        for row, side in ((1, "left"), (2, "right")):
+            layout.addWidget(QLabel(side.capitalize()), row, 0)
+            for column, value in enumerate(env_values[side], start=1):
+                value_label = QLabel(value)
+                value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                layout.addWidget(value_label, row, column)
+        return group
 
     def _build_flight_tab(self):
         tab = QWidget()

@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v4"
-LEGACY_RESEARCH_SCHEMA_VERSIONS = frozenset({"s2_atomic_pair_v3"})
+RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v5"
+LEGACY_RESEARCH_SCHEMA_VERSIONS = frozenset({"s2_atomic_pair_v3", "s2_atomic_pair_v4"})
 
 
 def _diagnostic_record_extension_columns() -> tuple[str, ...]:
@@ -54,6 +54,8 @@ def _diagnostic_record_extension_columns() -> tuple[str, ...]:
                 f"{prefix}_ray_gt_down_error_m",
                 f"{prefix}_ray_gt_range_error_m",
                 f"{prefix}_ray_gt_position_error_m",
+                f"{prefix}_ray_left_attitude_truth_residual_deg",
+                f"{prefix}_ray_right_attitude_truth_residual_deg",
                 f"{prefix}_ray_pixel_source",
                 f"{prefix}_ray_attitude_source",
                 f"{prefix}_ray_camera_center_source",
@@ -142,6 +144,13 @@ PAIR_RECORD_COLUMNS = (
     "right_camera_oracle_optical_qz", "right_camera_oracle_optical_qw",
     "cam_l_optical_roll_deg", "cam_l_optical_pitch_deg", "cam_l_optical_yaw_deg",
     "cam_r_optical_roll_deg", "cam_r_optical_pitch_deg", "cam_r_optical_yaw_deg",
+    # These four columns keep their v3/v4 names for schema-migration
+    # compatibility (validate_pair_record's legacy path matches on an exact
+    # subset of PAIR_RECORD_COLUMNS). Since the optical_derived_body_attitude_v1
+    # model, they hold the deterministic PX4 body-local attitude *error*
+    # (cam_l_px4_attitude_error_roll_deg etc on the node), not an independent
+    # absolute PX4 attitude -- see px4_attitude_model_version and
+    # legacy_px4_absolute_attitude_used below.
     "cam_l_px4_roll_deg", "cam_l_px4_pitch_deg", "cam_l_px4_yaw_deg",
     "cam_r_px4_roll_deg", "cam_r_px4_pitch_deg", "cam_r_px4_yaw_deg",
     "common_optical_roll_error_deg", "relative_optical_roll_error_deg",
@@ -215,6 +224,9 @@ PAIR_RECORD_COLUMNS = (
     "research_recording_error_count", "output_frame", "output_axes",
     "position_unit", "pixel_unit", "angle_unit", "timestamp_unit",
     "correction_source", *DIAGNOSTIC_RECORD_EXTENSION_COLUMNS,
+    "px4_attitude_model_version", "px4_attitude_reference_source",
+    "px4_attitude_error_frame", "px4_attitude_error_composition",
+    "px4_attitude_quaternion_order", "legacy_px4_absolute_attitude_used",
 )
 
 IDENTITY_FIELDS = (
