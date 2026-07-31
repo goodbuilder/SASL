@@ -179,10 +179,21 @@ ros2 launch pose_simulation pose_simulation_ui.launch.py
 
 The UI roles are intentionally separate:
 
-- rqt (`PoseSimulationPlugin`) shows status, validity, source provenance,
-  numeric errors, time alignment, diagnostics, and bounded trends in the five
-  tabs `Overview`, `Pose Error`, `Stereo Geometry`, `Reference & Time`, and
-  `Trends`.
+- rqt (`PoseSimulationPlugin`) is a read-only operator view with the tabs
+  `Overview`, `Camera`, `Pose Error`, `Stereo Geometry`, `Reference & Time`,
+  `Trends`, and `Diagnostics`. The header keeps the overall state, evaluation
+  identity, simulation time, GT/left/right/frame badges, and a non-interactive
+  `Read-only` badge. Invalid or unaligned values are shown as `—`, never as
+  zero; raw enum values and nanosecond timestamps remain in `Diagnostics`.
+- The Camera tab reads the external Simulation overlay streams
+  `/left_camera/detection_image` and `/right_camera/detection_image` as
+  `sensor_msgs/msg/Image` with sensor-data QoS. It uses a latest-frame-wins
+  buffer and displays an explicit unavailable state when a source is absent;
+  PoseSimulation does not create, alter, or overlay the image stream.
+- Trends use a 2×2 layout for relative attitude, optical alignment, time
+  alignment, and baseline stability. Invalid evaluations insert a visual gap
+  and are not converted to zero. The baseline plot switches between metres
+  and degrees so unlike units never share one axis.
 - RViz uses `gazebo_world_enu` as Fixed Frame and consumes
   `/pose_simulation/visualization/markers` for actual optical poses,
   GT/RTK ideal poses, target/LOS rays, baseline geometry, and error labels.
@@ -192,9 +203,11 @@ The UI roles are intentionally separate:
 
 RTK markers are deleted when the current RTK sample is invalid or stale; a
 previous valid RTK marker is never silently presented as current. The rqt
-trend pause button pauses only display accumulation. The UI always displays
-`DIAGNOSTIC ONLY — NO POSE COMMAND`; it has no pose controls, Interactive
-Markers, `/set_pose` caller, or correction path.
+trend pause button pauses only screen refresh; subscriptions and the bounded
+buffer continue. The UI displays a small
+`Read-only` badge with the tooltip `Diagnostic only — no pose command
+publisher`; it has no pose controls, Interactive Markers, `/set_pose` caller,
+or correction path.
 
 UI launch arguments include `start_pose_simulation`, `start_visualization`,
 `start_rqt`, `start_rviz`, `namespace`, `rviz_config`, `ui_config`, and

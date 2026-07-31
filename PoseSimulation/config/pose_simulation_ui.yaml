@@ -3,6 +3,16 @@
 # to a node as undeclared ROS parameters.
 namespace: /pose_simulation
 trend_buffer_size: 6000
+default_window_s: 30.0
+
+# These are external read-only camera streams published by the Simulation
+# camera bridge/overlay.  PoseSimulation does not create or modify them.
+camera:
+  enabled: true
+  left_topic: /left_camera/detection_image
+  right_topic: /right_camera/detection_image
+  message_type: sensor_msgs/msg/Image
+  display_max_hz: 20.0
 
 visualization:
   ray_mode: normalized
