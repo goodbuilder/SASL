@@ -1,0 +1,17 @@
+<library path="src">
+  <class name="PoseSimulationPlugin" type="pose_simulation_rqt.pose_simulation_plugin.PoseSimulationPlugin" base_class_type="rqt_gui_py::Plugin">
+    <description>
+      Read-only status, metric, validity, and trend UI for PoseSimulation diagnostics.
+    </description>
+    <qtgui>
+      <group>
+        <label>PoseSimulation</label>
+        <icon type="theme">video-display</icon>
+        <statustip>PoseSimulation diagnostic-only UI.</statustip>
+      </group>
+      <label>PoseSimulation</label>
+      <icon type="theme">video-display</icon>
+      <statustip>Read-only pose, stereo geometry, reference, time, and trend diagnostics.</statustip>
+    </qtgui>
+  </class>
+</library>

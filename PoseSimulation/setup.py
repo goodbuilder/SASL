@@ -23,10 +23,20 @@ setup(
             "share/ament_index/resource_index/packages",
             [os.path.join("resource", package_name)],
         ),
-        (os.path.join("share", package_name), ["package.xml", "README.md"]),
-        (os.path.join("share", package_name, "launch"), ["launch/pose_simulation.launch.py"]),
-        (os.path.join("share", package_name, "config"), ["config/pose_simulation.yaml"]),
-        (os.path.join("share", package_name, "rviz"), ["config/pose_simulation.rviz"]),
+        (os.path.join("share", package_name), ["package.xml", "README.md", "plugin.xml"]),
+        (
+            os.path.join("share", package_name, "launch"),
+            ["launch/pose_simulation.launch.py", "launch/pose_simulation_ui.launch.py"],
+        ),
+        (
+            os.path.join("share", package_name, "config"),
+            [
+                "config/pose_simulation.yaml",
+                "config/pose_simulation_ui.yaml",
+                "config/pose_simulation_visualization.yaml",
+                "config/pose_simulation.rviz",
+            ],
+        ),
         (os.path.join("share", package_name, "worlds"), ["worlds/stereo_ground_drone.sdf"]),
     ] + model_files,
     install_requires=["setuptools"],
@@ -38,6 +48,7 @@ setup(
     entry_points={
         "console_scripts": [
             "pose_simulation = pose_simulation.pose_simulation_node:main",
+            "pose_visualization = pose_simulation.pose_visualization_node:main",
         ],
     },
 )

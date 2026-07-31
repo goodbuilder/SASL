@@ -79,6 +79,17 @@ All outputs are under `/simulation/pose_simulation`:
   messages for the same two sources.
 - `actual_pose/{left,right}` — observed optical `PoseStamped` re-publication
   for inspection only.
+- `visualization/markers` — atomic `visualization_msgs/MarkerArray` for the
+  read-only RViz scene.
+- `diagnostics` — standard `diagnostic_msgs/DiagnosticArray` generated from the
+  same validated evaluation sample.
+
+The UI adapter consumes the existing JSON and `PoseStamped` outputs. It does
+not recalculate pose errors, perform WGS84 conversion, or issue pose commands.
+The core has no independent sequence ID in this Phase, so
+`evaluation_timestamp_ns` is used as the sample identity. If the three JSON
+outputs or the actual pose timestamps cannot be paired, rqt shows
+`PAIR ID MISMATCH`/`TIMESTAMP MISMATCH` and RViz deletes the prior marker set.
 
 ## Run
 
@@ -89,6 +100,38 @@ workspace, and run:
 ros2 launch pose_simulation pose_simulation.launch.py
 ```
 
+To launch the core with the read-only UI adapter, rqt, and RViz:
+
+```bash
+ros2 launch pose_simulation pose_simulation_ui.launch.py
+```
+
+The UI roles are intentionally separate:
+
+- rqt (`PoseSimulationPlugin`) shows status, validity, source provenance,
+  numeric errors, time alignment, diagnostics, and bounded trends in the five
+  tabs `Overview`, `Pose Error`, `Stereo Geometry`, `Reference & Time`, and
+  `Trends`.
+- RViz uses `gazebo_world_enu` as Fixed Frame and consumes
+  `/simulation/pose_simulation/visualization/markers` for actual optical poses,
+  GT/RTK ideal poses, target/LOS rays, baseline geometry, and error labels.
+  The checked-in display config is `config/pose_simulation.rviz`; marker
+  namespaces separate `actual`, `ideal_gt`, `ideal_rtk`, `rays`, `error`,
+  `baseline`, `target`, and `text` so each group can be toggled independently.
+
+RTK markers are deleted when the current RTK sample is invalid or stale; a
+previous valid RTK marker is never silently presented as current. The rqt
+trend pause button pauses only display accumulation. The UI always displays
+`DIAGNOSTIC ONLY — NO POSE COMMAND`; it has no pose controls, Interactive
+Markers, `/set_pose` caller, or correction path.
+
+UI launch arguments include `start_pose_simulation`, `start_visualization`,
+`start_rqt`, `start_rviz`, `namespace`, `rviz_config`, `ui_config`, and
+`visualization_config`. The checked-in UI config leaves all pass/fail
+thresholds unspecified, so values are never labeled PASS by assumption. If a
+project-approved warning/failure value is added under `ui_thresholds`, rqt
+shows the configured policy without changing PoseSimulation calculations.
+
 For the same build-and-run workflow as the Simulation entrypoints, use the
 independent launcher from this directory:
 
@@ -98,7 +141,8 @@ independent launcher from this directory:
 
 It builds only `PoseSimulation`, sources `/opt/ros/${ROS_DISTRO:-humble}` and
 the optional `POSE_SIMULATION_ROS_WORKSPACE` overlay, then starts the node,
-`rqt_gui`, RViz, and the copied Gazebo world with server + GUI. Use
+PoseSimulation visualization, the `PoseSimulation` rqt plugin, RViz, and the
+copied Gazebo world with server + GUI. Use
 `--no-build` when the local install is already current, or `--node-only` for
 the diagnostic node without GUIs. `--gazebo-gui-only` opens only the client
 against an already running server. The launcher never starts, imports,

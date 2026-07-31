@@ -1,0 +1,33 @@
+# rqt reads this file through POSE_SIMULATION_UI_CONFIG.  It is deliberately
+# separate from the ROS parameter file so nested threshold maps are not passed
+# to a node as undeclared ROS parameters.
+namespace: /simulation/pose_simulation
+trend_buffer_size: 6000
+
+visualization:
+  ray_mode: normalized
+  normalized_ray_length_m: 50.0
+  show_detail_axes: false
+  axis_length_m: 12.0
+
+# No project-approved numeric pass/fail thresholds exist in this Phase.  The
+# rqt UI reports available values and never invents PASS.
+ui_thresholds:
+  relative_yaw_error_deg:
+    warning: null
+    failure: null
+  optical_axis_error_deg:
+    warning: null
+    failure: null
+  rtk_los_error_deg:
+    warning: null
+    failure: null
+  time_residual_ms:
+    warning: null
+    failure: null
+  baseline_length_error_m:
+    warning: null
+    failure: null
+  baseline_direction_error_deg:
+    warning: null
+    failure: null

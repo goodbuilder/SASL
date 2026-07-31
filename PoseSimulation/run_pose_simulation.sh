@@ -13,6 +13,7 @@ GAZEBO_WORLD="${POSE_SIMULATION_GAZEBO_WORLD:-$ROOT_DIR/worlds/stereo_ground_dro
 build_local=true
 start_rqt=true
 start_rviz=true
+start_visualization=true
 start_gazebo_gui=true
 gazebo_gui_only=false
 launch_args=()
@@ -72,6 +73,7 @@ while (($# > 0)); do
     --no-gui|--node-only)
       start_rqt=false
       start_rviz=false
+      start_visualization=false
       start_gazebo_gui=false
       shift
       ;;
@@ -255,12 +257,18 @@ printf '%s\n' "Starting PoseSimulation (diagnostic-only; no pose command path)."
 setsid ros2 launch pose_simulation pose_simulation.launch.py "${launch_args[@]}" &
 children+=("$!")
 
-if [[ "$start_rqt" == true ]]; then
-  start_child "rqt_gui" ros2 run rqt_gui rqt_gui --clear-config --force-discover
-fi
-
-if [[ "$start_rviz" == true ]]; then
-  start_child "RViz" rviz2 -d "$RVIZ_CONFIG"
+if [[ "$start_visualization" == true || "$start_rqt" == true || "$start_rviz" == true ]]; then
+  ui_launch_args=(
+    "start_pose_simulation:=false"
+    "start_visualization:=$start_visualization"
+    "start_rqt:=$start_rqt"
+    "start_rviz:=$start_rviz"
+    "namespace:=simulation/pose_simulation"
+    "rviz_config:=$RVIZ_CONFIG"
+    "ui_config:=$ROOT_DIR/config/pose_simulation_ui.yaml"
+    "visualization_config:=$ROOT_DIR/config/pose_simulation_visualization.yaml"
+  )
+  start_child "PoseSimulation UI" ros2 launch pose_simulation pose_simulation_ui.launch.py "${ui_launch_args[@]}"
 fi
 
 if [[ "$start_gazebo_gui" == true ]]; then
@@ -279,7 +287,7 @@ if [[ "$start_gazebo_gui" == true ]]; then
   fi
 fi
 
-if [[ "$start_rqt" == true || "$start_rviz" == true || "$start_gazebo_gui" == true ]]; then
+if [[ "$start_visualization" == true || "$start_rqt" == true || "$start_rviz" == true || "$start_gazebo_gui" == true ]]; then
   printf '%s\n' "PoseSimulation and requested observation GUIs are running."
 else
   printf '%s\n' "PoseSimulation is running without observation GUIs."

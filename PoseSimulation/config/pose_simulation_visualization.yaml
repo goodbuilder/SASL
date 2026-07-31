@@ -1,0 +1,13 @@
+/simulation/pose_simulation/pose_visualization:
+  ros__parameters:
+    pose_error_topic: pose_error
+    stereo_geometry_topic: stereo_geometry
+    status_topic: status
+    actual_left_topic: actual_pose/left
+    actual_right_topic: actual_pose/right
+    marker_topic: visualization/markers
+    diagnostics_topic: diagnostics
+    ray_mode: normalized
+    normalized_ray_length_m: 50.0
+    show_detail_axes: false
+    axis_length_m: 12.0
