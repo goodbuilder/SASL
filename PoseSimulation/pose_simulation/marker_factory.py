@@ -32,6 +32,7 @@ class MarkerSpec:
     color: Color = (1.0, 1.0, 1.0, 1.0)
     text: str = ""
     lifetime_s: float = 0.0
+    stamp_ns: int = 0
 
 
 COLORS: Mapping[str, Color] = {

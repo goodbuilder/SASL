@@ -338,6 +338,19 @@ class PoseSimulationNode(Node):
             "ideal_right": self.create_publisher(
                 PoseStamped, str(self._values["POSESIM_GT_IDEAL_RIGHT_POSE_TOPIC"]), 10
             ),
+            # Read-only evaluated pose exposure for the RViz adapter.  These
+            # topics carry the already validated M3 sample at the evaluation
+            # stamp; they do not introduce a new source or alter measurement
+            # semantics.
+            "gt_target": self.create_publisher(
+                PoseStamped, str(self._values["POSESIM_GT_TARGET_POSE_TOPIC"]), 10
+            ),
+            "actual_left": self.create_publisher(
+                PoseStamped, str(self._values["POSESIM_ACTUAL_LEFT_POSE_TOPIC"]), 10
+            ),
+            "actual_right": self.create_publisher(
+                PoseStamped, str(self._values["POSESIM_ACTUAL_RIGHT_POSE_TOPIC"]), 10
+            ),
         }
 
     def _create_subscriptions(self) -> None:
@@ -452,6 +465,21 @@ class PoseSimulationNode(Node):
         if ideal.right_pose is not None:
             self._publishers["ideal_right"].publish(
                 _pose_stamped(ideal.right_pose, result.evaluation_stamp_ns, self._contract.world_frame)
+            )
+        aligned_gt = result.ground_truth.ground_truth
+        aligned_left = result.ground_truth.left_actual_camera
+        aligned_right = result.ground_truth.right_actual_camera
+        if aligned_gt is not None:
+            self._publishers["gt_target"].publish(
+                _pose_stamped(aligned_gt.pose, result.evaluation_stamp_ns, self._contract.world_frame)
+            )
+        if aligned_left is not None:
+            self._publishers["actual_left"].publish(
+                _pose_stamped(aligned_left.pose, result.evaluation_stamp_ns, self._contract.world_frame)
+            )
+        if aligned_right is not None:
+            self._publishers["actual_right"].publish(
+                _pose_stamped(aligned_right.pose, result.evaluation_stamp_ns, self._contract.world_frame)
             )
 
     def _publish_waiting_status(

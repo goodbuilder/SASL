@@ -51,6 +51,7 @@ Visualization Manager:
         pose_sim/rays/actual: true
         pose_sim/rays/gt_los: true
         pose_sim/rays/rtk_los: false
+        pose_sim/status: true
         pose_sim/target/gt: true
         pose_sim/target/rtk: false
         pose_sim/target/rtk_gt_error: false

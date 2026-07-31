@@ -26,7 +26,11 @@ setup(
         (os.path.join("share", package_name), ["package.xml", "README.md", "plugin.xml"]),
         (
             os.path.join("share", package_name, "launch"),
-            ["launch/pose_simulation.launch.py", "launch/pose_simulation_ui.launch.py"],
+            [
+                "launch/pose_simulation.launch.py",
+                "launch/pose_simulation_ui.launch.py",
+                "launch/pose_simulation_rviz.launch.py",
+            ],
         ),
         (
             os.path.join("share", package_name, "config"),

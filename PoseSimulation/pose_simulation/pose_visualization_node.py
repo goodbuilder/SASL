@@ -1,18 +1,15 @@
-"""ROS 2 adapter that publishes read-only PoseSimulation RViz diagnostics."""
+"""Read-only typed PoseSimulation adapter for RViz MarkerArray output."""
 
 from __future__ import annotations
 
-import json
-import math
-import time
-from typing import Any, Mapping
+from typing import Any
 
-try:  # Keep the pure marker and snapshot modules importable without ROS 2.
+try:  # Keep the pure visualization modules importable without ROS 2.
     import rclpy
     from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     from geometry_msgs.msg import Point, PoseStamped
+    from pose_simulation_interfaces.msg import PoseError, PoseSimulationStatus, StereoGeometry
     from rclpy.node import Node
-    from std_msgs.msg import String
     from visualization_msgs.msg import Marker, MarkerArray
 except ImportError:  # pragma: no cover - exercised outside a ROS installation
     rclpy = None
@@ -21,212 +18,295 @@ except ImportError:  # pragma: no cover - exercised outside a ROS installation
     KeyValue = None  # type: ignore[assignment,misc]
     Point = None  # type: ignore[assignment,misc]
     PoseStamped = None  # type: ignore[assignment,misc]
+    PoseError = None  # type: ignore[assignment,misc]
+    PoseSimulationStatus = None  # type: ignore[assignment,misc]
+    StereoGeometry = None  # type: ignore[assignment,misc]
     Node = object  # type: ignore[assignment,misc]
-    String = None  # type: ignore[assignment,misc]
     Marker = None  # type: ignore[assignment,misc]
     MarkerArray = None  # type: ignore[assignment,misc]
 
-from .diagnostic_adapter import build_diagnostic_records
-from .marker_factory import MarkerSpec, build_marker_specs
-from .ui_snapshot import PoseRecord, PoseSimulationSnapshot, WORLD_FRAME, build_ui_snapshot
-
-
-def _stamp_ns(message: Any) -> int:
-    return int(message.header.stamp.sec) * 1_000_000_000 + int(message.header.stamp.nanosec)
-
-
-def _pose_record_from_ros(message: Any, *, source: str) -> PoseRecord:
-    frame_id = str(getattr(message.header, "frame_id", "") or "")
-    position = (
-        float(message.pose.position.x),
-        float(message.pose.position.y),
-        float(message.pose.position.z),
-    )
-    quaternion = (
-        float(message.pose.orientation.x),
-        float(message.pose.orientation.y),
-        float(message.pose.orientation.z),
-        float(message.pose.orientation.w),
-    )
-    if frame_id != WORLD_FRAME:
-        raise ValueError(f"{source} frame mismatch: {frame_id}")
-    if not all(math.isfinite(value) for value in (*position, *quaternion)):
-        raise ValueError(f"{source} contains NaN or Inf")
-    norm = math.sqrt(sum(value * value for value in quaternion))
-    if norm <= 1.0e-12:
-        raise ValueError(f"{source} quaternion is zero")
-    normalized = tuple(value / norm for value in quaternion)
-    return PoseRecord(
-        frame_id=frame_id,
-        position_world_enu_m=position,
-        orientation_xyzw=normalized,  # type: ignore[arg-type]
-        source_timestamp_ns=_stamp_ns(message),
-        source=source,
-    )
+from .marker_factory import MarkerSpec
+from .visualization_marker_factory import (
+    VisualizationConfig,
+    build_visualization_marker_specs,
+)
+from .visualization_snapshot import (
+    build_visualization_snapshot,
+    stamp_ns,
+)
 
 
 class PoseVisualizationNode(Node):
-    """Pair existing PoseSimulation outputs and publish MarkerArray/diagnostics."""
+    """Pair typed M3 outputs and publish one evaluation-atomic MarkerArray."""
 
     def __init__(self) -> None:  # pragma: no cover - ROS wiring is smoke-tested
-        if rclpy is None:
-            raise RuntimeError("PoseVisualizationNode requires ROS 2")
+        if rclpy is None or PoseError is None or MarkerArray is None:
+            raise RuntimeError(
+                "PoseVisualizationNode requires ROS 2 and pose_simulation_interfaces"
+            )
         super().__init__("pose_visualization")
         self._declare_parameters()
         self._load_parameters()
-        self._payloads: dict[str, Mapping[str, Any]] = {}
-        self._payload_history: dict[str, dict[str, Mapping[str, Any]]] = {
+        self._typed_history: dict[str, dict[tuple[int, int], Any]] = {
             "pose_error": {},
             "stereo_geometry": {},
             "status": {},
         }
-        self._actual_poses: dict[str, dict[int, PoseRecord]] = {
+        self._pose_history: dict[str, dict[int, Any]] = {
+            "gt_target": {},
             "actual_left": {},
             "actual_right": {},
+            "ideal_gt_rig": {},
+            "ideal_gt_left": {},
+            "ideal_gt_right": {},
+            "rtk_target": {},
+            "ideal_rtk_rig": {},
+            "ideal_rtk_left": {},
+            "ideal_rtk_right": {},
         }
-        self._last_snapshot: PoseSimulationSnapshot | None = None
+        self._last_signature: tuple[Any, ...] | None = None
         self._marker_publisher = self.create_publisher(MarkerArray, self._marker_topic, 10)
         self._diagnostic_publisher = self.create_publisher(DiagnosticArray, self._diagnostics_topic, 10)
-        self._subscriptions = [
-            self.create_subscription(String, self._pose_error_topic, lambda msg: self._json_callback("pose_error", msg), 10),
-            self.create_subscription(String, self._stereo_geometry_topic, lambda msg: self._json_callback("stereo_geometry", msg), 10),
-            self.create_subscription(String, self._status_topic, lambda msg: self._json_callback("status", msg), 10),
-            self.create_subscription(PoseStamped, self._actual_left_topic, lambda msg: self._actual_pose_callback("actual_left", msg), 10),
-            self.create_subscription(PoseStamped, self._actual_right_topic, lambda msg: self._actual_pose_callback("actual_right", msg), 10),
-        ]
+        self._subscriptions = []
+        self._create_subscriptions()
+        self._publish_snapshot(build_visualization_snapshot(pose_error=None, stereo_geometry=None, status=None))
         self.get_logger().info(
-            "PoseSimulation read-only visualization started: "
-            f"markers={self._marker_topic}, diagnostics={self._diagnostics_topic}"
+            "PoseSimulation typed RViz visualization started read-only: "
+            f"markers={self._marker_topic}"
         )
 
     def _declare_parameters(self) -> None:
-        declarations = {
+        values = {
             "pose_error_topic": "pose_error",
             "stereo_geometry_topic": "stereo_geometry",
             "status_topic": "status",
+            "gt_target_topic": "target/ground_truth",
             "actual_left_topic": "actual_pose/left",
             "actual_right_topic": "actual_pose/right",
+            "ideal_gt_rig_topic": "ideal_pose/ground_truth/rig",
+            "ideal_gt_left_topic": "ideal_pose/ground_truth/left",
+            "ideal_gt_right_topic": "ideal_pose/ground_truth/right",
+            "rtk_target_topic": "",
+            "ideal_rtk_rig_topic": "ideal_pose/rtk/rig",
+            "ideal_rtk_left_topic": "ideal_pose/rtk/left",
+            "ideal_rtk_right_topic": "ideal_pose/rtk/right",
             "marker_topic": "visualization/markers",
             "diagnostics_topic": "diagnostics",
             "ray_mode": "normalized",
             "normalized_ray_length_m": 50.0,
-            "show_detail_axes": False,
-            "axis_length_m": 12.0,
+            "camera_axis_length_m": 5.0,
+            "rig_axis_length_m": 10.0,
+            "target_marker_scale_m": 3.0,
+            "optical_center_scale_m": 1.0,
+            "frustum_length_m": 3.0,
+            "frustum_width_m": 1.0,
+            "frustum_height_m": 0.7,
+            "show_actual": True,
+            "show_gt_ideal": True,
+            "show_rtk_ideal": False,
+            "show_actual_forward": True,
+            "show_gt_los": True,
+            "show_rtk_los": False,
+            "show_error_arcs": True,
+            "show_baseline": True,
+            "show_text": True,
+            "show_detailed_optical_axes": False,
+            "marker_lifetime_s": 0.5,
+            "angular_visual_scale": 1.0,
+            "position_error_visual_scale": 1.0,
         }
-        for name, default in declarations.items():
-            self.declare_parameter(name, default)
+        for name, value in values.items():
+            self.declare_parameter(name, value)
 
     def _parameter(self, name: str) -> Any:
         return self.get_parameter(name).value
 
+    def _topic(self, name: str) -> str:
+        return str(self._parameter(name)).strip()
+
     def _load_parameters(self) -> None:
-        self._pose_error_topic = str(self._parameter("pose_error_topic"))
-        self._stereo_geometry_topic = str(self._parameter("stereo_geometry_topic"))
-        self._status_topic = str(self._parameter("status_topic"))
-        self._actual_left_topic = str(self._parameter("actual_left_topic"))
-        self._actual_right_topic = str(self._parameter("actual_right_topic"))
-        self._marker_topic = str(self._parameter("marker_topic"))
-        self._diagnostics_topic = str(self._parameter("diagnostics_topic"))
-        self._ray_mode = str(self._parameter("ray_mode")).strip().lower()
-        if self._ray_mode not in {"normalized", "full_distance"}:
-            raise ValueError("ray_mode must be normalized or full_distance")
-        self._normalized_ray_length_m = float(self._parameter("normalized_ray_length_m"))
-        self._show_detail_axes = bool(self._parameter("show_detail_axes"))
-        self._axis_length_m = float(self._parameter("axis_length_m"))
-        if self._normalized_ray_length_m <= 0.0 or self._axis_length_m <= 0.0:
-            raise ValueError("visualization lengths must be positive")
+        self._topics = {name: self._topic(name) for name in (
+            "pose_error_topic",
+            "stereo_geometry_topic",
+            "status_topic",
+            "gt_target_topic",
+            "actual_left_topic",
+            "actual_right_topic",
+            "ideal_gt_rig_topic",
+            "ideal_gt_left_topic",
+            "ideal_gt_right_topic",
+            "rtk_target_topic",
+            "ideal_rtk_rig_topic",
+            "ideal_rtk_left_topic",
+            "ideal_rtk_right_topic",
+        )}
+        self._marker_topic = self._topic("marker_topic")
+        self._diagnostics_topic = self._topic("diagnostics_topic")
+        self._config = VisualizationConfig(
+            ray_mode=str(self._parameter("ray_mode")).strip().lower(),
+            normalized_ray_length_m=float(self._parameter("normalized_ray_length_m")),
+            camera_axis_length_m=float(self._parameter("camera_axis_length_m")),
+            rig_axis_length_m=float(self._parameter("rig_axis_length_m")),
+            target_marker_scale_m=float(self._parameter("target_marker_scale_m")),
+            optical_center_scale_m=float(self._parameter("optical_center_scale_m")),
+            frustum_length_m=float(self._parameter("frustum_length_m")),
+            frustum_width_m=float(self._parameter("frustum_width_m")),
+            frustum_height_m=float(self._parameter("frustum_height_m")),
+            show_actual=bool(self._parameter("show_actual")),
+            show_gt_ideal=bool(self._parameter("show_gt_ideal")),
+            show_rtk_ideal=bool(self._parameter("show_rtk_ideal")),
+            show_actual_forward=bool(self._parameter("show_actual_forward")),
+            show_gt_los=bool(self._parameter("show_gt_los")),
+            show_rtk_los=bool(self._parameter("show_rtk_los")),
+            show_error_arcs=bool(self._parameter("show_error_arcs")),
+            show_baseline=bool(self._parameter("show_baseline")),
+            show_text=bool(self._parameter("show_text")),
+            show_detailed_optical_axes=bool(self._parameter("show_detailed_optical_axes")),
+            marker_lifetime_s=float(self._parameter("marker_lifetime_s")),
+            angular_visual_scale=float(self._parameter("angular_visual_scale")),
+            position_error_visual_scale=float(self._parameter("position_error_visual_scale")),
+        ).validate()
 
-    def _json_callback(self, name: str, message: Any) -> None:
-        try:
-            payload = json.loads(str(message.data))
-            if not isinstance(payload, Mapping):
-                raise ValueError("payload is not a JSON object")
-            stored = dict(payload)
-            self._payloads[name] = stored
-            evaluation_timestamp = stored.get("evaluation_timestamp_ns")
-            evaluation_id = None
-            try:
-                evaluation_id = f"evaluation:{int(evaluation_timestamp)}"
-            except (TypeError, ValueError):
-                pass
-            if evaluation_id is not None:
-                history = self._payload_history[name]
-                history[evaluation_id] = stored
-                while len(history) > 32:
-                    del history[next(iter(history))]
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self.get_logger().warning(f"PoseSimulation {name} payload rejected: {exc}")
-            self._payloads.pop(name, None)
-        self._try_publish_snapshot()
-
-    def _actual_pose_callback(self, name: str, message: Any) -> None:
-        try:
-            record = _pose_record_from_ros(message, source=name)
-            history = self._actual_poses[name]
-            history[record.source_timestamp_ns] = record
-            while len(history) > 64:
-                del history[next(iter(history))]
-        except (AttributeError, TypeError, ValueError) as exc:
-            self._actual_poses[name].clear()
-            self.get_logger().warning(f"PoseSimulation {name} pose rejected: {exc}")
-        self._try_publish_snapshot()
-
-    def _try_publish_snapshot(self) -> None:
-        common_ids = set(self._payload_history["pose_error"])
-        common_ids &= set(self._payload_history["stereo_geometry"])
-        common_ids &= set(self._payload_history["status"])
-        if common_ids:
-            evaluation_id = sorted(common_ids, key=lambda value: int(value.split(":", 1)[1]))[-1]
-            pose_error = self._payload_history["pose_error"][evaluation_id]
-            stereo_geometry = self._payload_history["stereo_geometry"][evaluation_id]
-            status = self._payload_history["status"][evaluation_id]
-            actual_poses: dict[str, PoseRecord] = {}
-            for name, timestamp_key in (
-                ("actual_left", "left_camera_pose_timestamp_ns"),
-                ("actual_right", "right_camera_pose_timestamp_ns"),
-            ):
-                try:
-                    timestamp = int(status.get(timestamp_key))
-                except (TypeError, ValueError):
-                    continue
-                record = self._actual_poses[name].get(timestamp)
-                if record is not None:
-                    actual_poses[name] = record
-        else:
-            pose_error = self._payloads.get("pose_error")
-            stereo_geometry = self._payloads.get("stereo_geometry")
-            status = self._payloads.get("status")
-            actual_poses = {}
-        snapshot = build_ui_snapshot(
-            pose_error,
-            stereo_geometry,
-            status,
-            actual_poses=actual_poses,
-            now_receive_ns=time.monotonic_ns(),
+    def _create_subscriptions(self) -> None:
+        typed = (
+            ("pose_error", PoseError, "pose_error_topic"),
+            ("stereo_geometry", StereoGeometry, "stereo_geometry_topic"),
+            ("status", PoseSimulationStatus, "status_topic"),
         )
-        self._last_snapshot = snapshot
-        specs = build_marker_specs(
-            snapshot,
-            ray_mode=self._ray_mode,
-            normalized_ray_length_m=self._normalized_ray_length_m,
-            show_detail_axes=self._show_detail_axes,
-            axis_length_m=self._axis_length_m,
+        for name, message_type, parameter_name in typed:
+            self._subscriptions.append(
+                self.create_subscription(
+                    message_type,
+                    self._topics[parameter_name],
+                    lambda message, key=name: self._typed_callback(key, message),
+                    10,
+                )
+            )
+        pose_topics = (
+            ("gt_target", "gt_target_topic"),
+            ("actual_left", "actual_left_topic"),
+            ("actual_right", "actual_right_topic"),
+            ("ideal_gt_rig", "ideal_gt_rig_topic"),
+            ("ideal_gt_left", "ideal_gt_left_topic"),
+            ("ideal_gt_right", "ideal_gt_right_topic"),
+            ("rtk_target", "rtk_target_topic"),
+            ("ideal_rtk_rig", "ideal_rtk_rig_topic"),
+            ("ideal_rtk_left", "ideal_rtk_left_topic"),
+            ("ideal_rtk_right", "ideal_rtk_right_topic"),
         )
-        self._marker_publisher.publish(self._marker_array_from_specs(specs))
-        self._diagnostic_publisher.publish(self._diagnostic_array_from_snapshot(snapshot))
+        for name, parameter_name in pose_topics:
+            topic = self._topics[parameter_name]
+            if not topic:
+                continue
+            self._subscriptions.append(
+                self.create_subscription(
+                    PoseStamped,
+                    topic,
+                    lambda message, key=name: self._pose_callback(key, message),
+                    10,
+                )
+            )
 
-    def _marker_array_from_specs(self, specs: tuple[MarkerSpec, ...]) -> Any:
+    def _typed_callback(self, name: str, message: Any) -> None:
+        message_stamp = stamp_ns(message)
+        try:
+            message_id = int(message.evaluation_id)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if message_stamp is None:
+            return
+        history = self._typed_history[name]
+        history[(message_id, message_stamp)] = message
+        while len(history) > 64:
+            del history[next(iter(history))]
+        self._try_publish_latest_status()
+
+    def _pose_callback(self, name: str, message: Any) -> None:
+        message_stamp = stamp_ns(message)
+        if message_stamp is None:
+            return
+        history = self._pose_history[name]
+        history[message_stamp] = message
+        while len(history) > 64:
+            del history[next(iter(history))]
+        self._try_publish_latest_status()
+
+    def _latest_status(self) -> Any | None:
+        history = self._typed_history["status"]
+        if not history:
+            return None
+        return max(history.values(), key=lambda message: (stamp_ns(message) or 0, int(message.evaluation_id)))
+
+    def _try_publish_latest_status(self) -> None:
+        status = self._latest_status()
+        if status is None:
+            return
+        evaluation_id = int(status.evaluation_id)
+        evaluation_stamp_ns = stamp_ns(status) or 0
+        key = (evaluation_id, evaluation_stamp_ns)
+        pose_error = self._typed_history["pose_error"].get(key)
+        stereo_geometry = self._typed_history["stereo_geometry"].get(key)
+        poses = {
+            name: history.get(evaluation_stamp_ns)
+            for name, history in self._pose_history.items()
+        }
+        source_topics = {
+            "pose_error": self._topics["pose_error_topic"],
+            "stereo_geometry": self._topics["stereo_geometry_topic"],
+            "status": self._topics["status_topic"],
+            **{name: self._topics[f"{name}_topic"] for name in (
+                "gt_target", "actual_left", "actual_right", "ideal_gt_rig", "ideal_gt_left", "ideal_gt_right",
+                "rtk_target", "ideal_rtk_rig", "ideal_rtk_left", "ideal_rtk_right",
+            )},
+        }
+        snapshot = build_visualization_snapshot(
+            pose_error=pose_error,
+            stereo_geometry=stereo_geometry,
+            status=status,
+            gt_target=poses["gt_target"],
+            actual_left=poses["actual_left"],
+            actual_right=poses["actual_right"],
+            ideal_gt_rig=poses["ideal_gt_rig"],
+            ideal_gt_left=poses["ideal_gt_left"],
+            ideal_gt_right=poses["ideal_gt_right"],
+            rtk_target=poses["rtk_target"],
+            ideal_rtk_rig=poses["ideal_rtk_rig"],
+            ideal_rtk_left=poses["ideal_rtk_left"],
+            ideal_rtk_right=poses["ideal_rtk_right"],
+            source_topics=source_topics,
+        )
+        self._publish_snapshot(snapshot)
+
+    def _publish_snapshot(self, snapshot: Any) -> None:
+        signature = (
+            snapshot.evaluation_id,
+            snapshot.evaluation_stamp_ns,
+            snapshot.valid,
+            snapshot.state,
+            snapshot.invalid_reason,
+            snapshot.rtk_available,
+            tuple(sorted(snapshot.source_identity.items())),
+        )
+        if signature == self._last_signature:
+            return
+        self._last_signature = signature
+        specs = build_visualization_marker_specs(snapshot, self._config)
         message = MarkerArray()
         message.markers = [self._marker_from_spec(spec) for spec in specs]
-        return message
+        self._marker_publisher.publish(message)
+        self._diagnostic_publisher.publish(self._diagnostic_array(snapshot))
 
     def _marker_from_spec(self, spec: MarkerSpec) -> Any:
         marker = Marker()
         marker.header.frame_id = spec.frame_id
-        marker.header.stamp = self.get_clock().now().to_msg()
+        stamp = spec.stamp_ns
+        if stamp <= 0:
+            stamp = int(self.get_clock().now().nanoseconds)
+        marker.header.stamp.sec = int(stamp // 1_000_000_000)
+        marker.header.stamp.nanosec = int(stamp % 1_000_000_000)
         marker.ns = spec.namespace
         marker.id = int(spec.marker_id)
-        marker.action = Marker.DELETEALL if spec.action == "DELETEALL" else Marker.ADD
+        marker.action = Marker.DELETE if spec.action == "DELETE" else Marker.ADD
         marker.type = {
             "arrow": Marker.ARROW,
             "line_strip": Marker.LINE_STRIP,
@@ -243,26 +323,30 @@ class PoseVisualizationNode(Node):
         marker.color.r, marker.color.g, marker.color.b, marker.color.a = spec.color
         marker.text = spec.text
         marker.lifetime.sec = int(max(0.0, spec.lifetime_s))
-        marker.lifetime.nanosec = int(max(0.0, spec.lifetime_s) % 1.0 * 1.0e9)
+        marker.lifetime.nanosec = int((max(0.0, spec.lifetime_s) % 1.0) * 1.0e9)
         return marker
 
-    def _diagnostic_array_from_snapshot(self, snapshot: PoseSimulationSnapshot) -> Any:
+    def _diagnostic_array(self, snapshot: Any) -> Any:
         array = DiagnosticArray()
-        array.header.stamp = self.get_clock().now().to_msg()
-        array.header.frame_id = WORLD_FRAME
-        for record in build_diagnostic_records(snapshot):
-            status = DiagnosticStatus()
-            status.name = record.name
-            # Humble's generated DiagnosticStatus setter represents uint8 as
-            # a one-byte Python bytes value.
-            status.level = bytes([max(0, min(255, int(record.level)))])
-            status.message = record.message
-            status.values = [KeyValue(key=key, value=value) for key, value in record.values]
-            array.status.append(status)
+        array.header.frame_id = snapshot.world_frame
+        array.header.stamp.sec = int(max(0, snapshot.evaluation_stamp_ns) // 1_000_000_000)
+        array.header.stamp.nanosec = int(max(0, snapshot.evaluation_stamp_ns) % 1_000_000_000)
+        status = DiagnosticStatus()
+        status.name = "PoseSimulation/Visualization"
+        status.level = bytes([0 if snapshot.valid else 1])
+        status.message = "VALID" if snapshot.valid else snapshot.invalid_reason or snapshot.state
+        status.values = [
+            KeyValue(key="evaluation_id", value=str(snapshot.evaluation_id)),
+            KeyValue(key="evaluation_stamp_ns", value=str(snapshot.evaluation_stamp_ns)),
+            KeyValue(key="fixed_frame", value=snapshot.world_frame),
+            KeyValue(key="read_only", value="true"),
+            KeyValue(key="pose_command_enabled", value="false"),
+        ]
+        array.status.append(status)
         return array
 
 
-def main() -> None:  # pragma: no cover - requires ROS 2/Gazebo runtime
+def main() -> None:  # pragma: no cover - requires ROS 2 runtime
     if rclpy is None:
         raise RuntimeError("PoseVisualizationNode requires ROS 2")
     rclpy.init()

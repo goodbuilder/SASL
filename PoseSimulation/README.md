@@ -201,6 +201,17 @@ The UI roles are intentionally separate:
   namespaces separate `actual`, `ideal_gt`, `ideal_rtk`, `rays`, `error`,
   `baseline`, `target`, and `text` so each group can be toggled independently.
 
+The RViz adapter consumes typed M3 results and the evaluation-stamped,
+read-only PoseStamped topics `target/ground_truth`, `actual_pose/left`, and
+`actual_pose/right` published by the PoseSimulation measurement node.  These
+topics expose validated source data for visualization only; they do not alter
+the measurement calculation or source Simulation.  Every MarkerArray is
+assembled from one evaluation identity and uses deterministic namespace/ID
+pairs.  Invalid or mismatched evaluations emit explicit DELETE markers rather
+than retaining stale geometry.  Camera frustums are symbolic orientation
+frustums, not calibrated FOV displays, because no public calibrated intrinsic
+contract exists.
+
 RTK markers are deleted when the current RTK sample is invalid or stale; a
 previous valid RTK marker is never silently presented as current. The rqt
 trend pause button pauses only screen refresh; subscriptions and the bounded
