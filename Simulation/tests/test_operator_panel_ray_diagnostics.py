@@ -345,3 +345,59 @@ def test_sensors_tab_does_not_flag_reference_mismatch_when_error_is_injected(
     )
 
     assert panel._attitude_fields["Right residual [deg]"].toolTip() == ""
+
+
+def test_ray_diagnostics_tabs_do_not_force_a_tall_minimum_window(qt_app):
+    """Regression test: QTabWidget sizes for the union of every page (Qt's
+    internal QStackedWidget considers all pages, not just the current one),
+    so the Sensors tab's many-row PX4/GPS health grids used to inflate this
+    whole panel's minimumSizeHint to ~860px tall even while showing the
+    small Geometry tab. That minimum propagated to the top-level operator
+    window and, once it exceeded the screen height, several window managers
+    could no longer maximize it (there was no smaller "restored" state left
+    to grow from). Each tab is now wrapped in a resizable QScrollArea, whose
+    own minimumSizeHint stays small regardless of the wrapped content."""
+
+    panel = operator_panel.RayDiagnosticsPanel()
+    panel.show()
+    qt_app.processEvents()
+
+    assert panel.minimumSizeHint().height() < 400
+
+
+def test_toggling_ray_diagnostics_off_and_on_keeps_minimum_height_bounded(qt_app):
+    panel = operator_panel.RayDiagnosticsPanel()
+    panel.show()
+    qt_app.processEvents()
+
+    from python_qt_binding.QtWidgets import QGroupBox
+
+    group = panel.findChild(QGroupBox)
+    assert group is not None
+
+    group.setChecked(False)
+    qt_app.processEvents()
+    assert panel.minimumSizeHint().height() < 100
+
+    group.setChecked(True)
+    qt_app.processEvents()
+    assert panel.minimumSizeHint().height() < 400
+
+
+def test_analysis_graph_legend_matches_the_saved_ray_names():
+    # These four series ARE recorded Rays; their legend text must exactly
+    # match RAY_DIAGNOSTICS_ROWS / the CSV-XLSX Ray display names.
+    ray_display_names = dict(operator_panel.RAY_DIAGNOSTICS_ROWS)
+    assert operator_panel.SERIES_LABELS["raw"] == ray_display_names["nominal"]
+    assert operator_panel.SERIES_LABELS["optical"] == ray_display_names["optical"]
+    assert operator_panel.SERIES_LABELS["ideal"] == ray_display_names["ideal"]
+    assert operator_panel.SERIES_LABELS["raw_gps_baseline"] == ray_display_names["gps_raw"]
+
+
+def test_analysis_graph_legend_does_not_collide_gt_with_the_truth_ray():
+    # "truth" subscribes to /ground_truth_position (the literal Gazebo
+    # target GT), which is not one of the eight recorded Rays and must not
+    # render as a near-duplicate of the "optical" series' "Truth" Ray label.
+    assert operator_panel.SERIES_LABELS["truth"] != "truth"
+    assert operator_panel.SERIES_LABELS["truth"].lower() != "truth"
+    assert operator_panel.SERIES_LABELS["truth"] != operator_panel.SERIES_LABELS["optical"]

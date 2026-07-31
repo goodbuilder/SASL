@@ -17,6 +17,7 @@ from python_qt_binding.QtWidgets import (
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QTabWidget,
     QTableWidget,
@@ -76,7 +77,14 @@ SERIES = (
     ("uam_raw_gps_reference", "/stereo/uam_raw_gps_reference_position", QColor(134, 89, 45)),
 )
 SERIES_LABELS = {
-    "truth": "truth",
+    # "truth" subscribes to /ground_truth_position, the literal Gazebo
+    # target_reference_link Ground Truth -- it is not one of the eight
+    # recorded Rays. Label it distinctly so it cannot be misread as the
+    # "optical" series below, which *is* the recorded "Truth" Ray (an
+    # oracle triangulation of the observed pixels, not the GT point
+    # itself). These names must stay identical to RAY_DIAGNOSTICS_ROWS /
+    # stereo_distance_node.RAY_DISPLAY_NAMES and the CSV/XLSX Ray labels.
+    "truth": "Gazebo Target GT",
     "raw": "Raw",
     "optical": "Truth",
     "ideal": "Ideal",
@@ -531,13 +539,38 @@ class RayDiagnosticsPanel(QWidget):
         content_layout.addWidget(self._frame_label)
 
         tabs = QTabWidget()
-        tabs.addTab(self._build_geometry_tab(), "Geometry")
-        tabs.addTab(self._build_delta_tab(), "Truth Δ / Interaction")
-        tabs.addTab(self._build_gt_tab(), "GT Error")
-        tabs.addTab(self._build_sensors_tab(), "Sensors")
+        tabs.addTab(self._scrollable(self._build_geometry_tab()), "Geometry")
+        tabs.addTab(self._scrollable(self._build_delta_tab()), "Truth Δ / Interaction")
+        tabs.addTab(self._scrollable(self._build_gt_tab()), "GT Error")
+        tabs.addTab(self._scrollable(self._build_sensors_tab()), "Sensors")
         content_layout.addWidget(tabs)
 
     # -- tab construction -------------------------------------------------
+
+    @staticmethod
+    def _scrollable(widget):
+        """Wrap one tab page so it can scroll instead of forcing the window
+        to grow to fit its full content.
+
+        QTabWidget's own minimumSizeHint is driven by the *tallest* page
+        (Qt's internal QStackedWidget sizes for the union of every page, not
+        just the current one), so a single content-heavy tab -- like
+        Sensors, whose PX4/GPS health grids run well past a dozen rows --
+        otherwise inflates this whole panel's minimum height regardless of
+        which tab is showing. That minimum then propagates up through the
+        checkable "Ray Diagnostics" group box to the top-level operator
+        window, and once it exceeds the screen height most window managers
+        can no longer satisfy maximize (there is no smaller "restored" size
+        left to grow from). A resizable QScrollArea reports a small,
+        bounded minimumSizeHint on its own regardless of the wrapped
+        widget's natural size, so it no longer bounds the window.
+        """
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(widget)
+        return scroll
 
     @staticmethod
     def _make_table(headers):
@@ -2108,8 +2141,8 @@ class OperatorPanel(Plugin):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.addWidget(
             QLabel(
-                "FRDR comparison: truth, Raw, Truth, Ideal (simulation-only), GPS, "
-                "and Global. "
+                "FRDR comparison: Gazebo Target GT, Raw, Truth, Ideal (simulation-only), "
+                "and GPS. "
                 "Range is the 3D vector magnitude when a source "
                 "publishes F/R/D only."
             )
