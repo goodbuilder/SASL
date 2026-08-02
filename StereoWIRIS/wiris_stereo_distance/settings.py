@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from wiris_stereo_distance.gnss_operation import GnssOperationConfig
 
 
 APP_ROOT = Path(__file__).resolve().parents[1]
@@ -100,6 +102,9 @@ class AppSettings:
     gnss_base_survey_in_min_duration_s: int = 300
     gnss_base_survey_in_accuracy_m: float = 1.0
     gnss_base_rtcm_injection_target: str = "both"
+    # Three-mode GNSS operation contract.  Legacy flat GNSS fields above are
+    # kept for compatibility with the existing GUI and local Survey-in flow.
+    gnss_operation: GnssOperationConfig = field(default_factory=GnssOperationConfig)
     clock_ftp_user: str = "anonymous"
     clock_ftp_password: str = ""
     clock_ftp_port: int = 21
@@ -291,6 +296,7 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         gnss_base_rtcm_injection_target=str(
             payload.get("gnss_base_rtcm_injection_target", AppSettings.gnss_base_rtcm_injection_target)
         ),
+        gnss_operation=GnssOperationConfig.from_mapping(payload.get("gnss_operation")),
         clock_ftp_user=str(payload.get("clock_ftp_user", AppSettings.clock_ftp_user)),
         clock_ftp_password=str(payload.get("clock_ftp_password", AppSettings.clock_ftp_password)),
         clock_ftp_port=int(payload.get("clock_ftp_port", AppSettings.clock_ftp_port)),
@@ -303,7 +309,9 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
 def save_settings(settings: AppSettings, path: str | Path = DEFAULT_SETTINGS_PATH) -> None:
     settings_path = Path(path)
     settings_path.parent.mkdir(parents=True, exist_ok=True)
-    settings_path.write_text(json.dumps(settings.__dict__, indent=2, ensure_ascii=False))
+    payload = dict(settings.__dict__)
+    payload["gnss_operation"] = settings.gnss_operation.to_mapping()
+    settings_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def resolve_settings_path(raw_path: str, *, base_dir: str | Path) -> Path:

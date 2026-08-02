@@ -77,6 +77,54 @@
   "gnss_base_survey_in_min_duration_s": 300,
   "gnss_base_survey_in_accuracy_m": 1.0,
   "gnss_base_rtcm_injection_target": "both",
+  "gnss_operation": {
+    "operation_mode": "LOCAL_SURVEY_IN",
+    "require_drone_rtk_fixed": false,
+    "readiness_gate_enabled": true,
+    "readiness": {
+      "minimum_fixed_duration_s": 30.0,
+      "maximum_correction_age_s": 3.0,
+      "maximum_gps_sample_age_s": 1.0,
+      "maximum_horizontal_accuracy_m": 0.03,
+      "maximum_vertical_accuracy_m": 0.05,
+      "maximum_left_right_timestamp_delta_ms": 50.0,
+      "maximum_baseline_std_m": 0.02
+    },
+    "local_base": {
+      "device": "/dev/ttyACM0",
+      "baud": 460800,
+      "survey_in_min_duration_s": 300.0,
+      "survey_in_accuracy_limit_m": 1.0
+    },
+    "network": {
+      "caster_host": "",
+      "caster_port": 2101,
+      "mountpoint": "",
+      "username_env": "NTRIP_USERNAME",
+      "password_env": "NTRIP_PASSWORD",
+      "tls": false,
+      "gga_policy": "SYSTEM_CENTER",
+      "reconnect_interval_s": 5.0,
+      "connect_timeout_s": 10.0,
+      "read_timeout_s": 10.0
+    },
+    "fixed_base": {
+      "coordinate_profile_path": "",
+      "acquisition_duration_s": 180.0,
+      "minimum_fixed_duration_s": 60.0,
+      "minimum_fixed_ratio": 0.95,
+      "maximum_horizontal_scatter_m": 0.03,
+      "maximum_vertical_scatter_m": 0.05,
+      "permit_profile_reuse": false,
+      "height_type": "ELLIPSOID"
+    },
+    "routing": {
+      "left_enabled": true,
+      "right_enabled": true,
+      "drone_enabled": false,
+      "field_base_enabled": false
+    }
+  },
   "clock_ftp_user": "anonymous",
   "clock_ftp_password": "",
   "clock_ftp_port": 21,

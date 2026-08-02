@@ -291,6 +291,77 @@ def test_ubx_cfg_tmode3_frames_encode_survey_in_and_disabled_modes() -> None:
     assert poll_payload == b""
 
 
+def test_ubx_cfg_tmode3_fixed_frame_uses_ecef_and_fixed_flag() -> None:
+    import wiris_stereo_distance.gui as gui
+
+    parser = gui.UbxStreamParser()
+    messages = parser.feed(
+        gui.ubx_cfg_tmode3_fixed_frame(
+            latitude_deg=37.0,
+            longitude_deg=127.0,
+            ellipsoid_height_m=52.0,
+            fixed_position_accuracy_m=0.05,
+        )
+    )
+
+    assert len(messages) == 1
+    _message_class, _message_id, payload = messages[0]
+    _version, _reserved0, flags = struct.unpack_from("<BBH", payload, 0)
+    assert flags == 2
+    x_cm, y_cm, z_cm = struct.unpack_from("<lll", payload, 4)
+    assert (x_cm, y_cm, z_cm) != (0, 0, 0)
+    assert struct.unpack_from("<I", payload, 28)[0] == 500
+
+
+def test_ubx_nav_pvt_coordinate_parser_preserves_height_and_fix_contract() -> None:
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import HeightType
+
+    payload = bytearray(92)
+    # u-blox NAV-PVT uses fixType=3 plus carrier solution FIXED (flags bits
+    # 6..7 == 2).  PX4's MAVLink fix_type=6 is a different contract.
+    payload[20] = 3
+    payload[21] = 0x81
+    struct.pack_into("<i", payload, 24, int(round(127.0 * 1e7)))
+    struct.pack_into("<i", payload, 28, int(round(37.0 * 1e7)))
+    struct.pack_into("<i", payload, 32, 52_000)
+    struct.pack_into("<i", payload, 36, 48_000)
+
+    sample = gui.parse_ubx_nav_pvt_coordinate_sample(
+        0x01,
+        0x07,
+        bytes(payload),
+        timestamp_s=10.0,
+        height_type=HeightType.ELLIPSOID,
+    )
+
+    assert sample is not None
+    assert sample.fixed is True
+    assert sample.latitude_deg == pytest.approx(37.0)
+    assert sample.longitude_deg == pytest.approx(127.0)
+    assert sample.ellipsoid_height_m == pytest.approx(52.0)
+    assert sample.msl_altitude_m == pytest.approx(48.0)
+    assert sample.selected_height_m == pytest.approx(52.0)
+
+    payload[20] = 6
+    payload[21] = 0x81
+    assert gui.parse_ubx_nav_pvt_coordinate_sample(
+        0x01, 0x07, bytes(payload), timestamp_s=10.0, height_type=HeightType.ELLIPSOID
+    ).fixed is False
+
+    for fix_type, flags in ((3, 0x41), (3, 0x80), (5, 0x81)):
+        payload[20] = fix_type
+        payload[21] = flags
+        sample = gui.parse_ubx_nav_pvt_coordinate_sample(
+            0x01, 0x07, bytes(payload), timestamp_s=10.0, height_type=HeightType.ELLIPSOID
+        )
+        assert sample is not None
+        assert sample.fixed is False
+    assert gui.parse_ubx_nav_pvt_coordinate_sample(
+        0x01, 0x07, b"\x00" * 47, timestamp_s=10.0, height_type=HeightType.ELLIPSOID
+    ) is None
+
+
 def test_ubx_base_satellite_count_uses_nav_pvt_or_nav_sat() -> None:
     import wiris_stereo_distance.gui as gui
 
@@ -414,6 +485,126 @@ def test_gnss_base_rtcm_frame_routes_to_selected_rovers(monkeypatch) -> None:
     assert "L frames=1 bytes=9 fail=0" in widget.gnss_base_status_labels["rtcm_injection_stats"].text()
     assert "R frames=1 bytes=9 fail=0" in widget.gnss_base_status_labels["rtcm_injection_stats"].text()
     assert "MAVLink packets=2" in widget.gnss_base_status_labels["rtcm_bandwidth"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_network_rtk_direct_routes_ntrip_rtcm_without_base_serial(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import GnssOperationMode
+
+    class FakeMavlink:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, bytes]] = []
+
+        def send_rtcm_data(self, camera: str, payload: bytes) -> int:
+            self.sent.append((camera, payload))
+            return 1
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.mavlink_pixhawk = FakeMavlink()
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_RTK_DIRECT.value)
+    widget._set_combo_data(widget.gnss_base_rtcm_target_combo, "left")
+    widget.gnss_active_operation_config = widget._build_gnss_operation_config()
+    # Controls can only be changed programmatically while active.  The
+    # in-flight route remains the latched direct-mode left endpoint.
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value)
+    widget._set_combo_data(widget.gnss_base_rtcm_target_combo, "right")
+    frame = b"\xd3\x00\x03" + bytes((1077 >> 4, (1077 & 0x0F) << 4, 0x00)) + b"\x00\x00\x00"
+
+    widget._handle_gnss_network_chunk(b"noise" + frame)
+
+    assert widget.mavlink_pixhawk.sent == [("left", frame)]
+    assert "NTRIP RTCM 1 frame" in widget.gnss_base_status_labels["network"].text()
+    assert "frames=1" in widget.gnss_base_status_labels["rtcm_receive"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_network_assisted_fixed_base_promotes_repeated_fixed_coordinate(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import (
+        CorrectionSourceIdentity,
+        GnssOperationMode,
+        GnssOperationState,
+        HeightType,
+    )
+    from wiris_stereo_distance.gnss_profile import GnssCoordinateSample
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, bytes]] = []
+
+        def send_bytes(self, label: str, payload: bytes) -> None:
+            self.sent.append((label, payload))
+
+    class FakeMavlink:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, bytes]] = []
+
+        def send_rtcm_data(self, camera: str, payload: bytes) -> int:
+            self.sent.append((camera, payload))
+            return 1
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value)
+    widget._set_combo_data(widget.gnss_base_rtcm_target_combo, "left")
+    widget.gnss_fixed_height_combo.setCurrentIndex(0)
+    widget.gnss_fixed_acquisition_duration_spin.setValue(1)
+    widget.gnss_fixed_min_duration_spin.setValue(1)
+    widget.gnss_base_serial_worker = FakeWorker()
+    widget.gnss_base_serial_connected = True
+    widget.gnss_network_connected = True
+    widget.mavlink_pixhawk = FakeMavlink()
+    config = widget._build_gnss_operation_config()
+    widget._gnss_configure_manager(config)
+    widget.gnss_operation_manager.set_source_identity(CorrectionSourceIdentity(source_kind="test-ntrip"))
+    widget.gnss_operation_manager.transition(GnssOperationState.INITIALIZING, "test")
+    widget.gnss_operation_manager.transition(GnssOperationState.NTRIP_CONNECTING, "test")
+    widget.gnss_operation_manager.transition(GnssOperationState.NTRIP_ACTIVE, "test")
+
+    for timestamp_s in (0.0, 1.0, 2.0):
+        widget._handle_gnss_base_position(
+            GnssCoordinateSample(
+                latitude_deg=37.0,
+                longitude_deg=127.0,
+                ellipsoid_height_m=52.0,
+                msl_altitude_m=48.0,
+                height_type=HeightType.ELLIPSOID,
+                timestamp_s=timestamp_s,
+                fixed=True,
+            )
+        )
+
+    labels = [label for label, _payload in widget.gnss_base_serial_worker.sent]
+    assert "CFG-TMODE3 fixed coordinate" in labels
+    assert widget.gnss_fixed_base_profile is None
+    assert widget.gnss_fixed_base_command_sent is True
+    assert widget.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
+
+    widget._handle_gnss_base_ubx_message(0x05, 0x01, b"\x06\x71")
+    labels = [label for label, _payload in widget.gnss_base_serial_worker.sent]
+    assert "CFG-TMODE3 poll after fixed coordinate ACK" in labels
+    fixed_frame = next(payload for label, payload in widget.gnss_base_serial_worker.sent if label == "CFG-TMODE3 fixed coordinate")
+    _message_class, _message_id, fixed_payload = gui.UbxStreamParser().feed(fixed_frame)[0]
+    widget._handle_gnss_base_ubx_message(0x06, 0x71, fixed_payload)
+    assert widget.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
+
+    frame = b"\xd3\x00\x03" + bytes((1005 >> 4, (1005 & 0x0F) << 4, 0x00)) + b"\x00\x00\x00"
+    widget._handle_gnss_base_rtcm_frame(frame)
+    assert widget.mavlink_pixhawk.sent == [("left", frame)]
+    assert widget.gnss_fixed_base_profile is not None
+    assert widget.gnss_operation_manager.state == GnssOperationState.LOCAL_RTCM_ACTIVE
 
     widget.deleteLater()
     _ = app

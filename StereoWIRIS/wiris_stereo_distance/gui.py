@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import ftplib
+import hashlib
 import html as html_lib
 import faulthandler
 import json
@@ -77,6 +78,27 @@ from wiris_stereo_distance.measurement_attempt import (
     detection_pair_key,
 )
 from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
+from wiris_stereo_distance.fixed_base_initializer import FixedBaseInitializer
+from wiris_stereo_distance.gnss_network import NtripClient, format_nmea_gga, gga_from_position
+from wiris_stereo_distance.gnss_operation import (
+    CorrectionSourceIdentity,
+    evaluate_gnss_readiness,
+    GnssReadinessInputs,
+    GnssOperationConfig,
+    GnssOperationManager,
+    GnssOperationMode,
+    GnssOperationState,
+    GnssReadinessSnapshot,
+    GgaPolicy,
+    HeightType,
+    NetworkConfig,
+    RoverCorrectionStatus,
+    RoverReadinessInput,
+)
+from wiris_stereo_distance.gnss_profile import (
+    GnssCoordinateSample,
+    geodetic_to_ecef_m,
+)
 from wiris_stereo_distance.network import (
     DEFAULT_CAMERA_URLS,
     DEFAULT_HOST_ADDRESS,
@@ -2028,12 +2050,151 @@ def ubx_cfg_tmode3_disabled_frame() -> bytes:
     return ubx_frame(0x06, 0x71, payload)
 
 
+def _ubx_tmode3_ecef_components(value_m: float) -> tuple[int, int]:
+    """Encode ECEF metres as CFG-TMODE3 centimetres plus 0.1 mm high part."""
+
+    coarse_cm = int(round(float(value_m) * 100.0))
+    high_part = int(round((float(value_m) - coarse_cm * 0.01) / 0.0001))
+    while high_part > 99:
+        coarse_cm += 1
+        high_part -= 100
+    while high_part < -99:
+        coarse_cm -= 1
+        high_part += 100
+    return coarse_cm, high_part
+
+
+def ubx_cfg_tmode3_fixed_frame(
+    *,
+    latitude_deg: float,
+    longitude_deg: float,
+    ellipsoid_height_m: float,
+    fixed_position_accuracy_m: float = 0.05,
+) -> bytes:
+    """Build UBX-CFG-TMODE3 fixed-base command from WGS84 geodetic data.
+
+    The receiver command uses ECEF centimetres and 0.1 mm high parts.  The
+    input height is explicitly ellipsoid height; MSL values must be converted
+    with a geoid model before calling this function.
+    """
+
+    ecef = geodetic_to_ecef_m(latitude_deg, longitude_deg, ellipsoid_height_m)
+    coarse_x, high_x = _ubx_tmode3_ecef_components(ecef[0])
+    coarse_y, high_y = _ubx_tmode3_ecef_components(ecef[1])
+    coarse_z, high_z = _ubx_tmode3_ecef_components(ecef[2])
+    accuracy_0_1mm = max(1, int(round(float(fixed_position_accuracy_m) / 0.0001)))
+    payload = struct.pack(
+        "<BBHlllbbbBIII8s",
+        0,
+        0,
+        2,
+        coarse_x,
+        coarse_y,
+        coarse_z,
+        high_x,
+        high_y,
+        high_z,
+        0,
+        0,
+        0,
+        accuracy_0_1mm,
+        b"\x00" * 8,
+    )
+    return ubx_frame(0x06, 0x71, payload)
+
+
 def ubx_poll_frame(message_class: int, message_id: int) -> bytes:
     return ubx_frame(message_class, message_id, b"")
 
 
 def ubx_nav_svin_poll_frame() -> bytes:
     return ubx_poll_frame(0x01, 0x3B)
+
+
+def ubx_nav_pvt_poll_frame() -> bytes:
+    return ubx_poll_frame(0x01, 0x07)
+
+
+def ubx_cfg_tmode3_poll_frame() -> bytes:
+    """Poll the receiver's active CFG-TMODE3 configuration."""
+
+    return ubx_poll_frame(0x06, 0x71)
+
+
+def parse_ubx_ack(message_class: int, message_id: int, payload: bytes) -> tuple[bool, int, int] | None:
+    """Return ``(accepted, target_class, target_id)`` for UBX ACK messages."""
+
+    if message_class != 0x05 or message_id not in {0x00, 0x01} or len(payload) < 2:
+        return None
+    return message_id == 0x01, int(payload[0]), int(payload[1])
+
+
+def parse_ubx_cfg_tmode3(payload: bytes) -> dict[str, object] | None:
+    """Decode the fixed/survey-in ECEF representation used by CFG-TMODE3.
+
+    Coordinate contract: the three coordinate components are WGS84 ECEF
+    centimetres plus signed 0.1 mm high parts.  They are intentionally never
+    treated as rover NED or camera-frame values.
+    """
+
+    if len(payload) < 40:
+        return None
+    (
+        _version,
+        _reserved0,
+        flags,
+        x_cm,
+        y_cm,
+        z_cm,
+        x_hp,
+        y_hp,
+        z_hp,
+        _reserved1,
+        _svin_min_duration_s,
+        _svin_accuracy_0_1mm,
+        fixed_accuracy_0_1mm,
+        _reserved2,
+    ) = struct.unpack_from("<BBHlllbbbBIII8s", payload, 0)
+    return {
+        "mode": int(flags) & 0xFF,
+        "ecef_cm": (int(x_cm), int(y_cm), int(z_cm)),
+        "ecef_hp_0_1mm": (int(x_hp), int(y_hp), int(z_hp)),
+        "fixed_accuracy_0_1mm": int(fixed_accuracy_0_1mm),
+    }
+
+
+def parse_ubx_nav_pvt_coordinate_sample(
+    message_class: int,
+    message_id: int,
+    payload: bytes,
+    *,
+    timestamp_s: float,
+    height_type: HeightType = HeightType.ELLIPSOID,
+) -> GnssCoordinateSample | None:
+    """Parse UBX-NAV-PVT into the WGS84 coordinate contract used by fixed-base."""
+
+    if message_class != 0x01 or message_id != 0x07 or len(payload) < 48:
+        return None
+    fix_type = int(payload[20])
+    flags = int(payload[21])
+    latitude_deg = struct.unpack_from("<i", payload, 28)[0] * 1e-7
+    longitude_deg = struct.unpack_from("<i", payload, 24)[0] * 1e-7
+    ellipsoid_height_m = struct.unpack_from("<i", payload, 32)[0] * 1e-3
+    msl_altitude_m = struct.unpack_from("<i", payload, 36)[0] * 1e-3
+    gnss_fix_ok = bool(flags & 0x01)
+    carrier_solution = (flags >> 6) & 0x03
+    return GnssCoordinateSample(
+        latitude_deg=latitude_deg,
+        longitude_deg=longitude_deg,
+        ellipsoid_height_m=ellipsoid_height_m,
+        msl_altitude_m=msl_altitude_m,
+        height_type=height_type,
+        timestamp_s=float(timestamp_s),
+        # Raw u-blox NAV-PVT is not PX4 GPS_RAW_INT: RTK fixed is encoded by
+        # gnssFixOK plus carrSoln=2, while fixType remains a 3D/GNSS+DR value.
+        fixed=fix_type in {3, 4} and gnss_fix_ok and carrier_solution == 2,
+        device_id="field-base",
+    )
 
 
 def parse_ubx_nav_svin(payload: bytes) -> dict[str, object] | None:
@@ -2311,16 +2472,19 @@ class GnssBaseSerialWorker(QtCore.QObject):
     survey_in_changed = QtCore.pyqtSignal(object)
     satellite_count_changed = QtCore.pyqtSignal(int, str)
     satellite_quality_changed = QtCore.pyqtSignal(object)
+    position_changed = QtCore.pyqtSignal(object)
+    ubx_message_received = QtCore.pyqtSignal(int, int, object)
     rtcm_frame_received = QtCore.pyqtSignal(object)
     command_sent = QtCore.pyqtSignal(str, int)
     failed = QtCore.pyqtSignal(str)
     disconnected = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, *, port: str, baud: int) -> None:
+    def __init__(self, *, port: str, baud: int, height_type: HeightType = HeightType.ELLIPSOID) -> None:
         super().__init__()
         self.port = port
         self.baud = int(baud)
+        self.height_type = HeightType(height_type)
         self._stop_requested = False
         self._write_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
 
@@ -2348,6 +2512,7 @@ class GnssBaseSerialWorker(QtCore.QObject):
                 now_s = time.monotonic()
                 if now_s - last_nav_svin_poll_s >= 2.0:
                     serial_obj.write(ubx_nav_svin_poll_frame())
+                    serial_obj.write(ubx_nav_pvt_poll_frame())
                     try:
                         serial_obj.flush()
                     except Exception:
@@ -2369,10 +2534,21 @@ class GnssBaseSerialWorker(QtCore.QObject):
                                 satellites, fix_quality = gga
                                 self.satellite_count_changed.emit(satellites, f"NMEA-GGA fix={fix_quality}")
                     for message_class, message_id, payload in ubx_parser.feed(chunk):
+                        self.ubx_message_received.emit(message_class, message_id, payload)
                         if message_class == 0x01 and message_id == 0x3B:
                             survey_in = parse_ubx_nav_svin(payload)
                             if survey_in is not None:
                                 self.survey_in_changed.emit(survey_in)
+                        if message_class == 0x01 and message_id == 0x07:
+                            coordinate = parse_ubx_nav_pvt_coordinate_sample(
+                                message_class,
+                                message_id,
+                                payload,
+                                timestamp_s=now_s,
+                                height_type=self.height_type,
+                            )
+                            if coordinate is not None:
+                                self.position_changed.emit(coordinate)
                         satellite_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
                         if satellite_count is not None:
                             source = "NAV-PVT" if message_id == 0x07 else "NAV-SAT"
@@ -2417,6 +2593,70 @@ class GnssBaseSerialWorker(QtCore.QObject):
             except Exception:
                 pass
             self.command_sent.emit(label, len(payload))
+
+
+class NtripNetworkWorker(QtCore.QObject):
+    """Qt adapter for the blocking, dependency-free NTRIP client."""
+
+    connected = QtCore.pyqtSignal(str, object)
+    chunk_received = QtCore.pyqtSignal(object)
+    reconnecting = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, config: NetworkConfig, gga_provider=None) -> None:
+        super().__init__()
+        self.config = config
+        self.gga_provider = gga_provider
+        self._stop_event = threading.Event()
+        self._client: NtripClient | None = None
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                client = NtripClient(self.config)
+                self._client = client
+                try:
+                    initial_gga = self.gga_provider() if self.gga_provider is not None else None
+                    status_line, initial_payload = client.connect(gga_sentence=initial_gga)
+                    self.connected.emit(status_line, client.stats)
+                    for chunk in client.iter_chunks(
+                        self._stop_event,
+                        gga_provider=self.gga_provider,
+                        initial_payload=initial_payload,
+                    ):
+                        self.chunk_received.emit(chunk)
+                    if self._stop_event.is_set():
+                        break
+                    raise RuntimeError("NTRIP stream ended without a stop request")
+                except Exception as exc:
+                    if self._stop_event.is_set():
+                        break
+                    self.reconnecting.emit(str(exc))
+                    # The failed client is closed before retrying.  A fresh
+                    # client owns the interruptible reconnect delay because a
+                    # closed client intentionally never retries.
+                    client.close()
+                    self._client = None
+                    retry_waiter = NtripClient(self.config)
+                    if not retry_waiter.wait_for_reconnect(self._stop_event):
+                        break
+                    continue
+                finally:
+                    client.close()
+                    if self._client is client:
+                        self._client = None
+        finally:
+            self._client = None
+            self.finished.emit()
+
+    @QtCore.pyqtSlot()
+    def request_stop(self) -> None:
+        self._stop_event.set()
+        client = self._client
+        if client is not None:
+            client.close()
 
 
 class GnssBaseSerialDetectWorker(QtCore.QObject):
@@ -2712,6 +2952,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_serial_thread: QtCore.QThread | None = None
         self.gnss_base_serial_worker: GnssBaseSerialWorker | None = None
         self.gnss_base_serial_connected = False
+        self.gnss_network_thread: QtCore.QThread | None = None
+        self.gnss_network_worker: NtripNetworkWorker | None = None
+        self.gnss_network_connected = False
+        self.gnss_network_status_line = ""
+        self.gnss_network_rtcm_parser = Rtcm3StreamParser()
+        self.gnss_coordinate_samples: deque[GnssCoordinateSample] = deque(maxlen=2400)
+        self.gnss_fixed_base_profile = None
+        self.gnss_fixed_base_pending_profile = None
+        self.gnss_fixed_base_command_sent = False
+        self.gnss_fixed_base_reconfigure_expected: dict[str, object] | None = None
+        self.gnss_fixed_base_reconfigure_ack = False
+        self.gnss_fixed_base_reconfigure_readback = False
+        self.gnss_fixed_base_reconfigure_rtcm = False
+        self.gnss_fixed_base_reconfigure_deadline_s: float | None = None
+        self.gnss_active_operation_config: GnssOperationConfig | None = None
+        self.gnss_rover_fixed_since: dict[str, float | None] = {"left": None, "right": None, "drone": None}
+        self.gnss_operation_gate_active = False
         self.gnss_base_detect_thread: QtCore.QThread | None = None
         self.gnss_base_detect_worker: GnssBaseSerialDetectWorker | None = None
         self._gnss_base_candidate_rows: list[dict[str, object]] = []
@@ -2721,6 +2978,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
         self.settings = load_settings()
+        self.gnss_operation_manager = GnssOperationManager(self.settings.gnss_operation)
         self.distance_history: deque[DistanceHistoryPoint] = deque(maxlen=600)
         self.distance_recording_rows: SpoolRows | list[dict[str, object]] = SpoolRows(
             preview_limit=RECORDING_PREVIEW_LIMIT,
@@ -6074,6 +6332,40 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         settings_group = QtWidgets.QGroupBox("GNSS Base 설정")
         settings_form = QtWidgets.QGridLayout(settings_group)
+        operation_config = self.settings.gnss_operation
+        self.gnss_operation_mode_combo = QtWidgets.QComboBox()
+        self.gnss_operation_mode_combo.addItem("현장 Base Survey-in", GnssOperationMode.LOCAL_SURVEY_IN.value)
+        self.gnss_operation_mode_combo.addItem(
+            "NTRIP 보조 Fixed Base", GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value
+        )
+        self.gnss_operation_mode_combo.addItem("Network RTK 직접", GnssOperationMode.NETWORK_RTK_DIRECT.value)
+        self._set_combo_data(self.gnss_operation_mode_combo, operation_config.operation_mode.value)
+        self.gnss_operation_mode_combo.currentIndexChanged.connect(
+            lambda _index: self._handle_gnss_operation_mode_changed()
+        )
+        self.gnss_ntrip_host_edit = QtWidgets.QLineEdit(operation_config.network.caster_host)
+        self.gnss_ntrip_port_spin = QtWidgets.QSpinBox()
+        self.gnss_ntrip_port_spin.setRange(1, 65535)
+        self.gnss_ntrip_port_spin.setValue(operation_config.network.caster_port)
+        self.gnss_ntrip_mountpoint_edit = QtWidgets.QLineEdit(operation_config.network.mountpoint)
+        self.gnss_ntrip_username_env_edit = QtWidgets.QLineEdit(operation_config.network.username_env)
+        self.gnss_ntrip_password_env_edit = QtWidgets.QLineEdit(operation_config.network.password_env)
+        self.gnss_ntrip_gga_policy_combo = QtWidgets.QComboBox()
+        self.gnss_ntrip_gga_policy_combo.addItem("좌우 중심", GgaPolicy.SYSTEM_CENTER.value)
+        self.gnss_ntrip_gga_policy_combo.addItem("Left GNSS", GgaPolicy.LEFT_GNSS.value)
+        self.gnss_ntrip_gga_policy_combo.addItem("수동/미사용", GgaPolicy.MANUAL.value)
+        self.gnss_ntrip_gga_policy_combo.addItem("세션별 rover", GgaPolicy.PER_ROVER_SESSION.value)
+        self._set_combo_data(self.gnss_ntrip_gga_policy_combo, operation_config.network.gga_policy.value)
+        self.gnss_fixed_height_combo = QtWidgets.QComboBox()
+        self.gnss_fixed_height_combo.addItem("WGS84 ellipsoid height", HeightType.ELLIPSOID.value)
+        self.gnss_fixed_height_combo.addItem("MSL (고정 좌표 전 변환 필요)", HeightType.MSL.value)
+        self._set_combo_data(self.gnss_fixed_height_combo, operation_config.fixed_base.height_type.value)
+        self.gnss_fixed_acquisition_duration_spin = QtWidgets.QSpinBox()
+        self.gnss_fixed_acquisition_duration_spin.setRange(1, 86400)
+        self.gnss_fixed_acquisition_duration_spin.setValue(int(operation_config.fixed_base.acquisition_duration_s))
+        self.gnss_fixed_min_duration_spin = QtWidgets.QSpinBox()
+        self.gnss_fixed_min_duration_spin.setRange(1, 86400)
+        self.gnss_fixed_min_duration_spin.setValue(int(operation_config.fixed_base.minimum_fixed_duration_s))
         self.gnss_base_serial_port_edit = QtWidgets.QLineEdit(self.settings.gnss_base_serial_port)
         self.gnss_base_baud_spin = QtWidgets.QSpinBox()
         self.gnss_base_baud_spin.setRange(1200, 4000000)
@@ -6093,11 +6385,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_rtcm_target_combo.addItem("Right Pixhawk", "right")
         self._set_combo_data(self.gnss_base_rtcm_target_combo, self.settings.gnss_base_rtcm_injection_target)
         settings_items = (
+            ("GNSS 운용 모드", self.gnss_operation_mode_combo),
             ("Base serial port", self.gnss_base_serial_port_edit),
             ("Baudrate", self.gnss_base_baud_spin),
             ("Survey-in 최소 시간(s)", self.gnss_base_survey_duration_spin),
             ("Survey-in 목표 정확도(m)", self.gnss_base_survey_accuracy_spin),
             ("RTCM 주입 대상", self.gnss_base_rtcm_target_combo),
+            ("NTRIP caster host", self.gnss_ntrip_host_edit),
+            ("NTRIP port", self.gnss_ntrip_port_spin),
+            ("NTRIP mountpoint", self.gnss_ntrip_mountpoint_edit),
+            ("NTRIP username 환경변수", self.gnss_ntrip_username_env_edit),
+            ("NTRIP password 환경변수", self.gnss_ntrip_password_env_edit),
+            ("NTRIP GGA 정책", self.gnss_ntrip_gga_policy_combo),
+            ("Fixed Base 높이 기준", self.gnss_fixed_height_combo),
+            ("Fixed 좌표 수집 시간(s)", self.gnss_fixed_acquisition_duration_spin),
+            ("Fixed 상태 최소 시간(s)", self.gnss_fixed_min_duration_spin),
         )
         for row, (title, widget) in enumerate(settings_items):
             settings_form.addWidget(QtWidgets.QLabel(title), row, 0)
@@ -6113,6 +6415,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_survey_stop_button = QtWidgets.QPushButton("Survey-in 중지")
         self.gnss_base_survey_stop_button.clicked.connect(self.stop_gnss_base_survey_in)
         self.gnss_base_survey_stop_button.setEnabled(False)
+        self.gnss_network_start_button = QtWidgets.QPushButton("NTRIP 시작")
+        self.gnss_network_start_button.clicked.connect(self.start_gnss_network)
+        self.gnss_network_stop_button = QtWidgets.QPushButton("NTRIP 중지")
+        self.gnss_network_stop_button.clicked.connect(self.stop_gnss_network)
+        self.gnss_network_stop_button.setEnabled(False)
         self.gnss_base_discover_button = QtWidgets.QPushButton("Base 포트 탐색")
         self.gnss_base_discover_button.clicked.connect(self.discover_gnss_base_serial_ports)
         self.gnss_base_apply_candidate_button = QtWidgets.QPushButton("선택 포트 적용")
@@ -6124,6 +6431,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         button_row.addWidget(self.gnss_base_disconnect_button)
         button_row.addWidget(self.gnss_base_survey_start_button)
         button_row.addWidget(self.gnss_base_survey_stop_button)
+        button_row.addWidget(self.gnss_network_start_button)
+        button_row.addWidget(self.gnss_network_stop_button)
         button_row.addWidget(self.gnss_base_apply_candidate_button)
         button_row.addStretch(1)
         settings_form.addLayout(button_row, len(settings_items), 0, 1, 2)
@@ -6146,6 +6455,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         base_grid = QtWidgets.QGridLayout(base_group)
         base_items = (
             ("connection", "Base 연결", "대기 중", "idle"),
+            ("operation", "운용 상태", operation_config.operation_mode.value, "idle"),
+            ("network", "NTRIP", "미연결", "idle"),
             ("survey_in", "Survey-in", "미연결", "idle"),
             ("base_satellites", "Base 위성 수", "대기 중", "idle"),
             ("rtcm_rx", "Raw 수신", "없음", "idle"),
@@ -6242,7 +6553,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_health_label(label, text, "idle")
 
         note = QtWidgets.QLabel(
-            "Base serial raw 수신, UBX NAV-SVIN 상태 polling, Survey-in 시작/중지 명령을 지원합니다."
+            "현장 Base Survey-in, NTRIP 보조 Fixed Base, Network RTK 직접 모드를 지원합니다. "
+            "NTRIP 비밀번호는 설정 파일에 저장하지 않고 지정한 환경변수에서 읽습니다."
         )
         note.setWordWrap(True)
         note.setObjectName("statusStrip")
@@ -6258,6 +6570,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         scroll_area.setWidget(content)
         layout.addWidget(scroll_area, 1)
         self._refresh_gnss_base_tab()
+        self._handle_gnss_operation_mode_changed()
 
     def _new_gnss_base_rtcm_stats(self) -> dict[str, object]:
         return {
@@ -7282,6 +7595,600 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             text = f"{text} | {reason}"
         self._set_health_label(labels["baseline"], text, level)
 
+    def _gnss_selected_operation_mode(self) -> GnssOperationMode:
+        value = self.gnss_operation_mode_combo.currentData()
+        try:
+            return GnssOperationMode(value)
+        except (TypeError, ValueError):
+            return GnssOperationMode.LOCAL_SURVEY_IN
+
+    def _gnss_active_operation_config(self) -> GnssOperationConfig:
+        """Return the immutable active-session config, or the configured default.
+
+        UI widgets are editable presentation state.  Once an operation starts,
+        correction routing and datum semantics must come from the snapshot that
+        was configured at start, never from a later combo-box change.
+        """
+
+        return self.gnss_active_operation_config or self._build_gnss_operation_config()
+
+    def _set_gnss_operation_controls_locked(self, locked: bool) -> None:
+        """Prevent mutable GNSS settings from changing an active operation."""
+
+        names = (
+            "gnss_operation_mode_combo",
+            "gnss_ntrip_host_edit",
+            "gnss_ntrip_port_spin",
+            "gnss_ntrip_mountpoint_edit",
+            "gnss_ntrip_username_env_edit",
+            "gnss_ntrip_password_env_edit",
+            "gnss_ntrip_gga_policy_combo",
+            "gnss_fixed_height_combo",
+            "gnss_fixed_acquisition_duration_spin",
+            "gnss_fixed_min_duration_spin",
+            "gnss_base_rtcm_target_combo",
+            "gnss_base_serial_port_edit",
+            "gnss_base_baud_spin",
+        )
+        for name in names:
+            control = getattr(self, name, None)
+            if control is not None:
+                control.setEnabled(not locked)
+
+    def _build_gnss_operation_config(self) -> GnssOperationConfig:
+        """Build the persisted GNSS contract from the visible controls.
+
+        Credentials remain environment-variable names only.  The raw serial
+        and MAVLink paths are still owned by their existing widgets; this
+        object records how correction bytes are sourced and routed.
+        """
+
+        previous = self.settings.gnss_operation
+        height_value = self.gnss_fixed_height_combo.currentData()
+        if height_value not in {HeightType.ELLIPSOID.value, HeightType.MSL.value}:
+            height_value = HeightType.ELLIPSOID.value
+        target = str(self.gnss_base_rtcm_target_combo.currentData() or "disabled")
+        mapping = previous.to_mapping()
+        mapping.update(
+            {
+                "operation_mode": self._gnss_selected_operation_mode().value,
+                "local_base": {
+                    **previous.local_base.to_mapping(),
+                    "device": self.gnss_base_serial_port_edit.text().strip(),
+                    "baud": int(self.gnss_base_baud_spin.value()),
+                    "survey_in_min_duration_s": float(self.gnss_base_survey_duration_spin.value()),
+                    "survey_in_accuracy_limit_m": float(self.gnss_base_survey_accuracy_spin.value()),
+                },
+                "network": {
+                    **previous.network.to_mapping(),
+                    "caster_host": self.gnss_ntrip_host_edit.text().strip(),
+                    "caster_port": int(self.gnss_ntrip_port_spin.value()),
+                    "mountpoint": self.gnss_ntrip_mountpoint_edit.text().strip(),
+                    "username_env": self.gnss_ntrip_username_env_edit.text().strip() or "NTRIP_USERNAME",
+                    "password_env": self.gnss_ntrip_password_env_edit.text().strip() or "NTRIP_PASSWORD",
+                    "gga_policy": str(self.gnss_ntrip_gga_policy_combo.currentData() or GgaPolicy.SYSTEM_CENTER.value),
+                },
+                "fixed_base": {
+                    **previous.fixed_base.to_mapping(),
+                    "acquisition_duration_s": float(self.gnss_fixed_acquisition_duration_spin.value()),
+                    "minimum_fixed_duration_s": float(self.gnss_fixed_min_duration_spin.value()),
+                    "height_type": height_value,
+                },
+                "routing": {
+                    **previous.routing.to_mapping(),
+                    "left_enabled": target in {"both", "left"},
+                    "right_enabled": target in {"both", "right"},
+                    "field_base_enabled": self._gnss_selected_operation_mode()
+                    == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
+                },
+            }
+        )
+        return GnssOperationConfig.from_mapping(mapping)
+
+    def _gnss_configure_manager(self, config: GnssOperationConfig) -> None:
+        state = self.gnss_operation_manager.state
+        if state not in {GnssOperationState.DISCONNECTED, GnssOperationState.STOPPED, GnssOperationState.CONFIGURED}:
+            self.gnss_operation_manager.stop()
+        self.gnss_operation_manager.configure(config)
+
+    def _gnss_transition(self, state: GnssOperationState, reason: str) -> bool:
+        try:
+            self.gnss_operation_manager.transition(state, reason)
+        except (RuntimeError, ValueError) as exc:
+            self._set_health_label(self.gnss_base_status_labels["operation"], f"상태 전환 실패: {exc}", "bad")
+            self._log(f"[GNSS] 상태 전환 실패: {exc}")
+            return False
+        self._set_health_label(
+            self.gnss_base_status_labels["operation"],
+            f"{self.gnss_operation_manager.state.value} | {reason}",
+            "good" if self.gnss_operation_manager.state == GnssOperationState.READY else "warn",
+        )
+        return True
+
+    def _handle_gnss_operation_mode_changed(self) -> None:
+        if not hasattr(self, "gnss_operation_mode_combo"):
+            return
+        mode = self._gnss_selected_operation_mode()
+        local_mode = mode == GnssOperationMode.LOCAL_SURVEY_IN
+        serial_allowed = mode in {
+            GnssOperationMode.LOCAL_SURVEY_IN,
+            GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
+        }
+        network_allowed = not local_mode
+        if hasattr(self, "gnss_base_connect_button"):
+            self.gnss_base_connect_button.setEnabled(serial_allowed and self.gnss_base_serial_thread is None)
+        if hasattr(self, "gnss_base_discover_button"):
+            self.gnss_base_discover_button.setEnabled(serial_allowed and self.gnss_base_detect_thread is None)
+        if hasattr(self, "gnss_base_survey_start_button"):
+            self.gnss_base_survey_start_button.setEnabled(local_mode and self.gnss_base_serial_connected)
+        if hasattr(self, "gnss_base_survey_stop_button"):
+            self.gnss_base_survey_stop_button.setEnabled(local_mode and self.gnss_base_serial_connected)
+        if hasattr(self, "gnss_network_start_button"):
+            self.gnss_network_start_button.setEnabled(network_allowed and self.gnss_network_thread is None)
+        if hasattr(self, "gnss_base_status_labels") and "operation" in self.gnss_base_status_labels:
+            self._set_health_label(
+                self.gnss_base_status_labels["operation"],
+                f"{mode.value} | {'현장 serial' if local_mode else 'NTRIP correction'}",
+                "idle" if self.gnss_operation_manager.state in {GnssOperationState.DISCONNECTED, GnssOperationState.STOPPED} else "warn",
+            )
+
+    def _gnss_source_identity(self, config: GnssOperationConfig) -> CorrectionSourceIdentity:
+        if config.operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
+            return CorrectionSourceIdentity(
+                source_kind="local-serial-survey-in",
+                base_device=config.local_base.device,
+            )
+        return CorrectionSourceIdentity(
+            source_kind=("ntrip-fixed-base" if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE else "ntrip-direct"),
+            caster_host=config.network.caster_host,
+            caster_port=config.network.caster_port,
+            mountpoint=config.network.mountpoint,
+            gga_policy=config.network.gga_policy,
+            base_device=config.local_base.device if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE else "",
+        )
+
+    def _gnss_gga_provider(self) -> str | None:
+        policy = self._gnss_active_operation_config().network.gga_policy
+        left = self.latest_gps.get("left")
+        right = self.latest_gps.get("right")
+        positions = [position for position in (left, right) if position is not None and position.has_position]
+        if policy == GgaPolicy.MANUAL or not positions:
+            return None
+        if policy == GgaPolicy.LEFT_GNSS or len(positions) == 1:
+            return gga_from_position(positions[0])
+        if policy == GgaPolicy.PER_ROVER_SESSION:
+            return gga_from_position(left or positions[0])
+        # SYSTEM_CENTER: average WGS84 geodetic values for the two antenna hints.
+        lat = sum(float(position.latitude_deg) for position in positions) / len(positions)
+        lon = sum(float(position.longitude_deg) for position in positions) / len(positions)
+        alt = sum(float(position.altitude_m) for position in positions) / len(positions)
+        return format_nmea_gga(lat, lon, alt, fix_quality=1, satellites=12, hdop=1.0)
+
+    def start_gnss_network(self) -> None:
+        if self.gnss_network_thread is not None:
+            return
+        config = self._build_gnss_operation_config()
+        if config.operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
+            self._set_health_label(self.gnss_base_status_labels["network"], "현장 모드에서는 NTRIP을 시작할 수 없습니다", "warn")
+            return
+        if not config.network.caster_host or not config.network.mountpoint:
+            self._set_health_label(self.gnss_base_status_labels["network"], "caster host/mountpoint 필요", "bad")
+            return
+        if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and not self.gnss_base_serial_connected:
+            self._set_health_label(self.gnss_base_status_labels["network"], "보조 Fixed Base 모드는 먼저 Base serial을 연결하세요", "bad")
+            return
+        if self.mavlink_pixhawk is None:
+            self._set_health_label(self.gnss_base_status_labels["network"], "RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
+            return
+        try:
+            self._gnss_configure_manager(config)
+            self.gnss_operation_manager.set_source_identity(self._gnss_source_identity(config))
+            if not self._gnss_transition(GnssOperationState.INITIALIZING, "NTRIP 운용 초기화"):
+                return
+            if not self._gnss_transition(GnssOperationState.NTRIP_CONNECTING, "NTRIP caster 연결 중"):
+                return
+        except (ValueError, RuntimeError) as exc:
+            self._set_health_label(self.gnss_base_status_labels["network"], f"운용 설정 실패: {exc}", "bad")
+            return
+        self.gnss_operation_gate_active = True
+        self.gnss_active_operation_config = config
+        self.gnss_network_connected = False
+        self.gnss_network_status_line = ""
+        self.gnss_network_rtcm_parser = Rtcm3StreamParser()
+        self.gnss_coordinate_samples.clear()
+        self.gnss_fixed_base_profile = None
+        self.gnss_fixed_base_pending_profile = None
+        self.gnss_fixed_base_command_sent = False
+        self.gnss_fixed_base_reconfigure_expected = None
+        self.gnss_fixed_base_reconfigure_ack = False
+        self.gnss_fixed_base_reconfigure_readback = False
+        self.gnss_fixed_base_reconfigure_rtcm = False
+        self.gnss_fixed_base_reconfigure_deadline_s = None
+        self._reset_gnss_base_rtcm_stats()
+        self.gnss_network_start_button.setEnabled(False)
+        self.gnss_network_stop_button.setEnabled(True)
+        self._set_gnss_operation_controls_locked(True)
+        self._set_health_label(self.gnss_base_status_labels["network"], "NTRIP 연결 중", "warn")
+        thread = QtCore.QThread(self)
+        worker = NtripNetworkWorker(config=config, gga_provider=self._gnss_gga_provider)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.connected.connect(self._handle_gnss_network_connected)
+        worker.chunk_received.connect(self._handle_gnss_network_chunk)
+        worker.reconnecting.connect(self._handle_gnss_network_reconnecting)
+        worker.failed.connect(self._handle_gnss_network_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda: self._clear_gnss_network_worker(thread))
+        self.gnss_network_thread = thread
+        self.gnss_network_worker = worker
+        thread.start()
+
+    def stop_gnss_network(self) -> bool:
+        worker = self.gnss_network_worker
+        if worker is not None:
+            worker.request_stop()
+        thread = self.gnss_network_thread
+        self.gnss_network_connected = False
+        self.gnss_operation_gate_active = False
+        self.gnss_operation_manager.stop()
+        if hasattr(self, "gnss_base_status_labels"):
+            self._set_health_label(
+                self.gnss_base_status_labels["network"],
+                "NTRIP 종료 중" if thread is not None and thread.isRunning() else "NTRIP 중지",
+                "warn" if thread is not None and thread.isRunning() else "idle",
+            )
+        if thread is None or not thread.isRunning():
+            self.gnss_active_operation_config = None
+            self._set_gnss_operation_controls_locked(False)
+            self._handle_gnss_operation_mode_changed()
+            return True
+        return False
+
+    def _handle_gnss_network_connected(self, status_line: str, stats: object) -> None:
+        self.gnss_network_connected = True
+        self.gnss_network_status_line = str(status_line)
+        self._gnss_transition(GnssOperationState.NTRIP_ACTIVE, f"NTRIP active: {status_line}")
+        self._set_health_label(self.gnss_base_status_labels["network"], f"{status_line} | RTCM 대기", "good")
+
+    def _handle_gnss_network_chunk(self, chunk: object) -> None:
+        if not isinstance(chunk, (bytes, bytearray)):
+            return
+        payload = bytes(chunk)
+        mode = self._gnss_active_operation_config().operation_mode
+        if mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
+            worker = self.gnss_base_serial_worker
+            if worker is None or not self.gnss_base_serial_connected:
+                self._set_health_label(self.gnss_base_status_labels["network"], "NTRIP 수신 중이나 Base serial이 끊겼습니다", "bad")
+                return
+            worker.send_bytes("NTRIP RTCM -> fixed base", payload)
+            self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP {len(payload)} bytes -> fixed base", "good")
+            return
+        frames = self.gnss_network_rtcm_parser.feed(payload)
+        if not frames:
+            self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP raw {len(payload)} bytes | RTCM frame 대기", "warn")
+            return
+        for frame in frames:
+            self._handle_gnss_base_rtcm_frame(frame)
+        self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP RTCM {len(frames)} frame 수신", "good")
+
+    def _handle_gnss_network_failed(self, message: str) -> None:
+        self.gnss_network_connected = False
+        self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP 실패: {message}", "bad")
+        self._gnss_transition(GnssOperationState.FAULT, f"NTRIP failure: {message}")
+
+    def _handle_gnss_network_reconnecting(self, message: str) -> None:
+        if not self.gnss_operation_gate_active:
+            return
+        self.gnss_network_connected = False
+        self._set_health_label(
+            self.gnss_base_status_labels["network"],
+            f"NTRIP 재연결 대기: {message}",
+            "warn",
+        )
+
+    def _clear_gnss_network_worker(self, thread: QtCore.QThread) -> None:
+        if self.gnss_network_thread is thread:
+            self.gnss_network_thread = None
+            self.gnss_network_worker = None
+            self.gnss_network_connected = False
+            self.gnss_active_operation_config = None
+            self._set_gnss_operation_controls_locked(False)
+            if hasattr(self, "gnss_network_start_button"):
+                self.gnss_network_start_button.setEnabled(self._gnss_selected_operation_mode() != GnssOperationMode.LOCAL_SURVEY_IN)
+            if hasattr(self, "gnss_network_stop_button"):
+                self.gnss_network_stop_button.setEnabled(False)
+        thread.deleteLater()
+
+    def _handle_gnss_base_position(self, sample: object) -> None:
+        if not isinstance(sample, GnssCoordinateSample):
+            return
+        self.gnss_coordinate_samples.append(sample)
+        config = self._gnss_active_operation_config()
+        if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
+            return
+        if not self.gnss_network_connected or self.gnss_fixed_base_command_sent:
+            return
+        state = self.gnss_operation_manager.state
+        if state == GnssOperationState.NTRIP_ACTIVE:
+            self._gnss_transition(GnssOperationState.BASE_AS_ROVER_FLOAT, "Base가 NTRIP 보정 rover로 수렴 중")
+            state = self.gnss_operation_manager.state
+        if sample.fixed and state == GnssOperationState.BASE_AS_ROVER_FLOAT:
+            self._gnss_transition(GnssOperationState.BASE_AS_ROVER_FIXED, "Base rover가 RTK FIXED")
+            state = self.gnss_operation_manager.state
+        if sample.fixed and state == GnssOperationState.BASE_AS_ROVER_FIXED:
+            self._gnss_transition(GnssOperationState.FIXED_COORDINATE_COLLECTING, "고정 좌표 반복 측정 수집")
+        if self.gnss_operation_manager.state != GnssOperationState.FIXED_COORDINATE_COLLECTING:
+            self._set_health_label(
+                self.gnss_base_status_labels["operation"],
+                f"{self.gnss_operation_manager.state.value} | Base fix={sample.fixed}",
+                "warn",
+            )
+            return
+        if sample.height_type != config.fixed_base.height_type:
+            self._set_health_label(
+                self.gnss_base_status_labels["operation"],
+                "Base 좌표 height datum이 활성 GNSS 운용 설정과 다릅니다",
+                "bad",
+            )
+            self._gnss_transition(GnssOperationState.FAULT, "Base coordinate height datum changed during operation")
+            return
+        validation = FixedBaseInitializer(config.fixed_base).validate(
+            tuple(self.gnss_coordinate_samples),
+            acquisition_start_utc="",
+            acquisition_end_utc="",
+            source_caster=config.network.caster_host,
+            source_mountpoint=config.network.mountpoint,
+        )
+        profile = validation.profile
+        if profile is None:
+            self._set_health_label(self.gnss_base_status_labels["operation"], "고정 좌표 프로파일 수집 중", "warn")
+            return
+        self._set_health_label(
+            self.gnss_base_status_labels["operation"],
+            f"FIXED 수집 {profile.collection_duration_s:.1f}s/{config.fixed_base.acquisition_duration_s:.1f}s | "
+            f"scatter H/V={profile.horizontal_scatter_m:.3f}/{profile.vertical_scatter_m:.3f}m",
+            "warn" if not validation.valid else "good",
+        )
+        if not validation.valid:
+            return
+        if profile.height_type != HeightType.ELLIPSOID:
+            self._set_health_label(
+                self.gnss_base_status_labels["operation"],
+                "고정 좌표 검증됨이지만 TMODE3에는 WGS84 ellipsoid height가 필요합니다",
+                "bad",
+            )
+            return
+        worker = self.gnss_base_serial_worker
+        if worker is None or not self.gnss_base_serial_connected:
+            self._set_health_label(self.gnss_base_status_labels["operation"], "고정 좌표 검증됨 | Base serial 재연결 필요", "bad")
+            return
+        if not self._gnss_transition(GnssOperationState.FIXED_COORDINATE_VALIDATED, "반복 측정 좌표 검증 통과"):
+            return
+        if not self._gnss_transition(GnssOperationState.BASE_RECONFIGURING, "CFG-TMODE3 fixed 좌표 적용"):
+            return
+        accuracy_m = max(0.01, profile.horizontal_scatter_m, profile.vertical_scatter_m)
+        fixed_frame = ubx_cfg_tmode3_fixed_frame(
+            latitude_deg=profile.latitude_deg,
+            longitude_deg=profile.longitude_deg,
+            ellipsoid_height_m=profile.height_m,
+            fixed_position_accuracy_m=accuracy_m,
+        )
+        expected = parse_ubx_cfg_tmode3(fixed_frame[6:-2])
+        if expected is None:
+            self._gnss_transition(GnssOperationState.FAULT, "CFG-TMODE3 fixed command could not be decoded")
+            return
+        self._reset_gnss_base_rtcm_stats()
+        worker.send_bytes("CFG-TMODE3 fixed coordinate", fixed_frame)
+        self.gnss_fixed_base_pending_profile = profile
+        self.gnss_fixed_base_reconfigure_expected = expected
+        self.gnss_fixed_base_reconfigure_ack = False
+        self.gnss_fixed_base_reconfigure_readback = False
+        self.gnss_fixed_base_reconfigure_rtcm = False
+        self.gnss_fixed_base_reconfigure_deadline_s = time.monotonic() + 10.0
+        self.gnss_fixed_base_command_sent = True
+        self._set_health_label(
+            self.gnss_base_status_labels["operation"],
+            "CFG-TMODE3 fixed 전송됨 | ACK/readback/post-config RTCM 대기",
+            "warn",
+        )
+
+    def _fail_gnss_fixed_base_reconfiguration(self, reason: str) -> None:
+        self.gnss_fixed_base_pending_profile = None
+        self.gnss_fixed_base_reconfigure_expected = None
+        self.gnss_fixed_base_reconfigure_deadline_s = None
+        self._set_health_label(self.gnss_base_status_labels["operation"], f"Fixed Base 재설정 실패: {reason}", "bad")
+        self._gnss_transition(GnssOperationState.FAULT, f"fixed base reconfiguration failed: {reason}")
+
+    def _handle_gnss_base_ubx_message(self, message_class: int, message_id: int, payload: object) -> None:
+        """Advance fixed-base setup only from receiver evidence, not queued writes."""
+
+        if not isinstance(payload, (bytes, bytearray)):
+            return
+        if self.gnss_operation_manager.state != GnssOperationState.BASE_RECONFIGURING:
+            return
+        raw_payload = bytes(payload)
+        ack = parse_ubx_ack(int(message_class), int(message_id), raw_payload)
+        if ack is not None:
+            accepted, target_class, target_id = ack
+            if (target_class, target_id) != (0x06, 0x71):
+                return
+            if not accepted:
+                self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 ACK-NAK")
+                return
+            self.gnss_fixed_base_reconfigure_ack = True
+            worker = self.gnss_base_serial_worker
+            if worker is None or not self.gnss_base_serial_connected:
+                self._fail_gnss_fixed_base_reconfiguration("Base serial disconnected before CFG-TMODE3 readback")
+                return
+            worker.send_bytes("CFG-TMODE3 poll after fixed coordinate ACK", ubx_cfg_tmode3_poll_frame())
+            self._set_health_label(self.gnss_base_status_labels["operation"], "CFG-TMODE3 ACK 수신 | readback 대기", "warn")
+            return
+        if (int(message_class), int(message_id)) != (0x06, 0x71):
+            return
+        expected = self.gnss_fixed_base_reconfigure_expected
+        received = parse_ubx_cfg_tmode3(raw_payload)
+        if expected is None or received is None:
+            self._fail_gnss_fixed_base_reconfiguration("invalid CFG-TMODE3 readback")
+            return
+        keys = ("mode", "ecef_cm", "ecef_hp_0_1mm", "fixed_accuracy_0_1mm")
+        if any(received.get(key) != expected.get(key) for key in keys):
+            self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 readback mismatch")
+            return
+        self.gnss_fixed_base_reconfigure_readback = True
+        self._set_health_label(self.gnss_base_status_labels["operation"], "CFG-TMODE3 readback 확인 | post-config RTCM 대기", "warn")
+        self._maybe_activate_gnss_fixed_base()
+
+    def _maybe_activate_gnss_fixed_base(self) -> None:
+        if self.gnss_operation_manager.state != GnssOperationState.BASE_RECONFIGURING:
+            return
+        if not (
+            self.gnss_fixed_base_reconfigure_ack
+            and self.gnss_fixed_base_reconfigure_readback
+            and self.gnss_fixed_base_reconfigure_rtcm
+        ):
+            return
+        profile = self.gnss_fixed_base_pending_profile
+        if profile is None:
+            self._fail_gnss_fixed_base_reconfiguration("validated profile was lost")
+            return
+        self.gnss_fixed_base_profile = profile
+        self.gnss_fixed_base_pending_profile = None
+        self.gnss_fixed_base_reconfigure_deadline_s = None
+        self._gnss_transition(GnssOperationState.LOCAL_RTCM_ACTIVE, "CFG-TMODE3 ACK/readback와 post-config Base RTCM 확인")
+
+    def _refresh_gnss_operation_readiness(self) -> None:
+        if not self.gnss_operation_gate_active:
+            return
+        config = self.gnss_operation_manager.config
+        if (
+            self.gnss_active_operation_config is not None
+            and self.gnss_operation_manager.state in {GnssOperationState.READY, GnssOperationState.MEASURING}
+            and self._build_gnss_operation_config() != config
+        ):
+            self.gnss_operation_manager.invalidate("GNSS controls changed during active operation")
+            return
+        if self.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING:
+            deadline_s = self.gnss_fixed_base_reconfigure_deadline_s
+            if deadline_s is not None and time.monotonic() > deadline_s:
+                self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 ACK/readback/post-config RTCM timeout")
+            return
+        target_sides = self._gnss_base_rtcm_target_sides()
+        now_s = time.monotonic()
+        injection = self.gnss_base_rtcm_stats.get("injection")
+        injection_map = injection if isinstance(injection, dict) else {}
+        mavlink = self.mavlink_pixhawk
+        connections = getattr(mavlink, "connections", None)
+        heartbeat_sides = getattr(mavlink, "_heartbeat_logged", set())
+        routes: dict[str, RoverCorrectionStatus] = {}
+        rover_samples: dict[str, RoverReadinessInput] = {}
+        for side in target_sides:
+            side_stats = injection_map.get(side)
+            if not isinstance(side_stats, dict):
+                side_stats = {}
+            if isinstance(connections, dict):
+                endpoint_live = side in connections and side in heartbeat_sides
+                endpoint_identity = f"mavlink:{side}" if endpoint_live else ""
+            else:
+                # Test adapters may not expose the production subscriber
+                # internals; their presence still represents a route endpoint.
+                endpoint_identity = "" if mavlink is None else f"mavlink:{side}"
+            routes[side] = RoverCorrectionStatus(
+                target=side,
+                enabled=True,
+                endpoint_identity=endpoint_identity,
+                bytes_sent=int(side_stats.get("bytes") or 0),
+                packets_sent=int(side_stats.get("packets") or 0),
+                last_delivery_monotonic_s=side_stats.get("last_delivery_s"),
+                fault_reason=("injection failed" if int(side_stats.get("fail") or 0) > 0 else ""),
+            )
+        for side in ("left", "right", "drone"):
+            gps = self.latest_gps.get(side)
+            if gps is None:
+                self.gnss_rover_fixed_since[side] = None
+                continue
+            if gps.fix_type == 6:
+                if self.gnss_rover_fixed_since.get(side) is None:
+                    self.gnss_rover_fixed_since[side] = now_s
+            else:
+                self.gnss_rover_fixed_since[side] = None
+            rover_samples[side] = RoverReadinessInput(
+                target=side,
+                fix_type=gps.fix_type,
+                gps_sample_monotonic_s=gps.timestamp_s,
+                eph_m=gps.eph_m,
+                epv_m=getattr(gps, "epv_m", None),
+                rtk_fixed_since_monotonic_s=self.gnss_rover_fixed_since.get(side),
+                device_id=str(getattr(gps, "topic", side)),
+            )
+        last_frame_s = self.gnss_base_rtcm_stats.get("last_frame_s")
+        baseline_vector = self.latest_baseline_vector
+        baseline_quality = self.latest_baseline_quality
+        source = self.gnss_operation_manager.source_identity
+        candidate = evaluate_gnss_readiness(
+            config,
+            GnssReadinessInputs(
+                # Evaluate the policy as a candidate; the transition state is
+                # applied below only after every enabled criterion passes.
+                state=GnssOperationState.READY,
+                now_monotonic_s=now_s,
+                correction_received_monotonic_s=last_frame_s,
+                correction_source_id="" if source is None else source.stable_id,
+                routes=routes,
+                rover_samples=rover_samples,
+                left_right_timestamp_delta_ms=(
+                    None if baseline_vector is None else baseline_vector.timestamp_delta_ms
+                ),
+                baseline_std_m=(
+                    None if baseline_quality is None else baseline_quality.baseline_length_std_m
+                ),
+            ),
+        )
+        reasons = candidate.reasons
+        # A disabled readiness gate remains observable in the status snapshot,
+        # but must not leave the state machine permanently below READY.  The
+        # measurement manager records the warning-only, no-contract path.
+        transition_reasons = reasons if config.readiness_gate_enabled else ()
+        state = self.gnss_operation_manager.state
+        if state in {GnssOperationState.NTRIP_ACTIVE, GnssOperationState.LOCAL_RTCM_ACTIVE} and not transition_reasons:
+            self._gnss_transition(GnssOperationState.ROVERS_CONVERGING, "RTCM rover 주입 시작")
+            state = self.gnss_operation_manager.state
+        if state == GnssOperationState.ROVERS_CONVERGING and not transition_reasons:
+            self._gnss_transition(GnssOperationState.ALIGNMENT_COLLECTING, "양쪽 rover FIXED 수신")
+            state = self.gnss_operation_manager.state
+        if state == GnssOperationState.ALIGNMENT_COLLECTING and not transition_reasons:
+            self._gnss_transition(GnssOperationState.ALIGNMENT_VALID, "GNSS rover 정합 조건 통과")
+            state = self.gnss_operation_manager.state
+        if state == GnssOperationState.ALIGNMENT_VALID and not transition_reasons:
+            self._gnss_transition(GnssOperationState.READY, "GNSS measurement readiness 통과")
+            state = self.gnss_operation_manager.state
+        if state == GnssOperationState.READY and transition_reasons:
+            self._gnss_transition(GnssOperationState.DEGRADED, "; ".join(reasons))
+            state = self.gnss_operation_manager.state
+        if state == GnssOperationState.DEGRADED and not transition_reasons:
+            self._gnss_transition(GnssOperationState.READY, "GNSS 조건 복구")
+            state = self.gnss_operation_manager.state
+        if state == GnssOperationState.MEASURING and transition_reasons:
+            self.gnss_operation_manager.invalidate("GNSS readiness changed: " + ", ".join(reasons))
+            state = self.gnss_operation_manager.state
+        snapshot = GnssReadinessSnapshot(
+            ready=not reasons,
+            state=state,
+            reasons=reasons,
+            warnings=candidate.warnings,
+            mode=config.operation_mode,
+            correction_source_id="" if source is None else source.stable_id,
+            timestamp_s=now_s,
+            reason_messages=candidate.reason_messages,
+        )
+        self.gnss_operation_manager.update_readiness(snapshot)
+        if hasattr(self, "gnss_base_status_labels") and "operation" in self.gnss_base_status_labels and reasons:
+            self._set_health_label(
+                self.gnss_base_status_labels["operation"],
+                f"{state.value} | " + "; ".join(snapshot.reason_messages.get(code, code) for code in reasons[:3]),
+                "warn",
+            )
+
     def connect_gnss_base_serial(self) -> None:
         if self.gnss_base_serial_thread is not None:
             return
@@ -7296,7 +8203,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_connect_button.setEnabled(False)
         self.gnss_base_disconnect_button.setEnabled(True)
         thread = QtCore.QThread(self)
-        worker = GnssBaseSerialWorker(port=port, baud=baud)
+        height_value = self.gnss_fixed_height_combo.currentData()
+        try:
+            height_type = HeightType(height_value)
+        except (TypeError, ValueError):
+            height_type = HeightType.ELLIPSOID
+        worker = GnssBaseSerialWorker(port=port, baud=baud, height_type=height_type)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.connected.connect(self._handle_gnss_base_serial_connected)
@@ -7304,6 +8216,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         worker.survey_in_changed.connect(self._handle_gnss_base_survey_in)
         worker.satellite_count_changed.connect(self._handle_gnss_base_satellite_count)
         worker.satellite_quality_changed.connect(self._handle_gnss_base_satellite_quality)
+        worker.position_changed.connect(self._handle_gnss_base_position)
+        worker.ubx_message_received.connect(self._handle_gnss_base_ubx_message)
         worker.rtcm_frame_received.connect(self._handle_gnss_base_rtcm_frame)
         worker.command_sent.connect(self._handle_gnss_base_command_sent)
         worker.failed.connect(self._handle_gnss_base_serial_failed)
@@ -7329,6 +8243,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if worker is None:
             self._set_health_label(self.gnss_base_status_labels["survey_in"], "serial 미연결", "bad")
             return
+        config = self._build_gnss_operation_config()
+        if config.operation_mode != GnssOperationMode.LOCAL_SURVEY_IN:
+            self._set_health_label(
+                self.gnss_base_status_labels["survey_in"],
+                "현재 모드에서는 현장 Survey-in을 시작할 수 없습니다",
+                "warn",
+            )
+            return
+        self._gnss_configure_manager(config)
+        self.gnss_operation_manager.set_source_identity(self._gnss_source_identity(config))
+        self.gnss_active_operation_config = config
+        self.gnss_operation_gate_active = True
+        self._set_gnss_operation_controls_locked(True)
+        self._gnss_transition(GnssOperationState.INITIALIZING, "현장 Base Survey-in 초기화")
+        self._gnss_transition(GnssOperationState.BASE_SURVEYING, "현장 Base Survey-in 진행")
         frame = ubx_cfg_tmode3_survey_in_frame(
             min_duration_s=self.gnss_base_survey_duration_spin.value(),
             accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
@@ -7345,7 +8274,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         worker.send_bytes("CFG-TMODE3 disabled", ubx_cfg_tmode3_disabled_frame())
         worker.send_bytes("NAV-SVIN poll after survey-in stop", ubx_nav_svin_poll_frame())
+        self.gnss_operation_gate_active = False
+        self.gnss_operation_manager.stop()
+        self.gnss_active_operation_config = None
+        self._set_gnss_operation_controls_locked(False)
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "survey-in 중지 명령 전송 대기", "warn")
+        self._handle_gnss_operation_mode_changed()
 
     def discover_gnss_base_serial_ports(self) -> None:
         if self.gnss_base_detect_thread is not None:
@@ -7430,8 +8364,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "UBX NAV-SVIN 대기 중", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "UBX NAV-PVT/NAV-SAT 대기 중", "idle")
         self._set_gnss_base_quality_waiting("NAV-SAT 대기 중")
-        self.gnss_base_survey_start_button.setEnabled(True)
-        self.gnss_base_survey_stop_button.setEnabled(True)
+        self._handle_gnss_operation_mode_changed()
 
     def _handle_gnss_base_serial_stats(self, total_bytes: int, rate_bps: float, age_s: float) -> None:
         age_text = "no data" if age_s < 0.0 else f"age={age_s:.1f}s"
@@ -7452,6 +8385,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._reset_gnss_base_rtcm_stats()
         self.gnss_base_survey_start_button.setEnabled(False)
         self.gnss_base_survey_stop_button.setEnabled(False)
+        if self.gnss_operation_gate_active:
+            self._gnss_transition(GnssOperationState.DEGRADED, f"Base serial failure: {message}")
 
     def _handle_gnss_base_serial_disconnected(self, message: str) -> None:
         self.gnss_base_serial_connected = False
@@ -7462,6 +8397,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._reset_gnss_base_rtcm_stats()
         self.gnss_base_survey_start_button.setEnabled(False)
         self.gnss_base_survey_stop_button.setEnabled(False)
+        if self.gnss_operation_gate_active:
+            self._gnss_transition(GnssOperationState.DEGRADED, f"Base serial disconnected: {message}")
 
     def _handle_gnss_base_satellite_count(self, count: int, source: str) -> None:
         level = "good" if count >= 12 else "warn" if count >= 6 else "bad"
@@ -7621,6 +8558,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _gnss_base_rtcm_target_sides(self) -> tuple[str, ...]:
+        config = self.gnss_active_operation_config
+        if config is not None:
+            return tuple(
+                side
+                for side, enabled in (("left", config.routing.left_enabled), ("right", config.routing.right_enabled))
+                if enabled
+            )
         target = str(self.gnss_base_rtcm_target_combo.currentData() or "disabled")
         if target == "both":
             return ("left", "right")
@@ -7662,16 +8606,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         side_stats["frames"] = int(side_stats.get("frames") or 0) + 1
         side_stats["bytes"] = int(side_stats.get("bytes") or 0) + int(payload_bytes)
         side_stats["packets"] = int(side_stats.get("packets") or 0) + int(packet_count)
+        side_stats["last_delivery_s"] = time.monotonic()
 
     def _handle_gnss_base_rtcm_frame(self, frame: object) -> None:
         if not isinstance(frame, (bytes, bytearray)):
             return
         payload = bytes(frame)
         self._record_gnss_base_rtcm_frame(payload)
+        if (
+            self.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
+            and parse_rtcm3_message_type(payload) in {1005, 1006}
+        ):
+            self.gnss_fixed_base_reconfigure_rtcm = True
         target_sides = self._gnss_base_rtcm_target_sides()
         if not target_sides:
             self._set_health_label(self.gnss_base_status_labels["rtcm_injection"], "비활성", "idle")
             self._refresh_gnss_base_rtcm_stats()
+            self._refresh_gnss_operation_readiness()
             return
         if self.mavlink_pixhawk is None:
             for side in target_sides:
@@ -7682,6 +8633,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "warn",
             )
             self._refresh_gnss_base_rtcm_stats()
+            self._refresh_gnss_operation_readiness()
             return
         sent_sides: list[str] = []
         failed: list[str] = []
@@ -7716,6 +8668,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "bad",
             )
         self._refresh_gnss_base_rtcm_stats()
+        self._maybe_activate_gnss_fixed_base()
+        self._refresh_gnss_operation_readiness()
 
     def _handle_gnss_base_command_sent(self, label: str, byte_count: int) -> None:
         self._set_health_label(
@@ -7761,6 +8715,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             accuracy_m=accuracy_m,
             observations=observations,
         )
+        if valid and self._gnss_active_operation_config().operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
+            if self.gnss_operation_manager.state == GnssOperationState.BASE_SURVEYING:
+                self._gnss_transition(GnssOperationState.LOCAL_RTCM_ACTIVE, "현장 Survey-in valid; RTCM rover 라우팅")
+            self._refresh_gnss_operation_readiness()
 
     def _update_gnss_base_survey_visualization(
         self,
@@ -13195,6 +14153,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "camera_time_sync_drift": self._camera_time_sync_drift_metadata(),
             "camera_timing_diagnostics": self._recording_camera_timing_diagnostics(),
             "pc_utc_sync": self._last_wiris_pc_utc_sync,
+            "gnss_operation": self.gnss_operation_manager.metadata(),
+            "gnss_operation_config": self.gnss_operation_manager.config.to_mapping(),
+            "gnss_fixed_base_profile": (
+                None
+                if self.gnss_fixed_base_profile is None
+                else self.gnss_fixed_base_profile.to_mapping()
+            ),
             "rtcp_pair_delta_s": camera_time_metrics["pair_delta_s"],
             "rtcp_pc_offset_max_ms": camera_time_metrics["max_pc_offset_ms"],
             "rtcp_frame_transit_max_ms": camera_time_metrics["max_frame_transit_delay_ms"],
@@ -15359,6 +16324,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             gnss_base_survey_in_min_duration_s=self.gnss_base_survey_duration_spin.value(),
             gnss_base_survey_in_accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
             gnss_base_rtcm_injection_target=str(self.gnss_base_rtcm_target_combo.currentData() or "disabled"),
+            gnss_operation=(
+                self._build_gnss_operation_config()
+                if hasattr(self, "gnss_operation_mode_combo")
+                else self.settings.gnss_operation
+            ),
             clock_ftp_user=self.clock_ftp_user_edit.text().strip() or "anonymous",
             clock_ftp_password=self.clock_ftp_password_edit.text(),
             clock_ftp_port=self.clock_ftp_port_spin.value(),
@@ -16110,6 +17080,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.gnss_base_detect_thread is not None:
             self.gnss_base_detect_thread.quit()
             self.gnss_base_detect_thread.wait(1000)
+        if not self.stop_gnss_network():
+            event.ignore()
+            QtCore.QTimer.singleShot(100, self.close)
+            return
         self.disconnect_gnss_base_serial()
         self.stop_all()
         if not self._wait_for_session_save():
@@ -16828,6 +17802,73 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             scale_to_m=scale_to_m,
         )
 
+    def _capture_measurement_gnss_contract(
+        self, readiness: GnssReadinessSnapshot
+    ) -> object | None:
+        """Capture the immutable GNSS provenance used by one measurement.
+
+        The baseline hash names the NED vector explicitly: north/east/down is
+        the PX4/world position contract, never a camera RDF or stereo-center
+        coordinate.  Camera-frame conversion remains in MeasurementAttempt.
+        """
+
+        config = self.gnss_operation_manager.config
+        if not config.readiness_gate_enabled:
+            return None
+        base_profile = self.gnss_fixed_base_profile
+        base_hash = "" if base_profile is None else str(base_profile.profile_hash)
+        vector = self.latest_baseline_vector
+        baseline_hash = ""
+        if vector is not None:
+            baseline_payload = {
+                "frame": "NED",
+                "axis_order": "north,east,down",
+                "north_m": vector.north_m,
+                "east_m": vector.east_m,
+                "down_m": vector.down_m,
+                "timestamp_delta_ms": vector.timestamp_delta_ms,
+            }
+            baseline_hash = hashlib.sha256(
+                json.dumps(baseline_payload, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+        routes = {
+            side: f"mavlink:{side}"
+            for side in self._gnss_base_rtcm_target_sides()
+        }
+        device_ids = {
+            side: str(getattr(sample, "topic", side))
+            for side, sample in self.latest_gps.items()
+            if side in {"left", "right", "drone"}
+        }
+        return self.gnss_operation_manager.capture_measurement_contract(
+            readiness,
+            base_coordinate_profile_hash=base_hash,
+            baseline_profile_hash=baseline_hash,
+            device_ids=device_ids,
+            route_endpoints=routes,
+            datum="WGS84",
+        )
+
+    def _measurement_gnss_record_metadata(self) -> dict[str, object]:
+        """Return the frozen GNSS contract fields for a recording row."""
+
+        metadata = self.gnss_operation_manager.metadata()
+        contract = metadata.get("measurement_contract")
+        readiness = metadata.get("readiness")
+        if not isinstance(contract, dict):
+            return {
+                "gnss_contract_id": "",
+                "gnss_contract_metadata": "",
+                "gnss_readiness_timestamp_s": "",
+            }
+        return {
+            "gnss_contract_id": str(contract.get("gnss_contract_id", "")),
+            "gnss_contract_metadata": json.dumps(contract, sort_keys=True, separators=(",", ":")),
+            "gnss_readiness_timestamp_s": ""
+            if not isinstance(readiness, dict)
+            else self._fmt_record_float(readiness.get("timestamp_s"), 6),
+        }
+
     def _refresh_distance(self) -> None:
         if self._rtsp_urls_are_same_stream():
             self._clear_measurement_pair_display()
@@ -16849,6 +17890,37 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 detail=self._detection_wait_detail(),
             )
             return
+        if self.gnss_operation_gate_active:
+            readiness = self.gnss_operation_manager.readiness()
+            config = self.gnss_operation_manager.config
+            if config.readiness_gate_enabled and (readiness is None or not readiness.ready):
+                reasons = ("GNSS readiness snapshot 대기",) if readiness is None else readiness.reasons
+                reason_text = "; ".join(reasons[:3]) or self.gnss_operation_manager.state.value
+                self._clear_measurement_pair_display()
+                self._clear_triangulation_quality("GNSS 운용 준비 조건 미충족")
+                self._set_distance_text(
+                    f"거리: GNSS 운용 준비 중 | {reason_text}",
+                    quality="BAD",
+                    detail="그래프 미표시: 선택한 GNSS 보정 운용의 readiness 조건을 만족하지 못했습니다.",
+                )
+                return
+            if readiness is not None:
+                try:
+                    contract = self._capture_measurement_gnss_contract(readiness)
+                    if self.gnss_operation_manager.state == GnssOperationState.READY:
+                        self.gnss_operation_manager.begin_measurement(contract, readiness)
+                    elif self.gnss_operation_manager.state == GnssOperationState.MEASURING:
+                        if not self.gnss_operation_manager.validate_measurement_contract(contract, readiness):
+                            raise RuntimeError("GNSS measurement contract changed")
+                except (RuntimeError, ValueError) as exc:
+                    self._clear_measurement_pair_display()
+                    self._clear_triangulation_quality("GNSS measurement contract 검증 실패")
+                    self._set_distance_text(
+                        f"거리: GNSS measurement contract 차단 | {exc}",
+                        quality="BAD",
+                        detail="그래프 미표시: 측정 시작 시점 GNSS provenance를 고정하거나 검증하지 못했습니다.",
+                    )
+                    return
         if self._measurement_display_mode() == "detection":
             self._show_measurement_pair(pair.left, pair.right)
         else:
@@ -17199,6 +18271,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         row.update(self._record_intrinsic_parameters(measurement_attempt))
         row.update(self._record_frame_timestamp_parameters(measurement_attempt))
         row.update(self._record_live_telemetry_snapshot_parameters(measurement_attempt))
+        row.update(self._measurement_gnss_record_metadata())
         row.update(self._record_external_parameters(estimate=None, measurement_attempt=measurement_attempt))
         row.update(self._record_reference_delta_parameters(measurement_attempt))
         return row
@@ -18783,6 +19856,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_rtk_baseline()
         self._refresh_baseline_alignment_ui()
         self._refresh_gnss_base_tab()
+        self._refresh_gnss_operation_readiness()
         self._append_baseline_sample_if_active()
         self._refresh_camera_parameters_tab()
         self._refresh_distance()

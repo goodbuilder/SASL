@@ -149,6 +149,7 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
 
     assert loaded == settings
     assert "legacy_removed_mount_key" not in path.read_text()
+    assert '"gnss_operation"' in path.read_text()
 
 
 def test_load_settings_ignores_unknown_legacy_keys(tmp_path: Path) -> None:

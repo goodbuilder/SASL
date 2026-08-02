@@ -1,5 +1,31 @@
 # 업데이트 기록
 
+## 2026-08-03 — GNSS Survey-in 운용 안전성 보완
+
+- `NAV-PVT` Fixed 판정을 raw u-blox carrier-solution 계약으로 분리했고, PX4 rover의 MAVLink `fix_type=6` 판정은 별도로 유지했다.
+- 활성 운용 설정과 route를 고정하고, assisted fixed Base는 `CFG-TMODE3` ACK·정확한 ECEF readback·새 Base RTCM을 모두 확인할 때까지 활성화하지 않는다.
+- readiness 정책과 측정 GNSS contract ID를 고정해 기록 행과 세션 metadata에 남긴다. NTRIP 재연결/종료도 stop event로 중단 가능하다.
+- 하드웨어 receiver/caster/Pixhawk 조합 검증은 자동화 범위 밖이며 현장에서 별도 확인해야 한다.
+
+## 2026-08-02 — StereoWIRIS GNSS Survey-in 3가지 운용 모드 구현
+
+- 변경:
+  - `LOCAL_SURVEY_IN`: 기존 u-blox `CFG-TMODE3` 현장 Survey-in과 `NAV-SVIN` polling을 유지하고, valid 이후 RTCM을 선택한 Left/Right Pixhawk로 전달한다.
+  - `NETWORK_ASSISTED_FIXED_BASE`: NTRIP caster의 RTCM을 Base serial로 전달하고, Base `NAV-PVT`의 RTK Fixed 좌표를 반복 수집한다. 수집 시간·Fixed 비율·수평/수직 산포를 통과한 WGS84 ellipsoid 좌표만 `CFG-TMODE3 fixed` ECEF 명령으로 재설정한다.
+  - `NETWORK_RTK_DIRECT`: NTRIP RTCM3 frame을 GUI에서 분리해 Base 없이 선택한 Pixhawk MAVLink `GPS_RTCM_DATA` 경로로 직접 전달한다.
+  - NTRIP 인증 비밀번호는 JSON에 저장하지 않고 설정된 환경변수에서만 읽으며, GGA 정책(좌우 중심/Left/미사용/rover)을 지원한다.
+  - 운용 상태, correction source identity, readiness, fixed-coordinate profile hash를 세션 metadata에 기록하고 readiness 미충족 시 측정을 차단한다.
+- 이유:
+  - 현장 Survey-in, 네트워크 보조 Base, 네트워크 직접 RTK를 같은 UI에서 명시적으로 구분하고, 보정 스트림 수신만으로 측정 준비 완료로 오인하지 않기 위해서다.
+- 입력/출력 계약:
+  - NTRIP/GNSS 좌표 입력은 WGS84 위도/경도와 명시적 ellipsoid 또는 MSL 높이이며, TMODE3 고정좌표 명령은 ellipsoid 높이를 ECEF cm + high-part로 변환한다.
+  - RTCM은 opaque bytes로만 운반하며 NED/ENU baseline이나 `baseline_center_frd`로 변환하지 않는다.
+- 확인:
+  - NTRIP request/response/GGA/stream transport, Fixed profile validation, WGS84→ECEF, UBX command/parser 회귀 테스트를 추가했다.
+  - 관련 targeted pytest 19개 통과, 기존 GNSS UI 회귀 19개 통과.
+- 남은 위험:
+  - MSL 높이는 geoid 변환 없이 TMODE3 fixed 명령으로 승격하지 않는다. 실제 caster credential, Base receiver firmware, Pixhawk heartbeat/RTK 수렴은 현장 장비에서 별도 확인해야 한다.
+
 ## 2026-08-01 — PX4 MAVLink 자력계 wide CSV 저장
 
 - 변경:

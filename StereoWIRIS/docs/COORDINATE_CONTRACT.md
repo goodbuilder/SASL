@@ -18,6 +18,43 @@ StereoWIRIS. The code source of truth is
 only through the explicit attitude, mount, and baseline transforms used by the
 triangulation path.
 
+## GNSS correction-operation contract
+
+The three GNSS operation modes share one correction transport contract but
+have different ownership of the Base receiver:
+
+| Mode | Correction path | Coordinate operation | Measurement prerequisite |
+| --- | --- | --- | --- |
+| `LOCAL_SURVEY_IN` | Base serial RTCM output → selected rover MAVLink | Base position is established by u-blox Survey-in | Survey-in valid, RTCM routed, selected rovers RTK Fixed and fresh |
+| `NETWORK_ASSISTED_FIXED_BASE` | NTRIP caster RTCM → Base serial → rover MAVLink | Base first acts as a corrected rover; repeated Fixed WGS84 coordinates are validated, then Base is set to fixed | `CFG-TMODE3` ACK, matching ECEF readback, fresh post-config Base RTCM, selected rovers RTK Fixed and fresh |
+| `NETWORK_RTK_DIRECT` | NTRIP caster RTCM → selected rover MAVLink | No Base coordinate is inferred or written | RTCM routed, selected rovers RTK Fixed and fresh |
+
+NTRIP RTCM is opaque correction data. It is never interpreted as a stereo
+baseline and is never written into `ned`, `enu`, `baseline_center_frd`, or a
+camera optical frame. Rover GPS positions remain WGS84 geodetic input fields;
+the existing `rtk_geometry` path derives the selected rover antenna delta as
+`North/East/Down` metres.
+
+The fixed-base initializer accepts only repeated samples with one known height
+datum. The current `CFG-TMODE3 fixed` adapter accepts WGS84 ellipsoid height
+only and converts geodetic latitude/longitude/ellipsoid height to ECEF metres,
+then to the u-blox ECEF centimetre and high-part fields. MSL samples are
+reported but fail closed until a geoid conversion is supplied; they are never
+silently treated as ellipsoid height.
+
+Operation provenance records the selected mode, caster/mountpoint or serial
+source identity, GGA policy, fixed-coordinate profile hash, and readiness
+reasons. Raw u-blox `NAV-PVT` RTK Fixed means `fixType` 3/4 with
+`gnssFixOK=1` and `carrSoln=2`; this is distinct from PX4/MAVLink rover
+`fix_type=6`. A correction stream being connected is not itself
+measurement-ready.
+
+Mode, GGA policy, height datum, serial/caster identity, and rover routes are
+latched at operation start. They require stop/restart to change. Every enabled
+readiness threshold fails closed when its value is missing; explicitly disabling
+the gate only allows an unasserted GNSS measurement and leaves the failed
+readiness result plus `gate_disabled` warning in metadata.
+
 ## Active measurement method
 
 The only runtime measurement method is `two_ray_closest_midpoint`.
