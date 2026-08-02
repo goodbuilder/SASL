@@ -10,6 +10,8 @@ APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SETTINGS_PATH = APP_ROOT / "stereo_distance_settings.json"
 DEFAULT_INTRINSICS_PATH = "calibration_captures/intrinsics.json"
 DEFAULT_CLOCK_DOWNLOAD_DIR = "clock_captures"
+PIXHAWK_ETHERNET_MODES = ("dual", "mavlink", "uxrce")
+DEFAULT_PIXHAWK_ETHERNET_MODE = "dual"
 
 
 @dataclass(frozen=True)
@@ -56,7 +58,17 @@ class AppSettings:
     yolo_frame_queue_size: int = 2
     rtsp_decoder: str = "nvidia"
     stream_backend: str = "gstreamer"
-    rtsp_transport: str = "udp"
+    # TCP interleaving keeps RTCP Sender Reports on the RTSP control channel;
+    # use it as the safe default for absolute camera-clock verification.
+    rtsp_transport: str = "tcp"
+    camera_sync_history_window_s: float = 1.0
+    camera_sync_receive_pair_max_delta_s: float = 0.350
+    camera_sync_rtcp_pair_max_delta_s: float = 0.050
+    camera_sync_max_sr_age_s: float = 7.0
+    camera_sync_max_pc_offset_s: float = 0.100
+    camera_sync_max_clock_rate_error: float = 0.005
+    camera_sync_required_sr_count: int = 2
+    camera_sync_warmup_timeout_s: float = 30.0
     ros_domain_id: int = 0
     left_namespace: str = "uav_0"
     right_namespace: str = "uav_1"
@@ -75,6 +87,7 @@ class AppSettings:
     mavlink_stream_rate: int = 2_000_000
     mavlink_configure_uxrce_agent: bool = True
     uxrce_port: int = 8888
+    pixhawk_ethernet_mode: str = DEFAULT_PIXHAWK_ETHERNET_MODE
     auto_load_intrinsics: bool = True
     manual_focal_override: bool = False
     use_triangulation: bool = True
@@ -102,6 +115,11 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         save_settings(settings, settings_path)
         return settings
     payload = json.loads(settings_path.read_text())
+    pixhawk_ethernet_mode = str(
+        payload.get("pixhawk_ethernet_mode", DEFAULT_PIXHAWK_ETHERNET_MODE)
+    )
+    if pixhawk_ethernet_mode not in PIXHAWK_ETHERNET_MODES:
+        pixhawk_ethernet_mode = DEFAULT_PIXHAWK_ETHERNET_MODE
     triangulation_extrinsics_source = str(
         payload.get("triangulation_extrinsics_source", AppSettings.triangulation_extrinsics_source)
     )
@@ -171,6 +189,53 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         rtsp_decoder=str(payload.get("rtsp_decoder", AppSettings.rtsp_decoder)),
         stream_backend=str(payload.get("stream_backend", AppSettings.stream_backend)),
         rtsp_transport=str(payload.get("rtsp_transport", AppSettings.rtsp_transport)),
+        camera_sync_history_window_s=max(
+            0.1,
+            float(payload.get("camera_sync_history_window_s", AppSettings.camera_sync_history_window_s)),
+        ),
+        camera_sync_receive_pair_max_delta_s=max(
+            0.0,
+            float(
+                payload.get(
+                    "camera_sync_receive_pair_max_delta_s",
+                    AppSettings.camera_sync_receive_pair_max_delta_s,
+                )
+            ),
+        ),
+        camera_sync_rtcp_pair_max_delta_s=max(
+            0.0,
+            float(
+                payload.get(
+                    "camera_sync_rtcp_pair_max_delta_s",
+                    AppSettings.camera_sync_rtcp_pair_max_delta_s,
+                )
+            ),
+        ),
+        camera_sync_max_sr_age_s=max(
+            0.1,
+            float(payload.get("camera_sync_max_sr_age_s", AppSettings.camera_sync_max_sr_age_s)),
+        ),
+        camera_sync_max_pc_offset_s=max(
+            0.0,
+            float(payload.get("camera_sync_max_pc_offset_s", AppSettings.camera_sync_max_pc_offset_s)),
+        ),
+        camera_sync_max_clock_rate_error=max(
+            0.0,
+            float(
+                payload.get(
+                    "camera_sync_max_clock_rate_error",
+                    AppSettings.camera_sync_max_clock_rate_error,
+                )
+            ),
+        ),
+        camera_sync_required_sr_count=max(
+            1,
+            int(payload.get("camera_sync_required_sr_count", AppSettings.camera_sync_required_sr_count)),
+        ),
+        camera_sync_warmup_timeout_s=max(
+            1.0,
+            float(payload.get("camera_sync_warmup_timeout_s", AppSettings.camera_sync_warmup_timeout_s)),
+        ),
         ros_domain_id=int(payload.get("ros_domain_id", AppSettings.ros_domain_id)),
         left_namespace=str(payload.get("left_namespace", AppSettings.left_namespace)),
         right_namespace=str(payload.get("right_namespace", AppSettings.right_namespace)),
@@ -204,6 +269,7 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
             )
         ),
         uxrce_port=int(payload.get("uxrce_port", AppSettings.uxrce_port)),
+        pixhawk_ethernet_mode=pixhawk_ethernet_mode,
         auto_load_intrinsics=bool(payload.get("auto_load_intrinsics", True)),
         manual_focal_override=bool(payload.get("manual_focal_override", False)),
         use_triangulation=bool(payload.get("use_triangulation", True)),

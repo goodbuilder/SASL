@@ -428,6 +428,7 @@ class StereoDistanceNode(Node):
         # This is a bounded burst buffer, not a sustained-rate guarantee.
         # Strict overflow accounting invalidates a run instead of dropping silently.
         self.declare_parameter("measurement_queue_capacity", 32)
+        self.declare_parameter("measurement_latest_only", False)
         self.declare_parameter("rviz_live_latest_only", True)
         self.declare_parameter(
             "rviz_live_ray_hz",
@@ -541,6 +542,7 @@ class StereoDistanceNode(Node):
             self.get_parameter("observation_mode").value
         )
         self.rviz_live_latest_only = self._bool_param("rviz_live_latest_only")
+        self.measurement_latest_only = self._bool_param("measurement_latest_only")
         self.rviz_live_ray_hz = max(0.1, self._float_param("rviz_live_ray_hz"))
         self.enable_synthetic_detections = self._bool_param("enable_synthetic_detections")
         self.synthetic_detection_width_px = max(1, int(self.get_parameter("synthetic_detection_width_px").value))
@@ -2376,6 +2378,17 @@ class StereoDistanceNode(Node):
                         f"the run: rejected_pair_id={pair.pair_id}"
                     )
                 continue
+            if (
+                getattr(self, "measurement_latest_only", False)
+                and getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo"
+                and not getattr(self, "enable_research_recording", False)
+            ):
+                while self.measurement_pair_queue:
+                    stale_pair = self.measurement_pair_queue.popleft()
+                    self._drop_pair_state_locked(stale_pair.pair_id, "measurement_latest_only")
+                    self.measurement_latest_drop_count = (
+                        getattr(self, "measurement_latest_drop_count", 0) + 1
+                    )
             if len(self.measurement_pair_queue) >= self.measurement_queue_capacity:
                 self.measurement_queue_overflow_count += 1
                 self.measurement_overrun_invalid = True
@@ -5747,6 +5760,8 @@ class StereoDistanceNode(Node):
                 "pair_midpoint_stamp_ns": metrics.get("pair_midpoint_stamp_ns"),
                 "measurement_queue_depth": len(getattr(self, "measurement_pair_queue", ())),
                 "measurement_queue_capacity": getattr(self, "measurement_queue_capacity", None),
+                "measurement_latest_only": bool(getattr(self, "measurement_latest_only", False)),
+                "measurement_latest_drop_count": getattr(self, "measurement_latest_drop_count", 0),
                 "measurement_overrun_invalid": getattr(self, "measurement_overrun_invalid", False),
             }
         )

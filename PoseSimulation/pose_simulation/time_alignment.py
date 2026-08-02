@@ -190,7 +190,9 @@ def _sample_stamp_ns(sample: GroundTruthPoseSample | CameraOpticalPoseSample) ->
     return sample.gazebo_stamp_ns
 
 
-def _sample_pose(sample: GroundTruthPoseSample | CameraOpticalPoseSample) -> Pose3D:
+def sample_pose(sample: GroundTruthPoseSample | CameraOpticalPoseSample) -> Pose3D:
+    """Materialize a validated flattened input sample as ``Pose3D``."""
+
     if isinstance(sample, GroundTruthPoseSample):
         assert sample.position_world_enu_m is not None
         assert sample.orientation_world_from_reference_xyzw is not None
@@ -253,7 +255,7 @@ def _interpolate_sample(
     if gap_ns <= 0 or gap_ns > max_gap_ns:
         return None, False, f"interpolation gap {gap_ns} ns exceeds policy"
     alpha = (evaluation_stamp_ns - previous_stamp_ns) / gap_ns
-    pose = interpolate_pose(_sample_pose(previous), _sample_pose(following), alpha)
+    pose = interpolate_pose(sample_pose(previous), sample_pose(following), alpha)
     if isinstance(previous, GroundTruthPoseSample):
         interpolated: GroundTruthPoseSample | CameraOpticalPoseSample = replace(
             previous,

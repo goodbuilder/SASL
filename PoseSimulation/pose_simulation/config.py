@@ -27,6 +27,34 @@ APPLICATION_NAMESPACE = "/pose_simulation"
 OUTPUT_TOPIC_PREFIX = "/pose_simulation/"
 POSESIM_NAME_PATTERN = re.compile(r"^POSESIM_[A-Z0-9_]+$")
 
+# These names belong to the separately launched Simulation application. A
+# PoseSimulation process must never consume them, even if a caller happens to
+# export them in the same shell. Rejecting the contamination is deliberate:
+# silently ignoring source-application controls makes a launch look
+# reproducible when it is not.
+SIMULATION_ENV_KEYS = frozenset(
+    {
+        "SIM_CONFIG",
+        "SIM_SCENARIO_CONFIG",
+        "ENABLE_GPS_BASELINE_TRIANGULATION",
+        "GPS_BASELINE_SOURCE",
+        "GPS_BASELINE_MAX_AGE_S",
+        "MEASUREMENT_QUEUE_CAPACITY",
+    }
+)
+SIMULATION_ENV_PREFIXES = (
+    "CAMERA_",
+    "CAM_L_",
+    "CAM_R_",
+    "COMMON_OPTICAL_",
+    "RELATIVE_OPTICAL_",
+    "DRONE_",
+    "WAYPOINT_",
+    "WAYPOINTS_",
+    "YOLO_",
+    "ATTITUDE_EXPERIMENT_",
+)
+
 
 class ConfigError(ValueError):
     """Raised when a PoseSimulation configuration violates its contract."""
@@ -316,6 +344,24 @@ def _capture_explicit_environment(environ: Mapping[str, str]) -> tuple[dict[str,
     return overrides, tuple(sorted(names))
 
 
+def _reject_simulation_environment(environ: Mapping[str, str]) -> None:
+    """Fail closed when Simulation-owned controls leak into this process."""
+
+    leaked = sorted(
+        key
+        for key in environ
+        if key in SIMULATION_ENV_KEYS
+        or any(key.startswith(prefix) for prefix in SIMULATION_ENV_PREFIXES)
+    )
+    if leaked:
+        names = ", ".join(leaked)
+        raise ConfigError(
+            "Simulation-owned environment variables were passed to PoseSimulation: "
+            f"{names}. Start the applications with separate process environments; "
+            "PoseSimulation accepts only POSESIM_* configuration overrides."
+        )
+
+
 def _resolve_profile_path(raw_path: str, *, cwd: Path) -> Path:
     candidate = Path(raw_path).expanduser()
     if candidate.is_absolute():
@@ -561,6 +607,7 @@ def resolve_config(
     """Resolve and validate config, profile, environment, and CLI layers."""
 
     environment = dict(os.environ if environ is None else environ)
+    _reject_simulation_environment(environment)
     current_dir = Path.cwd() if cwd is None else Path(cwd).expanduser().resolve()
     environment_overrides, environment_names = _capture_explicit_environment(environment)
     if explicit_overrides:

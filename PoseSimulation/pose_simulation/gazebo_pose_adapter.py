@@ -1,13 +1,15 @@
-"""Independent raw Gazebo ``Pose_V`` parser and optional stream adapter."""
+"""Pure parser for externally supplied Gazebo ``Pose_V`` payloads.
+
+This module does not launch, subscribe to, or control Gazebo.  Runtime
+PoseSimulation inputs arrive through the external ROS topic contract.
+"""
 
 from __future__ import annotations
 
 import json
 import math
-import subprocess
-import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 from .pose_math import (
     GAZEBO_LINK_FLU_FROM_OPTICAL_RDF,
@@ -203,99 +205,9 @@ def parse_world_pose_v_payload(
     )
 
 
-class GazeboPoseStream:
-    """Read one raw Gazebo topic in a stoppable background thread.
-
-    The stream is opt-in.  It only observes ``gz topic`` output and exposes
-    parsed samples through a callback; it contains no Gazebo mutation API.
-    """
-
-    def __init__(
-        self,
-        *,
-        topic: str,
-        entity_name: str,
-        parent_model_name: str,
-        on_record: Callable[[GazeboPoseRecord], None],
-        on_error: Callable[[str], None] | None = None,
-        executable: str = "gz",
-    ) -> None:
-        self._command = (
-            executable,
-            "topic",
-            "-e",
-            "-t",
-            str(topic),
-            "--json-output",
-        )
-        self._entity_name = str(entity_name)
-        self._parent_model_name = str(parent_model_name)
-        self._on_record = on_record
-        self._on_error = on_error or (lambda _message: None)
-        self._shutdown = threading.Event()
-        self._process: subprocess.Popen[str] | None = None
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> None:
-        if not self._thread.is_alive():
-            self._thread.start()
-
-    def _run(self) -> None:
-        while not self._shutdown.is_set():
-            try:
-                process = subprocess.Popen(
-                    self._command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    bufsize=1,
-                )
-            except OSError as exc:
-                self._on_error(f"failed to start Gazebo Pose_V stream: {exc}")
-                self._shutdown.wait(0.5)
-                continue
-            self._process = process
-            try:
-                if process.stdout is not None:
-                    for line in process.stdout:
-                        if self._shutdown.is_set():
-                            break
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            payload = json.loads(line)
-                            record = parse_world_pose_v_payload(
-                                payload,
-                                entity_name=self._entity_name,
-                                parent_model_name=self._parent_model_name,
-                            )
-                            self._on_record(record)
-                        except (json.JSONDecodeError, GazeboPosePayloadError) as exc:
-                            self._on_error(f"Gazebo Pose_V sample rejected: {exc}")
-            finally:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                self._process = None
-            if not self._shutdown.is_set():
-                self._shutdown.wait(0.5)
-
-    def shutdown(self) -> None:
-        self._shutdown.set()
-        if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-
 __all__ = [
     "GazeboPosePayloadError",
     "GazeboPoseRecord",
-    "GazeboPoseStream",
     "parse_pose_v_payload",
     "parse_world_pose_v_payload",
     "resolve_pose_v_record_world",

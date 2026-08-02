@@ -10,6 +10,8 @@ PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/
 PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
 export PATH="$HOME/.local/bin:$PATH"
 export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-$APP_DIR/.cache/matplotlib}"
+mkdir -p "$MPLCONFIGDIR"
 
 usage() {
   cat <<'USAGE'
@@ -100,7 +102,7 @@ fi
 
 case "${1:-}" in
   --check)
-    export PYTHONPATH="$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     "$PYTHON_BIN" - <<'PY'
 from pathlib import Path
 import sys
@@ -133,5 +135,5 @@ if [[ "${STEREO_BOOTSTRAP_CALIBRATION_DEPS:-0}" == "1" ]]; then
 fi
 
 cd "$APP_DIR"
-export PYTHONPATH="$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 exec "$PYTHON_BIN" "$APP_DIR/main.py" "$@"

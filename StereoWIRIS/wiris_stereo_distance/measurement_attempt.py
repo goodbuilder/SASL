@@ -55,6 +55,11 @@ DETECTION_METADATA_ALLOWLIST = (
     "rtcp_frame_ntp_unix_s",
     "rtcp_frame_received_wall_s",
     "rtcp_frame_receive_delay_s",
+    "rtcp_frame_transport_delay_s",
+    "rtcp_camera_ntp_rate",
+    "rtcp_camera_media_rate",
+    "rtcp_sr_received_count",
+    "rtsp_transport",
     "rtcp_timing_invalid_reason",
 )
 

@@ -77,6 +77,7 @@ from .pose_math import (
     matrix_to_quaternion_xyzw,
     validate_pose_contract,
 )
+from .time_alignment import sample_pose
 
 
 DEFAULT_EVALUATION_FRAME = WORLD_FRAME
@@ -603,15 +604,15 @@ class PoseSimulationNode(Node):
         aligned_right = result.ground_truth.right_actual_camera
         if aligned_gt is not None:
             self._publishers["gt_target"].publish(
-                _pose_stamped(aligned_gt.pose, result.evaluation_stamp_ns, self._contract.world_frame)
+                _pose_stamped(sample_pose(aligned_gt), result.evaluation_stamp_ns, self._contract.world_frame)
             )
         if aligned_left is not None:
             self._publishers["actual_left"].publish(
-                _pose_stamped(aligned_left.pose, result.evaluation_stamp_ns, self._contract.world_frame)
+                _pose_stamped(sample_pose(aligned_left), result.evaluation_stamp_ns, self._contract.world_frame)
             )
         if aligned_right is not None:
             self._publishers["actual_right"].publish(
-                _pose_stamped(aligned_right.pose, result.evaluation_stamp_ns, self._contract.world_frame)
+                _pose_stamped(sample_pose(aligned_right), result.evaluation_stamp_ns, self._contract.world_frame)
             )
 
     def _publish_attitude_validation(self, result: GtMeasurementResult) -> None:

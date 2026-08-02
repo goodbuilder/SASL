@@ -26,11 +26,23 @@
     normalized_ray_length_m: 50.0
     camera_axis_length_m: 5.0
     rig_axis_length_m: 10.0
-    target_marker_scale_m: 3.0
-    optical_center_scale_m: 1.0
+    target_marker_scale_m: 12.0
+    optical_center_scale_m: 3.0
     frustum_length_m: 3.0
     frustum_width_m: 1.0
     frustum_height_m: 0.7
+    marker_visual_scale: 1.0
+    ray_shaft_width_m: 2.0
+    ray_head_width_m: 2.0
+    ray_line_width_m: 2.0
+
+    # RViz MESH_RESOURCE assets.  The camera is the existing WIRIS STL; the
+    # x500 mesh is generated from the Gazebo DAE so RViz loads STL for both.
+    show_meshes: true
+    camera_mesh_resource: package://pose_simulation/models/wiris_camera/meshes/WIRIS.stl
+    camera_mesh_scale_m: 0.001
+    drone_mesh_resource: package://pose_simulation/models/x500_15m/meshes/x500_15m.stl
+    drone_mesh_scale_m: 22.0
 
     show_actual: true
     show_gt_ideal: true
@@ -43,6 +55,7 @@
     show_text: true
     show_detailed_optical_axes: false
 
-    marker_lifetime_s: 0.5
+    # Marker snapshots are deduplicated; keep them until the next snapshot.
+    marker_lifetime_s: 0.0
     angular_visual_scale: 1.0
     position_error_visual_scale: 1.0

@@ -56,6 +56,22 @@ coordinate-frame contract, time policy, and RTK altitude-datum policy without
 importing ROS or starting a source process. Empty metric thresholds mean
 `UNSPECIFIED`, not `PASS`.
 
+## Application boundary
+
+`Simulation` and `PoseSimulation` use separate process environments. The
+Simulation-owned `SIM_CONFIG`, `SIM_SCENARIO_CONFIG`, `CAM_*`, `DRONE_*`,
+`WAYPOINT_*`, `YOLO_*`, and `ATTITUDE_EXPERIMENT_*` variables are rejected by
+the PoseSimulation configuration loader; they are never sourced, interpreted,
+or forwarded as PoseSimulation settings. PoseSimulation accepts only the
+`POSESIM_*` configuration contract.
+
+Change optical attitude only in the Simulation-owned environment;
+PoseSimulation receives the resolved result through
+`/simulation/experiment_context` and external pose topics. The applications'
+configuration environments remain separate, and their runtime boundary is the
+ROS interface even when the PoseSimulation runner starts the Simulation
+runner as a child.
+
 ## M3 source contract
 
 - `/simulation/ground_truth/vehicle_reference_link` is the configured M3
@@ -173,7 +189,26 @@ GT receive freshness is checked separately against
 `POSESIM_MAX_GT_SOURCE_AGE_MS`; static camera snapshots are not aged out by
 this policy.
 
-The supported input-probe entrypoint is:
+The runner validates the independent configuration before every operation.
+Its default operation starts PoseSimulation with the read-only visualization
+adapter, rqt operator view, and RViz display:
+
+```bash
+cd PoseSimulation
+./run_pose_simulation.sh
+```
+
+The default run starts the repository's Simulation runner as a child in
+headless mode: Gazebo GUI, Simulation RViz, and Simulation rqt are disabled,
+while Gazebo server, PX4 SITL, YOLO, and the detection overlay run to publish
+the external ROS inputs. The Camera tabs therefore receive
+`/left_camera/detection_image` and `/right_camera/detection_image`. It then
+starts the read-only PoseSimulation visualization adapter, rqt operator view,
+and RViz display. The child Simulation process is stopped when the
+PoseSimulation runner exits. If the ROS package is installed in a non-default
+workspace, set `POSESIM_ROS_SETUP` to that workspace's `install/setup.bash`.
+
+The inspection-only entrypoints are:
 
 ```bash
 cd PoseSimulation
@@ -182,13 +217,11 @@ cd PoseSimulation
 ./run_pose_simulation.sh --check-inputs --timeout-s 5
 ```
 
-The runner preserves the caller's working directory, resolves the optional
-profile path, validates the resolved snapshot, and never starts or stops
-Gazebo, PX4, rqt, RViz, or any Simulation process. `--check-inputs` only
-subscribes to external ROS 2 topics and returns `SOURCE_UNAVAILABLE` when the
-ROS runtime or source application is not present. For a two-application
-workflow, start Simulation in its own terminal using its own entrypoint, then
-run the PoseSimulation probe in a separate terminal.
+The runner preserves the caller's working directory and resolves the optional
+profile path. `--check-inputs` only subscribes to external ROS 2 topics and
+returns `SOURCE_UNAVAILABLE` when the ROS runtime or source application is not
+present. Use `--check-config`, `--print-config`, or `--check-inputs` when the
+child Simulation must not be started.
 
 The probe uses a reliable/volatile depth-ten subscription for the GT topic and
 a reliable/transient-local depth-one subscription for each camera snapshot,
@@ -260,6 +293,9 @@ thresholds unspecified, so values are never labeled PASS by assumption. If a
 project-approved warning/failure value is added under `ui_thresholds`, rqt
 shows the configured policy without changing PoseSimulation calculations.
 
-Before a real evaluation, set the WGS84 reference origin, altitude datum, and
-nominal stereo extrinsics in `config/pose_simulation.yaml`. The checked-in
-zero origin is a placeholder and is not a physical survey result.
+Before a real evaluation, set the WGS84 reference origin and altitude policy
+in the PoseSimulation-owned `config/posesimulation.env`, and validate the
+application-owned nominal stereo contract in `config/pose_contract.yaml`.
+These values are interface metadata; they do not configure or modify the
+source Simulation. The checked-in origin is a placeholder and is not a
+physical survey result.

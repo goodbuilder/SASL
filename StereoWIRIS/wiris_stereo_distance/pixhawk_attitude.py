@@ -56,6 +56,9 @@ class CameraExtrinsicState:
     timestamp_s: float
     topic: str
     q: tuple[float, float, float, float]
+    rollspeed_rad_s: float | None = None
+    pitchspeed_rad_s: float | None = None
+    yawspeed_rad_s: float | None = None
     px4_timestamp_s: float | None = None
     px4_timestamp_us: int | None = None
     px4_timestamp_sample_us: int | None = None
@@ -78,6 +81,31 @@ class MagSensorState:
     temperature_c: float | None = None
     error_count: int | None = None
     px4_timestamp_s: float | None = None
+    accel_x: float | None = None
+    accel_y: float | None = None
+    accel_z: float | None = None
+    gyro_x: float | None = None
+    gyro_y: float | None = None
+    gyro_z: float | None = None
+    time_boot_ms: int | None = None
+
+
+def magnetometer_value_units(topic: object) -> str:
+    """Return the unit carried by a raw magnetometer telemetry topic."""
+    topic_text = str(topic)
+    if topic_text.startswith("mavlink/SCALED_IMU"):
+        return "mG"
+    if "sensor_mag" in topic_text or "vehicle_magnetometer" in topic_text:
+        return "G"
+    return ""
+
+
+def magnetometer_value_to_gauss(value: object, topic: object) -> float | None:
+    """Convert a raw magnetometer magnitude to the canonical G unit."""
+    if value is None:
+        return None
+    magnitude = float(value)
+    return magnitude * 1e-3 if magnetometer_value_units(topic) == "mG" else magnitude
 
 
 @dataclass(frozen=True)
@@ -248,9 +276,15 @@ def sensor_gnss_relative_topic(namespace: str) -> str:
 
 MAVLINK_MESSAGE_IDS = {
     "ATTITUDE": 30,
+    "SYS_STATUS": 1,
     "GPS_RAW_INT": 24,
+    "RAW_IMU": 27,
+    "LOCAL_POSITION_NED": 32,
+    "GLOBAL_POSITION_INT": 33,
+    "VFR_HUD": 74,
     "GPS_RTK": 127,
     "GPS2_RAW": 124,
+    "BATTERY_STATUS": 147,
     "GPS2_RTK": 128,
     "SCALED_IMU": 26,
     "SCALED_IMU2": 116,
@@ -258,6 +292,7 @@ MAVLINK_MESSAGE_IDS = {
 }
 MAVLINK_RM3100_STREAM_REQUESTS = (
     ("ATTITUDE", 30.0),
+    ("SYS_STATUS", 1.0),
     ("GPS_RAW_INT", 5.0),
     ("GPS2_RAW", 5.0),
     ("GPS_RTK", 5.0),
@@ -265,7 +300,14 @@ MAVLINK_RM3100_STREAM_REQUESTS = (
     ("SCALED_IMU", 20.0),
     ("SCALED_IMU2", 20.0),
     ("SCALED_IMU3", 20.0),
+    ("RAW_IMU", 20.0),
+    ("LOCAL_POSITION_NED", 10.0),
+    ("GLOBAL_POSITION_INT", 10.0),
+    ("VFR_HUD", 5.0),
+    ("BATTERY_STATUS", 2.0),
 )
+MAVLINK_MAX_MESSAGES_PER_TICK = 256
+MAVLINK_MAX_PROCESS_TIME_S = 0.020
 
 
 def camera_label_ko(camera: str) -> str:
@@ -1088,6 +1130,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
     gps_sensor_changed = QtCore.pyqtSignal(str, object)
     gnss_relative_changed = QtCore.pyqtSignal(str, object)
     custom_watch_changed = QtCore.pyqtSignal(object)
+    optional_timeline_changed = QtCore.pyqtSignal(str, object)
     shell_output = QtCore.pyqtSignal(str, str)
     status_changed = QtCore.pyqtSignal(str)
 
@@ -1406,7 +1449,10 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
 
     def spin_once(self) -> None:
         for camera, connection in list(self.connections.items()):
-            while True:
+            # ``spin_once`` runs from a Qt timer.  A continuously busy serial
+            # link must not monopolize the GUI thread while we drain it.
+            deadline = time.monotonic() + MAVLINK_MAX_PROCESS_TIME_S
+            for _ in range(MAVLINK_MAX_MESSAGES_PER_TICK):
                 try:
                     message = connection.recv_match(blocking=False)
                 except Exception as exc:
@@ -1415,12 +1461,17 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 if message is None:
                     break
                 self._handle_mavlink_message(camera, message)
+                if time.monotonic() >= deadline:
+                    break
 
     def _handle_mavlink_message(self, camera: str, message: Any) -> None:
         message_type = message.get_type() if hasattr(message, "get_type") else ""
         namespace = self.urls.get(camera, "")
         now_s = time.monotonic()
         self._emit_custom_watch_samples(camera, message, message_type, now_s)
+        optional_row = _mavlink_optional_timeline_row(message_type, message, now_s)
+        if optional_row is not None:
+            self.optional_timeline_changed.emit(camera, optional_row)
         if message_type == "ATTITUDE":
             extrinsic = camera_extrinsic_from_euler_rad(
                 camera=camera,
@@ -1438,6 +1489,12 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     px4_timestamp_s=float(px4_timestamp_us) * 1e-6,
                     px4_timestamp_us=px4_timestamp_us,
                 )
+            extrinsic = replace(
+                extrinsic,
+                rollspeed_rad_s=_optional_float(message, "rollspeed"),
+                pitchspeed_rad_s=_optional_float(message, "pitchspeed"),
+                yawspeed_rad_s=_optional_float(message, "yawspeed"),
+            )
             self.extrinsic_changed.emit(camera, extrinsic)
             return
         if message_type in {"GPS_RAW_INT", "GPS2_RAW"}:
@@ -1543,6 +1600,109 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 )
             )
 
+
+
+def _mavlink_optional_timeline_row(
+    message_type: str,
+    message: Any,
+    timestamp_s: float,
+) -> dict[str, object] | None:
+    """Normalize optional MAVLink state messages for the session timeline."""
+    row: dict[str, object] = {
+        "sample_type": f"mavlink_{message_type.lower()}",
+        "topic": f"mavlink/{message_type}",
+        "sample_app_timestamp_s": timestamp_s,
+        "mavlink_message_name": message_type,
+    }
+    if message_type == "GLOBAL_POSITION_INT":
+        row.update(
+            {
+                "mavlink_global_latitude_deg": _mavlink_scaled_degrees(getattr(message, "lat", None)),
+                "mavlink_global_longitude_deg": _mavlink_scaled_degrees(getattr(message, "lon", None)),
+                "mavlink_global_altitude_m": _mavlink_scaled_millimetres(getattr(message, "alt", None)),
+                "mavlink_global_relative_altitude_m": _mavlink_scaled_millimetres(getattr(message, "relative_alt", None)),
+                "mavlink_global_velocity_n_m_s": _mavlink_scaled_centimetres(getattr(message, "vx", None)),
+                "mavlink_global_velocity_e_m_s": _mavlink_scaled_centimetres(getattr(message, "vy", None)),
+                "mavlink_global_velocity_d_m_s": _mavlink_scaled_centimetres(getattr(message, "vz", None)),
+                "mavlink_global_heading_deg": _mavlink_heading_cdeg(getattr(message, "hdg", None)),
+                "mavlink_time_boot_ms": _optional_int(message, "time_boot_ms"),
+            }
+        )
+    elif message_type == "LOCAL_POSITION_NED":
+        row.update(
+            {
+                "mavlink_local_x_m": _optional_float(message, "x"),
+                "mavlink_local_y_m": _optional_float(message, "y"),
+                "mavlink_local_z_m": _optional_float(message, "z"),
+                "mavlink_local_velocity_x_m_s": _optional_float(message, "vx"),
+                "mavlink_local_velocity_y_m_s": _optional_float(message, "vy"),
+                "mavlink_local_velocity_z_m_s": _optional_float(message, "vz"),
+                "mavlink_time_boot_ms": _optional_int(message, "time_boot_ms"),
+            }
+        )
+    elif message_type == "VFR_HUD":
+        row.update(
+            {
+                "mavlink_vfr_airspeed_m_s": _optional_float(message, "airspeed"),
+                "mavlink_vfr_groundspeed_m_s": _optional_float(message, "groundspeed"),
+                "mavlink_vfr_heading_deg": _optional_float(message, "heading"),
+                "mavlink_vfr_throttle_pct": _optional_float(message, "throttle"),
+                "mavlink_vfr_altitude_m": _optional_float(message, "alt"),
+                "mavlink_vfr_climb_m_s": _optional_float(message, "climb"),
+            }
+        )
+    elif message_type == "SYS_STATUS":
+        row.update(
+            {
+                "mavlink_sys_voltage_battery_v": _scaled_mavlink_value(message, "voltage_battery", 1e-3),
+                "mavlink_sys_current_battery_a": _scaled_mavlink_value(message, "current_battery", 1e-2),
+                "mavlink_sys_battery_remaining_pct": _optional_float(message, "battery_remaining"),
+                "mavlink_sys_drop_rate_comm_pct": _scaled_mavlink_value(message, "drop_rate_comm", 1e-2),
+                "mavlink_sys_errors_comm": _optional_int(message, "errors_comm"),
+            }
+        )
+    elif message_type == "BATTERY_STATUS":
+        row.update(
+            {
+                "mavlink_battery_current_a": _scaled_mavlink_value(message, "current_battery", 1e-2),
+                "mavlink_battery_remaining_pct": _optional_float(message, "battery_remaining"),
+                "mavlink_battery_temperature_c": _scaled_mavlink_value(message, "temperature", 1e-2),
+                "mavlink_battery_voltage_0_v": _scaled_mavlink_array_value(message, "voltages", 0, 1e-3),
+                "mavlink_battery_voltage_1_v": _scaled_mavlink_array_value(message, "voltages", 1, 1e-3),
+                "mavlink_battery_voltage_2_v": _scaled_mavlink_array_value(message, "voltages", 2, 1e-3),
+            }
+        )
+    elif message_type == "RAW_IMU":
+        row.update(
+            {
+                "mavlink_raw_accel_x": _optional_float(message, "xacc"),
+                "mavlink_raw_accel_y": _optional_float(message, "yacc"),
+                "mavlink_raw_accel_z": _optional_float(message, "zacc"),
+                "mavlink_raw_gyro_x": _optional_float(message, "xgyro"),
+                "mavlink_raw_gyro_y": _optional_float(message, "ygyro"),
+                "mavlink_raw_gyro_z": _optional_float(message, "zgyro"),
+                "mavlink_raw_mag_x": _optional_float(message, "xmag"),
+                "mavlink_raw_mag_y": _optional_float(message, "ymag"),
+                "mavlink_raw_mag_z": _optional_float(message, "zmag"),
+                "mavlink_time_usec": _optional_int(message, "time_usec"),
+            }
+        )
+    else:
+        return None
+    return row
+
+
+def _scaled_mavlink_value(message: Any, name: str, scale: float) -> float | None:
+    value = _optional_float(message, name)
+    return None if value is None or value < 0 else value * scale
+
+
+def _scaled_mavlink_array_value(message: Any, name: str, index: int, scale: float) -> float | None:
+    values = getattr(message, name, None)
+    if not isinstance(values, (list, tuple)) or index >= len(values):
+        return None
+    value = float(values[index])
+    return None if value in (0, 65535) else value * scale
 
 
 def mavlink_graphable_fields_for_message(message_name: str) -> list[str]:
@@ -1736,6 +1896,13 @@ def _mag_sensor_state_from_mavlink(
         magnitude=math.sqrt(x * x + y * y + z * z),
         temperature_c=_optional_float(message, "temperature"),
         px4_timestamp_s=None,
+        accel_x=_optional_float(message, "xacc"),
+        accel_y=_optional_float(message, "yacc"),
+        accel_z=_optional_float(message, "zacc"),
+        gyro_x=_optional_float(message, "xgyro"),
+        gyro_y=_optional_float(message, "ygyro"),
+        gyro_z=_optional_float(message, "zgyro"),
+        time_boot_ms=_optional_int(message, "time_boot_ms"),
     )
 
 

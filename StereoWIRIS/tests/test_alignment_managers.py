@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 
 def test_alignment_profile_manager_payload_contains_required_contracts() -> None:
     from wiris_stereo_distance.alignment_managers import (
@@ -61,3 +63,28 @@ def test_alignment_validator_reports_fail_for_large_profile_delta() -> None:
 
     assert result.baseline_vector_difference_m == 0.20
     assert result.status == "FAIL"
+
+
+def test_magnetometer_difference_normalizes_milligauss_but_preserves_display_unit() -> None:
+    from wiris_stereo_distance.alignment_managers import MagnetometerMonitor
+    from wiris_stereo_distance.pixhawk_attitude import MagSensorState
+
+    monitor = MagnetometerMonitor()
+    for slot, magnitude, topic in (
+        ("CAN1", 100.0, "mavlink/SCALED_IMU"),
+        ("CAN2", 110.0, "mavlink/SCALED_IMU2"),
+    ):
+        monitor.update(
+            "left",
+            MagSensorState(
+                camera="left",
+                namespace="uav_0",
+                sensor_slot=slot,
+                timestamp_s=1.0,
+                topic=topic,
+                magnitude=magnitude,
+            ),
+        )
+
+    assert monitor.can_difference("left") == pytest.approx(0.01)
+    assert monitor.can_difference_display("left") == (10.0, "mG")

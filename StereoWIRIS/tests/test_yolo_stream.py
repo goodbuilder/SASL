@@ -334,6 +334,53 @@ def test_sender_report_clock_rates_separate_ntp_drift_from_media_clock_drift() -
     assert sender_report_clock_rates(first, report(0.0, 1_000.0, 0.0)) is None
 
 
+def test_sender_report_clock_rates_use_median_of_recent_intervals() -> None:
+    from wiris_stereo_distance.yolo_stream import robust_sender_report_clock_rates
+
+    samples = [
+        {"ntp_rate": 0.9998, "media_rate": 1.0002},
+        {"ntp_rate": 1.0001, "media_rate": 0.9999},
+        # A polling/dispatch outlier should not become the camera's rate.
+        {"ntp_rate": 1.048, "media_rate": 0.971},
+        {"ntp_rate": 1.0000, "media_rate": 1.0001},
+    ]
+
+    rates = robust_sender_report_clock_rates(samples)
+
+    assert rates == pytest.approx({"ntp_rate": 1.00005, "media_rate": 1.0000})
+
+
+def test_sender_report_arrival_cache_preserves_probe_timestamp() -> None:
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    tracker._remember_sender_report_arrival(
+        ssrc=1234,
+        ntp_raw=99,
+        received_monotonic_s=12.345,
+        received_wall_s=1_800_000_012.345,
+    )
+
+    assert tracker._sender_report_arrival(ssrc=1234, ntp_raw=99) == pytest.approx(
+        (12.345, 1_800_000_012.345)
+    )
+
+
+def test_sender_report_arrival_cache_evicts_old_keys_without_leaking() -> None:
+    from wiris_stereo_distance.yolo_stream import MAX_RTCP_SR_ARRIVAL_CACHE
+
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+    for ntp_raw in range(MAX_RTCP_SR_ARRIVAL_CACHE + 1):
+        tracker._remember_sender_report_arrival(
+            ssrc=1234,
+            ntp_raw=ntp_raw,
+            received_monotonic_s=float(ntp_raw),
+            received_wall_s=float(ntp_raw),
+        )
+
+    assert tracker._sender_report_arrival(ssrc=1234, ntp_raw=0) is None
+    assert len(tracker._sr_arrival_by_key) == MAX_RTCP_SR_ARRIVAL_CACHE
+
+
 def test_rtp_timing_tracker_does_not_attach_stale_timing_to_known_pts() -> None:
     tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
     timing = RtpFrameTiming(

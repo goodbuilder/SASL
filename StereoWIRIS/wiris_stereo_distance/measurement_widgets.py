@@ -566,9 +566,19 @@ class ClockOffsetHistoryPlot(QtWidgets.QWidget):
         self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
         self.setMinimumHeight(300)
         self.setToolTip(
-            "transit delay: 카메라 절대 시각 오차가 포함되어 클럭이 드리프트하면 계속 커집니다.\n"
-            "transport delay: 그 오차를 상쇄한 값으로, 실제 전송 지연만 남아 평평해야 합니다.\n"
-            "anchor age: Sender Report 앵커가 갱신되지 않고 고착되면 커집니다."
+            "시간축: 오른쪽 0 s가 최신 샘플이고 왼쪽의 음수 값은 몇 초 전인지 나타냅니다.\n"
+            "L/R: 왼쪽/오른쪽 카메라의 같은 시계열 진단입니다. 값이 없으면 해당 시점에 유효한 RTCP/NTP가 없었다는 뜻입니다.\n"
+            "transit delay (ms): rtcp_frame_receive_delay_s입니다. RTCP/NTP로 추정한 frame 시각부터 PC 수신까지의 차이로, "
+            "카메라 clock offset과 encoder/network/decoder transit이 함께 들어갑니다. 순수한 네트워크 지연이 아니며, "
+            "카메라 clock이 틀리거나 drift하면 커질 수 있습니다.\n"
+            "transport delay (ms): rtcp_frame_transport_delay_s입니다. Sender Report의 PC 기준 offset을 상쇄해 "
+            "실제 encoder/network/decoder 경로에 가까운 지연만 남긴 값입니다. clock drift와 무관하게 평평해야 하며, "
+            "갑자기 증가하면 수신 경로 또는 encoder 지연을 의심합니다.\n"
+            "Sender Report anchor age (s): 마지막 RTCP Sender Report를 받은 뒤 지난 시간입니다. 계속 증가하면 anchor가 "
+            "갱신되지 않아 transit/transport 값이 오래된 anchor를 기준으로 외삽되고 있다는 뜻입니다.\n"
+            "주의: 이 그래프의 transit delay는 YOLO 설정의 `RTP 지연(ms)`(GStreamer jitter buffer 대기시간)와 다릅니다. "
+            "또한 좌우 RTCP/NTP Δt 자체를 그리는 그래프가 아니라 카메라별 PC 수신/transport 진단입니다. STUS 후 stream을 재시작하면 "
+            "새 RTCP anchor로 그래프가 초기화됩니다."
         )
 
     def add_point(self, point: ClockOffsetPoint) -> None:

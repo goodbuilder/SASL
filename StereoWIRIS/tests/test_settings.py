@@ -31,7 +31,15 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.yolo_frame_queue_size == 2
     assert settings.rtsp_decoder == "nvidia"
     assert settings.stream_backend == "gstreamer"
-    assert settings.rtsp_transport == "udp"
+    assert settings.rtsp_transport == "tcp"
+    assert settings.camera_sync_history_window_s == 1.0
+    assert settings.camera_sync_receive_pair_max_delta_s == 0.350
+    assert settings.camera_sync_rtcp_pair_max_delta_s == 0.050
+    assert settings.camera_sync_max_sr_age_s == 7.0
+    assert settings.camera_sync_max_pc_offset_s == 0.100
+    assert settings.camera_sync_max_clock_rate_error == 0.005
+    assert settings.camera_sync_required_sr_count == 2
+    assert settings.camera_sync_warmup_timeout_s == 30.0
     assert settings.measurement_display_mode == "detection"
     assert settings.yolo_gate_class_enabled is False
     assert settings.yolo_gate_min_bbox_enabled is False
@@ -91,6 +99,14 @@ def test_save_and_load_settings_roundtrip(tmp_path: Path) -> None:
         rtsp_decoder="software",
         stream_backend="opencv",
         rtsp_transport="tcp",
+        camera_sync_history_window_s=1.5,
+        camera_sync_receive_pair_max_delta_s=0.42,
+        camera_sync_rtcp_pair_max_delta_s=0.08,
+        camera_sync_max_sr_age_s=9.0,
+        camera_sync_max_pc_offset_s=0.15,
+        camera_sync_max_clock_rate_error=0.008,
+        camera_sync_required_sr_count=4,
+        camera_sync_warmup_timeout_s=45.0,
         ros_domain_id=7,
         left_namespace="uav_left",
         right_namespace="uav_right",

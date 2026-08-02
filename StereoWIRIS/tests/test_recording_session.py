@@ -6,6 +6,7 @@ from zipfile import ZipFile
 
 from wiris_stereo_distance.recording_session import (
     CAMERA_TIMELINE_COMPACT_COLUMNS,
+    compact_px4_timeline_rows,
     DISTANCE_MEASUREMENT_COLUMNS,
     PX4_TIMELINE_COMPACT_COLUMNS,
     SpoolRows,
@@ -39,6 +40,279 @@ def test_format_video_paths_handles_empty_and_populated_paths() -> None:
         format_video_paths({"left": Path("/tmp/session/video/raw_left.mp4")})
         == "left=/tmp/session/video/raw_left.mp4"
     )
+
+
+def test_compact_px4_timeline_preserves_mag_samples_and_slot_status() -> None:
+    rows = compact_px4_timeline_rows(
+        [
+            {
+                "sample_type": "magnetometer",
+                "topic": "/uav_0/fmu/out/sensor_mag_1",
+                "sensor_slot": "CAN1",
+                "mag_value_units": "gauss",
+                "mag_device_type": "RM3100",
+                "mag_x": 1.25,
+                "mag_y": -2.5,
+                "mag_z": 3.75,
+                "mag_vector_norm": 4.677,
+                "mag_temperature_c": 24.5,
+                "mag_error_count": 2,
+                "mag_px4_timestamp_s": 12.3,
+                "device_id": 8944899,
+            },
+            {
+                "sample_type": "mag_slot_status",
+                "topic": "px4_mag_manager",
+                "sensor_slot": "CAL_MAG1",
+                "mag_slot": 1,
+                "mag_cal_slot": "CAL_MAG1",
+                "mag_device_id": 8944899,
+                "mag_device_type": "RM3100",
+                "mag_interface": "DroneCAN",
+                "mag_is_rm3100": True,
+                "mag_priority": 100,
+                "mag_rotation": 0,
+                "mag_enabled": True,
+                "mag_expected_selected": True,
+                "mag_actual_selected": True,
+                "mag_expected_selected_device_id": 8944899,
+                "mag_actual_selected_device_id": 8944899,
+                "mag_is_actual_rm3100": True,
+                "mag_armed": False,
+                "mag_status": "Actual selected",
+                "mag_warning_text": "ok",
+                "mag_rm3100_primary_id": 8944899,
+                "mag_rm3100_backup_id": 8944387,
+                "mag_param_uavcan_enable": 2,
+                "mag_param_uavcan_sub_mag": 1,
+                "mag_param_ekf2_mag_type": 0,
+                "mag_param_snapshot_json": "{\"CAL_MAG1_PRIO\":100}",
+            },
+        ]
+    )
+
+    sample, status = rows
+    assert sample["sample_type"] == "magnetometer"
+    assert sample["mag_sensor_slot"] == "CAN1"
+    assert sample["mag_x"] == 1.25
+    assert sample["mag_y"] == -2.5
+    assert sample["mag_z"] == 3.75
+    assert sample["mag_vector_norm"] == 4.677
+    assert status["sample_type"] == "mag_slot_status"
+    assert status["mag_cal_slot"] == "CAL_MAG1"
+    assert status["mag_priority"] == 100
+    assert status["mag_actual_selected"] is True
+    assert status["mag_status"] == "Actual selected"
+    assert status["mag_param_uavcan_sub_mag"] == 1
+    assert "mag_device_id" not in sample
+    assert "mag_device_type" not in sample
+    assert "mag_rm3100_primary_id" not in status
+
+
+def test_compact_px4_timeline_widens_mavlink_mag_streams() -> None:
+    rows = compact_px4_timeline_rows(
+        [
+            {
+                "sequence": 10,
+                "recording_time_ns": 1_000_000_000,
+                "sample_type": "magnetometer",
+                "topic": "mavlink/SCALED_IMU",
+                "mag_value_units": "milligauss",
+                "mag_x": 1.0,
+                "mag_y": 2.0,
+                "mag_z": 3.0,
+            },
+            {
+                "sequence": 11,
+                "recording_time_ns": 1_008_000_000,
+                "sample_type": "magnetometer",
+                "topic": "mavlink/SCALED_IMU2",
+                "mag_value_units": "milligauss",
+                "mag_x": 4.0,
+                "mag_y": 5.0,
+                "mag_z": 6.0,
+            },
+            {
+                "sequence": 12,
+                "recording_time_ns": 1_016_000_000,
+                "sample_type": "magnetometer",
+                "topic": "mavlink/SCALED_IMU3",
+                "mag_value_units": "milligauss",
+                "mag_x": 7.0,
+                "mag_y": 8.0,
+                "mag_z": 9.0,
+            },
+        ]
+    )
+
+    assert len(rows) == 1
+    wide = rows[0]
+    assert wide["topic"] == "mavlink/SCALED_IMU"
+    assert wide["mag_scaled_imu_x"] == 1.0
+    assert wide["mag_scaled_imu_y"] == 2.0
+    assert wide["mag_scaled_imu_z"] == 3.0
+    assert wide["mag_scaled_imu_unit"] == "milligauss"
+    assert wide["mag_scaled_imu2_x"] == 4.0
+    assert wide["mag_scaled_imu2_y"] == 5.0
+    assert wide["mag_scaled_imu2_z"] == 6.0
+    assert wide["mag_scaled_imu3_x"] == 7.0
+    assert wide["mag_scaled_imu3_y"] == 8.0
+    assert wide["mag_scaled_imu3_z"] == 9.0
+
+
+def test_compact_px4_timeline_keeps_unmatched_mavlink_mag_rows() -> None:
+    rows = compact_px4_timeline_rows(
+        [
+            {
+                "recording_time_ns": 1_000_000_000,
+                "sample_type": "magnetometer",
+                "topic": "mavlink/SCALED_IMU",
+                "mag_value_units": "milligauss",
+                "mag_x": 1.0,
+                "mag_y": 2.0,
+                "mag_z": 3.0,
+            },
+            {
+                "recording_time_ns": 1_100_000_000,
+                "sample_type": "magnetometer",
+                "topic": "mavlink/SCALED_IMU2",
+                "mag_value_units": "milligauss",
+                "mag_x": 4.0,
+                "mag_y": 5.0,
+                "mag_z": 6.0,
+            },
+        ]
+    )
+
+    assert len(rows) == 2
+    assert rows[0]["mag_scaled_imu_x"] == 1.0
+    assert rows[0]["mag_scaled_imu2_x"] is None
+    assert rows[1]["mag_scaled_imu_x"] is None
+    assert rows[1]["mag_scaled_imu2_x"] == 4.0
+
+
+def test_compact_px4_timeline_widens_gps1_gps2_and_preserves_generated_utc() -> None:
+    rows = compact_px4_timeline_rows(
+        [
+            {
+                "sample_type": "gps",
+                "topic": "mavlink/GPS_RAW_INT",
+                "latitude_deg": 37.123456,
+                "longitude_deg": 127.123456,
+                "altitude_m": 42.5,
+                "fix_type": 6,
+                "satellites_used": 18,
+                "gps_utc_us": 1_800_000_000_123_456,
+            },
+            {
+                "sample_type": "gps",
+                "topic": "mavlink/GPS2_RAW",
+                "latitude_deg": 37.123457,
+                "longitude_deg": 127.123457,
+                "altitude_m": 42.7,
+                "fix_type": 5,
+                "satellites_used": 16,
+                "gps_utc_us": 1_800_000_000_223_456,
+            },
+        ]
+    )
+
+    assert len(rows) == 2
+    gps1, gps2 = rows
+    assert gps1["gps1_latitude_deg"] == 37.123456
+    assert gps1["gps1_longitude_deg"] == 127.123456
+    assert gps1["gps1_altitude_m"] == 42.5
+    assert gps1["gps1_fix_type"] == 6
+    assert gps1["gps1_satellites_used"] == 18
+    assert gps1["gps_utc_time_ns"] == 1_800_000_000_123_456_000
+    assert gps1["gps_utc_source"] == "GPS1"
+    assert gps1["gps2_latitude_deg"] is None
+    assert gps2["gps1_latitude_deg"] is None
+    assert gps2["gps2_latitude_deg"] == 37.123457
+    assert gps2["gps2_altitude_m"] == 42.7
+    assert gps2["gps2_fix_type"] == 5
+    assert gps2["gps2_satellites_used"] == 16
+    assert gps2["gps_utc_time_ns"] == 1_800_000_000_223_456_000
+    assert gps2["gps_utc_source"] == "GPS2"
+
+
+def test_save_session_files_publishes_mag_rows_to_px4_artifacts(tmp_path) -> None:
+    saved = save_session_files(
+        tmp_path / "mag_session",
+        metadata={"session_id": "mag_session"},
+        pair_rows=[],
+        px4_rows={
+            "left": [
+                {
+                    "sequence": 0,
+                    "sample_monotonic_ns": 2_500_000_000,
+                    "sample_type": "magnetometer",
+                    "topic": "/uav_0/fmu/out/sensor_mag_1",
+                    "sensor_slot": "CAN1",
+                    "mag_value_units": "gauss",
+                    "mag_device_type": "RM3100",
+                    "mag_x": 0.1,
+                    "mag_y": 0.2,
+                    "mag_z": 0.3,
+                    "mag_vector_norm": 0.3741657387,
+                },
+                {
+                    "sequence": 1,
+                    "sample_monotonic_ns": 2_600_000_000,
+                    "sample_type": "mag_slot_status",
+                    "topic": "px4_mag_manager",
+                    "sensor_slot": "CAL_MAG1",
+                    "mag_slot": 1,
+                    "mag_cal_slot": "CAL_MAG1",
+                    "mag_device_id": 8944899,
+                    "mag_priority": 100,
+                    "mag_enabled": True,
+                    "mag_actual_selected": True,
+                    "mag_status": "Actual selected",
+                },
+            ],
+            "right": [
+                {
+                    "sequence": 0,
+                    "sample_monotonic_ns": 2_500_000_000,
+                    "sample_type": "magnetometer",
+                    "topic": "/uav_1/fmu/out/sensor_mag_3",
+                    "sensor_slot": "GPS1_MAG",
+                    "mag_value_units": "gauss",
+                    "mag_device_type": "GPS1 integrated IST8310 compass",
+                    "mag_x": 1.1,
+                    "mag_y": 1.2,
+                    "mag_z": 1.3,
+                    "mag_vector_norm": 2.0,
+                }
+            ],
+        },
+    )
+
+    with saved.px4_left_csv.open("r", newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["sample_type"] == "magnetometer"
+    assert rows[0]["mag_sensor_slot"] == "CAN1"
+    assert rows[0]["mag_x"] == "0.1"
+    assert rows[0]["mag_y"] == "0.2"
+    assert rows[0]["mag_z"] == "0.3"
+    assert rows[0]["mag_vector_norm"] == "0.3741657387"
+    assert rows[1]["sample_type"] == "mag_slot_status"
+    assert rows[1]["mag_priority"] == "100"
+    assert rows[1]["mag_actual_selected"] == "True"
+
+    with saved.px4_right_csv.open("r", newline="", encoding="utf-8") as handle:
+        right_rows = list(csv.DictReader(handle))
+    assert right_rows[0]["mag_sensor_slot"] == "GPS1_MAG"
+    assert right_rows[0]["mag_x"] == "1.1"
+    assert right_rows[0]["mag_y"] == "1.2"
+    assert right_rows[0]["mag_z"] == "1.3"
+    assert right_rows[0]["mag_vector_norm"] == "2.0"
+
+    xlsx_rows = _xlsx_table_rows(saved.xlsx, 5)
+    assert xlsx_rows[0]["sample_type"] == "magnetometer"
+    assert xlsx_rows[1]["mag_cal_slot"] == "CAL_MAG1"
+    assert xlsx_rows[1]["mag_priority"] == 100
 
 
 def _xlsx_sheet_names_and_row_counts(path: Path) -> tuple[list[str], list[int]]:
@@ -243,6 +517,18 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
                     "sample_type": "gui_camera_frame",
                     "sample_monotonic_ns": 1_000_000_000,
                     "source_utc_ns": 1_800_000_000_000_000_000,
+                    "rtp_timestamp": 90_000,
+                    "rtp_ssrc": 11,
+                    "rtp_marker_seq": 42,
+                    "rtcp_sr_received_count": 3,
+                    "rtcp_sr_rtp_timestamp": 45_000,
+                    "rtcp_clock_rate_hz": 90_000,
+                    "rtcp_sr_age_s": 0.25,
+                    "rtcp_sr_pc_offset_s": -0.010,
+                    "rtcp_frame_receive_delay_s": 0.055,
+                    "rtcp_frame_transport_delay_s": 0.012,
+                    "rtcp_camera_ntp_rate": 0.999,
+                    "rtcp_camera_media_rate": 0.979,
                 }
             ]
         },
@@ -290,9 +576,33 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
         saved.px4_left_parquet,
         saved.px4_right_csv,
         saved.px4_right_parquet,
+        saved.px4_left_xlsx,
+        saved.px4_right_xlsx,
+        saved.session_rtk_xlsx,
     ]
     assert saved.csv == output_dir / "20260605_120000_distance_measurements.csv"
     assert saved.xlsx == output_dir / "20260605_120000.xlsx"
+    assert _xlsx_sheet_names_and_row_counts(saved.px4_left_xlsx)[0] == [
+        "ATTITUDE",
+        "GPS1",
+        "GPS2",
+        "MAG",
+        "GLOBAL_POSITION",
+        "LOCAL_POSITION_NED",
+        "RAW_IMU",
+        "MAG_CONFIG",
+    ]
+    assert _xlsx_sheet_names_and_row_counts(saved.px4_right_xlsx)[0] == [
+        "ATTITUDE",
+        "GPS1",
+        "GPS2",
+        "MAG",
+        "GLOBAL_POSITION",
+        "LOCAL_POSITION_NED",
+        "RAW_IMU",
+        "MAG_CONFIG",
+    ]
+    assert _xlsx_sheet_names_and_row_counts(saved.session_rtk_xlsx)[0] == ["GPS_RTK"]
     assert sorted(path.name for path in output_dir.iterdir()) == [
         ".generations",
         "20260605_120000.xlsx",
@@ -304,8 +614,11 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
         "20260605_120000_distance_measurements.parquet",
         "20260605_120000_px4_left.csv",
         "20260605_120000_px4_left.parquet",
+        "20260605_120000_px4_left.xlsx",
         "20260605_120000_px4_right.csv",
         "20260605_120000_px4_right.parquet",
+        "20260605_120000_px4_right.xlsx",
+        "20260605_120000_session_rtk.xlsx",
         "20260605_120000_session_static.json",
         "published",
         "session_manifest.json",
@@ -358,30 +671,35 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
     assert set(camera_rows[0]) == set(CAMERA_TIMELINE_COMPACT_COLUMNS)
     assert camera_rows[0]["recording_time_ns"] == ""
     assert camera_rows[0]["device_utc_time_ns"] == "1800000000000000000"
+    assert camera_rows[0]["rtp_ssrc"] == "11"
+    assert camera_rows[0]["rtcp_clock_rate_hz"] == "90000.0"
+    assert camera_rows[0]["rtcp_receive_delay_ns"] == "55000000"
+    assert camera_rows[0]["rtcp_transport_delay_ns"] == "12000000"
+    assert camera_rows[0]["rtcp_camera_media_rate"] == "0.979"
     with saved.px4_right_csv.open("r", newline="", encoding="utf-8") as handle:
         px4_rows = list(csv.DictReader(handle))
     assert set(px4_rows[0]) == set(PX4_TIMELINE_COMPACT_COLUMNS)
     assert px4_rows[0]["sample_type"] == "gps_rtk"
     assert px4_rows[0]["topic"] == "/uav_1/fmu/out/vehicle_gps_position"
-    assert px4_rows[0]["device_utc_time_ns"] == "1800000000123456000"
+    assert px4_rows[0]["gps_utc_time_ns"] == "1800000000123456000"
+    assert px4_rows[0]["gps_utc_source"] == "GPS1"
     assert px4_rows[0]["latitude_deg"] == "37.123456789"
     assert px4_rows[0]["longitude_deg"] == "127.987654321"
     assert px4_rows[0]["altitude_m"] == "42.25"
-    assert px4_rows[0]["altitude_ellipsoid_m"] == "47.5"
     assert px4_rows[0]["fix_type"] == "6"
     assert px4_rows[0]["satellites_used"] == "18"
-    assert px4_rows[0]["rtk_label"] == "RTK Fixed"
-    assert px4_rows[0]["gps_utc_us"] == "1800000000123456"
-    assert px4_rows[0]["velocity_ned_valid"] == "True"
+    assert "altitude_ellipsoid_m" not in px4_rows[0]
+    assert "rtk_label" not in px4_rows[0]
+    assert "velocity_ned_valid" not in px4_rows[0]
     px4_xlsx_rows = _xlsx_table_rows(saved.xlsx, 6)
     assert px4_xlsx_rows[0]["sample_type"] == "gps_rtk"
-    assert px4_xlsx_rows[0]["rtk_label"] == "RTK Fixed"
     assert px4_xlsx_rows[0]["fix_type"] == 6
     assert px4_xlsx_rows[0]["satellites_used"] == 18
-    assert px4_xlsx_rows[0]["gps_utc_us"] == 1800000000123456
+    assert px4_xlsx_rows[0]["gps_utc_time_ns"] == 1800000000123456000
     assert px4_xlsx_rows[0]["latitude_deg"] == 37.123456789
     assert px4_xlsx_rows[0]["longitude_deg"] == 127.987654321
-    assert px4_xlsx_rows[0]["velocity_n_m_s"] == 1.25
+    assert "rtk_label" not in px4_xlsx_rows[0]
+    assert "velocity_n_m_s" not in px4_xlsx_rows[0]
     manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
     assert manifest["status"] == "finalized"
     assert manifest["artifact_roles"][saved.distance_measurements_parquet.name] == "distance_measurements_parquet"

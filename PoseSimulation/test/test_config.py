@@ -202,14 +202,47 @@ class PoseSimulationConfigTests(unittest.TestCase):
                 environ={"POSESIM_NOT_A_SCHEMA_KEY": "value"},
             )
 
+    def test_simulation_owned_environment_is_rejected(self):
+        for key in (
+            "SIM_CONFIG",
+            "SIM_SCENARIO_CONFIG",
+            "CAM_L_OPTICAL_YAW_DEG",
+            "COMMON_OPTICAL_YAW_ERROR_DEG",
+            "DRONE_SPAWN_Y_M",
+            "WAYPOINTS_XY_ALT_M",
+            "YOLO_MODEL_PATH",
+            "ATTITUDE_EXPERIMENT_AXES",
+        ):
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ConfigError, "Simulation-owned"):
+                    resolve_config(
+                        config_path=DEFAULT_CONFIG_PATH,
+                        environ={key: "simulation-owned-value"},
+                    )
+
     def test_static_source_independence(self):
         source_paths = list(POSESIM_ROOT.glob("*.sh")) + list(
             (POSESIM_ROOT / "pose_simulation").glob("*.py")
         )
         source = "\n".join(path.read_text(encoding="utf-8") for path in source_paths)
-        self.assertNotRegex(source, re.compile(r"(?<!POSE)SIM_CONFIG"))
-        self.assertNotRegex(source, re.compile(r"(?<!POSE)SIM_SCENARIO_CONFIG"))
+        # Naming the variables is allowed for the fail-closed boundary guard;
+        # sourcing or executing them is not.
+        self.assertNotRegex(
+            source,
+            re.compile(r"\bsource\b[^\n]*(?:SIM_CONFIG|SIM_SCENARIO_CONFIG|simulation\.env)"),
+        )
         self.assertNotIn("Simulation/config/simulation.env", source)
+        self.assertNotIn("subprocess.Popen", source)
+        self.assertNotIn("GazeboPoseStream", source)
+        runner = (POSESIM_ROOT / "run_pose_simulation.sh").read_text(encoding="utf-8")
+        self.assertIn('mode="run"', runner)
+        self.assertIn("ros2 launch pose_simulation pose_simulation_ui.launch.py", runner)
+        self.assertIn("run_operator_view.sh", runner)
+        self.assertIn('"$simulation_runner" --headless >"$simulation_log"', runner)
+        self.assertNotIn('"$simulation_runner" --headless --no-yolo', runner)
+        self.assertIn("stop_previous_pose_simulation", runner)
+        self.assertIn("/tmp/posesimulation-run.pid", runner)
+        self.assertIn("pose_simulation_rqt.pose_simulation_plugin.PoseSimulationPlugin", runner)
         for path in source_paths:
             if path.suffix != ".py":
                 continue
@@ -224,6 +257,19 @@ class PoseSimulationConfigTests(unittest.TestCase):
                 for module in modules:
                     self.assertFalse(module == "Simulation" or module.startswith("Simulation."))
                     self.assertFalse(module == "stereo_ground_sim" or module.startswith("stereo_ground_sim."))
+
+    def test_legacy_raw_gazebo_stream_is_absent_from_owned_config(self):
+        legacy_config = (POSESIM_ROOT / "config" / "pose_simulation.yaml").read_text(
+            encoding="utf-8"
+        )
+        for forbidden in (
+            "enable_gazebo_raw_pose_streams",
+            "gazebo_executable:",
+            "gazebo_target_pose_topic:",
+            "gazebo_left_pose_topic:",
+            "gazebo_right_pose_topic:",
+        ):
+            self.assertNotIn(forbidden, legacy_config)
 
 
 if __name__ == "__main__":

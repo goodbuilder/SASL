@@ -49,7 +49,7 @@ setup(
     zip_safe=True,
     maintainer="moontaehyung",
     maintainer_email="user@example.com",
-    description="Diagnostic-only Gazebo and RTK stereo pose evaluation.",
+    description="Independent read-only ROS 2 consumer for external pose diagnostics.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [

@@ -1,5 +1,200 @@
 # 업데이트 기록
 
+## 2026-08-01 — PX4 MAVLink 자력계 wide CSV 저장
+
+- 변경:
+  - `SCALED_IMU`, `SCALED_IMU2`, `SCALED_IMU3` 수신 샘플을 PX4 CSV/Parquet의 한 행에 결합한다.
+  - 각 스트림에 대해 x/y/z/unit 4개씩, 총 12개의 고정 wide 열을 추가했다.
+  - 스트림 수신시각이 최대 25 ms 이내인 샘플을 같은 묶음으로 결합하고, 누락 스트림은 빈 값으로 남긴다.
+- 이유:
+  - MAVLink만 사용하는 운용 경로에서도 세 자력계 스트림을 열 위치로 구분해 분석할 수 있어야 하기 때문이다.
+- 확인:
+  - recording-session 회귀 테스트 18개 통과.
+  - 기존 generic `mag_x/y/z` 및 MAG slot 상태 열은 유지한다.
+- 남은 위험:
+  - 세 스트림의 수신 간격이 25 ms를 초과하면 해당 샘플은 별도 행으로 저장된다.
+
+## 2026-08-01 — PX4 GPS1/GPS2 wide 열 및 GPS UTC 저장
+
+- 변경:
+  - GPS 행에 `gps1_*` 또는 `gps2_*` 명시 열을 추가해 위치·고도·fix·위성 수·속도·heading·RTK 상태를 별도 열로 저장한다.
+  - GPS 수신 메시지의 `time_utc_usec`를 공통 `gps_utc_time_ns`로 변환해 저장하고, `gps_utc_source`로 GPS1/GPS2를 표시한다.
+- 이유:
+  - GPS1과 GPS2를 하나의 모호한 위치 열로 섞지 않고, 데이터 생성 UTC와 호스트 기록 시각을 구분하기 위해서다.
+- 확인:
+  - GPS1/GPS2 wide 열 및 UTC 보존 회귀 테스트를 추가한다.
+- 남은 위험:
+  - GPS가 UTC를 제공하지 않거나 0을 보내면 해당 UTC 열은 빈 값이다.
+
+## 2026-08-01 — PX4 동기화 시간축 단순화
+
+- 변경:
+  - PX4 CSV/Parquet의 동기화 시간축을 `recording_time_ns`와 `gps_utc_time_ns` 두 개로 제한했다.
+  - `estimated_utc_time_ns`, `device_utc_time_ns`, `gps_utc_us`, `gps1/2_gps_utc_us` 저장 열을 제거했다.
+- 이유:
+  - GPS 연결 여부와 무관하게 사용할 호스트 시간축 하나와, GPS 연결 시 사용할 장비 생성 UTC 하나만 남겨 시간 기준을 명확히 하기 위해서다.
+- 확인:
+  - recording-session 회귀 테스트 19개와 CSV/Parquet 열 계약 검증을 통과했다.
+- 남은 위험:
+  - GPS UTC가 유효하지 않은 행에서는 `gps_utc_time_ns`가 빈 값이며 `recording_time_ns`만 동기화에 사용할 수 있다.
+
+## 2026-08-01 — MAVLink 단일 연결 저장 스키마 정리
+
+- 변경:
+  - MAVLink 표준 메시지로 보장할 수 없는 물리 MAG device ID/type/interface와 selected physical ID 열을 PX4 CSV/Parquet/XLSX에서 제거했다.
+  - ROS2/uORB 전용 ellipsoid altitude, RTK label, GPS velocity 상세, heading accuracy 열을 제거했다.
+  - MAVLink에서 직접 확인 가능한 GPS 기본 위치/품질/heading과 세 `SCALED_IMU*` 스트림, MAVLink parameter 기반 MAG 상태만 유지했다.
+- 이유:
+  - ROS2를 사용하지 않는 단일 MAVLink 운용에서 항상 빈 값이거나 물리 센서 식별을 보장하지 못하는 열을 저장 계약에 남기지 않기 위해서다.
+- 확인:
+  - MAVLink-only compact 열 계약과 기존 세션 저장 회귀 테스트를 갱신한다.
+- 남은 위험:
+  - GPS_RTK baseline은 일반 GPS 위치 열과 의미가 다르므로 별도 좌표 계약 검토 후 저장 여부를 결정해야 한다.
+
+## 2026-08-01 — MAVLink 상세 telemetry 저장 확장
+
+- 변경:
+  - ATTITUDE rate/time_boot_ms, GPS ground speed/yaw/heading accuracy, SCALED_IMU* 가속도·자이로·time_boot_ms를 저장한다.
+  - GLOBAL_POSITION_INT, LOCAL_POSITION_NED, VFR_HUD, SYS_STATUS, BATTERY_STATUS, RAW_IMU를 MAVLink stream 요청 및 PX4 timeline 저장 대상으로 추가했다.
+- 이유:
+  - ROS2 없이도 MAVLink 단일 연결에서 복구 가능한 상세 telemetry를 세션 파일에 남기기 위해서다.
+- 확인:
+  - recording-session 스키마 회귀와 Python compileall을 실행한다.
+- 남은 위험:
+  - GPS_RTK baseline은 일반 GPS 위치 열과 의미가 다르므로 별도 좌표 계약 검토 후 저장 여부를 결정해야 한다.
+
+## 2026-08-01 — Pixhawk 전용 XLSX 및 세션 RTK 파일 추가
+
+- 변경:
+  - P1/P2별 `px4_left.xlsx`/`px4_right.xlsx` 전용 workbook을 생성하고 telemetry 종류별 탭으로 분리했다.
+  - `Summary`와 `SyncSnapshot`은 전용 Pixhawk workbook에 생성하지 않는다.
+  - GNSS-relative/RTK 데이터는 `session_rtk.xlsx`의 `GPS_RTK` 탭으로 분리했다.
+- 이유:
+  - PX4 CSV 한 행에 서로 다른 주기의 메시지를 억지로 합치지 않고, 각 데이터 종류를 독립적인 단일 행 구조로 분석하기 위해서다.
+- 확인:
+  - recording-session 테스트에서 세 전용 workbook의 탭 계약을 검증한다.
+- 남은 위험:
+  - 기존 CSV/Parquet와 통합 review workbook은 호환성을 위해 계속 생성된다.
+
+## 2026-08-01 — RTCP 도착시각 기반 시간 동기화 검증 보정
+
+- 변경:
+  - GStreamer `recv_rtcp_sink_*` pad probe에서 RTCP Sender Report의 실제 수신시각을 기록하고, 통계 폴링 시각은 probe가 없는 환경의 fallback으로만 사용한다.
+  - 단일 SR 간격 대신 최근 SR 간격의 median으로 NTP/RTP clock rate를 추정해 250ms 폴링 양자화 outlier를 억제한다.
+  - 동기화 readiness가 최신 좌/우 프레임이 아니라 1초 history 안에서 수신 skew 350ms 이내이고 RTCP/NTP frame timestamp 차이 50ms 이내인 temporal pair를 사용하도록 했다.
+  - GDTI를 질의 왕복 중간시각 및 1초 정수 해상도 기준으로 검증하고, STUS 요청시각과의 직접 비교로 인한 오판을 제거했다.
+  - RTCP warmup timeout을 8초에서 30초로 늘렸다.
+- 이유:
+  - 250ms 주기 통계 polling 시각이 실제 RTCP 도착시각을 대신해 SR clock-rate와 PC offset을 흔들었고, 최신 프레임끼리의 비교가 서로 다른 시점의 프레임을 pair로 오인했기 때문이다.
+- 확인:
+  - RTCP/NTP 및 camera sync 회귀 테스트와 전체 테스트 557개를 통과시켰다.
+- 남은 위험:
+  - 실제 카메라에서 RTCP pad probe가 연결되지 않으면 통계 polling fallback이 사용되므로, 실행 로그의 `실제 Sender Report 도착시각 probe 연결` 메시지를 확인해야 한다.
+
+## 2026-08-01 — RTCP history 및 Sender Report stale 기준 조정
+
+- 변경:
+  - 좌우 frame pairing history window를 1000ms로 명시하고, Sender Report stale 기준을 7초로 분리했다.
+  - 좌측 stream의 비대칭 수신 지연을 흡수하기 위해 history pair 선택의 receive skew 허용값을 350ms로 늘리고, 최종 승인 기준은 RTCP/NTP frame timestamp Δt 50ms로 유지했다.
+- 이유:
+  - 실제 카메라 Sender Report 주기가 약 5초라 1초 stale 기준은 정상적인 SR 사이 공백을 stale로 오판할 수 있었고, 좌우 RTSP transport delay 차이 때문에 수신시각만으로 같은 촬영시각의 frame을 찾을 수 없었기 때문이다.
+- 확인:
+  - frame history 1초 window와 SR 7초 기준 회귀 테스트를 실행한다.
+
+## 2026-08-01 — STUS 이후 RTCP/NTP 동기화 자동 검증
+
+- 변경:
+  - `STUS → GDTI → RTSP 재연결 → RTCP 워밍업 → 검증` 절차를 시간 동기화 버튼에 연결했다.
+  - TCP interleaved를 RTSP 기본 전송으로 사용하고, Sender Report가 없는 상태에서는 거리 측정을 유효 결과로 만들지 않는다.
+  - 좌우 Δt, PC UTC offset, Sender Report age, GDTI offset, NTP/RTP clock rate를 함께 검증하고 실패 사유를 세션 metadata에 저장한다.
+- 이유:
+  - 기존에는 STUS를 실행해도 이미 열린 RTSP stream의 RTP/RTCP anchor가 갱신되지 않았고, 좌측 clock drift와 RTCP 유실을 측정 단계에서 차단하지 못했기 때문이다.
+- 확인:
+  - GDTI parser, fresh RTCP readiness, TCP 기본값, 기존 clock-sync 회귀 테스트를 추가·갱신한다.
+- 남은 위험:
+  - TCP 재연결 후에도 clock rate drift가 지속되면 카메라 펌웨어 또는 RTP timestamp 생성기 문제로 장비 측 확인이 필요하다.
+
+## 2026-08-01 — 세션 종료 전 카메라 시간 동기화 관측값 보존
+
+- 변경:
+  - 카메라 스트림을 종료하기 전에 마지막 RTCP/NTP 좌우 pair를 캡처해 세션 고정 JSON과 `.spool/session_metadata.json`에 보존한다.
+  - 기록 시작 후 첫 유효 pair와 종료 직전 pair를 함께 저장하고, pair 변화량과 상대 drift(ppm)를 계산한다.
+  - PC UTC `STUS` 전송 결과, 대상 카메라, 요청 시각, 응답, 전송 skew를 세션 메타데이터에 남긴다.
+- 이유:
+  - 카메라 전원 종료나 스트림 재연결로 RTCP anchor가 초기화되어도, 해당 실험 중 마지막 동기화 상태와 비정상 원인을 사후 확인할 수 있어야 하기 때문이다.
+- 확인:
+  - PC UTC 기록과 세션 종료 직전 RTCP snapshot 회귀 테스트를 추가한다.
+- 남은 위험:
+  - PC UTC 동기화 후에도 pair drift가 반복되면 카메라 RTC 또는 RTCP Sender Report 매핑 문제로 판단하고 하드웨어/펌웨어 로그를 추가 확인해야 한다.
+
+## 2026-08-01 — RTP/RTCP drift 진단 원시값 저장
+
+- 변경:
+  - 카메라 타임라인 CSV/Parquet에 RTP SSRC·sequence, RTCP clock rate, Sender Report age/PC offset, transit delay, 보정 transport delay, NTP/media rate를 저장한다.
+  - 세션 고정 JSON에 카메라별 RTCP 수신률, delay 범위, NTP/media rate, 추정 RTP clock rate를 집계한다.
+- 이유:
+  - UDP RTCP 유실과 좌측 카메라 RTP clock drift를 분리하려면 기존 `missing-rtcp` 상태만으로는 증거가 부족했기 때문이다.
+- 확인:
+  - RTP/RTCP 원시값 compact 저장과 세션별 clock-rate 집계 회귀 테스트를 추가한다.
+- 남은 위험:
+  - 실제 원인 판정은 PC UTC 설정 후 RTSP 재연결하고 UDP/TCP interleaved를 각각 녹화한 비교 실험이 필요하다.
+
+## 2026-08-01 — MAVLink 자기장 차이 단위 표시 수정
+
+- 변경:
+  - MAVLink `SCALED_IMU*`의 mG 값을 G로 잘못 표시하던 주/보조 자기장 차이 UI를 단위 인식 방식으로 수정했다.
+  - 비교 임계값과 그래프 계산은 G로 정규화하고, 같은 단위의 원시 비교 결과는 mG로 표시하도록 했다.
+  - mG 차이 계산과 UI 표시 회귀 테스트를 추가했다.
+- 이유:
+  - mG 원시값을 단순 차감한 뒤 `G`를 붙여 실제 차이보다 1,000배 크게 보이는 문제가 있었기 때문이다.
+- 확인:
+  - `tests/test_alignment_managers.py`와 자기장 UI 회귀 테스트를 실행한다.
+  - 관련 Python 모듈 `compileall` 검사를 통과한다.
+- 남은 위험:
+  - 실제 Pixhawk MAVLink/ROS2 혼합 수신 환경의 장시간 표시 동작은 하드웨어에서 별도로 확인해야 한다.
+
+## 2026-08-01 — Matplotlib 3D toolkit 혼합 설치 경고 수정
+
+- 변경:
+  - 실행 시 사용자 설치 Matplotlib과 Ubuntu 시스템 `mpl_toolkits`가 섞이지 않도록 호환 namespace 경로를 추가했다.
+  - Matplotlib 캐시를 프로젝트 내부 writable 경로로 지정했다.
+- 이유:
+  - Matplotlib core 3.10.8이 시스템의 구버전 `mplot3d`를 읽어 `Axes3D` import 경고를 출력하고, 사용자 캐시 경로도 쓰지 못했기 때문이다.
+- 확인:
+  - 실행 Python에서 `Axes3D` import와 GUI import를 확인한다.
+- 남은 위험:
+  - 외부에서 `python3`로 직접 실행하면 `run.sh`의 호환 경로 설정이 적용되지 않는다.
+
+## 2026-08-01 — MAVLink MAG 자동 readback으로 인한 GUI 정지 방지
+
+- 변경:
+  - ROS2 `vehicle_magnetometer` 수신과 MAVLink 연결 직후에는 CAL_MAG PARAM readback을 실행하지 않고, 수동 `새로고침`에서만 실행하도록 분리했다.
+  - 고주기 MAG telemetry callback이 Pixhawk 응답을 기다리며 Qt/ROS2 이벤트 처리를 막지 않도록 했다.
+- 이유:
+  - Pixhawk가 PARAM 응답을 보내지 않는 경우 MAG 샘플마다 여러 개의 순차 readback이 반복되어 WIRIS-only GUI가 멈춘 것처럼 보였기 때문이다.
+- 확인:
+  - MAVLink 연결 상태에서 telemetry callback이 PARAM readback을 호출하지 않는 회귀 테스트를 추가했다.
+- 남은 위험:
+  - 수동 `새로고침`은 실제 MAVLink PARAM 응답을 기다리므로 장비 연결 상태에 따라 지연될 수 있다.
+
+## 2026-08-01 — MAG 역할 상태와 PX4 상세 설정 화면 분리
+
+- 변경:
+  - `정렬 > MAG 관리`는 `BOARD`, `CAN1`, `CAN2`, `GPS1`, `GPS2` 역할별 상태와 Device Type을 항상 표시하도록 정리했다.
+  - 역할 열은 제거하고 Device Type 중심으로 단순화했으며, selected telemetry만 있고 역할 raw sample이 없을 때의 대기 원인을 구분해 표시한다.
+  - 역할별 상태에 `X`, `Y`, `Z`, `벡터 크기`를 추가했으며, raw sample이 없을 때는 수치와 대기 원인을 분리해 표시한다.
+  - 일반 MAG 관리 화면에는 Priority 수정, 저장, 재부팅 기능을 유지했다.
+  - CAL_MAG 슬롯/Device ID/Device Type/Priority 상세 표는 `고급 > PX4 MAG`로 이동했다.
+  - Left/Right PX4 CSV의 `magnetometer` 행에 Device Type, X/Y/Z, `mag_vector_norm`을 저장하도록 정리했다.
+- 이유:
+  - 현장 운용 화면에서는 역할·수신·선택 상태와 Priority 조작을 빠르게 확인하고, PX4 슬롯 매핑과 원시 PARAM 진단은 고급 화면에서 분리하기 위해서다.
+- 확인:
+  - MAG 역할 상태 UI 회귀 테스트와 고급 탭 구성 테스트를 갱신했다.
+  - PX4 compact CSV가 양쪽 raw magnetometer 행의 Device Type과 벡터 성분을 유지하는지 회귀 테스트를 추가했다.
+  - `python3 -m compileall -q wiris_stereo_distance/gui.py`로 문법을 확인했다.
+- 남은 위험:
+  - 실제 MAVLink PARAM 연결과 장비별 CAL_MAG readback은 하드웨어 연결 상태에서 별도로 확인해야 한다.
+
 ## 2026-07-29 — CSV 기반 보정 프로파일 배포 계약 명시
 
 - 변경:

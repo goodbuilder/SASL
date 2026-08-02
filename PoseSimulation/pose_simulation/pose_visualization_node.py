@@ -96,11 +96,20 @@ class PoseVisualizationNode(Node):
             "normalized_ray_length_m": 50.0,
             "camera_axis_length_m": 5.0,
             "rig_axis_length_m": 10.0,
-            "target_marker_scale_m": 3.0,
-            "optical_center_scale_m": 1.0,
+            "target_marker_scale_m": 12.0,
+            "optical_center_scale_m": 3.0,
             "frustum_length_m": 3.0,
             "frustum_width_m": 1.0,
             "frustum_height_m": 0.7,
+            "marker_visual_scale": 1.0,
+            "ray_shaft_width_m": 2.0,
+            "ray_head_width_m": 2.0,
+            "ray_line_width_m": 2.0,
+            "show_meshes": True,
+            "camera_mesh_resource": "package://pose_simulation/models/wiris_camera/meshes/WIRIS.stl",
+            "camera_mesh_scale_m": 0.001,
+            "drone_mesh_resource": "package://pose_simulation/models/x500_15m/meshes/x500_15m.stl",
+            "drone_mesh_scale_m": 22.0,
             "show_actual": True,
             "show_gt_ideal": True,
             "show_rtk_ideal": False,
@@ -111,7 +120,7 @@ class PoseVisualizationNode(Node):
             "show_baseline": True,
             "show_text": True,
             "show_detailed_optical_axes": False,
-            "marker_lifetime_s": 0.5,
+            "marker_lifetime_s": 0.0,
             "angular_visual_scale": 1.0,
             "position_error_visual_scale": 1.0,
         }
@@ -152,6 +161,15 @@ class PoseVisualizationNode(Node):
             frustum_length_m=float(self._parameter("frustum_length_m")),
             frustum_width_m=float(self._parameter("frustum_width_m")),
             frustum_height_m=float(self._parameter("frustum_height_m")),
+            marker_visual_scale=float(self._parameter("marker_visual_scale")),
+            ray_shaft_width_m=float(self._parameter("ray_shaft_width_m")),
+            ray_head_width_m=float(self._parameter("ray_head_width_m")),
+            ray_line_width_m=float(self._parameter("ray_line_width_m")),
+            show_meshes=bool(self._parameter("show_meshes")),
+            camera_mesh_resource=str(self._parameter("camera_mesh_resource")).strip(),
+            camera_mesh_scale_m=float(self._parameter("camera_mesh_scale_m")),
+            drone_mesh_resource=str(self._parameter("drone_mesh_resource")).strip(),
+            drone_mesh_scale_m=float(self._parameter("drone_mesh_scale_m")),
             show_actual=bool(self._parameter("show_actual")),
             show_gt_ideal=bool(self._parameter("show_gt_ideal")),
             show_rtk_ideal=bool(self._parameter("show_rtk_ideal")),
@@ -313,6 +331,7 @@ class PoseVisualizationNode(Node):
             "line_list": Marker.LINE_LIST,
             "sphere": Marker.SPHERE,
             "text": Marker.TEXT_VIEW_FACING,
+            "mesh": Marker.MESH_RESOURCE,
             "none": Marker.CUBE,
         }.get(spec.marker_type, Marker.CUBE)
         marker.pose.position.x, marker.pose.position.y, marker.pose.position.z = spec.position
@@ -322,6 +341,8 @@ class PoseVisualizationNode(Node):
         marker.scale.x, marker.scale.y, marker.scale.z = spec.scale
         marker.color.r, marker.color.g, marker.color.b, marker.color.a = spec.color
         marker.text = spec.text
+        marker.mesh_resource = spec.mesh_resource
+        marker.mesh_use_embedded_materials = spec.mesh_use_embedded_materials
         marker.lifetime.sec = int(max(0.0, spec.lifetime_s))
         marker.lifetime.nanosec = int((max(0.0, spec.lifetime_s) % 1.0) * 1.0e9)
         return marker

@@ -1479,9 +1479,19 @@ class LiveSavedCsvPreview(QWidget):
                 "intersection_angle_deg",
                 "left_depth_m",
                 "right_depth_m",
+                # Only present on attitude/full (px4_vehicle_attitude-sourced)
+                # rays: the actual PX4 quaternion fed into the triangulation,
+                # and its heading residual against Gazebo ground truth.
+                "left_attitude_truth_residual_deg",
+                "right_attitude_truth_residual_deg",
             ):
                 if key in ray:
                     self._live_latest[f"{prefix}_{key}"] = self._format_csv_value(ray.get(key))
+            for label in ("left", "right"):
+                for axis in ("w", "x", "y", "z"):
+                    key = f"{label}_px4_q_{axis}"
+                    if key in ray:
+                        self._live_latest[f"{prefix}_{key}"] = self._format_csv_value(ray.get(key))
             for source_key, field_middle in (
                 ("left_point_frd_m", "left_point"),
                 ("right_point_frd_m", "right_point"),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import multiprocessing
+import math
 import queue
 import shlex
 import shutil
@@ -13,6 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 from typing import Any, Callable
 
 from PyQt5 import QtCore, QtGui
@@ -57,6 +59,8 @@ NTP_UNIX_EPOCH_OFFSET_S = 2_208_988_800
 UINT32_MODULUS = 2**32
 UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
+MAX_RTCP_SR_ARRIVAL_CACHE = 128
+MAX_RTCP_RATE_SAMPLES = 12
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
 MAX_RTCP_SR_PC_OFFSET_S = 0.5
 
@@ -560,6 +564,7 @@ class RtcpSenderReportTiming:
     clock_rate_hz: int
     received_monotonic_s: float
     received_wall_s: float | None = None
+    arrival_basis: str = "poll-detected"
 
 
 def rtcp_sender_report_pc_offset_s(
@@ -613,6 +618,30 @@ def sender_report_clock_rates(
     }
 
 
+def robust_sender_report_clock_rates(
+    samples: deque[dict[str, float]] | list[dict[str, float]],
+) -> dict[str, float] | None:
+    """Return median clock rates over recent Sender Report intervals."""
+
+    valid = [
+        sample
+        for sample in samples
+        if all(
+            key in sample
+            and isinstance(sample[key], (int, float))
+            and math.isfinite(float(sample[key]))
+            and float(sample[key]) > 0.0
+            for key in ("ntp_rate", "media_rate")
+        )
+    ]
+    if not valid:
+        return None
+    return {
+        "ntp_rate": float(median(float(sample["ntp_rate"]) for sample in valid)),
+        "media_rate": float(median(float(sample["media_rate"]) for sample in valid)),
+    }
+
+
 class GstRtpTimingTracker:
     def __init__(self, Gst, GstRtp, *, status_callback: Callable[[str], None] | None = None) -> None:
         self.Gst = Gst
@@ -624,6 +653,11 @@ class GstRtpTimingTracker:
         self._pts_order: deque[int] = deque(maxlen=MAX_RTP_TIMING_CACHE)
         self._sr_by_ssrc: dict[int, RtcpSenderReportTiming] = {}
         self._sr_count_by_ssrc: dict[int, int] = {}
+        self._clock_rate_samples_by_ssrc: dict[int, deque[dict[str, float]]] = {}
+        self._clock_rates_by_ssrc: dict[int, dict[str, float]] = {}
+        self._sr_arrival_by_key: dict[tuple[int, int], tuple[float, float]] = {}
+        self._sr_arrival_order: deque[tuple[int, int]] = deque()
+        self._rtcp_probe_pads: set[str] = set()
         self._manager = None
         self._last_rtcp_poll_s = 0.0
         self._last_clock_rates: dict[str, float] | None = None
@@ -649,12 +683,23 @@ class GstRtpTimingTracker:
         if interval_s <= 0.0:
             return None
         rates = sender_report_clock_rates(previous, timing)
-        self._last_clock_rates = rates
-        rate_text = ""
         if rates is not None:
+            with self._lock:
+                samples = self._clock_rate_samples_by_ssrc.setdefault(
+                    timing.ssrc,
+                    deque(maxlen=MAX_RTCP_RATE_SAMPLES),
+                )
+                samples.append(rates)
+                robust_rates = robust_sender_report_clock_rates(samples)
+                if robust_rates is not None:
+                    self._clock_rates_by_ssrc[timing.ssrc] = robust_rates
+                    self._last_clock_rates = robust_rates
+        rate_text = ""
+        robust_rates = self._clock_rates_by_ssrc.get(timing.ssrc)
+        if robust_rates is not None:
             rate_text = (
-                f", ntp_rate={rates['ntp_rate']:.6f}"
-                f", media_rate={rates['media_rate']:.6f}"
+                f", ntp_rate={robust_rates['ntp_rate']:.6f}"
+                f", media_rate={robust_rates['media_rate']:.6f}"
             )
         return (
             "[RTCP] Sender Report 갱신: "
@@ -717,9 +762,11 @@ class GstRtpTimingTracker:
                 "rtcp_sr_received_count": sr_received_count,
             }
         )
-        if self._last_clock_rates is not None:
-            metadata["rtcp_camera_ntp_rate"] = self._last_clock_rates["ntp_rate"]
-            metadata["rtcp_camera_media_rate"] = self._last_clock_rates["media_rate"]
+        clock_rates = self._clock_rates_by_ssrc.get(frame_timing.rtp_ssrc) or self._last_clock_rates
+        if clock_rates is not None:
+            metadata["rtcp_camera_ntp_rate"] = clock_rates["ntp_rate"]
+            metadata["rtcp_camera_media_rate"] = clock_rates["media_rate"]
+        metadata["rtcp_sr_arrival_basis"] = sr_timing.arrival_basis
         sr_pc_offset_s = None
         if sr_timing.received_wall_s is not None:
             sr_pc_offset_s = rtcp_sender_report_pc_offset_s(
@@ -748,6 +795,92 @@ class GstRtpTimingTracker:
     def _handle_new_manager(self, _source, manager) -> None:
         with self._lock:
             self._manager = manager
+        try:
+            manager.connect("pad-added", self._handle_manager_pad_added)
+            iterator = manager.iterate_pads()
+            while True:
+                result, pad = iterator.next()
+                if result != self.Gst.IteratorResult.OK:
+                    break
+                self._handle_manager_pad_added(manager, pad)
+        except Exception as exc:
+            self._emit_status(f"[RTCP] 실제 도착 probe 연결 실패, 통계 폴링 fallback: {exc}")
+
+    def _handle_manager_pad_added(self, _manager, pad) -> None:
+        try:
+            pad_name = str(pad.get_name())
+        except Exception:
+            return
+        if not pad_name.startswith("recv_rtcp_sink_") or pad_name in self._rtcp_probe_pads:
+            return
+        try:
+            pad.add_probe(self.Gst.PadProbeType.BUFFER, self._capture_rtcp_packet)
+        except Exception as exc:
+            self._emit_status(f"[RTCP] {pad_name} probe 연결 실패, 통계 폴링 fallback: {exc}")
+            return
+        self._rtcp_probe_pads.add(pad_name)
+        self._emit_status(f"[RTCP] 실제 Sender Report 도착시각 probe 연결: {pad_name}")
+
+    def _remember_sender_report_arrival(
+        self,
+        *,
+        ssrc: int,
+        ntp_raw: int,
+        received_monotonic_s: float,
+        received_wall_s: float,
+    ) -> None:
+        key = (int(ssrc), int(ntp_raw))
+        with self._lock:
+            if key not in self._sr_arrival_by_key:
+                self._sr_arrival_order.append(key)
+            self._sr_arrival_by_key[key] = (float(received_monotonic_s), float(received_wall_s))
+            while len(self._sr_arrival_by_key) > MAX_RTCP_SR_ARRIVAL_CACHE and self._sr_arrival_order:
+                old_key = self._sr_arrival_order.popleft()
+                self._sr_arrival_by_key.pop(old_key, None)
+
+    def _sender_report_arrival(self, *, ssrc: int, ntp_raw: int) -> tuple[float, float] | None:
+        with self._lock:
+            return self._sr_arrival_by_key.get((int(ssrc), int(ntp_raw)))
+
+    def _capture_rtcp_packet(self, _pad, info):
+        buffer = info.get_buffer()
+        if buffer is None:
+            return self.Gst.PadProbeReturn.OK
+        received_monotonic_s = time.monotonic()
+        received_wall_s = time.time()
+        rtcp_buffer = self.GstRtp.RTCPBuffer()
+        try:
+            success = self.GstRtp.RTCPBuffer.map(
+                buffer,
+                self.Gst.MapFlags.READ,
+                rtcp_buffer,
+            )
+        except Exception:
+            return self.Gst.PadProbeReturn.OK
+        if not success:
+            return self.Gst.PadProbeReturn.OK
+        try:
+            packet = self.GstRtp.RTCPPacket()
+            if not rtcp_buffer.get_first_packet(packet):
+                return self.Gst.PadProbeReturn.OK
+            while True:
+                if packet.get_type() == self.GstRtp.RTCPType.SR:
+                    ssrc, ntp_raw, _rtp_timestamp, _packet_count, _octet_count = packet.sr_get_sender_info()
+                    self._remember_sender_report_arrival(
+                        ssrc=int(ssrc),
+                        ntp_raw=int(ntp_raw),
+                        received_monotonic_s=received_monotonic_s,
+                        received_wall_s=received_wall_s,
+                    )
+                if not packet.move_to_next():
+                    break
+        except Exception:
+            # Keep the stats-based path alive if a platform's GI bindings do
+            # not expose one of the RTCP packet accessors.
+            return self.Gst.PadProbeReturn.OK
+        finally:
+            rtcp_buffer.unmap()
+        return self.Gst.PadProbeReturn.OK
 
     def _capture_rtp_packet(self, _pad, info):
         buffer = info.get_buffer()
@@ -857,6 +990,18 @@ class GstRtpTimingTracker:
                 received_monotonic_s=now_s,
                 received_wall_s=time.time(),
             )
+            arrival = self._sender_report_arrival(ssrc=ssrc, ntp_raw=ntp_raw)
+            if arrival is not None:
+                timing = RtcpSenderReportTiming(
+                    ssrc=timing.ssrc,
+                    ntp_raw=timing.ntp_raw,
+                    ntp_unix_s=timing.ntp_unix_s,
+                    rtp_timestamp=timing.rtp_timestamp,
+                    clock_rate_hz=timing.clock_rate_hz,
+                    received_monotonic_s=arrival[0],
+                    received_wall_s=arrival[1],
+                    arrival_basis="rtcp-pad-probe",
+                )
             message = self._register_sender_report(timing)
             if message is not None:
                 emitted_messages.append(message)
@@ -2201,6 +2346,7 @@ class YoloStreamWorker(QtCore.QObject):
                     "source_timestamp_s": None,
                     "timestamp_source": "legacy-frame",
                 }
+            metadata.setdefault("rtsp_transport", self.config["rtsp_transport"])
             image = QtGui.QImage(
                 data,
                 width,
@@ -2227,6 +2373,8 @@ class YoloStreamWorker(QtCore.QObject):
             else:
                 _kind, timestamp_s, width, height, best_detection, detections = message
                 timestamp_metadata = {}
+            timestamp_metadata = dict(timestamp_metadata or {})
+            timestamp_metadata.setdefault("rtsp_transport", self.config["rtsp_transport"])
             self.detection_ready.emit(
                 {
                     "timestamp_s": timestamp_s,

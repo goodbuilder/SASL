@@ -14,7 +14,7 @@ from pose_simulation.input_types import (
     WAITING_FOR_LEFT_CAMERA,
     WAITING_FOR_RIGHT_CAMERA,
 )
-from pose_simulation.time_alignment import align_dynamic_streams, align_static_snapshot
+from pose_simulation.time_alignment import align_dynamic_streams, align_static_snapshot, sample_pose
 
 from test_input_adapters import _camera_payload, _gt_message
 
@@ -51,6 +51,22 @@ class TimeAlignmentTests(unittest.TestCase):
         self.assertEqual(aligned.gt_time_residual_ns, 0)
         self.assertIsNone(aligned.left_time_residual_ns)
         self.assertIsNone(aligned.right_time_residual_ns)
+
+    def test_flattened_samples_materialize_as_publishable_poses(self):
+        aligned = align_static_snapshot(
+            _gt(10_250_000_000),
+            _camera("left", 1),
+            _camera("right", 1, x=12.5),
+        )
+        self.assertTrue(aligned.valid)
+        assert aligned.ground_truth is not None
+        assert aligned.left_actual_camera is not None
+        self.assertEqual(sample_pose(aligned.ground_truth).frame_id, "gazebo_world_enu")
+        self.assertEqual(sample_pose(aligned.left_actual_camera).frame_id, "camera_optical_rdf")
+        self.assertEqual(
+            sample_pose(aligned.ground_truth).position_world_enu_m,
+            aligned.ground_truth.position_world_enu_m,
+        )
 
     def test_static_alignment_reports_missing_and_invalid_inputs_without_reuse(self):
         self.assertEqual(align_static_snapshot(None, None, None).status, WAITING_FOR_GT)

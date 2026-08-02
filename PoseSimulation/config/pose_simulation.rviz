@@ -4,19 +4,19 @@ Panels:
 Visualization Manager:
   Class: ""
   Displays:
-    - Alpha: 0.5
-      Cell Size: 1
+    - Alpha: 0.35
+      Cell Size: 100
       Class: rviz_default_plugins/Grid
       Color: 160; 160; 164
       Enabled: true
       Line Style:
         Line Width: 0.03
         Value: Lines
-      Name: World Grid
+      Name: Ground Grid
       Normal Cell Count: 0
       Offset: 0
       Plane: XY
-      Plane Cell Count: 20
+      Plane Cell Count: 40
       Reference Frame: <Fixed Frame>
       Value: true
     - Class: rviz_default_plugins/TF
@@ -30,7 +30,12 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
-      Marker Topic: /pose_simulation/visualization/markers
+      Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /pose_simulation/visualization/markers
       Name: PoseSimulation Diagnostics
       Namespaces:
         pose_sim/actual/left: true
@@ -71,7 +76,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 100
+      Distance: 2000
       Focal Point: 0; 0; 0
       Name: Current View
       Pitch: 0.5

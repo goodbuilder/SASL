@@ -11,21 +11,6 @@
     # link=[Forward, -Right, -Down]. This is the verified SDF extrinsic.
     gazebo_link_rotation_from_optical_flat: [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]
 
-    # This independent app observes its copied Gazebo world directly. The
-    # x500 model is a configured fallback because this world does not rename
-    # the model to target_reference_link.
-    enable_gazebo_raw_pose_streams: true
-    gazebo_executable: gz
-    gazebo_target_pose_topic: /model/x500_15m/pose
-    gazebo_target_entity_name: x500_15m
-    gazebo_target_parent_model_name: x500_15m
-    gazebo_left_pose_topic: /model/left_stereo_camera/pose_static
-    gazebo_left_entity_name: left_stereo_camera::optical_link
-    gazebo_left_parent_model_name: left_stereo_camera
-    gazebo_right_pose_topic: /model/right_stereo_camera/pose_static
-    gazebo_right_entity_name: right_stereo_camera::optical_link
-    gazebo_right_parent_model_name: right_stereo_camera
-
     # Current Simulation camera diagnostics publish observed optical RDF world
     # poses as JSON.  Desired fields in those payloads are not consumed.
     actual_left_camera_topic: /simulation/camera_pose_diagnostics/left

@@ -3565,14 +3565,6 @@ Simulation/.venv/bin/python Simulation/scripts/run_estimated_to_truth_calibratio
   --output-dir Simulation/results/estimated_to_truth_calibration_exp
 ```
 
-운용 스크립트로 기록한 CSV를 바로 후처리하려면 wrapper를 사용할 수 있다.
-CSV 경로를 생략하면 `results/calibration_flight` 아래 최신 CSV를 찾는다.
-
-```bash
-./run_estimated_to_truth_from_csv.sh \
-  results/calibration_flight/telemetry.csv
-```
-
 후처리 결과의 runtime profile을 측정 실행에 적용하려면 다음 wrapper를
 사용한다. profile 경로를 생략하면 `results/` 아래 최신
 `active_runtime_profile.json` 또는 `sim3_runtime_profile.json`을 찾는다.

@@ -141,7 +141,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2800
+      Distance: 2000
       Focal Point:
         X: 0
         Y: 1000

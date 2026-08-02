@@ -15,7 +15,12 @@ from wiris_stereo_distance.baseline_alignment import (
     baseline_from_gps,
     evaluate_baseline_quality,
 )
-from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState, MagSensorState
+from wiris_stereo_distance.pixhawk_attitude import (
+    CameraExtrinsicState,
+    MagSensorState,
+    magnetometer_value_to_gauss,
+    magnetometer_value_units,
+)
 from wiris_stereo_distance.rtk_geometry import GpsPositionState
 
 
@@ -105,11 +110,32 @@ class MagnetometerMonitor:
         return None if state is None else state.magnitude
 
     def can_difference(self, side: str) -> float | None:
-        can1 = self.field_strength(side, "CAN1")
-        can2 = self.field_strength(side, "CAN2")
+        can1_state = self.sensors.get(side, {}).get("CAN1")
+        can2_state = self.sensors.get(side, {}).get("CAN2")
+        if can1_state is None or can2_state is None:
+            return None
+        can1 = magnetometer_value_to_gauss(can1_state.magnitude, can1_state.topic)
+        can2 = magnetometer_value_to_gauss(can2_state.magnitude, can2_state.topic)
         if can1 is None or can2 is None:
             return None
         return abs(can1 - can2)
+
+    def can_difference_display(self, side: str) -> tuple[float | None, str]:
+        """Return CAN1/CAN2 difference in a truthful display unit."""
+        can1_state = self.sensors.get(side, {}).get("CAN1")
+        can2_state = self.sensors.get(side, {}).get("CAN2")
+        if can1_state is None or can2_state is None:
+            return None, ""
+        can1 = can1_state.magnitude
+        can2 = can2_state.magnitude
+        if can1 is None or can2 is None:
+            return None, ""
+        can1_units = magnetometer_value_units(can1_state.topic)
+        can2_units = magnetometer_value_units(can2_state.topic)
+        if can1_units and can1_units == can2_units:
+            return abs(float(can1) - float(can2)), can1_units
+        difference = self.can_difference(side)
+        return difference, "G"
 
 
 class AttitudeMonitor:

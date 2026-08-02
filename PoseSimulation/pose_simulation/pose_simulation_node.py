@@ -25,7 +25,6 @@ from .evaluation import (
     PoseEvaluationResult,
     evaluate_pose_snapshot,
 )
-from .gazebo_pose_adapter import GazeboPoseRecord, GazeboPoseStream
 from .pose_math import (
     Matrix3,
     Pose3D,
@@ -76,7 +75,6 @@ class PoseSimulationNode(_RosNode):
         self._load_parameters()
         self._setup_publishers()
         self._setup_subscriptions()
-        self._setup_gazebo_raw_pose_streams()
         self._timer = self.create_timer(1.0 / self._evaluation_rate_hz, self._evaluate_timer)
         self.get_logger().info(
             "PoseSimulation diagnostic-only node started: "
@@ -92,17 +90,6 @@ class PoseSimulationNode(_RosNode):
             "ground_truth_model_fallback_topic": "",
             "target_entity_name": "target_reference_link",
             "gazebo_link_rotation_from_optical_flat": [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0],
-            "enable_gazebo_raw_pose_streams": False,
-            "gazebo_executable": "gz",
-            "gazebo_target_pose_topic": "/model/target/pose",
-            "gazebo_target_entity_name": "target_reference_link",
-            "gazebo_target_parent_model_name": "target",
-            "gazebo_left_pose_topic": "/model/left_stereo_camera/pose_static",
-            "gazebo_left_entity_name": "left_stereo_camera::optical_link",
-            "gazebo_left_parent_model_name": "left_stereo_camera",
-            "gazebo_right_pose_topic": "/model/right_stereo_camera/pose_static",
-            "gazebo_right_entity_name": "right_stereo_camera::optical_link",
-            "gazebo_right_parent_model_name": "right_stereo_camera",
             "actual_left_camera_topic": "/simulation/camera_pose_diagnostics/left",
             "actual_right_camera_topic": "/simulation/camera_pose_diagnostics/right",
             "expected_left_optical_entity_name": "left_stereo_camera::optical_link",
@@ -154,25 +141,6 @@ class PoseSimulationNode(_RosNode):
         self._camera_link_rotation_from_optical = _matrix_from_flat(
             self._parameter("gazebo_link_rotation_from_optical_flat"),
             "gazebo_link_rotation_from_optical_flat",
-        )
-        self._enable_gazebo_raw_pose_streams = bool(
-            self._parameter("enable_gazebo_raw_pose_streams")
-        )
-        self._gazebo_executable = str(self._parameter("gazebo_executable"))
-        self._gazebo_target_pose_topic = str(self._parameter("gazebo_target_pose_topic"))
-        self._gazebo_target_entity_name = str(self._parameter("gazebo_target_entity_name"))
-        self._gazebo_target_parent_model_name = str(
-            self._parameter("gazebo_target_parent_model_name")
-        )
-        self._gazebo_left_pose_topic = str(self._parameter("gazebo_left_pose_topic"))
-        self._gazebo_left_entity_name = str(self._parameter("gazebo_left_entity_name"))
-        self._gazebo_left_parent_model_name = str(
-            self._parameter("gazebo_left_parent_model_name")
-        )
-        self._gazebo_right_pose_topic = str(self._parameter("gazebo_right_pose_topic"))
-        self._gazebo_right_entity_name = str(self._parameter("gazebo_right_entity_name"))
-        self._gazebo_right_parent_model_name = str(
-            self._parameter("gazebo_right_parent_model_name")
         )
         self._left_camera_topic = str(self._parameter("actual_left_camera_topic"))
         self._right_camera_topic = str(self._parameter("actual_right_camera_topic"))
@@ -247,7 +215,6 @@ class PoseSimulationNode(_RosNode):
         self._rtk_status = "INVALID_FIX"
         self._previous_accepted_rtk_world: Vector3 | None = None
         self._last_evaluation: PoseEvaluationResult | None = None
-        self._gazebo_streams: list[GazeboPoseStream] = []
 
     def _setup_publishers(self) -> None:
         self._pose_error_publisher = self.create_publisher(String, "pose_error", 10)
@@ -330,89 +297,6 @@ class PoseSimulationNode(_RosNode):
             history.clear()
             self.get_logger().warning(f"{label} timestamp moved backwards; starting a new sample epoch")
         history.append(sample)
-
-    def _setup_gazebo_raw_pose_streams(self) -> None:
-        if not self._enable_gazebo_raw_pose_streams:
-            return
-        target_source_is_authoritative = self._gazebo_target_entity_name == self._target_entity_name
-        target_is_model_fallback = (
-            self._gazebo_target_entity_name == self._gazebo_target_parent_model_name
-        )
-        if target_source_is_authoritative:
-            target_history = self._gt_primary_history
-            target_source = "TARGET_REFERENCE_LINK"
-        elif target_is_model_fallback:
-            target_history = self._gt_model_history
-            target_source = "MODEL_POSE_FALLBACK"
-        else:
-            target_history = self._gt_fallback_history
-            target_source = "CONFIGURED_FALLBACK_LINK"
-        target_stream = GazeboPoseStream(
-            topic=self._gazebo_target_pose_topic,
-            entity_name=self._gazebo_target_entity_name,
-            parent_model_name=self._gazebo_target_parent_model_name,
-            on_record=lambda record: self._raw_target_record_callback(
-                record, target_history, target_source
-            ),
-            on_error=lambda message: self.get_logger().warning(message),
-            executable=self._gazebo_executable,
-        )
-        left_stream = GazeboPoseStream(
-            topic=self._gazebo_left_pose_topic,
-            entity_name=self._gazebo_left_entity_name,
-            parent_model_name=self._gazebo_left_parent_model_name,
-            on_record=lambda record: self._raw_camera_record_callback(
-                record, self._left_history, "left"
-            ),
-            on_error=lambda message: self.get_logger().warning(message),
-            executable=self._gazebo_executable,
-        )
-        right_stream = GazeboPoseStream(
-            topic=self._gazebo_right_pose_topic,
-            entity_name=self._gazebo_right_entity_name,
-            parent_model_name=self._gazebo_right_parent_model_name,
-            on_record=lambda record: self._raw_camera_record_callback(
-                record, self._right_history, "right"
-            ),
-            on_error=lambda message: self.get_logger().warning(message),
-            executable=self._gazebo_executable,
-        )
-        self._gazebo_streams = [target_stream, left_stream, right_stream]
-        for stream in self._gazebo_streams:
-            stream.start()
-        self.get_logger().info("Raw Gazebo Pose_V observation streams enabled")
-
-    def _raw_target_record_callback(
-        self,
-        record: GazeboPoseRecord,
-        history: Deque[PoseSourceSample],
-        source: str,
-    ) -> None:
-        sample = PoseSourceSample(
-            source=source,
-            frame_id="gazebo_world_enu",
-            pose=record.as_pose(),
-            source_timestamp_ns=record.stamp_ns,
-            receive_timestamp_ns=_now_receive_ns(),
-            entity_name=record.entity_name,
-        )
-        self._append_pose_sample(history, sample, source)
-
-    def _raw_camera_record_callback(
-        self,
-        record: GazeboPoseRecord,
-        history: Deque[PoseSourceSample],
-        side: str,
-    ) -> None:
-        sample = PoseSourceSample(
-            source=f"gazebo_actual_{side}_optical",
-            frame_id="camera_optical_rdf",
-            pose=record.as_optical_pose(self._camera_link_rotation_from_optical),
-            source_timestamp_ns=record.stamp_ns,
-            receive_timestamp_ns=_now_receive_ns(),
-            entity_name=record.entity_name,
-        )
-        self._append_pose_sample(history, sample, f"raw actual {side} optical")
 
     def _ground_truth_primary_callback(self, message: Any) -> None:
         self._pose_callback(message, self._gt_primary_history, "TARGET_REFERENCE_LINK", "target_reference_link")
@@ -654,9 +538,6 @@ class PoseSimulationNode(_RosNode):
             publisher.publish(self._pose_stamped_from_pose(sample.pose, sample.source_timestamp_ns))
 
     def destroy_node(self) -> bool:
-        for stream in getattr(self, "_gazebo_streams", []):
-            stream.shutdown()
-        self._gazebo_streams = []
         return super().destroy_node()
 
     @staticmethod

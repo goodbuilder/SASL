@@ -2,7 +2,7 @@
 <package format="3">
   <name>pose_simulation</name>
   <version>0.1.0</version>
-  <description>PoseSimulation diagnostic-only stereo pose evaluation application.</description>
+  <description>Independent read-only ROS 2 consumer for external pose diagnostics.</description>
   <maintainer email="user@example.com">moontaehyung</maintainer>
   <license>Apache-2.0</license>
 

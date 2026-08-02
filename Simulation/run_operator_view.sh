@@ -288,8 +288,9 @@ Options:
   --gazebo-gui           Show Gazebo GUI. Default keeps Gazebo server-only while
                          RViz and rqt_gui remain open.
   --no-gazebo-gui        Keep Gazebo server-only; this is the default.
-  --headless             Do not start Gazebo GUI or rqt_gui. Useful for automated
-                         record-lite smoke runs.
+  --headless             Do not start Gazebo GUI or rqt_gui. YOLO and detection
+                         overlay topics remain enabled unless --no-yolo or
+                         --raw-view is also selected.
   --auto-mission         Start PX4 offboard takeoff/approach/land after the app starts.
   --mission              Alias for --auto-mission.
   --quick-mission        Faster PX4 offboard approach settings for smoke testing.
@@ -578,7 +579,6 @@ while (($#)); do
       ;;
     --headless)
       headless=true
-      show_detection_images=false
       shift
       ;;
     --params)
