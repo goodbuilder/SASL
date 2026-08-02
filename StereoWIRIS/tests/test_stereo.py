@@ -1650,6 +1650,9 @@ def test_persistent_pixhawk_eth_command_uses_side_ip_and_host(monkeypatch) -> No
         lambda **_kwargs: [SimpleNamespace(name="pixhawk0", address=ip_interface("192.168.0.254/24"))],
     )
     widget = gui.WirisStereoDistancePanel()
+    widget.pixhawk_ethernet_mode_combo.setCurrentIndex(
+        widget.pixhawk_ethernet_mode_combo.findData("mavlink")
+    )
     widget.pixhawk_host_address_edit.setText("192.168.0.254")
     widget.right_pixhawk_eth_ip_edit.setText("192.168.0.3")
     widget.right_mavlink_url_edit.setText("/dev/ttyACM0")
@@ -1659,28 +1662,18 @@ def test_persistent_pixhawk_eth_command_uses_side_ip_and_host(monkeypatch) -> No
     net_cfg_text = widget._persistent_pixhawk_net_cfg_text("right")
 
     assert "ifconfig eth0 192.168.0.3 netmask 255.255.255.0 up" in command
-    assert "param set MAV_2_CONFIG 0" in command
-    assert "param set UXRCE_DDS_CFG 1000" in command
-    assert "param set UXRCE_DDS_KEY 2" in command
-    assert "param set UXRCE_DDS_DOM_ID 0" in command
-    assert "param set UXRCE_DDS_AG_IP 3232235774" in command
-    assert "param set UXRCE_DDS_PTCFG 0" in command
-    assert "param set UXRCE_DDS_SYNCC 0" in command
-    assert "param set UXRCE_DDS_SYNCT 1" in command
-    assert "uxrce_dds_client stop" in command
-    assert "uxrce_dds_client start -t udp -p 8888 -h 192.168.0.254 -n uav_1" in command
-    assert "mavlink stop -u 14551" in command
-    assert "mavlink start -x -u 14551 -o 14551 -t 192.168.0.254 -r 2000000 -m normal" in command
+    assert "param set MAV_2_CONFIG 1000" in command
+    assert "param set UXRCE_DDS_CFG 0" in command
+    assert "uxrce_dds_client start" not in command
+    assert "mavlink stop -u 14551" not in command
+    assert "mavlink start -x -u 14551 -o 14551 -t 192.168.0.254 -r 2000000 -m normal" not in command
     assert "mavlink status" in command
     assert "echo 'ifup eth0' > /fs/microsd/etc/extras.txt" in command
     assert "echo 'ifconfig eth0 192.168.0.3 netmask 255.255.255.0 up' >> /fs/microsd/etc/extras.txt" in command
-    assert "echo 'uxrce_dds_client start -t udp -p 8888 -h 192.168.0.254 -n uav_1' >> /fs/microsd/etc/extras.txt" in command
-    assert "echo 'mavlink start -x -u 14551 -o 14551 -t 192.168.0.254 -r 2000000 -m normal' >> /fs/microsd/etc/extras.txt" in command
     assert "cat /fs/microsd/etc/extras.txt" in command
     assert "ifconfig eth0 192.168.0.3 netmask 255.255.255.0 up" in extras_text
-    assert "uxrce_dds_client start -t udp -p 8888 -h 192.168.0.254 -n uav_1" in extras_text
-    assert "mavlink stop -u 14551" in extras_text
-    assert "mavlink start -x -u 14551 -o 14551 -t 192.168.0.254 -r 2000000 -m normal" in extras_text
+    assert "uxrce_dds_client start" not in extras_text
+    assert "mavlink start" not in extras_text
     assert "echo '" not in extras_text
     assert "IPADDR=192.168.0.3" in net_cfg_text
     assert "ROUTER=192.168.0.254" in net_cfg_text
