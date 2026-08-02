@@ -57,12 +57,11 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     for tab_name in ("Setup", "Flight", "Analysis", "Record", "Debug"):
         assert f'"{tab_name}"' in source
     assert "RecordingControls" in source
-    assert "/stereo/raw_gps_baseline_position" in source
+    assert "/stereo/gps_baseline_position" in source
     assert "/stereo/uam_raw_gps_reference_position" in source
-    assert "/stereo/global_position_baseline_position" not in source
     assert "/stereo/ideal_position" in source
-    assert '"raw": "Raw"' in source
-    assert '"optical": "Truth"' in source
+    assert '"nominal_pose": "Nominal Pose"' in source
+    assert '"optical_pose": "Optical Pose"' in source
     assert '"ideal": "Ideal"' in source
     assert "bbox x1,y1,x2,y2" in source
     assert '("Range", 3)' in source
@@ -106,10 +105,10 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert 'QPushButton("Open XLSX")' in source
     assert 'QPushButton("Export analysis CSV")' in source
     assert "read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)" in source
-    assert '("raw_gps_baseline_range_m", "GPS range (m)")' in source
-    assert '("raw_gps_baseline_forward_m", "GPS F (m)")' in source
-    assert '("nominal_ray_midpoint_forward_m", "F Raw")' in source
-    assert '("optical_ray_midpoint_right_m", "Rt Truth")' in source
+    assert '("gps_baseline_range_m", "GPS Baseline range (m)")' in source
+    assert '("gps_baseline_forward_m", "GPS Baseline F (m)")' in source
+    assert '("nominal_pose_ray_midpoint_forward_m", "F Nominal Pose")' in source
+    assert '("optical_pose_ray_midpoint_right_m", "Rt Optical Pose")' in source
     assert '("ideal_ray_range_m", "Rg Ideal")' in source
     assert 'ray_metrics = Signal(str)' in source
     assert '"/stereo/ray_metrics"' in source
@@ -124,9 +123,8 @@ def test_rqt_runtime_patch_keeps_gps_position_series_in_axis_plots() -> None:
 
     for index in range(3):
         assert f"/stereo/ideal_position/data[{index}]" in source
-        assert f"/stereo/raw_gps_baseline_plot/data[{index}]" in source
+        assert f"/stereo/gps_baseline_plot/data[{index}]" in source
         assert f"/stereo/uam_raw_gps_reference_plot/data[{index}]" in source
-        assert f"/stereo/global_position_baseline_plot/data[{index}]" not in source
 
 
 def test_flight_toolbar_exposes_csv_mp4_and_debug_recording_actions() -> None:

@@ -76,7 +76,7 @@ def _node(left=(0.0, 0.0, 0.0), right=(0.0, 0.0, 0.0), common=(0.0, 0.0, 0.0), r
         setattr(node, f"{prefix}_roll_deg", values[0])
         setattr(node, f"{prefix}_pitch_deg", values[1])
         setattr(node, f"{prefix}_yaw_deg", values[2])
-    for prefix in ("cam_l_px4_attitude_error", "cam_r_px4_attitude_error"):
+    for prefix in ("cam_l_px4_attitude", "cam_r_px4_attitude"):
         setattr(node, f"{prefix}_roll_deg", 0.0)
         setattr(node, f"{prefix}_pitch_deg", 0.0)
         setattr(node, f"{prefix}_yaw_deg", 0.0)
@@ -258,7 +258,7 @@ def _world_context(left_direct, right_direct, common, relative):
         values[f"{prefix}_roll_deg"] = rpy[0]
         values[f"{prefix}_pitch_deg"] = rpy[1]
         values[f"{prefix}_yaw_deg"] = rpy[2]
-    for prefix in ("cam_l_px4_attitude_error", "cam_r_px4_attitude_error"):
+    for prefix in ("cam_l_px4_attitude", "cam_r_px4_attitude"):
         values[f"{prefix}_roll_deg"] = 0.0
         values[f"{prefix}_pitch_deg"] = 0.0
         values[f"{prefix}_yaw_deg"] = 0.0
@@ -355,12 +355,12 @@ def test_node_effective_state_metadata_and_nominal_baseline_are_complete() -> No
         "relative_optical_pitch_error_deg": 0.02,
         "common_optical_yaw_error_deg": 0.10,
         "relative_optical_yaw_error_deg": 0.04,
-        "cam_l_px4_attitude_error_roll_deg": 0.0,
-        "cam_l_px4_attitude_error_pitch_deg": 0.0,
-        "cam_l_px4_attitude_error_yaw_deg": 0.0,
-        "cam_r_px4_attitude_error_roll_deg": 0.0,
-        "cam_r_px4_attitude_error_pitch_deg": 0.0,
-        "cam_r_px4_attitude_error_yaw_deg": 0.0,
+        "cam_l_px4_attitude_roll_deg": 0.0,
+        "cam_l_px4_attitude_pitch_deg": 0.0,
+        "cam_l_px4_attitude_yaw_deg": 0.0,
+        "cam_r_px4_attitude_roll_deg": 0.0,
+        "cam_r_px4_attitude_pitch_deg": 0.0,
+        "cam_r_px4_attitude_yaw_deg": 0.0,
     }
     for name, value in expected_sources.items():
         assert metadata[name] == pytest.approx(value)

@@ -29,7 +29,7 @@ left/right overlay video; `Save Debug` also adds a rosbag. While recording,
 all preset buttons and the output directory are locked. `Flight` contains balanced left/right camera images and direct telemetry values. `Analysis` gives the
 Forward, Right, Down, and Range plots the whole tab. The Raw GPS baseline
 publishes F/R/D; its Range plot value is the explicit 3D vector magnitude.
-GlobalPosition remains in the CSV/XLSX evidence only, not the rqt display.
+Global Baseline is displayed from the same Ray snapshot as the other diagnostic Rays.
 `Debug` provides raw runtime
 status without turning it into an automated warning or qualification result.
 Calibration recording remains a CLI workflow.
@@ -37,17 +37,16 @@ Calibration recording remains a CLI workflow.
 `Flight` also has a collapsible `Ray Diagnostics` group below the direct
 telemetry line. It reads the existing `/stereo/ray_metrics` snapshot only; it
 adds no triangulation, GT, or GPS-anchor logic of its own. `Geometry` lists
-all eight rays (`Raw`, `Truth`, `Ideal`, `GPS`, `Global`, `Attitude`,
-`Baseline`, `Full`) with a state chip, Forward/Right/Down/Range/Gap/Angle in
+seven rays (`Nominal Pose`, `Optical Pose`, `Ideal`, `GPS Baseline`,
+`Global Baseline`, `Attitude`, `Operational`) with a state chip, Forward/Right/Down/Range/Gap/Angle in
 `baseline_center_frd`, and a tooltip carrying the underlying
-`computation_status`/`failure_reason`. `Truth Δ / Interaction` shows how much
-`Attitude`, `Baseline`, and `Full` moved relative to `Truth`, plus the
-`interaction` composite-effect indicator; interaction is explicitly labelled
-"not a Ray" since it is `Full − Attitude − Baseline + Truth`, not a
-triangulated result. `GT Error` shows the absolute position error of
-`Attitude`/`Baseline`/`Full` against the Gazebo `target_reference_link`
-Ground Truth, which is a different comparison from the `Truth` Ray (an
-oracle triangulation of the observed pixels, not the target GT point itself).
+`computation_status`/`failure_reason`. `Optical Pose Δ` shows how much
+`Attitude` and `Operational` move relative to `Optical Pose`. The former
+Interaction panel was removed because its `Full − Attitude − Baseline + Truth`
+decomposition depended on the removed Baseline Ray and was not a directly
+triangulated result. `GT Error` shows absolute error against the Gazebo
+`target_reference_link` Ground Truth, which is different from Optical Pose
+(an oracle triangulation of observed pixels, not the target GT point itself).
 `Sensors` shows PX4 attitude and GPS baseline input health (age, pair skew,
 reset counters, quaternion order/semantics, baseline length and anchor
 policy) read from the same snapshot, with quaternion components and baseline
@@ -91,7 +90,8 @@ It opens native `rqt_graph` in a separate window, preserving the full tabbed
 operator workspace for setup, flight, and analysis. It is an inspection view
 only: it does not change flight, sensor, or recording settings.
 
-The two `*_baseline_position` topics remain the canonical stamped FRD results
+The two `/stereo/gps_baseline_position` and `/stereo/global_baseline_position`
+topics remain the canonical stamped FRD results
 for recorders. The rqt plots use the matching `*_baseline_plot` arrays
 (`data[0..2] = Forward, Right, Down`) so simulation header time cannot move a
 curve outside rqt's wall-clock time window.
@@ -109,10 +109,10 @@ overlay MP4를, `Save Debug`는 그 결과물과 rosbag까지 남긴다. 바로 
 카메라·그래프·baseline source 선택 상태는 유지된다.
 
 각 `telemetry.csv` 행은 public FRD (Forward, Right, Down) 미터 계약으로
-`raw_gps_baseline_*`와 `global_position_baseline_*`를 동시에 남긴다. 각
+`gps_baseline_*`와 `global_baseline_*`를 동시에 남긴다. 각
 `*_position_error_m`은 `/ground_truth_position` 대비 3D FRD 오차이며,
-`raw_minus_global_baseline_{forward,right,down}_m` 및
-`raw_minus_global_baseline_delta_m`은 raw GPS minus PX4 GlobalPosition의
+`gps_baseline_minus_global_baseline_{forward,right,down}_m` 및
+`gps_baseline_minus_global_baseline_delta_m`은 raw GPS minus PX4 GlobalPosition의
 축별/3D 차이다. 값이 없는 스트림은 0으로 채우지 않고 빈 셀로 남긴다.
 
 This phase provides only a pure terminal-record adapter. Runtime publishers,

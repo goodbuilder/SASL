@@ -44,7 +44,7 @@ def _node() -> StereoDistanceNode:
     node.px4_attitude_pair_skew_s = 2.5
     node.px4_attitudes = {"left": None, "right": None}
     node.enable_gps_baseline_triangulation = True
-    node.gps_baseline_source = "raw_gps"
+    node.gps_baseline_source = "gps_baseline"
     node.gps_baseline_max_age_s = 2.5
     node.gps_baseline_fixes = {"left": None, "right": None, "uam": None}
     node.global_baseline_fixes = {"left": None, "right": None}
@@ -217,7 +217,7 @@ def test_left_and_right_sdf_fixed_joints_prove_zero_relative_mount_rotation() ->
     assert gazebo_relative_pose_angle_error_deg <= 1.0e-8
 
 
-def test_diagnostic_rays_compute_attitude_baseline_and_full_combinations(monkeypatch) -> None:
+def test_diagnostic_rays_compute_attitude_and_operational_combinations(monkeypatch) -> None:
     node = _node()
     _seed_attitudes(node)
     _seed_gps(node)
@@ -228,7 +228,7 @@ def test_diagnostic_rays_compute_attitude_baseline_and_full_combinations(monkeyp
     truth = _truth(node, pixels)
     analysis = node._diagnostic_analysis(truth, diagnostics)
 
-    for key in ("attitude", "baseline", "full"):
+    for key in ("attitude", "operational"):
         assert diagnostics[key]["computation_status"] == "computed"
         assert diagnostics[key]["output_frame"] == "baseline_center_frd"
         assert diagnostics[key]["axis_contract"] == BASELINE_CENTER_FRD_AXIS_CONTRACT
@@ -237,9 +237,8 @@ def test_diagnostic_rays_compute_attitude_baseline_and_full_combinations(monkeyp
         assert diagnostics[key]["right_depth_m"] > 0.0
         assert diagnostics[key]["valid"] is True
         assert analysis["comparisons"][key]["position_difference_m"] <= 1.0e-9
-    assert _position_error(diagnostics["full"], (900.0, 3.0, -2.0)) < 1.0e-6
-    assert analysis["interaction"]["valid"] is True
-    assert analysis["interaction"]["position_m"] <= 1.0e-9
+    assert _position_error(diagnostics["operational"], (900.0, 3.0, -2.0)) < 1.0e-6
+    assert "interaction" not in analysis
 
 
 def test_attitude_only_error_keeps_baseline_equal_truth(monkeypatch) -> None:
@@ -262,9 +261,9 @@ def test_attitude_only_error_keeps_baseline_equal_truth(monkeypatch) -> None:
     )
     analysis = node._diagnostic_analysis(truth, diagnostics)
 
-    assert analysis["comparisons"]["baseline"]["position_difference_m"] <= 1.0e-9
+    assert analysis["comparisons"]["operational"]["position_difference_m"] > 1.0e-6
     assert math.dist(
-        diagnostics["full"]["midpoint_baseline_center_frd_m"],
+        diagnostics["operational"]["midpoint_baseline_center_frd_m"],
         diagnostics["attitude"]["midpoint_baseline_center_frd_m"],
     ) <= 1.0e-9
     assert analysis["comparisons"]["attitude"]["position_difference_m"] > 1.0e-6
@@ -288,10 +287,10 @@ def test_baseline_only_error_keeps_attitude_equal_truth(monkeypatch) -> None:
 
     assert analysis["comparisons"]["attitude"]["position_difference_m"] <= 1.0e-9
     assert math.dist(
-        diagnostics["full"]["midpoint_baseline_center_frd_m"],
-        diagnostics["baseline"]["midpoint_baseline_center_frd_m"],
-    ) <= 1.0e-9
-    assert analysis["comparisons"]["baseline"]["position_difference_m"] > 1.0e-6
+        diagnostics["operational"]["midpoint_baseline_center_frd_m"],
+        diagnostics["attitude"]["midpoint_baseline_center_frd_m"],
+    ) > 1.0e-6
+    assert analysis["comparisons"]["operational"]["position_difference_m"] > 1.0e-6
 
 
 def test_combined_error_retriangulates_full_and_reports_finite_interaction(monkeypatch) -> None:
@@ -314,15 +313,14 @@ def test_combined_error_retriangulates_full_and_reports_finite_interaction(monke
     )
     analysis = node._diagnostic_analysis(truth, diagnostics)
 
-    full_midpoint = diagnostics["full"]["midpoint_baseline_center_frd_m"]
+    full_midpoint = diagnostics["operational"]["midpoint_baseline_center_frd_m"]
     assert math.dist(
         full_midpoint, diagnostics["attitude"]["midpoint_baseline_center_frd_m"]
     ) > 1.0e-6
     assert math.dist(
-        full_midpoint, diagnostics["baseline"]["midpoint_baseline_center_frd_m"]
+        full_midpoint, diagnostics["attitude"]["midpoint_baseline_center_frd_m"]
     ) > 1.0e-6
-    assert analysis["interaction"]["valid"] is True
-    assert math.isfinite(analysis["interaction"]["position_m"])
+    assert "interaction" not in analysis
 
 
 def test_diagnostic_rays_isolate_invalid_attitude_from_baseline(monkeypatch) -> None:
@@ -336,8 +334,7 @@ def test_diagnostic_rays_isolate_invalid_attitude_from_baseline(monkeypatch) -> 
     diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
 
     assert diagnostics["attitude"]["computation_status"] == "invalid_px4_attitude"
-    assert diagnostics["full"]["computation_status"] == "invalid_px4_attitude"
-    assert diagnostics["baseline"]["computation_status"] == "computed"
+    assert diagnostics["operational"]["computation_status"] == "invalid_px4_attitude"
 
 
 def test_attitude_pose_selection_rejects_stale_skewed_and_old_epoch_samples() -> None:
@@ -386,7 +383,7 @@ def test_baseline_pose_selection_rejects_stale_and_invalid_gps(monkeypatch) -> N
     _seed_gps(node)
     monkeypatch.setattr(stereo_distance_module, "gps_baseline_enu_m", lambda _left, _right: (25.0, 0.0, 0.0))
 
-    poses, status, provenance = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, provenance = node._gps_baseline_camera_poses("gps_baseline")
 
     assert poses is not None
     assert status == "available"
@@ -395,7 +392,7 @@ def test_baseline_pose_selection_rejects_stale_and_invalid_gps(monkeypatch) -> N
 
     old = time.monotonic() - node.gps_baseline_max_age_s - 0.1
     node.gps_baseline_fixes["left"] = (_fix(), old)
-    poses, status, provenance = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, provenance = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None
     assert status == "stale_left_gps_fix"
     assert provenance["baseline_anchor_policy"]
@@ -406,7 +403,7 @@ def test_baseline_pose_selection_rejects_stale_and_invalid_gps(monkeypatch) -> N
         "gps_baseline_enu_m",
         lambda _left, _right: (_ for _ in ()).throw(ValueError("bad fix")),
     )
-    poses, status, provenance = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, provenance = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None
     assert status == "invalid_raw_gps_fix"
     assert provenance["baseline_source"] == "px4_raw_sensor_gps"
@@ -427,10 +424,10 @@ def test_diagnostic_rays_with_existing_nominal_inputs_match_existing_raw_ray_reg
     assert diagnostics["attitude"]["midpoint_baseline_center_frd_m"] == pytest.approx(
         raw["midpoint_baseline_center_frd_m"], abs=1.0e-9
     )
-    assert diagnostics["baseline"]["midpoint_baseline_center_frd_m"] == pytest.approx(
+    assert diagnostics["attitude"]["midpoint_baseline_center_frd_m"] == pytest.approx(
         raw["midpoint_baseline_center_frd_m"], abs=1.0e-9
     )
-    assert diagnostics["full"]["midpoint_baseline_center_frd_m"] == pytest.approx(
+    assert diagnostics["operational"]["midpoint_baseline_center_frd_m"] == pytest.approx(
         raw["midpoint_baseline_center_frd_m"], abs=1.0e-9
     )
 
@@ -462,8 +459,7 @@ def test_invalid_attitude_sample_replaces_previous_value_and_isolates_dependenci
     )
 
     assert diagnostics["attitude"]["valid"] is False
-    assert diagnostics["full"]["valid"] is False
-    assert diagnostics["baseline"]["valid"] is True
+    assert diagnostics["operational"]["valid"] is False
     assert diagnostics["attitude"]["failure_reason"] == "invalid_left_quaternion"
 
 
@@ -486,8 +482,7 @@ def test_missing_attitude_is_explicit_and_does_not_disable_baseline(
     )
 
     assert diagnostics["attitude"]["computation_status"] == f"missing_{missing_label}_attitude"
-    assert diagnostics["full"]["valid"] is False
-    assert diagnostics["baseline"]["valid"] is True
+    assert diagnostics["operational"]["valid"] is False
 
 
 @pytest.mark.parametrize(
@@ -513,8 +508,8 @@ def test_invalid_gps_baseline_isolates_attitude(monkeypatch, baseline, expected_
     )
 
     assert diagnostics["attitude"]["valid"] is True
-    assert diagnostics["baseline"]["computation_status"] == expected_status
-    assert diagnostics["full"]["valid"] is False
+    assert diagnostics["operational"]["computation_status"] == expected_status
+    assert diagnostics["operational"]["valid"] is False
 
 
 def test_gps_pair_skew_and_missing_side_are_explicit() -> None:
@@ -522,15 +517,15 @@ def test_gps_pair_skew_and_missing_side_are_explicit() -> None:
     now = time.monotonic()
     node.gps_baseline_fixes["left"] = (_fix(1_000_000), now)
     node.gps_baseline_fixes["right"] = (_fix(4_000_001), now)
-    poses, status, _ = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, _ = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None and status == "gps_pair_skew_exceeded"
 
     node.gps_baseline_fixes["left"] = None
-    poses, status, _ = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, _ = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None and status == "missing_left_gps_fix"
     node.gps_baseline_fixes["left"] = (_fix(), now)
     node.gps_baseline_fixes["right"] = None
-    poses, status, _ = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, _ = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None and status == "missing_right_gps_fix"
 
 
@@ -544,11 +539,11 @@ def test_gps_right_stale_and_epoch_mismatch_are_explicit() -> None:
         now_ns - int((node.gps_baseline_max_age_s + 0.1) * 1_000_000_000),
         current_epoch,
     )
-    poses, status, _ = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, _ = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None and status == "stale_right_gps_fix"
 
     node.gps_baseline_fixes["right"] = (_fix(), now_ns, current_epoch - 1)
-    poses, status, _ = node._gps_baseline_camera_poses("raw_gps")
+    poses, status, _ = node._gps_baseline_camera_poses("gps_baseline")
     assert poses is None and status == "gps_epoch_mismatch"
 
 
@@ -653,7 +648,7 @@ def test_delta_interaction_gt_errors_and_research_fields_share_fixed_frd_frame(
     metrics.update(evaluation)
     record_fields = node._diagnostic_research_record_fields(metrics)
 
-    for name in ("attitude", "baseline", "full"):
+    for name in ("attitude", "operational"):
         assert evaluation[f"{name}_gt_forward_error_m"] == pytest.approx(-0.1, abs=1.0e-12)
         assert evaluation[f"{name}_gt_right_error_m"] == pytest.approx(0.2, abs=1.0e-12)
         assert evaluation[f"{name}_gt_down_error_m"] == pytest.approx(-0.3, abs=1.0e-12)
@@ -668,7 +663,7 @@ def test_delta_interaction_gt_errors_and_research_fields_share_fixed_frd_frame(
     assert record_fields["px4_quaternion_order"] == "wxyz"
     assert record_fields["px4_attitude_semantics"] == "body_frd_to_earth_ned"
     assert record_fields["baseline_anchor_policy"].startswith("nominal_left")
-    assert record_fields["interaction_valid"] is True
+    assert "interaction_valid" not in record_fields
 
 
 def test_missing_ground_truth_fails_closed_without_px4_fallback() -> None:
@@ -696,7 +691,7 @@ def test_missing_ground_truth_fails_closed_without_px4_fallback() -> None:
     assert evaluation["gt_fallback_used"] is False
 
 
-def test_runtime_metrics_publish_named_deltas_interaction_and_invalid_reason() -> None:
+def test_runtime_metrics_publish_named_deltas_without_interaction() -> None:
     node = StereoDistanceNode.__new__(StereoDistanceNode)
     messages = []
     node.ray_metrics_pub = SimpleNamespace(
@@ -721,35 +716,26 @@ def test_runtime_metrics_publish_named_deltas_interaction_and_invalid_reason() -
         "position_difference_m": 0.25,
         "failure_reason": "",
     }
-    baseline = {
+    operational = {
         "valid": False,
         "computation_status": "missing_left_gps_fix",
         "failure_reason": "missing_left_gps_fix",
         "output_frame": "baseline_center_frd",
     }
     node._publish_ray_metrics(
-        optical=truth,
+        optical_pose=truth,
         attitude=attitude,
-        baseline=baseline,
-        interaction={
-            "valid": False,
-            "failure_reason": "invalid:baseline",
-            "forward_m": None,
-            "right_m": None,
-            "down_m": None,
-            "position_m": None,
-        },
+        operational=operational,
     )
 
     payload = messages[-1]
     assert payload["attitude_delta_forward_m"] == 0.25
-    assert payload["baseline"]["valid"] is False
-    assert payload["baseline"]["failure_reason"] == "missing_left_gps_fix"
-    assert payload["interaction_valid"] is False
-    assert payload["interaction_failure_reason"] == "invalid:baseline"
+    assert payload["operational"]["valid"] is False
+    assert payload["operational"]["failure_reason"] == "missing_left_gps_fix"
+    assert "interaction" not in payload
 
 
-def test_runtime_metrics_publish_pair_id_and_gps_raw_gps_global_rows() -> None:
+def test_runtime_metrics_publish_pair_id_and_gps_global_rows() -> None:
     node = StereoDistanceNode.__new__(StereoDistanceNode)
     messages = []
     node.ray_metrics_pub = SimpleNamespace(
@@ -763,7 +749,7 @@ def test_runtime_metrics_publish_pair_id_and_gps_raw_gps_global_rows() -> None:
         "range_m": 10.0,
         "output_frame": "baseline_center_frd",
     }
-    gps_raw = {
+    gps_baseline = {
         **truth,
         "forward_m": 10.1,
         "valid": True,
@@ -771,17 +757,17 @@ def test_runtime_metrics_publish_pair_id_and_gps_raw_gps_global_rows() -> None:
     }
     node._publish_ray_metrics(
         pair_id=42,
-        optical=truth,
-        gps_raw=gps_raw,
-        gps_global=None,
+        optical_pose=truth,
+        gps_baseline=gps_baseline,
+        global_baseline=None,
         gt_source="gazebo_vehicle_reference_link_world_pose",
         gt_fallback_used=False,
     )
 
     payload = messages[-1]
     assert payload["pair_id"] == 42
-    assert payload["gps_raw"]["forward_m"] == pytest.approx(10.1, abs=1.0e-9)
-    assert payload["gps_raw"]["valid"] is True
-    assert "gps_global" not in payload
+    assert payload["gps_baseline"]["forward_m"] == pytest.approx(10.1, abs=1.0e-9)
+    assert payload["gps_baseline"]["valid"] is True
+    assert "global_baseline" not in payload
     assert payload["gt_source"] == "gazebo_vehicle_reference_link_world_pose"
     assert payload["gt_fallback_used"] is False

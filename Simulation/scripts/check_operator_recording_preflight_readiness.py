@@ -10,14 +10,10 @@ from typing import Mapping, Sequence
 
 PUBLIC_AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
 REQUIRED_ESTIMATED_FIELDS = (
-    "raw_forward_m",
-    "raw_right_m",
-    "raw_down_m",
-    "raw_range_m",
-    "estimated_forward_m",
-    "estimated_right_m",
-    "estimated_down_m",
-    "estimated_range_m",
+    "nominal_pose_forward_m",
+    "nominal_pose_right_m",
+    "nominal_pose_down_m",
+    "nominal_pose_range_m",
 )
 REQUIRED_CORRECTED_FIELDS = (
     "corrected_forward_m",
@@ -27,7 +23,7 @@ REQUIRED_CORRECTED_FIELDS = (
 )
 REQUIRED_DETECTION_FIELDS = ("left_cx", "left_cy", "raw_disparity_px")
 REQUIRED_TOPICS = (
-    "/stereo/estimated_position",
+    "/stereo/nominal_pose_position",
     "/stereo/corrected_position",
     "/stereo/detections",
     "/stereo/disparity",
@@ -106,7 +102,7 @@ def check_readiness(root_dir: Path) -> dict[str, object]:
             for field in REQUIRED_DETECTION_FIELDS:
                 require(field in detection_fields, failures, f"operator_recorder:detection_field:{field}")
             for topic in REQUIRED_TOPICS:
-                if topic == "/stereo/estimated_position":
+                if topic == "/stereo/nominal_pose_position":
                     require("_estimated_position_cb" in run_script_text or hasattr(recorder.OperatorRecorder, "_estimated_position_cb"), failures, "operator_recorder:estimated_topic_cb")
                 elif topic == "/stereo/corrected_position":
                     require(hasattr(recorder.OperatorRecorder, "_corrected_position_cb"), failures, "operator_recorder:corrected_topic_cb")

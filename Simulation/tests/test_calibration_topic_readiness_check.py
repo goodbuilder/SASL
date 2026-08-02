@@ -35,7 +35,7 @@ class CalibrationTopicReadinessCheckTests(unittest.TestCase):
         )
         expected = {
             "/fmu/out/vehicle_local_position": "px4_msgs/msg/VehicleLocalPosition",
-            "/stereo/estimated_position": "std_msgs/msg/Float32MultiArray",
+            "/stereo/nominal_pose_position": "std_msgs/msg/Float32MultiArray",
             "/stereo/detections": "std_msgs/msg/Float32MultiArray",
             "/stereo/disparity": "std_msgs/msg/Float32",
         }
@@ -59,7 +59,7 @@ class CalibrationTopicReadinessCheckTests(unittest.TestCase):
         )
         expected = {
             "/ground_truth_position": "std_msgs/msg/Float32MultiArray",
-            "/stereo/estimated_position": "std_msgs/msg/Float32MultiArray",
+            "/stereo/nominal_pose_position": "std_msgs/msg/Float32MultiArray",
             "/stereo/detections": "std_msgs/msg/Float32MultiArray",
         }
 

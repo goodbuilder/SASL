@@ -22,13 +22,12 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v5"
-LEGACY_RESEARCH_SCHEMA_VERSIONS = frozenset({"s2_atomic_pair_v3", "s2_atomic_pair_v4"})
+RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v6"
 
 
 def _diagnostic_record_extension_columns() -> tuple[str, ...]:
     columns: list[str] = []
-    for prefix in ("attitude", "baseline", "full"):
+    for prefix in ("attitude", "operational"):
         columns.extend(
             (
                 f"{prefix}_ray_valid",
@@ -61,7 +60,7 @@ def _diagnostic_record_extension_columns() -> tuple[str, ...]:
                 f"{prefix}_ray_camera_center_source",
             )
         )
-        if prefix == "attitude":
+        if prefix in ("attitude", "operational"):
             columns.extend(
                 (
                     "attitude_ray_source",
@@ -79,12 +78,6 @@ def _diagnostic_record_extension_columns() -> tuple[str, ...]:
             )
     columns.extend(
         (
-            "interaction_valid",
-            "interaction_failure_reason",
-            "interaction_forward_m",
-            "interaction_right_m",
-            "interaction_down_m",
-            "interaction_position_m",
             "left_px4_q_w",
             "left_px4_q_x",
             "left_px4_q_y",
@@ -144,13 +137,10 @@ PAIR_RECORD_COLUMNS = (
     "right_camera_oracle_optical_qz", "right_camera_oracle_optical_qw",
     "cam_l_optical_roll_deg", "cam_l_optical_pitch_deg", "cam_l_optical_yaw_deg",
     "cam_r_optical_roll_deg", "cam_r_optical_pitch_deg", "cam_r_optical_yaw_deg",
-    # These four columns keep their v3/v4 names for schema-migration
+    # These six columns keep their v3/v4 names for schema-migration
     # compatibility (validate_pair_record's legacy path matches on an exact
-    # subset of PAIR_RECORD_COLUMNS). Since the optical_derived_body_attitude_v1
-    # model, they hold the deterministic PX4 body-local attitude *error*
-    # (cam_l_px4_attitude_error_roll_deg etc on the node), not an independent
-    # absolute PX4 attitude -- see px4_attitude_model_version and
-    # legacy_px4_absolute_attitude_used below.
+    # subset of PAIR_RECORD_COLUMNS). They hold the configured independent
+    # PX4 body attitude; the parameter names are cam_*_px4_attitude_*.
     "cam_l_px4_roll_deg", "cam_l_px4_pitch_deg", "cam_l_px4_yaw_deg",
     "cam_r_px4_roll_deg", "cam_r_px4_pitch_deg", "cam_r_px4_yaw_deg",
     "common_optical_roll_error_deg", "relative_optical_roll_error_deg",
@@ -161,10 +151,10 @@ PAIR_RECORD_COLUMNS = (
     "effective_left_optical_yaw_error_deg",
     "effective_right_optical_roll_error_deg",
     "effective_right_optical_pitch_error_deg",
-    "effective_right_optical_yaw_error_deg", "raw_computation_status",
-    "raw_forward_m", "raw_right_m", "raw_down_m", "raw_range_m",
-    "raw_ray_gap_m", "raw_intersection_angle_deg", "raw_left_depth_m",
-    "raw_right_depth_m", "raw_geometry_rank", "raw_condition_number",
+    "effective_right_optical_yaw_error_deg", "nominal_pose_computation_status",
+    "nominal_pose_forward_m", "nominal_pose_right_m", "nominal_pose_down_m", "nominal_pose_range_m",
+    "nominal_pose_ray_gap_m", "nominal_pose_intersection_angle_deg", "nominal_pose_left_depth_m",
+    "nominal_pose_right_depth_m", "nominal_pose_geometry_rank", "nominal_pose_condition_number",
     "corrected_computation_status", "corrected_forward_m", "corrected_right_m",
     "corrected_down_m", "corrected_range_m", "corrected_ray_gap_m",
     "corrected_intersection_angle_deg", "corrected_left_depth_m",
@@ -175,40 +165,25 @@ PAIR_RECORD_COLUMNS = (
     "attitude_ray_gap_m", "attitude_ray_intersection_angle_deg",
     "attitude_ray_delta_forward_m", "attitude_ray_delta_right_m",
     "attitude_ray_delta_down_m", "attitude_ray_delta_range_m",
-    "attitude_ray_position_difference_m", "baseline_ray_computation_status",
-    "baseline_ray_failure_reason", "baseline_ray_source",
-    "baseline_ray_baseline_source", "baseline_ray_gps_baseline_source",
-    "baseline_ray_forward_m", "baseline_ray_right_m", "baseline_ray_down_m",
-    "baseline_ray_range_m", "baseline_ray_gap_m",
-    "baseline_ray_intersection_angle_deg", "baseline_ray_delta_forward_m",
-    "baseline_ray_delta_right_m", "baseline_ray_delta_down_m",
-    "baseline_ray_delta_range_m", "baseline_ray_position_difference_m",
-    "baseline_ray_gps_baseline_world_enu_x_m",
-    "baseline_ray_gps_baseline_world_enu_y_m",
-    "baseline_ray_gps_baseline_world_enu_z_m",
-    "baseline_ray_gps_baseline_length_m",
-    "baseline_ray_gps_baseline_delta_world_enu_x_m",
-    "baseline_ray_gps_baseline_delta_world_enu_y_m",
-    "baseline_ray_gps_baseline_delta_world_enu_z_m",
-    "baseline_ray_gps_baseline_delta_norm_m", "full_ray_computation_status",
-    "full_ray_failure_reason", "full_ray_source", "full_ray_baseline_source",
-    "full_ray_gps_baseline_source", "full_ray_forward_m", "full_ray_right_m",
-    "full_ray_down_m", "full_ray_range_m", "full_ray_gap_m",
-    "full_ray_intersection_angle_deg", "full_ray_delta_forward_m",
-    "full_ray_delta_right_m", "full_ray_delta_down_m",
-    "full_ray_delta_range_m", "full_ray_position_difference_m",
-    "full_ray_gps_baseline_world_enu_x_m",
-    "full_ray_gps_baseline_world_enu_y_m",
-    "full_ray_gps_baseline_world_enu_z_m",
-    "full_ray_gps_baseline_length_m",
-    "full_ray_gps_baseline_delta_world_enu_x_m",
-    "full_ray_gps_baseline_delta_world_enu_y_m",
-    "full_ray_gps_baseline_delta_world_enu_z_m",
-    "full_ray_gps_baseline_delta_norm_m", "gt_source", "gt_source_entity",
+    "attitude_ray_position_difference_m", "operational_ray_computation_status",
+    "operational_ray_failure_reason", "operational_ray_source", "operational_ray_baseline_source",
+    "operational_ray_gps_baseline_source", "operational_ray_forward_m", "operational_ray_right_m",
+    "operational_ray_down_m", "operational_ray_range_m", "operational_ray_gap_m",
+    "operational_ray_intersection_angle_deg", "operational_ray_delta_forward_m",
+    "operational_ray_delta_right_m", "operational_ray_delta_down_m",
+    "operational_ray_delta_range_m", "operational_ray_position_difference_m",
+    "operational_ray_gps_baseline_world_enu_x_m",
+    "operational_ray_gps_baseline_world_enu_y_m",
+    "operational_ray_gps_baseline_world_enu_z_m",
+    "operational_ray_gps_baseline_length_m",
+    "operational_ray_gps_baseline_delta_world_enu_x_m",
+    "operational_ray_gps_baseline_delta_world_enu_y_m",
+    "operational_ray_gps_baseline_delta_world_enu_z_m",
+    "operational_ray_gps_baseline_delta_norm_m", "gt_source", "gt_source_entity",
     "gt_reference_name", "gt_reference_definition", "gt_fallback_used",
     "gt_forward_m", "gt_right_m", "gt_down_m", "gt_range_m",
-    "raw_position_error_m", "raw_forward_error_m", "raw_right_error_m",
-    "raw_down_error_m", "raw_range_error_m", "corrected_position_error_m",
+    "nominal_pose_position_error_m", "nominal_pose_forward_error_m", "nominal_pose_right_error_m",
+    "nominal_pose_down_error_m", "nominal_pose_range_error_m", "corrected_position_error_m",
     "corrected_forward_error_m", "corrected_right_error_m",
     "corrected_down_error_m", "corrected_range_error_m",
     "ideal_position_error_m", "ideal_forward_error_m", "ideal_right_error_m",
@@ -225,7 +200,7 @@ PAIR_RECORD_COLUMNS = (
     "position_unit", "pixel_unit", "angle_unit", "timestamp_unit",
     "correction_source", *DIAGNOSTIC_RECORD_EXTENSION_COLUMNS,
     "px4_attitude_model_version", "px4_attitude_reference_source",
-    "px4_attitude_error_frame", "px4_attitude_error_composition",
+    "px4_attitude_frame", "px4_attitude_composition",
     "px4_attitude_quaternion_order", "legacy_px4_absolute_attitude_used",
 )
 
@@ -329,13 +304,7 @@ def _validate_scalar(value: Any, field: str) -> None:
 
 
 def validate_pair_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    source_version = record.get("schema_version")
-    legacy = source_version in LEGACY_RESEARCH_SCHEMA_VERSIONS
-    if legacy and set(record).issubset(PAIR_RECORD_COLUMNS):
-        normalized = empty_pair_record()
-        normalized.update(record)
-        normalized["schema_version"] = RESEARCH_SCHEMA_VERSION
-    elif set(record.keys()) == set(PAIR_RECORD_COLUMNS):
+    if set(record.keys()) == set(PAIR_RECORD_COLUMNS):
         normalized = {name: record[name] for name in PAIR_RECORD_COLUMNS}
     else:
         missing = [name for name in PAIR_RECORD_COLUMNS if name not in record]

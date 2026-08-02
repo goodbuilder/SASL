@@ -29,21 +29,21 @@ class CapturePublisher:
 
 def _node_harness():
     node = StereoDistanceNode.__new__(StereoDistanceNode)
-    node.raw_position_pub = CapturePublisher()
+    node.nominal_pose_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.canonical_ground_truth_position_pub = CapturePublisher()
-    node.raw_gps_baseline_position_pub = CapturePublisher()
-    node.global_position_baseline_position_pub = CapturePublisher()
-    node.raw_gps_baseline_plot_pub = CapturePublisher()
-    node.global_position_baseline_plot_pub = CapturePublisher()
+    node.gps_baseline_position_pub = CapturePublisher()
+    node.global_baseline_position_pub = CapturePublisher()
+    node.gps_baseline_plot_pub = CapturePublisher()
+    node.global_baseline_plot_pub = CapturePublisher()
     node.uam_raw_gps_reference_position_pub = CapturePublisher()
     node.uam_raw_gps_reference_plot_pub = CapturePublisher()
     node.last_raw_published_pair_id = 0
     node.last_corrected_published_pair_id = 0
     node.last_gps_baseline_published_pair_id = 0
     node.last_gps_baseline_published_pair_id_by_source = {
-        "raw_gps": 0,
-        "global_position": 0,
+        "gps_baseline": 0,
+        "global_baseline": 0,
     }
     node.last_uam_raw_gps_reference_published_pair_id = 0
     node.gt_published_pair_ids = BoundedIdHistory(128)
@@ -92,7 +92,7 @@ def test_raw_and_corrected_publish_before_late_gt_on_same_pair_stamp() -> None:
     }
     node._publish_canonical_pair_positions(metrics)
     node._publish_canonical_pair_positions(metrics)
-    assert len(node.raw_position_pub.messages) == 1
+    assert len(node.nominal_pose_position_pub.messages) == 1
     assert len(node.attitude_corrected_position_pub.messages) == 1
     assert node.canonical_ground_truth_position_pub.messages == []
 
@@ -111,7 +111,7 @@ def test_raw_and_corrected_publish_before_late_gt_on_same_pair_stamp() -> None:
     assert not node._try_evaluate_pair_locked(5)
     assert len(node.canonical_ground_truth_position_pub.messages) == 1
     messages = [
-        node.raw_position_pub.messages[0],
+            node.nominal_pose_position_pub.messages[0],
         node.attitude_corrected_position_pub.messages[0],
         node.canonical_ground_truth_position_pub.messages[0],
     ]
@@ -128,14 +128,14 @@ def test_gps_baseline_plot_arrays_preserve_public_frd_order_without_header_time(
         "pair_id": 6,
         "pair_midpoint_stamp_ns": 200,
         "gps_baseline_computation_status": "unavailable",
-        "raw_gps_baseline_computation_status": "computed",
-        "raw_gps_baseline_forward_m": 1002.0,
-        "raw_gps_baseline_right_m": 6.0,
-        "raw_gps_baseline_down_m": 5.0,
-        "global_position_baseline_computation_status": "computed",
-        "global_position_baseline_forward_m": 1000.0,
-        "global_position_baseline_right_m": 5.5,
-        "global_position_baseline_down_m": 4.5,
+        "gps_baseline_computation_status": "computed",
+        "gps_baseline_forward_m": 1002.0,
+        "gps_baseline_right_m": 6.0,
+        "gps_baseline_down_m": 5.0,
+        "global_baseline_computation_status": "computed",
+        "global_baseline_forward_m": 1000.0,
+        "global_baseline_right_m": 5.5,
+        "global_baseline_down_m": 4.5,
         "uam_raw_gps_reference_computation_status": "computed",
         "uam_raw_gps_reference_forward_m": 1001.0,
         "uam_raw_gps_reference_right_m": 5.0,
@@ -145,12 +145,12 @@ def test_gps_baseline_plot_arrays_preserve_public_frd_order_without_header_time(
     node._publish_canonical_pair_positions(metrics)
     node._publish_canonical_pair_positions(metrics)
 
-    assert len(node.raw_gps_baseline_position_pub.messages) == 1
-    assert len(node.global_position_baseline_position_pub.messages) == 1
+    assert len(node.gps_baseline_position_pub.messages) == 1
+    assert len(node.global_baseline_position_pub.messages) == 1
     assert len(node.uam_raw_gps_reference_position_pub.messages) == 1
-    assert node.raw_gps_baseline_plot_pub.messages[0].data == [1002.0, 6.0, 5.0]
+    assert node.gps_baseline_plot_pub.messages[0].data == [1002.0, 6.0, 5.0]
     assert node.uam_raw_gps_reference_plot_pub.messages[0].data == [1001.0, 5.0, 4.0]
-    assert node.global_position_baseline_plot_pub.messages[0].data == [1000.0, 5.5, 4.5]
+    assert node.global_baseline_plot_pub.messages[0].data == [1000.0, 5.5, 4.5]
 
 
 def test_uam_raw_gps_reference_uses_left_local_enu_then_public_frd() -> None:

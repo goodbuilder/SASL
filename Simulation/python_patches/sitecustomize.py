@@ -106,30 +106,30 @@ def _patch_rqt_plot_default_topics():
             axis_label = "Forward"
             topics = [
                 "/ground_truth_position/data[0]",
-                "/stereo/estimated_position/data[0]",
-                "/stereo/optical_position/data[0]",
+                "/stereo/nominal_pose_position/data[0]",
+                "/stereo/optical_pose_position/data[0]",
                 "/stereo/ideal_position/data[0]",
-                "/stereo/raw_gps_baseline_plot/data[0]",
+                "/stereo/gps_baseline_plot/data[0]",
                 "/stereo/uam_raw_gps_reference_plot/data[0]",
             ]
         elif serial == 2:
             axis_label = "Right"
             topics = [
                 "/ground_truth_position/data[1]",
-                "/stereo/estimated_position/data[1]",
-                "/stereo/optical_position/data[1]",
+                "/stereo/nominal_pose_position/data[1]",
+                "/stereo/optical_pose_position/data[1]",
                 "/stereo/ideal_position/data[1]",
-                "/stereo/raw_gps_baseline_plot/data[1]",
+                "/stereo/gps_baseline_plot/data[1]",
                 "/stereo/uam_raw_gps_reference_plot/data[1]",
             ]
         elif serial == 3:
             axis_label = "Down"
             topics = [
                 "/ground_truth_position/data[2]",
-                "/stereo/estimated_position/data[2]",
-                "/stereo/optical_position/data[2]",
+                "/stereo/nominal_pose_position/data[2]",
+                "/stereo/optical_pose_position/data[2]",
                 "/stereo/ideal_position/data[2]",
-                "/stereo/raw_gps_baseline_plot/data[2]",
+                "/stereo/gps_baseline_plot/data[2]",
                 "/stereo/uam_raw_gps_reference_plot/data[2]",
             ]
         else:
@@ -150,7 +150,7 @@ def _patch_rqt_plot_default_topics():
                 try:
                     plot_widget = self._widget.data_plot._data_plot_widget._plot_widget
                     plot_widget.getPlotItem().setTitle(
-                        f"{axis_label} axis: truth, Nominal, Optical, Ideal, Raw GPS Baseline"
+                        f"{axis_label} axis: ground truth, Nominal Pose, Optical Pose, Ideal, GPS Baseline"
                     )
                     plot_widget.getPlotItem().setLabel("left", f"{axis_label} (m)")
                 except Exception:

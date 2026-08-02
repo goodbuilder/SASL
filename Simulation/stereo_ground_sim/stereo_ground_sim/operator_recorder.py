@@ -57,14 +57,10 @@ GROUND_TRUTH_POSITION_FIELDS = [
 ]
 
 ESTIMATED_POSITION_FIELDS = [
-    "raw_forward_m",
-    "raw_right_m",
-    "raw_down_m",
-    "raw_range_m",
-    "estimated_forward_m",
-    "estimated_right_m",
-    "estimated_down_m",
-    "estimated_range_m",
+    "nominal_pose_forward_m",
+    "nominal_pose_right_m",
+    "nominal_pose_down_m",
+    "nominal_pose_range_m",
 ]
 
 CORRECTED_POSITION_FIELDS = [
@@ -75,10 +71,10 @@ CORRECTED_POSITION_FIELDS = [
 ]
 
 OPTICAL_POSITION_FIELDS = [
-    "optical_forward_m",
-    "optical_right_m",
-    "optical_down_m",
-    "optical_range_m",
+    "optical_pose_forward_m",
+    "optical_pose_right_m",
+    "optical_pose_down_m",
+    "optical_pose_range_m",
 ]
 
 IDEAL_POSITION_FIELDS = [
@@ -89,18 +85,18 @@ IDEAL_POSITION_FIELDS = [
 ]
 
 GPS_BASELINE_POSITION_FIELDS = [
-    "raw_gps_baseline_forward_m",
-    "raw_gps_baseline_right_m",
-    "raw_gps_baseline_down_m",
-    "raw_gps_baseline_position_error_m",
-    "global_position_baseline_forward_m",
-    "global_position_baseline_right_m",
-    "global_position_baseline_down_m",
-    "global_position_baseline_position_error_m",
-    "raw_minus_global_baseline_forward_m",
-    "raw_minus_global_baseline_right_m",
-    "raw_minus_global_baseline_down_m",
-    "raw_minus_global_baseline_delta_m",
+    "gps_baseline_forward_m",
+    "gps_baseline_right_m",
+    "gps_baseline_down_m",
+    "gps_baseline_position_error_m",
+    "global_baseline_forward_m",
+    "global_baseline_right_m",
+    "global_baseline_down_m",
+    "global_baseline_position_error_m",
+    "gps_baseline_minus_global_baseline_forward_m",
+    "gps_baseline_minus_global_baseline_right_m",
+    "gps_baseline_minus_global_baseline_down_m",
+    "gps_baseline_minus_global_baseline_delta_m",
     "uam_raw_gps_reference_forward_m",
     "uam_raw_gps_reference_right_m",
     "uam_raw_gps_reference_down_m",
@@ -178,7 +174,15 @@ IDEAL_OBSERVATION_FIELDS = [
     "ideal_pixel_source",
 ]
 
-RAY_TYPES = ("nominal", "optical", "ideal", "attitude", "baseline", "full")
+RAY_TYPES = (
+    "nominal_pose",
+    "optical_pose",
+    "ideal",
+    "gps_baseline",
+    "global_baseline",
+    "attitude",
+    "operational",
+)
 
 RAY_TEXT_KEYS = (
     ("failure_reason", "failure_reason"),
@@ -314,14 +318,7 @@ def _ray_fields():
 
 
 RAY_FIELDS = _ray_fields()
-INTERACTION_FIELDS = [
-    "interaction_valid",
-    "interaction_failure_reason",
-    "interaction_forward_m",
-    "interaction_right_m",
-    "interaction_down_m",
-    "interaction_position_m",
-]
+INTERACTION_FIELDS = []
 
 PROFILE_STATUS_FIELDS = [
     "profile_id",
@@ -347,7 +344,6 @@ TEXT_TELEMETRY_FIELDS = {
         for prefix in RAY_TYPES
         for _, field_suffix in RAY_TEXT_KEYS
     ),
-    "interaction_failure_reason",
 }
 
 
@@ -455,10 +451,10 @@ INTEGER_TELEMETRY_FIELDS = {
 
 PROGRESS_VALIDITY_FIELDS = (
     "ground_truth_m",
-    "raw_range_m",
-    "raw_gps_baseline_forward_m",
-    "global_position_baseline_forward_m",
-    "raw_minus_global_baseline_delta_m",
+    "nominal_pose_range_m",
+    "gps_baseline_forward_m",
+    "global_baseline_forward_m",
+    "gps_baseline_minus_global_baseline_delta_m",
     "left_x1",
     "right_x1",
 )
@@ -531,9 +527,9 @@ XLSX_DIRECT_SHEET_FIELDS = (
             "ground_truth_R_m",
             "ground_truth_D_m",
             "ground_truth_Rg_m",
-            "raw_range_m",
+            "nominal_pose_range_m",
             "corrected_range_m",
-            "optical_range_m",
+            "optical_pose_range_m",
             "ideal_range_m",
             "target_distance_m",
             "distance_error_m",
@@ -611,39 +607,39 @@ XLSX_DIRECT_SHEET_FIELDS = (
             "drone_right_m",
             "drone_down_m",
             "ground_truth_m",
-            "raw_forward_m",
-            "raw_right_m",
-            "raw_down_m",
-            "raw_range_m",
+            "nominal_pose_forward_m",
+            "nominal_pose_right_m",
+            "nominal_pose_down_m",
+            "nominal_pose_range_m",
             "corrected_forward_m",
             "corrected_right_m",
             "corrected_down_m",
             "corrected_range_m",
-            "optical_forward_m",
-            "optical_right_m",
-            "optical_down_m",
-            "optical_range_m",
+            "optical_pose_forward_m",
+            "optical_pose_right_m",
+            "optical_pose_down_m",
+            "optical_pose_range_m",
             "ideal_forward_m",
             "ideal_right_m",
             "ideal_down_m",
             "ideal_range_m",
-            "raw_gps_baseline_forward_m",
-            "raw_gps_baseline_right_m",
-            "raw_gps_baseline_down_m",
-            "raw_gps_baseline_position_error_m",
+            "gps_baseline_forward_m",
+            "gps_baseline_right_m",
+            "gps_baseline_down_m",
+            "gps_baseline_position_error_m",
             "uam_raw_gps_reference_forward_m",
             "uam_raw_gps_reference_right_m",
             "uam_raw_gps_reference_down_m",
             "uam_raw_gps_reference_range_m",
             "uam_raw_gps_reference_position_error_m",
-            "global_position_baseline_forward_m",
-            "global_position_baseline_right_m",
-            "global_position_baseline_down_m",
-            "global_position_baseline_position_error_m",
-            "raw_minus_global_baseline_forward_m",
-            "raw_minus_global_baseline_right_m",
-            "raw_minus_global_baseline_down_m",
-            "raw_minus_global_baseline_delta_m",
+            "global_baseline_forward_m",
+            "global_baseline_right_m",
+            "global_baseline_down_m",
+            "global_baseline_position_error_m",
+            "gps_baseline_minus_global_baseline_forward_m",
+            "gps_baseline_minus_global_baseline_right_m",
+            "gps_baseline_minus_global_baseline_down_m",
+            "gps_baseline_minus_global_baseline_delta_m",
         ),
     ),
     (
@@ -660,33 +656,31 @@ XLSX_DIRECT_SHEET_FIELDS = (
             "profile_mode",
             "profile_fallback_level",
             "profile_fallback_reason",
-            "nominal_ray_computation_status",
-            "optical_ray_computation_status",
+            "nominal_pose_ray_computation_status",
+            "optical_pose_ray_computation_status",
             "ideal_ray_computation_status",
             "attitude_ray_computation_status",
-            "baseline_ray_computation_status",
-            "full_ray_computation_status",
+            "gps_baseline_ray_computation_status",
+            "global_baseline_ray_computation_status",
+            "operational_ray_computation_status",
             "attitude_ray_failure_reason",
-            "baseline_ray_failure_reason",
-            "full_ray_failure_reason",
-            "nominal_ray_gap_m",
-            "optical_ray_gap_m",
+            "gps_baseline_ray_failure_reason",
+            "global_baseline_ray_failure_reason",
+            "operational_ray_failure_reason",
+            "nominal_pose_ray_gap_m",
+            "optical_pose_ray_gap_m",
             "ideal_ray_gap_m",
             "attitude_ray_gap_m",
-            "baseline_ray_gap_m",
-            "full_ray_gap_m",
-            "nominal_ray_intersection_angle_deg",
-            "optical_ray_intersection_angle_deg",
+            "gps_baseline_ray_gap_m",
+            "global_baseline_ray_gap_m",
+            "operational_ray_gap_m",
+            "nominal_pose_ray_intersection_angle_deg",
+            "optical_pose_ray_intersection_angle_deg",
             "ideal_ray_intersection_angle_deg",
             "attitude_ray_intersection_angle_deg",
-            "baseline_ray_intersection_angle_deg",
-            "full_ray_intersection_angle_deg",
-            "interaction_valid",
-            "interaction_failure_reason",
-            "interaction_forward_m",
-            "interaction_right_m",
-            "interaction_down_m",
-            "interaction_position_m",
+            "gps_baseline_ray_intersection_angle_deg",
+            "global_baseline_ray_intersection_angle_deg",
+            "operational_ray_intersection_angle_deg",
         ),
     ),
 )
@@ -790,92 +784,87 @@ COMPACT_DISTANCE_FIELDS = (
     "drone_forward_m",
     "drone_right_m",
     "drone_down_m",
-    "raw_forward_m",
-    "raw_right_m",
-    "raw_down_m",
-    "raw_range_m",
+    "nominal_pose_forward_m",
+    "nominal_pose_right_m",
+    "nominal_pose_down_m",
+    "nominal_pose_range_m",
     "corrected_forward_m",
     "corrected_right_m",
     "corrected_down_m",
     "corrected_range_m",
-    "optical_forward_m",
-    "optical_right_m",
-    "optical_down_m",
-    "optical_range_m",
+    "optical_pose_forward_m",
+    "optical_pose_right_m",
+    "optical_pose_down_m",
+    "optical_pose_range_m",
     "ideal_forward_m",
     "ideal_right_m",
     "ideal_down_m",
     "ideal_range_m",
-    "raw_gps_baseline_forward_m",
-    "raw_gps_baseline_right_m",
-    "raw_gps_baseline_down_m",
-    "raw_gps_baseline_position_error_m",
+    "gps_baseline_forward_m",
+    "gps_baseline_right_m",
+    "gps_baseline_down_m",
+    "gps_baseline_position_error_m",
 )
 
 COMPACT_RAY_SUMMARY_FIELDS = (
     "time_sec",
     "ros_time_sec",
     "truth_forward_m",
-    "nominal_forward_m",
-    "optical_forward_m",
+    "nominal_pose_forward_m",
+    "optical_pose_forward_m",
     "ideal_forward_m",
     "attitude_forward_m",
-    "baseline_forward_m",
-    "full_forward_m",
+    "gps_baseline_forward_m",
+    "global_baseline_forward_m",
+    "operational_forward_m",
     "truth_right_m",
-    "nominal_right_m",
-    "optical_right_m",
+    "nominal_pose_right_m",
+    "optical_pose_right_m",
     "ideal_right_m",
     "attitude_right_m",
-    "baseline_right_m",
-    "full_right_m",
+    "gps_baseline_right_m",
+    "global_baseline_right_m",
+    "operational_right_m",
     "truth_down_m",
-    "nominal_down_m",
-    "optical_down_m",
+    "nominal_pose_down_m",
+    "optical_pose_down_m",
     "ideal_down_m",
     "attitude_down_m",
-    "baseline_down_m",
-    "full_down_m",
+    "gps_baseline_down_m",
+    "global_baseline_down_m",
+    "operational_down_m",
     "truth_Rg_m",
-    "nominal_Rg_m",
-    "optical_Rg_m",
+    "nominal_pose_Rg_m",
+    "optical_pose_Rg_m",
     "ideal_Rg_m",
     "attitude_Rg_m",
-    "baseline_Rg_m",
-    "full_Rg_m",
-    "nominal_ray_gap_m",
-    "optical_ray_gap_m",
+    "gps_baseline_Rg_m",
+    "global_baseline_Rg_m",
+    "operational_Rg_m",
+    "nominal_pose_ray_gap_m",
+    "optical_pose_ray_gap_m",
     "ideal_ray_gap_m",
     "attitude_ray_gap_m",
-    "baseline_ray_gap_m",
-    "full_ray_gap_m",
-    "nominal_ray_intersection_angle_deg",
-    "optical_ray_intersection_angle_deg",
+    "gps_baseline_ray_gap_m",
+    "global_baseline_ray_gap_m",
+    "operational_ray_gap_m",
+    "nominal_pose_ray_intersection_angle_deg",
+    "optical_pose_ray_intersection_angle_deg",
     "ideal_ray_intersection_angle_deg",
     "attitude_ray_intersection_angle_deg",
-    "baseline_ray_intersection_angle_deg",
-    "full_ray_intersection_angle_deg",
+    "gps_baseline_ray_intersection_angle_deg",
+    "global_baseline_ray_intersection_angle_deg",
+    "operational_ray_intersection_angle_deg",
     "attitude_delta_forward_m",
     "attitude_delta_right_m",
     "attitude_delta_down_m",
     "attitude_delta_range_m",
     "attitude_position_difference_m",
-    "baseline_delta_forward_m",
-    "baseline_delta_right_m",
-    "baseline_delta_down_m",
-    "baseline_delta_range_m",
-    "baseline_position_difference_m",
-    "full_delta_forward_m",
-    "full_delta_right_m",
-    "full_delta_down_m",
-    "full_delta_range_m",
-    "full_position_difference_m",
-    "interaction_valid",
-    "interaction_failure_reason",
-    "interaction_forward_m",
-    "interaction_right_m",
-    "interaction_down_m",
-    "interaction_position_m",
+    "operational_delta_forward_m",
+    "operational_delta_right_m",
+    "operational_delta_down_m",
+    "operational_delta_range_m",
+    "operational_position_difference_m",
 )
 
 COMPACT_DETECTION_FIELDS = (
@@ -958,15 +947,15 @@ DEBUG_BAG_TOPICS = [
     "/stereo/distance_error",
     "/stereo/distance_comparison",
     "/ground_truth_position",
-    "/stereo/estimated_position",
+    "/stereo/nominal_pose_position",
     "/stereo/corrected_position",
-    "/stereo/optical_position",
+    "/stereo/optical_pose_position",
     "/stereo/ideal_position",
     "/stereo/ray_metrics",
     "/stereo/bbox_adjustment",
     "/stereo/profile_status",
-    "/stereo/raw_gps_baseline_position",
-    "/stereo/global_position_baseline_position",
+    "/stereo/gps_baseline_position",
+    "/stereo/global_baseline_position",
     "/stereo/uam_raw_gps_reference_position",
     "/stereo/distance_marker",
     "/target_distance",
@@ -1199,6 +1188,22 @@ def _has_any_compact_data(row, fields):
     return any(str(row.get(field, "")).strip() for field in fields[2:])
 
 
+def _require_new_ray_schema(fieldnames, source):
+    required = {
+        "nominal_pose_ray_computation_status",
+        "optical_pose_ray_computation_status",
+        "gps_baseline_ray_computation_status",
+        "global_baseline_ray_computation_status",
+        "attitude_ray_computation_status",
+        "operational_ray_computation_status",
+    }
+    missing = sorted(required.difference(fieldnames))
+    if missing:
+        raise ValueError(
+            f"unsupported legacy or incomplete Ray schema in {source}: missing {', '.join(missing)}"
+        )
+
+
 def _compact_distance_row(row):
     return {field: row.get(field, "") for field in COMPACT_DISTANCE_FIELDS}
 
@@ -1229,7 +1234,7 @@ def _compact_ray_summary_row(row):
         compact[f"{ray_type}_ray_intersection_angle_deg"] = row.get(
             f"{ray_type}_ray_intersection_angle_deg", ""
         )
-        if ray_type in ("attitude", "baseline", "full"):
+        if ray_type in ("attitude", "operational"):
             compact[f"{ray_type}_delta_forward_m"] = row.get(
                 f"{ray_type}_ray_delta_forward_m", ""
             )
@@ -1274,7 +1279,7 @@ def _session_static_payload(*, mode, csv_hz=None, video_fps=None, manifest_rows=
     }
     return {
         "file_type": "simulation_operator_session_static",
-        "schema_version": "1",
+        "schema_version": "simulation-ray-v3",
         "generated_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "mode": mode,
         "axis_contract": AXIS_CONTRACT,
@@ -1308,7 +1313,9 @@ def export_compact_session_files(csv_path, session_dir, *, mode, csv_hz=None, vi
         "manifest": output_dir / "session_manifest.json",
     }
     with source.open(newline="", encoding="utf-8") as handle:
-        source_rows = list(csv.DictReader(handle))
+        reader = csv.DictReader(handle)
+        _require_new_ray_schema(reader.fieldnames or (), source)
+        source_rows = list(reader)
 
     distance_rows = [_compact_distance_row(row) for row in source_rows]
     ray_rows = [
@@ -1358,11 +1365,11 @@ def export_compact_session_files(csv_path, session_dir, *, mode, csv_hz=None, vi
         outputs["px4_uam"].name: "compact_px4_uam_csv",
         outputs["px4_left"].name: "compact_px4_left_csv",
         outputs["px4_right"].name: "compact_px4_right_csv",
-        source.name: "legacy_wide_telemetry_csv",
+        source.name: "wide_telemetry_csv",
     }
     manifest = {
         "status": "finalized",
-        "schema_version": "1",
+        "schema_version": "simulation-ray-v3",
         "mode": mode,
         "axis_contract": AXIS_CONTRACT,
         "source_csv": source.name,
@@ -1433,6 +1440,7 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
         row_count = 0
         with source.open(newline="", encoding="utf-8") as source_file:
             reader = csv.DictReader(source_file)
+            _require_new_ray_schema(reader.fieldnames or (), source)
             for row in reader:
                 for worksheet, fields in sheets:
                     values = []
@@ -1442,14 +1450,14 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                             "ground_truth_R_m": "drone_right_m",
                             "ground_truth_D_m": "drone_down_m",
                             "ground_truth_Rg_m": "ground_truth_m",
-                            "nominal_F_m": "nominal_ray_midpoint_forward_m",
-                            "nominal_R_m": "nominal_ray_midpoint_right_m",
-                            "nominal_D_m": "nominal_ray_midpoint_down_m",
-                            "nominal_Rg_m": "nominal_ray_range_m",
-                            "optical_F_m": "optical_ray_midpoint_forward_m",
-                            "optical_R_m": "optical_ray_midpoint_right_m",
-                            "optical_D_m": "optical_ray_midpoint_down_m",
-                            "optical_Rg_m": "optical_ray_range_m",
+                            "nominal_F_m": "nominal_pose_ray_midpoint_forward_m",
+                            "nominal_R_m": "nominal_pose_ray_midpoint_right_m",
+                            "nominal_D_m": "nominal_pose_ray_midpoint_down_m",
+                            "nominal_Rg_m": "nominal_pose_ray_range_m",
+                            "optical_F_m": "optical_pose_ray_midpoint_forward_m",
+                            "optical_R_m": "optical_pose_ray_midpoint_right_m",
+                            "optical_D_m": "optical_pose_ray_midpoint_down_m",
+                            "optical_Rg_m": "optical_pose_ray_range_m",
                             "ideal_F_m": "ideal_ray_midpoint_forward_m",
                             "ideal_R_m": "ideal_ray_midpoint_right_m",
                             "ideal_D_m": "ideal_ray_midpoint_down_m",
@@ -1609,17 +1617,17 @@ class OperatorRecorder(Node):
             f"xlsx={self.xlsx_path.name} (generated from finalized CSV at Stop)",
             f"analysis_export=analysis_{self.recording_timestamp}.csv (optional compact user export; CSV remains raw)",
             f"axis_contract={AXIS_CONTRACT}",
-            "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, raw_forward_m/raw_right_m/raw_down_m, estimated_forward_m/estimated_right_m/estimated_down_m, corrected_forward_m/corrected_right_m/corrected_down_m",
+            "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, nominal_pose_forward_m/nominal_pose_right_m/nominal_pose_down_m, corrected_forward_m/corrected_right_m/corrected_down_m",
             "axis_aliases=public CSV uses forward/right/down; legacy x/y/z is intentionally not emitted",
-            "estimated_position_topic=/stereo/estimated_position publishes raw forward/right/down/range",
+            "nominal_pose_topic=/stereo/nominal_pose_position publishes nominal forward/right/down/range",
             "corrected_position_topic=/stereo/corrected_position publishes bbox-adjusted forward/right/down/range",
-            "optical_position_topic=/stereo/optical_position publishes YOLO pixels triangulated with Gazebo-observed optical camera poses",
+            "optical_pose_topic=/stereo/optical_pose_position publishes YOLO pixels triangulated with Gazebo-observed optical camera poses",
             "ideal_position_topic=/stereo/ideal_position publishes GT-projected nominal-pixel triangulation for simulation reference only",
             "ray_metrics_topic=/stereo/ray_metrics publishes numeric nominal/optical/ideal ray diagnostics for the XLSX Rays sheet",
-            "raw_gps_baseline_topic=/stereo/raw_gps_baseline_position publishes raw-GPS-baseline forward/right/down",
-            "global_position_baseline_topic=/stereo/global_position_baseline_position publishes fused-PX4-global-baseline forward/right/down",
+            "gps_baseline_topic=/stereo/gps_baseline_position publishes raw-GPS-baseline forward/right/down",
+            "global_baseline_topic=/stereo/global_baseline_position publishes fused-PX4-global-baseline forward/right/down",
             "gps_baseline_errors=3D FRD error versus /ground_truth_position; truth_range_bin_100m is floor(truth forward / 100) * 100",
-            "gps_baseline_comparison=raw_minus_global_baseline_{forward,right,down}_m and raw_minus_global_baseline_delta_m are raw GPS minus PX4 GlobalPosition in public FRD metres",
+            "gps_baseline_comparison=gps_baseline_minus_global_baseline_{forward,right,down}_m and gps_baseline_minus_global_baseline_delta_m are raw GPS minus PX4 GlobalPosition in public FRD metres",
             "uam_raw_gps_reference_position=/stereo/uam_raw_gps_reference_position publishes the UAM raw-GPS target reference in public FRD metres; it is not simulator truth",
             "detection_bbox_contract=left/right bbox source fields are x1,y1,x2,y2 in image pixels; cx/cy and width/height are retained only as derived compatibility fields",
             "bbox_adjustment_topic=/stereo/bbox_adjustment publishes corrected centers, center deltas, profile hash, fallback, sample count, raw disparity/range",
@@ -1681,35 +1689,35 @@ class OperatorRecorder(Node):
                 ("yolo_imgsz", os.environ.get("YOLO_IMGSZ", "unknown")),
                 ("yolo_target_hz", os.environ.get("YOLO_TARGET_HZ", "20.0")),
                 ("camera_pair_target_hz", os.environ.get("CAMERA_UPDATE_RATE_HZ", "20.0")),
-                ("px4_attitude_model_version", "optical_derived_body_attitude_v1"),
-                ("px4_attitude_reference_source", "gazebo_actual_optical_pose"),
-                ("px4_attitude_error_frame", "body_frd_local"),
-                ("px4_attitude_error_composition", "right_multiply"),
+                ("px4_attitude_model_version", "configured_independent_body_attitude_v2"),
+                ("px4_attitude_reference_source", "configured_px4_attitude_rpy"),
+                ("px4_attitude_frame", "body_frd"),
+                ("px4_attitude_composition", "canonical_rig_heading_plus_configured_rpy"),
                 ("px4_attitude_quaternion_order", "wxyz"),
-                ("legacy_px4_absolute_attitude_used", "false"),
+                ("legacy_px4_absolute_attitude_used", "true"),
                 (
-                    "left_px4_attitude_error_roll_deg",
-                    os.environ.get("CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0"),
+                    "left_px4_attitude_roll_deg",
+                    os.environ.get("CAM_L_PX4_ATTITUDE_ROLL_DEG", "0.0"),
                 ),
                 (
-                    "left_px4_attitude_error_pitch_deg",
-                    os.environ.get("CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0"),
+                    "left_px4_attitude_pitch_deg",
+                    os.environ.get("CAM_L_PX4_ATTITUDE_PITCH_DEG", "0.0"),
                 ),
                 (
-                    "left_px4_attitude_error_yaw_deg",
-                    os.environ.get("CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0"),
+                    "left_px4_attitude_yaw_deg",
+                    os.environ.get("CAM_L_PX4_ATTITUDE_YAW_DEG", "0.0"),
                 ),
                 (
-                    "right_px4_attitude_error_roll_deg",
-                    os.environ.get("CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG", "0.0"),
+                    "right_px4_attitude_roll_deg",
+                    os.environ.get("CAM_R_PX4_ATTITUDE_ROLL_DEG", "0.0"),
                 ),
                 (
-                    "right_px4_attitude_error_pitch_deg",
-                    os.environ.get("CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG", "0.0"),
+                    "right_px4_attitude_pitch_deg",
+                    os.environ.get("CAM_R_PX4_ATTITUDE_PITCH_DEG", "0.0"),
                 ),
                 (
-                    "right_px4_attitude_error_yaw_deg",
-                    os.environ.get("CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG", "0.0"),
+                    "right_px4_attitude_yaw_deg",
+                    os.environ.get("CAM_R_PX4_ATTITUDE_YAW_DEG", "0.0"),
                 ),
             )
         )
@@ -1745,14 +1753,14 @@ class OperatorRecorder(Node):
         )
         self.create_subscription(
             PointStamped,
-            "/stereo/raw_gps_baseline_position",
-            lambda msg: self._gps_baseline_position_cb("raw_gps_baseline", msg),
+            "/stereo/gps_baseline_position",
+            lambda msg: self._gps_baseline_position_cb("gps_baseline", msg),
             10,
         )
         self.create_subscription(
             PointStamped,
-            "/stereo/global_position_baseline_position",
-            lambda msg: self._gps_baseline_position_cb("global_position_baseline", msg),
+            "/stereo/global_baseline_position",
+            lambda msg: self._gps_baseline_position_cb("global_baseline", msg),
             10,
         )
         self.create_subscription(
@@ -1769,7 +1777,7 @@ class OperatorRecorder(Node):
         )
         self.create_subscription(
             Float32MultiArray,
-            "/stereo/estimated_position",
+            "/stereo/nominal_pose_position",
             self._estimated_position_cb,
             10,
         )
@@ -1781,7 +1789,7 @@ class OperatorRecorder(Node):
         )
         self.create_subscription(
             Float32MultiArray,
-            "/stereo/optical_position",
+            "/stereo/optical_pose_position",
             self._optical_position_cb,
             10,
         )
@@ -1916,23 +1924,19 @@ class OperatorRecorder(Node):
         self.latest["drone_right_m"] = float(values[1])
         self.latest["drone_down_m"] = float(values[2])
         self.latest["ground_truth_m"] = float(values[3])
-        self._update_gps_baseline_error("raw_gps_baseline")
-        self._update_gps_baseline_error("global_position_baseline")
+        self._update_gps_baseline_error("gps_baseline")
+        self._update_gps_baseline_error("global_baseline")
         self.last_stamp["/ground_truth_position"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _estimated_position_cb(self, msg):
         values = list(msg.data[:4])
         while len(values) < 4:
             values.append(math.nan)
-        self.latest["raw_forward_m"] = float(values[0])
-        self.latest["raw_right_m"] = float(values[1])
-        self.latest["raw_down_m"] = float(values[2])
-        self.latest["raw_range_m"] = float(values[3])
-        self.latest["estimated_forward_m"] = float(values[0])
-        self.latest["estimated_right_m"] = float(values[1])
-        self.latest["estimated_down_m"] = float(values[2])
-        self.latest["estimated_range_m"] = float(values[3])
-        self.last_stamp["/stereo/estimated_position"] = self.get_clock().now().nanoseconds * 1e-9
+        self.latest["nominal_pose_forward_m"] = float(values[0])
+        self.latest["nominal_pose_right_m"] = float(values[1])
+        self.latest["nominal_pose_down_m"] = float(values[2])
+        self.latest["nominal_pose_range_m"] = float(values[3])
+        self.last_stamp["/stereo/nominal_pose_position"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _corrected_position_cb(self, msg):
         values = list(msg.data[:4])
@@ -1948,7 +1952,7 @@ class OperatorRecorder(Node):
             values.append(math.nan)
         for field, value in zip(OPTICAL_POSITION_FIELDS, values):
             self.latest[field] = float(value)
-        self.last_stamp["/stereo/optical_position"] = self.get_clock().now().nanoseconds * 1e-9
+        self.last_stamp["/stereo/optical_pose_position"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _ideal_position_cb(self, msg):
         values = list(msg.data[:4])
@@ -2106,26 +2110,26 @@ class OperatorRecorder(Node):
     def _update_gps_baseline_comparison(self):
         """Store raw-GPS minus EKF-global baseline in the public FRD contract."""
 
-        raw = tuple(
-            self.latest.get(f"raw_gps_baseline_{axis}_m")
+        gps = tuple(
+            self.latest.get(f"gps_baseline_{axis}_m")
             for axis in ("forward", "right", "down")
         )
-        global_position = tuple(
-            self.latest.get(f"global_position_baseline_{axis}_m")
+        global_baseline = tuple(
+            self.latest.get(f"global_baseline_{axis}_m")
             for axis in ("forward", "right", "down")
         )
         if not all(
             value is not None and math.isfinite(float(value))
-            for value in (*raw, *global_position)
+            for value in (*gps, *global_baseline)
         ):
             for axis in ("forward", "right", "down"):
-                self.latest[f"raw_minus_global_baseline_{axis}_m"] = math.nan
-            self.latest["raw_minus_global_baseline_delta_m"] = math.nan
+                self.latest[f"gps_baseline_minus_global_baseline_{axis}_m"] = math.nan
+            self.latest["gps_baseline_minus_global_baseline_delta_m"] = math.nan
             return
-        difference = tuple(float(raw[index]) - float(global_position[index]) for index in range(3))
+        difference = tuple(float(gps[index]) - float(global_baseline[index]) for index in range(3))
         for axis, value in zip(("forward", "right", "down"), difference):
-            self.latest[f"raw_minus_global_baseline_{axis}_m"] = value
-        self.latest["raw_minus_global_baseline_delta_m"] = math.sqrt(
+            self.latest[f"gps_baseline_minus_global_baseline_{axis}_m"] = value
+        self.latest["gps_baseline_minus_global_baseline_delta_m"] = math.sqrt(
             sum(value * value for value in difference)
         )
 
@@ -2157,7 +2161,7 @@ class OperatorRecorder(Node):
             self.latest["raw_disparity_px"] = left_cx - right_cx
         else:
             self.latest["raw_disparity_px"] = self.latest.get("disparity_px", math.nan)
-        self.latest["yolo_measurement_raw_range_m"] = self.latest.get("raw_range_m", math.nan)
+        self.latest["yolo_measurement_raw_range_m"] = self.latest.get("nominal_pose_range_m", math.nan)
         self.last_stamp["/stereo/detections"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _profile_status_cb(self, msg):
@@ -2181,10 +2185,6 @@ class OperatorRecorder(Node):
         # results or provenance from the preceding observation pair.
         for field in RAY_FIELDS:
             self.latest[field] = "" if field in TEXT_TELEMETRY_FIELDS else math.nan
-        for field in INTERACTION_FIELDS:
-            self.latest[field] = (
-                "" if field == "interaction_failure_reason" else math.nan
-            )
         for field in IDEAL_OBSERVATION_FIELDS:
             if field in payload:
                 if field == "ideal_pixel_source":
@@ -2246,21 +2246,6 @@ class OperatorRecorder(Node):
                     continue
                 for axis, value in zip(axes, values[: len(axes)]):
                     self.latest[f"{prefix}_{field_middle}_{axis}_m"] = value
-        interaction = payload.get("interaction")
-        if isinstance(interaction, dict):
-            self.latest["interaction_valid"] = bool(interaction.get("valid", False))
-            self.latest["interaction_failure_reason"] = str(
-                interaction.get("failure_reason", "")
-            )
-            for source, target in (
-                ("forward_m", "interaction_forward_m"),
-                ("right_m", "interaction_right_m"),
-                ("down_m", "interaction_down_m"),
-                ("position_m", "interaction_position_m"),
-            ):
-                self.latest[target] = interaction.get(source, math.nan)
-        else:
-            self.latest["interaction_valid"] = False
         self.last_stamp["/stereo/ray_metrics"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _write_csv_row(self):

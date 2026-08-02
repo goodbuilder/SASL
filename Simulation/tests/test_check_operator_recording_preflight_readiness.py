@@ -35,7 +35,7 @@ class CheckOperatorRecordingPreflightReadinessTests(unittest.TestCase):
         self.assertIn("public FRD+range", result["coordinate_contract"])
         schema = result["recorder_schema"]
         self.assertEqual(schema["axis_contract"], module.PUBLIC_AXIS_CONTRACT)
-        for field in ("raw_forward_m", "raw_right_m", "raw_down_m"):
+        for field in ("nominal_pose_forward_m", "nominal_pose_right_m", "nominal_pose_down_m"):
             self.assertIn(field, schema["estimated_position_fields"])
         for field in ("corrected_forward_m", "corrected_right_m", "corrected_down_m"):
             self.assertIn(field, schema["corrected_position_fields"])

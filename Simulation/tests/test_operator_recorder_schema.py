@@ -104,12 +104,10 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
 
         self.assertEqual(module.AXIS_CONTRACT, "stereodistance_public_frd:forward,right,down,range")
         for field in (
-            "raw_forward_m",
-            "raw_right_m",
-            "raw_down_m",
-            "estimated_forward_m",
-            "estimated_right_m",
-            "estimated_down_m",
+            "nominal_pose_forward_m",
+            "nominal_pose_right_m",
+            "nominal_pose_down_m",
+            "nominal_pose_range_m",
             "corrected_forward_m",
             "corrected_right_m",
             "corrected_down_m",
@@ -160,10 +158,10 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         recorder._float_cb(FakeMsg(200.0), "disparity_px", "/stereo/disparity")
         recorder._ground_truth_position_cb(FakeMsg([1000.0, 7.0, 4.0, 1000.0325]))
         recorder._gps_baseline_position_cb(
-            "raw_gps_baseline", FakePointStamped(1002.0, 6.0, 5.0)
+            "gps_baseline", FakePointStamped(1002.0, 6.0, 5.0)
         )
         recorder._gps_baseline_position_cb(
-            "global_position_baseline", FakePointStamped(999.0, 8.0, 4.5)
+            "global_baseline", FakePointStamped(999.0, 8.0, 4.5)
         )
         recorder._detections_cb(FakeMsg([1, 690, 380, 710, 400, 0.9, 700, 390, 1, 490, 380, 510, 400, 0.8, 500, 390]))
         recorder._profile_status_cb(
@@ -179,7 +177,7 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                         "ideal_right_v_px": 391.0,
                         "ideal_disparity_px": 200.0,
                         "ideal_pixel_source": "unit_test_projection",
-                        "nominal": {
+                        "nominal_pose": {
                             "computation_status": "computed",
                             "forward_m": 1000.0,
                             "right_m": 7.0,
@@ -227,14 +225,14 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                             "left_attitude_receive_monotonic_ns": 9007199254740993,
                             "output_frame": "baseline_center_frd",
                         },
-                        "baseline": {
+                        "gps_baseline": {
                             "computation_status": "stale_gps_baseline",
-                            "gps_baseline_source": "raw_gps",
+                            "gps_baseline_source": "gps_baseline",
                             "gps_baseline_world_enu_m": [25.1, 0.2, 0.0],
                             "gps_baseline_delta_world_enu_m": [0.1, 0.2, 0.0],
                             "gps_baseline_delta_norm_m": 0.2236,
                         },
-                        "full": {
+                        "operational": {
                             "computation_status": "computed",
                             "baseline_source": "px4_raw_vehicle_gps_position_baseline_only",
                             "forward_m": 998.5,
@@ -243,14 +241,6 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                             "range_m": 998.534,
                             "gap_m": 0.3,
                             "intersection_angle_deg": 1.0,
-                        },
-                        "interaction": {
-                            "valid": True,
-                            "failure_reason": "",
-                            "forward_m": 0.01,
-                            "right_m": -0.02,
-                            "down_m": 0.03,
-                            "position_m": 0.0374165738677394,
                         },
                     }
                 )
@@ -262,22 +252,22 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertNotIn("axis_contract", row)
-        self.assertEqual(row["raw_forward_m"], "1000")
-        self.assertEqual(row["raw_right_m"], "7")
-        self.assertEqual(row["raw_down_m"], "4")
-        self.assertEqual(row["estimated_forward_m"], "1000")
+        self.assertEqual(row["nominal_pose_forward_m"], "1000")
+        self.assertEqual(row["nominal_pose_right_m"], "7")
+        self.assertEqual(row["nominal_pose_down_m"], "4")
+        self.assertNotIn("estimated_forward_m", row)
         self.assertEqual(row["corrected_forward_m"], "999")
         self.assertEqual(row["corrected_right_m"], "6.5")
         self.assertEqual(row["corrected_down_m"], "3.5")
-        self.assertEqual(row["optical_forward_m"], "1001")
+        self.assertEqual(row["optical_pose_forward_m"], "1001")
         self.assertEqual(row["ideal_forward_m"], "1000.5")
         self.assertEqual(row["raw_disparity_px"], "200")
         self.assertEqual(row["ideal_left_u_px"], "701")
         self.assertEqual(row["ideal_right_u_px"], "501")
         self.assertEqual(row["ideal_pixel_source"], "unit_test_projection")
-        self.assertEqual(row["nominal_ray_computation_status"], "computed")
-        self.assertEqual(row["nominal_ray_gap_m"], "0.1")
-        self.assertEqual(row["nominal_ray_midpoint_right_m"], "7.05")
+        self.assertEqual(row["nominal_pose_ray_computation_status"], "computed")
+        self.assertEqual(row["nominal_pose_ray_gap_m"], "0.1")
+        self.assertEqual(row["nominal_pose_ray_midpoint_right_m"], "7.05")
         self.assertEqual(row["attitude_ray_computation_status"], "computed")
         self.assertEqual(row["attitude_ray_delta_forward_m"], "-0.5")
         self.assertEqual(row["attitude_ray_gt_range_m"], "1000.0325")
@@ -288,14 +278,13 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             row["attitude_ray_left_attitude_receive_monotonic_ns"],
             "9007199254740993",
         )
-        self.assertEqual(row["baseline_ray_failure_reason"], "stale_gps_baseline")
-        self.assertEqual(row["baseline_ray_gps_baseline_source"], "raw_gps")
-        self.assertEqual(row["baseline_ray_gps_baseline_world_enu_x_m"], "25.1")
-        self.assertEqual(row["baseline_ray_gps_baseline_delta_norm_m"], "0.2236")
-        self.assertEqual(row["full_ray_baseline_source"], "px4_raw_vehicle_gps_position_baseline_only")
-        self.assertEqual(row["full_ray_gap_m"], "0.3")
-        self.assertEqual(row["interaction_valid"], "1")
-        self.assertEqual(row["interaction_forward_m"], "0.01")
+        self.assertEqual(row["gps_baseline_ray_computation_status"], "stale_gps_baseline")
+        self.assertEqual(row["gps_baseline_ray_gps_baseline_source"], "gps_baseline")
+        self.assertEqual(row["gps_baseline_ray_gps_baseline_world_enu_x_m"], "25.1")
+        self.assertEqual(row["gps_baseline_ray_gps_baseline_delta_norm_m"], "0.2236")
+        self.assertEqual(row["operational_ray_baseline_source"], "px4_raw_vehicle_gps_position_baseline_only")
+        self.assertEqual(row["operational_ray_gap_m"], "0.3")
+        self.assertNotIn("interaction_valid", row)
 
         self.assertEqual(row["left_x1"], "690")
         self.assertEqual(row["left_y1"], "380")
@@ -311,14 +300,14 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
         self.assertEqual(row["profile_id"], "unit")
         self.assertEqual(row["profile_mode"], "sim3")
         self.assertEqual(row["profile_fallback_level"], "2")
-        self.assertEqual(row["raw_gps_baseline_forward_m"], "1002")
-        self.assertEqual(row["raw_gps_baseline_position_error_m"], "2.44948974")
-        self.assertEqual(row["global_position_baseline_forward_m"], "999")
-        self.assertEqual(row["global_position_baseline_position_error_m"], "1.5")
-        self.assertEqual(row["raw_minus_global_baseline_forward_m"], "3")
-        self.assertEqual(row["raw_minus_global_baseline_right_m"], "-2")
-        self.assertEqual(row["raw_minus_global_baseline_down_m"], "0.5")
-        self.assertEqual(row["raw_minus_global_baseline_delta_m"], "3.64005494")
+        self.assertEqual(row["gps_baseline_forward_m"], "1002")
+        self.assertEqual(row["gps_baseline_position_error_m"], "2.44948974")
+        self.assertEqual(row["global_baseline_forward_m"], "999")
+        self.assertEqual(row["global_baseline_position_error_m"], "1.5")
+        self.assertEqual(row["gps_baseline_minus_global_baseline_forward_m"], "3")
+        self.assertEqual(row["gps_baseline_minus_global_baseline_right_m"], "-2")
+        self.assertEqual(row["gps_baseline_minus_global_baseline_down_m"], "0.5")
+        self.assertEqual(row["gps_baseline_minus_global_baseline_delta_m"], "3.64005494")
         self.assertEqual(row["truth_range_bin_100m"], "1000")
 
     def test_invalid_ray_snapshot_clears_prior_numeric_values(self) -> None:
@@ -340,7 +329,6 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                             "delta_forward_m": 1.0,
                             "left_attitude_timestamp_us": 42,
                         },
-                        "interaction": {"valid": True, "forward_m": 0.5},
                     }
                 )
             )
@@ -353,10 +341,6 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                             "valid": False,
                             "computation_status": "stale_left_attitude",
                             "failure_reason": "stale_left_attitude",
-                        },
-                        "interaction": {
-                            "valid": False,
-                            "failure_reason": "invalid:attitude",
                         },
                     }
                 )
@@ -377,11 +361,7 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             recorder.latest["attitude_ray_failure_reason"],
             "stale_left_attitude",
         )
-        self.assertFalse(recorder.latest["interaction_valid"])
-        self.assertTrue(math.isnan(recorder.latest["interaction_forward_m"]))
-        self.assertEqual(
-            recorder.latest["interaction_failure_reason"], "invalid:attitude"
-        )
+        self.assertNotIn("interaction_valid", recorder.latest)
 
     def test_detection_schema_keeps_bbox_corners_as_the_source_values(self) -> None:
         module = load_module()
@@ -447,11 +427,11 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                 writer.writerow(
                     {
                         "time_sec": "1.0",
-                        "raw_range_m": "2000.0",
+                        "nominal_pose_range_m": "2000.0",
                         "yolo_inference_ms": "45.0",
                         "yolo_update_hz": "20.5",
-                        "raw_gps_baseline_forward_m": "1999.0",
-                        "global_position_baseline_forward_m": "1998.0",
+                        "gps_baseline_forward_m": "1999.0",
+                        "global_baseline_forward_m": "1998.0",
                         "left_x1": "10",
                         "left_y1": "20",
                         "left_x2": "30",
@@ -460,25 +440,23 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                         "right_y1": "60",
                         "right_x2": "70",
                         "right_y2": "80",
-                        "nominal_ray_computation_status": "computed",
-                        "nominal_ray_forward_m": "2000",
-                        "nominal_ray_right_m": "1",
-                        "nominal_ray_down_m": "2",
-                        "nominal_ray_range_m": "2000.00125",
-                        "nominal_ray_gap_m": "0.05",
-                        "nominal_ray_intersection_angle_deg": "1.5",
+                        "nominal_pose_ray_computation_status": "computed",
+                        "nominal_pose_ray_forward_m": "2000",
+                        "nominal_pose_ray_right_m": "1",
+                        "nominal_pose_ray_down_m": "2",
+                        "nominal_pose_ray_range_m": "2000.00125",
+                        "nominal_pose_ray_gap_m": "0.05",
+                        "nominal_pose_ray_intersection_angle_deg": "1.5",
                         "attitude_ray_computation_status": "computed",
                         "attitude_ray_midpoint_forward_m": "1999.5",
                         "attitude_ray_range_m": "1999.501",
                         "attitude_ray_delta_forward_m": "-0.5",
                         "attitude_ray_position_difference_m": "0.5",
-                        "baseline_ray_computation_status": "stale_gps_baseline",
-                        "baseline_ray_failure_reason": "stale_gps_baseline",
-                        "full_ray_computation_status": "computed",
-                        "full_ray_midpoint_forward_m": "1998.5",
-                        "full_ray_range_m": "1998.501",
-                        "interaction_valid": "true",
-                        "interaction_position_m": "0.0374",
+                        "gps_baseline_ray_computation_status": "computed",
+                        "global_baseline_ray_computation_status": "computed",
+                        "operational_ray_computation_status": "computed",
+                        "operational_ray_midpoint_forward_m": "1998.5",
+                        "operational_ray_range_m": "1998.501",
                     }
                 )
 
@@ -514,7 +492,7 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             ):
                 self.assertIn(f'name="{sheet_name}"', workbook_xml)
             self.assertIn(result["csv_sha256"], worksheets_xml)
-            self.assertIn("nominal", worksheets_xml)
+            self.assertIn("nominal_pose", worksheets_xml)
             self.assertIn("ground_truth_F_m", worksheets_xml)
             self.assertIn("ground_truth_R_m", worksheets_xml)
             self.assertIn("ground_truth_D_m", worksheets_xml)
@@ -526,13 +504,14 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             self.assertIn("optical_F_m", worksheets_xml)
             self.assertIn("ideal_Rg_m", worksheets_xml)
             self.assertIn("attitude", worksheets_xml)
-            self.assertIn("baseline", worksheets_xml)
-            self.assertIn("full", worksheets_xml)
+            self.assertIn("gps_baseline", worksheets_xml)
+            self.assertIn("global_baseline", worksheets_xml)
+            self.assertIn("operational", worksheets_xml)
             self.assertIn("failure_reason", worksheets_xml)
             self.assertIn("position_difference_m", worksheets_xml)
             self.assertIn("gt_forward_error_m", worksheets_xml)
             self.assertIn("px4_quaternion_order", worksheets_xml)
-            self.assertIn("interaction_position_m", worksheets_xml)
+            self.assertNotIn("interaction_position_m", worksheets_xml)
 
     def test_compact_session_export_separates_static_json_and_minimal_time_csvs(self) -> None:
         module = load_module()
@@ -549,10 +528,10 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                         "drone_forward_m": "1000",
                         "drone_right_m": "7",
                         "drone_down_m": "4",
-                        "raw_forward_m": "999",
-                        "raw_right_m": "8",
-                        "raw_down_m": "5",
-                        "raw_range_m": "999.04",
+                        "nominal_pose_forward_m": "999",
+                        "nominal_pose_right_m": "8",
+                        "nominal_pose_down_m": "5",
+                        "nominal_pose_range_m": "999.04",
                         "left_x1": "10",
                         "left_y1": "20",
                         "left_x2": "30",
@@ -563,12 +542,12 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                         "right_x2": "70",
                         "right_y2": "80",
                         "right_confidence": "0.8",
-                        "nominal_ray_midpoint_forward_m": "998",
-                        "nominal_ray_midpoint_right_m": "6",
-                        "nominal_ray_midpoint_down_m": "3",
-                        "nominal_ray_range_m": "998.02",
-                        "nominal_ray_gap_m": "0.05",
-                        "nominal_ray_intersection_angle_deg": "1.5",
+                        "nominal_pose_ray_midpoint_forward_m": "998",
+                        "nominal_pose_ray_midpoint_right_m": "6",
+                        "nominal_pose_ray_midpoint_down_m": "3",
+                        "nominal_pose_ray_range_m": "998.02",
+                        "nominal_pose_ray_gap_m": "0.05",
+                        "nominal_pose_ray_intersection_angle_deg": "1.5",
                         "attitude_ray_midpoint_forward_m": "997",
                         "attitude_ray_midpoint_right_m": "5",
                         "attitude_ray_midpoint_down_m": "2",
@@ -594,7 +573,7 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             manifest = json.loads((Path(tmpdir) / "session_manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(static_payload["static_values"]["camera_baseline_m"], "25.0")
             self.assertEqual(static_payload["axis_contract"], module.AXIS_CONTRACT)
-            self.assertEqual(manifest["artifact_roles"]["telemetry.csv"], "legacy_wide_telemetry_csv")
+            self.assertEqual(manifest["artifact_roles"]["telemetry.csv"], "wide_telemetry_csv")
             self.assertEqual(result["row_counts"]["distance_measurements"], 1)
             self.assertEqual(result["row_counts"]["ray_summary"], 1)
             self.assertEqual(result["row_counts"]["detections"], 1)
@@ -602,7 +581,7 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             with (Path(tmpdir) / "ray_summary.csv").open(newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
             self.assertEqual(rows[0]["truth_Rg_m"], "1000.1")
-            self.assertEqual(rows[0]["nominal_forward_m"], "998")
+            self.assertEqual(rows[0]["nominal_pose_forward_m"], "998")
             self.assertEqual(rows[0]["attitude_forward_m"], "997")
             self.assertEqual(rows[0]["attitude_delta_forward_m"], "-1")
             self.assertEqual(rows[0]["attitude_position_difference_m"], "1.2")

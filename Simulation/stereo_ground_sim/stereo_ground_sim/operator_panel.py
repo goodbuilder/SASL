@@ -70,19 +70,18 @@ AXES = (
 )
 SERIES = (
     ("truth", "/ground_truth_position", QColor(55, 71, 79)),
-    ("raw", "/stereo/estimated_position", QColor(220, 32, 32)),
-    ("optical", "/stereo/optical_position", QColor(0, 170, 170)),
+    ("nominal_pose", "/stereo/nominal_pose_position", QColor(220, 32, 32)),
+    ("optical_pose", "/stereo/optical_pose_position", QColor(0, 170, 170)),
     ("ideal", "/stereo/ideal_position", QColor(32, 86, 255)),
-    ("raw_gps_baseline", "/stereo/raw_gps_baseline_position", QColor(235, 135, 0)),
+    ("gps_baseline", "/stereo/gps_baseline_position", QColor(235, 135, 0)),
     ("uam_raw_gps_reference", "/stereo/uam_raw_gps_reference_position", QColor(134, 89, 45)),
     # No dedicated position topic -- fed from /stereo/ray_metrics (see
     # _handle_ray_metrics), which is the only place these four Rays are
     # published. topic is None so _init_ros skips the per-topic subscription
     # loop for them.
-    ("gps_global", None, QColor(0, 150, 60)),
+    ("global_baseline", None, QColor(0, 150, 60)),
     ("attitude", None, QColor(156, 39, 176)),
-    ("baseline", None, QColor(255, 193, 7)),
-    ("full", None, QColor(0, 0, 0)),
+    ("operational", None, QColor(0, 0, 0)),
 )
 SERIES_LABELS = {
     # "truth" subscribes to /ground_truth_position, the literal Gazebo
@@ -93,14 +92,13 @@ SERIES_LABELS = {
     # itself). These names must stay identical to RAY_DIAGNOSTICS_ROWS /
     # stereo_distance_node.RAY_DISPLAY_NAMES and the CSV/XLSX Ray labels.
     "truth": "Gazebo Target GT",
-    "raw": "Raw",
-    "optical": "Truth",
+    "nominal_pose": "Nominal Pose",
+    "optical_pose": "Optical Pose",
     "ideal": "Ideal",
-    "raw_gps_baseline": "GPS",
-    "gps_global": "Global",
+    "gps_baseline": "GPS Baseline",
+    "global_baseline": "Global Baseline",
     "attitude": "Attitude",
-    "baseline": "Baseline",
-    "full": "Full",
+    "operational": "Operational",
     "uam_raw_gps_reference": "UAM raw GPS reference",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -273,10 +271,10 @@ class TelemetryFacts(QWidget):
         super().__init__(parent)
         self._latest = {
             "truth": [math.nan] * 4,
-            "raw": [math.nan] * 4,
-            "optical": [math.nan] * 4,
+            "nominal_pose": [math.nan] * 4,
+            "optical_pose": [math.nan] * 4,
             "ideal": [math.nan] * 4,
-            "raw_gps_baseline": [math.nan] * 4,
+            "gps_baseline": [math.nan] * 4,
         }
         self._latest_scalars = {"yolo_hz": math.nan, "yolo_ms": math.nan}
         self._profile_text = "--"
@@ -402,23 +400,23 @@ class TelemetryFacts(QWidget):
             f"{self._format_float(self._latest_scalars['yolo_hz'])} Hz / "
             f"{self._format_float(self._latest_scalars['yolo_ms'])} ms"
         )
-        self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth'])}")
-        self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw'])}")
+        self._truth_label.setText(f"Target GT F/R/D/R: {self._format_frd(self._latest['truth'])}")
+        self._raw_label.setText(f"Nominal Pose F/R/D/R: {self._format_frd(self._latest['nominal_pose'])}")
         self._corrected_label.setText(
-            f"Truth F/R/D/R: {self._format_frd(self._latest['optical'])}"
+            f"Optical Pose F/R/D/R: {self._format_frd(self._latest['optical_pose'])}"
         )
         self._ideal_label.setText(
             f"Ideal F/R/D/R: {self._format_frd(self._latest['ideal'])}"
         )
         self._raw_gps_baseline_label.setText(
-            "GPS F/R/D/R: "
-            f"{self._format_frd(self._latest['raw_gps_baseline'])}"
+            "GPS Baseline F/R/D/R: "
+            f"{self._format_frd(self._latest['gps_baseline'])}"
         )
         self._detection_label.setText(self._detection_text)
 
 
-def _px4_attitude_error_env_values():
-    """Launch-time PX4 attitude error configuration for this run.
+def _px4_attitude_env_values():
+    """Launch-time independent PX4 attitude configuration for this run.
 
     Fixed once at launch (baked into the generated SDF); relaunching is
     required to change it, so a static os.environ read at construction time
@@ -427,11 +425,11 @@ def _px4_attitude_error_env_values():
 
     return {
         "left": tuple(
-            os.environ.get(f"CAM_L_PX4_ATTITUDE_ERROR_{axis}_DEG", "0.0")
+            os.environ.get(f"CAM_L_PX4_ATTITUDE_{axis}_DEG", "0.0")
             for axis in ("ROLL", "PITCH", "YAW")
         ),
         "right": tuple(
-            os.environ.get(f"CAM_R_PX4_ATTITUDE_ERROR_{axis}_DEG", "0.0")
+            os.environ.get(f"CAM_R_PX4_ATTITUDE_{axis}_DEG", "0.0")
             for axis in ("ROLL", "PITCH", "YAW")
         ),
     }
@@ -440,16 +438,15 @@ def _px4_attitude_error_env_values():
 # Display labels only; mirrors stereo_distance_node.RAY_DISPLAY_NAMES without
 # importing the ROS node module into this rqt plugin process.
 RAY_DIAGNOSTICS_ROWS = (
-    ("nominal", "Raw"),
-    ("optical", "Truth"),
+    ("nominal_pose", "Nominal Pose"),
+    ("optical_pose", "Optical Pose"),
     ("ideal", "Ideal"),
-    ("gps_raw", "GPS"),
-    ("gps_global", "Global"),
+    ("gps_baseline", "GPS Baseline"),
+    ("global_baseline", "Global Baseline"),
     ("attitude", "Attitude"),
-    ("baseline", "Baseline"),
-    ("full", "Full"),
+    ("operational", "Operational"),
 )
-DIAGNOSTIC_DELTA_ROWS = (("attitude", "Attitude"), ("baseline", "Baseline"), ("full", "Full"))
+DIAGNOSTIC_DELTA_ROWS = (("attitude", "Attitude"), ("operational", "Operational"))
 
 # Coarse state buckets derived from the existing computation_status/failure_reason
 # strings already produced by stereo_distance_node.  This only classifies the
@@ -552,7 +549,7 @@ class RayDiagnosticsPanel(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self._scrollable(self._build_geometry_tab()), "Geometry")
-        tabs.addTab(self._scrollable(self._build_delta_tab()), "Truth Δ / Interaction")
+        tabs.addTab(self._scrollable(self._build_delta_tab()), "Optical Pose Δ")
         tabs.addTab(self._scrollable(self._build_gt_tab()), "GT Error")
         tabs.addTab(self._scrollable(self._build_sensors_tab()), "Sensors")
         content_layout.addWidget(tabs)
@@ -626,24 +623,6 @@ class RayDiagnosticsPanel(QWidget):
         layout.addWidget(table)
         self._delta_table = table
 
-        interaction_box = QGroupBox("Interaction (composite effect, not a Ray)")
-        interaction_box.setToolTip(
-            "interaction = Full - Attitude - Baseline + Truth\n"
-            "Non-zero only when Attitude and Baseline errors combine non-linearly."
-        )
-        self._interaction_box = interaction_box
-        interaction_layout = QGridLayout(interaction_box)
-        self._interaction_labels = {}
-        for column, name in enumerate(("Valid", "Forward [m]", "Right [m]", "Down [m]", "Magnitude [m]")):
-            header = QLabel(name)
-            header.setStyleSheet("font-weight: 600;")
-            interaction_layout.addWidget(header, 0, column)
-            value_label = QLabel("—")
-            interaction_layout.addWidget(value_label, 1, column)
-            self._interaction_labels[name] = value_label
-        self._interaction_reason_label = QLabel("Failure reason: —")
-        interaction_layout.addWidget(self._interaction_reason_label, 2, 0, 1, 5)
-        layout.addWidget(interaction_box)
         return tab
 
     def _build_gt_tab(self):
@@ -706,7 +685,7 @@ class RayDiagnosticsPanel(QWidget):
         # Fixed for the whole run (see the Setup tab's PX4 Attitude Error
         # Injection group for the full tooltip / how to change it).
         self._attitude_fields["Model"].setText("optical_derived_body_attitude_v1")
-        env_values = _px4_attitude_error_env_values()
+        env_values = _px4_attitude_env_values()
         self._attitude_fields["Left injected R/P/Y [deg]"].setText("/".join(env_values["left"]))
         self._attitude_fields["Right injected R/P/Y [deg]"].setText("/".join(env_values["right"]))
 
@@ -754,7 +733,6 @@ class RayDiagnosticsPanel(QWidget):
         )
         self._refresh_geometry(data)
         self._refresh_delta(data)
-        self._refresh_interaction(data)
         self._refresh_gt(data)
         self._refresh_sensors(data)
 
@@ -800,18 +778,6 @@ class RayDiagnosticsPanel(QWidget):
             table.setItem(row_index, 7, reason_item)
         table.resizeColumnsToContents()
 
-    def _refresh_interaction(self, data):
-        interaction = data.get("interaction")
-        values = interaction if isinstance(interaction, dict) else {}
-        valid = bool(values.get("valid", False))
-        self._interaction_labels["Valid"].setText("yes" if valid else "no")
-        self._interaction_labels["Forward [m]"].setText(_fmt_num(values.get("forward_m"), 3))
-        self._interaction_labels["Right [m]"].setText(_fmt_num(values.get("right_m"), 3))
-        self._interaction_labels["Down [m]"].setText(_fmt_num(values.get("down_m"), 3))
-        self._interaction_labels["Magnitude [m]"].setText(_fmt_num(values.get("position_m"), 3))
-        reason = str(values.get("failure_reason", "") or "")
-        self._interaction_reason_label.setText(f"Failure reason: {reason or '—'}")
-
     def _refresh_gt(self, data):
         source = data.get("gt_source")
         fallback = data.get("gt_fallback_used")
@@ -846,7 +812,7 @@ class RayDiagnosticsPanel(QWidget):
     def _refresh_attitude_residual(self, side, residual_deg):
         label = self._attitude_fields[f"{side} residual [deg]"]
         label.setText(_fmt_num(residual_deg, 3))
-        env_values = _px4_attitude_error_env_values()
+        env_values = _px4_attitude_env_values()
         try:
             injected = [float(value) for value in env_values[side.lower()]]
         except (TypeError, ValueError):
@@ -872,9 +838,9 @@ class RayDiagnosticsPanel(QWidget):
             label.setToolTip("")
 
     def _refresh_sensors(self, data):
-        full = data.get("full") if isinstance(data.get("full"), dict) else {}
+        operational = data.get("operational") if isinstance(data.get("operational"), dict) else {}
         attitude = data.get("attitude") if isinstance(data.get("attitude"), dict) else {}
-        attitude_source = full if full.get("left_attitude_age_ms") is not None else attitude
+        attitude_source = operational if operational.get("left_attitude_age_ms") is not None else attitude
         attitude_status, attitude_detail = _ray_state(attitude if attitude else None)
         self._attitude_fields["Overall status"].setText(attitude_status)
         self._attitude_fields["Overall status"].setToolTip(attitude_detail)
@@ -900,9 +866,9 @@ class RayDiagnosticsPanel(QWidget):
             f"Right receive_monotonic_ns: {attitude_source.get('right_attitude_receive_monotonic_ns', '—')}"
         )
 
-        baseline = data.get("baseline") if isinstance(data.get("baseline"), dict) else {}
-        gps_source = full if full.get("gps_baseline_length_m") is not None else baseline
-        gps_status, gps_detail = _ray_state(baseline if baseline else None)
+        gps_baseline = data.get("gps_baseline") if isinstance(data.get("gps_baseline"), dict) else {}
+        gps_source = operational if operational.get("gps_baseline_length_m") is not None else gps_baseline
+        gps_status, gps_detail = _ray_state(gps_baseline if gps_baseline else None)
         self._gps_fields["Overall status"].setText(gps_status)
         self._gps_fields["Overall status"].setToolTip(gps_detail)
         self._gps_fields["Left age [ms]"].setText(_fmt_num(gps_source.get("left_gps_age_ms"), 1))
@@ -928,10 +894,10 @@ class ExperimentHud(QWidget):
         super().__init__(parent)
         self._latest = {
             "truth": [math.nan, math.nan, math.nan, math.nan],
-            "raw": [math.nan, math.nan, math.nan, math.nan],
+            "nominal_pose": [math.nan, math.nan, math.nan, math.nan],
             "corrected": [math.nan, math.nan, math.nan, math.nan],
-            "raw_gps_baseline": [math.nan, math.nan, math.nan, math.nan],
-            "global_position_baseline": [math.nan, math.nan, math.nan, math.nan],
+            "gps_baseline": [math.nan, math.nan, math.nan, math.nan],
+            "global_baseline": [math.nan, math.nan, math.nan, math.nan],
         }
         self._latest_stamp = {}
         self._error_history = {
@@ -939,10 +905,10 @@ class ExperimentHud(QWidget):
             "corrected_forward": deque(),
             "raw_down": deque(),
             "corrected_down": deque(),
-            "raw_gps_baseline_forward": deque(),
-            "raw_gps_baseline_down": deque(),
-            "global_position_baseline_forward": deque(),
-            "global_position_baseline_down": deque(),
+            "gps_baseline_forward": deque(),
+            "gps_baseline_down": deque(),
+            "global_baseline_forward": deque(),
+            "global_baseline_down": deque(),
         }
         self._detection_history = deque()
         self._latest_detection = {
@@ -973,10 +939,10 @@ class ExperimentHud(QWidget):
         self._mission_label = QLabel(mission)
         self._profile_label = QLabel("Profile: --")
         self._yolo_label = QLabel("YOLO: --")
-        self._truth_label = QLabel("Truth F/R/D/R: --")
-        self._raw_label = QLabel("Raw F/R/D/R: --")
-        self._corrected_label = QLabel("Truth F/R/D/R: --")
-        self._raw_gps_baseline_label = QLabel("GPS F/R/D/R: --")
+        self._truth_label = QLabel("Target GT F/R/D/R: --")
+        self._raw_label = QLabel("Nominal Pose F/R/D/R: --")
+        self._corrected_label = QLabel("Optical Pose F/R/D/R: --")
+        self._raw_gps_baseline_label = QLabel("GPS Baseline F/R/D/R: --")
         self._global_baseline_label = QLabel("Global F/R/D/R: --")
         self._forward_error_label = QLabel("Forward Δ raw/corr: --")
         self._down_error_label = QLabel("Down Δ raw/corr: --")
@@ -1040,18 +1006,18 @@ class LiveSavedCsvPreview(QWidget):
             (
                 ("time_sec", "Time (s)"),
                 ("ground_truth_m", "Truth range (m)"),
-                ("raw_range_m", "Raw range (m)"),
-                ("raw_gps_baseline_range_m", "GPS range (m)"),
+                ("nominal_pose_range_m", "Nominal Pose range (m)"),
+                ("gps_baseline_range_m", "GPS Baseline range (m)"),
             ),
         ),
         (
             "GPS",
             (
                 ("time_sec", "Time (s)"),
-                ("raw_gps_baseline_forward_m", "GPS F (m)"),
-                ("raw_gps_baseline_right_m", "GPS R (m)"),
-                ("raw_gps_baseline_down_m", "GPS D (m)"),
-                ("raw_gps_baseline_position_error_m", "GPS position error (m)"),
+                ("gps_baseline_forward_m", "GPS Baseline F (m)"),
+                ("gps_baseline_right_m", "GPS Baseline R (m)"),
+                ("gps_baseline_down_m", "GPS Baseline D (m)"),
+                ("gps_baseline_position_error_m", "GPS Baseline position error (m)"),
             ),
         ),
         (
@@ -1070,16 +1036,16 @@ class LiveSavedCsvPreview(QWidget):
             "Ray summary",
             (
                 ("time_sec", "Time (s)"),
-                ("nominal_ray_midpoint_forward_m", "F Raw"),
-                ("nominal_ray_midpoint_right_m", "Rt Raw"),
-                ("nominal_ray_midpoint_down_m", "D Raw"),
-                ("nominal_ray_range_m", "Rg Raw"),
-                ("nominal_ray_gap_m", "Gap Raw"),
-                ("optical_ray_midpoint_forward_m", "F Truth"),
-                ("optical_ray_midpoint_right_m", "Rt Truth"),
-                ("optical_ray_midpoint_down_m", "D Truth"),
-                ("optical_ray_range_m", "Rg Truth"),
-                ("optical_ray_gap_m", "Gap Truth"),
+                ("nominal_pose_ray_midpoint_forward_m", "F Nominal Pose"),
+                ("nominal_pose_ray_midpoint_right_m", "Rt Nominal Pose"),
+                ("nominal_pose_ray_midpoint_down_m", "D Nominal Pose"),
+                ("nominal_pose_ray_range_m", "Rg Nominal Pose"),
+                ("nominal_pose_ray_gap_m", "Gap Nominal Pose"),
+                ("optical_pose_ray_midpoint_forward_m", "F Optical Pose"),
+                ("optical_pose_ray_midpoint_right_m", "Rt Optical Pose"),
+                ("optical_pose_ray_midpoint_down_m", "D Optical Pose"),
+                ("optical_pose_ray_range_m", "Rg Optical Pose"),
+                ("optical_pose_ray_gap_m", "Gap Optical Pose"),
                 ("ideal_ray_midpoint_forward_m", "F Ideal"),
                 ("ideal_ray_midpoint_right_m", "Rt Ideal"),
                 ("ideal_ray_midpoint_down_m", "D Ideal"),
@@ -1331,19 +1297,19 @@ class LiveSavedCsvPreview(QWidget):
             parsed[3] = math.sqrt(sum(value * value for value in parsed[:3]))
         field_prefixes = {
             "truth": ("drone_forward_m", "drone_right_m", "drone_down_m", "ground_truth_m"),
-            "raw": ("raw_forward_m", "raw_right_m", "raw_down_m", "raw_range_m"),
-            "optical": (
-                "optical_forward_m",
-                "optical_right_m",
-                "optical_down_m",
-                "optical_range_m",
+            "nominal_pose": ("nominal_pose_forward_m", "nominal_pose_right_m", "nominal_pose_down_m", "nominal_pose_range_m"),
+            "optical_pose": (
+                "optical_pose_forward_m",
+                "optical_pose_right_m",
+                "optical_pose_down_m",
+                "optical_pose_range_m",
             ),
             "ideal": ("ideal_forward_m", "ideal_right_m", "ideal_down_m", "ideal_range_m"),
-            "raw_gps_baseline": (
-                "raw_gps_baseline_forward_m",
-                "raw_gps_baseline_right_m",
-                "raw_gps_baseline_down_m",
-                "raw_gps_baseline_range_m",
+            "gps_baseline": (
+                "gps_baseline_forward_m",
+                "gps_baseline_right_m",
+                "gps_baseline_down_m",
+                "gps_baseline_range_m",
             ),
             "uam_raw_gps_reference": (
                 "uam_raw_gps_reference_forward_m",
@@ -1362,9 +1328,9 @@ class LiveSavedCsvPreview(QWidget):
             self._live_latest.get("drone_down_m"),
         ]
         baseline = [
-            self._live_latest.get("raw_gps_baseline_forward_m"),
-            self._live_latest.get("raw_gps_baseline_right_m"),
-            self._live_latest.get("raw_gps_baseline_down_m"),
+            self._live_latest.get("gps_baseline_forward_m"),
+            self._live_latest.get("gps_baseline_right_m"),
+            self._live_latest.get("gps_baseline_down_m"),
         ]
         try:
             truth_values = [float(value) for value in truth]
@@ -1376,7 +1342,7 @@ class LiveSavedCsvPreview(QWidget):
             error = math.sqrt(
                 sum((estimate - actual) ** 2 for estimate, actual in zip(baseline_values, truth_values))
             )
-            self._live_latest["raw_gps_baseline_position_error_m"] = self._format_csv_value(error)
+            self._live_latest["gps_baseline_position_error_m"] = self._format_csv_value(error)
         self._refresh_live_preview()
 
     def update_live_scalar(self, key, value):
@@ -1458,11 +1424,11 @@ class LiveSavedCsvPreview(QWidget):
         ):
             if field in parsed:
                 self._live_latest[field] = self._format_csv_value(parsed.get(field))
-        # "gps_raw" is recorded separately under the "raw_gps_baseline_*"
+        # GPS baseline is recorded separately under the "gps_baseline_*"
         # columns (see update_live_sample), fed from its own PointStamped
         # topic rather than this JSON payload -- omitted here to avoid a
         # second, differently-named set of columns for the same Ray.
-        for ray_type in ("nominal", "optical", "ideal", "gps_global", "attitude", "baseline", "full"):
+        for ray_type in ("nominal_pose", "optical_pose", "ideal", "gps_baseline", "global_baseline", "attitude", "operational"):
             ray = parsed.get(ray_type)
             if not isinstance(ray, dict):
                 continue
@@ -1479,7 +1445,7 @@ class LiveSavedCsvPreview(QWidget):
                 "intersection_angle_deg",
                 "left_depth_m",
                 "right_depth_m",
-                # Only present on attitude/full (px4_vehicle_attitude-sourced)
+                # Only present on attitude/operational (PX4-attitude-sourced)
                 # rays: the actual PX4 quaternion fed into the triangulation,
                 # and its heading residual against Gazebo ground truth.
                 "left_attitude_truth_residual_deg",
@@ -1589,7 +1555,7 @@ class LiveSavedCsvPreview(QWidget):
                 "Coverage (facts only): "
                 f"Ground truth {valid.get('ground_truth_m', 0)}/{rows} · "
                 f"Stereo {valid.get('raw_range_m', 0)}/{rows} · "
-                f"GPS {valid.get('raw_gps_baseline_forward_m', 0)}/{rows} · "
+                f"GPS {valid.get('gps_baseline_forward_m', 0)}/{rows} · "
                 f"bbox pair {pair_count}/{rows}"
             )
             return
@@ -1686,7 +1652,7 @@ class LiveSavedCsvPreview(QWidget):
         self._latest[series_name] = frd
         self._latest_stamp[series_name] = now
         if series_name in (
-            "raw", "corrected", "raw_gps_baseline", "global_position_baseline"
+            "nominal_pose", "corrected", "gps_baseline", "global_baseline"
         ):
             self._append_error_sample(series_name, axis_index=0, axis_name="forward", now=now)
             self._append_error_sample(series_name, axis_index=2, axis_name="down", now=now)
@@ -1830,20 +1796,20 @@ class LiveSavedCsvPreview(QWidget):
         yolo_hz = self._format_float(self._latest_scalars.get("yolo_hz", math.nan), 1)
         yolo_ms = self._format_float(self._latest_scalars.get("yolo_ms", math.nan), 1)
         self._yolo_label.setText(f"YOLO: {yolo_hz} Hz / {yolo_ms} ms")
-        self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth'])}")
-        self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw'])}")
+        self._truth_label.setText(f"Target GT F/R/D/R: {self._format_frd(self._latest['truth'])}")
+        self._raw_label.setText(f"Nominal Pose F/R/D/R: {self._format_frd(self._latest['nominal_pose'])}")
         corrected = self._latest["corrected"]
         if self._profile_not_configured and not any(math.isfinite(value) for value in corrected):
-            self._corrected_label.setText("Truth F/R/D/R: NOT CONFIGURED")
+            self._corrected_label.setText("Optical Pose F/R/D/R: NOT CONFIGURED")
         else:
-            self._corrected_label.setText(f"Truth F/R/D/R: {self._format_frd(corrected)}")
+            self._corrected_label.setText(f"Optical Pose F/R/D/R: {self._format_frd(corrected)}")
         self._raw_gps_baseline_label.setText(
             "GPS F/R/D/R: "
-            f"{self._format_frd(self._latest['raw_gps_baseline'])}"
+            f"{self._format_frd(self._latest['gps_baseline'])}"
         )
         self._global_baseline_label.setText(
-            "Global F/R/D/R: "
-            f"{self._format_frd(self._latest['global_position_baseline'])}"
+            "Global Baseline F/R/D/R: "
+            f"{self._format_frd(self._latest['global_baseline'])}"
         )
         raw_f = self._latest_error("raw_forward")
         corr_f = self._latest_error("corrected_forward")
@@ -1867,8 +1833,8 @@ class LiveSavedCsvPreview(QWidget):
             f"RMSE{PLOT_WINDOW_S:.0f}s "
             f"{self._format_float(raw_d_rmse, 2)} / {self._format_float(corr_d_rmse, 2)}"
         )
-        raw_gps_f = self._latest_error("raw_gps_baseline_forward")
-        global_f = self._latest_error("global_position_baseline_forward")
+        raw_gps_f = self._latest_error("gps_baseline_forward")
+        global_f = self._latest_error("global_baseline_forward")
         self._gps_baseline_error_label.setText(
             "PX4 baseline ΔF raw/global: "
             f"{self._format_float(raw_gps_f, 2, signed=True)} / "
@@ -2100,7 +2066,7 @@ class OperatorPanel(Plugin):
         layout.addWidget(
             QLabel("Raw GPS and GlobalPosition are recorded together for offline comparison."),
         )
-        layout.addWidget(self._build_px4_attitude_error_injection_group())
+        layout.addWidget(self._build_px4_attitude_group())
         layout.addWidget(QLabel("StereoCAM run parameters (/stereo_distance_node, read-only)"))
         self._runtime_parameters = QPlainTextEdit()
         self._runtime_parameters.setReadOnly(True)
@@ -2114,24 +2080,18 @@ class OperatorPanel(Plugin):
         layout.addWidget(self._recording_controls)
         return tab
 
-    def _build_px4_attitude_error_injection_group(self):
-        group = QGroupBox("PX4 Attitude Error Injection")
+    def _build_px4_attitude_group(self):
+        group = QGroupBox("PX4 Attitude")
         group.setToolTip(
-            "True attitude source:\n"
-            "  Gazebo actual camera optical pose\n"
-            "Conversion:\n"
-            "  Optical RDF / Gazebo ENU -> Body FRD / PX4 NED\n"
-            "Error frame:\n"
-            "  PX4 body-local FRD\n"
-            "Composition:\n"
-            "  true body attitude x error rotation (right-multiply)\n"
-            "Recorded model: optical_derived_body_attitude_v1\n"
-            "This is fixed for the whole run: set CAM_L/R_PX4_ATTITUDE_ERROR_{ROLL,PITCH,YAW}_DEG "
+            "PX4 body attitude is independent of the camera optical pose.\n"
+            "Frame: body FRD / PX4 NED\n"
+            "Recorded model: configured_independent_body_attitude_v2\n"
+            "This is fixed for the whole run: set CAM_L/R_PX4_ATTITUDE_{ROLL,PITCH,YAW}_DEG "
             "in config/simulation.env before launching, then relaunch to change it."
         )
         layout = QGridLayout(group)
-        env_values = _px4_attitude_error_env_values()
-        headers = ("Roll error [deg]", "Pitch error [deg]", "Yaw error [deg]")
+        env_values = _px4_attitude_env_values()
+        headers = ("Roll [deg]", "Pitch [deg]", "Yaw [deg]")
         for column, header in enumerate(headers, start=1):
             header_label = QLabel(header)
             header_label.setStyleSheet("font-weight: 600;")
@@ -2167,9 +2127,9 @@ class OperatorPanel(Plugin):
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
         description = QLabel(
-            "FRDR comparison: Gazebo Target GT plus all eight recorded Rays "
-            "(Raw, Truth, Ideal [simulation-only], GPS, Global, Attitude, "
-            "Baseline, Full). "
+            "FRDR comparison: Gazebo Target GT plus the seven recorded Rays "
+            "(Nominal Pose, Optical Pose, Ideal, GPS Baseline, Global Baseline, "
+            "Attitude, Operational). "
             "Range is the 3D vector magnitude when a source "
             "publishes F/R/D only. Attitude/Full can be far larger than the "
             "others at long range (shallow stereo intersection angle "
@@ -2234,9 +2194,9 @@ class OperatorPanel(Plugin):
         self._debug_label.setText(
             f"Status: {text}\n"
             f"Images: {IMAGE_TOPICS[0][1]}, {IMAGE_TOPICS[1][1]}\n"
-            "Series: /ground_truth_position, /stereo/estimated_position (Raw), "
-            "/stereo/optical_position (Truth), /stereo/ideal_position (Ideal), "
-            "/stereo/raw_gps_baseline_position (GPS); Global/Attitude/Baseline/Full "
+            "Series: /ground_truth_position, /stereo/nominal_pose_position (Nominal Pose), "
+            "/stereo/optical_pose_position (Optical Pose), /stereo/ideal_position (Ideal), "
+            "/stereo/gps_baseline_position (GPS Baseline); Global Baseline/Attitude/Operational "
             "from /stereo/ray_metrics\n"
             "Detection format: left/right bbox x1,y1,x2,y2, confidence, center."
         )
@@ -2292,11 +2252,11 @@ class OperatorPanel(Plugin):
             return
         if not isinstance(parsed, dict):
             return
-        # "gps_global"/"attitude"/"baseline"/"full" have no dedicated
-        # position topic of their own (unlike raw/optical/ideal/GPS above);
+        # Global Baseline/Attitude/Operational have no dedicated position
+        # topic of their own (unlike Nominal/Optical/Ideal/GPS above);
         # /stereo/ray_metrics is their only source, so plot/facts/CSV get
         # them from here instead of the SERIES topic-subscription loop.
-        for ray_key in ("gps_global", "attitude", "baseline", "full"):
+        for ray_key in ("global_baseline", "attitude", "operational"):
             ray = parsed.get(ray_key)
             if not isinstance(ray, dict):
                 continue
@@ -2364,7 +2324,7 @@ class OperatorPanel(Plugin):
                 qos_profile_sensor_data,
             )
             for series_name, topic, _color in SERIES:
-                if topic is None or series_name in ("raw_gps_baseline", "uam_raw_gps_reference"):
+                if topic is None or series_name in ("gps_baseline", "uam_raw_gps_reference"):
                     continue
                 self._ros_node.create_subscription(
                     Float32MultiArray,
@@ -2374,9 +2334,9 @@ class OperatorPanel(Plugin):
                 )
             self._ros_node.create_subscription(
                 PointStamped,
-                "/stereo/raw_gps_baseline_position",
+                "/stereo/gps_baseline_position",
                 lambda msg: self._bridge.sample.emit(
-                    "raw_gps_baseline", [msg.point.x, msg.point.y, msg.point.z, math.nan]
+                    "gps_baseline", [msg.point.x, msg.point.y, msg.point.z, math.nan]
                 ),
                 10,
             )

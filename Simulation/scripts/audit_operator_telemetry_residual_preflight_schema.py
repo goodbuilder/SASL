@@ -23,9 +23,9 @@ FIELD_GROUPS: tuple[tuple[str, tuple[str, ...], str], ...] = (
         ("raw_disparity_px", "disparity_px", "bbox_adjustment_raw_disparity_px"),
         "measured stereo disparity, pixels",
     ),
-    ("raw_forward_m", ("raw_forward_m", "estimated_forward_m"), "public FRD forward, meters"),
-    ("raw_right_m", ("raw_right_m", "estimated_right_m"), "public FRD right, meters"),
-    ("raw_down_m", ("raw_down_m", "estimated_down_m"), "public FRD down, meters"),
+    ("nominal_pose_forward_m", ("nominal_pose_forward_m",), "public FRD nominal forward, meters"),
+    ("nominal_pose_right_m", ("nominal_pose_right_m",), "public FRD nominal right, meters"),
+    ("nominal_pose_down_m", ("nominal_pose_down_m",), "public FRD nominal down, meters"),
     ("observation_forward_m", ("corrected_forward_m",), "public FRD corrected forward, meters"),
     ("observation_right_m", ("corrected_right_m",), "public FRD corrected right, meters"),
     ("observation_down_m", ("corrected_down_m",), "public FRD corrected down, meters"),
@@ -35,9 +35,9 @@ RAW_REQUIRED_GROUPS = {
     "left_u_px",
     "left_v_px",
     "measured_disparity_px",
-    "raw_forward_m",
-    "raw_right_m",
-    "raw_down_m",
+    "nominal_pose_forward_m",
+    "nominal_pose_right_m",
+    "nominal_pose_down_m",
 }
 CORRECTED_REQUIRED_GROUPS = {"observation_forward_m", "observation_right_m", "observation_down_m"}
 

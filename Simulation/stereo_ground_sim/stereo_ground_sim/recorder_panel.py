@@ -40,12 +40,12 @@ RECORDING_MODE_BUTTONS = (
 )
 ANALYSIS_CSV_FIELDS = (
     "time_sec",
-    "raw_range_m",
+    "nominal_pose_range_m",
     "left_x1",
     "right_x1",
-    "raw_gps_baseline_forward_m",
-    "global_position_baseline_forward_m",
-    "raw_minus_global_baseline_delta_m",
+    "gps_baseline_forward_m",
+    "global_baseline_forward_m",
+    "gps_baseline_minus_global_baseline_delta_m",
 )
 
 
@@ -434,7 +434,7 @@ class RecorderPanel(Plugin):
             "yolo_ms": math.nan,
             "yolo_hz": math.nan,
             "truth_frd": None,
-            "raw_frd": None,
+            "nominal_pose_frd": None,
             "corrected_frd": None,
             "profile_status": "",
         }
@@ -603,8 +603,8 @@ class RecorderPanel(Plugin):
                 ),
                 self._ros_node.create_subscription(
                     Float32MultiArray,
-                    "/stereo/estimated_position",
-                    lambda msg: self._set_frd("raw_frd", msg.data),
+                    "/stereo/nominal_pose_position",
+                    lambda msg: self._set_frd("nominal_pose_frd", msg.data),
                     10,
                 ),
                 self._ros_node.create_subscription(
@@ -676,8 +676,8 @@ class RecorderPanel(Plugin):
         yolo_hz = self._format_float(self._latest["yolo_hz"], 1)
         self._yolo_ms_label.setText(f"YOLO ms: {yolo_ms}{' stale' if self._is_stale('yolo_ms') else ''}")
         self._yolo_hz_label.setText(f"YOLO Hz: {yolo_hz}{' stale' if self._is_stale('yolo_hz') else ''}")
-        self._truth_label.setText(f"Truth F/R/D/R: {self._format_frd(self._latest['truth_frd'])}")
-        self._raw_label.setText(f"Raw F/R/D/R: {self._format_frd(self._latest['raw_frd'])}")
+        self._truth_label.setText(f"Target GT F/R/D/R: {self._format_frd(self._latest['truth_frd'])}")
+        self._raw_label.setText(f"Nominal Pose F/R/D/R: {self._format_frd(self._latest['nominal_pose_frd'])}")
         self._corrected_label.setText(f"Corrected F/R/D/R: {self._format_frd(self._latest['corrected_frd'])}")
         profile = self._latest["profile_status"] or "--"
         self._profile_label.setText(f"Profile: {profile}")

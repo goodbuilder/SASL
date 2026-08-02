@@ -288,6 +288,28 @@ def apply_optical_rpy_error(
     return actual
 
 
+def apply_px4_attitude_rpy(
+    nominal_camera_pose: CameraOpticalPose,
+    roll_rad: float,
+    pitch_rad: float,
+    yaw_rad: float,
+) -> CameraOpticalPose:
+    """Build a PX4 body attitude independently of configured optical errors.
+
+    The returned camera-basis carrier uses the same physical Forward/Right/
+    Down axes as PX4 body FRD.  The input pose supplies only the canonical
+    rig origin and heading; ``CAM_*_OPTICAL_*`` values are intentionally not
+    involved.
+    """
+
+    return apply_optical_rpy_error(
+        nominal_camera_pose,
+        roll_rad,
+        pitch_rad,
+        yaw_rad,
+    )
+
+
 def apply_optical_yaw(
     nominal_camera_pose: CameraOpticalPose,
     yaw_error_rad: float,
@@ -683,6 +705,7 @@ __all__ = [
     "VEHICLE_REFERENCE_LINK",
     "WORLD_FRAME",
     "apply_optical_rpy_error",
+    "apply_px4_attitude_rpy",
     "apply_optical_yaw",
     "build_baseline_center_frd",
     "camera_optical_pose_from_quaternion",

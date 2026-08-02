@@ -11,9 +11,9 @@ from typing import Mapping, Sequence
 
 PUBLIC_AXIS_CONTRACT = "stereodistance_public_frd:forward,right,down,range"
 REQUIRED_FIELDS = (
-    "raw_forward_m",
-    "raw_right_m",
-    "raw_down_m",
+    "nominal_pose_forward_m",
+    "nominal_pose_right_m",
+    "nominal_pose_down_m",
     "corrected_forward_m",
     "corrected_right_m",
     "corrected_down_m",

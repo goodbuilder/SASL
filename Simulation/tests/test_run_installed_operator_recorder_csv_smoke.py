@@ -44,11 +44,11 @@ class RunInstalledOperatorRecorderCsvSmokeTests(unittest.TestCase):
         self.assertEqual(result["schema_audit_status"], "PASS")
         self.assertEqual(result["schema_audit_valid_row_count"], 1)
         self.assertFalse(result["first_row_has_axis_contract"])
-        self.assertEqual(result["first_row_raw_forward_m"], "1000")
+        self.assertEqual(result["first_row_nominal_pose_forward_m"], "1000")
         self.assertEqual(result["first_row_corrected_forward_m"], "999")
-        self.assertEqual(result["first_row_raw_gps_baseline_forward_m"], "1002")
-        self.assertEqual(result["first_row_global_position_baseline_forward_m"], "999")
-        self.assertEqual(result["first_row_raw_minus_global_baseline_delta_m"], "3.64005494")
+        self.assertEqual(result["first_row_gps_baseline_forward_m"], "1002")
+        self.assertEqual(result["first_row_global_baseline_forward_m"], "999")
+        self.assertEqual(result["first_row_gps_baseline_minus_global_baseline_delta_m"], "3.64005494")
         # The public recorder derives raw disparity from the recorded BBox centres
         # (700 - 690), rather than preserving an earlier standalone disparity sample.
         self.assertEqual(result["first_row_raw_disparity_px"], "10")

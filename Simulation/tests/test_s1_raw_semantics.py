@@ -15,6 +15,7 @@ from sasl_common.stereo_geometry import (  # noqa: E402
     BASELINE_CENTER_FRD_VECTOR_CONTRACT,
 )
 from stereo_ground_sim.stereo_distance_node import StereoDistanceNode  # noqa: E402
+from stereo_ground_sim.coordinate_frames import apply_optical_rpy_error  # noqa: E402
 from camera_oracle_test_support import seed_observed_camera_oracle  # noqa: E402
 
 
@@ -98,3 +99,40 @@ def test_canonical_raw_result_reports_baseline_frame_provenance() -> None:
     assert result["output_frame"] == BASELINE_CENTER_FRD_FRAME
     assert result["axis_contract"] == BASELINE_CENTER_FRD_AXIS_CONTRACT
     assert result["vector_contract"] == BASELINE_CENTER_FRD_VECTOR_CONTRACT
+
+
+def test_nominal_uses_fixed_px4_bias_without_consuming_runtime_attitude() -> None:
+    node = _node_with_camera_error()
+    node.cam_l_px4_attitude_roll_deg = 0.0
+    node.cam_l_px4_attitude_pitch_deg = 0.0
+    node.cam_l_px4_attitude_yaw_deg = -0.1
+    node.cam_r_px4_attitude_roll_deg = 0.0
+    node.cam_r_px4_attitude_pitch_deg = 0.0
+    node.cam_r_px4_attitude_yaw_deg = 0.1
+    node._ensure_attitude_error_state()
+    node._configure_camera_frames()
+
+    expected_left = apply_optical_rpy_error(
+        node.nominal_left_camera,
+        0.0,
+        0.0,
+        math.radians(-0.1),
+    )
+    assert node.nominal_px4_left_camera.forward_world_enu == expected_left.forward_world_enu
+    assert node.nominal_px4_left_camera.right_world_enu == expected_left.right_world_enu
+    assert node.nominal_px4_left_camera.down_world_enu == expected_left.down_world_enu
+
+    left, right = node._synthetic_detection_pair_from_rdf(
+        right_m=2.0,
+        down_m=1.0,
+        forward_m=100.0,
+        width=1280,
+        height=720,
+    )
+    first = node._triangulate_pixel_centers(
+        left["cx"], left["cy"], right["cx"], right["cy"], 1280, 720
+    )
+    second = node._triangulate_pixel_centers(
+        left["cx"], left["cy"], right["cx"], right["cy"], 1280, 720
+    )
+    assert first["midpoint_baseline_center_frd_m"] == second["midpoint_baseline_center_frd_m"]

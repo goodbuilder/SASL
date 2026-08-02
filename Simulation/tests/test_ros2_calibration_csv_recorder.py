@@ -158,7 +158,7 @@ class Ros2CalibrationCsvRecorderTests(unittest.TestCase):
                     truth_source="local_ned",
                     sim_truth_topic="/ground_truth_position",
                     sim_truth_role="oracle",
-                    estimated_topic="/stereo/estimated_position",
+                    estimated_topic="/stereo/nominal_pose_position",
                     detections_topic="/stereo/detections",
                     disparity_topic="/stereo/disparity",
                 ),

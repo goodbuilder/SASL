@@ -302,8 +302,11 @@ ray gap, 교차각, signed depths, geometry rank, conditioning metric,
 `computation_status`가 포함된다. PX4 Local/Global/GPS/Odometry는 이 절대
 Ground Truth의 보조 정보일 뿐이다.
 
-Rendered/ideal observation pixel은 actual optical pose에서 투영하고,
-canonical Raw는 nominal zero-error optical pose로 같은 pixel을 해석한다.
+Rendered/ideal observation pixel은 actual optical pose에서 투영한다.
+canonical Nominal/Raw는 시뮬레이션 중 변하지 않는 configured PX4 nominal body
+attitude를 사용하고, Attitude는 시간에 따라 변하는 PX4 `VehicleAttitude`를
+사용한다. Truth/Ideal의 optical oracle 경로와 GPS/Global 경로는 PX4 attitude
+설정과 독립이다.
 공통 kernel을 호출할 때는 `common_frame=baseline_center_frd`,
 `geometry_policy=diagnostic_signed_depth`, `axis_contract=forward_right_down`를
 명시한다. 한 run의 baseline, camera height, FOV, target model identity,
@@ -5652,8 +5655,8 @@ Replay 출력:
 기본 실행은 target PX4(instance 0)를 `x500_15m`에, Camera_Left PX4(instance 1)를 `left_stereo_camera`에, Camera_Right PX4(instance 2)를 `right_stereo_camera`에 각각 attach합니다. target PX4는 기존 `/fmu`와 QGroundControl MAVLink UDP 14550 계약을 유지하고, 카메라 PX4는 `/camera_left/fmu`, `/camera_right/fmu` namespace로 격리됩니다. target의 이륙-접근-착륙을 자동 시작하려면 `--auto-mission`을 붙입니다.
 `x500_15m`는 카메라 전방 +Y 약 2000 m 지점에서 yaw -90도로 스폰되어, QGC/PX4에서 전진 명령을 주면 카메라 방향으로 접근합니다. 스테레오 베이스라인은 X축 방향입니다.
 Gazebo 3D GUI에서는 카메라 뒤에서 전방 +Y를 바라보는 운용자 기준으로 왼쪽 카메라는 world X 음수 위치의 파란색 본체, 오른쪽 카메라는 world X 양수 위치의 빨간색 본체로 표시됩니다. 카메라 모델 원점은 실제 sensor optical center이며, 렌즈 visual의 앞면이 이 원점에 맞춰집니다.
-`rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, truth/raw/corrected FRD, Forward/Down `estimate-truth` 오차와 최근 시간창 RMSE, detection valid ratio, 좌표 계약을 표시합니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
-Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), raw YOLO 추정값(`/stereo/estimated_position`), bbox 중심 보정 추정값(`/stereo/corrected_position`)을 비교합니다. 축 계약은 StereoDistance와 같은 비교 계약으로 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다.
+`rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, Truth/Nominal Pose/Optical Pose FRD, 좌표 계약을 표시합니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
+Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), Nominal Pose(`/stereo/nominal_pose_position`), Optical Pose(`/stereo/optical_pose_position`)를 비교합니다. 축 계약은 StereoDistance와 같은 비교 계약으로 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다.
 Gazebo visible 카메라 센서는 기본 20 Hz(`CAMERA_UPDATE_RATE_HZ=20.0`), 1280x720이며 frame interval은 50,000,000 ns입니다. Ground Truth는 별도 adapter가 raw `Pose_V`의 simulation stamp를 보존해 발행하고, S1의 비교 frame은 고정 `baseline_center_frd`입니다. 이전 model-origin/Down offset 설명은 폐기된 historical 기록이며 active 경로에서 사용하지 않습니다. 거리/오차 그래프 및 overlay timer는 이 Phase의 camera-rate contract와 별개입니다. 기본 실행은 Gazebo 3D GUI도 함께 엽니다(`gz_gui:=true`). 카메라/그래프 Hz를 우선해 headless로 돌리려면 `gz_gui:=false`를 붙입니다.
 각 Plot의 시간축은 최근 30초 창으로 autoscroll되며, 값 축은 현재 보이는 데이터 범위에 맞춰 자동으로 다시 잡히도록 실행 시 rqt_plot 패치를 적용합니다. 시간 창 길이는 `--plot-window 30`처럼 바꿀 수 있습니다.
 기본 YOLO 설정은 `config/simulation.env`에서 읽습니다. 기본 모델은 `yolov8n_uav.pt`, class는 `UAV`, confidence는 `0.10`입니다. `.pt` 파일은 git에 넣지 않는 machine-local 입력이므로 runner는 `Simulation/`, 상위 workspace, `~/Downloads/`, `~/다운로드/` 순서로 같은 파일명을 찾습니다. 다른 PC에서는 `Simulation/yolov8n_uav.pt`를 같은 위치에 두거나 `YOLO_MODEL_PATH`/`--yolo-model`로 다른 파일을 명시합니다. 이 설정은 left/right image pixel bbox detector만 바꾸며, `/ground_truth_position`과 거리 토픽의 stereo-center FRD 축 계약은 바꾸지 않습니다.
@@ -5867,7 +5870,12 @@ export GZ_CONFIG_HOME=/tmp/gz-config
 /stereo/disparity
 /ground_truth
 /ground_truth_position
-/stereo/estimated_position
+/stereo/nominal_pose_position
+/stereo/optical_pose_position
+/stereo/ideal_position
+/stereo/gps_baseline_position
+/stereo/global_baseline_position
+/stereo/ray_metrics
 /stereo/corrected_position
 /stereo/bbox_adjustment
 /stereo/distance_error
@@ -5887,7 +5895,8 @@ ros2 topic echo /target_distance
 ```bash
 ros2 topic echo /ground_truth
 ros2 topic echo /ground_truth_position
-ros2 topic echo /stereo/estimated_position
+ros2 topic echo /stereo/nominal_pose_position
+ros2 topic echo /stereo/optical_pose_position
 ros2 topic echo /stereo/corrected_position
 ros2 topic echo /stereo/distance_error
 ```
@@ -5911,12 +5920,12 @@ ros2 topic echo /stereo/distance_comparison
 ```
 
 여기서 배열은 StereoDistance와 같은 FRD 비교 계약입니다. `data[0]`은 전방, `data[1]`은 오른쪽, `data[2]`는 아래쪽입니다. `ground_truth_m`은 카메라 위치 기준 실제 3D 직선거리이며, `estimated_range_m` 비교용입니다. `/ground_truth` 토픽과 `/stereo/distance_comparison`의 `actual_m`은 카메라 전방축 실제 거리 `forward_m`을 발행합니다.
-새 CSV에서는 `drone_forward_m/right_m/down_m`과 `estimated_forward_m/right_m/down_m`을 표준으로 사용하고 legacy `x/y/z` 공개 필드는 쓰지 않습니다. 과거 CSV에는 `drone_x_m/y_m/z_m`과 `estimated_x_m/y_m/z_m`가 남아 있을 수 있으므로, reader는 `axis_contract`를 확인해 `stereo_center_frd:forward_right_down`이면 legacy `x/y/z=forward/right/down`, 누락/구버전이면 변경 전 RDF인지 구분해야 합니다.
+새 CSV에서는 `drone_forward_m/right_m/down_m`과 `nominal_pose_forward_m/right_m/down_m`을 표준으로 사용하고 legacy `x/y/z` 공개 필드는 쓰지 않습니다. 기존 CSV는 새 reader에서 허용하지 않습니다.
 
-`/stereo/estimated_position` 배열 순서는 다음과 같습니다.
+`/stereo/nominal_pose_position` 배열 순서는 다음과 같습니다.
 
 ```text
-[estimated_forward_m, estimated_right_m, estimated_down_m, estimated_range_m]
+[nominal_pose_forward_m, nominal_pose_right_m, nominal_pose_down_m, nominal_pose_range_m]
 ```
 
 `/stereo/corrected_position` 배열 순서도 같습니다.
@@ -5925,7 +5934,7 @@ ros2 topic echo /stereo/distance_comparison
 [corrected_forward_m, corrected_right_m, corrected_down_m, corrected_range_m]
 ```
 
-추정값도 같은 FRD 축 계약을 사용합니다. `/target_distance`는 raw `estimated_forward_m`을 발행합니다. CSV bbox-center affine 보정에서는 `/stereo/bbox_adjustment`가 `[left_corrected_cx, left_corrected_cy, right_corrected_cx, right_corrected_cy, left_du_px, left_dv_px, right_du_px, right_dv_px]`를 발행합니다. JSON output profile은 bbox 중심을 옮기지 않고 FRD 결과를 직접 보정하므로 `/stereo/corrected_position`만 비교하면 됩니다.
+Nominal Pose도 같은 FRD 축 계약을 사용합니다. `/target_distance`는 nominal pose의 전방 거리를 발행합니다. CSV bbox-center affine 보정에서는 `/stereo/bbox_adjustment`가 `[left_corrected_cx, left_corrected_cy, right_corrected_cx, right_corrected_cy, left_du_px, left_dv_px, right_du_px, right_dv_px]`를 발행합니다.
 
 ## 파라미터 확인/변경
 
@@ -5953,7 +5962,7 @@ ros2 param set /stereo_distance_node yolo_class_name drone
 `stereo_ground_sim/worlds/stereo_ground_drone.sdf`에서 수정합니다.
 기본 ground는 `4000 m x 4000 m`이고 월드 기준 x=0..4000, y=-2000..2000 범위를 덮습니다. 실행 시 `stereo_ground_sim.launch.py`가 같은 범위에 100 m 간격 grid line visual을 생성합니다. 카메라 모델 원점은 sensor optical center이고, Gazebo GUI 확인용 본체와 렌즈 visual은 그 기준점 뒤쪽에 배치됩니다.
 
-카메라 optical 자세는 `config/simulation.env`의 `CAM_L/R_OPTICAL_*`로 설정하며, 이것이 image sensor가 실제로 바라보는 물리적 방향(Gazebo actual optical pose)입니다. PX4 attitude는 더 이상 독립적인 절대각이 아닙니다. 각 카메라 PX4의 true body attitude는 고정된 zero-relative-pose body↔optical extrinsic을 통해 바로 그 optical pose에서 유도되며, `CAM_L/R_PX4_ATTITUDE_ERROR_*`는 그 위에 합성하는 deterministic body-local(PX4 FRD) fixed-bias 오차입니다. 오차가 0이면 PX4가 보고하는 attitude에서 재구성한 optical orientation은 Gazebo actual optical orientation과 (수치오차 내에서) 같습니다.
+카메라 optical 자세와 PX4 자세는 서로 다른 입력으로 관리합니다. `CAM_L/R_OPTICAL_*`는 image sensor가 실제로 바라보는 물리적 방향(Gazebo actual optical pose, OpenCV optical RDF)을 결정하고, `CAM_L/R_PX4_ATTITUDE_*`는 canonical rig heading을 기준으로 한 PX4 body 자세(PX4 FRD)를 고정값으로 결정합니다. PX4 자세는 optical 자세에서 유도하지 않으며, launch가 생성하는 `optical_link`의 상대 장착 자세가 두 설정을 분리해 optical 실제 자세가 PX4 설정에 의해 바뀌지 않도록 합니다.
 
 ```bash
 CAM_L_OPTICAL_ROLL_DEG=0.0
@@ -5961,15 +5970,15 @@ CAM_L_OPTICAL_PITCH_DEG=0.0
 CAM_L_OPTICAL_YAW_DEG=0.0
 CAM_R_OPTICAL_YAW_DEG=0.25
 
-CAM_L_PX4_ATTITUDE_ERROR_ROLL_DEG=0.0
-CAM_L_PX4_ATTITUDE_ERROR_PITCH_DEG=0.0
-CAM_L_PX4_ATTITUDE_ERROR_YAW_DEG=0.0
-CAM_R_PX4_ATTITUDE_ERROR_ROLL_DEG=0.0
-CAM_R_PX4_ATTITUDE_ERROR_PITCH_DEG=0.0
-CAM_R_PX4_ATTITUDE_ERROR_YAW_DEG=0.0
+CAM_L_PX4_ATTITUDE_ROLL_DEG=0.0
+CAM_L_PX4_ATTITUDE_PITCH_DEG=0.0
+CAM_L_PX4_ATTITUDE_YAW_DEG=-0.1
+CAM_R_PX4_ATTITUDE_ROLL_DEG=0.0
+CAM_R_PX4_ATTITUDE_PITCH_DEG=0.0
+CAM_R_PX4_ATTITUDE_YAW_DEG=0.1
 ```
 
-`CAM_L_OPTICAL_*`를 변경하면 left optical frame이 회전하고, PX4 attitude error가 0인 한 left PX4 true body attitude도 같은 물리적 방향으로 함께 회전합니다(둘이 독립이 아님). `CAM_L_PX4_ATTITUDE_ERROR_*`만 변경하면 left PX4 body/IMU가 그 오차만큼 회전해 PX4 SITL이 보고하는 VehicleAttitude가 바뀌지만, generated SDF의 `optical_link` 장착 오프셋이 그 오차를 보정하므로 optical sensor의 실제 world attitude는 그대로 유지됩니다. 옛 `CAM_L/R_PX4_ROLL/PITCH/YAW_DEG` 이름은 더 이상 존재하지 않으며, 남아 있으면 `./run_operator_view.sh`가 시작 전에 즉시 실패합니다. 파일을 저장한 뒤 `./run_operator_view.sh`를 다시 실행하면 적용되며, 명령줄 인자가 우선합니다.
+`CAM_L/R_OPTICAL_*`를 변경하면 optical frame과 렌더링 방향만 바뀌고, `CAM_L/R_PX4_ATTITUDE_*`를 변경하면 PX4 body/IMU가 보고하는 자세만 바뀝니다. 따라서 optical 자세는 카메라를, PX4 자세는 PX4를 결정합니다. `Nominal`/`Raw`는 configured PX4 자세를 고정 사용하고, `Attitude`는 시뮬레이션 중 변동하는 `VehicleAttitude`를 사용합니다. 기존 `CAM_L/R_PX4_ROLL/PITCH/YAW_DEG`와 `CAM_*_PX4_ATTITUDE_ERROR_*` 이름은 사용하지 않으며, 전자는 `./run_operator_view.sh`가 시작 전에 즉시 실패합니다. 파일을 저장한 뒤 `./run_operator_view.sh`를 다시 실행하면 적용되며, 명령줄 인자가 우선합니다.
 
 PX4 waypoint 경로도 같은 `config/simulation.env`에서 설정합니다.
 
@@ -6004,23 +6013,27 @@ WAYPOINT_RECORD_LITE=true
   --speed-mps 8
 ```
 
-## 카메라 자세각 오차 실험
+## 카메라 optical 자세각 실험
 
-launch 인자로 좌/우 카메라 roll, pitch, yaw 오차를 도 단위로 줄 수 있습니다.
+이 절의 실험은 PX4 body attitude가 아니라 `CAM_L/R_OPTICAL_*`로 지정하는
+카메라 optical roll, pitch, yaw를 launch 인자로 바꿔가며 검증합니다.
 거리 계산 노드는 이상적인 평행 스테레오 조건에서 bbox 중심을 3D 위치로 복원하므로, RViz2와 토픽에서 자세각 오차가 3D 추정값과 거리 측정값에 주는 영향을 관찰할 수 있습니다.
 단일 `rqt_gui` 운용 창에는 좌/우 원본 카메라 영상과 하단에 상하 3단으로 쌓인 Forward/Right/Down축 실제값-raw 추정값-corrected 추정값 비교 그래프가 표시됩니다.
-그래프는 표준 `rqt_plot` 플러그인 3개로 나뉩니다. Forward Axis Plot은 `/ground_truth_position/data[0]`, `/stereo/estimated_position/data[0]`, `/stereo/corrected_position/data[0]`, Right Axis Plot은 각 topic의 `data[1]`, Down Axis Plot은 각 topic의 `data[2]`를 표시합니다. 런타임 패치는 각 plot 제목과 Y축 라벨에 `Forward`, `Right`, `Down` 이름을 명시합니다.
+그래프는 표준 `rqt_plot` 플러그인 3개로 나뉩니다. Forward Axis Plot은 `/ground_truth_position/data[0]`, `/stereo/nominal_pose_position/data[0]`, `/stereo/optical_pose_position/data[0]`, `/stereo/ideal_position/data[0]`, `/stereo/gps_baseline_plot/data[0]`를 표시합니다. 런타임 패치는 각 plot 제목과 Y축 라벨에 `Forward`, `Right`, `Down` 이름을 명시합니다.
 거리 측정은 왼쪽/오른쪽 영상에서 같은 YOLO class의 bbox 중심을 찾고, disparity와 영상 중심 오프셋으로 내부 RDF를 계산한 뒤 FRD topic 순서인 `estimated_forward_m`, `estimated_right_m`, `estimated_down_m`, `estimated_range_m`으로 발행합니다. bbox 중심 보정이 켜져 있으면 같은 순서로 `corrected_forward_m`, `corrected_right_m`, `corrected_down_m`, `corrected_range_m`도 발행합니다. 기존 거리 그래프와 `/target_distance`는 이 3D 복원 결과 중 raw 카메라 전방 거리인 `estimated_forward_m`을 사용합니다. `/ground_truth_position`의 `ground_truth_m`은 카메라 기준 FRD로 계산한 3D 직선거리이므로 `estimated_range_m` 및 `corrected_range_m`과 직접 비교합니다.
 자동 접근 실험은 QGC mission 또는 PX4용 MAVLink/offboard 명령으로 수행합니다. 이전 `./run_x500_mission.sh`의 Gazebo `cmd_vel` 방식은 현재 QGC/PX4 제어와 충돌하므로 비활성화되어 있습니다.
 
-자세각 오차 정량 실험은 아래 명령을 사용합니다. 기본 실행은 Gazebo 이미지와 YOLO 거리 계산을 포함한 반복 실험입니다.
+카메라 optical 자세 정량 실험은 아래 명령을 사용합니다. 실행 스크립트 이름은
+기존 호환성을 위해 `attitude_error`를 유지하지만, 실험 대상은 optical 자세입니다.
+기본 실행은 Gazebo 이미지와 YOLO 거리 계산을 포함한 반복 실험입니다.
 실행 전에 이전 `attitude_error` Gazebo/ROS 프로세스가 남아 있으면 자동으로 종료한 뒤 새 실험을 시작합니다. 이 자동 정리를 막고 기존처럼 즉시 실패하게 하려면 `--no-stop-existing-sim`을 사용하고, 의도적으로 기존 시뮬레이션과 함께 실행하려면 `--allow-existing-sim`을 사용합니다.
 
 ```bash
 ./run_attitude_error_experiment.sh
 ```
 
-기본 Gazebo/YOLO 실험은 오른쪽 카메라 roll/pitch/yaw 축을 대상으로 `+0.25도` 오차를 테스트합니다. 음수 오차도 포함하려면:
+기본 Gazebo/YOLO 실험은 오른쪽 카메라 optical roll/pitch/yaw 축을 대상으로
+`+0.25도` 변위를 테스트합니다. 음수 변위도 포함하려면:
 
 ```bash
 ./run_attitude_error_experiment.sh --include-negative
@@ -6179,6 +6192,7 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 
 ## 변경 이력
 
+- 2026-08-03: PX4 고정 자세 설정을 `CAM_L/R_PX4_ATTITUDE_{ROLL,PITCH,YAW}_DEG`로 통일하고 optical pose와 PX4 body attitude를 독립 입력으로 분리했습니다. 생성 SDF는 PX4 body pose와 `optical_link` 상대 자세를 각각 구성하며, `Nominal`/`Raw`는 고정 configured PX4 자세, `Attitude`는 시간별 `VehicleAttitude`를 사용합니다. 기존 `CAM_*_PX4_ATTITUDE_ERROR_*` 이름은 제거했습니다.
 - 2026-06-18: fresh-seed replay에서 단일 frame 보정 profile과 단순 raw/disparity/alpha-beta prefilter는 1852 m worst-case tail을 안정적으로 통과하지 못했습니다. 실패 원인은 전역 자세/원점 보정 부족보다 순간 disparity/BBox 측정 이상치가 장거리에서 증폭되는 문제로 좁혀졌습니다. 후속으로 `repeated_observation_trimmed_mean_n7_trim0p2`를 적용해 left image `u/v`와 measured disparity를 7회 독립 관측 후 trimmed mean으로 fuse하고 stereo-center RDF로 재삼각측량한 뒤 runtime profile을 적용했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/repeated_observation_fusion_all_scenarios_followup/aggregate_summary/`에 CSV/TXT로 저장되어 있습니다. nominal, yaw/pitch, disparity noise, combined sensor, bbox outlier stress는 기존 bbox-runtime profile과 함께 STRICT_PASS이고, intrinsic-only stress는 calibrated profile이 range RMSE를 악화시켜 identity passthrough profile이 STRICT_PASS입니다. runtime 입력은 fused pixel/disparity와 raw RDF뿐이며 PX4/NED truth는 synthetic generation/audit 전용입니다. 내부 보정 좌표는 stereo-center RDF(right, down, forward), public StereoDistance topic 계약은 FRD+range(forward, right, down, range)입니다.
 - 2026-06-18: repeated observation의 독립 오차 가정이 너무 낙관적인지 확인하기 위해 common-mode 오차를 포함한 multi-burst fusion도 검증했습니다. `multiburst_observation_*_b5x5_trim0p2_common0p5` 계열은 bbox outlier, combined sensor, disparity noise, intrinsic identity stress에서 모두 20/20 STRICT_PASS입니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/aggregate_summary/`에 저장되어 있습니다. 이 결과는 실제 운용에서 단일 BBox 중심 하나를 바로 보정하지 말고, 짧은 burst 단위로 pixel/disparity를 robust fusion한 뒤 보정 profile 또는 identity passthrough를 적용하는 구조가 더 적합하다는 증거입니다.
 - 2026-06-18: 최신 multi-burst 결과를 StereoDistance runtime에서 읽을 수 있는 observation-fusion manifest로 export했습니다. manifest는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/fresh_runtime_manifest/observation_fusion_runtime_manifest.json`이며 초기 fresh 기본 tier는 `fresh_common_mode_b5x5_aggregate_best`였습니다. audit, raw apply smoke, runtime profile apply smoke, input/output schema validation을 통과했습니다. 이 manifest는 image `left_u_px/left_v_px/measured_disparity_px` burst를 stereo-center RDF로 fuse하는 adapter 설정만 포함하며, PX4/NED truth나 validation metric은 runtime 입력으로 사용하지 않습니다.

@@ -14,7 +14,7 @@ CALIBRATION_RDF_AXIS_CONTRACT = "stereo_center_opencv_optical:RDF(right,down,for
 
 
 DEFAULT_REQUIRED_TOPICS = {
-    "/stereo/estimated_position": "std_msgs/msg/Float32MultiArray",
+    "/stereo/nominal_pose_position": "std_msgs/msg/Float32MultiArray",
     "/stereo/detections": "std_msgs/msg/Float32MultiArray",
     "/stereo/disparity": "std_msgs/msg/Float32",
 }
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--truth-topic", default="/fmu/out/vehicle_local_position")
     parser.add_argument("--sim-truth-topic", default="")
-    parser.add_argument("--estimated-topic", default="/stereo/estimated_position")
+    parser.add_argument("--nominal-pose-topic", default="/stereo/nominal_pose_position")
     parser.add_argument("--detections-topic", default="/stereo/detections")
     parser.add_argument("--disparity-topic", default="/stereo/disparity")
     parser.add_argument("--output-dir", type=Path)
@@ -67,7 +67,7 @@ def topic_list_from_ros2() -> tuple[dict[str, set[str]], str]:
 
 def expected_topics(args: argparse.Namespace) -> dict[str, str]:
     topics = {
-        args.estimated_topic: DEFAULT_REQUIRED_TOPICS["/stereo/estimated_position"],
+        args.nominal_pose_topic: DEFAULT_REQUIRED_TOPICS["/stereo/nominal_pose_position"],
         args.detections_topic: DEFAULT_REQUIRED_TOPICS["/stereo/detections"],
         args.disparity_topic: DEFAULT_REQUIRED_TOPICS["/stereo/disparity"],
     }

@@ -216,15 +216,10 @@ def test_schema_accepts_nullable_diagnostic_ray_exports() -> None:
             "attitude_ray_range_m": 999.532,
             "attitude_ray_delta_forward_m": -0.5,
             "attitude_ray_position_difference_m": 0.5745,
-            "baseline_ray_computation_status": "stale_gps_baseline",
-            "baseline_ray_failure_reason": "stale_gps_baseline",
-            "baseline_ray_gps_baseline_source": "raw_gps",
-            "baseline_ray_gps_baseline_world_enu_x_m": 25.1,
-            "baseline_ray_gps_baseline_delta_norm_m": 0.2236,
-            "full_ray_computation_status": "computed",
-            "full_ray_baseline_source": "px4_raw_vehicle_gps_position_baseline_only",
-            "full_ray_forward_m": 998.5,
-            "full_ray_range_m": 998.534,
+            "operational_ray_computation_status": "computed",
+            "operational_ray_baseline_source": "px4_raw_vehicle_gps_position_baseline_only",
+            "operational_ray_forward_m": 998.5,
+            "operational_ray_range_m": 998.534,
             "ideal_position_error_m": 0.03,
             "ideal_forward_error_m": 0.01,
         }
@@ -234,11 +229,10 @@ def test_schema_accepts_nullable_diagnostic_ray_exports() -> None:
 
     assert normalized["schema_version"] == RESEARCH_SCHEMA_VERSION
     assert normalized["attitude_ray_delta_forward_m"] == -0.5
-    assert normalized["baseline_ray_failure_reason"] == "stale_gps_baseline"
-    assert normalized["full_ray_baseline_source"] == "px4_raw_vehicle_gps_position_baseline_only"
+    assert normalized["operational_ray_baseline_source"] == "px4_raw_vehicle_gps_position_baseline_only"
     assert "attitude_ray_computation_status" in PAIR_RECORD_COLUMNS
-    assert "baseline_ray_gps_baseline_world_enu_x_m" in PAIR_RECORD_COLUMNS
-    assert "full_ray_position_difference_m" in PAIR_RECORD_COLUMNS
+    assert "operational_ray_gps_baseline_world_enu_x_m" in PAIR_RECORD_COLUMNS
+    assert "operational_ray_position_difference_m" in PAIR_RECORD_COLUMNS
     assert "ideal_position_error_m" in PAIR_RECORD_COLUMNS
 
 
@@ -270,17 +264,9 @@ def test_diagnostic_analysis_round_trip_preserves_precision_status_and_time_unit
             "attitude_ray_delta_forward_m": 0.000000000123,
             "attitude_ray_gt_valid": True,
             "attitude_ray_gt_position_error_m": 0.25,
-            "baseline_ray_valid": False,
-            "baseline_ray_computation_status": "stale_left_gps_fix",
-            "baseline_ray_failure_reason": "stale_left_gps_fix",
-            "full_ray_valid": True,
-            "full_ray_computation_status": "computed",
-            "full_ray_gt_position_error_m": 0.5,
-            "interaction_valid": True,
-            "interaction_forward_m": 0.01,
-            "interaction_right_m": -0.02,
-            "interaction_down_m": 0.03,
-            "interaction_position_m": 0.0374165738677394,
+            "operational_ray_valid": True,
+            "operational_ray_computation_status": "computed",
+            "operational_ray_gt_position_error_m": 0.5,
             "left_px4_q_w": 1.0,
             "left_px4_q_x": 0.0,
             "left_px4_q_y": 0.0,
@@ -306,15 +292,14 @@ def test_diagnostic_analysis_round_trip_preserves_precision_status_and_time_unit
 
     stored = json.loads(recorder.jsonl_path.read_text(encoding="utf-8"))
     assert abs(stored["attitude_ray_midpoint_x_m"] - 1000.123456789012) <= 1.0e-12
-    assert stored["baseline_ray_failure_reason"] == "stale_left_gps_fix"
+    assert stored["operational_ray_computation_status"] == "computed"
     assert stored["px4_quaternion_order"] == "wxyz"
     assert stored["left_attitude_timestamp_us"] == 9_007_199_254_740_991
     assert stored["left_attitude_receive_monotonic_ns"] == 9_007_199_254_740_993
     assert stored["left_attitude_reset_counter"] == 3
     with recorder.csv_path.open(encoding="utf-8", newline="") as handle:
         csv_row = next(csv.DictReader(handle))
-    assert abs(float(csv_row["interaction_position_m"]) - 0.0374165738677394) <= 1.0e-12
-    assert csv_row["full_ray_gt_position_error_m"] == "0.5"
+    assert csv_row["operational_ray_gt_position_error_m"] == "0.5"
     assert csv_row["left_attitude_timestamp_us"] == "9007199254740991"
     assert csv_row["left_attitude_receive_monotonic_ns"] == "9007199254740993"
     assert csv_row["right_attitude_reset_counter"] == "4"
@@ -323,7 +308,7 @@ def test_diagnostic_analysis_round_trip_preserves_precision_status_and_time_unit
     assert saved_metadata["extrinsic_matrix_storage_order"] == "row_major"
 
 
-def test_legacy_v3_record_is_read_with_new_diagnostic_fields_missing() -> None:
+def test_legacy_v3_record_is_rejected_by_new_schema_only_reader() -> None:
     legacy = _record()
     legacy["record_sequence"] = 1
     legacy["schema_version"] = "s2_atomic_pair_v3"
@@ -333,11 +318,8 @@ def test_legacy_v3_record_is_read_with_new_diagnostic_fields_missing() -> None:
         if not key.endswith("_ray_valid") and not key.startswith("interaction_")
     }
 
-    normalized = validate_pair_record(legacy)
-
-    assert normalized["schema_version"] == RESEARCH_SCHEMA_VERSION
-    assert normalized["attitude_ray_valid"] is None
-    assert normalized["interaction_position_m"] is None
+    with pytest.raises(ValueError, match="pair record columns differ"):
+        validate_pair_record(legacy)
 
 
 def test_jsonl_rejects_nan_without_writing_a_terminal_line(tmp_path: Path) -> None:

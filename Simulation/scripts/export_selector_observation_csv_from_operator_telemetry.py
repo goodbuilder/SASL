@@ -20,9 +20,9 @@ OUTPUT_COLUMNS = (
     "left_v_px",
     "measured_disparity_px",
     "fused_disparity_px",
-    "raw_right_m",
-    "raw_down_m",
-    "raw_forward_m",
+    "nominal_pose_right_m",
+    "nominal_pose_down_m",
+    "nominal_pose_forward_m",
     "observation_right_m",
     "observation_down_m",
     "observation_forward_m",
@@ -94,9 +94,9 @@ def convert_row(
     left_u = pick_float(row, ("left_cx", "left_cx_px", "left_u_px"))
     left_v = pick_float(row, ("left_cy", "left_cy_px", "left_v_px"))
     disparity = pick_float(row, ("raw_disparity_px", "disparity_px", "bbox_adjustment_raw_disparity_px"))
-    raw_forward = pick_float(row, ("raw_forward_m", "estimated_forward_m"))
-    raw_right = pick_float(row, ("raw_right_m", "estimated_right_m"))
-    raw_down = pick_float(row, ("raw_down_m", "estimated_down_m"))
+    nominal_forward = pick_float(row, ("nominal_pose_forward_m",))
+    nominal_right = pick_float(row, ("nominal_pose_right_m",))
+    nominal_down = pick_float(row, ("nominal_pose_down_m",))
     corrected_forward = pick_float(row, ("corrected_forward_m",))
     corrected_right = pick_float(row, ("corrected_right_m",))
     corrected_down = pick_float(row, ("corrected_down_m",))
@@ -105,9 +105,9 @@ def convert_row(
         "left_u_px": left_u,
         "left_v_px": left_v,
         "measured_disparity_px": disparity,
-        "raw_forward_m": raw_forward,
-        "raw_right_m": raw_right,
-        "raw_down_m": raw_down,
+        "nominal_pose_forward_m": nominal_forward,
+        "nominal_pose_right_m": nominal_right,
+        "nominal_pose_down_m": nominal_down,
     }
     for name, value in required.items():
         if value is None:
@@ -116,9 +116,9 @@ def convert_row(
         failures.append("measured_disparity_px_not_positive")
     if corrected_forward is None or corrected_right is None or corrected_down is None:
         if allow_missing_corrected:
-            corrected_forward = raw_forward
-            corrected_right = raw_right
-            corrected_down = raw_down
+            corrected_forward = nominal_forward
+            corrected_right = nominal_right
+            corrected_down = nominal_down
         else:
             for name, value in (
                 ("observation_forward_m", corrected_forward),
@@ -136,9 +136,9 @@ def convert_row(
             "measured_disparity_px": disparity,
             "fused_disparity_px": disparity,
             # Source telemetry field names are public FRD; output names are explicit RDF components.
-            "raw_right_m": raw_right,
-            "raw_down_m": raw_down,
-            "raw_forward_m": raw_forward,
+            "nominal_pose_right_m": nominal_right,
+            "nominal_pose_down_m": nominal_down,
+            "nominal_pose_forward_m": nominal_forward,
             "observation_right_m": corrected_right,
             "observation_down_m": corrected_down,
             "observation_forward_m": corrected_forward,

@@ -114,8 +114,8 @@ with telemetry.open("w", newline="", encoding="utf-8") as handle:
     instance._estimated_position_cb(FakeMsg([1000.0, 7.0, 4.0, 1000.0325]))
     instance._corrected_position_cb(FakeMsg([999.0, 6.5, 3.5, 999.0274]))
     instance._ground_truth_position_cb(FakeMsg([1000.0, 7.0, 4.0, 1000.0325]))
-    instance._gps_baseline_position_cb("raw_gps_baseline", FakePointStamped(1002.0, 6.0, 5.0))
-    instance._gps_baseline_position_cb("global_position_baseline", FakePointStamped(999.0, 8.0, 4.5))
+    instance._gps_baseline_position_cb("gps_baseline", FakePointStamped(1002.0, 6.0, 5.0))
+    instance._gps_baseline_position_cb("global_baseline", FakePointStamped(999.0, 8.0, 4.5))
     instance._float_cb(FakeMsg(200.0), "disparity_px", "/stereo/disparity")
     instance._detections_cb(FakeMsg([1, 690, 380, 710, 400, 0.9, 700, 390, 1, 680, 380, 700, 400, 0.8, 690, 390]))
     instance._profile_status_cb(FakeMsg(json.dumps({"profile_id": "installed_smoke", "profile_mode": "sim3", "fallback_level": 0})))
@@ -203,15 +203,13 @@ def run(argv: Sequence[str] | None = None) -> dict[str, object]:
         "schema_audit_status": audit_payload.get("status", ""),
         "schema_audit_valid_row_count": audit_payload.get("valid_row_count", 0),
         "first_row_has_axis_contract": "axis_contract" in first_row,
-        "first_row_raw_forward_m": first_row.get("raw_forward_m", ""),
+        "first_row_nominal_pose_forward_m": first_row.get("nominal_pose_forward_m", ""),
         "first_row_corrected_forward_m": first_row.get("corrected_forward_m", ""),
         "first_row_raw_disparity_px": first_row.get("raw_disparity_px", ""),
-        "first_row_raw_gps_baseline_forward_m": first_row.get("raw_gps_baseline_forward_m", ""),
-        "first_row_global_position_baseline_forward_m": first_row.get(
-            "global_position_baseline_forward_m", ""
-        ),
-        "first_row_raw_minus_global_baseline_delta_m": first_row.get(
-            "raw_minus_global_baseline_delta_m", ""
+        "first_row_gps_baseline_forward_m": first_row.get("gps_baseline_forward_m", ""),
+        "first_row_global_baseline_forward_m": first_row.get("global_baseline_forward_m", ""),
+        "first_row_gps_baseline_minus_global_baseline_delta_m": first_row.get(
+            "gps_baseline_minus_global_baseline_delta_m", ""
         ),
         "probe_returncode": probe.returncode,
         "probe_stderr": probe.stderr[-4000:],
