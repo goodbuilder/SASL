@@ -6330,8 +6330,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(8)
 
-        settings_group = QtWidgets.QGroupBox("GNSS Base 설정")
-        settings_form = QtWidgets.QGridLayout(settings_group)
         operation_config = self.settings.gnss_operation
         self.gnss_operation_mode_combo = QtWidgets.QComboBox()
         self.gnss_operation_mode_combo.addItem("현장 Base Survey-in", GnssOperationMode.LOCAL_SURVEY_IN.value)
@@ -6384,26 +6382,42 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_rtcm_target_combo.addItem("Left Pixhawk", "left")
         self.gnss_base_rtcm_target_combo.addItem("Right Pixhawk", "right")
         self._set_combo_data(self.gnss_base_rtcm_target_combo, self.settings.gnss_base_rtcm_injection_target)
-        settings_items = (
-            ("GNSS 운용 모드", self.gnss_operation_mode_combo),
-            ("Base serial port", self.gnss_base_serial_port_edit),
-            ("Baudrate", self.gnss_base_baud_spin),
-            ("Survey-in 최소 시간(s)", self.gnss_base_survey_duration_spin),
-            ("Survey-in 목표 정확도(m)", self.gnss_base_survey_accuracy_spin),
-            ("RTCM 주입 대상", self.gnss_base_rtcm_target_combo),
-            ("NTRIP caster host", self.gnss_ntrip_host_edit),
-            ("NTRIP port", self.gnss_ntrip_port_spin),
-            ("NTRIP mountpoint", self.gnss_ntrip_mountpoint_edit),
-            ("NTRIP username 환경변수", self.gnss_ntrip_username_env_edit),
-            ("NTRIP password 환경변수", self.gnss_ntrip_password_env_edit),
-            ("NTRIP GGA 정책", self.gnss_ntrip_gga_policy_combo),
-            ("Fixed Base 높이 기준", self.gnss_fixed_height_combo),
-            ("Fixed 좌표 수집 시간(s)", self.gnss_fixed_acquisition_duration_spin),
-            ("Fixed 상태 최소 시간(s)", self.gnss_fixed_min_duration_spin),
-        )
-        for row, (title, widget) in enumerate(settings_items):
-            settings_form.addWidget(QtWidgets.QLabel(title), row, 0)
-            settings_form.addWidget(widget, row, 1)
+
+        def add_setting(form: QtWidgets.QGridLayout, row: int, title: str, widget: QtWidgets.QWidget) -> None:
+            form.addWidget(QtWidgets.QLabel(title), row, 0)
+            form.addWidget(widget, row, 1)
+            form.setColumnStretch(1, 1)
+
+        self.gnss_common_config_group = QtWidgets.QGroupBox("GNSS 운용")
+        common_form = QtWidgets.QGridLayout(self.gnss_common_config_group)
+        add_setting(common_form, 0, "GNSS 운용 모드", self.gnss_operation_mode_combo)
+        add_setting(common_form, 1, "RTCM 주입 대상", self.gnss_base_rtcm_target_combo)
+
+        self.gnss_base_config_group = QtWidgets.QGroupBox("Base Serial 설정")
+        base_config_form = QtWidgets.QGridLayout(self.gnss_base_config_group)
+        add_setting(base_config_form, 0, "Base serial port", self.gnss_base_serial_port_edit)
+        add_setting(base_config_form, 1, "Baudrate", self.gnss_base_baud_spin)
+
+        self.gnss_survey_config_group = QtWidgets.QGroupBox("Local Survey-in 설정")
+        survey_config_form = QtWidgets.QGridLayout(self.gnss_survey_config_group)
+        add_setting(survey_config_form, 0, "Survey-in 최소 시간(s)", self.gnss_base_survey_duration_spin)
+        add_setting(survey_config_form, 1, "Survey-in 목표 정확도(m)", self.gnss_base_survey_accuracy_spin)
+
+        self.gnss_network_config_group = QtWidgets.QGroupBox("NTRIP Network 설정")
+        network_config_form = QtWidgets.QGridLayout(self.gnss_network_config_group)
+        add_setting(network_config_form, 0, "NTRIP caster host", self.gnss_ntrip_host_edit)
+        add_setting(network_config_form, 1, "NTRIP port", self.gnss_ntrip_port_spin)
+        add_setting(network_config_form, 2, "NTRIP mountpoint", self.gnss_ntrip_mountpoint_edit)
+        add_setting(network_config_form, 3, "NTRIP username 환경변수", self.gnss_ntrip_username_env_edit)
+        add_setting(network_config_form, 4, "NTRIP password 환경변수", self.gnss_ntrip_password_env_edit)
+        add_setting(network_config_form, 5, "NTRIP GGA 정책", self.gnss_ntrip_gga_policy_combo)
+
+        self.gnss_fixed_config_group = QtWidgets.QGroupBox("Fixed Base 설정")
+        fixed_config_form = QtWidgets.QGridLayout(self.gnss_fixed_config_group)
+        add_setting(fixed_config_form, 0, "Fixed Base 높이 기준", self.gnss_fixed_height_combo)
+        add_setting(fixed_config_form, 1, "Fixed 좌표 수집 시간(s)", self.gnss_fixed_acquisition_duration_spin)
+        add_setting(fixed_config_form, 2, "Fixed 상태 최소 시간(s)", self.gnss_fixed_min_duration_spin)
+
         self.gnss_base_connect_button = QtWidgets.QPushButton("Base 연결")
         self.gnss_base_connect_button.clicked.connect(self.connect_gnss_base_serial)
         self.gnss_base_disconnect_button = QtWidgets.QPushButton("연결 해제")
@@ -6435,7 +6449,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         button_row.addWidget(self.gnss_network_stop_button)
         button_row.addWidget(self.gnss_base_apply_candidate_button)
         button_row.addStretch(1)
-        settings_form.addLayout(button_row, len(settings_items), 0, 1, 2)
+        self.gnss_base_control_group = QtWidgets.QGroupBox("GNSS 운용 제어")
+        self.gnss_base_control_group.setLayout(button_row)
 
         self.gnss_base_candidate_table = QtWidgets.QTableWidget(0, 5)
         self.gnss_base_candidate_table.setHorizontalHeaderLabels(["Port", "Target", "Baud", "상태", "UBX 메시지"])
@@ -6447,7 +6462,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_candidate_table.itemSelectionChanged.connect(self._refresh_gnss_base_candidate_actions)
         gnss_candidate_header = self.gnss_base_candidate_table.horizontalHeader()
         gnss_candidate_header.setSectionResizeMode(QtWidgets.QHeaderView.Stretch)
-        settings_form.addWidget(self.gnss_base_candidate_table, len(settings_items) + 1, 0, 1, 2)
+        self.gnss_base_candidate_group = QtWidgets.QGroupBox("Base 포트 후보")
+        candidate_layout = QtWidgets.QVBoxLayout(self.gnss_base_candidate_group)
+        candidate_layout.addWidget(self.gnss_base_candidate_table)
+
+        content_layout.addWidget(self.gnss_common_config_group)
+        content_layout.addWidget(self.gnss_base_config_group)
+        content_layout.addWidget(self.gnss_survey_config_group)
+        content_layout.addWidget(self.gnss_network_config_group)
+        content_layout.addWidget(self.gnss_fixed_config_group)
+        content_layout.addWidget(self.gnss_base_control_group)
+        content_layout.addWidget(self.gnss_base_candidate_group)
 
         base_group = QtWidgets.QGroupBox("GNSS Base 연결")
         base_group.setObjectName("gnssBaseConnectionGroup")
@@ -6536,6 +6561,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         survey_layout.addLayout(survey_plot_row)
 
         quality_group = QtWidgets.QGroupBox("Survey-in 품질 진단")
+        self.gnss_survey_quality_group = quality_group
         quality_grid = QtWidgets.QGridLayout(quality_group)
         quality_items = (
             ("satellites", "위성", "NAV-SAT 대기 중"),
@@ -6559,10 +6585,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         note.setWordWrap(True)
         note.setObjectName("statusStrip")
 
-        content_layout.addWidget(settings_group)
         content_layout.addWidget(base_group)
         content_layout.addWidget(rtcm_group)
         content_layout.addWidget(rover_group)
+        self.gnss_survey_progress_group = survey_group
         content_layout.addWidget(survey_group)
         content_layout.addWidget(quality_group)
         content_layout.addWidget(note)
@@ -7710,11 +7736,44 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         mode = self._gnss_selected_operation_mode()
         local_mode = mode == GnssOperationMode.LOCAL_SURVEY_IN
+        assisted_fixed_mode = mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE
         serial_allowed = mode in {
             GnssOperationMode.LOCAL_SURVEY_IN,
             GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
         }
         network_allowed = not local_mode
+
+        # Keep the settings page focused on the currently selected correction
+        # path.  The underlying widgets remain alive so persisted settings and
+        # the existing operation-config builder keep their stable interface.
+        visibility = (
+            ("gnss_base_config_group", serial_allowed),
+            ("gnss_survey_config_group", local_mode),
+            ("gnss_network_config_group", network_allowed),
+            ("gnss_fixed_config_group", assisted_fixed_mode),
+            ("gnss_base_candidate_group", serial_allowed),
+            ("gnss_survey_progress_group", local_mode),
+            ("gnss_survey_quality_group", local_mode),
+        )
+        for name, visible in visibility:
+            group = getattr(self, name, None)
+            if group is not None:
+                group.setVisible(visible)
+
+        for name, visible in (
+            ("gnss_base_discover_button", serial_allowed),
+            ("gnss_base_connect_button", serial_allowed),
+            ("gnss_base_disconnect_button", serial_allowed),
+            ("gnss_base_survey_start_button", local_mode),
+            ("gnss_base_survey_stop_button", local_mode),
+            ("gnss_network_start_button", network_allowed),
+            ("gnss_network_stop_button", network_allowed),
+            ("gnss_base_apply_candidate_button", serial_allowed),
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setVisible(visible)
+
         if hasattr(self, "gnss_base_connect_button"):
             self.gnss_base_connect_button.setEnabled(serial_allowed and self.gnss_base_serial_thread is None)
         if hasattr(self, "gnss_base_discover_button"):
@@ -9315,6 +9374,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _build_single_pixhawk_sensor_tab(self, layout: QtWidgets.QVBoxLayout, camera: str, title: str) -> None:
         layout.setSpacing(8)
+
         top_row = QtWidgets.QHBoxLayout()
         top_row.setSpacing(8)
 

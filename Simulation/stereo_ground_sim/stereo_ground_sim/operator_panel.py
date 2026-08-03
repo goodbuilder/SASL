@@ -42,6 +42,7 @@ try:
     from geometry_msgs.msg import PointStamped
     from sensor_msgs.msg import Image
     from std_msgs.msg import Float32, Float32MultiArray, String
+    from std_srvs.srv import Trigger
 except Exception:  # pragma: no cover - rqt can still load the widget shell.
     rclpy = None
     ParameterType = None
@@ -53,11 +54,13 @@ except Exception:  # pragma: no cover - rqt can still load the widget shell.
     Float32 = None
     Float32MultiArray = None
     String = None
+    Trigger = None
 
 try:
-    from px4_msgs.msg import SensorGps, VehicleGlobalPosition, VehicleOdometry
+    from px4_msgs.msg import SensorGps, VehicleAttitude, VehicleGlobalPosition, VehicleOdometry
 except Exception:  # pragma: no cover - PX4 messages are optional for the rqt shell.
     SensorGps = None
+    VehicleAttitude = None
     VehicleGlobalPosition = None
     VehicleOdometry = None
 
@@ -70,7 +73,7 @@ AXES = (
 )
 SERIES = (
     ("truth", "/ground_truth_position", QColor(55, 71, 79)),
-    ("nominal_pose", "/stereo/nominal_pose_position", QColor(220, 32, 32)),
+    ("nominal_pose", "/stereo/nominal_pose_plot", QColor(220, 32, 32)),
     ("optical_pose", "/stereo/optical_pose_position", QColor(0, 170, 170)),
     ("ideal", "/stereo/ideal_position", QColor(32, 86, 255)),
     ("gps_baseline", "/stereo/gps_baseline_position", QColor(235, 135, 0)),
@@ -112,6 +115,12 @@ IMAGE_TOPICS = (
         "/right_camera/image" if _IMAGE_TOPIC_MODE == "raw" else "/right_camera/detection_image",
     ),
 )
+PX4_ATTITUDE_TOPICS = {
+    "left": os.environ.get("PX4_ATTITUDE_LEFT_TOPIC", "/camera_left/fmu/out/vehicle_attitude").strip()
+    or "/camera_left/fmu/out/vehicle_attitude",
+    "right": os.environ.get("PX4_ATTITUDE_RIGHT_TOPIC", "/camera_right/fmu/out/vehicle_attitude").strip()
+    or "/camera_right/fmu/out/vehicle_attitude",
+}
 try:
     PLOT_WINDOW_S = max(1.0, float(os.environ.get("RQT_PLOT_WINDOW_S", "30.0")))
 except ValueError:
@@ -177,8 +186,10 @@ class PanelBridge(QObject):
     px4_raw_gps = Signal(str, object)
     px4_global_position = Signal(str, object)
     px4_odometry = Signal(str, object)
+    px4_attitude = Signal(str, object)
     status = Signal(str)
     runtime_parameters = Signal(str)
+    respawn_finished = Signal()
 
 
 class CameraView(QLabel):
@@ -524,6 +535,7 @@ class RayDiagnosticsPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._last_pair_id = None
+        self._actual_attitude_samples = {"left": None, "right": None}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -682,6 +694,41 @@ class RayDiagnosticsPanel(QWidget):
         attitude_grid.addWidget(self._attitude_quaternion_label, len(attitude_rows), 0, 1, 2)
         layout.addWidget(attitude_box)
 
+        actual_box = QGroupBox("Published VehicleAttitude (actual)")
+        actual_box.setToolTip(
+            "Direct subscription to the left/right PX4 VehicleAttitude topics. "
+            "Values are the messages actually received by this panel, not the configured injection values."
+        )
+        actual_grid = QGridLayout(actual_box)
+        actual_headers = (
+            "Camera", "R/P/Y [deg] (PX4 NED)", "Quaternion [w,x,y,z]",
+            "PX4 timestamp_sample [us]", "Receive age [ms]", "Reset counter", "Topic",
+        )
+        for column, name in enumerate(actual_headers):
+            header = QLabel(name)
+            header.setStyleSheet("font-weight: 600;")
+            header.setFixedHeight(22)
+            actual_grid.addWidget(header, 0, column)
+        for column, width in ((1, 140), (2, 220), (3, 150), (4, 90), (5, 90), (6, 330)):
+            actual_grid.setColumnMinimumWidth(column, width)
+        self._actual_attitude_fields = {"left": {}, "right": {}}
+        for row, side in enumerate(("left", "right"), start=1):
+            actual_grid.addWidget(QLabel(side.capitalize()), row, 0)
+            actual_grid.setRowMinimumHeight(row, 24)
+            fields = self._actual_attitude_fields[side]
+            for column, key in enumerate(
+                ("rpy", "quaternion", "timestamp", "age", "reset", "topic"), start=1
+            ):
+                value_label = QLabel("—")
+                value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value_label.setWordWrap(False)
+                value_label.setFixedHeight(22)
+                actual_grid.addWidget(value_label, row, column)
+                fields[key] = value_label
+        actual_grid.setColumnStretch(2, 1)
+        actual_grid.setColumnStretch(6, 1)
+        layout.addWidget(actual_box)
+
         # Fixed for the whole run (see the Setup tab's PX4 Attitude Error
         # Injection group for the full tooltip / how to change it).
         self._attitude_fields["Model"].setText("optical_derived_body_attitude_v1")
@@ -719,6 +766,44 @@ class RayDiagnosticsPanel(QWidget):
         if not isinstance(data, dict):
             return
         self._refresh(data)
+
+    def update_actual_attitude(self, side, msg):
+        """Render the raw left/right VehicleAttitude stream received by RQT."""
+        if side not in self._actual_attitude_fields:
+            return
+        try:
+            quaternion = _finite_tuple(getattr(msg, "q", ()), 4)
+            rpy = _rpy_deg_from_rotation(_rotation_from_wxyz(quaternion))
+        except (TypeError, ValueError, IndexError, AttributeError):
+            return
+        timestamp_sample_us = getattr(msg, "timestamp_sample", None)
+        if timestamp_sample_us in (None, 0):
+            timestamp_sample_us = getattr(msg, "timestamp", None)
+        reset_counter = getattr(msg, "quat_reset_counter", None)
+        self._actual_attitude_samples[side] = {
+            "rpy": rpy,
+            "quaternion": quaternion,
+            "timestamp_sample_us": timestamp_sample_us,
+            "receive_monotonic_ns": time.monotonic_ns(),
+            "reset_counter": reset_counter,
+            "topic": PX4_ATTITUDE_TOPICS[side],
+        }
+        self._refresh_actual_attitude(side)
+
+    def _refresh_actual_attitude(self, side):
+        sample = self._actual_attitude_samples.get(side)
+        if not sample:
+            return
+        fields = self._actual_attitude_fields[side]
+        fields["rpy"].setText(" / ".join(f"{value:+.3f}" for value in sample["rpy"]))
+        fields["quaternion"].setText(
+            "(" + ", ".join(f"{value:+.8f}" for value in sample["quaternion"]) + ")"
+        )
+        fields["timestamp"].setText(_fmt_int(sample["timestamp_sample_us"]))
+        age_ms = max(0.0, time.monotonic_ns() - sample["receive_monotonic_ns"]) / 1.0e6
+        fields["age"].setText(f"{age_ms:.1f}")
+        fields["reset"].setText(_fmt_int(sample["reset_counter"]))
+        fields["topic"].setText(sample["topic"])
 
     # -- rendering ------------------------------------------------------
 
@@ -1990,6 +2075,8 @@ class OperatorPanel(Plugin):
         self._ros_node = None
         self._parameter_get_client = None
         self._parameter_list_client = None
+        self._respawn_client = None
+        self._respawn_pending = False
         self._ros_graph_process = None
         self._spin_thread = None
         self._stop_event = threading.Event()
@@ -2038,8 +2125,10 @@ class OperatorPanel(Plugin):
         self._bridge.px4_raw_gps.connect(self._handle_px4_raw_gps)
         self._bridge.px4_global_position.connect(self._handle_px4_global_position)
         self._bridge.px4_odometry.connect(self._handle_px4_odometry)
+        self._bridge.px4_attitude.connect(self._ray_diagnostics.update_actual_attitude)
         self._bridge.status.connect(self._set_status)
         self._bridge.runtime_parameters.connect(self._set_runtime_parameters)
+        self._bridge.respawn_finished.connect(self._on_respawn_finished)
         self._init_ros()
         # A perspective can restore its previously active tab after the plugin
         # constructor returns. Defer the pre-flight default until that restore
@@ -2116,6 +2205,12 @@ class OperatorPanel(Plugin):
         cameras.addWidget(self._left_view, 0, 0)
         cameras.addWidget(self._right_view, 0, 1)
         layout.addLayout(cameras)
+        self._respawn_button = QPushButton("Respawn Drone")
+        self._respawn_button.setToolTip(
+            "Teleport the target drone to the configured launch pose in Gazebo."
+        )
+        self._respawn_button.clicked.connect(self._respawn_drone)
+        layout.addWidget(self._respawn_button)
         layout.addWidget(self._facts)
         layout.addWidget(self._status)
         layout.addWidget(self._ray_diagnostics)
@@ -2194,7 +2289,7 @@ class OperatorPanel(Plugin):
         self._debug_label.setText(
             f"Status: {text}\n"
             f"Images: {IMAGE_TOPICS[0][1]}, {IMAGE_TOPICS[1][1]}\n"
-            "Series: /ground_truth_position, /stereo/nominal_pose_position (Nominal Pose), "
+            "Series: /ground_truth_position, /stereo/nominal_pose_plot (Nominal Pose), "
             "/stereo/optical_pose_position (Optical Pose), /stereo/ideal_position (Ideal), "
             "/stereo/gps_baseline_position (GPS Baseline); Global Baseline/Attitude/Operational "
             "from /stereo/ray_metrics\n"
@@ -2297,7 +2392,7 @@ class OperatorPanel(Plugin):
             rclpy is None or ParameterType is None or GetParameters is None
             or ListParameters is None
             or Image is None or PointStamped is None or Float32 is None
-            or Float32MultiArray is None or String is None
+            or Float32MultiArray is None or String is None or Trigger is None
         ):
             self._status.setText("ROS imports unavailable; operator panel cannot subscribe.")
             return
@@ -2310,6 +2405,9 @@ class OperatorPanel(Plugin):
             )
             self._parameter_list_client = self._ros_node.create_client(
                 ListParameters, "/stereo_distance_node/list_parameters"
+            )
+            self._respawn_client = self._ros_node.create_client(
+                Trigger, "/stereo/respawn_drone"
             )
             self._ros_node.create_subscription(
                 Image,
@@ -2403,6 +2501,14 @@ class OperatorPanel(Plugin):
                         lambda msg, label=label: self._bridge.px4_odometry.emit(label, msg),
                         qos_profile_sensor_data,
                     )
+            if VehicleAttitude is not None:
+                for label, topic in PX4_ATTITUDE_TOPICS.items():
+                    self._ros_node.create_subscription(
+                        VehicleAttitude,
+                        topic,
+                        lambda msg, label=label: self._bridge.px4_attitude.emit(label, msg),
+                        qos_profile_sensor_data,
+                    )
             self._spin_thread = threading.Thread(target=self._spin_loop, daemon=True)
             self._spin_thread.start()
             self._request_runtime_parameters()
@@ -2410,7 +2516,39 @@ class OperatorPanel(Plugin):
             self._ros_node = None
             self._parameter_get_client = None
             self._parameter_list_client = None
+            self._respawn_client = None
             self._status.setText(f"Operator panel subscribe failed: {exc}")
+
+    def _respawn_drone(self):
+        if self._respawn_pending:
+            self._bridge.status.emit("Drone respawn is already in progress.")
+            return
+        if self._respawn_client is None:
+            self._bridge.status.emit("Respawn service is unavailable.")
+            return
+        if not self._respawn_client.service_is_ready():
+            self._bridge.status.emit("Respawn service is not ready yet.")
+            return
+        self._respawn_pending = True
+        self._respawn_button.setEnabled(False)
+        self._bridge.status.emit("Respawning drone at the configured launch pose…")
+        future = self._respawn_client.call_async(Trigger.Request())
+        future.add_done_callback(self._finish_respawn_drone)
+
+    def _on_respawn_finished(self):
+        self._respawn_button.setEnabled(True)
+
+    def _finish_respawn_drone(self, future):
+        try:
+            result = future.result()
+            message = str(getattr(result, "message", "respawn complete"))
+            if not bool(getattr(result, "success", False)):
+                message = f"Respawn failed: {message}"
+        except Exception as exc:
+            message = f"Respawn failed: {exc}"
+        self._respawn_pending = False
+        self._bridge.status.emit(message)
+        self._bridge.respawn_finished.emit()
 
     def _request_runtime_parameters(self):
         if self._parameter_list_client is None or ListParameters is None:

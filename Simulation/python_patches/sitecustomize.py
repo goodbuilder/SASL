@@ -106,7 +106,7 @@ def _patch_rqt_plot_default_topics():
             axis_label = "Forward"
             topics = [
                 "/ground_truth_position/data[0]",
-                "/stereo/nominal_pose_position/data[0]",
+                "/stereo/nominal_pose_plot/data[0]",
                 "/stereo/optical_pose_position/data[0]",
                 "/stereo/ideal_position/data[0]",
                 "/stereo/gps_baseline_plot/data[0]",
@@ -116,7 +116,7 @@ def _patch_rqt_plot_default_topics():
             axis_label = "Right"
             topics = [
                 "/ground_truth_position/data[1]",
-                "/stereo/nominal_pose_position/data[1]",
+                "/stereo/nominal_pose_plot/data[1]",
                 "/stereo/optical_pose_position/data[1]",
                 "/stereo/ideal_position/data[1]",
                 "/stereo/gps_baseline_plot/data[1]",
@@ -126,7 +126,7 @@ def _patch_rqt_plot_default_topics():
             axis_label = "Down"
             topics = [
                 "/ground_truth_position/data[2]",
-                "/stereo/nominal_pose_position/data[2]",
+                "/stereo/nominal_pose_plot/data[2]",
                 "/stereo/optical_pose_position/data[2]",
                 "/stereo/ideal_position/data[2]",
                 "/stereo/gps_baseline_plot/data[2]",

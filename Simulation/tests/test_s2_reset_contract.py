@@ -75,3 +75,10 @@ def test_ground_truth_source_link_is_parameterized_and_launch_uses_target_model(
     ).read_text(encoding="utf-8")
     assert '"parent_model_name": LaunchConfiguration("target_model_name")' in launch
     assert '"source_link_name": ""' in launch
+    for parameter in (
+        "target_spawn_x_m",
+        "target_spawn_y_m",
+        "target_spawn_z_m",
+        "target_spawn_yaw_deg",
+    ):
+        assert f'"{parameter}"' in launch

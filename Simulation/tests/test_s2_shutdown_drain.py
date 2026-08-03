@@ -73,7 +73,7 @@ def test_production_worker_drains_ten_gt_unavailable_measurements() -> None:
     node.last_raw_published_pair_id = 0
     node.last_corrected_published_pair_id = 0
     node.gt_published_pair_ids = BoundedIdHistory(128)
-    node.raw_position_pub = CapturePublisher()
+    node.nominal_pose_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.canonical_ground_truth_position_pub = CapturePublisher()
     node.raw_computed_count = 0
@@ -163,7 +163,7 @@ def test_production_worker_drains_ten_gt_unavailable_measurements() -> None:
     assert node.shutdown_drain_status == "SUCCESS"
     assert sorted(processed) == list(range(1, 11))
     assert node.gt_alignment_counts["unavailable"] == 10
-    assert len(node.raw_position_pub.messages) == 10
+    assert len(node.nominal_pose_position_pub.messages) == 10
     assert len(node.attitude_corrected_position_pub.messages) == 10
     assert node.canonical_ground_truth_position_pub.messages == []
     assert node.measurement_pair_queue == deque()

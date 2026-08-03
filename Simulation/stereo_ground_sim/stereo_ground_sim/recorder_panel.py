@@ -603,7 +603,7 @@ class RecorderPanel(Plugin):
                 ),
                 self._ros_node.create_subscription(
                     Float32MultiArray,
-                    "/stereo/nominal_pose_position",
+                    "/stereo/nominal_pose_plot",
                     lambda msg: self._set_frd("nominal_pose_frd", msg.data),
                     10,
                 ),

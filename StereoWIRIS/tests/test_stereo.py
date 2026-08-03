@@ -490,6 +490,54 @@ def test_gnss_base_rtcm_frame_routes_to_selected_rovers(monkeypatch) -> None:
     _ = app
 
 
+def test_gnss_operation_mode_changes_visible_settings(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import GnssOperationMode
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.LOCAL_SURVEY_IN.value)
+    assert not widget.gnss_base_config_group.isHidden()
+    assert not widget.gnss_survey_config_group.isHidden()
+    assert widget.gnss_network_config_group.isHidden()
+    assert widget.gnss_fixed_config_group.isHidden()
+    assert not widget.gnss_base_candidate_group.isHidden()
+    assert not widget.gnss_survey_progress_group.isHidden()
+    assert not widget.gnss_survey_quality_group.isHidden()
+    assert not widget.gnss_base_survey_start_button.isHidden()
+    assert widget.gnss_network_start_button.isHidden()
+
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value)
+    assert not widget.gnss_base_config_group.isHidden()
+    assert widget.gnss_survey_config_group.isHidden()
+    assert not widget.gnss_network_config_group.isHidden()
+    assert not widget.gnss_fixed_config_group.isHidden()
+    assert not widget.gnss_base_candidate_group.isHidden()
+    assert widget.gnss_survey_progress_group.isHidden()
+    assert widget.gnss_survey_quality_group.isHidden()
+    assert widget.gnss_base_survey_start_button.isHidden()
+    assert not widget.gnss_network_start_button.isHidden()
+
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_RTK_DIRECT.value)
+    assert widget.gnss_base_config_group.isHidden()
+    assert widget.gnss_survey_config_group.isHidden()
+    assert not widget.gnss_network_config_group.isHidden()
+    assert widget.gnss_fixed_config_group.isHidden()
+    assert widget.gnss_base_candidate_group.isHidden()
+    assert widget.gnss_survey_progress_group.isHidden()
+    assert widget.gnss_survey_quality_group.isHidden()
+    assert widget.gnss_base_connect_button.isHidden()
+    assert not widget.gnss_network_start_button.isHidden()
+
+    widget.close()
+    widget.deleteLater()
+    _ = app
+
+
 def test_network_rtk_direct_routes_ntrip_rtcm_without_base_serial(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 

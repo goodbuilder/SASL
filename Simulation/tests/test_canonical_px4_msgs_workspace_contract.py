@@ -14,11 +14,22 @@ def test_operator_view_consumes_only_the_canonical_px4_msgs_overlay() -> None:
 
     assert 'SASL_ROS_WORKSPACE="${SASL_ROS_WORKSPACE:-$INTEGRATION_ROOT/workspace/main}"' in source
     assert 'source "$PX4_MSGS_OVERLAY_SETUP"' in source
+    assert 'PX4_MSGS_PACKAGE_SETUP="$SASL_ROS_WORKSPACE/install/px4_msgs/share/px4_msgs/local_setup.bash"' in source
+    assert 'source "$PX4_MSGS_PACKAGE_SETUP"' in source
     assert "86d8239e962f6939e05c3737784f60c02fa884db" in source
     assert "PX4_MSGS_OVERLAY_MANIFEST" in source
     assert '--packages-select stereo_ground_sim stereo_ground_sim_overlay' in source
     assert '--packages-select px4_msgs stereo_ground_sim' not in source
     assert '"$ROOT_DIR/px4_msgs"' not in source
+
+
+def test_operator_view_guards_sensor_gps_cdr_definition_alignment() -> None:
+    source = (SIMULATION_ROOT / "run_operator_view.sh").read_text(encoding="utf-8")
+
+    assert "require_sensor_gps_definition_match" in source
+    assert 'px4_sensor_gps="$PX4_DIR/msg/SensorGps.msg"' in source
+    assert 'ros_sensor_gps="$PX4_MSGS_SOURCE_DIR/msg/SensorGps.msg"' in source
+    assert 'cmp -s "$px4_sensor_gps" "$ros_sensor_gps"' in source
 
 
 def test_machine_local_px4_artifacts_are_ignored() -> None:

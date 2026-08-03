@@ -15,7 +15,7 @@ DEFAULT_TOPICS = {
     "right_image_topic": "/stereo/right/image_raw",
     "bbox_topic": "/stereo/detections",
     "disparity_topic": "/stereo/disparity",
-    "nominal_pose_topic": "/stereo/nominal_pose_position",
+    "nominal_pose_topic": "/stereo/nominal_pose_plot",
     "corrected_position_topic": "/stereo/corrected_position",
 }
 

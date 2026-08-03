@@ -356,12 +356,13 @@ Raw는 nominal pose, `/stereo/attitude_corrected_position`은 injected actual po
 ray를 다시 생성해 같은 two-ray midpoint kernel을 호출한다. correction source는
 `injected_attitude_oracle`이고 Ground Truth는 correction 입력이 아니다.
 
-Canonical `geometry_msgs/msg/PointStamped` topic은 `/stereo/raw_position`,
+Canonical `geometry_msgs/msg/PointStamped` topic은 `/stereo/nominal_pose_position`,
 `/stereo/attitude_corrected_position`, `/stereo/ground_truth_position`이다. 모두
 pair midpoint simulation stamp, `frame_id=baseline_center_frd`, point x/y/z =
 Forward/Right/Down metres를 사용한다. 기존 `/stereo/estimated_position`,
-`/ground_truth_position`, `/stereo/corrected_position`은 S3 전까지 legacy migration
-topic이며 `/stereo/corrected_position`은 injected oracle 의미가 아니다.
+`/ground_truth_position`, `/stereo/nominal_pose_plot`, `/stereo/corrected_position`은
+S3 전까지 legacy `Float32MultiArray` migration topic이며
+`/stereo/corrected_position`은 injected oracle 의미가 아니다.
 Raw와 attitude-corrected는 measurement 완료 직후 발행하고, Ground Truth는 같은
 pair midpoint의 exact/interpolated/explicit nearest alignment가 준비된 뒤 발행한다.
 
@@ -5656,7 +5657,7 @@ Replay 출력:
 `x500_15m`는 카메라 전방 +Y 약 2000 m 지점에서 yaw -90도로 스폰되어, QGC/PX4에서 전진 명령을 주면 카메라 방향으로 접근합니다. 스테레오 베이스라인은 X축 방향입니다.
 Gazebo 3D GUI에서는 카메라 뒤에서 전방 +Y를 바라보는 운용자 기준으로 왼쪽 카메라는 world X 음수 위치의 파란색 본체, 오른쪽 카메라는 world X 양수 위치의 빨간색 본체로 표시됩니다. 카메라 모델 원점은 실제 sensor optical center이며, 렌즈 visual의 앞면이 이 원점에 맞춰집니다.
 `rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, Truth/Nominal Pose/Optical Pose FRD, 좌표 계약을 표시합니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
-Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), Nominal Pose(`/stereo/nominal_pose_position`), Optical Pose(`/stereo/optical_pose_position`)를 비교합니다. 축 계약은 StereoDistance와 같은 비교 계약으로 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다.
+Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), Nominal Pose(`/stereo/nominal_pose_plot`), Optical Pose(`/stereo/optical_pose_position`)를 비교합니다. 배열 축 계약은 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다. 정식 Nominal Pose는 별도 `PointStamped` 토픽 `/stereo/nominal_pose_position`이며 `frame_id=baseline_center_frd`, `point.x/y/z=Forward/Right/Down [m]`입니다.
 Gazebo visible 카메라 센서는 기본 20 Hz(`CAMERA_UPDATE_RATE_HZ=20.0`), 1280x720이며 frame interval은 50,000,000 ns입니다. Ground Truth는 별도 adapter가 raw `Pose_V`의 simulation stamp를 보존해 발행하고, S1의 비교 frame은 고정 `baseline_center_frd`입니다. 이전 model-origin/Down offset 설명은 폐기된 historical 기록이며 active 경로에서 사용하지 않습니다. 거리/오차 그래프 및 overlay timer는 이 Phase의 camera-rate contract와 별개입니다. 기본 실행은 Gazebo 3D GUI도 함께 엽니다(`gz_gui:=true`). 카메라/그래프 Hz를 우선해 headless로 돌리려면 `gz_gui:=false`를 붙입니다.
 각 Plot의 시간축은 최근 30초 창으로 autoscroll되며, 값 축은 현재 보이는 데이터 범위에 맞춰 자동으로 다시 잡히도록 실행 시 rqt_plot 패치를 적용합니다. 시간 창 길이는 `--plot-window 30`처럼 바꿀 수 있습니다.
 기본 YOLO 설정은 `config/simulation.env`에서 읽습니다. 기본 모델은 `yolov8n_uav.pt`, class는 `UAV`, confidence는 `0.10`입니다. `.pt` 파일은 git에 넣지 않는 machine-local 입력이므로 runner는 `Simulation/`, 상위 workspace, `~/Downloads/`, `~/다운로드/` 순서로 같은 파일명을 찾습니다. 다른 PC에서는 `Simulation/yolov8n_uav.pt`를 같은 위치에 두거나 `YOLO_MODEL_PATH`/`--yolo-model`로 다른 파일을 명시합니다. 이 설정은 left/right image pixel bbox detector만 바꾸며, `/ground_truth_position`과 거리 토픽의 stereo-center FRD 축 계약은 바꾸지 않습니다.
@@ -5803,7 +5804,13 @@ activate할 필요가 없습니다. 다른 Python을 강제할 때는
 ./run_auto_mission.sh --check-connection
 ```
 
-`./run_operator_view.sh`의 기본값은 `gz_gui:=true`, `launch_rviz:=true`입니다. 기본 실행에서 Gazebo 3D GUI, rqt 카메라/그래프 창, RViz가 함께 뜹니다.
+`./run_operator_view.sh`의 기본값은 `gz_gui:=false`, `launch_rviz:=true`입니다. 기본 실행에서 Gazebo server, rqt 카메라/그래프 창, RViz가 함께 뜹니다. Gazebo 3D GUI까지 열려면 `--gazebo-gui` 또는 `gz_gui:=true`를 사용합니다.
+
+rqt의 `Flight` 탭에서 `Respawn Drone`을 누르면 target model이
+`target_spawn_x_m`, `target_spawn_y_m`, `target_spawn_z_m`,
+`target_spawn_yaw_deg`로 지정한 launch pose로 Gazebo에서 재배치됩니다.
+서비스가 완료되면 버튼이 다시 활성화되며, 이 동작은 Gazebo pose만 바꾸고
+PX4 estimator를 재부팅하지 않습니다.
 
 RViz와 ray metrics의 사용자 표시 이름은 `Raw`, `Truth`, `Ideal`, `GPS`,
 `Global`, `Attitude`, `Baseline`, `Full`입니다. `Truth`는 target Ground
@@ -5822,6 +5829,12 @@ GNSS antenna–optical-center lever arm을 보정하지 않습니다. attitude �
 좌우 skew는 `PX4_ATTITUDE_MAX_AGE_S`, `PX4_ATTITUDE_PAIR_SKEW_S`로
 조정하며, invalid/stale 입력은 nominal로 fallback하지 않습니다.
 RViz를 끄려면 `launch_rviz:=false`를 명시합니다.
+
+`gz_gui:=false`로 실행해도 Gazebo server, PX4 SITL, MicroXRCEAgent, ROS
+launch는 계속 실행됩니다. 이 모드에서 RViz와 rqt 창을 모두 닫으면
+`run_operator_view.sh`가 GUI lifecycle watchdog으로 전체 스택을 종료합니다.
+따라서 창만 닫은 뒤 PX4/DDS 프로세스가 남지 않으며, 다음 실행 때 stale
+MicroXRCEAgent를 재사용하지 않습니다.
 
 인자를 넘길 수도 있습니다.
 
@@ -5871,6 +5884,7 @@ export GZ_CONFIG_HOME=/tmp/gz-config
 /ground_truth
 /ground_truth_position
 /stereo/nominal_pose_position
+/stereo/nominal_pose_plot
 /stereo/optical_pose_position
 /stereo/ideal_position
 /stereo/gps_baseline_position
@@ -5896,6 +5910,7 @@ ros2 topic echo /target_distance
 ros2 topic echo /ground_truth
 ros2 topic echo /ground_truth_position
 ros2 topic echo /stereo/nominal_pose_position
+ros2 topic echo /stereo/nominal_pose_plot
 ros2 topic echo /stereo/optical_pose_position
 ros2 topic echo /stereo/corrected_position
 ros2 topic echo /stereo/distance_error
@@ -5922,7 +5937,7 @@ ros2 topic echo /stereo/distance_comparison
 여기서 배열은 StereoDistance와 같은 FRD 비교 계약입니다. `data[0]`은 전방, `data[1]`은 오른쪽, `data[2]`는 아래쪽입니다. `ground_truth_m`은 카메라 위치 기준 실제 3D 직선거리이며, `estimated_range_m` 비교용입니다. `/ground_truth` 토픽과 `/stereo/distance_comparison`의 `actual_m`은 카메라 전방축 실제 거리 `forward_m`을 발행합니다.
 새 CSV에서는 `drone_forward_m/right_m/down_m`과 `nominal_pose_forward_m/right_m/down_m`을 표준으로 사용하고 legacy `x/y/z` 공개 필드는 쓰지 않습니다. 기존 CSV는 새 reader에서 허용하지 않습니다.
 
-`/stereo/nominal_pose_position` 배열 순서는 다음과 같습니다.
+`/stereo/nominal_pose_plot` 배열 순서는 다음과 같습니다.
 
 ```text
 [nominal_pose_forward_m, nominal_pose_right_m, nominal_pose_down_m, nominal_pose_range_m]
@@ -6019,7 +6034,7 @@ WAYPOINT_RECORD_LITE=true
 카메라 optical roll, pitch, yaw를 launch 인자로 바꿔가며 검증합니다.
 거리 계산 노드는 이상적인 평행 스테레오 조건에서 bbox 중심을 3D 위치로 복원하므로, RViz2와 토픽에서 자세각 오차가 3D 추정값과 거리 측정값에 주는 영향을 관찰할 수 있습니다.
 단일 `rqt_gui` 운용 창에는 좌/우 원본 카메라 영상과 하단에 상하 3단으로 쌓인 Forward/Right/Down축 실제값-raw 추정값-corrected 추정값 비교 그래프가 표시됩니다.
-그래프는 표준 `rqt_plot` 플러그인 3개로 나뉩니다. Forward Axis Plot은 `/ground_truth_position/data[0]`, `/stereo/nominal_pose_position/data[0]`, `/stereo/optical_pose_position/data[0]`, `/stereo/ideal_position/data[0]`, `/stereo/gps_baseline_plot/data[0]`를 표시합니다. 런타임 패치는 각 plot 제목과 Y축 라벨에 `Forward`, `Right`, `Down` 이름을 명시합니다.
+그래프는 표준 `rqt_plot` 플러그인 3개로 나뉩니다. Forward Axis Plot은 `/ground_truth_position/data[0]`, `/stereo/nominal_pose_plot/data[0]`, `/stereo/optical_pose_position/data[0]`, `/stereo/ideal_position/data[0]`, `/stereo/gps_baseline_plot/data[0]`를 표시합니다. 런타임 패치는 각 plot 제목과 Y축 라벨에 `Forward`, `Right`, `Down` 이름을 명시합니다.
 거리 측정은 왼쪽/오른쪽 영상에서 같은 YOLO class의 bbox 중심을 찾고, disparity와 영상 중심 오프셋으로 내부 RDF를 계산한 뒤 FRD topic 순서인 `estimated_forward_m`, `estimated_right_m`, `estimated_down_m`, `estimated_range_m`으로 발행합니다. bbox 중심 보정이 켜져 있으면 같은 순서로 `corrected_forward_m`, `corrected_right_m`, `corrected_down_m`, `corrected_range_m`도 발행합니다. 기존 거리 그래프와 `/target_distance`는 이 3D 복원 결과 중 raw 카메라 전방 거리인 `estimated_forward_m`을 사용합니다. `/ground_truth_position`의 `ground_truth_m`은 카메라 기준 FRD로 계산한 3D 직선거리이므로 `estimated_range_m` 및 `corrected_range_m`과 직접 비교합니다.
 자동 접근 실험은 QGC mission 또는 PX4용 MAVLink/offboard 명령으로 수행합니다. 이전 `./run_x500_mission.sh`의 Gazebo `cmd_vel` 방식은 현재 QGC/PX4 제어와 충돌하므로 비활성화되어 있습니다.
 
@@ -6445,3 +6460,23 @@ python3 Simulation/scripts/check_non_alias_selector_deployment_readiness.py \
 - 2026-07-28: operator `Save CSV` 세션이 기존 `telemetry.csv` 호환 원본에 더해 `session_static.json`, compact `distance_measurements.csv`, `ray_summary.csv`, `detections.csv`, `px4_uam.csv`, `px4_left.csv`, `px4_right.csv`, `session_manifest.json`을 Stop 시 생성하도록 했다. 고정 config/static mount 값은 JSON에 한 번만 저장하고, 후처리용 시간축 CSV는 최소 동적 컬럼만 담는다.
 - 2026-06-11: EXP009 `bounded_gain_forward_cell_guard` JSON profile을 StereoDistance runtime loader에서 지원하도록 추가했습니다. 보수 Down guard를 적용한 EXP013은 5-trial Simulation Runtime 검증 `PASS`이며, 아직 hardware/WIRIS 검증은 아닙니다.
 - 2026-06-09: YOLO inference 기본 입력 크기를 `1280`으로 통일했습니다.
+- 2026-08-03: `gz_gui:=false` 실행에서 RViz/rqt를 모두 닫을 때 ROS launch,
+  PX4 SITL, MicroXRCEAgent까지 함께 종료하도록 operator GUI lifecycle
+  watchdog과 cleanup을 보강했습니다. PX4 raw `SensorGps` 구독은
+  publisher의 BEST_EFFORT + TRANSIENT_LOCAL QoS를 명시적으로 사용해
+  GPS Baseline/Operational Ray가 누락되지 않도록 했습니다. PX4 SITL의
+  `msg/SensorGps.msg`도 canonical `px4_msgs v1.17.0`의
+  `antenna_offset_x/y/z` 필드와 동일하게 유지해야 DDS CDR 레이아웃이
+  일치합니다.
+- 2026-08-03: 기본 RViz live Ray 발행 주기를 `rviz_live_ray_hz:=20.0`
+  (최대 20 Hz, 약 0.05초 간격)으로 올렸습니다. 필요하면 launch 인자로
+  별도 주기를 지정할 수 있습니다.
+- 2026-08-03: `run_operator_view.sh`가 canonical `px4_msgs` 중첩 install
+  prefix의 Python environment hook도 source하도록 보강했습니다. 이 hook이
+  빠지면 `stereo_distance_node`와 카메라 pose 진단 노드가
+  `ModuleNotFoundError: px4_msgs`로 종료해 카메라 영상과 RViz Ray가 모두
+  발행되지 않습니다.
+- 2026-08-03: rqt Flight 탭에 `Respawn Drone` 버튼을 추가했습니다. 버튼은
+  `/stereo/respawn_drone` Trigger service를 호출해 Gazebo target model을
+  launch-time `target_spawn_x/y/z/yaw` pose로 되돌립니다. 이는 Gazebo 모델
+  재배치 기능이며 PX4 estimator 재부팅까지 수행하지는 않습니다.

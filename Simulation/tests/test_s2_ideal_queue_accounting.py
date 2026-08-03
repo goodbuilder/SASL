@@ -93,7 +93,7 @@ def _node():
     node.dropped_on_shutdown_pair_id_min = None
     node.dropped_on_shutdown_pair_id_max = None
     node.get_logger = lambda: _Logger()
-    node.raw_position_pub = _CapturePublisher()
+    node.nominal_pose_position_pub = _CapturePublisher()
     node.attitude_corrected_position_pub = _CapturePublisher()
     node.canonical_ground_truth_position_pub = _CapturePublisher()
     node.estimated_position_pub = _CapturePublisher()
@@ -172,7 +172,7 @@ def test_ideal_overflow_drains_accepted_pair_and_rejects_new_admission():
         publish_counts_before_pair_c = {
             name: len(getattr(node, name).messages)
             for name in (
-                "raw_position_pub",
+                "nominal_pose_position_pub",
                 "attitude_corrected_position_pub",
                 "canonical_ground_truth_position_pub",
                 "estimated_position_pub",

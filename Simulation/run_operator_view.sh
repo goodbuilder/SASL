@@ -8,6 +8,7 @@ SASL_ROS_WORKSPACE="${SASL_ROS_WORKSPACE:-$INTEGRATION_ROOT/workspace/main}"
 PX4_MSGS_SOURCE_DIR="$SASL_ROS_WORKSPACE/src/px4_msgs"
 PX4_MSGS_OVERLAY_SETUP="$SASL_ROS_WORKSPACE/install/setup.bash"
 PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/px4_msgs-overlay.env"
+PX4_MSGS_PACKAGE_SETUP="$SASL_ROS_WORKSPACE/install/px4_msgs/share/px4_msgs/local_setup.bash"
 PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
 cd "$ROOT_DIR"
 
@@ -333,6 +334,12 @@ require_canonical_px4_msgs_overlay() {
       "Run: cd $INTEGRATION_ROOT && scripts/bootstrap_ros_workspace.sh" >&2
     return 2
   fi
+  if [[ ! -f "$PX4_MSGS_PACKAGE_SETUP" ]]; then
+    printf '%s\n' \
+      "error: px4_msgs Python environment hook is not built: $PX4_MSGS_PACKAGE_SETUP" \
+      "Run: cd $INTEGRATION_ROOT && scripts/bootstrap_ros_workspace.sh" >&2
+    return 2
+  fi
   overlay_commit="$(sed -n 's/^PX4_MSGS_COMMIT=//p' "$PX4_MSGS_OVERLAY_MANIFEST" | head -n 1)"
   if [[ "$overlay_commit" != "$actual_commit" ]]; then
     printf '%s\n' \
@@ -644,6 +651,32 @@ if [[ "$PX4_ACTUAL_VERSION" != "${PX4_REQUIRED_VERSION:-v1.17.0}" ]]; then
   exit 2
 fi
 
+require_sensor_gps_definition_match() {
+  local px4_sensor_gps ros_sensor_gps
+  px4_sensor_gps="$PX4_DIR/msg/SensorGps.msg"
+  ros_sensor_gps="$PX4_MSGS_SOURCE_DIR/msg/SensorGps.msg"
+  if [[ ! -f "$px4_sensor_gps" || ! -f "$ros_sensor_gps" ]]; then
+    # Minimal launcher fixtures and older external test harnesses may not
+    # carry interface sources; the runtime workspaces do.  Keep those
+    # harnesses runnable while enforcing equality whenever both definitions
+    # are present.
+    return 0
+  fi
+  if ! cmp -s "$px4_sensor_gps" "$ros_sensor_gps"; then
+    printf '%s\n' \
+      "error: PX4 and px4_msgs SensorGps.msg definitions differ." \
+      "The DDS CDR layout must match before starting operator view." \
+      "PX4: $px4_sensor_gps" \
+      "ROS: $ros_sensor_gps" >&2
+    diff -u "$px4_sensor_gps" "$ros_sensor_gps" | sed -n '1,80p' >&2 || true
+    return 2
+  fi
+}
+
+if ! require_sensor_gps_definition_match; then
+  exit 2
+fi
+
 resolve_px4_python() {
   local candidate
   for candidate in "$@"; do
@@ -776,6 +809,7 @@ set +u
 # shellcheck disable=SC1091
 source /opt/ros/humble/setup.bash
 source "$PX4_MSGS_OVERLAY_SETUP"
+source "$PX4_MSGS_PACKAGE_SETUP"
 set -u
 
 children=()
@@ -873,6 +907,7 @@ cleanup_previous_run() {
   terminate_matching TERM "px4_auto_mission.py"
   terminate_matching TERM "make px4_sitl gz_x500"
   terminate_matching TERM "$PX4_DIR/build/px4_sitl_default/bin/px4"
+  terminate_matching TERM "MicroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}"
 
   sleep 1
 
@@ -897,6 +932,7 @@ cleanup_previous_run() {
   terminate_matching KILL "px4_auto_mission.py"
   terminate_matching KILL "make px4_sitl gz_x500"
   terminate_matching KILL "$PX4_DIR/build/px4_sitl_default/bin/px4"
+  terminate_matching KILL "MicroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}"
 
   rm -f /tmp/stereo_ground_drone_attitude_error.sdf /tmp/stereo_distance_node_params.yaml /tmp/detection_overlay_node_params.yaml
 }
@@ -922,6 +958,10 @@ cleanup() {
   terminate_matching KILL "stereo_ground_sim.detection_overlay_node"
   terminate_matching KILL "stereo_ground_sim_overlay/detection_overlay_node"
   terminate_matching KILL "detection_overlay_node --ros-args"
+  terminate_matching KILL "ros2 launch stereo_ground_sim stereo_ground_sim.launch.py"
+  terminate_matching KILL "stereo_ground_sim.stereo_distance_node"
+  terminate_matching KILL "$PX4_DIR/build/px4_sitl_default/bin/px4"
+  terminate_matching KILL "MicroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}"
   terminate_matching KILL "^gz sim server$"
   terminate_matching KILL "^gz sim gui$"
   terminate_gz_sim_processes KILL
@@ -1295,6 +1335,49 @@ if [[ "$headless" != true ]]; then
   fi
 else
   printf '%s\n' "Headless mode: rqt_gui is disabled."
+fi
+
+# Gazebo GUI exits as part of the ROS launch tree, so closing it used to
+# trigger the launcher's EXIT trap.  With gz_gui:=false there is no equivalent
+# GUI process to take the tree down: closing RViz and rqt otherwise leaves the
+# ROS launch, PX4 instances, bridge, and DDS agent running.  Treat the visible
+# operator windows as the lifecycle owner in non-headless mode as well.
+start_gui_watchdog() {
+  local launcher_pid="$1"
+  local expect_rviz="$2"
+  local expect_rqt="$3"
+  setsid bash -c '
+    set +e
+    launcher_pid="$1"
+    expect_rviz="$2"
+    expect_rqt="$3"
+    sleep 30
+    while kill -0 "$launcher_pid" >/dev/null 2>&1; do
+      rviz_alive=0
+      rqt_alive=0
+      if [[ "$expect_rviz" == true ]] && pgrep -f "(^|/)rviz2( |$)" >/dev/null 2>&1; then
+        rviz_alive=1
+      fi
+      if [[ "$expect_rqt" == true ]] && pgrep -f "(^|/)rqt_gui( |$)" >/dev/null 2>&1; then
+        rqt_alive=1
+      fi
+      if [[ "$rviz_alive" -eq 0 && "$rqt_alive" -eq 0 ]]; then
+        printf "%s\n" "Operator GUI windows closed; stopping the simulation stack." >&2
+        kill -TERM "$launcher_pid" >/dev/null 2>&1 || true
+        exit 0
+      fi
+      sleep 2
+    done
+  ' _ "$launcher_pid" "$expect_rviz" "$expect_rqt" &
+  children+=("$!")
+}
+
+if [[ "$headless" != true ]]; then
+  launch_rviz_value="$(get_launch_arg_value launch_rviz "${launch_args[@]}" || true)"
+  if [[ -z "$launch_rviz_value" ]]; then
+    launch_rviz_value=true
+  fi
+  start_gui_watchdog "$$" "$launch_rviz_value" true
 fi
 
 if [[ -n "$record_mode" ]]; then

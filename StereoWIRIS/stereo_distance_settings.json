@@ -78,7 +78,7 @@
   "gnss_base_survey_in_accuracy_m": 1.0,
   "gnss_base_rtcm_injection_target": "both",
   "gnss_operation": {
-    "operation_mode": "LOCAL_SURVEY_IN",
+    "operation_mode": "NETWORK_RTK_DIRECT",
     "require_drone_rtk_fixed": false,
     "readiness_gate_enabled": true,
     "readiness": {

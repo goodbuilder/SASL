@@ -227,7 +227,7 @@ def test_launch_exposes_latest_only_rviz_ray_controls() -> None:
     launch = (ROOT_DIR / "stereo_ground_sim" / "launch" / "stereo_ground_sim.launch.py").read_text(encoding="utf-8")
 
     assert 'DeclareLaunchArgument("rviz_live_latest_only", default_value="true")' in launch
-    assert 'DeclareLaunchArgument("rviz_live_ray_hz", default_value="5.0")' in launch
+    assert 'DeclareLaunchArgument("rviz_live_ray_hz", default_value="20.0")' in launch
     assert '"rviz_live_latest_only"' in launch
     assert '"rviz_live_ray_hz"' in launch
 

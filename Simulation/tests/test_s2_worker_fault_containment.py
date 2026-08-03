@@ -96,7 +96,7 @@ def _node() -> StereoDistanceNode:
     node.yolo_target_hz = 1_000_000.0
     node.yolo_inference_in_progress = False
     node.last_yolo_update = 0.0
-    node.raw_position_pub = CapturePublisher()
+    node.nominal_pose_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.raw_computed_count = 0
     node.corrected_computed_count = 0
@@ -164,7 +164,7 @@ def test_compute_failure_is_contained_and_same_worker_processes_next_pair() -> N
     assert not node.yolo_inference_in_progress
     assert 1 not in node.pairs_by_pair_id
     assert 1 not in node.measurement_results_by_pair_id
-    assert len(node.raw_position_pub.messages) == 1
+    assert len(node.nominal_pose_position_pub.messages) == 1
     assert len(node.attitude_corrected_position_pub.messages) == 1
     assert node.last_measurement_error_type == "RuntimeError"
 

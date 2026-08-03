@@ -947,7 +947,7 @@ DEBUG_BAG_TOPICS = [
     "/stereo/distance_error",
     "/stereo/distance_comparison",
     "/ground_truth_position",
-    "/stereo/nominal_pose_position",
+    "/stereo/nominal_pose_plot",
     "/stereo/corrected_position",
     "/stereo/optical_pose_position",
     "/stereo/ideal_position",
@@ -1619,7 +1619,7 @@ class OperatorRecorder(Node):
             f"axis_contract={AXIS_CONTRACT}",
             "axis_public_fields=drone_forward_m/drone_right_m/drone_down_m, nominal_pose_forward_m/nominal_pose_right_m/nominal_pose_down_m, corrected_forward_m/corrected_right_m/corrected_down_m",
             "axis_aliases=public CSV uses forward/right/down; legacy x/y/z is intentionally not emitted",
-            "nominal_pose_topic=/stereo/nominal_pose_position publishes nominal forward/right/down/range",
+            "nominal_pose_plot_topic=/stereo/nominal_pose_plot publishes nominal forward/right/down/range",
             "corrected_position_topic=/stereo/corrected_position publishes bbox-adjusted forward/right/down/range",
             "optical_pose_topic=/stereo/optical_pose_position publishes YOLO pixels triangulated with Gazebo-observed optical camera poses",
             "ideal_position_topic=/stereo/ideal_position publishes GT-projected nominal-pixel triangulation for simulation reference only",
@@ -1777,7 +1777,7 @@ class OperatorRecorder(Node):
         )
         self.create_subscription(
             Float32MultiArray,
-            "/stereo/nominal_pose_position",
+            "/stereo/nominal_pose_plot",
             self._estimated_position_cb,
             10,
         )
@@ -1936,7 +1936,7 @@ class OperatorRecorder(Node):
         self.latest["nominal_pose_right_m"] = float(values[1])
         self.latest["nominal_pose_down_m"] = float(values[2])
         self.latest["nominal_pose_range_m"] = float(values[3])
-        self.last_stamp["/stereo/nominal_pose_position"] = self.get_clock().now().nanoseconds * 1e-9
+        self.last_stamp["/stereo/nominal_pose_plot"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _corrected_position_cb(self, msg):
         values = list(msg.data[:4])

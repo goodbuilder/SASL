@@ -72,6 +72,10 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert "_ASPECT_HEIGHT_PER_WIDTH = 9.0 / 16.0" in source
     assert "QSizePolicy.Ignored, QSizePolicy.MinimumExpanding" in source
     assert "layout.addLayout(cameras)" in source
+    assert 'QPushButton("Respawn Drone")' in source
+    assert '"/stereo/respawn_drone"' in source
+    assert "Trigger.Request()" in source
+    assert "respawn_finished = Signal()" in source
     assert "layout.addStretch(1)" in source
     assert "StereoCAM run parameters (/stereo_distance_node, read-only)" in source
     assert "ListParameters" in source
@@ -113,9 +117,28 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert 'ray_metrics = Signal(str)' in source
     assert '"/stereo/ray_metrics"' in source
     assert "update_live_ray_metrics" in source
+    assert 'from px4_msgs.msg import SensorGps, VehicleAttitude, VehicleGlobalPosition, VehicleOdometry' in source
+    assert 'QGroupBox("Published VehicleAttitude (actual)")' in source
+    assert 'PX4 timestamp_sample [us]' in source
+    assert 'value_label.setWordWrap(False)' in source
+    assert 'actual_grid.setRowMinimumHeight(row, 24)' in source
+    assert 'self._bridge.px4_attitude.connect(self._ray_diagnostics.update_actual_attitude)' in source
+    assert 'VehicleAttitude,' in source
+    assert 'PX4_ATTITUDE_TOPICS.items()' in source
     assert '("midpoint_frd_m", "midpoint")' in source
     for record_view in ("Summary", "GPS", "BBox", "Ray summary", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
         assert f'"{record_view}"' in source
+
+
+def test_respawn_service_contract_is_declared_by_distance_node() -> None:
+    source = (ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "stereo_distance_node.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'self.create_service(\n            Trigger, "/stereo/respawn_drone"' in source
+    assert "self._set_gazebo_target_pose(" in source
+    for parameter in ("target_spawn_x_m", "target_spawn_y_m", "target_spawn_z_m", "target_spawn_yaw_deg"):
+        assert f'"{parameter}"' in source
 
 
 def test_rqt_runtime_patch_keeps_gps_position_series_in_axis_plots() -> None:

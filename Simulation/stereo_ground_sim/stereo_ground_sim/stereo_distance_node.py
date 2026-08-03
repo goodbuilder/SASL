@@ -21,6 +21,7 @@ try:  # ROS is present in production; pure geometry tests may run without it.
     from rosgraph_msgs.msg import Clock
     from sensor_msgs.msg import Image as ImageMsg
     from std_msgs.msg import Float32, Float32MultiArray, String
+    from std_srvs.srv import Trigger
     from visualization_msgs.msg import Marker, MarkerArray
 except ImportError:  # pragma: no cover - exercised only outside ROS
     rclpy = None
@@ -68,6 +69,15 @@ except ImportError:  # pragma: no cover - exercised only outside ROS
     class String(_Message):  # type: ignore[no-redef]
         def __init__(self, data="", **kwargs):
             super().__init__(data=data, **kwargs)
+
+    class Trigger:  # type: ignore[no-redef]
+        class Request:
+            pass
+
+        class Response:
+            def __init__(self):
+                self.success = False
+                self.message = ""
 
     class ImageMsg(_Message):  # type: ignore[no-redef]
         pass
@@ -407,7 +417,10 @@ class StereoDistanceNode(Node):
         self.declare_parameter("final_hover_duration_s", 5.0)
         self.declare_parameter("land_duration_s", 10.0)
         self.declare_parameter("target_model_name", "x500_15m")
+        self.declare_parameter("target_spawn_x_m", 0.0)
+        self.declare_parameter("target_spawn_y_m", 2000.0)
         self.declare_parameter("target_spawn_z_m", 0.75)
+        self.declare_parameter("target_spawn_yaw_deg", -90.0)
         self.declare_parameter("fly_target_in_gazebo", False)
         self.declare_parameter("yolo_model_path", "")
         self.declare_parameter("yolo_class_name", "drone")
@@ -427,7 +440,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("rviz_live_latest_only", True)
         self.declare_parameter(
             "rviz_live_ray_hz",
-            2.0,
+            20.0,
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("enable_synthetic_detections", False)
@@ -525,7 +538,10 @@ class StereoDistanceNode(Node):
         self.final_hover_duration_s = self._float_param("final_hover_duration_s")
         self.land_duration_s = self._float_param("land_duration_s")
         self.target_model_name = self.get_parameter("target_model_name").value
+        self.target_spawn_x_m = self._float_param("target_spawn_x_m")
+        self.target_spawn_y_m = self._float_param("target_spawn_y_m")
         self.target_spawn_z_m = self._float_param("target_spawn_z_m")
+        self.target_spawn_yaw_deg = self._float_param("target_spawn_yaw_deg")
         self.fly_target_in_gazebo = self._bool_param("fly_target_in_gazebo")
         self.yolo_model_path = str(self.get_parameter("yolo_model_path").value)
         self.yolo_class_name = str(self.get_parameter("yolo_class_name").value)
@@ -905,11 +921,22 @@ class StereoDistanceNode(Node):
             QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
         )
         if self.enable_gps_baseline_triangulation:
+            # PX4's uXRCE-DDS SensorGps publisher offers BEST_EFFORT with
+            # TRANSIENT_LOCAL durability.  Keep this explicit instead of
+            # relying on QoSProfile defaults; otherwise a freshly started
+            # node can discover the endpoint while silently missing the raw
+            # GPS samples needed by GPS Baseline and Operational rays.
+            sensor_gps_qos = QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=10,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
             self.create_subscription(
                 SensorGps,
                 self.gps_baseline_left_topic,
                 lambda msg: self._gps_baseline_callback("left", msg),
-                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+                sensor_gps_qos,
             )
             self.create_subscription(
                 VehicleGlobalPosition,
@@ -927,20 +954,24 @@ class StereoDistanceNode(Node):
                 SensorGps,
                 self.gps_baseline_right_topic,
                 lambda msg: self._gps_baseline_callback("right", msg),
-                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+                sensor_gps_qos,
             )
             self.create_subscription(
                 SensorGps,
                 self.uam_raw_gps_topic,
                 lambda msg: self._gps_baseline_callback("uam", msg),
-                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT),
+                sensor_gps_qos,
             )
         self.clock_sub = self.create_subscription(Clock, "/clock", self._clock_cb, 10)
         self.disparity_pub = self.create_publisher(Float32, "/stereo/disparity", 10)
         self.error_pub = self.create_publisher(Float32, "/stereo/distance_error", 10)
         self.comparison_pub = self.create_publisher(Float32MultiArray, "/stereo/distance_comparison", 10)
-        self.nominal_pose_position_pub = self.create_publisher(
-            Float32MultiArray, "/stereo/nominal_pose_position", 10
+        # The canonical nominal-pose result is stamped and carries the
+        # baseline-center FRD frame.  Keep the un-stamped array used by the
+        # operator plots on its own topic so ROS never sees two types on one
+        # graph name.
+        self.nominal_pose_plot_pub = self.create_publisher(
+            Float32MultiArray, "/stereo/nominal_pose_plot", 10
         )
         self.corrected_position_pub = self.create_publisher(
             Float32MultiArray, "/stereo/corrected_position", 10
@@ -984,6 +1015,9 @@ class StereoDistanceNode(Node):
             else None
         )
         self.ray_metrics_pub = self.create_publisher(String, "/stereo/ray_metrics", 10)
+        self.respawn_service = self.create_service(
+            Trigger, "/stereo/respawn_drone", self._respawn_drone_service
+        )
         self.yolo_inference_ms_pub = self.create_publisher(
             Float32, "/stereo/yolo_inference_ms", 10
         )
@@ -4045,7 +4079,7 @@ class StereoDistanceNode(Node):
         self.distance_pub.publish(Float32(data=distance_value))
         self.error_pub.publish(Float32(data=error_value))
         self.disparity_pub.publish(Float32(data=disparity_value))
-        self.nominal_pose_position_pub.publish(Float32MultiArray(data=estimated_position_values))
+        self.nominal_pose_plot_pub.publish(Float32MultiArray(data=estimated_position_values))
         self.corrected_position_pub.publish(Float32MultiArray(data=corrected_position_values))
         optical_publisher = getattr(self, "optical_pose_position_pub", None)
         if optical_publisher is not None:
@@ -4236,13 +4270,23 @@ class StereoDistanceNode(Node):
         if now - self.last_gazebo_velocity_update < 0.5:
             return
         self.last_gazebo_velocity_update = now
+        self._set_gazebo_target_pose(
+            self.target_spawn_x_m,
+            state["distance_m"],
+            state["altitude_m"],
+            self.target_spawn_yaw_deg,
+        )
+
+    def _set_gazebo_target_pose(self, x_m, y_m, z_m, yaw_deg):
+        yaw_rad = math.radians(float(yaw_deg))
+        half_yaw = yaw_rad * 0.5
         pose_msg = (
             f'name: "{self.target_model_name}", '
-            f"position: {{x: 0.0, y: {state['distance_m']:.6f}, z: {state['altitude_m']:.6f}}}, "
-            "orientation: {x: 0.0, y: 0.0, z: -0.707106781, w: 0.707106781}"
+            f"position: {{x: {float(x_m):.6f}, y: {float(y_m):.6f}, z: {float(z_m):.6f}}}, "
+            f"orientation: {{x: 0.0, y: 0.0, z: {math.sin(half_yaw):.9f}, w: {math.cos(half_yaw):.9f}}}"
         )
         try:
-            subprocess.run(
+            completed = subprocess.run(
                 [
                     "gz",
                     "service",
@@ -4262,8 +4306,38 @@ class StereoDistanceNode(Node):
                 timeout=5.0,
                 check=False,
             )
+            if completed.returncode != 0:
+                self.get_logger().warning(
+                    f"Gazebo set_pose returned exit code {completed.returncode}"
+                )
+                return False
+            return True
         except (OSError, subprocess.SubprocessError):
             self.get_logger().warning("Failed to command Gazebo target pose; will retry.")
+            return False
+
+    def _respawn_drone_service(self, _request, response):
+        """Teleport the target model back to the configured launch pose."""
+
+        success = self._set_gazebo_target_pose(
+            self.target_spawn_x_m,
+            self.target_spawn_y_m,
+            self.target_spawn_z_m,
+            self.target_spawn_yaw_deg,
+        )
+        if success:
+            self.start_time = time.monotonic()
+            self.last_gazebo_velocity_update = 0.0
+            response.success = True
+            response.message = (
+                f"Respawned {self.target_model_name} at "
+                f"({self.target_spawn_x_m:.2f}, {self.target_spawn_y_m:.2f}, "
+                f"{self.target_spawn_z_m:.2f}) m"
+            )
+        else:
+            response.success = False
+            response.message = "Gazebo set_pose service failed"
+        return response
 
     def _left_cb(self, msg):
         self._store_image("left", msg)
@@ -4539,17 +4613,21 @@ class StereoDistanceNode(Node):
                 phase = self._mission_state()["phase"]
                 self.rviz_live_latest_processed_pair_id = pair.pair_id
                 next_tick = time.monotonic() + 1.0 / max(
-                    0.1, float(getattr(self, "rviz_live_ray_hz", 2.0))
+                    0.1, float(getattr(self, "rviz_live_ray_hz", 20.0))
                 )
             try:
                 computed = self._compute_pair_measurement(pair, phase)
                 raw = computed.get("raw")
+                # The display-only Ideal Ray is independent of YOLO.  Keep
+                # computing it when the vehicle is outside the image and no
+                # raw bbox triangulation is available; _latest_rviz_ideal_ray
+                # falls back to the cached World-ENU reference point.
+                ideal = self._latest_rviz_ideal_ray(pair)
                 if raw is not None:
                     left = computed.get("left")
                     right = computed.get("right")
                     if left is not None or right is not None:
                         self.live_detections_pub.publish(self._detections_to_msg(left, right))
-                    ideal = self._latest_rviz_ideal_ray(pair)
                     diagnostic_rays = computed.get("diagnostic_rays", {})
                     diagnostic_analysis = self._diagnostic_analysis(
                         computed.get("corrected"), diagnostic_rays
@@ -4586,6 +4664,15 @@ class StereoDistanceNode(Node):
                         global_baseline=computed.get("gps_baselines", {}).get("global_baseline"),
                         **diagnostic_rays,
                     )
+                    self.rviz_live_publish_count += 1
+                elif ideal is not None:
+                    # No detector-derived ray exists outside the FOV, but the
+                    # simulation reference ray should remain visible.
+                    self._publish_ray_metrics(
+                        pair_id=pair.pair_id,
+                        ideal=ideal,
+                    )
+                    self._publish_ray_markers(ideal=ideal)
                     self.rviz_live_publish_count += 1
             except Exception as exc:
                 self.rviz_live_error_count += 1
@@ -5159,13 +5246,25 @@ class StereoDistanceNode(Node):
             gt_fallback_used=evaluation.get("gt_fallback_used"),
             **diagnostic_rays,
         )
-        if ideal is not None:
+        # Ideal metrics intentionally remain unavailable when nominal pixels
+        # are outside the image.  For RViz, however, retain a display-only
+        # reference ray to the aligned Ground Truth point in that case.
+        ideal_marker = ideal
+        if ideal_marker is None and alignment.position_world_enu_m is not None:
+            self._ensure_camera_frames()
+            ideal_marker = reference_ray_world_enu_from_point(
+                self.baseline_center_frd,
+                self.nominal_left_camera,
+                self.nominal_right_camera,
+                alignment.position_world_enu_m,
+            )
+        if ideal_marker is not None:
             if not self._rviz_latest_only_markers_enabled():
-                self._publish_ray_markers(ideal=ideal)
+                self._publish_ray_markers(ideal=ideal_marker)
         # The initial publish happens before GT alignment exists.  Republish
         # after the DKL reference has been evaluated so rqt receives it without
         # waiting for the periodic plot sampler.
-        if getattr(self, "nominal_pose_position_pub", None) is not None:
+        if getattr(self, "nominal_pose_plot_pub", None) is not None:
             self._publish_estimated_position(metrics)
         unavailable = alignment.gt_alignment_mode == "unavailable"
         if gt_baseline is not None and pair_id not in self.gt_published_pair_ids:
@@ -5579,7 +5678,7 @@ class StereoDistanceNode(Node):
             self.last_uam_raw_gps_reference_published_pair_id = pair_id
 
     def _publish_estimated_position(self, metrics):
-        estimated_publisher = getattr(self, "nominal_pose_position_pub", None)
+        estimated_publisher = getattr(self, "nominal_pose_plot_pub", None)
         if estimated_publisher is not None:
             estimated_publisher.publish(
                 Float32MultiArray(

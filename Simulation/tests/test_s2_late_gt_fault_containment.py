@@ -99,9 +99,10 @@ def _node() -> StereoDistanceNode:
     node.dropped_on_shutdown_count = 0
     node.dropped_on_shutdown_pair_id_min = None
     node.dropped_on_shutdown_pair_id_max = None
-    node.raw_position_pub = CapturePublisher()
+    node.nominal_pose_position_pub = CapturePublisher()
     node.attitude_corrected_position_pub = CapturePublisher()
     node.canonical_ground_truth_position_pub = FailFirstPublisher()
+    node.live_detections_pub = CapturePublisher()
     node.raw_computed_count = 0
     node.corrected_computed_count = 0
     node.last_raw_published_pair_id = 0
@@ -191,7 +192,7 @@ def test_late_gt_publish_exception_is_contained_and_next_pair_evaluates() -> Non
         time.sleep(0.01)
 
     assert node.yolo_thread.is_alive()
-    assert len(node.raw_position_pub.messages) == 2
+    assert len(node.nominal_pose_position_pub.messages) == 2
     assert len(node.attitude_corrected_position_pub.messages) == 2
     assert node.measurement_processed_count == 2
     assert node.accepted_pair_discard_count == 0
@@ -271,7 +272,7 @@ def test_gt_first_then_production_commit_contains_evaluation_failure() -> None:
     assert node.measurement_processing_error_count == 0
     assert node.gt_evaluation_error_count == 1
     assert node.gt_evaluation_success_count == 0
-    assert len(node.raw_position_pub.messages) == 1
+    assert len(node.nominal_pose_position_pub.messages) == 1
     assert len(node.attitude_corrected_position_pub.messages) == 1
     assert pair.pair_id in node.gt_evaluation_failed_pair_ids
     assert node.last_pair_result["measurement_status"] == "processed"

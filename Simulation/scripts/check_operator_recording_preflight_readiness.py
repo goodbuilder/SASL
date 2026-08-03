@@ -23,7 +23,7 @@ REQUIRED_CORRECTED_FIELDS = (
 )
 REQUIRED_DETECTION_FIELDS = ("left_cx", "left_cy", "raw_disparity_px")
 REQUIRED_TOPICS = (
-    "/stereo/nominal_pose_position",
+    "/stereo/nominal_pose_plot",
     "/stereo/corrected_position",
     "/stereo/detections",
     "/stereo/disparity",
@@ -102,7 +102,7 @@ def check_readiness(root_dir: Path) -> dict[str, object]:
             for field in REQUIRED_DETECTION_FIELDS:
                 require(field in detection_fields, failures, f"operator_recorder:detection_field:{field}")
             for topic in REQUIRED_TOPICS:
-                if topic == "/stereo/nominal_pose_position":
+                if topic == "/stereo/nominal_pose_plot":
                     require("_estimated_position_cb" in run_script_text or hasattr(recorder.OperatorRecorder, "_estimated_position_cb"), failures, "operator_recorder:estimated_topic_cb")
                 elif topic == "/stereo/corrected_position":
                     require(hasattr(recorder.OperatorRecorder, "_corrected_position_cb"), failures, "operator_recorder:corrected_topic_cb")
