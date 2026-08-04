@@ -103,7 +103,7 @@ def test_every_runner_uses_the_unified_config() -> None:
     for name in (
         "run_operator_view.sh",
         "run_attitude_error_experiment.sh",
-        "run_auto_mission.sh",
+        "run_mission.sh",
         "run_px4_waypoint_mission.sh",
     ):
         source = (ROOT / name).read_text(encoding="utf-8")

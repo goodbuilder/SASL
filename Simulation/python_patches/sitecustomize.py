@@ -288,11 +288,14 @@ def _patch_rqt_image_view_default_topics():
             # shared image row so the three decision plots remain readable.
             dock.setMaximumHeight(440)
         for dock in plot_docks:
-            dock.setMinimumHeight(440)
+            # Keep the restored window smaller than a typical desktop so the
+            # window manager still exposes normal resize/maximize controls.
+            # The user can enlarge the plots after maximizing rqt.
+            dock.setMinimumHeight(180)
         # The two image docks share one horizontal row: resizing either dock
         # vertically resizes that row. Supplying both is ignored by Qt.
         main_window.resizeDocks([image_docks[0]], [420], Qt.Vertical)
-        main_window.resizeDocks(plot_docks, [440, 440, 440], Qt.Vertical)
+        main_window.resizeDocks(plot_docks, [260, 260, 260], Qt.Vertical)
 
     globals()["_apply_rqt_image_view_default_topics"] = apply_topics
     QTimer.singleShot(1500, center_image_frames)

@@ -14,7 +14,9 @@ from python_qt_binding.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QCheckBox,
     QLabel,
+    QLayout,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -64,6 +66,11 @@ except Exception:  # pragma: no cover - PX4 messages are optional for the rqt sh
     VehicleGlobalPosition = None
     VehicleOdometry = None
 
+try:
+    from pymavlink import mavutil
+except Exception:  # pragma: no cover - MAVLink is an optional diagnostics input.
+    mavutil = None
+
 
 AXES = (
     ("Forward", 0),
@@ -102,7 +109,7 @@ SERIES_LABELS = {
     "global_baseline": "Global Baseline",
     "attitude": "Attitude",
     "operational": "Operational",
-    "uam_raw_gps_reference": "UAM raw GPS reference",
+    "uam_raw_gps_reference": "UAM GPS",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
 IMAGE_TOPICS = (
@@ -121,6 +128,14 @@ PX4_ATTITUDE_TOPICS = {
     "right": os.environ.get("PX4_ATTITUDE_RIGHT_TOPIC", "/camera_right/fmu/out/vehicle_attitude").strip()
     or "/camera_right/fmu/out/vehicle_attitude",
 }
+# All three PX4 instances publish their operator-diagnostics MAVLink link to
+# one UDP destination. PX4 SITL assigns system IDs instance+1, so target=1,
+# left camera=2, and right camera=3. The target stream is received on this
+# socket too, but only the camera rows are rendered in the attitude comparison.
+MAVLINK_ATTITUDE_URL = os.environ.get(
+    "RQT_MAVLINK_ATTITUDE_URL", "udpin:0.0.0.0:14551"
+).strip()
+MAVLINK_ATTITUDE_SIDE_BY_SYSID = {2: "left", 3: "right"}
 try:
     PLOT_WINDOW_S = max(1.0, float(os.environ.get("RQT_PLOT_WINDOW_S", "30.0")))
 except ValueError:
@@ -139,6 +154,8 @@ def _env_float(name, default, minimum):
 RQT_IMAGE_RENDER_HZ = _env_float("RQT_IMAGE_RENDER_HZ", 5.0, 0.5)
 RQT_FACTS_RENDER_HZ = _env_float("RQT_FACTS_RENDER_HZ", 5.0, 0.5)
 RQT_PREVIEW_RENDER_HZ = _env_float("RQT_PREVIEW_RENDER_HZ", 2.0, 0.5)
+RAY_DIAGNOSTICS_RENDER_HZ = 10.0
+RAY_DIAGNOSTICS_HORIZONTAL_SPACING = 8
 
 
 def _finite_tuple(values, size):
@@ -176,6 +193,141 @@ def _rpy_deg_from_rotation(rotation):
     return tuple(math.degrees(value) for value in (roll, pitch, yaw))
 
 
+def _shortest_angle_delta_deg(first, second):
+    """Return first-second wrapped to [-180, 180) degrees."""
+
+    first = float(first)
+    second = float(second)
+    if not math.isfinite(first) or not math.isfinite(second):
+        return math.nan
+    return (first - second + 180.0) % 360.0 - 180.0
+
+
+def _mavlink_attitude_sample(message, url, receive_monotonic_ns=None):
+    """Normalize one MAVLink ATTITUDE message for the read-only UI.
+
+    MAVLink ATTITUDE carries roll/pitch/yaw in radians and time_boot_ms in
+    milliseconds. The normalized R/P/Y values are degrees in PX4 NED/body-FRD
+    semantics, matching the ROS2 VehicleAttitude display above.
+    """
+
+    rpy_deg = tuple(
+        math.degrees(float(getattr(message, axis)))
+        for axis in ("roll", "pitch", "yaw")
+    )
+    if not all(math.isfinite(value) for value in rpy_deg):
+        raise ValueError("MAVLink ATTITUDE contains a non-finite angle")
+    source_system = getattr(message, "get_srcSystem", lambda: None)()
+    source_component = getattr(message, "get_srcComponent", lambda: None)()
+    return {
+        "rpy": rpy_deg,
+        "time_boot_ms": getattr(message, "time_boot_ms", None),
+        "sysid": source_system,
+        "compid": source_component,
+        "receive_monotonic_ns": (
+            time.monotonic_ns()
+            if receive_monotonic_ns is None
+            else int(receive_monotonic_ns)
+        ),
+        "url": str(url),
+    }
+
+
+class MavlinkAttitudeReader(QObject):
+    """Receive raw MAVLink ATTITUDE messages without blocking the Qt thread."""
+
+    attitude = Signal(str, object)
+    status = Signal(str)
+
+    def __init__(self, url, side_by_sysid, parent=None):
+        super().__init__(parent)
+        self._url = str(url).strip()
+        self._side_by_sysid = dict(side_by_sysid)
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._connection = None
+        self._connections_lock = threading.Lock()
+
+    def start(self):
+        if mavutil is None:
+            self.status.emit(
+                "MAVLink ATTITUDE unavailable: install pymavlink or disable the raw MAVLink view."
+            )
+            return
+        if not self._url:
+            self.status.emit("MAVLink ATTITUDE: URL is empty; raw stream disabled.")
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="mavlink-attitude",
+        )
+        self._thread.start()
+
+    def _run(self):
+        connection = None
+        last_error = None
+        while not self._stop_event.is_set():
+            if connection is None:
+                try:
+                    connection = mavutil.mavlink_connection(
+                        self._url, autoreconnect=True, source_system=254
+                    )
+                    with self._connections_lock:
+                        self._connection = connection
+                    last_error = None
+                except Exception as exc:
+                    message = f"MAVLink ATTITUDE connect failed ({self._url}): {exc}"
+                    if message != last_error:
+                        self.status.emit(message)
+                        last_error = message
+                    self._stop_event.wait(1.0)
+                    continue
+            try:
+                message = connection.recv_match(
+                    type="ATTITUDE", blocking=True, timeout=0.25
+                )
+                if message is not None:
+                    sample = _mavlink_attitude_sample(message, self._url)
+                    side = self._side_by_sysid.get(sample.get("sysid"))
+                    if side is not None:
+                        self.attitude.emit(side, sample)
+            except Exception as exc:
+                error = f"MAVLink ATTITUDE receive failed ({self._url}): {exc}"
+                if error != last_error:
+                    self.status.emit(error)
+                    last_error = error
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                with self._connections_lock:
+                    self._connection = None
+                connection = None
+
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        with self._connections_lock:
+            if self._connection is connection:
+                self._connection = None
+
+    def stop(self):
+        self._stop_event.set()
+        with self._connections_lock:
+            connection = self._connection
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+
 class PanelBridge(QObject):
     image = Signal(str, object)
     sample = Signal(str, list)
@@ -187,6 +339,7 @@ class PanelBridge(QObject):
     px4_global_position = Signal(str, object)
     px4_odometry = Signal(str, object)
     px4_attitude = Signal(str, object)
+    mavlink_attitude = Signal(str, object)
     status = Signal(str)
     runtime_parameters = Signal(str)
     respawn_finished = Signal()
@@ -199,7 +352,7 @@ class CameraView(QLabel):
         super().__init__(parent)
         self._title = title
         self._pixmap = None
-        self.setMinimumSize(480, 480)
+        self.setMinimumSize(320, 180)
         # The source pixmap must not dictate a column width: both stereo panes
         # receive the same horizontal share, then request their 16:9 height.
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.MinimumExpanding)
@@ -224,7 +377,7 @@ class CameraView(QLabel):
         return True
 
     def heightForWidth(self, width):
-        return max(480, int(width * self._ASPECT_HEIGHT_PER_WIDTH))
+        return max(180, int(width * self._ASPECT_HEIGHT_PER_WIDTH))
 
     def _refresh_pixmap(self):
         if self._pixmap is None:
@@ -534,30 +687,20 @@ class RayDiagnosticsPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._last_pair_id = None
         self._actual_attitude_samples = {"left": None, "right": None}
+        self._mavlink_attitude_samples = {"left": None, "right": None}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
         group = QGroupBox("Ray Diagnostics")
-        group.setCheckable(True)
-        group.setChecked(True)
         group_layout = QVBoxLayout(group)
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(4, 4, 4, 4)
         content_layout.setSpacing(4)
         group_layout.addWidget(content)
-        group.toggled.connect(content.setVisible)
         layout.addWidget(group)
-
-        self._frame_label = QLabel(
-            "Output frame: baseline_center_frd  |  Axes: Forward / Right / Down  |  "
-            "Position/Range: m  |  Angle: deg  |  Pair: —"
-        )
-        self._frame_label.setStyleSheet("font-weight: 600; color: #263238;")
-        content_layout.addWidget(self._frame_label)
 
         tabs = QTabWidget()
         tabs.addTab(self._scrollable(self._build_geometry_tab()), "Geometry")
@@ -565,6 +708,14 @@ class RayDiagnosticsPanel(QWidget):
         tabs.addTab(self._scrollable(self._build_gt_tab()), "GT Error")
         tabs.addTab(self._scrollable(self._build_sensors_tab()), "Sensors")
         content_layout.addWidget(tabs)
+
+        self._pending_ray_metrics = None
+        self._pending_actual_attitude = set()
+        self._pending_mavlink_attitude = set()
+        self._render_timer = QTimer(self)
+        self._render_timer.setInterval(int(1000.0 / RAY_DIAGNOSTICS_RENDER_HZ))
+        self._render_timer.timeout.connect(self._flush_pending_updates)
+        self._render_timer.start()
 
     # -- tab construction -------------------------------------------------
 
@@ -675,6 +826,7 @@ class RayDiagnosticsPanel(QWidget):
 
         attitude_box = QGroupBox("PX4 Attitude")
         attitude_grid = QGridLayout(attitude_box)
+        attitude_grid.setHorizontalSpacing(RAY_DIAGNOSTICS_HORIZONTAL_SPACING)
         self._attitude_fields = {}
         attitude_rows = (
             "Model", "Overall status", "Left age [ms]", "Right age [ms]", "Pair skew [ms]",
@@ -700,6 +852,7 @@ class RayDiagnosticsPanel(QWidget):
             "Values are the messages actually received by this panel, not the configured injection values."
         )
         actual_grid = QGridLayout(actual_box)
+        actual_grid.setHorizontalSpacing(RAY_DIAGNOSTICS_HORIZONTAL_SPACING)
         actual_headers = (
             "Camera", "R/P/Y [deg] (PX4 NED)", "Quaternion [w,x,y,z]",
             "PX4 timestamp_sample [us]", "Receive age [ms]", "Reset counter", "Topic",
@@ -729,6 +882,42 @@ class RayDiagnosticsPanel(QWidget):
         actual_grid.setColumnStretch(6, 1)
         layout.addWidget(actual_box)
 
+        mavlink_box = QGroupBox("MAVLink ATTITUDE (raw)")
+        mavlink_box.setToolTip(
+            "Raw MAVLink ATTITUDE messages received by this panel. "
+            "The angles are read directly from ATTITUDE.roll/pitch/yaw in radians "
+            "and converted to degrees; they are not calculated from a quaternion."
+        )
+        mavlink_grid = QGridLayout(mavlink_box)
+        mavlink_grid.setHorizontalSpacing(RAY_DIAGNOSTICS_HORIZONTAL_SPACING)
+        mavlink_headers = (
+            "Camera", "R/P/Y [deg] (ATTITUDE)", "Δyaw ROS2-MAVLink [deg]",
+            "time_boot_ms", "Sys/Comp", "Receive age [ms]", "MAVLink URL",
+        )
+        for column, name in enumerate(mavlink_headers):
+            header = QLabel(name)
+            header.setStyleSheet("font-weight: 600;")
+            header.setFixedHeight(22)
+            mavlink_grid.addWidget(header, 0, column)
+        for column, width in ((1, 140), (2, 150), (3, 100), (4, 75), (5, 100), (6, 330)):
+            mavlink_grid.setColumnMinimumWidth(column, width)
+        self._mavlink_attitude_fields = {"left": {}, "right": {}}
+        for row, side in enumerate(("left", "right"), start=1):
+            mavlink_grid.addWidget(QLabel(side.capitalize()), row, 0)
+            mavlink_grid.setRowMinimumHeight(row, 24)
+            fields = self._mavlink_attitude_fields[side]
+            for column, key in enumerate(
+                ("rpy", "yaw_delta", "timestamp", "source", "age", "url"), start=1
+            ):
+                value_label = QLabel("—")
+                value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                value_label.setWordWrap(False)
+                value_label.setFixedHeight(22)
+                mavlink_grid.addWidget(value_label, row, column)
+                fields[key] = value_label
+        mavlink_grid.setColumnStretch(6, 1)
+        layout.addWidget(mavlink_box)
+
         # Fixed for the whole run (see the Setup tab's PX4 Attitude Error
         # Injection group for the full tooltip / how to change it).
         self._attitude_fields["Model"].setText("optical_derived_body_attitude_v1")
@@ -738,6 +927,7 @@ class RayDiagnosticsPanel(QWidget):
 
         gps_box = QGroupBox("GPS Baseline")
         gps_grid = QGridLayout(gps_box)
+        gps_grid.setHorizontalSpacing(RAY_DIAGNOSTICS_HORIZONTAL_SPACING)
         self._gps_fields = {}
         gps_rows = (
             "Overall status", "Left age [ms]", "Right age [ms]", "Pair skew [ms]",
@@ -765,7 +955,24 @@ class RayDiagnosticsPanel(QWidget):
             return
         if not isinstance(data, dict):
             return
-        self._refresh(data)
+        if self.isVisible():
+            self._pending_ray_metrics = data
+        else:
+            self._refresh(data)
+
+    def _flush_pending_updates(self):
+        if not self.isVisible():
+            return
+        if self._pending_ray_metrics is not None:
+            data = self._pending_ray_metrics
+            self._pending_ray_metrics = None
+            self._refresh(data)
+        for side in tuple(self._pending_actual_attitude):
+            self._refresh_actual_attitude(side)
+        self._pending_actual_attitude.clear()
+        for side in tuple(self._pending_mavlink_attitude):
+            self._refresh_mavlink_attitude(side)
+        self._pending_mavlink_attitude.clear()
 
     def update_actual_attitude(self, side, msg):
         """Render the raw left/right VehicleAttitude stream received by RQT."""
@@ -788,7 +995,11 @@ class RayDiagnosticsPanel(QWidget):
             "reset_counter": reset_counter,
             "topic": PX4_ATTITUDE_TOPICS[side],
         }
-        self._refresh_actual_attitude(side)
+        if self.isVisible():
+            self._pending_actual_attitude.add(side)
+        else:
+            self._refresh_actual_attitude(side)
+        self._refresh_mavlink_attitude(side)
 
     def _refresh_actual_attitude(self, side):
         sample = self._actual_attitude_samples.get(side)
@@ -805,17 +1016,47 @@ class RayDiagnosticsPanel(QWidget):
         fields["reset"].setText(_fmt_int(sample["reset_counter"]))
         fields["topic"].setText(sample["topic"])
 
+    def update_mavlink_attitude(self, side, sample):
+        """Render one raw MAVLink ATTITUDE sample beside VehicleAttitude."""
+        if side not in self._mavlink_attitude_fields or not isinstance(sample, dict):
+            return
+        rpy = sample.get("rpy")
+        if not isinstance(rpy, (tuple, list)) or len(rpy) != 3:
+            return
+        try:
+            rpy = tuple(float(value) for value in rpy)
+        except (TypeError, ValueError):
+            return
+        if not all(math.isfinite(value) for value in rpy):
+            return
+        self._mavlink_attitude_samples[side] = dict(sample, rpy=rpy)
+        if self.isVisible():
+            self._pending_mavlink_attitude.add(side)
+        else:
+            self._refresh_mavlink_attitude(side)
+
+    def _refresh_mavlink_attitude(self, side):
+        sample = self._mavlink_attitude_samples.get(side)
+        if not sample:
+            return
+        fields = self._mavlink_attitude_fields[side]
+        fields["rpy"].setText(" / ".join(f"{value:+.3f}" for value in sample["rpy"]))
+        ros_sample = self._actual_attitude_samples.get(side)
+        yaw_delta = math.nan
+        if ros_sample:
+            yaw_delta = _shortest_angle_delta_deg(sample["rpy"][2], ros_sample["rpy"][2])
+        fields["yaw_delta"].setText(_fmt_num(yaw_delta, 3))
+        fields["timestamp"].setText(_fmt_int(sample.get("time_boot_ms")))
+        fields["source"].setText(
+            f"{_fmt_int(sample.get('sysid'))}/{_fmt_int(sample.get('compid'))}"
+        )
+        age_ms = max(0.0, time.monotonic_ns() - sample["receive_monotonic_ns"]) / 1.0e6
+        fields["age"].setText(f"{age_ms:.1f}")
+        fields["url"].setText(sample.get("url", "—"))
+
     # -- rendering ------------------------------------------------------
 
     def _refresh(self, data):
-        pair_id = data.get("pair_id")
-        if pair_id is not None:
-            self._last_pair_id = pair_id
-        self._frame_label.setText(
-            "Output frame: baseline_center_frd  |  Axes: Forward / Right / Down  |  "
-            "Position/Range: m  |  Angle: deg  |  Pair: "
-            f"{_fmt_int(pair_id) if pair_id is not None else _fmt_int(self._last_pair_id)}"
-        )
         self._refresh_geometry(data)
         self._refresh_delta(data)
         self._refresh_gt(data)
@@ -1939,8 +2180,9 @@ class LiveSavedCsvPreview(QWidget):
 class FrdPlotStack(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(660, 880)
+        self.setMinimumSize(420, 240)
         self._repaint_pending = False
+        self._visible_series = {series_name: True for series_name, _, _ in SERIES}
         self.samples = {
             axis_name: {series_name: deque() for series_name, _, _ in SERIES}
             for axis_name, _ in AXES
@@ -1949,6 +2191,19 @@ class FrdPlotStack(QWidget):
         self._repaint_timer.setInterval(int(1000.0 / RQT_FACTS_RENDER_HZ))
         self._repaint_timer.timeout.connect(self._flush_repaint)
         self._repaint_timer.start()
+
+    def set_series_visible(self, series_name, visible):
+        if series_name not in self._visible_series:
+            return
+        visible = bool(visible)
+        if self._visible_series[series_name] == visible:
+            return
+        self._visible_series[series_name] = visible
+        self._repaint_pending = True
+        self.update()
+
+    def is_series_visible(self, series_name):
+        return bool(self._visible_series.get(series_name, False))
 
     def append(self, series_name, values):
         now = time.monotonic()
@@ -1977,7 +2232,17 @@ class FrdPlotStack(QWidget):
         painter.fillRect(self.rect(), QColor(250, 250, 250))
         painter.setRenderHint(QPainter.Antialiasing, True)
         margin_left = 68
-        margin_right = 190
+        painter.setFont(QFont("Sans", 9))
+        legend_label_width = max(
+            (
+                painter.fontMetrics().horizontalAdvance(SERIES_LABELS[series_name])
+                for series_name, _, _ in SERIES
+            ),
+            default=0,
+        )
+        # Reserve a real legend column instead of drawing into a fixed tail.
+        # Reserve enough space for the UAM GPS label on narrower windows.
+        margin_right = max(220, 53 + legend_label_width)
         margin_top = 34
         margin_bottom = 28
         gap = 22
@@ -1997,7 +2262,12 @@ class FrdPlotStack(QWidget):
             right = margin_left + width
             bottom = top + height
             finite_values = []
-            for series_name, _topic, _color in SERIES:
+            visible_series = [
+                (series_name, topic, color)
+                for series_name, topic, color in SERIES
+                if self.is_series_visible(series_name)
+            ]
+            for series_name, _topic, _color in visible_series:
                 finite_values.extend(
                     value
                     for stamp, value in self.samples[axis_name][series_name]
@@ -2033,15 +2303,15 @@ class FrdPlotStack(QWidget):
 
             legend_x = right + 12
             legend_y = top + 16
-            painter.setFont(QFont("Sans", 10))
-            for series_name, _topic, color in SERIES:
+            painter.setFont(QFont("Sans", 9))
+            for series_name, _topic, color in visible_series:
                 painter.setPen(QPen(color, 3))
                 painter.drawLine(legend_x, legend_y, legend_x + 20, legend_y)
                 painter.setPen(QPen(QColor(32, 32, 32), 1))
                 painter.drawText(legend_x + 35, legend_y + 5, SERIES_LABELS[series_name])
-                legend_y += 24
+                legend_y += 18
 
-            for series_name, _topic, color in SERIES:
+            for series_name, _topic, color in visible_series:
                 points = [
                     (stamp, value)
                     for stamp, value in self.samples[axis_name][series_name]
@@ -2062,7 +2332,11 @@ class FrdPlotStack(QWidget):
                         if last_xy is not None:
                             painter.drawLine(last_xy[0], last_xy[1], x, y)
                         last_xy = (x, y)
-            if not finite_values:
+            if not visible_series:
+                painter.setPen(QPen(QColor(110, 110, 110), 1))
+                painter.setFont(QFont("Sans", 12))
+                painter.drawText(left + 12, top + 34, "Select at least one data series above")
+            elif not finite_values:
                 painter.setPen(QPen(QColor(110, 110, 110), 1))
                 painter.setFont(QFont("Sans", 12))
                 painter.drawText(left + 12, top + 34, "No finite FRD samples in the last 30s")
@@ -2083,10 +2357,19 @@ class OperatorPanel(Plugin):
         self._image_emit_lock = threading.Lock()
         self._last_image_emit_monotonic = {}
         self._bridge = PanelBridge()
+        self._mavlink_attitude_reader = MavlinkAttitudeReader(
+            MAVLINK_ATTITUDE_URL, MAVLINK_ATTITUDE_SIDE_BY_SYSID
+        )
 
         self._widget = QWidget()
         self._widget.setWindowTitle("StereoCAM Operator Panel")
+        # Do not propagate the union of every tab's preferred size to rqt's
+        # top-level QMainWindow.  That can create a desktop-sized minimum
+        # window and remove the window manager's maximize affordance.
+        self._widget.setMinimumSize(0, 0)
+        self._widget.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         root = QVBoxLayout(self._widget)
+        root.setSizeConstraint(QLayout.SetNoConstraint)
         root.setContentsMargins(6, 6, 6, 6)
         model_path = os.environ.get("RQT_YOLO_MODEL_PATH", "").strip()
         model_filename = os.path.basename(model_path) if model_path else "not configured"
@@ -2098,11 +2381,16 @@ class OperatorPanel(Plugin):
         self._debug_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._debug_label.setStyleSheet("font-family: monospace;")
         self._debug_label.setWordWrap(True)
-        self._facts = TelemetryFacts(model_filename)
+        # Ray Diagnostics/Geometry is the single UI source for per-Ray
+        # distance values. Keep the old facts sink optional for compatibility
+        # with live update paths, but do not create a duplicate Flight widget.
+        self._facts = None
         self._left_view = CameraView("Left Camera")
         self._right_view = CameraView("Right Camera")
         self._plot_stack = FrdPlotStack()
         self._recording_controls = RecordingControls()
+        self._respawn_button = self._recording_controls.respawn_button
+        self._respawn_button.clicked.connect(self._respawn_drone)
         self._ray_diagnostics = RayDiagnosticsPanel()
 
         tabs = QTabWidget()
@@ -2126,10 +2414,14 @@ class OperatorPanel(Plugin):
         self._bridge.px4_global_position.connect(self._handle_px4_global_position)
         self._bridge.px4_odometry.connect(self._handle_px4_odometry)
         self._bridge.px4_attitude.connect(self._ray_diagnostics.update_actual_attitude)
+        self._bridge.mavlink_attitude.connect(self._ray_diagnostics.update_mavlink_attitude)
         self._bridge.status.connect(self._set_status)
         self._bridge.runtime_parameters.connect(self._set_runtime_parameters)
         self._bridge.respawn_finished.connect(self._on_respawn_finished)
+        self._mavlink_attitude_reader.attitude.connect(self._bridge.mavlink_attitude.emit)
+        self._mavlink_attitude_reader.status.connect(self._set_status)
         self._init_ros()
+        self._mavlink_attitude_reader.start()
         # A perspective can restore its previously active tab after the plugin
         # constructor returns. Defer the pre-flight default until that restore
         # has completed so a new operator window always opens on Setup.
@@ -2205,13 +2497,6 @@ class OperatorPanel(Plugin):
         cameras.addWidget(self._left_view, 0, 0)
         cameras.addWidget(self._right_view, 0, 1)
         layout.addLayout(cameras)
-        self._respawn_button = QPushButton("Respawn Drone")
-        self._respawn_button.setToolTip(
-            "Teleport the target drone to the configured launch pose in Gazebo."
-        )
-        self._respawn_button.clicked.connect(self._respawn_drone)
-        layout.addWidget(self._respawn_button)
-        layout.addWidget(self._facts)
         layout.addWidget(self._status)
         layout.addWidget(self._ray_diagnostics)
         layout.addStretch(1)
@@ -2221,22 +2506,21 @@ class OperatorPanel(Plugin):
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
-        description = QLabel(
-            "FRDR comparison: Gazebo Target GT plus the seven recorded Rays "
-            "(Nominal Pose, Optical Pose, Ideal, GPS Baseline, Global Baseline, "
-            "Attitude, Operational). "
-            "Range is the 3D vector magnitude when a source "
-            "publishes F/R/D only. Attitude/Full can be far larger than the "
-            "others at long range (shallow stereo intersection angle "
-            "amplifying attitude error) and will dominate the axis scale "
-            "when they diverge."
-        )
-        # Unwrapped, this single-line label's sizeHint is wide enough (~3200px)
-        # to force the whole window's minimum width past most screens,
-        # blocking maximize -- the same union-of-pages sizeHint failure mode
-        # fixed for the Ray Diagnostics tabs.
-        description.setWordWrap(True)
-        layout.addWidget(description)
+        series_group = QGroupBox("Data to draw")
+        series_layout = QGridLayout(series_group)
+        series_layout.setContentsMargins(8, 5, 8, 5)
+        series_layout.setHorizontalSpacing(16)
+        series_layout.setVerticalSpacing(2)
+        self._plot_series_checks = {}
+        for index, (series_name, _topic, _color) in enumerate(SERIES):
+            checkbox = QCheckBox(SERIES_LABELS[series_name])
+            checkbox.setChecked(True)
+            checkbox.toggled.connect(
+                lambda checked, name=series_name: self._plot_stack.set_series_visible(name, checked)
+            )
+            self._plot_series_checks[series_name] = checkbox
+            series_layout.addWidget(checkbox, index // 3, index % 3)
+        layout.addWidget(series_group)
         layout.addWidget(self._plot_stack, 1)
         return tab
 
@@ -2323,19 +2607,23 @@ class OperatorPanel(Plugin):
         if not math.isfinite(frdr[3]) and all(math.isfinite(value) for value in frdr[:3]):
             frdr[3] = math.sqrt(sum(value * value for value in frdr[:3]))
         self._plot_stack.append(series_name, frdr)
-        self._facts.update_sample(series_name, frdr)
+        if self._facts is not None:
+            self._facts.update_sample(series_name, frdr)
         self._record_preview.update_live_sample(series_name, frdr)
 
     def _handle_scalar(self, key, value):
-        self._facts.update_scalar(key, value)
+        if self._facts is not None:
+            self._facts.update_scalar(key, value)
         self._record_preview.update_live_scalar(key, value)
 
     def _handle_detections(self, values):
-        self._facts.update_detections(values)
+        if self._facts is not None:
+            self._facts.update_detections(values)
         self._record_preview.update_live_detections(values)
 
     def _handle_profile(self, payload):
-        self._facts.update_profile(payload)
+        if self._facts is not None:
+            self._facts.update_profile(payload)
         self._record_preview.update_live_profile(payload)
 
     def _handle_ray_metrics(self, payload):
@@ -2649,6 +2937,7 @@ class OperatorPanel(Plugin):
 
     def shutdown_plugin(self):
         self._stop_event.set()
+        self._mavlink_attitude_reader.stop()
         self._recording_controls.shutdown()
         self._record_preview.shutdown()
         if self._ros_graph_process is not None and self._ros_graph_process.poll() is None:

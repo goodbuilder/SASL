@@ -63,16 +63,27 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert '"nominal_pose": "Nominal Pose"' in source
     assert '"optical_pose": "Optical Pose"' in source
     assert '"ideal": "Ideal"' in source
+    assert '"uam_raw_gps_reference": "UAM GPS"' in source
     assert "bbox x1,y1,x2,y2" in source
     assert '("Range", 3)' in source
-    assert "FRDR comparison" in source
+    assert "FRDR comparison" not in source
     assert "legend_x = right + 12" in source
     assert "legend_x + 35" in source
-    assert "legend_y += 24" in source
+    assert "legend_y += 18" in source
+    assert "legend_label_width" in source
+    assert "set_series_visible" in source
+    assert "QCheckBox" in source
+    assert "self._facts = None" in source
+    assert "layout.addWidget(self._facts)" not in source
+    assert "group.setCheckable(True)" not in source
+    assert "group.toggled.connect(content.setVisible)" not in source
     assert "_ASPECT_HEIGHT_PER_WIDTH = 9.0 / 16.0" in source
     assert "QSizePolicy.Ignored, QSizePolicy.MinimumExpanding" in source
     assert "layout.addLayout(cameras)" in source
-    assert 'QPushButton("Respawn Drone")' in source
+    recorder_source = RECORDER_PANEL_PATH.read_text(encoding="utf-8")
+    assert "self._recording_controls.respawn_button" in source
+    assert 'self.respawn_button = QPushButton("Respawn Drone")' in recorder_source
+    assert "controls.addWidget(self.respawn_button)" in recorder_source
     assert '"/stereo/respawn_drone"' in source
     assert "Trigger.Request()" in source
     assert "respawn_finished = Signal()" in source
@@ -120,6 +131,16 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert 'from px4_msgs.msg import SensorGps, VehicleAttitude, VehicleGlobalPosition, VehicleOdometry' in source
     assert 'QGroupBox("Published VehicleAttitude (actual)")' in source
     assert 'PX4 timestamp_sample [us]' in source
+    assert 'QGroupBox("MAVLink ATTITUDE (raw)")' in source
+    assert 'recv_match(' in source
+    assert 'type="ATTITUDE"' in source
+    assert 'RQT_MAVLINK_ATTITUDE_URL' in source
+    assert '"udpin:0.0.0.0:14551"' in source
+    assert 'MAVLINK_ATTITUDE_SIDE_BY_SYSID = {2: "left", 3: "right"}' in source
+    assert 'time_boot_ms' in source
+    assert 'Δyaw ROS2-MAVLink [deg]' in source
+    assert 'self._bridge.mavlink_attitude.connect' in source
+    assert 'MAVLink ATTITUDE: listening on' not in source
     assert 'value_label.setWordWrap(False)' in source
     assert 'actual_grid.setRowMinimumHeight(row, 24)' in source
     assert 'self._bridge.px4_attitude.connect(self._ray_diagnostics.update_actual_attitude)' in source
@@ -157,9 +178,11 @@ def test_flight_toolbar_exposes_csv_mp4_and_debug_recording_actions() -> None:
     assert '("lite", PRIMARY_RECORD_BUTTON_TEXT)' in source
     assert '("full", "Save MP4")' in source
     assert '("debug", "Save Debug")' in source
-    assert 'QPushButton("Auto Mission")' in source
+    assert 'QPushButton("Mission")' in source
     assert 'QPushButton("Waypoint")' in source
-    assert '"run_auto_mission.sh"' in source
+    assert 'QPushButton("Auto")' in source
+    assert '"run_mission.sh"' in source
+    assert '"run_auto.sh"' in source
     assert '"run_px4_waypoint_mission.sh"' in source
     assert "build_mission_command(kind" in source
     assert 'self._start_recording(record_mode)' in source

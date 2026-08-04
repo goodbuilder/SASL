@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import importlib.util
+import signal
 import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -134,6 +136,48 @@ class RecorderPanelTruthSourceTests(unittest.TestCase):
                     ],
                 )
 
+    def test_auto_mission_command_and_stop_helper_use_owned_process_group(self) -> None:
+        module = load_panel_module()
+        self.assertEqual(
+            module.build_mission_command("auto_fov", root_dir=Path("/sim")),
+            ["/sim/run_auto.sh"],
+        )
+
+        class FakeProcess:
+            pid = 321
+
+            def __init__(self):
+                self.return_code = None
+
+            def poll(self):
+                return self.return_code
+
+            def wait(self, timeout=None):
+                self.return_code = 0
+                return self.return_code
+
+        process = FakeProcess()
+        with mock.patch.object(module.os, "killpg") as killpg:
+            module.stop_process_group(process)
+
+        killpg.assert_called_once_with(process.pid, signal.SIGINT)
+
+    def test_stop_button_is_shared_by_recording_and_mission_lifecycle(self) -> None:
+        source = (ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "recorder_panel.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('self._stop_button.clicked.connect(self._stop_all)', source)
+        self.assertIn('"Stopping Auto and finalizing recording…"', source)
+        self.assertIn("os.killpg(process.pid, signal.SIGINT)", source)
+
+    def test_auto_does_not_create_a_mission_recorder_and_save_buttons_remain_independent(self) -> None:
+        source = (ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "recorder_panel.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn('cmd.extend(["--record-dir", str(mission_record_path)])', source)
+        self.assertNotIn("Stop the active recorder before starting Auto", source)
+        self.assertIn("recording starts at the button click", source)
+
     def test_csv_tail_preview_keeps_header_and_latest_persisted_rows(self) -> None:
         module = load_panel_module()
         with tempfile.TemporaryDirectory() as directory:
@@ -181,8 +225,8 @@ class RecorderPanelTruthSourceTests(unittest.TestCase):
             source = Path(directory) / "telemetry.csv"
             output = Path(directory) / "analysis.csv"
             source.write_text(
-                "time_sec,raw_range_m,left_x1,right_x1,raw_gps_baseline_forward_m,"
-                "global_position_baseline_forward_m,raw_minus_global_baseline_delta_m,extra\n"
+                "time_sec,nominal_pose_range_m,left_x1,right_x1,gps_baseline_forward_m,"
+                "global_baseline_forward_m,gps_baseline_minus_global_baseline_delta_m,extra\n"
                 "1.0,2000.0,10,20,1999.0,1998.0,1.0,retain-only-in-raw\n"
                 "2.0,,,,,,,\n",
                 encoding="utf-8",

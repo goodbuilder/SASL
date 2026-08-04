@@ -5,7 +5,7 @@ target metadata. They are shell env files loaded after the base config files:
 
 ```bash
 SIM_SCENARIO_CONFIG=small_drone_close_2m_4x.env ./run_operator_view.sh
-SIM_SCENARIO_CONFIG=small_drone_close_2m_4x.env ./run_auto_mission.sh
+SIM_SCENARIO_CONFIG=small_drone_close_2m_4x.env ./run_mission.sh
 ```
 
 Command-line arguments and explicitly exported environment variables still

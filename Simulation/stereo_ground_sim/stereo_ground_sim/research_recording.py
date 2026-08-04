@@ -22,7 +22,50 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v6"
+RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v9"
+
+
+# Flat scalar fields required to reproduce the reality-transferable
+# Operational measurement.  Oracle/ideal fields remain separate diagnostics.
+CALIBRATION_SAMPLE_COLUMNS = (
+    "sample_id", "simulation_timestamp_ns",
+    "left_observation_timestamp_ns", "right_observation_timestamp_ns",
+    "left_right_dt_s", "left_pose_alignment_dt_s", "right_pose_alignment_dt_s",
+    "observation_gt_dt_s", "sync_valid", "sync_failure_reason",
+    "interpolation_method", "source_timestamp_before_ns",
+    "source_timestamp_after_ns", "interpolation_alpha",
+    "left_observation_source", "right_observation_source",
+    "left_observation_valid", "right_observation_valid",
+    "left_bbox_xmin_px", "left_bbox_ymin_px", "left_bbox_xmax_px", "left_bbox_ymax_px",
+    "right_bbox_xmin_px", "right_bbox_ymin_px", "right_bbox_xmax_px", "right_bbox_ymax_px",
+    "left_operational_position_baseline_center_frd_x_m",
+    "left_operational_position_baseline_center_frd_y_m",
+    "left_operational_position_baseline_center_frd_z_m",
+    "right_operational_position_baseline_center_frd_x_m",
+    "right_operational_position_baseline_center_frd_y_m",
+    "right_operational_position_baseline_center_frd_z_m",
+    "operational_position_source", "operational_position_frame",
+    "left_operational_position_valid", "right_operational_position_valid",
+    "left_operational_attitude_qw", "left_operational_attitude_qx",
+    "left_operational_attitude_qy", "left_operational_attitude_qz",
+    "right_operational_attitude_qw", "right_operational_attitude_qx",
+    "right_operational_attitude_qy", "right_operational_attitude_qz",
+    "operational_attitude_source", "operational_attitude_parent_frame",
+    "operational_attitude_child_frame", "operational_attitude_quaternion_order",
+    "left_operational_pose_timestamp_ns", "right_operational_pose_timestamp_ns",
+    "left_operational_pose_valid", "right_operational_pose_valid",
+    "operational_x_m", "operational_y_m", "operational_z_m",
+    "operational_range_m", "operational_azimuth_deg", "operational_elevation_deg",
+    "operational_ray_generation_valid", "triangulation_valid",
+    "triangulation_status", "triangulation_failure_reason",
+    "near_parallel", "negative_left_depth", "negative_right_depth",
+    "nonfinite_input", "nonfinite_output", "zero_or_small_baseline",
+    "condition_exceeded", "sample_valid", "failure_stage", "failure_code",
+    "failure_reason", "gt_timestamp_ns", "gt_valid", "gt_model_name", "gt_link_name",
+    "gt_world_enu_x_m", "gt_world_enu_y_m", "gt_world_enu_z_m",
+    "left_injected_roll_deg", "left_injected_pitch_deg", "left_injected_yaw_deg",
+    "right_injected_roll_deg", "right_injected_pitch_deg", "right_injected_yaw_deg",
+)
 
 
 def _diagnostic_record_extension_columns() -> tuple[str, ...]:
@@ -31,6 +74,18 @@ def _diagnostic_record_extension_columns() -> tuple[str, ...]:
         columns.extend(
             (
                 f"{prefix}_ray_valid",
+                f"{prefix}_ray_left_origin_x_m",
+                f"{prefix}_ray_left_origin_y_m",
+                f"{prefix}_ray_left_origin_z_m",
+                f"{prefix}_ray_left_direction_x",
+                f"{prefix}_ray_left_direction_y",
+                f"{prefix}_ray_left_direction_z",
+                f"{prefix}_ray_right_origin_x_m",
+                f"{prefix}_ray_right_origin_y_m",
+                f"{prefix}_ray_right_origin_z_m",
+                f"{prefix}_ray_right_direction_x",
+                f"{prefix}_ray_right_direction_y",
+                f"{prefix}_ray_right_direction_z",
                 f"{prefix}_ray_left_depth_m",
                 f"{prefix}_ray_right_depth_m",
                 f"{prefix}_ray_geometry_rank",
@@ -106,16 +161,21 @@ def _diagnostic_record_extension_columns() -> tuple[str, ...]:
             "baseline_anchor_policy",
         )
     )
-    return tuple(columns)
+    # The attitude/operational blocks intentionally share a few provenance
+    # names.  Keep the fixed CSV schema unique so DictWriter/DictReader do not
+    # collapse duplicate header fields during finalization.
+    return tuple(dict.fromkeys(columns))
 
 
 DIAGNOSTIC_RECORD_EXTENSION_COLUMNS = _diagnostic_record_extension_columns()
 
 PAIR_RECORD_COLUMNS = (
-    "schema_version", "run_id", "case_id", "record_sequence", "record_type",
+    "schema_version", "session_id", "run_id", "attempt_id", "case_id",
+    "effective_config_sha256", "record_sequence", "record_type",
+    *CALIBRATION_SAMPLE_COLUMNS,
     "pair_id", "epoch", "left_stamp_ns", "right_stamp_ns",
     "pair_midpoint_stamp_ns", "pair_delta_ns", "pairing_mode",
-    "terminal_status", "terminal_reason", "sample_eligible",
+    "terminal_status", "terminal_reason", "mission_phase", "sample_eligible",
     "measurement_status", "evaluation_status", "gt_alignment_mode",
     "gt_before_stamp_ns", "gt_after_stamp_ns", "gt_interpolation_alpha",
     "gt_nearest_delta_ns", "observation_mode", "observation_source",
@@ -160,6 +220,19 @@ PAIR_RECORD_COLUMNS = (
     "corrected_intersection_angle_deg", "corrected_left_depth_m",
     "corrected_right_depth_m", "corrected_geometry_rank",
     "corrected_condition_number", "attitude_ray_computation_status",
+    "uam_raw_gps_reference_computation_status",
+    "uam_raw_gps_reference_forward_m", "uam_raw_gps_reference_right_m",
+    "uam_raw_gps_reference_down_m", "uam_raw_gps_reference_range_m",
+    "uam_raw_gps_reference_world_enu_x_m",
+    "uam_raw_gps_reference_world_enu_y_m",
+    "uam_raw_gps_reference_world_enu_z_m",
+    "uam_raw_gps_reference_left_timestamp_us",
+    "uam_raw_gps_reference_timestamp_us",
+    "uam_raw_gps_reference_left_age_ms",
+    "uam_raw_gps_reference_uam_age_ms",
+    "uam_raw_gps_reference_pair_skew_ms",
+    "uam_raw_gps_reference_left_eph_m",
+    "uam_raw_gps_reference_uam_eph_m",
     "attitude_ray_failure_reason", "attitude_ray_forward_m",
     "attitude_ray_right_m", "attitude_ray_down_m", "attitude_ray_range_m",
     "attitude_ray_gap_m", "attitude_ray_intersection_angle_deg",
@@ -282,8 +355,18 @@ def validate_recording_configuration(
         raise ValueError("research_output_dir must be absolute")
     resolved_output = candidate.resolve(strict=False)
     resolved_repository = Path(repository_root).resolve(strict=True)
-    if resolved_output == resolved_repository or resolved_repository in resolved_output.parents:
-        raise ValueError("research_output_dir must be outside the repository")
+    recordings_root = resolved_repository / "Simulation" / "recordings"
+    if resolved_repository.name == "Simulation":
+        recordings_root = resolved_repository / "recordings"
+    in_allowed_recordings = (
+        resolved_output == recordings_root
+        or recordings_root in resolved_output.parents
+    )
+    if (resolved_output == resolved_repository or resolved_repository in resolved_output.parents) \
+            and not in_allowed_recordings:
+        raise ValueError(
+            "research_output_dir must be outside the repository or under Simulation/recordings"
+        )
     if candidate.exists() and not candidate.is_dir():
         raise ValueError("research_output_dir exists and is not a directory")
     if candidate.exists() and any(candidate.iterdir()):

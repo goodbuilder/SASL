@@ -212,25 +212,18 @@ def test_panel_separates_truth_delta_gt_error_and_interaction(qt_app):
     assert panel._gt_source_label.text().startswith("GT source: gazebo_vehicle_reference_link_world_pose")
 
 
-def test_panel_frame_and_unit_labels_are_present(qt_app):
+def test_panel_frame_and_unit_summary_is_removed_from_ray_diagnostics(qt_app):
     panel = operator_panel.RayDiagnosticsPanel()
 
-    text = panel._frame_label.text()
-
-    assert "baseline_center_frd" in text
-    assert "Forward" in text
-    assert "Right" in text
-    assert "Down" in text
-    assert " m " in text or text.endswith(" m") or "m " in text
-    assert "deg" in text
+    assert not hasattr(panel, "_frame_label")
 
 
-def test_panel_pair_label_updates_from_payload(qt_app):
+def test_panel_pair_id_payload_still_refreshes_geometry_without_summary_label(qt_app):
     panel = operator_panel.RayDiagnosticsPanel()
 
-    panel.update_ray_metrics(json.dumps({"pair_id": 123, "nominal": _valid_ray()}))
+    panel.update_ray_metrics(json.dumps({"pair_id": 123, "nominal_pose": _valid_ray()}))
 
-    assert "Pair: 123" in panel._frame_label.text()
+    assert _cell(panel._geometry_table, 0, 1) == "VALID"
 
 
 def test_px4_attitude_env_values_read_from_environment(monkeypatch):
@@ -364,7 +357,7 @@ def test_ray_diagnostics_tabs_do_not_force_a_tall_minimum_window(qt_app):
     assert panel.minimumSizeHint().height() < 400
 
 
-def test_toggling_ray_diagnostics_off_and_on_keeps_minimum_height_bounded(qt_app):
+def test_ray_diagnostics_group_has_no_collapse_toggle(qt_app):
     panel = operator_panel.RayDiagnosticsPanel()
     panel.show()
     qt_app.processEvents()
@@ -373,14 +366,16 @@ def test_toggling_ray_diagnostics_off_and_on_keeps_minimum_height_bounded(qt_app
 
     group = panel.findChild(QGroupBox)
     assert group is not None
-
-    group.setChecked(False)
-    qt_app.processEvents()
-    assert panel.minimumSizeHint().height() < 100
-
-    group.setChecked(True)
-    qt_app.processEvents()
+    assert group.isCheckable() is False
     assert panel.minimumSizeHint().height() < 400
+
+
+def test_ray_diagnostics_renders_at_10_hz_with_fixed_horizontal_spacing(qt_app):
+    panel = operator_panel.RayDiagnosticsPanel()
+
+    assert operator_panel.RAY_DIAGNOSTICS_RENDER_HZ == 10.0
+    assert panel._render_timer.interval() == 100
+    assert operator_panel.RAY_DIAGNOSTICS_HORIZONTAL_SPACING == 8
 
 
 def test_analysis_tab_description_does_not_force_a_wide_minimum_window(qt_app):
@@ -458,6 +453,32 @@ def test_plot_stack_accepts_ray_metrics_only_series(qt_app):
         stack.append(series_name, [900.0, 3.0, -2.0, 900.01])
         axis_name, _axis_index = operator_panel.AXES[0]
         assert stack.samples[axis_name][series_name][-1][1] == pytest.approx(900.0)
+
+
+def test_analysis_series_checkboxes_control_plot_visibility(qt_app):
+    stack = operator_panel.FrdPlotStack()
+    assert stack.is_series_visible("truth") is True
+
+    stack.set_series_visible("truth", False)
+    assert stack.is_series_visible("truth") is False
+    assert stack.is_series_visible("nominal_pose") is True
+
+    stack.set_series_visible("unknown", True)
+    assert stack.is_series_visible("unknown") is False
+
+
+def test_analysis_tab_builds_checked_series_selectors(qt_app):
+    panel = operator_panel.OperatorPanel.__new__(operator_panel.OperatorPanel)
+    panel._plot_stack = operator_panel.FrdPlotStack()
+    tab = operator_panel.OperatorPanel._build_analysis_tab(panel)
+
+    assert set(panel._plot_series_checks) == {
+        series_name for series_name, _topic, _color in operator_panel.SERIES
+    }
+    assert all(checkbox.isChecked() for checkbox in panel._plot_series_checks.values())
+    panel._plot_series_checks["truth"].setChecked(False)
+    assert panel._plot_stack.is_series_visible("truth") is False
+    tab.deleteLater()
 
 
 def test_handle_ray_metrics_feeds_the_plot_stack_for_the_four_json_only_rays(qt_app, monkeypatch):

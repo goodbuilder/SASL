@@ -29,7 +29,7 @@ PX4_UXRCE_DDS_PORT="${PX4_UXRCE_DDS_PORT:-8888}"
 PX4_UXRCE_DDS_AGENT_LOG="${PX4_UXRCE_DDS_AGENT_LOG:-/dev/null}"
 PX4_UXRCE_DDS_LIBRARY_PATH="${PX4_UXRCE_DDS_LIBRARY_PATH:-}"
 export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/install/stereo_ground_sim/share/stereo_ground_sim/models:${GZ_SIM_RESOURCE_PATH:-}"
-RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
+RQT_PYTHONPATH="$ROOT_DIR/python_patches:$ROOT_DIR/stereo_ground_sim${PYTHONPATH:+:$PYTHONPATH}"
 DEFAULT_OVERLAY_HZ="${DEFAULT_OVERLAY_HZ:-5.0}"
 DEFAULT_PLOT_HZ="${DEFAULT_PLOT_HZ:-30.0}"
 DEFAULT_PLOT_WINDOW_S="${DEFAULT_PLOT_WINDOW_S:-30.0}"
@@ -291,11 +291,13 @@ Options:
   --headless             Do not start Gazebo GUI or rqt_gui. YOLO and detection
                          overlay topics remain enabled unless --no-yolo or
                          --raw-view is also selected.
+  --skip-colcon-build     Reuse the existing ROS install and repo-local Python sources.
+  --skip-px4-build        Reuse the existing PX4 SITL binary and build output.
   --auto-mission         Start PX4 offboard takeoff/approach/land after the app starts.
   --mission              Alias for --auto-mission.
   --quick-mission        Faster PX4 offboard approach settings for smoke testing.
   --mission-delay S      Delay before auto mission starts. Default: 25.
-  --mission-arg ARG      Pass ARG to ./run_auto_mission.sh. Repeatable.
+  --mission-arg ARG      Pass ARG to ./run_mission.sh. Repeatable.
 USAGE
 }
 
@@ -357,6 +359,8 @@ fi
 
 record_mode=""
 record_dir=""
+record_wait_for_bbox=false
+recording_pid=""
 calibration_csv_path=""
 run_mission=false
 mission_delay_s=25
@@ -369,6 +373,8 @@ launch_input=()
 mission_args=()
 selected_yolo_model=""
 yolo_enabled=true
+skip_colcon_build=false
+skip_px4_build=false
 
 while (($#)); do
   case "$1" in
@@ -395,6 +401,10 @@ while (($#)); do
         record_dir="$1"
         shift
       fi
+      ;;
+    --record-wait-for-bbox)
+      record_wait_for_bbox=true
+      shift
       ;;
     --record-calibration-csv)
       shift
@@ -585,6 +595,14 @@ while (($#)); do
       ;;
     --headless)
       headless=true
+      shift
+      ;;
+    --skip-colcon-build)
+      skip_colcon_build=true
+      shift
+      ;;
+    --skip-px4-build)
+      skip_px4_build=true
       shift
       ;;
     --params)
@@ -903,7 +921,8 @@ cleanup_previous_run() {
   terminate_matching TERM "operator_recorder --mode"
   terminate_matching TERM "calibration_csv_recorder"
   terminate_matching TERM "ros2 bag record .* /stereo/distance"
-  terminate_matching TERM "run_auto_mission.sh"
+  terminate_matching TERM "run_mission.sh"
+  terminate_matching TERM "run_auto.sh"
   terminate_matching TERM "px4_auto_mission.py"
   terminate_matching TERM "make px4_sitl gz_x500"
   terminate_matching TERM "$PX4_DIR/build/px4_sitl_default/bin/px4"
@@ -928,7 +947,8 @@ cleanup_previous_run() {
   terminate_matching KILL "operator_recorder --mode"
   terminate_matching KILL "calibration_csv_recorder"
   terminate_matching KILL "ros2 bag record .* /stereo/distance"
-  terminate_matching KILL "run_auto_mission.sh"
+  terminate_matching KILL "run_mission.sh"
+  terminate_matching KILL "run_auto.sh"
   terminate_matching KILL "px4_auto_mission.py"
   terminate_matching KILL "make px4_sitl gz_x500"
   terminate_matching KILL "$PX4_DIR/build/px4_sitl_default/bin/px4"
@@ -939,11 +959,34 @@ cleanup_previous_run() {
 
 cleanup() {
   local pid
+  # The research recorder is owned by the Python stereo-distance node. Send
+  # SIGINT first: its main loop turns KeyboardInterrupt into node.shutdown(),
+  # which drains the S2 queue and writes pair_records.csv/run_summary.json.
+  # A process-group SIGTERM first would terminate that Python process before
+  # this finalization path can run.
+  if [[ -n "${research_output_dir:-}" ]]; then
+    terminate_matching INT "stereo_ground_sim.stereo_distance_node"
+    terminate_matching INT "stereo_ground_sim/stereo_distance_node"
+    for _ in {1..180}; do
+      [[ -f "$research_output_dir/RUN_FINALIZED_VALID" ]] && break
+      sleep 1
+    done
+  fi
   for pid in "${children[@]}"; do
     if kill -0 "$pid" >/dev/null 2>&1; then
       kill -TERM "-$pid" >/dev/null 2>&1 || kill "$pid" >/dev/null 2>&1 || true
     fi
   done
+  # The recorder flushes CSV/MP4/XLSX and writes its final validity marker on
+  # SIGTERM.  Give it a bounded grace period before the generic child cleanup
+  # escalates to SIGKILL; otherwise Stop can leave RUN_INCOMPLETE despite a
+  # completed Auto mission.
+  if [[ -n "$recording_pid" ]]; then
+    for _ in {1..15}; do
+      kill -0 "$recording_pid" >/dev/null 2>&1 || break
+      sleep 1
+    done
+  fi
   sleep 1
   for pid in "${children[@]}"; do
     # ``ros2 run rqt_gui`` can exit after its inner Python process forks.
@@ -1126,6 +1169,7 @@ if ! has_launch_arg enable_rviz_rays "${launch_input[@]}"; then
   launch_args+=("enable_rviz_rays:=true")
 fi
 launch_args+=("${launch_input[@]}")
+research_output_dir="$(get_launch_arg_value research_output_dir "${launch_args[@]}" || true)"
 rqt_yolo_model_path="${DEFAULT_YOLO_MODEL:-}"
 explicit_yolo_model_path="$(get_launch_arg_value yolo_model_path "${launch_args[@]}" || true)"
 if [[ -n "$explicit_yolo_model_path" ]]; then
@@ -1145,9 +1189,24 @@ if [[ -n "$calibration_csv_path" ]]; then
   printf '%s\n' "Calibration CSV will be recorded to: $calibration_csv_path"
 fi
 
-colcon build \
-  --base-paths "$ROOT_DIR/stereo_ground_sim" "$ROOT_DIR/stereo_ground_sim_overlay" \
-  --packages-select stereo_ground_sim stereo_ground_sim_overlay
+if [[ "$skip_colcon_build" == true ]]; then
+  printf '%s\n' "Skipping colcon build; reusing the existing ROS install and repo-local Python sources."
+else
+  # Build the producer-owned message package together with the Python nodes.
+  # Without it, the immutable experiment-context publisher starts from an
+  # install that has package metadata but no generated Python message module.
+  # Keep the CMake build space outside the repository: colcon/rosidl can
+  # mis-handle the non-ASCII checkout path when its build cache is under
+  # Simulation/build. The install space remains repo-local and portable.
+  operator_colcon_build_base="${SASL_OPERATOR_COLCON_BUILD_BASE:-}"
+  if [[ -z "$operator_colcon_build_base" ]]; then
+    operator_colcon_build_base="$(mktemp -d /tmp/sasl-operator-colcon-build.XXXXXX)"
+  fi
+  colcon build \
+    --base-paths "$ROOT_DIR" \
+    --build-base "$operator_colcon_build_base" \
+    --packages-select simulation_interfaces stereo_ground_sim stereo_ground_sim_overlay
+fi
 
 # Builds (if needed) a local drop-in replacement for gz-sim's installed
 # magnetometer plugin whose built-in geomagnetic table disagrees with PX4's
@@ -1161,7 +1220,13 @@ set +u
 # shellcheck disable=SC1091
 source "$ROOT_DIR/install/setup.bash"
 set -u
-RQT_PYTHONPATH="$ROOT_DIR/python_patches${PYTHONPATH:+:$PYTHONPATH}"
+# The install-space entry points use importlib.metadata to resolve the
+# package, while the source checkout owns sasl_common.  Keep both available
+# when reusing an existing install with --skip-colcon-build.  The build-space
+# egg-info is generated by colcon and is intentionally only a local fallback;
+# a normal rebuild recreates it.
+export PYTHONPATH="$ROOT_DIR/stereo_ground_sim:$INTEGRATION_ROOT:$ROOT_DIR/build/stereo_ground_sim:$ROOT_DIR/stereo_ground_sim_overlay${PYTHONPATH:+:$PYTHONPATH}"
+RQT_PYTHONPATH="$ROOT_DIR/python_patches:$ROOT_DIR/stereo_ground_sim:$INTEGRATION_ROOT:$ROOT_DIR/build/stereo_ground_sim${PYTHONPATH:+:$PYTHONPATH}"
 
 setsid ros2 launch stereo_ground_sim stereo_ground_sim.launch.py "${launch_args[@]}" &
 ros_launch_pid="$!"
@@ -1190,6 +1255,7 @@ setsid bash -c '
     uxrce_dds_port="${12}"
     console_log="${13}"
     camera_airframe_src="${14}"
+    skip_px4_build="${15}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
@@ -1205,7 +1271,11 @@ setsid bash -c '
     cp "$camera_airframe_src" \
       "$px4_dir/ROMFS/px4fmu_common/init.d-posix/airframes/4090_camera_px4"
 
-    make px4_sitl_default
+    if [[ "$skip_px4_build" == true ]]; then
+      printf '%s\n' "Skipping PX4 SITL build; reusing $px4_dir/build/px4_sitl_default."
+    else
+      make px4_sitl_default
+    fi
 
     px4_binary="$px4_dir/build/px4_sitl_default/bin/px4"
     gz_bridge_dir="$px4_dir/build/px4_sitl_default/src/modules/simulation/gz_bridge"
@@ -1286,14 +1356,15 @@ setsid bash -c '
     "$PX4_PYTHON_EXECUTABLE" \
     "$PX4_UXRCE_DDS_PORT" \
     "$PX4_CONSOLE_LOG" \
-    "$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4" &
+    "$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4" \
+    "$skip_px4_build" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
 printf '%s\n' \
   "Target PX4 instance 0: model=$PX4_GZ_MODEL_NAME namespace=/fmu" \
   "Camera_Left PX4 instance ${CAM_L_PX4_INSTANCE:-1}: model=${CAM_L_PX4_MODEL_NAME:-left_stereo_camera} namespace=/${CAM_L_PX4_DDS_NAMESPACE:-camera_left}/fmu" \
   "Camera_Right PX4 instance ${CAM_R_PX4_INSTANCE:-2}: model=${CAM_R_PX4_MODEL_NAME:-right_stereo_camera} namespace=/${CAM_R_PX4_DDS_NAMESPACE:-camera_right}/fmu"
-printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550."
+printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550; operator MAVLink ATTITUDE uses UDP 14551."
 if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
   printf '%s\n' "PX4 console log: $PX4_CONSOLE_LOG"
 fi
@@ -1385,17 +1456,24 @@ if [[ -n "$record_mode" ]]; then
     record_dir="$ROOT_DIR/bags/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"
   fi
   mkdir -p "$record_dir"
-  setsid "$OPERATOR_RECORDER_PYTHON" -m stereo_ground_sim.operator_recorder \
-    --mode "$record_mode" \
-    --output-dir "$record_dir" &
-  children+=("$!")
+  recorder_cmd=(
+    "$OPERATOR_RECORDER_PYTHON" -m stereo_ground_sim.operator_recorder
+    --mode "$record_mode"
+    --output-dir "$record_dir"
+  )
+  if [[ "$record_wait_for_bbox" == true ]]; then
+    recorder_cmd+=(--wait-for-bbox)
+  fi
+  setsid "${recorder_cmd[@]}" &
+  recording_pid="$!"
+  children+=("$recording_pid")
   printf '%s\n' "Recording $record_mode session to: $record_dir"
 fi
 
 if [[ "$run_mission" == true ]]; then
-  setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_auto_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
+  setsid bash -c 'delay="$1"; root="$2"; shift 2; sleep "$delay"; exec "$root/run_mission.sh" "$@"' _ "$mission_delay_s" "$ROOT_DIR" "${mission_args[@]}" &
   children+=("$!")
-  printf '%s\n' "PX4 auto mission will start after ${mission_delay_s}s."
+  printf '%s\n' "PX4 mission will start after ${mission_delay_s}s."
 fi
 
 printf '%s\n' "Operator view started."
@@ -1411,7 +1489,7 @@ else
 fi
 printf '%s\n' "Use QGC for normal control of the existing x500_15m target."
 if [[ "$run_mission" == true ]]; then
-  printf '%s\n' "Auto mission command: ./run_auto_mission.sh ${mission_args[*]}"
+  printf '%s\n' "Mission command: ./run_mission.sh ${mission_args[*]}"
 fi
 
 if wait -n "$ros_launch_pid" "$px4_supervisor_pid"; then

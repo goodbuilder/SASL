@@ -1,0 +1,19 @@
+{
+  "artifacts": {
+    "20260725_165646_667573196.csv": "prepared",
+    "20260725_165646_667573196.xlsx": "prepared",
+    "camera_left.csv": "prepared",
+    "camera_right.csv": "prepared",
+    "px4_left.csv": "prepared",
+    "px4_right.csv": "prepared"
+  },
+  "csv_authoritative": true,
+  "error": "",
+  "generation_id": "20260725_170022_936230770",
+  "phase": "published",
+  "publish_contract": "all stable artifact links resolve through one atomically replaced generation pointer",
+  "published_pointer": "published",
+  "retryable": false,
+  "session_id": "20260725_165646_667573196",
+  "status": "finalized"
+}

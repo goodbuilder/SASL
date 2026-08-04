@@ -53,6 +53,7 @@ Simulation/reports/**
 !Simulation/reports/experiments/*.csv
 Simulation/reports/experiments/EXP-*/
 Simulation/bags/
+Simulation/recordings/
 *.bag
 *.db3
 *.ulg

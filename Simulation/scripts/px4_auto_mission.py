@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import math
+import os
 import sys
 import threading
 import time
@@ -13,6 +14,34 @@ def positive_float(value):
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
+
+
+def bounded_ratio(value):
+    parsed = float(value)
+    if not 0.0 <= parsed < 0.5:
+        raise argparse.ArgumentTypeError("must be in the range [0, 0.5)")
+    return parsed
+
+
+def bbox_inside_safe_fov(bbox, image_width_px, image_height_px, margin_ratio):
+    if bbox is None or len(bbox) != 4:
+        return False
+    try:
+        x1, y1, x2, y2 = (float(value) for value in bbox)
+    except (TypeError, ValueError):
+        return False
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+        return False
+    margin_x = float(image_width_px) * float(margin_ratio)
+    margin_y = float(image_height_px) * float(margin_ratio)
+    return (
+        x2 > x1
+        and y2 > y1
+        and x1 >= margin_x
+        and y1 >= margin_y
+        and x2 <= float(image_width_px) - margin_x
+        and y2 <= float(image_height_px) - margin_y
+    )
 
 
 def build_parser():
@@ -36,6 +65,23 @@ def build_parser():
     parser.add_argument("--setpoint-hz", type=positive_float, default=20.0)
     parser.add_argument("--heartbeat-timeout-s", type=positive_float, default=30.0)
     parser.add_argument(
+        "--fov-guard",
+        action="store_true",
+        help="Require both full detection bounding boxes to stay inside the safe FOV area.",
+    )
+    parser.add_argument(
+        "--bbox-margin-ratio",
+        type=bounded_ratio,
+        default=float(os.environ.get("AUTO_FOV_MARGIN_RATIO", "0.05")),
+        help="Inset each image edge by this ratio before allowing forward motion.",
+    )
+    parser.add_argument(
+        "--fov-detection-timeout-s",
+        type=positive_float,
+        default=float(os.environ.get("AUTO_FOV_DETECTION_TIMEOUT_S", "0.5")),
+        help="Maximum age of the paired left/right detections.",
+    )
+    parser.add_argument(
         "--check-connection",
         action="store_true",
         help="Connect to PX4 and print local position without arming or moving.",
@@ -49,48 +95,224 @@ class ActualDistanceMonitor:
         self.value = None
         self._node = None
         self._thread = None
+        self._executor = None
         self._rclpy = None
+        self._owns_rclpy = False
         self._ready = False
+        self._phase_publish_warning_logged = False
         self._stop = threading.Event()
 
     def start(self):
         try:
             import rclpy
-            from std_msgs.msg import Float32
+            from std_msgs.msg import Float32, String
         except Exception as exc:
             print(f"Actual-distance ROS monitor unavailable: {exc}", flush=True)
             return
 
         self._rclpy = rclpy
-        rclpy.init(args=None)
-        self._node = rclpy.create_node("px4_auto_mission_distance_monitor")
-        self._node.create_subscription(Float32, self.topic, self._callback, 10)
-        self._ready = True
-        self._thread = threading.Thread(target=self._spin, daemon=True)
-        self._thread.start()
+        try:
+            try:
+                from rclpy.executors import SingleThreadedExecutor
+            except Exception:
+                SingleThreadedExecutor = None
+            if not rclpy.ok():
+                rclpy.init(args=None)
+                self._owns_rclpy = True
+            self._node = rclpy.create_node("px4_auto_mission_distance_monitor")
+            self._node.create_subscription(Float32, self.topic, self._callback, 10)
+            self._phase_pub = self._node.create_publisher(
+                String, "/stereo/auto_mission_phase", 10
+            )
+            self._phase_type = String
+            if SingleThreadedExecutor is not None:
+                self._executor = SingleThreadedExecutor()
+                self._executor.add_node(self._node)
+            self._ready = True
+            self._thread = threading.Thread(target=self._spin, daemon=True)
+            self._thread.start()
+        except Exception as exc:
+            print(f"Actual-distance ROS monitor unavailable: {exc}", flush=True)
+            self._ready = False
+            self._node = None
 
     def _callback(self, msg):
         self.value = float(msg.data)
 
+    def publish_phase(self, phase):
+        if self._node is None or not self._ready:
+            return
+        try:
+            if self._rclpy is not None and not self._rclpy.ok():
+                return
+            self._phase_pub.publish(self._phase_type(data=str(phase)))
+        except Exception as exc:
+            if not self._phase_publish_warning_logged:
+                print(
+                    f"Auto mission phase topic unavailable; continuing mission: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                self._phase_publish_warning_logged = True
+
     def _spin(self):
         while not self._stop.is_set() and self._node is not None:
-            self._rclpy.spin_once(self._node, timeout_sec=0.1)
+            try:
+                if self._executor is not None:
+                    self._executor.spin_once(timeout_sec=0.1)
+                else:
+                    self._rclpy.spin_once(self._node, timeout_sec=0.1)
+            except Exception:
+                if not self._stop.is_set():
+                    self._ready = False
+                return
 
     def stop(self):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
         if self._node is not None:
-            self._node.destroy_node()
-        if self._rclpy is not None:
+            try:
+                if self._executor is not None:
+                    self._executor.remove_node(self._node)
+                self._node.destroy_node()
+            except Exception:
+                pass
+        if self._rclpy is not None and self._owns_rclpy:
             try:
                 self._rclpy.shutdown()
             except Exception:
                 pass
+            self._owns_rclpy = False
 
     @property
     def ready(self):
         return self._ready
+
+
+class BboxFovMonitor:
+    """Guard known bbox geometry without making detection a movement prerequisite."""
+
+    def __init__(
+        self,
+        topic="/stereo/live_detections",
+        image_width_px=1280,
+        image_height_px=720,
+        margin_ratio=0.05,
+        timeout_s=0.5,
+    ):
+        self.topic = topic
+        self.image_width_px = int(image_width_px)
+        self.image_height_px = int(image_height_px)
+        self.margin_ratio = float(margin_ratio)
+        self.timeout_s = float(timeout_s)
+        self._rclpy = None
+        self._node = None
+        self._thread = None
+        self._executor = None
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._latest = None
+        self._latest_time = None
+        self.error = None
+
+    def start(self):
+        try:
+            import rclpy
+            from std_msgs.msg import Float32MultiArray
+        except Exception as exc:
+            self.error = f"ROS bbox monitor unavailable: {exc}"
+            return
+
+        self._rclpy = rclpy
+        try:
+            try:
+                from rclpy.executors import SingleThreadedExecutor
+            except Exception:
+                SingleThreadedExecutor = None
+            if not rclpy.ok():
+                rclpy.init(args=None)
+            self._node = rclpy.create_node("px4_auto_fov_bbox_guard")
+            self._node.create_subscription(
+                Float32MultiArray,
+                self.topic,
+                self._callback,
+                10,
+            )
+            if SingleThreadedExecutor is not None:
+                self._executor = SingleThreadedExecutor()
+                self._executor.add_node(self._node)
+        except Exception as exc:
+            self.error = f"ROS bbox monitor failed to start: {exc}"
+            return
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def _callback(self, msg):
+        values = list(getattr(msg, "data", []))
+        if len(values) < 16:
+            return
+        parsed = []
+        for offset in (0, 8):
+            try:
+                valid = float(values[offset]) > 0.5
+                bbox = tuple(float(values[offset + index]) for index in range(1, 5))
+            except (TypeError, ValueError):
+                return
+            if not valid or not all(math.isfinite(value) for value in bbox):
+                parsed.append(None)
+            else:
+                parsed.append(bbox)
+        with self._lock:
+            self._latest = tuple(parsed)
+            self._latest_time = time.monotonic()
+
+    def _spin(self):
+        while not self._stop.is_set() and self._node is not None:
+            try:
+                if self._executor is not None:
+                    self._executor.spin_once(timeout_sec=0.1)
+                else:
+                    self._rclpy.spin_once(self._node, timeout_sec=0.1)
+            except Exception:
+                if self._stop.is_set():
+                    return
+
+    def snapshot(self):
+        with self._lock:
+            latest = self._latest
+            latest_time = self._latest_time
+        if self.error:
+            return True, f"FOV monitor unavailable; movement not gated ({self.error})"
+        if latest is None or latest_time is None:
+            return True, "no paired detections; movement not gated"
+        age = time.monotonic() - latest_time
+        if age > self.timeout_s:
+            return True, f"detections stale ({age:.2f}s); movement not gated"
+        if latest[0] is None or latest[1] is None:
+            return True, "left/right full bbox pair unavailable; movement not gated"
+
+        for side, bbox in zip(("left", "right"), latest):
+            if not bbox_inside_safe_fov(
+                bbox,
+                self.image_width_px,
+                self.image_height_px,
+                self.margin_ratio,
+            ):
+                return False, f"{side} full bbox is outside the safe FOV margin"
+        return True, "both full bboxes inside safe FOV margin"
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        if self._node is not None:
+            try:
+                if self._executor is not None:
+                    self._executor.remove_node(self._node)
+                self._node.destroy_node()
+            except Exception:
+                pass
 
 
 class GcsHeartbeat:
@@ -191,6 +413,14 @@ def command_long(master, command, *params):
         0,
         *padded,
     )
+
+
+def request_land(master):
+    """Ask PX4 to land, including when the offboard mission is interrupted."""
+    if "LAND" in master.mode_mapping():
+        set_mode(master, "LAND")
+    else:
+        command_long(master, mavutil.mavlink.MAV_CMD_NAV_LAND)
 
 
 def wait_command_ack(master, command, timeout_s=5.0):
@@ -343,9 +573,11 @@ def choose_approach_vector():
     }
 
 
-def approach_until_target(master, boot_time, args, x0, y0):
-    monitor = ActualDistanceMonitor()
-    monitor.start()
+def approach_until_target(master, boot_time, args, x0, y0, fov_monitor=None, distance_monitor=None):
+    monitor = distance_monitor or ActualDistanceMonitor()
+    owns_monitor = distance_monitor is None
+    if owns_monitor:
+        monitor.start()
     period_s = 1.0 / args.setpoint_hz
     deadline = time.monotonic() + args.approach_timeout_s
     last_report = 0.0
@@ -373,13 +605,25 @@ def approach_until_target(master, boot_time, args, x0, y0):
                 traveled = math.hypot(x - x0, y - y0)
                 lateral_error = (x - x0) if approach["lateral_axis"] == "north" else (y - y0)
 
-            lateral_mps = clamp(-lateral_gain * lateral_error, -max_lateral_mps, max_lateral_mps)
-            north_mps = approach["north_sign"] * approach_speed_mps
-            east_mps = approach["east_sign"] * approach_speed_mps
-            if approach["lateral_axis"] == "north":
-                north_mps += lateral_mps
+            fov_allowed = True
+            fov_reason = "FOV guard disabled"
+            if fov_monitor is not None:
+                fov_allowed, fov_reason = fov_monitor.snapshot()
+            if fov_allowed:
+                lateral_mps = clamp(-lateral_gain * lateral_error, -max_lateral_mps, max_lateral_mps)
+                north_mps = approach["north_sign"] * approach_speed_mps
+                east_mps = approach["east_sign"] * approach_speed_mps
+                if approach["lateral_axis"] == "north":
+                    north_mps += lateral_mps
+                else:
+                    east_mps += lateral_mps
             else:
-                east_mps += lateral_mps
+                # Once both bboxes are known, stop on a margin violation. A
+                # missing/stale detection is intentionally handled as an
+                # ungated condition by BboxFovMonitor.snapshot().
+                lateral_mps = 0.0
+                north_mps = 0.0
+                east_mps = 0.0
             send_local_velocity_setpoint(
                 master,
                 boot_time,
@@ -417,14 +661,16 @@ def approach_until_target(master, boot_time, args, x0, y0):
                 print(
                     f"  actual={actual_text}, traveled={traveled_text}, "
                     f"speed={approach_speed_mps:.1f} m/s, "
-                    f"lateral_error={lateral_error:.1f} m, lateral={lateral_mps:.1f} m/s",
+                    f"lateral_error={lateral_error:.1f} m, lateral={lateral_mps:.1f} m/s, "
+                    f"fov={'ok' if fov_allowed else fov_reason}",
                     flush=True,
                 )
                 last_report = time.monotonic()
             time.sleep(period_s)
     finally:
         send_local_velocity_setpoint(master, boot_time, 0.0, 0.0, 0.0)
-        monitor.stop()
+        if owns_monitor:
+            monitor.stop()
 
     raise RuntimeError(
         f"Approach timed out before reaching {args.target_distance_m:.1f} m actual distance."
@@ -466,11 +712,28 @@ def wait_landed(master, timeout_s):
 
 def run(args):
     master = mavutil.mavlink_connection(args.connect, autoreconnect=True)
-    wait_heartbeat(master, args.heartbeat_timeout_s)
-    heartbeat = GcsHeartbeat(master)
-    heartbeat.start()
-    pos = wait_local_position(master)
+    fov_monitor = None
+    heartbeat = None
+    distance_monitor = None
     try:
+        wait_heartbeat(master, args.heartbeat_timeout_s)
+        heartbeat = GcsHeartbeat(master)
+        heartbeat.start()
+        distance_monitor = ActualDistanceMonitor()
+        distance_monitor.start()
+        distance_monitor.publish_phase("preflight")
+        if args.fov_guard:
+            fov_monitor = BboxFovMonitor(
+                topic=os.environ.get("AUTO_FOV_DETECTIONS_TOPIC", "/stereo/live_detections"),
+                image_width_px=int(os.environ.get("CAMERA_IMAGE_WIDTH_PX", "1280")),
+                image_height_px=int(os.environ.get("CAMERA_IMAGE_HEIGHT_PX", "720")),
+                margin_ratio=args.bbox_margin_ratio,
+                timeout_s=args.fov_detection_timeout_s,
+            )
+            fov_monitor.start()
+            if fov_monitor.error:
+                raise RuntimeError(fov_monitor.error)
+        pos = wait_local_position(master)
         if args.check_connection:
             print(
                 "PX4 local position: "
@@ -490,6 +753,7 @@ def run(args):
             args.setpoint_hz,
             lambda: send_position_setpoint(master, boot_time, x0, y0, target_z),
         )
+        distance_monitor.publish_phase("takeoff")
         set_mode(master, "OFFBOARD")
         stream_for(
             2.0,
@@ -507,15 +771,21 @@ def run(args):
             target_z,
             args.takeoff_timeout_s,
         )
+        distance_monitor.publish_phase("hover_before_approach")
         stream_for(
             args.first_hover_s,
             args.setpoint_hz,
             lambda: send_position_setpoint(master, boot_time, x0, y0, target_z),
         )
 
-        approach_until_target(master, boot_time, args, x0, y0)
+        distance_monitor.publish_phase("approach")
+        approach_until_target(
+            master, boot_time, args, x0, y0,
+            fov_monitor=fov_monitor, distance_monitor=distance_monitor,
+        )
 
         print("Final hover ...", flush=True)
+        distance_monitor.publish_phase("hover_after_approach")
         stream_for(
             args.final_hover_s,
             args.setpoint_hz,
@@ -523,13 +793,28 @@ def run(args):
         )
 
         print("Landing ...", flush=True)
-        if "LAND" in master.mode_mapping():
-            set_mode(master, "LAND")
-        else:
-            command_long(master, mavutil.mavlink.MAV_CMD_NAV_LAND)
+        distance_monitor.publish_phase("landing")
+        request_land(master)
         wait_landed(master, args.land_timeout_s)
+        distance_monitor.publish_phase("complete")
+    except KeyboardInterrupt:
+        # A GUI Stop or terminal Ctrl+C must not leave an armed vehicle in
+        # OFFBOARD just because the mission process is going away.
+        try:
+            if distance_monitor is not None:
+                distance_monitor.publish_phase("interrupted")
+            request_land(master)
+            print("Mission interrupted; LAND requested.", flush=True)
+        except Exception as exc:
+            print(f"Mission interrupted; LAND request failed: {exc}", file=sys.stderr)
+        raise
     finally:
-        heartbeat.stop()
+        if distance_monitor is not None:
+            distance_monitor.stop()
+        if fov_monitor is not None:
+            fov_monitor.stop()
+        if heartbeat is not None:
+            heartbeat.stop()
 
 
 def main():

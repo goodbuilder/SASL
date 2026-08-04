@@ -1547,12 +1547,14 @@ class OperatorRecorder(Node):
     def __init__(self, args):
         super().__init__("operator_recorder")
         self.mode = args.mode
+        self.wait_for_bbox = bool(getattr(args, "wait_for_bbox", False))
+        self.recording_active = not self.wait_for_bbox
         self.session_dir = Path(args.output_dir).expanduser().resolve()
         self.session_dir.mkdir(parents=True, exist_ok=True)
-        self.recording_started_local = datetime.now().astimezone()
-        self.recording_timestamp = self.recording_started_local.strftime("%Y%m%d_%H%M%S")
-        self.csv_path = self.session_dir / f"telemetry_{self.recording_timestamp}.csv"
-        self.xlsx_path = self.session_dir / f"session_{self.recording_timestamp}.xlsx"
+        self.recording_started_local = None
+        self.recording_timestamp = ""
+        self.csv_path = None
+        self.xlsx_path = None
         self.csv_hz = max(0.5, float(args.csv_hz))
         self.video_fps = max(1.0, float(args.video_fps))
         self.start_monotonic = time.monotonic()
@@ -1586,17 +1588,36 @@ class OperatorRecorder(Node):
         self.bag_storage = (
             self._resolve_bag_storage(args.bag_storage) if self.mode == "debug" else args.bag_storage
         )
-        self._open_csv()
-        self._write_manifest()
-        self._write_progress()
+        if self.recording_active:
+            self._begin_recording()
+        else:
+            self._write_progress(state="waiting_for_bbox")
         self._create_subscriptions()
         self.create_timer(1.0 / self.csv_hz, self._write_csv_row)
         self.create_timer(1.0, self._write_progress)
         if self.mode in ("full", "debug"):
             self._create_video_subscriptions()
-        if self.mode == "debug":
+        if self.mode == "debug" and self.recording_active:
             self._start_debug_bag()
-        self.get_logger().info(f"Recording {self.mode} session to {self.session_dir}")
+        self.get_logger().info(
+            f"Recording {self.mode} session to {self.session_dir}"
+            + (" after first valid bbox pair" if self.wait_for_bbox else "")
+        )
+
+    def _begin_recording(self):
+        if self.recording_active and self.csv_file is not None:
+            return
+        self.recording_active = True
+        self.recording_started_local = datetime.now().astimezone()
+        self.recording_timestamp = self.recording_started_local.strftime("%Y%m%d_%H%M%S")
+        self.csv_path = self.session_dir / f"telemetry_{self.recording_timestamp}.csv"
+        self.xlsx_path = self.session_dir / f"session_{self.recording_timestamp}.xlsx"
+        self.start_monotonic = time.monotonic()
+        self._open_csv()
+        self._write_manifest()
+        if self.mode == "debug" and self.bag_process is None:
+            self._start_debug_bag()
+        self._write_progress(state="writing")
 
     def _open_csv(self):
         self.csv_file = self.csv_path.open("w", newline="", encoding="utf-8")
@@ -2163,6 +2184,20 @@ class OperatorRecorder(Node):
             self.latest["raw_disparity_px"] = self.latest.get("disparity_px", math.nan)
         self.latest["yolo_measurement_raw_range_m"] = self.latest.get("nominal_pose_range_m", math.nan)
         self.last_stamp["/stereo/detections"] = self.get_clock().now().nanoseconds * 1e-9
+        if self.wait_for_bbox and not self.recording_active:
+            valid_pair = all(
+                bool(self.latest.get(field, False))
+                and all(
+                    math.isfinite(float(self.latest.get(coord, math.nan)))
+                    for coord in coords
+                )
+                for field, coords in (
+                    ("left_valid", ("left_x1", "left_y1", "left_x2", "left_y2")),
+                    ("right_valid", ("right_x1", "right_y1", "right_x2", "right_y2")),
+                )
+            )
+            if valid_pair:
+                self._begin_recording()
 
     def _profile_status_cb(self, msg):
         try:
@@ -2249,6 +2284,8 @@ class OperatorRecorder(Node):
         self.last_stamp["/stereo/ray_metrics"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _write_csv_row(self):
+        if not self.recording_active or self.csv_writer is None:
+            return
         now = self.get_clock().now().nanoseconds * 1e-9
         row = {
             "time_sec": f"{time.monotonic() - self.start_monotonic:.6f}",
@@ -2303,6 +2340,8 @@ class OperatorRecorder(Node):
         temporary_path.replace(progress_path)
 
     def _image_cb(self, name, msg):
+        if not self.recording_active:
+            return
         image = self._msg_to_bgr(msg)
         if image is None:
             return
@@ -2407,6 +2446,8 @@ class OperatorRecorder(Node):
                 self.compact_status = "saved"
                 self.compact_error = ""
             self._write_progress(state="finalized")
+        else:
+            self._write_progress(state="not_started")
 
 
 def parse_args():
@@ -2416,6 +2457,11 @@ def parse_args():
     parser.add_argument("--csv-hz", type=float, default=30.0)
     parser.add_argument("--video-fps", type=float, default=20.0)
     parser.add_argument("--bag-storage", default=os.environ.get("OPERATOR_BAG_STORAGE", "auto"))
+    parser.add_argument(
+        "--wait-for-bbox",
+        action="store_true",
+        help="Do not write CSV/MP4 until both left/right bbox detections are valid.",
+    )
     return parser.parse_args()
 
 
@@ -2432,11 +2478,26 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     try:
-        rclpy.spin(recorder)
+        # A malformed/incompatible DDS sample can fail while rclpy converts
+        # it before the Python callback is entered.  Let the recorder skip
+        # that sample and keep the operator/PX4 lifecycle alive; one bad
+        # telemetry sample must not terminate an otherwise valid run.
+        executor = rclpy.executors.SingleThreadedExecutor()
+        executor.add_node(recorder)
+        while rclpy.ok():
+            try:
+                executor.spin_once(timeout_sec=0.2)
+            except RuntimeError as exc:
+                recorder.get_logger().warning(f"Skipping incompatible DDS sample: {exc}")
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         recorder.close()
+        try:
+            executor.remove_node(recorder)
+            executor.shutdown()
+        except (NameError, RuntimeError):
+            pass
         recorder.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

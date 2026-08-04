@@ -45,7 +45,8 @@ SIM_EXPLICIT_NAMES=(
   DRONE_TAKEOFF_ALTITUDE_M DRONE_FORWARD_SPEED_MPS DRONE_MOVE_DISTANCE_M
   DRONE_TARGET_DISTANCE_M DRONE_APPROACH_TIMEOUT_S DRONE_TAKEOFF_TIMEOUT_S
   DRONE_FIRST_HOVER_S DRONE_FINAL_HOVER_S DRONE_LAND_TIMEOUT_S
-  DRONE_SETPOINT_HZ
+  DRONE_SETPOINT_HZ AUTO_FOV_MARGIN_RATIO AUTO_FOV_DETECTION_TIMEOUT_S
+  AUTO_FOV_DETECTIONS_TOPIC
 )
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
@@ -54,7 +55,7 @@ load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./run_auto_mission.sh [options]
+  ./run_mission.sh [options]
 
 Starts the drone auto mission.
 
@@ -70,14 +71,17 @@ Options:
   --distance-m N         Fallback max movement if /ground_truth is unavailable.
   --approach-timeout-s N Approach timeout in seconds.
   --connect STRING       pymavlink connection string. Default: udpin:0.0.0.0:14540
+  --fov-guard            Require both full detection bboxes inside the safe FOV area.
+  --bbox-margin-ratio N  Inset each image edge by N before forward motion. Default: 0.05.
+  --fov-detection-timeout-s N  Maximum age of the paired detections. Default: 0.5.
   --check-connection     Check PX4 connection without moving the drone.
   --help, -h             Show this help.
 
 Examples:
   ./run_operator_view.sh --record-lite
-  ./run_auto_mission.sh
-  ./run_auto_mission.sh --quick
-  ./run_auto_mission.sh --target-distance-m 200 --altitude-m 10 --speed-mps 15
+  ./run_mission.sh
+  ./run_mission.sh --quick
+  ./run_mission.sh --target-distance-m 200 --altitude-m 10 --speed-mps 15
 USAGE
 }
 
@@ -134,6 +138,15 @@ while (($#)); do
       shift
       ;;
     --connect)
+      provided_args+=("$1")
+      mission_args+=("$1" "${2:?missing value for $1}")
+      shift 2
+      ;;
+    --fov-guard)
+      mission_args+=("$1")
+      shift
+      ;;
+    --bbox-margin-ratio|--fov-detection-timeout-s)
       provided_args+=("$1")
       mission_args+=("$1" "${2:?missing value for $1}")
       shift 2

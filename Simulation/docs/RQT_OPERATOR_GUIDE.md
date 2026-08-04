@@ -12,8 +12,9 @@ rather than replaced by zero.
 reference in the same public FRD frame. It converts simultaneous UAM and
 left-camera raw WGS-84 fixes through ECEF and left-local ENU, then anchors the
 result at the nominal left optical center before applying the fixed rig FRD
-transform. It is shown beside Stereo measurements in rqt and recorded in CSV,
-but is not simulator ground truth.
+transform. It is shown as `UAM GPS` beside Stereo measurements in rqt and as
+`UAM GPS Ray` from the fixed baseline-center origin in RViz. The same source is
+recorded in CSV, but is not simulator ground truth.
 
 Simulation World uses ENU; camera optical vectors use RDF; public measurement
 vectors use fixed `baseline_center_frd` (Forward, Right, Down), with origin at
@@ -26,7 +27,9 @@ contract, and the live parameters used by the current run.
 It also contains the recording controls: `Save CSV`, `Save MP4`, `Save Debug`,
 `Stop`, and the output directory. `Save CSV` writes telemetry; `Save MP4` adds
 left/right overlay video; `Save Debug` also adds a rosbag. While recording,
-all preset buttons and the output directory are locked. `Flight` contains balanced left/right camera images and direct telemetry values. `Analysis` gives the
+all preset buttons and the output directory are locked. Auto itself does not
+start a recorder: these buttons remain available during Auto, and the selected
+recording starts at the button click. `Flight` contains balanced left/right camera images and direct telemetry values. `Analysis` gives the
 Forward, Right, Down, and Range plots the whole tab. The Raw GPS baseline
 publishes F/R/D; its Range plot value is the explicit 3D vector magnitude.
 Global Baseline is displayed from the same Ray snapshot as the other diagnostic Rays.
@@ -34,7 +37,17 @@ Global Baseline is displayed from the same Ray snapshot as the other diagnostic 
 status without turning it into an automated warning or qualification result.
 Calibration recording remains a CLI workflow.
 
-`Flight` also has a collapsible `Ray Diagnostics` group below the direct
+When a mission was started from the Flight toolbar, `Stop` stops the owned
+Mission/Waypoint/Auto process group. For Auto, the mission requests PX4 `LAND`
+on interruption, and the recorder receives the same stop signal before the UI
+waits for CSV flush, MP4 release, and XLSX/compact-session finalization. The
+saved artifacts therefore contain only samples accepted from the Save button
+click through the Stop action. If no Save button was pressed, Auto produces no
+CSV or MP4 artifact.
+An Auto process started separately from a terminal or from `--auto-mission` is
+not owned by this rqt control and must be stopped by its launcher/QGC path.
+
+`Flight` also has a `Ray Diagnostics` group below the direct
 telemetry line. It reads the existing `/stereo/ray_metrics` snapshot only; it
 adds no triangulation, GT, or GPS-anchor logic of its own. `Geometry` lists
 seven rays (`Nominal Pose`, `Optical Pose`, `Ideal`, `GPS Baseline`,
@@ -105,7 +118,8 @@ R4-B work.
 `Setup` 탭의 `Save CSV`는 Lite 기록을, `Save MP4`는 Full 기록을, `Save Debug`는
 Debug 기록을 시작한다. `Save CSV`는 `telemetry.csv`만, `Save MP4`는 CSV와 좌/우
 overlay MP4를, `Save Debug`는 그 결과물과 rosbag까지 남긴다. 바로 옆 `Stop`으로
-종료한다. 별도 `operator_recorder` 프로세스가 현재 ROS 토픽을 구독하므로
+종료한다. `Auto` 실행 중에도 Save 버튼을 누를 수 있으며, 버튼 클릭 이후부터
+수집된 데이터만 저장한다. 별도 `operator_recorder` 프로세스가 현재 ROS 토픽을 구독하므로
 카메라·그래프·baseline source 선택 상태는 유지된다.
 
 각 `telemetry.csv` 행은 public FRD (Forward, Right, Down) 미터 계약으로

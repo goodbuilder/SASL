@@ -133,7 +133,7 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
                 f"case \"$*\" in\n"
                 f"  *\"make px4_sitl_default\"*) exec \"$@\" ;;\n"
                 f"  *\"MicroXRCEAgent\"*) exec \"$@\" ;;\n"
-                f"  *\"run_auto_mission.sh\"*) printf '%s\\n' mission-start >> {str(marker)!r} ;;\n"
+                f"  *\"run_mission.sh\"*) printf '%s\\n' mission-start >> {str(marker)!r} ;;\n"
                 f"  ros2*) /bin/sleep \"${{PX4_TEST_ROS_SLEEP:-0.1}}\"; printf '%s\\n' \"setsid:$1\" >> {str(marker)!r} ;;\n"
                 f"  *) printf '%s\\n' \"setsid:$1\" >> {str(marker)!r} ;;\n"
                 "esac"

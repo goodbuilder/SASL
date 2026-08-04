@@ -18,6 +18,7 @@ from stereo_ground_sim.stereo_distance_node import (
     dkl_ideal_pixels_from_world,
     reference_ray_world_enu_from_point,
     ray_visualization_world_enu_from_triangulation,
+    uam_gps_ray_visualization_world_enu_from_point,
 )
 
 
@@ -109,6 +110,26 @@ def test_rviz_reference_ray_can_display_points_outside_dkl_pixel_bounds() -> Non
     )
 
 
+def test_uam_gps_ray_uses_baseline_center_origin_and_world_enu_target() -> None:
+    left, right = nominal_camera_poses(25.0, 5.0)
+    frame = build_baseline_center_frd(
+        left.center_world_enu_m,
+        right.center_world_enu_m,
+        left.forward_world_enu,
+        right.forward_world_enu,
+    )
+    point_world = frame.point_to_world((1000.0, 4.0, -2.0))
+
+    ray = uam_gps_ray_visualization_world_enu_from_point(frame, point_world)
+
+    assert ray is not None
+    assert ray["computation_status"] == "computed"
+    assert ray["output_frame"] == "baseline_center_frd"
+    assert ray["origin_world_enu_m"] == pytest.approx(frame.origin_world_enu_m)
+    assert ray["target_world_enu_m"] == pytest.approx(point_world)
+    assert ray["point_baseline_center_frd_m"] == pytest.approx((1000.0, 4.0, -2.0))
+
+
 def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> None:
     launcher = (ROOT_DIR / "run_operator_view.sh").read_text(encoding="utf-8")
     launch = (ROOT_DIR / "stereo_ground_sim" / "launch" / "stereo_ground_sim.launch.py").read_text(
@@ -135,7 +156,7 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     assert "Marker Topic:" not in distance_display
     assert "/stereo/distance_marker" in distance_display
     assert "Enabled: false" in distance_display
-    ray_display = rviz.split("Name: Stereo Rays — Nominal Pose / Optical Pose / Ideal / GPS Baseline / Global Baseline / Attitude / Operational (World ENU)", 1)[0].rsplit("Class: rviz_default_plugins/MarkerArray", 1)[1]
+    ray_display = rviz.split("Name: Stereo Rays — Nominal Pose / Optical Pose / Ideal / GPS Baseline / Global Baseline / Attitude / Operational / UAM GPS Ray (World ENU)", 1)[0].rsplit("Class: rviz_default_plugins/MarkerArray", 1)[1]
     assert "Topic:" in ray_display
     assert "Marker Topic:" not in ray_display
     assert "Durability Policy: Transient Local" in ray_display
@@ -152,6 +173,7 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     assert "stereo_rays_global_baseline: true" in rviz
     assert "stereo_rays_attitude: true" in rviz
     assert "stereo_rays_operational: true" in rviz
+    assert "stereo_rays_uam_gps: true" in rviz
     assert "stereo_cameras: true" in rviz
     assert "Name: Stereo Camera FOV (World ENU)" in rviz
     assert "- Class: rviz_default_plugins/MarkerArray\n      Enabled: false" in rviz
@@ -159,11 +181,12 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
     assert "stereo_actual_drone: true" in rviz
 
 
-def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_groups() -> None:
+def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -> None:
     source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
 
     assert "_rviz_live_worker_loop" in source
     assert "_latest_rviz_ideal_ray" in source
+    assert "uam_gps_ray_visualization_world_enu_from_point" in source
     assert '"/stereo/live_detections"' in source
     assert "self.live_detections_pub.publish(self._detections_to_msg(left, right))" in source
     assert "rviz_live_latest_only" in source
@@ -187,6 +210,9 @@ def test_marker_source_contains_nominal_optical_ideal_and_gps_baseline_ray_group
     assert 'label="optical_pose"' in source
     assert 'label="ideal"' in source
     assert 'label="gps_baseline"' in source
+    assert '"UAM GPS Ray"' in source
+    assert 'namespace = "stereo_rays_uam_gps"' in source
+    assert "uam_gps_ray=uam_gps_ray" in source
     assert 'label="global_baseline"' in source
     assert 'display_name = RAY_DISPLAY_NAMES[label]' in source
     assert 'f"left_{display_name}_ray"' in source
@@ -255,6 +281,7 @@ def test_rviz_ray_colors_match_the_nominal_optical_and_ideal_rqt_series() -> Non
     ):
         assert f'label="{label}",' in source
         assert f"marker_id={marker_id}," in source
+    assert "line(80, namespace, \"UAM GPS Ray\"" in source
     for color in (
         "(0.65, 0.25, 0.95)",
         "(1.0, 0.62, 0.0)",

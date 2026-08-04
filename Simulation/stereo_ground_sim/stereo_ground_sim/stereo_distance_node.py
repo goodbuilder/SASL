@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -355,6 +356,40 @@ def reference_ray_world_enu_from_point(
     }
 
 
+def uam_gps_ray_visualization_world_enu_from_point(
+    baseline_center_frd,
+    point_world_enu_m,
+):
+    """Return one GPS reference ray from the fixed baseline-center origin.
+
+    The GPS reference point is public ``baseline_center_frd`` data, while RViz
+    renders in World ENU.  This helper keeps that conversion explicit and does
+    not apply camera projection or stereo triangulation.
+    """
+
+    try:
+        point_world = tuple(float(value) for value in point_world_enu_m[:3])
+    except (TypeError, ValueError):
+        return None
+    if len(point_world) != 3 or not all(math.isfinite(value) for value in point_world):
+        return None
+    point_frd = tuple(baseline_center_frd.point_from_world(point_world))
+    origin_world = tuple(baseline_center_frd.origin_world_enu_m)
+    return {
+        "origin_world_enu_m": origin_world,
+        "target_world_enu_m": point_world,
+        "point_baseline_center_frd_m": point_frd,
+        "forward_m": float(point_frd[0]),
+        "right_m": float(point_frd[1]),
+        "down_m": float(point_frd[2]),
+        "range_m": math.sqrt(sum(float(value) * float(value) for value in point_frd)),
+        "computation_status": "computed",
+        "output_frame": BASELINE_CENTER_FRD_FRAME,
+        "axis_contract": BASELINE_CENTER_FRD_AXIS_CONTRACT,
+        "vector_contract": BASELINE_CENTER_FRD_VECTOR_CONTRACT,
+    }
+
+
 def dkl_ideal_pixels_from_world(
     point_world_enu_m,
     left_camera_pose,
@@ -489,7 +524,11 @@ class StereoDistanceNode(Node):
         self.declare_parameter("enable_research_recording", False)
         self.declare_parameter("research_output_dir", "")
         self.declare_parameter("research_run_id", "")
+        self.declare_parameter("research_session_id", "")
+        self.declare_parameter("research_attempt_id", "")
         self.declare_parameter("research_case_id", "")
+        self.declare_parameter("research_effective_config_path", "")
+        self.declare_parameter("research_effective_config_sha256", "")
         self.declare_parameter("research_repository", "")
         self.declare_parameter("research_branch", "")
         self.declare_parameter("research_commit_sha", "")
@@ -646,7 +685,15 @@ class StereoDistanceNode(Node):
         self.enable_research_recording = self._bool_param("enable_research_recording")
         self.research_output_dir = str(self.get_parameter("research_output_dir").value)
         self.research_run_id = str(self.get_parameter("research_run_id").value)
+        self.research_session_id = str(self.get_parameter("research_session_id").value)
+        self.research_attempt_id = str(self.get_parameter("research_attempt_id").value)
         self.research_case_id = str(self.get_parameter("research_case_id").value)
+        self.research_effective_config_path = str(
+            self.get_parameter("research_effective_config_path").value
+        )
+        self.research_effective_config_sha256 = str(
+            self.get_parameter("research_effective_config_sha256").value
+        )
         self.research_repository = str(self.get_parameter("research_repository").value)
         self.research_branch = str(self.get_parameter("research_branch").value)
         self.research_commit_sha = str(self.get_parameter("research_commit_sha").value)
@@ -733,6 +780,7 @@ class StereoDistanceNode(Node):
             "global_baseline": 0,
         }
         self.last_uam_raw_gps_reference_published_pair_id = 0
+        self.external_mission_phase = ""
         self.measurement_queue_overflow_count = 0
         self.measurement_overrun_invalid = False
         self.measurement_rejected_after_overrun_count = 0
@@ -888,6 +936,12 @@ class StereoDistanceNode(Node):
             PoseStamped,
             "/simulation/ground_truth/vehicle_reference_link",
             self._ground_truth_pose_cb,
+            10,
+        )
+        self.auto_mission_phase_sub = self.create_subscription(
+            String,
+            "/stereo/auto_mission_phase",
+            self._auto_mission_phase_callback,
             10,
         )
         camera_oracle_qos = QoSProfile(
@@ -1114,7 +1168,11 @@ class StereoDistanceNode(Node):
             "enable_research_recording",
             "research_output_dir",
             "research_run_id",
+            "research_session_id",
+            "research_attempt_id",
             "research_case_id",
+            "research_effective_config_path",
+            "research_effective_config_sha256",
             "research_repository",
             "research_branch",
             "research_commit_sha",
@@ -1137,6 +1195,15 @@ class StereoDistanceNode(Node):
 
     def _research_run_metadata(self):
         observation = self._observation_metadata()
+        intrinsics = self._camera_intrinsics(
+            self.camera_image_width_px, self.camera_image_height_px
+        )
+        left_origin_frd = self.baseline_center_frd.point_from_world(
+            self.nominal_left_camera.center_world_enu_m
+        )
+        right_origin_frd = self.baseline_center_frd.point_from_world(
+            self.nominal_right_camera.center_world_enu_m
+        )
         desired_camera_poses = {
             label: {
                 "center_world_enu_m": list(camera.center_world_enu_m),
@@ -1168,8 +1235,13 @@ class StereoDistanceNode(Node):
         )
         return {
             "schema_version": RESEARCH_SCHEMA_VERSION,
+            "recorder_version": RESEARCH_SCHEMA_VERSION,
+            "session_id": self.research_session_id,
             "run_id": self.research_run_id,
+            "attempt_id": self.research_attempt_id,
             "case_id": self.research_case_id,
+            "effective_config_path": self.research_effective_config_path,
+            "effective_config_sha256": self.research_effective_config_sha256,
             "repository": self.research_repository,
             "branch": self.research_branch,
             "commit_sha": self.research_commit_sha,
@@ -1201,6 +1273,31 @@ class StereoDistanceNode(Node):
             "image_width_px": self.camera_image_width_px,
             "image_height_px": self.camera_image_height_px,
             "camera_update_rate_hz": self.camera_update_rate_hz,
+            "intrinsic_profile_id": "simulation_pinhole_from_horizontal_fov",
+            "intrinsic_profile_sha256": "not_applicable_generated_from_effective_config",
+            "fx_px": intrinsics.fx_px,
+            "fy_px": intrinsics.fy_px,
+            "cx_px": intrinsics.cx_px,
+            "cy_px": intrinsics.cy_px,
+            "skew_px": 0.0,
+            "distortion_model": "none",
+            "distortion_coefficients": [],
+            "pixel_origin": "top_left",
+            "u_axis_direction": "right",
+            "v_axis_direction": "down",
+            "distorted_or_undistorted": "undistorted_pinhole",
+            "crop_policy": "none",
+            "resize_policy": "none",
+            "letterbox_policy": "none",
+            "left_nominal_origin_baseline_center_frd_m": list(left_origin_frd),
+            "right_nominal_origin_baseline_center_frd_m": list(right_origin_frd),
+            "baseline_vector_baseline_center_frd_m": [
+                right_origin_frd[index] - left_origin_frd[index] for index in range(3)
+            ],
+            "baseline_length_m": math.sqrt(sum(
+                (right_origin_frd[index] - left_origin_frd[index]) ** 2
+                for index in range(3)
+            )),
             "camera_oracle_source": "gazebo_observed_optical",
             "camera_oracle_expected_sdf_sha256": self.camera_oracle_generated_sdf_sha256,
             "camera_oracle_max_age_s": self.camera_oracle_max_age_s,
@@ -1263,7 +1360,12 @@ class StereoDistanceNode(Node):
             "target_class": self.target_class,
             "target_size_m": self._finite_or_none(self.target_size_m),
             "mission_profile": self.mission_profile,
+            "trajectory_id": self.mission_profile,
             "target_model_name": self.target_model_name,
+            "ground_truth_source": "gazebo_vehicle_reference_link_world_pose",
+            "ground_truth_model_name": self.target_model_name,
+            "ground_truth_link_name": VEHICLE_REFERENCE_LINK,
+            "ground_truth_fallback_allowed": False,
             "target_spawn_z_m": self.target_spawn_z_m,
             "scenario_range_min_m": self._finite_or_none(self.scenario_range_min_m),
             "scenario_range_max_m": self._finite_or_none(self.scenario_range_max_m),
@@ -1990,10 +2092,11 @@ class StereoDistanceNode(Node):
         )
         if left_epoch != current_epoch or uam_epoch != current_epoch:
             return {"computation_status": "raw_gps_epoch_mismatch"}
-        if (
-            time.monotonic_ns() - min(left_received_ns, uam_received_ns)
-            > self.gps_baseline_max_age_s * 1_000_000_000
-        ):
+        now_ns = time.monotonic_ns()
+        left_age_ms = max(0.0, (now_ns - left_received_ns) / 1_000_000.0)
+        uam_age_ms = max(0.0, (now_ns - uam_received_ns) / 1_000_000.0)
+        pair_skew_ms = abs(left_fix.timestamp_us - uam_fix.timestamp_us) / 1000.0
+        if max(left_age_ms, uam_age_ms) > self.gps_baseline_max_age_s * 1000.0:
             return {"computation_status": "stale_raw_gps_fix"}
         if (
             abs(left_fix.timestamp_us - uam_fix.timestamp_us)
@@ -2022,7 +2125,23 @@ class StereoDistanceNode(Node):
             "uam_timestamp_us": uam_fix.timestamp_us,
             "left_eph_m": left_fix.eph_m,
             "uam_eph_m": uam_fix.eph_m,
+            "left_age_ms": left_age_ms,
+            "uam_age_ms": uam_age_ms,
+            "pair_skew_ms": pair_skew_ms,
         }
+
+    def _auto_mission_phase_callback(self, msg):
+        phase = str(getattr(msg, "data", "")).strip()
+        if phase:
+            self.external_mission_phase = phase
+
+    def _recording_mission_phase(self, fallback=None):
+        phase = str(getattr(self, "external_mission_phase", "")).strip()
+        if phase:
+            return phase
+        if fallback is not None:
+            return fallback
+        return self._mission_state()["phase"]
 
     def _camera_oracle_record_fields(self, snapshot=_CAMERA_ORACLE_UNSET):
         fields = {
@@ -2119,8 +2238,11 @@ class StereoDistanceNode(Node):
         record.update(
             {
                 "schema_version": RESEARCH_SCHEMA_VERSION,
+                "session_id": self.research_session_id,
                 "run_id": self.research_run_id,
+                "attempt_id": self.research_attempt_id,
                 "case_id": self.research_case_id,
+                "effective_config_sha256": self.research_effective_config_sha256,
                 "record_sequence": None,
                 "record_type": "pair_terminal",
                 "pair_id": int(pair.pair_id),
@@ -2132,6 +2254,7 @@ class StereoDistanceNode(Node):
                 "pairing_mode": str(pair.pairing_mode),
                 "terminal_status": str(terminal_status),
                 "terminal_reason": str(terminal_reason),
+                "mission_phase": metrics.get("mission_phase", self._recording_mission_phase()),
                 "measurement_status": str(measurement_status),
                 "evaluation_status": str(evaluation_status),
                 "gt_alignment_mode": (
@@ -2275,6 +2398,7 @@ class StereoDistanceNode(Node):
             )
         )
         record.update(self._diagnostic_research_record_fields(metrics))
+        record.update(self._calibration_research_record_fields(pair, alignment, metrics))
         for name in self._attitude_parameter_names():
             record[
                 PX4_ATTITUDE_TO_LEGACY_RESEARCH_COLUMN.get(name, name)
@@ -2712,6 +2836,10 @@ class StereoDistanceNode(Node):
             "disparity_px": pixels[0] - pixels[2],
             "point_on_left_ray_baseline_center_frd_m": None,
             "point_on_right_ray_baseline_center_frd_m": None,
+            "left_ray_origin_baseline_center_frd_m": None,
+            "right_ray_origin_baseline_center_frd_m": None,
+            "left_ray_direction_baseline_center_frd": None,
+            "right_ray_direction_baseline_center_frd": None,
             "midpoint_baseline_center_frd_m": None,
             "forward_m": None,
             "right_m": None,
@@ -2765,6 +2893,10 @@ class StereoDistanceNode(Node):
         right_point = result.point_on_right_ray_rdf_m
         base.update(
             {
+                "left_ray_origin_baseline_center_frd_m": tuple(left_origin),
+                "right_ray_origin_baseline_center_frd_m": tuple(right_origin),
+                "left_ray_direction_baseline_center_frd": tuple(left_ray),
+                "right_ray_direction_baseline_center_frd": tuple(right_ray),
                 "point_on_left_ray_baseline_center_frd_m": left_point,
                 "point_on_right_ray_baseline_center_frd_m": right_point,
                 "midpoint_baseline_center_frd_m": midpoint,
@@ -3105,10 +3237,52 @@ class StereoDistanceNode(Node):
 
     @staticmethod
     def _diagnostic_research_record_fields(metrics):
+        fields = {
+            "uam_raw_gps_reference_computation_status": metrics.get(
+                "uam_raw_gps_reference_computation_status"
+            ),
+            "uam_raw_gps_reference_forward_m": metrics.get(
+                "uam_raw_gps_reference_forward_m"
+            ),
+            "uam_raw_gps_reference_right_m": metrics.get(
+                "uam_raw_gps_reference_right_m"
+            ),
+            "uam_raw_gps_reference_down_m": metrics.get(
+                "uam_raw_gps_reference_down_m"
+            ),
+            "uam_raw_gps_reference_range_m": metrics.get(
+                "uam_raw_gps_reference_range_m"
+            ),
+            "uam_raw_gps_reference_left_timestamp_us": metrics.get(
+                "uam_raw_gps_reference_left_timestamp_us"
+            ),
+            "uam_raw_gps_reference_timestamp_us": metrics.get(
+                "uam_raw_gps_reference_timestamp_us"
+            ),
+            "uam_raw_gps_reference_left_age_ms": metrics.get(
+                "uam_raw_gps_reference_left_age_ms"
+            ),
+            "uam_raw_gps_reference_uam_age_ms": metrics.get(
+                "uam_raw_gps_reference_uam_age_ms"
+            ),
+            "uam_raw_gps_reference_pair_skew_ms": metrics.get(
+                "uam_raw_gps_reference_pair_skew_ms"
+            ),
+            "uam_raw_gps_reference_left_eph_m": metrics.get(
+                "uam_raw_gps_reference_left_eph_m"
+            ),
+            "uam_raw_gps_reference_uam_eph_m": metrics.get(
+                "uam_raw_gps_reference_uam_eph_m"
+            ),
+        }
+        world_enu = metrics.get("uam_raw_gps_reference_world_enu_m")
+        for axis, value in zip(("x", "y", "z"), world_enu or ()):
+            fields[f"uam_raw_gps_reference_world_enu_{axis}_m"] = value
+        for axis in ("x", "y", "z"):
+            fields.setdefault(f"uam_raw_gps_reference_world_enu_{axis}_m", None)
         diagnostic_rays = metrics.get("_diagnostic_rays")
         if not isinstance(diagnostic_rays, dict):
-            return {}
-        fields = {}
+            return fields
         for name in ("attitude", "operational"):
             result = diagnostic_rays.get(name)
             if not isinstance(result, dict):
@@ -3146,6 +3320,16 @@ class StereoDistanceNode(Node):
                     ),
                 }
             )
+            for side in ("left", "right"):
+                origin = result.get(f"{side}_ray_origin_baseline_center_frd_m")
+                direction = result.get(f"{side}_ray_direction_baseline_center_frd")
+                for axis, value in zip(("x", "y", "z"), origin or ()):
+                    fields[f"{record_prefix}_{side}_origin_{axis}_m"] = value
+                for axis, value in zip(("x", "y", "z"), direction or ()):
+                    fields[f"{record_prefix}_{side}_direction_{axis}"] = value
+                for axis in ("x", "y", "z"):
+                    fields.setdefault(f"{record_prefix}_{side}_origin_{axis}_m", None)
+                    fields.setdefault(f"{record_prefix}_{side}_direction_{axis}", None)
             for field in (
                 "forward_m",
                 "right_m",
@@ -3284,6 +3468,140 @@ class StereoDistanceNode(Node):
                 "baseline_anchor_policy": gps_source.get("baseline_anchor_policy"),
             }
         )
+        return fields
+
+    @staticmethod
+    def _calibration_research_record_fields(pair, alignment, metrics):
+        """Flatten the reality-transferable Operational input contract.
+
+        Values here intentionally come only from observed pixels, PX4 attitude,
+        and the GPS-baseline operational pose. Gazebo optical pose and injected
+        truth remain separate label/debug fields.
+        """
+
+        rays = metrics.get("_diagnostic_rays")
+        operational = rays.get("operational", {}) if isinstance(rays, dict) else {}
+        status = str(operational.get("computation_status") or "unavailable")
+        op_valid = bool(operational.get("valid", False))
+        gt_mode = "unavailable" if alignment is None else alignment.gt_alignment_mode
+        gt_before = None if alignment is None else alignment.gt_before_stamp_ns
+        gt_after = None if alignment is None else alignment.gt_after_stamp_ns
+        gt_timestamp = (
+            pair.pair_midpoint_stamp_ns if gt_mode in ("exact", "interpolated")
+            else gt_before if gt_mode == "nearest_before"
+            else gt_after if gt_mode == "nearest_after"
+            else None
+        )
+        gt_world = None if alignment is None else alignment.position_world_enu_m
+        left_pose_us = operational.get("left_attitude_timestamp_us")
+        right_pose_us = operational.get("right_attitude_timestamp_us")
+        left_depth = operational.get("left_depth_m")
+        right_depth = operational.get("right_depth_m")
+        failure_reason = str(operational.get("failure_reason") or "")
+        failure_token = f"{status};{failure_reason}".lower()
+        fields = {
+            "sample_id": f"{pair.epoch}:{pair.pair_id}",
+            "simulation_timestamp_ns": int(pair.pair_midpoint_stamp_ns),
+            "left_observation_timestamp_ns": int(pair.left_stamp_ns),
+            "right_observation_timestamp_ns": int(pair.right_stamp_ns),
+            "left_right_dt_s": float(pair.pair_delta_ns) / 1_000_000_000.0,
+            "left_pose_alignment_dt_s": (
+                None if left_pose_us is None else (int(left_pose_us) * 1000 - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+            ),
+            "right_pose_alignment_dt_s": (
+                None if right_pose_us is None else (int(right_pose_us) * 1000 - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+            ),
+            "observation_gt_dt_s": (
+                None if gt_timestamp is None else (int(gt_timestamp) - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+            ),
+            "sync_valid": (
+                bool(pair.pairing_mode)
+                and gt_mode != "unavailable"
+                and left_pose_us is not None
+                and right_pose_us is not None
+            ),
+            "sync_failure_reason": (
+                "" if gt_mode != "unavailable" and left_pose_us is not None and right_pose_us is not None
+                else "ground_truth_alignment_unavailable" if gt_mode == "unavailable"
+                else "operational_pose_timestamp_unavailable"
+            ),
+            "interpolation_method": gt_mode,
+            "source_timestamp_before_ns": gt_before,
+            "source_timestamp_after_ns": gt_after,
+            "interpolation_alpha": None if alignment is None else alignment.gt_interpolation_alpha,
+            "left_observation_source": metrics.get("left_observation_source"),
+            "right_observation_source": metrics.get("right_observation_source"),
+            "left_observation_valid": metrics.get("left_observation_valid"),
+            "right_observation_valid": metrics.get("right_observation_valid"),
+            "left_bbox_xmin_px": metrics.get("left_bbox_xmin_px"),
+            "left_bbox_ymin_px": metrics.get("left_bbox_ymin_px"),
+            "left_bbox_xmax_px": metrics.get("left_bbox_xmax_px"),
+            "left_bbox_ymax_px": metrics.get("left_bbox_ymax_px"),
+            "right_bbox_xmin_px": metrics.get("right_bbox_xmin_px"),
+            "right_bbox_ymin_px": metrics.get("right_bbox_ymin_px"),
+            "right_bbox_xmax_px": metrics.get("right_bbox_xmax_px"),
+            "right_bbox_ymax_px": metrics.get("right_bbox_ymax_px"),
+            "operational_position_source": operational.get("baseline_source"),
+            "operational_position_frame": BASELINE_CENTER_FRD_FRAME,
+            "left_operational_position_valid": op_valid,
+            "right_operational_position_valid": op_valid,
+            "operational_attitude_source": operational.get("attitude_source"),
+            "operational_attitude_parent_frame": "earth_ned",
+            "operational_attitude_child_frame": "body_frd",
+            "operational_attitude_quaternion_order": operational.get("px4_quaternion_order"),
+            "left_operational_pose_timestamp_ns": None if left_pose_us is None else int(left_pose_us) * 1000,
+            "right_operational_pose_timestamp_ns": None if right_pose_us is None else int(right_pose_us) * 1000,
+            "left_operational_pose_valid": op_valid,
+            "right_operational_pose_valid": op_valid,
+            "operational_x_m": operational.get("forward_m"),
+            "operational_y_m": operational.get("right_m"),
+            "operational_z_m": operational.get("down_m"),
+            "operational_range_m": operational.get("range_m"),
+            "operational_azimuth_deg": None,
+            "operational_elevation_deg": None,
+            "operational_ray_generation_valid": op_valid,
+            "triangulation_valid": op_valid,
+            "triangulation_status": status,
+            "triangulation_failure_reason": failure_reason,
+            "near_parallel": "parallel" in failure_token,
+            "negative_left_depth": None if left_depth is None else float(left_depth) < 0.0,
+            "negative_right_depth": None if right_depth is None else float(right_depth) < 0.0,
+            "nonfinite_input": "nonfinite_input" in failure_token or "invalid_input" in failure_token,
+            "nonfinite_output": "nonfinite_output" in failure_token,
+            "zero_or_small_baseline": "baseline" in failure_token,
+            "condition_exceeded": "condition" in failure_token,
+            "sample_valid": op_valid and gt_mode != "unavailable",
+            "failure_stage": "" if op_valid else "operational_triangulation",
+            "failure_code": "" if op_valid else status,
+            "failure_reason": "" if op_valid else failure_reason,
+            "gt_timestamp_ns": gt_timestamp,
+            "gt_valid": gt_world is not None,
+            "gt_model_name": metrics.get("target_model_name"),
+            "gt_link_name": VEHICLE_REFERENCE_LINK,
+            "gt_world_enu_x_m": None if gt_world is None else gt_world[0],
+            "gt_world_enu_y_m": None if gt_world is None else gt_world[1],
+            "gt_world_enu_z_m": None if gt_world is None else gt_world[2],
+            "left_injected_roll_deg": metrics.get("cam_l_optical_roll_deg"),
+            "left_injected_pitch_deg": metrics.get("cam_l_optical_pitch_deg"),
+            "left_injected_yaw_deg": metrics.get("cam_l_optical_yaw_deg"),
+            "right_injected_roll_deg": metrics.get("cam_r_optical_roll_deg"),
+            "right_injected_pitch_deg": metrics.get("cam_r_optical_pitch_deg"),
+            "right_injected_yaw_deg": metrics.get("cam_r_optical_yaw_deg"),
+        }
+        for side in ("left", "right"):
+            origin = operational.get(f"{side}_ray_origin_baseline_center_frd_m")
+            for axis, value in zip(("x", "y", "z"), origin or ()):
+                fields[f"{side}_operational_position_baseline_center_frd_{axis}_m"] = value
+            for axis in ("x", "y", "z"):
+                fields.setdefault(f"{side}_operational_position_baseline_center_frd_{axis}_m", None)
+            for axis in ("w", "x", "y", "z"):
+                fields[f"{side}_operational_attitude_q{axis}"] = operational.get(
+                    f"{side}_px4_q_{axis}"
+                )
+        forward, right, down = (operational.get(name) for name in ("forward_m", "right_m", "down_m"))
+        if all(value is not None and math.isfinite(float(value)) for value in (forward, right, down)):
+            fields["operational_azimuth_deg"] = math.degrees(math.atan2(float(right), float(forward)))
+            fields["operational_elevation_deg"] = math.degrees(math.atan2(-float(down), math.hypot(float(forward), float(right))))
         return fields
 
     def _diagnostic_rays(self, left_u, left_v, right_u, right_v, width, height, snapshot):
@@ -3986,7 +4304,7 @@ class StereoDistanceNode(Node):
             self.reference_distance_m = actual
         with self.lock:
             self.metrics["actual_distance_m"] = actual
-            self.metrics["mission_phase"] = state["phase"]
+            self.metrics["mission_phase"] = self._recording_mission_phase(state["phase"])
         if actual is not None:
             self.actual_distance_pub.publish(Float32(data=float(actual)))
             if self.cached_ground_truth_position is not None:
@@ -4432,7 +4750,7 @@ class StereoDistanceNode(Node):
                     continue
                 if pair is None:
                     continue
-                phase = self._mission_state()["phase"]
+                phase = self._recording_mission_phase()
                 self.yolo_inference_in_progress = True
                 self.inflight_pair_id = pair.pair_id
                 self.inflight_pair_epoch = pair.epoch
@@ -4610,7 +4928,7 @@ class StereoDistanceNode(Node):
                     self.yolo_condition.wait(timeout=wait_s)
                     continue
                 pair = self.rviz_live_latest_pair
-                phase = self._mission_state()["phase"]
+                phase = self._recording_mission_phase()
                 self.rviz_live_latest_processed_pair_id = pair.pair_id
                 next_tick = time.monotonic() + 1.0 / max(
                     0.1, float(getattr(self, "rviz_live_ray_hz", 20.0))
@@ -4623,6 +4941,15 @@ class StereoDistanceNode(Node):
                 # raw bbox triangulation is available; _latest_rviz_ideal_ray
                 # falls back to the cached World-ENU reference point.
                 ideal = self._latest_rviz_ideal_ray(pair)
+                uam_reference = self._uam_raw_gps_reference()
+                uam_gps_ray = (
+                    uam_gps_ray_visualization_world_enu_from_point(
+                        self.baseline_center_frd,
+                        uam_reference.get("world_enu_m"),
+                    )
+                    if uam_reference.get("computation_status") == "computed"
+                    else None
+                )
                 if raw is not None:
                     left = computed.get("left")
                     right = computed.get("right")
@@ -4662,6 +4989,7 @@ class StereoDistanceNode(Node):
                         ideal=ideal,
                         gps_baseline=computed.get("gps_baselines", {}).get("gps_baseline"),
                         global_baseline=computed.get("gps_baselines", {}).get("global_baseline"),
+                        uam_gps_ray=uam_gps_ray,
                         **diagnostic_rays,
                     )
                     self.rviz_live_publish_count += 1
@@ -4672,7 +5000,10 @@ class StereoDistanceNode(Node):
                         pair_id=pair.pair_id,
                         ideal=ideal,
                     )
-                    self._publish_ray_markers(ideal=ideal)
+                    self._publish_ray_markers(ideal=ideal, uam_gps_ray=uam_gps_ray)
+                    self.rviz_live_publish_count += 1
+                elif uam_gps_ray is not None:
+                    self._publish_ray_markers(uam_gps_ray=uam_gps_ray)
                     self.rviz_live_publish_count += 1
             except Exception as exc:
                 self.rviz_live_error_count += 1
@@ -4805,6 +5136,15 @@ class StereoDistanceNode(Node):
         raw = computed.get("raw")
         optical = computed.get("corrected")
         gps_baselines = computed.get("gps_baselines", {})
+        uam_reference = self._uam_raw_gps_reference()
+        uam_gps_ray = (
+            uam_gps_ray_visualization_world_enu_from_point(
+                self.baseline_center_frd,
+                uam_reference.get("world_enu_m"),
+            )
+            if uam_reference.get("computation_status") == "computed"
+            else None
+        )
         diagnostic_rays = computed.get("diagnostic_rays", {})
         diagnostic_analysis = self._diagnostic_analysis(optical, diagnostic_rays)
         for name, comparison in diagnostic_analysis["comparisons"].items():
@@ -4849,14 +5189,15 @@ class StereoDistanceNode(Node):
                 global_baseline=gps_baselines.get("global_baseline"),
                 **diagnostic_rays,
             )
-            if not self._rviz_latest_only_markers_enabled():
-                self._publish_ray_markers(
-                    nominal_pose=raw,
-                    optical_pose=optical,
-                    gps_baseline=gps_baselines.get("gps_baseline"),
-                    global_baseline=gps_baselines.get("global_baseline"),
-                    **diagnostic_rays,
-                )
+        if not self._rviz_latest_only_markers_enabled():
+            self._publish_ray_markers(
+                nominal_pose=raw,
+                optical_pose=optical,
+                gps_baseline=gps_baselines.get("gps_baseline"),
+                global_baseline=gps_baselines.get("global_baseline"),
+                uam_gps_ray=uam_gps_ray,
+                **diagnostic_rays,
+            )
         metrics.update(
             {
                 "optical_computation_status": (
@@ -4904,7 +5245,6 @@ class StereoDistanceNode(Node):
                     "gps_baseline_down_m": gps_baseline.get("down_m"),
                 }
             )
-        uam_reference = self._uam_raw_gps_reference()
         metrics.update(
             {
                 "uam_raw_gps_reference_computation_status": uam_reference.get(
@@ -4917,6 +5257,11 @@ class StereoDistanceNode(Node):
                 "uam_raw_gps_reference_world_enu_m": uam_reference.get("world_enu_m"),
                 "uam_raw_gps_reference_left_timestamp_us": uam_reference.get("left_timestamp_us"),
                 "uam_raw_gps_reference_timestamp_us": uam_reference.get("uam_timestamp_us"),
+                "uam_raw_gps_reference_left_age_ms": uam_reference.get("left_age_ms"),
+                "uam_raw_gps_reference_uam_age_ms": uam_reference.get("uam_age_ms"),
+                "uam_raw_gps_reference_pair_skew_ms": uam_reference.get("pair_skew_ms"),
+                "uam_raw_gps_reference_left_eph_m": uam_reference.get("left_eph_m"),
+                "uam_raw_gps_reference_uam_eph_m": uam_reference.get("uam_eph_m"),
             }
         )
         metrics.update(
@@ -4928,8 +5273,7 @@ class StereoDistanceNode(Node):
             "camera_oracle_snapshot", _CAMERA_ORACLE_UNSET
         )
         metrics.update(self._observation_metadata())
-        metrics["left_confidence"] = None if left is None else left.get("confidence")
-        metrics["right_confidence"] = None if right is None else right.get("confidence")
+        metrics.update(self._observation_record_fields(left, right))
         self.last_pair_result = dict(metrics)
         self.left_detection = left
         self.right_detection = right
@@ -5002,6 +5346,36 @@ class StereoDistanceNode(Node):
             "evaluation_gt_source": "gazebo_reference_link_world_pose",
             "output_frame": BASELINE_CENTER_FRD_FRAME,
         }
+
+    def _observation_record_fields(self, left, right):
+        """Return immutable per-pair observation provenance for S2 recording."""
+
+        mode = self._validate_observation_mode(self.observation_mode)
+        fields = {
+            "left_confidence": None if left is None else left.get("confidence"),
+            "right_confidence": None if right is None else right.get("confidence"),
+            "left_observation_source": (
+                "gazebo_reference_point_projection" if mode == "ideal_reference_point" else "yolo_bbox"
+            ),
+            "right_observation_source": (
+                "gazebo_reference_point_projection" if mode == "ideal_reference_point" else "yolo_bbox"
+            ),
+            "left_observation_valid": left is not None,
+            "right_observation_valid": right is not None,
+        }
+        for label, detection in (("left", left), ("right", right)):
+            bbox = None if detection is None else detection.get("bbox")
+            if mode != "bbox_yolo" or not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
+                fields.update({
+                    f"{label}_bbox_xmin_px": None,
+                    f"{label}_bbox_ymin_px": None,
+                    f"{label}_bbox_xmax_px": None,
+                    f"{label}_bbox_ymax_px": None,
+                })
+                continue
+            for suffix, value in zip(("xmin", "ymin", "xmax", "ymax"), bbox):
+                fields[f"{label}_bbox_{suffix}_px"] = float(value)
+        return fields
 
     def _update_metrics_from_messages(
         self,
@@ -5416,6 +5790,7 @@ class StereoDistanceNode(Node):
         if count_alignment and hasattr(self, "gt_alignment_counts"):
             self.gt_alignment_counts[alignment_mode] += 1
         metadata = {
+            "target_model_name": self.target_model_name,
             "pair_id": None if pair is None else pair.pair_id,
             "epoch": None if pair is None else pair.epoch,
             "left_stamp_ns": None if pair is None else pair.left_stamp_ns,
@@ -7391,9 +7766,9 @@ class StereoDistanceNode(Node):
     def _publish_ray_markers(
         self, nominal_pose=None, optical_pose=None, ideal=None,
         gps_baseline=None, global_baseline=None, attitude=None,
-        operational=None,
+        operational=None, uam_gps_ray=None,
     ):
-        """Publish stereo rays in World ENU, including GPS-baseline variants.
+        """Publish stereo rays in World ENU, including the UAM GPS ray.
 
         ``gps_baseline`` and ``global_baseline`` retain the World ENU camera origins
         used by their baseline-only triangulations.  They are visualization
@@ -7537,6 +7912,32 @@ class StereoDistanceNode(Node):
                 midpoint_color=(1.0, 0.62, 0.0),
             )
         )
+        if uam_gps_ray is not None and uam_gps_ray.get("computation_status") == "computed":
+            geometry = uam_gps_ray.get("ray_visualization_world_enu")
+            if geometry is None:
+                geometry = {
+                    "origin_world_enu_m": uam_gps_ray["origin_world_enu_m"],
+                    "target_world_enu_m": uam_gps_ray["target_world_enu_m"],
+                }
+            namespace = "stereo_rays_uam_gps"
+            origin = geometry["origin_world_enu_m"]
+            target = geometry["target_world_enu_m"]
+            gps_color = (134.0 / 255.0, 89.0 / 255.0, 45.0 / 255.0)
+            markers.append(
+                line(80, namespace, "UAM GPS Ray", gps_color, origin, target, 2.5)
+            )
+            target_marker = Marker()
+            target_marker.header.frame_id = WORLD_FRAME
+            target_marker.header.stamp = stamp
+            target_marker.ns = namespace
+            target_marker.id = 81
+            target_marker.type = Marker.SPHERE
+            target_marker.action = Marker.ADD
+            target_marker.pose.position = self._marker_point(target)
+            target_marker.pose.orientation.w = 1.0
+            target_marker.scale.x = target_marker.scale.y = target_marker.scale.z = 12.0
+            target_marker.color.r, target_marker.color.g, target_marker.color.b, target_marker.color.a = (*gps_color, 1.0)
+            markers.append(target_marker)
         if markers:
             publisher.publish(MarkerArray(markers=markers))
 
@@ -7551,6 +7952,15 @@ def main():
     # Keep the ROS context alive during SIGINT drain.  With rclpy's default
     # handler the context becomes invalid before ``node.shutdown()`` can
     # publish and finish accepted in-flight pairs.
+    # Make the process-level contract explicit as ros2 launch/operator cleanup
+    # can deliver either SIGINT or SIGTERM.  Both signals must enter the
+    # ``finally`` block below so the research recorder exports its fixed CSV
+    # and writes a terminal validity marker before the launch tree is killed.
+    def _graceful_shutdown_signal(_signum, _frame):
+        raise KeyboardInterrupt
+
+    previous_sigint = signal.signal(signal.SIGINT, _graceful_shutdown_signal)
+    previous_sigterm = signal.signal(signal.SIGTERM, _graceful_shutdown_signal)
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = StereoDistanceNode()
     executor = MultiThreadedExecutor(num_threads=4)
@@ -7568,6 +7978,8 @@ def main():
             pass
         if rclpy.ok():
             rclpy.shutdown()
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

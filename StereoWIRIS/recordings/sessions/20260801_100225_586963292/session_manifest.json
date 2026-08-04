@@ -1,0 +1,40 @@
+{
+  "artifact_roles": {
+    "20260801_100225_586963292.xlsx": "integrated_review_workbook",
+    "20260801_100225_586963292_camera_left.csv": "camera_timeline_csv",
+    "20260801_100225_586963292_camera_left.parquet": "camera_timeline_parquet",
+    "20260801_100225_586963292_camera_right.csv": "camera_timeline_csv",
+    "20260801_100225_586963292_camera_right.parquet": "camera_timeline_parquet",
+    "20260801_100225_586963292_distance_measurements.csv": "distance_measurements_csv",
+    "20260801_100225_586963292_distance_measurements.parquet": "distance_measurements_parquet",
+    "20260801_100225_586963292_px4_left.csv": "px4_timeline_csv",
+    "20260801_100225_586963292_px4_left.parquet": "px4_timeline_parquet",
+    "20260801_100225_586963292_px4_right.csv": "px4_timeline_csv",
+    "20260801_100225_586963292_px4_right.parquet": "px4_timeline_parquet",
+    "20260801_100225_586963292_session_static.json": "session_static_metadata"
+  },
+  "artifacts": {
+    "20260801_100225_586963292.xlsx": "prepared",
+    "20260801_100225_586963292_camera_left.csv": "prepared",
+    "20260801_100225_586963292_camera_left.parquet": "prepared",
+    "20260801_100225_586963292_camera_right.csv": "prepared",
+    "20260801_100225_586963292_camera_right.parquet": "prepared",
+    "20260801_100225_586963292_distance_measurements.csv": "prepared",
+    "20260801_100225_586963292_distance_measurements.parquet": "prepared",
+    "20260801_100225_586963292_px4_left.csv": "prepared",
+    "20260801_100225_586963292_px4_left.parquet": "prepared",
+    "20260801_100225_586963292_px4_right.csv": "prepared",
+    "20260801_100225_586963292_px4_right.parquet": "prepared",
+    "20260801_100225_586963292_session_static.json": "prepared"
+  },
+  "error": "",
+  "generation_id": "20260801_100239_109799400",
+  "phase": "published",
+  "publish_contract": "all stable artifact links resolve through one atomically replaced generation pointer",
+  "published_pointer": "published",
+  "resource_files_authoritative": true,
+  "retryable": false,
+  "session_id": "20260801_100225_586963292",
+  "status": "finalized",
+  "time_axis": "recording_time_ns"
+}

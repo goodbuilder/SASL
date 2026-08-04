@@ -144,7 +144,7 @@ def test_enabled_configuration_rejects_invalid_provenance(
         validate_recording_configuration(**_config(tmp_path, **{field: value}))
 
 
-def test_output_path_must_be_absolute_outside_repository_and_empty(tmp_path: Path) -> None:
+def test_output_path_must_be_absolute_or_under_simulation_recordings_and_empty(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="absolute"):
         validate_recording_configuration(**_config(tmp_path, output_dir="relative"))
     repository = _config(tmp_path)["repository_root"]
@@ -152,6 +152,11 @@ def test_output_path_must_be_absolute_outside_repository_and_empty(tmp_path: Pat
         validate_recording_configuration(
             **_config(tmp_path, output_dir=str(repository / "results"))
         )
+    allowed = repository / "Simulation" / "recordings" / "case-1"
+    output = validate_recording_configuration(
+        **_config(tmp_path, output_dir=str(allowed))
+    )
+    assert output == allowed
     symlink = tmp_path / "symlink"
     symlink.symlink_to(repository, target_is_directory=True)
     with pytest.raises(ValueError, match="outside"):
@@ -234,6 +239,20 @@ def test_schema_accepts_nullable_diagnostic_ray_exports() -> None:
     assert "operational_ray_gps_baseline_world_enu_x_m" in PAIR_RECORD_COLUMNS
     assert "operational_ray_position_difference_m" in PAIR_RECORD_COLUMNS
     assert "ideal_position_error_m" in PAIR_RECORD_COLUMNS
+    assert "mission_phase" in PAIR_RECORD_COLUMNS
+    assert "uam_raw_gps_reference_forward_m" in PAIR_RECORD_COLUMNS
+    assert "uam_raw_gps_reference_world_enu_x_m" in PAIR_RECORD_COLUMNS
+    assert "uam_raw_gps_reference_pair_skew_ms" in PAIR_RECORD_COLUMNS
+    assert "session_id" in PAIR_RECORD_COLUMNS
+    assert "attempt_id" in PAIR_RECORD_COLUMNS
+    assert "effective_config_sha256" in PAIR_RECORD_COLUMNS
+    assert "operational_ray_left_origin_x_m" in PAIR_RECORD_COLUMNS
+    assert "operational_ray_right_direction_z" in PAIR_RECORD_COLUMNS
+    assert "sample_id" in PAIR_RECORD_COLUMNS
+    assert "left_bbox_xmin_px" in PAIR_RECORD_COLUMNS
+    assert "left_operational_attitude_qw" in PAIR_RECORD_COLUMNS
+    assert "operational_x_m" in PAIR_RECORD_COLUMNS
+    assert "gt_timestamp_ns" in PAIR_RECORD_COLUMNS
 
 
 def test_diagnostic_analysis_round_trip_preserves_precision_status_and_time_units(
@@ -325,7 +344,7 @@ def test_legacy_v3_record_is_rejected_by_new_schema_only_reader() -> None:
 def test_jsonl_rejects_nan_without_writing_a_terminal_line(tmp_path: Path) -> None:
     recorder = _recorder(tmp_path)
     record = _record()
-    record["raw_forward_m"] = float("nan")
+    record["nominal_pose_forward_m"] = float("nan")
     assert recorder.submit(record) is True
     summary = recorder.close(_final_state())
     assert summary["run_valid"] is False

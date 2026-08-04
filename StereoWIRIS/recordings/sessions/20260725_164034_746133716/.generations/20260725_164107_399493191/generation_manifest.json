@@ -1,0 +1,17 @@
+{
+  "artifacts": {
+    "20260725_164034_746133716.csv": "prepared",
+    "20260725_164034_746133716.xlsx": "prepared",
+    "camera_left.csv": "prepared",
+    "camera_right.csv": "prepared",
+    "px4_left.csv": "prepared",
+    "px4_right.csv": "prepared"
+  },
+  "csv_authoritative": true,
+  "error": "",
+  "generation_id": "20260725_164107_399493191",
+  "phase": "publish",
+  "retryable": false,
+  "session_id": "20260725_164034_746133716",
+  "status": "prepared"
+}

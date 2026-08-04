@@ -143,7 +143,8 @@ def simulation_root():
     candidates = [Path.cwd(), *Path(__file__).resolve().parents]
     for candidate in candidates:
         if (
-            (candidate / "run_auto_mission.sh").is_file()
+            (candidate / "run_mission.sh").is_file()
+            and (candidate / "run_auto.sh").is_file()
             and (candidate / "run_px4_waypoint_mission.sh").is_file()
         ):
             return candidate
@@ -153,13 +154,48 @@ def simulation_root():
 def build_mission_command(kind, *, root_dir=None):
     root = Path(root_dir) if root_dir is not None else simulation_root()
     scripts = {
-        "auto": "run_auto_mission.sh",
+        "auto": "run_mission.sh",
+        "auto_fov": "run_auto.sh",
         "waypoint": "run_px4_waypoint_mission.sh",
     }
     script = scripts.get(kind)
     if script is None:
         raise ValueError(f"unknown mission kind: {kind}")
     return [str(root / script)]
+
+
+def stop_process_group(
+    process,
+    *,
+    interrupt_timeout_s=10.0,
+    terminate_timeout_s=5.0,
+    interrupt_sent=False,
+):
+    """Stop an owned process group and give its cleanup handlers time to flush."""
+    if process is None or process.poll() is not None:
+        return
+    if not interrupt_sent:
+        try:
+            os.killpg(process.pid, signal.SIGINT)
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=interrupt_timeout_s)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=terminate_timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait(timeout=1.0)
 
 
 class RecordingControls(QWidget):
@@ -182,11 +218,16 @@ class RecordingControls(QWidget):
             mode: QPushButton(button_text) for mode, button_text in RECORDING_MODE_BUTTONS
         }
         self._mission_buttons = {
-            "auto": QPushButton("Auto Mission"),
+            "auto": QPushButton("Mission"),
             "waypoint": QPushButton("Waypoint"),
+            "auto_fov": QPushButton("Auto"),
         }
         self._stop_button = QPushButton("Stop")
         self._stop_button.setEnabled(False)
+        self.respawn_button = QPushButton("Respawn Drone")
+        self.respawn_button.setToolTip(
+            "Teleport the target drone to the configured launch pose in Gazebo."
+        )
         self._status_label = QLabel("Idle")
         self._status_label.setMinimumWidth(180)
         self._status_label.setStyleSheet("font-weight: 600;")
@@ -202,6 +243,7 @@ class RecordingControls(QWidget):
         for button in self._mission_buttons.values():
             controls.addWidget(button)
         controls.addWidget(self._stop_button)
+        controls.addWidget(self.respawn_button)
         controls.addWidget(QLabel("Save to"))
         controls.addWidget(self._dir_edit, 1)
         controls.addWidget(self._browse_button)
@@ -210,13 +252,16 @@ class RecordingControls(QWidget):
         layout.addWidget(
             QLabel(
                 "Save CSV records telemetry and detections. Save MP4 adds left/right "
-                "overlay videos. Save Debug also adds a rosbag. Each detection stores "
-                "left/right bbox x1,y1,x2,y2 plus derived centers; vectors use FRD metres."
+                "overlay videos. Save Debug also adds a rosbag. These buttons can be "
+                "pressed while Auto is running; recording starts at the button click. "
+                "Each detection stores left/right bbox x1,y1,x2,y2 plus derived centers; "
+                "vectors use FRD metres."
             )
         )
         self.setToolTip(
             "CSV: telemetry. MP4: CSV plus overlay video. Debug: MP4 plus rosbag. "
-            "Stop first to change the output directory."
+            "Auto does not record until one of these buttons is pressed. Stop first "
+            "to change the output directory."
         )
 
         self._browse_button.clicked.connect(self._choose_directory)
@@ -228,7 +273,10 @@ class RecordingControls(QWidget):
             button.clicked.connect(
                 lambda _checked=False, mission_kind=kind: self._start_mission(mission_kind)
             )
-        self._stop_button.clicked.connect(self._stop_recording)
+        self._stop_button.setToolTip(
+            "Stop Auto/mission and finalize any recorder at the time of this click."
+        )
+        self._stop_button.clicked.connect(self._stop_all)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_process)
         self._timer.start(500)
@@ -281,7 +329,8 @@ class RecordingControls(QWidget):
     def _start_mission(self, kind):
         process = self._mission_processes.get(kind)
         if process is not None and process.poll() is None:
-            self._set_status(f"{kind.title()} mission already running", error=True)
+            label = {"auto": "Mission", "auto_fov": "Auto"}.get(kind, "Waypoint")
+            self._set_status(f"{label} already running", error=True)
             return
         root = simulation_root()
         cmd = build_mission_command(kind, root_dir=root)
@@ -298,29 +347,53 @@ class RecordingControls(QWidget):
             return
         self._mission_processes[kind] = process
         self._mission_buttons[kind].setEnabled(False)
-        label = "Auto Mission" if kind == "auto" else "Waypoint"
+        self._stop_button.setEnabled(True)
+        label = {"auto": "Mission", "auto_fov": "Auto"}.get(kind, "Waypoint")
         self._set_status(f"Started: {label}")
 
-    def _stop_recording(self):
-        if self._process is None:
+    def _stop_all(self):
+        mission_processes = [
+            (kind, process)
+            for kind, process in self._mission_processes.items()
+            if process.poll() is None
+        ]
+        recorder_process = self._process
+        if not mission_processes and recorder_process is None:
             return
-        process = self._process
-        self._set_status("Stopping…")
-        try:
-            os.killpg(process.pid, signal.SIGINT)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=10.0)
-        except subprocess.TimeoutExpired:
+
+        self._set_status(
+            "Stopping Auto and finalizing recording…" if mission_processes else "Stopping…"
+        )
+        processes = [process for _kind, process in mission_processes]
+        if recorder_process is not None:
+            processes.append(recorder_process)
+        # Signal all owned groups before waiting on any one process. This makes
+        # the recorder's terminal row boundary correspond to the Stop click,
+        # even when Auto takes time to run its PX4 cleanup path.
+        seen_pids = set()
+        for process in processes:
+            if process.pid in seen_pids:
+                continue
+            seen_pids.add(process.pid)
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                os.killpg(process.pid, signal.SIGINT)
             except ProcessLookupError:
                 pass
-            process.wait(timeout=5.0)
+        for process in processes:
+            stop_process_group(process, interrupt_sent=True)
+
+        stopped_path = self._record_path
+        self._mission_processes.clear()
+        for button in self._mission_buttons.values():
+            button.setEnabled(True)
         path = self._record_path
         self._reset_controls()
-        self._set_status(f"Saved: {path.name}" if path else "Stopped")
+        if mission_processes and stopped_path is not None:
+            self._set_status(f"Auto stopped; saved: {stopped_path.name}")
+        elif mission_processes:
+            self._set_status("Auto stopped; no recording was started")
+        else:
+            self._set_status(f"Saved: {path.name}" if path else "Stopped")
 
     def _poll_process(self):
         self._poll_missions()
@@ -345,9 +418,11 @@ class RecordingControls(QWidget):
                 continue
             self._mission_processes.pop(kind, None)
             self._mission_buttons[kind].setEnabled(True)
-            label = "Auto Mission" if kind == "auto" else "Waypoint"
+            self._set_stop_button_enabled()
+            label = {"auto": "Mission", "auto_fov": "Auto"}.get(kind, "Waypoint")
+            status = f"{label} complete" if return_code == 0 else f"{label} exited: {return_code}"
             self._set_status(
-                f"{label} complete" if return_code == 0 else f"{label} exited: {return_code}",
+                status,
                 error=return_code != 0,
             )
 
@@ -356,7 +431,7 @@ class RecordingControls(QWidget):
         self._record_mode = None
         self._record_path = None
         self._set_record_buttons_enabled(True)
-        self._stop_button.setEnabled(False)
+        self._set_stop_button_enabled()
         self._dir_edit.setEnabled(True)
         self._browse_button.setEnabled(True)
         self._set_locked_widgets_enabled(True)
@@ -368,6 +443,13 @@ class RecordingControls(QWidget):
     def _set_record_buttons_enabled(self, enabled):
         for button in self._record_buttons.values():
             button.setEnabled(enabled)
+
+    def _set_stop_button_enabled(self):
+        recording_active = self._process is not None
+        mission_active = any(
+            process.poll() is None for process in self._mission_processes.values()
+        )
+        self._stop_button.setEnabled(recording_active or mission_active)
 
     def add_lock_widgets(self, *widgets):
         self._lock_widgets += tuple(widgets)
@@ -409,15 +491,7 @@ class RecordingControls(QWidget):
 
     def shutdown(self):
         self._timer.stop()
-        if self._process is not None:
-            self._stop_recording()
-        for process in self._mission_processes.values():
-            if process.poll() is None:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-        self._mission_processes.clear()
+        self._stop_all()
 
 
 class RecorderPanel(Plugin):
@@ -488,8 +562,9 @@ class RecorderPanel(Plugin):
             mode: QPushButton(button_text) for mode, button_text in RECORDING_MODE_BUTTONS
         }
         self._mission_buttons = {
-            "auto": QPushButton("Auto Mission"),
+            "auto": QPushButton("Mission"),
             "waypoint": QPushButton("Waypoint"),
+            "auto_fov": QPushButton("Auto"),
         }
         self._stop_button = QPushButton("Stop")
         self._stop_button.setEnabled(False)
@@ -730,7 +805,8 @@ class RecorderPanel(Plugin):
     def _start_mission(self, kind):
         process = self._mission_processes.get(kind)
         if process is not None and process.poll() is None:
-            self._set_status(f"{kind.title()} mission already running", error=True)
+            label = {"auto": "Mission", "auto_fov": "Auto"}.get(kind, "Waypoint")
+            self._set_status(f"{label} already running", error=True)
             return
         root = simulation_root()
         cmd = build_mission_command(kind, root_dir=root)
@@ -747,7 +823,7 @@ class RecorderPanel(Plugin):
             return
         self._mission_processes[kind] = process
         self._mission_buttons[kind].setEnabled(False)
-        label = "Auto Mission" if kind == "auto" else "Waypoint"
+        label = {"auto": "Mission", "auto_fov": "Auto"}.get(kind, "Waypoint")
         self._set_status(f"Started: {label}")
 
     def _stop_recording(self):
@@ -800,7 +876,7 @@ class RecorderPanel(Plugin):
                 continue
             self._mission_processes.pop(kind, None)
             self._mission_buttons[kind].setEnabled(True)
-            label = "Auto Mission" if kind == "auto" else "Waypoint"
+            label = {"auto": "Mission", "auto_fov": "Auto"}.get(kind, "Waypoint")
             self._set_status(
                 f"{label} complete" if return_code == 0 else f"{label} exited: {return_code}",
                 error=return_code != 0,

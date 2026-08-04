@@ -32,6 +32,103 @@ The existing Gazebo target/model domain mismatch for `bbox_yolo` remains a
 separate limitation; ideal correspondence is not evidence that YOLO detects
 the target.
 
+## PX4 Auto attitude calibration sweep
+
+`run_auto.sh` remains the normal forward-only, FOV-guarded mission. It does
+not create CSV or MP4 files by itself; an operator starts those recordings
+from rqt with `Save CSV` or `Save MP4`.
+
+For repeatable calibration data, use
+`./run_auto_attitude_sweep.sh -- --quick` only as a smoke test, or omit
+`--quick` for the normal mission. The runner always includes a zero-degree
+baseline, then restarts the complete Gazebo/PX4/operator stack for each
+one-axis right-camera optical-RDF case. The default is baseline plus
+`roll,pitch,yaw = -1, +1` degrees. `--repetitions N` repeats each non-zero
+case. The non-zero conditions are randomized by default using a recorded seed;
+a 0-degree baseline is run before each condition and once after the final
+condition. Use `--ordered` to disable randomization. Every case writes its own
+`operator.log`, readiness/Auto logs, case contract, S2 `pair_records.csv`, and
+an `operator-recording/` full session under `Simulation/recordings/` by
+default (or a user-specified output directory). The case directory also
+contains `effective_config.json`. Its canonical payload records the actual
+right-camera optical-RDF perturbation, observation mode, camera rate,
+coordinate/quaternion contracts, Gazebo reference link, output paths, and
+repository provenance. Its `effective_config_sha256` is copied to
+`run_metadata.json`, the sweep manifest, and every S2 pair row. `session_id`
+identifies one sweep and `attempt_id` identifies one case execution. The
+full session waits for the first valid left/right bbox pair, then writes
+telemetry CSV and left/right overlay MP4 from that detection onward. The parent
+`sweep_manifest.tsv`
+records execution order and pass/fail status.
+An individual case passes only when PX4 readiness and Auto exit successfully
+and the research recording has `RUN_FINALIZED_VALID`, `run_valid=true`, and
+`pair_records.csv`; otherwise it is marked FAIL even if the flight itself
+completed.
+
+### Sweep environment variables
+
+The defaults are stored in `config/simulation.env`. An explicitly exported
+environment variable overrides that file, and a CLI option overrides both.
+
+- `SWEEP_AXES`: attitude axes to test, such as `roll,pitch,yaw`.
+- `SWEEP_VALUES_DEG`: comma-separated optical-RDF angle values in degrees,
+  such as `-1,0,1`. Zero is the baseline and is not used as a perturbation.
+- `SWEEP_REPETITIONS`: number of repetitions for each non-zero axis/value
+  condition.
+- `SWEEP_OUTPUT_DIR`: directory for logs, manifests, contracts, and research
+  recordings. The default is `Simulation/recordings/`; repository paths other
+  than that directory are rejected.
+- `SWEEP_WAIT_S`: maximum seconds to wait for PX4 readiness per case.
+- `SWEEP_CAMERA_UPDATE_RATE_HZ`: camera and measurement sampling rate used
+  only by the strict S2 sweep. Default `2.0` keeps accepted pair production
+  below the measured YOLO processing capacity, so every accepted row can be
+  finalized without queue overrun. It does not change normal operator runs.
+- `SWEEP_YOLO_TARGET_HZ`: YOLO processing target used only by the sweep.
+  Default `2.0` matches the sweep camera rate.
+- `SWEEP_SEED`: randomization seed. Empty uses the current epoch seconds; set
+  it to reproduce the same condition order.
+- `SWEEP_RANDOMIZE`: `true` randomizes conditions; `false` preserves the
+  configured axis/value order. `--ordered` is the CLI equivalent of `false`.
+- `SWEEP_SKIP_COLCON_BUILD`: `true` reuses the existing ROS install and skips
+  the build for each case.
+- `SWEEP_SKIP_PX4_BUILD`: `true` reuses the existing PX4 SITL binary/build
+  output for each case; use only after the PX4 build and camera airframe are
+  known to be current. The CLI equivalent is `--skip-px4-build`.
+- `SWEEP_KEEP_GOING`: `true` continues after a failed case and records the
+  failure in the manifest.
+- `SWEEP_FORCE_EXISTING_SIM`: `true` allows the runner to clean an existing
+  operator/PX4 session; leave it `false` for the safety default.
+
+When Auto finishes, Stop waits for both the standalone operator recorder and
+the S2 research recorder in the ROS launch tree to finalize before escalating
+cleanup. A valid case therefore requires the final research marker, not only
+the flight's `Landed` message.
+
+`PX4_DIR` selects the PX4 checkout and `SIM_CONFIG` selects the configuration
+file. Per-flight values such as `--quick`, `--target-distance-m`, and
+`--speed-mps` remain CLI arguments after `--` because they commonly change per
+experiment.
+
+The research recorder is intentionally enabled only by this explicit sweep;
+it is not a change to normal rqt recording semantics. Each pair row preserves
+`mission_phase` (`preflight`, `takeoff`, `hover_before_approach`, `approach`,
+`hover_after_approach`, `landing`, or `complete`) when the Auto mission phase
+topic is available. It also preserves the UAM raw-GPS reference status, its
+public Forward/Right/Down result, World-ENU point, GPS ages, GPS-pair skew, and
+Eph values. These are reference inputs for later analysis, not a fitted
+calibration result. Rows may include startup samples, so downstream analysis
+must select the intended Auto-flight phases and require the run's
+`RUN_FINALIZED_VALID`/`run_valid` evidence. The injected attitude is the
+physical right-camera `camera_optical_rdf` pose in degrees. Gazebo World is
+ENU, PX4 control is local NED/body FRD, and public measurement vectors remain
+`baseline_center_frd` (Forward, Right, Down, m).
+Gazebo Target GT is calibration-time/offline validation truth only; a runtime
+correction must use Operational Ray and UAM raw GPS reference, not GT.
+
+Because the actual camera pose is generated in the Gazebo world at launch and
+the geometry parameters are immutable during a run, changing a ROS parameter
+inside one Auto flight would not create a valid physical attitude sweep.
+
 ## Atomic pair-level research recording (S2-R2)
 
 `enable_research_recording` defaults to `false`, so the normal launch creates
@@ -43,13 +140,27 @@ identity, attitude inputs, errors, and runtime counters therefore come from
 one in-process pair state rather than a latest-value topic join.
 
 The authoritative artifact is UTF-8 `pair_records.jsonl` with schema
-`s2_atomic_pair_v1`; deterministic `pair_records.csv` is exported only during
+`s2_atomic_pair_v9`; deterministic `pair_records.csv` is exported only during
 clean finalization.  `run_metadata.json`, `run_summary.json`, SHA-256 hashes,
 and `RUN_FINALIZED_VALID` or `RUN_FINALIZED_INVALID` bind provenance and run
 validity to the rows.  `RUN_INCOMPLETE` remains after an abnormal termination.
 Recorder queue overflow or writer failure invalidates the run and is never a
 silent drop.  File I/O, CSV conversion, validation, and hashing execute outside
 the measurement condition lock.
+
+The `operational` diagnostic family stores the left/right ray origin and unit
+direction in `baseline_center_frd`. These values are reproducibility
+diagnostics. The runtime-calibration inputs remain the observed pixels,
+intrinsic/profile provenance, operational pose source, timestamps, and
+validity/status fields. Ideal, Gazebo-true-pose, and oracle-corrected rays are
+offline/debug families and are not required runtime calibration inputs.
+
+S2 v9 additionally records the source Simulation timestamps, observation
+validity, BBox corners in `bbox_yolo` mode, PX4/GPS-derived Operational pose
+provenance, Operational result/status, injected optical-RDF labels, and Gazebo
+`vehicle_reference_link` timestamp/world-ENU label. These fields keep
+Operational inputs separate from Gazebo-only labels: calibration runtime code
+must not consume GT, the injected error, or `gazebo_observed_optical_pose`.
 
 `sample_eligible=true` identifies a successfully evaluated, finite,
 `baseline_center_frd` pair, but it does not make the dataset valid by itself.
@@ -5653,11 +5764,12 @@ Replay 출력:
 ```
 
 이 단일 명령이 build, Gazebo Sim 서버, ROS-Gazebo bridge, 거리 계산 노드, PX4 SITL 3개, 단일 `rqt_gui` 운용 창을 모두 실행합니다. 커스텀 앱을 만들지 않고 표준 ROS 도구만 실행합니다.
-기본 실행은 target PX4(instance 0)를 `x500_15m`에, Camera_Left PX4(instance 1)를 `left_stereo_camera`에, Camera_Right PX4(instance 2)를 `right_stereo_camera`에 각각 attach합니다. target PX4는 기존 `/fmu`와 QGroundControl MAVLink UDP 14550 계약을 유지하고, 카메라 PX4는 `/camera_left/fmu`, `/camera_right/fmu` namespace로 격리됩니다. target의 이륙-접근-착륙을 자동 시작하려면 `--auto-mission`을 붙입니다.
+기본 실행은 target PX4(instance 0)를 `x500_15m`에, Camera_Left PX4(instance 1)를 `left_stereo_camera`에, Camera_Right PX4(instance 2)를 `right_stereo_camera`에 각각 attach합니다. target PX4는 기존 `/fmu`와 QGroundControl MAVLink UDP 14550 계약을 유지하고, 카메라 PX4는 `/camera_left/fmu`, `/camera_right/fmu` namespace로 격리됩니다. 세 PX4의 operator용 MAVLink `ATTITUDE`는 UDP 14551 하나로 모이며, RQT 패널은 MAVLink system ID 2/3을 각각 Left/Right로 분류합니다(system ID 1 target은 수신하지만 카메라 비교 표에는 표시하지 않습니다). target의 이륙-접근-착륙을 자동 시작하려면 `--auto-mission`을 붙입니다.
 `x500_15m`는 카메라 전방 +Y 약 2000 m 지점에서 yaw -90도로 스폰되어, QGC/PX4에서 전진 명령을 주면 카메라 방향으로 접근합니다. 스테레오 베이스라인은 X축 방향입니다.
 Gazebo 3D GUI에서는 카메라 뒤에서 전방 +Y를 바라보는 운용자 기준으로 왼쪽 카메라는 world X 음수 위치의 파란색 본체, 오른쪽 카메라는 world X 양수 위치의 빨간색 본체로 표시됩니다. 카메라 모델 원점은 실제 sensor optical center이며, 렌즈 visual의 앞면이 이 원점에 맞춰집니다.
-`rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, Truth/Nominal Pose/Optical Pose FRD, 좌표 계약을 표시합니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
+`rqt_gui` 안에는 상단 실험 HUD, 좌/우 표준 Image View 2개, 가운데 기록 패널, 하단에 상하 3단으로 쌓인 Plot 3개가 로드됩니다. HUD는 사용 중인 PyTorch 모델 파일명, mission 거리, profile 상태, YOLO Hz/ms, Truth/Nominal Pose/Optical Pose FRD, 좌표 계약을 표시합니다. Sensors/Debug의 raw MAVLink ATTITUDE 표는 단일 UDP 14551 수신 소켓을 사용하며 `RQT_MAVLINK_ATTITUDE_URL` 환경 변수로 endpoint를 바꿀 수 있습니다. 기본 화면은 카메라와 그래프가 최대한 넓게 보이도록 파라미터 패널을 열지 않습니다.
 Image View는 기본적으로 YOLO bbox overlay 토픽인 `/left_camera/detection_image`, `/right_camera/detection_image`를 봅니다. 추론 부하를 낮추고 원본 화면을 보려면 `--raw-view`를 붙여 `/left_camera/image`, `/right_camera/image`를 표시합니다. Plot 3개는 각각 카메라 중앙 기준 FRD축 실제값(`/ground_truth_position`), Nominal Pose(`/stereo/nominal_pose_plot`), Optical Pose(`/stereo/optical_pose_position`)를 비교합니다. 배열 축 계약은 `data[0]=Forward`, `data[1]=Right`, `data[2]=Down`입니다. 정식 Nominal Pose는 별도 `PointStamped` 토픽 `/stereo/nominal_pose_position`이며 `frame_id=baseline_center_frd`, `point.x/y/z=Forward/Right/Down [m]`입니다.
+Analysis 탭의 상단 `Data to draw` 체크박스는 Gazebo Target GT와 각 Ray 계열의 표시 여부를 제어합니다. 체크를 해제하면 해당 선과 우측 범례가 함께 숨겨지고 Y축 자동 범위 계산에서도 제외됩니다. rqt에서는 UAM raw GPS reference를 `UAM GPS`로 표시하고, RViz에서는 같은 기준점을 baseline-center 원점에서 연결한 `UAM GPS Ray`로 표시합니다.
 Gazebo visible 카메라 센서는 기본 20 Hz(`CAMERA_UPDATE_RATE_HZ=20.0`), 1280x720이며 frame interval은 50,000,000 ns입니다. Ground Truth는 별도 adapter가 raw `Pose_V`의 simulation stamp를 보존해 발행하고, S1의 비교 frame은 고정 `baseline_center_frd`입니다. 이전 model-origin/Down offset 설명은 폐기된 historical 기록이며 active 경로에서 사용하지 않습니다. 거리/오차 그래프 및 overlay timer는 이 Phase의 camera-rate contract와 별개입니다. 기본 실행은 Gazebo 3D GUI도 함께 엽니다(`gz_gui:=true`). 카메라/그래프 Hz를 우선해 headless로 돌리려면 `gz_gui:=false`를 붙입니다.
 각 Plot의 시간축은 최근 30초 창으로 autoscroll되며, 값 축은 현재 보이는 데이터 범위에 맞춰 자동으로 다시 잡히도록 실행 시 rqt_plot 패치를 적용합니다. 시간 창 길이는 `--plot-window 30`처럼 바꿀 수 있습니다.
 기본 YOLO 설정은 `config/simulation.env`에서 읽습니다. 기본 모델은 `yolov8n_uav.pt`, class는 `UAV`, confidence는 `0.10`입니다. `.pt` 파일은 git에 넣지 않는 machine-local 입력이므로 runner는 `Simulation/`, 상위 workspace, `~/Downloads/`, `~/다운로드/` 순서로 같은 파일명을 찾습니다. 다른 PC에서는 `Simulation/yolov8n_uav.pt`를 같은 위치에 두거나 `YOLO_MODEL_PATH`/`--yolo-model`로 다른 파일을 명시합니다. 이 설정은 left/right image pixel bbox detector만 바꾸며, `/ground_truth_position`과 거리 토픽의 stereo-center FRD 축 계약은 바꾸지 않습니다.
@@ -5665,7 +5777,7 @@ Gazebo visible 카메라 센서는 기본 20 Hz(`CAMERA_UPDATE_RATE_HZ=20.0`), 1
 YOLO runtime bootstrap은 기본적으로 CUDA PyTorch wheel을 요구합니다(`YOLO_TORCH_BACKEND=cuda`, `YOLO_TORCH_CUDA_INDEX_URL=https://download.pytorch.org/whl/cu126`). CPU-only 환경을 의도적으로 쓰려면 `YOLO_TORCH_BACKEND=cpu ./run_operator_view.sh ...`처럼 실행합니다. CUDA wheel이 설치되어도 OS에서 NVIDIA driver와 `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm` 장치 노드가 정상이어야 `torch.cuda.is_available()`이 true가 됩니다.
 YOLO bbox overlay 화면은 기본으로 켜집니다(`overlay_publish_hz:=20.0`). Overlay 이미지는 전용 `detection_overlay_node`가 raw HD 카메라와 `/stereo/detections` bbox 결과를 결합해 발행하므로, YOLO 거리 계산 루프와 이미지 그리기/rqt 표시 부하를 분리합니다. Overlay 노드는 최신 카메라 프레임을 캐시하고 좌/우 이미지를 교차 발행해 부하 피크를 줄입니다. 이 값은 목표 발행률이며, Gazebo/rqt/PX4 부하에 따라 실측 Hz는 낮아질 수 있습니다. YOLO 거리 계산에 자원을 우선 배정하려면 `--raw-view`를 붙여 overlay 발행을 끕니다.
 YOLO 실제 추론 Hz는 `/stereo/yolo_update_hz`를 기준으로 확인합니다. `/target_distance`는 그래프 표시를 위해 마지막 거리값도 `plot_publish_hz`로 재발행하므로, 이 토픽 Hz가 곧 YOLO 추론 Hz를 의미하지는 않습니다.
-실시간 기록은 앱 가운데의 Recorder 패널에서 `Start Lite`, `Start Full`, `Start Debug`, `Stop` 버튼으로 제어합니다. `Lite`는 Excel/MATLAB용 `telemetry.csv`, `Full`은 CSV와 좌/우 overlay MP4, `Debug`는 CSV/MP4와 재현용 rosbag을 함께 저장합니다. 새 `telemetry.csv`에는 `axis_contract=stereo_center_frd:forward_right_down`이 들어가며, 카메라 기준 실제 위치는 `drone_forward_m`, `drone_right_m`, `drone_down_m`, 카메라 기준 실제 3D 직선거리는 `ground_truth_m`으로 저장됩니다. 스테레오 3D 추정값은 `estimated_forward_m`, `estimated_right_m`, `estimated_down_m`, `estimated_range_m`과 raw YOLO alias `raw_forward_m/right_m/down_m`, bbox 보정 alias `corrected_forward_m/right_m/down_m`으로 저장합니다. 새 CSV는 공개 축 필드로 legacy `x/y/z`를 내보내지 않습니다. 명령 실행과 동시에 기록을 시작해야 하는 경우에는 `--record-lite`, `--record-full`, `--record-debug` 옵션을 사용할 수 있습니다.
+실시간 기록은 앱 가운데의 Recorder 패널에서 `Start Lite`, `Start Full`, `Start Debug`, `Stop` 버튼으로 제어합니다. `Respawn Drone`은 `Waypoint`, `Stop`과 같은 운용 툴바에서 `Stop` 오른쪽에 표시되며, `/stereo/respawn_drone` Trigger service로 target을 launch pose에 재배치합니다. `Lite`는 Excel/MATLAB용 `telemetry.csv`, `Full`은 CSV와 좌/우 overlay MP4, `Debug`는 CSV/MP4와 재현용 rosbag을 함께 저장합니다. 새 `telemetry.csv`에는 `axis_contract=stereo_center_frd:forward_right_down`이 들어가며, 카메라 기준 실제 위치는 `drone_forward_m`, `drone_right_m`, `drone_down_m`, 카메라 기준 실제 3D 직선거리는 `ground_truth_m`으로 저장됩니다. 스테레오 3D 추정값은 `estimated_forward_m`, `estimated_right_m`, `estimated_down_m`, `estimated_range_m`과 raw YOLO alias `raw_forward_m/right_m/down_m`, bbox 보정 alias `corrected_forward_m/right_m/down_m`으로 저장합니다. 새 CSV는 공개 축 필드로 legacy `x/y/z`를 내보내지 않습니다. 명령 실행과 동시에 기록을 시작해야 하는 경우에는 `--record-lite`, `--record-full`, `--record-debug` 옵션을 사용할 수 있습니다.
 저장된 debug rosbag을 같은 `rqt_gui` 창 안의 Bag 플러그인으로 확인하려면 Plot 대신 Bag 구성을 선택합니다.
 
 ```bash
@@ -5774,7 +5886,11 @@ Gazebo, rqt, PX4 실행 후 자동 이륙-접근-착륙까지 한 번에 시작�
 ./run_operator_view.sh --auto-mission
 ```
 
-기본 자동 임무는 PX4 SITL이 붙을 시간을 기다린 뒤 `./run_auto_mission.sh`를 실행합니다. 빠른 확인용 설정은:
+rqt `Flight` 탭에서는 자동 임무 버튼을 `Mission`으로 표시합니다. 실행 스크립트는
+`run_mission.sh`로 이름을 통일했으며, 기존 `--auto-mission` 옵션은 다른 실행 환경과의
+호환성을 위해 그대로 유지합니다.
+
+기본 자동 임무는 PX4 SITL이 붙을 시간을 기다린 뒤 `./run_mission.sh`를 실행합니다. 빠른 확인용 설정은:
 
 ```bash
 ./run_operator_view.sh --auto-mission --quick-mission
@@ -5783,44 +5899,73 @@ Gazebo, rqt, PX4 실행 후 자동 이륙-접근-착륙까지 한 번에 시작�
 이미 `./run_operator_view.sh`로 Gazebo, PX4 SITL, QGC 연결이 떠 있는 상태에서 자동 이륙-접근-착륙만 실행하려면 별도 터미널에서 아래 명령을 실행합니다.
 
 ```bash
-./run_auto_mission.sh
+./run_mission.sh
 ```
 
-`run_auto_mission.sh`는 `pymavlink`를 import할 수 있는 Python을 자동으로 고릅니다.
+`run_mission.sh`는 `pymavlink`를 import할 수 있는 Python을 자동으로 고릅니다.
 `Simulation/.venv`에 없으면 로컬 PX4 가상환경도 검사하므로 venv를 별도로
 activate할 필요가 없습니다. 다른 Python을 강제할 때는
-`MISSION_PYTHON=/path/to/python ./run_auto_mission.sh`처럼 지정합니다.
+`MISSION_PYTHON=/path/to/python ./run_mission.sh`처럼 지정합니다.
 
 기본 동작은 `config/simulation.env` 기준으로 이륙, 호버, PX4 local `north` 음수 방향 접근, Gazebo Ground Truth가 목표 거리 이하가 되면 호버, 착륙입니다. 현재 월드에서는 이 축이 Gazebo Y 거리를 줄이는 카메라 방향 접근입니다. Ground Truth가 unavailable인 경우에도 임무 명령은 `DRONE_MOVE_DISTANCE_M` local displacement를 상한으로 계속할 수 있지만, 그 계획값은 `/ground_truth`, actual distance, distance error에 절대 사용하지 않습니다. PX4 기본 `MPC_XY_CRUISE`/`MPC_XY_VEL_MAX` 제한 때문에 명령 속도보다 실제 접근 속도가 낮을 수 있습니다. 한 번만 목표 거리나 속도를 바꾸려면:
 
 ```bash
-./run_auto_mission.sh --target-distance-m 200 --altitude-m 10 --speed-mps 15
+./run_mission.sh --target-distance-m 200 --altitude-m 10 --speed-mps 15
 ```
 
 이 명령은 Gazebo나 rqt 앱을 다시 띄우지 않고, 실행 중인 PX4에 MAVLink offboard 명령만 병렬로 보냅니다. 기본 연결 포트는 PX4 SITL offboard 포트인 `udpin:0.0.0.0:14540`입니다.
 임무를 시작하지 않고 연결만 확인하려면:
 
 ```bash
-./run_auto_mission.sh --check-connection
+./run_mission.sh --check-connection
 ```
 
-`./run_operator_view.sh`의 기본값은 `gz_gui:=false`, `launch_rviz:=true`입니다. 기본 실행에서 Gazebo server, rqt 카메라/그래프 창, RViz가 함께 뜹니다. Gazebo 3D GUI까지 열려면 `--gazebo-gui` 또는 `gz_gui:=true`를 사용합니다.
+`Flight` 탭의 `Auto` 버튼은 `run_auto.sh`를 실행하지만 recorder는 자동으로
+시작하지 않습니다. Auto가 진행 중일 때 `Save CSV`를 누르면 그 시점부터
+telemetry/detections CSV를, `Save MP4`를 누르면 그 시점부터 CSV와 좌우 overlay
+MP4를 저장합니다. 이동 중에는
+좌우 카메라의 전체 bbox가 모두 image pixel 안전 영역(기본 각 변 5% 마진) 안에
+있을 때만 알려진 bbox의 마진 이탈을 정지 조건으로 사용합니다. 초기/일시적인
+검출 누락이나 stale 상태는 전진을 막지 않으며, 카메라가 촬영 가능한 거리로
+접근하면서 데이터 수집이 시작됩니다. 후진 명령은 사용하지 않습니다. 실행 중에는 같은 툴바의 `Stop`을
+누르면 Auto process group에 SIGINT를 보내고 PX4 `LAND`를 요청합니다. 기록을
+시작한 경우 CSV/MP4 recorder도 같은 Stop 시점을 기준으로 flush/finalize하므로,
+Save 버튼을 누른 시점부터 Stop 시점까지의 데이터만 `telemetry.csv`, overlay
+MP4, XLSX에 남습니다. 수동 실행은
+다음과 같습니다:
 
-rqt의 `Flight` 탭에서 `Respawn Drone`을 누르면 target model이
+```bash
+./run_auto.sh
+```
+
+`./run_operator_view.sh`의 기본값은 `gz_gui:=false`, `launch_rviz:=true`입니다. 기본 실행에서 Gazebo server, rqt 카메라/그래프 창, RViz가 함께 뜹니다. Gazebo 3D GUI까지 열려면 `--gazebo-gui` 또는 `gz_gui:=true`를 사용합니다. 일반 실행은 `simulation_interfaces`, `stereo_ground_sim`, `stereo_ground_sim_overlay`를 함께 빌드하며, 한글 경로에서 ROSIDL이 깨지지 않도록 colcon CMake build cache는 `/tmp/sasl-operator-colcon-build.*` 아래에 만들고 install space만 repo-local `Simulation/install`에 유지합니다. 다른 build base가 필요하면 `SASL_OPERATOR_COLCON_BUILD_BASE=/tmp/my-build ./run_operator_view.sh`처럼 지정할 수 있습니다.
+현재 ROS 설치본을 재사용하고 repo-local Python 소스를 우선 사용해야 하는 환경에서는
+`./run_operator_view.sh --skip-colcon-build`를 사용할 수 있습니다. 이 옵션은 colcon
+빌드를 생략하지만 PX4/ROS 인터페이스 사전 점검은 유지합니다.
+
+rqt의 `Flight` 탭 운용 툴바에서 `Stop`을 누르면 rqt가 시작한 `Mission`, `Waypoint`,
+`Auto` process를 중단합니다. `Auto`는 PX4 `LAND` 요청 후 recorder가 CSV/MP4/XLSX를
+마무리할 때까지 기다립니다. `Respawn Drone`을 누르면 target model이
 `target_spawn_x_m`, `target_spawn_y_m`, `target_spawn_z_m`,
 `target_spawn_yaw_deg`로 지정한 launch pose로 Gazebo에서 재배치됩니다.
-서비스가 완료되면 버튼이 다시 활성화되며, 이 동작은 Gazebo pose만 바꾸고
-PX4 estimator를 재부팅하지 않습니다.
+버튼은 `Waypoint`, `Auto`, `Stop` 오른쪽에 있으며, 서비스가 완료되면 다시 활성화됩니다.
+이 동작은 Gazebo pose만 바꾸고 PX4 estimator를 재부팅하지 않습니다.
 
-RViz와 ray metrics의 사용자 표시 이름은 `Raw`, `Truth`, `Ideal`, `GPS`,
-`Global`, `Attitude`, `Baseline`, `Full`입니다. `Truth`는 target Ground
-Truth 점 자체가 아니라, 동일한 observed pixel에 Gazebo observed optical
-pose를 적용한 oracle 삼각측량입니다. `Attitude`는 PX4
-`VehicleAttitude`로 생성한 optical 자세와 Gazebo optical center를,
-`Baseline`은 Gazebo optical 자세와 raw `SensorGps` baseline을, `Full`은
-두 PX4 입력을 동시에 적용해 각각 독립적으로 재삼각측량합니다.
+Flight 탭에서는 Ray Diagnostics 위에 별도의 `Target GT / Nominal Pose /
+Optical Pose / GPS / Global Baseline` 거리 요약 패널을 표시하지 않습니다.
+각 Ray의 거리 데이터는 Ray Diagnostics의 `Geometry` 표에서 확인하며, 중복
+패널을 제거한 공간은 Ray Diagnostics의 표와 Sensors 내용을 표시하는 데
+사용됩니다. Geometry 표의 상태·단위·축 정보는 그대로 유지됩니다.
 
-`/stereo/ray_markers`는 모든 좌·우 ray, closest-ray gap, midpoint를 Gazebo
+RViz와 ray metrics의 사용자 표시 이름은 `Nominal Pose`, `Optical Pose`,
+`Ideal`, `GPS Baseline`, `Global Baseline`, `Attitude`, `Operational`입니다.
+rqt의 GPS reference plot은 `UAM GPS`로 표시하고, RViz에서는 같은 위치를
+`UAM GPS Ray`로 표시합니다. `Optical Pose`는 target Ground Truth 점 자체가
+아니라 observed pixel에 Gazebo observed optical pose를 적용한 oracle
+삼각측량입니다.
+
+`/stereo/ray_markers`는 모든 좌·우 ray, closest-ray gap, midpoint와
+baseline-center 원점에서 UAM GPS 기준점으로 연결한 `UAM GPS Ray`를 Gazebo
 World ENU (`gazebo_world_enu`, metre)로 표시합니다. 측정값·delta·interaction·
 Gazebo GT 오차는 고정 `baseline_center_frd` [Forward, Right, Down]에
 저장됩니다. raw GPS baseline은 기존 정책대로 nominal left optical center를
@@ -6118,7 +6263,7 @@ ATTITUDE_EXPERIMENT_INCLUDE_NEGATIVE=false
 ATTITUDE_EXPERIMENT_QUICK=false
 ```
 
-전체 기본값 묶음을 임시로 교체하려면 `SIM_CONFIG=config/my_simulation.env ./run_operator_view.sh`처럼 실행합니다. 같은 `SIM_CONFIG` 계약을 `run_auto_mission.sh`, `run_px4_waypoint_mission.sh`, `run_attitude_error_experiment.sh`에서도 사용합니다.
+전체 기본값 묶음을 임시로 교체하려면 `SIM_CONFIG=config/my_simulation.env ./run_operator_view.sh`처럼 실행합니다. 같은 `SIM_CONFIG` 계약을 `run_mission.sh`, `run_px4_waypoint_mission.sh`, `run_attitude_error_experiment.sh`에서도 사용합니다.
 
 예: 오른쪽 카메라 yaw를 1도 틀기
 
@@ -6207,6 +6352,20 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 
 ## 변경 이력
 
+- 2026-08-04: Auto mission phase publisher가 ROS context 종료를 비행 실패로 전파하지 않도록 보완했습니다. phase 메타데이터를 쓸 수 없을 때도 Auto 비행은 계속되며, sweep recorder는 bbox 검출 이후의 telemetry CSV/MP4를 독립적으로 finalize합니다.
+- 2026-08-04: Auto FOV guard가 bbox 미검출/stale 상태를 전진 차단 조건으로 사용하지 않도록 수정했습니다. 검출이 없을 때도 전진하고, 좌우 bbox가 실제로 수신된 경우에만 image margin 이탈을 정지 조건으로 적용합니다.
+- 2026-08-04: Auto 자세 보정 sweep의 반복 조건 기본값을 `config/simulation.env`의 `SWEEP_*` 환경변수로 관리하도록 추가했습니다. CLI가 환경변수보다 우선하며, 축/각도/반복/출력경로/대기시간/seed/무작위화/실패 후 계속/기존 세션 허용 여부를 명시적으로 설정할 수 있습니다.
+- 2026-08-04: Auto 데이터 생성용 S2 pair record를 v7로 올리고 `mission_phase`와 UAM raw GPS reference의 FRD/World-ENU 값, GPS age/skew/Eph를 보존하도록 했습니다. Auto phase는 `/stereo/auto_mission_phase`에서 전달되며, 이 변경은 보정법 탐색이나 선택을 수행하지 않습니다.
+- 2026-08-04: 일반 operator 실행이 `simulation_interfaces`까지 함께 빌드하고, 한글 checkout 경로에서 ROSIDL이 생성 경로를 잘못 해석하지 않도록 colcon build cache를 외부 임시 경로로 분리했습니다.
+- 2026-08-04: Auto가 CSV/MP4 recorder를 자동 시작하지 않도록 변경했습니다. Auto 중 `Save CSV` 또는 `Save MP4`를 누른 시점부터 기록하고, `Stop` 시 해당 recorder만 flush/finalize합니다.
+- 2026-08-04: rqt `Stop`이 rqt에서 시작한 Auto/Mission process group과 recorder를 함께 중단하도록 했습니다. Auto 중단 시 PX4 `LAND`를 요청하고, Stop 클릭 시점까지의 CSV/MP4만 flush/finalize하도록 process-group과 recorder lifecycle을 연결했습니다.
+- 2026-08-04: Auto mission에서 FOV monitor와 실제 거리 monitor가 ROS context를 중복 초기화해 이륙 직후 종료되던 문제를 수정했습니다. 이미 초기화된 context를 재사용하고, monitor가 직접 초기화한 경우에만 종료하도록 했습니다.
+- 2026-08-04: Flight 탭 상단 상태 라벨에서 MAVLink ATTITUDE 연결 성공 시 표시하던 `listening...` 문구를 제거했습니다. raw ATTITUDE 수신과 좌우 비교 표시는 그대로 유지됩니다.
+- 2026-08-04: `run_auto.sh`가 `set -u` 상태에서 ROS setup을 source해 recorder 시작 직후 종료되던 문제를 수정했습니다. ROS setup source 동안만 unset 환경변수 검사를 완화하고, 이후 strict shell 검사를 복원합니다.
+- 2026-08-04: `Flight` 탭의 `Auto` 버튼과 `run_auto.sh`를 추가했습니다. Auto는 full recorder로 CSV와 좌우 overlay MP4를 저장하고, 좌우 전체 bbox가 5% image margin 안에 있을 때만 PX4 LOCAL_NED 전진 명령을 보내며 검출 누락/경계 이탈 시 정지합니다. 후진은 사용하지 않습니다.
+- 2026-08-04: Analysis 탭 상단의 `FRDR comparison: ...` 설명 문구를 제거하고 데이터 계열 선택 영역부터 표시하도록 정리했습니다. 그래프 계열과 FRD 축 계약은 변경하지 않았습니다.
+- 2026-08-04: Flight 탭의 자동 임무 표시명을 `Auto Mission`에서 `Mission`으로 변경하고 실행 스크립트명을 `run_mission.sh`로 통일했습니다. CLI 옵션 `--auto-mission`은 호환성을 위해 유지합니다.
+- 2026-08-04: Analysis 상단에 데이터 계열별 표시 체크박스를 추가했습니다. 체크 해제 시 그래프 선, 우측 범례, Y축 자동 범위에서 해당 계열을 제외하며 긴 범례 라벨이 잘리지 않도록 우측 여백을 자동 조정합니다. `Respawn Drone`을 `Waypoint`/`Stop` 툴바의 `Stop` 오른쪽으로 이동하고, Flight 탭에서 Geometry와 중복되는 각 Ray 거리 요약 패널을 제거했습니다. Ray Diagnostics는 항상 펼쳐진 상태로 표시하고 접기/펼치기 토글을 제거했으며, 표시 갱신 주기를 10 Hz로 제한하고 좌우 Grid 간격을 8 px로 고정했습니다. 세 PX4의 raw MAVLink ATTITUDE operator 링크를 UDP 14551 단일 수신 포트로 통합하고 system ID로 좌/우 카메라를 분류했습니다. QGroundControl용 UDP 14550은 유지합니다.
 - 2026-08-03: PX4 고정 자세 설정을 `CAM_L/R_PX4_ATTITUDE_{ROLL,PITCH,YAW}_DEG`로 통일하고 optical pose와 PX4 body attitude를 독립 입력으로 분리했습니다. 생성 SDF는 PX4 body pose와 `optical_link` 상대 자세를 각각 구성하며, `Nominal`/`Raw`는 고정 configured PX4 자세, `Attitude`는 시간별 `VehicleAttitude`를 사용합니다. 기존 `CAM_*_PX4_ATTITUDE_ERROR_*` 이름은 제거했습니다.
 - 2026-06-18: fresh-seed replay에서 단일 frame 보정 profile과 단순 raw/disparity/alpha-beta prefilter는 1852 m worst-case tail을 안정적으로 통과하지 못했습니다. 실패 원인은 전역 자세/원점 보정 부족보다 순간 disparity/BBox 측정 이상치가 장거리에서 증폭되는 문제로 좁혀졌습니다. 후속으로 `repeated_observation_trimmed_mean_n7_trim0p2`를 적용해 left image `u/v`와 measured disparity를 7회 독립 관측 후 trimmed mean으로 fuse하고 stereo-center RDF로 재삼각측량한 뒤 runtime profile을 적용했습니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/repeated_observation_fusion_all_scenarios_followup/aggregate_summary/`에 CSV/TXT로 저장되어 있습니다. nominal, yaw/pitch, disparity noise, combined sensor, bbox outlier stress는 기존 bbox-runtime profile과 함께 STRICT_PASS이고, intrinsic-only stress는 calibrated profile이 range RMSE를 악화시켜 identity passthrough profile이 STRICT_PASS입니다. runtime 입력은 fused pixel/disparity와 raw RDF뿐이며 PX4/NED truth는 synthetic generation/audit 전용입니다. 내부 보정 좌표는 stereo-center RDF(right, down, forward), public StereoDistance topic 계약은 FRD+range(forward, right, down, range)입니다.
 - 2026-06-18: repeated observation의 독립 오차 가정이 너무 낙관적인지 확인하기 위해 common-mode 오차를 포함한 multi-burst fusion도 검증했습니다. `multiburst_observation_*_b5x5_trim0p2_common0p5` 계열은 bbox outlier, combined sensor, disparity noise, intrinsic identity stress에서 모두 20/20 STRICT_PASS입니다. 결과는 `Simulation/results/rtk_stereo_runtime_observation_stress_fscale_grid_matched360/multiburst_observation_fusion_followup/aggregate_summary/`에 저장되어 있습니다. 이 결과는 실제 운용에서 단일 BBox 중심 하나를 바로 보정하지 말고, 짧은 burst 단위로 pixel/disparity를 robust fusion한 뒤 보정 profile 또는 identity passthrough를 적용하는 구조가 더 적합하다는 증거입니다.
@@ -6480,3 +6639,15 @@ python3 Simulation/scripts/check_non_alias_selector_deployment_readiness.py \
   `/stereo/respawn_drone` Trigger service를 호출해 Gazebo target model을
   launch-time `target_spawn_x/y/z/yaw` pose로 되돌립니다. 이는 Gazebo 모델
   재배치 기능이며 PX4 estimator 재부팅까지 수행하지는 않습니다.
+### Sweep runtime workaround
+
+`run_auto_attitude_sweep.sh` keeps rqt/RViz and the optional
+`detection_overlay_node` enabled so the full operator recorder writes its
+required left/right MP4 artifacts. The strict sweep's default 2 Hz camera/YOLO
+sampling bounds overlay load; normal operator rates remain unchanged. YOLO
+detection, the operator recorder's CSV/MP4 outputs, and the research recorder's
+Gazebo GT/UAM GPS/Operational Ray records remain enabled. During Stop/Auto completion, the operator waits up to
+180 seconds for `RUN_FINALIZED_VALID`; it sends the research node `SIGINT`
+before stopping the ROS launch tree so accepted rows are flushed before the
+next case. The sweep uses `SIGTERM` (not background-shell `SIGINT`) to enter
+that finalization path immediately after Auto completes.
