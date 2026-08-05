@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import os
@@ -196,6 +197,30 @@ from stereo_ground_sim.time_alignment import (
 
 
 DRONE_MESH_RESOURCE = "package://stereo_ground_sim/models/x500_15m/meshes/NXP-HGD-CF.dae"
+# Must match this model's base_link_visual mesh <scale> in its model.sdf, or
+# the RViz marker will render at the wrong size relative to the real Gazebo
+# geometry.
+DRONE_MESH_VISUAL_SCALE = 24.5245
+_ADDITIONAL_TARGET_MODEL_VISUALS: dict[str, tuple[str, float]] = {
+    "x500_2m": (
+        "package://stereo_ground_sim/models/x500_2m/meshes/NXP-HGD-CF.dae",
+        3.2699,
+    ),
+}
+
+
+def _resolve_target_model_visual(model_name: str) -> tuple[str, float]:
+    """Return (mesh_resource, visual_scale) for the given target model name."""
+    if model_name == "x500_15m":
+        return DRONE_MESH_RESOURCE, DRONE_MESH_VISUAL_SCALE
+    try:
+        return _ADDITIONAL_TARGET_MODEL_VISUALS[model_name]
+    except KeyError:
+        known = ", ".join(sorted({"x500_15m", *_ADDITIONAL_TARGET_MODEL_VISUALS}))
+        raise ValueError(
+            f"unknown target model {model_name!r}; register its mesh resource/visual "
+            f"scale in _ADDITIONAL_TARGET_MODEL_VISUALS (known: {known})"
+        ) from None
 
 # Canonical Ray identifiers are also the public JSON/CSV schema identifiers.
 # ``optical_pose`` is the Gazebo optical-pose oracle, not target Ground Truth.
@@ -259,6 +284,7 @@ class Px4AttitudeSample:
 
     quaternion_wxyz: tuple[float, float, float, float] | None
     timestamp_us: int | None
+    simulation_timestamp_ns: int | None
     reset_counter: int | None
     simulation_epoch: int
     received_monotonic_ns: int
@@ -577,6 +603,9 @@ class StereoDistanceNode(Node):
         self.final_hover_duration_s = self._float_param("final_hover_duration_s")
         self.land_duration_s = self._float_param("land_duration_s")
         self.target_model_name = self.get_parameter("target_model_name").value
+        self._mesh_resource, self._mesh_visual_scale = _resolve_target_model_visual(
+            self.target_model_name
+        )
         self.target_spawn_x_m = self._float_param("target_spawn_x_m")
         self.target_spawn_y_m = self._float_param("target_spawn_y_m")
         self.target_spawn_z_m = self._float_param("target_spawn_z_m")
@@ -766,6 +795,12 @@ class StereoDistanceNode(Node):
         self.measurement_results_by_pair_id = {}
         self.gt_alignments_by_pair_id = {}
         self.pairs_by_pair_id = {}
+        # Freeze the latest reality-transferable PX4/GPS inputs when an image
+        # pair is accepted.  YOLO processing is intentionally FIFO and may lag
+        # simulation time by many seconds; reading the live sensor cache in the
+        # worker would therefore combine an old pixel observation with a future
+        # operational pose.
+        self.operational_sources_by_pair_id = {}
         self.max_pair_result_history = 128
         self.evaluated_pair_ids = BoundedIdHistory(self.max_pair_result_history)
         self.gt_evaluation_failed_pair_ids = BoundedIdHistory(
@@ -1204,6 +1239,44 @@ class StereoDistanceNode(Node):
         right_origin_frd = self.baseline_center_frd.point_from_world(
             self.nominal_right_camera.center_world_enu_m
         )
+        intrinsic_contract = {
+            "image_width_px": int(self.camera_image_width_px),
+            "image_height_px": int(self.camera_image_height_px),
+            "horizontal_fov_rad": float(self.horizontal_fov_rad),
+            "fx_px": float(intrinsics.fx_px),
+            "fy_px": float(intrinsics.fy_px),
+            "cx_px": float(intrinsics.cx_px),
+            "cy_px": float(intrinsics.cy_px),
+            "skew_px": 0.0,
+            "distortion_model": "none",
+            "distortion_coefficients": [],
+        }
+        intrinsic_profile_sha256 = hashlib.sha256(
+            json.dumps(
+                intrinsic_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        baseline_vector_frd = [
+            right_origin_frd[index] - left_origin_frd[index] for index in range(3)
+        ]
+        baseline_length_m = math.sqrt(sum(value * value for value in baseline_vector_frd))
+        rig_contract = {
+            "left_nominal_origin_baseline_center_frd_m": list(left_origin_frd),
+            "right_nominal_origin_baseline_center_frd_m": list(right_origin_frd),
+            "baseline_vector_baseline_center_frd_m": baseline_vector_frd,
+            "baseline_length_m": baseline_length_m,
+        }
+        rig_profile_sha256 = hashlib.sha256(
+            json.dumps(
+                rig_contract,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         desired_camera_poses = {
             label: {
                 "center_world_enu_m": list(camera.center_world_enu_m),
@@ -1274,7 +1347,7 @@ class StereoDistanceNode(Node):
             "image_height_px": self.camera_image_height_px,
             "camera_update_rate_hz": self.camera_update_rate_hz,
             "intrinsic_profile_id": "simulation_pinhole_from_horizontal_fov",
-            "intrinsic_profile_sha256": "not_applicable_generated_from_effective_config",
+            "intrinsic_profile_sha256": intrinsic_profile_sha256,
             "fx_px": intrinsics.fx_px,
             "fy_px": intrinsics.fy_px,
             "cx_px": intrinsics.cx_px,
@@ -1289,15 +1362,9 @@ class StereoDistanceNode(Node):
             "crop_policy": "none",
             "resize_policy": "none",
             "letterbox_policy": "none",
-            "left_nominal_origin_baseline_center_frd_m": list(left_origin_frd),
-            "right_nominal_origin_baseline_center_frd_m": list(right_origin_frd),
-            "baseline_vector_baseline_center_frd_m": [
-                right_origin_frd[index] - left_origin_frd[index] for index in range(3)
-            ],
-            "baseline_length_m": math.sqrt(sum(
-                (right_origin_frd[index] - left_origin_frd[index]) ** 2
-                for index in range(3)
-            )),
+            "rig_profile_id": "simulation_symmetric_baseline",
+            "rig_profile_sha256": rig_profile_sha256,
+            **rig_contract,
             "camera_oracle_source": "gazebo_observed_optical",
             "camera_oracle_expected_sdf_sha256": self.camera_oracle_generated_sdf_sha256,
             "camera_oracle_max_age_s": self.camera_oracle_max_age_s,
@@ -1311,6 +1378,25 @@ class StereoDistanceNode(Node):
             },
             "px4_attitude_max_age_s": self.px4_attitude_max_age_s,
             "px4_attitude_pair_skew_s": self.px4_attitude_pair_skew_s,
+            "gps_baseline_max_age_s": self.gps_baseline_max_age_s,
+            "operational_pose_timestamp_source": (
+                "/clock values observed when PX4 attitude/GPS samples were received"
+            ),
+            "operational_pose_alignment_method": (
+                "latest_valid_px4_sensor_snapshot_at_image_pair_acceptance"
+            ),
+            "px4_source_timestamp_fields": [
+                "left_attitude_timestamp_us",
+                "right_attitude_timestamp_us",
+                "left_gps_timestamp_us",
+                "right_gps_timestamp_us",
+            ],
+            "operational_simulation_timestamp_fields": [
+                "left_operational_attitude_timestamp_ns",
+                "right_operational_attitude_timestamp_ns",
+                "left_operational_position_timestamp_ns",
+                "right_operational_position_timestamp_ns",
+            ],
             "px4_quaternion_order": "wxyz",
             "px4_attitude_semantics": "body_frd_to_earth_ned",
             "px4_attitude_model_version": PX4_ATTITUDE_MODEL_VERSION,
@@ -1676,6 +1762,9 @@ class StereoDistanceNode(Node):
 
         received_monotonic_ns = time.monotonic_ns()
         epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        simulation_timestamp_ns = getattr(
+            getattr(self, "simulation_epoch", None), "last_clock_stamp_ns", None
+        )
         try:
             fix = RawGpsFix(
                 timestamp_us=int(message.timestamp_sample or message.timestamp),
@@ -1714,6 +1803,7 @@ class StereoDistanceNode(Node):
                 fix,
                 received_monotonic_ns,
                 epoch,
+                simulation_timestamp_ns,
             )
             failures = getattr(self, "gps_baseline_failures", None)
             if failures is None:
@@ -1726,6 +1816,9 @@ class StereoDistanceNode(Node):
 
         received_monotonic_ns = time.monotonic_ns()
         epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        simulation_timestamp_ns = getattr(
+            getattr(self, "simulation_epoch", None), "last_clock_stamp_ns", None
+        )
         quaternion = None
         timestamp_us = None
         reset_counter = None
@@ -1749,6 +1842,7 @@ class StereoDistanceNode(Node):
             sample = Px4AttitudeSample(
                 quaternion_wxyz=quaternion,
                 timestamp_us=timestamp_us,
+                simulation_timestamp_ns=simulation_timestamp_ns,
                 reset_counter=reset_counter,
                 simulation_epoch=epoch,
                 received_monotonic_ns=received_monotonic_ns,
@@ -1766,6 +1860,7 @@ class StereoDistanceNode(Node):
             sample = Px4AttitudeSample(
                 quaternion_wxyz=quaternion,
                 timestamp_us=timestamp_us,
+                simulation_timestamp_ns=simulation_timestamp_ns,
                 reset_counter=reset_counter,
                 simulation_epoch=epoch,
                 received_monotonic_ns=received_monotonic_ns,
@@ -1801,6 +1896,7 @@ class StereoDistanceNode(Node):
         return Px4AttitudeSample(
             quaternion_wxyz=quaternion,
             timestamp_us=int(timestamp_us),
+            simulation_timestamp_ns=None,
             reset_counter=int(reset_counter),
             simulation_epoch=int(epoch),
             received_monotonic_ns=received_ns,
@@ -1809,7 +1905,12 @@ class StereoDistanceNode(Node):
         )
 
     def _px4_attitude_camera_poses(
-        self, camera_sources, *, include_provenance=False
+        self,
+        camera_sources,
+        *,
+        include_provenance=False,
+        operational_snapshot=None,
+        observation_timestamp_ns=None,
     ):
         def finish(poses, status, provenance):
             return (
@@ -1826,16 +1927,35 @@ class StereoDistanceNode(Node):
             "left_attitude_topic": getattr(self, "px4_attitude_left_topic", ""),
             "right_attitude_topic": getattr(self, "px4_attitude_right_topic", ""),
             "simulation_epoch": getattr(getattr(self, "simulation_epoch", None), "epoch", 0),
+            "operational_source_snapshot_timestamp_ns": (
+                None
+                if not isinstance(operational_snapshot, dict)
+                else operational_snapshot.get("captured_simulation_timestamp_ns")
+            ),
+            "attitude_alignment_method": (
+                "latest_valid_px4_sample_at_image_pair_acceptance"
+                if isinstance(operational_snapshot, dict)
+                else "latest_valid_px4_sample_at_computation"
+            ),
         }
         if camera_sources is None:
             return finish(None, "missing_camera_oracle", provenance)
-        with self.lock:
-            left_sample = self._legacy_attitude_sample(
-                self.px4_attitudes.get("left")
-            )
-            right_sample = self._legacy_attitude_sample(
-                self.px4_attitudes.get("right")
-            )
+        snapshot_attitudes = (
+            operational_snapshot.get("px4_attitudes")
+            if isinstance(operational_snapshot, dict)
+            else None
+        )
+        if isinstance(snapshot_attitudes, dict):
+            left_sample = self._legacy_attitude_sample(snapshot_attitudes.get("left"))
+            right_sample = self._legacy_attitude_sample(snapshot_attitudes.get("right"))
+        else:
+            with self.lock:
+                left_sample = self._legacy_attitude_sample(
+                    self.px4_attitudes.get("left")
+                )
+                right_sample = self._legacy_attitude_sample(
+                    self.px4_attitudes.get("right")
+                )
         if left_sample is None:
             return finish(None, "missing_left_attitude", provenance)
         if right_sample is None:
@@ -1845,6 +1965,7 @@ class StereoDistanceNode(Node):
             provenance.update(
                 {
                     f"{label}_attitude_timestamp_us": sample.timestamp_us,
+                    f"{label}_attitude_simulation_timestamp_ns": sample.simulation_timestamp_ns,
                     f"{label}_attitude_receive_monotonic_ns": sample.received_monotonic_ns,
                     f"{label}_attitude_reset_counter": sample.reset_counter,
                     **{
@@ -1864,7 +1985,12 @@ class StereoDistanceNode(Node):
         epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
         if left_sample.simulation_epoch != epoch or right_sample.simulation_epoch != epoch:
             return finish(None, "attitude_epoch_mismatch", provenance)
-        now_ns = time.monotonic_ns()
+        now_ns = (
+            int(operational_snapshot.get("captured_monotonic_ns"))
+            if isinstance(operational_snapshot, dict)
+            and operational_snapshot.get("captured_monotonic_ns") is not None
+            else time.monotonic_ns()
+        )
         left_age_ms = (now_ns - left_sample.received_monotonic_ns) / 1_000_000.0
         right_age_ms = (now_ns - right_sample.received_monotonic_ns) / 1_000_000.0
         pair_skew_ms = abs(left_sample.timestamp_us - right_sample.timestamp_us) / 1_000.0
@@ -1881,6 +2007,25 @@ class StereoDistanceNode(Node):
             return finish(None, "stale_right_attitude", provenance)
         if pair_skew_ms > self.px4_attitude_pair_skew_s * 1_000.0:
             return finish(None, "attitude_pair_skew_exceeded", provenance)
+        if observation_timestamp_ns is not None:
+            for label, sample in (("left", left_sample), ("right", right_sample)):
+                sample_stamp_ns = sample.simulation_timestamp_ns
+                if sample_stamp_ns is None:
+                    return finish(
+                        None,
+                        f"missing_{label}_attitude_simulation_timestamp",
+                        provenance,
+                    )
+                alignment_dt_s = (
+                    int(sample_stamp_ns) - int(observation_timestamp_ns)
+                ) / 1_000_000_000.0
+                provenance[f"{label}_attitude_alignment_dt_s"] = alignment_dt_s
+                if abs(alignment_dt_s) > self.px4_attitude_max_age_s:
+                    return finish(
+                        None,
+                        f"{label}_attitude_observation_skew_exceeded",
+                        provenance,
+                    )
         try:
             left_source, right_source = camera_sources
             left_pose = getattr(left_source, "pose", left_source)
@@ -1912,6 +2057,11 @@ class StereoDistanceNode(Node):
     def _global_baseline_callback(self, camera_label, message):
         """Retain the newest valid PX4 fused-global-position fix."""
 
+        received_monotonic_ns = time.monotonic_ns()
+        epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
+        simulation_timestamp_ns = getattr(
+            getattr(self, "simulation_epoch", None), "last_clock_stamp_ns", None
+        )
         try:
             if not bool(message.lat_lon_valid) or not bool(message.alt_valid):
                 raise ValueError("invalid fused global position")
@@ -1939,8 +2089,9 @@ class StereoDistanceNode(Node):
         with self.lock:
             self.global_baseline_fixes[camera_label] = (
                 fix,
-                time.monotonic_ns(),
-                getattr(getattr(self, "simulation_epoch", None), "epoch", 0),
+                received_monotonic_ns,
+                epoch,
+                simulation_timestamp_ns,
             )
 
     @staticmethod
@@ -1954,12 +2105,34 @@ class StereoDistanceNode(Node):
                 if float(received) > 1.0e12
                 else int(float(received) * 1_000_000_000)
             )
-            return fix, received_ns, int(current_epoch)
-        fix, received_ns, epoch = entry
-        return fix, int(received_ns), int(epoch)
+            return fix, received_ns, int(current_epoch), None
+        if len(entry) == 3:
+            fix, received_ns, epoch = entry
+            return fix, int(received_ns), int(epoch), None
+        fix, received_ns, epoch, simulation_timestamp_ns = entry
+        return (
+            fix,
+            int(received_ns),
+            int(epoch),
+            None if simulation_timestamp_ns is None else int(simulation_timestamp_ns),
+        )
 
-    def _gps_baseline_camera_poses(self, source):
-        """Build nominal-attitude poses separated by one PX4 position source."""
+    def _gps_baseline_camera_poses(
+        self,
+        source,
+        *,
+        operational_snapshot=None,
+        observation_timestamp_ns=None,
+    ):
+        """Build configured-optical-attitude poses separated by one PX4 position source.
+
+        Orientation comes from ``desired_left_camera``/``desired_right_camera``
+        (the CAM_*_OPTICAL_* configured attitude), not the level nominal pose,
+        so the ray reflects the camera's actual look direction. Only the
+        camera *centers* are replaced with the GPS/global-position-derived
+        separation, which is what isolates raw position error from the
+        time-varying PX4 VehicleAttitude stream used by the Attitude ray.
+        """
 
         provenance = {
             "pixel_source": "observed",
@@ -1967,23 +2140,49 @@ class StereoDistanceNode(Node):
             "baseline_anchor_policy": GPS_BASELINE_ANCHOR_POLICY,
             "left_camera_center_source": "nominal_left_optical_center_anchor",
             "right_camera_center_source": "nominal_left_anchor_plus_px4_relative_enu_separation",
+            "camera_orientation_source": "configured_cam_optical_rpy",
             "left_gps_topic": getattr(self, "gps_baseline_left_topic", ""),
             "right_gps_topic": getattr(self, "gps_baseline_right_topic", ""),
+            "operational_source_snapshot_timestamp_ns": (
+                None
+                if not isinstance(operational_snapshot, dict)
+                else operational_snapshot.get("captured_simulation_timestamp_ns")
+            ),
+            "position_alignment_method": (
+                "latest_valid_px4_position_at_image_pair_acceptance"
+                if isinstance(operational_snapshot, dict)
+                else "latest_valid_px4_position_at_computation"
+            ),
         }
         if not getattr(self, "enable_gps_baseline_triangulation", False):
             return None, "disabled", provenance
         source = self._validate_gps_baseline_source(source)
         if source == "both":
             raise ValueError("both is an output selection, not one baseline source")
-        fixes = (
-            self.gps_baseline_fixes
+        snapshot_key = (
+            "gps_baseline_fixes"
             if source == "gps_baseline"
-            else self.global_baseline_fixes
+            else "global_baseline_fixes"
         )
-        with self.lock:
-            left_entry = fixes.get("left")
-            right_entry = fixes.get("right")
+        snapshot_fixes = (
+            operational_snapshot.get(snapshot_key)
+            if isinstance(operational_snapshot, dict)
+            else None
+        )
+        if isinstance(snapshot_fixes, dict):
+            left_entry = snapshot_fixes.get("left")
+            right_entry = snapshot_fixes.get("right")
             failures = dict(getattr(self, "gps_baseline_failures", {}))
+        else:
+            fixes = (
+                self.gps_baseline_fixes
+                if source == "gps_baseline"
+                else self.global_baseline_fixes
+            )
+            with self.lock:
+                left_entry = fixes.get("left")
+                right_entry = fixes.get("right")
+                failures = dict(getattr(self, "gps_baseline_failures", {}))
         current_epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
         if left_entry is None:
             failure = failures.get("left") if source == "gps_baseline" else None
@@ -2001,22 +2200,29 @@ class StereoDistanceNode(Node):
                 else "missing_right_gps_fix"
             )
             return None, status, provenance
-        left_fix, left_received_ns, left_epoch = self._gps_fix_entry(
+        left_fix, left_received_ns, left_epoch, left_simulation_timestamp_ns = self._gps_fix_entry(
             left_entry, current_epoch
         )
-        right_fix, right_received_ns, right_epoch = self._gps_fix_entry(
+        right_fix, right_received_ns, right_epoch, right_simulation_timestamp_ns = self._gps_fix_entry(
             right_entry, current_epoch
         )
         provenance.update(
             {
                 "gps_left_timestamp_us": left_fix.timestamp_us,
                 "gps_right_timestamp_us": right_fix.timestamp_us,
+                "left_gps_simulation_timestamp_ns": left_simulation_timestamp_ns,
+                "right_gps_simulation_timestamp_ns": right_simulation_timestamp_ns,
                 "simulation_epoch": current_epoch,
             }
         )
         if left_epoch != current_epoch or right_epoch != current_epoch:
             return None, "gps_epoch_mismatch", provenance
-        now_ns = time.monotonic_ns()
+        now_ns = (
+            int(operational_snapshot.get("captured_monotonic_ns"))
+            if isinstance(operational_snapshot, dict)
+            and operational_snapshot.get("captured_monotonic_ns") is not None
+            else time.monotonic_ns()
+        )
         left_age_ms = (now_ns - left_received_ns) / 1_000_000.0
         right_age_ms = (now_ns - right_received_ns) / 1_000_000.0
         pair_skew_ms = abs(left_fix.timestamp_us - right_fix.timestamp_us) / 1_000.0
@@ -2033,6 +2239,23 @@ class StereoDistanceNode(Node):
             return None, "stale_right_gps_fix", provenance
         if pair_skew_ms > self.gps_baseline_max_age_s * 1_000.0:
             return None, "gps_pair_skew_exceeded", provenance
+        if observation_timestamp_ns is not None:
+            for label, sample_stamp_ns in (
+                ("left", left_simulation_timestamp_ns),
+                ("right", right_simulation_timestamp_ns),
+            ):
+                if sample_stamp_ns is None:
+                    return None, f"missing_{label}_gps_simulation_timestamp", provenance
+                alignment_dt_s = (
+                    int(sample_stamp_ns) - int(observation_timestamp_ns)
+                ) / 1_000_000_000.0
+                provenance[f"{label}_gps_alignment_dt_s"] = alignment_dt_s
+                if abs(alignment_dt_s) > self.gps_baseline_max_age_s:
+                    return (
+                        None,
+                        f"{label}_gps_observation_skew_exceeded",
+                        provenance,
+                    )
         try:
             baseline_enu = gps_baseline_enu_m(left_fix, right_fix)
         except ValueError:
@@ -2045,8 +2268,8 @@ class StereoDistanceNode(Node):
         left_center = self.nominal_left_camera.center_world_enu_m
         right_center = tuple(left_center[index] + baseline_enu[index] for index in range(3))
         poses = (
-            replace(self.nominal_left_camera, center_world_enu_m=left_center),
-            replace(self.nominal_right_camera, center_world_enu_m=right_center),
+            replace(self.desired_left_camera, center_world_enu_m=left_center),
+            replace(self.desired_right_camera, center_world_enu_m=right_center),
         )
         nominal_baseline = tuple(
             self.nominal_right_camera.center_world_enu_m[index]
@@ -2084,10 +2307,10 @@ class StereoDistanceNode(Node):
         if left_entry is None or uam_entry is None:
             return {"computation_status": "unavailable_raw_gps_fix"}
         current_epoch = getattr(getattr(self, "simulation_epoch", None), "epoch", 0)
-        left_fix, left_received_ns, left_epoch = self._gps_fix_entry(
+        left_fix, left_received_ns, left_epoch, _ = self._gps_fix_entry(
             left_entry, current_epoch
         )
-        uam_fix, uam_received_ns, uam_epoch = self._gps_fix_entry(
+        uam_fix, uam_received_ns, uam_epoch, _ = self._gps_fix_entry(
             uam_entry, current_epoch
         )
         if left_epoch != current_epoch or uam_epoch != current_epoch:
@@ -2234,15 +2457,24 @@ class StereoDistanceNode(Node):
         alignment = alignment or getattr(self, "gt_alignments_by_pair_id", {}).get(
             pair.pair_id
         )
+        run_id = str(getattr(self, "research_run_id", "") or "legacy-test-run")
+        case_id = str(getattr(self, "research_case_id", "") or "legacy-test-case")
         record = empty_pair_record()
         record.update(
             {
                 "schema_version": RESEARCH_SCHEMA_VERSION,
-                "session_id": self.research_session_id,
-                "run_id": self.research_run_id,
-                "attempt_id": self.research_attempt_id,
-                "case_id": self.research_case_id,
-                "effective_config_sha256": self.research_effective_config_sha256,
+                "session_id": str(
+                    getattr(self, "research_session_id", "") or run_id
+                ),
+                "run_id": run_id,
+                "attempt_id": str(
+                    getattr(self, "research_attempt_id", "") or case_id
+                ),
+                "case_id": case_id,
+                "effective_config_sha256": str(
+                    getattr(self, "research_effective_config_sha256", "")
+                    or ("0" * 64)
+                ),
                 "record_sequence": None,
                 "record_type": "pair_terminal",
                 "pair_id": int(pair.pair_id),
@@ -2516,6 +2748,7 @@ class StereoDistanceNode(Node):
         self.measurement_results_by_pair_id.clear()
         self.gt_alignments_by_pair_id.clear()
         self.pairs_by_pair_id.clear()
+        getattr(self, "operational_sources_by_pair_id", {}).clear()
         self.evaluated_pair_ids.clear()
         self.gt_evaluation_failed_pair_ids.clear()
         self.gt_published_pair_ids.clear()
@@ -2523,6 +2756,34 @@ class StereoDistanceNode(Node):
         self.cached_actual_distance = None
         self.ground_truth_stamp_ns = None
         self.old_epoch_frame_count += dropped
+
+    def _capture_operational_sources_locked(self):
+        """Freeze the sensor values available when an image pair is accepted.
+
+        The image timestamps and ``captured_simulation_timestamp_ns`` use the
+        Gazebo/ROS Simulation clock.  PX4 source timestamps remain separately
+        recorded in their native microsecond domain.  No ENU/NED/FRD/RDF value
+        is converted here; this is only an immutable timing/provenance snapshot.
+        """
+
+        return {
+            "captured_simulation_timestamp_ns": getattr(
+                getattr(self, "simulation_epoch", None),
+                "last_clock_stamp_ns",
+                None,
+            ),
+            "captured_monotonic_ns": time.monotonic_ns(),
+            "simulation_epoch": getattr(
+                getattr(self, "simulation_epoch", None), "epoch", 0
+            ),
+            "px4_attitudes": dict(getattr(self, "px4_attitudes", {})),
+            "gps_baseline_fixes": dict(
+                getattr(self, "gps_baseline_fixes", {})
+            ),
+            "global_baseline_fixes": dict(
+                getattr(self, "global_baseline_fixes", {})
+            ),
+        }
 
     def _register_measurement_pairs_locked(self, pairs):
         ready_count = 0
@@ -2576,6 +2837,11 @@ class StereoDistanceNode(Node):
                     )
                 continue
             self.pairs_by_pair_id[pair.pair_id] = pair
+            snapshots = getattr(self, "operational_sources_by_pair_id", None)
+            if snapshots is None:
+                snapshots = {}
+                self.operational_sources_by_pair_id = snapshots
+            snapshots[pair.pair_id] = self._capture_operational_sources_locked()
             if getattr(self, "observation_mode", "bbox_yolo") == "bbox_yolo":
                 self.measurement_pair_queue.append(pair)
             alignments = self.pending_gt_aligner.add_pair(pair)
@@ -2609,6 +2875,7 @@ class StereoDistanceNode(Node):
         )
         self.pending_gt_aligner.remove_pair(pair_id)
         self.pairs_by_pair_id.pop(pair_id, None)
+        getattr(self, "operational_sources_by_pair_id", {}).pop(pair_id, None)
         self.measurement_results_by_pair_id.pop(pair_id, None)
         self.gt_alignments_by_pair_id.pop(pair_id, None)
         self.evaluated_pair_ids.discard(pair_id)
@@ -3211,6 +3478,8 @@ class StereoDistanceNode(Node):
             "right_camera_center_source",
             "left_attitude_timestamp_us",
             "right_attitude_timestamp_us",
+            "left_attitude_simulation_timestamp_ns",
+            "right_attitude_simulation_timestamp_ns",
             "left_attitude_receive_monotonic_ns",
             "right_attitude_receive_monotonic_ns",
             "left_attitude_reset_counter",
@@ -3493,11 +3762,31 @@ class StereoDistanceNode(Node):
             else None
         )
         gt_world = None if alignment is None else alignment.position_world_enu_m
-        left_pose_us = operational.get("left_attitude_timestamp_us")
-        right_pose_us = operational.get("right_attitude_timestamp_us")
+        left_pose_ns = operational.get("left_attitude_simulation_timestamp_ns")
+        right_pose_ns = operational.get("right_attitude_simulation_timestamp_ns")
+        left_position_ns = operational.get("left_gps_simulation_timestamp_ns")
+        right_position_ns = operational.get("right_gps_simulation_timestamp_ns")
+        source_snapshot_ns = operational.get(
+            "operational_source_snapshot_timestamp_ns"
+        )
         left_depth = operational.get("left_depth_m")
         right_depth = operational.get("right_depth_m")
-        failure_reason = str(operational.get("failure_reason") or "")
+        observation_valid = bool(
+            metrics.get("left_observation_valid")
+            and metrics.get("right_observation_valid")
+        )
+        if observation_valid:
+            observation_failure_reason = ""
+        elif not metrics.get("left_observation_valid") and not metrics.get("right_observation_valid"):
+            observation_failure_reason = "missing_left_and_right_observation"
+        elif not metrics.get("left_observation_valid"):
+            observation_failure_reason = "missing_left_observation"
+        else:
+            observation_failure_reason = "missing_right_observation"
+        failure_reason = str(
+            operational.get("failure_reason")
+            or ("" if op_valid else observation_failure_reason or status)
+        )
         failure_token = f"{status};{failure_reason}".lower()
         fields = {
             "sample_id": f"{pair.epoch}:{pair.pair_id}",
@@ -3506,10 +3795,16 @@ class StereoDistanceNode(Node):
             "right_observation_timestamp_ns": int(pair.right_stamp_ns),
             "left_right_dt_s": float(pair.pair_delta_ns) / 1_000_000_000.0,
             "left_pose_alignment_dt_s": (
-                None if left_pose_us is None else (int(left_pose_us) * 1000 - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+                None if left_pose_ns is None else (int(left_pose_ns) - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
             ),
             "right_pose_alignment_dt_s": (
-                None if right_pose_us is None else (int(right_pose_us) * 1000 - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+                None if right_pose_ns is None else (int(right_pose_ns) - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+            ),
+            "left_position_alignment_dt_s": (
+                None if left_position_ns is None else (int(left_position_ns) - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
+            ),
+            "right_position_alignment_dt_s": (
+                None if right_position_ns is None else (int(right_position_ns) - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
             ),
             "observation_gt_dt_s": (
                 None if gt_timestamp is None else (int(gt_timestamp) - pair.pair_midpoint_stamp_ns) / 1_000_000_000.0
@@ -3517,12 +3812,18 @@ class StereoDistanceNode(Node):
             "sync_valid": (
                 bool(pair.pairing_mode)
                 and gt_mode != "unavailable"
-                and left_pose_us is not None
-                and right_pose_us is not None
+                and op_valid
+                and left_pose_ns is not None
+                and right_pose_ns is not None
+                and left_position_ns is not None
+                and right_position_ns is not None
             ),
             "sync_failure_reason": (
-                "" if gt_mode != "unavailable" and left_pose_us is not None and right_pose_us is not None
+                "" if gt_mode != "unavailable" and op_valid
+                and left_pose_ns is not None and right_pose_ns is not None
+                and left_position_ns is not None and right_position_ns is not None
                 else "ground_truth_alignment_unavailable" if gt_mode == "unavailable"
+                else str(operational.get("failure_reason") or status) if not op_valid
                 else "operational_pose_timestamp_unavailable"
             ),
             "interpolation_method": gt_mode,
@@ -3543,14 +3844,19 @@ class StereoDistanceNode(Node):
             "right_bbox_ymax_px": metrics.get("right_bbox_ymax_px"),
             "operational_position_source": operational.get("baseline_source"),
             "operational_position_frame": BASELINE_CENTER_FRD_FRAME,
+            "operational_source_snapshot_timestamp_ns": source_snapshot_ns,
+            "left_operational_position_timestamp_ns": left_position_ns,
+            "right_operational_position_timestamp_ns": right_position_ns,
             "left_operational_position_valid": op_valid,
             "right_operational_position_valid": op_valid,
             "operational_attitude_source": operational.get("attitude_source"),
             "operational_attitude_parent_frame": "earth_ned",
             "operational_attitude_child_frame": "body_frd",
             "operational_attitude_quaternion_order": operational.get("px4_quaternion_order"),
-            "left_operational_pose_timestamp_ns": None if left_pose_us is None else int(left_pose_us) * 1000,
-            "right_operational_pose_timestamp_ns": None if right_pose_us is None else int(right_pose_us) * 1000,
+            "left_operational_pose_timestamp_ns": left_pose_ns,
+            "right_operational_pose_timestamp_ns": right_pose_ns,
+            "left_operational_attitude_timestamp_ns": left_pose_ns,
+            "right_operational_attitude_timestamp_ns": right_pose_ns,
             "left_operational_pose_valid": op_valid,
             "right_operational_pose_valid": op_valid,
             "operational_x_m": operational.get("forward_m"),
@@ -3570,9 +3876,17 @@ class StereoDistanceNode(Node):
             "nonfinite_output": "nonfinite_output" in failure_token,
             "zero_or_small_baseline": "baseline" in failure_token,
             "condition_exceeded": "condition" in failure_token,
-            "sample_valid": op_valid and gt_mode != "unavailable",
-            "failure_stage": "" if op_valid else "operational_triangulation",
-            "failure_code": "" if op_valid else status,
+            "sample_valid": observation_valid and op_valid and gt_mode != "unavailable",
+            "failure_stage": (
+                "" if observation_valid and op_valid
+                else "observation" if not observation_valid
+                else "operational_triangulation"
+            ),
+            "failure_code": (
+                "" if observation_valid and op_valid
+                else observation_failure_reason if not observation_valid
+                else status
+            ),
             "failure_reason": "" if op_valid else failure_reason,
             "gt_timestamp_ns": gt_timestamp,
             "gt_valid": gt_world is not None,
@@ -3604,10 +3918,27 @@ class StereoDistanceNode(Node):
             fields["operational_elevation_deg"] = math.degrees(math.atan2(-float(down), math.hypot(float(forward), float(right))))
         return fields
 
-    def _diagnostic_rays(self, left_u, left_v, right_u, right_v, width, height, snapshot):
+    def _diagnostic_rays(
+        self,
+        left_u,
+        left_v,
+        right_u,
+        right_v,
+        width,
+        height,
+        snapshot,
+        *,
+        operational_snapshot=None,
+        observation_timestamp_ns=None,
+    ):
         """Re-triangulate observed pixels with independently selected inputs."""
         attitude_poses, attitude_status, attitude_provenance = (
-            self._px4_attitude_camera_poses(snapshot, include_provenance=True)
+            self._px4_attitude_camera_poses(
+                snapshot,
+                include_provenance=True,
+                operational_snapshot=operational_snapshot,
+                observation_timestamp_ns=observation_timestamp_ns,
+            )
         )
         attitude_provenance.update(
             {
@@ -3630,7 +3961,11 @@ class StereoDistanceNode(Node):
             attitude = self._finalize_diagnostic_ray(
                 attitude, provenance=attitude_provenance
             )
-        gps_poses, gps_status, gps_provenance = self._gps_baseline_camera_poses("gps_baseline")
+        gps_poses, gps_status, gps_provenance = self._gps_baseline_camera_poses(
+            "gps_baseline",
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+        )
         full_attitude_poses = None
         full_attitude_status = attitude_status
         full_attitude_provenance = attitude_provenance
@@ -3640,7 +3975,10 @@ class StereoDistanceNode(Node):
                 full_attitude_status,
                 full_attitude_provenance,
             ) = self._px4_attitude_camera_poses(
-                gps_poses, include_provenance=True
+                gps_poses,
+                include_provenance=True,
+                operational_snapshot=operational_snapshot,
+                observation_timestamp_ns=observation_timestamp_ns,
             )
         if gps_poses is None or full_attitude_poses is None:
             status = gps_status if gps_poses is None else full_attitude_status
@@ -4803,6 +5141,10 @@ class StereoDistanceNode(Node):
 
         started = time.monotonic()
         camera_oracle_snapshot = self._camera_oracle_snapshot()
+        with self.lock:
+            operational_snapshot = getattr(
+                self, "operational_sources_by_pair_id", {}
+            ).get(pair.pair_id)
         if getattr(self, "observation_mode", "bbox_yolo") == "ideal_reference_point":
             width = int(getattr(pair.left_message, "width", 0))
             height = int(getattr(pair.left_message, "height", 0))
@@ -4836,7 +5178,17 @@ class StereoDistanceNode(Node):
             gps_baselines = self._triangulate_gps_baselines(
                 left["cx"], left["cy"], right["cx"], right["cy"], width, height
             )
-            diagnostic_rays = self._diagnostic_rays(left["cx"], left["cy"], right["cx"], right["cy"], width, height, camera_oracle_snapshot)
+            diagnostic_rays = self._diagnostic_rays(
+                left["cx"],
+                left["cy"],
+                right["cx"],
+                right["cy"],
+                width,
+                height,
+                camera_oracle_snapshot,
+                operational_snapshot=operational_snapshot,
+                observation_timestamp_ns=pair.pair_midpoint_stamp_ns,
+            )
             return {
                 "started": started, "finished": time.monotonic(), "phase": phase,
                 "left_image": np.zeros((height, width, 3), dtype=np.uint8),
@@ -4885,6 +5237,8 @@ class StereoDistanceNode(Node):
             diagnostic_rays = self._diagnostic_rays(
                 left["cx"], left["cy"], right["cx"], right["cy"],
                 left_image.shape[1], left_image.shape[0], camera_oracle_snapshot,
+                operational_snapshot=operational_snapshot,
+                observation_timestamp_ns=pair.pair_midpoint_stamp_ns,
             )
         return {
             "started": started,
@@ -5352,6 +5706,10 @@ class StereoDistanceNode(Node):
 
         mode = self._validate_observation_mode(self.observation_mode)
         fields = {
+            "left_u_px": None if left is None else left.get("cx"),
+            "left_v_px": None if left is None else left.get("cy"),
+            "right_u_px": None if right is None else right.get("cx"),
+            "right_v_px": None if right is None else right.get("cy"),
             "left_confidence": None if left is None else left.get("confidence"),
             "right_confidence": None if right is None else right.get("confidence"),
             "left_observation_source": (
@@ -7754,10 +8112,10 @@ class StereoDistanceNode(Node):
             marker.pose.orientation.w,
         ) = (float(value) for value in orientation_xyzw)
         # Match the model SDF visual scale.  This affects only RViz rendering.
-        marker.scale.x = marker.scale.y = marker.scale.z = 22.0
+        marker.scale.x = marker.scale.y = marker.scale.z = self._mesh_visual_scale
         marker.color.r = marker.color.g = marker.color.b = 0.72
         marker.color.a = 1.0
-        marker.mesh_resource = DRONE_MESH_RESOURCE
+        marker.mesh_resource = self._mesh_resource
         # Keep the mesh readable against RViz's dark background; the source
         # geometry remains the actual Gazebo X500 asset.
         marker.mesh_use_embedded_materials = False

@@ -23,6 +23,7 @@ from stereo_ground_sim.research_recording import (
 
 
 SHA = "a" * 40
+CONFIG_SHA = "c" * 64
 
 
 def _config(tmp_path: Path, **changes):
@@ -66,10 +67,14 @@ def _record(pair_id=1, epoch=0, stamp=9_007_199_254_740_993):
     record.update(
         {
             "schema_version": RESEARCH_SCHEMA_VERSION,
+            "session_id": "session-1",
             "run_id": "run-1",
+            "attempt_id": "case-1",
             "case_id": "case-1",
+            "effective_config_sha256": CONFIG_SHA,
             "record_sequence": None,
             "record_type": "pair_terminal",
+            "sample_id": f"{epoch}:{pair_id}",
             "pair_id": pair_id,
             "epoch": epoch,
             "left_stamp_ns": stamp,

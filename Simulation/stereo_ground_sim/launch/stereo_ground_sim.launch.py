@@ -47,18 +47,25 @@ def _bool_config_default(context, name, default):
 
 
 def _set_target_include_static(world_xml, *, target_model_name, static_enabled):
-    """Set only the configured research target include's Gazebo static flag."""
+    """Point the world's sole research-target include at target_model_name and
+    set its Gazebo static flag.
+
+    The world file has exactly one world-level ``<include>`` (the research
+    target; the stereo cameras are inline ``<model>`` blocks, not includes),
+    so that include is selected structurally and its ``<uri>`` is rewritten
+    to match ``target_model_name`` rather than requiring it to already match.
+    """
     root = ET.fromstring(world_xml)
     expected_uri = f"model://{target_model_name}"
-    matches = [
-        include
-        for include in root.findall("./world/include")
-        if (include.findtext("uri") or "").strip() == expected_uri
-    ]
+    matches = root.findall("./world/include")
     if len(matches) != 1:
         raise ValueError(
-            f"expected exactly one target include for {expected_uri}, found {len(matches)}"
+            f"expected exactly one world-level research target include, found {len(matches)}"
         )
+    uri_fields = matches[0].findall("uri")
+    if len(uri_fields) != 1:
+        raise ValueError("target include must contain exactly one uri field")
+    uri_fields[0].text = expected_uri
     static_fields = matches[0].findall("static")
     if len(static_fields) != 1:
         raise ValueError(
@@ -332,6 +339,12 @@ def _generate_world(context):
     target_spawn_z_m = _float_config(context, "target_spawn_z_m")
     target_spawn_yaw_deg = _float_config(context, "target_spawn_yaw_deg")
     target_model_name = LaunchConfiguration("target_model_name", default="x500_15m").perform(context)
+    target_model_sdf = os.path.join(share_dir, "models", target_model_name, "model.sdf")
+    if not os.path.isfile(target_model_sdf):
+        raise ValueError(
+            f"target_model_name {target_model_name!r} has no model.sdf at {target_model_sdf}; "
+            "add the model under stereo_ground_sim/models/ before selecting it"
+        )
     target_static_for_research = _bool_config_default(
         context, "target_static_for_research", False
     )

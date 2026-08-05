@@ -34,10 +34,14 @@ def _record(*, status="evaluated", eligible=True):
     record.update(
         {
             "schema_version": RESEARCH_SCHEMA_VERSION,
+            "session_id": "session",
             "run_id": "run",
+            "attempt_id": "case",
             "case_id": "case",
+            "effective_config_sha256": "c" * 64,
             "record_sequence": None,
             "record_type": "pair_terminal",
+            "sample_id": "0:1",
             "pair_id": 1,
             "epoch": 0,
             "left_stamp_ns": 10,

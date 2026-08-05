@@ -33,6 +33,30 @@ RVIZ_MARKER_TOPIC = "/stereo/ground_truth_markers"
 GAZEBO_MESSAGE_TYPE = "gz.msgs.Pose_V"
 ROS_MESSAGE_TYPE = "geometry_msgs/msg/PoseStamped"
 DRONE_MESH_RESOURCE = "package://stereo_ground_sim/models/x500_15m/meshes/NXP-HGD-CF.dae"
+# Must match this model's base_link_visual mesh <scale> in its model.sdf, or
+# the RViz marker will render at the wrong size relative to the real Gazebo
+# geometry.
+DRONE_MESH_VISUAL_SCALE = 24.5245
+_ADDITIONAL_TARGET_MODEL_VISUALS: dict[str, tuple[str, float]] = {
+    "x500_2m": (
+        "package://stereo_ground_sim/models/x500_2m/meshes/NXP-HGD-CF.dae",
+        3.2699,
+    ),
+}
+
+
+def _resolve_target_model_visual(model_name: str) -> tuple[str, float]:
+    """Return (mesh_resource, visual_scale) for the given target model name."""
+    if model_name == "x500_15m":
+        return DRONE_MESH_RESOURCE, DRONE_MESH_VISUAL_SCALE
+    try:
+        return _ADDITIONAL_TARGET_MODEL_VISUALS[model_name]
+    except KeyError:
+        known = ", ".join(sorted({"x500_15m", *_ADDITIONAL_TARGET_MODEL_VISUALS}))
+        raise ValueError(
+            f"unknown target model {model_name!r}; register its mesh resource/visual "
+            f"scale in _ADDITIONAL_TARGET_MODEL_VISUALS (known: {known})"
+        ) from None
 
 
 class PosePayloadError(ValueError):
@@ -353,6 +377,9 @@ class GazeboGroundTruthAdapter:
         self._marker_type = Marker
         self._marker_array_type = MarkerArray
         self._parent_model_name = str(self._node.get_parameter("parent_model_name").value)
+        self._mesh_resource, self._mesh_visual_scale = _resolve_target_model_visual(
+            self._parent_model_name
+        )
         configured_source_link = str(self._node.get_parameter("source_link_name").value)
         self._source_link_name = configured_source_link or f"{self._parent_model_name}::{SOURCE_GAZEBO_ENTITY}"
         self._topic = str(topic or f"/model/{self._parent_model_name}/pose")
@@ -417,10 +444,10 @@ class GazeboGroundTruthAdapter:
             marker.pose.orientation.z,
             marker.pose.orientation.w,
         ) = record.orientation_world_from_entity_xyzw
-        marker.scale.x = marker.scale.y = marker.scale.z = 22.0
+        marker.scale.x = marker.scale.y = marker.scale.z = self._mesh_visual_scale
         marker.color.r = marker.color.g = marker.color.b = 0.72
         marker.color.a = 1.0
-        marker.mesh_resource = DRONE_MESH_RESOURCE
+        marker.mesh_resource = self._mesh_resource
         marker.mesh_use_embedded_materials = False
         self._marker_publisher.publish(self._marker_array_type(markers=[marker]))
 

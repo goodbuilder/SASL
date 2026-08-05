@@ -42,18 +42,42 @@ For repeatable calibration data, use
 `./run_auto_attitude_sweep.sh -- --quick` only as a smoke test, or omit
 `--quick` for the normal mission. The runner always includes a zero-degree
 baseline, then restarts the complete Gazebo/PX4/operator stack for each
-one-axis right-camera optical-RDF case. The default is baseline plus
-`roll,pitch,yaw = -1, +1` degrees. `--repetitions N` repeats each non-zero
-case. The non-zero conditions are randomized by default using a recorded seed;
-a 0-degree baseline is run before each condition and once after the final
-condition. Use `--ordered` to disable randomization. Every case writes its own
+right-camera optical-RDF case. The default axes are `roll,pitch,yaw,combined`;
+`combined` applies the same angle to roll, pitch, and yaw simultaneously in one
+case so coupled multi-axis error is sampled too, not only one-factor-at-a-time.
+The default values are `-1.0` to `1.0` degrees in `0.1` steps (0 excluded, it is
+the baseline). `--repetitions N` repeats each non-zero case. Every
+baseline-before/condition pair cycles one shared entry from `--altitudes-m`
+(default `20,30,40`) and one from `--lateral-biases-m` (default `-5,0,5`, a
+constant lateral offset the approach controller holds the target away from
+image-center) by condition index, so elevation-angle and off-boresight
+geometry are sampled across the campaign without multiplying it by a full
+cross-product. The baseline and its paired condition always share the same
+altitude/lateral-bias draw, so their difference isolates the attitude-only
+effect instead of also confounding a geometry change; passing an explicit
+`--altitude-m`/`--lateral-bias-m` after `--` opts a run out of that per-case
+cycling. On top of the per-case lateral bias, every case also runs a
+continuous triangle-wave lateral sweep (`--lateral-sweep-amplitude-m`,
+default `10`, period `--lateral-sweep-period-s`, default `24`) during its
+approach, so a single flight actively samples a range of off-boresight
+offsets within the safe-FOV margin instead of holding one fixed value; the
+safe-FOV guard is unchanged and still freezes all motion if a bbox nears the
+margin. With the full default grid the sweep runs 161 cases (80 non-zero
+attitude conditions x2 baselines, plus 1); narrow `--axes`/`--values-deg` for a
+shorter campaign. The non-zero conditions are randomized by default using a
+recorded seed; a 0-degree baseline is run before each condition and once after
+the final condition. Use `--ordered` to disable randomization. RViz and
+`rqt_gui` stay visible for every case (no `--headless`), so a full default
+sweep keeps a display busy for its whole duration. Every case writes its own
 `operator.log`, readiness/Auto logs, case contract, S2 `pair_records.csv`, and
 an `operator-recording/` full session under `Simulation/recordings/` by
 default (or a user-specified output directory). The case directory also
 contains `effective_config.json`. Its canonical payload records the actual
 right-camera optical-RDF perturbation, observation mode, camera rate,
-coordinate/quaternion contracts, Gazebo reference link, output paths, and
-repository provenance. Its `effective_config_sha256` is copied to
+coordinate/quaternion contracts, Gazebo reference link, the per-case
+`geometry_altitude_m`/`geometry_lateral_bias_m`/`geometry_lateral_sweep_amplitude_m`/
+`geometry_lateral_sweep_period_s`, output paths, and repository
+provenance. Its `effective_config_sha256` is copied to
 `run_metadata.json`, the sweep manifest, and every S2 pair row. `session_id`
 identifies one sweep and `attempt_id` identifies one case execution. The
 full session waits for the first valid left/right bbox pair, then writes
@@ -70,11 +94,23 @@ completed.
 The defaults are stored in `config/simulation.env`. An explicitly exported
 environment variable overrides that file, and a CLI option overrides both.
 
-- `SWEEP_AXES`: attitude axes to test, such as `roll,pitch,yaw`.
+- `SWEEP_AXES`: attitude axes to test, such as `roll,pitch,yaw,combined`.
+  `combined` perturbs roll, pitch, and yaw together in one case.
 - `SWEEP_VALUES_DEG`: comma-separated optical-RDF angle values in degrees,
   such as `-1,0,1`. Zero is the baseline and is not used as a perturbation.
 - `SWEEP_REPETITIONS`: number of repetitions for each non-zero axis/value
   condition.
+- `SWEEP_ALTITUDES_M`: comma-separated takeoff altitudes (m), one shared per
+  baseline-before/condition pair, for elevation-angle diversity.
+  `--altitudes-m` is the CLI equivalent.
+- `SWEEP_LATERAL_BIASES_M`: comma-separated constant lateral offsets (m), one
+  shared per baseline-before/condition pair, so the target sits off
+  image-center for some pairs. `--lateral-biases-m` is the CLI equivalent.
+- `SWEEP_LATERAL_SWEEP_AMPLITUDE_M`/`SWEEP_LATERAL_SWEEP_PERIOD_S`: amplitude
+  (m) and period (s) of a continuous triangle-wave lateral sweep every case
+  runs during its approach, on top of the lateral bias above. `0` amplitude
+  disables it. `--lateral-sweep-amplitude-m`/`--lateral-sweep-period-s` are
+  the CLI equivalents.
 - `SWEEP_OUTPUT_DIR`: directory for logs, manifests, contracts, and research
   recordings. The default is `Simulation/recordings/`; repository paths other
   than that directory are rejected.

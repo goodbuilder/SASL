@@ -19,6 +19,7 @@ if str(PACKAGE_DIR) not in sys.path:
 from stereo_ground_sim.coordinate_frames import (  # noqa: E402
     BASELINE_CENTER_FRD_FRAME,
     WORLD_FRAME,
+    apply_optical_rpy_error,
     build_baseline_center_frd,
     nominal_camera_poses,
     project_world_point_to_pixel,
@@ -36,7 +37,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Generate disjoint calibration and validation PX4 waypoint sets "
-            "inside the nominal stereo camera 3D FOV."
+            "inside the stereo camera 3D FOV, at any configured optical "
+            "attitude (--cam-l/r-optical-roll/pitch/yaw-deg; default 0 "
+            "reproduces the old level-camera behavior)."
         )
     )
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -47,6 +50,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-range-m", type=float, default=2000.0)
     parser.add_argument("--camera-baseline-m", type=float, default=25.0)
     parser.add_argument("--camera-height-m", type=float, default=0.5)
+    parser.add_argument(
+        "--cam-l-optical-roll-deg", type=float, default=0.0,
+        help="Left camera optical RDF roll, deg. Matches CAM_L_OPTICAL_ROLL_DEG.",
+    )
+    parser.add_argument(
+        "--cam-l-optical-pitch-deg", type=float, default=0.0,
+        help="Left camera optical RDF pitch, deg. Matches CAM_L_OPTICAL_PITCH_DEG.",
+    )
+    parser.add_argument(
+        "--cam-l-optical-yaw-deg", type=float, default=0.0,
+        help="Left camera optical RDF yaw, deg. Matches CAM_L_OPTICAL_YAW_DEG.",
+    )
+    parser.add_argument(
+        "--cam-r-optical-roll-deg", type=float, default=0.0,
+        help="Right camera optical RDF roll, deg. Matches CAM_R_OPTICAL_ROLL_DEG.",
+    )
+    parser.add_argument(
+        "--cam-r-optical-pitch-deg", type=float, default=0.0,
+        help="Right camera optical RDF pitch, deg. Matches CAM_R_OPTICAL_PITCH_DEG.",
+    )
+    parser.add_argument(
+        "--cam-r-optical-yaw-deg", type=float, default=0.0,
+        help="Right camera optical RDF yaw, deg. Matches CAM_R_OPTICAL_YAW_DEG.",
+    )
     parser.add_argument("--horizontal-fov-rad", type=float, default=0.154997710698)
     parser.add_argument("--image-width-px", type=int, default=1280)
     parser.add_argument("--image-height-px", type=int, default=720)
@@ -169,8 +196,12 @@ def sample_one(
             "world_frame": WORLD_FRAME,
             "baseline_frame": BASELINE_CENTER_FRD_FRAME,
             "world_to_px4_waypoint_contract": WORLD_TO_PX4_WAYPOINT_CONTRACT,
-            "north_m": world[0],
-            "east_m": world[1],
+            # world is Gazebo ENU: world[0]=East, world[1]=North, world[2]=Up
+            # (coordinate_frames.R_ENU_FROM_NED). PX4's north/east are NED, so
+            # north_m must read world[1] and east_m must read world[0] -- not
+            # the same index, despite the visual symmetry of the old code.
+            "north_m": world[1],
+            "east_m": world[0],
             "altitude_agl_m": world[2],
             "world_x_m": world[0],
             "world_y_m": world[1],
@@ -204,7 +235,24 @@ def generate_waypoints(
     if args.min_range_m <= 0.0 or args.max_range_m <= args.min_range_m:
         raise ValueError("range bounds must be positive and increasing")
     rng = random.Random(args.seed)
-    left_camera, right_camera = nominal_camera_poses(args.camera_baseline_m, args.camera_height_m)
+    nominal_left, nominal_right = nominal_camera_poses(args.camera_baseline_m, args.camera_height_m)
+    # nominal_camera_poses() is always level (roll=pitch=0); rotate it to the
+    # actual configured optical attitude so the sampling cone -- and the
+    # left/right pixel-margin check in sample_one() -- match where the
+    # cameras really point, not just the level case. Zero angles are a no-op,
+    # so this generalizes the old level-only behavior rather than replacing it.
+    left_camera = apply_optical_rpy_error(
+        nominal_left,
+        math.radians(args.cam_l_optical_roll_deg),
+        math.radians(args.cam_l_optical_pitch_deg),
+        math.radians(args.cam_l_optical_yaw_deg),
+    )
+    right_camera = apply_optical_rpy_error(
+        nominal_right,
+        math.radians(args.cam_r_optical_roll_deg),
+        math.radians(args.cam_r_optical_pitch_deg),
+        math.radians(args.cam_r_optical_yaw_deg),
+    )
     frame = build_baseline_center_frd(
         left_camera.center_world_enu_m,
         right_camera.center_world_enu_m,
@@ -276,6 +324,12 @@ def generate_waypoints(
             for right in validation
         ),
         "min_set_separation_m": args.min_set_separation_m,
+        "cam_l_optical_roll_deg": args.cam_l_optical_roll_deg,
+        "cam_l_optical_pitch_deg": args.cam_l_optical_pitch_deg,
+        "cam_l_optical_yaw_deg": args.cam_l_optical_yaw_deg,
+        "cam_r_optical_roll_deg": args.cam_r_optical_roll_deg,
+        "cam_r_optical_pitch_deg": args.cam_r_optical_pitch_deg,
+        "cam_r_optical_yaw_deg": args.cam_r_optical_yaw_deg,
         "world_frame": WORLD_FRAME,
         "baseline_frame": BASELINE_CENTER_FRD_FRAME,
         "px4_waypoint_frame": PX4_WAYPOINT_FRAME,
@@ -300,10 +354,20 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
 
 
 def write_mission_path(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
+    """Write north,east,altitude_agl_m ordered far-to-near for flight use.
+
+    ``rows`` (calibration/validation) are i.i.d. random samples with no
+    inherent order; the *_waypoints.csv files preserve that raw order for
+    calibration analysis. This file is the one meant to be flown (e.g. via
+    px4_auto_mission.py --path-file), so it's sorted by descending range --
+    each row is still an individually FOV/margin-verified point, just
+    sequenced into an approach instead of a scatter.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(rows, key=lambda row: float(row["baseline_forward_m"]), reverse=True)
     with path.open("w", encoding="utf-8") as handle:
         handle.write("north,east,altitude_agl_m\n")
-        for row in rows:
+        for row in ordered:
             handle.write(
                 f"{float(row['north_m']):.6f},"
                 f"{float(row['east_m']):.6f},"

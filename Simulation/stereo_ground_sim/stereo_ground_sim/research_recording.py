@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v9"
+RESEARCH_SCHEMA_VERSION = "s2_atomic_pair_v11"
 
 
 # Flat scalar fields required to reproduce the reality-transferable
@@ -31,6 +31,7 @@ CALIBRATION_SAMPLE_COLUMNS = (
     "sample_id", "simulation_timestamp_ns",
     "left_observation_timestamp_ns", "right_observation_timestamp_ns",
     "left_right_dt_s", "left_pose_alignment_dt_s", "right_pose_alignment_dt_s",
+    "left_position_alignment_dt_s", "right_position_alignment_dt_s",
     "observation_gt_dt_s", "sync_valid", "sync_failure_reason",
     "interpolation_method", "source_timestamp_before_ns",
     "source_timestamp_after_ns", "interpolation_alpha",
@@ -45,6 +46,9 @@ CALIBRATION_SAMPLE_COLUMNS = (
     "right_operational_position_baseline_center_frd_y_m",
     "right_operational_position_baseline_center_frd_z_m",
     "operational_position_source", "operational_position_frame",
+    "operational_source_snapshot_timestamp_ns",
+    "left_operational_position_timestamp_ns",
+    "right_operational_position_timestamp_ns",
     "left_operational_position_valid", "right_operational_position_valid",
     "left_operational_attitude_qw", "left_operational_attitude_qx",
     "left_operational_attitude_qy", "left_operational_attitude_qz",
@@ -53,6 +57,8 @@ CALIBRATION_SAMPLE_COLUMNS = (
     "operational_attitude_source", "operational_attitude_parent_frame",
     "operational_attitude_child_frame", "operational_attitude_quaternion_order",
     "left_operational_pose_timestamp_ns", "right_operational_pose_timestamp_ns",
+    "left_operational_attitude_timestamp_ns",
+    "right_operational_attitude_timestamp_ns",
     "left_operational_pose_valid", "right_operational_pose_valid",
     "operational_x_m", "operational_y_m", "operational_z_m",
     "operational_range_m", "operational_azimuth_deg", "operational_elevation_deg",
@@ -278,7 +284,8 @@ PAIR_RECORD_COLUMNS = (
 )
 
 IDENTITY_FIELDS = (
-    "schema_version", "run_id", "case_id", "record_sequence", "record_type",
+    "schema_version", "session_id", "run_id", "attempt_id", "case_id",
+    "effective_config_sha256", "record_sequence", "record_type", "sample_id",
     "pair_id", "epoch", "left_stamp_ns", "right_stamp_ns",
     "pair_midpoint_stamp_ns", "pair_delta_ns", "pairing_mode",
     "terminal_status", "terminal_reason", "measurement_status",
@@ -402,6 +409,11 @@ def validate_pair_record(record: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("pair record schema version mismatch")
     if normalized["record_type"] != "pair_terminal":
         raise ValueError("record_type must be pair_terminal")
+    if len(str(normalized["effective_config_sha256"])) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in str(normalized["effective_config_sha256"])
+    ):
+        raise ValueError("effective_config_sha256 must contain 64 lowercase hex characters")
     for field in (
         "pair_id", "epoch", "left_stamp_ns", "right_stamp_ns",
         "pair_midpoint_stamp_ns", "pair_delta_ns", "record_sequence",

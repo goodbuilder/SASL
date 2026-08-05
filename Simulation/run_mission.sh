@@ -46,7 +46,10 @@ SIM_EXPLICIT_NAMES=(
   DRONE_TARGET_DISTANCE_M DRONE_APPROACH_TIMEOUT_S DRONE_TAKEOFF_TIMEOUT_S
   DRONE_FIRST_HOVER_S DRONE_FINAL_HOVER_S DRONE_LAND_TIMEOUT_S
   DRONE_SETPOINT_HZ AUTO_FOV_MARGIN_RATIO AUTO_FOV_DETECTION_TIMEOUT_S
-  AUTO_FOV_DETECTIONS_TOPIC
+  AUTO_FOV_DETECTIONS_TOPIC DRONE_LATERAL_BIAS_M
+  DRONE_LATERAL_SWEEP_AMPLITUDE_M DRONE_LATERAL_SWEEP_PERIOD_S
+  DRONE_MPC_Z_VEL_MAX_UP_MPS DRONE_MPC_Z_VEL_MAX_DN_MPS
+  DRONE_WAYPOINT_ACCEPTANCE_RADIUS_M
 )
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
@@ -70,10 +73,30 @@ Options:
   --speed-mps N          Forward approach speed.
   --distance-m N         Fallback max movement if /ground_truth is unavailable.
   --approach-timeout-s N Approach timeout in seconds.
+  --mpc-z-vel-max-up-mps N
+                         Override PX4 MPC_Z_VEL_MAX_UP (climb limit) before takeoff.
+  --mpc-z-vel-max-dn-mps N
+                         Override PX4 MPC_Z_VEL_MAX_DN (descent limit) before takeoff.
+  --lateral-bias-m N     Constant lateral offset (m) the approach holds the target
+                         away from image-center. Default: 0 (centered).
+  --lateral-sweep-amplitude-m N  Triangle-wave lateral sweep amplitude (m) added on
+                         top of --lateral-bias-m during the approach. Default: 0 (off).
+  --lateral-sweep-period-s N     Sweep period in seconds. Default: 24.
   --connect STRING       pymavlink connection string. Default: udpin:0.0.0.0:14540
   --fov-guard            Require both full detection bboxes inside the safe FOV area.
   --bbox-margin-ratio N  Inset each image edge by N before forward motion. Default: 0.05.
   --fov-detection-timeout-s N  Maximum age of the paired detections. Default: 0.5.
+  --waypoints-xy-alt LIST  Semicolon-separated north,east,altitude_agl_m path. With
+                         --fov-guard, flies this path (instead of the straight
+                         --altitude-m/--distance-m approach) and stops to hover in
+                         place the instant both cameras' bboxes span the full safe
+                         box on every side. Must be passed explicitly (not read
+                         from WAYPOINTS_XY_ALT_M, which run_px4_waypoint_mission.sh
+                         also uses for its own, unrelated mission).
+  --path-file FILE       Read waypoints from a north,east,altitude_agl_m CSV/text
+                         file instead of --waypoints-xy-alt.
+  --waypoint-acceptance-radius-m N  Distance (m) at which a waypoint counts as
+                         reached. Default: 5.
   --check-connection     Check PX4 connection without moving the drone.
   --help, -h             Show this help.
 
@@ -156,6 +179,38 @@ while (($#)); do
       mission_args+=("$1" "${2:?missing value for $1}")
       shift 2
       ;;
+    --lateral-bias-m|--lateral-sweep-amplitude-m|--lateral-sweep-period-s)
+      provided_args+=("$1")
+      mission_args+=("$1" "${2:?missing value for $1}")
+      shift 2
+      ;;
+    --mpc-z-vel-max-up-mps|--mpc-z-vel-max-dn-mps)
+      provided_args+=("$1")
+      mission_args+=("$1" "${2:?missing value for $1}")
+      shift 2
+      ;;
+    --waypoints-xy-alt)
+      provided_args+=("$1")
+      # A single "=" joined token, since a leading "-100,..." waypoint would
+      # otherwise look like an unrecognized option to Python's argparse.
+      mission_args+=("--waypoints-xy-alt=${2:?missing value for $1}")
+      shift 2
+      ;;
+    --waypoint)
+      provided_args+=("$1")
+      mission_args+=("--waypoint=${2:?missing value for $1}")
+      shift 2
+      ;;
+    --path-file)
+      provided_args+=("$1")
+      mission_args+=("$1" "${2:?missing value for $1}")
+      shift 2
+      ;;
+    --waypoint-acceptance-radius-m)
+      provided_args+=("$1")
+      mission_args+=("$1" "${2:?missing value for $1}")
+      shift 2
+      ;;
     --distance-m|--takeoff-timeout-s|--first-hover-s|--final-hover-s|--land-timeout-s|--setpoint-hz)
       provided_args+=("$1")
       mission_args+=("$1" "${2:?missing value for $1}")
@@ -179,6 +234,17 @@ add_default_arg --first-hover-s "${DRONE_FIRST_HOVER_S:-}"
 add_default_arg --final-hover-s "${DRONE_FINAL_HOVER_S:-}"
 add_default_arg --land-timeout-s "${DRONE_LAND_TIMEOUT_S:-}"
 add_default_arg --setpoint-hz "${DRONE_SETPOINT_HZ:-}"
+add_default_arg --lateral-bias-m "${DRONE_LATERAL_BIAS_M:-}"
+add_default_arg --lateral-sweep-amplitude-m "${DRONE_LATERAL_SWEEP_AMPLITUDE_M:-}"
+add_default_arg --lateral-sweep-period-s "${DRONE_LATERAL_SWEEP_PERIOD_S:-}"
+add_default_arg --mpc-z-vel-max-up-mps "${DRONE_MPC_Z_VEL_MAX_UP_MPS:-}"
+add_default_arg --mpc-z-vel-max-dn-mps "${DRONE_MPC_Z_VEL_MAX_DN_MPS:-}"
+# WAYPOINTS_XY_ALT_M is deliberately NOT wired as an automatic default here:
+# it's also read by run_px4_waypoint_mission.sh, and this script's plain
+# (non-waypoint) callers -- e.g. run_operator_view.sh's --auto-mission,
+# which never passes --fov-guard -- must keep working. The waypoint+FOV-hover
+# flow only activates when --waypoints-xy-alt/--waypoint is explicitly passed.
+add_default_arg --waypoint-acceptance-radius-m "${DRONE_WAYPOINT_ACCEPTANCE_RADIUS_M:-}"
 
 set +u
 # shellcheck disable=SC1091

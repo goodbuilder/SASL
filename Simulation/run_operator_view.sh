@@ -35,7 +35,6 @@ DEFAULT_PLOT_HZ="${DEFAULT_PLOT_HZ:-30.0}"
 DEFAULT_PLOT_WINDOW_S="${DEFAULT_PLOT_WINDOW_S:-30.0}"
 DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH="${DEFAULT_BBOX_CENTER_ADJUSTMENT_PATH:-$ROOT_DIR/../ref/Stereo_Camera_3D_Position_DKL/Cent_Bbox_Adj_Mtrx.csv}"
 PX4_DIR="${PX4_DIR:-}"
-PX4_GZ_MODEL_NAME="${PX4_GZ_MODEL_NAME:-x500_15m}"
 PX4_GZ_WORLD="${PX4_GZ_WORLD:-stereo_ground_drone}"
 GAZEBO_MAJOR_VERSION="${GAZEBO_MAJOR_VERSION:-8}"
 SIM_CONFIG="${SIM_CONFIG:-$ROOT_DIR/config/simulation.env}"
@@ -55,6 +54,7 @@ SIM_EXPLICIT_NAMES=(
   COMMON_OPTICAL_ROLL_ERROR_DEG RELATIVE_OPTICAL_ROLL_ERROR_DEG
   COMMON_OPTICAL_PITCH_ERROR_DEG RELATIVE_OPTICAL_PITCH_ERROR_DEG
   COMMON_OPTICAL_YAW_ERROR_DEG RELATIVE_OPTICAL_YAW_ERROR_DEG
+  PX4_GZ_MODEL_NAME
   DRONE_SPAWN_X_M DRONE_SPAWN_Y_M DRONE_SPAWN_Z_M DRONE_SPAWN_YAW_DEG
   DRONE_TAKEOFF_ALTITUDE_M DRONE_FORWARD_SPEED_MPS DRONE_MOVE_DISTANCE_M
   DRONE_TARGET_DISTANCE_M DRONE_APPROACH_TIMEOUT_S DRONE_TAKEOFF_TIMEOUT_S
@@ -68,6 +68,9 @@ SIM_EXPLICIT_NAMES=(
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
 load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
+
+# Fallback for SIM_CONFIG files that predate this variable.
+PX4_GZ_MODEL_NAME="${PX4_GZ_MODEL_NAME:-x500_15m}"
 
 for legacy_px4_attitude_var in \
   CAM_L_PX4_ROLL_DEG CAM_L_PX4_PITCH_DEG CAM_L_PX4_YAW_DEG \
@@ -1487,7 +1490,7 @@ elif [[ "$headless" == true ]]; then
 else
   printf '%s\n' "The single rqt_gui window contains Setup, Flight, Analysis, and Debug tabs."
 fi
-printf '%s\n' "Use QGC for normal control of the existing x500_15m target."
+printf '%s\n' "Use QGC for normal control of the existing $PX4_GZ_MODEL_NAME target."
 if [[ "$run_mission" == true ]]; then
   printf '%s\n' "Mission command: ./run_mission.sh ${mission_args[*]}"
 fi

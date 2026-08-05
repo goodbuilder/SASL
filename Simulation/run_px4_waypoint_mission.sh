@@ -45,6 +45,7 @@ SIM_EXPLICIT_NAMES=(
   WAYPOINT_TIMEOUT_S WAYPOINT_TAKEOFF_TIMEOUT_S WAYPOINT_HOLD_S
   WAYPOINT_FINAL_HOVER_S WAYPOINT_LAND_TIMEOUT_S WAYPOINT_SETPOINT_HZ
   WAYPOINT_LAND_AFTER WAYPOINT_RECORD_LITE WAYPOINT_RECORD_DIR
+  WAYPOINT_MPC_Z_VEL_MAX_UP_MPS WAYPOINT_MPC_Z_VEL_MAX_DN_MPS
 )
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
@@ -68,6 +69,10 @@ Options:
   --waypoint X,Y,ALT     Add one waypoint. Repeatable.
   --path-file FILE       Read waypoints from CSV/text file.
   --speed-mps N          Horizontal speed limit.
+  --mpc-z-vel-max-up-mps N
+                         Override PX4 MPC_Z_VEL_MAX_UP (climb limit) before the mission.
+  --mpc-z-vel-max-dn-mps N
+                         Override PX4 MPC_Z_VEL_MAX_DN (descent limit) before the mission.
   --acceptance-radius-m N
                          Waypoint reached radius.
   --waypoint-timeout-s N Timeout per waypoint.
@@ -114,7 +119,7 @@ while (($#)); do
       record_lite=false
       shift
       ;;
-    --waypoint|--path-file|--waypoints-xy-alt|--speed-mps|--acceptance-radius-m|--waypoint-timeout-s|--takeoff-timeout-s|--hold-s|--final-hover-s|--land-timeout-s|--setpoint-hz|--connect)
+    --waypoint|--path-file|--waypoints-xy-alt|--speed-mps|--mpc-z-vel-max-up-mps|--mpc-z-vel-max-dn-mps|--acceptance-radius-m|--waypoint-timeout-s|--takeoff-timeout-s|--hold-s|--final-hover-s|--land-timeout-s|--setpoint-hz|--connect)
       mission_cli+=("$1=${2:?missing value for $1}")
       shift 2
       ;;
@@ -143,6 +148,12 @@ if [[ "$cli_sets_waypoints" == false && -n "${WAYPOINTS_XY_ALT_M:-}" ]]; then
 fi
 if [[ -n "${WAYPOINT_SPEED_MPS:-${DRONE_FORWARD_SPEED_MPS:-}}" ]]; then
   args+=(--speed-mps "${WAYPOINT_SPEED_MPS:-${DRONE_FORWARD_SPEED_MPS:-}}")
+fi
+if [[ -n "${WAYPOINT_MPC_Z_VEL_MAX_UP_MPS:-}" ]]; then
+  args+=(--mpc-z-vel-max-up-mps "$WAYPOINT_MPC_Z_VEL_MAX_UP_MPS")
+fi
+if [[ -n "${WAYPOINT_MPC_Z_VEL_MAX_DN_MPS:-}" ]]; then
+  args+=(--mpc-z-vel-max-dn-mps "$WAYPOINT_MPC_Z_VEL_MAX_DN_MPS")
 fi
 if [[ -n "${WAYPOINT_ACCEPTANCE_RADIUS_M:-}" ]]; then
   args+=(--acceptance-radius-m "$WAYPOINT_ACCEPTANCE_RADIUS_M")

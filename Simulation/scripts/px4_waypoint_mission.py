@@ -17,7 +17,9 @@ from px4_auto_mission import (
     send_local_velocity_setpoint,
     send_position_setpoint,
     set_mode,
+    set_param_float,
     stream_for,
+    stream_until_interrupted,
     wait_heartbeat,
     wait_landed,
     wait_local_position,
@@ -109,6 +111,20 @@ def build_parser():
     )
     parser.add_argument("--path-file", help="Read waypoints from CSV/text file.")
     parser.add_argument("--speed-mps", type=positive_float, default=12.0)
+    parser.add_argument(
+        "--mpc-z-vel-max-up-mps",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MPC_Z_VEL_MAX_UP (climb speed limit, default PX4 value: 3 m/s) "
+        "before the mission starts. Unset leaves PX4's configured value alone.",
+    )
+    parser.add_argument(
+        "--mpc-z-vel-max-dn-mps",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MPC_Z_VEL_MAX_DN (descent speed limit, default PX4 value: 1.5 m/s) "
+        "before the mission starts. Unset leaves PX4's configured value alone.",
+    )
     parser.add_argument("--acceptance-radius-m", type=positive_float, default=5.0)
     parser.add_argument("--waypoint-timeout-s", type=positive_float, default=120.0)
     parser.add_argument("--takeoff-timeout-s", type=positive_float, default=60.0)
@@ -238,6 +254,11 @@ def run(args):
             print("Connection check complete. No mission command was sent.", flush=True)
             return
 
+        if args.mpc_z_vel_max_up_mps is not None:
+            set_param_float(master, "MPC_Z_VEL_MAX_UP", args.mpc_z_vel_max_up_mps)
+        if args.mpc_z_vel_max_dn_mps is not None:
+            set_param_float(master, "MPC_Z_VEL_MAX_DN", args.mpc_z_vel_max_dn_mps)
+
         first = waypoints[0]
         boot_time = time.monotonic()
         print(f"Loaded {len(waypoints)} waypoint(s).", flush=True)
@@ -282,7 +303,15 @@ def run(args):
                 command_long(master, mavutil.mavlink.MAV_CMD_NAV_LAND)
             wait_landed(master, args.land_timeout_s)
         else:
-            print("Mission complete. Holding final waypoint in OFFBOARD.", flush=True)
+            print(
+                "Mission complete. Hovering at the final waypoint in OFFBOARD "
+                "(Ctrl+C to stop).",
+                flush=True,
+            )
+            stream_until_interrupted(
+                args.setpoint_hz,
+                lambda: send_position_setpoint(master, boot_time, last[0], last[1], last[2]),
+            )
     finally:
         heartbeat.stop()
 

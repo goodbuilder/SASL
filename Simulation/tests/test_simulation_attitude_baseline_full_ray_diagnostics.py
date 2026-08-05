@@ -43,6 +43,7 @@ def _node() -> StereoDistanceNode:
     node.px4_attitude_max_age_s = 2.5
     node.px4_attitude_pair_skew_s = 2.5
     node.px4_attitudes = {"left": None, "right": None}
+    node.operational_sources_by_pair_id = {}
     node.enable_gps_baseline_triangulation = True
     node.gps_baseline_source = "gps_baseline"
     node.gps_baseline_max_age_s = 2.5
@@ -110,9 +111,21 @@ def _seed_attitudes(
 
 
 def _seed_gps(node: StereoDistanceNode) -> None:
-    now = time.monotonic()
-    node.gps_baseline_fixes["left"] = (_fix(), now)
-    node.gps_baseline_fixes["right"] = (_fix(), now)
+    now_ns = time.monotonic_ns()
+    simulation_timestamp_ns = node.simulation_epoch.last_clock_stamp_ns
+    epoch = node.simulation_epoch.epoch
+    node.gps_baseline_fixes["left"] = (
+        _fix(),
+        now_ns,
+        epoch,
+        simulation_timestamp_ns,
+    )
+    node.gps_baseline_fixes["right"] = (
+        _fix(),
+        now_ns,
+        epoch,
+        simulation_timestamp_ns,
+    )
 
 
 def _observed_pixels_for_baseline_point(node: StereoDistanceNode, point_frd=(900.0, 3.0, -2.0)):
@@ -689,6 +702,170 @@ def test_missing_ground_truth_fails_closed_without_px4_fallback() -> None:
     assert evaluation["attitude_gt_position_error_m"] is None
     assert evaluation["gt_source"] == "gazebo_vehicle_reference_link_world_pose"
     assert evaluation["gt_fallback_used"] is False
+
+
+def test_operational_pose_alignment_uses_simulation_clock_not_px4_epoch_time(
+    monkeypatch,
+) -> None:
+    node = _node()
+    node.simulation_epoch.last_clock_stamp_ns = 10_000_000_000
+    _seed_attitudes(
+        node,
+        left_stamp=1_785_848_817_333_979,
+        right_stamp=1_785_848_817_337_806,
+    )
+    _seed_gps(node)
+    monkeypatch.setattr(
+        stereo_distance_module,
+        "gps_baseline_enu_m",
+        lambda _left, _right: (25.0, 0.0, 0.0),
+    )
+    pixels = _observed_pixels_for_baseline_point(node)
+    operational_snapshot = node._capture_operational_sources_locked()
+    operational = node._diagnostic_rays(
+        *pixels,
+        1280,
+        720,
+        node._camera_oracle_snapshot(),
+        operational_snapshot=operational_snapshot,
+        observation_timestamp_ns=9_950_000_000,
+    )["operational"]
+    pair = SimpleNamespace(
+        epoch=0,
+        pair_id=7,
+        pair_midpoint_stamp_ns=9_950_000_000,
+        left_stamp_ns=9_950_000_000,
+        right_stamp_ns=9_950_000_000,
+        pair_delta_ns=0,
+        pairing_mode="exact",
+    )
+    alignment = SimpleNamespace(
+        gt_alignment_mode="exact",
+        gt_before_stamp_ns=9_950_000_000,
+        gt_after_stamp_ns=9_950_000_000,
+        gt_interpolation_alpha=0.0,
+        position_world_enu_m=(0.0, 900.0, 3.0),
+    )
+    fields = node._calibration_research_record_fields(
+        pair,
+        alignment,
+        {
+            "_diagnostic_rays": {"operational": operational},
+            "left_observation_valid": True,
+            "right_observation_valid": True,
+            "left_observation_source": "yolo_bbox",
+            "right_observation_source": "yolo_bbox",
+            "target_model_name": "x500_15m",
+            "cam_l_optical_roll_deg": 0.0,
+            "cam_l_optical_pitch_deg": 0.0,
+            "cam_l_optical_yaw_deg": 0.0,
+            "cam_r_optical_roll_deg": 0.0,
+            "cam_r_optical_pitch_deg": 0.0,
+            "cam_r_optical_yaw_deg": 0.0,
+        },
+    )
+
+    assert fields["left_operational_pose_timestamp_ns"] == 10_000_000_000
+    assert fields["right_operational_pose_timestamp_ns"] == 10_000_000_000
+    assert fields["left_operational_position_timestamp_ns"] == 10_000_000_000
+    assert fields["right_operational_position_timestamp_ns"] == 10_000_000_000
+    assert fields["left_pose_alignment_dt_s"] == pytest.approx(0.05)
+    assert fields["right_pose_alignment_dt_s"] == pytest.approx(0.05)
+    assert fields["left_position_alignment_dt_s"] == pytest.approx(0.05)
+    assert fields["right_position_alignment_dt_s"] == pytest.approx(0.05)
+    assert fields["sync_valid"] is True
+
+
+def test_operational_snapshot_prevents_future_pose_leaking_into_delayed_pair(
+    monkeypatch,
+) -> None:
+    node = _node()
+    node.simulation_epoch.last_clock_stamp_ns = 10_000_000_000
+    _seed_attitudes(node, left_q=(1.0, 0.0, 0.0, 0.0), right_q=(1.0, 0.0, 0.0, 0.0))
+    _seed_gps(node)
+    snapshot = node._capture_operational_sources_locked()
+
+    node.simulation_epoch.last_clock_stamp_ns = 60_000_000_000
+    _seed_attitudes(node, left_q=_yaw_q_wxyz(45.0), right_q=_yaw_q_wxyz(45.0))
+    _seed_gps(node)
+    monkeypatch.setattr(
+        stereo_distance_module,
+        "gps_baseline_enu_m",
+        lambda _left, _right: (25.0, 0.0, 0.0),
+    )
+    pixels = _observed_pixels_for_baseline_point(node)
+
+    operational = node._diagnostic_rays(
+        *pixels,
+        1280,
+        720,
+        node._camera_oracle_snapshot(),
+        operational_snapshot=snapshot,
+        observation_timestamp_ns=9_950_000_000,
+    )["operational"]
+
+    assert operational["valid"] is True
+    assert operational["left_px4_q_w"] == pytest.approx(1.0)
+    assert operational["right_px4_q_w"] == pytest.approx(1.0)
+    assert operational["left_attitude_simulation_timestamp_ns"] == 10_000_000_000
+    assert operational["right_attitude_simulation_timestamp_ns"] == 10_000_000_000
+    assert operational["left_gps_simulation_timestamp_ns"] == 10_000_000_000
+    assert operational["right_gps_simulation_timestamp_ns"] == 10_000_000_000
+
+
+def test_single_side_observation_preserves_available_pixel_and_bbox() -> None:
+    node = _node()
+    node.observation_mode = "bbox_yolo"
+    left = {
+        "cx": 101.5,
+        "cy": 202.5,
+        "confidence": 0.75,
+        "bbox": (90.0, 180.0, 113.0, 225.0),
+    }
+
+    fields = node._observation_record_fields(left, None)
+
+    assert fields["left_observation_valid"] is True
+    assert fields["right_observation_valid"] is False
+    assert fields["left_u_px"] == pytest.approx(101.5)
+    assert fields["left_v_px"] == pytest.approx(202.5)
+    assert fields["left_bbox_xmin_px"] == pytest.approx(90.0)
+    assert fields["left_bbox_ymax_px"] == pytest.approx(225.0)
+    assert fields["right_u_px"] is None
+
+
+def test_invalid_observation_keeps_explicit_failure_provenance() -> None:
+    node = _node()
+    pair = SimpleNamespace(
+        epoch=0,
+        pair_id=8,
+        pair_midpoint_stamp_ns=2_000_000_000,
+        left_stamp_ns=2_000_000_000,
+        right_stamp_ns=2_000_000_000,
+        pair_delta_ns=0,
+        pairing_mode="exact",
+    )
+    alignment = SimpleNamespace(
+        gt_alignment_mode="exact",
+        gt_before_stamp_ns=2_000_000_000,
+        gt_after_stamp_ns=2_000_000_000,
+        gt_interpolation_alpha=0.0,
+        position_world_enu_m=(0.0, 900.0, 3.0),
+    )
+    fields = node._calibration_research_record_fields(
+        pair,
+        alignment,
+        {
+            "left_observation_valid": False,
+            "right_observation_valid": False,
+            "target_model_name": "x500_15m",
+        },
+    )
+
+    assert fields["sample_valid"] is False
+    assert fields["failure_stage"] == "observation"
+    assert fields["failure_code"] == "missing_left_and_right_observation"
+    assert fields["failure_reason"] == "missing_left_and_right_observation"
 
 
 def test_runtime_metrics_publish_named_deltas_without_interaction() -> None:
