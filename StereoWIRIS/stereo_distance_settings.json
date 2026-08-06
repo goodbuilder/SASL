@@ -97,9 +97,9 @@
       "survey_in_accuracy_limit_m": 1.0
     },
     "network": {
-      "caster_host": "",
+      "caster_host": "rtk2go.com",
       "caster_port": 2101,
-      "mountpoint": "",
+      "mountpoint": "KAIST-RTK-RTCM",
       "username_env": "NTRIP_USERNAME",
       "password_env": "NTRIP_PASSWORD",
       "tls": false,

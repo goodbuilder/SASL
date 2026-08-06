@@ -62,18 +62,64 @@ def build_ntrip_request(
     return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
 
 
+_NTRIP1_STATUS_LINE_PREFIXES = ("ICY ", "SOURCETABLE ", "ERROR")
+
+
+def _ntrip1_status_line(data: bytes) -> str | None:
+    """Return the decoded first line when a legacy NTRIP 1.0 header is complete.
+
+    NTRIP 1.0 casters (the common ICY-style response used by rtk2go/SNIP and
+    most volunteer casters) terminate their status line with a single
+    ``\\r\\n`` and start streaming raw RTCM bytes immediately after -- there
+    is no second ``\\r\\n`` to close out an HTTP-style header block. This is
+    only recognised once we can see that what follows the single ``\\r\\n``
+    is not further printable header text, so a caster that *does* send
+    additional header lines before the real blank-line terminator is not
+    mistaken for the legacy single-line style while more header bytes are
+    still in flight.
+    """
+
+    index = data.find(b"\r\n")
+    if index < 0:
+        return None
+    first_line = data[:index].decode("latin-1", "replace").strip()
+    if not first_line.upper().startswith(_NTRIP1_STATUS_LINE_PREFIXES):
+        return None
+    remainder = data[index + 2 :]
+    if not remainder:
+        return None
+    next_byte = remainder[0]
+    if 0x20 <= next_byte <= 0x7E and next_byte not in (0x0D, 0x0A):
+        return None
+    return first_line
+
+
+def ntrip_header_ready(data: bytes) -> bool:
+    """Return whether ``data`` contains a complete NTRIP response header."""
+
+    if b"\r\n\r\n" in data:
+        return True
+    return _ntrip1_status_line(data) is not None
+
+
 def parse_ntrip_response_header(data: bytes) -> tuple[str, bytes]:
     """Return the status line and bytes received after the HTTP header."""
 
     separator = data.find(b"\r\n\r\n")
-    if separator < 0:
-        raise NtripProtocolError("NTRIP response header is incomplete")
-    header = data[:separator].decode("latin-1", "replace")
-    status_line = header.splitlines()[0].strip() if header.splitlines() else ""
+    if separator >= 0:
+        header = data[:separator].decode("latin-1", "replace")
+        status_line = header.splitlines()[0].strip() if header.splitlines() else ""
+        payload_start = separator + 4
+    else:
+        legacy_line = _ntrip1_status_line(data)
+        if legacy_line is None:
+            raise NtripProtocolError("NTRIP response header is incomplete")
+        status_line = legacy_line
+        payload_start = data.find(b"\r\n") + 2
     upper = status_line.upper()
     if not (" 200 " in f" {upper} " or upper.endswith(" 200")):
         raise NtripProtocolError(f"NTRIP caster rejected request: {status_line or 'empty response'}")
-    return status_line, data[separator + 4 :]
+    return status_line, data[payload_start:]
 
 
 def _nmea_checksum(body: str) -> str:
@@ -214,7 +260,7 @@ class NtripClient:
             self._socket.sendall(request)
             response = bytearray()
             deadline = time.monotonic() + float(self.config.connect_timeout_s)
-            while b"\r\n\r\n" not in response:
+            while not ntrip_header_ready(bytes(response)):
                 if self._closed:
                     raise RuntimeError("NTRIP client was closed before response header completed")
                 if time.monotonic() > deadline:

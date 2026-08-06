@@ -202,9 +202,9 @@ class LocalBaseConfig:
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    caster_host: str = ""
+    caster_host: str = "rtk2go.com"
     caster_port: int = 2101
-    mountpoint: str = ""
+    mountpoint: str = "KAIST-RTK-RTCM"
     username_env: str = "NTRIP_USERNAME"
     password_env: str = "NTRIP_PASSWORD"
     tls: bool = False
@@ -822,6 +822,39 @@ _ALLOWED_TRANSITIONS: dict[GnssOperationState, frozenset[GnssOperationState]] = 
     GnssOperationState.FAULT: frozenset({GnssOperationState.INITIALIZING, GnssOperationState.CONFIGURED, GnssOperationState.STOPPED}),
     GnssOperationState.INVALIDATED: frozenset({GnssOperationState.INITIALIZING, GnssOperationState.CONFIGURED, GnssOperationState.STOPPED}),
     GnssOperationState.STOPPED: frozenset({GnssOperationState.CONFIGURED, GnssOperationState.INITIALIZING, GnssOperationState.DISCONNECTED}),
+}
+
+
+class GnssStatusGroup(str, Enum):
+    """Which independently-owned GUI status concern a state belongs to."""
+
+    NETWORK = "network"  # Group A: NTRIP connection lifecycle
+    BASE_FIXED = "base_fixed"  # Group B: Base's own RTK-Fixed acquisition
+    READINESS = "readiness"  # Group C + lifecycle bookend states
+
+
+STATE_STATUS_GROUP: dict[GnssOperationState, GnssStatusGroup] = {
+    GnssOperationState.DISCONNECTED: GnssStatusGroup.READINESS,
+    GnssOperationState.CONFIGURED: GnssStatusGroup.READINESS,
+    GnssOperationState.INITIALIZING: GnssStatusGroup.READINESS,
+    GnssOperationState.NTRIP_CONNECTING: GnssStatusGroup.NETWORK,
+    GnssOperationState.NTRIP_ACTIVE: GnssStatusGroup.NETWORK,
+    GnssOperationState.BASE_SURVEYING: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.BASE_AS_ROVER_FLOAT: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.BASE_AS_ROVER_FIXED: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.FIXED_COORDINATE_COLLECTING: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.FIXED_COORDINATE_VALIDATED: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.BASE_RECONFIGURING: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.LOCAL_RTCM_ACTIVE: GnssStatusGroup.BASE_FIXED,
+    GnssOperationState.ROVERS_CONVERGING: GnssStatusGroup.READINESS,
+    GnssOperationState.ALIGNMENT_COLLECTING: GnssStatusGroup.READINESS,
+    GnssOperationState.ALIGNMENT_VALID: GnssStatusGroup.READINESS,
+    GnssOperationState.READY: GnssStatusGroup.READINESS,
+    GnssOperationState.MEASURING: GnssStatusGroup.READINESS,
+    GnssOperationState.DEGRADED: GnssStatusGroup.READINESS,
+    GnssOperationState.FAULT: GnssStatusGroup.READINESS,
+    GnssOperationState.INVALIDATED: GnssStatusGroup.READINESS,
+    GnssOperationState.STOPPED: GnssStatusGroup.READINESS,
 }
 
 

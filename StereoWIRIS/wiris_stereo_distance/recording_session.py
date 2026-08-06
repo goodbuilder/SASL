@@ -264,6 +264,16 @@ DEVICE_TIMELINE_COLUMNS = (
     "host_receive_monotonic_ns",
     "host_receive_utc_ns",
 )
+GNSS_BASE_COMPACT_COLUMNS = DEVICE_TIMELINE_COLUMNS + (
+    "latitude_deg",
+    "longitude_deg",
+    "ellipsoid_height_m",
+    "msl_altitude_m",
+    "height_type",
+    "fixed",
+    "device_id",
+    "gnss_operation_state",
+)
 DYNAMIC_SHEET_RULES: dict[str, tuple[str, ...]] = {
     "Measurements": (
         "measurement",
@@ -361,6 +371,8 @@ class SavedSessionFiles:
     px4_left_xlsx: Path
     px4_right_xlsx: Path
     session_rtk_xlsx: Path
+    gnss_base_csv: Path
+    gnss_base_parquet: Path
     manifest: Path
     finalized: bool = True
     error: str = ""
@@ -388,6 +400,8 @@ class SavedSessionFiles:
             self.px4_left_xlsx,
             self.px4_right_xlsx,
             self.session_rtk_xlsx,
+            self.gnss_base_csv,
+            self.gnss_base_parquet,
         ]
 
 
@@ -398,6 +412,7 @@ class RetryableSession:
     pair_rows: "SpoolRows"
     camera_rows: dict[str, "SpoolRows"]
     px4_rows: dict[str, "SpoolRows"]
+    gnss_base_rows: "SpoolRows"
 
 
 class SpoolRows(Sequence[dict[str, object]]):
@@ -1032,6 +1047,35 @@ def compact_px4_timeline_rows(
     return _wide_mavlink_mag_rows(compact_rows)
 
 
+def _compact_gnss_base_row(row: dict[str, object]) -> dict[str, object]:
+    # Unlike PX4 rows, GNSS Base rows are already built from
+    # ``_raw_timeline_row`` with every DEVICE_TIMELINE_COLUMNS field
+    # (including session_utc_ns/host_receive_utc_ns) resolved at record
+    # time, so no metadata-driven timestamp reconstruction is needed here.
+    compact = {column: row.get(column) for column in DEVICE_TIMELINE_COLUMNS}
+    compact.update(
+        {
+            "latitude_deg": _optional_float(row.get("latitude_deg")),
+            "longitude_deg": _optional_float(row.get("longitude_deg")),
+            "ellipsoid_height_m": _optional_float(row.get("ellipsoid_height_m")),
+            "msl_altitude_m": _optional_float(row.get("msl_altitude_m")),
+            "height_type": str(row.get("height_type") or ""),
+            "fixed": _optional_bool(row.get("fixed")),
+            "device_id": str(row.get("device_id") or ""),
+            "gnss_operation_state": str(row.get("gnss_operation_state") or ""),
+        }
+    )
+    return {column: compact.get(column) for column in GNSS_BASE_COMPACT_COLUMNS}
+
+
+def compact_gnss_base_rows(
+    rows: Iterable[dict[str, object]],
+    metadata: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    del metadata  # kept for signature parity with the other compact_*_rows() helpers
+    return [_compact_gnss_base_row(row) for row in rows]
+
+
 def _mavlink_mag_stream_name(topic: object) -> str | None:
     topic_text = str(topic or "")
     if topic_text in _PX4_MAVLINK_MAG_STREAMS:
@@ -1663,7 +1707,11 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
         camera_rows[side].open_existing(spool_dir / f"camera_{side}.jsonl")
         px4_rows[side] = SpoolRows()
         px4_rows[side].open_existing(spool_dir / f"px4_{side}.jsonl")
-    return RetryableSession(output_dir, metadata, pair_rows, camera_rows, px4_rows)
+    gnss_base_rows = SpoolRows()
+    # Sessions recorded before this field existed have no gnss_base.jsonl;
+    # open_existing() tolerates a missing path (empty rows, fresh append handle).
+    gnss_base_rows.open_existing(spool_dir / "gnss_base.jsonl")
+    return RetryableSession(output_dir, metadata, pair_rows, camera_rows, px4_rows, gnss_base_rows)
 
 
 def _cleanup_finalize_orphans(output_dir: Path) -> None:
@@ -1727,12 +1775,14 @@ def save_session_files(
     pair_rows: Iterable[dict[str, object]],
     camera_rows: dict[str, Iterable[dict[str, object]]] | None = None,
     px4_rows: dict[str, Iterable[dict[str, object]]] | None = None,
+    gnss_base_rows: Iterable[dict[str, object]] | None = None,
 ) -> SavedSessionFiles:
     output_dir.mkdir(parents=True, exist_ok=True)
     session_id = Path(str(metadata.get("session_id") or output_dir.name)).name
     rows = _normalized_pair_rows(pair_rows)
     camera_rows = camera_rows or {}
     px4_rows = px4_rows or {}
+    gnss_base_full_rows = _normalized_generic_rows(gnss_base_rows or [])
     camera_full_rows = {
         side: _normalized_generic_rows(camera_rows.get(side, []))
         for side in ("left", "right")
@@ -1751,6 +1801,7 @@ def save_session_files(
         for side in ("left", "right")
     }
     compact_rtk_rows = _compact_rtk_rows(px4_full_rows, metadata)
+    compact_gnss_base_row_list = compact_gnss_base_rows(gnss_base_full_rows, metadata)
     static_output = output_dir / f"{session_id}_session_static.json"
     distance_csv_output = output_dir / f"{session_id}_distance_measurements.csv"
     distance_parquet_output = output_dir / f"{session_id}_distance_measurements.parquet"
@@ -1766,6 +1817,8 @@ def save_session_files(
     px4_left_xlsx_output = output_dir / f"{session_id}_px4_left.xlsx"
     px4_right_xlsx_output = output_dir / f"{session_id}_px4_right.xlsx"
     session_rtk_xlsx_output = output_dir / f"{session_id}_session_rtk.xlsx"
+    gnss_base_output = output_dir / f"{session_id}_gnss_base.csv"
+    gnss_base_parquet_output = output_dir / f"{session_id}_gnss_base.parquet"
     manifest_output = output_dir / "session_manifest.json"
     resource_files = {
         "session_static": static_output.name,
@@ -1782,6 +1835,8 @@ def save_session_files(
         "px4_left_xlsx": px4_left_xlsx_output.name,
         "px4_right_xlsx": px4_right_xlsx_output.name,
         "session_rtk_xlsx": session_rtk_xlsx_output.name,
+        "gnss_base_csv": gnss_base_output.name,
+        "gnss_base_parquet": gnss_base_parquet_output.name,
         "workbook": xlsx_output.name,
     }
     _cleanup_finalize_orphans(output_dir)
@@ -1796,6 +1851,7 @@ def save_session_files(
         (camera_right_output.name, compact_camera_rows["right"], CAMERA_TIMELINE_COMPACT_COLUMNS),
         (px4_left_output.name, compact_px4_rows["left"], PX4_TIMELINE_COMPACT_COLUMNS),
         (px4_right_output.name, compact_px4_rows["right"], PX4_TIMELINE_COMPACT_COLUMNS),
+        (gnss_base_output.name, compact_gnss_base_row_list, GNSS_BASE_COMPACT_COLUMNS),
     )
     parquet_names_and_rows = (
         (distance_parquet_output.name, compact_distance_rows, DISTANCE_MEASUREMENT_COLUMNS),
@@ -1803,6 +1859,7 @@ def save_session_files(
         (camera_right_parquet_output.name, compact_camera_rows["right"], CAMERA_TIMELINE_COMPACT_COLUMNS),
         (px4_left_parquet_output.name, compact_px4_rows["left"], PX4_TIMELINE_COMPACT_COLUMNS),
         (px4_right_parquet_output.name, compact_px4_rows["right"], PX4_TIMELINE_COMPACT_COLUMNS),
+        (gnss_base_parquet_output.name, compact_gnss_base_row_list, GNSS_BASE_COMPACT_COLUMNS),
     )
     manifest: dict[str, object] = {
         "session_id": session_id,
@@ -1825,6 +1882,8 @@ def save_session_files(
             px4_left_xlsx_output.name: "px4_left_workbook",
             px4_right_xlsx_output.name: "px4_right_workbook",
             session_rtk_xlsx_output.name: "session_rtk_workbook",
+            gnss_base_output.name: "gnss_base_timeline_csv",
+            gnss_base_parquet_output.name: "gnss_base_timeline_parquet",
             xlsx_output.name: "integrated_review_workbook",
         },
     }
@@ -1924,12 +1983,14 @@ def save_session_files(
         px4_left_xlsx=px4_left_xlsx_output,
         px4_right_xlsx=px4_right_xlsx_output,
         session_rtk_xlsx=session_rtk_xlsx_output,
+        gnss_base_csv=gnss_base_output,
+        gnss_base_parquet=gnss_base_parquet_output,
         manifest=manifest_output,
         finalized=not error,
         error=error,
     )
     if saved.finalized:
-        for source_rows in (pair_rows, *camera_rows.values(), *px4_rows.values()):
+        for source_rows in (pair_rows, *camera_rows.values(), *px4_rows.values(), gnss_base_rows):
             if isinstance(source_rows, SpoolRows):
                 source_rows.discard_spool()
         recovery_metadata = output_dir / ".spool" / "session_metadata.json"

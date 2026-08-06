@@ -90,10 +90,12 @@ from wiris_stereo_distance.gnss_operation import (
     GnssOperationState,
     GnssReadinessSnapshot,
     GgaPolicy,
+    GnssStatusGroup,
     HeightType,
     NetworkConfig,
     RoverCorrectionStatus,
     RoverReadinessInput,
+    STATE_STATUS_GROUP,
 )
 from wiris_stereo_distance.gnss_profile import (
     GnssCoordinateSample,
@@ -1425,6 +1427,7 @@ class SessionSaveWorker(QtCore.QObject):
         pair_rows: Sequence[dict[str, object]],
         camera_rows: dict[str, SpoolRows],
         px4_rows: dict[str, SpoolRows],
+        gnss_base_rows: SpoolRows | None = None,
     ) -> None:
         super().__init__()
         self.output_dir = output_dir
@@ -1432,6 +1435,7 @@ class SessionSaveWorker(QtCore.QObject):
         self.pair_rows = pair_rows
         self.camera_rows = camera_rows
         self.px4_rows = px4_rows
+        self.gnss_base_rows = gnss_base_rows
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -1442,6 +1446,7 @@ class SessionSaveWorker(QtCore.QObject):
                 pair_rows=self.pair_rows,
                 camera_rows=self.camera_rows,
                 px4_rows=self.px4_rows,
+                gnss_base_rows=self.gnss_base_rows,
             )
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -2994,6 +2999,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "left": SpoolRows(),
             "right": SpoolRows(),
         }
+        self.gnss_base_recording_rows: SpoolRows = SpoolRows()
         self._session_save_thread: QtCore.QThread | None = None
         self._session_save_worker: SessionSaveWorker | None = None
         self._session_save_retry_required = False
@@ -6320,6 +6326,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _build_gnss_base_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         layout.setSpacing(8)
         self.gnss_base_status_labels: dict[str, QtWidgets.QLabel] = {}
+        self.gnss_base_status_title_labels: dict[str, QtWidgets.QLabel] = {}
         self.gnss_base_quality_labels: dict[str, QtWidgets.QLabel] = {}
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setObjectName("gnssBaseScrollArea")
@@ -6480,7 +6487,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         base_grid = QtWidgets.QGridLayout(base_group)
         base_items = (
             ("connection", "Base 연결", "대기 중", "idle"),
-            ("operation", "운용 상태", operation_config.operation_mode.value, "idle"),
+            ("operation", "측정 준비 상태", "대기 중", "idle"),
             ("network", "NTRIP", "미연결", "idle"),
             ("survey_in", "Survey-in", "미연결", "idle"),
             ("base_satellites", "Base 위성 수", "대기 중", "idle"),
@@ -6491,10 +6498,39 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             label = QtWidgets.QLabel(text)
             label.setObjectName("statusStrip")
             label.setWordWrap(True)
-            base_grid.addWidget(QtWidgets.QLabel(title), row, 0)
+            title_label = QtWidgets.QLabel(title)
+            base_grid.addWidget(title_label, row, 0)
             base_grid.addWidget(label, row, 1)
             self.gnss_base_status_labels[key] = label
+            self.gnss_base_status_title_labels[key] = title_label
             self._set_health_label(label, text, level)
+
+        base_fixed_group = QtWidgets.QGroupBox("Base RTK-Fixed 진행")
+        base_fixed_group.setObjectName("gnssBaseFixedProgressGroup")
+        base_fixed_grid = QtWidgets.QGridLayout(base_fixed_group)
+        base_fixed_label = QtWidgets.QLabel("대기 중")
+        base_fixed_label.setObjectName("statusStrip")
+        base_fixed_label.setWordWrap(True)
+        base_fixed_grid.addWidget(QtWidgets.QLabel("Base Fixed 상태"), 0, 0)
+        base_fixed_grid.addWidget(base_fixed_label, 0, 1)
+        self.gnss_base_status_labels["base_fixed"] = base_fixed_label
+        self._set_health_label(base_fixed_label, "대기 중", "idle")
+        base_position_label = QtWidgets.QLabel("대기 중")
+        base_position_label.setObjectName("statusStrip")
+        base_position_label.setWordWrap(True)
+        base_fixed_grid.addWidget(QtWidgets.QLabel("Base 위치"), 1, 0)
+        base_fixed_grid.addWidget(base_position_label, 1, 1)
+        self.gnss_base_status_labels["base_position"] = base_position_label
+        self._set_health_label(base_position_label, "대기 중", "idle")
+        base_fixed_plot_row = QtWidgets.QHBoxLayout()
+        self.gnss_base_fixed_state_plot = TelemetryHistoryPlot("Base RTK Fix 상태 (Float→Fixed)", "fix")
+        self.gnss_base_fixed_state_plot.setMinimumHeight(180)
+        self.gnss_base_fixed_scatter_plot = TelemetryHistoryPlot("Fixed 좌표 수렴 (scatter H/V)", "m")
+        self.gnss_base_fixed_scatter_plot.setMinimumHeight(180)
+        base_fixed_plot_row.addWidget(self.gnss_base_fixed_state_plot, 1)
+        base_fixed_plot_row.addWidget(self.gnss_base_fixed_scatter_plot, 1)
+        base_fixed_grid.addLayout(base_fixed_plot_row, 2, 0, 1, 2)
+        self.gnss_base_fixed_progress_group = base_fixed_group
 
         rtcm_group = QtWidgets.QGroupBox("RTCM 보정 데이터")
         rtcm_grid = QtWidgets.QGridLayout(rtcm_group)
@@ -6586,6 +6622,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         note.setObjectName("statusStrip")
 
         content_layout.addWidget(base_group)
+        content_layout.addWidget(base_fixed_group)
         content_layout.addWidget(rtcm_group)
         content_layout.addWidget(rover_group)
         self.gnss_survey_progress_group = survey_group
@@ -7604,7 +7641,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             age_ms = max(0.0, now_s - gps.timestamp_s) * 1000.0
             sats = "sats=--" if gps.satellites_used is None else f"sats={gps.satellites_used}"
             eph = "" if gps.eph_m is None else f" | eph={gps.eph_m:.2f}m"
-            text = f"{gps.rtk_label} | {sats}{eph} | age={age_ms:.0f}ms"
+            if gps.latitude_deg is None or gps.longitude_deg is None:
+                position = " | pos=--"
+            else:
+                height_m = gps.altitude_ellipsoid_m if gps.altitude_ellipsoid_m is not None else gps.altitude_m
+                height_text = "--" if height_m is None else f"{height_m:.3f}m"
+                position = f" | {gps.latitude_deg:.7f}, {gps.longitude_deg:.7f} | h={height_text}"
+            text = f"{gps.rtk_label} | {sats}{eph}{position} | age={age_ms:.0f}ms"
             self._set_health_label(labels[key], text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
 
         baseline = self.latest_rtk_baseline
@@ -7717,18 +7760,49 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.gnss_operation_manager.stop()
         self.gnss_operation_manager.configure(config)
 
+    def _gnss_status_label_key_for_state(self, state: GnssOperationState) -> str:
+        group = STATE_STATUS_GROUP.get(state, GnssStatusGroup.READINESS)
+        if group is GnssStatusGroup.NETWORK:
+            return "network"
+        if group is GnssStatusGroup.BASE_FIXED:
+            return "base_fixed"
+        return "operation"
+
     def _gnss_transition(self, state: GnssOperationState, reason: str) -> bool:
         try:
             self.gnss_operation_manager.transition(state, reason)
         except (RuntimeError, ValueError) as exc:
-            self._set_health_label(self.gnss_base_status_labels["operation"], f"상태 전환 실패: {exc}", "bad")
+            label_key = self._gnss_status_label_key_for_state(state)
+            self._set_health_label(self.gnss_base_status_labels[label_key], f"상태 전환 실패: {exc}", "bad")
             self._log(f"[GNSS] 상태 전환 실패: {exc}")
             return False
-        self._set_health_label(
-            self.gnss_base_status_labels["operation"],
-            f"{self.gnss_operation_manager.state.value} | {reason}",
-            "good" if self.gnss_operation_manager.state == GnssOperationState.READY else "warn",
-        )
+        new_state = self.gnss_operation_manager.state
+        group = STATE_STATUS_GROUP.get(new_state, GnssStatusGroup.READINESS)
+        if group is GnssStatusGroup.NETWORK:
+            # Group A (NTRIP) already has a dedicated "network" label kept up
+            # to date by the NTRIP handlers themselves; writing NTRIP_CONNECTING/
+            # NTRIP_ACTIVE transitions here would just duplicate/race with that.
+            # But in NETWORK_ASSISTED_FIXED_BASE, Group B (base_fixed) can't
+            # start until this NTRIP handshake finishes, so surface *why*
+            # base_fixed is still idle instead of leaving stale placeholder
+            # text with no explanation.
+            if (
+                self._gnss_active_operation_config().operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE
+                and "base_fixed" in self.gnss_base_status_labels
+            ):
+                waiting_text = (
+                    "NTRIP 연결 대기 중"
+                    if new_state == GnssOperationState.NTRIP_CONNECTING
+                    else "NTRIP 연결됨 | Base 위치 샘플 수신 대기 중"
+                )
+                self._set_health_label(self.gnss_base_status_labels["base_fixed"], waiting_text, "warn")
+        else:
+            label_key = "base_fixed" if group is GnssStatusGroup.BASE_FIXED else "operation"
+            self._set_health_label(
+                self.gnss_base_status_labels[label_key],
+                f"{new_state.value} | {reason}",
+                "good" if new_state == GnssOperationState.READY else "warn",
+            )
         return True
 
     def _handle_gnss_operation_mode_changed(self) -> None:
@@ -7754,11 +7828,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ("gnss_base_candidate_group", serial_allowed),
             ("gnss_survey_progress_group", local_mode),
             ("gnss_survey_quality_group", local_mode),
+            ("gnss_base_fixed_progress_group", serial_allowed),
         )
         for name, visible in visibility:
             group = getattr(self, name, None)
             if group is not None:
                 group.setVisible(visible)
+
+        # The "survey_in" row inside base_group only means anything in
+        # LOCAL_SURVEY_IN (NAV-SVIN); the underlying poll runs every mode
+        # (NAV-PVT is needed regardless), so hide the row itself rather than
+        # let a stale/irrelevant value keep showing.
+        for key, visible in (("survey_in", local_mode),):
+            value_label = self.gnss_base_status_labels.get(key) if hasattr(self, "gnss_base_status_labels") else None
+            title_label = (
+                self.gnss_base_status_title_labels.get(key) if hasattr(self, "gnss_base_status_title_labels") else None
+            )
+            if value_label is not None:
+                value_label.setVisible(visible)
+            if title_label is not None:
+                title_label.setVisible(visible)
 
         for name, visible in (
             ("gnss_base_discover_button", serial_allowed),
@@ -7836,7 +7925,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and not self.gnss_base_serial_connected:
             self._set_health_label(self.gnss_base_status_labels["network"], "보조 Fixed Base 모드는 먼저 Base serial을 연결하세요", "bad")
             return
-        if self.mavlink_pixhawk is None:
+        if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and self.mavlink_pixhawk is None:
             self._set_health_label(self.gnss_base_status_labels["network"], "RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
             return
         try:
@@ -7855,6 +7944,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_network_status_line = ""
         self.gnss_network_rtcm_parser = Rtcm3StreamParser()
         self.gnss_coordinate_samples.clear()
+        if hasattr(self, "gnss_base_fixed_state_plot"):
+            self.gnss_base_fixed_state_plot.points.clear()
+        if hasattr(self, "gnss_base_fixed_scatter_plot"):
+            self.gnss_base_fixed_scatter_plot.points.clear()
         self.gnss_fixed_base_profile = None
         self.gnss_fixed_base_pending_profile = None
         self.gnss_fixed_base_command_sent = False
@@ -7869,7 +7962,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._set_gnss_operation_controls_locked(True)
         self._set_health_label(self.gnss_base_status_labels["network"], "NTRIP 연결 중", "warn")
         thread = QtCore.QThread(self)
-        worker = NtripNetworkWorker(config=config, gga_provider=self._gnss_gga_provider)
+        worker = NtripNetworkWorker(config=config.network, gga_provider=self._gnss_gga_provider)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.connected.connect(self._handle_gnss_network_connected)
@@ -7959,6 +8052,46 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 self.gnss_network_stop_button.setEnabled(False)
         thread.deleteLater()
 
+    def _record_gnss_base_position_row(self, sample: GnssCoordinateSample) -> None:
+        """Persist one GNSS Base position sample (NAV-PVT) to gnss_base.jsonl.
+
+        Reuses ``_raw_timeline_row`` (the same helper camera/px4 recording
+        uses) so the row gets the same session_utc_ns/host_receive_utc_ns
+        UTC columns.  The sample itself only carries a monotonic timestamp
+        (the UBX NAV-PVT parser does not extract the message's UTC
+        time-of-week fields), so source_utc_ns is left unset and callers
+        fall back to the session-anchor-derived session_utc_ns.
+        """
+
+        rows = self.gnss_base_recording_rows
+        row = self._raw_timeline_row(
+            side="base",
+            sample_type="gnss_base_position",
+            row_contract="one row per GNSS Base position sample (NAV-PVT) received by the GUI",
+            sample_monotonic_s=sample.timestamp_s,
+            host_receive_monotonic_ns=time.monotonic_ns(),
+            host_receive_utc_ns=time.time_ns(),
+            source_utc_ns=None,
+            source_utc_method="unavailable",
+            sequence=len(rows),
+        )
+        if row is None:
+            return
+        row.update(
+            {
+                "latitude_deg": sample.latitude_deg,
+                "longitude_deg": sample.longitude_deg,
+                "ellipsoid_height_m": sample.ellipsoid_height_m,
+                "msl_altitude_m": sample.msl_altitude_m,
+                "height_type": sample.height_type.value,
+                "fixed": sample.fixed,
+                "device_id": sample.device_id,
+                "gnss_operation_state": self.gnss_operation_manager.state.value,
+            }
+        )
+        rows.append(row)
+        self.external_parameter_recording_rows.append(row)
+
     def _handle_gnss_base_position(self, sample: object) -> None:
         if not isinstance(sample, GnssCoordinateSample):
             return
@@ -7966,6 +8099,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         config = self._gnss_active_operation_config()
         if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
             return
+        self._record_gnss_base_position_row(sample)
+        if hasattr(self, "gnss_base_fixed_state_plot"):
+            self.gnss_base_fixed_state_plot.add_point(
+                TelemetryHistoryPoint(sample.timestamp_s, "fix", 1.0 if sample.fixed else 0.0)
+            )
+        if "base_position" in self.gnss_base_status_labels:
+            height_m = sample.selected_height_m
+            height_text = "--" if height_m is None else f"{height_m:.3f}m"
+            self._set_health_label(
+                self.gnss_base_status_labels["base_position"],
+                f"{sample.latitude_deg:.7f}, {sample.longitude_deg:.7f} | h={height_text} ({sample.height_type.value}) | fix={sample.fixed}",
+                "good" if sample.fixed else "warn",
+            )
         if not self.gnss_network_connected or self.gnss_fixed_base_command_sent:
             return
         state = self.gnss_operation_manager.state
@@ -7979,14 +8125,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._gnss_transition(GnssOperationState.FIXED_COORDINATE_COLLECTING, "고정 좌표 반복 측정 수집")
         if self.gnss_operation_manager.state != GnssOperationState.FIXED_COORDINATE_COLLECTING:
             self._set_health_label(
-                self.gnss_base_status_labels["operation"],
+                self.gnss_base_status_labels["base_fixed"],
                 f"{self.gnss_operation_manager.state.value} | Base fix={sample.fixed}",
                 "warn",
             )
             return
         if sample.height_type != config.fixed_base.height_type:
             self._set_health_label(
-                self.gnss_base_status_labels["operation"],
+                self.gnss_base_status_labels["base_fixed"],
                 "Base 좌표 height datum이 활성 GNSS 운용 설정과 다릅니다",
                 "bad",
             )
@@ -8001,26 +8147,39 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         profile = validation.profile
         if profile is None:
-            self._set_health_label(self.gnss_base_status_labels["operation"], "고정 좌표 프로파일 수집 중", "warn")
+            self._set_health_label(self.gnss_base_status_labels["base_fixed"], "고정 좌표 프로파일 수집 중", "warn")
             return
         self._set_health_label(
-            self.gnss_base_status_labels["operation"],
+            self.gnss_base_status_labels["base_fixed"],
             f"FIXED 수집 {profile.collection_duration_s:.1f}s/{config.fixed_base.acquisition_duration_s:.1f}s | "
             f"scatter H/V={profile.horizontal_scatter_m:.3f}/{profile.vertical_scatter_m:.3f}m",
             "warn" if not validation.valid else "good",
         )
+        if hasattr(self, "gnss_base_fixed_scatter_plot"):
+            self.gnss_base_fixed_scatter_plot.add_point(
+                TelemetryHistoryPoint(sample.timestamp_s, "horizontal", profile.horizontal_scatter_m)
+            )
+            self.gnss_base_fixed_scatter_plot.add_point(
+                TelemetryHistoryPoint(sample.timestamp_s, "vertical", profile.vertical_scatter_m)
+            )
+            self.gnss_base_fixed_scatter_plot.add_point(
+                TelemetryHistoryPoint(sample.timestamp_s, "target_h", config.fixed_base.maximum_horizontal_scatter_m)
+            )
+            self.gnss_base_fixed_scatter_plot.add_point(
+                TelemetryHistoryPoint(sample.timestamp_s, "target_v", config.fixed_base.maximum_vertical_scatter_m)
+            )
         if not validation.valid:
             return
         if profile.height_type != HeightType.ELLIPSOID:
             self._set_health_label(
-                self.gnss_base_status_labels["operation"],
+                self.gnss_base_status_labels["base_fixed"],
                 "고정 좌표 검증됨이지만 TMODE3에는 WGS84 ellipsoid height가 필요합니다",
                 "bad",
             )
             return
         worker = self.gnss_base_serial_worker
         if worker is None or not self.gnss_base_serial_connected:
-            self._set_health_label(self.gnss_base_status_labels["operation"], "고정 좌표 검증됨 | Base serial 재연결 필요", "bad")
+            self._set_health_label(self.gnss_base_status_labels["base_fixed"], "고정 좌표 검증됨 | Base serial 재연결 필요", "bad")
             return
         if not self._gnss_transition(GnssOperationState.FIXED_COORDINATE_VALIDATED, "반복 측정 좌표 검증 통과"):
             return
@@ -8047,7 +8206,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_fixed_base_reconfigure_deadline_s = time.monotonic() + 10.0
         self.gnss_fixed_base_command_sent = True
         self._set_health_label(
-            self.gnss_base_status_labels["operation"],
+            self.gnss_base_status_labels["base_fixed"],
             "CFG-TMODE3 fixed 전송됨 | ACK/readback/post-config RTCM 대기",
             "warn",
         )
@@ -8056,7 +8215,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_fixed_base_pending_profile = None
         self.gnss_fixed_base_reconfigure_expected = None
         self.gnss_fixed_base_reconfigure_deadline_s = None
-        self._set_health_label(self.gnss_base_status_labels["operation"], f"Fixed Base 재설정 실패: {reason}", "bad")
+        self._set_health_label(self.gnss_base_status_labels["base_fixed"], f"Fixed Base 재설정 실패: {reason}", "bad")
         self._gnss_transition(GnssOperationState.FAULT, f"fixed base reconfiguration failed: {reason}")
 
     def _handle_gnss_base_ubx_message(self, message_class: int, message_id: int, payload: object) -> None:
@@ -8081,7 +8240,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 self._fail_gnss_fixed_base_reconfiguration("Base serial disconnected before CFG-TMODE3 readback")
                 return
             worker.send_bytes("CFG-TMODE3 poll after fixed coordinate ACK", ubx_cfg_tmode3_poll_frame())
-            self._set_health_label(self.gnss_base_status_labels["operation"], "CFG-TMODE3 ACK 수신 | readback 대기", "warn")
+            self._set_health_label(self.gnss_base_status_labels["base_fixed"], "CFG-TMODE3 ACK 수신 | readback 대기", "warn")
             return
         if (int(message_class), int(message_id)) != (0x06, 0x71):
             return
@@ -8095,7 +8254,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 readback mismatch")
             return
         self.gnss_fixed_base_reconfigure_readback = True
-        self._set_health_label(self.gnss_base_status_labels["operation"], "CFG-TMODE3 readback 확인 | post-config RTCM 대기", "warn")
+        self._set_health_label(self.gnss_base_status_labels["base_fixed"], "CFG-TMODE3 readback 확인 | post-config RTCM 대기", "warn")
         self._maybe_activate_gnss_fixed_base()
 
     def _maybe_activate_gnss_fixed_base(self) -> None:
@@ -8209,7 +8368,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         # measurement manager records the warning-only, no-contract path.
         transition_reasons = reasons if config.readiness_gate_enabled else ()
         state = self.gnss_operation_manager.state
-        if state in {GnssOperationState.NTRIP_ACTIVE, GnssOperationState.LOCAL_RTCM_ACTIVE} and not transition_reasons:
+        # LOCAL_RTCM_ACTIVE is Group B's (STATE_STATUS_GROUP == BASE_FIXED)
+        # terminal state -- reaching it means the Base has finished its own
+        # convergence/fixed-coordinate sequence and rover convergence can
+        # begin.  NTRIP_ACTIVE is Group A (STATE_STATUS_GROUP == NETWORK); it
+        # only implies convergence-eligibility in NETWORK_RTK_DIRECT, where
+        # there is no Group B stage at all (RTCM goes straight to rovers). In
+        # NETWORK_ASSISTED_FIXED_BASE, NTRIP_ACTIVE just means the caster feed
+        # is reaching the Base serial port; the Base must still complete its
+        # own Fixed-coordinate sequence (up to LOCAL_RTCM_ACTIVE) before rover
+        # convergence readiness has any meaning.
+        convergence_eligible = state == GnssOperationState.LOCAL_RTCM_ACTIVE or (
+            state == GnssOperationState.NTRIP_ACTIVE
+            and config.operation_mode == GnssOperationMode.NETWORK_RTK_DIRECT
+        )
+        if convergence_eligible and not transition_reasons:
             self._gnss_transition(GnssOperationState.ROVERS_CONVERGING, "RTCM rover 주입 시작")
             state = self.gnss_operation_manager.state
         if state == GnssOperationState.ROVERS_CONVERGING and not transition_reasons:
@@ -13649,10 +13822,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.px4_recording_rows = {
             side: SpoolRows() for side in ("left", "right")
         }
+        self.gnss_base_recording_rows = SpoolRows()
         for side, rows in self.camera_recording_rows.items():
             rows.bind(spool_root / f"camera_{side}.jsonl")
         for side, rows in self.px4_recording_rows.items():
             rows.bind(spool_root / f"px4_{side}.jsonl")
+        self.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
         self._recording_pair_row_index.clear()
         self._recovered_session_metadata = None
         self._recording_clock_sync_start_observation = None
@@ -13740,6 +13915,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_recording_rows["right"].clear()
         self.px4_recording_rows["left"].clear()
         self.px4_recording_rows["right"].clear()
+        self.gnss_base_recording_rows.clear()
         if self.distance_recording_enabled and self.recording_session_id:
             spool_root = self._recording_session_dir(self.recording_session_id) / ".spool"
             if isinstance(self.distance_recording_rows, SpoolRows):
@@ -13748,6 +13924,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 rows.bind(spool_root / f"camera_{side}.jsonl")
             for side, rows in self.px4_recording_rows.items():
                 rows.bind(spool_root / f"px4_{side}.jsonl")
+            self.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
         self._recording_pair_row_index.clear()
         if not self.distance_recording_enabled:
             self.distance_recording_started_monotonic_s = None
@@ -13894,7 +14071,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         stamp = self.recording_session_id or session_id_now()
         output_dir = self._recording_session_dir(stamp)
-        for rows in (self.distance_recording_rows, *self.camera_recording_rows.values(), *self.px4_recording_rows.values()):
+        for rows in (
+            self.distance_recording_rows,
+            *self.camera_recording_rows.values(),
+            *self.px4_recording_rows.values(),
+            self.gnss_base_recording_rows,
+        ):
             if isinstance(rows, SpoolRows):
                 rows.close()
         if self._recovered_session_metadata is None:
@@ -13910,6 +14092,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     "camera_right_gui_frame_count": len(self.camera_recording_rows["right"]),
                     "px4_left_sample_count": len(self.px4_recording_rows["left"]),
                     "px4_right_sample_count": len(self.px4_recording_rows["right"]),
+                    "gnss_base_sample_count": len(self.gnss_base_recording_rows),
                     "finalization": {
                         "requested_unix_ns": time.time_ns(),
                         "recovered_retry": True,
@@ -13928,6 +14111,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             pair_rows=pair_rows,
             camera_rows=dict(self.camera_recording_rows),
             px4_rows=dict(self.px4_recording_rows),
+            gnss_base_rows=self.gnss_base_recording_rows,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -14191,6 +14375,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "camera_right_gui_frame_count": len(self.camera_recording_rows["right"]),
             "px4_left_sample_count": len(self.px4_recording_rows["left"]),
             "px4_right_sample_count": len(self.px4_recording_rows["right"]),
+            "gnss_base_sample_count": len(self.gnss_base_recording_rows),
             "device_timeline_contract": {
                 "camera_row": "one row per frame delivered to the GUI frame_changed callback",
                 "camera_not_guaranteed": "not a one-to-one index of encoded MP4 frames",
@@ -20533,6 +20718,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.distance_recording_rows = recovered.pair_rows
         self.camera_recording_rows = recovered.camera_rows
         self.px4_recording_rows = recovered.px4_rows
+        self.gnss_base_recording_rows = recovered.gnss_base_rows
         self._recovered_session_metadata = metadata
         self._session_save_retry_required = True
         self._session_save_finalized = False

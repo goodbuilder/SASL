@@ -13,6 +13,7 @@ from wiris_stereo_distance.gnss_operation import (
     GnssOperationManager,
     GnssOperationMode,
     GnssOperationState,
+    GnssStatusGroup,
     HeightType,
     MeasurementGnssContract,
     NetworkConfig,
@@ -20,6 +21,7 @@ from wiris_stereo_distance.gnss_operation import (
     RoverCorrectionStatus,
     RoverReadinessInput,
     RoutingConfig,
+    STATE_STATUS_GROUP,
     build_measurement_gnss_contract,
     evaluate_gnss_readiness,
 )
@@ -404,3 +406,11 @@ def test_gate_disabled_measurement_starts_without_asserted_gnss_contract() -> No
     assert manager.state == GnssOperationState.MEASURING
     assert manager.measurement_contract is None
     assert manager.metadata()["readiness"]["warnings"] == ["gate_disabled"]
+
+
+def test_every_gnss_operation_state_has_a_status_group() -> None:
+    # Guards against a future GnssOperationState addition silently falling
+    # through to the GUI's default READINESS routing without an explicit,
+    # reviewed classification (see STATE_STATUS_GROUP in gnss_operation.py).
+    assert set(STATE_STATUS_GROUP) == set(GnssOperationState)
+    assert set(STATE_STATUS_GROUP.values()) <= set(GnssStatusGroup)

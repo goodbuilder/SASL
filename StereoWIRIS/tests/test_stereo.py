@@ -538,6 +538,102 @@ def test_gnss_operation_mode_changes_visible_settings(monkeypatch) -> None:
     _ = app
 
 
+def test_gnss_operation_mode_changes_status_label_visibility(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import GnssOperationMode
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.LOCAL_SURVEY_IN.value)
+    assert not widget.gnss_base_fixed_progress_group.isHidden()
+    assert not widget.gnss_base_status_labels["survey_in"].isHidden()
+    assert not widget.gnss_base_status_title_labels["survey_in"].isHidden()
+
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value)
+    assert not widget.gnss_base_fixed_progress_group.isHidden()
+    assert widget.gnss_base_status_labels["survey_in"].isHidden()
+    assert widget.gnss_base_status_title_labels["survey_in"].isHidden()
+
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_RTK_DIRECT.value)
+    assert widget.gnss_base_fixed_progress_group.isHidden()
+    assert widget.gnss_base_status_labels["survey_in"].isHidden()
+    assert widget.gnss_base_status_title_labels["survey_in"].isHidden()
+
+    widget.close()
+    widget.deleteLater()
+    _ = app
+
+
+def test_gnss_transition_routes_to_group_specific_label(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import GnssOperationMode, GnssOperationState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    # NETWORK_RTK_DIRECT has no Group B stage, so this pins the "operation"/
+    # "base_fixed" untouched-by-Group-A assertion regardless of whatever
+    # operation_mode the on-disk settings file last saved.
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_RTK_DIRECT.value)
+    widget.gnss_operation_manager.transition(GnssOperationState.CONFIGURED, "test setup")
+    widget.gnss_operation_manager.transition(GnssOperationState.INITIALIZING, "test setup")
+
+    operation_before = widget.gnss_base_status_labels["operation"].text()
+    base_fixed_before = widget.gnss_base_status_labels["base_fixed"].text()
+
+    # Group A (NTRIP): the dedicated "network" label owns this, "operation"
+    # and "base_fixed" must stay untouched in NETWORK_RTK_DIRECT (no Group B).
+    widget._gnss_transition(GnssOperationState.NTRIP_CONNECTING, "caster 연결 중")
+    assert widget.gnss_base_status_labels["operation"].text() == operation_before
+    assert widget.gnss_base_status_labels["base_fixed"].text() == base_fixed_before
+
+    widget.gnss_operation_manager.transition(GnssOperationState.NTRIP_ACTIVE, "test setup")
+
+    # Group B (Base RTK-Fixed acquisition): only "base_fixed" should change.
+    widget._gnss_transition(GnssOperationState.BASE_AS_ROVER_FLOAT, "Base가 NTRIP 보정 rover로 수렴 중")
+    assert widget.gnss_base_status_labels["operation"].text() == operation_before
+    assert "BASE_AS_ROVER_FLOAT" in widget.gnss_base_status_labels["base_fixed"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_gnss_transition_explains_base_fixed_wait_during_ntrip_handshake(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.gnss_operation import GnssOperationMode, GnssOperationState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget._set_combo_data(widget.gnss_operation_mode_combo, GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value)
+    widget.gnss_operation_manager.transition(GnssOperationState.CONFIGURED, "test setup")
+    widget.gnss_operation_manager.transition(GnssOperationState.INITIALIZING, "test setup")
+
+    # Still waiting on the caster handshake: base_fixed should say so, not
+    # just sit on the generic "대기 중" placeholder.
+    widget._gnss_transition(GnssOperationState.NTRIP_CONNECTING, "caster 연결 중")
+    assert "NTRIP 연결 대기 중" in widget.gnss_base_status_labels["base_fixed"].text()
+
+    # Caster connected, but no Base position sample has arrived yet.
+    widget._gnss_transition(GnssOperationState.NTRIP_ACTIVE, "caster 연결됨")
+    assert "샘플 수신 대기" in widget.gnss_base_status_labels["base_fixed"].text()
+
+    # Once a real sample arrives, _handle_gnss_base_position takes over.
+    widget._gnss_transition(GnssOperationState.BASE_AS_ROVER_FLOAT, "Base가 NTRIP 보정 rover로 수렴 중")
+    assert "BASE_AS_ROVER_FLOAT" in widget.gnss_base_status_labels["base_fixed"].text()
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_network_rtk_direct_routes_ntrip_rtcm_without_base_serial(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
@@ -639,6 +735,27 @@ def test_network_assisted_fixed_base_promotes_repeated_fixed_coordinate(monkeypa
     assert widget.gnss_fixed_base_profile is None
     assert widget.gnss_fixed_base_command_sent is True
     assert widget.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
+    position_text = widget.gnss_base_status_labels["base_position"].text()
+    assert "37.0000000" in position_text
+    assert "127.0000000" in position_text
+    assert "fix=True" in position_text
+
+    recorded = list(widget.gnss_base_recording_rows)
+    assert len(recorded) == 3
+    assert recorded[-1]["latitude_deg"] == 37.0
+    assert recorded[-1]["longitude_deg"] == 127.0
+    assert recorded[-1]["ellipsoid_height_m"] == 52.0
+    assert recorded[-1]["height_type"] == "ELLIPSOID"
+    assert recorded[-1]["fixed"] is True
+    assert recorded[-1]["side"] == "base"
+    assert recorded[-1]["sample_type"] == "gnss_base_position"
+    assert isinstance(recorded[-1]["host_receive_utc_ns"], int)
+
+    fix_series = [p.value for p in widget.gnss_base_fixed_state_plot.points if p.series == "fix"]
+    assert fix_series == [1.0, 1.0, 1.0]
+    scatter_h_series = [p.value for p in widget.gnss_base_fixed_scatter_plot.points if p.series == "horizontal"]
+    assert len(scatter_h_series) >= 1
+    assert recorded[-1]["host_receive_utc_ns"] > 0
 
     widget._handle_gnss_base_ubx_message(0x05, 0x01, b"\x06\x71")
     labels = [label for label, _payload in widget.gnss_base_serial_worker.sent]
@@ -653,6 +770,31 @@ def test_network_assisted_fixed_base_promotes_repeated_fixed_coordinate(monkeypa
     assert widget.mavlink_pixhawk.sent == [("left", frame)]
     assert widget.gnss_fixed_base_profile is not None
     assert widget.gnss_operation_manager.state == GnssOperationState.LOCAL_RTCM_ACTIVE
+
+    widget.deleteLater()
+    _ = app
+
+
+def test_gnss_base_tab_shows_rover_position(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+    widget.latest_gps["left"] = GpsPositionState(
+        "left", "/uav_0", 10.0, "gps", 37.401234, 127.123456, 10.0,
+        fix_type=6, altitude_ellipsoid_m=52.5,
+    )
+
+    widget._refresh_gnss_base_tab()
+
+    text = widget.gnss_base_status_labels["left_rover"].text()
+    assert "37.4012340" in text
+    assert "127.1234560" in text
+    assert "h=52.500m" in text
 
     widget.deleteLater()
     _ = app

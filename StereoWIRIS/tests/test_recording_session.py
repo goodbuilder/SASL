@@ -8,6 +8,7 @@ from wiris_stereo_distance.recording_session import (
     CAMERA_TIMELINE_COMPACT_COLUMNS,
     compact_px4_timeline_rows,
     DISTANCE_MEASUREMENT_COLUMNS,
+    GNSS_BASE_COMPACT_COLUMNS,
     PX4_TIMELINE_COMPACT_COLUMNS,
     SpoolRows,
     discover_retryable_sessions,
@@ -561,6 +562,25 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
                 }
             ]
         },
+        gnss_base_rows=[
+            {
+                "sequence": 0,
+                "session_id": "20260605_120000",
+                "side": "base",
+                "sample_type": "gnss_base_position",
+                "sample_monotonic_ns": 1_150_000_000,
+                "session_utc_ns": 1_800_000_000_150_000_000,
+                "host_receive_utc_ns": 1_800_000_000_200_000_000,
+                "latitude_deg": 37.401234,
+                "longitude_deg": 127.123456,
+                "ellipsoid_height_m": 52.3,
+                "msl_altitude_m": 48.1,
+                "height_type": "ELLIPSOID",
+                "fixed": True,
+                "device_id": "base-f9p",
+                "gnss_operation_state": "BASE_AS_ROVER_FIXED",
+            }
+        ],
     )
 
     assert saved.outputs == [
@@ -579,6 +599,8 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
         saved.px4_left_xlsx,
         saved.px4_right_xlsx,
         saved.session_rtk_xlsx,
+        saved.gnss_base_csv,
+        saved.gnss_base_parquet,
     ]
     assert saved.csv == output_dir / "20260605_120000_distance_measurements.csv"
     assert saved.xlsx == output_dir / "20260605_120000.xlsx"
@@ -612,6 +634,8 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
         "20260605_120000_camera_right.parquet",
         "20260605_120000_distance_measurements.csv",
         "20260605_120000_distance_measurements.parquet",
+        "20260605_120000_gnss_base.csv",
+        "20260605_120000_gnss_base.parquet",
         "20260605_120000_px4_left.csv",
         "20260605_120000_px4_left.parquet",
         "20260605_120000_px4_left.xlsx",
@@ -700,9 +724,27 @@ def test_save_session_files_writes_compact_resource_csvs_parquet_and_integrated_
     assert px4_xlsx_rows[0]["longitude_deg"] == 127.987654321
     assert "rtk_label" not in px4_xlsx_rows[0]
     assert "velocity_n_m_s" not in px4_xlsx_rows[0]
+    with saved.gnss_base_csv.open("r", newline="", encoding="utf-8") as handle:
+        gnss_base_rows = list(csv.DictReader(handle))
+    assert set(gnss_base_rows[0]) == set(GNSS_BASE_COMPACT_COLUMNS)
+    assert gnss_base_rows[0]["latitude_deg"] == "37.401234"
+    assert gnss_base_rows[0]["longitude_deg"] == "127.123456"
+    assert gnss_base_rows[0]["ellipsoid_height_m"] == "52.3"
+    assert gnss_base_rows[0]["height_type"] == "ELLIPSOID"
+    assert gnss_base_rows[0]["fixed"] == "True"
+    assert gnss_base_rows[0]["device_id"] == "base-f9p"
+    assert gnss_base_rows[0]["gnss_operation_state"] == "BASE_AS_ROVER_FIXED"
+    assert gnss_base_rows[0]["session_utc_ns"] == "1800000000150000000"
+    assert gnss_base_rows[0]["host_receive_utc_ns"] == "1800000000200000000"
+
+    gnss_base_parquet_table = pq.read_table(saved.gnss_base_parquet)
+    assert gnss_base_parquet_table.column_names == list(GNSS_BASE_COMPACT_COLUMNS)
+    assert gnss_base_parquet_table["latitude_deg"].to_pylist() == [37.401234]
+
     manifest = json.loads(saved.manifest.read_text(encoding="utf-8"))
     assert manifest["status"] == "finalized"
     assert manifest["artifact_roles"][saved.distance_measurements_parquet.name] == "distance_measurements_parquet"
+    assert manifest["artifact_roles"][saved.gnss_base_csv.name] == "gnss_base_timeline_csv"
 
 
 def test_save_session_files_creates_headers_for_empty_pair_rows(tmp_path) -> None:
