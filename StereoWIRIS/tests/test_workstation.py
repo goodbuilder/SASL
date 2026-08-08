@@ -1,0 +1,1410 @@
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from PyQt5 import QtWidgets
+
+from wiris_stereo_distance.gui import _parse_ui_mode
+from workstation.backend import LegacyPanelBackend
+from workstation.evidence import EvidenceAdapter
+from sasl_common.lifecycle import LifecycleCoordinator, LifecycleStep
+from workstation.main_window import WorkstationMainWindow
+from workstation.status_model import BackendStatusAdapter, StatusSeverity
+from workstation.standalone_backend import (
+    StandalonePanelBackend,
+    create_standalone_backend,
+)
+
+
+def test_ui_mode_parser_removes_workstation_argument() -> None:
+    mode, argv = _parse_ui_mode(["main.py", "--ui", "workstation", "--maximized"])
+
+    assert mode == "workstation"
+    assert argv == ["main.py", "--maximized"]
+    assert _parse_ui_mode(["main.py"])[0] == "legacy"
+
+
+def test_gui_compatibility_module_aliases_legacy_implementation() -> None:
+    import wiris_stereo_distance.gui as gui
+    import wiris_stereo_distance.legacy_gui as legacy_gui
+
+    assert gui is legacy_gui
+    assert gui.__file__.endswith("/legacy_gui.py")
+    assert gui.WirisStereoDistancePanel is legacy_gui.WirisStereoDistancePanel
+
+
+def test_standalone_entrypoint_does_not_import_legacy_gui() -> None:
+    app_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(app_root)
+    environment["SASL_ROS_LIBRARY_PATH_READY"] = "1"
+    script = """
+import sys
+
+import main
+
+assert main._workstation_requested(["main.py", "--ui", "workstation"])
+assert "wiris_stereo_distance.gui" not in sys.modules
+assert "wiris_stereo_distance.legacy_gui" not in sys.modules
+from workstation import standalone_gui
+assert standalone_gui.__file__.endswith("/standalone_gui.py")
+assert "wiris_stereo_distance.gui" not in sys.modules
+assert "wiris_stereo_distance.legacy_gui" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=app_root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_legacy_entrypoint_does_not_import_workstation_modules() -> None:
+    app_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(app_root)
+    environment["SASL_ROS_LIBRARY_PATH_READY"] = "1"
+    script = """
+import sys
+
+import main
+
+assert not main._workstation_requested(["main.py"])
+from wiris_stereo_distance import legacy_gui
+assert legacy_gui.__file__.endswith("/legacy_gui.py")
+assert "workstation" not in sys.modules
+assert not any(name.startswith("workstation.") for name in sys.modules)
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=app_root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_workstation_runtime_paths_are_separate_from_legacy_storage() -> None:
+    from wiris_stereo_distance import settings as legacy_settings
+    from workstation.runtime_paths import (
+        WORKSTATION_DATA_ROOT,
+        WORKSTATION_RECORDINGS_ROOT,
+        WORKSTATION_SETTINGS_PATH,
+    )
+
+    assert WORKSTATION_DATA_ROOT.name == "workstation_data"
+    assert WORKSTATION_SETTINGS_PATH == WORKSTATION_DATA_ROOT / "stereo_distance_settings.json"
+    assert WORKSTATION_RECORDINGS_ROOT == WORKSTATION_DATA_ROOT / "recordings"
+    assert WORKSTATION_SETTINGS_PATH != legacy_settings.DEFAULT_SETTINGS_PATH
+    assert WORKSTATION_RECORDINGS_ROOT != legacy_settings.APP_ROOT / "recordings"
+
+
+def test_standalone_settings_wrappers_use_workstation_settings_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    from workstation import standalone_gui
+    from workstation.runtime_paths import WORKSTATION_SETTINGS_PATH
+
+    captured: dict[str, object] = {}
+    sentinel = object()
+    monkeypatch.setattr(
+        standalone_gui,
+        "_load_shared_settings",
+        lambda path: captured.__setitem__("load", path) or sentinel,
+    )
+    monkeypatch.setattr(
+        standalone_gui,
+        "_save_shared_settings",
+        lambda settings, path: captured.update(save=(settings, path)),
+    )
+
+    assert standalone_gui.load_settings() is sentinel
+    standalone_gui.save_settings(sentinel)
+    assert captured["load"] == WORKSTATION_SETTINGS_PATH
+    assert captured["save"] == (sentinel, WORKSTATION_SETTINGS_PATH)
+
+
+def test_workstation_evidence_uses_panel_data_root(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from wiris_stereo_distance import settings as legacy_settings
+
+    legacy_root = tmp_path / "legacy"
+    workstation_root = tmp_path / "workstation"
+    monkeypatch.setattr(legacy_settings, "APP_ROOT", legacy_root)
+    session_dir = workstation_root / "recordings" / "sessions" / "workstation-session"
+    session_dir.mkdir(parents=True)
+    (session_dir / "session_manifest.json").write_text(
+        '{"status":"finalized","artifact_roles":'
+        '{"workstation-session_distance_measurements.csv":"distance_measurements_csv"}}',
+        encoding="utf-8",
+    )
+    (session_dir / "workstation-session_distance_measurements.csv").write_text(
+        "recording_time_ns,forward_m,right_m,down_m,range_m\n1,2,3,4,5\n",
+        encoding="utf-8",
+    )
+
+    adapter = EvidenceAdapter(SimpleNamespace(app_root=workstation_root))
+    catalog = adapter.session_catalog()
+    rows = adapter.session_artifact_rows(
+        "workstation-session",
+        "workstation-session_distance_measurements.csv",
+    )
+
+    assert catalog and catalog[0]["path"] == str(session_dir)
+    assert rows["rows"] == (
+        {"recording_time_ns": "1", "forward_m": "2", "right_m": "3", "down_m": "4", "range_m": "5"},
+    )
+
+
+def test_standalone_backend_is_a_separate_copy_and_factory_owner(monkeypatch: pytest.MonkeyPatch) -> None:
+    from workstation import standalone_gui
+
+    assert not issubclass(StandalonePanelBackend, LegacyPanelBackend)
+    assert Path(standalone_gui.__file__).name == "standalone_gui.py"
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = QtWidgets.QWidget()
+    monkeypatch.setattr(standalone_gui, "WirisStereoDistancePanel", lambda **_kwargs: panel)
+    backend = create_standalone_backend()
+
+    assert isinstance(backend, StandalonePanelBackend)
+    assert backend.panel is panel
+    assert backend.owner_widget is panel
+    backend.deleteLater()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_lifecycle_coordinator_resumes_after_pending_step() -> None:
+    calls: list[str] = []
+    pending = {"value": True}
+
+    def first() -> bool:
+        calls.append("first")
+        if pending["value"]:
+            pending["value"] = False
+            return False
+        return True
+
+    coordinator = LifecycleCoordinator(
+        [LifecycleStep("first", first), LifecycleStep("second", lambda: calls.append("second"))]
+    )
+
+    assert coordinator.run() is False
+    assert calls == ["first"]
+    assert coordinator.run() is True
+    assert calls == ["first", "first", "second"]
+    assert coordinator.run() is True
+    assert calls == ["first", "first", "second"]
+
+
+class _FakeBackend:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+        self.panel = SimpleNamespace(
+            camera_connected=False,
+            yolo_enabled=False,
+            camera_frame_times={"left": [], "right": []},
+            camera_stream_stats={"left": {}, "right": {}},
+            pixhawk_attitude_times={"left": [], "right": []},
+            last_distance_quality="BAD",
+            last_distance_status="거리: 좌/우 검출 매칭 대기 중",
+            recording_session_id="",
+            distance_history=[],
+            left_url_edit=QtWidgets.QLineEdit("rtsp://left"),
+            right_url_edit=QtWidgets.QLineEdit("rtsp://right"),
+            _session_save_thread=None,
+            _session_save_retry_required=False,
+            _session_save_finalized=False,
+            recording_active=False,
+            camera_frame_metadata={"left": {}, "right": {}},
+            camera_sync_status="not-verified",
+            camera_sync_reason="STUS 동기화 후 RTCP/NTP 검증이 필요합니다.",
+            selected_runtime_frame_pair_delta_s=None,
+            selected_runtime_frame_pair_basis="",
+            selected_runtime_frame_pair_camera_rtc_delta_s=None,
+            latest_gps={},
+            latest_rtk_baseline=None,
+            custom_watch_specs=[],
+        )
+        self.panel._session_recording_active = lambda: bool(self.panel.recording_active)
+        self.legacy_widget = QtWidgets.QLabel("legacy workflow")
+
+    def toggle_camera(self) -> None:
+        self.calls.append("camera")
+
+    def toggle_detection(self) -> None:
+        self.calls.append("detection")
+
+    def toggle_recording(self) -> None:
+        self.calls.append("recording")
+
+    def save_session(self) -> None:
+        self.calls.append("save")
+
+    def toggle_pixhawk(self) -> None:
+        self.calls.append("pixhawk")
+
+    def apply_camera_settings(self, left: str, right: str) -> bool:
+        self.calls.append(("settings", left, right))
+        return True
+
+    def camera_discover_host_ip(self) -> None:
+        self.calls.append("camera_discover_host_ip")
+
+    def camera_check_rtsp(self) -> None:
+        self.calls.append("camera_check_rtsp")
+
+    def camera_check_control(self) -> None:
+        self.calls.append("camera_check_control")
+
+    def camera_enable_rtsp(self) -> None:
+        self.calls.append("camera_enable_rtsp")
+
+    def camera_swap(self) -> None:
+        self.calls.append("camera_swap")
+
+    def camera_save_settings(self) -> None:
+        self.calls.append("camera_save_settings")
+
+    def time_set_pc(self) -> None:
+        self.calls.append("time_set_pc")
+
+    def time_run_photo_workflow(self) -> None:
+        self.calls.append("time_run_photo_workflow")
+
+    def time_check_sync(self) -> None:
+        self.calls.append("time_check_sync")
+
+    def pixhawk_auto_detect(self) -> None:
+        self.calls.append("pixhawk_auto_detect")
+
+    def pixhawk_toggle_mavlink(self) -> None:
+        self.calls.append("pixhawk_toggle_mavlink")
+
+    def gnss_base_discover(self) -> None:
+        self.calls.append("gnss_base_discover")
+
+    def gnss_base_connect(self) -> None:
+        self.calls.append("gnss_base_connect")
+
+    def gnss_base_disconnect(self) -> None:
+        self.calls.append("gnss_base_disconnect")
+
+    def gnss_survey_start(self) -> None:
+        self.calls.append("gnss_survey_start")
+
+    def gnss_survey_stop(self) -> None:
+        self.calls.append("gnss_survey_stop")
+
+    def gnss_ntrip_start(self) -> None:
+        self.calls.append("gnss_ntrip_start")
+
+    def gnss_ntrip_stop(self) -> None:
+        self.calls.append("gnss_ntrip_stop")
+
+    def calibration_capture_images(self) -> None:
+        self.calls.append("calibration_capture_images")
+
+    def calibration_run_intrinsic(self) -> None:
+        self.calls.append("calibration_run_intrinsic")
+
+    def calibration_save_intrinsics(self) -> None:
+        self.calls.append("calibration_save_intrinsics")
+
+    def calibration_load_intrinsics(self) -> None:
+        self.calls.append("calibration_load_intrinsics")
+
+    def calibration_apply_intrinsics(self) -> None:
+        self.calls.append("calibration_apply_intrinsics")
+
+    def calibration_load_validation(self) -> None:
+        self.calls.append("calibration_load_validation")
+
+    def calibration_run_validation(self) -> None:
+        self.calls.append("calibration_run_validation")
+
+    def calibration_save_validation(self) -> None:
+        self.calls.append("calibration_save_validation")
+
+    def calibration_apply_validation(self) -> None:
+        self.calls.append("calibration_apply_validation")
+
+    def apply_measurement_settings(self, settings: dict[str, object]) -> None:
+        self.calls.append(("measurement_apply_settings", settings))
+
+    def save_measurement_settings(self) -> None:
+        self.calls.append("measurement_save_settings")
+
+    def workstation_settings_snapshot(self) -> dict[str, object]:
+        from wiris_stereo_distance.settings import AppSettings
+
+        defaults = AppSettings()
+        snapshot = dict(defaults.__dict__)
+        snapshot["gnss_operation"] = defaults.gnss_operation.to_mapping()
+        return snapshot
+
+    def apply_workstation_system_settings(self, settings: dict[str, object]) -> None:
+        self.calls.append(("settings_apply", dict(settings)))
+
+    def save_workstation_system_settings(self) -> None:
+        self.calls.append("settings_save")
+
+    def calibration_apply_setup(self, setup: dict[str, object]) -> None:
+        self.calls.append(("calibration_apply_setup", setup))
+
+    def calibration_scan_validation(self) -> None:
+        self.calls.append("calibration_scan_validation")
+
+    def calibration_save_setup(self) -> None:
+        self.calls.append("calibration_save_setup")
+
+    def alignment_scan_sources(self) -> None:
+        self.calls.append("alignment_scan_sources")
+
+    def alignment_start_sampling(self) -> None:
+        self.calls.append("alignment_start_sampling")
+
+    def alignment_stop_sampling(self) -> None:
+        self.calls.append("alignment_stop_sampling")
+
+    def alignment_save_profile(self) -> None:
+        self.calls.append("alignment_save_profile")
+
+    def alignment_load_profile(self) -> None:
+        self.calls.append("alignment_load_profile")
+
+    def alignment_swap_pixhawks(self) -> None:
+        self.calls.append("alignment_swap_pixhawks")
+
+    def advanced_wiris_catalog(self) -> tuple[dict[str, str], ...]:
+        return (
+            {
+                "category": "Basic",
+                "label": "Check connection",
+                "command": "HIWS",
+                "terminator": "\n",
+                "description": "Connection check",
+            },
+        )
+
+    def advanced_send_wiris_command(self, target: str, command: str, terminator: str) -> None:
+        self.calls.append(("advanced_wiris", target, command, terminator))
+
+    def advanced_send_zoom(self, target: str, action: str, level: int | None = None) -> None:
+        self.calls.append(("advanced_zoom", target, action, level))
+
+    def advanced_discover_custom_topic_watch(self) -> None:
+        self.calls.append("advanced_watch_discover_ros2")
+
+    def advanced_discover_custom_mavlink_watch(self) -> None:
+        self.calls.append("advanced_watch_discover_mavlink")
+
+    def advanced_add_custom_topic_watch(self, name: str, topic: str, field: str) -> str:
+        self.calls.append(("advanced_watch_add", name, topic, field))
+        return name or f"{topic}.{field}"
+
+    def advanced_remove_custom_topic_watch(self, key: str) -> None:
+        self.calls.append(("advanced_watch_remove", key))
+
+    def advanced_refresh_baseline_fields(self) -> dict[str, object]:
+        self.calls.append("advanced_baseline_scan")
+        return {
+            "ros2_topics": (("yes", "/fmu/out/vehicle_gps_position", "px4_msgs/msg/SensorGps"),),
+            "mavlink_messages": (("GPS_RAW_INT", "lat, lon, alt"),),
+            "axis_contract": "producer fields preserved",
+        }
+
+    def advanced_describe_baseline_fields(self, topic_type: str) -> tuple[str, ...]:
+        self.calls.append(("advanced_baseline_describe", topic_type))
+        return ("lat", "lon", "alt")
+
+    def advanced_open_px4_shell(self, camera: str) -> None:
+        self.calls.append(("advanced_px4_shell", camera))
+
+    def advanced_refresh_px4_mag(self, camera: str, *, read_params: bool = True) -> None:
+        self.calls.append(("advanced_px4_mag", camera, read_params))
+
+    def advanced_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> None:
+        self.calls.append(("advanced_px4_attitude", camera, read_params))
+
+    def advanced_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> None:
+        self.calls.append(("advanced_px4_apply_mag", camera, priorities))
+
+    def advanced_save_px4_mag_params(self, camera: str) -> None:
+        self.calls.append(("advanced_px4_save_mag", camera))
+
+    def advanced_reboot_px4(self, camera: str) -> None:
+        self.calls.append(("advanced_px4_reboot", camera))
+
+    def advanced_refresh_calibration_preview(self) -> dict[str, object]:
+        self.calls.append("advanced_preview_refresh")
+        return {"images": {}, "axis_contract": "checkerboard pixels preserved"}
+
+    def advanced_calibration_preview_snapshot(self) -> dict[str, object]:
+        return {"images": {}, "axis_contract": "checkerboard pixels preserved"}
+
+    def select_legacy_context(self, context_id: str) -> None:
+        self.calls.append(("legacy", context_id))
+
+    def diagnostic_text(self) -> str:
+        return "[fake] source-backed log"
+
+    def shutdown_for_close(self) -> bool:
+        self.calls.append("shutdown")
+        return True
+
+
+def test_workstation_shell_navigation_and_close() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    window.resize(1366, 768)
+    app.processEvents()
+    assert window.workspace_host.width() > 500
+
+    window.navigation.select_context("devices.cameras")
+    app.processEvents()
+    assert window.workspace_host.currentWidget().widget() is window.camera
+    assert [
+        window.camera.operation_buttons[key].text()
+        for key in (
+            "camera.discover_host_ip",
+            "camera.check_control",
+            "camera.enable_rtsp",
+            "camera.check_rtsp",
+        )
+    ] == [
+        "Discover camera IP",
+        "Check WIRIS control",
+        "Enable RTSP",
+        "Check RTSP",
+    ]
+
+    window.navigation.select_context("devices.time")
+    app.processEvents()
+    assert window.workspace_host.currentWidget().widget() is window.time_workspace
+    assert window.commands.invoke("time.check_sync") is True
+    assert backend.calls[-1] == "time_check_sync"
+
+    window.navigation.select_context("processing.measurement")
+    app.processEvents()
+    assert window.workspace_host.currentWidget().widget() is window.measurement
+    assert any(
+        "baseline_center_frd" in label.text()
+        for label in window.measurement.findChildren(QtWidgets.QLabel)
+    )
+    assert [window.measurement.values[key].label.text() for key in ("range", "forward", "right", "down")] == [
+        "Range",
+        "Forward",
+        "Right",
+        "Down",
+    ]
+    assert window.measurement.history.model().headerData(0, 1) == "timestamp_s"
+    assert set(window.measurement.previews) == {"left", "right"}
+    assert set(window.measurement.upstream_values) >= {
+        "camera.left",
+        "camera.right",
+        "detection",
+        "synchronization",
+        "gnss",
+        "recording",
+    }
+    assert set(window.measurement.control_buttons) == {
+        "camera.toggle",
+        "detection.toggle",
+        "recording.toggle",
+        "session.save",
+    }
+    assert set(window.measurement.quality_labels) == {
+        "status",
+        "gap",
+        "distance",
+        "mode",
+        "attitude",
+        "raw_point",
+    }
+    backend.panel.triangulation_quality_status_label = QtWidgets.QLabel("GOOD | ray pair accepted")
+    backend.panel.triangulation_quality_gap_label = QtWidgets.QLabel("gap: 0.012 m")
+    backend.panel.triangulation_quality_distance_label = QtWidgets.QLabel("distance: 12.300 m")
+    backend.panel.triangulation_quality_mode_label = QtWidgets.QLabel("mode: two_ray_closest_midpoint")
+    backend.panel.triangulation_quality_attitude_label = QtWidgets.QLabel("Attitude timing: FRESH")
+    backend.panel.triangulation_quality_raw_point_label = QtWidgets.QLabel(
+        "Raw baseline_center_frd point: [12.0, 0.3, -0.1, 12.0]"
+    )
+    window.measurement.refresh(window.status_adapter.model.snapshot())
+    assert window.measurement.quality_labels["mode"].text() == "mode: two_ray_closest_midpoint"
+    assert "baseline_center_frd" in window.measurement.quality_labels["raw_point"].text()
+    assert "INVALID" not in window.inspector.status_value.meta.text()
+    assert "source=" not in window.inspector.status_value.meta.text()
+    assert all(
+        "source=" not in value.meta.text()
+        for value in window.inspector.context_values.values()
+    )
+
+    window.navigation.select_context("devices.pixhawk")
+    app.processEvents()
+    assert window.alignment.operation_tabs.currentIndex() == 0
+    window.navigation.select_context("devices.gnss")
+    app.processEvents()
+    assert window.workspace_host.currentWidget().widget() is window.alignment
+    assert window.alignment.operation_tabs.currentIndex() == 1
+    assert any(indicator.label.text() == "GNSS / RTK" for indicator in window.alignment.indicators.values())
+
+    window.navigation.select_context("processing.alignment")
+    app.processEvents()
+    assert window.alignment.operation_tabs.currentIndex() == 2
+
+    window.navigation.select_context("diagnostics.logs")
+    app.processEvents()
+    assert window.diagnostics_dock.isVisible()
+    assert window.diagnostics.log_view.toPlainText() == "[fake] source-backed log"
+    current_workspace = window.workspace_host.currentWidget()
+    window.navigation.select_context("diagnostics.camera")
+    app.processEvents()
+    assert window.workspace_host.currentWidget() is current_workspace
+    assert window.diagnostics.tabs.currentIndex() == 1
+    window.navigation.select_context("diagnostics.performance")
+    app.processEvents()
+    assert window.diagnostics.tabs.currentIndex() == 6
+    assert "fps" in window.status_widgets
+
+    assert window.commands.invoke("camera.toggle") is True
+    assert backend.calls[-1] == "camera"
+    window.close()
+    app.processEvents()
+    assert "shutdown" in backend.calls
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    backend.panel.recording_active = True
+    backend.panel.recording_session_id = "active-session"
+    window.status_adapter.refresh()
+    app.processEvents()
+
+    assert not window.commands.action("camera.toggle").isEnabled()
+    assert not window.commands.action("session.save").isEnabled()
+    assert not window.measurement.control_buttons["camera.toggle"].isEnabled()
+    assert not window.measurement.control_buttons["session.save"].isEnabled()
+    assert not window.camera.operation_buttons["camera.swap"].isEnabled()
+    assert not window.alignment.operation_buttons["alignment.swap_pixhawks"].isEnabled()
+
+    backend.panel.recording_active = False
+    backend.panel._session_save_finalized = True
+    window.status_adapter.refresh()
+    app.processEvents()
+    assert window.commands.action("camera.toggle").isEnabled()
+    assert window.commands.action("session.save").isEnabled()
+    assert window.measurement.control_buttons["session.save"].isEnabled()
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_exposes_complete_system_settings_surface() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    window.navigation.select_context("tasks.settings")
+    app.processEvents()
+    settings = window.settings_workspace
+    assert window.workspace_host.currentWidget().widget() is settings
+    assert settings.tabs.count() == 6
+    assert {
+        "interface_name",
+        "left_rtsp_url",
+        "yolo_weights_path",
+        "rtsp_transport",
+        "pixhawk_host_address",
+        "pixhawk_ethernet_mode",
+        "intrinsics_path",
+        "gnss_operation_mode",
+        "gnss_network_caster_host",
+        "gnss_network_tls",
+        "gnss_readiness_maximum_baseline_std_m",
+        "gnss_fixed_coordinate_profile_path",
+        "clock_ftp_password",
+    } <= set(settings.settings_widgets)
+    assert settings.settings_widgets["gnss_readiness_minimum_fixed_duration_s"].value() == pytest.approx(30.0)
+    assert settings.settings_widgets["gnss_readiness_maximum_baseline_std_m"].value() == pytest.approx(0.02)
+
+    settings.settings_widgets["interface_name"].setText("enx-workstation")
+    settings.settings_widgets["gnss_network_tls"].setChecked(True)
+    settings.settings_widgets["gnss_readiness_maximum_baseline_std_m"].setValue(0.1234)
+    settings.settings_widgets["gnss_fixed_coordinate_profile_path"].setText("gnss/base.json")
+    payload = settings.settings_payload()
+    assert payload["interface_name"] == "enx-workstation"
+    assert payload["gnss_operation"]["network"]["tls"] is True
+    assert payload["gnss_operation"]["readiness"]["maximum_baseline_std_m"] == pytest.approx(0.1234)
+    assert payload["gnss_operation"]["fixed_base"]["coordinate_profile_path"] == "gnss/base.json"
+
+    assert window.commands.invoke("settings.apply") is True
+    assert backend.calls[-1][0] == "settings_apply"
+    assert window.commands.invoke("settings.save") is True
+    assert backend.calls[-1] == "settings_save"
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_main_cards_hide_source_but_provenance_survives_in_inspector() -> None:
+    from workstation.components import EngineeringValue, StatusIndicator
+    from workstation.status_model import RuntimeStatus, StatusSeverity
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    status = RuntimeStatus(
+        key="camera.left",
+        label="CAM L",
+        state="LIVE",
+        severity=StatusSeverity.OK,
+        detail="frame age 0.10 s",
+        source="CameraPane[left]",
+        clock="app_receive_monotonic",
+    )
+
+    main_value = EngineeringValue("Range")
+    main_value.set_value("12.3", source="MeasurementAttempt/controller result", frame="baseline_center_frd")
+    assert "source=" not in main_value.meta.text()
+    assert "frame=baseline_center_frd" in main_value.meta.text()
+
+    inspector_value = EngineeringValue("Evidence", show_source=True)
+    inspector_value.set_value("frame age 0.10 s", source=status.source)
+    assert "source=CameraPane[left]" in inspector_value.meta.text()
+
+    inspector_without_prefix = EngineeringValue("Inspector evidence", show_source=True, source_prefix="")
+    inspector_without_prefix.set_value("frame age 0.10 s", source=status.source)
+    assert "source=" not in inspector_without_prefix.meta.text()
+    assert "CameraPane[left]" in inspector_without_prefix.meta.text()
+
+    main_indicator = StatusIndicator("CAM L")
+    main_indicator.set_status(status)
+    assert "source=" not in main_indicator.toolTip()
+
+    _ = app
+
+
+def test_status_adapter_distinguishes_fresh_stale_and_error_evidence() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.left_pane = SimpleNamespace(current_status="수신 중")
+    backend.panel.right_pane = SimpleNamespace(current_status="중지됨")
+    backend.panel.camera_connected = True
+    backend.panel.camera_frame_times["left"] = [time.monotonic()]
+
+    adapter = BackendStatusAdapter(backend)
+    adapter.refresh()
+    fresh = adapter.model.record("camera.left")
+    assert fresh is not None
+    assert fresh.state == "LIVE"
+    assert fresh.severity == StatusSeverity.OK
+
+    backend.panel.camera_frame_times["left"] = [time.monotonic() - 3.0]
+    backend.panel.left_pane.current_status = "카메라 연결 중"
+    adapter.refresh()
+    stale = adapter.model.record("camera.left")
+    assert stale is not None
+    assert stale.state == "STARTING"
+    assert stale.age_s is not None and stale.age_s >= 2.9
+
+    backend.panel.camera_connected = False
+    backend.panel.camera_frame_times["left"] = []
+    backend.panel.left_pane.current_status = "오류: decoder"
+    adapter.refresh()
+    failed = adapter.model.record("camera.left")
+    assert failed is not None
+    assert failed.state == "ERROR"
+    assert failed.severity == StatusSeverity.BAD
+    _ = app
+
+
+def test_status_adapter_exposes_sync_and_ned_baseline_evidence() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.camera_sync_status = "verified"
+    backend.panel.camera_sync_reason = "RTCP/NTP pair gate verified"
+    backend.panel.selected_runtime_frame_pair_delta_s = 0.012
+    backend.panel.selected_runtime_frame_pair_basis = "camera_rtc"
+    backend.panel.selected_runtime_frame_pair_camera_rtc_delta_s = 0.004
+    backend.panel.latest_gps = {
+        "left": SimpleNamespace(
+            timestamp_s=time.monotonic() - 0.1,
+            rtk_label="RTK_FIXED",
+            fix_type=6,
+            satellites_used=18,
+            eph_m=0.02,
+            epv_m=0.03,
+        ),
+        "right": SimpleNamespace(
+            timestamp_s=time.monotonic() - 0.2,
+            rtk_label="RTK_FIXED",
+            fix_type=6,
+            satellites_used=17,
+            eph_m=0.03,
+            epv_m=0.04,
+        ),
+    }
+    backend.panel.latest_rtk_baseline = SimpleNamespace(
+        baseline_m=1.25,
+        north_m=1.0,
+        east_m=0.7,
+        down_m=-0.1,
+        left_age_s=0.1,
+        right_age_s=0.2,
+        fix_quality="GOOD",
+    )
+
+    adapter = BackendStatusAdapter(backend)
+    adapter.refresh()
+    sync = adapter.model.record("synchronization")
+    gnss = adapter.model.record("gnss")
+    assert sync is not None and sync.state == "SYNCED"
+    assert "RTCP/NTP" in sync.detail
+    assert gnss is not None and gnss.state == "FIX"
+    assert "baseline NED=+1.000/+0.700/-0.100 m" in gnss.detail
+    assert gnss.age_s is not None and gnss.age_s >= 0.19
+    _ = app
+
+
+def test_backend_command_failure_is_not_reported_as_completion() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = QtWidgets.QWidget()
+    backend = LegacyPanelBackend(panel)
+    errors: list[str] = []
+    backend.command_error.connect(errors.append)
+    with pytest.raises(RuntimeError, match="toggle_camera_connection"):
+        backend.toggle_camera()
+    assert errors and "unavailable" in errors[0]
+    panel.deleteLater()
+    backend.deleteLater()
+    app.processEvents()
+
+
+def test_phase_one_backend_facades_delegate_to_legacy_owner() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    calls: list[str] = []
+    panel = SimpleNamespace()
+    method_names = (
+        "discover_pc_camera_ip",
+        "check_cameras",
+        "check_wiris_control",
+        "enable_wiris_rtsp",
+        "swap_cameras",
+        "save_current_settings_from_ui",
+        "set_selected_wiris_time_from_pc",
+        "capture_download_analyze_clock_photos",
+        "refresh_clock_sync_status",
+        "auto_detect_pixhawks",
+        "toggle_mavlink_connection",
+        "discover_gnss_base_serial_ports",
+        "connect_gnss_base_serial",
+        "disconnect_gnss_base_serial",
+        "start_gnss_base_survey_in",
+        "stop_gnss_base_survey_in",
+        "start_gnss_network",
+        "stop_gnss_network",
+        "capture_calibration_images",
+        "run_intrinsic_calibration",
+        "save_intrinsics",
+        "load_intrinsics",
+        "apply_intrinsics_to_distance",
+        "load_checkerboard_validation_json",
+        "run_checkerboard_random_validation",
+        "save_checkerboard_validation_result",
+        "apply_checkerboard_validation_result",
+    )
+    for name in method_names:
+        setattr(panel, name, lambda name=name: calls.append(name) or (False if name == "stop_gnss_network" else None))
+    backend = LegacyPanelBackend(panel)
+
+    facades = (
+        "camera_discover_host_ip",
+        "camera_check_rtsp",
+        "camera_check_control",
+        "camera_enable_rtsp",
+        "camera_swap",
+        "camera_save_settings",
+        "time_set_pc",
+        "time_run_photo_workflow",
+        "time_check_sync",
+        "pixhawk_auto_detect",
+        "pixhawk_toggle_mavlink",
+        "gnss_base_discover",
+        "gnss_base_connect",
+        "gnss_base_disconnect",
+        "gnss_survey_start",
+        "gnss_survey_stop",
+        "gnss_ntrip_start",
+        "gnss_ntrip_stop",
+        "calibration_capture_images",
+        "calibration_run_intrinsic",
+        "calibration_save_intrinsics",
+        "calibration_load_intrinsics",
+        "calibration_apply_intrinsics",
+        "calibration_load_validation",
+        "calibration_run_validation",
+        "calibration_save_validation",
+        "calibration_apply_validation",
+    )
+    for facade in facades:
+        getattr(backend, facade)()
+
+    assert calls == list(method_names)
+    assert backend.gnss_ntrip_stop() is None
+    assert calls[-1] == "stop_gnss_network"
+    backend.deleteLater()
+    app.processEvents()
+
+
+def test_measurement_and_calibration_setup_facades_delegate_to_owner() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    calls: list[tuple[str, object]] = []
+    panel = SimpleNamespace(
+        apply_workstation_measurement_settings=lambda payload: calls.append(("measurement", payload)),
+        save_current_settings_from_ui=lambda: calls.append(("save", None)),
+        apply_workstation_calibration_setup=lambda payload: calls.append(("calibration", payload)),
+        scan_checkerboard_validation_files=lambda: calls.append(("scan", None)),
+        refresh_baseline_field_browser=lambda: calls.append(("alignment_scan", None)),
+        start_baseline_sampling=lambda: calls.append(("alignment_start", None)),
+        stop_baseline_sampling=lambda: calls.append(("alignment_stop", None)),
+        save_alignment_profile=lambda: calls.append(("alignment_save", None)),
+        load_alignment_profile=lambda: calls.append(("alignment_load", None)),
+        swap_pixhawks=lambda: calls.append(("alignment_swap", None)),
+    )
+    backend = LegacyPanelBackend(panel)
+    measurement = {"distance_mode": "pixhawk", "focal_px": 900.0}
+    setup = {"inner_cols": 13, "inner_rows": 8, "square_size_mm": 40.0}
+    backend.apply_measurement_settings(measurement)
+    backend.save_measurement_settings()
+    backend.calibration_apply_setup(setup)
+    backend.calibration_scan_validation()
+    backend.calibration_save_setup()
+    backend.alignment_scan_sources()
+    backend.alignment_start_sampling()
+    backend.alignment_stop_sampling()
+    backend.alignment_save_profile()
+    backend.alignment_load_profile()
+    backend.alignment_swap_pixhawks()
+    assert calls == [
+        ("measurement", measurement),
+        ("save", None),
+        ("calibration", setup),
+        ("scan", None),
+        ("save", None),
+        ("alignment_scan", None),
+        ("alignment_start", None),
+        ("alignment_stop", None),
+        ("alignment_save", None),
+        ("alignment_load", None),
+        ("alignment_swap", None),
+    ]
+    backend.deleteLater()
+    app.processEvents()
+
+
+def test_advanced_backend_facades_delegate_without_creating_resource_owners() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    calls: list[object] = []
+    panel = SimpleNamespace()
+    panel.workstation_wiris_command_catalog = lambda: ({"command": "HIWS"},)
+    panel.workstation_send_wiris_command = lambda target, command, terminator: calls.append(
+        ("wiris", target, command, terminator)
+    )
+    panel.workstation_send_zoom = lambda target, action, level: calls.append(
+        ("zoom", target, action, level)
+    )
+    panel.workstation_discover_custom_topic_watch = lambda: calls.append("watch_ros2")
+    panel.workstation_discover_custom_mavlink_watch = lambda: calls.append("watch_mavlink")
+    panel.workstation_add_custom_topic_watch = lambda name, topic, field: calls.append(
+        ("watch_add", name, topic, field)
+    )
+    panel.workstation_remove_custom_topic_watch = lambda key: calls.append(("watch_remove", key))
+    panel.workstation_refresh_baseline_field_browser = lambda: calls.append("baseline_scan") or {}
+    panel.workstation_describe_baseline_fields = lambda topic_type: calls.append(
+        ("baseline_describe", topic_type)
+    ) or ("lat",)
+    panel.workstation_open_px4_shell = lambda camera: calls.append(("shell", camera))
+    panel.workstation_refresh_px4_mag = lambda camera, read_params=True: calls.append(
+        ("mag", camera, read_params)
+    )
+    panel.workstation_refresh_px4_attitude_cal = lambda camera, read_params=True: calls.append(
+        ("attitude", camera, read_params)
+    )
+    panel.workstation_apply_px4_mag_priorities = lambda camera, priorities: calls.append(
+        ("apply_mag", camera, priorities)
+    )
+    panel.workstation_save_px4_mag_params = lambda camera: calls.append(("save_mag", camera))
+    panel.workstation_reboot_px4 = lambda camera: calls.append(("reboot", camera))
+    panel.workstation_refresh_calibration_preview = lambda: calls.append("preview") or {"images": {}}
+    panel.workstation_calibration_preview_snapshot = lambda: {"images": {}}
+    backend = LegacyPanelBackend(panel)
+
+    assert backend.advanced_wiris_catalog() == ({"command": "HIWS"},)
+    backend.advanced_send_wiris_command("left", "HIWS", "\n")
+    backend.advanced_send_zoom("both", "set", 10)
+    backend.advanced_discover_custom_topic_watch()
+    backend.advanced_discover_custom_mavlink_watch()
+    backend.advanced_add_custom_topic_watch("z", "/topic", "z")
+    backend.advanced_remove_custom_topic_watch("z")
+    backend.advanced_refresh_baseline_fields()
+    assert backend.advanced_describe_baseline_fields("px4_msgs/msg/SensorGps") == ("lat",)
+    backend.advanced_open_px4_shell("right")
+    backend.advanced_refresh_px4_mag("right")
+    backend.advanced_refresh_px4_attitude_cal("right")
+    backend.advanced_apply_px4_mag_priorities("right", {"CAN1": 100})
+    backend.advanced_save_px4_mag_params("right")
+    backend.advanced_reboot_px4("right")
+    backend.advanced_refresh_calibration_preview()
+    backend.advanced_calibration_preview_snapshot()
+
+    assert calls == [
+        ("wiris", "left", "HIWS", "\n"),
+        ("zoom", "both", "set", 10),
+        "watch_ros2",
+        "watch_mavlink",
+        ("watch_add", "z", "/topic", "z"),
+        ("watch_remove", "z"),
+        "baseline_scan",
+        ("baseline_describe", "px4_msgs/msg/SensorGps"),
+        ("shell", "right"),
+        ("mag", "right", True),
+        ("attitude", "right", True),
+        ("apply_mag", "right", {"CAN1": 100}),
+        ("save_mag", "right"),
+        ("reboot", "right"),
+        "preview",
+    ]
+    backend.deleteLater()
+    app.processEvents()
+
+
+def test_evidence_adapter_preserves_attitude_gps_detection_and_recording_contracts() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    now = time.monotonic()
+    panel = SimpleNamespace(
+        latest_extrinsics={
+            "left": SimpleNamespace(
+                roll_deg=1.0,
+                pitch_deg=2.0,
+                yaw_deg=3.0,
+                q=(1.0, 0.0, 0.0, 0.0),
+                timestamp_s=now - 0.25,
+                px4_timestamp_s=123.5,
+                px4_timestamp_us=123500000,
+                px4_timestamp_sample_us=123400000,
+                namespace="px4_1",
+                topic="/px4_1/fmu/out/vehicle_attitude",
+            )
+        },
+        latest_gps={
+            "left": SimpleNamespace(
+                rtk_label="RTK_FIXED",
+                fix_type=6,
+                satellites_used=18,
+                eph_m=0.02,
+                epv_m=0.03,
+                latitude_deg=37.0,
+                longitude_deg=127.0,
+                altitude_m=20.0,
+                timestamp_s=now - 0.1,
+                px4_timestamp_s=22.0,
+                namespace="px4_1",
+                topic="/px4_1/fmu/out/vehicle_gps_position",
+                time_source="px4_ros2",
+            )
+        },
+        latest_rtk_baseline=SimpleNamespace(
+            fix_quality="GOOD",
+            north_m=1.0,
+            east_m=2.0,
+            down_m=-0.2,
+            baseline_m=2.25,
+            left_age_s=0.1,
+            right_age_s=0.2,
+            warnings=(),
+        ),
+        latest_left=SimpleNamespace(
+            timestamp_s=now - 0.05,
+            width=1920,
+            height=1080,
+            x1=10.0,
+            y1=20.0,
+            x2=110.0,
+            y2=220.0,
+            center=(60.0, 120.0),
+            confidence=0.9,
+            class_id=0,
+            class_name="person",
+            candidate_class_ids=(0,),
+            timestamp_metadata={"source_timestamp_s": 100.0, "timestamp_source": "rtcp_ntp"},
+        ),
+        latest_right=None,
+        camera_stream_stats={"left": {"inferred_hz": 15.0}, "right": {}},
+        yolo_enabled=True,
+        recording_session_id="session-1",
+        distance_recording_enabled=False,
+        video_recording_enabled=False,
+        distance_recording_rows=[{"row": 1}],
+        camera_recording_rows={},
+        px4_recording_rows={},
+        gnss_base_recording_rows=[],
+        video_recording_paths={},
+        _session_save_thread=None,
+        _session_save_retry_required=False,
+        _session_save_finalized=True,
+        _recording_elapsed_s=lambda _now: 1.5,
+        _recording_session_dir=lambda _session: "/tmp/session-1",
+        recording_status_label=QtWidgets.QLabel("saved"),
+    )
+    evidence = EvidenceAdapter(panel)
+    attitude = evidence.attitude("left", now_s=now)
+    gps = evidence.gps("left", now_s=now)
+    detection = evidence.detection("left", now_s=now)
+    recording = evidence.recording(now_s=now)
+    assert attitude["frame_contract"].startswith("PX4")
+    assert attitude["px4_timestamp_s"] == 123.5
+    assert gps["position_contract"].startswith("WGS84")
+    assert evidence.baseline()["axis_contract"] == "NED = north / east / down; metres"
+    assert detection["pixel_contract"].startswith("bbox")
+    assert detection["center_u_px"] == 60.0
+    assert recording["state"] == "FINALIZED"
+    assert recording["sample_counts"]["pairs"] == 1
+    _ = app
+
+
+def test_evidence_projects_measurement_settings_and_session_csv_without_conversion(tmp_path, monkeypatch) -> None:
+    from wiris_stereo_distance import settings as settings_module
+
+    panel = SimpleNamespace(
+        settings=SimpleNamespace(
+            manual_focal_override=False,
+            triangulation_extrinsics_source="pixhawk",
+            yolo_input_size=640,
+            yolo_conf_threshold=0.6,
+            yolo_iou_threshold=0.4,
+            yolo_gate_class_enabled=True,
+            yolo_gate_class_text="person",
+            yolo_gate_matching_enabled=True,
+            yolo_gate_time_delta_enabled=True,
+            yolo_gate_vertical_delta_enabled=False,
+            yolo_gate_max_time_delta_s=0.08,
+            yolo_gate_time_basis="camera_rtcp",
+            yolo_gate_max_vertical_delta_px=50.0,
+            camera_sync_history_window_s=1.0,
+            camera_sync_receive_pair_max_delta_s=0.3,
+            camera_sync_rtcp_pair_max_delta_s=0.05,
+            camera_sync_max_sr_age_s=7.0,
+            camera_sync_max_pc_offset_s=0.1,
+            camera_sync_max_clock_rate_error=0.005,
+            camera_sync_required_sr_count=2,
+            camera_sync_warmup_timeout_s=30.0,
+        )
+    )
+    evidence = EvidenceAdapter(panel)
+    measurement = evidence.measurement_settings()
+    assert measurement["yolo_input_size_px"] == 640
+    assert measurement["class_gate"] == "person"
+    assert measurement["distance_mode"] == "pixhawk"
+    assert measurement["camera_sync_rtcp_pair_max_delta_ms"] == 50.0
+    assert "bbox_gate_enabled" not in measurement
+    assert "min_bbox_width_px" not in measurement
+    assert "min_bbox_height_px" not in measurement
+    assert "min_bbox_area_px2" not in measurement
+    assert "baseline_center_frd" in str(measurement["coordinate_contract"])
+
+    monkeypatch.setattr(settings_module, "APP_ROOT", tmp_path)
+    session_dir = tmp_path / "recordings" / "sessions" / "session-1"
+    generation_dir = session_dir / ".generations" / "generation-1"
+    generation_dir.mkdir(parents=True)
+    csv_path = generation_dir / "session-1_distance_measurements.csv"
+    csv_path.write_text("recording_time_ns,forward_m,right_m,down_m\n1,2,3,4\n", encoding="utf-8")
+    (session_dir / "published").symlink_to(Path(".generations") / "generation-1")
+    (session_dir / "session_manifest.json").write_text(
+        '{"status":"finalized","generation_id":"generation-1",'
+        '"time_axis":"recording_time_ns",'
+        '"artifact_roles":{"session-1_distance_measurements.csv":"distance_measurements_csv"}}',
+        encoding="utf-8",
+    )
+    catalog = evidence.session_catalog()
+    assert catalog[0]["session_id"] == "session-1"
+    assert "session-1_distance_measurements.csv" in catalog[0]["artifacts"]
+    preview = evidence.session_artifact_rows("session-1", "session-1_distance_measurements.csv")
+    assert preview["columns"] == ("recording_time_ns", "forward_m", "right_m", "down_m")
+    assert preview["rows"][0]["forward_m"] == "2"
+    assert "no NED/ENU" in str(preview["coordinate_contract"])
+
+
+def test_workstation_uses_source_backed_alignment_calibration_and_recording_pages() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    for context, workspace in (
+        ("devices.pixhawk", window.alignment),
+        ("tasks.calibration", window.calibration),
+        ("tasks.recording", window.recording),
+        ("tasks.playback", window.advanced),
+        ("tasks.export", window.advanced),
+        ("tasks.advanced", window.advanced),
+    ):
+        window.navigation.select_context(context)
+        app.processEvents()
+        assert window.workspace_host.currentWidget().widget() is workspace
+
+    assert window.alignment.attitude_model.rowCount() == 2
+    assert window.alignment.gnss_model.rowCount() == 2
+    assert window.calibration.intrinsic_model.rowCount() == 2
+    assert window.recording.artifact_model.rowCount() >= 1
+    assert "NED" in window.alignment.findChildren(QtWidgets.QLabel)[-1].text()
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    camera_commands = (
+        "camera.discover_host_ip",
+        "camera.check_rtsp",
+        "camera.check_control",
+        "camera.enable_rtsp",
+        "camera.swap",
+        "camera.save_settings",
+    )
+    alignment_commands = (
+        "pixhawk.auto_detect",
+        "pixhawk.toggle_mavlink",
+        "gnss.base_discover",
+        "gnss.base_connect",
+        "gnss.base_disconnect",
+        "gnss.survey_start",
+        "gnss.survey_stop",
+        "gnss.ntrip_start",
+        "gnss.ntrip_stop",
+    )
+    calibration_commands = (
+        "calibration.capture_images",
+        "calibration.run_intrinsic",
+        "calibration.save_intrinsics",
+        "calibration.load_intrinsics",
+        "calibration.apply_intrinsics",
+        "calibration.load_validation",
+        "calibration.run_validation",
+        "calibration.save_validation",
+        "calibration.apply_validation",
+    )
+
+    assert all(window.camera.operation_buttons[command].isEnabled() for command in camera_commands)
+    assert all(window.alignment.operation_buttons[command].isEnabled() for command in alignment_commands)
+    assert all(window.calibration.operation_buttons[command].isEnabled() for command in calibration_commands)
+    for command in (*camera_commands, *alignment_commands, *calibration_commands):
+        assert window.commands.invoke(command) is True
+
+    assert backend.calls[-len(camera_commands) - len(alignment_commands) - len(calibration_commands):] == [
+        "camera_discover_host_ip",
+        "camera_check_rtsp",
+        "camera_check_control",
+        "camera_enable_rtsp",
+        "camera_swap",
+        "camera_save_settings",
+        "pixhawk_auto_detect",
+        "pixhawk_toggle_mavlink",
+        "gnss_base_discover",
+        "gnss_base_connect",
+        "gnss_base_disconnect",
+        "gnss_survey_start",
+        "gnss_survey_stop",
+        "gnss_ntrip_start",
+        "gnss_ntrip_stop",
+        "calibration_capture_images",
+        "calibration_run_intrinsic",
+        "calibration_save_intrinsics",
+        "calibration_load_intrinsics",
+        "calibration_apply_intrinsics",
+        "calibration_load_validation",
+        "calibration_run_validation",
+        "calibration_save_validation",
+        "calibration_apply_validation",
+    ]
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_exposes_measurement_and_calibration_setup_controls() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    assert window.measurement.operation_buttons["measurement.apply_settings"].isEnabled()
+    assert window.measurement.operation_buttons["measurement.save_settings"].isEnabled()
+    assert window.calibration.operation_buttons["calibration.apply_setup"].isEnabled()
+    assert window.calibration.operation_buttons["calibration.scan_validation"].isEnabled()
+    assert window.calibration.operation_buttons["calibration.save_setup"].isEnabled()
+    assert window.alignment.operation_buttons["alignment.scan_sources"].isEnabled()
+    assert window.alignment.operation_buttons["alignment.start_sampling"].isEnabled()
+    assert window.alignment.operation_buttons["alignment.stop_sampling"].isEnabled()
+    assert window.alignment.operation_buttons["alignment.save_profile"].isEnabled()
+    assert window.alignment.operation_buttons["alignment.load_profile"].isEnabled()
+    assert window.alignment.operation_buttons["alignment.swap_pixhawks"].isEnabled()
+    measurement_payload = window.measurement.settings_payload()
+    assert measurement_payload["distance_mode"] in {"pixhawk", "checkerboard"}
+    assert measurement_payload["focal_px"] > 0
+    assert "camera_sync_rtcp_pair_max_delta_ms" in measurement_payload
+    calibration_payload = window.calibration.setup_payload()
+    assert calibration_payload["inner_cols"] >= 2
+    assert calibration_payload["square_size_mm"] > 0
+    assert window.commands.invoke("measurement.apply_settings") is True
+    assert window.commands.invoke("measurement.save_settings") is True
+    assert window.commands.invoke("calibration.apply_setup") is True
+    assert window.commands.invoke("calibration.scan_validation") is True
+    assert window.commands.invoke("calibration.save_setup") is True
+    assert window.commands.invoke("alignment.scan_sources") is True
+    assert window.commands.invoke("alignment.start_sampling") is True
+    assert window.commands.invoke("alignment.stop_sampling") is True
+    assert window.commands.invoke("alignment.save_profile") is True
+    assert window.commands.invoke("alignment.load_profile") is True
+    assert window.commands.invoke("alignment.swap_pixhawks") is True
+    extended_calls = backend.calls[-11:]
+    assert extended_calls[0][0] == "measurement_apply_settings"
+    assert extended_calls[1] == "measurement_save_settings"
+    assert extended_calls[2][0] == "calibration_apply_setup"
+    assert extended_calls[3] == "calibration_scan_validation"
+    assert extended_calls[4] == "calibration_save_setup"
+    assert extended_calls[5:] == [
+        "alignment_scan_sources",
+        "alignment_start_sampling",
+        "alignment_stop_sampling",
+        "alignment_save_profile",
+        "alignment_load_profile",
+        "alignment_swap_pixhawks",
+    ]
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_recording_workspace_reviews_saved_csv_without_frame_conversion(tmp_path, monkeypatch) -> None:
+    from wiris_stereo_distance import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "APP_ROOT", tmp_path)
+    session_dir = tmp_path / "recordings" / "sessions" / "session-1"
+    generation_dir = session_dir / ".generations" / "generation-1"
+    generation_dir.mkdir(parents=True)
+    (generation_dir / "session-1_distance_measurements.csv").write_text(
+        "recording_time_ns,forward_m,right_m,down_m,range_m\n1,2,3,4,5\n",
+        encoding="utf-8",
+    )
+    (session_dir / "published").symlink_to(Path(".generations") / "generation-1")
+    (session_dir / "session_manifest.json").write_text(
+        '{"status":"finalized","generation_id":"generation-1",'
+        '"time_axis":"recording_time_ns",'
+        '"artifact_roles":{"session-1_distance_measurements.csv":"distance_measurements_csv"}}',
+        encoding="utf-8",
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = WorkstationMainWindow(backend=_FakeBackend())
+    window.show()
+    app.processEvents()
+    assert window.recording.session_selector.count() == 1
+    assert window.recording.session_selector.currentData() == "session-1"
+    assert window.recording.artifact_selector.currentData() == "session-1_distance_measurements.csv"
+    assert window.recording.review_model.rowCount() == 1
+    assert window.recording.review_model.item(0, 1).text() == "2"
+    assert "no NED/ENU" in window.recording.review_status_label.text()
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_exposes_advanced_owner_tools_and_preserves_contracts() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    window.navigation.select_context("tasks.advanced")
+    app.processEvents()
+    assert window.workspace_host.currentWidget().widget() is window.advanced
+    assert window.advanced.wiris_catalog_combo.count() == 1
+    assert window.advanced.baseline_topic_model.rowCount() == 0
+    assert "NED" in window.advanced.findChildren(QtWidgets.QLabel)[-1].text()
+
+    window.advanced.wiris_command_edit.setText("HIWS")
+    assert window.commands.invoke("advanced.wiris.send") is True
+    assert backend.calls[-1] == ("advanced_wiris", "both", "HIWS", "\n")
+
+    window.advanced.zoom_level_spin.setValue(12)
+    assert window.commands.invoke("advanced.zoom.set") is True
+    assert backend.calls[-1] == ("advanced_zoom", "both", "set", 12)
+
+    window.advanced.watch_name_edit.setText("local_z")
+    window.advanced.watch_topic_edit.setText("/uav_0/fmu/out/vehicle_local_position")
+    window.advanced.watch_field_edit.setText("z")
+    assert window.commands.invoke("advanced.watch.add") is True
+    assert backend.calls[-1] == (
+        "advanced_watch_add",
+        "local_z",
+        "/uav_0/fmu/out/vehicle_local_position",
+        "z",
+    )
+
+    assert window.commands.invoke("advanced.baseline.scan") is True
+    assert window.advanced.baseline_topic_model.rowCount() == 1
+    window.advanced.baseline_topic_table.selectRow(0)
+    assert window.commands.invoke("advanced.baseline.describe") is True
+    assert [window.advanced.baseline_field_list.item(i).text() for i in range(3)] == ["lat", "lon", "alt"]
+
+    window.advanced.px4_camera_combo.setCurrentIndex(1)
+    assert window.commands.invoke("advanced.px4.refresh_mag") is True
+    assert backend.calls[-1] == ("advanced_px4_mag", "right", True)
+    assert window.commands.invoke("advanced.px4.refresh_attitude") is True
+    assert backend.calls[-1] == ("advanced_px4_attitude", "right", True)
+    assert window.commands.invoke("advanced.px4.shell") is True
+    assert backend.calls[-1] == ("advanced_px4_shell", "right")
+
+    assert window.commands.invoke("advanced.preview.refresh") is True
+    assert "checkerboard pixels" in window.advanced.preview_status_label.text()
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()

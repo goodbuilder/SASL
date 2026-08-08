@@ -37,7 +37,28 @@ if missing_library_paths and os.environ.get("SASL_ROS_LIBRARY_PATH_READY") != "1
     env["SASL_ROS_LIBRARY_PATH_READY"] = "1"
     os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
-from wiris_stereo_distance.gui import main
+
+
+def _workstation_requested(argv: list[str]) -> bool:
+    """Return whether this launch should load the standalone Workstation UI."""
+
+    for index, argument in enumerate(argv[1:], start=1):
+        if argument == "--ui" and index + 1 < len(argv):
+            return argv[index + 1] == "workstation"
+        if argument.startswith("--ui="):
+            return argument.partition("=")[2] == "workstation"
+    return False
+
+
+def main() -> int:
+    # Keep the Legacy import lazy.  A Workstation process must load only the
+    # copied GUI module; this is the import boundary that makes the two
+    # runtimes independently replaceable.
+    if _workstation_requested(sys.argv):
+        from workstation.standalone_gui import main as selected_main
+    else:
+        from wiris_stereo_distance.legacy_gui import main as selected_main
+    return selected_main()
 
 if __name__ == "__main__":
     raise SystemExit(main())

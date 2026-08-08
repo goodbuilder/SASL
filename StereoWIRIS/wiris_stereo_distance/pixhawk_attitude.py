@@ -1281,6 +1281,12 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
         return _mavlink_read_param_int(connection, name, timeout_s=timeout_s)
 
+    def read_param(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | float | None:
+        connection = self.connections.get(camera)
+        if connection is None:
+            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
+        return _mavlink_read_param(connection, name, timeout_s=timeout_s)
+
     def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
         connection = self.connections.get(camera)
         if connection is None:
@@ -2097,6 +2103,41 @@ def _mavlink_recv_param_value(connection: Any, name: str, *, timeout_s: float) -
             continue
         return _mavlink_param_float_to_int(getattr(message, "param_value"))
     return None
+
+
+# MAV_PARAM_TYPE_REAL32 = 9, MAV_PARAM_TYPE_REAL64 = 10. Every other MAV_PARAM_TYPE is an
+# integer whose bits are reinterpreted (not numerically cast) into the PARAM_VALUE float field,
+# per the MAVLink param protocol convention PX4 uses.
+_MAVLINK_FLOAT_PARAM_TYPES = (9, 10)
+
+
+def _mavlink_decode_param_value(raw_param_value: float, param_type: int | None) -> int | float:
+    if param_type in _MAVLINK_FLOAT_PARAM_TYPES:
+        return float(raw_param_value)
+    return _mavlink_param_float_to_int(raw_param_value)
+
+
+def _mavlink_recv_param_value_typed(connection: Any, name: str, *, timeout_s: float) -> int | float | None:
+    deadline = time.monotonic() + float(timeout_s)
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        message = connection.recv_match(type="PARAM_VALUE", blocking=True, timeout=min(0.2, remaining))
+        if message is None:
+            continue
+        if _mavlink_param_id_text(message) != name:
+            continue
+        return _mavlink_decode_param_value(getattr(message, "param_value"), getattr(message, "param_type", None))
+    return None
+
+
+def _mavlink_read_param(connection: Any, name: str, *, timeout_s: float = 2.0) -> int | float | None:
+    mav = getattr(connection, "mav", None)
+    if mav is None or not hasattr(mav, "param_request_read_send"):
+        return None
+    target_system = int(getattr(connection, "target_system", 0) or 1)
+    target_component = int(getattr(connection, "target_component", 0) or 1)
+    mav.param_request_read_send(target_system, target_component, _mavlink_param_id(name), -1)
+    return _mavlink_recv_param_value_typed(connection, name, timeout_s=timeout_s)
 
 
 def _mavlink_read_param_int(connection: Any, name: str, *, timeout_s: float = 2.0) -> int | None:

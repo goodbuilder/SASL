@@ -1,5 +1,149 @@
 # 업데이트 기록
 
+## 2026-08-09 — Workstation 메인 카드 provenance 표시 정리
+
+- 변경:
+  - Workstation 메인 `EngineeringValue`와 `StatusIndicator`에서 반복적인 `source=` 표시를 숨겼다.
+  - Inspector의 source-backed context와 Diagnostics의 Source column/text는 그대로 유지했다.
+  - camera preview의 source timestamp는 `camera_ts`로 간결하게 표시하고, 내부 source metadata는 변경하지 않았다.
+- 확인:
+  - Workstation regression **18 passed**.
+  - source provenance를 메인 카드에서는 숨기고 Inspector에 유지하는 회귀를 추가했다.
+
+Coordinate contract checked: `workstation/components.py`, `workstation/inspector.py`, `workstation/workspaces.py`; display-only provenance formatting changed, while PX4 FRD→world NED, GPS NED, camera RDF, and `baseline_center_frd` contracts remain unchanged.
+
+## 2026-08-09 — Workstation 전체 설정 편집 surface 통합
+
+- 변경:
+  - `Tasks > All settings` Workstation 화면을 추가해 Legacy에만 남아 있던 Camera/WIRIS, YOLO/RTSP, PX4/ROS2, runtime flag, GNSS/RTK, Clock/FTP 설정을 한 곳에서 편집할 수 있게 했다.
+  - GNSS `GnssOperationConfig`의 operation mode, NTRIP/TLS/timeout, readiness limits, fixed-base profile/scatter/height, route 설정을 nested mapping 그대로 보존한다. `UNKNOWN` height도 Legacy owner combo에서 손실되지 않는다.
+  - Workstation의 Apply는 기존 `WirisStereoDistancePanel` owner widget/manager로 전달하고, Save는 기존 `stereo_distance_settings.json`만 갱신한다. 별도 설정 저장소나 측정 계산/worker를 만들지 않았다.
+  - intrinsics path, auto-load, triangulation/RTK flags와 Workstation 적용값을 명시적 in-memory override로 유지해 화면을 이동해도 Save 전 설정이 사라지지 않게 했다.
+- 이유:
+  - 실장비 장시간 검증 이전에 software에서 확인 가능한 Legacy 설정 편집 범위를 Workstation으로 통합하고, camera/Pixhawk/GNSS/measurement의 단일 owner 및 기존 저장 계약을 유지하기 위해서다.
+- 확인:
+  - Workstation system settings surface 및 실제 panel owner→JSON bridge 회귀를 추가했다.
+  - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest StereoWIRIS/tests -q` → **629 passed**.
+  - `./run.sh --check`, `bash StereoWIRIS/run.sh --check`, `compileall`, `git diff --check` 통과.
+- 남은 위험:
+  - 실제 RTSP/WIRIS/Pixhawk/ROS2/GNSS/NTRIP 연결과 장시간 운용은 여전히 실장비/manual 검증 범위다.
+
+Coordinate contract checked: `gui.py`, `workstation/settings_workspace.py`, `workstation/backend.py`, `workstation/workspaces.py`, `gnss_operation.py`, `coordinate_contract.py`; Workstation settings only route WGS84 GNSS/RTCM inputs and existing PX4 body FRD→world NED, GPS north/east/down NED, camera optical RDF, public `baseline_center_frd` forward/right/down contracts unchanged.
+
+## 2026-08-09 — Workstation 고급 owner workflow 직접 이관
+
+- 변경:
+  - Workstation에 `Advanced owner tools` workspace와 `tasks.advanced` navigation을 추가했다. 기존 legacy panel은 TCP/MAVLink/ROS2/preview/session resource owner로 유지하고, Workstation은 typed facade와 `CommandRegistry`를 통해 호출한다.
+  - WIRIS SDK catalog/raw command, LINE/NULL terminator, 양쪽/좌/우 target, 기존 confirmation·timeout·partial-response 로그를 Workstation에서 직접 사용할 수 있게 했다.
+  - WIRIS zoom in/out/stop/absolute level, checkerboard live preview/overlay를 Workstation에 연결했다. preview는 기존 lazy worker와 `QImage` signal을 공유하며 두 번째 worker를 만들지 않는다.
+  - PX4 MAG refresh/priority apply/save/reboot, attitude calibration readback, per-side PX4 Shell, ROS2/MAVLink field-watch add/discover/remove, baseline ROS2/MAVLink field scan/describe를 연결했다.
+  - Playback/Export context를 Advanced owner tools로 이동했다. session CSV preview는 저장 열과 `recording_time_ns`를 그대로 유지하고, XLSX/Parquet/video는 Workstation에서 경로를 안전하게 열며 workbook 생성은 기존 session-save writer, video 재생은 시스템 연결 player를 사용한다.
+  - 기존 `Recording/Review`와 legacy fallback은 유지하되 일반 Workstation 진입점은 고급 화면으로 통일했다.
+- 이유:
+  - 실장비 장시간 검증 이전에 남아 있던 고급 조작 진입점을 Workstation으로 옮기면서도 카메라/Pixhawk subscriber/preview worker/session writer를 중복 소유하지 않기 위해서다.
+- 확인:
+  - Workstation test에 advanced facade/UI/좌표 계약 검증을 추가했다.
+  - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest StereoWIRIS/tests/test_workstation.py StereoWIRIS/tests/test_stereo_geometry_common.py StereoWIRIS/tests/test_coordinate_contract.py StereoWIRIS/tests/test_measurement_attempt.py StereoWIRIS/tests/test_measurement_controller.py StereoWIRIS/tests/test_triangulation.py StereoWIRIS/tests/test_recording_session.py -q` → **203 passed**.
+  - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest StereoWIRIS/tests -q` → **627 passed**.
+- 남은 위험:
+  - 실제 RTSP/WIRIS SDK 응답, Pixhawk MAVLink PARAM/Shell/reboot, ROS2 field publisher, checkerboard frame/overlay, system video player와 장시간 session finalization은 실장비/manual 검증이 필요하다.
+
+Coordinate contract checked: `gui.py`, `workstation/backend.py`, `workstation/workspaces.py`, `workstation/inspector.py`, `coordinate_contract.py`, `pixhawk_attitude.py`, `rtk_geometry.py`, `recording_session.py`; WIRIS target은 좌/우 camera control endpoint로만 다루고, PX4 body FRD→world NED, GPS/RTK north/east/down NED, checkerboard/OpenCV optical RDF, public `baseline_center_frd` forward/right/down, 저장 `recording_time_ns`와 raw CSV field를 섞지 않았다.
+
+## 2026-08-08 — Workstation 소프트웨어 이관 범위 확장 및 실장비 전 조건 정리
+
+- 변경:
+  - Measurement workspace에 내부 파라미터/외부 파라미터 source, YOLO gate, RTCP/NTP 동기화 임계값을 편집하고 Apply/Save하는 owner-backed controls를 추가했다.
+  - Calibration workspace에 zoom·체커보드 geometry·검증 root/mode/runs/pairs/seed를 편집하고 Apply/scan/Save하는 controls를 추가했다.
+  - Alignment workspace에 source scan, baseline sampling start/stop, profile save/load, Pixhawk side swap 명령을 추가했다.
+  - Recording workspace에 session catalog, manifest error/retryable 상태, artifact 선택, 저장 CSV preview, session/artifact 경로 열기를 추가했다. CSV의 저장 열·`recording_time_ns`와 frame semantics는 변환하지 않는다.
+  - checkerboard preview worker를 lazy-start로 바꿔 Workstation/settings-only panel 생성이 불필요한 QThread를 만들지 않게 했고, remaining handoff 버튼을 calibration preview/zoom, raw SDK/PX4/MAG/field-watch, media playback/export 고급 도구로 명시했다.
+- 이유:
+  - 실장비 장시간 검증 이전에 소프트웨어에서 확인 가능한 workflow parity를 최대한 Workstation shell로 이동하되, 측정·좌표·세션 저장 owner와 one-consumer worker 구조는 유지하기 위해서다.
+- 확인:
+  - Workstation/좌표/측정/삼각측량/기록 대상 회귀 **201 passed**.
+  - `python3 -m compileall -q workstation sasl_common StereoWIRIS/wiris_stereo_distance/legacy_gui.py` 통과.
+  - 현재 session 산출물 계약과 `stop_all(wait=True)` close contract에 맞춰 characterization tests를 갱신했고, `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS python3 -m pytest StereoWIRIS/tests -q`가 **625 passed**로 완료됐다.
+- 남은 위험:
+  - 실제 RTSP/Pixhawk/ROS2/GNSS/NTRIP, 영상 writer flush, 장시간 session finalization/close, 화면 가독성은 실장비/manual validation이 필요하다.
+  - raw SDK/PX4/MAG/field-watch와 video playback/workbook export는 기존 owner의 고급 도구 handoff로 남겼다.
+
+Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.py`, `workstation/backend.py`, `gui.py`, `coordinate_contract.py`, `rtk_geometry.py`, `measurement_attempt.py`, `recording_session.py`; camera image/intrinsics는 OpenCV optical RDF와 px, Pixhawk attitude는 body FRD→world NED, GPS/RTK baseline은 north/east/down NED, public measurement는 `baseline_center_frd` forward/right/down/range, session preview는 저장된 `recording_time_ns`와 raw fields를 그대로 유지했다.
+
+## 2026-08-08 — Workstation source-backed workflow projection 확장
+
+- 변경:
+  - `workstation/evidence.py`에 기존 패널의 `CameraExtrinsicState`, `GpsPositionState`, `RtkBaselineEstimate`, `DetectionObservation`, session spool/save worker, calibration result를 읽기 전용으로 투영하는 adapter를 추가했다.
+  - Alignment 화면에 PX4 roll/pitch/yaw·PX4 timestamp/age, GPS fix/satellites/eph/epv, WGS84 receiver 값과 NED north/east/down baseline 표를 추가했다.
+  - Calibration 화면에 active profile/zoom, 좌우 intrinsics pixel metrics, stereo R/T frame contract, validation summary를 추가했다.
+  - Recording/Review/Export 화면에 session ID·elapsed·finalization/retry, sample counts, video path와 산출 artifact 목록을 추가했다. 실제 저장/review/export owner와 포맷은 기존 panel/session worker를 유지한다.
+  - Camera/Inspector/Diagnostics에 YOLO 설정, target bbox와 pixel `u/v`, detection freshness, source/clock 정보를 추가했다.
+  - `CommandRegistry`에 accepted 신호와 명시적 `False` rejection 처리를 추가해 handler 반환과 비동기 상태 postcondition을 구분했다.
+  - 설정 파일을 읽는 기존 Qt characterization test 두 건은 operator의 현재 JSON 대신 repository-default `AppSettings`를 사용하도록 격리했다.
+  - 1단계 migration으로 Camera IP/RTSP/control, Pixhawk discovery/MAVLink, GNSS Base serial/Survey-in/NTRIP, Calibration capture/run/save/load/apply/validation 명령을 Workstation command facade와 operation buttons에서 직접 실행하도록 연결했다. 계산·기록 owner는 이동하지 않았다.
+- 이유:
+  - 감사 문서의 대표 workflow를 legacy handoff 안내만으로 끝내지 않고, 새 shell에서도 기존 authoritative source를 확인할 수 있게 하기 위해서다. 새 UI는 measurement/coordinate/recording/calibration 계산을 복제하지 않는다.
+- 확인:
+  - Workstation 계약 테스트 10개, 좌표·측정·삼각측량·기록 포함 대상 회귀 총 197개 통과.
+  - 1366×768, 1600×900, 1920×1080 offscreen에서 Alignment/Calibration/Recording/Camera context 생성·전환·종료를 확인했다.
+  - 실제 panel 기반 Workstation context 전환·종료와 `compileall`, `git diff --check`를 통과했다.
+- 남은 위험:
+  - 실제 RTSP/Pixhawk/ROS2/GNSS와 SessionSaveWorker 장시간 finalization은 장비/manual smoke가 필요하다.
+  - 테스트 두 건은 operator 설정과 분리해 repository default를 사용하도록 보완했지만, 전체 Qt suite는 누적 legacy panel worker teardown에서 `QThread: Destroyed while thread is still running`으로 중단되어 별도 조건으로 남아 있다. targeted suite는 이 중단과 분리해 통과했다.
+
+Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.py`, `workstation/inspector.py`, `workstation/status_model.py`, `coordinate_contract.py`, `pixhawk_attitude.py`, `rtk_geometry.py`, `stereo.py`; PX4/body FRD orientation→world NED, GPS WGS84 fields, RTK baseline NED north/east/down, camera optical/left-camera RDF, detection pixel u/v, public `baseline_center_frd` forward/right/down, and app/source/PX4/RTCP timestamps were kept separate and covered by Workstation/coordinate regression tests.
+
+## 2026-08-08 — Workstation UI 설계 감사 및 구현 게이트 추가
+
+- 변경:
+  - `docs/ui/workstation/11_DESIGN_AUDIT_RESULT.md`에 실제 런처·상태·명령·데이터 흐름·스레드/종료·workspace·테스트 감사를 기록했다.
+  - 현재 Phase 1 operational UI는 `NO-GO`로 판정하고, launcher mode, 공통 shutdown/finalization, authoritative adapter를 구현 차단 조건으로 명시했다.
+  - 09 구현 계획은 recording을 포함한 이틀 구현안에서 read-only foundation MVP와 legacy handoff 중심으로 축소했다.
+- 이유:
+  - 설계 문서의 candidate 구조를 실제 `gui.py`와 혼동하지 않고, 측정·좌표·세션 저장 코어를 중복 구현하지 않기 위해서다.
+- 확인:
+  - `compileall` 통과, 핵심 좌표·측정·저장 회귀 187개 통과, 오프스크린 대표 UI 6개 통과.
+- 남은 위험:
+  - WIRIS/RTSP, ROS2/MAVLink, GNSS/RTK, video writer의 현장 종료·재연결 동작은 하드웨어 검증이 필요하다.
+
+## 2026-08-08 — Workstation UI Phase 1 shell 및 단일 backend adapter 구현
+
+- 변경:
+  - `./run.sh --ui legacy|workstation` 런처 선택을 추가하고, 기본 legacy 실행과 한 프로세스당 하나의 operational UI 계약을 유지했다.
+  - 저장소 루트 `workstation/`에 QMainWindow shell, Navigation Tree, Overview/Camera/Measurement workspace, Inspector, Diagnostics dock, global status bar, QAction command registry를 추가했다.
+  - 기존 `WirisStereoDistancePanel`을 유일한 camera/Pixhawk/GNSS/measurement/recording resource owner로 유지하는 `LegacyPanelBackend`를 추가했다. 새 UI는 측정·좌표·기록 알고리즘을 복제하지 않는다.
+  - `BackendStatusAdapter`가 CameraPane frame age, ROS2/MAVLink attitude evidence, GNSS operation state, inference stats, MeasurementAttempt/result, session spool/save worker를 `StatusModel` 하나로 투영한다.
+  - 설정 저장, 보조 worker, GNSS network/base, runtime worker, session save를 순서대로 처리하고 pending step을 재시도하는 UI-neutral `sasl_common/lifecycle.py`의 `LifecycleCoordinator`를 top-level close와 연결했다. Workstation 설정/recordings는 `workstation_data/`, Legacy는 `StereoWIRIS/`를 사용한다.
+  - `MeasurementWorkspace`와 Diagnostics에 `baseline_center_frd` 공개 결과, `forward/right/down` 축, NED/PX4 FRD/optical RDF/left-camera RDF 계약, source/clock/age를 명시했다.
+- 이유:
+  - 감사에서 확인한 launcher, shutdown, status ownership 차단 조건을 해소하면서 기존 운용 코어와 one-consumer/one-owner 계약을 보존하기 위해서다.
+- 확인:
+  - Workstation offscreen 계약 테스트 3개, 기존 대표 UI 회귀 6개, 핵심 좌표·측정·저장 회귀 187개, compileall을 통과했다.
+  - 1366×768 fake-backend shell smoke와 실제 panel offscreen construction/close를 확인했다.
+- 남은 위험:
+  - 실제 RTSP, Pixhawk ROS2/MAVLink, GNSS/RTK, video writer finalization과 장시간 close는 하드웨어/manual smoke가 필요하다.
+  - 현재 checkout의 settings가 `NETWORK_RTK_DIRECT`/`pixhawk_ethernet_mode=mavlink`를 선택해 기존 GNSS/MAVLink 테스트 일부의 기본 가정과 다르며, 별도로 보존한 사용자 Pixhawk endpoint 변경도 있다. 전체 Qt suite는 별도 worker teardown에서 종료되지 않았다. 사용자 상태는 되돌리지 않았다.
+
+Coordinate contract checked: `coordinate_contract.py`, `workstation/workspaces.py`, `workstation/status_model.py`, `measurement_attempt.py`, `rtk_geometry.py`, `recording_session.py`; world NED, PX4/body FRD, camera optical/left-camera RDF, baseline-center FRD, pixel px, app-receive/source/RTCP timestamps와 관련 회귀를 대조했다.
+
+## 2026-08-08 — Workstation Measurement 상류 증거 및 실패 전파 보강
+
+- 변경:
+  - Measurement workspace에 기존 `CameraPane.frame_changed`를 재사용하는 좌/우 영상 프록시를 추가했다.
+  - detection, RTCP/NTP synchronization, GNSS/RTK receiver와 NED baseline, recording, decoded FPS를 측정 결과와 같은 화면에 표시했다.
+  - Diagnostics를 System/Camera/Pixhawk/GNSS/Log/Measurement/Performance source-backed 탭으로 확장하고 System/Measurement 표를 `QTableView`/model 기반으로 유지했다.
+  - `LegacyPanelBackend`에서 unavailable/exception 명령을 예외로 전달해 `CommandRegistry`가 완료가 아닌 실패로 기록하도록 했고, Inspector camera Apply에는 inline 결과를 추가했다.
+  - Alignment/Calibration/Recording legacy handoff에도 현재 evidence를 표시하되 resource owner와 계산 로직은 기존 panel에 남겼다.
+- 이유:
+  - 문서의 Measurement visibility, command/state separation, diagnostics evidence, structured data component 요구사항을 충족하면서 새 UI가 카메라 queue·측정·기록·좌표 변환을 중복 소유하지 않게 하기 위해서다.
+- 확인:
+  - Workstation 계약 테스트 6개, 좌표·측정·기록 포함 대상 회귀 193개 통과.
+  - 1366×768 및 1920×1080 offscreen 측정 화면에서 upstream evidence, diagnostics dock, global status를 확인했다.
+- 남은 위험:
+  - 실제 RTSP/Pixhawk/ROS2/GNSS와 장시간 SessionSaveWorker 종료는 장비/manual smoke가 필요하다.
+
+Coordinate contract checked: `workstation/workspaces.py`, `workstation/status_model.py`, `workstation/components.py`, `coordinate_contract.py`, `rtk_geometry.py`, `measurement_attempt.py`; public `baseline_center_frd` [forward/right/down]와 upstream GPS NED [north/east/down], camera optical/left-camera RDF, app-receive/RTCP/source timestamp를 혼합하지 않았고 관련 Workstation/좌표 회귀를 실행했다.
+
 ## 2026-08-03 — GNSS Survey-in 운용 안전성 보완
 
 - `NAV-PVT` Fixed 판정을 raw u-blox carrier-solution 계약으로 분리했고, PX4 rover의 MAVLink `fix_type=6` 판정은 별도로 유지했다.

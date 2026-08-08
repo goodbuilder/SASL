@@ -16,12 +16,13 @@ mkdir -p "$MPLCONFIGDIR"
 usage() {
   cat <<'USAGE'
 Usage:
-  StereoWIRIS/run.sh [--check] [app args...]
+  StereoWIRIS/run.sh [--check] [--ui legacy|workstation] [app args...]
 
 Starts the StereoWIRIS GUI application.
 
 Options:
   --check   Verify Python and import paths without starting the GUI.
+  --ui      Select the single operational UI for this process; default is legacy.
   --help    Show this help.
 USAGE
 }
@@ -114,7 +115,10 @@ import xlsxwriter
 import yaml
 
 import sasl_common.stereo_geometry
+import sasl_common.lifecycle
 import wiris_stereo_distance.gui
+import wiris_stereo_distance.legacy_gui
+import workstation.standalone_gui
 
 print("StereoWIRIS runtime check ok")
 print(f"python={sys.executable}")

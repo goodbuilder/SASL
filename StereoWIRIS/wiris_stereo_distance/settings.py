@@ -41,10 +41,6 @@ class AppSettings:
     yolo_iou_threshold: float = 0.45
     yolo_gate_class_enabled: bool = False
     yolo_gate_class_text: str = ""
-    yolo_gate_min_bbox_enabled: bool = False
-    yolo_gate_min_width_px: int = 0
-    yolo_gate_min_height_px: int = 0
-    yolo_gate_min_area_px: int = 0
     yolo_gate_matching_enabled: bool = False
     yolo_gate_time_delta_enabled: bool = False
     yolo_gate_vertical_delta_enabled: bool = False
@@ -159,12 +155,6 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         yolo_iou_threshold=float(payload.get("yolo_iou_threshold", AppSettings.yolo_iou_threshold)),
         yolo_gate_class_enabled=bool(payload.get("yolo_gate_class_enabled", AppSettings.yolo_gate_class_enabled)),
         yolo_gate_class_text=str(payload.get("yolo_gate_class_text", AppSettings.yolo_gate_class_text)),
-        yolo_gate_min_bbox_enabled=bool(
-            payload.get("yolo_gate_min_bbox_enabled", AppSettings.yolo_gate_min_bbox_enabled)
-        ),
-        yolo_gate_min_width_px=int(payload.get("yolo_gate_min_width_px", AppSettings.yolo_gate_min_width_px)),
-        yolo_gate_min_height_px=int(payload.get("yolo_gate_min_height_px", AppSettings.yolo_gate_min_height_px)),
-        yolo_gate_min_area_px=int(payload.get("yolo_gate_min_area_px", AppSettings.yolo_gate_min_area_px)),
         yolo_gate_matching_enabled=bool(
             payload.get("yolo_gate_matching_enabled", AppSettings.yolo_gate_matching_enabled)
         ),

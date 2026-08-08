@@ -42,7 +42,6 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.camera_sync_warmup_timeout_s == 30.0
     assert settings.measurement_display_mode == "detection"
     assert settings.yolo_gate_class_enabled is False
-    assert settings.yolo_gate_min_bbox_enabled is False
     assert settings.yolo_gate_matching_enabled is False
     assert settings.yolo_gate_time_delta_enabled is False
     assert settings.yolo_gate_vertical_delta_enabled is False

@@ -17,6 +17,7 @@ cd <STEREO_WIRIS_APP>
 ./run.sh --maximized      # 최대화 실행
 ./run.sh --start          # YOLO/Depth 스트림 자동 시작
 ./run.sh --wiris-only     # WIRIS 스테레오 창만 실행
+./run.sh --ui workstation  # Workstation shell 실행; 생략하면 legacy UI
 ```
 
 문서 역할:
@@ -77,7 +78,68 @@ Useful options:
 ./run.sh --maximized
 ./run.sh --start        # auto-start YOLO/depth streams
 ./run.sh --wiris-only   # open the standalone WIRIS stereo window
+./run.sh --ui workstation  # launch the Workstation shell; default is legacy
 ```
+
+`--ui legacy`와 `--ui workstation`은 한 프로세스에서 하나의 operational UI만
+선택한다. Legacy UI 구현은 `legacy_gui.py`에 있고 기존 `gui.py`는 호환 alias로 남아 있으며,
+Workstation은
+저장소 루트의 `workstation/standalone_gui.py`/`StandalonePanelBackend` 경로를 사용한다. lifecycle은
+UI-neutral `sasl_common/lifecycle.py`를 공유하지만 panel/resource owner는 분리되어 있다. 두 UI는 서로의
+panel owner를 import하거나 instantiate하지 않는다. Workstation 복사본은 현재 공유
+measurement/camera/telemetry/calibration/recording 모듈과 저장·좌표 계약을 그대로 사용하며,
+Overview·Camera·Time/Sync·Measurement·Alignment·Calibration·Recording/Review와
+Inspector·Diagnostics를 새 shell에서 제공한다. Camera IP/RTSP/control, Pixhawk discovery/MAVLink,
+GNSS Base serial/Survey-in/NTRIP은 Workstation의 1단계 command facade에서 기존 owner를
+호출한다. Calibration capture/run/save/load/apply/validation과 calibration setup fields,
+measurement/synchronization settings, alignment source scan/baseline sampling/profile
+save/load도 owner-backed facade로 호출한다. 세션 목록·manifest 오류·CSV preview·세션/산출물
+경로 열기도 Workstation에서 제공한다. 고급 owner tools 화면에서 실시간 checkerboard
+preview/zoom, raw WIRIS SDK 명령, PX4 MAG·attitude·Shell, ROS2/MAVLink field-watch와
+baseline field browser, 세션 CSV preview·XLSX/Parquet/video artifact 열기를 직접 제공한다.
+video는 별도 Workstation decoder를 만들지 않고 시스템 연결 player로 열며, workbook 생성은
+기존 session save writer가 담당한다. 두 UI를 동시에 실행해도 서로 다른 panel/backend
+owner가 생성되며, 같은 프로세스 안에서 같은 camera queue나 Pixhawk subscriber를 이중
+소비하지 않는다. 원본과 복사본의 UI 코드는 자동 동기화되지 않으므로 기능 변경 시 두
+경로를 의도적으로 비교하고 테스트한다.
+Workstation의 Measurement 화면은 기존 `CameraPane.frame_changed` 신호를 프록시한 좌/우
+영상과 함께 측정 결과/품질, detection, RTCP/NTP 동기화, GNSS/RTK 및 NED baseline,
+recording, decoded FPS를 한 화면에서 보여준다. 화면 상단 Run control에서 Preview →
+Detection → Record → Save session 순서로 실행하며, 녹화 중 Preview 중지·카메라 매핑
+교체·세션 저장은 비활성화된다. `Current measurement quality`는 기존 panel의 ray gap,
+midpoint Range, method, attitude timing, Raw point를 복사해 표시한다. 공개 측정값은 계속
+`baseline_center_frd`의 `forward/right/down` 미터 계약을 따른다.
+`Tasks > All settings` 화면에서는 Legacy에만 남아 있던 Camera/WIRIS, YOLO/RTSP,
+PX4/ROS2, runtime flag, Clock/FTP와 전체 GNSS/RTK nested operation 설정을 편집할 수
+있다. `Apply all settings`는 기존 panel owner의 위젯/운용 설정에 반영하고,
+`Save all settings`는 Workstation 전용 `workstation_data/stereo_distance_settings.json`에,
+Legacy는 `StereoWIRIS/stereo_distance_settings.json`에 기존 schema로 저장한다. 두 JSON은
+서로 읽지 않는다. GNSS credential은 기존처럼 비밀번호 값이 아니라 환경변수 이름만
+설정하며, 좌표 입력은 WGS84이고 측정 출력/기존 저장 schema의 NED·camera RDF·FRD
+계약은 변경하지 않는다. 메인 Workstation 카드에는 반복적인 `source=`를 표시하지
+않고, 값의 provenance는 Inspector와 Diagnostics의 Source/Evidence 영역에서 확인한다.
+Inspector의 provenance는 `source=` 접두어 없이 표시하며, 내부 source 필드와 저장 계약은 유지한다.
+Alignment 화면은 PX4 roll/pitch/yaw와 PX4/GPS timestamp/age, GPS fix/satellites/eph/epv,
+명시적인 NED baseline을 표시한다. Calibration 화면은 active profile/zoom, camera matrix
+pixel metrics, stereo R/T frame contract를 표시한다. Recording/Review/Export 화면은
+session ID, elapsed/finalization/retry, sample counts, video paths와 저장 artifact를 기존
+session owner에서 읽어 표시하고, CSV는 저장된 열·`recording_time_ns`·좌표 필드를 변환 없이
+미리 본다. 저장 포맷과 AppSettings schema는 유지하되, Workstation은 `workstation_data/`, Legacy는
+`StereoWIRIS/`를 각각의 runtime data root로 사용한다.
+Detection 설정과 target bbox는 기존 AppSettings/DetectionObservation을 읽고, bbox는
+이미지 pixel `u/v`로만 표시한다.
+1366×768 화면에서는 Workstation workspace와 Inspector가 세로 스크롤을 사용해
+좌표 계약·진단·고급 handoff 내용을 잘라내지 않고 탐색한다.
+
+Workstation field sequence:
+
+1. `Devices > Cameras`: IP 탐색 → WIRIS control 확인 → RTSP 활성화 → RTSP frame 확인.
+2. `Devices > Time / Sync`: PC UTC 설정 → RTCP/NTP 확인 → still-image clock workflow.
+3. `Devices > Pixhawk`: ROS2 namespace/MAVLink 상태와 P1/P2 mapping을 확인한다.
+4. `Devices > GNSS / RTK`: Base serial, Survey-in/NTRIP, GPS fix와 NED baseline을 확인한다.
+5. `Tasks > Calibration`: setup 적용 → preview/촬영 → intrinsic → validation 순서로 수행한다.
+6. `Processing > Measurement`: Preflight evidence와 Current measurement quality를 확인한 뒤
+   Run control에서 Preview, Detection, Record를 실행하고 정지 후 Save session을 누른다.
 
 The current top-level tab order follows the field workflow:
 
@@ -243,7 +305,7 @@ Use this tab to start and monitor object distance.
 
 Use this tab to review the current recording summary, inspect Raw recorded samples, and persist data/settings. It is split into `세션 저장` and `기록 샘플`.
 
-- `세션 저장` contains `세션 파일 저장` and `전체 설정 저장`. `세션 파일 저장`, `세션 기록 중지`, camera Preview disconnect, and normal GUI shutdown finalize the active structured record under `<STEREO_WIRIS_APP>/recordings/sessions/<session_id>/` as `<session_id>_session_static.json`, `<session_id>_distance_measurements.csv/.parquet`, `<session_id>_camera_left.csv/.parquet`, `<session_id>_camera_right.csv/.parquet`, `<session_id>_px4_left.csv/.parquet`, `<session_id>_px4_right.csv/.parquet`, and `<session_id>.xlsx`. Raw camera MP4 files remain under the session's `video/` directory.
+- `세션 저장` contains `세션 파일 저장` and `전체 설정 저장`. `세션 파일 저장`, `세션 기록 중지`, camera Preview disconnect, and normal GUI shutdown finalize the active structured record under the active UI's data root: Workstation uses `workstation_data/recordings/sessions/<session_id>/`, while Legacy uses `StereoWIRIS/recordings/sessions/<session_id>/`. The artifact names remain `<session_id>_session_static.json`, `<session_id>_distance_measurements.csv/.parquet`, `<session_id>_camera_left.csv/.parquet`, `<session_id>_camera_right.csv/.parquet`, `<session_id>_px4_left.csv/.parquet`, `<session_id>_px4_right.csv/.parquet`, and `<session_id>.xlsx`. Raw camera MP4 files remain under the session's `video/` directory.
 - CSV files are compact human-check files. Parquet files carry the same resource rows with typed analysis-friendly storage. The integrated workbook remains a review file with `Summary`, `DistanceMeasurements`, `CameraLeft`, `CameraRight`, `Px4Left`, `Px4Right`, and `CalibrationStatic` sheets. Dedicated `${session_id}_px4_left.xlsx` and `${session_id}_px4_right.xlsx` workbooks split Pixhawk data into `ATTITUDE`, `GPS1`, `GPS2`, `MAG`, `GLOBAL_POSITION`, `LOCAL_POSITION_NED`, `RAW_IMU`, and `MAG_CONFIG` tabs without a Summary or SyncSnapshot tab. Session-level GNSS-relative data is written to `${session_id}_session_rtk.xlsx` in the `GPS_RTK` tab.
 - Pair, GUI-delivered camera, and PX4 callback rows are durably appended under `.spool/` while recording. The GUI table keeps only the most recent 256 pair rows, but final CSV generation reads the complete spool.
 - Final artifacts are prepared in one `.generations/<generation_id>` directory. Stable filenames resolve through the single `published` symlink; replacing that pointer is the session-level publish boundary, so readers see either the previous complete CSV generation or the new complete generation.
@@ -258,7 +320,7 @@ Use this tab to review the current recording summary, inspect Raw recorded sampl
 - Recorded YOLO values use `baseline_center_frd`: origin at the midpoint of the left optical origin and selected right-origin estimate, axes `Forward/Right/Down`, public vector `[Forward, Right, Down, Range]`. Checkerboard records the `R/T` optical-center model; Pixhawk records its GPS/RTK antenna baseline as an optical-baseline proxy without a calibrated lever arm. V2 rows use `baseline_center_*` and `raw_baseline_center_*`; they do not emit `x_m/y_m/z_m`, old `left_camera_*`, or `stereo_center_*` public aliases. `source_left_camera_rdf_*` is diagnostic provenance only. Each row records an attempt-scoped frame instance id because Pixhawk/GPS geometry can differ between measurement attempts.
 - Live stereo pairing uses `RTCP/NTP 우선` by default. If the two WIRIS RTCP clocks do not produce a pair inside `최대 Δt`, the app falls back to the common app-receive monotonic clock and labels the pair `app fallback`. This preserves live pairing while keeping the RTCP/NTP/PC-UTC result as a separate diagnostic; an `app fallback` pair must not be treated as an absolute UTC-synchronized pair.
 - The original session files do not contain `drone_*`, `ulg_*`, or target truth/error fields. A future user-selected drone ULog comparison must be emitted as a separate derived `<session_id>_ulg_comparison.csv/.xlsx` pair without modifying the original session data.
-- `전체 설정 저장` persists current runtime settings to `<STEREO_WIRIS_APP>/stereo_distance_settings.json`, including setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and 이미지-tab FTP/download fields.
+- `전체 설정 저장` persists current runtime settings to `workstation_data/stereo_distance_settings.json` in Workstation mode or `StereoWIRIS/stereo_distance_settings.json` in Legacy mode, including setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and 이미지-tab FTP/download fields.
 - Closing the GUI also saves the current settings automatically.
 
 ### 시간

@@ -42,6 +42,7 @@ firmware/PX4-Autopilot/
 Simulation/PX4-Autopilot/
 
 # Large generated experiment/runtime outputs
+workstation_data/
 Simulation/results/
 Simulation/Simulation/results/
 Simulation/reports/**

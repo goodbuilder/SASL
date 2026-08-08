@@ -931,10 +931,85 @@ def test_gnss_base_candidate_rows_apply_selected_port(monkeypatch) -> None:
     app.processEvents()
 
 
+def test_workstation_system_settings_bridge_preserves_legacy_owner_contract(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.settings import AppSettings
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(gui, "load_settings", lambda: AppSettings())
+    saved: list[AppSettings] = []
+    monkeypatch.setattr(gui, "save_settings", lambda settings: saved.append(settings))
+
+    widget = gui.WirisStereoDistancePanel()
+    operation = AppSettings().gnss_operation.to_mapping()
+    operation["operation_mode"] = "NETWORK_RTK_DIRECT"
+    operation["readiness_gate_enabled"] = False
+    operation["network"] = {
+        **operation["network"],
+        "caster_host": "caster.example",
+        "tls": True,
+        "read_timeout_s": 22.0,
+    }
+    operation["readiness"] = {
+        **operation["readiness"],
+        "maximum_baseline_std_m": 0.1234,
+    }
+    operation["fixed_base"] = {
+        **operation["fixed_base"],
+        "coordinate_profile_path": "gnss/base.json",
+    }
+    widget.apply_workstation_system_settings(
+        {
+            "interface_name": "enx-workstation",
+            "yolo_device": "cuda:0",
+            "pixhawk_ethernet_mode": "mavlink",
+            "intrinsics_path": "custom/intrinsics.json",
+            "auto_load_intrinsics": False,
+            "manual_focal_override": True,
+            "use_triangulation": False,
+            "measurement_display_mode": "preview",
+            "use_rtk_baseline": False,
+            "require_rtk_fixed": True,
+            "gnss_operation": operation,
+        }
+    )
+
+    assert widget.interface_edit.text() == "enx-workstation"
+    assert widget.device_edit.text() == "cuda:0"
+    assert widget.pixhawk_ethernet_mode_combo.currentData() == "mavlink"
+    assert widget.gnss_operation_mode_combo.currentData() == "NETWORK_RTK_DIRECT"
+    built_config = widget._build_gnss_operation_config()
+    assert built_config.network.caster_host == "caster.example"
+    assert built_config.network.tls is True
+    assert built_config.readiness_gate_enabled is False
+
+    widget._save_current_settings()
+    assert saved
+    settings = saved[-1]
+    assert settings.intrinsics_path == "custom/intrinsics.json"
+    assert settings.auto_load_intrinsics is False
+    assert settings.manual_focal_override is True
+    assert settings.use_triangulation is False
+    assert settings.measurement_display_mode == "preview"
+    assert settings.use_rtk_baseline is False
+    assert settings.require_rtk_fixed is True
+    assert settings.gnss_operation.network.tls is True
+    assert settings.gnss_operation.network.read_timeout_s == 22.0
+    assert settings.gnss_operation.fixed_base.coordinate_profile_path == "gnss/base.json"
+    assert settings.gnss_operation.fixed_base.height_type.value == "UNKNOWN"
+
+    widget.deleteLater()
+    app.processEvents()
+
+
 def test_gnss_base_survey_in_command_status_moves_past_waiting(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.settings import AppSettings
 
     class FakeWorker:
         def __init__(self) -> None:
@@ -944,6 +1019,9 @@ def test_gnss_base_survey_in_command_status_moves_past_waiting(monkeypatch) -> N
             self.sent.append((label, payload))
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    # Keep this command-path characterization test independent of the operator's
+    # machine-local JSON, which may intentionally select NETWORK_RTK_DIRECT.
+    monkeypatch.setattr(gui, "load_settings", lambda: AppSettings())
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
     worker = FakeWorker()
@@ -3769,6 +3847,7 @@ def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 
     import wiris_stereo_distance.gui as gui
+    from wiris_stereo_distance.settings import AppSettings
 
     class FakeSignal:
         def __init__(self) -> None:
@@ -3829,6 +3908,9 @@ def test_ros2_failure_starts_mavlink_recovery_and_fallback(monkeypatch) -> None:
                 self.connections.pop(camera, None)
 
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    # This transport fallback characterization uses the repository defaults,
+    # not an operator's intentionally selected pixhawk_ethernet_mode.
+    monkeypatch.setattr(gui, "load_settings", lambda: AppSettings())
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_ensure_micro_xrce_agent", lambda self: None)
     monkeypatch.setattr(
         gui,
@@ -5602,10 +5684,15 @@ def test_session_save_omits_pixhawk_mag_csv(tmp_path, monkeypatch) -> None:
         "20260605_153012_camera_right.parquet",
         "20260605_153012_distance_measurements.csv",
         "20260605_153012_distance_measurements.parquet",
+        "20260605_153012_gnss_base.csv",
+        "20260605_153012_gnss_base.parquet",
         "20260605_153012_px4_left.csv",
         "20260605_153012_px4_left.parquet",
+        "20260605_153012_px4_left.xlsx",
         "20260605_153012_px4_right.csv",
         "20260605_153012_px4_right.parquet",
+        "20260605_153012_px4_right.xlsx",
+        "20260605_153012_session_rtk.xlsx",
         "20260605_153012_session_static.json",
         "published",
         "session_manifest.json",
@@ -8253,8 +8340,11 @@ def test_yolo_gate_off_wait_status_does_not_blame_delta_t(monkeypatch) -> None:
     monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     widget = gui.WirisStereoDistancePanel()
+    assert not hasattr(widget, "yolo_gate_min_bbox_checkbox")
+    assert not hasattr(widget, "yolo_gate_min_width_spin")
+    assert not hasattr(widget, "yolo_gate_min_height_spin")
+    assert not hasattr(widget, "yolo_gate_min_area_spin")
     widget.yolo_gate_class_checkbox.setChecked(False)
-    widget.yolo_gate_min_bbox_checkbox.setChecked(False)
     widget.yolo_gate_matching_checkbox.setChecked(False)
     widget.yolo_gate_time_delta_checkbox.setChecked(False)
     widget.yolo_gate_vertical_delta_checkbox.setChecked(False)
@@ -10040,10 +10130,15 @@ def test_stop_session_writes_pair_workbook_and_device_timeline_csvs(tmp_path, mo
         f"{session_id}_camera_right.parquet",
         f"{session_id}_distance_measurements.csv",
         f"{session_id}_distance_measurements.parquet",
+        f"{session_id}_gnss_base.csv",
+        f"{session_id}_gnss_base.parquet",
         f"{session_id}_px4_left.csv",
         f"{session_id}_px4_left.parquet",
+        f"{session_id}_px4_left.xlsx",
         f"{session_id}_px4_right.csv",
         f"{session_id}_px4_right.parquet",
+        f"{session_id}_px4_right.xlsx",
+        f"{session_id}_session_rtk.xlsx",
         f"{session_id}_session_static.json",
         "published",
         "session_manifest.json",
@@ -10120,7 +10215,7 @@ def test_panel_close_is_deferred_while_session_save_is_running(monkeypatch) -> N
     monkeypatch.setattr(widget, "_save_current_settings", lambda: None)
     monkeypatch.setattr(widget, "_stop_calibration_preview_worker", lambda *_args: None)
     monkeypatch.setattr(widget, "disconnect_gnss_base_serial", lambda: None)
-    monkeypatch.setattr(widget, "stop_all", lambda: None)
+    monkeypatch.setattr(widget, "stop_all", lambda *args, **kwargs: None)
     monkeypatch.setattr(widget, "_wait_for_session_save", lambda *_args: False)
     scheduled: list[tuple[int, object]] = []
     monkeypatch.setattr(
@@ -10133,7 +10228,7 @@ def test_panel_close_is_deferred_while_session_save_is_running(monkeypatch) -> N
     widget.closeEvent(event)
 
     assert event.isAccepted() is False
-    assert scheduled and scheduled[0][0] == 500
+    assert scheduled and scheduled[0][0] == 250
     widget.deleteLater()
     _ = app
 
@@ -10203,7 +10298,7 @@ def test_live_save_worker_finishes_before_panel_close_is_accepted(tmp_path, monk
     monkeypatch.setattr(widget, "_save_current_settings", lambda: None)
     monkeypatch.setattr(widget, "_stop_calibration_preview_worker", lambda *_args: None)
     monkeypatch.setattr(widget, "disconnect_gnss_base_serial", lambda: None)
-    monkeypatch.setattr(widget, "stop_all", lambda: None)
+    monkeypatch.setattr(widget, "stop_all", lambda *args, **kwargs: None)
     event = QtGui.QCloseEvent()
 
     widget.closeEvent(event)

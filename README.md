@@ -641,16 +641,36 @@ The app tries PyQt6 first and falls back to PySide6 if PyQt6 is unavailable.
 - Time sync source changes update the Live tab sync mode.
 - Video receiver backend changes update Live status and Debug diagnostics.
 - YOLO `.pt` model selection updates Live status and Debug diagnostics, but does not run inference yet.
+- Workstation `Tasks > All settings` exposes the remaining camera/WIRIS, YOLO/RTSP, PX4/ROS2, runtime, GNSS/RTK, and Clock/FTP settings; Apply delegates to the existing owner and Save persists the same settings schema at `workstation_data/stereo_distance_settings.json`.
+- Workstation is a repository-level package in `workstation/`, alongside `StereoWIRIS`; it launches through `workstation/standalone_gui.py` and `workstation/standalone_backend.py`. The Legacy implementation remains under `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, while `gui.py` remains a compatibility alias. The two UI runtimes no longer import or instantiate each other's panel owner.
+- The standalone copy currently preserves the shared measurement, camera, telemetry, calibration, and recording modules and their coordinate/schema contracts. Lifecycle sequencing is shared only through the UI-neutral `sasl_common/lifecycle.py`; Legacy and Workstation keep separate panel/resource owners.
+- Workstation recordings, retryable spools, calibration captures, clock downloads, and alignment files live under `workstation_data/` (recordings under `workstation_data/recordings/`). Legacy continues to use `StereoWIRIS/stereo_distance_settings.json` and `StereoWIRIS/recordings/`; the two stores are not migrated or read through each other.
+- Removing unused ROS2 Pixhawk and still-image clock workflows is a later, separately verified slice.
+- Workstation field flow is ordered as `Devices > Cameras` (IP/control/RTSP readiness), `Devices > Time / Sync` (PC UTC, RTCP/NTP, still-image clock evidence), `Devices > Pixhawk`, `Devices > GNSS / RTK`, `Tasks > Calibration`, and `Processing > Measurement`.
+- Measurement Run control keeps Preview, Detection, Record, and Save session together; Current measurement quality mirrors the existing ray-gap, midpoint-range, method, attitude-timing, and Raw `baseline_center_frd` evidence.
+- While recording is `ACTIVE` or `FINALIZING`, Preview stop, camera/Pixhawk mapping swaps, and Save session are disabled so the session protocol cannot be interrupted or saved prematurely.
+- Workstation main cards keep values compact; provenance remains available in the Inspector and Diagnostics views instead of being repeated as `source=` on every card.
+- Inspector provenance remains available as a plain value without the literal `source=` prefix; the underlying status/evidence source fields are unchanged.
+- The obsolete minimum-bounding-box controls are not exposed or persisted; the remaining detection-gate controls are unchanged.
 - The UI does not synthesize telemetry. Runtime values remain empty or UNKNOWN until a backend updates the shared state.
+- Changes to the Legacy UI are not automatically propagated to the standalone Workstation copy; update and test both copies deliberately until the remaining migration is complete.
 
 ## Known Limitations and Workarounds
 
 - Real WIRIS, Pixhawk, RTSP, YOLO, stereo matching, ROS2, and calibration persistence are not connected yet.
-- Settings are not persisted to disk.
+- The standalone Workstation and Legacy GUI are source-copied runtime owners, but shared domain modules remain common dependencies; long-duration hardware validation and final removal of unused workflows are still pending.
+- Workstation settings and recordings are persisted under the ignored `workstation_data/` runtime root; Legacy settings and recordings remain under `StereoWIRIS/`.
 - If neither PyQt6 nor PySide6 is installed, the app cannot launch; install `requirements.txt` or install PySide6 manually.
 
 ## Change Log
 
+- 2026-08-09: Promoted Workstation to the repository-level `workstation/` package alongside `StereoWIRIS`; its copied owner and shared measurement/saved-coordinate contracts remain unchanged.
+- 2026-08-09: Separated Workstation runtime state into `workstation_data/`, kept Legacy storage under `StereoWIRIS/`, and moved the retryable lifecycle coordinator to neutral `sasl_common/lifecycle.py`.
+- 2026-08-09: Hid repetitive `source=` provenance labels from Workstation main cards while retaining the source field and detailed provenance in Inspector/Diagnostics.
+- 2026-08-09: Added a Workstation-wide settings surface for the remaining Legacy-only AppSettings, including nested GNSS/RTK operation settings, with owner-backed Apply/Save and no new settings store.
+- 2026-08-09: Removed the unused minimum-bounding-box setting from the StereoWIRIS settings model, JSON schema, Legacy UI, Workstation UI, and evidence projection; existing image-pixel bbox coordinates remain unchanged.
+- 2026-08-09: Reordered Workstation field actions around the experiment protocol, added the Time/Sync workspace and measurement quality/run-control surface, grouped Pixhawk/GNSS/Alignment and calibration actions, and added recording safety gates.
+- 2026-08-09: Removed the literal `source=` prefix from Inspector provenance display while retaining the underlying source metadata.
 - 2026-05-04: Removed simulated mock state, live mock refreshes, fake target overlays, mock events, mock topics, and fake calibration values; the UI now starts in a disconnected state.
 - 2026-05-04: Added Detection settings for selecting a YOLO `.pt` model path and reflecting the selected model in Live and Debug views.
 - 2026-05-04: Added the standalone Qt UI prototype package with README-specified tabs, shared models, reusable widgets, and cross-tab state wiring.
