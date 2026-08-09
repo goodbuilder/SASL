@@ -86,9 +86,9 @@ mapping/settings group.
 
 ## 14. Time / Sync Workspace
 
-The field clock sequence is visible together: set WIRIS time from the PC, run the existing
-still-image clock workflow, and check RTCP/NTP stream evidence. Camera RTC/RTCP/NTP and
-EXIF/GPS timestamps remain separate evidence sources.
+The field clock sequence is visible together: set WIRIS time from the PC and check RTCP/NTP
+stream evidence. Workstation timing evidence is limited to WIRIS RTC/STUS-GDTI and live
+RTCP/NTP frame metadata; still-image capture, FTP, and EXIF comparison remain Legacy-only.
 
 ## 15. Measurement Workspace
 
@@ -106,6 +106,9 @@ handoff placed immediately before the workflow actions.
 
 Pixhawk, GNSS/RTK, and Alignment actions use local tabs on the shared evidence workspace;
 Detection remains with Cameras, and Recording/Review remains a task workspace.
+The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
+`[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
+orientation without confusing it with camera optical RDF or public measurement output.
 
 ## 18. Density Targets
 

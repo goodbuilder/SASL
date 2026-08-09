@@ -52,9 +52,6 @@ class StandalonePanelBackend(QtCore.QObject):
     def save_session(self) -> Any:
         return self._call("save_distance_history_csv")
 
-    def toggle_pixhawk(self) -> Any:
-        return self._call("toggle_ros2_connection")
-
     def apply_camera_settings(self, left_url: str, right_url: str) -> bool:
         left_edit = getattr(self.panel, "left_url_edit", None)
         right_edit = getattr(self.panel, "right_url_edit", None)
@@ -74,6 +71,9 @@ class StandalonePanelBackend(QtCore.QObject):
     # runtime has its own independent panel and backend.
     def camera_discover_host_ip(self) -> Any:
         return self._call("discover_pc_camera_ip")
+
+    def camera_auto_connect(self) -> Any:
+        return self._call("auto_connect_wiris")
 
     def camera_check_rtsp(self) -> Any:
         return self._call("check_cameras")
@@ -95,21 +95,22 @@ class StandalonePanelBackend(QtCore.QObject):
 
         return self._call("set_selected_wiris_time_from_pc")
 
-    def time_run_photo_workflow(self) -> Any:
-        """Run the existing CPTR/ICPT/FTP/EXIF clock verification workflow."""
-
-        return self._call("capture_download_analyze_clock_photos")
-
     def time_check_sync(self) -> Any:
         """Refresh the existing RTCP/NTP synchronization evidence."""
 
         return self._call("refresh_clock_sync_status")
 
-    def pixhawk_auto_detect(self) -> Any:
-        return self._call("auto_detect_pixhawks")
-
     def pixhawk_toggle_mavlink(self) -> Any:
         return self._call("toggle_mavlink_connection")
+
+    def pixhawk_discover_usb(self) -> Any:
+        return self._call("discover_usb_pixhawk_connections")
+
+    def pixhawk_discover_mavlink_candidates(self) -> Any:
+        return self._call("discover_mavlink_url_candidates")
+
+    def pixhawk_discover_host_ip(self) -> Any:
+        return self._call("discover_pc_pixhawk_ip")
 
     def gnss_base_discover(self) -> Any:
         return self._call("discover_gnss_base_serial_ports")
@@ -207,9 +208,9 @@ class StandalonePanelBackend(QtCore.QObject):
     def alignment_swap_pixhawks(self) -> Any:
         return self._call("swap_pixhawks")
 
-    # Advanced owner tools.  These are intentionally typed entry points for
-    # Workstation; the panel remains the sole owner of TCP/MAVLink/ROS2
-    # resources, dialogs, preview workers, and session writers.
+    # Advanced owner tools. These are intentionally typed entry points for
+    # Workstation; the panel remains the sole owner of TCP/MAVLink resources,
+    # dialogs, preview workers, and session writers.
     def advanced_wiris_catalog(self) -> Any:
         return self._call("workstation_wiris_command_catalog")
 
@@ -219,23 +220,17 @@ class StandalonePanelBackend(QtCore.QObject):
     def advanced_send_zoom(self, target: str, action: str, level: int | None = None) -> Any:
         return self._call("workstation_send_zoom", target, action, level)
 
-    def advanced_discover_custom_topic_watch(self) -> Any:
-        return self._call("workstation_discover_custom_topic_watch")
-
     def advanced_discover_custom_mavlink_watch(self) -> Any:
         return self._call("workstation_discover_custom_mavlink_watch")
 
-    def advanced_add_custom_topic_watch(self, name: str, topic: str, field: str) -> Any:
-        return self._call("workstation_add_custom_topic_watch", name, topic, field)
+    def advanced_add_custom_mavlink_watch(self, name: str, message: str, field: str) -> Any:
+        return self._call("workstation_add_custom_mavlink_watch", name, message, field)
 
-    def advanced_remove_custom_topic_watch(self, key: str) -> Any:
-        return self._call("workstation_remove_custom_topic_watch", key)
+    def advanced_remove_custom_mavlink_watch(self, key: str) -> Any:
+        return self._call("workstation_remove_custom_mavlink_watch", key)
 
     def advanced_refresh_baseline_fields(self) -> Any:
         return self._call("workstation_refresh_baseline_field_browser")
-
-    def advanced_describe_baseline_fields(self, topic_type: str) -> Any:
-        return self._call("workstation_describe_baseline_fields", topic_type)
 
     def advanced_open_px4_shell(self, camera: str) -> Any:
         return self._call("workstation_open_px4_shell", camera)
@@ -266,7 +261,7 @@ class StandalonePanelBackend(QtCore.QObject):
         if tabs is None:
             return
         index_attr = {
-            "devices.cameras": "image_tab_index",
+            "devices.cameras": "setup_tab_index",
             "devices.pixhawk": "alignment_tab_index",
             "devices.gnss": "alignment_tab_index",
             "processing.alignment": "alignment_tab_index",

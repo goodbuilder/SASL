@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from wiris_stereo_distance.theme import (
+from workstation_core.theme import (
     ACCENT,
     APP_BG,
     ERROR,
@@ -115,89 +115,101 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 shortcut="Ctrl+S",
             )
         )
-        self.commands.register(
-            CommandSpec(
-                "pixhawk.toggle",
-                "Pixhawk ROS2",
-                "Connect/disconnect the existing ROS2 Pixhawk subscriber path.",
-                "device",
-                self._toggle_pixhawk,
-            )
-        )
         for command_id, text, tooltip, category, handler in (
             (
                 "camera.discover_host_ip",
-                "Discover camera IP",
+                "Discover Camera Network",
                 "Discover the camera-network host/interface through the existing owner.",
                 "camera",
                 self._camera_discover_host_ip,
             ),
             (
+                "camera.auto_connect",
+                "Auto-Connect Cameras",
+                "Discover WIRIS control candidates, verify HIWS, enable RTSP, and apply the verified camera pair.",
+                "camera",
+                self._camera_auto_connect,
+            ),
+            (
                 "camera.check_rtsp",
-                "Check RTSP",
+                "Verify Video Stream",
                 "Check RTSP ports and frame reception through the existing camera worker path.",
                 "camera",
                 self._camera_check_rtsp,
             ),
             (
                 "camera.check_control",
-                "Check WIRIS control",
+                "Verify Camera Control",
                 "Check WIRIS control ports through the existing network path.",
                 "camera",
                 self._camera_check_control,
             ),
             (
                 "camera.enable_rtsp",
-                "Enable RTSP",
+                "Enable Video Stream",
                 "Enable WIRIS RTSP using the existing control and camera owner.",
                 "camera",
                 self._camera_enable_rtsp,
             ),
             (
                 "camera.swap",
-                "Swap cameras",
+                "Swap Camera Sides",
                 "Swap the existing Left/Right camera mapping without changing coordinate contracts.",
                 "camera",
                 self._camera_swap,
             ),
             (
                 "camera.save_settings",
-                "Save camera settings",
+                "Save Camera Settings",
                 "Save the current camera settings through the existing settings owner.",
                 "camera",
                 self._camera_save_settings,
             ),
             (
-                "pixhawk.auto_detect",
-                "Auto-detect Pixhawk",
-                "Discover PX4 ROS2 namespaces through the existing Pixhawk owner.",
-                "device",
-                self._pixhawk_auto_detect,
-            ),
-            (
                 "pixhawk.toggle_mavlink",
-                "Pixhawk MAVLink",
+                "Connect Pixhawk MAVLink",
                 "Connect/disconnect the existing MAVLink Pixhawk path.",
                 "device",
                 self._pixhawk_toggle_mavlink,
             ),
             (
+                "pixhawk.discover_usb",
+                "Scan USB Pixhawks",
+                "List USB serial candidates and MAVLink heartbeat evidence without auto-assigning P1/P2.",
+                "device",
+                self._pixhawk_discover_usb,
+            ),
+            (
+                "pixhawk.discover_mavlink_candidates",
+                "Generate MAVLink Candidates",
+                "Generate Ethernet MAVLink URL candidates without changing the selected P1/P2 endpoints.",
+                "device",
+                self._pixhawk_discover_mavlink_candidates,
+            ),
+            (
+                "pixhawk.discover_host_ip",
+                "Discover Pixhawk Host IP",
+                "List local IPv4 interfaces that can be used for Pixhawk Ethernet candidates.",
+                "device",
+                self._pixhawk_discover_host_ip,
+            ),
+            (
                 "gnss.base_discover",
-                "Discover Base serial",
+                "Scan Base GNSS Ports",
                 "Discover GNSS Base serial candidates through the existing owner.",
                 "gnss",
                 self._gnss_base_discover,
             ),
             (
                 "gnss.base_connect",
-                "Connect Base serial",
+                "Connect Base GNSS",
                 "Connect the configured GNSS Base serial through the existing worker owner.",
                 "gnss",
                 self._gnss_base_connect,
             ),
             (
                 "gnss.base_disconnect",
-                "Disconnect Base serial",
+                "Disconnect Base GNSS",
                 "Stop the configured GNSS Base serial worker.",
                 "gnss",
                 self._gnss_base_disconnect,
@@ -218,14 +230,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "gnss.ntrip_start",
-                "Start NTRIP",
+                "Start NTRIP Corrections",
                 "Start the configured NTRIP operation through the existing GNSS owner.",
                 "gnss",
                 self._gnss_ntrip_start,
             ),
             (
                 "gnss.ntrip_stop",
-                "Stop NTRIP",
+                "Stop NTRIP Corrections",
                 "Stop the existing NTRIP operation and its correction path.",
                 "gnss",
                 self._gnss_ntrip_stop,
@@ -238,12 +250,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Set WIRIS time from PC",
                 "Set the selected WIRIS camera clock through the existing owner.",
                 self._time_set_pc,
-            ),
-            (
-                "time.run_photo_workflow",
-                "Run photo clock workflow",
-                "Run CPTR/ICPT, FTP download, and EXIF/GPS clock comparison through the existing owner.",
-                self._time_run_photo_workflow,
             ),
             (
                 "time.check_sync",
@@ -344,7 +350,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "alignment.scan_sources",
                 "Scan alignment sources",
-                "Refresh ROS2/MAVLink alignment source evidence through the existing owner.",
+                "Refresh MAVLink alignment source evidence through the existing owner.",
                 self._alignment_scan_sources,
             ),
             (
@@ -373,7 +379,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "alignment.swap_pixhawks",
-                "Swap Pixhawk sides",
+                "Swap P1 / P2 Roles",
                 "Swap P1/P2 mapping through the existing owner; coordinate labels remain explicit.",
                 self._alignment_swap_pixhawks,
             ),
@@ -433,16 +439,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 lambda: self._advanced_zoom("set"),
             ),
             (
-                "advanced.watch.add",
-                "Add field watch",
-                "Add a ROS2 custom field watch to the existing Pixhawk subscriber timeline.",
-                self._advanced_watch_add,
-            ),
-            (
-                "advanced.watch.discover_ros2",
-                "Discover ROS2 watch",
-                "Open the existing ROS2 topic/field browser.",
-                self._advanced_watch_discover_ros2,
+                "advanced.watch.add_mavlink",
+                "Add MAVLink watch",
+                "Add a MAVLink field watch to the existing Pixhawk telemetry timeline.",
+                self._advanced_watch_add_mavlink,
             ),
             (
                 "advanced.watch.discover_mavlink",
@@ -459,14 +459,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "advanced.baseline.scan",
                 "Scan baseline fields",
-                "Refresh ROS2/MAVLink baseline field evidence through the existing owner.",
+                "Refresh MAVLink baseline field evidence through the existing owner.",
                 self._advanced_baseline_scan,
-            ),
-            (
-                "advanced.baseline.describe",
-                "Describe baseline fields",
-                "Describe the selected ROS2 message type without changing its producer contract.",
-                self._advanced_baseline_describe,
             ),
             (
                 "advanced.px4.refresh_mag",
@@ -545,12 +539,59 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.register(
             CommandSpec(
                 "legacy.open",
-                "Advanced owner tools",
-                "Open the existing owner for low-level SDK, PX4, field-watch, calibration-preview, and media tools.",
+                "Open owner tools / candidates",
+                "Open the copied owner workflow for device candidate tables and remaining low-level tools.",
                 "view",
                 self._open_legacy,
             )
         )
+        for command_id in (
+            "camera.toggle",
+            "detection.toggle",
+            "recording.toggle",
+            "session.save",
+            "camera.discover_host_ip",
+            "camera.auto_connect",
+            "camera.check_rtsp",
+            "camera.check_control",
+            "camera.enable_rtsp",
+            "time.set_pc",
+            "time.check_sync",
+            "pixhawk.toggle_mavlink",
+            "pixhawk.discover_usb",
+            "pixhawk.discover_host_ip",
+            "gnss.base_discover",
+            "gnss.base_connect",
+            "gnss.base_disconnect",
+            "gnss.survey_start",
+            "gnss.survey_stop",
+            "gnss.ntrip_start",
+            "gnss.ntrip_stop",
+            "calibration.capture_images",
+            "calibration.run_intrinsic",
+            "calibration.load_intrinsics",
+            "calibration.run_validation",
+            "calibration.load_validation",
+            "advanced.wiris.send",
+            "advanced.zoom.in",
+            "advanced.zoom.out",
+            "advanced.zoom.stop",
+            "advanced.zoom.set",
+            "advanced.watch.discover_mavlink",
+            "advanced.px4.refresh_mag",
+            "advanced.px4.refresh_attitude",
+            "advanced.px4.shell",
+            "advanced.px4.apply_mag",
+            "advanced.px4.save_mag",
+            "advanced.px4.reboot",
+            "advanced.preview.refresh",
+            "advanced.media.refresh",
+            "advanced.media.preview",
+            "advanced.media.open_session",
+            "advanced.media.open_artifact",
+            "advanced.media.open_video",
+        ):
+            self.commands.set_deferred_completion(command_id)
 
     def _build_shell(self) -> None:
         self.navigation_dock = QtWidgets.QDockWidget("Navigation", self)
@@ -595,7 +636,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         toolbar.addAction(self.commands.action("recording.toggle"))
         toolbar.addAction(self.commands.action("session.save"))
         toolbar.addSeparator()
-        toolbar.addAction(self.commands.action("pixhawk.toggle"))
         toolbar.addAction(self.diagnostics_dock.toggleViewAction())
         self.toolbar = toolbar
 
@@ -629,7 +669,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         view_menu.addAction(self.diagnostics_dock.toggleViewAction())
         device_menu = self.menuBar().addMenu("Device")
         device_menu.addAction(self.commands.action("camera.toggle"))
-        device_menu.addAction(self.commands.action("pixhawk.toggle"))
+        device_menu.addAction(self.commands.action("camera.auto_connect"))
+        device_menu.addAction(self.commands.action("pixhawk.toggle_mavlink"))
+        device_menu.addAction(self.commands.action("pixhawk.discover_usb"))
+        device_menu.addAction(self.commands.action("pixhawk.discover_mavlink_candidates"))
         measurement_menu = self.menuBar().addMenu("Measurement")
         measurement_menu.addAction(self.commands.action("detection.toggle"))
         measurement_menu.addAction(self.commands.action("recording.toggle"))
@@ -754,7 +797,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             QGroupBox {{ border: 1px solid {PANEL_BORDER}; margin-top: 7px; padding-top: 5px; }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 7px; padding: 0 3px; color: {TEXT_MUTED}; }}
             QLabel#workspaceTitle {{ font-size: 16px; font-weight: 600; }}
-            QLabel#workspaceSubtitle, QLabel#engineeringMeta, QLabel#cameraPreviewMeta {{ color: {TEXT_MUTED}; }}
+            QLabel#workspaceSubtitle,
+            QLabel#engineeringMeta,
+            QLabel#cameraPreviewMeta,
+            QLabel#statusIndicatorDetail,
+            QLabel#statusStrip,
+            QLabel#compactContract,
+            QLabel#protocolCheck {{ color: {TEXT_MUTED}; font-size: 10px; }}
+            QLabel#engineeringMeta {{ font-size: 9px; }}
+            QLabel#protocolState {{ font-size: 11px; font-weight: 600; }}
             QLabel#engineeringValue {{ font-size: 13px; font-weight: 600; }}
             QFrame#cameraPreview {{ background: #161616; border: 1px solid #525252; }}
             QLabel#cameraPreviewTitle, QLabel#cameraPreviewMeta {{ color: #ffffff; }}
@@ -801,12 +852,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _open_legacy_context(self, context_id: str = "") -> None:
         if context_id:
             selector = getattr(self.backend, "select_owner_context", None)
+            if not callable(selector):
+                selector = getattr(self.backend, "select_legacy_context", None)
             if callable(selector):
                 selector(context_id)
         self.workspace_host.setCurrentIndex(self._workspace_indexes["legacy"])
 
     def _open_legacy(self) -> None:
-        self._select_context("tasks.advanced")
+        self._open_legacy_context(self._current_context)
 
     def _toggle_camera(self) -> object:
         return self.backend.toggle_camera()
@@ -820,11 +873,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _save_session(self) -> object:
         return self.backend.save_session()
 
-    def _toggle_pixhawk(self) -> object:
-        return self.backend.toggle_pixhawk()
-
     def _camera_discover_host_ip(self) -> object:
         return self.backend.camera_discover_host_ip()
+
+    def _camera_auto_connect(self) -> object:
+        return self.backend.camera_auto_connect()
 
     def _camera_check_rtsp(self) -> object:
         return self.backend.camera_check_rtsp()
@@ -844,17 +897,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _time_set_pc(self) -> object:
         return self.backend.time_set_pc()
 
-    def _time_run_photo_workflow(self) -> object:
-        return self.backend.time_run_photo_workflow()
-
     def _time_check_sync(self) -> object:
         return self.backend.time_check_sync()
 
-    def _pixhawk_auto_detect(self) -> object:
-        return self.backend.pixhawk_auto_detect()
-
     def _pixhawk_toggle_mavlink(self) -> object:
         return self.backend.pixhawk_toggle_mavlink()
+
+    def _pixhawk_discover_usb(self) -> object:
+        return self.backend.pixhawk_discover_usb()
+
+    def _pixhawk_discover_mavlink_candidates(self) -> object:
+        return self.backend.pixhawk_discover_mavlink_candidates()
+
+    def _pixhawk_discover_host_ip(self) -> object:
+        return self.backend.pixhawk_discover_host_ip()
 
     def _gnss_base_discover(self) -> object:
         return self.backend.gnss_base_discover()
@@ -958,17 +1014,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             level,
         )
 
-    def _advanced_watch_add(self) -> object:
-        result = self.backend.advanced_add_custom_topic_watch(
+    def _advanced_watch_add_mavlink(self) -> object:
+        result = self.backend.advanced_add_custom_mavlink_watch(
             self.advanced.watch_name_edit.text(),
-            self.advanced.watch_topic_edit.text(),
+            self.advanced.watch_message_edit.text(),
             self.advanced.watch_field_edit.text(),
         )
-        self.advanced._refresh_custom_watch_selector()
-        return result
-
-    def _advanced_watch_discover_ros2(self) -> object:
-        result = self.backend.advanced_discover_custom_topic_watch()
         self.advanced._refresh_custom_watch_selector()
         return result
 
@@ -979,19 +1030,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _advanced_watch_remove(self) -> object:
         key = str(self.advanced.watch_remove_combo.currentData() or "")
-        result = self.backend.advanced_remove_custom_topic_watch(key)
+        result = self.backend.advanced_remove_custom_mavlink_watch(key)
         self.advanced._refresh_custom_watch_selector()
         return result
 
     def _advanced_baseline_scan(self) -> object:
         result = self.backend.advanced_refresh_baseline_fields()
         self.advanced.apply_baseline_snapshot(result)
-        return result
-
-    def _advanced_baseline_describe(self) -> object:
-        topic_type = self.advanced.selected_baseline_topic_type()
-        result = self.backend.advanced_describe_baseline_fields(topic_type)
-        self.advanced.apply_baseline_field_list(result)
         return result
 
     def _advanced_px4_refresh_mag(self) -> object:
@@ -1066,12 +1111,26 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "session.save",
             not recording_locked and (has_session_data or recording_state == "RECOVERABLE"),
         )
-        self.commands.set_enabled("pixhawk.toggle", True)
         camera_state = snapshot.get("camera.left")
         self.commands.set_text("camera.toggle", "Stop preview" if camera_state and camera_state.state in {"LIVE", "STARTING"} else "Preview")
         detection = snapshot.get("detection")
         self.commands.set_text("detection.toggle", "Stop detection" if detection and detection.state in {"RUNNING", "STARTING"} else "Detection")
         self.commands.set_text("recording.toggle", "Stop recording" if recording and recording.state in {"ACTIVE", "FINALIZING"} else "Record")
+        pixhawk_states = {
+            str(snapshot.get(key).state).upper()
+            for key in ("pixhawk.left", "pixhawk.right")
+            if snapshot.get(key) is not None
+        }
+        pixhawk_connected = bool(pixhawk_states & {"LIVE", "CONNECTED", "STARTING"})
+        self.commands.set_text(
+            "pixhawk.toggle_mavlink",
+            "Disconnect Pixhawk MAVLink" if pixhawk_connected else "Connect Pixhawk MAVLink",
+        )
+        pixhawk_button = self.alignment.operation_buttons.get("pixhawk.toggle_mavlink")
+        if pixhawk_button is not None:
+            pixhawk_button.setText(
+                "Disconnect Pixhawk MAVLink" if pixhawk_connected else "Connect Pixhawk MAVLink"
+            )
 
     def _show_command_error(self, command_id: str, message: str) -> None:
         self.statusBar().showMessage(f"{command_id}: {message}", 5000)

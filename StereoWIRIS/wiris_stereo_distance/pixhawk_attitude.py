@@ -24,19 +24,52 @@ from wiris_stereo_distance.rtk_geometry import GpsPositionState, gps_state_from_
 
 from PyQt5 import QtCore
 
-try:
-    import rclpy
-    from rclpy.executors import SingleThreadedExecutor
-    from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-    from rosidl_runtime_py.utilities import get_message
-except ImportError:  # pragma: no cover - depends on sourced ROS2 environment.
-    rclpy = None
-    SingleThreadedExecutor = None
-    DurabilityPolicy = None
-    HistoryPolicy = None
-    QoSProfile = None
-    ReliabilityPolicy = None
-    get_message = None
+# ROS2 remains a Legacy-only transport.  Keep these bindings lazy so the
+# Workstation's MAVLink-only import path does not load rclpy or px4 message
+# support merely because the shared Legacy telemetry module is importable.
+rclpy = None
+SingleThreadedExecutor = None
+DurabilityPolicy = None
+HistoryPolicy = None
+QoSProfile = None
+ReliabilityPolicy = None
+get_message = None
+_ROS2_IMPORT_ERROR: Exception | None = None
+
+
+def _load_ros2_bindings() -> bool:
+    """Load ROS2 dependencies only when a Legacy ROS2 operation is requested."""
+
+    global rclpy
+    global SingleThreadedExecutor
+    global DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+    global get_message, _ROS2_IMPORT_ERROR
+
+    if rclpy is not None and SingleThreadedExecutor is not None and get_message is not None:
+        return True
+    try:
+        import rclpy as rclpy_module
+        from rclpy.executors import SingleThreadedExecutor as executor_type
+        from rclpy.qos import (
+            DurabilityPolicy as durability_policy,
+            HistoryPolicy as history_policy,
+            QoSProfile as qos_profile,
+            ReliabilityPolicy as reliability_policy,
+        )
+        from rosidl_runtime_py.utilities import get_message as get_message_type
+    except Exception as exc:  # pragma: no cover - depends on sourced ROS2 environment.
+        _ROS2_IMPORT_ERROR = exc
+        return False
+
+    rclpy = rclpy_module
+    SingleThreadedExecutor = executor_type
+    DurabilityPolicy = durability_policy
+    HistoryPolicy = history_policy
+    QoSProfile = qos_profile
+    ReliabilityPolicy = reliability_policy
+    get_message = get_message_type
+    _ROS2_IMPORT_ERROR = None
+    return True
 
 
 @dataclass(frozen=True)
@@ -363,7 +396,7 @@ def discover_ros2_topic_types(domain_id: int, *, timeout_s: float = 1.5) -> list
 
 
 def describe_ros2_message_fields(ros2_type: str) -> list[str]:
-    if get_message is None:
+    if not _load_ros2_bindings() or get_message is None:
         raise RuntimeError("rosidl_runtime_py를 사용할 수 없어 ROS2 메시지 field를 조회할 수 없습니다.")
     message_type = get_message(ros2_type)
     fields: list[str] = []
@@ -513,7 +546,7 @@ def _optional_bool(message: Any, *names: str) -> bool | None:
 
 
 def _qos_for_px4_out():
-    if QoSProfile is None:
+    if not _load_ros2_bindings() or QoSProfile is None:
         return 10
     return QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
@@ -667,7 +700,7 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         self.timer.timeout.connect(self.spin_once)
 
     def start(self) -> None:
-        if rclpy is None or SingleThreadedExecutor is None or get_message is None:
+        if not _load_ros2_bindings():
             raise RuntimeError("ROS2 Python 모듈을 사용할 수 없습니다. ROS2와 px4_msgs 환경을 먼저 source 해주세요.")
         import os
 
@@ -814,7 +847,7 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         source = str(spec.get("source", "ros2")).strip().lower()
         if source and source != "ros2":
             return
-        if self.node is None or get_message is None:
+        if self.node is None or not _load_ros2_bindings() or get_message is None:
             return
         topic = str(spec.get("topic", "")).strip()
         field_path = str(spec.get("field", "")).strip()
@@ -866,6 +899,10 @@ class DualPixhawkAttitudeSubscriber(QtCore.QObject):
         )
 
     def _optional_message_type(self, name: str, *, quiet: bool = False):
+        if not _load_ros2_bindings() or get_message is None:
+            if not quiet:
+                self.status_changed.emit(f"ROS2 메시지 타입을 로드할 수 없습니다: {name}")
+            return None
         try:
             return get_message(name)
         except Exception as exc:

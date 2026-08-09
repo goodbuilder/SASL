@@ -4,7 +4,7 @@ from typing import Callable
 
 from PyQt5 import QtCore, QtWidgets
 
-from wiris_stereo_distance.coordinate_contract import MEASUREMENT_AXIS_CONTRACT, MEASUREMENT_FRAME
+from workstation_core.coordinate_contract import MEASUREMENT_AXIS_CONTRACT, MEASUREMENT_FRAME
 
 from .components import EngineeringValue, PropertySection
 from .evidence import EvidenceAdapter
@@ -68,9 +68,9 @@ class InspectorWidget(QtWidgets.QWidget):
         contract_section.add_row("Public output", contract_value)
         root.addWidget(contract_section)
 
-        open_legacy_button = QtWidgets.QPushButton("Open advanced owner tools")
+        open_legacy_button = QtWidgets.QPushButton("Open owner tools / candidates")
         open_legacy_button.setToolTip(
-            "Open the remaining low-level SDK, PX4, field-watch, and media tools."
+            "Open the copied owner workflow for device candidate tables and remaining low-level tools."
         )
         open_legacy_button.clicked.connect(self.open_legacy)
         root.addWidget(open_legacy_button)
@@ -145,7 +145,7 @@ class InspectorWidget(QtWidgets.QWidget):
             values.update(
                 primary=f"{side.upper()} {attitude.get('state', 'WAITING')} r/p/y="
                 f"{attitude.get('roll_deg', '--')}/{attitude.get('pitch_deg', '--')}/{attitude.get('yaw_deg', '--')}°",
-                secondary=f"topic={attitude.get('topic') or '--'}; PX4 t={attitude.get('px4_timestamp_s', '--')}",
+                secondary=f"transport=MAVLink; PX4 t={attitude.get('px4_timestamp_s', '--')}",
                 timing=f"age={attitude.get('age_s', '--')}s; clock={attitude.get('clock', '--')}",
                 contract=str(attitude.get("orientation_contract", "PX4 body FRD → world NED")),
             )
@@ -155,15 +155,23 @@ class InspectorWidget(QtWidgets.QWidget):
             left = evidence.gps("left")
             right = evidence.gps("right")
             baseline = evidence.baseline()
+            p1_body_frd = (
+                f"{baseline.get('p1_body_frd_forward_m', '--')}/"
+                f"{baseline.get('p1_body_frd_right_m', '--')}/"
+                f"{baseline.get('p1_body_frd_down_m', '--')}"
+            )
             values.update(
                 primary=f"P1/P2={left.get('rtk_label', 'NO DATA')}/{right.get('rtk_label', 'NO DATA')}",
                 secondary=f"sats={left.get('satellites', '--')}/{right.get('satellites', '--')} "
                 f"eph={left.get('eph_m', '--')}/{right.get('eph_m', '--')}m",
                 timing=f"baseline age P1/P2={baseline.get('left_age_s', '--')}/{baseline.get('right_age_s', '--')}s",
-                contract=f"N/E/D={baseline.get('north_m', '--')}/{baseline.get('east_m', '--')}/{baseline.get('down_m', '--')} m",
+                contract=(
+                    f"N/E/D={baseline.get('north_m', '--')}/{baseline.get('east_m', '--')}/"
+                    f"{baseline.get('down_m', '--')} m; P1→P2 @ P1 FRD F/R/D={p1_body_frd} m"
+                ),
             )
-            frame = "GPS WGS84 receiver fields; baseline NED north/east/down"
-            source = "GpsPositionState + RtkBaselineEstimate"
+            frame = "GPS WGS84 receiver fields; raw baseline NED + derived P1 body FRD"
+            source = "GpsPositionState + RtkBaselineEstimate + BodyFrdBaselineProjection"
         elif context_id in {"processing.detection", "devices.cameras", "devices.cameras.left", "devices.cameras.right", "devices.cameras.stereo", "diagnostics.camera"}:
             config = evidence.detection_config()
             target = evidence.detection("right" if context_id.endswith("right") else "left")

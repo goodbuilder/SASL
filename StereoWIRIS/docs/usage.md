@@ -64,7 +64,11 @@ The app is designed for this operating sequence:
 
 ## Current Run Flow
 
-Launch through `run.sh` so ROS2 and the local PX4 message workspace are sourced before the GUI starts.
+For the Legacy UI, launch through `run.sh` so ROS2 and the local PX4 message workspace are
+sourced before the GUI starts. Workstation runtime behavior is MAVLink-only and the launcher
+branches before the ROS2/PX4 overlay bootstrap, so Workstation can be checked or started
+without a ROS2 installation or generated `px4_msgs` overlay. Shared ROS2 Python bindings are
+loaded lazily only when a Legacy ROS2 operation is requested.
 The launcher also tries to install `arp-scan` when it can do so without an interactive sudo password; if that is not possible, the GUI still starts and Auto Detect falls back to TCP scans.
 
 ```bash
@@ -89,13 +93,13 @@ UI-neutral `sasl_common/lifecycle.py`를 공유하지만 panel/resource owner는
 panel owner를 import하거나 instantiate하지 않는다. Workstation 복사본은 현재 공유
 measurement/camera/telemetry/calibration/recording 모듈과 저장·좌표 계약을 그대로 사용하며,
 Overview·Camera·Time/Sync·Measurement·Alignment·Calibration·Recording/Review와
-Inspector·Diagnostics를 새 shell에서 제공한다. Camera IP/RTSP/control, Pixhawk discovery/MAVLink,
+Inspector·Diagnostics를 새 shell에서 제공한다. Camera IP/RTSP/control, Pixhawk MAVLink,
 GNSS Base serial/Survey-in/NTRIP은 Workstation의 1단계 command facade에서 기존 owner를
 호출한다. Calibration capture/run/save/load/apply/validation과 calibration setup fields,
 measurement/synchronization settings, alignment source scan/baseline sampling/profile
 save/load도 owner-backed facade로 호출한다. 세션 목록·manifest 오류·CSV preview·세션/산출물
 경로 열기도 Workstation에서 제공한다. 고급 owner tools 화면에서 실시간 checkerboard
-preview/zoom, raw WIRIS SDK 명령, PX4 MAG·attitude·Shell, ROS2/MAVLink field-watch와
+preview/zoom, raw WIRIS SDK 명령, PX4 MAG·attitude·Shell, MAVLink field-watch와
 baseline field browser, 세션 CSV preview·XLSX/Parquet/video artifact 열기를 직접 제공한다.
 video는 별도 Workstation decoder를 만들지 않고 시스템 연결 player로 열며, workbook 생성은
 기존 session save writer가 담당한다. 두 UI를 동시에 실행해도 서로 다른 panel/backend
@@ -110,7 +114,7 @@ Detection → Record → Save session 순서로 실행하며, 녹화 중 Preview
 midpoint Range, method, attitude timing, Raw point를 복사해 표시한다. 공개 측정값은 계속
 `baseline_center_frd`의 `forward/right/down` 미터 계약을 따른다.
 `Tasks > All settings` 화면에서는 Legacy에만 남아 있던 Camera/WIRIS, YOLO/RTSP,
-PX4/ROS2, runtime flag, Clock/FTP와 전체 GNSS/RTK nested operation 설정을 편집할 수
+PX4/MAVLink, runtime flag와 전체 GNSS/RTK nested operation 설정을 편집할 수
 있다. `Apply all settings`는 기존 panel owner의 위젯/운용 설정에 반영하고,
 `Save all settings`는 Workstation 전용 `workstation_data/stereo_distance_settings.json`에,
 Legacy는 `StereoWIRIS/stereo_distance_settings.json`에 기존 schema로 저장한다. 두 JSON은
@@ -128,20 +132,25 @@ session owner에서 읽어 표시하고, CSV는 저장된 열·`recording_time_n
 `StereoWIRIS/`를 각각의 runtime data root로 사용한다.
 Detection 설정과 target bbox는 기존 AppSettings/DetectionObservation을 읽고, bbox는
 이미지 pixel `u/v`로만 표시한다.
+Workstation에서는 ROS2/uXRCE 연결·namespace/topic 탐색과 사진 촬영/FTP/EXIF TimeSync를
+제공하지 않는다. 이 기능들은 Legacy UI의 기존 운용 범위로 남아 있으며, Workstation은
+MAVLink Pixhawk telemetry와 PC UTC·WIRIS RTC·RTCP/NTP stream evidence만 사용한다.
 1366×768 화면에서는 Workstation workspace와 Inspector가 세로 스크롤을 사용해
 좌표 계약·진단·고급 handoff 내용을 잘라내지 않고 탐색한다.
 
 Workstation field sequence:
 
 1. `Devices > Cameras`: IP 탐색 → WIRIS control 확인 → RTSP 활성화 → RTSP frame 확인.
-2. `Devices > Time / Sync`: PC UTC 설정 → RTCP/NTP 확인 → still-image clock workflow.
-3. `Devices > Pixhawk`: ROS2 namespace/MAVLink 상태와 P1/P2 mapping을 확인한다.
+2. `Devices > Time / Sync`: PC UTC 설정 → RTCP/NTP 확인.
+3. `Devices > Pixhawk`: MAVLink 상태와 P1/P2 mapping을 확인한다.
 4. `Devices > GNSS / RTK`: Base serial, Survey-in/NTRIP, GPS fix와 NED baseline을 확인한다.
 5. `Tasks > Calibration`: setup 적용 → preview/촬영 → intrinsic → validation 순서로 수행한다.
 6. `Processing > Measurement`: Preflight evidence와 Current measurement quality를 확인한 뒤
    Run control에서 Preview, Detection, Record를 실행하고 정지 후 Save session을 누른다.
 
-The current top-level tab order follows the field workflow:
+The following tab-by-tab section documents the Legacy UI. Workstation uses the workspace
+sequence above and intentionally does not expose the Legacy ROS2 or still-image controls.
+The current Legacy top-level tab order follows the field workflow:
 
 1. `연결`
 2. `시간`
@@ -154,7 +163,7 @@ The current top-level tab order follows the field workflow:
 9. `고급`
 
 The `연결` tab contains `WIRIS` and `Pixhawk`. It keeps only the primary connection workflow.
-The `시간` tab contains WIRIS RTC setting, live RTCP/NTP stream synchronization checks, and still-image EXIF timestamp comparison.
+The Legacy `시간` tab contains WIRIS RTC setting, live RTCP/NTP stream synchronization checks, and still-image EXIF timestamp comparison.
 The `보정` tab contains a `체커보드` subtab for checkerboard capture/preview/zoom control, a `체커보드 검증/계산` subtab for file-set based calibration and random stability validation, and a `줌 내부 파라미터` subtab for per-zoom intrinsics with save/apply controls.
 The `파라미터` tab contains `내부`, `외부/기하`, and `계산 설정` subtabs so intrinsics, live geometry state, and calculation controls can be inspected separately.
 The `정렬` tab contains `센서 인식`, `소스 / 품질`, `GNSS Base`, `MAG 관리`, `Baseline 계산`, `Baseline / 자세 정렬`, and `Optical 정렬`.
@@ -314,16 +323,16 @@ Use this tab to review the current recording summary, inspect Raw recorded sampl
 - A recovered retry uses the original `.spool/session_metadata.json` as the authoritative capture provenance. Current GUI calibration, RTSP URL, timing, and configuration values do not replace it; only final row counts and finalization audit fields are added. Video paths are captured after the session paths have been prepared.
 - `<session_id>_distance_measurements.*` contains one row per matched detection pair that entered the measurement pipeline. Its primary time axis is `recording_time_ns`, defined as integer nanoseconds from `세션 기록 시작`. The compact row keeps pair id/status, class, bbox centers/confidence, distance/baseline-center result, baseline, sync delta, quality, and warning code.
 - `<session_id>_camera_left/right.*` contain one row per frame actually delivered to the GUI `frame_changed` callback while the session is active. They are GUI-delivery logs, not complete decoded-stream logs and not one-to-one MP4 frame indexes. Compact rows keep `recording_time_ns`, optional device UTC, image size, timestamp source, RTP timestamp, RTCP sender-report count, receive delay, and timing status.
-- `<session_id>_px4_left/right.*` contain one row per PX4 attitude, vehicle GPS, SensorGps, GNSS-relative, magnetometer, MAG-slot-status, or requested optional MAVLink status message received by the GUI. The only synchronization time axes in PX4 artifacts are `recording_time_ns` (always available host/session timeline) and `gps_utc_time_ns` (GPS-provided UTC generation time when GPS UTC is valid); `gps_utc_source` identifies GPS1 or GPS2. ATTITUDE rows additionally store roll/pitch/yaw rates and `time_boot_ms`. GPS rows fill explicit `gps1_*` or `gps2_*` columns, including position, fix/satellite quality, course heading, ground speed, GPS yaw, and heading accuracy. MAVLink `SCALED_IMU*` rows store magnetometer x/y/z/unit plus acceleration x/y/z, gyro x/y/z, and `time_boot_ms`. Requested `GLOBAL_POSITION_INT`, `LOCAL_POSITION_NED`, `VFR_HUD`, `SYS_STATUS`, `BATTERY_STATUS`, and `RAW_IMU` messages are stored in `mavlink_*` columns. Fields that require ROS2/uORB physical sensor identity, such as MAG device IDs/types/interfaces and selected physical sensor IDs, remain intentionally excluded. `sample_type=mag_slot_status` stores only MAVLink-readable CAL_MAG priority/rotation/enabled/selection status, UAVCAN/EKF2 parameter values, a parameter snapshot JSON, armed state, status, and warning text.
+- `<session_id>_px4_left/right.*` contain one row per PX4 attitude, vehicle GPS, SensorGps, GNSS-relative, magnetometer, MAG-slot-status, or requested optional MAVLink status message received by the GUI. The only synchronization time axes in PX4 artifacts are `recording_time_ns` (always available host/session timeline) and `gps_utc_time_ns` (GPS-provided UTC generation time when GPS UTC is valid); `gps_utc_source` identifies GPS1 or GPS2. ATTITUDE rows additionally store roll/pitch/yaw rates and `time_boot_ms`. GPS rows fill explicit `gps1_*` or `gps2_*` columns, including position, fix/satellite quality, course heading, ground speed, GPS yaw, and heading accuracy. MAVLink `SCALED_IMU*` rows store magnetometer x/y/z/unit plus acceleration x/y/z, gyro x/y/z, and `time_boot_ms`. Requested `GLOBAL_POSITION_INT`, `LOCAL_POSITION_NED`, `VFR_HUD`, `SYS_STATUS`, `BATTERY_STATUS`, and `RAW_IMU` messages are stored in `mavlink_*` columns. Workstation rows also preserve `mavlink_endpoint`, link-open/heartbeat evidence, link target system/component IDs, and received packet source system/component/sequence/message IDs when the active connection exposes them, so P1/P2 provenance can be checked without changing any value, frame, or time-axis contract. Fields that require ROS2/uORB physical sensor identity, such as MAG device IDs/types/interfaces and selected physical sensor IDs, remain intentionally excluded. `sample_type=mag_slot_status` stores only MAVLink-readable CAL_MAG priority/rotation/enabled/selection status, UAVCAN/EKF2 parameter values, a parameter snapshot JSON, armed state, status, and warning text.
 - Fixed session conditions such as schema, stream URLs, calibration/intrinsics/extrinsics, timestamp contract, video paths, and calculation mode are stored once in `<session_id>_session_static.json` instead of being repeated in every CSV row.
 - `기록 샘플` contains `매칭 프레임쌍 실시간 보기`. Selecting a row shows Raw baseline-center Forward/Right/Down/Range, source left-camera RDF diagnostics, detector pixels, P1/P2 camera/Pixhawk/GNSS geometry provenance, and timing. It does not show target NED truth, axis/range error, or a UAM alignment profile.
 - Recorded YOLO values use `baseline_center_frd`: origin at the midpoint of the left optical origin and selected right-origin estimate, axes `Forward/Right/Down`, public vector `[Forward, Right, Down, Range]`. Checkerboard records the `R/T` optical-center model; Pixhawk records its GPS/RTK antenna baseline as an optical-baseline proxy without a calibrated lever arm. V2 rows use `baseline_center_*` and `raw_baseline_center_*`; they do not emit `x_m/y_m/z_m`, old `left_camera_*`, or `stereo_center_*` public aliases. `source_left_camera_rdf_*` is diagnostic provenance only. Each row records an attempt-scoped frame instance id because Pixhawk/GPS geometry can differ between measurement attempts.
 - Live stereo pairing uses `RTCP/NTP 우선` by default. If the two WIRIS RTCP clocks do not produce a pair inside `최대 Δt`, the app falls back to the common app-receive monotonic clock and labels the pair `app fallback`. This preserves live pairing while keeping the RTCP/NTP/PC-UTC result as a separate diagnostic; an `app fallback` pair must not be treated as an absolute UTC-synchronized pair.
 - The original session files do not contain `drone_*`, `ulg_*`, or target truth/error fields. A future user-selected drone ULog comparison must be emitted as a separate derived `<session_id>_ulg_comparison.csv/.xlsx` pair without modifying the original session data.
-- `전체 설정 저장` persists current runtime settings to `workstation_data/stereo_distance_settings.json` in Workstation mode or `StereoWIRIS/stereo_distance_settings.json` in Legacy mode, including setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and 이미지-tab FTP/download fields.
+- `전체 설정 저장` persists current runtime settings to `workstation_data/stereo_distance_settings.json` in Workstation mode or `StereoWIRIS/stereo_distance_settings.json` in Legacy mode. The Legacy schema includes setup camera, WIRIS control, YOLO stream, ROS2, MAVLink, and image-tab FTP/download fields; Workstation keeps schema compatibility but exposes only its MAVLink/PC-UTC/RTCP-NTP controls.
 - Closing the GUI also saves the current settings automatically.
 
-### 시간
+### Legacy 시간
 
 Use this tab for WIRIS RTC synchronization from PC UTC and for watching the resulting stream clock offset over time. Still-image capture and EXIF comparison live in the 이미지 tab.
 
@@ -336,7 +345,7 @@ Use this tab for WIRIS RTC synchronization from PC UTC and for watching the resu
 - Verification requires the configured minimum number of fresh Sender Reports per camera (default 2), Sender Report age ≤7 s, a temporally paired left/right frame history within 1 s with receive skew within 350 ms, left/right RTCP/NTP frame timestamp Δt ≤50 ms, RTCP Sender Report-to-PC offset ≤100 ms, and NTP/RTP clock-rate drift within ±0.5%. GDTI is checked against the midpoint of its request/response interval with the camera's 1-second integer resolution (rather than against the older STUS send time); the two GDTI values must agree within 1 second. The warmup window is 30 seconds. Transit delay is retained as a diagnostic and is not confused with clock offset.
 - Timing contract: WIRIS `STUS/GDTI` is the camera body-clock check, RTP is a relative stream counter, and RTCP Sender Report NTP is a stream-derived wall-clock estimate. The app pairs frames by close PC receive time, uses RTCP/NTP delta only for the relative stereo gate, and records RTCP frame transit delay as a transport diagnostic. A stereo pair is within the relative timing criterion when its RTCP/NTP delta is at most the configured `최대 Δt` value, which defaults to 100 ms. Do not use this relative result as proof of synchronization to an external absolute UTC source.
 
-### 이미지
+### Legacy 이미지
 
 Use this tab to capture WIRIS still images over the Ethernet SDK path, download the latest FTP images, and inspect EXIF clock offset.
 The default FTP download directory is `<STEREO_WIRIS_APP>/clock_captures/`; relative paths in this tab are resolved from the StereoWIRIS app root, not from the shell's current working directory.

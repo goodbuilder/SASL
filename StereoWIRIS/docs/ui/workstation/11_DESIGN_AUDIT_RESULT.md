@@ -1,5 +1,13 @@
 # StereoWIRIS Workstation UI 설계 감사 결과
 
+Current boundary note (2026-08-09): the Workstation cleanup slice removed ROS2/uXRCE
+Pixhawk connection/discovery and still-image/EXIF TimeSync from the standalone runtime.
+MAVLink FTP remains only as an advanced PX4 Ethernet-settings owner operation, not as
+the removed still-image path.
+Older findings below may mention those paths as audit history; such paths remain Legacy-only.
+The Workstation launcher now skips ROS2/PX4 overlay bootstrap, and the shared telemetry
+module lazy-loads ROS2 Python bindings only for a Legacy ROS2 operation.
+
 - 감사일: 2026-08-08
 - 감사 브랜치: `audit/20260808-audit-prompt`
 - 감사 시작 기준 커밋: `b5f11bc`
@@ -36,7 +44,7 @@ Legacy 구현은 `legacy_gui.py`로 이동했고 `gui.py`는 기존 import와 mo
 4. **해결 조건부 — 상태/명령:** `BackendStatusAdapter`, `StatusModel`, `CommandRegistry`가 source/clock/age를 보존한다. 모든 transport/failure 상태의 현장 의미는 아직 hardware smoke가 필요하다.
 5. **유지 — 좌표 계약:** `ned`, `px4_frd`, OpenCV optical `RDF`, `left_camera_rdf`, `baseline_center_frd`, ENU 정렬 벡터를 명시 라벨로 표시하고 변환은 기존 backend에 남긴다.
 
-따라서 현재 Workstation adapter-backed slice는 **GO WITH CONDITIONS**다. 소프트웨어 acceptance와 source projection은 충족했지만 실제 RTSP/Pixhawk/ROS2/GNSS와 장시간 recording finalization을 확인하기 전에는 현장 운용 완료로 간주하지 않는다.
+따라서 현재 Workstation adapter-backed slice는 **GO WITH CONDITIONS**다. 소프트웨어 acceptance와 source projection은 충족했지만 실제 RTSP/Pixhawk MAVLink/GNSS와 장시간 recording finalization을 확인하기 전에는 현장 운용 완료로 간주하지 않는다. ROS2/uXRCE와 still-image/FTP/EXIF TimeSync는 현재 Workstation 범위가 아니라 Legacy 전용이다.
 
 ## Post-audit Implementation Evidence
 
@@ -50,7 +58,7 @@ Legacy 구현은 `legacy_gui.py`로 이동했고 `gui.py`는 기존 import와 mo
 | Workspaces | Overview/Camera/Measurement/Alignment/Calibration/Recording-Review/Advanced owner tools | PASS in offscreen smoke; source-backed tables plus operation controls are exposed |
 | Diagnostics | System/Camera/Pixhawk/GNSS/Log/Measurement/Performance plus Advanced owner tools | PASS from existing logs/status/attempt/telemetry evidence; raw SDK/PX4/MAG/field-watch, preview/zoom, and media review now use typed owner facades |
 | Coordinates/time | `coordinate_contract.py` labels and receive/source clock metadata | PASS by contract review; no geometry duplicated |
-| Regression | 203 targeted tests plus the refreshed full suite, including advanced-owner facade/UI tests | PASS for software scope; hardware/manual validation remains |
+| Regression | 58 Workstation tests plus the refreshed full suite of 672 tests, including advanced-owner and device-I/O worker tests | PASS for software scope; hardware/manual validation remains |
 
 ## Repository Baseline
 
@@ -76,12 +84,12 @@ Legacy 구현은 `legacy_gui.py`로 이동했고 `gui.py`는 기존 import와 mo
 ### 실행 증거
 
 - `python3 -m compileall -q StereoWIRIS/wiris_stereo_distance StereoWIRIS/main.py`: 통과
-- Workstation offscreen contract tests: **16 passed**; 1366×768 resize/navigation/close, source
-  projections, upstream evidence, advanced-owner controls, status transition, and command failure smoke 포함
-- 좌표·삼각측량·immutable attempt·controller·recording 회귀와 Workstation command/settings/alignment/advanced/session facade: **203 passed**
-- 문서에 지정된 기존 오프스크린 대표 PyQt 테스트와 MAVLink compatibility test: **7 passed**
-- checkerboard preview worker lazy-start 연속 Qt test: **2 passed**
-- 실제 RTSP, Pixhawk, ROS2/uXRCE, GNSS receiver/caster, video writer 하드웨어 검증: 수행하지 않음
+- Workstation offscreen/contract suite: **58 passed**; 1366×768 resize/navigation/close, source
+  projections, upstream evidence, device-candidate controls, deferred completion, worker shutdown,
+  standalone backend conformance, status transition, command failure, and device-I/O worker smoke 포함
+- 좌표·삼각측량·immutable attempt·controller·recording 회귀와 Workstation command/settings/alignment/advanced/session facade: **672 passed** in the full suite
+- Workstation device-I/O workers cover camera-network I/O, WIRIS STUS/GDTI/STIP/SDK/zoom, Pixhawk connect/USB bootstrap/stream setup/PARAM/Shell/FTP/reboot, and GNSS RTCM queue delivery.
+- 실제 RTSP, Pixhawk MAVLink, GNSS receiver/caster, video writer 하드웨어 검증: 수행하지 않음
 
 ## Architecture Findings
 
@@ -178,7 +186,6 @@ Blockers` 표를 우선한다.
 | Recording start/stop | `toggle_session_recording` → `SpoolRows`/video paths → async `SessionSaveWorker` | active spool/session metadata; final manifest/artifacts | save worker error, recoverable spool | lifecycle blocker 해결 전 금지 |
 | Save/export | `save_distance_history_csv` → `save_session_files` | published generation + manifest | XLSX/artifact failure, spool retained | backend facade로만 |
 | Calibration apply | calibration UI → `active_intrinsics`, K/D and mode refresh | applied profile/zoom/hash visible | invalid result or not applied | workflow-specific; legacy handoff |
-| Pixhawk ROS2 connect | `connect_pixhawk` → subscriber/context/QTimer → publisher/sample verify | actual sample age, not only publisher | no publisher, no sample, recovery path | telemetry adapter 필요 |
 | Pixhawk MAVLink connect | MAVLink connect → heartbeat → ATTITUDE/GPS/SCALED_IMU | open link + heartbeat + message sample | socket open without heartbeat | transport evidence 분리 |
 | GNSS/RTK operation | `start_gnss_network` / base serial → worker + `GnssOperationManager` | readiness snapshot and contract ID | NO DATA/NO FIX/FLOAT/stale/operation error | manager adapter로 제한 |
 
@@ -188,6 +195,14 @@ Blockers` 표를 우선한다.
 - **Why:** timeout이 있어도 응답이 늦거나 여러 대상이 동시에 실패하면 UI 이벤트 처리가 지연된다. Workstation toolbar에서 동일 handler를 더 쉽게 반복 호출할 수 있다.
 - **RECOMMENDED CHANGE:** 장비 command를 command worker/future로 감싸고 UI에는 pending/result signal만 전달한다. WIRIS 시간 동기화의 동시 실행·skew 계산은 보존하되 join을 presentation thread 밖으로 이동한다.
 - **Verification:** no-response, timeout, partial-left/right response, duplicate command, close-during-command를 offscreen fake transport로 검증한다.
+
+**2026-08-09 implementation status:** Workstation의 WIRIS command/zoom/time/STIP, camera-network
+queries, Pixhawk connect/stream setup/USB bootstrap/PARAM/Shell/FTP/reboot, and GNSS RTCM
+delivery now use dedicated workers or a bounded queue. MAVLink command workers reserve an
+exclusive per-camera receive slot so the Qt timer cannot consume PARAM/SERIAL_CONTROL responses.
+Fake transport tests cover partial timeout, exclusive command access, USB cleanup, shell/FTP
+ordering, and partial RTCM delivery. The historical direct paths remain only in the Legacy
+owner unless separately requested.
 
 ## Threading/Lifecycle Findings
 
@@ -297,16 +312,16 @@ Blockers` 표를 우선한다.
 | recording | `test_recording_session.py`, selected `test_stereo.py` | unit/integration-ish | fake close coordinator 추가; active writer 장시간 검증은 남음 |
 | GNSS/RTK | `test_gnss_operation.py`, `test_rtk_geometry.py`, network tests | unit/mock | real receiver/caster/Pixhawk chain 없음 |
 | camera/YOLO | `test_yolo_stream.py`, selected Qt tests | unit/component | multiprocessing stop, stale/failure aggregate status partial |
-| Pixhawk | `test_pixhawk_attitude.py`, selected triangulation | unit/mock | ROS2/MAVLink simultaneous lifecycle, close path 없음 |
+| Pixhawk | `test_pixhawk_attitude.py`, selected triangulation | unit/mock | MAVLink auxiliary lifecycle, close path 없음 |
 | settings/calibration | settings/calibration tests | unit | legacy/workstation shared preference contract 없음 |
 | launcher | `_parse_ui_mode`, `test_workstation.py` | unit/smoke | invalid mode/help and real process mode validation remains |
 | Workstation UI | `tests/test_workstation.py` + offscreen real-panel smoke | component/smoke | field hardware and full Qt teardown remain |
 
 ### 실행한 테스트
 
-- targeted regression 203개 통과: `test_workstation.py`와 `test_stereo_geometry_common.py`, `test_coordinate_contract.py`, `test_measurement_attempt.py`, `test_measurement_controller.py`, `test_triangulation.py`, `test_recording_session.py`의 좌표·측정·기록 묶음
-- Workstation 실제 panel offscreen context smoke 통과: overview/camera/detection/Pixhawk/GNSS/alignment/calibration/recording/playback/export/advanced/diagnostics 전환 및 close
-- 전체 `StereoWIRIS/tests` **627 passed**; advanced owner bridge를 포함해 새로 실행했고, session artifact-list characterization과 `stop_all(wait=True)` close test contract를 현재 owner 계약에 맞춰 정리
+- Workstation targeted regression **58개 통과**; 좌표·삼각측량·immutable attempt·controller·recording 회귀는 아래 full suite에 포함
+- Workstation standalone panel + `StandalonePanelBackend` no-device shell smoke 통과: overview/camera/detection/Pixhawk/GNSS/alignment/calibration/recording/session-review/artifacts/advanced/diagnostics 전환 및 close
+- 전체 `StereoWIRIS/tests` **672 passed**; device-candidate discovery, deferred command completion, WIRIS/Pixhawk blocking-I/O worker, Pixhawk connect/USB/stream/RTCM worker, retryable camera shutdown, standalone backend conformance를 포함해 새로 실행
 - compileall 통과
 
 ### 구현 후 판정
@@ -328,19 +343,20 @@ Blockers` 표를 우선한다.
 - model-based System/Measurement tables and command failure propagation
 - retryable lifecycle coordinator unit test
 
-상태 전이의 더 세분화된 fake worker 검증과 hardware smoke는 별도 검증으로 남긴다. 현재
+상태 전이의 하드웨어 timing 검증과 hardware smoke는 별도 검증으로 남긴다. 현재
 통과는 software shell/adapter correctness의 증거이지 현장 장비
 운용 완료의 증거가 아니다.
 
 전체 재현 명령은
-`QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS python3 -m pytest StereoWIRIS/tests -x -q`이다.
+`QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest -q StereoWIRIS/tests -x`이다.
 operator의 `NETWORK_RTK_DIRECT`/`pixhawk_ethernet_mode=mavlink` 설정에 의존하던
 `test_gnss_base_survey_in_command_status_moves_past_waiting`와
 `test_ros2_failure_starts_mavlink_recovery_and_fallback`는 테스트 안에서 repository
 default `AppSettings`를 사용하도록 격리했다. session artifact list를 현재 저장 owner의
 GNSS/workbook 산출물과 맞추고 close test의 `stop_all(wait=True)` stub을 명시한 뒤,
-`QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest StereoWIRIS/tests -q`
-가 **627 passed**로 완료됐다. preview worker lazy-start 연속 재현도 2개 통과했다.
+`QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest -q StereoWIRIS/tests -x`
+가 **672 passed**로 완료됐다. preview worker lazy-start와 새 Pixhawk device-I/O worker
+검증도 포함한다.
 
 ## Two-Day Feasibility
 
@@ -414,11 +430,11 @@ NO-GO 차단 조건을 해소한 **adapter-backed Phase 1 MVP**다. 측정·기�
 ## Remaining Unknowns
 
 - 실제 WIRIS RTSP decoder/AsyncVideoWriter가 stop request 뒤 flush를 완료하는 시간과 종료 실패 양상
-- ROS2 `rclpy` context와 MAVLink auxiliary subscriber가 동시에 실행·재연결·종료될 때의 실제 thread affinity
+- 실제 Pixhawk MAVLink subscriber가 재연결·종료될 때의 thread affinity와 heartbeat/sample 회복 시간
 - GNSS Base serial, NTRIP caster, Rover Pixhawk heartbeat/RTK Fixed가 결합된 현장 readiness와 재연결 시간
 - 1920×1080, 1600×900, 1366×768에서 새 source-backed table/path 값이 실제 운용 데이터로 채워졌을 때의 clipping/scroll/읽기성
-- 두 카메라 WIRIS command timeout/partial response가 UI event loop에 미치는 실제 지연
-- 새 Workstation Advanced owner workspace에서 tab 선택·selection event·시스템 artifact open이 worker나 recording state를 부작용 없이 유지하는지
+- 실제 장비에서 두 카메라 WIRIS/Pixhawk timeout·partial response가 UI와 장비 재연결에 미치는 지연
+- 시스템 연결 프로그램의 artifact open 결과와 장시간 recording state 영향
 
 이 항목들은 정적 감사만으로 확정할 수 없으며 hardware/manual smoke와 fake lifecycle test가 필요하다.
 
@@ -430,7 +446,7 @@ NO-GO 차단 조건을 해소한 **adapter-backed Phase 1 MVP**다. 측정·기�
 | B-02 | HIGH | top-level close가 panel cleanup을 우회하고 camera/GNSS/save 종료를 완전히 기다리지 않음 | **소프트웨어 해결 조건부** — coordinator/retry test 통과, 실장비 timeout pending |
 | B-03 | HIGH | Workstation이 사용할 authoritative status/command adapter 없음 | **해결 조건부** — `EvidenceAdapter`/`BackendStatusAdapter` 구현, field transition은 hardware pending |
 | B-04 | HIGH | measurement/recording lifecycle이 giant panel에 갇혀 있음 | **해결** — thin facade로 기존 backend 단일 owner 유지 |
-| B-05 | MEDIUM | blocking WIRIS/Pixhawk command와 multi-transport 동시성 미검증 | **잔여 조건** — Workstation 범위 밖의 현장/manual validation 필요 |
+| B-05 | MEDIUM | 실제 WIRIS/Pixhawk command timeout·partial response와 MAVLink 재연결 미검증 | **잔여 조건** — Workstation 범위 밖의 현장/manual validation 필요 |
 | B-06 | MEDIUM | Workstation shell/navigation/lifecycle/offscreen test 없음 | **해결** — `test_workstation.py`와 offscreen smoke 추가 |
 
 ## Final Recommendation
@@ -444,7 +460,7 @@ projection, recording command facade, diagnostics, and Advanced owner workspace 
 legacy parity를 주장하지 않는다.
 
 1. 실제 RTSP 두 스트림에서 frame/fps/stop 및 preview 단일 소비를 확인한다.
-2. Pixhawk ROS2/MAVLink heartbeat/sample, GNSS/RTK readiness, recording finalization을
+2. Pixhawk MAVLink heartbeat/sample, GNSS/RTK readiness, recording finalization을
    장비와 함께 확인한다.
 3. clean settings와 clean Qt teardown 조건에서 전체 `StereoWIRIS/tests`를 재실행한다.
 4. 1920×1080, 1600×900, 1366×768 화면에서 clipping/읽기성을 수동 확인한다.

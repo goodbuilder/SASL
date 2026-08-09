@@ -13,6 +13,12 @@ and Recording/Review/Export evidence. Advanced actions remain legacy-owned; the 
 shows their read-only status/profile/session projections without duplicating measurement,
 recording, calibration, or coordinate logic.
 
+Current Workstation boundary (2026-08-09): Pixhawk telemetry is MAVLink-only. ROS2/uXRCE
+connection/discovery and still-image/FTP/EXIF clock workflows are Legacy-only and are not
+part of the Workstation runtime or its operator sequence. The launcher also branches before
+the ROS2/PX4 overlay bootstrap for `--ui workstation`; ROS2 Python bindings in the shared
+telemetry module are lazy-loaded only by a Legacy ROS2 operation.
+
 ## 1. Audit Role
 
 Act as an independent senior software architect, Qt engineer, and adversarial UI reviewer. Treat design documents as hypotheses, not truth.
@@ -80,7 +86,7 @@ D/E are migration hotspots.
 Source → receiver/decoder → frame ownership → UI → FPS/state. Distinguish connection, RTSP availability, decoder state, actual frame reception, frame timestamp, FPS, preview state.
 
 ### Pixhawk
-PX4/MAVLink/ROS2 → receiver → parser/model → UI. Verify connection semantics, heartbeat, attitude, timestamps/freshness, multiple transport paths.
+PX4/MAVLink → receiver → parser/model → UI. Verify connection semantics, heartbeat, attitude, timestamps/freshness, and the single Workstation transport path; Legacy ROS2 remains outside this runtime.
 
 ### GNSS/RTK
 Receiver → fix/RTK → baseline/geometry → UI. Preserve NO DATA/NO FIX/FLOAT/FIX/stale semantics.

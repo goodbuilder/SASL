@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Any
 
 from PyQt5 import QtCore, QtWidgets
@@ -15,6 +15,7 @@ class CommandSpec:
     handler: Callable[[], Any]
     shortcut: str = ""
     checkable: bool = False
+    deferred_completion: bool = False
 
 
 class CommandRegistry(QtCore.QObject):
@@ -57,6 +58,11 @@ class CommandRegistry(QtCore.QObject):
         if action is not None:
             action.setText(str(text))
 
+    def set_deferred_completion(self, command_id: str, deferred: bool = True) -> None:
+        spec = self._specs.get(command_id)
+        if spec is not None:
+            self._specs[command_id] = replace(spec, deferred_completion=bool(deferred))
+
     def invoke(self, command_id: str) -> bool:
         spec = self._specs.get(command_id)
         if spec is None:
@@ -75,5 +81,6 @@ class CommandRegistry(QtCore.QObject):
         # runtime status remains the postcondition evidence for asynchronous
         # camera, telemetry, detection, recording, and save transitions.
         self.accepted.emit(command_id, result)
-        self.completed.emit(command_id, result)
+        if not spec.deferred_completion:
+            self.completed.emit(command_id, result)
         return True

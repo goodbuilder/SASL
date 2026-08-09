@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from wiris_stereo_distance.theme import (
+from workstation_core.theme import (
     ACCENT,
     ERROR,
     ERROR_BG,
@@ -30,6 +30,15 @@ def _level_color(level: StatusSeverity) -> tuple[str, str]:
     if level == StatusSeverity.INFO:
         return ACCENT, INFO_BG
     return TEXT_MUTED, PANEL_ALT_BG
+
+
+def _compact_status_detail(detail: object, *, limit: int = 96) -> str:
+    """Keep workspace status cards readable while the tooltip keeps full evidence."""
+
+    text = " ".join(str(detail or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
 
 
 class WorkspaceHeader(QtWidgets.QFrame):
@@ -112,7 +121,7 @@ class StatusIndicator(QtWidgets.QFrame):
         if status.age_s is not None:
             age = f" · age {status.age_s:.2f}s"
         detail = status.detail or "--"
-        self.detail.setText(detail)
+        self.detail.setText(_compact_status_detail(detail))
         self.dot.setStyleSheet(f"color: {color};")
         self.setStyleSheet(
             f"QFrame#statusIndicator {{ background: {background}; border: 1px solid {PANEL_BORDER}; }}"

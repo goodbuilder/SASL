@@ -13,6 +13,33 @@ export LD_LIBRARY_PATH="$HOME/.local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$APP_DIR/.cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
+workstation_ui_requested() {
+  local previous=""
+  local argument
+  for argument in "$@"; do
+    if [[ "$argument" == "--ui=workstation" ]]; then
+      return 0
+    fi
+    if [[ "$previous" == "--ui" && "$argument" == "workstation" ]]; then
+      return 0
+    fi
+    previous="$argument"
+  done
+  return 1
+}
+
+WORKSTATION_UI_REQUESTED=0
+if workstation_ui_requested "$@"; then
+  WORKSTATION_UI_REQUESTED=1
+fi
+CHECK_REQUESTED=0
+for argument in "$@"; do
+  if [[ "$argument" == "--check" ]]; then
+    CHECK_REQUESTED=1
+    break
+  fi
+done
+
 usage() {
   cat <<'USAGE'
 Usage:
@@ -67,14 +94,16 @@ require_canonical_px4_msgs_overlay() {
   fi
 }
 
-if ! require_canonical_px4_msgs_overlay; then
-  exit 2
-fi
+if [[ "$WORKSTATION_UI_REQUESTED" != "1" ]]; then
+  if ! require_canonical_px4_msgs_overlay; then
+    exit 2
+  fi
 
-# ROS setup scripts may reference unset variables, so do not enable nounset here.
-source /opt/ros/humble/setup.bash
-# shellcheck disable=SC1090
-source "$PX4_MSGS_OVERLAY_SETUP"
+  # ROS setup scripts may reference unset variables, so do not enable nounset here.
+  source /opt/ros/humble/setup.bash
+  # shellcheck disable=SC1090
+  source "$PX4_MSGS_OVERLAY_SETUP"
+fi
 
 resolve_python() {
   local candidate resolved
@@ -101,10 +130,32 @@ if [[ -z "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(resolve_python "$APP_DIR/.venv/bin/python" "$SASL_ROOT/Simulation/.venv/bin/python" python3 python)"
 fi
 
-case "${1:-}" in
-  --check)
+if [[ "$CHECK_REQUESTED" == "1" ]]; then
     export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
-    "$PYTHON_BIN" - <<'PY'
+    if [[ "$WORKSTATION_UI_REQUESTED" == "1" ]]; then
+      "$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import sys
+
+import cv2
+import numpy as np
+import pyarrow
+import xlsxwriter
+import yaml
+
+import sasl_common.lifecycle
+import workstation.standalone_gui
+
+print("StereoWIRIS Workstation runtime check ok")
+print(f"python={sys.executable}")
+print(f"sasl_root={Path.cwd().resolve()}")
+print(
+    f"opencv={cv2.__version__}, numpy={np.__version__}, yaml={yaml.__version__}, "
+    f"xlsxwriter={xlsxwriter.__version__}, pyarrow={pyarrow.__version__}"
+)
+PY
+    else
+      "$PYTHON_BIN" - <<'PY'
 from pathlib import Path
 import sys
 
@@ -128,9 +179,9 @@ print(
     f"xlsxwriter={xlsxwriter.__version__}, pyarrow={pyarrow.__version__}"
 )
 PY
+    fi
     exit 0
-    ;;
-esac
+fi
 
 bash "$APP_DIR/scripts/bootstrap_network_tools.sh" || true
 

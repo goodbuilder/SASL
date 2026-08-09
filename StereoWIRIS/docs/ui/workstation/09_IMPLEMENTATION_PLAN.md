@@ -2,7 +2,7 @@
 
 - Status: Implemented — GO WITH CONDITIONS for the software migration slice; hardware and long-duration finalization remain open
 - Depends on: 00–08 design documents
-- Primary constraint: preserve functionality, keep legacy UI available, and isolate the Workstation owner before removing unused workflows
+- Primary constraint: preserve functionality, keep legacy UI available, and isolate the Workstation owner while removing unused Workstation workflows
 
 Implementation gate (2026-08-08): the launcher selector, shared close coordinator, thin
 backend adapter, source-backed status model, Workstation shell, and copied standalone owner
@@ -67,7 +67,7 @@ Implemented:
 - Global Status Bar
 - source-backed System/Camera/Pixhawk/GNSS/Log/Measurement/Performance diagnostics
 - explicit Overview, Camera, and Measurement workspaces
-- explicit Time / Sync workspace for PC UTC, RTCP/NTP, and still-image clock evidence
+- explicit Time / Sync workspace for PC UTC, WIRIS RTC, and RTCP/NTP stream evidence
 - Measurement upstream evidence: left/right frame proxies, detection, synchronization,
   GNSS/RTK baseline, recording, and FPS
 - source-backed Alignment/Pixhawk/GNSS attitude, receiver, and NED baseline tables
@@ -84,7 +84,7 @@ Implemented:
 - read-only Inspector context details for PX4/GNSS/Detection/Recording/Calibration
 - phase-one direct operation commands for camera discovery/RTSP/control, Pixhawk discovery/MAVLink,
   GNSS Base serial/Survey-in/NTRIP, and calibration capture/run/save/load/apply/validation
-- Advanced owner workspace now directly exposes live checkerboard preview/zoom, raw WIRIS SDK, PX4 MAG/attitude/Shell, ROS2/MAVLink field-watch, baseline field browser, and session media/artifact review. The existing panel remains the technical resource owner; video opens through the system-associated player and workbook generation remains the existing session-save writer.
+- Advanced owner workspace now directly exposes live checkerboard preview/zoom, raw WIRIS SDK, PX4 MAG/attitude/Shell, MAVLink field-watch, baseline field browser, and session media/artifact review. The Workstation does not expose ROS2/uXRCE or still-image/FTP/EXIF clock workflows; those remain Legacy-only. The existing panel remains the technical resource owner; video opens through the system-associated player and workbook generation remains the existing session-save writer.
 
 The Inspector owns no engineering settings store: it exposes runtime evidence, existing
 camera RTSP controls, context-specific read-only details, and the public measurement contract.
@@ -118,7 +118,7 @@ and contextual commands.
 ## 11. Status Model
 
 `BackendStatusAdapter` projects only existing panel evidence into one `StatusModel`:
-CameraPane status/frame age, ROS2/MAVLink transport plus attitude samples, GNSS operation
+CameraPane status/frame age, MAVLink transport plus attitude samples, GNSS operation
 state and receiver/baseline evidence, camera RTCP/NTP synchronization state, inference
 stats, MeasurementAttempt/result fields, session spool/save state, and decoded FPS. Every
 displayed status retains source and clock metadata; command intent is not treated as
@@ -150,7 +150,7 @@ overview, basic status, and launcher/legacy preservation.
 Day 2: camera/measurement evidence reuse, recording/save command facade, diagnostics,
 offscreen smoke, 1366/1600/1920 layout checks, and regression tests.
 
-The implementation is still conditional for field operation: real RTSP, Pixhawk/ROS2/MAVLink,
+The implementation is still conditional for field operation: real RTSP, Pixhawk MAVLink,
 GNSS/RTK, video-writer finalization, and long-running close behavior require hardware/manual
 validation. Recording commands remain thin calls into the existing session owner.
 
@@ -180,7 +180,7 @@ session review slice is implemented, while hardware postconditions remain open.
 Phase 3: keep media review on the stable session manifest/evidence contract. Workstation
 previews CSVs, opens binary/XLSX/Parquet/video artifacts unchanged, and invokes the existing
 session-save writer for workbook generation; no second decoder or writer is introduced.
-Phase 4: reduce duplicated `gui.py`/`standalone_gui.py` responsibility and remove unused ROS2/still-image workflows from the standalone copy after parity tests.
+Phase 4: completed the Workstation-only removal of unused ROS2/uXRCE and still-image/FTP/EXIF workflows after parity tests; retain those workflows in Legacy until the separate Legacy retirement decision.
 Phase 5: remove legacy only after full parity and operator validation.
 
 ## 19. Phase 1 Completion

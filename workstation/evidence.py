@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from wiris_stereo_distance.coordinate_contract import (
+from workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
     BODY_FRAME,
     CAMERA_FRAME,
@@ -103,6 +103,38 @@ def _matrix_value(matrix: object, row: int, column: int) -> float | None:
         return None
 
 
+def mavlink_link_provenance(panel: object, side: str) -> dict[str, object]:
+    """Return link identity without changing any telemetry value semantics."""
+
+    subscriber = getattr(panel, "mavlink_pixhawk", None)
+    if subscriber is None:
+        return {}
+    urls = getattr(subscriber, "urls", {}) or {}
+    connections = getattr(subscriber, "connections", {}) or {}
+    connection = connections.get(side) if isinstance(connections, dict) else None
+    heartbeat_sides = getattr(subscriber, "_heartbeat_logged", set()) or set()
+
+    def optional_id(value: object) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if parsed > 0 else None
+
+    return {
+        "telemetry_transport": "MAVLink",
+        "mavlink_endpoint": str(urls.get(side, "") or "") if isinstance(urls, dict) else "",
+        "mavlink_link_open": connection is not None,
+        "mavlink_heartbeat_seen": side in heartbeat_sides,
+        "mavlink_target_system": optional_id(getattr(connection, "target_system", None)),
+        "mavlink_target_component": optional_id(getattr(connection, "target_component", None)),
+        "mavlink_identity_contract": (
+            "endpoint + target system/component identify the link; packet source system/component/sequence "
+            "are recorded when available; values retain producer frames/units"
+        ),
+    }
+
+
 class EvidenceAdapter:
     """Expose source-backed, UI-safe snapshots for one panel owner."""
 
@@ -117,7 +149,7 @@ class EvidenceAdapter:
             return Path(configured)
         # Compatibility panels created by older tests and the Legacy adapter
         # retain the original StereoWIRIS root.
-        from wiris_stereo_distance.settings import APP_ROOT
+        from workstation_core.settings import APP_ROOT
 
         return Path(APP_ROOT)
 
@@ -131,8 +163,13 @@ class EvidenceAdapter:
                 "state": "WAITING",
                 "age_s": None,
                 "frame_contract": "PX4 vehicle attitude quaternion rotates body FRD to world NED",
-                "source": "DualPixhawkAttitudeSubscriber/MAVLink extrinsic_changed",
+                "source": "MAVLink attitude telemetry",
             }
+        provenance = (
+            mavlink_link_provenance(self.panel, side)
+            if str(getattr(state, "topic", "")).startswith("mavlink/")
+            else {}
+        )
         return {
             "side": side,
             "state": "LIVE",
@@ -141,16 +178,19 @@ class EvidenceAdapter:
             "pitch_deg": _number(getattr(state, "pitch_deg", None)),
             "yaw_deg": _number(getattr(state, "yaw_deg", None)),
             "q_wxyz": tuple(getattr(state, "q", ()) or ()),
-            "namespace": str(getattr(state, "namespace", "") or ""),
-            "topic": str(getattr(state, "topic", "") or ""),
             "app_timestamp_s": _number(getattr(state, "timestamp_s", None)),
             "px4_timestamp_s": _number(getattr(state, "px4_timestamp_s", None)),
             "px4_timestamp_us": _integer(getattr(state, "px4_timestamp_us", None)),
             "px4_timestamp_sample_us": _integer(getattr(state, "px4_timestamp_sample_us", None)),
-            "source": "CameraExtrinsicState / attitude subscriber",
+            "mavlink_source_system": _integer(getattr(state, "mavlink_source_system", None)),
+            "mavlink_source_component": _integer(getattr(state, "mavlink_source_component", None)),
+            "mavlink_sequence": _integer(getattr(state, "mavlink_sequence", None)),
+            "mavlink_message_id": _integer(getattr(state, "mavlink_message_id", None)),
+            "source": "MAVLink attitude telemetry / CameraExtrinsicState",
             "clock": "app receive monotonic; PX4 timestamp when present",
             "frame_contract": "PX4 vehicle attitude quaternion rotates body FRD to world NED",
             "orientation_contract": f"orientation: {BODY_FRAME} → {WORLD_FRAME}; roll/pitch/yaw are degrees",
+            **provenance,
         }
 
     def gps(self, side: str, *, now_s: float | None = None) -> dict[str, object]:
@@ -164,6 +204,11 @@ class EvidenceAdapter:
                 "source": "GpsPositionState / GPS receiver",
                 "position_contract": "WGS84 latitude/longitude degrees; altitude metres",
             }
+        provenance = (
+            mavlink_link_provenance(self.panel, side)
+            if str(getattr(state, "topic", "")).startswith("mavlink/")
+            else {}
+        )
         fix_type = _integer(getattr(state, "fix_type", None))
         rtk_label = str(getattr(state, "rtk_label", "UNKNOWN") or "UNKNOWN")
         return {
@@ -185,21 +230,54 @@ class EvidenceAdapter:
             "px4_timestamp_us": _integer(getattr(state, "px4_timestamp_us", None)),
             "px4_timestamp_sample_us": _integer(getattr(state, "px4_timestamp_sample_us", None)),
             "gps_utc_us": _integer(getattr(state, "gps_utc_us", None)),
-            "namespace": str(getattr(state, "namespace", "") or ""),
-            "topic": str(getattr(state, "topic", "") or ""),
-            "time_source": str(getattr(state, "time_source", "") or ""),
-            "source": "GpsPositionState / GPS receiver",
+            "mavlink_source_system": _integer(getattr(state, "mavlink_source_system", None)),
+            "mavlink_source_component": _integer(getattr(state, "mavlink_source_component", None)),
+            "mavlink_sequence": _integer(getattr(state, "mavlink_sequence", None)),
+            "mavlink_message_id": _integer(getattr(state, "mavlink_message_id", None)),
+            "source": "MAVLink GPS telemetry / GpsPositionState",
             "clock": "GPS app receive monotonic; PX4/GPS source timestamps retained",
             "position_contract": "WGS84 latitude/longitude degrees; altitude metres",
+            **provenance,
         }
 
     def baseline(self) -> dict[str, object]:
         baseline = getattr(self.panel, "latest_rtk_baseline", None)
+        projection = getattr(self.panel, "latest_p1_body_frd_baseline", None)
+        projection_values: dict[str, object] = {
+            "p1_body_frd_state": "WAITING",
+            "p1_body_frd_forward_m": None,
+            "p1_body_frd_right_m": None,
+            "p1_body_frd_down_m": None,
+            "p1_body_frd_attitude_age_s": None,
+            "p1_body_frd_source": "P1 attitude-derived projection; waiting for P1 body FRD attitude",
+            "p1_body_frd_frame": BODY_FRAME,
+            "p1_body_frd_axis_contract": "P1->P2 in P1 body FRD: [Forward, Right, Down]; metres",
+        }
+        if projection is not None:
+            projection_values.update(
+                {
+                    "p1_body_frd_state": "READY",
+                    "p1_body_frd_forward_m": _number(getattr(projection, "forward_m", None)),
+                    "p1_body_frd_right_m": _number(getattr(projection, "right_m", None)),
+                    "p1_body_frd_down_m": _number(getattr(projection, "down_m", None)),
+                    "p1_body_frd_attitude_age_s": _number(getattr(projection, "attitude_age_s", None)),
+                    "p1_body_frd_source": "BodyFrdBaselineProjection from raw NED + P1 attitude",
+                    "p1_body_frd_frame": str(getattr(projection, "target_frame", BODY_FRAME)),
+                    "p1_body_frd_axis_contract": str(
+                        getattr(
+                            projection,
+                            "axis_contract",
+                            "P1->P2 in P1 body FRD: [Forward, Right, Down]; metres",
+                        )
+                    ),
+                }
+            )
         if baseline is None:
             return {
                 "state": "NO DATA",
                 "source": "RtkBaselineEstimate from left/right GpsPositionState",
                 "axis_contract": "NED = north / east / down; metres",
+                **projection_values,
             }
         return {
             "state": str(getattr(baseline, "fix_quality", "UNKNOWN") or "UNKNOWN"),
@@ -213,6 +291,7 @@ class EvidenceAdapter:
             "source": "RtkBaselineEstimate from left/right GpsPositionState",
             "axis_contract": "NED = north / east / down; metres",
             "position_frame": "GPS/RTK WGS84 delta projected to local NED; not camera or FRD",
+            **projection_values,
         }
 
     def detection(self, side: str, *, now_s: float | None = None) -> dict[str, object]:

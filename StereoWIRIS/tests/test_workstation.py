@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from PyQt5 import QtWidgets
 
 from wiris_stereo_distance.gui import _parse_ui_mode
 from workstation.backend import LegacyPanelBackend
+from workstation.command_registry import CommandRegistry, CommandSpec
 from workstation.evidence import EvidenceAdapter
 from sasl_common.lifecycle import LifecycleCoordinator, LifecycleStep
 from workstation.main_window import WorkstationMainWindow
@@ -20,6 +22,29 @@ from workstation.standalone_backend import (
     StandalonePanelBackend,
     create_standalone_backend,
 )
+
+
+def test_p1_body_frd_baseline_projection_keeps_raw_ned_contract_explicit() -> None:
+    from math import cos, radians, sin
+
+    from workstation_core.rtk_geometry import project_ned_baseline_to_p1_body_frd
+
+    identity = project_ned_baseline_to_p1_body_frd(
+        (1.0, 2.0, 3.0),
+        (1.0, 0.0, 0.0, 0.0),
+        attitude_timestamp_s=10.0,
+        attitude_age_s=0.25,
+    )
+    assert identity.vector_m == pytest.approx((1.0, 2.0, 3.0))
+    assert identity.source_frame == "ned"
+    assert identity.target_frame == "px4_frd"
+    assert identity.direction == "P1->P2"
+    assert identity.axis_contract == "P1->P2 in P1 body FRD: [Forward, Right, Down]; metres"
+    assert identity.attitude_age_s == pytest.approx(0.25)
+
+    yaw_90 = (cos(radians(90.0) / 2.0), 0.0, 0.0, sin(radians(90.0) / 2.0))
+    rotated = project_ned_baseline_to_p1_body_frd((1.0, 2.0, 3.0), yaw_90)
+    assert rotated.vector_m == pytest.approx((2.0, -1.0, 3.0))
 
 
 def test_ui_mode_parser_removes_workstation_argument() -> None:
@@ -56,6 +81,224 @@ from workstation import standalone_gui
 assert standalone_gui.__file__.endswith("/standalone_gui.py")
 assert "wiris_stereo_distance.gui" not in sys.modules
 assert "wiris_stereo_distance.legacy_gui" not in sys.modules
+assert not any(
+    name == "wiris_stereo_distance" or name.startswith("wiris_stereo_distance.")
+    for name in sys.modules
+)
+assert "rclpy" not in sys.modules
+"""
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=app_root,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_workstation_core_has_no_legacy_ros_or_image_timesync_surface() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    core_root = repo_root / "workstation_core"
+    forbidden_markers = (
+        "wiris_stereo_distance",
+        "rclpy",
+        "rosidl",
+        "ros2",
+        "ros 2",
+        "uxrce",
+        "mavros",
+        "photo_clock",
+        "cptr",
+        "icpt",
+        "exif",
+        "clock_ftp",
+        "still-image",
+        "still image",
+    )
+    for source_path in (*core_root.glob("*.py"), *(repo_root / "workstation").glob("*.py")):
+        if source_path.name == "__init__.py":
+            continue
+        source = source_path.read_text(encoding="utf-8").lower()
+        assert not any(marker in source for marker in forbidden_markers), source_path
+
+    from workstation_core.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+    from workstation_core.settings import AppSettings
+
+    assert not hasattr(DualPixhawkMavlinkSubscriber, "start_ros2_client")
+    assert not hasattr(DualPixhawkMavlinkSubscriber, "start_px4_uxrce_client_shell")
+    assert not hasattr(AppSettings, "ros_domain_id")
+    assert not hasattr(AppSettings, "mavlink_configure_uxrce_agent")
+    assert not hasattr(AppSettings, "clock_ftp_user")
+
+
+def test_legacy_ros2_and_image_timesync_surface_remains_available() -> None:
+    from wiris_stereo_distance import settings as legacy_settings
+    from wiris_stereo_distance.photo_clock import compare_photo_clocks
+    from wiris_stereo_distance.pixhawk_attitude import DualPixhawkMavlinkSubscriber
+
+    assert hasattr(legacy_settings.AppSettings, "ros_domain_id")
+    assert hasattr(legacy_settings.AppSettings, "clock_ftp_user")
+    assert hasattr(DualPixhawkMavlinkSubscriber, "start_ros2_client")
+    assert callable(compare_photo_clocks)
+
+
+def test_workstation_mavlink_packet_provenance_reaches_state_and_timeline() -> None:
+    from workstation_core.pixhawk_attitude import (
+        DualPixhawkMavlinkSubscriber,
+        _mavlink_optional_timeline_row,
+    )
+    from workstation_core.measurement_attempt import AttitudeSnapshot, GpsSnapshot
+
+    subscriber = DualPixhawkMavlinkSubscriber(left_url="", right_url="")
+    attitudes = []
+    gps_states = []
+    subscriber.extrinsic_changed.connect(lambda _camera, state: attitudes.append(state))
+    subscriber.gps_changed.connect(lambda _camera, state: gps_states.append(state))
+
+    attitude_message = SimpleNamespace(
+        get_type=lambda: "ATTITUDE",
+        get_srcSystem=lambda: 11,
+        get_srcComponent=lambda: 42,
+        get_seq=lambda: 7,
+        get_msgId=lambda: 30,
+        roll=0.1,
+        pitch=0.2,
+        yaw=0.3,
+        rollspeed=0.0,
+        pitchspeed=0.0,
+        yawspeed=0.0,
+        time_boot_ms=123,
+    )
+    subscriber._handle_mavlink_message("left", attitude_message)
+    assert len(attitudes) == 1
+    assert attitudes[0].mavlink_source_system == 11
+    assert attitudes[0].mavlink_source_component == 42
+    assert attitudes[0].mavlink_sequence == 7
+    assert attitudes[0].mavlink_message_id == 30
+    attitude_snapshot = AttitudeSnapshot.from_state(attitudes[0])
+    assert attitude_snapshot.mavlink_sequence == 7
+
+    gps_message = SimpleNamespace(
+        get_type=lambda: "GPS_RAW_INT",
+        get_srcSystem=lambda: 11,
+        get_srcComponent=lambda: 42,
+        get_seq=lambda: 8,
+        get_msgId=lambda: 24,
+        lat=370000000,
+        lon=1270000000,
+        alt=10000,
+        fix_type=6,
+        satellites_visible=18,
+        eph=50,
+        epv=60,
+        cog=9000,
+        time_usec=1_800_000_000_000_000,
+        yaw=0,
+        hdg_acc=0,
+    )
+    subscriber._handle_mavlink_message("left", gps_message)
+    assert len(gps_states) == 1
+    assert gps_states[0].mavlink_source_system == 11
+    assert gps_states[0].mavlink_source_component == 42
+    assert gps_states[0].mavlink_sequence == 8
+    assert gps_states[0].mavlink_message_id == 24
+    gps_snapshot = GpsSnapshot.from_state(gps_states[0])
+    assert gps_snapshot.mavlink_sequence == 8
+
+    timeline_row = _mavlink_optional_timeline_row(
+        "GLOBAL_POSITION_INT",
+        SimpleNamespace(
+            get_srcSystem=lambda: 11,
+            get_srcComponent=lambda: 42,
+            get_seq=lambda: 9,
+            get_msgId=lambda: 33,
+            lat=370000000,
+            lon=1270000000,
+            alt=10000,
+            relative_alt=9000,
+            vx=1,
+            vy=2,
+            vz=3,
+            hdg=9000,
+            time_boot_ms=123,
+        ),
+        10.0,
+    )
+    assert timeline_row is not None
+    assert timeline_row["mavlink_source_system"] == 11
+    assert timeline_row["mavlink_source_component"] == 42
+    assert timeline_row["mavlink_sequence"] == 9
+    assert timeline_row["mavlink_message_id"] == 33
+
+
+def test_experiment_protocol_readiness_is_advisory_and_mode_specific() -> None:
+    from workstation.protocol import evaluate_recording_protocol
+
+    snapshot = {
+        key: SimpleNamespace(state="LIVE" if key.startswith(("camera.", "pixhawk.")) else state)
+        for key, state in (
+            ("camera.left", "LIVE"),
+            ("camera.right", "LIVE"),
+            ("synchronization", "SYNCED"),
+            ("detection", "RUNNING"),
+            ("pixhawk.left", "LIVE"),
+            ("pixhawk.right", "LIVE"),
+        )
+    }
+    calibration = {
+        "active": True,
+        "left": {"state": "AVAILABLE"},
+        "right": {"state": "AVAILABLE"},
+        "extrinsics": {"state": "AVAILABLE"},
+    }
+    baseline = {"state": "GOOD", "length_m": 1.2}
+
+    pixhawk_ready = evaluate_recording_protocol(
+        snapshot,
+        distance_mode="pixhawk",
+        calibration=calibration,
+        baseline=baseline,
+        require_rtk_fixed=True,
+    )
+    assert pixhawk_ready.state == "READY"
+    assert not pixhawk_ready.blocking
+
+    checkerboard_ready = evaluate_recording_protocol(
+        snapshot,
+        distance_mode="checkerboard",
+        calibration=calibration,
+        baseline={"state": "NO DATA", "length_m": None},
+        require_rtk_fixed=True,
+    )
+    assert checkerboard_ready.state == "READY"
+
+    snapshot["synchronization"] = SimpleNamespace(state="UNVERIFIED")
+    blocked = evaluate_recording_protocol(
+        snapshot,
+        distance_mode="pixhawk",
+        calibration=calibration,
+        baseline=baseline,
+        require_rtk_fixed=True,
+    )
+    assert blocked.state == "BLOCKED"
+    assert {check.key for check in blocked.blocking} == {"synchronization"}
+
+
+def test_workstation_entrypoint_does_not_add_ros_runtime_paths() -> None:
+    app_root = Path(__file__).resolve().parents[1]
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(app_root)
+    environment["SASL_ROS_LIBRARY_PATH_READY"] = "1"
+    script = """
+import sys
+
+sys.argv = ["main.py", "--ui", "workstation"]
+import main
+
+assert main.WORKSTATION_REQUESTED is True
+assert not any("/opt/ros/" in path for path in sys.path)
+assert not any("workspace/main/install" in path for path in sys.path)
 """
     subprocess.run(
         [sys.executable, "-c", script],
@@ -181,6 +424,13 @@ def test_standalone_backend_is_a_separate_copy_and_factory_owner(monkeypatch: py
     app.processEvents()
 
 
+def test_legacy_and_standalone_backend_facades_share_a_checked_contract() -> None:
+    from workstation.protocol import missing_backend_facades
+
+    assert missing_backend_facades(LegacyPanelBackend) == ()
+    assert missing_backend_facades(StandalonePanelBackend) == ()
+
+
 def test_lifecycle_coordinator_resumes_after_pending_step() -> None:
     calls: list[str] = []
     pending = {"value": True}
@@ -248,15 +498,15 @@ class _FakeBackend:
     def save_session(self) -> None:
         self.calls.append("save")
 
-    def toggle_pixhawk(self) -> None:
-        self.calls.append("pixhawk")
-
     def apply_camera_settings(self, left: str, right: str) -> bool:
         self.calls.append(("settings", left, right))
         return True
 
     def camera_discover_host_ip(self) -> None:
         self.calls.append("camera_discover_host_ip")
+
+    def camera_auto_connect(self) -> None:
+        self.calls.append("camera_auto_connect")
 
     def camera_check_rtsp(self) -> None:
         self.calls.append("camera_check_rtsp")
@@ -276,17 +526,20 @@ class _FakeBackend:
     def time_set_pc(self) -> None:
         self.calls.append("time_set_pc")
 
-    def time_run_photo_workflow(self) -> None:
-        self.calls.append("time_run_photo_workflow")
-
     def time_check_sync(self) -> None:
         self.calls.append("time_check_sync")
 
-    def pixhawk_auto_detect(self) -> None:
-        self.calls.append("pixhawk_auto_detect")
-
     def pixhawk_toggle_mavlink(self) -> None:
         self.calls.append("pixhawk_toggle_mavlink")
+
+    def pixhawk_discover_usb(self) -> None:
+        self.calls.append("pixhawk_discover_usb")
+
+    def pixhawk_discover_mavlink_candidates(self) -> None:
+        self.calls.append("pixhawk_discover_mavlink_candidates")
+
+    def pixhawk_discover_host_ip(self) -> None:
+        self.calls.append("pixhawk_discover_host_ip")
 
     def gnss_base_discover(self) -> None:
         self.calls.append("gnss_base_discover")
@@ -400,30 +653,22 @@ class _FakeBackend:
     def advanced_send_zoom(self, target: str, action: str, level: int | None = None) -> None:
         self.calls.append(("advanced_zoom", target, action, level))
 
-    def advanced_discover_custom_topic_watch(self) -> None:
-        self.calls.append("advanced_watch_discover_ros2")
-
     def advanced_discover_custom_mavlink_watch(self) -> None:
         self.calls.append("advanced_watch_discover_mavlink")
 
-    def advanced_add_custom_topic_watch(self, name: str, topic: str, field: str) -> str:
-        self.calls.append(("advanced_watch_add", name, topic, field))
-        return name or f"{topic}.{field}"
+    def advanced_add_custom_mavlink_watch(self, name: str, message: str, field: str) -> str:
+        self.calls.append(("advanced_watch_add_mavlink", name, message, field))
+        return name or f"mavlink:{message}.{field}"
 
-    def advanced_remove_custom_topic_watch(self, key: str) -> None:
+    def advanced_remove_custom_mavlink_watch(self, key: str) -> None:
         self.calls.append(("advanced_watch_remove", key))
 
     def advanced_refresh_baseline_fields(self) -> dict[str, object]:
         self.calls.append("advanced_baseline_scan")
         return {
-            "ros2_topics": (("yes", "/fmu/out/vehicle_gps_position", "px4_msgs/msg/SensorGps"),),
             "mavlink_messages": (("GPS_RAW_INT", "lat, lon, alt"),),
             "axis_contract": "producer fields preserved",
         }
-
-    def advanced_describe_baseline_fields(self, topic_type: str) -> tuple[str, ...]:
-        self.calls.append(("advanced_baseline_describe", topic_type))
-        return ("lat", "lon", "alt")
 
     def advanced_open_px4_shell(self, camera: str) -> None:
         self.calls.append(("advanced_px4_shell", camera))
@@ -484,10 +729,10 @@ def test_workstation_shell_navigation_and_close() -> None:
             "camera.check_rtsp",
         )
     ] == [
-        "Discover camera IP",
-        "Check WIRIS control",
-        "Enable RTSP",
-        "Check RTSP",
+        "Discover Camera Network",
+        "Verify Camera Control",
+        "Enable Video Stream",
+        "Verify Video Stream",
     ]
 
     window.navigation.select_context("devices.time")
@@ -559,6 +804,22 @@ def test_workstation_shell_navigation_and_close() -> None:
     assert window.workspace_host.currentWidget().widget() is window.alignment
     assert window.alignment.operation_tabs.currentIndex() == 1
     assert any(indicator.label.text() == "GNSS / RTK" for indicator in window.alignment.indicators.values())
+    assert [
+        window.alignment.operation_buttons[key].text()
+        for key in (
+            "gnss.base_discover",
+            "gnss.base_connect",
+            "gnss.base_disconnect",
+            "gnss.ntrip_start",
+            "gnss.ntrip_stop",
+        )
+    ] == [
+        "Scan Base GNSS Ports",
+        "Connect Base GNSS",
+        "Disconnect Base GNSS",
+        "Start NTRIP Corrections",
+        "Stop NTRIP Corrections",
+    ]
 
     window.navigation.select_context("processing.alignment")
     app.processEvents()
@@ -620,6 +881,659 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     app.processEvents()
 
 
+def test_workstation_exposes_device_candidate_discovery_and_owner_route() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    assert window.camera.operation_buttons["camera.auto_connect"].text() == "Auto-Connect Cameras"
+    assert window.camera.operation_buttons["legacy.open"].text() == "Open Device Candidate Tools"
+    for command_id in (
+        "camera.auto_connect",
+        "pixhawk.discover_usb",
+        "pixhawk.discover_mavlink_candidates",
+        "pixhawk.discover_host_ip",
+    ):
+        assert window.commands.invoke(command_id) is True
+
+    assert backend.calls[-4:] == [
+        "camera_auto_connect",
+        "pixhawk_discover_usb",
+        "pixhawk_discover_mavlink_candidates",
+        "pixhawk_discover_host_ip",
+    ]
+    assert window.commands.invoke("legacy.open") is True
+    assert window.workspace_host.currentWidget().widget() is window.legacy_page
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_shell_smoke_uses_standalone_backend_without_devices() -> None:
+    from workstation_core.settings import AppSettings
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    source = _FakeBackend()
+    panel = QtWidgets.QWidget()
+    panel.__dict__.update(source.panel.__dict__)
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def record(name: str):
+        def handler(*args: object, **_kwargs: object) -> None:
+            calls.append((name, args))
+
+        return handler
+
+    for method_name in (
+        "toggle_camera_connection",
+        "toggle_yolo_detection",
+        "toggle_session_recording",
+        "save_distance_history_csv",
+        "auto_connect_wiris",
+        "discover_usb_pixhawk_connections",
+        "discover_mavlink_url_candidates",
+        "discover_pc_pixhawk_ip",
+        "save_current_settings_from_ui",
+        "apply_workstation_measurement_settings",
+    ):
+        setattr(panel, method_name, record(method_name))
+    panel.workstation_settings_snapshot = lambda: {
+        **dict(AppSettings().__dict__),
+        "gnss_operation": AppSettings().gnss_operation.to_mapping(),
+    }
+    panel.workstation_wiris_command_catalog = lambda: (
+        {"category": "Basic", "label": "Check", "command": "HIWS", "terminator": "\n"},
+    )
+    panel.shutdown_for_close = lambda: True
+
+    backend = StandalonePanelBackend(panel)
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    assert window.legacy_page.findChild(QtWidgets.QWidget) is not None
+    assert window.commands.invoke("camera.auto_connect") is True
+    assert window.commands.invoke("pixhawk.discover_usb") is True
+    assert window.commands.invoke("settings.save") is True
+    assert [name for name, _args in calls] == [
+        "auto_connect_wiris",
+        "discover_usb_pixhawk_connections",
+        "save_current_settings_from_ui",
+    ]
+
+    window.navigation.select_context("tasks.playback")
+    app.processEvents()
+    assert window.advanced.tabs.tabText(3) == "Session Review / Artifacts"
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_command_registry_distinguishes_deferred_completion() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    registry = CommandRegistry()
+    events: list[tuple[str, str]] = []
+    registry.accepted.connect(lambda command_id, _result: events.append(("accepted", command_id)))
+    registry.completed.connect(lambda command_id, _result: events.append(("completed", command_id)))
+    registry.register(CommandSpec("sync", "Sync", "", "test", lambda: "done"))
+    registry.register(CommandSpec("async", "Async", "", "test", lambda: None))
+    registry.set_deferred_completion("async")
+
+    assert registry.invoke("sync") is True
+    assert registry.invoke("async") is True
+    assert events == [
+        ("accepted", "sync"),
+        ("completed", "sync"),
+        ("accepted", "async"),
+    ]
+    registry.deleteLater()
+    app.processEvents()
+
+
+def test_wiris_control_probe_worker_keeps_socket_checks_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    calls: list[tuple[str, int, float]] = []
+
+    def fake_check(host: str, port: int, *, timeout: float) -> bool:
+        calls.append((host, port, timeout))
+        return host == "10.0.0.11"
+
+    monkeypatch.setattr(standalone_gui, "check_tcp_port", fake_check)
+    results: list[object] = []
+    worker = standalone_gui.WirisControlCheckWorker(
+        (("left", "10.0.0.11", 5000), ("right", "", 5001)),
+        timeout_s=2.5,
+    )
+    worker.checked.connect(results.append)
+    worker.run()
+
+    assert calls == [("10.0.0.11", 5000, 2.5)]
+    assert results == [[
+        {"label": "left", "host": "10.0.0.11", "port": 5000, "state": "control-open"},
+        {"label": "right", "host": "", "port": 5001, "state": "missing-host"},
+    ]]
+
+
+def test_wiris_command_and_zoom_workers_keep_tcp_io_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    sent: list[str] = []
+
+    def fake_send(command) -> str:
+        sent.append(str(command.command))
+        return "OK"
+
+    monkeypatch.setattr(standalone_gui, "send_tcp_line", fake_send)
+    command_results: list[object] = []
+    command_worker = standalone_gui.WirisCommandWorker(
+        (("left", "10.0.0.11", 5000, 1.0),),
+        command_text="HIWS",
+        terminator="\n",
+    )
+    command_worker.completed.connect(command_results.append)
+    command_worker.run()
+
+    zoom_results: list[object] = []
+    zoom_worker = standalone_gui.WirisZoomWorker(
+        (("right", "10.0.0.12", 5001),),
+        template="SZIN",
+        level=None,
+        timeout_s=1.0,
+    )
+    zoom_worker.completed.connect(zoom_results.append)
+    zoom_worker.run()
+
+    assert sent == ["HIWS", "SZIN"]
+    assert command_results[0]["statuses"] == {"left": "OK"}
+    assert zoom_results == [[{"label": "right", "state": "sent", "command": "SZIN", "response": "OK"}]]
+
+
+def test_pixhawk_usb_discovery_worker_keeps_serial_probe_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui, "usb_mavlink_device_candidates", lambda: ["/dev/ttyACM0"])
+    monkeypatch.setattr(
+        standalone_gui,
+        "probe_usb_mavlink_devices",
+        lambda *, candidates, timeout_s: [(candidates[0], 115200)],
+    )
+    results: list[object] = []
+    worker = standalone_gui.PixhawkUsbDiscoveryWorker(timeout_s=0.8)
+    worker.discovered.connect(results.append)
+    worker.run()
+
+    assert results == [{"candidates": ["/dev/ttyACM0"], "found": [("/dev/ttyACM0", 115200)]}]
+
+
+def test_camera_network_discovery_worker_keeps_nm_queries_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    interface = SimpleNamespace(name="enx-camera", address="10.0.0.1/24")
+    candidate = SimpleNamespace(interface=interface, neighbor_hosts=("10.0.0.11",))
+    monkeypatch.setattr(
+        standalone_gui,
+        "discover_host_interface_candidates",
+        lambda **_kwargs: [candidate],
+    )
+    monkeypatch.setattr(
+        standalone_gui,
+        "resolve_nm_interface_address",
+        lambda _name, _hints: "10.0.0.1/24",
+    )
+    monkeypatch.setattr(standalone_gui, "nm_device_connection_name", lambda _name: "camera-profile")
+    monkeypatch.setattr(standalone_gui, "nm_connection_ipv4_addresses", lambda _name: ("10.0.0.1/24",))
+
+    results: list[object] = []
+    worker = standalone_gui.CameraNetworkDiscoveryWorker(
+        host_address="10.0.0.1/24",
+        host_hints=("10.0.0.11",),
+    )
+    worker.discovered.connect(results.append)
+    worker.run()
+
+    assert results[0]["candidates"] == (candidate,)
+    assert results[0]["resolved_address"] == "10.0.0.1/24"
+    assert results[0]["connection_name"] == "camera-profile"
+
+
+def test_wiris_clock_worker_keeps_stus_and_gdti_io_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    sent: list[str] = []
+
+    def fake_send(command) -> str:
+        sent.append(str(command.command))
+        return "OK" if command.command.startswith("STUS ") else "2026/08/09 12:00:00"
+
+    monkeypatch.setattr(standalone_gui, "send_tcp_line", fake_send)
+    target_infos = (
+        ("left", "10.0.0.11", 5000, 1.0),
+        ("right", "10.0.0.12", 5001, 1.0),
+    )
+    stus_results: list[object] = []
+    stus_worker = standalone_gui.WirisClockCommandWorker(
+        target_infos,
+        command_text="STUS",
+        shared_utc=True,
+    )
+    stus_worker.completed.connect(stus_results.append)
+    stus_worker.run()
+
+    gdti_results: list[object] = []
+    gdti_worker = standalone_gui.WirisClockCommandWorker(target_infos, command_text="GDTI")
+    gdti_worker.completed.connect(gdti_results.append)
+    gdti_worker.run()
+
+    assert len(sent) == 4
+    assert sent[0].startswith("STUS ") and sent[1].startswith("STUS ")
+    assert stus_results[0]["results"]["left"]["response"] == "OK"
+    assert stus_results[0]["results"]["right"]["response"] == "OK"
+    assert stus_results[0]["command_times"]["left"] == stus_results[0]["command_times"]["right"]
+    assert gdti_results[0]["results"]["left"]["response"].startswith("2026/")
+
+
+def test_camera_network_address_worker_keeps_interface_apply_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        standalone_gui,
+        "apply_interface_address",
+        lambda interface_name, address_text: calls.append((interface_name, address_text)) or (True, "applied"),
+    )
+    monkeypatch.setattr(standalone_gui, "interface_addresses", lambda interface_name: f"{interface_name} UP")
+    results: list[object] = []
+    worker = standalone_gui.CameraNetworkAddressApplyWorker(
+        interface_name="enx-camera",
+        address_text="10.0.0.1/24",
+    )
+    worker.applied.connect(results.append)
+    worker.run()
+
+    assert calls == [("enx-camera", "10.0.0.1/24")]
+    assert results == [
+        {
+            "ok": True,
+            "message": "applied",
+            "interface_name": "enx-camera",
+            "address_text": "10.0.0.1/24",
+            "addresses": "enx-camera UP",
+        }
+    ]
+
+
+def test_interface_status_worker_keeps_startup_ip_query_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui, "interface_addresses", lambda name: f"{name} UP")
+    results: list[tuple[str, str]] = []
+    worker = standalone_gui.InterfaceStatusWorker("enx-camera")
+    worker.ready.connect(lambda name, status: results.append((name, status)))
+    worker.run()
+
+    assert results == [("enx-camera", "enx-camera UP")]
+
+
+def test_pixhawk_host_ip_discovery_worker_keeps_interface_scan_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    interfaces = (SimpleNamespace(name="enx-pixhawk", address="10.41.10.1/24"),)
+    monkeypatch.setattr(standalone_gui, "local_ipv4_interfaces", lambda *, include_wireless: interfaces)
+    results: list[object] = []
+    worker = standalone_gui.PixhawkHostIpDiscoveryWorker()
+    worker.discovered.connect(results.append)
+    worker.run()
+
+    assert results == [interfaces]
+
+
+def test_wiris_stip_worker_keeps_interface_and_tcp_io_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    interface = SimpleNamespace(name="enx-camera", address="10.0.0.1/24")
+    candidate = SimpleNamespace(interface=interface, neighbor_hosts=())
+    sent: list[str] = []
+    monkeypatch.setattr(standalone_gui, "interface_link_exists", lambda _name: False)
+    monkeypatch.setattr(standalone_gui, "discover_host_interface_candidates", lambda **_kwargs: [candidate])
+    monkeypatch.setattr(standalone_gui, "resolve_nm_interface_address", lambda _name, _hints: None)
+    monkeypatch.setattr(standalone_gui, "interface_has_address", lambda _name, _address: True)
+
+    def fake_send(command) -> str:
+        sent.append(str(command.command))
+        return "OK"
+
+    monkeypatch.setattr(standalone_gui, "send_tcp_line", fake_send)
+    results: list[object] = []
+    worker = standalone_gui.WirisStipWorker(
+        interface_name="enx-camera",
+        host_address="10.0.0.1/24",
+        host_hints=("10.0.0.11",),
+        current_host="10.0.0.11",
+        new_ip="10.0.0.21",
+        mask="255.255.255.0",
+        port=5000,
+        reboot=False,
+        timeout_s=1.0,
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert sent == [
+        "STIP 10.0.0.21",
+        "STMS 255.255.255.0",
+    ]
+    assert results[0]["state"] == "sent"
+    assert results[0]["interface_name"] == "enx-camera"
+
+
+def test_wiris_command_worker_reports_partial_timeout_without_ui_join(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    def fake_send(command) -> str:
+        if command.host.endswith("12"):
+            raise TimeoutError("right camera timeout")
+        return "OK"
+
+    monkeypatch.setattr(standalone_gui, "send_tcp_line", fake_send)
+    results: list[object] = []
+    worker = standalone_gui.WirisCommandWorker(
+        (
+            ("left", "10.0.0.11", 5000, 1.0),
+            ("right", "10.0.0.12", 5001, 1.0),
+        ),
+        command_text="HIWS",
+        terminator=standalone_gui.LINE_TERMINATOR,
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert results[0]["statuses"]["left"] == "OK"
+    assert results[0]["statuses"]["right"] == "실패: right camera timeout"
+
+
+def test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path() -> None:
+    from contextlib import contextmanager
+
+    from workstation import standalone_gui
+    from workstation_core.pixhawk_attitude import MavlinkShellCommandResult
+    from workstation_core.px4_mag_manager import MAG_PARAM_NAMES
+
+    class FakeSubscriber:
+        def __init__(self) -> None:
+            self.connections = {"left": object()}
+            self.params = {name: None for name in MAG_PARAM_NAMES}
+            self.params.update(
+                {
+                    "UAVCAN_ENABLE": 2,
+                    "UAVCAN_SUB_MAG": 1,
+                    "CAL_MAG0_ID": standalone_gui.BOARD_INTERNAL_MAG_ID,
+                    "CAL_MAG0_PRIO": 75,
+                }
+            )
+            self.active: list[str] = []
+
+        @contextmanager
+        def exclusive_command(self, camera: str):
+            self.active.append(camera)
+            try:
+                yield
+            finally:
+                self.active.pop()
+
+        def send_shell_command_with_result(self, camera: str, command: str, *, timeout_s: float):
+            assert self.active == [camera]
+            return MavlinkShellCommandResult(command, "nsh> OK", "respond+exclusive")
+
+        def read_param_int(self, camera: str, name: str, *, timeout_s: float):
+            assert self.active == [camera]
+            return self.params.get(name)
+
+        def read_param(self, camera: str, name: str, *, timeout_s: float):
+            assert self.active == [camera]
+            return self.params.get(name)
+
+        def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float):
+            assert self.active == [camera]
+            self.params[name] = int(value)
+            return int(value)
+
+        def reboot_autopilot(self, camera: str) -> None:
+            assert self.active == [camera]
+
+    subscriber = FakeSubscriber()
+    shell_results: list[object] = []
+    shell_worker = standalone_gui.PixhawkShellCommandWorker(
+        subscriber,
+        camera="left",
+        command="param show",
+    )
+    shell_worker.completed.connect(shell_results.append)
+    shell_worker.run()
+    assert shell_results[0]["output"] == "nsh> OK"
+
+    parameter_results: list[object] = []
+    parameter_worker = standalone_gui.PixhawkParameterWorker(
+        subscriber,
+        camera="left",
+        operation="mag_apply",
+        priorities={"BOARD": 100},
+    )
+    parameter_worker.completed.connect(parameter_results.append)
+    parameter_worker.run()
+    assert parameter_results[0]["applied"] == ("BOARD:CAL_MAG0_PRIO=100",)
+    assert subscriber.params["CAL_MAG0_PRIO"] == 100
+
+
+def test_pixhawk_connection_and_stream_setup_workers_keep_transport_io_off_ui_path() -> None:
+    from workstation import standalone_gui
+
+    class FakeSubscriber:
+        def __init__(self) -> None:
+            self.connections = {}
+            self.start_args = None
+            self.setup_args = None
+
+        def start(self, camera, *, start_timer, apply_pending_setup):
+            self.start_args = (camera, start_timer, apply_pending_setup)
+            self.connections["left"] = object()
+
+        def start_receive_timer(self):
+            raise AssertionError("timer activation belongs to the UI completion handler")
+
+        def configure_mavlink_streams(self, **kwargs):
+            self.setup_args = kwargs
+
+    subscriber = FakeSubscriber()
+    connection_results: list[object] = []
+    connection_worker = standalone_gui.PixhawkConnectionWorker(subscriber, "left")
+    connection_worker.completed.connect(connection_results.append)
+    connection_worker.run()
+
+    setup_results: list[object] = []
+    setup_worker = standalone_gui.PixhawkStreamSetupWorker(
+        subscriber,
+        host_ip="10.41.10.1",
+        ports={"left": 14550, "right": 14551},
+        sysids={"left": 1, "right": 2},
+        rate=2_000_000,
+        cameras=("left",),
+    )
+    setup_worker.completed.connect(setup_results.append)
+    setup_worker.run()
+
+    assert subscriber.start_args == ("left", False, False)
+    assert subscriber.setup_args["host_ip"] == "10.41.10.1"
+    assert setup_results[0]["cameras"] == ("left",)
+    assert connection_results[0]["connections"] == ("left",)
+
+
+def test_pixhawk_usb_bootstrap_worker_keeps_usb_shell_and_cleanup_off_ui_path(monkeypatch) -> None:
+    from workstation import standalone_gui
+    from workstation_core.pixhawk_attitude import MavlinkShellCommandResult
+
+    instances: list[object] = []
+
+    class FakeConnection:
+        def wait_heartbeat(self, *, timeout):
+            return object()
+
+    class FakeSubscriber:
+        def __init__(self, *args, **kwargs) -> None:
+            self.connections = {}
+            self.closed = False
+            self.commands: list[str] = []
+            instances.append(self)
+
+        def start(self, camera, *, start_timer, apply_pending_setup):
+            self.connections[camera] = FakeConnection()
+
+        def stop(self, camera=None):
+            self.closed = True
+            self.connections.clear()
+
+        @contextmanager
+        def exclusive_command(self, camera):
+            yield
+
+        def send_shell_command_with_result(self, camera, command, *, timeout_s):
+            self.commands.append(command)
+            return MavlinkShellCommandResult(command, "OK", "respond+exclusive")
+
+    monkeypatch.setattr(standalone_gui, "DualPixhawkMavlinkSubscriber", FakeSubscriber)
+    results: list[object] = []
+    worker = standalone_gui.PixhawkUsbBootstrapWorker(
+        camera="left",
+        usb_url="/dev/ttyACM0",
+        baud_candidates=(115200,),
+        command="ifup eth0",
+        fallback_command="ifup eth0 -m onboard",
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert results[0]["camera"] == "left"
+    assert results[0]["baud"] == 115200
+    assert instances[0].commands == ["ifup eth0"]
+    assert instances[0].closed is True
+
+
+def test_pixhawk_persistent_config_worker_serializes_shell_and_ftp() -> None:
+    from workstation import standalone_gui
+    from workstation_core.pixhawk_attitude import MavlinkShellCommandResult
+
+    class FakeSubscriber:
+        connections = {"left": object()}
+
+        def __init__(self) -> None:
+            self.active = False
+            self.calls: list[tuple[str, str]] = []
+
+        @contextmanager
+        def exclusive_command(self, camera):
+            assert self.active is False
+            self.active = True
+            try:
+                yield
+            finally:
+                self.active = False
+
+        def send_shell_command_with_result(self, camera, command, *, timeout_s):
+            assert self.active is True
+            self.calls.append(("shell", command))
+            return MavlinkShellCommandResult(command, "saved", "respond+exclusive")
+
+        def write_remote_file_mavftp(self, camera, path, content):
+            assert self.active is True
+            self.calls.append((path, content))
+
+    subscriber = FakeSubscriber()
+    results: list[object] = []
+    worker = standalone_gui.PixhawkPersistentConfigWorker(
+        subscriber,
+        camera="left",
+        command="param save",
+        extras_text="ifup eth0\n",
+        net_cfg_text="IPADDR=10.41.10.2\n",
+    )
+    worker.completed.connect(results.append)
+    worker.run()
+
+    assert [name for name, _value in subscriber.calls] == [
+        "shell",
+        "/fs/microsd/etc/extras.txt",
+        "/fs/microsd/net.cfg",
+    ]
+    assert results[0]["camera"] == "left"
+
+
+def test_pixhawk_rtcm_worker_queues_injection_and_reports_partial_failure(monkeypatch) -> None:
+    from workstation import standalone_gui
+
+    class FakeSubscriber:
+        def __init__(self) -> None:
+            self.sent: list[tuple[str, bytes]] = []
+
+        @contextmanager
+        def exclusive_command(self, camera):
+            yield
+
+        def send_rtcm_data(self, camera, payload):
+            self.sent.append((camera, payload))
+            if camera == "right":
+                raise TimeoutError("right unavailable")
+            return 3
+
+    monkeypatch.setattr(standalone_gui.QtCore.QTimer, "singleShot", lambda *_args: None)
+    subscriber = FakeSubscriber()
+    results: list[object] = []
+    worker = standalone_gui.PixhawkRtcmInjectionWorker(subscriber, max_queue=2)
+    worker.injected.connect(results.append)
+    worker.enqueue(("left", "right"), b"RTCM")
+
+    assert subscriber.sent == [("left", b"RTCM"), ("right", b"RTCM")]
+    assert results == [
+        {
+            "payload_bytes": 4,
+            "sent": (("left", 3),),
+            "failed": (("right", "right unavailable"),),
+            "dropped": 0,
+        }
+    ]
+
+
+def test_workstation_uses_explicit_camera_coordinate_label() -> None:
+    source = (Path(__file__).resolve().parents[2] / "workstation" / "standalone_gui.py").read_text(
+        encoding="utf-8"
+    )
+    assert "OpenCV optical RDF" in source
+    assert "ROS Optical Frame" not in source
+
+
+def test_workstation_shutdown_orders_runtime_stop_before_settings_save() -> None:
+    from workstation import standalone_gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel()
+    assert tuple(step.name for step in panel._shutdown_coordinator.steps) == (
+        "stop-runtime-workers",
+        "stop-gnss-network",
+        "stop-gnss-base-serial",
+        "stop-auxiliary-workers",
+        "wait-session-save",
+        "save-settings",
+    )
+    panel.close()
+    app.processEvents()
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_workstation_exposes_complete_system_settings_surface() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
@@ -631,7 +1545,11 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     app.processEvents()
     settings = window.settings_workspace
     assert window.workspace_host.currentWidget().widget() is settings
-    assert settings.tabs.count() == 6
+    assert settings.tabs.count() == 5
+    assert not any(
+        "Units/frames" in label.text()
+        for label in settings.findChildren(QtWidgets.QLabel)
+    )
     assert {
         "interface_name",
         "left_rtsp_url",
@@ -645,8 +1563,15 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
         "gnss_network_tls",
         "gnss_readiness_maximum_baseline_std_m",
         "gnss_fixed_coordinate_profile_path",
-        "clock_ftp_password",
     } <= set(settings.settings_widgets)
+    assert not {
+        "ros_domain_id",
+        "left_namespace",
+        "right_namespace",
+        "mavlink_configure_uxrce_agent",
+        "uxrce_port",
+        "clock_ftp_password",
+    } & set(settings.settings_widgets)
     assert settings.settings_widgets["gnss_readiness_minimum_fixed_duration_s"].value() == pytest.approx(30.0)
     assert settings.settings_widgets["gnss_readiness_maximum_baseline_std_m"].value() == pytest.approx(0.02)
 
@@ -704,6 +1629,29 @@ def test_workstation_main_cards_hide_source_but_provenance_survives_in_inspector
     main_indicator.set_status(status)
     assert "source=" not in main_indicator.toolTip()
 
+    _ = app
+
+
+def test_workstation_secondary_status_text_is_compact_but_tooltip_keeps_evidence() -> None:
+    from workstation.components import StatusIndicator
+    from workstation.status_model import RuntimeStatus, StatusSeverity
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    detail = "baseline NED=+1.000/+2.000/+3.000 m; length=3.742 m; quality=GOOD; age P1/P2=0.10/0.20s; P1→P2 @ P1 body FRD F/R/D=+2.000/-1.000/+3.000 m"
+    status = RuntimeStatus(
+        key="gnss",
+        label="RTK / GNSS",
+        state="FIX",
+        severity=StatusSeverity.OK,
+        detail=detail,
+    )
+
+    indicator = StatusIndicator("RTK")
+    indicator.set_status(status)
+
+    assert len(indicator.detail.text()) <= 96
+    assert indicator.detail.text().endswith("…")
+    assert detail in indicator.toolTip()
     _ = app
 
 
@@ -776,6 +1724,12 @@ def test_status_adapter_exposes_sync_and_ned_baseline_evidence() -> None:
         right_age_s=0.2,
         fix_quality="GOOD",
     )
+    backend.panel.latest_p1_body_frd_baseline = SimpleNamespace(
+        forward_m=0.7,
+        right_m=-1.0,
+        down_m=-0.1,
+        attitude_age_s=0.05,
+    )
 
     adapter = BackendStatusAdapter(backend)
     adapter.refresh()
@@ -785,8 +1739,42 @@ def test_status_adapter_exposes_sync_and_ned_baseline_evidence() -> None:
     assert "RTCP/NTP" in sync.detail
     assert gnss is not None and gnss.state == "FIX"
     assert "baseline NED=+1.000/+0.700/-0.100 m" in gnss.detail
+    assert "P1→P2 @ P1 body FRD F/R/D=+0.700/-1.000/-0.100 m" in gnss.detail
     assert gnss.age_s is not None and gnss.age_s >= 0.19
     _ = app
+
+
+def test_alignment_workspace_keeps_raw_ned_and_p1_body_frd_values_separate() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.latest_rtk_baseline = SimpleNamespace(
+        baseline_m=3.741,
+        north_m=1.0,
+        east_m=2.0,
+        down_m=3.0,
+        left_age_s=0.1,
+        right_age_s=0.1,
+        fix_quality="GOOD",
+        warnings=(),
+    )
+    backend.panel.latest_p1_body_frd_baseline = SimpleNamespace(
+        forward_m=1.0,
+        right_m=2.0,
+        down_m=3.0,
+        attitude_age_s=0.05,
+        target_frame="px4_frd",
+        axis_contract="P1->P2 in P1 body FRD: [Forward, Right, Down]; metres",
+    )
+    window = WorkstationMainWindow(backend=backend)
+    window.alignment.refresh({})
+    assert window.alignment.baseline_values["north_m"].value.text() == "1.000 m"
+    assert window.alignment.p1_body_frd_values["p1_body_frd_forward_m"].value.text() == "1.000 m"
+    assert "frame=NED north/east/down" in window.alignment.baseline_values["north_m"].meta.text()
+    assert "frame=P1 body FRD" in window.alignment.p1_body_frd_values["p1_body_frd_forward_m"].meta.text()
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
 
 
 def test_backend_command_failure_is_not_reported_as_completion() -> None:
@@ -815,9 +1803,7 @@ def test_phase_one_backend_facades_delegate_to_legacy_owner() -> None:
         "swap_cameras",
         "save_current_settings_from_ui",
         "set_selected_wiris_time_from_pc",
-        "capture_download_analyze_clock_photos",
         "refresh_clock_sync_status",
-        "auto_detect_pixhawks",
         "toggle_mavlink_connection",
         "discover_gnss_base_serial_ports",
         "connect_gnss_base_serial",
@@ -848,9 +1834,7 @@ def test_phase_one_backend_facades_delegate_to_legacy_owner() -> None:
         "camera_swap",
         "camera_save_settings",
         "time_set_pc",
-        "time_run_photo_workflow",
         "time_check_sync",
-        "pixhawk_auto_detect",
         "pixhawk_toggle_mavlink",
         "gnss_base_discover",
         "gnss_base_connect",
@@ -936,16 +1920,12 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
     panel.workstation_send_zoom = lambda target, action, level: calls.append(
         ("zoom", target, action, level)
     )
-    panel.workstation_discover_custom_topic_watch = lambda: calls.append("watch_ros2")
     panel.workstation_discover_custom_mavlink_watch = lambda: calls.append("watch_mavlink")
-    panel.workstation_add_custom_topic_watch = lambda name, topic, field: calls.append(
-        ("watch_add", name, topic, field)
+    panel.workstation_add_custom_mavlink_watch = lambda name, message, field: calls.append(
+        ("watch_add", name, message, field)
     )
-    panel.workstation_remove_custom_topic_watch = lambda key: calls.append(("watch_remove", key))
+    panel.workstation_remove_custom_mavlink_watch = lambda key: calls.append(("watch_remove", key))
     panel.workstation_refresh_baseline_field_browser = lambda: calls.append("baseline_scan") or {}
-    panel.workstation_describe_baseline_fields = lambda topic_type: calls.append(
-        ("baseline_describe", topic_type)
-    ) or ("lat",)
     panel.workstation_open_px4_shell = lambda camera: calls.append(("shell", camera))
     panel.workstation_refresh_px4_mag = lambda camera, read_params=True: calls.append(
         ("mag", camera, read_params)
@@ -965,12 +1945,10 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
     assert backend.advanced_wiris_catalog() == ({"command": "HIWS"},)
     backend.advanced_send_wiris_command("left", "HIWS", "\n")
     backend.advanced_send_zoom("both", "set", 10)
-    backend.advanced_discover_custom_topic_watch()
     backend.advanced_discover_custom_mavlink_watch()
-    backend.advanced_add_custom_topic_watch("z", "/topic", "z")
-    backend.advanced_remove_custom_topic_watch("z")
+    backend.advanced_add_custom_mavlink_watch("z", "GPS_RAW_INT", "lat")
+    backend.advanced_remove_custom_mavlink_watch("z")
     backend.advanced_refresh_baseline_fields()
-    assert backend.advanced_describe_baseline_fields("px4_msgs/msg/SensorGps") == ("lat",)
     backend.advanced_open_px4_shell("right")
     backend.advanced_refresh_px4_mag("right")
     backend.advanced_refresh_px4_attitude_cal("right")
@@ -983,12 +1961,10 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
     assert calls == [
         ("wiris", "left", "HIWS", "\n"),
         ("zoom", "both", "set", 10),
-        "watch_ros2",
         "watch_mavlink",
-        ("watch_add", "z", "/topic", "z"),
+        ("watch_add", "z", "GPS_RAW_INT", "lat"),
         ("watch_remove", "z"),
         "baseline_scan",
-        ("baseline_describe", "px4_msgs/msg/SensorGps"),
         ("shell", "right"),
         ("mag", "right", True),
         ("attitude", "right", True),
@@ -1046,6 +2022,14 @@ def test_evidence_adapter_preserves_attitude_gps_detection_and_recording_contrac
             right_age_s=0.2,
             warnings=(),
         ),
+        latest_p1_body_frd_baseline=SimpleNamespace(
+            forward_m=2.0,
+            right_m=1.0,
+            down_m=-0.2,
+            attitude_age_s=0.04,
+            target_frame="px4_frd",
+            axis_contract="P1->P2 in P1 body FRD: [Forward, Right, Down]; metres",
+        ),
         latest_left=SimpleNamespace(
             timestamp_s=now - 0.05,
             width=1920,
@@ -1088,6 +2072,9 @@ def test_evidence_adapter_preserves_attitude_gps_detection_and_recording_contrac
     assert attitude["px4_timestamp_s"] == 123.5
     assert gps["position_contract"].startswith("WGS84")
     assert evidence.baseline()["axis_contract"] == "NED = north / east / down; metres"
+    assert evidence.baseline()["p1_body_frd_state"] == "READY"
+    assert evidence.baseline()["p1_body_frd_forward_m"] == pytest.approx(2.0)
+    assert evidence.baseline()["p1_body_frd_axis_contract"].startswith("P1->P2 in P1 body FRD")
     assert detection["pixel_contract"].startswith("bbox")
     assert detection["center_u_px"] == 60.0
     assert recording["state"] == "FINALIZED"
@@ -1096,7 +2083,7 @@ def test_evidence_adapter_preserves_attitude_gps_detection_and_recording_contrac
 
 
 def test_evidence_projects_measurement_settings_and_session_csv_without_conversion(tmp_path, monkeypatch) -> None:
-    from wiris_stereo_distance import settings as settings_module
+    from workstation_core import settings as settings_module
 
     panel = SimpleNamespace(
         settings=SimpleNamespace(
@@ -1157,6 +2144,95 @@ def test_evidence_projects_measurement_settings_and_session_csv_without_conversi
     assert "no NED/ENU" in str(preview["coordinate_contract"])
 
 
+def test_workstation_evidence_preserves_mavlink_link_provenance() -> None:
+    from wiris_stereo_distance.pixhawk_attitude import CameraExtrinsicState
+    from wiris_stereo_distance.rtk_geometry import GpsPositionState
+
+    connection = SimpleNamespace(target_system=11, target_component=42)
+    subscriber = SimpleNamespace(
+        urls={"left": "udpin:0.0.0.0:14550"},
+        connections={"left": connection},
+        _heartbeat_logged={"left"},
+    )
+    panel = SimpleNamespace(
+        mavlink_pixhawk=subscriber,
+        latest_extrinsics={
+            "left": CameraExtrinsicState(
+                camera="left",
+                namespace="",
+                roll_deg=1.0,
+                pitch_deg=2.0,
+                yaw_deg=3.0,
+                timestamp_s=10.0,
+                topic="mavlink/ATTITUDE",
+                q=(1.0, 0.0, 0.0, 0.0),
+            )
+        },
+        latest_gps={
+            "left": GpsPositionState(
+                camera="left",
+                namespace="",
+                timestamp_s=10.0,
+                topic="mavlink/GPS_RAW_INT",
+                latitude_deg=37.0,
+                longitude_deg=127.0,
+                altitude_m=10.0,
+                fix_type=6,
+            )
+        },
+    )
+
+    evidence = EvidenceAdapter(panel)
+    attitude = evidence.attitude("left", now_s=10.1)
+    gps = evidence.gps("left", now_s=10.1)
+
+    for snapshot in (attitude, gps):
+        assert snapshot["telemetry_transport"] == "MAVLink"
+        assert snapshot["mavlink_endpoint"] == "udpin:0.0.0.0:14550"
+        assert snapshot["mavlink_link_open"] is True
+        assert snapshot["mavlink_heartbeat_seen"] is True
+        assert snapshot["mavlink_target_system"] == 11
+        assert snapshot["mavlink_target_component"] == 42
+
+
+def test_workstation_px4_timeline_persists_mavlink_link_provenance() -> None:
+    from workstation import standalone_gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel()
+    now_s = time.monotonic()
+    panel.recording_session_id = "provenance-session"
+    panel.recording_session_started_monotonic_ns = int((now_s - 1.0) * 1_000_000_000)
+    panel.recording_session_started_unix_ns = 1_800_000_000_000_000_000
+    panel.recording_session_anchor_uncertainty_ns = 100
+    panel.distance_recording_enabled = True
+    panel.video_recording_enabled = False
+    panel.mavlink_pixhawk = SimpleNamespace(
+        urls={"left": "udpin:0.0.0.0:14550"},
+        connections={"left": SimpleNamespace(target_system=11, target_component=42)},
+        _heartbeat_logged={"left"},
+    )
+
+    panel._record_external_timeline_row(
+        "left",
+        "pixhawk_attitude",
+        {
+            "topic": "mavlink/ATTITUDE",
+            "sample_app_timestamp_s": now_s,
+        },
+    )
+    row = panel.px4_recording_rows["left"][0]
+    assert row["mavlink_endpoint"] == "udpin:0.0.0.0:14550"
+    assert row["mavlink_link_open"] is True
+    assert row["mavlink_heartbeat_seen"] is True
+    assert row["mavlink_target_system"] == 11
+    assert row["mavlink_target_component"] == 42
+
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_workstation_uses_source_backed_alignment_calibration_and_recording_pages() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
@@ -1180,10 +2256,64 @@ def test_workstation_uses_source_backed_alignment_calibration_and_recording_page
     assert window.alignment.gnss_model.rowCount() == 2
     assert window.calibration.intrinsic_model.rowCount() == 2
     assert window.recording.artifact_model.rowCount() >= 1
+    assert window.recording.protocol_state_label.text().startswith("BLOCKED")
+    assert any("Both camera streams" in label.text() for label in window.recording.protocol_check_labels.values())
     assert "NED" in window.alignment.findChildren(QtWidgets.QLabel)[-1].text()
     window.close()
     app.processEvents()
     window.deleteLater()
+    app.processEvents()
+
+
+def test_workstation_camera_pane_shutdown_is_cooperative_and_retryable() -> None:
+    from workstation_core.camera_pane import CameraPane
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    pane = CameraPane("left")
+    calls: list[str] = []
+
+    class FakeThread:
+        def __init__(self) -> None:
+            self.running = True
+            self.wait_calls: list[int] = []
+
+        def wait(self, timeout: int) -> bool:
+            self.wait_calls.append(timeout)
+            return not self.running
+
+    thread = FakeThread()
+
+    class FakeWorker:
+        def request_stop(self) -> None:
+            calls.append("request_stop")
+
+        def stop(self) -> None:
+            calls.append("stop")
+            thread.running = False
+
+    worker = FakeWorker()
+    pane.worker = worker
+    pane.thread = thread
+
+    assert pane.stop(wait=True) is True
+    assert calls == ["request_stop", "stop"]
+    assert thread.wait_calls == [1500, 1500]
+    assert pane.worker is None
+    assert pane.thread is None
+
+    pane.worker = worker
+    pane.thread = thread
+    thread.running = True
+    calls.clear()
+    assert pane.stop(wait=False) is False
+    assert calls == ["request_stop"]
+    assert pane.worker is worker
+    assert pane.thread is thread
+
+    pane._clear_thread_if_current(1, thread)
+    assert pane.worker is None
+    assert pane.thread is None
+    pane.deleteLater()
     app.processEvents()
 
 
@@ -1203,7 +2333,6 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "camera.save_settings",
     )
     alignment_commands = (
-        "pixhawk.auto_detect",
         "pixhawk.toggle_mavlink",
         "gnss.base_discover",
         "gnss.base_connect",
@@ -1238,7 +2367,6 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "camera_enable_rtsp",
         "camera_swap",
         "camera_save_settings",
-        "pixhawk_auto_detect",
         "pixhawk_toggle_mavlink",
         "gnss_base_discover",
         "gnss_base_connect",
@@ -1320,7 +2448,7 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
 
 
 def test_recording_workspace_reviews_saved_csv_without_frame_conversion(tmp_path, monkeypatch) -> None:
-    from wiris_stereo_distance import settings as settings_module
+    from workstation_core import settings as settings_module
 
     monkeypatch.setattr(settings_module, "APP_ROOT", tmp_path)
     session_dir = tmp_path / "recordings" / "sessions" / "session-1"
@@ -1365,8 +2493,9 @@ def test_workstation_exposes_advanced_owner_tools_and_preserves_contracts() -> N
     app.processEvents()
     assert window.workspace_host.currentWidget().widget() is window.advanced
     assert window.advanced.wiris_catalog_combo.count() == 1
-    assert window.advanced.baseline_topic_model.rowCount() == 0
-    assert "NED" in window.advanced.findChildren(QtWidgets.QLabel)[-1].text()
+    assert window.advanced.baseline_mavlink_model.rowCount() == 0
+    assert not any("Safety contracts" in label.text() for label in window.advanced.findChildren(QtWidgets.QLabel))
+    assert "OpenCV RDF" in window.advanced.preview_status_label.text()
 
     window.advanced.wiris_command_edit.setText("HIWS")
     assert window.commands.invoke("advanced.wiris.send") is True
@@ -1377,21 +2506,19 @@ def test_workstation_exposes_advanced_owner_tools_and_preserves_contracts() -> N
     assert backend.calls[-1] == ("advanced_zoom", "both", "set", 12)
 
     window.advanced.watch_name_edit.setText("local_z")
-    window.advanced.watch_topic_edit.setText("/uav_0/fmu/out/vehicle_local_position")
+    window.advanced.watch_message_edit.setText("LOCAL_POSITION_NED")
     window.advanced.watch_field_edit.setText("z")
-    assert window.commands.invoke("advanced.watch.add") is True
+    assert window.commands.invoke("advanced.watch.add_mavlink") is True
     assert backend.calls[-1] == (
-        "advanced_watch_add",
+        "advanced_watch_add_mavlink",
         "local_z",
-        "/uav_0/fmu/out/vehicle_local_position",
+        "LOCAL_POSITION_NED",
         "z",
     )
 
     assert window.commands.invoke("advanced.baseline.scan") is True
-    assert window.advanced.baseline_topic_model.rowCount() == 1
-    window.advanced.baseline_topic_table.selectRow(0)
-    assert window.commands.invoke("advanced.baseline.describe") is True
-    assert [window.advanced.baseline_field_list.item(i).text() for i in range(3)] == ["lat", "lon", "alt"]
+    assert window.advanced.baseline_mavlink_model.rowCount() == 1
+    assert "advanced.baseline.describe" not in window.commands._specs
 
     window.advanced.px4_camera_combo.setCurrentIndex(1)
     assert window.commands.invoke("advanced.px4.refresh_mag") is True

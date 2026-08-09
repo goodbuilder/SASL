@@ -6,7 +6,7 @@ from typing import Callable
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from wiris_stereo_distance.coordinate_contract import (
+from workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
     BODY_FRAME,
     CAMERA_FRAME,
@@ -17,6 +17,7 @@ from wiris_stereo_distance.coordinate_contract import (
 
 from .components import EngineeringValue, EmptyStateView, StatusIndicator, WorkspaceHeader
 from .evidence import EvidenceAdapter
+from .protocol import ProtocolReadiness, evaluate_recording_protocol
 from .status_model import RuntimeStatus, StatusModel, StatusSeverity
 
 
@@ -38,6 +39,13 @@ def _display_number(value: object, *, digits: int = 3, suffix: str = "") -> str:
         return f"{float(value):.{digits}f}{suffix}"
     except (TypeError, ValueError):
         return f"{value}{suffix}"
+
+
+def _compact_text(value: object, *, limit: int = 128) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
 
 
 def _display_class(target: dict[str, object]) -> str:
@@ -87,7 +95,7 @@ class OverviewWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Overview", "System visibility and measurement readiness evidence. Commands remain in the toolbar."))
+        layout.addWidget(WorkspaceHeader("Overview"))
 
         status_group = QtWidgets.QGroupBox("Global status")
         status_layout = QtWidgets.QGridLayout(status_group)
@@ -234,7 +242,7 @@ class CameraWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Cameras", "Preview and detection evidence. Frame timestamps retain receive and source clock semantics."))
+        layout.addWidget(WorkspaceHeader("Cameras"))
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.previews = {side: CameraPreview(side) for side in ("left", "right")}
         splitter.addWidget(self.previews["left"])
@@ -291,10 +299,11 @@ class CameraWorkspace(QtWidgets.QWidget):
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for index, (command_id, label) in enumerate(
             (
-                ("camera.discover_host_ip", "Discover camera IP"),
-                ("camera.check_control", "Check WIRIS control"),
-                ("camera.enable_rtsp", "Enable RTSP"),
-                ("camera.check_rtsp", "Check RTSP"),
+                ("camera.discover_host_ip", "Discover Camera Network"),
+                ("camera.auto_connect", "Auto-Connect Cameras"),
+                ("camera.check_control", "Verify Camera Control"),
+                ("camera.enable_rtsp", "Enable Video Stream"),
+                ("camera.check_rtsp", "Verify Video Stream"),
             )
         ):
             button = _command_button(label, command_id, invoke_command)
@@ -306,8 +315,9 @@ class CameraWorkspace(QtWidgets.QWidget):
         mapping_layout = QtWidgets.QHBoxLayout(mapping_group)
         mapping_layout.setContentsMargins(6, 6, 6, 6)
         for command_id, label in (
-            ("camera.swap", "Swap Left / Right"),
-            ("camera.save_settings", "Save camera settings"),
+            ("camera.swap", "Swap Camera Sides"),
+            ("camera.save_settings", "Save Camera Settings"),
+            ("legacy.open", "Open Device Candidate Tools"),
         ):
             button = _command_button(label, command_id, invoke_command)
             self.operation_buttons[command_id] = button
@@ -416,7 +426,7 @@ class TimeWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Time / Sync",
-                "Set the WIRIS clock, verify RTCP/NTP frame timing, then confirm still-image clock evidence before measurement.",
+                "RTCP/NTP frame evidence",
             )
         )
 
@@ -427,7 +437,6 @@ class TimeWorkspace(QtWidgets.QWidget):
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for command_id, label in (
             ("time.set_pc", "Set WIRIS time from PC"),
-            ("time.run_photo_workflow", "Run photo clock workflow"),
             ("time.check_sync", "Check RTCP/NTP sync"),
         ):
             button = _command_button(label, command_id, invoke_command)
@@ -450,27 +459,8 @@ class TimeWorkspace(QtWidgets.QWidget):
         sync_layout.addWidget(self.sync_summary)
         layout.addWidget(sync_group)
 
-        photo_group = QtWidgets.QGroupBox("Still-image clock evidence")
-        photo_layout = QtWidgets.QVBoxLayout(photo_group)
-        self.photo_status = QtWidgets.QLabel(
-            "CPTR/ICPT와 FTP 다운로드 결과, EXIF/GPS timestamp 비교 결과를 표시합니다."
-        )
-        self.photo_status.setObjectName("statusStrip")
-        self.photo_status.setWordWrap(True)
-        self.photo_summary = QtWidgets.QPlainTextEdit()
-        self.photo_summary.setReadOnly(True)
-        self.photo_summary.setMaximumBlockCount(120)
-        self.photo_summary.setFixedHeight(140)
-        photo_layout.addWidget(self.photo_status)
-        photo_layout.addWidget(self.photo_summary)
-        layout.addWidget(photo_group)
-
-        contract = QtWidgets.QLabel(
-            "Time contract: camera RTC/RTCP/NTP and EXIF/GPS timestamps remain separate evidence sources. "
-            "A clock check does not alter camera pixels, Pixhawk FRD attitude, GPS NED baseline, or measurement output."
-        )
-        contract.setWordWrap(True)
-        contract.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        contract = QtWidgets.QLabel("Evidence: RTCP/NTP frame timestamps")
+        contract.setObjectName("compactContract")
         layout.addWidget(contract)
         layout.addStretch(1)
 
@@ -488,17 +478,13 @@ class TimeWorkspace(QtWidgets.QWidget):
 
     def refresh(self, _snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
-        self.sync_status.setText(
-            self._widget_text(getattr(panel, "clock_sync_status_label", None), "RTCP/NTP frame timestamp 대기 중")
+        sync_status = self._widget_text(
+            getattr(panel, "clock_sync_status_label", None), "RTCP/NTP frame timestamp 대기 중"
         )
+        self.sync_status.setText(_compact_text(sync_status))
+        self.sync_status.setToolTip(sync_status)
         self.sync_summary.setPlainText(
             self._widget_text(getattr(panel, "clock_sync_summary_text", None), "")
-        )
-        self.photo_status.setText(
-            self._widget_text(getattr(panel, "clock_status_label", None), "still-image clock evidence 대기 중")
-        )
-        self.photo_summary.setPlainText(
-            self._widget_text(getattr(panel, "clock_summary_text", None), "")
         )
 
 
@@ -517,7 +503,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Measurement", "Attempt-scoped stereo result, timing, quality, and explicit public frame contract."))
+        layout.addWidget(WorkspaceHeader("Measurement", "Quality · timing · output frame"))
         self.result_status = QtWidgets.QLabel("measurement evidence 대기")
         self.result_status.setObjectName("measurementResultStatus")
         self.result_status.setWordWrap(True)
@@ -630,13 +616,13 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         contract_layout = QtWidgets.QFormLayout(contract)
         contract_layout.setContentsMargins(8, 8, 8, 8)
         for label, value in (
-            ("World / attitude", f"{WORLD_FRAME} / {BODY_FRAME} (PX4 body FRD → world NED)"),
-            ("Camera input", f"{CAMERA_FRAME} pixels/rays (RDF: right, down, forward)"),
-            ("Baseline translation", f"{BASELINE_TRANSLATION_FRAME} (meters)"),
-            ("Public output", f"{MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}] (meters)"),
-            ("Geometry rule", "selected immutable MeasurementAttempt; invalid/missing inputs fail closed"),
+            ("World / attitude", f"{BODY_FRAME} → {WORLD_FRAME}"),
+            ("Camera input", f"{CAMERA_FRAME} · [u,v]"),
+            ("Baseline translation", f"{BASELINE_TRANSLATION_FRAME} · m"),
+            ("Public output", f"{MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}] · m"),
         ):
             label_widget = QtWidgets.QLabel(value)
+            label_widget.setObjectName("compactContract")
             label_widget.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
             label_widget.setWordWrap(True)
             contract_layout.addRow(label, label_widget)
@@ -794,7 +780,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         settings_layout.addWidget(sync_group)
 
         self.measurement_settings_status = QtWidgets.QLabel(
-            "변경값은 Apply 후 기존 panel owner에 반영되고, Save 후 Workstation data root의 stereo_distance_settings.json에 기록됩니다."
+            "Apply: runtime · Save: workstation_data/stereo_distance_settings.json"
         )
         self.measurement_settings_status.setObjectName("statusStrip")
         self.measurement_settings_status.setWordWrap(True)
@@ -904,9 +890,10 @@ class MeasurementWorkspace(QtWidgets.QWidget):
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         measurement = snapshot.get("measurement")
-        self.result_status.setText(measurement.detail if measurement else "measurement evidence 대기")
+        measurement_detail = measurement.detail if measurement else "measurement evidence 대기"
+        self.result_status.setText(_compact_text(measurement_detail))
         self.result_status.setToolTip(
-            f"clock={measurement.clock}" if measurement else ""
+            f"{measurement_detail}\nclock={measurement.clock}" if measurement else ""
         )
         self._refresh_preview_metadata(panel)
         self._refresh_quality(panel)
@@ -985,7 +972,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Alignment / Pixhawk / GNSS",
-                "Telemetry evidence and phase-one connection/survey commands use the existing owner; calibration remains a guarded handoff.",
+                "Telemetry · baseline · attitude",
             )
         )
 
@@ -1009,7 +996,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
         self.attitude_model = _table_model(
             self,
-            ("Side", "State", "Roll°", "Pitch°", "Yaw°", "Age", "PX4 t", "Topic / namespace"),
+            ("Side", "State", "Roll°", "Pitch°", "Yaw°", "Age", "PX4 t", "Transport"),
         )
         self.attitude_table = QtWidgets.QTableView()
         self.attitude_table.setModel(self.attitude_model)
@@ -1048,13 +1035,26 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             baseline_layout.addWidget(value, index // 3, index % 3)
         layout.addWidget(baseline_group)
 
+        body_frd_group = QtWidgets.QGroupBox("P1→P2 body-FRD projection")
+        body_frd_layout = QtWidgets.QGridLayout(body_frd_group)
+        self.p1_body_frd_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (
+                ("p1_body_frd_forward_m", "Forward"),
+                ("p1_body_frd_right_m", "Right"),
+                ("p1_body_frd_down_m", "Down"),
+                ("p1_body_frd_state", "State"),
+            )
+        ):
+            value = EngineeringValue(label)
+            self.p1_body_frd_values[key] = value
+            body_frd_layout.addWidget(value, index // 3, index % 3)
+        layout.addWidget(body_frd_group)
+
         contract = QtWidgets.QLabel(
-            "Coordinate contract: attitude orientation is PX4 body FRD → world NED; "
-            "GPS positions are WGS84 lat/lon/alt; RTK baseline is explicit NED north/east/down metres. "
-            "No NED value is written into a camera or baseline_center_frd field."
+            "PX4: FRD→NED · RTK raw: NED [N,E,D] · P1→P2: P1 FRD [F,R,D] · GPS: WGS84"
         )
-        contract.setWordWrap(True)
-        contract.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        contract.setObjectName("compactContract")
         layout.addWidget(contract)
 
         self.operation_tabs = QtWidgets.QTabWidget()
@@ -1063,21 +1063,23 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             (
                 "Pixhawk",
                 (
-                    ("pixhawk.auto_detect", "Auto-detect Pixhawk"),
-                    ("pixhawk.toggle_mavlink", "Toggle MAVLink"),
-                    ("alignment.swap_pixhawks", "Swap Pixhawk sides"),
+                    ("pixhawk.toggle_mavlink", "Connect Pixhawk MAVLink"),
+                    ("pixhawk.discover_usb", "Scan USB Pixhawks"),
+                    ("pixhawk.discover_mavlink_candidates", "Generate MAVLink Candidates"),
+                    ("pixhawk.discover_host_ip", "Discover Pixhawk Host IP"),
+                    ("alignment.swap_pixhawks", "Swap P1 / P2 Roles"),
                 ),
             ),
             (
                 "GNSS / RTK",
                 (
-                    ("gnss.base_discover", "Discover Base serial"),
-                    ("gnss.base_connect", "Connect Base"),
-                    ("gnss.base_disconnect", "Disconnect Base"),
+                    ("gnss.base_discover", "Scan Base GNSS Ports"),
+                    ("gnss.base_connect", "Connect Base GNSS"),
+                    ("gnss.base_disconnect", "Disconnect Base GNSS"),
                     ("gnss.survey_start", "Start Survey-in"),
                     ("gnss.survey_stop", "Stop Survey-in"),
-                    ("gnss.ntrip_start", "Start NTRIP"),
-                    ("gnss.ntrip_stop", "Stop NTRIP"),
+                    ("gnss.ntrip_start", "Start NTRIP Corrections"),
+                    ("gnss.ntrip_stop", "Stop NTRIP Corrections"),
                 ),
             ),
             (
@@ -1127,7 +1129,6 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.attitude_model.removeRows(0, self.attitude_model.rowCount())
         for side in ("left", "right"):
             data = evidence.attitude(side)
-            topic = str(data.get("topic") or data.get("namespace") or "--")
             _append_table_row(
                 self.attitude_model,
                 (
@@ -1138,13 +1139,12 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                     _display_number(data.get("yaw_deg")),
                     _display_number(data.get("age_s"), digits=2, suffix="s"),
                     _display_number(data.get("px4_timestamp_s"), digits=6),
-                    topic,
+                    "MAVLink",
                 ),
             )
         self.gnss_model.removeRows(0, self.gnss_model.rowCount())
         for side in ("left", "right"):
             data = evidence.gps(side)
-            source = str(data.get("time_source") or data.get("topic") or "--")
             _append_table_row(
                 self.gnss_model,
                 (
@@ -1158,7 +1158,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                     _display_number(data.get("longitude_deg"), digits=7),
                     _display_number(data.get("altitude_m")),
                     _display_number(data.get("age_s"), digits=2, suffix="s"),
-                    source,
+                    "MAVLink GPS",
                 ),
             )
         baseline = evidence.baseline()
@@ -1169,6 +1169,31 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                 source=str(baseline.get("source", "")),
                 frame="NED north/east/down" if key.endswith("_m") else "",
                 valid=(None if baseline.get("state") in {"NO DATA", "UNKNOWN"} else baseline.get("state") == "GOOD"),
+            )
+        projection_state = str(baseline.get("p1_body_frd_state", "WAITING") or "WAITING")
+        projection_valid = projection_state == "READY"
+        projection_age_s = baseline.get("p1_body_frd_attitude_age_s")
+        try:
+            projection_age_s = None if projection_age_s in (None, "") else float(projection_age_s)
+        except (TypeError, ValueError):
+            projection_age_s = None
+        for key, value in self.p1_body_frd_values.items():
+            raw = baseline.get(key)
+            is_metric = key.endswith("_m")
+            value.set_value(
+                _display_number(raw, suffix=" m") if is_metric else raw,
+                source=str(baseline.get("p1_body_frd_source", "")),
+                age_s=(
+                    projection_age_s
+                    if key == "p1_body_frd_state"
+                    else None
+                ),
+                frame=(
+                    "P1 body FRD P1→P2 [Forward,Right,Down]"
+                    if is_metric
+                    else str(baseline.get("p1_body_frd_axis_contract", ""))
+                ),
+                valid=(None if projection_state == "WAITING" else projection_valid),
             )
         recording = snapshot.get("recording")
         recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
@@ -1195,7 +1220,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Calibration",
-                "Active profile and validation evidence plus owner-backed calibration commands; the existing owner remains authoritative.",
+                "Profile · validation",
             )
         )
         profile_group = QtWidgets.QGroupBox("Active profile")
@@ -1232,6 +1257,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         metrics_layout.addWidget(self.extrinsic_value)
         metrics_layout.addWidget(self.validation_value)
         self.calibration_contract = QtWidgets.QLabel()
+        self.calibration_contract.setObjectName("compactContract")
         self.calibration_contract.setWordWrap(True)
         self.calibration_contract.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         metrics_layout.addWidget(self.calibration_contract)
@@ -1327,11 +1353,9 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         path_form.addWidget(setup_text("validation_json", "intrinsics.json"), 2, 1, 1, 3)
         setup_layout.addLayout(path_form)
         setup_contract = QtWidgets.QLabel(
-            "Setup contract: square size is millimetres; image coordinates and intrinsics stay in OpenCV optical RDF; "
-            "checkerboard stereo translation is left-camera optical RDF → right-camera optical RDF."
+            "Square: mm · pixels/intrinsics: OpenCV RDF · stereo T: left-camera→right-camera"
         )
-        setup_contract.setWordWrap(True)
-        setup_contract.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        setup_contract.setObjectName("compactContract")
         setup_layout.addWidget(setup_contract)
         layout.addWidget(setup_group)
 
@@ -1443,8 +1467,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             valid=True if summary_text else None,
         )
         self.calibration_contract.setText(
-            f"Frame contract: {data.get('frame_contract', CAMERA_FRAME)}\n"
-            f"{data.get('measurement_contract', '')}"
+            f"Pixels/intrinsics: {CAMERA_FRAME} · stereo T: left→right · "
+            f"output: {MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]"
         )
 
 
@@ -1479,7 +1503,6 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Advanced owner tools",
-                "WIRIS SDK, PX4/MAG/field-watch, checkerboard preview/zoom, and session media tools are exposed here through the existing resource owner.",
             )
         )
 
@@ -1505,16 +1528,8 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.tabs.addTab(self._build_wiris_tab(), "WIRIS SDK / Zoom")
         self.tabs.addTab(self._build_px4_and_watch_tab(), "PX4 / Field watch")
         self.tabs.addTab(self._build_preview_tab(), "Calibration preview")
-        self.tabs.addTab(self._build_media_tab(), "Playback / Export")
+        self.tabs.addTab(self._build_media_tab(), "Session Review / Artifacts")
         layout.addWidget(self.tabs, 1)
-
-        contract = QtWidgets.QLabel(
-            "Safety contracts: WIRIS targets are left/right/both camera control endpoints; PX4 attitude is body FRD orientation into world NED; GPS/RTK baseline fields remain NED north/east/down; checkerboard pixels remain left/right OpenCV optical RDF; session artifacts retain recording_time_ns and saved field names."
-        )
-        contract.setObjectName("statusStrip")
-        contract.setWordWrap(True)
-        contract.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-        layout.addWidget(contract)
 
         self._connect_preview_signal()
         self._refresh_custom_watch_selector()
@@ -1550,7 +1565,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.wiris_command_edit.setPlaceholderText("SDK command, e.g. HIWS")
         self.wiris_terminator_combo = self._combo((("LINE", "\n"), ("NULL", "\0")))
         self.wiris_send_button = self._button("Send SDK command", "advanced.wiris.send")
-        self.wiris_status_label = QtWidgets.QLabel("Select a catalog item or enter a command.")
+        self.wiris_status_label = QtWidgets.QLabel("")
         self.wiris_status_label.setObjectName("statusStrip")
         self.wiris_status_label.setWordWrap(True)
         command_form.addWidget(QtWidgets.QLabel("Target"), 0, 0)
@@ -1582,7 +1597,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
             "stop": self._button("Stop", "advanced.zoom.stop"),
             "set": self._button("Set level", "advanced.zoom.set"),
         }
-        self.zoom_status_label = QtWidgets.QLabel("Zoom command status appears here.")
+        self.zoom_status_label = QtWidgets.QLabel("")
         self.zoom_status_label.setObjectName("statusStrip")
         self.zoom_status_label.setWordWrap(True)
         zoom_layout.addWidget(QtWidgets.QLabel("Target"), 0, 0)
@@ -1673,57 +1688,43 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         px4_layout.addWidget(self._button("Save MAG params", "advanced.px4.save_mag"), 3, 0, 1, 2)
         px4_layout.addWidget(self._button("Reboot PX4", "advanced.px4.reboot"), 4, 0, 1, 2)
         self.px4_status_label = QtWidgets.QLabel(
-            "MAG priority writes require MAVLink PARAM readback and disarm. Attitude calibration is read-only here; perform calibration in QGC Sensor Setup."
+            "MAG: disarmed + PARAM readback · attitude calibration: QGC Sensor Setup"
         )
         self.px4_status_label.setObjectName("statusStrip")
         self.px4_status_label.setWordWrap(True)
         px4_layout.addWidget(self.px4_status_label, 6, 0, 1, 5)
         layout.addWidget(px4_group)
 
-        watch_group = QtWidgets.QGroupBox("ROS2 / MAVLink field watch")
+        watch_group = QtWidgets.QGroupBox("MAVLink field watch")
         watch_layout = QtWidgets.QGridLayout(watch_group)
         watch_layout.setColumnStretch(1, 1)
         self.watch_name_edit = QtWidgets.QLineEdit("local_z")
-        self.watch_topic_edit = QtWidgets.QLineEdit("/uav_0/fmu/out/vehicle_local_position")
+        self.watch_message_edit = QtWidgets.QLineEdit("ATTITUDE")
         self.watch_field_edit = QtWidgets.QLineEdit("z")
         self.watch_remove_combo = QtWidgets.QComboBox()
         watch_layout.addWidget(QtWidgets.QLabel("Name"), 0, 0)
         watch_layout.addWidget(self.watch_name_edit, 0, 1)
-        watch_layout.addWidget(QtWidgets.QLabel("ROS2 topic"), 1, 0)
-        watch_layout.addWidget(self.watch_topic_edit, 1, 1)
+        watch_layout.addWidget(QtWidgets.QLabel("MAVLink message"), 1, 0)
+        watch_layout.addWidget(self.watch_message_edit, 1, 1)
         watch_layout.addWidget(QtWidgets.QLabel("Field"), 2, 0)
         watch_layout.addWidget(self.watch_field_edit, 2, 1)
-        watch_layout.addWidget(self._button("Add watch", "advanced.watch.add"), 0, 2)
-        watch_layout.addWidget(self._button("Discover ROS2", "advanced.watch.discover_ros2"), 1, 2)
+        watch_layout.addWidget(self._button("Add MAVLink watch", "advanced.watch.add_mavlink"), 0, 2)
         watch_layout.addWidget(self._button("Discover MAVLink", "advanced.watch.discover_mavlink"), 2, 2)
         watch_layout.addWidget(QtWidgets.QLabel("Remove"), 3, 0)
         watch_layout.addWidget(self.watch_remove_combo, 3, 1)
         watch_layout.addWidget(self._button("Remove watch", "advanced.watch.remove"), 3, 2)
-        self.watch_status_label = QtWidgets.QLabel("Custom watch uses the existing subscriber timeline and preserves the producer field name.")
+        self.watch_status_label = QtWidgets.QLabel("")
         self.watch_status_label.setObjectName("statusStrip")
         self.watch_status_label.setWordWrap(True)
         watch_layout.addWidget(self.watch_status_label, 4, 0, 1, 3)
         layout.addWidget(watch_group)
 
-        baseline_group = QtWidgets.QGroupBox("Baseline ROS2 field browser / MAVLink field reference")
+        baseline_group = QtWidgets.QGroupBox("MAVLink field reference")
         baseline_layout = QtWidgets.QVBoxLayout(baseline_group)
         baseline_actions = QtWidgets.QHBoxLayout()
         baseline_actions.addWidget(self._button("Scan fields", "advanced.baseline.scan"))
-        baseline_actions.addWidget(self._button("Describe selected ROS2 type", "advanced.baseline.describe"))
         baseline_actions.addStretch(1)
         baseline_layout.addLayout(baseline_actions)
-        self.baseline_topic_model = _table_model(self, ("Priority", "Topic", "Type"))
-        self.baseline_topic_table = QtWidgets.QTableView()
-        self.baseline_topic_table.setModel(self.baseline_topic_model)
-        self.baseline_topic_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.baseline_topic_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.baseline_topic_table.verticalHeader().setVisible(False)
-        self.baseline_topic_table.setMaximumHeight(150)
-        self.baseline_topic_table.horizontalHeader().setStretchLastSection(True)
-        baseline_layout.addWidget(self.baseline_topic_table)
-        self.baseline_field_list = QtWidgets.QListWidget()
-        self.baseline_field_list.setMaximumHeight(90)
-        baseline_layout.addWidget(self.baseline_field_list)
         self.baseline_mavlink_model = _table_model(self, ("Message", "Fields"))
         self.baseline_mavlink_table = QtWidgets.QTableView()
         self.baseline_mavlink_table.setModel(self.baseline_mavlink_model)
@@ -1732,10 +1733,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.baseline_mavlink_table.setMaximumHeight(100)
         self.baseline_mavlink_table.horizontalHeader().setStretchLastSection(True)
         baseline_layout.addWidget(self.baseline_mavlink_table)
-        self.baseline_topic_table.selectionModel().currentChanged.connect(
-            lambda _current, _previous: self.baseline_field_list.clear()
-        )
-        self.baseline_status_label = QtWidgets.QLabel("No field scan requested.")
+        self.baseline_status_label = QtWidgets.QLabel("")
         self.baseline_status_label.setObjectName("statusStrip")
         self.baseline_status_label.setWordWrap(True)
         baseline_layout.addWidget(self.baseline_status_label)
@@ -1763,9 +1761,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         row.setStretchFactor(0, 1)
         row.setStretchFactor(1, 1)
         layout.addWidget(row, 1)
-        self.preview_status_label = QtWidgets.QLabel(
-            "Preview images are OpenCV image pixels. Detection overlay is generated by the existing lazy checkerboard worker."
-        )
+        self.preview_status_label = QtWidgets.QLabel("Pixels: OpenCV RDF · overlay: checkerboard worker")
         self.preview_status_label.setObjectName("statusStrip")
         self.preview_status_label.setWordWrap(True)
         layout.addWidget(self.preview_status_label)
@@ -1804,7 +1800,9 @@ class AdvancedWorkspace(QtWidgets.QWidget):
             for camera, image in images.items():
                 if str(camera) in self.preview_labels and isinstance(image, QtGui.QImage) and not image.isNull():
                     self._set_preview_image(str(camera), image)
-        self.preview_status_label.setText(str(payload.get("axis_contract") or "Preview snapshot updated."))
+        preview_detail = str(payload.get("axis_contract") or "Preview snapshot updated.")
+        self.preview_status_label.setText(_compact_text(preview_detail))
+        self.preview_status_label.setToolTip(preview_detail)
 
     def _build_media_tab(self) -> QtWidgets.QWidget:
         page = QtWidgets.QWidget()
@@ -1829,7 +1827,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         selector.addWidget(self._button("Open in system player", "advanced.media.open_video"), 2, 2, 1, 2)
         layout.addLayout(selector)
         self.media_status_label = QtWidgets.QLabel(
-            "CSV preview is read-only. XLSX/Parquet/video artifacts are opened unchanged; session save invokes the existing asynchronous writer."
+            "Read-only · saved fields/timestamps unchanged"
         )
         self.media_status_label.setObjectName("statusStrip")
         self.media_status_label.setWordWrap(True)
@@ -1873,31 +1871,14 @@ class AdvancedWorkspace(QtWidgets.QWidget):
     def px4_priority_payload(self) -> dict[str, int]:
         return {role: int(spin.value()) for role, spin in self.px4_priority_spins.items()}
 
-    def selected_baseline_topic_type(self) -> str:
-        index = self.baseline_topic_table.currentIndex()
-        if not index.isValid():
-            return ""
-        return str(self.baseline_topic_model.index(index.row(), 2).data() or "").strip()
-
     def apply_baseline_snapshot(self, payload: object) -> None:
         if not isinstance(payload, dict):
             return
-        self.baseline_topic_model.removeRows(0, self.baseline_topic_model.rowCount())
-        for row in payload.get("ros2_topics", ()) or ():
-            if isinstance(row, (tuple, list)):
-                _append_table_row(self.baseline_topic_model, tuple(row))
         self.baseline_mavlink_model.removeRows(0, self.baseline_mavlink_model.rowCount())
         for row in payload.get("mavlink_messages", ()) or ():
             if isinstance(row, (tuple, list)):
                 _append_table_row(self.baseline_mavlink_model, tuple(row))
         self.baseline_status_label.setText(str(payload.get("axis_contract") or "Baseline fields updated."))
-
-    def apply_baseline_field_list(self, payload: object) -> None:
-        self.baseline_field_list.clear()
-        if isinstance(payload, (tuple, list)):
-            self.baseline_field_list.addItems([str(value) for value in payload])
-        if not self.baseline_field_list.count():
-            self.baseline_field_list.addItem("No numeric fields or message type unavailable")
 
     def _selected_media_record(self) -> dict[str, object] | None:
         session_id = str(self.media_session_combo.currentData() or "")
@@ -2012,9 +1993,13 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         for row in data.get("rows", ()) or ():
             if isinstance(row, dict):
                 _append_table_row(self.media_model, tuple(row.get(column, "") for column in columns))
-        self.media_status_label.setText(
-            f"{artifact}: {len(data.get('rows', ()) or ())} preview rows | "
-            f"{data.get('time_axis', 'stored time axis')} | {data.get('coordinate_contract', 'stored fields preserved')}"
+        media_detail = (
+            f"{artifact}: {len(data.get('rows', ()) or ())} rows · "
+            f"{data.get('time_axis', 'stored time axis')} · fields unchanged"
+        )
+        self.media_status_label.setText(_compact_text(media_detail))
+        self.media_status_label.setToolTip(
+            f"{media_detail}\n{data.get('coordinate_contract', 'stored fields preserved')}"
         )
 
     def media_open_session(self) -> bool:
@@ -2061,7 +2046,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Recording / Review / Export",
-                "Global record/save commands use the existing session owner. This page exposes session, output, and partial-failure evidence read-only.",
+                "Session · preflight · artifacts",
             )
         )
         status_group = QtWidgets.QGroupBox("Session status")
@@ -2074,6 +2059,25 @@ class RecordingWorkspace(QtWidgets.QWidget):
             self.indicators[key] = indicator
             status_layout.addWidget(indicator, index // 2, index % 2)
         layout.addWidget(status_group)
+
+        protocol_group = QtWidgets.QGroupBox("Experiment preflight (advisory)")
+        protocol_layout = QtWidgets.QVBoxLayout(protocol_group)
+        protocol_layout.setContentsMargins(6, 6, 6, 6)
+        self.protocol_state_label = QtWidgets.QLabel("BLOCKED · evidence waiting")
+        self.protocol_state_label.setObjectName("protocolState")
+        self.protocol_state_label.setWordWrap(True)
+        protocol_layout.addWidget(self.protocol_state_label)
+        self.protocol_check_labels: dict[str, QtWidgets.QLabel] = {}
+        protocol_checks_layout = QtWidgets.QGridLayout()
+        protocol_checks_layout.setContentsMargins(0, 0, 0, 0)
+        for index in range(6):
+            label = QtWidgets.QLabel("--")
+            label.setObjectName("protocolCheck")
+            label.setWordWrap(True)
+            self.protocol_check_labels[str(index)] = label
+            protocol_checks_layout.addWidget(label, index // 2, index % 2)
+        protocol_layout.addLayout(protocol_checks_layout)
+        layout.addWidget(protocol_group)
 
         session_group = QtWidgets.QGroupBox("Current session")
         session_layout = QtWidgets.QGridLayout(session_group)
@@ -2139,7 +2143,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         selector_layout.addWidget(self.open_artifact_button, 1, 3)
         review_layout.addLayout(selector_layout)
         self.review_status_label = QtWidgets.QLabel(
-            "CSV preview preserves saved fields and recording_time_ns; no coordinate or timestamp conversion is applied."
+            "Read-only · saved fields/timestamps unchanged · no NED/ENU conversion"
         )
         self.review_status_label.setObjectName("statusStrip")
         self.review_status_label.setWordWrap(True)
@@ -2163,11 +2167,8 @@ class RecordingWorkspace(QtWidgets.QWidget):
         review_layout.addLayout(review_actions)
         layout.addWidget(review_group)
 
-        self.contract_label = QtWidgets.QLabel(
-            "Session clock: monotonic anchor + wall-clock session ID. Output files are shown from the existing session directory; this view never deletes, rewrites, or reinterprets recorded rows."
-        )
-        self.contract_label.setWordWrap(True)
-        self.contract_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.contract_label = QtWidgets.QLabel("Session clock: monotonic + wall ID")
+        self.contract_label.setObjectName("compactContract")
         layout.addWidget(self.contract_label)
         button = QtWidgets.QPushButton("Open playback / export tools")
         button.setToolTip(
@@ -2181,6 +2182,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         for key, indicator in self.indicators.items():
             indicator.set_status(snapshot.get(key))
+        self._refresh_protocol(snapshot)
         data = _evidence(self.backend).recording()
         for key, value in self.session_values.items():
             raw = data.get(key)
@@ -2201,6 +2203,40 @@ class RecordingWorkspace(QtWidgets.QWidget):
         if not self.artifact_model.rowCount():
             _append_table_row(self.artifact_model, ("--", "No finalized artifacts", "recording session evidence"))
         self.refresh_sessions()
+
+    def _refresh_protocol(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        evidence = _evidence(self.backend)
+        settings = getattr(getattr(self.backend, "panel", self.backend), "settings", None)
+        measurement = evidence.measurement_settings()
+        readiness = evaluate_recording_protocol(
+            snapshot,
+            distance_mode=str(measurement.get("distance_mode", "pixhawk") or "pixhawk"),
+            calibration=evidence.calibration(),
+            baseline=evidence.baseline(),
+            require_rtk_fixed=bool(getattr(settings, "require_rtk_fixed", False)),
+        )
+        self.protocol_state_label.setText(
+            f"{readiness.state} · {len(readiness.blocking)} blocking prerequisite(s) · advisory only"
+        )
+        state_style = (
+            "background:#123d2a; color:#b8f5d0; border:1px solid #2e8b57; padding:5px;"
+            if readiness.state == "READY"
+            else "background:#4a241f; color:#ffd1c8; border:1px solid #c9574a; padding:5px;"
+        )
+        self.protocol_state_label.setStyleSheet(state_style)
+        for index, label in enumerate(self.protocol_check_labels.values()):
+            if index >= len(readiness.checks):
+                label.clear()
+                label.setVisible(False)
+                continue
+            check = readiness.checks[index]
+            label.setVisible(True)
+            detail = str(check.detail)
+            label.setText(f"{'✓' if check.passed else '×'} {check.label}: {_compact_text(detail, limit=112)}")
+            label.setToolTip(detail)
+            label.setStyleSheet(
+                "color:#b8f5d0;" if check.passed else "color:#ffd1c8;"
+            )
 
     def refresh_sessions(self) -> None:
         records = _evidence(self.backend).session_catalog()
@@ -2325,9 +2361,14 @@ class RecordingWorkspace(QtWidgets.QWidget):
             _append_table_row(self.review_model, tuple(row.get(column, "") for column in columns))
         record_error = str(record.get("error") or "")
         failure_note = f" | manifest error: {record_error}" if record_error else ""
-        self.review_status_label.setText(
-            f"{artifact}: {len(rows)}개 preview 행 | {data.get('time_axis', 'stored time axis')} | "
-            f"{data.get('coordinate_contract', 'stored fields preserved')}{failure_note}"
+        review_detail = (
+            f"{artifact}: {len(rows)}개 행 · {data.get('time_axis', 'stored time axis')} · "
+            "fields unchanged · no NED/ENU conversion"
+            f"{failure_note}"
+        )
+        self.review_status_label.setText(_compact_text(review_detail))
+        self.review_status_label.setToolTip(
+            f"{review_detail}\n{data.get('coordinate_contract', 'stored fields preserved')}"
         )
 
 
@@ -2467,7 +2508,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 f"{_display_number(data.get('yaw_deg'))}; "
                 f"age={_display_number(data.get('age_s'), digits=2, suffix='s')}; "
                 f"px4_t={_display_number(data.get('px4_timestamp_s'), digits=6)}; "
-                f"source={data.get('topic') or data.get('namespace') or '--'}"
+                "transport=MAVLink"
             )
         self.pixhawk_view.appendPlainText("\n".join(attitude_lines))
         baseline = evidence.baseline()
@@ -2494,6 +2535,12 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 f"{_display_number(baseline.get('east_m'))}/"
                 f"{_display_number(baseline.get('down_m'))}; "
                 f"length={_display_number(baseline.get('length_m'))} m",
+                "P1→P2 @ P1 body FRD [F,R,D]="
+                f"state={baseline.get('p1_body_frd_state', 'WAITING')} "
+                f"{_display_number(baseline.get('p1_body_frd_forward_m'))}/"
+                f"{_display_number(baseline.get('p1_body_frd_right_m'))}/"
+                f"{_display_number(baseline.get('p1_body_frd_down_m'))} m; "
+                f"attitude_age={_display_number(baseline.get('p1_body_frd_attitude_age_s'), digits=2, suffix='s')}",
             ]
         )
         self.gnss_view.appendPlainText("\n".join(gnss_lines))
@@ -2521,6 +2568,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
         pair_basis = getattr(panel, "selected_runtime_frame_pair_basis", "") or "--"
         rtc_delta = getattr(panel, "selected_runtime_frame_pair_camera_rtc_delta_s", None)
         baseline = getattr(panel, "latest_rtk_baseline", None)
+        body_frd_projection = getattr(panel, "latest_p1_body_frd_baseline", None)
         if baseline is None:
             baseline_text = "NO DATA"
         else:
@@ -2532,6 +2580,14 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 f"length={float(getattr(baseline, 'baseline_m', 0.0)):.3f} m; "
                 f"quality={getattr(baseline, 'fix_quality', 'UNKNOWN')}"
             )
+        if body_frd_projection is None:
+            body_frd_text = "WAITING"
+        else:
+            body_frd_text = (
+                f"{float(getattr(body_frd_projection, 'forward_m', 0.0)):+.3f}/"
+                f"{float(getattr(body_frd_projection, 'right_m', 0.0)):+.3f}/"
+                f"{float(getattr(body_frd_projection, 'down_m', 0.0)):+.3f} m"
+            )
         lines = [
             f"status: {getattr(panel, 'last_distance_status', '--')}",
             f"quality: {getattr(panel, 'last_distance_quality', '--')}",
@@ -2541,6 +2597,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
             f"selected_pair_basis: {pair_basis}",
             f"selected_pair_rtcp_ntp_delta_s: {rtc_delta if rtc_delta is not None else '--'}",
             f"rtk_baseline_ned_m: {baseline_text}",
+            f"rtk_baseline_p1_body_frd_m: {body_frd_text}",
             f"measurement_frame: {MEASUREMENT_FRAME}",
             f"axis_contract: {MEASUREMENT_AXIS_CONTRACT}",
             f"world_frame: {WORLD_FRAME}",

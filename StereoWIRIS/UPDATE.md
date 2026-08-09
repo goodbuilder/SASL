@@ -1,5 +1,39 @@
 # 업데이트 기록
 
+## 2026-08-09 — Workstation 장비 I/O 비동기화 및 전체 회귀 마감
+
+- 변경:
+  - Workstation Pixhawk MAVLink 연결, Ethernet stream 설정, USB Ethernet 부트스트랩, PX4 shell/PARAM/재부팅, MAVLink FTP 영구 설정을 전용 worker로 옮겼다.
+  - GNSS RTCM 주입은 bounded queue worker로 분리해 correction frame마다 UI thread에서 MAVLink 송신이 실행되지 않게 했다.
+  - 녹화 중 PX4 MAG timeline snapshot은 PARAM readback을 암묵적으로 실행하지 않고 마지막 명시적 readback cache만 사용한다.
+  - `CommandRegistry`에서 camera host IP와 Pixhawk host IP 비동기 명령의 completion을 pending 상태로 유지한다.
+  - Workstation 범위에서 ROS2/uXRCE 및 still-image/EXIF TimeSync 표면은 계속 제거된 상태로 유지하고, MAVLink FTP는 PX4 Ethernet 설정 고급 조작으로만 남겼다.
+- 확인:
+  - Workstation regression: **58 passed**.
+  - 전체 `StereoWIRIS/tests`: **672 passed**.
+  - `python3 -m py_compile workstation/standalone_gui.py workstation_core/pixhawk_attitude.py`, `git diff --check` 통과.
+- 남은 위험:
+  - 실제 RTSP/Pixhawk/GNSS 장비의 heartbeat·reconnect·writer flush와 장시간 close는 실장비/manual validation 범위다.
+
+Coordinate contract checked: `workstation_core/pixhawk_attitude.py`, `workstation/standalone_gui.py`, `workstation/command_registry.py`, `StereoWIRIS/tests/test_workstation.py`; MAVLink/RTCM transport threading only changed delivery ownership, while GPS/RTK raw NED `[N,E,D]`, P1 body FRD `[F,R,D]`, camera optical RDF, `baseline_center_frd`, WGS84 and source/receive timestamps remain unchanged.
+
+## 2026-08-09 — P1→P2 body-FRD 기준선 파생값 명시
+
+- 변경:
+  - raw GPS/RTK 기준선은 기존대로 `P1→P2` local NED `[North, East, Down]`으로 유지했다.
+  - PX4 P1 자세가 수신되면 inverse quaternion으로 같은 벡터를 P1 body FRD `[Forward, Right, Down]`으로 변환하는 별도 projection을 추가했다.
+  - Alignment, Inspector, GNSS 상태, Recording preflight와 measurement row에 raw NED와 파생 FRD를 별도 필드/라벨로 노출했다. camera optical RDF와 public `baseline_center_frd`에는 쓰지 않는다.
+- 이유:
+  - 실험자가 P1 방향 기준으로 baseline 성분을 직관적으로 확인하면서도 GPS/NED·Pixhawk FRD·카메라 RDF 좌표 계약을 혼동하지 않게 하기 위해서다.
+- 확인:
+  - inverse quaternion identity/yaw 회전 및 source/target/축 순서 회귀 테스트를 추가했다.
+  - `test_workstation.py` **34 passed**, 전체 `StereoWIRIS/tests` **648 passed**.
+  - `StereoWIRIS/run.sh --check --ui workstation`, import boundary, compileall, `git diff --check`를 통과했다.
+- 남은 위험:
+  - 실장비 GNSS/Pixhawk 자세 품질과 장시간 운용 검증은 별도 manual validation 범위다.
+
+Coordinate contract checked: `workstation_core/attitude_geometry.py`, `workstation_core/rtk_geometry.py`, `workstation_core/triangulation.py`, `workstation/standalone_gui.py`, `workstation/evidence.py`, `workstation/workspaces.py`, `workstation/status_model.py`; raw `P1→P2` local NED `[N,E,D]` remains distinct from derived P1 body FRD `[F,R,D]`, camera optical RDF, and `baseline_center_frd`.
+
 ## 2026-08-09 — Workstation 메인 카드 provenance 표시 정리
 
 - 변경:

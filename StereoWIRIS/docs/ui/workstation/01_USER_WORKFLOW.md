@@ -15,7 +15,7 @@ StereoWIRIS shall not assume only one subsystem is used at a time. Typical work 
 
 1. Application startup and readiness verification
 2. Hardware connection
-3. Camera clock and stream synchronization
+3. Camera RTC and stream synchronization
 4. Live camera observation
 5. Measurement operation
 6. Recording
@@ -45,9 +45,9 @@ Success: required devices for intended task are connected and providing expected
 
 Field sequence for the Workstation implementation:
 1. Camera IP/control/RTSP readiness
-2. WIRIS PC clock, RTCP/NTP, and still-image clock evidence
+2. WIRIS PC clock, RTCP/NTP stream evidence
 3. Pixhawk transport and P1/P2 role mapping
-4. GNSS Base/Rover operation and NED baseline readiness
+4. GNSS Base/Rover operation, raw NED baseline readiness, and the derived P1 body-FRD baseline view
 5. Calibration setup, capture/intrinsics, and validation
 6. Measurement preflight, Preview, Detection, Record, stop, and Save session
 
@@ -97,6 +97,13 @@ Required visibility:
 - write/save errors
 - relevant system state
 
+Before capture, the Recording workspace shows an advisory experiment preflight. The
+pass criteria are both camera streams live, RTCP/NTP pair synchronization verified,
+detection running, active stereo intrinsics, and either P1/P2 MAVLink plus the GNSS/RTK
+NED baseline or checkerboard left-to-right optical RDF geometry according to the selected
+measurement path. `require_rtk_fixed` adds the RTK-fixed condition. `READY`/`BLOCKED` is
+evidence only and does not change the existing recording command.
+
 State candidates: Idle, Starting, Recording, Stopping, Saved, Error.
 
 Record command is not proof that data is being written.
@@ -124,6 +131,10 @@ Expose connectivity, attitude, timestamp/age, source, relative attitude, and rel
 ## 12. GNSS / RTK Verification
 
 Expose receiver state, fix/quality, satellites, eph/epv, baseline, RTK, source, timestamp/age.
+The selected antenna baseline remains `P1→P2` in local NED `[North, East, Down]`.
+When P1 attitude is available, show the same vector separately in P1 body FRD
+`[Forward, Right, Down]`; this is an attitude-derived operator aid and is not camera
+optical RDF or `baseline_center_frd` measurement output.
 
 ## 13. Detection
 

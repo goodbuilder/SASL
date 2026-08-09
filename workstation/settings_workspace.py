@@ -5,7 +5,7 @@ from typing import Any
 
 from PyQt5 import QtWidgets
 
-from wiris_stereo_distance.settings import AppSettings, PIXHAWK_ETHERNET_MODES
+from workstation_core.settings import AppSettings
 
 from .components import WorkspaceHeader
 
@@ -34,7 +34,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Settings",
-                "All editable AppSettings are collected here. Apply updates the existing panel owner; Save persists the same JSON contract.",
             )
         )
 
@@ -45,15 +44,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
         self._build_pixhawk_tab()
         self._build_runtime_tab()
         self._build_gnss_tab()
-        self._build_clock_tab()
         layout.addWidget(self.tabs, 1)
 
-        self.status_label = QtWidgets.QLabel(
-            "단위와 주소 형식은 기존 설정 계약을 따릅니다. GNSS 좌표는 WGS84, 측정 출력은 기존 NED/카메라 계약을 유지합니다."
-        )
-        self.status_label.setObjectName("statusStrip")
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
         actions = QtWidgets.QHBoxLayout()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for command_id, label in (
@@ -302,14 +294,11 @@ class SettingsWorkspace(QtWidgets.QWidget):
         layout.addStretch(1)
 
     def _build_pixhawk_tab(self) -> None:
-        layout = self._tab("PX4 / ROS2")
+        layout = self._tab("PX4 / MAVLink")
         layout.addWidget(
             self._group(
-                "ROS2 / host",
+                "MAVLink / host",
                 [
-                    ("ROS domain ID", self._integer("ros_domain_id", 0, 232)),
-                    ("Left namespace", self._text("left_namespace")),
-                    ("Right namespace", self._text("right_namespace")),
                     ("Pixhawk host address", self._text("pixhawk_host_address")),
                 ],
             )
@@ -335,11 +324,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
             self._group(
                 "PX4 transport setup",
                 [
-                    ("Ethernet mode", self._combo("pixhawk_ethernet_mode", tuple((mode.upper(), mode) for mode in PIXHAWK_ETHERNET_MODES))),
+                    ("Ethernet mode", self._combo("pixhawk_ethernet_mode", (("MAVLink", "mavlink"),))),
                     ("Configure MAVLink streams", self._toggle("mavlink_configure_streams", "Apply stream parameters after MAVLink connect")),
                     ("MAVLink stream rate", self._integer("mavlink_stream_rate", 1, 10_000_000)),
-                    ("Configure uXRCE agent", self._toggle("mavlink_configure_uxrce_agent", "Apply uXRCE-DDS agent parameters")),
-                    ("uXRCE agent port", self._integer("uxrce_port", 1, 65535)),
                 ],
             )
         )
@@ -361,12 +348,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
-        note = QtWidgets.QLabel(
-            "기존 Measurement 화면의 focal/distance/gate/synchronization 값과 Calibration 화면의 geometry/validation 값은 해당 화면에서 계속 편집합니다."
-        )
-        note.setWordWrap(True)
-        note.setObjectName("statusStrip")
-        layout.addWidget(note)
         layout.addStretch(1)
 
     def _build_gnss_tab(self) -> None:
@@ -441,23 +422,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("Height type", self._combo("gnss_fixed_height_type", (("Ellipsoid", "ELLIPSOID"), ("MSL", "MSL"), ("Unknown", "UNKNOWN")))),
                     ("Route to drone", self._toggle("gnss_route_drone_enabled", "Enable drone correction route")),
                     ("Field base route", self._toggle("gnss_route_field_base_enabled", "Enable field-base route")),
-                ],
-            )
-        )
-        layout.addStretch(1)
-
-    def _build_clock_tab(self) -> None:
-        layout = self._tab("Clock / FTP")
-        layout.addWidget(
-            self._group(
-                "WIRIS photo clock",
-                [
-                    ("FTP user", self._text("clock_ftp_user")),
-                    ("FTP password", self._text("clock_ftp_password", password=True)),
-                    ("FTP port", self._integer("clock_ftp_port", 1, 65535)),
-                    ("Remote directory", self._text("clock_ftp_remote_dir")),
-                    ("Download directory", self._text("clock_download_dir")),
-                    ("Capture wait", self._number("clock_capture_wait_s", 0.0, 3600.0, 2, " s")),
                 ],
             )
         )

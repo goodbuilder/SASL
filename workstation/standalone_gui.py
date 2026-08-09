@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import ftplib
 import hashlib
 import html as html_lib
 import faulthandler
@@ -31,7 +30,7 @@ from urllib.parse import urlparse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from wiris_stereo_distance.calibration import (
+from workstation_core.calibration import (
     CheckerboardConfig,
     StereoIntrinsicsResult,
     calibrate_camera_from_images,
@@ -42,14 +41,14 @@ from wiris_stereo_distance.calibration import (
     save_intrinsics_json,
 )
 
-from wiris_stereo_distance.attitude_geometry import (
+from workstation_core.attitude_geometry import (
     quaternion_conjugate,
     quaternion_multiply,
     relative_attitude,
     relative_rotation_angle_deg,
 )
-from wiris_stereo_distance.camera_pane import CameraPane
-from wiris_stereo_distance.coordinate_contract import (
+from workstation_core.camera_pane import CameraPane
+from workstation_core.coordinate_contract import (
     BODY_FRAME,
     CAMERA_FRAME,
     CAMERA_MOUNT_PROFILE,
@@ -59,7 +58,7 @@ from wiris_stereo_distance.coordinate_contract import (
     PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
     WORLD_FRAME,
 )
-from wiris_stereo_distance.measurement_widgets import (
+from workstation_core.measurement_widgets import (
     ClockOffsetHistoryPlot,
     ClockOffsetPoint,
     DistanceHistoryPlot,
@@ -67,7 +66,7 @@ from wiris_stereo_distance.measurement_widgets import (
     Triangulation3DView,
     triangulation_3d_scene_points,
 )
-from wiris_stereo_distance.measurement_attempt import (
+from workstation_core.measurement_attempt import (
     AttitudeSnapshot,
     DetectionSnapshot,
     GeometryConfigSnapshot,
@@ -78,10 +77,10 @@ from wiris_stereo_distance.measurement_attempt import (
     build_pixhawk_baseline_snapshot,
     detection_pair_key,
 )
-from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
-from wiris_stereo_distance.fixed_base_initializer import FixedBaseInitializer
-from wiris_stereo_distance.gnss_network import NtripClient, format_nmea_gga, gga_from_position
-from wiris_stereo_distance.gnss_operation import (
+from workstation_core.measurement_controller import calculate_measurement_geometry
+from workstation_core.fixed_base_initializer import FixedBaseInitializer
+from workstation_core.gnss_network import NtripClient, format_nmea_gga, gga_from_position
+from workstation_core.gnss_operation import (
     CorrectionSourceIdentity,
     evaluate_gnss_readiness,
     GnssReadinessInputs,
@@ -98,11 +97,11 @@ from wiris_stereo_distance.gnss_operation import (
     RoverReadinessInput,
     STATE_STATUS_GROUP,
 )
-from wiris_stereo_distance.gnss_profile import (
+from workstation_core.gnss_profile import (
     GnssCoordinateSample,
     geodetic_to_ecef_m,
 )
-from wiris_stereo_distance.network import (
+from workstation_core.network import (
     DEFAULT_CAMERA_URLS,
     DEFAULT_HOST_ADDRESS,
     DEFAULT_INTERFACE,
@@ -123,13 +122,13 @@ from wiris_stereo_distance.network import (
     select_host_for_camera,
     tcp_port_scan_sequence,
 )
-from wiris_stereo_distance.baseline_alignment import (
+from workstation_core.baseline_alignment import (
     BaselineQuality,
     BaselineVector,
     baseline_from_gps,
     evaluate_baseline_quality,
 )
-from wiris_stereo_distance.alignment_managers import (
+from workstation_core.alignment_managers import (
     AlignmentProfileManager,
     AlignmentValidator,
     AttitudeMonitor,
@@ -138,38 +137,24 @@ from wiris_stereo_distance.alignment_managers import (
     GNSSMonitor,
     MagnetometerMonitor,
 )
-from wiris_stereo_distance.photo_clock import (
-    ClockFolderResult,
-    ClockOffsetResult,
-    PhotoMetadataError,
-    compare_photo_clocks,
-    compare_photo_folders,
-    format_offset_seconds,
-    format_photo_timestamp,
-)
-from wiris_stereo_distance.pixhawk_attitude import (
+from workstation_core.pixhawk_attitude import (
     CameraExtrinsicState,
     CustomTopicSample,
     DEFAULT_USB_MAVLINK_BAUDRATES,
-    DualPixhawkAttitudeSubscriber,
     DualPixhawkMavlinkSubscriber,
+    MavlinkShellCommandResult,
     camera_label_ko,
-    describe_ros2_message_fields,
     discover_mavlink_messages,
-    discover_pixhawk_topics,
-    discover_ros2_topic_types,
     mavlink_graphable_fields_for_message,
     magnetometer_value_units,
     probe_usb_mavlink_devices,
-    sensor_gps_topics,
-    sensor_mag_topics,
     usb_mavlink_device_candidates,
-    _ros2_topic_has_publisher,
 )
-from wiris_stereo_distance.px4_mag_manager import (
+from workstation_core.px4_mag_manager import (
     BOARD_INTERNAL_MAG_ID,
     GPS1_MAG_ID,
     GPS2_MAG_ID,
+    MAG_PARAM_NAMES,
     MAG_SLOTS,
     MockParameterStore,
     Px4MagManager,
@@ -178,16 +163,26 @@ from wiris_stereo_distance.px4_mag_manager import (
     RM3100_IDS,
     RM3100_PRIMARY_ID,
     RM3100_PRIMARY_IDS,
+    build_mag_status,
     current_pixhawk_6x_mag_params,
     identify_mag_device,
 )
-from wiris_stereo_distance.px4_attitude_cal_manager import (
+from workstation_core.px4_attitude_cal_manager import (
+    ATTITUDE_CAL_PARAM_NAMES,
     Px4AttitudeCalManager,
     Px4AttitudeCalStatus,
+    build_attitude_cal_status,
     current_pixhawk_6x_attitude_cal_params,
 )
-from wiris_stereo_distance.rtk_geometry import GpsPositionState, RtkBaselineEstimate, estimate_rtk_baseline, ned_delta_m
-from wiris_stereo_distance.recording_session import (
+from workstation_core.rtk_geometry import (
+    BodyFrdBaselineProjection,
+    GpsPositionState,
+    RtkBaselineEstimate,
+    estimate_rtk_baseline,
+    ned_delta_m,
+    project_ned_baseline_to_p1_body_frd,
+)
+from workstation_core.recording_session import (
     SavedSessionFiles,
     SpoolRows,
     compact_distance_measurement_rows,
@@ -201,22 +196,19 @@ from wiris_stereo_distance.recording_session import (
     session_sheet_previews,
     write_recovery_metadata,
 )
-from wiris_stereo_distance.settings import (
-    DEFAULT_CLOCK_DOWNLOAD_DIR,
+from workstation_core.settings import (
     DEFAULT_INTRINSICS_PATH,
-    DEFAULT_PIXHAWK_ETHERNET_MODE,
-    PIXHAWK_ETHERNET_MODES,
     AppSettings,
     load_settings as _load_shared_settings,
     resolve_settings_path,
     save_settings as _save_shared_settings,
 )
-from wiris_stereo_distance.stereo import (
+from workstation_core.stereo import (
     DetectionObservation,
     correspondence_rejection_reason,
     detection_timestamp_for_basis,
 )
-from wiris_stereo_distance.theme import (
+from workstation_core.theme import (
     ACCENT,
     ACCENT_ACTIVE,
     ACCENT_HOVER,
@@ -255,7 +247,7 @@ from wiris_stereo_distance.theme import (
     WARNING_BG,
     WARNING_TEXT,
 )
-from wiris_stereo_distance.sync import (
+from workstation_core.sync import (
     ATTITUDE_STALE_AGE_S,
     ATTITUDE_STALE_PAIR_DELTA_S,
     ATTITUDE_TIMING_POLICY,
@@ -265,15 +257,14 @@ from wiris_stereo_distance.sync import (
     classify_attitude_timing,
     match_nearest_pair,
 )
-from wiris_stereo_distance.triangulation import (
+from workstation_core.triangulation import (
     RayTriangulationResult,
     body_frd_vector_to_camera,
     camera_translation_right_in_left_camera,
     invert_left_to_right_camera_transform,
     world_ned_vector_to_body_frd,
 )
-from wiris_stereo_distance.xrce_agent import ensure_micro_xrce_agent
-from wiris_stereo_distance.yolo_stream import (
+from workstation_core.yolo_stream import (
     DECODER_AUTO,
     DECODER_NVIDIA,
     DECODER_SOFTWARE,
@@ -292,6 +283,7 @@ from wiris_stereo_distance.yolo_stream import (
     normalize_stream_backend,
 )
 from sasl_common.lifecycle import LifecycleCoordinator, LifecycleStep
+from workstation.evidence import mavlink_link_provenance
 from workstation.runtime_paths import WORKSTATION_DATA_ROOT, WORKSTATION_SETTINGS_PATH
 
 
@@ -307,7 +299,7 @@ def load_settings(path: str | Path | None = None) -> AppSettings:
 def save_settings(settings: AppSettings, path: str | Path | None = None) -> None:
     _save_shared_settings(settings, WORKSTATION_SETTINGS_PATH if path is None else path)
 
-from wiris_stereo_distance.wiris_zoom import (
+from workstation_core.wiris_zoom import (
     DEFAULT_ZOOM_CONTROL_PORT,
     DEFAULT_ZOOM_IN_TEMPLATE,
     DEFAULT_ZOOM_OUT_TEMPLATE,
@@ -380,10 +372,10 @@ NETWORK_FIELD_MIN_WIDTHS = {
 }
 APP_WINDOW_TITLE = "StereoWIRIS"
 STARTUP_CAMERA_STATUS = "카메라: 대기 중 - 장비 연결 후 영상 수신 확인 또는 카메라 Preview 연결"
-STARTUP_PIXHAWK_STATUS = "픽스호크: 대기 중 - 장비 연결 후 ROS2 연결 또는 MAVLink 연결"
+STARTUP_PIXHAWK_STATUS = "픽스호크: 대기 중 - 장비 연결 후 MAVLink 연결"
 STARTUP_READY_MESSAGE = (
     "[연결] 카메라/픽스호크 미연결 상태에서도 앱을 사용할 수 있습니다. "
-    "장비 연결 후 영상 수신 확인, 카메라 Preview 연결, ROS2 연결 또는 MAVLink 연결을 누르세요."
+    "장비 연결 후 영상 수신 확인, 카메라 Preview 연결 또는 MAVLink 연결을 누르세요."
 )
 YOLO_CPU_DEVICE = "cpu"
 YOLO_CUDA_DEVICE = "cuda:0"
@@ -443,7 +435,6 @@ GNSS_ID_LABELS = {
 RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
 RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
-WIRIS_FTP_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff")
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
 
@@ -519,8 +510,6 @@ WIRIS_COMMAND_CATALOG = (
     ("Zoom", "Get thermal zoom list", "GZTL", LINE_TERMINATOR, "지원되는 열화상 줌 값 목록을 읽습니다."),
     ("Zoom", "Set visible zoom", "SZVN <index>", LINE_TERMINATOR, "가시광 줌 값을 설정합니다. <index>를 지원 값으로 바꾸세요."),
     ("Zoom", "Get visible zoom", "GZVV", LINE_TERMINATOR, "현재 가시광 줌 값을 읽습니다."),
-    ("Capture/Record", "Capture image", "CPTR", LINE_TERMINATOR, "카메라 자체 이미지 캡처를 트리거합니다."),
-    ("Capture/Record", "Is capturing", "ICPT", LINE_TERMINATOR, "카메라 캡처 진행 상태를 읽습니다."),
     ("Capture/Record", "Recording start", "RCRS", LINE_TERMINATOR, "카메라 자체 녹화를 시작합니다."),
     ("Capture/Record", "Recording finish", "RCRF", LINE_TERMINATOR, "카메라 자체 녹화를 종료합니다."),
     ("Capture/Record", "Is recording", "IRCR", LINE_TERMINATOR, "카메라 녹화 상태를 읽습니다."),
@@ -1604,23 +1593,1038 @@ class CameraAutoDetectWorker(QtCore.QObject):
             self.finished.emit()
 
 
-class PixhawkAutoDetectWorker(QtCore.QObject):
-    detected = QtCore.pyqtSignal(object)
+class WirisControlCheckWorker(QtCore.QObject):
+    """Probe WIRIS control ports without blocking the Qt event loop."""
+
+    checked = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
 
-    def __init__(self, *, domain_id: int) -> None:
+    def __init__(self, targets: Sequence[tuple[str, str, int]], *, timeout_s: float) -> None:
         super().__init__()
-        self.domain_id = domain_id
+        self.targets = tuple((str(label), str(host), int(port)) for label, host, port in targets)
+        self.timeout_s = max(0.1, float(timeout_s))
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        results: list[dict[str, object]] = []
+        try:
+            for label, host, port in self.targets:
+                if not host.strip():
+                    results.append({"label": label, "host": host, "port": port, "state": "missing-host"})
+                    continue
+                try:
+                    is_open = bool(check_tcp_port(host.strip(), port, timeout=self.timeout_s))
+                except Exception as exc:
+                    results.append(
+                        {
+                            "label": label,
+                            "host": host,
+                            "port": port,
+                            "state": "error",
+                            "error": str(exc),
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "label": label,
+                            "host": host,
+                            "port": port,
+                            "state": "control-open" if is_open else "control-closed",
+                        }
+                    )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.checked.emit(results)
+        finally:
+            self.finished.emit()
+
+
+class WirisCommandWorker(QtCore.QObject):
+    """Send one SDK command to one or both cameras off the UI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        *,
+        command_text: str,
+        terminator: str,
+    ) -> None:
+        super().__init__()
+        self.target_infos = tuple(
+            (str(label), str(host), int(port), max(0.1, float(timeout_s)))
+            for label, host, port, timeout_s in target_infos
+        )
+        self.command_text = str(command_text)
+        self.terminator = str(terminator)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        statuses: dict[str, str] = {}
+        command_logs: dict[str, str] = {}
+        send_times: dict[str, float] = {}
+        barrier = threading.Barrier(len(self.target_infos)) if len(self.target_infos) >= 2 else None
+
+        def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
+            try:
+                command = build_wiris_command(
+                    host=host,
+                    port=port,
+                    command=self.command_text,
+                    timeout_s=timeout_s,
+                    terminator=self.terminator,
+                )
+                if barrier is not None:
+                    barrier.wait(timeout=max(1.0, timeout_s))
+                send_times[label] = time.perf_counter()
+                response = send_tcp_line(command)
+            except Exception as exc:
+                statuses[label] = f"실패: {exc}"
+                return
+            response_text = response or "<no response>"
+            statuses[label] = response_text
+            command_logs[label] = f"> {label} {command.host}:{command.port} {command.command}\n{response_text}\n"
+
+        threads = [
+            threading.Thread(
+                target=send_one,
+                args=(label, host, port, timeout_s),
+                name=f"wiris-command-{label}",
+            )
+            for label, host, port, timeout_s in self.target_infos
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            max_timeout_s = max(max(1.0, timeout_s) for _label, _host, _port, timeout_s in self.target_infos)
+            for thread in threads:
+                thread.join(timeout=max_timeout_s + 1.0)
+            for label, _host, _port, _timeout_s in self.target_infos:
+                statuses.setdefault(label, "실패: 전송 스레드 timeout")
+            self.completed.emit(
+                {
+                    "statuses": statuses,
+                    "command_logs": command_logs,
+                    "send_times": send_times,
+                    "target_infos": self.target_infos,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class WirisZoomWorker(QtCore.QObject):
+    """Send WIRIS zoom commands without blocking the UI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        targets: Sequence[tuple[str, str, int]],
+        *,
+        template: str,
+        level: int | None,
+        timeout_s: float,
+    ) -> None:
+        super().__init__()
+        self.targets = tuple((str(label), str(host), int(port)) for label, host, port in targets)
+        self.template = str(template)
+        self.level = None if level is None else int(level)
+        self.timeout_s = max(0.1, float(timeout_s))
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        statuses: list[dict[str, object]] = []
+        try:
+            for label, host, port in self.targets:
+                try:
+                    command = build_zoom_command(
+                        host=host,
+                        port=port,
+                        template=self.template,
+                        level=self.level,
+                        timeout_s=self.timeout_s,
+                    )
+                    response = send_tcp_line(command)
+                except Exception as exc:
+                    statuses.append({"label": label, "state": "failed", "detail": str(exc)})
+                else:
+                    statuses.append(
+                        {
+                            "label": label,
+                            "state": "sent",
+                            "command": command.command,
+                            "response": response,
+                        }
+                    )
+            self.completed.emit(statuses)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class PixhawkUsbDiscoveryWorker(QtCore.QObject):
+    """Probe USB serial candidates without blocking the owner UI."""
+
+    discovered = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, timeout_s: float = 0.8) -> None:
+        super().__init__()
+        self.timeout_s = max(0.1, float(timeout_s))
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            result = discover_pixhawk_topics(current_domain_id=self.domain_id, timeout_s=1.5)
+            candidates = usb_mavlink_device_candidates()
+            found = probe_usb_mavlink_devices(candidates=candidates, timeout_s=self.timeout_s) if candidates else []
         except Exception as exc:
             self.failed.emit(str(exc))
         else:
-            self.detected.emit(result)
+            self.discovered.emit({"candidates": candidates, "found": found})
+        finally:
+            self.finished.emit()
+
+
+class CameraNetworkDiscoveryWorker(QtCore.QObject):
+    """Discover camera-network interfaces and NetworkManager addresses off the UI thread."""
+
+    discovered = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, host_address: str, host_hints: Sequence[str]) -> None:
+        super().__init__()
+        self.host_address = str(host_address)
+        self.host_hints = tuple(str(value) for value in host_hints)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            candidates = discover_host_interface_candidates(
+                host_address=self.host_address or DEFAULT_HOST_ADDRESS,
+                include_unconfigured=True,
+            )
+            if not candidates:
+                result = {"candidates": (), "resolved_address": None, "connection_name": None, "addresses": ()}
+            else:
+                selected = candidates[0]
+                interface_name = str(getattr(selected.interface, "name", ""))
+                resolved_address = resolve_nm_interface_address(interface_name, self.host_hints)
+                connection_name = nm_device_connection_name(interface_name)
+                addresses = () if connection_name is None else nm_connection_ipv4_addresses(connection_name)
+                result = {
+                    "candidates": tuple(candidates),
+                    "resolved_address": resolved_address,
+                    "connection_name": connection_name,
+                    "addresses": tuple(addresses),
+                }
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.discovered.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class CameraNetworkAddressApplyWorker(QtCore.QObject):
+    """Apply a selected camera-network address without blocking the UI."""
+
+    applied = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, *, interface_name: str, address_text: str) -> None:
+        super().__init__()
+        self.interface_name = str(interface_name)
+        self.address_text = str(address_text)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            ok, message = apply_interface_address(self.interface_name, self.address_text)
+            addresses = interface_addresses(self.interface_name) if ok else ""
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.applied.emit(
+                {
+                    "ok": bool(ok),
+                    "message": str(message),
+                    "interface_name": self.interface_name,
+                    "address_text": self.address_text,
+                    "addresses": addresses,
+                }
+            )
+        finally:
+            self.finished.emit()
+
+
+class InterfaceStatusWorker(QtCore.QObject):
+    """Read one local interface status without blocking panel construction."""
+
+    ready = QtCore.pyqtSignal(str, str)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, interface_name: str) -> None:
+        super().__init__()
+        self.interface_name = str(interface_name)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            status = interface_addresses(self.interface_name)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.ready.emit(self.interface_name, str(status))
+        finally:
+            self.finished.emit()
+
+
+class PixhawkHostIpDiscoveryWorker(QtCore.QObject):
+    """Enumerate local IPv4 interfaces for Pixhawk host candidates off the UI thread."""
+
+    discovered = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            interfaces = local_ipv4_interfaces(include_wireless=True)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.discovered.emit(tuple(interfaces))
+        finally:
+            self.finished.emit()
+
+
+class PixhawkConnectionWorker(QtCore.QObject):
+    """Open a MAVLink transport without touching the Workstation event loop."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str | None) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.camera = None if camera is None else str(camera)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            self.subscriber.start(
+                self.camera,
+                start_timer=False,
+                apply_pending_setup=False,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(
+                {
+                    "camera": self.camera,
+                    "connections": tuple(getattr(self.subscriber, "connections", {}).keys()),
+                }
+            )
+        finally:
+            self.finished.emit()
+
+
+class PixhawkStreamSetupWorker(QtCore.QObject):
+    """Apply the optional PX4 MAVLink stream setup away from the UI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        *,
+        host_ip: str,
+        ports: dict[str, int],
+        sysids: dict[str, int],
+        rate: int,
+        cameras: Sequence[str],
+    ) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.host_ip = str(host_ip)
+        self.ports = {str(key): int(value) for key, value in dict(ports).items()}
+        self.sysids = {str(key): int(value) for key, value in dict(sysids).items()}
+        self.rate = int(rate)
+        self.cameras = tuple(str(camera) for camera in cameras)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            self.subscriber.configure_mavlink_streams(
+                host_ip=self.host_ip,
+                ports=self.ports,
+                sysids=self.sysids,
+                rate=self.rate,
+                cameras=self.cameras,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(
+                {
+                    "host_ip": self.host_ip,
+                    "ports": dict(self.ports),
+                    "cameras": self.cameras,
+                }
+            )
+        finally:
+            self.finished.emit()
+
+
+class PixhawkUsbBootstrapWorker(QtCore.QObject):
+    """Bootstrap one Ethernet MAVLink stream over a temporary USB link."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        camera: str,
+        usb_url: str,
+        baud_candidates: Sequence[int],
+        command: str,
+        fallback_command: str,
+    ) -> None:
+        super().__init__()
+        self.camera = str(camera)
+        self.usb_url = str(usb_url)
+        self.baud_candidates = tuple(int(value) for value in baud_candidates if int(value) > 0)
+        self.command = str(command)
+        self.fallback_command = str(fallback_command)
+
+    @staticmethod
+    def _heartbeat(subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> bool:
+        connection = getattr(subscriber, "connections", {}).get(camera)
+        if connection is None:
+            return False
+        wait_heartbeat = getattr(connection, "wait_heartbeat", None)
+        if wait_heartbeat is None:
+            return True
+        try:
+            return wait_heartbeat(timeout=1.2) is not None
+        except Exception:
+            return False
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        last_error = ""
+        selected_baud: int | None = None
+        output = ""
+        flag_label = ""
+        for candidate_baud in self.baud_candidates:
+            temp = DualPixhawkMavlinkSubscriber(
+                left_url=self.usb_url if self.camera == "left" else "",
+                right_url=self.usb_url if self.camera == "right" else "",
+                left_baud=candidate_baud,
+                right_baud=candidate_baud,
+            )
+            try:
+                temp.start(self.camera, start_timer=False, apply_pending_setup=False)
+                if not self._heartbeat(temp, self.camera):
+                    last_error = f"{candidate_baud} baud heartbeat timeout"
+                    continue
+                with temp.exclusive_command(self.camera):
+                    result = temp.send_shell_command_with_result(
+                        self.camera,
+                        self.command,
+                        timeout_s=2.0,
+                    )
+                    if "invalid mode" in result.output.lower() and self.fallback_command:
+                        result = temp.send_shell_command_with_result(
+                            self.camera,
+                            self.fallback_command,
+                            timeout_s=2.0,
+                        )
+                selected_baud = candidate_baud
+                output = str(result.output or "")
+                flag_label = str(result.flag_label or "")
+                break
+            except Exception as exc:
+                last_error = f"{candidate_baud} baud: {exc}"
+            finally:
+                try:
+                    temp.stop(self.camera)
+                except Exception:
+                    pass
+        if selected_baud is None:
+            self.failed.emit(last_error or "USB MAVLink bootstrap failed")
+        else:
+            self.completed.emit(
+                {
+                    "camera": self.camera,
+                    "baud": selected_baud,
+                    "output": output,
+                    "flag_label": flag_label,
+                }
+            )
+        self.finished.emit()
+
+
+class PixhawkPersistentConfigWorker(QtCore.QObject):
+    """Apply PX4 Ethernet settings and persist their files off the UI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        *,
+        camera: str,
+        command: str,
+        extras_text: str,
+        net_cfg_text: str,
+    ) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.camera = str(camera)
+        self.command = str(command)
+        self.extras_text = str(extras_text)
+        self.net_cfg_text = str(net_cfg_text)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            with self.subscriber.exclusive_command(self.camera):
+                result = self.subscriber.send_shell_command_with_result(
+                    self.camera,
+                    self.command,
+                    timeout_s=3.0,
+                )
+                self.subscriber.write_remote_file_mavftp(
+                    self.camera,
+                    "/fs/microsd/etc/extras.txt",
+                    self.extras_text,
+                )
+                self.subscriber.write_remote_file_mavftp(
+                    self.camera,
+                    "/fs/microsd/net.cfg",
+                    self.net_cfg_text,
+                )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(
+                {
+                    "camera": self.camera,
+                    "output": str(getattr(result, "output", "") or ""),
+                    "flag_label": str(getattr(result, "flag_label", "") or ""),
+                }
+            )
+        finally:
+            self.finished.emit()
+
+
+class PixhawkRtcmInjectionWorker(QtCore.QObject):
+    """Queue RTCM packets so GNSS correction delivery never runs in the UI."""
+
+    request = QtCore.pyqtSignal(object, object)
+    injected = QtCore.pyqtSignal(object)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, *, max_queue: int = 96) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.max_queue = max(1, int(max_queue))
+        self._queue: deque[tuple[tuple[str, ...], bytes]] = deque()
+        self._queue_lock = threading.Lock()
+        self._draining = False
+
+    @QtCore.pyqtSlot(object, object)
+    def enqueue(self, sides: object, payload: object) -> None:
+        target_sides = tuple(str(side) for side in (sides or ()))
+        frame = bytes(payload or b"")
+        if not target_sides or not frame:
+            return
+        with self._queue_lock:
+            dropped = 0
+            while len(self._queue) >= self.max_queue:
+                self._queue.popleft()
+                dropped += 1
+            self._queue.append((target_sides, frame))
+            if self._draining:
+                return
+            self._draining = True
+        if dropped:
+            self.injected.emit({"dropped": dropped, "payload_bytes": 0, "sent": (), "failed": ()})
+        self._drain_one()
+
+    def _drain_one(self) -> None:
+        with self._queue_lock:
+            if not self._queue:
+                self._draining = False
+                return
+            sides, payload = self._queue.popleft()
+        sent: list[tuple[str, int]] = []
+        failed: list[tuple[str, str]] = []
+        for side in sides:
+            try:
+                with self.subscriber.exclusive_command(side):
+                    packet_count = int(self.subscriber.send_rtcm_data(side, payload) or 0)
+                sent.append((side, packet_count))
+            except Exception as exc:
+                failed.append((side, str(exc)))
+        self.injected.emit(
+            {
+                "payload_bytes": len(payload),
+                "sent": tuple(sent),
+                "failed": tuple(failed),
+                "dropped": 0,
+            }
+        )
+        QtCore.QTimer.singleShot(0, self._drain_one)
+
+    def clear_pending(self) -> None:
+        with self._queue_lock:
+            self._queue.clear()
+
+
+class PixhawkShellCommandWorker(QtCore.QObject):
+    """Run one blocking MAVLink shell/reboot operation off the UI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        *,
+        camera: str,
+        command: str,
+        operation: str = "shell",
+        timeout_s: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.camera = str(camera)
+        self.command = str(command)
+        self.operation = str(operation)
+        self.timeout_s = max(0.1, float(timeout_s))
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            with self.subscriber.exclusive_command(self.camera):
+                if self.operation == "reboot":
+                    self.subscriber.reboot_autopilot(self.camera)
+                    result: dict[str, object] = {
+                        "camera": self.camera,
+                        "operation": self.operation,
+                        "command": self.command,
+                        "output": "",
+                        "flag_label": "command-sent",
+                    }
+                else:
+                    shell_result = self.subscriber.send_shell_command_with_result(
+                        self.camera,
+                        self.command,
+                        timeout_s=self.timeout_s,
+                    )
+                    if isinstance(shell_result, MavlinkShellCommandResult):
+                        result = {
+                            "camera": self.camera,
+                            "operation": self.operation,
+                            "command": shell_result.command,
+                            "output": shell_result.output,
+                            "flag_label": shell_result.flag_label,
+                        }
+                    else:
+                        result = {
+                            "camera": self.camera,
+                            "operation": self.operation,
+                            "command": self.command,
+                            "output": str(getattr(shell_result, "output", "") or ""),
+                            "flag_label": str(getattr(shell_result, "flag_label", "unknown")),
+                        }
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class PixhawkParameterWorker(QtCore.QObject):
+    """Read or update PX4 parameters without blocking the Workstation UI."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber,
+        *,
+        camera: str,
+        operation: str,
+        actual_selected_device_id: int | None = None,
+        armed: bool = False,
+        priorities: dict[str, int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.camera = str(camera)
+        self.operation = str(operation)
+        self.actual_selected_device_id = actual_selected_device_id
+        self.armed = bool(armed)
+        self.priorities = {str(key): int(value) for key, value in dict(priorities or {}).items()}
+
+    def _read_mag_params(self) -> dict[str, int | float | None]:
+        return {
+            name: self.subscriber.read_param_int(self.camera, name, timeout_s=1.5)
+            for name in MAG_PARAM_NAMES
+        }
+
+    def _read_attitude_params(self) -> dict[str, int | float | None]:
+        return {
+            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
+            for name in ATTITUDE_CAL_PARAM_NAMES
+        }
+
+    @staticmethod
+    def _role_for_device_id(device_id: int | None) -> str | None:
+        if device_id == BOARD_INTERNAL_MAG_ID:
+            return "BOARD"
+        if device_id in RM3100_PRIMARY_IDS:
+            return "CAN1"
+        if device_id in RM3100_BACKUP_IDS:
+            return "CAN2"
+        if device_id == GPS1_MAG_ID:
+            return "GPS1_MAG"
+        if device_id == GPS2_MAG_ID:
+            return "GPS2_MAG"
+        return None
+
+    def _run_mag_apply(self) -> dict[str, object]:
+        if self.armed:
+            raise RuntimeError("Disarm required before changing PX4 magnetometer parameters.")
+        params = self._read_mag_params()
+        before = build_mag_status(
+            params,
+            actual_selected_device_id=self.actual_selected_device_id,
+            armed=self.armed,
+        )
+        applied: list[str] = []
+        missing = set(self.priorities)
+        for slot in before.slots:
+            role = self._role_for_device_id(slot.device_id)
+            if role is None or role not in self.priorities:
+                continue
+            name = f"CAL_MAG{slot.slot}_PRIO"
+            expected = int(self.priorities[role])
+            actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
+            if actual != expected:
+                raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
+            applied.append(f"{role}:{name}={expected}")
+            missing.discard(role)
+        if not applied:
+            raise RuntimeError("적용 가능한 BOARD/CAN/GPS MAG 슬롯을 찾지 못했습니다.")
+        after_params = self._read_mag_params()
+        status = build_mag_status(
+            after_params,
+            actual_selected_device_id=self.actual_selected_device_id,
+            armed=self.armed,
+        )
+        return {
+            "kind": self.operation,
+            "camera": self.camera,
+            "status": status,
+            "applied": tuple(applied),
+            "missing": tuple(sorted(missing)),
+        }
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            with self.subscriber.exclusive_command(self.camera):
+                if self.operation == "mag_refresh":
+                    status = build_mag_status(
+                        self._read_mag_params(),
+                        actual_selected_device_id=self.actual_selected_device_id,
+                        armed=self.armed,
+                    )
+                    result = {"kind": self.operation, "camera": self.camera, "status": status}
+                elif self.operation == "attitude_refresh":
+                    status = build_attitude_cal_status(self._read_attitude_params())
+                    result = {"kind": self.operation, "camera": self.camera, "status": status}
+                elif self.operation == "mag_apply":
+                    result = self._run_mag_apply()
+                else:
+                    raise ValueError(f"Unknown Pixhawk parameter operation: {self.operation}")
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(result)
+        finally:
+            self.finished.emit()
+
+
+class WirisClockCommandWorker(QtCore.QObject):
+    """Send WIRIS STUS/GDTI commands without joining worker threads on the UI thread."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        *,
+        command_text: str,
+        shared_utc: bool = False,
+    ) -> None:
+        super().__init__()
+        self.target_infos = tuple(
+            (str(label), str(host), int(port), max(0.1, float(timeout_s)))
+            for label, host, port, timeout_s in target_infos
+        )
+        self.command_text = str(command_text).strip().upper()
+        self.shared_utc = bool(shared_utc)
+
+    @staticmethod
+    def _stus_command(unix_time_s: float) -> str:
+        seconds = int(unix_time_s)
+        microseconds = int(round((float(unix_time_s) - seconds) * 1_000_000))
+        if microseconds >= 1_000_000:
+            seconds += 1
+            microseconds -= 1_000_000
+        return f"STUS {seconds} {microseconds}"
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        results: dict[str, dict[str, object]] = {}
+        command_times: dict[str, float] = {}
+        tcp_start_times: dict[str, float] = {}
+        shared_command_time: dict[str, float] = {}
+        barrier = (
+            threading.Barrier(len(self.target_infos), action=lambda: shared_command_time.update(unix=time.time()))
+            if self.shared_utc and len(self.target_infos) >= 2
+            else None
+        )
+
+        def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
+            started_utc_s = time.time()
+            try:
+                command_time_s = started_utc_s
+                if barrier is not None:
+                    barrier.wait(timeout=max(1.0, timeout_s))
+                    command_time_s = float(shared_command_time.get("unix", time.time()))
+                command_text = self._stus_command(command_time_s) if self.command_text == "STUS" else self.command_text
+                command = build_wiris_command(
+                    host=host,
+                    port=port,
+                    command=command_text,
+                    timeout_s=timeout_s,
+                    terminator=LINE_TERMINATOR,
+                )
+                command_times[label] = command_time_s
+                tcp_start_times[label] = time.perf_counter()
+                response = send_tcp_line(command)
+            except Exception as exc:
+                results[label] = {
+                    "response": f"실패: {exc}",
+                    "query_started_utc_s": started_utc_s,
+                    "query_finished_utc_s": time.time(),
+                    "command": self._stus_command(command_times.get(label, started_utc_s))
+                    if self.command_text == "STUS"
+                    else self.command_text,
+                    "host": host,
+                    "port": port,
+                }
+                return
+            results[label] = {
+                "response": response or "<no response>",
+                "query_started_utc_s": started_utc_s,
+                "query_finished_utc_s": time.time(),
+                "command": command.command,
+                "host": host,
+                "port": port,
+            }
+
+        threads = [
+            threading.Thread(
+                target=send_one,
+                args=(label, host, port, timeout_s),
+                name=f"wiris-clock-{self.command_text.lower()}-{label}",
+            )
+            for label, host, port, timeout_s in self.target_infos
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            max_timeout_s = max(
+                (max(1.0, timeout_s) for _label, _host, _port, timeout_s in self.target_infos),
+                default=1.0,
+            )
+            for thread in threads:
+                thread.join(timeout=max_timeout_s + 1.0)
+            for label, host, port, _timeout_s in self.target_infos:
+                results.setdefault(
+                    label,
+                    {
+                        "response": "실패: 전송 스레드 timeout",
+                        "query_started_utc_s": None,
+                        "query_finished_utc_s": None,
+                        "command": self.command_text,
+                        "host": host,
+                        "port": port,
+                    },
+                )
+            self.completed.emit(
+                {
+                    "command": self.command_text,
+                    "results": results,
+                    "command_times": command_times,
+                    "tcp_start_times": tcp_start_times,
+                    "requested_utc_s": shared_command_time.get("unix")
+                    if self.shared_utc
+                    else (next(iter(command_times.values()), None)),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class WirisStipWorker(QtCore.QObject):
+    """Apply the deliberate WIRIS IP change without blocking the Qt event loop."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        *,
+        interface_name: str,
+        host_address: str,
+        host_hints: Sequence[str],
+        current_host: str,
+        new_ip: str,
+        mask: str,
+        port: int,
+        reboot: bool,
+        timeout_s: float,
+    ) -> None:
+        super().__init__()
+        self.interface_name = str(interface_name)
+        self.host_address = str(host_address)
+        self.host_hints = tuple(str(value) for value in host_hints)
+        self.current_host = str(current_host)
+        self.new_ip = str(new_ip)
+        self.mask = str(mask)
+        self.port = int(port)
+        self.reboot = bool(reboot)
+        self.timeout_s = max(0.1, float(timeout_s))
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            candidates: list[object] = []
+            interface_name = self.interface_name
+            address_text = self.host_address
+            if not interface_name or not interface_link_exists(interface_name):
+                candidates = list(
+                    discover_host_interface_candidates(
+                        host_address=address_text or DEFAULT_HOST_ADDRESS,
+                        include_unconfigured=True,
+                    )
+                )
+                if not candidates:
+                    self.completed.emit({"state": "failed", "error": "camera interface not found"})
+                    return
+                selected = candidates[0]
+                interface_name = str(getattr(selected.interface, "name", ""))
+                address_text = str(getattr(selected.interface, "address", ""))
+            resolved_address = resolve_nm_interface_address(interface_name, self.host_hints)
+            if resolved_address is not None:
+                address_text = str(resolved_address)
+            if not address_text:
+                self.completed.emit({"state": "failed", "error": "camera host IP is missing", "candidates": candidates})
+                return
+            if not interface_has_address(interface_name, address_text):
+                applied, message = apply_interface_address(interface_name, address_text)
+                if not applied:
+                    self.completed.emit(
+                        {
+                            "state": "failed",
+                            "error": f"camera host IP apply failed: {message}",
+                            "candidates": candidates,
+                            "interface_name": interface_name,
+                            "host_address": address_text,
+                        }
+                    )
+                    return
+            commands = [
+                SET_IP_ADDRESS_TEMPLATE.format(address=self.new_ip),
+                SET_SUBNET_MASK_TEMPLATE.format(mask=self.mask),
+            ]
+            if self.reboot:
+                commands.append(REBOOT_COMMAND)
+            statuses: list[str] = []
+            for command_text in commands:
+                command = build_wiris_command(
+                    host=self.current_host,
+                    port=self.port,
+                    command=command_text,
+                    timeout_s=self.timeout_s,
+                )
+                try:
+                    response = send_tcp_line(command)
+                except Exception as exc:
+                    self.completed.emit(
+                        {
+                            "state": "failed",
+                            "error": f"{command_text}: {exc}",
+                            "statuses": statuses,
+                            "candidates": candidates,
+                            "interface_name": interface_name,
+                            "host_address": address_text,
+                        }
+                    )
+                    return
+                statuses.append(f"{command_text}={response or 'sent'}")
+            self.completed.emit(
+                {
+                    "state": "sent",
+                    "statuses": statuses,
+                    "candidates": candidates,
+                    "interface_name": interface_name,
+                    "host_address": address_text,
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
         finally:
             self.finished.emit()
 
@@ -2817,7 +3821,7 @@ class CheckerboardPreviewWorker(QtCore.QObject):
 
 
 class TopicBrowserDialog(QtWidgets.QDialog):
-    def __init__(self, topics: list[dict[str, str]], parent=None, *, title: str = "ROS2 Topic Browser") -> None:
+    def __init__(self, topics: list[dict[str, str]], parent=None, *, title: str = "MAVLink Message Browser") -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(900, 560)
@@ -2973,6 +3977,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.latest_gps: dict[str, GpsPositionState] = {}
         self.custom_watch_specs: list[dict[str, str]] = []
         self.latest_rtk_baseline: RtkBaselineEstimate | None = None
+        self.latest_p1_body_frd_baseline: BodyFrdBaselineProjection | None = None
         self.calibration_capture_index = 0
         self.last_calibration_result: StereoIntrinsicsResult | None = None
         self.checkerboard_validation_result: StereoIntrinsicsResult | None = None
@@ -2987,13 +3992,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "left": TimedSampleBuffer[CameraExtrinsicState](maxlen=1000),
             "right": TimedSampleBuffer[CameraExtrinsicState](maxlen=1000),
         }
-        self.pixhawk: DualPixhawkAttitudeSubscriber | None = None
-        self.pixhawk_ros2_subscribers: dict[str, DualPixhawkAttitudeSubscriber | None] = {
-            "left": None,
-            "right": None,
-        }
         self.mavlink_pixhawk: DualPixhawkMavlinkSubscriber | None = None
-        self._ros2_retry_after_uxrce_agent_setup = False
         self._eth0_probe_buffers: dict[str, str] = {}
         self._eth0_probe_tokens: dict[str, int] = {}
         self._eth0_probe_counter = 0
@@ -3002,8 +4001,42 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.yolo_enabled = False
         self.camera_auto_detect_thread: QtCore.QThread | None = None
         self.camera_auto_detect_worker: CameraAutoDetectWorker | None = None
-        self.pixhawk_auto_detect_thread: QtCore.QThread | None = None
-        self.pixhawk_auto_detect_worker: PixhawkAutoDetectWorker | None = None
+        self.wiris_control_check_thread: QtCore.QThread | None = None
+        self.wiris_control_check_worker: WirisControlCheckWorker | None = None
+        self.wiris_command_thread: QtCore.QThread | None = None
+        self.wiris_command_worker: WirisCommandWorker | None = None
+        self.wiris_zoom_thread: QtCore.QThread | None = None
+        self.wiris_zoom_worker: WirisZoomWorker | None = None
+        self.wiris_time_sync_thread: QtCore.QThread | None = None
+        self.wiris_time_sync_worker: WirisClockCommandWorker | None = None
+        self.wiris_gdti_thread: QtCore.QThread | None = None
+        self.wiris_gdti_worker: WirisClockCommandWorker | None = None
+        self.wiris_stip_thread: QtCore.QThread | None = None
+        self.wiris_stip_worker: WirisStipWorker | None = None
+        self.camera_network_discovery_thread: QtCore.QThread | None = None
+        self.camera_network_discovery_worker: CameraNetworkDiscoveryWorker | None = None
+        self.camera_network_apply_thread: QtCore.QThread | None = None
+        self.camera_network_apply_worker: CameraNetworkAddressApplyWorker | None = None
+        self.interface_status_thread: QtCore.QThread | None = None
+        self.interface_status_worker: InterfaceStatusWorker | None = None
+        self.pixhawk_usb_discovery_thread: QtCore.QThread | None = None
+        self.pixhawk_usb_discovery_worker: PixhawkUsbDiscoveryWorker | None = None
+        self.pixhawk_host_ip_discovery_thread: QtCore.QThread | None = None
+        self.pixhawk_host_ip_discovery_worker: PixhawkHostIpDiscoveryWorker | None = None
+        self.pixhawk_connection_thread: QtCore.QThread | None = None
+        self.pixhawk_connection_worker: PixhawkConnectionWorker | None = None
+        self.pixhawk_stream_setup_thread: QtCore.QThread | None = None
+        self.pixhawk_stream_setup_worker: PixhawkStreamSetupWorker | None = None
+        self.pixhawk_usb_bootstrap_thread: QtCore.QThread | None = None
+        self.pixhawk_usb_bootstrap_worker: PixhawkUsbBootstrapWorker | None = None
+        self.pixhawk_persistent_config_thread: QtCore.QThread | None = None
+        self.pixhawk_persistent_config_worker: PixhawkPersistentConfigWorker | None = None
+        self.pixhawk_rtcm_thread: QtCore.QThread | None = None
+        self.pixhawk_rtcm_worker: PixhawkRtcmInjectionWorker | None = None
+        self.pixhawk_shell_threads: dict[str, QtCore.QThread] = {}
+        self.pixhawk_shell_workers: dict[str, PixhawkShellCommandWorker] = {}
+        self.pixhawk_parameter_threads: dict[str, QtCore.QThread] = {}
+        self.pixhawk_parameter_workers: dict[str, PixhawkParameterWorker] = {}
         self.rtsp_check_thread: QtCore.QThread | None = None
         self.rtsp_check_worker: RtspStreamCheckWorker | None = None
         self.rtsp_enable_thread: QtCore.QThread | None = None
@@ -3141,11 +4174,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.loaded_alignment_profile: dict[str, object] | None = None
         self.latest_mag_sensors: dict[str, dict[str, object]] = {"left": {}, "right": {}}
         self.latest_vehicle_mag_device_ids: dict[str, int | None] = {"left": None, "right": None}
-        self.ros2_sensor_topic_publishers: dict[str, dict[str, bool]] = {"left": {}, "right": {}}
         self.px4_mag_managers = {
             "left": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
             "right": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
         }
+        self._px4_mag_status_cache: dict[str, object] = {}
         self.px4_mag_manager = self.px4_mag_managers["left"]
         self.px4_attitude_cal_managers = {
             "left": Px4AttitudeCalManager(MockParameterStore(current_pixhawk_6x_attitude_cal_params())),
@@ -3169,8 +4202,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         setup_layout = QtWidgets.QVBoxLayout(setup_tab)
         time_tab = QtWidgets.QWidget()
         time_layout = QtWidgets.QVBoxLayout(time_tab)
-        image_tab = QtWidgets.QWidget()
-        image_layout = QtWidgets.QVBoxLayout(image_tab)
         alignment_tab = QtWidgets.QWidget()
         alignment_layout = QtWidgets.QVBoxLayout(alignment_tab)
         alignment_overview_tab = QtWidgets.QWidget()
@@ -3236,7 +4267,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for layout in (
             setup_layout,
             time_layout,
-            image_layout,
             alignment_layout,
             alignment_overview_layout,
             rtk_layout,
@@ -3272,7 +4302,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         self.tabs.addTab(setup_tab, "연결")
         self.tabs.addTab(time_tab, "시간")
-        self.tabs.addTab(image_tab, "이미지")
         self.tabs.addTab(calibration_tab, "보정")
         self.tabs.addTab(camera_params_tab, "파라미터")
         self.tabs.addTab(alignment_tab, "정렬")
@@ -3281,7 +4310,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.tabs.addTab(save_tab, "저장·분석")
         self.tabs.addTab(advanced_tab, "고급")
         self.time_tab_index = self.tabs.indexOf(time_tab)
-        self.image_tab_index = self.tabs.indexOf(image_tab)
+        self.setup_tab_index = self.tabs.indexOf(setup_tab)
         self.alignment_tab_index = self.tabs.indexOf(alignment_tab)
         self.calibration_tab_index = self.tabs.indexOf(calibration_tab)
         self.parameter_tab_index = self.tabs.indexOf(camera_params_tab)
@@ -3395,13 +4424,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.right_rtsp_ip_edit = QtWidgets.QLineEdit(
             self._rtsp_url_host_text(self.right_url_edit.text()).split(":", 1)[0]
         )
-        self.left_rtsp_apply_button = QtWidgets.QPushButton("RTSP 적용")
+        self.left_rtsp_apply_button = QtWidgets.QPushButton("Apply Video URL")
         self.left_rtsp_apply_button.clicked.connect(lambda _checked=False: self.apply_rtsp_url("left"))
-        self.right_rtsp_apply_button = QtWidgets.QPushButton("RTSP 적용")
+        self.right_rtsp_apply_button = QtWidgets.QPushButton("Apply Video URL")
         self.right_rtsp_apply_button.clicked.connect(lambda _checked=False: self.apply_rtsp_url("right"))
-        self.left_control_apply_button = QtWidgets.QPushButton("Telnet 적용")
+        self.left_control_apply_button = QtWidgets.QPushButton("Apply Control Port")
         self.left_control_apply_button.clicked.connect(lambda _checked=False: self.apply_control_settings("left"))
-        self.right_control_apply_button = QtWidgets.QPushButton("Telnet 적용")
+        self.right_control_apply_button = QtWidgets.QPushButton("Apply Control Port")
         self.right_control_apply_button.clicked.connect(lambda _checked=False: self.apply_control_settings("right"))
         self.left_zoom_host_edit = QtWidgets.QLineEdit(self.settings.left_control_host)
         self.right_zoom_host_edit = QtWidgets.QLineEdit(self.settings.right_control_host)
@@ -3505,19 +4534,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.rtsp_transport_combo.addItem("UDP", RTSP_TRANSPORT_UDP)
         self.rtsp_transport_combo.addItem("TCP", RTSP_TRANSPORT_TCP)
         self._set_combo_data(self.rtsp_transport_combo, self.settings.rtsp_transport)
-        self.detect_control_button = QtWidgets.QPushButton("Telnet port 탐색")
+        self.detect_control_button = QtWidgets.QPushButton("Scan Control Port")
         self.detect_control_button.clicked.connect(lambda _checked=False: self.detect_camera_control("left"))
-        self.right_detect_control_button = QtWidgets.QPushButton("Telnet port 탐색")
+        self.right_detect_control_button = QtWidgets.QPushButton("Scan Control Port")
         self.right_detect_control_button.clicked.connect(lambda _checked=False: self.detect_camera_control("right"))
-        self.detect_rtsp_button = QtWidgets.QPushButton("영상 주소 탐색")
+        self.detect_rtsp_button = QtWidgets.QPushButton("Scan Video URL")
         self.detect_rtsp_button.clicked.connect(self.detect_camera_rtsp)
-        self.right_detect_rtsp_button = QtWidgets.QPushButton("영상 주소 탐색")
+        self.right_detect_rtsp_button = QtWidgets.QPushButton("Scan Video URL")
         self.right_detect_rtsp_button.clicked.connect(self.detect_camera_rtsp)
-        self.auto_wiris_connect_button = QtWidgets.QPushButton("WIRIS 자동 연결")
+        self.auto_wiris_connect_button = QtWidgets.QPushButton("Auto-Connect Cameras")
         self.auto_wiris_connect_button.clicked.connect(self.auto_connect_wiris)
-        self.detect_pc_ip_button = QtWidgets.QPushButton("PC IP 탐색")
+        self.detect_pc_ip_button = QtWidgets.QPushButton("Discover PC IP")
         self.detect_pc_ip_button.clicked.connect(self.discover_pc_camera_ip)
-        self.apply_pc_ip_button = QtWidgets.QPushButton("PC IP 적용")
+        self.apply_pc_ip_button = QtWidgets.QPushButton("Apply PC IP")
         self.apply_pc_ip_button.clicked.connect(self.apply_pc_camera_ip)
         self.camera_candidate_table = QtWidgets.QTableWidget(0, 6)
         self.camera_candidate_table.setHorizontalHeaderLabels(["종류", "주소", "포트", "상태", "인터페이스", "PC IP"])
@@ -3531,11 +4560,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self.connection_sequence_label.setObjectName("statusStrip")
         self.connection_sequence_label.setWordWrap(True)
-        self.apply_candidate_nic_button = QtWidgets.QPushButton("선택 NIC")
+        self.apply_candidate_nic_button = QtWidgets.QPushButton("Apply Selected NIC")
         self.apply_candidate_nic_button.clicked.connect(self.apply_selected_camera_candidate_nic)
-        self.apply_candidate_left_button = QtWidgets.QPushButton("Left에 적용")
+        self.apply_candidate_left_button = QtWidgets.QPushButton("Apply to Left")
         self.apply_candidate_left_button.clicked.connect(lambda _checked=False: self.apply_selected_camera_candidate("left"))
-        self.apply_candidate_right_button = QtWidgets.QPushButton("Right에 적용")
+        self.apply_candidate_right_button = QtWidgets.QPushButton("Apply to Right")
         self.apply_candidate_right_button.clicked.connect(lambda _checked=False: self.apply_selected_camera_candidate("right"))
         self.clear_camera_candidate_button = QtWidgets.QPushButton("Clear")
         self.clear_camera_candidate_button.clicked.connect(self.clear_camera_candidate_history)
@@ -3543,11 +4572,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.clear_camera_candidate_button.setToolTip("WIRIS 탐색 후보 내역을 지웁니다.")
         self.camera_candidate_table.itemSelectionChanged.connect(self._refresh_camera_candidate_actions)
         self._camera_candidate_rows: list[dict[str, object]] = []
-        self.pixhawk_auto_detect_button = QtWidgets.QPushButton("Pixhawk 자동 탐색")
-        self.pixhawk_auto_detect_button.clicked.connect(self.auto_detect_pixhawks)
-        self.pixhawk_usb_discover_button = QtWidgets.QPushButton("USB 연결 탐색")
+        self.pixhawk_usb_discover_button = QtWidgets.QPushButton("Scan USB Pixhawks")
         self.pixhawk_usb_discover_button.clicked.connect(self.discover_usb_pixhawk_connections)
-        self.pixhawk_mavlink_url_candidate_button = QtWidgets.QPushButton("MAVLink URL 후보")
+        self.pixhawk_mavlink_url_candidate_button = QtWidgets.QPushButton(
+            "Generate Ethernet MAVLink Candidates"
+        )
         self.pixhawk_mavlink_url_candidate_button.clicked.connect(self.discover_mavlink_url_candidates)
         def build_pixhawk_candidate_table() -> QtWidgets.QTableWidget:
             table = QtWidgets.QTableWidget(0, 5)
@@ -3568,7 +4597,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         self.pc_pixhawk_candidate_table = build_pixhawk_candidate_table()
         self.mavlink_pixhawk_candidate_table = build_pixhawk_candidate_table()
-        self.ros2_pixhawk_candidate_table = build_pixhawk_candidate_table()
         self.pixhawk_candidate_table = self.mavlink_pixhawk_candidate_table
         self.clear_pixhawk_candidate_button = QtWidgets.QPushButton("Clear")
         self.clear_pixhawk_candidate_button.clicked.connect(
@@ -3580,47 +4608,29 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.clear_pixhawk_pc_candidate_button.clicked.connect(lambda _checked=False: self.clear_pixhawk_candidate_history("pc"))
         self.clear_pixhawk_pc_candidate_button.setEnabled(False)
         self.clear_pixhawk_pc_candidate_button.setToolTip("Pixhawk PC 후보 내역을 지웁니다.")
-        self.clear_pixhawk_ros2_candidate_button = QtWidgets.QPushButton("Clear")
-        self.clear_pixhawk_ros2_candidate_button.clicked.connect(lambda _checked=False: self.clear_pixhawk_candidate_history("ros2"))
-        self.clear_pixhawk_ros2_candidate_button.setEnabled(False)
-        self.clear_pixhawk_ros2_candidate_button.setToolTip("Pixhawk ROS2 후보 내역을 지웁니다.")
-        self.apply_pixhawk_candidate_host_button = QtWidgets.QPushButton("Host에 적용")
+        self.apply_pixhawk_candidate_host_button = QtWidgets.QPushButton("Apply to Host")
         self.apply_pixhawk_candidate_host_button.setEnabled(False)
         self.apply_pixhawk_candidate_host_button.clicked.connect(
             lambda _checked=False: self.apply_selected_pixhawk_candidate("host")
         )
-        self.apply_pixhawk_candidate_left_button = QtWidgets.QPushButton("P1에 적용")
+        self.apply_pixhawk_candidate_left_button = QtWidgets.QPushButton("Apply to P1")
         self.apply_pixhawk_candidate_left_button.setEnabled(False)
         self.apply_pixhawk_candidate_left_button.clicked.connect(
             lambda _checked=False: self.apply_selected_pixhawk_candidate("left")
         )
-        self.apply_pixhawk_candidate_right_button = QtWidgets.QPushButton("P2에 적용")
+        self.apply_pixhawk_candidate_right_button = QtWidgets.QPushButton("Apply to P2")
         self.apply_pixhawk_candidate_right_button.setEnabled(False)
         self.apply_pixhawk_candidate_right_button.clicked.connect(
             lambda _checked=False: self.apply_selected_pixhawk_candidate("right")
         )
-        self.apply_pixhawk_ros2_candidate_left_button = QtWidgets.QPushButton("P1 적용")
-        self.apply_pixhawk_ros2_candidate_left_button.setEnabled(False)
-        self.apply_pixhawk_ros2_candidate_left_button.clicked.connect(
-            lambda _checked=False: self.apply_selected_pixhawk_candidate("left", source="ros2")
-        )
-        self.apply_pixhawk_ros2_candidate_right_button = QtWidgets.QPushButton("P2 적용")
-        self.apply_pixhawk_ros2_candidate_right_button.setEnabled(False)
-        self.apply_pixhawk_ros2_candidate_right_button.clicked.connect(
-            lambda _checked=False: self.apply_selected_pixhawk_candidate("right", source="ros2")
-        )
         for button in (
-            self.pixhawk_auto_detect_button,
             self.pixhawk_usb_discover_button,
             self.pixhawk_mavlink_url_candidate_button,
             self.clear_pixhawk_candidate_button,
             self.clear_pixhawk_pc_candidate_button,
-            self.clear_pixhawk_ros2_candidate_button,
             self.apply_pixhawk_candidate_host_button,
             self.apply_pixhawk_candidate_left_button,
             self.apply_pixhawk_candidate_right_button,
-            self.apply_pixhawk_ros2_candidate_left_button,
-            self.apply_pixhawk_ros2_candidate_right_button,
         ):
             button.setMinimumWidth(0)
             button.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
@@ -3628,50 +4638,41 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._pixhawk_candidate_rows_by_source: dict[str, list[dict[str, object]]] = {
             "pc": [],
             "mavlink": [],
-            "ros2": [],
         }
-        self.swap_camera_button = QtWidgets.QPushButton("좌우 카메라 교체")
+        self.swap_camera_button = QtWidgets.QPushButton("Swap Camera Sides")
         self.swap_camera_button.clicked.connect(self.swap_cameras)
-        self.swap_pixhawk_button = QtWidgets.QPushButton("P1/P2 매핑 교체")
+        self.swap_pixhawk_button = QtWidgets.QPushButton("Swap P1 / P2 Roles")
         self.swap_pixhawk_button.clicked.connect(self.swap_pixhawks)
-        self.check_button = QtWidgets.QPushButton("영상 수신 확인")
+        self.check_button = QtWidgets.QPushButton("Verify Video Stream")
         self.check_button.clicked.connect(self.check_cameras)
-        self.check_control_button = QtWidgets.QPushButton("제어 확인")
+        self.check_control_button = QtWidgets.QPushButton("Verify Camera Control")
         self.check_control_button.clicked.connect(lambda _checked=False: self.check_wiris_control())
-        self.enable_rtsp_button = QtWidgets.QPushButton("영상 송출 활성화")
+        self.enable_rtsp_button = QtWidgets.QPushButton("Enable Video Stream")
         self.enable_rtsp_button.clicked.connect(self.enable_wiris_rtsp)
         self.left_stip_button = QtWidgets.QPushButton("STIP 적용")
         self.left_stip_button.clicked.connect(lambda _checked=False: self.apply_wiris_stip("left"))
         self.right_stip_button = QtWidgets.QPushButton("STIP 적용")
         self.right_stip_button.clicked.connect(lambda _checked=False: self.apply_wiris_stip("right"))
-        self.camera_connect_button = QtWidgets.QPushButton("카메라 Preview 연결")
+        self.camera_connect_button = QtWidgets.QPushButton("Connect Camera Preview")
         self.camera_connect_button.clicked.connect(self.toggle_camera_connection)
-        self.pixhawk_button = QtWidgets.QPushButton("ROS2 연결")
-        self.pixhawk_button.clicked.connect(self.toggle_ros2_connection)
-        self.left_ros2_button = QtWidgets.QPushButton("P1 ROS2 연결")
-        self.left_ros2_button.clicked.connect(lambda _checked=False: self.toggle_ros2_connection("left"))
-        self.right_ros2_button = QtWidgets.QPushButton("P2 ROS2 연결")
-        self.right_ros2_button.clicked.connect(lambda _checked=False: self.toggle_ros2_connection("right"))
-        self.detect_pixhawk_host_ip_button = QtWidgets.QPushButton("PC IP 탐색")
+        self.detect_pixhawk_host_ip_button = QtWidgets.QPushButton("Discover PC IP")
         self.detect_pixhawk_host_ip_button.clicked.connect(self.discover_pc_pixhawk_ip)
-        self.left_mavlink_button = QtWidgets.QPushButton("P1 MAVLink 연결")
+        self.left_mavlink_button = QtWidgets.QPushButton("Connect P1 MAVLink")
         self.left_mavlink_button.clicked.connect(lambda _checked=False: self.toggle_mavlink_connection("left"))
-        self.right_mavlink_button = QtWidgets.QPushButton("P2 MAVLink 연결")
+        self.right_mavlink_button = QtWidgets.QPushButton("Connect P2 MAVLink")
         self.right_mavlink_button.clicked.connect(lambda _checked=False: self.toggle_mavlink_connection("right"))
-        self.left_mavlink_bootstrap_button = QtWidgets.QPushButton("P1 ETH MAV 시작(USB)")
+        self.left_mavlink_bootstrap_button = QtWidgets.QPushButton(
+            "Start Ethernet MAVLink via USB (P1)"
+        )
         self.left_mavlink_bootstrap_button.clicked.connect(
             lambda _checked=False: self.bootstrap_ethernet_mavlink_from_usb("left")
         )
-        self.right_mavlink_bootstrap_button = QtWidgets.QPushButton("P2 ETH MAV 시작(USB)")
+        self.right_mavlink_bootstrap_button = QtWidgets.QPushButton(
+            "Start Ethernet MAVLink via USB (P2)"
+        )
         self.right_mavlink_bootstrap_button.clicked.connect(
             lambda _checked=False: self.bootstrap_ethernet_mavlink_from_usb("right")
         )
-        self.left_uxrce_param_button = QtWidgets.QPushButton("P1 uXRCE 설정")
-        self.left_uxrce_param_button.setEnabled(False)
-        self.left_uxrce_param_button.clicked.connect(lambda _checked=False: self.apply_uxrce_params_from_mavlink("left"))
-        self.right_uxrce_param_button = QtWidgets.QPushButton("P2 uXRCE 설정")
-        self.right_uxrce_param_button.setEnabled(False)
-        self.right_uxrce_param_button.clicked.connect(lambda _checked=False: self.apply_uxrce_params_from_mavlink("right"))
         self.left_px4_shell_button = QtWidgets.QPushButton("P1 Shell")
         self.left_px4_shell_button.setEnabled(False)
         self.left_px4_shell_button.clicked.connect(lambda: self.open_px4_shell("left"))
@@ -3690,11 +4691,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.right_reboot_pixhawk_button = QtWidgets.QPushButton("P2 재부팅")
         self.right_reboot_pixhawk_button.setEnabled(False)
         self.right_reboot_pixhawk_button.clicked.connect(lambda _checked=False: self.reboot_pixhawk_from_mavlink("right"))
-        self.domain_spin = QtWidgets.QSpinBox()
-        self.domain_spin.setRange(0, 232)
-        self.domain_spin.setValue(self.settings.ros_domain_id)
-        self.left_namespace_edit = QtWidgets.QLineEdit(self.settings.left_namespace)
-        self.right_namespace_edit = QtWidgets.QLineEdit(self.settings.right_namespace)
         self.left_pixhawk_eth_ip_edit = QtWidgets.QLineEdit(self.settings.left_pixhawk_eth_ip)
         self.right_pixhawk_eth_ip_edit = QtWidgets.QLineEdit(self.settings.right_pixhawk_eth_ip)
         self.left_mavlink_url_edit = QtWidgets.QLineEdit(self.settings.left_mavlink_url)
@@ -3713,20 +4709,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "MAVLink stream 설정",
             self.settings.mavlink_configure_streams,
         )
-        self.mavlink_configure_uxrce_agent_checkbox = self._build_toggle_button(
-            "PX4 uXRCE Agent 설정",
-            self.settings.mavlink_configure_uxrce_agent,
-        )
         self.mavlink_stream_rate_spin = QtWidgets.QSpinBox()
         self.mavlink_stream_rate_spin.setRange(1_000, 10_000_000)
         self.mavlink_stream_rate_spin.setValue(self.settings.mavlink_stream_rate)
-        self.uxrce_port_spin = QtWidgets.QSpinBox()
-        self.uxrce_port_spin.setRange(1, 65535)
-        self.uxrce_port_spin.setValue(self.settings.uxrce_port)
         self.pixhawk_ethernet_mode_combo = QtWidgets.QComboBox()
-        self.pixhawk_ethernet_mode_combo.addItem("uXRCE-DDS + MAVLink (공존)", "dual")
         self.pixhawk_ethernet_mode_combo.addItem("MAVLink만", "mavlink")
-        self.pixhawk_ethernet_mode_combo.addItem("uXRCE-DDS만", "uxrce")
         mode_index = self.pixhawk_ethernet_mode_combo.findData(
             self.settings.pixhawk_ethernet_mode
         )
@@ -3738,44 +4725,38 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.browse_weights_button.clicked.connect(self.browse_yolo_weights)
         self.start_button = QtWidgets.QPushButton("YOLO 측정 시작")
         self.start_button.clicked.connect(self.toggle_yolo_detection)
-        self.detect_control_button.setText("Telnet port 탐색")
-        self.right_detect_control_button.setText("Telnet port 탐색")
-        self.detect_rtsp_button.setText("영상 주소 탐색")
-        self.right_detect_rtsp_button.setText("영상 주소 탐색")
-        self.auto_wiris_connect_button.setText("WIRIS 자동 연결")
-        self.detect_pc_ip_button.setText("PC IP 탐색")
-        self.apply_pc_ip_button.setText("PC IP 적용")
-        self.apply_candidate_nic_button.setText("선택 NIC")
-        self.apply_candidate_left_button.setText("Left에 적용")
-        self.apply_candidate_right_button.setText("Right에 적용")
+        self.detect_control_button.setText("Scan Control Port")
+        self.right_detect_control_button.setText("Scan Control Port")
+        self.detect_rtsp_button.setText("Scan Video URL")
+        self.right_detect_rtsp_button.setText("Scan Video URL")
+        self.auto_wiris_connect_button.setText("Auto-Connect Cameras")
+        self.detect_pc_ip_button.setText("Discover PC IP")
+        self.apply_pc_ip_button.setText("Apply PC IP")
+        self.apply_candidate_nic_button.setText("Apply Selected NIC")
+        self.apply_candidate_left_button.setText("Apply to Left")
+        self.apply_candidate_right_button.setText("Apply to Right")
         self.clear_camera_candidate_button.setText("Clear")
-        self.left_control_apply_button.setText("Telnet 적용")
-        self.right_control_apply_button.setText("Telnet 적용")
-        self.left_rtsp_apply_button.setText("RTSP 적용")
-        self.right_rtsp_apply_button.setText("RTSP 적용")
-        self.pixhawk_auto_detect_button.setText("Pixhawk 자동 탐색")
-        self.pixhawk_usb_discover_button.setText("USB 연결 탐색")
-        self.pixhawk_mavlink_url_candidate_button.setText("MAVLink URL 후보")
-        self.detect_pixhawk_host_ip_button.setText("PC IP 탐색")
+        self.left_control_apply_button.setText("Apply Control Port")
+        self.right_control_apply_button.setText("Apply Control Port")
+        self.left_rtsp_apply_button.setText("Apply Video URL")
+        self.right_rtsp_apply_button.setText("Apply Video URL")
+        self.pixhawk_usb_discover_button.setText("Scan USB Pixhawks")
+        self.pixhawk_mavlink_url_candidate_button.setText("Generate Ethernet MAVLink Candidates")
+        self.detect_pixhawk_host_ip_button.setText("Discover PC IP")
         self.clear_pixhawk_candidate_button.setText("Clear")
-        self.apply_pixhawk_candidate_host_button.setText("Host에 적용")
-        self.apply_pixhawk_candidate_left_button.setText("P1에 적용")
-        self.apply_pixhawk_candidate_right_button.setText("P2에 적용")
-        self.swap_camera_button.setText("좌우 카메라 교체")
-        self.swap_pixhawk_button.setText("P1/P2 매핑 교체")
-        self.check_button.setText("영상 수신 확인")
-        self.check_control_button.setText("제어 확인")
-        self.enable_rtsp_button.setText("영상 송출 활성화")
-        self.camera_connect_button.setText("카메라 Preview 연결")
-        self.pixhawk_button.setText("ROS2 연결")
-        self.left_ros2_button.setText("P1 ROS2 연결")
-        self.right_ros2_button.setText("P2 ROS2 연결")
-        self.left_mavlink_button.setText("P1 MAVLink 연결")
-        self.right_mavlink_button.setText("P2 MAVLink 연결")
-        self.left_mavlink_bootstrap_button.setText("P1 ETH MAV 시작(USB)")
-        self.right_mavlink_bootstrap_button.setText("P2 ETH MAV 시작(USB)")
-        self.left_uxrce_param_button.setText("P1 uXRCE 설정")
-        self.right_uxrce_param_button.setText("P2 uXRCE 설정")
+        self.apply_pixhawk_candidate_host_button.setText("Apply to Host")
+        self.apply_pixhawk_candidate_left_button.setText("Apply to P1")
+        self.apply_pixhawk_candidate_right_button.setText("Apply to P2")
+        self.swap_camera_button.setText("Swap Camera Sides")
+        self.swap_pixhawk_button.setText("Swap P1 / P2 Roles")
+        self.check_button.setText("Verify Video Stream")
+        self.check_control_button.setText("Verify Camera Control")
+        self.enable_rtsp_button.setText("Enable Video Stream")
+        self.camera_connect_button.setText("Connect Camera Preview")
+        self.left_mavlink_button.setText("Connect P1 MAVLink")
+        self.right_mavlink_button.setText("Connect P2 MAVLink")
+        self.left_mavlink_bootstrap_button.setText("Start Ethernet MAVLink via USB (P1)")
+        self.right_mavlink_bootstrap_button.setText("Start Ethernet MAVLink via USB (P2)")
         self.start_button.setText("YOLO 측정 시작")
         self.left_stip_button.setText("STIP 적용")
         self.right_stip_button.setText("STIP 적용")
@@ -4044,28 +5025,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         mavlink_candidate_actions.addWidget(self.apply_pixhawk_candidate_right_button, 1)
         mavlink_candidate_layout.addLayout(mavlink_candidate_actions)
 
-        ros2_candidate_group = QtWidgets.QGroupBox("ROS2 Namespace")
-        ros2_candidate_group.setObjectName("pixhawkRos2CandidateGroup")
-        ros2_candidate_group.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
-        ros2_candidate_group.setMinimumHeight(320)
-        ros2_candidate_layout = QtWidgets.QVBoxLayout(ros2_candidate_group)
-        ros2_candidate_layout.setSpacing(6)
-        ros2_candidate_layout.setContentsMargins(8, 18, 8, 8)
-        ros2_candidate_layout.addWidget(self.pixhawk_auto_detect_button)
-        ros2_candidate_layout.addWidget(self.ros2_pixhawk_candidate_table)
-        ros2_candidate_actions = QtWidgets.QHBoxLayout()
-        ros2_candidate_actions.setSpacing(6)
-        ros2_candidate_actions.addWidget(self.clear_pixhawk_ros2_candidate_button, 1)
-        ros2_candidate_actions.addWidget(self.apply_pixhawk_ros2_candidate_left_button, 1)
-        ros2_candidate_actions.addWidget(self.apply_pixhawk_ros2_candidate_right_button, 1)
-        ros2_candidate_layout.addLayout(ros2_candidate_actions)
-
         pixhawk_candidate_layout.addWidget(pc_candidate_group)
         pixhawk_candidate_layout.addWidget(mavlink_candidate_group)
-        pixhawk_candidate_layout.addWidget(ros2_candidate_group)
         self.pixhawk_pc_candidate_group = pc_candidate_group
         self.pixhawk_mavlink_candidate_group = mavlink_candidate_group
-        self.pixhawk_ros2_candidate_group = ros2_candidate_group
         self.pixhawk_candidate_group = pixhawk_candidate_group
         pixhawk_form.addWidget(pixhawk_candidate_group, 1, 0, 1, 6)
 
@@ -4097,25 +5060,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
                 side_form.addWidget(label, row, 0)
                 side_form.addWidget(field_widget, row, 1)
-            return side_group
-
-        def build_pixhawk_ros2_side_group(
-            title: str,
-            object_name: str,
-            namespace_edit: QtWidgets.QLineEdit,
-        ) -> QtWidgets.QGroupBox:
-            side_group = QtWidgets.QGroupBox(title)
-            side_group.setObjectName(object_name)
-            side_form = QtWidgets.QGridLayout(side_group)
-            side_form.setHorizontalSpacing(8)
-            side_form.setVerticalSpacing(10)
-            side_form.setContentsMargins(12, 24, 12, 12)
-            side_form.setColumnStretch(0, 0)
-            side_form.setColumnStretch(1, 1)
-            label = QtWidgets.QLabel("ROS2 Namespace")
-            label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            side_form.addWidget(label, 0, 0)
-            side_form.addWidget(namespace_edit, 0, 1)
             return side_group
 
         pixhawk_mavlink_group = QtWidgets.QGroupBox("2 Rover MAVLink / RTCM")
@@ -4174,54 +5118,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.pixhawk_pair_settings_group = pixhawk_mavlink_group
         pixhawk_form.addWidget(pixhawk_mavlink_group, 2, 0, 1, 6)
 
-        pixhawk_ros2_group = QtWidgets.QGroupBox("3 ROS2 Telemetry")
-        pixhawk_ros2_group.setObjectName("pixhawkRos2TelemetryGroup")
-        pixhawk_ros2_layout = QtWidgets.QVBoxLayout(pixhawk_ros2_group)
-        pixhawk_ros2_layout.setSpacing(8)
-        pixhawk_ros2_layout.setContentsMargins(12, 24, 12, 12)
-        pixhawk_ros2_options = QtWidgets.QGridLayout()
-        pixhawk_ros2_options.setHorizontalSpacing(8)
-        pixhawk_ros2_options.setVerticalSpacing(8)
-        pixhawk_ros2_options.setColumnStretch(1, 1)
-        pixhawk_ros2_options.setColumnStretch(3, 1)
-        pixhawk_ros2_options.addWidget(QtWidgets.QLabel("ROS_DOMAIN_ID"), 0, 0)
-        pixhawk_ros2_options.addWidget(self.domain_spin, 0, 1)
-        pixhawk_ros2_options.addWidget(QtWidgets.QLabel("uXRCE 포트"), 0, 2)
-        pixhawk_ros2_options.addWidget(self.uxrce_port_spin, 0, 3)
-        pixhawk_ros2_options.addWidget(self.mavlink_configure_uxrce_agent_checkbox, 0, 4)
-        pixhawk_ros2_pair_layout = QtWidgets.QHBoxLayout()
-        pixhawk_ros2_pair_layout.setSpacing(8)
-        left_ros2_group = build_pixhawk_ros2_side_group(
-            "Pixhawk 1 ROS2",
-            "leftPixhawkRos2WorkflowGroup",
-            self.left_namespace_edit,
-        )
-        right_ros2_group = build_pixhawk_ros2_side_group(
-            "Pixhawk 2 ROS2",
-            "rightPixhawkRos2WorkflowGroup",
-            self.right_namespace_edit,
-        )
-        pixhawk_ros2_pair_layout.addWidget(left_ros2_group, 1)
-        pixhawk_ros2_pair_layout.addWidget(right_ros2_group, 1)
-        pixhawk_ros2_actions = QtWidgets.QHBoxLayout()
-        pixhawk_ros2_actions.setSpacing(6)
-        for button in (
-            self.left_ros2_button,
-            self.right_ros2_button,
-            self.left_uxrce_param_button,
-            self.right_uxrce_param_button,
-        ):
-            button.setMinimumWidth(128)
-            button.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Fixed)
-            pixhawk_ros2_actions.addWidget(button, 1)
-        pixhawk_ros2_layout.addLayout(pixhawk_ros2_options)
-        pixhawk_ros2_layout.addLayout(pixhawk_ros2_pair_layout)
-        pixhawk_ros2_layout.addLayout(pixhawk_ros2_actions)
-        self.left_pixhawk_ros2_workflow_group = left_ros2_group
-        self.right_pixhawk_ros2_workflow_group = right_ros2_group
-        self.pixhawk_ros2_telemetry_group = pixhawk_ros2_group
-        self.pixhawk_connection_actions_group = pixhawk_ros2_group
-        pixhawk_form.addWidget(pixhawk_ros2_group, 3, 0, 1, 6)
+        self.pixhawk_connection_actions_group = pixhawk_mavlink_group
 
         pixhawk_advanced_group = QtWidgets.QGroupBox("4 고급 / 진단")
         pixhawk_advanced_group.setObjectName("pixhawkAdvancedDiagnosticsGroup")
@@ -4238,10 +5135,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         ):
             pixhawk_advanced_actions.addWidget(button, 1)
         self.pixhawk_advanced_diagnostics_group = pixhawk_advanced_group
-        pixhawk_form.addWidget(pixhawk_advanced_group, 4, 0, 1, 6)
+        pixhawk_form.addWidget(pixhawk_advanced_group, 3, 0, 1, 6)
         self.pixhawk_connection_label = QtWidgets.QLabel(STARTUP_PIXHAWK_STATUS)
         self.pixhawk_connection_label.setObjectName("statusStrip")
-        pixhawk_form.addWidget(self.pixhawk_connection_label, 5, 0, 1, 6)
+        pixhawk_form.addWidget(self.pixhawk_connection_label, 4, 0, 1, 6)
 
         camera_scroll = QtWidgets.QScrollArea()
         camera_scroll.setWidgetResizable(True)
@@ -4554,16 +5451,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.advanced_px4_mag_tab_index = advanced_tabs.indexOf(px4_mag_advanced_tab)
         self.wiris_command_tab_index = self.advanced_wiris_command_tab_index
 
-        custom_watch_group = QtWidgets.QGroupBox("사용자 지정 ROS2/uORB 또는 MAVLink 감시")
+        custom_watch_group = QtWidgets.QGroupBox("사용자 지정 MAVLink 감시")
         custom_watch_group_layout = QtWidgets.QVBoxLayout(custom_watch_group)
         custom_watch_form = QtWidgets.QGridLayout()
         self.custom_watch_name_edit = QtWidgets.QLineEdit("local_z")
-        self.custom_watch_topic_edit = QtWidgets.QLineEdit("/uav_0/fmu/out/vehicle_local_position")
+        self.custom_watch_message_edit = QtWidgets.QLineEdit("LOCAL_POSITION_NED")
         self.custom_watch_field_edit = QtWidgets.QLineEdit("z")
         self.custom_watch_add_button = QtWidgets.QPushButton("감시 추가")
-        self.custom_watch_add_button.clicked.connect(self.add_custom_topic_watch_from_ui)
-        self.custom_watch_discover_button = QtWidgets.QPushButton("ROS2 토픽 찾기")
-        self.custom_watch_discover_button.clicked.connect(self.discover_custom_topic_watch)
+        self.custom_watch_add_button.clicked.connect(self.add_custom_mavlink_watch_from_ui)
         self.custom_watch_mavlink_discover_button = QtWidgets.QPushButton("MAVLink 필드 찾기")
         self.custom_watch_mavlink_discover_button.clicked.connect(self.discover_custom_mavlink_watch)
         self.custom_watch_remove_combo = QtWidgets.QComboBox()
@@ -4572,12 +5467,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.custom_watch_remove_button.clicked.connect(self.remove_selected_custom_topic_watch)
         custom_watch_form.addWidget(QtWidgets.QLabel("이름"), 0, 0)
         custom_watch_form.addWidget(self.custom_watch_name_edit, 0, 1)
-        custom_watch_form.addWidget(QtWidgets.QLabel("토픽"), 1, 0)
-        custom_watch_form.addWidget(self.custom_watch_topic_edit, 1, 1)
+        custom_watch_form.addWidget(QtWidgets.QLabel("MAVLink message"), 1, 0)
+        custom_watch_form.addWidget(self.custom_watch_message_edit, 1, 1)
         custom_watch_form.addWidget(QtWidgets.QLabel("필드"), 2, 0)
         custom_watch_form.addWidget(self.custom_watch_field_edit, 2, 1)
         custom_watch_buttons = QtWidgets.QHBoxLayout()
-        custom_watch_buttons.addWidget(self.custom_watch_discover_button)
         custom_watch_buttons.addWidget(self.custom_watch_mavlink_discover_button)
         custom_watch_buttons.addWidget(self.custom_watch_add_button)
         custom_watch_buttons.addWidget(self.custom_watch_remove_combo)
@@ -4585,7 +5479,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         custom_watch_buttons.addStretch(1)
         custom_watch_form.addLayout(custom_watch_buttons, 3, 0, 1, 2)
         custom_watch_group_layout.addLayout(custom_watch_form)
-        self.custom_watch_plot = TelemetryHistoryPlot("사용자 지정 ROS2/uORB/MAVLink 숫자 필드", "값")
+        self.custom_watch_plot = TelemetryHistoryPlot("사용자 지정 MAVLink 숫자 필드", "값")
         self.custom_watch_plot.setMinimumHeight(360)
         custom_watch_group_layout.addWidget(self.custom_watch_plot, 1)
         custom_watch_layout.addWidget(custom_watch_group, 1)
@@ -5137,7 +6031,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         recording_table_layout.addWidget(self.recording_sample_detail, 1)
         save_layout.addWidget(self.recording_table_group, 1)
 
-        self._build_clock_sync_tab(time_layout, image_layout)
+        self._build_clock_sync_tab(time_layout)
         self._polish_controls()
         self._refresh_session_toggle_buttons()
         self._install_tooltips()
@@ -5147,12 +6041,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
         self._shutdown_coordinator = LifecycleCoordinator(
             [
-                LifecycleStep("save-settings", lambda: self._shutdown_save_settings()),
-                LifecycleStep("stop-auxiliary-workers", lambda: self._shutdown_stop_auxiliary_workers()),
+                LifecycleStep("stop-runtime-workers", lambda: self.stop_all(wait=True)),
                 LifecycleStep("stop-gnss-network", lambda: self.stop_gnss_network()),
                 LifecycleStep("stop-gnss-base-serial", lambda: self._shutdown_stop_gnss_base_serial()),
-                LifecycleStep("stop-runtime-workers", lambda: self.stop_all(wait=True)),
+                LifecycleStep("stop-auxiliary-workers", lambda: self._shutdown_stop_auxiliary_workers()),
                 LifecycleStep("wait-session-save", lambda: self._wait_for_session_save()),
+                LifecycleStep("save-settings", lambda: self._shutdown_save_settings()),
             ]
         )
         QtCore.QTimer.singleShot(0, self._initial_status)
@@ -5167,18 +6061,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return button
 
     def _pixhawk_ethernet_mode(self) -> str:
-        mode = str(self.pixhawk_ethernet_mode_combo.currentData() or DEFAULT_PIXHAWK_ETHERNET_MODE)
-        return mode if mode in PIXHAWK_ETHERNET_MODES else DEFAULT_PIXHAWK_ETHERNET_MODE
+        mode = str(self.pixhawk_ethernet_mode_combo.currentData() or "mavlink")
+        return mode if mode == "mavlink" else "mavlink"
 
     def _refresh_pixhawk_ethernet_mode_controls(self) -> None:
-        mode = self._pixhawk_ethernet_mode()
-        uxrce_enabled = mode in {"dual", "uxrce"}
-        self.mavlink_configure_uxrce_agent_checkbox.setEnabled(uxrce_enabled)
-        self.mavlink_configure_uxrce_agent_checkbox.setToolTip(
-            "Ethernet 공존/전용 모드에서 uXRCE-DDS를 설정합니다."
-            if uxrce_enabled
-            else "MAVLink 전용 모드에서는 Ethernet uXRCE-DDS를 사용하지 않습니다."
-        )
+        # Workstation has a MAVLink-only Pixhawk transport surface.
+        self.pixhawk_ethernet_mode_combo.setCurrentIndex(0)
 
     def _set_yolo_device_combo(self, device: str) -> None:
         index = self.device_combo.findData(self._normalized_yolo_device(device))
@@ -5316,7 +6204,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _refresh_session_toggle_buttons(self) -> None:
         if not hasattr(self, "camera_connect_button"):
             return
-        self.camera_connect_button.setText("카메라 Preview 해제" if self.camera_connected else "카메라 Preview 연결")
+        self.camera_connect_button.setText(
+            "Disconnect Camera Preview" if self.camera_connected else "Connect Camera Preview"
+        )
         self._set_button_role(self.camera_connect_button, "danger" if self.camera_connected else "primary")
 
         self.start_button.setText("YOLO 측정 중지" if self.yolo_enabled else "YOLO 측정 시작")
@@ -5325,25 +6215,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.record_button.setText("세션 기록 중지" if self._session_recording_active() else "세션 기록 시작")
         self._set_button_role(self.record_button, "danger" if self._session_recording_active() else "success")
 
-        connected_ros2_sides = self._ros2_connected_sides()
-        self.pixhawk_button.setText("ROS2 전체 해제" if connected_ros2_sides else "ROS2 전체 연결")
-        self._set_button_role(self.pixhawk_button, "danger" if connected_ros2_sides else "primary")
-        self.left_ros2_button.setText("P1 ROS2 해제" if "left" in connected_ros2_sides else "P1 ROS2 연결")
-        self._set_button_role(self.left_ros2_button, "danger" if "left" in connected_ros2_sides else "primary")
-        self.right_ros2_button.setText("P2 ROS2 해제" if "right" in connected_ros2_sides else "P2 ROS2 연결")
-        self._set_button_role(self.right_ros2_button, "danger" if "right" in connected_ros2_sides else "primary")
-
         connected_mavlink_sides = self._mavlink_open_sides()
-        self.left_mavlink_button.setText("P1 MAVLink 해제" if "left" in connected_mavlink_sides else "P1 MAVLink 연결")
+        self.left_mavlink_button.setText(
+            "Disconnect P1 MAVLink" if "left" in connected_mavlink_sides else "Connect P1 MAVLink"
+        )
         self._set_button_role(self.left_mavlink_button, "danger" if "left" in connected_mavlink_sides else "primary")
-        self.right_mavlink_button.setText("P2 MAVLink 해제" if "right" in connected_mavlink_sides else "P2 MAVLink 연결")
+        self.right_mavlink_button.setText(
+            "Disconnect P2 MAVLink" if "right" in connected_mavlink_sides else "Connect P2 MAVLink"
+        )
         self._set_button_role(self.right_mavlink_button, "danger" if "right" in connected_mavlink_sides else "primary")
 
     def _install_tooltips(self) -> None:
         tooltips = {
             self.interface_edit: "카메라 네트워크 도달성을 확인할 때 사용할 로컬 네트워크 인터페이스입니다.",
             self.host_address_edit: "WIRIS 카메라망에서 PC가 사용할 IP입니다. 카메라 IP가 아니며 Pixhawk host 주소와도 별개입니다.",
-            self.pixhawk_host_address_edit: "Pixhawk가 uXRCE-DDS 대상으로 사용할 PC 주소입니다. 예: 10.0.0.10",
+            self.pixhawk_host_address_edit: "Pixhawk MAVLink가 사용할 PC 주소입니다. 예: 10.0.0.10",
             self.left_url_edit: "왼쪽 카메라 스트림의 전체 RTSP URL입니다. 카메라 IP, 포트, 경로를 포함합니다.",
             self.right_url_edit: "오른쪽 카메라 스트림의 전체 RTSP URL입니다. 카메라 IP, 포트, 경로를 포함합니다.",
             self.left_rtsp_ip_edit: "왼쪽 RTSP URL에 적용할 OSD IP Address 값입니다. Telnet 제어 host는 이 버튼으로 바꾸지 않습니다.",
@@ -5460,24 +6346,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "IP Address / IP Mask 변경 그룹의 Right IP Address를 오른쪽 WIRIS에 씁니다.\n"
                 "완료되면 오른쪽 RTSP URL의 host도 같이 갱신됩니다."
             ),
-            self.pixhawk_auto_detect_button: "현재 ROS_DOMAIN_ID에서 ROS2 PX4 토픽을 스캔해 Pixhawk namespace를 채웁니다.",
             self.pixhawk_usb_discover_button: "OS에 보이는 USB Pixhawk 포트와 MAVLink heartbeat/권한 상태를 후보 표에 표시합니다. 자동 할당은 하지 않습니다.",
             self.pixhawk_mavlink_url_candidate_button: "Ethernet MAVLink UDP 기본 URL 후보를 표에 추가합니다. PX4가 해당 UDP 포트로 MAVLink를 보내고 있어야 연결됩니다.",
             self.detect_pixhawk_host_ip_button: "P1/P2 Pixhawk ETH IP 대역에 맞는 이 PC의 IPv4를 찾아 Pixhawk Host IP에 채웁니다.",
             self.swap_camera_button: "좌/우 카메라 RTSP URL과 IP Address/Telnet port를 서로 바꿉니다. 실행 중인 스트림은 새 매핑으로 재시작됩니다.",
-            self.swap_pixhawk_button: (
-                "P1/P2의 MAVLink URL, USB 제어 포트, ETH IP, ROS2 namespace 매핑을 서로 바꿉니다. "
-                "실행 중인 구독은 새 매핑으로 재시작됩니다."
-            ),
+            self.swap_pixhawk_button: "P1/P2의 MAVLink URL, USB 제어 포트, ETH IP 매핑을 서로 바꿉니다. 실행 중인 MAVLink 링크는 새 매핑으로 재시작됩니다.",
             self.check_button: "좌/우 RTSP 호스트의 RTSP 포트가 열려 있는지 확인합니다.",
             self.camera_connect_button: "좌/우 RTSP Preview를 연결하거나, 연결 중이면 카메라 Preview와 활성 YOLO 검출을 중지합니다.",
-            self.pixhawk_button: "P1/P2 ROS2 Pixhawk 세션을 모두 연결하거나, 연결 중이면 ROS2 토픽 구독을 모두 중지합니다.",
-            self.left_ros2_button: "Pixhawk 1 ROS2 세션만 연결합니다. /uav_0 namespace의 topic만 왼쪽 Pixhawk 값으로 구독합니다.",
-            self.right_ros2_button: "Pixhawk 2 ROS2 세션만 연결합니다. /uav_1 namespace의 topic만 오른쪽 Pixhawk 값으로 구독합니다.",
             self.left_mavlink_button: "Pixhawk 1 MAVLink 세션을 연결하거나, 연결 중이면 P1 MAVLink 링크만 중지합니다.",
             self.right_mavlink_button: "Pixhawk 2 MAVLink 세션을 연결하거나, 연결 중이면 P2 MAVLink 링크만 중지합니다.",
-            self.left_uxrce_param_button: "활성 P1 MAVLink 연결로 PX4 UXRCE_DDS_* 파라미터를 Pixhawk Host IP에 맞게 설정하고 확인합니다.",
-            self.right_uxrce_param_button: "활성 P2 MAVLink 연결로 PX4 UXRCE_DDS_* 파라미터를 Pixhawk Host IP에 맞게 설정하고 확인합니다.",
             self.left_px4_shell_button: "활성 MAVLink 연결을 통해 Pixhawk 1 PX4 shell 창을 엽니다.",
             self.right_px4_shell_button: "활성 MAVLink 연결을 통해 Pixhawk 2 PX4 shell 창을 엽니다.",
             self.left_persist_eth_button: "왼쪽 Pixhawk eth0/MAVLink UDP 설정을 즉시 적용하고 extras.txt에 저장합니다.",
@@ -5512,9 +6389,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             self.runtime_pair_status_label: "좌우 계산/동기화 frame pair의 time basis, pair 시각, 좌우 delta를 표시합니다.",
             self.pixhawk_connection_label: "Pixhawk 자세 구독 상태와 메시지 수신 속도를 표시합니다.",
-            self.domain_spin: "PX4/ROS2 uORB 토픽 탐색에 사용할 ROS_DOMAIN_ID입니다.",
-            self.left_namespace_edit: "Pixhawk 1의 ROS2 namespace입니다. 왼쪽 카메라와 매핑됩니다.",
-            self.right_namespace_edit: "Pixhawk 2의 ROS2 namespace입니다. 오른쪽 카메라와 매핑됩니다.",
             self.left_pixhawk_eth_ip_edit: "왼쪽 Pixhawk에 적용하고 저장할 eth0 고정 IP입니다. 예: 10.0.0.2",
             self.right_pixhawk_eth_ip_edit: "오른쪽 Pixhawk에 적용하고 저장할 eth0 고정 IP입니다. 예: 10.0.0.3",
             self.left_mavlink_url_edit: "Pixhawk 1 MAVLink URL입니다. 예: udpin:0.0.0.0:14550, /dev/ttyACM0, tcp:192.168.0.3:5760",
@@ -5523,13 +6397,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_mavlink_baud_spin: "Pixhawk 2 MAVLink URL이 시리얼 장치일 때 사용할 baud rate입니다.",
             self.mavlink_configure_streams_checkbox: "MAVLink 연결 후 MAV_SYS_ID 설정과 Pixhawk Host IP 방향 MAVLink stream 시작 명령을 보냅니다.",
             self.mavlink_stream_rate_spin: "PX4 shell로 MAVLink stream을 설정할 때 사용할 mavlink start -r 값입니다.",
-            self.mavlink_configure_uxrce_agent_checkbox: "MAVLink 연결 후 PX4 uXRCE-DDS Client가 접속할 PC Micro XRCE-DDS Agent IP/port 파라미터를 설정하고 readback으로 확인합니다.",
-            self.uxrce_port_spin: "호스트 PC의 Micro XRCE-DDS Agent UDP 포트입니다. 일반적으로 8888입니다.",
-            self.custom_watch_name_edit: "사용자 지정 ROS2/uORB 필드 감시의 표시 이름입니다.",
-            self.custom_watch_topic_edit: "감시할 전체 ROS2 토픽입니다. 예: /uav_0/fmu/out/vehicle_local_position",
+            self.custom_watch_name_edit: "사용자 지정 MAVLink 필드 감시의 표시 이름입니다.",
+            self.custom_watch_message_edit: "감시할 MAVLink message 이름입니다. 예: ATTITUDE, GPS_RAW_INT",
             self.custom_watch_field_edit: "읽을 메시지 필드 경로입니다. 예: z, q[0], position[2]. 숫자 필드는 그래프로 표시됩니다.",
-            self.custom_watch_add_button: "사용자 지정 감시를 추가합니다. ROS2 연결 중이면 즉시 구독합니다.",
-            self.custom_watch_discover_button: "현재 보이는 ROS2 토픽을 탐색하고 그래프 가능한 필드를 골라 자동 감시에 추가합니다.",
+            self.custom_watch_add_button: "사용자 지정 MAVLink 감시를 추가합니다.",
             self.custom_watch_mavlink_discover_button: "ATTITUDE.roll 같은 MAVLink 메시지/필드를 골라 활성 MAVLink Pixhawk 연결에서 그래프로 표시합니다.",
             self.custom_watch_remove_combo: "제거할 기존 사용자 지정 감시를 선택합니다.",
             self.custom_watch_remove_button: "선택한 사용자 지정 감시를 제거하고 그래프 series를 지웁니다.",
@@ -5614,28 +6485,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.recording_status_label: "메모리 내 세션 기록 상태와 매칭 프레임쌍 수입니다.",
             self.recording_sheet_tabs: "저장될 세션 XLSX와 같은 시트 구성으로 현재 기록을 미리 보여줍니다.",
             self.recording_sample_detail: "선택한 매칭 프레임쌍의 전체 내부 기록 필드를 표시합니다.",
-            self.clock_ftp_user_edit: "WIRIS FTP 로그인 사용자 이름입니다. 장비 설정에 맞게 입력하세요.",
-            self.clock_ftp_password_edit: "WIRIS FTP 로그인 비밀번호입니다. 비어 있으면 빈 비밀번호로 로그인합니다.",
-            self.clock_ftp_port_spin: "WIRIS FTP 포트입니다. 일반 FTP는 21번을 사용합니다.",
-            self.clock_ftp_remote_dir_edit: "CPTR로 저장된 JPG/TIFF 파일이 있는 WIRIS FTP 원격 폴더입니다.",
-            self.clock_download_dir_edit: "FTP로 내려받은 좌/우 촬영 이미지를 저장할 로컬 폴더입니다.",
-            self.clock_download_dir_button: "FTP 다운로드 로컬 저장 폴더를 선택합니다.",
-            self.clock_capture_wait_spin: "CPTR 후 ICPT가 촬영 완료 상태가 될 때까지 기다릴 최대 시간입니다.",
-            self.clock_cptr_button: "좌/우 WIRIS에 CPTR 촬영 명령을 전송합니다.",
-            self.clock_icpt_button: "좌/우 WIRIS에 ICPT 명령을 보내 캡처 진행 상태를 확인합니다.",
-            self.clock_download_latest_button: "좌/우 WIRIS FTP 폴더에서 최신 JPG/TIFF 이미지를 다운로드하고 EXIF를 분석합니다.",
-            self.clock_workflow_button: "CPTR 촬영, ICPT 완료 대기, FTP 최신 이미지 다운로드, EXIF 분석을 순서대로 실행합니다.",
-            self.clock_left_file_edit: "FTP로 내려받은 왼쪽 WIRIS 이미지 파일입니다. JPG/JPEG/TIFF EXIF를 읽습니다.",
-            self.clock_right_file_edit: "FTP로 내려받은 오른쪽 WIRIS 이미지 파일입니다. JPG/JPEG/TIFF EXIF를 읽습니다.",
-            self.clock_left_folder_edit: "왼쪽 WIRIS에서 FTP로 받은 이미지 폴더입니다. 하위 폴더까지 검색합니다.",
-            self.clock_right_folder_edit: "오른쪽 WIRIS에서 FTP로 받은 이미지 폴더입니다. 하위 폴더까지 검색합니다.",
-            self.clock_analyze_pair_button: "선택한 좌/우 이미지 한 쌍의 EXIF timestamp 차이를 right-left 기준으로 계산합니다.",
-            self.clock_analyze_folder_button: "좌/우 폴더의 공통 파일명 또는 정렬 순서로 이미지 쌍을 만들어 clock offset 분포를 계산합니다.",
-            self.clock_result_table: "분석된 이미지 쌍별 촬영 시간, timestamp source, right-left clock offset, 경고입니다.",
-            self.clock_summary_text: "clock offset 요약과 EXIF/GPS timestamp 품질 경고입니다.",
             self.wiris_log: "WIRIS, 카메라 Preview 연결, 보정, 시간 확인 메시지 로그입니다.",
             self.camera_yolo_log: "YOLO, 거리 측정, 저장 메시지 로그입니다.",
-            self.pixhawk_log: "Pixhawk, PX4, ROS2, MAVLink, uXRCE 메시지 로그입니다.",
+            self.pixhawk_log: "Pixhawk, PX4, MAVLink 메시지 로그입니다.",
         }
         for widget, tooltip in tooltips.items():
             widget.setToolTip(tooltip)
@@ -5887,26 +6739,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_rtsp_apply_button,
             self.browse_weights_button,
             self.camera_connect_button,
-            self.pixhawk_button,
-            self.left_ros2_button,
-            self.right_ros2_button,
             self.left_mavlink_button,
             self.right_mavlink_button,
             self.start_button,
             self.capture_calibration_button,
             self.run_calibration_button,
             self.save_intrinsics_button,
-            self.clock_left_file_button,
-            self.clock_right_file_button,
-            self.clock_left_folder_button,
-            self.clock_right_folder_button,
-            self.clock_analyze_pair_button,
-            self.clock_analyze_folder_button,
-            self.clock_download_dir_button,
-            self.clock_cptr_button,
-            self.clock_icpt_button,
-            self.clock_download_latest_button,
-            self.clock_workflow_button,
             self.save_settings_button,
         )
         danger_buttons = ()
@@ -5957,7 +6795,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for table in (
             getattr(self, "pc_pixhawk_candidate_table", None),
             getattr(self, "mavlink_pixhawk_candidate_table", None),
-            getattr(self, "ros2_pixhawk_candidate_table", None),
         ):
             if table is not None:
                 table.setFixedHeight(240)
@@ -6289,7 +7126,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.signal_gps_sensor_labels[camera] = sensor_label
         layout.addWidget(status_group)
 
-        self.signal_gps_sats_plot = TelemetryHistoryPlot("GPS 위성 수 수신 확인 (ROS2/MAVLink)", "sats")
+        self.signal_gps_sats_plot = TelemetryHistoryPlot("GPS 위성 수 수신 확인 (MAVLink)", "sats")
         self.signal_gps_sats_plot.set_series_labels(
             {
                 "left_GPS1": "P1 GPS1",
@@ -6298,7 +7135,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "right_GPS2": "P2 GPS2",
             }
         )
-        self.signal_gps_eph_plot = TelemetryHistoryPlot("GPS eph 수신 확인 (ROS2/MAVLink)", "m")
+        self.signal_gps_eph_plot = TelemetryHistoryPlot("GPS eph 수신 확인 (MAVLink)", "m")
         self.signal_gps_eph_plot.set_series_labels(
             {
                 "left_GPS1": "P1 GPS1",
@@ -6455,25 +7292,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         add_setting(fixed_config_form, 1, "Fixed 좌표 수집 시간(s)", self.gnss_fixed_acquisition_duration_spin)
         add_setting(fixed_config_form, 2, "Fixed 상태 최소 시간(s)", self.gnss_fixed_min_duration_spin)
 
-        self.gnss_base_connect_button = QtWidgets.QPushButton("Base 연결")
+        self.gnss_base_connect_button = QtWidgets.QPushButton("Connect Base GNSS")
         self.gnss_base_connect_button.clicked.connect(self.connect_gnss_base_serial)
-        self.gnss_base_disconnect_button = QtWidgets.QPushButton("연결 해제")
+        self.gnss_base_disconnect_button = QtWidgets.QPushButton("Disconnect Base GNSS")
         self.gnss_base_disconnect_button.clicked.connect(self.disconnect_gnss_base_serial)
         self.gnss_base_disconnect_button.setEnabled(False)
-        self.gnss_base_survey_start_button = QtWidgets.QPushButton("Survey-in 시작")
+        self.gnss_base_survey_start_button = QtWidgets.QPushButton("Start Survey-in")
         self.gnss_base_survey_start_button.clicked.connect(self.start_gnss_base_survey_in)
         self.gnss_base_survey_start_button.setEnabled(False)
-        self.gnss_base_survey_stop_button = QtWidgets.QPushButton("Survey-in 중지")
+        self.gnss_base_survey_stop_button = QtWidgets.QPushButton("Stop Survey-in")
         self.gnss_base_survey_stop_button.clicked.connect(self.stop_gnss_base_survey_in)
         self.gnss_base_survey_stop_button.setEnabled(False)
-        self.gnss_network_start_button = QtWidgets.QPushButton("NTRIP 시작")
+        self.gnss_network_start_button = QtWidgets.QPushButton("Start NTRIP Corrections")
         self.gnss_network_start_button.clicked.connect(self.start_gnss_network)
-        self.gnss_network_stop_button = QtWidgets.QPushButton("NTRIP 중지")
+        self.gnss_network_stop_button = QtWidgets.QPushButton("Stop NTRIP Corrections")
         self.gnss_network_stop_button.clicked.connect(self.stop_gnss_network)
         self.gnss_network_stop_button.setEnabled(False)
-        self.gnss_base_discover_button = QtWidgets.QPushButton("Base 포트 탐색")
+        self.gnss_base_discover_button = QtWidgets.QPushButton("Scan Base GNSS Ports")
         self.gnss_base_discover_button.clicked.connect(self.discover_gnss_base_serial_ports)
-        self.gnss_base_apply_candidate_button = QtWidgets.QPushButton("선택 포트 적용")
+        self.gnss_base_apply_candidate_button = QtWidgets.QPushButton("Apply Selected Port")
         self.gnss_base_apply_candidate_button.clicked.connect(self.apply_selected_gnss_base_candidate)
         self.gnss_base_apply_candidate_button.setEnabled(False)
         button_row = QtWidgets.QHBoxLayout()
@@ -6923,7 +7760,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.alignment_global_frame_combo = QtWidgets.QComboBox()
         self.alignment_global_frame_combo.addItems(["ENU", "NED"])
         self.alignment_camera_frame_combo = QtWidgets.QComboBox()
-        self.alignment_camera_frame_combo.addItems(["RDF", "ROS Optical Frame"])
+        self.alignment_camera_frame_combo.addItems(["OpenCV optical RDF"])
         self.alignment_origin_combo = QtWidgets.QComboBox()
         self.alignment_origin_combo.addItems(["Left Camera", "Midpoint"])
         self.alignment_transform_text = QtWidgets.QPlainTextEdit("0 1 0\n0 0 1\n1 0 0")
@@ -7045,7 +7882,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             row.addWidget(group, 1)
         layout.addLayout(row, 2)
 
-        detail_group = QtWidgets.QGroupBox("GPS1/GPS2 ROS2 Topic / MAVLink Field 상태")
+        detail_group = QtWidgets.QGroupBox("GPS1/GPS2 MAVLink Field 상태")
         detail_form = QtWidgets.QGridLayout(detail_group)
         detail_form.setColumnStretch(1, 1)
         detail_form.setColumnStretch(3, 1)
@@ -7072,37 +7909,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _build_baseline_field_browser_view(self, layout: QtWidgets.QVBoxLayout) -> None:
         actions = QtWidgets.QHBoxLayout()
-        self.baseline_scan_topics_button = QtWidgets.QPushButton("ROS2 Topic 스캔")
+        self.baseline_scan_topics_button = QtWidgets.QPushButton("MAVLink field 스캔")
         self.baseline_scan_topics_button.clicked.connect(self.refresh_baseline_field_browser)
         actions.addWidget(self.baseline_scan_topics_button)
         actions.addStretch(1)
         layout.addLayout(actions)
-
-        split = QtWidgets.QHBoxLayout()
-        self.baseline_ros2_topic_table = QtWidgets.QTableWidget(0, 3)
-        self.baseline_ros2_topic_table.setHorizontalHeaderLabels(["우선", "Topic", "Type"])
-        self.baseline_ros2_topic_table.verticalHeader().setVisible(False)
-        self.baseline_ros2_topic_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.baseline_ros2_topic_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.baseline_ros2_topic_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        self.baseline_ros2_topic_table.itemSelectionChanged.connect(self._show_selected_baseline_ros2_fields)
-        self.baseline_ros2_field_list = QtWidgets.QListWidget()
-        ros2_group = QtWidgets.QGroupBox("ROS2 Topic")
-        ros2_layout = QtWidgets.QHBoxLayout(ros2_group)
-        ros2_layout.addWidget(self.baseline_ros2_topic_table, 2)
-        ros2_layout.addWidget(self.baseline_ros2_field_list, 1)
-        split.addWidget(ros2_group, 2)
 
         self.baseline_mavlink_message_table = QtWidgets.QTableWidget(0, 2)
         self.baseline_mavlink_message_table.setHorizontalHeaderLabels(["Message", "Fields"])
         self.baseline_mavlink_message_table.verticalHeader().setVisible(False)
         self.baseline_mavlink_message_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.baseline_mavlink_message_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
-        mav_group = QtWidgets.QGroupBox("MAVLink Raw")
+        mav_group = QtWidgets.QGroupBox("MAVLink field reference")
         mav_layout = QtWidgets.QVBoxLayout(mav_group)
         mav_layout.addWidget(self.baseline_mavlink_message_table)
-        split.addWidget(mav_group, 1)
-        layout.addLayout(split, 1)
+        layout.addWidget(mav_group, 1)
 
     def _build_baseline_source_selection_view(self, layout: QtWidgets.QVBoxLayout) -> None:
         control_group = QtWidgets.QGroupBox("Baseline 입력 선택")
@@ -7157,6 +7978,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             (
                 ("enu", "baseline vector ENU [E,N,U]"),
                 ("ned", "baseline vector NED [N,E,D]"),
+                ("p1_body_frd", "P1→P2 in P1 body FRD [F,R,D]"),
                 ("length", "baseline length"),
                 ("azimuth", "azimuth"),
                 ("elevation", "elevation"),
@@ -7183,6 +8005,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "azimuth는 북쪽 기준 수평 방향각, elevation은 수평면 대비 기울기입니다.\n"
             "altitude difference는 P2 altitude - P1 altitude입니다. "
             "timestamp delta는 P1/P2 GNSS 샘플 시간 차이이며, 클수록 baseline 신뢰도가 낮습니다.\n"
+            "P1→P2 in P1 body FRD는 같은 raw NED 벡터를 P1 Pixhawk 자세의 역회전으로 "
+            "[Forward, Right, Down] 순서로 다시 표현한 파생값입니다. "
+            "카메라 optical RDF나 public baseline_center_frd 측정값이 아닙니다.\n"
             "이 탭은 GNSS 위치 기반 baseline만 계산합니다. "
             "Forward와 baseline의 직각 여부는 Baseline / 자세 정렬 탭에서 확인합니다."
         )
@@ -7206,6 +8031,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 ("rdf_forward_angle", "P1 RDF Forward vs Baseline (deg)"),
                 ("effective_baseline", "P1 effective baseline (RDF Right/Down)"),
                 ("forward_component", "P1 Forward component"),
+                ("p1_body_frd", "P1→P2 in P1 body FRD [F,R,D]"),
                 ("right_rdf_forward_angle", "P2 RDF Forward vs Baseline (deg)"),
                 ("right_effective_baseline", "P2 effective baseline (RDF Right/Down)"),
                 ("right_forward_component", "P2 Forward component"),
@@ -7414,6 +8240,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.gnss_monitor.left_source = str(self.baseline_left_gps_combo.currentData() or "GPS1")
             self.gnss_monitor.right_source = str(self.baseline_right_gps_combo.currentData() or "GPS1")
         self._refresh_baseline_source_summary()
+        self._refresh_rtk_baseline()
         self._refresh_baseline_alignment_ui()
 
     def _refresh_baseline_source_summary(self) -> None:
@@ -7429,68 +8256,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_label_text_if_changed(label, text)
 
     def refresh_baseline_field_browser(self) -> None:
-        if not hasattr(self, "baseline_ros2_topic_table"):
+        if not hasattr(self, "baseline_mavlink_message_table"):
             return
-        priority_topics = (
-            "/mavros/global_position/global",
-            "/mavros/gpsstatus/gps1/raw",
-            "/mavros/gpsstatus/gps2/raw",
-            "/mavros/local_position/pose",
-            "/mavros/imu/data",
-            "/fmu/out/vehicle_gps_position",
-            "/fmu/out/sensor_gps",
-            "/fmu/out/vehicle_global_position",
-            "/fmu/out/vehicle_local_position",
-        )
-        discovered = discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.0)
-        by_name = {item.get("name", ""): item.get("type", "") for item in discovered}
-        rows: list[tuple[str, str, str]] = []
-        for topic in priority_topics:
-            rows.append(("yes", topic, by_name.pop(topic, "")))
-        for topic, topic_type in sorted(by_name.items()):
-            if any(pattern in topic for pattern in ("/fmu/out/", "/mavros/")):
-                rows.append(("", topic, topic_type))
-        self.baseline_ros2_topic_table.setRowCount(len(rows))
-        for row, (priority, topic, topic_type) in enumerate(rows):
-            for column, value in enumerate((priority, topic, topic_type)):
-                self.baseline_ros2_topic_table.setItem(row, column, QtWidgets.QTableWidgetItem(value))
-
         mavlink_rows = {
-            "GPS_RAW_INT": (
-                "time_usec, fix_type, lat, lon, alt, eph, epv, vel, cog, satellites_visible, "
-                "h_acc, v_acc, vel_acc, hdg_acc, yaw"
-            ),
-            "GPS2_RAW": (
-                "time_usec, fix_type, lat, lon, alt, eph, epv, vel, cog, satellites_visible, "
-                "h_acc, v_acc, vel_acc, hdg_acc, yaw"
-            ),
-            "GLOBAL_POSITION_INT": "time_boot_ms, lat, lon, alt, relative_alt, vx, vy, vz, hdg",
+            str(item.get("name") or ""): ", ".join(
+                mavlink_graphable_fields_for_message(str(item.get("name") or ""))
+            )
+            for item in discover_mavlink_messages()
+            if str(item.get("name") or "")
         }
         self.baseline_mavlink_message_table.setRowCount(len(mavlink_rows))
         for row, (message, fields) in enumerate(mavlink_rows.items()):
             self.baseline_mavlink_message_table.setItem(row, 0, QtWidgets.QTableWidgetItem(message))
             self.baseline_mavlink_message_table.setItem(row, 1, QtWidgets.QTableWidgetItem(fields))
-
-    def _show_selected_baseline_ros2_fields(self) -> None:
-        if not hasattr(self, "baseline_ros2_topic_table"):
-            return
-        selected = self.baseline_ros2_topic_table.selectedItems()
-        if not selected:
-            return
-        row = selected[0].row()
-        type_item = self.baseline_ros2_topic_table.item(row, 2)
-        topic_type = "" if type_item is None else type_item.text().strip()
-        self.baseline_ros2_field_list.clear()
-        if not topic_type:
-            self.baseline_ros2_field_list.addItem("message type 대기 중")
-            return
-        try:
-            fields = describe_ros2_message_fields(topic_type)
-        except Exception as exc:
-            self.baseline_ros2_field_list.addItem(f"field 조회 실패: {exc}")
-            return
-        for field in fields:
-            self.baseline_ros2_field_list.addItem(field)
 
     def _selected_baseline_gps_state(self, side: str) -> GpsPositionState | None:
         if hasattr(self, "baseline_left_gps_combo"):
@@ -7516,11 +8294,56 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return None
         return vector, left, right
 
+    def _refresh_p1_body_frd_baseline(self) -> BodyFrdBaselineProjection | None:
+        """Refresh the explicit P1→P2 body-FRD projection without replacing raw NED."""
+
+        baseline = self.latest_rtk_baseline
+        p1_attitude = self.latest_extrinsics.get("left")
+        projection = None
+        if baseline is not None and p1_attitude is not None:
+            projection = project_ned_baseline_to_p1_body_frd(
+                (baseline.north_m, baseline.east_m, baseline.down_m),
+                p1_attitude.q,
+                attitude_timestamp_s=p1_attitude.timestamp_s,
+                attitude_age_s=max(0.0, time.monotonic() - p1_attitude.timestamp_s),
+            )
+        self.latest_p1_body_frd_baseline = projection
+        self._set_p1_body_frd_baseline_labels(projection)
+        return projection
+
+    def _set_p1_body_frd_baseline_labels(
+        self,
+        projection: BodyFrdBaselineProjection | None,
+    ) -> None:
+        if projection is None:
+            if hasattr(self, "baseline_calc_labels"):
+                self._set_label_text_if_changed(self.baseline_calc_labels["p1_body_frd"], "P1 자세 대기 중")
+            if hasattr(self, "baseline_attitude_labels"):
+                self._set_health_label(
+                    self.baseline_attitude_labels["p1_body_frd"],
+                    "P1 자세 대기 중",
+                    "warn",
+                )
+            return
+        value_text = (
+            f"[F={projection.forward_m:+.4f}, R={projection.right_m:+.4f}, "
+            f"D={projection.down_m:+.4f}] m"
+        )
+        if projection.attitude_age_s is not None:
+            value_text += f" | attitude age={projection.attitude_age_s * 1000.0:.0f} ms"
+        if hasattr(self, "baseline_calc_labels"):
+            self._set_label_text_if_changed(self.baseline_calc_labels["p1_body_frd"], value_text)
+        if hasattr(self, "baseline_attitude_labels"):
+            baseline = self.latest_rtk_baseline
+            level = "good" if baseline is not None and baseline.fix_quality == "GOOD" else "warn"
+            self._set_health_label(self.baseline_attitude_labels["p1_body_frd"], value_text, level)
+
     def _refresh_baseline_alignment_ui(self) -> None:
         self._refresh_baseline_gps_cards()
         current = self._current_baseline_vector()
         if current is None:
             self.latest_baseline_vector = None
+            self.latest_p1_body_frd_baseline = None
             if hasattr(self, "baseline_calc_labels"):
                 for label in self.baseline_calc_labels.values():
                     self._set_health_label(label, "대기 중", "idle")
@@ -7532,6 +8355,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     self.rtk_alignment_detail_label,
                     "정렬 성분: 좌/우 GPS 위치 또는 timestamp 동기화 대기 중",
                 )
+            self._set_p1_body_frd_baseline_labels(None)
             return
         vector, left, right = current
         self.latest_baseline_vector = vector
@@ -7564,6 +8388,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 fix_quality="GOOD" if left.fix_type == 6 and right.fix_type == 6 else "DEGRADED",
             )
             self.latest_rtk_baseline = estimate
+            self._refresh_p1_body_frd_baseline()
             camera_translation = self._alignment_view_camera_translation_right_in_left_m(estimate)
             right_camera_translation = self._baseline_camera_translation_in_side_rdf_m(estimate, "right")
             self.rtk_alignment_plot.set_alignment(
@@ -7586,6 +8411,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"NED N/E/D={vector.north_m:+.3f}/{vector.east_m:+.3f}/{-vector.up_m:+.3f} m | "
                 f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}",
             )
+        else:
+            self._refresh_p1_body_frd_baseline()
+        if hasattr(self, "baseline_calc_labels"):
+            self._set_p1_body_frd_baseline_labels(self.latest_p1_body_frd_baseline)
         self._refresh_alignment_overview()
         self._refresh_alignment_validation()
 
@@ -7600,9 +8429,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_health_label(labels["connection"], "connected" if connected else "waiting", "good" if connected else "idle")
             for slot_key, label_key in (("GPS1", "gps1"), ("GPS2", "gps2")):
                 state = sensors.get(slot_key)
-                unavailable = state is None and self._ros2_only_unavailable(side, slot_key)
-                level = "good" if state is not None else "warn" if unavailable else "idle"
-                text = "인식" if state is not None else "ROS2 미게시" if unavailable else "대기"
+                level = "good" if state is not None else "idle"
+                text = "인식" if state is not None else "대기"
                 if state is not None and state.fix_type is not None:
                     text += f" fix={state.fix_type}"
                 self._set_health_label(labels[label_key], text, level)
@@ -7637,15 +8465,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for side in ("left", "right"):
             for slot in ("GPS1", "GPS2"):
                 state = self.latest_gps_sensors.get(side, {}).get(slot)
-                unavailable = state is None and self._ros2_only_unavailable(side, slot)
-                level = "good" if state is not None else "warn" if unavailable else "idle"
-                text = "인식" if state is not None else "ROS2 미게시" if unavailable else "대기"
+                level = "good" if state is not None else "idle"
+                text = "인식" if state is not None else "대기"
                 self._set_health_label(labels[f"{side}_{slot.lower()}"], text, level)
             for slot in ("CAN1", "CAN2"):
                 state = self.latest_mag_sensors.get(side, {}).get(slot)
-                unavailable = state is None and self._ros2_only_unavailable(side, slot)
-                level = "good" if state is not None else "warn" if unavailable else "idle"
-                text = "인식" if state is not None else "ROS2 미게시" if unavailable else "대기"
+                level = "good" if state is not None else "idle"
+                text = "인식" if state is not None else "대기"
                 self._set_health_label(labels[f"{side}_{slot.lower()}"], text, level)
         vector = self.latest_baseline_vector
         quality = self.latest_baseline_quality
@@ -8904,38 +9730,84 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._refresh_gnss_base_rtcm_stats()
             self._refresh_gnss_operation_readiness()
             return
-        sent_sides: list[str] = []
-        failed: list[str] = []
-        for side in target_sides:
-            try:
-                packet_count = self.mavlink_pixhawk.send_rtcm_data(side, payload)
-                self._record_gnss_base_rtcm_injection(
-                    side,
-                    payload_bytes=len(payload),
-                    packet_count=int(packet_count or 0),
-                )
-                sent_sides.append(self._px4_mag_camera_label(side))
-            except Exception as exc:
+        worker = self._ensure_pixhawk_rtcm_worker()
+        if worker is None:
+            for side in target_sides:
                 self._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
-                failed.append(f"{self._px4_mag_camera_label(side)}:{exc}")
-        if sent_sides and not failed:
             self._set_health_label(
                 self.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM {len(payload)} bytes -> {', '.join(sent_sides)}",
-                "good",
-            )
-        elif sent_sides:
-            self._set_health_label(
-                self.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM 일부 주입: {', '.join(sent_sides)} | 실패 {', '.join(failed)}",
-                "warn",
-            )
-        else:
-            self._set_health_label(
-                self.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM 주입 실패: {', '.join(failed)}",
+                f"RTCM 주입 대기 실패: MAVLink worker 없음 ({len(payload)} bytes)",
                 "bad",
             )
+            self._refresh_gnss_base_rtcm_stats()
+            self._refresh_gnss_operation_readiness()
+            return
+        worker.request.emit(tuple(target_sides), payload)
+        self._set_health_label(
+            self.gnss_base_status_labels["rtcm_injection"],
+            f"RTCM {len(payload)} bytes 대기 중 -> "
+            f"{', '.join(self._px4_mag_camera_label(side) for side in target_sides)}",
+            "warn",
+        )
+
+    def _ensure_pixhawk_rtcm_worker(self) -> PixhawkRtcmInjectionWorker | None:
+        subscriber = self.mavlink_pixhawk
+        if subscriber is None:
+            return None
+        if self.pixhawk_rtcm_thread is not None and self.pixhawk_rtcm_worker is not None:
+            return self.pixhawk_rtcm_worker
+        thread = QtCore.QThread(self)
+        worker = PixhawkRtcmInjectionWorker(subscriber)
+        worker.moveToThread(thread)
+        worker.request.connect(worker.enqueue, QtCore.Qt.QueuedConnection)
+        worker.injected.connect(self._apply_pixhawk_rtcm_result)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_pixhawk_rtcm_worker)
+        self.pixhawk_rtcm_thread = thread
+        self.pixhawk_rtcm_worker = worker
+        thread.start()
+        return worker
+
+    def _apply_pixhawk_rtcm_result(self, result: object) -> None:
+        data = dict(result or {})
+        payload_bytes = int(data.get("payload_bytes") or 0)
+        sent = tuple(data.get("sent") or ())
+        failed = tuple(data.get("failed") or ())
+        dropped = int(data.get("dropped") or 0)
+        sent_labels: list[str] = []
+        failed_labels: list[str] = []
+        for side, packet_count in sent:
+            side = str(side)
+            self._record_gnss_base_rtcm_injection(
+                side,
+                payload_bytes=payload_bytes,
+                packet_count=int(packet_count or 0),
+            )
+            sent_labels.append(self._px4_mag_camera_label(side))
+        for side, error in failed:
+            side = str(side)
+            self._record_gnss_base_rtcm_injection(side, payload_bytes=payload_bytes, failed=True)
+            failed_labels.append(f"{self._px4_mag_camera_label(side)}:{error}")
+        if dropped:
+            self._log(f"[GNSS] RTCM 오래된 대기 프레임 {dropped}개를 폐기했습니다.")
+        if sent_labels and not failed_labels:
+            level = "good"
+            text = f"RTCM {payload_bytes} bytes -> {', '.join(sent_labels)}"
+        elif sent_labels:
+            level = "warn"
+            text = f"RTCM 일부 주입: {', '.join(sent_labels)} | 실패 {', '.join(failed_labels)}"
+        elif failed_labels:
+            level = "bad"
+            text = f"RTCM 주입 실패: {', '.join(failed_labels)}"
+        else:
+            return
+        self._set_health_label(self.gnss_base_status_labels["rtcm_injection"], text, level)
+        self._refresh_gnss_base_rtcm_stats()
+        self._refresh_gnss_operation_readiness()
+
+    def _clear_pixhawk_rtcm_worker(self) -> None:
+        self.pixhawk_rtcm_thread = None
+        self.pixhawk_rtcm_worker = None
         self._refresh_gnss_base_rtcm_stats()
         self._maybe_activate_gnss_fixed_base()
         self._refresh_gnss_operation_readiness()
@@ -9142,10 +10014,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _magnetometer_pending_text(self, camera: str) -> str:
         if self.latest_vehicle_mag_device_ids.get(camera) is not None:
             return "selected telemetry만 수신 · 역할 raw sample 대기"
-        if self._ros2_only_unavailable(camera, "MAG"):
-            return "ROS2 raw MAG 미게시"
-        if self._ros2_topic_available(camera, "sensor_mag"):
-            return "역할 raw sample 대기"
         return "MAG sample 대기"
 
     def _refresh_alignment_magnetometer_ui(self) -> None:
@@ -9192,7 +10060,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 labels["rate"].setText("live")
                 labels["source"].setText(
                     {
-                        "telemetry": "ROS2 telemetry",
+                        "telemetry": "MAVLink telemetry",
                         "PX4 param inferred": "PX4 추정",
                         "unknown": "확인 불가",
                     }.get(device_source, device_source)
@@ -9642,7 +10510,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         rm_form.setContentsMargins(8, 10, 8, 8)
         rm_form.setHorizontalSpacing(8)
         rm_form.setVerticalSpacing(6)
-        rm_source_label = QtWidgets.QLabel("소스: ROS2 /fmu/out/sensor_mag, MAVLink SCALED_IMU* fallback")
+        rm_source_label = QtWidgets.QLabel("소스: MAVLink SCALED_IMU* / MAVLink sensor telemetry")
         rm_source_label.setObjectName("statusStrip")
         rm_form.addWidget(rm_source_label, 0, 0, 1, 2)
         rm_form.addWidget(QtWidgets.QLabel("센서"), 1, 0)
@@ -9666,7 +10534,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         gnss_form.setContentsMargins(8, 10, 8, 8)
         gnss_form.setHorizontalSpacing(8)
         gnss_form.setVerticalSpacing(6)
-        gnss_source_label = QtWidgets.QLabel("소스: ROS2 /fmu/out/sensor_gps, /fmu/out/sensor_gnss_relative")
+        gnss_source_label = QtWidgets.QLabel("소스: MAVLink GPS / GNSS telemetry")
         gnss_source_label.setObjectName("statusStrip")
         gnss_form.addWidget(gnss_source_label, 0, 0, 1, 2)
         gnss_form.addWidget(QtWidgets.QLabel("수신기"), 1, 0)
@@ -9723,69 +10591,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._configure_collapsible_group(f9p_detail_group, checked=False)
         layout.addWidget(f9p_detail_group)
 
-    def _build_clock_sync_tab(
-        self,
-        layout: QtWidgets.QVBoxLayout,
-        image_layout: QtWidgets.QVBoxLayout,
-    ) -> None:
-        """Build the 시간 (STUS sync) and 이미지 (capture/EXIF) tabs.
+    def _build_clock_sync_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
+        """Build the Workstation camera-clock and RTCP/NTP evidence surface.
 
-        Both tabs are built here because their widgets share the clock_* command
-        helpers; ``layout`` receives only the RTC sync group and its history
-        plot, and everything capture/EXIF related goes to ``image_layout``.
+        Workstation timing evidence is limited to the WIRIS RTC command and
+        live RTCP/NTP frame metadata.
         """
 
         layout.setSpacing(8)
-        image_layout.setSpacing(8)
-        workflow_group = QtWidgets.QGroupBox("CPTR 촬영 / FTP 다운로드")
-        workflow_form = QtWidgets.QGridLayout(workflow_group)
-        workflow_form.setColumnStretch(1, 1)
-        workflow_form.setColumnStretch(4, 1)
-        self.clock_ftp_user_edit = QtWidgets.QLineEdit(self.settings.clock_ftp_user or "anonymous")
-        self.clock_ftp_password_edit = QtWidgets.QLineEdit(self.settings.clock_ftp_password)
-        self.clock_ftp_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
-        self.clock_ftp_port_spin = QtWidgets.QSpinBox()
-        self.clock_ftp_port_spin.setRange(1, 65535)
-        self.clock_ftp_port_spin.setValue(max(1, min(65535, int(self.settings.clock_ftp_port))))
-        self.clock_ftp_remote_dir_edit = QtWidgets.QLineEdit(self.settings.clock_ftp_remote_dir or "/")
-        clock_download_dir = resolve_settings_path(
-            self.settings.clock_download_dir or DEFAULT_CLOCK_DOWNLOAD_DIR,
-            base_dir=APP_ROOT,
-        )
-        self.clock_download_dir_edit = QtWidgets.QLineEdit(str(clock_download_dir))
-        self.clock_download_dir_button = QtWidgets.QPushButton("폴더 선택")
-        self.clock_capture_wait_spin = QtWidgets.QDoubleSpinBox()
-        self.clock_capture_wait_spin.setRange(0.0, 120.0)
-        self.clock_capture_wait_spin.setDecimals(1)
-        self.clock_capture_wait_spin.setSingleStep(0.5)
-        self.clock_capture_wait_spin.setValue(float(self.settings.clock_capture_wait_s))
-        self.clock_workflow_button = QtWidgets.QPushButton("전체 실행")
-        self.clock_cptr_button = QtWidgets.QPushButton("CPTR 촬영")
-        self.clock_icpt_button = QtWidgets.QPushButton("ICPT 확인")
-        self.clock_download_latest_button = QtWidgets.QPushButton("FTP 다운로드")
-        self.clock_download_dir_button.clicked.connect(self.browse_clock_download_folder)
-        self.clock_cptr_button.clicked.connect(self.capture_clock_photos)
-        self.clock_icpt_button.clicked.connect(self.check_clock_capture_status)
-        self.clock_download_latest_button.clicked.connect(self.download_latest_clock_photos)
-        self.clock_workflow_button.clicked.connect(self.capture_download_analyze_clock_photos)
-
-        workflow_form.addWidget(QtWidgets.QLabel("FTP User"), 0, 0)
-        workflow_form.addWidget(self.clock_ftp_user_edit, 0, 1)
-        workflow_form.addWidget(QtWidgets.QLabel("Password"), 0, 2)
-        workflow_form.addWidget(self.clock_ftp_password_edit, 0, 3)
-        workflow_form.addWidget(QtWidgets.QLabel("Port"), 0, 4)
-        workflow_form.addWidget(self.clock_ftp_port_spin, 0, 5)
-        workflow_form.addWidget(QtWidgets.QLabel("Remote Dir"), 1, 0)
-        workflow_form.addWidget(self.clock_ftp_remote_dir_edit, 1, 1, 1, 2)
-        workflow_form.addWidget(QtWidgets.QLabel("저장 폴더"), 1, 3)
-        workflow_form.addWidget(self.clock_download_dir_edit, 1, 4)
-        workflow_form.addWidget(self.clock_download_dir_button, 1, 5)
-        workflow_form.addWidget(QtWidgets.QLabel("완료 대기(s)"), 2, 0)
-        workflow_form.addWidget(self.clock_capture_wait_spin, 2, 1)
-        workflow_form.addWidget(self.clock_workflow_button, 2, 2)
-        workflow_form.addWidget(self.clock_cptr_button, 2, 3)
-        workflow_form.addWidget(self.clock_icpt_button, 2, 4)
-        workflow_form.addWidget(self.clock_download_latest_button, 2, 5)
 
         rtc_group = QtWidgets.QGroupBox("WIRIS RTC / 스트림 동기화")
         rtc_layout = QtWidgets.QGridLayout(rtc_group)
@@ -9823,143 +10636,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         rtc_layout.addWidget(self.clock_sync_status_label, 1, 0, 1, 4)
         rtc_layout.addWidget(self.clock_sync_summary_text, 2, 0, 1, 4)
 
-        source_group = QtWidgets.QGroupBox("EXIF 시계 차이")
-        source_form = QtWidgets.QGridLayout(source_group)
-        source_form.setColumnStretch(1, 1)
-        source_form.setColumnStretch(4, 1)
-        self.clock_left_file_edit = QtWidgets.QLineEdit()
-        self.clock_right_file_edit = QtWidgets.QLineEdit()
-        self.clock_left_folder_edit = QtWidgets.QLineEdit()
-        self.clock_right_folder_edit = QtWidgets.QLineEdit()
-        self.clock_left_file_button = QtWidgets.QPushButton("파일 선택")
-        self.clock_right_file_button = QtWidgets.QPushButton("파일 선택")
-        self.clock_left_folder_button = QtWidgets.QPushButton("폴더 선택")
-        self.clock_right_folder_button = QtWidgets.QPushButton("폴더 선택")
-        self.clock_analyze_pair_button = QtWidgets.QPushButton("파일 쌍 비교")
-        self.clock_analyze_folder_button = QtWidgets.QPushButton("폴더 비교")
-        self.clock_status_label = QtWidgets.QLabel(
-            "FTP로 내려받은 좌/우 이미지의 EXIF GPS 시간 또는 촬영 시간을 비교합니다."
-        )
-        self.clock_status_label.setObjectName("statusStrip")
-        self.clock_status_label.setWordWrap(True)
-        self.clock_left_file_button.clicked.connect(lambda: self.browse_clock_photo("left"))
-        self.clock_right_file_button.clicked.connect(lambda: self.browse_clock_photo("right"))
-        self.clock_left_folder_button.clicked.connect(lambda: self.browse_clock_folder("left"))
-        self.clock_right_folder_button.clicked.connect(lambda: self.browse_clock_folder("right"))
-        self.clock_analyze_pair_button.clicked.connect(self.analyze_clock_photo_pair)
-        self.clock_analyze_folder_button.clicked.connect(self.analyze_clock_photo_folders)
-
-        source_form.addWidget(QtWidgets.QLabel("왼쪽 사진"), 0, 0)
-        source_form.addWidget(self.clock_left_file_edit, 0, 1)
-        source_form.addWidget(self.clock_left_file_button, 0, 2)
-        source_form.addWidget(QtWidgets.QLabel("오른쪽 사진"), 0, 3)
-        source_form.addWidget(self.clock_right_file_edit, 0, 4)
-        source_form.addWidget(self.clock_right_file_button, 0, 5)
-        source_form.addWidget(QtWidgets.QLabel("왼쪽 폴더"), 1, 0)
-        source_form.addWidget(self.clock_left_folder_edit, 1, 1)
-        source_form.addWidget(self.clock_left_folder_button, 1, 2)
-        source_form.addWidget(QtWidgets.QLabel("오른쪽 폴더"), 1, 3)
-        source_form.addWidget(self.clock_right_folder_edit, 1, 4)
-        source_form.addWidget(self.clock_right_folder_button, 1, 5)
-        source_form.addWidget(self.clock_analyze_pair_button, 2, 0, 1, 2)
-        source_form.addWidget(self.clock_analyze_folder_button, 2, 2, 1, 2)
-        source_form.addWidget(self.clock_status_label, 3, 0, 1, 6)
-
-        self.clock_result_table = QtWidgets.QTableWidget(0, 8)
-        self.clock_result_table.setHorizontalHeaderLabels(
-            ("Pair", "Left file", "Right file", "Left time", "Right time", "Δ right-left", "Source", "Warnings")
-        )
-        self.clock_result_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-        self.clock_result_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
-        self.clock_result_table.setAlternatingRowColors(True)
-        self.clock_result_table.horizontalHeader().setStretchLastSection(True)
-        self.clock_result_table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-        self.clock_result_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.Stretch)
-
-        self.clock_summary_text = QtWidgets.QPlainTextEdit()
-        self.clock_summary_text.setReadOnly(True)
-        self.clock_summary_text.setMaximumBlockCount(300)
-        self.clock_summary_text.setPlaceholderText("분석 결과가 여기에 표시됩니다.")
         self.clock_offset_plot = ClockOffsetHistoryPlot()
         history_group = QtWidgets.QGroupBox("RTCP/NTP 오프셋 추이")
         history_layout = QtWidgets.QVBoxLayout(history_group)
         history_layout.addWidget(self.clock_offset_plot)
         layout.addWidget(rtc_group)
         layout.addWidget(history_group, 1)
-
-        image_layout.addWidget(workflow_group)
-        image_layout.addWidget(source_group)
-        image_layout.addWidget(self.clock_result_table, 2)
-        image_layout.addWidget(self.clock_summary_text, 1)
-
-    def browse_clock_photo(self, camera: str) -> None:
-        edit = self.clock_left_file_edit if camera == "left" else self.clock_right_file_edit
-        start_dir = self._clock_start_dir(edit.text().strip())
-        selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            f"Select {camera} WIRIS photo",
-            str(start_dir),
-            "Image files (*.jpg *.jpeg *.tif *.tiff);;All files (*)",
-        )
-        if selected:
-            edit.setText(selected)
-
-    def browse_clock_folder(self, camera: str) -> None:
-        edit = self.clock_left_folder_edit if camera == "left" else self.clock_right_folder_edit
-        start_dir = self._clock_start_dir(edit.text().strip())
-        selected = QtWidgets.QFileDialog.getExistingDirectory(self, f"Select {camera} WIRIS folder", str(start_dir))
-        if selected:
-            edit.setText(selected)
-
-    def browse_clock_download_folder(self) -> None:
-        start_dir = self._clock_start_dir(self.clock_download_dir_edit.text().strip())
-        selected = QtWidgets.QFileDialog.getExistingDirectory(self, "Select WIRIS FTP download folder", str(start_dir))
-        if selected:
-            self.clock_download_dir_edit.setText(selected)
-
-    def capture_clock_photos(self) -> None:
-        statuses = self._send_clock_wiris_command_parallel("CPTR")
-        status_text = " | ".join(f"{self._camera_name_ko(camera)}: {response or '<no response>'}" for camera, response in statuses)
-        self.clock_status_label.setText(f"CPTR 전송: {status_text}")
-        self.clock_summary_text.setPlainText(f"CPTR sent\n{status_text}")
-        self._log(f"[시계] CPTR 전송: {status_text}")
-
-    def check_clock_capture_status(self) -> None:
-        statuses = self._send_clock_wiris_command("ICPT")
-        lines = []
-        for camera, response in statuses:
-            busy = self._wiris_capture_busy(response)
-            lines.append(f"{self._camera_name_ko(camera)}: {'capturing' if busy else 'idle'} ({response or '<no response>'})")
-        text = "\n".join(lines)
-        self.clock_status_label.setText("ICPT 확인 완료")
-        self.clock_summary_text.setPlainText(text)
-        self._log(f"[시계] ICPT 확인: {' | '.join(lines)}")
-
-    def capture_download_analyze_clock_photos(self) -> None:
-        try:
-            self.capture_clock_photos()
-            completed = self._wait_for_clock_capture_complete(timeout_s=self.clock_capture_wait_spin.value())
-            if not completed:
-                self.clock_status_label.setText("CPTR 후 ICPT 완료 대기 시간이 초과되었습니다. 최신 파일 다운로드는 계속 시도합니다.")
-            paths = self._download_latest_clock_photo_pair()
-        except Exception as exc:
-            self.clock_status_label.setText(f"촬영/다운로드 실패: {exc}")
-            self.clock_summary_text.setPlainText(str(exc))
-            self._log(f"[시계] 촬영/다운로드 실패: {exc}")
-            return
-        self._set_clock_downloaded_paths(paths)
-        self.analyze_clock_photo_pair()
-
-    def download_latest_clock_photos(self) -> None:
-        try:
-            paths = self._download_latest_clock_photo_pair()
-        except Exception as exc:
-            self.clock_status_label.setText(f"FTP 다운로드 실패: {exc}")
-            self.clock_summary_text.setPlainText(str(exc))
-            self._log(f"[시계] FTP 다운로드 실패: {exc}")
-            return
-        self._set_clock_downloaded_paths(paths)
-        self.analyze_clock_photo_pair()
 
     def _set_camera_sync_state(self, status: str, reason: str) -> None:
         self.camera_sync_status = str(status)
@@ -9995,13 +10677,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return None
         return value.timestamp()
 
-    def _read_camera_gdti_after_stus(self) -> dict[str, dict[str, object]]:
+    def _format_wiris_gdti_results(self, result: object) -> dict[str, dict[str, object]]:
+        data = dict(result or {})
+        raw_results = dict(data.get("results") or {})
+        requested_utc_s = self._camera_sync_requested_utc_s
         results: dict[str, dict[str, object]] = {}
-        for camera, response in self._send_clock_wiris_command_parallel("GDTI"):
+        for camera, raw in raw_results.items():
+            row = dict(raw or {})
+            response = str(row.get("response") or "")
             parsed_s = self._parse_wiris_gdti_unix_s(response)
-            timing = getattr(self, "_last_clock_command_timing", {}).get(camera, {})
-            started_s = timing.get("started_utc_s")
-            finished_s = timing.get("finished_utc_s")
+            started_s = row.get("query_started_utc_s")
+            finished_s = row.get("query_finished_utc_s")
             midpoint_s = None
             query_duration_s = None
             if started_s is not None and finished_s is not None:
@@ -10024,12 +10710,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 and abs(float(query_offset_ms)) <= tolerance_ms
             )
             results[camera] = {
-                "response": str(response),
+                "response": response,
                 "unix_s": parsed_s,
                 "offset_ms": (
                     None
-                    if parsed_s is None or self._camera_sync_requested_utc_s is None
-                    else (parsed_s - self._camera_sync_requested_utc_s) * 1000.0
+                    if parsed_s is None or requested_utc_s is None
+                    else (parsed_s - requested_utc_s) * 1000.0
                 ),
                 "query_started_utc_s": started_s,
                 "query_finished_utc_s": finished_s,
@@ -10244,7 +10930,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             self._set_camera_sync_state(CAMERA_SYNC_STATUS_WARMING, reason)
 
-    def _begin_camera_sync_after_stus(self, *, target: str, result: str, requested_utc_s: float | None) -> None:
+    def _begin_camera_sync_after_stus(
+        self,
+        *,
+        target: str,
+        result: str,
+        requested_utc_s: float | None,
+        target_infos: Sequence[tuple[str, str, int, float]],
+    ) -> None:
         self._camera_sync_requested_utc_s = requested_utc_s
         if target != "both" or result != "success":
             self._set_camera_sync_state(
@@ -10262,7 +10955,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "STUS는 완료됐지만 RTSP 스트림이 없어 검증을 시작하지 않았습니다.",
             )
             return
-        self._camera_sync_gdti = self._read_camera_gdti_after_stus()
+        self._start_wiris_gdti_worker(target_infos)
+
+    def _start_wiris_gdti_worker(self, target_infos: Sequence[tuple[str, str, int, float]]) -> None:
+        if self.wiris_gdti_thread is not None:
+            self._log("[시계] GDTI 조회가 이미 진행 중입니다.")
+            return
+        self.wiris_command_status_label.setText("GDTI 확인: querying...")
+        self.wiris_gdti_thread = QtCore.QThread(self)
+        self.wiris_gdti_worker = WirisClockCommandWorker(target_infos, command_text="GDTI")
+        self.wiris_gdti_worker.moveToThread(self.wiris_gdti_thread)
+        self.wiris_gdti_thread.started.connect(self.wiris_gdti_worker.run)
+        self.wiris_gdti_worker.completed.connect(self._apply_wiris_gdti_result)
+        self.wiris_gdti_worker.failed.connect(self._wiris_gdti_failed)
+        self.wiris_gdti_worker.finished.connect(self.wiris_gdti_thread.quit)
+        self.wiris_gdti_worker.finished.connect(self.wiris_gdti_worker.deleteLater)
+        self.wiris_gdti_thread.finished.connect(self.wiris_gdti_thread.deleteLater)
+        self.wiris_gdti_thread.finished.connect(self._clear_wiris_gdti_worker)
+        self.wiris_gdti_thread.start()
+
+    def _apply_wiris_gdti_result(self, result: object) -> None:
+        self._camera_sync_gdti = self._format_wiris_gdti_results(result)
         self._camera_sync_transport_override = RTSP_TRANSPORT_TCP
         self._camera_sync_deadline_monotonic_s = time.monotonic() + self._camera_sync_warmup_timeout_s()
         self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
@@ -10272,89 +10985,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self._camera_sync_timer.start()
 
-    def _send_clock_wiris_command(self, command_text: str) -> list[tuple[str, str]]:
-        statuses: list[tuple[str, str]] = []
-        for camera, host in self.zoom_hosts("both"):
-            command = build_wiris_command(
-                host=host,
-                port=self._control_port_for_camera(camera),
-                command=command_text,
-                timeout_s=self.zoom_timeout_spin.value(),
-                terminator=LINE_TERMINATOR,
-            )
-            response = send_tcp_line(command)
-            statuses.append((camera, response))
-        return statuses
+    def _wiris_gdti_failed(self, error: str) -> None:
+        self._camera_sync_gdti = {}
+        self._set_camera_sync_state(CAMERA_SYNC_STATUS_FAILED, f"GDTI 조회 실패: {error}")
+        self._log(f"[시계] GDTI 조회 실패: {error}")
 
-    def _send_clock_wiris_command_parallel(self, command_text: str) -> list[tuple[str, str]]:
-        self._last_clock_command_timing = {}
-        targets = self.zoom_hosts("both")
-        if len(targets) <= 1:
-            return self._send_clock_wiris_command(command_text)
-        barrier = threading.Barrier(len(targets))
-        results: dict[str, str] = {}
-        send_times: dict[str, float] = {}
-        command_timing: dict[str, dict[str, float]] = {}
-
-        def send_one(camera: str, host: str) -> None:
-            try:
-                command = build_wiris_command(
-                    host=host,
-                    port=self._control_port_for_camera(camera),
-                    command=command_text,
-                    timeout_s=self.zoom_timeout_spin.value(),
-                    terminator=LINE_TERMINATOR,
-                )
-                barrier.wait(timeout=max(1.0, self.zoom_timeout_spin.value()))
-                send_times[camera] = time.perf_counter()
-                started_utc_s = time.time()
-                results[camera] = send_tcp_line(command)
-                command_timing[camera] = {
-                    "started_utc_s": started_utc_s,
-                    "finished_utc_s": time.time(),
-                }
-            except Exception as exc:
-                results[camera] = f"failed: {exc}"
-
-        threads = [
-            threading.Thread(target=send_one, args=(camera, host), name=f"clock-{command_text.lower()}-{camera}")
-            for camera, host in targets
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=max(1.0, self.zoom_timeout_spin.value()) + 1.0)
-        if len(send_times) >= 2:
-            ordered_times = [(camera, send_times[camera]) for camera, _host in targets if camera in send_times]
-            if len(ordered_times) >= 2:
-                first_camera, first_time = ordered_times[0]
-                last_camera, last_time = ordered_times[-1]
-                delta_ms = (last_time - first_time) * 1000.0
-                self._log(
-                    f"[시계] {command_text} 병렬 전송 시각 차이 "
-                    f"{self._camera_name_ko(first_camera)}→{self._camera_name_ko(last_camera)}: {delta_ms:.3f} ms"
-                )
-        self._last_clock_command_timing = command_timing
-        return [(camera, results.get(camera, "<no response>")) for camera, _host in targets]
-
-    def _wait_for_clock_capture_complete(self, *, timeout_s: float) -> bool:
-        deadline = time.monotonic() + max(0.0, float(timeout_s))
-        while True:
-            statuses = self._send_clock_wiris_command("ICPT")
-            if not any(self._wiris_capture_busy(response) for _camera, response in statuses):
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            QtWidgets.QApplication.processEvents()
-            time.sleep(0.25)
-
-    def _wiris_capture_busy(self, response: str) -> bool:
-        text = response.strip().upper()
-        if not text:
-            return False
-        if any(token in text for token in ("FALSE", "IDLE", "DONE", "READY", " 0", "=0")) or text == "0":
-            return False
-        return any(token in text for token in ("TRUE", "BUSY", "CAPT", " 1", "=1")) or text == "1"
+    def _clear_wiris_gdti_worker(self) -> None:
+        self.wiris_gdti_thread = None
+        self.wiris_gdti_worker = None
 
     def _clock_sync_side_summary(self, camera: str, metadata: dict[str, object], now_wall_s: float, now_mono_s: float) -> tuple[str, float | None]:
         if metadata.get("rtcp_timing_invalid_reason"):
@@ -10798,195 +11436,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if status is not None:
             self._log(f"[시계] {status}")
 
-    def _download_latest_clock_photo_pair(self) -> dict[str, Path]:
-        output_root = self._clock_download_root()
-        paths = {}
-        for camera, host in self.zoom_hosts("both"):
-            paths[camera] = self._download_latest_ftp_image(camera, host, output_root)
-        return paths
-
-    def _download_latest_ftp_image(self, camera: str, host: str, output_root: Path) -> Path:
-        normalized_host = host.strip()
-        if not normalized_host:
-            raise ValueError(f"{self._camera_name_ko(camera)} WIRIS host is empty")
-        user = self.clock_ftp_user_edit.text().strip() or "anonymous"
-        password = self.clock_ftp_password_edit.text()
-        remote_dir = self.clock_ftp_remote_dir_edit.text().strip() or "/"
-        port = int(self.clock_ftp_port_spin.value())
-        timeout_s = float(self.zoom_timeout_spin.value())
-        camera_dir = output_root / camera
-        camera_dir.mkdir(parents=True, exist_ok=True)
-        with ftplib.FTP() as ftp:
-            ftp.connect(normalized_host, port, timeout=timeout_s)
-            ftp.login(user=user, passwd=password)
-            if remote_dir and remote_dir != ".":
-                ftp.cwd(remote_dir)
-            latest = self._latest_ftp_image_name(ftp)
-            output = camera_dir / Path(latest).name
-            if output.exists():
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                output = camera_dir / f"{timestamp}_{output.name}"
-            with output.open("wb") as handle:
-                ftp.retrbinary(f"RETR {latest}", handle.write)
-        self._log(f"[시계] {self._camera_name_ko(camera)} FTP 최신 이미지 다운로드: {output}")
-        return output
-
-    def _latest_ftp_image_name(self, ftp: ftplib.FTP) -> str:
-        names = [
-            name
-            for name in ftp.nlst()
-            if Path(name).suffix.lower() in WIRIS_FTP_IMAGE_EXTENSIONS
-        ]
-        if not names:
-            raise FileNotFoundError("FTP remote directory has no JPG/TIFF images")
-
-        def sort_key(name: str) -> tuple[float, str]:
-            try:
-                response = ftp.voidcmd(f"MDTM {name}")
-                timestamp = response.split()[-1]
-                parsed = datetime.strptime(timestamp, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
-                return parsed.timestamp(), name
-            except Exception:
-                return 0.0, name
-
-        return max(names, key=sort_key)
-
-    def _set_clock_downloaded_paths(self, paths: dict[str, Path]) -> None:
-        left_path = paths.get("left")
-        right_path = paths.get("right")
-        if left_path is not None:
-            self.clock_left_file_edit.setText(str(left_path))
-            self.clock_left_folder_edit.setText(str(left_path.parent))
-        if right_path is not None:
-            self.clock_right_file_edit.setText(str(right_path))
-            self.clock_right_folder_edit.setText(str(right_path.parent))
-
-    def analyze_clock_photo_pair(self) -> None:
-        left_path = self.clock_left_file_edit.text().strip()
-        right_path = self.clock_right_file_edit.text().strip()
-        if not left_path or not right_path:
-            self.clock_status_label.setText("좌/우 이미지 파일을 모두 선택하세요.")
-            return
-        try:
-            result = compare_photo_clocks(left_path, right_path)
-        except PhotoMetadataError as exc:
-            self.clock_status_label.setText(f"분석 실패: {exc}")
-            self.clock_summary_text.setPlainText(str(exc))
-            return
-        self._set_clock_table_results([result])
-        summary = self._format_clock_result_summary(result)
-        self.clock_summary_text.setPlainText(summary)
-        self.clock_status_label.setText(f"파일 쌍 clock offset: {format_offset_seconds(result.offset_seconds)}")
-        self._log(f"[시계] 파일 쌍 offset: {format_offset_seconds(result.offset_seconds)}")
-
-    def analyze_clock_photo_folders(self) -> None:
-        left_dir = self.clock_left_folder_edit.text().strip()
-        right_dir = self.clock_right_folder_edit.text().strip()
-        if not left_dir or not right_dir:
-            self.clock_status_label.setText("좌/우 이미지 폴더를 모두 선택하세요.")
-            return
-        try:
-            result = compare_photo_folders(left_dir, right_dir)
-        except PhotoMetadataError as exc:
-            self.clock_status_label.setText(f"분석 실패: {exc}")
-            self.clock_summary_text.setPlainText(str(exc))
-            return
-        self._set_clock_table_results(result.pairs)
-        summary = self._format_clock_folder_summary(result)
-        self.clock_summary_text.setPlainText(summary)
-        self.clock_status_label.setText(
-            f"폴더 clock offset median: {format_offset_seconds(result.median_offset_seconds)}"
-        )
-        self._log(
-            "[시계] 폴더 offset: "
-            f"pairs={len(result.pairs)}, median={format_offset_seconds(result.median_offset_seconds)}"
-        )
-
-    def _set_clock_table_results(self, results: list[ClockOffsetResult] | tuple[ClockOffsetResult, ...]) -> None:
-        self.clock_result_table.setRowCount(0)
-        for index, result in enumerate(results, start=1):
-            self._append_clock_result_row(index, result)
-        self.clock_result_table.resizeColumnsToContents()
-        self.clock_result_table.horizontalHeader().setSectionResizeMode(7, QtWidgets.QHeaderView.Stretch)
-
-    def _append_clock_result_row(self, index: int, result: ClockOffsetResult) -> None:
-        row = self.clock_result_table.rowCount()
-        self.clock_result_table.insertRow(row)
-        source = result.left.capture_time_source
-        if result.right.capture_time_source != source:
-            source = f"{source} / {result.right.capture_time_source}"
-        values = (
-            str(index),
-            result.left.path.name,
-            result.right.path.name,
-            format_photo_timestamp(result.left),
-            format_photo_timestamp(result.right),
-            format_offset_seconds(result.offset_seconds),
-            source,
-            "; ".join(dict.fromkeys(result.warnings)) or "none",
-        )
-        for column, value in enumerate(values):
-            item = QtWidgets.QTableWidgetItem(value)
-            if column == 5:
-                item.setTextAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-            self.clock_result_table.setItem(row, column, item)
-
-    def _format_clock_result_summary(self, result: ClockOffsetResult) -> str:
-        lines = [
-            f"Offset (right-left): {format_offset_seconds(result.offset_seconds)}",
-            "",
-            f"Left: {result.left.path}",
-            f"  time: {format_photo_timestamp(result.left)}",
-            f"  gps: {self._format_clock_gps(result.left.gps_latitude, result.left.gps_longitude)}",
-            f"Right: {result.right.path}",
-            f"  time: {format_photo_timestamp(result.right)}",
-            f"  gps: {self._format_clock_gps(result.right.gps_latitude, result.right.gps_longitude)}",
-        ]
-        unique_warnings = list(dict.fromkeys(result.warnings))
-        if unique_warnings:
-            lines.extend(["", "Warnings:", *[f"- {warning}" for warning in unique_warnings]])
-        return "\n".join(lines)
-
-    def _format_clock_folder_summary(self, result: ClockFolderResult) -> str:
-        valid_offsets = result.valid_offsets
-        lines = [
-            f"Pairing mode: {result.pairing_mode}",
-            f"Pairs analyzed: {len(result.pairs)}",
-            f"Valid offsets: {len(valid_offsets)}",
-            f"Median offset: {format_offset_seconds(result.median_offset_seconds)}",
-            f"Mean offset: {format_offset_seconds(result.mean_offset_seconds)}",
-        ]
-        if valid_offsets:
-            lines.append(f"Min/Max offset: {min(valid_offsets):+.6f} s / {max(valid_offsets):+.6f} s")
-        warnings = list(result.warnings)
-        for pair in result.pairs:
-            warnings.extend(pair.warnings)
-        unique_warnings = list(dict.fromkeys(warnings))
-        if unique_warnings:
-            lines.extend(["", "Warnings:", *[f"- {warning}" for warning in unique_warnings]])
-        return "\n".join(lines)
-
-    def _format_clock_gps(self, latitude: float | None, longitude: float | None) -> str:
-        if latitude is None or longitude is None:
-            return "missing"
-        return f"{latitude:.7f}, {longitude:.7f}"
-
-    def _clock_start_dir(self, text: str) -> Path:
-        default_dir = resolve_settings_path(DEFAULT_CLOCK_DOWNLOAD_DIR, base_dir=APP_ROOT)
-        if text:
-            path = resolve_settings_path(text, base_dir=APP_ROOT)
-            if path.is_dir():
-                return path
-            if path.parent.exists():
-                return path.parent
-        return default_dir
-
-    def _clock_download_root(self) -> Path:
-        text = self.clock_download_dir_edit.text().strip() or DEFAULT_CLOCK_DOWNLOAD_DIR
-        path = resolve_settings_path(text, base_dir=APP_ROOT)
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
     def yolo_kwargs(self) -> dict:
         return {
             "weights_path": self.weights_edit.text().strip(),
@@ -11107,59 +11556,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 hints.append(value)
         return tuple(hints)
 
-    def _ensure_camera_host_ip(self, context: str) -> bool:
-        interface_name = self.interface_edit.text().strip()
-        address_text = self.host_address_edit.text().strip()
-        if not interface_name or not interface_link_exists(interface_name):
-            reason = "비어 있습니다" if not interface_name else f"현재 시스템에 없습니다: {interface_name}"
-            self._log(f"[연결] {context}: 카메라망 인터페이스가 {reason}. 유선 어댑터 자동 선택을 시도합니다.")
-            candidates = discover_host_interface_candidates(
-                host_address=address_text or DEFAULT_HOST_ADDRESS,
-                include_unconfigured=True,
-            )
-            if candidates:
-                self._apply_host_interface_candidates(candidates)
-                interface_name = self.interface_edit.text().strip()
-                address_text = self.host_address_edit.text().strip()
-            else:
-                self._log(f"[연결] {context}: 사용할 수 있는 유선 카메라망 인터페이스를 찾지 못했습니다.")
-                self.camera_connection_label.setText("camera host IP: interface not found")
-                return False
-        resolved_address = resolve_nm_interface_address(interface_name, self._camera_host_hints())
-        if resolved_address is not None:
-            resolved_text = str(resolved_address)
-            if resolved_text != address_text:
-                self.host_address_edit.setText(resolved_text)
-                self._log(
-                    f"[연결] {context}: NetworkManager 활성 프로필에서 카메라망 IP를 찾았습니다: "
-                    f"{interface_name} {resolved_text}"
-                )
-            address_text = resolved_text
-        if not address_text:
-            self._log(f"[연결] {context}: 카메라망 인터페이스 또는 IP가 비어 있습니다.")
-            self.camera_connection_label.setText("camera host IP: missing")
-            return False
-        if interface_has_address(interface_name, address_text):
-            return True
-        self._log(
-            f"[연결] {context}: 카메라망 IP가 아직 적용되지 않았습니다. "
-            f"자동 적용을 시도합니다: {interface_name} {address_text}"
-        )
-        ok, message = apply_interface_address(interface_name, address_text)
-        if ok:
-            self._log(f"[연결] {context}: 카메라망 IP 자동 적용 완료: {message}")
-            self._log("[연결] 네트워크 인터페이스 상태:\n" + interface_addresses(interface_name))
-            self._save_current_settings()
-            return True
-        self._log(f"[연결] {context}: 카메라망 IP 자동 적용 실패: {message}")
-        self.camera_connection_label.setText("camera host IP: apply failed")
-        return False
-
     def _start_camera_detection(self, mode: str, *, target_side: str | None = None) -> None:
         if self.camera_auto_detect_thread is not None:
             return
-        if not self._ensure_camera_host_ip(f"카메라 {mode} 탐색"):
-            return
+        self._log(
+            f"[연결] 카메라 {mode} 탐색은 설정된 인터페이스를 사용합니다. "
+            "필요하면 Discover Camera Network로 후보 NIC/IP를 먼저 확인하세요."
+        )
         if mode == "auto_connect":
             self._log(
                 "[카메라] WIRIS 자동 연결을 시작합니다: 제어 포트 전체 스캔, HIWS 검증, "
@@ -11190,23 +11593,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_auto_detect_thread.finished.connect(self.camera_auto_detect_thread.deleteLater)
         self.camera_auto_detect_thread.finished.connect(self._clear_camera_auto_detect_worker)
         self.camera_auto_detect_thread.start()
-
-    def auto_detect_pixhawks(self) -> None:
-        if self.pixhawk_auto_detect_thread is not None:
-            return
-        self._log("[픽스호크] ROS2 PX4 topic과 namespace를 자동 탐색합니다.")
-        self.pixhawk_auto_detect_button.setEnabled(False)
-        self.pixhawk_auto_detect_thread = QtCore.QThread(self)
-        self.pixhawk_auto_detect_worker = PixhawkAutoDetectWorker(domain_id=self.domain_spin.value())
-        self.pixhawk_auto_detect_worker.moveToThread(self.pixhawk_auto_detect_thread)
-        self.pixhawk_auto_detect_thread.started.connect(self.pixhawk_auto_detect_worker.run)
-        self.pixhawk_auto_detect_worker.detected.connect(self._apply_pixhawk_discovery)
-        self.pixhawk_auto_detect_worker.failed.connect(self._pixhawk_auto_detect_failed)
-        self.pixhawk_auto_detect_worker.finished.connect(self.pixhawk_auto_detect_thread.quit)
-        self.pixhawk_auto_detect_worker.finished.connect(self.pixhawk_auto_detect_worker.deleteLater)
-        self.pixhawk_auto_detect_thread.finished.connect(self.pixhawk_auto_detect_thread.deleteLater)
-        self.pixhawk_auto_detect_thread.finished.connect(self._clear_pixhawk_auto_detect_worker)
-        self.pixhawk_auto_detect_thread.start()
 
     def _apply_camera_detection(self, result: object) -> None:
         if isinstance(result, dict):
@@ -11704,57 +12090,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connection_label.setText("WIRIS auto connect: control verified, enabling RTSP")
         self.enable_wiris_rtsp()
 
-    def _apply_pixhawk_discovery(self, discovery: object | None) -> None:
-        if discovery is None:
-            self._log("[픽스호크] ROS2 PX4 topic을 자동으로 찾지 못했습니다.")
-            return
-        self.domain_spin.setValue(discovery.domain_id)
-        namespaces = list(discovery.namespaces)
-        self._set_pixhawk_candidate_rows(
-            [
-                {
-                    "kind": "ROS2",
-                    "value": namespace,
-                    "baud": "",
-                    "status": f"domain={discovery.domain_id}",
-                }
-                for namespace in namespaces
-            ],
-            source="ros2",
-        )
-        if namespaces:
-            self.left_namespace_edit.setText(namespaces[0])
-        if len(namespaces) > 1:
-            self.right_namespace_edit.setText(namespaces[1])
-        self._log(
-            f"[픽스호크] 자동 탐색: ROS_DOMAIN_ID={discovery.domain_id}, "
-            f"namespace={namespaces or ['<root>']}, topic={len(discovery.topics)}개"
-        )
-
     def _pixhawk_candidate_table_for_source(self, source: str) -> QtWidgets.QTableWidget:
         if source == "pc":
             return self.pc_pixhawk_candidate_table
-        if source == "ros2":
-            return self.ros2_pixhawk_candidate_table
         return self.mavlink_pixhawk_candidate_table
 
     def _pixhawk_candidate_source_for_kind(self, kind: str) -> str:
         if kind == "PC_IP":
             return "pc"
-        if kind == "ROS2":
-            return "ros2"
         return "mavlink"
 
     def _sync_legacy_pixhawk_candidate_rows(self) -> None:
         self._pixhawk_candidate_rows = [
             *self._pixhawk_candidate_rows_by_source.get("pc", []),
             *self._pixhawk_candidate_rows_by_source.get("mavlink", []),
-            *self._pixhawk_candidate_rows_by_source.get("ros2", []),
         ]
 
     def _set_pixhawk_candidate_rows(self, rows: list[dict[str, object]], *, source: str | None = None) -> None:
         if source is None:
-            grouped: dict[str, list[dict[str, object]]] = {"pc": [], "mavlink": [], "ros2": []}
+            grouped: dict[str, list[dict[str, object]]] = {"pc": [], "mavlink": []}
             for entry in rows:
                 grouped[self._pixhawk_candidate_source_for_kind(str(entry.get("kind", "")))].append(entry)
             self._pixhawk_candidate_rows_by_source = grouped
@@ -11804,14 +12158,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         mavlink_kind = ""
         if 0 <= mavlink_row < len(mavlink_rows):
             mavlink_kind = str(mavlink_rows[mavlink_row].get("kind", ""))
-        ros2_selected = self.ros2_pixhawk_candidate_table.currentRow() >= 0
         self.clear_pixhawk_pc_candidate_button.setEnabled(bool(self._pixhawk_candidate_rows_by_source.get("pc")))
         self.clear_pixhawk_candidate_button.setEnabled(bool(mavlink_rows))
-        self.clear_pixhawk_ros2_candidate_button.setEnabled(bool(self._pixhawk_candidate_rows_by_source.get("ros2")))
         self.clear_pixhawk_candidate_button.setToolTip("Pixhawk MAVLink/USB 후보 내역을 지웁니다.")
         self.apply_pixhawk_candidate_host_button.setEnabled(pc_selected)
         self.apply_pixhawk_candidate_host_button.setToolTip(
-            "선택한 PC IP 후보를 Pixhawk Host IP/uXRCE Agent IP에 적용합니다."
+            "선택한 PC IP 후보를 Pixhawk Host IP에 적용합니다."
             if pc_selected
             else "PC_IP 후보를 선택하면 Host에 적용할 수 있습니다."
         )
@@ -11824,15 +12176,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 button.setToolTip("선택한 MAVLink URL 후보를 P1/P2 MAVLink URL에 적용합니다. 연결은 적용 후 직접 누르세요.")
             else:
                 button.setToolTip("USB 또는 MAVLink 후보를 선택하면 P1/P2에 적용할 수 있습니다.")
-        self.apply_pixhawk_ros2_candidate_left_button.setEnabled(ros2_selected)
-        self.apply_pixhawk_ros2_candidate_right_button.setEnabled(ros2_selected)
-        for button in (self.apply_pixhawk_ros2_candidate_left_button, self.apply_pixhawk_ros2_candidate_right_button):
-            button.setToolTip(
-                "선택한 ROS2 namespace 후보를 P1/P2에 적용합니다."
-                if ros2_selected
-                else "ROS2 namespace 후보를 선택하면 적용할 수 있습니다."
-            )
-
     def _mavlink_url_candidate_rows(self) -> list[dict[str, object]]:
         host_ip = self.pixhawk_host_address_edit.text().strip() or "0.0.0.0"
         left_eth_ip = self.left_pixhawk_eth_ip_edit.text().strip().split("/", 1)[0]
@@ -11889,16 +12232,27 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
 
     def discover_usb_pixhawk_connections(self) -> None:
+        if self.pixhawk_usb_discovery_thread is not None:
+            self._log("[픽스호크] USB Pixhawk 연결 탐색이 이미 진행 중입니다.")
+            return
         self.pixhawk_usb_discover_button.setEnabled(False)
         self._log("[픽스호크] USB Pixhawk 연결 탐색을 시작합니다. 후보는 자동 할당하지 않습니다.")
-        try:
-            candidates = usb_mavlink_device_candidates()
-            found = probe_usb_mavlink_devices(candidates=candidates, timeout_s=0.8) if candidates else []
-        except Exception as exc:
-            self.pixhawk_usb_discover_button.setEnabled(True)
-            self._log(f"[픽스호크] USB Pixhawk 연결 탐색 실패: {exc}")
-            return
-        self.pixhawk_usb_discover_button.setEnabled(True)
+        self.pixhawk_usb_discovery_thread = QtCore.QThread(self)
+        self.pixhawk_usb_discovery_worker = PixhawkUsbDiscoveryWorker(timeout_s=0.8)
+        self.pixhawk_usb_discovery_worker.moveToThread(self.pixhawk_usb_discovery_thread)
+        self.pixhawk_usb_discovery_thread.started.connect(self.pixhawk_usb_discovery_worker.run)
+        self.pixhawk_usb_discovery_worker.discovered.connect(self._apply_pixhawk_usb_discovery)
+        self.pixhawk_usb_discovery_worker.failed.connect(self._pixhawk_usb_discovery_failed)
+        self.pixhawk_usb_discovery_worker.finished.connect(self.pixhawk_usb_discovery_thread.quit)
+        self.pixhawk_usb_discovery_worker.finished.connect(self.pixhawk_usb_discovery_worker.deleteLater)
+        self.pixhawk_usb_discovery_thread.finished.connect(self.pixhawk_usb_discovery_thread.deleteLater)
+        self.pixhawk_usb_discovery_thread.finished.connect(self._clear_pixhawk_usb_discovery)
+        self.pixhawk_usb_discovery_thread.start()
+
+    def _apply_pixhawk_usb_discovery(self, result: object) -> None:
+        data = dict(result or {}) if isinstance(result, dict) else {}
+        candidates = list(data.get("candidates") or [])
+        found = list(data.get("found") or [])
         rows: list[dict[str, object]] = []
         found_by_device = {device: baud for device, baud in found}
         for device in candidates:
@@ -11926,6 +12280,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"[픽스호크] USB 후보: {row['value']} "
                 f"baud={row['baud'] or '-'} status={row['status']}"
             )
+
+    def _pixhawk_usb_discovery_failed(self, error: str) -> None:
+        self._log(f"[픽스호크] USB Pixhawk 연결 탐색 실패: {error}")
+
+    def _clear_pixhawk_usb_discovery(self) -> None:
+        self.pixhawk_usb_discovery_thread = None
+        self.pixhawk_usb_discovery_worker = None
+        self.pixhawk_usb_discover_button.setEnabled(True)
 
     def _usb_pixhawk_probe_status(self, device: str) -> str:
         try:
@@ -11977,13 +12339,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[픽스호크] {kind} 후보는 P1/P2에 적용하세요.")
             return
         mavlink_was_active = side in self._mavlink_open_sides()
-        ros2_was_active = side in self._ros2_connected_sides()
-        if kind == "ROS2":
-            if side == "left":
-                self.left_namespace_edit.setText(value)
-            else:
-                self.right_namespace_edit.setText(value)
-        elif kind == "USB":
+        if kind == "USB":
             try:
                 baud = int(entry.get("baud") or 0)
             except (TypeError, ValueError):
@@ -12023,13 +12379,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 self.pixhawk_connection_label.setText(f"{label} USB 부트스트랩 후보 적용됨: ETH MAV 시작(USB)을 누르세요.")
             else:
                 self.pixhawk_connection_label.setText(f"{label} MAVLink URL 후보 적용됨: {label} MAVLink 연결을 누르세요.")
-        elif kind == "ROS2":
-            if ros2_was_active:
-                self._log(f"[픽스호크] {label} ROS2 후보 적용으로 {label} ROS2 세션을 새 namespace로 재시작합니다.")
-                self.disconnect_pixhawk(side)
-                self.connect_pixhawk(side)
-            else:
-                self.pixhawk_connection_label.setText(f"{label} ROS2 후보 적용됨: {label} ROS2 연결을 누르세요.")
         self._refresh_operation_header()
 
     def _camera_auto_detect_failed(self, error: str) -> None:
@@ -12037,10 +12386,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connection_label.setText(f"camera RTSP: auto detect failed ({error})")
         self.last_rtsp_check_status = {"left": "check-failed", "right": "check-failed"}
         self._refresh_operation_header()
-
-    def _pixhawk_auto_detect_failed(self, error: str) -> None:
-        self._log(f"[픽스호크] 자동 탐색 실패: {error}")
-        self.pixhawk_connection_label.setText(f"pixhawk: auto detect failed ({error})")
 
     def _clear_camera_auto_detect_worker(self) -> None:
         self.camera_auto_detect_thread = None
@@ -12050,11 +12395,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.right_detect_control_button.setEnabled(True)
         self.detect_rtsp_button.setEnabled(True)
         self.right_detect_rtsp_button.setEnabled(True)
-
-    def _clear_pixhawk_auto_detect_worker(self) -> None:
-        self.pixhawk_auto_detect_thread = None
-        self.pixhawk_auto_detect_worker = None
-        self.pixhawk_auto_detect_button.setEnabled(True)
 
     def swap_cameras(self) -> None:
         cameras_running = self.camera_connected or bool(self.left_pane.worker or self.right_pane.worker)
@@ -12069,25 +12409,33 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._start_camera_streams(enable_detection=detection_was_enabled, switch_to_depth=False)
 
     def swap_pixhawks(self) -> None:
-        ros2_connected_sides = self._ros2_connected_sides()
         mavlink_connected_sides = self._mavlink_open_sides()
-        if ros2_connected_sides:
-            self.disconnect_pixhawk()
         for side in ("left", "right"):
             if side in mavlink_connected_sides:
                 self.disconnect_mavlink_pixhawk(side)
-        self.left_namespace_edit.setText(self._swap_line_edit_text(self.left_namespace_edit, self.right_namespace_edit))
         self.left_mavlink_url_edit.setText(self._swap_line_edit_text(self.left_mavlink_url_edit, self.right_mavlink_url_edit))
         self.left_pixhawk_eth_ip_edit.setText(
             self._swap_line_edit_text(self.left_pixhawk_eth_ip_edit, self.right_pixhawk_eth_ip_edit)
         )
-        self._log("[픽스호크] Pixhawk 1/2 ROS2 namespace와 MAVLink URL 매핑을 교체했습니다.")
-        for side in ("left", "right"):
-            if side in ros2_connected_sides:
-                self.connect_pixhawk(side)
+        self.left_mavlink_baud_spin.setValue(
+            int(self._swap_spinbox_value(self.left_mavlink_baud_spin, self.right_mavlink_baud_spin))
+        )
+        self.left_pixhawk_bootstrap_url_edit.setText(
+            self._swap_line_edit_text(self.left_pixhawk_bootstrap_url_edit, self.right_pixhawk_bootstrap_url_edit)
+        )
+        self.left_pixhawk_bootstrap_baud_spin.setValue(
+            int(self._swap_spinbox_value(self.left_pixhawk_bootstrap_baud_spin, self.right_pixhawk_bootstrap_baud_spin))
+        )
+        self._log("[픽스호크] Pixhawk 1/2 MAVLink 매핑을 교체했습니다.")
         for side in ("left", "right"):
             if side in mavlink_connected_sides:
                 self.connect_mavlink_pixhawk(side)
+
+    def _swap_spinbox_value(self, left: QtWidgets.QAbstractSpinBox, right: QtWidgets.QAbstractSpinBox) -> object:
+        left_value = left.value()
+        right_value = right.value()
+        right.setValue(left_value)
+        return right_value
 
     def _swap_line_edit_text(self, left: QtWidgets.QLineEdit, right: QtWidgets.QLineEdit) -> str:
         left_text = left.text()
@@ -12099,7 +12447,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.rtsp_check_thread is not None:
             self._log("[카메라] RTSP 스트림 확인이 이미 진행 중입니다.")
             return
-        self._ensure_camera_host_ip("RTSP 수신 확인")
+        self._log("[연결] RTSP 확인은 설정된 카메라망 인터페이스와 URL을 사용합니다.")
         urls = {
             "left": self.left_url_edit.text().strip(),
             "right": self.right_url_edit.text().strip(),
@@ -12129,35 +12477,64 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.rtsp_check_thread.start()
 
     def check_wiris_control(self) -> None:
-        self._ensure_camera_host_ip("WIRIS 제어 확인")
-        statuses = []
+        if self.wiris_control_check_thread is not None:
+            self._log("[카메라] WIRIS 제어 확인이 이미 진행 중입니다.")
+            return
+        self._log("[연결] WIRIS 제어 확인은 설정된 Control Host/port를 사용합니다.")
+        targets = []
         for label, host in self.zoom_hosts("both"):
             normalized_host = host.strip()
-            camera_name = self._camera_name_ko(label)
-            if not normalized_host:
-                statuses.append(f"{label}=missing-host")
-                self._log(f"[카메라] {camera_name} WIRIS 제어 host가 비어 있습니다.")
+            if normalized_host:
+                self._log_rtsp_control_host_mismatch(label, normalized_host)
+            targets.append((label, normalized_host, self._control_port_for_camera(label)))
+        self.check_control_button.setEnabled(False)
+        self.camera_connection_label.setText("camera control: checking...")
+        self.wiris_control_check_thread = QtCore.QThread(self)
+        self.wiris_control_check_worker = WirisControlCheckWorker(
+            targets,
+            timeout_s=self.zoom_timeout_spin.value(),
+        )
+        self.wiris_control_check_worker.moveToThread(self.wiris_control_check_thread)
+        self.wiris_control_check_thread.started.connect(self.wiris_control_check_worker.run)
+        self.wiris_control_check_worker.checked.connect(self._apply_wiris_control_check)
+        self.wiris_control_check_worker.failed.connect(self._wiris_control_check_failed)
+        self.wiris_control_check_worker.finished.connect(self.wiris_control_check_thread.quit)
+        self.wiris_control_check_worker.finished.connect(self.wiris_control_check_worker.deleteLater)
+        self.wiris_control_check_thread.finished.connect(self.wiris_control_check_thread.deleteLater)
+        self.wiris_control_check_thread.finished.connect(self._clear_wiris_control_check_worker)
+        self.wiris_control_check_thread.start()
+
+    def _apply_wiris_control_check(self, results: object) -> None:
+        statuses: list[str] = []
+        for result in list(results or []):
+            if not isinstance(result, dict):
                 continue
-            self._log_rtsp_control_host_mismatch(label, normalized_host)
-            port = self._control_port_for_camera(label)
-            port_open = check_tcp_port(
-                normalized_host,
-                port,
-                timeout=self.zoom_timeout_spin.value(),
-            )
-            if port_open:
-                statuses.append(f"{label}=control-open")
-                self._log(f"[카메라] {camera_name} WIRIS 제어 포트 열림: {normalized_host}:{port}")
+            label = str(result.get("label") or "")
+            host = str(result.get("host") or "")
+            port = result.get("port", "")
+            state = str(result.get("state") or "error")
+            camera_name = self._camera_name_ko(label)
+            statuses.append(f"{label}={state}")
+            if state == "missing-host":
+                self._log(f"[카메라] {camera_name} WIRIS 제어 host가 비어 있습니다.")
+            elif state == "control-open":
+                self._log(f"[카메라] {camera_name} WIRIS 제어 포트 열림: {host}:{port}")
+            elif state == "control-closed":
+                self._log(f"[카메라] {camera_name} WIRIS 제어 포트 닫힘/오류: {host}:{port}")
             else:
-                statuses.append(f"{label}=control-closed")
-                self._log(f"[카메라] {camera_name} WIRIS 제어 포트 닫힘/오류: {normalized_host}:{port}")
+                self._log(f"[카메라] {camera_name} WIRIS 제어 확인 오류: {result.get('error', state)}")
         self.camera_connection_label.setText(f"camera control: {', '.join(statuses)}")
+        self._refresh_operation_header()
 
-    def _ethernet_mode_response_ok(self, response: str) -> bool:
-        return response.strip().upper() in {"TRUE", "FALSE"}
+    def _wiris_control_check_failed(self, error: str) -> None:
+        self._log(f"[카메라] WIRIS 제어 확인 실패: {error}")
+        self.camera_connection_label.setText(f"camera control: failed ({error})")
+        self._refresh_operation_header()
 
-    def _set_ethernet_response_ok(self, response: str) -> bool:
-        return response.strip().upper() in {"OK", "TRUE"}
+    def _clear_wiris_control_check_worker(self) -> None:
+        self.wiris_control_check_thread = None
+        self.wiris_control_check_worker = None
+        self.check_control_button.setEnabled(True)
 
     def _ethernet_mode_candidate_ports(self, camera: str) -> list[int]:
         ports = [
@@ -12172,47 +12549,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 unique_ports.append(port)
         return unique_ports
 
-    def _probe_ethernet_mode_port(self, host: str, port: int) -> tuple[bool, str]:
-        command = build_wiris_command(
-            host=host,
-            port=port,
-            command=GET_ETHERNET_MODE_COMMAND,
-            timeout_s=self.zoom_timeout_spin.value(),
-        )
-        response = send_tcp_line(command)
-        return self._ethernet_mode_response_ok(response), response
-
-    def _resolve_ethernet_mode_port(self, camera: str, host: str) -> tuple[int | None, str]:
-        failures = []
-        for port in self._ethernet_mode_candidate_ports(camera):
-            try:
-                ok, response = self._probe_ethernet_mode_port(host, port)
-            except Exception as exc:
-                failures.append(f"{port}=failed:{exc}")
-                continue
-            if ok:
-                current_port = self._control_port_for_camera(camera)
-                if port != current_port:
-                    self._set_control_port_for_camera(camera, port)
-                    self.zoom_port_spin.setValue(port)
-                    self._save_current_settings()
-                    self._log(
-                        f"[카메라] {self._camera_name_ko(camera)} Telnet port 자동 보정: "
-                        f"{current_port} -> {port} ({GET_ETHERNET_MODE_COMMAND}={response})"
-                    )
-                return port, response
-            failures.append(f"{port}={response or 'empty'}")
-        self._log(
-            f"[카메라] {self._camera_name_ko(camera)} Ethernet Mode 지원 포트를 찾지 못했습니다: "
-            + ", ".join(failures)
-        )
-        return None, failures[-1] if failures else "no-candidate"
-
     def enable_wiris_rtsp(self) -> None:
         if self.rtsp_enable_thread is not None:
             self._log("[카메라] RTSP 송출 활성화가 이미 진행 중입니다.")
             return
-        self._ensure_camera_host_ip("RTSP 송출 활성화")
+        self._log("[연결] RTSP 활성화는 설정된 Control Host/port와 영상 URL을 사용합니다.")
         hosts = {label: host.strip() for label, host in self.zoom_hosts("both")}
         candidate_ports = {label: self._ethernet_mode_candidate_ports(label) for label in ("left", "right")}
         urls = {
@@ -12296,35 +12637,98 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if answer != QtWidgets.QMessageBox.Ok:
             self._log(f"[카메라] {camera_name} STIP 취소됨.")
             return
-        self._ensure_camera_host_ip(f"{camera_name} STIP 적용")
-        commands = [
-            SET_IP_ADDRESS_TEMPLATE.format(address=new_ip),
-            SET_SUBNET_MASK_TEMPLATE.format(mask=mask),
-        ]
-        if self.stip_reboot_checkbox.isChecked():
-            commands.append(REBOOT_COMMAND)
-        statuses = []
-        for command_text in commands:
-            try:
-                command = build_wiris_command(
-                    host=current_host,
-                    port=port,
-                    command=command_text,
-                    timeout_s=self.zoom_timeout_spin.value(),
-                )
-                response = send_tcp_line(command)
-            except Exception as exc:
-                statuses.append(f"{command_text}=failed")
-                self._log(f"[카메라] {camera_name} STIP 명령 실패 ({command_text}): {exc}")
-                self.camera_connection_label.setText(f"camera STIP: {camera}=failed")
-                return
-            statuses.append(f"{command_text}={response or 'sent'}")
+        if self.wiris_stip_thread is not None:
+            self._log("[카메라] STIP 적용이 이미 진행 중입니다.")
+            return
+        if camera == "left":
+            self.left_stip_button.setEnabled(False)
+        else:
+            self.right_stip_button.setEnabled(False)
+        self.camera_connection_label.setText(f"camera STIP: {camera}=applying...")
+        self.wiris_stip_thread = QtCore.QThread(self)
+        self.wiris_stip_worker = WirisStipWorker(
+            interface_name=self.interface_edit.text().strip(),
+            host_address=self.host_address_edit.text().strip(),
+            host_hints=self._camera_host_hints(),
+            current_host=current_host,
+            new_ip=new_ip,
+            mask=mask,
+            port=port,
+            reboot=self.stip_reboot_checkbox.isChecked(),
+            timeout_s=self.zoom_timeout_spin.value(),
+        )
+        self.wiris_stip_worker.moveToThread(self.wiris_stip_thread)
+        self.wiris_stip_thread.started.connect(self.wiris_stip_worker.run)
+        self.wiris_stip_worker.completed.connect(
+            lambda result, camera=camera, camera_name=camera_name, host_edit=host_edit, new_ip_edit=new_ip_edit, url_edit=url_edit, new_ip=new_ip, current_host=current_host: self._apply_wiris_stip_result(
+                camera,
+                camera_name,
+                host_edit,
+                new_ip_edit,
+                url_edit,
+                new_ip,
+                current_host,
+                result,
+            )
+        )
+        self.wiris_stip_worker.failed.connect(
+            lambda error, camera=camera, camera_name=camera_name: self._wiris_stip_failed(camera, camera_name, error)
+        )
+        self.wiris_stip_worker.finished.connect(self.wiris_stip_thread.quit)
+        self.wiris_stip_worker.finished.connect(self.wiris_stip_worker.deleteLater)
+        self.wiris_stip_thread.finished.connect(self.wiris_stip_thread.deleteLater)
+        self.wiris_stip_thread.finished.connect(lambda camera=camera: self._clear_wiris_stip_worker(camera))
+        self.wiris_stip_thread.start()
+
+    def _apply_wiris_stip_result(
+        self,
+        camera: str,
+        camera_name: str,
+        host_edit: QtWidgets.QLineEdit,
+        new_ip_edit: QtWidgets.QLineEdit,
+        url_edit: QtWidgets.QLineEdit,
+        new_ip: str,
+        current_host: str,
+        result: object,
+    ) -> None:
+        data = dict(result or {})
+        candidates = list(data.get("candidates") or [])
+        if candidates:
+            self._apply_host_interface_candidates(candidates)
+        interface_name = str(data.get("interface_name") or self.interface_edit.text().strip())
+        host_address = str(data.get("host_address") or self.host_address_edit.text().strip())
+        if interface_name:
+            self.interface_edit.setText(interface_name)
+        if host_address:
+            self.host_address_edit.setText(host_address)
+        if str(data.get("state") or "failed") != "sent":
+            error = str(data.get("error") or "unknown error")
+            self._log(f"[카메라] {camera_name} STIP 적용 실패: {error}")
+            self.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
+            self._refresh_operation_header()
+            return
+        statuses = [str(status) for status in list(data.get("statuses") or [])]
         host_edit.setText(new_ip)
         new_ip_edit.setText(new_ip)
         self._replace_rtsp_url_host(url_edit, new_ip)
         self._rtsp_widgets_for_camera(camera)[1].setText(new_ip)
         self._log(f"[카메라] {camera_name} STIP 적용: {current_host} -> {new_ip}, {'; '.join(statuses)}")
         self.camera_connection_label.setText(f"camera STIP: {camera}={current_host}->{new_ip}")
+        self._save_current_settings()
+        self._refresh_operation_header()
+
+    def _wiris_stip_failed(self, camera: str, camera_name: str, error: str) -> None:
+        self._log(f"[카메라] {camera_name} STIP worker 실패: {error}")
+        self.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
+        self._refresh_operation_header()
+
+    def _clear_wiris_stip_worker(self, camera: str) -> None:
+        self.wiris_stip_thread = None
+        self.wiris_stip_worker = None
+        if camera == "left":
+            self.left_stip_button.setEnabled(True)
+        else:
+            self.right_stip_button.setEnabled(True)
 
     def _rtsp_widgets_for_camera(self, camera: str) -> tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]:
         if camera == "left":
@@ -12773,9 +13177,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         topic = extrinsic.topic.strip()
         if topic.startswith("mavlink/"):
             return f"MAVLink ({topic})"
-        if "/fmu/out/" in topic:
-            return f"ROS2/uORB ({topic})"
-        return topic or "unknown"
+        return f"MAVLink ({topic})" if topic else "MAVLink telemetry"
 
     def _distance_mode(self) -> str:
         if not hasattr(self, "distance_mode_combo"):
@@ -13078,7 +13480,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"{title}\n"
                 "status: waiting\n\n"
                 f"source: {self._extrinsics_source_label(None)}\n\n"
-                "실시간 카메라 자세를 보려면 ROS2 또는 MAVLink로 픽스호크를 연결하세요."
+                "실시간 카메라 자세를 보려면 MAVLink로 픽스호크를 연결하세요."
             )
         age_ms = max(0.0, time.monotonic() - extrinsic.timestamp_s) * 1000.0
         px4_timestamp = "n/a" if extrinsic.px4_timestamp_s is None else f"{extrinsic.px4_timestamp_s:.6f}"
@@ -13086,8 +13488,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"{title}\n"
             f"status: live\n"
             f"source: {self._extrinsics_source_label(extrinsic)}\n"
-            f"namespace/source: {extrinsic.namespace}\n"
-            f"topic: {extrinsic.topic}\n"
             f"age: {age_ms:.0f} ms\n"
             f"px4_timestamp: {px4_timestamp}\n\n"
             f"roll:  {extrinsic.roll_deg:.6f} deg\n"
@@ -13556,18 +13956,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             self.start_yolo()
 
-    def toggle_ros2_connection(self, camera: str | None = None) -> None:
-        if camera is None:
-            if self._ros2_connected_sides():
-                self.disconnect_pixhawk()
-            else:
-                self.connect_pixhawk()
-            return
-        if camera in self._ros2_connected_sides():
-            self.disconnect_pixhawk(camera)
-        else:
-            self.connect_pixhawk(camera)
-
     def toggle_mavlink_connection(self, camera: str | None = None) -> None:
         if camera is None:
             if self._mavlink_open_sides():
@@ -13609,7 +13997,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_distance_text("거리: 좌/우 RTSP URL이 동일해 측정 차단", quality="BAD")
             self._log(f"[카메라] {message}")
             return
-        self._ensure_camera_host_ip("카메라 프리뷰/YOLO 시작")
+        self._log("[연결] 카메라 프리뷰/YOLO는 설정된 인터페이스와 RTSP URL을 사용합니다.")
         self.start_button.setEnabled(False)
         self.camera_connect_button.setEnabled(False)
         if switch_to_depth:
@@ -13644,18 +14032,37 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._clear_calibration_previews("YOLO depth mode")
 
         def start_both() -> None:
-            self.left_pane.start_stream(
+            left_started = self.left_pane.start_stream(
                 left_url,
                 enable_detection=enable_detection,
                 **kwargs,
                 **self._video_recording_kwargs("left"),
             )
-            self.right_pane.start_stream(
+            if not left_started:
+                self.camera_connected = False
+                self.yolo_enabled = False
+                self.camera_connection_label.setText("카메라: 이전 Left worker 종료 대기 중")
+                self._log("[카메라] Left worker가 종료되지 않아 새 스트림을 시작하지 않았습니다.")
+                self.start_button.setEnabled(True)
+                self.camera_connect_button.setEnabled(True)
+                self._refresh_operation_header()
+                return
+            right_started = self.right_pane.start_stream(
                 right_url,
                 enable_detection=enable_detection,
                 **kwargs,
                 **self._video_recording_kwargs("right"),
             )
+            if not right_started:
+                self.left_pane.stop(wait=True)
+                self.camera_connected = False
+                self.yolo_enabled = False
+                self.camera_connection_label.setText("카메라: 이전 Right worker 종료 대기 중")
+                self._log("[카메라] Right worker가 종료되지 않아 새 스트림을 중단했습니다.")
+                self.start_button.setEnabled(True)
+                self.camera_connect_button.setEnabled(True)
+                self._refresh_operation_header()
+                return
             self.camera_connected = True
             self.yolo_enabled = enable_detection
             self.start_button.setEnabled(True)
@@ -13665,7 +14072,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         start_both()
 
-    def stop_yolo_streams(self, *, wait: bool = False) -> None:
+    def stop_yolo_streams(self, *, wait: bool = False) -> bool:
         self._camera_sync_timer.stop()
         self._camera_sync_deadline_monotonic_s = None
         self._camera_sync_transport_override = None
@@ -13677,7 +14084,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         if final_clock_sync_snapshot is not None:
             self._recording_clock_sync_end_observation = final_clock_sync_snapshot
-        self._stop_camera_panes(clear_previews=True, wait=wait)
+        panes_stopped = self._stop_camera_panes(clear_previews=True, wait=wait)
+        if wait and not panes_stopped:
+            self._log("[종료] 카메라 worker가 아직 종료 중입니다. 다음 종료 시도에서 다시 확인합니다.")
+            return False
         if finalize_session:
             self.distance_recording_enabled = False
             self.video_recording_enabled = False
@@ -13697,10 +14107,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connect_button.setEnabled(True)
         self._refresh_session_toggle_buttons()
         self._refresh_operation_header()
+        return True
 
-    def _stop_camera_panes(self, *, clear_previews: bool, wait: bool = False) -> None:
-        self.left_pane.stop(wait=wait)
-        self.right_pane.stop(wait=wait)
+    def _stop_camera_panes(self, *, clear_previews: bool, wait: bool = False) -> bool:
+        left_stopped = self.left_pane.stop(wait=wait)
+        right_stopped = self.right_pane.stop(wait=wait)
         self.camera_frame_times["left"].clear()
         self.camera_frame_times["right"].clear()
         self.camera_frame_metadata["left"] = {}
@@ -13712,9 +14123,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.active_stream_decoders["left"] = None
         self.active_stream_decoders["right"] = None
         self._update_runtime_camera_stats_labels()
-        if not clear_previews:
-            return
-        self._clear_calibration_previews("left preview", right_text="right preview")
+        if clear_previews:
+            self._clear_calibration_previews("left preview", right_text="right preview")
+        return bool(left_stopped and right_stopped)
 
     def _clear_calibration_previews(self, left_text: str, *, right_text: str | None = None) -> None:
         self.latest_calibration_preview_images.clear()
@@ -13740,14 +14151,28 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._clear_measurement_pair_display()
         self._refresh_distance()
 
-    def stop_all(self, *, wait: bool = False) -> None:
-        self.stop_yolo_streams(wait=wait)
-        self.disconnect_pixhawk()
+    def stop_all(self, *, wait: bool = False) -> bool:
+        if not self.stop_yolo_streams(wait=wait):
+            return False
+        if not self._stop_pixhawk_operation_workers(wait=wait):
+            return False
         self.disconnect_mavlink_pixhawk()
-        self._stop_calibration_preview_worker()
+        if not self._stop_calibration_preview_worker():
+            return False
+        all_stopped = True
         for attr in (
             "camera_auto_detect_thread",
-            "pixhawk_auto_detect_thread",
+            "wiris_control_check_thread",
+            "wiris_command_thread",
+            "wiris_zoom_thread",
+            "wiris_time_sync_thread",
+            "wiris_gdti_thread",
+            "wiris_stip_thread",
+            "camera_network_discovery_thread",
+            "camera_network_apply_thread",
+            "interface_status_thread",
+            "pixhawk_usb_discovery_thread",
+            "pixhawk_host_ip_discovery_thread",
             "rtsp_check_thread",
             "rtsp_enable_thread",
         ):
@@ -13755,8 +14180,56 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if thread is None:
                 continue
             thread.quit()
-            thread.wait(1000)
-            setattr(self, attr, None)
+            if thread.isRunning() and not thread.wait(1000):
+                all_stopped = False
+                continue
+            if getattr(self, attr, None) is thread:
+                setattr(self, attr, None)
+        return all_stopped
+
+    def _stop_pixhawk_operation_workers(self, *, wait: bool) -> bool:
+        all_stopped = True
+        for attr in (
+            "pixhawk_connection_thread",
+            "pixhawk_stream_setup_thread",
+            "pixhawk_usb_bootstrap_thread",
+            "pixhawk_persistent_config_thread",
+            "pixhawk_rtcm_thread",
+        ):
+            thread = getattr(self, attr, None)
+            if thread is None:
+                continue
+            worker_attr = attr.replace("_thread", "_worker")
+            worker = getattr(self, worker_attr, None)
+            if attr == "pixhawk_rtcm_thread" and worker is not None:
+                try:
+                    worker.clear_pending()
+                except Exception:
+                    pass
+            thread.quit()
+            if wait and thread.isRunning() and not thread.wait(1000):
+                all_stopped = False
+                continue
+            if not thread.isRunning() and getattr(self, attr, None) is thread:
+                setattr(self, attr, None)
+                if getattr(self, worker_attr, None) is worker:
+                    setattr(self, worker_attr, None)
+        for workers in (self.pixhawk_shell_threads, self.pixhawk_parameter_threads):
+            for camera, thread in list(workers.items()):
+                try:
+                    thread.quit()
+                    if wait and thread.isRunning() and not thread.wait(1000):
+                        all_stopped = False
+                        continue
+                except RuntimeError:
+                    pass
+                if not thread.isRunning():
+                    workers.pop(camera, None)
+                    if workers is self.pixhawk_shell_threads:
+                        self.pixhawk_shell_workers.pop(camera, None)
+                    else:
+                        self.pixhawk_parameter_workers.pop(camera, None)
+        return all_stopped
 
     def _distance_history_key(self, point: DistanceHistoryPoint) -> tuple[object, ...]:
         return point.sample_key or (point.timestamp_s, point.distance_m, point.method)
@@ -14152,13 +14625,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right_mavlink_url": "right_mavlink_url_edit",
             "left_pixhawk_bootstrap_url": "left_pixhawk_bootstrap_url_edit",
             "right_pixhawk_bootstrap_url": "right_pixhawk_bootstrap_url_edit",
-            "left_namespace": "left_namespace_edit",
-            "right_namespace": "right_namespace_edit",
             "gnss_base_serial_port": "gnss_base_serial_port_edit",
-            "clock_ftp_user": "clock_ftp_user_edit",
-            "clock_ftp_password": "clock_ftp_password_edit",
-            "clock_ftp_remote_dir": "clock_ftp_remote_dir_edit",
-            "clock_download_dir": "clock_download_dir_edit",
         }
         for name, attribute in simple_text.items():
             set_text(name, attribute)
@@ -14172,18 +14639,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "rtsp_latency_ms": "rtsp_latency_spin",
             "yolo_event_queue_size": "yolo_event_queue_size_spin",
             "yolo_frame_queue_size": "yolo_frame_queue_size_spin",
-            "ros_domain_id": "domain_spin",
             "left_mavlink_baud": "left_mavlink_baud_spin",
             "right_mavlink_baud": "right_mavlink_baud_spin",
             "left_pixhawk_bootstrap_baud": "left_pixhawk_bootstrap_baud_spin",
             "right_pixhawk_bootstrap_baud": "right_pixhawk_bootstrap_baud_spin",
             "mavlink_stream_rate": "mavlink_stream_rate_spin",
-            "uxrce_port": "uxrce_port_spin",
             "gnss_base_baud": "gnss_base_baud_spin",
             "gnss_base_survey_in_min_duration_s": "gnss_base_survey_duration_spin",
             "gnss_base_survey_in_accuracy_m": "gnss_base_survey_accuracy_spin",
-            "clock_ftp_port": "clock_ftp_port_spin",
-            "clock_capture_wait_s": "clock_capture_wait_spin",
         }
         for name, attribute in simple_values.items():
             set_value(name, attribute)
@@ -14191,7 +14654,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         simple_checks = {
             "stip_reboot": "stip_reboot_checkbox",
             "mavlink_configure_streams": "mavlink_configure_streams_checkbox",
-            "mavlink_configure_uxrce_agent": "mavlink_configure_uxrce_agent_checkbox",
         }
         for name, attribute in simple_checks.items():
             set_checked(name, attribute)
@@ -14201,7 +14663,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         set_combo("rtsp_decoder", "decoder_combo", "nvidia")
         set_combo("stream_backend", "stream_backend_combo", "gstreamer")
         set_combo("rtsp_transport", "rtsp_transport_combo", "tcp")
-        set_combo("pixhawk_ethernet_mode", "pixhawk_ethernet_mode_combo", DEFAULT_PIXHAWK_ETHERNET_MODE)
+        set_combo("pixhawk_ethernet_mode", "pixhawk_ethernet_mode_combo", "mavlink")
 
         if has("manual_focal_override"):
             self.manual_focal_checkbox.setChecked(bool(values["manual_focal_override"]))
@@ -14389,11 +14851,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def discover_pc_camera_ip(self) -> None:
+        if self.camera_network_discovery_thread is not None:
+            self._log("[연결] PC IP 탐색이 이미 진행 중입니다.")
+            return
         self._log("[연결] PC IP 탐색: 카메라망 인터페이스와 PC IP를 함께 탐색합니다.")
-        candidates = discover_host_interface_candidates(
+        self.detect_pc_ip_button.setEnabled(False)
+        self.camera_connection_label.setText("camera host IP: discovering...")
+        self.camera_network_discovery_thread = QtCore.QThread(self)
+        self.camera_network_discovery_worker = CameraNetworkDiscoveryWorker(
             host_address=self.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
-            include_unconfigured=True,
+            host_hints=self._camera_host_hints(),
         )
+        self.camera_network_discovery_worker.moveToThread(self.camera_network_discovery_thread)
+        self.camera_network_discovery_thread.started.connect(self.camera_network_discovery_worker.run)
+        self.camera_network_discovery_worker.discovered.connect(self._apply_camera_network_discovery)
+        self.camera_network_discovery_worker.failed.connect(self._camera_network_discovery_failed)
+        self.camera_network_discovery_worker.finished.connect(self.camera_network_discovery_thread.quit)
+        self.camera_network_discovery_worker.finished.connect(self.camera_network_discovery_worker.deleteLater)
+        self.camera_network_discovery_thread.finished.connect(self.camera_network_discovery_thread.deleteLater)
+        self.camera_network_discovery_thread.finished.connect(self._clear_camera_network_discovery)
+        self.camera_network_discovery_thread.start()
+
+    def _apply_camera_network_discovery(self, result: object) -> None:
+        data = dict(result or {})
+        candidates = list(data.get("candidates") or [])
         if not candidates:
             self._log("[연결] PC IP 탐색: 사용할 수 있는 유선 인터페이스를 찾지 못했습니다.")
             self.camera_connection_label.setText("camera host IP: interface not found")
@@ -14401,13 +14882,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         self._apply_host_interface_candidates(candidates)
         interface_name = self.interface_edit.text().strip()
-        resolved_address = resolve_nm_interface_address(interface_name, self._camera_host_hints())
+        resolved_address = data.get("resolved_address")
         if resolved_address is None:
-            connection_name = nm_device_connection_name(interface_name)
+            connection_name = data.get("connection_name")
+            addresses = tuple(data.get("addresses") or ())
             if connection_name is None:
                 self._log(f"[연결] PC IP 탐색: {interface_name}에 활성 NetworkManager 연결이 없습니다.")
             else:
-                addresses = nm_connection_ipv4_addresses(connection_name)
                 if addresses:
                     address_text = ", ".join(str(address) for address in addresses)
                     self._log(f"[연결] PC IP 탐색: 활성 프로필 {connection_name} 주소={address_text}")
@@ -14425,16 +14906,54 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connection_label.setText(f"camera host IP: found {resolved_text}")
         self._refresh_operation_header()
 
+    def _camera_network_discovery_failed(self, error: str) -> None:
+        self._log(f"[연결] PC IP 탐색 실패: {error}")
+        self.camera_connection_label.setText(f"camera host IP: failed ({error})")
+        self._refresh_operation_header()
+
+    def _clear_camera_network_discovery(self) -> None:
+        self.camera_network_discovery_thread = None
+        self.camera_network_discovery_worker = None
+        self.detect_pc_ip_button.setEnabled(True)
+
     def discover_pc_pixhawk_ip(self) -> None:
-        interfaces = local_ipv4_interfaces(include_wireless=True)
-        if not interfaces:
+        if self.pixhawk_host_ip_discovery_thread is not None:
+            self._log("[픽스호크] PC IP 탐색이 이미 진행 중입니다.")
+            return
+        self.detect_pixhawk_host_ip_button.setEnabled(False)
+        self.pixhawk_connection_label.setText("pixhawk host IP: discovering...")
+        self.pixhawk_host_ip_discovery_thread = QtCore.QThread(self)
+        self.pixhawk_host_ip_discovery_worker = PixhawkHostIpDiscoveryWorker()
+        self.pixhawk_host_ip_discovery_worker.moveToThread(self.pixhawk_host_ip_discovery_thread)
+        self.pixhawk_host_ip_discovery_thread.started.connect(self.pixhawk_host_ip_discovery_worker.run)
+        self.pixhawk_host_ip_discovery_worker.discovered.connect(self._apply_pixhawk_host_ip_discovery)
+        self.pixhawk_host_ip_discovery_worker.failed.connect(self._pixhawk_host_ip_discovery_failed)
+        self.pixhawk_host_ip_discovery_worker.finished.connect(self.pixhawk_host_ip_discovery_thread.quit)
+        self.pixhawk_host_ip_discovery_worker.finished.connect(self.pixhawk_host_ip_discovery_worker.deleteLater)
+        self.pixhawk_host_ip_discovery_thread.finished.connect(self.pixhawk_host_ip_discovery_thread.deleteLater)
+        self.pixhawk_host_ip_discovery_thread.finished.connect(self._clear_pixhawk_host_ip_discovery)
+        self.pixhawk_host_ip_discovery_thread.start()
+
+    def _apply_pixhawk_host_ip_discovery(self, interfaces: object) -> None:
+        rows = list(interfaces or [])
+        if not rows:
             self._log("[픽스호크] PC IP 탐색: 활성 IPv4 인터페이스를 찾지 못했습니다.")
             self.pixhawk_connection_label.setText("pixhawk host IP: not found")
             self._refresh_operation_header()
             return
-        self._append_pixhawk_host_ip_candidates(interfaces)
+        self._append_pixhawk_host_ip_candidates(rows)
         self.pixhawk_connection_label.setText("pixhawk host IP: 후보 표시됨 - 표에서 PC_IP를 선택해 적용하세요")
         self._refresh_operation_header()
+
+    def _pixhawk_host_ip_discovery_failed(self, error: str) -> None:
+        self._log(f"[픽스호크] PC IP 탐색 실패: {error}")
+        self.pixhawk_connection_label.setText(f"pixhawk host IP: failed ({error})")
+        self._refresh_operation_header()
+
+    def _clear_pixhawk_host_ip_discovery(self) -> None:
+        self.pixhawk_host_ip_discovery_thread = None
+        self.pixhawk_host_ip_discovery_worker = None
+        self.detect_pixhawk_host_ip_button.setEnabled(True)
 
     def _append_pixhawk_host_ip_candidates(self, interfaces: Sequence[object]) -> None:
         hints: list[IPv4Address] = []
@@ -14484,19 +15003,62 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 )
 
     def apply_pc_camera_ip(self) -> None:
+        if self.camera_network_apply_thread is not None:
+            self._log("[연결] PC IP 적용이 이미 진행 중입니다.")
+            return
         interface_name = self.interface_edit.text().strip()
         address_text = self.host_address_edit.text().strip()
+        if not interface_name or not address_text:
+            self._log("[연결] PC IP 적용 실패: 인터페이스와 주소를 먼저 지정하세요.")
+            self.camera_connection_label.setText("camera host IP: missing")
+            return
         self._log(f"[연결] PC IP 적용 시도: {interface_name} {address_text}")
-        ok, message = apply_interface_address(interface_name, address_text)
-        if ok:
-            self._log(f"[연결] PC IP 적용 완료: {message}")
-            self._log("[연결] 네트워크 인터페이스 상태:\n" + interface_addresses(interface_name))
-            self._save_current_settings()
-            self.camera_connection_label.setText(f"camera host IP: applied {address_text}")
-        else:
+        self.apply_pc_ip_button.setEnabled(False)
+        self.camera_connection_label.setText("camera host IP: applying...")
+        self.camera_network_apply_thread = QtCore.QThread(self)
+        self.camera_network_apply_worker = CameraNetworkAddressApplyWorker(
+            interface_name=interface_name,
+            address_text=address_text,
+        )
+        self.camera_network_apply_worker.moveToThread(self.camera_network_apply_thread)
+        self.camera_network_apply_thread.started.connect(self.camera_network_apply_worker.run)
+        self.camera_network_apply_worker.applied.connect(self._apply_camera_network_address_result)
+        self.camera_network_apply_worker.failed.connect(self._camera_network_apply_failed)
+        self.camera_network_apply_worker.finished.connect(self.camera_network_apply_thread.quit)
+        self.camera_network_apply_worker.finished.connect(self.camera_network_apply_worker.deleteLater)
+        self.camera_network_apply_thread.finished.connect(self.camera_network_apply_thread.deleteLater)
+        self.camera_network_apply_thread.finished.connect(self._clear_camera_network_apply)
+        self.camera_network_apply_thread.start()
+
+    def _apply_camera_network_address_result(self, result: object) -> None:
+        data = dict(result or {})
+        interface_name = str(data.get("interface_name") or self.interface_edit.text().strip())
+        address_text = str(data.get("address_text") or self.host_address_edit.text().strip())
+        if not bool(data.get("ok")):
+            message = str(data.get("message") or "unknown error")
             self._log(f"[연결] PC IP 적용 실패: {message}")
             self.camera_connection_label.setText("camera host IP: apply failed")
+            self._refresh_operation_header()
+            return
+        self._log(f"[연결] PC IP 적용 완료: {data.get('message', '')}")
+        addresses = str(data.get("addresses") or "")
+        if addresses:
+            self._log(f"[연결] 네트워크 인터페이스 상태:\n{addresses}")
+        self.interface_edit.setText(interface_name)
+        self.host_address_edit.setText(address_text)
+        self._save_current_settings()
+        self.camera_connection_label.setText(f"camera host IP: applied {address_text}")
         self._refresh_operation_header()
+
+    def _camera_network_apply_failed(self, error: str) -> None:
+        self._log(f"[연결] PC IP 적용 worker 실패: {error}")
+        self.camera_connection_label.setText(f"camera host IP: failed ({error})")
+        self._refresh_operation_header()
+
+    def _clear_camera_network_apply(self) -> None:
+        self.camera_network_apply_thread = None
+        self.camera_network_apply_worker = None
+        self.apply_pc_ip_button.setEnabled(True)
 
     def save_distance_history_csv(
         self,
@@ -14660,12 +15222,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if not self._px4_mag_manager_has_data_source(camera):
                 continue
             if not self._sync_px4_mag_manager_store(camera):
-                # ROS2 raw MAG/vehicle_magnetometer does not expose CAL_MAG
-                # priority readback; retain the raw sample but do not persist
-                # guessed slot state from the local fallback defaults.
+                # A raw MAVLink sample does not expose CAL_MAG priority
+                # readback; retain live telemetry but do not persist guessed
+                # slot state from the local fallback defaults.
                 continue
-            manager.actual_selected_device_id = self.latest_vehicle_mag_device_ids.get(camera)
-            status = manager.refresh()
+            status = self._px4_mag_status_cache.get(camera)
+            if status is None:
+                # PARAM readback is a blocking MAVLink operation and is owned
+                # by PixhawkParameterWorker.  Recording must never trigger a
+                # hidden readback from the GUI thread.
+                continue
             for slot in status.slots:
                 rows.append(
                     {
@@ -14832,6 +15398,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "sample_monotonic": "producer/app receive CLOCK_MONOTONIC timestamp",
                 "session_utc": "derived from session host Unix/monotonic anchor",
                 "source_utc": "RTCP NTP or GNSS UTC only when explicitly valid",
+                "mavlink_provenance": (
+                    "endpoint, link-open/heartbeat, link target system/component, and received packet "
+                    "source system/component/sequence/message id are recorded when available"
+                ),
             },
             "camera_time_sync_status": camera_time_metrics["status"],
             "camera_time_sync_basis": camera_time_metrics["basis"],
@@ -14954,43 +15524,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             message += " [기록 샘플은 찾지 못함]"
         self._log(message)
 
-    def discover_custom_topic_watch(self) -> None:
-        self._log("[픽스호크] ROS2 topic 탐색을 시작합니다...")
-        topics = discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.5)
-        if not topics:
-            self._log("[픽스호크] ROS2 topic을 찾지 못했습니다. ROS2 Connect/uXRCE 상태와 ROS_DOMAIN_ID를 확인하세요.")
-            return
-        dialog = TopicBrowserDialog(topics, parent=self, title="ROS2 Topic Browser")
-        if dialog.exec_() != QtWidgets.QDialog.Accepted:
-            return
-        selected_topic = dialog.selected_topic()
-        if not selected_topic:
-            return
-        topic_name = selected_topic.get("name", "")
-        topic_type = selected_topic.get("type", "")
-        if not topic_type:
-            self._log(f"[픽스호크] 선택한 topic의 메시지 타입을 알 수 없습니다: {topic_name}")
-            return
-        try:
-            fields = describe_ros2_message_fields(topic_type)
-        except Exception as exc:
-            self._log(f"[픽스호크] ROS2 field 조회 실패: {topic_type} ({exc})")
-            return
-        if not fields:
-            self._log(f"[픽스호크] 그래프 가능한 numeric field를 찾지 못했습니다: {topic_name}")
-            return
-        field_dialog = FieldSelectionDialog(topic_name, topic_type, fields, parent=self)
-        if field_dialog.exec_() != QtWidgets.QDialog.Accepted:
-            return
-        selected_fields = field_dialog.selected_fields()
-        if not selected_fields:
-            self._log("[픽스호크] 선택한 field가 없습니다.")
-            return
-        for field in selected_fields:
-            key = f"ros2:{topic_name}:{field}"
-            self._add_custom_topic_watch(key=key, topic=topic_name, field=field, source="ros2")
-        self._log(f"[픽스호크] ROS2 Custom watch {len(selected_fields)}개 추가: {topic_name}")
-
     def discover_custom_mavlink_watch(self) -> None:
         messages = discover_mavlink_messages()
         dialog = TopicBrowserDialog(messages, parent=self, title="MAVLink Message Browser")
@@ -15015,39 +15548,33 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         for field in selected_fields:
             key = f"mavlink:{message_name}.{field}"
-            self._add_custom_topic_watch(
+            self._add_custom_mavlink_watch(
                 key=key,
                 topic=message_name,
                 field=field,
-                source="mavlink",
                 message=message_name,
             )
         self._log(f"[픽스호크] MAVLink Custom watch {len(selected_fields)}개 추가: {message_name}")
 
-    def _add_custom_topic_watch(
+    def _add_custom_mavlink_watch(
         self,
         *,
         key: str,
         topic: str,
         field: str,
-        source: str = "ros2",
         message: str | None = None,
     ) -> None:
-        spec = {"key": key, "topic": topic, "field": field, "source": source}
+        spec = {"key": key, "topic": topic, "field": field, "source": "mavlink"}
         if message:
             spec["message"] = message
         if spec not in self.custom_watch_specs:
             self.custom_watch_specs.append(spec)
         if self.custom_watch_remove_combo.findData(key) < 0:
             self.custom_watch_remove_combo.addItem(key, key)
-        if source == "ros2":
-            for subscriber in self.pixhawk_ros2_subscribers.values():
-                if subscriber is not None:
-                    subscriber.add_custom_watch(spec)
-        if source == "mavlink" and self.mavlink_pixhawk is not None:
+        if self.mavlink_pixhawk is not None:
             self.mavlink_pixhawk.add_custom_watch(spec)
 
-    def remove_custom_topic_watch(self, key: str) -> None:
+    def remove_custom_mavlink_watch(self, key: str) -> None:
         removed_specs = [spec for spec in self.custom_watch_specs if str(spec.get("key", "")) == key]
         if not removed_specs:
             self._log(f"[픽스호크] 제거할 Custom watch가 없습니다: {key}")
@@ -15059,9 +15586,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.custom_watch_plot.remove_series(key)
         self.custom_watch_plot.remove_series(f"left:{key}")
         self.custom_watch_plot.remove_series(f"right:{key}")
-        for subscriber in self.pixhawk_ros2_subscribers.values():
-            if subscriber is not None:
-                subscriber.remove_custom_watch(key)
         if self.mavlink_pixhawk is not None:
             self.mavlink_pixhawk.remove_custom_watch(key)
         self._log(f"[픽스호크] Custom watch 제거: {key}")
@@ -15071,17 +15595,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if key is None:
             self._log("[픽스호크] 제거할 Custom watch가 없습니다.")
             return
-        self.remove_custom_topic_watch(str(key))
+        self.remove_custom_mavlink_watch(str(key))
 
-    def add_custom_topic_watch_from_ui(self) -> None:
-        topic = self.custom_watch_topic_edit.text().strip()
+    def add_custom_mavlink_watch_from_ui(self) -> None:
+        message = self.custom_watch_message_edit.text().strip().upper()
         field = self.custom_watch_field_edit.text().strip()
-        name = self.custom_watch_name_edit.text().strip() or f"{topic}.{field}"
-        if not topic or not field:
-            self._log("[픽스호크] Custom watch 추가 실패: topic/field가 비어 있습니다.")
+        name = self.custom_watch_name_edit.text().strip() or f"mavlink:{message}.{field}"
+        if not message or not field:
+            self._log("[픽스호크] MAVLink watch 추가 실패: message/field가 비어 있습니다.")
             return
-        self._add_custom_topic_watch(key=name, topic=topic, field=field, source="ros2")
-        self._log(f"[픽스호크] Custom watch 추가: {name} = {topic}.{field}")
+        self._add_custom_mavlink_watch(
+            key=name,
+            topic=message,
+            field=field,
+            message=message,
+        )
+        self._log(f"[픽스호크] MAVLink watch 추가: {name} = {message}.{field}")
 
     def _update_custom_watch(self, sample: CustomTopicSample) -> None:
         if sample.numeric_value is not None:
@@ -15093,214 +15622,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         sample_type = str(payload.get("sample_type") or "mavlink_status")
         values = {key: value for key, value in payload.items() if key != "sample_type"}
         self._record_external_timeline_row(camera, sample_type, values)
-
-    def _ros2_target_sides(self, camera: str | None) -> tuple[str, ...]:
-        if camera is None:
-            return ("left", "right")
-        if camera not in {"left", "right"}:
-            raise ValueError(f"Unknown Pixhawk side: {camera}")
-        return (camera,)
-
-    def _ros2_connected_sides(self) -> set[str]:
-        return {
-            side
-            for side in ("left", "right")
-            if self.pixhawk_ros2_subscribers.get(side) is not None
-        }
-
-    def _sync_legacy_pixhawk_ref(self) -> None:
-        self.pixhawk = self.pixhawk_ros2_subscribers.get("left") or self.pixhawk_ros2_subscribers.get("right")
-
-    def _create_ros2_pixhawk_subscriber(self, side: str) -> DualPixhawkAttitudeSubscriber:
-        kwargs = {
-            "domain_id": self.domain_spin.value(),
-            "left_namespace": self.left_namespace_edit.text().strip(),
-            "right_namespace": self.right_namespace_edit.text().strip(),
-            "custom_watches": tuple(self.custom_watch_specs),
-            "active_sides": (side,),
-        }
-        try:
-            return DualPixhawkAttitudeSubscriber(**kwargs)
-        except TypeError as exc:
-            if "active_sides" not in str(exc):
-                raise
-            kwargs.pop("active_sides")
-            return DualPixhawkAttitudeSubscriber(**kwargs)
-
-    def connect_pixhawk(self, camera: str | None = None, *, allow_mavlink_recovery: bool = True) -> bool:
-        target_sides = self._ros2_target_sides(camera)
-        if all(self.pixhawk_ros2_subscribers.get(side) is not None for side in target_sides):
-            self._sync_legacy_pixhawk_ref()
-            return True
-        ok = True
-        failed: list[str] = []
-        first_error: Exception | None = None
-        self._ensure_micro_xrce_agent()
-        for side in target_sides:
-            if self.pixhawk_ros2_subscribers.get(side) is not None:
-                continue
-            label = self._px4_mag_camera_label(side)
-            try:
-                subscriber = self._create_ros2_pixhawk_subscriber(side)
-                subscriber.extrinsic_changed.connect(self._update_extrinsic)
-                subscriber.gps_changed.connect(self._update_gps)
-                subscriber.mag_sensor_changed.connect(self._update_mag_sensor)
-                subscriber.gps_sensor_changed.connect(self._update_gps_sensor)
-                subscriber.gnss_relative_changed.connect(self._update_gnss_relative)
-                subscriber.custom_watch_changed.connect(self._update_custom_watch)
-                subscriber.status_changed.connect(lambda text: self._log(f"[픽스호크] {text}"))
-                subscriber.start()
-                self.pixhawk_ros2_subscribers[side] = subscriber
-                self._log(f"[픽스호크] {label} ROS2 세션을 시작했습니다. 데이터 수신을 기다립니다.")
-            except Exception as exc:
-                ok = False
-                if first_error is None:
-                    first_error = exc
-                failed.append(label)
-                self.pixhawk_ros2_subscribers[side] = None
-                self._log(f"[픽스호크] {label} ROS2 연결 실패: {exc}")
-                if allow_mavlink_recovery and camera is not None:
-                    self._start_mavlink_recovery_after_ros2_failure(exc, camera=side)
-        if allow_mavlink_recovery and camera is None and failed and first_error is not None:
-            self._start_mavlink_recovery_after_ros2_failure(first_error)
-        self._sync_legacy_pixhawk_ref()
-        self.pixhawk_button.setEnabled(True)
-        self.left_ros2_button.setEnabled(True)
-        self.right_ros2_button.setEnabled(True)
-        self._refresh_session_toggle_buttons()
-        connected = self._ros2_connected_sides()
-        if connected:
-            labels = ", ".join(self._px4_mag_camera_label(side) for side in sorted(connected))
-            self.pixhawk_connection_label.setText(f"픽스호크 ROS2: {labels} 세션 시작, 데이터 대기 중")
-            QtCore.QTimer.singleShot(2000, lambda sides=tuple(connected): self._verify_ros2_pixhawk_publishers(sides))
-        elif failed and self.mavlink_pixhawk is None:
-            self.pixhawk_connection_label.setText(f"pixhawk ROS2: failed ({', '.join(failed)})")
-        self.refresh_px4_mag_manager()
-        self.refresh_px4_attitude_cal_status()
-        self._refresh_operation_header()
-        return ok
-
-    def _ensure_micro_xrce_agent(self) -> None:
-        started, message = ensure_micro_xrce_agent(self.uxrce_port_spin.value())
-        if started:
-            self._log(f"[픽스호크] MicroXRCEAgent를 시작했습니다: {message}")
-        else:
-            self._log(f"[픽스호크] MicroXRCEAgent가 이미 실행 중입니다: {message}")
-
-    def _verify_ros2_pixhawk_publishers(self, sides: tuple[str, ...] | None = None) -> None:
-        connected_sides = self._ros2_connected_sides()
-        if not connected_sides:
-            return
-        target_sides = tuple(side for side in (sides or ("left", "right")) if side in connected_sides)
-        if not target_sides:
-            return
-        domain_id = int(self.domain_spin.value())
-        checks = []
-        namespaces = {
-            "left": self.left_namespace_edit.text().strip().strip("/"),
-            "right": self.right_namespace_edit.text().strip().strip("/"),
-        }
-        for side in target_sides:
-            namespace = namespaces[side]
-            topic = f"/{namespace}/fmu/out/vehicle_attitude" if namespace else "/fmu/out/vehicle_attitude"
-            ok = _ros2_topic_has_publisher(domain_id, topic, timeout_s=0.8)
-            checks.append((side, topic, ok))
-            sensor_checks = {
-                "vehicle_gps_position": (
-                    f"/{namespace}/fmu/out/vehicle_gps_position" if namespace else "/fmu/out/vehicle_gps_position",
-                ),
-                "sensor_gps": sensor_gps_topics(namespace),
-                "sensor_mag": sensor_mag_topics(namespace),
-                "vehicle_magnetometer": (
-                    f"/{namespace}/fmu/out/vehicle_magnetometer" if namespace else "/fmu/out/vehicle_magnetometer",
-                ),
-            }
-            self.ros2_sensor_topic_publishers[side] = {}
-            for key, sensor_topics in sensor_checks.items():
-                self.ros2_sensor_topic_publishers[side][key] = any(
-                    _ros2_topic_has_publisher(domain_id, sensor_topic, timeout_s=0.2)
-                    for sensor_topic in sensor_topics
-                )
-        self._refresh_ros2_only_alignment_availability()
-        if any(ok for _side, _topic, ok in checks):
-            ok_topics = ", ".join(topic for _side, topic, ok in checks if ok)
-            receiving_sides = [
-                side for side, _topic, ok in checks if ok and self._ros2_attitude_sample_age_s(side) is not None
-            ]
-            if receiving_sides:
-                labels = ", ".join(self._px4_mag_camera_label(side) for side in receiving_sides)
-                self.pixhawk_connection_label.setText(
-                    f"픽스호크 ROS2: {labels} 자세 데이터 수신 확인됨 ({ok_topics})"
-                )
-                self._log(f"[픽스호크] ROS2 자세 데이터 수신 확인: {ok_topics}")
-            else:
-                self.pixhawk_connection_label.setText(
-                    f"픽스호크 ROS2: publisher만 확인됨, 자세 데이터 미수신 ({ok_topics})"
-                )
-                self._log(f"[픽스호크] ROS2 publisher는 있으나 자세 데이터 미수신: {ok_topics}")
-            missing = []
-            for side, topics in self.ros2_sensor_topic_publishers.items():
-                for key in ("sensor_gps", "sensor_mag", "vehicle_magnetometer"):
-                    if not topics.get(key, False):
-                        missing.append(f"{self._px4_mag_camera_label(side)} {key}")
-            if missing:
-                self._log("[픽스호크] ROS2 only 센서 미게시: " + ", ".join(missing))
-                QtCore.QTimer.singleShot(500, self._start_mavlink_sensor_auxiliary_if_needed)
-            return
-        topics = ", ".join(topic for _side, topic, _ok in checks)
-        self.pixhawk_connection_label.setText("픽스호크 ROS2: topic 이름만 있음, PX4 publisher 없음")
-        self._log(
-            "[픽스호크] ROS2 publisher 없음: topic 이름은 앱 subscription 때문에 보일 수 있습니다. "
-            f"확인 topic={topics}. MicroXRCEAgent, Pixhawk Host IP, PX4 uXRCE client 재부팅/재시작을 확인하세요."
-        )
-
-    def _ros2_attitude_sample_age_s(self, side: str, *, max_age_s: float = 2.0) -> float | None:
-        """Seconds since the last real ``vehicle_attitude`` sample for ``side``, or None if none/stale.
-
-        A DDS publisher count > 0 only proves something advertised the topic
-        name; it says nothing about whether it is actually sending usable
-        data. This checks the subscriber's own received-message state instead.
-        """
-
-        subscriber = self.pixhawk_ros2_subscribers.get(side)
-        if subscriber is None:
-            return None
-        state = subscriber.latest_extrinsics.get(side)
-        if state is None:
-            return None
-        age_s = time.monotonic() - state.timestamp_s
-        return age_s if 0.0 <= age_s <= max_age_s else None
-
-    def _refresh_ros2_only_alignment_availability(self) -> None:
-        self._refresh_baseline_gps_cards()
-        self._refresh_alignment_magnetometer_ui()
-        self._refresh_alignment_overview()
-        self._refresh_pixhawk_sensor_health()
-        for side in ("left", "right"):
-            gps2_label = self.f9p_slot_labels.get(side, {}).get("GPS2") if hasattr(self, "f9p_slot_labels") else None
-            if gps2_label is not None and "GPS2" not in self.latest_gps_sensors.get(side, {}) and self._ros2_only_unavailable(side, "GPS2"):
-                self._set_health_label(gps2_label, "ROS2 sensor_gps(_0/_1) 미게시", "warn")
-            for slot in ("CAN1", "CAN2"):
-                mag_label = self.rm3100_slot_labels.get(side, {}).get(slot) if hasattr(self, "rm3100_slot_labels") else None
-                if mag_label is not None and slot not in self.latest_mag_sensors.get(side, {}) and self._ros2_only_unavailable(side, slot):
-                    self._set_health_label(mag_label, "ROS2 sensor_mag(_0..4)/vehicle_magnetometer 미게시", "warn")
-
-    def _ros2_topic_available(self, side: str, key: str) -> bool:
-        return bool(self.ros2_sensor_topic_publishers.get(side, {}).get(key, False))
-
-    def _ros2_only_unavailable(self, side: str, kind: str) -> bool:
-        if side not in self._ros2_connected_sides():
-            return False
-        if self.mavlink_pixhawk is not None and side in self._mavlink_connected_sides():
-            return False
-        if kind == "GPS2":
-            return not self._ros2_topic_available(side, "sensor_gps")
-        if kind in {"CAN1", "CAN2", "MAG"}:
-            return not (
-                self._ros2_topic_available(side, "sensor_mag")
-                or self._ros2_topic_available(side, "vehicle_magnetometer")
-            )
-        return False
 
     def _mavlink_connected_sides(self) -> set[str]:
         if self.mavlink_pixhawk is None:
@@ -15323,37 +15644,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _refresh_mavlink_side_actions(self) -> None:
         connected_sides = self._mavlink_connected_sides()
-        self.left_uxrce_param_button.setEnabled("left" in connected_sides)
-        self.right_uxrce_param_button.setEnabled("right" in connected_sides)
         self.left_px4_shell_button.setEnabled("left" in connected_sides)
         self.right_px4_shell_button.setEnabled("right" in connected_sides)
         self.left_persist_eth_button.setEnabled("left" in connected_sides)
         self.right_persist_eth_button.setEnabled("right" in connected_sides)
         self.left_reboot_pixhawk_button.setEnabled("left" in connected_sides)
         self.right_reboot_pixhawk_button.setEnabled("right" in connected_sides)
-
-    def disconnect_pixhawk(self, camera: str | None = None) -> None:
-        target_sides = self._ros2_target_sides(camera)
-        for side in target_sides:
-            subscriber = self.pixhawk_ros2_subscribers.get(side)
-            if subscriber is not None:
-                subscriber.stop()
-                self.pixhawk_ros2_subscribers[side] = None
-            self.pixhawk_attitude_times[side].clear()
-            self.ros2_sensor_topic_publishers[side] = {}
-            if side not in self._mavlink_connected_sides():
-                self._clear_px4_mag_manager_connection_state(side)
-                self._clear_px4_attitude_cal_connection_state(side)
-        self._sync_legacy_pixhawk_ref()
-        self.pixhawk_button.setEnabled(True)
-        self.left_ros2_button.setEnabled(True)
-        self.right_ros2_button.setEnabled(True)
-        self._refresh_session_toggle_buttons()
-        if not self._ros2_connected_sides() and self.mavlink_pixhawk is None:
-            self.pixhawk_connection_label.setText("픽스호크: 연결 해제")
-        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-        self._log(f"[픽스호크] {label} ROS2 연결을 해제했습니다.")
-        self._refresh_operation_header()
 
     def _mavlink_target_sides(self, camera: str | None) -> tuple[str, ...]:
         if camera is None:
@@ -15390,6 +15686,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             optional_timeline_changed = getattr(self.mavlink_pixhawk, "optional_timeline_changed", None)
             if optional_timeline_changed is not None:
                 optional_timeline_changed.connect(self._update_mavlink_optional_timeline)
+            stream_setup_required = getattr(self.mavlink_pixhawk, "stream_setup_required", None)
+            if stream_setup_required is not None:
+                stream_setup_required.connect(self._handle_mavlink_stream_setup_required)
             self.mavlink_pixhawk.shell_output.connect(self._append_px4_shell_output)
             self.mavlink_pixhawk.status_changed.connect(self._handle_mavlink_status_changed)
         else:
@@ -15400,92 +15699,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log(f"[픽스호크] {text}")
         self._refresh_session_toggle_buttons()
         self._refresh_mavlink_side_actions()
-
-    def _retry_ros2_after_mavlink_recovery(self, camera: str | None = None) -> None:
-        target_sides = self._ros2_target_sides(camera)
-        if all(side in self._ros2_connected_sides() for side in target_sides):
-            return
-        self._log("[픽스호크] MAVLink 복구 설정 이후 ROS2 연결을 다시 시도합니다.")
-        if self.connect_pixhawk(camera, allow_mavlink_recovery=False):
-            self._log("[픽스호크] MAVLink 복구 설정 이후 ROS2 세션이 시작되었습니다.")
-        else:
-            self._log("[픽스호크] ROS2 재시도 실패. MAVLink telemetry fallback을 유지합니다.")
-
-    def _start_mavlink_sensor_auxiliary_if_needed(self) -> None:
-        if not self._ros2_connected_sides():
-            return
-        configured_sides = self._configured_mavlink_sides()
-        if not configured_sides:
-            self._log("[픽스호크] GPS2/RM3100 보조 수신용 MAVLink URL이 없어 ROS2 sensor topic만 사용합니다.")
-            return
-        missing_sides = [
-            side
-            for side in configured_sides
-            if (
-                "GPS2" not in self.latest_gps_sensors.get(side, {})
-                or "CAN1" not in self.latest_mag_sensors.get(side, {})
-                or "CAN2" not in self.latest_mag_sensors.get(side, {})
-            )
-        ]
-        if not missing_sides:
-            return
-        missing_sides = self._deduplicate_mavlink_auxiliary_sides(missing_sides)
-        if not missing_sides:
-            return
-        subscriber = self._ensure_mavlink_subscriber()
-        started: list[str] = []
-        for side in missing_sides:
-            if side in self._mavlink_connected_sides():
-                continue
-            try:
-                subscriber.start(side)
-            except Exception as exc:
-                self._log(f"[픽스호크] {self._px4_mag_camera_label(side)} GPS2/RM3100 MAVLink 보조 수신 시작 실패: {exc}")
-                continue
-            started.append(side)
-        if not started:
-            return
-        self._refresh_session_toggle_buttons()
-        self._refresh_mavlink_side_actions()
-        labels = ", ".join(self._px4_mag_camera_label(side) for side in started)
-        self._log(
-            f"[픽스호크] {labels} GPS2/RM3100 보조 수신을 MAVLink로 시작했습니다. "
-            "ROS2 자세/위치 세션은 유지하고 GPS_RAW_INT/GPS2_RAW/SCALED_IMU*만 보조로 수신합니다."
-        )
-        self.pixhawk_connection_label.setText(f"픽스호크 ROS2 + MAVLink 센서 보조: {labels} 데이터 대기 중")
-        self._refresh_operation_header()
-
-    def _start_mavlink_gps2_auxiliary_if_needed(self) -> None:
-        self._start_mavlink_sensor_auxiliary_if_needed()
-
-    def _deduplicate_mavlink_auxiliary_sides(self, sides: Sequence[str]) -> list[str]:
-        selected: list[str] = []
-        by_url: dict[str, list[str]] = {}
-        for side in sides:
-            url_edit = self.left_mavlink_url_edit if side == "left" else self.right_mavlink_url_edit
-            url = url_edit.text().strip()
-            if not url:
-                continue
-            by_url.setdefault(url, []).append(side)
-        for url, url_sides in by_url.items():
-            if len(url_sides) == 1:
-                selected.append(url_sides[0])
-                continue
-            preferred = max(url_sides, key=self._mavlink_auxiliary_side_score)
-            labels = ", ".join(self._px4_mag_camera_label(side) for side in url_sides)
-            self._log(
-                f"[픽스호크] {labels} MAVLink URL이 동일합니다({url}). "
-                f"중복 serial open을 피하려고 {self._px4_mag_camera_label(preferred)} 보조 수신만 시작합니다."
-            )
-            selected.append(preferred)
-        return selected
-
-    def _mavlink_auxiliary_side_score(self, side: str) -> tuple[int, int, int]:
-        return (
-            1 if side in self._mavlink_connected_sides() else 0,
-            1 if self.latest_gps_sensors.get(side) or side in self.latest_gps else 0,
-            1 if side in self.latest_extrinsics else 0,
-        )
 
     def _configured_mavlink_sides(self) -> tuple[str, ...]:
         sides = []
@@ -15502,67 +15715,62 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _apply_mavlink_pixhawk_setup(self, subscriber: DualPixhawkMavlinkSubscriber, target_sides: tuple[str, ...]) -> None:
         setup_sides = self._mavlink_setup_target_sides(target_sides)
-        if not setup_sides:
+        if not setup_sides or not self.mavlink_configure_streams_checkbox.isChecked():
             return
-        host_ip = self._validated_pixhawk_host_ip_for_manual_uxrce(sorted(setup_sides)[0])
-        if self.mavlink_configure_streams_checkbox.isChecked():
-            subscriber.configure_mavlink_streams(
-                host_ip=host_ip,
-                ports={
-                    "left": self._mavlink_stream_port(self.left_mavlink_url_edit.text().strip(), default=14550),
-                    "right": self._mavlink_stream_port(self.right_mavlink_url_edit.text().strip(), default=14551),
-                },
-                sysids={"left": 1, "right": 2},
-                rate=self.mavlink_stream_rate_spin.value(),
-                cameras=setup_sides,
-            )
-        if self.mavlink_configure_uxrce_agent_checkbox.isChecked():
-            configured_sides = [
-                side
-                for side in sorted(setup_sides)
-                if self._apply_uxrce_params_for_side(subscriber, side, host_ip=host_ip, emit_success=False)
-            ]
-            if configured_sides and self._ros2_retry_after_uxrce_agent_setup:
-                self._ros2_retry_after_uxrce_agent_setup = False
-                labels = ", ".join(self._px4_mag_camera_label(side) for side in configured_sides)
-                self._log(
-                    f"[픽스호크] MAVLink로 {labels} uXRCE 파라미터를 확인했습니다. "
-                    "PX4 재부팅/클라이언트 재시작 후 ROS2 연결을 재시도합니다."
-                )
-                retry_sides = tuple(configured_sides)
-                QtCore.QTimer.singleShot(
-                    2500,
-                    lambda sides=retry_sides: [self._retry_ros2_after_mavlink_recovery(side) for side in sides],
-                )
+        self._start_pixhawk_stream_setup_worker(subscriber, tuple(sorted(setup_sides)))
 
-    def _start_mavlink_recovery_after_ros2_failure(self, error: Exception, camera: str | None = None) -> None:
-        target_sides = self._mavlink_target_sides(camera)
-        configured_sides = tuple(side for side in target_sides if side in self._configured_mavlink_sides())
-        if not configured_sides:
-            self._log("[픽스호크] ROS2 복구용 MAVLink URL이 없어 MAVLink fallback을 시작하지 못했습니다.")
+    def _start_pixhawk_stream_setup_worker(
+        self,
+        subscriber: DualPixhawkMavlinkSubscriber | None = None,
+        cameras: Sequence[str] = (),
+    ) -> bool:
+        subscriber = subscriber or self.mavlink_pixhawk
+        if subscriber is None:
+            return False
+        if self.pixhawk_stream_setup_thread is not None:
+            self._log("[픽스호크] MAVLink stream 설정이 이미 진행 중입니다.")
+            return False
+        target_sides = tuple(str(side) for side in cameras if str(side) in getattr(subscriber, "connections", {}))
+        if not target_sides:
+            return False
+        thread = QtCore.QThread(self)
+        worker = PixhawkStreamSetupWorker(
+            subscriber,
+            host_ip=self.pixhawk_host_address_edit.text().strip(),
+            ports={
+                "left": self._mavlink_stream_port(self.left_mavlink_url_edit.text().strip(), default=14550),
+                "right": self._mavlink_stream_port(self.right_mavlink_url_edit.text().strip(), default=14551),
+            },
+            sysids={"left": 1, "right": 2},
+            rate=self.mavlink_stream_rate_spin.value(),
+            cameras=target_sides,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda result: self._log(
+                f"[픽스호크] MAVLink stream 설정 완료: {', '.join(target_sides)} "
+                f"host={result.get('host_ip', '')}"
+            )
+        )
+        worker.failed.connect(lambda error: self._log(f"[픽스호크] MAVLink stream 설정 실패: {error}"))
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_pixhawk_stream_setup_worker)
+        self.pixhawk_stream_setup_thread = thread
+        self.pixhawk_stream_setup_worker = worker
+        thread.start()
+        return True
+
+    def _handle_mavlink_stream_setup_required(self, camera: str) -> None:
+        if not self.mavlink_configure_streams_checkbox.isChecked():
             return
-        self._ros2_retry_after_uxrce_agent_setup = self.mavlink_configure_uxrce_agent_checkbox.isChecked()
-        if self._ros2_retry_after_uxrce_agent_setup:
-            self._log(
-                "[픽스호크] ROS2 실패 후 MAVLink 복구를 시작합니다. "
-                "PX4에 MAVLink stream/uXRCE-DDS client 설정을 전송합니다."
-            )
-        else:
-            self._log(
-                "[픽스호크] ROS2 실패 후 MAVLink telemetry fallback을 시작합니다. "
-                "PX4 uXRCE Agent 설정 옵션이 꺼져 있어 ROS2 자동 재시도는 건너뜁니다."
-            )
-        try:
-            if camera is None:
-                self.connect_mavlink_pixhawk(force_setup=True)
-            else:
-                for side in configured_sides:
-                    self.connect_mavlink_pixhawk(side, force_setup=True)
-            if not any(side in self._mavlink_connected_sides() for side in configured_sides):
-                self._ros2_retry_after_uxrce_agent_setup = False
-        except Exception as fallback_exc:
-            self._ros2_retry_after_uxrce_agent_setup = False
-            self._log(f"[픽스호크] MAVLink 복구/fallback 시작 실패: {fallback_exc} (원래 ROS2 오류: {error})")
+        self._start_pixhawk_stream_setup_worker(self.mavlink_pixhawk, (str(camera),))
+
+    def _clear_pixhawk_stream_setup_worker(self) -> None:
+        self.pixhawk_stream_setup_thread = None
+        self.pixhawk_stream_setup_worker = None
 
     def bootstrap_ethernet_mavlink_from_usb(self, camera: str) -> None:
         if camera not in {"left", "right"}:
@@ -15582,51 +15790,60 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         except Exception as exc:
             self._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 명령 생성 실패: {exc}")
             return
-        baud_candidates = self._usb_bootstrap_baud_candidates(usb_baud)
-        last_error = ""
-        selected_baud = usb_baud
-        for candidate_baud in baud_candidates:
-            temp = DualPixhawkMavlinkSubscriber(
-                left_url=usb_url if camera == "left" else "",
-                right_url=usb_url if camera == "right" else "",
-                left_baud=candidate_baud,
-                right_baud=candidate_baud,
-            )
-            temp.status_changed.connect(lambda text: self._log(f"[픽스호크 USB] {text}"))
-            try:
-                temp.start(camera)
-                if not self._temporary_mavlink_heartbeat(temp, camera):
-                    last_error = f"{candidate_baud} baud heartbeat timeout"
-                    self._log(f"[픽스호크] {label} USB {candidate_baud} baud heartbeat 없음, 다음 후보를 시도합니다.")
-                    continue
-                selected_baud = candidate_baud
-                result = temp.send_shell_command_with_result(camera, command, timeout_s=2.0)
-                if "invalid mode" in result.output.lower():
-                    fallback_command = self._ethernet_mavlink_bootstrap_command(camera, mode="onboard")
-                    self._log(f"[픽스호크] {label} PX4가 MAVLink mode normal을 거부해 onboard로 재시도합니다.")
-                    result = temp.send_shell_command_with_result(camera, fallback_command, timeout_s=2.0)
-                if result.output.strip():
-                    self._log(f"[픽스호크 USB] {label} PX4 shell 응답({result.flag_label}): {result.output.strip()[-800:]}")
-                last_error = ""
-                break
-            except Exception as exc:
-                last_error = f"{candidate_baud} baud: {exc}"
-                self._log(f"[픽스호크] {label} USB {candidate_baud} baud 부트스트랩 실패: {exc}")
-            finally:
-                try:
-                    temp.stop(camera)
-                except Exception:
-                    pass
-        if last_error:
-            self._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 실패: {last_error}")
+        if self.pixhawk_usb_bootstrap_thread is not None:
+            self._log(f"[픽스호크] {label} USB 부트스트랩이 이미 진행 중입니다.")
             return
+        try:
+            fallback_command = self._ethernet_mavlink_bootstrap_command(camera, mode="onboard")
+        except Exception as exc:
+            self._log(f"[픽스호크] {label} ETH MAVLink USB fallback 명령 생성 실패: {exc}")
+            return
+        thread = QtCore.QThread(self)
+        worker = PixhawkUsbBootstrapWorker(
+            camera=camera,
+            usb_url=usb_url,
+            baud_candidates=self._usb_bootstrap_baud_candidates(usb_baud),
+            command=command,
+            fallback_command=fallback_command,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._apply_pixhawk_usb_bootstrap_result)
+        worker.failed.connect(
+            lambda error, label=label: self._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 실패: {error}")
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_pixhawk_usb_bootstrap_worker)
+        self.pixhawk_usb_bootstrap_thread = thread
+        self.pixhawk_usb_bootstrap_worker = worker
+        self._log(f"[픽스호크] {label} USB Ethernet MAVLink 부트스트랩을 시작했습니다.")
+        thread.start()
+
+    def _apply_pixhawk_usb_bootstrap_result(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        if camera not in {"left", "right"}:
+            return
+        selected_baud = int(data.get("baud") or 0)
         self._set_usb_bootstrap_baud(camera, selected_baud)
+        output = str(data.get("output") or "").strip()
+        if output:
+            self._log(
+                f"[픽스호크 USB] {self._px4_mag_camera_label(camera)} PX4 shell 응답 "
+                f"({data.get('flag_label', '')}): {output[-800:]}"
+            )
         self._log(
-            f"[픽스호크] {label} USB {selected_baud} baud 부트스트랩으로 Ethernet MAVLink stream 시작 명령을 전송했습니다. "
+            f"[픽스호크] {self._px4_mag_camera_label(camera)} USB {selected_baud} baud 부트스트랩 완료. "
             "UDP MAVLink 수신을 다시 시작합니다."
         )
         self._save_current_settings()
         self.connect_mavlink_pixhawk(camera)
+
+    def _clear_pixhawk_usb_bootstrap_worker(self) -> None:
+        self.pixhawk_usb_bootstrap_thread = None
+        self.pixhawk_usb_bootstrap_worker = None
 
     def _usb_bootstrap_baud_candidates(self, selected_baud: int) -> tuple[int, ...]:
         ordered = [int(selected_baud)]
@@ -15666,8 +15883,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _ethernet_mavlink_bootstrap_command(self, camera: str, *, mode: str = "normal") -> str:
         setup = self._persistent_pixhawk_eth_setup(camera)
-        if setup["mode"] == "uxrce":
-            raise ValueError("Ethernet 서비스가 uXRCE-DDS 전용이라 MAVLink 부트스트랩을 시작할 수 없습니다.")
         mavlink_start_cmd = str(setup["mavlink_start_cmd"])
         if mode == "onboard":
             mavlink_start_cmd = mavlink_start_cmd.replace("-m normal", "-m onboard -n eth0")
@@ -15687,39 +15902,88 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if force_setup and self.mavlink_pixhawk is not None:
                 self._apply_mavlink_pixhawk_setup(self.mavlink_pixhawk, target_sides)
             return
+        if self.pixhawk_connection_thread is not None:
+            self._log("[픽스호크] MAVLink 연결 작업이 이미 진행 중입니다.")
+            return
+        subscriber = self._ensure_mavlink_subscriber()
+        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
+        thread = QtCore.QThread(self)
+        worker = PixhawkConnectionWorker(subscriber, camera)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda _result, camera=camera, force_setup=force_setup, target_sides=target_sides:
+            self._apply_pixhawk_connection_result(camera, force_setup, target_sides)
+        )
+        worker.failed.connect(
+            lambda error, camera=camera, target_sides=target_sides: self._pixhawk_connection_failed(
+                camera, target_sides, error
+            )
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_pixhawk_connection_worker)
+        self.pixhawk_connection_thread = thread
+        self.pixhawk_connection_worker = worker
+        self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 중...")
+        self._log(f"[픽스호크] {label} MAVLink 연결을 시작했습니다.")
+        thread.start()
+
+    def _apply_pixhawk_connection_result(
+        self,
+        camera: str | None,
+        force_setup: bool,
+        target_sides: Sequence[str],
+    ) -> None:
+        subscriber = self.mavlink_pixhawk
+        if subscriber is None:
+            return
         try:
-            subscriber = self._ensure_mavlink_subscriber()
-            subscriber.start(camera)
-            if force_setup:
-                self._apply_mavlink_pixhawk_setup(subscriber, target_sides)
-            elif self.mavlink_configure_streams_checkbox.isChecked() or self.mavlink_configure_uxrce_agent_checkbox.isChecked():
-                self._log(
-                    "[픽스호크] 일반 MAVLink 연결에서는 UI 응답성을 위해 stream/uXRCE 설정을 자동 실행하지 않습니다. "
-                    "필요하면 P1/P2 uXRCE 설정 버튼 또는 ROS2 복구 경로를 사용하세요."
-                )
-            self._refresh_session_toggle_buttons()
-            self._refresh_mavlink_side_actions()
-            label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-            self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
-            self._log(f"[픽스호크] {label} MAVLink 세션을 시작했습니다. 데이터 수신을 기다립니다.")
-            self._request_mavlink_eth0_status(target_sides)
-            self.refresh_px4_mag_manager()
-            self.refresh_px4_attitude_cal_status()
-            self._refresh_operation_header()
+            subscriber.start_receive_timer()
         except Exception as exc:
-            if self.mavlink_pixhawk is not None:
-                try:
-                    self.mavlink_pixhawk.stop(camera)
-                except Exception:
-                    pass
-                if not getattr(self.mavlink_pixhawk, "connections", {}):
-                    self.mavlink_pixhawk = None
-            self._refresh_session_toggle_buttons()
-            self._refresh_mavlink_side_actions()
-            label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-            self.pixhawk_connection_label.setText(f"pixhawk MAVLink {label}: failed ({exc})")
-            self._log(f"[픽스호크] {label} MAVLink 연결 실패: {exc}")
-            self._refresh_operation_header()
+            self._pixhawk_connection_failed(camera, tuple(target_sides), str(exc))
+            return
+        if force_setup:
+            self._apply_mavlink_pixhawk_setup(subscriber, tuple(target_sides))
+        elif self.mavlink_configure_streams_checkbox.isChecked():
+            self._log(
+                "[픽스호크] 일반 MAVLink 연결에서는 stream 설정을 자동 실행하지 않습니다. "
+                "필요하면 Workstation의 MAVLink stream 설정을 적용하세요."
+            )
+        self._refresh_session_toggle_buttons()
+        self._refresh_mavlink_side_actions()
+        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
+        self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
+        self._log(f"[픽스호크] {label} MAVLink 세션이 시작됐습니다. 데이터 수신을 기다립니다.")
+        self._request_mavlink_eth0_status(tuple(target_sides))
+        self.refresh_px4_mag_manager()
+        self.refresh_px4_attitude_cal_status()
+        self._refresh_operation_header()
+
+    def _pixhawk_connection_failed(
+        self,
+        camera: str | None,
+        target_sides: Sequence[str],
+        error: str,
+    ) -> None:
+        if self.mavlink_pixhawk is not None:
+            try:
+                self.mavlink_pixhawk.stop(camera)
+            except Exception:
+                pass
+            if not getattr(self.mavlink_pixhawk, "connections", {}):
+                self.mavlink_pixhawk = None
+        self._refresh_session_toggle_buttons()
+        self._refresh_mavlink_side_actions()
+        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
+        self.pixhawk_connection_label.setText(f"pixhawk MAVLink {label}: failed ({error})")
+        self._log(f"[픽스호크] {label} MAVLink 연결 실패: {error}")
+        self._refresh_operation_header()
+
+    def _clear_pixhawk_connection_worker(self) -> None:
+        self.pixhawk_connection_thread = None
+        self.pixhawk_connection_worker = None
 
     def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
         target_sides = self._mavlink_target_sides(camera)
@@ -15733,86 +15997,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._clear_px4_attitude_cal_connection_state(camera)
         self._refresh_session_toggle_buttons()
         self._refresh_mavlink_side_actions()
-        if not self._ros2_connected_sides():
-            if self.mavlink_pixhawk is None:
-                self.pixhawk_connection_label.setText("픽스호크: 연결 해제")
-            else:
-                label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-                self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
+        if self.mavlink_pixhawk is None:
+            self.pixhawk_connection_label.setText("픽스호크: 연결 해제")
+        else:
+            label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
+            self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
         label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
         self._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
         self._refresh_operation_header()
-
-
-    def apply_uxrce_params_from_mavlink(self, camera: str) -> None:
-        if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 실패: MAVLink 연결이 없습니다.")
-            return
-        try:
-            host_ip = self._validated_pixhawk_host_ip_for_manual_uxrce(camera)
-            ok = self._apply_uxrce_params_for_side(self.mavlink_pixhawk, camera, host_ip=host_ip, emit_success=True)
-        except Exception as exc:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 실패: {exc}")
-            return
-        if ok:
-            self.pixhawk_connection_label.setText(
-                f"{camera_label_ko(camera)} uXRCE 설정 확인 완료: PX4 재부팅/클라이언트 재시작 후 ROS2 연결"
-            )
-
-    def _apply_uxrce_params_for_side(
-        self,
-        subscriber: DualPixhawkMavlinkSubscriber,
-        camera: str,
-        *,
-        host_ip: str,
-        emit_success: bool,
-    ) -> bool:
-        if camera not in subscriber.connections:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 건너뜀: MAVLink 연결 없음")
-            return False
-        if self._pixhawk_ethernet_mode() == "mavlink":
-            self._log(
-                f"[픽스호크] {camera_label_ko(camera)} uXRCE 설정 차단: Ethernet 서비스가 MAVLink 전용입니다."
-            )
-            return False
-        dds_key = 1 if camera == "left" else 2
-        params = {
-            "MAV_2_CONFIG": 0,
-            "UXRCE_DDS_CFG": 1000,
-            "UXRCE_DDS_KEY": dds_key,
-            "UXRCE_DDS_DOM_ID": int(self.domain_spin.value()),
-            "UXRCE_DDS_AG_IP": int(IPv4Address(host_ip)),
-            "UXRCE_DDS_PRT": int(self.uxrce_port_spin.value()),
-            "UXRCE_DDS_PTCFG": 0,
-            "UXRCE_DDS_SYNCC": 0,
-            "UXRCE_DDS_SYNCT": 1,
-        }
-        mismatches: list[str] = []
-        for name, expected in params.items():
-            actual = subscriber.set_param_int(camera, name, expected)
-            if actual != expected:
-                mismatches.append(f"{name}: expected={expected}, actual={actual}")
-        if mismatches:
-            self._log(
-                f"[픽스호크] {camera_label_ko(camera)} uXRCE 파라미터 readback 불일치: "
-                + "; ".join(mismatches)
-            )
-            return False
-        namespace = (self.left_namespace_edit if camera == "left" else self.right_namespace_edit).text().strip()
-        message = (
-            f"{camera_label_ko(camera)} uXRCE 파라미터 확인: "
-            f"agent={host_ip}:{self.uxrce_port_spin.value()}, domain={self.domain_spin.value()}, "
-            f"key={dds_key}, namespace={namespace or '<default>'}. "
-            "Shell이 아닌 MAVLink PARAM_SET/readback 경로입니다. "
-            "Ethernet uXRCE 충돌 방지를 위해 MAV_2_CONFIG=0도 확인합니다."
-        )
-        self._log(f"[픽스호크] {message}")
-        if emit_success:
-            self._log(
-                f"[픽스호크] {camera_label_ko(camera)} ROS2 topic이 계속 없으면 PX4 재부팅 또는 "
-                "uxrce_dds_client 재시작이 필요합니다."
-            )
-        return True
 
     def apply_persistent_pixhawk_eth(self, camera: str) -> None:
         if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
@@ -15820,27 +16012,60 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         try:
             command = self._persistent_pixhawk_eth_command(camera)
-            self.mavlink_pixhawk.send_shell_command(camera, command)
-        except Exception as exc:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell 즉시 적용 명령 실패: {exc}")
-        else:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell 즉시 적용 명령을 전송했습니다.")
-        try:
             extras_text = self._persistent_pixhawk_extras_text(camera)
-            self.mavlink_pixhawk.write_remote_file_mavftp(camera, "/fs/microsd/etc/extras.txt", extras_text)
             net_cfg_text = self._persistent_pixhawk_net_cfg_text(camera)
-            self.mavlink_pixhawk.write_remote_file_mavftp(camera, "/fs/microsd/net.cfg", net_cfg_text)
         except Exception as exc:
-            self._log(
-                f"[픽스호크] {camera_label_ko(camera)} ETH MAVLink FTP 영구 저장 실패: {exc}. "
-                "PX4 shell과 MAVLink FTP가 모두 막히면 앱만으로 eth0 영구 설정을 저장할 수 없습니다."
-            )
+            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 설정 생성 실패: {exc}")
             return
+        if self.pixhawk_persistent_config_thread is not None:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정이 이미 진행 중입니다.")
+            return
+        thread = QtCore.QThread(self)
+        worker = PixhawkPersistentConfigWorker(
+            self.mavlink_pixhawk,
+            camera=camera,
+            command=command,
+            extras_text=extras_text,
+            net_cfg_text=net_cfg_text,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._apply_pixhawk_persistent_config_result)
+        worker.failed.connect(
+            lambda error, camera=camera: self._log(
+                f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: {error}. "
+                "PX4 shell과 MAVLink FTP가 모두 막히면 앱만으로 저장할 수 없습니다."
+            )
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_pixhawk_persistent_config_worker)
+        self.pixhawk_persistent_config_thread = thread
+        self.pixhawk_persistent_config_worker = worker
+        self._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell/FTP 영구 설정을 시작했습니다.")
+        thread.start()
+
+    def _apply_pixhawk_persistent_config_result(self, result: object) -> None:
+        data = dict(result or {})
+        camera = str(data.get("camera") or "")
+        if camera not in {"left", "right"}:
+            return
+        output = str(data.get("output") or "").strip()
+        if output:
+            self._log(
+                f"[픽스호크] {camera_label_ko(camera)} ETH shell 응답 "
+                f"({data.get('flag_label', '')}): {output[-800:]}"
+            )
         self._log(
             f"[픽스호크] {camera_label_ko(camera)} ETH MAVLink FTP 영구 저장 완료: "
             "/fs/microsd/net.cfg, /fs/microsd/etc/extras.txt. "
-            "재부팅 후 eth0, uXRCE-DDS, Ethernet MAVLink stream 적용을 확인하세요."
+            "재부팅 후 eth0와 Ethernet MAVLink stream 적용을 확인하세요."
         )
+
+    def _clear_pixhawk_persistent_config_worker(self) -> None:
+        self.pixhawk_persistent_config_thread = None
+        self.pixhawk_persistent_config_worker = None
 
     def reboot_pixhawk_from_mavlink(self, camera: str) -> None:
         if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
@@ -15856,14 +16081,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if result != QtWidgets.QMessageBox.Yes:
             self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 취소했습니다.")
             return
-        try:
-            self.mavlink_pixhawk.reboot_autopilot(camera)
-        except Exception as exc:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령 실패: {exc}")
-            return
-        self._log(
-            f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 전송했습니다. "
-            "연결이 끊긴 뒤 부팅 완료 후 다시 MAVLink/ROS2를 연결하세요."
+        self._start_pixhawk_shell_worker(
+            camera,
+            "MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN",
+            operation="reboot",
+            timeout_s=1.0,
         )
 
     def _persistent_pixhawk_eth_command(self, camera: str) -> str:
@@ -15876,7 +16098,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 *setup["param_lines"],
                 "param save",
                 *extras_lines,
-                "uxrce_dds_client status",
                 "mavlink status",
                 f"echo '{extras_lines[0]}' > {extras}",
                 *(f"echo '{line}' >> {extras}" for line in extras_lines[1:]),
@@ -15903,74 +16124,38 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _persistent_pixhawk_eth_setup(self, camera: str) -> dict[str, object]:
         if camera == "left":
             eth_ip = self.left_pixhawk_eth_ip_edit.text().strip()
-            namespace = self.left_namespace_edit.text().strip().strip("/")
-            dds_key = 1
             mavlink_url = self.left_mavlink_url_edit.text().strip()
             mavlink_default_port = 14550
         elif camera == "right":
             eth_ip = self.right_pixhawk_eth_ip_edit.text().strip()
-            namespace = self.right_namespace_edit.text().strip().strip("/")
-            dds_key = 2
             mavlink_url = self.right_mavlink_url_edit.text().strip()
             mavlink_default_port = 14551
         else:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
-        host_ip = self._pixhawk_host_ip_for_uxrce()
-        for label, value in (
-            ("Pixhawk ETH IP", eth_ip),
-            ("Pixhawk Host IP", host_ip),
-            ("Pixhawk ROS2 namespace", namespace),
-        ):
+        host_ip = self._pixhawk_host_ip_for_mavlink()
+        for label, value in (("Pixhawk ETH IP", eth_ip), ("Pixhawk Host IP", host_ip)):
             if not value or any(ch.isspace() or ch in "'\";`$" for ch in value):
                 raise ValueError(f"{label} 값이 비어 있거나 shell 명령에 사용할 수 없는 문자를 포함합니다: {value!r}")
-        host_ip_int = int(IPv4Address(host_ip))
         ifup_cmd = "ifup eth0"
         ifconfig_cmd = f"ifconfig eth0 {eth_ip} netmask 255.255.255.0 up"
-        uxrce_stop_cmd = "uxrce_dds_client stop"
-        uxrce_start_cmd = f"uxrce_dds_client start -t udp -p {self.uxrce_port_spin.value()} -h {host_ip} -n {namespace}"
         mavlink_port = self._mavlink_stream_port(mavlink_url, default=mavlink_default_port)
         mavlink_stop_cmd = f"mavlink stop -u {mavlink_port}"
         mavlink_start_cmd = (
             f"mavlink start -x -u {mavlink_port} -o {mavlink_port} "
             f"-t {host_ip} -r {self.mavlink_stream_rate_spin.value()} -m normal"
         )
-        mode = self._pixhawk_ethernet_mode()
-        param_lines = [
-            f"param set MAV_2_CONFIG {1000 if mode == 'mavlink' else 0}",
-        ]
-        if mode == "mavlink":
-            param_lines.append("param set UXRCE_DDS_CFG 0")
-            extras_lines = [ifup_cmd, ifconfig_cmd]
-        else:
-            param_lines.extend(
-                (
-                    "param set UXRCE_DDS_CFG 1000",
-                    f"param set UXRCE_DDS_KEY {dds_key}",
-                    f"param set UXRCE_DDS_DOM_ID {self.domain_spin.value()}",
-                    f"param set UXRCE_DDS_AG_IP {host_ip_int}",
-                    f"param set UXRCE_DDS_PRT {self.uxrce_port_spin.value()}",
-                    "param set UXRCE_DDS_PTCFG 0",
-                    "param set UXRCE_DDS_SYNCC 0",
-                    "param set UXRCE_DDS_SYNCT 1",
-                )
-            )
-            extras_lines = [ifup_cmd, ifconfig_cmd, uxrce_stop_cmd, uxrce_start_cmd]
-            if mode == "dual":
-                extras_lines.extend((mavlink_stop_cmd, mavlink_start_cmd))
-        if mode == "mavlink":
-            # PX4 starts the Ethernet MAVLink instance from MAV_2_CONFIG after reboot.
-            # Do not add a second manual instance to extras.txt.
-            pass
+        # Workstation owns only the Ethernet MAVLink path. PX4 starts the
+        # configured MAVLink instance from MAV_2_CONFIG after reboot; extras
+        # only brings the network interface up and assigns its static address.
+        param_lines = ["param set MAV_2_CONFIG 1000"]
+        extras_lines = [ifup_cmd, ifconfig_cmd]
         return {
             "eth_ip": eth_ip,
             "host_ip": host_ip,
             "ifup_cmd": ifup_cmd,
             "ifconfig_cmd": ifconfig_cmd,
-            "uxrce_stop_cmd": uxrce_stop_cmd,
-            "uxrce_start_cmd": uxrce_start_cmd,
             "mavlink_stop_cmd": mavlink_stop_cmd,
             "mavlink_start_cmd": mavlink_start_cmd,
-            "mode": mode,
             "param_lines": param_lines,
             "extras_lines": extras_lines,
         }
@@ -15996,13 +16181,207 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.mavlink_pixhawk is None:
             self._log(f"[픽스호크] {camera_label_ko(camera)} PX4 Shell 명령 실패: MAVLink 연결이 없습니다.")
             return
-        try:
-            self.mavlink_pixhawk.send_shell_command(camera, command)
-        except Exception as exc:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} PX4 Shell 명령 실패: {exc}")
-            dialog = self.px4_shell_dialogs.get(camera)
-            if dialog is not None:
-                dialog.append_output(f"\n[error] {exc}\n")
+        self._start_pixhawk_shell_worker(camera, command)
+
+    def _start_pixhawk_shell_worker(
+        self,
+        camera: str,
+        command: str,
+        *,
+        operation: str = "shell",
+        timeout_s: float = 2.0,
+        on_complete=None,
+    ) -> bool:
+        if self.mavlink_pixhawk is None or camera not in self._mavlink_open_sides():
+            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령 실패: 연결이 없습니다.")
+            return False
+        if camera in self.pixhawk_shell_threads:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
+            return False
+        thread = QtCore.QThread(self)
+        worker = PixhawkShellCommandWorker(
+            self.mavlink_pixhawk,
+            camera=camera,
+            command=command,
+            operation=operation,
+            timeout_s=timeout_s,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda result, camera=camera, callback=on_complete: self._apply_pixhawk_shell_worker_result(
+                camera, result, callback
+            )
+        )
+        worker.failed.connect(
+            lambda error, camera=camera: self._pixhawk_shell_worker_failed(camera, error)
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda camera=camera, thread=thread: self._clear_pixhawk_shell_worker(camera, thread))
+        self.pixhawk_shell_threads[camera] = thread
+        self.pixhawk_shell_workers[camera] = worker
+        thread.start()
+        return True
+
+    def _apply_pixhawk_shell_worker_result(self, camera: str, result: object, callback=None) -> None:
+        data = dict(result or {})
+        output = str(data.get("output") or "")
+        if output:
+            self._append_px4_shell_output(camera, output)
+        operation = str(data.get("operation") or "shell")
+        command = str(data.get("command") or "")
+        if operation == "reboot":
+            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 전송했습니다.")
+        else:
+            flag = str(data.get("flag_label") or "")
+            suffix = f" ({flag})" if flag else ""
+            self._log(f"[픽스호크] {camera_label_ko(camera)} PX4 Shell 명령 완료{suffix}: {command}")
+        if callable(callback):
+            callback(data)
+
+    def _pixhawk_shell_worker_failed(self, camera: str, error: str) -> None:
+        message = f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령 실패: {error}"
+        self._log(message)
+        dialog = self.px4_shell_dialogs.get(camera)
+        if dialog is not None:
+            dialog.append_output(f"\n[error] {error}\n")
+
+    def _clear_pixhawk_shell_worker(self, camera: str, thread: QtCore.QThread) -> None:
+        if self.pixhawk_shell_threads.get(camera) is thread:
+            self.pixhawk_shell_threads.pop(camera, None)
+            self.pixhawk_shell_workers.pop(camera, None)
+
+    def _start_pixhawk_parameter_worker(
+        self,
+        camera: str,
+        operation: str,
+        *,
+        priorities: dict[str, int] | None = None,
+    ) -> bool:
+        subscriber = self.mavlink_pixhawk
+        if subscriber is None or camera not in self._mavlink_open_sides():
+            self._log(f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패: MAVLink 연결이 없습니다.")
+            return False
+        if camera in self.pixhawk_parameter_threads:
+            self._log(f"[픽스호크] {camera_label_ko(camera)} PARAM 작업이 이미 진행 중입니다.")
+            return False
+        manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
+        actual_selected = self.latest_vehicle_mag_device_ids.get(camera)
+        armed = bool(getattr(manager, "armed", False))
+        thread = QtCore.QThread(self)
+        worker = PixhawkParameterWorker(
+            subscriber,
+            camera=camera,
+            operation=operation,
+            actual_selected_device_id=actual_selected,
+            armed=armed,
+            priorities=priorities,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self._apply_pixhawk_parameter_worker_result)
+        worker.failed.connect(
+            lambda error, camera=camera, operation=operation: self._pixhawk_parameter_worker_failed(
+                camera, operation, error
+            )
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda camera=camera, thread=thread: self._clear_pixhawk_parameter_worker(camera, thread)
+        )
+        self.pixhawk_parameter_threads[camera] = thread
+        self.pixhawk_parameter_workers[camera] = worker
+        self._set_px4_mag_manager_button_state(
+            camera,
+            refresh_enabled=False,
+            actions_enabled=False,
+            tooltip="MAVLink PARAM 작업 중",
+        )
+        thread.start()
+        return True
+
+    def _apply_pixhawk_parameter_worker_result(self, result: object) -> None:
+        data = dict(result or {})
+        kind = str(data.get("kind") or "")
+        status = data.get("status")
+        camera = ""
+        if hasattr(status, "actual_selected_device_id"):
+            camera = next(
+                (
+                    side
+                    for side in ("left", "right")
+                    if self.latest_vehicle_mag_device_ids.get(side)
+                    == getattr(status, "actual_selected_device_id", None)
+                    and side in self.pixhawk_parameter_threads
+                ),
+                "",
+            )
+        camera = str(data.get("camera") or camera)
+        # The worker payload is intentionally allowed to carry the side
+        # explicitly; older fake workers may only return a status object.
+        if not camera:
+            for side, worker in self.pixhawk_parameter_workers.items():
+                if worker.operation == kind:
+                    camera = side
+                    break
+        if not camera or status is None:
+            return
+        if kind in {"mag_refresh", "mag_apply"}:
+            manager = self.px4_mag_managers.get(camera)
+            if manager is not None:
+                manager.actual_selected_device_id = getattr(status, "actual_selected_device_id", None)
+                manager.armed = bool(getattr(status, "armed", False))
+            self._render_px4_mag_status(camera, status)
+            applied = tuple(str(item) for item in data.get("applied") or ())
+            missing = tuple(str(item) for item in data.get("missing") or ())
+            if kind == "mag_apply":
+                self._log(
+                    f"[PX4 MAG] {self._px4_mag_camera_label(camera)} Workstation PARAM 적용: "
+                    f"{', '.join(applied) or 'none'}"
+                )
+                if missing:
+                    self._log(
+                        f"[PX4 MAG] {self._px4_mag_camera_label(camera)} 미적용 role: {', '.join(missing)}"
+                    )
+        elif kind == "attitude_refresh":
+            self._render_px4_attitude_cal_status(camera, status, using_real_params=True)
+
+    def _pixhawk_parameter_worker_failed(self, camera: str, operation: str, error: str) -> None:
+        self._log(
+            f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패 ({operation}): {error}"
+        )
+        if operation == "mag_refresh" or operation == "mag_apply":
+            self._set_px4_mag_manager_button_state(
+                camera,
+                refresh_enabled=True,
+                actions_enabled=True,
+                tooltip="",
+            )
+        elif operation == "attitude_refresh":
+            button = self.px4_attitude_cal_refresh_buttons.get(camera)
+            if button is not None:
+                button.setEnabled(True)
+
+    def _clear_pixhawk_parameter_worker(self, camera: str, thread: QtCore.QThread) -> None:
+        if self.pixhawk_parameter_threads.get(camera) is not thread:
+            return
+        self.pixhawk_parameter_threads.pop(camera, None)
+        self.pixhawk_parameter_workers.pop(camera, None)
+        manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
+        armed = bool(getattr(manager, "armed", False))
+        self._set_px4_mag_manager_button_state(
+            camera,
+            refresh_enabled=True,
+            actions_enabled=not armed,
+            tooltip="Disarm required" if armed else "",
+        )
+        button = self.px4_attitude_cal_refresh_buttons.get(camera) if hasattr(self, "px4_attitude_cal_refresh_buttons") else None
+        if button is not None:
+            button.setEnabled(True)
 
     def _px4_mag_camera_label(self, camera: str) -> str:
         return "Pixhawk 1" if camera == "left" else "Pixhawk 2"
@@ -16011,10 +16390,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.latest_vehicle_mag_device_ids.get(camera) is not None:
             return True
         return camera in self._mavlink_connected_sides()
-
-    def _ros2_raw_mag_slots_seen(self, camera: str) -> list[str]:
-        states = self.latest_mag_sensors.get(camera, {})
-        return sorted(slot for slot in states if slot != "SELECTED")
 
     def _sync_px4_mag_manager_store(self, camera: str) -> bool:
         manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
@@ -16065,34 +16440,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if table is not None:
             table.setRowCount(0)
         if status_label is not None:
-            if self._ros2_only_unavailable(camera, "MAG"):
-                status_label.setText(
-                    f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: ROS2 MAG topic 미게시\n"
-                    "/fmu/out/sensor_mag 또는 /fmu/out/vehicle_magnetometer가 publish되면 실제 MAG device_id가 표시됩니다."
-                )
-            else:
-                status_label.setText(
-                    f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: 프로토콜 수신 대기 중\n"
-                    "물리 연결과 별개로 MAVLink/ROS2에서 실제 MAG device_id를 수신하면 관리 내용이 표시됩니다."
-                )
-            raw_slots = self._ros2_raw_mag_slots_seen(camera)
-            if raw_slots and self.latest_vehicle_mag_device_ids.get(camera) is None:
-                status_label.setText(
-                    f"{self._px4_mag_camera_label(camera)} | ROS2 raw MAG 수신 중: {', '.join(raw_slots)}\n"
-                    "selected MAG /fmu/out/vehicle_magnetometer device_id 수신 대기 중입니다. "
-                    "CAL_MAG priority readback은 MAVLink PARAM 연결이 필요합니다."
-                )
+            status_label.setText(
+                f"{self._px4_mag_camera_label(camera)} | 픽스호크 MAG 관리: MAVLink 수신 대기 중\n"
+                "MAVLink에서 실제 MAG device_id를 수신하면 관리 내용이 표시됩니다."
+            )
         self._set_px4_mag_manager_button_state(
             camera,
             refresh_enabled=False,
             actions_enabled=False,
-            tooltip="MAVLink/ROS2 MAG 수신 후 사용 가능",
+            tooltip="MAVLink MAG 수신 후 사용 가능",
         )
 
     def _clear_px4_mag_manager_connection_state(self, camera: str | None = None) -> None:
         sides = ("left", "right") if camera is None else (camera,)
         for side in sides:
             self.latest_vehicle_mag_device_ids[side] = None
+            self._px4_mag_status_cache.pop(side, None)
             self._clear_px4_mag_manager_ui(side)
 
     def _render_px4_mag_mavlink_pending_status(self, camera: str) -> None:
@@ -16127,11 +16490,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if using_real_params and not read_params:
                 self._render_px4_mag_mavlink_pending_status(side)
                 continue
+            if using_real_params and read_params:
+                self._start_pixhawk_parameter_worker(side, "mag_refresh")
+                continue
             status = manager.refresh()
             if using_real_params:
                 self._render_px4_mag_status(side, status)
             else:
-                self._render_px4_mag_ros2_only_status(side, status)
+                self._render_px4_mag_mavlink_pending_status(side)
             self._record_px4_mag_status_snapshot(side)
 
     def _sync_px4_attitude_cal_store(self, camera: str) -> bool:
@@ -16240,6 +16606,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if using_real_params and not read_params:
                 self._render_px4_attitude_cal_pending_status(side)
                 continue
+            if using_real_params and read_params:
+                self._start_pixhawk_parameter_worker(side, "attitude_refresh")
+                continue
             status = manager.refresh()
             self._render_px4_attitude_cal_status(side, status, using_real_params=using_real_params)
 
@@ -16260,7 +16629,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         manager = self.px4_mag_managers[camera]
         label = self._px4_mag_camera_label(camera)
         if not self._px4_mag_manager_has_data_source(camera):
-            self._log(f"[PX4 MAG] {label} 수동 Priority 적용 차단: MAVLink/ROS2 MAG 수신 없음")
+            self._log(f"[PX4 MAG] {label} 수동 Priority 적용 차단: MAVLink MAG 수신 없음")
             self._clear_px4_mag_manager_ui(camera)
             return
         if manager.armed:
@@ -16271,12 +16640,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not using_mavlink_params:
             self._log(
                 f"[PX4 MAG] {label} 수동 Priority 적용 차단: "
-                "ROS2는 PX4 파라미터 쓰기를 지원하지 않습니다. MAVLink 연결 후 다시 시도하세요."
+                "MAVLink PARAM 연결 후 다시 시도하세요."
             )
             self.refresh_px4_mag_manager(camera, read_params=True)
             return
         spins = self.px4_mag_priority_spins.get(camera, {})
         desired = {role: int(spin.value()) for role, spin in spins.items()}
+        if using_mavlink_params:
+            if self._start_pixhawk_parameter_worker(
+                camera,
+                "mag_apply",
+                priorities=desired,
+            ):
+                return
+            self._log(f"[PX4 MAG] {label} 수동 Priority 적용이 이미 진행 중입니다.")
+            return
         try:
             status = manager.refresh()
             applied: list[str] = []
@@ -16305,19 +16683,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         manager = self.px4_mag_managers[camera]
         label = self._px4_mag_camera_label(camera)
         if not self._px4_mag_manager_has_data_source(camera):
-            self._log(f"[PX4 MAG] {label} param save 차단: MAVLink/ROS2 MAG 수신 없음")
+            self._log(f"[PX4 MAG] {label} param save 차단: MAVLink MAG 수신 없음")
             self._clear_px4_mag_manager_ui(camera)
             return
         if manager.armed:
             self._log(f"[PX4 MAG] {label} param save 차단: Disarm required")
         else:
             if self.mavlink_pixhawk is not None and camera in self._mavlink_connected_sides():
-                try:
-                    self.mavlink_pixhawk.send_shell_command(camera, "param save")
-                except Exception as exc:
-                    self._log(f"[PX4 MAG] {label} param save 명령 실패: {exc}")
-                else:
-                    self._log(f"[PX4 MAG] {label} MAVLink PX4 shell로 `param save` 명령을 전송했습니다.")
+                if self._start_pixhawk_shell_worker(
+                    camera,
+                    "param save",
+                    timeout_s=2.0,
+                    on_complete=lambda _result, camera=camera: self._start_pixhawk_parameter_worker(
+                        camera, "mag_refresh"
+                    ),
+                ):
+                    return
             else:
                 self._log(f"[PX4 MAG] {label} QGC 또는 PX4 shell에서 `param save` 후 reboot 필요")
         self.refresh_px4_mag_manager(camera, read_params=True)
@@ -16326,7 +16707,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         manager = self.px4_mag_managers[camera]
         label = self._px4_mag_camera_label(camera)
         if not self._px4_mag_manager_has_data_source(camera):
-            self._log(f"[PX4 MAG] {label} reboot 차단: MAVLink/ROS2 MAG 수신 없음")
+            self._log(f"[PX4 MAG] {label} reboot 차단: MAVLink MAG 수신 없음")
             self._clear_px4_mag_manager_ui(camera)
             return
         if manager.armed:
@@ -16345,17 +16726,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.No,
         )
         if result == QtWidgets.QMessageBox.Yes:
-            try:
-                self.mavlink_pixhawk.reboot_autopilot(camera)
-            except Exception as exc:
-                self._log(f"[PX4 MAG] {label} MAVLink 재부팅 명령 실패: {exc}")
-            else:
-                self._log(f"[PX4 MAG] {label} MAVLink 재부팅 명령을 전송했습니다.")
+            self._start_pixhawk_shell_worker(
+                camera,
+                "MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN",
+                operation="reboot",
+                timeout_s=1.0,
+            )
         else:
             self._log(f"[PX4 MAG] {label} MAVLink 재부팅 명령을 취소했습니다.")
         self.refresh_px4_mag_manager(camera)
 
     def _render_px4_mag_status(self, camera: str, status) -> None:
+        self._px4_mag_status_cache[camera] = status
         if not hasattr(self, "px4_mag_tables"):
             return
         table = self.px4_mag_tables.get(camera)
@@ -16411,31 +16793,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             tooltip="Disarm required" if disable_actions else "",
         )
 
-    def _render_px4_mag_ros2_only_status(self, camera: str, status) -> None:
-        if not hasattr(self, "px4_mag_tables"):
-            return
-        table = self.px4_mag_tables.get(camera)
-        status_label = self.px4_mag_status_labels.get(camera)
-        if table is not None:
-            table.setRowCount(0)
-        if status_label is not None:
-            actual = status.actual_selected_device_id
-            label = self._px4_mag_camera_label(camera)
-            raw_slots = self._ros2_raw_mag_slots_seen(camera)
-            raw_text = "없음" if not raw_slots else ", ".join(raw_slots)
-            status_label.setText(
-                f"{label} | Actual selected MAG: {'N/A' if actual is None else actual} (ROS2 vehicle_magnetometer)\n"
-                "CAL_MAG slot/priority: N/A - ROS2-only에서는 PX4 PARAM readback이 불가합니다. "
-                "실제 CAL_MAG*_PRIO 확인/적용은 MAVLink 연결 또는 QGC/PX4 shell이 필요합니다.\n"
-                f"ROS2 raw MAG slots: {raw_text}"
-            )
-        self._set_px4_mag_manager_button_state(
-            camera,
-            refresh_enabled=True,
-            actions_enabled=False,
-            tooltip="CAL_MAG priority readback/apply requires MAVLink PARAM connection",
-        )
-
     def _append_px4_shell_output(self, camera: str, text: str) -> None:
         self._handle_eth0_probe_output(camera, text)
         dialog = self.px4_shell_dialogs.get(camera)
@@ -16454,12 +16811,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._eth0_probe_tokens[camera] = token
             self._eth0_probe_buffers[camera] = ""
             label = camera_label_ko(camera)
-            try:
-                self.mavlink_pixhawk.send_shell_command(camera, "ifconfig eth0")
-            except Exception as exc:
+            if not self._start_pixhawk_shell_worker(camera, "ifconfig eth0", timeout_s=2.0):
                 self._eth0_probe_tokens.pop(camera, None)
                 self._eth0_probe_buffers.pop(camera, None)
-                self._log(f"[픽스호크] {label} 실제 eth0 확인 실패: PX4 shell 명령 전송 실패 ({exc})")
                 continue
             configured_ip = (
                 self.left_pixhawk_eth_ip_edit.text().strip()
@@ -16507,105 +16861,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._eth0_probe_tokens.pop(camera, None)
         self._eth0_probe_buffers.pop(camera, None)
 
-    def _validated_pixhawk_host_ip_for_manual_uxrce(self, camera: str) -> str:
+    def _pixhawk_host_ip_for_mavlink(self, *, extra_hints: Sequence[str] = ()) -> str:
         text = self.pixhawk_host_address_edit.text().strip()
         if "/" in text:
             text = text.split("/", 1)[0]
         if not text:
-            raise ValueError("Pixhawk Host IP가 비어 있습니다. PC IP 탐색 후 PC_IP 후보를 명시적으로 적용하세요.")
+            raise ValueError("Pixhawk Host IP가 비어 있어 Ethernet MAVLink를 시작할 수 없습니다.")
         try:
-            host_ip = IPv4Address(text)
+            IPv4Address(text)
         except ValueError as exc:
             raise ValueError(f"Pixhawk Host IP 형식이 올바르지 않습니다: {text}") from exc
-        interfaces = local_ipv4_interfaces(include_wireless=True)
-        matching = [candidate for candidate in interfaces if candidate.address.ip == host_ip]
-        if not matching:
-            available = ", ".join(f"{candidate.name}={candidate.address}" for candidate in interfaces) or "none"
-            raise ValueError(
-                f"Pixhawk Host IP가 현재 PC 주소가 아닙니다: {text}. 사용 가능한 IPv4={available}"
-            )
-        interface_name = str(getattr(matching[0], "name", ""))
-        if interface_name.startswith(("wl", "wlan")):
-            self._log(
-                f"[픽스호크] 경고: Pixhawk Host IP {host_ip}는 Wi-Fi 인터페이스({interface_name})입니다. "
-                "Pixhawk가 유선 ETH로 연결되어 있으면 ROS2/uXRCE가 붙지 않을 수 있습니다."
-            )
-        pixhawk_ip_text = (
-            self.left_pixhawk_eth_ip_edit.text().strip()
-            if camera == "left"
-            else self.right_pixhawk_eth_ip_edit.text().strip()
-        )
-        if pixhawk_ip_text:
-            try:
-                pixhawk_ip = IPv4Address(pixhawk_ip_text.split("/", 1)[0])
-            except ValueError:
-                pixhawk_ip = None
-            if pixhawk_ip is not None and not any(pixhawk_ip in candidate.address.network for candidate in matching):
-                self._log(
-                    f"[픽스호크] 경고: {camera_label_ko(camera)} Pixhawk ETH IP {pixhawk_ip}와 "
-                    f"Pixhawk Host IP {host_ip}가 같은 PC 인터페이스 subnet에 없습니다."
-                )
-        return str(host_ip)
-
-    def _pixhawk_host_ip_for_uxrce(self, *, extra_hints: Sequence[str] = ()) -> str:
-        text = self.pixhawk_host_address_edit.text().strip()
-        if "/" in text:
-            text = text.split("/", 1)[0]
-        if not text:
-            raise ValueError("Pixhawk Host IP가 비어 있어 uXRCE-DDS client를 시작할 수 없습니다.")
-        try:
-            current_ip = IPv4Address(text)
-        except ValueError as exc:
-            raise ValueError(f"Pixhawk Host IP 형식이 올바르지 않습니다: {text}") from exc
-        interfaces = local_ipv4_interfaces(include_wireless=True)
-        local_ips = {candidate.address.ip for candidate in interfaces}
-        if current_ip in local_ips and not extra_hints:
-            return text
-        selected = self._select_pixhawk_host_interface(interfaces, extra_hints=extra_hints)
-        if current_ip in local_ips and selected is not None and selected.address.ip == current_ip:
-            return text
-        if selected is None:
-            available = ", ".join(f"{candidate.name}={candidate.address}" for candidate in interfaces) or "none"
-            raise ValueError(
-                f"Pixhawk Host IP가 현재 PC 주소가 아닙니다: {text}. 사용 가능한 IPv4={available}"
-            )
-        host_ip = str(selected.address.ip)
-        self.pixhawk_host_address_edit.setText(host_ip)
-        self._log(
-            f"[픽스호크] Host IP 자동 보정: {text} -> {host_ip} "
-            f"({selected.name}, {selected.address.network})"
-        )
-        return host_ip
-
-    def _select_pixhawk_host_interface(
-        self,
-        interfaces: Sequence[object],
-        *,
-        extra_hints: Sequence[str] = (),
-    ) -> object | None:
-        hints: list[IPv4Address] = []
-        for text in extra_hints:
-            try:
-                hints.append(IPv4Address(str(text).split("/", 1)[0]))
-            except ValueError:
-                continue
-        for edit in (self.left_pixhawk_eth_ip_edit, self.right_pixhawk_eth_ip_edit):
-            text = edit.text().strip()
-            if not text:
-                continue
-            try:
-                hints.append(IPv4Address(text.split("/", 1)[0]))
-            except ValueError:
-                continue
-        for hint in hints:
-            for candidate in interfaces:
-                if hint in candidate.address.network:
-                    return candidate
-        if not interfaces:
-            return None
-        camera_network = IPv4Address(DEFAULT_HOST_ADDRESS.split("/", 1)[0])
-        non_camera = [candidate for candidate in interfaces if camera_network not in candidate.address.network]
-        return non_camera[0] if non_camera else interfaces[0]
+        # Host-interface discovery is an explicit asynchronous Workstation
+        # command.  Do not rescan NetworkManager from a PX4 command handler;
+        # the selected candidate is already the operator's input here.
+        return text
 
     def _active_mavlink_remote_hosts(self) -> tuple[str, ...]:
         hosts: list[str] = []
@@ -16717,32 +16986,65 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._control_port_spin_for_camera(camera).setValue(int(port))
 
     def send_zoom(self, target: str, action: str) -> None:
+        if self.wiris_zoom_thread is not None:
+            self._log("[카메라] 줌 명령이 이미 진행 중입니다.")
+            return
         command_text = self.zoom_command_text(action)
         level = self.zoom_level_spin.value() if action == "set" else None
-        statuses = []
-        for label, host in self.zoom_hosts(target):
-            try:
-                command = build_zoom_command(
-                    host=host,
-                    port=self._control_port_for_camera(label),
-                    template=command_text,
-                    level=level,
-                    timeout_s=self.zoom_timeout_spin.value(),
-                )
-                response = send_tcp_line(command)
-            except Exception as exc:
-                statuses.append(f"{self._camera_name_ko(label)}: 실패: {exc}")
+        targets = [
+            (label, host, self._control_port_for_camera(label))
+            for label, host in self.zoom_hosts(target)
+        ]
+        self.zoom_status_label.setText("Zoom command: sending...")
+        self.wiris_zoom_thread = QtCore.QThread(self)
+        self.wiris_zoom_worker = WirisZoomWorker(
+            targets,
+            template=command_text,
+            level=level,
+            timeout_s=self.zoom_timeout_spin.value(),
+        )
+        self.wiris_zoom_worker.moveToThread(self.wiris_zoom_thread)
+        self.wiris_zoom_thread.started.connect(self.wiris_zoom_worker.run)
+        self.wiris_zoom_worker.completed.connect(
+            lambda statuses, target=target, action=action: self._apply_wiris_zoom_result(
+                target, action, statuses
+            )
+        )
+        self.wiris_zoom_worker.failed.connect(self._wiris_zoom_failed)
+        self.wiris_zoom_worker.finished.connect(self.wiris_zoom_thread.quit)
+        self.wiris_zoom_worker.finished.connect(self.wiris_zoom_worker.deleteLater)
+        self.wiris_zoom_thread.finished.connect(self.wiris_zoom_thread.deleteLater)
+        self.wiris_zoom_thread.finished.connect(self._clear_wiris_zoom_worker)
+        self.wiris_zoom_thread.start()
+
+    def _apply_wiris_zoom_result(self, target: str, action: str, result: object) -> None:
+        statuses: list[str] = []
+        for item in list(result or []):
+            if not isinstance(item, dict):
                 continue
-            suffix = f" 응답={response}" if response else " 전송됨"
-            statuses.append(f"{self._camera_name_ko(label)}: {command.command}{suffix}")
+            label = str(item.get("label") or "")
+            if item.get("state") == "sent":
+                response = str(item.get("response") or "")
+                suffix = f" 응답={response}" if response else " 전송됨"
+                statuses.append(f"{self._camera_name_ko(label)}: {item.get('command', '')}{suffix}")
+            else:
+                statuses.append(f"{self._camera_name_ko(label)}: 실패: {item.get('detail', 'unknown')}")
         status_text = " | ".join(statuses)
         self.zoom_status_label.setText(status_text)
         self._log(f"[카메라] 줌 명령 target={target}, action={action}: {status_text}")
 
+    def _wiris_zoom_failed(self, error: str) -> None:
+        self.zoom_status_label.setText(f"Zoom command: failed ({error})")
+        self._log(f"[카메라] 줌 명령 실패: {error}")
+
+    def _clear_wiris_zoom_worker(self) -> None:
+        self.wiris_zoom_thread = None
+        self.wiris_zoom_worker = None
+
     # Workstation advanced-tool bridges.  The methods below are deliberately
     # small: they validate the public arguments, then hand control back to
     # the existing panel widgets/managers.  They do not create a second
-    # camera, Pixhawk, ROS2 subscriber, preview worker, or session writer.
+    # camera, Pixhawk, preview worker, or session writer.
     def workstation_wiris_command_catalog(self) -> tuple[dict[str, str], ...]:
         return tuple(
             {
@@ -16783,56 +17085,44 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.zoom_level_spin.setValue(int(level))
         self.send_zoom(target, action)
 
-    def workstation_discover_custom_topic_watch(self) -> None:
-        self.discover_custom_topic_watch()
-
     def workstation_discover_custom_mavlink_watch(self) -> None:
         self.discover_custom_mavlink_watch()
 
-    def workstation_add_custom_topic_watch(self, name: str, topic: str, field: str) -> str:
-        topic = str(topic or "").strip()
+    def workstation_add_custom_mavlink_watch(self, name: str, message: str, field: str) -> str:
+        message = str(message or "").strip().upper()
         field = str(field or "").strip()
-        name = str(name or "").strip() or f"{topic}.{field}"
-        if not topic or not field:
-            raise ValueError("ROS2 custom watch requires topic and field")
-        self._add_custom_topic_watch(key=name, topic=topic, field=field, source="ros2")
-        self._log(f"[픽스호크] Workstation Custom watch 추가: {name} = {topic}.{field}")
+        name = str(name or "").strip() or f"mavlink:{message}.{field}"
+        if not message or not field:
+            raise ValueError("MAVLink custom watch requires message and field")
+        self._add_custom_mavlink_watch(
+            key=name,
+            topic=message,
+            field=field,
+            message=message,
+        )
+        self._log(f"[픽스호크] Workstation MAVLink watch 추가: {name} = {message}.{field}")
         return name
 
-    def workstation_remove_custom_topic_watch(self, key: str) -> None:
+    def workstation_remove_custom_mavlink_watch(self, key: str) -> None:
         key = str(key or "").strip()
         if not key:
             raise ValueError("custom watch key is empty")
-        self.remove_custom_topic_watch(key)
-
-    @staticmethod
-    def _workstation_table_rows(table: QtWidgets.QTableWidget) -> tuple[tuple[str, ...], ...]:
-        rows: list[tuple[str, ...]] = []
-        for row in range(table.rowCount()):
-            values = []
-            for column in range(table.columnCount()):
-                item = table.item(row, column)
-                values.append("" if item is None else item.text())
-            rows.append(tuple(values))
-        return tuple(rows)
+        self.remove_custom_mavlink_watch(key)
 
     def workstation_refresh_baseline_field_browser(self) -> dict[str, object]:
-        self.refresh_baseline_field_browser()
-        ros2_table = getattr(self, "baseline_ros2_topic_table", None)
-        mavlink_table = getattr(self, "baseline_mavlink_message_table", None)
+        mavlink_rows = tuple(
+            (
+                str(item.get("name") or ""),
+                ", ".join(mavlink_graphable_fields_for_message(str(item.get("name") or ""))),
+            )
+            for item in discover_mavlink_messages()
+            if str(item.get("name") or "")
+        )
         return {
-            "ros2_topics": () if ros2_table is None else self._workstation_table_rows(ros2_table),
-            "mavlink_messages": () if mavlink_table is None else self._workstation_table_rows(mavlink_table),
-            "ros2_headers": ("priority", "topic", "type"),
+            "mavlink_messages": mavlink_rows,
             "mavlink_headers": ("message", "fields"),
             "axis_contract": "GPS/RTK source fields remain producer-labelled; no NED/ENU/camera-frame conversion",
         }
-
-    def workstation_describe_baseline_fields(self, topic_type: str) -> tuple[str, ...]:
-        topic_type = str(topic_type or "").strip()
-        if not topic_type:
-            return ()
-        return tuple(str(field) for field in describe_ros2_message_fields(topic_type))
 
     def workstation_open_px4_shell(self, camera: str) -> None:
         camera = str(camera or "")
@@ -16844,12 +17134,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         camera = str(camera or "")
         if camera not in {"left", "right"}:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
+        if read_params and self._start_pixhawk_parameter_worker(camera, "mag_refresh"):
+            return
         self.refresh_px4_mag_manager(camera, read_params=bool(read_params))
 
     def workstation_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> None:
         camera = str(camera or "")
         if camera not in {"left", "right"}:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
+        if read_params and self._start_pixhawk_parameter_worker(camera, "attitude_refresh"):
+            return
         self.refresh_px4_attitude_cal_status(camera, read_params=bool(read_params))
 
     def workstation_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> None:
@@ -16862,19 +17156,54 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if spin is None:
                 raise ValueError(f"Unknown PX4 MAG role: {role}")
             spin.setValue(int(value))
+        if self._start_pixhawk_parameter_worker(
+            camera,
+            "mag_apply",
+            priorities={str(role): int(value) for role, value in dict(priorities).items()},
+        ):
+            return
         self.apply_manual_mag_priorities_from_panel(camera)
 
     def workstation_save_px4_mag_params(self, camera: str) -> None:
         camera = str(camera or "")
         if camera not in {"left", "right"}:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
-        self.save_px4_mag_params_from_panel(camera)
+        self._start_pixhawk_shell_worker(
+            camera,
+            "param save",
+            timeout_s=2.0,
+            on_complete=lambda _result, camera=camera: self._start_pixhawk_parameter_worker(
+                camera, "mag_refresh"
+            ),
+        )
 
     def workstation_reboot_px4(self, camera: str) -> None:
         camera = str(camera or "")
         if camera not in {"left", "right"}:
             raise ValueError(f"Unknown Pixhawk side: {camera}")
-        self.reboot_px4_from_panel(camera)
+        manager = self.px4_mag_managers.get(camera)
+        if manager is None or manager.armed:
+            self._log(f"[PX4 MAG] {self._px4_mag_camera_label(camera)} 재부팅 차단: Disarm required")
+            return
+        if self.mavlink_pixhawk is None or camera not in self._mavlink_open_sides():
+            self._log(f"[PX4 MAG] {self._px4_mag_camera_label(camera)} 재부팅 차단: MAVLink 연결 없음")
+            return
+        result = QtWidgets.QMessageBox.question(
+            self,
+            f"Reboot {self._px4_mag_camera_label(camera)}",
+            f"{self._px4_mag_camera_label(camera)} Pixhawk에 MAVLink 재부팅 명령을 보냅니다.\n계속할까요?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self._log(f"[PX4 MAG] {self._px4_mag_camera_label(camera)} 재부팅을 취소했습니다.")
+            return
+        self._start_pixhawk_shell_worker(
+            camera,
+            "MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN",
+            operation="reboot",
+            timeout_s=1.0,
+        )
 
     def workstation_refresh_calibration_preview(self) -> dict[str, object]:
         self._workstation_calibration_preview_active = True
@@ -16941,6 +17270,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             else:
                 target = str(self.wiris_command_target_combo.currentData() or "both")
         target = str(target or "both")
+        if self.wiris_time_sync_thread is not None:
+            self._log("[카메라] WIRIS RTC PC UTC 설정이 이미 진행 중입니다.")
+            return
         target_infos = [
             (label, host, self._control_port_for_camera(label), self.zoom_timeout_spin.value())
             for label, host in self.zoom_hosts(target)
@@ -16951,102 +17283,85 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             if hasattr(self, "clock_sync_status_label"):
                 self.clock_sync_status_label.setText(status_text)
             return
+        self.wiris_set_pc_time_button.setEnabled(False)
+        self.wiris_command_status_label.setText("PC UTC 설정: sending...")
+        if hasattr(self, "clock_sync_status_label"):
+            self.clock_sync_status_label.setText("PC UTC 설정: sending...")
+        self.wiris_time_sync_thread = QtCore.QThread(self)
+        self.wiris_time_sync_worker = WirisClockCommandWorker(
+            target_infos,
+            command_text="STUS",
+            shared_utc=True,
+        )
+        self.wiris_time_sync_worker.moveToThread(self.wiris_time_sync_thread)
+        self.wiris_time_sync_thread.started.connect(self.wiris_time_sync_worker.run)
+        self.wiris_time_sync_worker.completed.connect(
+            lambda result, target=target, target_infos=target_infos: self._apply_wiris_time_sync_result(
+                target, target_infos, result
+            )
+        )
+        self.wiris_time_sync_worker.failed.connect(self._wiris_time_sync_failed)
+        self.wiris_time_sync_worker.finished.connect(self.wiris_time_sync_thread.quit)
+        self.wiris_time_sync_worker.finished.connect(self.wiris_time_sync_worker.deleteLater)
+        self.wiris_time_sync_thread.finished.connect(self.wiris_time_sync_thread.deleteLater)
+        self.wiris_time_sync_thread.finished.connect(self._clear_wiris_time_sync_worker)
+        self.wiris_time_sync_thread.start()
 
-        statuses: dict[str, str] = {}
-        send_times: dict[str, float] = {}
-        tcp_start_times: dict[str, float] = {}
-        command_logs: dict[str, str] = {}
-        shared_command_time_s: dict[str, float] = {}
-
-        def capture_shared_command_time() -> None:
-            shared_command_time_s["unix"] = time.time()
-
-        barrier = (
-            threading.Barrier(len(target_infos), action=capture_shared_command_time)
-            if len(target_infos) >= 2
+    def _apply_wiris_time_sync_result(
+        self,
+        target: str,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        result: object,
+    ) -> None:
+        data = dict(result or {})
+        results = dict(data.get("results") or {})
+        statuses = {label: str(dict(results.get(label) or {}).get("response") or "") for label, *_ in target_infos}
+        for label, _host, port, _timeout_s in target_infos:
+            row = dict(results.get(label) or {})
+            response = statuses.get(label, "")
+            command = str(row.get("command") or "STUS")
+            requested_utc_s = data.get("requested_utc_s")
+            utc_text = ""
+            if requested_utc_s is not None:
+                utc_text = datetime.fromtimestamp(float(requested_utc_s), tz=timezone.utc).isoformat(timespec="microseconds")
+            utc_suffix = f" [pc_utc={utc_text.replace('+00:00', 'Z')}]" if utc_text else ""
+            self._append_wiris_command_log(
+                f"> {self._camera_name_ko(label)} {row.get('host', '')}:{port} {command}"
+                f"{utc_suffix}\n{response}\n"
+            )
+        command_times = dict(data.get("command_times") or {})
+        tcp_start_times = dict(data.get("tcp_start_times") or {})
+        ordered_command_times = [
+            (label, float(command_times[label]))
+            for label, *_ in target_infos
+            if label in command_times
+        ]
+        ordered_tcp_times = [
+            (label, float(tcp_start_times[label]))
+            for label, *_ in target_infos
+            if label in tcp_start_times
+        ]
+        command_skew_ms = (
+            (ordered_command_times[-1][1] - ordered_command_times[0][1]) * 1000.0
+            if len(ordered_command_times) >= 2
             else None
         )
-
-        def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
-            camera_name = self._camera_name_ko(label)
-            unix_time_s = time.time()
-            try:
-                if barrier is not None:
-                    barrier.wait(timeout=max(1.0, float(timeout_s)))
-                    unix_time_s = float(shared_command_time_s.get("unix", time.time()))
-                command_text = self._stus_command_from_unix_time(unix_time_s)
-                command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=command_text,
-                    timeout_s=timeout_s,
-                    terminator=LINE_TERMINATOR,
-                )
-                send_times[label] = unix_time_s
-                tcp_start_times[label] = time.perf_counter()
-                response = send_tcp_line(command)
-            except Exception as exc:
-                statuses[label] = f"실패: {exc}"
-                return
-            response_text = response or "<no response>"
-            utc_text = datetime.fromtimestamp(unix_time_s, tz=timezone.utc).isoformat(timespec="microseconds")
-            statuses[label] = response_text
-            command_logs[label] = (
-                f"> {camera_name} {command.host}:{command.port} {command.command} "
-                f"[pc_utc={utc_text.replace('+00:00', 'Z')}]\n{response_text}\n"
-            )
-
-        threads = [
-            threading.Thread(
-                target=send_one,
-                args=(label, host, port, timeout_s),
-                name=f"wiris-stus-{label}",
-            )
-            for label, host, port, timeout_s in target_infos
-        ]
-        for thread in threads:
-            thread.start()
-        max_timeout_s = max(max(1.0, float(timeout_s)) for _label, _host, _port, timeout_s in target_infos)
-        for thread in threads:
-            thread.join(timeout=max_timeout_s + 1.0)
-
-        for label, _host, _port, _timeout_s in target_infos:
-            if label not in statuses:
-                statuses[label] = "실패: 전송 스레드 timeout"
-            if label in command_logs:
-                self._append_wiris_command_log(command_logs[label])
-
+        tcp_start_skew_ms = (
+            (ordered_tcp_times[-1][1] - ordered_tcp_times[0][1]) * 1000.0
+            if len(ordered_tcp_times) >= 2
+            else None
+        )
         skew_text = ""
-        command_skew_ms: float | None = None
-        tcp_start_skew_ms: float | None = None
-        if len(send_times) >= 2:
-            ordered_times = [
-                (label, send_times[label])
-                for label, _host, _port, _timeout_s in target_infos
-                if label in send_times
-            ]
-            first_label, first_time_s = ordered_times[0]
-            last_label, last_time_s = ordered_times[-1]
-            tcp_skew_text = ""
-            ordered_tcp_times = [
-                (label, tcp_start_times[label])
-                for label, _host, _port, _timeout_s in target_infos
-                if label in tcp_start_times
-            ]
-            if len(ordered_tcp_times) >= 2:
-                _first_tcp_label, first_tcp_s = ordered_tcp_times[0]
-                _last_tcp_label, last_tcp_s = ordered_tcp_times[-1]
-                tcp_start_skew_ms = (last_tcp_s - first_tcp_s) * 1000.0
-                tcp_skew_text = f", TCP 호출 시작 차이: {tcp_start_skew_ms:.3f} ms"
-            command_skew_ms = (last_time_s - first_time_s) * 1000.0
+        if command_skew_ms is not None:
             skew_text = (
-                f" | 명령 UTC 차이 {self._camera_name_ko(first_label)}→"
-                f"{self._camera_name_ko(last_label)}: {command_skew_ms:.3f} ms"
-                f"{tcp_skew_text}"
+                f" | 명령 UTC 차이 {self._camera_name_ko(ordered_command_times[0][0])}→"
+                f"{self._camera_name_ko(ordered_command_times[-1][0])}: {command_skew_ms:.3f} ms"
             )
+        if tcp_start_skew_ms is not None:
+            skew_text += f", TCP 호출 시작 차이: {tcp_start_skew_ms:.3f} ms"
         status_text = " | ".join(
             f"{self._camera_name_ko(label)}: {statuses.get(label, '<no response>')}"
-            for label, _host, _port, _timeout_s in target_infos
+            for label, *_ in target_infos
         ) + skew_text
         self.wiris_command_status_label.setText(status_text)
         if hasattr(self, "clock_sync_status_label"):
@@ -17057,33 +17372,41 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"{status_text}"
             )
         successful_targets = [
-            label
-            for label, _host, _port, _timeout_s in target_infos
-            if not str(statuses.get(label, "")).startswith("실패:")
+            label for label, *_ in target_infos if not statuses.get(label, "").startswith("실패:")
         ]
-        requested_utc_s = shared_command_time_s.get("unix")
-        if requested_utc_s is None and send_times:
-            requested_utc_s = next(iter(send_times.values()))
-        result = "success" if len(successful_targets) == len(target_infos) else (
+        requested_utc_s = data.get("requested_utc_s")
+        result_state = "success" if len(successful_targets) == len(target_infos) else (
             "partial" if successful_targets else "failed"
         )
         self._last_wiris_pc_utc_sync = {
             "command": "STUS",
             "target": target,
-            "result": result,
+            "result": result_state,
             "requested_utc_s": requested_utc_s,
             "successful_targets": successful_targets,
-            "responses": {label: statuses.get(label, "") for label, _host, _port, _timeout_s in target_infos},
+            "responses": statuses,
             "command_skew_ms": command_skew_ms,
             "tcp_start_skew_ms": tcp_start_skew_ms,
             "recorded_at_unix_s": time.time(),
         }
         self._begin_camera_sync_after_stus(
             target=target,
-            result=result,
-            requested_utc_s=requested_utc_s,
+            result=result_state,
+            requested_utc_s=None if requested_utc_s is None else float(requested_utc_s),
+            target_infos=target_infos,
         )
         self._log(f"[카메라] WIRIS RTC PC UTC 설정 target={target}: {status_text}")
+
+    def _wiris_time_sync_failed(self, error: str) -> None:
+        self.wiris_command_status_label.setText(f"PC UTC 설정: failed ({error})")
+        if hasattr(self, "clock_sync_status_label"):
+            self.clock_sync_status_label.setText(f"PC UTC 설정: failed ({error})")
+        self._log(f"[카메라] WIRIS RTC PC UTC 설정 실패: {error}")
+
+    def _clear_wiris_time_sync_worker(self) -> None:
+        self.wiris_time_sync_thread = None
+        self.wiris_time_sync_worker = None
+        self.wiris_set_pc_time_button.setEnabled(True)
 
     def send_selected_wiris_command(self) -> None:
         command_text = self.wiris_command_edit.text().strip()
@@ -17119,59 +17442,60 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.wiris_command_status_label.setText("명령을 전송할 WIRIS 대상이 없습니다.")
             return
 
-        statuses: dict[str, str] = {}
-        command_logs: dict[str, str] = {}
-        send_times: dict[str, float] = {}
-        barrier = threading.Barrier(len(target_infos)) if len(target_infos) >= 2 else None
+        self._start_wiris_command_worker(
+            target=target,
+            target_infos=target_infos,
+            command_text=command_text,
+            terminator=terminator,
+        )
 
-        def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
-            camera_name = self._camera_name_ko(label)
-            try:
-                command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=command_text,
-                    timeout_s=timeout_s,
-                    terminator=terminator,
-                )
-                if barrier is not None:
-                    barrier.wait(timeout=max(1.0, float(timeout_s)))
-                send_times[label] = time.perf_counter()
-                response = send_tcp_line(command)
-            except Exception as exc:
-                statuses[label] = f"실패: {exc}"
-                return
-            response_text = response or "<no response>"
-            statuses[label] = response_text
-            command_logs[label] = f"> {camera_name} {command.host}:{command.port} {command.command}\n{response_text}\n"
-
-        threads = [
-            threading.Thread(
-                target=send_one,
-                args=(label, host, port, timeout_s),
-                name=f"wiris-command-{label}",
+    def _start_wiris_command_worker(
+        self,
+        *,
+        target: str,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        command_text: str,
+        terminator: str,
+    ) -> None:
+        if self.wiris_command_thread is not None:
+            self._log("[카메라] WIRIS SDK 명령이 이미 진행 중입니다.")
+            return
+        self.wiris_command_status_label.setText("WIRIS SDK command: sending...")
+        self.wiris_send_button.setEnabled(False)
+        self.wiris_command_thread = QtCore.QThread(self)
+        self.wiris_command_worker = WirisCommandWorker(
+            target_infos,
+            command_text=command_text,
+            terminator=terminator,
+        )
+        self.wiris_command_worker.moveToThread(self.wiris_command_thread)
+        self.wiris_command_thread.started.connect(self.wiris_command_worker.run)
+        self.wiris_command_worker.completed.connect(
+            lambda result, target=target, command_text=command_text: self._apply_wiris_command_result(
+                target, command_text, result
             )
-            for label, host, port, timeout_s in target_infos
-        ]
-        for thread in threads:
-            thread.start()
-        max_timeout_s = max(max(1.0, float(timeout_s)) for _label, _host, _port, timeout_s in target_infos)
-        for thread in threads:
-            thread.join(timeout=max_timeout_s + 1.0)
+        )
+        self.wiris_command_worker.failed.connect(self._wiris_command_failed)
+        self.wiris_command_worker.finished.connect(self.wiris_command_thread.quit)
+        self.wiris_command_worker.finished.connect(self.wiris_command_worker.deleteLater)
+        self.wiris_command_thread.finished.connect(self.wiris_command_thread.deleteLater)
+        self.wiris_command_thread.finished.connect(self._clear_wiris_command_worker)
+        self.wiris_command_thread.start()
 
-        for label, _host, _port, _timeout_s in target_infos:
-            if label not in statuses:
-                statuses[label] = "실패: 전송 스레드 timeout"
-            if label in command_logs:
-                self._append_wiris_command_log(command_logs[label])
-
+    def _apply_wiris_command_result(self, target: str, command_text: str, result: object) -> None:
+        data = dict(result or {}) if isinstance(result, dict) else {}
+        statuses = {str(key): str(value) for key, value in dict(data.get("statuses") or {}).items()}
+        send_times = {str(key): float(value) for key, value in dict(data.get("send_times") or {}).items()}
+        target_infos = tuple(data.get("target_infos") or ())
+        for log_text in dict(data.get("command_logs") or {}).values():
+            self._append_wiris_command_log(str(log_text))
         skew_text = ""
-        if len(send_times) >= 2:
-            ordered_times = [
-                (label, send_times[label])
-                for label, _host, _port, _timeout_s in target_infos
-                if label in send_times
-            ]
+        ordered_times = [
+            (str(label), send_times[str(label)])
+            for label, _host, _port, _timeout_s in target_infos
+            if str(label) in send_times
+        ]
+        if len(ordered_times) >= 2:
             first_label, first_time_s = ordered_times[0]
             last_label, last_time_s = ordered_times[-1]
             skew_text = (
@@ -17179,11 +17503,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"{self._camera_name_ko(last_label)}: {(last_time_s - first_time_s) * 1000.0:.3f} ms"
             )
         status_text = " | ".join(
-            f"{self._camera_name_ko(label)}: {statuses.get(label, '<no response>')}"
+            f"{self._camera_name_ko(str(label))}: {statuses.get(str(label), '<no response>')}"
             for label, _host, _port, _timeout_s in target_infos
         ) + skew_text
         self.wiris_command_status_label.setText(status_text)
         self._log(f"[카메라] WIRIS SDK 명령 target={target}, command={command_text}: {status_text}")
+
+    def _wiris_command_failed(self, error: str) -> None:
+        self.wiris_command_status_label.setText(f"WIRIS SDK command: failed ({error})")
+        self._log(f"[카메라] WIRIS SDK 명령 실패: {error}")
+
+    def _clear_wiris_command_worker(self) -> None:
+        self.wiris_command_thread = None
+        self.wiris_command_worker = None
+        self.wiris_send_button.setEnabled(True)
 
     def _auto_load_intrinsics(self) -> None:
         if not bool(self._workstation_setting("auto_load_intrinsics", self.settings.auto_load_intrinsics)):
@@ -17267,9 +17600,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             camera_sync_max_clock_rate_error=self.camera_sync_clock_rate_error_spin.value() / 100.0,
             camera_sync_required_sr_count=self.camera_sync_required_sr_count_spin.value(),
             camera_sync_warmup_timeout_s=self.camera_sync_warmup_timeout_spin.value(),
-            ros_domain_id=self.domain_spin.value(),
-            left_namespace=self.left_namespace_edit.text().strip(),
-            right_namespace=self.right_namespace_edit.text().strip(),
             pixhawk_host_address=self.pixhawk_host_address_edit.text().strip(),
             left_pixhawk_eth_ip=self.left_pixhawk_eth_ip_edit.text().strip(),
             right_pixhawk_eth_ip=self.right_pixhawk_eth_ip_edit.text().strip(),
@@ -17283,8 +17613,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             right_pixhawk_bootstrap_baud=self.right_pixhawk_bootstrap_baud_spin.value(),
             mavlink_configure_streams=self.mavlink_configure_streams_checkbox.isChecked(),
             mavlink_stream_rate=self.mavlink_stream_rate_spin.value(),
-            mavlink_configure_uxrce_agent=self.mavlink_configure_uxrce_agent_checkbox.isChecked(),
-            uxrce_port=self.uxrce_port_spin.value(),
             pixhawk_ethernet_mode=self._pixhawk_ethernet_mode(),
             auto_load_intrinsics=bool(
                 self._workstation_setting("auto_load_intrinsics", self.settings.auto_load_intrinsics)
@@ -17311,17 +17639,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 if hasattr(self, "gnss_operation_mode_combo")
                 else self.settings.gnss_operation
             ),
-            clock_ftp_user=self.clock_ftp_user_edit.text().strip() or "anonymous",
-            clock_ftp_password=self.clock_ftp_password_edit.text(),
-            clock_ftp_port=self.clock_ftp_port_spin.value(),
-            clock_ftp_remote_dir=self.clock_ftp_remote_dir_edit.text().strip() or "/",
-            clock_download_dir=self._app_relative_path_text(
-                resolve_settings_path(
-                    self.clock_download_dir_edit.text().strip() or DEFAULT_CLOCK_DOWNLOAD_DIR,
-                    base_dir=APP_ROOT,
-                )
-            ),
-            clock_capture_wait_s=self.clock_capture_wait_spin.value(),
         )
         save_settings(self.settings)
 
@@ -18067,16 +18384,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return True
 
     def _shutdown_stop_auxiliary_workers(self) -> bool:
-        self._stop_calibration_preview_worker()
+        preview_stopped = self._stop_calibration_preview_worker()
         attrs = (
             "camera_auto_detect_thread",
-            "pixhawk_auto_detect_thread",
+            "wiris_control_check_thread",
+            "wiris_command_thread",
+            "wiris_zoom_thread",
+            "wiris_time_sync_thread",
+            "wiris_gdti_thread",
+            "wiris_stip_thread",
+            "camera_network_discovery_thread",
+            "camera_network_apply_thread",
+            "interface_status_thread",
+            "pixhawk_usb_discovery_thread",
+            "pixhawk_host_ip_discovery_thread",
             "rtsp_check_thread",
             "rtsp_enable_thread",
             "gnss_base_detect_thread",
         )
         results = [self._shutdown_stop_thread(attr) for attr in attrs]
-        return all(results)
+        return bool(preview_stopped and all(results))
 
     def _shutdown_stop_gnss_base_serial(self) -> bool:
         self.disconnect_gnss_base_serial()
@@ -18098,14 +18425,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         super().closeEvent(event)
 
-    def _stop_calibration_preview_worker(self, *_args) -> None:
+    def _stop_calibration_preview_worker(self, *_args) -> bool:
         thread = getattr(self, "_calibration_preview_thread", None)
         if thread is None:
-            return
+            return True
         thread.quit()
-        thread.wait(1000)
+        if thread.isRunning() and not thread.wait(1000):
+            return False
         self._calibration_preview_thread = None
         self._calibration_preview_worker = None
+        return True
 
     def _update_detection(self, camera: str, detection: DetectionObservation | None) -> None:
         if camera == "left":
@@ -18188,6 +18517,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             require_fixed=False,
         )
         self.latest_rtk_baseline = baseline
+        self._refresh_p1_body_frd_baseline()
         reference_text = " | 거리 계산 필수 입력"
         if hasattr(self, "rtk_fixed_status_label"):
             self.rtk_fixed_status_label.setText(self._rtk_fixed_status_text(baseline))
@@ -18213,7 +18543,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.rtk_baseline_label.setText(
             f"GPS baseline: {baseline.baseline_m:.3f} m "
             f"N/E/D={baseline.north_m:.3f}/{baseline.east_m:.3f}/{baseline.down_m:.3f} m "
-            f"age={baseline.left_age_s * 1000:.0f}/{baseline.right_age_s * 1000:.0f}ms "
+            + (
+                "P1 FRD=대기 중 "
+                if self.latest_p1_body_frd_baseline is None
+                else (
+                    "P1 FRD F/R/D="
+                    f"{self.latest_p1_body_frd_baseline.forward_m:.3f}/"
+                    f"{self.latest_p1_body_frd_baseline.right_m:.3f}/"
+                    f"{self.latest_p1_body_frd_baseline.down_m:.3f} m "
+                )
+            )
+            + f"age={baseline.left_age_s * 1000:.0f}/{baseline.right_age_s * 1000:.0f}ms "
             f"quality={baseline.fix_quality}{reference_text}{warning_text}"
         )
         self._refresh_rtk_alignment_view()
@@ -18311,6 +18651,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
 
     def _refresh_rtk_alignment_view(self) -> None:
+        self._refresh_p1_body_frd_baseline()
         if not hasattr(self, "rtk_alignment_plot"):
             return
         baseline = self.latest_rtk_baseline
@@ -18334,9 +18675,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         if camera_translation is None:
             self._set_rtk_summary_chip("camera", "Camera: 자세 대기 중", "warn")
+            body_text = "P1 body FRD=자세 대기 중"
+            if self.latest_p1_body_frd_baseline is not None:
+                projection = self.latest_p1_body_frd_baseline
+                body_text = (
+                    "P1 body FRD F/R/D="
+                    f"{projection.forward_m:+.3f}/{projection.right_m:+.3f}/{projection.down_m:+.3f} m"
+                )
             self.rtk_alignment_detail_label.setText(
                 f"정렬 성분: {antenna_text}. GPS-only 모드: N/E/D 기준선을 표시합니다. "
-                "카메라 기준 Right/Down/Forward 변환은 픽스호크 자세 수신 후 추가됩니다."
+                f"{body_text}. 카메라 기준 Right/Down/Forward 변환은 픽스호크 자세 수신 후 추가됩니다."
             )
             return
         attitude_text = ""
@@ -18364,7 +18712,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         self.rtk_alignment_detail_label.setText(
             f"정렬 성분: {antenna_text}. "
-            f"P1 RDF Right={x_m:.3f} m, Down={y_m:.3f} m, Forward={z_m:.3f} m. "
+            + (
+                "P1 body FRD 대기 중. "
+                if self.latest_p1_body_frd_baseline is None
+                else (
+                    "P1 body FRD F/R/D="
+                    f"{self.latest_p1_body_frd_baseline.forward_m:+.3f}/"
+                    f"{self.latest_p1_body_frd_baseline.right_m:+.3f}/"
+                    f"{self.latest_p1_body_frd_baseline.down_m:+.3f} m. "
+                )
+            )
+            + f"P1 RDF Right={x_m:.3f} m, Down={y_m:.3f} m, Forward={z_m:.3f} m. "
             f"P1 RDF 좌우 성분 |Right|={abs(x_m):.3f} m입니다. "
             f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}.{attitude_text}"
         )
@@ -19761,6 +20119,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "distance_mode": self._distance_mode_label(),
             }
         )
+        row.update(mavlink_link_provenance(self, side))
         row.update(values)
         rows.append(row)
         self.external_parameter_recording_rows.append(row)
@@ -20395,6 +20754,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     "rtk_baseline_north_m": self._fmt_record_float(None if ned is None else ned[0], 6),
                     "rtk_baseline_east_m": self._fmt_record_float(None if ned is None else ned[1], 6),
                     "rtk_baseline_down_m": self._fmt_record_float(None if ned is None else ned[2], 6),
+                    "baseline_p1_body_frd_state": "WAITING",
+                    "baseline_p1_body_frd_forward_m": "",
+                    "baseline_p1_body_frd_right_m": "",
+                    "baseline_p1_body_frd_down_m": "",
+                    "baseline_p1_body_frd_attitude_age_s": "",
+                    "baseline_p1_body_frd_frame": BODY_FRAME,
+                    "baseline_p1_body_frd_axis_contract": (
+                        "P1->P2 in P1 body FRD: [Forward, Right, Down]; metres"
+                    ),
                     "rtk_left_age_s": self._fmt_record_float(baseline.left_age_at_capture_s, 6),
                     "rtk_right_age_s": self._fmt_record_float(baseline.right_age_at_capture_s, 6),
                     "rtk_fix_quality": baseline.fix_quality,
@@ -20408,6 +20776,31 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     ),
                 }
             )
+            left_attitude = measurement_attempt.left_attitude
+            if ned is not None and left_attitude is not None:
+                projection = project_ned_baseline_to_p1_body_frd(
+                    ned,
+                    left_attitude.quaternion_wxyz,
+                    attitude_timestamp_s=left_attitude.app_receive_monotonic_s,
+                    attitude_age_s=measurement_attempt.left_attitude_age_s,
+                )
+                row.update(
+                    {
+                        "baseline_p1_body_frd_state": "READY",
+                        "baseline_p1_body_frd_forward_m": self._fmt_record_float(
+                            projection.forward_m, 6
+                        ),
+                        "baseline_p1_body_frd_right_m": self._fmt_record_float(
+                            projection.right_m, 6
+                        ),
+                        "baseline_p1_body_frd_down_m": self._fmt_record_float(
+                            projection.down_m, 6
+                        ),
+                        "baseline_p1_body_frd_attitude_age_s": self._fmt_record_float(
+                            projection.attitude_age_s, 6
+                        ),
+                    }
+                )
             if camera_translation is not None:
                 row.update(
                     {
@@ -20491,6 +20884,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"{prefix}_quat_reset_counter": (
                 "" if state.quat_reset_counter is None else state.quat_reset_counter
             ),
+            f"{prefix}_mavlink_source_system": (
+                "" if state.mavlink_source_system is None else state.mavlink_source_system
+            ),
+            f"{prefix}_mavlink_source_component": (
+                "" if state.mavlink_source_component is None else state.mavlink_source_component
+            ),
+            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
+            f"{prefix}_mavlink_message_id": (
+                "" if state.mavlink_message_id is None else state.mavlink_message_id
+            ),
         }
 
     def _record_gps_state(
@@ -20539,6 +20942,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             f"{prefix}_vdop": self._fmt_record_float(state.vdop, 6),
             f"{prefix}_device_id": "" if state.device_id is None else state.device_id,
             f"{prefix}_time_source": state.time_source,
+            f"{prefix}_mavlink_source_system": (
+                "" if state.mavlink_source_system is None else state.mavlink_source_system
+            ),
+            f"{prefix}_mavlink_source_component": (
+                "" if state.mavlink_source_component is None else state.mavlink_source_component
+            ),
+            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
+            f"{prefix}_mavlink_message_id": (
+                "" if state.mavlink_message_id is None else state.mavlink_message_id
+            ),
         }
 
     def _record_gnss_relative_state(self, camera: str) -> dict[str, str]:
@@ -20572,6 +20985,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             f"{prefix}_gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
             f"{prefix}_gps_utc_valid": self._fmt_record_bool(state.gps_utc_us is not None),
+            f"{prefix}_mavlink_source_system": (
+                "" if state.mavlink_source_system is None else state.mavlink_source_system
+            ),
+            f"{prefix}_mavlink_source_component": (
+                "" if state.mavlink_source_component is None else state.mavlink_source_component
+            ),
+            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
+            f"{prefix}_mavlink_message_id": (
+                "" if state.mavlink_message_id is None else state.mavlink_message_id
+            ),
         }
 
     def _format_distance_label_text(self, text: str, detail: str | None = None) -> str:
@@ -20726,6 +21149,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             {
                 "namespace": extrinsic.namespace,
                 "topic": extrinsic.topic,
+                "mavlink_source_system": (
+                    "" if extrinsic.mavlink_source_system is None else extrinsic.mavlink_source_system
+                ),
+                "mavlink_source_component": (
+                    "" if extrinsic.mavlink_source_component is None else extrinsic.mavlink_source_component
+                ),
+                "mavlink_sequence": "" if extrinsic.mavlink_sequence is None else extrinsic.mavlink_sequence,
+                "mavlink_message_id": (
+                    "" if extrinsic.mavlink_message_id is None else extrinsic.mavlink_message_id
+                ),
                 "sample_app_timestamp_s": extrinsic.timestamp_s,
                 "sample_px4_timestamp_s": self._fmt_record_float(extrinsic.px4_timestamp_s, 6),
                 "px4_timestamp_us": (
@@ -20802,6 +21235,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             {
                 "namespace": gps.namespace,
                 "topic": gps.topic,
+                "mavlink_source_system": "" if gps.mavlink_source_system is None else gps.mavlink_source_system,
+                "mavlink_source_component": (
+                    "" if gps.mavlink_source_component is None else gps.mavlink_source_component
+                ),
+                "mavlink_sequence": "" if gps.mavlink_sequence is None else gps.mavlink_sequence,
+                "mavlink_message_id": "" if gps.mavlink_message_id is None else gps.mavlink_message_id,
                 "sample_app_timestamp_s": gps.timestamp_s,
                 "sample_px4_timestamp_s": self._fmt_record_float(gps.px4_timestamp_s, 6),
                 "px4_timestamp_us": "" if gps.px4_timestamp_us is None else gps.px4_timestamp_us,
@@ -20929,10 +21368,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             table = self.px4_mag_tables.get(camera) if hasattr(self, "px4_mag_tables") else None
             if table is not None and table.rowCount() == 0 and self._mag_state_display_device_id(camera, state)[0] is not None:
                 self.refresh_px4_mag_manager(camera)
-        elif "sensor_mag" in topic and self.latest_vehicle_mag_device_ids.get(camera) is None:
-            status_label = self.px4_mag_status_labels.get(camera) if hasattr(self, "px4_mag_status_labels") else None
-            if status_label is not None and "ROS2 raw MAG 수신 중" not in status_label.text():
-                self.refresh_px4_mag_manager(camera)
         self.magnetometer_monitor.update(camera, state)
         label = self.mag_sensor_labels.get(camera, {}).get(state.sensor_slot)
         age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
@@ -20967,6 +21402,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "namespace": state.namespace,
                 "topic": state.topic,
                 "sensor_slot": state.sensor_slot,
+                "mavlink_source_system": (
+                    "" if getattr(state, "mavlink_source_system", None) is None else state.mavlink_source_system
+                ),
+                "mavlink_source_component": (
+                    ""
+                    if getattr(state, "mavlink_source_component", None) is None
+                    else state.mavlink_source_component
+                ),
+                "mavlink_sequence": "" if getattr(state, "mavlink_sequence", None) is None else state.mavlink_sequence,
+                "mavlink_message_id": (
+                    "" if getattr(state, "mavlink_message_id", None) is None else state.mavlink_message_id
+                ),
                 "sample_app_timestamp_s": state.timestamp_s,
                 "sample_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
                 "px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
@@ -21067,6 +21514,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "namespace": state.namespace,
                 "topic": state.topic,
                 "sample_app_timestamp_s": state.timestamp_s,
+                "mavlink_source_system": (
+                    "" if getattr(state, "mavlink_source_system", None) is None else state.mavlink_source_system
+                ),
+                "mavlink_source_component": (
+                    ""
+                    if getattr(state, "mavlink_source_component", None) is None
+                    else state.mavlink_source_component
+                ),
+                "mavlink_sequence": "" if getattr(state, "mavlink_sequence", None) is None else state.mavlink_sequence,
+                "mavlink_message_id": (
+                    "" if getattr(state, "mavlink_message_id", None) is None else state.mavlink_message_id
+                ),
                 "sample_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
                 "px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
                 "px4_timestamp_sample_us": (
@@ -21129,9 +21588,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return "source=unknown"
         if text.startswith("mavlink/"):
             return f"MAVLink {text.removeprefix('mavlink/')}"
-        if "/fmu/out/" in text:
-            return f"ROS2 {text}"
-        return text
+        return f"MAVLink {text}"
 
     def _gps_position_summary_text(self, gps: GpsPositionState, *, age_ms: float) -> str:
         sats = f"sats={gps.satellites_used}" if gps.satellites_used is not None else "sats=waiting"
@@ -21229,11 +21686,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for slot, label in self.rm3100_slot_labels[camera].items():
             state = mag_slots.get(slot)
             if state is None:
-                unavailable = self._ros2_only_unavailable(camera, slot)
                 self._set_health_label(
                     label,
-                    "ROS2 sensor_mag(_0..4)/vehicle_magnetometer 미게시" if unavailable else "waiting",
-                    "warn" if unavailable else "idle",
+                    "waiting",
+                    "idle",
                 )
                 continue
             age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
@@ -21250,12 +21706,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         can1 = mag_slots.get("CAN1")
         can2 = mag_slots.get("CAN2")
         rm_level = "bad"
-        rm_unavailable = rm_detected == 0 and self._ros2_only_unavailable(camera, "MAG")
-        rm_summary = (
-            "Status: ROS2 MAG topic 미게시 | 0/2 detected"
-            if rm_unavailable
-            else f"Status: 대기 중 | {rm_detected}/2 detected"
-        )
+        rm_summary = f"Status: 대기 중 | {rm_detected}/2 detected"
         if can1 is not None and can2 is not None:
             can1_age = now_s - can1.timestamp_s
             can2_age = now_s - can2.timestamp_s
@@ -21289,23 +21740,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_health_label(
                 self.rm3100_compare_labels[camera],
                 rm_summary,
-                "bad" if rm_detected else "warn" if rm_unavailable else "idle",
+                "bad" if rm_detected else "idle",
             )
         self._set_health_label(
             self.pixhawk_sensor_summary_labels[camera]["rm3100"],
             f"{title}: {rm_summary}",
-            rm_level if rm_detected else "warn" if rm_unavailable else "idle",
+            rm_level if rm_detected else "idle",
         )
 
         gps_detected = sum(1 for slot in ("GPS1", "GPS2") if slot in gps_slots)
         for slot, label in self.f9p_slot_labels[camera].items():
             state = gps_slots.get(slot)
             if state is None:
-                unavailable = self._ros2_only_unavailable(camera, slot)
                 self._set_health_label(
                     label,
-                    "ROS2 sensor_gps(_0/_1) 미게시" if unavailable else "waiting",
-                    "warn" if unavailable else "idle",
+                    "waiting",
+                    "idle",
                 )
                 continue
             age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
@@ -21316,12 +21766,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         gps1 = gps_slots.get("GPS1")
         gps2 = gps_slots.get("GPS2")
         f9p_level = "bad"
-        gps2_unavailable = gps2 is None and self._ros2_only_unavailable(camera, "GPS2")
-        f9p_summary = (
-            f"{gps_detected}/2 detected · GPS2 ROS2 sensor_gps(_0/_1) 미게시"
-            if gps2_unavailable
-            else f"{gps_detected}/2 detected"
-        )
+        f9p_summary = f"{gps_detected}/2 detected"
         if gps1 is not None and gps2 is not None:
             details = []
             if gps1.fix_type is not None and gps2.fix_type is not None:
@@ -21342,12 +21787,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._set_health_label(
                 self.f9p_compare_labels[camera],
                 f9p_summary,
-                "bad" if gps_detected else "warn" if gps2_unavailable else "idle",
+                "bad" if gps_detected else "idle",
             )
         self._set_health_label(
             self.pixhawk_sensor_summary_labels[camera]["f9p"],
             f"{title}: {f9p_summary}",
-            f9p_level if gps_detected else "warn" if gps2_unavailable else "idle",
+            f9p_level if gps_detected else "idle",
         )
         heading_text = "GNSS Heading: sensor_gnss_relative waiting"
         heading_level = "idle"
@@ -21437,7 +21882,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return "bad"
 
     def _initial_status(self) -> None:
-        self._log("[연결] 네트워크 인터페이스 상태:\n" + interface_addresses(self.interface_edit.text().strip()))
+        self._start_interface_status_worker()
         self.camera_connection_label.setText(STARTUP_CAMERA_STATUS)
         self.pixhawk_connection_label.setText(STARTUP_PIXHAWK_STATUS)
         self._log(STARTUP_READY_MESSAGE)
@@ -21446,6 +21891,33 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(500, self._auto_start_pixhawk)
         if self.auto_start:
             self.start_yolo()
+
+    def _start_interface_status_worker(self) -> None:
+        if self.interface_status_thread is not None:
+            return
+        thread = QtCore.QThread(self)
+        worker = InterfaceStatusWorker(self.interface_edit.text().strip())
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.ready.connect(self._apply_interface_status)
+        worker.failed.connect(self._interface_status_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_interface_status_worker)
+        self.interface_status_thread = thread
+        self.interface_status_worker = worker
+        thread.start()
+
+    def _apply_interface_status(self, interface_name: str, status: str) -> None:
+        self._log(f"[연결] 네트워크 인터페이스 상태 ({interface_name}):\n{status}")
+
+    def _interface_status_failed(self, error: str) -> None:
+        self._log(f"[연결] 네트워크 인터페이스 상태 확인 실패: {error}")
+
+    def _clear_interface_status_worker(self) -> None:
+        self.interface_status_thread = None
+        self.interface_status_worker = None
 
     def _recover_retryable_recording_session(self) -> bool:
         candidates = discover_retryable_sessions(APP_ROOT / "recordings")

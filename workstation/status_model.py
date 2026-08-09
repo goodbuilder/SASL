@@ -187,23 +187,16 @@ class BackendStatusAdapter(QtCore.QObject):
         )
 
     def _refresh_pixhawk(self, panel: object, side: str, label: str, now_s: float) -> None:
-        connected_sides = set(_safe_call(panel, "_ros2_connected_sides", default=()) or ())
         mavlink_sides = set(_safe_call(panel, "_mavlink_open_sides", default=()) or ())
         attitude_times = getattr(panel, "pixhawk_attitude_times", {}) or {}
-        age_s = _safe_call(panel, "_ros2_attitude_sample_age_s", side, default=None)
-        if age_s is None:
-            age_s = _sample_age(attitude_times.get(side, []), now_s)
-        transport = []
-        if side in connected_sides:
-            transport.append("ROS2")
-        if side in mavlink_sides:
-            transport.append("MAVLink")
+        age_s = _sample_age(attitude_times.get(side, []), now_s)
+        transport = "MAVLink" if side in mavlink_sides else "telemetry"
         if age_s is not None and float(age_s) < 2.0:
             state, severity = "LIVE", StatusSeverity.OK
-            detail = f"{'+'.join(transport) or 'telemetry'} attitude age {float(age_s):.2f} s"
-        elif transport:
+            detail = f"{transport} attitude age {float(age_s):.2f} s"
+        elif side in mavlink_sides:
             state, severity = "CONNECTED", StatusSeverity.WARN
-            detail = f"{'+'.join(transport)}; sample 대기 또는 stale"
+            detail = "MAVLink heartbeat; attitude sample 대기 또는 stale"
         else:
             state, severity = "DISCONNECTED", StatusSeverity.UNKNOWN
             detail = "heartbeat/sample evidence 없음"
@@ -222,7 +215,7 @@ class BackendStatusAdapter(QtCore.QObject):
             state,
             severity,
             detail=detail,
-            source="ROS2 subscriber/MAVLink heartbeat + attitude sample",
+            source="MAVLink heartbeat + attitude sample",
             age_s=None if age_s is None else float(age_s),
             clock="app_receive_monotonic",
             observed_monotonic_s=now_s,
@@ -271,6 +264,16 @@ class BackendStatusAdapter(QtCore.QObject):
                 f"quality={getattr(baseline, 'fix_quality', 'UNKNOWN')}, "
                 f"age P1/P2={left_age:.2f}/{right_age:.2f}s"
             )
+            projection = getattr(panel, "latest_p1_body_frd_baseline", None)
+            if projection is None:
+                baseline_detail += "; P1 body FRD projection=WAITING"
+            else:
+                baseline_detail += (
+                    "; P1→P2 @ P1 body FRD F/R/D="
+                    f"{float(getattr(projection, 'forward_m', 0.0)):+.3f}/"
+                    f"{float(getattr(projection, 'right_m', 0.0)):+.3f}/"
+                    f"{float(getattr(projection, 'down_m', 0.0)):+.3f} m"
+                )
         readiness = _safe_call(manager, "readiness", default=None)
         readiness_ready = getattr(readiness, "ready", None)
         readiness_text = ""
