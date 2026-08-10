@@ -1,7 +1,7 @@
 """Compatibility alias for the Legacy StereoWIRIS GUI.
 
 The implementation lives in :mod:`wiris_stereo_distance.legacy_gui` so the
-Workstation can keep its own copied owner in :mod:`workstation.standalone_gui`.
+Workstation can keep its own copied owner in :mod:`Workstation.standalone_gui`.
 Replacing this module object with
 the implementation module preserves existing imports and, importantly,
 keeps monkeypatches on ``wiris_stereo_distance.gui`` applied to the Legacy

@@ -368,6 +368,7 @@ NETWORK_FIELD_MIN_WIDTHS = {
 APP_WINDOW_TITLE = "StereoWIRIS"
 STARTUP_CAMERA_STATUS = "카메라: 대기 중 - 장비 연결 후 영상 수신 확인 또는 카메라 Preview 연결"
 STARTUP_PIXHAWK_STATUS = "픽스호크: 대기 중 - 장비 연결 후 ROS2 연결 또는 MAVLink 연결"
+STARTUP_PIXHAWK_MAVLINK_STATUS = "픽스호크: 대기 중 - MAVLink 연결 후 telemetry 수신 확인"
 STARTUP_READY_MESSAGE = (
     "[연결] 카메라/픽스호크 미연결 상태에서도 앱을 사용할 수 있습니다. "
     "장비 연결 후 영상 수신 확인, 카메라 Preview 연결, ROS2 연결 또는 MAVLink 연결을 누르세요."
@@ -3046,6 +3047,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
         self.settings = load_settings()
+        # ``main.py``/``run.sh`` set this marker before importing Legacy when
+        # the persisted Ethernet mode is MAVLink-only.  Keep the flag separate
+        # from the editable combo: switching to dual at runtime cannot load a
+        # ROS2 overlay that was intentionally not bootstrapped for this
+        # process; the operator must restart after changing the saved mode.
+        self.mavlink_only_runtime = os.environ.get("SASL_MAVLINK_ONLY", "0").strip() == "1"
         self._workstation_setting_overrides: dict[str, object] = {}
         self.gnss_operation_manager = GnssOperationManager(self.settings.gnss_operation)
         self.distance_history: deque[DistanceHistoryPoint] = deque(maxlen=600)
@@ -4249,7 +4256,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             pixhawk_advanced_actions.addWidget(button, 1)
         self.pixhawk_advanced_diagnostics_group = pixhawk_advanced_group
         pixhawk_form.addWidget(pixhawk_advanced_group, 4, 0, 1, 6)
-        self.pixhawk_connection_label = QtWidgets.QLabel(STARTUP_PIXHAWK_STATUS)
+        self.pixhawk_connection_label = QtWidgets.QLabel(
+            STARTUP_PIXHAWK_MAVLINK_STATUS if self.mavlink_only_runtime else STARTUP_PIXHAWK_STATUS
+        )
         self.pixhawk_connection_label.setObjectName("statusStrip")
         pixhawk_form.addWidget(self.pixhawk_connection_label, 5, 0, 1, 6)
 
@@ -4628,7 +4637,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._build_baseline_calculation_view(alignment_mag_layout, include_source_controls=False, include_alignment_plot=False)
         self._build_baseline_attitude_alignment_tab(alignment_attitude_layout)
         self._build_optical_alignment_tab(optical_alignment_layout)
-        self.refresh_baseline_field_browser()
+        if not self.mavlink_only_runtime:
+            self.refresh_baseline_field_browser()
         self._refresh_baseline_alignment_ui()
 
         zoom_group = QtWidgets.QGroupBox("WIRIS 줌 명령 제어")
@@ -5147,6 +5157,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         save_layout.addWidget(self.recording_table_group, 1)
 
         self._build_clock_sync_tab(time_layout, image_layout)
+        self._refresh_pixhawk_ethernet_mode_controls()
         self._polish_controls()
         self._refresh_session_toggle_buttons()
         self._install_tooltips()
@@ -5180,14 +5191,56 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return mode if mode in PIXHAWK_ETHERNET_MODES else DEFAULT_PIXHAWK_ETHERNET_MODE
 
     def _refresh_pixhawk_ethernet_mode_controls(self) -> None:
-        mode = self._pixhawk_ethernet_mode()
+        # A MAVLink-only process was started without ROS2 Python/px4_msgs
+        # paths.  Treat that process as permanently MAVLink-only even if an
+        # operator edits the combo after startup; switching to dual requires
+        # a restart so the ROS2 overlay can be loaded safely.
+        mode = "mavlink" if self.mavlink_only_runtime else self._pixhawk_ethernet_mode()
         uxrce_enabled = mode in {"dual", "uxrce"}
+        if self.mavlink_only_runtime:
+            self.mavlink_configure_uxrce_agent_checkbox.setChecked(False)
         self.mavlink_configure_uxrce_agent_checkbox.setEnabled(uxrce_enabled)
         self.mavlink_configure_uxrce_agent_checkbox.setToolTip(
             "Ethernet 공존/전용 모드에서 uXRCE-DDS를 설정합니다."
             if uxrce_enabled
             else "MAVLink 전용 모드에서는 Ethernet uXRCE-DDS를 사용하지 않습니다."
         )
+        mode_combo = getattr(self, "pixhawk_ethernet_mode_combo", None)
+        if mode_combo is not None:
+            mode_combo.setEnabled(not self.mavlink_only_runtime)
+            if self.mavlink_only_runtime:
+                mode_combo.setToolTip(
+                    "MAVLink-only 런타임입니다. ROS2/uXRCE-DDS를 사용하려면 저장 모드를 dual로 바꾸고 재시작하세요."
+                )
+
+        if not self.mavlink_only_runtime:
+            return
+
+        # Hide and disable every ROS2 discovery/connection surface.  Keeping
+        # these widgets out of the active UI also prevents accidental signal
+        # activation from creating a ROS2 subscriber or launching ros2 CLI.
+        ros2_widgets = (
+            getattr(self, "pixhawk_ros2_telemetry_group", None),
+            getattr(self, "pixhawk_ros2_candidate_group", None),
+            getattr(self, "baseline_ros2_group", None),
+            getattr(self, "pixhawk_button", None),
+            getattr(self, "left_ros2_button", None),
+            getattr(self, "right_ros2_button", None),
+            getattr(self, "left_uxrce_param_button", None),
+            getattr(self, "right_uxrce_param_button", None),
+            getattr(self, "pixhawk_auto_detect_button", None),
+            getattr(self, "baseline_scan_topics_button", None),
+            getattr(self, "custom_watch_discover_button", None),
+            getattr(self, "domain_spin", None),
+            getattr(self, "left_namespace_edit", None),
+            getattr(self, "right_namespace_edit", None),
+            getattr(self, "uxrce_port_spin", None),
+        )
+        for widget in ros2_widgets:
+            if widget is None:
+                continue
+            widget.setEnabled(False)
+            widget.setVisible(False)
 
     def _set_yolo_device_combo(self, device: str) -> None:
         index = self.device_combo.findData(self._normalized_yolo_device(device))
@@ -6722,7 +6775,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.baseline_tabs.addTab(calc_tab, "Baseline 계산")
         self.baseline_tabs.addTab(quality_tab, "신뢰성 평가")
         layout.addWidget(self.baseline_tabs, 1)
-        self.refresh_baseline_field_browser()
+        if not self.mavlink_only_runtime:
+            self.refresh_baseline_field_browser()
         self._refresh_baseline_alignment_ui()
 
     def _build_alignment_overview_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
@@ -7114,6 +7168,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         ros2_layout.addWidget(self.baseline_ros2_topic_table, 2)
         ros2_layout.addWidget(self.baseline_ros2_field_list, 1)
         split.addWidget(ros2_group, 2)
+        self.baseline_ros2_group = ros2_group
 
         self.baseline_mavlink_message_table = QtWidgets.QTableWidget(0, 2)
         self.baseline_mavlink_message_table.setHorizontalHeaderLabels(["Message", "Fields"])
@@ -7464,7 +7519,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "/fmu/out/vehicle_global_position",
             "/fmu/out/vehicle_local_position",
         )
-        discovered = discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.0)
+        discovered = (
+            []
+            if self.mavlink_only_runtime
+            else discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.0)
+        )
         by_name = {item.get("name", ""): item.get("type", "") for item in discovered}
         rows: list[tuple[str, str, str]] = []
         for topic in priority_topics:
@@ -7494,6 +7553,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.baseline_mavlink_message_table.setItem(row, 1, QtWidgets.QTableWidgetItem(fields))
 
     def _show_selected_baseline_ros2_fields(self) -> None:
+        if self.mavlink_only_runtime:
+            return
         if not hasattr(self, "baseline_ros2_topic_table"):
             return
         selected = self.baseline_ros2_topic_table.selectedItems()
@@ -11328,6 +11389,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_auto_detect_thread.start()
 
     def auto_detect_pixhawks(self) -> None:
+        if self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 ROS2 PX4 topic 자동 탐색을 사용하지 않습니다.")
+            return
         if self.pixhawk_auto_detect_thread is not None:
             return
         self._log("[픽스호크] ROS2 PX4 topic과 namespace를 자동 탐색합니다.")
@@ -12111,6 +12175,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         if side not in {"left", "right"}:
             self._log(f"[픽스호크] {kind} 후보는 P1/P2에 적용하세요.")
+            return
+        if kind == "ROS2" and self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 ROS2 후보를 적용하지 않습니다.")
             return
         mavlink_was_active = side in self._mavlink_open_sides()
         ros2_was_active = side in self._ros2_connected_sides()
@@ -13693,6 +13760,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.start_yolo()
 
     def toggle_ros2_connection(self, camera: str | None = None) -> None:
+        if self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 ROS2 연결을 사용하지 않습니다.")
+            return
         if camera is None:
             if self._ros2_connected_sides():
                 self.disconnect_pixhawk()
@@ -15094,6 +15164,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log(message)
 
     def discover_custom_topic_watch(self) -> None:
+        if self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 ROS2 Custom watch 탐색을 사용하지 않습니다.")
+            return
         self._log("[픽스호크] ROS2 topic 탐색을 시작합니다...")
         topics = discover_ros2_topic_types(self.domain_spin.value(), timeout_s=1.5)
         if not topics:
@@ -15172,6 +15245,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         source: str = "ros2",
         message: str | None = None,
     ) -> None:
+        if source == "ros2" and self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 ROS2 Custom watch를 추가하지 않습니다.")
+            return
         spec = {"key": key, "topic": topic, "field": field, "source": source}
         if message:
             spec["message"] = message
@@ -15213,6 +15289,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.remove_custom_topic_watch(str(key))
 
     def add_custom_topic_watch_from_ui(self) -> None:
+        if self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 MAVLink 필드 찾기를 사용하세요.")
+            return
         topic = self.custom_watch_topic_edit.text().strip()
         field = self.custom_watch_field_edit.text().strip()
         name = self.custom_watch_name_edit.text().strip() or f"{topic}.{field}"
@@ -15251,6 +15330,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.pixhawk = self.pixhawk_ros2_subscribers.get("left") or self.pixhawk_ros2_subscribers.get("right")
 
     def _create_ros2_pixhawk_subscriber(self, side: str) -> DualPixhawkAttitudeSubscriber:
+        if self.mavlink_only_runtime:
+            raise RuntimeError("ROS2 Pixhawk subscriber is unavailable in MAVLink-only mode")
         kwargs = {
             "domain_id": self.domain_spin.value(),
             "left_namespace": self.left_namespace_edit.text().strip(),
@@ -15267,6 +15348,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return DualPixhawkAttitudeSubscriber(**kwargs)
 
     def connect_pixhawk(self, camera: str | None = None, *, allow_mavlink_recovery: bool = True) -> bool:
+        if self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 ROS2 연결을 사용하지 않습니다.")
+            self.pixhawk_connection_label.setText("픽스호크 MAVLink-only: ROS2 연결 비활성화")
+            return False
         target_sides = self._ros2_target_sides(camera)
         if all(self.pixhawk_ros2_subscribers.get(side) is not None for side in target_sides):
             self._sync_legacy_pixhawk_ref()
@@ -15320,6 +15405,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return ok
 
     def _ensure_micro_xrce_agent(self) -> None:
+        if self.mavlink_only_runtime:
+            self._log("[픽스호크] MAVLink-only 런타임에서는 MicroXRCEAgent를 시작하지 않습니다.")
+            return
         started, message = ensure_micro_xrce_agent(self.uxrce_port_spin.value())
         if started:
             self._log(f"[픽스호크] MicroXRCEAgent를 시작했습니다: {message}")
@@ -15327,6 +15415,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log(f"[픽스호크] MicroXRCEAgent가 이미 실행 중입니다: {message}")
 
     def _verify_ros2_pixhawk_publishers(self, sides: tuple[str, ...] | None = None) -> None:
+        if self.mavlink_only_runtime:
+            return
         connected_sides = self._ros2_connected_sides()
         if not connected_sides:
             return
@@ -15541,6 +15631,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_mavlink_side_actions()
 
     def _retry_ros2_after_mavlink_recovery(self, camera: str | None = None) -> None:
+        if self.mavlink_only_runtime:
+            return
         target_sides = self._ros2_target_sides(camera)
         if all(side in self._ros2_connected_sides() for side in target_sides):
             return
@@ -16929,6 +17021,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.discover_custom_mavlink_watch()
 
     def workstation_add_custom_topic_watch(self, name: str, topic: str, field: str) -> str:
+        if self.mavlink_only_runtime:
+            raise RuntimeError("ROS2 custom watch is unavailable in MAVLink-only mode")
         topic = str(topic or "").strip()
         field = str(field or "").strip()
         name = str(name or "").strip() or f"{topic}.{field}"
@@ -16968,6 +17062,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
 
     def workstation_describe_baseline_fields(self, topic_type: str) -> tuple[str, ...]:
+        if self.mavlink_only_runtime:
+            return ()
         topic_type = str(topic_type or "").strip()
         if not topic_type:
             return ()
@@ -21660,8 +21756,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _initial_status(self) -> None:
         self._log("[연결] 네트워크 인터페이스 상태:\n" + interface_addresses(self.interface_edit.text().strip()))
         self.camera_connection_label.setText(STARTUP_CAMERA_STATUS)
-        self.pixhawk_connection_label.setText(STARTUP_PIXHAWK_STATUS)
-        self._log(STARTUP_READY_MESSAGE)
+        if self.mavlink_only_runtime:
+            self.pixhawk_connection_label.setText(STARTUP_PIXHAWK_MAVLINK_STATUS)
+            self._log(
+                "[연결] MAVLink-only 모드입니다. ROS2/uXRCE-DDS bootstrap, topic 탐색, ROS2 연결을 사용하지 않습니다. "
+                "MAVLink 연결 후 telemetry 수신을 확인하세요."
+            )
+        else:
+            self.pixhawk_connection_label.setText(STARTUP_PIXHAWK_STATUS)
+            self._log(STARTUP_READY_MESSAGE)
         self._recover_retryable_recording_session()
         if self.auto_start_pixhawk:
             QtCore.QTimer.singleShot(500, self._auto_start_pixhawk)
@@ -21860,6 +21963,9 @@ def main() -> int:
         pass
     ui_mode, cleaned_argv = _parse_ui_mode(list(sys.argv))
     sys.argv[:] = cleaned_argv
+    if "--mavlink-only" in sys.argv:
+        os.environ["SASL_MAVLINK_ONLY"] = "1"
+        sys.argv.remove("--mavlink-only")
     auto_start = "--start" in sys.argv
     if auto_start:
         sys.argv.remove("--start")

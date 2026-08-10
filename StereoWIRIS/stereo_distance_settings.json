@@ -45,14 +45,14 @@
   "ros_domain_id": 0,
   "left_namespace": "uav_0",
   "right_namespace": "uav_1",
-  "pixhawk_host_address": "172.30.1.69",
+  "pixhawk_host_address": "10.0.0.10",
   "left_pixhawk_eth_ip": "10.0.0.2",
   "right_pixhawk_eth_ip": "10.0.0.3",
-  "left_mavlink_url": "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6C.x_0-if00",
-  "right_mavlink_url": "udpin:0.0.0.0:14551",
+  "left_mavlink_url": "udpin:0.0.0.0:14550",
+  "right_mavlink_url": "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00",
   "left_mavlink_baud": 57600,
   "right_mavlink_baud": 57600,
-  "left_pixhawk_bootstrap_url": "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6C.x_0-if00",
+  "left_pixhawk_bootstrap_url": "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00",
   "right_pixhawk_bootstrap_url": "/dev/serial/by-id/usb-Auterion_PX4_FMU_v6X.x_0-if00",
   "left_pixhawk_bootstrap_baud": 57600,
   "right_pixhawk_bootstrap_baud": 57600,
@@ -76,7 +76,7 @@
   "gnss_operation": {
     "site_label": "",
     "site_address": "",
-    "operation_mode": "NETWORK_ASSISTED_FIXED_BASE",
+    "operation_mode": "NETWORK_RTK_DIRECT",
     "require_drone_rtk_fixed": false,
     "readiness_gate_enabled": true,
     "readiness": {
@@ -121,7 +121,7 @@
       "left_enabled": true,
       "right_enabled": true,
       "drone_enabled": false,
-      "field_base_enabled": true
+      "field_base_enabled": false
     }
   },
   "clock_ftp_user": "anonymous",

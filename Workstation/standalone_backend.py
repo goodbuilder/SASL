@@ -1,0 +1,292 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from PyQt5 import QtCore, QtWidgets
+
+from .evidence import EvidenceAdapter
+
+
+class StandalonePanelBackend(QtCore.QObject):
+    """Backend for the Workstation-owned copy of the panel.
+
+    This is the only backend adapter in the Workstation package.  It evolves
+    with the standalone owner without importing or instantiating a sibling UI
+    runtime.
+    """
+
+    command_error = QtCore.pyqtSignal(str)
+
+    def __init__(self, panel: QtWidgets.QWidget, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self.panel = panel
+        self.evidence = EvidenceAdapter(panel)
+
+    @property
+    def owner_widget(self) -> QtWidgets.QWidget:
+        return self.panel
+
+    def _call(self, name: str, *args: object, **kwargs: object) -> Any:
+        method = getattr(self.panel, name, None)
+        if not callable(method):
+            message = f"backend command unavailable: {name}"
+            self.command_error.emit(message)
+            raise RuntimeError(message)
+        try:
+            return method(*args, **kwargs)
+        except Exception as exc:
+            message = f"{name}: {exc}"
+            self.command_error.emit(message)
+            raise RuntimeError(message) from exc
+
+    def toggle_camera(self) -> Any:
+        return self._call("toggle_camera_connection")
+
+    def toggle_detection(self) -> Any:
+        return self._call("toggle_yolo_detection")
+
+    def toggle_recording(self) -> Any:
+        return self._call("toggle_session_recording")
+
+    def save_session(self) -> Any:
+        return self._call("save_distance_history_csv")
+
+    # Operation facades delegate to the standalone panel owner.  The
+    # Workstation has one camera/telemetry worker per runtime; sibling
+    # applications keep independent resource owners.
+    def camera_discover_host_ip(self) -> Any:
+        return self._call("discover_pc_camera_ip")
+
+    def camera_apply_candidate(self, row: int, target: str) -> Any:
+        return self._call("apply_camera_candidate", row, target)
+
+    def camera_auto_connect(self) -> Any:
+        return self._call("auto_connect_wiris")
+
+    def camera_check_rtsp(self) -> Any:
+        return self._call("check_cameras")
+
+    def camera_check_control(self) -> Any:
+        return self._call("check_wiris_control")
+
+    def camera_enable_rtsp(self) -> Any:
+        return self._call("enable_wiris_rtsp")
+
+    def camera_swap(self) -> Any:
+        return self._call("swap_cameras")
+
+    def camera_save_settings(self) -> Any:
+        return self._call("save_current_settings_from_ui")
+
+    def time_set_pc(self) -> Any:
+        """Set the selected WIRIS camera clock from the existing PC-time path."""
+
+        return self._call("set_selected_wiris_time_from_pc")
+
+    def time_check_sync(self) -> Any:
+        """Refresh the existing RTCP/NTP synchronization evidence."""
+
+        return self._call("refresh_clock_sync_status")
+
+    def pixhawk_toggle_mavlink(self) -> Any:
+        return self._call("toggle_mavlink_connection")
+
+    def pixhawk_recover_eth_mavlink(self, camera: str) -> Any:
+        """Recover one PX4 Ethernet MAVLink stream through its USB shell path."""
+
+        return self._call("bootstrap_ethernet_mavlink_from_usb", camera)
+
+    def pixhawk_discover_usb(self) -> Any:
+        return self._call("discover_usb_pixhawk_connections")
+
+    def pixhawk_discover_mavlink_candidates(self) -> Any:
+        return self._call("discover_mavlink_url_candidates")
+
+    def pixhawk_discover_host_ip(self) -> Any:
+        return self._call("discover_pc_pixhawk_ip")
+
+    def pixhawk_apply_candidate(self, source: str, row: int, target: str) -> Any:
+        return self._call("apply_pixhawk_candidate", source, row, target)
+
+    def gnss_base_discover(self) -> Any:
+        return self._call("discover_gnss_base_serial_ports")
+
+    def gnss_base_apply_candidate(self, row: int) -> Any:
+        return self._call("apply_gnss_base_candidate", row)
+
+    def gnss_base_connect(self) -> Any:
+        return self._call("connect_gnss_base_serial")
+
+    def gnss_base_disconnect(self) -> Any:
+        return self._call("disconnect_gnss_base_serial")
+
+    def gnss_survey_start(self) -> Any:
+        return self._call("start_gnss_base_survey_in")
+
+    def gnss_survey_stop(self) -> Any:
+        return self._call("stop_gnss_base_survey_in")
+
+    def gnss_ntrip_start(self) -> Any:
+        return self._call("start_gnss_network")
+
+    def gnss_ntrip_stop(self) -> Any:
+        # The stop handler returns False while its worker is still
+        # winding down.  That is a pending postcondition, not a rejected
+        # command, so do not surface it as CommandRegistry failure.
+        self._call("stop_gnss_network")
+        return None
+
+    def calibration_capture_images(self) -> Any:
+        return self._call("capture_calibration_images")
+
+    def calibration_run_intrinsic(self) -> Any:
+        return self._call("run_intrinsic_calibration")
+
+    def calibration_save_intrinsics(self) -> Any:
+        return self._call("save_intrinsics")
+
+    def calibration_load_intrinsics(self) -> Any:
+        return self._call("load_intrinsics")
+
+    def calibration_load_current_zoom_intrinsics(self) -> Any:
+        return self._call("load_current_zoom_intrinsics")
+
+    def calibration_apply_intrinsics(self) -> Any:
+        return self._call("apply_intrinsics_to_distance")
+
+    def calibration_load_validation(self) -> Any:
+        return self._call("load_checkerboard_validation_json")
+
+    def calibration_run_validation(self) -> Any:
+        return self._call("run_checkerboard_random_validation")
+
+    def calibration_save_validation(self) -> Any:
+        return self._call("save_checkerboard_validation_result")
+
+    def calibration_apply_validation(self) -> Any:
+        return self._call("apply_checkerboard_validation_result")
+
+    def apply_measurement_settings(self, settings: dict[str, object]) -> Any:
+        """Apply Workstation-owned controls through the existing panel owner."""
+
+        return self._call("apply_workstation_measurement_settings", dict(settings))
+
+    def save_measurement_settings(self) -> Any:
+        return self._call("save_current_settings_from_ui")
+
+    def workstation_settings_snapshot(self) -> Any:
+        return self._call("workstation_settings_snapshot")
+
+    def apply_workstation_system_settings(self, settings: dict[str, object]) -> Any:
+        return self._call("apply_workstation_system_settings", dict(settings))
+
+    def save_workstation_system_settings(self) -> Any:
+        return self._call("save_current_settings_from_ui")
+
+    def calibration_apply_setup(self, setup: dict[str, object]) -> Any:
+        return self._call("apply_workstation_calibration_setup", dict(setup))
+
+    def calibration_scan_validation(self) -> Any:
+        return self._call("scan_checkerboard_validation_files")
+
+    def calibration_save_setup(self) -> Any:
+        return self._call("save_current_settings_from_ui")
+
+    def alignment_scan_sources(self) -> Any:
+        return self._call("refresh_baseline_field_browser")
+
+    def alignment_start_sampling(self) -> Any:
+        return self._call("start_baseline_sampling")
+
+    def alignment_stop_sampling(self) -> Any:
+        return self._call("stop_baseline_sampling")
+
+    def alignment_save_profile(self) -> Any:
+        return self._call("save_alignment_profile")
+
+    def alignment_load_profile(self) -> Any:
+        return self._call("load_alignment_profile")
+
+    def alignment_swap_pixhawks(self) -> Any:
+        return self._call("swap_pixhawks")
+
+    # Advanced owner tools. These are intentionally typed entry points for
+    # Workstation; the panel remains the sole owner of TCP/MAVLink resources,
+    # dialogs, preview workers, and session writers.
+    def advanced_wiris_catalog(self) -> Any:
+        return self._call("workstation_wiris_command_catalog")
+
+    def advanced_send_wiris_command(self, target: str, command: str, terminator: str) -> Any:
+        return self._call("workstation_send_wiris_command", target, command, terminator)
+
+    def advanced_send_zoom(self, target: str, action: str, level: int | None = None) -> Any:
+        return self._call("workstation_send_zoom", target, action, level)
+
+    def advanced_discover_custom_mavlink_watch(self) -> Any:
+        return self._call("workstation_discover_custom_mavlink_watch")
+
+    def advanced_add_custom_mavlink_watch(self, name: str, message: str, field: str) -> Any:
+        return self._call("workstation_add_custom_mavlink_watch", name, message, field)
+
+    def advanced_remove_custom_mavlink_watch(self, key: str) -> Any:
+        return self._call("workstation_remove_custom_mavlink_watch", key)
+
+    def advanced_refresh_baseline_fields(self) -> Any:
+        return self._call("workstation_refresh_baseline_field_browser")
+
+    def advanced_open_px4_shell(self, camera: str) -> Any:
+        return self._call("workstation_open_px4_shell", camera)
+
+    def advanced_refresh_px4_mag(self, camera: str, *, read_params: bool = True) -> Any:
+        return self._call("workstation_refresh_px4_mag", camera, read_params=read_params)
+
+    def advanced_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> Any:
+        return self._call("workstation_refresh_px4_attitude_cal", camera, read_params=read_params)
+
+    def advanced_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> Any:
+        return self._call("workstation_apply_px4_mag_priorities", camera, dict(priorities))
+
+    def advanced_save_px4_mag_params(self, camera: str) -> Any:
+        return self._call("workstation_save_px4_mag_params", camera)
+
+    def advanced_reboot_px4(self, camera: str) -> Any:
+        return self._call("workstation_reboot_px4", camera)
+
+    def advanced_refresh_calibration_preview(self) -> Any:
+        return self._call("workstation_refresh_calibration_preview")
+
+    def advanced_calibration_preview_snapshot(self) -> Any:
+        return self._call("workstation_calibration_preview_snapshot")
+
+    def diagnostic_text(self) -> str:
+        sources = []
+        for attr in ("camera_yolo_log", "pixhawk_log", "wiris_log"):
+            widget = getattr(self.panel, attr, None)
+            if widget is None or not hasattr(widget, "toPlainText"):
+                continue
+            text = widget.toPlainText().strip()
+            if text:
+                sources.append(f"[{attr}]\n{text}")
+        return "\n\n".join(sources)
+
+    def shutdown_for_close(self) -> bool:
+        method = getattr(self.panel, "shutdown_for_close", None)
+        if callable(method):
+            return bool(method())
+        stop = getattr(self.panel, "stop_all", None)
+        if callable(stop):
+            stop(wait=True)
+        wait = getattr(self.panel, "_wait_for_session_save", None)
+        return True if not callable(wait) else bool(wait())
+
+
+def create_standalone_backend(
+    *,
+    auto_start: bool = False,
+    auto_start_pixhawk: bool = False,
+) -> StandalonePanelBackend:
+    from Workstation.standalone_gui import WirisStereoDistancePanel
+
+    panel = WirisStereoDistancePanel(auto_start=auto_start, auto_start_pixhawk=auto_start_pixhawk)
+    return StandalonePanelBackend(panel)

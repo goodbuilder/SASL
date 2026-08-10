@@ -28,9 +28,52 @@ workstation_ui_requested() {
   return 1
 }
 
+mavlink_only_requested() {
+  local override mode argument
+
+  # The launcher may be used from CI or a field script where the persisted
+  # settings file is intentionally not modified.  An explicit runtime flag
+  # therefore takes precedence over the saved mode.
+  for argument in "$@"; do
+    if [[ "$argument" == "--mavlink-only" ]]; then
+      return 0
+    fi
+  done
+
+  override="${SASL_MAVLINK_ONLY:-}"
+  if [[ "$override" == "1" ]]; then
+    return 0
+  fi
+  if [[ "$override" == "0" ]]; then
+    return 1
+  fi
+
+  mode="${SASL_PIXHAWK_ETHERNET_MODE:-}"
+  if [[ -n "$mode" ]]; then
+    [[ "$mode" == "mavlink" ]]
+    return
+  fi
+
+  # Legacy persists its mode in this repository-local JSON file.  Keep the
+  # check dependency-free so the decision can be made before any ROS setup is
+  # sourced.  The application validates the JSON again in Python.
+  if [[ -f "$APP_DIR/stereo_distance_settings.json" ]] && \
+    grep -Eq '"pixhawk_ethernet_mode"[[:space:]]*:[[:space:]]*"mavlink"' \
+      "$APP_DIR/stereo_distance_settings.json"; then
+    return 0
+  fi
+
+  return 1
+}
+
 WORKSTATION_UI_REQUESTED=0
 if workstation_ui_requested "$@"; then
   WORKSTATION_UI_REQUESTED=1
+fi
+MAVLINK_ONLY_REQUESTED=0
+if [[ "$WORKSTATION_UI_REQUESTED" != "1" ]] && mavlink_only_requested "$@"; then
+  MAVLINK_ONLY_REQUESTED=1
+  export SASL_MAVLINK_ONLY=1
 fi
 CHECK_REQUESTED=0
 for argument in "$@"; do
@@ -43,12 +86,13 @@ done
 usage() {
   cat <<'USAGE'
 Usage:
-  StereoWIRIS/run.sh [--check] [--ui legacy|workstation] [app args...]
+  StereoWIRIS/run.sh [--check] [--mavlink-only] [--ui legacy|workstation] [app args...]
 
 Starts the StereoWIRIS GUI application.
 
 Options:
   --check   Verify Python and import paths without starting the GUI.
+  --mavlink-only  Start Legacy without ROS2/uXRCE-DDS dependencies.
   --ui      Select the single operational UI for this process; default is legacy.
   --help    Show this help.
 USAGE
@@ -94,17 +138,6 @@ require_canonical_px4_msgs_overlay() {
   fi
 }
 
-if [[ "$WORKSTATION_UI_REQUESTED" != "1" ]]; then
-  if ! require_canonical_px4_msgs_overlay; then
-    exit 2
-  fi
-
-  # ROS setup scripts may reference unset variables, so do not enable nounset here.
-  source /opt/ros/humble/setup.bash
-  # shellcheck disable=SC1090
-  source "$PX4_MSGS_OVERLAY_SETUP"
-fi
-
 resolve_python() {
   local candidate resolved
   for candidate in "$@"; do
@@ -130,6 +163,17 @@ if [[ -z "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(resolve_python "$APP_DIR/.venv/bin/python" "$SASL_ROOT/Simulation/.venv/bin/python" python3 python)"
 fi
 
+if [[ "$WORKSTATION_UI_REQUESTED" != "1" && "$MAVLINK_ONLY_REQUESTED" != "1" ]]; then
+  if ! require_canonical_px4_msgs_overlay; then
+    exit 2
+  fi
+
+  # ROS setup scripts may reference unset variables, so do not enable nounset here.
+  source /opt/ros/humble/setup.bash
+  # shellcheck disable=SC1090
+  source "$PX4_MSGS_OVERLAY_SETUP"
+fi
+
 if [[ "$CHECK_REQUESTED" == "1" ]]; then
     export PYTHONPATH="$APP_DIR/compat:$APP_DIR:$SASL_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     if [[ "$WORKSTATION_UI_REQUESTED" == "1" ]]; then
@@ -144,7 +188,7 @@ import xlsxwriter
 import yaml
 
 import sasl_common.lifecycle
-import workstation.standalone_gui
+import Workstation.standalone_gui
 
 print("StereoWIRIS Workstation runtime check ok")
 print(f"python={sys.executable}")
@@ -169,7 +213,7 @@ import sasl_common.stereo_geometry
 import sasl_common.lifecycle
 import wiris_stereo_distance.gui
 import wiris_stereo_distance.legacy_gui
-import workstation.standalone_gui
+import Workstation.standalone_gui
 
 print("StereoWIRIS runtime check ok")
 print(f"python={sys.executable}")

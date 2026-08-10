@@ -88,7 +88,7 @@ Useful options:
 `--ui legacy`와 `--ui workstation`은 한 프로세스에서 하나의 operational UI만
 선택한다. Legacy UI 구현은 `legacy_gui.py`에 있고 기존 `gui.py`는 호환 alias로 남아 있으며,
 Workstation은
-저장소 루트의 `workstation/standalone_gui.py`/`StandalonePanelBackend` 경로를 사용한다. lifecycle은
+저장소 루트의 `Workstation/standalone_gui.py`/`StandalonePanelBackend` 경로를 사용한다. lifecycle은
 UI-neutral `sasl_common/lifecycle.py`를 공유하지만 panel/resource owner는 분리되어 있다. 두 UI는 서로의
 panel owner를 import하거나 instantiate하지 않는다. Workstation 복사본은 현재 공유
 measurement/camera/telemetry/calibration/recording 모듈과 저장·좌표 계약을 그대로 사용하며,

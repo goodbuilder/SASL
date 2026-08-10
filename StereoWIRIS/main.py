@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import os
 import sys
@@ -16,16 +17,52 @@ def _workstation_requested(argv: list[str]) -> bool:
     return False
 
 
-# Workstation is intentionally MAVLink/PC-clock/RTCP-NTP only.  Do not add
-# ROS Python/library paths to that process: Legacy still gets the existing
-# ROS bootstrap below, but an operator launching Workstation must not need a
-# ROS installation or a generated px4_msgs overlay just to start the UI.
+def _mavlink_only_requested(argv: list[str]) -> bool:
+    """Return whether Legacy must start without the ROS2 runtime bootstrap.
+
+    ``StereoWIRIS/run.sh`` makes the same decision before sourcing ROS.  The
+    duplicate, dependency-free check here keeps direct ``python main.py``
+    launches portable as well.  ``SASL_MAVLINK_ONLY=0`` is useful for an
+    operator or test that intentionally wants to validate the ROS2/dual path
+    against a saved MAVLink-only settings file.
+    """
+
+    if "--mavlink-only" in argv[1:]:
+        return True
+
+    override = os.environ.get("SASL_MAVLINK_ONLY", "").strip()
+    if override in {"0", "1"}:
+        return override == "1"
+
+    mode_override = os.environ.get("SASL_PIXHAWK_ETHERNET_MODE", "").strip().lower()
+    if mode_override:
+        return mode_override == "mavlink"
+
+    settings_path = SASL_ROOT / "StereoWIRIS" / "stereo_distance_settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return str(payload.get("pixhawk_ethernet_mode", "")).strip().lower() == "mavlink"
+
+
+# Workstation is intentionally MAVLink/PC-clock/RTCP-NTP only, and Legacy's
+# MAVLink-only mode has the same no-ROS bootstrap contract.  Do not add ROS
+# Python/library paths to either process unless Legacy is explicitly running
+# the dual/uXRCE transport.  An operator launching either MAVLink-only UI must
+# not need a ROS installation or a generated px4_msgs overlay just to start.
 WORKSTATION_REQUESTED = _workstation_requested(sys.argv)
+MAVLINK_ONLY_REQUESTED = _mavlink_only_requested(sys.argv)
+
+if not WORKSTATION_REQUESTED:
+    # The panel uses this runtime marker to disable ROS2-only controls and
+    # topic discovery.  It is deliberately set before importing Legacy GUI.
+    os.environ.setdefault("SASL_MAVLINK_ONLY", "1" if MAVLINK_ONLY_REQUESTED else "0")
 
 if str(SASL_ROOT) not in sys.path:
     sys.path.insert(0, str(SASL_ROOT))
 
-if not WORKSTATION_REQUESTED:
+if not WORKSTATION_REQUESTED and not MAVLINK_ONLY_REQUESTED:
     for ros_path in (
         Path("/opt/ros/humble/lib/python3.10/site-packages"),
         Path("/opt/ros/humble/local/lib/python3.10/dist-packages"),
@@ -62,7 +99,7 @@ def main() -> int:
     if _workstation_requested(sys.argv):
         print(
             "StereoWIRIS and workstation are independent apps; "
-            "launch workstation with `python -m workstation`.",
+            "launch Workstation with `python -m Workstation`.",
             file=sys.stderr,
         )
         return 2

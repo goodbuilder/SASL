@@ -48,6 +48,7 @@ def test_direct_python_entrypoint_uses_only_canonical_ros_workspace() -> None:
 def test_missing_source_fails_before_network_bootstrap() -> None:
     env = os.environ.copy()
     env["SASL_ROS_WORKSPACE"] = "/definitely/missing/sasl-workspace"
+    env["SASL_MAVLINK_ONLY"] = "0"
     result = subprocess.run(
         [str(RUNNER), "--check"],
         cwd=ROOT,
@@ -93,9 +94,29 @@ def test_workstation_check_skips_ros_overlay_bootstrap() -> None:
     assert result_reordered.returncode == 0, result_reordered.stderr
 
 
+def test_mavlink_only_check_skips_ros_overlay_bootstrap() -> None:
+    env = os.environ.copy()
+    env["SASL_ROS_WORKSPACE"] = "/definitely/missing/sasl-workspace"
+    env["SASL_MAVLINK_ONLY"] = "1"
+    result = subprocess.run(
+        [str(RUNNER), "--check"],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "StereoWIRIS runtime check ok" in result.stdout
+    assert "canonical px4_msgs source is missing" not in result.stderr
+
+
 def test_runner_keeps_ros_bootstrap_conditional_to_legacy() -> None:
     source = RUNNER.read_text(encoding="utf-8")
 
     assert 'WORKSTATION_UI_REQUESTED=0' in source
-    assert 'if [[ "$WORKSTATION_UI_REQUESTED" != "1" ]]; then' in source
+    assert 'MAVLINK_ONLY_REQUESTED=0' in source
+    assert 'if [[ "$WORKSTATION_UI_REQUESTED" != "1" && "$MAVLINK_ONLY_REQUESTED" != "1" ]]; then' in source
     assert 'source /opt/ros/humble/setup.bash' in source

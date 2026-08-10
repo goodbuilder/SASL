@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-testpaths = ["StereoWIRIS/tests", "PoseSimulation/test", "Simulation/tests"]
+testpaths = ["StereoWIRIS/tests", "Workstation/tests", "PoseSimulation/test", "Simulation/tests"]
 addopts = "--strict-markers"
 norecursedirs = [
   ".git",

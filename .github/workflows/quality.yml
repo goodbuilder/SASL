@@ -31,4 +31,4 @@ jobs:
           StereoWIRIS/tests/test_coordinate_contract.py
           StereoWIRIS/tests/test_stereo_geometry_common.py
           StereoWIRIS/tests/test_triangulation.py
-          StereoWIRIS/tests/test_workstation.py
+          Workstation/tests/test_workstation.py

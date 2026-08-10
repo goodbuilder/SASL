@@ -3420,6 +3420,38 @@ def test_mavlink_connection_routes_sensor_signals_to_alignment(monkeypatch) -> N
     _ = app
 
 
+def test_mavlink_only_runtime_never_scans_or_connects_ros2(monkeypatch) -> None:
+    from PyQt5 import QtWidgets
+
+    import wiris_stereo_distance.gui as gui
+
+    monkeypatch.setenv("SASL_MAVLINK_ONLY", "1")
+    monkeypatch.setattr(gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+
+    def fail_ros2_scan(*_args, **_kwargs):
+        raise AssertionError("ROS2 topic discovery must not run in MAVLink-only mode")
+
+    monkeypatch.setattr(gui, "discover_ros2_topic_types", fail_ros2_scan)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    widget = gui.WirisStereoDistancePanel()
+
+    assert widget.mavlink_only_runtime is True
+    assert widget.pixhawk_ros2_telemetry_group.isHidden()
+    assert widget.pixhawk_ros2_candidate_group.isHidden()
+    assert widget.baseline_ros2_group.isHidden()
+    assert not widget.pixhawk_ethernet_mode_combo.isEnabled()
+    assert not widget.mavlink_configure_uxrce_agent_checkbox.isEnabled()
+    assert widget.connect_pixhawk("left") is False
+
+    widget.refresh_baseline_field_browser()
+    widget.auto_detect_pixhawks()
+    widget.toggle_ros2_connection("left")
+    assert widget.pixhawk_ros2_subscribers == {"left": None, "right": None}
+
+    widget.deleteLater()
+    _ = app
+
+
 def test_mavlink_connection_requests_and_logs_actual_eth0_ip(monkeypatch) -> None:
     from PyQt5 import QtWidgets
 

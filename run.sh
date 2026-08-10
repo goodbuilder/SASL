@@ -34,8 +34,8 @@ mkdir -p "$MPLCONFIGDIR"
 
 case "${1:-}" in
   --check|--help|-h)
-    exec "$PYTHON_BIN" -m workstation "$@"
+    exec "$PYTHON_BIN" -m Workstation "$@"
     ;;
 esac
 
-exec "$PYTHON_BIN" -m workstation --maximized "$@"
+exec "$PYTHON_BIN" -m Workstation --maximized "$@"

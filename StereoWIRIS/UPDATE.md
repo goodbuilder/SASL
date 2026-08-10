@@ -7,7 +7,7 @@
 - 두 Rover RTCM 대상은 `both`로 유지하며, Rover `RTK Fixed`는 상태/증거로 표시하되 기본 readiness 조건은 `fix_type >= 3`으로 남겼다.
 - 현장 위치가 바뀔 때 이전 좌표 프로파일을 재사용하지 않도록 세션 종료·Base 재연결에서 최신 좌표를 지우고, `permit_profile_reuse=false`를 유지한다. Survey-in 기본값은 `300 s / 0.5 m`이다.
 
-Coordinate contract checked: `workstation_core/gnss_operation.py`, `workstation_core/gnss_network.py`, `workstation_core/gnss_protocol.py`, `workstation/gnss_runtime_controller.py`, `workstation/standalone_gui.py`, `StereoWIRIS/wiris_stereo_distance/gnss_operation.py`, `StereoWIRIS/wiris_stereo_distance/gnss_network.py`, `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, GNSS tests; WGS84 geodetic/ECEF, explicit ellipsoid/MSL height, PX4 NED, body-FRD, camera optical RDF, and stereo-center contracts remain distinct.
+Coordinate contract checked: `Workstation/workstation_core/gnss_operation.py`, `Workstation/workstation_core/gnss_network.py`, `Workstation/workstation_core/gnss_protocol.py`, `Workstation/gnss_runtime_controller.py`, `Workstation/standalone_gui.py`, `StereoWIRIS/wiris_stereo_distance/gnss_operation.py`, `StereoWIRIS/wiris_stereo_distance/gnss_network.py`, `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, GNSS tests; WGS84 geodetic/ECEF, explicit ellipsoid/MSL height, PX4 NED, body-FRD, camera optical RDF, and stereo-center contracts remain distinct.
 
 ## v2.2.5 — 2026-08-10 — Sync limits를 Time/Sync로 이동
 
@@ -28,7 +28,7 @@ Coordinate contract checked: `workstation_core/gnss_operation.py`, `workstation_
 - 남은 위험:
   - 실제 장비 화면에서 좁은 해상도의 Time/Sync 배치와 설정 적용 결과는 현장 확인이 필요하다.
 
-Coordinate contract checked: `workstation/workspaces.py`, `workstation/main_window.py`, `workstation/standalone_gui.py`, `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, 관련 Workstation/Legacy tests; NED, ENU, PX4 body-FRD, OpenCV optical RDF, stereo-center, WIRIS RTC/RTCP/NTP UTC, PC UTC, CSV 공간 축 값은 이동하거나 재해석하지 않았다.
+Coordinate contract checked: `Workstation/workspaces.py`, `Workstation/main_window.py`, `Workstation/standalone_gui.py`, `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, 관련 Workstation/Legacy tests; NED, ENU, PX4 body-FRD, OpenCV optical RDF, stereo-center, WIRIS RTC/RTCP/NTP UTC, PC UTC, CSV 공간 축 값은 이동하거나 재해석하지 않았다.
 
 ## v2.2.4 — 2026-08-10 — Legacy StereoWIRIS WIRIS RTC STUS 전송 지연 보정
 
@@ -77,7 +77,7 @@ Coordinate contract checked: Legacy WIRIS RTC, GDTI, RTCP Sender Report NTP-deri
   - 가정: 제어 경로의 양방향 지연이 대체로 대칭이며, 2ms 파싱 여유가 현재 펌웨어의 명령 처리 오차를 흡수한다.
   - 통과 기준: 각 STUS 결과가 성공하고, 카메라별 보정 메타데이터가 저장되며, 이후 GDTI·RTCP/NTP 검증 단계가 계속 수행된다.
 - 확인:
-  - `QT_QPA_PLATFORM=offscreen python3 -m pytest StereoWIRIS/tests/test_workstation.py -k 'wiris_clock_worker or wiris_stus_compensation' -q` — 2 passed.
+  - `QT_QPA_PLATFORM=offscreen python3 -m pytest Workstation/tests/test_workstation.py -k 'wiris_clock_worker or wiris_stus_compensation' -q` — 2 passed.
   - Workstation/RTSP timing/recording 집중 회귀 — `137 passed`.
   - 전체 저장소 회귀(`ROS_LOG_DIR=/tmp/sasl-ros-log MPLCONFIGDIR=/tmp/sasl-mpl QT_QPA_PLATFORM=offscreen python3 -m pytest -q`) — `2178 passed, 98 skipped, 2 warnings`.
 - 남은 위험:
@@ -92,17 +92,17 @@ Coordinate contract checked: WIRIS RTC/RTCP Sender Report NTP-derived UTC/PC UTC
   - Workstation과 Legacy StereoWIRIS는 완전히 분리된 앱이므로 어느 한쪽의 구현 파일을 다른 앱에서 import해 대체하지 않는다.
   - 동일한 장치/측정 개념이 있더라도 앱별 runtime owner와 데이터 root를 유지하고, 공통화가 필요할 때만 앱 중립 `sasl_common` 계약을 사용한다.
 - 변경:
-  - `standalone_gui.py`에 있던 UBX/RTCM frame 생성·파싱과 field-base serial probe를 Workstation 전용 `workstation_core/gnss_protocol.py`로 옮겼다.
+  - `standalone_gui.py`에 있던 UBX/RTCM frame 생성·파싱과 field-base serial probe를 Workstation 전용 `Workstation/workstation_core/gnss_protocol.py`로 옮겼다.
   - WGS84 geodetic/ellipsoid/MSL, CFG-TMODE3 ECEF cm+0.1 mm 계약을 명시하고 PX4 NED, body FRD, camera frame과 혼용하지 않게 했다.
-  - live camera 상태와 timestamp 문자열 생성을 `workstation_core/runtime_camera_status.py`로 옮겼다. RTCP/NTP UTC, source clock, host receive 시각은 서로 다른 provenance로 유지한다.
-  - attitude history, generic telemetry, RTK/alignment plot widget을 Workstation 전용 `workstation/telemetry_plots.py`로 옮겼다. GPS local NED와 P1 optical RDF 입력은 표시 계층에서 변환하지 않는다.
-  - integer PARAM write/readback과 calibration REAL32 read adapter를 `workstation_core/mavlink_parameter_store.py`로 옮겼다.
-  - 기존 `workstation.standalone_gui` 함수·클래스 이름은 re-export해 공개 호출 표면을 유지했다.
+  - live camera 상태와 timestamp 문자열 생성을 `Workstation/workstation_core/runtime_camera_status.py`로 옮겼다. RTCP/NTP UTC, source clock, host receive 시각은 서로 다른 provenance로 유지한다.
+  - attitude history, generic telemetry, RTK/alignment plot widget을 Workstation 전용 `Workstation/telemetry_plots.py`로 옮겼다. GPS local NED와 P1 optical RDF 입력은 표시 계층에서 변환하지 않는다.
+  - integer PARAM write/readback과 calibration REAL32 read adapter를 `Workstation/workstation_core/mavlink_parameter_store.py`로 옮겼다.
+  - 기존 `Workstation.standalone_gui` 함수·클래스 이름은 re-export해 공개 호출 표면을 유지했다.
 - 검증:
   - Workstation GNSS/runtime status/telemetry plot/PARAM adapter/독립 실행 집중 회귀 `72 passed`.
   - `standalone_gui.py`는 22,304줄에서 약 21,100줄로 감소했다. 남은 대형 panel 초기화와 기능군은 Workstation 내부 모듈로 계속 분리한다.
 
-Coordinate contract checked: `workstation_core/gnss_protocol.py`, `workstation_core/runtime_camera_status.py`, `workstation/telemetry_plots.py`, `workstation/standalone_gui.py`, Workstation tests; WGS84 geodetic/ECEF, GPS local NED, P1 optical RDF, RTCP/NTP UTC, source clock, and host receive time remain distinct.
+Coordinate contract checked: `Workstation/workstation_core/gnss_protocol.py`, `Workstation/workstation_core/runtime_camera_status.py`, `Workstation/telemetry_plots.py`, `Workstation/standalone_gui.py`, Workstation tests; WGS84 geodetic/ECEF, GPS local NED, P1 optical RDF, RTCP/NTP UTC, source clock, and host receive time remain distinct.
 
 ## v2.2.0 — 2026-08-10 — StereoDistanceNode 순수 정책 분리
 
@@ -226,11 +226,11 @@ Coordinate contract checked: `README.md`, `StereoWIRIS/recordings/README.md`; ra
 - 확인:
   - Workstation regression: **58 passed**.
   - 전체 `StereoWIRIS/tests`: **672 passed**.
-  - `python3 -m py_compile workstation/standalone_gui.py workstation_core/pixhawk_attitude.py`, `git diff --check` 통과.
+  - `python3 -m py_compile Workstation/standalone_gui.py Workstation/workstation_core/pixhawk_attitude.py`, `git diff --check` 통과.
 - 남은 위험:
   - 실제 RTSP/Pixhawk/GNSS 장비의 heartbeat·reconnect·writer flush와 장시간 close는 실장비/manual validation 범위다.
 
-Coordinate contract checked: `workstation_core/pixhawk_attitude.py`, `workstation/standalone_gui.py`, `workstation/command_registry.py`, `StereoWIRIS/tests/test_workstation.py`; MAVLink/RTCM transport threading only changed delivery ownership, while GPS/RTK raw NED `[N,E,D]`, P1 body FRD `[F,R,D]`, camera optical RDF, `baseline_center_frd`, WGS84 and source/receive timestamps remain unchanged.
+Coordinate contract checked: `Workstation/workstation_core/pixhawk_attitude.py`, `Workstation/standalone_gui.py`, `Workstation/command_registry.py`, `Workstation/tests/test_workstation.py`; MAVLink/RTCM transport threading only changed delivery ownership, while GPS/RTK raw NED `[N,E,D]`, P1 body FRD `[F,R,D]`, camera optical RDF, `baseline_center_frd`, WGS84 and source/receive timestamps remain unchanged.
 
 ## 2026-08-09 — P1→P2 body-FRD 기준선 파생값 명시
 
@@ -247,7 +247,7 @@ Coordinate contract checked: `workstation_core/pixhawk_attitude.py`, `workstatio
 - 남은 위험:
   - 실장비 GNSS/Pixhawk 자세 품질과 장시간 운용 검증은 별도 manual validation 범위다.
 
-Coordinate contract checked: `workstation_core/attitude_geometry.py`, `workstation_core/rtk_geometry.py`, `workstation_core/triangulation.py`, `workstation/standalone_gui.py`, `workstation/evidence.py`, `workstation/workspaces.py`, `workstation/status_model.py`; raw `P1→P2` local NED `[N,E,D]` remains distinct from derived P1 body FRD `[F,R,D]`, camera optical RDF, and `baseline_center_frd`.
+Coordinate contract checked: `Workstation/workstation_core/attitude_geometry.py`, `Workstation/workstation_core/rtk_geometry.py`, `Workstation/workstation_core/triangulation.py`, `Workstation/standalone_gui.py`, `Workstation/evidence.py`, `Workstation/workspaces.py`, `Workstation/status_model.py`; raw `P1→P2` local NED `[N,E,D]` remains distinct from derived P1 body FRD `[F,R,D]`, camera optical RDF, and `baseline_center_frd`.
 
 ## 2026-08-09 — Workstation 메인 카드 provenance 표시 정리
 
@@ -259,7 +259,7 @@ Coordinate contract checked: `workstation_core/attitude_geometry.py`, `workstati
   - Workstation regression **18 passed**.
   - source provenance를 메인 카드에서는 숨기고 Inspector에 유지하는 회귀를 추가했다.
 
-Coordinate contract checked: `workstation/components.py`, `workstation/inspector.py`, `workstation/workspaces.py`; display-only provenance formatting changed, while PX4 FRD→world NED, GPS NED, camera RDF, and `baseline_center_frd` contracts remain unchanged.
+Coordinate contract checked: `Workstation/components.py`, `Workstation/inspector.py`, `Workstation/workspaces.py`; display-only provenance formatting changed, while PX4 FRD→world NED, GPS NED, camera RDF, and `baseline_center_frd` contracts remain unchanged.
 
 ## 2026-08-09 — Workstation 전체 설정 편집 surface 통합
 
@@ -277,7 +277,7 @@ Coordinate contract checked: `workstation/components.py`, `workstation/inspector
 - 남은 위험:
   - 실제 RTSP/WIRIS/Pixhawk/ROS2/GNSS/NTRIP 연결과 장시간 운용은 여전히 실장비/manual 검증 범위다.
 
-Coordinate contract checked: `gui.py`, `workstation/settings_workspace.py`, `workstation/backend.py`, `workstation/workspaces.py`, `gnss_operation.py`, `coordinate_contract.py`; Workstation settings only route WGS84 GNSS/RTCM inputs and existing PX4 body FRD→world NED, GPS north/east/down NED, camera optical RDF, public `baseline_center_frd` forward/right/down contracts unchanged.
+Coordinate contract checked: `gui.py`, `Workstation/settings_workspace.py`, `Workstation/backend.py`, `Workstation/workspaces.py`, `gnss_operation.py`, `coordinate_contract.py`; Workstation settings only route WGS84 GNSS/RTCM inputs and existing PX4 body FRD→world NED, GPS north/east/down NED, camera optical RDF, public `baseline_center_frd` forward/right/down contracts unchanged.
 
 ## 2026-08-09 — Workstation 고급 owner workflow 직접 이관
 
@@ -292,12 +292,12 @@ Coordinate contract checked: `gui.py`, `workstation/settings_workspace.py`, `wor
   - 실장비 장시간 검증 이전에 남아 있던 고급 조작 진입점을 Workstation으로 옮기면서도 카메라/Pixhawk subscriber/preview worker/session writer를 중복 소유하지 않기 위해서다.
 - 확인:
   - Workstation test에 advanced facade/UI/좌표 계약 검증을 추가했다.
-  - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest StereoWIRIS/tests/test_workstation.py StereoWIRIS/tests/test_stereo_geometry_common.py StereoWIRIS/tests/test_coordinate_contract.py StereoWIRIS/tests/test_measurement_attempt.py StereoWIRIS/tests/test_measurement_controller.py StereoWIRIS/tests/test_triangulation.py StereoWIRIS/tests/test_recording_session.py -q` → **203 passed**.
+  - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest Workstation/tests/test_workstation.py StereoWIRIS/tests/test_stereo_geometry_common.py StereoWIRIS/tests/test_coordinate_contract.py StereoWIRIS/tests/test_measurement_attempt.py StereoWIRIS/tests/test_measurement_controller.py StereoWIRIS/tests/test_triangulation.py StereoWIRIS/tests/test_recording_session.py -q` → **203 passed**.
   - `QT_QPA_PLATFORM=offscreen PYTHONPATH=StereoWIRIS Simulation/.venv/bin/python -m pytest StereoWIRIS/tests -q` → **627 passed**.
 - 남은 위험:
   - 실제 RTSP/WIRIS SDK 응답, Pixhawk MAVLink PARAM/Shell/reboot, ROS2 field publisher, checkerboard frame/overlay, system video player와 장시간 session finalization은 실장비/manual 검증이 필요하다.
 
-Coordinate contract checked: `gui.py`, `workstation/backend.py`, `workstation/workspaces.py`, `workstation/inspector.py`, `coordinate_contract.py`, `pixhawk_attitude.py`, `rtk_geometry.py`, `recording_session.py`; WIRIS target은 좌/우 camera control endpoint로만 다루고, PX4 body FRD→world NED, GPS/RTK north/east/down NED, checkerboard/OpenCV optical RDF, public `baseline_center_frd` forward/right/down, 저장 `recording_time_ns`와 raw CSV field를 섞지 않았다.
+Coordinate contract checked: `gui.py`, `Workstation/backend.py`, `Workstation/workspaces.py`, `Workstation/inspector.py`, `coordinate_contract.py`, `pixhawk_attitude.py`, `rtk_geometry.py`, `recording_session.py`; WIRIS target은 좌/우 camera control endpoint로만 다루고, PX4 body FRD→world NED, GPS/RTK north/east/down NED, checkerboard/OpenCV optical RDF, public `baseline_center_frd` forward/right/down, 저장 `recording_time_ns`와 raw CSV field를 섞지 않았다.
 
 ## 2026-08-08 — Workstation 소프트웨어 이관 범위 확장 및 실장비 전 조건 정리
 
@@ -317,12 +317,12 @@ Coordinate contract checked: `gui.py`, `workstation/backend.py`, `workstation/wo
   - 실제 RTSP/Pixhawk/ROS2/GNSS/NTRIP, 영상 writer flush, 장시간 session finalization/close, 화면 가독성은 실장비/manual validation이 필요하다.
   - raw SDK/PX4/MAG/field-watch와 video playback/workbook export는 기존 owner의 고급 도구 handoff로 남겼다.
 
-Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.py`, `workstation/backend.py`, `gui.py`, `coordinate_contract.py`, `rtk_geometry.py`, `measurement_attempt.py`, `recording_session.py`; camera image/intrinsics는 OpenCV optical RDF와 px, Pixhawk attitude는 body FRD→world NED, GPS/RTK baseline은 north/east/down NED, public measurement는 `baseline_center_frd` forward/right/down/range, session preview는 저장된 `recording_time_ns`와 raw fields를 그대로 유지했다.
+Coordinate contract checked: `Workstation/evidence.py`, `Workstation/workspaces.py`, `Workstation/backend.py`, `gui.py`, `coordinate_contract.py`, `rtk_geometry.py`, `measurement_attempt.py`, `recording_session.py`; camera image/intrinsics는 OpenCV optical RDF와 px, Pixhawk attitude는 body FRD→world NED, GPS/RTK baseline은 north/east/down NED, public measurement는 `baseline_center_frd` forward/right/down/range, session preview는 저장된 `recording_time_ns`와 raw fields를 그대로 유지했다.
 
 ## 2026-08-08 — Workstation source-backed workflow projection 확장
 
 - 변경:
-  - `workstation/evidence.py`에 기존 패널의 `CameraExtrinsicState`, `GpsPositionState`, `RtkBaselineEstimate`, `DetectionObservation`, session spool/save worker, calibration result를 읽기 전용으로 투영하는 adapter를 추가했다.
+  - `Workstation/evidence.py`에 기존 패널의 `CameraExtrinsicState`, `GpsPositionState`, `RtkBaselineEstimate`, `DetectionObservation`, session spool/save worker, calibration result를 읽기 전용으로 투영하는 adapter를 추가했다.
   - Alignment 화면에 PX4 roll/pitch/yaw·PX4 timestamp/age, GPS fix/satellites/eph/epv, WGS84 receiver 값과 NED north/east/down baseline 표를 추가했다.
   - Calibration 화면에 active profile/zoom, 좌우 intrinsics pixel metrics, stereo R/T frame contract, validation summary를 추가했다.
   - Recording/Review/Export 화면에 session ID·elapsed·finalization/retry, sample counts, video path와 산출 artifact 목록을 추가했다. 실제 저장/review/export owner와 포맷은 기존 panel/session worker를 유지한다.
@@ -340,12 +340,12 @@ Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.
   - 실제 RTSP/Pixhawk/ROS2/GNSS와 SessionSaveWorker 장시간 finalization은 장비/manual smoke가 필요하다.
   - 테스트 두 건은 operator 설정과 분리해 repository default를 사용하도록 보완했지만, 전체 Qt suite는 누적 legacy panel worker teardown에서 `QThread: Destroyed while thread is still running`으로 중단되어 별도 조건으로 남아 있다. targeted suite는 이 중단과 분리해 통과했다.
 
-Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.py`, `workstation/inspector.py`, `workstation/status_model.py`, `coordinate_contract.py`, `pixhawk_attitude.py`, `rtk_geometry.py`, `stereo.py`; PX4/body FRD orientation→world NED, GPS WGS84 fields, RTK baseline NED north/east/down, camera optical/left-camera RDF, detection pixel u/v, public `baseline_center_frd` forward/right/down, and app/source/PX4/RTCP timestamps were kept separate and covered by Workstation/coordinate regression tests.
+Coordinate contract checked: `Workstation/evidence.py`, `Workstation/workspaces.py`, `Workstation/inspector.py`, `Workstation/status_model.py`, `coordinate_contract.py`, `pixhawk_attitude.py`, `rtk_geometry.py`, `stereo.py`; PX4/body FRD orientation→world NED, GPS WGS84 fields, RTK baseline NED north/east/down, camera optical/left-camera RDF, detection pixel u/v, public `baseline_center_frd` forward/right/down, and app/source/PX4/RTCP timestamps were kept separate and covered by Workstation/coordinate regression tests.
 
 ## 2026-08-08 — Workstation UI 설계 감사 및 구현 게이트 추가
 
 - 변경:
-  - `docs/ui/workstation/11_DESIGN_AUDIT_RESULT.md`에 실제 런처·상태·명령·데이터 흐름·스레드/종료·workspace·테스트 감사를 기록했다.
+  - `Workstation/docs/ui/11_DESIGN_AUDIT_RESULT.md`에 실제 런처·상태·명령·데이터 흐름·스레드/종료·workspace·테스트 감사를 기록했다.
   - 현재 Phase 1 operational UI는 `NO-GO`로 판정하고, launcher mode, 공통 shutdown/finalization, authoritative adapter를 구현 차단 조건으로 명시했다.
   - 09 구현 계획은 recording을 포함한 이틀 구현안에서 read-only foundation MVP와 legacy handoff 중심으로 축소했다.
 - 이유:
@@ -359,7 +359,7 @@ Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.
 
 - 변경:
   - `./run.sh --ui legacy|workstation` 런처 선택을 추가하고, 기본 legacy 실행과 한 프로세스당 하나의 operational UI 계약을 유지했다.
-  - 저장소 루트 `workstation/`에 QMainWindow shell, Navigation Tree, Overview/Camera/Measurement workspace, Inspector, Diagnostics dock, global status bar, QAction command registry를 추가했다.
+  - 저장소 루트 `Workstation/`에 QMainWindow shell, Navigation Tree, Overview/Camera/Measurement workspace, Inspector, Diagnostics dock, global status bar, QAction command registry를 추가했다.
   - 기존 `WirisStereoDistancePanel`을 유일한 camera/Pixhawk/GNSS/measurement/recording resource owner로 유지하는 `LegacyPanelBackend`를 추가했다. 새 UI는 측정·좌표·기록 알고리즘을 복제하지 않는다.
   - `BackendStatusAdapter`가 CameraPane frame age, ROS2/MAVLink attitude evidence, GNSS operation state, inference stats, MeasurementAttempt/result, session spool/save worker를 `StatusModel` 하나로 투영한다.
   - 설정 저장, 보조 worker, GNSS network/base, runtime worker, session save를 순서대로 처리하고 pending step을 재시도하는 UI-neutral `sasl_common/lifecycle.py`의 `LifecycleCoordinator`를 top-level close와 연결했다. Workstation 설정/recordings는 `workstation_data/`, Legacy는 `StereoWIRIS/`를 사용한다.
@@ -373,7 +373,7 @@ Coordinate contract checked: `workstation/evidence.py`, `workstation/workspaces.
   - 실제 RTSP, Pixhawk ROS2/MAVLink, GNSS/RTK, video writer finalization과 장시간 close는 하드웨어/manual smoke가 필요하다.
   - 현재 checkout의 settings가 `NETWORK_RTK_DIRECT`/`pixhawk_ethernet_mode=mavlink`를 선택해 기존 GNSS/MAVLink 테스트 일부의 기본 가정과 다르며, 별도로 보존한 사용자 Pixhawk endpoint 변경도 있다. 전체 Qt suite는 별도 worker teardown에서 종료되지 않았다. 사용자 상태는 되돌리지 않았다.
 
-Coordinate contract checked: `coordinate_contract.py`, `workstation/workspaces.py`, `workstation/status_model.py`, `measurement_attempt.py`, `rtk_geometry.py`, `recording_session.py`; world NED, PX4/body FRD, camera optical/left-camera RDF, baseline-center FRD, pixel px, app-receive/source/RTCP timestamps와 관련 회귀를 대조했다.
+Coordinate contract checked: `coordinate_contract.py`, `Workstation/workspaces.py`, `Workstation/status_model.py`, `measurement_attempt.py`, `rtk_geometry.py`, `recording_session.py`; world NED, PX4/body FRD, camera optical/left-camera RDF, baseline-center FRD, pixel px, app-receive/source/RTCP timestamps와 관련 회귀를 대조했다.
 
 ## 2026-08-08 — Workstation Measurement 상류 증거 및 실패 전파 보강
 
@@ -391,7 +391,7 @@ Coordinate contract checked: `coordinate_contract.py`, `workstation/workspaces.p
 - 남은 위험:
   - 실제 RTSP/Pixhawk/ROS2/GNSS와 장시간 SessionSaveWorker 종료는 장비/manual smoke가 필요하다.
 
-Coordinate contract checked: `workstation/workspaces.py`, `workstation/status_model.py`, `workstation/components.py`, `coordinate_contract.py`, `rtk_geometry.py`, `measurement_attempt.py`; public `baseline_center_frd` [forward/right/down]와 upstream GPS NED [north/east/down], camera optical/left-camera RDF, app-receive/RTCP/source timestamp를 혼합하지 않았고 관련 Workstation/좌표 회귀를 실행했다.
+Coordinate contract checked: `Workstation/workspaces.py`, `Workstation/status_model.py`, `Workstation/components.py`, `coordinate_contract.py`, `rtk_geometry.py`, `measurement_attempt.py`; public `baseline_center_frd` [forward/right/down]와 upstream GPS NED [north/east/down], camera optical/left-camera RDF, app-receive/RTCP/source timestamp를 혼합하지 않았고 관련 Workstation/좌표 회귀를 실행했다.
 
 ## 2026-08-03 — GNSS Survey-in 운용 안전성 보완
 
