@@ -1,0 +1,523 @@
+{
+  "manifest": "promoted_simulation_pass_candidates",
+  "version": 1,
+  "hardware_validated_complete_all_axis": false,
+  "default_recheck_command": "python3 apps/Simulation/scripts/check_promoted_simulation_pass_candidates.py --output-dir /tmp/sasl_promoted_pass_candidates_check",
+  "extended_recheck_command": "python3 apps/Simulation/scripts/check_promoted_simulation_pass_candidates.py --output-dir /tmp/sasl_promoted_pass_candidates_check_with_non_alias --include-non-alias-smoke",
+  "coordinate_contract": {
+    "internal_measurement_frame": "stereo-center RDF right/down/forward",
+    "public_stereodistance_frame": "FRD+range forward/right/down/range",
+    "truth_transform_requirement": "truth_rdf must come from explicit T_source_to_stereo_rdf or an already stereo-frame producer; direct NED-to-RDF alias is forbidden",
+    "runtime_truth_used": false
+  },
+  "candidates": [
+    {
+      "id": "origin_bbox_reprojection_grid_v1_component_gains_range_only_forward_fusion",
+      "status": "PASS",
+      "scope": "simulation_origin_saved_report",
+      "method": "origin-bbox-reprojection-grid-v1 + component_gains + range_only_forward_fusion",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625",
+        "result_txt": "apps/Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625/result.txt",
+        "validation_gate_summary_csv": "apps/Simulation/reports/origin_bbox_reprojection_validation_attitude_aware_component_gains_longprofile_right_att_0p1_20260609_seed20260625/validation_gate_summary.csv",
+        "final_pass": true,
+        "validation_trial_pass": "5/5",
+        "validation_sample_count": 1944,
+        "min_right_rmse_improvement_m": 0.00006538888756901784,
+        "min_down_rmse_improvement_m": 0.0021987374456409192,
+        "min_forward_rmse_improvement_m": 3.436332772030994
+      },
+      "runtime_contract": "Simulation-origin oracle-style validation; reprojection profile records corrected bbox diagnostics and uses raw Right/Down plus corrected Forward under range_only_forward_fusion.",
+      "promotion_limit": "simulation evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "bbox_anchor_global_fullscreen_right_att_0p1",
+      "status": "PASS",
+      "scope": "simulation_bbox_anchor_saved_report",
+      "method": "bbox internal origin anchor profile v1, global fullscreen anchor",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625",
+        "result_txt": "apps/Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625/result.txt",
+        "validation_gate_summary_csv": "apps/Simulation/reports/bbox_anchor_global_fullscreen_right_att_0p1_seed20260625/validation_gate_summary.csv",
+        "final_pass": true,
+        "validation_trial_pass": "5/5",
+        "validation_sample_count": 1654,
+        "min_right_rmse_improvement_m": 0.235088043,
+        "min_down_rmse_improvement_m": 0.000256281,
+        "min_forward_rmse_improvement_m": 34.78620407
+      },
+      "runtime_contract": "Runtime uses bbox x1/y1/width/height only, then stereo ray triangulation with right extrinsic rotation; validation report compares stereo-center RDF improvements.",
+      "promotion_limit": "simulation saved-report candidate only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "origin_bbox_output_validation_8trials_slow",
+      "status": "PASS",
+      "scope": "simulation_origin_bbox_output_saved_report",
+      "method": "origin-bbox output profile validation, slow 8-trial run",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616",
+        "result_txt": "apps/Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616/result.txt",
+        "summary_csv": "apps/Simulation/reports/origin_bbox_output_validation_8trials_slow_20260609_1530_seed20260616/summary.csv",
+        "final_pass": true,
+        "validation_trial_pass": "3/3",
+        "validation_sample_count": 1127,
+        "min_right_mae_improvement_m": 0.0152450943,
+        "min_down_mae_improvement_m": 0.0291990022,
+        "min_forward_mae_improvement_m": 0.47364686
+      },
+      "runtime_contract": "Metadata axis contract is stereo_center_frd:forward_right_down; checker requires corrected MAE to be strictly lower for Right, Down, and Forward in repo-local summary rows.",
+      "promotion_limit": "legacy simulation saved-report candidate only; metadata contains historical machine-local source paths, so current reproducibility evidence is limited to committed result/summary artifacts"
+    },
+    {
+      "id": "small_drone_multiburst_observation_inner_median_outer_median_b1x3_trim0p2_common0_sim3",
+      "status": "STRICT_PASS",
+      "scope": "simulation_small_drone_observation_fusion_saved_report",
+      "method": "small-drone multiburst observation fusion, 1 burst x 3 observations, median/median, trim 0.2, common 0.0, sim3 correction",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion",
+        "metrics_json": "apps/Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_metrics.json",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_method_summary.csv",
+        "scenario_pass": "2/2",
+        "trial_pass": "100/100",
+        "validation_rows": 9000,
+        "close_range_rmse_raw_to_corrected_m": "0.2775 -> 0.0623",
+        "mid_range_rmse_raw_to_corrected_m": "0.6143 -> 0.0953"
+      },
+      "runtime_contract": "Small-drone observation fusion consumes only runtime left_u_px, left_v_px, measured_disparity_px, fixed camera intrinsics, and fixed stereo baseline; validation truth remains offline-only.",
+      "promotion_limit": "small-drone synthetic close/mid scenario evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "small_drone_multiburst_observation_inner_median_outer_median_b3x5_trim0p2_common0_affine_ridge",
+      "status": "STRICT_PASS",
+      "scope": "simulation_small_drone_observation_fusion_saved_report",
+      "method": "small-drone multiburst observation fusion, 3 bursts x 5 observations, median/median, trim 0.2, common 0.0, affine ridge correction",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion",
+        "metrics_json": "apps/Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_metrics.json",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-213-small-drone-observation-fusion/small_drone_observation_method_summary.csv",
+        "scenario_pass": "2/2",
+        "trial_pass": "100/100",
+        "validation_rows": 9000,
+        "close_range_rmse_raw_to_corrected_m": "0.2775 -> 0.0337",
+        "mid_range_rmse_raw_to_corrected_m": "0.6143 -> 0.0524"
+      },
+      "runtime_contract": "Small-drone observation fusion consumes only runtime left_u_px, left_v_px, measured_disparity_px, fixed camera intrinsics, and fixed stereo baseline; validation truth remains offline-only.",
+      "promotion_limit": "quality-oriented small-drone synthetic close/mid scenario evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "repeated_observation_median_n3_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, median, n=3, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-201-bbox-outlier-repeated-observation-fusion",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-201-bbox-outlier-repeated-observation-fusion/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.5244",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.5377",
+        "target_max_abs_error_m": 2.6499217620864783
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic scenario only; independence and latency must be validated before hardware use"
+    },
+    {
+      "id": "repeated_observation_median_n7_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, median, n=7, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-201-bbox-outlier-repeated-observation-fusion",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-201-bbox-outlier-repeated-observation-fusion/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.3475",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.3651",
+        "target_max_abs_error_m": 2.150302617752459
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic scenario only; independence and latency must be validated before hardware use"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-202-bbox-outlier-repeated-observation-fusion-extended/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2213",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2475",
+        "target_max_abs_error_m": 1.1520381736604577
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic scenario only; independence and latency must be validated before hardware use"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p1",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.1",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-203-bbox-outlier-n15-trim0p1",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-203-bbox-outlier-n15-trim0p1/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2371",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2622",
+        "target_max_abs_error_m": 1.5324440793920076
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic n15 trim-sensitivity candidate only; trim0.2 remains the stronger n15 default"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p3",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.3",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-204-bbox-outlier-n15-trim0p3",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-204-bbox-outlier-n15-trim0p3/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2249",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2507",
+        "target_max_abs_error_m": 1.1750158595118592
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic n15 trim-sensitivity candidate only; trim0.2 remains the stronger n15 default"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n15_trim0p4",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=15, trim 0.4",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-205-bbox-outlier-n15-trim0p4",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-205-bbox-outlier-n15-trim0p4/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2370",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2616",
+        "target_max_abs_error_m": 1.18871662966626
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic n15 trim-sensitivity candidate only; trim0.2 remains the stronger n15 default"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n21_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=21, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-206-bbox-outlier-n21-trim0p2",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-206-bbox-outlier-n21-trim0p2/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1937",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2231",
+        "target_max_abs_error_m": 0.9268674399672818
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic quality candidate only; observation count requires latency validation"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n31_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=31, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-207-bbox-outlier-n31-trim0p2",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-207-bbox-outlier-n31-trim0p2/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1687",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2016",
+        "target_max_abs_error_m": 0.8864604513898939
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic quality candidate only; high observation count requires latency validation"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n51_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=51, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-208-bbox-outlier-n51-trim0p2",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-208-bbox-outlier-n51-trim0p2/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1455",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.1825",
+        "target_max_abs_error_m": 0.802752453134417
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic upper-bound candidate only; high observation count requires latency validation"
+    },
+    {
+      "id": "repeated_observation_trimmed_mean_n75_trim0p2",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_repeated_observation_saved_report",
+      "method": "repeated observation fusion, trimmed mean, n=75, trim 0.2",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-209-bbox-outlier-n75-trim0p2",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-209-bbox-outlier-n75-trim0p2/repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1319",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.1718",
+        "target_max_abs_error_m": 0.6138470657162998
+      },
+      "runtime_contract": "Repeated-observation fusion consumes multiple independent left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; PX4/RTK truth is synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic upper-bound candidate only; high observation count requires latency validation"
+    },
+    {
+      "id": "correlated_repeated_observation_trimmed_mean_n15_trim0p2_common0",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_correlated_repeated_observation_saved_report",
+      "method": "correlated repeated observation fusion, trimmed mean, n=15, trim 0.2, common 0.0",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation/correlated_repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2225",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2486",
+        "target_max_abs_error_m": 1.1762613852793038
+      },
+      "runtime_contract": "Correlated repeated-observation fusion consumes multiple left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; the correlation model and PX4/RTK truth are synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic correlated-observation candidate only; real observation correlation and latency must be validated"
+    },
+    {
+      "id": "correlated_repeated_observation_trimmed_mean_n31_trim0p2_common0",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_correlated_repeated_observation_saved_report",
+      "method": "correlated repeated observation fusion, trimmed mean, n=31, trim 0.2, common 0.0",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-210-bbox-outlier-correlated-repeated-observation/correlated_repeated_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.1690",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2019",
+        "target_max_abs_error_m": 0.9865546146425004
+      },
+      "runtime_contract": "Correlated repeated-observation fusion consumes multiple left_u_px, left_v_px, and measured_disparity_px observations plus fixed camera intrinsics/baseline; the correlation model and PX4/RTK truth are synthetic audit-only.",
+      "promotion_limit": "bbox-outlier synthetic correlated-observation quality candidate only; high observation count requires latency validation"
+    },
+    {
+      "id": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b5x5_trim0p2_common0p25",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_multiburst_common_mode_saved_report",
+      "method": "multi-burst observation fusion, inner trimmed mean, outer trimmed mean, 5 bursts x 5 observations, trim 0.2, common 0.25",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-211-bbox-outlier-multiburst-common-mode-fusion/multiburst_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.2460",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.2699",
+        "target_max_abs_error_m": 1.4121575735146052
+      },
+      "runtime_contract": "Multi-burst observation fusion consumes left_u_px, left_v_px, and measured_disparity_px observations grouped into bursts; common-mode error is synthetic/audit-only and PX4/RTK truth is not runtime input.",
+      "promotion_limit": "bbox-outlier common-mode synthetic candidate only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "multiburst_observation_inner_trimmed_mean_outer_median_b3x5_trim0p2_common1",
+      "status": "STRICT_PASS",
+      "scope": "simulation_bbox_outlier_multiburst_common_mode_saved_report",
+      "method": "multi-burst observation fusion, inner trimmed mean, outer median, 3 bursts x 5 observations, trim 0.2, common 1.0",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260617-212-bbox-outlier-multiburst-common1-confirmation",
+        "method_summary_csv": "apps/Simulation/reports/experiments/EXP-20260617-212-bbox-outlier-multiburst-common1-confirmation/multiburst_observation_method_summary.csv",
+        "trial_pass": "50/50",
+        "range_rmse_raw_to_corrected_m": "2.6590 -> 0.5249",
+        "position_rmse_raw_to_corrected_m": "5.0974 -> 0.5383",
+        "target_max_abs_error_m": 4.1930430413228805
+      },
+      "runtime_contract": "Multi-burst observation fusion consumes left_u_px, left_v_px, and measured_disparity_px observations grouped into bursts; common-mode error is synthetic/audit-only and PX4/RTK truth is not runtime input.",
+      "promotion_limit": "bbox-outlier common-mode synthetic scenario only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "multiburst_disparity_residual_aggregate_best",
+      "status": "PASS",
+      "scope": "simulation_multiburst_disparity_residual_aggregate_saved_report",
+      "method": "multiburst observation fusion b7x3 trim0.05 common0.5 + ray_scale log_disparity degree1 ridge1 clip0.5 residual",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary",
+        "summary_json": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary/multiburst_disparity_residual_summary.json",
+        "scenario_best_csv": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/aggregate_summary/multiburst_disparity_residual_scenario_best.csv",
+        "scenario_pass": "4/4",
+        "target_worst_observation_to_residual_m": "5.0912 -> 2.4378",
+        "range_rmse_observation_to_residual_mean_m": "1.4179 -> 0.4052",
+        "position_rmse_observation_to_residual_mean_m": "2.7947 -> 1.8618"
+      },
+      "runtime_contract": "Residual coefficients are fit with calibration-time truth only; runtime application consumes fused measured_disparity_px/log_disparity and corrected stereo-center RDF right/down/forward, then publishes public FRD+range.",
+      "promotion_limit": "simulation aggregate residual evidence only; scenario-specific residual catalogs still require explicit deployment labels or truth-free selector guards"
+    },
+    {
+      "id": "scenario_labeled_disparity_residual_profile_catalog_exp281",
+      "status": "PASS",
+      "scope": "simulation_disparity_residual_catalog_saved_report",
+      "method": "scenario-labeled disparity residual profile catalog selected by explicit deployment/scenario label",
+      "checker_included_by_default": true,
+      "evidence": {
+        "catalog_dir": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog",
+        "selector_json": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_label_selector.json",
+        "catalog_csv": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/scenario_residual_catalog/disparity_residual_profile_catalog.csv",
+        "runtime_export_summary_json": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/runtime_export_summary.json",
+        "operator_launch_check_json": "apps/Simulation/reports/experiments/EXP-20260618-281-fresh-stereodistance-disparity-residual-search/runtime_export_scenario_best/operator_view_launch_check_disparity_noise.json",
+        "selection_pass": "4/4",
+        "runtime_export_pass": "20/20",
+        "operator_launch_status": "PASS",
+        "scenario_labels": [
+          "bbox_outlier_stress",
+          "combined_sensor_stress",
+          "disparity_noise_stress",
+          "intrinsic_scale_stress"
+        ]
+      },
+      "runtime_contract": "Runtime residual profile selection uses explicit deployment_label/scenario_label/scenario_name only. Selected profiles consume measured disparity and corrected stereo-center RDF right/down/forward, then publish public FRD+range.",
+      "promotion_limit": "scenario-labeled residual catalog evidence only; deploy only with explicit truth-free operator/deployment labels, not as an unconditional single all-scenario residual"
+    },
+    {
+      "id": "multiburst_b7x3_disparity_ray_scale_residual_all_scenario_fresh50",
+      "status": "STRICT_PASS",
+      "scope": "simulation_all_scenario_disparity_residual_saved_report",
+      "method": "multiburst observation fusion b7x3 trim0.05 common0.5 + ray_scale disparity degree2 ridge0 clip0.25 residual",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260621-288-b7x3-disparity-residual-all-scenario-fresh50",
+        "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_deg2_ridge0_clip0p25",
+        "scenario_pass": "8/8",
+        "trial_pass": "500/500",
+        "fresh50_scenarios": [
+          "nominal",
+          "yaw_pitch_stress",
+          "bbox_outlier_stress",
+          "combined_sensor_stress",
+          "disparity_noise_stress",
+          "intrinsic_scale_stress"
+        ],
+        "intrinsic_tail_check": "intrinsic_scale_stress_fresh100",
+        "bbox_outlier_tail_check": "bbox_outlier_stress_fresh100",
+        "worst_target_max_abs_error_residual_m": 3.3829351488334396,
+        "worst_tail_target_max_abs_error_residual_m": 4.06733367825359,
+        "intrinsic_range_rmse_raw_to_observation_to_residual_m": "1.851247 -> 2.385011 -> 0.223355",
+        "intrinsic_tail_range_rmse_raw_to_observation_to_residual_m": "1.852460 -> 2.388347 -> 0.224077",
+        "bbox_outlier_tail_range_rmse_raw_to_observation_to_residual_m": "2.605711 -> 0.405026 -> 0.400922"
+      },
+      "runtime_contract": "Residual coefficients are fit with calibration-time train truth only; runtime application consumes fused measured_disparity_px and corrected stereo-center RDF right/down/forward, then publishes public FRD+range.",
+      "promotion_limit": "simulation saved-report evidence only; not hardware/WIRIS validated and not yet packaged as the default runtime deployment"
+    },
+    {
+      "id": "scenario_pooled_disparity_residual_catalog_exp289",
+      "status": "PASS",
+      "scope": "simulation_scenario_pooled_disparity_residual_catalog_saved_report",
+      "method": "scenario-labeled pooled b7x3 disparity ray-scale residual catalog",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog",
+        "catalog_json": "apps/Simulation/reports/experiments/EXP-20260621-289-scenario-pooled-disparity-residual-catalog/scenario_pooled_disparity_residual_catalog.json",
+        "transfer_summary_json": "apps/Simulation/reports/experiments/EXP-20260621-290-scenario-pooled-catalog-label-matched-fresh100/disparity_residual_catalog_transfer_summary.json",
+        "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_deg2_ridge0_clip0p25_pooled",
+        "scenario_profile_pass": "300/300",
+        "label_matched_transfer_pass": "6/6",
+        "label_matched_transfer_trials": "100 per scenario; 600/600 total",
+        "single_pooled_profile_result": "FAIL 100/120; intrinsic_scale_stress failed 0/20"
+      },
+      "runtime_contract": "Runtime residual profile selection uses explicit deployment_label/scenario_label/scenario_name only. Selected pooled profiles consume fused measured_disparity_px and corrected stereo-center RDF right/down/forward, then publish public FRD+range.",
+      "promotion_limit": "scenario-labeled simulation catalog evidence only; not hardware/WIRIS validated and not an unconditional single-profile residual"
+    },
+    {
+      "id": "universal_product_disparity_forward_residual_exp292",
+      "status": "STRICT_PASS",
+      "scope": "simulation_single_profile_product_residual_saved_report",
+      "method": "single pooled b7x3 disparity-forward-product ray-scale residual",
+      "checker_included_by_default": true,
+      "evidence": {
+        "report_dir": "apps/Simulation/reports/experiments/EXP-20260621-292-universal-product-residual-fresh100",
+        "summary_json": "apps/Simulation/reports/experiments/EXP-20260621-292-universal-product-residual-fresh100/pooled_disparity_residual_summary.json",
+        "profile_json": "apps/Simulation/reports/experiments/EXP-20260621-292-universal-product-residual-fresh100/pooled_disparity_residual_profile.json",
+        "runtime_package_smoke_summary_json": "apps/Simulation/reports/experiments/EXP-20260621-292-universal-product-residual-fresh100/runtime_package_smoke/observation_fusion_deployment_package_summary.json",
+        "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p05_common0p5_residual_ray_scale_disparity_forward_product_deg1_ridge10_clip0p1_pooled",
+        "fresh100_pass": "600/600",
+        "tail_fresh100_pass": "600/600",
+        "tail2_report_dir": "apps/Simulation/reports/experiments/EXP-20260621-294-universal-product-residual-tail2-fresh100",
+        "tail2_fresh100_pass": "600/600",
+        "tail3_report_dir": "apps/Simulation/reports/experiments/EXP-20260621-295-universal-product-residual-tail3-fresh100",
+        "tail3_fresh100_pass": "600/600",
+        "tail4_report_dir": "apps/Simulation/reports/experiments/EXP-20260621-296-universal-product-residual-tail4-fresh100",
+        "tail4_fresh100_pass": "600/600",
+        "tail5_report_dir": "apps/Simulation/reports/experiments/EXP-20260621-297-universal-product-residual-tail5-fresh100",
+        "tail5_fresh100_pass": "600/600",
+        "runtime_package_smoke": "PASS",
+        "feature": "measured_disparity_px * raw_forward_m",
+        "train_ratio": "0.5"
+      },
+      "runtime_contract": "Runtime application consumes fused measured_disparity_px and corrected stereo-center RDF right/down/forward. The residual feature is measured_disparity_px * raw_forward_m, where raw_forward_m is RDF forward. It then publishes public FRD+range.",
+      "promotion_limit": "simulation saved-report evidence only; runtime package and hardware/WIRIS validation still required; mean RMSE versus observation can regress in non-intrinsic scenarios"
+    },
+    {
+      "id": "fresh_common_mode_b7x3_aggregate_best",
+      "status": "PASS",
+      "scope": "software_deployment_package",
+      "method": "multiburst_observation_inner_trimmed_mean_outer_trimmed_mean_b7x3_trim0p2_common0p5",
+      "checker_included_by_default": true,
+      "evidence": {
+        "tier_spec_json": "apps/Simulation/config/observation_fusion_fresh_deployment_tiers.json",
+        "tier_evidence_csv": "apps/Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv",
+        "expected_acceptance_status": "PASS",
+        "expected_node_fusion_status": "fused:MultiBurstObservationFusion:21"
+      },
+      "runtime_contract": "Runtime adapter consumes image u/v and measured disparity, then emits stereo-center RDF right/down/forward before public FRD+range publishing.",
+      "promotion_limit": "simulation/software deployment evidence only; not hardware/WIRIS validated"
+    },
+    {
+      "id": "fresh_common_mode_b7x3_aggregate_best_disparity_noise_residual",
+      "status": "PASS",
+      "scope": "software_deployment_package_scenario_residual",
+      "method": "fresh_common_mode_b7x3_aggregate_best + disparity_noise_stress_seed_281000_disparity_residual",
+      "checker_included_by_default": true,
+      "evidence": {
+        "tier_spec_json": "apps/Simulation/config/observation_fusion_fresh_deployment_tiers.json",
+        "tier_evidence_csv": "apps/Simulation/config/observation_fusion_fresh_deployment_tier_evidence.csv",
+        "disparity_residual_profile_json": "apps/Simulation/config/disparity_residual_profile_disparity_noise_stress.json",
+        "expected_acceptance_status": "PASS",
+        "expected_node_fusion_status": "fused:MultiBurstObservationFusion:21",
+        "expected_residual_status_prefix": "applied:"
+      },
+      "runtime_contract": "Residual apply consumes fused measured_disparity_px and corrected stereo-center RDF only.",
+      "promotion_limit": "scenario-specific residual; do not deploy as unconditional all-scenario residual"
+    },
+    {
+      "id": "non_alias_scenario_profile_catalog_label_selector",
+      "status": "PASS",
+      "scope": "simulation_software_catalog_selector",
+      "method": "scenario profile catalog selected by explicit deployment/scenario label",
+      "checker_included_by_default": false,
+      "checker_option": "--include-non-alias-smoke",
+      "evidence": {
+        "expected_robustness_acceptance_pass": true,
+        "expected_deployment_strategy": "scenario_profile_catalog",
+        "expected_single_profile_pass": false,
+        "expected_scenario_catalog_profiles": 6,
+        "expected_scenario_catalog_promotion_pass_count": 6,
+        "expected_selector_package_status": "PASS",
+        "expected_operator_launch": "19/19"
+      },
+      "runtime_contract": "Runtime selection uses explicit deployment/scenario labels only; it must not inspect PX4/RTK/NED truth, validation errors, target-window labels, or replay metrics.",
+      "promotion_limit": "simulation/software catalog evidence only; not hardware/WIRIS validated"
+    }
+  ]
+}

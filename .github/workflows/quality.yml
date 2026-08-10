@@ -12,7 +12,7 @@ jobs:
       - name: Reject generated and machine-local tracked state
         # Remove --allow-existing-debt after the historical recording/profiler
         # files reported by this command are untracked in a dedicated cleanup.
-        run: python3 scripts/check_repository_policy.py --allow-existing-debt
+        run: python3 tools/check_repository_policy.py --allow-existing-debt
 
   python-tests:
     runs-on: ubuntu-22.04
@@ -28,7 +28,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: >-
           python -m pytest
-          StereoWIRIS/tests/test_coordinate_contract.py
-          StereoWIRIS/tests/test_stereo_geometry_common.py
-          StereoWIRIS/tests/test_triangulation.py
-          Workstation/tests/test_workstation.py
+          apps/StereoWIRIS/tests/test_coordinate_contract.py
+          apps/StereoWIRIS/tests/test_stereo_geometry_common.py
+          apps/StereoWIRIS/tests/test_triangulation.py
+          apps/Workstation/tests/test_workstation.py
