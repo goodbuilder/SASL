@@ -59,13 +59,14 @@ if not WORKSTATION_REQUESTED:
 
 
 def main() -> int:
-    # Keep the Legacy import lazy.  A Workstation process must load only the
-    # copied GUI module; this is the import boundary that makes the two
-    # runtimes independently replaceable.
     if _workstation_requested(sys.argv):
-        from workstation.standalone_gui import main as selected_main
-    else:
-        from wiris_stereo_distance.legacy_gui import main as selected_main
+        print(
+            "StereoWIRIS and workstation are independent apps; "
+            "launch workstation with `python -m workstation`.",
+            file=sys.stderr,
+        )
+        return 2
+    from wiris_stereo_distance.legacy_gui import main as selected_main
     return selected_main()
 
 if __name__ == "__main__":

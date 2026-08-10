@@ -52,7 +52,7 @@ I_FRAME_ONLY_ENV = "STEREO_GST_I_FRAME_ONLY"
 NVIDIA_H264_DECODER = "nvh264dec"
 SOFTWARE_H264_DECODER = "avdec_h264"
 RED_BGR = (0, 0, 255)
-GREEN_BGR = (0, 180, 0)
+NEUTRAL_BGR = (128, 128, 128)
 WHITE_BGR = (255, 255, 255)
 RTP_CLOCK_RATE_HZ = 90_000
 NTP_UNIX_EPOCH_OFFSET_S = 2_208_988_800
@@ -158,7 +158,7 @@ def _draw_detections(cv2, frame, detections: list[DetectionBox], best_detection:
     annotated = frame.copy()
     for detection in detections:
         is_best = detection is best_detection
-        color = RED_BGR if is_best else GREEN_BGR
+        color = RED_BGR if is_best else NEUTRAL_BGR
         thickness = 3 if is_best else 2
         x1 = int(round(detection.x1))
         y1 = int(round(detection.y1))
@@ -2290,6 +2290,22 @@ class YoloStreamWorker(QtCore.QObject):
         self._stop_requested = True
         if self._stop_event is not None:
             self._stop_event.set()
+
+    def terminate_child_process(self) -> None:
+        """Escalate shutdown without waiting on the caller's thread."""
+
+        self.request_stop()
+        process = self._process
+        if process is not None and process.is_alive():
+            process.terminate()
+
+    def kill_child_process(self) -> None:
+        """Last-resort non-blocking kill used by retryable UI shutdown."""
+
+        self.request_stop()
+        process = self._process
+        if process is not None and process.is_alive():
+            process.kill()
 
     def _queue_has_pending_messages(self) -> bool:
         return _queue_has_pending_messages(self._event_queue) or _queue_has_pending_messages(self._frame_queue)

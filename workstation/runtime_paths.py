@@ -2,7 +2,7 @@
 
 The directory is deliberately repository-relative so a checkout can be
 continued on another machine.  It is runtime state and is ignored by Git;
-the Legacy application keeps its existing ``StereoWIRIS`` data root.
+no sibling application data directory is consulted.
 """
 
 from __future__ import annotations

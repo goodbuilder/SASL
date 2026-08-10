@@ -41,3 +41,5 @@ session/artifact 표가 포함됩니다. Inspector와 Diagnostics도 같은 `Evi
 validation 실행도 동일한 owner-backed facade로 제공합니다. Calibration setup fields,
 measurement tuning, playback/export와 실제 RTSP/Pixhawk/GNSS 장비·장시간 writer 종료는
 별도 조건입니다.
+Workstation은 ROS2/uXRCE Pixhawk 연결·탐색과 still-image/FTP/EXIF TimeSync를 제공하지
+않으며, 해당 Legacy workflow는 `StereoWIRIS/` 런타임에 유지됩니다.

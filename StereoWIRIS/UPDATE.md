@@ -1,5 +1,220 @@
 # 업데이트 기록
 
+## GNSS/NTRIP 세션 운용 — 2026-08-10
+
+- Workstation과 Legacy에 동일한 세 가지 GNSS 운용 모드, Base USB u-blox by-id 자동 선택, 세션별 장소/주소와 caster/mountpoint 설정을 노출했다.
+- 절대 WGS84 운용의 기본 경로를 `NTRIP 보조 Fixed Base`로 정리했다. Base 최신 WGS84 위치를 `Base GNSS` GGA로 전송하고, `WGS84 ellipsoid` 높이와 반복 Fixed 좌표 검증을 거친 뒤 Base에 RTCM을 계속 주입한다.
+- 두 Rover RTCM 대상은 `both`로 유지하며, Rover `RTK Fixed`는 상태/증거로 표시하되 기본 readiness 조건은 `fix_type >= 3`으로 남겼다.
+- 현장 위치가 바뀔 때 이전 좌표 프로파일을 재사용하지 않도록 세션 종료·Base 재연결에서 최신 좌표를 지우고, `permit_profile_reuse=false`를 유지한다. Survey-in 기본값은 `300 s / 0.5 m`이다.
+
+Coordinate contract checked: `workstation_core/gnss_operation.py`, `workstation_core/gnss_network.py`, `workstation_core/gnss_protocol.py`, `workstation/gnss_runtime_controller.py`, `workstation/standalone_gui.py`, `StereoWIRIS/wiris_stereo_distance/gnss_operation.py`, `StereoWIRIS/wiris_stereo_distance/gnss_network.py`, `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, GNSS tests; WGS84 geodetic/ECEF, explicit ellipsoid/MSL height, PX4 NED, body-FRD, camera optical RDF, and stereo-center contracts remain distinct.
+
+## v2.2.5 — 2026-08-10 — Sync limits를 Time/Sync로 이동
+
+- 변경:
+  - Workstation `Time / Sync`에 카메라 RTCP/NTP `Sync limits` 편집 surface와 `Apply limits`/`Save limits`를 추가했다.
+  - Workstation/Legacy owner panel의 카메라 동기화 Gate 위젯을 `시간` 탭으로 이동했다.
+  - `Measurement`에는 측정 pair/class/geometry gate와 읽기 전용 `Sync` 상태를 남겼다.
+  - 기존 AppSettings와 owner-backed Apply/Save 경로를 유지했으며, 측정 CSV와 좌표 필드는 변경하지 않았다.
+- 방법 계약:
+  - 목적: SR age, RTCP/NTP Δt, PC offset, clock-rate tolerance, required SR count, warmup 등 시간 동기 검증 기준을 거리 계산 설정과 분리한다.
+  - 입력: 기존 `AppSettings`의 카메라 동기화 한계값과 Workstation/Legacy Time UI의 편집값.
+  - 출력: 현재 owner에 적용된 sync limits와 다음 실행에 저장될 설정; 좌표 변환이나 측정 프레임 값은 출력하지 않는다.
+  - 통과 기준: 모든 sync limit 필드가 `Time / Sync`에만 editable surface를 갖고, Measurement payload에는 포함되지 않으며, Apply/Save command가 기존 owner를 호출한다.
+- 확인:
+  - Legacy 동기화 탭 배치 — `2 passed`.
+  - Workstation Measurement/Time 설정 surface — `3 passed`.
+  - 전체 pytest — `2196 passed, 98 skipped, 2 warnings`.
+- 남은 위험:
+  - 실제 장비 화면에서 좁은 해상도의 Time/Sync 배치와 설정 적용 결과는 현장 확인이 필요하다.
+
+Coordinate contract checked: `workstation/workspaces.py`, `workstation/main_window.py`, `workstation/standalone_gui.py`, `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`, 관련 Workstation/Legacy tests; NED, ENU, PX4 body-FRD, OpenCV optical RDF, stereo-center, WIRIS RTC/RTCP/NTP UTC, PC UTC, CSV 공간 축 값은 이동하거나 재해석하지 않았다.
+
+## v2.2.4 — 2026-08-10 — Legacy StereoWIRIS WIRIS RTC STUS 전송 지연 보정
+
+- `StereoWIRIS/wiris_stereo_distance/legacy_gui.py`에도 Workstation과 같은 WIRIS RTC 보정 경로를 적용했다.
+- 변경:
+  - 각 WIRIS 제어 채널에서 무해한 `HIWS`를 3회 호출하고 RTT 중앙값을 측정한다.
+  - 카메라별 STUS 목표시각을 `PC TCP 호출 직전 UTC + RTT/2 + 2ms 파싱 여유`로 계산한다.
+  - RTT 중앙값이 없거나 250ms를 초과하면 네트워크 지연을 임의로 보정하지 않고 보정값을 0으로 기록한다.
+  - STUS 응답은 `OK`일 때만 성공으로 판정하며, RTT 샘플/오류/one-way 추정/보정량/카메라별 목표 UTC를 `_last_wiris_pc_utc_sync`와 UI 로그에 저장한다.
+  - GDTI 검증은 카메라별 STUS 목표 UTC를 참조하고, RTCP/NTP Sender Report 검증과 재연결 절차는 기존 순서를 유지한다.
+- 방법 계약:
+  - 입력: NTP/chrony 등으로 유지되는 PC Unix UTC, 카메라별 WIRIS 제어 TCP HIWS RTT.
+  - 출력: 카메라별 STUS 목표 UTC와 RTT/보정 provenance; 공간 좌표나 프레임 축 값은 출력하지 않는다.
+  - 가정: 제어 경로 양방향 지연이 대체로 대칭이고 2ms 파싱 여유가 현재 펌웨어 처리 오차를 흡수한다.
+  - 통과 기준: 양쪽 STUS가 `OK`이고 카메라별 보정 메타데이터가 남으며, 이후 GDTI·RTCP/NTP 검증이 계속된다.
+- 확인:
+  - Legacy WIRIS 시간/보정 집중 테스트 — `4 passed`.
+  - `StereoWIRIS/tests/test_stereo.py` 전체 — `275 passed`.
+  - 전체 pytest(`ROS_LOG_DIR=/tmp/sasl-ros-log MPLCONFIGDIR=/tmp/sasl-mpl QT_QPA_PLATFORM=offscreen python3 -m pytest -q`) — `2194 passed, 98 skipped, 2 warnings`.
+
+Coordinate contract checked: Legacy WIRIS RTC, GDTI, RTCP Sender Report NTP-derived UTC, and PC UTC time bases; no NED, ENU, PX4 body-FRD, OpenCV optical RDF, stereo-center, or CSV spatial axis values were moved.
+
+## v2.2.3 — 2026-08-10 — StereoDistanceNode 조립 계층 분리
+
+- `StereoDistanceNode` 클래스 본체를 약 1,065줄의 ROS 조립 계층으로 축소했다.
+- ROS 발행, runtime 설정, pair/GT routing, camera/PX4/GPS pose,
+  recording, terminal record, runtime control, triangulation facade를 분리했다.
+- workstation과 StereoWIRIS는 서로의 앱 구현을 import하지 않는
+  완전히 독립된 앱으로 유지했다.
+- Gazebo/RViz World ENU, PX4 NED/body FRD, OpenCV optical RDF,
+  baseline-center FRD 측정 계약을 명시적으로 유지했다.
+
+## v2.2.2 — 2026-08-10 — WIRIS RTC STUS 전송 지연 보정
+
+- 변경:
+  - Workstation의 WIRIS STUS 실행 전에 카메라별 HIWS 제어 채널 RTT를 3회 측정하고 중앙값을 기록한다.
+  - 각 카메라의 STUS 목표시각을 `PC TCP 전송 직전 UTC + RTT/2 + 2ms 파싱 여유`로 계산해 카메라별로 전송한다.
+  - 로컬 제어 채널에서 250ms를 넘는 RTT는 펌웨어 응답 지연으로 간주해 one-way 보정에 사용하지 않는다.
+  - RTT 샘플, 중앙값, one-way 추정값, 보정량, 카메라별 STUS 목표 UTC를 세션 메타데이터와 UI 로그에 남긴다.
+  - RTT 측정에 실패하면 보정값을 임의로 추정하지 않고 0으로 두며, 실패 원인을 결과에 기록한다.
+- 목적:
+  - WIRIS SDK가 STUS 명령 전송·파싱 시간을 자동 보정하지 않으므로, PC에서 만든 시각이 카메라에 도착할 때 이미 과거가 되는 오차를 줄이기 위해서다.
+- 방법 계약:
+  - 입력: PC가 NTP/chrony 등으로 유지하는 Unix UTC와 WIRIS 제어 TCP 연결의 HIWS 왕복시간.
+  - 출력: 카메라 RTC에 적용할 Unix UTC와 카메라별 RTT/보정 provenance.
+  - 가정: 제어 경로의 양방향 지연이 대체로 대칭이며, 2ms 파싱 여유가 현재 펌웨어의 명령 처리 오차를 흡수한다.
+  - 통과 기준: 각 STUS 결과가 성공하고, 카메라별 보정 메타데이터가 저장되며, 이후 GDTI·RTCP/NTP 검증 단계가 계속 수행된다.
+- 확인:
+  - `QT_QPA_PLATFORM=offscreen python3 -m pytest StereoWIRIS/tests/test_workstation.py -k 'wiris_clock_worker or wiris_stus_compensation' -q` — 2 passed.
+  - Workstation/RTSP timing/recording 집중 회귀 — `137 passed`.
+  - 전체 저장소 회귀(`ROS_LOG_DIR=/tmp/sasl-ros-log MPLCONFIGDIR=/tmp/sasl-mpl QT_QPA_PLATFORM=offscreen python3 -m pytest -q`) — `2178 passed, 98 skipped, 2 warnings`.
+- 남은 위험:
+  - RTT/2는 네트워크 지연의 추정치이므로 하드웨어 PPS/PTP 수준의 sub-ms 동기를 보장하지 않는다.
+  - WIRIS 재부팅 후 RTC가 유지되지 않는 모델은 세션 시작마다 STUS를 다시 적용해야 한다.
+
+Coordinate contract checked: WIRIS RTC/RTCP Sender Report NTP-derived UTC/PC UTC time bases; no NED, ENU, PX4 body-FRD, OpenCV optical RDF, stereo-center, or CSV spatial axis values were moved.
+
+## v2.2.1 — 2026-08-10 — Workstation 독립 앱 경계 감사 및 분리 시작
+
+- 판단:
+  - Workstation과 Legacy StereoWIRIS는 완전히 분리된 앱이므로 어느 한쪽의 구현 파일을 다른 앱에서 import해 대체하지 않는다.
+  - 동일한 장치/측정 개념이 있더라도 앱별 runtime owner와 데이터 root를 유지하고, 공통화가 필요할 때만 앱 중립 `sasl_common` 계약을 사용한다.
+- 변경:
+  - `standalone_gui.py`에 있던 UBX/RTCM frame 생성·파싱과 field-base serial probe를 Workstation 전용 `workstation_core/gnss_protocol.py`로 옮겼다.
+  - WGS84 geodetic/ellipsoid/MSL, CFG-TMODE3 ECEF cm+0.1 mm 계약을 명시하고 PX4 NED, body FRD, camera frame과 혼용하지 않게 했다.
+  - live camera 상태와 timestamp 문자열 생성을 `workstation_core/runtime_camera_status.py`로 옮겼다. RTCP/NTP UTC, source clock, host receive 시각은 서로 다른 provenance로 유지한다.
+  - attitude history, generic telemetry, RTK/alignment plot widget을 Workstation 전용 `workstation/telemetry_plots.py`로 옮겼다. GPS local NED와 P1 optical RDF 입력은 표시 계층에서 변환하지 않는다.
+  - integer PARAM write/readback과 calibration REAL32 read adapter를 `workstation_core/mavlink_parameter_store.py`로 옮겼다.
+  - 기존 `workstation.standalone_gui` 함수·클래스 이름은 re-export해 공개 호출 표면을 유지했다.
+- 검증:
+  - Workstation GNSS/runtime status/telemetry plot/PARAM adapter/독립 실행 집중 회귀 `72 passed`.
+  - `standalone_gui.py`는 22,304줄에서 약 21,100줄로 감소했다. 남은 대형 panel 초기화와 기능군은 Workstation 내부 모듈로 계속 분리한다.
+
+Coordinate contract checked: `workstation_core/gnss_protocol.py`, `workstation_core/runtime_camera_status.py`, `workstation/telemetry_plots.py`, `workstation/standalone_gui.py`, Workstation tests; WGS84 geodetic/ECEF, GPS local NED, P1 optical RDF, RTCP/NTP UTC, source clock, and host receive time remain distinct.
+
+## v2.2.0 — 2026-08-10 — StereoDistanceNode 순수 정책 분리
+
+- 변경:
+  - ROS/Gazebo I/O와 같이 있던 임무 phase 계산을 `mission_timeline.py`의 순수 함수로 분리했다.
+  - observation mode 검증, pixel/provenance 레코드, output-frame metadata를 `observation_contract.py`로 분리했다.
+  - pair, measurement, world-ENU GT alignment map과 evaluated/failed tombstone을 `pair_evaluation_registry.py`의 단일 소유로 옮겼다. terminal 처리는 세 join entry를 원자적으로 제거한다.
+  - research terminal deduplication과 recorder submit 실패 상태를 `research_terminal_coordinator.py`로 옮겼다.
+  - measurement/GT-alignment ready queue와 교대 스케줄링을 `pair_work_scheduler.py`로 옮겨 연속 image stream이 late GT evaluation을 starvation하지 못하게 했다.
+  - baseline-center FRD로 정렬된 후의 GT residual 계산을 `evaluation_pipeline.py`의 순수 함수로 분리했다.
+  - mission scalar를 world ENU Gazebo pose로 인코딩하고 command rate를 제한하는 책임을 `gazebo_target_controller.py`로 옮겼다.
+  - world ENU GT record의 epoch/future/quarantine/release 상태를 `ground_truth_provider.py`의 단일 소유로 옮겼다.
+  - OpenCV optical pixel에서 ray를 만들고 baseline-center FRD로 triangulation하는 핵심을 `stereo_measurement_pipeline.py`의 순수 계층으로 분리했다.
+  - PX4 attitude/raw GPS/global position cache와 pair-acceptance snapshot을 `pose_source_provider.py`의 단일 소유로 옮겼다.
+  - PX4 attitude age/epoch/skew 검증과 body-FRD→earth-NED 기반 optical pose 구성, GPS world-ENU baseline pose, UAM baseline-center FRD reference 구성을 `pose_conversion_adapter.py`로 옮겼다.
+  - plot/measurement/RViz thread 생성과 bounded join을 `runtime_worker_lifecycle.py`로 분리했다.
+  - measurement/late-GT fair dequeue, target-Hz wait, drain 종료, pair fault containment와 latest-only RViz loop를 `runtime_worker_loops.py`로 옮겼다.
+  - image decode, observation, Nominal/Optical/GPS/diagnostic ray 호출 순서를 `pair_measurement_orchestrator.py`로 옮겨 모든 ray가 동일 pixel/pair timestamp/source snapshot을 사용하게 했다.
+  - plot publisher의 FRD/range 배열 직렬화를 `visualization_payloads.py`의 read-only builder로 분리했다.
+  - ray metrics JSON의 finite-safe FRD/provenance 직렬화도 `visualization_payloads.py`로 옮겼다.
+  - research sample eligibility의 finite pixel, computed ray, canonical FRD frame gate를 `research_record_policy.py`의 순수 정책으로 분리했다.
+  - camera frustum/ray의 display-only world ENU geometry를 `rviz_geometry.py`로 분리했다.
+  - UAM baseline-center FRD reference를 world-ENU display ray로 만드는 명시적 변환도 `rviz_geometry.py`로 옮겼다.
+  - distance/FOV/camera/ray/drone Marker와 ray-metrics ROS 직렬화·publish를 `rviz_publisher.py`의 단일 owner로 옮겼다. node에는 기존 호출 호환 delegate만 남겼다.
+  - YOLO model load/device move/warmup/class filter/single·pair inference와 관련 상태 저장을 `yolo_model_runtime.py`의 단일 owner로 옮겼다. 기존 node attribute/method는 property/delegate로 보존했다.
+  - recorder close와 최종 failure state까지 `research_terminal_coordinator.py`가 소유하게 했다.
+  - world ENU reference point의 OpenCV stereo pixel/FOV/bbox projection을 `observation_projection.py`로 분리했다.
+  - diagnostic ray의 canonical FRD validity gate와 signed delta를 `diagnostic_ray_pipeline.py`로 분리했다.
+  - Attitude/Operational diagnostic ray의 자세·GPS baseline·triangulation 호출 순서도 `DiagnosticRayOrchestrator`로 옮겼다. 입력 pose/baseline은 world ENU이고 출력은 baseline-center FRD m로 고정한다.
+  - diagnostic FRD ray와 camera-oracle world ENU/XYZW의 CSV field flattening을 `research_record_fields.py`로 분리했다.
+  - UAM reference, Attitude/Operational ray, Operational calibration input/GT label 필드의 전체 flattening도 동일 순수 schema builder로 옮겼다.
+  - terminal pair의 schema identity, observation, Nominal/Corrected/GT FRD, queue counter, oracle/debug label, eligibility를 포함한 전체 payload를 `research_terminal_record_builder.py`로 옮겼다.
+  - `StereoDistanceNode`는 기존 호출 표면을 유지하는 thin delegate로 바꾸어 ROS 런타임 동작을 변경하지 않았다.
+- 목적:
+  - 8천 라인이 넘는 node에서 시간표와 관측 계약을 ROS 생명주기 없이 단위 검증할 수 있는 첫 책임 경계로 만들기 위해서다.
+- 검증:
+  - mission phase 경계, ENU 고도/수직 속도, OpenCV pixel 순서, ideal/bbox provenance, baseline-center FRD output 계약 테스트 60개를 통과했다.
+  - pair evaluation registry와 late-GT/fault/terminal/shutdown 경계 테스트 16개를 통과했다.
+  - terminal coordinator 관련 29개, pair scheduler 관련 11개 테스트를 통과했다.
+  - evaluation pipeline 관련 44개와 Gazebo controller/mission 관련 24개 테스트를 통과했다.
+  - GT provider 관련 14개와 stereo geometry/diagnostic 관련 91개 테스트를 통과했다.
+  - pose source provider 관련 45개와 runtime lifecycle 관련 49개 테스트를 통과했다.
+  - pair orchestrator 관련 13개와 visualization payload 관련 79개 테스트를 통과했다.
+  - diagnostic orchestrator와 기존 node 호환 집중 회귀 47개를 통과했다.
+  - RViz world-ENU geometry/publisher와 diagnostic 연동 집중 회귀 45개를 통과했다.
+  - YOLO runtime 상태 소유권, OpenCV pixel bbox 계약, observation/worker/shutdown 집중 회귀 51개를 통과했다.
+  - pose provider/conversion, Attitude·Operational diagnostic, runtime topic 집중 회귀 40개를 통과했다.
+  - worker scheduling/drain/fault/latest-only RViz와 geometry 집중 회귀 64개를 통과했다.
+  - ray metrics visualization 관련 57개와 research eligibility 관련 35개 테스트를 통과했다.
+  - RViz geometry 관련 24개와 recorder close/shutdown 관련 19개 테스트를 통과했다.
+  - observation projection 관련 16개와 diagnostic pipeline 관련 55개 테스트를 통과했다.
+  - research field builder 관련 25개를 통과했고, 최신 `Simulation/tests` 전체 결과는 `1349 passed, 98 skipped, 2 warnings`이다.
+  - calibration builder 이동 후 recording/diagnostic 호환 테스트 69개를 통과했다.
+  - terminal payload builder 이동 후 recording/schema 테스트 37개를 통과했다.
+  - 최신 `Simulation/tests` 전체 결과는 `1337 passed, 98 skipped, 2 warnings`이다.
+  - `Simulation/tests` 전체 결과 `1323 passed, 98 skipped, 2 warnings`를 확인했다.
+  - 전체 `pytest` 결과 `2114 passed, 98 skipped, 2 warnings`를 확인했다. skip 98개는 외부 sealed qualification fixture가 없을 때의 명시적 skip이다.
+
+Coordinate contract checked: `mission_timeline.py` world ENU `z/+up` and scenario approach scalar; `observation_contract.py` OpenCV optical pixel `(u=right,v=down)` and baseline-center FRD `[F,R,D]`; targeted boundary tests.
+
+## v2.1.2 — 2026-08-09 — 전체 테스트 기준선 복구
+
+- 변경:
+  - sealed qualification 테스트의 `/home/moon/...` 절대경로를 제거하고 `SASL_QUALIFICATION_FIXTURE` 입력 계약으로 교체했다.
+  - 연구 통계 계산기가 canonical `nominal_pose_*` 오류 필드를 읽고, 기존 보고서의 `raw_*` 지표 이름은 유지하도록 했다.
+  - PX4 operator launcher fixture가 canonical px4_msgs package hook, magnetometer helper, camera airframe 및 ROMFS 구조를 재현하도록 갱신했다.
+  - GPS baseline source와 nominal pose publisher 테스트를 현재 producer 명칭에 맞췄다.
+  - ROS Humble 시스템 SciPy와 충돌하지 않도록 NumPy/SciPy 런타임 범위를 함께 선언했다.
+- 이유:
+  - 일반 소프트웨어 회귀와 외부 불변 실험 증거 검증을 분리하고, 다른 PC의 clone에서도 전체 테스트 결과를 해석 가능하게 만들기 위해서다.
+- 확인:
+  - 전체 pytest: **2,094 passed, 98 skipped**, 98 skip은 sealed fixture 미제공 항목이다.
+  - `git diff --check`를 통과했다.
+- 남은 위험:
+  - sealed fixture를 제공한 98개 보안 검증은 현재 장비에 증거 번들이 없어 실행하지 못했다.
+  - 기존 Git 추적 runtime artifact 237개는 별도 index cleanup이 필요하다.
+
+Coordinate contract checked: `Simulation/stereo_ground_sim/stereo_ground_sim/correction_sweep.py`, telemetry export/audit tests, research recording tests, PX4 launcher tests; research canonical `nominal_pose_*` and legacy `raw_*` aliases remain stereo-center RDF, public arrays remain FRD, and GPS baseline sources retain their declared baseline frames.
+
+## v2.1.1 — 2026-08-09 — 운영 telemetry 스키마 호환 복구
+
+- 변경:
+  - operator telemetry preflight가 새 `nominal_pose_*`와 과거 `raw_*` public-FRD 입력을 모두 허용한다.
+  - selector observation CSV는 canonical `nominal_pose_*`와 기존 배포 profile이 소비하는 `raw_*`를 동일 stereo-center RDF 값의 명시적 alias로 함께 쓴다.
+  - observation-fusion topic manifest의 누락된 estimated-position 기본 토픽을 복구했다.
+  - recorder와 연구 노드의 부분 초기화 단위 테스트 경계를 안전하게 처리하고, waypoint optical RPY의 무지정 기본값을 0도로 고정했다.
+- 이유:
+  - producer, preflight, selector profile이 서로 다른 세대의 필드명을 사용해 진실값 비사용 runtime replay가 중단되는 문제를 해결하기 위해서다.
+- 확인:
+  - telemetry audit/export/manifest/recorder/observation 계약 57개 테스트와 mission/waypoint/research terminal 관련 회귀를 실행했다.
+- 남은 위험:
+  - sealed qualification artifact와 현재 dirty Git anchor에 결박된 통합 테스트는 별도 격리가 필요하다.
+
+Coordinate contract checked: `Simulation/scripts/audit_operator_telemetry_residual_preflight_schema.py`, `Simulation/scripts/export_selector_observation_csv_from_operator_telemetry.py`, `Simulation/scripts/export_observation_fusion_topic_contract_manifest.py`, `Simulation/stereo_ground_sim/stereo_ground_sim/operator_recorder.py`, `Simulation/stereo_ground_sim/stereo_ground_sim/stereo_distance_node.py`; input public FRD `[F,R,D]` is explicitly reordered to selector RDF `[R,D,F]`, while `raw_*` and `nominal_pose_*` output names are same-frame aliases only.
+
+## v2.1.0 — 2026-08-09 — 실행·의존성·산출물 계약 정리
+
+- 변경:
+  - Legacy와 Workstation을 기능이 동등한 두 UI 앱으로 명시하고 실행 명령을 루트 README에 고정했다.
+  - 실제 공통 런타임 및 개발 의존성을 `requirements/runtime.txt`, `requirements/dev.txt`로 선언했다.
+  - pytest 수집 경계, GitHub Actions의 좌표/Workstation 회귀, 저장소 산출물 정책 검사를 추가했다.
+  - Legacy 녹화 디렉터리를 runtime artifact store로 문서화하고 새 CSV/Parquet/JSONL/spool 생성을 Git에서 제외했다.
+- 이유:
+  - 로컬에 우연히 설치된 패키지와 생성 파일에 의존하지 않고 다른 PC에서 같은 checkout을 재현하기 위해서다.
+- 확인:
+  - pip requirement 해석과 ignore 규칙을 확인했다. 기존 Git 추적 산출물 237개는 정책 검사에서 명시적으로 보고된다.
+- 남은 위험:
+  - 기존 녹화물과 `perf.data`의 index 제거는 데이터 보존 검토가 필요한 별도 cleanup이다.
+  - 실제 장비 및 ROS 전체 테스트는 이 변경의 소프트웨어 검증 범위 밖이다.
+
+Coordinate contract checked: `README.md`, `StereoWIRIS/recordings/README.md`; raw NED `[N,E,D]`, P1 body FRD `[F,R,D]`, camera optical RDF `[R,D,F]`, and public stereo-center FRD remain distinct, and no producer, formula, CSV field, or conversion changed.
+
 ## 2026-08-09 — Workstation 장비 I/O 비동기화 및 전체 회귀 마감
 
 - 변경:

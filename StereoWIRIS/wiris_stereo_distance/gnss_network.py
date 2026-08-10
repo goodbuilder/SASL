@@ -184,6 +184,38 @@ def gga_from_position(position: Any, *, utc_datetime: datetime | None = None) ->
     )
 
 
+def gga_from_coordinate_sample(sample: Any, *, utc_datetime: datetime | None = None) -> str | None:
+    """Format NMEA GGA from a WGS84 geodetic Base coordinate sample.
+
+    ``GnssCoordinateSample`` stores the Base position as latitude/longitude
+    degrees and heights in metres.  GGA's altitude field is represented as an
+    MSL value when the receiver supplied one; ellipsoidal height is the
+    explicit fallback.  This helper never converts the coordinate into the
+    rover NED/ENU baseline frame.
+    """
+
+    latitude = getattr(sample, "latitude_deg", None)
+    longitude = getattr(sample, "longitude_deg", None)
+    if latitude is None or longitude is None:
+        return None
+    altitude = getattr(sample, "msl_altitude_m", None)
+    if altitude is None:
+        altitude = getattr(sample, "ellipsoid_height_m", None)
+    if altitude is None:
+        altitude = getattr(sample, "selected_height_m", None)
+    if altitude is None:
+        return None
+    return format_nmea_gga(
+        latitude,
+        longitude,
+        altitude,
+        utc_datetime=utc_datetime,
+        fix_quality=6 if bool(getattr(sample, "fixed", False)) else 1,
+        satellites=getattr(sample, "satellites_used", None) or 12,
+        hdop=1.0,
+    )
+
+
 @dataclass(frozen=True)
 class NtripStreamStats:
     connected_at_monotonic_s: float

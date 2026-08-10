@@ -6,6 +6,7 @@ from collections import deque
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from workstation_core.stereo import DetectionObservation
+from workstation_core.theme import ACCENT
 from workstation_core.yolo_stream import YoloStreamWorker
 
 
@@ -49,6 +50,8 @@ class CameraPane(QtWidgets.QGroupBox):
         self.detection_stream_active = False
         self.stream_generation = 0
         self.current_status = "중지됨"
+        self._stop_requested_monotonic_s: float | None = None
+        self._stop_escalation_level = 0
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 12, 10, 10)
@@ -66,7 +69,7 @@ class CameraPane(QtWidgets.QGroupBox):
 
     def start_stream(self, url: str, *, enable_detection: bool, **kwargs) -> bool:
         if self.worker is not None or self.thread is not None:
-            if not self.stop(wait=True):
+            if not self.stop(wait=False):
                 self._set_status("이전 카메라 worker 종료 대기 중")
                 return False
         self.stream_generation += 1
@@ -79,6 +82,8 @@ class CameraPane(QtWidgets.QGroupBox):
         self.selected_measurement_frame_timestamp_s = None
         self.selected_measurement_frame_lookup_delta_s = None
         self.detection_stream_active = bool(enable_detection)
+        self._stop_requested_monotonic_s = None
+        self._stop_escalation_level = 0
         self.image_label.setPixmap(QtGui.QPixmap())
         self.image_label.setText("YOLO 시작 중..." if enable_detection else "카메라 연결 중...")
         self._set_detection_label(None)
@@ -126,6 +131,8 @@ class CameraPane(QtWidgets.QGroupBox):
         thread = self.thread
         if worker is not None:
             worker.request_stop()
+            if self._stop_requested_monotonic_s is None:
+                self._stop_requested_monotonic_s = time.monotonic()
         stopped = thread is None
         if thread is not None:
             if wait:
@@ -141,9 +148,23 @@ class CameraPane(QtWidgets.QGroupBox):
             else:
                 is_running = getattr(thread, "isRunning", None)
                 stopped = bool(is_running is not None and callable(is_running) and not is_running())
+                if not stopped and worker is not None and self._stop_requested_monotonic_s is not None:
+                    elapsed_s = max(0.0, time.monotonic() - self._stop_requested_monotonic_s)
+                    if elapsed_s >= 3.0 and self._stop_escalation_level < 2:
+                        kill_child = getattr(worker, "kill_child_process", None)
+                        if callable(kill_child):
+                            kill_child()
+                        self._stop_escalation_level = 2
+                    elif elapsed_s >= 1.5 and self._stop_escalation_level < 1:
+                        terminate_child = getattr(worker, "terminate_child_process", None)
+                        if callable(terminate_child):
+                            terminate_child()
+                        self._stop_escalation_level = 1
         if stopped:
             self.worker = None
             self.thread = None
+            self._stop_requested_monotonic_s = None
+            self._stop_escalation_level = 0
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
@@ -166,7 +187,7 @@ class CameraPane(QtWidgets.QGroupBox):
         super().resizeEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        if not self.stop(wait=True):
+        if not self.stop(wait=False):
             event.ignore()
             QtCore.QTimer.singleShot(100, self.close)
             return
@@ -265,7 +286,7 @@ class CameraPane(QtWidgets.QGroupBox):
         painter = QtGui.QPainter(pixmap)
         try:
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
-            color = QtGui.QColor(60, 220, 90)
+            color = QtGui.QColor(ACCENT)
             rect = QtCore.QRectF(
                 detection.x1 * scale_x,
                 detection.y1 * scale_y,
@@ -337,3 +358,5 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self.thread = None
         self.worker = None
+        self._stop_requested_monotonic_s = None
+        self._stop_escalation_level = 0

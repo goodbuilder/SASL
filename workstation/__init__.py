@@ -1,10 +1,8 @@
-"""Standalone Workstation UI shell and runtime owner for StereoWIRIS.
+"""Standalone Workstation UI shell and runtime owner.
 
-The Workstation imports its copied GUI/backend pair.  Shared measurement,
-streaming, telemetry, calibration, and recording modules remain explicit
-dependencies of that copied owner, while the Legacy launcher continues to
-load ``wiris_stereo_distance.legacy_gui`` independently.  The old ``gui.py``
-import surface remains a compatibility alias.
+This package imports only the Workstation-owned GUI, backend, and core
+modules.  Its settings, recordings, lifecycle, and launcher are rooted in
+the repository-level Workstation runtime.
 """
 
 __all__ = ["WorkstationMainWindow"]

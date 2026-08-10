@@ -2184,7 +2184,7 @@ class OperatorRecorder(Node):
             self.latest["raw_disparity_px"] = self.latest.get("disparity_px", math.nan)
         self.latest["yolo_measurement_raw_range_m"] = self.latest.get("nominal_pose_range_m", math.nan)
         self.last_stamp["/stereo/detections"] = self.get_clock().now().nanoseconds * 1e-9
-        if self.wait_for_bbox and not self.recording_active:
+        if getattr(self, "wait_for_bbox", False) and not getattr(self, "recording_active", True):
             valid_pair = all(
                 bool(self.latest.get(field, False))
                 and all(
@@ -2284,7 +2284,7 @@ class OperatorRecorder(Node):
         self.last_stamp["/stereo/ray_metrics"] = self.get_clock().now().nanoseconds * 1e-9
 
     def _write_csv_row(self):
-        if not self.recording_active or self.csv_writer is None:
+        if not getattr(self, "recording_active", True) or self.csv_writer is None:
             return
         now = self.get_clock().now().nanoseconds * 1e-9
         row = {
@@ -2340,7 +2340,7 @@ class OperatorRecorder(Node):
         temporary_path.replace(progress_path)
 
     def _image_cb(self, name, msg):
-        if not self.recording_active:
+        if not getattr(self, "recording_active", True):
             return
         image = self._msg_to_bgr(msg)
         if image is None:

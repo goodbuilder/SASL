@@ -155,10 +155,12 @@ def test_auto_attitude_sweep_exposes_stable_defaults_through_simulation_config()
 
 def test_auto_mission_phase_is_recorded_without_using_gazebo_gt_as_runtime_input():
     mission = (ROOT / "scripts" / "px4_auto_mission.py").read_text(encoding="utf-8")
-    node = (ROOT / "stereo_ground_sim" / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
+    package = ROOT / "stereo_ground_sim" / "stereo_ground_sim"
+    node = (package / "stereo_distance_node.py").read_text(encoding="utf-8")
+    pair_results = (package / "pair_result_coordinator.py").read_text(encoding="utf-8")
     assert '"/stereo/auto_mission_phase"' in mission
     assert 'publish_phase("takeoff")' in mission
     assert 'publish_phase("approach")' in mission
     assert 'publish_phase("landing")' in mission
     assert '"/stereo/auto_mission_phase"' in node
-    assert '"uam_raw_gps_reference_world_enu_m"' in node
+    assert '"uam_raw_gps_reference_world_enu_m"' in node + pair_results

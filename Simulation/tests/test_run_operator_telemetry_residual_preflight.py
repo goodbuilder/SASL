@@ -251,7 +251,7 @@ class RunOperatorTelemetryResidualPreflightTests(unittest.TestCase):
         self.assertEqual(decision["status"], "SKIPPED")
         self.assertFalse(decision["apply_residual_allowed"])
         self.assertFalse(result["apply_residual_allowed"])
-        self.assertIn("schema_audit:missing_required_group:raw_forward_m", result["failures"])
+        self.assertIn("schema_audit:missing_required_group:nominal_pose_forward_m", result["failures"])
 
     def test_preflight_can_discover_latest_telemetry_csv(self) -> None:
         module = load_module()

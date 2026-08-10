@@ -25,25 +25,31 @@ Purpose: select device, subsystem, or engineering task. Navigation does not exec
 Candidate hierarchy:
 
 StereoWIRIS
+- Overview
+- Protocol
 - Devices
-  - Cameras: Left, Right, Stereo Pair
-  - Pixhawk: P1, P2
+  - Cameras
+  - Pixhawk
   - GNSS / RTK
-- Processing
-  - Detection
-  - Measurement
-  - Synchronization
-  - Alignment
-- Tasks
-  - Calibration
-  - Recording
-  - Playback
-  - Export
+  - Time / Sync
+- Measurement
+- Alignment
+- Pre-run Calibration
+- Recording / Sessions
+- Advanced
+- Settings
 - Diagnostics / Analysis
+
+Left/Right camera views and P1/P2 Pixhawk evidence are local paired views, not separate
+navigation contexts. Detection belongs to Cameras, synchronization belongs to Time / Sync,
+and Review/Files belong to Recording / Sessions.
 
 ## 4. Workspace
 
-Largest area where engineering work is performed. Candidate workspaces: Overview, Camera, Measurement, Calibration, Playback, Analysis, and possibly Pixhawk/GNSS/Detection if justified by audit.
+Largest area where engineering work is performed. Current Workstation workspaces are
+Overview, Protocol, Cameras, Time / Sync, Measurement, Alignment, Pre-run Calibration,
+Recording / Sessions, and Advanced. Pixhawk and GNSS are local tabs of the paired Alignment
+workspace; Detection is a Cameras section.
 
 ## 5. Inspector
 

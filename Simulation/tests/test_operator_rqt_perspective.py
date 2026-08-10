@@ -157,7 +157,8 @@ def test_respawn_service_contract_is_declared_by_distance_node() -> None:
     )
 
     assert 'self.create_service(\n            Trigger, "/stereo/respawn_drone"' in source
-    assert "self._set_gazebo_target_pose(" in source
+    runtime_control = (ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "runtime_control_coordinator.py").read_text(encoding="utf-8")
+    assert "self.node._set_gazebo_target_pose(" in runtime_control
     for parameter in ("target_spawn_x_m", "target_spawn_y_m", "target_spawn_z_m", "target_spawn_yaw_deg"):
         assert f'"{parameter}"' in source
 

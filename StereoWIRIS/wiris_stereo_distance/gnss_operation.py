@@ -52,6 +52,7 @@ class GnssOperationState(str, Enum):
 
 
 class GgaPolicy(str, Enum):
+    BASE_GNSS = "BASE_GNSS"
     SYSTEM_CENTER = "SYSTEM_CENTER"
     LEFT_GNSS = "LEFT_GNSS"
     MANUAL = "MANUAL"
@@ -117,6 +118,10 @@ def _positive(value: Any, name: str) -> float:
 
 @dataclass(frozen=True)
 class ReadinessConfig:
+    # Numeric GNSS fix acceptance is separate from the optional RTK Fixed
+    # policy.  The default accepts a normal 3D solution while retaining the
+    # receiver's RTK/fix status as evidence for the UI.
+    minimum_fix_type: int = 3
     minimum_fixed_duration_s: float = 30.0
     maximum_correction_age_s: float = 3.0
     maximum_gps_sample_age_s: float = 1.0
@@ -126,6 +131,10 @@ class ReadinessConfig:
     maximum_baseline_std_m: float = 0.02
 
     def __post_init__(self) -> None:
+        minimum_fix_type = int(self.minimum_fix_type)
+        if minimum_fix_type < 0 or minimum_fix_type > 255:
+            raise ValueError("minimum_fix_type must be between 0 and 255")
+        object.__setattr__(self, "minimum_fix_type", minimum_fix_type)
         for name in (
             "minimum_fixed_duration_s",
             "maximum_correction_age_s",
@@ -142,6 +151,7 @@ class ReadinessConfig:
         value = value or {}
         defaults = cls()
         return cls(
+            minimum_fix_type=value.get("minimum_fix_type", defaults.minimum_fix_type),
             minimum_fixed_duration_s=value.get("minimum_fixed_duration_s", defaults.minimum_fixed_duration_s),
             maximum_correction_age_s=value.get("maximum_correction_age_s", defaults.maximum_correction_age_s),
             maximum_gps_sample_age_s=value.get("maximum_gps_sample_age_s", defaults.maximum_gps_sample_age_s),
@@ -155,6 +165,7 @@ class ReadinessConfig:
 
     def to_mapping(self) -> dict[str, float]:
         return {
+            "minimum_fix_type": self.minimum_fix_type,
             "minimum_fixed_duration_s": self.minimum_fixed_duration_s,
             "maximum_correction_age_s": self.maximum_correction_age_s,
             "maximum_gps_sample_age_s": self.maximum_gps_sample_age_s,
@@ -170,7 +181,7 @@ class LocalBaseConfig:
     device: str = ""
     baud: int = 115200
     survey_in_min_duration_s: float = 300.0
-    survey_in_accuracy_limit_m: float = 0.05
+    survey_in_accuracy_limit_m: float = 0.5
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "device", str(self.device).strip())
@@ -338,6 +349,11 @@ class RoutingConfig:
 
 @dataclass(frozen=True)
 class GnssOperationConfig:
+    # Per-experiment site metadata.  These fields describe the current
+    # WGS84/ellipsoidal-height session context; they are never used as a
+    # substitute for a measured Base coordinate.
+    site_label: str = ""
+    site_address: str = ""
     operation_mode: GnssOperationMode = GnssOperationMode.LOCAL_SURVEY_IN
     require_drone_rtk_fixed: bool = False
     readiness: ReadinessConfig = field(default_factory=ReadinessConfig)
@@ -348,6 +364,8 @@ class GnssOperationConfig:
     readiness_gate_enabled: bool = True
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "site_label", str(self.site_label).strip())
+        object.__setattr__(self, "site_address", str(self.site_address).strip())
         object.__setattr__(self, "operation_mode", GnssOperationMode(self.operation_mode))
         if not isinstance(self.readiness, ReadinessConfig):
             object.__setattr__(self, "readiness", ReadinessConfig.from_mapping(self.readiness))
@@ -366,6 +384,8 @@ class GnssOperationConfig:
         if not isinstance(value, Mapping):
             raise ValueError("gnss settings must be an object")
         return cls(
+            site_label=value.get("site_label", ""),
+            site_address=value.get("site_address", ""),
             operation_mode=value.get("operation_mode", cls.operation_mode.value),
             require_drone_rtk_fixed=bool(value.get("require_drone_rtk_fixed", False)),
             readiness=ReadinessConfig.from_mapping(value.get("readiness")),
@@ -378,6 +398,8 @@ class GnssOperationConfig:
 
     def to_mapping(self) -> dict[str, Any]:
         return {
+            "site_label": self.site_label,
+            "site_address": self.site_address,
             "operation_mode": self.operation_mode.value,
             "require_drone_rtk_fixed": self.require_drone_rtk_fixed,
             "readiness_gate_enabled": self.readiness_gate_enabled,
@@ -398,6 +420,8 @@ class CorrectionSourceIdentity:
     gga_policy: GgaPolicy = GgaPolicy.SYSTEM_CENTER
     stream_id: str = ""
     base_device: str = ""
+    site_label: str = ""
+    site_address: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "source_kind", str(self.source_kind).strip())
@@ -406,6 +430,8 @@ class CorrectionSourceIdentity:
         object.__setattr__(self, "gga_policy", GgaPolicy(self.gga_policy))
         object.__setattr__(self, "stream_id", str(self.stream_id).strip())
         object.__setattr__(self, "base_device", str(self.base_device).strip())
+        object.__setattr__(self, "site_label", str(self.site_label).strip())
+        object.__setattr__(self, "site_address", str(self.site_address).strip())
         if self.caster_port is not None:
             port = int(self.caster_port)
             if port <= 0 or port > 65535:
@@ -424,6 +450,8 @@ class CorrectionSourceIdentity:
             "gga_policy": self.gga_policy.value,
             "stream_id": self.stream_id,
             "base_device": self.base_device,
+            "site_label": self.site_label,
+            "site_address": self.site_address,
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -436,6 +464,8 @@ class CorrectionSourceIdentity:
             "gga_policy": self.gga_policy.value,
             "stream_id": self.stream_id,
             "base_device": self.base_device,
+            "site_label": self.site_label,
+            "site_address": self.site_address,
             "correction_source_id": self.stable_id,
         }
 
@@ -650,13 +680,23 @@ def evaluate_gnss_readiness(config: GnssOperationConfig, inputs: GnssReadinessIn
         if sample is None:
             _append_reason(reasons, "drone_missing" if target == "drone" else "rover_missing")
             continue
-        if not sample.rtk_fixed:
-            _append_reason(reasons, "drone_not_fixed" if target == "drone" else "rover_not_fixed")
-        fixed_duration_s = sample.rtk_fixed_duration_s(now_s)
-        if fixed_duration_s is None:
-            _append_reason(reasons, "rover_fixed_duration_missing")
-        elif fixed_duration_s < readiness.minimum_fixed_duration_s:
-            _append_reason(reasons, "rover_fixed_duration_short")
+        if sample.fix_type is None:
+            _append_reason(reasons, "rover_fix_type_missing")
+        elif sample.fix_type < readiness.minimum_fix_type:
+            _append_reason(reasons, "rover_fix_type_low")
+        # RTK Fixed is evidence by default.  Require it only when the
+        # configured numeric threshold is 6 or an explicit drone policy asks
+        # for it, matching the Workstation readiness contract.
+        requires_fixed = target == "drone" and config.require_drone_rtk_fixed
+        requires_fixed = requires_fixed or readiness.minimum_fix_type >= 6
+        if requires_fixed:
+            if not sample.rtk_fixed:
+                _append_reason(reasons, "drone_not_fixed" if target == "drone" else "rover_not_fixed")
+            fixed_duration_s = sample.rtk_fixed_duration_s(now_s)
+            if fixed_duration_s is None:
+                _append_reason(reasons, "rover_fixed_duration_missing")
+            elif fixed_duration_s < readiness.minimum_fixed_duration_s:
+                _append_reason(reasons, "rover_fixed_duration_short")
         gps_age_s = sample.gps_age_s(now_s)
         if gps_age_s is None:
             _append_reason(reasons, "gps_sample_missing")
@@ -712,6 +752,8 @@ class MeasurementGnssContract:
     route_endpoints: tuple[tuple[str, str], ...]
     datum: str
     height_type: HeightType
+    site_label: str = ""
+    site_address: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "gnss_operation_mode", GnssOperationMode(self.gnss_operation_mode))
@@ -724,6 +766,8 @@ class MeasurementGnssContract:
             "base_coordinate_profile_hash",
             "baseline_profile_hash",
             "datum",
+            "site_label",
+            "site_address",
         ):
             object.__setattr__(self, name, str(getattr(self, name)))
         object.__setattr__(self, "device_ids", tuple((str(k), str(v)) for k, v in self.device_ids))
@@ -748,6 +792,8 @@ class MeasurementGnssContract:
             "route_endpoints": sorted(self.route_endpoints),
             "datum": self.datum,
             "height_type": self.height_type.value,
+            "site_label": self.site_label,
+            "site_address": self.site_address,
         }
 
     def to_metadata(self) -> dict[str, Any]:
@@ -764,6 +810,8 @@ class MeasurementGnssContract:
             "gnss_route_endpoints": dict(self.route_endpoints),
             "datum": self.datum,
             "height_type": self.height_type.value,
+            "site_label": self.site_label,
+            "site_address": self.site_address,
         }
 
 
@@ -797,6 +845,8 @@ def build_measurement_gnss_contract(
         route_endpoints=tuple(sorted((route_endpoints or {}).items())),
         datum=str(datum),
         height_type=config.fixed_base.height_type,
+        site_label=config.site_label,
+        site_address=config.site_address,
     )
 
 

@@ -46,6 +46,7 @@ from workstation_core.attitude_geometry import (
     quaternion_multiply,
     relative_attitude,
     relative_rotation_angle_deg,
+    world_ned_vector_to_body_frd,
 )
 from workstation_core.camera_pane import CameraPane
 from workstation_core.coordinate_contract import (
@@ -79,7 +80,7 @@ from workstation_core.measurement_attempt import (
 )
 from workstation_core.measurement_controller import calculate_measurement_geometry
 from workstation_core.fixed_base_initializer import FixedBaseInitializer
-from workstation_core.gnss_network import NtripClient, format_nmea_gga, gga_from_position
+from workstation_core.gnss_network import NtripClient, format_nmea_gga, gga_from_position, gga_from_coordinate_sample
 from workstation_core.gnss_operation import (
     CorrectionSourceIdentity,
     evaluate_gnss_readiness,
@@ -127,6 +128,12 @@ from workstation_core.baseline_alignment import (
     BaselineVector,
     baseline_from_gps,
     evaluate_baseline_quality,
+)
+from workstation_core.physical_alignment import (
+    PhysicalAlignmentQuality,
+    PhysicalAlignmentSample,
+    evaluate_physical_alignment,
+    make_physical_alignment_sample,
 )
 from workstation_core.alignment_managers import (
     AlignmentProfileManager,
@@ -320,45 +327,15 @@ from workstation_core.wiris_zoom import (
 )
 
 
-def _new_measurement_attempt_generation_id(session_id: str = "") -> str:
-    """Return a collision-resistant generation identity independent of wall-clock resolution."""
-
-    return f"{session_id or 'runtime'}-{uuid.uuid4().hex}"
-
-
 def angle_diff_deg(a_deg: float, b_deg: float) -> float:
     """Return wrapped angular difference a-b in [-180, 180) degrees."""
     return (float(a_deg) - float(b_deg) + 180.0) % 360.0 - 180.0
 
 
-class MavlinkParameterStore:
-    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> None:
-        self.subscriber = subscriber
-        self.camera = camera
-
-    def get_param(self, name: str) -> int | float | None:
-        return self.subscriber.read_param_int(self.camera, name, timeout_s=1.5)
-
-    def set_param(self, name: str, value: int | float) -> None:
-        expected = int(value)
-        actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
-        if actual != expected:
-            raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
-
-
-class MavlinkAttitudeParameterStore:
-    """Read-only, type-aware PARAM store for accel/gyro/board-rotation calibration params.
-
-    Unlike MavlinkParameterStore this decodes REAL32 params (e.g. CAL_ACC0_XOFF) as floats
-    instead of bit-reinterpreting them as int32, since those params carry genuine float values.
-    """
-
-    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> None:
-        self.subscriber = subscriber
-        self.camera = camera
-
-    def get_param(self, name: str) -> int | float | None:
-        return self.subscriber.read_param(self.camera, name, timeout_s=1.5)
+from workstation_core.mavlink_parameter_store import (
+    MavlinkAttitudeParameterStore,
+    MavlinkParameterStore,
+)
 
 
 FORM_LABEL_MIN_WIDTH = 138
@@ -397,41 +374,7 @@ WIRIS_VISIBLE_ZOOM_FX_ESTIMATES = (
     (14, 30.0, 30906),
 )
 MAX_MANUAL_FOCAL_PX = 100_000.0
-RTSP_ENABLE_SETTLE_DELAY_MS = 4000
-RTSP_ENABLE_PORT_WAIT_INTERVAL_MS = 1000
-RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS = 12
 DETECTION_PAIR_MAX_AGE_S = 1.0
-CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.050
-CAMERA_RTCP_PAIR_MAX_DELTA_S = 0.050
-CAMERA_RTCP_MAX_PC_OFFSET_S = 0.100
-CAMERA_SYNC_FRAME_HISTORY_WINDOW_S = 1.0
-CAMERA_SYNC_HISTORY_MAX_AGE_S = CAMERA_SYNC_FRAME_HISTORY_WINDOW_S
-CAMERA_SYNC_MAX_SR_AGE_S = 7.0
-CAMERA_SYNC_RECEIVE_PAIR_MAX_DELTA_S = 0.350
-CAMERA_SYNC_WARMUP_TIMEOUT_S = 30.0
-CAMERA_SYNC_REQUIRED_SR_COUNT = 2
-CAMERA_SYNC_MAX_CLOCK_RATE_ERROR = 0.005
-CAMERA_GDTI_RESOLUTION_S = 1.0
-CAMERA_GDTI_MAX_PAIR_DELTA_S = 1.0
-CAMERA_SYNC_STATUS_NOT_VERIFIED = "not-verified"
-CAMERA_SYNC_STATUS_RECONNECTING = "reconnecting"
-CAMERA_SYNC_STATUS_WARMING = "warming"
-CAMERA_SYNC_STATUS_VERIFIED = "verified"
-CAMERA_SYNC_STATUS_FAILED = "failed"
-GNSS_BASE_SURVEY_TREND_WINDOW_S = 60.0
-GNSS_BASE_SURVEY_STAGNANT_DELTA_M = 0.01
-GNSS_BASE_SURVEY_IMPROVING_DELTA_M = 0.05
-GNSS_BASE_LOW_CNO_DBHZ = 30
-GNSS_BASE_LOW_ELEVATION_DEG = 15
-GNSS_ID_LABELS = {
-    0: "GPS",
-    1: "SBAS",
-    2: "Galileo",
-    3: "BeiDou",
-    5: "QZSS",
-    6: "GLONASS",
-    7: "NavIC",
-}
 RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
 RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
@@ -556,807 +499,29 @@ WIRIS_DANGEROUS_COMMAND_PREFIXES = (
 )
 
 
-def camera_resolution_text(stats: dict) -> str:
-    try:
-        width = int(stats.get("width", 0))
-        height = int(stats.get("height", 0))
-    except (TypeError, ValueError):
-        return ""
-    if width <= 0 or height <= 0:
-        return ""
-    return f" @ {width}x{height}"
-
-
-def camera_display_name(camera: str) -> str:
-    return {"left": "왼쪽", "right": "오른쪽"}.get(camera, camera)
-
-
-def format_camera_stream_stats(camera: str, state: str, stats: dict) -> str:
-    camera_name = camera_display_name(camera)
-    state_text = {"connected": "연결", "stale": "지연", "waiting": "대기"}.get(state, state)
-    decoded_hz = float(stats.get("decoded_hz", 0.0))
-    inferred_hz = float(stats.get("inferred_hz", 0.0))
-    resolution = camera_resolution_text(stats)
-    resolution_text = resolution.removeprefix(" @ ")
-    if stats.get("enable_detection"):
-        receive_rate_text = f"{resolution_text} 수신 {decoded_hz:.1f} Hz".strip()
-        return f"{camera_name}={state_text} {receive_rate_text}, YOLO {inferred_hz:.1f} Hz"
-    receive_rate_text = f"{resolution_text} 수신 {decoded_hz:.1f} Hz".strip()
-    return f"{camera_name}={state_text} {receive_rate_text}"
-
-
-def format_runtime_camera_stats(camera: str, stats: dict, fallback_hz: float, *, stale: bool) -> str:
-    label = camera_display_name(camera)
-    resolution = camera_resolution_text(stats) or " @ --"
-    has_stats = bool(stats)
-    decoded_hz = float(stats.get("decoded_hz", 0.0)) if has_stats else 0.0
-    if has_stats:
-        stream_hz_text = f"{resolution.removeprefix(' @ ')} {decoded_hz:.1f} Hz".strip()
-        yolo_hz_text = f"{float(stats.get('inferred_hz', 0.0)):.1f} Hz"
-    else:
-        stream_hz_text = resolution.removeprefix(" @ ") or "--"
-        yolo_hz_text = "--"
-    state_text = " | 지연" if stale else ""
-    return (
-        f"{label}: {stream_hz_text} | "
-        f"{yolo_hz_text}{format_runtime_yolo_device_text(stats)}{state_text}"
-    )
-
-
-def format_runtime_camera_status(camera: str, stats: dict, metadata: dict, fallback_hz: float, *, stale: bool) -> str:
-    return f"{format_runtime_camera_stats(camera, stats, fallback_hz, stale=stale)} | 시각: {format_runtime_camera_timestamp(metadata)}"
-
-
-def format_runtime_yolo_device_text(stats: dict) -> str:
-    if not stats or not stats.get("enable_detection"):
-        return ""
-    actual_device = str(stats.get("yolo_actual_device") or "").strip()
-    if not actual_device:
-        return " (장치 대기)"
-    normalized = actual_device.lower()
-    if normalized == "cpu":
-        return " (CPU fallback)" if stats.get("yolo_cpu_fallback") else " (CPU)"
-    if normalized.startswith("cuda"):
-        return " (CUDA)"
-    return f" ({actual_device})"
-
-
-def infer_runtime_camera_timestamp_reference(metadata: dict) -> str:
-    reference = (
-        str(metadata.get("timestamp_reference") or "")
-        .strip()
-        .lower()
-        .replace("_", "-")
-        .replace("/", "-")
-        .replace(" ", "-")
-    )
-    if reference:
-        return reference
-    if metadata.get("rtcp_timing_invalid_reason"):
-        return "rtcp-invalid"
-    if metadata.get("rtcp_frame_ntp_unix_s") is not None:
-        return "rtcp-ntp"
-    if metadata.get("source_timestamp_s") is not None:
-        return "source"
-    return "app-receive"
-
-
-def format_runtime_camera_timestamp(metadata: dict) -> str:
-    frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
-    timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
-    if timestamp_reference == "rtcp-invalid":
-        return "RTCP invalid (SR-PC offset)"
-    if frame_ntp_unix_s is not None:
-        try:
-            utc_text = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc).isoformat(timespec="microseconds")
-        except (TypeError, ValueError, OverflowError, OSError):
-            utc_text = ""
-        if utc_text:
-            if timestamp_reference == "gnss-utc":
-                return f"UTC {utc_text.replace('+00:00', 'Z')}"
-            return f"RTCP NTP {utc_text.replace('+00:00', 'Z')}"
-    source_timestamp_s = metadata.get("source_timestamp_s")
-    if source_timestamp_s is not None:
-        source_source = str(metadata.get("timestamp_source") or "source")
-        return f"src {float(source_timestamp_s):.6f} s [{source_source}]"
-    return "missing"
-
-
-def format_runtime_camera_timestamp_compact(metadata: dict) -> str:
-    frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
-    timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
-    if timestamp_reference == "rtcp-invalid":
-        return "RTCP invalid"
-    if frame_ntp_unix_s is not None:
-        try:
-            utc_dt = datetime.fromtimestamp(float(frame_ntp_unix_s), tz=timezone.utc)
-        except (TypeError, ValueError, OverflowError, OSError):
-            utc_dt = None
-        if utc_dt is not None:
-            prefix = "UTC" if timestamp_reference == "gnss-utc" else "RTCP"
-            return f"{prefix} {utc_dt.strftime('%H:%M:%S.%f')[:-3]}Z"
-    source_timestamp_s = metadata.get("source_timestamp_s")
-    if source_timestamp_s is not None:
-        source_source = str(metadata.get("timestamp_source") or "source")
-        return f"src {float(source_timestamp_s):.3f}s [{source_source}]"
-    return "missing"
-
-
-def format_unix_timestamp_compact(value: float | None) -> str:
-    if value is None:
-        return "--"
-    try:
-        utc_dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
-    except (TypeError, ValueError, OverflowError, OSError):
-        return "invalid"
-    return f"{utc_dt.strftime('%H:%M:%S.%f')[:-3]}Z"
-
-
-def format_runtime_camera_ntp_compact(metadata: dict) -> str:
-    return format_unix_timestamp_compact(metadata.get("rtcp_frame_ntp_unix_s"))
-
-
-def format_signed_ms_compact(value_s: object) -> str:
-    try:
-        value_s = float(value_s)
-    except (TypeError, ValueError):
-        return "--"
-    if not isfinite(value_s):
-        return "--"
-    return f"{value_s * 1000.0:+.1f} ms"
-
-
-@dataclass(frozen=True)
-class AttitudeHistoryPoint:
-    timestamp_s: float
-    left_deg: float | None = None
-    right_deg: float | None = None
-
-
-class AttitudeHistoryPlot(QtWidgets.QWidget):
-    def __init__(self, axis_name: str) -> None:
-        super().__init__()
-        self.axis_name = axis_name
-        self.points: deque[AttitudeHistoryPoint] = deque(maxlen=600)
-        self.setMinimumHeight(150)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
-
-    def add_point(self, point: AttitudeHistoryPoint) -> None:
-        self.points.append(point)
-        self.update()
-
-    @staticmethod
-    def auto_y_bounds(values: list[float]) -> tuple[float, float]:
-        min_value = min(values)
-        max_value = max(values)
-        if min_value == max_value:
-            padding = max(0.0001, abs(min_value) * 0.05)
-            return min_value - padding, max_value + padding
-        return min_value, max_value
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
-        rect = self.rect().adjusted(50, 18, -18, -34)
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(rect)
-
-        if len(self.points) < 2:
-            painter.setPen(QtGui.QColor(CHART_MUTED))
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, f"{self.axis_name}: 픽스호크 샘플 대기 중")
-            painter.end()
-            return
-
-        values = [
-            value
-            for point in self.points
-            for value in (point.left_deg, point.right_deg)
-            if value is not None and isfinite(value)
-        ]
-        if not values:
-            painter.setPen(QtGui.QColor(CHART_MUTED))
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, f"{self.axis_name}: 픽스호크 샘플 대기 중")
-            painter.end()
-            return
-        min_value, max_value = self.auto_y_bounds(values)
-        start_s = self.points[0].timestamp_s
-        end_s = max(self.points[-1].timestamp_s, start_s + 1.0)
-
-        def map_xy(timestamp_s: float, value: float) -> QtCore.QPointF:
-            x_ratio = (timestamp_s - start_s) / (end_s - start_s)
-            y_ratio = (value - min_value) / (max_value - min_value)
-            return QtCore.QPointF(rect.left() + x_ratio * rect.width(), rect.bottom() - y_ratio * rect.height())
-
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1))
-        mid_y = rect.center().y()
-        painter.drawLine(rect.left(), mid_y, rect.right(), mid_y)
-        for i in range(1, 4):
-            y = rect.top() + rect.height() * i / 4
-            painter.drawLine(rect.left(), int(y), rect.right(), int(y))
-
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.left(), rect.top() - 4, self.axis_name)
-
-        series = (
-            ("Pixhawk 1", SERIES_LEFT, lambda point: point.left_deg),
-            ("Pixhawk 2", SERIES_RIGHT, lambda point: point.right_deg),
-        )
-        painter.save()
-        painter.setClipRect(rect)
-        for name, color, getter in series:
-            painter.setPen(QtGui.QPen(QtGui.QColor(color), 2))
-            path = QtGui.QPainterPath()
-            path_started = False
-            for point in self.points:
-                value = getter(point)
-                if value is None or not isfinite(value):
-                    path_started = False
-                    continue
-                mapped = map_xy(point.timestamp_s, value)
-                if not path_started:
-                    path.moveTo(mapped)
-                    path_started = True
-                else:
-                    path.lineTo(mapped)
-            painter.drawPath(path)
-        painter.restore()
-
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(8, rect.top() + 6, f"{max_value:.4f} deg")
-        painter.drawText(8, rect.bottom(), f"{min_value:.4f} deg")
-        legend_x = rect.left()
-        for name, color, _getter in series:
-            painter.setPen(QtGui.QColor(color))
-            painter.drawText(legend_x, self.height() - 10, name)
-            legend_x += 58
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.right() - 130, self.height() - 10, f"{end_s - start_s:.1f}s window")
-        painter.end()
-
-
-class Px4ShellDialog(QtWidgets.QDialog):
-    def __init__(self, title: str, send_callback) -> None:
-        super().__init__()
-        self.send_callback = send_callback
-        self.setWindowTitle(title)
-        self.resize(760, 420)
-        layout = QtWidgets.QVBoxLayout(self)
-        self.output = QtWidgets.QPlainTextEdit()
-        self.output.setReadOnly(True)
-        self.output.setStyleSheet(
-            f"background: {INVERSE_BG}; color: {INVERSE_TEXT}; font-family: monospace; "
-            f"border: 1px solid {PANEL_BORDER_STRONG};"
-        )
-        command_row = QtWidgets.QHBoxLayout()
-        self.command_edit = QtWidgets.QLineEdit()
-        self.command_edit.setPlaceholderText("PX4 shell 명령")
-        self.command_edit.returnPressed.connect(self.send_command)
-        self.send_button = QtWidgets.QPushButton("전송")
-        self.send_button.clicked.connect(self.send_command)
-        command_row.addWidget(self.command_edit, 1)
-        command_row.addWidget(self.send_button)
-        layout.addWidget(self.output, 1)
-        layout.addLayout(command_row)
-
-    def append_output(self, text: str) -> None:
-        self.output.moveCursor(QtGui.QTextCursor.End)
-        self.output.insertPlainText(text)
-        self.output.moveCursor(QtGui.QTextCursor.End)
-
-    def send_command(self) -> None:
-        command = self.command_edit.text().strip()
-        if not command:
-            return
-        self.append_output(f"\n> {command}\n")
-        self.command_edit.clear()
-        self.send_callback(command)
-
-
-@dataclass(frozen=True)
-class TelemetryHistoryPoint:
-    timestamp_s: float
-    series: str
-    value: float
-
-
-class TelemetryHistoryPlot(QtWidgets.QWidget):
-    def __init__(self, title: str, y_unit: str) -> None:
-        super().__init__()
-        self.title = title
-        self.y_unit = y_unit
-        self.points: deque[TelemetryHistoryPoint] = deque(maxlen=600)
-        self.series_labels: dict[str, str] = {
-            "Δnorm": "Delta Norm",
-            "angle": "Angle",
-        }
-        self.series_order: dict[str, int] = {
-            "Δnorm": 50,
-            "angle": 51,
-        }
-        self.setMouseTracking(True)
-        self.setMinimumHeight(200)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
-
-    def add_point(self, point: TelemetryHistoryPoint) -> None:
-        self.points.append(point)
-        self.update()
-
-    def set_series_labels(self, labels: dict[str, str]) -> None:
-        self.series_labels.update(labels)
-        self.update()
-
-    def remove_series(self, series: str) -> None:
-        self.points = deque((point for point in self.points if point.series != series), maxlen=self.points.maxlen)
-        self.update()
-
-    def _plot_rect(self) -> QtCore.QRect:
-        return self.rect().adjusted(54, 24, -18, -34)
-
-    def _series_names(self) -> list[str]:
-        return sorted({point.series for point in self.points}, key=lambda name: (self.series_order.get(name, 1000), name))
-
-    def _series_color_map(self) -> dict[str, str]:
-        colors = [SERIES_LEFT, SERIES_RIGHT, SERIES_Z, SERIES_DISTANCE]
-        return {
-            series_name: colors[index % len(colors)]
-            for index, series_name in enumerate(self._series_names())
-        }
-
-    def _series_label(self, series_name: str) -> str:
-        return self.series_labels.get(series_name, series_name)
-
-    def _value_bounds(self) -> tuple[float, float]:
-        values = [point.value for point in self.points]
-        min_value = min(values)
-        max_value = max(values)
-        if max_value - min_value < 1e-6:
-            min_value -= 1.0
-            max_value += 1.0
-        return min_value, max_value
-
-    def _time_bounds(self) -> tuple[float, float]:
-        start_s = self.points[0].timestamp_s
-        end_s = max(self.points[-1].timestamp_s, start_s + 1.0)
-        return start_s, end_s
-
-    def _map_point(
-        self,
-        point: TelemetryHistoryPoint,
-        rect: QtCore.QRect,
-        start_s: float,
-        end_s: float,
-        min_value: float,
-        max_value: float,
-    ) -> QtCore.QPointF:
-        x_ratio = (point.timestamp_s - start_s) / (end_s - start_s)
-        y_ratio = (point.value - min_value) / (max_value - min_value)
-        return QtCore.QPointF(rect.left() + x_ratio * rect.width(), rect.bottom() - y_ratio * rect.height())
-
-    def _format_hover_text(self, point: TelemetryHistoryPoint) -> str:
-        return f"{self._series_label(point.series)}\nt={point.timestamp_s:.3f}s\nvalue={point.value:.3f} {self.y_unit}"
-
-    def _nearest_point_at(self, position: QtCore.QPoint) -> TelemetryHistoryPoint | None:
-        if len(self.points) < 2:
-            return None
-        rect = self._plot_rect()
-        if not rect.adjusted(-8, -8, 8, 8).contains(position):
-            return None
-        min_value, max_value = self._value_bounds()
-        start_s, end_s = self._time_bounds()
-        best_point: TelemetryHistoryPoint | None = None
-        best_distance_sq = 14.0 * 14.0
-        for point in self.points:
-            mapped = self._map_point(point, rect, start_s, end_s, min_value, max_value)
-            dx = mapped.x() - position.x()
-            dy = mapped.y() - position.y()
-            distance_sq = dx * dx + dy * dy
-            if distance_sq <= best_distance_sq:
-                best_distance_sq = distance_sq
-                best_point = point
-        return best_point
-
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        point = self._nearest_point_at(event.pos())
-        if point is None:
-            QtWidgets.QToolTip.hideText()
-            return
-        QtWidgets.QToolTip.showText(event.globalPos(), self._format_hover_text(point), self)
-
-    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        QtWidgets.QToolTip.hideText()
-        super().leaveEvent(event)
-
-    def _draw_legend(self, painter: QtGui.QPainter, rect: QtCore.QRect, series_colors: dict[str, str]) -> None:
-        if not series_colors:
-            return
-        font = painter.font()
-        font.setPointSize(8)
-        painter.setFont(font)
-        metrics = QtGui.QFontMetrics(font)
-        entries = [(self._series_label(series), color) for series, color in series_colors.items()]
-        row_h = max(12, metrics.height())
-        width = min(
-            max(metrics.horizontalAdvance(label) for label, _color in entries) + 24,
-            max(74, rect.width() // 2),
-        )
-        height = row_h * len(entries) + 8
-        legend = QtCore.QRect(rect.right() - width - 6, rect.top() + 6, width, height)
-        painter.fillRect(legend, QtGui.QColor(244, 244, 244, 220))
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(legend)
-        y = legend.top() + 5 + metrics.ascent()
-        for label, color in entries:
-            painter.setPen(QtGui.QColor(color))
-            painter.drawText(legend.left() + 7, y, "●")
-            painter.setPen(QtGui.QColor(CHART_TEXT))
-            painter.drawText(legend.left() + 20, y, label)
-            y += row_h
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
-        rect = self._plot_rect()
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(rect)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(10, 18, self.title)
-
-        if len(self.points) < 2:
-            painter.drawText(self.rect(), QtCore.Qt.AlignCenter, "샘플 대기 중")
-            painter.end()
-            return
-
-        min_value, max_value = self._value_bounds()
-        start_s, end_s = self._time_bounds()
-
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1))
-        for i in range(1, 4):
-            y = rect.top() + rect.height() * i / 4
-            painter.drawLine(rect.left(), int(y), rect.right(), int(y))
-
-        series_colors = self._series_color_map()
-        for series_name in self._series_names():
-            series_points = [point for point in self.points if point.series == series_name]
-            if len(series_points) < 2:
-                continue
-            painter.setPen(QtGui.QPen(QtGui.QColor(series_colors[series_name]), 2))
-            path = QtGui.QPainterPath(
-                self._map_point(series_points[0], rect, start_s, end_s, min_value, max_value)
-            )
-            for point in series_points[1:]:
-                path.lineTo(self._map_point(point, rect, start_s, end_s, min_value, max_value))
-            painter.drawPath(path)
-
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(8, rect.top() + 6, f"{max_value:.2f} {self.y_unit}")
-        painter.drawText(8, rect.bottom(), f"{min_value:.2f} {self.y_unit}")
-        painter.setPen(QtGui.QColor(CHART_MUTED))
-        painter.drawText(rect.left(), rect.bottom() + 18, f"t={start_s:.3f}s")
-        painter.drawText(rect.right() - 86, rect.bottom() + 18, f"t={end_s:.3f}s")
-        self._draw_legend(painter, rect, series_colors)
-        painter.end()
-
-
-class RtkAlignmentPlot(QtWidgets.QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        self.baseline: RtkBaselineEstimate | None = None
-        self.camera_translation_m: tuple[float, float, float] | None = None
-        self.left_attitude: CameraExtrinsicState | None = None
-        self.right_attitude: CameraExtrinsicState | None = None
-        self.setMinimumHeight(260)
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.setStyleSheet(f"background: {CHART_BG}; border: 1px solid {PANEL_BORDER};")
-
-    def set_alignment(
-        self,
-        baseline: RtkBaselineEstimate | None,
-        camera_translation_m: tuple[float, float, float] | None = None,
-        left_attitude: CameraExtrinsicState | None = None,
-        right_attitude: CameraExtrinsicState | None = None,
-    ) -> None:
-        self.baseline = baseline
-        self.camera_translation_m = camera_translation_m
-        self.left_attitude = left_attitude
-        self.right_attitude = right_attitude
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        super().paintEvent(event)
-        painter = QtGui.QPainter(self)
-        painter.setRenderHint(QtGui.QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor(CHART_BG))
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(12, 22, "GPS baseline 정렬 시각화")
-
-        content = self.rect().adjusted(14, 34, -14, -18)
-        if self.baseline is None:
-            painter.drawText(content, QtCore.Qt.AlignCenter, "GPS baseline 대기 중")
-            painter.end()
-            return
-
-        if self.camera_translation_m is None:
-            self._draw_gps_only_panel(painter, content)
-        else:
-            gap = 12
-            panel_width = int((content.width() - gap) * 0.62)
-            alignment_rect = QtCore.QRect(content.left(), content.top(), panel_width, content.height())
-            component_rect = QtCore.QRect(
-                alignment_rect.right() + gap,
-                content.top(),
-                content.right() - alignment_rect.right() - gap,
-                content.height(),
-            )
-            self._draw_forward_alignment_panel(painter, alignment_rect, self.camera_translation_m)
-            self._draw_component_panel(painter, component_rect, self.camera_translation_m)
-        painter.end()
-
-    def _draw_forward_alignment_panel(
-        self,
-        painter: QtGui.QPainter,
-        rect: QtCore.QRect,
-        camera_translation_m: tuple[float, float, float],
-    ) -> None:
-        right_m, down_m, forward_m = camera_translation_m
-        length_m = math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
-        if length_m <= 1e-9:
-            self._draw_vector_panel(
-                painter,
-                rect,
-                title="Top view: Forward vs Baseline",
-                x_label="Right",
-                y_label="Forward",
-                x_m=0.0,
-                y_m=0.0,
-                footer="baseline 대기 중",
-                color=SERIES_RIGHT,
-            )
-            return
-        angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, forward_m / length_m))))
-        effective_m = math.sqrt(right_m * right_m + down_m * down_m)
-        level = self._angle_level(angle_deg)
-        status_color = {"good": SUCCESS, "warn": WARNING, "bad": ERROR}[level]
-
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(rect)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.left() + 8, rect.top() + 18, "상단 보기: P1 RDF Forward vs P1→P2 Baseline")
-
-        plot = rect.adjusted(42, 44, -42, -70)
-        center = QtCore.QPointF(plot.center())
-        scale_value = max(abs(right_m), abs(forward_m), 0.05)
-        scale = 0.42 * min(plot.width(), plot.height()) / scale_value
-        baseline_end = QtCore.QPointF(center.x() + right_m * scale, center.y() - forward_m * scale)
-        forward_end = QtCore.QPointF(center.x(), center.y() - min(plot.height() * 0.36, 150.0))
-        right_end = QtCore.QPointF(center.x() + min(plot.width() * 0.36, 170.0), center.y())
-
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1, QtCore.Qt.DashLine))
-        painter.drawLine(plot.left(), int(center.y()), plot.right(), int(center.y()))
-        painter.drawLine(int(center.x()), plot.top(), int(center.x()), plot.bottom())
-
-        target_rect = QtCore.QRectF(center.x() + 14, center.y() - 44, 40, 40)
-        painter.setPen(QtGui.QPen(QtGui.QColor(SUCCESS), 2))
-        painter.drawArc(target_rect, 180 * 16, 90 * 16)
-        painter.drawText(int(center.x() + 58), int(center.y() - 30), "목표 90°")
-
-        self._draw_arrow(painter, center, forward_end, QtGui.QColor(SERIES_Z))
-        painter.setPen(QtGui.QColor(SERIES_Z))
-        painter.drawText(forward_end + QtCore.QPointF(8, 4), "Forward +Z")
-
-        self._draw_arrow(painter, center, right_end, QtGui.QColor(CHART_MUTED))
-        painter.setPen(QtGui.QColor(CHART_MUTED))
-        painter.drawText(right_end + QtCore.QPointF(-48, 18), "Right")
-
-        self._draw_arrow(painter, center, baseline_end, QtGui.QColor(SERIES_RIGHT))
-        painter.setBrush(QtGui.QColor(SERIES_RIGHT))
-        painter.setPen(QtCore.Qt.NoPen)
-        painter.drawEllipse(baseline_end, 5, 5)
-        painter.setPen(QtGui.QColor(SERIES_RIGHT))
-        painter.drawText(baseline_end + QtCore.QPointF(8, -8), "P1→P2 baseline")
-
-        badge = QtCore.QRect(rect.left() + 8, rect.bottom() - 48, 118, 28)
-        painter.fillRect(badge, QtGui.QColor(status_color))
-        painter.setPen(QtGui.QColor("#ffffff"))
-        painter.drawText(badge, QtCore.Qt.AlignCenter, level.upper())
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(
-            badge.right() + 12,
-            badge.top() + 19,
-            f"angle={angle_deg:.2f}°  effective={effective_m:.3f}/{length_m:.3f} m  forward={forward_m:+.3f} m",
-        )
-
-    def _angle_level(self, angle_deg: float) -> str:
-        if 80.0 <= angle_deg <= 100.0:
-            return "good"
-        if 70.0 <= angle_deg <= 110.0:
-            return "warn"
-        return "bad"
-
-    def _draw_component_panel(
-        self,
-        painter: QtGui.QPainter,
-        rect: QtCore.QRect,
-        camera_translation_m: tuple[float, float, float],
-    ) -> None:
-        right_m, down_m, forward_m = camera_translation_m
-        length_m = math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
-        effective_m = math.sqrt(right_m * right_m + down_m * down_m)
-        painter.setBrush(QtCore.Qt.NoBrush)
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(rect)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.left() + 8, rect.top() + 18, "P1 RDF 기준 baseline 성분")
-
-        rows = (
-            ("Right", right_m, SERIES_RIGHT),
-            ("Down", down_m, SERIES_LEFT),
-            ("Forward", forward_m, ERROR if abs(forward_m) > max(0.05, length_m * 0.15) else SUCCESS),
-            ("Effective", effective_m, SERIES_DISTANCE),
-        )
-        max_value = max(*(abs(value) for _name, value, _color in rows), 0.05)
-        bar_left = rect.left() + 88
-        bar_right = rect.right() - 18
-        zero_x = int((bar_left + bar_right) / 2)
-        top = rect.top() + 52
-        row_h = 38
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1))
-        painter.drawLine(zero_x, top - 12, zero_x, top + row_h * len(rows) - 4)
-        for index, (name, value, color) in enumerate(rows):
-            y = top + index * row_h
-            painter.setPen(QtGui.QColor(CHART_TEXT))
-            painter.drawText(rect.left() + 10, y + 17, name)
-            half_width = (bar_right - bar_left) * 0.46
-            bar_len = int((abs(value) / max_value) * half_width)
-            if value >= 0:
-                bar_rect = QtCore.QRect(zero_x, y, bar_len, 20)
-            else:
-                bar_rect = QtCore.QRect(zero_x - bar_len, y, bar_len, 20)
-            painter.fillRect(bar_rect, QtGui.QColor(color))
-            painter.setPen(QtGui.QColor(CHART_TEXT))
-            painter.drawText(bar_right - 86, y + 17, f"{value:+.3f} m")
-        painter.setPen(QtGui.QColor(CHART_MUTED))
-        painter.drawText(
-            rect.adjusted(10, 0, -10, -10),
-            QtCore.Qt.AlignLeft | QtCore.Qt.AlignBottom,
-            "Forward≈0, Effective≈전체 baseline이면 좋습니다.",
-        )
-
-    def _format_relative_attitude_line(self) -> str:
-        if self.left_attitude is None or self.right_attitude is None:
-            return "상대 ΔR/P/Y: 대기 중"
-        relative = relative_attitude(self.left_attitude.q, self.right_attitude.q)
-        return f"상대 ΔR/P/Y: {relative.roll_deg:+.2f}° / {relative.pitch_deg:+.2f}° / {relative.yaw_deg:+.2f}°"
-
-    def _attitude_arrow_components(self, state: CameraExtrinsicState) -> tuple[float, float, float]:
-        yaw = max(-1.0, min(1.0, state.yaw_deg / 45.0))
-        pitch = max(-1.0, min(1.0, state.pitch_deg / 45.0))
-        return yaw, pitch, state.roll_deg
-
-    def _draw_camera_attitude_arrows(self, painter: QtGui.QPainter, rect: QtCore.QRect) -> None:
-        states = (
-            ("L", self.left_attitude, SERIES_LEFT),
-            ("R", self.right_attitude, SERIES_Z),
-        )
-        if all(state is None for _label, state, _color in states):
-            return
-        overlay_width = min(238, max(150, rect.width() - 24))
-        overlay = QtCore.QRect(rect.right() - overlay_width - 10, rect.top() + 28, overlay_width, 92)
-        painter.fillRect(overlay, QtGui.QColor(244, 244, 244, 232))
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(overlay)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(overlay.left() + 8, overlay.top() + 16, "자세 화살표")
-        for index, (label, state, color) in enumerate(states):
-            origin = QtCore.QPointF(overlay.left() + 58 + index * 92, overlay.top() + 58)
-            self._draw_single_attitude_glyph(painter, origin, label, state, QtGui.QColor(color))
-        painter.setPen(QtGui.QColor(CHART_MUTED))
-        painter.drawText(overlay.left() + 8, overlay.bottom() - 8, "광축: yaw/pitch, 원호: roll")
-
-    def _draw_single_attitude_glyph(
-        self,
-        painter: QtGui.QPainter,
-        origin: QtCore.QPointF,
-        label: str,
-        state: CameraExtrinsicState | None,
-        color: QtGui.QColor,
-    ) -> None:
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawLine(QtCore.QPointF(origin.x() - 24, origin.y()), QtCore.QPointF(origin.x() + 24, origin.y()))
-        painter.drawLine(QtCore.QPointF(origin.x(), origin.y() - 30), QtCore.QPointF(origin.x(), origin.y() + 8))
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(int(origin.x() - 5), int(origin.y() + 24), label)
-        if state is None:
-            painter.setPen(QtGui.QColor(CHART_MUTED))
-            painter.drawText(int(origin.x() - 16), int(origin.y() - 10), "대기")
-            return
-        yaw, pitch, roll = self._attitude_arrow_components(state)
-        end = QtCore.QPointF(origin.x() + yaw * 24.0, origin.y() - 28.0 - pitch * 18.0)
-        self._draw_arrow(painter, origin, end, color)
-        self._draw_roll_arc(painter, origin, roll, color)
-
-    def _draw_arrow(self, painter: QtGui.QPainter, start: QtCore.QPointF, end: QtCore.QPointF, color: QtGui.QColor) -> None:
-        painter.setPen(QtGui.QPen(color, 2))
-        painter.drawLine(start, end)
-        angle = math.atan2(end.y() - start.y(), end.x() - start.x())
-        head_len = 7.0
-        for offset in (math.radians(150), -math.radians(150)):
-            point = QtCore.QPointF(
-                end.x() + math.cos(angle + offset) * head_len,
-                end.y() + math.sin(angle + offset) * head_len,
-            )
-            painter.drawLine(end, point)
-
-    def _draw_roll_arc(self, painter: QtGui.QPainter, origin: QtCore.QPointF, roll_deg: float, color: QtGui.QColor) -> None:
-        radius = 14
-        rect = QtCore.QRectF(origin.x() - radius, origin.y() - radius, radius * 2, radius * 2)
-        span_deg = max(-120.0, min(120.0, roll_deg))
-        if abs(span_deg) < 0.5:
-            span_deg = 18.0
-        painter.setPen(QtGui.QPen(color, 1))
-        painter.drawArc(rect, 35 * 16, int(span_deg * 16))
-
-    def _draw_gps_only_panel(self, painter: QtGui.QPainter, rect: QtCore.QRect) -> None:
-        if self.baseline is None:
-            return
-        up_m = -self.baseline.down_m
-        self._draw_vector_panel(
-            painter,
-            rect,
-            title="GPS 전용 E/U",
-            x_label="E",
-            y_label="U",
-            x_m=self.baseline.east_m,
-            y_m=up_m,
-            footer=f"E={self.baseline.east_m:.3f} m, U={up_m:.3f} m, N={self.baseline.north_m:.3f} m",
-            color=SERIES_RIGHT,
-        )
-
-    def _draw_vector_panel(
-        self,
-        painter: QtGui.QPainter,
-        rect: QtCore.QRect,
-        *,
-        title: str,
-        x_label: str,
-        y_label: str,
-        x_m: float,
-        y_m: float,
-        footer: str,
-        color: str,
-    ) -> None:
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_AXIS), 1))
-        painter.drawRect(rect)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.left() + 8, rect.top() + 18, title)
-
-        plot = rect.adjusted(32, 34, -24, -42)
-        center = QtCore.QPointF(plot.center())
-        scale_value = max(abs(x_m), abs(y_m), 0.05)
-        scale = 0.45 * min(plot.width(), plot.height()) / scale_value
-        end = QtCore.QPointF(center.x() + x_m * scale, center.y() - y_m * scale)
-
-        painter.setPen(QtGui.QPen(QtGui.QColor(CHART_GRID), 1))
-        painter.drawLine(plot.left(), int(center.y()), plot.right(), int(center.y()))
-        painter.drawLine(int(center.x()), plot.top(), int(center.x()), plot.bottom())
-        painter.setPen(QtGui.QColor(CHART_MUTED))
-        painter.drawText(plot.right() - 44, int(center.y()) - 6, x_label)
-        painter.drawText(int(center.x()) + 6, plot.top() + 14, y_label)
-
-        painter.setPen(QtGui.QPen(QtGui.QColor(color), 3))
-        painter.drawLine(center, end)
-        painter.setBrush(QtGui.QColor(color))
-        painter.drawEllipse(end, 4, 4)
-        painter.setPen(QtGui.QColor(CHART_TEXT))
-        painter.drawText(rect.left() + 8, rect.bottom() - 18, footer)
-
-
+from workstation_core.runtime_camera_status import (
+    camera_display_name,
+    camera_resolution_text,
+    format_camera_stream_stats,
+    format_runtime_camera_ntp_compact,
+    format_runtime_camera_stats,
+    format_runtime_camera_status,
+    format_runtime_camera_timestamp,
+    format_runtime_camera_timestamp_compact,
+    format_runtime_yolo_device_text,
+    format_signed_ms_compact,
+    format_unix_timestamp_compact,
+    infer_runtime_camera_timestamp_reference,
+)
+
+
+from workstation.telemetry_plots import (
+    AttitudeHistoryPlot,
+    AttitudeHistoryPoint,
+    RtkAlignmentPlot,
+    TelemetryHistoryPlot,
+    TelemetryHistoryPoint,
+)
 def _control_candidate_value(candidate: object, key: str, default: object | None = None) -> object | None:
     if isinstance(candidate, dict):
         return candidate.get(key, default)
@@ -1438,46 +603,7 @@ def _verify_wiris_control_candidates(candidates: list[object]) -> list[dict[str,
     return verified
 
 
-class SessionSaveWorker(QtCore.QObject):
-    saved = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        *,
-        output_dir: Path,
-        metadata: dict[str, object],
-        pair_rows: Sequence[dict[str, object]],
-        camera_rows: dict[str, SpoolRows],
-        px4_rows: dict[str, SpoolRows],
-        gnss_base_rows: SpoolRows | None = None,
-    ) -> None:
-        super().__init__()
-        self.output_dir = output_dir
-        self.metadata = metadata
-        self.pair_rows = pair_rows
-        self.camera_rows = camera_rows
-        self.px4_rows = px4_rows
-        self.gnss_base_rows = gnss_base_rows
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            saved = save_session_files(
-                self.output_dir,
-                metadata=self.metadata,
-                pair_rows=self.pair_rows,
-                camera_rows=self.camera_rows,
-                px4_rows=self.px4_rows,
-                gnss_base_rows=self.gnss_base_rows,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.saved.emit(saved)
-        finally:
-            self.finished.emit()
+from workstation.session_workers import SessionSaveWorker
 
 
 class CameraAutoDetectWorker(QtCore.QObject):
@@ -1642,2182 +768,143 @@ class WirisControlCheckWorker(QtCore.QObject):
             self.finished.emit()
 
 
-class WirisCommandWorker(QtCore.QObject):
-    """Send one SDK command to one or both cameras off the UI thread."""
 
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
 
-    def __init__(
-        self,
-        target_infos: Sequence[tuple[str, str, int, float]],
-        *,
-        command_text: str,
-        terminator: str,
-    ) -> None:
-        super().__init__()
-        self.target_infos = tuple(
-            (str(label), str(host), int(port), max(0.1, float(timeout_s)))
-            for label, host, port, timeout_s in target_infos
-        )
-        self.command_text = str(command_text)
-        self.terminator = str(terminator)
 
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        statuses: dict[str, str] = {}
-        command_logs: dict[str, str] = {}
-        send_times: dict[str, float] = {}
-        barrier = threading.Barrier(len(self.target_infos)) if len(self.target_infos) >= 2 else None
 
-        def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
-            try:
-                command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=self.command_text,
-                    timeout_s=timeout_s,
-                    terminator=self.terminator,
-                )
-                if barrier is not None:
-                    barrier.wait(timeout=max(1.0, timeout_s))
-                send_times[label] = time.perf_counter()
-                response = send_tcp_line(command)
-            except Exception as exc:
-                statuses[label] = f"실패: {exc}"
-                return
-            response_text = response or "<no response>"
-            statuses[label] = response_text
-            command_logs[label] = f"> {label} {command.host}:{command.port} {command.command}\n{response_text}\n"
-
-        threads = [
-            threading.Thread(
-                target=send_one,
-                args=(label, host, port, timeout_s),
-                name=f"wiris-command-{label}",
-            )
-            for label, host, port, timeout_s in self.target_infos
-        ]
-        try:
-            for thread in threads:
-                thread.start()
-            max_timeout_s = max(max(1.0, timeout_s) for _label, _host, _port, timeout_s in self.target_infos)
-            for thread in threads:
-                thread.join(timeout=max_timeout_s + 1.0)
-            for label, _host, _port, _timeout_s in self.target_infos:
-                statuses.setdefault(label, "실패: 전송 스레드 timeout")
-            self.completed.emit(
-                {
-                    "statuses": statuses,
-                    "command_logs": command_logs,
-                    "send_times": send_times,
-                    "target_infos": self.target_infos,
-                }
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
-
-
-class WirisZoomWorker(QtCore.QObject):
-    """Send WIRIS zoom commands without blocking the UI thread."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        targets: Sequence[tuple[str, str, int]],
-        *,
-        template: str,
-        level: int | None,
-        timeout_s: float,
-    ) -> None:
-        super().__init__()
-        self.targets = tuple((str(label), str(host), int(port)) for label, host, port in targets)
-        self.template = str(template)
-        self.level = None if level is None else int(level)
-        self.timeout_s = max(0.1, float(timeout_s))
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        statuses: list[dict[str, object]] = []
-        try:
-            for label, host, port in self.targets:
-                try:
-                    command = build_zoom_command(
-                        host=host,
-                        port=port,
-                        template=self.template,
-                        level=self.level,
-                        timeout_s=self.timeout_s,
-                    )
-                    response = send_tcp_line(command)
-                except Exception as exc:
-                    statuses.append({"label": label, "state": "failed", "detail": str(exc)})
-                else:
-                    statuses.append(
-                        {
-                            "label": label,
-                            "state": "sent",
-                            "command": command.command,
-                            "response": response,
-                        }
-                    )
-            self.completed.emit(statuses)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
-
-
-class PixhawkUsbDiscoveryWorker(QtCore.QObject):
-    """Probe USB serial candidates without blocking the owner UI."""
-
-    discovered = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, *, timeout_s: float = 0.8) -> None:
-        super().__init__()
-        self.timeout_s = max(0.1, float(timeout_s))
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            candidates = usb_mavlink_device_candidates()
-            found = probe_usb_mavlink_devices(candidates=candidates, timeout_s=self.timeout_s) if candidates else []
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.discovered.emit({"candidates": candidates, "found": found})
-        finally:
-            self.finished.emit()
-
-
-class CameraNetworkDiscoveryWorker(QtCore.QObject):
-    """Discover camera-network interfaces and NetworkManager addresses off the UI thread."""
-
-    discovered = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, *, host_address: str, host_hints: Sequence[str]) -> None:
-        super().__init__()
-        self.host_address = str(host_address)
-        self.host_hints = tuple(str(value) for value in host_hints)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            candidates = discover_host_interface_candidates(
-                host_address=self.host_address or DEFAULT_HOST_ADDRESS,
-                include_unconfigured=True,
-            )
-            if not candidates:
-                result = {"candidates": (), "resolved_address": None, "connection_name": None, "addresses": ()}
-            else:
-                selected = candidates[0]
-                interface_name = str(getattr(selected.interface, "name", ""))
-                resolved_address = resolve_nm_interface_address(interface_name, self.host_hints)
-                connection_name = nm_device_connection_name(interface_name)
-                addresses = () if connection_name is None else nm_connection_ipv4_addresses(connection_name)
-                result = {
-                    "candidates": tuple(candidates),
-                    "resolved_address": resolved_address,
-                    "connection_name": connection_name,
-                    "addresses": tuple(addresses),
-                }
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.discovered.emit(result)
-        finally:
-            self.finished.emit()
-
-
-class CameraNetworkAddressApplyWorker(QtCore.QObject):
-    """Apply a selected camera-network address without blocking the UI."""
-
-    applied = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, *, interface_name: str, address_text: str) -> None:
-        super().__init__()
-        self.interface_name = str(interface_name)
-        self.address_text = str(address_text)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            ok, message = apply_interface_address(self.interface_name, self.address_text)
-            addresses = interface_addresses(self.interface_name) if ok else ""
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.applied.emit(
-                {
-                    "ok": bool(ok),
-                    "message": str(message),
-                    "interface_name": self.interface_name,
-                    "address_text": self.address_text,
-                    "addresses": addresses,
-                }
-            )
-        finally:
-            self.finished.emit()
-
-
-class InterfaceStatusWorker(QtCore.QObject):
-    """Read one local interface status without blocking panel construction."""
-
-    ready = QtCore.pyqtSignal(str, str)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, interface_name: str) -> None:
-        super().__init__()
-        self.interface_name = str(interface_name)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            status = interface_addresses(self.interface_name)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.ready.emit(self.interface_name, str(status))
-        finally:
-            self.finished.emit()
-
-
-class PixhawkHostIpDiscoveryWorker(QtCore.QObject):
-    """Enumerate local IPv4 interfaces for Pixhawk host candidates off the UI thread."""
-
-    discovered = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            interfaces = local_ipv4_interfaces(include_wireless=True)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.discovered.emit(tuple(interfaces))
-        finally:
-            self.finished.emit()
-
-
-class PixhawkConnectionWorker(QtCore.QObject):
-    """Open a MAVLink transport without touching the Workstation event loop."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str | None) -> None:
-        super().__init__()
-        self.subscriber = subscriber
-        self.camera = None if camera is None else str(camera)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            self.subscriber.start(
-                self.camera,
-                start_timer=False,
-                apply_pending_setup=False,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.completed.emit(
-                {
-                    "camera": self.camera,
-                    "connections": tuple(getattr(self.subscriber, "connections", {}).keys()),
-                }
-            )
-        finally:
-            self.finished.emit()
-
-
-class PixhawkStreamSetupWorker(QtCore.QObject):
-    """Apply the optional PX4 MAVLink stream setup away from the UI thread."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        subscriber: DualPixhawkMavlinkSubscriber,
-        *,
-        host_ip: str,
-        ports: dict[str, int],
-        sysids: dict[str, int],
-        rate: int,
-        cameras: Sequence[str],
-    ) -> None:
-        super().__init__()
-        self.subscriber = subscriber
-        self.host_ip = str(host_ip)
-        self.ports = {str(key): int(value) for key, value in dict(ports).items()}
-        self.sysids = {str(key): int(value) for key, value in dict(sysids).items()}
-        self.rate = int(rate)
-        self.cameras = tuple(str(camera) for camera in cameras)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            self.subscriber.configure_mavlink_streams(
-                host_ip=self.host_ip,
-                ports=self.ports,
-                sysids=self.sysids,
-                rate=self.rate,
-                cameras=self.cameras,
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.completed.emit(
-                {
-                    "host_ip": self.host_ip,
-                    "ports": dict(self.ports),
-                    "cameras": self.cameras,
-                }
-            )
-        finally:
-            self.finished.emit()
-
-
-class PixhawkUsbBootstrapWorker(QtCore.QObject):
-    """Bootstrap one Ethernet MAVLink stream over a temporary USB link."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        *,
-        camera: str,
-        usb_url: str,
-        baud_candidates: Sequence[int],
-        command: str,
-        fallback_command: str,
-    ) -> None:
-        super().__init__()
-        self.camera = str(camera)
-        self.usb_url = str(usb_url)
-        self.baud_candidates = tuple(int(value) for value in baud_candidates if int(value) > 0)
-        self.command = str(command)
-        self.fallback_command = str(fallback_command)
-
-    @staticmethod
-    def _heartbeat(subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> bool:
-        connection = getattr(subscriber, "connections", {}).get(camera)
-        if connection is None:
-            return False
-        wait_heartbeat = getattr(connection, "wait_heartbeat", None)
-        if wait_heartbeat is None:
-            return True
-        try:
-            return wait_heartbeat(timeout=1.2) is not None
-        except Exception:
-            return False
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        last_error = ""
-        selected_baud: int | None = None
-        output = ""
-        flag_label = ""
-        for candidate_baud in self.baud_candidates:
-            temp = DualPixhawkMavlinkSubscriber(
-                left_url=self.usb_url if self.camera == "left" else "",
-                right_url=self.usb_url if self.camera == "right" else "",
-                left_baud=candidate_baud,
-                right_baud=candidate_baud,
-            )
-            try:
-                temp.start(self.camera, start_timer=False, apply_pending_setup=False)
-                if not self._heartbeat(temp, self.camera):
-                    last_error = f"{candidate_baud} baud heartbeat timeout"
-                    continue
-                with temp.exclusive_command(self.camera):
-                    result = temp.send_shell_command_with_result(
-                        self.camera,
-                        self.command,
-                        timeout_s=2.0,
-                    )
-                    if "invalid mode" in result.output.lower() and self.fallback_command:
-                        result = temp.send_shell_command_with_result(
-                            self.camera,
-                            self.fallback_command,
-                            timeout_s=2.0,
-                        )
-                selected_baud = candidate_baud
-                output = str(result.output or "")
-                flag_label = str(result.flag_label or "")
-                break
-            except Exception as exc:
-                last_error = f"{candidate_baud} baud: {exc}"
-            finally:
-                try:
-                    temp.stop(self.camera)
-                except Exception:
-                    pass
-        if selected_baud is None:
-            self.failed.emit(last_error or "USB MAVLink bootstrap failed")
-        else:
-            self.completed.emit(
-                {
-                    "camera": self.camera,
-                    "baud": selected_baud,
-                    "output": output,
-                    "flag_label": flag_label,
-                }
-            )
-        self.finished.emit()
-
-
-class PixhawkPersistentConfigWorker(QtCore.QObject):
-    """Apply PX4 Ethernet settings and persist their files off the UI thread."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        subscriber: DualPixhawkMavlinkSubscriber,
-        *,
-        camera: str,
-        command: str,
-        extras_text: str,
-        net_cfg_text: str,
-    ) -> None:
-        super().__init__()
-        self.subscriber = subscriber
-        self.camera = str(camera)
-        self.command = str(command)
-        self.extras_text = str(extras_text)
-        self.net_cfg_text = str(net_cfg_text)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            with self.subscriber.exclusive_command(self.camera):
-                result = self.subscriber.send_shell_command_with_result(
-                    self.camera,
-                    self.command,
-                    timeout_s=3.0,
-                )
-                self.subscriber.write_remote_file_mavftp(
-                    self.camera,
-                    "/fs/microsd/etc/extras.txt",
-                    self.extras_text,
-                )
-                self.subscriber.write_remote_file_mavftp(
-                    self.camera,
-                    "/fs/microsd/net.cfg",
-                    self.net_cfg_text,
-                )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.completed.emit(
-                {
-                    "camera": self.camera,
-                    "output": str(getattr(result, "output", "") or ""),
-                    "flag_label": str(getattr(result, "flag_label", "") or ""),
-                }
-            )
-        finally:
-            self.finished.emit()
-
-
-class PixhawkRtcmInjectionWorker(QtCore.QObject):
-    """Queue RTCM packets so GNSS correction delivery never runs in the UI."""
-
-    request = QtCore.pyqtSignal(object, object)
-    injected = QtCore.pyqtSignal(object)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, *, max_queue: int = 96) -> None:
-        super().__init__()
-        self.subscriber = subscriber
-        self.max_queue = max(1, int(max_queue))
-        self._queue: deque[tuple[tuple[str, ...], bytes]] = deque()
-        self._queue_lock = threading.Lock()
-        self._draining = False
-
-    @QtCore.pyqtSlot(object, object)
-    def enqueue(self, sides: object, payload: object) -> None:
-        target_sides = tuple(str(side) for side in (sides or ()))
-        frame = bytes(payload or b"")
-        if not target_sides or not frame:
-            return
-        with self._queue_lock:
-            dropped = 0
-            while len(self._queue) >= self.max_queue:
-                self._queue.popleft()
-                dropped += 1
-            self._queue.append((target_sides, frame))
-            if self._draining:
-                return
-            self._draining = True
-        if dropped:
-            self.injected.emit({"dropped": dropped, "payload_bytes": 0, "sent": (), "failed": ()})
-        self._drain_one()
-
-    def _drain_one(self) -> None:
-        with self._queue_lock:
-            if not self._queue:
-                self._draining = False
-                return
-            sides, payload = self._queue.popleft()
-        sent: list[tuple[str, int]] = []
-        failed: list[tuple[str, str]] = []
-        for side in sides:
-            try:
-                with self.subscriber.exclusive_command(side):
-                    packet_count = int(self.subscriber.send_rtcm_data(side, payload) or 0)
-                sent.append((side, packet_count))
-            except Exception as exc:
-                failed.append((side, str(exc)))
-        self.injected.emit(
-            {
-                "payload_bytes": len(payload),
-                "sent": tuple(sent),
-                "failed": tuple(failed),
-                "dropped": 0,
-            }
-        )
-        QtCore.QTimer.singleShot(0, self._drain_one)
-
-    def clear_pending(self) -> None:
-        with self._queue_lock:
-            self._queue.clear()
-
-
-class PixhawkShellCommandWorker(QtCore.QObject):
-    """Run one blocking MAVLink shell/reboot operation off the UI thread."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        subscriber: DualPixhawkMavlinkSubscriber,
-        *,
-        camera: str,
-        command: str,
-        operation: str = "shell",
-        timeout_s: float = 2.0,
-    ) -> None:
-        super().__init__()
-        self.subscriber = subscriber
-        self.camera = str(camera)
-        self.command = str(command)
-        self.operation = str(operation)
-        self.timeout_s = max(0.1, float(timeout_s))
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            with self.subscriber.exclusive_command(self.camera):
-                if self.operation == "reboot":
-                    self.subscriber.reboot_autopilot(self.camera)
-                    result: dict[str, object] = {
-                        "camera": self.camera,
-                        "operation": self.operation,
-                        "command": self.command,
-                        "output": "",
-                        "flag_label": "command-sent",
-                    }
-                else:
-                    shell_result = self.subscriber.send_shell_command_with_result(
-                        self.camera,
-                        self.command,
-                        timeout_s=self.timeout_s,
-                    )
-                    if isinstance(shell_result, MavlinkShellCommandResult):
-                        result = {
-                            "camera": self.camera,
-                            "operation": self.operation,
-                            "command": shell_result.command,
-                            "output": shell_result.output,
-                            "flag_label": shell_result.flag_label,
-                        }
-                    else:
-                        result = {
-                            "camera": self.camera,
-                            "operation": self.operation,
-                            "command": self.command,
-                            "output": str(getattr(shell_result, "output", "") or ""),
-                            "flag_label": str(getattr(shell_result, "flag_label", "unknown")),
-                        }
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.completed.emit(result)
-        finally:
-            self.finished.emit()
-
-
-class PixhawkParameterWorker(QtCore.QObject):
-    """Read or update PX4 parameters without blocking the Workstation UI."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        subscriber: DualPixhawkMavlinkSubscriber,
-        *,
-        camera: str,
-        operation: str,
-        actual_selected_device_id: int | None = None,
-        armed: bool = False,
-        priorities: dict[str, int] | None = None,
-    ) -> None:
-        super().__init__()
-        self.subscriber = subscriber
-        self.camera = str(camera)
-        self.operation = str(operation)
-        self.actual_selected_device_id = actual_selected_device_id
-        self.armed = bool(armed)
-        self.priorities = {str(key): int(value) for key, value in dict(priorities or {}).items()}
-
-    def _read_mag_params(self) -> dict[str, int | float | None]:
-        return {
-            name: self.subscriber.read_param_int(self.camera, name, timeout_s=1.5)
-            for name in MAG_PARAM_NAMES
-        }
-
-    def _read_attitude_params(self) -> dict[str, int | float | None]:
-        return {
-            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
-            for name in ATTITUDE_CAL_PARAM_NAMES
-        }
-
-    @staticmethod
-    def _role_for_device_id(device_id: int | None) -> str | None:
-        if device_id == BOARD_INTERNAL_MAG_ID:
-            return "BOARD"
-        if device_id in RM3100_PRIMARY_IDS:
-            return "CAN1"
-        if device_id in RM3100_BACKUP_IDS:
-            return "CAN2"
-        if device_id == GPS1_MAG_ID:
-            return "GPS1_MAG"
-        if device_id == GPS2_MAG_ID:
-            return "GPS2_MAG"
-        return None
-
-    def _run_mag_apply(self) -> dict[str, object]:
-        if self.armed:
-            raise RuntimeError("Disarm required before changing PX4 magnetometer parameters.")
-        params = self._read_mag_params()
-        before = build_mag_status(
-            params,
-            actual_selected_device_id=self.actual_selected_device_id,
-            armed=self.armed,
-        )
-        applied: list[str] = []
-        missing = set(self.priorities)
-        for slot in before.slots:
-            role = self._role_for_device_id(slot.device_id)
-            if role is None or role not in self.priorities:
-                continue
-            name = f"CAL_MAG{slot.slot}_PRIO"
-            expected = int(self.priorities[role])
-            actual = self.subscriber.set_param_int(self.camera, name, expected, timeout_s=2.0)
-            if actual != expected:
-                raise RuntimeError(f"{name} readback mismatch: expected={expected}, actual={actual}")
-            applied.append(f"{role}:{name}={expected}")
-            missing.discard(role)
-        if not applied:
-            raise RuntimeError("적용 가능한 BOARD/CAN/GPS MAG 슬롯을 찾지 못했습니다.")
-        after_params = self._read_mag_params()
-        status = build_mag_status(
-            after_params,
-            actual_selected_device_id=self.actual_selected_device_id,
-            armed=self.armed,
-        )
-        return {
-            "kind": self.operation,
-            "camera": self.camera,
-            "status": status,
-            "applied": tuple(applied),
-            "missing": tuple(sorted(missing)),
-        }
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            with self.subscriber.exclusive_command(self.camera):
-                if self.operation == "mag_refresh":
-                    status = build_mag_status(
-                        self._read_mag_params(),
-                        actual_selected_device_id=self.actual_selected_device_id,
-                        armed=self.armed,
-                    )
-                    result = {"kind": self.operation, "camera": self.camera, "status": status}
-                elif self.operation == "attitude_refresh":
-                    status = build_attitude_cal_status(self._read_attitude_params())
-                    result = {"kind": self.operation, "camera": self.camera, "status": status}
-                elif self.operation == "mag_apply":
-                    result = self._run_mag_apply()
-                else:
-                    raise ValueError(f"Unknown Pixhawk parameter operation: {self.operation}")
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.completed.emit(result)
-        finally:
-            self.finished.emit()
-
-
-class WirisClockCommandWorker(QtCore.QObject):
-    """Send WIRIS STUS/GDTI commands without joining worker threads on the UI thread."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        target_infos: Sequence[tuple[str, str, int, float]],
-        *,
-        command_text: str,
-        shared_utc: bool = False,
-    ) -> None:
-        super().__init__()
-        self.target_infos = tuple(
-            (str(label), str(host), int(port), max(0.1, float(timeout_s)))
-            for label, host, port, timeout_s in target_infos
-        )
-        self.command_text = str(command_text).strip().upper()
-        self.shared_utc = bool(shared_utc)
-
-    @staticmethod
-    def _stus_command(unix_time_s: float) -> str:
-        seconds = int(unix_time_s)
-        microseconds = int(round((float(unix_time_s) - seconds) * 1_000_000))
-        if microseconds >= 1_000_000:
-            seconds += 1
-            microseconds -= 1_000_000
-        return f"STUS {seconds} {microseconds}"
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        results: dict[str, dict[str, object]] = {}
-        command_times: dict[str, float] = {}
-        tcp_start_times: dict[str, float] = {}
-        shared_command_time: dict[str, float] = {}
-        barrier = (
-            threading.Barrier(len(self.target_infos), action=lambda: shared_command_time.update(unix=time.time()))
-            if self.shared_utc and len(self.target_infos) >= 2
-            else None
-        )
-
-        def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
-            started_utc_s = time.time()
-            try:
-                command_time_s = started_utc_s
-                if barrier is not None:
-                    barrier.wait(timeout=max(1.0, timeout_s))
-                    command_time_s = float(shared_command_time.get("unix", time.time()))
-                command_text = self._stus_command(command_time_s) if self.command_text == "STUS" else self.command_text
-                command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=command_text,
-                    timeout_s=timeout_s,
-                    terminator=LINE_TERMINATOR,
-                )
-                command_times[label] = command_time_s
-                tcp_start_times[label] = time.perf_counter()
-                response = send_tcp_line(command)
-            except Exception as exc:
-                results[label] = {
-                    "response": f"실패: {exc}",
-                    "query_started_utc_s": started_utc_s,
-                    "query_finished_utc_s": time.time(),
-                    "command": self._stus_command(command_times.get(label, started_utc_s))
-                    if self.command_text == "STUS"
-                    else self.command_text,
-                    "host": host,
-                    "port": port,
-                }
-                return
-            results[label] = {
-                "response": response or "<no response>",
-                "query_started_utc_s": started_utc_s,
-                "query_finished_utc_s": time.time(),
-                "command": command.command,
-                "host": host,
-                "port": port,
-            }
-
-        threads = [
-            threading.Thread(
-                target=send_one,
-                args=(label, host, port, timeout_s),
-                name=f"wiris-clock-{self.command_text.lower()}-{label}",
-            )
-            for label, host, port, timeout_s in self.target_infos
-        ]
-        try:
-            for thread in threads:
-                thread.start()
-            max_timeout_s = max(
-                (max(1.0, timeout_s) for _label, _host, _port, timeout_s in self.target_infos),
-                default=1.0,
-            )
-            for thread in threads:
-                thread.join(timeout=max_timeout_s + 1.0)
-            for label, host, port, _timeout_s in self.target_infos:
-                results.setdefault(
-                    label,
-                    {
-                        "response": "실패: 전송 스레드 timeout",
-                        "query_started_utc_s": None,
-                        "query_finished_utc_s": None,
-                        "command": self.command_text,
-                        "host": host,
-                        "port": port,
-                    },
-                )
-            self.completed.emit(
-                {
-                    "command": self.command_text,
-                    "results": results,
-                    "command_times": command_times,
-                    "tcp_start_times": tcp_start_times,
-                    "requested_utc_s": shared_command_time.get("unix")
-                    if self.shared_utc
-                    else (next(iter(command_times.values()), None)),
-                }
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
-
-
-class WirisStipWorker(QtCore.QObject):
-    """Apply the deliberate WIRIS IP change without blocking the Qt event loop."""
-
-    completed = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        *,
-        interface_name: str,
-        host_address: str,
-        host_hints: Sequence[str],
-        current_host: str,
-        new_ip: str,
-        mask: str,
-        port: int,
-        reboot: bool,
-        timeout_s: float,
-    ) -> None:
-        super().__init__()
-        self.interface_name = str(interface_name)
-        self.host_address = str(host_address)
-        self.host_hints = tuple(str(value) for value in host_hints)
-        self.current_host = str(current_host)
-        self.new_ip = str(new_ip)
-        self.mask = str(mask)
-        self.port = int(port)
-        self.reboot = bool(reboot)
-        self.timeout_s = max(0.1, float(timeout_s))
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            candidates: list[object] = []
-            interface_name = self.interface_name
-            address_text = self.host_address
-            if not interface_name or not interface_link_exists(interface_name):
-                candidates = list(
-                    discover_host_interface_candidates(
-                        host_address=address_text or DEFAULT_HOST_ADDRESS,
-                        include_unconfigured=True,
-                    )
-                )
-                if not candidates:
-                    self.completed.emit({"state": "failed", "error": "camera interface not found"})
-                    return
-                selected = candidates[0]
-                interface_name = str(getattr(selected.interface, "name", ""))
-                address_text = str(getattr(selected.interface, "address", ""))
-            resolved_address = resolve_nm_interface_address(interface_name, self.host_hints)
-            if resolved_address is not None:
-                address_text = str(resolved_address)
-            if not address_text:
-                self.completed.emit({"state": "failed", "error": "camera host IP is missing", "candidates": candidates})
-                return
-            if not interface_has_address(interface_name, address_text):
-                applied, message = apply_interface_address(interface_name, address_text)
-                if not applied:
-                    self.completed.emit(
-                        {
-                            "state": "failed",
-                            "error": f"camera host IP apply failed: {message}",
-                            "candidates": candidates,
-                            "interface_name": interface_name,
-                            "host_address": address_text,
-                        }
-                    )
-                    return
-            commands = [
-                SET_IP_ADDRESS_TEMPLATE.format(address=self.new_ip),
-                SET_SUBNET_MASK_TEMPLATE.format(mask=self.mask),
-            ]
-            if self.reboot:
-                commands.append(REBOOT_COMMAND)
-            statuses: list[str] = []
-            for command_text in commands:
-                command = build_wiris_command(
-                    host=self.current_host,
-                    port=self.port,
-                    command=command_text,
-                    timeout_s=self.timeout_s,
-                )
-                try:
-                    response = send_tcp_line(command)
-                except Exception as exc:
-                    self.completed.emit(
-                        {
-                            "state": "failed",
-                            "error": f"{command_text}: {exc}",
-                            "statuses": statuses,
-                            "candidates": candidates,
-                            "interface_name": interface_name,
-                            "host_address": address_text,
-                        }
-                    )
-                    return
-                statuses.append(f"{command_text}={response or 'sent'}")
-            self.completed.emit(
-                {
-                    "state": "sent",
-                    "statuses": statuses,
-                    "candidates": candidates,
-                    "interface_name": interface_name,
-                    "host_address": address_text,
-                }
-            )
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            self.finished.emit()
-
-
-class WirisRtspEnableWorker(QtCore.QObject):
-    enabled = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        *,
-        hosts: dict[str, str],
-        candidate_ports: dict[str, list[int]],
-        urls: dict[str, str],
-        timeout_s: float,
-    ) -> None:
-        super().__init__()
-        self.hosts = hosts
-        self.candidate_ports = candidate_ports
-        self.urls = urls
-        self.timeout_s = timeout_s
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            result = self._enable_rtsp()
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.enabled.emit(result)
-        finally:
-            self.finished.emit()
-
-    def _enable_rtsp(self) -> dict[str, object]:
-        logs: list[str] = []
-        statuses: list[str] = []
-        corrected_ports: dict[str, int] = {}
-        for label in ("left", "right"):
-            host = self.hosts.get(label, "").strip()
-            camera_name = camera_display_name(label)
-            if not host:
-                statuses.append(f"{label}=missing-host")
-                logs.append(f"[카메라] {camera_name} WIRIS RTSP 활성화 건너뜀: 제어 host가 비어 있습니다.")
-                continue
-            port, before, corrected, failure_detail = self._resolve_ethernet_mode_port(label, host)
-            if port is None:
-                statuses.append(f"{label}=unsupported-port")
-                logs.append(f"[카메라] {camera_name} Ethernet Mode 지원 포트를 찾지 못했습니다: {failure_detail}")
-                logs.append(
-                    f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
-                    f"{GET_ETHERNET_MODE_COMMAND} 응답={before}"
-                )
-                continue
-            if corrected:
-                corrected_ports[label] = port
-                logs.append(
-                    f"[카메라] {camera_name} Telnet port 자동 보정: "
-                    f"{corrected} -> {port} ({GET_ETHERNET_MODE_COMMAND}={before})"
-                )
-            try:
-                set_command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=SET_ETHERNET_MODE_COMMAND,
-                    timeout_s=self.timeout_s,
-                )
-                response = send_tcp_line(set_command)
-            except Exception as exc:
-                statuses.append(f"{label}=enable-failed")
-                logs.append(f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: {exc}")
-                continue
-            if not self._set_ethernet_response_ok(response):
-                statuses.append(f"{label}=enable-rejected")
-                logs.append(
-                    f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
-                    f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'empty'}"
-                )
-                continue
-            statuses.append(f"{label}=enable-sent")
-            logs.append(
-                f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화: "
-                f"{GET_ETHERNET_MODE_COMMAND}={before or 'n/a'}, {SET_ETHERNET_MODE_COMMAND} 응답={response or 'sent'}"
-            )
-
-        should_check = any(status.endswith("=enable-sent") for status in statuses)
-        closed: list[str] = []
-        if should_check:
-            logs.append(
-                f"[카메라] RTSP port가 열릴 때까지 최대 {RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS}초 대기한 뒤 프레임 수신을 확인합니다."
-            )
-            closed = self._wait_for_rtsp_ports(logs)
-        else:
-            logs.append("[카메라] RTSP 활성화에 성공한 카메라가 없어 프레임 확인을 건너뜁니다.")
-        return {
-            "statuses": statuses,
-            "logs": logs,
-            "corrected_ports": corrected_ports,
-            "should_check": should_check,
-            "closed": closed,
-        }
-
-    def _resolve_ethernet_mode_port(self, camera: str, host: str) -> tuple[int | None, str, int | None, str]:
-        failures = []
-        ports = self.candidate_ports.get(camera, [])
-        original_port = ports[0] if ports else None
-        for port in ports:
-            try:
-                command = build_wiris_command(
-                    host=host,
-                    port=port,
-                    command=GET_ETHERNET_MODE_COMMAND,
-                    timeout_s=self.timeout_s,
-                )
-                response = send_tcp_line(command)
-            except Exception as exc:
-                failures.append(f"{port}=failed:{exc}")
-                continue
-            if self._ethernet_mode_response_ok(response):
-                corrected = original_port if original_port is not None and port != original_port else None
-                return port, response, corrected, ", ".join(failures)
-            failures.append(f"{port}={response or 'empty'}")
-        return None, failures[-1] if failures else "no-candidate", None, ", ".join(failures)
-
-    def _wait_for_rtsp_ports(self, logs: list[str]) -> list[str]:
-        closed: list[str] = []
-        QtCore.QThread.msleep(RTSP_ENABLE_SETTLE_DELAY_MS)
-        for attempt in range(RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS + 1):
-            closed = self._closed_rtsp_ports()
-            if not closed:
-                logs.append("[카메라] RTSP port 열림 확인 완료. 프레임 수신 확인을 시작합니다.")
-                return []
-            if attempt >= RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS:
-                logs.append("[카메라] RTSP port 대기 초과: " + ", ".join(closed))
-                return closed
-            logs.append("[카메라] RTSP port 대기 중: " + ", ".join(closed))
-            QtCore.QThread.msleep(RTSP_ENABLE_PORT_WAIT_INTERVAL_MS)
-        return closed
-
-    def _closed_rtsp_ports(self) -> list[str]:
-        closed = []
-        for camera, url in self.urls.items():
-            try:
-                host, port = rtsp_host_port(url.strip())
-            except Exception as exc:
-                closed.append(f"{camera}=invalid-url:{exc}")
-                continue
-            if not check_tcp_port(host, port, timeout=0.5):
-                closed.append(f"{camera}={host}:{port}")
-        return closed
-
-    def _ethernet_mode_response_ok(self, response: str) -> bool:
-        return response.strip().upper() in {"TRUE", "FALSE"}
-
-    def _set_ethernet_response_ok(self, response: str) -> bool:
-        return response.strip().upper() in {"OK", "TRUE"}
-
-
-class RtspStreamCheckWorker(QtCore.QObject):
-    checked = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(
-        self,
-        urls: dict[str, str],
-        *,
-        latency_ms: int,
-        decoder: str,
-        backend: str,
-        transport: str,
-        timeout_s: float = 4.0,
-    ) -> None:
-        super().__init__()
-        self.urls = urls
-        self.latency_ms = latency_ms
-        self.decoder = normalize_decoder_mode(decoder)
-        self.backend = normalize_stream_backend(backend)
-        self.transport = normalize_rtsp_transport(transport)
-        self.timeout_s = timeout_s
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        if self.backend in {STREAM_BACKEND_OPENCV, STREAM_BACKEND_OPENCV_AUTO}:
-            self._run_opencv()
-            return
-        if self.backend == STREAM_BACKEND_PYAV:
-            self._run_pyav()
-            return
-        self._run_gstreamer()
-
-    def _run_opencv(self) -> None:
-        try:
-            import cv2
-        except Exception as exc:
-            self.failed.emit(f"OpenCV unavailable: {exc}")
-            self.finished.emit()
-            return
-        results = {}
-        for label, url in self.urls.items():
-            results[label] = self._check_one_opencv(cv2, url)
-        self.checked.emit(results)
-        self.finished.emit()
-
-    def _check_one_opencv(self, cv2, url: str) -> dict[str, object]:
-        backend_name = "opencv_auto" if self.backend == STREAM_BACKEND_OPENCV_AUTO else "opencv"
-        api_preference = cv2.CAP_ANY if self.backend == STREAM_BACKEND_OPENCV_AUTO else cv2.CAP_FFMPEG
-        started_s = time.monotonic()
-        try:
-            host, port = rtsp_host_port(url)
-        except Exception as exc:
-            return {"port_open": False, "frame_ok": False, "error": f"invalid url: {exc}", "backend": backend_name}
-        if not check_tcp_port(host, port, timeout=min(self.timeout_s, 1.0)):
-            return {"port_open": False, "frame_ok": False, "error": f"{host}:{port} closed", "backend": backend_name}
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            f"rtsp_transport;{self.transport}|stimeout;2000000|max_delay;500000"
-        )
-        cap = cv2.VideoCapture(url, api_preference)
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-        try:
-            while time.monotonic() - started_s < self.timeout_s:
-                ok, frame = cap.read()
-                if ok and frame is not None:
-                    height, width = frame.shape[:2]
-                    return {
-                        "port_open": True,
-                        "frame_ok": True,
-                        "width": width,
-                        "height": height,
-                        "elapsed_s": time.monotonic() - started_s,
-                        "decoder": "opencv-auto" if self.backend == STREAM_BACKEND_OPENCV_AUTO else "opencv-ffmpeg",
-                        "backend": backend_name,
-                    }
-                QtCore.QThread.msleep(20)
-        finally:
-            cap.release()
-        return {
-            "port_open": True,
-            "frame_ok": False,
-            "error": f"no frame within {self.timeout_s:.1f}s",
-            "backend": backend_name,
-        }
-
-    def _run_pyav(self) -> None:
-        try:
-            import av
-        except Exception as exc:
-            self.failed.emit(f"PyAV unavailable: {exc}")
-            self.finished.emit()
-            return
-        results = {}
-        for label, url in self.urls.items():
-            results[label] = self._check_one_pyav(av, url)
-        self.checked.emit(results)
-        self.finished.emit()
-
-    def _check_one_pyav(self, av, url: str) -> dict[str, object]:
-        started_s = time.monotonic()
-        try:
-            host, port = rtsp_host_port(url)
-        except Exception as exc:
-            return {"port_open": False, "frame_ok": False, "error": f"invalid url: {exc}", "backend": "pyav"}
-        if not check_tcp_port(host, port, timeout=min(self.timeout_s, 1.0)):
-            return {"port_open": False, "frame_ok": False, "error": f"{host}:{port} closed", "backend": "pyav"}
-        options = {
-            "rtsp_transport": self.transport,
-            "stimeout": "2000000",
-            "max_delay": "500000",
-            "fflags": "nobuffer",
-            "flags": "low_delay",
-        }
-        container = None
-        try:
-            container = av.open(url, mode="r", options=options)
-            video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
-            if video_stream is None:
-                return {"port_open": True, "frame_ok": False, "error": "no video stream", "backend": "pyav"}
-            for packet in container.demux(video_stream):
-                for frame in packet.decode():
-                    pts_s = None
-                    if frame.pts is not None and frame.time_base is not None:
-                        pts_s = float(frame.pts * frame.time_base)
-                    return {
-                        "url": url,
-                        "port_open": True,
-                        "frame_ok": True,
-                        "width": int(frame.width),
-                        "height": int(frame.height),
-                        "pts_s": pts_s,
-                        "elapsed_s": time.monotonic() - started_s,
-                        "decoder": "pyav",
-                        "backend": "pyav",
-                    }
-                if time.monotonic() - started_s >= self.timeout_s:
-                    break
-            return {
-                "url": url,
-                "port_open": True,
-                "frame_ok": False,
-                "error": f"no frame within {self.timeout_s:.1f}s",
-                "decoder": "pyav",
-                "backend": "pyav",
-            }
-        except Exception as exc:
-            return {"url": url, "port_open": True, "frame_ok": False, "error": str(exc), "decoder": "pyav", "backend": "pyav"}
-        finally:
-            if container is not None:
-                container.close()
-
-    def _run_gstreamer(self) -> None:
-        try:
-            import gi
-
-            gi.require_version("Gst", "1.0")
-            from gi.repository import Gst
-        except Exception as exc:
-            self.failed.emit(f"GStreamer unavailable: {exc}")
-            self.finished.emit()
-            return
-
-        Gst.init(None)
-        results = {}
-        for label, url in self.urls.items():
-            results[label] = self._check_one(Gst, url)
-        self.checked.emit(results)
-        self.finished.emit()
-
-    def _check_one(self, Gst, url: str) -> dict[str, object]:
-        try:
-            host, port = rtsp_host_port(url)
-            port_open = check_tcp_port(host, port, timeout=1.0)
-        except Exception as exc:
-            return {"url": url, "port_open": False, "frame_ok": False, "error": str(exc)}
-        if not port_open:
-            return {"url": url, "port_open": False, "frame_ok": False, "error": f"{host}:{port} closed"}
-
-        last_error = ""
-        candidates = decoder_candidates(self.decoder)
-        for decoder in candidates:
-            pipeline = None
-            try:
-                pipeline_text = build_gst_pipeline_text(
-                    url,
-                    latency_ms=self.latency_ms,
-                    decoder=decoder,
-                    transport=self.transport,
-                )
-                pipeline = Gst.parse_launch(pipeline_text)
-                sink = pipeline.get_by_name("sink")
-                bus = pipeline.get_bus()
-                if sink is None or bus is None:
-                    raise RuntimeError("pipeline missing appsink or bus")
-                state_result = pipeline.set_state(Gst.State.PLAYING)
-                if state_result == Gst.StateChangeReturn.FAILURE:
-                    raise RuntimeError(f"{decoder} failed to enter PLAYING state")
-                return self._wait_for_rtsp_frame(Gst, pipeline, sink, bus, url, decoder)
-            except Exception as exc:
-                last_error = str(exc)
-                if pipeline is not None:
-                    pipeline.set_state(Gst.State.NULL)
-                if self.decoder == DECODER_AUTO and decoder != candidates[-1]:
-                    continue
-                break
-        return {"url": url, "port_open": True, "frame_ok": False, "error": last_error or "decoder unavailable"}
-
-    def _wait_for_rtsp_frame(self, Gst, pipeline, sink, bus, url: str, decoder: str) -> dict[str, object]:
-        try:
-            start_s = time.monotonic()
-            while time.monotonic() - start_s < self.timeout_s:
-                message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
-                if message is not None:
-                    if message.type == Gst.MessageType.ERROR:
-                        error, debug = message.parse_error()
-                        detail = error.message if debug is None else f"{error.message} ({debug})"
-                    else:
-                        detail = "EOS before frame"
-                    return {"url": url, "port_open": True, "frame_ok": False, "error": detail, "decoder": decoder}
-
-                sample = sink.emit("try-pull-sample", 200_000_000)
-                if sample is None:
-                    continue
-                buffer = sample.get_buffer()
-                pts_s = None if buffer.pts == Gst.CLOCK_TIME_NONE else buffer.pts / 1e9
-                caps = sample.get_caps().get_structure(0)
-                return {
-                    "url": url,
-                    "port_open": True,
-                    "frame_ok": True,
-                    "width": int(caps.get_value("width")),
-                    "height": int(caps.get_value("height")),
-                    "pts_s": pts_s,
-                    "elapsed_s": time.monotonic() - start_s,
-                    "decoder": decoder,
-                }
-            return {
-                "url": url,
-                "port_open": True,
-                "frame_ok": False,
-                "error": f"no frame within {self.timeout_s:.1f}s",
-                "decoder": decoder,
-            }
-        except Exception as exc:
-            return {"url": url, "port_open": True, "frame_ok": False, "error": str(exc), "decoder": decoder}
-        finally:
-            pipeline.set_state(Gst.State.NULL)
-
-
-def _ubx_checksum(data: bytes) -> tuple[int, int]:
-    ck_a = 0
-    ck_b = 0
-    for value in data:
-        ck_a = (ck_a + value) & 0xFF
-        ck_b = (ck_b + ck_a) & 0xFF
-    return ck_a, ck_b
-
-
-def ubx_frame(message_class: int, message_id: int, payload: bytes) -> bytes:
-    header = bytes((message_class & 0xFF, message_id & 0xFF)) + len(payload).to_bytes(2, "little")
-    ck_a, ck_b = _ubx_checksum(header + payload)
-    return b"\xb5\x62" + header + payload + bytes((ck_a, ck_b))
-
-
-def ubx_cfg_tmode3_survey_in_frame(*, min_duration_s: int, accuracy_m: float) -> bytes:
-    min_duration_s = max(1, int(min_duration_s))
-    accuracy_0_1mm = max(1, int(round(float(accuracy_m) / 0.0001)))
-    payload = struct.pack(
-        "<BBHlllbbbBIII8s",
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        min_duration_s,
-        accuracy_0_1mm,
-        b"\x00" * 8,
-    )
-    return ubx_frame(0x06, 0x71, payload)
-
-
-def ubx_cfg_tmode3_disabled_frame() -> bytes:
-    payload = struct.pack(
-        "<BBHlllbbbBIII8s",
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        b"\x00" * 8,
-    )
-    return ubx_frame(0x06, 0x71, payload)
-
-
-def _ubx_tmode3_ecef_components(value_m: float) -> tuple[int, int]:
-    """Encode ECEF metres as CFG-TMODE3 centimetres plus 0.1 mm high part."""
-
-    coarse_cm = int(round(float(value_m) * 100.0))
-    high_part = int(round((float(value_m) - coarse_cm * 0.01) / 0.0001))
-    while high_part > 99:
-        coarse_cm += 1
-        high_part -= 100
-    while high_part < -99:
-        coarse_cm -= 1
-        high_part += 100
-    return coarse_cm, high_part
-
-
-def ubx_cfg_tmode3_fixed_frame(
-    *,
-    latitude_deg: float,
-    longitude_deg: float,
-    ellipsoid_height_m: float,
-    fixed_position_accuracy_m: float = 0.05,
-) -> bytes:
-    """Build UBX-CFG-TMODE3 fixed-base command from WGS84 geodetic data.
-
-    The receiver command uses ECEF centimetres and 0.1 mm high parts.  The
-    input height is explicitly ellipsoid height; MSL values must be converted
-    with a geoid model before calling this function.
-    """
-
-    ecef = geodetic_to_ecef_m(latitude_deg, longitude_deg, ellipsoid_height_m)
-    coarse_x, high_x = _ubx_tmode3_ecef_components(ecef[0])
-    coarse_y, high_y = _ubx_tmode3_ecef_components(ecef[1])
-    coarse_z, high_z = _ubx_tmode3_ecef_components(ecef[2])
-    accuracy_0_1mm = max(1, int(round(float(fixed_position_accuracy_m) / 0.0001)))
-    payload = struct.pack(
-        "<BBHlllbbbBIII8s",
-        0,
-        0,
-        2,
-        coarse_x,
-        coarse_y,
-        coarse_z,
-        high_x,
-        high_y,
-        high_z,
-        0,
-        0,
-        0,
-        accuracy_0_1mm,
-        b"\x00" * 8,
-    )
-    return ubx_frame(0x06, 0x71, payload)
-
-
-def ubx_poll_frame(message_class: int, message_id: int) -> bytes:
-    return ubx_frame(message_class, message_id, b"")
-
-
-def ubx_nav_svin_poll_frame() -> bytes:
-    return ubx_poll_frame(0x01, 0x3B)
-
-
-def ubx_nav_pvt_poll_frame() -> bytes:
-    return ubx_poll_frame(0x01, 0x07)
-
-
-def ubx_cfg_tmode3_poll_frame() -> bytes:
-    """Poll the receiver's active CFG-TMODE3 configuration."""
-
-    return ubx_poll_frame(0x06, 0x71)
-
-
-def parse_ubx_ack(message_class: int, message_id: int, payload: bytes) -> tuple[bool, int, int] | None:
-    """Return ``(accepted, target_class, target_id)`` for UBX ACK messages."""
-
-    if message_class != 0x05 or message_id not in {0x00, 0x01} or len(payload) < 2:
-        return None
-    return message_id == 0x01, int(payload[0]), int(payload[1])
-
-
-def parse_ubx_cfg_tmode3(payload: bytes) -> dict[str, object] | None:
-    """Decode the fixed/survey-in ECEF representation used by CFG-TMODE3.
-
-    Coordinate contract: the three coordinate components are WGS84 ECEF
-    centimetres plus signed 0.1 mm high parts.  They are intentionally never
-    treated as rover NED or camera-frame values.
-    """
-
-    if len(payload) < 40:
-        return None
-    (
-        _version,
-        _reserved0,
-        flags,
-        x_cm,
-        y_cm,
-        z_cm,
-        x_hp,
-        y_hp,
-        z_hp,
-        _reserved1,
-        _svin_min_duration_s,
-        _svin_accuracy_0_1mm,
-        fixed_accuracy_0_1mm,
-        _reserved2,
-    ) = struct.unpack_from("<BBHlllbbbBIII8s", payload, 0)
-    return {
-        "mode": int(flags) & 0xFF,
-        "ecef_cm": (int(x_cm), int(y_cm), int(z_cm)),
-        "ecef_hp_0_1mm": (int(x_hp), int(y_hp), int(z_hp)),
-        "fixed_accuracy_0_1mm": int(fixed_accuracy_0_1mm),
-    }
-
-
-def parse_ubx_nav_pvt_coordinate_sample(
-    message_class: int,
-    message_id: int,
-    payload: bytes,
-    *,
-    timestamp_s: float,
-    height_type: HeightType = HeightType.ELLIPSOID,
-) -> GnssCoordinateSample | None:
-    """Parse UBX-NAV-PVT into the WGS84 coordinate contract used by fixed-base."""
-
-    if message_class != 0x01 or message_id != 0x07 or len(payload) < 48:
-        return None
-    fix_type = int(payload[20])
-    flags = int(payload[21])
-    latitude_deg = struct.unpack_from("<i", payload, 28)[0] * 1e-7
-    longitude_deg = struct.unpack_from("<i", payload, 24)[0] * 1e-7
-    ellipsoid_height_m = struct.unpack_from("<i", payload, 32)[0] * 1e-3
-    msl_altitude_m = struct.unpack_from("<i", payload, 36)[0] * 1e-3
-    gnss_fix_ok = bool(flags & 0x01)
-    carrier_solution = (flags >> 6) & 0x03
-    return GnssCoordinateSample(
-        latitude_deg=latitude_deg,
-        longitude_deg=longitude_deg,
-        ellipsoid_height_m=ellipsoid_height_m,
-        msl_altitude_m=msl_altitude_m,
-        height_type=height_type,
-        timestamp_s=float(timestamp_s),
-        # Raw u-blox NAV-PVT is not PX4 GPS_RAW_INT: RTK fixed is encoded by
-        # gnssFixOK plus carrSoln=2, while fixType remains a 3D/GNSS+DR value.
-        fixed=fix_type in {3, 4} and gnss_fix_ok and carrier_solution == 2,
-        device_id="field-base",
-    )
-
-
-def parse_ubx_nav_svin(payload: bytes) -> dict[str, object] | None:
-    if len(payload) < 40:
-        return None
-    (
-        _version,
-        _reserved0,
-        _itow_ms,
-        duration_s,
-        mean_x_cm,
-        mean_y_cm,
-        mean_z_cm,
-        mean_x_hp_0_1mm,
-        mean_y_hp_0_1mm,
-        mean_z_hp_0_1mm,
-        _reserved1,
-        mean_acc_0_1mm,
-        observations,
-        valid,
-        active,
-        _reserved2,
-    ) = struct.unpack_from("<B3sLLlllbbbBLLBBH", payload, 0)
-    return {
-        "duration_s": int(duration_s),
-        "mean_accuracy_m": float(mean_acc_0_1mm) * 0.0001,
-        "observations": int(observations),
-        "valid": bool(valid),
-        "active": bool(active),
-        "mean_x_m": float(mean_x_cm) * 0.01 + float(mean_x_hp_0_1mm) * 0.0001,
-        "mean_y_m": float(mean_y_cm) * 0.01 + float(mean_y_hp_0_1mm) * 0.0001,
-        "mean_z_m": float(mean_z_cm) * 0.01 + float(mean_z_hp_0_1mm) * 0.0001,
-    }
-
-
-def parse_ubx_base_satellite_count(message_class: int, message_id: int, payload: bytes) -> int | None:
-    if message_class != 0x01:
-        return None
-    if message_id == 0x07 and len(payload) >= 24:
-        return int(payload[23])
-    if message_id == 0x35 and len(payload) >= 8:
-        return int(payload[5])
-    return None
-
-
-def parse_ubx_nav_sat_quality(message_class: int, message_id: int, payload: bytes) -> dict[str, object] | None:
-    if message_class != 0x01 or message_id != 0x35 or len(payload) < 8:
-        return None
-    reported_count = int(payload[5])
-    available_count = max(0, (len(payload) - 8) // 12)
-    record_count = min(reported_count, available_count)
-    if record_count <= 0:
-        return {
-            "tracked": 0,
-            "used": 0,
-            "avg_cno_dbhz": None,
-            "low_cno": 0,
-            "low_elevation": 0,
-            "constellations": {},
-        }
-    cno_values: list[int] = []
-    used = 0
-    low_cno = 0
-    low_elevation = 0
-    constellations: dict[str, int] = {}
-    for index in range(record_count):
-        offset = 8 + index * 12
-        gnss_id = int(payload[offset])
-        cno = int(payload[offset + 2])
-        elevation = struct.unpack_from("<b", payload, offset + 3)[0]
-        flags = struct.unpack_from("<I", payload, offset + 8)[0]
-        label = GNSS_ID_LABELS.get(gnss_id, f"GNSS{gnss_id}")
-        constellations[label] = constellations.get(label, 0) + 1
-        if flags & 0x01:
-            used += 1
-        if cno > 0:
-            cno_values.append(cno)
-            if cno < GNSS_BASE_LOW_CNO_DBHZ:
-                low_cno += 1
-        if elevation < GNSS_BASE_LOW_ELEVATION_DEG:
-            low_elevation += 1
-    avg_cno = sum(cno_values) / len(cno_values) if cno_values else None
-    return {
-        "tracked": record_count,
-        "used": used,
-        "avg_cno_dbhz": avg_cno,
-        "low_cno": low_cno,
-        "low_elevation": low_elevation,
-        "constellations": constellations,
-    }
-
-
-def parse_nmea_gga_satellite_count(line: str) -> tuple[int, int] | None:
-    text = line.strip()
-    if not text.startswith(("$GNGGA", "$GPGGA", "$GAGGA", "$GLGGA", "$GBGGA")):
-        return None
-    if "*" in text:
-        body, checksum_text = text[1:].split("*", 1)
-        checksum = 0
-        for char in body:
-            checksum ^= ord(char)
-        try:
-            expected = int(checksum_text[:2], 16)
-        except ValueError:
-            return None
-        if checksum != expected:
-            return None
-        fields = body.split(",")
-    else:
-        fields = text[1:].split(",")
-    if len(fields) <= 7:
-        return None
-    try:
-        fix_quality = int(fields[6] or "0")
-        satellites = int(fields[7] or "0")
-    except ValueError:
-        return None
-    return satellites, fix_quality
-
-
-def parse_rtcm3_message_type(frame: bytes) -> int | None:
-    if len(frame) < 6 or frame[0] != 0xD3:
-        return None
-    payload_len = ((frame[1] & 0x03) << 8) | frame[2]
-    if payload_len < 2 or len(frame) < 3 + payload_len + 3:
-        return None
-    return ((int(frame[3]) << 4) | (int(frame[4]) >> 4)) & 0x0FFF
-
-
-def gnss_base_serial_port_candidates() -> list[str]:
-    candidates: list[str] = []
-    for pattern in ("/dev/serial/by-id/*", "/dev/ttyACM*", "/dev/ttyUSB*"):
-        for path in sorted(Path("/").glob(pattern.removeprefix("/"))):
-            text = str(path)
-            if text not in candidates:
-                candidates.append(text)
-    return candidates
-
-
-def probe_gnss_base_serial_ports(candidates: Sequence[str], *, baud: int, timeout_s: float = 0.6) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    try:
-        import serial  # type: ignore[import-not-found]
-    except Exception as exc:
-        return [
-            {
-                "port": str(candidate),
-                "target": os.path.realpath(str(candidate)),
-                "baud": int(baud),
-                "status": f"pyserial 필요: {exc}",
-                "ubx": False,
-                "messages": "",
-            }
-            for candidate in candidates
-        ]
-    for candidate in candidates:
-        port = str(candidate)
-        parser = UbxStreamParser()
-        nmea_buffer = ""
-        messages_seen: set[str] = set()
-        total_bytes = 0
-        status = "no data"
-        ubx_detected = False
-        try:
-            with serial.Serial(port, int(baud), timeout=0.1) as serial_obj:
-                deadline = time.monotonic() + max(0.1, float(timeout_s))
-                while time.monotonic() < deadline:
-                    chunk = serial_obj.read(4096)
-                    if not chunk:
-                        continue
-                    total_bytes += len(chunk)
-                    nmea_buffer += chunk.decode("ascii", "ignore")
-                    if "\n" in nmea_buffer:
-                        lines = nmea_buffer.splitlines()
-                        nmea_buffer = "" if nmea_buffer.endswith(("\n", "\r")) else lines.pop() if lines else nmea_buffer
-                        for line in lines:
-                            gga = parse_nmea_gga_satellite_count(line)
-                            if gga is not None:
-                                satellites, fix_quality = gga
-                                messages_seen.add(f"NMEA-GGA sats={satellites} fix={fix_quality}")
-                    for message_class, message_id, payload in parser.feed(chunk):
-                        ubx_detected = True
-                        if message_class == 0x01 and message_id == 0x3B:
-                            messages_seen.add("NAV-SVIN")
-                        elif message_class == 0x01 and message_id == 0x07:
-                            sat_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
-                            messages_seen.add("NAV-PVT" if sat_count is None else f"NAV-PVT sats={sat_count}")
-                        elif message_class == 0x01 and message_id == 0x35:
-                            sat_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
-                            messages_seen.add("NAV-SAT" if sat_count is None else f"NAV-SAT sats={sat_count}")
-                        else:
-                            messages_seen.add(f"UBX {message_class:02X}/{message_id:02X}")
-                    if messages_seen:
-                        break
-            if messages_seen:
-                status = "GNSS data detected"
-            elif total_bytes:
-                status = f"raw data only ({total_bytes} bytes)"
-        except Exception as exc:
-            status = str(exc)
-        rows.append(
-            {
-                "port": port,
-                "target": os.path.realpath(port),
-                "baud": int(baud),
-                "status": status,
-                "ubx": ubx_detected,
-                "messages": ", ".join(sorted(messages_seen)),
-            }
-        )
-    return rows
-
-
-class UbxStreamParser:
-    def __init__(self) -> None:
-        self._buffer = bytearray()
-
-    def feed(self, data: bytes) -> list[tuple[int, int, bytes]]:
-        self._buffer.extend(data)
-        messages: list[tuple[int, int, bytes]] = []
-        while True:
-            sync_index = self._buffer.find(b"\xb5\x62")
-            if sync_index < 0:
-                if len(self._buffer) > 1:
-                    del self._buffer[:-1]
-                break
-            if sync_index:
-                del self._buffer[:sync_index]
-            if len(self._buffer) < 8:
-                break
-            payload_len = int.from_bytes(self._buffer[4:6], "little")
-            frame_len = 8 + payload_len
-            if len(self._buffer) < frame_len:
-                break
-            frame = bytes(self._buffer[:frame_len])
-            del self._buffer[:frame_len]
-            ck_a, ck_b = _ubx_checksum(frame[2:-2])
-            if ck_a != frame[-2] or ck_b != frame[-1]:
-                continue
-            messages.append((frame[2], frame[3], frame[6:-2]))
-        return messages
-
-
-class Rtcm3StreamParser:
-    def __init__(self) -> None:
-        self._buffer = bytearray()
-
-    def feed(self, data: bytes) -> list[bytes]:
-        self._buffer.extend(data)
-        frames: list[bytes] = []
-        while True:
-            sync_index = self._buffer.find(b"\xd3")
-            if sync_index < 0:
-                self._buffer.clear()
-                break
-            if sync_index:
-                del self._buffer[:sync_index]
-            if len(self._buffer) < 3:
-                break
-            if self._buffer[1] & 0xFC:
-                del self._buffer[0]
-                continue
-            payload_len = ((self._buffer[1] & 0x03) << 8) | self._buffer[2]
-            frame_len = 3 + payload_len + 3
-            if len(self._buffer) < frame_len:
-                break
-            frames.append(bytes(self._buffer[:frame_len]))
-            del self._buffer[:frame_len]
-        return frames
-
-
-class GnssBaseSerialWorker(QtCore.QObject):
-    connected = QtCore.pyqtSignal(str, int)
-    stats_changed = QtCore.pyqtSignal(int, float, float)
-    survey_in_changed = QtCore.pyqtSignal(object)
-    satellite_count_changed = QtCore.pyqtSignal(int, str)
-    satellite_quality_changed = QtCore.pyqtSignal(object)
-    position_changed = QtCore.pyqtSignal(object)
-    ubx_message_received = QtCore.pyqtSignal(int, int, object)
-    rtcm_frame_received = QtCore.pyqtSignal(object)
-    command_sent = QtCore.pyqtSignal(str, int)
-    failed = QtCore.pyqtSignal(str)
-    disconnected = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, *, port: str, baud: int, height_type: HeightType = HeightType.ELLIPSOID) -> None:
-        super().__init__()
-        self.port = port
-        self.baud = int(baud)
-        self.height_type = HeightType(height_type)
-        self._stop_requested = False
-        self._write_queue: queue.Queue[tuple[str, bytes]] = queue.Queue()
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        serial_obj = None
-        total_bytes = 0
-        started_s = time.monotonic()
-        last_emit_s = started_s
-        last_rx_s: float | None = None
-        last_nav_svin_poll_s = 0.0
-        ubx_parser = UbxStreamParser()
-        rtcm_parser = Rtcm3StreamParser()
-        nmea_buffer = ""
-        try:
-            try:
-                import serial  # type: ignore[import-not-found]
-            except Exception as exc:
-                self.failed.emit(f"pyserial 필요: {exc}")
-                return
-            serial_obj = serial.Serial(self.port, self.baud, timeout=0.2)
-            self.connected.emit(self.port, self.baud)
-            while not self._stop_requested:
-                self._drain_writes(serial_obj)
-                now_s = time.monotonic()
-                if now_s - last_nav_svin_poll_s >= 2.0:
-                    serial_obj.write(ubx_nav_svin_poll_frame())
-                    serial_obj.write(ubx_nav_pvt_poll_frame())
-                    try:
-                        serial_obj.flush()
-                    except Exception:
-                        pass
-                    last_nav_svin_poll_s = now_s
-                chunk = serial_obj.read(4096)
-                if chunk:
-                    total_bytes += len(chunk)
-                    last_rx_s = now_s
-                    for rtcm_frame in rtcm_parser.feed(chunk):
-                        self.rtcm_frame_received.emit(rtcm_frame)
-                    nmea_buffer += chunk.decode("ascii", "ignore")
-                    if "\n" in nmea_buffer:
-                        lines = nmea_buffer.splitlines()
-                        nmea_buffer = "" if nmea_buffer.endswith(("\n", "\r")) else lines.pop() if lines else nmea_buffer
-                        for line in lines:
-                            gga = parse_nmea_gga_satellite_count(line)
-                            if gga is not None:
-                                satellites, fix_quality = gga
-                                self.satellite_count_changed.emit(satellites, f"NMEA-GGA fix={fix_quality}")
-                    for message_class, message_id, payload in ubx_parser.feed(chunk):
-                        self.ubx_message_received.emit(message_class, message_id, payload)
-                        if message_class == 0x01 and message_id == 0x3B:
-                            survey_in = parse_ubx_nav_svin(payload)
-                            if survey_in is not None:
-                                self.survey_in_changed.emit(survey_in)
-                        if message_class == 0x01 and message_id == 0x07:
-                            coordinate = parse_ubx_nav_pvt_coordinate_sample(
-                                message_class,
-                                message_id,
-                                payload,
-                                timestamp_s=now_s,
-                                height_type=self.height_type,
-                            )
-                            if coordinate is not None:
-                                self.position_changed.emit(coordinate)
-                        satellite_count = parse_ubx_base_satellite_count(message_class, message_id, payload)
-                        if satellite_count is not None:
-                            source = "NAV-PVT" if message_id == 0x07 else "NAV-SAT"
-                            self.satellite_count_changed.emit(satellite_count, source)
-                        satellite_quality = parse_ubx_nav_sat_quality(message_class, message_id, payload)
-                        if satellite_quality is not None:
-                            self.satellite_quality_changed.emit(satellite_quality)
-                if now_s - last_emit_s >= 0.5:
-                    elapsed_s = max(1e-6, now_s - started_s)
-                    rate_bps = total_bytes / elapsed_s
-                    age_s = -1.0 if last_rx_s is None else max(0.0, now_s - last_rx_s)
-                    self.stats_changed.emit(total_bytes, rate_bps, age_s)
-                    last_emit_s = now_s
-            self.disconnected.emit("disconnected")
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        finally:
-            if serial_obj is not None:
-                try:
-                    serial_obj.close()
-                except Exception:
-                    pass
-            self.finished.emit()
-
-    @QtCore.pyqtSlot()
-    def request_stop(self) -> None:
-        self._stop_requested = True
-
-    @QtCore.pyqtSlot(str, bytes)
-    def send_bytes(self, label: str, payload: bytes) -> None:
-        self._write_queue.put((label, bytes(payload)))
-
-    def _drain_writes(self, serial_obj) -> None:
-        while True:
-            try:
-                label, payload = self._write_queue.get_nowait()
-            except queue.Empty:
-                return
-            serial_obj.write(payload)
-            try:
-                serial_obj.flush()
-            except Exception:
-                pass
-            self.command_sent.emit(label, len(payload))
-
-
-class NtripNetworkWorker(QtCore.QObject):
-    """Qt adapter for the blocking, dependency-free NTRIP client."""
-
-    connected = QtCore.pyqtSignal(str, object)
-    chunk_received = QtCore.pyqtSignal(object)
-    reconnecting = QtCore.pyqtSignal(str)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, *, config: NetworkConfig, gga_provider=None) -> None:
-        super().__init__()
-        self.config = config
-        self.gga_provider = gga_provider
-        self._stop_event = threading.Event()
-        self._client: NtripClient | None = None
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            while not self._stop_event.is_set():
-                client = NtripClient(self.config)
-                self._client = client
-                try:
-                    initial_gga = self.gga_provider() if self.gga_provider is not None else None
-                    status_line, initial_payload = client.connect(gga_sentence=initial_gga)
-                    self.connected.emit(status_line, client.stats)
-                    for chunk in client.iter_chunks(
-                        self._stop_event,
-                        gga_provider=self.gga_provider,
-                        initial_payload=initial_payload,
-                    ):
-                        self.chunk_received.emit(chunk)
-                    if self._stop_event.is_set():
-                        break
-                    raise RuntimeError("NTRIP stream ended without a stop request")
-                except Exception as exc:
-                    if self._stop_event.is_set():
-                        break
-                    self.reconnecting.emit(str(exc))
-                    # The failed client is closed before retrying.  A fresh
-                    # client owns the interruptible reconnect delay because a
-                    # closed client intentionally never retries.
-                    client.close()
-                    self._client = None
-                    retry_waiter = NtripClient(self.config)
-                    if not retry_waiter.wait_for_reconnect(self._stop_event):
-                        break
-                    continue
-                finally:
-                    client.close()
-                    if self._client is client:
-                        self._client = None
-        finally:
-            self._client = None
-            self.finished.emit()
-
-    @QtCore.pyqtSlot()
-    def request_stop(self) -> None:
-        self._stop_event.set()
-        client = self._client
-        if client is not None:
-            client.close()
-
-
-class GnssBaseSerialDetectWorker(QtCore.QObject):
-    detected = QtCore.pyqtSignal(object)
-    failed = QtCore.pyqtSignal(str)
-    finished = QtCore.pyqtSignal()
-
-    def __init__(self, *, baud: int) -> None:
-        super().__init__()
-        self.baud = int(baud)
-
-    @QtCore.pyqtSlot()
-    def run(self) -> None:
-        try:
-            candidates = gnss_base_serial_port_candidates()
-            rows = probe_gnss_base_serial_ports(candidates, baud=self.baud, timeout_s=0.6)
-        except Exception as exc:
-            self.failed.emit(str(exc))
-        else:
-            self.detected.emit(rows)
-        finally:
-            self.finished.emit()
-
-
-class CheckerboardPreviewWorker(QtCore.QObject):
-    result_ready = QtCore.pyqtSignal(object)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._pending_payload: dict[str, object] | None = None
-        self._busy = False
-        self._process_scheduled = False
-        self._cv_modules: tuple[object, object] | None = None
-        self._cv_error: str | None = None
-
-    @QtCore.pyqtSlot(object)
-    def submit(self, payload: object) -> None:
-        self._pending_payload = dict(payload or {}) if isinstance(payload, dict) else {}
-        if not self._busy and not self._process_scheduled:
-            self._process_scheduled = True
-            QtCore.QTimer.singleShot(0, self._process_next)
-
-    @QtCore.pyqtSlot()
-    def _process_next(self) -> None:
-        self._process_scheduled = False
-        if self._busy or self._pending_payload is None:
-            return
-        payload = self._pending_payload
-        self._pending_payload = None
-        self._busy = True
-        try:
-            result = self._detect(payload)
-        finally:
-            self._busy = False
-        self.result_ready.emit(result)
-        if self._pending_payload is not None and not self._process_scheduled:
-            self._process_scheduled = True
-            QtCore.QTimer.singleShot(0, self._process_next)
-
-    def _detect(self, payload: dict[str, object]) -> dict[str, object]:
-        image = payload.get("image")
-        result = {
-            "camera": str(payload.get("camera") or ""),
-            "request_id": int(payload.get("request_id") or 0),
-            "image": image,
-            "found": False,
-            "corners": [],
-            "status": "checkerboard: not found",
-        }
-        pattern_size = payload.get("pattern_size")
-        if not isinstance(image, QtGui.QImage):
-            result["status"] = "checkerboard: missing frame"
-            return result
-        if not (
-            isinstance(pattern_size, tuple)
-            and len(pattern_size) == 2
-            and all(isinstance(value, int) and value > 0 for value in pattern_size)
-        ):
-            result["status"] = "checkerboard: invalid pattern"
-            return result
-        cv2, np, error = self._load_cv_modules()
-        if error is not None:
-            result["status"] = f"OpenCV unavailable: {error}"
-            return result
-
-        rgb_image = image.convertToFormat(QtGui.QImage.Format_RGB888).copy()
-        width = rgb_image.width()
-        height = rgb_image.height()
-        ptr = rgb_image.bits()
-        ptr.setsize(rgb_image.byteCount())
-        rgb = np.frombuffer(ptr, dtype=np.uint8).reshape((height, rgb_image.bytesPerLine()))[:, : width * 3]
-        rgb = rgb.reshape((height, width, 3))
-        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-        flags = int(getattr(cv2, "CALIB_CB_FAST_CHECK", 0))
-        found, raw_corners = cv2.findChessboardCorners(gray, pattern_size, flags)
-        if not found or raw_corners is None:
-            return result
-        corners = [(float(point[0][0]), float(point[0][1])) for point in raw_corners]
-        result["found"] = True
-        result["corners"] = corners
-        result["status"] = f"checkerboard: {len(corners)} corners"
-        return result
-
-    def _load_cv_modules(self):
-        if self._cv_error is not None:
-            return None, None, self._cv_error
-        if self._cv_modules is not None:
-            cv2, np = self._cv_modules
-            return cv2, np, None
-        try:
-            import cv2
-            import numpy as np
-        except Exception as exc:
-            self._cv_error = str(exc)
-            return None, None, self._cv_error
-        self._cv_modules = (cv2, np)
-        return cv2, np, None
+from workstation.device_runtime_workers import (
+    PixhawkUsbDiscoveryWorker,
+    CameraNetworkDiscoveryWorker,
+    CameraNetworkAddressApplyWorker,
+    InterfaceStatusWorker,
+    PixhawkHostIpDiscoveryWorker,
+    PixhawkConnectionWorker,
+    PixhawkStreamSetupWorker,
+    PixhawkUsbBootstrapWorker,
+    PixhawkPersistentConfigWorker,
+    PixhawkRtcmInjectionWorker,
+    PixhawkShellCommandWorker,
+    PixhawkParameterWorker,
+)
+from workstation.device_runtime_controller import (
+    DEVICE_RUNTIME_CONTROLLER_METHODS,
+    DeviceRuntimeController,
+)
+
+
+from workstation.wiris_runtime_workers import (
+    RTSP_ENABLE_PORT_WAIT_INTERVAL_MS,
+    RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS,
+    RTSP_ENABLE_SETTLE_DELAY_MS,
+    WIRIS_STUS_MAX_VALID_RTT_S,
+    WIRIS_STUS_PARSE_MARGIN_S,
+    WIRIS_STUS_RTT_PROBE_COMMAND,
+    WIRIS_STUS_RTT_PROBE_COUNT,
+    RtspStreamCheckWorker,
+    WirisClockCommandWorker,
+    WirisCommandWorker,
+    WirisRtspEnableWorker,
+    WirisStipWorker,
+    WirisZoomWorker,
+)
+from workstation.wiris_control_controller import (
+    WIRIS_CONTROL_METHODS,
+    WirisControlController,
+)
+from workstation.app_lifecycle_controller import (
+    APP_LIFECYCLE_METHODS,
+    AppLifecycleController,
+)
+from workstation.camera_time_sync_controller import (
+    CAMERA_GDTI_MAX_PAIR_DELTA_S,
+    CAMERA_GDTI_RESOLUTION_S,
+    CAMERA_RTCP_MAX_PC_OFFSET_S,
+    CAMERA_RTCP_PAIR_MAX_DELTA_S,
+    CAMERA_SYNC_FRAME_HISTORY_WINDOW_S,
+    CAMERA_SYNC_HISTORY_MAX_AGE_S,
+    CAMERA_SYNC_MAX_CLOCK_RATE_ERROR,
+    CAMERA_SYNC_MAX_SR_AGE_S,
+    CAMERA_SYNC_RECEIVE_PAIR_MAX_DELTA_S,
+    CAMERA_SYNC_REQUIRED_SR_COUNT,
+    CAMERA_SYNC_STATUS_FAILED,
+    CAMERA_SYNC_STATUS_NOT_VERIFIED,
+    CAMERA_SYNC_STATUS_RECONNECTING,
+    CAMERA_SYNC_STATUS_VERIFIED,
+    CAMERA_SYNC_STATUS_WARMING,
+    CAMERA_SYNC_WARMUP_TIMEOUT_S,
+    CAMERA_TIME_SYNC_METHODS,
+    CameraTimeSyncController,
+)
+from workstation.camera_stream_controller import (
+    CAMERA_STREAM_LIFECYCLE_METHODS,
+    CameraStreamLifecycleController,
+)
+
+
+from workstation_core.gnss_protocol import (
+    GNSS_BASE_LOW_CNO_DBHZ,
+    GNSS_BASE_LOW_ELEVATION_DEG,
+    GNSS_BASE_SURVEY_IMPROVING_DELTA_M,
+    GNSS_BASE_SURVEY_STAGNANT_DELTA_M,
+    GNSS_BASE_SURVEY_TREND_WINDOW_S,
+    Rtcm3StreamParser,
+    UbxStreamParser,
+    gnss_base_serial_port_candidates,
+    preferred_gnss_base_serial_port,
+    parse_nmea_gga_satellite_count,
+    parse_rtcm3_message_type,
+    parse_ubx_ack,
+    parse_ubx_base_satellite_count,
+    parse_ubx_cfg_tmode3,
+    parse_ubx_nav_pvt_coordinate_sample,
+    parse_ubx_nav_sat_quality,
+    parse_ubx_nav_svin,
+    probe_gnss_base_serial_ports,
+    ubx_cfg_tmode3_disabled_frame,
+    ubx_cfg_tmode3_fixed_frame,
+    ubx_cfg_tmode3_poll_frame,
+    ubx_cfg_tmode3_survey_in_frame,
+    ubx_frame,
+    ubx_nav_pvt_poll_frame,
+    ubx_nav_svin_poll_frame,
+    ubx_poll_frame,
+)
+
+from workstation.gnss_runtime_workers import (
+    GnssBaseSerialWorker,
+    NtripNetworkWorker,
+    GnssBaseSerialDetectWorker,
+)
+from workstation.gnss_runtime_controller import (
+    GNSS_RUNTIME_CONTROLLER_METHODS,
+    GnssRuntimeController,
+)
+
+
+from workstation.calibration_workers import (
+    CheckerboardCaptureWorker,
+    CheckerboardCalibrationWorker,
+    CheckerboardRandomValidationWorker,
+    CheckerboardPreviewWorker,
+)
+from workstation.calibration_controller import (
+    CALIBRATION_WORKFLOW_METHODS,
+    CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
+    CalibrationWorkflowController,
+)
+from workstation.recording_controller import (
+    RECORDING_CONTROLLER_METHODS,
+    RecordingController,
+    new_measurement_attempt_generation_id as _new_measurement_attempt_generation_id,
+)
+from workstation.measurement_view_controller import (
+    MEASUREMENT_VIEW_CONTROLLER_METHODS,
+    MeasurementViewController,
+)
+from workstation.sensor_presentation_controller import (
+    SENSOR_PRESENTATION_METHODS,
+    SensorPresentationController,
+)
 
 
 class TopicBrowserDialog(QtWidgets.QDialog):
@@ -3945,9 +1032,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         except Exception:
             pass
 
-    def __init__(self, *, auto_start: bool = False, auto_start_pixhawk: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        auto_start: bool = False,
+        auto_start_pixhawk: bool = False,
+        app_root: str | Path | None = None,
+        settings_path: str | Path | None = None,
+    ) -> None:
         super().__init__()
-        self.app_root = APP_ROOT
+        self.app_root = Path(APP_ROOT if app_root is None else app_root).expanduser().resolve()
+        self.settings_path = Path(
+            self.app_root / WORKSTATION_SETTINGS_PATH.name
+            if settings_path is None
+            else settings_path
+        ).expanduser().resolve()
         self.setMinimumSize(900, 820)
         self.latest_left: DetectionObservation | None = None
         self.latest_right: DetectionObservation | None = None
@@ -3967,6 +1066,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         # create a long-lived QThread that outlives a deleteLater() cycle.
         self._calibration_preview_worker: CheckerboardPreviewWorker | None = None
         self._calibration_preview_thread: QtCore.QThread | None = None
+        self.checkerboard_calibration_worker: QtCore.QObject | None = None
+        self.checkerboard_calibration_thread: QtCore.QThread | None = None
         self._workstation_calibration_preview_active = False
         self.destroyed.connect(self._stop_calibration_preview_worker)
         self.detection_buffers = {
@@ -3999,6 +1100,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.px4_shell_dialogs: dict[str, Px4ShellDialog] = {}
         self.camera_connected = False
         self.yolo_enabled = False
+        self._camera_start_request_generation = 0
+        self._pending_camera_start: tuple[bool, bool] | None = None
         self.camera_auto_detect_thread: QtCore.QThread | None = None
         self.camera_auto_detect_worker: CameraAutoDetectWorker | None = None
         self.wiris_control_check_thread: QtCore.QThread | None = None
@@ -4050,6 +1153,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_network_status_line = ""
         self.gnss_network_rtcm_parser = Rtcm3StreamParser()
         self.gnss_coordinate_samples: deque[GnssCoordinateSample] = deque(maxlen=2400)
+        # Latest Base position is a WGS84 geodetic sample used only for the
+        # assisted-mode NTRIP GGA hint.  It is cleared between serial/session
+        # lifecycles so a previous experiment's coordinate cannot be reused.
+        self.latest_gnss_base_position: GnssCoordinateSample | None = None
         self.gnss_fixed_base_profile = None
         self.gnss_fixed_base_pending_profile = None
         self.gnss_fixed_base_command_sent = False
@@ -4064,12 +1171,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_detect_thread: QtCore.QThread | None = None
         self.gnss_base_detect_worker: GnssBaseSerialDetectWorker | None = None
         self._gnss_base_candidate_rows: list[dict[str, object]] = []
+        self.workstation_gnss_base_discovery_status = "NOT RUN"
+        self.latest_gnss_base_survey_in: dict[str, object] | None = None
         self.gnss_base_survey_samples: deque[tuple[float, int, float, bool, bool]] = deque(maxlen=240)
         self.gnss_base_rtcm_stats = self._new_gnss_base_rtcm_stats()
         self.auto_wiris_connect_pending = False
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
-        self.settings = load_settings()
+        self.settings = load_settings(self.settings_path)
         self._workstation_setting_overrides: dict[str, object] = {}
         self.gnss_operation_manager = GnssOperationManager(self.settings.gnss_operation)
         self.distance_history: deque[DistanceHistoryPoint] = deque(maxlen=600)
@@ -4107,9 +1216,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._last_wiris_pc_utc_sync: dict[str, object] | None = None
         self.camera_sync_status = CAMERA_SYNC_STATUS_NOT_VERIFIED
         self.camera_sync_reason = "STUS 동기화 후 RTCP/NTP 검증이 필요합니다."
+        # Workstation protocol checkpoints are evidence only.  They do not
+        # alter the existing camera sync state or measurement timestamps.
+        self.workstation_time_sync_checkpoints: list[dict[str, object]] = []
         self._camera_sync_transport_override: str | None = None
         self._camera_sync_deadline_monotonic_s: float | None = None
         self._camera_sync_requested_utc_s: float | None = None
+        self._camera_sync_requested_utc_by_camera: dict[str, float] = {}
         self._camera_sync_gdti: dict[str, dict[str, object]] = {}
         self._camera_sync_timer = QtCore.QTimer(self)
         self._camera_sync_timer.setInterval(250)
@@ -4187,7 +1300,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.latest_gps_sensors: dict[str, dict[str, object]] = {"left": {}, "right": {}}
         self.latest_gnss_relative: dict[str, object] = {}
         self.last_rtsp_check_status: dict[str, str] = {"left": "unchecked", "right": "unchecked"}
-        self.last_distance_quality = "BAD"
+        self.last_distance_quality = "WARNING"
         self.last_distance_status = "거리: 좌/우 검출 매칭 대기 중"
 
         root = QtWidgets.QVBoxLayout(self)
@@ -4572,6 +1685,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.clear_camera_candidate_button.setToolTip("WIRIS 탐색 후보 내역을 지웁니다.")
         self.camera_candidate_table.itemSelectionChanged.connect(self._refresh_camera_candidate_actions)
         self._camera_candidate_rows: list[dict[str, object]] = []
+        self.workstation_camera_discovery_status = "NOT RUN"
         self.pixhawk_usb_discover_button = QtWidgets.QPushButton("Scan USB Pixhawks")
         self.pixhawk_usb_discover_button.clicked.connect(self.discover_usb_pixhawk_connections)
         self.pixhawk_mavlink_url_candidate_button = QtWidgets.QPushButton(
@@ -4639,6 +1753,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "pc": [],
             "mavlink": [],
         }
+        self.workstation_pixhawk_discovery_status = "NOT RUN"
         self.swap_camera_button = QtWidgets.QPushButton("Swap Camera Sides")
         self.swap_camera_button.clicked.connect(self.swap_cameras)
         self.swap_pixhawk_button = QtWidgets.QPushButton("Swap P1 / P2 Roles")
@@ -5304,9 +2419,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_sync_warmup_timeout_spin.setDecimals(0)
         self.camera_sync_warmup_timeout_spin.setValue(self.settings.camera_sync_warmup_timeout_s)
         self.camera_sync_warmup_timeout_spin.setSuffix(" s")
-        camera_sync_settings_group = QtWidgets.QGroupBox("카메라 RTCP 동기화 Gate")
-        camera_sync_settings_group.setObjectName("cameraSyncSettingsGroup")
-        camera_sync_settings_form = QtWidgets.QGridLayout(camera_sync_settings_group)
+        self.camera_sync_settings_group = QtWidgets.QGroupBox("카메라 RTCP 동기화 Gate")
+        self.camera_sync_settings_group.setObjectName("cameraSyncSettingsGroup")
+        camera_sync_settings_form = QtWidgets.QGridLayout(self.camera_sync_settings_group)
         camera_sync_settings_form.setHorizontalSpacing(8)
         camera_sync_settings_form.setVerticalSpacing(6)
         camera_sync_settings_form.setColumnStretch(1, 1)
@@ -5391,8 +2506,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         stereo_form.addWidget(self.current_parameters_group, 0, 0, 1, 6)
         stereo_form.addWidget(stereo_parameter_splitter, 1, 0, 1, 6)
-        stereo_form.addWidget(camera_sync_settings_group, 2, 0, 1, 6)
-        stereo_form.addWidget(self.distance_label, 3, 0, 1, 6)
+        stereo_form.addWidget(self.distance_label, 2, 0, 1, 6)
         for widget in (
             self.camera_sync_history_window_spin,
             self.camera_sync_receive_pair_max_delta_spin,
@@ -5637,7 +2751,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.save_intrinsics_button = QtWidgets.QPushButton("저장")
         self.save_intrinsics_button.clicked.connect(self.save_intrinsics)
         self.apply_intrinsics_button = QtWidgets.QPushButton("계산에 적용")
-        self.apply_intrinsics_button.clicked.connect(self.load_intrinsics)
+        self.apply_intrinsics_button.clicked.connect(self.apply_intrinsics_to_distance)
         self.calibration_status_label = QtWidgets.QLabel("좌/우 중 체커보드가 보이는 카메라 프레임을 캡처하세요.")
         self.calibration_status_label.setObjectName("statusStrip")
         self.calibration_status_label.setWordWrap(True)
@@ -6041,7 +3155,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
         self._shutdown_coordinator = LifecycleCoordinator(
             [
-                LifecycleStep("stop-runtime-workers", lambda: self.stop_all(wait=True)),
+                LifecycleStep("stop-runtime-workers", lambda: self.stop_all(wait=False)),
                 LifecycleStep("stop-gnss-network", lambda: self.stop_gnss_network()),
                 LifecycleStep("stop-gnss-base-serial", lambda: self._shutdown_stop_gnss_base_serial()),
                 LifecycleStep("stop-auxiliary-workers", lambda: self._shutdown_stop_auxiliary_workers()),
@@ -6315,7 +3429,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             self.yolo_gate_time_delta_checkbox: (
                 "좌/우 detection pair의 최대 시간 차이 gate를 켭니다. 아래 최대 Δt보다 timestamp 차이가 큰 후보는 매칭하지 않습니다. "
-                "이 값은 YOLO pair 선택 기준이며, `파라미터 > 계산 설정`의 RTCP/NTP 동기화 Gate(기본 50ms)나 `RTP 지연(ms)`와는 별개입니다."
+                "이 값은 YOLO pair 선택 기준이며, `시간 > Sync limits`의 RTCP/NTP 동기화 Gate(기본 50ms)나 `RTP 지연(ms)`와는 별개입니다."
             ),
             self.yolo_gate_time_delta_spin: "YOLO 좌/우 pair 최대 Δt(s)입니다. 최대 Δt gate가 켜져 있을 때 이 값보다 오래 떨어진 detection pair를 제외합니다.",
             self.yolo_gate_vertical_delta_checkbox: (
@@ -6428,7 +3542,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.clock_wiris_time_target_combo: "PC UTC를 설정할 WIRIS RTC 대상을 선택합니다.",
             self.wiris_set_pc_time_button: (
                 "선택한 WIRIS 대상의 RTC를 PC 현재 UTC로 설정합니다. "
-                "양쪽 전송에서는 같은 STUS UTC 값을 만들고 명령 UTC/TCP 호출 시작 차이를 로그에 남깁니다."
+                "카메라별 HIWS 제어 채널 RTT를 측정해 RTT/2와 파싱 여유를 더한 STUS 목표시각을 사용하고, 측정값을 로그에 남깁니다."
             ),
             self.clock_sync_check_button: (
                 "최근 스트림 frame의 RTCP/NTP 기반 시각을 PC UTC와 비교합니다. "
@@ -6674,7 +3788,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 color: {ACCENT_ACTIVE};
             }}
             QPushButton[role="toggle"]:checked:hover {{
-                background: #d0e2ff;
+                background: {PANEL_ALT_STRONG};
                 border-color: {ACCENT_HOVER};
             }}
             QCheckBox {{
@@ -6690,7 +3804,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 padding: 5px 7px;
             }}
             QLabel#distanceStatus {{
-                background: {INFO_BG};
+                background: {PANEL_ALT_BG};
                 border: 1px solid {ACCENT};
                 border-radius: 0px;
                 padding: 7px 10px;
@@ -7167,6 +4281,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.baseline_sampling_started_s: float | None = None
         self.baseline_samples: list[tuple[BaselineVector, GpsPositionState, GpsPositionState]] = []
         self.latest_baseline_quality: BaselineQuality | None = None
+        self.physical_alignment_samples: list[PhysicalAlignmentSample] = []
+        self.latest_physical_alignment_quality: PhysicalAlignmentQuality | None = None
+        self.alignment_iteration_history: list[dict[str, object]] = []
+        self.alignment_iteration_number = 0
         self.latest_baseline_vector: BaselineVector | None = None
         self.baseline_gps_rate_history: dict[str, deque[float]] = {"left": deque(maxlen=120), "right": deque(maxlen=120)}
         self.baseline_source_summary_labels: list[QtWidgets.QLabel] = []
@@ -7204,6 +4322,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         content_layout.setSpacing(8)
 
         operation_config = self.settings.gnss_operation
+        self.gnss_site_label_edit = QtWidgets.QLineEdit(operation_config.site_label)
+        self.gnss_site_label_edit.setPlaceholderText("이번 실험의 장소/지점명")
+        self.gnss_site_address_edit = QtWidgets.QLineEdit(operation_config.site_address)
+        self.gnss_site_address_edit.setPlaceholderText("이번 실험의 주소 또는 현장 설명")
         self.gnss_operation_mode_combo = QtWidgets.QComboBox()
         self.gnss_operation_mode_combo.addItem("현장 Base Survey-in", GnssOperationMode.LOCAL_SURVEY_IN.value)
         self.gnss_operation_mode_combo.addItem(
@@ -7222,6 +4344,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_ntrip_username_env_edit = QtWidgets.QLineEdit(operation_config.network.username_env)
         self.gnss_ntrip_password_env_edit = QtWidgets.QLineEdit(operation_config.network.password_env)
         self.gnss_ntrip_gga_policy_combo = QtWidgets.QComboBox()
+        self.gnss_ntrip_gga_policy_combo.addItem("Base GNSS (보조 Fixed Base)", GgaPolicy.BASE_GNSS.value)
         self.gnss_ntrip_gga_policy_combo.addItem("좌우 중심", GgaPolicy.SYSTEM_CENTER.value)
         self.gnss_ntrip_gga_policy_combo.addItem("Left GNSS", GgaPolicy.LEFT_GNSS.value)
         self.gnss_ntrip_gga_policy_combo.addItem("수동/미사용", GgaPolicy.MANUAL.value)
@@ -7238,7 +4361,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_fixed_min_duration_spin = QtWidgets.QSpinBox()
         self.gnss_fixed_min_duration_spin.setRange(1, 86400)
         self.gnss_fixed_min_duration_spin.setValue(int(operation_config.fixed_base.minimum_fixed_duration_s))
-        self.gnss_base_serial_port_edit = QtWidgets.QLineEdit(self.settings.gnss_base_serial_port)
+        self.gnss_rover_min_fix_type_spin = QtWidgets.QSpinBox()
+        self.gnss_rover_min_fix_type_spin.setRange(0, 255)
+        self.gnss_rover_min_fix_type_spin.setValue(int(operation_config.readiness.minimum_fix_type))
+        self.gnss_base_serial_port_edit = QtWidgets.QLineEdit(
+            preferred_gnss_base_serial_port(self.settings.gnss_base_serial_port)
+        )
         self.gnss_base_baud_spin = QtWidgets.QSpinBox()
         self.gnss_base_baud_spin.setRange(1200, 4000000)
         self.gnss_base_baud_spin.setValue(int(self.settings.gnss_base_baud))
@@ -7265,7 +4393,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_common_config_group = QtWidgets.QGroupBox("GNSS 운용")
         common_form = QtWidgets.QGridLayout(self.gnss_common_config_group)
         add_setting(common_form, 0, "GNSS 운용 모드", self.gnss_operation_mode_combo)
-        add_setting(common_form, 1, "RTCM 주입 대상", self.gnss_base_rtcm_target_combo)
+        add_setting(common_form, 1, "실험 장소/지점명", self.gnss_site_label_edit)
+        add_setting(common_form, 2, "실험 주소/현장 설명", self.gnss_site_address_edit)
+        add_setting(common_form, 3, "RTCM 주입 대상", self.gnss_base_rtcm_target_combo)
+        add_setting(common_form, 4, "Rover 최소 fix_type (3=3D, 6=Fixed)", self.gnss_rover_min_fix_type_spin)
 
         self.gnss_base_config_group = QtWidgets.QGroupBox("Base Serial 설정")
         base_config_form = QtWidgets.QGridLayout(self.gnss_base_config_group)
@@ -8485,1503 +5616,63 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         grade = "GOOD" if quality is not None and quality.grade == "GOOD" else "WARNING" if vector is not None else "BAD"
         self._set_health_label(labels["alignment_quality"], grade, "good" if grade == "GOOD" else "warn" if grade == "WARNING" else "bad")
 
-    def _refresh_gnss_base_tab(self) -> None:
-        if not hasattr(self, "gnss_base_status_labels"):
-            return
-        labels = self.gnss_base_status_labels
-        now_s = time.monotonic()
-        for side, key in (("left", "left_rover"), ("right", "right_rover")):
-            gps = self.latest_gps.get(side)
-            if gps is None:
-                self._set_health_label(labels[key], "GPS/RTK 대기 중", "idle")
-                continue
-            age_ms = max(0.0, now_s - gps.timestamp_s) * 1000.0
-            sats = "sats=--" if gps.satellites_used is None else f"sats={gps.satellites_used}"
-            eph = "" if gps.eph_m is None else f" | eph={gps.eph_m:.2f}m"
-            if gps.latitude_deg is None or gps.longitude_deg is None:
-                position = " | pos=--"
-            else:
-                height_m = gps.altitude_ellipsoid_m if gps.altitude_ellipsoid_m is not None else gps.altitude_m
-                height_text = "--" if height_m is None else f"{height_m:.3f}m"
-                position = f" | {gps.latitude_deg:.7f}, {gps.longitude_deg:.7f} | h={height_text}"
-            text = f"{gps.rtk_label} | {sats}{eph}{position} | age={age_ms:.0f}ms"
-            self._set_health_label(labels[key], text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
-
-        baseline = self.latest_rtk_baseline
-        if baseline is None:
-            self._set_health_label(labels["baseline"], "대기 중", "idle")
-            return
-        usable, reason = self._gps_baseline_usable_for_translation(baseline)
-        level = "good" if usable and baseline.fix_quality == "GOOD" else "warn" if usable else "bad"
-        text = (
-            f"{baseline.baseline_m:.3f} m | {baseline.fix_quality} | "
-            f"N/E/D={baseline.north_m:+.3f}/{baseline.east_m:+.3f}/{baseline.down_m:+.3f} m"
-        )
-        if not usable:
-            text = f"{text} | {reason}"
-        self._set_health_label(labels["baseline"], text, level)
-
-    def _gnss_selected_operation_mode(self) -> GnssOperationMode:
-        value = self.gnss_operation_mode_combo.currentData()
-        try:
-            return GnssOperationMode(value)
-        except (TypeError, ValueError):
-            return GnssOperationMode.LOCAL_SURVEY_IN
-
-    def _gnss_active_operation_config(self) -> GnssOperationConfig:
-        """Return the immutable active-session config, or the configured default.
-
-        UI widgets are editable presentation state.  Once an operation starts,
-        correction routing and datum semantics must come from the snapshot that
-        was configured at start, never from a later combo-box change.
-        """
-
-        return self.gnss_active_operation_config or self._build_gnss_operation_config()
-
-    def _set_gnss_operation_controls_locked(self, locked: bool) -> None:
-        """Prevent mutable GNSS settings from changing an active operation."""
-
-        names = (
-            "gnss_operation_mode_combo",
-            "gnss_ntrip_host_edit",
-            "gnss_ntrip_port_spin",
-            "gnss_ntrip_mountpoint_edit",
-            "gnss_ntrip_username_env_edit",
-            "gnss_ntrip_password_env_edit",
-            "gnss_ntrip_gga_policy_combo",
-            "gnss_fixed_height_combo",
-            "gnss_fixed_acquisition_duration_spin",
-            "gnss_fixed_min_duration_spin",
-            "gnss_base_rtcm_target_combo",
-            "gnss_base_serial_port_edit",
-            "gnss_base_baud_spin",
-        )
-        for name in names:
-            control = getattr(self, name, None)
-            if control is not None:
-                control.setEnabled(not locked)
-
-    def _build_gnss_operation_config(self) -> GnssOperationConfig:
-        """Build the persisted GNSS contract from the visible controls.
-
-        Credentials remain environment-variable names only.  The raw serial
-        and MAVLink paths are still owned by their existing widgets; this
-        object records how correction bytes are sourced and routed.
-        """
-
-        previous = self._workstation_setting_overrides.get("gnss_operation", self.settings.gnss_operation)
-        if not isinstance(previous, GnssOperationConfig):
-            previous = GnssOperationConfig.from_mapping(previous)
-        height_value = self.gnss_fixed_height_combo.currentData()
-        if height_value not in {
-            HeightType.ELLIPSOID.value,
-            HeightType.MSL.value,
-            HeightType.UNKNOWN.value,
-        }:
-            height_value = HeightType.ELLIPSOID.value
-        target = str(self.gnss_base_rtcm_target_combo.currentData() or "disabled")
-        mapping = previous.to_mapping()
-        mapping.update(
-            {
-                "operation_mode": self._gnss_selected_operation_mode().value,
-                "local_base": {
-                    **previous.local_base.to_mapping(),
-                    "device": self.gnss_base_serial_port_edit.text().strip(),
-                    "baud": int(self.gnss_base_baud_spin.value()),
-                    "survey_in_min_duration_s": float(self.gnss_base_survey_duration_spin.value()),
-                    "survey_in_accuracy_limit_m": float(self.gnss_base_survey_accuracy_spin.value()),
-                },
-                "network": {
-                    **previous.network.to_mapping(),
-                    "caster_host": self.gnss_ntrip_host_edit.text().strip(),
-                    "caster_port": int(self.gnss_ntrip_port_spin.value()),
-                    "mountpoint": self.gnss_ntrip_mountpoint_edit.text().strip(),
-                    "username_env": self.gnss_ntrip_username_env_edit.text().strip() or "NTRIP_USERNAME",
-                    "password_env": self.gnss_ntrip_password_env_edit.text().strip() or "NTRIP_PASSWORD",
-                    "gga_policy": str(self.gnss_ntrip_gga_policy_combo.currentData() or GgaPolicy.SYSTEM_CENTER.value),
-                },
-                "fixed_base": {
-                    **previous.fixed_base.to_mapping(),
-                    "acquisition_duration_s": float(self.gnss_fixed_acquisition_duration_spin.value()),
-                    "minimum_fixed_duration_s": float(self.gnss_fixed_min_duration_spin.value()),
-                    "height_type": height_value,
-                },
-                "routing": {
-                    **previous.routing.to_mapping(),
-                    "left_enabled": target in {"both", "left"},
-                    "right_enabled": target in {"both", "right"},
-                    "field_base_enabled": self._gnss_selected_operation_mode()
-                    == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
-                },
-            }
-        )
-        return GnssOperationConfig.from_mapping(mapping)
-
-    def _gnss_configure_manager(self, config: GnssOperationConfig) -> None:
-        state = self.gnss_operation_manager.state
-        if state not in {GnssOperationState.DISCONNECTED, GnssOperationState.STOPPED, GnssOperationState.CONFIGURED}:
-            self.gnss_operation_manager.stop()
-        self.gnss_operation_manager.configure(config)
-
-    def _gnss_status_label_key_for_state(self, state: GnssOperationState) -> str:
-        group = STATE_STATUS_GROUP.get(state, GnssStatusGroup.READINESS)
-        if group is GnssStatusGroup.NETWORK:
-            return "network"
-        if group is GnssStatusGroup.BASE_FIXED:
-            return "base_fixed"
-        return "operation"
-
-    def _gnss_transition(self, state: GnssOperationState, reason: str) -> bool:
-        try:
-            self.gnss_operation_manager.transition(state, reason)
-        except (RuntimeError, ValueError) as exc:
-            label_key = self._gnss_status_label_key_for_state(state)
-            self._set_health_label(self.gnss_base_status_labels[label_key], f"상태 전환 실패: {exc}", "bad")
-            self._log(f"[GNSS] 상태 전환 실패: {exc}")
-            return False
-        new_state = self.gnss_operation_manager.state
-        group = STATE_STATUS_GROUP.get(new_state, GnssStatusGroup.READINESS)
-        if group is GnssStatusGroup.NETWORK:
-            # Group A (NTRIP) already has a dedicated "network" label kept up
-            # to date by the NTRIP handlers themselves; writing NTRIP_CONNECTING/
-            # NTRIP_ACTIVE transitions here would just duplicate/race with that.
-            # But in NETWORK_ASSISTED_FIXED_BASE, Group B (base_fixed) can't
-            # start until this NTRIP handshake finishes, so surface *why*
-            # base_fixed is still idle instead of leaving stale placeholder
-            # text with no explanation.
-            if (
-                self._gnss_active_operation_config().operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE
-                and "base_fixed" in self.gnss_base_status_labels
-            ):
-                waiting_text = (
-                    "NTRIP 연결 대기 중"
-                    if new_state == GnssOperationState.NTRIP_CONNECTING
-                    else "NTRIP 연결됨 | Base 위치 샘플 수신 대기 중"
-                )
-                self._set_health_label(self.gnss_base_status_labels["base_fixed"], waiting_text, "warn")
-        else:
-            label_key = "base_fixed" if group is GnssStatusGroup.BASE_FIXED else "operation"
-            self._set_health_label(
-                self.gnss_base_status_labels[label_key],
-                f"{new_state.value} | {reason}",
-                "good" if new_state == GnssOperationState.READY else "warn",
-            )
-        return True
-
-    def _handle_gnss_operation_mode_changed(self) -> None:
-        if not hasattr(self, "gnss_operation_mode_combo"):
-            return
-        mode = self._gnss_selected_operation_mode()
-        local_mode = mode == GnssOperationMode.LOCAL_SURVEY_IN
-        assisted_fixed_mode = mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE
-        serial_allowed = mode in {
-            GnssOperationMode.LOCAL_SURVEY_IN,
-            GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
-        }
-        network_allowed = not local_mode
-
-        # Keep the settings page focused on the currently selected correction
-        # path.  The underlying widgets remain alive so persisted settings and
-        # the existing operation-config builder keep their stable interface.
-        visibility = (
-            ("gnss_base_config_group", serial_allowed),
-            ("gnss_survey_config_group", local_mode),
-            ("gnss_network_config_group", network_allowed),
-            ("gnss_fixed_config_group", assisted_fixed_mode),
-            ("gnss_base_candidate_group", serial_allowed),
-            ("gnss_survey_progress_group", local_mode),
-            ("gnss_survey_quality_group", local_mode),
-            ("gnss_base_fixed_progress_group", serial_allowed),
-        )
-        for name, visible in visibility:
-            group = getattr(self, name, None)
-            if group is not None:
-                group.setVisible(visible)
-
-        # The "survey_in" row inside base_group only means anything in
-        # LOCAL_SURVEY_IN (NAV-SVIN); the underlying poll runs every mode
-        # (NAV-PVT is needed regardless), so hide the row itself rather than
-        # let a stale/irrelevant value keep showing.
-        for key, visible in (("survey_in", local_mode),):
-            value_label = self.gnss_base_status_labels.get(key) if hasattr(self, "gnss_base_status_labels") else None
-            title_label = (
-                self.gnss_base_status_title_labels.get(key) if hasattr(self, "gnss_base_status_title_labels") else None
-            )
-            if value_label is not None:
-                value_label.setVisible(visible)
-            if title_label is not None:
-                title_label.setVisible(visible)
-
-        for name, visible in (
-            ("gnss_base_discover_button", serial_allowed),
-            ("gnss_base_connect_button", serial_allowed),
-            ("gnss_base_disconnect_button", serial_allowed),
-            ("gnss_base_survey_start_button", local_mode),
-            ("gnss_base_survey_stop_button", local_mode),
-            ("gnss_network_start_button", network_allowed),
-            ("gnss_network_stop_button", network_allowed),
-            ("gnss_base_apply_candidate_button", serial_allowed),
-        ):
-            button = getattr(self, name, None)
-            if button is not None:
-                button.setVisible(visible)
-
-        if hasattr(self, "gnss_base_connect_button"):
-            self.gnss_base_connect_button.setEnabled(serial_allowed and self.gnss_base_serial_thread is None)
-        if hasattr(self, "gnss_base_discover_button"):
-            self.gnss_base_discover_button.setEnabled(serial_allowed and self.gnss_base_detect_thread is None)
-        if hasattr(self, "gnss_base_survey_start_button"):
-            self.gnss_base_survey_start_button.setEnabled(local_mode and self.gnss_base_serial_connected)
-        if hasattr(self, "gnss_base_survey_stop_button"):
-            self.gnss_base_survey_stop_button.setEnabled(local_mode and self.gnss_base_serial_connected)
-        if hasattr(self, "gnss_network_start_button"):
-            self.gnss_network_start_button.setEnabled(network_allowed and self.gnss_network_thread is None)
-        if hasattr(self, "gnss_base_status_labels") and "operation" in self.gnss_base_status_labels:
-            self._set_health_label(
-                self.gnss_base_status_labels["operation"],
-                f"{mode.value} | {'현장 serial' if local_mode else 'NTRIP correction'}",
-                "idle" if self.gnss_operation_manager.state in {GnssOperationState.DISCONNECTED, GnssOperationState.STOPPED} else "warn",
-            )
-
-    def _gnss_source_identity(self, config: GnssOperationConfig) -> CorrectionSourceIdentity:
-        if config.operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
-            return CorrectionSourceIdentity(
-                source_kind="local-serial-survey-in",
-                base_device=config.local_base.device,
-            )
-        return CorrectionSourceIdentity(
-            source_kind=("ntrip-fixed-base" if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE else "ntrip-direct"),
-            caster_host=config.network.caster_host,
-            caster_port=config.network.caster_port,
-            mountpoint=config.network.mountpoint,
-            gga_policy=config.network.gga_policy,
-            base_device=config.local_base.device if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE else "",
-        )
-
-    def _gnss_gga_provider(self) -> str | None:
-        policy = self._gnss_active_operation_config().network.gga_policy
-        left = self.latest_gps.get("left")
-        right = self.latest_gps.get("right")
-        positions = [position for position in (left, right) if position is not None and position.has_position]
-        if policy == GgaPolicy.MANUAL or not positions:
-            return None
-        if policy == GgaPolicy.LEFT_GNSS or len(positions) == 1:
-            return gga_from_position(positions[0])
-        if policy == GgaPolicy.PER_ROVER_SESSION:
-            return gga_from_position(left or positions[0])
-        # SYSTEM_CENTER: average WGS84 geodetic values for the two antenna hints.
-        lat = sum(float(position.latitude_deg) for position in positions) / len(positions)
-        lon = sum(float(position.longitude_deg) for position in positions) / len(positions)
-        alt = sum(float(position.altitude_m) for position in positions) / len(positions)
-        return format_nmea_gga(lat, lon, alt, fix_quality=1, satellites=12, hdop=1.0)
-
-    def start_gnss_network(self) -> None:
-        if self.gnss_network_thread is not None:
-            return
-        config = self._build_gnss_operation_config()
-        if config.operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
-            self._set_health_label(self.gnss_base_status_labels["network"], "현장 모드에서는 NTRIP을 시작할 수 없습니다", "warn")
-            return
-        if not config.network.caster_host or not config.network.mountpoint:
-            self._set_health_label(self.gnss_base_status_labels["network"], "caster host/mountpoint 필요", "bad")
-            return
-        if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and not self.gnss_base_serial_connected:
-            self._set_health_label(self.gnss_base_status_labels["network"], "보조 Fixed Base 모드는 먼저 Base serial을 연결하세요", "bad")
-            return
-        if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and self.mavlink_pixhawk is None:
-            self._set_health_label(self.gnss_base_status_labels["network"], "RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
-            return
-        try:
-            self._gnss_configure_manager(config)
-            self.gnss_operation_manager.set_source_identity(self._gnss_source_identity(config))
-            if not self._gnss_transition(GnssOperationState.INITIALIZING, "NTRIP 운용 초기화"):
-                return
-            if not self._gnss_transition(GnssOperationState.NTRIP_CONNECTING, "NTRIP caster 연결 중"):
-                return
-        except (ValueError, RuntimeError) as exc:
-            self._set_health_label(self.gnss_base_status_labels["network"], f"운용 설정 실패: {exc}", "bad")
-            return
-        self.gnss_operation_gate_active = True
-        self.gnss_active_operation_config = config
-        self.gnss_network_connected = False
-        self.gnss_network_status_line = ""
-        self.gnss_network_rtcm_parser = Rtcm3StreamParser()
-        self.gnss_coordinate_samples.clear()
-        if hasattr(self, "gnss_base_fixed_state_plot"):
-            self.gnss_base_fixed_state_plot.points.clear()
-        if hasattr(self, "gnss_base_fixed_scatter_plot"):
-            self.gnss_base_fixed_scatter_plot.points.clear()
-        self.gnss_fixed_base_profile = None
-        self.gnss_fixed_base_pending_profile = None
-        self.gnss_fixed_base_command_sent = False
-        self.gnss_fixed_base_reconfigure_expected = None
-        self.gnss_fixed_base_reconfigure_ack = False
-        self.gnss_fixed_base_reconfigure_readback = False
-        self.gnss_fixed_base_reconfigure_rtcm = False
-        self.gnss_fixed_base_reconfigure_deadline_s = None
-        self._reset_gnss_base_rtcm_stats()
-        self.gnss_network_start_button.setEnabled(False)
-        self.gnss_network_stop_button.setEnabled(True)
-        self._set_gnss_operation_controls_locked(True)
-        self._set_health_label(self.gnss_base_status_labels["network"], "NTRIP 연결 중", "warn")
-        thread = QtCore.QThread(self)
-        worker = NtripNetworkWorker(config=config.network, gga_provider=self._gnss_gga_provider)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.connected.connect(self._handle_gnss_network_connected)
-        worker.chunk_received.connect(self._handle_gnss_network_chunk)
-        worker.reconnecting.connect(self._handle_gnss_network_reconnecting)
-        worker.failed.connect(self._handle_gnss_network_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._clear_gnss_network_worker(thread))
-        self.gnss_network_thread = thread
-        self.gnss_network_worker = worker
-        thread.start()
-
-    def stop_gnss_network(self) -> bool:
-        worker = self.gnss_network_worker
-        if worker is not None:
-            worker.request_stop()
-        thread = self.gnss_network_thread
-        self.gnss_network_connected = False
-        self.gnss_operation_gate_active = False
-        self.gnss_operation_manager.stop()
-        if hasattr(self, "gnss_base_status_labels"):
-            self._set_health_label(
-                self.gnss_base_status_labels["network"],
-                "NTRIP 종료 중" if thread is not None and thread.isRunning() else "NTRIP 중지",
-                "warn" if thread is not None and thread.isRunning() else "idle",
-            )
-        if thread is None or not thread.isRunning():
-            self.gnss_active_operation_config = None
-            self._set_gnss_operation_controls_locked(False)
-            self._handle_gnss_operation_mode_changed()
-            return True
-        return False
-
-    def _handle_gnss_network_connected(self, status_line: str, stats: object) -> None:
-        self.gnss_network_connected = True
-        self.gnss_network_status_line = str(status_line)
-        self._gnss_transition(GnssOperationState.NTRIP_ACTIVE, f"NTRIP active: {status_line}")
-        self._set_health_label(self.gnss_base_status_labels["network"], f"{status_line} | RTCM 대기", "good")
-
-    def _handle_gnss_network_chunk(self, chunk: object) -> None:
-        if not isinstance(chunk, (bytes, bytearray)):
-            return
-        payload = bytes(chunk)
-        mode = self._gnss_active_operation_config().operation_mode
-        if mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
-            worker = self.gnss_base_serial_worker
-            if worker is None or not self.gnss_base_serial_connected:
-                self._set_health_label(self.gnss_base_status_labels["network"], "NTRIP 수신 중이나 Base serial이 끊겼습니다", "bad")
-                return
-            worker.send_bytes("NTRIP RTCM -> fixed base", payload)
-            self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP {len(payload)} bytes -> fixed base", "good")
-            return
-        frames = self.gnss_network_rtcm_parser.feed(payload)
-        if not frames:
-            self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP raw {len(payload)} bytes | RTCM frame 대기", "warn")
-            return
-        for frame in frames:
-            self._handle_gnss_base_rtcm_frame(frame)
-        self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP RTCM {len(frames)} frame 수신", "good")
-
-    def _handle_gnss_network_failed(self, message: str) -> None:
-        self.gnss_network_connected = False
-        self._set_health_label(self.gnss_base_status_labels["network"], f"NTRIP 실패: {message}", "bad")
-        self._gnss_transition(GnssOperationState.FAULT, f"NTRIP failure: {message}")
-
-    def _handle_gnss_network_reconnecting(self, message: str) -> None:
-        if not self.gnss_operation_gate_active:
-            return
-        self.gnss_network_connected = False
-        self._set_health_label(
-            self.gnss_base_status_labels["network"],
-            f"NTRIP 재연결 대기: {message}",
-            "warn",
-        )
-
-    def _clear_gnss_network_worker(self, thread: QtCore.QThread) -> None:
-        if self.gnss_network_thread is thread:
-            self.gnss_network_thread = None
-            self.gnss_network_worker = None
-            self.gnss_network_connected = False
-            self.gnss_active_operation_config = None
-            self._set_gnss_operation_controls_locked(False)
-            if hasattr(self, "gnss_network_start_button"):
-                self.gnss_network_start_button.setEnabled(self._gnss_selected_operation_mode() != GnssOperationMode.LOCAL_SURVEY_IN)
-            if hasattr(self, "gnss_network_stop_button"):
-                self.gnss_network_stop_button.setEnabled(False)
-        thread.deleteLater()
-
-    def _record_gnss_base_position_row(self, sample: GnssCoordinateSample) -> None:
-        """Persist one GNSS Base position sample (NAV-PVT) to gnss_base.jsonl.
-
-        Reuses ``_raw_timeline_row`` (the same helper camera/px4 recording
-        uses) so the row gets the same session_utc_ns/host_receive_utc_ns
-        UTC columns.  The sample itself only carries a monotonic timestamp
-        (the UBX NAV-PVT parser does not extract the message's UTC
-        time-of-week fields), so source_utc_ns is left unset and callers
-        fall back to the session-anchor-derived session_utc_ns.
-        """
-
-        rows = self.gnss_base_recording_rows
-        row = self._raw_timeline_row(
-            side="base",
-            sample_type="gnss_base_position",
-            row_contract="one row per GNSS Base position sample (NAV-PVT) received by the GUI",
-            sample_monotonic_s=sample.timestamp_s,
-            host_receive_monotonic_ns=time.monotonic_ns(),
-            host_receive_utc_ns=time.time_ns(),
-            source_utc_ns=None,
-            source_utc_method="unavailable",
-            sequence=len(rows),
-        )
-        if row is None:
-            return
-        row.update(
-            {
-                "latitude_deg": sample.latitude_deg,
-                "longitude_deg": sample.longitude_deg,
-                "ellipsoid_height_m": sample.ellipsoid_height_m,
-                "msl_altitude_m": sample.msl_altitude_m,
-                "height_type": sample.height_type.value,
-                "fixed": sample.fixed,
-                "device_id": sample.device_id,
-                "gnss_operation_state": self.gnss_operation_manager.state.value,
-            }
-        )
-        rows.append(row)
-        self.external_parameter_recording_rows.append(row)
-
-    def _handle_gnss_base_position(self, sample: object) -> None:
-        if not isinstance(sample, GnssCoordinateSample):
-            return
-        self.gnss_coordinate_samples.append(sample)
-        config = self._gnss_active_operation_config()
-        if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
-            return
-        self._record_gnss_base_position_row(sample)
-        if hasattr(self, "gnss_base_fixed_state_plot"):
-            self.gnss_base_fixed_state_plot.add_point(
-                TelemetryHistoryPoint(sample.timestamp_s, "fix", 1.0 if sample.fixed else 0.0)
-            )
-        if "base_position" in self.gnss_base_status_labels:
-            height_m = sample.selected_height_m
-            height_text = "--" if height_m is None else f"{height_m:.3f}m"
-            self._set_health_label(
-                self.gnss_base_status_labels["base_position"],
-                f"{sample.latitude_deg:.7f}, {sample.longitude_deg:.7f} | h={height_text} ({sample.height_type.value}) | fix={sample.fixed}",
-                "good" if sample.fixed else "warn",
-            )
-        if not self.gnss_network_connected or self.gnss_fixed_base_command_sent:
-            return
-        state = self.gnss_operation_manager.state
-        if state == GnssOperationState.NTRIP_ACTIVE:
-            self._gnss_transition(GnssOperationState.BASE_AS_ROVER_FLOAT, "Base가 NTRIP 보정 rover로 수렴 중")
-            state = self.gnss_operation_manager.state
-        if sample.fixed and state == GnssOperationState.BASE_AS_ROVER_FLOAT:
-            self._gnss_transition(GnssOperationState.BASE_AS_ROVER_FIXED, "Base rover가 RTK FIXED")
-            state = self.gnss_operation_manager.state
-        if sample.fixed and state == GnssOperationState.BASE_AS_ROVER_FIXED:
-            self._gnss_transition(GnssOperationState.FIXED_COORDINATE_COLLECTING, "고정 좌표 반복 측정 수집")
-        if self.gnss_operation_manager.state != GnssOperationState.FIXED_COORDINATE_COLLECTING:
-            self._set_health_label(
-                self.gnss_base_status_labels["base_fixed"],
-                f"{self.gnss_operation_manager.state.value} | Base fix={sample.fixed}",
-                "warn",
-            )
-            return
-        if sample.height_type != config.fixed_base.height_type:
-            self._set_health_label(
-                self.gnss_base_status_labels["base_fixed"],
-                "Base 좌표 height datum이 활성 GNSS 운용 설정과 다릅니다",
-                "bad",
-            )
-            self._gnss_transition(GnssOperationState.FAULT, "Base coordinate height datum changed during operation")
-            return
-        validation = FixedBaseInitializer(config.fixed_base).validate(
-            tuple(self.gnss_coordinate_samples),
-            acquisition_start_utc="",
-            acquisition_end_utc="",
-            source_caster=config.network.caster_host,
-            source_mountpoint=config.network.mountpoint,
-        )
-        profile = validation.profile
-        if profile is None:
-            self._set_health_label(self.gnss_base_status_labels["base_fixed"], "고정 좌표 프로파일 수집 중", "warn")
-            return
-        self._set_health_label(
-            self.gnss_base_status_labels["base_fixed"],
-            f"FIXED 수집 {profile.collection_duration_s:.1f}s/{config.fixed_base.acquisition_duration_s:.1f}s | "
-            f"scatter H/V={profile.horizontal_scatter_m:.3f}/{profile.vertical_scatter_m:.3f}m",
-            "warn" if not validation.valid else "good",
-        )
-        if hasattr(self, "gnss_base_fixed_scatter_plot"):
-            self.gnss_base_fixed_scatter_plot.add_point(
-                TelemetryHistoryPoint(sample.timestamp_s, "horizontal", profile.horizontal_scatter_m)
-            )
-            self.gnss_base_fixed_scatter_plot.add_point(
-                TelemetryHistoryPoint(sample.timestamp_s, "vertical", profile.vertical_scatter_m)
-            )
-            self.gnss_base_fixed_scatter_plot.add_point(
-                TelemetryHistoryPoint(sample.timestamp_s, "target_h", config.fixed_base.maximum_horizontal_scatter_m)
-            )
-            self.gnss_base_fixed_scatter_plot.add_point(
-                TelemetryHistoryPoint(sample.timestamp_s, "target_v", config.fixed_base.maximum_vertical_scatter_m)
-            )
-        if not validation.valid:
-            return
-        if profile.height_type != HeightType.ELLIPSOID:
-            self._set_health_label(
-                self.gnss_base_status_labels["base_fixed"],
-                "고정 좌표 검증됨이지만 TMODE3에는 WGS84 ellipsoid height가 필요합니다",
-                "bad",
-            )
-            return
-        worker = self.gnss_base_serial_worker
-        if worker is None or not self.gnss_base_serial_connected:
-            self._set_health_label(self.gnss_base_status_labels["base_fixed"], "고정 좌표 검증됨 | Base serial 재연결 필요", "bad")
-            return
-        if not self._gnss_transition(GnssOperationState.FIXED_COORDINATE_VALIDATED, "반복 측정 좌표 검증 통과"):
-            return
-        if not self._gnss_transition(GnssOperationState.BASE_RECONFIGURING, "CFG-TMODE3 fixed 좌표 적용"):
-            return
-        accuracy_m = max(0.01, profile.horizontal_scatter_m, profile.vertical_scatter_m)
-        fixed_frame = ubx_cfg_tmode3_fixed_frame(
-            latitude_deg=profile.latitude_deg,
-            longitude_deg=profile.longitude_deg,
-            ellipsoid_height_m=profile.height_m,
-            fixed_position_accuracy_m=accuracy_m,
-        )
-        expected = parse_ubx_cfg_tmode3(fixed_frame[6:-2])
-        if expected is None:
-            self._gnss_transition(GnssOperationState.FAULT, "CFG-TMODE3 fixed command could not be decoded")
-            return
-        self._reset_gnss_base_rtcm_stats()
-        worker.send_bytes("CFG-TMODE3 fixed coordinate", fixed_frame)
-        self.gnss_fixed_base_pending_profile = profile
-        self.gnss_fixed_base_reconfigure_expected = expected
-        self.gnss_fixed_base_reconfigure_ack = False
-        self.gnss_fixed_base_reconfigure_readback = False
-        self.gnss_fixed_base_reconfigure_rtcm = False
-        self.gnss_fixed_base_reconfigure_deadline_s = time.monotonic() + 10.0
-        self.gnss_fixed_base_command_sent = True
-        self._set_health_label(
-            self.gnss_base_status_labels["base_fixed"],
-            "CFG-TMODE3 fixed 전송됨 | ACK/readback/post-config RTCM 대기",
-            "warn",
-        )
-
-    def _fail_gnss_fixed_base_reconfiguration(self, reason: str) -> None:
-        self.gnss_fixed_base_pending_profile = None
-        self.gnss_fixed_base_reconfigure_expected = None
-        self.gnss_fixed_base_reconfigure_deadline_s = None
-        self._set_health_label(self.gnss_base_status_labels["base_fixed"], f"Fixed Base 재설정 실패: {reason}", "bad")
-        self._gnss_transition(GnssOperationState.FAULT, f"fixed base reconfiguration failed: {reason}")
-
-    def _handle_gnss_base_ubx_message(self, message_class: int, message_id: int, payload: object) -> None:
-        """Advance fixed-base setup only from receiver evidence, not queued writes."""
-
-        if not isinstance(payload, (bytes, bytearray)):
-            return
-        if self.gnss_operation_manager.state != GnssOperationState.BASE_RECONFIGURING:
-            return
-        raw_payload = bytes(payload)
-        ack = parse_ubx_ack(int(message_class), int(message_id), raw_payload)
-        if ack is not None:
-            accepted, target_class, target_id = ack
-            if (target_class, target_id) != (0x06, 0x71):
-                return
-            if not accepted:
-                self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 ACK-NAK")
-                return
-            self.gnss_fixed_base_reconfigure_ack = True
-            worker = self.gnss_base_serial_worker
-            if worker is None or not self.gnss_base_serial_connected:
-                self._fail_gnss_fixed_base_reconfiguration("Base serial disconnected before CFG-TMODE3 readback")
-                return
-            worker.send_bytes("CFG-TMODE3 poll after fixed coordinate ACK", ubx_cfg_tmode3_poll_frame())
-            self._set_health_label(self.gnss_base_status_labels["base_fixed"], "CFG-TMODE3 ACK 수신 | readback 대기", "warn")
-            return
-        if (int(message_class), int(message_id)) != (0x06, 0x71):
-            return
-        expected = self.gnss_fixed_base_reconfigure_expected
-        received = parse_ubx_cfg_tmode3(raw_payload)
-        if expected is None or received is None:
-            self._fail_gnss_fixed_base_reconfiguration("invalid CFG-TMODE3 readback")
-            return
-        keys = ("mode", "ecef_cm", "ecef_hp_0_1mm", "fixed_accuracy_0_1mm")
-        if any(received.get(key) != expected.get(key) for key in keys):
-            self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 readback mismatch")
-            return
-        self.gnss_fixed_base_reconfigure_readback = True
-        self._set_health_label(self.gnss_base_status_labels["base_fixed"], "CFG-TMODE3 readback 확인 | post-config RTCM 대기", "warn")
-        self._maybe_activate_gnss_fixed_base()
-
-    def _maybe_activate_gnss_fixed_base(self) -> None:
-        if self.gnss_operation_manager.state != GnssOperationState.BASE_RECONFIGURING:
-            return
-        if not (
-            self.gnss_fixed_base_reconfigure_ack
-            and self.gnss_fixed_base_reconfigure_readback
-            and self.gnss_fixed_base_reconfigure_rtcm
-        ):
-            return
-        profile = self.gnss_fixed_base_pending_profile
-        if profile is None:
-            self._fail_gnss_fixed_base_reconfiguration("validated profile was lost")
-            return
-        self.gnss_fixed_base_profile = profile
-        self.gnss_fixed_base_pending_profile = None
-        self.gnss_fixed_base_reconfigure_deadline_s = None
-        self._gnss_transition(GnssOperationState.LOCAL_RTCM_ACTIVE, "CFG-TMODE3 ACK/readback와 post-config Base RTCM 확인")
-
-    def _refresh_gnss_operation_readiness(self) -> None:
-        if not self.gnss_operation_gate_active:
-            return
-        config = self.gnss_operation_manager.config
-        if (
-            self.gnss_active_operation_config is not None
-            and self.gnss_operation_manager.state in {GnssOperationState.READY, GnssOperationState.MEASURING}
-            and self._build_gnss_operation_config() != config
-        ):
-            self.gnss_operation_manager.invalidate("GNSS controls changed during active operation")
-            return
-        if self.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING:
-            deadline_s = self.gnss_fixed_base_reconfigure_deadline_s
-            if deadline_s is not None and time.monotonic() > deadline_s:
-                self._fail_gnss_fixed_base_reconfiguration("CFG-TMODE3 ACK/readback/post-config RTCM timeout")
-            return
-        target_sides = self._gnss_base_rtcm_target_sides()
-        now_s = time.monotonic()
-        injection = self.gnss_base_rtcm_stats.get("injection")
-        injection_map = injection if isinstance(injection, dict) else {}
-        mavlink = self.mavlink_pixhawk
-        connections = getattr(mavlink, "connections", None)
-        heartbeat_sides = getattr(mavlink, "_heartbeat_logged", set())
-        routes: dict[str, RoverCorrectionStatus] = {}
-        rover_samples: dict[str, RoverReadinessInput] = {}
-        for side in target_sides:
-            side_stats = injection_map.get(side)
-            if not isinstance(side_stats, dict):
-                side_stats = {}
-            if isinstance(connections, dict):
-                endpoint_live = side in connections and side in heartbeat_sides
-                endpoint_identity = f"mavlink:{side}" if endpoint_live else ""
-            else:
-                # Test adapters may not expose the production subscriber
-                # internals; their presence still represents a route endpoint.
-                endpoint_identity = "" if mavlink is None else f"mavlink:{side}"
-            routes[side] = RoverCorrectionStatus(
-                target=side,
-                enabled=True,
-                endpoint_identity=endpoint_identity,
-                bytes_sent=int(side_stats.get("bytes") or 0),
-                packets_sent=int(side_stats.get("packets") or 0),
-                last_delivery_monotonic_s=side_stats.get("last_delivery_s"),
-                fault_reason=("injection failed" if int(side_stats.get("fail") or 0) > 0 else ""),
-            )
-        for side in ("left", "right", "drone"):
-            gps = self.latest_gps.get(side)
-            if gps is None:
-                self.gnss_rover_fixed_since[side] = None
-                continue
-            if gps.fix_type == 6:
-                if self.gnss_rover_fixed_since.get(side) is None:
-                    self.gnss_rover_fixed_since[side] = now_s
-            else:
-                self.gnss_rover_fixed_since[side] = None
-            rover_samples[side] = RoverReadinessInput(
-                target=side,
-                fix_type=gps.fix_type,
-                gps_sample_monotonic_s=gps.timestamp_s,
-                eph_m=gps.eph_m,
-                epv_m=getattr(gps, "epv_m", None),
-                rtk_fixed_since_monotonic_s=self.gnss_rover_fixed_since.get(side),
-                device_id=str(getattr(gps, "topic", side)),
-            )
-        last_frame_s = self.gnss_base_rtcm_stats.get("last_frame_s")
-        baseline_vector = self.latest_baseline_vector
-        baseline_quality = self.latest_baseline_quality
-        source = self.gnss_operation_manager.source_identity
-        candidate = evaluate_gnss_readiness(
-            config,
-            GnssReadinessInputs(
-                # Evaluate the policy as a candidate; the transition state is
-                # applied below only after every enabled criterion passes.
-                state=GnssOperationState.READY,
-                now_monotonic_s=now_s,
-                correction_received_monotonic_s=last_frame_s,
-                correction_source_id="" if source is None else source.stable_id,
-                routes=routes,
-                rover_samples=rover_samples,
-                left_right_timestamp_delta_ms=(
-                    None if baseline_vector is None else baseline_vector.timestamp_delta_ms
-                ),
-                baseline_std_m=(
-                    None if baseline_quality is None else baseline_quality.baseline_length_std_m
-                ),
-            ),
-        )
-        reasons = candidate.reasons
-        # A disabled readiness gate remains observable in the status snapshot,
-        # but must not leave the state machine permanently below READY.  The
-        # measurement manager records the warning-only, no-contract path.
-        transition_reasons = reasons if config.readiness_gate_enabled else ()
-        state = self.gnss_operation_manager.state
-        # LOCAL_RTCM_ACTIVE is Group B's (STATE_STATUS_GROUP == BASE_FIXED)
-        # terminal state -- reaching it means the Base has finished its own
-        # convergence/fixed-coordinate sequence and rover convergence can
-        # begin.  NTRIP_ACTIVE is Group A (STATE_STATUS_GROUP == NETWORK); it
-        # only implies convergence-eligibility in NETWORK_RTK_DIRECT, where
-        # there is no Group B stage at all (RTCM goes straight to rovers). In
-        # NETWORK_ASSISTED_FIXED_BASE, NTRIP_ACTIVE just means the caster feed
-        # is reaching the Base serial port; the Base must still complete its
-        # own Fixed-coordinate sequence (up to LOCAL_RTCM_ACTIVE) before rover
-        # convergence readiness has any meaning.
-        convergence_eligible = state == GnssOperationState.LOCAL_RTCM_ACTIVE or (
-            state == GnssOperationState.NTRIP_ACTIVE
-            and config.operation_mode == GnssOperationMode.NETWORK_RTK_DIRECT
-        )
-        if convergence_eligible and not transition_reasons:
-            self._gnss_transition(GnssOperationState.ROVERS_CONVERGING, "RTCM rover 주입 시작")
-            state = self.gnss_operation_manager.state
-        if state == GnssOperationState.ROVERS_CONVERGING and not transition_reasons:
-            self._gnss_transition(GnssOperationState.ALIGNMENT_COLLECTING, "양쪽 rover FIXED 수신")
-            state = self.gnss_operation_manager.state
-        if state == GnssOperationState.ALIGNMENT_COLLECTING and not transition_reasons:
-            self._gnss_transition(GnssOperationState.ALIGNMENT_VALID, "GNSS rover 정합 조건 통과")
-            state = self.gnss_operation_manager.state
-        if state == GnssOperationState.ALIGNMENT_VALID and not transition_reasons:
-            self._gnss_transition(GnssOperationState.READY, "GNSS measurement readiness 통과")
-            state = self.gnss_operation_manager.state
-        if state == GnssOperationState.READY and transition_reasons:
-            self._gnss_transition(GnssOperationState.DEGRADED, "; ".join(reasons))
-            state = self.gnss_operation_manager.state
-        if state == GnssOperationState.DEGRADED and not transition_reasons:
-            self._gnss_transition(GnssOperationState.READY, "GNSS 조건 복구")
-            state = self.gnss_operation_manager.state
-        if state == GnssOperationState.MEASURING and transition_reasons:
-            self.gnss_operation_manager.invalidate("GNSS readiness changed: " + ", ".join(reasons))
-            state = self.gnss_operation_manager.state
-        snapshot = GnssReadinessSnapshot(
-            ready=not reasons,
-            state=state,
-            reasons=reasons,
-            warnings=candidate.warnings,
-            mode=config.operation_mode,
-            correction_source_id="" if source is None else source.stable_id,
-            timestamp_s=now_s,
-            reason_messages=candidate.reason_messages,
-        )
-        self.gnss_operation_manager.update_readiness(snapshot)
-        if hasattr(self, "gnss_base_status_labels") and "operation" in self.gnss_base_status_labels and reasons:
-            self._set_health_label(
-                self.gnss_base_status_labels["operation"],
-                f"{state.value} | " + "; ".join(snapshot.reason_messages.get(code, code) for code in reasons[:3]),
-                "warn",
-            )
-
-    def connect_gnss_base_serial(self) -> None:
-        if self.gnss_base_serial_thread is not None:
-            return
-        port = self.gnss_base_serial_port_edit.text().strip()
-        if not port:
-            self._set_health_label(self.gnss_base_status_labels["connection"], "serial port 필요", "bad")
-            return
-        baud = int(self.gnss_base_baud_spin.value())
-        self._set_health_label(self.gnss_base_status_labels["connection"], f"connecting {port} @ {baud}", "warn")
-        self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "raw bytes 대기 중", "idle")
-        self._reset_gnss_base_rtcm_stats()
-        self.gnss_base_connect_button.setEnabled(False)
-        self.gnss_base_disconnect_button.setEnabled(True)
-        thread = QtCore.QThread(self)
-        height_value = self.gnss_fixed_height_combo.currentData()
-        try:
-            height_type = HeightType(height_value)
-        except (TypeError, ValueError):
-            height_type = HeightType.ELLIPSOID
-        worker = GnssBaseSerialWorker(port=port, baud=baud, height_type=height_type)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.connected.connect(self._handle_gnss_base_serial_connected)
-        worker.stats_changed.connect(self._handle_gnss_base_serial_stats)
-        worker.survey_in_changed.connect(self._handle_gnss_base_survey_in)
-        worker.satellite_count_changed.connect(self._handle_gnss_base_satellite_count)
-        worker.satellite_quality_changed.connect(self._handle_gnss_base_satellite_quality)
-        worker.position_changed.connect(self._handle_gnss_base_position)
-        worker.ubx_message_received.connect(self._handle_gnss_base_ubx_message)
-        worker.rtcm_frame_received.connect(self._handle_gnss_base_rtcm_frame)
-        worker.command_sent.connect(self._handle_gnss_base_command_sent)
-        worker.failed.connect(self._handle_gnss_base_serial_failed)
-        worker.disconnected.connect(self._handle_gnss_base_serial_disconnected)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._clear_gnss_base_serial_worker(thread))
-        self.gnss_base_serial_thread = thread
-        self.gnss_base_serial_worker = worker
-        thread.start()
-
-    def disconnect_gnss_base_serial(self) -> None:
-        worker = self.gnss_base_serial_worker
-        if worker is not None:
-            worker.request_stop()
-        thread = self.gnss_base_serial_thread
-        if thread is not None and not thread.wait(1500):
-            thread.quit()
-            thread.wait(500)
-
-    def start_gnss_base_survey_in(self) -> None:
-        worker = self.gnss_base_serial_worker
-        if worker is None:
-            self._set_health_label(self.gnss_base_status_labels["survey_in"], "serial 미연결", "bad")
-            return
-        config = self._build_gnss_operation_config()
-        if config.operation_mode != GnssOperationMode.LOCAL_SURVEY_IN:
-            self._set_health_label(
-                self.gnss_base_status_labels["survey_in"],
-                "현재 모드에서는 현장 Survey-in을 시작할 수 없습니다",
-                "warn",
-            )
-            return
-        self._gnss_configure_manager(config)
-        self.gnss_operation_manager.set_source_identity(self._gnss_source_identity(config))
-        self.gnss_active_operation_config = config
-        self.gnss_operation_gate_active = True
-        self._set_gnss_operation_controls_locked(True)
-        self._gnss_transition(GnssOperationState.INITIALIZING, "현장 Base Survey-in 초기화")
-        self._gnss_transition(GnssOperationState.BASE_SURVEYING, "현장 Base Survey-in 진행")
-        frame = ubx_cfg_tmode3_survey_in_frame(
-            min_duration_s=self.gnss_base_survey_duration_spin.value(),
-            accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
-        )
-        self.gnss_base_survey_samples.clear()
-        worker.send_bytes("CFG-TMODE3 survey-in start", frame)
-        worker.send_bytes("NAV-SVIN poll after survey-in start", ubx_nav_svin_poll_frame())
-        self._set_health_label(self.gnss_base_status_labels["survey_in"], "survey-in 시작 명령 전송 대기", "warn")
-
-    def stop_gnss_base_survey_in(self) -> None:
-        worker = self.gnss_base_serial_worker
-        if worker is None:
-            self._set_health_label(self.gnss_base_status_labels["survey_in"], "serial 미연결", "bad")
-            return
-        worker.send_bytes("CFG-TMODE3 disabled", ubx_cfg_tmode3_disabled_frame())
-        worker.send_bytes("NAV-SVIN poll after survey-in stop", ubx_nav_svin_poll_frame())
-        self.gnss_operation_gate_active = False
-        self.gnss_operation_manager.stop()
-        self.gnss_active_operation_config = None
-        self._set_gnss_operation_controls_locked(False)
-        self._set_health_label(self.gnss_base_status_labels["survey_in"], "survey-in 중지 명령 전송 대기", "warn")
-        self._handle_gnss_operation_mode_changed()
-
-    def discover_gnss_base_serial_ports(self) -> None:
-        if self.gnss_base_detect_thread is not None:
-            return
-        self.gnss_base_discover_button.setEnabled(False)
-        self.gnss_base_apply_candidate_button.setEnabled(False)
-        self._set_health_label(self.gnss_base_status_labels["connection"], "base port 탐색 중", "warn")
-        thread = QtCore.QThread(self)
-        worker = GnssBaseSerialDetectWorker(baud=self.gnss_base_baud_spin.value())
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.detected.connect(self._handle_gnss_base_candidates_detected)
-        worker.failed.connect(self._handle_gnss_base_candidate_detect_failed)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(lambda: self._clear_gnss_base_detect_worker(thread))
-        self.gnss_base_detect_thread = thread
-        self.gnss_base_detect_worker = worker
-        thread.start()
-
-    def _handle_gnss_base_candidates_detected(self, rows: object) -> None:
-        candidate_rows = [dict(row) for row in rows] if isinstance(rows, list) else []
-        self._set_gnss_base_candidate_rows(candidate_rows)
-        count = len(candidate_rows)
-        ubx_count = sum(1 for row in candidate_rows if row.get("ubx"))
-        level = "good" if ubx_count else "warn" if count else "bad"
-        self._set_health_label(
-            self.gnss_base_status_labels["connection"],
-            f"탐색 완료: {count} candidates, UBX {ubx_count}",
-            level,
-        )
-
-    def _handle_gnss_base_candidate_detect_failed(self, message: str) -> None:
-        self._set_health_label(self.gnss_base_status_labels["connection"], f"탐색 실패: {message}", "bad")
-
-    def _clear_gnss_base_detect_worker(self, thread: QtCore.QThread) -> None:
-        if self.gnss_base_detect_thread is thread:
-            self.gnss_base_detect_thread = None
-            self.gnss_base_detect_worker = None
-            if hasattr(self, "gnss_base_discover_button"):
-                self.gnss_base_discover_button.setEnabled(True)
-            self._refresh_gnss_base_candidate_actions()
-        thread.deleteLater()
-
-    def _set_gnss_base_candidate_rows(self, rows: list[dict[str, object]]) -> None:
-        self._gnss_base_candidate_rows = rows
-        table = self.gnss_base_candidate_table
-        table.setRowCount(len(rows))
-        keys = ("port", "target", "baud", "status", "messages")
-        for row_index, row in enumerate(rows):
-            for column, key in enumerate(keys):
-                item = QtWidgets.QTableWidgetItem(str(row.get(key, "")))
-                table.setItem(row_index, column, item)
-        table.resizeRowsToContents()
-        self._refresh_gnss_base_candidate_actions()
-
-    def _refresh_gnss_base_candidate_actions(self) -> None:
-        row = self.gnss_base_candidate_table.currentRow() if hasattr(self, "gnss_base_candidate_table") else -1
-        self.gnss_base_apply_candidate_button.setEnabled(0 <= row < len(self._gnss_base_candidate_rows))
-
-    def apply_selected_gnss_base_candidate(self) -> None:
-        row = self.gnss_base_candidate_table.currentRow()
-        if row < 0 or row >= len(self._gnss_base_candidate_rows):
-            self._set_health_label(self.gnss_base_status_labels["connection"], "포트 후보를 먼저 선택하세요", "warn")
-            return
-        entry = self._gnss_base_candidate_rows[row]
-        port = str(entry.get("port", "")).strip()
-        if not port:
-            self._set_health_label(self.gnss_base_status_labels["connection"], "선택 후보 port가 비어 있습니다", "bad")
-            return
-        self.gnss_base_serial_port_edit.setText(port)
-        try:
-            baud = int(entry.get("baud", self.gnss_base_baud_spin.value()))
-        except (TypeError, ValueError):
-            baud = self.gnss_base_baud_spin.value()
-        self.gnss_base_baud_spin.setValue(baud)
-        self._set_health_label(self.gnss_base_status_labels["connection"], f"선택 포트 적용: {port}", "good")
-
-    def _handle_gnss_base_serial_connected(self, port: str, baud: int) -> None:
-        self.gnss_base_serial_connected = True
-        self._set_health_label(self.gnss_base_status_labels["connection"], f"connected {port} @ {baud}", "good")
-        self._set_health_label(self.gnss_base_status_labels["survey_in"], "UBX NAV-SVIN 대기 중", "idle")
-        self._set_health_label(self.gnss_base_status_labels["base_satellites"], "UBX NAV-PVT/NAV-SAT 대기 중", "idle")
-        self._set_gnss_base_quality_waiting("NAV-SAT 대기 중")
-        self._handle_gnss_operation_mode_changed()
-
-    def _handle_gnss_base_serial_stats(self, total_bytes: int, rate_bps: float, age_s: float) -> None:
-        age_text = "no data" if age_s < 0.0 else f"age={age_s:.1f}s"
-        level = "good" if rate_bps > 0.0 and 0.0 <= age_s < 2.0 else "warn" if rate_bps > 0.0 else "idle"
-        self._set_health_label(
-            self.gnss_base_status_labels["rtcm_rx"],
-            f"raw={total_bytes} bytes | {rate_bps:.1f} B/s | {age_text}",
-            level,
-        )
-
-    def _handle_gnss_base_serial_failed(self, message: str) -> None:
-        self.gnss_base_serial_connected = False
-        self._set_health_label(self.gnss_base_status_labels["connection"], f"failed: {message}", "bad")
-        self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
-        self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
-        self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "없음", "idle")
-        self._set_gnss_base_quality_waiting("미연결")
-        self._reset_gnss_base_rtcm_stats()
-        self.gnss_base_survey_start_button.setEnabled(False)
-        self.gnss_base_survey_stop_button.setEnabled(False)
-        if self.gnss_operation_gate_active:
-            self._gnss_transition(GnssOperationState.DEGRADED, f"Base serial failure: {message}")
-
-    def _handle_gnss_base_serial_disconnected(self, message: str) -> None:
-        self.gnss_base_serial_connected = False
-        self._set_health_label(self.gnss_base_status_labels["connection"], message, "idle")
-        self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
-        self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
-        self._set_gnss_base_quality_waiting("미연결")
-        self._reset_gnss_base_rtcm_stats()
-        self.gnss_base_survey_start_button.setEnabled(False)
-        self.gnss_base_survey_stop_button.setEnabled(False)
-        if self.gnss_operation_gate_active:
-            self._gnss_transition(GnssOperationState.DEGRADED, f"Base serial disconnected: {message}")
-
-    def _handle_gnss_base_satellite_count(self, count: int, source: str) -> None:
-        level = "good" if count >= 12 else "warn" if count >= 6 else "bad"
-        self._set_health_label(
-            self.gnss_base_status_labels["base_satellites"],
-            f"{count} satellites | {source}",
-            level,
-        )
-
-    def _set_gnss_base_quality_waiting(self, text: str) -> None:
-        if not hasattr(self, "gnss_base_quality_labels"):
-            return
-        waiting_text = {
-            "satellites": text,
-            "signal": "C/N0 대기 중" if text != "미연결" else text,
-            "elevation": "elevation 대기 중" if text != "미연결" else text,
-            "constellations": "constellation 대기 중" if text != "미연결" else text,
-        }
-        for key, label in self.gnss_base_quality_labels.items():
-            self._set_health_label(label, waiting_text.get(key, text), "idle")
-
-    def _reset_gnss_base_rtcm_stats(self) -> None:
-        self.gnss_base_rtcm_stats = self._new_gnss_base_rtcm_stats()
-        self._refresh_gnss_base_rtcm_stats()
-
-    def _format_rtcm_message_types(self, message_types: dict[int, int]) -> str:
-        if not message_types:
-            return "type 대기 중"
-        ordered = sorted(message_types.items(), key=lambda item: (-item[1], item[0]))[:8]
-        return " | ".join(f"{message_type}:{count}" for message_type, count in ordered)
-
-    def _refresh_gnss_base_rtcm_stats(self) -> None:
-        if not hasattr(self, "gnss_base_status_labels"):
-            return
-        labels = self.gnss_base_status_labels
-        if not all(key in labels for key in ("rtcm_receive", "rtcm_messages", "rtcm_injection_stats", "rtcm_bandwidth")):
-            return
-        stats = self.gnss_base_rtcm_stats
-        now_s = time.monotonic()
-        frames = int(stats.get("frames") or 0)
-        total_bytes = int(stats.get("bytes") or 0)
-        start_s = float(stats.get("start_s") or now_s)
-        elapsed_s = max(1e-6, now_s - start_s)
-        fps = frames / elapsed_s
-        byte_rate = total_bytes / elapsed_s
-        last_frame_s = stats.get("last_frame_s")
-        age_s = None
-        if last_frame_s is not None:
-            try:
-                age_s = max(0.0, now_s - float(last_frame_s))
-            except (TypeError, ValueError):
-                age_s = None
-        if frames <= 0:
-            receive_text = "RTCM 대기 중"
-            receive_level = "idle"
-        else:
-            age_text = "--" if age_s is None else f"{age_s:.1f}s"
-            receive_text = f"frames={frames} | {fps:.2f} fps | {byte_rate / 1000.0:.2f} kB/s | age={age_text}"
-            receive_level = "good" if age_s is not None and age_s <= 2.0 else "warn" if age_s is not None and age_s <= 5.0 else "bad"
-        message_types = stats.get("message_types")
-        message_type_counts = message_types if isinstance(message_types, dict) else {}
-        base_position_present = any(int(key) in {1005, 1006} for key in message_type_counts)
-        msm_present = any(1070 <= int(key) <= 1129 for key in message_type_counts)
-        message_level = "good" if base_position_present and msm_present else "warn" if frames else "idle"
-        injection = stats.get("injection") if isinstance(stats.get("injection"), dict) else {}
-        injection_parts: list[str] = []
-        total_packets = 0
-        total_fail = 0
-        for side, label in (("left", "L"), ("right", "R")):
-            side_stats = injection.get(side) if isinstance(injection, dict) else None
-            if not isinstance(side_stats, dict):
-                side_stats = {}
-            side_frames = int(side_stats.get("frames") or 0)
-            side_bytes = int(side_stats.get("bytes") or 0)
-            side_packets = int(side_stats.get("packets") or 0)
-            side_fail = int(side_stats.get("fail") or 0)
-            total_packets += side_packets
-            total_fail += side_fail
-            injection_parts.append(f"{label} frames={side_frames} bytes={side_bytes} fail={side_fail}")
-        target_sides = self._gnss_base_rtcm_target_sides() if hasattr(self, "gnss_base_rtcm_target_combo") else ()
-        if not target_sides:
-            injection_text = "비활성"
-            injection_level = "idle"
-        else:
-            injection_text = " | ".join(injection_parts)
-            injection_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
-        avg_frame = (total_bytes / frames) if frames else 0.0
-        bandwidth_text = (
-            "packet 대기 중"
-            if frames <= 0
-            else f"MAVLink packets={total_packets} | avg frame={avg_frame:.0f}B | max frame={int(stats.get('max_frame_bytes') or 0)}B"
-        )
-        bandwidth_level = "good" if frames and total_fail == 0 else "warn" if frames else "idle"
-        self._set_health_label(labels["rtcm_receive"], receive_text, receive_level)
-        self._set_health_label(labels["rtcm_messages"], self._format_rtcm_message_types(message_type_counts), message_level)
-        self._set_health_label(labels["rtcm_injection_stats"], injection_text, injection_level)
-        self._set_health_label(labels["rtcm_bandwidth"], bandwidth_text, bandwidth_level)
-
-    def _handle_gnss_base_satellite_quality(self, quality: object) -> None:
-        if not isinstance(quality, dict) or not hasattr(self, "gnss_base_quality_labels"):
-            return
-        try:
-            tracked = int(quality.get("tracked") or 0)
-            used = int(quality.get("used") or 0)
-            low_cno = int(quality.get("low_cno") or 0)
-            low_elevation = int(quality.get("low_elevation") or 0)
-        except (TypeError, ValueError):
-            return
-        avg_cno = quality.get("avg_cno_dbhz")
-        try:
-            avg_cno_value = float(avg_cno) if avg_cno is not None else None
-        except (TypeError, ValueError):
-            avg_cno_value = None
-        constellations = quality.get("constellations")
-        constellation_items: list[tuple[str, int]] = []
-        if isinstance(constellations, dict):
-            for name, count in constellations.items():
-                try:
-                    constellation_items.append((str(name), int(count)))
-                except (TypeError, ValueError):
-                    continue
-        constellation_text = " / ".join(
-            f"{name} {count}" for name, count in sorted(constellation_items)
-        ) or "--"
-        satellite_level = "good" if used >= 12 else "warn" if used >= 6 or tracked >= 12 else "bad"
-        signal_level = (
-            "idle"
-            if avg_cno_value is None
-            else "good"
-            if avg_cno_value >= 35.0 and low_cno == 0
-            else "warn"
-            if avg_cno_value >= 30.0
-            else "bad"
-        )
-        elevation_level = "good" if low_elevation == 0 else "warn" if low_elevation <= max(1, tracked // 4) else "bad"
-        constellation_level = "good" if len(constellation_items) >= 3 else "warn" if len(constellation_items) >= 2 else "bad"
-        avg_cno_text = "--" if avg_cno_value is None else f"{avg_cno_value:.1f} dBHz"
-        self._set_health_label(
-            self.gnss_base_quality_labels["satellites"],
-            f"used={used} tracked={tracked}",
-            satellite_level,
-        )
-        self._set_health_label(
-            self.gnss_base_quality_labels["signal"],
-            f"avg C/N0={avg_cno_text} | low<{GNSS_BASE_LOW_CNO_DBHZ}={low_cno}",
-            signal_level,
-        )
-        self._set_health_label(
-            self.gnss_base_quality_labels["elevation"],
-            f"low<{GNSS_BASE_LOW_ELEVATION_DEG}deg={low_elevation}",
-            elevation_level,
-        )
-        self._set_health_label(
-            self.gnss_base_quality_labels["constellations"],
-            constellation_text,
-            constellation_level,
-        )
-
-    def _gnss_base_rtcm_target_sides(self) -> tuple[str, ...]:
-        config = self.gnss_active_operation_config
-        if config is not None:
-            return tuple(
-                side
-                for side, enabled in (("left", config.routing.left_enabled), ("right", config.routing.right_enabled))
-                if enabled
-            )
-        target = str(self.gnss_base_rtcm_target_combo.currentData() or "disabled")
-        if target == "both":
-            return ("left", "right")
-        if target in {"left", "right"}:
-            return (target,)
-        return ()
-
-    def _record_gnss_base_rtcm_frame(self, payload: bytes) -> None:
-        stats = self.gnss_base_rtcm_stats
-        stats["frames"] = int(stats.get("frames") or 0) + 1
-        stats["bytes"] = int(stats.get("bytes") or 0) + len(payload)
-        stats["max_frame_bytes"] = max(int(stats.get("max_frame_bytes") or 0), len(payload))
-        stats["last_frame_s"] = time.monotonic()
-        message_type = parse_rtcm3_message_type(payload)
-        if message_type is not None:
-            message_types = stats.get("message_types")
-            if not isinstance(message_types, dict):
-                message_types = {}
-                stats["message_types"] = message_types
-            message_types[message_type] = int(message_types.get(message_type, 0)) + 1
-
-    def _record_gnss_base_rtcm_injection(
-        self,
-        side: str,
-        *,
-        payload_bytes: int,
-        packet_count: int = 0,
-        failed: bool = False,
-    ) -> None:
-        injection = self.gnss_base_rtcm_stats.get("injection")
-        if not isinstance(injection, dict):
-            return
-        side_stats = injection.get(side)
-        if not isinstance(side_stats, dict):
-            return
-        if failed:
-            side_stats["fail"] = int(side_stats.get("fail") or 0) + 1
-            return
-        side_stats["frames"] = int(side_stats.get("frames") or 0) + 1
-        side_stats["bytes"] = int(side_stats.get("bytes") or 0) + int(payload_bytes)
-        side_stats["packets"] = int(side_stats.get("packets") or 0) + int(packet_count)
-        side_stats["last_delivery_s"] = time.monotonic()
-
-    def _handle_gnss_base_rtcm_frame(self, frame: object) -> None:
-        if not isinstance(frame, (bytes, bytearray)):
-            return
-        payload = bytes(frame)
-        self._record_gnss_base_rtcm_frame(payload)
-        if (
-            self.gnss_operation_manager.state == GnssOperationState.BASE_RECONFIGURING
-            and parse_rtcm3_message_type(payload) in {1005, 1006}
-        ):
-            self.gnss_fixed_base_reconfigure_rtcm = True
-        target_sides = self._gnss_base_rtcm_target_sides()
-        if not target_sides:
-            self._set_health_label(self.gnss_base_status_labels["rtcm_injection"], "비활성", "idle")
-            self._refresh_gnss_base_rtcm_stats()
-            self._refresh_gnss_operation_readiness()
-            return
-        if self.mavlink_pixhawk is None:
-            for side in target_sides:
-                self._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
-            self._set_health_label(
-                self.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM {len(payload)} bytes 수신 | MAVLink rover 미연결",
-                "warn",
-            )
-            self._refresh_gnss_base_rtcm_stats()
-            self._refresh_gnss_operation_readiness()
-            return
-        worker = self._ensure_pixhawk_rtcm_worker()
-        if worker is None:
-            for side in target_sides:
-                self._record_gnss_base_rtcm_injection(side, payload_bytes=len(payload), failed=True)
-            self._set_health_label(
-                self.gnss_base_status_labels["rtcm_injection"],
-                f"RTCM 주입 대기 실패: MAVLink worker 없음 ({len(payload)} bytes)",
-                "bad",
-            )
-            self._refresh_gnss_base_rtcm_stats()
-            self._refresh_gnss_operation_readiness()
-            return
-        worker.request.emit(tuple(target_sides), payload)
-        self._set_health_label(
-            self.gnss_base_status_labels["rtcm_injection"],
-            f"RTCM {len(payload)} bytes 대기 중 -> "
-            f"{', '.join(self._px4_mag_camera_label(side) for side in target_sides)}",
-            "warn",
-        )
-
-    def _ensure_pixhawk_rtcm_worker(self) -> PixhawkRtcmInjectionWorker | None:
-        subscriber = self.mavlink_pixhawk
-        if subscriber is None:
-            return None
-        if self.pixhawk_rtcm_thread is not None and self.pixhawk_rtcm_worker is not None:
-            return self.pixhawk_rtcm_worker
-        thread = QtCore.QThread(self)
-        worker = PixhawkRtcmInjectionWorker(subscriber)
-        worker.moveToThread(thread)
-        worker.request.connect(worker.enqueue, QtCore.Qt.QueuedConnection)
-        worker.injected.connect(self._apply_pixhawk_rtcm_result)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_pixhawk_rtcm_worker)
-        self.pixhawk_rtcm_thread = thread
-        self.pixhawk_rtcm_worker = worker
-        thread.start()
-        return worker
-
-    def _apply_pixhawk_rtcm_result(self, result: object) -> None:
-        data = dict(result or {})
-        payload_bytes = int(data.get("payload_bytes") or 0)
-        sent = tuple(data.get("sent") or ())
-        failed = tuple(data.get("failed") or ())
-        dropped = int(data.get("dropped") or 0)
-        sent_labels: list[str] = []
-        failed_labels: list[str] = []
-        for side, packet_count in sent:
-            side = str(side)
-            self._record_gnss_base_rtcm_injection(
-                side,
-                payload_bytes=payload_bytes,
-                packet_count=int(packet_count or 0),
-            )
-            sent_labels.append(self._px4_mag_camera_label(side))
-        for side, error in failed:
-            side = str(side)
-            self._record_gnss_base_rtcm_injection(side, payload_bytes=payload_bytes, failed=True)
-            failed_labels.append(f"{self._px4_mag_camera_label(side)}:{error}")
-        if dropped:
-            self._log(f"[GNSS] RTCM 오래된 대기 프레임 {dropped}개를 폐기했습니다.")
-        if sent_labels and not failed_labels:
-            level = "good"
-            text = f"RTCM {payload_bytes} bytes -> {', '.join(sent_labels)}"
-        elif sent_labels:
-            level = "warn"
-            text = f"RTCM 일부 주입: {', '.join(sent_labels)} | 실패 {', '.join(failed_labels)}"
-        elif failed_labels:
-            level = "bad"
-            text = f"RTCM 주입 실패: {', '.join(failed_labels)}"
-        else:
-            return
-        self._set_health_label(self.gnss_base_status_labels["rtcm_injection"], text, level)
-        self._refresh_gnss_base_rtcm_stats()
-        self._refresh_gnss_operation_readiness()
-
-    def _clear_pixhawk_rtcm_worker(self) -> None:
-        self.pixhawk_rtcm_thread = None
-        self.pixhawk_rtcm_worker = None
-        self._refresh_gnss_base_rtcm_stats()
-        self._maybe_activate_gnss_fixed_base()
-        self._refresh_gnss_operation_readiness()
-
-    def _handle_gnss_base_command_sent(self, label: str, byte_count: int) -> None:
-        self._set_health_label(
-            self.gnss_base_status_labels["connection"],
-            f"connected | sent {label} ({byte_count} bytes)",
-            "good",
-        )
-        if label == "CFG-TMODE3 survey-in start":
-            self._set_health_label(
-                self.gnss_base_status_labels["survey_in"],
-                "survey-in 시작 명령 전송 완료 | NAV-SVIN 상태 수신 대기",
-                "warn",
-            )
-        elif label == "CFG-TMODE3 disabled":
-            self._set_health_label(
-                self.gnss_base_status_labels["survey_in"],
-                "survey-in 중지 명령 전송 완료 | NAV-SVIN 상태 수신 대기",
-                "warn",
-            )
-
-    def _handle_gnss_base_survey_in(self, state: object) -> None:
-        if not isinstance(state, dict):
-            return
-        active = bool(state.get("active"))
-        valid = bool(state.get("valid"))
-        duration_s = int(state.get("duration_s") or 0)
-        accuracy_m = float(state.get("mean_accuracy_m") or 0.0)
-        observations = int(state.get("observations") or 0)
-        mean_x_m = float(state.get("mean_x_m") or 0.0)
-        mean_y_m = float(state.get("mean_y_m") or 0.0)
-        mean_z_m = float(state.get("mean_z_m") or 0.0)
-        status = "valid" if valid else "active" if active else "not running"
-        level = "good" if valid else "warn" if active else "idle"
-        text = (
-            f"{status} | duration={duration_s}s | acc={accuracy_m:.4f}m | obs={observations} | "
-            f"ECEF={mean_x_m:.3f}/{mean_y_m:.3f}/{mean_z_m:.3f}m"
-        )
-        self._set_health_label(self.gnss_base_status_labels["survey_in"], text, level)
-        self._update_gnss_base_survey_visualization(
-            active=active,
-            valid=valid,
-            duration_s=duration_s,
-            accuracy_m=accuracy_m,
-            observations=observations,
-        )
-        if valid and self._gnss_active_operation_config().operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
-            if self.gnss_operation_manager.state == GnssOperationState.BASE_SURVEYING:
-                self._gnss_transition(GnssOperationState.LOCAL_RTCM_ACTIVE, "현장 Survey-in valid; RTCM rover 라우팅")
-            self._refresh_gnss_operation_readiness()
-
-    def _update_gnss_base_survey_visualization(
-        self,
-        *,
-        active: bool,
-        valid: bool,
-        duration_s: int,
-        accuracy_m: float,
-        observations: int,
-    ) -> None:
-        if not hasattr(self, "gnss_base_survey_progress_bar"):
-            return
-        target_duration_s = max(1, int(self.gnss_base_survey_duration_spin.value()))
-        target_accuracy_m = max(0.001, float(self.gnss_base_survey_accuracy_spin.value()))
-        progress = min(100, int(round(duration_s * 100.0 / target_duration_s)))
-        self.gnss_base_survey_progress_bar.setValue(progress)
-        state_text = "valid" if valid else "active" if active else "not running"
-        accuracy_delta_m = accuracy_m - target_accuracy_m
-        time_text = "time ok" if progress >= 100 else f"time {progress}%"
-        accuracy_text = "accuracy ok" if valid or accuracy_delta_m <= 0.0 else "accuracy pending"
-        if not active and not valid:
-            accuracy_text = "accuracy --"
-        self.gnss_base_survey_progress_bar.setFormat(f"{state_text} | {time_text} | {accuracy_text}")
-        level = "good" if valid or accuracy_delta_m <= 0.0 else "warn" if active else "idle"
-        self._set_health_label(
-            self.gnss_base_survey_accuracy_label,
-            f"target={target_accuracy_m:.4f}m | current={accuracy_m:.4f}m | Δ={accuracy_delta_m:+.4f}m | obs={observations}",
-            level,
-        )
-        now_s = time.monotonic()
-        self.gnss_base_survey_samples.append((now_s, duration_s, accuracy_m, active, valid))
-        self.gnss_base_survey_accuracy_plot.add_point(TelemetryHistoryPoint(now_s, "accuracy", accuracy_m))
-        self.gnss_base_survey_accuracy_plot.add_point(TelemetryHistoryPoint(now_s, "target", target_accuracy_m))
-        self.gnss_base_survey_observation_plot.add_point(TelemetryHistoryPoint(now_s, "observations", float(observations)))
-        self._update_gnss_base_survey_convergence(
-            active=active,
-            valid=valid,
-            duration_s=duration_s,
-            accuracy_m=accuracy_m,
-            target_accuracy_m=target_accuracy_m,
-            target_duration_s=target_duration_s,
-            now_s=now_s,
-        )
-
-    def _format_eta_seconds(self, seconds: float | None) -> str:
-        if seconds is None or not isfinite(float(seconds)):
-            return "--"
-        seconds = max(0.0, float(seconds))
-        if seconds < 60.0:
-            return f"~{seconds:.0f}s"
-        return f"~{seconds / 60.0:.1f}m"
-
-    def _update_gnss_base_survey_convergence(
-        self,
-        *,
-        active: bool,
-        valid: bool,
-        duration_s: int,
-        accuracy_m: float,
-        target_accuracy_m: float,
-        target_duration_s: int,
-        now_s: float,
-    ) -> None:
-        if not hasattr(self, "gnss_base_survey_convergence_label"):
-            return
-        if valid:
-            self._set_health_label(
-                self.gnss_base_survey_convergence_label,
-                "수렴: complete | ETA: done | 최근 개선: --",
-                "good",
-            )
-            return
-        if not active:
-            self._set_health_label(
-                self.gnss_base_survey_convergence_label,
-                "수렴: not running | ETA: -- | 최근 개선: --",
-                "idle",
-            )
-            return
-
-        trend_samples = [
-            sample
-            for sample in self.gnss_base_survey_samples
-            if 0.0 <= now_s - sample[0] <= GNSS_BASE_SURVEY_TREND_WINDOW_S
-        ]
-        if len(trend_samples) < 2:
-            self._set_health_label(
-                self.gnss_base_survey_convergence_label,
-                "수렴: collecting trend | ETA: -- | 최근 개선: --",
-                "warn",
-            )
-            return
-
-        first = trend_samples[0]
-        elapsed_s = max(0.0, now_s - first[0])
-        improvement_m = max(0.0, float(first[2]) - float(accuracy_m))
-        time_remaining_s = max(0.0, float(target_duration_s) - float(duration_s))
-        accuracy_remaining_m = max(0.0, float(accuracy_m) - float(target_accuracy_m))
-        eta_s: float | None
-        if accuracy_remaining_m <= 0.0:
-            eta_s = time_remaining_s
-        elif elapsed_s > 0.0 and improvement_m > 0.0:
-            eta_s = max(time_remaining_s, accuracy_remaining_m / (improvement_m / elapsed_s))
-        else:
-            eta_s = None
-        if elapsed_s >= GNSS_BASE_SURVEY_TREND_WINDOW_S and improvement_m < GNSS_BASE_SURVEY_STAGNANT_DELTA_M:
-            convergence = f"stagnant {elapsed_s:.0f}s"
-            level = "bad"
-        elif improvement_m >= GNSS_BASE_SURVEY_IMPROVING_DELTA_M:
-            convergence = "improving"
-            level = "warn"
-        elif improvement_m > 0.0:
-            convergence = "slow"
-            level = "warn"
-        else:
-            convergence = "waiting for improvement"
-            level = "warn"
-        self._set_health_label(
-            self.gnss_base_survey_convergence_label,
-            f"수렴: {convergence} | ETA: {self._format_eta_seconds(eta_s)} | 최근 개선: -{improvement_m:.4f}m/{elapsed_s:.0f}s",
-            level,
-        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _clear_gnss_base_serial_worker(self, thread: QtCore.QThread) -> None:
         if self.gnss_base_serial_thread is thread:
@@ -10208,7 +5899,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.baseline_sampling_active = True
         self.baseline_sampling_started_s = time.monotonic()
         self.baseline_samples.clear()
+        self.physical_alignment_samples.clear()
         self.latest_baseline_quality = None
+        self.latest_physical_alignment_quality = None
         if hasattr(self, "baseline_length_plot"):
             self.baseline_length_plot.points.clear()
             self.baseline_length_plot.update()
@@ -10226,7 +5919,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if current is None:
             return
         self.baseline_samples.append(current)
-        vector, _left, _right = current
+        vector, left, right = current
+        left_attitude = self.latest_extrinsics.get("left")
+        right_attitude = self.latest_extrinsics.get("right")
+        if left_attitude is not None and right_attitude is not None:
+            try:
+                self.physical_alignment_samples.append(
+                    make_physical_alignment_sample(
+                        timestamp_s=time.monotonic(),
+                        baseline_ned_m=vector.ned_m,
+                        p1_body_to_world_q=left_attitude.q,
+                        p2_body_to_world_q=right_attitude.q,
+                        left_fix_type=left.fix_type,
+                        right_fix_type=right.fix_type,
+                    )
+                )
+            except (TypeError, ValueError):
+                # Keep raw baseline quality usable even when one attitude
+                # sample is malformed or temporarily unavailable.
+                pass
         if hasattr(self, "baseline_length_plot"):
             self.baseline_length_plot.add_point(TelemetryHistoryPoint(time.monotonic(), "length", vector.length_m))
         duration = self.baseline_sample_duration_spin.value() if hasattr(self, "baseline_sample_duration_spin") else 10.0
@@ -10241,6 +5952,116 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         quality = evaluate_baseline_quality(self.baseline_samples, duration_s=duration)
         self.latest_baseline_quality = quality
         self._render_baseline_quality(quality)
+        minimum_fix_type = 3
+        minimum_fixed_ratio = 0.0
+        try:
+            readiness = self._build_gnss_operation_config().readiness
+            minimum_fix_type = readiness.minimum_fix_type
+        except (AttributeError, TypeError, ValueError):
+            pass
+        physical_quality = evaluate_physical_alignment(
+            self.physical_alignment_samples,
+            target_baseline_frd_m=self._physical_alignment_reference_baseline_frd_m(),
+            minimum_fix_type=minimum_fix_type,
+            minimum_fixed_ratio=minimum_fixed_ratio,
+        )
+        self.latest_physical_alignment_quality = physical_quality
+        if physical_quality is not None:
+            self.alignment_iteration_number += 1
+            self.alignment_iteration_history.append(
+                {
+                    "iteration": self.alignment_iteration_number,
+                    "timestamp_s": time.monotonic(),
+                    **physical_quality.to_mapping(),
+                }
+            )
+            self.alignment_iteration_history = self.alignment_iteration_history[-20:]
+
+    def _physical_alignment_reference_baseline_frd_m(self) -> tuple[float, float, float] | None:
+        """Convert a loaded ENU profile reference into P1 body FRD explicitly."""
+
+        profile = getattr(self, "loaded_alignment_profile", None)
+        if not isinstance(profile, dict):
+            return None
+        alignment = profile.get("alignment_profile")
+        if not isinstance(alignment, dict):
+            return None
+        baseline = alignment.get("baseline")
+        attitude = alignment.get("left_attitude")
+        if not isinstance(baseline, dict) or not isinstance(attitude, dict):
+            return None
+        if str(baseline.get("frame", "")).upper() != "ENU":
+            return None
+        vector = baseline.get("vector_m")
+        quaternion = attitude.get("quaternion_wxyz")
+        if not isinstance(vector, (tuple, list)) or len(vector) != 3:
+            return None
+        if not isinstance(quaternion, (tuple, list)) or len(quaternion) != 4:
+            return None
+        try:
+            # The persisted alignment profile is explicitly ENU.  Convert it
+            # to local NED before applying the P1 body-FRD inverse attitude.
+            east, north, up = (float(value) for value in vector)
+            return world_ned_vector_to_body_frd(
+                (north, east, -up),
+                tuple(float(value) for value in quaternion),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def workstation_physical_alignment_snapshot(self) -> dict[str, object]:
+        """Return Workstation alignment evidence without applying corrections."""
+
+        baseline = self.latest_rtk_baseline
+        projection = self.latest_p1_body_frd_baseline
+        left = self.latest_extrinsics.get("left")
+        right = self.latest_extrinsics.get("right")
+        relative_rpy = None
+        if left is not None and right is not None:
+            try:
+                relative = relative_attitude(left.q, right.q)
+                relative_rpy = (relative.roll_deg, relative.pitch_deg, relative.yaw_deg)
+            except (TypeError, ValueError):
+                relative_rpy = None
+        quality = self.latest_physical_alignment_quality
+        if self.baseline_sampling_active:
+            state = "SAMPLING"
+        elif quality is not None:
+            state = quality.state
+        elif relative_rpy is not None and baseline is not None:
+            state = "LIVE"
+        else:
+            state = "WAITING"
+        return {
+            "state": state,
+            "sampling_active": bool(self.baseline_sampling_active),
+            "sample_count": len(self.physical_alignment_samples),
+            "current_baseline_ned_m": (
+                None
+                if baseline is None
+                else (baseline.north_m, baseline.east_m, baseline.down_m)
+            ),
+            "current_baseline_frd_m": (
+                None
+                if projection is None
+                else (projection.forward_m, projection.right_m, projection.down_m)
+            ),
+            "relative_rpy_deg": relative_rpy,
+            "fix_type": {
+                "left": getattr(self.latest_gps.get("left"), "fix_type", None),
+                "right": getattr(self.latest_gps.get("right"), "fix_type", None),
+            },
+            "quality": {} if quality is None else quality.to_mapping(),
+            "reference_baseline_frd_m": self._physical_alignment_reference_baseline_frd_m(),
+            "iterations": tuple(self.alignment_iteration_history[-20:]),
+            "time_sync_checkpoints": tuple(self.workstation_time_sync_checkpoints[-20:]),
+            "physical_adjustment_only": True,
+            "coordinate_contract": (
+                "raw GPS/RTK NED [north,east,down] preserved; P1→P2 FRD "
+                "[forward,right,down] is an attitude-derived observation; "
+                "relative attitude is P2 relative P1 [roll,pitch,yaw]"
+            ),
+        }
 
     def _render_baseline_quality(self, quality: BaselineQuality | None) -> None:
         if not hasattr(self, "baseline_quality_labels"):
@@ -10271,7 +6092,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         selected, _filter = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Save Alignment Profile",
-            str(APP_ROOT / "alignment_profile.yaml"),
+            str(self.app_root / "alignment_profile.yaml"),
             "YAML (*.yaml *.yml)",
         )
         if not selected:
@@ -10292,6 +6113,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "right_can1": "CAN1",
                 "right_can2": "CAN2",
             },
+            physical_alignment=self.workstation_physical_alignment_snapshot(),
         )
         text = self.alignment_profile_manager.dump(payload)
         path = Path(selected)
@@ -10303,7 +6125,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         selected, _filter = QtWidgets.QFileDialog.getOpenFileName(
             self,
             "Load Alignment Profile",
-            str(APP_ROOT),
+            str(self.app_root),
             "YAML (*.yaml *.yml)",
         )
         if not selected:
@@ -10594,8 +6416,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _build_clock_sync_tab(self, layout: QtWidgets.QVBoxLayout) -> None:
         """Build the Workstation camera-clock and RTCP/NTP evidence surface.
 
-        Workstation timing evidence is limited to the WIRIS RTC command and
-        live RTCP/NTP frame metadata.
+        Workstation timing evidence includes the WIRIS RTC command, editable
+        RTCP/NTP sync limits, and live RTCP/NTP frame metadata.
         """
 
         layout.setSpacing(8)
@@ -10641,800 +6463,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         history_layout = QtWidgets.QVBoxLayout(history_group)
         history_layout.addWidget(self.clock_offset_plot)
         layout.addWidget(rtc_group)
+        layout.addWidget(self.camera_sync_settings_group)
         layout.addWidget(history_group, 1)
 
-    def _set_camera_sync_state(self, status: str, reason: str) -> None:
-        self.camera_sync_status = str(status)
-        self.camera_sync_reason = str(reason)
-        if hasattr(self, "clock_sync_status_label"):
-            self._update_clock_sync_display()
-
-    def _parse_wiris_gdti_unix_s(self, response: str) -> float | None:
-        """Parse the documented WIRIS date/time text without trusting raw text."""
-
-        text = str(response or "")
-        match = re.search(
-            r"(?P<year>\d{4})[/-](?P<month>\d{2})[/-](?P<day>\d{2})"
-            r"(?:[ T-])(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
-            r"(?:\.(?P<fraction>\d{1,6}))?",
-            text,
-        )
-        if match is None:
-            return None
-        fraction = (match.group("fraction") or "").ljust(6, "0")
-        try:
-            value = datetime(
-                int(match.group("year")),
-                int(match.group("month")),
-                int(match.group("day")),
-                int(match.group("hour")),
-                int(match.group("minute")),
-                int(match.group("second")),
-                int(fraction or 0),
-                tzinfo=timezone.utc,
-            )
-        except ValueError:
-            return None
-        return value.timestamp()
-
-    def _format_wiris_gdti_results(self, result: object) -> dict[str, dict[str, object]]:
-        data = dict(result or {})
-        raw_results = dict(data.get("results") or {})
-        requested_utc_s = self._camera_sync_requested_utc_s
-        results: dict[str, dict[str, object]] = {}
-        for camera, raw in raw_results.items():
-            row = dict(raw or {})
-            response = str(row.get("response") or "")
-            parsed_s = self._parse_wiris_gdti_unix_s(response)
-            started_s = row.get("query_started_utc_s")
-            finished_s = row.get("query_finished_utc_s")
-            midpoint_s = None
-            query_duration_s = None
-            if started_s is not None and finished_s is not None:
-                query_duration_s = max(0.0, float(finished_s) - float(started_s))
-                midpoint_s = (float(started_s) + float(finished_s)) / 2.0
-            reference_s = midpoint_s
-            if reference_s is None:
-                reference_s = self._camera_sync_requested_utc_s
-            query_offset_ms = (
-                None
-                if parsed_s is None or reference_s is None
-                else (parsed_s - reference_s) * 1000.0
-            )
-            tolerance_ms = CAMERA_GDTI_RESOLUTION_S * 500.0
-            if query_duration_s is not None:
-                tolerance_ms += query_duration_s * 500.0
-            clock_valid = (
-                parsed_s is not None
-                and query_offset_ms is not None
-                and abs(float(query_offset_ms)) <= tolerance_ms
-            )
-            results[camera] = {
-                "response": response,
-                "unix_s": parsed_s,
-                "offset_ms": (
-                    None
-                    if parsed_s is None or requested_utc_s is None
-                    else (parsed_s - requested_utc_s) * 1000.0
-                ),
-                "query_started_utc_s": started_s,
-                "query_finished_utc_s": finished_s,
-                "query_midpoint_utc_s": midpoint_s,
-                "query_duration_ms": None if query_duration_s is None else query_duration_s * 1000.0,
-                "query_offset_ms": query_offset_ms,
-                "resolution_s": CAMERA_GDTI_RESOLUTION_S,
-                "offset_tolerance_ms": tolerance_ms,
-                "clock_valid": clock_valid,
-            }
-        return results
-
-    def _camera_sync_widget_value(self, attribute: str, fallback: float) -> float:
-        try:
-            widget = getattr(self, attribute)
-            return float(widget.value())
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            return float(fallback)
-
-    def _camera_sync_history_window_s(self) -> float:
-        return max(
-            0.1,
-            self._camera_sync_widget_value(
-                "camera_sync_history_window_spin",
-                CAMERA_SYNC_FRAME_HISTORY_WINDOW_S,
-            ),
-        )
-
-    def _camera_sync_receive_pair_max_delta_s(self) -> float:
-        return max(
-            0.0,
-            self._camera_sync_widget_value(
-                "camera_sync_receive_pair_max_delta_spin",
-                CAMERA_SYNC_RECEIVE_PAIR_MAX_DELTA_S * 1000.0,
-            )
-            / 1000.0,
-        )
-
-    def _camera_sync_rtcp_pair_max_delta_s(self) -> float:
-        return max(
-            0.0,
-            self._camera_sync_widget_value(
-                "camera_sync_rtcp_pair_max_delta_spin",
-                CAMERA_RTCP_PAIR_MAX_DELTA_S * 1000.0,
-            )
-            / 1000.0,
-        )
-
-    def _camera_sync_max_sr_age_s(self) -> float:
-        return max(
-            0.1,
-            self._camera_sync_widget_value("camera_sync_max_sr_age_spin", CAMERA_SYNC_MAX_SR_AGE_S),
-        )
-
-    def _camera_sync_max_pc_offset_s(self) -> float:
-        return max(
-            0.0,
-            self._camera_sync_widget_value(
-                "camera_sync_max_pc_offset_spin",
-                CAMERA_RTCP_MAX_PC_OFFSET_S * 1000.0,
-            )
-            / 1000.0,
-        )
-
-    def _camera_sync_max_clock_rate_error(self) -> float:
-        return max(
-            0.0,
-            self._camera_sync_widget_value(
-                "camera_sync_clock_rate_error_spin",
-                CAMERA_SYNC_MAX_CLOCK_RATE_ERROR * 100.0,
-            )
-            / 100.0,
-        )
-
-    def _camera_sync_required_sr_count(self) -> int:
-        try:
-            widget = getattr(self, "camera_sync_required_sr_count_spin")
-            return max(1, int(widget.value()))
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            return CAMERA_SYNC_REQUIRED_SR_COUNT
-
-    def _camera_sync_warmup_timeout_s(self) -> float:
-        return max(
-            1.0,
-            self._camera_sync_widget_value(
-                "camera_sync_warmup_timeout_spin",
-                CAMERA_SYNC_WARMUP_TIMEOUT_S,
-            ),
-        )
-
-    def _camera_sync_readiness(self) -> tuple[bool, str]:
-        if not self.camera_connected:
-            return False, "좌우 RTSP 스트림이 실행 중이 아닙니다."
-        now_mono_s = time.monotonic()
-        try:
-            self.camera_frame_metadata_history
-        except (AttributeError, RuntimeError):
-            has_frame_history = False
-        else:
-            has_frame_history = True
-        if has_frame_history:
-            left_metadata, right_metadata = self._clock_sync_pair_metadata(now_mono_s=now_mono_s)
-        else:
-            left_metadata = self.camera_frame_metadata.get("left") or {}
-            right_metadata = self.camera_frame_metadata.get("right") or {}
-        metadata_by_camera = {"left": left_metadata, "right": right_metadata}
-        missing: list[str] = []
-        for camera, metadata in metadata_by_camera.items():
-            count = int(metadata.get("rtcp_sr_received_count") or 0)
-            required_sr_count = self._camera_sync_required_sr_count()
-            if count < required_sr_count:
-                missing.append(f"{self._camera_name_ko(camera)} SR {count}/{required_sr_count}")
-                continue
-            try:
-                age_s = float(metadata.get("rtcp_sr_age_s"))
-            except (TypeError, ValueError):
-                missing.append(f"{self._camera_name_ko(camera)} SR age 없음")
-                continue
-            if not math.isfinite(age_s) or age_s > self._camera_sync_max_sr_age_s():
-                missing.append(f"{self._camera_name_ko(camera)} SR stale {age_s:.2f}s")
-            for key, label in (
-                ("rtcp_camera_ntp_rate", "NTP clock"),
-                ("rtcp_camera_media_rate", "RTP clock"),
-            ):
-                try:
-                    rate = float(metadata.get(key))
-                except (TypeError, ValueError):
-                    missing.append(f"{self._camera_name_ko(camera)} {label} 없음")
-                    continue
-                if not math.isfinite(rate) or abs(rate - 1.0) > self._camera_sync_max_clock_rate_error():
-                    missing.append(f"{self._camera_name_ko(camera)} {label}={rate:.6f}")
-
-            gdti = self._camera_sync_gdti.get(camera) or {}
-            gdti_s = gdti.get("unix_s")
-            if gdti_s is None:
-                missing.append(f"{self._camera_name_ko(camera)} GDTI 파싱 실패")
-            elif gdti.get("clock_valid") is False:
-                offset_ms = gdti.get("query_offset_ms")
-                tolerance_ms = gdti.get("offset_tolerance_ms")
-                try:
-                    missing.append(
-                        f"{self._camera_name_ko(camera)} GDTI query offset="
-                        f"{float(offset_ms):+.1f}ms (허용 {float(tolerance_ms):.1f}ms)"
-                    )
-                except (TypeError, ValueError):
-                    missing.append(f"{self._camera_name_ko(camera)} GDTI 시간 검증 실패")
-
-        gdti_values = [
-            (self._camera_sync_gdti.get(camera) or {}).get("unix_s")
-            for camera in ("left", "right")
-        ]
-        if all(value is not None for value in gdti_values):
-            try:
-                gdti_pair_delta_s = abs(float(gdti_values[1]) - float(gdti_values[0]))
-            except (TypeError, ValueError):
-                gdti_pair_delta_s = float("inf")
-            if gdti_pair_delta_s > CAMERA_GDTI_MAX_PAIR_DELTA_S:
-                missing.append(f"좌우 GDTI Δt={gdti_pair_delta_s:.3f}s")
-
-        metrics = self._camera_time_sync_metrics(
-            left_metadata,
-            right_metadata,
-            now_wall_s=time.time(),
-            now_mono_s=now_mono_s,
-        )
-        pair_delta_s = metrics.get("pair_delta_s")
-        if pair_delta_s is None:
-            missing.append("좌우 RTCP/NTP pair 없음")
-        elif abs(float(pair_delta_s)) > self._camera_sync_rtcp_pair_max_delta_s():
-            missing.append(f"좌우 RTCP/NTP Δt={abs(float(pair_delta_s)) * 1000.0:.1f}ms")
-        receive_pair_delta_s = metrics.get("receive_pair_delta_s")
-        if receive_pair_delta_s is None:
-            try:
-                receive_pair_delta_s = abs(
-                    float(right_metadata["timestamp_s"]) - float(left_metadata["timestamp_s"])
-                )
-            except (KeyError, TypeError, ValueError):
-                receive_pair_delta_s = None
-        if receive_pair_delta_s is None:
-            missing.append("좌우 실제 수신시각 pair 없음")
-        elif float(receive_pair_delta_s) > self._camera_sync_receive_pair_max_delta_s():
-            missing.append(f"좌우 실제 수신 Δt={float(receive_pair_delta_s) * 1000.0:.1f}ms")
-        max_sr_pc_offset_ms = metrics.get("max_sr_pc_offset_ms")
-        if max_sr_pc_offset_ms is None:
-            missing.append("RTCP SR/PC UTC offset 없음")
-        elif float(max_sr_pc_offset_ms) > self._camera_sync_max_pc_offset_s() * 1000.0:
-            missing.append(f"RTCP SR/PC UTC offset={float(max_sr_pc_offset_ms):.1f}ms")
-        if missing:
-            return False, "; ".join(missing)
-        return True, "GDTI·RTCP/NTP·PC UTC·좌우 Δt 검증 완료"
-
-    def _poll_camera_sync_state(self) -> None:
-        if self.camera_sync_status not in {
-            CAMERA_SYNC_STATUS_RECONNECTING,
-            CAMERA_SYNC_STATUS_WARMING,
-        }:
-            self._camera_sync_timer.stop()
-            return
-        deadline = self._camera_sync_deadline_monotonic_s
-        if deadline is not None and time.monotonic() >= deadline:
-            self._camera_sync_timer.stop()
-            self._set_camera_sync_state(
-                CAMERA_SYNC_STATUS_FAILED,
-                "동기화 검증 timeout: " + self.camera_sync_reason,
-            )
-            return
-        ready, reason = self._camera_sync_readiness()
-        if ready:
-            self._camera_sync_timer.stop()
-            self._camera_sync_deadline_monotonic_s = None
-            self._set_camera_sync_state(CAMERA_SYNC_STATUS_VERIFIED, reason)
-        else:
-            self._set_camera_sync_state(CAMERA_SYNC_STATUS_WARMING, reason)
-
-    def _begin_camera_sync_after_stus(
-        self,
-        *,
-        target: str,
-        result: str,
-        requested_utc_s: float | None,
-        target_infos: Sequence[tuple[str, str, int, float]],
-    ) -> None:
-        self._camera_sync_requested_utc_s = requested_utc_s
-        if target != "both" or result != "success":
-            self._set_camera_sync_state(
-                CAMERA_SYNC_STATUS_FAILED,
-                "좌우 카메라 모두에 STUS가 성공해야 동기화를 검증할 수 있습니다.",
-            )
-            return
-        self._set_camera_sync_state(
-            CAMERA_SYNC_STATUS_RECONNECTING,
-            "STUS 완료: GDTI 확인 후 RTSP 스트림을 TCP로 재연결합니다.",
-        )
-        if not self.camera_connected:
-            self._set_camera_sync_state(
-                CAMERA_SYNC_STATUS_NOT_VERIFIED,
-                "STUS는 완료됐지만 RTSP 스트림이 없어 검증을 시작하지 않았습니다.",
-            )
-            return
-        self._start_wiris_gdti_worker(target_infos)
-
-    def _start_wiris_gdti_worker(self, target_infos: Sequence[tuple[str, str, int, float]]) -> None:
-        if self.wiris_gdti_thread is not None:
-            self._log("[시계] GDTI 조회가 이미 진행 중입니다.")
-            return
-        self.wiris_command_status_label.setText("GDTI 확인: querying...")
-        self.wiris_gdti_thread = QtCore.QThread(self)
-        self.wiris_gdti_worker = WirisClockCommandWorker(target_infos, command_text="GDTI")
-        self.wiris_gdti_worker.moveToThread(self.wiris_gdti_thread)
-        self.wiris_gdti_thread.started.connect(self.wiris_gdti_worker.run)
-        self.wiris_gdti_worker.completed.connect(self._apply_wiris_gdti_result)
-        self.wiris_gdti_worker.failed.connect(self._wiris_gdti_failed)
-        self.wiris_gdti_worker.finished.connect(self.wiris_gdti_thread.quit)
-        self.wiris_gdti_worker.finished.connect(self.wiris_gdti_worker.deleteLater)
-        self.wiris_gdti_thread.finished.connect(self.wiris_gdti_thread.deleteLater)
-        self.wiris_gdti_thread.finished.connect(self._clear_wiris_gdti_worker)
-        self.wiris_gdti_thread.start()
-
-    def _apply_wiris_gdti_result(self, result: object) -> None:
-        self._camera_sync_gdti = self._format_wiris_gdti_results(result)
-        self._camera_sync_transport_override = RTSP_TRANSPORT_TCP
-        self._camera_sync_deadline_monotonic_s = time.monotonic() + self._camera_sync_warmup_timeout_s()
-        self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
-        self._set_camera_sync_state(
-            CAMERA_SYNC_STATUS_WARMING,
-            "RTSP 재연결 완료 대기: 양쪽 RTCP Sender Report를 수집합니다.",
-        )
-        self._camera_sync_timer.start()
-
-    def _wiris_gdti_failed(self, error: str) -> None:
-        self._camera_sync_gdti = {}
-        self._set_camera_sync_state(CAMERA_SYNC_STATUS_FAILED, f"GDTI 조회 실패: {error}")
-        self._log(f"[시계] GDTI 조회 실패: {error}")
-
-    def _clear_wiris_gdti_worker(self) -> None:
-        self.wiris_gdti_thread = None
-        self.wiris_gdti_worker = None
-
-    def _clock_sync_side_summary(self, camera: str, metadata: dict[str, object], now_wall_s: float, now_mono_s: float) -> tuple[str, float | None]:
-        if metadata.get("rtcp_timing_invalid_reason"):
-            return f"{self._camera_name_ko(camera)}: RTCP/NTP 무효(SR-PC offset 초과)", None
-        camera_rtc_s = self._camera_rtc_timestamp_s_from_metadata(metadata)
-        receive_mono_s = metadata.get("timestamp_s")
-        if camera_rtc_s is None:
-            return f"{self._camera_name_ko(camera)}: RTCP/NTP 없음", None
-        try:
-            frame_age_s = max(0.0, now_mono_s - float(receive_mono_s)) if receive_mono_s is not None else 0.0
-        except (TypeError, ValueError):
-            frame_age_s = 0.0
-        frame_receive_delay_s = metadata.get("rtcp_frame_receive_delay_s")
-        try:
-            if frame_receive_delay_s is not None and isfinite(float(frame_receive_delay_s)):
-                return (
-                    f"{self._camera_name_ko(camera)}: transit_delay={float(frame_receive_delay_s) * 1000.0:+.1f} ms, "
-                    f"frame_age={frame_age_s:.2f} s, basis={infer_runtime_camera_timestamp_reference(metadata)}",
-                    float(frame_receive_delay_s) * 1000.0,
-                )
-        except (TypeError, ValueError):
-            pass
-        pc_utc_at_frame_s = now_wall_s - frame_age_s
-        offset_ms = (float(camera_rtc_s) - pc_utc_at_frame_s) * 1000.0
-        reference = infer_runtime_camera_timestamp_reference(metadata)
-        return (
-            f"{self._camera_name_ko(camera)}: offset={offset_ms:+.1f} ms, "
-            f"frame_age={frame_age_s:.2f} s, basis={reference}",
-            offset_ms,
-        )
-
-    def _rtcp_sender_report_count(self, metadata: dict[str, object]) -> int | None:
-        value = metadata.get("rtcp_sr_received_count")
-        try:
-            count = int(value)
-        except (TypeError, ValueError):
-            return None
-        return count if count >= 0 else None
-
-    def _clock_sync_pair_metadata(self, now_mono_s: float | None = None) -> tuple[dict[str, object], dict[str, object]]:
-        """Select a temporally corresponding recent RTCP frame pair.
-
-        The latest left and latest right frames are not a pair when the
-        cameras decode at different rates. Prefer frames received close
-        together, then minimize their RTCP-derived timestamp delta.
-        """
-        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
-        latest = (
-            dict(self.camera_frame_metadata.get("left") or {}),
-            dict(self.camera_frame_metadata.get("right") or {}),
-        )
-
-        def usable(metadata: dict[str, object]) -> bool:
-            return self._camera_rtc_timestamp_s_from_metadata(metadata) is not None
-
-        def recent(history: deque[dict[str, object]]) -> list[dict[str, object]]:
-            rows: list[dict[str, object]] = []
-            for metadata in history:
-                if not usable(metadata):
-                    continue
-                timestamp_s = metadata.get("timestamp_s")
-                if timestamp_s is None:
-                    rows.append(dict(metadata))
-                    continue
-                try:
-                    age_s = now_mono_s - float(timestamp_s)
-                except (TypeError, ValueError):
-                    continue
-                if -0.1 <= age_s <= self._camera_sync_history_window_s():
-                    rows.append(dict(metadata))
-            return rows
-
-        left_rows = recent(self.camera_frame_metadata_history["left"])
-        right_rows = recent(self.camera_frame_metadata_history["right"])
-        if not left_rows or not right_rows:
-            return latest
-
-        candidates: list[tuple[float, float, dict[str, object], dict[str, object]]] = []
-        for left in left_rows:
-            left_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(left)
-            left_receive_s = left.get("timestamp_s")
-            for right in right_rows:
-                right_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(right)
-                if left_rtcp_s is None or right_rtcp_s is None:
-                    continue
-                receive_delta_s = float("inf")
-                if left_receive_s is not None and right.get("timestamp_s") is not None:
-                    try:
-                        receive_delta_s = abs(float(right["timestamp_s"]) - float(left_receive_s))
-                    except (TypeError, ValueError):
-                        pass
-                candidates.append(
-                    (
-                        abs(float(right_rtcp_s) - float(left_rtcp_s)),
-                        receive_delta_s,
-                        left,
-                        right,
-                    )
-                )
-        if not candidates:
-            return latest
-        close_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate[1] <= self._camera_sync_receive_pair_max_delta_s()
-        ]
-        search_space = close_candidates or candidates
-        _rtcp_delta, _receive_delta, left, right = min(
-            search_space,
-            key=lambda candidate: (candidate[0], candidate[1]),
-        )
-        return left, right
-
-    def _camera_time_sync_metrics(
-        self,
-        left_metadata: dict[str, object] | None = None,
-        right_metadata: dict[str, object] | None = None,
-        *,
-        left_receive_mono_s: float | None = None,
-        right_receive_mono_s: float | None = None,
-        now_wall_s: float | None = None,
-        now_mono_s: float | None = None,
-    ) -> dict[str, object]:
-        """Summarize RTCP/NTP timing without treating it as verified UTC."""
-        now_wall_s = time.time() if now_wall_s is None else float(now_wall_s)
-        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
-        left_metadata = left_metadata or {}
-        right_metadata = right_metadata or {}
-        left_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(left_metadata)
-        right_rtcp_s = self._camera_rtc_timestamp_s_from_metadata(right_metadata)
-        receive_pair_delta_s = None
-        try:
-            if left_metadata.get("timestamp_s") is not None and right_metadata.get("timestamp_s") is not None:
-                receive_pair_delta_s = abs(
-                    float(right_metadata["timestamp_s"]) - float(left_metadata["timestamp_s"])
-                )
-        except (TypeError, ValueError):
-            receive_pair_delta_s = None
-        invalid_cameras = [
-            self._camera_name_ko(camera)
-            for camera, metadata in (("left", left_metadata), ("right", right_metadata))
-            if metadata.get("rtcp_timing_invalid_reason")
-        ]
-        offsets_ms: dict[str, float] = {}
-        sr_offsets_ms: dict[str, float] = {}
-        transit_delays_ms: dict[str, float] = {}
-        for camera, metadata, explicit_receive_s, rtcp_s in (
-            ("left", left_metadata, left_receive_mono_s, left_rtcp_s),
-            ("right", right_metadata, right_receive_mono_s, right_rtcp_s),
-        ):
-            if rtcp_s is None or metadata.get("rtcp_timing_invalid_reason"):
-                continue
-            sr_offset_s = metadata.get("rtcp_sr_pc_offset_s")
-            try:
-                if sr_offset_s is not None and isfinite(float(sr_offset_s)):
-                    sr_offsets_ms[camera] = float(sr_offset_s) * 1000.0
-            except (TypeError, ValueError):
-                pass
-            frame_receive_delay_s = metadata.get("rtcp_frame_receive_delay_s")
-            try:
-                if frame_receive_delay_s is not None and isfinite(float(frame_receive_delay_s)):
-                    transit_delays_ms[camera] = float(frame_receive_delay_s) * 1000.0
-            except (TypeError, ValueError):
-                pass
-            receive_s = explicit_receive_s
-            if receive_s is None:
-                receive_s = metadata.get("timestamp_s")
-            if receive_s is None:
-                # A transit-delay-only observation has no PC receive anchor;
-                # keep it as a transport diagnostic, but do not invent an
-                # absolute PC UTC offset from the current wall clock.
-                continue
-            try:
-                frame_age_s = max(0.0, now_mono_s - float(receive_s))
-            except (TypeError, ValueError):
-                frame_age_s = 0.0
-            pc_utc_at_frame_s = now_wall_s - frame_age_s
-            offsets_ms[camera] = (float(rtcp_s) - pc_utc_at_frame_s) * 1000.0
-
-        pair_delta_s = None
-        if left_rtcp_s is not None and right_rtcp_s is not None:
-            pair_delta_s = float(right_rtcp_s) - float(left_rtcp_s)
-        max_offset_ms = max((abs(value) for value in offsets_ms.values()), default=None)
-        max_sr_offset_ms = max((abs(value) for value in sr_offsets_ms.values()), default=None)
-        max_transit_delay_ms = max((abs(value) for value in transit_delays_ms.values()), default=None)
-        if pair_delta_s is None:
-            if invalid_cameras:
-                status = "invalid-rtcp"
-                warning = f"{', '.join(invalid_cameras)} Sender Report NTP가 PC 수신 UTC와 500 ms 이상 어긋났습니다."
-            else:
-                status = "missing-rtcp"
-                warning = "좌우 프레임 중 하나에 RTCP/NTP 시각이 없습니다."
-        elif abs(pair_delta_s) > self._camera_sync_rtcp_pair_max_delta_s():
-            status = "pair-delta-failed"
-            warning = (
-                f"좌우 RTCP/NTP 차이가 {self._camera_sync_rtcp_pair_max_delta_s() * 1000.0:.0f} ms를 초과했습니다."
-            )
-        elif invalid_cameras:
-            status = "absolute-rtcp-invalid"
-            warning = (
-                f"좌우 RTCP/NTP pair는 {abs(pair_delta_s) * 1000.0:.1f} ms 이내지만, "
-                f"{', '.join(invalid_cameras)} Sender Report NTP의 PC UTC 기준이 500 ms 이상 어긋났습니다. "
-                "절대 UTC 기준으로 사용할 수 없습니다."
-            )
-        elif max_offset_ms is not None and max_offset_ms > self._camera_sync_max_pc_offset_s() * 1000.0:
-            status = "pc-offset-failed"
-            warning = (
-                f"RTCP/NTP와 PC UTC 차이가 {self._camera_sync_max_pc_offset_s() * 1000.0:.0f} ms를 초과했습니다. "
-                "카메라 GDTI와 RTCP 매핑을 검증해야 합니다."
-            )
-        else:
-            status = "within-threshold-unverified"
-            warning = "좌우/PC 오차는 임계값 이내지만 RTCP/NTP의 UTC 기준은 아직 검증되지 않았습니다."
-        return {
-            "status": status,
-            "basis": "rtcp-sender-report-ntp",
-            "pair_delta_s": pair_delta_s,
-            "receive_pair_delta_s": receive_pair_delta_s,
-            "max_pc_offset_ms": max_offset_ms,
-            "max_sr_pc_offset_ms": max_sr_offset_ms,
-            "max_frame_transit_delay_ms": max_transit_delay_ms,
-            "left_frame_transit_delay_ms": transit_delays_ms.get("left"),
-            "right_frame_transit_delay_ms": transit_delays_ms.get("right"),
-            "left_pc_offset_ms": offsets_ms.get("left"),
-            "right_pc_offset_ms": offsets_ms.get("right"),
-            "left_sr_pc_offset_ms": sr_offsets_ms.get("left"),
-            "right_sr_pc_offset_ms": sr_offsets_ms.get("right"),
-            "warning": warning,
-        }
-
-    def _camera_time_sync_snapshot(
-        self,
-        scope: str,
-        *,
-        now_wall_s: float | None = None,
-        now_mono_s: float | None = None,
-    ) -> dict[str, object]:
-        """Capture one JSON-safe RTCP/NTP observation before stream state is cleared."""
-        now_wall_s = time.time() if now_wall_s is None else float(now_wall_s)
-        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
-        left_metadata, right_metadata = self._clock_sync_pair_metadata(now_mono_s)
-        metrics = self._camera_time_sync_metrics(
-            left_metadata,
-            right_metadata,
-            now_wall_s=now_wall_s,
-            now_mono_s=now_mono_s,
-        )
-        return {
-            "scope": str(scope),
-            "observed_at_unix_s": now_wall_s,
-            "observed_at_monotonic_s": now_mono_s,
-            "metrics": dict(metrics),
-        }
-
-    def _capture_recording_clock_sync_start_observation(self) -> None:
-        if not self._session_recording_active() or self._recording_clock_sync_start_observation is not None:
-            return
-        snapshot = self._camera_time_sync_snapshot("first_valid_pair_after_recording_start")
-        metrics = snapshot["metrics"]
-        if isinstance(metrics, dict) and metrics.get("pair_delta_s") is not None:
-            self._recording_clock_sync_start_observation = snapshot
-
-    def _camera_time_sync_drift_metadata(self) -> dict[str, object]:
-        start = self._recording_clock_sync_start_observation
-        end = self._recording_clock_sync_end_observation
-        if not isinstance(start, dict) or not isinstance(end, dict):
-            return {
-                "status": "not-enough-observations",
-                "start_pair_delta_s": None,
-                "end_pair_delta_s": None,
-                "pair_delta_change_s": None,
-                "elapsed_s": None,
-                "relative_drift_ppm": None,
-            }
-        start_metrics = start.get("metrics")
-        end_metrics = end.get("metrics")
-        if not isinstance(start_metrics, dict) or not isinstance(end_metrics, dict):
-            return {
-                "status": "invalid-observations",
-                "start_pair_delta_s": None,
-                "end_pair_delta_s": None,
-                "pair_delta_change_s": None,
-                "elapsed_s": None,
-                "relative_drift_ppm": None,
-            }
-        start_delta = start_metrics.get("pair_delta_s")
-        end_delta = end_metrics.get("pair_delta_s")
-        try:
-            start_delta = float(start_delta)
-            end_delta = float(end_delta)
-            elapsed_s = float(end["observed_at_monotonic_s"]) - float(start["observed_at_monotonic_s"])
-        except (KeyError, TypeError, ValueError):
-            return {
-                "status": "missing-pair-delta",
-                "start_pair_delta_s": None,
-                "end_pair_delta_s": None,
-                "pair_delta_change_s": None,
-                "elapsed_s": None,
-                "relative_drift_ppm": None,
-            }
-        change_s = end_delta - start_delta
-        relative_drift_ppm = None if elapsed_s <= 0.0 else change_s / elapsed_s * 1_000_000.0
-        return {
-            "status": "measured" if relative_drift_ppm is not None else "invalid-elapsed-time",
-            "start_pair_delta_s": start_delta,
-            "end_pair_delta_s": end_delta,
-            "pair_delta_change_s": change_s,
-            "elapsed_s": elapsed_s,
-            "relative_drift_ppm": relative_drift_ppm,
-        }
-
-    def _format_clock_sync_status(
-        self,
-        now_wall_s: float | None = None,
-        now_mono_s: float | None = None,
-    ) -> tuple[str, str]:
-        now_wall_s = time.time() if now_wall_s is None else float(now_wall_s)
-        now_mono_s = time.monotonic() if now_mono_s is None else float(now_mono_s)
-        left_metadata, right_metadata = self._clock_sync_pair_metadata(now_mono_s)
-        left_text, left_offset_ms = self._clock_sync_side_summary("left", left_metadata, now_wall_s, now_mono_s)
-        right_text, right_offset_ms = self._clock_sync_side_summary("right", right_metadata, now_wall_s, now_mono_s)
-        left_rtc_s = self._camera_rtc_timestamp_s_from_metadata(left_metadata)
-        right_rtc_s = self._camera_rtc_timestamp_s_from_metadata(right_metadata)
-        invalid_cameras = [
-            self._camera_name_ko(camera)
-            for camera, metadata in (("left", left_metadata), ("right", right_metadata))
-            if metadata.get("rtcp_timing_invalid_reason")
-        ]
-        if left_rtc_s is not None and right_rtc_s is not None:
-            pair_delta_ms = (float(right_rtc_s) - float(left_rtc_s)) * 1000.0
-            pair_text = f"좌우 RTCP/NTPΔ={pair_delta_ms:+.1f} ms"
-        else:
-            pair_text = "좌우 RTCP/NTPΔ=RTCP/NTP 부족"
-        quality_parts = []
-        if left_offset_ms is not None:
-            quality_parts.append(abs(left_offset_ms))
-        if right_offset_ms is not None:
-            quality_parts.append(abs(right_offset_ms))
-        worst_quality_ms = max(quality_parts) if quality_parts else None
-        has_transit_delay = any(
-            metadata.get("rtcp_frame_receive_delay_s") is not None
-            for metadata in (left_metadata, right_metadata)
-        )
-        left_sr_count = self._rtcp_sender_report_count(left_metadata)
-        right_sr_count = self._rtcp_sender_report_count(right_metadata)
-        sr_count_text = (
-            "RTCP SR 수신: "
-            f"L={'--' if left_sr_count is None else left_sr_count} "
-            f"R={'--' if right_sr_count is None else right_sr_count}"
-        )
-        quality_label = "RTCP frame transit max" if has_transit_delay else "PC UTC 최대 offset"
-        status = (
-            f"스트림 RTCP/NTP 상태: {pair_text}"
-            if worst_quality_ms is None
-            else f"스트림 RTCP/NTP 상태: {pair_text}, {quality_label}={worst_quality_ms:.1f} ms"
-        )
-        status += f", {sr_count_text}"
-        if invalid_cameras:
-            status += f", 절대 UTC 검증 실패={','.join(invalid_cameras)}"
-        detail = "\n".join(
-            (
-                "time_basis: RTCP Sender Report NTP-derived stream frame timestamp; WIRIS GDTI/UTC mapping unverified",
-                "pc_utc_at_frame: current PC UTC minus app receive frame age",
-                sr_count_text,
-                left_text,
-                right_text,
-                pair_text,
-            )
-        )
-        return status, detail
-
-    def _record_clock_offset_sample(self, now_s: float, *, min_interval_s: float = 0.5) -> None:
-        """Append one RTCP timing sample for the 시간 tab history plot.
-
-        Sampled from the frame path regardless of which tab is showing: the
-        plot exists to expose slow drift, which a history with holes in it
-        cannot show. Only the painting is gated on visibility.
-        """
-
-        if not hasattr(self, "clock_offset_plot"):
-            return
-        if now_s - self._last_clock_offset_sample_s < min_interval_s:
-            return
-        self._last_clock_offset_sample_s = now_s
-
-        def metric(camera: str, key: str, scale: float) -> float | None:
-            value = (self.camera_frame_metadata.get(camera) or {}).get(key)
-            try:
-                value = float(value)
-            except (TypeError, ValueError):
-                return None
-            return value * scale if isfinite(value) else None
-
-        self.clock_offset_plot.add_point(
-            ClockOffsetPoint(
-                timestamp_s=now_s,
-                left_transit_delay_ms=metric("left", "rtcp_frame_receive_delay_s", 1000.0),
-                right_transit_delay_ms=metric("right", "rtcp_frame_receive_delay_s", 1000.0),
-                left_transport_delay_ms=metric("left", "rtcp_frame_transport_delay_s", 1000.0),
-                right_transport_delay_ms=metric("right", "rtcp_frame_transport_delay_s", 1000.0),
-                left_sr_age_s=metric("left", "rtcp_sr_age_s", 1.0),
-                right_sr_age_s=metric("right", "rtcp_sr_age_s", 1.0),
-            )
-        )
-
-    def _update_clock_sync_display(self) -> str | None:
-        """Refresh the RTCP/NTP status label/detail text without logging.
-
-        Called continuously from the frame-arrival path while the 시간 tab is
-        visible; the manual button below still logs a snapshot on click.
-        """
-
-        if not hasattr(self, "clock_sync_status_label"):
-            return None
-        status, detail = self._format_clock_sync_status()
-        sync_status_text = (
-            f"동기화 상태: {self.camera_sync_status} | {self.camera_sync_reason}"
-        )
-        stus_sync = self._last_wiris_pc_utc_sync
-        stus_status_text = ""
-        stus_detail = ""
-        if isinstance(stus_sync, dict) and stus_sync.get("command") == "STUS":
-            stus_status_text = f"PC UTC 설정 전송: {stus_sync.get('result', '')}"
-            stus_detail = (
-                "STUS command sent from PC UTC.\n"
-                "Run RTCP/NTP 동기화 확인 after stream frames arrive to verify "
-                "left/right RTC and PC UTC offsets."
-            )
-        status = " | ".join(filter(None, (stus_status_text, sync_status_text, status)))
-        detail = "\n".join(filter(None, (stus_detail, sync_status_text, detail)))
-        self.clock_sync_status_label.setText(status)
-        self.clock_sync_status_label.setToolTip(detail)
-        self.clock_sync_summary_text.setPlainText(detail)
-        return status
-
-    def _is_clock_sync_tab_visible(self) -> bool:
-        return hasattr(self, "time_tab_index") and self.tabs.currentIndex() == self.time_tab_index
-
-    def refresh_clock_sync_status(self) -> None:
-        status = self._update_clock_sync_display()
-        if status is not None:
-            self._log(f"[시계] {status}")
+    def _camera_time_sync_controller(self):
+        owner = getattr(self, "_camera_time_sync_controller_owner", None)
+        if owner is None:
+            owner = CameraTimeSyncController(self)
+            self._camera_time_sync_controller_owner = owner
+        return owner
 
     def yolo_kwargs(self) -> dict:
         return {
@@ -11469,10 +6506,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
 
     def _recording_session_dir(self, stamp: str | None = None) -> Path:
-        return session_dir(APP_ROOT / "recordings", stamp or self.recording_session_id)
+        return session_dir(self.app_root / "recordings", stamp or self.recording_session_id)
 
     def _prepare_video_recording_paths(self) -> None:
-        root = APP_ROOT / "recordings"
+        root = self.app_root / "recordings"
         self.video_recording_paths = raw_video_paths(root, self.recording_session_id)
         output_dir = session_dir(root, self.recording_session_id)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -11526,9 +6563,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def detect_camera_rtsp(self) -> None:
         self._start_camera_detection("rtsp")
 
-    def auto_connect_wiris(self) -> None:
+    def auto_connect_wiris(self) -> bool | None:
+        if self._session_recording_active():
+            self._log("[카메라] 세션 기록 중에는 WIRIS 자동 연결을 시작할 수 없습니다.")
+            return False
         self.auto_wiris_connect_pending = True
         self._start_camera_detection("auto_connect")
+        return None
 
     def _camera_host_hints(self) -> tuple[str, ...]:
         hints: list[str] = []
@@ -11559,6 +6600,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _start_camera_detection(self, mode: str, *, target_side: str | None = None) -> None:
         if self.camera_auto_detect_thread is not None:
             return
+        self.workstation_camera_discovery_status = f"SEARCHING {mode.upper()}"
         self._log(
             f"[연결] 카메라 {mode} 탐색은 설정된 인터페이스를 사용합니다. "
             "필요하면 Discover Camera Network로 후보 NIC/IP를 먼저 확인하세요."
@@ -11613,6 +6655,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             arp_scan_reports = []
         self._log_arp_scan_reports(arp_scan_reports)
         self._set_camera_candidate_rows(host_interfaces, rtsp_candidates, control_candidates, verified_control_candidates)
+        if mode == "auto_connect" and self._session_recording_active():
+            self.auto_wiris_connect_pending = False
+            self.camera_connection_label.setText("WIRIS auto connect: recording is active")
+            self._log("[카메라] 탐색 중 세션 기록이 시작되어 자동 후보 적용과 프리뷰 연결을 건너뛰었습니다.")
+            return
+        if not (host_interfaces or rtsp_candidates or control_candidates or verified_control_candidates):
+            self.workstation_camera_discovery_status = "FOUND 0 ENDPOINTS"
         if host_interfaces:
             self._apply_host_interface_candidates(host_interfaces)
         if mode == "auto_connect":
@@ -11712,6 +6761,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _set_camera_candidate_table_rows(self, rows: list[dict[str, object]]) -> None:
         self._camera_candidate_rows = rows
+        if rows:
+            self.workstation_camera_discovery_status = f"FOUND {len(rows)} ENDPOINTS"
         self.camera_candidate_table.setRowCount(len(rows))
         for row, entry in enumerate(rows):
             for column, key in enumerate(("kind", "address", "port", "status", "interface", "host_ip")):
@@ -11812,6 +6863,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.host_address_edit.setText(str(getattr(interface, "address", "")))
         self._log(f"[카메라] 선택 후보를 {self._camera_name_ko(side)}에 적용했습니다: {kind} {host}")
         self._refresh_operation_header()
+
+    def apply_camera_candidate(self, row: int, target: str) -> bool:
+        """Apply a discovered camera endpoint selected by the Workstation surface."""
+
+        if self._session_recording_active():
+            self._log("[카메라] 세션 기록 중에는 카메라 네트워크/Left/Right 후보를 적용할 수 없습니다.")
+            return False
+        if isinstance(row, bool) or not isinstance(row, int) or not 0 <= row < len(self._camera_candidate_rows):
+            self._log("[카메라] 적용할 탐색 후보가 올바르지 않습니다.")
+            return False
+        if target not in {"nic", "left", "right"}:
+            self._log(f"[카메라] 지원하지 않는 후보 적용 대상입니다: {target}")
+            return False
+        self.camera_candidate_table.selectRow(row)
+        if target == "nic":
+            self.apply_selected_camera_candidate_nic()
+        else:
+            self.apply_selected_camera_candidate(target)
+        return True
 
     def _log_arp_scan_reports(self, reports: list[object]) -> None:
         if not reports:
@@ -12118,6 +7188,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._pixhawk_candidate_rows_by_source[source] = rows
             self._render_pixhawk_candidate_rows(source, rows)
         self._sync_legacy_pixhawk_candidate_rows()
+        if self._pixhawk_candidate_rows:
+            self.workstation_pixhawk_discovery_status = f"FOUND {len(self._pixhawk_candidate_rows)} ENDPOINTS"
         self._refresh_pixhawk_candidate_actions()
 
     def _render_pixhawk_candidate_rows(self, source: str, rows: list[dict[str, object]]) -> None:
@@ -12225,6 +7297,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def discover_mavlink_url_candidates(self) -> None:
         rows = self._mavlink_url_candidate_rows()
         self._append_pixhawk_candidate_rows(rows, source="mavlink")
+        self.workstation_pixhawk_discovery_status = f"FOUND {len(rows)} NETWORK ENDPOINTS"
         for row in rows:
             self._log(
                 f"[픽스호크] MAVLink URL 후보: {row['value']} "
@@ -12236,6 +7309,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log("[픽스호크] USB Pixhawk 연결 탐색이 이미 진행 중입니다.")
             return
         self.pixhawk_usb_discover_button.setEnabled(False)
+        self.workstation_pixhawk_discovery_status = "SEARCHING USB"
         self._log("[픽스호크] USB Pixhawk 연결 탐색을 시작합니다. 후보는 자동 할당하지 않습니다.")
         self.pixhawk_usb_discovery_thread = QtCore.QThread(self)
         self.pixhawk_usb_discovery_worker = PixhawkUsbDiscoveryWorker(timeout_s=0.8)
@@ -12272,9 +7346,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     }
                 )
         if not rows:
+            self.workstation_pixhawk_discovery_status = "FOUND 0 USB ENDPOINTS"
             self._log("[픽스호크] USB Pixhawk 장치가 보이지 않습니다: /dev/ttyACM*, /dev/ttyUSB* 없음")
             return
         self._append_pixhawk_candidate_rows(rows, source="mavlink")
+        self.workstation_pixhawk_discovery_status = f"FOUND {len(rows)} USB ENDPOINTS"
         for row in rows:
             self._log(
                 f"[픽스호크] USB 후보: {row['value']} "
@@ -12282,6 +7358,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             )
 
     def _pixhawk_usb_discovery_failed(self, error: str) -> None:
+        self.workstation_pixhawk_discovery_status = f"ERROR · {error}"
         self._log(f"[픽스호크] USB Pixhawk 연결 탐색 실패: {error}")
 
     def _clear_pixhawk_usb_discovery(self) -> None:
@@ -12381,7 +7458,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 self.pixhawk_connection_label.setText(f"{label} MAVLink URL 후보 적용됨: {label} MAVLink 연결을 누르세요.")
         self._refresh_operation_header()
 
+    def apply_pixhawk_candidate(self, source: str, row: int, target: str) -> bool:
+        """Apply a discovered endpoint selected by the Workstation surface."""
+
+        if self._session_recording_active():
+            self._log("[픽스호크] 세션 기록 중에는 Pixhawk Host/P1/P2 후보를 적용할 수 없습니다.")
+            return False
+        if source not in {"pc", "mavlink"} or target not in {"host", "left", "right"}:
+            self._log("[픽스호크] 후보 source 또는 적용 대상이 올바르지 않습니다.")
+            return False
+        rows = self._pixhawk_candidate_rows_by_source.get(source, [])
+        if isinstance(row, bool) or not isinstance(row, int) or not 0 <= row < len(rows):
+            self._log("[픽스호크] 적용할 탐색 후보가 올바르지 않습니다.")
+            return False
+        self._pixhawk_candidate_table_for_source(source).selectRow(row)
+        self.apply_selected_pixhawk_candidate(target, source=source)
+        return True
+
     def _camera_auto_detect_failed(self, error: str) -> None:
+        self.workstation_camera_discovery_status = f"ERROR · {error}"
         self._log(f"[카메라] 자동 탐색 실패: {error}")
         self.camera_connection_label.setText(f"camera RTSP: auto detect failed ({error})")
         self.last_rtsp_check_status = {"left": "check-failed", "right": "check-failed"}
@@ -12396,7 +7491,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.detect_rtsp_button.setEnabled(True)
         self.right_detect_rtsp_button.setEnabled(True)
 
-    def swap_cameras(self) -> None:
+    def swap_cameras(self) -> bool | None:
+        if self._session_recording_active():
+            self._log("[카메라] 세션 기록 중에는 Left/Right 카메라 매핑을 교체할 수 없습니다.")
+            return False
         cameras_running = self.camera_connected or bool(self.left_pane.worker or self.right_pane.worker)
         detection_was_enabled = self.yolo_enabled
         if cameras_running:
@@ -12407,8 +7505,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log("[카메라] Left/Right 카메라 매핑을 교체했습니다.")
         if cameras_running:
             self._start_camera_streams(enable_detection=detection_was_enabled, switch_to_depth=False)
+        return None
 
-    def swap_pixhawks(self) -> None:
+    def swap_pixhawks(self) -> bool | None:
+        if self._session_recording_active():
+            self._log("[픽스호크] 세션 기록 중에는 P1/P2 Pixhawk 매핑을 교체할 수 없습니다.")
+            return False
         mavlink_connected_sides = self._mavlink_open_sides()
         for side in ("left", "right"):
             if side in mavlink_connected_sides:
@@ -12430,6 +7532,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for side in ("left", "right"):
             if side in mavlink_connected_sides:
                 self.connect_mavlink_pixhawk(side)
+        return None
 
     def _swap_spinbox_value(self, left: QtWidgets.QAbstractSpinBox, right: QtWidgets.QAbstractSpinBox) -> object:
         left_value = left.value()
@@ -13832,9 +8935,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         painter = QtGui.QPainter(annotated)
         painter.setRenderHint(QtGui.QPainter.Antialiasing)
         if found and corners:
-            pen = QtGui.QPen(QtGui.QColor(30, 220, 80), 3)
+            pen = QtGui.QPen(QtGui.QColor(SUCCESS), 3)
             painter.setPen(pen)
-            painter.setBrush(QtGui.QBrush(QtGui.QColor(30, 220, 80)))
+            painter.setBrush(QtGui.QBrush(QtGui.QColor(SUCCESS)))
             previous = None
             for x, y in corners:
                 point = QtCore.QPointF(x, y)
@@ -13843,7 +8946,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     painter.drawLine(previous, point)
                 previous = point
         else:
-            painter.setPen(QtGui.QPen(QtGui.QColor(255, 90, 90), 4))
+            painter.setPen(QtGui.QPen(QtGui.QColor(ERROR), 4))
             painter.drawRect(2, 2, max(0, annotated.width() - 4), max(0, annotated.height() - 4))
         painter.fillRect(0, 0, annotated.width(), 28, QtGui.QColor(0, 0, 0, 170))
         painter.setPen(QtGui.QPen(QtGui.QColor(230, 230, 230), 1))
@@ -13944,561 +9047,86 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._rescale_calibration_preview_pixmaps()
         super().resizeEvent(event)
 
-    def toggle_camera_connection(self) -> None:
-        if self.camera_connected:
-            self.stop_yolo_streams()
-        else:
-            self.connect_cameras()
 
-    def toggle_yolo_detection(self) -> None:
-        if self.yolo_enabled:
-            self.stop_yolo_detection()
-        else:
-            self.start_yolo()
 
-    def toggle_mavlink_connection(self, camera: str | None = None) -> None:
-        if camera is None:
-            if self._mavlink_open_sides():
-                self.disconnect_mavlink_pixhawk()
-            else:
-                self.connect_mavlink_pixhawk()
-            return
-        if camera in self._mavlink_open_sides():
-            self.disconnect_mavlink_pixhawk(camera)
-        else:
-            self.connect_mavlink_pixhawk(camera)
 
-    def connect_cameras(self) -> None:
-        self._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
-    def start_yolo(self) -> None:
-        self._start_camera_streams(enable_detection=True, switch_to_depth=True)
 
-    def stop_yolo_detection(self) -> None:
-        if not self.camera_connected:
-            self._log("[YOLO] 연결된 카메라 스트림이 없어 중지할 YOLO가 없습니다.")
-            return
-        if not self.yolo_enabled:
-            self._log("[YOLO] 이미 중지 상태입니다. 카메라 프리뷰는 유지 중입니다.")
-            return
-        self._log("[YOLO] 검출을 중지하고 카메라 프리뷰만 유지합니다.")
-        self._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
-    def _start_camera_streams(self, *, enable_detection: bool, switch_to_depth: bool) -> None:
-        kwargs = self.yolo_kwargs()
-        left_url = self.left_url_edit.text().strip()
-        right_url = self.right_url_edit.text().strip()
-        if not left_url or not right_url:
-            self._log("[카메라] Left/Right RTSP URL을 입력해야 합니다.")
-            return
-        if self._rtsp_urls_are_same_stream():
-            message = "카메라: 좌/우 RTSP URL이 같은 스트림입니다. 좌우 카메라 IP를 분리하세요."
-            self.camera_connection_label.setText(message)
-            self._set_distance_text("거리: 좌/우 RTSP URL이 동일해 측정 차단", quality="BAD")
-            self._log(f"[카메라] {message}")
-            return
-        self._log("[연결] 카메라 프리뷰/YOLO는 설정된 인터페이스와 RTSP URL을 사용합니다.")
-        self.start_button.setEnabled(False)
-        self.camera_connect_button.setEnabled(False)
-        if switch_to_depth:
-            self.tabs.setCurrentIndex(self.depth_tab_index)
-        if enable_detection:
-            message = "[YOLO] 좌/우 WIRIS 스트림을 YOLO Depth 측정 모드로 시작합니다."
-        else:
-            message = "[카메라] 좌/우 WIRIS RTSP 프리뷰 스트림을 시작합니다."
-        if self.camera_sync_status not in {
-            CAMERA_SYNC_STATUS_RECONNECTING,
-            CAMERA_SYNC_STATUS_WARMING,
-        }:
-            self._camera_sync_transport_override = None
-            self._set_camera_sync_state(
-                CAMERA_SYNC_STATUS_NOT_VERIFIED,
-                "새 스트림은 STUS 후 RTCP/NTP 검증이 필요합니다.",
-            )
-        if self.camera_connected:
-            message += " 기존 스트림은 재시작합니다."
-        self._log(message)
-        self._stop_camera_panes(clear_previews=False)
-        self.active_stream_decoders["left"] = None
-        self.active_stream_decoders["right"] = None
-        self._clear_detection_state()
-        # Restarting the stream re-establishes the RTCP Sender Report anchor, so
-        # samples taken against the previous anchor are a different series and
-        # would also hold the y axis at the pre-resync scale.
-        if hasattr(self, "clock_offset_plot"):
-            self.clock_offset_plot.clear()
-            self._last_clock_offset_sample_s = 0.0
-        if enable_detection:
-            self._clear_calibration_previews("YOLO depth mode")
 
-        def start_both() -> None:
-            left_started = self.left_pane.start_stream(
-                left_url,
-                enable_detection=enable_detection,
-                **kwargs,
-                **self._video_recording_kwargs("left"),
-            )
-            if not left_started:
-                self.camera_connected = False
-                self.yolo_enabled = False
-                self.camera_connection_label.setText("카메라: 이전 Left worker 종료 대기 중")
-                self._log("[카메라] Left worker가 종료되지 않아 새 스트림을 시작하지 않았습니다.")
-                self.start_button.setEnabled(True)
-                self.camera_connect_button.setEnabled(True)
-                self._refresh_operation_header()
-                return
-            right_started = self.right_pane.start_stream(
-                right_url,
-                enable_detection=enable_detection,
-                **kwargs,
-                **self._video_recording_kwargs("right"),
-            )
-            if not right_started:
-                self.left_pane.stop(wait=True)
-                self.camera_connected = False
-                self.yolo_enabled = False
-                self.camera_connection_label.setText("카메라: 이전 Right worker 종료 대기 중")
-                self._log("[카메라] Right worker가 종료되지 않아 새 스트림을 중단했습니다.")
-                self.start_button.setEnabled(True)
-                self.camera_connect_button.setEnabled(True)
-                self._refresh_operation_header()
-                return
-            self.camera_connected = True
-            self.yolo_enabled = enable_detection
-            self.start_button.setEnabled(True)
-            self.camera_connect_button.setEnabled(True)
-            self._refresh_session_toggle_buttons()
-            self._refresh_operation_header()
 
-        start_both()
 
-    def stop_yolo_streams(self, *, wait: bool = False) -> bool:
-        self._camera_sync_timer.stop()
-        self._camera_sync_deadline_monotonic_s = None
-        self._camera_sync_transport_override = None
-        finalize_session = self._session_recording_active()
-        final_clock_sync_snapshot = (
-            self._camera_time_sync_snapshot("last_observed_before_stream_stop")
-            if finalize_session
-            else None
-        )
-        if final_clock_sync_snapshot is not None:
-            self._recording_clock_sync_end_observation = final_clock_sync_snapshot
-        panes_stopped = self._stop_camera_panes(clear_previews=True, wait=wait)
-        if wait and not panes_stopped:
-            self._log("[종료] 카메라 worker가 아직 종료 중입니다. 다음 종료 시도에서 다시 확인합니다.")
-            return False
-        if finalize_session:
-            self.distance_recording_enabled = False
-            self.video_recording_enabled = False
-            self.distance_recording_started_monotonic_s = None
-            self.record_button.setText("세션 기록 시작")
-            self._log(f"[저장] 카메라 Preview 해제로 세션 기록을 중지했습니다: {self._format_video_recording_paths()}")
-            self.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
-        self._clear_detection_state()
-        self.camera_connected = False
-        self.yolo_enabled = False
-        self._set_camera_sync_state(
-            CAMERA_SYNC_STATUS_NOT_VERIFIED,
-            "스트림이 중지되어 동기화 검증이 초기화되었습니다.",
-        )
-        self.camera_connection_label.setText("카메라: 연결 해제")
-        self.start_button.setEnabled(True)
-        self.camera_connect_button.setEnabled(True)
-        self._refresh_session_toggle_buttons()
-        self._refresh_operation_header()
-        return True
 
-    def _stop_camera_panes(self, *, clear_previews: bool, wait: bool = False) -> bool:
-        left_stopped = self.left_pane.stop(wait=wait)
-        right_stopped = self.right_pane.stop(wait=wait)
-        self.camera_frame_times["left"].clear()
-        self.camera_frame_times["right"].clear()
-        self.camera_frame_metadata["left"] = {}
-        self.camera_frame_metadata["right"] = {}
-        self.camera_frame_metadata_history["left"].clear()
-        self.camera_frame_metadata_history["right"].clear()
-        self.camera_stream_stats["left"] = {}
-        self.camera_stream_stats["right"] = {}
-        self.active_stream_decoders["left"] = None
-        self.active_stream_decoders["right"] = None
-        self._update_runtime_camera_stats_labels()
-        if clear_previews:
-            self._clear_calibration_previews("left preview", right_text="right preview")
-        return bool(left_stopped and right_stopped)
 
-    def _clear_calibration_previews(self, left_text: str, *, right_text: str | None = None) -> None:
-        self.latest_calibration_preview_images.clear()
-        self.calibration_preview_overlay_images.clear()
-        self.calibration_preview_request_ids["left"] = 0
-        self.calibration_preview_request_ids["right"] = 0
-        if right_text is None:
-            right_text = left_text
-        for label, text in (
-            (self.calibration_left_preview, left_text),
-            (self.calibration_right_preview, right_text),
-        ):
-            label.setPixmap(QtGui.QPixmap())
-            label.setText(text)
 
-    def _clear_detection_state(self) -> None:
-        self.latest_left = None
-        self.latest_right = None
-        self.detection_buffers["left"].clear()
-        self.detection_buffers["right"].clear()
-        self.left_pane.latest_detection = None
-        self.right_pane.latest_detection = None
-        self._clear_measurement_pair_display()
-        self._refresh_distance()
 
-    def stop_all(self, *, wait: bool = False) -> bool:
-        if not self.stop_yolo_streams(wait=wait):
-            return False
-        if not self._stop_pixhawk_operation_workers(wait=wait):
-            return False
-        self.disconnect_mavlink_pixhawk()
-        if not self._stop_calibration_preview_worker():
-            return False
-        all_stopped = True
-        for attr in (
-            "camera_auto_detect_thread",
-            "wiris_control_check_thread",
-            "wiris_command_thread",
-            "wiris_zoom_thread",
-            "wiris_time_sync_thread",
-            "wiris_gdti_thread",
-            "wiris_stip_thread",
-            "camera_network_discovery_thread",
-            "camera_network_apply_thread",
-            "interface_status_thread",
-            "pixhawk_usb_discovery_thread",
-            "pixhawk_host_ip_discovery_thread",
-            "rtsp_check_thread",
-            "rtsp_enable_thread",
-        ):
-            thread = getattr(self, attr, None)
-            if thread is None:
-                continue
-            thread.quit()
-            if thread.isRunning() and not thread.wait(1000):
-                all_stopped = False
-                continue
-            if getattr(self, attr, None) is thread:
-                setattr(self, attr, None)
-        return all_stopped
 
-    def _stop_pixhawk_operation_workers(self, *, wait: bool) -> bool:
-        all_stopped = True
-        for attr in (
-            "pixhawk_connection_thread",
-            "pixhawk_stream_setup_thread",
-            "pixhawk_usb_bootstrap_thread",
-            "pixhawk_persistent_config_thread",
-            "pixhawk_rtcm_thread",
-        ):
-            thread = getattr(self, attr, None)
-            if thread is None:
-                continue
-            worker_attr = attr.replace("_thread", "_worker")
-            worker = getattr(self, worker_attr, None)
-            if attr == "pixhawk_rtcm_thread" and worker is not None:
-                try:
-                    worker.clear_pending()
-                except Exception:
-                    pass
-            thread.quit()
-            if wait and thread.isRunning() and not thread.wait(1000):
-                all_stopped = False
-                continue
-            if not thread.isRunning() and getattr(self, attr, None) is thread:
-                setattr(self, attr, None)
-                if getattr(self, worker_attr, None) is worker:
-                    setattr(self, worker_attr, None)
-        for workers in (self.pixhawk_shell_threads, self.pixhawk_parameter_threads):
-            for camera, thread in list(workers.items()):
-                try:
-                    thread.quit()
-                    if wait and thread.isRunning() and not thread.wait(1000):
-                        all_stopped = False
-                        continue
-                except RuntimeError:
-                    pass
-                if not thread.isRunning():
-                    workers.pop(camera, None)
-                    if workers is self.pixhawk_shell_threads:
-                        self.pixhawk_shell_workers.pop(camera, None)
-                    else:
-                        self.pixhawk_parameter_workers.pop(camera, None)
-        return all_stopped
 
     def _distance_history_key(self, point: DistanceHistoryPoint) -> tuple[object, ...]:
         return point.sample_key or (point.timestamp_s, point.distance_m, point.method)
 
-    def _refresh_recording_status_label(self) -> None:
-        if self._session_save_thread is not None:
-            self.recording_status_label.setText(
-                f"세션 기록: 저장 중, session={self.recording_session_id or 'none'}"
-            )
-            return
-        state = "진행 중" if self._session_recording_active() else "중지"
-        session = f", session={self.recording_session_id}" if self.recording_session_id else ""
-        self.recording_status_label.setText(
-            "세션 기록: "
-            f"{state}, 매칭 프레임쌍={len(self.distance_recording_rows)}{session}"
-        )
+    def _recording_controller(self):
+        owner = getattr(self, "_recording_controller_owner", None)
+        if owner is None:
+            owner = RecordingController(self)
+            self._recording_controller_owner = owner
+        return owner
 
-    def _recording_table_value(self, row: dict[str, object], field: str) -> str:
-        value = row.get(field, "")
-        if value is None:
-            return ""
-        return str(value)
+    def _calibration_workflow_controller(self):
+        owner = getattr(self, "_calibration_workflow_controller_owner", None)
+        if owner is None:
+            owner = CalibrationWorkflowController(self)
+            self._calibration_workflow_controller_owner = owner
+        return owner
 
-    def _recording_preview_rows(self) -> list[dict[str, object]]:
-        rows = self.distance_recording_rows
-        if isinstance(rows, SpoolRows):
-            return rows.preview_rows
-        return list(rows[-RECORDING_PREVIEW_LIMIT:])
+    def _device_runtime_controller(self):
+        owner = getattr(self, "_device_runtime_controller_owner", None)
+        if owner is None:
+            owner = DeviceRuntimeController(self)
+            self._device_runtime_controller_owner = owner
+        return owner
 
-    def _recording_sheet_names(self) -> tuple[str, ...]:
-        """Workbook sheet names, in write order, without needing session rows."""
+    def _gnss_runtime_controller(self):
+        owner = getattr(self, "_gnss_runtime_controller_owner", None)
+        if owner is None:
+            owner = GnssRuntimeController(self)
+            self._gnss_runtime_controller_owner = owner
+        return owner
 
-        return tuple(sheet.name for sheet in session_sheet_previews({}, []))
+    def _measurement_view_controller(self):
+        owner = getattr(self, "_measurement_view_controller_owner", None)
+        if owner is None:
+            owner = MeasurementViewController(self)
+            self._measurement_view_controller_owner = owner
+        return owner
 
-    def _active_recording_sheet_name(self) -> str | None:
-        if not hasattr(self, "recording_sheet_tabs"):
-            return None
-        index = self.recording_sheet_tabs.currentIndex()
-        if index < 0:
-            return None
-        return self.recording_sheet_tabs.tabText(index)
+    def _sensor_presentation_controller(self):
+        owner = getattr(self, "_sensor_presentation_controller_owner", None)
+        if owner is None:
+            owner = SensorPresentationController(self)
+            self._sensor_presentation_controller_owner = owner
+        return owner
 
-    def _append_recording_table_row(self, _row: dict[str, object]) -> None:
-        """Refresh the visible sheet after one accepted pair was recorded.
+    def _camera_stream_lifecycle_controller(self):
+        owner = getattr(self, "_camera_stream_lifecycle_controller_owner", None)
+        if owner is None:
+            owner = CameraStreamLifecycleController(self)
+            self._camera_stream_lifecycle_controller_owner = owner
+        return owner
 
-        Sheet columns are projected from every recorded row, so a new sample
-        can widen them; rebuilding the visible sheet is simpler than patching
-        one row into each of the seven sheets.
-        """
+    def _wiris_control_controller(self):
+        owner = getattr(self, "_wiris_control_controller_owner", None)
+        if owner is None:
+            owner = WirisControlController(self)
+            self._wiris_control_controller_owner = owner
+        return owner
 
-        self._refresh_active_recording_sheet(scroll_to_bottom=True)
-
-    def _refresh_active_recording_sheet(self, *, scroll_to_bottom: bool = False) -> None:
-        sheet_name = self._active_recording_sheet_name()
-        if sheet_name is None:
-            return
-        table = self.recording_sheet_tables.get(sheet_name)
-        if table is None:
-            return
-        rows = self._recording_preview_rows()
-        # Only the key/value sheets read metadata, and building it runs the
-        # clock-sync and camera-timing probes — skip it on the sample sheets,
-        # which are refreshed once per recorded pair.
-        needs_metadata = sheet_name in {"Summary", "CalibrationStatic"}
-        metadata = self._recording_session_metadata() if needs_metadata else {}
-        preview = next(
-            (sheet for sheet in session_sheet_previews(metadata, rows) if sheet.name == sheet_name),
-            None,
-        )
-        if preview is None:
-            return
-        table.blockSignals(True)
-        try:
-            if preview.kind == "key_value":
-                self._fill_recording_sheet(table, ("key", "value"), [
-                    (str(key), "" if value is None else str(value)) for key, value in preview.entries
-                ])
-            else:
-                display_rows = (
-                    compact_distance_measurement_rows(
-                        rows,
-                        {
-                            "session_started_unix_ns": self.recording_session_started_unix_ns,
-                            "session_started_monotonic_ns": self.recording_session_started_monotonic_ns,
-                        },
-                    )
-                    if sheet_name == "DistanceMeasurements"
-                    else []
-                )
-                self._fill_recording_sheet(
-                    table,
-                    preview.columns,
-                    [
-                        tuple(self._recording_table_value(row, field) for field in preview.columns)
-                        for row in display_rows
-                    ],
-                )
-        finally:
-            table.blockSignals(False)
-        if scroll_to_bottom and table.rowCount():
-            table.scrollToBottom()
-            table.selectRow(table.rowCount() - 1)
-        self._refresh_recording_sample_detail()
-
-    def _fill_recording_sheet(
-        self,
-        table: QtWidgets.QTableWidget,
-        headers: Sequence[str],
-        rows: Sequence[Sequence[str]],
-    ) -> None:
-        table.clear()
-        table.setColumnCount(len(headers))
-        table.setHorizontalHeaderLabels(list(headers))
-        table.setRowCount(len(rows))
-        for row_index, values in enumerate(rows):
-            for column_index, value in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(value)
-                item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
-                table.setItem(row_index, column_index, item)
-
-    def _refresh_recording_table(self) -> None:
-        if not hasattr(self, "recording_sheet_tabs"):
-            return
-        self._refresh_active_recording_sheet()
-        if not self.distance_recording_rows:
-            self.recording_sample_detail.clear()
-
-    def _refresh_recording_sample_detail(self) -> None:
-        if not hasattr(self, "recording_sheet_tabs"):
-            return
-        sheet_name = self._active_recording_sheet_name()
-        table = self.recording_sheet_tables.get(sheet_name) if sheet_name else None
-        if table is None:
-            return
-        selected_rows = table.selectionModel().selectedRows()
-        preview_rows = self._recording_preview_rows()
-        if not selected_rows:
-            self.recording_sample_detail.clear()
-            return
-        row_index = selected_rows[0].row()
-        # Key/value sheets hold metadata, not samples, so there is no row to expand.
-        if row_index < 0 or row_index >= len(preview_rows):
-            self.recording_sample_detail.clear()
-            return
-        row = preview_rows[row_index]
-        lines = [f"{key}: {value}" for key, value in row.items()]
-        self.recording_sample_detail.setPlainText("\n".join(lines))
-
-    def toggle_session_recording(self) -> None:
-        if self._session_recording_active():
-            self._stop_session_recording()
-            return
-        self._start_session_recording()
-
-    def _start_session_recording(self) -> None:
-        if self._session_save_thread is not None:
-            self.recording_status_label.setText("세션 기록: 이전 세션 저장 완료 대기 중")
-            return
-        self.recording_session_id = session_id_now()
-        self._session_save_finalized = False
-        self._measurement_attempt_generation_id = _new_measurement_attempt_generation_id(
-            self.recording_session_id
-        )
-        monotonic_before_ns = time.monotonic_ns()
-        self.recording_session_started_unix_ns = time.time_ns()
-        monotonic_after_ns = time.monotonic_ns()
-        self.recording_session_started_monotonic_ns = (
-            monotonic_before_ns + monotonic_after_ns
-        ) // 2
-        self.recording_session_anchor_uncertainty_ns = (
-            monotonic_after_ns - monotonic_before_ns
-        ) // 2
-        self.recording_session_started_wall_s = self.recording_session_started_unix_ns * 1e-9
-        self.recording_session_started_monotonic_s = self.recording_session_started_monotonic_ns * 1e-9
-        self.distance_recording_started_monotonic_s = self.recording_session_started_monotonic_s
-        self.distance_recording_rows = SpoolRows(
-            preview_limit=RECORDING_PREVIEW_LIMIT,
-            supports_updates=True,
-        )
-        self.distance_recording_keys.clear()
-        self.external_parameter_recording_rows.clear()
-        spool_root = self._recording_session_dir(self.recording_session_id) / ".spool"
-        self.distance_recording_rows.bind(spool_root / "pair_rows.jsonl")
-        self.camera_recording_rows = {
-            side: SpoolRows() for side in ("left", "right")
-        }
-        self.px4_recording_rows = {
-            side: SpoolRows() for side in ("left", "right")
-        }
-        self.gnss_base_recording_rows = SpoolRows()
-        for side, rows in self.camera_recording_rows.items():
-            rows.bind(spool_root / f"camera_{side}.jsonl")
-        for side, rows in self.px4_recording_rows.items():
-            rows.bind(spool_root / f"px4_{side}.jsonl")
-        self.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
-        self._recording_pair_row_index.clear()
-        self._recovered_session_metadata = None
-        self._recording_clock_sync_start_observation = None
-        self._recording_clock_sync_end_observation = None
-        self.recording_reference_attitudes = {
-            camera: AttitudeSnapshot.from_state(state)
-            for camera, state in self.latest_extrinsics.items()
-            if camera in {"left", "right"}
-        }
-        self.recording_reference_gps = {
-            camera: GpsSnapshot.from_state(state)
-            for camera, state in self.latest_gps.items()
-            if camera in {"left", "right"}
-        }
-        self.recording_origin_gps = self.recording_reference_gps.get("left")
-        left_reference_gps = self.recording_reference_gps.get("left")
-        right_reference_gps = self.recording_reference_gps.get("right")
-        self.recording_reference_baseline_ned_m = (
-            None
-            if left_reference_gps is None or right_reference_gps is None
-            else ned_delta_m(left_reference_gps, right_reference_gps)
-        )
-        self.distance_recording_enabled = True
-        self.video_recording_enabled = True
-        self._record_px4_mag_status_snapshot()
-        self._last_distance_history_key = None
-        self._measurement_attempt_counter = 0
-        self._last_measurement_attempt_key = None
-        self._last_measurement_attempt = None
-        self._prepare_video_recording_paths()
-        write_recovery_metadata(
-            self._recording_session_dir(self.recording_session_id),
-            self._recording_session_metadata(),
-        )
-        self._refresh_recording_table()
-        self.record_button.setText("세션 기록 중지")
-        self._log(
-            "[저장] 세션 기록을 시작했습니다: "
-            f"session={self.recording_session_id}, {self._format_video_recording_paths()}"
-        )
-        if self.camera_connected:
-            self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
-        else:
-            self._log("[저장] 카메라 스트림을 시작하면 좌/우 영상 녹화가 함께 시작됩니다.")
-        self._refresh_recording_status_label()
-        self._refresh_operation_header()
-
-    def _stop_session_recording(self) -> None:
-        final_clock_sync_snapshot = (
-            self._camera_time_sync_snapshot("last_observed_before_session_stop")
-            if self._session_recording_active()
-            else None
-        )
-        if final_clock_sync_snapshot is not None:
-            self._recording_clock_sync_end_observation = final_clock_sync_snapshot
-        self.distance_recording_enabled = False
-        self.video_recording_enabled = False
-        self.distance_recording_started_monotonic_s = None
-        self.record_button.setText("세션 기록 시작")
-        self._log(
-            "[저장] 세션 기록을 중지했습니다: "
-            f"session={self.recording_session_id or 'none'}, {self._format_video_recording_paths()}"
-        )
-        if self.camera_connected:
-            self._start_camera_streams(enable_detection=self.yolo_enabled, switch_to_depth=self.yolo_enabled)
-        self.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
-        self._refresh_recording_status_label()
-        self._refresh_operation_header()
-
-    def toggle_distance_recording(self) -> None:
-        self.toggle_session_recording()
-
-    def toggle_video_recording(self) -> None:
-        self.toggle_session_recording()
+    def _app_lifecycle_controller(self):
+        owner = getattr(self, "_app_lifecycle_controller_owner", None)
+        if owner is None:
+            owner = AppLifecycleController(self)
+            self._app_lifecycle_controller_owner = owner
+        return owner
 
     def clear_distance_history(self) -> None:
         if self._session_save_thread is not None:
@@ -14669,12 +9297,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.manual_focal_checkbox.setChecked(bool(values["manual_focal_override"]))
 
         if has("gnss_operation"):
-            config = GnssOperationConfig.from_mapping(values["gnss_operation"])
-            self._workstation_setting_overrides["gnss_operation"] = config.to_mapping()
+            operation = GnssOperationConfig.from_mapping(values["gnss_operation"]).to_mapping()
+            operation.pop("require_drone_rtk_fixed", None)
+            operation["routing"] = {
+                **operation["routing"],
+                "drone_enabled": False,
+                "field_base_enabled": operation["operation_mode"]
+                == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value,
+            }
+            config = GnssOperationConfig.from_mapping(operation)
             operation = config.to_mapping()
+            operation.pop("require_drone_rtk_fixed", None)
+            self._workstation_setting_overrides["gnss_operation"] = operation
             self._set_combo_data(self.gnss_operation_mode_combo, operation["operation_mode"])
+            self.gnss_site_label_edit.setText(str(operation.get("site_label", "")))
+            self.gnss_site_address_edit.setText(str(operation.get("site_address", "")))
+            set_numeric_widget(self.gnss_rover_min_fix_type_spin, operation["readiness"].get("minimum_fix_type", 3))
             set_checked("gnss_readiness_gate_enabled", "gnss_readiness_gate_checkbox")
-            set_checked("gnss_require_drone_rtk_fixed", "gnss_require_drone_rtk_fixed_checkbox")
             network = operation["network"]
             for name, attribute in (
                 ("caster_host", "gnss_ntrip_host_edit"),
@@ -14720,10 +9359,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log("[설정] Workstation 전체 설정을 owner widget에 적용했습니다.")
 
     def apply_workstation_measurement_settings(self, values: dict[str, object]) -> None:
-        """Apply Workstation measurement controls to this panel's owner widgets.
+        """Apply Workstation Measurement and Time/Sync controls to owner widgets.
 
         This is intentionally a thin UI bridge.  The panel remains the single
-        owner of AppSettings, stream workers, measurement gates, and geometry;
+        owner of AppSettings, stream workers, measurement gates, geometry, and
+        camera synchronization limits;
         Workstation only supplies validated widget values.  Timing values keep
         their displayed units (milliseconds/percent) until the existing
         ``_save_current_settings`` conversion writes AppSettings.
@@ -14798,7 +9438,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_camera_parameters_tab()
         self._refresh_operation_header()
         self._log(
-            "[측정] Workstation 설정 적용: "
+            "[설정] Workstation Measurement/Time-Sync 설정 적용: "
             f"intrinsics={self._intrinsics_source()}, "
             f"extrinsics={self._distance_mode()}, "
             "public output=baseline_center_frd [Forward,Right,Down,Range]"
@@ -14850,679 +9490,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "image geometry remains OpenCV optical RDF"
         )
 
-    def discover_pc_camera_ip(self) -> None:
-        if self.camera_network_discovery_thread is not None:
-            self._log("[연결] PC IP 탐색이 이미 진행 중입니다.")
-            return
-        self._log("[연결] PC IP 탐색: 카메라망 인터페이스와 PC IP를 함께 탐색합니다.")
-        self.detect_pc_ip_button.setEnabled(False)
-        self.camera_connection_label.setText("camera host IP: discovering...")
-        self.camera_network_discovery_thread = QtCore.QThread(self)
-        self.camera_network_discovery_worker = CameraNetworkDiscoveryWorker(
-            host_address=self.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
-            host_hints=self._camera_host_hints(),
-        )
-        self.camera_network_discovery_worker.moveToThread(self.camera_network_discovery_thread)
-        self.camera_network_discovery_thread.started.connect(self.camera_network_discovery_worker.run)
-        self.camera_network_discovery_worker.discovered.connect(self._apply_camera_network_discovery)
-        self.camera_network_discovery_worker.failed.connect(self._camera_network_discovery_failed)
-        self.camera_network_discovery_worker.finished.connect(self.camera_network_discovery_thread.quit)
-        self.camera_network_discovery_worker.finished.connect(self.camera_network_discovery_worker.deleteLater)
-        self.camera_network_discovery_thread.finished.connect(self.camera_network_discovery_thread.deleteLater)
-        self.camera_network_discovery_thread.finished.connect(self._clear_camera_network_discovery)
-        self.camera_network_discovery_thread.start()
 
-    def _apply_camera_network_discovery(self, result: object) -> None:
-        data = dict(result or {})
-        candidates = list(data.get("candidates") or [])
-        if not candidates:
-            self._log("[연결] PC IP 탐색: 사용할 수 있는 유선 인터페이스를 찾지 못했습니다.")
-            self.camera_connection_label.setText("camera host IP: interface not found")
-            self._refresh_operation_header()
-            return
-        self._apply_host_interface_candidates(candidates)
-        interface_name = self.interface_edit.text().strip()
-        resolved_address = data.get("resolved_address")
-        if resolved_address is None:
-            connection_name = data.get("connection_name")
-            addresses = tuple(data.get("addresses") or ())
-            if connection_name is None:
-                self._log(f"[연결] PC IP 탐색: {interface_name}에 활성 NetworkManager 연결이 없습니다.")
-            else:
-                if addresses:
-                    address_text = ", ".join(str(address) for address in addresses)
-                    self._log(f"[연결] PC IP 탐색: 활성 프로필 {connection_name} 주소={address_text}")
-                else:
-                    self._log(f"[연결] PC IP 탐색: 활성 프로필 {connection_name}에서 주소를 찾지 못했습니다.")
-            self.camera_connection_label.setText("camera host IP: not found")
-            self._refresh_operation_header()
-            return
-        resolved_text = str(resolved_address)
-        self.host_address_edit.setText(resolved_text)
-        self._log(
-            f"[연결] PC IP 탐색: NetworkManager 활성 프로필에서 카메라망 IP를 찾았습니다: "
-            f"{interface_name} {resolved_text}"
-        )
-        self.camera_connection_label.setText(f"camera host IP: found {resolved_text}")
-        self._refresh_operation_header()
 
-    def _camera_network_discovery_failed(self, error: str) -> None:
-        self._log(f"[연결] PC IP 탐색 실패: {error}")
-        self.camera_connection_label.setText(f"camera host IP: failed ({error})")
-        self._refresh_operation_header()
 
-    def _clear_camera_network_discovery(self) -> None:
-        self.camera_network_discovery_thread = None
-        self.camera_network_discovery_worker = None
-        self.detect_pc_ip_button.setEnabled(True)
 
-    def discover_pc_pixhawk_ip(self) -> None:
-        if self.pixhawk_host_ip_discovery_thread is not None:
-            self._log("[픽스호크] PC IP 탐색이 이미 진행 중입니다.")
-            return
-        self.detect_pixhawk_host_ip_button.setEnabled(False)
-        self.pixhawk_connection_label.setText("pixhawk host IP: discovering...")
-        self.pixhawk_host_ip_discovery_thread = QtCore.QThread(self)
-        self.pixhawk_host_ip_discovery_worker = PixhawkHostIpDiscoveryWorker()
-        self.pixhawk_host_ip_discovery_worker.moveToThread(self.pixhawk_host_ip_discovery_thread)
-        self.pixhawk_host_ip_discovery_thread.started.connect(self.pixhawk_host_ip_discovery_worker.run)
-        self.pixhawk_host_ip_discovery_worker.discovered.connect(self._apply_pixhawk_host_ip_discovery)
-        self.pixhawk_host_ip_discovery_worker.failed.connect(self._pixhawk_host_ip_discovery_failed)
-        self.pixhawk_host_ip_discovery_worker.finished.connect(self.pixhawk_host_ip_discovery_thread.quit)
-        self.pixhawk_host_ip_discovery_worker.finished.connect(self.pixhawk_host_ip_discovery_worker.deleteLater)
-        self.pixhawk_host_ip_discovery_thread.finished.connect(self.pixhawk_host_ip_discovery_thread.deleteLater)
-        self.pixhawk_host_ip_discovery_thread.finished.connect(self._clear_pixhawk_host_ip_discovery)
-        self.pixhawk_host_ip_discovery_thread.start()
 
-    def _apply_pixhawk_host_ip_discovery(self, interfaces: object) -> None:
-        rows = list(interfaces or [])
-        if not rows:
-            self._log("[픽스호크] PC IP 탐색: 활성 IPv4 인터페이스를 찾지 못했습니다.")
-            self.pixhawk_connection_label.setText("pixhawk host IP: not found")
-            self._refresh_operation_header()
-            return
-        self._append_pixhawk_host_ip_candidates(rows)
-        self.pixhawk_connection_label.setText("pixhawk host IP: 후보 표시됨 - 표에서 PC_IP를 선택해 적용하세요")
-        self._refresh_operation_header()
 
-    def _pixhawk_host_ip_discovery_failed(self, error: str) -> None:
-        self._log(f"[픽스호크] PC IP 탐색 실패: {error}")
-        self.pixhawk_connection_label.setText(f"pixhawk host IP: failed ({error})")
-        self._refresh_operation_header()
 
-    def _clear_pixhawk_host_ip_discovery(self) -> None:
-        self.pixhawk_host_ip_discovery_thread = None
-        self.pixhawk_host_ip_discovery_worker = None
-        self.detect_pixhawk_host_ip_button.setEnabled(True)
 
-    def _append_pixhawk_host_ip_candidates(self, interfaces: Sequence[object]) -> None:
-        hints: list[IPv4Address] = []
-        for text in (
-            self.left_pixhawk_eth_ip_edit.text().strip(),
-            self.right_pixhawk_eth_ip_edit.text().strip(),
-            *self._active_mavlink_remote_hosts(),
-        ):
-            if not text:
-                continue
-            try:
-                hints.append(IPv4Address(str(text).split("/", 1)[0]))
-            except ValueError:
-                continue
-        rows: list[dict[str, object]] = []
-        seen: set[tuple[str, str]] = set()
-        for candidate in interfaces:
-            ip_text = str(candidate.address.ip)
-            interface_name = str(getattr(candidate, "name", ""))
-            key = (interface_name, ip_text)
-            if key in seen:
-                continue
-            seen.add(key)
-            matching_hints = [str(hint) for hint in hints if hint in candidate.address.network]
-            status_parts = [str(candidate.address.network)]
-            if matching_hints:
-                status_parts.append("Pixhawk subnet match: " + ", ".join(matching_hints))
-            if interface_name.startswith(("wl", "wlan")):
-                status_parts.append("Wi-Fi")
-            else:
-                status_parts.append("wired/other")
-            rows.append(
-                {
-                    "kind": "PC_IP",
-                    "value": ip_text,
-                    "baud": "",
-                    "status": " | ".join(status_parts),
-                    "interface": interface_name,
-                }
-            )
-        if rows:
-            self._append_pixhawk_candidate_rows(rows, source="pc")
-            for row in rows:
-                self._log(
-                    f"[픽스호크] PC IP 후보: {row['interface']} {row['value']} "
-                    f"({row['status']})"
-                )
 
-    def apply_pc_camera_ip(self) -> None:
-        if self.camera_network_apply_thread is not None:
-            self._log("[연결] PC IP 적용이 이미 진행 중입니다.")
-            return
-        interface_name = self.interface_edit.text().strip()
-        address_text = self.host_address_edit.text().strip()
-        if not interface_name or not address_text:
-            self._log("[연결] PC IP 적용 실패: 인터페이스와 주소를 먼저 지정하세요.")
-            self.camera_connection_label.setText("camera host IP: missing")
-            return
-        self._log(f"[연결] PC IP 적용 시도: {interface_name} {address_text}")
-        self.apply_pc_ip_button.setEnabled(False)
-        self.camera_connection_label.setText("camera host IP: applying...")
-        self.camera_network_apply_thread = QtCore.QThread(self)
-        self.camera_network_apply_worker = CameraNetworkAddressApplyWorker(
-            interface_name=interface_name,
-            address_text=address_text,
-        )
-        self.camera_network_apply_worker.moveToThread(self.camera_network_apply_thread)
-        self.camera_network_apply_thread.started.connect(self.camera_network_apply_worker.run)
-        self.camera_network_apply_worker.applied.connect(self._apply_camera_network_address_result)
-        self.camera_network_apply_worker.failed.connect(self._camera_network_apply_failed)
-        self.camera_network_apply_worker.finished.connect(self.camera_network_apply_thread.quit)
-        self.camera_network_apply_worker.finished.connect(self.camera_network_apply_worker.deleteLater)
-        self.camera_network_apply_thread.finished.connect(self.camera_network_apply_thread.deleteLater)
-        self.camera_network_apply_thread.finished.connect(self._clear_camera_network_apply)
-        self.camera_network_apply_thread.start()
 
-    def _apply_camera_network_address_result(self, result: object) -> None:
-        data = dict(result or {})
-        interface_name = str(data.get("interface_name") or self.interface_edit.text().strip())
-        address_text = str(data.get("address_text") or self.host_address_edit.text().strip())
-        if not bool(data.get("ok")):
-            message = str(data.get("message") or "unknown error")
-            self._log(f"[연결] PC IP 적용 실패: {message}")
-            self.camera_connection_label.setText("camera host IP: apply failed")
-            self._refresh_operation_header()
-            return
-        self._log(f"[연결] PC IP 적용 완료: {data.get('message', '')}")
-        addresses = str(data.get("addresses") or "")
-        if addresses:
-            self._log(f"[연결] 네트워크 인터페이스 상태:\n{addresses}")
-        self.interface_edit.setText(interface_name)
-        self.host_address_edit.setText(address_text)
-        self._save_current_settings()
-        self.camera_connection_label.setText(f"camera host IP: applied {address_text}")
-        self._refresh_operation_header()
 
-    def _camera_network_apply_failed(self, error: str) -> None:
-        self._log(f"[연결] PC IP 적용 worker 실패: {error}")
-        self.camera_connection_label.setText(f"camera host IP: failed ({error})")
-        self._refresh_operation_header()
 
-    def _clear_camera_network_apply(self) -> None:
-        self.camera_network_apply_thread = None
-        self.camera_network_apply_worker = None
-        self.apply_pc_ip_button.setEnabled(True)
-
-    def save_distance_history_csv(
-        self,
-        *,
-        final_clock_sync_snapshot: dict[str, object] | None = None,
-    ) -> None:
-        if self.distance_recording_enabled:
-            self.recording_status_label.setText("세션 기록: 기록을 중지한 뒤 저장할 수 있습니다")
-            self._refresh_operation_header()
-            return
-        if self._session_save_thread is not None:
-            self.recording_status_label.setText("세션 기록: 저장 작업이 이미 진행 중입니다")
-            self._refresh_operation_header()
-            return
-        if self._session_save_finalized:
-            self.recording_status_label.setText("세션 기록: 현재 세션 파일은 이미 확정되었습니다")
-            return
-        if not self.recording_session_id and not self.distance_recording_rows:
-            self.recording_status_label.setText("세션 기록: 저장할 샘플 없음")
-            self._refresh_operation_header()
-            return
-        stamp = self.recording_session_id or session_id_now()
-        output_dir = self._recording_session_dir(stamp)
-        for rows in (
-            self.distance_recording_rows,
-            *self.camera_recording_rows.values(),
-            *self.px4_recording_rows.values(),
-            self.gnss_base_recording_rows,
-        ):
-            if isinstance(rows, SpoolRows):
-                rows.close()
-        if self._recovered_session_metadata is None:
-            metadata = self._recording_session_metadata(clock_sync_snapshot=final_clock_sync_snapshot)
-            write_recovery_metadata(output_dir, metadata)
-            self._recovered_session_metadata = json.loads(json.dumps(metadata))
-        else:
-            metadata = json.loads(json.dumps(self._recovered_session_metadata))
-            metadata.update(
-                {
-                    "matched_frame_pair_count": len(self.distance_recording_rows),
-                    "camera_left_gui_frame_count": len(self.camera_recording_rows["left"]),
-                    "camera_right_gui_frame_count": len(self.camera_recording_rows["right"]),
-                    "px4_left_sample_count": len(self.px4_recording_rows["left"]),
-                    "px4_right_sample_count": len(self.px4_recording_rows["right"]),
-                    "gnss_base_sample_count": len(self.gnss_base_recording_rows),
-                    "finalization": {
-                        "requested_unix_ns": time.time_ns(),
-                        "recovered_retry": True,
-                        "provenance_source": ".spool/session_metadata.json",
-                    },
-                }
-            )
-        if isinstance(self.distance_recording_rows, SpoolRows):
-            pair_rows = self.distance_recording_rows
-        else:
-            pair_rows = [dict(row) for row in self.distance_recording_rows]
-        thread = QtCore.QThread(self)
-        worker = SessionSaveWorker(
-            output_dir=output_dir,
-            metadata=metadata,
-            pair_rows=pair_rows,
-            camera_rows=dict(self.camera_recording_rows),
-            px4_rows=dict(self.px4_recording_rows),
-            gnss_base_rows=self.gnss_base_recording_rows,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.saved.connect(self._handle_session_saved)
-        worker.failed.connect(self._handle_session_save_failed)
-        worker.finished.connect(thread.quit, QtCore.Qt.DirectConnection)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(self._handle_session_save_thread_finished)
-        self._session_save_thread = thread
-        self._session_save_worker = worker
-        self._session_save_retry_required = False
-        self.record_button.setEnabled(False)
-        self.save_history_button.setEnabled(False)
-        self.recording_status_label.setText(
-            f"세션 기록: 저장 중, 매칭 프레임쌍={len(pair_rows)}개"
-        )
-        self._log(f"[저장] 세션 파일을 백그라운드에서 확정 중입니다: {output_dir}")
-        thread.start()
-        self._refresh_operation_header()
-
-    @QtCore.pyqtSlot(object)
-    def _handle_session_saved(self, saved_files: SavedSessionFiles) -> None:
-        self._log(
-            "[저장] 거리 측정 compact CSV/Parquet을 저장했습니다: "
-            f"csv={saved_files.distance_measurements_csv}, "
-            f"parquet={saved_files.distance_measurements_parquet}"
-        )
-        self._log(f"[저장] 세션 고정 JSON을 저장했습니다: {saved_files.session_static_json}")
-        self._log(
-            "[저장] GUI 전달 카메라 프레임 CSV/Parquet을 저장했습니다: "
-            f"left={saved_files.camera_left_csv}/{saved_files.camera_left_parquet}, "
-            f"right={saved_files.camera_right_csv}/{saved_files.camera_right_parquet}"
-        )
-        self._log(
-            "[저장] PX4 타임라인 CSV/Parquet을 저장했습니다: "
-            f"left={saved_files.px4_left_csv}/{saved_files.px4_left_parquet}, "
-            f"right={saved_files.px4_right_csv}/{saved_files.px4_right_parquet}"
-        )
-        self._log(f"[저장] 세션 manifest를 저장했습니다: {saved_files.manifest}")
-        if saved_files.finalized:
-            self._log(f"[저장] 목적별 탭 XLSX를 저장했습니다: {saved_files.xlsx}")
-            output_text = ", ".join(str(output) for output in saved_files.outputs)
-            self.recording_status_label.setText(
-                "세션 기록 저장 완료: "
-                f"매칭 프레임쌍={len(self.distance_recording_rows)}개 - {output_text}"
-            )
-            self._session_save_retry_required = False
-            self._session_save_finalized = True
-        else:
-            self._session_save_retry_required = True
-            self._session_save_finalized = False
-            self._log(f"[저장] XLSX 생성 실패; CSV는 확정되었으며 재시도할 수 있습니다: {saved_files.error}")
-            self.recording_status_label.setText(
-                f"세션 CSV 저장 완료 / XLSX 실패(재시도 가능): {saved_files.error}"
-            )
-        self._refresh_operation_header()
-
-    @QtCore.pyqtSlot(str)
-    def _handle_session_save_failed(self, error: str) -> None:
-        self._session_save_retry_required = True
-        self._session_save_finalized = False
-        self._log(f"[저장] 세션 파일 확정 실패; spool을 보존했습니다: {error}")
-        self.recording_status_label.setText(f"세션 저장 실패(재시도 가능): {error}")
-        self._refresh_operation_header()
-
-    @QtCore.pyqtSlot()
-    def _handle_session_save_thread_finished(self) -> None:
-        thread = self._session_save_thread
-        self._session_save_thread = None
-        self._session_save_worker = None
-        if thread is not None:
-            thread.deleteLater()
-        self.save_history_button.setEnabled(not self._session_save_finalized)
-        self.record_button.setEnabled(not self._session_save_retry_required)
-        self._refresh_operation_header()
-
-    def _wait_for_session_save(self, timeout_ms: int = 15000) -> bool:
-        thread = self._session_save_thread
-        if thread is None:
-            return True
-        completed = thread.wait(timeout_ms)
-        if not completed:
-            self._log(
-                "[저장] 종료 대기 시간이 초과되었습니다. 원본 spool과 manifest를 보존해 재시도할 수 있습니다."
-            )
-        return completed
-
-    def _record_px4_mag_status_rows(self) -> list[dict[str, object]]:
-        if not hasattr(self, "px4_mag_managers"):
-            return []
-        now_s = time.monotonic()
-        rows: list[dict[str, object]] = []
-        for camera, label in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
-            manager = self.px4_mag_managers.get(camera)
-            if manager is None:
-                continue
-            if not self._px4_mag_manager_has_data_source(camera):
-                continue
-            if not self._sync_px4_mag_manager_store(camera):
-                # A raw MAVLink sample does not expose CAL_MAG priority
-                # readback; retain live telemetry but do not persist guessed
-                # slot state from the local fallback defaults.
-                continue
-            status = self._px4_mag_status_cache.get(camera)
-            if status is None:
-                # PARAM readback is a blocking MAVLink operation and is owned
-                # by PixhawkParameterWorker.  Recording must never trigger a
-                # hidden readback from the GUI thread.
-                continue
-            for slot in status.slots:
-                rows.append(
-                    {
-                        "session_id": self.recording_session_id,
-                        "session_started_unix_s": self._fmt_record_float(self.recording_session_started_wall_s, 6),
-                        "recording_elapsed_s": self._fmt_record_float(self._recording_elapsed_s(now_s), 6),
-                        "recorded_app_timestamp_s": self._fmt_record_float(now_s, 6),
-                        "pixhawk_side": camera,
-                        "pixhawk_label": label,
-                        "cal_mag_slot": f"CAL_MAG{slot.slot}",
-                        "mag_slot": slot.slot,
-                        "mag_device_id": "" if slot.device_id is None else str(slot.device_id),
-                        "mag_device_type": slot.device_type,
-                        "mag_interface": slot.interface,
-                        "mag_is_rm3100": self._fmt_record_bool(slot.is_rm3100),
-                        "mag_priority": "" if slot.priority is None else str(slot.priority),
-                        "mag_rotation": "" if slot.rotation is None else str(slot.rotation),
-                        "mag_enabled": self._fmt_record_bool(slot.enabled),
-                        "mag_expected_selected": self._fmt_record_bool(slot.expected_selected),
-                        "mag_actual_selected": self._fmt_record_bool(slot.actual_selected),
-                        "mag_expected_selected_device_id": (
-                            "" if status.expected_selected_device_id is None else str(status.expected_selected_device_id)
-                        ),
-                        "mag_actual_selected_device_id": (
-                            "" if status.actual_selected_device_id is None else str(status.actual_selected_device_id)
-                        ),
-                        "mag_is_actual_rm3100": self._fmt_record_bool(status.is_actual_rm3100),
-                        "mag_armed": self._fmt_record_bool(status.armed),
-                        "mag_status": slot.status,
-                        "mag_warning_text": status.warning_text,
-                        "mag_rm3100_primary_id": status.rm3100_primary_id,
-                        "mag_rm3100_backup_id": status.rm3100_backup_id,
-                        "mag_param_uavcan_enable": status.params.get("UAVCAN_ENABLE"),
-                        "mag_param_uavcan_sub_mag": status.params.get("UAVCAN_SUB_MAG"),
-                        "mag_param_ekf2_mag_type": status.params.get("EKF2_MAG_TYPE"),
-                        "mag_param_snapshot_json": json.dumps(status.params, sort_keys=True),
-                    }
-                )
-        return rows
-
-    def _record_px4_mag_status_snapshot(self, camera: str | None = None) -> None:
-        """Persist the current MAG slot/priority selection state in the PX4 timeline."""
-        for values in self._record_px4_mag_status_rows():
-            if camera is not None and values.get("pixhawk_side") != camera:
-                continue
-            self._record_external_timeline_row(
-                str(values["pixhawk_side"]),
-                "mag_slot_status",
-                {
-                    "namespace": "",
-                    "topic": "px4_mag_manager",
-                    "sample_app_timestamp_s": values["recorded_app_timestamp_s"],
-                    "sensor_slot": values["cal_mag_slot"],
-                    **values,
-                },
-            )
-
-    def _recording_camera_timing_diagnostics(self) -> dict[str, object]:
-        """Summarize the raw camera timing evidence retained in the session spool."""
-
-        def numeric_values(rows: list[dict[str, object]], field: str) -> list[float]:
-            values: list[float] = []
-            for row in rows:
-                value = row.get(field)
-                try:
-                    parsed = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if isfinite(parsed):
-                    values.append(parsed)
-            return values
-
-        def summary(values: list[float], *, scale: float = 1.0) -> dict[str, float | None]:
-            if not values:
-                return {"min": None, "median": None, "max": None}
-            scaled = [value * scale for value in values]
-            return {
-                "min": min(scaled),
-                "median": median(scaled),
-                "max": max(scaled),
-            }
-
-        diagnostics: dict[str, object] = {}
-        for camera in ("left", "right"):
-            rows = [dict(row) for row in self.camera_recording_rows[camera]]
-            valid_rtcp_count = sum(
-                1 for row in rows
-                if row.get("rtcp_frame_ntp_unix_s") not in (None, "")
-            )
-            invalid_rtcp_count = sum(
-                1 for row in rows
-                if row.get("rtcp_timing_invalid_reason") not in (None, "")
-            )
-            clock_rate_values = numeric_values(rows, "rtcp_clock_rate_hz")
-            media_rate_values = numeric_values(rows, "rtcp_camera_media_rate")
-            estimated_media_clock_values: list[float] = []
-            for row in rows:
-                try:
-                    clock_rate = float(row.get("rtcp_clock_rate_hz"))
-                    media_rate = float(row.get("rtcp_camera_media_rate"))
-                except (TypeError, ValueError):
-                    continue
-                if isfinite(clock_rate) and isfinite(media_rate):
-                    estimated_media_clock_values.append(clock_rate * media_rate)
-            rtp_timestamps = numeric_values(rows, "rtp_timestamp")
-            diagnostics[camera] = {
-                "frame_count": len(rows),
-                "rtcp_valid_frame_count": valid_rtcp_count,
-                "rtcp_missing_frame_count": max(0, len(rows) - valid_rtcp_count),
-                "rtcp_invalid_frame_count": invalid_rtcp_count,
-                "rtcp_valid_ratio": (
-                    None if not rows else valid_rtcp_count / float(len(rows))
-                ),
-                "rtcp_receive_delay_ms": summary(
-                    numeric_values(rows, "rtcp_frame_receive_delay_s"),
-                    scale=1000.0,
-                ),
-                "rtcp_transport_delay_ms": summary(
-                    numeric_values(rows, "rtcp_frame_transport_delay_s"),
-                    scale=1000.0,
-                ),
-                "rtcp_clock_rate_hz": summary(clock_rate_values),
-                "rtcp_camera_ntp_rate": summary(numeric_values(rows, "rtcp_camera_ntp_rate")),
-                "rtcp_camera_media_rate": summary(media_rate_values),
-                "estimated_rtp_clock_rate_hz": summary(estimated_media_clock_values),
-                "rtp_timestamp_first": None if not rtp_timestamps else rtp_timestamps[0],
-                "rtp_timestamp_last": None if not rtp_timestamps else rtp_timestamps[-1],
-            }
-        return diagnostics
-
-    def _recording_session_metadata(
-        self,
-        *,
-        clock_sync_snapshot: dict[str, object] | None = None,
-    ) -> dict[str, object]:
-        stamp = self.recording_session_id or time.strftime("%Y%m%d_%H%M%S")
-        clock_sync_snapshot = clock_sync_snapshot or self._camera_time_sync_snapshot("metadata_read")
-        camera_time_metrics = clock_sync_snapshot["metrics"]
-        if not isinstance(camera_time_metrics, dict):
-            camera_time_metrics = {}
-        triangulation_source = self._triangulation_extrinsics_source()
-        _baseline_m, baseline_source, _baseline_warnings = self._active_baseline_m()
-        return {
-            "session_id": self.recording_session_id,
-            "session_dir": str(self._recording_session_dir(stamp)),
-            "session_started_unix_s": self.recording_session_started_wall_s,
-            "session_started_unix_ns": self.recording_session_started_unix_ns,
-            "session_started_monotonic_ns": self.recording_session_started_monotonic_ns,
-            "session_time_anchor_uncertainty_ns": self.recording_session_anchor_uncertainty_ns,
-            "schema_version": "stereowiris-paired-frame-v2",
-            "row_contract": "one row per accepted left/right matched detection frame pair",
-            "left_video_path": str(self.video_recording_paths.get("left", "")),
-            "right_video_path": str(self.video_recording_paths.get("right", "")),
-            "matched_frame_pair_count": len(self.distance_recording_rows),
-            "camera_left_gui_frame_count": len(self.camera_recording_rows["left"]),
-            "camera_right_gui_frame_count": len(self.camera_recording_rows["right"]),
-            "px4_left_sample_count": len(self.px4_recording_rows["left"]),
-            "px4_right_sample_count": len(self.px4_recording_rows["right"]),
-            "gnss_base_sample_count": len(self.gnss_base_recording_rows),
-            "device_timeline_contract": {
-                "camera_row": "one row per frame delivered to the GUI frame_changed callback",
-                "camera_not_guaranteed": "not a one-to-one index of encoded MP4 frames",
-                "px4_row": "one row per PX4 telemetry callback received by the GUI",
-                "sample_monotonic": "producer/app receive CLOCK_MONOTONIC timestamp",
-                "session_utc": "derived from session host Unix/monotonic anchor",
-                "source_utc": "RTCP NTP or GNSS UTC only when explicitly valid",
-                "mavlink_provenance": (
-                    "endpoint, link-open/heartbeat, link target system/component, and received packet "
-                    "source system/component/sequence/message id are recorded when available"
-                ),
-            },
-            "camera_time_sync_status": camera_time_metrics["status"],
-            "camera_time_sync_basis": camera_time_metrics["basis"],
-            "camera_time_sync_warning": camera_time_metrics["warning"],
-            "stream_sync_state": self.camera_sync_status,
-            "stream_sync_reason": self.camera_sync_reason,
-            "stream_sync_gdti": self._camera_sync_gdti,
-            "camera_time_sync_observation": clock_sync_snapshot,
-            "camera_time_sync_observations": {
-                "start": self._recording_clock_sync_start_observation,
-                "end": self._recording_clock_sync_end_observation,
-            },
-            "camera_time_sync_drift": self._camera_time_sync_drift_metadata(),
-            "camera_timing_diagnostics": self._recording_camera_timing_diagnostics(),
-            "pc_utc_sync": self._last_wiris_pc_utc_sync,
-            "gnss_operation": self.gnss_operation_manager.metadata(),
-            "gnss_operation_config": self.gnss_operation_manager.config.to_mapping(),
-            "gnss_fixed_base_profile": (
-                None
-                if self.gnss_fixed_base_profile is None
-                else self.gnss_fixed_base_profile.to_mapping()
-            ),
-            "rtcp_pair_delta_s": camera_time_metrics["pair_delta_s"],
-            "rtcp_pc_offset_max_ms": camera_time_metrics["max_pc_offset_ms"],
-            "rtcp_frame_transit_max_ms": camera_time_metrics["max_frame_transit_delay_ms"],
-            "left_rtcp_frame_transit_ms": camera_time_metrics["left_frame_transit_delay_ms"],
-            "right_rtcp_frame_transit_ms": camera_time_metrics["right_frame_transit_delay_ms"],
-            "calculation": {
-                "triangulation_extrinsics_source": triangulation_source,
-                "distance_mode": self._distance_mode_label(),
-                "baseline_source": baseline_source,
-                "measurement_path": self._measurement_path_label(),
-                "method": "two_ray_closest_midpoint",
-                "measurement_frame": MEASUREMENT_FRAME,
-                "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
-                "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
-                "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
-                "baseline_frame_scope": "measurement_attempt",
-                "baseline_frame_origin_contract": (
-                    "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
-                ),
-                "baseline_frame_origin_model": (
-                    "checkerboard_stereo_rt_optical_centers"
-                    if triangulation_source == "checkerboard"
-                    else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
-                ),
-                "baseline_frame_axis_contract": (
-                    "right=left_to_right_center; forward=projected_average_optical_forward; "
-                    "down=forward_cross_right"
-                ),
-                "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
-                "attitude_timing_blocks_measurement": False,
-                "attitude_stale_age_threshold_s": ATTITUDE_STALE_AGE_S,
-                "attitude_very_stale_age_threshold_s": ATTITUDE_VERY_STALE_AGE_S,
-                "attitude_stale_pair_delta_threshold_s": ATTITUDE_STALE_PAIR_DELTA_S,
-                "attitude_very_stale_pair_delta_threshold_s": ATTITUDE_VERY_STALE_PAIR_DELTA_S,
-                "mount_assumption_model": (
-                    "checkerboard-stereo-extrinsics-v1"
-                    if triangulation_source == "checkerboard"
-                    else "gps-rtk-baseline-only-v1"
-                ),
-            },
-            "checkerboard_stereo_extrinsics": self._record_current_checkerboard_extrinsics_parameters(),
-            "timestamp_contract": {
-                "manufacturer_confirmed": False,
-                "camera_captured_timestamp_clock": "WIRIS RTC checked by STUS/GDTI",
-                "rtp_rtcp_timestamp_clock": "RTP relative media counter; RTCP Sender Report NTP-derived stream time",
-                "rtp_timestamp_note": "RTP timestamp is a 90 kHz media clock counter; mapping RTCP NTP to WIRIS GDTI/UTC is unverified.",
-                "preferred_frame_time_field": "rtcp_frame_ntp_unix_s",
-                "legacy_equivalent_field": "camera_rtc_frame_unix_s",
-                "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before absolute UTC claims.",
-            },
-            "intrinsics": self._record_current_intrinsic_parameters(),
-            "stream": {
-                "left_rtsp_url": self.left_url_edit.text().strip(),
-                "right_rtsp_url": self.right_url_edit.text().strip(),
-                "backend": self.stream_backend_combo.currentData(),
-                "transport": self.rtsp_transport_combo.currentData(),
-                "decoder": self.decoder_combo.currentData(),
-                "rtsp_latency_ms": self.rtsp_latency_spin.value(),
-            },
-        }
-
-    def _remove_distance_history_point(self, point: DistanceHistoryPoint) -> None:
-        point_key = self._distance_history_key(point)
-        filtered_history: deque[DistanceHistoryPoint] = deque(maxlen=self.distance_history.maxlen)
-        removed_history = False
-        for candidate in self.distance_history:
-            if self._distance_history_key(candidate) == point_key:
-                removed_history = True
-                continue
-            filtered_history.append(candidate)
-        if not removed_history:
-            self._log("[Depth] 거리 그래프 삭제 요청이 현재 기록과 일치하지 않았습니다.")
-            return
-
-        self.distance_history = filtered_history
-        removed_row = False
-        if point_key in self.distance_recording_keys:
-            cached_index = self.distance_recording_keys.index(point_key)
-            row_index = len(self.distance_recording_rows) - len(self.distance_recording_keys) + cached_index
-            self.distance_recording_keys.pop(cached_index)
-            if row_index < len(self.distance_recording_rows):
-                self.distance_recording_rows.pop(row_index)
-                removed_row = True
-                base_index = len(self.distance_recording_rows) - len(self.distance_recording_keys)
-                self._recording_pair_row_index = {
-                    tuple(key): base_index + index
-                    for index, key in enumerate(self.distance_recording_keys)
-                }
-                self._refresh_recording_table()
-        self._last_distance_history_key = None
-        self._refresh_recording_status_label()
-        self._refresh_operation_header()
-        message = (
-            f"[Depth] 거리 그래프 점을 삭제했습니다: {point.distance_m:.2f} m "
-            f"({point.method}, quality={point.quality})"
-        )
-        if not removed_row:
-            message += " [기록 샘플은 찾지 못함]"
-        self._log(message)
 
     def discover_custom_mavlink_watch(self) -> None:
         messages = discover_mavlink_messages()
@@ -15618,232 +9597,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 TelemetryHistoryPoint(sample.timestamp_s, sample.key, sample.numeric_value)
             )
 
-    def _update_mavlink_optional_timeline(self, camera: str, payload: dict[str, object]) -> None:
-        sample_type = str(payload.get("sample_type") or "mavlink_status")
-        values = {key: value for key, value in payload.items() if key != "sample_type"}
-        self._record_external_timeline_row(camera, sample_type, values)
 
-    def _mavlink_connected_sides(self) -> set[str]:
-        if self.mavlink_pixhawk is None:
-            return set()
-        connections = getattr(self.mavlink_pixhawk, "connections", {})
-        heartbeat_sides = getattr(self.mavlink_pixhawk, "_heartbeat_logged", set())
-        try:
-            return {side for side in ("left", "right") if side in connections and side in heartbeat_sides}
-        except TypeError:
-            return set()
 
-    def _mavlink_open_sides(self) -> set[str]:
-        if self.mavlink_pixhawk is None:
-            return set()
-        connections = getattr(self.mavlink_pixhawk, "connections", {})
-        try:
-            return {side for side in ("left", "right") if side in connections}
-        except TypeError:
-            return set()
 
-    def _refresh_mavlink_side_actions(self) -> None:
-        connected_sides = self._mavlink_connected_sides()
-        self.left_px4_shell_button.setEnabled("left" in connected_sides)
-        self.right_px4_shell_button.setEnabled("right" in connected_sides)
-        self.left_persist_eth_button.setEnabled("left" in connected_sides)
-        self.right_persist_eth_button.setEnabled("right" in connected_sides)
-        self.left_reboot_pixhawk_button.setEnabled("left" in connected_sides)
-        self.right_reboot_pixhawk_button.setEnabled("right" in connected_sides)
 
-    def _mavlink_target_sides(self, camera: str | None) -> tuple[str, ...]:
-        if camera is None:
-            return ("left", "right")
-        if camera not in {"left", "right"}:
-            raise ValueError(f"Unknown Pixhawk side: {camera}")
-        return (camera,)
 
-    def _sync_mavlink_subscriber_settings(self) -> None:
-        if self.mavlink_pixhawk is None:
-            return
-        if hasattr(self.mavlink_pixhawk, "urls"):
-            self.mavlink_pixhawk.urls["left"] = self.left_mavlink_url_edit.text().strip()
-            self.mavlink_pixhawk.urls["right"] = self.right_mavlink_url_edit.text().strip()
-        if hasattr(self.mavlink_pixhawk, "baudrates"):
-            self.mavlink_pixhawk.baudrates["left"] = self.left_mavlink_baud_spin.value()
-            self.mavlink_pixhawk.baudrates["right"] = self.right_mavlink_baud_spin.value()
 
-    def _ensure_mavlink_subscriber(self) -> DualPixhawkMavlinkSubscriber:
-        if self.mavlink_pixhawk is None:
-            self.mavlink_pixhawk = DualPixhawkMavlinkSubscriber(
-                left_url=self.left_mavlink_url_edit.text().strip(),
-                right_url=self.right_mavlink_url_edit.text().strip(),
-                left_baud=self.left_mavlink_baud_spin.value(),
-                right_baud=self.right_mavlink_baud_spin.value(),
-                custom_watches=tuple(self.custom_watch_specs),
-            )
-            self.mavlink_pixhawk.extrinsic_changed.connect(self._update_extrinsic)
-            self.mavlink_pixhawk.gps_changed.connect(self._update_gps)
-            self.mavlink_pixhawk.mag_sensor_changed.connect(self._update_mag_sensor)
-            self.mavlink_pixhawk.gps_sensor_changed.connect(self._update_gps_sensor)
-            self.mavlink_pixhawk.gnss_relative_changed.connect(self._update_gnss_relative)
-            self.mavlink_pixhawk.custom_watch_changed.connect(self._update_custom_watch)
-            optional_timeline_changed = getattr(self.mavlink_pixhawk, "optional_timeline_changed", None)
-            if optional_timeline_changed is not None:
-                optional_timeline_changed.connect(self._update_mavlink_optional_timeline)
-            stream_setup_required = getattr(self.mavlink_pixhawk, "stream_setup_required", None)
-            if stream_setup_required is not None:
-                stream_setup_required.connect(self._handle_mavlink_stream_setup_required)
-            self.mavlink_pixhawk.shell_output.connect(self._append_px4_shell_output)
-            self.mavlink_pixhawk.status_changed.connect(self._handle_mavlink_status_changed)
-        else:
-            self._sync_mavlink_subscriber_settings()
-        return self.mavlink_pixhawk
 
-    def _handle_mavlink_status_changed(self, text: str) -> None:
-        self._log(f"[픽스호크] {text}")
-        self._refresh_session_toggle_buttons()
-        self._refresh_mavlink_side_actions()
 
-    def _configured_mavlink_sides(self) -> tuple[str, ...]:
-        sides = []
-        if self.left_mavlink_url_edit.text().strip():
-            sides.append("left")
-        if self.right_mavlink_url_edit.text().strip():
-            sides.append("right")
-        return tuple(sides)
 
-    def _mavlink_setup_target_sides(self, target_sides: tuple[str, ...]) -> set[str]:
-        configured = set(self._configured_mavlink_sides())
-        connected = self._mavlink_connected_sides()
-        return {side for side in target_sides if side in configured or side in connected}
 
-    def _apply_mavlink_pixhawk_setup(self, subscriber: DualPixhawkMavlinkSubscriber, target_sides: tuple[str, ...]) -> None:
-        setup_sides = self._mavlink_setup_target_sides(target_sides)
-        if not setup_sides or not self.mavlink_configure_streams_checkbox.isChecked():
-            return
-        self._start_pixhawk_stream_setup_worker(subscriber, tuple(sorted(setup_sides)))
 
-    def _start_pixhawk_stream_setup_worker(
-        self,
-        subscriber: DualPixhawkMavlinkSubscriber | None = None,
-        cameras: Sequence[str] = (),
-    ) -> bool:
-        subscriber = subscriber or self.mavlink_pixhawk
-        if subscriber is None:
-            return False
-        if self.pixhawk_stream_setup_thread is not None:
-            self._log("[픽스호크] MAVLink stream 설정이 이미 진행 중입니다.")
-            return False
-        target_sides = tuple(str(side) for side in cameras if str(side) in getattr(subscriber, "connections", {}))
-        if not target_sides:
-            return False
-        thread = QtCore.QThread(self)
-        worker = PixhawkStreamSetupWorker(
-            subscriber,
-            host_ip=self.pixhawk_host_address_edit.text().strip(),
-            ports={
-                "left": self._mavlink_stream_port(self.left_mavlink_url_edit.text().strip(), default=14550),
-                "right": self._mavlink_stream_port(self.right_mavlink_url_edit.text().strip(), default=14551),
-            },
-            sysids={"left": 1, "right": 2},
-            rate=self.mavlink_stream_rate_spin.value(),
-            cameras=target_sides,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(
-            lambda result: self._log(
-                f"[픽스호크] MAVLink stream 설정 완료: {', '.join(target_sides)} "
-                f"host={result.get('host_ip', '')}"
-            )
-        )
-        worker.failed.connect(lambda error: self._log(f"[픽스호크] MAVLink stream 설정 실패: {error}"))
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_pixhawk_stream_setup_worker)
-        self.pixhawk_stream_setup_thread = thread
-        self.pixhawk_stream_setup_worker = worker
-        thread.start()
-        return True
 
-    def _handle_mavlink_stream_setup_required(self, camera: str) -> None:
-        if not self.mavlink_configure_streams_checkbox.isChecked():
-            return
-        self._start_pixhawk_stream_setup_worker(self.mavlink_pixhawk, (str(camera),))
 
-    def _clear_pixhawk_stream_setup_worker(self) -> None:
-        self.pixhawk_stream_setup_thread = None
-        self.pixhawk_stream_setup_worker = None
 
-    def bootstrap_ethernet_mavlink_from_usb(self, camera: str) -> None:
-        if camera not in {"left", "right"}:
-            raise ValueError(f"Unknown Pixhawk side: {camera}")
-        label = self._px4_mag_camera_label(camera)
-        if camera == "left":
-            usb_url = self.left_pixhawk_bootstrap_url_edit.text().strip()
-            usb_baud = self.left_pixhawk_bootstrap_baud_spin.value()
-        else:
-            usb_url = self.right_pixhawk_bootstrap_url_edit.text().strip()
-            usb_baud = self.right_pixhawk_bootstrap_baud_spin.value()
-        if not usb_url:
-            self._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 실패: USB 부트스트랩 포트가 비어 있습니다.")
-            return
-        try:
-            command = self._ethernet_mavlink_bootstrap_command(camera, mode="normal")
-        except Exception as exc:
-            self._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 명령 생성 실패: {exc}")
-            return
-        if self.pixhawk_usb_bootstrap_thread is not None:
-            self._log(f"[픽스호크] {label} USB 부트스트랩이 이미 진행 중입니다.")
-            return
-        try:
-            fallback_command = self._ethernet_mavlink_bootstrap_command(camera, mode="onboard")
-        except Exception as exc:
-            self._log(f"[픽스호크] {label} ETH MAVLink USB fallback 명령 생성 실패: {exc}")
-            return
-        thread = QtCore.QThread(self)
-        worker = PixhawkUsbBootstrapWorker(
-            camera=camera,
-            usb_url=usb_url,
-            baud_candidates=self._usb_bootstrap_baud_candidates(usb_baud),
-            command=command,
-            fallback_command=fallback_command,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self._apply_pixhawk_usb_bootstrap_result)
-        worker.failed.connect(
-            lambda error, label=label: self._log(f"[픽스호크] {label} ETH MAVLink USB 부트스트랩 실패: {error}")
-        )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_pixhawk_usb_bootstrap_worker)
-        self.pixhawk_usb_bootstrap_thread = thread
-        self.pixhawk_usb_bootstrap_worker = worker
-        self._log(f"[픽스호크] {label} USB Ethernet MAVLink 부트스트랩을 시작했습니다.")
-        thread.start()
 
-    def _apply_pixhawk_usb_bootstrap_result(self, result: object) -> None:
-        data = dict(result or {})
-        camera = str(data.get("camera") or "")
-        if camera not in {"left", "right"}:
-            return
-        selected_baud = int(data.get("baud") or 0)
-        self._set_usb_bootstrap_baud(camera, selected_baud)
-        output = str(data.get("output") or "").strip()
-        if output:
-            self._log(
-                f"[픽스호크 USB] {self._px4_mag_camera_label(camera)} PX4 shell 응답 "
-                f"({data.get('flag_label', '')}): {output[-800:]}"
-            )
-        self._log(
-            f"[픽스호크] {self._px4_mag_camera_label(camera)} USB {selected_baud} baud 부트스트랩 완료. "
-            "UDP MAVLink 수신을 다시 시작합니다."
-        )
-        self._save_current_settings()
-        self.connect_mavlink_pixhawk(camera)
 
-    def _clear_pixhawk_usb_bootstrap_worker(self) -> None:
-        self.pixhawk_usb_bootstrap_thread = None
-        self.pixhawk_usb_bootstrap_worker = None
 
     def _usb_bootstrap_baud_candidates(self, selected_baud: int) -> tuple[int, ...]:
         ordered = [int(selected_baud)]
@@ -15856,309 +9625,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         else:
             self.right_pixhawk_bootstrap_baud_spin.setValue(int(baud))
 
-    def _temporary_mavlink_heartbeat(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str) -> bool:
-        connection = getattr(subscriber, "connections", {}).get(camera)
-        if connection is None:
-            return False
-        wait_heartbeat = getattr(connection, "wait_heartbeat", None)
-        if wait_heartbeat is None:
-            return True
-        mav = getattr(connection, "mav", None)
-        mavlink = getattr(connection, "mavlink", None)
-        if mav is not None and hasattr(mav, "heartbeat_send"):
-            try:
-                mav.heartbeat_send(
-                    getattr(mavlink, "MAV_TYPE_GENERIC", 0),
-                    getattr(mavlink, "MAV_AUTOPILOT_INVALID", 8),
-                    0,
-                    0,
-                    0,
-                )
-            except Exception:
-                pass
-        try:
-            return wait_heartbeat(timeout=1.2) is not None
-        except Exception:
-            return False
 
-    def _ethernet_mavlink_bootstrap_command(self, camera: str, *, mode: str = "normal") -> str:
-        setup = self._persistent_pixhawk_eth_setup(camera)
-        mavlink_start_cmd = str(setup["mavlink_start_cmd"])
-        if mode == "onboard":
-            mavlink_start_cmd = mavlink_start_cmd.replace("-m normal", "-m onboard -n eth0")
-        return "\n".join(
-            (
-                setup["ifup_cmd"],
-                setup["ifconfig_cmd"],
-                setup["mavlink_stop_cmd"],
-                mavlink_start_cmd,
-                "mavlink status",
-            )
-        )
 
-    def connect_mavlink_pixhawk(self, camera: str | None = None, *, force_setup: bool = False) -> None:
-        target_sides = self._mavlink_target_sides(camera)
-        if all(side in self._mavlink_connected_sides() for side in target_sides):
-            if force_setup and self.mavlink_pixhawk is not None:
-                self._apply_mavlink_pixhawk_setup(self.mavlink_pixhawk, target_sides)
-            return
-        if self.pixhawk_connection_thread is not None:
-            self._log("[픽스호크] MAVLink 연결 작업이 이미 진행 중입니다.")
-            return
-        subscriber = self._ensure_mavlink_subscriber()
-        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-        thread = QtCore.QThread(self)
-        worker = PixhawkConnectionWorker(subscriber, camera)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(
-            lambda _result, camera=camera, force_setup=force_setup, target_sides=target_sides:
-            self._apply_pixhawk_connection_result(camera, force_setup, target_sides)
-        )
-        worker.failed.connect(
-            lambda error, camera=camera, target_sides=target_sides: self._pixhawk_connection_failed(
-                camera, target_sides, error
-            )
-        )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_pixhawk_connection_worker)
-        self.pixhawk_connection_thread = thread
-        self.pixhawk_connection_worker = worker
-        self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 중...")
-        self._log(f"[픽스호크] {label} MAVLink 연결을 시작했습니다.")
-        thread.start()
 
-    def _apply_pixhawk_connection_result(
-        self,
-        camera: str | None,
-        force_setup: bool,
-        target_sides: Sequence[str],
-    ) -> None:
-        subscriber = self.mavlink_pixhawk
-        if subscriber is None:
-            return
-        try:
-            subscriber.start_receive_timer()
-        except Exception as exc:
-            self._pixhawk_connection_failed(camera, tuple(target_sides), str(exc))
-            return
-        if force_setup:
-            self._apply_mavlink_pixhawk_setup(subscriber, tuple(target_sides))
-        elif self.mavlink_configure_streams_checkbox.isChecked():
-            self._log(
-                "[픽스호크] 일반 MAVLink 연결에서는 stream 설정을 자동 실행하지 않습니다. "
-                "필요하면 Workstation의 MAVLink stream 설정을 적용하세요."
-            )
-        self._refresh_session_toggle_buttons()
-        self._refresh_mavlink_side_actions()
-        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-        self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
-        self._log(f"[픽스호크] {label} MAVLink 세션이 시작됐습니다. 데이터 수신을 기다립니다.")
-        self._request_mavlink_eth0_status(tuple(target_sides))
-        self.refresh_px4_mag_manager()
-        self.refresh_px4_attitude_cal_status()
-        self._refresh_operation_header()
 
-    def _pixhawk_connection_failed(
-        self,
-        camera: str | None,
-        target_sides: Sequence[str],
-        error: str,
-    ) -> None:
-        if self.mavlink_pixhawk is not None:
-            try:
-                self.mavlink_pixhawk.stop(camera)
-            except Exception:
-                pass
-            if not getattr(self.mavlink_pixhawk, "connections", {}):
-                self.mavlink_pixhawk = None
-        self._refresh_session_toggle_buttons()
-        self._refresh_mavlink_side_actions()
-        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-        self.pixhawk_connection_label.setText(f"pixhawk MAVLink {label}: failed ({error})")
-        self._log(f"[픽스호크] {label} MAVLink 연결 실패: {error}")
-        self._refresh_operation_header()
 
-    def _clear_pixhawk_connection_worker(self) -> None:
-        self.pixhawk_connection_thread = None
-        self.pixhawk_connection_worker = None
 
-    def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
-        target_sides = self._mavlink_target_sides(camera)
-        if self.mavlink_pixhawk is not None:
-            self.mavlink_pixhawk.stop(camera)
-            if not getattr(self.mavlink_pixhawk, "connections", {}):
-                self.mavlink_pixhawk = None
-        for side in target_sides:
-            self.pixhawk_attitude_times[side].clear()
-        self._clear_px4_mag_manager_connection_state(camera)
-        self._clear_px4_attitude_cal_connection_state(camera)
-        self._refresh_session_toggle_buttons()
-        self._refresh_mavlink_side_actions()
-        if self.mavlink_pixhawk is None:
-            self.pixhawk_connection_label.setText("픽스호크: 연결 해제")
-        else:
-            label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-            self.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
-        label = " / ".join(self._px4_mag_camera_label(side) for side in target_sides)
-        self._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
-        self._refresh_operation_header()
 
-    def apply_persistent_pixhawk_eth(self, camera: str) -> None:
-        if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: MAVLink 연결이 없습니다.")
-            return
-        try:
-            command = self._persistent_pixhawk_eth_command(camera)
-            extras_text = self._persistent_pixhawk_extras_text(camera)
-            net_cfg_text = self._persistent_pixhawk_net_cfg_text(camera)
-        except Exception as exc:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 설정 생성 실패: {exc}")
-            return
-        if self.pixhawk_persistent_config_thread is not None:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정이 이미 진행 중입니다.")
-            return
-        thread = QtCore.QThread(self)
-        worker = PixhawkPersistentConfigWorker(
-            self.mavlink_pixhawk,
-            camera=camera,
-            command=command,
-            extras_text=extras_text,
-            net_cfg_text=net_cfg_text,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self._apply_pixhawk_persistent_config_result)
-        worker.failed.connect(
-            lambda error, camera=camera: self._log(
-                f"[픽스호크] {camera_label_ko(camera)} ETH 영구 설정 실패: {error}. "
-                "PX4 shell과 MAVLink FTP가 모두 막히면 앱만으로 저장할 수 없습니다."
-            )
-        )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._clear_pixhawk_persistent_config_worker)
-        self.pixhawk_persistent_config_thread = thread
-        self.pixhawk_persistent_config_worker = worker
-        self._log(f"[픽스호크] {camera_label_ko(camera)} ETH shell/FTP 영구 설정을 시작했습니다.")
-        thread.start()
 
-    def _apply_pixhawk_persistent_config_result(self, result: object) -> None:
-        data = dict(result or {})
-        camera = str(data.get("camera") or "")
-        if camera not in {"left", "right"}:
-            return
-        output = str(data.get("output") or "").strip()
-        if output:
-            self._log(
-                f"[픽스호크] {camera_label_ko(camera)} ETH shell 응답 "
-                f"({data.get('flag_label', '')}): {output[-800:]}"
-            )
-        self._log(
-            f"[픽스호크] {camera_label_ko(camera)} ETH MAVLink FTP 영구 저장 완료: "
-            "/fs/microsd/net.cfg, /fs/microsd/etc/extras.txt. "
-            "재부팅 후 eth0와 Ethernet MAVLink stream 적용을 확인하세요."
-        )
 
-    def _clear_pixhawk_persistent_config_worker(self) -> None:
-        self.pixhawk_persistent_config_thread = None
-        self.pixhawk_persistent_config_worker = None
 
-    def reboot_pixhawk_from_mavlink(self, camera: str) -> None:
-        if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} 재부팅 실패: MAVLink 연결이 없습니다.")
-            return
-        result = QtWidgets.QMessageBox.question(
-            self,
-            f"{camera_label_ko(camera)} PX4 재부팅",
-            f"{camera_label_ko(camera)} Pixhawk에 MAVLink 재부팅 명령을 보냅니다.\n계속할까요?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        if result != QtWidgets.QMessageBox.Yes:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 취소했습니다.")
-            return
-        self._start_pixhawk_shell_worker(
-            camera,
-            "MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN",
-            operation="reboot",
-            timeout_s=1.0,
-        )
 
-    def _persistent_pixhawk_eth_command(self, camera: str) -> str:
-        setup = self._persistent_pixhawk_eth_setup(camera)
-        extras = "/fs/microsd/etc/extras.txt"
-        extras_lines = list(setup["extras_lines"])
-        return "\n".join(
-            (
-                "mkdir /fs/microsd/etc",
-                *setup["param_lines"],
-                "param save",
-                *extras_lines,
-                "mavlink status",
-                f"echo '{extras_lines[0]}' > {extras}",
-                *(f"echo '{line}' >> {extras}" for line in extras_lines[1:]),
-                f"cat {extras}",
-            )
-        )
 
-    def _persistent_pixhawk_extras_text(self, camera: str) -> str:
-        setup = self._persistent_pixhawk_eth_setup(camera)
-        return "\n".join(setup["extras_lines"]) + "\n"
 
-    def _persistent_pixhawk_net_cfg_text(self, camera: str) -> str:
-        setup = self._persistent_pixhawk_eth_setup(camera)
-        return "\n".join(
-            (
-                "DEVICE=eth0",
-                "BOOTPROTO=static",
-                "NETMASK=255.255.255.0",
-                f"IPADDR={setup['eth_ip']}",
-                f"ROUTER={setup['host_ip']}",
-            )
-        ) + "\n"
 
-    def _persistent_pixhawk_eth_setup(self, camera: str) -> dict[str, object]:
-        if camera == "left":
-            eth_ip = self.left_pixhawk_eth_ip_edit.text().strip()
-            mavlink_url = self.left_mavlink_url_edit.text().strip()
-            mavlink_default_port = 14550
-        elif camera == "right":
-            eth_ip = self.right_pixhawk_eth_ip_edit.text().strip()
-            mavlink_url = self.right_mavlink_url_edit.text().strip()
-            mavlink_default_port = 14551
-        else:
-            raise ValueError(f"Unknown Pixhawk side: {camera}")
-        host_ip = self._pixhawk_host_ip_for_mavlink()
-        for label, value in (("Pixhawk ETH IP", eth_ip), ("Pixhawk Host IP", host_ip)):
-            if not value or any(ch.isspace() or ch in "'\";`$" for ch in value):
-                raise ValueError(f"{label} 값이 비어 있거나 shell 명령에 사용할 수 없는 문자를 포함합니다: {value!r}")
-        ifup_cmd = "ifup eth0"
-        ifconfig_cmd = f"ifconfig eth0 {eth_ip} netmask 255.255.255.0 up"
-        mavlink_port = self._mavlink_stream_port(mavlink_url, default=mavlink_default_port)
-        mavlink_stop_cmd = f"mavlink stop -u {mavlink_port}"
-        mavlink_start_cmd = (
-            f"mavlink start -x -u {mavlink_port} -o {mavlink_port} "
-            f"-t {host_ip} -r {self.mavlink_stream_rate_spin.value()} -m normal"
-        )
-        # Workstation owns only the Ethernet MAVLink path. PX4 starts the
-        # configured MAVLink instance from MAV_2_CONFIG after reboot; extras
-        # only brings the network interface up and assigns its static address.
-        param_lines = ["param set MAV_2_CONFIG 1000"]
-        extras_lines = [ifup_cmd, ifconfig_cmd]
-        return {
-            "eth_ip": eth_ip,
-            "host_ip": host_ip,
-            "ifup_cmd": ifup_cmd,
-            "ifconfig_cmd": ifconfig_cmd,
-            "mavlink_stop_cmd": mavlink_stop_cmd,
-            "mavlink_start_cmd": mavlink_start_cmd,
-            "param_lines": param_lines,
-            "extras_lines": extras_lines,
-        }
 
     def open_px4_shell(self, camera: str) -> None:
         if self.mavlink_pixhawk is None or camera not in self.mavlink_pixhawk.connections:
@@ -16183,205 +9663,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         self._start_pixhawk_shell_worker(camera, command)
 
-    def _start_pixhawk_shell_worker(
-        self,
-        camera: str,
-        command: str,
-        *,
-        operation: str = "shell",
-        timeout_s: float = 2.0,
-        on_complete=None,
-    ) -> bool:
-        if self.mavlink_pixhawk is None or camera not in self._mavlink_open_sides():
-            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령 실패: 연결이 없습니다.")
-            return False
-        if camera in self.pixhawk_shell_threads:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령이 이미 진행 중입니다.")
-            return False
-        thread = QtCore.QThread(self)
-        worker = PixhawkShellCommandWorker(
-            self.mavlink_pixhawk,
-            camera=camera,
-            command=command,
-            operation=operation,
-            timeout_s=timeout_s,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(
-            lambda result, camera=camera, callback=on_complete: self._apply_pixhawk_shell_worker_result(
-                camera, result, callback
-            )
-        )
-        worker.failed.connect(
-            lambda error, camera=camera: self._pixhawk_shell_worker_failed(camera, error)
-        )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda camera=camera, thread=thread: self._clear_pixhawk_shell_worker(camera, thread))
-        self.pixhawk_shell_threads[camera] = thread
-        self.pixhawk_shell_workers[camera] = worker
-        thread.start()
-        return True
 
-    def _apply_pixhawk_shell_worker_result(self, camera: str, result: object, callback=None) -> None:
-        data = dict(result or {})
-        output = str(data.get("output") or "")
-        if output:
-            self._append_px4_shell_output(camera, output)
-        operation = str(data.get("operation") or "shell")
-        command = str(data.get("command") or "")
-        if operation == "reboot":
-            self._log(f"[픽스호크] {camera_label_ko(camera)} MAVLink 재부팅 명령을 전송했습니다.")
-        else:
-            flag = str(data.get("flag_label") or "")
-            suffix = f" ({flag})" if flag else ""
-            self._log(f"[픽스호크] {camera_label_ko(camera)} PX4 Shell 명령 완료{suffix}: {command}")
-        if callable(callback):
-            callback(data)
 
-    def _pixhawk_shell_worker_failed(self, camera: str, error: str) -> None:
-        message = f"[픽스호크] {camera_label_ko(camera)} MAVLink 명령 실패: {error}"
-        self._log(message)
-        dialog = self.px4_shell_dialogs.get(camera)
-        if dialog is not None:
-            dialog.append_output(f"\n[error] {error}\n")
 
-    def _clear_pixhawk_shell_worker(self, camera: str, thread: QtCore.QThread) -> None:
-        if self.pixhawk_shell_threads.get(camera) is thread:
-            self.pixhawk_shell_threads.pop(camera, None)
-            self.pixhawk_shell_workers.pop(camera, None)
 
-    def _start_pixhawk_parameter_worker(
-        self,
-        camera: str,
-        operation: str,
-        *,
-        priorities: dict[str, int] | None = None,
-    ) -> bool:
-        subscriber = self.mavlink_pixhawk
-        if subscriber is None or camera not in self._mavlink_open_sides():
-            self._log(f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패: MAVLink 연결이 없습니다.")
-            return False
-        if camera in self.pixhawk_parameter_threads:
-            self._log(f"[픽스호크] {camera_label_ko(camera)} PARAM 작업이 이미 진행 중입니다.")
-            return False
-        manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
-        actual_selected = self.latest_vehicle_mag_device_ids.get(camera)
-        armed = bool(getattr(manager, "armed", False))
-        thread = QtCore.QThread(self)
-        worker = PixhawkParameterWorker(
-            subscriber,
-            camera=camera,
-            operation=operation,
-            actual_selected_device_id=actual_selected,
-            armed=armed,
-            priorities=priorities,
-        )
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.completed.connect(self._apply_pixhawk_parameter_worker_result)
-        worker.failed.connect(
-            lambda error, camera=camera, operation=operation: self._pixhawk_parameter_worker_failed(
-                camera, operation, error
-            )
-        )
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
-            lambda camera=camera, thread=thread: self._clear_pixhawk_parameter_worker(camera, thread)
-        )
-        self.pixhawk_parameter_threads[camera] = thread
-        self.pixhawk_parameter_workers[camera] = worker
-        self._set_px4_mag_manager_button_state(
-            camera,
-            refresh_enabled=False,
-            actions_enabled=False,
-            tooltip="MAVLink PARAM 작업 중",
-        )
-        thread.start()
-        return True
 
-    def _apply_pixhawk_parameter_worker_result(self, result: object) -> None:
-        data = dict(result or {})
-        kind = str(data.get("kind") or "")
-        status = data.get("status")
-        camera = ""
-        if hasattr(status, "actual_selected_device_id"):
-            camera = next(
-                (
-                    side
-                    for side in ("left", "right")
-                    if self.latest_vehicle_mag_device_ids.get(side)
-                    == getattr(status, "actual_selected_device_id", None)
-                    and side in self.pixhawk_parameter_threads
-                ),
-                "",
-            )
-        camera = str(data.get("camera") or camera)
-        # The worker payload is intentionally allowed to carry the side
-        # explicitly; older fake workers may only return a status object.
-        if not camera:
-            for side, worker in self.pixhawk_parameter_workers.items():
-                if worker.operation == kind:
-                    camera = side
-                    break
-        if not camera or status is None:
-            return
-        if kind in {"mag_refresh", "mag_apply"}:
-            manager = self.px4_mag_managers.get(camera)
-            if manager is not None:
-                manager.actual_selected_device_id = getattr(status, "actual_selected_device_id", None)
-                manager.armed = bool(getattr(status, "armed", False))
-            self._render_px4_mag_status(camera, status)
-            applied = tuple(str(item) for item in data.get("applied") or ())
-            missing = tuple(str(item) for item in data.get("missing") or ())
-            if kind == "mag_apply":
-                self._log(
-                    f"[PX4 MAG] {self._px4_mag_camera_label(camera)} Workstation PARAM 적용: "
-                    f"{', '.join(applied) or 'none'}"
-                )
-                if missing:
-                    self._log(
-                        f"[PX4 MAG] {self._px4_mag_camera_label(camera)} 미적용 role: {', '.join(missing)}"
-                    )
-        elif kind == "attitude_refresh":
-            self._render_px4_attitude_cal_status(camera, status, using_real_params=True)
 
-    def _pixhawk_parameter_worker_failed(self, camera: str, operation: str, error: str) -> None:
-        self._log(
-            f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패 ({operation}): {error}"
-        )
-        if operation == "mag_refresh" or operation == "mag_apply":
-            self._set_px4_mag_manager_button_state(
-                camera,
-                refresh_enabled=True,
-                actions_enabled=True,
-                tooltip="",
-            )
-        elif operation == "attitude_refresh":
-            button = self.px4_attitude_cal_refresh_buttons.get(camera)
-            if button is not None:
-                button.setEnabled(True)
 
-    def _clear_pixhawk_parameter_worker(self, camera: str, thread: QtCore.QThread) -> None:
-        if self.pixhawk_parameter_threads.get(camera) is not thread:
-            return
-        self.pixhawk_parameter_threads.pop(camera, None)
-        self.pixhawk_parameter_workers.pop(camera, None)
-        manager = self.px4_mag_managers.get(camera) if hasattr(self, "px4_mag_managers") else None
-        armed = bool(getattr(manager, "armed", False))
-        self._set_px4_mag_manager_button_state(
-            camera,
-            refresh_enabled=True,
-            actions_enabled=not armed,
-            tooltip="Disarm required" if armed else "",
-        )
-        button = self.px4_attitude_cal_refresh_buttons.get(camera) if hasattr(self, "px4_attitude_cal_refresh_buttons") else None
-        if button is not None:
-            button.setEnabled(True)
 
     def _px4_mag_camera_label(self, camera: str) -> str:
         return "Pixhawk 1" if camera == "left" else "Pixhawk 2"
@@ -16762,14 +10050,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 for column, value in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(value)
                     if slot.is_rm3100:
-                        item.setBackground(QtGui.QColor("#123d1f"))
-                        item.setForeground(QtGui.QColor("#d8ffd8"))
+                        item.setForeground(QtGui.QColor(SUCCESS_TEXT))
                     if slot.actual_selected:
-                        item.setBackground(QtGui.QColor("#1f3d63"))
-                        item.setForeground(QtGui.QColor("#e6f2ff"))
+                        item.setForeground(QtGui.QColor(ACCENT))
                     elif slot.expected_selected:
-                        item.setBackground(QtGui.QColor("#4b3b00"))
-                        item.setForeground(QtGui.QColor("#fff0b3"))
+                        item.setForeground(QtGui.QColor(WARNING_TEXT))
                     item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
                     table.setItem(row, column, item)
             table.resizeRowsToContents()
@@ -16948,142 +10233,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         except ValueError:
             return int(default)
 
-    def zoom_command_text(self, action: str) -> str:
-        if action == "in":
-            return DEFAULT_ZOOM_IN_TEMPLATE
-        if action == "out":
-            return DEFAULT_ZOOM_OUT_TEMPLATE
-        if action == "stop":
-            return DEFAULT_ZOOM_STOP_TEMPLATE
-        if action == "set":
-            return DEFAULT_ZOOM_SET_TEMPLATE
-        raise ValueError(f"Unknown zoom action: {action}")
 
-    def selected_zoom_target(self) -> str:
-        return str(self.zoom_target_combo.currentData() or "both")
 
-    def zoom_hosts(self, target: str) -> list[tuple[str, str]]:
-        if target == "left":
-            return [("left", self.left_zoom_host_edit.text())]
-        if target == "right":
-            return [("right", self.right_zoom_host_edit.text())]
-        if target == "both":
-            return [("left", self.left_zoom_host_edit.text()), ("right", self.right_zoom_host_edit.text())]
-        raise ValueError(f"Unknown zoom target: {target}")
 
-    def _control_port_spin_for_camera(self, camera: str) -> QtWidgets.QSpinBox:
-        if camera == "left":
-            return self.left_control_port_spin
-        if camera == "right":
-            return self.right_control_port_spin
-        raise ValueError(f"Unknown camera: {camera}")
 
-    def _control_port_for_camera(self, camera: str) -> int:
-        return int(self._control_port_spin_for_camera(camera).value())
 
-    def _set_control_port_for_camera(self, camera: str, port: int) -> None:
-        if 1 <= int(port) <= 65535:
-            self._control_port_spin_for_camera(camera).setValue(int(port))
 
-    def send_zoom(self, target: str, action: str) -> None:
-        if self.wiris_zoom_thread is not None:
-            self._log("[카메라] 줌 명령이 이미 진행 중입니다.")
-            return
-        command_text = self.zoom_command_text(action)
-        level = self.zoom_level_spin.value() if action == "set" else None
-        targets = [
-            (label, host, self._control_port_for_camera(label))
-            for label, host in self.zoom_hosts(target)
-        ]
-        self.zoom_status_label.setText("Zoom command: sending...")
-        self.wiris_zoom_thread = QtCore.QThread(self)
-        self.wiris_zoom_worker = WirisZoomWorker(
-            targets,
-            template=command_text,
-            level=level,
-            timeout_s=self.zoom_timeout_spin.value(),
-        )
-        self.wiris_zoom_worker.moveToThread(self.wiris_zoom_thread)
-        self.wiris_zoom_thread.started.connect(self.wiris_zoom_worker.run)
-        self.wiris_zoom_worker.completed.connect(
-            lambda statuses, target=target, action=action: self._apply_wiris_zoom_result(
-                target, action, statuses
-            )
-        )
-        self.wiris_zoom_worker.failed.connect(self._wiris_zoom_failed)
-        self.wiris_zoom_worker.finished.connect(self.wiris_zoom_thread.quit)
-        self.wiris_zoom_worker.finished.connect(self.wiris_zoom_worker.deleteLater)
-        self.wiris_zoom_thread.finished.connect(self.wiris_zoom_thread.deleteLater)
-        self.wiris_zoom_thread.finished.connect(self._clear_wiris_zoom_worker)
-        self.wiris_zoom_thread.start()
 
-    def _apply_wiris_zoom_result(self, target: str, action: str, result: object) -> None:
-        statuses: list[str] = []
-        for item in list(result or []):
-            if not isinstance(item, dict):
-                continue
-            label = str(item.get("label") or "")
-            if item.get("state") == "sent":
-                response = str(item.get("response") or "")
-                suffix = f" 응답={response}" if response else " 전송됨"
-                statuses.append(f"{self._camera_name_ko(label)}: {item.get('command', '')}{suffix}")
-            else:
-                statuses.append(f"{self._camera_name_ko(label)}: 실패: {item.get('detail', 'unknown')}")
-        status_text = " | ".join(statuses)
-        self.zoom_status_label.setText(status_text)
-        self._log(f"[카메라] 줌 명령 target={target}, action={action}: {status_text}")
 
-    def _wiris_zoom_failed(self, error: str) -> None:
-        self.zoom_status_label.setText(f"Zoom command: failed ({error})")
-        self._log(f"[카메라] 줌 명령 실패: {error}")
 
-    def _clear_wiris_zoom_worker(self) -> None:
-        self.wiris_zoom_thread = None
-        self.wiris_zoom_worker = None
 
     # Workstation advanced-tool bridges.  The methods below are deliberately
     # small: they validate the public arguments, then hand control back to
     # the existing panel widgets/managers.  They do not create a second
     # camera, Pixhawk, preview worker, or session writer.
-    def workstation_wiris_command_catalog(self) -> tuple[dict[str, str], ...]:
-        return tuple(
-            {
-                "category": str(category),
-                "label": str(label),
-                "command": str(command),
-                "terminator": str(terminator),
-                "description": str(description),
-            }
-            for category, label, command, terminator, description in WIRIS_COMMAND_CATALOG
-        )
 
-    def workstation_send_wiris_command(self, target: str, command: str, terminator: str) -> None:
-        target = str(target or "both")
-        if target not in {"both", "left", "right"}:
-            raise ValueError(f"Unknown WIRIS target: {target}")
-        command = str(command or "").strip()
-        if not command:
-            raise ValueError("WIRIS SDK command is empty")
-        terminator = str(terminator or LINE_TERMINATOR)
-        if terminator not in {LINE_TERMINATOR, NUL_TERMINATOR}:
-            raise ValueError("Unknown WIRIS command terminator")
-        self._set_combo_data(self.wiris_command_target_combo, target)
-        self.wiris_command_edit.setText(command)
-        self._set_combo_data(self.wiris_command_terminator_combo, terminator)
-        self.send_selected_wiris_command()
 
-    def workstation_send_zoom(self, target: str, action: str, level: int | None = None) -> None:
-        target = str(target or "both")
-        if target not in {"both", "left", "right"}:
-            raise ValueError(f"Unknown zoom target: {target}")
-        action = str(action or "")
-        if action not in {"in", "out", "stop", "set"}:
-            raise ValueError(f"Unknown zoom action: {action}")
-        if action == "set":
-            if level is None:
-                raise ValueError("zoom level is required for set")
-            self.zoom_level_spin.setValue(int(level))
-        self.send_zoom(target, action)
 
     def workstation_discover_custom_mavlink_watch(self) -> None:
         self.discover_custom_mavlink_watch()
@@ -17233,290 +10398,161 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "axis_contract": "checkerboard image pixels; left/right camera optical RDF labels remain unchanged",
         }
 
-    def _apply_selected_wiris_command(self, *_args) -> None:
-        if not hasattr(self, "wiris_command_combo"):
-            return
-        data = self.wiris_command_combo.currentData()
-        if not data:
-            return
-        command, terminator, description = data
-        self.wiris_command_edit.setText(str(command))
-        self._set_combo_data(self.wiris_command_terminator_combo, str(terminator))
-        self.wiris_command_status_label.setText(str(description))
-        self.wiris_command_status_label.setToolTip(str(description))
-        self.wiris_command_combo.setToolTip(str(description))
-        self.wiris_command_edit.setToolTip(str(description))
 
-    def _append_wiris_command_log(self, text: str) -> None:
-        self.wiris_command_log.appendPlainText(text)
-        self.wiris_command_log.moveCursor(QtGui.QTextCursor.End)
 
-    def _wiris_command_needs_confirmation(self, command_text: str) -> bool:
-        normalized = " ".join(command_text.upper().split())
-        return any(normalized.startswith(prefix) for prefix in WIRIS_DANGEROUS_COMMAND_PREFIXES)
 
-    def _stus_command_from_unix_time(self, unix_time_s: float) -> str:
-        seconds = int(unix_time_s)
-        microseconds = int(round((float(unix_time_s) - seconds) * 1_000_000))
-        if microseconds >= 1_000_000:
-            seconds += 1
-            microseconds -= 1_000_000
-        return f"STUS {seconds} {microseconds}"
 
-    def set_selected_wiris_time_from_pc(self, target: str | None = None) -> None:
-        if target is None:
-            if hasattr(self, "clock_wiris_time_target_combo"):
-                target = str(self.clock_wiris_time_target_combo.currentData() or "both")
-            else:
-                target = str(self.wiris_command_target_combo.currentData() or "both")
-        target = str(target or "both")
-        if self.wiris_time_sync_thread is not None:
-            self._log("[카메라] WIRIS RTC PC UTC 설정이 이미 진행 중입니다.")
-            return
-        target_infos = [
-            (label, host, self._control_port_for_camera(label), self.zoom_timeout_spin.value())
-            for label, host in self.zoom_hosts(target)
-        ]
-        if not target_infos:
-            status_text = "시간을 설정할 WIRIS 대상이 없습니다."
-            self.wiris_command_status_label.setText(status_text)
-            if hasattr(self, "clock_sync_status_label"):
-                self.clock_sync_status_label.setText(status_text)
-            return
-        self.wiris_set_pc_time_button.setEnabled(False)
-        self.wiris_command_status_label.setText("PC UTC 설정: sending...")
-        if hasattr(self, "clock_sync_status_label"):
-            self.clock_sync_status_label.setText("PC UTC 설정: sending...")
-        self.wiris_time_sync_thread = QtCore.QThread(self)
-        self.wiris_time_sync_worker = WirisClockCommandWorker(
-            target_infos,
-            command_text="STUS",
-            shared_utc=True,
-        )
-        self.wiris_time_sync_worker.moveToThread(self.wiris_time_sync_thread)
-        self.wiris_time_sync_thread.started.connect(self.wiris_time_sync_worker.run)
-        self.wiris_time_sync_worker.completed.connect(
-            lambda result, target=target, target_infos=target_infos: self._apply_wiris_time_sync_result(
-                target, target_infos, result
-            )
-        )
-        self.wiris_time_sync_worker.failed.connect(self._wiris_time_sync_failed)
-        self.wiris_time_sync_worker.finished.connect(self.wiris_time_sync_thread.quit)
-        self.wiris_time_sync_worker.finished.connect(self.wiris_time_sync_worker.deleteLater)
-        self.wiris_time_sync_thread.finished.connect(self.wiris_time_sync_thread.deleteLater)
-        self.wiris_time_sync_thread.finished.connect(self._clear_wiris_time_sync_worker)
-        self.wiris_time_sync_thread.start()
 
-    def _apply_wiris_time_sync_result(
-        self,
-        target: str,
-        target_infos: Sequence[tuple[str, str, int, float]],
-        result: object,
-    ) -> None:
-        data = dict(result or {})
-        results = dict(data.get("results") or {})
-        statuses = {label: str(dict(results.get(label) or {}).get("response") or "") for label, *_ in target_infos}
-        for label, _host, port, _timeout_s in target_infos:
-            row = dict(results.get(label) or {})
-            response = statuses.get(label, "")
-            command = str(row.get("command") or "STUS")
-            requested_utc_s = data.get("requested_utc_s")
-            utc_text = ""
-            if requested_utc_s is not None:
-                utc_text = datetime.fromtimestamp(float(requested_utc_s), tz=timezone.utc).isoformat(timespec="microseconds")
-            utc_suffix = f" [pc_utc={utc_text.replace('+00:00', 'Z')}]" if utc_text else ""
-            self._append_wiris_command_log(
-                f"> {self._camera_name_ko(label)} {row.get('host', '')}:{port} {command}"
-                f"{utc_suffix}\n{response}\n"
-            )
-        command_times = dict(data.get("command_times") or {})
-        tcp_start_times = dict(data.get("tcp_start_times") or {})
-        ordered_command_times = [
-            (label, float(command_times[label]))
-            for label, *_ in target_infos
-            if label in command_times
-        ]
-        ordered_tcp_times = [
-            (label, float(tcp_start_times[label]))
-            for label, *_ in target_infos
-            if label in tcp_start_times
-        ]
-        command_skew_ms = (
-            (ordered_command_times[-1][1] - ordered_command_times[0][1]) * 1000.0
-            if len(ordered_command_times) >= 2
-            else None
-        )
-        tcp_start_skew_ms = (
-            (ordered_tcp_times[-1][1] - ordered_tcp_times[0][1]) * 1000.0
-            if len(ordered_tcp_times) >= 2
-            else None
-        )
-        skew_text = ""
-        if command_skew_ms is not None:
-            skew_text = (
-                f" | 명령 UTC 차이 {self._camera_name_ko(ordered_command_times[0][0])}→"
-                f"{self._camera_name_ko(ordered_command_times[-1][0])}: {command_skew_ms:.3f} ms"
-            )
-        if tcp_start_skew_ms is not None:
-            skew_text += f", TCP 호출 시작 차이: {tcp_start_skew_ms:.3f} ms"
-        status_text = " | ".join(
-            f"{self._camera_name_ko(label)}: {statuses.get(label, '<no response>')}"
-            for label, *_ in target_infos
-        ) + skew_text
-        self.wiris_command_status_label.setText(status_text)
-        if hasattr(self, "clock_sync_status_label"):
-            self.clock_sync_status_label.setText(f"PC UTC 설정 전송: {status_text}")
-            self.clock_sync_summary_text.setPlainText(
-                "STUS command sent from PC UTC.\n"
-                "Run RTCP/NTP 동기화 확인 after stream frames arrive to verify left/right RTC and PC UTC offsets.\n"
-                f"{status_text}"
-            )
-        successful_targets = [
-            label for label, *_ in target_infos if not statuses.get(label, "").startswith("실패:")
-        ]
-        requested_utc_s = data.get("requested_utc_s")
-        result_state = "success" if len(successful_targets) == len(target_infos) else (
-            "partial" if successful_targets else "failed"
-        )
-        self._last_wiris_pc_utc_sync = {
-            "command": "STUS",
-            "target": target,
-            "result": result_state,
-            "requested_utc_s": requested_utc_s,
-            "successful_targets": successful_targets,
-            "responses": statuses,
-            "command_skew_ms": command_skew_ms,
-            "tcp_start_skew_ms": tcp_start_skew_ms,
-            "recorded_at_unix_s": time.time(),
-        }
-        self._begin_camera_sync_after_stus(
-            target=target,
-            result=result_state,
-            requested_utc_s=None if requested_utc_s is None else float(requested_utc_s),
-            target_infos=target_infos,
-        )
-        self._log(f"[카메라] WIRIS RTC PC UTC 설정 target={target}: {status_text}")
 
-    def _wiris_time_sync_failed(self, error: str) -> None:
-        self.wiris_command_status_label.setText(f"PC UTC 설정: failed ({error})")
-        if hasattr(self, "clock_sync_status_label"):
-            self.clock_sync_status_label.setText(f"PC UTC 설정: failed ({error})")
-        self._log(f"[카메라] WIRIS RTC PC UTC 설정 실패: {error}")
 
-    def _clear_wiris_time_sync_worker(self) -> None:
-        self.wiris_time_sync_thread = None
-        self.wiris_time_sync_worker = None
-        self.wiris_set_pc_time_button.setEnabled(True)
 
-    def send_selected_wiris_command(self) -> None:
-        command_text = self.wiris_command_edit.text().strip()
-        if not command_text:
-            self.wiris_command_status_label.setText("전송할 명령이 비어 있습니다.")
-            return
-        if "<" in command_text or ">" in command_text or "{" in command_text or "}" in command_text:
-            self.wiris_command_status_label.setText("placeholder를 실제 값으로 바꾼 뒤 전송하세요.")
-            return
-        if self._wiris_command_needs_confirmation(command_text):
-            answer = QtWidgets.QMessageBox.warning(
-                self,
-                "Send WIRIS SDK Command",
-                (
-                    f"이 명령은 카메라 설정, 네트워크, 녹화, 전원 상태를 바꿀 수 있습니다.\n\n"
-                    f"{command_text}\n\n"
-                    "대상 카메라가 확실할 때만 전송하세요."
-                ),
-                QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
-                QtWidgets.QMessageBox.Cancel,
-            )
-            if answer != QtWidgets.QMessageBox.Ok:
-                self.wiris_command_status_label.setText("명령 전송이 취소되었습니다.")
-                return
 
-        target = str(self.wiris_command_target_combo.currentData() or "both")
-        terminator = str(self.wiris_command_terminator_combo.currentData() or LINE_TERMINATOR)
-        target_infos = [
-            (label, host, self._control_port_for_camera(label), self.zoom_timeout_spin.value())
-            for label, host in self.zoom_hosts(target)
-        ]
-        if not target_infos:
-            self.wiris_command_status_label.setText("명령을 전송할 WIRIS 대상이 없습니다.")
-            return
 
-        self._start_wiris_command_worker(
-            target=target,
-            target_infos=target_infos,
-            command_text=command_text,
-            terminator=terminator,
-        )
 
-    def _start_wiris_command_worker(
-        self,
-        *,
-        target: str,
-        target_infos: Sequence[tuple[str, str, int, float]],
-        command_text: str,
-        terminator: str,
-    ) -> None:
-        if self.wiris_command_thread is not None:
-            self._log("[카메라] WIRIS SDK 명령이 이미 진행 중입니다.")
-            return
-        self.wiris_command_status_label.setText("WIRIS SDK command: sending...")
-        self.wiris_send_button.setEnabled(False)
-        self.wiris_command_thread = QtCore.QThread(self)
-        self.wiris_command_worker = WirisCommandWorker(
-            target_infos,
-            command_text=command_text,
-            terminator=terminator,
-        )
-        self.wiris_command_worker.moveToThread(self.wiris_command_thread)
-        self.wiris_command_thread.started.connect(self.wiris_command_worker.run)
-        self.wiris_command_worker.completed.connect(
-            lambda result, target=target, command_text=command_text: self._apply_wiris_command_result(
-                target, command_text, result
-            )
-        )
-        self.wiris_command_worker.failed.connect(self._wiris_command_failed)
-        self.wiris_command_worker.finished.connect(self.wiris_command_thread.quit)
-        self.wiris_command_worker.finished.connect(self.wiris_command_worker.deleteLater)
-        self.wiris_command_thread.finished.connect(self.wiris_command_thread.deleteLater)
-        self.wiris_command_thread.finished.connect(self._clear_wiris_command_worker)
-        self.wiris_command_thread.start()
 
-    def _apply_wiris_command_result(self, target: str, command_text: str, result: object) -> None:
-        data = dict(result or {}) if isinstance(result, dict) else {}
-        statuses = {str(key): str(value) for key, value in dict(data.get("statuses") or {}).items()}
-        send_times = {str(key): float(value) for key, value in dict(data.get("send_times") or {}).items()}
-        target_infos = tuple(data.get("target_infos") or ())
-        for log_text in dict(data.get("command_logs") or {}).values():
-            self._append_wiris_command_log(str(log_text))
-        skew_text = ""
-        ordered_times = [
-            (str(label), send_times[str(label)])
-            for label, _host, _port, _timeout_s in target_infos
-            if str(label) in send_times
-        ]
-        if len(ordered_times) >= 2:
-            first_label, first_time_s = ordered_times[0]
-            last_label, last_time_s = ordered_times[-1]
-            skew_text = (
-                f" | 전송 시각 차이 {self._camera_name_ko(first_label)}→"
-                f"{self._camera_name_ko(last_label)}: {(last_time_s - first_time_s) * 1000.0:.3f} ms"
-            )
-        status_text = " | ".join(
-            f"{self._camera_name_ko(str(label))}: {statuses.get(str(label), '<no response>')}"
-            for label, _host, _port, _timeout_s in target_infos
-        ) + skew_text
-        self.wiris_command_status_label.setText(status_text)
-        self._log(f"[카메라] WIRIS SDK 명령 target={target}, command={command_text}: {status_text}")
 
-    def _wiris_command_failed(self, error: str) -> None:
-        self.wiris_command_status_label.setText(f"WIRIS SDK command: failed ({error})")
-        self._log(f"[카메라] WIRIS SDK 명령 실패: {error}")
 
-    def _clear_wiris_command_worker(self) -> None:
-        self.wiris_command_thread = None
-        self.wiris_command_worker = None
-        self.wiris_send_button.setEnabled(True)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
     def _auto_load_intrinsics(self) -> None:
         if not bool(self._workstation_setting("auto_load_intrinsics", self.settings.auto_load_intrinsics)):
@@ -17551,7 +10587,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if path is None:
             configured_path = str(self._workstation_setting("intrinsics_path", "") or "").strip()
             if configured_path:
-                path = resolve_settings_path(configured_path, base_dir=APP_ROOT)
+                path = resolve_settings_path(configured_path, base_dir=self.app_root)
             else:
                 root, _left_dir, _right_dir = self._calibration_dirs()
                 path = root / "intrinsics.json"
@@ -17640,659 +10676,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 else self.settings.gnss_operation
             ),
         )
-        save_settings(self.settings)
-
-    def _app_relative_path_text(self, path: str | Path) -> str:
-        resolved = Path(path).expanduser().resolve()
-        try:
-            return str(resolved.relative_to(APP_ROOT.resolve()))
-        except ValueError:
-            return str(resolved)
-
-    def _checkerboard_validation_mode(self) -> str:
-        if not hasattr(self, "checkerboard_validation_mode_combo"):
-            return "pixhawk"
-        mode = str(self.checkerboard_validation_mode_combo.currentData() or "pixhawk")
-        return mode if mode in {"pixhawk", "checkerboard"} else "pixhawk"
-
-    def _checkerboard_validation_root(self) -> Path:
-        text = self.checkerboard_validation_root_edit.text().strip() if hasattr(self, "checkerboard_validation_root_edit") else ""
-        if text:
-            return resolve_settings_path(text, base_dir=APP_ROOT)
-        root, _left_dir, _right_dir = self._calibration_dirs()
-        return root
-
-    def _calibration_image_paths_for_root(self, root: Path, side: str) -> list[Path]:
-        return sorted((root / side).glob(f"{side}_*.png"))
-
-    def _calibration_stereo_pair_paths_for_root(self, root: Path) -> list[tuple[str, Path, Path]]:
-        def indexed(paths: list[Path], side: str) -> dict[str, Path]:
-            result: dict[str, Path] = {}
-            for path in paths:
-                suffix = path.stem.replace(f"{side}_", "", 1)
-                result[suffix] = path
-            return result
-
-        left_by_id = indexed(self._calibration_image_paths_for_root(root, "left"), "left")
-        right_by_id = indexed(self._calibration_image_paths_for_root(root, "right"), "right")
-        return [(key, left_by_id[key], right_by_id[key]) for key in sorted(set(left_by_id) & set(right_by_id))]
-
-    def _checkerboard_validation_scan_counts(self) -> tuple[Path, list[Path], list[Path], list[tuple[str, Path, Path]]]:
-        root = self._checkerboard_validation_root()
-        left_paths = self._calibration_image_paths_for_root(root, "left")
-        right_paths = self._calibration_image_paths_for_root(root, "right")
-        pairs = self._calibration_stereo_pair_paths_for_root(root)
-        return root, left_paths, right_paths, pairs
-
-    def scan_checkerboard_validation_files(self) -> None:
-        root, left_paths, right_paths, pairs = self._checkerboard_validation_scan_counts()
-        mode = self._checkerboard_validation_mode()
-        requirement = (
-            "필수: left/right 이미지"
-            if mode == "pixhawk"
-            else "필수: matching stereo pair"
-        )
-        level = "good" if (pairs if mode == "checkerboard" else left_paths and right_paths) else "warn"
-        text = (
-            f"root={root} | left={len(left_paths)} right={len(right_paths)} "
-            f"stereo_pair={len(pairs)} | {requirement}"
-        )
-        self._set_health_label(self.checkerboard_validation_scan_label, text, level)
-
-    def choose_checkerboard_validation_root(self) -> None:
-        directory = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            "체커보드 사진셋 root 선택",
-            str(self._checkerboard_validation_root()),
-        )
-        if not directory:
-            return
-        self.checkerboard_validation_root_edit.setText(directory)
-        self.scan_checkerboard_validation_files()
-
-    def choose_checkerboard_validation_json(self) -> None:
-        path, _filter = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "기존 intrinsics JSON 선택",
-            str(self._intrinsics_storage_path()),
-            "Intrinsics JSON (*.json);;All Files (*)",
-        )
-        if path:
-            self.checkerboard_validation_json_edit.setText(path)
-
-    def _checkerboard_validation_set_result(
-        self,
-        result: StereoIntrinsicsResult,
-        *,
-        mode: str,
-        summary: dict[str, object],
-        text: str,
-    ) -> None:
-        self.checkerboard_validation_result = result
-        self.checkerboard_validation_result_mode = mode
-        self.checkerboard_validation_summary = dict(summary)
-        self.checkerboard_validation_result_saved = False
-        self.last_calibration_result = result
-        self.last_calibration_zoom_level = self.zoom_level_spin.value()
-        self._active_intrinsics_profile_path = (
-            f"memory:checkerboard-validation:{mode}:zoom-{self.last_calibration_zoom_level:02d}"
-        )
-        self.calibration_result_text.setPlainText(text)
-        extrinsics_state = "with checkerboard stereo R/T" if result.extrinsics is not None else "intrinsics only"
-        self._set_health_label(
-            self.checkerboard_validation_status_label,
-            f"계산 결과 있음: {mode} | {extrinsics_state} | 저장 전",
-            "good",
-        )
-        self._refresh_camera_parameters_tab()
-        self._refresh_zoom_intrinsics_tab()
-
-    def _calibrate_checkerboard_selection(
-        self,
-        *,
-        mode: str,
-        left_paths: list[Path],
-        right_paths: list[Path],
-        pair_count: int | None,
-    ) -> StereoIntrinsicsResult:
-        config = self._checkerboard_config()
-        left = calibrate_camera_from_images(left_paths, config)
-        right = calibrate_camera_from_images(right_paths, config)
-        extrinsics = None
-        if mode == "checkerboard":
-            extrinsics = calibrate_stereo_extrinsics_from_image_pairs(left_paths, right_paths, config, left, right)
-        return StereoIntrinsicsResult(left=left, right=right, board=config, extrinsics=extrinsics)
-
-    def _checkerboard_result_baseline_m(self, result: StereoIntrinsicsResult) -> float | None:
-        extrinsics = result.extrinsics
-        if extrinsics is None:
-            return None
-        return math.sqrt(sum(value * value for value in extrinsics.translation_left_to_right_m))
-
-    def _rotation_delta_deg_from_matrices(
-        self,
-        reference: list[list[float]] | None,
-        current: list[list[float]] | None,
-    ) -> float | None:
-        if reference is None or current is None:
-            return None
-        try:
-            trace = sum(
-                float(current[row][col]) * float(reference[row][col])
-                for row in range(3)
-                for col in range(3)
-            )
-        except (TypeError, ValueError, IndexError):
-            return None
-        ratio = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
-        return math.degrees(math.acos(ratio))
-
-    def _format_checkerboard_validation_result_summary(
-        self,
-        result: StereoIntrinsicsResult,
-        *,
-        mode: str,
-        title: str,
-        root: Path | None = None,
-        pair_count: int | None = None,
-    ) -> str:
-        baseline_m = self._checkerboard_result_baseline_m(result)
-        extrinsics = result.extrinsics
-        lines = [
-            title,
-            f"mode: {mode}",
-            f"root: {root}" if root is not None else "",
-            f"Left: images={result.left.image_count}, error={result.left.reprojection_error_px:.3f}px, "
-            f"fx={result.left.camera_matrix[0][0]:.3f}, fy={result.left.camera_matrix[1][1]:.3f}, "
-            f"cx={result.left.camera_matrix[0][2]:.3f}, cy={result.left.camera_matrix[1][2]:.3f}",
-            f"Right: images={result.right.image_count}, error={result.right.reprojection_error_px:.3f}px, "
-            f"fx={result.right.camera_matrix[0][0]:.3f}, fy={result.right.camera_matrix[1][1]:.3f}, "
-            f"cx={result.right.camera_matrix[0][2]:.3f}, cy={result.right.camera_matrix[1][2]:.3f}",
-        ]
-        if extrinsics is None:
-            lines.append("Extrinsics: not computed (Pixhawk mode uses live attitude + GPS/RTK baseline)")
-        else:
-            lines.extend(
-                [
-                    f"Stereo: pairs={extrinsics.pair_count}, error={extrinsics.reprojection_error_px:.3f}px, "
-                    f"|T|={baseline_m:.6f} m",
-                    f"T_left_to_right_m={extrinsics.translation_left_to_right_m}",
-                    f"R_left_to_right={extrinsics.rotation_left_to_right}",
-                ]
-            )
-        if pair_count is not None:
-            lines.append(f"selected stereo pairs: {pair_count}")
-        return "\n".join(line for line in lines if line)
-
-    def load_checkerboard_validation_json(self) -> None:
-        path_text = self.checkerboard_validation_json_edit.text().strip()
-        if not path_text:
-            self._set_health_label(self.checkerboard_validation_status_label, "JSON 경로가 비어 있습니다", "bad")
-            return
-        path = resolve_settings_path(path_text, base_dir=APP_ROOT)
-        try:
-            result = load_intrinsics_json(path)
-        except Exception as exc:
-            self._set_health_label(self.checkerboard_validation_status_label, f"JSON 불러오기 실패: {exc}", "bad")
-            return
-        mode = "checkerboard" if result.extrinsics is not None else "pixhawk"
-        if hasattr(self, "checkerboard_validation_mode_combo"):
-            self._set_combo_data(self.checkerboard_validation_mode_combo, mode)
-        text = self._format_checkerboard_validation_result_summary(
-            result,
-            mode=mode,
-            title=f"Loaded intrinsics JSON: {path}",
-        )
-        self._checkerboard_validation_set_result(
-            result,
-            mode=mode,
-            summary={"source": "json", "path": str(path)},
-            text=text,
-        )
-        self.checkerboard_validation_result_saved = True
-        self._set_health_label(
-            self.checkerboard_validation_status_label,
-            f"기존 JSON 불러옴: {mode} | {path}",
-            "good",
-        )
-
-    def _checkerboard_random_subset_count(self, total_pairs: int) -> int:
-        configured = self.checkerboard_validation_random_pair_count_spin.value()
-        if configured > 0:
-            return min(total_pairs, max(3, configured))
-        min_images = self.calib_min_images_spin.value()
-        return min(total_pairs, max(3, min_images, int(math.ceil(total_pairs * 0.7))))
-
-    def _checkerboard_intrinsic_delta_px(self, result: StereoIntrinsicsResult, reference: StereoIntrinsicsResult) -> tuple[float, float]:
-        left_delta = max(
-            abs(float(result.left.camera_matrix[row][col]) - float(reference.left.camera_matrix[row][col]))
-            for row, col in ((0, 0), (1, 1), (0, 2), (1, 2))
-        )
-        right_delta = max(
-            abs(float(result.right.camera_matrix[row][col]) - float(reference.right.camera_matrix[row][col]))
-            for row, col in ((0, 0), (1, 1), (0, 2), (1, 2))
-        )
-        return left_delta, right_delta
-
-    def _checkerboard_validation_stddev(self, values: list[float]) -> float:
-        if len(values) < 2:
-            return 0.0
-        mean = sum(values) / len(values)
-        return math.sqrt(sum((value - mean) ** 2 for value in values) / (len(values) - 1))
-
-    def run_checkerboard_random_validation(self) -> None:
-        available, error = opencv_available()
-        if not available:
-            self._set_health_label(self.checkerboard_validation_status_label, f"OpenCV unavailable: {error}", "bad")
-            return
-        reference = self.checkerboard_validation_result
-        if reference is None:
-            self._set_health_label(
-                self.checkerboard_validation_status_label,
-                "랜덤 검증 전에 전체 사진으로 계산을 먼저 실행하세요.",
-                "warn",
-            )
-            return
-        mode = self._checkerboard_validation_mode()
-        root, _left_paths, _right_paths, pairs = self._checkerboard_validation_scan_counts()
-        if len(pairs) < 3:
-            self._set_health_label(
-                self.checkerboard_validation_status_label,
-                f"랜덤 검증 실패: stereo pair가 부족합니다 (pair={len(pairs)}, need>=3)",
-                "bad",
-            )
-            return
-        subset_count = self._checkerboard_random_subset_count(len(pairs))
-        runs = self.checkerboard_validation_random_runs_spin.value()
-        seed = self.checkerboard_validation_seed_spin.value()
-        rng = random.Random(seed if seed > 0 else None)
-        rows: list[str] = []
-        baselines: list[float] = []
-        rotations: list[float] = []
-        left_deltas: list[float] = []
-        right_deltas: list[float] = []
-        reference_baseline = self._checkerboard_result_baseline_m(reference)
-        reference_rotation = None if reference.extrinsics is None else reference.extrinsics.rotation_left_to_right
-        rows.append(
-            "Run       Pairs  Lerr   Rerr   Serr   Baseline(m)  dB(mm)   dR(deg)  max_dK_L(px)  max_dK_R(px)"
-        )
-        rows.append(self._checkerboard_validation_result_row("Full", reference, reference, len(pairs)))
-        for index in range(1, runs + 1):
-            subset = rng.sample(pairs, subset_count)
-            left_subset = [left for _key, left, _right in subset]
-            right_subset = [right for _key, _left, right in subset]
-            try:
-                result = self._calibrate_checkerboard_selection(
-                    mode=mode,
-                    left_paths=left_subset,
-                    right_paths=right_subset,
-                    pair_count=len(subset),
-                )
-            except Exception as exc:
-                rows.append(f"Random {index:<2} FAILED: {exc}")
-                continue
-            rows.append(self._checkerboard_validation_result_row(f"Random {index}", result, reference, len(subset)))
-            left_delta, right_delta = self._checkerboard_intrinsic_delta_px(result, reference)
-            left_deltas.append(left_delta)
-            right_deltas.append(right_delta)
-            baseline = self._checkerboard_result_baseline_m(result)
-            if baseline is not None:
-                baselines.append(baseline)
-            rotation = self._rotation_delta_deg_from_matrices(
-                reference_rotation,
-                None if result.extrinsics is None else result.extrinsics.rotation_left_to_right,
-            )
-            if rotation is not None:
-                rotations.append(rotation)
-        baseline_std = self._checkerboard_validation_stddev(baselines)
-        rotation_std = self._checkerboard_validation_stddev(rotations)
-        rows.extend(
-            [
-                "",
-                "Stability:",
-                f"max_dK_L std={self._checkerboard_validation_stddev(left_deltas):.3f} px",
-                f"max_dK_R std={self._checkerboard_validation_stddev(right_deltas):.3f} px",
-                f"baseline std={baseline_std * 1000.0:.3f} mm" if baselines else "baseline std=n/a",
-                f"rotation delta std={rotation_std:.6f} deg" if rotations else "rotation delta std=n/a",
-            ]
-        )
-        summary = dict(self.checkerboard_validation_summary)
-        summary["random_validation"] = {
-            "runs": runs,
-            "subset_pair_count": subset_count,
-            "seed": None if seed == 0 else seed,
-            "baseline_std_m": baseline_std if baselines else None,
-            "rotation_delta_std_deg": rotation_std if rotations else None,
-            "left_intrinsics_delta_std_px": self._checkerboard_validation_stddev(left_deltas),
-            "right_intrinsics_delta_std_px": self._checkerboard_validation_stddev(right_deltas),
-        }
-        self.checkerboard_validation_summary = summary
-        full_text = self.calibration_result_text.toPlainText().rstrip()
-        self.calibration_result_text.setPlainText(full_text + "\n\nRandom stereo-pair validation:\n" + "\n".join(rows))
-        self._set_health_label(
-            self.checkerboard_validation_status_label,
-            f"랜덤 검증 완료: runs={runs}, subset_pairs={subset_count}, mode={mode}",
-            "good",
-        )
-
-    def _checkerboard_validation_result_row(
-        self,
-        name: str,
-        result: StereoIntrinsicsResult,
-        reference: StereoIntrinsicsResult,
-        pairs: int,
-    ) -> str:
-        baseline = self._checkerboard_result_baseline_m(result)
-        reference_baseline = self._checkerboard_result_baseline_m(reference)
-        baseline_text = "n/a" if baseline is None else f"{baseline:.6f}"
-        baseline_delta_text = (
-            "n/a"
-            if baseline is None or reference_baseline is None
-            else f"{(baseline - reference_baseline) * 1000.0:+.3f}"
-        )
-        rotation_delta = self._rotation_delta_deg_from_matrices(
-            None if reference.extrinsics is None else reference.extrinsics.rotation_left_to_right,
-            None if result.extrinsics is None else result.extrinsics.rotation_left_to_right,
-        )
-        rotation_text = "n/a" if rotation_delta is None else f"{rotation_delta:.6f}"
-        stereo_error = "n/a" if result.extrinsics is None else f"{result.extrinsics.reprojection_error_px:.3f}"
-        left_delta, right_delta = self._checkerboard_intrinsic_delta_px(result, reference)
-        return (
-            f"{name:<10} {pairs:>5}  {result.left.reprojection_error_px:>5.3f}  "
-            f"{result.right.reprojection_error_px:>5.3f}  {stereo_error:>5}  "
-            f"{baseline_text:>11}  {baseline_delta_text:>7}  {rotation_text:>8}  "
-            f"{left_delta:>11.3f}  {right_delta:>11.3f}"
-        )
-
-    def save_checkerboard_validation_result(self) -> None:
-        result = self.checkerboard_validation_result
-        if result is None:
-            self._set_health_label(self.checkerboard_validation_status_label, "저장할 계산 결과가 없습니다", "warn")
-            return
-        root, _left_dir, _right_dir = self._calibration_dirs()
-        root.mkdir(parents=True, exist_ok=True)
-        zoom_level = self.zoom_level_spin.value()
-        zoom_output = self._intrinsics_storage_path(zoom_level)
-        latest_output = self._intrinsics_storage_base_path()
-        metadata = {
-            "note": "Generated by StereoWIRIS checkerboard validation/calculation tab",
-            "timestamp_s": time.time(),
-            "zoom_level": zoom_level,
-            "zoom_target": str(self.zoom_target_combo.currentData() or "both"),
-            "calculation_mode": self.checkerboard_validation_result_mode,
-            "validation": self.checkerboard_validation_summary,
-        }
-        save_intrinsics_json(zoom_output, result, metadata=metadata)
-        if zoom_output != latest_output:
-            save_intrinsics_json(latest_output, result, metadata=metadata)
-        self.checkerboard_validation_result_saved = True
-        self.last_calibration_zoom_level = zoom_level
-        self._add_zoom_intrinsics_comparison_path(zoom_output)
-        self._save_current_settings()
-        self._set_health_label(
-            self.checkerboard_validation_status_label,
-            f"계산 결과 저장 완료: zoom {zoom_level:02d} | {zoom_output}",
-            "good",
-        )
-        self._refresh_operation_header()
-        self._refresh_zoom_intrinsics_tab()
-
-    def apply_checkerboard_validation_result(self) -> None:
-        result = self.checkerboard_validation_result
-        if result is None:
-            self._set_health_label(self.checkerboard_validation_status_label, "적용할 계산 결과가 없습니다", "warn")
-            return
-        mode = self.checkerboard_validation_result_mode
-        if mode == "checkerboard" and result.extrinsics is None:
-            self._set_health_label(
-                self.checkerboard_validation_status_label,
-                "체커보드 Stereo 모드는 stereo R/T가 있는 결과만 적용할 수 있습니다",
-                "bad",
-            )
-            return
-        self.last_calibration_result = result
-        self.last_calibration_zoom_level = self.zoom_level_spin.value()
-        self._set_combo_data(self.distance_mode_combo, mode)
-        self.apply_intrinsics_to_distance()
-        self._save_current_settings()
-        saved_text = "저장됨" if self.checkerboard_validation_result_saved else "저장 전"
-        self._set_health_label(
-            self.checkerboard_validation_status_label,
-            f"계산에 적용 완료: mode={mode} | {saved_text}",
-            "good",
-        )
-
-    def _checkerboard_config(self) -> CheckerboardConfig:
-        return CheckerboardConfig(
-            inner_cols=self.calib_cols_spin.value(),
-            inner_rows=self.calib_rows_spin.value(),
-            square_size_m=self.calib_square_spin.value() / 1000.0,
-        )
-
-    def _calibration_dirs(self) -> tuple[Path, Path, Path]:
-        text = self.calib_dir_edit.text().strip()
-        if text:
-            root = resolve_settings_path(text, base_dir=APP_ROOT)
-        else:
-            root = resolve_settings_path(DEFAULT_INTRINSICS_PATH, base_dir=APP_ROOT).parent
-        left_dir = root / "left"
-        right_dir = root / "right"
-        return root, left_dir, right_dir
-
-    def _intrinsics_storage_base_path(self) -> Path:
-        if hasattr(self, "calib_dir_edit"):
-            root, _left_dir, _right_dir = self._calibration_dirs()
-            path = root / "intrinsics.json"
-        else:
-            path = resolve_settings_path(self.settings.intrinsics_path, base_dir=APP_ROOT)
-        stem = path.stem
-        if "_zoom_" in stem:
-            base_stem, zoom_suffix = stem.rsplit("_zoom_", 1)
-            if zoom_suffix.isdigit():
-                return path.with_name(f"{base_stem}{path.suffix}")
-        return path
-
-    def _intrinsics_storage_path(self, zoom_level: int | None = None) -> Path:
-        base_path = self._intrinsics_storage_base_path()
-        level = self.zoom_level_spin.value() if zoom_level is None else int(zoom_level)
-        return base_path.with_name(f"{base_path.stem}_zoom_{level:02d}{base_path.suffix}")
-
-    def _calibration_image_paths(self, side: str) -> list[Path]:
-        _root, left_dir, right_dir = self._calibration_dirs()
-        directory = left_dir if side == "left" else right_dir
-        return sorted(directory.glob(f"{side}_*.png"))
-
-    def _next_calibration_capture_stem(self) -> str:
-        max_index = self.calibration_capture_index
-        for side in ("left", "right"):
-            for path in self._calibration_image_paths(side):
-                suffix = path.stem.replace(f"{side}_", "", 1)
-                if suffix.isdigit():
-                    max_index = max(max_index, int(suffix))
-        self.calibration_capture_index = max_index + 1
-        return f"{self.calibration_capture_index:03d}"
-
-    def _checkerboard_capture_pair_timing(self) -> tuple[bool, str, float | None, str]:
-        left_metadata = self.camera_frame_metadata.get("left") or {}
-        right_metadata = self.camera_frame_metadata.get("right") or {}
-        left_timestamp = self._camera_rtc_timestamp_s_from_metadata(left_metadata)
-        right_timestamp = self._camera_rtc_timestamp_s_from_metadata(right_metadata)
-        if left_timestamp is None or right_timestamp is None:
-            return (
-                False,
-                "rtcp-ntp",
-                None,
-                "missing RTCP/NTP camera timestamp for left or right frame",
-            )
-        delta_s = float(right_timestamp) - float(left_timestamp)
-        if abs(delta_s) > CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S:
-            return (
-                False,
-                "rtcp-ntp",
-                delta_s,
-                f"RTCP/NTP pair delta {delta_s * 1000.0:.1f} ms exceeds "
-                f"{CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S * 1000.0:.1f} ms",
-            )
-        return True, "rtcp-ntp", delta_s, "ok"
-
-    def capture_calibration_images(self) -> None:
-        frames = {
-            "left": self.left_pane.current_image(),
-            "right": self.right_pane.current_image(),
-        }
-        if frames["left"] is None and frames["right"] is None:
-            self.calibration_status_label.setText("Start at least one camera stream before capturing calibration images.")
-            self._log("[캘리브레이션] 이미지 캡처 실패: 좌/우 카메라 프레임 중 하나 이상이 필요합니다.")
-            return
-        root, left_dir, right_dir = self._calibration_dirs()
-        left_dir.mkdir(parents=True, exist_ok=True)
-        right_dir.mkdir(parents=True, exist_ok=True)
-        stem = self._next_calibration_capture_stem()
-        available, error = opencv_available()
-        config = self._checkerboard_config() if available else None
-        directories = {"left": left_dir, "right": right_dir}
-        saved_sides: list[str] = []
-        status_parts: list[str] = []
-        pair_candidate = frames["left"] is not None and frames["right"] is not None
-        pair_timing_ok = False
-        pair_time_basis = "rtcp-ntp"
-        pair_delta_s: float | None = None
-        pair_timing_detail = "single-camera capture"
-        if pair_candidate:
-            pair_timing_ok, pair_time_basis, pair_delta_s, pair_timing_detail = self._checkerboard_capture_pair_timing()
-            if not pair_timing_ok:
-                status_parts.append(f"pair=rejected ({pair_timing_detail})")
-        for side in ("left", "right"):
-            image = frames[side]
-            if image is None:
-                status_parts.append(f"{side}=no frame")
-                continue
-            if pair_candidate and not pair_timing_ok:
-                other_side = "right" if side == "left" else "left"
-                other_image = frames[other_side]
-                if other_image is not None:
-                    status_parts.append(f"{side}=not saved as stereo pair ({pair_timing_detail})")
-                    continue
-            path = directories[side] / f"{side}_{stem}.png"
-            if not image.save(str(path), "PNG"):
-                status_parts.append(f"{side}=save FAIL")
-                continue
-            if not available:
-                saved_sides.append(side)
-                opencv_detail = f": {error}" if error else ""
-                status_parts.append(f"{side}=saved (OpenCV unavailable{opencv_detail})")
-                continue
-            assert config is not None
-            detection = detect_checkerboard(path, config)
-            if detection.found:
-                saved_sides.append(side)
-                status_parts.append(f"{side}=OK saved ({detection.corner_count})")
-            else:
-                path.unlink(missing_ok=True)
-                detail = f"error: {detection.error}" if detection.error else f"{detection.corner_count}"
-                status_parts.append(f"{side}=not found ({detail})")
-
-        if not saved_sides:
-            status = f"Capture {stem}: no calibration images saved; " + ", ".join(status_parts)
-            self.calibration_status_label.setText(status)
-            self._log(f"[캘리브레이션] 이미지 캡처 실패 {stem}: {', '.join(status_parts)}")
-            return
-
-        metadata_dir = root / "capture_metadata"
-        metadata_dir.mkdir(parents=True, exist_ok=True)
-        metadata_payload = {
-            "capture_id": stem,
-            "saved_sides": saved_sides,
-            "stereo_pair_saved": set(saved_sides) == {"left", "right"},
-            "pair_time_basis": pair_time_basis,
-            "pair_delta_s": pair_delta_s,
-            "pair_max_delta_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
-            "pair_timing_status": pair_timing_detail,
-            "left_rtcp_frame_ntp_unix_s": (self.camera_frame_metadata.get("left") or {}).get("rtcp_frame_ntp_unix_s"),
-            "right_rtcp_frame_ntp_unix_s": (self.camera_frame_metadata.get("right") or {}).get("rtcp_frame_ntp_unix_s"),
-            "frame_contract": "OpenCV image pixels; stereo timing uses RTCP/NTP camera timestamp before saving a left/right pair",
-        }
-        (metadata_dir / f"capture_{stem}.json").write_text(
-            json.dumps(metadata_payload, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        status = f"Captured {stem}: " + ", ".join(status_parts)
-        if pair_timing_ok and pair_delta_s is not None and set(saved_sides) == {"left", "right"}:
-            status += f"; pair_time_basis={pair_time_basis}, pair_delta_s={pair_delta_s:.6f}"
-        self.calibration_status_label.setText(status)
-        self._log(f"[캘리브레이션] 이미지 캡처 {stem}: 저장={','.join(saved_sides)}; {', '.join(status_parts)}")
-
-    def run_intrinsic_calibration(self) -> None:
-        available, error = opencv_available()
-        if not available:
-            self._set_health_label(self.checkerboard_validation_status_label, f"OpenCV unavailable: {error}", "bad")
-            self.calibration_result_text.setPlainText(f"OpenCV unavailable:\n{error}")
-            return
-        mode = self._checkerboard_validation_mode()
-        root, left_paths, right_paths, pairs = self._checkerboard_validation_scan_counts()
-        if mode == "checkerboard":
-            left_paths = [left for _key, left, _right in pairs]
-            right_paths = [right for _key, _left, right in pairs]
-        pair_count = len(pairs)
-        min_images = self.calib_min_images_spin.value()
-        if not left_paths or not right_paths:
-            self._set_health_label(
-                self.checkerboard_validation_status_label,
-                f"계산 실패: left/right 이미지가 부족합니다 (left={len(left_paths)}, right={len(right_paths)})",
-                "bad",
-            )
-            return
-        if mode == "checkerboard" and pair_count < 3:
-            self._set_health_label(
-                self.checkerboard_validation_status_label,
-                f"계산 실패: stereo pair가 부족합니다 (pair={pair_count}, need>=3)",
-                "bad",
-            )
-            return
-        self.scan_checkerboard_validation_files()
-        try:
-            result = self._calibrate_checkerboard_selection(
-                mode=mode,
-                left_paths=left_paths,
-                right_paths=right_paths,
-                pair_count=pair_count,
-            )
-        except Exception as exc:
-            self._set_health_label(self.checkerboard_validation_status_label, f"Calibration failed: {exc}", "bad")
-            self.calibration_result_text.setPlainText(str(exc))
-            self._log(f"[캘리브레이션] 검증/계산 실패: {exc}")
-            return
-        warning = (
-            f"\nWARNING: valid images below requested minimum {min_images}."
-            if result.left.image_count < min_images or result.right.image_count < min_images
-            else ""
-        )
-        text = self._format_checkerboard_validation_result_summary(
-            result,
-            mode=mode,
-            title="Full checkerboard calibration result",
-            root=root,
-            pair_count=pair_count if mode == "checkerboard" else None,
-        ) + warning
-        self._checkerboard_validation_set_result(
-            result,
-            mode=mode,
-            summary={
-                "source": "full",
-                "root": str(root),
-                "mode": mode,
-                "left_image_count": len(left_paths),
-                "right_image_count": len(right_paths),
-                "stereo_pair_count": pair_count,
-                "min_images": min_images,
-            },
-            text=text,
-        )
-        if mode == "checkerboard":
-            self._log("[캘리브레이션] 전체 사진 기반 intrinsic 및 체커보드 stereo 외부 파라미터 계산을 완료했습니다.")
-        else:
-            self._log("[캘리브레이션] 전체 사진 기반 Pixhawk 모드용 intrinsic 계산을 완료했습니다.")
-        self._refresh_operation_header()
+        save_settings(self.settings, self.settings_path)
 
     def save_intrinsics(self) -> None:
         if self.last_calibration_result is None:
@@ -18324,7 +10708,89 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
         self._refresh_zoom_intrinsics_tab()
 
+    def _validate_intrinsics_result(self, result: StereoIntrinsicsResult) -> tuple[str, ...]:
+        errors: list[str] = []
+        for side, intrinsics in (("left", result.left), ("right", result.right)):
+            if intrinsics.width <= 0 or intrinsics.height <= 0:
+                errors.append(f"{side}: image size must be positive")
+            matrix = intrinsics.camera_matrix
+            if len(matrix) != 3 or any(len(row) != 3 for row in matrix):
+                errors.append(f"{side}: camera_matrix must be 3x3")
+                continue
+            values = [value for row in matrix for value in row]
+            if not all(math.isfinite(float(value)) for value in values):
+                errors.append(f"{side}: camera_matrix contains a non-finite value")
+            elif float(matrix[0][0]) <= 0.0 or float(matrix[1][1]) <= 0.0:
+                errors.append(f"{side}: fx and fy must be positive")
+            if not all(math.isfinite(float(value)) for value in intrinsics.distortion_coefficients):
+                errors.append(f"{side}: distortion coefficients contain a non-finite value")
+        return tuple(errors)
+
+    def _confirm_intrinsics_profile_mismatch(
+        self,
+        path: Path,
+        result: StereoIntrinsicsResult,
+        metadata_zoom_level: int | None,
+    ) -> bool:
+        warnings: list[str] = []
+        current_zoom_level = self.zoom_level_spin.value()
+        if metadata_zoom_level is not None and metadata_zoom_level != current_zoom_level:
+            warnings.append(
+                f"파일 zoom_level={metadata_zoom_level:02d}, 현재 WIRIS zoom={current_zoom_level:02d}"
+            )
+        left_size = (result.left.width, result.left.height)
+        right_size = (result.right.width, result.right.height)
+        if left_size != right_size:
+            warnings.append(f"좌/우 calibration 해상도가 다름: left={left_size}, right={right_size}")
+        if not warnings:
+            return True
+        answer = QtWidgets.QMessageBox.warning(
+            self,
+            "Intrinsics profile mismatch",
+            f"{path.name}\n\n" + "\n".join(warnings) + "\n\n그래도 적용하시겠습니까?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        return answer == QtWidgets.QMessageBox.Yes
+
     def load_intrinsics(self) -> None:
+        initial_path = self._intrinsics_storage_path(self.zoom_level_spin.value())
+        selected, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load intrinsics",
+            str(initial_path if initial_path.exists() else initial_path.parent),
+            "Intrinsics JSON (*.json);;All files (*)",
+        )
+        if not selected:
+            return
+        path = Path(selected)
+        try:
+            result = load_intrinsics_json(path)
+            errors = self._validate_intrinsics_result(result)
+            if errors:
+                raise ValueError("; ".join(errors))
+            metadata_zoom_level = self._intrinsics_file_zoom_level(path)
+        except Exception as exc:
+            self.calibration_status_label.setText(f"Failed to load intrinsics: {exc}")
+            self._log(f"[캘리브레이션] intrinsic 파일 검증 실패: {path}: {exc}")
+            return
+        if not self._confirm_intrinsics_profile_mismatch(path, result, metadata_zoom_level):
+            self._log(f"[캘리브레이션] intrinsic 적용을 취소했습니다: {path}")
+            return
+        self.last_calibration_result = result
+        self.last_calibration_zoom_level = (
+            self.zoom_level_spin.value() if metadata_zoom_level is None else metadata_zoom_level
+        )
+        self._active_intrinsics_profile_path = str(path)
+        self.apply_intrinsics_to_distance()
+        self._save_current_settings(path)
+        self.calibration_status_label.setText(f"Loaded and applied intrinsics: {path.name}")
+        self._add_zoom_intrinsics_comparison_path(path)
+        self._log(f"[캘리브레이션] intrinsic 파일을 선택해 적용했습니다: {path}")
+        self._refresh_zoom_intrinsics_tab()
+        self._refresh_operation_header()
+
+    def load_current_zoom_intrinsics(self) -> None:
         zoom_level = self.zoom_level_spin.value()
         result = self._load_current_zoom_intrinsics_for_apply()
         if result is None:
@@ -18360,3526 +10826,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_distance()
         self._refresh_optical_alignment_view()
         self._refresh_operation_header()
-
-    def _shutdown_save_settings(self) -> bool:
-        try:
-            self._save_current_settings()
-        except Exception as exc:
-            self._log(f"[종료] 설정 저장 실패: {exc}")
-            return False
-        return True
-
-    def _shutdown_stop_thread(self, attr: str, timeout_ms: int = 1000) -> bool:
-        thread = getattr(self, attr, None)
-        if thread is None:
-            return True
-        try:
-            thread.quit()
-            if thread.isRunning() and not thread.wait(timeout_ms):
-                return False
-        except RuntimeError:
-            pass
-        if getattr(self, attr, None) is thread:
-            setattr(self, attr, None)
-        return True
-
-    def _shutdown_stop_auxiliary_workers(self) -> bool:
-        preview_stopped = self._stop_calibration_preview_worker()
-        attrs = (
-            "camera_auto_detect_thread",
-            "wiris_control_check_thread",
-            "wiris_command_thread",
-            "wiris_zoom_thread",
-            "wiris_time_sync_thread",
-            "wiris_gdti_thread",
-            "wiris_stip_thread",
-            "camera_network_discovery_thread",
-            "camera_network_apply_thread",
-            "interface_status_thread",
-            "pixhawk_usb_discovery_thread",
-            "pixhawk_host_ip_discovery_thread",
-            "rtsp_check_thread",
-            "rtsp_enable_thread",
-            "gnss_base_detect_thread",
-        )
-        results = [self._shutdown_stop_thread(attr) for attr in attrs]
-        return bool(preview_stopped and all(results))
-
-    def _shutdown_stop_gnss_base_serial(self) -> bool:
-        self.disconnect_gnss_base_serial()
-        thread = getattr(self, "gnss_base_serial_thread", None)
-        return thread is None or not thread.isRunning()
-
-    def shutdown_for_close(self) -> bool:
-        """Run the one close sequence shared by every top-level window."""
-
-        coordinator = getattr(self, "_shutdown_coordinator", None)
-        if coordinator is None:
-            return False
-        return bool(coordinator.run())
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        if not self.shutdown_for_close():
-            event.ignore()
-            QtCore.QTimer.singleShot(250, self.close)
-            return
-        super().closeEvent(event)
-
-    def _stop_calibration_preview_worker(self, *_args) -> bool:
-        thread = getattr(self, "_calibration_preview_thread", None)
-        if thread is None:
-            return True
-        thread.quit()
-        if thread.isRunning() and not thread.wait(1000):
-            return False
-        self._calibration_preview_thread = None
-        self._calibration_preview_worker = None
-        return True
-
-    def _update_detection(self, camera: str, detection: DetectionObservation | None) -> None:
-        if camera == "left":
-            self.latest_left = detection
-        elif camera == "right":
-            self.latest_right = detection
-        if detection is not None:
-            self.detection_buffers[camera].add(detection)
-        self._refresh_distance()
-        self._refresh_optical_alignment_view()
-
-    def _checkerboard_translation_right_in_left_m(self) -> tuple[float, float, float] | None:
-        calibration = self.active_intrinsics
-        extrinsics = None if calibration is None else calibration.extrinsics
-        if extrinsics is None:
-            return None
-        _rotation_right_to_left, translation_right_in_left_m = invert_left_to_right_camera_transform(
-            extrinsics.rotation_left_to_right,
-            extrinsics.translation_left_to_right_m,
-        )
-        return translation_right_in_left_m
-
-    def _active_baseline_m(self) -> tuple[float, str, tuple[str, ...]]:
-        if self._distance_mode() == "checkerboard":
-            translation = self._checkerboard_translation_right_in_left_m()
-            if translation is None:
-                return 0.0, "checkerboard-waiting", ("waiting for checkerboard stereo extrinsics",)
-            baseline_m = math.sqrt(sum(value * value for value in translation))
-            if baseline_m <= 0.0:
-                return 0.0, "checkerboard-waiting", ("checkerboard baseline length <= 0",)
-            return baseline_m, "checkerboard", ()
-        baseline = self.latest_rtk_baseline
-        if baseline is None:
-            return 0.0, "gps-rtk-waiting", ("waiting for live GPS baseline",)
-        usable, reason = self._gps_baseline_usable_for_translation(baseline)
-        if not usable:
-            return baseline.baseline_m, "gps-rtk-blocked", (*baseline.warnings, reason)
-        return baseline.baseline_m, "gps-rtk", baseline.warnings
-
-    def _gps_fix_ready_for_baseline(self, state: GpsPositionState | None) -> bool:
-        return state is not None and state.has_position and state.fix_type is not None and state.fix_type >= 3
-
-    def _gps_baseline_usable_for_translation(self, baseline: RtkBaselineEstimate | None) -> tuple[bool, str]:
-        if baseline is None:
-            return False, "live GPS baseline waiting"
-        left, right = self._selected_baseline_gps_states()
-        if left is None or right is None:
-            if baseline.baseline_m <= 0.0:
-                return False, "GPS baseline length <= 0"
-            return True, "usable"
-        if not self._gps_fix_ready_for_baseline(left) or not self._gps_fix_ready_for_baseline(right):
-            return False, "GPS fix < 3D"
-        if baseline.baseline_m <= 0.0:
-            return False, "GPS baseline length <= 0"
-        return True, "usable"
-
-    def _rtk_fixed_status_text(self, baseline: RtkBaselineEstimate | None) -> str:
-        left = self.latest_gps.get("left")
-        right = self.latest_gps.get("right")
-
-        def side_text(label: str, state: GpsPositionState | None) -> str:
-            if state is None:
-                return f"{label}=대기"
-            sats = "--" if state.satellites_used is None else str(state.satellites_used)
-            eph = "--" if state.eph_m is None else f"{state.eph_m:.2f}m"
-            return f"{label}={state.rtk_label}(fix={state.fix_type}, sats={sats}, eph={eph})"
-
-        fixed = left is not None and right is not None and left.fix_type == 6 and right.fix_type == 6
-        usable, reason = self._gps_baseline_usable_for_translation(baseline)
-        fixed_text = "YES" if fixed else "NO"
-        usability = "사용 가능" if usable else f"대기/차단: {reason}"
-        return f"RTK Fixed: {fixed_text} | GPS baseline 필수, {usability} | {side_text('P1', left)} | {side_text('P2', right)}"
-
-    def _refresh_rtk_baseline(self) -> RtkBaselineEstimate | None:
-        left_gps, right_gps = self._selected_baseline_gps_states()
-        baseline = estimate_rtk_baseline(
-            left_gps,
-            right_gps,
-            now_s=time.monotonic(),
-            require_fixed=False,
-        )
-        self.latest_rtk_baseline = baseline
-        self._refresh_p1_body_frd_baseline()
-        reference_text = " | 거리 계산 필수 입력"
-        if hasattr(self, "rtk_fixed_status_label"):
-            self.rtk_fixed_status_label.setText(self._rtk_fixed_status_text(baseline))
-        if baseline is None:
-            self._set_rtk_summary_chip("baseline", "Baseline: 대기 중", "idle")
-            self._set_rtk_summary_chip("camera", "Camera: 자세 대기 중", "idle")
-            self._set_rtk_summary_chip("status", "Status: GPS 대기 중", "idle")
-            self.rtk_baseline_label.setText(f"GPS baseline: 좌/우 GPS 대기 중{reference_text}")
-            self._refresh_rtk_alignment_view()
-            self._refresh_operation_header()
-            self._refresh_alignment_workflow_status()
-            return None
-        warning_text = f" | {'; '.join(baseline.warnings)}" if baseline.warnings else ""
-        usable, reason = self._gps_baseline_usable_for_translation(baseline)
-        baseline_level = "good" if baseline.fix_quality == "GOOD" else "warn" if baseline.fix_quality == "DEGRADED" else "bad"
-        status_level = "good" if usable else "bad"
-        self._set_rtk_summary_chip("baseline", f"Baseline {baseline.baseline_m:.3f} m", baseline_level)
-        self._set_rtk_summary_chip(
-            "status",
-            "Status: 사용 가능" if usable else f"Status: {reason}",
-            status_level,
-        )
-        self.rtk_baseline_label.setText(
-            f"GPS baseline: {baseline.baseline_m:.3f} m "
-            f"N/E/D={baseline.north_m:.3f}/{baseline.east_m:.3f}/{baseline.down_m:.3f} m "
-            + (
-                "P1 FRD=대기 중 "
-                if self.latest_p1_body_frd_baseline is None
-                else (
-                    "P1 FRD F/R/D="
-                    f"{self.latest_p1_body_frd_baseline.forward_m:.3f}/"
-                    f"{self.latest_p1_body_frd_baseline.right_m:.3f}/"
-                    f"{self.latest_p1_body_frd_baseline.down_m:.3f} m "
-                )
-            )
-            + f"age={baseline.left_age_s * 1000:.0f}/{baseline.right_age_s * 1000:.0f}ms "
-            f"quality={baseline.fix_quality}{reference_text}{warning_text}"
-        )
-        self._refresh_rtk_alignment_view()
-        self._refresh_operation_header()
-        self._refresh_alignment_workflow_status()
-        return baseline
-
-    def _set_rtk_summary_chip(self, key: str, text: str, level: str) -> None:
-        labels = getattr(self, "rtk_summary_labels", {})
-        label = labels.get(key)
-        if label is not None:
-            self._set_health_label(label, text, level)
-
-    def _baseline_forward_geometry_from_camera_translation(
-        self, camera_translation: tuple[float, float, float] | None
-    ) -> tuple[float, float, float, float] | None:
-        if camera_translation is None:
-            return None
-        right_m, down_m, forward_m = camera_translation
-        length_m = math.sqrt(right_m * right_m + down_m * down_m + forward_m * forward_m)
-        if length_m <= 1e-9:
-            return None
-        ratio = max(-1.0, min(1.0, forward_m / length_m))
-        angle_deg = math.degrees(math.acos(ratio))
-        effective_m = math.sqrt(right_m * right_m + down_m * down_m)
-        return angle_deg, effective_m, length_m, forward_m
-
-    def _baseline_camera_translation_in_side_rdf_m(
-        self,
-        baseline: RtkBaselineEstimate,
-        side: str,
-    ) -> tuple[float, float, float] | None:
-        extrinsic = self.latest_extrinsics.get(side)
-        if extrinsic is None:
-            return None
-        world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
-        body_vector = world_ned_vector_to_body_frd(world_vector, extrinsic.q)
-        camera_vector = body_frd_vector_to_camera(body_vector)
-        scale_to_m = self.baseline_spin.value() if hasattr(self, "baseline_spin") else None
-        if scale_to_m is None:
-            return camera_vector
-        length_m = math.sqrt(sum(component * component for component in camera_vector))
-        if length_m <= 1e-9:
-            return None
-        scale = float(scale_to_m) / length_m
-        return (camera_vector[0] * scale, camera_vector[1] * scale, camera_vector[2] * scale)
-
-    def _set_baseline_forward_metric_labels(
-        self,
-        *,
-        prefix: str,
-        geometry: tuple[float, float, float, float] | None,
-        missing_text: str = "자세 대기 중",
-    ) -> None:
-        if not hasattr(self, "baseline_attitude_labels"):
-            return
-        angle_key = "rdf_forward_angle" if prefix == "left" else "right_rdf_forward_angle"
-        effective_key = "effective_baseline" if prefix == "left" else "right_effective_baseline"
-        forward_key = "forward_component" if prefix == "left" else "right_forward_component"
-        if geometry is None:
-            self._set_health_label(self.baseline_attitude_labels[angle_key], missing_text, "warn")
-            self._set_health_label(self.baseline_attitude_labels[effective_key], missing_text, "warn")
-            self._set_health_label(self.baseline_attitude_labels[forward_key], missing_text, "warn")
-            return
-        angle_deg, effective_m, length_m, forward_m = geometry
-        self._set_health_label(
-            self.baseline_attitude_labels[angle_key],
-            f"{angle_deg:.2f} deg ({'P1' if prefix == 'left' else 'P2'} RDF +Z vs P1->P2 baseline)",
-            self._baseline_forward_angle_level(angle_deg),
-        )
-        self._set_label_text_if_changed(
-            self.baseline_attitude_labels[effective_key],
-            f"{effective_m:.4f} m / {length_m:.4f} m",
-        )
-        self._set_label_text_if_changed(
-            self.baseline_attitude_labels[forward_key],
-            f"{forward_m:+.4f} m",
-        )
-
-    def _baseline_forward_angle_level(self, angle_deg: float) -> str:
-        if 80.0 <= angle_deg <= 100.0:
-            return "good"
-        if 70.0 <= angle_deg <= 110.0:
-            return "warn"
-        return "bad"
-
-    def _baseline_forward_geometry_text(self, camera_translation: tuple[float, float, float] | None) -> str:
-        geometry = self._baseline_forward_geometry_from_camera_translation(camera_translation)
-        if geometry is None:
-            return "P1 RDF Forward 각도: 자세 대기 중"
-        angle_deg, effective_m, length_m, forward_m = geometry
-        return (
-            f"P1 RDF Forward vs baseline angle={angle_deg:.2f}°, "
-            f"effective={effective_m:.3f}/{length_m:.3f} m, forward={forward_m:+.3f} m"
-        )
-
-    def _refresh_rtk_alignment_view(self) -> None:
-        self._refresh_p1_body_frd_baseline()
-        if not hasattr(self, "rtk_alignment_plot"):
-            return
-        baseline = self.latest_rtk_baseline
-        if baseline is None:
-            self.rtk_alignment_plot.set_alignment(
-                None,
-                left_attitude=self.latest_extrinsics.get("left"),
-                right_attitude=self.latest_extrinsics.get("right"),
-            )
-            self.rtk_alignment_detail_label.setText(
-                "정렬 성분: 좌/우 GPS 위치 대기 중. 안테나 baseline은 카메라 광축 수직 baseline과 다를 수 있습니다."
-            )
-            return
-        camera_translation = self._alignment_view_camera_translation_right_in_left_m(baseline)
-        left_ext = self.latest_extrinsics.get("left")
-        right_ext = self.latest_extrinsics.get("right")
-        self.rtk_alignment_plot.set_alignment(baseline, camera_translation, left_ext, right_ext)
-        antenna_text = (
-            f"안테나 |T|={baseline.baseline_m:.3f} m, "
-            f"N/E/D={baseline.north_m:.3f}/{baseline.east_m:.3f}/{baseline.down_m:.3f} m"
-        )
-        if camera_translation is None:
-            self._set_rtk_summary_chip("camera", "Camera: 자세 대기 중", "warn")
-            body_text = "P1 body FRD=자세 대기 중"
-            if self.latest_p1_body_frd_baseline is not None:
-                projection = self.latest_p1_body_frd_baseline
-                body_text = (
-                    "P1 body FRD F/R/D="
-                    f"{projection.forward_m:+.3f}/{projection.right_m:+.3f}/{projection.down_m:+.3f} m"
-                )
-            self.rtk_alignment_detail_label.setText(
-                f"정렬 성분: {antenna_text}. GPS-only 모드: N/E/D 기준선을 표시합니다. "
-                f"{body_text}. 카메라 기준 Right/Down/Forward 변환은 픽스호크 자세 수신 후 추가됩니다."
-            )
-            return
-        attitude_text = ""
-        if left_ext is not None and right_ext is not None:
-            relative = relative_attitude(left_ext.q, right_ext.q)
-            attitude_text = (
-                f" 상대 자세 ΔR/P/Y={relative.roll_deg:+.2f}/"
-                f"{relative.pitch_deg:+.2f}/{relative.yaw_deg:+.2f}°."
-            )
-        x_m, y_m, z_m = camera_translation
-        right_camera_translation = self._baseline_camera_translation_in_side_rdf_m(baseline, "right")
-        left_geometry = self._baseline_forward_geometry_from_camera_translation(camera_translation)
-        right_geometry = self._baseline_forward_geometry_from_camera_translation(right_camera_translation)
-        self._set_baseline_forward_metric_labels(prefix="left", geometry=left_geometry)
-        self._set_baseline_forward_metric_labels(prefix="right", geometry=right_geometry)
-        right_geometry_text = self._baseline_forward_geometry_text(right_camera_translation).replace(
-            "P1 RDF Forward", "P2 RDF Forward"
-        )
-        forward_warn = abs(z_m) > max(0.2, abs(x_m) * 0.5)
-        down_warn = abs(y_m) > max(0.1, abs(x_m) * 0.25)
-        self._set_rtk_summary_chip(
-            "camera",
-            f"P1 RDF R/D/F {x_m:+.3f}/{y_m:+.3f}/{z_m:+.3f} m",
-            "warn" if forward_warn or down_warn else "good",
-        )
-        self.rtk_alignment_detail_label.setText(
-            f"정렬 성분: {antenna_text}. "
-            + (
-                "P1 body FRD 대기 중. "
-                if self.latest_p1_body_frd_baseline is None
-                else (
-                    "P1 body FRD F/R/D="
-                    f"{self.latest_p1_body_frd_baseline.forward_m:+.3f}/"
-                    f"{self.latest_p1_body_frd_baseline.right_m:+.3f}/"
-                    f"{self.latest_p1_body_frd_baseline.down_m:+.3f} m. "
-                )
-            )
-            + f"P1 RDF Right={x_m:.3f} m, Down={y_m:.3f} m, Forward={z_m:.3f} m. "
-            f"P1 RDF 좌우 성분 |Right|={abs(x_m):.3f} m입니다. "
-            f"{self._baseline_forward_geometry_text(camera_translation)} | {right_geometry_text}.{attitude_text}"
-        )
-
-    def _optical_alignment_intrinsics_result(self) -> tuple[StereoIntrinsicsResult | None, str]:
-        if self.active_intrinsics is not None:
-            return self.active_intrinsics, "active calibration result"
-        if self.last_calibration_result is not None:
-            return self.last_calibration_result, "latest calibration result, not applied"
-        return None, "intrinsics waiting"
-
-    def _optical_alignment_mean_focal_px(self, axis: str) -> tuple[float | None, str]:
-        result, source = self._optical_alignment_intrinsics_result()
-        if result is None:
-            return None, source
-        try:
-            if axis == "x":
-                left_value = float(result.left.camera_matrix[0][0])
-                right_value = float(result.right.camera_matrix[0][0])
-            else:
-                left_value = float(result.left.camera_matrix[1][1])
-                right_value = float(result.right.camera_matrix[1][1])
-        except (TypeError, ValueError, IndexError):
-            return None, "intrinsics focal invalid"
-        mean_value = (left_value + right_value) / 2.0
-        if not isfinite(mean_value) or mean_value <= 0.0:
-            return None, "intrinsics focal invalid"
-        return mean_value, source
-
-    def _optical_alignment_expected_dy_px(self) -> tuple[float | None, str, str]:
-        mode = str(self.optical_expected_dy_combo.currentData() or "rectified")
-        if mode == "rectified":
-            return 0.0, "Rectified 0 px", "good"
-        if mode == "manual":
-            return self.optical_expected_dy_spin.value(), "Manual", "good"
-        result, source = self._optical_alignment_intrinsics_result()
-        if result is None:
-            return None, source, "warn"
-        try:
-            left_cy = float(result.left.camera_matrix[1][2])
-            right_cy = float(result.right.camera_matrix[1][2])
-        except (TypeError, ValueError, IndexError):
-            return None, "intrinsics cy invalid", "bad"
-        expected = left_cy - right_cy
-        return expected, f"Raw intrinsics cy diff ({source})", "warn" if result is not self.active_intrinsics else "good"
-
-    def _optical_alignment_level_from_mrad(self, value_mrad: float | None) -> str:
-        if value_mrad is None or not isfinite(value_mrad):
-            return "idle"
-        magnitude = abs(value_mrad)
-        if magnitude <= 0.2:
-            return "good"
-        if magnitude <= 0.6:
-            return "warn"
-        return "bad"
-
-    def _optical_alignment_overall_level(self, levels: Sequence[str]) -> str:
-        if any(level == "bad" for level in levels):
-            return "bad"
-        if any(level == "warn" for level in levels):
-            return "warn"
-        if any(level == "good" for level in levels):
-            return "good"
-        return "idle"
-
-    def _optical_alignment_level_text(self, level: str) -> str:
-        return {"good": "GOOD", "warn": "WARN", "bad": "BAD", "idle": "WAITING"}.get(level, "WAITING")
-
-    def _format_optical_px(self, value: float | None) -> str:
-        return "--" if value is None or not isfinite(value) else f"{value:+.3f} px"
-
-    def _format_optical_mrad(self, value: float | None) -> str:
-        return "--" if value is None or not isfinite(value) else f"{value:+.3f} mrad"
-
-    def _refresh_optical_alignment_view(self) -> None:
-        if not hasattr(self, "optical_alignment_labels"):
-            return
-        labels = self.optical_alignment_labels
-        pair = self._matched_detection_pair()
-        if pair is None:
-            self._set_health_label(
-                self.optical_alignment_status_label,
-                "Optical alignment: YOLO target pair 대기 중",
-                "idle",
-            )
-            for label in labels.values():
-                self._set_health_label(label, "대기 중", "idle")
-            expected_dy, expected_source, expected_level = self._optical_alignment_expected_dy_px()
-            self._set_health_label(
-                labels["expected_dy"],
-                f"{self._format_optical_px(expected_dy)} | {expected_source}",
-                expected_level,
-            )
-            return
-
-        left_center_x, left_center_y = pair.left.center
-        right_center_x, right_center_y = pair.right.center
-        observed_dx_px = float(left_center_x) - float(right_center_x)
-        observed_dy_px = float(left_center_y) - float(right_center_y)
-        expected_dy_px, expected_dy_source, expected_dy_level = self._optical_alignment_expected_dy_px()
-        dy_residual_px = None if expected_dy_px is None else observed_dy_px - expected_dy_px
-        mean_fy_px, fy_source = self._optical_alignment_mean_focal_px("y")
-        mean_fx_px, fx_source = self._optical_alignment_mean_focal_px("x")
-        vertical_error_mrad = None if dy_residual_px is None or mean_fy_px is None else dy_residual_px / mean_fy_px * 1000.0
-        vertical_level = self._optical_alignment_level_from_mrad(vertical_error_mrad)
-
-        left_timestamp_s = self._yolo_match_timestamp_s(pair.left)
-        right_timestamp_s = self._yolo_match_timestamp_s(pair.right)
-        camera_delta_s = (
-            None if left_timestamp_s is None or right_timestamp_s is None else abs(left_timestamp_s - right_timestamp_s)
-        )
-        try:
-            attempt = self._build_measurement_attempt(pair)
-            geometry_result = calculate_measurement_geometry(attempt)
-        except (TypeError, ValueError) as exc:
-            attempt = None
-            geometry_result = None
-            geometry_error = str(exc)
-        else:
-            geometry_error = ""
-
-        baseline_m = 0.0 if attempt is None else attempt.baseline_m
-        baseline_source = "waiting" if attempt is None else attempt.baseline_source
-        target_distance_m = self.optical_target_distance_spin.value()
-        expected_disparity_px = None
-        yaw_residual_px = None
-        yaw_error_mrad = None
-        if mean_fx_px is not None and baseline_m > 0.0 and target_distance_m > 0.0:
-            expected_disparity_mag_px = mean_fx_px * baseline_m / target_distance_m
-            expected_disparity_px = expected_disparity_mag_px if observed_dx_px >= 0.0 else -expected_disparity_mag_px
-            yaw_residual_px = observed_dx_px - expected_disparity_px
-            yaw_error_mrad = yaw_residual_px / mean_fx_px * 1000.0
-        yaw_level = self._optical_alignment_level_from_mrad(yaw_error_mrad)
-        overall_level = self._optical_alignment_overall_level((vertical_level, yaw_level))
-
-        class_text = pair.left.class_name or str(pair.left.class_id)
-        confidence_text = f"L={pair.left.confidence:.2f}, R={pair.right.confidence:.2f}"
-        self._set_health_label(
-            labels["left_center"],
-            f"x={left_center_x:.1f}, y={left_center_y:.1f} | {pair.left.width}x{pair.left.height}",
-            "good",
-        )
-        self._set_health_label(
-            labels["right_center"],
-            f"x={right_center_x:.1f}, y={right_center_y:.1f} | {pair.right.width}x{pair.right.height}",
-            "good",
-        )
-        self._set_health_label(
-            labels["bbox_delta"],
-            f"dx={observed_dx_px:+.3f} px, dy={observed_dy_px:+.3f} px",
-            "good",
-        )
-        self._set_health_label(labels["bbox_quality"], f"class={class_text} | conf {confidence_text}", "good")
-        camera_delta_text = "--" if camera_delta_s is None else f"{camera_delta_s * 1000.0:.1f} ms"
-        self._set_health_label(labels["camera_time"], camera_delta_text, "good" if camera_delta_s is not None else "warn")
-
-        self._set_health_label(
-            labels["expected_dy"],
-            f"{self._format_optical_px(expected_dy_px)} | {expected_dy_source}",
-            expected_dy_level,
-        )
-        self._set_health_label(labels["observed_dy"], self._format_optical_px(observed_dy_px), "good")
-        self._set_health_label(labels["dy_residual"], self._format_optical_px(dy_residual_px), vertical_level)
-        self._set_health_label(
-            labels["vertical_error"],
-            f"{self._format_optical_mrad(vertical_error_mrad)} | fy={mean_fy_px:.1f}px"
-            if mean_fy_px is not None
-            else f"-- | {fy_source}",
-            vertical_level,
-        )
-
-        self._set_health_label(labels["observed_dx"], self._format_optical_px(observed_dx_px), "good")
-        self._set_health_label(
-            labels["expected_disparity"],
-            f"{self._format_optical_px(expected_disparity_px)} | target={target_distance_m:.2f} m",
-            "good" if expected_disparity_px is not None else "warn",
-        )
-        self._set_health_label(labels["yaw_residual"], self._format_optical_px(yaw_residual_px), yaw_level)
-        self._set_health_label(
-            labels["yaw_error"],
-            f"{self._format_optical_mrad(yaw_error_mrad)} | fx={mean_fx_px:.1f}px"
-            if mean_fx_px is not None
-            else f"-- | {fx_source}",
-            yaw_level,
-        )
-
-        triangulated = None if geometry_result is None else geometry_result.triangulated
-        estimate = None if geometry_result is None else geometry_result.estimate
-        if triangulated is None:
-            reason = geometry_error or ("" if geometry_result is None else geometry_result.triangulation_reason)
-            self._set_health_label(labels["range"], "대기 중", "idle")
-            self._set_health_label(labels["ray_gap"], reason or "geometry 대기 중", "warn")
-        else:
-            self._set_health_label(labels["range"], f"{triangulated.range_m:.3f} m", "good")
-            self._set_health_label(labels["ray_gap"], f"{triangulated.closest_gap_m:.3f} m", "good")
-        self._set_health_label(labels["baseline"], f"{baseline_source}:{baseline_m:.3f} m", "good" if baseline_m > 0.0 else "warn")
-        triangulation_text = (
-            "대기 중"
-            if attempt is None
-            else f"{attempt.triangulation_source} | {geometry_result.triangulation_reason if geometry_result else geometry_error}"
-        )
-        self._set_health_label(labels["triangulation"], triangulation_text, "good" if triangulated is not None else "warn")
-        attitude_status = "WAITING"
-        if attempt is not None:
-            attitude_status = classify_attitude_timing(
-                uses_pixhawk_attitude=attempt.triangulation_source != "checkerboard",
-                left_age_s=None if estimate is None else estimate.left_attitude_age_s,
-                right_age_s=None if estimate is None else estimate.right_attitude_age_s,
-                pair_delta_s=attempt.attitude_pair_delta_s,
-            )
-        self._set_health_label(
-            labels["attitude"],
-            attitude_status,
-            self._attitude_timing_health_level(attitude_status),
-        )
-
-        self._set_health_label(
-            self.optical_alignment_status_label,
-            (
-                f"Optical alignment: {self._optical_alignment_level_text(overall_level)} | "
-                f"vertical={self._format_optical_mrad(vertical_error_mrad)} | "
-                f"yaw={self._format_optical_mrad(yaw_error_mrad)} | "
-                f"mode={self._distance_mode_label()}"
-            ),
-            overall_level,
-        )
-
-    def _build_measurement_attempt(self, pair) -> MeasurementAttempt:
-        """Freeze every input selected for one detection pair before geometry runs."""
-
-        triangulation_source = self._triangulation_extrinsics_source()
-        timestamp_basis = self._effective_yolo_time_basis()
-        left_pairing_timestamp_s = self._yolo_match_timestamp_s(pair.left)
-        right_pairing_timestamp_s = self._yolo_match_timestamp_s(pair.right)
-        if left_pairing_timestamp_s is None or right_pairing_timestamp_s is None:
-            raise ValueError("matched detection pair has no timestamp on its selected basis")
-        key = detection_pair_key(
-            triangulation_source=triangulation_source,
-            timestamp_basis=timestamp_basis,
-            left=pair.left,
-            right=pair.right,
-            left_pairing_timestamp_s=left_pairing_timestamp_s,
-            right_pairing_timestamp_s=right_pairing_timestamp_s,
-        )
-        cached_attempt = (
-            self._last_measurement_attempt
-            if key == self._last_measurement_attempt_key
-            else None
-        )
-        if cached_attempt is not None and cached_attempt.is_geometry_ready:
-            return cached_attempt
-
-        created_monotonic_s = time.monotonic()
-        detection_midpoint_s = (float(pair.left.timestamp_s) + float(pair.right.timestamp_s)) / 2.0
-        left_detection = DetectionSnapshot.from_observation(
-            pair.left,
-            pairing_timestamp_basis=timestamp_basis,
-            pairing_timestamp_s=left_pairing_timestamp_s,
-        )
-        right_detection = DetectionSnapshot.from_observation(
-            pair.right,
-            pairing_timestamp_basis=timestamp_basis,
-            pairing_timestamp_s=right_pairing_timestamp_s,
-        )
-        intrinsics = None
-        if self.active_intrinsics is not None:
-            profile_path = self._active_intrinsics_profile_path or (
-                f"memory:active-calibration:zoom-{self.zoom_level_spin.value():02d}"
-            )
-            intrinsics = StereoIntrinsicsSnapshot.from_result(
-                self.active_intrinsics,
-                active_zoom_level=self.zoom_level_spin.value(),
-                selected_profile_path=profile_path,
-            )
-        max_time_delta_s = self._yolo_pair_max_delta_s()
-        max_vertical_delta_px = self._yolo_vertical_max_delta_px()
-        geometry_config = GeometryConfigSnapshot(
-            focal_length_px=self.focal_spin.value(),
-            max_time_delta_s=max_time_delta_s if math.isfinite(max_time_delta_s) else None,
-            max_vertical_delta_px=(
-                max_vertical_delta_px if math.isfinite(max_vertical_delta_px) else None
-            ),
-            require_same_class=True,
-            timestamp_basis=timestamp_basis,
-            manual_focal_override=self.manual_focal_checkbox.isChecked(),
-            require_rtk_fixed_setting=bool(
-                self._workstation_setting("require_rtk_fixed", self.settings.require_rtk_fixed)
-            ),
-        )
-
-        left_attitude_snapshot = None
-        right_attitude_snapshot = None
-        left_gps_snapshot = None
-        right_gps_snapshot = None
-        left_attitude_age_s = None
-        right_attitude_age_s = None
-        attitude_pair_delta_s = None
-        relative = None
-        warnings: tuple[str, ...] = ()
-        left_nearest = self.attitude_buffers["left"].nearest(float(pair.left.timestamp_s))
-        right_nearest = self.attitude_buffers["right"].nearest(float(pair.right.timestamp_s))
-        if left_nearest is not None:
-            left_attitude_snapshot = AttitudeSnapshot.from_state(left_nearest.sample)
-            left_attitude_age_s = left_nearest.age_s
-        if right_nearest is not None:
-            right_attitude_snapshot = AttitudeSnapshot.from_state(right_nearest.sample)
-            right_attitude_age_s = right_nearest.age_s
-        if left_attitude_snapshot is not None and right_attitude_snapshot is not None:
-            attitude_pair_delta_s = abs(
-                left_attitude_snapshot.timestamp_s - right_attitude_snapshot.timestamp_s
-            )
-            relative = relative_attitude(
-                left_attitude_snapshot.quaternion_wxyz,
-                right_attitude_snapshot.quaternion_wxyz,
-            )
-
-        # Preserve the selected GPS antenna samples in both checkerboard and RTK modes.
-        selected_left_gps, selected_right_gps = self._selected_baseline_gps_states()
-        if selected_left_gps is not None:
-            left_gps_snapshot = GpsSnapshot.from_state(selected_left_gps)
-        if selected_right_gps is not None:
-            right_gps_snapshot = GpsSnapshot.from_state(selected_right_gps)
-
-        if triangulation_source == "checkerboard":
-            baseline = build_checkerboard_baseline_snapshot(intrinsics)
-            if baseline is None:
-                warnings = ("waiting for checkerboard stereo extrinsics",)
-            elif baseline.warnings:
-                warnings = baseline.warnings
-        else:
-            baseline = None
-            if left_gps_snapshot is not None and right_gps_snapshot is not None:
-                baseline = build_pixhawk_baseline_snapshot(
-                    left_gps=left_gps_snapshot,
-                    right_gps=right_gps_snapshot,
-                    selected_left_quaternion_wxyz=(
-                        None
-                        if left_attitude_snapshot is None
-                        else left_attitude_snapshot.quaternion_wxyz
-                    ),
-                    selected_right_quaternion_wxyz=(
-                        None
-                        if right_attitude_snapshot is None
-                        else right_attitude_snapshot.quaternion_wxyz
-                    ),
-                    selected_left_attitude_monotonic_s=(
-                        None
-                        if left_attitude_snapshot is None
-                        else left_attitude_snapshot.timestamp_s
-                    ),
-                    created_monotonic_s=created_monotonic_s,
-                    detection_midpoint_monotonic_s=detection_midpoint_s,
-                )
-                warnings = baseline.warnings
-                if baseline.unusable_reason:
-                    warnings = tuple(dict.fromkeys((*warnings, baseline.unusable_reason)))
-            else:
-                warnings = ("waiting for live GPS baseline",)
-
-        candidate_attempt_id = self._measurement_attempt_counter + 1
-        attempt = MeasurementAttempt(
-            attempt_id=candidate_attempt_id,
-            attempt_session_id=self._measurement_attempt_generation_id,
-            detection_pair_key=key,
-            created_monotonic_s=created_monotonic_s,
-            created_wall_s=time.time(),
-            detection_midpoint_monotonic_s=detection_midpoint_s,
-            timestamp_basis=timestamp_basis,
-            triangulation_source=triangulation_source,
-            left_detection=left_detection,
-            right_detection=right_detection,
-            left_attitude=left_attitude_snapshot,
-            right_attitude=right_attitude_snapshot,
-            left_gps=left_gps_snapshot,
-            right_gps=right_gps_snapshot,
-            intrinsics=intrinsics,
-            baseline=baseline,
-            geometry_config=geometry_config,
-            left_attitude_age_s=left_attitude_age_s,
-            right_attitude_age_s=right_attitude_age_s,
-            attitude_pair_delta_s=attitude_pair_delta_s,
-            relative_roll_deg=None if relative is None else relative.roll_deg,
-            relative_pitch_deg=None if relative is None else relative.pitch_deg,
-            relative_yaw_deg=None if relative is None else relative.yaw_deg,
-            source_quality=(
-                "GOOD"
-                if baseline is None or baseline.fix_quality == "NOT_USED"
-                else baseline.fix_quality
-            ),
-            warnings=warnings,
-        )
-        if cached_attempt is not None:
-            previous_missing = set(cached_attempt.missing_geometry_inputs)
-            candidate_missing = set(attempt.missing_geometry_inputs)
-            if not candidate_missing < previous_missing:
-                return cached_attempt
-        self._measurement_attempt_counter = candidate_attempt_id
-        self._last_measurement_attempt_key = key
-        self._last_measurement_attempt = attempt
-        return attempt
-
-    def _translation_right_in_left_m(
-        self, attempt: MeasurementAttempt
-    ) -> tuple[float, float, float] | None:
-        """Return the immutable attempt translation without consulting latest state."""
-
-        return attempt.translation_right_in_left_m
-
-    def _latest_translation_right_in_left_m_for_diagnostics(self) -> tuple[float, float, float] | None:
-        if self._distance_mode() == "checkerboard":
-            return self._checkerboard_translation_right_in_left_m()
-        left_ext = self.latest_extrinsics.get("left")
-        if left_ext is None:
-            return None
-        baseline = self.latest_rtk_baseline
-        if baseline is None:
-            return None
-        usable, _reason = self._gps_baseline_usable_for_translation(baseline)
-        if not usable:
-            return None
-        right_ext = self.latest_extrinsics.get("right")
-        world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
-        return camera_translation_right_in_left_camera(
-            baseline_right_in_left_world_m=world_vector,
-            left_body_to_world_q=left_ext.q,
-            right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
-            scale_to_m=None,
-        )
-
-    def _alignment_view_camera_translation_right_in_left_m(
-        self, baseline: RtkBaselineEstimate
-    ) -> tuple[float, float, float] | None:
-        left_ext = self.latest_extrinsics.get("left")
-        if left_ext is None:
-            return None
-        right_ext = self.latest_extrinsics.get("right")
-        world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
-        scale_to_m = self.baseline_spin.value() if hasattr(self, "baseline_spin") else None
-        return camera_translation_right_in_left_camera(
-            baseline_right_in_left_world_m=world_vector,
-            left_body_to_world_q=left_ext.q,
-            right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
-            scale_to_m=scale_to_m,
-        )
-
-    def _capture_measurement_gnss_contract(
-        self, readiness: GnssReadinessSnapshot
-    ) -> object | None:
-        """Capture the immutable GNSS provenance used by one measurement.
-
-        The baseline hash names the NED vector explicitly: north/east/down is
-        the PX4/world position contract, never a camera RDF or stereo-center
-        coordinate.  Camera-frame conversion remains in MeasurementAttempt.
-        """
-
-        config = self.gnss_operation_manager.config
-        if not config.readiness_gate_enabled:
-            return None
-        base_profile = self.gnss_fixed_base_profile
-        base_hash = "" if base_profile is None else str(base_profile.profile_hash)
-        vector = self.latest_baseline_vector
-        baseline_hash = ""
-        if vector is not None:
-            baseline_payload = {
-                "frame": "NED",
-                "axis_order": "north,east,down",
-                "north_m": vector.north_m,
-                "east_m": vector.east_m,
-                "down_m": vector.down_m,
-                "timestamp_delta_ms": vector.timestamp_delta_ms,
-            }
-            baseline_hash = hashlib.sha256(
-                json.dumps(baseline_payload, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()
-        routes = {
-            side: f"mavlink:{side}"
-            for side in self._gnss_base_rtcm_target_sides()
-        }
-        device_ids = {
-            side: str(getattr(sample, "topic", side))
-            for side, sample in self.latest_gps.items()
-            if side in {"left", "right", "drone"}
-        }
-        return self.gnss_operation_manager.capture_measurement_contract(
-            readiness,
-            base_coordinate_profile_hash=base_hash,
-            baseline_profile_hash=baseline_hash,
-            device_ids=device_ids,
-            route_endpoints=routes,
-            datum="WGS84",
-        )
-
-    def _measurement_gnss_record_metadata(self) -> dict[str, object]:
-        """Return the frozen GNSS contract fields for a recording row."""
-
-        metadata = self.gnss_operation_manager.metadata()
-        contract = metadata.get("measurement_contract")
-        readiness = metadata.get("readiness")
-        if not isinstance(contract, dict):
-            return {
-                "gnss_contract_id": "",
-                "gnss_contract_metadata": "",
-                "gnss_readiness_timestamp_s": "",
-            }
-        return {
-            "gnss_contract_id": str(contract.get("gnss_contract_id", "")),
-            "gnss_contract_metadata": json.dumps(contract, sort_keys=True, separators=(",", ":")),
-            "gnss_readiness_timestamp_s": ""
-            if not isinstance(readiness, dict)
-            else self._fmt_record_float(readiness.get("timestamp_s"), 6),
-        }
-
-    def _refresh_distance(self) -> None:
-        if self._rtsp_urls_are_same_stream():
-            self._clear_measurement_pair_display()
-            self._clear_triangulation_quality("좌/우 RTSP URL이 동일해 3D ray 품질을 표시할 수 없습니다.")
-            self._set_distance_text(
-                "거리: 좌/우 RTSP URL이 동일해 측정 차단",
-                quality="BAD",
-                detail="그래프 미표시: 좌/우가 같은 스트림이라 유효한 매칭 쌍이 없습니다.",
-            )
-            return
-        pair = self._matched_detection_pair()
-        if pair is None:
-            self._clear_measurement_pair_display()
-            wait_status = self._detection_wait_status()
-            self._clear_triangulation_quality(wait_status.removeprefix("거리: "))
-            self._set_distance_text(
-                wait_status,
-                quality="BAD",
-                detail=self._detection_wait_detail(),
-            )
-            return
-        if self.gnss_operation_gate_active:
-            readiness = self.gnss_operation_manager.readiness()
-            config = self.gnss_operation_manager.config
-            if config.readiness_gate_enabled and (readiness is None or not readiness.ready):
-                reasons = ("GNSS readiness snapshot 대기",) if readiness is None else readiness.reasons
-                reason_text = "; ".join(reasons[:3]) or self.gnss_operation_manager.state.value
-                self._clear_measurement_pair_display()
-                self._clear_triangulation_quality("GNSS 운용 준비 조건 미충족")
-                self._set_distance_text(
-                    f"거리: GNSS 운용 준비 중 | {reason_text}",
-                    quality="BAD",
-                    detail="그래프 미표시: 선택한 GNSS 보정 운용의 readiness 조건을 만족하지 못했습니다.",
-                )
-                return
-            if readiness is not None:
-                try:
-                    contract = self._capture_measurement_gnss_contract(readiness)
-                    if self.gnss_operation_manager.state == GnssOperationState.READY:
-                        self.gnss_operation_manager.begin_measurement(contract, readiness)
-                    elif self.gnss_operation_manager.state == GnssOperationState.MEASURING:
-                        if not self.gnss_operation_manager.validate_measurement_contract(contract, readiness):
-                            raise RuntimeError("GNSS measurement contract changed")
-                except (RuntimeError, ValueError) as exc:
-                    self._clear_measurement_pair_display()
-                    self._clear_triangulation_quality("GNSS measurement contract 검증 실패")
-                    self._set_distance_text(
-                        f"거리: GNSS measurement contract 차단 | {exc}",
-                        quality="BAD",
-                        detail="그래프 미표시: 측정 시작 시점 GNSS provenance를 고정하거나 검증하지 못했습니다.",
-                    )
-                    return
-        if self._measurement_display_mode() == "detection":
-            self._show_measurement_pair(pair.left, pair.right)
-        else:
-            self._clear_measurement_pair_display()
-
-        try:
-            attempt = self._build_measurement_attempt(pair)
-        except (TypeError, ValueError) as exc:
-            self._clear_triangulation_quality("측정 입력 snapshot 생성 실패")
-            self._set_distance_text(
-                f"거리: 측정 입력 snapshot 생성 실패 | {exc}",
-                quality="BAD",
-                detail="그래프 미표시: 동일 입력 provenance를 고정할 수 없습니다.",
-            )
-            return
-
-        baseline_m = attempt.baseline_m
-        baseline_source = attempt.baseline_source
-        if baseline_source in {"rtk-blocked", "gps-rtk-blocked"}:
-            self._record_unresolved_pair(
-                attempt,
-                status="matched_baseline_blocked",
-                warnings=attempt.warnings,
-            )
-            self._clear_triangulation_quality("GPS baseline 조건 미충족")
-            self._set_distance_text(
-                "거리: GPS baseline 조건 미충족 | " + "; ".join(attempt.warnings),
-                quality="BAD",
-                detail="그래프 미표시: GPS baseline 조건을 만족하지 못했습니다.",
-            )
-            return
-        triangulation_source = attempt.triangulation_source
-        geometry_result = calculate_measurement_geometry(attempt)
-        match = geometry_result.match
-        triangulated = geometry_result.triangulated
-        estimate = geometry_result.estimate
-        combined_warnings = geometry_result.warnings
-        if match is None:
-            self._record_unresolved_pair(
-                attempt,
-                status="matched_stereo_geometry_invalid",
-                warnings=combined_warnings,
-            )
-            self._clear_triangulation_quality("유효한 스테레오 기하 대기 중")
-            self._set_distance_text(
-                "거리: 유효한 스테레오 기하 대기 중",
-                quality="BAD",
-                detail=self._stereo_geometry_wait_detail(pair),
-            )
-            return
-        if triangulated is None:
-            self._record_unresolved_pair(
-                attempt,
-                status="matched_triangulation_pending",
-                warnings=combined_warnings,
-            )
-            warning_text = f" | {'; '.join(combined_warnings)}" if combined_warnings else ""
-            self._clear_triangulation_quality("3D ray 기하 대기 중")
-            self._set_distance_text(
-                f"거리: 3D ray 기하 대기 중 ({self._triangulation_extrinsics_source_label()}){warning_text}",
-                quality="BAD",
-                detail=self._triangulation_wait_detail(combined_warnings),
-            )
-            return
-        if estimate is None:
-            self._record_unresolved_pair(
-                attempt,
-                status="matched_distance_invalid",
-                warnings=combined_warnings,
-            )
-            self._clear_triangulation_quality("유효한 거리 계산 대기 중")
-            self._set_distance_text(
-                "거리: 유효한 거리 계산 대기 중",
-                quality="BAD",
-                detail="그래프 미표시: 현재 입력으로 거리를 만들 수 없습니다.",
-            )
-            return
-
-        public_point_m = triangulated.point_m
-        source_point_left_rdf_m = getattr(triangulated, "source_point_left_rdf_m", None)
-        display_point_m = public_point_m
-        display_distance_m = triangulated.range_m
-        method_text = f"{triangulated.method}-{triangulation_source}"
-        gap_text = f" gap={triangulated.closest_gap_m:.3f}m"
-        display_baseline_source = baseline_source
-        display_baseline_m = baseline_m
-        attitude_timing_status = classify_attitude_timing(
-            uses_pixhawk_attitude=triangulation_source != "checkerboard",
-            left_age_s=estimate.left_attitude_age_s,
-            right_age_s=estimate.right_attitude_age_s,
-            pair_delta_s=estimate.attitude_pair_delta_s,
-        )
-        self._update_triangulation_quality(
-            triangulated=triangulated,
-            method_text=method_text,
-            display_distance_m=display_distance_m,
-            display_baseline_source=display_baseline_source,
-            display_baseline_m=display_baseline_m,
-            public_point_m=public_point_m,
-            source_point_left_rdf_m=source_point_left_rdf_m,
-            attitude_timing_status=attitude_timing_status,
-            left_attitude_age_s=estimate.left_attitude_age_s,
-            right_attitude_age_s=estimate.right_attitude_age_s,
-            attitude_pair_delta_s=estimate.attitude_pair_delta_s,
-        )
-
-        attitude_badge = "N/A" if attitude_timing_status == "NOT_USED" else attitude_timing_status
-        display_quality = estimate.sync_quality
-        if attitude_timing_status in {"STALE", "VERY_STALE"} and display_quality == "GOOD":
-            display_quality = "DEGRADED"
-        relative_text = "relRPY=대기"
-        if estimate.relative_roll_deg is not None:
-            relative_text = (
-                f"relRPY={estimate.relative_roll_deg:.2f}/"
-                f"{estimate.relative_pitch_deg:.2f}/{estimate.relative_yaw_deg:.2f}°"
-            )
-        warning_text = f" | {'; '.join(estimate.warnings)}" if estimate.warnings else ""
-        self._set_distance_text(
-            f"거리: {display_distance_m:.2f} m ({method_text}{gap_text}) | bboxΔx={estimate.disparity_px:.1f}px "
-            f"camΔt={estimate.time_delta_s * 1000:.0f}ms Δy={estimate.vertical_delta_px:.1f}px "
-            f"baseline={display_baseline_source}:{display_baseline_m:.3f}m "
-            f"ATT:{attitude_badge} {relative_text} quality={display_quality}{warning_text}",
-            quality=display_quality,
-        )
-        appended = self._append_distance_history(
-            estimate=estimate,
-            distance_m=display_distance_m,
-            method=method_text,
-            baseline_source=display_baseline_source,
-            baseline_m=display_baseline_m,
-            point_m=display_point_m,
-            raw_point_m=public_point_m,
-            raw_point_left_m=source_point_left_rdf_m,
-            measurement_attempt=attempt,
-        )
-        if not appended:
-            self._set_distance_text(
-                self.last_distance_status,
-                quality=display_quality,
-                detail="그래프 미표시: 직전과 동일한 샘플이라 중복 추가를 건너뛰었습니다.",
-            )
-
-    def _show_measurement_pair(self, left: DetectionObservation, right: DetectionObservation) -> None:
-        left_shown = self.left_pane.show_measurement_frame_for_detection(left)
-        right_shown = self.right_pane.show_measurement_frame_for_detection(right)
-        if not (left_shown and right_shown):
-            self._update_runtime_camera_stats_labels()
-            return
-        self.selected_runtime_frame_metadata["left"] = dict(left.timestamp_metadata)
-        self.selected_runtime_frame_metadata["right"] = dict(right.timestamp_metadata)
-        left_timestamp_s = self._yolo_match_timestamp_s(left)
-        right_timestamp_s = self._yolo_match_timestamp_s(right)
-        self.selected_runtime_frame_pair_delta_s = (
-            None if left_timestamp_s is None or right_timestamp_s is None else abs(left_timestamp_s - right_timestamp_s)
-        )
-        (
-            self.selected_runtime_frame_pair_basis,
-            self.selected_runtime_frame_pair_camera_rtc_delta_s,
-        ) = self._selected_pair_sync_summary(left, right)
-        self._update_runtime_camera_stats_labels()
-
-    def _clear_measurement_pair_display(self) -> None:
-        self.left_pane.clear_measurement_pair_display()
-        self.right_pane.clear_measurement_pair_display()
-        self._clear_selected_runtime_measurement_pair(update_labels=True)
-
-    def _clear_selected_runtime_measurement_pair(self, *, update_labels: bool = True) -> None:
-        self.selected_runtime_frame_metadata["left"] = {}
-        self.selected_runtime_frame_metadata["right"] = {}
-        self.selected_runtime_frame_pair_delta_s = None
-        self.selected_runtime_frame_pair_basis = ""
-        self.selected_runtime_frame_pair_camera_rtc_delta_s = None
-        if update_labels:
-            self._update_runtime_camera_stats_labels()
-
-    def _detection_wait_detail(self) -> str:
-        left_count = len(self.detection_buffers["left"])
-        right_count = len(self.detection_buffers["right"])
-        left_stats = self.camera_stream_stats.get("left") or {}
-        right_stats = self.camera_stream_stats.get("right") or {}
-        left_yolo_hz = float(left_stats.get("inferred_hz", 0.0))
-        right_yolo_hz = float(right_stats.get("inferred_hz", 0.0))
-        if self._last_correspondence_rejection_reason and not self._last_correspondence_rejection_reason.startswith(
-            "missing_"
-        ):
-            return (
-                "그래프 미표시: correspondence 검증 실패 "
-                f"({self._last_correspondence_rejection_reason})."
-            )
-        if left_count == 0 or right_count == 0:
-            if left_yolo_hz <= 0.0 or right_yolo_hz <= 0.0:
-                return (
-                    "그래프 미표시: YOLO 추론 대기 중 "
-                    f"(left={left_yolo_hz:.1f} Hz, right={right_yolo_hz:.1f} Hz)."
-                )
-            return f"그래프 미표시: bbox 검출 대기 중 (left={left_count}, right={right_count})."
-        if self._yolo_time_basis() == "camera_rtc_required":
-            left_has_rtc = any(
-                self._camera_rtc_timestamp_s_from_metadata(detection.timestamp_metadata) is not None
-                for detection in self.detection_buffers["left"]
-            )
-            right_has_rtc = any(
-                self._camera_rtc_timestamp_s_from_metadata(detection.timestamp_metadata) is not None
-                for detection in self.detection_buffers["right"]
-            )
-            if not left_has_rtc or not right_has_rtc:
-                return (
-                    "그래프 미표시: RTCP/NTP 필수 모드에서 RTCP/NTP timestamp가 없는 검출이 있습니다 "
-                    f"(left_rtc={'OK' if left_has_rtc else 'missing'}, "
-                    f"right_rtc={'OK' if right_has_rtc else 'missing'})."
-                )
-        return (
-            "그래프 미표시: 좌/우 bbox timestamp가 `최대 Δt` 안에서 아직 맞지 않습니다 "
-            f"(left={left_count}, right={right_count})."
-            if self._yolo_time_delta_gate_enabled()
-            else f"그래프 미표시: 좌/우 bbox 매칭 후보 대기 중 (left={left_count}, right={right_count})."
-        )
-
-    def _detection_wait_status(self) -> str:
-        if self._last_correspondence_rejection_reason and not self._last_correspondence_rejection_reason.startswith(
-            "missing_"
-        ):
-            return f"거리: 검출 대응 거부 ({self._last_correspondence_rejection_reason})"
-        if self._yolo_time_delta_gate_enabled() or self._yolo_time_basis() != "detection":
-            return "거리: timestamp가 맞는 좌/우 검출 대기 중"
-        return "거리: 좌/우 검출 쌍 대기 중"
-
-    def _stereo_geometry_wait_detail(self, pair) -> str:
-        left = pair.left
-        right = pair.right
-        left_center = getattr(left, "center", (0.0, 0.0))
-        right_center = getattr(right, "center", (0.0, 0.0))
-        disparity_px = abs(float(left_center[0]) - float(right_center[0]))
-        left_timestamp_s = self._yolo_match_timestamp_s(left)
-        right_timestamp_s = self._yolo_match_timestamp_s(right)
-        time_delta_ms = (
-            float("inf")
-            if left_timestamp_s is None or right_timestamp_s is None
-            else abs(left_timestamp_s - right_timestamp_s) * 1000.0
-        )
-        time_limit_ms = self._yolo_pair_max_delta_s() * 1000.0
-        if not isfinite(disparity_px) or disparity_px <= 1e-6:
-            return (
-                "그래프 미표시: 좌/우 bbox 중심의 x 차이가 0에 가까워 disparity를 만들 수 없습니다. "
-                f"left_x={float(left_center[0]):.1f}px, right_x={float(right_center[0]):.1f}px."
-            )
-        if time_delta_ms > time_limit_ms:
-            return (
-                "그래프 미표시: 좌/우 bbox timestamp 차이가 `최대 Δt`보다 큽니다. "
-                f"camΔt={time_delta_ms:.0f}ms, limit={time_limit_ms:.0f}ms."
-            )
-        return (
-            "그래프 미표시: 좌/우 bbox는 선택됐지만 거리 계산용 stereo match가 생성되지 않았습니다. "
-            f"disparity={disparity_px:.1f}px, camΔt={time_delta_ms:.0f}ms."
-        )
-
-    def _triangulation_wait_detail(self, warnings: tuple[str, ...]) -> str:
-        warning_text = "; ".join(warnings)
-        if any("waiting for intrinsics" in warning for warning in warnings):
-            return (
-                "그래프 미표시: bbox 매칭은 됐지만 내부 파라미터가 아직 적용되지 않아 3D ray triangulation을 "
-                "계산할 수 없습니다. `줌 내부 파라미터`에서 intrinsics JSON을 불러온 뒤 `계산에 적용`을 누르세요. "
-                f"{warning_text}"
-            )
-        if any("waiting for Pixhawk R" in warning for warning in warnings):
-            return (
-                "그래프 미표시: bbox 매칭은 됐지만 Pixhawk 자세 샘플이 아직 없어 3D ray 방향을 만들 수 없습니다. "
-                f"{warning_text}"
-            )
-        if any("waiting for checkerboard stereo extrinsics" in warning for warning in warnings):
-            return (
-                "그래프 미표시: bbox 매칭은 됐지만 적용된 체커보드 calibration에 stereo 외부 파라미터가 없습니다. "
-                "좌/우 체커보드 쌍을 최소 3개 이상 보정한 뒤 결과를 계산에 적용하세요. "
-                f"{warning_text}"
-            )
-        if any("waiting for RTK T" in warning for warning in warnings):
-            return (
-                "그래프 미표시: bbox 매칭은 됐지만 좌/우 카메라 translation을 만들 RTK/GPS baseline이 아직 없습니다. "
-                f"{warning_text}"
-            )
-        if any("triangulation error" in warning for warning in warnings):
-            return f"그래프 미표시: triangulation 계산 중 오류가 발생했습니다. {warning_text}"
-        if warning_text:
-            return f"그래프 미표시: 3D ray triangulation 결과가 아직 없습니다. {warning_text}"
-        return "그래프 미표시: bbox 매칭은 됐지만 3D ray triangulation 결과가 아직 없습니다."
-
-    def _pair_recording_base_row(self, measurement_attempt: MeasurementAttempt) -> dict[str, object]:
-        pair_mid_monotonic_s = measurement_attempt.detection_midpoint_monotonic_s
-        pair_mid_monotonic_ns = int(round(pair_mid_monotonic_s * 1_000_000_000.0))
-        session_elapsed_ns = (
-            None
-            if self.recording_session_started_monotonic_ns is None
-            else max(0, pair_mid_monotonic_ns - self.recording_session_started_monotonic_ns)
-        )
-        row: dict[str, object] = {
-            "session_id": self.recording_session_id,
-            "measurement_attempt_id": str(measurement_attempt.attempt_id),
-            "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
-            "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
-            "measurement_detection_pair_key": json.dumps(
-                measurement_attempt.detection_pair_key, separators=(",", ":")
-            ),
-            "schema_version": "stereowiris-paired-frame-v2",
-            "measurement_attempt_content_sha256": measurement_attempt.content_sha256(),
-            "measurement_attempt_instance_sha256": measurement_attempt.instance_sha256(),
-            "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
-            "measurement_attempt_source_quality": measurement_attempt.source_quality,
-            "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
-            "measurement_frame": MEASUREMENT_FRAME,
-            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
-            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
-            "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
-            "baseline_frame_scope": "measurement_attempt",
-            "baseline_frame_instance_id": measurement_attempt.instance_sha256(),
-            "baseline_frame_origin_contract": (
-                "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
-            ),
-            "baseline_frame_origin_model": (
-                "checkerboard_stereo_rt_optical_centers"
-                if measurement_attempt.triangulation_source == "checkerboard"
-                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
-            ),
-            "baseline_frame_axis_construction": (
-                "right=left_to_right_center;forward=projected_average_optical_forward;"
-                "down=forward_cross_right"
-            ),
-            "measurement_valid": "false",
-            "pair_status": "matched_geometry_pending",
-            "session_started_unix_ns": self.recording_session_started_unix_ns,
-            "session_started_monotonic_ns": self.recording_session_started_monotonic_ns,
-            "recorded_unix_ns": int(round(measurement_attempt.created_wall_s * 1_000_000_000.0)),
-            "pair_app_mid_monotonic_ns": pair_mid_monotonic_ns,
-            "session_elapsed_ns": session_elapsed_ns,
-            "session_elapsed_s": (
-                "" if session_elapsed_ns is None else session_elapsed_ns * 1e-9
-            ),
-            "left_video_path": str(self.video_recording_paths.get("left", "")),
-            "right_video_path": str(self.video_recording_paths.get("right", "")),
-            "selected_left_pairing_timestamp_s": self._fmt_record_float(
-                measurement_attempt.left_detection.pairing_timestamp_s, 9
-            ),
-            "selected_right_pairing_timestamp_s": self._fmt_record_float(
-                measurement_attempt.right_detection.pairing_timestamp_s, 9
-            ),
-        }
-        row.update(self._record_bbox_parameters(measurement_attempt))
-        row.update(self._record_measurement_sync_timestamp_parameters(measurement_attempt))
-        row.update(self._record_intrinsic_parameters(measurement_attempt))
-        row.update(self._record_frame_timestamp_parameters(measurement_attempt))
-        row.update(self._record_live_telemetry_snapshot_parameters(measurement_attempt))
-        row.update(self._measurement_gnss_record_metadata())
-        row.update(self._record_external_parameters(estimate=None, measurement_attempt=measurement_attempt))
-        row.update(self._record_reference_delta_parameters(measurement_attempt))
-        return row
-
-    def _upsert_pair_recording_row(
-        self,
-        measurement_attempt: MeasurementAttempt,
-        values: dict[str, object],
-    ) -> bool:
-        if not self.distance_recording_enabled:
-            return False
-        key = tuple(measurement_attempt.detection_pair_key)
-        row_index = self._recording_pair_row_index.get(key)
-        if row_index is None:
-            row_index = len(self.distance_recording_rows)
-            values["sample_index"] = row_index
-            values["pair_sequence"] = row_index
-            content_sha256 = values.pop("measurement_attempt_content_sha256", None)
-            instance_sha256 = values.pop("measurement_attempt_instance_sha256", None)
-            values["measurement_attempt_content_sha256"] = content_sha256
-            values["measurement_attempt_instance_sha256"] = instance_sha256
-            self._recording_pair_row_index[key] = row_index
-            self.distance_recording_rows.append(values)
-            self.distance_recording_keys.append(key)
-            if len(self.distance_recording_keys) > RECORDING_KEY_CACHE_LIMIT:
-                self.distance_recording_keys.pop(0)
-            minimum_cached_index = max(
-                0, len(self.distance_recording_rows) - RECORDING_KEY_CACHE_LIMIT
-            )
-            self._recording_pair_row_index = {
-                cached_key: cached_index
-                for cached_key, cached_index in self._recording_pair_row_index.items()
-                if cached_index >= minimum_cached_index
-            }
-            self._append_recording_table_row(values)
-            inserted = True
-        else:
-            current = self.distance_recording_rows[row_index]
-            sample_index = current.get("sample_index", row_index)
-            pair_sequence = current.get("pair_sequence", row_index)
-            current.update(values)
-            current["sample_index"] = sample_index
-            current["pair_sequence"] = pair_sequence
-            if isinstance(self.distance_recording_rows, SpoolRows):
-                self.distance_recording_rows.replace(row_index, current)
-            self._refresh_recording_table()
-            inserted = False
-        self._refresh_recording_status_label()
-        self._refresh_operation_header()
-        return inserted
-
-    def _record_unresolved_pair(
-        self,
-        measurement_attempt: MeasurementAttempt,
-        *,
-        status: str,
-        warnings: tuple[str, ...] = (),
-    ) -> None:
-        if not self.distance_recording_enabled:
-            return
-        row = self._pair_recording_base_row(measurement_attempt)
-        row.update(
-            {
-                "pair_status": status,
-                "measurement_valid": "false",
-                "warnings": "; ".join(warnings or measurement_attempt.warnings),
-            }
-        )
-        self._upsert_pair_recording_row(measurement_attempt, row)
-
-    def _append_distance_history(
-        self,
-        *,
-        estimate,
-        distance_m: float,
-        method: str,
-        baseline_source: str,
-        baseline_m: float,
-        point_m: tuple[float, float, float] | None = None,
-        raw_point_m: tuple[float, float, float] | None = None,
-        raw_point_left_m: tuple[float, float, float] | None = None,
-        point_left_m: tuple[float, float, float] | None = None,
-        measurement_attempt: MeasurementAttempt,
-    ) -> bool:
-        baseline_source = measurement_attempt.baseline_source
-        baseline_m = measurement_attempt.baseline_m
-        key = tuple(measurement_attempt.detection_pair_key)
-        if key == self._last_distance_history_key:
-            return False
-        self._last_distance_history_key = key
-        if point_m is None:
-            point_m = point_left_m
-        if raw_point_m is None:
-            raw_point_m = raw_point_left_m
-        timestamp_s = max(estimate.left.timestamp_s, estimate.right.timestamp_s)
-        class_name = self._distance_history_class_name(estimate)
-        recording_elapsed_s = None
-        if self.distance_recording_enabled:
-            if self.distance_recording_started_monotonic_s is None:
-                self.distance_recording_started_monotonic_s = time.monotonic()
-            recording_elapsed_s = max(0.0, time.monotonic() - self.distance_recording_started_monotonic_s)
-        point = DistanceHistoryPoint(
-            timestamp_s=timestamp_s,
-            distance_m=distance_m,
-            quality=estimate.sync_quality,
-            method=method,
-            forward_m=None if point_m is None else float(point_m[0]),
-            right_m=None if point_m is None else float(point_m[1]),
-            down_m=None if point_m is None else float(point_m[2]),
-            class_name=class_name,
-            sample_key=tuple(measurement_attempt.detection_pair_key),
-            recording_elapsed_s=recording_elapsed_s,
-        )
-        self.distance_history.append(point)
-        self.distance_plot.add_point(point)
-        if not self.distance_recording_enabled:
-            return True
-        raw_distance_m = None
-        if raw_point_m is not None:
-            raw_distance_m = math.sqrt(
-                raw_point_m[0] * raw_point_m[0]
-                + raw_point_m[1] * raw_point_m[1]
-                + raw_point_m[2] * raw_point_m[2]
-            )
-        measurement_attempt_content_sha256 = measurement_attempt.content_sha256()
-        measurement_attempt_instance_sha256 = measurement_attempt.instance_sha256()
-        row = self._pair_recording_base_row(measurement_attempt)
-        row.update({
-            "session_id": self.recording_session_id,
-            "measurement_attempt_id": str(measurement_attempt.attempt_id),
-            "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
-            "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
-            "measurement_detection_pair_key": json.dumps(
-                measurement_attempt.detection_pair_key, separators=(",", ":")
-            ),
-            "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
-            "selected_left_pairing_timestamp_s": self._fmt_record_float(
-                measurement_attempt.left_detection.pairing_timestamp_s, 6
-            ),
-            "selected_right_pairing_timestamp_s": self._fmt_record_float(
-                measurement_attempt.right_detection.pairing_timestamp_s, 6
-            ),
-            "measurement_attempt_source_quality": measurement_attempt.source_quality,
-            "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
-            "session_started_unix_s": self._fmt_record_float(self.recording_session_started_wall_s, 6),
-            "left_video_path": str(self.video_recording_paths.get("left", "")),
-            "right_video_path": str(self.video_recording_paths.get("right", "")),
-            "timestamp_s": f"{timestamp_s:.6f}",
-            "distance_m": f"{distance_m:.6f}",
-            "method": method,
-            "quality": estimate.sync_quality,
-            "disparity_px": f"{estimate.disparity_px:.6f}",
-            "raw_disparity_px": f"{estimate.disparity_px:.6f}",
-            "camera_delta_s": f"{estimate.time_delta_s:.6f}",
-            "vertical_delta_px": f"{estimate.vertical_delta_px:.6f}",
-            "baseline_source": baseline_source,
-            "baseline_m": f"{baseline_m:.6f}",
-            "measurement_frame": MEASUREMENT_FRAME,
-            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
-            "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
-            "point_frame": MEASUREMENT_FRAME,
-            "output_frame": MEASUREMENT_FRAME,
-            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
-            "baseline_frame_scope": "measurement_attempt",
-            "baseline_frame_instance_id": measurement_attempt.instance_sha256(),
-            "baseline_frame_origin_contract": (
-                "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
-            ),
-            "baseline_frame_origin_model": (
-                "checkerboard_stereo_rt_optical_centers"
-                if measurement_attempt.triangulation_source == "checkerboard"
-                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
-            ),
-            "measurement_method": "two_ray_closest_midpoint",
-            "range_m": self._fmt_record_float(distance_m, 6),
-            "baseline_center_forward_m": self._fmt_record_float(point.forward_m, 6),
-            "baseline_center_right_m": self._fmt_record_float(point.right_m, 6),
-            "baseline_center_down_m": self._fmt_record_float(point.down_m, 6),
-            "baseline_center_range_m": self._fmt_record_float(distance_m, 6),
-            "raw_baseline_center_forward_m": self._fmt_record_float(
-                None if raw_point_m is None else raw_point_m[0], 6
-            ),
-            "raw_baseline_center_right_m": self._fmt_record_float(
-                None if raw_point_m is None else raw_point_m[1], 6
-            ),
-            "raw_baseline_center_down_m": self._fmt_record_float(
-                None if raw_point_m is None else raw_point_m[2], 6
-            ),
-            "raw_baseline_center_range_m": self._fmt_record_float(raw_distance_m, 6),
-            "source_left_camera_rdf_right_m": self._fmt_record_float(
-                None if raw_point_left_m is None else raw_point_left_m[0], 6
-            ),
-            "source_left_camera_rdf_down_m": self._fmt_record_float(
-                None if raw_point_left_m is None else raw_point_left_m[1], 6
-            ),
-            "source_left_camera_rdf_forward_m": self._fmt_record_float(
-                None if raw_point_left_m is None else raw_point_left_m[2], 6
-            ),
-            "recording_elapsed_s": self._fmt_record_float(recording_elapsed_s, 6),
-            "warnings": "; ".join(estimate.warnings),
-            "pair_status": "measured",
-            "measurement_valid": "true",
-        })
-        row.update(self._record_bbox_parameters(estimate))
-        row.update(self._record_measurement_sync_timestamp_parameters(estimate))
-        row.update(self._record_intrinsic_parameters(measurement_attempt))
-        row.update(self._record_frame_timestamp_parameters(measurement_attempt))
-        row.update(self._record_live_telemetry_snapshot_parameters(measurement_attempt))
-        row.update(self._record_external_parameters(estimate=estimate, measurement_attempt=measurement_attempt))
-        row.pop("measurement_attempt_content_sha256", None)
-        row.pop("measurement_attempt_instance_sha256", None)
-        row["measurement_attempt_content_sha256"] = measurement_attempt_content_sha256
-        row["measurement_attempt_instance_sha256"] = measurement_attempt_instance_sha256
-        self._upsert_pair_recording_row(measurement_attempt, row)
-        return True
-
-    def _distance_history_class_name(self, estimate) -> str | None:
-        left_class_name = str(getattr(estimate.left, "class_name", "") or "").strip()
-        right_class_name = str(getattr(estimate.right, "class_name", "") or "").strip()
-        if left_class_name and right_class_name:
-            if left_class_name == right_class_name:
-                return left_class_name
-            return f"{left_class_name}/{right_class_name}"
-        return left_class_name or right_class_name or None
-
-    def _fmt_record_float(self, value: float | None, precision: int = 6) -> str:
-        return "" if value is None else f"{float(value):.{precision}f}"
-
-    def _fmt_record_bool(self, value: bool | None) -> str:
-        return "" if value is None else ("true" if value else "false")
-
-    def _recording_elapsed_s(self, timestamp_s: float | None = None) -> float | None:
-        started_s = self.distance_recording_started_monotonic_s or self.recording_session_started_monotonic_s
-        if started_s is None:
-            return None
-        if timestamp_s is None:
-            timestamp_s = time.monotonic()
-        return max(0.0, float(timestamp_s) - started_s)
-
-    def _session_utc_ns_for_monotonic_ns(self, monotonic_ns: int) -> int | None:
-        if (
-            self.recording_session_started_unix_ns is None
-            or self.recording_session_started_monotonic_ns is None
-        ):
-            return None
-        return (
-            self.recording_session_started_unix_ns
-            + monotonic_ns
-            - self.recording_session_started_monotonic_ns
-        )
-
-    def _recording_side(self, camera: str) -> str | None:
-        normalized = str(camera).lower()
-        if normalized.startswith("left"):
-            return "left"
-        if normalized.startswith("right"):
-            return "right"
-        return None
-
-    def _raw_timeline_row(
-        self,
-        *,
-        side: str,
-        sample_type: str,
-        row_contract: str,
-        sample_monotonic_s: float,
-        host_receive_monotonic_ns: int,
-        host_receive_utc_ns: int,
-        source_utc_ns: int | None,
-        source_utc_method: str,
-        sequence: int,
-    ) -> dict[str, object] | None:
-        sample_monotonic_ns = int(round(float(sample_monotonic_s) * 1_000_000_000.0))
-        started_monotonic_ns = self.recording_session_started_monotonic_ns
-        if started_monotonic_ns is not None and sample_monotonic_ns < started_monotonic_ns:
-            return None
-        session_elapsed_s = (
-            None
-            if started_monotonic_ns is None
-            else (sample_monotonic_ns - started_monotonic_ns) * 1e-9
-        )
-        session_utc_ns = self._session_utc_ns_for_monotonic_ns(sample_monotonic_ns)
-        return {
-            "sequence": sequence,
-            "session_id": self.recording_session_id,
-            "side": side,
-            "sample_type": sample_type,
-            "row_contract": row_contract,
-            "sample_monotonic_ns": sample_monotonic_ns,
-            "sample_monotonic_s": self._fmt_record_float(sample_monotonic_s, 9),
-            "session_elapsed_s": self._fmt_record_float(session_elapsed_s, 9),
-            "session_utc_ns": "" if session_utc_ns is None else session_utc_ns,
-            "session_utc_s": self._fmt_record_float(
-                None if session_utc_ns is None else session_utc_ns * 1e-9,
-                9,
-            ),
-            "session_utc_method": (
-                "unavailable" if session_utc_ns is None else "host_unix_monotonic_session_anchor"
-            ),
-            "session_utc_anchor_uncertainty_ns": (
-                ""
-                if self.recording_session_anchor_uncertainty_ns is None
-                else self.recording_session_anchor_uncertainty_ns
-            ),
-            "source_utc_ns": "" if source_utc_ns is None else source_utc_ns,
-            "source_utc_s": self._fmt_record_float(
-                None if source_utc_ns is None else source_utc_ns * 1e-9,
-                9,
-            ),
-            "source_utc_valid": self._fmt_record_bool(source_utc_ns is not None),
-            "source_utc_method": source_utc_method if source_utc_ns is not None else "unavailable",
-            "host_receive_monotonic_ns": host_receive_monotonic_ns,
-            "host_receive_utc_ns": host_receive_utc_ns,
-        }
-
-    def _record_gui_camera_frame(
-        self,
-        camera: str,
-        image: QtGui.QImage,
-        metadata: dict[str, object],
-    ) -> None:
-        if not self.distance_recording_enabled or camera not in self.camera_recording_rows:
-            return
-        host_receive_monotonic_ns = time.monotonic_ns()
-        host_receive_utc_ns = time.time_ns()
-        sample_monotonic_s = float(
-            metadata.get("timestamp_s") or host_receive_monotonic_ns * 1e-9
-        )
-        rtcp_ntp_s = metadata.get("rtcp_frame_ntp_unix_s")
-        source_utc_ns = (
-            None
-            if rtcp_ntp_s is None
-            else self._unix_seconds_to_ns(float(rtcp_ntp_s))
-        )
-        rows = self.camera_recording_rows[camera]
-        row = self._raw_timeline_row(
-            side=camera,
-            sample_type="gui_camera_frame",
-            row_contract="one row per frame delivered to the GUI frame_changed callback",
-            sample_monotonic_s=sample_monotonic_s,
-            host_receive_monotonic_ns=host_receive_monotonic_ns,
-            host_receive_utc_ns=host_receive_utc_ns,
-            source_utc_ns=source_utc_ns,
-            source_utc_method="rtcp_ntp",
-            sequence=len(rows),
-        )
-        if row is None:
-            return
-        row.update(
-            {
-                "frame_stage": "gui_delivered_preview",
-                "mp4_frame_index_contract": "not_available",
-                "image_width_px": image.width(),
-                "image_height_px": image.height(),
-                "image_axis_contract": "opencv_pixels_origin_top_left_u_right_v_down",
-                "timestamp_source": str(metadata.get("timestamp_source") or ""),
-                "timestamp_reference": str(metadata.get("timestamp_reference") or ""),
-                "source_timestamp_s": self._fmt_record_float(
-                    None
-                    if metadata.get("source_timestamp_s") is None
-                    else float(metadata["source_timestamp_s"]),
-                    9,
-                ),
-                "rtp_timestamp": (
-                    "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
-                ),
-                "rtp_ssrc": (
-                    "" if metadata.get("rtp_ssrc") is None else str(int(metadata["rtp_ssrc"]))
-                ),
-                "rtp_marker_seq": (
-                    "" if metadata.get("rtp_marker_seq") is None else str(int(metadata["rtp_marker_seq"]))
-                ),
-                "rtcp_sr_received_count": (
-                    ""
-                    if metadata.get("rtcp_sr_received_count") is None
-                    else str(int(metadata["rtcp_sr_received_count"]))
-                ),
-                "rtcp_sr_rtp_timestamp": (
-                    ""
-                    if metadata.get("rtcp_sr_rtp_timestamp") is None
-                    else str(int(metadata["rtcp_sr_rtp_timestamp"]))
-                ),
-                "rtcp_clock_rate_hz": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_clock_rate_hz") is None
-                    else float(metadata["rtcp_clock_rate_hz"]),
-                    3,
-                ),
-                "rtcp_sr_age_s": self._fmt_record_float(
-                    None if metadata.get("rtcp_sr_age_s") is None else float(metadata["rtcp_sr_age_s"]),
-                    9,
-                ),
-                "rtcp_sr_pc_offset_s": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_sr_pc_offset_s") is None
-                    else float(metadata["rtcp_sr_pc_offset_s"]),
-                    9,
-                ),
-                "rtcp_frame_ntp_unix_s": self._fmt_record_float(
-                    None if rtcp_ntp_s is None else float(rtcp_ntp_s),
-                    9,
-                ),
-                "rtcp_frame_received_wall_s": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_frame_received_wall_s") is None
-                    else float(metadata["rtcp_frame_received_wall_s"]),
-                    9,
-                ),
-                "rtcp_frame_receive_delay_s": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_frame_receive_delay_s") is None
-                    else float(metadata["rtcp_frame_receive_delay_s"]),
-                    9,
-                ),
-                "rtcp_frame_transport_delay_s": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_frame_transport_delay_s") is None
-                    else float(metadata["rtcp_frame_transport_delay_s"]),
-                    9,
-                ),
-                "rtcp_camera_ntp_rate": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_camera_ntp_rate") is None
-                    else float(metadata["rtcp_camera_ntp_rate"]),
-                    9,
-                ),
-                "rtcp_camera_media_rate": self._fmt_record_float(
-                    None
-                    if metadata.get("rtcp_camera_media_rate") is None
-                    else float(metadata["rtcp_camera_media_rate"]),
-                    9,
-                ),
-                "rtsp_transport": str(metadata.get("rtsp_transport") or ""),
-                "rtcp_timing_invalid_reason": str(
-                    metadata.get("rtcp_timing_invalid_reason") or ""
-                ),
-            }
-        )
-        rows.append(row)
-
-    def _record_external_timeline_row(self, camera: str, sample_type: str, values: dict[str, object]) -> None:
-        if not self.distance_recording_enabled:
-            return
-        side = self._recording_side(camera)
-        if side is None:
-            return
-        host_receive_monotonic_ns = time.monotonic_ns()
-        host_receive_utc_ns = time.time_ns()
-        raw_sample_monotonic_s = values.get("sample_app_timestamp_s")
-        sample_monotonic_s = (
-            host_receive_monotonic_ns * 1e-9
-            if raw_sample_monotonic_s in (None, "")
-            else float(raw_sample_monotonic_s)
-        )
-        raw_gps_utc_us = values.get("gps_utc_us")
-        source_utc_ns = (
-            None
-            if raw_gps_utc_us in (None, "", 0, "0")
-            else int(raw_gps_utc_us) * 1000
-        )
-        rows = self.px4_recording_rows[side]
-        row = self._raw_timeline_row(
-            side=side,
-            sample_type=sample_type,
-            row_contract="one row per PX4 telemetry callback received by the GUI",
-            sample_monotonic_s=sample_monotonic_s,
-            host_receive_monotonic_ns=host_receive_monotonic_ns,
-            host_receive_utc_ns=host_receive_utc_ns,
-            source_utc_ns=source_utc_ns,
-            source_utc_method=str(values.get("source_utc_method") or "gps_utc"),
-            sequence=len(rows),
-        )
-        if row is None:
-            return
-        row.update(
-            {
-                "camera": camera,
-                "triangulation_extrinsics_source": self._triangulation_extrinsics_source(),
-                "distance_mode": self._distance_mode_label(),
-            }
-        )
-        row.update(mavlink_link_provenance(self, side))
-        row.update(values)
-        rows.append(row)
-        self.external_parameter_recording_rows.append(row)
-        self._refresh_recording_status_label()
-
-    def _record_bbox_parameters(self, estimate) -> dict[str, str]:
-        row: dict[str, str] = {}
-        for camera in ("left", "right"):
-            detection = getattr(estimate, camera, None)
-            center = getattr(detection, "center", None)
-            if center is None:
-                center_x = None
-                center_y = None
-            else:
-                center_x = float(center[0])
-                center_y = float(center[1])
-            x1 = getattr(detection, "x1", None)
-            y1 = getattr(detection, "y1", None)
-            x2 = getattr(detection, "x2", None)
-            y2 = getattr(detection, "y2", None)
-            bbox_width = None
-            bbox_height = None
-            if x1 is not None and x2 is not None:
-                bbox_width = float(x2) - float(x1)
-            if y1 is not None and y2 is not None:
-                bbox_height = float(y2) - float(y1)
-            row[f"{camera}_bbox_x1_px"] = self._fmt_record_float(getattr(detection, "x1", None), 3)
-            row[f"{camera}_bbox_y1_px"] = self._fmt_record_float(getattr(detection, "y1", None), 3)
-            row[f"{camera}_bbox_x2_px"] = self._fmt_record_float(getattr(detection, "x2", None), 3)
-            row[f"{camera}_bbox_y2_px"] = self._fmt_record_float(getattr(detection, "y2", None), 3)
-            row[f"{camera}_bbox_center_x_px"] = self._fmt_record_float(center_x, 3)
-            row[f"{camera}_bbox_center_y_px"] = self._fmt_record_float(center_y, 3)
-            row[f"{camera}_bbox_confidence"] = self._fmt_record_float(getattr(detection, "confidence", None), 6)
-            row[f"{camera}_bbox_class_id"] = "" if getattr(detection, "class_id", None) is None else str(detection.class_id)
-            row[f"{camera}_bbox_class_name"] = str(getattr(detection, "class_name", "") or "")
-            row[f"{camera}_x1"] = self._fmt_record_float(x1, 3)
-            row[f"{camera}_y1"] = self._fmt_record_float(y1, 3)
-            row[f"{camera}_x2"] = self._fmt_record_float(x2, 3)
-            row[f"{camera}_y2"] = self._fmt_record_float(y2, 3)
-            row[f"{camera}_cx"] = self._fmt_record_float(center_x, 3)
-            row[f"{camera}_cy"] = self._fmt_record_float(center_y, 3)
-            row[f"{camera}_width_px"] = self._fmt_record_float(bbox_width, 3)
-            row[f"{camera}_height_px"] = self._fmt_record_float(bbox_height, 3)
-            row[f"{camera}_confidence"] = self._fmt_record_float(getattr(detection, "confidence", None), 6)
-        return row
-
-    def _detection_utc_unix_s(self, detection) -> float | None:
-        metadata = dict(getattr(detection, "timestamp_metadata", None) or {})
-        value = metadata.get("rtcp_frame_ntp_unix_s")
-        if value is None:
-            return None
-        try:
-            parsed = float(value)
-        except (TypeError, ValueError):
-            return None
-        return parsed if isfinite(parsed) else None
-
-    def _unix_seconds_to_ns(self, value: float | None) -> int | None:
-        if value is None:
-            return None
-        try:
-            return int(
-                (Decimal(str(value)) * Decimal(1_000_000_000)).to_integral_value(
-                    rounding=ROUND_HALF_UP
-                )
-            )
-        except (InvalidOperation, ValueError):
-            return None
-
-    def _record_measurement_sync_timestamp_parameters(self, estimate) -> dict[str, object]:
-        left_timestamp_s = float(getattr(estimate.left, "timestamp_s", 0.0))
-        right_timestamp_s = float(getattr(estimate.right, "timestamp_s", 0.0))
-        bbox_mid_timestamp_s = (left_timestamp_s + right_timestamp_s) / 2.0
-        left_utc_unix_s = self._detection_utc_unix_s(estimate.left)
-        right_utc_unix_s = self._detection_utc_unix_s(estimate.right)
-        bbox_mid_utc_unix_s = (
-            (left_utc_unix_s + right_utc_unix_s) / 2.0
-            if left_utc_unix_s is not None and right_utc_unix_s is not None
-            else None
-        )
-        left_utc_ns = self._unix_seconds_to_ns(left_utc_unix_s)
-        right_utc_ns = self._unix_seconds_to_ns(right_utc_unix_s)
-        pair_mid_utc_ns = (
-            None if left_utc_ns is None or right_utc_ns is None else (left_utc_ns + right_utc_ns) // 2
-        )
-        rtcp_pair_delta_ns = (
-            None if left_utc_ns is None or right_utc_ns is None else right_utc_ns - left_utc_ns
-        )
-        pair_limit_s = self._yolo_pair_max_delta_s()
-        pair_limit_ns = (
-            None
-            if not isfinite(pair_limit_s)
-            else int(round(pair_limit_s * 1_000_000_000.0))
-        )
-        camera_time_metrics = self._camera_time_sync_metrics(
-            dict(getattr(estimate.left, "timestamp_metadata", None) or {}),
-            dict(getattr(estimate.right, "timestamp_metadata", None) or {}),
-            left_receive_mono_s=left_timestamp_s,
-            right_receive_mono_s=right_timestamp_s,
-        )
-        row = {
-            "left_bbox_timestamp_s": self._fmt_record_float(left_timestamp_s, 6),
-            "right_bbox_timestamp_s": self._fmt_record_float(right_timestamp_s, 6),
-            "bbox_mid_timestamp_s": self._fmt_record_float(bbox_mid_timestamp_s, 6),
-            "left_bbox_utc_unix_s": self._fmt_record_float(left_utc_unix_s, 6),
-            "right_bbox_utc_unix_s": self._fmt_record_float(right_utc_unix_s, 6),
-            "bbox_mid_utc_unix_s": self._fmt_record_float(bbox_mid_utc_unix_s, 6),
-            "left_frame_utc_ns": "" if left_utc_ns is None else left_utc_ns,
-            "right_frame_utc_ns": "" if right_utc_ns is None else right_utc_ns,
-            "pair_mid_utc_ns": "" if pair_mid_utc_ns is None else pair_mid_utc_ns,
-            "rtcp_pair_delta_ns": "" if rtcp_pair_delta_ns is None else rtcp_pair_delta_ns,
-            "pair_timing_limit_ns": "" if pair_limit_ns is None else pair_limit_ns,
-            "pair_timing_valid": self._fmt_record_bool(
-                rtcp_pair_delta_ns is not None
-                and (pair_limit_ns is None or abs(rtcp_pair_delta_ns) <= pair_limit_ns)
-            ),
-            "left_bbox_timestamp_reference": str(
-                (getattr(estimate.left, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
-            ),
-            "right_bbox_timestamp_reference": str(
-                (getattr(estimate.right, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
-            ),
-            "camera_time_sync_status": str(camera_time_metrics["status"]),
-            "camera_time_sync_basis": str(camera_time_metrics["basis"]),
-            "camera_time_sync_warning": str(camera_time_metrics["warning"]),
-            "stream_sync_state": self.camera_sync_status,
-            "stream_sync_reason": self.camera_sync_reason,
-            "rtcp_pair_delta_s": self._fmt_record_float(camera_time_metrics["pair_delta_s"], 6),
-            "rtcp_pc_offset_max_ms": self._fmt_record_float(camera_time_metrics["max_pc_offset_ms"], 3),
-            "rtcp_frame_transit_max_ms": self._fmt_record_float(camera_time_metrics["max_frame_transit_delay_ms"], 3),
-            "left_rtcp_frame_transit_ms": self._fmt_record_float(camera_time_metrics["left_frame_transit_delay_ms"], 3),
-            "right_rtcp_frame_transit_ms": self._fmt_record_float(camera_time_metrics["right_frame_transit_delay_ms"], 3),
-            "left_rtcp_pc_offset_ms": self._fmt_record_float(camera_time_metrics["left_pc_offset_ms"], 3),
-            "right_rtcp_pc_offset_ms": self._fmt_record_float(camera_time_metrics["right_pc_offset_ms"], 3),
-        }
-        return row
-
-    def _record_frame_timestamp_parameters(
-        self, measurement_attempt: MeasurementAttempt
-    ) -> dict[str, object]:
-        row: dict[str, object] = {}
-        detections = {
-            "left": measurement_attempt.left_detection,
-            "right": measurement_attempt.right_detection,
-        }
-        for camera, detection in detections.items():
-            metadata = detection.timestamp_metadata
-            timestamp_s = detection.app_receive_monotonic_s
-            source_timestamp = metadata.get("source_timestamp_s")
-            timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
-            row[f"{camera}_display_frame_timestamp_s"] = self._fmt_record_float(timestamp_s, 6)
-            row[f"{camera}_source_frame_timestamp_s"] = self._fmt_record_float(
-                None if source_timestamp is None else float(source_timestamp),
-                6,
-            )
-            row[f"{camera}_frame_timestamp_source"] = str(metadata.get("timestamp_source") or "")
-            row[f"{camera}_frame_timestamp_reference"] = timestamp_reference
-            row[f"{camera}_rtp_timestamp"] = "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
-            row[f"{camera}_rtp_ssrc"] = "" if metadata.get("rtp_ssrc") is None else str(int(metadata["rtp_ssrc"]))
-            row[f"{camera}_rtcp_frame_ntp_unix_s"] = self._fmt_record_float(
-                None if metadata.get("rtcp_frame_ntp_unix_s") is None else float(metadata["rtcp_frame_ntp_unix_s"]),
-                6,
-            )
-            rtcp_frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
-            row[f"{camera}_rtcp_frame_ntp_unix_ns"] = (
-                ""
-                if rtcp_frame_ntp_unix_s is None
-                else self._unix_seconds_to_ns(float(rtcp_frame_ntp_unix_s))
-            )
-            row[f"{camera}_app_receive_monotonic_ns"] = int(
-                round(timestamp_s * 1_000_000_000.0)
-            )
-            row[f"{camera}_camera_rtc_frame_unix_s"] = row[f"{camera}_rtcp_frame_ntp_unix_s"]
-            row[f"{camera}_rtcp_sr_ntp_unix_s"] = self._fmt_record_float(
-                None if metadata.get("rtcp_sr_ntp_unix_s") is None else float(metadata["rtcp_sr_ntp_unix_s"]),
-                6,
-            )
-            row[f"{camera}_camera_rtc_sr_unix_s"] = row[f"{camera}_rtcp_sr_ntp_unix_s"]
-            row[f"{camera}_rtcp_sr_rtp_timestamp"] = (
-                "" if metadata.get("rtcp_sr_rtp_timestamp") is None else str(int(metadata["rtcp_sr_rtp_timestamp"]))
-            )
-            row[f"{camera}_rtsp_transport"] = str(metadata.get("rtsp_transport") or "")
-            row[f"{camera}_camera_rtc_basis"] = (
-                "rtcp-sender-report"
-                if metadata.get("rtcp_frame_ntp_unix_s") is not None
-                else timestamp_reference
-            )
-        display_delta_s = (
-            measurement_attempt.right_detection.app_receive_monotonic_s
-            - measurement_attempt.left_detection.app_receive_monotonic_s
-        )
-        left_metadata = measurement_attempt.left_detection.timestamp_metadata
-        right_metadata = measurement_attempt.right_detection.timestamp_metadata
-        left_source = left_metadata.get("source_timestamp_s")
-        right_source = right_metadata.get("source_timestamp_s")
-        source_delta_s = (
-            float(right_source) - float(left_source)
-            if left_source is not None and right_source is not None
-            else None
-        )
-        left_rtcp_ntp = left_metadata.get("rtcp_frame_ntp_unix_s")
-        right_rtcp_ntp = right_metadata.get("rtcp_frame_ntp_unix_s")
-        rtcp_ntp_delta_s = (
-            float(right_rtcp_ntp) - float(left_rtcp_ntp)
-            if left_rtcp_ntp is not None and right_rtcp_ntp is not None
-            else None
-        )
-        row["display_frame_delta_s"] = self._fmt_record_float(display_delta_s, 6)
-        row["source_frame_delta_s"] = self._fmt_record_float(source_delta_s, 6)
-        row["rtcp_frame_ntp_delta_s"] = self._fmt_record_float(rtcp_ntp_delta_s, 6)
-        row["camera_rtc_frame_delta_s"] = row["rtcp_frame_ntp_delta_s"]
-        return row
-
-    def _record_live_telemetry_snapshot_parameters(
-        self, measurement_attempt: MeasurementAttempt
-    ) -> dict[str, object]:
-        row: dict[str, object] = {
-            "attitude_frame": BODY_FRAME,
-            "attitude_units": "deg",
-            "gps_quality_frame": "gps_telemetry_metadata",
-            "gps_quality_units": "satellites_count,eph_m,epv_m",
-        }
-        for camera in ("left", "right"):
-            attitude = (
-                measurement_attempt.left_attitude
-                if camera == "left"
-                else measurement_attempt.right_attitude
-            )
-            attitude_age_s = (
-                measurement_attempt.left_attitude_age_s
-                if camera == "left"
-                else measurement_attempt.right_attitude_age_s
-            )
-            row[f"{camera}_roll_deg"] = self._fmt_record_float(None if attitude is None else attitude.roll_deg, 6)
-            row[f"{camera}_pitch_deg"] = self._fmt_record_float(None if attitude is None else attitude.pitch_deg, 6)
-            row[f"{camera}_yaw_deg"] = self._fmt_record_float(None if attitude is None else attitude.yaw_deg, 6)
-            row[f"{camera}_attitude_sample_age_s"] = self._fmt_record_float(
-                attitude_age_s,
-                6,
-            )
-            row[f"{camera}_attitude_alignment"] = (
-                "missing" if attitude is None else "nearest_app_receive_monotonic"
-            )
-            row[f"{camera}_attitude_topic"] = "" if attitude is None else str(attitude.topic)
-            gps = measurement_attempt.left_gps if camera == "left" else measurement_attempt.right_gps
-            gps_age_s = (
-                None
-                if gps is None
-                else abs(
-                    (
-                        measurement_attempt.left_detection.app_receive_monotonic_s
-                        if camera == "left"
-                        else measurement_attempt.right_detection.app_receive_monotonic_s
-                    )
-                    - gps.app_receive_monotonic_s
-                )
-            )
-            row[f"{camera}_gps_satellites_used"] = (
-                "" if gps is None or getattr(gps, "satellites_used", None) is None else str(gps.satellites_used)
-            )
-            row[f"{camera}_gps_eph_m"] = self._fmt_record_float(
-                None if gps is None else getattr(gps, "eph_m", None),
-                6,
-            )
-            row[f"{camera}_gps_epv_m"] = self._fmt_record_float(
-                None if gps is None else getattr(gps, "epv_m", None),
-                6,
-            )
-            row[f"{camera}_gps_fix_type"] = "" if gps is None or getattr(gps, "fix_type", None) is None else str(gps.fix_type)
-            row[f"{camera}_gps_sample_age_s"] = self._fmt_record_float(
-                gps_age_s
-                if measurement_attempt.baseline is None
-                else (
-                    measurement_attempt.baseline.left_age_at_capture_s
-                    if camera == "left"
-                    else measurement_attempt.baseline.right_age_at_capture_s
-                ),
-                6,
-            )
-            row[f"{camera}_gps_alignment"] = (
-                "missing" if gps is None else "latest_selected_app_receive_monotonic"
-            )
-            row[f"{camera}_gps_topic"] = "" if gps is None else str(gps.topic)
-        return row
-
-    def _record_reference_delta_parameters(
-        self, measurement_attempt: MeasurementAttempt
-    ) -> dict[str, object]:
-        row: dict[str, object] = {
-            "gps_position_frame": "session_left_start_gps_antenna_ned",
-            "gps_position_axis_contract": "north,east,down; metres",
-            "attitude_orientation_contract": "px4_frd_to_ned; quaternion_wxyz",
-        }
-        attitudes = {
-            "left": measurement_attempt.left_attitude,
-            "right": measurement_attempt.right_attitude,
-        }
-        gps_states = {
-            "left": measurement_attempt.left_gps,
-            "right": measurement_attempt.right_gps,
-        }
-        for camera, attitude in attitudes.items():
-            if attitude is None:
-                continue
-            reference = self.recording_reference_attitudes.setdefault(camera, attitude)
-            delta = relative_attitude(reference.quaternion_wxyz, attitude.quaternion_wxyz)
-            prefix = f"{camera}_pixhawk"
-            row.update(
-                {
-                    f"{prefix}_reference_q_wxyz": json.dumps(
-                        list(reference.quaternion_wxyz), separators=(",", ":")
-                    ),
-                    f"{prefix}_delta_roll_deg": self._fmt_record_float(delta.roll_deg, 9),
-                    f"{prefix}_delta_pitch_deg": self._fmt_record_float(delta.pitch_deg, 9),
-                    f"{prefix}_delta_yaw_deg": self._fmt_record_float(delta.yaw_deg, 9),
-                    f"{prefix}_delta_rotation_angle_deg": self._fmt_record_float(
-                        relative_rotation_angle_deg(reference.quaternion_wxyz, attitude.quaternion_wxyz), 9
-                    ),
-                }
-            )
-
-        if (
-            attitudes["left"] is not None
-            and attitudes["right"] is not None
-            and "left" in self.recording_reference_attitudes
-            and "right" in self.recording_reference_attitudes
-        ):
-            initial_relative_q = quaternion_multiply(
-                self.recording_reference_attitudes["right"].quaternion_wxyz,
-                quaternion_conjugate(self.recording_reference_attitudes["left"].quaternion_wxyz),
-            )
-            current_relative_q = quaternion_multiply(
-                attitudes["right"].quaternion_wxyz,
-                quaternion_conjugate(attitudes["left"].quaternion_wxyz),
-            )
-            row["left_right_relative_reference_q_wxyz"] = json.dumps(
-                list(initial_relative_q), separators=(",", ":")
-            )
-            row["left_right_relative_q_wxyz"] = json.dumps(
-                list(current_relative_q), separators=(",", ":")
-            )
-            row["left_right_relative_delta_rotation_angle_deg"] = self._fmt_record_float(
-                relative_rotation_angle_deg(initial_relative_q, current_relative_q), 9
-            )
-
-        if self.recording_origin_gps is None and gps_states["left"] is not None:
-            self.recording_origin_gps = gps_states["left"]
-        for camera, gps in gps_states.items():
-            if gps is None:
-                continue
-            reference = self.recording_reference_gps.setdefault(camera, gps)
-            origin_delta = (
-                None if self.recording_origin_gps is None else ned_delta_m(self.recording_origin_gps, gps)
-            )
-            reference_delta = ned_delta_m(reference, gps)
-            prefix = f"{camera}_gps_antenna"
-            if origin_delta is not None:
-                row[f"{prefix}_north_m"] = self._fmt_record_float(origin_delta[0], 9)
-                row[f"{prefix}_east_m"] = self._fmt_record_float(origin_delta[1], 9)
-                row[f"{prefix}_down_m"] = self._fmt_record_float(origin_delta[2], 9)
-            if reference_delta is not None:
-                row[f"{prefix}_delta_north_m"] = self._fmt_record_float(reference_delta[0], 9)
-                row[f"{prefix}_delta_east_m"] = self._fmt_record_float(reference_delta[1], 9)
-                row[f"{prefix}_delta_down_m"] = self._fmt_record_float(reference_delta[2], 9)
-                row[f"{prefix}_delta_position_m"] = self._fmt_record_float(
-                    math.sqrt(sum(value * value for value in reference_delta)), 9
-                )
-
-        if gps_states["left"] is not None and gps_states["right"] is not None:
-            baseline_ned = ned_delta_m(gps_states["left"], gps_states["right"])
-            if baseline_ned is not None:
-                if self.recording_reference_baseline_ned_m is None:
-                    self.recording_reference_baseline_ned_m = baseline_ned
-                baseline_delta = tuple(
-                    value - reference
-                    for value, reference in zip(baseline_ned, self.recording_reference_baseline_ned_m)
-                )
-                baseline_length_m = math.sqrt(sum(value * value for value in baseline_ned))
-                reference_baseline_length_m = math.sqrt(
-                    sum(value * value for value in self.recording_reference_baseline_ned_m)
-                )
-                row.update(
-                    {
-                        "baseline_north_m": self._fmt_record_float(baseline_ned[0], 9),
-                        "baseline_east_m": self._fmt_record_float(baseline_ned[1], 9),
-                        "baseline_down_m": self._fmt_record_float(baseline_ned[2], 9),
-                        "baseline_length_m": self._fmt_record_float(baseline_length_m, 9),
-                        "baseline_reference_length_m": self._fmt_record_float(
-                            reference_baseline_length_m, 9
-                        ),
-                        "baseline_length_change_m": self._fmt_record_float(
-                            baseline_length_m - reference_baseline_length_m, 9
-                        ),
-                        "baseline_delta_north_m": self._fmt_record_float(baseline_delta[0], 9),
-                        "baseline_delta_east_m": self._fmt_record_float(baseline_delta[1], 9),
-                        "baseline_delta_down_m": self._fmt_record_float(baseline_delta[2], 9),
-                        "baseline_delta_length_m": self._fmt_record_float(
-                            math.sqrt(sum(value * value for value in baseline_delta)), 9
-                        ),
-                    }
-                )
-        return row
-
-    def _record_current_intrinsic_parameters(self) -> dict[str, str]:
-        row: dict[str, str] = {
-            "intrinsics_active": "true" if self.active_intrinsics is not None else "false",
-            "intrinsics_path": str(
-                self._workstation_setting("intrinsics_path", self.settings.intrinsics_path)
-            ),
-            "intrinsics_zoom_level": str(self.zoom_level_spin.value()),
-            "intrinsics_zoom_path": str(self._intrinsics_storage_path()),
-            "intrinsics_latest_path": str(self._intrinsics_storage_base_path()),
-            "manual_focal_override": self._fmt_record_bool(self.manual_focal_checkbox.isChecked()),
-            "runtime_focal_px": self._fmt_record_float(self.focal_spin.value(), 3),
-        }
-        if self.active_intrinsics is None:
-            return row
-        for prefix, intrinsics in (("left", self.active_intrinsics.left), ("right", self.active_intrinsics.right)):
-            matrix = intrinsics.camera_matrix
-            row.update(
-                {
-                    f"{prefix}_intr_width": str(intrinsics.width),
-                    f"{prefix}_intr_height": str(intrinsics.height),
-                    f"{prefix}_intr_fx": self._fmt_record_float(matrix[0][0], 6),
-                    f"{prefix}_intr_fy": self._fmt_record_float(matrix[1][1], 6),
-                    f"{prefix}_intr_cx": self._fmt_record_float(matrix[0][2], 6),
-                    f"{prefix}_intr_cy": self._fmt_record_float(matrix[1][2], 6),
-                    f"{prefix}_intr_distortion": json.dumps(intrinsics.distortion_coefficients, separators=(",", ":")),
-                    f"{prefix}_intr_reprojection_error_px": self._fmt_record_float(
-                        intrinsics.reprojection_error_px, 6
-                    ),
-                    f"{prefix}_intr_image_count": str(intrinsics.image_count),
-                }
-            )
-        return row
-
-    def _record_intrinsic_parameters(
-        self, measurement_attempt: MeasurementAttempt
-    ) -> dict[str, str]:
-        intrinsics_snapshot = measurement_attempt.intrinsics
-        row: dict[str, str] = {
-            "intrinsics_active": self._fmt_record_bool(intrinsics_snapshot is not None),
-            "intrinsics_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
-            "intrinsics_zoom_level": "" if intrinsics_snapshot is None else str(intrinsics_snapshot.active_zoom_level),
-            "intrinsics_zoom_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
-            "intrinsics_latest_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
-            "intrinsics_content_sha256": "" if intrinsics_snapshot is None else intrinsics_snapshot.content_sha256,
-            "manual_focal_override": self._fmt_record_bool(
-                measurement_attempt.geometry_config.manual_focal_override
-            ),
-            "runtime_focal_px": self._fmt_record_float(
-                measurement_attempt.geometry_config.focal_length_px, 3
-            ),
-        }
-        if intrinsics_snapshot is None:
-            return row
-        for prefix, intrinsics in (
-            ("left", intrinsics_snapshot.left),
-            ("right", intrinsics_snapshot.right),
-        ):
-            matrix = intrinsics.camera_matrix
-            row.update(
-                {
-                    f"{prefix}_intr_width": str(intrinsics.width),
-                    f"{prefix}_intr_height": str(intrinsics.height),
-                    f"{prefix}_intr_fx": self._fmt_record_float(matrix[0][0], 6),
-                    f"{prefix}_intr_fy": self._fmt_record_float(matrix[1][1], 6),
-                    f"{prefix}_intr_cx": self._fmt_record_float(matrix[0][2], 6),
-                    f"{prefix}_intr_cy": self._fmt_record_float(matrix[1][2], 6),
-                    f"{prefix}_intr_distortion": json.dumps(
-                        intrinsics.distortion_coefficients, separators=(",", ":")
-                    ),
-                    f"{prefix}_intr_reprojection_error_px": self._fmt_record_float(
-                        intrinsics.reprojection_error_px, 6
-                    ),
-                    f"{prefix}_intr_image_count": str(intrinsics.image_count),
-                }
-            )
-        return row
-
-    def _record_current_checkerboard_extrinsics_parameters(self) -> dict[str, object]:
-        calibration = self.active_intrinsics
-        extrinsics = None if calibration is None else calibration.extrinsics
-        row: dict[str, object] = {
-            "active": extrinsics is not None,
-            "source": "applied_intrinsics",
-            "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
-        }
-        if extrinsics is None:
-            return row
-        right_origin = self._checkerboard_translation_right_in_left_m()
-        row.update(
-            {
-                "pair_count": int(extrinsics.pair_count),
-                "reprojection_error_px": float(extrinsics.reprojection_error_px),
-                "rotation_left_to_right": [list(map(float, values)) for values in extrinsics.rotation_left_to_right],
-                "translation_left_to_right_m": [float(value) for value in extrinsics.translation_left_to_right_m],
-                "right_camera_origin_in_left_rdf_m": (
-                    None if right_origin is None else [float(value) for value in right_origin]
-                ),
-            }
-        )
-        return row
-
-    def _record_checkerboard_extrinsics_parameters(
-        self, measurement_attempt: MeasurementAttempt
-    ) -> dict[str, object]:
-        calibration = measurement_attempt.intrinsics
-        extrinsics = None if calibration is None else calibration.checkerboard_extrinsics
-        row: dict[str, object] = {
-            "active": extrinsics is not None,
-            "source": "measurement_attempt",
-            "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
-        }
-        if extrinsics is None:
-            return row
-        right_origin = measurement_attempt.translation_right_in_left_m
-        row.update(
-            {
-                "pair_count": extrinsics.pair_count,
-                "reprojection_error_px": extrinsics.reprojection_error_px,
-                "rotation_left_to_right": [list(values) for values in extrinsics.rotation_left_to_right],
-                "translation_left_to_right_m": list(extrinsics.translation_left_to_right_m),
-                "right_camera_origin_in_left_rdf_m": (
-                    None if right_origin is None else list(right_origin)
-                ),
-            }
-        )
-        return row
-
-    def _record_external_parameters(
-        self, *, estimate=None, measurement_attempt: MeasurementAttempt
-    ) -> dict[str, str]:
-        triangulation_source = measurement_attempt.triangulation_source
-        checkerboard_mode = triangulation_source == "checkerboard"
-        attitude_timing_status = classify_attitude_timing(
-            uses_pixhawk_attitude=not checkerboard_mode,
-            left_age_s=(
-                measurement_attempt.left_attitude_age_s
-                if estimate is None
-                else estimate.left_attitude_age_s
-            ),
-            right_age_s=(
-                measurement_attempt.right_attitude_age_s
-                if estimate is None
-                else estimate.right_attitude_age_s
-            ),
-            pair_delta_s=(
-                measurement_attempt.attitude_pair_delta_s
-                if estimate is None
-                else estimate.attitude_pair_delta_s
-            ),
-        )
-        checkerboard = self._record_checkerboard_extrinsics_parameters(measurement_attempt)
-        row: dict[str, str] = {
-            "triangulation_extrinsics_source": triangulation_source,
-            "use_rtk_baseline": self._fmt_record_bool(not checkerboard_mode),
-            "rtk_baseline_applied": self._fmt_record_bool(not checkerboard_mode),
-            "require_rtk_fixed": self._fmt_record_bool(
-                False if checkerboard_mode else measurement_attempt.geometry_config.require_rtk_fixed_setting
-            ),
-            "use_triangulation": self._fmt_record_bool(True),
-            "distance_mode": (
-                "체커보드 Stereo 외부 파라미터"
-                if checkerboard_mode
-                else "Pixhawk 자세 + GPS/RTK baseline"
-            ),
-            "world_frame": WORLD_FRAME,
-            "body_frame": BODY_FRAME,
-            "camera_frame": CAMERA_FRAME,
-            "camera_mount_profile": CAMERA_MOUNT_PROFILE,
-            "mount_assumption_model": (
-                "checkerboard-stereo-extrinsics-v1"
-                if checkerboard_mode
-                else "gps-rtk-baseline-only-v1"
-            ),
-            "mount_assumption_status": (
-                "checkerboard stereo extrinsics" if checkerboard_mode else "GPS/RTK baseline only"
-            ),
-            "mount_assumption_detail": (
-                "applied_checkerboard_stereo_extrinsics_used_as_fixed_optical_transform"
-                if checkerboard_mode
-                else "live_gps_rtk_baseline_used_as_stereo_translation"
-            ),
-            "checkerboard_extrinsics_active": self._fmt_record_bool(bool(checkerboard["active"])),
-            "checkerboard_extrinsics_pair_count": str(checkerboard.get("pair_count", "")),
-            "checkerboard_extrinsics_reprojection_error_px": self._fmt_record_float(
-                checkerboard.get("reprojection_error_px"), 6
-            ),
-            "checkerboard_extrinsics_frame_contract": str(checkerboard["frame_contract"]),
-            "require_attitude": self._fmt_record_bool(False),
-            "attitude_used_for_triangulation": self._fmt_record_bool(not checkerboard_mode),
-            "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
-            "attitude_timing_status": attitude_timing_status,
-            "attitude_timing_blocks_measurement": self._fmt_record_bool(False),
-            "attitude_stale_age_threshold_s": self._fmt_record_float(ATTITUDE_STALE_AGE_S, 3),
-            "attitude_very_stale_age_threshold_s": self._fmt_record_float(
-                ATTITUDE_VERY_STALE_AGE_S, 3
-            ),
-            "attitude_stale_pair_delta_threshold_s": self._fmt_record_float(
-                ATTITUDE_STALE_PAIR_DELTA_S, 3
-            ),
-            "attitude_very_stale_pair_delta_threshold_s": self._fmt_record_float(
-                ATTITUDE_VERY_STALE_PAIR_DELTA_S, 3
-            ),
-            "left_attitude_age_s": self._fmt_record_float(
-                measurement_attempt.left_attitude_age_s if estimate is None else estimate.left_attitude_age_s, 6
-            ),
-            "right_attitude_age_s": self._fmt_record_float(
-                measurement_attempt.right_attitude_age_s if estimate is None else estimate.right_attitude_age_s, 6
-            ),
-            "attitude_pair_delta_s": self._fmt_record_float(
-                measurement_attempt.attitude_pair_delta_s if estimate is None else estimate.attitude_pair_delta_s, 6
-            ),
-            "relative_roll_deg": self._fmt_record_float(
-                measurement_attempt.relative_roll_deg if estimate is None else estimate.relative_roll_deg, 6
-            ),
-            "relative_pitch_deg": self._fmt_record_float(
-                measurement_attempt.relative_pitch_deg if estimate is None else estimate.relative_pitch_deg, 6
-            ),
-            "relative_yaw_deg": self._fmt_record_float(
-                measurement_attempt.relative_yaw_deg if estimate is None else estimate.relative_yaw_deg, 6
-            ),
-        }
-        baseline = measurement_attempt.baseline
-        if baseline is not None:
-            camera_translation = baseline.translation_right_in_left_rdf_m
-            baseline_forward_geometry = self._baseline_forward_geometry_from_camera_translation(camera_translation)
-            ned = baseline.ned_right_from_left_m
-            row.update(
-                {
-                    "rtk_baseline_north_m": self._fmt_record_float(None if ned is None else ned[0], 6),
-                    "rtk_baseline_east_m": self._fmt_record_float(None if ned is None else ned[1], 6),
-                    "rtk_baseline_down_m": self._fmt_record_float(None if ned is None else ned[2], 6),
-                    "baseline_p1_body_frd_state": "WAITING",
-                    "baseline_p1_body_frd_forward_m": "",
-                    "baseline_p1_body_frd_right_m": "",
-                    "baseline_p1_body_frd_down_m": "",
-                    "baseline_p1_body_frd_attitude_age_s": "",
-                    "baseline_p1_body_frd_frame": BODY_FRAME,
-                    "baseline_p1_body_frd_axis_contract": (
-                        "P1->P2 in P1 body FRD: [Forward, Right, Down]; metres"
-                    ),
-                    "rtk_left_age_s": self._fmt_record_float(baseline.left_age_at_capture_s, 6),
-                    "rtk_right_age_s": self._fmt_record_float(baseline.right_age_at_capture_s, 6),
-                    "rtk_fix_quality": baseline.fix_quality,
-                    "rtk_warnings": "; ".join(baseline.warnings),
-                    "selected_gps_pair_delta_s": self._fmt_record_float(baseline.gps_pair_delta_s, 6),
-                    "selected_left_gps_detection_age_s": self._fmt_record_float(
-                        baseline.left_age_from_detection_midpoint_s, 6
-                    ),
-                    "selected_right_gps_detection_age_s": self._fmt_record_float(
-                        baseline.right_age_from_detection_midpoint_s, 6
-                    ),
-                }
-            )
-            left_attitude = measurement_attempt.left_attitude
-            if ned is not None and left_attitude is not None:
-                projection = project_ned_baseline_to_p1_body_frd(
-                    ned,
-                    left_attitude.quaternion_wxyz,
-                    attitude_timestamp_s=left_attitude.app_receive_monotonic_s,
-                    attitude_age_s=measurement_attempt.left_attitude_age_s,
-                )
-                row.update(
-                    {
-                        "baseline_p1_body_frd_state": "READY",
-                        "baseline_p1_body_frd_forward_m": self._fmt_record_float(
-                            projection.forward_m, 6
-                        ),
-                        "baseline_p1_body_frd_right_m": self._fmt_record_float(
-                            projection.right_m, 6
-                        ),
-                        "baseline_p1_body_frd_down_m": self._fmt_record_float(
-                            projection.down_m, 6
-                        ),
-                        "baseline_p1_body_frd_attitude_age_s": self._fmt_record_float(
-                            projection.attitude_age_s, 6
-                        ),
-                    }
-                )
-            if camera_translation is not None:
-                row.update(
-                    {
-                        "baseline_left_camera_rdf_right_m": self._fmt_record_float(camera_translation[0], 6),
-                        "baseline_left_camera_rdf_down_m": self._fmt_record_float(camera_translation[1], 6),
-                        "baseline_left_camera_rdf_forward_m": self._fmt_record_float(camera_translation[2], 6),
-                    }
-                )
-            if baseline_forward_geometry is not None:
-                angle_deg, effective_m, length_m, forward_m = baseline_forward_geometry
-                row.update(
-                    {
-                        "baseline_rdf_forward_angle_deg": self._fmt_record_float(angle_deg, 6),
-                        "baseline_effective_perpendicular_m": self._fmt_record_float(effective_m, 6),
-                        "baseline_camera_frame_length_m": self._fmt_record_float(length_m, 6),
-                        "baseline_forward_component_m": self._fmt_record_float(forward_m, 6),
-                    }
-                )
-        for camera in ("left", "right"):
-            attitude = (
-                measurement_attempt.left_attitude
-                if camera == "left"
-                else measurement_attempt.right_attitude
-            )
-            attitude_age_s = (
-                measurement_attempt.left_attitude_age_s
-                if camera == "left"
-                else measurement_attempt.right_attitude_age_s
-            )
-            gps = measurement_attempt.left_gps if camera == "left" else measurement_attempt.right_gps
-            gps_age_s = None
-            if measurement_attempt.baseline is not None:
-                gps_age_s = (
-                    measurement_attempt.baseline.left_age_at_capture_s
-                    if camera == "left"
-                    else measurement_attempt.baseline.right_age_at_capture_s
-                )
-            if gps_age_s is None and gps is not None:
-                frame_timestamp_s = (
-                    measurement_attempt.left_detection.app_receive_monotonic_s
-                    if camera == "left"
-                    else measurement_attempt.right_detection.app_receive_monotonic_s
-                )
-                gps_age_s = abs(frame_timestamp_s - gps.app_receive_monotonic_s)
-            row.update(self._record_extrinsic_state(camera, attitude, attitude_age_s))
-            row.update(self._record_gps_state(camera, gps, gps_age_s))
-            row.update(self._record_gnss_relative_state(camera))
-        return row
-
-    def _record_extrinsic_state(
-        self,
-        camera: str,
-        state: AttitudeSnapshot | None,
-        age_s: float | None,
-    ) -> dict[str, str]:
-        prefix = f"{camera}_pixhawk"
-        if state is None:
-            return {}
-        return {
-            f"{prefix}_namespace": state.namespace,
-            f"{prefix}_topic": state.topic,
-            f"{prefix}_roll_deg": self._fmt_record_float(state.roll_deg, 6),
-            f"{prefix}_pitch_deg": self._fmt_record_float(state.pitch_deg, 6),
-            f"{prefix}_yaw_deg": self._fmt_record_float(state.yaw_deg, 6),
-            f"{prefix}_q": json.dumps(list(state.quaternion_wxyz), separators=(",", ":")),
-            f"{prefix}_q_w": self._fmt_record_float(state.quaternion_wxyz[0], 9),
-            f"{prefix}_q_x": self._fmt_record_float(state.quaternion_wxyz[1], 9),
-            f"{prefix}_q_y": self._fmt_record_float(state.quaternion_wxyz[2], 9),
-            f"{prefix}_q_z": self._fmt_record_float(state.quaternion_wxyz[3], 9),
-            f"{prefix}_age_s": self._fmt_record_float(age_s, 6),
-            f"{prefix}_app_receive_timestamp_s": self._fmt_record_float(state.timestamp_s, 6),
-            f"{prefix}_app_receive_monotonic_ns": int(round(state.timestamp_s * 1_000_000_000.0)),
-            f"{prefix}_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
-            f"{prefix}_px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
-            f"{prefix}_px4_timestamp_sample_us": (
-                "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
-            ),
-            f"{prefix}_delta_q_reset_wxyz": (
-                "" if state.delta_q_reset is None else json.dumps(list(state.delta_q_reset), separators=(",", ":"))
-            ),
-            f"{prefix}_quat_reset_counter": (
-                "" if state.quat_reset_counter is None else state.quat_reset_counter
-            ),
-            f"{prefix}_mavlink_source_system": (
-                "" if state.mavlink_source_system is None else state.mavlink_source_system
-            ),
-            f"{prefix}_mavlink_source_component": (
-                "" if state.mavlink_source_component is None else state.mavlink_source_component
-            ),
-            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
-            f"{prefix}_mavlink_message_id": (
-                "" if state.mavlink_message_id is None else state.mavlink_message_id
-            ),
-        }
-
-    def _record_gps_state(
-        self,
-        camera: str,
-        state: GpsSnapshot | None,
-        age_s: float | None,
-    ) -> dict[str, str]:
-        prefix = f"{camera}_gps"
-        if state is None:
-            return {}
-        return {
-            f"{prefix}_namespace": state.namespace,
-            f"{prefix}_topic": state.topic,
-            f"{prefix}_lat_deg": self._fmt_record_float(state.latitude_deg, 9),
-            f"{prefix}_lon_deg": self._fmt_record_float(state.longitude_deg, 9),
-            f"{prefix}_alt_m": self._fmt_record_float(state.altitude_m, 6),
-            f"{prefix}_altitude_ellipsoid_m": self._fmt_record_float(state.altitude_ellipsoid_m, 6),
-            f"{prefix}_fix_type": "" if state.fix_type is None else str(state.fix_type),
-            f"{prefix}_satellites": "" if state.satellites_used is None else str(state.satellites_used),
-            f"{prefix}_eph_m": self._fmt_record_float(state.eph_m, 6),
-            f"{prefix}_epv_m": self._fmt_record_float(state.epv_m, 6),
-            f"{prefix}_heading_deg": self._fmt_record_float(state.heading_deg, 6),
-            f"{prefix}_heading_accuracy_deg": self._fmt_record_float(state.heading_accuracy_deg, 6),
-            f"{prefix}_rtk_label": state.rtk_label,
-            f"{prefix}_age_s": self._fmt_record_float(age_s, 6),
-            f"{prefix}_app_receive_timestamp_s": self._fmt_record_float(state.timestamp_s, 6),
-            f"{prefix}_app_receive_monotonic_ns": int(round(state.timestamp_s * 1_000_000_000.0)),
-            f"{prefix}_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
-            f"{prefix}_px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
-            f"{prefix}_px4_timestamp_sample_us": (
-                "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
-            ),
-            f"{prefix}_gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
-            f"{prefix}_gps_utc_valid": self._fmt_record_bool(state.gps_utc_us is not None),
-            f"{prefix}_timestamp_time_relative_us": (
-                ""
-                if state.gps_timestamp_time_relative_us is None
-                else state.gps_timestamp_time_relative_us
-            ),
-            f"{prefix}_velocity_n_m_s": self._fmt_record_float(state.velocity_n_m_s, 6),
-            f"{prefix}_velocity_e_m_s": self._fmt_record_float(state.velocity_e_m_s, 6),
-            f"{prefix}_velocity_d_m_s": self._fmt_record_float(state.velocity_d_m_s, 6),
-            f"{prefix}_velocity_ned_valid": self._fmt_record_bool(state.velocity_ned_valid),
-            f"{prefix}_hdop": self._fmt_record_float(state.hdop, 6),
-            f"{prefix}_vdop": self._fmt_record_float(state.vdop, 6),
-            f"{prefix}_device_id": "" if state.device_id is None else state.device_id,
-            f"{prefix}_time_source": state.time_source,
-            f"{prefix}_mavlink_source_system": (
-                "" if state.mavlink_source_system is None else state.mavlink_source_system
-            ),
-            f"{prefix}_mavlink_source_component": (
-                "" if state.mavlink_source_component is None else state.mavlink_source_component
-            ),
-            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
-            f"{prefix}_mavlink_message_id": (
-                "" if state.mavlink_message_id is None else state.mavlink_message_id
-            ),
-        }
-
-    def _record_gnss_relative_state(self, camera: str) -> dict[str, str]:
-        state = self.latest_gnss_relative.get(camera)
-        prefix = f"{camera}_gnss_relative"
-        if state is None:
-            return {}
-        age_s = max(0.0, time.monotonic() - state.timestamp_s)
-        heading_deg = None if state.heading_rad is None else math.degrees(state.heading_rad)
-        heading_accuracy_deg = None if state.heading_accuracy_rad is None else math.degrees(state.heading_accuracy_rad)
-        return {
-            f"{prefix}_namespace": state.namespace,
-            f"{prefix}_topic": state.topic,
-            f"{prefix}_device_id": "" if state.device_id is None else str(state.device_id),
-            f"{prefix}_heading_deg": self._fmt_record_float(heading_deg, 6),
-            f"{prefix}_heading_accuracy_deg": self._fmt_record_float(heading_accuracy_deg, 6),
-            f"{prefix}_position_length_m": self._fmt_record_float(state.position_length_m, 6),
-            f"{prefix}_accuracy_length_m": self._fmt_record_float(state.accuracy_length_m, 6),
-            f"{prefix}_gnss_fix_ok": self._fmt_record_bool(state.gnss_fix_ok),
-            f"{prefix}_differential_solution": self._fmt_record_bool(state.differential_solution),
-            f"{prefix}_relative_position_valid": self._fmt_record_bool(state.relative_position_valid),
-            f"{prefix}_carrier_solution_floating": self._fmt_record_bool(state.carrier_solution_floating),
-            f"{prefix}_carrier_solution_fixed": self._fmt_record_bool(state.carrier_solution_fixed),
-            f"{prefix}_moving_base_mode": self._fmt_record_bool(state.moving_base_mode),
-            f"{prefix}_heading_valid": self._fmt_record_bool(state.heading_valid),
-            f"{prefix}_age_s": self._fmt_record_float(age_s, 6),
-            f"{prefix}_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
-            f"{prefix}_px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
-            f"{prefix}_px4_timestamp_sample_us": (
-                "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
-            ),
-            f"{prefix}_gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
-            f"{prefix}_gps_utc_valid": self._fmt_record_bool(state.gps_utc_us is not None),
-            f"{prefix}_mavlink_source_system": (
-                "" if state.mavlink_source_system is None else state.mavlink_source_system
-            ),
-            f"{prefix}_mavlink_source_component": (
-                "" if state.mavlink_source_component is None else state.mavlink_source_component
-            ),
-            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
-            f"{prefix}_mavlink_message_id": (
-                "" if state.mavlink_message_id is None else state.mavlink_message_id
-            ),
-        }
-
-    def _format_distance_label_text(self, text: str, detail: str | None = None) -> str:
-        if not detail:
-            return text
-        return (
-            "<div style='line-height: 1.1;'>"
-            f"{html_lib.escape(text)}"
-            "<br>"
-            f"<span style='font-size: 9px; font-weight: 400;'>{html_lib.escape(detail)}</span>"
-            "</div>"
-        )
-
-    def _format_quality_point(self, point: tuple[float, float, float] | None) -> str:
-        if point is None:
-            return "--"
-        return f"Right={point[0]:+.3f} m, Down={point[1]:+.3f} m, Forward={point[2]:+.3f} m"
-
-    def _format_attitude_timing_age(self, value_s: float | None) -> str:
-        return "--" if value_s is None else f"{value_s:.3f} s"
-
-    def _attitude_timing_health_level(self, status: str) -> str:
-        return {
-            "FRESH": "good",
-            "STALE": "warn",
-            "VERY_STALE": "bad",
-            "WAITING": "warn",
-            "NOT_USED": "idle",
-        }.get(status, "idle")
-
-    def _format_attitude_timing_text(
-        self,
-        *,
-        status: str,
-        left_age_s: float | None,
-        right_age_s: float | None,
-        pair_delta_s: float | None,
-        baseline_source: str,
-        baseline_m: float,
-    ) -> str:
-        baseline_text = f"Baseline {baseline_source}:{baseline_m:.3f} m"
-        if status == "NOT_USED":
-            return f"Attitude timing [N/A] | {baseline_text} | PIXHAWK ATTITUDE NOT USED (checkerboard)"
-        return (
-            f"Attitude timing [{status}] | {baseline_text} | "
-            f"Left age {self._format_attitude_timing_age(left_age_s)} | "
-            f"Right age {self._format_attitude_timing_age(right_age_s)} | "
-            f"Pair Δt {self._format_attitude_timing_age(pair_delta_s)} | "
-            "display-only; measurement continues"
-        )
-
-    def _clear_triangulation_quality(self, reason: str) -> None:
-        if not hasattr(self, "triangulation_quality_status_label"):
-            return
-        self.triangulation_quality_status_label.setText(reason)
-        self.triangulation_quality_gap_label.setText("gap: --")
-        self.triangulation_quality_distance_label.setText("distance: --")
-        self.triangulation_quality_mode_label.setText("mode: --")
-        self._set_health_label(self.triangulation_quality_attitude_label, "Attitude timing: --", "idle")
-        self.triangulation_quality_raw_point_label.setText("Raw baseline_center_frd point: --")
-        self.triangulation_quality_plot.set_quality(None)
-
-    def _update_triangulation_quality(
-        self,
-        *,
-        triangulated: RayTriangulationResult,
-        method_text: str,
-        display_distance_m: float,
-        display_baseline_source: str,
-        display_baseline_m: float,
-        public_point_m: tuple[float, float, float] | None,
-        source_point_left_rdf_m: tuple[float, float, float] | None,
-        attitude_timing_status: str,
-        left_attitude_age_s: float | None,
-        right_attitude_age_s: float | None,
-        attitude_pair_delta_s: float | None,
-    ) -> None:
-        if not hasattr(self, "triangulation_quality_status_label"):
-            return
-        self.triangulation_quality_status_label.setText(
-            "표시 전용: 현재 좌/우 bbox ray의 최단거리 gap과 3D midpoint를 보여줍니다."
-        )
-        self.triangulation_quality_gap_label.setText(f"gap: {triangulated.closest_gap_m:.3f} m")
-        self.triangulation_quality_distance_label.setText(f"distance: {display_distance_m:.3f} m")
-        self.triangulation_quality_mode_label.setText(f"mode: {method_text}")
-        self._set_health_label(
-            self.triangulation_quality_attitude_label,
-            self._format_attitude_timing_text(
-                status=attitude_timing_status,
-                left_age_s=left_attitude_age_s,
-                right_age_s=right_attitude_age_s,
-                pair_delta_s=attitude_pair_delta_s,
-                baseline_source=display_baseline_source,
-                baseline_m=display_baseline_m,
-            ),
-            self._attitude_timing_health_level(attitude_timing_status),
-        )
-        self.triangulation_quality_raw_point_label.setText(
-            "Raw baseline_center_frd point [F/R/D]: "
-            f"{self._format_quality_point(public_point_m)} | origin=baseline midpoint "
-            "| source left_camera_rdf [R/D/F]: "
-            f"{self._format_quality_point(source_point_left_rdf_m)}"
-        )
-        self.triangulation_quality_plot.set_quality(
-            {
-                "closest_gap_m": triangulated.closest_gap_m,
-                "distance_m": display_distance_m,
-                "method": method_text,
-                "scene": triangulation_3d_scene_points(triangulated, baseline_m=display_baseline_m),
-            }
-        )
-
-    def _set_distance_text(self, text: str, *, quality: str = "unknown", detail: str | None = None) -> None:
-        self.last_distance_status = text
-        self.last_distance_quality = quality
-        if hasattr(self, "distance_plot"):
-            self.distance_plot.set_empty_message(detail or text)
-        if detail:
-            self.distance_label.setTextFormat(QtCore.Qt.RichText)
-        else:
-            self.distance_label.setTextFormat(QtCore.Qt.PlainText)
-        self.distance_label.setText(self._format_distance_label_text(text, detail))
-        style = self._distance_style(quality)
-        self.distance_label.setStyleSheet(
-            "font-size: 14px; font-weight: 700; padding: 8px 10px; "
-            f"border: 1px solid {PANEL_BORDER}; border-radius: 0px; " + style
-        )
-        self._refresh_operation_header()
-
-    def _distance_style(self, quality: str) -> str:
-        if quality == "GOOD":
-            return f"background: {SUCCESS_BG}; color: {SUCCESS_TEXT}; border-color: {SUCCESS};"
-        if quality == "DEGRADED":
-            return f"background: {WARNING_BG}; color: {WARNING_TEXT}; border-color: {WARNING};"
-        if quality == "BAD":
-            return f"background: {ERROR_BG}; color: {ERROR_TEXT}; border-color: {ERROR};"
-        return f"background: {PANEL_ALT_BG}; color: {TEXT_MUTED}; border-color: {PANEL_BORDER};"
-
-    def _update_extrinsic(self, camera: str, extrinsic: CameraExtrinsicState) -> None:
-        age_ms = max(0.0, time.monotonic() - extrinsic.timestamp_s) * 1000.0
-        px4_text = f", px4_t={extrinsic.px4_timestamp_s:.3f}" if extrinsic.px4_timestamp_s is not None else ""
-        text = (
-            f"{camera}/namespace={extrinsic.namespace}: "
-            f"roll={extrinsic.roll_deg:.4f}°, pitch={extrinsic.pitch_deg:.4f}°, "
-            f"yaw={extrinsic.yaw_deg:.4f}°, age={age_ms:.0f}ms{px4_text}"
-        )
-        self.latest_extrinsics[camera] = extrinsic
-        self.attitude_monitor.update(camera, extrinsic)
-        self._record_external_timeline_row(
-            camera,
-            "pixhawk_attitude",
-            {
-                "namespace": extrinsic.namespace,
-                "topic": extrinsic.topic,
-                "mavlink_source_system": (
-                    "" if extrinsic.mavlink_source_system is None else extrinsic.mavlink_source_system
-                ),
-                "mavlink_source_component": (
-                    "" if extrinsic.mavlink_source_component is None else extrinsic.mavlink_source_component
-                ),
-                "mavlink_sequence": "" if extrinsic.mavlink_sequence is None else extrinsic.mavlink_sequence,
-                "mavlink_message_id": (
-                    "" if extrinsic.mavlink_message_id is None else extrinsic.mavlink_message_id
-                ),
-                "sample_app_timestamp_s": extrinsic.timestamp_s,
-                "sample_px4_timestamp_s": self._fmt_record_float(extrinsic.px4_timestamp_s, 6),
-                "px4_timestamp_us": (
-                    "" if extrinsic.px4_timestamp_us is None else extrinsic.px4_timestamp_us
-                ),
-                "px4_timestamp_sample_us": (
-                    ""
-                    if extrinsic.px4_timestamp_sample_us is None
-                    else extrinsic.px4_timestamp_sample_us
-                ),
-                "roll_deg": self._fmt_record_float(extrinsic.roll_deg, 6),
-                "pitch_deg": self._fmt_record_float(extrinsic.pitch_deg, 6),
-                "yaw_deg": self._fmt_record_float(extrinsic.yaw_deg, 6),
-                "attitude_rollspeed_rad_s": self._fmt_record_float(extrinsic.rollspeed_rad_s, 9),
-                "attitude_pitchspeed_rad_s": self._fmt_record_float(extrinsic.pitchspeed_rad_s, 9),
-                "attitude_yawspeed_rad_s": self._fmt_record_float(extrinsic.yawspeed_rad_s, 9),
-                "attitude_time_boot_ms": "" if extrinsic.px4_timestamp_us is None else extrinsic.px4_timestamp_us // 1000,
-                "q": json.dumps(list(extrinsic.q), separators=(",", ":")),
-                "q_w": self._fmt_record_float(extrinsic.q[0], 9),
-                "q_x": self._fmt_record_float(extrinsic.q[1], 9),
-                "q_y": self._fmt_record_float(extrinsic.q[2], 9),
-                "q_z": self._fmt_record_float(extrinsic.q[3], 9),
-                "orientation_contract": "PX4 vehicle attitude quaternion rotates body FRD to world NED",
-                "delta_q_reset_wxyz": (
-                    ""
-                    if extrinsic.delta_q_reset is None
-                    else json.dumps(list(extrinsic.delta_q_reset), separators=(",", ":"))
-                ),
-                "quat_reset_counter": (
-                    "" if extrinsic.quat_reset_counter is None else extrinsic.quat_reset_counter
-                ),
-                "age_s": self._fmt_record_float(max(0.0, time.monotonic() - extrinsic.timestamp_s), 6),
-            },
-        )
-        self.attitude_buffers[camera].add(extrinsic)
-        self.pixhawk_attitude_times[camera].append(time.monotonic())
-        if hasattr(self, "signal_attitude_labels"):
-            source = self._telemetry_source_label(extrinsic.topic)
-            self.signal_attitude_labels[camera].setText(
-                f"Attitude: {source} | roll={extrinsic.roll_deg:.2f} pitch={extrinsic.pitch_deg:.2f} "
-                f"yaw={extrinsic.yaw_deg:.2f} | age={age_ms:.0f}ms{px4_text}"
-            )
-        if hasattr(self, "signal_attitude_age_plot"):
-            self.signal_attitude_age_plot.add_point(TelemetryHistoryPoint(time.monotonic(), camera, age_ms))
-        self._update_pixhawk_connection_status()
-        self._update_relative_attitude_status()
-        self._refresh_rtk_alignment_view()
-        self._refresh_alignment_attitude_ui()
-        self._refresh_alignment_overview()
-        self._refresh_gnss_base_tab()
-        self._refresh_alignment_validation()
-        self._refresh_camera_parameters_tab()
-        self._refresh_distance()
-
-
-    def _update_gps(self, camera: str, gps: GpsPositionState) -> None:
-        self.latest_gps[camera] = gps
-        if camera in {"left", "right"}:
-            self.gnss_monitor.update_position(camera, gps)
-        if hasattr(self, "baseline_gps_rate_history") and camera in self.baseline_gps_rate_history:
-            self.baseline_gps_rate_history[camera].append(time.monotonic())
-        raw = gps.raw
-        raw_vel = getattr(raw, "vel", None) if raw is not None else None
-        ground_speed_m_s = None if raw_vel in (None, 65535) else float(raw_vel) * 0.01
-        raw_yaw = getattr(raw, "yaw", None) if raw is not None else None
-        gps_yaw_deg = None if raw_yaw in (None, 0, 65535) else float(raw_yaw) * 0.01
-        raw_hdg_acc = getattr(raw, "hdg_acc", None) if raw is not None else None
-        heading_accuracy_deg = (
-            None if raw_hdg_acc in (None, 0, 65535) else float(raw_hdg_acc) * 1e-5
-        )
-        self._record_external_timeline_row(
-            camera,
-            "gps_rtk",
-            {
-                "namespace": gps.namespace,
-                "topic": gps.topic,
-                "mavlink_source_system": "" if gps.mavlink_source_system is None else gps.mavlink_source_system,
-                "mavlink_source_component": (
-                    "" if gps.mavlink_source_component is None else gps.mavlink_source_component
-                ),
-                "mavlink_sequence": "" if gps.mavlink_sequence is None else gps.mavlink_sequence,
-                "mavlink_message_id": "" if gps.mavlink_message_id is None else gps.mavlink_message_id,
-                "sample_app_timestamp_s": gps.timestamp_s,
-                "sample_px4_timestamp_s": self._fmt_record_float(gps.px4_timestamp_s, 6),
-                "px4_timestamp_us": "" if gps.px4_timestamp_us is None else gps.px4_timestamp_us,
-                "px4_timestamp_sample_us": (
-                    "" if gps.px4_timestamp_sample_us is None else gps.px4_timestamp_sample_us
-                ),
-                "gps_utc_us": "" if gps.gps_utc_us is None else gps.gps_utc_us,
-                "gps_timestamp_time_relative_us": (
-                    ""
-                    if gps.gps_timestamp_time_relative_us is None
-                    else gps.gps_timestamp_time_relative_us
-                ),
-                "time_source": gps.time_source,
-                "source_utc_method": (
-                    gps.time_source
-                    if gps.time_source.startswith("mavlink_")
-                    else "px4_vehicle_gps_position_time_utc_usec"
-                ),
-                "lat_deg": self._fmt_record_float(gps.latitude_deg, 9),
-                "lon_deg": self._fmt_record_float(gps.longitude_deg, 9),
-                "alt_m": self._fmt_record_float(gps.altitude_m, 6),
-                "altitude_ellipsoid_m": self._fmt_record_float(gps.altitude_ellipsoid_m, 6),
-                "fix_type": "" if gps.fix_type is None else str(gps.fix_type),
-                "satellites": "" if gps.satellites_used is None else str(gps.satellites_used),
-                "eph_m": self._fmt_record_float(gps.eph_m, 6),
-                "epv_m": self._fmt_record_float(gps.epv_m, 6),
-                "heading_deg": self._fmt_record_float(gps.heading_deg, 6),
-                "ground_speed_m_s": self._fmt_record_float(ground_speed_m_s, 6),
-                "gps_yaw_deg": self._fmt_record_float(gps_yaw_deg, 6),
-                "heading_accuracy_deg": self._fmt_record_float(
-                    heading_accuracy_deg if heading_accuracy_deg is not None else gps.heading_accuracy_deg,
-                    6,
-                ),
-                "position_contract": "WGS84 latitude/longitude; MSL and ellipsoid altitude fields explicit",
-                "velocity_contract": "world NED north/east/down metres_per_second",
-                "rtk_label": gps.rtk_label,
-                "age_s": self._fmt_record_float(max(0.0, time.monotonic() - gps.timestamp_s), 6),
-            },
-        )
-        age_ms = max(0.0, time.monotonic() - gps.timestamp_s) * 1000.0
-        accuracy_text = []
-        if gps.satellites_used is not None:
-            accuracy_text.append(f"sats={gps.satellites_used}")
-        if gps.eph_m is not None:
-            accuracy_text.append(f"eph={gps.eph_m:.2f}m")
-        if gps.heading_deg is not None:
-            accuracy_text.append(f"gpsYaw={gps.heading_deg:.2f}°")
-        extra = " ".join(accuracy_text)
-        source = self._telemetry_source_label(gps.topic)
-        text = f"{camera} GPS/RTK: {source} | {gps.rtk_label}, age={age_ms:.0f}ms, {extra}"
-        if camera == "left":
-            self._set_health_label(self.left_gps_label, text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
-        elif camera == "right":
-            self._set_health_label(self.right_gps_label, text, self._gps_fix_level(gps.fix_type, age_ms=age_ms))
-        if hasattr(self, "signal_gps_position_labels") and camera in self.signal_gps_position_labels:
-            self._set_health_label(
-                self.signal_gps_position_labels[camera],
-                f"GPS position: {self._telemetry_source_label(gps.topic)} | {gps.rtk_label} | "
-                f"{self._gps_position_summary_text(gps, age_ms=age_ms)}",
-                self._gps_fix_level(gps.fix_type, age_ms=age_ms),
-            )
-        self._refresh_rtk_baseline()
-        self._refresh_baseline_alignment_ui()
-        self._refresh_gnss_base_tab()
-        self._refresh_gnss_operation_readiness()
-        self._append_baseline_sample_if_active()
-        self._refresh_camera_parameters_tab()
-        self._refresh_distance()
-
-    def _update_mag_sensor(self, camera: str, state) -> None:
-        topic = str(getattr(state, "topic", ""))
-        namespace = str(getattr(state, "namespace", ""))
-        timestamp_s = float(getattr(state, "timestamp_s", time.monotonic()))
-        px4_timestamp_s = getattr(state, "px4_timestamp_s", None)
-        if "vehicle_magnetometer" in topic and getattr(state, "device_id", None) is not None:
-            self.latest_vehicle_mag_device_ids[camera] = int(state.device_id)
-            self.refresh_px4_mag_manager(camera)
-        sensor_slot = str(getattr(state, "sensor_slot", ""))
-        device_id, device_source = self._mag_state_display_device_id(camera, state)
-        device_type = self._magnetometer_device_type(sensor_slot, device_id)
-        self.latest_mag_sensors.setdefault(camera, {})[state.sensor_slot] = state
-        stream_prefix = {
-            "mavlink/SCALED_IMU": "mag_scaled_imu",
-            "mavlink/SCALED_IMU2": "mag_scaled_imu2",
-            "mavlink/SCALED_IMU3": "mag_scaled_imu3",
-        }.get(topic)
-        mag_detail_values = {}
-        if stream_prefix is not None:
-            for suffix in ("accel_x", "accel_y", "accel_z", "gyro_x", "gyro_y", "gyro_z"):
-                mag_detail_values[f"{stream_prefix}_{suffix}"] = self._fmt_record_float(
-                    getattr(state, suffix, None), 9
-                )
-            mag_detail_values[f"{stream_prefix}_time_boot_ms"] = (
-                "" if getattr(state, "time_boot_ms", None) is None else state.time_boot_ms
-            )
-        self._record_external_timeline_row(
-            camera,
-            "magnetometer",
-            {
-                "namespace": namespace,
-                "topic": topic,
-                "sensor_slot": sensor_slot,
-                "sample_app_timestamp_s": timestamp_s,
-                "sample_px4_timestamp_s": self._fmt_record_float(px4_timestamp_s, 6),
-                "device_id": "" if getattr(state, "device_id", None) is None else state.device_id,
-                "mag_device_type": device_type,
-                "mag_value_units": (
-                    "gauss"
-                    if "sensor_mag" in topic or "vehicle_magnetometer" in topic
-                    else "milligauss"
-                    if topic.startswith("mavlink/SCALED_IMU")
-                    else ""
-                ),
-                "mag_x": self._fmt_record_float(getattr(state, "x", None), 9),
-                "mag_y": self._fmt_record_float(getattr(state, "y", None), 9),
-                "mag_z": self._fmt_record_float(getattr(state, "z", None), 9),
-                "mag_vector_norm": self._fmt_record_float(getattr(state, "magnitude", None), 9),
-                "mag_temperature_c": self._fmt_record_float(getattr(state, "temperature_c", None), 6),
-                "mag_error_count": "" if getattr(state, "error_count", None) is None else state.error_count,
-                "mag_px4_timestamp_s": self._fmt_record_float(px4_timestamp_s, 6),
-                **mag_detail_values,
-            },
-        )
-        if topic.startswith("mavlink/SCALED_IMU"):
-            table = self.px4_mag_tables.get(camera) if hasattr(self, "px4_mag_tables") else None
-            if table is not None and table.rowCount() == 0 and self._mag_state_display_device_id(camera, state)[0] is not None:
-                self.refresh_px4_mag_manager(camera)
-        self.magnetometer_monitor.update(camera, state)
-        label = self.mag_sensor_labels.get(camera, {}).get(state.sensor_slot)
-        age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
-        components = "x/y/z=waiting"
-        if state.x is not None and state.y is not None and state.z is not None:
-            components = f"x/y/z={state.x:.3f}/{state.y:.3f}/{state.z:.3f}"
-        vector_norm = f" norm={state.magnitude:.3f}" if state.magnitude is not None else ""
-        device = "" if device_id is None else f" device={device_id} ({device_source})"
-        text = f"{components}{vector_norm}, age={age_ms:.0f}ms{device}"
-        if label is not None:
-            label.setText(text)
-        if state.magnitude is not None:
-            legacy_plot = self.mag_sensor_plots.get(camera)
-            if legacy_plot is not None:
-                legacy_plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.magnitude))
-            if hasattr(self, "rm3100_norm_plots"):
-                plot = self.rm3100_norm_plots.get(camera)
-                if plot is not None:
-                    plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.magnitude))
-        self._refresh_pixhawk_sensor_health()
-        self._refresh_alignment_workflow_status()
-        self._refresh_alignment_magnetometer_ui()
-        self._refresh_alignment_overview()
-
-    def _update_gps_sensor(self, camera: str, state) -> None:
-        self.latest_gps_sensors.setdefault(camera, {})[state.sensor_slot] = state
-        self.gnss_monitor.update_sensor(camera, state.sensor_slot, state)
-        self._record_external_timeline_row(
-            camera,
-            "sensor_gps",
-            {
-                "namespace": state.namespace,
-                "topic": state.topic,
-                "sensor_slot": state.sensor_slot,
-                "mavlink_source_system": (
-                    "" if getattr(state, "mavlink_source_system", None) is None else state.mavlink_source_system
-                ),
-                "mavlink_source_component": (
-                    ""
-                    if getattr(state, "mavlink_source_component", None) is None
-                    else state.mavlink_source_component
-                ),
-                "mavlink_sequence": "" if getattr(state, "mavlink_sequence", None) is None else state.mavlink_sequence,
-                "mavlink_message_id": (
-                    "" if getattr(state, "mavlink_message_id", None) is None else state.mavlink_message_id
-                ),
-                "sample_app_timestamp_s": state.timestamp_s,
-                "sample_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
-                "px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
-                "px4_timestamp_sample_us": (
-                    "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
-                ),
-                "gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
-                "gps_timestamp_time_relative_us": (
-                    ""
-                    if state.gps_timestamp_time_relative_us is None
-                    else state.gps_timestamp_time_relative_us
-                ),
-                "time_source": "px4_sensor_gps",
-                "source_utc_method": "px4_sensor_gps_time_utc_usec",
-                "device_id": "" if state.device_id is None else state.device_id,
-                "fix_type": "" if state.fix_type is None else state.fix_type,
-                "satellites": "" if state.satellites_used is None else state.satellites_used,
-                "eph_m": self._fmt_record_float(state.eph_m, 6),
-                "epv_m": self._fmt_record_float(state.epv_m, 6),
-            },
-        )
-        label = self.gps_sensor_labels.get(camera, {}).get(state.sensor_slot)
-        text = self._gps_sensor_status_text(state, include_source=True, include_detail=True)
-        if label is not None:
-            label.setText(text)
-        if hasattr(self, "signal_gps_sensor_labels") and camera in self.signal_gps_sensor_labels:
-            age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
-            self._set_health_label(
-                self.signal_gps_sensor_labels[camera],
-                f"GPS sensor: {state.sensor_slot} | "
-                f"{self._gps_sensor_status_text(state, include_source=True, include_detail=False)}",
-                self._gps_fix_level(state.fix_type, age_ms=age_ms),
-            )
-        signal_series = f"{camera}_{state.sensor_slot}"
-        if state.satellites_used is not None and hasattr(self, "signal_gps_sats_plot"):
-            self.signal_gps_sats_plot.add_point(
-                TelemetryHistoryPoint(state.timestamp_s, signal_series, float(state.satellites_used))
-            )
-        if state.eph_m is not None and hasattr(self, "signal_gps_eph_plot"):
-            self.signal_gps_eph_plot.add_point(TelemetryHistoryPoint(state.timestamp_s, signal_series, state.eph_m))
-        if state.satellites_used is not None:
-            legacy_plot = self.gps_sensor_plots.get(camera)
-            if legacy_plot is not None:
-                legacy_plot.add_point(
-                    TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, float(state.satellites_used))
-                )
-            if hasattr(self, "f9p_sats_plots"):
-                plot = self.f9p_sats_plots.get(camera)
-                if plot is not None:
-                    plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, float(state.satellites_used)))
-        if state.eph_m is not None and hasattr(self, "f9p_quality_plots"):
-            plot = self.f9p_quality_plots.get(camera)
-            if plot is not None:
-                plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.eph_m))
-        self._refresh_pixhawk_sensor_health()
-        self._refresh_alignment_workflow_status()
-        self._refresh_baseline_alignment_ui()
-        self._refresh_gnss_base_tab()
-        self._refresh_f9p_compare_label(camera)
-
-    def _refresh_f9p_compare_label(self, camera: str) -> None:
-        label = self.f9p_compare_labels.get(camera)
-        if label is None:
-            return
-        now_s = time.monotonic()
-        gps_slots = self.latest_gps_sensors.get(camera, {})
-        gps_detected = sum(1 for slot in ("GPS1", "GPS2") if slot in gps_slots)
-        gps1 = gps_slots.get("GPS1")
-        gps2 = gps_slots.get("GPS2")
-        if gps1 is None or gps2 is None:
-            self._set_health_label(label, f"{gps_detected}/2 detected", "bad" if gps_detected else "idle")
-            return
-        details = []
-        if gps1.fix_type is not None and gps2.fix_type is not None:
-            details.append(f"fix={self._fix_type_label(gps1.fix_type)}/{self._fix_type_label(gps2.fix_type)}")
-        if gps1.satellites_used is not None and gps2.satellites_used is not None:
-            details.append(f"Δsats={abs(gps1.satellites_used - gps2.satellites_used)}")
-        if gps1.eph_m is not None and gps2.eph_m is not None:
-            details.append(f"Δeph={abs(gps1.eph_m - gps2.eph_m):.2f}m")
-        details.append(f"skew={abs(gps1.timestamp_s - gps2.timestamp_s) * 1000.0:.0f}ms")
-        details.append(f"src={self._telemetry_source_label(gps1.topic)} / {self._telemetry_source_label(gps2.topic)}")
-        poor_fix = (gps1.fix_type is not None and gps1.fix_type < 3) or (
-            gps2.fix_type is not None and gps2.fix_type < 3
-        )
-        not_rtk = (gps1.fix_type or 0) < 5 or (gps2.fix_type or 0) < 5
-        stale = now_s - gps1.timestamp_s > 1.0 or now_s - gps2.timestamp_s > 1.0
-        level = "bad" if poor_fix else "warn" if stale or not_rtk else "good"
-        self._set_health_label(label, f"2/2 detected · {' · '.join(details)}", level)
-
-    def _update_gnss_relative(self, camera: str, state) -> None:
-        self.latest_gnss_relative[camera] = state
-        heading_deg = None if state.heading_rad is None else math.degrees(state.heading_rad)
-        heading_accuracy_deg = None if state.heading_accuracy_rad is None else math.degrees(state.heading_accuracy_rad)
-        self._record_external_timeline_row(
-            camera,
-            "gnss_relative",
-            {
-                "namespace": state.namespace,
-                "topic": state.topic,
-                "sample_app_timestamp_s": state.timestamp_s,
-                "mavlink_source_system": (
-                    "" if getattr(state, "mavlink_source_system", None) is None else state.mavlink_source_system
-                ),
-                "mavlink_source_component": (
-                    ""
-                    if getattr(state, "mavlink_source_component", None) is None
-                    else state.mavlink_source_component
-                ),
-                "mavlink_sequence": "" if getattr(state, "mavlink_sequence", None) is None else state.mavlink_sequence,
-                "mavlink_message_id": (
-                    "" if getattr(state, "mavlink_message_id", None) is None else state.mavlink_message_id
-                ),
-                "sample_px4_timestamp_s": self._fmt_record_float(state.px4_timestamp_s, 6),
-                "px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
-                "px4_timestamp_sample_us": (
-                    "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
-                ),
-                "gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
-                "time_source": "px4_sensor_gnss_relative",
-                "source_utc_method": "px4_sensor_gnss_relative_time_utc_usec",
-                "device_id": "" if state.device_id is None else str(state.device_id),
-                "heading_deg": self._fmt_record_float(heading_deg, 6),
-                "heading_accuracy_deg": self._fmt_record_float(heading_accuracy_deg, 6),
-                "position_length_m": self._fmt_record_float(state.position_length_m, 6),
-                "accuracy_length_m": self._fmt_record_float(state.accuracy_length_m, 6),
-                "gnss_fix_ok": self._fmt_record_bool(state.gnss_fix_ok),
-                "differential_solution": self._fmt_record_bool(state.differential_solution),
-                "relative_position_valid": self._fmt_record_bool(state.relative_position_valid),
-                "carrier_solution_floating": self._fmt_record_bool(state.carrier_solution_floating),
-                "carrier_solution_fixed": self._fmt_record_bool(state.carrier_solution_fixed),
-                "moving_base_mode": self._fmt_record_bool(state.moving_base_mode),
-                "heading_valid": self._fmt_record_bool(state.heading_valid),
-                "age_s": self._fmt_record_float(max(0.0, time.monotonic() - state.timestamp_s), 6),
-            },
-        )
-        self._refresh_pixhawk_sensor_health()
-
-    def _freshest_sensor_slots(self, sensor_map: dict[str, dict[str, object]]) -> dict[str, object]:
-        merged: dict[str, object] = {}
-        for states in sensor_map.values():
-            for slot, state in states.items():
-                previous = merged.get(slot)
-                if previous is None or getattr(state, "timestamp_s", 0.0) > getattr(previous, "timestamp_s", 0.0):
-                    merged[slot] = state
-        return merged
-
-    def _set_health_label(self, label: QtWidgets.QLabel, text: str, level: str) -> None:
-        colors = {
-            "good": (SUCCESS_BG, SUCCESS, SUCCESS_TEXT),
-            "warn": (WARNING_BG, WARNING, WARNING_TEXT),
-            "bad": (ERROR_BG, ERROR, ERROR_TEXT),
-            "idle": (PANEL_ALT_BG, PANEL_BORDER, TEXT_MUTED),
-        }
-        background, border, color = colors.get(level, colors["idle"])
-        style = (
-            f"background: {background}; border: 1px solid {border}; "
-            f"border-radius: 0px; color: {color}; padding: 6px 8px; font-weight: 600;"
-        )
-        if label.text() == text and label.property("healthLevel") == level and label.styleSheet() == style:
-            return
-        label.setProperty("healthLevel", level)
-        label.setText(text)
-        label.setStyleSheet(style)
-
-    def _set_label_text_if_changed(self, label: QtWidgets.QLabel, text: str) -> None:
-        if label.text() != text:
-            label.setText(text)
-
-    def _telemetry_source_label(self, topic: object) -> str:
-        text = str(topic or "").strip()
-        if not text:
-            return "source=unknown"
-        if text.startswith("mavlink/"):
-            return f"MAVLink {text.removeprefix('mavlink/')}"
-        return f"MAVLink {text}"
-
-    def _gps_position_summary_text(self, gps: GpsPositionState, *, age_ms: float) -> str:
-        sats = f"sats={gps.satellites_used}" if gps.satellites_used is not None else "sats=waiting"
-        eph = f" | eph={gps.eph_m:.2f}m" if gps.eph_m is not None else ""
-        return f"{sats}{eph} | age={age_ms:.0f}ms"
-
-    def _gps_fix_level(self, fix_type: int | None, *, age_ms: float | None = None) -> str:
-        if fix_type is None or fix_type < 3:
-            return "bad"
-        if age_ms is not None and age_ms > 3000:
-            return "bad"
-        if age_ms is not None and age_ms > 1000:
-            return "warn"
-        if fix_type >= 6:
-            return "good"
-        return "warn"
-
-    def _gps_sensor_status_text(
-        self,
-        state: object,
-        *,
-        now_s: float | None = None,
-        include_source: bool,
-        include_detail: bool = True,
-    ) -> str:
-        if now_s is None:
-            now_s = time.monotonic()
-        age_ms = max(0.0, now_s - float(getattr(state, "timestamp_s", now_s))) * 1000.0
-        fix_value = getattr(state, "fix_type", None)
-        fix = self._fix_type_label(fix_value)
-        sats = (
-            f"sats={getattr(state, 'satellites_used')}"
-            if getattr(state, "satellites_used", None) is not None
-            else "sats=waiting"
-        )
-        eph = f" | eph={getattr(state, 'eph_m'):.2f}m" if getattr(state, "eph_m", None) is not None else ""
-        epv = ""
-        device = ""
-        px4_time = ""
-        if include_detail:
-            epv = f" | epv={getattr(state, 'epv_m'):.2f}m" if getattr(state, "epv_m", None) is not None else ""
-            device = f" | device={getattr(state, 'device_id')}" if getattr(state, "device_id", None) is not None else ""
-            px4_time = (
-                f" | px4_t={getattr(state, 'px4_timestamp_s'):.3f}s"
-                if getattr(state, "px4_timestamp_s", None) is not None
-                else ""
-            )
-        source = f" | {self._telemetry_source_label(getattr(state, 'topic', ''))}" if include_source else ""
-        return f"fix={fix} | {sats}{eph}{epv} | age={age_ms:.0f}ms{device}{px4_time}{source}"
-
-    def _vector_angle_deg(self, first, second) -> float | None:
-        if (
-            first.x is None
-            or first.y is None
-            or first.z is None
-            or second.x is None
-            or second.y is None
-            or second.z is None
-        ):
-            return None
-        first_norm = math.sqrt(first.x * first.x + first.y * first.y + first.z * first.z)
-        second_norm = math.sqrt(second.x * second.x + second.y * second.y + second.z * second.z)
-        if first_norm < 1e-9 or second_norm < 1e-9:
-            return None
-        dot = first.x * second.x + first.y * second.y + first.z * second.z
-        ratio = max(-1.0, min(1.0, dot / (first_norm * second_norm)))
-        return math.degrees(math.acos(ratio))
-
-    def _fix_type_label(self, fix_type: int | None) -> str:
-        return {
-            0: "no fix",
-            1: "dead reckoning",
-            2: "2D",
-            3: "3D",
-            4: "DGPS",
-            5: "RTK Float",
-            6: "RTK Fixed",
-            8: "Static",
-        }.get(fix_type, "waiting" if fix_type is None else str(fix_type))
-
-    def _refresh_pixhawk_sensor_health(self) -> None:
-        if not hasattr(self, "pixhawk_sensor_summary_labels"):
-            return
-        if not self.pixhawk_sensor_summary_labels.get("left") and not self.pixhawk_sensor_summary_labels.get("right"):
-            return
-        now_s = time.monotonic()
-        for camera, title in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
-            self._refresh_one_pixhawk_sensor_health(camera, title, now_s)
-
-    def _refresh_one_pixhawk_sensor_health(self, camera: str, title: str, now_s: float) -> None:
-        mag_slots = self.latest_mag_sensors.get(camera, {})
-        gps_slots = self.latest_gps_sensors.get(camera, {})
-        gnss_relative = self.latest_gnss_relative.get(camera)
-        rm_detected = sum(1 for slot in ("CAN1", "CAN2") if slot in mag_slots)
-        for slot, label in self.rm3100_slot_labels[camera].items():
-            state = mag_slots.get(slot)
-            if state is None:
-                self._set_health_label(
-                    label,
-                    "waiting",
-                    "idle",
-                )
-                continue
-            age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
-            components = "x/y/z=waiting"
-            if state.x is not None and state.y is not None and state.z is not None:
-                components = f"x/y/z={state.x:.3f}/{state.y:.3f}/{state.z:.3f}G"
-            magnitude = f" | norm={state.magnitude:.3f}G" if state.magnitude is not None else ""
-            temp = f" | temp={state.temperature_c:.1f}C" if state.temperature_c is not None else ""
-            errors = f" | errors={state.error_count}" if getattr(state, "error_count", None) is not None else ""
-            device = f" | device={state.device_id}" if state.device_id is not None else ""
-            level = "bad" if age_ms > 3000 else "warn" if age_ms > 1000 else "good"
-            self._set_health_label(label, f"{components}{magnitude}{temp}{errors} | age={age_ms:.0f}ms{device}", level)
-
-        can1 = mag_slots.get("CAN1")
-        can2 = mag_slots.get("CAN2")
-        rm_level = "bad"
-        rm_summary = f"Status: 대기 중 | {rm_detected}/2 detected"
-        if can1 is not None and can2 is not None:
-            can1_age = now_s - can1.timestamp_s
-            can2_age = now_s - can2.timestamp_s
-            delta_mag = self.magnetometer_monitor.can_difference(camera)
-            delta_display, delta_units = self.magnetometer_monitor.can_difference_display(camera)
-            angle = self._vector_angle_deg(can1, can2)
-            details = []
-            if delta_mag is not None:
-                details.append(
-                    f"Δnorm={delta_display:.3f}{delta_units}"
-                    if delta_display is not None
-                    else f"Δnorm={delta_mag:.3f}G"
-                )
-                self.rm3100_delta_plots[camera].add_point(TelemetryHistoryPoint(now_s, "Δnorm", delta_mag))
-            if angle is not None:
-                details.append(f"angle={angle:.1f}deg")
-                self.rm3100_delta_plots[camera].add_point(TelemetryHistoryPoint(now_s, "angle", angle))
-            details.append(f"skew={abs(can1_age - can2_age) * 1000.0:.0f}ms")
-            stale = can1_age > 1.0 or can2_age > 1.0
-            abnormal_delta = delta_mag is not None and delta_mag > 0.20
-            abnormal_angle = angle is not None and angle > 20.0
-            rm_level = "warn" if stale or abnormal_delta or abnormal_angle else "good"
-            status = "WARN" if rm_level == "warn" else "OK"
-            can1_text = self._mag_state_value_text(can1.magnitude, self._mag_state_value_units(can1))
-            can2_text = self._mag_state_value_text(can2.magnitude, self._mag_state_value_units(can2))
-            delta_text = "--" if delta_display is None else self._mag_state_value_text(delta_display, delta_units)
-            angle_text = "--" if angle is None else f"{angle:.1f}deg"
-            rm_summary = f"Status: {status} | CAN1 {can1_text} / CAN2 {can2_text} | Δ {delta_text}, {angle_text}"
-            self._set_health_label(self.rm3100_compare_labels[camera], rm_summary, rm_level)
-        else:
-            self._set_health_label(
-                self.rm3100_compare_labels[camera],
-                rm_summary,
-                "bad" if rm_detected else "idle",
-            )
-        self._set_health_label(
-            self.pixhawk_sensor_summary_labels[camera]["rm3100"],
-            f"{title}: {rm_summary}",
-            rm_level if rm_detected else "idle",
-        )
-
-        gps_detected = sum(1 for slot in ("GPS1", "GPS2") if slot in gps_slots)
-        for slot, label in self.f9p_slot_labels[camera].items():
-            state = gps_slots.get(slot)
-            if state is None:
-                self._set_health_label(
-                    label,
-                    "waiting",
-                    "idle",
-                )
-                continue
-            age_ms = max(0.0, now_s - state.timestamp_s) * 1000.0
-            poor_fix = state.fix_type is not None and state.fix_type < 3
-            level = "bad" if age_ms > 3000 or poor_fix else "warn" if age_ms > 1000 or (state.fix_type or 0) < 5 else "good"
-            self._set_health_label(label, self._gps_sensor_status_text(state, now_s=now_s, include_source=True), level)
-
-        gps1 = gps_slots.get("GPS1")
-        gps2 = gps_slots.get("GPS2")
-        f9p_level = "bad"
-        f9p_summary = f"{gps_detected}/2 detected"
-        if gps1 is not None and gps2 is not None:
-            details = []
-            if gps1.fix_type is not None and gps2.fix_type is not None:
-                details.append(f"fix={self._fix_type_label(gps1.fix_type)}/{self._fix_type_label(gps2.fix_type)}")
-            if gps1.satellites_used is not None and gps2.satellites_used is not None:
-                details.append(f"Δsats={abs(gps1.satellites_used - gps2.satellites_used)}")
-            if gps1.eph_m is not None and gps2.eph_m is not None:
-                details.append(f"Δeph={abs(gps1.eph_m - gps2.eph_m):.2f}m")
-            details.append(f"skew={abs(gps1.timestamp_s - gps2.timestamp_s) * 1000.0:.0f}ms")
-            details.append(f"src={self._telemetry_source_label(gps1.topic)} / {self._telemetry_source_label(gps2.topic)}")
-            poor_fix = (gps1.fix_type is not None and gps1.fix_type < 3) or (gps2.fix_type is not None and gps2.fix_type < 3)
-            not_rtk = (gps1.fix_type or 0) < 5 or (gps2.fix_type or 0) < 5
-            stale = now_s - gps1.timestamp_s > 1.0 or now_s - gps2.timestamp_s > 1.0
-            f9p_level = "bad" if poor_fix else "warn" if stale or not_rtk else "good"
-            f9p_summary = f"2/2 detected · {' · '.join(details)}"
-            self._set_health_label(self.f9p_compare_labels[camera], f9p_summary, f9p_level)
-        else:
-            self._set_health_label(
-                self.f9p_compare_labels[camera],
-                f9p_summary,
-                "bad" if gps_detected else "idle",
-            )
-        self._set_health_label(
-            self.pixhawk_sensor_summary_labels[camera]["f9p"],
-            f"{title}: {f9p_summary}",
-            f9p_level if gps_detected else "idle",
-        )
-        heading_text = "GNSS Heading: sensor_gnss_relative waiting"
-        heading_level = "idle"
-        if gnss_relative is not None:
-            age_ms = max(0.0, now_s - gnss_relative.timestamp_s) * 1000.0
-            heading_deg = None
-            if gnss_relative.heading_rad is not None:
-                heading_deg = math.degrees(gnss_relative.heading_rad)
-            accuracy_deg = None
-            if gnss_relative.heading_accuracy_rad is not None:
-                accuracy_deg = math.degrees(gnss_relative.heading_accuracy_rad)
-            heading_parts = [
-                f"heading={heading_deg:.2f}deg" if heading_deg is not None else "heading=waiting",
-                f"acc={accuracy_deg:.2f}deg" if accuracy_deg is not None else "acc=waiting",
-                f"fixed={gnss_relative.carrier_solution_fixed}",
-                f"moving_base={gnss_relative.moving_base_mode}",
-                f"relative_valid={gnss_relative.relative_position_valid}",
-                f"age={age_ms:.0f}ms",
-            ]
-            if gnss_relative.position_length_m is not None:
-                heading_parts.append(f"baseline={gnss_relative.position_length_m:.2f}m")
-            heading_level = (
-                "good"
-                if gnss_relative.heading_valid and gnss_relative.relative_position_valid and gnss_relative.carrier_solution_fixed
-                else "warn"
-                if gnss_relative.heading_valid or gnss_relative.relative_position_valid
-                else "bad"
-            )
-            if age_ms > 3000:
-                heading_level = "bad"
-            elif age_ms > 1000 and heading_level == "good":
-                heading_level = "warn"
-            heading_text = f"GNSS Heading: {' · '.join(heading_parts)}"
-        self._set_health_label(self.gnss_heading_labels[camera], heading_text, heading_level)
-        self._set_health_label(self.pixhawk_sensor_summary_labels[camera]["heading"], heading_text, heading_level)
-
-    def _update_relative_attitude_status(self) -> None:
-        left = self.latest_extrinsics.get("left")
-        right = self.latest_extrinsics.get("right")
-        axis_values = (
-            ("roll", None if left is None else left.roll_deg, None if right is None else right.roll_deg),
-            ("pitch", None if left is None else left.pitch_deg, None if right is None else right.pitch_deg),
-            ("yaw", None if left is None else left.yaw_deg, None if right is None else right.yaw_deg),
-        )
-        labels_by_axis = getattr(self, "attitude_compare_labels", {})
-        for axis, left_value, right_value in axis_values:
-            labels = labels_by_axis.get(axis)
-            if labels is None:
-                continue
-            left_label, right_label, delta_label = labels
-            left_label.setText("대기 중" if left_value is None else f"{left_value:.4f} deg")
-            right_label.setText("대기 중" if right_value is None else f"{right_value:.4f} deg")
-            if left_value is None or right_value is None:
-                self._set_health_label(delta_label, "대기 중", "idle")
-            else:
-                delta = angle_diff_deg(right_value, left_value) if axis == "yaw" else right_value - left_value
-                self._set_health_label(
-                    delta_label,
-                    f"Δ{axis.capitalize()} {delta:+.2f}°",
-                    self._attitude_delta_level(axis, delta),
-                )
-        if left is None and right is None:
-            self._refresh_alignment_workflow_status()
-            return
-        now_s = time.monotonic()
-        plots_by_axis = getattr(self, "attitude_plots", {})
-        for axis, left_value, right_value in axis_values:
-            point = AttitudeHistoryPoint(
-                timestamp_s=now_s,
-                left_deg=left_value,
-                right_deg=right_value,
-            )
-            self.attitude_history[axis].append(point)
-            plot = plots_by_axis.get(axis)
-            if plot is not None:
-                plot.add_point(point)
-        self._refresh_alignment_workflow_status()
-
-    def _attitude_delta_level(self, axis: str, delta_deg: float) -> str:
-        abs_delta = abs(delta_deg)
-        good_limit = 3.0 if axis == "yaw" else 1.0
-        bad_limit = 8.0 if axis == "yaw" else 3.0
-        if abs_delta <= good_limit:
-            return "good"
-        if abs_delta <= bad_limit:
-            return "warn"
-        return "bad"
 
     def _initial_status(self) -> None:
         self._start_interface_status_worker()
@@ -21920,7 +10866,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.interface_status_worker = None
 
     def _recover_retryable_recording_session(self) -> bool:
-        candidates = discover_retryable_sessions(APP_ROOT / "recordings")
+        candidates = discover_retryable_sessions(self.app_root / "recordings")
         if not candidates:
             return False
         try:
@@ -22029,48 +10975,176 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
 
 
-class WirisStereoDistanceGui(QtWidgets.QMainWindow):
-    def __init__(self, *, auto_start: bool = False, auto_start_pixhawk: bool = False) -> None:
-        super().__init__()
-        self.setWindowTitle(APP_WINDOW_TITLE)
-        self.setWindowFlags(
-            self.windowFlags()
-            | QtCore.Qt.WindowMinimizeButtonHint
-            | QtCore.Qt.WindowMaximizeButtonHint
-            | QtCore.Qt.WindowCloseButtonHint
-        )
-        self.resize(1280, 820)
-        self.panel = WirisStereoDistancePanel(auto_start=auto_start, auto_start_pixhawk=auto_start_pixhawk)
-        self.setCentralWidget(self.panel)
+def _camera_time_sync_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        method = getattr(panel._camera_time_sync_controller(), method_name)
+        return method(*args, **kwargs)
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        if not self.panel.shutdown_for_close():
-            event.ignore()
-            QtCore.QTimer.singleShot(250, self.close)
-            return
-        super().closeEvent(event)
+    delegated.__name__ = method_name
+    return delegated
 
 
-class IntegratedWirisPixhawkConsole(QtWidgets.QMainWindow):
-    def __init__(self, *, auto_start_wiris: bool = False, auto_start_pixhawk: bool = False) -> None:
-        super().__init__()
-        self.setWindowTitle(APP_WINDOW_TITLE)
-        self.setWindowFlags(
-            self.windowFlags()
-            | QtCore.Qt.WindowMinimizeButtonHint
-            | QtCore.Qt.WindowMaximizeButtonHint
-            | QtCore.Qt.WindowCloseButtonHint
-        )
-        self.resize(1500, 920)
-        self.panel = WirisStereoDistancePanel(auto_start=auto_start_wiris, auto_start_pixhawk=auto_start_pixhawk)
-        self.setCentralWidget(self.panel)
+for _camera_time_sync_method_name in CAMERA_TIME_SYNC_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _camera_time_sync_method_name,
+        _camera_time_sync_delegate(_camera_time_sync_method_name),
+    )
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override.
-        if not self.panel.shutdown_for_close():
-            event.ignore()
-            QtCore.QTimer.singleShot(250, self.close)
-            return
-        super().closeEvent(event)
+
+def _recording_controller_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_recording_controller", None)
+        owner = owner_factory() if callable(owner_factory) else RecordingController(panel)
+        method = getattr(owner, method_name)
+        return method(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _recording_controller_method_name in RECORDING_CONTROLLER_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _recording_controller_method_name,
+        _recording_controller_delegate(_recording_controller_method_name),
+    )
+
+
+def _calibration_workflow_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_calibration_workflow_controller", None)
+        owner = owner_factory() if callable(owner_factory) else CalibrationWorkflowController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _calibration_workflow_method_name in CALIBRATION_WORKFLOW_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _calibration_workflow_method_name,
+        _calibration_workflow_delegate(_calibration_workflow_method_name),
+    )
+
+
+def _device_runtime_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_device_runtime_controller", None)
+        owner = owner_factory() if callable(owner_factory) else DeviceRuntimeController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _device_runtime_method_name in DEVICE_RUNTIME_CONTROLLER_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _device_runtime_method_name,
+        _device_runtime_delegate(_device_runtime_method_name),
+    )
+
+
+def _gnss_runtime_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_gnss_runtime_controller", None)
+        owner = owner_factory() if callable(owner_factory) else GnssRuntimeController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _gnss_runtime_method_name in GNSS_RUNTIME_CONTROLLER_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _gnss_runtime_method_name,
+        _gnss_runtime_delegate(_gnss_runtime_method_name),
+    )
+
+
+def _measurement_view_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_measurement_view_controller", None)
+        owner = owner_factory() if callable(owner_factory) else MeasurementViewController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _measurement_view_method_name in MEASUREMENT_VIEW_CONTROLLER_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _measurement_view_method_name,
+        _measurement_view_delegate(_measurement_view_method_name),
+    )
+
+
+def _sensor_presentation_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_sensor_presentation_controller", None)
+        owner = owner_factory() if callable(owner_factory) else SensorPresentationController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _sensor_presentation_method_name in SENSOR_PRESENTATION_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _sensor_presentation_method_name,
+        _sensor_presentation_delegate(_sensor_presentation_method_name),
+    )
+
+
+def _camera_stream_lifecycle_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_camera_stream_lifecycle_controller", None)
+        owner = owner_factory() if callable(owner_factory) else CameraStreamLifecycleController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _camera_stream_lifecycle_method_name in CAMERA_STREAM_LIFECYCLE_METHODS:
+    setattr(
+        WirisStereoDistancePanel,
+        _camera_stream_lifecycle_method_name,
+        _camera_stream_lifecycle_delegate(_camera_stream_lifecycle_method_name),
+    )
+
+
+def _wiris_control_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_wiris_control_controller", None)
+        owner = owner_factory() if callable(owner_factory) else WirisControlController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _wiris_control_method_name in WIRIS_CONTROL_METHODS:
+    setattr(WirisStereoDistancePanel, _wiris_control_method_name, _wiris_control_delegate(_wiris_control_method_name))
+
+
+def _app_lifecycle_delegate(method_name):
+    def delegated(panel, *args, **kwargs):
+        owner_factory = getattr(panel, "_app_lifecycle_controller", None)
+        owner = owner_factory() if callable(owner_factory) else AppLifecycleController(panel)
+        return getattr(owner, method_name)(*args, **kwargs)
+
+    delegated.__name__ = method_name
+    return delegated
+
+
+for _app_lifecycle_method_name in APP_LIFECYCLE_METHODS:
+    setattr(WirisStereoDistancePanel, _app_lifecycle_method_name, _app_lifecycle_delegate(_app_lifecycle_method_name))
 
 
 def _configure_gl_surface_format() -> None:
@@ -22098,7 +11172,7 @@ def _configure_gl_surface_format() -> None:
 
 def _parse_ui_mode(argv: list[str]) -> tuple[str, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--ui", choices=("legacy", "workstation"), default="legacy")
+    parser.add_argument("--ui", choices=("workstation",), default="workstation")
     parsed, remaining = parser.parse_known_args(argv[1:])
     return str(parsed.ui), [argv[0], *remaining]
 
@@ -22109,7 +11183,7 @@ def main() -> int:
         faulthandler.register(signal.SIGUSR1)
     except Exception:
         pass
-    ui_mode, cleaned_argv = _parse_ui_mode(list(sys.argv))
+    _ui_mode, cleaned_argv = _parse_ui_mode(list(sys.argv))
     sys.argv[:] = cleaned_argv
     auto_start = "--start" in sys.argv
     if auto_start:
@@ -22122,22 +11196,14 @@ def main() -> int:
     maximized = "--maximized" in sys.argv
     if maximized:
         sys.argv.remove("--maximized")
-    wiris_only = "--wiris-only" in sys.argv
-    if wiris_only:
-        sys.argv.remove("--wiris-only")
     _configure_gl_surface_format()
     app = QtWidgets.QApplication(sys.argv)
-    if ui_mode == "workstation":
-        from workstation.main_window import WorkstationMainWindow
+    from workstation.main_window import WorkstationMainWindow
 
-        window = WorkstationMainWindow(
-            auto_start=auto_start,
-            auto_start_pixhawk=auto_start_pixhawk,
-        )
-    elif wiris_only:
-        window = WirisStereoDistanceGui(auto_start=auto_start, auto_start_pixhawk=auto_start_pixhawk)
-    else:
-        window = IntegratedWirisPixhawkConsole(auto_start_wiris=auto_start, auto_start_pixhawk=auto_start_pixhawk)
+    window = WorkstationMainWindow(
+        auto_start=auto_start,
+        auto_start_pixhawk=auto_start_pixhawk,
+    )
     if maximized:
         window.showMaximized()
     else:

@@ -20,6 +20,11 @@ OUTPUT_COLUMNS = (
     "left_v_px",
     "measured_disparity_px",
     "fused_disparity_px",
+    # Compatibility aliases consumed by deployed residual profiles. These are
+    # the same stereo-center RDF components as nominal_pose_* below.
+    "raw_right_m",
+    "raw_down_m",
+    "raw_forward_m",
     "nominal_pose_right_m",
     "nominal_pose_down_m",
     "nominal_pose_forward_m",
@@ -94,9 +99,13 @@ def convert_row(
     left_u = pick_float(row, ("left_cx", "left_cx_px", "left_u_px"))
     left_v = pick_float(row, ("left_cy", "left_cy_px", "left_v_px"))
     disparity = pick_float(row, ("raw_disparity_px", "disparity_px", "bbox_adjustment_raw_disparity_px"))
-    nominal_forward = pick_float(row, ("nominal_pose_forward_m",))
-    nominal_right = pick_float(row, ("nominal_pose_right_m",))
-    nominal_down = pick_float(row, ("nominal_pose_down_m",))
+    # `nominal_pose_*` is canonical. `raw_*` remains an input-only alias for
+    # recordings made before the nominal/observation schema split. Both are
+    # public FRD fields; the output assignment below is the explicit FRD→RDF
+    # component reorder and does not change frame origin.
+    nominal_forward = pick_float(row, ("nominal_pose_forward_m", "raw_forward_m"))
+    nominal_right = pick_float(row, ("nominal_pose_right_m", "raw_right_m"))
+    nominal_down = pick_float(row, ("nominal_pose_down_m", "raw_down_m"))
     corrected_forward = pick_float(row, ("corrected_forward_m",))
     corrected_right = pick_float(row, ("corrected_right_m",))
     corrected_down = pick_float(row, ("corrected_down_m",))
@@ -136,6 +145,9 @@ def convert_row(
             "measured_disparity_px": disparity,
             "fused_disparity_px": disparity,
             # Source telemetry field names are public FRD; output names are explicit RDF components.
+            "raw_right_m": nominal_right,
+            "raw_down_m": nominal_down,
+            "raw_forward_m": nominal_forward,
             "nominal_pose_right_m": nominal_right,
             "nominal_pose_down_m": nominal_down,
             "nominal_pose_forward_m": nominal_forward,

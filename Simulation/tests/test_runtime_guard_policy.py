@@ -375,7 +375,7 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         node.disparity_residual_feature_selector_window = deque(maxlen=1)
         node.lock = type("NullLock", (), {"__enter__": lambda self: None, "__exit__": lambda self, *args: None})()
         node.detections_pub = FakePublisher()
-        node.estimated_position_pub = FakePublisher()
+        node.nominal_pose_plot_pub = FakePublisher()
         node.corrected_position_pub = FakePublisher()
         node.bbox_adjustment_pub = FakePublisher()
         node.profile_status_pub = FakePublisher()
@@ -396,8 +396,8 @@ class RuntimeGuardPolicyTests(unittest.TestCase):
         StereoDistanceNode._external_detections_cb(node, msg)
 
         self.assertEqual(len(node.detections_pub.messages), 1)
-        self.assertEqual(len(node.estimated_position_pub.messages), 1)
-        estimated = node.estimated_position_pub.messages[-1].data
+        self.assertEqual(len(node.nominal_pose_plot_pub.messages), 1)
+        estimated = node.nominal_pose_plot_pub.messages[-1].data
         self.assertAlmostEqual(estimated[0], 1000.0, places=3)
         self.assertAlmostEqual(estimated[1], 7.0, places=3)
         self.assertAlmostEqual(estimated[2], 4.0, places=3)

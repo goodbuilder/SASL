@@ -11,78 +11,92 @@ Navigation represents system structure, engineering context, and major tasks. It
 
 StereoWIRIS
 - Overview
+- Protocol
+- Pre-run Calibration
 - Devices
   - Cameras
-  - Left Camera
-  - Right Camera
-  - Stereo Pair
-  - Time / Sync
   - Pixhawk
-    - Pixhawk 1
-  - Pixhawk 2
-  - GNSS / RTK
-- Processing
-  - Detection
-  - Measurement
-  - Synchronization
-  - Alignment
-- Tasks
-  - Calibration
-  - Recording
-  - Playback
-  - Export
+  - Base GNSS
+  - Time / Sync
+- Alignment
+- Measurement
+- Recording / Sessions
+- Advanced
+- Settings
 - Diagnostics
   - System
   - Camera
   - Pixhawk / MAVLink
   - GNSS
+  - Logs
   - Measurement
   - Performance
 
 This hierarchy is now the logical Workstation context tree. It does not own device,
-measurement, calibration, recording, or export state; each selection only changes the
-workspace/Inspector context.
+measurement, calibration, recording, review, or export state; each selection only changes
+the workspace/Inspector context. Cameras and Pixhawk are paired contexts; their Left/Right
+or P1/P2 detail is shown inside the workspace and Inspector rather than as navigation
+children. Detection is part of Cameras, synchronization is part of Time / Sync, and
+Review/Files are part of Recording / Sessions.
 
 ## 3. Selection Semantics
 
 One active selection determines Workspace and Inspector context. Selection must never stop recording, disconnect a device, reset calibration, or discard settings.
 
-## 4. Device Nodes
+## 4. Protocol Entry
+
+Protocol is the only navigation item that presents the numbered field sequence. It links
+to the Cameras, Pixhawk, Base GNSS, time, measurement, alignment, calibration, and
+recording contexts. Steps 1 and 4 provide multiple device shortcuts where one page cannot
+show all required connection or fix-number evidence.
+QGC Pixhawk calibration remains an external prerequisite; selecting Protocol never starts
+hardware actions.
+
+## 5. Device Nodes
 
 Disconnected hardware remains selectable so configuration can still be inspected. Stable logical roles should not disappear based on connectivity.
 
-## 5. Navigation vs Local Tabs
+## 6. Navigation vs Local Tabs
 
 Navigation handles system-level context. Local tabs switch views within that context.
 
-## 6. Diagnostics Exception
+## 7. Diagnostics Exception
 
 Selecting Diagnostics may focus/expand the bottom dock while preserving current Workspace.
 
-## 7. Global Commands
+## 8. Global Commands
 
 Availability depends on runtime state, not navigation location.
 
-## 8. Logical vs Physical Identity
+## 9. Logical vs Physical Identity
 
-Navigation primarily shows logical role (Left Camera, Pixhawk 1). Physical address/serial/device path belongs in Inspector/Diagnostics.
+Navigation shows paired logical contexts (Cameras, Pixhawk). Physical side, address, serial,
+and device path belong in the paired workspace or Inspector/Diagnostics.
 
-## 9. State Decoration
+## 10. State Decoration
 
 Compact secondary decoration is allowed but must not replace textual meaning. Detailed state belongs elsewhere.
 
-## 10. Keyboard / Density
+## 11. Keyboard / Density
 
 Use native QTreeView keyboard behavior. Recommended row height 22–26 px. Target depth approximately 3–4 meaningful levels.
 
-## 11. Phase 1 Minimum
+## 12. Phase 1 Minimum
 
-Overview; Devices/Cameras/Time/Pixhawk/GNSS; Processing/Detection/Measurement; Tasks/Calibration/Recording; Diagnostics.
+Overview; Protocol; Pre-run Calibration; Devices/Cameras/Pixhawk/GNSS/Time;
+Alignment; Measurement; Recording/Sessions; Diagnostics.
 
-## 12. Anti-Patterns
+## 13. Compatibility IDs
+
+Old saved or external context IDs remain accepted as aliases: camera Left/Right/Stereo
+resolve to Cameras, Pixhawk P1/P2 resolve to Pixhawk, Detection resolves to Cameras,
+Synchronization resolves to Time / Sync, and Review/Files resolve to Recording / Sessions.
+They are not rendered as separate navigation nodes.
+
+## 14. Anti-Patterns
 
 Do not execute on selection, hide disconnected nodes, embed primary commands in tree rows, create nodes for every parameter, duplicate local tabs, expose raw module names, or build deeply nested hierarchy without engineering meaning.
 
-## 13. Summary
+## 15. Summary
 
 > Navigation changes context. Commands change the system.

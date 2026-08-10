@@ -18,7 +18,7 @@ def test_operator_view_consumes_only_the_canonical_px4_msgs_overlay() -> None:
     assert 'source "$PX4_MSGS_PACKAGE_SETUP"' in source
     assert "86d8239e962f6939e05c3737784f60c02fa884db" in source
     assert "PX4_MSGS_OVERLAY_MANIFEST" in source
-    assert '--packages-select stereo_ground_sim stereo_ground_sim_overlay' in source
+    assert '--packages-select simulation_interfaces stereo_ground_sim stereo_ground_sim_overlay' in source
     assert '--packages-select px4_msgs stereo_ground_sim' not in source
     assert '"$ROOT_DIR/px4_msgs"' not in source
 

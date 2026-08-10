@@ -60,7 +60,7 @@ def test_load_settings_defaults_when_missing(tmp_path: Path) -> None:
     assert settings.gnss_base_serial_port == "/dev/ttyACM0"
     assert settings.gnss_base_baud == 460800
     assert settings.gnss_base_survey_in_min_duration_s == 300
-    assert settings.gnss_base_survey_in_accuracy_m == 1.0
+    assert settings.gnss_base_survey_in_accuracy_m == 0.5
     assert settings.gnss_base_rtcm_injection_target == "both"
     assert settings.clock_ftp_user == "anonymous"
     assert settings.clock_ftp_port == 21

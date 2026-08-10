@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 from PyQt5 import QtCore
 
@@ -42,6 +43,21 @@ class StatusModel(QtCore.QObject):
     def __init__(self, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self._records: dict[str, RuntimeStatus] = {}
+        self._batch_depth = 0
+        self._batch_changed = False
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        """Coalesce multiple status writes into one presentation signal."""
+
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0 and self._batch_changed:
+                self._batch_changed = False
+                self.changed.emit(self.snapshot())
 
     def set_status(
         self,
@@ -93,7 +109,10 @@ class StatusModel(QtCore.QObject):
         )
         if not same_semantics:
             self._records[record.key] = record
-            self.changed.emit(self.snapshot())
+            if self._batch_depth:
+                self._batch_changed = True
+            else:
+                self.changed.emit(self.snapshot())
             return record
         return previous
 
@@ -130,6 +149,8 @@ def _sample_age(samples: object, now_s: float) -> float | None:
 class BackendStatusAdapter(QtCore.QObject):
     """Derive status from backend evidence at a bounded polling cadence."""
 
+    polled = QtCore.pyqtSignal(object)
+
     def __init__(self, backend: object, parent: QtCore.QObject | None = None) -> None:
         super().__init__(parent)
         self.backend = backend
@@ -137,7 +158,6 @@ class BackendStatusAdapter(QtCore.QObject):
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(250)
         self.timer.timeout.connect(self.refresh)
-        self._last_snapshot: dict[str, RuntimeStatus] = {}
 
     def start(self) -> None:
         self.refresh()
@@ -149,16 +169,19 @@ class BackendStatusAdapter(QtCore.QObject):
     def refresh(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         now_s = time.monotonic()
-        self._refresh_camera(panel, "left", "CAM L", now_s)
-        self._refresh_camera(panel, "right", "CAM R", now_s)
-        self._refresh_pixhawk(panel, "left", "P1", now_s)
-        self._refresh_pixhawk(panel, "right", "P2", now_s)
-        self._refresh_gnss(panel, now_s)
-        self._refresh_detection(panel, now_s)
-        self._refresh_synchronization(panel, now_s)
-        self._refresh_measurement(panel, now_s)
-        self._refresh_recording(panel, now_s)
-        self._refresh_fps(panel, now_s)
+        with self.model.batch():
+            self._refresh_camera(panel, "left", "CAM L", now_s)
+            self._refresh_camera(panel, "right", "CAM R", now_s)
+            self._refresh_pixhawk(panel, "left", "P1", now_s)
+            self._refresh_pixhawk(panel, "right", "P2", now_s)
+            self._refresh_base_gnss(panel, now_s)
+            self._refresh_gnss(panel, now_s)
+            self._refresh_detection(panel, now_s)
+            self._refresh_synchronization(panel, now_s)
+            self._refresh_measurement(panel, now_s)
+            self._refresh_recording(panel, now_s)
+            self._refresh_fps(panel, now_s)
+        self.polled.emit(self.model.snapshot())
 
     def _refresh_camera(self, panel: object, side: str, label: str, now_s: float) -> None:
         panes = getattr(panel, f"{side}_pane", None)
@@ -166,10 +189,12 @@ class BackendStatusAdapter(QtCore.QObject):
         connected = bool(getattr(panel, "camera_connected", False))
         frame_times = getattr(panel, "camera_frame_times", {}) or {}
         age_s = _sample_age(frame_times.get(side, []), now_s)
-        if age_s is not None and age_s < 2.0:
-            state, severity, detail = "LIVE", StatusSeverity.OK, f"frame age {age_s:.2f} s"
-        elif "error" in pane_state.lower() or "실패" in pane_state or "오류" in pane_state:
+        if "error" in pane_state.lower() or "실패" in pane_state or "오류" in pane_state:
             state, severity, detail = "ERROR", StatusSeverity.BAD, pane_state
+        elif age_s is not None and age_s < 2.0:
+            state, severity, detail = "LIVE", StatusSeverity.OK, f"frame age {age_s:.2f} s"
+        elif age_s is not None:
+            state, severity, detail = "STALE", StatusSeverity.WARN, f"last frame age {age_s:.2f} s"
         elif connected or pane_state not in {"중지됨", ""}:
             state, severity, detail = "STARTING", StatusSeverity.WARN, pane_state or "first frame 대기"
         else:
@@ -186,6 +211,75 @@ class BackendStatusAdapter(QtCore.QObject):
             observed_monotonic_s=now_s,
         )
 
+    def _refresh_base_gnss(self, panel: object, now_s: float) -> None:
+        """Project only the correction-source/Base receiver lifecycle.
+
+        This status deliberately excludes P1/P2 rover fixes and their NED/FRD
+        baseline. Those remain part of the aggregate ``gnss`` readiness and
+        Pixhawk/Alignment evidence.
+        """
+
+        manager = getattr(panel, "gnss_operation_manager", None)
+        state = str(getattr(getattr(manager, "state", None), "value", "DISCONNECTED") or "DISCONNECTED").upper()
+        config = getattr(manager, "config", None)
+        mode = str(getattr(getattr(config, "operation_mode", None), "value", "UNKNOWN") or "UNKNOWN")
+        serial_connected = bool(getattr(panel, "gnss_base_serial_connected", False))
+        ntrip_connected = bool(getattr(panel, "gnss_network_connected", False))
+        stats = getattr(panel, "gnss_base_rtcm_stats", {}) or {}
+        stats = stats if isinstance(stats, Mapping) else {}
+        last_frame_s = stats.get("last_frame_s")
+        try:
+            frame_age_s = None if last_frame_s is None else max(0.0, now_s - float(last_frame_s))
+        except (TypeError, ValueError):
+            frame_age_s = None
+        frames = int(stats.get("frames") or 0)
+        maximum_age_s = float(
+            getattr(getattr(config, "readiness", None), "maximum_correction_age_s", 2.0) or 2.0
+        )
+        survey = getattr(panel, "latest_gnss_base_survey_in", None)
+        survey = survey if isinstance(survey, Mapping) else {}
+
+        if state in {"FAULT", "INVALIDATED", "ERROR", "FAILED"}:
+            display_state, severity = "ERROR", StatusSeverity.BAD
+        elif frame_age_s is not None and frame_age_s <= maximum_age_s:
+            display_state, severity = "RTCM ACTIVE", StatusSeverity.OK
+        elif state == "BASE_SURVEYING" or survey.get("active"):
+            display_state, severity = "SURVEYING", StatusSeverity.WARN
+        elif ntrip_connected:
+            display_state, severity = "NTRIP ACTIVE", StatusSeverity.WARN
+        elif serial_connected:
+            display_state, severity = "CONNECTED", StatusSeverity.WARN
+        else:
+            display_state, severity = "DISCONNECTED", StatusSeverity.UNKNOWN
+
+        detail_parts = [
+            f"mode={mode}",
+            f"operation={state}",
+            f"serial={'connected' if serial_connected else 'disconnected'}",
+            f"NTRIP={'connected' if ntrip_connected else 'disconnected'}",
+            f"RTCM frames={frames}",
+        ]
+        if frame_age_s is not None:
+            detail_parts.append(f"RTCM age={frame_age_s:.2f}s")
+        if survey:
+            detail_parts.append(
+                "Survey-in="
+                f"{'valid' if survey.get('valid') else 'active' if survey.get('active') else 'not-running'}"
+                f"({survey.get('duration_s', 0)}s, {survey.get('mean_accuracy_m', '--')}m, "
+                f"obs={survey.get('observations', '--')})"
+            )
+        self.model.set_status(
+            "gnss.base",
+            "BASE",
+            display_state,
+            severity,
+            detail="; ".join(detail_parts),
+            source="GnssOperationManager + Base serial/NTRIP/RTCM/NAV-SVIN evidence",
+            age_s=frame_age_s,
+            clock="app_receive_monotonic; Base WGS84/Survey ECEF contracts remain separate",
+            observed_monotonic_s=now_s,
+        )
+
     def _refresh_pixhawk(self, panel: object, side: str, label: str, now_s: float) -> None:
         mavlink_sides = set(_safe_call(panel, "_mavlink_open_sides", default=()) or ())
         attitude_times = getattr(panel, "pixhawk_attitude_times", {}) or {}
@@ -193,6 +287,9 @@ class BackendStatusAdapter(QtCore.QObject):
         transport = "MAVLink" if side in mavlink_sides else "telemetry"
         if age_s is not None and float(age_s) < 2.0:
             state, severity = "LIVE", StatusSeverity.OK
+            detail = f"{transport} attitude age {float(age_s):.2f} s"
+        elif age_s is not None:
+            state, severity = "STALE", StatusSeverity.WARN
             detail = f"{transport} attitude age {float(age_s):.2f} s"
         elif side in mavlink_sides:
             state, severity = "CONNECTED", StatusSeverity.WARN
@@ -396,7 +493,7 @@ class BackendStatusAdapter(QtCore.QObject):
         )
 
     def _refresh_measurement(self, panel: object, now_s: float) -> None:
-        quality = str(getattr(panel, "last_distance_quality", "BAD") or "BAD").upper()
+        quality = str(getattr(panel, "last_distance_quality", "WARNING") or "WARNING").upper()
         detail = str(getattr(panel, "last_distance_status", "measurement evidence 대기") or "")
         if "대기" in detail or "WAIT" in detail.upper():
             state, severity = "WAITING", StatusSeverity.WARN
@@ -404,8 +501,19 @@ class BackendStatusAdapter(QtCore.QObject):
             state, severity = "VALID", StatusSeverity.OK
         elif quality in {"DEGRADED", "WARN", "WARNING"}:
             state, severity = "DEGRADED", StatusSeverity.WARN
+        elif quality in {"ERROR", "FAILED"}:
+            state, severity = "ERROR", StatusSeverity.BAD
         else:
             state, severity = "REJECTED", StatusSeverity.BAD
+        measurement_age_s = None
+        history = getattr(panel, "distance_history", None)
+        try:
+            if history:
+                measurement_age_s = max(0.0, now_s - float(list(history)[-1].timestamp_s))
+        except (TypeError, ValueError, IndexError, AttributeError):
+            measurement_age_s = None
+        if state == "VALID" and measurement_age_s is not None and measurement_age_s >= 2.0:
+            state, severity = "STALE", StatusSeverity.WARN
         self.model.set_status(
             "measurement",
             "MEAS",
@@ -413,6 +521,7 @@ class BackendStatusAdapter(QtCore.QObject):
             severity,
             detail=detail,
             source="MeasurementAttempt/controller result",
+            age_s=measurement_age_s,
             clock="attempt selected timestamps",
             observed_monotonic_s=now_s,
         )

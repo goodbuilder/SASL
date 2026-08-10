@@ -16,7 +16,7 @@ from pose_simulation.input_types import (
 )
 from pose_simulation.time_alignment import align_dynamic_streams, align_static_snapshot, sample_pose
 
-from test_input_adapters import _camera_payload, _gt_message
+from .test_input_adapters import _camera_payload, _gt_message
 
 
 def _gt(stamp_ns: int):

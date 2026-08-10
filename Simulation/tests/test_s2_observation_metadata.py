@@ -45,7 +45,7 @@ def test_actual_observation_metadata_dict_is_isolated_by_mode(mode, expected):
     assert metadata["measurement_gt_independent"] is expected["measurement_gt_independent"]
     assert metadata["reference_source"] == expected["reference_source"]
     assert metadata["projection_camera_pose_source"] == expected["projection_camera_pose_source"]
-    assert metadata["raw_interpretation_pose_source"] == "nominal"
+    assert metadata["raw_interpretation_pose_source"] == "nominal_pose"
     assert metadata["corrected_interpretation_pose_source"] == "gazebo_observed_optical"
     assert metadata["correction_source"] == "gazebo_observed_optical_pose"
     assert metadata["evaluation_gt_source"] == "gazebo_reference_link_world_pose"

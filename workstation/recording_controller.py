@@ -1,0 +1,2342 @@
+"""Workstation recording session controller.
+
+Recording rows retain their declared camera/PX4/GNSS coordinate and timestamp
+contracts. This controller owns session state transitions and presentation;
+persistence I/O runs in workstation.session_workers.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import time
+import uuid
+from collections import deque
+from collections.abc import Sequence
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from pathlib import Path
+from statistics import median
+
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+from workstation_core.attitude_geometry import (quaternion_conjugate, quaternion_multiply, relative_attitude, relative_rotation_angle_deg)
+from workstation_core.measurement_attempt import AttitudeSnapshot, GpsSnapshot, MeasurementAttempt
+from workstation_core.coordinate_contract import (
+    BODY_FRAME,
+    CAMERA_FRAME,
+    CAMERA_MOUNT_PROFILE,
+    LEGACY_XYZ_ALIAS_CONTRACT,
+    MEASUREMENT_AXIS_CONTRACT,
+    MEASUREMENT_FRAME,
+    PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+    WORLD_FRAME,
+)
+from workstation_core.measurement_widgets import DistanceHistoryPoint
+from workstation_core.recording_session import (
+    SavedSessionFiles,
+    SpoolRows,
+    compact_distance_measurement_rows,
+    session_id_now,
+    session_sheet_previews,
+    write_recovery_metadata,
+)
+from workstation_core.rtk_geometry import ned_delta_m, project_ned_baseline_to_p1_body_frd
+from workstation_core.runtime_camera_status import infer_runtime_camera_timestamp_reference
+from workstation_core.sync import (
+    ATTITUDE_STALE_AGE_S,
+    ATTITUDE_STALE_PAIR_DELTA_S,
+    ATTITUDE_TIMING_POLICY,
+    ATTITUDE_VERY_STALE_AGE_S,
+    ATTITUDE_VERY_STALE_PAIR_DELTA_S,
+    classify_attitude_timing,
+)
+from workstation.device_runtime_workers import PixhawkParameterWorker
+from workstation.evidence import mavlink_link_provenance
+from workstation.session_workers import SessionSaveWorker
+
+RECORDING_PREVIEW_LIMIT = 256
+RECORDING_KEY_CACHE_LIMIT = 1024
+
+
+def new_measurement_attempt_generation_id(session_id: str = "") -> str:
+    return f"{session_id or 'runtime'}-{uuid.uuid4().hex}"
+
+
+RECORDING_CONTROLLER_METHODS = [
+    "_refresh_recording_status_label",
+    "_recording_table_value",
+    "_recording_preview_rows",
+    "_recording_sheet_names",
+    "_recording_sheet_kind",
+    "_active_recording_sheet_name",
+    "_append_recording_table_row",
+    "_refresh_active_recording_sheet",
+    "_fill_recording_sheet",
+    "_refresh_recording_table",
+    "_refresh_recording_sample_detail",
+    "toggle_session_recording",
+    "_start_session_recording",
+    "_stop_session_recording",
+    "toggle_distance_recording",
+    "toggle_video_recording"
+]
+
+
+class RecordingController:
+    def __init__(self, panel):
+        self.panel = panel
+
+    def _refresh_recording_status_label(self) -> None:
+        if self.panel._session_save_thread is not None:
+            self.panel.recording_status_label.setText(
+                f"세션 기록: 저장 중, session={self.panel.recording_session_id or 'none'}"
+            )
+            return
+        state = "진행 중" if self.panel._session_recording_active() else "중지"
+        session = f", session={self.panel.recording_session_id}" if self.panel.recording_session_id else ""
+        self.panel.recording_status_label.setText(
+            "세션 기록: "
+            f"{state}, 매칭 프레임쌍={len(self.panel.distance_recording_rows)}{session}"
+        )
+
+    def _recording_table_value(self, row: dict[str, object], field: str) -> str:
+        value = row.get(field, "")
+        if value is None:
+            return ""
+        return str(value)
+
+    def _recording_preview_rows(self) -> list[dict[str, object]]:
+        rows = self.panel.distance_recording_rows
+        if isinstance(rows, SpoolRows):
+            return rows.preview_rows
+        return list(rows[-RECORDING_PREVIEW_LIMIT:])
+
+    def _recording_sheet_names(self) -> tuple[str, ...]:
+        """Workbook sheet names, in write order, without needing session rows."""
+
+        return tuple(sheet.name for sheet in session_sheet_previews({}, []))
+
+    def _recording_sheet_kind(self, sheet_name: str) -> str | None:
+        return next(
+            (sheet.kind for sheet in session_sheet_previews({}, []) if sheet.name == sheet_name),
+            None,
+        )
+
+    def _active_recording_sheet_name(self) -> str | None:
+        if not hasattr(self.panel, "recording_sheet_tabs"):
+            return None
+        index = self.panel.recording_sheet_tabs.currentIndex()
+        if index < 0:
+            return None
+        return self.panel.recording_sheet_tabs.tabText(index)
+
+    def _append_recording_table_row(self, _row: dict[str, object]) -> None:
+        """Refresh the visible sheet after one accepted pair was recorded.
+
+        Sheet columns are projected from every recorded row, so a new sample
+        can widen them; rebuilding the visible sheet is simpler than patching
+        one row into each of the seven sheets.
+        """
+
+        self.panel._refresh_active_recording_sheet(scroll_to_bottom=True)
+
+    def _refresh_active_recording_sheet(self, *, scroll_to_bottom: bool = False) -> None:
+        sheet_name = self.panel._active_recording_sheet_name()
+        if sheet_name is None:
+            return
+        table = self.panel.recording_sheet_tables.get(sheet_name)
+        if table is None:
+            return
+        rows = self.panel._recording_preview_rows()
+        # Only the key/value sheets read metadata, and building it runs the
+        # clock-sync and camera-timing probes — skip it on the sample sheets,
+        # which are refreshed once per recorded pair.
+        needs_metadata = sheet_name in {"Summary", "CalibrationStatic"}
+        metadata = self.panel._recording_session_metadata() if needs_metadata else {}
+        preview = next(
+            (sheet for sheet in session_sheet_previews(metadata, rows) if sheet.name == sheet_name),
+            None,
+        )
+        if preview is None:
+            return
+        table.blockSignals(True)
+        try:
+            if preview.kind == "key_value":
+                self.panel._fill_recording_sheet(table, ("key", "value"), [
+                    (str(key), "" if value is None else str(value)) for key, value in preview.entries
+                ])
+            else:
+                display_rows = (
+                    compact_distance_measurement_rows(
+                        rows,
+                        {
+                            "session_started_unix_ns": self.panel.recording_session_started_unix_ns,
+                            "session_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
+                        },
+                    )
+                    if sheet_name == "DistanceMeasurements"
+                    else []
+                )
+                self.panel._fill_recording_sheet(
+                    table,
+                    preview.columns,
+                    [
+                        tuple(self.panel._recording_table_value(row, field) for field in preview.columns)
+                        for row in display_rows
+                    ],
+                )
+        finally:
+            table.blockSignals(False)
+        if scroll_to_bottom and table.rowCount():
+            table.scrollToBottom()
+            table.selectRow(table.rowCount() - 1)
+        self.panel._refresh_recording_sample_detail()
+
+    def _fill_recording_sheet(
+        self,
+        table: QtWidgets.QTableWidget,
+        headers: Sequence[str],
+        rows: Sequence[Sequence[str]],
+    ) -> None:
+        normalized_headers = tuple(str(header) for header in headers)
+        current_headers = tuple(
+            table.horizontalHeaderItem(index).text()
+            if table.horizontalHeaderItem(index) is not None
+            else ""
+            for index in range(table.columnCount())
+        )
+        if table.columnCount() != len(normalized_headers):
+            table.setColumnCount(len(normalized_headers))
+        if current_headers != normalized_headers:
+            table.setHorizontalHeaderLabels(list(normalized_headers))
+        if table.rowCount() != len(rows):
+            table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column_index, value in enumerate(values):
+                text = str(value)
+                item = table.item(row_index, column_index)
+                if item is None:
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable)
+                    table.setItem(row_index, column_index, item)
+                elif item.text() != text:
+                    item.setText(text)
+
+    def _refresh_recording_table(self) -> None:
+        if not hasattr(self.panel, "recording_sheet_tabs"):
+            return
+        self.panel._refresh_active_recording_sheet()
+        if not self.panel.distance_recording_rows:
+            self.panel.recording_sample_detail.clear()
+
+    def _refresh_recording_sample_detail(self) -> None:
+        if not hasattr(self.panel, "recording_sheet_tabs"):
+            return
+        sheet_name = self.panel._active_recording_sheet_name()
+        table = self.panel.recording_sheet_tables.get(sheet_name) if sheet_name else None
+        if table is None:
+            return
+        if sheet_name is not None and self.panel._recording_sheet_kind(sheet_name) == "key_value":
+            self.panel.recording_sample_detail.clear()
+            return
+        selected_rows = table.selectionModel().selectedRows()
+        preview_rows = self.panel._recording_preview_rows()
+        if not selected_rows:
+            self.panel.recording_sample_detail.clear()
+            return
+        row_index = selected_rows[0].row()
+        if row_index < 0 or row_index >= len(preview_rows):
+            self.panel.recording_sample_detail.clear()
+            return
+        row = preview_rows[row_index]
+        lines = [f"{key}: {value}" for key, value in row.items()]
+        self.panel.recording_sample_detail.setPlainText("\n".join(lines))
+
+    def toggle_session_recording(self) -> bool | None:
+        if self.panel._session_recording_active():
+            self.panel._stop_session_recording()
+            return None
+        return self.panel._start_session_recording()
+
+    def _start_session_recording(self) -> bool | None:
+        if self.panel._session_save_thread is not None:
+            self.panel.recording_status_label.setText("세션 기록: 이전 세션 저장 완료 대기 중")
+            return False
+        if self.panel.wiris_time_sync_thread is not None or self.panel.wiris_gdti_thread is not None:
+            status_text = "세션 기록: WIRIS 시간 동기화 및 스트림 재연결 완료 대기 중"
+            self.panel.recording_status_label.setText(status_text)
+            self.panel._log(f"[저장] {status_text}")
+            return False
+        if self.panel.pixhawk_connection_thread is not None or self.panel.pixhawk_usb_bootstrap_thread is not None:
+            status_text = "세션 기록: Pixhawk 연결/부트스트랩 완료 대기 중"
+            self.panel.recording_status_label.setText(status_text)
+            self.panel._log(f"[저장] {status_text}")
+            return False
+        self.panel.recording_session_id = session_id_now()
+        self.panel._session_save_finalized = False
+        self.panel._measurement_attempt_generation_id = new_measurement_attempt_generation_id(
+            self.panel.recording_session_id
+        )
+        monotonic_before_ns = time.monotonic_ns()
+        self.panel.recording_session_started_unix_ns = time.time_ns()
+        monotonic_after_ns = time.monotonic_ns()
+        self.panel.recording_session_started_monotonic_ns = (
+            monotonic_before_ns + monotonic_after_ns
+        ) // 2
+        self.panel.recording_session_anchor_uncertainty_ns = (
+            monotonic_after_ns - monotonic_before_ns
+        ) // 2
+        self.panel.recording_session_started_wall_s = self.panel.recording_session_started_unix_ns * 1e-9
+        self.panel.recording_session_started_monotonic_s = self.panel.recording_session_started_monotonic_ns * 1e-9
+        self.panel.distance_recording_started_monotonic_s = self.panel.recording_session_started_monotonic_s
+        self.panel.distance_recording_rows = SpoolRows(
+            preview_limit=RECORDING_PREVIEW_LIMIT,
+            supports_updates=True,
+        )
+        self.panel.distance_recording_keys.clear()
+        self.panel.external_parameter_recording_rows.clear()
+        spool_root = self.panel._recording_session_dir(self.panel.recording_session_id) / ".spool"
+        self.panel.distance_recording_rows.bind(spool_root / "pair_rows.jsonl")
+        self.panel.camera_recording_rows = {
+            side: SpoolRows() for side in ("left", "right")
+        }
+        self.panel.px4_recording_rows = {
+            side: SpoolRows() for side in ("left", "right")
+        }
+        self.panel.gnss_base_recording_rows = SpoolRows()
+        for side, rows in self.panel.camera_recording_rows.items():
+            rows.bind(spool_root / f"camera_{side}.jsonl")
+        for side, rows in self.panel.px4_recording_rows.items():
+            rows.bind(spool_root / f"px4_{side}.jsonl")
+        self.panel.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
+        self.panel._recording_pair_row_index.clear()
+        self.panel._recovered_session_metadata = None
+        self.panel._recording_clock_sync_start_observation = None
+        self.panel._recording_clock_sync_end_observation = None
+        self.panel.recording_reference_attitudes = {
+            camera: AttitudeSnapshot.from_state(state)
+            for camera, state in self.panel.latest_extrinsics.items()
+            if camera in {"left", "right"}
+        }
+        self.panel.recording_reference_gps = {
+            camera: GpsSnapshot.from_state(state)
+            for camera, state in self.panel.latest_gps.items()
+            if camera in {"left", "right"}
+        }
+        self.panel.recording_origin_gps = self.panel.recording_reference_gps.get("left")
+        left_reference_gps = self.panel.recording_reference_gps.get("left")
+        right_reference_gps = self.panel.recording_reference_gps.get("right")
+        self.panel.recording_reference_baseline_ned_m = (
+            None
+            if left_reference_gps is None or right_reference_gps is None
+            else ned_delta_m(left_reference_gps, right_reference_gps)
+        )
+        self.panel.distance_recording_enabled = True
+        self.panel.video_recording_enabled = True
+        self.panel._record_px4_mag_status_snapshot()
+        self.panel._last_distance_history_key = None
+        self.panel._measurement_attempt_counter = 0
+        self.panel._last_measurement_attempt_key = None
+        self.panel._last_measurement_attempt = None
+        self.panel._prepare_video_recording_paths()
+        write_recovery_metadata(
+            self.panel._recording_session_dir(self.panel.recording_session_id),
+            self.panel._recording_session_metadata(),
+        )
+        self.panel._refresh_recording_table()
+        self.panel.record_button.setText("세션 기록 중지")
+        self.panel._log(
+            "[저장] 세션 기록을 시작했습니다: "
+            f"session={self.panel.recording_session_id}, {self.panel._format_video_recording_paths()}"
+        )
+        if self.panel.camera_connected:
+            self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
+        else:
+            self.panel._log("[저장] 카메라 스트림을 시작하면 좌/우 영상 녹화가 함께 시작됩니다.")
+        self.panel._refresh_recording_status_label()
+        self.panel._refresh_operation_header()
+        return None
+
+    def _stop_session_recording(self) -> None:
+        final_clock_sync_snapshot = (
+            self.panel._camera_time_sync_snapshot("last_observed_before_session_stop")
+            if self.panel._session_recording_active()
+            else None
+        )
+        if final_clock_sync_snapshot is not None:
+            self.panel._recording_clock_sync_end_observation = final_clock_sync_snapshot
+        self.panel.distance_recording_enabled = False
+        self.panel.video_recording_enabled = False
+        self.panel.distance_recording_started_monotonic_s = None
+        self.panel.record_button.setText("세션 기록 시작")
+        self.panel._log(
+            "[저장] 세션 기록을 중지했습니다: "
+            f"session={self.panel.recording_session_id or 'none'}, {self.panel._format_video_recording_paths()}"
+        )
+        if self.panel.camera_connected:
+            self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
+        self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
+        self.panel._refresh_recording_status_label()
+        self.panel._refresh_operation_header()
+
+    def toggle_distance_recording(self) -> None:
+        self.panel.toggle_session_recording()
+
+    def toggle_video_recording(self) -> None:
+        self.panel.toggle_session_recording()
+
+    def save_distance_history_csv(
+        self,
+        *,
+        final_clock_sync_snapshot: dict[str, object] | None = None,
+    ) -> None:
+        if self.panel.distance_recording_enabled:
+            self.panel.recording_status_label.setText("세션 기록: 기록을 중지한 뒤 저장할 수 있습니다")
+            self.panel._refresh_operation_header()
+            return
+        if self.panel._session_save_thread is not None:
+            self.panel.recording_status_label.setText("세션 기록: 저장 작업이 이미 진행 중입니다")
+            self.panel._refresh_operation_header()
+            return
+        if self.panel._session_save_finalized:
+            self.panel.recording_status_label.setText("세션 기록: 현재 세션 파일은 이미 확정되었습니다")
+            return
+        if not self.panel.recording_session_id and not self.panel.distance_recording_rows:
+            self.panel.recording_status_label.setText("세션 기록: 저장할 샘플 없음")
+            self.panel._refresh_operation_header()
+            return
+        stamp = self.panel.recording_session_id or session_id_now()
+        output_dir = self.panel._recording_session_dir(stamp)
+        for rows in (
+            self.panel.distance_recording_rows,
+            *self.panel.camera_recording_rows.values(),
+            *self.panel.px4_recording_rows.values(),
+            self.panel.gnss_base_recording_rows,
+        ):
+            if isinstance(rows, SpoolRows):
+                rows.close()
+        if self.panel._recovered_session_metadata is None:
+            metadata = self.panel._recording_session_metadata(clock_sync_snapshot=final_clock_sync_snapshot)
+            write_recovery_metadata(output_dir, metadata)
+            self.panel._recovered_session_metadata = json.loads(json.dumps(metadata))
+        else:
+            metadata = json.loads(json.dumps(self.panel._recovered_session_metadata))
+            metadata.update(
+                {
+                    "matched_frame_pair_count": len(self.panel.distance_recording_rows),
+                    "camera_left_gui_frame_count": len(self.panel.camera_recording_rows["left"]),
+                    "camera_right_gui_frame_count": len(self.panel.camera_recording_rows["right"]),
+                    "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
+                    "px4_right_sample_count": len(self.panel.px4_recording_rows["right"]),
+                    "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
+                    "finalization": {
+                        "requested_unix_ns": time.time_ns(),
+                        "recovered_retry": True,
+                        "provenance_source": ".spool/session_metadata.json",
+                    },
+                }
+            )
+        if isinstance(self.panel.distance_recording_rows, SpoolRows):
+            pair_rows = self.panel.distance_recording_rows
+        else:
+            pair_rows = [dict(row) for row in self.panel.distance_recording_rows]
+        thread = QtCore.QThread(self)
+        worker = SessionSaveWorker(
+            output_dir=output_dir,
+            metadata=metadata,
+            pair_rows=pair_rows,
+            camera_rows=dict(self.panel.camera_recording_rows),
+            px4_rows=dict(self.panel.px4_recording_rows),
+            gnss_base_rows=self.panel.gnss_base_recording_rows,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.saved.connect(self.panel._handle_session_saved)
+        worker.failed.connect(self.panel._handle_session_save_failed)
+        worker.finished.connect(thread.quit, QtCore.Qt.DirectConnection)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self.panel._handle_session_save_thread_finished)
+        self.panel._session_save_thread = thread
+        self.panel._session_save_worker = worker
+        self.panel._session_save_retry_required = False
+        self.panel.record_button.setEnabled(False)
+        self.panel.save_history_button.setEnabled(False)
+        self.panel.recording_status_label.setText(
+            f"세션 기록: 저장 중, 매칭 프레임쌍={len(pair_rows)}개"
+        )
+        self.panel._log(f"[저장] 세션 파일을 백그라운드에서 확정 중입니다: {output_dir}")
+        thread.start()
+        self.panel._refresh_operation_header()
+
+    @QtCore.pyqtSlot(object)
+    def _handle_session_saved(self, saved_files: SavedSessionFiles) -> None:
+        self.panel._log(
+            "[저장] 거리 측정 compact CSV/Parquet을 저장했습니다: "
+            f"csv={saved_files.distance_measurements_csv}, "
+            f"parquet={saved_files.distance_measurements_parquet}"
+        )
+        self.panel._log(f"[저장] 세션 고정 JSON을 저장했습니다: {saved_files.session_static_json}")
+        self.panel._log(
+            "[저장] GUI 전달 카메라 프레임 CSV/Parquet을 저장했습니다: "
+            f"left={saved_files.camera_left_csv}/{saved_files.camera_left_parquet}, "
+            f"right={saved_files.camera_right_csv}/{saved_files.camera_right_parquet}"
+        )
+        self.panel._log(
+            "[저장] PX4 타임라인 CSV/Parquet을 저장했습니다: "
+            f"left={saved_files.px4_left_csv}/{saved_files.px4_left_parquet}, "
+            f"right={saved_files.px4_right_csv}/{saved_files.px4_right_parquet}"
+        )
+        self.panel._log(f"[저장] 세션 manifest를 저장했습니다: {saved_files.manifest}")
+        if saved_files.finalized:
+            self.panel._log(f"[저장] 목적별 탭 XLSX를 저장했습니다: {saved_files.xlsx}")
+            output_text = ", ".join(str(output) for output in saved_files.outputs)
+            self.panel.recording_status_label.setText(
+                "세션 기록 저장 완료: "
+                f"매칭 프레임쌍={len(self.panel.distance_recording_rows)}개 - {output_text}"
+            )
+            self.panel._session_save_retry_required = False
+            self.panel._session_save_finalized = True
+        else:
+            self.panel._session_save_retry_required = True
+            self.panel._session_save_finalized = False
+            self.panel._log(f"[저장] XLSX 생성 실패; CSV는 확정되었으며 재시도할 수 있습니다: {saved_files.error}")
+            self.panel.recording_status_label.setText(
+                f"세션 CSV 저장 완료 / XLSX 실패(재시도 가능): {saved_files.error}"
+            )
+        self.panel._refresh_operation_header()
+
+    @QtCore.pyqtSlot(str)
+    def _handle_session_save_failed(self, error: str) -> None:
+        self.panel._session_save_retry_required = True
+        self.panel._session_save_finalized = False
+        self.panel._log(f"[저장] 세션 파일 확정 실패; spool을 보존했습니다: {error}")
+        self.panel.recording_status_label.setText(f"세션 저장 실패(재시도 가능): {error}")
+        self.panel._refresh_operation_header()
+
+    @QtCore.pyqtSlot()
+    def _handle_session_save_thread_finished(self) -> None:
+        thread = self.panel._session_save_thread
+        self.panel._session_save_thread = None
+        self.panel._session_save_worker = None
+        self.panel._session_save_shutdown_wait_started_s = None
+        self.panel._session_save_shutdown_timeout_logged = False
+        if thread is not None:
+            thread.deleteLater()
+        self.panel.save_history_button.setEnabled(not self.panel._session_save_finalized)
+        self.panel.record_button.setEnabled(not self.panel._session_save_retry_required)
+        self.panel._refresh_operation_header()
+
+    def _wait_for_session_save(self, timeout_ms: int = 15000) -> bool:
+        thread = self.panel._session_save_thread
+        if thread is None:
+            self.panel._session_save_shutdown_wait_started_s = None
+            self.panel._session_save_shutdown_timeout_logged = False
+            return True
+        try:
+            running = thread.isRunning()
+        except RuntimeError:
+            self.panel._session_save_thread = None
+            self.panel._session_save_worker = None
+            return True
+        now_s = time.monotonic()
+        started_s = getattr(self.panel, "_session_save_shutdown_wait_started_s", None)
+        if started_s is None:
+            started_s = now_s
+            self.panel._session_save_shutdown_wait_started_s = started_s
+        timeout_s = max(0.0, float(timeout_ms) / 1000.0)
+        if (
+            running
+            and now_s - float(started_s) >= timeout_s
+            and not bool(getattr(self.panel, "_session_save_shutdown_timeout_logged", False))
+        ):
+            self.panel._log(
+                "[저장] 종료 대기 시간이 초과되었습니다. 원본 spool과 manifest를 보존해 재시도할 수 있습니다."
+            )
+            self.panel._session_save_shutdown_timeout_logged = True
+        # Keep the Qt event loop alive so saved/failed/finished signals can be
+        # delivered.  The top-level closeEvent retries this lifecycle step.
+        return False
+
+    def _record_px4_mag_status_rows(self) -> list[dict[str, object]]:
+        if not hasattr(self.panel, "px4_mag_managers"):
+            return []
+        now_s = time.monotonic()
+        rows: list[dict[str, object]] = []
+        for camera, label in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
+            manager = self.panel.px4_mag_managers.get(camera)
+            if manager is None:
+                continue
+            if not self.panel._px4_mag_manager_has_data_source(camera):
+                continue
+            if not self.panel._sync_px4_mag_manager_store(camera):
+                # A raw MAVLink sample does not expose CAL_MAG priority
+                # readback; retain live telemetry but do not persist guessed
+                # slot state from the local fallback defaults.
+                continue
+            status = self.panel._px4_mag_status_cache.get(camera)
+            if status is None:
+                # PARAM readback is a blocking MAVLink operation and is owned
+                # by PixhawkParameterWorker.  Recording must never trigger a
+                # hidden readback from the GUI thread.
+                continue
+            for slot in status.slots:
+                rows.append(
+                    {
+                        "session_id": self.panel.recording_session_id,
+                        "session_started_unix_s": self.panel._fmt_record_float(self.panel.recording_session_started_wall_s, 6),
+                        "recording_elapsed_s": self.panel._fmt_record_float(self.panel._recording_elapsed_s(now_s), 6),
+                        "recorded_app_timestamp_s": self.panel._fmt_record_float(now_s, 6),
+                        "pixhawk_side": camera,
+                        "pixhawk_label": label,
+                        "cal_mag_slot": f"CAL_MAG{slot.slot}",
+                        "mag_slot": slot.slot,
+                        "mag_device_id": "" if slot.device_id is None else str(slot.device_id),
+                        "mag_device_type": slot.device_type,
+                        "mag_interface": slot.interface,
+                        "mag_is_rm3100": self.panel._fmt_record_bool(slot.is_rm3100),
+                        "mag_priority": "" if slot.priority is None else str(slot.priority),
+                        "mag_rotation": "" if slot.rotation is None else str(slot.rotation),
+                        "mag_enabled": self.panel._fmt_record_bool(slot.enabled),
+                        "mag_expected_selected": self.panel._fmt_record_bool(slot.expected_selected),
+                        "mag_actual_selected": self.panel._fmt_record_bool(slot.actual_selected),
+                        "mag_expected_selected_device_id": (
+                            "" if status.expected_selected_device_id is None else str(status.expected_selected_device_id)
+                        ),
+                        "mag_actual_selected_device_id": (
+                            "" if status.actual_selected_device_id is None else str(status.actual_selected_device_id)
+                        ),
+                        "mag_is_actual_rm3100": self.panel._fmt_record_bool(status.is_actual_rm3100),
+                        "mag_armed": self.panel._fmt_record_bool(status.armed),
+                        "mag_status": slot.status,
+                        "mag_warning_text": status.warning_text,
+                        "mag_rm3100_primary_id": status.rm3100_primary_id,
+                        "mag_rm3100_backup_id": status.rm3100_backup_id,
+                        "mag_param_uavcan_enable": status.params.get("UAVCAN_ENABLE"),
+                        "mag_param_uavcan_sub_mag": status.params.get("UAVCAN_SUB_MAG"),
+                        "mag_param_ekf2_mag_type": status.params.get("EKF2_MAG_TYPE"),
+                        "mag_param_snapshot_json": json.dumps(status.params, sort_keys=True),
+                    }
+                )
+        return rows
+
+    def _record_px4_mag_status_snapshot(self, camera: str | None = None) -> None:
+        """Persist the current MAG slot/priority selection state in the PX4 timeline."""
+        for values in self.panel._record_px4_mag_status_rows():
+            if camera is not None and values.get("pixhawk_side") != camera:
+                continue
+            self.panel._record_external_timeline_row(
+                str(values["pixhawk_side"]),
+                "mag_slot_status",
+                {
+                    "namespace": "",
+                    "topic": "px4_mag_manager",
+                    "sample_app_timestamp_s": values["recorded_app_timestamp_s"],
+                    "sensor_slot": values["cal_mag_slot"],
+                    **values,
+                },
+            )
+
+    def _recording_camera_timing_diagnostics(self) -> dict[str, object]:
+        """Summarize the raw camera timing evidence retained in the session spool."""
+
+        def numeric_values(rows: list[dict[str, object]], field: str) -> list[float]:
+            values: list[float] = []
+            for row in rows:
+                value = row.get(field)
+                try:
+                    parsed = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if isfinite(parsed):
+                    values.append(parsed)
+            return values
+
+        def summary(values: list[float], *, scale: float = 1.0) -> dict[str, float | None]:
+            if not values:
+                return {"min": None, "median": None, "max": None}
+            scaled = [value * scale for value in values]
+            return {
+                "min": min(scaled),
+                "median": median(scaled),
+                "max": max(scaled),
+            }
+
+        diagnostics: dict[str, object] = {}
+        for camera in ("left", "right"):
+            rows = [dict(row) for row in self.panel.camera_recording_rows[camera]]
+            valid_rtcp_count = sum(
+                1 for row in rows
+                if row.get("rtcp_frame_ntp_unix_s") not in (None, "")
+            )
+            invalid_rtcp_count = sum(
+                1 for row in rows
+                if row.get("rtcp_timing_invalid_reason") not in (None, "")
+            )
+            clock_rate_values = numeric_values(rows, "rtcp_clock_rate_hz")
+            media_rate_values = numeric_values(rows, "rtcp_camera_media_rate")
+            estimated_media_clock_values: list[float] = []
+            for row in rows:
+                try:
+                    clock_rate = float(row.get("rtcp_clock_rate_hz"))
+                    media_rate = float(row.get("rtcp_camera_media_rate"))
+                except (TypeError, ValueError):
+                    continue
+                if isfinite(clock_rate) and isfinite(media_rate):
+                    estimated_media_clock_values.append(clock_rate * media_rate)
+            rtp_timestamps = numeric_values(rows, "rtp_timestamp")
+            diagnostics[camera] = {
+                "frame_count": len(rows),
+                "rtcp_valid_frame_count": valid_rtcp_count,
+                "rtcp_missing_frame_count": max(0, len(rows) - valid_rtcp_count),
+                "rtcp_invalid_frame_count": invalid_rtcp_count,
+                "rtcp_valid_ratio": (
+                    None if not rows else valid_rtcp_count / float(len(rows))
+                ),
+                "rtcp_receive_delay_ms": summary(
+                    numeric_values(rows, "rtcp_frame_receive_delay_s"),
+                    scale=1000.0,
+                ),
+                "rtcp_transport_delay_ms": summary(
+                    numeric_values(rows, "rtcp_frame_transport_delay_s"),
+                    scale=1000.0,
+                ),
+                "rtcp_clock_rate_hz": summary(clock_rate_values),
+                "rtcp_camera_ntp_rate": summary(numeric_values(rows, "rtcp_camera_ntp_rate")),
+                "rtcp_camera_media_rate": summary(media_rate_values),
+                "estimated_rtp_clock_rate_hz": summary(estimated_media_clock_values),
+                "rtp_timestamp_first": None if not rtp_timestamps else rtp_timestamps[0],
+                "rtp_timestamp_last": None if not rtp_timestamps else rtp_timestamps[-1],
+            }
+        return diagnostics
+
+    def _recording_session_metadata(
+        self,
+        *,
+        clock_sync_snapshot: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        stamp = self.panel.recording_session_id or time.strftime("%Y%m%d_%H%M%S")
+        clock_sync_snapshot = clock_sync_snapshot or self.panel._camera_time_sync_snapshot("metadata_read")
+        camera_time_metrics = clock_sync_snapshot["metrics"]
+        if not isinstance(camera_time_metrics, dict):
+            camera_time_metrics = {}
+        triangulation_source = self.panel._triangulation_extrinsics_source()
+        _baseline_m, baseline_source, _baseline_warnings = self.panel._active_baseline_m()
+        return {
+            "session_id": self.panel.recording_session_id,
+            "session_dir": str(self.panel._recording_session_dir(stamp)),
+            "session_started_unix_s": self.panel.recording_session_started_wall_s,
+            "session_started_unix_ns": self.panel.recording_session_started_unix_ns,
+            "session_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
+            "session_time_anchor_uncertainty_ns": self.panel.recording_session_anchor_uncertainty_ns,
+            "schema_version": "stereowiris-paired-frame-v2",
+            "row_contract": "one row per accepted left/right matched detection frame pair",
+            "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
+            "right_video_path": str(self.panel.video_recording_paths.get("right", "")),
+            "matched_frame_pair_count": len(self.panel.distance_recording_rows),
+            "camera_left_gui_frame_count": len(self.panel.camera_recording_rows["left"]),
+            "camera_right_gui_frame_count": len(self.panel.camera_recording_rows["right"]),
+            "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
+            "px4_right_sample_count": len(self.panel.px4_recording_rows["right"]),
+            "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
+            "device_timeline_contract": {
+                "camera_row": "one row per frame delivered to the GUI frame_changed callback",
+                "camera_not_guaranteed": "not a one-to-one index of encoded MP4 frames",
+                "px4_row": "one row per PX4 telemetry callback received by the GUI",
+                "sample_monotonic": "producer/app receive CLOCK_MONOTONIC timestamp",
+                "session_utc": "derived from session host Unix/monotonic anchor",
+                "source_utc": "RTCP NTP or GNSS UTC only when explicitly valid",
+                "mavlink_provenance": (
+                    "endpoint, link-open/heartbeat, link target system/component, and received packet "
+                    "source system/component/sequence/message id are recorded when available"
+                ),
+            },
+            "camera_time_sync_status": camera_time_metrics["status"],
+            "camera_time_sync_basis": camera_time_metrics["basis"],
+            "camera_time_sync_warning": camera_time_metrics["warning"],
+            "stream_sync_state": self.panel.camera_sync_status,
+            "stream_sync_reason": self.panel.camera_sync_reason,
+            "stream_sync_gdti": self.panel._camera_sync_gdti,
+            "camera_time_sync_observation": clock_sync_snapshot,
+            "camera_time_sync_observations": {
+                "start": self.panel._recording_clock_sync_start_observation,
+                "end": self.panel._recording_clock_sync_end_observation,
+            },
+            "camera_time_sync_drift": self.panel._camera_time_sync_drift_metadata(),
+            "camera_timing_diagnostics": self.panel._recording_camera_timing_diagnostics(),
+            "pc_utc_sync": self.panel._last_wiris_pc_utc_sync,
+            "gnss_operation": self.panel.gnss_operation_manager.metadata(),
+            "gnss_operation_config": self.panel.gnss_operation_manager.config.to_mapping(),
+            "gnss_fixed_base_profile": (
+                None
+                if self.panel.gnss_fixed_base_profile is None
+                else self.panel.gnss_fixed_base_profile.to_mapping()
+            ),
+            "rtcp_pair_delta_s": camera_time_metrics["pair_delta_s"],
+            "rtcp_pc_offset_max_ms": camera_time_metrics["max_pc_offset_ms"],
+            "rtcp_frame_transit_max_ms": camera_time_metrics["max_frame_transit_delay_ms"],
+            "left_rtcp_frame_transit_ms": camera_time_metrics["left_frame_transit_delay_ms"],
+            "right_rtcp_frame_transit_ms": camera_time_metrics["right_frame_transit_delay_ms"],
+            "calculation": {
+                "triangulation_extrinsics_source": triangulation_source,
+                "distance_mode": self.panel._distance_mode_label(),
+                "baseline_source": baseline_source,
+                "measurement_path": self.panel._measurement_path_label(),
+                "method": "two_ray_closest_midpoint",
+                "measurement_frame": MEASUREMENT_FRAME,
+                "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+                "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+                "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+                "baseline_frame_scope": "measurement_attempt",
+                "baseline_frame_origin_contract": (
+                    "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
+                ),
+                "baseline_frame_origin_model": (
+                    "checkerboard_stereo_rt_optical_centers"
+                    if triangulation_source == "checkerboard"
+                    else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+                ),
+                "baseline_frame_axis_contract": (
+                    "right=left_to_right_center; forward=projected_average_optical_forward; "
+                    "down=forward_cross_right"
+                ),
+                "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
+                "attitude_timing_blocks_measurement": False,
+                "attitude_stale_age_threshold_s": ATTITUDE_STALE_AGE_S,
+                "attitude_very_stale_age_threshold_s": ATTITUDE_VERY_STALE_AGE_S,
+                "attitude_stale_pair_delta_threshold_s": ATTITUDE_STALE_PAIR_DELTA_S,
+                "attitude_very_stale_pair_delta_threshold_s": ATTITUDE_VERY_STALE_PAIR_DELTA_S,
+                "mount_assumption_model": (
+                    "checkerboard-stereo-extrinsics-v1"
+                    if triangulation_source == "checkerboard"
+                    else "gps-rtk-baseline-only-v1"
+                ),
+            },
+            "checkerboard_stereo_extrinsics": self.panel._record_current_checkerboard_extrinsics_parameters(),
+            "timestamp_contract": {
+                "manufacturer_confirmed": False,
+                "camera_captured_timestamp_clock": "WIRIS RTC checked by STUS/GDTI",
+                "rtp_rtcp_timestamp_clock": "RTP relative media counter; RTCP Sender Report NTP-derived stream time",
+                "rtp_timestamp_note": "RTP timestamp is a 90 kHz media clock counter; mapping RTCP NTP to WIRIS GDTI/UTC is unverified.",
+                "preferred_frame_time_field": "rtcp_frame_ntp_unix_s",
+                "legacy_equivalent_field": "camera_rtc_frame_unix_s",
+                "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before absolute UTC claims.",
+            },
+            "intrinsics": self.panel._record_current_intrinsic_parameters(),
+            "stream": {
+                "left_rtsp_url": self.panel.left_url_edit.text().strip(),
+                "right_rtsp_url": self.panel.right_url_edit.text().strip(),
+                "backend": self.panel.stream_backend_combo.currentData(),
+                "transport": self.panel.rtsp_transport_combo.currentData(),
+                "decoder": self.panel.decoder_combo.currentData(),
+                "rtsp_latency_ms": self.panel.rtsp_latency_spin.value(),
+            },
+        }
+
+    def _remove_distance_history_point(self, point: DistanceHistoryPoint) -> None:
+        point_key = self.panel._distance_history_key(point)
+        filtered_history: deque[DistanceHistoryPoint] = deque(maxlen=self.panel.distance_history.maxlen)
+        removed_history = False
+        for candidate in self.panel.distance_history:
+            if self.panel._distance_history_key(candidate) == point_key:
+                removed_history = True
+                continue
+            filtered_history.append(candidate)
+        if not removed_history:
+            self.panel._log("[Depth] 거리 그래프 삭제 요청이 현재 기록과 일치하지 않았습니다.")
+            return
+
+        self.panel.distance_history = filtered_history
+        removed_row = False
+        if point_key in self.panel.distance_recording_keys:
+            cached_index = self.panel.distance_recording_keys.index(point_key)
+            row_index = len(self.panel.distance_recording_rows) - len(self.panel.distance_recording_keys) + cached_index
+            self.panel.distance_recording_keys.pop(cached_index)
+            if row_index < len(self.panel.distance_recording_rows):
+                self.panel.distance_recording_rows.pop(row_index)
+                removed_row = True
+                base_index = len(self.panel.distance_recording_rows) - len(self.panel.distance_recording_keys)
+                self.panel._recording_pair_row_index = {
+                    tuple(key): base_index + index
+                    for index, key in enumerate(self.panel.distance_recording_keys)
+                }
+                self.panel._refresh_recording_table()
+        self.panel._last_distance_history_key = None
+        self.panel._refresh_recording_status_label()
+        self.panel._refresh_operation_header()
+        message = (
+            f"[Depth] 거리 그래프 점을 삭제했습니다: {point.distance_m:.2f} m "
+            f"({point.method}, quality={point.quality})"
+        )
+        if not removed_row:
+            message += " [기록 샘플은 찾지 못함]"
+        self.panel._log(message)
+
+
+
+
+    def _pair_recording_base_row(self, measurement_attempt: MeasurementAttempt) -> dict[str, object]:
+        pair_mid_monotonic_s = measurement_attempt.detection_midpoint_monotonic_s
+        pair_mid_monotonic_ns = int(round(pair_mid_monotonic_s * 1_000_000_000.0))
+        session_elapsed_ns = (
+            None
+            if self.panel.recording_session_started_monotonic_ns is None
+            else max(0, pair_mid_monotonic_ns - self.panel.recording_session_started_monotonic_ns)
+        )
+        row: dict[str, object] = {
+            "session_id": self.panel.recording_session_id,
+            "measurement_attempt_id": str(measurement_attempt.attempt_id),
+            "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
+            "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
+            "measurement_detection_pair_key": json.dumps(
+                measurement_attempt.detection_pair_key, separators=(",", ":")
+            ),
+            "schema_version": "stereowiris-paired-frame-v2",
+            "measurement_attempt_content_sha256": measurement_attempt.content_sha256(),
+            "measurement_attempt_instance_sha256": measurement_attempt.instance_sha256(),
+            "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
+            "measurement_attempt_source_quality": measurement_attempt.source_quality,
+            "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
+            "measurement_frame": MEASUREMENT_FRAME,
+            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+            "baseline_frame_scope": "measurement_attempt",
+            "baseline_frame_instance_id": measurement_attempt.instance_sha256(),
+            "baseline_frame_origin_contract": (
+                "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
+            ),
+            "baseline_frame_origin_model": (
+                "checkerboard_stereo_rt_optical_centers"
+                if measurement_attempt.triangulation_source == "checkerboard"
+                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+            ),
+            "baseline_frame_axis_construction": (
+                "right=left_to_right_center;forward=projected_average_optical_forward;"
+                "down=forward_cross_right"
+            ),
+            "measurement_valid": "false",
+            "pair_status": "matched_geometry_pending",
+            "session_started_unix_ns": self.panel.recording_session_started_unix_ns,
+            "session_started_monotonic_ns": self.panel.recording_session_started_monotonic_ns,
+            "recorded_unix_ns": int(round(measurement_attempt.created_wall_s * 1_000_000_000.0)),
+            "pair_app_mid_monotonic_ns": pair_mid_monotonic_ns,
+            "session_elapsed_ns": session_elapsed_ns,
+            "session_elapsed_s": (
+                "" if session_elapsed_ns is None else session_elapsed_ns * 1e-9
+            ),
+            "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
+            "right_video_path": str(self.panel.video_recording_paths.get("right", "")),
+            "selected_left_pairing_timestamp_s": self.panel._fmt_record_float(
+                measurement_attempt.left_detection.pairing_timestamp_s, 9
+            ),
+            "selected_right_pairing_timestamp_s": self.panel._fmt_record_float(
+                measurement_attempt.right_detection.pairing_timestamp_s, 9
+            ),
+        }
+        row.update(self.panel._record_bbox_parameters(measurement_attempt))
+        row.update(self.panel._record_measurement_sync_timestamp_parameters(measurement_attempt))
+        row.update(self.panel._record_intrinsic_parameters(measurement_attempt))
+        row.update(self.panel._record_frame_timestamp_parameters(measurement_attempt))
+        row.update(self.panel._record_live_telemetry_snapshot_parameters(measurement_attempt))
+        row.update(self.panel._measurement_gnss_record_metadata())
+        row.update(self.panel._record_external_parameters(estimate=None, measurement_attempt=measurement_attempt))
+        row.update(self.panel._record_reference_delta_parameters(measurement_attempt))
+        return row
+
+    def _upsert_pair_recording_row(
+        self,
+        measurement_attempt: MeasurementAttempt,
+        values: dict[str, object],
+    ) -> bool:
+        if not self.panel.distance_recording_enabled:
+            return False
+        key = tuple(measurement_attempt.detection_pair_key)
+        row_index = self.panel._recording_pair_row_index.get(key)
+        if row_index is None:
+            row_index = len(self.panel.distance_recording_rows)
+            values["sample_index"] = row_index
+            values["pair_sequence"] = row_index
+            content_sha256 = values.pop("measurement_attempt_content_sha256", None)
+            instance_sha256 = values.pop("measurement_attempt_instance_sha256", None)
+            values["measurement_attempt_content_sha256"] = content_sha256
+            values["measurement_attempt_instance_sha256"] = instance_sha256
+            self.panel._recording_pair_row_index[key] = row_index
+            self.panel.distance_recording_rows.append(values)
+            self.panel.distance_recording_keys.append(key)
+            if len(self.panel.distance_recording_keys) > RECORDING_KEY_CACHE_LIMIT:
+                self.panel.distance_recording_keys.pop(0)
+            minimum_cached_index = max(
+                0, len(self.panel.distance_recording_rows) - RECORDING_KEY_CACHE_LIMIT
+            )
+            self.panel._recording_pair_row_index = {
+                cached_key: cached_index
+                for cached_key, cached_index in self.panel._recording_pair_row_index.items()
+                if cached_index >= minimum_cached_index
+            }
+            self.panel._append_recording_table_row(values)
+            inserted = True
+        else:
+            current = self.panel.distance_recording_rows[row_index]
+            sample_index = current.get("sample_index", row_index)
+            pair_sequence = current.get("pair_sequence", row_index)
+            current.update(values)
+            current["sample_index"] = sample_index
+            current["pair_sequence"] = pair_sequence
+            if isinstance(self.panel.distance_recording_rows, SpoolRows):
+                self.panel.distance_recording_rows.replace(row_index, current)
+            self.panel._refresh_recording_table()
+            inserted = False
+        self.panel._refresh_recording_status_label()
+        self.panel._refresh_operation_header()
+        return inserted
+
+    def _record_unresolved_pair(
+        self,
+        measurement_attempt: MeasurementAttempt,
+        *,
+        status: str,
+        warnings: tuple[str, ...] = (),
+    ) -> None:
+        if not self.panel.distance_recording_enabled:
+            return
+        row = self.panel._pair_recording_base_row(measurement_attempt)
+        row.update(
+            {
+                "pair_status": status,
+                "measurement_valid": "false",
+                "warnings": "; ".join(warnings or measurement_attempt.warnings),
+            }
+        )
+        self.panel._upsert_pair_recording_row(measurement_attempt, row)
+
+    def _append_distance_history(
+        self,
+        *,
+        estimate,
+        distance_m: float,
+        method: str,
+        baseline_source: str,
+        baseline_m: float,
+        point_m: tuple[float, float, float] | None = None,
+        raw_point_m: tuple[float, float, float] | None = None,
+        raw_point_left_m: tuple[float, float, float] | None = None,
+        point_left_m: tuple[float, float, float] | None = None,
+        measurement_attempt: MeasurementAttempt,
+    ) -> bool:
+        baseline_source = measurement_attempt.baseline_source
+        baseline_m = measurement_attempt.baseline_m
+        key = tuple(measurement_attempt.detection_pair_key)
+        if key == self.panel._last_distance_history_key:
+            return False
+        self.panel._last_distance_history_key = key
+        if point_m is None:
+            point_m = point_left_m
+        if raw_point_m is None:
+            raw_point_m = raw_point_left_m
+        timestamp_s = max(estimate.left.timestamp_s, estimate.right.timestamp_s)
+        class_name = self.panel._distance_history_class_name(estimate)
+        recording_elapsed_s = None
+        if self.panel.distance_recording_enabled:
+            if self.panel.distance_recording_started_monotonic_s is None:
+                self.panel.distance_recording_started_monotonic_s = time.monotonic()
+            recording_elapsed_s = max(0.0, time.monotonic() - self.panel.distance_recording_started_monotonic_s)
+        point = DistanceHistoryPoint(
+            timestamp_s=timestamp_s,
+            distance_m=distance_m,
+            quality=estimate.sync_quality,
+            method=method,
+            forward_m=None if point_m is None else float(point_m[0]),
+            right_m=None if point_m is None else float(point_m[1]),
+            down_m=None if point_m is None else float(point_m[2]),
+            class_name=class_name,
+            sample_key=tuple(measurement_attempt.detection_pair_key),
+            recording_elapsed_s=recording_elapsed_s,
+        )
+        self.panel.distance_history.append(point)
+        self.panel.distance_plot.add_point(point)
+        if not self.panel.distance_recording_enabled:
+            return True
+        raw_distance_m = None
+        if raw_point_m is not None:
+            raw_distance_m = math.sqrt(
+                raw_point_m[0] * raw_point_m[0]
+                + raw_point_m[1] * raw_point_m[1]
+                + raw_point_m[2] * raw_point_m[2]
+            )
+        measurement_attempt_content_sha256 = measurement_attempt.content_sha256()
+        measurement_attempt_instance_sha256 = measurement_attempt.instance_sha256()
+        row = self.panel._pair_recording_base_row(measurement_attempt)
+        row.update({
+            "session_id": self.panel.recording_session_id,
+            "measurement_attempt_id": str(measurement_attempt.attempt_id),
+            "measurement_attempt_session_id": measurement_attempt.attempt_session_id,
+            "measurement_attempt_sha256": measurement_attempt.canonical_sha256(),
+            "measurement_detection_pair_key": json.dumps(
+                measurement_attempt.detection_pair_key, separators=(",", ":")
+            ),
+            "measurement_attempt_timestamp_basis": measurement_attempt.timestamp_basis,
+            "selected_left_pairing_timestamp_s": self.panel._fmt_record_float(
+                measurement_attempt.left_detection.pairing_timestamp_s, 6
+            ),
+            "selected_right_pairing_timestamp_s": self.panel._fmt_record_float(
+                measurement_attempt.right_detection.pairing_timestamp_s, 6
+            ),
+            "measurement_attempt_source_quality": measurement_attempt.source_quality,
+            "measurement_attempt_warnings": "; ".join(measurement_attempt.warnings),
+            "session_started_unix_s": self.panel._fmt_record_float(self.panel.recording_session_started_wall_s, 6),
+            "left_video_path": str(self.panel.video_recording_paths.get("left", "")),
+            "right_video_path": str(self.panel.video_recording_paths.get("right", "")),
+            "timestamp_s": f"{timestamp_s:.6f}",
+            "distance_m": f"{distance_m:.6f}",
+            "method": method,
+            "quality": estimate.sync_quality,
+            "disparity_px": f"{estimate.disparity_px:.6f}",
+            "raw_disparity_px": f"{estimate.disparity_px:.6f}",
+            "camera_delta_s": f"{estimate.time_delta_s:.6f}",
+            "vertical_delta_px": f"{estimate.vertical_delta_px:.6f}",
+            "baseline_source": baseline_source,
+            "baseline_m": f"{baseline_m:.6f}",
+            "measurement_frame": MEASUREMENT_FRAME,
+            "measurement_axis_contract": MEASUREMENT_AXIS_CONTRACT,
+            "legacy_xyz_alias_contract": LEGACY_XYZ_ALIAS_CONTRACT,
+            "point_frame": MEASUREMENT_FRAME,
+            "output_frame": MEASUREMENT_FRAME,
+            "public_vector_contract": PUBLIC_MEASUREMENT_VECTOR_CONTRACT,
+            "baseline_frame_scope": "measurement_attempt",
+            "baseline_frame_instance_id": measurement_attempt.instance_sha256(),
+            "baseline_frame_origin_contract": (
+                "midpoint_of_left_optical_origin_and_selected_right_origin_proxy"
+            ),
+            "baseline_frame_origin_model": (
+                "checkerboard_stereo_rt_optical_centers"
+                if measurement_attempt.triangulation_source == "checkerboard"
+                else "gps_rtk_antenna_baseline_proxy_no_lever_arm"
+            ),
+            "measurement_method": "two_ray_closest_midpoint",
+            "range_m": self.panel._fmt_record_float(distance_m, 6),
+            "baseline_center_forward_m": self.panel._fmt_record_float(point.forward_m, 6),
+            "baseline_center_right_m": self.panel._fmt_record_float(point.right_m, 6),
+            "baseline_center_down_m": self.panel._fmt_record_float(point.down_m, 6),
+            "baseline_center_range_m": self.panel._fmt_record_float(distance_m, 6),
+            "raw_baseline_center_forward_m": self.panel._fmt_record_float(
+                None if raw_point_m is None else raw_point_m[0], 6
+            ),
+            "raw_baseline_center_right_m": self.panel._fmt_record_float(
+                None if raw_point_m is None else raw_point_m[1], 6
+            ),
+            "raw_baseline_center_down_m": self.panel._fmt_record_float(
+                None if raw_point_m is None else raw_point_m[2], 6
+            ),
+            "raw_baseline_center_range_m": self.panel._fmt_record_float(raw_distance_m, 6),
+            "source_left_camera_rdf_right_m": self.panel._fmt_record_float(
+                None if raw_point_left_m is None else raw_point_left_m[0], 6
+            ),
+            "source_left_camera_rdf_down_m": self.panel._fmt_record_float(
+                None if raw_point_left_m is None else raw_point_left_m[1], 6
+            ),
+            "source_left_camera_rdf_forward_m": self.panel._fmt_record_float(
+                None if raw_point_left_m is None else raw_point_left_m[2], 6
+            ),
+            "recording_elapsed_s": self.panel._fmt_record_float(recording_elapsed_s, 6),
+            "warnings": "; ".join(estimate.warnings),
+            "pair_status": "measured",
+            "measurement_valid": "true",
+        })
+        row.update(self.panel._record_bbox_parameters(estimate))
+        row.update(self.panel._record_measurement_sync_timestamp_parameters(estimate))
+        row.update(self.panel._record_intrinsic_parameters(measurement_attempt))
+        row.update(self.panel._record_frame_timestamp_parameters(measurement_attempt))
+        row.update(self.panel._record_live_telemetry_snapshot_parameters(measurement_attempt))
+        row.update(self.panel._record_external_parameters(estimate=estimate, measurement_attempt=measurement_attempt))
+        row.pop("measurement_attempt_content_sha256", None)
+        row.pop("measurement_attempt_instance_sha256", None)
+        row["measurement_attempt_content_sha256"] = measurement_attempt_content_sha256
+        row["measurement_attempt_instance_sha256"] = measurement_attempt_instance_sha256
+        self.panel._upsert_pair_recording_row(measurement_attempt, row)
+        return True
+
+    def _distance_history_class_name(self, estimate) -> str | None:
+        left_class_name = str(getattr(estimate.left, "class_name", "") or "").strip()
+        right_class_name = str(getattr(estimate.right, "class_name", "") or "").strip()
+        if left_class_name and right_class_name:
+            if left_class_name == right_class_name:
+                return left_class_name
+            return f"{left_class_name}/{right_class_name}"
+        return left_class_name or right_class_name or None
+
+    def _fmt_record_float(self, value: float | None, precision: int = 6) -> str:
+        return "" if value is None else f"{float(value):.{precision}f}"
+
+    def _fmt_record_bool(self, value: bool | None) -> str:
+        return "" if value is None else ("true" if value else "false")
+
+    def _recording_elapsed_s(self, timestamp_s: float | None = None) -> float | None:
+        started_s = self.panel.distance_recording_started_monotonic_s or self.panel.recording_session_started_monotonic_s
+        if started_s is None:
+            return None
+        if timestamp_s is None:
+            timestamp_s = time.monotonic()
+        return max(0.0, float(timestamp_s) - started_s)
+
+    def _session_utc_ns_for_monotonic_ns(self, monotonic_ns: int) -> int | None:
+        if (
+            self.panel.recording_session_started_unix_ns is None
+            or self.panel.recording_session_started_monotonic_ns is None
+        ):
+            return None
+        return (
+            self.panel.recording_session_started_unix_ns
+            + monotonic_ns
+            - self.panel.recording_session_started_monotonic_ns
+        )
+
+    def _recording_side(self, camera: str) -> str | None:
+        normalized = str(camera).lower()
+        if normalized.startswith("left"):
+            return "left"
+        if normalized.startswith("right"):
+            return "right"
+        return None
+
+    def _raw_timeline_row(
+        self,
+        *,
+        side: str,
+        sample_type: str,
+        row_contract: str,
+        sample_monotonic_s: float,
+        host_receive_monotonic_ns: int,
+        host_receive_utc_ns: int,
+        source_utc_ns: int | None,
+        source_utc_method: str,
+        sequence: int,
+    ) -> dict[str, object] | None:
+        sample_monotonic_ns = int(round(float(sample_monotonic_s) * 1_000_000_000.0))
+        started_monotonic_ns = self.panel.recording_session_started_monotonic_ns
+        if started_monotonic_ns is not None and sample_monotonic_ns < started_monotonic_ns:
+            return None
+        session_elapsed_s = (
+            None
+            if started_monotonic_ns is None
+            else (sample_monotonic_ns - started_monotonic_ns) * 1e-9
+        )
+        session_utc_ns = self.panel._session_utc_ns_for_monotonic_ns(sample_monotonic_ns)
+        return {
+            "sequence": sequence,
+            "session_id": self.panel.recording_session_id,
+            "side": side,
+            "sample_type": sample_type,
+            "row_contract": row_contract,
+            "sample_monotonic_ns": sample_monotonic_ns,
+            "sample_monotonic_s": self.panel._fmt_record_float(sample_monotonic_s, 9),
+            "session_elapsed_s": self.panel._fmt_record_float(session_elapsed_s, 9),
+            "session_utc_ns": "" if session_utc_ns is None else session_utc_ns,
+            "session_utc_s": self.panel._fmt_record_float(
+                None if session_utc_ns is None else session_utc_ns * 1e-9,
+                9,
+            ),
+            "session_utc_method": (
+                "unavailable" if session_utc_ns is None else "host_unix_monotonic_session_anchor"
+            ),
+            "session_utc_anchor_uncertainty_ns": (
+                ""
+                if self.panel.recording_session_anchor_uncertainty_ns is None
+                else self.panel.recording_session_anchor_uncertainty_ns
+            ),
+            "source_utc_ns": "" if source_utc_ns is None else source_utc_ns,
+            "source_utc_s": self.panel._fmt_record_float(
+                None if source_utc_ns is None else source_utc_ns * 1e-9,
+                9,
+            ),
+            "source_utc_valid": self.panel._fmt_record_bool(source_utc_ns is not None),
+            "source_utc_method": source_utc_method if source_utc_ns is not None else "unavailable",
+            "host_receive_monotonic_ns": host_receive_monotonic_ns,
+            "host_receive_utc_ns": host_receive_utc_ns,
+        }
+
+    def _record_gui_camera_frame(
+        self,
+        camera: str,
+        image: QtGui.QImage,
+        metadata: dict[str, object],
+    ) -> None:
+        if not self.panel.distance_recording_enabled or camera not in self.panel.camera_recording_rows:
+            return
+        host_receive_monotonic_ns = time.monotonic_ns()
+        host_receive_utc_ns = time.time_ns()
+        sample_monotonic_s = float(
+            metadata.get("timestamp_s") or host_receive_monotonic_ns * 1e-9
+        )
+        rtcp_ntp_s = metadata.get("rtcp_frame_ntp_unix_s")
+        source_utc_ns = (
+            None
+            if rtcp_ntp_s is None
+            else self.panel._unix_seconds_to_ns(float(rtcp_ntp_s))
+        )
+        rows = self.panel.camera_recording_rows[camera]
+        row = self.panel._raw_timeline_row(
+            side=camera,
+            sample_type="gui_camera_frame",
+            row_contract="one row per frame delivered to the GUI frame_changed callback",
+            sample_monotonic_s=sample_monotonic_s,
+            host_receive_monotonic_ns=host_receive_monotonic_ns,
+            host_receive_utc_ns=host_receive_utc_ns,
+            source_utc_ns=source_utc_ns,
+            source_utc_method="rtcp_ntp",
+            sequence=len(rows),
+        )
+        if row is None:
+            return
+        row.update(
+            {
+                "frame_stage": "gui_delivered_preview",
+                "mp4_frame_index_contract": "not_available",
+                "image_width_px": image.width(),
+                "image_height_px": image.height(),
+                "image_axis_contract": "opencv_pixels_origin_top_left_u_right_v_down",
+                "timestamp_source": str(metadata.get("timestamp_source") or ""),
+                "timestamp_reference": str(metadata.get("timestamp_reference") or ""),
+                "source_timestamp_s": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("source_timestamp_s") is None
+                    else float(metadata["source_timestamp_s"]),
+                    9,
+                ),
+                "rtp_timestamp": (
+                    "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
+                ),
+                "rtp_ssrc": (
+                    "" if metadata.get("rtp_ssrc") is None else str(int(metadata["rtp_ssrc"]))
+                ),
+                "rtp_marker_seq": (
+                    "" if metadata.get("rtp_marker_seq") is None else str(int(metadata["rtp_marker_seq"]))
+                ),
+                "rtcp_sr_received_count": (
+                    ""
+                    if metadata.get("rtcp_sr_received_count") is None
+                    else str(int(metadata["rtcp_sr_received_count"]))
+                ),
+                "rtcp_sr_rtp_timestamp": (
+                    ""
+                    if metadata.get("rtcp_sr_rtp_timestamp") is None
+                    else str(int(metadata["rtcp_sr_rtp_timestamp"]))
+                ),
+                "rtcp_clock_rate_hz": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_clock_rate_hz") is None
+                    else float(metadata["rtcp_clock_rate_hz"]),
+                    3,
+                ),
+                "rtcp_sr_age_s": self.panel._fmt_record_float(
+                    None if metadata.get("rtcp_sr_age_s") is None else float(metadata["rtcp_sr_age_s"]),
+                    9,
+                ),
+                "rtcp_sr_pc_offset_s": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_sr_pc_offset_s") is None
+                    else float(metadata["rtcp_sr_pc_offset_s"]),
+                    9,
+                ),
+                "rtcp_frame_ntp_unix_s": self.panel._fmt_record_float(
+                    None if rtcp_ntp_s is None else float(rtcp_ntp_s),
+                    9,
+                ),
+                "rtcp_frame_received_wall_s": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_frame_received_wall_s") is None
+                    else float(metadata["rtcp_frame_received_wall_s"]),
+                    9,
+                ),
+                "rtcp_frame_receive_delay_s": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_frame_receive_delay_s") is None
+                    else float(metadata["rtcp_frame_receive_delay_s"]),
+                    9,
+                ),
+                "rtcp_frame_transport_delay_s": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_frame_transport_delay_s") is None
+                    else float(metadata["rtcp_frame_transport_delay_s"]),
+                    9,
+                ),
+                "rtcp_camera_ntp_rate": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_camera_ntp_rate") is None
+                    else float(metadata["rtcp_camera_ntp_rate"]),
+                    9,
+                ),
+                "rtcp_camera_media_rate": self.panel._fmt_record_float(
+                    None
+                    if metadata.get("rtcp_camera_media_rate") is None
+                    else float(metadata["rtcp_camera_media_rate"]),
+                    9,
+                ),
+                "rtsp_transport": str(metadata.get("rtsp_transport") or ""),
+                "rtcp_timing_invalid_reason": str(
+                    metadata.get("rtcp_timing_invalid_reason") or ""
+                ),
+            }
+        )
+        rows.append(row)
+
+    def _record_external_timeline_row(self, camera: str, sample_type: str, values: dict[str, object]) -> None:
+        if not self.panel.distance_recording_enabled:
+            return
+        side = self.panel._recording_side(camera)
+        if side is None:
+            return
+        host_receive_monotonic_ns = time.monotonic_ns()
+        host_receive_utc_ns = time.time_ns()
+        raw_sample_monotonic_s = values.get("sample_app_timestamp_s")
+        sample_monotonic_s = (
+            host_receive_monotonic_ns * 1e-9
+            if raw_sample_monotonic_s in (None, "")
+            else float(raw_sample_monotonic_s)
+        )
+        raw_gps_utc_us = values.get("gps_utc_us")
+        source_utc_ns = (
+            None
+            if raw_gps_utc_us in (None, "", 0, "0")
+            else int(raw_gps_utc_us) * 1000
+        )
+        rows = self.panel.px4_recording_rows[side]
+        row = self.panel._raw_timeline_row(
+            side=side,
+            sample_type=sample_type,
+            row_contract="one row per PX4 telemetry callback received by the GUI",
+            sample_monotonic_s=sample_monotonic_s,
+            host_receive_monotonic_ns=host_receive_monotonic_ns,
+            host_receive_utc_ns=host_receive_utc_ns,
+            source_utc_ns=source_utc_ns,
+            source_utc_method=str(values.get("source_utc_method") or "gps_utc"),
+            sequence=len(rows),
+        )
+        if row is None:
+            return
+        row.update(
+            {
+                "camera": camera,
+                "triangulation_extrinsics_source": self.panel._triangulation_extrinsics_source(),
+                "distance_mode": self.panel._distance_mode_label(),
+            }
+        )
+        row.update(mavlink_link_provenance(self.panel, side))
+        row.update(values)
+        rows.append(row)
+        self.panel.external_parameter_recording_rows.append(row)
+        self.panel._refresh_recording_status_label()
+
+    def _record_bbox_parameters(self, estimate) -> dict[str, str]:
+        row: dict[str, str] = {}
+        for camera in ("left", "right"):
+            detection = getattr(estimate, camera, None)
+            center = getattr(detection, "center", None)
+            if center is None:
+                center_x = None
+                center_y = None
+            else:
+                center_x = float(center[0])
+                center_y = float(center[1])
+            x1 = getattr(detection, "x1", None)
+            y1 = getattr(detection, "y1", None)
+            x2 = getattr(detection, "x2", None)
+            y2 = getattr(detection, "y2", None)
+            bbox_width = None
+            bbox_height = None
+            if x1 is not None and x2 is not None:
+                bbox_width = float(x2) - float(x1)
+            if y1 is not None and y2 is not None:
+                bbox_height = float(y2) - float(y1)
+            row[f"{camera}_bbox_x1_px"] = self.panel._fmt_record_float(getattr(detection, "x1", None), 3)
+            row[f"{camera}_bbox_y1_px"] = self.panel._fmt_record_float(getattr(detection, "y1", None), 3)
+            row[f"{camera}_bbox_x2_px"] = self.panel._fmt_record_float(getattr(detection, "x2", None), 3)
+            row[f"{camera}_bbox_y2_px"] = self.panel._fmt_record_float(getattr(detection, "y2", None), 3)
+            row[f"{camera}_bbox_center_x_px"] = self.panel._fmt_record_float(center_x, 3)
+            row[f"{camera}_bbox_center_y_px"] = self.panel._fmt_record_float(center_y, 3)
+            row[f"{camera}_bbox_confidence"] = self.panel._fmt_record_float(getattr(detection, "confidence", None), 6)
+            row[f"{camera}_bbox_class_id"] = "" if getattr(detection, "class_id", None) is None else str(detection.class_id)
+            row[f"{camera}_bbox_class_name"] = str(getattr(detection, "class_name", "") or "")
+            row[f"{camera}_x1"] = self.panel._fmt_record_float(x1, 3)
+            row[f"{camera}_y1"] = self.panel._fmt_record_float(y1, 3)
+            row[f"{camera}_x2"] = self.panel._fmt_record_float(x2, 3)
+            row[f"{camera}_y2"] = self.panel._fmt_record_float(y2, 3)
+            row[f"{camera}_cx"] = self.panel._fmt_record_float(center_x, 3)
+            row[f"{camera}_cy"] = self.panel._fmt_record_float(center_y, 3)
+            row[f"{camera}_width_px"] = self.panel._fmt_record_float(bbox_width, 3)
+            row[f"{camera}_height_px"] = self.panel._fmt_record_float(bbox_height, 3)
+            row[f"{camera}_confidence"] = self.panel._fmt_record_float(getattr(detection, "confidence", None), 6)
+        return row
+
+    def _detection_utc_unix_s(self, detection) -> float | None:
+        metadata = dict(getattr(detection, "timestamp_metadata", None) or {})
+        value = metadata.get("rtcp_frame_ntp_unix_s")
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isfinite(parsed) else None
+
+    def _unix_seconds_to_ns(self, value: float | None) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(
+                (Decimal(str(value)) * Decimal(1_000_000_000)).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+            )
+        except (InvalidOperation, ValueError):
+            return None
+
+    def _record_measurement_sync_timestamp_parameters(self, estimate) -> dict[str, object]:
+        left_timestamp_s = float(getattr(estimate.left, "timestamp_s", 0.0))
+        right_timestamp_s = float(getattr(estimate.right, "timestamp_s", 0.0))
+        bbox_mid_timestamp_s = (left_timestamp_s + right_timestamp_s) / 2.0
+        left_utc_unix_s = self.panel._detection_utc_unix_s(estimate.left)
+        right_utc_unix_s = self.panel._detection_utc_unix_s(estimate.right)
+        bbox_mid_utc_unix_s = (
+            (left_utc_unix_s + right_utc_unix_s) / 2.0
+            if left_utc_unix_s is not None and right_utc_unix_s is not None
+            else None
+        )
+        left_utc_ns = self.panel._unix_seconds_to_ns(left_utc_unix_s)
+        right_utc_ns = self.panel._unix_seconds_to_ns(right_utc_unix_s)
+        pair_mid_utc_ns = (
+            None if left_utc_ns is None or right_utc_ns is None else (left_utc_ns + right_utc_ns) // 2
+        )
+        rtcp_pair_delta_ns = (
+            None if left_utc_ns is None or right_utc_ns is None else right_utc_ns - left_utc_ns
+        )
+        pair_limit_s = self.panel._yolo_pair_max_delta_s()
+        pair_limit_ns = (
+            None
+            if not isfinite(pair_limit_s)
+            else int(round(pair_limit_s * 1_000_000_000.0))
+        )
+        camera_time_metrics = self.panel._camera_time_sync_metrics(
+            dict(getattr(estimate.left, "timestamp_metadata", None) or {}),
+            dict(getattr(estimate.right, "timestamp_metadata", None) or {}),
+            left_receive_mono_s=left_timestamp_s,
+            right_receive_mono_s=right_timestamp_s,
+        )
+        row = {
+            "left_bbox_timestamp_s": self.panel._fmt_record_float(left_timestamp_s, 6),
+            "right_bbox_timestamp_s": self.panel._fmt_record_float(right_timestamp_s, 6),
+            "bbox_mid_timestamp_s": self.panel._fmt_record_float(bbox_mid_timestamp_s, 6),
+            "left_bbox_utc_unix_s": self.panel._fmt_record_float(left_utc_unix_s, 6),
+            "right_bbox_utc_unix_s": self.panel._fmt_record_float(right_utc_unix_s, 6),
+            "bbox_mid_utc_unix_s": self.panel._fmt_record_float(bbox_mid_utc_unix_s, 6),
+            "left_frame_utc_ns": "" if left_utc_ns is None else left_utc_ns,
+            "right_frame_utc_ns": "" if right_utc_ns is None else right_utc_ns,
+            "pair_mid_utc_ns": "" if pair_mid_utc_ns is None else pair_mid_utc_ns,
+            "rtcp_pair_delta_ns": "" if rtcp_pair_delta_ns is None else rtcp_pair_delta_ns,
+            "pair_timing_limit_ns": "" if pair_limit_ns is None else pair_limit_ns,
+            "pair_timing_valid": self.panel._fmt_record_bool(
+                rtcp_pair_delta_ns is not None
+                and (pair_limit_ns is None or abs(rtcp_pair_delta_ns) <= pair_limit_ns)
+            ),
+            "left_bbox_timestamp_reference": str(
+                (getattr(estimate.left, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
+            ),
+            "right_bbox_timestamp_reference": str(
+                (getattr(estimate.right, "timestamp_metadata", None) or {}).get("timestamp_reference") or "app-receive"
+            ),
+            "camera_time_sync_status": str(camera_time_metrics["status"]),
+            "camera_time_sync_basis": str(camera_time_metrics["basis"]),
+            "camera_time_sync_warning": str(camera_time_metrics["warning"]),
+            "stream_sync_state": self.panel.camera_sync_status,
+            "stream_sync_reason": self.panel.camera_sync_reason,
+            "rtcp_pair_delta_s": self.panel._fmt_record_float(camera_time_metrics["pair_delta_s"], 6),
+            "rtcp_pc_offset_max_ms": self.panel._fmt_record_float(camera_time_metrics["max_pc_offset_ms"], 3),
+            "rtcp_frame_transit_max_ms": self.panel._fmt_record_float(camera_time_metrics["max_frame_transit_delay_ms"], 3),
+            "left_rtcp_frame_transit_ms": self.panel._fmt_record_float(camera_time_metrics["left_frame_transit_delay_ms"], 3),
+            "right_rtcp_frame_transit_ms": self.panel._fmt_record_float(camera_time_metrics["right_frame_transit_delay_ms"], 3),
+            "left_rtcp_pc_offset_ms": self.panel._fmt_record_float(camera_time_metrics["left_pc_offset_ms"], 3),
+            "right_rtcp_pc_offset_ms": self.panel._fmt_record_float(camera_time_metrics["right_pc_offset_ms"], 3),
+        }
+        return row
+
+    def _record_frame_timestamp_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, object]:
+        row: dict[str, object] = {}
+        detections = {
+            "left": measurement_attempt.left_detection,
+            "right": measurement_attempt.right_detection,
+        }
+        for camera, detection in detections.items():
+            metadata = detection.timestamp_metadata
+            timestamp_s = detection.app_receive_monotonic_s
+            source_timestamp = metadata.get("source_timestamp_s")
+            timestamp_reference = infer_runtime_camera_timestamp_reference(metadata)
+            row[f"{camera}_display_frame_timestamp_s"] = self.panel._fmt_record_float(timestamp_s, 6)
+            row[f"{camera}_source_frame_timestamp_s"] = self.panel._fmt_record_float(
+                None if source_timestamp is None else float(source_timestamp),
+                6,
+            )
+            row[f"{camera}_frame_timestamp_source"] = str(metadata.get("timestamp_source") or "")
+            row[f"{camera}_frame_timestamp_reference"] = timestamp_reference
+            row[f"{camera}_rtp_timestamp"] = "" if metadata.get("rtp_timestamp") is None else str(int(metadata["rtp_timestamp"]))
+            row[f"{camera}_rtp_ssrc"] = "" if metadata.get("rtp_ssrc") is None else str(int(metadata["rtp_ssrc"]))
+            row[f"{camera}_rtcp_frame_ntp_unix_s"] = self.panel._fmt_record_float(
+                None if metadata.get("rtcp_frame_ntp_unix_s") is None else float(metadata["rtcp_frame_ntp_unix_s"]),
+                6,
+            )
+            rtcp_frame_ntp_unix_s = metadata.get("rtcp_frame_ntp_unix_s")
+            row[f"{camera}_rtcp_frame_ntp_unix_ns"] = (
+                ""
+                if rtcp_frame_ntp_unix_s is None
+                else self.panel._unix_seconds_to_ns(float(rtcp_frame_ntp_unix_s))
+            )
+            row[f"{camera}_app_receive_monotonic_ns"] = int(
+                round(timestamp_s * 1_000_000_000.0)
+            )
+            row[f"{camera}_camera_rtc_frame_unix_s"] = row[f"{camera}_rtcp_frame_ntp_unix_s"]
+            row[f"{camera}_rtcp_sr_ntp_unix_s"] = self.panel._fmt_record_float(
+                None if metadata.get("rtcp_sr_ntp_unix_s") is None else float(metadata["rtcp_sr_ntp_unix_s"]),
+                6,
+            )
+            row[f"{camera}_camera_rtc_sr_unix_s"] = row[f"{camera}_rtcp_sr_ntp_unix_s"]
+            row[f"{camera}_rtcp_sr_rtp_timestamp"] = (
+                "" if metadata.get("rtcp_sr_rtp_timestamp") is None else str(int(metadata["rtcp_sr_rtp_timestamp"]))
+            )
+            row[f"{camera}_rtsp_transport"] = str(metadata.get("rtsp_transport") or "")
+            row[f"{camera}_camera_rtc_basis"] = (
+                "rtcp-sender-report"
+                if metadata.get("rtcp_frame_ntp_unix_s") is not None
+                else timestamp_reference
+            )
+        display_delta_s = (
+            measurement_attempt.right_detection.app_receive_monotonic_s
+            - measurement_attempt.left_detection.app_receive_monotonic_s
+        )
+        left_metadata = measurement_attempt.left_detection.timestamp_metadata
+        right_metadata = measurement_attempt.right_detection.timestamp_metadata
+        left_source = left_metadata.get("source_timestamp_s")
+        right_source = right_metadata.get("source_timestamp_s")
+        source_delta_s = (
+            float(right_source) - float(left_source)
+            if left_source is not None and right_source is not None
+            else None
+        )
+        left_rtcp_ntp = left_metadata.get("rtcp_frame_ntp_unix_s")
+        right_rtcp_ntp = right_metadata.get("rtcp_frame_ntp_unix_s")
+        rtcp_ntp_delta_s = (
+            float(right_rtcp_ntp) - float(left_rtcp_ntp)
+            if left_rtcp_ntp is not None and right_rtcp_ntp is not None
+            else None
+        )
+        row["display_frame_delta_s"] = self.panel._fmt_record_float(display_delta_s, 6)
+        row["source_frame_delta_s"] = self.panel._fmt_record_float(source_delta_s, 6)
+        row["rtcp_frame_ntp_delta_s"] = self.panel._fmt_record_float(rtcp_ntp_delta_s, 6)
+        row["camera_rtc_frame_delta_s"] = row["rtcp_frame_ntp_delta_s"]
+        return row
+
+    def _record_live_telemetry_snapshot_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, object]:
+        row: dict[str, object] = {
+            "attitude_frame": BODY_FRAME,
+            "attitude_units": "deg",
+            "gps_quality_frame": "gps_telemetry_metadata",
+            "gps_quality_units": "satellites_count,eph_m,epv_m",
+        }
+        for camera in ("left", "right"):
+            attitude = (
+                measurement_attempt.left_attitude
+                if camera == "left"
+                else measurement_attempt.right_attitude
+            )
+            attitude_age_s = (
+                measurement_attempt.left_attitude_age_s
+                if camera == "left"
+                else measurement_attempt.right_attitude_age_s
+            )
+            row[f"{camera}_roll_deg"] = self.panel._fmt_record_float(None if attitude is None else attitude.roll_deg, 6)
+            row[f"{camera}_pitch_deg"] = self.panel._fmt_record_float(None if attitude is None else attitude.pitch_deg, 6)
+            row[f"{camera}_yaw_deg"] = self.panel._fmt_record_float(None if attitude is None else attitude.yaw_deg, 6)
+            row[f"{camera}_attitude_sample_age_s"] = self.panel._fmt_record_float(
+                attitude_age_s,
+                6,
+            )
+            row[f"{camera}_attitude_alignment"] = (
+                "missing" if attitude is None else "nearest_app_receive_monotonic"
+            )
+            row[f"{camera}_attitude_topic"] = "" if attitude is None else str(attitude.topic)
+            gps = measurement_attempt.left_gps if camera == "left" else measurement_attempt.right_gps
+            gps_age_s = (
+                None
+                if gps is None
+                else abs(
+                    (
+                        measurement_attempt.left_detection.app_receive_monotonic_s
+                        if camera == "left"
+                        else measurement_attempt.right_detection.app_receive_monotonic_s
+                    )
+                    - gps.app_receive_monotonic_s
+                )
+            )
+            row[f"{camera}_gps_satellites_used"] = (
+                "" if gps is None or getattr(gps, "satellites_used", None) is None else str(gps.satellites_used)
+            )
+            row[f"{camera}_gps_eph_m"] = self.panel._fmt_record_float(
+                None if gps is None else getattr(gps, "eph_m", None),
+                6,
+            )
+            row[f"{camera}_gps_epv_m"] = self.panel._fmt_record_float(
+                None if gps is None else getattr(gps, "epv_m", None),
+                6,
+            )
+            row[f"{camera}_gps_fix_type"] = "" if gps is None or getattr(gps, "fix_type", None) is None else str(gps.fix_type)
+            row[f"{camera}_gps_sample_age_s"] = self.panel._fmt_record_float(
+                gps_age_s
+                if measurement_attempt.baseline is None
+                else (
+                    measurement_attempt.baseline.left_age_at_capture_s
+                    if camera == "left"
+                    else measurement_attempt.baseline.right_age_at_capture_s
+                ),
+                6,
+            )
+            row[f"{camera}_gps_alignment"] = (
+                "missing" if gps is None else "latest_selected_app_receive_monotonic"
+            )
+            row[f"{camera}_gps_topic"] = "" if gps is None else str(gps.topic)
+        return row
+
+    def _record_reference_delta_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, object]:
+        row: dict[str, object] = {
+            "gps_position_frame": "session_left_start_gps_antenna_ned",
+            "gps_position_axis_contract": "north,east,down; metres",
+            "attitude_orientation_contract": "px4_frd_to_ned; quaternion_wxyz",
+        }
+        attitudes = {
+            "left": measurement_attempt.left_attitude,
+            "right": measurement_attempt.right_attitude,
+        }
+        gps_states = {
+            "left": measurement_attempt.left_gps,
+            "right": measurement_attempt.right_gps,
+        }
+        for camera, attitude in attitudes.items():
+            if attitude is None:
+                continue
+            reference = self.panel.recording_reference_attitudes.setdefault(camera, attitude)
+            delta = relative_attitude(reference.quaternion_wxyz, attitude.quaternion_wxyz)
+            prefix = f"{camera}_pixhawk"
+            row.update(
+                {
+                    f"{prefix}_reference_q_wxyz": json.dumps(
+                        list(reference.quaternion_wxyz), separators=(",", ":")
+                    ),
+                    f"{prefix}_delta_roll_deg": self.panel._fmt_record_float(delta.roll_deg, 9),
+                    f"{prefix}_delta_pitch_deg": self.panel._fmt_record_float(delta.pitch_deg, 9),
+                    f"{prefix}_delta_yaw_deg": self.panel._fmt_record_float(delta.yaw_deg, 9),
+                    f"{prefix}_delta_rotation_angle_deg": self.panel._fmt_record_float(
+                        relative_rotation_angle_deg(reference.quaternion_wxyz, attitude.quaternion_wxyz), 9
+                    ),
+                }
+            )
+
+        if (
+            attitudes["left"] is not None
+            and attitudes["right"] is not None
+            and "left" in self.panel.recording_reference_attitudes
+            and "right" in self.panel.recording_reference_attitudes
+        ):
+            initial_relative_q = quaternion_multiply(
+                self.panel.recording_reference_attitudes["right"].quaternion_wxyz,
+                quaternion_conjugate(self.panel.recording_reference_attitudes["left"].quaternion_wxyz),
+            )
+            current_relative_q = quaternion_multiply(
+                attitudes["right"].quaternion_wxyz,
+                quaternion_conjugate(attitudes["left"].quaternion_wxyz),
+            )
+            row["left_right_relative_reference_q_wxyz"] = json.dumps(
+                list(initial_relative_q), separators=(",", ":")
+            )
+            row["left_right_relative_q_wxyz"] = json.dumps(
+                list(current_relative_q), separators=(",", ":")
+            )
+            row["left_right_relative_delta_rotation_angle_deg"] = self.panel._fmt_record_float(
+                relative_rotation_angle_deg(initial_relative_q, current_relative_q), 9
+            )
+
+        if self.panel.recording_origin_gps is None and gps_states["left"] is not None:
+            self.panel.recording_origin_gps = gps_states["left"]
+        for camera, gps in gps_states.items():
+            if gps is None:
+                continue
+            reference = self.panel.recording_reference_gps.setdefault(camera, gps)
+            origin_delta = (
+                None if self.panel.recording_origin_gps is None else ned_delta_m(self.panel.recording_origin_gps, gps)
+            )
+            reference_delta = ned_delta_m(reference, gps)
+            prefix = f"{camera}_gps_antenna"
+            if origin_delta is not None:
+                row[f"{prefix}_north_m"] = self.panel._fmt_record_float(origin_delta[0], 9)
+                row[f"{prefix}_east_m"] = self.panel._fmt_record_float(origin_delta[1], 9)
+                row[f"{prefix}_down_m"] = self.panel._fmt_record_float(origin_delta[2], 9)
+            if reference_delta is not None:
+                row[f"{prefix}_delta_north_m"] = self.panel._fmt_record_float(reference_delta[0], 9)
+                row[f"{prefix}_delta_east_m"] = self.panel._fmt_record_float(reference_delta[1], 9)
+                row[f"{prefix}_delta_down_m"] = self.panel._fmt_record_float(reference_delta[2], 9)
+                row[f"{prefix}_delta_position_m"] = self.panel._fmt_record_float(
+                    math.sqrt(sum(value * value for value in reference_delta)), 9
+                )
+
+        if gps_states["left"] is not None and gps_states["right"] is not None:
+            baseline_ned = ned_delta_m(gps_states["left"], gps_states["right"])
+            if baseline_ned is not None:
+                if self.panel.recording_reference_baseline_ned_m is None:
+                    self.panel.recording_reference_baseline_ned_m = baseline_ned
+                baseline_delta = tuple(
+                    value - reference
+                    for value, reference in zip(baseline_ned, self.panel.recording_reference_baseline_ned_m)
+                )
+                baseline_length_m = math.sqrt(sum(value * value for value in baseline_ned))
+                reference_baseline_length_m = math.sqrt(
+                    sum(value * value for value in self.panel.recording_reference_baseline_ned_m)
+                )
+                row.update(
+                    {
+                        "baseline_north_m": self.panel._fmt_record_float(baseline_ned[0], 9),
+                        "baseline_east_m": self.panel._fmt_record_float(baseline_ned[1], 9),
+                        "baseline_down_m": self.panel._fmt_record_float(baseline_ned[2], 9),
+                        "baseline_length_m": self.panel._fmt_record_float(baseline_length_m, 9),
+                        "baseline_reference_length_m": self.panel._fmt_record_float(
+                            reference_baseline_length_m, 9
+                        ),
+                        "baseline_length_change_m": self.panel._fmt_record_float(
+                            baseline_length_m - reference_baseline_length_m, 9
+                        ),
+                        "baseline_delta_north_m": self.panel._fmt_record_float(baseline_delta[0], 9),
+                        "baseline_delta_east_m": self.panel._fmt_record_float(baseline_delta[1], 9),
+                        "baseline_delta_down_m": self.panel._fmt_record_float(baseline_delta[2], 9),
+                        "baseline_delta_length_m": self.panel._fmt_record_float(
+                            math.sqrt(sum(value * value for value in baseline_delta)), 9
+                        ),
+                    }
+                )
+        return row
+
+    def _record_current_intrinsic_parameters(self) -> dict[str, str]:
+        row: dict[str, str] = {
+            "intrinsics_active": "true" if self.panel.active_intrinsics is not None else "false",
+            "intrinsics_path": str(
+                self.panel._workstation_setting("intrinsics_path", self.panel.settings.intrinsics_path)
+            ),
+            "intrinsics_zoom_level": str(self.panel.zoom_level_spin.value()),
+            "intrinsics_zoom_path": str(self.panel._intrinsics_storage_path()),
+            "intrinsics_latest_path": str(self.panel._intrinsics_storage_base_path()),
+            "manual_focal_override": self.panel._fmt_record_bool(self.panel.manual_focal_checkbox.isChecked()),
+            "runtime_focal_px": self.panel._fmt_record_float(self.panel.focal_spin.value(), 3),
+        }
+        if self.panel.active_intrinsics is None:
+            return row
+        for prefix, intrinsics in (("left", self.panel.active_intrinsics.left), ("right", self.panel.active_intrinsics.right)):
+            matrix = intrinsics.camera_matrix
+            row.update(
+                {
+                    f"{prefix}_intr_width": str(intrinsics.width),
+                    f"{prefix}_intr_height": str(intrinsics.height),
+                    f"{prefix}_intr_fx": self.panel._fmt_record_float(matrix[0][0], 6),
+                    f"{prefix}_intr_fy": self.panel._fmt_record_float(matrix[1][1], 6),
+                    f"{prefix}_intr_cx": self.panel._fmt_record_float(matrix[0][2], 6),
+                    f"{prefix}_intr_cy": self.panel._fmt_record_float(matrix[1][2], 6),
+                    f"{prefix}_intr_distortion": json.dumps(intrinsics.distortion_coefficients, separators=(",", ":")),
+                    f"{prefix}_intr_reprojection_error_px": self.panel._fmt_record_float(
+                        intrinsics.reprojection_error_px, 6
+                    ),
+                    f"{prefix}_intr_image_count": str(intrinsics.image_count),
+                }
+            )
+        return row
+
+    def _record_intrinsic_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, str]:
+        intrinsics_snapshot = measurement_attempt.intrinsics
+        row: dict[str, str] = {
+            "intrinsics_active": self.panel._fmt_record_bool(intrinsics_snapshot is not None),
+            "intrinsics_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
+            "intrinsics_zoom_level": "" if intrinsics_snapshot is None else str(intrinsics_snapshot.active_zoom_level),
+            "intrinsics_zoom_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
+            "intrinsics_latest_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
+            "intrinsics_content_sha256": "" if intrinsics_snapshot is None else intrinsics_snapshot.content_sha256,
+            "manual_focal_override": self.panel._fmt_record_bool(
+                measurement_attempt.geometry_config.manual_focal_override
+            ),
+            "runtime_focal_px": self.panel._fmt_record_float(
+                measurement_attempt.geometry_config.focal_length_px, 3
+            ),
+        }
+        if intrinsics_snapshot is None:
+            return row
+        for prefix, intrinsics in (
+            ("left", intrinsics_snapshot.left),
+            ("right", intrinsics_snapshot.right),
+        ):
+            matrix = intrinsics.camera_matrix
+            row.update(
+                {
+                    f"{prefix}_intr_width": str(intrinsics.width),
+                    f"{prefix}_intr_height": str(intrinsics.height),
+                    f"{prefix}_intr_fx": self.panel._fmt_record_float(matrix[0][0], 6),
+                    f"{prefix}_intr_fy": self.panel._fmt_record_float(matrix[1][1], 6),
+                    f"{prefix}_intr_cx": self.panel._fmt_record_float(matrix[0][2], 6),
+                    f"{prefix}_intr_cy": self.panel._fmt_record_float(matrix[1][2], 6),
+                    f"{prefix}_intr_distortion": json.dumps(
+                        intrinsics.distortion_coefficients, separators=(",", ":")
+                    ),
+                    f"{prefix}_intr_reprojection_error_px": self.panel._fmt_record_float(
+                        intrinsics.reprojection_error_px, 6
+                    ),
+                    f"{prefix}_intr_image_count": str(intrinsics.image_count),
+                }
+            )
+        return row
+
+    def _record_current_checkerboard_extrinsics_parameters(self) -> dict[str, object]:
+        calibration = self.panel.active_intrinsics
+        extrinsics = None if calibration is None else calibration.extrinsics
+        row: dict[str, object] = {
+            "active": extrinsics is not None,
+            "source": "applied_intrinsics",
+            "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
+        }
+        if extrinsics is None:
+            return row
+        right_origin = self.panel._checkerboard_translation_right_in_left_m()
+        row.update(
+            {
+                "pair_count": int(extrinsics.pair_count),
+                "reprojection_error_px": float(extrinsics.reprojection_error_px),
+                "rotation_left_to_right": [list(map(float, values)) for values in extrinsics.rotation_left_to_right],
+                "translation_left_to_right_m": [float(value) for value in extrinsics.translation_left_to_right_m],
+                "right_camera_origin_in_left_rdf_m": (
+                    None if right_origin is None else [float(value) for value in right_origin]
+                ),
+            }
+        )
+        return row
+
+    def _record_checkerboard_extrinsics_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, object]:
+        calibration = measurement_attempt.intrinsics
+        extrinsics = None if calibration is None else calibration.checkerboard_extrinsics
+        row: dict[str, object] = {
+            "active": extrinsics is not None,
+            "source": "measurement_attempt",
+            "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
+        }
+        if extrinsics is None:
+            return row
+        right_origin = measurement_attempt.translation_right_in_left_m
+        row.update(
+            {
+                "pair_count": extrinsics.pair_count,
+                "reprojection_error_px": extrinsics.reprojection_error_px,
+                "rotation_left_to_right": [list(values) for values in extrinsics.rotation_left_to_right],
+                "translation_left_to_right_m": list(extrinsics.translation_left_to_right_m),
+                "right_camera_origin_in_left_rdf_m": (
+                    None if right_origin is None else list(right_origin)
+                ),
+            }
+        )
+        return row
+
+    def _record_external_parameters(
+        self, *, estimate=None, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, str]:
+        triangulation_source = measurement_attempt.triangulation_source
+        checkerboard_mode = triangulation_source == "checkerboard"
+        attitude_timing_status = classify_attitude_timing(
+            uses_pixhawk_attitude=not checkerboard_mode,
+            left_age_s=(
+                measurement_attempt.left_attitude_age_s
+                if estimate is None
+                else estimate.left_attitude_age_s
+            ),
+            right_age_s=(
+                measurement_attempt.right_attitude_age_s
+                if estimate is None
+                else estimate.right_attitude_age_s
+            ),
+            pair_delta_s=(
+                measurement_attempt.attitude_pair_delta_s
+                if estimate is None
+                else estimate.attitude_pair_delta_s
+            ),
+        )
+        checkerboard = self.panel._record_checkerboard_extrinsics_parameters(measurement_attempt)
+        row: dict[str, str] = {
+            "triangulation_extrinsics_source": triangulation_source,
+            "use_rtk_baseline": self.panel._fmt_record_bool(not checkerboard_mode),
+            "rtk_baseline_applied": self.panel._fmt_record_bool(not checkerboard_mode),
+            "require_rtk_fixed": self.panel._fmt_record_bool(
+                False if checkerboard_mode else measurement_attempt.geometry_config.require_rtk_fixed_setting
+            ),
+            "use_triangulation": self.panel._fmt_record_bool(True),
+            "distance_mode": (
+                "체커보드 Stereo 외부 파라미터"
+                if checkerboard_mode
+                else "Pixhawk 자세 + GPS/RTK baseline"
+            ),
+            "world_frame": WORLD_FRAME,
+            "body_frame": BODY_FRAME,
+            "camera_frame": CAMERA_FRAME,
+            "camera_mount_profile": CAMERA_MOUNT_PROFILE,
+            "mount_assumption_model": (
+                "checkerboard-stereo-extrinsics-v1"
+                if checkerboard_mode
+                else "gps-rtk-baseline-only-v1"
+            ),
+            "mount_assumption_status": (
+                "checkerboard stereo extrinsics" if checkerboard_mode else "GPS/RTK baseline only"
+            ),
+            "mount_assumption_detail": (
+                "applied_checkerboard_stereo_extrinsics_used_as_fixed_optical_transform"
+                if checkerboard_mode
+                else "live_gps_rtk_baseline_used_as_stereo_translation"
+            ),
+            "checkerboard_extrinsics_active": self.panel._fmt_record_bool(bool(checkerboard["active"])),
+            "checkerboard_extrinsics_pair_count": str(checkerboard.get("pair_count", "")),
+            "checkerboard_extrinsics_reprojection_error_px": self.panel._fmt_record_float(
+                checkerboard.get("reprojection_error_px"), 6
+            ),
+            "checkerboard_extrinsics_frame_contract": str(checkerboard["frame_contract"]),
+            "require_attitude": self.panel._fmt_record_bool(False),
+            "attitude_used_for_triangulation": self.panel._fmt_record_bool(not checkerboard_mode),
+            "attitude_timing_policy": ATTITUDE_TIMING_POLICY,
+            "attitude_timing_status": attitude_timing_status,
+            "attitude_timing_blocks_measurement": self.panel._fmt_record_bool(False),
+            "attitude_stale_age_threshold_s": self.panel._fmt_record_float(ATTITUDE_STALE_AGE_S, 3),
+            "attitude_very_stale_age_threshold_s": self.panel._fmt_record_float(
+                ATTITUDE_VERY_STALE_AGE_S, 3
+            ),
+            "attitude_stale_pair_delta_threshold_s": self.panel._fmt_record_float(
+                ATTITUDE_STALE_PAIR_DELTA_S, 3
+            ),
+            "attitude_very_stale_pair_delta_threshold_s": self.panel._fmt_record_float(
+                ATTITUDE_VERY_STALE_PAIR_DELTA_S, 3
+            ),
+            "left_attitude_age_s": self.panel._fmt_record_float(
+                measurement_attempt.left_attitude_age_s if estimate is None else estimate.left_attitude_age_s, 6
+            ),
+            "right_attitude_age_s": self.panel._fmt_record_float(
+                measurement_attempt.right_attitude_age_s if estimate is None else estimate.right_attitude_age_s, 6
+            ),
+            "attitude_pair_delta_s": self.panel._fmt_record_float(
+                measurement_attempt.attitude_pair_delta_s if estimate is None else estimate.attitude_pair_delta_s, 6
+            ),
+            "relative_roll_deg": self.panel._fmt_record_float(
+                measurement_attempt.relative_roll_deg if estimate is None else estimate.relative_roll_deg, 6
+            ),
+            "relative_pitch_deg": self.panel._fmt_record_float(
+                measurement_attempt.relative_pitch_deg if estimate is None else estimate.relative_pitch_deg, 6
+            ),
+            "relative_yaw_deg": self.panel._fmt_record_float(
+                measurement_attempt.relative_yaw_deg if estimate is None else estimate.relative_yaw_deg, 6
+            ),
+        }
+        baseline = measurement_attempt.baseline
+        if baseline is not None:
+            camera_translation = baseline.translation_right_in_left_rdf_m
+            baseline_forward_geometry = self.panel._baseline_forward_geometry_from_camera_translation(camera_translation)
+            ned = baseline.ned_right_from_left_m
+            row.update(
+                {
+                    "rtk_baseline_north_m": self.panel._fmt_record_float(None if ned is None else ned[0], 6),
+                    "rtk_baseline_east_m": self.panel._fmt_record_float(None if ned is None else ned[1], 6),
+                    "rtk_baseline_down_m": self.panel._fmt_record_float(None if ned is None else ned[2], 6),
+                    "baseline_p1_body_frd_state": "WAITING",
+                    "baseline_p1_body_frd_forward_m": "",
+                    "baseline_p1_body_frd_right_m": "",
+                    "baseline_p1_body_frd_down_m": "",
+                    "baseline_p1_body_frd_attitude_age_s": "",
+                    "baseline_p1_body_frd_frame": BODY_FRAME,
+                    "baseline_p1_body_frd_axis_contract": (
+                        "P1->P2 in P1 body FRD: [Forward, Right, Down]; metres"
+                    ),
+                    "rtk_left_age_s": self.panel._fmt_record_float(baseline.left_age_at_capture_s, 6),
+                    "rtk_right_age_s": self.panel._fmt_record_float(baseline.right_age_at_capture_s, 6),
+                    "rtk_fix_quality": baseline.fix_quality,
+                    "rtk_warnings": "; ".join(baseline.warnings),
+                    "selected_gps_pair_delta_s": self.panel._fmt_record_float(baseline.gps_pair_delta_s, 6),
+                    "selected_left_gps_detection_age_s": self.panel._fmt_record_float(
+                        baseline.left_age_from_detection_midpoint_s, 6
+                    ),
+                    "selected_right_gps_detection_age_s": self.panel._fmt_record_float(
+                        baseline.right_age_from_detection_midpoint_s, 6
+                    ),
+                }
+            )
+            left_attitude = measurement_attempt.left_attitude
+            if ned is not None and left_attitude is not None:
+                projection = project_ned_baseline_to_p1_body_frd(
+                    ned,
+                    left_attitude.quaternion_wxyz,
+                    attitude_timestamp_s=left_attitude.app_receive_monotonic_s,
+                    attitude_age_s=measurement_attempt.left_attitude_age_s,
+                )
+                row.update(
+                    {
+                        "baseline_p1_body_frd_state": "READY",
+                        "baseline_p1_body_frd_forward_m": self.panel._fmt_record_float(
+                            projection.forward_m, 6
+                        ),
+                        "baseline_p1_body_frd_right_m": self.panel._fmt_record_float(
+                            projection.right_m, 6
+                        ),
+                        "baseline_p1_body_frd_down_m": self.panel._fmt_record_float(
+                            projection.down_m, 6
+                        ),
+                        "baseline_p1_body_frd_attitude_age_s": self.panel._fmt_record_float(
+                            projection.attitude_age_s, 6
+                        ),
+                    }
+                )
+            if camera_translation is not None:
+                row.update(
+                    {
+                        "baseline_left_camera_rdf_right_m": self.panel._fmt_record_float(camera_translation[0], 6),
+                        "baseline_left_camera_rdf_down_m": self.panel._fmt_record_float(camera_translation[1], 6),
+                        "baseline_left_camera_rdf_forward_m": self.panel._fmt_record_float(camera_translation[2], 6),
+                    }
+                )
+            if baseline_forward_geometry is not None:
+                angle_deg, effective_m, length_m, forward_m = baseline_forward_geometry
+                row.update(
+                    {
+                        "baseline_rdf_forward_angle_deg": self.panel._fmt_record_float(angle_deg, 6),
+                        "baseline_effective_perpendicular_m": self.panel._fmt_record_float(effective_m, 6),
+                        "baseline_camera_frame_length_m": self.panel._fmt_record_float(length_m, 6),
+                        "baseline_forward_component_m": self.panel._fmt_record_float(forward_m, 6),
+                    }
+                )
+        for camera in ("left", "right"):
+            attitude = (
+                measurement_attempt.left_attitude
+                if camera == "left"
+                else measurement_attempt.right_attitude
+            )
+            attitude_age_s = (
+                measurement_attempt.left_attitude_age_s
+                if camera == "left"
+                else measurement_attempt.right_attitude_age_s
+            )
+            gps = measurement_attempt.left_gps if camera == "left" else measurement_attempt.right_gps
+            gps_age_s = None
+            if measurement_attempt.baseline is not None:
+                gps_age_s = (
+                    measurement_attempt.baseline.left_age_at_capture_s
+                    if camera == "left"
+                    else measurement_attempt.baseline.right_age_at_capture_s
+                )
+            if gps_age_s is None and gps is not None:
+                frame_timestamp_s = (
+                    measurement_attempt.left_detection.app_receive_monotonic_s
+                    if camera == "left"
+                    else measurement_attempt.right_detection.app_receive_monotonic_s
+                )
+                gps_age_s = abs(frame_timestamp_s - gps.app_receive_monotonic_s)
+            row.update(self.panel._record_extrinsic_state(camera, attitude, attitude_age_s))
+            row.update(self.panel._record_gps_state(camera, gps, gps_age_s))
+            row.update(self.panel._record_gnss_relative_state(camera))
+        return row
+
+    def _record_extrinsic_state(
+        self,
+        camera: str,
+        state: AttitudeSnapshot | None,
+        age_s: float | None,
+    ) -> dict[str, str]:
+        prefix = f"{camera}_pixhawk"
+        if state is None:
+            return {}
+        return {
+            f"{prefix}_namespace": state.namespace,
+            f"{prefix}_topic": state.topic,
+            f"{prefix}_roll_deg": self.panel._fmt_record_float(state.roll_deg, 6),
+            f"{prefix}_pitch_deg": self.panel._fmt_record_float(state.pitch_deg, 6),
+            f"{prefix}_yaw_deg": self.panel._fmt_record_float(state.yaw_deg, 6),
+            f"{prefix}_q": json.dumps(list(state.quaternion_wxyz), separators=(",", ":")),
+            f"{prefix}_q_w": self.panel._fmt_record_float(state.quaternion_wxyz[0], 9),
+            f"{prefix}_q_x": self.panel._fmt_record_float(state.quaternion_wxyz[1], 9),
+            f"{prefix}_q_y": self.panel._fmt_record_float(state.quaternion_wxyz[2], 9),
+            f"{prefix}_q_z": self.panel._fmt_record_float(state.quaternion_wxyz[3], 9),
+            f"{prefix}_age_s": self.panel._fmt_record_float(age_s, 6),
+            f"{prefix}_app_receive_timestamp_s": self.panel._fmt_record_float(state.timestamp_s, 6),
+            f"{prefix}_app_receive_monotonic_ns": int(round(state.timestamp_s * 1_000_000_000.0)),
+            f"{prefix}_px4_timestamp_s": self.panel._fmt_record_float(state.px4_timestamp_s, 6),
+            f"{prefix}_px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
+            f"{prefix}_px4_timestamp_sample_us": (
+                "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
+            ),
+            f"{prefix}_delta_q_reset_wxyz": (
+                "" if state.delta_q_reset is None else json.dumps(list(state.delta_q_reset), separators=(",", ":"))
+            ),
+            f"{prefix}_quat_reset_counter": (
+                "" if state.quat_reset_counter is None else state.quat_reset_counter
+            ),
+            f"{prefix}_mavlink_source_system": (
+                "" if state.mavlink_source_system is None else state.mavlink_source_system
+            ),
+            f"{prefix}_mavlink_source_component": (
+                "" if state.mavlink_source_component is None else state.mavlink_source_component
+            ),
+            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
+            f"{prefix}_mavlink_message_id": (
+                "" if state.mavlink_message_id is None else state.mavlink_message_id
+            ),
+        }
+
+    def _record_gps_state(
+        self,
+        camera: str,
+        state: GpsSnapshot | None,
+        age_s: float | None,
+    ) -> dict[str, str]:
+        prefix = f"{camera}_gps"
+        if state is None:
+            return {}
+        return {
+            f"{prefix}_namespace": state.namespace,
+            f"{prefix}_topic": state.topic,
+            f"{prefix}_lat_deg": self.panel._fmt_record_float(state.latitude_deg, 9),
+            f"{prefix}_lon_deg": self.panel._fmt_record_float(state.longitude_deg, 9),
+            f"{prefix}_alt_m": self.panel._fmt_record_float(state.altitude_m, 6),
+            f"{prefix}_altitude_ellipsoid_m": self.panel._fmt_record_float(state.altitude_ellipsoid_m, 6),
+            f"{prefix}_fix_type": "" if state.fix_type is None else str(state.fix_type),
+            f"{prefix}_satellites": "" if state.satellites_used is None else str(state.satellites_used),
+            f"{prefix}_eph_m": self.panel._fmt_record_float(state.eph_m, 6),
+            f"{prefix}_epv_m": self.panel._fmt_record_float(state.epv_m, 6),
+            f"{prefix}_heading_deg": self.panel._fmt_record_float(state.heading_deg, 6),
+            f"{prefix}_heading_accuracy_deg": self.panel._fmt_record_float(state.heading_accuracy_deg, 6),
+            f"{prefix}_rtk_label": state.rtk_label,
+            f"{prefix}_age_s": self.panel._fmt_record_float(age_s, 6),
+            f"{prefix}_app_receive_timestamp_s": self.panel._fmt_record_float(state.timestamp_s, 6),
+            f"{prefix}_app_receive_monotonic_ns": int(round(state.timestamp_s * 1_000_000_000.0)),
+            f"{prefix}_px4_timestamp_s": self.panel._fmt_record_float(state.px4_timestamp_s, 6),
+            f"{prefix}_px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
+            f"{prefix}_px4_timestamp_sample_us": (
+                "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
+            ),
+            f"{prefix}_gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
+            f"{prefix}_gps_utc_valid": self.panel._fmt_record_bool(state.gps_utc_us is not None),
+            f"{prefix}_timestamp_time_relative_us": (
+                ""
+                if state.gps_timestamp_time_relative_us is None
+                else state.gps_timestamp_time_relative_us
+            ),
+            f"{prefix}_velocity_n_m_s": self.panel._fmt_record_float(state.velocity_n_m_s, 6),
+            f"{prefix}_velocity_e_m_s": self.panel._fmt_record_float(state.velocity_e_m_s, 6),
+            f"{prefix}_velocity_d_m_s": self.panel._fmt_record_float(state.velocity_d_m_s, 6),
+            f"{prefix}_velocity_ned_valid": self.panel._fmt_record_bool(state.velocity_ned_valid),
+            f"{prefix}_hdop": self.panel._fmt_record_float(state.hdop, 6),
+            f"{prefix}_vdop": self.panel._fmt_record_float(state.vdop, 6),
+            f"{prefix}_device_id": "" if state.device_id is None else state.device_id,
+            f"{prefix}_time_source": state.time_source,
+            f"{prefix}_mavlink_source_system": (
+                "" if state.mavlink_source_system is None else state.mavlink_source_system
+            ),
+            f"{prefix}_mavlink_source_component": (
+                "" if state.mavlink_source_component is None else state.mavlink_source_component
+            ),
+            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
+            f"{prefix}_mavlink_message_id": (
+                "" if state.mavlink_message_id is None else state.mavlink_message_id
+            ),
+        }
+
+    def _record_gnss_relative_state(self, camera: str) -> dict[str, str]:
+        state = self.panel.latest_gnss_relative.get(camera)
+        prefix = f"{camera}_gnss_relative"
+        if state is None:
+            return {}
+        age_s = max(0.0, time.monotonic() - state.timestamp_s)
+        heading_deg = None if state.heading_rad is None else math.degrees(state.heading_rad)
+        heading_accuracy_deg = None if state.heading_accuracy_rad is None else math.degrees(state.heading_accuracy_rad)
+        return {
+            f"{prefix}_namespace": state.namespace,
+            f"{prefix}_topic": state.topic,
+            f"{prefix}_device_id": "" if state.device_id is None else str(state.device_id),
+            f"{prefix}_heading_deg": self.panel._fmt_record_float(heading_deg, 6),
+            f"{prefix}_heading_accuracy_deg": self.panel._fmt_record_float(heading_accuracy_deg, 6),
+            f"{prefix}_position_length_m": self.panel._fmt_record_float(state.position_length_m, 6),
+            f"{prefix}_accuracy_length_m": self.panel._fmt_record_float(state.accuracy_length_m, 6),
+            f"{prefix}_gnss_fix_ok": self.panel._fmt_record_bool(state.gnss_fix_ok),
+            f"{prefix}_differential_solution": self.panel._fmt_record_bool(state.differential_solution),
+            f"{prefix}_relative_position_valid": self.panel._fmt_record_bool(state.relative_position_valid),
+            f"{prefix}_carrier_solution_floating": self.panel._fmt_record_bool(state.carrier_solution_floating),
+            f"{prefix}_carrier_solution_fixed": self.panel._fmt_record_bool(state.carrier_solution_fixed),
+            f"{prefix}_moving_base_mode": self.panel._fmt_record_bool(state.moving_base_mode),
+            f"{prefix}_heading_valid": self.panel._fmt_record_bool(state.heading_valid),
+            f"{prefix}_age_s": self.panel._fmt_record_float(age_s, 6),
+            f"{prefix}_px4_timestamp_s": self.panel._fmt_record_float(state.px4_timestamp_s, 6),
+            f"{prefix}_px4_timestamp_us": "" if state.px4_timestamp_us is None else state.px4_timestamp_us,
+            f"{prefix}_px4_timestamp_sample_us": (
+                "" if state.px4_timestamp_sample_us is None else state.px4_timestamp_sample_us
+            ),
+            f"{prefix}_gps_utc_us": "" if state.gps_utc_us is None else state.gps_utc_us,
+            f"{prefix}_gps_utc_valid": self.panel._fmt_record_bool(state.gps_utc_us is not None),
+            f"{prefix}_mavlink_source_system": (
+                "" if state.mavlink_source_system is None else state.mavlink_source_system
+            ),
+            f"{prefix}_mavlink_source_component": (
+                "" if state.mavlink_source_component is None else state.mavlink_source_component
+            ),
+            f"{prefix}_mavlink_sequence": "" if state.mavlink_sequence is None else state.mavlink_sequence,
+            f"{prefix}_mavlink_message_id": (
+                "" if state.mavlink_message_id is None else state.mavlink_message_id
+            ),
+        }
+
+
+RECORDING_CONTROLLER_METHODS += [
+    "_pair_recording_base_row",
+    "_upsert_pair_recording_row",
+    "_record_unresolved_pair",
+    "_append_distance_history",
+    "_distance_history_class_name",
+    "_fmt_record_float",
+    "_fmt_record_bool",
+    "_recording_elapsed_s",
+    "_session_utc_ns_for_monotonic_ns",
+    "_recording_side",
+    "_raw_timeline_row",
+    "_record_gui_camera_frame",
+    "_record_external_timeline_row",
+    "_record_bbox_parameters",
+    "_detection_utc_unix_s",
+    "_unix_seconds_to_ns",
+    "_record_measurement_sync_timestamp_parameters",
+    "_record_frame_timestamp_parameters",
+    "_record_live_telemetry_snapshot_parameters",
+    "_record_reference_delta_parameters",
+    "_record_current_intrinsic_parameters",
+    "_record_intrinsic_parameters",
+    "_record_current_checkerboard_extrinsics_parameters",
+    "_record_checkerboard_extrinsics_parameters",
+    "_record_external_parameters",
+    "_record_extrinsic_state",
+    "_record_gps_state",
+    "_record_gnss_relative_state",
+    "save_distance_history_csv",
+    "_handle_session_saved",
+    "_handle_session_save_failed",
+    "_handle_session_save_thread_finished",
+    "_wait_for_session_save",
+    "_record_px4_mag_status_rows",
+    "_record_px4_mag_status_snapshot",
+    "_recording_camera_timing_diagnostics",
+    "_recording_session_metadata",
+    "_remove_distance_history_point"
+]

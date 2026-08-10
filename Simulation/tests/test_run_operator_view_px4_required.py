@@ -28,6 +28,20 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         launcher = root / "run_operator_view.sh"
         shutil.copy2(SCRIPT_PATH, launcher)
         shutil.copytree(ROOT_DIR / "config", root / "config")
+        magnetometer_build = (
+            root / "stereo_ground_sim" / "vendor" / "gz_magnetometer_wmm_patch" / "build.sh"
+        )
+        magnetometer_build.parent.mkdir(parents=True)
+        magnetometer_build.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        magnetometer_build.chmod(0o755)
+        camera_airframe = (
+            root / "stereo_ground_sim" / "vendor" / "px4_camera_airframe" / "4090_camera_px4"
+        )
+        camera_airframe.parent.mkdir(parents=True)
+        shutil.copy2(
+            ROOT_DIR / "stereo_ground_sim" / "vendor" / "px4_camera_airframe" / "4090_camera_px4",
+            camera_airframe,
+        )
 
         marker = root / "side-effects.log"
         scripts_dir = root / "scripts"
@@ -89,6 +103,11 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         overlay_setup = ros_workspace / "install" / "setup.bash"
         overlay_setup.parent.mkdir(parents=True)
         overlay_setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        px4_package_setup = (
+            ros_workspace / "install" / "px4_msgs" / "share" / "px4_msgs" / "local_setup.bash"
+        )
+        px4_package_setup.parent.mkdir(parents=True)
+        px4_package_setup.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
         overlay_manifest = ros_workspace / "install" / "share" / "sasl_ros_workspace" / "px4_msgs-overlay.env"
         overlay_manifest.parent.mkdir(parents=True)
         overlay_manifest.write_text(
@@ -157,6 +176,9 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         px4_dir = root / "PX4-Autopilot"
         (px4_dir / "Tools").mkdir(parents=True)
         (px4_dir / "src").mkdir()
+        (px4_dir / "ROMFS" / "px4fmu_common" / "init.d-posix" / "airframes").mkdir(
+            parents=True
+        )
         (px4_dir / "Makefile").write_text("# isolated PX4 checkout marker\n", encoding="utf-8")
         gz_bridge_dir = px4_dir / "build" / "px4_sitl_default" / "src" / "modules" / "simulation" / "gz_bridge"
         gz_bridge_dir.mkdir(parents=True)

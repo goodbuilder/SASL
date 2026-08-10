@@ -43,6 +43,9 @@ Simulation/PX4-Autopilot/
 
 # Large generated experiment/runtime outputs
 workstation_data/
+StereoWIRIS/recordings/**
+!StereoWIRIS/recordings/
+!StereoWIRIS/recordings/README.md
 Simulation/results/
 Simulation/Simulation/results/
 Simulation/reports/**
@@ -58,6 +61,7 @@ Simulation/recordings/
 *.bag
 *.db3
 *.ulg
+perf.data
 
 # Model weights and large binary assets
 *.pt

@@ -79,9 +79,9 @@ class AuditOperatorTelemetryResidualPreflightSchemaTests(unittest.TestCase):
             payload = module.audit_schema(input_csv=telemetry)
 
         self.assertEqual(payload["status"], "FAIL")
-        self.assertIn("missing_required_group:raw_forward_m", payload["failures"])
-        self.assertIn("missing_required_group:raw_right_m", payload["failures"])
-        self.assertIn("missing_required_group:raw_down_m", payload["failures"])
+        self.assertIn("missing_required_group:nominal_pose_forward_m", payload["failures"])
+        self.assertIn("missing_required_group:nominal_pose_right_m", payload["failures"])
+        self.assertIn("missing_required_group:nominal_pose_down_m", payload["failures"])
         self.assertIn("valid_row_count_below_min:0<1", payload["failures"])
         self.assertGreater(payload["row_failure_sample_count"], 0)
 

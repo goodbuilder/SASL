@@ -68,6 +68,10 @@ class CommandRegistry(QtCore.QObject):
         if spec is None:
             self.failed.emit(command_id, "unknown command")
             return False
+        action = self._actions.get(command_id)
+        if action is not None and not action.isEnabled():
+            self.failed.emit(command_id, "command disabled")
+            return False
         self.invoked.emit(command_id)
         try:
             result = spec.handler()

@@ -49,8 +49,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
         actions = QtWidgets.QHBoxLayout()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for command_id, label in (
-            ("settings.apply", "Apply all settings"),
-            ("settings.save", "Save all settings"),
+            ("settings.apply", "Apply"),
+            ("settings.save", "Save"),
         ):
             button = QtWidgets.QPushButton(label)
             button.setProperty("commandId", command_id)
@@ -99,8 +99,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
         if direct is not None:
             return direct
         mapping = {
+            "gnss_site_label": self._gnss().get("site_label"),
+            "gnss_site_address": self._gnss().get("site_address"),
             "gnss_operation_mode": self._gnss().get("operation_mode"),
-            "gnss_require_drone_rtk_fixed": self._gnss().get("require_drone_rtk_fixed"),
             "gnss_readiness_gate_enabled": self._gnss().get("readiness_gate_enabled"),
             "gnss_network_caster_host": self._gnss_value("network", "caster_host"),
             "gnss_network_caster_port": self._gnss_value("network", "caster_port"),
@@ -114,6 +115,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
             "gnss_network_gga_policy": self._gnss_value("network", "gga_policy"),
             "gnss_readiness_minimum_fixed_duration_s": self._gnss_value(
                 "readiness", "minimum_fixed_duration_s"
+            ),
+            "gnss_readiness_minimum_fix_type": self._gnss_value(
+                "readiness", "minimum_fix_type"
             ),
             "gnss_readiness_maximum_correction_age_s": self._gnss_value(
                 "readiness", "maximum_correction_age_s"
@@ -141,8 +145,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
             "gnss_fixed_max_vertical_scatter_m": self._gnss_value("fixed_base", "maximum_vertical_scatter_m"),
             "gnss_fixed_permit_profile_reuse": self._gnss_value("fixed_base", "permit_profile_reuse"),
             "gnss_fixed_height_type": self._gnss_value("fixed_base", "height_type"),
-            "gnss_route_drone_enabled": self._gnss_value("routing", "drone_enabled"),
-            "gnss_route_field_base_enabled": self._gnss_value("routing", "field_base_enabled"),
         }
         return mapping.get(key, "")
 
@@ -356,6 +358,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
             self._group(
                 "Base / operation",
                 [
+                    ("Experiment site / point", self._text("gnss_site_label", placeholder="Per-experiment site name")),
+                    ("Experiment address / note", self._text("gnss_site_address", placeholder="Per-experiment address or field note")),
                     (
                         "Operation mode",
                         self._combo(
@@ -373,7 +377,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("Survey-in accuracy", self._number("gnss_base_survey_in_accuracy_m", 0.001, 1000.0, 3, " m")),
                     ("RTCM injection target", self._combo("gnss_base_rtcm_injection_target", (("Disabled", "disabled"), ("Left", "left"), ("Right", "right"), ("Both", "both")))),
                     ("GNSS readiness gate", self._toggle("gnss_readiness_gate_enabled", "Require GNSS readiness before operation")),
-                    ("Require drone RTK Fixed", self._toggle("gnss_require_drone_rtk_fixed", "Require drone RTK Fixed")),
                 ],
             )
         )
@@ -390,7 +393,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("Reconnect interval", self._number("gnss_network_reconnect_interval_s", 0.0, 3600.0, 2, " s")),
                     ("Connect timeout", self._number("gnss_network_connect_timeout_s", 0.1, 3600.0, 2, " s")),
                     ("Read timeout", self._number("gnss_network_read_timeout_s", 0.1, 3600.0, 2, " s")),
-                    ("GGA policy", self._combo("gnss_network_gga_policy", (("System center", "SYSTEM_CENTER"), ("Left GNSS", "LEFT_GNSS"), ("Manual / disabled", "MANUAL"), ("Per rover session", "PER_ROVER_SESSION")))),
+                    ("GGA policy", self._combo("gnss_network_gga_policy", (("Base GNSS (assisted fixed base)", "BASE_GNSS"), ("System center", "SYSTEM_CENTER"), ("Left GNSS", "LEFT_GNSS"), ("Manual / disabled", "MANUAL"), ("Per rover session", "PER_ROVER_SESSION")))),
                 ],
             )
         )
@@ -398,6 +401,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
             self._group(
                 "Readiness limits (WGS84 / quality inputs)",
                 [
+                    ("Minimum numeric fix_type", self._integer("gnss_readiness_minimum_fix_type", 0, 255)),
                     ("Minimum fixed duration", self._number("gnss_readiness_minimum_fixed_duration_s", 0.0, 86_400.0, 2, " s")),
                     ("Maximum correction age", self._number("gnss_readiness_maximum_correction_age_s", 0.0, 3600.0, 2, " s")),
                     ("Maximum GPS sample age", self._number("gnss_readiness_maximum_gps_sample_age_s", 0.0, 3600.0, 2, " s")),
@@ -420,8 +424,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("Maximum vertical scatter", self._number("gnss_fixed_max_vertical_scatter_m", 0.0001, 1000.0, 4, " m")),
                     ("Permit profile reuse", self._toggle("gnss_fixed_permit_profile_reuse", "Reuse an existing fixed-base profile")),
                     ("Height type", self._combo("gnss_fixed_height_type", (("Ellipsoid", "ELLIPSOID"), ("MSL", "MSL"), ("Unknown", "UNKNOWN")))),
-                    ("Route to drone", self._toggle("gnss_route_drone_enabled", "Enable drone correction route")),
-                    ("Field base route", self._toggle("gnss_route_field_base_enabled", "Enable field-base route")),
                 ],
             )
         )
@@ -447,14 +449,18 @@ class SettingsWorkspace(QtWidgets.QWidget):
         fixed_base = _mapping(gnss.get("fixed_base"))
         routing = _mapping(gnss.get("routing"))
         gnss["operation_mode"] = payload.get("gnss_operation_mode")
-        gnss["require_drone_rtk_fixed"] = bool(payload.get("gnss_require_drone_rtk_fixed"))
+        gnss["site_label"] = payload.get("gnss_site_label", "")
+        gnss["site_address"] = payload.get("gnss_site_address", "")
+        # Workstation owns P1/P2 and one field Base receiver.  The old
+        # third-drone readiness flag is intentionally not part of this schema.
+        gnss.pop("require_drone_rtk_fixed", None)
         gnss["readiness_gate_enabled"] = bool(payload.get("gnss_readiness_gate_enabled"))
         local_base.update(
             {
                 "device": payload.get("gnss_base_serial_port", ""),
                 "baud": payload.get("gnss_base_baud", 115200),
                 "survey_in_min_duration_s": payload.get("gnss_base_survey_in_min_duration_s", 300),
-                "survey_in_accuracy_limit_m": payload.get("gnss_base_survey_in_accuracy_m", 0.05),
+                "survey_in_accuracy_limit_m": payload.get("gnss_base_survey_in_accuracy_m", 0.5),
             }
         )
         network.update(
@@ -473,6 +479,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
         )
         readiness.update(
             {
+                "minimum_fix_type": payload.get("gnss_readiness_minimum_fix_type", 3),
                 "minimum_fixed_duration_s": payload.get("gnss_readiness_minimum_fixed_duration_s", 30.0),
                 "maximum_correction_age_s": payload.get("gnss_readiness_maximum_correction_age_s", 3.0),
                 "maximum_gps_sample_age_s": payload.get("gnss_readiness_maximum_gps_sample_age_s", 1.0),
@@ -499,11 +506,15 @@ class SettingsWorkspace(QtWidgets.QWidget):
             {
                 "left_enabled": target in {"left", "both"},
                 "right_enabled": target in {"right", "both"},
-                "drone_enabled": bool(payload.get("gnss_route_drone_enabled")),
-                "field_base_enabled": bool(payload.get("gnss_route_field_base_enabled")),
+                "drone_enabled": False,
+                # NTRIP-to-Base routing is inherent in the assisted fixed-base
+                # operation; it is not an independent operator choice.
+                "field_base_enabled": payload.get("gnss_operation_mode")
+                == "NETWORK_ASSISTED_FIXED_BASE",
             }
         )
         gnss.update({"readiness": readiness, "local_base": local_base, "network": network, "fixed_base": fixed_base, "routing": routing})
+        gnss.pop("require_drone_rtk_fixed", None)
         payload["gnss_operation"] = gnss
         return payload
 

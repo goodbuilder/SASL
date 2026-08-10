@@ -96,7 +96,7 @@ class AppSettings:
     gnss_base_serial_port: str = "/dev/ttyACM0"
     gnss_base_baud: int = 460800
     gnss_base_survey_in_min_duration_s: int = 300
-    gnss_base_survey_in_accuracy_m: float = 1.0
+    gnss_base_survey_in_accuracy_m: float = 0.5
     gnss_base_rtcm_injection_target: str = "both"
     # Three-mode GNSS operation contract.  Legacy flat GNSS fields above are
     # kept for compatibility with the existing GUI and local Survey-in flow.

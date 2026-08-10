@@ -665,10 +665,19 @@ def _median(values: Sequence[float]) -> float:
 
 def _finite_column(records: Sequence[Mapping[str, Any]], name: str, *, absolute: bool = False) -> list[float]:
     values = []
+    source_name = (
+        "nominal_pose_" + name.removeprefix("raw_")
+        if name.startswith("raw_")
+        else name
+    )
     for record in records:
-        value = record.get(name)
+        value = record.get(source_name)
+        if value is None and source_name != name:
+            # Read-only compatibility for sealed artifacts produced before the
+            # research schema renamed raw_* to nominal_pose_*.
+            value = record.get(name)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-            raise ValueError(f"analysis field {name} must be finite")
+            raise ValueError(f"analysis field {source_name} must be finite")
         values.append(abs(float(value)) if absolute else float(value))
     return values
 

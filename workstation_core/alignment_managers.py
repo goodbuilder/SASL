@@ -239,6 +239,7 @@ class AlignmentProfileManager:
         coordinate_settings: CoordinateSystemSettings,
         gps_mapping: dict[str, str],
         magnetometer_mapping: dict[str, str],
+        physical_alignment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         baseline_payload: dict[str, Any] = {}
         if baseline is not None:
@@ -257,7 +258,7 @@ class AlignmentProfileManager:
                 "baseline_std_m": baseline_quality.baseline_length_std_m,
                 "timestamp_delta_ms": baseline_quality.timestamp_delta_ms,
             }
-        return {
+        payload = {
             "alignment_profile": {
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "baseline": baseline_payload,
@@ -274,6 +275,12 @@ class AlignmentProfileManager:
                 "magnetometer_source_mapping": magnetometer_mapping,
             }
         }
+        if physical_alignment is not None:
+            # This is evidence for the Workstation physical-adjustment loop;
+            # it is deliberately kept separate from the legacy ENU profile
+            # and does not become a correction transform.
+            payload["alignment_profile"]["physical_alignment"] = dict(physical_alignment)
+        return payload
 
     def dump(self, payload: dict[str, Any]) -> str:
         return yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)

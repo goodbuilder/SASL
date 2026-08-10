@@ -1435,7 +1435,7 @@ def _write_px4_workbook(output: Path, rows: Sequence[dict[str, object]]) -> None
     temp_path = Path(temp_name)
     try:
         with xlsxwriter.Workbook(temp_path) as workbook:
-            header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7"})
+            header_format = workbook.add_format({"bold": True, "bg_color": "#e0e0e0"})
             for name, columns in PX4_XLSX_TAB_COLUMNS.items():
                 worksheet = workbook.add_worksheet(name)
                 _write_table(worksheet, list(columns), buckets[name], header_format)
@@ -1503,7 +1503,7 @@ def _write_rtk_workbook(output: Path, rows: Sequence[dict[str, object]]) -> None
     temp_path = Path(temp_name)
     try:
         with xlsxwriter.Workbook(temp_path) as workbook:
-            header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7"})
+            header_format = workbook.add_format({"bold": True, "bg_color": "#e0e0e0"})
             worksheet = workbook.add_worksheet("GPS_RTK")
             _write_table(worksheet, list(RTK_XLSX_COLUMNS), rows, header_format)
         os.replace(temp_path, output)
@@ -1632,7 +1632,7 @@ def _write_xlsx(
     temp_path = Path(temp_name)
     try:
         with xlsxwriter.Workbook(temp_path) as workbook:
-            header_format = workbook.add_format({"bold": True, "bg_color": "#D9EAF7"})
+            header_format = workbook.add_format({"bold": True, "bg_color": "#e0e0e0"})
             for preview in previews:
                 worksheet = workbook.add_worksheet(preview.name)
                 if preview.kind == "key_value":

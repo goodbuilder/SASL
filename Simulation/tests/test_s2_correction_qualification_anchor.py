@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -25,8 +26,14 @@ from stereo_ground_sim.correction_sweep import canonical_json, sha256_file  # no
 
 
 AUTHORITATIVE_ROOT = Path(
-    "/home/moon/Desktop/영상감시시스템-audit-results/s2-r4a/qualification/"
-    "exact-profile-freeze-88a360f"
+    os.environ.get(
+        "SASL_QUALIFICATION_FIXTURE",
+        REPOSITORY_ROOT / "Simulation/tests/fixtures/qualification/exact-profile-freeze-88a360f",
+    )
+)
+pytestmark = pytest.mark.skipif(
+    not AUTHORITATIVE_ROOT.is_dir(),
+    reason="sealed qualification fixture unavailable; set SASL_QUALIFICATION_FIXTURE",
 )
 ANCHOR_PATH = REPOSITORY_ROOT / FREEZE_ANCHOR_REPOSITORY_PATH
 KNOWN_HASHES = {

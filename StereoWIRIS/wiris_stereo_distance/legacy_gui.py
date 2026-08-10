@@ -80,7 +80,7 @@ from wiris_stereo_distance.measurement_attempt import (
 )
 from wiris_stereo_distance.measurement_controller import calculate_measurement_geometry
 from wiris_stereo_distance.fixed_base_initializer import FixedBaseInitializer
-from wiris_stereo_distance.gnss_network import NtripClient, format_nmea_gga, gga_from_position
+from wiris_stereo_distance.gnss_network import NtripClient, format_nmea_gga, gga_from_position, gga_from_coordinate_sample
 from wiris_stereo_distance.gnss_operation import (
     CorrectionSourceIdentity,
     evaluate_gnss_readiness,
@@ -408,6 +408,10 @@ CAMERA_SYNC_REQUIRED_SR_COUNT = 2
 CAMERA_SYNC_MAX_CLOCK_RATE_ERROR = 0.005
 CAMERA_GDTI_RESOLUTION_S = 1.0
 CAMERA_GDTI_MAX_PAIR_DELTA_S = 1.0
+WIRIS_STUS_RTT_PROBE_COMMAND = "HIWS"
+WIRIS_STUS_RTT_PROBE_COUNT = 3
+WIRIS_STUS_MAX_VALID_RTT_S = 0.250
+WIRIS_STUS_PARSE_MARGIN_S = 0.002
 CAMERA_SYNC_STATUS_NOT_VERIFIED = "not-verified"
 CAMERA_SYNC_STATUS_RECONNECTING = "reconnecting"
 CAMERA_SYNC_STATUS_WARMING = "warming"
@@ -2361,6 +2365,22 @@ def gnss_base_serial_port_candidates() -> list[str]:
     return candidates
 
 
+def preferred_gnss_base_serial_port(configured_port: str = "") -> str:
+    """Choose a stable u-blox USB path when the configured port is generic."""
+
+    configured = str(configured_port).strip()
+    candidates = gnss_base_serial_port_candidates()
+    ublox_paths = [
+        path for path in candidates
+        if "/dev/serial/by-id/" in path.lower() and "u-blox" in path.lower()
+    ]
+    if ublox_paths and configured in {"", "/dev/ttyACM0"}:
+        return ublox_paths[0]
+    if configured:
+        return configured
+    return candidates[0] if candidates else ""
+
+
 def probe_gnss_base_serial_ports(candidates: Sequence[str], *, baud: int, timeout_s: float = 0.6) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     try:
@@ -3003,6 +3023,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_network_status_line = ""
         self.gnss_network_rtcm_parser = Rtcm3StreamParser()
         self.gnss_coordinate_samples: deque[GnssCoordinateSample] = deque(maxlen=2400)
+        # Latest Base position is a WGS84 geodetic sample used only for the
+        # assisted-mode NTRIP GGA hint and is cleared between sessions.
+        self.latest_gnss_base_position: GnssCoordinateSample | None = None
         self.gnss_fixed_base_profile = None
         self.gnss_fixed_base_pending_profile = None
         self.gnss_fixed_base_command_sent = False
@@ -3063,6 +3086,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._camera_sync_transport_override: str | None = None
         self._camera_sync_deadline_monotonic_s: float | None = None
         self._camera_sync_requested_utc_s: float | None = None
+        self._camera_sync_requested_utc_by_camera: dict[str, float] = {}
         self._camera_sync_gdti: dict[str, dict[str, object]] = {}
         self._camera_sync_timer = QtCore.QTimer(self)
         self._camera_sync_timer.setInterval(250)
@@ -4393,9 +4417,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_sync_warmup_timeout_spin.setDecimals(0)
         self.camera_sync_warmup_timeout_spin.setValue(self.settings.camera_sync_warmup_timeout_s)
         self.camera_sync_warmup_timeout_spin.setSuffix(" s")
-        camera_sync_settings_group = QtWidgets.QGroupBox("카메라 RTCP 동기화 Gate")
-        camera_sync_settings_group.setObjectName("cameraSyncSettingsGroup")
-        camera_sync_settings_form = QtWidgets.QGridLayout(camera_sync_settings_group)
+        self.camera_sync_settings_group = QtWidgets.QGroupBox("카메라 RTCP 동기화 Gate")
+        self.camera_sync_settings_group.setObjectName("cameraSyncSettingsGroup")
+        camera_sync_settings_form = QtWidgets.QGridLayout(self.camera_sync_settings_group)
         camera_sync_settings_form.setHorizontalSpacing(8)
         camera_sync_settings_form.setVerticalSpacing(6)
         camera_sync_settings_form.setColumnStretch(1, 1)
@@ -4480,8 +4504,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         stereo_form.addWidget(self.current_parameters_group, 0, 0, 1, 6)
         stereo_form.addWidget(stereo_parameter_splitter, 1, 0, 1, 6)
-        stereo_form.addWidget(camera_sync_settings_group, 2, 0, 1, 6)
-        stereo_form.addWidget(self.distance_label, 3, 0, 1, 6)
+        stereo_form.addWidget(self.distance_label, 2, 0, 1, 6)
         for widget in (
             self.camera_sync_history_window_spin,
             self.camera_sync_receive_pair_max_delta_spin,
@@ -5415,7 +5438,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             ),
             self.yolo_gate_time_delta_checkbox: (
                 "좌/우 detection pair의 최대 시간 차이 gate를 켭니다. 아래 최대 Δt보다 timestamp 차이가 큰 후보는 매칭하지 않습니다. "
-                "이 값은 YOLO pair 선택 기준이며, `파라미터 > 계산 설정`의 RTCP/NTP 동기화 Gate(기본 50ms)나 `RTP 지연(ms)`와는 별개입니다."
+                "이 값은 YOLO pair 선택 기준이며, `시간 > Sync limits`의 RTCP/NTP 동기화 Gate(기본 50ms)나 `RTP 지연(ms)`와는 별개입니다."
             ),
             self.yolo_gate_time_delta_spin: "YOLO 좌/우 pair 최대 Δt(s)입니다. 최대 Δt gate가 켜져 있을 때 이 값보다 오래 떨어진 detection pair를 제외합니다.",
             self.yolo_gate_vertical_delta_checkbox: (
@@ -5543,7 +5566,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.clock_wiris_time_target_combo: "PC UTC를 설정할 WIRIS RTC 대상을 선택합니다.",
             self.wiris_set_pc_time_button: (
                 "선택한 WIRIS 대상의 RTC를 PC 현재 UTC로 설정합니다. "
-                "양쪽 전송에서는 같은 STUS UTC 값을 만들고 명령 UTC/TCP 호출 시작 차이를 로그에 남깁니다."
+                "카메라별 HIWS 제어 채널 RTT를 측정해 RTT/2와 파싱 여유를 더한 STUS 목표시각을 사용하고, 측정값을 로그에 남깁니다."
             ),
             self.clock_sync_check_button: (
                 "최근 스트림 frame의 RTCP/NTP 기반 시각을 PC UTC와 비교합니다. "
@@ -6353,6 +6376,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         content_layout.setSpacing(8)
 
         operation_config = self.settings.gnss_operation
+        self.gnss_site_label_edit = QtWidgets.QLineEdit(operation_config.site_label)
+        self.gnss_site_label_edit.setPlaceholderText("이번 실험의 장소/지점명")
+        self.gnss_site_address_edit = QtWidgets.QLineEdit(operation_config.site_address)
+        self.gnss_site_address_edit.setPlaceholderText("이번 실험의 주소 또는 현장 설명")
         self.gnss_operation_mode_combo = QtWidgets.QComboBox()
         self.gnss_operation_mode_combo.addItem("현장 Base Survey-in", GnssOperationMode.LOCAL_SURVEY_IN.value)
         self.gnss_operation_mode_combo.addItem(
@@ -6371,6 +6398,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_ntrip_username_env_edit = QtWidgets.QLineEdit(operation_config.network.username_env)
         self.gnss_ntrip_password_env_edit = QtWidgets.QLineEdit(operation_config.network.password_env)
         self.gnss_ntrip_gga_policy_combo = QtWidgets.QComboBox()
+        self.gnss_ntrip_gga_policy_combo.addItem("Base GNSS (보조 Fixed Base)", GgaPolicy.BASE_GNSS.value)
         self.gnss_ntrip_gga_policy_combo.addItem("좌우 중심", GgaPolicy.SYSTEM_CENTER.value)
         self.gnss_ntrip_gga_policy_combo.addItem("Left GNSS", GgaPolicy.LEFT_GNSS.value)
         self.gnss_ntrip_gga_policy_combo.addItem("수동/미사용", GgaPolicy.MANUAL.value)
@@ -6387,7 +6415,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_fixed_min_duration_spin = QtWidgets.QSpinBox()
         self.gnss_fixed_min_duration_spin.setRange(1, 86400)
         self.gnss_fixed_min_duration_spin.setValue(int(operation_config.fixed_base.minimum_fixed_duration_s))
-        self.gnss_base_serial_port_edit = QtWidgets.QLineEdit(self.settings.gnss_base_serial_port)
+        self.gnss_rover_min_fix_type_spin = QtWidgets.QSpinBox()
+        self.gnss_rover_min_fix_type_spin.setRange(0, 255)
+        self.gnss_rover_min_fix_type_spin.setValue(int(operation_config.readiness.minimum_fix_type))
+        self.gnss_base_serial_port_edit = QtWidgets.QLineEdit(
+            preferred_gnss_base_serial_port(self.settings.gnss_base_serial_port)
+        )
         self.gnss_base_baud_spin = QtWidgets.QSpinBox()
         self.gnss_base_baud_spin.setRange(1200, 4000000)
         self.gnss_base_baud_spin.setValue(int(self.settings.gnss_base_baud))
@@ -6414,7 +6447,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_common_config_group = QtWidgets.QGroupBox("GNSS 운용")
         common_form = QtWidgets.QGridLayout(self.gnss_common_config_group)
         add_setting(common_form, 0, "GNSS 운용 모드", self.gnss_operation_mode_combo)
-        add_setting(common_form, 1, "RTCM 주입 대상", self.gnss_base_rtcm_target_combo)
+        add_setting(common_form, 1, "실험 장소/지점명", self.gnss_site_label_edit)
+        add_setting(common_form, 2, "실험 주소/현장 설명", self.gnss_site_address_edit)
+        add_setting(common_form, 3, "RTCM 주입 대상", self.gnss_base_rtcm_target_combo)
+        add_setting(common_form, 4, "Rover 최소 fix_type (3=3D, 6=Fixed)", self.gnss_rover_min_fix_type_spin)
 
         self.gnss_base_config_group = QtWidgets.QGroupBox("Base Serial 설정")
         base_config_form = QtWidgets.QGridLayout(self.gnss_base_config_group)
@@ -7703,6 +7739,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
         names = (
             "gnss_operation_mode_combo",
+            "gnss_site_label_edit",
+            "gnss_site_address_edit",
             "gnss_ntrip_host_edit",
             "gnss_ntrip_port_spin",
             "gnss_ntrip_mountpoint_edit",
@@ -7712,6 +7750,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "gnss_fixed_height_combo",
             "gnss_fixed_acquisition_duration_spin",
             "gnss_fixed_min_duration_spin",
+            "gnss_rover_min_fix_type_spin",
             "gnss_base_rtcm_target_combo",
             "gnss_base_serial_port_edit",
             "gnss_base_baud_spin",
@@ -7743,6 +7782,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         mapping = previous.to_mapping()
         mapping.update(
             {
+                "site_label": self.gnss_site_label_edit.text().strip(),
+                "site_address": self.gnss_site_address_edit.text().strip(),
                 "operation_mode": self._gnss_selected_operation_mode().value,
                 "local_base": {
                     **previous.local_base.to_mapping(),
@@ -7758,13 +7799,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     "mountpoint": self.gnss_ntrip_mountpoint_edit.text().strip(),
                     "username_env": self.gnss_ntrip_username_env_edit.text().strip() or "NTRIP_USERNAME",
                     "password_env": self.gnss_ntrip_password_env_edit.text().strip() or "NTRIP_PASSWORD",
-                    "gga_policy": str(self.gnss_ntrip_gga_policy_combo.currentData() or GgaPolicy.SYSTEM_CENTER.value),
+                    "gga_policy": str(self.gnss_ntrip_gga_policy_combo.currentData() or GgaPolicy.BASE_GNSS.value),
                 },
                 "fixed_base": {
                     **previous.fixed_base.to_mapping(),
                     "acquisition_duration_s": float(self.gnss_fixed_acquisition_duration_spin.value()),
                     "minimum_fixed_duration_s": float(self.gnss_fixed_min_duration_spin.value()),
                     "height_type": height_value,
+                },
+                "readiness": {
+                    **previous.readiness.to_mapping(),
+                    "minimum_fix_type": int(self.gnss_rover_min_fix_type_spin.value()),
                 },
                 "routing": {
                     **previous.routing.to_mapping(),
@@ -7840,6 +7885,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         network_allowed = not local_mode
 
+        if assisted_fixed_mode and hasattr(self, "gnss_ntrip_gga_policy_combo"):
+            self._set_combo_data(self.gnss_ntrip_gga_policy_combo, GgaPolicy.BASE_GNSS.value)
+
         # Keep the settings page focused on the currently selected correction
         # path.  The underlying widgets remain alive so persisted settings and
         # the existing operation-config builder keep their stable interface.
@@ -7908,6 +7956,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return CorrectionSourceIdentity(
                 source_kind="local-serial-survey-in",
                 base_device=config.local_base.device,
+                site_label=config.site_label,
+                site_address=config.site_address,
             )
         return CorrectionSourceIdentity(
             source_kind=("ntrip-fixed-base" if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE else "ntrip-direct"),
@@ -7916,10 +7966,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             mountpoint=config.network.mountpoint,
             gga_policy=config.network.gga_policy,
             base_device=config.local_base.device if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE else "",
+            site_label=config.site_label,
+            site_address=config.site_address,
         )
 
     def _gnss_gga_provider(self) -> str | None:
         policy = self._gnss_active_operation_config().network.gga_policy
+        if policy == GgaPolicy.BASE_GNSS:
+            sample = getattr(self, "latest_gnss_base_position", None)
+            if sample is None or max(0.0, time.monotonic() - sample.timestamp_s) > 15.0:
+                return None
+            return gga_from_coordinate_sample(sample)
         left = self.latest_gps.get("left")
         right = self.latest_gps.get("right")
         positions = [position for position in (left, right) if position is not None and position.has_position]
@@ -7948,6 +8005,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and not self.gnss_base_serial_connected:
             self._set_health_label(self.gnss_base_status_labels["network"], "보조 Fixed Base 모드는 먼저 Base serial을 연결하세요", "bad")
             return
+        if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
+            if config.network.gga_policy != GgaPolicy.BASE_GNSS:
+                self._set_health_label(self.gnss_base_status_labels["network"], "보조 Fixed Base는 Base GNSS GGA가 필요합니다", "bad")
+                return
+            if config.fixed_base.height_type != HeightType.ELLIPSOID:
+                self._set_health_label(self.gnss_base_status_labels["network"], "절대 WGS84 운용은 Fixed Base 높이를 ellipsoid로 설정하세요", "bad")
+                return
+            base_sample = getattr(self, "latest_gnss_base_position", None)
+            if base_sample is None or max(0.0, time.monotonic() - base_sample.timestamp_s) > 15.0:
+                self._set_health_label(self.gnss_base_status_labels["network"], "Base WGS84 위치 샘플 대기 중입니다", "warn")
+                return
         if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and self.mavlink_pixhawk is None:
             self._set_health_label(self.gnss_base_status_labels["network"], "RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
             return
@@ -8005,6 +8073,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             worker.request_stop()
         thread = self.gnss_network_thread
         self.gnss_network_connected = False
+        self.latest_gnss_base_position = None
         self.gnss_operation_gate_active = False
         self.gnss_operation_manager.stop()
         if hasattr(self, "gnss_base_status_labels"):
@@ -8119,6 +8188,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not isinstance(sample, GnssCoordinateSample):
             return
         self.gnss_coordinate_samples.append(sample)
+        self.latest_gnss_base_position = sample
+        if "base_position" in self.gnss_base_status_labels:
+            height_m = sample.selected_height_m
+            height_text = "--" if height_m is None else f"{height_m:.3f}m"
+            self._set_health_label(
+                self.gnss_base_status_labels["base_position"],
+                f"WGS84 {sample.latitude_deg:.7f}, {sample.longitude_deg:.7f} | h={height_text} ({sample.height_type.value}) | fix={sample.fixed}",
+                "good" if sample.fixed else "warn",
+            )
         config = self._gnss_active_operation_config()
         if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
             return
@@ -8126,14 +8204,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if hasattr(self, "gnss_base_fixed_state_plot"):
             self.gnss_base_fixed_state_plot.add_point(
                 TelemetryHistoryPoint(sample.timestamp_s, "fix", 1.0 if sample.fixed else 0.0)
-            )
-        if "base_position" in self.gnss_base_status_labels:
-            height_m = sample.selected_height_m
-            height_text = "--" if height_m is None else f"{height_m:.3f}m"
-            self._set_health_label(
-                self.gnss_base_status_labels["base_position"],
-                f"{sample.latitude_deg:.7f}, {sample.longitude_deg:.7f} | h={height_text} ({sample.height_type.value}) | fix={sample.fixed}",
-                "good" if sample.fixed else "warn",
             )
         if not self.gnss_network_connected or self.gnss_fixed_base_command_sent:
             return
@@ -8615,10 +8685,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _handle_gnss_base_serial_connected(self, port: str, baud: int) -> None:
         self.gnss_base_serial_connected = True
+        self.latest_gnss_base_position = None
         self._set_health_label(self.gnss_base_status_labels["connection"], f"connected {port} @ {baud}", "good")
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "UBX NAV-SVIN 대기 중", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "UBX NAV-PVT/NAV-SAT 대기 중", "idle")
         self._set_gnss_base_quality_waiting("NAV-SAT 대기 중")
+        self._set_health_label(self.gnss_base_status_labels["base_position"], "Base WGS84 위치 샘플 대기 중", "idle")
         self._handle_gnss_operation_mode_changed()
 
     def _handle_gnss_base_serial_stats(self, total_bytes: int, rate_bps: float, age_s: float) -> None:
@@ -8632,11 +8704,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _handle_gnss_base_serial_failed(self, message: str) -> None:
         self.gnss_base_serial_connected = False
+        self.latest_gnss_base_position = None
         self._set_health_label(self.gnss_base_status_labels["connection"], f"failed: {message}", "bad")
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
         self._set_health_label(self.gnss_base_status_labels["rtcm_rx"], "없음", "idle")
         self._set_gnss_base_quality_waiting("미연결")
+        self._set_health_label(self.gnss_base_status_labels["base_position"], "Base WGS84 위치 없음", "idle")
         self._reset_gnss_base_rtcm_stats()
         self.gnss_base_survey_start_button.setEnabled(False)
         self.gnss_base_survey_stop_button.setEnabled(False)
@@ -8645,10 +8719,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
     def _handle_gnss_base_serial_disconnected(self, message: str) -> None:
         self.gnss_base_serial_connected = False
+        self.latest_gnss_base_position = None
         self._set_health_label(self.gnss_base_status_labels["connection"], message, "idle")
         self._set_health_label(self.gnss_base_status_labels["survey_in"], "미연결", "idle")
         self._set_health_label(self.gnss_base_status_labels["base_satellites"], "대기 중", "idle")
         self._set_gnss_base_quality_waiting("미연결")
+        self._set_health_label(self.gnss_base_status_labels["base_position"], "Base WGS84 위치 없음", "idle")
         self._reset_gnss_base_rtcm_stats()
         self.gnss_base_survey_start_button.setEnabled(False)
         self.gnss_base_survey_stop_button.setEnabled(False)
@@ -9717,8 +9793,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         """Build the 시간 (STUS sync) and 이미지 (capture/EXIF) tabs.
 
         Both tabs are built here because their widgets share the clock_* command
-        helpers; ``layout`` receives only the RTC sync group and its history
-        plot, and everything capture/EXIF related goes to ``image_layout``.
+        helpers; ``layout`` receives the RTC sync group, editable sync limits,
+        and its history plot, and everything capture/EXIF related goes to
+        ``image_layout``.
         """
 
         layout.setSpacing(8)
@@ -9871,6 +9948,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         history_layout = QtWidgets.QVBoxLayout(history_group)
         history_layout.addWidget(self.clock_offset_plot)
         layout.addWidget(rtc_group)
+        layout.addWidget(self.camera_sync_settings_group)
         layout.addWidget(history_group, 1)
 
         image_layout.addWidget(workflow_group)
@@ -9985,6 +10063,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         results: dict[str, dict[str, object]] = {}
         for camera, response in self._send_clock_wiris_command_parallel("GDTI"):
             parsed_s = self._parse_wiris_gdti_unix_s(response)
+            requested_utc_by_camera = self.__dict__.get("_camera_sync_requested_utc_by_camera", {})
+            requested_utc_s = requested_utc_by_camera.get(camera)
+            if requested_utc_s is None:
+                requested_utc_s = self._camera_sync_requested_utc_s
             timing = getattr(self, "_last_clock_command_timing", {}).get(camera, {})
             started_s = timing.get("started_utc_s")
             finished_s = timing.get("finished_utc_s")
@@ -9995,7 +10077,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 midpoint_s = (float(started_s) + float(finished_s)) / 2.0
             reference_s = midpoint_s
             if reference_s is None:
-                reference_s = self._camera_sync_requested_utc_s
+                reference_s = requested_utc_s
             query_offset_ms = (
                 None
                 if parsed_s is None or reference_s is None
@@ -10014,8 +10096,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "unix_s": parsed_s,
                 "offset_ms": (
                     None
-                    if parsed_s is None or self._camera_sync_requested_utc_s is None
-                    else (parsed_s - self._camera_sync_requested_utc_s) * 1000.0
+                    if parsed_s is None or requested_utc_s is None
+                    else (parsed_s - requested_utc_s) * 1000.0
                 ),
                 "query_started_utc_s": started_s,
                 "query_finished_utc_s": finished_s,
@@ -10257,6 +10339,73 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "RTSP 재연결 완료 대기: 양쪽 RTCP Sender Report를 수집합니다.",
         )
         self._camera_sync_timer.start()
+
+    @staticmethod
+    def _normalized_stus_rtt_s(rtt_median_s: object) -> float | None:
+        try:
+            value = float(rtt_median_s)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(value)
+            or value < 0.0
+            or value > WIRIS_STUS_MAX_VALID_RTT_S
+        ):
+            return None
+        return value
+
+    @classmethod
+    def _stus_one_way_delay_s(cls, rtt_median_s: object) -> float:
+        value = cls._normalized_stus_rtt_s(rtt_median_s)
+        return 0.0 if value is None else value / 2.0
+
+    @classmethod
+    def _stus_compensation_s(cls, rtt_median_s: object) -> float:
+        value = cls._normalized_stus_rtt_s(rtt_median_s)
+        if value is None:
+            return 0.0
+        return value / 2.0 + WIRIS_STUS_PARSE_MARGIN_S
+
+    def _measure_wiris_control_rtt(
+        self,
+        *,
+        host: str,
+        port: int,
+        timeout_s: float,
+    ) -> dict[str, object]:
+        samples: list[float] = []
+        errors: list[str] = []
+        for _index in range(WIRIS_STUS_RTT_PROBE_COUNT):
+            started_mono_s = time.perf_counter()
+            try:
+                command = build_wiris_command(
+                    host=host,
+                    port=port,
+                    command=WIRIS_STUS_RTT_PROBE_COMMAND,
+                    timeout_s=timeout_s,
+                    terminator=LINE_TERMINATOR,
+                )
+                response = send_tcp_line(command)
+            except Exception as exc:
+                errors.append(str(exc))
+                continue
+            elapsed_s = max(0.0, time.perf_counter() - started_mono_s)
+            if not str(response or "").strip():
+                errors.append("HIWS empty response")
+                continue
+            if elapsed_s > WIRIS_STUS_MAX_VALID_RTT_S:
+                errors.append(
+                    f"HIWS RTT {elapsed_s * 1000.0:.1f}ms exceeds "
+                    f"{WIRIS_STUS_MAX_VALID_RTT_S * 1000.0:.0f}ms limit"
+                )
+                continue
+            samples.append(elapsed_s)
+        return {
+            "command": WIRIS_STUS_RTT_PROBE_COMMAND,
+            "samples_s": samples,
+            "median_s": median(samples) if samples else None,
+            "errors": errors,
+        }
 
     def _send_clock_wiris_command(self, command_text: str) -> list[tuple[str, str]]:
         statuses: list[tuple[str, str]] = []
@@ -10764,8 +10913,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         stus_detail = ""
         if isinstance(stus_sync, dict) and stus_sync.get("command") == "STUS":
             stus_status_text = f"PC UTC 설정 전송: {stus_sync.get('result', '')}"
+            compensation_method = str(stus_sync.get("compensation_method") or "control-rtt").strip()
             stus_detail = (
-                "STUS command sent from PC UTC.\n"
+                f"STUS camera-specific target applied ({compensation_method}): PC send UTC + HIWS RTT/2 + parse margin.\n"
                 "Run RTCP/NTP 동기화 확인 after stream frames arrive to verify "
                 "left/right RTC and PC UTC offsets."
             )
@@ -14197,6 +14347,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._workstation_setting_overrides["gnss_operation"] = config.to_mapping()
             operation = config.to_mapping()
             self._set_combo_data(self.gnss_operation_mode_combo, operation["operation_mode"])
+            self.gnss_site_label_edit.setText(str(operation.get("site_label", "")))
+            self.gnss_site_address_edit.setText(str(operation.get("site_address", "")))
+            set_numeric_widget(self.gnss_rover_min_fix_type_spin, operation["readiness"].get("minimum_fix_type", 3))
             set_checked("gnss_readiness_gate_enabled", "gnss_readiness_gate_checkbox")
             set_checked("gnss_require_drone_rtk_fixed", "gnss_require_drone_rtk_fixed_checkbox")
             network = operation["network"]
@@ -16941,25 +17094,38 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         statuses: dict[str, str] = {}
         send_times: dict[str, float] = {}
         tcp_start_times: dict[str, float] = {}
+        tcp_start_utc_times: dict[str, float] = {}
         command_logs: dict[str, str] = {}
-        shared_command_time_s: dict[str, float] = {}
-
-        def capture_shared_command_time() -> None:
-            shared_command_time_s["unix"] = time.time()
-
-        barrier = (
-            threading.Barrier(len(target_infos), action=capture_shared_command_time)
-            if len(target_infos) >= 2
-            else None
-        )
+        rtt_probe_by_camera: dict[str, dict[str, object]] = {}
+        timing_by_camera: dict[str, dict[str, object]] = {}
 
         def send_one(label: str, host: str, port: int, timeout_s: float) -> None:
             camera_name = self._camera_name_ko(label)
-            unix_time_s = time.time()
+            probe: dict[str, object] = {
+                "command": WIRIS_STUS_RTT_PROBE_COMMAND,
+                "samples_s": [],
+                "median_s": None,
+                "errors": [],
+            }
+            one_way_delay_s = 0.0
+            parse_margin_s = 0.0
+            compensation_s = 0.0
+            tcp_start_utc_s: float | None = None
             try:
-                if barrier is not None:
-                    barrier.wait(timeout=max(1.0, float(timeout_s)))
-                    unix_time_s = float(shared_command_time_s.get("unix", time.time()))
+                probe = self._measure_wiris_control_rtt(
+                    host=host,
+                    port=port,
+                    timeout_s=timeout_s,
+                )
+                rtt_median_s = probe.get("median_s")
+                valid_rtt_s = self._normalized_stus_rtt_s(rtt_median_s)
+                one_way_delay_s = self._stus_one_way_delay_s(valid_rtt_s)
+                if valid_rtt_s is not None:
+                    parse_margin_s = WIRIS_STUS_PARSE_MARGIN_S
+                compensation_s = one_way_delay_s + parse_margin_s
+                rtt_probe_by_camera[label] = probe
+                tcp_start_utc_s = time.time()
+                unix_time_s = tcp_start_utc_s + compensation_s
                 command_text = self._stus_command_from_unix_time(unix_time_s)
                 command = build_wiris_command(
                     host=host,
@@ -16969,17 +17135,40 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     terminator=LINE_TERMINATOR,
                 )
                 send_times[label] = unix_time_s
+                tcp_start_utc_times[label] = tcp_start_utc_s
                 tcp_start_times[label] = time.perf_counter()
                 response = send_tcp_line(command)
             except Exception as exc:
                 statuses[label] = f"실패: {exc}"
+                rtt_probe_by_camera[label] = probe
+                timing_by_camera[label] = {
+                    "stus_rtt_median_s": probe.get("median_s"),
+                    "stus_rtt_samples_s": list(probe.get("samples_s") or []),
+                    "stus_rtt_probe_errors": list(probe.get("errors") or []),
+                    "stus_one_way_delay_s": one_way_delay_s,
+                    "stus_parse_margin_s": parse_margin_s,
+                    "stus_compensation_s": compensation_s,
+                    "stus_requested_utc_s": send_times.get(label),
+                    "tcp_start_utc_s": tcp_start_utc_s,
+                }
                 return
             response_text = response or "<no response>"
             utc_text = datetime.fromtimestamp(unix_time_s, tz=timezone.utc).isoformat(timespec="microseconds")
             statuses[label] = response_text
+            timing_by_camera[label] = {
+                "stus_rtt_median_s": probe.get("median_s"),
+                "stus_rtt_samples_s": list(probe.get("samples_s") or []),
+                "stus_rtt_probe_errors": list(probe.get("errors") or []),
+                "stus_one_way_delay_s": one_way_delay_s,
+                "stus_parse_margin_s": parse_margin_s,
+                "stus_compensation_s": compensation_s,
+                "stus_requested_utc_s": unix_time_s,
+                "tcp_start_utc_s": tcp_start_utc_s,
+            }
             command_logs[label] = (
                 f"> {camera_name} {command.host}:{command.port} {command.command} "
-                f"[pc_utc={utc_text.replace('+00:00', 'Z')}]\n{response_text}\n"
+                f"[pc_utc={utc_text.replace('+00:00', 'Z')}]\n"
+                f"{response_text}\n"
             )
 
         threads = [
@@ -16994,7 +17183,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             thread.start()
         max_timeout_s = max(max(1.0, float(timeout_s)) for _label, _host, _port, timeout_s in target_infos)
         for thread in threads:
-            thread.join(timeout=max_timeout_s + 1.0)
+            thread.join(timeout=max_timeout_s * (WIRIS_STUS_RTT_PROBE_COUNT + 1) + 1.0)
 
         for label, _host, _port, _timeout_s in target_infos:
             if label not in statuses:
@@ -17030,26 +17219,63 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 f"{self._camera_name_ko(last_label)}: {command_skew_ms:.3f} ms"
                 f"{tcp_skew_text}"
             )
+        timing_text_parts: list[str] = []
+        rtt_by_camera: dict[str, float | None] = {}
+        one_way_delay_by_camera: dict[str, float | None] = {}
+        compensation_by_camera: dict[str, float | None] = {}
+        for label, _host, _port, _timeout_s in target_infos:
+            timing = timing_by_camera.get(label, {})
+            try:
+                rtt_median_s = float(timing.get("stus_rtt_median_s"))
+                if not math.isfinite(rtt_median_s) or rtt_median_s < 0.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                rtt_median_s = None
+            try:
+                one_way_delay_s = float(timing.get("stus_one_way_delay_s"))
+                if not math.isfinite(one_way_delay_s) or one_way_delay_s < 0.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                one_way_delay_s = None
+            try:
+                compensation_s = float(timing.get("stus_compensation_s"))
+                if not math.isfinite(compensation_s) or compensation_s < 0.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                compensation_s = None
+            rtt_by_camera[label] = rtt_median_s
+            one_way_delay_by_camera[label] = one_way_delay_s
+            compensation_by_camera[label] = compensation_s
+            if rtt_median_s is None:
+                timing_text_parts.append(f"{self._camera_name_ko(label)} RTT=측정 실패(보정 0ms)")
+            else:
+                compensation_ms = 0.0 if compensation_s is None else compensation_s * 1000.0
+                timing_text_parts.append(
+                    f"{self._camera_name_ko(label)} RTT={rtt_median_s * 1000.0:.2f}ms"
+                    f"→STUS 보정 {compensation_ms:.2f}ms"
+                )
+        timing_text = ""
+        if timing_text_parts:
+            timing_text = " | STUS RTT 보정: " + ", ".join(timing_text_parts)
         status_text = " | ".join(
             f"{self._camera_name_ko(label)}: {statuses.get(label, '<no response>')}"
             for label, _host, _port, _timeout_s in target_infos
-        ) + skew_text
+        ) + skew_text + timing_text
         self.wiris_command_status_label.setText(status_text)
         if hasattr(self, "clock_sync_status_label"):
             self.clock_sync_status_label.setText(f"PC UTC 설정 전송: {status_text}")
             self.clock_sync_summary_text.setPlainText(
-                "STUS command sent from PC UTC.\n"
+                "STUS target = PC send UTC + camera HIWS RTT/2 + 2ms parse margin.\n"
                 "Run RTCP/NTP 동기화 확인 after stream frames arrive to verify left/right RTC and PC UTC offsets.\n"
                 f"{status_text}"
             )
         successful_targets = [
             label
             for label, _host, _port, _timeout_s in target_infos
-            if not str(statuses.get(label, "")).startswith("실패:")
+            if str(statuses.get(label, "")).strip().upper() == "OK"
         ]
-        requested_utc_s = shared_command_time_s.get("unix")
-        if requested_utc_s is None and send_times:
-            requested_utc_s = next(iter(send_times.values()))
+        requested_utc_by_camera = dict(send_times)
+        requested_utc_s = min(send_times.values()) if send_times else None
         result = "success" if len(successful_targets) == len(target_infos) else (
             "partial" if successful_targets else "failed"
         )
@@ -17058,12 +17284,21 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "target": target,
             "result": result,
             "requested_utc_s": requested_utc_s,
+            "requested_utc_by_camera": requested_utc_by_camera,
+            "tcp_start_utc_times": dict(tcp_start_utc_times),
             "successful_targets": successful_targets,
             "responses": {label: statuses.get(label, "") for label, _host, _port, _timeout_s in target_infos},
             "command_skew_ms": command_skew_ms,
             "tcp_start_skew_ms": tcp_start_skew_ms,
+            "compensation_method": "control-rtt-half-plus-parse-margin",
+            "stus_parse_margin_s": WIRIS_STUS_PARSE_MARGIN_S,
+            "stus_rtt_by_camera": rtt_by_camera,
+            "stus_one_way_delay_by_camera": one_way_delay_by_camera,
+            "stus_compensation_by_camera": compensation_by_camera,
+            "stus_rtt_probe_by_camera": rtt_probe_by_camera,
             "recorded_at_unix_s": time.time(),
         }
+        self._camera_sync_requested_utc_by_camera = requested_utc_by_camera
         self._begin_camera_sync_after_stus(
             target=target,
             result=result,

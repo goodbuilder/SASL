@@ -56,6 +56,12 @@ Should receive approximately 55–65% or more of horizontal space under default 
 
 Default width candidate: 280–340 px, initial ~300 px, minimum ~240 px. Contextual, compact, collapsible.
 
+The Status group remains common where a source-backed channel exists. The section below it
+changes its title and field labels for the active context (for example Camera pair, Base
+operation, Physical alignment, or Recording session). Selecting a supported table row or
+engineering value temporarily switches that section to Selection details. Inspector values
+remain read-only projections and preserve the producer's frame, unit, and timestamp contract.
+
 ## 8. Diagnostics Dock
 
 Default height candidate: 180–240 px, initial ~200 px. Initial tabs may be System, Log, Measurement. Opening Diagnostics shall not replace Workspace.
@@ -86,9 +92,10 @@ mapping/settings group.
 
 ## 14. Time / Sync Workspace
 
-The field clock sequence is visible together: set WIRIS time from the PC and check RTCP/NTP
-stream evidence. Workstation timing evidence is limited to WIRIS RTC/STUS-GDTI and live
-RTCP/NTP frame metadata; still-image capture, FTP, and EXIF comparison remain Legacy-only.
+The field clock sequence is visible together: set WIRIS time from the PC, edit/apply/save
+RTCP/NTP sync limits, and check stream evidence. Workstation timing evidence includes WIRIS
+RTC/STUS-GDTI, live RTCP/NTP frame metadata, and the editable sync-limit contract; still-image
+capture, FTP, and EXIF comparison remain Legacy-only.
 
 ## 15. Measurement Workspace
 
@@ -99,13 +106,16 @@ prevent preview interruption and premature saving.
 
 ## 16. Calibration Workspace
 
-Uses local Setup, Capture/intrinsics, and Validation tabs, with the advanced preview/zoom
-handoff placed immediately before the workflow actions.
+Uses local Setup, Capture/intrinsics, and Validation tabs. The advanced preview button
+opens the Workstation `Advanced` preview tab rather than exposing the internal owner UI.
 
 ## 17. Pixhawk / GNSS / Detection / Recording / Analysis
 
-Pixhawk, GNSS/RTK, and Alignment actions use local tabs on the shared evidence workspace;
-Detection remains with Cameras, and Recording/Review remains a task workspace.
+Pixhawk, Base GNSS, and Alignment have separate Workstation pages. Pixhawk presents P1/P2
+attitude, rover fix numbers, and NED/FRD baseline evidence; Base GNSS presents the Base
+receiver, Survey-in/NTRIP, discovered receiver candidates, and RTCM delivery; Alignment
+presents physical sampling and iteration evidence. Detection remains with Cameras, and
+Recording/Review/Files is exposed once as Recording / Sessions.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
@@ -137,8 +147,8 @@ Menu, Toolbar, Navigation, Central Workspace, Diagnostics, Status Bar. Inspector
 - no new top-level tab per feature
 - desktop layout remains usable
 
-Implementation note: the current Workstation keeps one backend owner and provides
-source-backed Overview, Camera, Measurement, Alignment, Calibration, and
-Recording/Review/Export evidence. Advanced operational actions remain an explicit legacy
-handoff; 1366×768, 1600×900, and 1920×1080 offscreen construction was checked, while field
-data density and long-running finalization remain conditions.
+Implementation note: the current Workstation keeps one hidden runtime owner and provides
+source-backed Overview, Camera, Pixhawk, Base GNSS, Measurement, Alignment, Calibration,
+Recording/Review/Export, and Advanced pages. The internal owner UI is not a user-visible
+fallback. 1366×768, 1600×900, and 1920×1080 offscreen construction was checked, while
+field data density and long-running finalization remain conditions.

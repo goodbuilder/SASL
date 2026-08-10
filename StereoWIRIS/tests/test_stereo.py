@@ -4126,6 +4126,7 @@ def test_camera_sync_gate_fields_are_editable_and_loaded_from_settings(monkeypat
     group = widget.findChild(QtWidgets.QGroupBox, "cameraSyncSettingsGroup")
 
     assert group is not None
+    assert widget.tabs.indexOf(group.parentWidget()) == widget.time_tab_index
     assert widget.camera_sync_history_window_spin.value() == pytest.approx(1.0)
     assert widget.camera_sync_receive_pair_max_delta_spin.value() == pytest.approx(350.0)
     assert widget.camera_sync_rtcp_pair_max_delta_spin.value() == pytest.approx(50.0)
@@ -8458,7 +8459,7 @@ def test_manual_gps_baseline_calculator_is_removed(monkeypatch) -> None:
     _ = app
 
 
-def test_wiris_pc_time_uses_one_shared_stus_timestamp_for_both_cameras(monkeypatch) -> None:
+def test_wiris_pc_time_uses_camera_rtt_compensation_for_both_cameras(monkeypatch) -> None:
     import threading
 
     from PyQt5 import QtWidgets
@@ -8475,17 +8476,24 @@ def test_wiris_pc_time_uses_one_shared_stus_timestamp_for_both_cameras(monkeypat
     def fake_send_tcp_line(command):
         with lock:
             sent_commands.append(command.command)
-        return ""
+        return "OK"
 
     monkeypatch.setattr(gui, "send_tcp_line", fake_send_tcp_line)
 
     widget.set_selected_wiris_time_from_pc()
 
-    assert len(sent_commands) == 2
-    assert sent_commands[0] == sent_commands[1]
-    assert sent_commands[0].startswith("STUS ")
+    assert len(sent_commands) == 8
+    assert sent_commands.count("HIWS") == 6
+    stus_commands = [command for command in sent_commands if command.startswith("STUS ")]
+    assert len(stus_commands) == 2
+    assert all(value is not None for value in widget._last_wiris_pc_utc_sync["stus_rtt_by_camera"].values())
+    assert all(
+        value >= 0.002
+        for value in widget._last_wiris_pc_utc_sync["stus_compensation_by_camera"].values()
+    )
+    assert widget._last_wiris_pc_utc_sync["result"] == "success"
+    assert "STUS RTT 보정" in widget.wiris_command_status_label.text()
     assert "명령 UTC 차이" in widget.wiris_command_status_label.text()
-    assert "0.000 ms" in widget.wiris_command_status_label.text()
 
     widget.deleteLater()
     _ = app
@@ -8514,14 +8522,16 @@ def test_time_tab_pc_time_button_uses_selected_wiris_target(monkeypatch) -> None
 
     widget.wiris_set_pc_time_button.click()
 
-    assert len(sent_commands) == 2
-    assert sent_commands[0] == sent_commands[1]
-    assert sent_commands[0].startswith("STUS ")
+    assert len(sent_commands) == 8
+    assert sent_commands.count("HIWS") == 6
+    stus_commands = [command for command in sent_commands if command.startswith("STUS ")]
+    assert len(stus_commands) == 2
     assert "PC UTC 설정 전송" in widget.clock_sync_status_label.text()
-    assert "STUS command sent from PC UTC" in widget.clock_sync_summary_text.toPlainText()
+    assert "STUS camera-specific target applied" in widget.clock_sync_summary_text.toPlainText()
     assert widget._last_wiris_pc_utc_sync["command"] == "STUS"
     assert widget._last_wiris_pc_utc_sync["result"] == "success"
     assert set(widget._last_wiris_pc_utc_sync["successful_targets"]) == {"left", "right"}
+    assert set(widget._last_wiris_pc_utc_sync["requested_utc_by_camera"]) == {"left", "right"}
     widget.deleteLater()
     _ = app
 
@@ -8535,6 +8545,16 @@ def test_wiris_gdti_parser_accepts_sdk_datetime_text() -> None:
 
     assert parsed is not None
     assert parsed == pytest.approx(1785587696.123456, abs=1e-6)
+
+
+def test_wiris_stus_compensation_rejects_invalid_rtt() -> None:
+    from wiris_stereo_distance.gui import WirisStereoDistancePanel
+
+    assert WirisStereoDistancePanel._stus_one_way_delay_s(0.012) == pytest.approx(0.006)
+    assert WirisStereoDistancePanel._stus_compensation_s(0.012) == pytest.approx(0.008)
+    assert WirisStereoDistancePanel._stus_compensation_s(None) == 0.0
+    assert WirisStereoDistancePanel._stus_compensation_s(float("nan")) == 0.0
+    assert WirisStereoDistancePanel._stus_compensation_s(0.251) == 0.0
 
 
 def test_wiris_gdti_verification_uses_query_midpoint_and_integer_resolution() -> None:

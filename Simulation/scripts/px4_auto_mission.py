@@ -274,10 +274,6 @@ class ActualDistanceMonitor:
 
         self._rclpy = rclpy
         try:
-            try:
-                from rclpy.executors import SingleThreadedExecutor
-            except Exception:
-                SingleThreadedExecutor = None
             if not rclpy.ok():
                 rclpy.init(args=None)
                 self._owns_rclpy = True
@@ -287,9 +283,6 @@ class ActualDistanceMonitor:
                 String, "/stereo/auto_mission_phase", 10
             )
             self._phase_type = String
-            if SingleThreadedExecutor is not None:
-                self._executor = SingleThreadedExecutor()
-                self._executor.add_node(self._node)
             self._ready = True
             self._thread = threading.Thread(target=self._spin, daemon=True)
             self._thread.start()

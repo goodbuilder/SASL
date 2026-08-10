@@ -12,7 +12,9 @@ import time
 import csv
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from workstation_core.attitude_geometry import relative_attitude
 
 from workstation_core.coordinate_contract import (
     BASELINE_TRANSLATION_FRAME,
@@ -147,8 +149,8 @@ class EvidenceAdapter:
         configured = getattr(self.panel, "app_root", None)
         if configured not in (None, ""):
             return Path(configured)
-        # Compatibility panels created by older tests and the Legacy adapter
-        # retain the original StereoWIRIS root.
+        # Lightweight test owners may omit app_root; the repository-owned
+        # Workstation core root is the only fallback.
         from workstation_core.settings import APP_ROOT
 
         return Path(APP_ROOT)
@@ -243,6 +245,14 @@ class EvidenceAdapter:
     def baseline(self) -> dict[str, object]:
         baseline = getattr(self.panel, "latest_rtk_baseline", None)
         projection = getattr(self.panel, "latest_p1_body_frd_baseline", None)
+        quality = getattr(self.panel, "latest_baseline_quality", None)
+        quality_values: dict[str, object] = {
+            "sample_count": _integer(getattr(quality, "sample_count", None)),
+            "fixed_ratio": _number(getattr(quality, "rtk_fixed_ratio", None)),
+            "length_std_m": _number(getattr(quality, "baseline_length_std_m", None)),
+            "timestamp_delta_ms": _number(getattr(quality, "timestamp_delta_ms", None)),
+            "reasons": tuple(getattr(quality, "reasons", ()) or ()),
+        }
         projection_values: dict[str, object] = {
             "p1_body_frd_state": "WAITING",
             "p1_body_frd_forward_m": None,
@@ -277,6 +287,9 @@ class EvidenceAdapter:
                 "state": "NO DATA",
                 "source": "RtkBaselineEstimate from left/right GpsPositionState",
                 "axis_contract": "NED = north / east / down; metres",
+                "quality": quality_values,
+                "left_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("left"), "fix_type", None)),
+                "right_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("right"), "fix_type", None)),
                 **projection_values,
             }
         return {
@@ -291,7 +304,327 @@ class EvidenceAdapter:
             "source": "RtkBaselineEstimate from left/right GpsPositionState",
             "axis_contract": "NED = north / east / down; metres",
             "position_frame": "GPS/RTK WGS84 delta projected to local NED; not camera or FRD",
+            "quality": quality_values,
+            "left_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("left"), "fix_type", None)),
+            "right_fix_type": _integer(getattr((getattr(self.panel, "latest_gps", {}) or {}).get("right"), "fix_type", None)),
             **projection_values,
+        }
+
+    def gnss_operation(self, *, now_s: float | None = None) -> dict[str, object]:
+        """Project Base GNSS, Survey-in, NTRIP, and RTCM evidence.
+
+        Base coordinates retain their producer WGS84/height contract. Survey-in
+        ECEF means are explicitly named and never moved into NED, FRD, or camera
+        fields. Rover position and baseline evidence remain owned by ``gps`` and
+        ``baseline`` respectively.
+        """
+
+        now = time.monotonic() if now_s is None else float(now_s)
+        stats = getattr(self.panel, "gnss_base_rtcm_stats", {}) or {}
+        stats = stats if isinstance(stats, Mapping) else {}
+        injection = stats.get("injection", {})
+        injection = injection if isinstance(injection, Mapping) else {}
+        routes: dict[str, dict[str, object]] = {}
+        for side in ("left", "right"):
+            route = injection.get(side, {})
+            route = route if isinstance(route, Mapping) else {}
+            last_delivery = _number(route.get("last_delivery_s"))
+            routes[side] = {
+                "frames": _integer(route.get("frames"), 0),
+                "bytes": _integer(route.get("bytes"), 0),
+                "packets": _integer(route.get("packets"), 0),
+                "fail": _integer(route.get("fail"), 0),
+                "delivery_age_s": None if last_delivery is None else max(0.0, now - last_delivery),
+            }
+        manager = getattr(self.panel, "gnss_operation_manager", None)
+        metadata_method = getattr(manager, "metadata", None)
+        try:
+            metadata = metadata_method() if callable(metadata_method) else {}
+        except Exception:
+            metadata = {}
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        config = getattr(manager, "config", None)
+        config_method = getattr(config, "to_mapping", None)
+        try:
+            config_values = config_method() if callable(config_method) else {}
+        except Exception:
+            config_values = {}
+        config_values = config_values if isinstance(config_values, Mapping) else {}
+        local_config = config_values.get("local_base", {})
+        local_config = local_config if isinstance(local_config, Mapping) else {}
+        network_config = config_values.get("network", {})
+        network_config = network_config if isinstance(network_config, Mapping) else {}
+        fixed_config = config_values.get("fixed_base", {})
+        fixed_config = fixed_config if isinstance(fixed_config, Mapping) else {}
+
+        candidate_rows = getattr(self.panel, "_gnss_base_candidate_rows", ()) or ()
+        candidates: list[dict[str, object]] = []
+        for row in candidate_rows:
+            if not isinstance(row, Mapping):
+                continue
+            messages = row.get("messages", "")
+            if isinstance(messages, (tuple, list)):
+                messages = ", ".join(str(message) for message in messages)
+            candidates.append(
+                {
+                    "port": str(row.get("port", "") or ""),
+                    "target": str(row.get("target", "") or ""),
+                    "baud": _integer(row.get("baud")),
+                    "status": str(row.get("status", "") or ""),
+                    "messages": str(messages or ""),
+                    "ubx": bool(row.get("ubx", False)),
+                }
+            )
+
+        source_identity = metadata.get("correction_source")
+        source_identity = source_identity if isinstance(source_identity, Mapping) else {}
+        survey = getattr(self.panel, "latest_gnss_base_survey_in", None)
+        survey = survey if isinstance(survey, Mapping) else {}
+        survey_samples = getattr(self.panel, "gnss_base_survey_samples", ()) or ()
+        if not survey and survey_samples:
+            try:
+                _sample_time, duration_s, accuracy_m, active, valid = survey_samples[-1]
+                survey = {
+                    "duration_s": duration_s,
+                    "mean_accuracy_m": accuracy_m,
+                    "active": active,
+                    "valid": valid,
+                }
+            except (IndexError, TypeError, ValueError):
+                survey = {}
+
+        coordinate_samples = getattr(self.panel, "gnss_coordinate_samples", ()) or ()
+        latest_coordinate = None
+        try:
+            if coordinate_samples:
+                latest_coordinate = coordinate_samples[-1]
+        except (IndexError, TypeError):
+            latest_coordinate = None
+        coordinate = {
+            "latitude_deg": _number(getattr(latest_coordinate, "latitude_deg", None)),
+            "longitude_deg": _number(getattr(latest_coordinate, "longitude_deg", None)),
+            "ellipsoid_height_m": _number(getattr(latest_coordinate, "ellipsoid_height_m", None)),
+            "msl_altitude_m": _number(getattr(latest_coordinate, "msl_altitude_m", None)),
+            "selected_height_m": _number(getattr(latest_coordinate, "selected_height_m", None)),
+            "height_type": str(getattr(getattr(latest_coordinate, "height_type", None), "value", "UNKNOWN")),
+            "fixed": None if latest_coordinate is None else bool(getattr(latest_coordinate, "fixed", False)),
+            "device_id": str(getattr(latest_coordinate, "device_id", "") or ""),
+            "age_s": _age(getattr(latest_coordinate, "timestamp_s", None), now),
+            "position_contract": "WGS84 latitude/longitude degrees; heights metres with explicit height type",
+        }
+
+        profile = getattr(self.panel, "gnss_fixed_base_profile", None)
+        profile_method = getattr(profile, "to_mapping", None)
+        try:
+            profile_values = profile_method() if callable(profile_method) else {}
+        except Exception:
+            profile_values = {}
+        profile_values = profile_values if isinstance(profile_values, Mapping) else {}
+        readiness = None
+        readiness_method = getattr(manager, "readiness", None)
+        if callable(readiness_method):
+            try:
+                readiness = readiness_method()
+            except Exception:
+                readiness = None
+        state = getattr(manager, "state", "UNKNOWN")
+        state = str(getattr(state, "value", state) or "UNKNOWN")
+        elapsed_s = max(0.0, now - float(stats.get("start_s") or now))
+        return {
+            "state": state,
+            "mode": str(metadata.get("gnss_operation_mode", config_values.get("operation_mode", "UNKNOWN"))),
+            "experiment_site": {
+                "label": str(config_values.get("site_label", "") or ""),
+                "address": str(config_values.get("site_address", "") or ""),
+                "coordinate_contract": "WGS84 geodetic latitude/longitude; Base height is explicit ellipsoid/MSL",
+            },
+            "source_identity": dict(source_identity),
+            "invalidation_reason": str(metadata.get("invalidation_reason", "") or ""),
+            "base_serial": {
+                "connected": bool(getattr(self.panel, "gnss_base_serial_connected", False)),
+                "device": str(source_identity.get("base_device", local_config.get("device", "")) or ""),
+                "baud": _integer(local_config.get("baud")),
+            },
+            "base_candidates": tuple(candidates),
+            "base_discovery_active": getattr(self.panel, "gnss_base_detect_thread", None) is not None,
+            "base_discovery_status": str(
+                getattr(self.panel, "workstation_gnss_base_discovery_status", "NOT RUN") or "NOT RUN"
+            ),
+            "survey_in": {
+                "active": bool(survey.get("active", False)),
+                "valid": bool(survey.get("valid", False)),
+                "duration_s": _integer(survey.get("duration_s"), 0),
+                "target_duration_s": _number(local_config.get("survey_in_min_duration_s")),
+                "mean_accuracy_m": _number(survey.get("mean_accuracy_m")),
+                "target_accuracy_m": _number(local_config.get("survey_in_accuracy_limit_m")),
+                "observations": _integer(survey.get("observations")),
+                "mean_ecef_m": (
+                    _number(survey.get("mean_x_m")),
+                    _number(survey.get("mean_y_m")),
+                    _number(survey.get("mean_z_m")),
+                ),
+                "axis_contract": "ECEF [X,Y,Z] metres from UBX NAV-SVIN; not NED, FRD, or camera RDF",
+            },
+            "ntrip": {
+                "connected": bool(getattr(self.panel, "gnss_network_connected", False)),
+                "status": str(getattr(self.panel, "gnss_network_status_line", "") or ""),
+                "caster_host": str(source_identity.get("caster_host", network_config.get("caster_host", "")) or ""),
+                "caster_port": _integer(source_identity.get("caster_port", network_config.get("caster_port"))),
+                "mountpoint": str(source_identity.get("mountpoint", network_config.get("mountpoint", "")) or ""),
+                "gga_policy": str(source_identity.get("gga_policy", network_config.get("gga_policy", "")) or ""),
+                "tls": bool(network_config.get("tls", False)),
+                "username_env": str(network_config.get("username_env", "") or ""),
+                "password_env": str(network_config.get("password_env", "") or ""),
+            },
+            "base_coordinate": coordinate,
+            "fixed_base": {
+                "sample_count": _safe_len(coordinate_samples),
+                "profile": dict(profile_values),
+                "target_acquisition_duration_s": _number(fixed_config.get("acquisition_duration_s")),
+                "target_fixed_duration_s": _number(fixed_config.get("minimum_fixed_duration_s")),
+                "target_fixed_ratio": _number(fixed_config.get("minimum_fixed_ratio")),
+                "maximum_horizontal_scatter_m": _number(fixed_config.get("maximum_horizontal_scatter_m")),
+                "maximum_vertical_scatter_m": _number(fixed_config.get("maximum_vertical_scatter_m")),
+                "height_type": str(fixed_config.get("height_type", "UNKNOWN") or "UNKNOWN"),
+                "reconfigure_ack": bool(getattr(self.panel, "gnss_fixed_base_reconfigure_ack", False)),
+                "reconfigure_readback": bool(getattr(self.panel, "gnss_fixed_base_reconfigure_readback", False)),
+                "reconfigure_rtcm": bool(getattr(self.panel, "gnss_fixed_base_reconfigure_rtcm", False)),
+            },
+            "base_frames": _integer(stats.get("frames"), 0),
+            "base_bytes": _integer(stats.get("bytes"), 0),
+            "average_frame_rate_hz": float(stats.get("frames") or 0) / elapsed_s if elapsed_s > 0.0 else 0.0,
+            "average_byte_rate_bps": float(stats.get("bytes") or 0) / elapsed_s if elapsed_s > 0.0 else 0.0,
+            "last_frame_age_s": _age(stats.get("last_frame_s"), now),
+            "routes": routes,
+            "readiness": (
+                readiness.to_metadata()
+                if readiness is not None and callable(getattr(readiness, "to_metadata", None))
+                else {}
+            ),
+            "contract": "RTCM base stream → MAVLink GPS_RTCM_DATA route; bytes/packets are producer counters",
+        }
+
+    def camera_connection_candidates(self) -> dict[str, object]:
+        """Project discovered camera endpoints without exposing owner-only objects."""
+
+        rows = getattr(self.panel, "_camera_candidate_rows", ()) or ()
+        candidates: list[dict[str, object]] = []
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            interface = row.get("interface")
+            candidates.append(
+                {
+                    "kind": str(row.get("kind", "") or ""),
+                    "address": str(row.get("address", "") or ""),
+                    "host": str(row.get("host", "") or ""),
+                    "port": str(row.get("port", "") or ""),
+                    "status": str(row.get("status", "") or ""),
+                    "interface": str(getattr(interface, "name", "") or ""),
+                    "host_ip": str(row.get("host_ip", "") or ""),
+                }
+            )
+        return {
+            "candidates": tuple(candidates),
+            "discovery_active": any(
+                getattr(self.panel, name, None) is not None
+                for name in ("camera_network_discovery_thread", "camera_auto_detect_thread")
+            ),
+            "status": str(getattr(self.panel, "workstation_camera_discovery_status", "NOT RUN") or "NOT RUN"),
+            "contract": "Network/RTSP/control endpoint metadata; no image coordinates or camera-frame values",
+        }
+
+    def pixhawk_connection_candidates(self) -> dict[str, object]:
+        """Project PC-interface, USB, and MAVLink candidates for explicit P1/P2 assignment."""
+
+        grouped = getattr(self.panel, "_pixhawk_candidate_rows_by_source", None)
+        if not isinstance(grouped, Mapping):
+            grouped = {"mavlink": getattr(self.panel, "_pixhawk_candidate_rows", ()) or ()}
+        candidates: list[dict[str, object]] = []
+        for source in ("pc", "mavlink"):
+            rows = grouped.get(source, ()) or ()
+            for source_row, row in enumerate(rows):
+                if not isinstance(row, Mapping):
+                    continue
+                candidates.append(
+                    {
+                        "source": source,
+                        "source_row": source_row,
+                        "kind": str(row.get("kind", "") or ""),
+                        "value": str(row.get("value", "") or ""),
+                        "baud": _integer(row.get("baud")),
+                        "status": str(row.get("status", "") or ""),
+                        "interface": str(row.get("interface", "") or ""),
+                    }
+                )
+        return {
+            "candidates": tuple(candidates),
+            "discovery_active": any(
+                getattr(self.panel, name, None) is not None
+                for name in ("pixhawk_usb_discovery_thread", "pixhawk_host_ip_discovery_thread")
+            ),
+            "status": str(getattr(self.panel, "workstation_pixhawk_discovery_status", "NOT RUN") or "NOT RUN"),
+            "contract": "Host/serial/MAVLink endpoint metadata; no attitude, position, or baseline values",
+        }
+
+    def physical_alignment(self) -> dict[str, object]:
+        """Return physical-alignment evidence and iteration history."""
+
+        snapshot_method = getattr(self.panel, "workstation_physical_alignment_snapshot", None)
+        if callable(snapshot_method):
+            try:
+                snapshot = snapshot_method()
+            except Exception:
+                snapshot = None
+            if isinstance(snapshot, Mapping):
+                return dict(snapshot)
+
+        quality = getattr(self.panel, "latest_physical_alignment_quality", None)
+        quality_mapping = (
+            quality.to_mapping()
+            if quality is not None and callable(getattr(quality, "to_mapping", None))
+            else dict(quality)
+            if isinstance(quality, Mapping)
+            else {}
+        )
+        left = (getattr(self.panel, "latest_extrinsics", {}) or {}).get("left")
+        right = (getattr(self.panel, "latest_extrinsics", {}) or {}).get("right")
+        relative_rpy: tuple[float, float, float] | None = None
+        if left is not None and right is not None:
+            try:
+                relative = relative_attitude(left.q, right.q)
+                relative_rpy = (relative.roll_deg, relative.pitch_deg, relative.yaw_deg)
+            except (AttributeError, TypeError, ValueError):
+                relative_rpy = None
+        baseline = self.baseline()
+        current_frd = tuple(
+            baseline.get(key)
+            for key in (
+                "p1_body_frd_forward_m",
+                "p1_body_frd_right_m",
+                "p1_body_frd_down_m",
+            )
+        )
+        if not all(value is not None for value in current_frd):
+            current_frd = None
+        gps = {side: self.gps(side) for side in ("left", "right")}
+        return {
+            "state": "LIVE" if relative_rpy is not None and baseline.get("state") not in {"NO DATA", "UNKNOWN"} else "WAITING",
+            "sampling_active": bool(getattr(self.panel, "baseline_sampling_active", False)),
+            "sample_count": _safe_len(getattr(self.panel, "physical_alignment_samples", ())),
+            "current_baseline_ned_m": tuple(
+                baseline.get(key) for key in ("north_m", "east_m", "down_m")
+            ),
+            "current_baseline_frd_m": current_frd,
+            "relative_rpy_deg": relative_rpy,
+            "fix_type": {side: gps[side].get("fix_type") for side in ("left", "right")},
+            "quality": quality_mapping,
+            "iterations": tuple(getattr(self.panel, "alignment_iteration_history", ()) or ()),
+            "physical_adjustment_only": True,
+            "coordinate_contract": (
+                "raw baseline NED [north,east,down] is preserved; P1→P2 FRD [forward,right,down] "
+                "is an attitude-derived observation; ΔR/P/Y is [roll,pitch,yaw]"
+            ),
         }
 
     def detection(self, side: str, *, now_s: float | None = None) -> dict[str, object]:
@@ -373,7 +706,7 @@ class EvidenceAdapter:
         }
 
     def measurement_settings(self) -> dict[str, object]:
-        """Project editable measurement/synchronization settings.
+        """Project editable Measurement and Time/Sync settings.
 
         The values are read from the panel's existing controls and settings
         object.  Workstation may send this same shape back through the
@@ -501,7 +834,7 @@ class EvidenceAdapter:
                     setting("camera_sync_warmup_timeout_s"),
                 )
             ),
-            "source": "existing measurement parameter widgets + AppSettings",
+            "source": "existing Measurement/Time-Sync owner widgets + AppSettings",
             "coordinate_contract": f"intrinsics/extrinsics source selectors; public output {MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]",
         }
 
@@ -730,7 +1063,13 @@ class EvidenceAdapter:
         active = getattr(self.panel, "active_intrinsics", None)
         latest = getattr(self.panel, "last_calibration_result", None)
         result = active or latest
-        status_label = _widget_text(getattr(self.panel, "calibration_status_label", None), "")
+        calculation_active = getattr(self.panel, "checkerboard_calibration_thread", None) is not None
+        calibration_status = _widget_text(getattr(self.panel, "calibration_status_label", None), "")
+        calculation_status = _widget_text(
+            getattr(self.panel, "checkerboard_validation_status_label", None),
+            "",
+        )
+        status_label = calculation_status if calculation_active and calculation_status else calibration_status
         profile_path = str(getattr(self.panel, "_active_intrinsics_profile_path", "") or "")
         if not profile_path and result is not None:
             profile_path = "memory/latest-calibration"
@@ -751,12 +1090,21 @@ class EvidenceAdapter:
                 "baseline_m": sum(float(value) * float(value) for value in translation) ** 0.5 if translation else None,
             }
         return {
-            "state": "ACTIVE" if active is not None else "AVAILABLE" if result is not None else "NO DATA",
+            "state": (
+                "CALCULATING"
+                if calculation_active
+                else "ACTIVE"
+                if active is not None
+                else "AVAILABLE"
+                if result is not None
+                else "NO DATA"
+            ),
             "active": active is not None,
+            "calculation_active": calculation_active,
             "profile_path": profile_path,
             "zoom": zoom,
             "status_label": status_label,
-            "source": "active_intrinsics/last_calibration_result",
+            "source": "checkerboard calculation worker + active_intrinsics/last_calibration_result",
             "left": self._camera_intrinsics(None if result is None else getattr(result, "left", None)),
             "right": self._camera_intrinsics(None if result is None else getattr(result, "right", None)),
             "extrinsics": extrinsics_payload,

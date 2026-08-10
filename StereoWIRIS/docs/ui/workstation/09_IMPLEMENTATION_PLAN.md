@@ -77,17 +77,19 @@ Implemented:
 - protocol-ordered camera readiness actions, Pixhawk/GNSS/Alignment local action tabs, and Calibration setup/capture/validation tabs
 - Measurement Run control and source-backed Current measurement quality projection
 - recording safety gates for preview interruption, camera/Pixhawk mapping swaps, and premature session save
-- editable Measurement / synchronization settings with Apply and Save routed through the existing owner
+- editable Measurement settings and Time / Sync limits with Apply and Save routed through the existing owner
 - editable Calibration setup (checkerboard geometry, zoom, validation root/mode/seed) with Apply, scan, and Save routed through the existing owner
 - Alignment source scan, baseline sampling, profile save/load, and Pixhawk-side swap commands routed through the existing owner
 - session catalog, artifact selection, CSV preview, folder/artifact open, and manifest error visibility without rewriting saved rows
-- read-only Inspector context details for PX4/GNSS/Detection/Recording/Calibration
+- read-only, context-specific Inspector summaries for PX4/GNSS/Detection/Recording/Calibration,
+  with paired Camera and Pixhawk status plus selected-value evidence
 - phase-one direct operation commands for camera discovery/RTSP/control, Pixhawk discovery/MAVLink,
   GNSS Base serial/Survey-in/NTRIP, and calibration capture/run/save/load/apply/validation
 - Advanced owner workspace now directly exposes live checkerboard preview/zoom, raw WIRIS SDK, PX4 MAG/attitude/Shell, MAVLink field-watch, baseline field browser, and session media/artifact review. The Workstation does not expose ROS2/uXRCE or still-image/FTP/EXIF clock workflows; those remain Legacy-only. The existing panel remains the technical resource owner; video opens through the system-associated player and workbook generation remains the existing session-save writer.
 
-The Inspector owns no engineering settings store: it exposes runtime evidence, existing
-camera RTSP controls, context-specific read-only details, and the public measurement contract.
+The Inspector owns no engineering settings store: it exposes runtime evidence,
+context-specific read-only details, and the public measurement contract. Camera RTSP and
+other operational controls remain in their Workstation workspace.
 
 Core workspaces: Overview, Camera, Measurement, subject to audit feasibility.
 

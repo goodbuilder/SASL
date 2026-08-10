@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -15,8 +16,10 @@ sys.path.insert(0, str(PACKAGE_ROOT))
 SHA = "b" * 40
 BRANCH = "sim/s2-r4a-test"
 AUTHORITATIVE_ROOT = Path(
-    "/home/moon/Desktop/영상감시시스템-audit-results/s2-r4a/qualification/"
-    "exact-profile-freeze-88a360f"
+    os.environ.get(
+        "SASL_QUALIFICATION_FIXTURE",
+        Path(__file__).resolve().parent / "fixtures/qualification/exact-profile-freeze-88a360f",
+    )
 )
 
 
@@ -179,6 +182,8 @@ def test_unseal_requires_both_frozen_hashes() -> None:
 def test_verify_anchor_cli_uses_production_validator_before_any_mutation(
     tmp_path: Path,
 ) -> None:
+    if not AUTHORITATIVE_ROOT.is_dir():
+        pytest.skip("sealed qualification fixture unavailable; set SASL_QUALIFICATION_FIXTURE")
     module = _cli_module()
     qualification = tmp_path / "qualification"
     shutil.copytree(AUTHORITATIVE_ROOT, qualification)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Callable
 
@@ -14,11 +15,21 @@ from workstation_core.coordinate_contract import (
     MEASUREMENT_FRAME,
     WORLD_FRAME,
 )
+from workstation_core.theme import (
+    ERROR_BG,
+    ERROR_TEXT,
+    PANEL_BORDER,
+    SUCCESS_BG,
+    SUCCESS_TEXT,
+)
 
-from .components import EngineeringValue, EmptyStateView, StatusIndicator, WorkspaceHeader
+from .components import EngineeringValue, StatusIndicator, WorkspaceHeader
 from .evidence import EvidenceAdapter
 from .protocol import ProtocolReadiness, evaluate_recording_protocol
 from .status_model import RuntimeStatus, StatusModel, StatusSeverity
+
+
+SESSION_CATALOG_REFRESH_INTERVAL_S = 5.0
 
 
 def _status(model: StatusModel, key: str) -> RuntimeStatus | None:
@@ -71,6 +82,26 @@ def _append_table_row(model: QtGui.QStandardItemModel, values: tuple[object, ...
     model.appendRow(items)
 
 
+def _sync_table_rows(
+    model: QtGui.QStandardItemModel,
+    rows: tuple[tuple[object, ...], ...],
+) -> None:
+    """Update table cells in place so polling does not discard selection."""
+
+    if model.rowCount() != len(rows):
+        model.setRowCount(len(rows))
+    for row_index, values in enumerate(rows):
+        for column_index, value in enumerate(values):
+            text = str(value)
+            item = model.item(row_index, column_index)
+            if item is None:
+                item = QtGui.QStandardItem(text)
+                item.setEditable(False)
+                model.setItem(row_index, column_index, item)
+            elif item.text() != text:
+                item.setText(text)
+
+
 def _command_button(
     text: str,
     command_id: str,
@@ -85,6 +116,14 @@ def _command_button(
     return button
 
 
+def _live_inspection(
+    snapshot: dict[str, object],
+    resolver: Callable[[], dict[str, object]],
+) -> dict[str, object]:
+    snapshot["_resolver"] = resolver
+    return snapshot
+
+
 class OverviewWorkspace(QtWidgets.QWidget):
     open_context = QtCore.pyqtSignal(str)
 
@@ -95,9 +134,9 @@ class OverviewWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Overview"))
+        layout.addWidget(WorkspaceHeader("Overview", "Connect → verify → measure → record"))
 
-        status_group = QtWidgets.QGroupBox("Global status")
+        status_group = QtWidgets.QGroupBox("Status")
         status_layout = QtWidgets.QGridLayout(status_group)
         status_layout.setContentsMargins(6, 6, 6, 6)
         status_layout.setSpacing(5)
@@ -108,7 +147,7 @@ class OverviewWorkspace(QtWidgets.QWidget):
                 ("camera.right", "CAM R"),
                 ("pixhawk.left", "P1"),
                 ("pixhawk.right", "P2"),
-                ("gnss", "RTK / GNSS"),
+                ("gnss.base", "BASE"),
                 ("detection", "DET"),
                 ("measurement", "MEAS"),
                 ("recording", "REC"),
@@ -119,12 +158,12 @@ class OverviewWorkspace(QtWidgets.QWidget):
             status_layout.addWidget(indicator, index // 2, index % 2)
         layout.addWidget(status_group)
 
-        evidence_group = QtWidgets.QGroupBox("Measurement evidence")
+        evidence_group = QtWidgets.QGroupBox("Latest result")
         evidence_layout = QtWidgets.QGridLayout(evidence_group)
         evidence_layout.setContentsMargins(8, 8, 8, 8)
         self.session_value = EngineeringValue("Session")
-        self.measurement_value = EngineeringValue("Last result")
-        self.contract_value = EngineeringValue("Public contract")
+        self.measurement_value = EngineeringValue("Result")
+        self.contract_value = EngineeringValue("Output")
         evidence_layout.addWidget(self.session_value, 0, 0)
         evidence_layout.addWidget(self.measurement_value, 1, 0)
         evidence_layout.addWidget(self.contract_value, 2, 0)
@@ -132,12 +171,15 @@ class OverviewWorkspace(QtWidgets.QWidget):
         layout.addWidget(evidence_group)
 
         actions = QtWidgets.QHBoxLayout()
-        camera_button = QtWidgets.QPushButton("Camera workspace")
+        protocol_button = QtWidgets.QPushButton("Protocol")
+        protocol_button.clicked.connect(lambda: self.open_context.emit("processing.experiment"))
+        camera_button = QtWidgets.QPushButton("Connect cameras")
         camera_button.clicked.connect(lambda: self.open_context.emit("devices.cameras"))
-        measurement_button = QtWidgets.QPushButton("Measurement workspace")
+        measurement_button = QtWidgets.QPushButton("Measure")
         measurement_button.clicked.connect(lambda: self.open_context.emit("processing.measurement"))
-        diagnostics_button = QtWidgets.QPushButton("Show diagnostics")
+        diagnostics_button = QtWidgets.QPushButton("Diagnostics")
         diagnostics_button.clicked.connect(lambda: self.open_context.emit("diagnostics.system"))
+        actions.addWidget(protocol_button)
         actions.addWidget(camera_button)
         actions.addWidget(measurement_button)
         actions.addWidget(diagnostics_button)
@@ -151,19 +193,294 @@ class OverviewWorkspace(QtWidgets.QWidget):
         panel = getattr(self.backend, "panel", self.backend)
         session = str(getattr(panel, "recording_session_id", "") or "") or "--"
         self.session_value.set_value(session, source="recording session metadata")
+        measurement_status = snapshot.get("measurement")
         self.measurement_value.set_value(
-            str(getattr(panel, "last_distance_status", "measurement evidence 대기") or ""),
+            str(getattr(panel, "last_distance_status", "Waiting for measurement") or ""),
             source="MeasurementAttempt/controller result",
             frame=MEASUREMENT_FRAME,
-            valid=str(getattr(panel, "last_distance_quality", "BAD")).upper() in {"GOOD", "VALID"},
+            age_s=measurement_status.age_s if measurement_status else None,
+            valid=str(getattr(panel, "last_distance_quality", "WARNING")).upper() in {"GOOD", "VALID"},
         )
         self.contract_value.set_value(
-            f"{MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]",
+            f"{MEASUREMENT_AXIS_CONTRACT} · metres",
+            frame=MEASUREMENT_FRAME,
             source="coordinate_contract.py",
         )
 
 
+class ExperimentWorkspace(QtWidgets.QWidget):
+    """Guided view of the field protocol using existing owner evidence."""
+
+    open_context = QtCore.pyqtSignal(str)
+
+    def __init__(self, backend: object, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.backend = backend
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(
+            WorkspaceHeader(
+                "Protocol",
+                "0 external prerequisite → 1–11 field protocol · evidence follows the operator order",
+            )
+        )
+        prerequisite_row = QtWidgets.QHBoxLayout()
+        note = QtWidgets.QLabel(
+            "QGC Pixhawk Sensor Calibration is completed outside Workstation. "
+            "Camera intrinsic/stereo calibration remains available in Pre-run Calibration before the run."
+        )
+        note.setObjectName("compactContract")
+        note.setWordWrap(True)
+        prerequisite_row.addWidget(note, 1)
+        self.pre_run_calibration_button = QtWidgets.QPushButton("Open pre-run calibration")
+        self.pre_run_calibration_button.clicked.connect(
+            lambda _checked=False: self.open_context.emit("tasks.calibration")
+        )
+        prerequisite_row.addWidget(self.pre_run_calibration_button)
+        layout.addLayout(prerequisite_row)
+
+        protocol_group = QtWidgets.QGroupBox("Protocol")
+        protocol_layout = QtWidgets.QGridLayout(protocol_group)
+        protocol_layout.setColumnStretch(1, 1)
+        protocol_layout.setColumnStretch(2, 3)
+        protocol_layout.addWidget(QtWidgets.QLabel("Step"), 0, 0)
+        protocol_layout.addWidget(QtWidgets.QLabel("State"), 0, 1)
+        protocol_layout.addWidget(QtWidgets.QLabel("Evidence / action"), 0, 2)
+        protocol_layout.addWidget(QtWidgets.QLabel("Open"), 0, 3)
+        self.step_states: dict[int, QtWidgets.QLabel] = {}
+        self.step_details: dict[int, QtWidgets.QLabel] = {}
+        self.step_buttons: dict[int, QtWidgets.QPushButton] = {}
+        self.step_action_buttons: dict[int, tuple[QtWidgets.QPushButton, ...]] = {}
+        steps = (
+            (0, "QGC Pixhawk calibration", "External", None),
+            (
+                1,
+                "Connect and verify WIRIS / Pixhawk / Base GNSS",
+                "",
+                (
+                    ("Cameras", "devices.cameras"),
+                    ("Pixhawk", "devices.pixhawk"),
+                    ("Base", "devices.gnss"),
+                ),
+            ),
+            (2, "Start Base Survey-in or NTRIP", "", "devices.gnss"),
+            (3, "Initial WIRIS time synchronization", "", "devices.time"),
+            (
+                4,
+                "RTCM injection and numeric fix_type",
+                "",
+                (("Base", "devices.gnss"), ("Pixhawk", "devices.pixhawk")),
+            ),
+            (5, "Physical baseline alignment", "", "processing.alignment"),
+            (6, "Physical Roll / Pitch / Yaw alignment", "", "processing.alignment"),
+            (7, "Repeat physical alignment evidence", "", "processing.alignment"),
+            (8, "Final time-sync quality check / resync", "", "devices.time"),
+            (9, "YOLO and measurement settings", "", "processing.measurement"),
+            (10, "Start measurement", "", "processing.measurement"),
+            (11, "Save measured data", "", "tasks.recording"),
+        )
+        for row, (number, label, initial_state, context) in enumerate(steps, start=1):
+            protocol_layout.addWidget(QtWidgets.QLabel(f"{number}. {label}"), row, 0)
+            state = QtWidgets.QLabel(initial_state or "WAIT")
+            state.setObjectName("protocolState")
+            self.step_states[number] = state
+            protocol_layout.addWidget(state, row, 1)
+            detail = QtWidgets.QLabel("--")
+            detail.setObjectName("protocolCheck")
+            detail.setWordWrap(True)
+            self.step_details[number] = detail
+            protocol_layout.addWidget(detail, row, 2)
+            if context is None:
+                button = QtWidgets.QPushButton("External")
+                button.setEnabled(False)
+                action_widget: QtWidgets.QWidget = button
+                action_buttons = (button,)
+            elif isinstance(context, tuple):
+                action_widget = QtWidgets.QWidget()
+                action_layout = QtWidgets.QHBoxLayout(action_widget)
+                action_layout.setContentsMargins(0, 0, 0, 0)
+                action_layout.setSpacing(4)
+                buttons: list[QtWidgets.QPushButton] = []
+                for button_label, target in context:
+                    action_button = QtWidgets.QPushButton(button_label)
+                    action_button.clicked.connect(
+                        lambda _checked=False, target=target: self.open_context.emit(target)
+                    )
+                    action_layout.addWidget(action_button)
+                    buttons.append(action_button)
+                action_buttons = tuple(buttons)
+                button = action_buttons[0]
+            else:
+                button = QtWidgets.QPushButton("Open")
+                button.clicked.connect(lambda _checked=False, target=context: self.open_context.emit(target))
+                action_widget = button
+                action_buttons = (button,)
+            self.step_buttons[number] = button
+            self.step_action_buttons[number] = action_buttons
+            protocol_layout.addWidget(action_widget, row, 3)
+        layout.addWidget(protocol_group)
+        contract = QtWidgets.QLabel(
+            "Fix evidence is numeric PX4/MAVLink fix_type; RTK_FIXED=6 is reported as a ratio and is not assumed for every run. "
+            "Raw baseline remains NED [north,east,down]; alignment view is P1 body FRD [forward,right,down]."
+        )
+        contract.setObjectName("compactContract")
+        contract.setWordWrap(True)
+        layout.addWidget(contract)
+        layout.addStretch(1)
+
+    @staticmethod
+    def _state(status: RuntimeStatus | None) -> str:
+        return "UNKNOWN" if status is None else str(status.state or "UNKNOWN").upper()
+
+    def _set_step(self, number: int, state: str, detail: str) -> None:
+        self.step_states[number].setText(state)
+        self.step_details[number].setText(detail)
+
+    def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        evidence = _evidence(self.backend)
+        camera_states = (self._state(snapshot.get("camera.left")), self._state(snapshot.get("camera.right")))
+        pixhawk_states = (self._state(snapshot.get("pixhawk.left")), self._state(snapshot.get("pixhawk.right")))
+        gps = {side: evidence.gps(side) for side in ("left", "right")}
+        gnss = evidence.gnss_operation()
+        routes = gnss.get("routes") if isinstance(gnss.get("routes"), dict) else {}
+        physical = evidence.physical_alignment()
+        quality = physical.get("quality") if isinstance(physical.get("quality"), dict) else {}
+        calibration = evidence.calibration()
+        sync_state = self._state(snapshot.get("synchronization"))
+        checkpoints = getattr(getattr(self.backend, "panel", self.backend), "workstation_time_sync_checkpoints", ())
+        final_sync = any(
+            isinstance(item, dict)
+            and str(item.get("phase", "")) == "final"
+            and "VERIFIED" in str(item.get("status", "")).upper()
+            for item in checkpoints or ()
+        )
+
+        connected = all(state in {"LIVE", "CONNECTED", "STARTING"} for state in (*camera_states, *pixhawk_states))
+        gps_present = all(data.get("fix_type") is not None for data in gps.values())
+        mode = str(gnss.get("mode", "UNKNOWN") or "UNKNOWN")
+        base_serial = gnss.get("base_serial") if isinstance(gnss.get("base_serial"), dict) else {}
+        ntrip = gnss.get("ntrip") if isinstance(gnss.get("ntrip"), dict) else {}
+        if mode in {"LOCAL_SURVEY_IN", "NETWORK_ASSISTED_FIXED_BASE"}:
+            base_link_ready = bool(base_serial.get("connected", False))
+            base_link_text = "CONNECTED" if base_link_ready else "DISCONNECTED"
+        elif mode == "NETWORK_RTK_DIRECT":
+            base_link_ready = bool(ntrip.get("caster_host") and ntrip.get("mountpoint"))
+            base_link_text = "NTRIP CONFIGURED" if base_link_ready else "NTRIP NOT CONFIGURED"
+        else:
+            base_link_ready = False
+            base_link_text = f"MODE {mode}"
+        self._set_step(
+            1,
+            "READY" if connected and gps_present and base_link_ready else "WAIT",
+            f"CAM L/R={camera_states[0]}/{camera_states[1]} · P1/P2={pixhawk_states[0]}/{pixhawk_states[1]} · "
+            f"BASE={base_link_text} · GPS fix_type={gps['left'].get('fix_type', '--')}/{gps['right'].get('fix_type', '--')}",
+        )
+        base_frames = int(gnss.get("base_frames") or 0)
+        operation_state = str(gnss.get("state", "UNKNOWN") or "UNKNOWN")
+        survey_or_ntrip = operation_state in {
+            "BASE_SURVEYING",
+            "NTRIP_ACTIVE",
+            "LOCAL_RTCM_ACTIVE",
+            "ROVERS_CONVERGING",
+            "READY",
+            "MEASURING",
+        }
+        self._set_step(2, "READY" if survey_or_ntrip or base_frames > 0 else "WAIT", f"operation={operation_state} · base RTCM frames={base_frames}")
+        self._set_step(3, "READY" if sync_state == "SYNCED" else "WAIT", f"RTCP/NTP state={sync_state}")
+        route_ready = all(
+            isinstance(routes.get(side), dict)
+            and int(routes[side].get("packets") or 0) > 0
+            for side in ("left", "right")
+        )
+        self._set_step(
+            4,
+            "READY" if route_ready and gps_present else "WAIT",
+            f"RTCM route L/R={'OK' if route_ready else 'WAIT'} · numeric fix_type="
+            f"{gps['left'].get('fix_type', '--')}/{gps['right'].get('fix_type', '--')} · RTK_FIXED ratio="
+            f"{float(quality.get('fixed_ratio', 0.0)) * 100.0:.1f}%" if quality.get("fixed_ratio") not in (None, "") else
+            f"RTCM route L/R={'OK' if route_ready else 'WAIT'} · numeric fix_type="
+            f"{gps['left'].get('fix_type', '--')}/{gps['right'].get('fix_type', '--')}",
+        )
+        alignment_state = str(physical.get("state", "WAITING") or "WAITING")
+        relative = physical.get("relative_rpy_deg")
+        relative_text = "R/P/Y=--"
+        if isinstance(relative, (tuple, list)) and len(relative) == 3:
+            relative_text = "R/P/Y=" + "/".join(f"{float(value):+.2f}°" for value in relative)
+        sampling_active = bool(physical.get("sampling_active"))
+        quality_reasons = {
+            str(reason)
+            for reason in (quality.get("reasons") or ())
+        }
+        fix_reasons = {"fix_type_missing", "fix_type_below_minimum", "fixed_ratio_below_minimum"}
+        fix_ok = not bool(quality_reasons & fix_reasons)
+        baseline_error = quality.get("baseline_error_m")
+        baseline_evaluated = isinstance(baseline_error, (tuple, list)) and len(baseline_error) == 3
+        baseline_ok = baseline_evaluated and fix_ok and "baseline_frd_out_of_tolerance" not in quality_reasons
+        rpy_error = quality.get("relative_rpy_error_deg")
+        rpy_evaluated = isinstance(rpy_error, (tuple, list)) and len(rpy_error) == 3
+        rpy_ok = rpy_evaluated and fix_ok and "relative_rpy_out_of_tolerance" not in quality_reasons
+
+        def vector_text(value: object, *, suffix: str) -> str:
+            if not isinstance(value, (tuple, list)) or len(value) != 3:
+                return "--"
+            return "/".join(f"{float(item):+.3f}{suffix}" for item in value)
+
+        samples = physical.get("sample_count", quality.get("sample_count", "--"))
+        self._set_step(
+            5,
+            "SAMPLING" if sampling_active else "READY" if baseline_ok else "CHECK" if baseline_evaluated else "WAIT",
+            f"P1→P2 FRD error={vector_text(baseline_error, suffix='m')} · samples={samples}",
+        )
+        self._set_step(
+            6,
+            "SAMPLING" if sampling_active else "READY" if rpy_ok else "CHECK" if rpy_evaluated else "WAIT",
+            f"{relative_text} · error={vector_text(rpy_error, suffix='°')} · samples={samples}",
+        )
+        iterations = physical.get("iterations")
+        iteration_count = len(iterations) if isinstance(iterations, (tuple, list)) else 0
+        repeat_ready = iteration_count >= 2 and baseline_ok and rpy_ok
+        self._set_step(
+            7,
+            "SAMPLING" if sampling_active else "READY" if repeat_ready else "CHECK" if iteration_count else "WAIT",
+            f"completed iterations={iteration_count}/2 · latest state={alignment_state}",
+        )
+        self._set_step(8, "READY" if final_sync else "CHECK", f"current={sync_state} · final checkpoint={'recorded' if final_sync else 'not recorded'}")
+        calibration_ready = bool(calibration.get("active"))
+        measurement_config = evidence.measurement_settings()
+        self._set_step(9, "READY" if calibration_ready else "WAIT", f"active calibration={'yes' if calibration_ready else 'no'} · mode={measurement_config.get('distance_mode', '--')}")
+        measurement_state = self._state(snapshot.get("measurement"))
+        detection_state = self._state(snapshot.get("detection"))
+        if measurement_state == "VALID":
+            run_state = "VALID"
+        elif detection_state in {"RUNNING", "STARTING"}:
+            run_state = "RUNNING"
+        else:
+            run_state = "WAIT"
+        self._set_step(
+            10,
+            run_state,
+            f"detection={detection_state} · measurement result={measurement_state}",
+        )
+        panel = getattr(self.backend, "panel", self.backend)
+        has_data = bool(getattr(panel, "recording_session_id", "")) or bool(getattr(panel, "distance_history", ()))
+        recording_state = self._state(snapshot.get("recording"))
+        if recording_state == "SAVED":
+            save_state, save_detail = "SAVED", "session artifacts finalized"
+        elif recording_state == "FINALIZING":
+            save_state, save_detail = "SAVING", "session save worker running"
+        elif recording_state == "RECOVERABLE":
+            save_state, save_detail = "RETRY", "retryable spool preserved; save again"
+        elif has_data:
+            save_state, save_detail = "SAVE", "unsaved session data available"
+        else:
+            save_state, save_detail = "WAIT", "save becomes available after a measurement"
+        self._set_step(11, save_state, save_detail)
+
+
 class CameraPreview(QtWidgets.QFrame):
+    IMAGE_ASPECT_RATIO = 16.0 / 9.0
+
     def __init__(self, side: str, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.side = side
@@ -180,7 +497,7 @@ class CameraPreview(QtWidgets.QFrame):
         self.image.setMinimumSize(0, 0)
         self.image.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Expanding)
         self.image.setObjectName("cameraPreviewImage")
-        self.meta = QtWidgets.QLabel("status: waiting")
+        self.meta = QtWidgets.QLabel("WAITING")
         self.meta.setObjectName("cameraPreviewMeta")
         self.meta.setWordWrap(True)
         self.meta.setMinimumWidth(0)
@@ -190,14 +507,31 @@ class CameraPreview(QtWidgets.QFrame):
         layout.addWidget(self.meta)
         self._image: QtGui.QImage | None = None
 
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override.
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt override.
+        content_width = max(0, int(width) - self.layout().contentsMargins().left() - self.layout().contentsMargins().right())
+        image_height = int(round(content_width / self.IMAGE_ASPECT_RATIO))
+        chrome_height = sum(
+            widget.sizeHint().height()
+            for widget in (self.findChild(QtWidgets.QLabel, "cameraPreviewTitle"), self.meta)
+        )
+        return image_height + chrome_height + self.layout().spacing() * 2 + self.layout().contentsMargins().top() + self.layout().contentsMargins().bottom()
+
     def set_frame(self, image: QtGui.QImage, metadata: object) -> None:
         self._image = image
         self._render()
-        self.meta.setText(self._metadata_text(metadata, live=True))
+        self._set_metadata(metadata, live=True)
 
     def set_metadata(self, metadata: object) -> None:
         live = self._image is not None and not self._image.isNull()
-        self.meta.setText(self._metadata_text(metadata, live=live))
+        self._set_metadata(metadata, live=live)
+
+    def _set_metadata(self, metadata: object, *, live: bool) -> None:
+        self.meta.setText("LIVE" if live else "WAITING")
+        detail = self._metadata_text(metadata, live=live)
+        self.meta.setToolTip(detail)
 
     def _metadata_text(self, metadata: object, *, live: bool) -> str:
         data = metadata if isinstance(metadata, dict) else {}
@@ -227,6 +561,9 @@ class CameraPreview(QtWidgets.QFrame):
 
 
 class CameraWorkspace(QtWidgets.QWidget):
+    inspection_requested = QtCore.pyqtSignal(object)
+    CAMERA_ASPECT_RATIO = 16.0 / 9.0
+
     def __init__(
         self,
         backend: object,
@@ -243,23 +580,37 @@ class CameraWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(WorkspaceHeader("Cameras"))
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+
+        # Keep the live pair usable even when the camera workspace also shows
+        # discovery, detection, and mapping controls.  Those controls have
+        # sizeable layout hints and previously squeezed this splitter down to
+        # a narrow strip on typical workstation displays.
+        self.workspace_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.workspace_splitter.setChildrenCollapsible(False)
+        self.preview_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.preview_splitter.setChildrenCollapsible(False)
+        self.preview_splitter.setMinimumHeight(320)
         self.previews = {side: CameraPreview(side) for side in ("left", "right")}
-        splitter.addWidget(self.previews["left"])
-        splitter.addWidget(self.previews["right"])
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        layout.addWidget(splitter, 1)
-        facts = QtWidgets.QGroupBox("Runtime facts")
+        self.preview_splitter.addWidget(self.previews["left"])
+        self.preview_splitter.addWidget(self.previews["right"])
+        self.preview_splitter.setStretchFactor(0, 1)
+        self.preview_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.addWidget(self.preview_splitter)
+
+        details = QtWidgets.QWidget()
+        details_layout = QtWidgets.QVBoxLayout(details)
+        details_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.setSpacing(6)
+        facts = QtWidgets.QGroupBox("Status")
         facts_layout = QtWidgets.QGridLayout(facts)
         self.camera_values = {}
         for col, (key, label) in enumerate((("camera.left", "CAM L"), ("camera.right", "CAM R"), ("fps", "Decoded FPS"), ("detection", "Detection"))):
             value = EngineeringValue(label)
             self.camera_values[key] = value
             facts_layout.addWidget(value, 0, col)
-        layout.addWidget(facts)
+        details_layout.addWidget(facts)
 
-        detection_group = QtWidgets.QGroupBox("Detection configuration / target evidence")
+        detection_group = QtWidgets.QGroupBox("Detection")
         detection_layout = QtWidgets.QVBoxLayout(detection_group)
         detection_layout.setContentsMargins(6, 6, 6, 6)
         config_layout = QtWidgets.QGridLayout()
@@ -291,40 +642,116 @@ class CameraWorkspace(QtWidgets.QWidget):
         self.target_table.setMaximumHeight(118)
         self.target_table.horizontalHeader().setStretchLastSection(True)
         detection_layout.addWidget(self.target_table)
-        layout.addWidget(detection_group)
+        details_layout.addWidget(detection_group)
 
-        operations_group = QtWidgets.QGroupBox("Camera readiness")
+        operations_group = QtWidgets.QGroupBox("Connect")
         operations_layout = QtWidgets.QGridLayout(operations_group)
         operations_layout.setContentsMargins(6, 6, 6, 6)
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for index, (command_id, label) in enumerate(
             (
-                ("camera.discover_host_ip", "Discover Camera Network"),
-                ("camera.auto_connect", "Auto-Connect Cameras"),
-                ("camera.check_control", "Verify Camera Control"),
-                ("camera.enable_rtsp", "Enable Video Stream"),
-                ("camera.check_rtsp", "Verify Video Stream"),
+                ("camera.discover_host_ip", "Find network"),
+                ("camera.auto_connect", "Connect cameras"),
+                ("camera.check_control", "Check control"),
+                ("camera.enable_rtsp", "Enable stream"),
+                ("camera.check_rtsp", "Check video"),
             )
         ):
             button = _command_button(label, command_id, invoke_command)
             self.operation_buttons[command_id] = button
             operations_layout.addWidget(button, index // 3, index % 3)
-        layout.addWidget(operations_group)
+        details_layout.addWidget(operations_group)
 
-        mapping_group = QtWidgets.QGroupBox("Camera mapping / settings")
+        candidates_group = QtWidgets.QGroupBox("Discovered endpoints")
+        candidates_layout = QtWidgets.QVBoxLayout(candidates_group)
+        self.discovery_status = EngineeringValue("Discovery")
+        candidates_layout.addWidget(self.discovery_status)
+        self.candidate_model = _table_model(
+            self,
+            ("Kind", "Address", "Port", "Status", "Interface", "Host IP"),
+        )
+        self.candidate_table = QtWidgets.QTableView()
+        self.candidate_table.setModel(self.candidate_model)
+        self.candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.candidate_table.verticalHeader().setVisible(False)
+        self.candidate_table.setMaximumHeight(120)
+        self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_actions)
+        self.candidate_table.clicked.connect(self._inspect_candidate_row)
+        candidates_layout.addWidget(self.candidate_table)
+        candidate_actions = QtWidgets.QHBoxLayout()
+        self.candidate_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for target, label in (("nic", "Use host interface"), ("left", "Assign CAM L"), ("right", "Assign CAM R")):
+            button = QtWidgets.QPushButton(label)
+            button.setEnabled(False)
+            button.clicked.connect(lambda _checked=False, target=target: self._apply_candidate(target))
+            self.candidate_buttons[target] = button
+            candidate_actions.addWidget(button)
+        candidate_actions.addStretch(1)
+        candidates_layout.addLayout(candidate_actions)
+        self.candidate_feedback = QtWidgets.QLabel("")
+        self.candidate_feedback.setObjectName("statusStrip")
+        self.candidate_feedback.setWordWrap(True)
+        candidates_layout.addWidget(self.candidate_feedback)
+        details_layout.addWidget(candidates_group)
+        self._candidate_signature: tuple[tuple[object, ...], ...] = ()
+        self._recording_locked = False
+
+        mapping_group = QtWidgets.QGroupBox("Mapping")
         mapping_layout = QtWidgets.QHBoxLayout(mapping_group)
         mapping_layout.setContentsMargins(6, 6, 6, 6)
         for command_id, label in (
-            ("camera.swap", "Swap Camera Sides"),
-            ("camera.save_settings", "Save Camera Settings"),
-            ("legacy.open", "Open Device Candidate Tools"),
+            ("camera.swap", "Swap L/R"),
+            ("camera.save_settings", "Save"),
+            ("advanced.open", "Advanced"),
         ):
             button = _command_button(label, command_id, invoke_command)
             self.operation_buttons[command_id] = button
             mapping_layout.addWidget(button)
         mapping_layout.addStretch(1)
-        layout.addWidget(mapping_group)
+        details_layout.addWidget(mapping_group)
+        details_layout.addStretch(1)
+
+        self.details_scroll = QtWidgets.QScrollArea()
+        self.details_scroll.setWidgetResizable(True)
+        self.details_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.details_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.details_scroll.setWidget(details)
+        self.details_scroll.setMinimumHeight(120)
+        self.workspace_splitter.addWidget(self.details_scroll)
+        self.workspace_splitter.setStretchFactor(0, 3)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes([600, 240])
+        layout.addWidget(self.workspace_splitter, 1)
         self._connect_panes()
+
+    @classmethod
+    def preview_pair_orientation(cls, width: int, height: int) -> QtCore.Qt.Orientation:
+        """Choose the pair layout that gives two 16:9 frames more usable area."""
+
+        if width <= 0 or height <= 0:
+            return QtCore.Qt.Horizontal
+        return (
+            QtCore.Qt.Horizontal
+            if float(width) / float(height) >= cls.CAMERA_ASPECT_RATIO
+            else QtCore.Qt.Vertical
+        )
+
+    def _update_preview_pair_orientation(self) -> None:
+        orientation = self.preview_pair_orientation(
+            self.preview_splitter.width(),
+            self.preview_splitter.height(),
+        )
+        if self.preview_splitter.orientation() == orientation:
+            return
+        self.preview_splitter.setOrientation(orientation)
+        self.preview_splitter.setSizes([1, 1])
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._update_preview_pair_orientation()
 
     def _connect_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
@@ -362,10 +789,44 @@ class CameraWorkspace(QtWidgets.QWidget):
         )
         recording = snapshot.get("recording")
         recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
+        self._recording_locked = recording_locked
         for command_id in ("camera.swap", "camera.save_settings"):
             button = self.operation_buttons.get(command_id)
             if button is not None:
                 button.setEnabled(not recording_locked)
+        connection = evidence.camera_connection_candidates()
+        camera_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
+        self.discovery_status.set_value(
+            camera_discovery_status,
+            valid=False if camera_discovery_status.startswith("ERROR") else None,
+        )
+        candidates = connection.get("candidates")
+        candidates = tuple(row for row in candidates if isinstance(row, dict)) if isinstance(candidates, (tuple, list)) else ()
+        candidate_signature = tuple(
+            tuple(row.get(key, "") for key in ("kind", "address", "port", "status", "interface", "host_ip"))
+            for row in candidates
+        )
+        if candidate_signature != self._candidate_signature:
+            selected = self._selected_candidate_identity()
+            self.candidate_model.removeRows(0, self.candidate_model.rowCount())
+            for row in candidates:
+                _append_table_row(
+                    self.candidate_model,
+                    tuple(row.get(key, "") for key in ("kind", "address", "port", "status", "interface", "host_ip")),
+                )
+            self._candidate_signature = candidate_signature
+            if selected:
+                for row_index, row in enumerate(candidates):
+                    if (str(row.get("kind", "")), str(row.get("address", ""))) == selected:
+                        self.candidate_table.selectRow(row_index)
+                        break
+        self.operation_buttons["camera.discover_host_ip"].setEnabled(
+            not recording_locked and not bool(connection.get("discovery_active", False))
+        )
+        self.operation_buttons["camera.auto_connect"].setEnabled(
+            not recording_locked and not bool(connection.get("discovery_active", False))
+        )
+        self._refresh_candidate_actions()
         config = evidence.detection_config()
         for key, value in self.detection_config_values.items():
             raw = config.get(key)
@@ -376,7 +837,7 @@ class CameraWorkspace(QtWidgets.QWidget):
             elif key == "gate_enabled":
                 raw = ", ".join(str(item) for item in (raw or ())) or "OFF"
             value.set_value(raw, source=str(config.get("source", "")))
-        self.target_model.removeRows(0, self.target_model.rowCount())
+        target_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
             target = evidence.detection(side)
             bbox = "--"
@@ -389,8 +850,7 @@ class CameraWorkspace(QtWidgets.QWidget):
             confidence = _display_number(target.get("confidence"), digits=3)
             timestamp = _display_number(target.get("timestamp_s"), digits=3)
             age = _display_number(target.get("age_s"), digits=2, suffix="s")
-            _append_table_row(
-                self.target_model,
+            target_rows.append(
                 (
                     side.upper(),
                     target.get("runtime_state", "NO DATA"),
@@ -401,6 +861,70 @@ class CameraWorkspace(QtWidgets.QWidget):
                     age,
                 ),
             )
+        _sync_table_rows(self.target_model, tuple(target_rows))
+
+    def _selected_candidate_row(self) -> int:
+        selected = self.candidate_table.selectionModel().selectedRows()
+        return selected[0].row() if selected else -1
+
+    def _selected_candidate_identity(self) -> tuple[str, str] | None:
+        row = self._selected_candidate_row()
+        kind = self.candidate_model.item(row, 0) if row >= 0 else None
+        address = self.candidate_model.item(row, 1) if row >= 0 else None
+        if kind is None or address is None:
+            return None
+        return kind.text(), address.text()
+
+    def _refresh_candidate_actions(self, *_args: object) -> None:
+        row = self._selected_candidate_row()
+        item = self.candidate_model.item(row, 0) if row >= 0 else None
+        kind = item.text() if item is not None else ""
+        self.candidate_buttons["nic"].setEnabled(not self._recording_locked and kind == "NIC")
+        side_enabled = kind in {"RTSP", "WIRIS"}
+        self.candidate_buttons["left"].setEnabled(not self._recording_locked and side_enabled)
+        self.candidate_buttons["right"].setEnabled(not self._recording_locked and side_enabled)
+
+    def _apply_candidate(self, target: str) -> None:
+        row = self._selected_candidate_row()
+        method = getattr(self.backend, "camera_apply_candidate", None)
+        if row < 0 or not callable(method):
+            self.candidate_feedback.setText("ERROR: select a compatible endpoint")
+            return
+        try:
+            applied = method(row, target)
+        except Exception as exc:
+            self.candidate_feedback.setText(f"ERROR: {exc}")
+            return
+        if applied is False:
+            self.candidate_feedback.setText("ERROR: endpoint was not applied")
+            return
+        self.candidate_feedback.setText(f"Applied row {row + 1} to {target.upper()}")
+        self.refresh(self.status_model.snapshot())
+
+    def _inspect_candidate_row(self, index: QtCore.QModelIndex) -> None:
+        row = index.row()
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._candidate_inspection(row),
+                lambda row=row: self._candidate_inspection(row),
+            )
+        )
+
+    def _candidate_inspection(self, row: int) -> dict[str, object]:
+        candidates = _evidence(self.backend).camera_connection_candidates().get("candidates")
+        candidates = candidates if isinstance(candidates, (tuple, list)) else ()
+        candidate = dict(candidates[row]) if 0 <= row < len(candidates) and isinstance(candidates[row], dict) else {}
+        return {
+            "selection": f"Camera endpoint · {candidate.get('kind', '--')}",
+            "value": (
+                f"address={candidate.get('address', '--')} · port={candidate.get('port', '--')} · "
+                f"host interface={candidate.get('interface', '--')} {candidate.get('host_ip', '')}"
+            ),
+            "freshness": "Latest completed camera network discovery",
+            "contract": "Network/RTSP/control endpoint metadata; no image pixels or camera-frame coordinates",
+            "verdict": candidate.get("status") or "UNVERIFIED",
+            "source": "CameraNetworkDiscoveryWorker",
+        }
 
 
 class TimeWorkspace(QtWidgets.QWidget):
@@ -424,20 +948,17 @@ class TimeWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(
-            WorkspaceHeader(
-                "Time / Sync",
-                "RTCP/NTP frame evidence",
-            )
+            WorkspaceHeader("Clock", "RTCP/NTP")
         )
 
-        workflow_group = QtWidgets.QGroupBox("Clock readiness workflow")
+        workflow_group = QtWidgets.QGroupBox("Clock")
         workflow_layout = QtWidgets.QHBoxLayout(workflow_group)
         workflow_layout.setContentsMargins(6, 6, 6, 6)
         workflow_layout.setSpacing(6)
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for command_id, label in (
-            ("time.set_pc", "Set WIRIS time from PC"),
-            ("time.check_sync", "Check RTCP/NTP sync"),
+            ("time.set_pc", "Set camera clock"),
+            ("time.check_sync", "Check sync"),
         ):
             button = _command_button(label, command_id, invoke_command)
             self.operation_buttons[command_id] = button
@@ -445,21 +966,92 @@ class TimeWorkspace(QtWidgets.QWidget):
         workflow_layout.addStretch(1)
         layout.addWidget(workflow_group)
 
-        sync_group = QtWidgets.QGroupBox("RTCP/NTP stream evidence")
+        sync_group = QtWidgets.QGroupBox("Sync status")
         sync_layout = QtWidgets.QVBoxLayout(sync_group)
-        self.sync_status = QtWidgets.QLabel("RTCP/NTP frame timestamp 대기 중")
+        self.sync_status = QtWidgets.QLabel("Waiting for RTCP/NTP")
         self.sync_status.setObjectName("statusStrip")
         self.sync_status.setWordWrap(True)
         self.sync_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.sync_summary = QtWidgets.QPlainTextEdit()
         self.sync_summary.setReadOnly(True)
         self.sync_summary.setMaximumBlockCount(80)
-        self.sync_summary.setFixedHeight(110)
+        # Keep the sync evidence readable while preserving the compact time
+        # workflow: 30% more vertical room than the original 110 px.
+        self.sync_summary.setFixedHeight(143)
         sync_layout.addWidget(self.sync_status)
         sync_layout.addWidget(self.sync_summary)
         layout.addWidget(sync_group)
 
-        contract = QtWidgets.QLabel("Evidence: RTCP/NTP frame timestamps")
+        settings = _evidence(self.backend).measurement_settings()
+        self.settings_widgets: dict[str, QtWidgets.QWidget] = {}
+
+        def double_spin(
+            key: str,
+            minimum: float,
+            maximum: float,
+            decimals: int,
+            suffix: str,
+        ) -> QtWidgets.QDoubleSpinBox:
+            widget = QtWidgets.QDoubleSpinBox()
+            widget.setRange(minimum, maximum)
+            widget.setDecimals(decimals)
+            widget.setValue(float(settings.get(key) if settings.get(key) is not None else minimum))
+            widget.setSuffix(suffix)
+            self.settings_widgets[key] = widget
+            return widget
+
+        def int_spin(
+            key: str,
+            minimum: int,
+            maximum: int,
+            suffix: str = "",
+        ) -> QtWidgets.QSpinBox:
+            widget = QtWidgets.QSpinBox()
+            widget.setRange(minimum, maximum)
+            value = settings.get(key)
+            widget.setValue(int(value if value is not None else minimum))
+            widget.setSuffix(suffix)
+            self.settings_widgets[key] = widget
+            return widget
+
+        limits_group = QtWidgets.QGroupBox("Sync limits")
+        limits_form = QtWidgets.QGridLayout(limits_group)
+        limits_form.setHorizontalSpacing(8)
+        limits_form.setVerticalSpacing(5)
+        limits_form.setColumnStretch(1, 1)
+        limits_form.setColumnStretch(3, 1)
+        limits_fields = (
+            ("History", double_spin("camera_sync_history_window_s", 0.1, 5.0, 2, " s")),
+            ("Receive skew", double_spin("camera_sync_receive_pair_max_delta_ms", 0.0, 2000.0, 1, " ms")),
+            ("RTCP/NTP Δt", double_spin("camera_sync_rtcp_pair_max_delta_ms", 0.0, 1000.0, 1, " ms")),
+            ("SR stale", double_spin("camera_sync_max_sr_age_s", 0.1, 60.0, 2, " s")),
+            ("SR-PC offset", double_spin("camera_sync_max_pc_offset_ms", 0.0, 5000.0, 1, " ms")),
+            ("Clock rate error", double_spin("camera_sync_clock_rate_error_pct", 0.0, 10.0, 3, " %")),
+            ("Required SR", int_spin("camera_sync_required_sr_count", 1, 20, " count")),
+            ("Warmup", double_spin("camera_sync_warmup_timeout_s", 1.0, 120.0, 1, " s")),
+        )
+        for index, (label, widget) in enumerate(limits_fields):
+            row = index // 2
+            column = (index % 2) * 2
+            limits_form.addWidget(QtWidgets.QLabel(label), row, column)
+            limits_form.addWidget(widget, row, column + 1)
+        layout.addWidget(limits_group)
+
+        self.sync_settings_status = QtWidgets.QLabel(
+            "Sync limits apply now; Save keeps them for the next run."
+        )
+        self.sync_settings_status.setObjectName("statusStrip")
+        self.sync_settings_status.setWordWrap(True)
+        layout.addWidget(self.sync_settings_status)
+        for command_id, label in (
+            ("time.apply_settings", "Apply limits"),
+            ("time.save_settings", "Save limits"),
+        ):
+            button = _command_button(label, command_id, invoke_command)
+            self.operation_buttons[command_id] = button
+            workflow_layout.addWidget(button)
+
+        contract = QtWidgets.QLabel("RTCP/NTP timestamps")
         contract.setObjectName("compactContract")
         layout.addWidget(contract)
         layout.addStretch(1)
@@ -479,16 +1071,25 @@ class TimeWorkspace(QtWidgets.QWidget):
     def refresh(self, _snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         sync_status = self._widget_text(
-            getattr(panel, "clock_sync_status_label", None), "RTCP/NTP frame timestamp 대기 중"
+            getattr(panel, "clock_sync_status_label", None), "Waiting for RTCP/NTP"
         )
         self.sync_status.setText(_compact_text(sync_status))
         self.sync_status.setToolTip(sync_status)
-        self.sync_summary.setPlainText(
-            self._widget_text(getattr(panel, "clock_sync_summary_text", None), "")
-        )
+        summary = self._widget_text(getattr(panel, "clock_sync_summary_text", None), "")
+        if summary != self.sync_summary.toPlainText():
+            self.sync_summary.setPlainText(summary)
+
+    def settings_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        for key, widget in self.settings_widgets.items():
+            if isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+                payload[key] = widget.value()
+        return payload
 
 
 class MeasurementWorkspace(QtWidgets.QWidget):
+    inspection_requested = QtCore.pyqtSignal(object)
+
     def __init__(
         self,
         backend: object,
@@ -503,13 +1104,13 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(WorkspaceHeader("Measurement", "Quality · timing · output frame"))
-        self.result_status = QtWidgets.QLabel("measurement evidence 대기")
+        layout.addWidget(WorkspaceHeader("Measurement", "Camera → detection → result"))
+        self.result_status = QtWidgets.QLabel("Waiting for measurement")
         self.result_status.setObjectName("measurementResultStatus")
         self.result_status.setWordWrap(True)
         layout.addWidget(self.result_status)
 
-        run_group = QtWidgets.QGroupBox("Run control")
+        run_group = QtWidgets.QGroupBox("Run")
         run_layout = QtWidgets.QHBoxLayout(run_group)
         run_layout.setContentsMargins(6, 6, 6, 6)
         run_layout.setSpacing(6)
@@ -518,7 +1119,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             ("camera.toggle", "Preview"),
             ("detection.toggle", "Detection"),
             ("recording.toggle", "Record"),
-            ("session.save", "Save session"),
+            ("session.save", "Save"),
         ):
             button = _command_button(label, command_id, invoke_command)
             self.control_buttons[command_id] = button
@@ -526,19 +1127,20 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         run_layout.addStretch(1)
         layout.addWidget(run_group)
 
-        upstream_group = QtWidgets.QGroupBox("Upstream evidence")
+        upstream_group = QtWidgets.QGroupBox("Inputs")
         upstream_layout = QtWidgets.QVBoxLayout(upstream_group)
         upstream_layout.setContentsMargins(6, 6, 6, 6)
         upstream_layout.setSpacing(4)
-        preview_row = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.preview_row = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        preview_row = self.preview_row
         self.previews = {side: CameraPreview(side) for side in ("left", "right")}
         for side in ("left", "right"):
             preview = self.previews[side]
-            preview.setMinimumHeight(112)
-            preview.setMaximumHeight(220)
+            preview.setMinimumHeight(180)
+            preview.setMaximumHeight(380)
             preview_row.addWidget(preview)
-        preview_row.setMinimumHeight(112)
-        preview_row.setMaximumHeight(220)
+        preview_row.setMinimumHeight(180)
+        preview_row.setMaximumHeight(380)
         preview_row.setStretchFactor(0, 1)
         preview_row.setStretchFactor(1, 1)
         upstream_layout.addWidget(preview_row)
@@ -547,7 +1149,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             ("camera.left", "CAM L"),
             ("camera.right", "CAM R"),
             ("detection", "Detection"),
-            ("synchronization", "Timing / sync"),
+            ("synchronization", "Sync"),
             ("gnss", "GNSS / RTK"),
             ("recording", "Recording"),
             ("fps", "Decoded FPS"),
@@ -559,12 +1161,13 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         for index, (key, label) in enumerate(upstream_fields):
             value = EngineeringValue(label)
             self.upstream_values[key] = value
+            value.activated.connect(lambda key=key: self._inspect_upstream(key))
             facts_layout.addWidget(value, index // 4, index % 4)
         upstream_layout.addLayout(facts_layout)
         layout.addWidget(upstream_group)
         self._connect_panes()
 
-        quality_group = QtWidgets.QGroupBox("Current measurement quality")
+        quality_group = QtWidgets.QGroupBox("Quality")
         quality_layout = QtWidgets.QGridLayout(quality_group)
         quality_layout.setContentsMargins(6, 6, 6, 6)
         quality_layout.setHorizontalSpacing(8)
@@ -601,7 +1204,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         quality_layout.setColumnStretch(3, 1)
         layout.addWidget(quality_group)
 
-        values_group = QtWidgets.QGroupBox("Public result")
+        values_group = QtWidgets.QGroupBox("Result")
         values_layout = QtWidgets.QGridLayout(values_group)
         self.values = {
             "range": EngineeringValue("Range"),
@@ -610,25 +1213,10 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             "down": EngineeringValue("Down"),
         }
         for index, key in enumerate(("range", "forward", "right", "down")):
+            self.values[key].activated.connect(lambda key=key: self._inspect_result(key))
             values_layout.addWidget(self.values[key], index // 2, index % 2)
         layout.addWidget(values_group)
-        contract = QtWidgets.QGroupBox("Input / output contract")
-        contract_layout = QtWidgets.QFormLayout(contract)
-        contract_layout.setContentsMargins(8, 8, 8, 8)
-        for label, value in (
-            ("World / attitude", f"{BODY_FRAME} → {WORLD_FRAME}"),
-            ("Camera input", f"{CAMERA_FRAME} · [u,v]"),
-            ("Baseline translation", f"{BASELINE_TRANSLATION_FRAME} · m"),
-            ("Public output", f"{MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}] · m"),
-        ):
-            label_widget = QtWidgets.QLabel(value)
-            label_widget.setObjectName("compactContract")
-            label_widget.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
-            label_widget.setWordWrap(True)
-            contract_layout.addRow(label, label_widget)
-        layout.addWidget(contract)
-
-        settings_group = QtWidgets.QGroupBox("Measurement / synchronization settings")
+        settings_group = QtWidgets.QGroupBox("Settings")
         settings_layout = QtWidgets.QVBoxLayout(settings_group)
         settings_layout.setContentsMargins(6, 6, 6, 6)
         settings_layout.setSpacing(5)
@@ -699,7 +1287,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         geometry_form.setColumnStretch(3, 1)
         geometry_fields = (
             (
-                "Intrinsics source",
+                "Intrinsics",
                 combo("intrinsics_source", (("Checkerboard", "checkerboard"), ("Manual fallback", "manual"))),
             ),
             (
@@ -707,7 +1295,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
                 double_spin("focal_px", 1.0, 100000.0, 3, " px"),
             ),
             (
-                "Extrinsics / baseline",
+                "Baseline",
                 combo(
                     "distance_mode",
                     (("Pixhawk attitude + GPS/RTK NED", "pixhawk"), ("Checkerboard stereo R/T", "checkerboard")),
@@ -733,7 +1321,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             geometry_form.addWidget(widget, row, column + 1)
         settings_layout.addLayout(geometry_form)
 
-        gate_group = QtWidgets.QGroupBox("Detection pair gates")
+        gate_group = QtWidgets.QGroupBox("Pair gates")
         gate_form = QtWidgets.QGridLayout(gate_group)
         gate_form.setHorizontalSpacing(8)
         gate_form.setVerticalSpacing(5)
@@ -756,31 +1344,8 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         gate_form.addWidget(double_spin("max_vertical_delta_px", 0.0, 5000.0, 1, " px"), 1, 5)
         settings_layout.addWidget(gate_group)
 
-        sync_group = QtWidgets.QGroupBox("Camera RTCP/NTP synchronization gate")
-        sync_form = QtWidgets.QGridLayout(sync_group)
-        sync_form.setHorizontalSpacing(8)
-        sync_form.setVerticalSpacing(5)
-        sync_form.setColumnStretch(1, 1)
-        sync_form.setColumnStretch(3, 1)
-        sync_fields = (
-            ("History", double_spin("camera_sync_history_window_s", 0.1, 5.0, 2, " s")),
-            ("Receive skew", double_spin("camera_sync_receive_pair_max_delta_ms", 0.0, 2000.0, 1, " ms")),
-            ("RTCP/NTP Δt", double_spin("camera_sync_rtcp_pair_max_delta_ms", 0.0, 1000.0, 1, " ms")),
-            ("SR stale", double_spin("camera_sync_max_sr_age_s", 0.1, 60.0, 2, " s")),
-            ("SR-PC offset", double_spin("camera_sync_max_pc_offset_ms", 0.0, 5000.0, 1, " ms")),
-            ("Clock rate error", double_spin("camera_sync_clock_rate_error_pct", 0.0, 10.0, 3, " %")),
-            ("Required SR", int_spin("camera_sync_required_sr_count", 1, 20, " count")),
-            ("Warmup", double_spin("camera_sync_warmup_timeout_s", 1.0, 120.0, 1, " s")),
-        )
-        for index, (label, widget) in enumerate(sync_fields):
-            row = index // 2
-            column = (index % 2) * 2
-            sync_form.addWidget(QtWidgets.QLabel(label), row, column)
-            sync_form.addWidget(widget, row, column + 1)
-        settings_layout.addWidget(sync_group)
-
         self.measurement_settings_status = QtWidgets.QLabel(
-            "Apply: runtime · Save: workstation_data/stereo_distance_settings.json"
+            "Changes apply now; Save keeps them for the next run."
         )
         self.measurement_settings_status.setObjectName("statusStrip")
         self.measurement_settings_status.setWordWrap(True)
@@ -788,8 +1353,8 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         settings_actions = QtWidgets.QHBoxLayout()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         for command_id, label in (
-            ("measurement.apply_settings", "Apply measurement settings"),
-            ("measurement.save_settings", "Save measurement settings"),
+            ("measurement.apply_settings", "Apply"),
+            ("measurement.save_settings", "Save"),
         ):
             button = _command_button(label, command_id, invoke_command)
             self.operation_buttons[command_id] = button
@@ -809,7 +1374,61 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         for column in (1, 2, 3):
             self.history.setColumnWidth(column, 100)
         self.history.horizontalHeader().setStretchLastSection(True)
+        self.history.clicked.connect(self._inspect_history_row)
         layout.addWidget(self.history, 1)
+
+    def _inspect_upstream(self, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._upstream_inspection(key),
+                lambda key=key: self._upstream_inspection(key),
+            )
+        )
+
+    def _upstream_inspection(self, key: str) -> dict[str, object]:
+        status = self.status_model.record(key)
+        return {
+            "selection": self.upstream_values[key].label.text(),
+            "value": status.state if status is not None else "NO DATA",
+            "freshness": "--" if status is None or status.age_s is None else f"age {status.age_s:.2f}s · {status.clock}",
+            "contract": "Producer contract is preserved; inspect the owning device screen for field coordinates",
+            "verdict": status.detail if status is not None else "No evidence",
+            "source": status.source if status is not None else "StatusModel",
+        }
+
+    def _inspect_result(self, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._result_inspection(key),
+                lambda key=key: self._result_inspection(key),
+            )
+        )
+
+    def _result_inspection(self, key: str) -> dict[str, object]:
+        status = self.status_model.record("measurement")
+        value = self.values[key]
+        return {
+            "selection": f"Measurement {value.label.text()}",
+            "value": f"{value.value.text()} {value.unit.text()}".strip(),
+            "freshness": "--" if status is None or status.age_s is None else f"age {status.age_s:.2f}s · {status.clock}",
+            "contract": f"{MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}] · metres",
+            "verdict": self.quality_labels["status"].text(),
+            "source": "accepted DistanceHistoryPoint",
+        }
+
+    def _inspect_history_row(self, index: QtCore.QModelIndex) -> None:
+        row = index.row()
+        values = [self.history_model.item(row, column).text() for column in range(self.history_model.columnCount())]
+        self.inspection_requested.emit(
+            {
+                "selection": f"Measurement history row {row + 1}",
+                "value": f"F/R/D={values[1]}/{values[2]}/{values[3]} m · quality={values[4]}",
+                "freshness": f"timestamp_s={values[0]}",
+                "contract": f"{MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}] · metres",
+                "verdict": values[4],
+                "source": "DistanceHistoryPoint",
+            }
+        )
 
     def settings_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {}
@@ -858,7 +1477,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             text = getattr(widget, "text", None)
             self.quality_labels[key].setText(str(text()) if callable(text) else default)
 
-    def _refresh_run_controls(self, snapshot: dict[str, RuntimeStatus], panel: object) -> None:
+    def refresh_run_controls(self, snapshot: dict[str, RuntimeStatus], panel: object) -> None:
         camera = snapshot.get("camera.left")
         detection = snapshot.get("detection")
         recording = snapshot.get("recording")
@@ -866,6 +1485,14 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         detection_state = detection.state if detection else "DISABLED"
         recording_state = recording.state if recording else "IDLE"
         recording_locked = recording_state in {"ACTIVE", "FINALIZING"}
+        camera_running = bool(getattr(panel, "camera_connected", False)) or camera_state in {
+            "LIVE",
+            "STARTING",
+        }
+        clock_change_active = any(
+            getattr(panel, name, None) is not None
+            for name in ("wiris_time_sync_thread", "wiris_gdti_thread")
+        )
         self.control_buttons["camera.toggle"].setText(
             "Stop preview" if camera_state in {"LIVE", "STARTING"} else "Preview"
         )
@@ -876,9 +1503,12 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             "Stop recording" if recording_state in {"ACTIVE", "FINALIZING"} else "Record"
         )
         self.control_buttons["camera.toggle"].setEnabled(not recording_locked)
-        self.control_buttons["detection.toggle"].setEnabled(True)
+        self.control_buttons["detection.toggle"].setEnabled(
+            not (recording_locked and camera_running)
+        )
         self.control_buttons["recording.toggle"].setEnabled(
             recording_state not in {"FINALIZING", "RECOVERABLE"}
+            and (recording_locked or not clock_change_active)
         )
         has_session_data = bool(getattr(panel, "recording_session_id", "")) or bool(
             getattr(panel, "distance_history", [])
@@ -890,14 +1520,14 @@ class MeasurementWorkspace(QtWidgets.QWidget):
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
         measurement = snapshot.get("measurement")
-        measurement_detail = measurement.detail if measurement else "measurement evidence 대기"
+        measurement_detail = measurement.detail if measurement else "Waiting for measurement"
         self.result_status.setText(_compact_text(measurement_detail))
         self.result_status.setToolTip(
             f"{measurement_detail}\nclock={measurement.clock}" if measurement else ""
         )
         self._refresh_preview_metadata(panel)
         self._refresh_quality(panel)
-        self._refresh_run_controls(snapshot, panel)
+        self.refresh_run_controls(snapshot, panel)
         for key, value in self.upstream_values.items():
             status = snapshot.get(key)
             if status is None:
@@ -935,31 +1565,888 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             rows = list(history or [])[-100:]
         except TypeError:
             rows = []
-        self.history_model.removeRows(0, self.history_model.rowCount())
-        for row_index, row in enumerate(rows):
-            values = (
+        history_rows = tuple(
+            (
                 getattr(row, "timestamp_s", "--"),
                 getattr(row, "forward_m", "--"),
                 getattr(row, "right_m", "--"),
                 getattr(row, "down_m", "--"),
                 getattr(row, "quality", getattr(row, "method", "--")),
             )
-            items = []
-            for value in values:
-                item = QtGui.QStandardItem(str(value))
-                item.setEditable(False)
-                items.append(item)
-            self.history_model.appendRow(items)
+            for row in rows
+        )
+        _sync_table_rows(self.history_model, history_rows)
 
 
-class AlignmentWorkspace(QtWidgets.QWidget):
-    """Source-backed Pixhawk/GNSS view with phase-one operation facades."""
+class PixhawkWorkspace(QtWidgets.QWidget):
+    """P1/P2 MAVLink attitude and GNSS-baseline evidence."""
+
+    inspection_requested = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
         backend: object,
         status_model: StatusModel,
-        open_legacy: Callable[[], None],
+        invoke_command: Callable[[str], bool] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.backend = backend
+        self.status_model = status_model
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(WorkspaceHeader("Pixhawk"))
+
+        status_group = QtWidgets.QGroupBox("Connection")
+        status_layout = QtWidgets.QHBoxLayout(status_group)
+        self.indicators: dict[str, StatusIndicator] = {}
+        for key, label in (("pixhawk.left", "P1"), ("pixhawk.right", "P2")):
+            indicator = StatusIndicator(label)
+            self.indicators[key] = indicator
+            status_layout.addWidget(indicator)
+        layout.addWidget(status_group)
+
+        candidate_group = QtWidgets.QGroupBox("Discovered endpoints")
+        candidate_layout = QtWidgets.QVBoxLayout(candidate_group)
+        self.discovery_status = EngineeringValue("Discovery")
+        candidate_layout.addWidget(self.discovery_status)
+        self.candidate_model = _table_model(
+            self,
+            ("Source", "Kind", "Value", "Baud", "Status", "Interface"),
+        )
+        self.candidate_table = QtWidgets.QTableView()
+        self.candidate_table.setModel(self.candidate_model)
+        self.candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.candidate_table.verticalHeader().setVisible(False)
+        self.candidate_table.setMaximumHeight(120)
+        self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_actions)
+        self.candidate_table.clicked.connect(self._inspect_candidate_row)
+        candidate_layout.addWidget(self.candidate_table)
+        candidate_actions = QtWidgets.QHBoxLayout()
+        self.candidate_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for target, label in (("host", "Use host IP"), ("left", "Assign P1"), ("right", "Assign P2")):
+            button = QtWidgets.QPushButton(label)
+            button.setEnabled(False)
+            button.clicked.connect(lambda _checked=False, target=target: self._apply_candidate(target))
+            self.candidate_buttons[target] = button
+            candidate_actions.addWidget(button)
+        candidate_actions.addStretch(1)
+        candidate_layout.addLayout(candidate_actions)
+        self.candidate_feedback = QtWidgets.QLabel("")
+        self.candidate_feedback.setObjectName("statusStrip")
+        self.candidate_feedback.setWordWrap(True)
+        candidate_layout.addWidget(self.candidate_feedback)
+        layout.addWidget(candidate_group)
+        self._candidate_signature: tuple[tuple[object, ...], ...] = ()
+        self._candidate_rows: tuple[dict[str, object], ...] = ()
+        self._recording_locked = False
+
+        attitude_group = QtWidgets.QGroupBox("Attitude (R/P/Y)")
+        attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
+        self.attitude_model = _table_model(
+            self,
+            ("Pixhawk", "State", "Roll°", "Pitch°", "Yaw°", "Age", "PX4 time", "Endpoint"),
+        )
+        self.attitude_table = QtWidgets.QTableView()
+        self.attitude_table.setModel(self.attitude_model)
+        self.attitude_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.attitude_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.attitude_table.verticalHeader().setVisible(False)
+        self.attitude_table.setMaximumHeight(112)
+        self.attitude_table.horizontalHeader().setStretchLastSection(True)
+        self.attitude_table.clicked.connect(self._inspect_attitude_row)
+        attitude_layout.addWidget(self.attitude_table)
+        layout.addWidget(attitude_group)
+
+        receiver_group = QtWidgets.QGroupBox("P1/P2 GNSS receivers")
+        receiver_layout = QtWidgets.QVBoxLayout(receiver_group)
+        self.receiver_model = _table_model(
+            self,
+            ("Receiver", "Fix number", "RTK state", "Satellites", "Eph m", "Epv m", "Age"),
+        )
+        self.receiver_table = QtWidgets.QTableView()
+        self.receiver_table.setModel(self.receiver_model)
+        self.receiver_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.receiver_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.receiver_table.verticalHeader().setVisible(False)
+        self.receiver_table.setMaximumHeight(112)
+        self.receiver_table.horizontalHeader().setStretchLastSection(True)
+        self.receiver_table.clicked.connect(self._inspect_receiver_row)
+        receiver_layout.addWidget(self.receiver_table)
+        layout.addWidget(receiver_group)
+
+        baseline_group = QtWidgets.QGroupBox("P1→P2 baseline")
+        baseline_layout = QtWidgets.QGridLayout(baseline_group)
+        self.baseline_values: dict[str, EngineeringValue] = {}
+        baseline_fields = (
+            ("north_m", "NED North"),
+            ("east_m", "NED East"),
+            ("down_m", "NED Down"),
+            ("length_m", "Length"),
+            ("p1_body_frd_forward_m", "FRD Forward"),
+            ("p1_body_frd_right_m", "FRD Right"),
+            ("p1_body_frd_down_m", "FRD Down"),
+            ("state", "Quality"),
+        )
+        for index, (key, label) in enumerate(baseline_fields):
+            value = EngineeringValue(label)
+            self.baseline_values[key] = value
+            value.activated.connect(lambda key=key: self._inspect_baseline_value(key))
+            baseline_layout.addWidget(value, index // 4, index % 4)
+        layout.addWidget(baseline_group)
+
+        actions = QtWidgets.QHBoxLayout()
+        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for command_id, label in (
+            ("pixhawk.toggle_mavlink", "Connect"),
+            ("pixhawk.discover_usb", "Find USB"),
+            ("pixhawk.discover_mavlink_candidates", "Find network"),
+            ("pixhawk.discover_host_ip", "Find host IP"),
+            ("alignment.swap_pixhawks", "Swap P1/P2"),
+        ):
+            button = _command_button(label, command_id, invoke_command)
+            self.operation_buttons[command_id] = button
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
+    def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        for key, indicator in self.indicators.items():
+            indicator.set_status(snapshot.get(key))
+        evidence = _evidence(self.backend)
+        connection = evidence.pixhawk_connection_candidates()
+        pixhawk_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
+        self.discovery_status.set_value(
+            pixhawk_discovery_status,
+            valid=False if pixhawk_discovery_status.startswith("ERROR") else None,
+        )
+        candidates = connection.get("candidates")
+        candidates = tuple(row for row in candidates if isinstance(row, dict)) if isinstance(candidates, (tuple, list)) else ()
+        candidate_signature = tuple(
+            tuple(row.get(key, "") for key in ("source", "source_row", "kind", "value", "baud", "status", "interface"))
+            for row in candidates
+        )
+        if candidate_signature != self._candidate_signature:
+            selected = self._selected_candidate_identity()
+            self.candidate_model.removeRows(0, self.candidate_model.rowCount())
+            for row in candidates:
+                _append_table_row(
+                    self.candidate_model,
+                    tuple(row.get(key, "") for key in ("source", "kind", "value", "baud", "status", "interface")),
+                )
+            self._candidate_signature = candidate_signature
+            self._candidate_rows = candidates
+            if selected:
+                for row_index, row in enumerate(candidates):
+                    if (str(row.get("source", "")), str(row.get("kind", "")), str(row.get("value", ""))) == selected:
+                        self.candidate_table.selectRow(row_index)
+                        break
+        discovery_active = bool(connection.get("discovery_active", False))
+        recording = snapshot.get("recording")
+        self._recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
+        self.operation_buttons["pixhawk.toggle_mavlink"].setEnabled(not self._recording_locked)
+        for command_id in ("pixhawk.discover_usb", "pixhawk.discover_host_ip"):
+            self.operation_buttons[command_id].setEnabled(not discovery_active)
+        self._refresh_candidate_actions()
+        attitude_rows: list[tuple[object, ...]] = []
+        receiver_rows: list[tuple[object, ...]] = []
+        for side, label in (("left", "P1"), ("right", "P2")):
+            attitude = evidence.attitude(side)
+            attitude_rows.append(
+                (
+                    label,
+                    attitude.get("state", "WAITING"),
+                    _display_number(attitude.get("roll_deg")),
+                    _display_number(attitude.get("pitch_deg")),
+                    _display_number(attitude.get("yaw_deg")),
+                    _display_number(attitude.get("age_s"), digits=2, suffix="s"),
+                    _display_number(attitude.get("px4_timestamp_s"), digits=6),
+                    attitude.get("mavlink_endpoint", "--") or "--",
+                ),
+            )
+            gps = evidence.gps(side)
+            receiver_rows.append(
+                (
+                    label,
+                    gps.get("fix_type", "--"),
+                    gps.get("rtk_label", gps.get("state", "NO DATA")),
+                    gps.get("satellites", "--"),
+                    _display_number(gps.get("eph_m")),
+                    _display_number(gps.get("epv_m")),
+                    _display_number(gps.get("age_s"), digits=2, suffix="s"),
+                ),
+            )
+        _sync_table_rows(self.attitude_model, tuple(attitude_rows))
+        _sync_table_rows(self.receiver_model, tuple(receiver_rows))
+        baseline = evidence.baseline()
+        projection_state = str(baseline.get("p1_body_frd_state", "WAITING") or "WAITING")
+        for key, value in self.baseline_values.items():
+            raw = baseline.get(key)
+            is_frd = key.startswith("p1_body_frd_")
+            is_metric = key.endswith("_m")
+            if is_frd:
+                valid = None if projection_state == "WAITING" else projection_state == "READY"
+                frame = "P1 body FRD [Forward,Right,Down]"
+            else:
+                valid = None if baseline.get("state") in {"NO DATA", "UNKNOWN"} else baseline.get("state") == "GOOD"
+                frame = "local NED [North,East,Down]" if is_metric else ""
+            value.set_value(
+                _display_number(raw) if is_metric else raw,
+                unit="m" if is_metric else "",
+                frame=frame,
+                valid=valid,
+            )
+
+    def _selected_candidate_row(self) -> int:
+        selected = self.candidate_table.selectionModel().selectedRows()
+        return selected[0].row() if selected else -1
+
+    def _selected_candidate_identity(self) -> tuple[str, str, str] | None:
+        row = self._selected_candidate_row()
+        if not 0 <= row < len(self._candidate_rows):
+            return None
+        candidate = self._candidate_rows[row]
+        return str(candidate.get("source", "")), str(candidate.get("kind", "")), str(candidate.get("value", ""))
+
+    def _refresh_candidate_actions(self, *_args: object) -> None:
+        row = self._selected_candidate_row()
+        candidate = self._candidate_rows[row] if 0 <= row < len(self._candidate_rows) else {}
+        kind = str(candidate.get("kind", ""))
+        source = str(candidate.get("source", ""))
+        self.candidate_buttons["host"].setEnabled(
+            not self._recording_locked and source == "pc" and kind == "PC_IP"
+        )
+        endpoint_enabled = source == "mavlink" and kind in {"USB", "MAVLink"}
+        self.candidate_buttons["left"].setEnabled(not self._recording_locked and endpoint_enabled)
+        self.candidate_buttons["right"].setEnabled(not self._recording_locked and endpoint_enabled)
+
+    def _apply_candidate(self, target: str) -> None:
+        row = self._selected_candidate_row()
+        if not 0 <= row < len(self._candidate_rows):
+            self.candidate_feedback.setText("ERROR: select a compatible endpoint")
+            return
+        candidate = self._candidate_rows[row]
+        method = getattr(self.backend, "pixhawk_apply_candidate", None)
+        if not callable(method):
+            self.candidate_feedback.setText("ERROR: Pixhawk endpoint adapter unavailable")
+            return
+        try:
+            applied = method(str(candidate.get("source", "")), int(candidate.get("source_row", -1)), target)
+        except Exception as exc:
+            self.candidate_feedback.setText(f"ERROR: {exc}")
+            return
+        if applied is False:
+            self.candidate_feedback.setText("ERROR: endpoint was not applied")
+            return
+        self.candidate_feedback.setText(f"Applied {candidate.get('kind', 'endpoint')} to {target.upper()}")
+        self.refresh(self.status_model.snapshot())
+
+    def _inspect_candidate_row(self, index: QtCore.QModelIndex) -> None:
+        row = index.row()
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._candidate_inspection(row),
+                lambda row=row: self._candidate_inspection(row),
+            )
+        )
+
+    def _candidate_inspection(self, row: int) -> dict[str, object]:
+        candidates = _evidence(self.backend).pixhawk_connection_candidates().get("candidates")
+        candidates = candidates if isinstance(candidates, (tuple, list)) else ()
+        candidate = dict(candidates[row]) if 0 <= row < len(candidates) and isinstance(candidates[row], dict) else {}
+        return {
+            "selection": f"Pixhawk endpoint · {candidate.get('kind', '--')}",
+            "value": (
+                f"value={candidate.get('value', '--')} · baud={candidate.get('baud', '--')} · "
+                f"discovery path={candidate.get('source', '--')}"
+            ),
+            "freshness": "Latest completed Pixhawk endpoint discovery",
+            "contract": "Host/serial/MAVLink endpoint metadata; no attitude, GPS position, or baseline values",
+            "verdict": candidate.get("status") or "UNVERIFIED",
+            "source": "Pixhawk discovery workers",
+        }
+
+    def _inspect_attitude_row(self, index: QtCore.QModelIndex) -> None:
+        side = "left" if index.row() == 0 else "right"
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._attitude_inspection(side),
+                lambda side=side: self._attitude_inspection(side),
+            )
+        )
+
+    def _attitude_inspection(self, side: str) -> dict[str, object]:
+        label = "P1" if side == "left" else "P2"
+        data = _evidence(self.backend).attitude(side)
+        return {
+            "selection": f"{label} attitude",
+            "value": (
+                f"R/P/Y={_display_number(data.get('roll_deg'))}/"
+                f"{_display_number(data.get('pitch_deg'))}/{_display_number(data.get('yaw_deg'))}°"
+            ),
+            "freshness": f"age={_display_number(data.get('age_s'), digits=2, suffix='s')} · PX4 t={data.get('px4_timestamp_s', '--')}",
+            "contract": str(data.get("orientation_contract", "PX4 body FRD → world NED; R/P/Y degrees")),
+            "verdict": str(data.get("state", "WAITING")),
+            "source": str(data.get("source", "MAVLink attitude telemetry")),
+        }
+
+    def _inspect_receiver_row(self, index: QtCore.QModelIndex) -> None:
+        side = "left" if index.row() == 0 else "right"
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._receiver_inspection(side),
+                lambda side=side: self._receiver_inspection(side),
+            )
+        )
+
+    def _receiver_inspection(self, side: str) -> dict[str, object]:
+        label = "P1" if side == "left" else "P2"
+        data = _evidence(self.backend).gps(side)
+        return {
+            "selection": f"{label} GNSS receiver",
+            "value": (
+                f"fix number={data.get('fix_type', '--')} · {data.get('rtk_label', 'NO DATA')} · "
+                f"sats={data.get('satellites', '--')} · eph/epv={data.get('eph_m', '--')}/{data.get('epv_m', '--')} m"
+            ),
+            "freshness": f"age={_display_number(data.get('age_s'), digits=2, suffix='s')}",
+            "contract": str(data.get("position_contract", "WGS84 latitude/longitude degrees; altitude metres")),
+            "verdict": str(data.get("state", "NO DATA")),
+            "source": str(data.get("source", "MAVLink GPS telemetry")),
+        }
+
+    def _inspect_baseline_value(self, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._baseline_inspection(key),
+                lambda key=key: self._baseline_inspection(key),
+            )
+        )
+
+    def _baseline_inspection(self, key: str) -> dict[str, object]:
+        data = _evidence(self.backend).baseline()
+        is_frd = key.startswith("p1_body_frd_")
+        contract = (
+            str(data.get("p1_body_frd_axis_contract", "P1→P2 in P1 body FRD [Forward,Right,Down]; metres"))
+            if is_frd
+            else str(data.get("axis_contract", "P1→P2 local NED [North,East,Down]; metres"))
+        )
+        freshness = (
+            f"P1 attitude age={data.get('p1_body_frd_attitude_age_s', '--')}s"
+            if is_frd
+            else f"P1/P2 age={data.get('left_age_s', '--')}/{data.get('right_age_s', '--')}s"
+        )
+        verdict = data.get("p1_body_frd_state", "WAITING") if is_frd else data.get("state", "UNKNOWN")
+        return {
+            "selection": self.baseline_values[key].label.text(),
+            "value": f"{_display_number(data.get(key))}{' m' if key.endswith('_m') else ''}",
+            "freshness": freshness,
+            "contract": contract,
+            "verdict": verdict,
+            "source": data.get("p1_body_frd_source" if is_frd else "source", "baseline evidence"),
+        }
+
+
+class BaseGnssWorkspace(QtWidgets.QWidget):
+    """Current Base GNSS, Survey-in, NTRIP, and RTCM distribution state."""
+
+    inspection_requested = QtCore.pyqtSignal(object)
+
+    MODE_LABELS = {
+        "LOCAL_SURVEY_IN": "Local Survey-in",
+        "NETWORK_ASSISTED_FIXED_BASE": "NTRIP-assisted Fixed Base",
+        "NETWORK_RTK_DIRECT": "Network RTK Direct",
+    }
+
+    def __init__(
+        self,
+        backend: object,
+        invoke_command: Callable[[str], bool] | None = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.backend = backend
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(WorkspaceHeader("Base GNSS"))
+
+        summary_group = QtWidgets.QGroupBox("Current state")
+        summary_layout = QtWidgets.QGridLayout(summary_group)
+        self.summary_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (("mode", "Mode"), ("state", "Operation"), ("source", "Correction source"), ("rtcm", "RTCM stream"))
+        ):
+            value = EngineeringValue(label)
+            self.summary_values[key] = value
+            summary_layout.addWidget(value, index // 2, index % 2)
+        layout.addWidget(summary_group)
+
+        self.serial_group = QtWidgets.QGroupBox("Base receiver")
+        serial_layout = QtWidgets.QGridLayout(self.serial_group)
+        self.serial_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate((("connection", "Connection"), ("device", "Device"), ("baud", "Baud"))):
+            value = EngineeringValue(label)
+            self.serial_values[key] = value
+            serial_layout.addWidget(value, 0, index)
+        layout.addWidget(self.serial_group)
+
+        self.candidate_group = QtWidgets.QGroupBox("Discovered Base receivers")
+        candidate_layout = QtWidgets.QVBoxLayout(self.candidate_group)
+        self.discovery_status = EngineeringValue("Discovery")
+        candidate_layout.addWidget(self.discovery_status)
+        self.candidate_model = _table_model(self, ("Port", "Target", "Baud", "Status", "UBX messages"))
+        self.candidate_table = QtWidgets.QTableView()
+        self.candidate_table.setModel(self.candidate_model)
+        self.candidate_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.candidate_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.candidate_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.candidate_table.verticalHeader().setVisible(False)
+        self.candidate_table.setMaximumHeight(132)
+        self.candidate_table.horizontalHeader().setStretchLastSection(True)
+        self.candidate_table.clicked.connect(self._inspect_candidate_row)
+        self.candidate_table.selectionModel().selectionChanged.connect(self._refresh_candidate_action)
+        candidate_layout.addWidget(self.candidate_table)
+        candidate_actions = QtWidgets.QHBoxLayout()
+        self.apply_candidate_button = QtWidgets.QPushButton("Use selected receiver")
+        self.apply_candidate_button.setEnabled(False)
+        self.apply_candidate_button.clicked.connect(self._apply_selected_candidate)
+        candidate_actions.addWidget(self.apply_candidate_button)
+        candidate_actions.addStretch(1)
+        candidate_layout.addLayout(candidate_actions)
+        self.candidate_feedback = QtWidgets.QLabel("")
+        self.candidate_feedback.setObjectName("statusStrip")
+        self.candidate_feedback.setWordWrap(True)
+        candidate_layout.addWidget(self.candidate_feedback)
+        layout.addWidget(self.candidate_group)
+        self._candidate_signature: tuple[tuple[object, ...], ...] = ()
+
+        self.survey_group = QtWidgets.QGroupBox("Survey-in")
+        survey_layout = QtWidgets.QGridLayout(self.survey_group)
+        self.survey_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (
+                ("status", "Status"),
+                ("duration", "Duration"),
+                ("accuracy", "Mean accuracy"),
+                ("observations", "Observations"),
+                ("ecef", "Mean ECEF X/Y/Z"),
+            )
+        ):
+            value = EngineeringValue(label)
+            self.survey_values[key] = value
+            survey_layout.addWidget(value, index // 3, index % 3)
+        layout.addWidget(self.survey_group)
+
+        self.ntrip_group = QtWidgets.QGroupBox("NTRIP")
+        ntrip_layout = QtWidgets.QGridLayout(self.ntrip_group)
+        self.ntrip_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (("connection", "Connection"), ("caster", "Caster"), ("mountpoint", "Mountpoint"), ("gga", "GGA policy"), ("status", "Status"))
+        ):
+            value = EngineeringValue(label)
+            self.ntrip_values[key] = value
+            ntrip_layout.addWidget(value, index // 3, index % 3)
+        layout.addWidget(self.ntrip_group)
+
+        self.fixed_group = QtWidgets.QGroupBox("Fixed Base acquisition")
+        fixed_layout = QtWidgets.QGridLayout(self.fixed_group)
+        self.fixed_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (
+                ("position", "WGS84 position"),
+                ("height", "Height"),
+                ("fix", "Base fix"),
+                ("samples", "Samples"),
+                ("scatter", "Scatter H/V"),
+                ("reconfigure", "Apply verification"),
+            )
+        ):
+            value = EngineeringValue(label)
+            self.fixed_values[key] = value
+            fixed_layout.addWidget(value, index // 3, index % 3)
+        layout.addWidget(self.fixed_group)
+
+        route_group = QtWidgets.QGroupBox("RTCM distribution")
+        route_layout = QtWidgets.QVBoxLayout(route_group)
+        self.route_model = _table_model(self, ("Target", "Frames", "Packets", "Bytes", "Failures", "Last delivery"))
+        self.route_table = QtWidgets.QTableView()
+        self.route_table.setModel(self.route_model)
+        self.route_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.route_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.route_table.verticalHeader().setVisible(False)
+        self.route_table.setMaximumHeight(112)
+        self.route_table.horizontalHeader().setStretchLastSection(True)
+        self.route_table.clicked.connect(self._inspect_route_row)
+        route_layout.addWidget(self.route_table)
+        layout.addWidget(route_group)
+
+        for group_name, group_values in (
+            ("summary", self.summary_values),
+            ("serial", self.serial_values),
+            ("survey", self.survey_values),
+            ("ntrip", self.ntrip_values),
+            ("fixed", self.fixed_values),
+        ):
+            for key, value in group_values.items():
+                value.activated.connect(
+                    lambda group_name=group_name, key=key: self._inspect_value(group_name, key)
+                )
+
+        actions = QtWidgets.QGridLayout()
+        self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for index, (command_id, label) in enumerate(
+            (
+                ("gnss.base_discover", "Find Base"),
+                ("gnss.base_connect", "Connect Base"),
+                ("gnss.base_disconnect", "Disconnect Base"),
+                ("gnss.survey_start", "Start Survey-in"),
+                ("gnss.survey_stop", "Stop Survey-in"),
+                ("gnss.ntrip_start", "Start NTRIP"),
+                ("gnss.ntrip_stop", "Stop NTRIP"),
+            )
+        ):
+            button = _command_button(label, command_id, invoke_command)
+            self.operation_buttons[command_id] = button
+            actions.addWidget(button, index // 4, index % 4)
+        layout.addLayout(actions)
+        layout.addStretch(1)
+
+    @staticmethod
+    def _dict(value: object) -> dict[str, object]:
+        return dict(value) if isinstance(value, dict) else {}
+
+    def refresh(self, _snapshot: dict[str, RuntimeStatus]) -> None:
+        data = _evidence(self.backend).gnss_operation()
+        mode = str(data.get("mode", "UNKNOWN") or "UNKNOWN")
+        state = str(data.get("state", "UNKNOWN") or "UNKNOWN")
+        source = self._dict(data.get("source_identity"))
+        serial = self._dict(data.get("base_serial"))
+        survey = self._dict(data.get("survey_in"))
+        ntrip = self._dict(data.get("ntrip"))
+        coordinate = self._dict(data.get("base_coordinate"))
+        fixed = self._dict(data.get("fixed_base"))
+        profile = self._dict(fixed.get("profile"))
+        base_discovery_status = str(data.get("base_discovery_status", "NOT RUN") or "NOT RUN")
+        self.discovery_status.set_value(
+            base_discovery_status,
+            valid=False if base_discovery_status.startswith("ERROR") else None,
+        )
+
+        candidates = data.get("base_candidates")
+        candidates = tuple(row for row in candidates if isinstance(row, dict)) if isinstance(candidates, (tuple, list)) else ()
+        candidate_signature = tuple(
+            (
+                row.get("port", ""),
+                row.get("target", ""),
+                row.get("baud"),
+                row.get("status", ""),
+                row.get("messages", ""),
+                bool(row.get("ubx", False)),
+            )
+            for row in candidates
+        )
+        if candidate_signature != self._candidate_signature:
+            selected_port = self._selected_candidate_port()
+            self.candidate_model.removeRows(0, self.candidate_model.rowCount())
+            for row in candidates:
+                _append_table_row(
+                    self.candidate_model,
+                    (
+                        row.get("port", ""),
+                        row.get("target", ""),
+                        row.get("baud") or "--",
+                        row.get("status", ""),
+                        row.get("messages", ""),
+                    ),
+                )
+            self._candidate_signature = candidate_signature
+            if selected_port:
+                for row_index, row in enumerate(candidates):
+                    if str(row.get("port", "")) == selected_port:
+                        self.candidate_table.selectRow(row_index)
+                        break
+
+        source_text = str(source.get("source_kind", "") or "--")
+        if source.get("caster_host"):
+            source_text = f"{source.get('caster_host')}:{source.get('caster_port', '--')}/{source.get('mountpoint', '')}"
+        elif source.get("base_device"):
+            source_text = str(source.get("base_device"))
+        frame_age = data.get("last_frame_age_s")
+        frame_text = (
+            f"{data.get('base_frames', 0)} frames · {_display_number(data.get('average_frame_rate_hz'), digits=2)} Hz"
+            f" · age {_display_number(frame_age, digits=2, suffix='s')}"
+        )
+        self.summary_values["mode"].set_value(self.MODE_LABELS.get(mode, mode))
+        self.summary_values["state"].set_value(state, valid=False if state in {"FAULT", "INVALIDATED"} else None)
+        self.summary_values["source"].set_value(source_text)
+        self.summary_values["rtcm"].set_value(frame_text, age_s=float(frame_age) if frame_age not in (None, "") else None)
+
+        serial_connected = bool(serial.get("connected", False))
+        self.serial_values["connection"].set_value(
+            "CONNECTED" if serial_connected else "DISCONNECTED",
+            valid=True if serial_connected else None,
+        )
+        self.serial_values["device"].set_value(serial.get("device") or "--")
+        self.serial_values["baud"].set_value(serial.get("baud") or "--")
+
+        survey_active = bool(survey.get("active", False))
+        survey_valid = bool(survey.get("valid", False))
+        survey_state = "VALID" if survey_valid else "ACTIVE" if survey_active else "NOT RUNNING"
+        self.survey_values["status"].set_value(survey_state, valid=True if survey_valid else None)
+        self.survey_values["duration"].set_value(
+            f"{survey.get('duration_s', 0)} / {_display_number(survey.get('target_duration_s'), digits=0)}",
+            unit="s",
+        )
+        self.survey_values["accuracy"].set_value(
+            f"{_display_number(survey.get('mean_accuracy_m'), digits=4)} / {_display_number(survey.get('target_accuracy_m'), digits=4)}",
+            unit="m",
+        )
+        self.survey_values["observations"].set_value(survey.get("observations") or "--")
+        ecef = survey.get("mean_ecef_m")
+        ecef_text = "--"
+        if isinstance(ecef, (tuple, list)) and len(ecef) == 3 and all(value is not None for value in ecef):
+            ecef_text = "/".join(f"{float(value):.3f}" for value in ecef)
+        self.survey_values["ecef"].set_value(ecef_text, unit="m", frame="ECEF [X,Y,Z]")
+
+        ntrip_connected = bool(ntrip.get("connected", False))
+        self.ntrip_values["connection"].set_value(
+            "CONNECTED" if ntrip_connected else "DISCONNECTED",
+            valid=True if ntrip_connected else None,
+        )
+        tls_suffix = " · TLS" if ntrip.get("tls") else ""
+        self.ntrip_values["caster"].set_value(f"{ntrip.get('caster_host', '--')}:{ntrip.get('caster_port', '--')}{tls_suffix}")
+        self.ntrip_values["mountpoint"].set_value(ntrip.get("mountpoint") or "--")
+        self.ntrip_values["gga"].set_value(ntrip.get("gga_policy") or "--")
+        self.ntrip_values["status"].set_value(ntrip.get("status") or "--")
+
+        latitude = coordinate.get("latitude_deg")
+        longitude = coordinate.get("longitude_deg")
+        position_text = "--" if latitude is None or longitude is None else f"{float(latitude):.7f}, {float(longitude):.7f}"
+        self.fixed_values["position"].set_value(position_text, frame="WGS84 geodetic latitude/longitude degrees")
+        self.fixed_values["height"].set_value(
+            _display_number(coordinate.get("selected_height_m")),
+            unit="m",
+            frame=str(coordinate.get("height_type", fixed.get("height_type", "UNKNOWN"))),
+        )
+        base_fix = coordinate.get("fixed")
+        self.fixed_values["fix"].set_value("--" if base_fix is None else "FIXED" if base_fix else "NOT FIXED", valid=base_fix)
+        self.fixed_values["samples"].set_value(fixed.get("sample_count", 0))
+        self.fixed_values["scatter"].set_value(
+            f"{_display_number(profile.get('horizontal_scatter_m'))} / {_display_number(profile.get('vertical_scatter_m'))}",
+            unit="m",
+        )
+        verification = "/".join(
+            "OK" if fixed.get(key) else "WAIT"
+            for key in ("reconfigure_ack", "reconfigure_readback", "reconfigure_rtcm")
+        )
+        self.fixed_values["reconfigure"].set_value(verification)
+
+        route_rows: list[tuple[object, ...]] = []
+        routes = data.get("routes")
+        routes = routes if isinstance(routes, dict) else {}
+        for side, label in (("left", "P1"), ("right", "P2")):
+            route = self._dict(routes.get(side))
+            route_rows.append(
+                (
+                    label,
+                    route.get("frames", 0),
+                    route.get("packets", 0),
+                    route.get("bytes", 0),
+                    route.get("fail", 0),
+                    _display_number(route.get("delivery_age_s"), digits=2, suffix="s"),
+                ),
+            )
+        _sync_table_rows(self.route_model, tuple(route_rows))
+
+        local_mode = mode == "LOCAL_SURVEY_IN"
+        assisted_mode = mode == "NETWORK_ASSISTED_FIXED_BASE"
+        network_mode = assisted_mode or mode == "NETWORK_RTK_DIRECT"
+        self.serial_group.setVisible(local_mode or assisted_mode)
+        self.candidate_group.setVisible(local_mode or assisted_mode)
+        self.survey_group.setVisible(local_mode)
+        self.ntrip_group.setVisible(network_mode)
+        self.fixed_group.setVisible(assisted_mode)
+        for command_id in ("gnss.base_discover", "gnss.base_connect", "gnss.base_disconnect"):
+            self.operation_buttons[command_id].setVisible(local_mode or assisted_mode)
+        for command_id in ("gnss.survey_start", "gnss.survey_stop"):
+            self.operation_buttons[command_id].setVisible(local_mode)
+        for command_id in ("gnss.ntrip_start", "gnss.ntrip_stop"):
+            self.operation_buttons[command_id].setVisible(network_mode)
+        self.operation_buttons["gnss.base_connect"].setEnabled((local_mode or assisted_mode) and not serial_connected)
+        self.operation_buttons["gnss.base_discover"].setEnabled(
+            (local_mode or assisted_mode) and not bool(data.get("base_discovery_active", False))
+        )
+        self.operation_buttons["gnss.base_disconnect"].setEnabled((local_mode or assisted_mode) and serial_connected)
+        self.operation_buttons["gnss.survey_start"].setEnabled(local_mode and serial_connected and not survey_active)
+        self.operation_buttons["gnss.survey_stop"].setEnabled(local_mode and serial_connected and survey_active)
+        self.operation_buttons["gnss.ntrip_start"].setEnabled(
+            network_mode and not ntrip_connected and (not assisted_mode or serial_connected)
+        )
+        self.operation_buttons["gnss.ntrip_stop"].setEnabled(network_mode and ntrip_connected)
+        self._refresh_candidate_action()
+
+    def _selected_candidate_row(self) -> int:
+        selected = self.candidate_table.selectionModel().selectedRows()
+        return selected[0].row() if selected else -1
+
+    def _selected_candidate_port(self) -> str:
+        row = self._selected_candidate_row()
+        item = self.candidate_model.item(row, 0) if row >= 0 else None
+        return item.text() if item is not None else ""
+
+    def _refresh_candidate_action(self, *_args: object) -> None:
+        self.apply_candidate_button.setEnabled(self._selected_candidate_row() >= 0)
+
+    def _apply_selected_candidate(self) -> None:
+        row = self._selected_candidate_row()
+        method = getattr(self.backend, "gnss_base_apply_candidate", None)
+        if row < 0 or not callable(method):
+            self.candidate_feedback.setText("ERROR: select a Base receiver")
+            return
+        try:
+            applied = method(row)
+        except Exception as exc:
+            self.candidate_feedback.setText(f"ERROR: {exc}")
+            return
+        if applied is False:
+            self.candidate_feedback.setText("ERROR: Base receiver was not applied")
+            return
+        self.candidate_feedback.setText(f"Applied Base receiver row {row + 1}")
+        self.refresh({})
+
+    def _inspect_candidate_row(self, index: QtCore.QModelIndex) -> None:
+        row = index.row()
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._candidate_inspection(row),
+                lambda row=row: self._candidate_inspection(row),
+            )
+        )
+
+    def _candidate_inspection(self, row: int) -> dict[str, object]:
+        candidates = _evidence(self.backend).gnss_operation().get("base_candidates")
+        candidates = candidates if isinstance(candidates, (tuple, list)) else ()
+        candidate = self._dict(candidates[row]) if 0 <= row < len(candidates) else {}
+        return {
+            "selection": f"Base receiver candidate · {candidate.get('port', '--')}",
+            "value": (
+                f"target={candidate.get('target', '--')} · baud={candidate.get('baud', '--')} · "
+                f"messages={candidate.get('messages', '--')}"
+            ),
+            "freshness": "Latest completed Base serial discovery",
+            "contract": "Serial endpoint discovery metadata; contains no coordinates or rover baseline",
+            "verdict": candidate.get("status") or ("UBX DETECTED" if candidate.get("ubx") else "UNVERIFIED"),
+            "source": "GnssBaseSerialDetectWorker",
+        }
+
+    def _inspect_value(self, group_name: str, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._value_inspection(group_name, key),
+                lambda group_name=group_name, key=key: self._value_inspection(group_name, key),
+            )
+        )
+
+    def _value_inspection(self, group_name: str, key: str) -> dict[str, object]:
+        data = _evidence(self.backend).gnss_operation()
+        widget_groups = {
+            "summary": self.summary_values,
+            "serial": self.serial_values,
+            "survey": self.survey_values,
+            "ntrip": self.ntrip_values,
+            "fixed": self.fixed_values,
+        }
+        widget = widget_groups[group_name][key]
+        displayed = f"{widget.value.text()} {widget.unit.text()}".strip()
+        freshness = "current operation configuration"
+        contract = "Base GNSS operation state; no rover baseline or Pixhawk attitude"
+        verdict = widget.meta.text() or "Informational"
+        source = "GnssOperationManager"
+        if group_name == "survey":
+            survey = self._dict(data.get("survey_in"))
+            freshness = f"duration={survey.get('duration_s', 0)}s · observations={survey.get('observations', '--')}"
+            contract = (
+                "UBX NAV-SVIN mean ECEF [X,Y,Z] metres"
+                if key == "ecef"
+                else "Survey-in duration seconds and mean accuracy metres"
+            )
+            verdict = "VALID" if survey.get("valid") else "ACTIVE" if survey.get("active") else "NOT RUNNING"
+            source = "UBX NAV-SVIN"
+        elif group_name == "ntrip":
+            ntrip = self._dict(data.get("ntrip"))
+            freshness = str(ntrip.get("status", "No NTRIP status") or "No NTRIP status")
+            contract = "NTRIP connection metadata and RTCM transport; no coordinate-frame conversion"
+            verdict = "CONNECTED" if ntrip.get("connected") else "DISCONNECTED"
+            source = "NTRIP worker + GnssOperationConfig"
+        elif group_name == "fixed":
+            coordinate = self._dict(data.get("base_coordinate"))
+            freshness = f"age={_display_number(coordinate.get('age_s'), digits=2, suffix='s')}"
+            contract = "WGS84 latitude/longitude degrees; height metres with explicit height type"
+            verdict = "FIXED" if coordinate.get("fixed") else "NOT FIXED" if coordinate.get("fixed") is not None else "NO DATA"
+            source = "UBX NAV-PVT / validated Fixed Base profile"
+        elif group_name == "serial":
+            serial = self._dict(data.get("base_serial"))
+            verdict = "CONNECTED" if serial.get("connected") else "DISCONNECTED"
+            source = "Base serial worker"
+        elif key == "rtcm":
+            freshness = f"last frame age={_display_number(data.get('last_frame_age_s'), digits=2, suffix='s')}"
+            contract = "RTCM frame/byte counters are transport evidence, not position coordinates"
+            verdict = "FRESH" if data.get("last_frame_age_s") is not None else "NO FRAME"
+            source = "RTCM parser counters"
+        elif key == "state":
+            verdict = str(data.get("invalidation_reason") or data.get("state", "UNKNOWN"))
+        return {
+            "selection": f"{group_name.title()} · {widget.label.text()}",
+            "value": displayed,
+            "freshness": freshness,
+            "contract": contract,
+            "verdict": verdict,
+            "source": source,
+        }
+
+    def _inspect_route_row(self, index: QtCore.QModelIndex) -> None:
+        side = "left" if index.row() == 0 else "right"
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._route_inspection(side),
+                lambda side=side: self._route_inspection(side),
+            )
+        )
+
+    def _route_inspection(self, side: str) -> dict[str, object]:
+        label = "P1" if side == "left" else "P2"
+        data = _evidence(self.backend).gnss_operation()
+        routes = data.get("routes") if isinstance(data.get("routes"), dict) else {}
+        route = self._dict(routes.get(side))
+        failures = int(route.get("fail") or 0)
+        return {
+            "selection": f"RTCM route · {label}",
+            "value": (
+                f"frames={route.get('frames', 0)} · packets={route.get('packets', 0)} · "
+                f"bytes={route.get('bytes', 0)} · failures={failures}"
+            ),
+            "freshness": f"last delivery age={_display_number(route.get('delivery_age_s'), digits=2, suffix='s')}",
+            "contract": "RTCM base stream → MAVLink GPS_RTCM_DATA; transport counters only",
+            "verdict": "DELIVERY FAILURE" if failures else "DELIVERING" if route.get("packets") else "NO DELIVERY",
+            "source": "RTCM injection route counters",
+        }
+
+
+class AlignmentWorkspace(QtWidgets.QWidget):
+    """Source-backed Pixhawk/GNSS view with phase-one operation facades."""
+
+    inspection_requested = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        backend: object,
+        status_model: StatusModel,
+        open_advanced: Callable[[], None],
         invoke_command: Callable[[str], bool] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -970,13 +2457,10 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(
-            WorkspaceHeader(
-                "Alignment / Pixhawk / GNSS",
-                "Telemetry · baseline · attitude",
-            )
+            WorkspaceHeader("Alignment")
         )
 
-        evidence_group = QtWidgets.QGroupBox("Transport and readiness")
+        evidence_group = QtWidgets.QGroupBox("Status")
         evidence_layout = QtWidgets.QGridLayout(evidence_group)
         self.indicators: dict[str, StatusIndicator] = {}
         for index, (key, label) in enumerate(
@@ -992,7 +2476,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             evidence_layout.addWidget(indicator, index // 2, index % 2)
         layout.addWidget(evidence_group)
 
-        attitude_group = QtWidgets.QGroupBox("Attitude samples")
+        attitude_group = QtWidgets.QGroupBox("Attitude")
         attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
         self.attitude_model = _table_model(
             self,
@@ -1005,10 +2489,11 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.attitude_table.verticalHeader().setVisible(False)
         self.attitude_table.setMaximumHeight(112)
         self.attitude_table.horizontalHeader().setStretchLastSection(True)
+        self.attitude_table.clicked.connect(self._inspect_attitude_row)
         attitude_layout.addWidget(self.attitude_table)
         layout.addWidget(attitude_group)
 
-        gnss_group = QtWidgets.QGroupBox("GPS receiver samples")
+        gnss_group = QtWidgets.QGroupBox("GNSS")
         gnss_layout = QtWidgets.QVBoxLayout(gnss_group)
         self.gnss_model = _table_model(
             self,
@@ -1021,10 +2506,11 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.gnss_table.verticalHeader().setVisible(False)
         self.gnss_table.setMaximumHeight(128)
         self.gnss_table.horizontalHeader().setStretchLastSection(True)
+        self.gnss_table.clicked.connect(self._inspect_gnss_row)
         gnss_layout.addWidget(self.gnss_table)
         layout.addWidget(gnss_group)
 
-        baseline_group = QtWidgets.QGroupBox("RTK baseline evidence")
+        baseline_group = QtWidgets.QGroupBox("RTK baseline")
         baseline_layout = QtWidgets.QGridLayout(baseline_group)
         self.baseline_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
@@ -1032,10 +2518,11 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         ):
             value = EngineeringValue(label)
             self.baseline_values[key] = value
+            value.activated.connect(lambda key=key: self._inspect_alignment_value("ned", key))
             baseline_layout.addWidget(value, index // 3, index % 3)
         layout.addWidget(baseline_group)
 
-        body_frd_group = QtWidgets.QGroupBox("P1→P2 body-FRD projection")
+        body_frd_group = QtWidgets.QGroupBox("P1→P2 (FRD)")
         body_frd_layout = QtWidgets.QGridLayout(body_frd_group)
         self.p1_body_frd_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
@@ -1048,11 +2535,50 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         ):
             value = EngineeringValue(label)
             self.p1_body_frd_values[key] = value
+            value.activated.connect(lambda key=key: self._inspect_alignment_value("frd", key))
             body_frd_layout.addWidget(value, index // 3, index % 3)
         layout.addWidget(body_frd_group)
 
+        physical_group = QtWidgets.QGroupBox("Physical alignment evidence")
+        physical_layout = QtWidgets.QGridLayout(physical_group)
+        self.physical_alignment_values: dict[str, EngineeringValue] = {}
+        for index, (key, label) in enumerate(
+            (
+                ("state", "State"),
+                ("relative_rpy", "Δ Roll/Pitch/Yaw"),
+                ("baseline_frd", "P1→P2 FRD"),
+                ("fix_type", "Numeric fix_type"),
+                ("sample_count", "Samples"),
+                ("fixed_ratio", "RTK_FIXED ratio"),
+            )
+        ):
+            value = EngineeringValue(label)
+            self.physical_alignment_values[key] = value
+            value.activated.connect(lambda key=key: self._inspect_alignment_value("physical", key))
+            physical_layout.addWidget(value, index // 3, index % 3)
+        physical_note = QtWidgets.QLabel(
+            "Adjust the hardware physically. Workstation records baseline and attitude evidence; it applies no R/P/Y correction."
+        )
+        physical_note.setObjectName("compactContract")
+        physical_note.setWordWrap(True)
+        physical_layout.addWidget(physical_note, 2, 0, 1, 3)
+        self.alignment_iteration_model = _table_model(
+            self,
+            ("Iteration", "State", "Samples", "Fix ratio", "FRD mean [F,R,D]", "ΔR/P/Y mean"),
+        )
+        self.alignment_iteration_table = QtWidgets.QTableView()
+        self.alignment_iteration_table.setModel(self.alignment_iteration_model)
+        self.alignment_iteration_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.alignment_iteration_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.alignment_iteration_table.verticalHeader().setVisible(False)
+        self.alignment_iteration_table.setMaximumHeight(112)
+        self.alignment_iteration_table.horizontalHeader().setStretchLastSection(True)
+        self.alignment_iteration_table.clicked.connect(self._inspect_iteration_row)
+        physical_layout.addWidget(self.alignment_iteration_table, 3, 0, 1, 3)
+        layout.addWidget(physical_group)
+
         contract = QtWidgets.QLabel(
-            "PX4: FRD→NED · RTK raw: NED [N,E,D] · P1→P2: P1 FRD [F,R,D] · GPS: WGS84"
+            "Frames: PX4 FRD→NED · RTK NED · P1→P2 FRD · GPS WGS84"
         )
         contract.setObjectName("compactContract")
         layout.addWidget(contract)
@@ -1063,33 +2589,33 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             (
                 "Pixhawk",
                 (
-                    ("pixhawk.toggle_mavlink", "Connect Pixhawk MAVLink"),
-                    ("pixhawk.discover_usb", "Scan USB Pixhawks"),
-                    ("pixhawk.discover_mavlink_candidates", "Generate MAVLink Candidates"),
-                    ("pixhawk.discover_host_ip", "Discover Pixhawk Host IP"),
-                    ("alignment.swap_pixhawks", "Swap P1 / P2 Roles"),
+                    ("pixhawk.toggle_mavlink", "Connect"),
+                    ("pixhawk.discover_usb", "Find USB"),
+                    ("pixhawk.discover_mavlink_candidates", "Find network"),
+                    ("pixhawk.discover_host_ip", "Find host IP"),
+                    ("alignment.swap_pixhawks", "Swap P1/P2"),
                 ),
             ),
             (
                 "GNSS / RTK",
                 (
-                    ("gnss.base_discover", "Scan Base GNSS Ports"),
-                    ("gnss.base_connect", "Connect Base GNSS"),
-                    ("gnss.base_disconnect", "Disconnect Base GNSS"),
-                    ("gnss.survey_start", "Start Survey-in"),
-                    ("gnss.survey_stop", "Stop Survey-in"),
-                    ("gnss.ntrip_start", "Start NTRIP Corrections"),
-                    ("gnss.ntrip_stop", "Stop NTRIP Corrections"),
+                    ("gnss.base_discover", "Find base"),
+                    ("gnss.base_connect", "Connect base"),
+                    ("gnss.base_disconnect", "Disconnect"),
+                    ("gnss.survey_start", "Start survey"),
+                    ("gnss.survey_stop", "Stop survey"),
+                    ("gnss.ntrip_start", "Start NTRIP"),
+                    ("gnss.ntrip_stop", "Stop NTRIP"),
                 ),
             ),
             (
                 "Alignment",
                 (
-                    ("alignment.scan_sources", "Scan alignment sources"),
-                    ("alignment.start_sampling", "Start baseline sampling"),
-                    ("alignment.stop_sampling", "Stop baseline sampling"),
-                    ("alignment.save_profile", "Save alignment profile"),
-                    ("alignment.load_profile", "Load alignment profile"),
+                    ("alignment.scan_sources", "Find sources"),
+                    ("alignment.start_sampling", "Start sampling"),
+                    ("alignment.stop_sampling", "Stop sampling"),
+                    ("alignment.save_profile", "Save evidence"),
+                    ("alignment.load_profile", "Load reference"),
                 ),
             ),
         )
@@ -1106,11 +2632,11 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             page_layout.addStretch(1)
             self.operation_tabs.addTab(page, tab_label)
         layout.addWidget(self.operation_tabs)
-        button = QtWidgets.QPushButton("Open advanced sensor diagnostics")
+        button = QtWidgets.QPushButton("Advanced diagnostics")
         button.setToolTip(
-            "Open PX4 MAG, raw field/source watch, and low-level alignment diagnostics."
+            "Open PX4 MAG, field watch, and low-level alignment diagnostics."
         )
-        button.clicked.connect(open_legacy)
+        button.clicked.connect(open_advanced)
         layout.addWidget(button, alignment=QtCore.Qt.AlignRight)
         layout.addStretch(1)
 
@@ -1126,11 +2652,10 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         for key, indicator in self.indicators.items():
             indicator.set_status(snapshot.get(key))
         evidence = _evidence(self.backend)
-        self.attitude_model.removeRows(0, self.attitude_model.rowCount())
+        attitude_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
             data = evidence.attitude(side)
-            _append_table_row(
-                self.attitude_model,
+            attitude_rows.append(
                 (
                     side.upper(),
                     data.get("state", "WAITING"),
@@ -1142,11 +2667,11 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                     "MAVLink",
                 ),
             )
-        self.gnss_model.removeRows(0, self.gnss_model.rowCount())
+        _sync_table_rows(self.attitude_model, tuple(attitude_rows))
+        gnss_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
             data = evidence.gps(side)
-            _append_table_row(
-                self.gnss_model,
+            gnss_rows.append(
                 (
                     side.upper(),
                     data.get("rtk_label", data.get("state", "NO DATA")),
@@ -1161,6 +2686,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                     "MAVLink GPS",
                 ),
             )
+        _sync_table_rows(self.gnss_model, tuple(gnss_rows))
         baseline = evidence.baseline()
         for key, value in self.baseline_values.items():
             raw = baseline.get(key)
@@ -1195,11 +2721,187 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                 ),
                 valid=(None if projection_state == "WAITING" else projection_valid),
             )
+        physical = evidence.physical_alignment()
+        quality = physical.get("quality") if isinstance(physical.get("quality"), dict) else {}
+        physical_state = str(physical.get("state", "WAITING") or "WAITING")
+        relative_rpy = physical.get("relative_rpy_deg")
+        relative_text = "--"
+        if isinstance(relative_rpy, (tuple, list)) and len(relative_rpy) == 3:
+            relative_text = "R/P/Y=" + "/".join(f"{float(item):+.2f}°" for item in relative_rpy)
+        baseline_frd = physical.get("current_baseline_frd_m")
+        baseline_frd_text = "--"
+        if isinstance(baseline_frd, (tuple, list)) and len(baseline_frd) == 3 and all(item is not None for item in baseline_frd):
+            baseline_frd_text = "F/R/D=" + "/".join(f"{float(item):+.3f} m" for item in baseline_frd)
+        fix_types = physical.get("fix_type")
+        fix_type_text = "--"
+        if isinstance(fix_types, dict):
+            fix_type_text = f"P1={fix_types.get('left', '--')} / P2={fix_types.get('right', '--')}"
+        fixed_ratio = quality.get("fixed_ratio")
+        ratio_text = "--" if fixed_ratio in (None, "") else f"{float(fixed_ratio) * 100.0:.1f}%"
+        physical_display = {
+            "state": physical_state,
+            "relative_rpy": relative_text,
+            "baseline_frd": baseline_frd_text,
+            "fix_type": fix_type_text,
+            "sample_count": physical.get("sample_count", quality.get("sample_count", "--")),
+            "fixed_ratio": ratio_text,
+        }
+        for key, value in self.physical_alignment_values.items():
+            value.set_value(
+                physical_display.get(key),
+                source=str(physical.get("coordinate_contract", "")),
+                valid=(
+                    None
+                    if physical_state in {"WAITING", "LIVE", "SAMPLING"}
+                    else physical_state in {"PASS", "EVIDENCE"}
+                ),
+            )
+        iteration_rows: list[tuple[object, ...]] = []
+        iterations = physical.get("iterations", ())
+        if isinstance(iterations, (tuple, list)):
+            for iteration in iterations:
+                if not isinstance(iteration, dict):
+                    continue
+                frd_mean = iteration.get("baseline_frd_mean_m", ())
+                rpy_mean = iteration.get("relative_rpy_mean_deg", ())
+                frd_text = "--" if len(frd_mean) != 3 else "/".join(f"{float(item):+.3f}" for item in frd_mean)
+                rpy_text = "--" if len(rpy_mean) != 3 else "/".join(f"{float(item):+.2f}°" for item in rpy_mean)
+                iteration_rows.append(
+                    (
+                        iteration.get("iteration", "--"),
+                        iteration.get("state", "--"),
+                        iteration.get("sample_count", "--"),
+                        _display_number(float(iteration.get("fixed_ratio")) * 100.0, digits=1, suffix="%")
+                        if iteration.get("fixed_ratio") not in (None, "")
+                        else "--",
+                        frd_text,
+                        rpy_text,
+                    ),
+                )
+        _sync_table_rows(self.alignment_iteration_model, tuple(iteration_rows))
         recording = snapshot.get("recording")
         recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
         swap_button = self.operation_buttons.get("alignment.swap_pixhawks")
         if swap_button is not None:
             swap_button.setEnabled(not recording_locked)
+
+    def _inspect_attitude_row(self, index: QtCore.QModelIndex) -> None:
+        side = "left" if index.row() == 0 else "right"
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._attitude_inspection(side),
+                lambda side=side: self._attitude_inspection(side),
+            )
+        )
+
+    def _attitude_inspection(self, side: str) -> dict[str, object]:
+        label = "P1" if side == "left" else "P2"
+        data = _evidence(self.backend).attitude(side)
+        return {
+            "selection": f"Alignment input · {label} attitude",
+            "value": f"R/P/Y={data.get('roll_deg', '--')}/{data.get('pitch_deg', '--')}/{data.get('yaw_deg', '--')}°",
+            "freshness": f"age={_display_number(data.get('age_s'), digits=2, suffix='s')}",
+            "contract": str(data.get("orientation_contract", "PX4 body FRD → world NED")),
+            "verdict": str(data.get("state", "WAITING")),
+            "source": str(data.get("source", "MAVLink attitude telemetry")),
+        }
+
+    def _inspect_gnss_row(self, index: QtCore.QModelIndex) -> None:
+        side = "left" if index.row() == 0 else "right"
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._gnss_inspection(side),
+                lambda side=side: self._gnss_inspection(side),
+            )
+        )
+
+    def _gnss_inspection(self, side: str) -> dict[str, object]:
+        label = "P1" if side == "left" else "P2"
+        data = _evidence(self.backend).gps(side)
+        return {
+            "selection": f"Alignment input · {label} GNSS",
+            "value": (
+                f"fix={data.get('fix_type', '--')} · {data.get('rtk_label', 'NO DATA')} · "
+                f"sats={data.get('satellites', '--')} · eph/epv={data.get('eph_m', '--')}/{data.get('epv_m', '--')} m"
+            ),
+            "freshness": f"age={_display_number(data.get('age_s'), digits=2, suffix='s')}",
+            "contract": str(data.get("position_contract", "WGS84 receiver position; baseline is derived separately in NED")),
+            "verdict": str(data.get("state", "NO DATA")),
+            "source": str(data.get("source", "MAVLink GPS telemetry")),
+        }
+
+    def _inspect_alignment_value(self, group: str, key: str) -> None:
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._alignment_value_inspection(group, key),
+                lambda group=group, key=key: self._alignment_value_inspection(group, key),
+            )
+        )
+
+    def _alignment_value_inspection(self, group: str, key: str) -> dict[str, object]:
+        evidence = _evidence(self.backend)
+        if group in {"ned", "frd"}:
+            data = evidence.baseline()
+            widgets = self.baseline_values if group == "ned" else self.p1_body_frd_values
+            is_metric = key.endswith("_m")
+            contract = (
+                str(data.get("axis_contract", "P1→P2 local NED [North,East,Down]; metres"))
+                if group == "ned"
+                else str(data.get("p1_body_frd_axis_contract", "P1→P2 in P1 body FRD [Forward,Right,Down]; metres"))
+            )
+            freshness = (
+                f"P1/P2 age={data.get('left_age_s', '--')}/{data.get('right_age_s', '--')}s"
+                if group == "ned"
+                else f"P1 attitude age={data.get('p1_body_frd_attitude_age_s', '--')}s"
+            )
+            verdict = data.get("state", "UNKNOWN") if group == "ned" else data.get("p1_body_frd_state", "WAITING")
+            value = f"{_display_number(data.get(key))}{' m' if is_metric else ''}"
+            source = data.get("source" if group == "ned" else "p1_body_frd_source", "baseline evidence")
+        else:
+            data = evidence.physical_alignment()
+            widgets = self.physical_alignment_values
+            value = widgets[key].value.text()
+            freshness = f"samples={data.get('sample_count', 0)}"
+            contract = str(data.get("coordinate_contract", "raw NED; P1 body FRD; relative R/P/Y"))
+            verdict = str(data.get("state", "WAITING"))
+            source = "Physical alignment evidence"
+        return {
+            "selection": widgets[key].label.text(),
+            "value": value,
+            "freshness": freshness,
+            "contract": contract,
+            "verdict": verdict,
+            "source": source,
+        }
+
+    def _inspect_iteration_row(self, index: QtCore.QModelIndex) -> None:
+        row = index.row()
+        self.inspection_requested.emit(
+            _live_inspection(
+                self._iteration_inspection(row),
+                lambda row=row: self._iteration_inspection(row),
+            )
+        )
+
+    def _iteration_inspection(self, row: int) -> dict[str, object]:
+        if row < 0 or row >= self.alignment_iteration_model.rowCount():
+            return {
+                "selection": "Alignment iteration",
+                "value": "--",
+                "freshness": "selected row is no longer retained",
+                "contract": "P1→P2 in P1 body FRD [Forward,Right,Down] metres; ΔR/P/Y degrees",
+                "verdict": "EXPIRED",
+                "source": "Physical alignment iteration history",
+            }
+        values = [self.alignment_iteration_model.item(row, column).text() for column in range(self.alignment_iteration_model.columnCount())]
+        return {
+            "selection": f"Alignment iteration {values[0]}",
+            "value": f"FRD mean={values[4]} m · ΔR/P/Y mean={values[5]}",
+            "freshness": f"samples={values[2]} · fixed ratio={values[3]}",
+            "contract": "P1→P2 in P1 body FRD [Forward,Right,Down] metres; ΔR/P/Y degrees",
+            "verdict": values[1],
+            "source": "Physical alignment iteration history",
+        }
 
 
 class CalibrationWorkspace(QtWidgets.QWidget):
@@ -1208,7 +2910,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
     def __init__(
         self,
         backend: object,
-        open_legacy: Callable[[], None],
+        open_advanced: Callable[[], None],
         invoke_command: Callable[[str], bool] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -1220,10 +2922,9 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         layout.addWidget(
             WorkspaceHeader(
                 "Calibration",
-                "Profile · validation",
             )
         )
-        profile_group = QtWidgets.QGroupBox("Active profile")
+        profile_group = QtWidgets.QGroupBox("Profile")
         profile_layout = QtWidgets.QGridLayout(profile_group)
         self.profile_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
@@ -1234,7 +2935,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             profile_layout.addWidget(value, index // 2, index % 2)
         layout.addWidget(profile_group)
 
-        intrinsic_group = QtWidgets.QGroupBox("Camera intrinsics")
+        intrinsic_group = QtWidgets.QGroupBox("Intrinsics")
         intrinsic_layout = QtWidgets.QVBoxLayout(intrinsic_group)
         self.intrinsic_model = _table_model(
             self,
@@ -1252,7 +2953,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
 
         self.extrinsic_value = EngineeringValue("Stereo R/T")
         self.validation_value = EngineeringValue("Validation")
-        metrics_group = QtWidgets.QGroupBox("Stereo extrinsics / validation")
+        metrics_group = QtWidgets.QGroupBox("Validation")
         metrics_layout = QtWidgets.QVBoxLayout(metrics_group)
         metrics_layout.addWidget(self.extrinsic_value)
         metrics_layout.addWidget(self.validation_value)
@@ -1263,7 +2964,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         metrics_layout.addWidget(self.calibration_contract)
         layout.addWidget(metrics_group)
 
-        setup_group = QtWidgets.QGroupBox("Calibration setup")
+        setup_group = QtWidgets.QGroupBox("Setup")
         setup_layout = QtWidgets.QVBoxLayout(setup_group)
         setup_layout.setContentsMargins(6, 6, 6, 6)
         setup_layout.setSpacing(5)
@@ -1359,11 +3060,11 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         setup_layout.addWidget(setup_contract)
         layout.addWidget(setup_group)
 
-        handoff_button = QtWidgets.QPushButton("Open calibration preview / zoom tools")
+        handoff_button = QtWidgets.QPushButton("Advanced preview")
         handoff_button.setToolTip(
-            "Open live checkerboard preview, zoom capture, and per-zoom calibration tools."
+            "Open checkerboard preview, zoom capture, and per-zoom calibration tools."
         )
-        handoff_button.clicked.connect(open_legacy)
+        handoff_button.clicked.connect(open_advanced)
         layout.addWidget(handoff_button, alignment=QtCore.Qt.AlignRight)
 
         self.operation_tabs = QtWidgets.QTabWidget()
@@ -1377,20 +3078,21 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 ),
             ),
             (
-                "Capture / intrinsics",
+                "Capture",
                 (
-                    ("calibration.capture_images", "Capture images"),
-                    ("calibration.run_intrinsic", "Run intrinsic calibration"),
+                    ("calibration.capture_images", "Capture"),
+                    ("calibration.run_intrinsic", "Run calibration"),
                     ("calibration.save_intrinsics", "Save intrinsics"),
                     ("calibration.load_intrinsics", "Load intrinsics"),
+                    ("calibration.load_current_zoom_intrinsics", "Load current zoom"),
                     ("calibration.apply_intrinsics", "Apply intrinsics"),
                 ),
             ),
             (
-                "Validation",
+                "Validate",
                 (
-                    ("calibration.scan_validation", "Scan validation files"),
-                    ("calibration.load_validation", "Load validation JSON"),
+                    ("calibration.scan_validation", "Find files"),
+                    ("calibration.load_validation", "Load validation"),
                     ("calibration.run_validation", "Run validation"),
                     ("calibration.save_validation", "Save validation"),
                     ("calibration.apply_validation", "Apply validation"),
@@ -1427,7 +3129,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         data = _evidence(self.backend).calibration()
         for key, value in self.profile_values.items():
             value.set_value(data.get(key), source=str(data.get("source", "")))
-        self.intrinsic_model.removeRows(0, self.intrinsic_model.rowCount())
+        intrinsic_rows: list[tuple[object, ...]] = []
         for side in ("left", "right"):
             camera = data.get(side, {})
             if not isinstance(camera, dict):
@@ -1435,8 +3137,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             grid = "--"
             if camera.get("width_px") is not None and camera.get("height_px") is not None:
                 grid = f"{camera['width_px']}×{camera['height_px']}"
-            _append_table_row(
-                self.intrinsic_model,
+            intrinsic_rows.append(
                 (
                     side.upper(),
                     grid,
@@ -1449,6 +3150,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                     camera.get("frame_contract", CAMERA_FRAME),
                 ),
             )
+        _sync_table_rows(self.intrinsic_model, tuple(intrinsic_rows))
         extrinsics = data.get("extrinsics", {})
         if not isinstance(extrinsics, dict):
             extrinsics = {}
@@ -1494,19 +3196,21 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.invoke_command = invoke_command
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         self._media_signature: tuple[object, ...] = ()
+        self._media_video_signature: tuple[tuple[str, str], ...] = ()
         self._media_records: dict[str, dict[str, object]] = {}
         self._preview_images: dict[str, QtGui.QImage] = {}
+        self._last_media_scan_monotonic_s = float("-inf")
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(
             WorkspaceHeader(
-                "Advanced owner tools",
+                "Advanced",
             )
         )
 
-        status_group = QtWidgets.QGroupBox("Live owner status")
+        status_group = QtWidgets.QGroupBox("Status")
         status_layout = QtWidgets.QGridLayout(status_group)
         self.indicators: dict[str, StatusIndicator] = {}
         for index, (key, label) in enumerate(
@@ -1525,10 +3229,10 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         layout.addWidget(status_group)
 
         self.tabs = QtWidgets.QTabWidget()
-        self.tabs.addTab(self._build_wiris_tab(), "WIRIS SDK / Zoom")
-        self.tabs.addTab(self._build_px4_and_watch_tab(), "PX4 / Field watch")
-        self.tabs.addTab(self._build_preview_tab(), "Calibration preview")
-        self.tabs.addTab(self._build_media_tab(), "Session Review / Artifacts")
+        self.tabs.addTab(self._build_wiris_tab(), "Camera control")
+        self.tabs.addTab(self._build_px4_and_watch_tab(), "Pixhawk tools")
+        self.tabs.addTab(self._build_preview_tab(), "Preview")
+        self.tabs.addTab(self._build_media_tab(), "Files")
         layout.addWidget(self.tabs, 1)
 
         self._connect_preview_signal()
@@ -1553,7 +3257,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        command_group = QtWidgets.QGroupBox("Raw WIRIS SDK command")
+        command_group = QtWidgets.QGroupBox("Camera command")
         command_form = QtWidgets.QGridLayout(command_group)
         command_form.setColumnStretch(1, 1)
         command_form.setColumnStretch(2, 1)
@@ -1564,7 +3268,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.wiris_command_edit = QtWidgets.QLineEdit()
         self.wiris_command_edit.setPlaceholderText("SDK command, e.g. HIWS")
         self.wiris_terminator_combo = self._combo((("LINE", "\n"), ("NULL", "\0")))
-        self.wiris_send_button = self._button("Send SDK command", "advanced.wiris.send")
+        self.wiris_send_button = self._button("Send", "advanced.wiris.send")
         self.wiris_status_label = QtWidgets.QLabel("")
         self.wiris_status_label.setObjectName("statusStrip")
         self.wiris_status_label.setWordWrap(True)
@@ -1583,7 +3287,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self._load_wiris_catalog()
         self.wiris_catalog_combo.currentIndexChanged.connect(self._apply_wiris_catalog_item)
 
-        zoom_group = QtWidgets.QGroupBox("WIRIS camera zoom control")
+        zoom_group = QtWidgets.QGroupBox("Zoom")
         zoom_layout = QtWidgets.QGridLayout(zoom_group)
         self.zoom_target_combo = self._combo(
             (("Both cameras", "both"), ("Left camera", "left"), ("Right camera", "right"))
@@ -1592,10 +3296,10 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.zoom_level_spin.setRange(1, 100)
         self.zoom_level_spin.setValue(10)
         self.zoom_buttons = {
-            "in": self._button("Zoom in", "advanced.zoom.in"),
-            "out": self._button("Zoom out", "advanced.zoom.out"),
+            "in": self._button("In", "advanced.zoom.in"),
+            "out": self._button("Out", "advanced.zoom.out"),
             "stop": self._button("Stop", "advanced.zoom.stop"),
-            "set": self._button("Set level", "advanced.zoom.set"),
+            "set": self._button("Set", "advanced.zoom.set"),
         }
         self.zoom_status_label = QtWidgets.QLabel("")
         self.zoom_status_label.setObjectName("statusStrip")
@@ -1667,7 +3371,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
-        px4_group = QtWidgets.QGroupBox("PX4 MAG / attitude calibration / Shell")
+        px4_group = QtWidgets.QGroupBox("PX4 tools")
         px4_layout = QtWidgets.QGridLayout(px4_group)
         self.px4_camera_combo = self._combo((("Pixhawk 1 / Left", "left"), ("Pixhawk 2 / Right", "right")))
         self.px4_priority_spins: dict[str, QtWidgets.QSpinBox] = {}
@@ -1682,11 +3386,11 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         px4_layout.addWidget(QtWidgets.QLabel("Side"), 0, 0)
         px4_layout.addWidget(self.px4_camera_combo, 0, 1)
         px4_layout.addWidget(self._button("Refresh MAG", "advanced.px4.refresh_mag"), 0, 4)
-        px4_layout.addWidget(self._button("Refresh attitude calibration", "advanced.px4.refresh_attitude"), 1, 0, 1, 2)
-        px4_layout.addWidget(self._button("Open PX4 Shell", "advanced.px4.shell"), 1, 4)
-        px4_layout.addWidget(self._button("Apply MAG priorities", "advanced.px4.apply_mag"), 2, 0, 1, 2)
-        px4_layout.addWidget(self._button("Save MAG params", "advanced.px4.save_mag"), 3, 0, 1, 2)
-        px4_layout.addWidget(self._button("Reboot PX4", "advanced.px4.reboot"), 4, 0, 1, 2)
+        px4_layout.addWidget(self._button("Refresh attitude", "advanced.px4.refresh_attitude"), 1, 0, 1, 2)
+        px4_layout.addWidget(self._button("Shell", "advanced.px4.shell"), 1, 4)
+        px4_layout.addWidget(self._button("Apply MAG", "advanced.px4.apply_mag"), 2, 0, 1, 2)
+        px4_layout.addWidget(self._button("Save MAG", "advanced.px4.save_mag"), 3, 0, 1, 2)
+        px4_layout.addWidget(self._button("Reboot", "advanced.px4.reboot"), 4, 0, 1, 2)
         self.px4_status_label = QtWidgets.QLabel(
             "MAG: disarmed + PARAM readback · attitude calibration: QGC Sensor Setup"
         )
@@ -1695,7 +3399,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         px4_layout.addWidget(self.px4_status_label, 6, 0, 1, 5)
         layout.addWidget(px4_group)
 
-        watch_group = QtWidgets.QGroupBox("MAVLink field watch")
+        watch_group = QtWidgets.QGroupBox("Field watch")
         watch_layout = QtWidgets.QGridLayout(watch_group)
         watch_layout.setColumnStretch(1, 1)
         self.watch_name_edit = QtWidgets.QLineEdit("local_z")
@@ -1704,25 +3408,25 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.watch_remove_combo = QtWidgets.QComboBox()
         watch_layout.addWidget(QtWidgets.QLabel("Name"), 0, 0)
         watch_layout.addWidget(self.watch_name_edit, 0, 1)
-        watch_layout.addWidget(QtWidgets.QLabel("MAVLink message"), 1, 0)
+        watch_layout.addWidget(QtWidgets.QLabel("Message"), 1, 0)
         watch_layout.addWidget(self.watch_message_edit, 1, 1)
         watch_layout.addWidget(QtWidgets.QLabel("Field"), 2, 0)
         watch_layout.addWidget(self.watch_field_edit, 2, 1)
-        watch_layout.addWidget(self._button("Add MAVLink watch", "advanced.watch.add_mavlink"), 0, 2)
-        watch_layout.addWidget(self._button("Discover MAVLink", "advanced.watch.discover_mavlink"), 2, 2)
+        watch_layout.addWidget(self._button("Add", "advanced.watch.add_mavlink"), 0, 2)
+        watch_layout.addWidget(self._button("Find fields", "advanced.watch.discover_mavlink"), 2, 2)
         watch_layout.addWidget(QtWidgets.QLabel("Remove"), 3, 0)
         watch_layout.addWidget(self.watch_remove_combo, 3, 1)
-        watch_layout.addWidget(self._button("Remove watch", "advanced.watch.remove"), 3, 2)
+        watch_layout.addWidget(self._button("Remove", "advanced.watch.remove"), 3, 2)
         self.watch_status_label = QtWidgets.QLabel("")
         self.watch_status_label.setObjectName("statusStrip")
         self.watch_status_label.setWordWrap(True)
         watch_layout.addWidget(self.watch_status_label, 4, 0, 1, 3)
         layout.addWidget(watch_group)
 
-        baseline_group = QtWidgets.QGroupBox("MAVLink field reference")
+        baseline_group = QtWidgets.QGroupBox("Message fields")
         baseline_layout = QtWidgets.QVBoxLayout(baseline_group)
         baseline_actions = QtWidgets.QHBoxLayout()
-        baseline_actions.addWidget(self._button("Scan fields", "advanced.baseline.scan"))
+        baseline_actions.addWidget(self._button("Refresh", "advanced.baseline.scan"))
         baseline_actions.addStretch(1)
         baseline_layout.addLayout(baseline_actions)
         self.baseline_mavlink_model = _table_model(self, ("Message", "Fields"))
@@ -1745,7 +3449,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(page)
         layout.setContentsMargins(6, 6, 6, 6)
         controls = QtWidgets.QHBoxLayout()
-        controls.addWidget(self._button("Refresh checkerboard preview", "advanced.preview.refresh"))
+        controls.addWidget(self._button("Refresh", "advanced.preview.refresh"))
         controls.addStretch(1)
         layout.addLayout(controls)
         row = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -1761,7 +3465,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         row.setStretchFactor(0, 1)
         row.setStretchFactor(1, 1)
         layout.addWidget(row, 1)
-        self.preview_status_label = QtWidgets.QLabel("Pixels: OpenCV RDF · overlay: checkerboard worker")
+        self.preview_status_label = QtWidgets.QLabel("Pixels: OpenCV RDF")
         self.preview_status_label.setObjectName("statusStrip")
         self.preview_status_label.setWordWrap(True)
         layout.addWidget(self.preview_status_label)
@@ -1817,18 +3521,17 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         selector.addWidget(QtWidgets.QLabel("Session"), 0, 0)
         selector.addWidget(self.media_session_combo, 0, 1)
         selector.addWidget(self._button("Refresh", "advanced.media.refresh"), 0, 2)
-        selector.addWidget(self._button("Open session folder", "advanced.media.open_session"), 0, 3)
+        selector.addWidget(self._button("Open folder", "advanced.media.open_session"), 0, 3)
         selector.addWidget(QtWidgets.QLabel("Artifact"), 1, 0)
         selector.addWidget(self.media_artifact_combo, 1, 1)
-        selector.addWidget(self._button("Preview CSV", "advanced.media.preview"), 1, 2)
-        selector.addWidget(self._button("Open artifact", "advanced.media.open_artifact"), 1, 3)
+        selector.addWidget(self._button("Preview", "advanced.media.preview"), 1, 2)
+        selector.addWidget(self._button("Open file", "advanced.media.open_artifact"), 1, 3)
         selector.addWidget(QtWidgets.QLabel("Video"), 2, 0)
         selector.addWidget(self.media_video_combo, 2, 1)
-        selector.addWidget(self._button("Open in system player", "advanced.media.open_video"), 2, 2, 1, 2)
+        selector.addWidget(self._button("Play", "advanced.media.open_video"), 2, 2, 1, 2)
         layout.addLayout(selector)
-        self.media_status_label = QtWidgets.QLabel(
-            "Read-only · saved fields/timestamps unchanged"
-        )
+        self.media_status_label = QtWidgets.QLabel("Read-only")
+        self.media_status_label.setToolTip("Saved fields and timestamps are unchanged.")
         self.media_status_label.setObjectName("statusStrip")
         self.media_status_label.setWordWrap(True)
         layout.addWidget(self.media_status_label)
@@ -1841,7 +3544,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.media_table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.media_table, 1)
         actions = QtWidgets.QHBoxLayout()
-        actions.addWidget(self._button("Save / generate session artifacts", "session.save"))
+        actions.addWidget(self._button("Save", "session.save"))
         actions.addStretch(1)
         layout.addLayout(actions)
         self.media_session_combo.currentIndexChanged.connect(lambda _index: self._refresh_media_artifacts())
@@ -1912,7 +3615,16 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         self.media_status_label.setText(f"Opened with system association: {path}")
         return True
 
-    def refresh_media(self) -> None:
+    def refresh_media(self, *, force: bool = True) -> None:
+        now_s = time.monotonic()
+        if (
+            not force
+            and now_s - self._last_media_scan_monotonic_s
+            < SESSION_CATALOG_REFRESH_INTERVAL_S
+        ):
+            self._refresh_media_video_paths()
+            return
+        self._last_media_scan_monotonic_s = now_s
         records = _evidence(self.backend).session_catalog()
         signature = tuple(
             (
@@ -1923,7 +3635,8 @@ class AdvancedWorkspace(QtWidgets.QWidget):
             )
             for record in records
         )
-        if signature != self._media_signature or not self.media_session_combo.count():
+        changed = signature != self._media_signature or not self.media_session_combo.count()
+        if changed:
             current = str(self.media_session_combo.currentData() or "")
             self._media_records = {
                 str(record.get("session_id")): dict(record)
@@ -1945,15 +3658,31 @@ class AdvancedWorkspace(QtWidgets.QWidget):
                         self.media_session_combo.setCurrentIndex(index)
             finally:
                 self.media_session_combo.blockSignals(False)
-        self._refresh_media_artifacts()
+        if changed or force:
+            self._refresh_media_artifacts()
+        self._refresh_media_video_paths()
+
+    def _refresh_media_video_paths(self) -> None:
         recording = _evidence(self.backend).recording()
+        paths = recording.get("video_paths", {})
+        video_signature = (
+            tuple((str(side), str(path)) for side, path in sorted(paths.items()))
+            if isinstance(paths, dict)
+            else ()
+        )
+        if video_signature == self._media_video_signature:
+            return
+        self._media_video_signature = video_signature
+        current = str(self.media_video_combo.currentData() or "")
         self.media_video_combo.blockSignals(True)
         try:
             self.media_video_combo.clear()
-            paths = recording.get("video_paths", {})
-            if isinstance(paths, dict):
-                for side, path in sorted(paths.items()):
-                    self.media_video_combo.addItem(f"{side}: {path}", str(path))
+            for side, path in video_signature:
+                self.media_video_combo.addItem(f"{side}: {path}", path)
+            if current:
+                index = self.media_video_combo.findData(current)
+                if index >= 0:
+                    self.media_video_combo.setCurrentIndex(index)
         finally:
             self.media_video_combo.blockSignals(False)
 
@@ -1997,7 +3726,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
             f"{artifact}: {len(data.get('rows', ()) or ())} rows · "
             f"{data.get('time_axis', 'stored time axis')} · fields unchanged"
         )
-        self.media_status_label.setText(_compact_text(media_detail))
+        self.media_status_label.setText(f"{artifact}: {len(data.get('rows', ()) or ())} rows")
         self.media_status_label.setToolTip(
             f"{media_detail}\n{data.get('coordinate_contract', 'stored fields preserved')}"
         )
@@ -2020,7 +3749,7 @@ class AdvancedWorkspace(QtWidgets.QWidget):
         for key, indicator in self.indicators.items():
             indicator.set_status(snapshot.get(key))
         self._refresh_custom_watch_selector()
-        self.refresh_media()
+        self.refresh_media(force=False)
 
 
 class RecordingWorkspace(QtWidgets.QWidget):
@@ -2030,7 +3759,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self,
         backend: object,
         status_model: StatusModel,
-        open_legacy: Callable[[], None],
+        open_advanced: Callable[[], None],
         invoke_command: Callable[[str], bool] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
@@ -2040,16 +3769,16 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.invoke_command = invoke_command
         self.session_records: dict[str, dict[str, object]] = {}
         self._session_catalog_signature: tuple[object, ...] = ()
+        self._last_session_scan_monotonic_s = float("-inf")
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(
             WorkspaceHeader(
-                "Recording / Review / Export",
-                "Session · preflight · artifacts",
+                "Recording",
             )
         )
-        status_group = QtWidgets.QGroupBox("Session status")
+        status_group = QtWidgets.QGroupBox("Status")
         status_layout = QtWidgets.QGridLayout(status_group)
         self.indicators: dict[str, StatusIndicator] = {}
         for index, (key, label) in enumerate(
@@ -2060,7 +3789,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
             status_layout.addWidget(indicator, index // 2, index % 2)
         layout.addWidget(status_group)
 
-        protocol_group = QtWidgets.QGroupBox("Experiment preflight (advisory)")
+        protocol_group = QtWidgets.QGroupBox("Preflight")
         protocol_layout = QtWidgets.QVBoxLayout(protocol_group)
         protocol_layout.setContentsMargins(6, 6, 6, 6)
         self.protocol_state_label = QtWidgets.QLabel("BLOCKED · evidence waiting")
@@ -2070,7 +3799,9 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.protocol_check_labels: dict[str, QtWidgets.QLabel] = {}
         protocol_checks_layout = QtWidgets.QGridLayout()
         protocol_checks_layout.setContentsMargins(0, 0, 0, 0)
-        for index in range(6):
+        # Pixhawk mode currently evaluates nine checks; keep one spare row so
+        # an additional source-backed gate does not disappear silently.
+        for index in range(10):
             label = QtWidgets.QLabel("--")
             label.setObjectName("protocolCheck")
             label.setWordWrap(True)
@@ -2079,7 +3810,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         protocol_layout.addLayout(protocol_checks_layout)
         layout.addWidget(protocol_group)
 
-        session_group = QtWidgets.QGroupBox("Current session")
+        session_group = QtWidgets.QGroupBox("Session")
         session_layout = QtWidgets.QGridLayout(session_group)
         self.session_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
@@ -2090,7 +3821,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
             session_layout.addWidget(value, index // 2, index % 2)
         layout.addWidget(session_group)
 
-        data_group = QtWidgets.QGroupBox("Saved artifacts and sample counts")
+        data_group = QtWidgets.QGroupBox("Files")
         data_layout = QtWidgets.QVBoxLayout(data_group)
         self.count_values: dict[str, EngineeringValue] = {}
         count_layout = QtWidgets.QGridLayout()
@@ -2101,7 +3832,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
             self.count_values[key] = value
             count_layout.addWidget(value, index // 3, index % 3)
         data_layout.addLayout(count_layout)
-        self.artifact_model = _table_model(self, ("Artifact", "Output", "Source"))
+        self.artifact_model = _table_model(self, ("File", "Path", "Kind"))
         self.artifact_table = QtWidgets.QTableView()
         self.artifact_table.setModel(self.artifact_model)
         self.artifact_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -2112,7 +3843,7 @@ class RecordingWorkspace(QtWidgets.QWidget):
         data_layout.addWidget(self.artifact_table)
         layout.addWidget(data_group)
 
-        review_group = QtWidgets.QGroupBox("Session review / export")
+        review_group = QtWidgets.QGroupBox("Review")
         review_layout = QtWidgets.QVBoxLayout(review_group)
         review_layout.setContentsMargins(6, 6, 6, 6)
         review_layout.setSpacing(5)
@@ -2122,9 +3853,11 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.session_selector = QtWidgets.QComboBox()
         self.session_selector.setObjectName("sessionReviewSelector")
         self.session_selector.currentIndexChanged.connect(lambda _index: self._refresh_review_artifacts())
-        self.refresh_sessions_button = QtWidgets.QPushButton("Refresh sessions")
-        self.refresh_sessions_button.clicked.connect(self.refresh_sessions)
-        self.open_session_button = QtWidgets.QPushButton("Open session folder")
+        self.refresh_sessions_button = QtWidgets.QPushButton("Refresh")
+        self.refresh_sessions_button.clicked.connect(
+            lambda _checked=False: self.refresh_sessions(force=True)
+        )
+        self.open_session_button = QtWidgets.QPushButton("Open folder")
         self.open_session_button.clicked.connect(self._open_selected_session)
         selector_layout.addWidget(QtWidgets.QLabel("Session"), 0, 0)
         selector_layout.addWidget(self.session_selector, 0, 1)
@@ -2133,9 +3866,9 @@ class RecordingWorkspace(QtWidgets.QWidget):
         self.artifact_selector = QtWidgets.QComboBox()
         self.artifact_selector.setObjectName("sessionArtifactSelector")
         self.artifact_selector.currentIndexChanged.connect(lambda _index: self._preview_selected_artifact())
-        self.preview_artifact_button = QtWidgets.QPushButton("Preview CSV")
+        self.preview_artifact_button = QtWidgets.QPushButton("Preview")
         self.preview_artifact_button.clicked.connect(self._preview_selected_artifact)
-        self.open_artifact_button = QtWidgets.QPushButton("Open artifact")
+        self.open_artifact_button = QtWidgets.QPushButton("Open file")
         self.open_artifact_button.clicked.connect(self._open_selected_artifact)
         selector_layout.addWidget(QtWidgets.QLabel("Artifact"), 1, 0)
         selector_layout.addWidget(self.artifact_selector, 1, 1)
@@ -2143,10 +3876,13 @@ class RecordingWorkspace(QtWidgets.QWidget):
         selector_layout.addWidget(self.open_artifact_button, 1, 3)
         review_layout.addLayout(selector_layout)
         self.review_status_label = QtWidgets.QLabel(
-            "Read-only · saved fields/timestamps unchanged · no NED/ENU conversion"
+            "Read-only review"
         )
         self.review_status_label.setObjectName("statusStrip")
         self.review_status_label.setWordWrap(True)
+        self.review_status_label.setToolTip(
+            "Saved fields and timestamps are unchanged; no NED/ENU conversion is applied."
+        )
         review_layout.addWidget(self.review_status_label)
         self.review_model = QtGui.QStandardItemModel(0, 0, self)
         self.review_table = QtWidgets.QTableView()
@@ -2160,21 +3896,22 @@ class RecordingWorkspace(QtWidgets.QWidget):
         review_actions = QtWidgets.QHBoxLayout()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         if invoke_command is not None:
-            save_button = _command_button("Save current session", "session.save", invoke_command)
+            save_button = _command_button("Save", "session.save", invoke_command)
             self.operation_buttons["session.save"] = save_button
             review_actions.addWidget(save_button)
         review_actions.addStretch(1)
         review_layout.addLayout(review_actions)
         layout.addWidget(review_group)
 
-        self.contract_label = QtWidgets.QLabel("Session clock: monotonic + wall ID")
+        self.contract_label = QtWidgets.QLabel("Time: recording clock")
+        self.contract_label.setToolTip("Session IDs use wall time; samples retain the recording time axis.")
         self.contract_label.setObjectName("compactContract")
         layout.addWidget(self.contract_label)
-        button = QtWidgets.QPushButton("Open playback / export tools")
+        button = QtWidgets.QPushButton("Advanced files")
         button.setToolTip(
-            "Open the Workstation playback, workbook/export, and media review workspace."
+            "Open playback, export, and media review tools."
         )
-        button.clicked.connect(open_legacy)
+        button.clicked.connect(open_advanced)
         layout.addWidget(button, alignment=QtCore.Qt.AlignRight)
         layout.addStretch(1)
         self.refresh_sessions()
@@ -2192,36 +3929,70 @@ class RecordingWorkspace(QtWidgets.QWidget):
         counts = data.get("sample_counts", {})
         for key, value in self.count_values.items():
             value.set_value(counts.get(key, 0) if isinstance(counts, dict) else "--", source="session spool rows")
-        self.artifact_model.removeRows(0, self.artifact_model.rowCount())
+        artifact_rows: list[tuple[object, ...]] = []
         output_dir = str(data.get("output_dir") or "")
         paths = data.get("video_paths", {})
         if isinstance(paths, dict):
             for side, path in sorted(paths.items()):
-                _append_table_row(self.artifact_model, (f"{side} video", path or "not prepared", "video_recording_paths"))
+                artifact_rows.append((f"{side} video", path or "not prepared", "Video"))
         for artifact in data.get("artifacts", ()) or ():
-            _append_table_row(self.artifact_model, (artifact, f"{output_dir}/{artifact}" if output_dir else "--", "session directory"))
-        if not self.artifact_model.rowCount():
-            _append_table_row(self.artifact_model, ("--", "No finalized artifacts", "recording session evidence"))
-        self.refresh_sessions()
+            artifact_rows.append(
+                (artifact, f"{output_dir}/{artifact}" if output_dir else "--", "Session file")
+            )
+        if not artifact_rows:
+            artifact_rows.append(("--", "No finalized files", "Recording"))
+        _sync_table_rows(self.artifact_model, tuple(artifact_rows))
+        self.refresh_sessions(force=False)
 
     def _refresh_protocol(self, snapshot: dict[str, RuntimeStatus]) -> None:
         evidence = _evidence(self.backend)
-        settings = getattr(getattr(self.backend, "panel", self.backend), "settings", None)
+        panel = getattr(self.backend, "panel", self.backend)
+        settings = getattr(panel, "settings", None)
+        snapshot_method = getattr(self.backend, "workstation_settings_snapshot", None)
+        try:
+            settings_snapshot = snapshot_method() if callable(snapshot_method) else {}
+        except Exception:
+            settings_snapshot = {}
+        settings_snapshot = settings_snapshot if isinstance(settings_snapshot, Mapping) else {}
+        gnss_config = settings_snapshot.get("gnss_operation")
+        gnss_config = gnss_config if isinstance(gnss_config, Mapping) else {}
+        readiness_config = gnss_config.get("readiness")
+        readiness_config = readiness_config if isinstance(readiness_config, Mapping) else {}
+        try:
+            minimum_fix_type = int(readiness_config.get("minimum_fix_type", 3))
+        except (TypeError, ValueError):
+            minimum_fix_type = 3
+        physical_alignment = evidence.physical_alignment()
+        checkpoints = physical_alignment.get("time_sync_checkpoints")
+        if not isinstance(checkpoints, (tuple, list)):
+            checkpoints = getattr(panel, "workstation_time_sync_checkpoints", ())
+        final_sync_verified = any(
+            isinstance(item, Mapping)
+            and str(item.get("phase", "")) == "final"
+            and "VERIFIED" in str(item.get("status", "")).upper()
+            for item in checkpoints or ()
+        )
         measurement = evidence.measurement_settings()
         readiness = evaluate_recording_protocol(
             snapshot,
             distance_mode=str(measurement.get("distance_mode", "pixhawk") or "pixhawk"),
             calibration=evidence.calibration(),
             baseline=evidence.baseline(),
-            require_rtk_fixed=bool(getattr(settings, "require_rtk_fixed", False)),
+            require_rtk_fixed=bool(
+                settings_snapshot.get(
+                    "require_rtk_fixed",
+                    getattr(settings, "require_rtk_fixed", False),
+                )
+            ),
+            minimum_fix_type=minimum_fix_type,
+            physical_alignment=physical_alignment,
+            final_sync_verified=final_sync_verified,
         )
-        self.protocol_state_label.setText(
-            f"{readiness.state} · {len(readiness.blocking)} blocking prerequisite(s) · advisory only"
-        )
+        self.protocol_state_label.setText(f"{readiness.state} · {len(readiness.blocking)} checks")
         state_style = (
-            "background:#123d2a; color:#b8f5d0; border:1px solid #2e8b57; padding:5px;"
+            f"color:{SUCCESS_TEXT}; border:1px solid {PANEL_BORDER}; padding:5px;"
             if readiness.state == "READY"
-            else "background:#4a241f; color:#ffd1c8; border:1px solid #c9574a; padding:5px;"
+            else f"color:{ERROR_TEXT}; border:1px solid {ERROR_TEXT}; padding:5px;"
         )
         self.protocol_state_label.setStyleSheet(state_style)
         for index, label in enumerate(self.protocol_check_labels.values()):
@@ -2235,10 +4006,18 @@ class RecordingWorkspace(QtWidgets.QWidget):
             label.setText(f"{'✓' if check.passed else '×'} {check.label}: {_compact_text(detail, limit=112)}")
             label.setToolTip(detail)
             label.setStyleSheet(
-                "color:#b8f5d0;" if check.passed else "color:#ffd1c8;"
+                f"color:{SUCCESS_TEXT};" if check.passed else f"color:{ERROR_TEXT};"
             )
 
-    def refresh_sessions(self) -> None:
+    def refresh_sessions(self, *, force: bool = True) -> None:
+        now_s = time.monotonic()
+        if (
+            not force
+            and now_s - self._last_session_scan_monotonic_s
+            < SESSION_CATALOG_REFRESH_INTERVAL_S
+        ):
+            return
+        self._last_session_scan_monotonic_s = now_s
         records = _evidence(self.backend).session_catalog()
         signature = tuple(
             (
@@ -2319,30 +4098,30 @@ class RecordingWorkspace(QtWidgets.QWidget):
     def _open_selected_session(self) -> None:
         record = self._selected_record()
         if record is None:
-            self.review_status_label.setText("열 세션이 없습니다.")
+            self.review_status_label.setText("No session selected")
             return
         self._open_path(Path(str(record.get("path") or "")))
 
     def _open_selected_artifact(self) -> None:
         path = self._selected_artifact_path()
         if path is None:
-            self.review_status_label.setText("열 artifact가 없습니다.")
+            self.review_status_label.setText("No file selected")
             return
         self._open_path(path)
 
     def _open_path(self, path: Path) -> None:
         if not path.exists():
-            self.review_status_label.setText(f"경로가 없습니다: {path}")
+            self.review_status_label.setText(f"Path unavailable: {path}")
             return
         QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
-        self.review_status_label.setText(f"열기 요청: {path}")
+        self.review_status_label.setText(f"Opened: {path}")
 
     def _preview_selected_artifact(self) -> None:
         record = self._selected_record()
         artifact = self._selected_artifact_name()
         if record is None or not artifact:
             self.review_model.clear()
-            self.review_status_label.setText("CSV preview를 위해 세션과 artifact를 선택하세요.")
+            self.review_status_label.setText("Select a session and file")
             return
         data = _evidence(self.backend).session_artifact_rows(str(record.get("session_id")), artifact)
         error = str(data.get("error") or "")
@@ -2362,55 +4141,14 @@ class RecordingWorkspace(QtWidgets.QWidget):
         record_error = str(record.get("error") or "")
         failure_note = f" | manifest error: {record_error}" if record_error else ""
         review_detail = (
-            f"{artifact}: {len(rows)}개 행 · {data.get('time_axis', 'stored time axis')} · "
+            f"{artifact}: {len(rows)} rows · {data.get('time_axis', 'stored time axis')} · "
             "fields unchanged · no NED/ENU conversion"
             f"{failure_note}"
         )
-        self.review_status_label.setText(_compact_text(review_detail))
+        self.review_status_label.setText(f"{artifact}: {len(rows)} rows")
         self.review_status_label.setToolTip(
             f"{review_detail}\n{data.get('coordinate_contract', 'stored fields preserved')}"
         )
-
-
-class LegacyHandoffWorkspace(QtWidgets.QWidget):
-    def __init__(
-        self,
-        title: str,
-        detail: str,
-        open_legacy: Callable[[], None],
-        *,
-        status_model: StatusModel | None = None,
-        status_keys: tuple[tuple[str, str], ...] = (),
-        parent: QtWidgets.QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.status_model = status_model
-        self.status_keys = status_keys
-        self.indicators: dict[str, StatusIndicator] = {}
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.addWidget(WorkspaceHeader(title, detail))
-        if status_keys:
-            evidence_group = QtWidgets.QGroupBox("Current evidence")
-            evidence_layout = QtWidgets.QGridLayout(evidence_group)
-            evidence_layout.setContentsMargins(6, 6, 6, 6)
-            for index, (key, label) in enumerate(status_keys):
-                indicator = StatusIndicator(label)
-                self.indicators[key] = indicator
-                evidence_layout.addWidget(indicator, index // 2, index % 2)
-            layout.addWidget(evidence_group)
-        notice = EmptyStateView(
-            "Legacy workflow remains the operational owner",
-            "This context is kept in the existing panel until its adapter and lifecycle contract are verified.",
-        )
-        layout.addWidget(notice, 1)
-        button = QtWidgets.QPushButton("Open legacy workflow")
-        button.clicked.connect(open_legacy)
-        layout.addWidget(button, alignment=QtCore.Qt.AlignRight)
-
-    def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
-        for key, indicator in self.indicators.items():
-            indicator.set_status(snapshot.get(key))
 
 
 class DiagnosticsContent(QtWidgets.QWidget):
@@ -2433,6 +4171,23 @@ class DiagnosticsContent(QtWidgets.QWidget):
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self._log_pending_count = 0
+        self.log_new_label = QtWidgets.QLabel("")
+        self.log_new_label.setObjectName("statusStrip")
+        self.log_new_label.hide()
+        self.log_follow_button = QtWidgets.QPushButton("Follow latest")
+        self.log_follow_button.setObjectName("secondaryAction")
+        self.log_follow_button.clicked.connect(self._follow_latest_log)
+        self.log_follow_button.hide()
+        log_page = QtWidgets.QWidget()
+        log_layout = QtWidgets.QVBoxLayout(log_page)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_toolbar = QtWidgets.QHBoxLayout()
+        log_toolbar.addWidget(self.log_new_label)
+        log_toolbar.addStretch(1)
+        log_toolbar.addWidget(self.log_follow_button)
+        log_layout.addLayout(log_toolbar)
+        log_layout.addWidget(self.log_view)
         self.measurement_view = QtWidgets.QPlainTextEdit()
         self.measurement_view.setReadOnly(True)
         self.measurement_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
@@ -2444,7 +4199,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
         self.tabs.addTab(self.camera_view, "Camera")
         self.tabs.addTab(self.pixhawk_view, "Pixhawk")
         self.tabs.addTab(self.gnss_view, "GNSS")
-        self.tabs.addTab(self.log_view, "Log")
+        self.tabs.addTab(log_page, "Log")
         self.tabs.addTab(self.measurement_view, "Measurement")
         self.tabs.addTab(self.performance_view, "Performance")
         layout.addWidget(self.tabs)
@@ -2468,10 +4223,22 @@ class DiagnosticsContent(QtWidgets.QWidget):
         self.tabs.setCurrentIndex(tab_indexes.get(context_id, 0))
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
-        records = list(snapshot.values())
-        self.system_model.removeRows(0, self.system_model.rowCount())
-        for status in records:
-            values = (
+        refreshers = (
+            self._refresh_system,
+            self._refresh_camera,
+            self._refresh_pixhawk,
+            self._refresh_gnss,
+            self._refresh_log,
+            self._refresh_measurement,
+            self._refresh_performance,
+        )
+        index = self.tabs.currentIndex()
+        if 0 <= index < len(refreshers):
+            refreshers[index](snapshot)
+
+    def _refresh_system(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        rows = tuple(
+            (
                 status.key,
                 status.state,
                 status.severity.value,
@@ -2479,26 +4246,76 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 "--" if status.age_s is None else f"{status.age_s:.2f}s",
                 status.detail,
             )
-            items = []
-            for value in values:
-                item = QtGui.QStandardItem(str(value))
-                item.setEditable(False)
-                items.append(item)
-            self.system_model.appendRow(items)
+            for status in snapshot.values()
+        )
+        _sync_table_rows(self.system_model, rows)
+
+    def _refresh_log(self, _snapshot: dict[str, RuntimeStatus]) -> None:
         backend = getattr(self.backend, "diagnostic_text", None)
         if callable(backend):
-            self.log_view.setPlainText(str(backend()))
-            self.log_view.moveCursor(QtGui.QTextCursor.End)
-        for view, keys in (
-            (self.camera_view, ("camera.left", "camera.right", "detection", "synchronization")),
-            (self.pixhawk_view, ("pixhawk.left", "pixhawk.right")),
-            (self.gnss_view, ("gnss",)),
-            (self.performance_view, ("fps",)),
-        ):
-            view.setPlainText("\n".join(self._format_status(snapshot.get(key)) for key in keys))
-        panel = getattr(self.backend, "panel", self.backend)
+            self._set_log_text(str(backend()))
+
+    def _follow_latest_log(self) -> None:
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+        self._log_pending_count = 0
+        self.log_new_label.clear()
+        self.log_new_label.hide()
+        self.log_follow_button.hide()
+
+    def _set_log_text(self, text: str) -> None:
+        if text == self.log_view.toPlainText():
+            return
+        scrollbar = self.log_view.verticalScrollBar()
+        was_at_bottom = scrollbar.value() >= scrollbar.maximum() - 4
+        old_line_count = self.log_view.blockCount()
+        old_scroll_value = scrollbar.value()
+        self.log_view.setPlainText(text)
+        if was_at_bottom:
+            scrollbar.setValue(scrollbar.maximum())
+            self._log_pending_count = 0
+            self.log_new_label.clear()
+            self.log_new_label.hide()
+            self.log_follow_button.hide()
+        else:
+            scrollbar.setValue(min(old_scroll_value, scrollbar.maximum()))
+            added_lines = max(1, self.log_view.blockCount() - old_line_count)
+            self._log_pending_count += added_lines
+            self.log_new_label.setText(f"New logs: {self._log_pending_count}")
+            self.log_new_label.show()
+            self.log_follow_button.show()
+
+    def _refresh_camera(self, snapshot: dict[str, RuntimeStatus]) -> None:
         evidence = _evidence(self.backend)
-        attitude_lines = ["", "Attitude source projection (orientation only; PX4 body FRD → world NED):"]
+        config = evidence.detection_config()
+        detection_lines = [
+            "Detection configuration (AppSettings / existing controls):",
+            f"weights={config.get('weights_path', '--')}",
+            f"device={config.get('device', '--')} input={config.get('input_size_px', '--')} px "
+            f"conf/IoU={config.get('confidence', '--')}/{config.get('iou', '--')}",
+            f"gates={', '.join(str(item) for item in config.get('gate_enabled', ()) or ()) or 'OFF'}",
+        ]
+        target_lines = ["Target projection (bbox fields are image pixels u/v):"]
+        for side in ("left", "right"):
+            target = evidence.detection(side)
+            target_lines.append(
+                f"{side}: {target.get('runtime_state', 'NO TARGET')} class="
+                f"{_display_class(target)} "
+                f"conf={_display_number(target.get('confidence'), digits=3)} "
+                f"age={_display_number(target.get('age_s'), digits=2, suffix='s')}"
+            )
+        text = self._status_text(
+            snapshot,
+            ("camera.left", "camera.right", "detection", "synchronization"),
+        )
+        self._set_diagnostic_text(
+            self.camera_view,
+            "\n\n".join((text, "\n".join(detection_lines + target_lines))),
+        )
+
+    def _refresh_pixhawk(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        evidence = _evidence(self.backend)
+        attitude_lines = ["Attitude source projection (orientation only; PX4 body FRD → world NED):"]
         for side in ("left", "right"):
             data = evidence.attitude(side)
             attitude_lines.append(
@@ -2510,15 +4327,34 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 f"px4_t={_display_number(data.get('px4_timestamp_s'), digits=6)}; "
                 "transport=MAVLink"
             )
-        self.pixhawk_view.appendPlainText("\n".join(attitude_lines))
+        text = self._status_text(snapshot, ("pixhawk.left", "pixhawk.right"))
+        self._set_diagnostic_text(self.pixhawk_view, "\n\n".join((text, "\n".join(attitude_lines))))
+
+    def _refresh_gnss(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        evidence = _evidence(self.backend)
         baseline = evidence.baseline()
-        gnss_lines = [
+        operation = evidence.gnss_operation()
+        base_serial = operation.get("base_serial") if isinstance(operation.get("base_serial"), dict) else {}
+        survey = operation.get("survey_in") if isinstance(operation.get("survey_in"), dict) else {}
+        ntrip = operation.get("ntrip") if isinstance(operation.get("ntrip"), dict) else {}
+        lines = [
+            self._status_text(snapshot, ("gnss.base", "gnss")),
+            "Base operation (Base receiver / Survey-in / NTRIP / RTCM):",
+            f"mode={operation.get('mode', 'UNKNOWN')} state={operation.get('state', 'UNKNOWN')} "
+            f"serial={'CONNECTED' if base_serial.get('connected') else 'DISCONNECTED'} "
+            f"device={base_serial.get('device') or '--'} discovery={operation.get('base_discovery_status', 'NOT RUN')}",
+            f"survey active/valid={bool(survey.get('active'))}/{bool(survey.get('valid'))} "
+            f"duration={survey.get('duration_s', 0)} s accuracy={_display_number(survey.get('mean_accuracy_m'), digits=4)} m",
+            f"NTRIP={'CONNECTED' if ntrip.get('connected') else 'DISCONNECTED'} "
+            f"caster={ntrip.get('caster_host') or '--'}:{ntrip.get('caster_port') or '--'}/"
+            f"{ntrip.get('mountpoint') or '--'}; RTCM frames={operation.get('base_frames', 0)} "
+            f"age={_display_number(operation.get('last_frame_age_s'), digits=2, suffix='s')}",
             "",
-            "Receiver source projection (WGS84 geodetic; not NED baseline):",
+            "Rover receiver projection (WGS84 geodetic; not NED baseline):",
         ]
         for side in ("left", "right"):
             data = evidence.gps(side)
-            gnss_lines.append(
+            lines.append(
                 f"{side}: {data.get('rtk_label', data.get('state', 'NO DATA'))}; "
                 f"fix={data.get('fix_type', '--')} sats={data.get('satellites', '--')} "
                 f"eph/epv={_display_number(data.get('eph_m'))}/{_display_number(data.get('epv_m'))} m; "
@@ -2526,7 +4362,7 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 f"lat/lon={_display_number(data.get('latitude_deg'), digits=7)}/"
                 f"{_display_number(data.get('longitude_deg'), digits=7)}"
             )
-        gnss_lines.extend(
+        lines.extend(
             [
                 "",
                 "Baseline source projection (NED north/east/down metres):",
@@ -2543,26 +4379,10 @@ class DiagnosticsContent(QtWidgets.QWidget):
                 f"attitude_age={_display_number(baseline.get('p1_body_frd_attitude_age_s'), digits=2, suffix='s')}",
             ]
         )
-        self.gnss_view.appendPlainText("\n".join(gnss_lines))
-        config = evidence.detection_config()
-        detection_lines = [
-            "",
-            "Detection configuration (AppSettings / existing controls):",
-            f"weights={config.get('weights_path', '--')}",
-            f"device={config.get('device', '--')} input={config.get('input_size_px', '--')} px "
-            f"conf/IoU={config.get('confidence', '--')}/{config.get('iou', '--')}",
-            f"gates={', '.join(str(item) for item in config.get('gate_enabled', ()) or ()) or 'OFF'}",
-        ]
-        target_lines = ["Target projection (bbox fields are image pixels u/v):"]
-        for side in ("left", "right"):
-            target = evidence.detection(side)
-            target_lines.append(
-                f"{side}: {target.get('runtime_state', 'NO TARGET')} class="
-                f"{_display_class(target)} "
-                f"conf={_display_number(target.get('confidence'), digits=3)} "
-                f"age={_display_number(target.get('age_s'), digits=2, suffix='s')}"
-            )
-        self.camera_view.appendPlainText("\n".join(detection_lines + target_lines))
+        self._set_diagnostic_text(self.gnss_view, "\n".join(lines))
+
+    def _refresh_measurement(self, _snapshot: dict[str, RuntimeStatus]) -> None:
+        panel = getattr(self.backend, "panel", self.backend)
         attempt = getattr(panel, "_last_measurement_attempt", None)
         pair_delta = getattr(panel, "selected_runtime_frame_pair_delta_s", None)
         pair_basis = getattr(panel, "selected_runtime_frame_pair_basis", "") or "--"
@@ -2606,7 +4426,26 @@ class DiagnosticsContent(QtWidgets.QWidget):
             f"baseline_translation_frame: {BASELINE_TRANSLATION_FRAME}",
             f"attempt: {attempt!r}",
         ]
-        self.measurement_view.setPlainText("\n".join(lines))
+        self._set_diagnostic_text(self.measurement_view, "\n".join(lines))
+
+    def _refresh_performance(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        self._set_diagnostic_text(self.performance_view, self._status_text(snapshot, ("fps",)))
+
+    def _status_text(self, snapshot: dict[str, RuntimeStatus], keys: tuple[str, ...]) -> str:
+        return "\n".join(self._format_status(snapshot.get(key)) for key in keys)
+
+    @staticmethod
+    def _set_diagnostic_text(
+        view: QtWidgets.QPlainTextEdit,
+        text: str,
+        *,
+        move_to_end: bool = False,
+    ) -> None:
+        if text == view.toPlainText():
+            return
+        view.setPlainText(text)
+        if move_to_end:
+            view.moveCursor(QtGui.QTextCursor.End)
 
     @staticmethod
     def _format_status(status: RuntimeStatus | None) -> str:
@@ -2615,6 +4454,6 @@ class DiagnosticsContent(QtWidgets.QWidget):
         age = "--" if status.age_s is None else f"{status.age_s:.2f}s"
         return (
             f"{status.label} | state={status.state} | severity={status.severity.value} | age={age}\n"
-            f"source={status.source} | clock={status.clock}\n"
+            f"From: {status.source} | Clock: {status.clock}\n"
             f"detail={status.detail}"
         )

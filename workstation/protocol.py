@@ -19,8 +19,8 @@ BACKEND_FACADE_METHODS = (
     "toggle_detection",
     "toggle_recording",
     "save_session",
-    "apply_camera_settings",
     "camera_discover_host_ip",
+    "camera_apply_candidate",
     "camera_auto_connect",
     "camera_check_rtsp",
     "camera_check_control",
@@ -33,7 +33,9 @@ BACKEND_FACADE_METHODS = (
     "pixhawk_discover_usb",
     "pixhawk_discover_mavlink_candidates",
     "pixhawk_discover_host_ip",
+    "pixhawk_apply_candidate",
     "gnss_base_discover",
+    "gnss_base_apply_candidate",
     "gnss_base_connect",
     "gnss_base_disconnect",
     "gnss_survey_start",
@@ -84,7 +86,7 @@ BACKEND_FACADE_METHODS = (
 
 
 def missing_backend_facades(backend: object) -> tuple[str, ...]:
-    """Return missing public facade methods for Legacy/Standalone conformance tests."""
+    """Return missing public methods for the standalone backend contract."""
 
     return tuple(name for name in BACKEND_FACADE_METHODS if not callable(getattr(backend, name, None)))
 
@@ -126,12 +128,14 @@ def evaluate_recording_protocol(
     calibration: Mapping[str, object],
     baseline: Mapping[str, object],
     require_rtk_fixed: bool,
+    minimum_fix_type: int | None = None,
+    physical_alignment: Mapping[str, object] | None = None,
+    final_sync_verified: bool | None = None,
 ) -> ProtocolReadiness:
     """Classify the minimum evidence expected before an experiment run.
 
-    The result is intentionally advisory.  Legacy-compatible sessions may
-    still be started, but the operator can see which prerequisite was absent
-    when the capture began.
+    The result is intentionally advisory.  A session may still be started,
+    but the operator can see which prerequisite was absent when capture began.
     """
 
     checks: list[ProtocolCheck] = []
@@ -220,6 +224,37 @@ def evaluate_recording_protocol(
         elif baseline_available and not baseline_good:
             baseline_detail += " · degraded fix accepted by current setting"
         checks.append(ProtocolCheck("baseline", "GNSS/RTK NED baseline", baseline_passed, baseline_detail))
+        if minimum_fix_type is not None:
+            try:
+                threshold = int(minimum_fix_type)
+                left_fix = int(baseline.get("left_fix_type"))
+                right_fix = int(baseline.get("right_fix_type"))
+                fix_passed = left_fix >= threshold and right_fix >= threshold
+                fix_detail = f"P1={left_fix}, P2={right_fix} · minimum fix_type={threshold}"
+            except (TypeError, ValueError):
+                fix_passed = False
+                fix_detail = f"P1={baseline.get('left_fix_type', '--')}, P2={baseline.get('right_fix_type', '--')} · minimum fix_type={minimum_fix_type}"
+            checks.append(ProtocolCheck("fix_type", "Numeric GNSS fix_type", fix_passed, fix_detail))
+
+    if physical_alignment is not None:
+        alignment_state = str(physical_alignment.get("state", "WAITING") or "WAITING").upper()
+        checks.append(
+            ProtocolCheck(
+                "physical_alignment",
+                "Physical alignment evidence",
+                alignment_state == "PASS",
+                f"state={alignment_state} · hardware adjustment only; no software R/P/Y correction",
+            )
+        )
+    if final_sync_verified is not None:
+        checks.append(
+            ProtocolCheck(
+                "final_synchronization",
+                "Final WIRIS time-sync checkpoint",
+                bool(final_sync_verified),
+                "explicit post-alignment RTCP/NTP verification",
+            )
+        )
 
     return ProtocolReadiness(
         state="READY" if all(check.passed for check in checks) else "BLOCKED",

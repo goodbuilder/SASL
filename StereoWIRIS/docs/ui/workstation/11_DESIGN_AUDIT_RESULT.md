@@ -243,7 +243,7 @@ owner unless separately requested.
 | GNSS/RTK | MERGE into Alignment/Diagnostics | `GnssOperationManager` readiness와 GPS sample/baseline이 별도 source | readiness/source/age를 한 inspector group으로 |
 | Detection | MERGE with Cameras | inference 상태는 camera stream과 결합 | model/running/target freshness를 local section으로 |
 | Measurement | KEEP, but backend facade required | `MeasurementAttempt`와 controller는 명확한 vertical slice | geometry logic 재구현 없이 read-only result + guarded command |
-| Synchronization | MOVE to local Diagnostics/Inspector | camera pair/RTCP/NTP/attitude age가 별도 top-level을 요구할 정도로 독립적이지 않음 | pair delta와 clock domain을 measurement context에 표시 |
+| Synchronization | KEEP as Time / Sync | PC UTC, WIRIS RTC, RTCP/NTP evidence, and editable sync limits form an independent field workflow | Measurement keeps read-only synchronization state and rejection reason |
 | Alignment | KEEP as workflow-specific | baseline/attitude/MAG/GNSS 검증은 순차 workflow가 있음 | 기존 정렬 기능을 직접 복제하지 않음 |
 | Calibration | KEEP as workflow-specific | capture/calculate/apply/save의 상태 전이가 분명함 | Phase 1은 legacy handoff/read-only profile |
 | Recording | MERGE with global action + Save/Review local tab | 실제 기록은 cross-cutting lifecycle이고 save backend가 강함 | coordinator 이후에만 action wiring |
@@ -334,7 +334,7 @@ owner unless separately requested.
   detection/sync/GNSS/recording/FPS evidence
 - source-backed Alignment/Pixhawk/GNSS tables, Calibration profile/metric tables, and
   Recording/Review/Export session artifact tables
-- Workstation Measurement/synchronization settings Apply/Save, Calibration setup Apply/scan/Save,
+- Workstation Measurement settings and Time/Sync limits Apply/Save, Calibration setup Apply/scan/Save,
   Alignment source/sampling/profile/swap commands, and session CSV preview/open controls
 - phase-one direct camera discovery/RTSP/control, Pixhawk discovery/MAVLink, and GNSS
   Base serial/Survey-in/NTRIP command facades, plus calibration capture/run/save/load/apply/

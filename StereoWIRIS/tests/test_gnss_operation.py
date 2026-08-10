@@ -47,6 +47,8 @@ def fixed_sample(timestamp_s: float, *, lat: float = 37.0, lon: float = 127.0) -
 
 def test_operation_config_roundtrip_keeps_mode_and_network_identity() -> None:
     config = GnssOperationConfig(
+        site_label="Test field",
+        site_address="37.0, 127.0",
         operation_mode=GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
         network=NetworkConfig(caster_host="caster.example", mountpoint="MOUNT"),
     )
@@ -55,6 +57,8 @@ def test_operation_config_roundtrip_keeps_mode_and_network_identity() -> None:
 
     assert restored == config
     assert restored.network.mountpoint == "MOUNT"
+    assert restored.site_label == "Test field"
+    assert restored.site_address == "37.0, 127.0"
 
 
 def test_ecef_conversion_keeps_wgs84_geodetic_contract() -> None:
@@ -169,6 +173,23 @@ def test_readiness_evaluator_accepts_exact_threshold_boundaries() -> None:
     assert snapshot.reasons == ()
 
 
+def test_default_readiness_accepts_3d_rover_without_rtk_fixed_timer() -> None:
+    base = two_rover_readiness_inputs(100.0)
+    non_fixed = {
+        target: replace(sample, fix_type=3, rtk_fixed_since_monotonic_s=None)
+        for target, sample in base.rover_samples.items()
+    }
+
+    snapshot = evaluate_gnss_readiness(
+        GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT),
+        replace(base, rover_samples=non_fixed),
+    )
+
+    assert "rover_not_fixed" not in snapshot.reasons
+    assert "rover_fixed_duration_missing" not in snapshot.reasons
+    assert snapshot.ready is True
+
+
 @pytest.mark.parametrize(
     ("inputs", "reason"),
     [
@@ -228,7 +249,11 @@ def test_readiness_evaluator_accepts_exact_threshold_boundaries() -> None:
     ],
 )
 def test_readiness_evaluator_fails_just_outside_thresholds(inputs: GnssReadinessInputs, reason: str) -> None:
-    snapshot = evaluate_gnss_readiness(GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT), inputs)
+    readiness = ReadinessConfig(minimum_fix_type=6) if reason == "rover_fixed_duration_short" else ReadinessConfig()
+    snapshot = evaluate_gnss_readiness(
+        GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT, readiness=readiness),
+        inputs,
+    )
 
     assert snapshot.ready is False
     assert reason in snapshot.reasons
@@ -318,14 +343,29 @@ def test_gate_disabled_preserves_computed_not_ready_with_warning() -> None:
 
 
 def test_measurement_contract_stable_id_is_order_independent_and_in_metadata() -> None:
-    source = CorrectionSourceIdentity(source_kind="ntrip-direct", caster_host="caster.example", caster_port=2101, mountpoint="MOUNT")
+    source = CorrectionSourceIdentity(
+        source_kind="ntrip-direct",
+        caster_host="caster.example",
+        caster_port=2101,
+        mountpoint="MOUNT",
+        site_label="Test field",
+        site_address="37.0, 127.0",
+    )
     readiness = evaluate_gnss_readiness(
-        GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT),
+        GnssOperationConfig(
+            operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT,
+            site_label="Test field",
+            site_address="37.0, 127.0",
+        ),
         two_rover_readiness_inputs(100.0, source_id=source.stable_id),
     )
 
     left_first = build_measurement_gnss_contract(
-        GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT),
+        GnssOperationConfig(
+            operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT,
+            site_label="Test field",
+            site_address="37.0, 127.0",
+        ),
         source,
         readiness,
         base_coordinate_profile_hash="base-hash",
@@ -334,7 +374,11 @@ def test_measurement_contract_stable_id_is_order_independent_and_in_metadata() -
         route_endpoints={"left": "left-endpoint", "right": "right-endpoint"},
     )
     right_first = build_measurement_gnss_contract(
-        GnssOperationConfig(operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT),
+        GnssOperationConfig(
+            operation_mode=GnssOperationMode.NETWORK_RTK_DIRECT,
+            site_label="Test field",
+            site_address="37.0, 127.0",
+        ),
         source,
         readiness,
         base_coordinate_profile_hash="base-hash",
@@ -345,6 +389,8 @@ def test_measurement_contract_stable_id_is_order_independent_and_in_metadata() -
 
     assert left_first.stable_id == right_first.stable_id
     assert left_first.to_metadata()["gnss_contract_id"] == left_first.stable_id
+    assert left_first.to_metadata()["site_label"] == "Test field"
+    assert left_first.to_metadata()["site_address"] == "37.0, 127.0"
 
 
 def transition_manager_to_ready(manager: GnssOperationManager) -> None:

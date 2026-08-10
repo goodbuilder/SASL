@@ -13,7 +13,7 @@ from pose_simulation.input_probe_node import (
 from pose_simulation.input_types import SOURCE_UNAVAILABLE
 from pose_simulation.time_alignment import align_static_snapshot
 
-from test_input_adapters import _camera_payload, _gt_message
+from .test_input_adapters import _camera_payload, _gt_message
 
 
 def _gt(stamp_ns: int):

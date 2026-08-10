@@ -182,18 +182,23 @@ def test_rviz_rays_are_enabled_by_default_and_use_a_world_enu_marker_array() -> 
 
 
 def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -> None:
-    source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
+    node_source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
+    publisher_source = (PACKAGE_ROOT / "stereo_ground_sim" / "rviz_publisher.py").read_text(encoding="utf-8")
+    worker_source = (PACKAGE_ROOT / "stereo_ground_sim" / "runtime_worker_loops.py").read_text(encoding="utf-8")
+    coordinator_source = (PACKAGE_ROOT / "stereo_ground_sim" / "pair_result_coordinator.py").read_text(encoding="utf-8")
+    gt_source = (PACKAGE_ROOT / "stereo_ground_sim" / "pair_ground_truth_coordinator.py").read_text(encoding="utf-8")
+    source = node_source + publisher_source + worker_source + coordinator_source + gt_source
 
     assert "_rviz_live_worker_loop" in source
     assert "_latest_rviz_ideal_ray" in source
     assert "uam_gps_ray_visualization_world_enu_from_point" in source
     assert '"/stereo/live_detections"' in source
-    assert "self.live_detections_pub.publish(self._detections_to_msg(left, right))" in source
+    assert "self.node.live_detections_pub.publish(self.node._detections_to_msg(left, right))" in source
     assert "rviz_live_latest_only" in source
     assert "rviz_live_ray_hz" in source
     assert 'diagnostic_rays = computed.get("diagnostic_rays", {})' in source
-    assert "self._publish_ray_metrics(\n                        pair_id=pair.pair_id,\n                        nominal_pose=raw," in source
-    assert "if not self._rviz_latest_only_markers_enabled()" in source
+    assert "self.node._publish_ray_metrics(\n                        pair_id=pair.pair_id,\n                        nominal_pose=raw," in source
+    assert "if not self.node._rviz_latest_only_markers_enabled()" in source
     assert 'worker = getattr(self, "rviz_live_thread", None)' in source
     assert "and worker is not None" in source
     assert "and worker.is_alive()" in source
@@ -204,7 +209,7 @@ def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -
     assert "nominal_pose=metrics.get(\"_raw_ray\")" in source
     assert "ideal=ideal" in source
     assert "self.lock = threading.RLock()" in source
-    assert "self.live_detections_pub.publish(detection_message)" in source
+    assert "self.node.live_detections_pub.publish(detection_message)" in source
     assert "ideal=ideal" in source
     assert 'label="nominal_pose"' in source
     assert 'label="optical_pose"' in source
@@ -214,7 +219,7 @@ def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -
     assert 'namespace = "stereo_rays_uam_gps"' in source
     assert "uam_gps_ray=uam_gps_ray" in source
     assert 'label="global_baseline"' in source
-    assert 'display_name = RAY_DISPLAY_NAMES[label]' in source
+    assert 'display_name = self.ray_display_names[label]' in source
     assert 'f"left_{display_name}_ray"' in source
     assert 'f"right_{display_name}_ray"' in source
     assert 'f"{display_name}_closest_ray_gap"' in source
@@ -232,9 +237,9 @@ def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -
     assert "Publish the configured camera frustums without requiring a ray result." in source
     assert "def _camera_position_markers(self, stamp):" in source
     assert "Render the two configured camera origins in ``gazebo_world_enu`` metres." in source
-    assert 'publisher = getattr(self, "fov_marker_pub", None)' in source
-    assert "markers = self._camera_fov_markers(stamp)" in source
-    assert "depth_m = min(max(1.0, float(getattr(self, \"camera_clip_far_m\", 2500.0))), 2500.0)" in source
+    assert 'publisher = getattr(self.node, "fov_marker_pub", None)' in source
+    assert "markers = self.node._camera_fov_markers(stamp)" in source
+    assert "depth_m = min(max(1.0, float(getattr(self.node, \"camera_clip_far_m\", 2500.0))), 2500.0)" in source
     assert "faces.color.a = 0.20" in source
     assert "edges.scale.x = 3.0" in source
     assert 'marker.ns = "stereo_actual_drone"' in source
@@ -259,7 +264,7 @@ def test_launch_exposes_latest_only_rviz_ray_controls() -> None:
 
 
 def test_rviz_ray_colors_match_the_nominal_optical_and_ideal_rqt_series() -> None:
-    source = (PACKAGE_ROOT / "stereo_ground_sim" / "stereo_distance_node.py").read_text(encoding="utf-8")
+    source = (PACKAGE_ROOT / "stereo_ground_sim" / "rviz_publisher.py").read_text(encoding="utf-8")
 
     assert source.count('left_color=(220.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0)') == 1
     assert source.count('right_color=(220.0 / 255.0, 32.0 / 255.0, 32.0 / 255.0)') == 1

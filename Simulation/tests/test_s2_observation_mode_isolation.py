@@ -39,7 +39,7 @@ def test_observation_mode_validation_rejects_aliases_and_silent_fallbacks(mode):
         StereoDistanceNode._validate_observation_mode(mode)
 
 
-@pytest.mark.parametrize("source", ("raw_gps", "global_position", "both"))
+@pytest.mark.parametrize("source", ("gps_baseline", "global_baseline", "both"))
 def test_gps_baseline_source_validation_accepts_supported_sources(source):
     assert StereoDistanceNode._validate_gps_baseline_source(source) == source
 

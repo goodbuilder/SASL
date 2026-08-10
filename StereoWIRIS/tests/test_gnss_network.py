@@ -9,6 +9,7 @@ from wiris_stereo_distance.gnss_network import (
     NtripClient,
     NtripProtocolError,
     build_ntrip_request,
+    gga_from_coordinate_sample,
     format_nmea_gga,
     parse_ntrip_response_header,
 )
@@ -66,6 +67,29 @@ def test_gga_is_well_formed_and_checksummed() -> None:
     assert sentence.startswith("$GPGGA,123456.12,")
     assert body.endswith(",M,0.000,M,,")
     assert checksum == f"{expected:02X}"
+
+
+def test_base_coordinate_gga_uses_wgs84_sample_and_msl_altitude_for_ntrip() -> None:
+    from wiris_stereo_distance.gnss_profile import GnssCoordinateSample
+    from wiris_stereo_distance.gnss_operation import HeightType
+
+    sample = GnssCoordinateSample(
+        latitude_deg=37.0,
+        longitude_deg=127.0,
+        ellipsoid_height_m=52.0,
+        msl_altitude_m=48.0,
+        height_type=HeightType.ELLIPSOID,
+        timestamp_s=10.0,
+        fixed=True,
+    )
+
+    sentence = gga_from_coordinate_sample(
+        sample,
+        utc_datetime=datetime(2026, 8, 2, 12, 34, 56, tzinfo=timezone.utc),
+    )
+
+    assert sentence is not None
+    assert ",6,12,1.0,48.000,M,0.000,M,," in sentence
 
 
 class _FakeSocket:

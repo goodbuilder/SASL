@@ -266,11 +266,11 @@ def test_successful_evaluation_is_one_atomic_eligible_record() -> None:
     assert record["pair_midpoint_stamp_ns"] == (
         record["left_stamp_ns"] + record["right_stamp_ns"]
     ) // 2
-    assert record["raw_forward_error_m"] == -1.0
-    assert record["raw_right_error_m"] == 1.0
-    assert record["raw_down_error_m"] == 2.0
-    assert abs(record["raw_position_error_m"] - math.sqrt(6.0)) <= 1e-12
-    assert abs(record["raw_range_error_m"] - (math.sqrt(86.0) - 10.0)) <= 1e-12
+    assert record["nominal_pose_forward_error_m"] == -1.0
+    assert record["nominal_pose_right_error_m"] == 1.0
+    assert record["nominal_pose_down_error_m"] == 2.0
+    assert abs(record["nominal_pose_position_error_m"] - math.sqrt(6.0)) <= 1e-12
+    assert abs(record["nominal_pose_range_error_m"] - (math.sqrt(86.0) - 10.0)) <= 1e-12
     assert record["corrected_position_error_m"] == 0.0
     assert node.measurement_accepted_count == node.measurement_processed_count
 
@@ -288,7 +288,7 @@ def test_gt_unavailable_is_recorded_once_and_is_not_sample_eligible() -> None:
     assert record["terminal_status"] == "gt_unavailable"
     assert record["sample_eligible"] is False
     assert record["gt_forward_m"] is None
-    assert record["raw_position_error_m"] is None
+    assert record["nominal_pose_position_error_m"] is None
 
 
 def test_ideal_rejection_and_measurement_exception_are_terminal_once() -> None:

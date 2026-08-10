@@ -11,9 +11,9 @@ from .evidence import EvidenceAdapter
 class StandalonePanelBackend(QtCore.QObject):
     """Backend for the Workstation-owned copy of the panel.
 
-    This file intentionally remains a separate copy of ``backend.py``.  The
-    Workstation runtime can therefore evolve its owner without importing or
-    instantiating the Legacy UI adapter.
+    This is the only backend adapter in the Workstation package.  It evolves
+    with the standalone owner without importing or instantiating a sibling UI
+    runtime.
     """
 
     command_error = QtCore.pyqtSignal(str)
@@ -52,25 +52,14 @@ class StandalonePanelBackend(QtCore.QObject):
     def save_session(self) -> Any:
         return self._call("save_distance_history_csv")
 
-    def apply_camera_settings(self, left_url: str, right_url: str) -> bool:
-        left_edit = getattr(self.panel, "left_url_edit", None)
-        right_edit = getattr(self.panel, "right_url_edit", None)
-        if left_edit is None or right_edit is None:
-            message = "camera URL controls unavailable"
-            self.command_error.emit(message)
-            raise RuntimeError(message)
-        left_edit.setText(str(left_url).strip())
-        right_edit.setText(str(right_url).strip())
-        saver = getattr(self.panel, "_save_current_settings", None)
-        if callable(saver):
-            saver()
-        return True
-
     # Operation facades delegate to the standalone panel owner.  The
-    # Workstation still has one camera/telemetry worker per runtime; the Legacy
-    # runtime has its own independent panel and backend.
+    # Workstation has one camera/telemetry worker per runtime; sibling
+    # applications keep independent resource owners.
     def camera_discover_host_ip(self) -> Any:
         return self._call("discover_pc_camera_ip")
+
+    def camera_apply_candidate(self, row: int, target: str) -> Any:
+        return self._call("apply_camera_candidate", row, target)
 
     def camera_auto_connect(self) -> Any:
         return self._call("auto_connect_wiris")
@@ -112,8 +101,14 @@ class StandalonePanelBackend(QtCore.QObject):
     def pixhawk_discover_host_ip(self) -> Any:
         return self._call("discover_pc_pixhawk_ip")
 
+    def pixhawk_apply_candidate(self, source: str, row: int, target: str) -> Any:
+        return self._call("apply_pixhawk_candidate", source, row, target)
+
     def gnss_base_discover(self) -> Any:
         return self._call("discover_gnss_base_serial_ports")
+
+    def gnss_base_apply_candidate(self, row: int) -> Any:
+        return self._call("apply_gnss_base_candidate", row)
 
     def gnss_base_connect(self) -> Any:
         return self._call("connect_gnss_base_serial")
@@ -148,6 +143,9 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def calibration_load_intrinsics(self) -> Any:
         return self._call("load_intrinsics")
+
+    def calibration_load_current_zoom_intrinsics(self) -> Any:
+        return self._call("load_current_zoom_intrinsics")
 
     def calibration_apply_intrinsics(self) -> Any:
         return self._call("apply_intrinsics_to_distance")
@@ -255,27 +253,6 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def advanced_calibration_preview_snapshot(self) -> Any:
         return self._call("workstation_calibration_preview_snapshot")
-
-    def select_owner_context(self, context_id: str) -> None:
-        tabs = getattr(self.panel, "tabs", None)
-        if tabs is None:
-            return
-        index_attr = {
-            "devices.cameras": "setup_tab_index",
-            "devices.pixhawk": "alignment_tab_index",
-            "devices.gnss": "alignment_tab_index",
-            "processing.alignment": "alignment_tab_index",
-            "processing.calibration": "calibration_tab_index",
-            "tasks.calibration": "calibration_tab_index",
-            "tasks.recording": "results_tab_index",
-            "tasks.export": "results_tab_index",
-            "diagnostics.measurement": "depth_tab_index",
-        }.get(context_id)
-        if index_attr is None:
-            return
-        index = getattr(self.panel, index_attr, None)
-        if isinstance(index, int):
-            tabs.setCurrentIndex(index)
 
     def diagnostic_text(self) -> str:
         sources = []

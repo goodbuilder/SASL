@@ -5,7 +5,7 @@ from pose_simulation.visualization_marker_factory import (
     VisualizationConfig,
     build_visualization_marker_specs,
 )
-from test_visualization_snapshot import _status, _valid_snapshot
+from .test_visualization_snapshot import _status, _valid_snapshot
 
 
 WORLD = "gazebo_world_enu"

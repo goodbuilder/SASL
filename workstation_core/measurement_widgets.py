@@ -176,11 +176,11 @@ class Triangulation3DView(QtWidgets.QWidget):
         detected_pt = np.array(_frd_to_gl(scene["detected_point"]))
         self._cam_scatter.setData(
             pos=np.array([cam_l, cam_r]),
-            color=np.array([[0.3, 0.7, 1.0, 1.0], [1.0, 0.55, 0.2, 1.0]]),
+            color=np.array([[0.20, 0.20, 0.20, 1.0], [0.62, 0.62, 0.62, 1.0]]),
         )
-        self._point_scatter.setData(pos=np.array([detected_pt]), color=np.array([[1.0, 0.25, 0.3, 1.0]]))
-        self._left_ray.setData(pos=np.array([cam_l, left_pt]), color=(0.3, 0.7, 1.0, 1.0))
-        self._right_ray.setData(pos=np.array([cam_r, right_pt]), color=(1.0, 0.55, 0.2, 1.0))
+        self._point_scatter.setData(pos=np.array([detected_pt]), color=np.array([[0.80, 0.12, 0.16, 1.0]]))
+        self._left_ray.setData(pos=np.array([cam_l, left_pt]), color=(0.24, 0.24, 0.24, 1.0))
+        self._right_ray.setData(pos=np.array([cam_r, right_pt]), color=(0.62, 0.62, 0.62, 1.0))
         self._gap_line.setData(pos=np.array([left_pt, right_pt]), color=(1.0, 1.0, 1.0, 0.5))
 
     def _fmt(self, value: object) -> str:

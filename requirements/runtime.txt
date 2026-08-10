@@ -1,0 +1,13 @@
+# Standalone Workstation runtime. Pixhawk telemetry and RTCM injection use
+# pymavlink directly; no ROS 2 or px4_msgs overlay is required.
+PyQt5>=5.15,<6
+numpy>=1.23.5,<1.25
+scipy>=1.8,<1.11
+opencv-python>=4.8,<5
+PyYAML>=6,<7
+pyarrow>=14,<24
+XlsxWriter>=3.1,<4
+pyserial>=3.5,<4
+pymavlink>=2.4.41,<3
+pyqtgraph>=0.13,<1
+av>=11,<16

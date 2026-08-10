@@ -3,6 +3,32 @@ from __future__ import annotations
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 
+_CONTEXT_ALIASES = {
+    # Keep saved UI state and external callers compatible while the visible
+    # tree moves to paired contexts and a single session surface.
+    "devices.cameras.left": "devices.cameras",
+    "devices.cameras.right": "devices.cameras",
+    "devices.cameras.stereo": "devices.cameras",
+    "devices.pixhawk.p1": "devices.pixhawk",
+    "devices.pixhawk.p2": "devices.pixhawk",
+    "processing.detection": "devices.cameras",
+    "processing.synchronization": "devices.time",
+    "tasks.playback": "tasks.recording",
+    "tasks.export": "tasks.recording",
+}
+
+
+def canonical_context_id(context_id: str) -> str:
+    """Return the visible navigation context for a legacy/old saved ID."""
+
+    current = str(context_id or "")
+    seen: set[str] = set()
+    while current in _CONTEXT_ALIASES and current not in seen:
+        seen.add(current)
+        current = _CONTEXT_ALIASES[current]
+    return current
+
+
 class NavigationTree(QtWidgets.QTreeView):
     context_changed = QtCore.pyqtSignal(str)
 
@@ -28,39 +54,25 @@ class NavigationTree(QtWidgets.QTreeView):
         return item
 
     def _build_model(self) -> None:
-        root = self._item("StereoWIRIS", "root", selectable=False)
+        root = self._item("Workstation", "root", selectable=False)
         self.model.appendRow(root)
         root.appendRow(self._item("Overview", "overview"))
 
+        root.appendRow(self._item("Protocol", "processing.experiment"))
+        root.appendRow(self._item("Pre-run Calibration", "tasks.calibration"))
+
         devices = self._item("Devices", "devices", selectable=False)
-        cameras = self._item("Cameras", "devices.cameras", selectable=True)
-        cameras.appendRow(self._item("Left Camera", "devices.cameras.left"))
-        cameras.appendRow(self._item("Right Camera", "devices.cameras.right"))
-        cameras.appendRow(self._item("Stereo Pair", "devices.cameras.stereo"))
-        devices.appendRow(cameras)
+        devices.appendRow(self._item("Cameras", "devices.cameras"))
+        devices.appendRow(self._item("Pixhawk", "devices.pixhawk"))
+        devices.appendRow(self._item("Base GNSS", "devices.gnss"))
         devices.appendRow(self._item("Time / Sync", "devices.time"))
-        pixhawk = self._item("Pixhawk", "devices.pixhawk", selectable=True)
-        pixhawk.appendRow(self._item("Pixhawk 1", "devices.pixhawk.p1"))
-        pixhawk.appendRow(self._item("Pixhawk 2", "devices.pixhawk.p2"))
-        devices.appendRow(pixhawk)
-        devices.appendRow(self._item("GNSS / RTK", "devices.gnss"))
         root.appendRow(devices)
 
-        processing = self._item("Processing", "processing", selectable=False)
-        processing.appendRow(self._item("Detection", "processing.detection"))
-        processing.appendRow(self._item("Measurement", "processing.measurement"))
-        processing.appendRow(self._item("Synchronization", "processing.synchronization"))
-        processing.appendRow(self._item("Alignment", "processing.alignment"))
-        root.appendRow(processing)
-
-        tasks = self._item("Tasks", "tasks", selectable=False)
-        tasks.appendRow(self._item("Calibration", "tasks.calibration"))
-        tasks.appendRow(self._item("Recording", "tasks.recording"))
-        tasks.appendRow(self._item("Session Review", "tasks.playback"))
-        tasks.appendRow(self._item("Artifacts", "tasks.export"))
-        tasks.appendRow(self._item("Advanced owner tools", "tasks.advanced"))
-        tasks.appendRow(self._item("All settings", "tasks.settings"))
-        root.appendRow(tasks)
+        root.appendRow(self._item("Alignment", "processing.alignment"))
+        root.appendRow(self._item("Measurement", "processing.measurement"))
+        root.appendRow(self._item("Recording / Sessions", "tasks.recording"))
+        root.appendRow(self._item("Advanced", "tasks.advanced"))
+        root.appendRow(self._item("Settings", "tasks.settings"))
 
         diagnostics = self._item("Diagnostics", "diagnostics", selectable=False)
         diagnostics.appendRow(self._item("System", "diagnostics.system"))
@@ -72,10 +84,6 @@ class NavigationTree(QtWidgets.QTreeView):
         diagnostics.appendRow(self._item("Performance", "diagnostics.performance"))
         root.appendRow(diagnostics)
         self.expand(root.index())
-        self.expand(cameras.index())
-        self.expand(pixhawk.index())
-        self.expand(processing.index())
-        self.expand(tasks.index())
         self.expand(diagnostics.index())
         self.setCurrentIndex(root.child(0).index())
 
@@ -85,6 +93,7 @@ class NavigationTree(QtWidgets.QTreeView):
             self.context_changed.emit(str(context_id))
 
     def select_context(self, context_id: str) -> bool:
+        context_id = canonical_context_id(context_id)
         matches = self.model.match(
             self.model.index(0, 0),
             QtCore.Qt.UserRole,

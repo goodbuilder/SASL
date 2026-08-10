@@ -241,17 +241,21 @@ def generate_waypoints(
     # left/right pixel-margin check in sample_one() -- match where the
     # cameras really point, not just the level case. Zero angles are a no-op,
     # so this generalizes the old level-only behavior rather than replacing it.
+    left_rpy_deg = tuple(
+        float(getattr(args, name, 0.0))
+        for name in ("cam_l_optical_roll_deg", "cam_l_optical_pitch_deg", "cam_l_optical_yaw_deg")
+    )
+    right_rpy_deg = tuple(
+        float(getattr(args, name, 0.0))
+        for name in ("cam_r_optical_roll_deg", "cam_r_optical_pitch_deg", "cam_r_optical_yaw_deg")
+    )
     left_camera = apply_optical_rpy_error(
         nominal_left,
-        math.radians(args.cam_l_optical_roll_deg),
-        math.radians(args.cam_l_optical_pitch_deg),
-        math.radians(args.cam_l_optical_yaw_deg),
+        *(math.radians(value) for value in left_rpy_deg),
     )
     right_camera = apply_optical_rpy_error(
         nominal_right,
-        math.radians(args.cam_r_optical_roll_deg),
-        math.radians(args.cam_r_optical_pitch_deg),
-        math.radians(args.cam_r_optical_yaw_deg),
+        *(math.radians(value) for value in right_rpy_deg),
     )
     frame = build_baseline_center_frd(
         left_camera.center_world_enu_m,
@@ -324,12 +328,12 @@ def generate_waypoints(
             for right in validation
         ),
         "min_set_separation_m": args.min_set_separation_m,
-        "cam_l_optical_roll_deg": args.cam_l_optical_roll_deg,
-        "cam_l_optical_pitch_deg": args.cam_l_optical_pitch_deg,
-        "cam_l_optical_yaw_deg": args.cam_l_optical_yaw_deg,
-        "cam_r_optical_roll_deg": args.cam_r_optical_roll_deg,
-        "cam_r_optical_pitch_deg": args.cam_r_optical_pitch_deg,
-        "cam_r_optical_yaw_deg": args.cam_r_optical_yaw_deg,
+        "cam_l_optical_roll_deg": left_rpy_deg[0],
+        "cam_l_optical_pitch_deg": left_rpy_deg[1],
+        "cam_l_optical_yaw_deg": left_rpy_deg[2],
+        "cam_r_optical_roll_deg": right_rpy_deg[0],
+        "cam_r_optical_pitch_deg": right_rpy_deg[1],
+        "cam_r_optical_yaw_deg": right_rpy_deg[2],
         "world_frame": WORLD_FRAME,
         "baseline_frame": BASELINE_CENTER_FRD_FRAME,
         "px4_waypoint_frame": PX4_WAYPOINT_FRAME,

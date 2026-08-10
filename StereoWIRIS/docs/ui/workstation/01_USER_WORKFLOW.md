@@ -44,12 +44,56 @@ Persistent information candidates:
 Success: required devices for intended task are connected and providing expected data.
 
 Field sequence for the Workstation implementation:
-1. Camera IP/control/RTSP readiness
-2. WIRIS PC clock, RTCP/NTP stream evidence
-3. Pixhawk transport and P1/P2 role mapping
-4. GNSS Base/Rover operation, raw NED baseline readiness, and the derived P1 body-FRD baseline view
-5. Calibration setup, capture/intrinsics, and validation
-6. Measurement preflight, Preview, Detection, Record, stop, and Save session
+0. Complete Pixhawk Sensor Calibration in QGC outside Workstation.
+1. Connect and verify WIRIS, Pixhawk P1/P2, and Base GNSS.
+2. Start Base Survey-in or NTRIP.
+3. Set/check WIRIS time synchronization.
+4. Verify RTCM delivery to Left/Right Pixhawk and record numeric `fix_type`; do not assume every condition reaches `RTK_FIXED=6`.
+5. Physically align the P1–P2 baseline.
+6. Physically rotate the assembly to align Roll/Pitch/Yaw.
+7. Repeat steps 5–6 with a new evidence sample.
+8. Check final WIRIS time-sync quality and resync if required.
+9. Confirm YOLO and measurement settings.
+10. Start measurement.
+11. Save the measured data.
+
+Internal camera intrinsic/stereo calibration is a pre-experiment task. It remains
+available in `Pre-run Calibration`, but it is not inserted into the numbered field
+sequence after the final time-sync checkpoint.
+
+The `Protocol` page mirrors this order and links to the corresponding Workstation page for
+each action. QGC calibration is displayed as an external prerequisite and has no
+in-app execution button.
+
+### Calibration calculation execution
+
+`Checkerboard capture validation` copies the currently displayed left/right images, fixes
+their RTCP/NTP pair decision at capture time, then encodes PNG files and runs checkerboard
+detection in the shared background calibration slot. Its purpose is to prevent image
+encoding and OpenCV detection from blocking live controls. A stereo capture assumes both
+frames contain RTCP/NTP camera timestamps within the configured pair limit; otherwise
+neither side is admitted as a stereo pair. The output contract is unchanged OpenCV image
+pixels with capture metadata recording the original RTCP/NTP timestamps and delta. PASS
+means at least one available image was encoded and passed checkerboard detection (or was
+explicitly retained because OpenCV was unavailable); FAIL leaves rejected images out of the
+calibration set. This capture method does not use ground truth or produce NED/FRD values.
+
+`Full checkerboard calibration` runs the existing OpenCV intrinsic calculation for both
+cameras and, in checkerboard mode, the existing stereo extrinsic calculation. Its purpose is
+to keep the Workstation responsive while processing an image set; the numerical method is
+unchanged. Inputs are the selected checkerboard geometry and readable left/right images. In
+checkerboard mode, left/right files must have matching capture IDs and at least three stereo
+pairs. The output contract remains OpenCV optical RDF intrinsics and
+`X_right = R_left_to_right * X_left + T_left_to_right_m`. Completion with a typed calibration
+result is PASS; an OpenCV/input exception or invalid result is FAIL and leaves the prior
+applied result unchanged.
+
+`Random stereo-pair validation` repeats the same calculation on seeded subsets in the same
+background calculation slot. It assumes a completed full result and at least three matching
+pairs. PASS records each successful subset and reports intrinsic, baseline, and rotation
+stability; partial subset failures remain visible in the result table and do not become
+runtime calibration truth. Neither method uses ground truth or converts RDF values to NED,
+FRD, or the public measurement frame.
 
 ## 5. Hardware Connection
 
@@ -101,8 +145,11 @@ Before capture, the Recording workspace shows an advisory experiment preflight. 
 pass criteria are both camera streams live, RTCP/NTP pair synchronization verified,
 detection running, active stereo intrinsics, and either P1/P2 MAVLink plus the GNSS/RTK
 NED baseline or checkerboard left-to-right optical RDF geometry according to the selected
-measurement path. `require_rtk_fixed` adds the RTK-fixed condition. `READY`/`BLOCKED` is
-evidence only and does not change the existing recording command.
+measurement path. GNSS readiness checks the configured numeric `minimum_fix_type` (default
+3); `RTK_FIXED=6` and fixed duration are required only when explicitly selected. The same
+preflight also requires a passing physical-alignment result and an explicit final WIRIS
+time-sync checkpoint recorded after alignment. `READY`/`BLOCKED` is evidence only and does
+not change the existing recording command.
 
 State candidates: Idle, Starting, Recording, Stopping, Saved, Error.
 
@@ -126,11 +173,16 @@ Calibration is a multi-step engineering workflow. Typical sequence: select type,
 
 ## 11. PX4 / Attitude Verification
 
-Expose connectivity, attitude, timestamp/age, source, relative attitude, and relevant sensor state. Detailed raw telemetry belongs in Diagnostics.
+QGC Sensor Calibration is an external prerequisite. Workstation exposes the stored
+calibration status read-only, plus connectivity, attitude, timestamp/age, source,
+relative attitude, and relevant sensor state. Detailed raw telemetry belongs in
+Diagnostics.
 
 ## 12. GNSS / RTK Verification
 
-Expose receiver state, fix/quality, satellites, eph/epv, baseline, RTK, source, timestamp/age.
+Expose receiver state, numeric `fix_type`, RTK label, satellites, eph/epv, RTCM route
+delivery, baseline, source, timestamp/age, and the fixed-sample ratio. Numeric fix evidence
+must remain visible even when the solution is not `RTK_FIXED`.
 The selected antenna baseline remains `P1→P2` in local NED `[North, East, Down]`.
 When P1 attitude is available, show the same vector separately in P1 body FRD
 `[Forward, Right, Down]`; this is an attitude-derived operator aid and is not camera
@@ -175,7 +227,7 @@ Priority C: calibration, saved-session analysis, advanced configuration.
 
 ## 18. Representative Session
 
-Launch → camera readiness → time/sync evidence → connect Pixhawk → confirm GNSS/RTK → calibration → preview → enable detection → measurement quality check → start recording → monitor → diagnose if needed → stop → confirm saved session → review.
+Launch → external QGC calibration → internal camera calibration → connect/verify WIRIS, Pixhawk, Base GNSS → Survey-in/NTRIP → initial WIRIS sync → RTCM/fix_type check → physical baseline alignment → physical R/P/Y alignment → repeat evidence → final sync check/resync → confirm YOLO/measurement settings → measure → save → review.
 
 ## 19. Failure-Oriented Example
 

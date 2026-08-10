@@ -17,18 +17,20 @@ from .standalone_backend import create_standalone_backend
 from .command_registry import CommandRegistry, CommandSpec
 from .components import StatusIndicator
 from .inspector import InspectorWidget
-from .navigation import NavigationTree
+from .navigation import NavigationTree, canonical_context_id
 from .settings_workspace import SettingsWorkspace
 from .status_model import BackendStatusAdapter, RuntimeStatus
 from .workspaces import (
     AlignmentWorkspace,
     AdvancedWorkspace,
+    BaseGnssWorkspace,
     CameraWorkspace,
     CalibrationWorkspace,
     DiagnosticsContent,
-    LegacyHandoffWorkspace,
+    ExperimentWorkspace,
     MeasurementWorkspace,
     OverviewWorkspace,
+    PixhawkWorkspace,
     RecordingWorkspace,
     TimeWorkspace,
 )
@@ -70,6 +72,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self._ui_settings = QtCore.QSettings("SASL", "StereoWIRIS Workstation")
         self._restore_ui_state()
         self.status_adapter.model.changed.connect(self._refresh_from_status)
+        self.status_adapter.polled.connect(self._refresh_evidence_from_poll)
         self.commands.accepted.connect(self._show_command_accepted)
         self.commands.failed.connect(self._show_command_error)
         self.status_adapter.start()
@@ -118,126 +121,126 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         for command_id, text, tooltip, category, handler in (
             (
                 "camera.discover_host_ip",
-                "Discover Camera Network",
+                "Find camera network",
                 "Discover the camera-network host/interface through the existing owner.",
                 "camera",
                 self._camera_discover_host_ip,
             ),
             (
                 "camera.auto_connect",
-                "Auto-Connect Cameras",
+                "Connect cameras",
                 "Discover WIRIS control candidates, verify HIWS, enable RTSP, and apply the verified camera pair.",
                 "camera",
                 self._camera_auto_connect,
             ),
             (
                 "camera.check_rtsp",
-                "Verify Video Stream",
+                "Check video",
                 "Check RTSP ports and frame reception through the existing camera worker path.",
                 "camera",
                 self._camera_check_rtsp,
             ),
             (
                 "camera.check_control",
-                "Verify Camera Control",
+                "Check control",
                 "Check WIRIS control ports through the existing network path.",
                 "camera",
                 self._camera_check_control,
             ),
             (
                 "camera.enable_rtsp",
-                "Enable Video Stream",
+                "Enable stream",
                 "Enable WIRIS RTSP using the existing control and camera owner.",
                 "camera",
                 self._camera_enable_rtsp,
             ),
             (
                 "camera.swap",
-                "Swap Camera Sides",
+                "Swap L/R",
                 "Swap the existing Left/Right camera mapping without changing coordinate contracts.",
                 "camera",
                 self._camera_swap,
             ),
             (
                 "camera.save_settings",
-                "Save Camera Settings",
+                "Save camera",
                 "Save the current camera settings through the existing settings owner.",
                 "camera",
                 self._camera_save_settings,
             ),
             (
                 "pixhawk.toggle_mavlink",
-                "Connect Pixhawk MAVLink",
+                "Connect Pixhawk",
                 "Connect/disconnect the existing MAVLink Pixhawk path.",
                 "device",
                 self._pixhawk_toggle_mavlink,
             ),
             (
                 "pixhawk.discover_usb",
-                "Scan USB Pixhawks",
+                "Find USB Pixhawks",
                 "List USB serial candidates and MAVLink heartbeat evidence without auto-assigning P1/P2.",
                 "device",
                 self._pixhawk_discover_usb,
             ),
             (
                 "pixhawk.discover_mavlink_candidates",
-                "Generate MAVLink Candidates",
+                "Find network links",
                 "Generate Ethernet MAVLink URL candidates without changing the selected P1/P2 endpoints.",
                 "device",
                 self._pixhawk_discover_mavlink_candidates,
             ),
             (
                 "pixhawk.discover_host_ip",
-                "Discover Pixhawk Host IP",
+                "Find Pixhawk host IP",
                 "List local IPv4 interfaces that can be used for Pixhawk Ethernet candidates.",
                 "device",
                 self._pixhawk_discover_host_ip,
             ),
             (
                 "gnss.base_discover",
-                "Scan Base GNSS Ports",
+                "Find base GNSS",
                 "Discover GNSS Base serial candidates through the existing owner.",
                 "gnss",
                 self._gnss_base_discover,
             ),
             (
                 "gnss.base_connect",
-                "Connect Base GNSS",
+                "Connect base",
                 "Connect the configured GNSS Base serial through the existing worker owner.",
                 "gnss",
                 self._gnss_base_connect,
             ),
             (
                 "gnss.base_disconnect",
-                "Disconnect Base GNSS",
+                "Disconnect base",
                 "Stop the configured GNSS Base serial worker.",
                 "gnss",
                 self._gnss_base_disconnect,
             ),
             (
                 "gnss.survey_start",
-                "Start Survey-in",
+                "Start survey",
                 "Start local GNSS Base Survey-in through the existing UBX command path.",
                 "gnss",
                 self._gnss_survey_start,
             ),
             (
                 "gnss.survey_stop",
-                "Stop Survey-in",
+                "Stop survey",
                 "Stop local GNSS Base Survey-in through the existing UBX command path.",
                 "gnss",
                 self._gnss_survey_stop,
             ),
             (
                 "gnss.ntrip_start",
-                "Start NTRIP Corrections",
+                "Start NTRIP",
                 "Start the configured NTRIP operation through the existing GNSS owner.",
                 "gnss",
                 self._gnss_ntrip_start,
             ),
             (
                 "gnss.ntrip_stop",
-                "Stop NTRIP Corrections",
+                "Stop NTRIP",
                 "Stop the existing NTRIP operation and its correction path.",
                 "gnss",
                 self._gnss_ntrip_stop,
@@ -247,28 +250,40 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         for command_id, text, tooltip, handler in (
             (
                 "time.set_pc",
-                "Set WIRIS time from PC",
+                "Set camera clock",
                 "Set the selected WIRIS camera clock through the existing owner.",
                 self._time_set_pc,
             ),
             (
                 "time.check_sync",
-                "Check RTCP/NTP sync",
+                "Check sync",
                 "Refresh RTCP/NTP stream timing evidence through the existing owner.",
                 self._time_check_sync,
+            ),
+            (
+                "time.apply_settings",
+                "Apply sync limits",
+                "Apply Workstation camera synchronization limits through the existing owner.",
+                self._time_apply_settings,
+            ),
+            (
+                "time.save_settings",
+                "Save sync limits",
+                "Persist Workstation camera synchronization limits for the next run.",
+                self._time_save_settings,
             ),
         ):
             self.commands.register(CommandSpec(command_id, text, tooltip, "time", handler))
         for command_id, text, tooltip, handler in (
             (
                 "calibration.capture_images",
-                "Capture images",
+                "Capture",
                 "Capture calibration images through the existing checkerboard owner.",
                 self._calibration_capture_images,
             ),
             (
                 "calibration.run_intrinsic",
-                "Run intrinsic calibration",
+                "Run calibration",
                 "Run the existing intrinsic calibration pipeline without duplicating camera math.",
                 self._calibration_run_intrinsic,
             ),
@@ -281,8 +296,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "calibration.load_intrinsics",
                 "Load intrinsics",
-                "Load and apply the selected intrinsic profile through the existing owner.",
+                "Choose an intrinsic JSON file, validate it, and apply it.",
                 self._calibration_load_intrinsics,
+            ),
+            (
+                "calibration.load_current_zoom_intrinsics",
+                "Load current zoom",
+                "Load and apply the saved intrinsic profile matching the current WIRIS zoom.",
+                self._calibration_load_current_zoom_intrinsics,
             ),
             (
                 "calibration.apply_intrinsics",
@@ -292,7 +313,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "calibration.load_validation",
-                "Load validation JSON",
+                "Load validation",
                 "Load checkerboard validation evidence through the existing owner.",
                 self._calibration_load_validation,
             ),
@@ -319,67 +340,67 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         for command_id, text, tooltip, handler in (
             (
                 "measurement.apply_settings",
-                "Apply measurement settings",
-                "Apply Workstation measurement and synchronization fields through the existing owner.",
+                "Apply",
+                "Apply Workstation measurement fields through the existing owner.",
                 self._measurement_apply_settings,
             ),
             (
                 "measurement.save_settings",
-                "Save measurement settings",
+                "Save",
                 "Persist the current measurement settings without changing measurement schemas or coordinate frames.",
                 self._measurement_save_settings,
             ),
             (
                 "calibration.apply_setup",
-                "Apply calibration setup",
+                "Apply setup",
                 "Apply checkerboard geometry, zoom, path, and validation setup through the existing owner.",
                 self._calibration_apply_setup,
             ),
             (
                 "calibration.scan_validation",
-                "Scan validation files",
+                "Find validation files",
                 "Scan the selected calibration validation root through the existing owner.",
                 self._calibration_scan_validation,
             ),
             (
                 "calibration.save_setup",
-                "Save calibration setup",
+                "Save setup",
                 "Persist the selected calibration/intrinsics path through the existing settings owner.",
                 self._calibration_save_setup,
             ),
             (
                 "alignment.scan_sources",
-                "Scan alignment sources",
+                "Find sources",
                 "Refresh MAVLink alignment source evidence through the existing owner.",
                 self._alignment_scan_sources,
             ),
             (
                 "alignment.start_sampling",
-                "Start baseline sampling",
+                "Start sampling",
                 "Start the existing GNSS baseline quality sampling workflow.",
                 self._alignment_start_sampling,
             ),
             (
                 "alignment.stop_sampling",
-                "Stop baseline sampling",
+                "Stop sampling",
                 "Stop the existing GNSS baseline quality sampling workflow.",
                 self._alignment_stop_sampling,
             ),
             (
                 "alignment.save_profile",
-                "Save alignment profile",
+                "Save profile",
                 "Save the existing alignment profile without changing NED or camera-frame contracts.",
                 self._alignment_save_profile,
             ),
             (
                 "alignment.load_profile",
-                "Load alignment profile",
+                "Load profile",
                 "Load the existing alignment profile through the owner.",
                 self._alignment_load_profile,
             ),
             (
                 "alignment.swap_pixhawks",
-                "Swap P1 / P2 Roles",
+                "Swap P1/P2",
                 "Swap P1/P2 mapping through the existing owner; coordinate labels remain explicit.",
                 self._alignment_swap_pixhawks,
             ),
@@ -395,13 +416,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         for command_id, text, tooltip, handler in (
             (
                 "settings.apply",
-                "Apply all settings",
+                "Apply settings",
                 "Apply the complete Workstation settings payload through the existing panel owner.",
                 self._settings_apply,
             ),
             (
                 "settings.save",
-                "Save all settings",
+                "Save settings",
                 "Persist the complete Workstation settings payload without changing data or coordinate schemas.",
                 self._settings_save,
             ),
@@ -538,11 +559,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.commands.register(CommandSpec(command_id, text, tooltip, "advanced", handler))
         self.commands.register(
             CommandSpec(
-                "legacy.open",
-                "Open owner tools / candidates",
-                "Open the copied owner workflow for device candidate tables and remaining low-level tools.",
+                "advanced.open",
+                "Advanced",
+                "Open Workstation advanced diagnostics and tools.",
                 "view",
-                self._open_legacy,
+                lambda: self._select_context("tasks.advanced"),
             )
         )
         for command_id in (
@@ -570,6 +591,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "calibration.capture_images",
             "calibration.run_intrinsic",
             "calibration.load_intrinsics",
+            "calibration.load_current_zoom_intrinsics",
             "calibration.run_validation",
             "calibration.load_validation",
             "advanced.wiris.send",
@@ -605,7 +627,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.inspector_dock.setObjectName("inspectorDock")
         self.inspector_dock.setMinimumWidth(240)
         self.inspector_dock.setMaximumWidth(360)
-        self.inspector = InspectorWidget(self.backend, self._open_legacy)
+        self.inspector = InspectorWidget(
+            self.backend,
+            lambda: self._select_context("tasks.advanced"),
+        )
         self.inspector_scroll = self._scroll_container(self.inspector, "inspectorScroll", self.inspector_dock)
         self.inspector_dock.setWidget(self.inspector_scroll)
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.inspector_dock)
@@ -660,7 +685,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("File")
         file_menu.addAction(self.commands.action("session.save"))
-        file_menu.addAction(self.commands.action("legacy.open"))
         file_menu.addSeparator()
         file_menu.addAction("Quit", self.close, "Ctrl+Q")
         view_menu = self.menuBar().addMenu("View")
@@ -673,9 +697,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         device_menu.addAction(self.commands.action("pixhawk.toggle_mavlink"))
         device_menu.addAction(self.commands.action("pixhawk.discover_usb"))
         device_menu.addAction(self.commands.action("pixhawk.discover_mavlink_candidates"))
-        measurement_menu = self.menuBar().addMenu("Measurement")
+        measurement_menu = self.menuBar().addMenu("Run")
         measurement_menu.addAction(self.commands.action("detection.toggle"))
         measurement_menu.addAction(self.commands.action("recording.toggle"))
+        tools_menu = self.menuBar().addMenu("Tools")
+        tools_menu.addAction(self.commands.action("advanced.open"))
+        tools_menu.addAction(self.commands.action("settings.apply"))
+        tools_menu.addAction(self.commands.action("settings.save"))
         diagnostics_menu = self.menuBar().addMenu("Diagnostics")
         diagnostics_menu.addAction(self.diagnostics_dock.toggleViewAction())
 
@@ -688,11 +716,36 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.status_adapter.model,
             self.commands.invoke,
         )
+        self.experiment = ExperimentWorkspace(self.backend)
+        self.pixhawk = PixhawkWorkspace(
+            self.backend,
+            self.status_adapter.model,
+            self.commands.invoke,
+        )
+        self.base_gnss = BaseGnssWorkspace(
+            self.backend,
+            self.commands.invoke,
+        )
         self.alignment = AlignmentWorkspace(
             self.backend,
             self.status_adapter.model,
             lambda: self._select_context("tasks.advanced"),
             self.commands.invoke,
+        )
+        self.pixhawk.inspection_requested.connect(
+            lambda selection: self._inspect_selection("devices.pixhawk", selection)
+        )
+        self.camera.inspection_requested.connect(
+            lambda selection: self._inspect_selection("devices.cameras", selection)
+        )
+        self.base_gnss.inspection_requested.connect(
+            lambda selection: self._inspect_selection("devices.gnss", selection)
+        )
+        self.alignment.inspection_requested.connect(
+            lambda selection: self._inspect_selection("processing.alignment", selection)
+        )
+        self.measurement.inspection_requested.connect(
+            lambda selection: self._inspect_selection("processing.measurement", selection)
         )
         self.calibration = CalibrationWorkspace(
             self.backend,
@@ -714,26 +767,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.backend,
             self.commands.invoke,
         )
-        self.legacy_page = QtWidgets.QWidget()
-        legacy_layout = QtWidgets.QVBoxLayout(self.legacy_page)
-        legacy_layout.setContentsMargins(0, 0, 0, 0)
+        self._owner_host = QtWidgets.QWidget(self)
+        self._owner_host.hide()
         owner_widget = getattr(self.backend, "owner_widget", None)
         if isinstance(owner_widget, QtWidgets.QWidget):
-            legacy_scroll = QtWidgets.QScrollArea(self.legacy_page)
-            legacy_scroll.setObjectName("legacyWorkflowScroll")
-            legacy_scroll.setWidgetResizable(False)
-            legacy_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
-            legacy_scroll.setWidget(owner_widget)
-            legacy_scroll.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
-            legacy_layout.addWidget(legacy_scroll)
-        else:
-            legacy_layout.addWidget(
-                LegacyHandoffWorkspace(
-                    "Advanced owner workflow",
-                    "No standalone owner widget was supplied by the backend.",
-                    lambda: None,
-                )
-            )
+            owner_widget.setParent(self._owner_host)
+            owner_widget.hide()
         self._workspace_indexes: dict[str, int] = {}
         self.workspace_scrolls: dict[str, QtWidgets.QScrollArea] = {}
         for context_id, widget in (
@@ -741,17 +780,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ("camera", self.camera),
             ("time", self.time_workspace),
             ("measurement", self.measurement),
+            ("experiment", self.experiment),
+            ("pixhawk", self.pixhawk),
+            ("base_gnss", self.base_gnss),
             ("alignment", self.alignment),
             ("calibration", self.calibration),
             ("recording", self.recording),
             ("advanced", self.advanced),
             ("settings", self.settings_workspace),
-            ("legacy", self.legacy_page),
         ):
             scroll = self._scroll_container(widget, f"{context_id.replace('.', '_')}WorkspaceScroll", self.workspace_host)
             self.workspace_scrolls[context_id] = scroll
             self._workspace_indexes[context_id] = self.workspace_host.addWidget(scroll)
         self.overview.open_context.connect(self._select_context)
+        self.experiment.open_context.connect(self._select_context)
         self._select_context("overview")
 
     @staticmethod
@@ -796,7 +838,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             QTreeView {{ background: #ffffff; border: 1px solid {PANEL_BORDER}; }}
             QGroupBox {{ border: 1px solid {PANEL_BORDER}; margin-top: 7px; padding-top: 5px; }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 7px; padding: 0 3px; color: {TEXT_MUTED}; }}
+            QFrame#workstationHeader {{ border-bottom: 1px solid {PANEL_BORDER}; }}
             QLabel#workspaceTitle {{ font-size: 16px; font-weight: 600; }}
+            QLabel#inspectorContext {{ font-size: 14px; font-weight: 600; }}
+            QLabel#engineeringLabel {{ color: {TEXT_MUTED}; font-size: 10px; }}
             QLabel#workspaceSubtitle,
             QLabel#engineeringMeta,
             QLabel#cameraPreviewMeta,
@@ -815,6 +860,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         )
 
     def _select_context(self, context_id: str) -> None:
+        context_id = canonical_context_id(context_id)
         self._current_context = context_id
         if context_id == "overview":
             page = "overview"
@@ -822,9 +868,17 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             page = "camera"
         elif context_id == "devices.time":
             page = "time"
-        elif context_id in {"processing.measurement", "processing.synchronization", "tasks.recording"}:
-            page = "measurement" if context_id != "tasks.recording" else "recording"
-        elif context_id in {"devices.pixhawk", "devices.pixhawk.p1", "devices.pixhawk.p2", "devices.gnss", "processing.alignment"}:
+        elif context_id == "processing.experiment":
+            page = "experiment"
+        elif context_id in {"processing.measurement"}:
+            page = "measurement"
+        elif context_id in {"tasks.recording"}:
+            page = "recording"
+        elif context_id in {"devices.pixhawk", "devices.pixhawk.p1", "devices.pixhawk.p2"}:
+            page = "pixhawk"
+        elif context_id == "devices.gnss":
+            page = "base_gnss"
+        elif context_id == "processing.alignment":
             page = "alignment"
         elif context_id in {"tasks.calibration"}:
             page = "calibration"
@@ -843,23 +897,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.workspace_host.setCurrentIndex(self._workspace_indexes[page])
         if page == "alignment":
             self.alignment.select_tab_for_context(context_id)
+        self._refresh_visible_surfaces(self.status_adapter.model.snapshot())
         self.inspector.refresh(context_id, self.status_adapter.model)
         if context_id.startswith("diagnostics"):
             self.diagnostics.select_tab_for_context(context_id)
         if context_id not in {"overview"} and self.navigation.currentIndex().data(QtCore.Qt.UserRole) != context_id:
             self.navigation.select_context(context_id)
 
-    def _open_legacy_context(self, context_id: str = "") -> None:
-        if context_id:
-            selector = getattr(self.backend, "select_owner_context", None)
-            if not callable(selector):
-                selector = getattr(self.backend, "select_legacy_context", None)
-            if callable(selector):
-                selector(context_id)
-        self.workspace_host.setCurrentIndex(self._workspace_indexes["legacy"])
-
-    def _open_legacy(self) -> None:
-        self._open_legacy_context(self._current_context)
+    def _inspect_selection(self, context_id: str, selection: object) -> None:
+        if not isinstance(selection, dict):
+            return
+        context_id = canonical_context_id(context_id)
+        if context_id != self._current_context:
+            return
+        self.inspector.inspect_selection(context_id, selection, self.status_adapter.model)
 
     def _toggle_camera(self) -> object:
         return self.backend.toggle_camera()
@@ -899,6 +950,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _time_check_sync(self) -> object:
         return self.backend.time_check_sync()
+
+    def _time_apply_settings(self) -> object:
+        return self.backend.apply_measurement_settings(self.time_workspace.settings_payload())
+
+    def _time_save_settings(self) -> object:
+        return self.backend.save_measurement_settings()
 
     def _pixhawk_toggle_mavlink(self) -> object:
         return self.backend.pixhawk_toggle_mavlink()
@@ -944,6 +1001,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _calibration_load_intrinsics(self) -> object:
         return self.backend.calibration_load_intrinsics()
+
+    def _calibration_load_current_zoom_intrinsics(self) -> object:
+        return self.backend.calibration_load_current_zoom_intrinsics()
 
     def _calibration_apply_intrinsics(self) -> object:
         return self.backend.calibration_apply_intrinsics()
@@ -1085,27 +1145,49 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _refresh_from_status(self, snapshot: object) -> None:
         if not isinstance(snapshot, dict):
             snapshot = self.status_adapter.model.snapshot()
-        self.overview.refresh(snapshot)
-        self.camera.refresh(snapshot)
-        self.time_workspace.refresh(snapshot)
-        self.measurement.refresh(snapshot)
-        self.alignment.refresh(snapshot)
-        self.calibration.refresh(snapshot)
-        self.recording.refresh(snapshot)
-        self.advanced.refresh(snapshot)
-        self.diagnostics.refresh(snapshot)
-        self.inspector.refresh(self._current_context, self.status_adapter.model)
         for key, indicator in self.status_widgets.items():
             indicator.set_status(snapshot.get(key))
         recording = snapshot.get("recording")
         recording_state = recording.state if recording else "IDLE"
         recording_locked = recording_state in {"ACTIVE", "FINALIZING"}
+        panel = getattr(self.backend, "panel", self.backend)
+        camera_running = bool(getattr(panel, "camera_connected", False)) or any(
+            status is not None and status.state in {"LIVE", "STARTING"}
+            for status in (snapshot.get("camera.left"), snapshot.get("camera.right"))
+        )
+        clock_change_active = any(
+            getattr(panel, name, None) is not None
+            for name in ("wiris_time_sync_thread", "wiris_gdti_thread")
+        )
+        # These controls are safety gates shared by several hidden pages, so
+        # keep their enabled state current without rebuilding those pages.
+        self.measurement.refresh_run_controls(snapshot, panel)
+        for command_id in ("camera.swap", "camera.save_settings"):
+            button = self.camera.operation_buttons.get(command_id)
+            if button is not None:
+                button.setEnabled(not recording_locked)
+        time_set_button = self.time_workspace.operation_buttons.get("time.set_pc")
+        if time_set_button is not None:
+            time_set_button.setEnabled(not recording_locked)
+        swap_button = self.alignment.operation_buttons.get("alignment.swap_pixhawks")
+        if swap_button is not None:
+            swap_button.setEnabled(not recording_locked)
         self.commands.set_enabled("camera.toggle", not recording_locked)
-        # The legacy workflow intentionally permits starting a session before
-        # cameras are live; it then records when streams become available.
-        self.commands.set_enabled("detection.toggle", True)
-        self.commands.set_enabled("recording.toggle", recording_state not in {"FINALIZING", "RECOVERABLE"})
-        panel = getattr(self.backend, "panel", None)
+        self.commands.set_enabled("camera.auto_connect", not recording_locked)
+        self.commands.set_enabled("camera.swap", not recording_locked)
+        self.commands.set_enabled("camera.save_settings", not recording_locked)
+        self.commands.set_enabled("alignment.swap_pixhawks", not recording_locked)
+        self.commands.set_enabled("pixhawk.toggle_mavlink", not recording_locked)
+        self.commands.set_enabled("time.set_pc", not recording_locked)
+        # Recording may be armed before cameras are live; samples begin when
+        # the source streams become available. Once a stream is running, a
+        # mode switch would reopen the active session's video paths.
+        self.commands.set_enabled("detection.toggle", not (recording_locked and camera_running))
+        self.commands.set_enabled(
+            "recording.toggle",
+            recording_state not in {"FINALIZING", "RECOVERABLE"}
+            and (recording_locked or not clock_change_active),
+        )
         has_session_data = bool(getattr(panel, "recording_session_id", "")) or bool(getattr(panel, "distance_history", []))
         self.commands.set_enabled(
             "session.save",
@@ -1132,11 +1214,35 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Disconnect Pixhawk MAVLink" if pixhawk_connected else "Connect Pixhawk MAVLink"
             )
 
+    def _refresh_evidence_from_poll(self, snapshot: object) -> None:
+        if not isinstance(snapshot, dict):
+            snapshot = self.status_adapter.model.snapshot()
+        self._refresh_visible_surfaces(snapshot)
+        self.inspector.refresh(self._current_context, self.status_adapter.model)
+
+    def _refresh_visible_surfaces(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        """Refresh only UI surfaces that can currently be observed.
+
+        Camera frames have their own signals, while status evidence arrives at
+        4 Hz.  Rebuilding every hidden table on every status tick caused
+        avoidable UI-thread work and repeated file scans during long runs.
+        """
+
+        container = self.workspace_host.currentWidget()
+        current = container.widget() if isinstance(container, QtWidgets.QScrollArea) else container
+        refresh = getattr(current, "refresh", None)
+        if callable(refresh):
+            refresh(snapshot)
+        if self.diagnostics_dock.isVisible():
+            self.diagnostics.refresh(snapshot)
+
     def _show_command_error(self, command_id: str, message: str) -> None:
-        self.statusBar().showMessage(f"{command_id}: {message}", 5000)
+        label = self.commands.action(command_id).text() if command_id in self.commands._actions else command_id
+        self.statusBar().showMessage(f"{label}: {message}", 5000)
 
     def _show_command_accepted(self, command_id: str, _result: object) -> None:
-        self.statusBar().showMessage(f"{command_id}: accepted; waiting for runtime evidence", 3000)
+        label = self.commands.action(command_id).text() if command_id in self.commands._actions else command_id
+        self.statusBar().showMessage(f"{label}: started", 3000)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
         if self._closing:
