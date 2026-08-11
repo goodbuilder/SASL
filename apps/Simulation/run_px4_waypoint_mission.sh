@@ -83,7 +83,7 @@ Options:
   --setpoint-hz N        PX4 offboard setpoint rate.
   --land-after           Land after the final waypoint. Default from config.
   --no-land              Do not land after the final waypoint.
-  --record-dir DIR       Save lite CSV telemetry to DIR. Default: bags/waypoint_TIMESTAMP_lite.
+  --record-dir DIR       Save lite CSV telemetry to DIR. Default: Recordings/waypoint_TIMESTAMP_lite.
   --no-record            Disable automatic lite CSV recording.
   --connect STRING       pymavlink connection string.
   --check-connection     Check PX4 connection without moving.
@@ -205,7 +205,7 @@ case "$record_lite" in
   true|TRUE|1|yes|YES)
     if [[ "$check_connection" == false ]]; then
       if [[ -z "$record_dir" ]]; then
-        record_dir="$ROOT_DIR/bags/waypoint_$(date +%Y%m%d_%H%M%S)_lite"
+        record_dir="$ROOT_DIR/Recordings/waypoint_$(date +%Y%m%d_%H%M%S)_lite"
       fi
       mkdir -p "$record_dir"
       setsid "$OPERATOR_RECORDER_PYTHON" -m stereo_ground_sim.operator_recorder \

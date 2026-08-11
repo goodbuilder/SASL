@@ -210,7 +210,7 @@ class RecordingControls(QWidget):
         self._lock_widgets = tuple(lock_widgets)
         self._mission_processes = {}
 
-        default_dir = Path(os.environ.get("OPERATOR_BAG_DIR", Path.cwd() / "bags"))
+        default_dir = Path(os.environ.get("OPERATOR_BAG_DIR", Path.cwd() / "Recordings"))
         self._dir_edit = QLineEdit(str(default_dir))
         self._dir_edit.setMinimumWidth(320)
         self._browse_button = QPushButton("Browse…")
@@ -252,15 +252,15 @@ class RecordingControls(QWidget):
         layout.addWidget(
             QLabel(
                 "Save CSV records telemetry and detections. Save MP4 adds left/right "
-                "overlay videos. Save Debug also adds a rosbag. These buttons can be "
-                "pressed while Auto is running; recording starts at the button click. "
+                "overlay videos. Save Debug also adds a rosbag. Auto already creates "
+                "its own Full CSV/MP4 session; these buttons create a separate session. "
                 "Each detection stores left/right bbox x1,y1,x2,y2 plus derived centers; "
                 "vectors use FRD metres."
             )
         )
         self.setToolTip(
             "CSV: telemetry. MP4: CSV plus overlay video. Debug: MP4 plus rosbag. "
-            "Auto does not record until one of these buttons is pressed. Stop first "
+            "Auto records Full automatically; Save buttons create a separate session. Stop first "
             "to change the output directory."
         )
 
@@ -285,7 +285,7 @@ class RecordingControls(QWidget):
         directory = QFileDialog.getExistingDirectory(
             self,
             "Select recording save root",
-            self._dir_edit.text().strip() or str(Path.cwd() / "bags"),
+            self._dir_edit.text().strip() or str(Path.cwd() / "Recordings"),
         )
         if directory:
             self._dir_edit.setText(directory)
@@ -293,7 +293,7 @@ class RecordingControls(QWidget):
     def _start_recording(self, mode):
         if self._process is not None:
             return
-        save_root = Path(self._dir_edit.text().strip() or Path.cwd() / "bags").expanduser()
+        save_root = Path(self._dir_edit.text().strip() or Path.cwd() / "Recordings").expanduser()
         try:
             save_root.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -357,6 +357,7 @@ class RecordingControls(QWidget):
             for kind, process in self._mission_processes.items()
             if process.poll() is None
         ]
+        auto_full_recording = any(kind == "auto_fov" for kind, _process in mission_processes)
         recorder_process = self._process
         if not mission_processes and recorder_process is None:
             return
@@ -390,8 +391,10 @@ class RecordingControls(QWidget):
         self._reset_controls()
         if mission_processes and stopped_path is not None:
             self._set_status(f"Auto stopped; saved: {stopped_path.name}")
+        elif auto_full_recording:
+            self._set_status("Auto stopped; automatic Full recording finalized")
         elif mission_processes:
-            self._set_status("Auto stopped; no recording was started")
+            self._set_status("Mission stopped; no operator recording was started")
         else:
             self._set_status(f"Saved: {path.name}" if path else "Stopped")
 
@@ -552,7 +555,7 @@ class RecorderPanel(Plugin):
             label.setMinimumWidth(180)
             label.setStyleSheet("font-family: monospace;")
 
-        default_dir = Path(os.environ.get("OPERATOR_BAG_DIR", Path.cwd() / "bags"))
+        default_dir = Path(os.environ.get("OPERATOR_BAG_DIR", Path.cwd() / "Recordings"))
         self._dir_edit = QLineEdit(str(default_dir))
         self._dir_edit.setMinimumWidth(260)
 
@@ -761,7 +764,7 @@ class RecorderPanel(Plugin):
         directory = QFileDialog.getExistingDirectory(
             self._widget,
             "Select recording save root",
-            self._dir_edit.text().strip() or str(Path.cwd() / "bags"),
+            self._dir_edit.text().strip() or str(Path.cwd() / "Recordings"),
         )
         if directory:
             self._dir_edit.setText(directory)
@@ -771,7 +774,7 @@ class RecorderPanel(Plugin):
             self._set_status(f"Recording {self._record_mode}", error=True)
             return
 
-        save_root = Path(self._dir_edit.text().strip() or Path.cwd() / "bags").expanduser()
+        save_root = Path(self._dir_edit.text().strip() or Path.cwd() / "Recordings").expanduser()
         save_root.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
         output_path = save_root / f"operator_{timestamp}_{mode}"

@@ -30,8 +30,9 @@ def test_auto_attitude_sweep_preserves_interactive_auto_recording_contract():
     assert 'research_effective_config_sha256:=$effective_config_sha256' in source
     assert 'research_session_id:=$session_id' in source
     assert 'research_attempt_id:=$case_id' in source
-    assert "Save CSV" in auto_source
-    assert "Save MP4" in auto_source
+    assert "stereo_ground_sim.operator_recorder" in auto_source
+    assert "--mode full" in auto_source
+    assert 'auto_$(date +%Y%m%d_%H%M%S)_Full' in auto_source
     assert "run_auto_attitude_sweep.sh" in auto_source
     assert "SWEEP_RANDOMIZE" in source
     assert "baseline-before" in source

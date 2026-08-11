@@ -225,6 +225,7 @@ class RvizVisualizationPublisher:
         global_baseline=None,
         attitude=None,
         operational=None,
+        attitude_true_north=None,
         gt_source=None,
         gt_fallback_used=None,
     ):
@@ -242,6 +243,7 @@ class RvizVisualizationPublisher:
             global_baseline=global_baseline,
             attitude=attitude,
             operational=operational,
+            attitude_true_north=attitude_true_north,
         )
         if payload:
             publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
@@ -281,7 +283,7 @@ class RvizVisualizationPublisher:
     def _publish_ray_markers(
         self, nominal_pose=None, optical_pose=None, ideal=None,
         gps_baseline=None, global_baseline=None, attitude=None,
-        operational=None, uam_gps_ray=None,
+        operational=None, attitude_true_north=None, uam_gps_ray=None,
     ):
         """Publish stereo rays in World ENU, including the UAM GPS ray.
 
@@ -385,6 +387,20 @@ class RvizVisualizationPublisher:
                 right_color=(0.95, 0.95, 0.95),
                 gap_color=(0.7, 0.7, 0.7),
                 midpoint_color=(0.95, 0.95, 0.95),
+            )
+        )
+        markers.extend(
+            marker_group(
+                attitude_true_north,
+                label="attitude_true_north",
+                marker_id=90,
+                # Green-cyan denotes PX4 attitude with a live GPS-baseline
+                # declination correction applied (see gps_baseline.py
+                # declination_from_gps_baseline_rad).
+                left_color=(0.0, 0.85, 0.4),
+                right_color=(0.0, 0.85, 0.4),
+                gap_color=(0.45, 0.95, 0.7),
+                midpoint_color=(0.0, 0.85, 0.4),
             )
         )
         markers.extend(

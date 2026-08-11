@@ -102,7 +102,6 @@ def test_px4_attitude_names_are_independent_and_error_names_are_removed() -> Non
 def test_every_runner_uses_the_unified_config() -> None:
     for name in (
         "run_operator_view.sh",
-        "run_attitude_error_experiment.sh",
         "run_mission.sh",
         "run_px4_waypoint_mission.sh",
     ):
@@ -165,6 +164,95 @@ def test_camera_px4_sensors_include_nonzero_noise_for_px4_freshness() -> None:
             "./sensor[@name='imu_sensor']/imu/linear_acceleration/z/noise/stddev",
         )
         assert all(float(base.findtext(path)) > 0.0 for path in noise_paths)
+
+
+def test_generated_world_uses_independent_body_frd_mag_and_gyro_noise_bias(tmp_path: Path, monkeypatch) -> None:
+    module = _launch_module()
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+    generated = module._generate_world(
+        _context(
+            module,
+            cam_l_mag_noise_x_gauss=0.001,
+            cam_l_mag_noise_y_gauss=0.002,
+            cam_l_mag_noise_z_gauss=0.003,
+            cam_r_mag_noise_x_gauss=0.004,
+            cam_r_mag_noise_y_gauss=0.005,
+            cam_r_mag_noise_z_gauss=0.006,
+            cam_l_mag_bias_mean_x_gauss=-0.011,
+            cam_l_mag_bias_stddev_y_gauss=0.012,
+            cam_r_mag_bias_mean_z_gauss=0.013,
+            cam_r_mag_bias_stddev_x_gauss=0.014,
+            cam_l_gyro_noise_z_rad_s=0.021,
+            cam_l_gyro_bias_mean_y_rad_s=-0.022,
+            cam_l_gyro_bias_stddev_x_rad_s=0.023,
+            cam_r_gyro_noise_x_rad_s=0.024,
+            cam_r_gyro_bias_mean_z_rad_s=0.025,
+            cam_r_gyro_bias_stddev_y_rad_s=0.026,
+        )
+    )
+    root = ET.parse(generated).getroot()
+    for model_name, expected in (
+        ("left_stereo_camera", (0.001, 0.002, 0.003)),
+        ("right_stereo_camera", (0.004, 0.005, 0.006)),
+    ):
+        model = _camera_model(root, model_name)
+        actual = tuple(
+            float(model.findtext(
+                f"./link[@name='base_link']/sensor[@name='magnetometer_sensor']/magnetometer/{axis}/noise/stddev"
+            ))
+            for axis in ("x", "y", "z")
+        )
+        assert actual == pytest.approx(expected)
+    expected_fields = {
+        "left_stereo_camera": {
+            ("magnetometer_sensor", "magnetometer", "x", "bias_mean"): -0.011,
+            ("magnetometer_sensor", "magnetometer", "y", "bias_stddev"): 0.012,
+            ("imu_sensor", "imu/angular_velocity", "z", "stddev"): 0.021,
+            ("imu_sensor", "imu/angular_velocity", "y", "bias_mean"): -0.022,
+            ("imu_sensor", "imu/angular_velocity", "x", "bias_stddev"): 0.023,
+        },
+        "right_stereo_camera": {
+            ("magnetometer_sensor", "magnetometer", "z", "bias_mean"): 0.013,
+            ("magnetometer_sensor", "magnetometer", "x", "bias_stddev"): 0.014,
+            ("imu_sensor", "imu/angular_velocity", "x", "stddev"): 0.024,
+            ("imu_sensor", "imu/angular_velocity", "z", "bias_mean"): 0.025,
+            ("imu_sensor", "imu/angular_velocity", "y", "bias_stddev"): 0.026,
+        },
+    }
+    for model_name, fields in expected_fields.items():
+        model = _camera_model(root, model_name)
+        for (sensor_name, group, axis, field), expected in fields.items():
+            path = (
+                f"./link[@name='base_link']/sensor[@name='{sensor_name}']/"
+                f"{group}/{axis}/noise/{field}"
+            )
+            assert float(model.findtext(path)) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"cam_l_mag_noise_y_gauss": -0.001},
+        {"cam_r_mag_bias_stddev_z_gauss": -0.001},
+        {"cam_l_gyro_noise_x_rad_s": -0.001},
+        {"cam_r_gyro_bias_stddev_y_rad_s": -0.001},
+    ),
+)
+def test_generated_world_rejects_negative_sensor_stddev(tmp_path: Path, monkeypatch, override) -> None:
+    module = _launch_module()
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+    with pytest.raises(ValueError, match="standard deviations"):
+        module._generate_world(_context(module, **override))
+
+
+def test_generated_world_rejects_non_finite_sensor_value(tmp_path: Path, monkeypatch) -> None:
+    module = _launch_module()
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _: str(PACKAGE_ROOT))
+    monkeypatch.setattr(module.tempfile, "gettempdir", lambda: str(tmp_path))
+    with pytest.raises(ValueError, match="must be finite"):
+        module._generate_world(_context(module, cam_l_mag_bias_mean_x_gauss="nan"))
 
 
 def test_camera_px4_sensors_use_sdf_defined_elements_only() -> None:

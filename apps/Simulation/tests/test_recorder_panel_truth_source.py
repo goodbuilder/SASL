@@ -168,15 +168,16 @@ class RecorderPanelTruthSourceTests(unittest.TestCase):
         )
         self.assertIn('self._stop_button.clicked.connect(self._stop_all)', source)
         self.assertIn('"Stopping Auto and finalizing recording…"', source)
+        self.assertIn('"Auto stopped; automatic Full recording finalized"', source)
         self.assertIn("os.killpg(process.pid, signal.SIGINT)", source)
 
-    def test_auto_does_not_create_a_mission_recorder_and_save_buttons_remain_independent(self) -> None:
+    def test_auto_full_recorder_is_owned_by_runner_and_save_buttons_remain_independent(self) -> None:
         source = (ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "recorder_panel.py").read_text(
             encoding="utf-8"
         )
         self.assertNotIn('cmd.extend(["--record-dir", str(mission_record_path)])', source)
         self.assertNotIn("Stop the active recorder before starting Auto", source)
-        self.assertIn("recording starts at the button click", source)
+        self.assertIn("Auto already creates", source)
 
     def test_csv_tail_preview_keeps_header_and_latest_persisted_rows(self) -> None:
         module = load_panel_module()

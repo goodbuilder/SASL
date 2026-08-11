@@ -120,8 +120,6 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert 'QPushButton("Open XLSX")' in source
     assert 'QPushButton("Export analysis CSV")' in source
     assert "read_recent_csv_rows(csv_path, data_row_count=CSV_PREVIEW_TABLE_ROWS)" in source
-    assert '("gps_baseline_range_m", "GPS Baseline range (m)")' in source
-    assert '("gps_baseline_forward_m", "GPS Baseline F (m)")' in source
     assert '("nominal_pose_ray_midpoint_forward_m", "F Nominal Pose")' in source
     assert '("optical_pose_ray_midpoint_right_m", "Rt Optical Pose")' in source
     assert '("ideal_ray_range_m", "Rg Ideal")' in source
@@ -147,8 +145,10 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert 'VehicleAttitude,' in source
     assert 'PX4_ATTITUDE_TOPICS.items()' in source
     assert '("midpoint_frd_m", "midpoint")' in source
-    for record_view in ("Summary", "GPS", "BBox", "Ray summary", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
+    for record_view in ("Ray summary", "BBox", "Left PX4", "Right PX4", "UAM PX4", "Raw CSV"):
         assert f'"{record_view}"' in source
+    # "Ray summary" must be the first Record CSV-preview tab.
+    assert source.index('"Ray summary"') < source.index('"BBox"')
 
 
 def test_respawn_service_contract_is_declared_by_distance_node() -> None:

@@ -18,6 +18,7 @@ from stereo_ground_sim.coordinate_frames import (
 from stereo_ground_sim.ground_truth_provider import GroundTruthProvider
 from stereo_ground_sim.pair_work_scheduler import PairWorkScheduler
 from stereo_ground_sim.pose_source_provider import PoseSourceProvider
+from stereo_ground_sim.rviz_geometry import reference_ray_world_enu_from_point
 from stereo_ground_sim.time_alignment import PendingGroundTruthRecord
 
 PAIR_GROUND_TRUTH_ROUTING_METHODS = [
@@ -94,6 +95,9 @@ class PairGroundTruthCoordinator:
         dropped += len(self.node.gt_alignment_ready_queue)
         self.node.measurement_pair_queue.clear()
         self.node.gt_alignment_ready_queue.clear()
+        self.node.rviz_live_latest_pair = None
+        self.node.rviz_live_latest_result = None
+        self.node.rviz_live_latest_processed_pair_id = 0
         self.node.gt_position_buffer.reset_for_epoch(epoch)
         if reset_stamp_ns is None:
             reset_stamp_ns = self.node.simulation_epoch.last_clock_stamp_ns
@@ -315,6 +319,11 @@ class PairGroundTruthCoordinator:
         # Keeping it out of the ray stream prevents the initial marker from
         # lingering when image-pair or inference work is unavailable.
         try:
+            # The Ideal RViz ray is a display-only World-ENU reference and
+            # does not require detector pixels.  Publish it directly from GT
+            # so a missing/disabled YOLO model cannot suppress every ray at
+            # startup.  Measurement and CSV outputs remain pair-driven.
+            self._publish_ground_truth_reference_ray(point_world)
             position = ground_truth_world_to_baseline(point_world, self.node.baseline_center_frd)
             if hasattr(self.node, "gt_position_buffer"):
                 with self.node.yolo_condition:
@@ -331,6 +340,45 @@ class PairGroundTruthCoordinator:
             self.node.inconsistent_clock_count += 1
             self.node.get_logger().warning(f"Ground Truth ignored: {exc}")
             return
+
+    def _publish_ground_truth_reference_ray(self, point_world_enu_m):
+        """Publish one display-only Ideal ray without waiting for an image pair.
+
+        Input target and camera origins are Gazebo World ENU metres. Camera
+        orientations retain the configured optical RDF contract; the helper
+        returns Marker geometry in World ENU.
+        """
+
+        if not getattr(self.node, "enable_rviz_rays", False):
+            return False
+        if getattr(self.node, "ray_marker_pub", None) is None:
+            return False
+        now = time.monotonic()
+        publish_hz = max(
+            0.1, float(getattr(self.node, "rviz_live_ray_hz", 15.0))
+        )
+        last_publish = float(
+            getattr(self.node, "last_ideal_ray_marker_publish_monotonic", 0.0)
+        )
+        if now - last_publish < 1.0 / publish_hz:
+            return False
+        self.node._ensure_camera_frames()
+        frame = getattr(self.node, "baseline_center_frd", None)
+        left = getattr(self.node, "nominal_left_camera", None)
+        right = getattr(self.node, "nominal_right_camera", None)
+        if frame is None or left is None or right is None:
+            return False
+        ideal = reference_ray_world_enu_from_point(
+            frame,
+            left,
+            right,
+            point_world_enu_m,
+        )
+        if ideal is None:
+            return False
+        self.node._publish_ray_markers(ideal=ideal)
+        self.node.last_ideal_ray_marker_publish_monotonic = now
+        return True
 
     def _reject_ground_truth_record_locked(self, *, quarantine=False):
         provider = self.node._ensure_ground_truth_provider_locked()

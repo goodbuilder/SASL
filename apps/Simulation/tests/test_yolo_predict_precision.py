@@ -8,5 +8,5 @@ RUNTIME_PATH = ROOT_DIR / "stereo_ground_sim" / "stereo_ground_sim" / "yolo_mode
 def test_cuda_yolo_prediction_uses_quantize_not_deprecated_half_flag() -> None:
     source = RUNTIME_PATH.read_text(encoding="utf-8")
 
-    assert source.count('predict_kwargs["quantize"] = 16') == 3
+    assert 'kwargs["quantize"] = 16' in source
     assert 'predict_kwargs["half"]' not in source

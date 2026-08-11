@@ -17,6 +17,7 @@ from stereo_ground_sim.coordinate_frames import (
     relative_rotation_angle_deg,
 )
 from stereo_ground_sim.gps_baseline import (
+    declination_from_gps_baseline_rad,
     gps_relative_enu_m,
     norm_m,
 )
@@ -69,6 +70,7 @@ class PoseConversionAdapter:
         include_provenance=False,
         operational_snapshot=None,
         observation_timestamp_ns=None,
+        declination_correction_rad=0.0,
     ):
         def finish(poses, status, provenance):
             return (
@@ -192,10 +194,12 @@ class PoseConversionAdapter:
                 camera_optical_pose_from_px4_attitude_wxyz(
                     left_pose.center_world_enu_m,
                     left_sample.quaternion_wxyz,
+                    declination_correction_rad=declination_correction_rad,
                 ),
                 camera_optical_pose_from_px4_attitude_wxyz(
                     right_pose.center_world_enu_m,
                     right_sample.quaternion_wxyz,
+                    declination_correction_rad=declination_correction_rad,
                 ),
             )
         except ValueError:
@@ -212,6 +216,114 @@ class PoseConversionAdapter:
             provenance["right_attitude_truth_residual_deg"] = None
         return finish(poses, "available", provenance)
 
+    def _px4_attitude_true_north_camera_poses(
+        self,
+        camera_sources,
+        *,
+        include_provenance=False,
+        operational_snapshot=None,
+        observation_timestamp_ns=None,
+    ):
+        """Attitude-ray poses with a live GPS-baseline declination correction.
+
+        Estimates local magnetic declination in-situ from the existing
+        left/right camera GPS baseline (see ``declination_from_gps_baseline_rad``)
+        and applies it to the same PX4 VehicleAttitude pipeline used by the
+        plain Attitude ray, so this Ray reflects a true-north-referenced
+        heading instead of the magnetometer's uncorrected one. Fails closed
+        (returns ``None`` poses) if GPS is unavailable/stale or the
+        declination estimate is degenerate -- it never silently falls back
+        to an uncorrected pose.
+        """
+
+        def finish(poses, status, provenance):
+            return (
+                (poses, status, provenance)
+                if include_provenance
+                else (poses, status)
+            )
+
+        uncorrected_poses, attitude_status, attitude_provenance = self._px4_attitude_camera_poses(
+            camera_sources,
+            include_provenance=True,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+        )
+        provenance = dict(attitude_provenance)
+        provenance["camera_orientation_source"] = "px4_vehicle_attitude_declination_corrected"
+        if uncorrected_poses is None:
+            return finish(None, attitude_status, provenance)
+
+        current_epoch = getattr(getattr(self.node, "simulation_epoch", None), "epoch", 0)
+        snapshot_fixes = (
+            operational_snapshot.get("gps_baseline_fixes")
+            if isinstance(operational_snapshot, dict)
+            else None
+        )
+        if isinstance(snapshot_fixes, dict):
+            left_entry = snapshot_fixes.get("left")
+            right_entry = snapshot_fixes.get("right")
+        else:
+            with self.node.lock:
+                left_entry = self.node.gps_baseline_fixes.get("left")
+                right_entry = self.node.gps_baseline_fixes.get("right")
+        if left_entry is None:
+            return finish(None, "missing_left_gps_fix", provenance)
+        if right_entry is None:
+            return finish(None, "missing_right_gps_fix", provenance)
+        left_fix, left_received_ns, left_epoch, _left_ts_ns = self.node._gps_fix_entry(
+            left_entry, current_epoch
+        )
+        right_fix, right_received_ns, right_epoch, _right_ts_ns = self.node._gps_fix_entry(
+            right_entry, current_epoch
+        )
+        if left_epoch != current_epoch or right_epoch != current_epoch:
+            return finish(None, "gps_epoch_mismatch", provenance)
+        now_ns = (
+            int(operational_snapshot.get("captured_monotonic_ns"))
+            if isinstance(operational_snapshot, dict)
+            and operational_snapshot.get("captured_monotonic_ns") is not None
+            else time.monotonic_ns()
+        )
+        left_age_ms = (now_ns - left_received_ns) / 1_000_000.0
+        right_age_ms = (now_ns - right_received_ns) / 1_000_000.0
+        provenance.update(
+            {"gps_left_age_ms": left_age_ms, "gps_right_age_ms": right_age_ms}
+        )
+        if left_age_ms > self.node.gps_baseline_max_age_s * 1_000.0:
+            return finish(None, "stale_left_gps_fix", provenance)
+        if right_age_ms > self.node.gps_baseline_max_age_s * 1_000.0:
+            return finish(None, "stale_right_gps_fix", provenance)
+
+        nominal_baseline = tuple(
+            self.node.nominal_right_camera.center_world_enu_m[index]
+            - self.node.nominal_left_camera.center_world_enu_m[index]
+            for index in range(3)
+        )
+        declination_rad = declination_from_gps_baseline_rad(
+            left_fix,
+            right_fix,
+            nominal_baseline,
+            self.node.nominal_left_camera,
+            uncorrected_poses[0],
+        )
+        if declination_rad is None:
+            return finish(None, "declination_estimate_unavailable", provenance)
+        provenance["declination_correction_deg"] = math.degrees(declination_rad)
+
+        corrected_poses, corrected_status, corrected_provenance = self._px4_attitude_camera_poses(
+            camera_sources,
+            include_provenance=True,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+            declination_correction_rad=declination_rad,
+        )
+        if corrected_poses is None:
+            return finish(None, corrected_status, provenance)
+        provenance.update(corrected_provenance)
+        provenance["camera_orientation_source"] = "px4_vehicle_attitude_declination_corrected"
+        provenance["declination_correction_deg"] = math.degrees(declination_rad)
+        return finish(corrected_poses, "available", provenance)
 
     @staticmethod
     def _gps_fix_entry(entry, current_epoch):

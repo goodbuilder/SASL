@@ -6,6 +6,11 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1] / "stereo_ground_sim"
 sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.visualization_payloads import plot_payloads
+from stereo_ground_sim import runtime_control_coordinator
+
+
+def test_runtime_control_coordinator_imports_plot_payload_builder():
+    assert runtime_control_coordinator.plot_payloads is plot_payloads
 
 
 def test_plot_payload_preserves_public_frd_axis_order():

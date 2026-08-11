@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +14,8 @@ if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from stereo_ground_sim.coordinate_frames import build_baseline_center_frd, nominal_camera_poses
+from stereo_ground_sim.pair_ground_truth_coordinator import PairGroundTruthCoordinator
+from stereo_ground_sim.runtime_worker_loops import RuntimeWorkerLoops
 from sasl_common.stereo_geometry import PinholeIntrinsics
 from stereo_ground_sim.stereo_distance_node import (
     RAY_DISPLAY_NAMES,
@@ -110,6 +114,39 @@ def test_rviz_reference_ray_can_display_points_outside_dkl_pixel_bounds() -> Non
     )
 
 
+def test_ground_truth_publishes_ideal_ray_without_yolo_or_image_pair() -> None:
+    left, right = nominal_camera_poses(25.0, 5.0)
+    frame = build_baseline_center_frd(
+        left.center_world_enu_m,
+        right.center_world_enu_m,
+        left.forward_world_enu,
+        right.forward_world_enu,
+    )
+    published = []
+    node = SimpleNamespace(
+        enable_rviz_rays=True,
+        ray_marker_pub=object(),
+        baseline_center_frd=frame,
+        nominal_left_camera=left,
+        nominal_right_camera=right,
+        _ensure_camera_frames=lambda: None,
+        _publish_ray_markers=lambda **kwargs: published.append(kwargs),
+    )
+    target_world_enu_m = frame.point_to_world((1000.0, 0.0, 0.0))
+
+    assert PairGroundTruthCoordinator(node)._publish_ground_truth_reference_ray(
+        target_world_enu_m
+    )
+    assert len(published) == 1
+    ideal = published[0]["ideal"]
+    assert ideal["ray_visualization_world_enu"]["left_target_world_enu_m"] == pytest.approx(
+        target_world_enu_m
+    )
+    assert ideal["ray_visualization_world_enu"]["right_target_world_enu_m"] == pytest.approx(
+        target_world_enu_m
+    )
+
+
 def test_uam_gps_ray_uses_baseline_center_origin_and_world_enu_target() -> None:
     left, right = nominal_camera_poses(25.0, 5.0)
     frame = build_baseline_center_frd(
@@ -193,11 +230,14 @@ def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -
     assert "_latest_rviz_ideal_ray" in source
     assert "uam_gps_ray_visualization_world_enu_from_point" in source
     assert '"/stereo/live_detections"' in source
-    assert "self.node.live_detections_pub.publish(self.node._detections_to_msg(left, right))" in source
+    assert "self.node.rviz_live_latest_result = (pair, computed)" in source
+    assert worker_source.count("self.node._compute_pair_measurement(pair, phase)") == 1
+    assert "live_detections_pub.publish" not in worker_source
+    assert "_publish_ray_metrics(" not in worker_source
     assert "rviz_live_latest_only" in source
     assert "rviz_live_ray_hz" in source
     assert 'diagnostic_rays = computed.get("diagnostic_rays", {})' in source
-    assert "self.node._publish_ray_metrics(\n                        pair_id=pair.pair_id,\n                        nominal_pose=raw," in source
+    assert "self.node._publish_ray_metrics(" in coordinator_source
     assert "if not self.node._rviz_latest_only_markers_enabled()" in source
     assert 'worker = getattr(self, "rviz_live_thread", None)' in source
     assert "and worker is not None" in source
@@ -254,11 +294,59 @@ def test_marker_source_contains_nominal_optical_ideal_gps_and_uam_ray_groups() -
     assert 'left_target, right_target, 1.5)' in source
 
 
+def test_latest_only_rviz_reuses_completed_measurement_without_second_compute() -> None:
+    pair = SimpleNamespace(pair_id=7)
+    raw = {"computation_status": "computed", "frame_id": "gazebo_world_enu"}
+    corrected = {"computation_status": "computed", "frame_id": "gazebo_world_enu"}
+    computed = {
+        "raw": raw,
+        "corrected": corrected,
+        "left": None,
+        "right": None,
+        "gps_baselines": {},
+        "diagnostic_rays": {},
+    }
+    shutdown_event = threading.Event()
+    published_markers = []
+
+    def fail_if_recomputed(*_args, **_kwargs):
+        raise AssertionError("RViz worker must not decode or run YOLO again")
+
+    def publish_markers(**kwargs):
+        published_markers.append(kwargs)
+        shutdown_event.set()
+
+    node = SimpleNamespace(
+        observation_mode="bbox_yolo",
+        shutdown_event=shutdown_event,
+        yolo_condition=threading.Condition(threading.RLock()),
+        rviz_live_latest_result=(pair, computed),
+        rviz_live_latest_processed_pair_id=0,
+        rviz_live_ray_hz=20.0,
+        rviz_live_publish_count=0,
+        rviz_live_error_count=0,
+        last_ideal_ray_marker_publish_monotonic=0.0,
+        _warm_yolo_model=lambda: None,
+        _compute_pair_measurement=fail_if_recomputed,
+        _latest_rviz_ideal_ray=lambda _pair: None,
+        _uam_raw_gps_reference=lambda: {"computation_status": "unavailable"},
+        _publish_ray_markers=publish_markers,
+        get_logger=lambda: SimpleNamespace(warning=lambda _message: None),
+    )
+
+    RuntimeWorkerLoops(node)._rviz_live_worker_loop()
+
+    assert node.rviz_live_latest_processed_pair_id == 7
+    assert node.rviz_live_publish_count == 1
+    assert published_markers[0]["nominal_pose"] is raw
+    assert published_markers[0]["optical_pose"] is corrected
+
+
 def test_launch_exposes_latest_only_rviz_ray_controls() -> None:
     launch = (ROOT_DIR / "stereo_ground_sim" / "launch" / "stereo_ground_sim.launch.py").read_text(encoding="utf-8")
 
     assert 'DeclareLaunchArgument("rviz_live_latest_only", default_value="true")' in launch
-    assert 'DeclareLaunchArgument("rviz_live_ray_hz", default_value="20.0")' in launch
+    assert 'DeclareLaunchArgument("rviz_live_ray_hz", default_value="15.0")' in launch
     assert '"rviz_live_latest_only"' in launch
     assert '"rviz_live_ray_hz"' in launch
 

@@ -11,6 +11,7 @@ from sasl_common.stereo_geometry import BASELINE_CENTER_FRD_FRAME
 from stereo_ground_sim.coordinate_frames import (
     ground_truth_world_to_baseline,
 )
+from stereo_ground_sim.diagnostic_ray_pipeline import ray_gt_error
 from stereo_ground_sim.evaluation_pipeline import evaluation_metadata, vector_error
 from stereo_ground_sim.observation_contract import (
     observation_metadata,
@@ -418,6 +419,16 @@ class PairResultCoordinator:
         finished = computed.get("finished", time.monotonic())
         elapsed_ms = (finished - computed.get("started", finished)) * 1000.0
         self.node.yolo_inference_ms_pub.publish(self.float32_type(data=float(elapsed_ms)))
+        stage_timings_ms = computed.get("stage_timings_ms", {})
+        for publisher, key in (
+            (getattr(self.node, "image_decode_ms_pub", None), "image_decode_ms"),
+            (getattr(self.node, "yolo_predict_ms_pub", None), "yolo_predict_ms"),
+            (getattr(self.node, "ray_geometry_ms_pub", None), "ray_geometry_ms"),
+        ):
+            if publisher is not None:
+                publisher.publish(
+                    self.float32_type(data=float(stage_timings_ms.get(key, 0.0)))
+                )
         if self.node.last_yolo_completion is not None:
             period_s = finished - self.node.last_yolo_completion
             if period_s > 0.0:
@@ -701,6 +712,20 @@ class PairResultCoordinator:
                         ),
                     }
                 )
+        # attitude/operational reuse the evaluation_metadata()-computed gt_*
+        # fields above (also relied on by CSV/XLSX recording); the remaining
+        # Rays have no such flat-prefix precedent, so compute their
+        # Ground-Truth error directly from each ray's own FRD vector.
+        for name, ray in (
+            ("nominal_pose", metrics.get("_raw_ray")),
+            ("optical_pose", metrics.get("_truth_ray")),
+            ("ideal", ideal),
+            ("gps_baseline", metrics.get("_gps_baselines", {}).get("gps_baseline")),
+            ("global_baseline", metrics.get("_gps_baselines", {}).get("global_baseline")),
+            ("attitude_true_north", diagnostic_rays.get("attitude_true_north")),
+        ):
+            if isinstance(ray, dict):
+                ray.update(ray_gt_error(ray, gt_baseline))
         self.node._publish_ray_metrics(
             pair_id=pair_id,
             nominal_pose=metrics.get("_raw_ray"),

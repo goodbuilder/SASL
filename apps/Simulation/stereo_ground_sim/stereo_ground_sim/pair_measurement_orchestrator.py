@@ -18,9 +18,16 @@ class PairMeasurementOrchestrator:
     def compute(self, pair, phase, device=None):
         d = self.dependencies
         started = self.monotonic()
+        stage_started = started
         camera_snapshot = d["camera_snapshot"]()
         operational_snapshot = d["operational_snapshot"](pair.pair_id)
         mode = d["observation_mode"]()
+        stage_timings_ms = {
+            "snapshot_ms": (self.monotonic() - stage_started) * 1000.0,
+            "image_decode_ms": 0.0,
+            "yolo_predict_ms": 0.0,
+            "ray_geometry_ms": 0.0,
+        }
         if mode == "ideal_reference_point":
             width = int(getattr(pair.left_message, "width", 0))
             height = int(getattr(pair.left_message, "height", 0))
@@ -28,6 +35,7 @@ class PairMeasurementOrchestrator:
             if width <= 0 or height <= 0:
                 return self._result(
                     started, phase, camera_snapshot,
+                    stage_timings_ms=stage_timings_ms,
                     ideal_error="invalid_image_dimensions",
                 )
             point = None if alignment is None else alignment.position_world_enu_m
@@ -40,37 +48,57 @@ class PairMeasurementOrchestrator:
             if left is None or right is None:
                 return self._result(
                     started, phase, camera_snapshot,
+                    stage_timings_ms=stage_timings_ms,
                     left_image=blank, right_image=blank,
                     ideal_error="projection_invalid_or_out_of_fov",
                 )
+            stage_started = self.monotonic()
             rays = self._rays(
                 pair, left, right, width, height, camera_snapshot,
                 operational_snapshot,
             )
+            stage_timings_ms["ray_geometry_ms"] = (
+                self.monotonic() - stage_started
+            ) * 1000.0
             return self._result(
                 started, phase, camera_snapshot,
+                stage_timings_ms=stage_timings_ms,
                 left_image=blank, right_image=blank, left=left, right=right,
                 ideal_error=None, **rays,
             )
 
+        stage_started = self.monotonic()
         left_image = d["decode"](pair.left_message)
         right_image = d["decode"](pair.right_message)
+        stage_timings_ms["image_decode_ms"] = (
+            self.monotonic() - stage_started
+        ) * 1000.0
         if left_image is None or right_image is None:
             return self._result(
                 started, phase, camera_snapshot,
+                stage_timings_ms=stage_timings_ms,
                 left_image=left_image, right_image=right_image,
             )
         if device is None:
             device = d["device"]()
+        stage_started = self.monotonic()
         left, right = d["detect"](left_image, right_image, device)
+        stage_timings_ms["yolo_predict_ms"] = (
+            self.monotonic() - stage_started
+        ) * 1000.0
         rays = {}
         if left is not None and right is not None:
+            stage_started = self.monotonic()
             rays = self._rays(
                 pair, left, right, left_image.shape[1], left_image.shape[0],
                 camera_snapshot, operational_snapshot,
             )
+            stage_timings_ms["ray_geometry_ms"] = (
+                self.monotonic() - stage_started
+            ) * 1000.0
         return self._result(
             started, phase, camera_snapshot,
+            stage_timings_ms=stage_timings_ms,
             left_image=left_image, right_image=right_image,
             left=left, right=right, **rays,
         )
@@ -99,6 +127,7 @@ class PairMeasurementOrchestrator:
             "left": None, "right": None, "raw": None, "corrected": None,
             "gps_baselines": {}, "diagnostic_rays": {},
             "camera_oracle_snapshot": camera_snapshot,
+            "stage_timings_ms": {},
         }
         result.update(values)
         return result

@@ -94,12 +94,15 @@ def _cell(table, row, column):
     return "" if item is None else item.text()
 
 
-def test_panel_renders_all_seven_ray_rows_with_correct_labels_and_order(qt_app):
+def test_panel_renders_all_eight_ray_rows_with_correct_labels_and_order(qt_app):
     panel = operator_panel.RayDiagnosticsPanel()
 
     labels = [_cell(panel._geometry_table, row, 0) for row in range(panel._geometry_table.rowCount())]
 
-    assert labels == ["Nominal Pose", "Optical Pose", "Ideal", "GPS Baseline", "Global Baseline", "Attitude", "Operational"]
+    assert labels == [
+        "Nominal Pose", "Optical Pose", "Ideal", "GPS Baseline", "Global Baseline",
+        "Attitude", "Operational", "Attitude (True North)",
+    ]
 
 
 def test_panel_shows_valid_ray_numbers_and_not_available_for_invalid_ray(qt_app):
@@ -169,20 +172,21 @@ def test_panel_clears_stale_numbers_when_next_pair_is_invalid(qt_app):
     assert _cell(panel._geometry_table, full_row, 1) == "INVALID_QUATERNION"
 
 
-def test_panel_separates_truth_delta_gt_error_and_interaction(qt_app):
+def test_panel_has_no_optical_pose_delta_table(qt_app):
+    # The "Optical Pose Δ" tab (Truth-ray-relative delta) has been removed;
+    # only Geometry, GT Error, and Sensors remain.
+    panel = operator_panel.RayDiagnosticsPanel()
+
+    assert not hasattr(panel, "_delta_table")
+
+
+def test_panel_gt_error_covers_all_seven_rays(qt_app):
     panel = operator_panel.RayDiagnosticsPanel()
     payload = {
         "pair_id": 9,
         "attitude": {
             "valid": True,
             "computation_status": "computed",
-            "delta_valid": True,
-            "delta_forward_m": 0.25,
-            "delta_right_m": 0.0,
-            "delta_down_m": 0.0,
-            "delta_range_m": 0.25,
-            "position_difference_m": 0.25,
-            "delta_failure_reason": "",
             "gt_valid": True,
             "gt_forward_error_m": 0.05,
             "gt_right_error_m": 0.0,
@@ -191,13 +195,15 @@ def test_panel_separates_truth_delta_gt_error_and_interaction(qt_app):
             "gt_position_error_m": 0.05,
             "gt_failure_reason": "",
         },
-        "interaction": {
-            "valid": True,
-            "forward_m": 0.01,
-            "right_m": 0.0,
-            "down_m": 0.0,
-            "position_m": 0.01,
-            "failure_reason": "",
+        "gps_baseline": {
+            "computation_status": "computed",
+            "gt_valid": True,
+            "gt_forward_error_m": 0.12,
+            "gt_right_error_m": 0.0,
+            "gt_down_error_m": 0.0,
+            "gt_range_error_m": 0.12,
+            "gt_position_error_m": 0.12,
+            "gt_failure_reason": "",
         },
         "gt_source": "gazebo_vehicle_reference_link_world_pose",
         "gt_fallback_used": False,
@@ -205,10 +211,12 @@ def test_panel_separates_truth_delta_gt_error_and_interaction(qt_app):
 
     panel.update_ray_metrics(json.dumps(payload))
 
-    assert _cell(panel._delta_table, 0, 0) == "Attitude"
-    assert _cell(panel._delta_table, 0, 2) == "0.250"
-    assert _cell(panel._gt_table, 0, 2) == "0.050"
-    assert not hasattr(panel, "_interaction_labels")
+    gps_baseline_row = 3
+    attitude_row = 5
+    assert _cell(panel._gt_table, gps_baseline_row, 0) == "GPS Baseline"
+    assert _cell(panel._gt_table, gps_baseline_row, 2) == "0.120"
+    assert _cell(panel._gt_table, attitude_row, 0) == "Attitude"
+    assert _cell(panel._gt_table, attitude_row, 2) == "0.050"
     assert panel._gt_source_label.text().startswith("GT source: gazebo_vehicle_reference_link_world_pose")
 
 
@@ -415,7 +423,7 @@ def test_analysis_graph_legend_does_not_collide_gt_with_the_truth_ray():
     assert operator_panel.SERIES_LABELS["truth"] != operator_panel.SERIES_LABELS["optical_pose"]
 
 
-def test_analysis_tab_series_covers_all_seven_recorded_rays():
+def test_analysis_tab_series_covers_all_eight_recorded_rays():
     # RAY_DIAGNOSTICS_ROWS is the canonical list of the eight recorded Rays.
     # The Analysis tab's SERIES must plot every one of them, under the same
     # display name it uses elsewhere (the Ray Diagnostics panel, CSV/XLSX).
@@ -428,6 +436,7 @@ def test_analysis_tab_series_covers_all_seven_recorded_rays():
         "global_baseline": "global_baseline",
         "attitude": "attitude",
         "operational": "operational",
+        "attitude_true_north": "attitude_true_north",
     }
     series_names = {name for name, _topic, _color in operator_panel.SERIES}
     assert set(series_key_by_ray_key.values()) <= series_names

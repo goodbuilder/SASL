@@ -111,6 +111,24 @@ def _det(matrix: Matrix3) -> float:
     )
 
 
+def _ned_yaw_correction_rotation(yaw_rad: float) -> Matrix3:
+    """Rotation about NED Z (world vertical) that rotates North toward East.
+
+    Used to correct a magnetometer-referenced attitude to a true-north
+    reference: pre-multiplying ``rotation_ned_from_body`` by this matrix adds
+    ``yaw_rad`` of heading in the world/Earth frame, unlike the optical-RDF
+    RPY helpers below which compose in the camera's own (possibly tilted)
+    local frame.
+    """
+
+    cos_yaw, sin_yaw = math.cos(yaw_rad), math.sin(yaw_rad)
+    return (
+        (cos_yaw, -sin_yaw, 0.0),
+        (sin_yaw, cos_yaw, 0.0),
+        (0.0, 0.0, 1.0),
+    )
+
+
 def validate_rotation_matrix(
     matrix: Sequence[Sequence[float]], *, tolerance: float = 1.0e-12
 ) -> dict[str, float]:
@@ -570,11 +588,18 @@ def camera_optical_pose_from_px4_attitude_wxyz(
     quaternion_wxyz: Sequence[float],
     *,
     rotation_body_from_optical: Sequence[Sequence[float]] = PX4_BODY_FRD_FROM_OPTICAL_RDF,
+    declination_correction_rad: float = 0.0,
 ) -> CameraOpticalPose:
     """Build World-ENU optical RDF pose from PX4 FRD-to-NED attitude.
 
     ``quaternion_wxyz`` is PX4 VehicleAttitude.q, explicitly converted to the
     XYZW convention used by the existing quaternion rotation helper.
+
+    ``declination_correction_rad``, if nonzero, is applied as a world-frame
+    (NED Z) pre-multiply on ``rotation_ned_from_body`` -- i.e. added to the
+    magnetometer-referenced heading -- before the body-to-optical conversion,
+    so the caller can convert a magnetic-referenced attitude to a
+    true-north-referenced one without disturbing roll/pitch.
     """
 
     if len(quaternion_wxyz) != 4:
@@ -585,6 +610,11 @@ def camera_optical_pose_from_px4_attitude_wxyz(
         tuple(float(value) for value in row) for row in rotation_body_from_optical
     )  # type: ignore[assignment]
     rotation_ned_from_body = rotation_world_from_quaternion_xyzw((x, y, z, w))
+    if declination_correction_rad:
+        rotation_ned_from_body = _mat_mul(
+            _ned_yaw_correction_rotation(float(declination_correction_rad)),
+            rotation_ned_from_body,
+        )
     rotation_enu_from_optical = _mat_mul(
         _mat_mul(R_ENU_FROM_NED, rotation_ned_from_body),
         parsed_body_from_optical,

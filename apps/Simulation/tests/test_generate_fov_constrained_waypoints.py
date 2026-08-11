@@ -39,6 +39,9 @@ class GenerateFovConstrainedWaypointTests(unittest.TestCase):
                 "max_range_m": 900.0,
                 "camera_baseline_m": 25.0,
                 "camera_height_m": 0.5,
+                "px4_origin_world_east_m": 12.0,
+                "px4_origin_world_north_m": 2100.0,
+                "px4_origin_world_up_m": 6.0,
                 "horizontal_fov_rad": 0.154997710698,
                 "image_width_px": 1280,
                 "image_height_px": 720,
@@ -63,6 +66,18 @@ class GenerateFovConstrainedWaypointTests(unittest.TestCase):
         for row in calibration + validation:
             self.assertEqual(row["baseline_frame"], module.BASELINE_CENTER_FRD_FRAME)
             self.assertEqual(row["px4_waypoint_frame"], module.PX4_WAYPOINT_FRAME)
+            self.assertAlmostEqual(
+                float(row["north_m"]),
+                float(row["world_y_m"]) - args.px4_origin_world_north_m,
+            )
+            self.assertAlmostEqual(
+                float(row["east_m"]),
+                float(row["world_x_m"]) - args.px4_origin_world_east_m,
+            )
+            self.assertAlmostEqual(
+                float(row["altitude_agl_m"]),
+                float(row["world_z_m"]) - args.px4_origin_world_up_m,
+            )
             self.assertGreaterEqual(float(row["baseline_forward_m"]), args.min_range_m)
             self.assertLessEqual(float(row["baseline_forward_m"]), args.max_range_m)
             self.assertLess(abs(float(row["horizontal_angle_rad"])), usable_h)
@@ -83,6 +98,10 @@ class GenerateFovConstrainedWaypointTests(unittest.TestCase):
                     module.baseline_distance(left, right),
                     args.min_set_separation_m,
                 )
+        self.assertEqual(
+            manifest["px4_origin_world_enu_m"],
+            {"east": 12.0, "north": 2100.0, "up": 6.0},
+        )
 
     def test_main_writes_px4_mission_csvs(self) -> None:
         module = load_waypoint_module()

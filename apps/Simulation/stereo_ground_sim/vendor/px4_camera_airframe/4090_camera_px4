@@ -70,3 +70,18 @@ param set-default NAV_DLL_ACT 2
 # Attitude/Full Ray triangulation. MAG_TYPE=1 (Magnetic heading) fuses only
 # 2D heading and never attempts hard-iron bias learning, avoiding this.
 param set-default EKF2_MAG_TYPE 1
+
+# Operator MAVLink ATTITUDE diagnostics link (see operator_panel.py's
+# MavlinkAttitudeReader/MAVLINK_ATTITUDE_URL/MAVLINK_ATTITUDE_SIDE_BY_SYSID).
+# The rqt panel cross-checks its ROS2 VehicleAttitude reading against a raw
+# MAVLink ATTITUDE sample, but nothing previously pushed one to the panel's
+# listening port -- px4-rc.mavlink's default GCS/offboard/onboard links each
+# bind their own per-instance port and never target udpin:0.0.0.0:14551.
+# This airframe file only runs for the left/right camera instances (target
+# instance 0 stays on 4001), so both instances push here without touching
+# the target's link. A dedicated local port per instance avoids colliding
+# with px4-rc.mavlink's own udp_*_port_local allocations; both instances
+# push to the SAME remote port, and MAV_SYS_ID (rcS sets it to
+# px4_instance+1: left=2, right=3) is what lets the panel tell them apart.
+mavlink start -u $((14650+px4_instance)) -r 4000000 -o 14551
+mavlink stream -r 50 -s ATTITUDE -u $((14650+px4_instance))

@@ -29,6 +29,10 @@ def _float_config(context, name):
     return float(LaunchConfiguration(name).perform(context))
 
 
+def _float_config_default(context, name, default):
+    return float(LaunchConfiguration(name, default=str(default)).perform(context))
+
+
 def _int_config(context, name):
     return int(LaunchConfiguration(name).perform(context))
 
@@ -44,6 +48,49 @@ def _bool_config_default(context, name, default):
         "yes",
         "on",
     )
+
+
+def _camera_axis_values(context, camera, sensor, field, unit, default):
+    return tuple(
+        _float_config_default(
+            context, f"cam_{camera}_{sensor}_{field}_{axis}_{unit}", default
+        )
+        for axis in ("x", "y", "z")
+    )
+
+
+def _set_camera_sensor_noise(world_xml, camera_configs):
+    root = ET.fromstring(world_xml)
+    for model_name, config in camera_configs.items():
+        models = [
+            model
+            for model in root.findall("./world/model")
+            if model.attrib.get("name") == model_name
+        ]
+        if len(models) != 1:
+            raise ValueError(f"expected one camera model named {model_name!r}")
+        base = models[0].find("./link[@name='base_link']")
+        if base is None:
+            raise ValueError(f"camera model {model_name!r} has no base_link")
+        for sensor, axis_path in (
+            ("mag", "./sensor[@name='magnetometer_sensor']/magnetometer"),
+            ("gyro", "./sensor[@name='imu_sensor']/imu/angular_velocity"),
+        ):
+            parent = base.find(axis_path)
+            if parent is None:
+                raise ValueError(f"camera model {model_name!r} has no {sensor} sensor")
+            for index, axis in enumerate(("x", "y", "z")):
+                noise = parent.find(f"{axis}/noise")
+                if noise is None:
+                    raise ValueError(
+                        f"camera model {model_name!r} {sensor} {axis} has no noise element"
+                    )
+                for field in ("stddev", "bias_mean", "bias_stddev"):
+                    element = noise.find(field)
+                    if element is None:
+                        element = ET.SubElement(noise, field)
+                    element.text = f"{config[sensor][field][index]:.12g}"
+    return ET.tostring(root, encoding="unicode")
 
 
 def _set_target_include_static(world_xml, *, target_model_name, static_enabled):
@@ -333,6 +380,41 @@ def _generate_world(context):
     camera_update_rate_hz = _float_config(context, "camera_update_rate_hz")
     camera_clip_near_m = _float_config(context, "camera_clip_near_m")
     camera_clip_far_m = _float_config(context, "camera_clip_far_m")
+    camera_sensor_noise = {}
+    for camera, model_name in (
+        ("l", "left_stereo_camera"),
+        ("r", "right_stereo_camera"),
+    ):
+        camera_sensor_noise[model_name] = {
+            "mag": {
+                "stddev": _camera_axis_values(context, camera, "mag", "noise", "gauss", 0.0),
+                "bias_mean": _camera_axis_values(context, camera, "mag", "bias_mean", "gauss", 0.0),
+                "bias_stddev": _camera_axis_values(context, camera, "mag", "bias_stddev", "gauss", 0.0),
+            },
+            "gyro": {
+                "stddev": _camera_axis_values(context, camera, "gyro", "noise", "rad_s", 0.0008726646),
+                "bias_mean": _camera_axis_values(context, camera, "gyro", "bias_mean", "rad_s", 0.0),
+                "bias_stddev": _camera_axis_values(context, camera, "gyro", "bias_stddev", "rad_s", 0.0),
+            },
+        }
+    all_sensor_values = [
+        value
+        for config in camera_sensor_noise.values()
+        for sensor in config.values()
+        for values in sensor.values()
+        for value in values
+    ]
+    if not all(math.isfinite(value) for value in all_sensor_values):
+        raise ValueError("camera magnetometer and gyroscope noise/bias values must be finite")
+    sensor_stddevs = [
+        value
+        for config in camera_sensor_noise.values()
+        for sensor in config.values()
+        for field in ("stddev", "bias_stddev")
+        for value in sensor[field]
+    ]
+    if any(value < 0.0 for value in sensor_stddevs):
+        raise ValueError("camera magnetometer and gyroscope standard deviations must be non-negative")
     approach_start_distance_m = _float_config(context, "approach_start_distance_m")
     target_spawn_x_m = _float_config(context, "target_spawn_x_m")
     target_spawn_y_m = _float_config(context, "target_spawn_y_m")
@@ -457,6 +539,7 @@ def _generate_world(context):
     world = world.replace("<height>720</height>", f"<height>{camera_image_height_px}</height>")
     world = world.replace("<near>0.1</near>", f"<near>{camera_clip_near_m:.6f}</near>")
     world = world.replace("<far>2500</far>", f"<far>{camera_clip_far_m:.6f}</far>")
+    world = _set_camera_sensor_noise(world, camera_sensor_noise)
     for default_target_pose in (
         "<pose>2000 0 0.75 0 0 3.141592654</pose>",
         "<pose>2000 0 0.25 0 0 3.141592654</pose>",
@@ -845,6 +928,24 @@ def generate_launch_description():
             DeclareLaunchArgument("camera_update_rate_hz", default_value="20.0"),
             DeclareLaunchArgument("camera_clip_near_m", default_value="0.1"),
             DeclareLaunchArgument("camera_clip_far_m", default_value="2500.0"),
+            DeclareLaunchArgument("cam_l_mag_noise_x_gauss", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_mag_noise_y_gauss", default_value="0.0"),
+            DeclareLaunchArgument("cam_l_mag_noise_z_gauss", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_mag_noise_x_gauss", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_mag_noise_y_gauss", default_value="0.0"),
+            DeclareLaunchArgument("cam_r_mag_noise_z_gauss", default_value="0.0"),
+            *(
+                DeclareLaunchArgument(name, default_value=default)
+                for camera in ("l", "r")
+                for axis in ("x", "y", "z")
+                for name, default in (
+                    (f"cam_{camera}_mag_bias_mean_{axis}_gauss", "0.0"),
+                    (f"cam_{camera}_mag_bias_stddev_{axis}_gauss", "0.0"),
+                    (f"cam_{camera}_gyro_noise_{axis}_rad_s", "0.0008726646"),
+                    (f"cam_{camera}_gyro_bias_mean_{axis}_rad_s", "0.0"),
+                    (f"cam_{camera}_gyro_bias_stddev_{axis}_rad_s", "0.0"),
+                )
+            ),
             DeclareLaunchArgument("approach_start_distance_m", default_value="2000.0"),
             DeclareLaunchArgument("target_spawn_x_m", default_value="0.0"),
             DeclareLaunchArgument("target_spawn_y_m", default_value="2000.0"),
@@ -877,7 +978,7 @@ def generate_launch_description():
             # display-only YOLO stream; callers can still disable it for a
             # measurement-only run with ``rviz_live_latest_only:=false``.
             DeclareLaunchArgument("rviz_live_latest_only", default_value="true"),
-            DeclareLaunchArgument("rviz_live_ray_hz", default_value="20.0"),
+            DeclareLaunchArgument("rviz_live_ray_hz", default_value="15.0"),
             DeclareLaunchArgument("enable_synthetic_detections", default_value="false"),
             DeclareLaunchArgument("enable_gps_baseline_triangulation", default_value="false"),
             DeclareLaunchArgument("gps_baseline_source", default_value="gps_baseline"),

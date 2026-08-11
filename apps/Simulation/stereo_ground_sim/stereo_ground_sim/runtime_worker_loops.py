@@ -7,6 +7,8 @@ coordinate conversion remain delegated to their dedicated pipelines.
 
 import time
 
+from std_msgs.msg import Float32
+
 from stereo_ground_sim.rviz_geometry import (
     uam_gps_ray_visualization_world_enu_from_point,
 )
@@ -50,7 +52,17 @@ class RuntimeWorkerLoops:
                 if alignment_work is not None:
                     pair, alignment = alignment_work
                     try:
+                        alignment_started = time.monotonic()
                         self.node._store_gt_alignment_locked(pair, alignment)
+                        publisher = getattr(self.node, "gt_alignment_ms_pub", None)
+                        if publisher is not None:
+                            publisher.publish(
+                                Float32(
+                                    data=float(
+                                        (time.monotonic() - alignment_started) * 1000.0
+                                    )
+                                )
+                            )
                     except Exception as exc:
                         self.node._finalize_gt_evaluation_failure_locked(
                             pair.pair_id,
@@ -70,7 +82,29 @@ class RuntimeWorkerLoops:
             try:
                 computed = self.node._compute_pair_measurement(pair, phase)
                 with self.node.yolo_condition:
-                    self.node._commit_pair_measurement_if_current(pair, computed)
+                    commit_started = time.monotonic()
+                    metrics = self.node._commit_pair_measurement_if_current(pair, computed)
+                    publisher = getattr(self.node, "result_commit_ms_pub", None)
+                    if publisher is not None:
+                        publisher.publish(
+                            Float32(
+                                data=float(
+                                    (time.monotonic() - commit_started) * 1000.0
+                                )
+                            )
+                        )
+                    if (
+                        metrics is not None
+                        and getattr(self.node, "enable_rviz_rays", False)
+                        and getattr(self.node, "rviz_live_latest_only", False)
+                    ):
+                        # A completed pair is the single source for both the
+                        # ordered measurement stream and latest-only RViz.
+                        # Keep only the newest completed result so the display
+                        # worker never performs a second image decode or YOLO
+                        # inference for the same stereo observation.
+                        self.node.rviz_live_latest_result = (pair, computed)
+                        self.node.yolo_condition.notify_all()
             except Exception as exc:
                 failure = exc
                 with self.node.yolo_condition:
@@ -87,7 +121,7 @@ class RuntimeWorkerLoops:
 
 
     def _rviz_live_worker_loop(self):
-        """Publish RViz rays from the newest camera pair, independent of recording FIFO."""
+        """Publish the newest completed measurement in RViz without re-running YOLO."""
 
         if getattr(self.node, "observation_mode", "bbox_yolo") != "bbox_yolo":
             return
@@ -95,13 +129,12 @@ class RuntimeWorkerLoops:
         next_tick = time.monotonic()
         while not self.node.shutdown_event.is_set():
             pair = None
-            phase = None
             with self.node.yolo_condition:
                 while not self.node.shutdown_event.is_set():
-                    latest = getattr(self.node, "rviz_live_latest_pair", None)
+                    latest = getattr(self.node, "rviz_live_latest_result", None)
                     if (
                         latest is not None
-                        and latest.pair_id
+                        and latest[0].pair_id
                         > getattr(self.node, "rviz_live_latest_processed_pair_id", 0)
                     ):
                         break
@@ -112,14 +145,12 @@ class RuntimeWorkerLoops:
                 if wait_s > 0.0:
                     self.node.yolo_condition.wait(timeout=wait_s)
                     continue
-                pair = self.node.rviz_live_latest_pair
-                phase = self.node._recording_mission_phase()
+                pair, computed = self.node.rviz_live_latest_result
                 self.node.rviz_live_latest_processed_pair_id = pair.pair_id
                 next_tick = time.monotonic() + 1.0 / max(
-                    0.1, float(getattr(self.node, "rviz_live_ray_hz", 20.0))
+                    0.1, float(getattr(self.node, "rviz_live_ray_hz", 15.0))
                 )
             try:
-                computed = self.node._compute_pair_measurement(pair, phase)
                 raw = computed.get("raw")
                 # The display-only Ideal Ray is independent of YOLO.  Keep
                 # computing it when the vehicle is outside the image and no
@@ -136,38 +167,7 @@ class RuntimeWorkerLoops:
                     else None
                 )
                 if raw is not None:
-                    left = computed.get("left")
-                    right = computed.get("right")
-                    if left is not None or right is not None:
-                        self.node.live_detections_pub.publish(self.node._detections_to_msg(left, right))
                     diagnostic_rays = computed.get("diagnostic_rays", {})
-                    diagnostic_analysis = self.node._diagnostic_analysis(
-                        computed.get("corrected"), diagnostic_rays
-                    )
-                    for name, comparison in diagnostic_analysis["comparisons"].items():
-                        if isinstance(diagnostic_rays.get(name), dict):
-                            diagnostic_rays[name].update(
-                                {
-                                    "delta_valid": comparison["valid"],
-                                    "delta_failure_reason": comparison[
-                                        "failure_reason"
-                                    ],
-                                    **{
-                                        key: value
-                                        for key, value in comparison.items()
-                                        if key not in ("valid", "failure_reason")
-                                    },
-                                }
-                            )
-                    self.node._publish_ray_metrics(
-                        pair_id=pair.pair_id,
-                        nominal_pose=raw,
-                        optical_pose=computed.get("corrected"),
-                        ideal=ideal,
-                        gps_baseline=computed.get("gps_baselines", {}).get("gps_baseline"),
-                        global_baseline=computed.get("gps_baselines", {}).get("global_baseline"),
-                        **diagnostic_rays,
-                    )
                     self.node._publish_ray_markers(
                         nominal_pose=raw,
                         optical_pose=computed.get("corrected"),
@@ -177,15 +177,17 @@ class RuntimeWorkerLoops:
                         uam_gps_ray=uam_gps_ray,
                         **diagnostic_rays,
                     )
+                    if ideal is not None:
+                        # Share the same throttle timestamp with the direct GT
+                        # publisher so their combined Ideal-marker rate stays
+                        # within rviz_live_ray_hz.
+                        self.node.last_ideal_ray_marker_publish_monotonic = time.monotonic()
                     self.node.rviz_live_publish_count += 1
                 elif ideal is not None:
                     # No detector-derived ray exists outside the FOV, but the
                     # simulation reference ray should remain visible.
-                    self.node._publish_ray_metrics(
-                        pair_id=pair.pair_id,
-                        ideal=ideal,
-                    )
                     self.node._publish_ray_markers(ideal=ideal, uam_gps_ray=uam_gps_ray)
+                    self.node.last_ideal_ray_marker_publish_monotonic = time.monotonic()
                     self.node.rviz_live_publish_count += 1
                 elif uam_gps_ray is not None:
                     self.node._publish_ray_markers(uam_gps_ray=uam_gps_ray)

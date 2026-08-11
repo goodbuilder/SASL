@@ -13,6 +13,7 @@ PX4_MSGS_OVERLAY_MANIFEST="$SASL_ROS_WORKSPACE/install/share/sasl_ros_workspace/
 PX4_MSGS_PACKAGE_SETUP="$SASL_ROS_WORKSPACE/install/px4_msgs/share/px4_msgs/local_setup.bash"
 PX4_MSGS_REF="${PX4_MSGS_REF:-86d8239e962f6939e05c3737784f60c02fa884db}"
 cd "$ROOT_DIR"
+export OPERATOR_BAG_DIR="${OPERATOR_BAG_DIR:-$ROOT_DIR/Recordings}"
 
 for arg in "$@"; do
   if [[ "$arg" == "--no-px4" ]]; then
@@ -46,6 +47,18 @@ SIM_EXPLICIT_NAMES=(
   CAMERA_BASELINE_M CAMERA_HEIGHT_M CAMERA_HORIZONTAL_FOV_RAD
   CAMERA_IMAGE_WIDTH_PX CAMERA_IMAGE_HEIGHT_PX CAMERA_UPDATE_RATE_HZ
   CAMERA_CLIP_NEAR_M CAMERA_CLIP_FAR_M
+  CAM_L_MAG_NOISE_X_GAUSS CAM_L_MAG_NOISE_Y_GAUSS CAM_L_MAG_NOISE_Z_GAUSS
+  CAM_R_MAG_NOISE_X_GAUSS CAM_R_MAG_NOISE_Y_GAUSS CAM_R_MAG_NOISE_Z_GAUSS
+  CAM_L_MAG_BIAS_MEAN_X_GAUSS CAM_L_MAG_BIAS_MEAN_Y_GAUSS CAM_L_MAG_BIAS_MEAN_Z_GAUSS
+  CAM_R_MAG_BIAS_MEAN_X_GAUSS CAM_R_MAG_BIAS_MEAN_Y_GAUSS CAM_R_MAG_BIAS_MEAN_Z_GAUSS
+  CAM_L_MAG_BIAS_STDDEV_X_GAUSS CAM_L_MAG_BIAS_STDDEV_Y_GAUSS CAM_L_MAG_BIAS_STDDEV_Z_GAUSS
+  CAM_R_MAG_BIAS_STDDEV_X_GAUSS CAM_R_MAG_BIAS_STDDEV_Y_GAUSS CAM_R_MAG_BIAS_STDDEV_Z_GAUSS
+  CAM_L_GYRO_NOISE_X_RAD_S CAM_L_GYRO_NOISE_Y_RAD_S CAM_L_GYRO_NOISE_Z_RAD_S
+  CAM_R_GYRO_NOISE_X_RAD_S CAM_R_GYRO_NOISE_Y_RAD_S CAM_R_GYRO_NOISE_Z_RAD_S
+  CAM_L_GYRO_BIAS_MEAN_X_RAD_S CAM_L_GYRO_BIAS_MEAN_Y_RAD_S CAM_L_GYRO_BIAS_MEAN_Z_RAD_S
+  CAM_R_GYRO_BIAS_MEAN_X_RAD_S CAM_R_GYRO_BIAS_MEAN_Y_RAD_S CAM_R_GYRO_BIAS_MEAN_Z_RAD_S
+  CAM_L_GYRO_BIAS_STDDEV_X_RAD_S CAM_L_GYRO_BIAS_STDDEV_Y_RAD_S CAM_L_GYRO_BIAS_STDDEV_Z_RAD_S
+  CAM_R_GYRO_BIAS_STDDEV_X_RAD_S CAM_R_GYRO_BIAS_STDDEV_Y_RAD_S CAM_R_GYRO_BIAS_STDDEV_Z_RAD_S
   CAM_L_OPTICAL_ROLL_DEG CAM_L_OPTICAL_PITCH_DEG CAM_L_OPTICAL_YAW_DEG
   CAM_R_OPTICAL_ROLL_DEG CAM_R_OPTICAL_PITCH_DEG CAM_R_OPTICAL_YAW_DEG
   CAM_L_PX4_ATTITUDE_ROLL_DEG CAM_L_PX4_ATTITUDE_PITCH_DEG CAM_L_PX4_ATTITUDE_YAW_DEG
@@ -105,7 +118,7 @@ resolve_px4_checkout() {
 }
 
 resolve_model_spec() {
-  local candidate local_path
+  local candidate local_path bare_fallback=""
   for candidate in "$@"; do
     [[ -n "$candidate" ]] || continue
     if [[ -f "$candidate" ]]; then
@@ -115,8 +128,9 @@ resolve_model_spec() {
     if [[ "$candidate" != */* ]]; then
       # Keep the checked-out workspace self-contained first, while accepting
       # the standard per-user download folders for machine-local YOLO weights.
-      # A bare model name is still returned as a final fallback so Ultralytics
-      # can resolve its own built-in public weights.
+      # Remember a bare model name only as the final fallback.  Continue
+      # checking later explicit candidates first; otherwise a missing custom
+      # name such as yolov8n_uav.pt masks valid machine-local fallback paths.
       for local_path in \
         "$ROOT_DIR/$candidate" \
         "$ROOT_DIR/../$candidate" \
@@ -127,10 +141,15 @@ resolve_model_spec() {
           return 0
         fi
       done
-      printf '%s\n' "$candidate"
-      return 0
+      if [[ -z "$bare_fallback" ]]; then
+        bare_fallback="$candidate"
+      fi
     fi
   done
+  if [[ -n "$bare_fallback" ]]; then
+    printf '%s\n' "$bare_fallback"
+    return 0
+  fi
   return 1
 }
 
@@ -179,6 +198,7 @@ fi
 DEFAULT_YOLO_MODEL="${DEFAULT_YOLO_MODEL:-${YOLO_MODEL_PATH:-yolov8n_uav.pt}}"
 if ! DEFAULT_YOLO_MODEL="$(resolve_model_spec \
   "$DEFAULT_YOLO_MODEL" \
+  "$INTEGRATION_ROOT/.local/legacy/Simulation/yolov8n_uav.pt" \
   "$INTEGRATION_ROOT/.local/models/yolov8n.pt" \
   yolov8n_uav.pt \
   uav1.pt \
@@ -1093,6 +1113,28 @@ add_default_launch_arg camera_image_height_px "${CAMERA_IMAGE_HEIGHT_PX:-720}" "
 add_default_launch_arg camera_update_rate_hz "${CAMERA_UPDATE_RATE_HZ:-20.0}" "${launch_input[@]}"
 add_default_launch_arg camera_clip_near_m "${CAMERA_CLIP_NEAR_M:-0.1}" "${launch_input[@]}"
 add_default_launch_arg camera_clip_far_m "${CAMERA_CLIP_FAR_M:-2500.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_mag_noise_x_gauss "${CAM_L_MAG_NOISE_X_GAUSS:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_mag_noise_y_gauss "${CAM_L_MAG_NOISE_Y_GAUSS:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_mag_noise_z_gauss "${CAM_L_MAG_NOISE_Z_GAUSS:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_mag_noise_x_gauss "${CAM_R_MAG_NOISE_X_GAUSS:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_mag_noise_y_gauss "${CAM_R_MAG_NOISE_Y_GAUSS:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_mag_noise_z_gauss "${CAM_R_MAG_NOISE_Z_GAUSS:-0.0}" "${launch_input[@]}"
+for camera in l r; do
+  camera_upper="${camera^^}"
+  for axis in x y z; do
+    axis_upper="${axis^^}"
+    mag_bias_mean_var="CAM_${camera_upper}_MAG_BIAS_MEAN_${axis_upper}_GAUSS"
+    mag_bias_stddev_var="CAM_${camera_upper}_MAG_BIAS_STDDEV_${axis_upper}_GAUSS"
+    gyro_noise_var="CAM_${camera_upper}_GYRO_NOISE_${axis_upper}_RAD_S"
+    gyro_bias_mean_var="CAM_${camera_upper}_GYRO_BIAS_MEAN_${axis_upper}_RAD_S"
+    gyro_bias_stddev_var="CAM_${camera_upper}_GYRO_BIAS_STDDEV_${axis_upper}_RAD_S"
+    add_default_launch_arg "cam_${camera}_mag_bias_mean_${axis}_gauss" "${!mag_bias_mean_var:-0.0}" "${launch_input[@]}"
+    add_default_launch_arg "cam_${camera}_mag_bias_stddev_${axis}_gauss" "${!mag_bias_stddev_var:-0.0}" "${launch_input[@]}"
+    add_default_launch_arg "cam_${camera}_gyro_noise_${axis}_rad_s" "${!gyro_noise_var:-0.0008726646}" "${launch_input[@]}"
+    add_default_launch_arg "cam_${camera}_gyro_bias_mean_${axis}_rad_s" "${!gyro_bias_mean_var:-0.0}" "${launch_input[@]}"
+    add_default_launch_arg "cam_${camera}_gyro_bias_stddev_${axis}_rad_s" "${!gyro_bias_stddev_var:-0.0}" "${launch_input[@]}"
+  done
+done
 
 drone_spawn_y_default="${DRONE_SPAWN_Y_M:-2000.0}"
 approach_start_default="$drone_spawn_y_default"
@@ -1460,7 +1502,7 @@ fi
 
 if [[ -n "$record_mode" ]]; then
   if [[ -z "$record_dir" ]]; then
-    record_dir="$ROOT_DIR/bags/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"
+    record_dir="$ROOT_DIR/Recordings/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"
   fi
   mkdir -p "$record_dir"
   recorder_cmd=(

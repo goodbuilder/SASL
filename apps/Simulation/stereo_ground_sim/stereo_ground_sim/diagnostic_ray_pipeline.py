@@ -46,6 +46,30 @@ class DiagnosticRayOrchestrator:
                 provenance=attitude_provenance,
             )
 
+        true_north_poses, true_north_status, true_north_provenance = d["true_north_attitude_poses"](
+            snapshot, include_provenance=True,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+        )
+        true_north_provenance.update({
+            "baseline_source": "gazebo_observed_optical_centers",
+            "left_camera_center_source": "gazebo_observed_left_optical_center",
+            "right_camera_center_source": "gazebo_observed_right_optical_center",
+        })
+        if true_north_poses is None:
+            attitude_true_north = finalize_diagnostic_ray(
+                {"computation_status": true_north_status},
+                provenance=true_north_provenance, failure_reason=true_north_status,
+            )
+        else:
+            attitude_true_north = finalize_diagnostic_ray(
+                d["triangulate"](
+                    *pixels, left_camera_pose=true_north_poses[0],
+                    right_camera_pose=true_north_poses[1],
+                ),
+                provenance=true_north_provenance,
+            )
+
         gps_poses, gps_status, gps_provenance = d["gps_poses"](
             "gps_baseline", operational_snapshot=operational_snapshot,
             observation_timestamp_ns=observation_timestamp_ns,
@@ -85,7 +109,11 @@ class DiagnosticRayOrchestrator:
                 ),
                 provenance=provenance,
             )
-        return {"attitude": attitude, "operational": operational}
+        return {
+            "attitude": attitude,
+            "operational": operational,
+            "attitude_true_north": attitude_true_north,
+        }
 
 
 def _finite(values):
@@ -147,6 +175,54 @@ def diagnostic_delta(test, truth):
         "delta_forward_m": vector[0], "delta_right_m": vector[1],
         "delta_down_m": vector[2], "delta_range_m": delta_range,
         "position_difference_m": math.sqrt(sum(value * value for value in vector)),
+    }
+
+
+def ray_gt_error(ray, gt_baseline):
+    """Per-ray Ground Truth error: how far a ray's FRD estimate sits from GT.
+
+    Mirrors ``diagnostic_delta`` but compares against the plain
+    forward_m/right_m/down_m/range_m Ground Truth vector rather than another
+    ray, so it applies uniformly to every recorded Ray (not just the two
+    diagnostic-only rays that pipeline serves).
+
+    Gated on ``computation_status == "computed"`` rather than a ``valid``
+    key: only the diagnostic-only rays (attitude/operational, via
+    ``finalize_diagnostic_ray``) carry a ``valid`` flag -- the plain
+    triangulation output used by nominal_pose/optical_pose/ideal/gps_baseline
+    never sets one, only ``computation_status``.
+    """
+
+    empty = {
+        "gt_valid": False, "gt_failure_reason": "",
+        "gt_forward_error_m": None, "gt_right_error_m": None,
+        "gt_down_error_m": None, "gt_range_error_m": None,
+        "gt_position_error_m": None,
+    }
+    if not isinstance(gt_baseline, dict):
+        return {**empty, "gt_failure_reason": "gt_unavailable"}
+    if not isinstance(ray, dict) or ray.get("computation_status") != "computed":
+        reason = (
+            "ray_invalid"
+            if not isinstance(ray, dict)
+            else str(ray.get("failure_reason") or ray.get("computation_status") or "ray_invalid")
+        )
+        return {**empty, "gt_failure_reason": reason}
+    try:
+        vector = tuple(
+            float(ray[key]) - float(gt_baseline[key])
+            for key in ("forward_m", "right_m", "down_m")
+        )
+        range_error = float(ray["range_m"]) - float(gt_baseline["range_m"])
+        if not _finite((*vector, range_error)):
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        return {**empty, "gt_failure_reason": "invalid_gt_input"}
+    return {
+        "gt_valid": True, "gt_failure_reason": "",
+        "gt_forward_error_m": vector[0], "gt_right_error_m": vector[1],
+        "gt_down_error_m": vector[2], "gt_range_error_m": range_error,
+        "gt_position_error_m": math.sqrt(sum(value * value for value in vector)),
     }
 
 

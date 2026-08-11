@@ -92,6 +92,7 @@ SERIES = (
     ("global_baseline", None, QColor(0, 150, 60)),
     ("attitude", None, QColor(156, 39, 176)),
     ("operational", None, QColor(0, 0, 0)),
+    ("attitude_true_north", None, QColor(0, 217, 102)),
 )
 SERIES_LABELS = {
     # "truth" subscribes to /ground_truth_position, the literal Gazebo
@@ -109,6 +110,7 @@ SERIES_LABELS = {
     "global_baseline": "Global Baseline",
     "attitude": "Attitude",
     "operational": "Operational",
+    "attitude_true_north": "Attitude (True North)",
     "uam_raw_gps_reference": "UAM GPS",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -609,8 +611,8 @@ RAY_DIAGNOSTICS_ROWS = (
     ("global_baseline", "Global Baseline"),
     ("attitude", "Attitude"),
     ("operational", "Operational"),
+    ("attitude_true_north", "Attitude (True North)"),
 )
-DIAGNOSTIC_DELTA_ROWS = (("attitude", "Attitude"), ("operational", "Operational"))
 
 # Coarse state buckets derived from the existing computation_status/failure_reason
 # strings already produced by stereo_distance_node.  This only classifies the
@@ -704,7 +706,6 @@ class RayDiagnosticsPanel(QWidget):
 
         tabs = QTabWidget()
         tabs.addTab(self._scrollable(self._build_geometry_tab()), "Geometry")
-        tabs.addTab(self._scrollable(self._build_delta_tab()), "Optical Pose Δ")
         tabs.addTab(self._scrollable(self._build_gt_tab()), "GT Error")
         tabs.addTab(self._scrollable(self._build_sensors_tab()), "Sensors")
         content_layout.addWidget(tabs)
@@ -770,24 +771,6 @@ class RayDiagnosticsPanel(QWidget):
         self._geometry_table = table
         return tab
 
-    def _build_delta_tab(self):
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.addWidget(QLabel("Truth-relative delta: how much the input geometry source changed the triangulated result."))
-        headers = (
-            "Ray", "Valid", "ΔForward [m]", "ΔRight [m]", "ΔDown [m]",
-            "ΔRange [m]", "Position Diff [m]", "Failure Reason",
-        )
-        table = self._make_table(headers)
-        table.setRowCount(len(DIAGNOSTIC_DELTA_ROWS))
-        for row_index, (_key, label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
-            table.setItem(row_index, 0, QTableWidgetItem(label))
-        layout.addWidget(table)
-        self._delta_table = table
-
-        return tab
-
     def _build_gt_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -796,8 +779,8 @@ class RayDiagnosticsPanel(QWidget):
         layout.addWidget(self._gt_source_label)
         layout.addWidget(
             QLabel(
-                "Absolute position error against the Gazebo target_reference_link "
-                "Ground Truth (not the Truth Ray)."
+                "Each Ray's Forward/Right/Down/Range vs. the Gazebo "
+                "target_reference_link Ground Truth (not the Truth Ray) -- error only."
             )
         )
         headers = (
@@ -805,8 +788,8 @@ class RayDiagnosticsPanel(QWidget):
             "Range Error [m]", "Position Error [m]", "Failure Reason",
         )
         table = self._make_table(headers)
-        table.setRowCount(len(DIAGNOSTIC_DELTA_ROWS))
-        for row_index, (_key, label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
+        table.setRowCount(len(RAY_DIAGNOSTICS_ROWS))
+        for row_index, (_key, label) in enumerate(RAY_DIAGNOSTICS_ROWS):
             table.setItem(row_index, 0, QTableWidgetItem(label))
         layout.addWidget(table)
         self._gt_table = table
@@ -1058,7 +1041,6 @@ class RayDiagnosticsPanel(QWidget):
 
     def _refresh(self, data):
         self._refresh_geometry(data)
-        self._refresh_delta(data)
         self._refresh_gt(data)
         self._refresh_sensors(data)
 
@@ -1084,26 +1066,6 @@ class RayDiagnosticsPanel(QWidget):
             )
         table.resizeColumnsToContents()
 
-    def _refresh_delta(self, data):
-        table = self._delta_table
-        for row_index, (key, _label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
-            ray = data.get(key)
-            values = ray if isinstance(ray, dict) else {}
-            valid = bool(values.get("delta_valid", False))
-            valid_item = QTableWidgetItem("yes" if valid else "no")
-            valid_item.setForeground(QColor("#1b5e20" if valid else "#b00020"))
-            table.setItem(row_index, 1, valid_item)
-            table.setItem(row_index, 2, QTableWidgetItem(_fmt_num(values.get("delta_forward_m"), 3)))
-            table.setItem(row_index, 3, QTableWidgetItem(_fmt_num(values.get("delta_right_m"), 3)))
-            table.setItem(row_index, 4, QTableWidgetItem(_fmt_num(values.get("delta_down_m"), 3)))
-            table.setItem(row_index, 5, QTableWidgetItem(_fmt_num(values.get("delta_range_m"), 3)))
-            table.setItem(row_index, 6, QTableWidgetItem(_fmt_num(values.get("position_difference_m"), 3)))
-            reason = str(values.get("delta_failure_reason", "") or "")
-            reason_item = QTableWidgetItem(reason)
-            reason_item.setToolTip(reason)
-            table.setItem(row_index, 7, reason_item)
-        table.resizeColumnsToContents()
-
     def _refresh_gt(self, data):
         source = data.get("gt_source")
         fallback = data.get("gt_fallback_used")
@@ -1111,7 +1073,7 @@ class RayDiagnosticsPanel(QWidget):
             f"GT source: {source or '—'}   |   GT fallback used: {_fmt_bool(fallback)}"
         )
         table = self._gt_table
-        for row_index, (key, _label) in enumerate(DIAGNOSTIC_DELTA_ROWS):
+        for row_index, (key, _label) in enumerate(RAY_DIAGNOSTICS_ROWS):
             ray = data.get(key)
             values = ray if isinstance(ray, dict) else {}
             valid = bool(values.get("gt_valid", False))
@@ -1328,37 +1290,6 @@ class LiveSavedCsvPreview(QWidget):
 
     _TABLE_VIEWS = (
         (
-            "Summary",
-            (
-                ("time_sec", "Time (s)"),
-                ("ground_truth_m", "Truth range (m)"),
-                ("nominal_pose_range_m", "Nominal Pose range (m)"),
-                ("gps_baseline_range_m", "GPS Baseline range (m)"),
-            ),
-        ),
-        (
-            "GPS",
-            (
-                ("time_sec", "Time (s)"),
-                ("gps_baseline_forward_m", "GPS Baseline F (m)"),
-                ("gps_baseline_right_m", "GPS Baseline R (m)"),
-                ("gps_baseline_down_m", "GPS Baseline D (m)"),
-                ("gps_baseline_position_error_m", "GPS Baseline position error (m)"),
-            ),
-        ),
-        (
-            "BBox",
-            (
-                ("time_sec", "Time (s)"),
-                ("left_bbox", "Left bbox (x1,y1,x2,y2)"),
-                ("left_confidence", "Left confidence"),
-                ("right_bbox", "Right bbox (x1,y1,x2,y2)"),
-                ("right_confidence", "Right confidence"),
-                ("raw_disparity_px", "Raw disparity (px)"),
-                ("yolo_measurement_raw_range_m", "YOLO range (m)"),
-            ),
-        ),
-        (
             "Ray summary",
             (
                 ("time_sec", "Time (s)"),
@@ -1381,6 +1312,18 @@ class LiveSavedCsvPreview(QWidget):
                 ("drone_right_m", "Rt truth"),
                 ("drone_down_m", "D truth"),
                 ("ground_truth_m", "Rg truth"),
+            ),
+        ),
+        (
+            "BBox",
+            (
+                ("time_sec", "Time (s)"),
+                ("left_bbox", "Left bbox (x1,y1,x2,y2)"),
+                ("left_confidence", "Left confidence"),
+                ("right_bbox", "Right bbox (x1,y1,x2,y2)"),
+                ("right_confidence", "Right confidence"),
+                ("raw_disparity_px", "Raw disparity (px)"),
+                ("yolo_measurement_raw_range_m", "YOLO range (m)"),
             ),
         ),
         (
@@ -2639,7 +2582,7 @@ class OperatorPanel(Plugin):
         # topic of their own (unlike Nominal/Optical/Ideal/GPS above);
         # /stereo/ray_metrics is their only source, so plot/facts/CSV get
         # them from here instead of the SERIES topic-subscription loop.
-        for ray_key in ("global_baseline", "attitude", "operational"):
+        for ray_key in ("global_baseline", "attitude", "operational", "attitude_true_north"):
             ray = parsed.get(ray_key)
             if not isinstance(ray, dict):
                 continue

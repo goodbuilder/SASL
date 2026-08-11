@@ -386,7 +386,7 @@ PX4 local position은 `north/east/down` 순서의 NED이고, Gazebo world/model 
 
 ## Operator recording outputs
 
-rqt operator panel의 `Save CSV`는 `bags/operator_YYYYMMDD_HHMMSS_lite/` 아래에
+rqt operator panel의 `Save CSV`는 `Recordings/operator_YYYYMMDD_HHMMSS_lite/` 아래에
 세션을 저장한다. 기존 호환 원본인 `telemetry.csv`는 계속 생성하지만, 후처리는
 고정값과 시간 변동값을 분리한 compact 산출물을 우선 사용한다.
 
@@ -5956,18 +5956,19 @@ activate할 필요가 없습니다. 다른 Python을 강제할 때는
 ./run_mission.sh --check-connection
 ```
 
-`Flight` 탭의 `Auto` 버튼은 `run_auto.sh`를 실행하지만 recorder는 자동으로
-시작하지 않습니다. Auto가 진행 중일 때 `Save CSV`를 누르면 그 시점부터
-telemetry/detections CSV를, `Save MP4`를 누르면 그 시점부터 CSV와 좌우 overlay
-MP4를 저장합니다. 이동 중에는
+`Flight` 탭의 `Auto` 버튼은 `run_auto.sh`를 실행하면서 Full recorder를 자동으로
+시작합니다. 생성 waypoint, telemetry/detections CSV, XLSX, compact CSV와 좌우
+overlay MP4는 `Recordings/auto_YYYYMMDD_HHMMSS_Full/` 한 폴더에 저장됩니다.
+Auto 중 별도의 `Save CSV`, `Save MP4`, `Save Debug`를 누르면 독립된 operator
+세션이 추가로 생성됩니다. 이동 중에는
 좌우 카메라의 전체 bbox가 모두 image pixel 안전 영역(기본 각 변 5% 마진) 안에
 있을 때만 알려진 bbox의 마진 이탈을 정지 조건으로 사용합니다. 초기/일시적인
 검출 누락이나 stale 상태는 전진을 막지 않으며, 카메라가 촬영 가능한 거리로
 접근하면서 데이터 수집이 시작됩니다. 후진 명령은 사용하지 않습니다. 실행 중에는 같은 툴바의 `Stop`을
 누르면 Auto process group에 SIGINT를 보내고 PX4 `LAND`를 요청합니다. 기록을
-시작한 경우 CSV/MP4 recorder도 같은 Stop 시점을 기준으로 flush/finalize하므로,
-Save 버튼을 누른 시점부터 Stop 시점까지의 데이터만 `telemetry.csv`, overlay
-MP4, XLSX에 남습니다. 수동 실행은
+자동 Full recorder도 같은 Stop 시점을 기준으로 flush/finalize하므로,
+recorder 시작부터 Stop 시점까지의 데이터가 telemetry CSV, overlay MP4,
+XLSX에 남습니다. 수동 실행은
 다음과 같습니다:
 
 ```bash
@@ -6193,10 +6194,10 @@ WAYPOINT_RECORD_LITE=true
 ./run_px4_waypoint_mission.sh
 ```
 
-이 명령은 기본적으로 lite CSV도 함께 저장합니다. 저장 위치는 `bags/waypoint_YYYYmmdd_HHMMSS_lite`이고, `telemetry.csv`에는 실제 Forward/Right/Down/GroundTruth, 스테레오 3D 추정값, 거리/오차/YOLO bbox/confidence 같은 수치 로그가 기록됩니다. 저장 위치를 바꾸거나 끄려면:
+이 명령은 기본적으로 lite CSV도 함께 저장합니다. 저장 위치는 `Recordings/waypoint_YYYYmmdd_HHMMSS_lite`이고, `telemetry.csv`에는 실제 Forward/Right/Down/GroundTruth, 스테레오 3D 추정값, 거리/오차/YOLO bbox/confidence 같은 수치 로그가 기록됩니다. 저장 위치를 바꾸거나 끄려면:
 
 ```bash
-./run_px4_waypoint_mission.sh --record-dir bags/waypoint_test_01
+./run_px4_waypoint_mission.sh --record-dir Recordings/waypoint_test_01
 ./run_px4_waypoint_mission.sh --no-record
 ```
 
@@ -6219,52 +6220,50 @@ WAYPOINT_RECORD_LITE=true
 거리 측정은 왼쪽/오른쪽 영상에서 같은 YOLO class의 bbox 중심을 찾고, disparity와 영상 중심 오프셋으로 내부 RDF를 계산한 뒤 FRD topic 순서인 `estimated_forward_m`, `estimated_right_m`, `estimated_down_m`, `estimated_range_m`으로 발행합니다. bbox 중심 보정이 켜져 있으면 같은 순서로 `corrected_forward_m`, `corrected_right_m`, `corrected_down_m`, `corrected_range_m`도 발행합니다. 기존 거리 그래프와 `/target_distance`는 이 3D 복원 결과 중 raw 카메라 전방 거리인 `estimated_forward_m`을 사용합니다. `/ground_truth_position`의 `ground_truth_m`은 카메라 기준 FRD로 계산한 3D 직선거리이므로 `estimated_range_m` 및 `corrected_range_m`과 직접 비교합니다.
 자동 접근 실험은 QGC mission 또는 PX4용 MAVLink/offboard 명령으로 수행합니다. 이전 `./run_x500_mission.sh`의 Gazebo `cmd_vel` 방식은 현재 QGC/PX4 제어와 충돌하므로 비활성화되어 있습니다.
 
-카메라 optical 자세 정량 실험은 아래 명령을 사용합니다. 실행 스크립트 이름은
-기존 호환성을 위해 `attitude_error`를 유지하지만, 실험 대상은 optical 자세입니다.
-기본 실행은 Gazebo 이미지와 YOLO 거리 계산을 포함한 반복 실험입니다.
-실행 전에 이전 `attitude_error` Gazebo/ROS 프로세스가 남아 있으면 자동으로 종료한 뒤 새 실험을 시작합니다. 이 자동 정리를 막고 기존처럼 즉시 실패하게 하려면 `--no-stop-existing-sim`을 사용하고, 의도적으로 기존 시뮬레이션과 함께 실행하려면 `--allow-existing-sim`을 사용합니다.
+카메라 모델, optical/PX4 자세, target mission, waypoint, YOLO 기본값은 `config/simulation.env`에서 바꿉니다.
+
+### 카메라 magnetometer/gyroscope noise와 bias
+
+고정 카메라 PX4의 센서 민감도 실험을 위해 Left/Right 카메라의
+magnetometer와 gyroscope를 body FRD 축별로 독립 설정할 수 있습니다.
+목적은 센서 오차가 PX4 attitude와 Attitude/Full Ray 결과에 미치는 영향을
+재현하는 것입니다. 배열 및 변수의 X/Y/Z 계약은
+`Forward/Right/Down`이고, magnetometer 단위는 Gauss, gyroscope 단위는
+`rad/s`입니다.
+
+각 센서는 다음 세 필드를 제공합니다.
+
+- `NOISE`: 매 sample에 적용되는 Gaussian noise 표준편차
+- `BIAS_MEAN`: 실행 시 생성되는 고정 bias의 평균이며 음수도 허용
+- `BIAS_STDDEV`: 실행 시 생성되는 고정 bias 분포의 표준편차
+
+변수 이름은
+`CAM_{L|R}_{MAG|GYRO}_{NOISE|BIAS_MEAN|BIAS_STDDEV}_{X|Y|Z}_{GAUSS|RAD_S}`
+형식입니다. 예를 들어 오른쪽 카메라 yaw 축 gyro bias 평균은
+`CAM_R_GYRO_BIAS_MEAN_Z_RAD_S`, 왼쪽 magnetometer Y축 bias 분포는
+`CAM_L_MAG_BIAS_STDDEV_Y_GAUSS`입니다. 카메라 기본 gyro noise는
+`0.00001 rad/s`입니다. PX4 v1.17의 `1e-6 rad/s` 연속 동일값 판정
+경계보다 충분히 크면서 PX4 Gazebo 모델값 `0.0008726646 rad/s`보다
+작은 안전 최소값입니다. 기본 mag noise는 stale sample 방지를 위해
+`0.000001 G`이며 모든 bias 기본값은 0입니다.
 
 ```bash
-./run_attitude_error_experiment.sh
+CAM_L_MAG_NOISE_Z_GAUSS=0.000001
+CAM_L_MAG_BIAS_MEAN_Z_GAUSS=0.0
+CAM_L_MAG_BIAS_STDDEV_Z_GAUSS=0.0
+CAM_R_GYRO_NOISE_Z_RAD_S=0.00001
+CAM_R_GYRO_BIAS_MEAN_Z_RAD_S=0.0
+CAM_R_GYRO_BIAS_STDDEV_Z_RAD_S=0.0
 ```
 
-기본 Gazebo/YOLO 실험은 오른쪽 카메라 optical roll/pitch/yaw 축을 대상으로
-`+0.25도` 변위를 테스트합니다. 음수 변위도 포함하려면:
-
-```bash
-./run_attitude_error_experiment.sh --include-negative
-```
-
-각도 오차 범위는 `config/simulation.env`에서 조절합니다. 예를 들어 `-1.0도`부터 `+1.0도`까지 `0.25도` 간격으로 테스트하려면:
-
-```bash
-ATTITUDE_EXPERIMENT_ANGLE_MIN_DEG=-1.0
-ATTITUDE_EXPERIMENT_ANGLE_MAX_DEG=1.0
-ATTITUDE_EXPERIMENT_ANGLE_STEP_DEG=0.25
-```
-
-`0도` 케이스는 별도 `baseline`과 중복되므로 자동으로 제외됩니다.
-
-축마다 다른 범위와 단계를 쓰려면 `AXIS:MIN:MAX:STEP` 형식의 `--axis-range`를 반복해서 줍니다.
-
-```bash
-./run_attitude_error_experiment.sh \
-  --axis-range cam_r_optical_roll_deg:-5:5:0.5 \
-  --axis-range cam_r_optical_pitch_deg:-2:2:0.25 \
-  --axis-range cam_r_optical_yaw_deg:-10:10:1
-```
-
-설정 파일에서는 공백으로 구분합니다.
-
-```bash
-ATTITUDE_EXPERIMENT_AXIS_RANGES="cam_r_optical_roll_deg:-5:5:0.5 cam_r_optical_pitch_deg:-2:2:0.25 cam_r_optical_yaw_deg:-10:10:1"
-```
-
-축별 범위가 지정된 축은 전역 `ATTITUDE_EXPERIMENT_ANGLE_MIN_DEG`, `ATTITUDE_EXPERIMENT_ANGLE_MAX_DEG`, `ATTITUDE_EXPERIMENT_ANGLE_STEP_DEG` 대신 해당 축별 값을 사용합니다.
-
-Gazebo/YOLO 실험 결과는 `reports/attitude_error_*/summary.csv`와 케이스별 CSV/log로 저장됩니다. `summary.csv`에는 케이스별 좌/우 roll/pitch/yaw, 마지막 실제 Forward/Right/Down/GroundTruth, 마지막 3D 추정값, baseline, 카메라 높이, FOV, 해상도 같은 카메라 모델 정보도 함께 들어가며, 공통 실행 조건은 `metadata.txt`에도 저장됩니다.
-
-카메라 모델, optical/PX4 자세, target mission, waypoint, YOLO와 자세각 실험 기본값은 모두 `config/simulation.env`에서 바꿉니다. 같은 값이 operator view와 각 보조 runner에 적용됩니다.
+caller environment가 `simulation.env`보다 우선하며 같은 이름의 launch
+인자도 직접 지정할 수 있습니다. noise와 bias stddev는 0 이상인 유한값,
+bias mean은 부호가 있는 유한값이어야 합니다. 이 값들은 Gazebo 센서에
+주입되는 오차이며 PX4 EKF의 `estimator_sensor_bias.mag_bias` 상태를 직접
+지정하지 않습니다. 완전히 고정된 카메라에서는 yaw와 magnetometer bias가
+충분히 관측되지 않을 수 있으므로, bias 0만으로 yaw 오차 0을 보장하지
+않습니다. runtime 평가에는 Gazebo ground truth를 입력하지 않고 ULog의
+센서·추정 상태와 동일 frame으로 변환한 자세 오차만 사용합니다.
 
 ```bash
 CAMERA_BASELINE_M=25.0
@@ -6287,19 +6286,7 @@ YOLO_IMGSZ=1280
 YOLO_PYTHON=python3
 ```
 
-자세각 실험 범위 기본값은 `config/simulation.env`에서 바꿀 수 있습니다. 각도 단위는 도(deg)입니다.
-
-```bash
-ATTITUDE_EXPERIMENT_AXES="cam_r_optical_roll_deg cam_r_optical_pitch_deg cam_r_optical_yaw_deg"
-ATTITUDE_EXPERIMENT_AXIS_RANGES=""
-ATTITUDE_EXPERIMENT_ANGLE_MIN_DEG=0.25
-ATTITUDE_EXPERIMENT_ANGLE_MAX_DEG=0.25
-ATTITUDE_EXPERIMENT_ANGLE_STEP_DEG=0.25
-ATTITUDE_EXPERIMENT_INCLUDE_NEGATIVE=false
-ATTITUDE_EXPERIMENT_QUICK=false
-```
-
-전체 기본값 묶음을 임시로 교체하려면 `SIM_CONFIG=config/my_simulation.env ./run_operator_view.sh`처럼 실행합니다. 같은 `SIM_CONFIG` 계약을 `run_mission.sh`, `run_px4_waypoint_mission.sh`, `run_attitude_error_experiment.sh`에서도 사용합니다.
+전체 기본값 묶음을 임시로 교체하려면 `SIM_CONFIG=config/my_simulation.env ./run_operator_view.sh`처럼 실행합니다. 같은 `SIM_CONFIG` 계약을 `run_mission.sh`, `run_px4_waypoint_mission.sh`에서도 사용합니다.
 
 예: 오른쪽 카메라 yaw를 1도 틀기
 
@@ -6388,6 +6375,18 @@ Debug = telemetry.csv + left_overlay.mp4 + right_overlay.mp4 + rosbag/
 
 ## 변경 이력
 
+- 2026-08-10: 고정 카메라 gyro noise 기본값을 Left/Right 모든 body-FRD
+  축에서 `0.00001 rad/s`로 설정했습니다. `1e-10 rad/s`에서 PX4 센서
+  validator가 gyro를 stale로 판정해 약 5초 후 `sensor_combined`, attitude,
+  global-position 기반 Ray가 중단되던 조건을 피하는 안전 최소값입니다.
+- 2026-08-10: Analysis plot 발행을 `runtime_control_coordinator.py`로
+  분리한 뒤 누락됐던 `plot_payloads` import를 복구했습니다. 따라서
+  plot worker가 시작 직후 `NameError`로 종료하지 않고 기존 public
+  FRD+range `[forward,right,down,range]` payload를 계속 발행합니다.
+- 2026-08-10: `simulation.env`에서 Left/Right 카메라 magnetometer와
+  gyroscope의 Gaussian noise, 고정 bias mean, bias stddev를 body FRD
+  X/Y/Z별로 독립 설정하도록 추가했습니다. launch는 유한값과 비음수
+  표준편차를 검증한 뒤 Gazebo SDF 센서 noise 계약에 반영합니다.
 - 2026-08-04: Auto mission phase publisher가 ROS context 종료를 비행 실패로 전파하지 않도록 보완했습니다. phase 메타데이터를 쓸 수 없을 때도 Auto 비행은 계속되며, sweep recorder는 bbox 검출 이후의 telemetry CSV/MP4를 독립적으로 finalize합니다.
 - 2026-08-04: Auto FOV guard가 bbox 미검출/stale 상태를 전진 차단 조건으로 사용하지 않도록 수정했습니다. 검출이 없을 때도 전진하고, 좌우 bbox가 실제로 수신된 경우에만 image margin 이탈을 정지 조건으로 적용합니다.
 - 2026-08-04: Auto 자세 보정 sweep의 반복 조건 기본값을 `config/simulation.env`의 `SWEEP_*` 환경변수로 관리하도록 추가했습니다. CLI가 환경변수보다 우선하며, 축/각도/반복/출력경로/대기시간/seed/무작위화/실패 후 계속/기존 세션 허용 여부를 명시적으로 설정할 수 있습니다.

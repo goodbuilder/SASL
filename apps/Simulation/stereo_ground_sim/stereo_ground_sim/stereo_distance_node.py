@@ -329,6 +329,7 @@ RAY_DISPLAY_NAMES = {
     "global_baseline": "Global Baseline",
     "attitude": "Attitude",
     "operational": "Operational",
+    "attitude_true_north": "Attitude (True North)",
 }
 
 GPS_BASELINE_ANCHOR_POLICY = (
@@ -482,7 +483,7 @@ class StereoDistanceNode(Node):
         self.declare_parameter("rviz_live_latest_only", True)
         self.declare_parameter(
             "rviz_live_ray_hz",
-            20.0,
+            15.0,
             ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("enable_synthetic_detections", False)
@@ -770,9 +771,15 @@ class StereoDistanceNode(Node):
         self.pair_work_scheduler = PairWorkScheduler()
         self.measurement_pair_queue = self.pair_work_scheduler.measurements
         self.rviz_live_latest_pair = None
+        # Latest completed (pair, computed) tuple shared by the measurement
+        # and display workers.  It deliberately contains no converted frame
+        # aliases; the computed ray dictionaries retain their producer frame
+        # contracts unchanged.
+        self.rviz_live_latest_result = None
         self.rviz_live_latest_processed_pair_id = 0
         self.rviz_live_publish_count = 0
         self.rviz_live_error_count = 0
+        self.last_ideal_ray_marker_publish_monotonic = 0.0
         self.gt_alignment_ready_queue = self.pair_work_scheduler.alignments
         # A continuous camera stream keeps the measurement queue non-empty,
         # while ground-truth alignments are required to evaluate and render
@@ -1113,6 +1120,21 @@ class StereoDistanceNode(Node):
         self.yolo_inference_ms_pub = self.create_publisher(
             Float32, "/stereo/yolo_inference_ms", 10
         )
+        self.image_decode_ms_pub = self.create_publisher(
+            Float32, "/stereo/image_decode_ms", 10
+        )
+        self.yolo_predict_ms_pub = self.create_publisher(
+            Float32, "/stereo/yolo_predict_ms", 10
+        )
+        self.ray_geometry_ms_pub = self.create_publisher(
+            Float32, "/stereo/ray_geometry_ms", 10
+        )
+        self.result_commit_ms_pub = self.create_publisher(
+            Float32, "/stereo/result_commit_ms", 10
+        )
+        self.gt_alignment_ms_pub = self.create_publisher(
+            Float32, "/stereo/gt_alignment_ms", 10
+        )
         self.yolo_update_hz_pub = self.create_publisher(
             Float32, "/stereo/yolo_update_hz", 10
         )
@@ -1370,6 +1392,9 @@ class StereoDistanceNode(Node):
 
     def _cuda_status_message(self, torch_module):
         return self._yolo_model_runtime()._cuda_status_message(torch_module)
+
+    def _shutdown_yolo_process(self):
+        return self._yolo_model_runtime()._shutdown_yolo_process()
     def _triangulate_center_pixels(self, left_cx, left_cy, right_cx, right_cy, width, height):
         return self._triangulate_pixel_centers(left_cx, left_cy, right_cx, right_cy, width, height)
 

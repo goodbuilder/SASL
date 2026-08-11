@@ -28,8 +28,9 @@ from stereo_ground_sim.coordinate_frames import (  # noqa: E402
 
 PX4_WAYPOINT_FRAME = "px4_local_ned_setpoint:north,east,altitude_agl_m"
 WORLD_TO_PX4_WAYPOINT_CONTRACT = (
-    "simulation_px4_mission_contract: waypoint north/east/altitude_agl_m maps "
-    "to Gazebo world x/y/z for the current PX4 SITL mission runner"
+    "simulation_px4_mission_contract: Gazebo world ENU minus the PX4 home "
+    "world ENU origin maps to local NED north/east/down; mission altitude_agl_m "
+    "is local up and the runner sends down=-altitude_agl_m"
 )
 
 
@@ -50,6 +51,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-range-m", type=float, default=2000.0)
     parser.add_argument("--camera-baseline-m", type=float, default=25.0)
     parser.add_argument("--camera-height-m", type=float, default=0.5)
+    parser.add_argument(
+        "--px4-origin-world-east-m", type=float, default=0.0,
+        help="PX4 local origin in Gazebo world ENU east (world X), metres.",
+    )
+    parser.add_argument(
+        "--px4-origin-world-north-m", type=float, default=0.0,
+        help="PX4 local origin in Gazebo world ENU north (world Y), metres.",
+    )
+    parser.add_argument(
+        "--px4-origin-world-up-m", type=float, default=0.0,
+        help="PX4 local origin in Gazebo world ENU up (world Z), metres.",
+    )
     parser.add_argument(
         "--cam-l-optical-roll-deg", type=float, default=0.0,
         help="Left camera optical RDF roll, deg. Matches CAM_L_OPTICAL_ROLL_DEG.",
@@ -148,6 +161,7 @@ def sample_one(
     image_height_px: int,
     pixel_margin_px: float,
     max_attempts: int,
+    px4_origin_world_enu_m: tuple[float, float, float],
 ) -> dict[str, float | int | str]:
     usable_h = horizontal_fov_rad * 0.5 - fov_margin_rad
     usable_v = vertical_fov * 0.5 - fov_margin_rad
@@ -196,13 +210,13 @@ def sample_one(
             "world_frame": WORLD_FRAME,
             "baseline_frame": BASELINE_CENTER_FRD_FRAME,
             "world_to_px4_waypoint_contract": WORLD_TO_PX4_WAYPOINT_CONTRACT,
-            # world is Gazebo ENU: world[0]=East, world[1]=North, world[2]=Up
-            # (coordinate_frames.R_ENU_FROM_NED). PX4's north/east are NED, so
-            # north_m must read world[1] and east_m must read world[0] -- not
-            # the same index, despite the visual symmetry of the old code.
-            "north_m": world[1],
-            "east_m": world[0],
-            "altitude_agl_m": world[2],
+            # Position input is absolute Gazebo world ENU [East, North, Up].
+            # PX4 mission setpoints are local NED relative to the vehicle's
+            # home/spawn origin. The CSV stores local Up as altitude_agl_m;
+            # px4_auto_mission converts it explicitly to local Down by negating it.
+            "north_m": world[1] - px4_origin_world_enu_m[1],
+            "east_m": world[0] - px4_origin_world_enu_m[0],
+            "altitude_agl_m": world[2] - px4_origin_world_enu_m[2],
             "world_x_m": world[0],
             "world_y_m": world[1],
             "world_z_m": world[2],
@@ -265,6 +279,11 @@ def generate_waypoints(
     )
     v_fov = vertical_fov_rad(args.horizontal_fov_rad, args.image_width_px, args.image_height_px)
     fx_px, fy_px = focal_lengths_px(args.horizontal_fov_rad, args.image_width_px, args.image_height_px)
+    px4_origin_world_enu_m = (
+        float(args.px4_origin_world_east_m),
+        float(args.px4_origin_world_north_m),
+        float(args.px4_origin_world_up_m),
+    )
 
     calibration: list[dict[str, float | int | str]] = []
     for index in range(args.calibration_count):
@@ -289,6 +308,7 @@ def generate_waypoints(
                 image_height_px=args.image_height_px,
                 pixel_margin_px=args.pixel_margin_px,
                 max_attempts=args.max_attempts,
+                px4_origin_world_enu_m=px4_origin_world_enu_m,
             )
         )
 
@@ -315,6 +335,7 @@ def generate_waypoints(
                 image_height_px=args.image_height_px,
                 pixel_margin_px=args.pixel_margin_px,
                 max_attempts=args.max_attempts,
+                px4_origin_world_enu_m=px4_origin_world_enu_m,
             )
         )
 
@@ -338,6 +359,11 @@ def generate_waypoints(
         "baseline_frame": BASELINE_CENTER_FRD_FRAME,
         "px4_waypoint_frame": PX4_WAYPOINT_FRAME,
         "world_to_px4_waypoint_contract": WORLD_TO_PX4_WAYPOINT_CONTRACT,
+        "px4_origin_world_enu_m": {
+            "east": px4_origin_world_enu_m[0],
+            "north": px4_origin_world_enu_m[1],
+            "up": px4_origin_world_enu_m[2],
+        },
         "horizontal_fov_rad": args.horizontal_fov_rad,
         "vertical_fov_rad": v_fov,
         "fov_margin_rad": args.fov_margin_rad,

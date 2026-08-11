@@ -8,6 +8,7 @@ from stereo_ground_sim.gazebo_target_controller import GazeboTargetController
 from stereo_ground_sim.mission_timeline import MissionTimelineConfig, mission_state
 from stereo_ground_sim.runtime_worker_lifecycle import RuntimeWorkerLifecycle
 from stereo_ground_sim.time_alignment import image_stamp_ns
+from stereo_ground_sim.visualization_payloads import plot_payloads
 
 RUNTIME_CONTROL_METHODS = [
     "_should_subscribe_camera_images",
@@ -383,6 +384,7 @@ class RuntimeControlCoordinator:
         lifecycle.threads["rviz"] = getattr(self.node, "rviz_live_thread", None)
         lifecycle.join("measurement", 2.0)
         lifecycle.join("rviz", 2.0)
+        self.node._shutdown_yolo_process()
         self.node._finalize_research_recording()
 
     def _command_gazebo_target_pose(self, state):

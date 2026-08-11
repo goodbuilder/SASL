@@ -6,12 +6,43 @@ cd "$ROOT_DIR"
 
 SIM_CONFIG="${SIM_CONFIG:-$ROOT_DIR/config/simulation.env}"
 SIM_SCENARIO_CONFIG="${SIM_SCENARIO_CONFIG:-}"
+OPERATOR_RECORDER_PYTHON="${OPERATOR_RECORDER_PYTHON:-}"
+
+resolve_executable() {
+  local candidate resolved
+  for candidate in "$@"; do
+    [[ -n "$candidate" ]] || continue
+    if [[ "$candidate" == */* ]]; then
+      if [[ -x "$candidate" ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      continue
+    fi
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    if [[ -n "$resolved" && -x "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! OPERATOR_RECORDER_PYTHON="$(resolve_executable \
+  "$OPERATOR_RECORDER_PYTHON" \
+  "$ROOT_DIR/.venv/bin/python" \
+  "$ROOT_DIR/.venv/bin/python3" \
+  python3
+)"; then
+  OPERATOR_RECORDER_PYTHON="python3"
+fi
 SIM_EXPLICIT_NAMES=(
   AUTO_FOV_MARGIN_RATIO AUTO_FOV_DETECTION_TIMEOUT_S
   CAM_L_OPTICAL_ROLL_DEG CAM_L_OPTICAL_PITCH_DEG CAM_L_OPTICAL_YAW_DEG
   CAM_R_OPTICAL_ROLL_DEG CAM_R_OPTICAL_PITCH_DEG CAM_R_OPTICAL_YAW_DEG
   CAMERA_BASELINE_M CAMERA_HEIGHT_M CAMERA_HORIZONTAL_FOV_RAD
   CAMERA_IMAGE_WIDTH_PX CAMERA_IMAGE_HEIGHT_PX
+  DRONE_SPAWN_X_M DRONE_SPAWN_Y_M DRONE_SPAWN_Z_M
   AUTO_WAYPOINT_COUNT AUTO_WAYPOINT_MIN_RANGE_M AUTO_WAYPOINT_MAX_RANGE_M
   AUTO_WAYPOINT_SEED
 )
@@ -24,8 +55,8 @@ usage() {
 Usage:
   ./run_auto.sh [options]
 
-Starts a FOV-guarded mission. Recording is opt-in from the rqt operator
-panel: press Save CSV or Save MP4 while Auto is running.
+Starts a FOV-guarded mission and automatically records a Full operator session
+(telemetry, XLSX, compact CSVs, and left/right overlay MP4).
 
 By default this first generates a waypoint approach path with
 scripts/generate_fov_constrained_waypoints.py, verified point-by-point
@@ -43,7 +74,8 @@ Options:
   --waypoint-max-range-m N       Farthest generated point's range, m. Default: 2000.
   --waypoint-seed N              RNG seed for waypoint generation. Default: 20260729.
   --waypoints-dir DIR            Where to write the generated waypoint set.
-                                 Default: results/auto_waypoints/<timestamp>.
+                                 Also becomes the Full recording session directory.
+                                 Default: Recordings/auto_YYYYMMDD_HHMMSS_Full.
   --no-generate-waypoints        Skip generation; fall back to run_mission.sh's
                                  own straight-line --altitude-m/--distance-m approach.
   --help, -h                     Show this help.
@@ -55,7 +87,7 @@ All other options are passed to run_mission.sh, including --quick and mission li
 
 For offline attitude-error calibration, use ./run_auto_attitude_sweep.sh. It
 restarts the simulation for each physical optical-RDF attitude case and uses
-the explicit research recorder; normal Auto recording remains rqt-controlled.
+the explicit research recorder; normal Auto uses its automatic Full recorder.
 USAGE
 }
 
@@ -121,10 +153,10 @@ while (($#)); do
 done
 
 path_file=""
+if [[ -z "$waypoints_dir" ]]; then
+  waypoints_dir="$ROOT_DIR/Recordings/auto_$(date +%Y%m%d_%H%M%S)_Full"
+fi
 if [[ "$generate_waypoints" == true && "$mission_supplies_path" == false ]]; then
-  if [[ -z "$waypoints_dir" ]]; then
-    waypoints_dir="$ROOT_DIR/results/auto_waypoints/$(date +%Y%m%d_%H%M%S)"
-  fi
   pixel_margin_px="$(awk -v w="${CAMERA_IMAGE_WIDTH_PX:-1280}" -v r="$fov_margin_ratio" 'BEGIN { printf "%.6f", w * r }')"
   echo "Generating $waypoint_count FOV-verified waypoint(s) (range ${waypoint_min_range_m}-${waypoint_max_range_m} m)" \
     "for optical attitude L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
@@ -138,6 +170,9 @@ if [[ "$generate_waypoints" == true && "$mission_supplies_path" == false ]]; the
     --max-range-m "$waypoint_max_range_m" \
     --camera-baseline-m "${CAMERA_BASELINE_M:-25.0}" \
     --camera-height-m "${CAMERA_HEIGHT_M:-0.1}" \
+    --px4-origin-world-east-m "${DRONE_SPAWN_X_M:-0.0}" \
+    --px4-origin-world-north-m "${DRONE_SPAWN_Y_M:-0.0}" \
+    --px4-origin-world-up-m "${DRONE_SPAWN_Z_M:-0.0}" \
     --cam-l-optical-roll-deg "${CAM_L_OPTICAL_ROLL_DEG:-0.0}" \
     --cam-l-optical-pitch-deg "${CAM_L_OPTICAL_PITCH_DEG:-0.0}" \
     --cam-l-optical-yaw-deg "${CAM_L_OPTICAL_YAW_DEG:-0.0}" \
@@ -150,6 +185,34 @@ if [[ "$generate_waypoints" == true && "$mission_supplies_path" == false ]]; the
     --pixel-margin-px "$pixel_margin_px"
   path_file="$waypoints_dir/validation_mission.csv"
 fi
+
+mkdir -p "$waypoints_dir"
+
+set +u
+# shellcheck disable=SC1091
+source /opt/ros/humble/setup.bash
+if [[ -f "$ROOT_DIR/install/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source "$ROOT_DIR/install/setup.bash"
+fi
+set -u
+
+record_pid=""
+cleanup_recording() {
+  if [[ -n "$record_pid" ]] && kill -0 "$record_pid" >/dev/null 2>&1; then
+    kill -INT -- "-$record_pid" >/dev/null 2>&1 || kill -INT "$record_pid" >/dev/null 2>&1 || true
+    wait "$record_pid" >/dev/null 2>&1 || true
+  fi
+  record_pid=""
+}
+trap cleanup_recording EXIT INT TERM
+
+setsid "$OPERATOR_RECORDER_PYTHON" -m stereo_ground_sim.operator_recorder \
+  --mode full \
+  --output-dir "$waypoints_dir" &
+record_pid="$!"
+printf '%s\n' "Recording Auto Full session to: $waypoints_dir"
+sleep 1
 
 set +e
 if [[ -n "$path_file" ]]; then

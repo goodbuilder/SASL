@@ -350,6 +350,103 @@ def test_diagnostic_rays_isolate_invalid_attitude_from_baseline(monkeypatch) -> 
     assert diagnostics["operational"]["computation_status"] == "invalid_px4_attitude"
 
 
+def _seed_gps_matching_nominal_baseline(node: StereoDistanceNode, *, declination_deg: float = 0.0) -> None:
+    """Seed distinct, realistic left/right GPS fixes whose true-north
+    geodetic baseline matches the node's nominal camera separation (unlike
+    ``_seed_gps``, which points both cameras at the identical fixed lat/lon
+    -- a degenerate zero-length baseline that ``declination_from_gps_baseline_rad``
+    correctly rejects). ``declination_deg`` rotates the GPS baseline bearing
+    away from the nominal/design bearing, simulating a location with that
+    much true declination relative to the injected attitude bias.
+    """
+
+    wgs84_a_m = 6_378_137.0
+    lat0_deg, lon0_deg = 47.398, 8.546
+    nominal_baseline = tuple(
+        node.nominal_right_camera.center_world_enu_m[index]
+        - node.nominal_left_camera.center_world_enu_m[index]
+        for index in range(3)
+    )
+    rotation_rad = math.radians(declination_deg)
+    cos_r, sin_r = math.cos(rotation_rad), math.sin(rotation_rad)
+    east, north, up = nominal_baseline
+    rotated_east = cos_r * east - sin_r * north
+    rotated_north = sin_r * east + cos_r * north
+    dlat_deg = math.degrees(rotated_north / wgs84_a_m)
+    dlon_deg = math.degrees(rotated_east / (wgs84_a_m * math.cos(math.radians(lat0_deg))))
+    now_ns = time.monotonic_ns()
+    simulation_timestamp_ns = node.simulation_epoch.last_clock_stamp_ns
+    epoch = node.simulation_epoch.epoch
+    node.gps_baseline_fixes["left"] = (
+        RawGpsFix(
+            timestamp_us=1_000_000, latitude_deg=lat0_deg, longitude_deg=lon0_deg,
+            altitude_msl_m=0.0, eph_m=0.5, epv_m=0.5,
+        ),
+        now_ns, epoch, simulation_timestamp_ns,
+    )
+    node.gps_baseline_fixes["right"] = (
+        RawGpsFix(
+            timestamp_us=1_000_000, latitude_deg=lat0_deg + dlat_deg, longitude_deg=lon0_deg + dlon_deg,
+            altitude_msl_m=0.0, eph_m=0.5, epv_m=0.5,
+        ),
+        now_ns, epoch, simulation_timestamp_ns,
+    )
+
+
+def test_true_north_attitude_pose_selection_rejects_missing_and_stale_gps() -> None:
+    node = _node()
+    snapshot = node._camera_oracle_snapshot()
+    _seed_attitudes(node)
+
+    poses, status = node._px4_attitude_true_north_camera_poses(snapshot)
+    assert poses is None
+    assert status == "missing_left_gps_fix"
+
+    _seed_gps_matching_nominal_baseline(node)
+    poses, status = node._px4_attitude_true_north_camera_poses(snapshot)
+    assert poses is not None
+    assert status == "available"
+
+    old = time.monotonic_ns() - int((node.gps_baseline_max_age_s + 0.1) * 1.0e9)
+    left_fix, _old_ns, epoch, ts_ns = node.gps_baseline_fixes["left"]
+    node.gps_baseline_fixes["left"] = (left_fix, old, epoch, ts_ns)
+    poses, status = node._px4_attitude_true_north_camera_poses(snapshot)
+    assert poses is None
+    assert status == "stale_left_gps_fix"
+
+
+def test_declination_corrected_ray_reduces_position_error_versus_plain_attitude_ray(
+    monkeypatch,
+) -> None:
+    """The whole point of the attitude_true_north Ray: with a magnetometer
+    yaw bias present and GPS fixes implying zero true declination, the
+    GPS-baseline-corrected Ray should land much closer to Ground Truth than
+    the plain, uncorrected Attitude Ray for the identical observation."""
+
+    node = _node()
+    injected_yaw_bias_deg = 4.0
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(injected_yaw_bias_deg),
+        right_q=_yaw_q_wxyz(injected_yaw_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    monkeypatch.setattr(
+        stereo_distance_module, "gps_baseline_enu_m", lambda _left, _right: (25.0, 0.0, 0.0)
+    )
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+
+    assert diagnostics["attitude_true_north"]["computation_status"] == "computed"
+    assert diagnostics["attitude_true_north"]["valid"] is True
+    biased_error_m = _position_error(diagnostics["attitude"], expected_frd)
+    corrected_error_m = _position_error(diagnostics["attitude_true_north"], expected_frd)
+    assert biased_error_m > 1.0  # the injected bias must actually matter at this range
+    assert corrected_error_m < biased_error_m * 0.05
+
+
 def test_attitude_pose_selection_rejects_stale_skewed_and_old_epoch_samples() -> None:
     node = _node()
     snapshot = node._camera_oracle_snapshot()

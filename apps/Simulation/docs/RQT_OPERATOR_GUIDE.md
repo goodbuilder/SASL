@@ -27,9 +27,10 @@ contract, and the live parameters used by the current run.
 It also contains the recording controls: `Save CSV`, `Save MP4`, `Save Debug`,
 `Stop`, and the output directory. `Save CSV` writes telemetry; `Save MP4` adds
 left/right overlay video; `Save Debug` also adds a rosbag. While recording,
-all preset buttons and the output directory are locked. Auto itself does not
-start a recorder: these buttons remain available during Auto, and the selected
-recording starts at the button click. `Flight` contains balanced left/right camera images and direct telemetry values. `Analysis` gives the
+all preset buttons and the output directory are locked. Auto automatically
+starts its own Full recorder and stores telemetry, XLSX, compact CSVs, and both
+overlay MP4 files together with the generated path. Pressing a Save preset
+during Auto creates an additional independent operator session. `Flight` contains balanced left/right camera images and direct telemetry values. `Analysis` gives the
 Forward, Right, Down, and Range plots the whole tab. The Raw GPS baseline
 publishes F/R/D; its Range plot value is the explicit 3D vector magnitude.
 Global Baseline is displayed from the same Ray snapshot as the other diagnostic Rays.
@@ -37,15 +38,31 @@ Global Baseline is displayed from the same Ray snapshot as the other diagnostic 
 status without turning it into an automated warning or qualification result.
 Calibration recording remains a CLI workflow.
 
+All normal Simulation runtime outputs share the repository-local
+`apps/Simulation/Recordings/` root. The three Save presets create
+`operator_<timestamp>_<mode>/` sessions there, Waypoint's enabled automatic
+lite recorder creates `waypoint_<timestamp>_lite/`, and Auto creates
+`auto_<timestamp>_Full/` directly below `Recordings`. The Auto directory holds
+both its generated waypoint files and finalized Full recording artifacts.
+Mission itself creates no recorder; pressing a Save preset while Mission runs
+creates the corresponding operator session in the same root.
+
 When a mission was started from the Flight toolbar, `Stop` stops the owned
 Mission/Waypoint/Auto process group. For Auto, the mission requests PX4 `LAND`
 on interruption, and the recorder receives the same stop signal before the UI
 waits for CSV flush, MP4 release, and XLSX/compact-session finalization. The
-saved artifacts therefore contain only samples accepted from the Save button
-click through the Stop action. If no Save button was pressed, Auto produces no
-CSV or MP4 artifact.
+automatic Auto artifacts therefore contain samples from recorder startup
+through the Stop action, while any additional Save session starts at its own
+button click.
 An Auto process started separately from a terminal or from `--auto-mission` is
 not owned by this rqt control and must be stopped by its launcher/QGC path.
+Auto-generated target points are first sampled as absolute Gazebo world ENU
+`[East, North, Up]`, then converted to PX4 local NED using the configured drone
+spawn/home origin: `north=world_north-origin_north`,
+`east=world_east-origin_east`, and `down=-(world_up-origin_up)`. The mission CSV
+stores the last component as positive local `altitude_agl_m`; the MAVLink runner
+negates it when forming the NED setpoint. Changing `DRONE_SPAWN_X/Y/Z_M` is
+therefore reflected in each newly generated Auto path.
 
 `Flight` also has a `Ray Diagnostics` group below the direct
 telemetry line. It reads the existing `/stereo/ray_metrics` snapshot only; it

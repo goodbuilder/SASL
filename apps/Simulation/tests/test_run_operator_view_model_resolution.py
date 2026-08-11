@@ -10,6 +10,9 @@ def test_operator_launcher_discovers_machine_local_yolo_weights_before_bare_fall
     assert '"$ROOT_DIR/../$candidate"' in source
     assert '"$HOME/Downloads/$candidate"' in source
     assert '"$HOME/다운로드/$candidate"' in source
+    assert 'bare_fallback=""' in source
+    assert '"$INTEGRATION_ROOT/.local/legacy/Simulation/yolov8n_uav.pt"' in source
+    assert source.index('if [[ -n "$bare_fallback" ]]') > source.index("for candidate in \"$@\"")
 
 
 def test_operator_launcher_auto_selects_a_kconfiglib_capable_px4_python() -> None:
@@ -36,16 +39,36 @@ def test_mission_launcher_selects_a_pymavlink_capable_python() -> None:
     assert "-c 'import pymavlink'" in source
 
 
-def test_auto_launcher_does_not_start_recording_and_enables_fov_guard() -> None:
+def test_auto_launcher_starts_full_recording_and_enables_fov_guard() -> None:
     source = (Path(__file__).resolve().parents[1] / "run_auto.sh").read_text(encoding="utf-8")
 
     assert '"$ROOT_DIR/run_mission.sh"' in source
     assert "--fov-guard" in source
     assert "--bbox-margin-ratio" in source
     assert "--fov-detection-timeout-s" in source
-    assert "Save CSV or Save MP4 while Auto is running" in source
-    assert "operator_recorder" not in source
-    assert "--record-dir" not in source
+    assert "Recording Auto Full session to:" in source
+    assert '--px4-origin-world-east-m "${DRONE_SPAWN_X_M:-0.0}"' in source
+    assert '--px4-origin-world-north-m "${DRONE_SPAWN_Y_M:-0.0}"' in source
+    assert '--px4-origin-world-up-m "${DRONE_SPAWN_Z_M:-0.0}"' in source
+    assert '"$ROOT_DIR/Recordings/auto_$(date +%Y%m%d_%H%M%S)_Full"' in source
+    assert "stereo_ground_sim.operator_recorder" in source
+    assert "--mode full" in source
+    assert '--output-dir "$waypoints_dir"' in source
+    assert 'kill -INT -- "-$record_pid"' in source
+
+
+def test_runtime_outputs_share_recordings_root() -> None:
+    root = Path(__file__).resolve().parents[1]
+    operator_source = (root / "run_operator_view.sh").read_text(encoding="utf-8")
+    waypoint_source = (root / "run_px4_waypoint_mission.sh").read_text(encoding="utf-8")
+    panel_source = (root / "stereo_ground_sim" / "stereo_ground_sim" / "recorder_panel.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '"$ROOT_DIR/Recordings/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"' in operator_source
+    assert 'export OPERATOR_BAG_DIR="${OPERATOR_BAG_DIR:-$ROOT_DIR/Recordings}"' in operator_source
+    assert '"$ROOT_DIR/Recordings/waypoint_$(date +%Y%m%d_%H%M%S)_lite"' in waypoint_source
+    assert 'Path.cwd() / "Recordings"' in panel_source
 
 
 def test_operator_launcher_prefers_repo_local_rqt_python_sources() -> None:

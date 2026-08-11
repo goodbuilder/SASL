@@ -90,13 +90,13 @@
         <sensor name="magnetometer_sensor" type="magnetometer">
           <always_on>true</always_on>
           <update_rate>100</update_rate>
-          <!-- Per-axis magnetometer noise (Tesla stddev). Drives PX4's
+          <!-- Per-axis magnetometer noise/bias (Gauss). Drives PX4's
                EKF heading estimate for this camera's Pixhawk, which feeds
                the Attitude/Full Ray triangulation. -->
           <magnetometer>
-            <x><noise type="gaussian"><stddev>0.0001</stddev></noise></x>
-            <y><noise type="gaussian"><stddev>0.0001</stddev></noise></y>
-            <z><noise type="gaussian"><stddev>0.0001</stddev></noise></z>
+            <x><noise type="gaussian"><stddev>0.0001</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></x>
+            <y><noise type="gaussian"><stddev>0.0001</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></y>
+            <z><noise type="gaussian"><stddev>0.0001</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></z>
           </magnetometer>
         </sensor>
         <sensor name="navsat_sensor" type="navsat">
@@ -108,9 +108,9 @@
           <update_rate>250</update_rate>
           <imu>
             <angular_velocity>
-              <x><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></x>
-              <y><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></y>
-              <z><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></z>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></z>
             </angular_velocity>
             <linear_acceleration>
               <x><noise type="gaussian"><mean>0</mean><stddev>0.00637</stddev></noise></x>
@@ -197,13 +197,13 @@
         <sensor name="magnetometer_sensor" type="magnetometer">
           <always_on>true</always_on>
           <update_rate>100</update_rate>
-          <!-- Per-axis magnetometer noise (Tesla stddev). Drives PX4's
+          <!-- Per-axis magnetometer noise/bias (Gauss). Drives PX4's
                EKF heading estimate for this camera's Pixhawk, which feeds
                the Attitude/Full Ray triangulation. -->
           <magnetometer>
-            <x><noise type="gaussian"><stddev>0.0001</stddev></noise></x>
-            <y><noise type="gaussian"><stddev>0.0001</stddev></noise></y>
-            <z><noise type="gaussian"><stddev>0.0001</stddev></noise></z>
+            <x><noise type="gaussian"><stddev>0.0001</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></x>
+            <y><noise type="gaussian"><stddev>0.0001</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></y>
+            <z><noise type="gaussian"><stddev>0.0001</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></z>
           </magnetometer>
         </sensor>
         <sensor name="navsat_sensor" type="navsat">
@@ -215,9 +215,9 @@
           <update_rate>250</update_rate>
           <imu>
             <angular_velocity>
-              <x><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></x>
-              <y><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></y>
-              <z><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev></noise></z>
+              <x><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></x>
+              <y><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></y>
+              <z><noise type="gaussian"><mean>0</mean><stddev>0.0008726646</stddev><bias_mean>0</bias_mean><bias_stddev>0</bias_stddev></noise></z>
             </angular_velocity>
             <linear_acceleration>
               <x><noise type="gaussian"><mean>0</mean><stddev>0.00637</stddev></noise></x>

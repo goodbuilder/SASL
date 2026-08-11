@@ -2,8 +2,10 @@
 
 `4090_camera_px4` is a copy of PX4-Autopilot's stock
 `ROMFS/px4fmu_common/init.d-posix/airframes/4001_gz_x500` (the target drone's
-airframe, `PX4_SYS_AUTOSTART=4001`), with one addition:
-`param set-default EKF2_MAG_TYPE 1`.
+airframe, `PX4_SYS_AUTOSTART=4001`), with two additions:
+`param set-default EKF2_MAG_TYPE 1`, and a `mavlink start`/`mavlink stream`
+pair that pushes this camera's ATTITUDE to the operator rqt panel (see
+"Operator MAVLink ATTITUDE diagnostics link" below).
 
 ## Why a separate file
 
@@ -25,6 +27,28 @@ Rather than branching on `$px4_instance` inside the target drone's own
 `PX4_SYS_AUTOSTART=4090` airframe instead, so the target drone (which does
 maneuver, and could legitimately benefit from hard-iron bias learning) stays
 on `Automatic` unmodified.
+
+## Operator MAVLink ATTITUDE diagnostics link
+
+`operator_panel.py`'s Sensors tab shows a "MAVLink ATTITUDE (raw)" row next
+to "Published VehicleAttitude (actual)" as an independent cross-check
+(`Δyaw ROS2-MAVLink`): one path reads the ROS2 `VehicleAttitude` topic, the
+other reads a raw MAVLink `ATTITUDE` message, so a bug specific to either
+path is visible as a nonzero delta instead of silently agreeing with itself.
+That raw stream previously never arrived: PX4-Autopilot's own
+`px4-rc.mavlink` only opens per-instance GCS/offboard/onboard links on ports
+that are each a function of `$px4_instance` (e.g. `18570+instance`,
+`14580+instance`), never the fixed `udpin:0.0.0.0:14551` the panel's
+`MavlinkAttitudeReader` listens on.
+
+This file adds one more `mavlink start` instance, on a local port
+(`14650+$px4_instance`, distinct from `px4-rc.mavlink`'s own port
+allocations) that pushes to remote port `14551` -- the same port for both
+camera instances, since UDP happily accepts multiple senders on one
+receiving port and `MAV_SYS_ID` (set to `$px4_instance+1` by `rcS`: left=2,
+right=3) is exactly how the panel's `MAVLINK_ATTITUDE_SIDE_BY_SYSID` already
+tells them apart. `mavlink stream -s ATTITUDE` then requests just that one
+message at 50 Hz, instead of a full stream-mode preset.
 
 ## What this does *not* do
 
