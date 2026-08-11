@@ -458,6 +458,21 @@ class GroundTruthPositionBuffer:
         self.reset_count += 1
         return dropped
 
+    def clear(self) -> int:
+        """Drop all buffered GT history without changing the active epoch.
+
+        Used when the target's position changes discontinuously within the
+        same simulation epoch (e.g. a respawn/teleport that does not reset
+        ``/clock``), so a subsequent sample cannot be linearly interpolated
+        against stale pre-teleport history.
+        """
+
+        dropped = len(self._records)
+        self._records.clear()
+        self._last_stamp_ns = None
+        self.reset_count += 1
+        return dropped
+
     def align(self, pair_stamp_ns: int, epoch: int, *, allow_nearest: bool = False) -> GroundTruthAlignment:
         if int(epoch) != self.epoch or not self._records:
             return self._unavailable()

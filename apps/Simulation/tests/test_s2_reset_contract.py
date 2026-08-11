@@ -44,6 +44,27 @@ def test_gt_reset_is_externally_driven_and_rejects_old_pair_epoch() -> None:
     assert buffer.align(10, 1).position_world_enu_m == (2.0, 0.0, 0.0)
 
 
+def test_gt_buffer_clear_drops_history_without_moving_the_epoch() -> None:
+    """A same-epoch respawn must not shift the active epoch (unlike
+    ``reset_for_epoch``) but must still drop all prior position history, so
+    a subsequent sample cannot be interpolated across the teleport gap."""
+
+    buffer = GroundTruthPositionBuffer()
+    buffer.add(100, (1.0, 0.0, 0.0), Q)
+    buffer.add(200, (2.0, 0.0, 0.0), Q)
+
+    dropped = buffer.clear()
+
+    assert dropped == 2
+    assert buffer.epoch == 0
+    assert buffer.latest_stamp_ns is None
+    assert buffer.align(150, 0).gt_alignment_mode == "unavailable"
+    # A lower timestamp than the pre-clear history no longer raises -- the
+    # monotonic-stamp guard was reset along with the history.
+    buffer.add(50, (9.0, 0.0, 0.0), Q, epoch=0)
+    assert buffer.latest_stamp_ns == 50
+
+
 def test_image_reset_can_clear_pending_gt_pairs() -> None:
     buffer = GroundTruthPositionBuffer()
     aligner = PendingPairGroundTruthAligner(buffer)

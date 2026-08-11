@@ -53,6 +53,7 @@ TERMINAL_STATUSES = frozenset(
         "ideal_projection_rejected",
         "old_epoch_result_discarded",
         "simulation_reset_discarded",
+        "target_respawned_discarded",
         "shutdown_discarded",
     }
 )

@@ -24,6 +24,8 @@ from stereo_ground_sim.time_alignment import PendingGroundTruthRecord
 PAIR_GROUND_TRUTH_ROUTING_METHODS = [
     "_clock_cb",
     "_reset_for_simulation_epoch_locked",
+    "_reset_ground_truth_pipeline_locked",
+    "_reset_ground_truth_after_respawn_locked",
     "_capture_operational_sources_locked",
     "_ensure_pose_source_provider_locked",
     "_register_measurement_pairs_locked",
@@ -64,11 +66,33 @@ class PairGroundTruthCoordinator:
                 self.node._drain_future_ground_truth_locked(stamp_ns)
 
     def _reset_for_simulation_epoch_locked(self, epoch, reset_stamp_ns=None):
-        self.node._ensure_gt_evaluation_state_locked()
         self.node.observed_left_camera = None
         self.node.observed_right_camera = None
         self.node.camera_oracle_pair = (None, None)
         self.node.last_camera_oracle_rejection_reason = "simulation_epoch_reset"
+        dropped = self.node.image_pairer.reset_for_epoch(epoch)
+        dropped += self.node._reset_ground_truth_pipeline_locked(
+            reset_stamp_ns,
+            terminal_status="simulation_reset_discarded",
+            terminal_reason="simulation_clock_reset",
+        )
+        self.node.gt_position_buffer.reset_for_epoch(epoch)
+        self.node.old_epoch_frame_count += dropped
+
+    def _reset_ground_truth_pipeline_locked(self, reset_stamp_ns, *, terminal_status, terminal_reason):
+        """Tear down in-flight pair/measurement/GT-alignment state at a
+        position-discontinuity boundary and engage the GT quarantine.
+
+        Shared by a full simulation-epoch reset (``/clock`` decrease) and a
+        same-epoch target respawn -- both invalidate any GT alignment
+        currently in flight, since the target's true position immediately
+        before versus after the boundary cannot be linearly interpolated
+        across. Does not touch ``image_pairer`` or the camera oracle, which
+        are unaffected by a target-only discontinuity; callers that need
+        those reset (a real epoch change) do so separately.
+        """
+
+        self.node._ensure_gt_evaluation_state_locked()
         pending_pairs = tuple(self.node.pairs_by_pair_id.values())
         discarded_pending = sum(
             pair.pair_id not in self.node.measurement_results_by_pair_id
@@ -78,8 +102,8 @@ class PairGroundTruthCoordinator:
         for pair in pending_pairs:
             self.node._submit_research_terminal_locked(
                 pair,
-                terminal_status="simulation_reset_discarded",
-                terminal_reason="simulation_clock_reset",
+                terminal_status=terminal_status,
+                terminal_reason=terminal_reason,
                 measurement_status=(
                     "processed"
                     if pair.pair_id in self.node.measurement_results_by_pair_id
@@ -89,8 +113,7 @@ class PairGroundTruthCoordinator:
                 metrics=self.node.measurement_results_by_pair_id.get(pair.pair_id),
                 alignment=self.node.gt_alignments_by_pair_id.get(pair.pair_id),
             )
-        dropped = self.node.image_pairer.reset_for_epoch(epoch)
-        dropped += self.node.pending_gt_aligner.clear()
+        dropped = self.node.pending_gt_aligner.clear()
         dropped += len(self.node.measurement_pair_queue)
         dropped += len(self.node.gt_alignment_ready_queue)
         self.node.measurement_pair_queue.clear()
@@ -98,7 +121,6 @@ class PairGroundTruthCoordinator:
         self.node.rviz_live_latest_pair = None
         self.node.rviz_live_latest_result = None
         self.node.rviz_live_latest_processed_pair_id = 0
-        self.node.gt_position_buffer.reset_for_epoch(epoch)
         if reset_stamp_ns is None:
             reset_stamp_ns = self.node.simulation_epoch.last_clock_stamp_ns
         reset_stamp_ns = 0 if reset_stamp_ns is None else int(reset_stamp_ns)
@@ -118,7 +140,28 @@ class PairGroundTruthCoordinator:
         self.node.cached_ground_truth_position = None
         self.node.cached_actual_distance = None
         self.node.ground_truth_stamp_ns = None
-        self.node.old_epoch_frame_count += dropped
+        return dropped
+
+    def _reset_ground_truth_after_respawn_locked(self):
+        """Discard in-flight GT alignment state after a same-epoch respawn.
+
+        ``/stereo/respawn_drone`` teleports the target model via Gazebo's
+        ``set_pose`` without a ``/clock`` reset, so
+        ``_reset_for_simulation_epoch_locked`` never fires and none of its
+        GT-discontinuity protection applies. Without this, the Ground Truth
+        position buffer would linearly interpolate straight across the
+        teleport instant for any in-flight pair, and the Ideal Ray -- a raw,
+        unfiltered re-triangulation of that GT alignment -- would visibly
+        sweep from the old position to the new one across the pairs
+        straddling the boundary.
+        """
+
+        self.node._reset_ground_truth_pipeline_locked(
+            self.node.simulation_epoch.last_clock_stamp_ns,
+            terminal_status="target_respawned_discarded",
+            terminal_reason="target_drone_respawned",
+        )
+        self.node.gt_position_buffer.clear()
 
     def _capture_operational_sources_locked(self):
         """Freeze the sensor values available when an image pair is accepted.

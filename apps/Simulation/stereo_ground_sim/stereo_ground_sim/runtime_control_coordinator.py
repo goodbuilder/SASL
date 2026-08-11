@@ -425,6 +425,8 @@ class RuntimeControlCoordinator:
             self.node.target_spawn_yaw_deg,
         )
         if success:
+            with self.node.yolo_condition:
+                self.node._reset_ground_truth_after_respawn_locked()
             self.node.start_time = time.monotonic()
             self.node.last_gazebo_velocity_update = 0.0
             self.node._ensure_gazebo_target_controller().last_command_monotonic_s = 0.0

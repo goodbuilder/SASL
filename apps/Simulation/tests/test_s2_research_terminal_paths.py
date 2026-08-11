@@ -5,6 +5,7 @@ import sys
 import threading
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -351,6 +352,89 @@ def test_old_epoch_and_reset_pending_pairs_do_not_duplicate_terminal_records() -
     }
     assert node.accepted_pair_discard_count == 1
     assert node.measurement_processed_count + node.accepted_pair_discard_count == 2
+
+
+def test_respawn_reset_discards_pending_pairs_without_moving_epoch() -> None:
+    """/stereo/respawn_drone teleports the target without a /clock reset, so
+    this must tear down in-flight GT alignment state (same as a real epoch
+    reset) but must NOT advance the simulation epoch or touch image pairing
+    -- those are unrelated to a target-only position discontinuity."""
+
+    node = _node()
+    pending = _pair(pair_id=5, epoch=0)
+    processed = _pair(pair_id=6, epoch=0)
+    node.measurement_accepted_count = 2
+    node.measurement_processed_count = 1
+    node.pairs_by_pair_id = {5: pending, 6: processed}
+    node.measurement_results_by_pair_id[6] = _metrics(processed)
+    node.gt_position_buffer.add(50, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), epoch=0)
+    epoch_before = node.simulation_epoch.epoch
+
+    with node.yolo_condition:
+        node._reset_ground_truth_after_respawn_locked()
+
+    assert len(node.research_recorder.records) == 2
+    assert {record["terminal_status"] for record in node.research_recorder.records} == {
+        "target_respawned_discarded"
+    }
+    assert node.accepted_pair_discard_count == 1
+    assert node.simulation_epoch.epoch == epoch_before
+    assert node.image_pairer.image_reset_count == 0
+    # Pre-teleport GT history is gone, so a later sample cannot be linearly
+    # interpolated across the teleport gap.
+    assert node.gt_position_buffer.latest_stamp_ns is None
+    assert node.gt_quarantine_active is True
+
+
+def test_respawn_service_resets_gt_pipeline_on_successful_teleport(monkeypatch) -> None:
+    node = _node()
+    node.target_model_name = "x500_15m"
+    node.target_spawn_x_m = 1.0
+    node.target_spawn_y_m = 2.0
+    node.target_spawn_z_m = 3.0
+    node.target_spawn_yaw_deg = 45.0
+    node.last_gazebo_velocity_update = 5.0
+    pending = _pair(pair_id=7, epoch=0)
+    node.pairs_by_pair_id = {7: pending}
+    node.gt_position_buffer.add(50, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), epoch=0)
+    monkeypatch.setattr(node, "_set_gazebo_target_pose", lambda *_args: True)
+    response = SimpleNamespace(success=None, message=None)
+
+    result = node._respawn_drone_service(None, response)
+
+    assert result.success is True
+    assert "Respawned" in result.message
+    assert node.last_gazebo_velocity_update == 0.0
+    # The teleport must tear down in-flight GT alignment state exactly like
+    # _reset_ground_truth_after_respawn_locked does on its own.
+    assert node.gt_position_buffer.latest_stamp_ns is None
+    assert node.gt_quarantine_active is True
+    assert {record["terminal_status"] for record in node.research_recorder.records} == {
+        "target_respawned_discarded"
+    }
+
+
+def test_respawn_service_does_not_reset_gt_pipeline_on_failed_teleport(monkeypatch) -> None:
+    node = _node()
+    node.target_model_name = "x500_15m"
+    node.target_spawn_x_m = 1.0
+    node.target_spawn_y_m = 2.0
+    node.target_spawn_z_m = 3.0
+    node.target_spawn_yaw_deg = 45.0
+    node.last_gazebo_velocity_update = 5.0
+    node.gt_position_buffer.add(50, (1.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), epoch=0)
+    monkeypatch.setattr(node, "_set_gazebo_target_pose", lambda *_args: False)
+    response = SimpleNamespace(success=None, message=None)
+
+    result = node._respawn_drone_service(None, response)
+
+    assert result.success is False
+    assert node.last_gazebo_velocity_update == 5.0
+    # A failed Gazebo set_pose call is not a real teleport -- GT state must
+    # be left untouched.
+    assert node.gt_position_buffer.latest_stamp_ns == 50
+    assert node.gt_quarantine_active is False
+    assert node.research_recorder.records == []
 
 
 def test_shutdown_timeout_records_every_remaining_accepted_pair(monkeypatch) -> None:
