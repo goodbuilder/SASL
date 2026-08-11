@@ -209,6 +209,11 @@ PAIR_RECORD_COLUMNS = (
     # PX4 body attitude; the parameter names are cam_*_px4_attitude_*.
     "cam_l_px4_roll_deg", "cam_l_px4_pitch_deg", "cam_l_px4_yaw_deg",
     "cam_r_px4_roll_deg", "cam_r_px4_pitch_deg", "cam_r_px4_yaw_deg",
+    # Rig calibration constant for the attitude_true_north Ray (see
+    # gps_baseline.py) -- echoed here like every other cam_*_attitude_*
+    # parameter by build_terminal_record()'s generic
+    # _attitude_parameter_names() loop; no legacy alias needed.
+    "cam_l_gnss_baseline_to_forward_yaw_deg", "cam_r_gnss_baseline_to_forward_yaw_deg",
     "common_optical_roll_error_deg", "relative_optical_roll_error_deg",
     "common_optical_pitch_error_deg", "relative_optical_pitch_error_deg",
     "common_optical_yaw_error_deg", "relative_optical_yaw_error_deg",

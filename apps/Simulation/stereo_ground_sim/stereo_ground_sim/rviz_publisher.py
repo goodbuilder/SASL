@@ -394,9 +394,10 @@ class RvizVisualizationPublisher:
                 attitude_true_north,
                 label="attitude_true_north",
                 marker_id=90,
-                # Green-cyan denotes PX4 attitude with a live GPS-baseline
-                # declination correction applied (see gps_baseline.py
-                # declination_from_gps_baseline_rad).
+                # Green-cyan denotes PX4 attitude with a live, per-camera
+                # GPS-baseline True-North yaw correction applied (see
+                # gps_baseline.py gps_baseline_bearing_rad /
+                # true_north_yaw_correction_rad).
                 left_color=(0.0, 0.85, 0.4),
                 right_color=(0.0, 0.85, 0.4),
                 gap_color=(0.45, 0.95, 0.7),

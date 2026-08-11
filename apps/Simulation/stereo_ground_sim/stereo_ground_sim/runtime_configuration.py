@@ -79,6 +79,8 @@ class RuntimeConfigurationCoordinator:
             "cam_r_px4_attitude_roll_deg",
             "cam_r_px4_attitude_pitch_deg",
             "cam_r_px4_attitude_yaw_deg",
+            "cam_l_gnss_baseline_to_forward_yaw_deg",
+            "cam_r_gnss_baseline_to_forward_yaw_deg",
             "common_optical_roll_error_deg",
             "relative_optical_roll_error_deg",
             "common_optical_pitch_error_deg",

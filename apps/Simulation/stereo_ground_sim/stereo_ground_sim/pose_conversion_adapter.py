@@ -17,9 +17,10 @@ from stereo_ground_sim.coordinate_frames import (
     relative_rotation_angle_deg,
 )
 from stereo_ground_sim.gps_baseline import (
-    declination_from_gps_baseline_rad,
+    gps_baseline_bearing_rad,
     gps_relative_enu_m,
     norm_m,
+    true_north_yaw_correction_rad,
 )
 from stereo_ground_sim.pose_source_provider import Px4AttitudeSample
 
@@ -70,7 +71,8 @@ class PoseConversionAdapter:
         include_provenance=False,
         operational_snapshot=None,
         observation_timestamp_ns=None,
-        declination_correction_rad=0.0,
+        left_true_north_yaw_correction_rad=0.0,
+        right_true_north_yaw_correction_rad=0.0,
     ):
         def finish(poses, status, provenance):
             return (
@@ -194,12 +196,12 @@ class PoseConversionAdapter:
                 camera_optical_pose_from_px4_attitude_wxyz(
                     left_pose.center_world_enu_m,
                     left_sample.quaternion_wxyz,
-                    declination_correction_rad=declination_correction_rad,
+                    declination_correction_rad=left_true_north_yaw_correction_rad,
                 ),
                 camera_optical_pose_from_px4_attitude_wxyz(
                     right_pose.center_world_enu_m,
                     right_sample.quaternion_wxyz,
-                    declination_correction_rad=declination_correction_rad,
+                    declination_correction_rad=right_true_north_yaw_correction_rad,
                 ),
             )
         except ValueError:
@@ -224,15 +226,21 @@ class PoseConversionAdapter:
         operational_snapshot=None,
         observation_timestamp_ns=None,
     ):
-        """Attitude-ray poses with a live GPS-baseline declination correction.
+        """Attitude-ray poses with a live GPS-baseline True-North yaw correction.
 
-        Estimates local magnetic declination in-situ from the existing
-        left/right camera GPS baseline (see ``declination_from_gps_baseline_rad``)
-        and applies it to the same PX4 VehicleAttitude pipeline used by the
-        plain Attitude ray, so this Ray reflects a true-north-referenced
-        heading instead of the magnetometer's uncorrected one. Fails closed
-        (returns ``None`` poses) if GPS is unavailable/stale or the
-        declination estimate is degenerate -- it never silently falls back
+        Computes a True-North horizontal bearing from the existing left/right
+        camera GPS baseline (magnetism-free geodesy, see
+        ``gps_baseline_bearing_rad``), then independently corrects EACH
+        camera's own PX4-attitude yaw to match that bearing plus its own
+        known rig-calibration offset (``CAM_L/R_GNSS_BASELINE_TO_FORWARD_YAW_DEG``,
+        see ``true_north_yaw_correction_rad``). Left and right corrections are
+        computed and applied independently -- NOT a single shared value -- so
+        this also resolves any differential (left-vs-right) yaw error between
+        the two independent PX4 EKF instances, not just their common offset
+        from true north. PX4's own roll/pitch (tilt) are left untouched; only
+        yaw is corrected, and always as a world-frame (NED Z) pre-multiply.
+        Fails closed (returns ``None`` poses) if GPS is unavailable/stale or
+        either camera's heading is undefined -- it never silently falls back
         to an uncorrected pose.
         """
 
@@ -295,34 +303,61 @@ class PoseConversionAdapter:
         if right_age_ms > self.node.gps_baseline_max_age_s * 1_000.0:
             return finish(None, "stale_right_gps_fix", provenance)
 
-        nominal_baseline = tuple(
-            self.node.nominal_right_camera.center_world_enu_m[index]
-            - self.node.nominal_left_camera.center_world_enu_m[index]
-            for index in range(3)
+        bearing_rad = gps_baseline_bearing_rad(left_fix, right_fix)
+        if bearing_rad is None:
+            return finish(None, "gps_baseline_bearing_unavailable", provenance)
+        provenance["gps_baseline_bearing_deg"] = math.degrees(bearing_rad)
+
+        left_offset_deg = float(self.node.cam_l_gnss_baseline_to_forward_yaw_deg)
+        right_offset_deg = float(self.node.cam_r_gnss_baseline_to_forward_yaw_deg)
+        provenance["left_baseline_to_forward_yaw_deg"] = left_offset_deg
+        provenance["right_baseline_to_forward_yaw_deg"] = right_offset_deg
+        provenance["left_expected_true_north_heading_deg"] = math.degrees(bearing_rad) + left_offset_deg
+        provenance["right_expected_true_north_heading_deg"] = math.degrees(bearing_rad) + right_offset_deg
+        provenance["left_px4_forward_heading_deg"] = math.degrees(
+            math.atan2(uncorrected_poses[0].forward_world_enu[0], uncorrected_poses[0].forward_world_enu[1])
         )
-        declination_rad = declination_from_gps_baseline_rad(
-            left_fix,
-            right_fix,
-            nominal_baseline,
-            self.node.nominal_left_camera,
-            uncorrected_poses[0],
+        provenance["right_px4_forward_heading_deg"] = math.degrees(
+            math.atan2(uncorrected_poses[1].forward_world_enu[0], uncorrected_poses[1].forward_world_enu[1])
         )
-        if declination_rad is None:
-            return finish(None, "declination_estimate_unavailable", provenance)
-        provenance["declination_correction_deg"] = math.degrees(declination_rad)
+
+        yaw_correction_rad_left = true_north_yaw_correction_rad(
+            bearing_rad,
+            math.radians(left_offset_deg),
+            uncorrected_poses[0].forward_world_enu,
+        )
+        yaw_correction_rad_right = true_north_yaw_correction_rad(
+            bearing_rad,
+            math.radians(right_offset_deg),
+            uncorrected_poses[1].forward_world_enu,
+        )
+        if yaw_correction_rad_left is None:
+            return finish(None, "left_true_north_heading_undefined", provenance)
+        if yaw_correction_rad_right is None:
+            return finish(None, "right_true_north_heading_undefined", provenance)
+        provenance["left_true_north_yaw_correction_deg"] = math.degrees(yaw_correction_rad_left)
+        provenance["right_true_north_yaw_correction_deg"] = math.degrees(yaw_correction_rad_right)
+        provenance["common_yaw_correction_deg"] = (
+            math.degrees(yaw_correction_rad_left) + math.degrees(yaw_correction_rad_right)
+        ) / 2.0
+        differential_yaw_correction_rad = yaw_correction_rad_right - yaw_correction_rad_left
+        differential_yaw_correction_rad = (
+            (differential_yaw_correction_rad + math.pi) % (2.0 * math.pi)
+        ) - math.pi
+        provenance["differential_yaw_correction_deg"] = math.degrees(differential_yaw_correction_rad)
 
         corrected_poses, corrected_status, corrected_provenance = self._px4_attitude_camera_poses(
             camera_sources,
             include_provenance=True,
             operational_snapshot=operational_snapshot,
             observation_timestamp_ns=observation_timestamp_ns,
-            declination_correction_rad=declination_rad,
+            left_true_north_yaw_correction_rad=yaw_correction_rad_left,
+            right_true_north_yaw_correction_rad=yaw_correction_rad_right,
         )
         if corrected_poses is None:
             return finish(None, corrected_status, provenance)
         provenance.update(corrected_provenance)
-        provenance["camera_orientation_source"] = "px4_vehicle_attitude_declination_corrected"
-        provenance["declination_correction_deg"] = math.degrees(declination_rad)
+        provenance["camera_orientation_source"] = "px4_vehicle_attitude_true_north_corrected"
         return finish(corrected_poses, "available", provenance)
 
     @staticmethod

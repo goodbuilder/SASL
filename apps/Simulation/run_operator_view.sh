@@ -63,6 +63,7 @@ SIM_EXPLICIT_NAMES=(
   CAM_R_OPTICAL_ROLL_DEG CAM_R_OPTICAL_PITCH_DEG CAM_R_OPTICAL_YAW_DEG
   CAM_L_PX4_ATTITUDE_ROLL_DEG CAM_L_PX4_ATTITUDE_PITCH_DEG CAM_L_PX4_ATTITUDE_YAW_DEG
   CAM_R_PX4_ATTITUDE_ROLL_DEG CAM_R_PX4_ATTITUDE_PITCH_DEG CAM_R_PX4_ATTITUDE_YAW_DEG
+  CAM_L_GNSS_BASELINE_TO_FORWARD_YAW_DEG CAM_R_GNSS_BASELINE_TO_FORWARD_YAW_DEG
   CAM_L_PX4_MODEL_NAME CAM_R_PX4_MODEL_NAME CAM_L_PX4_INSTANCE CAM_R_PX4_INSTANCE
   CAM_L_PX4_DDS_NAMESPACE CAM_R_PX4_DDS_NAMESPACE
   PX4_REQUIRED_VERSION
@@ -1093,6 +1094,8 @@ add_default_launch_arg cam_l_px4_attitude_yaw_deg "${CAM_L_PX4_ATTITUDE_YAW_DEG:
 add_default_launch_arg cam_r_px4_attitude_roll_deg "${CAM_R_PX4_ATTITUDE_ROLL_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg cam_r_px4_attitude_pitch_deg "${CAM_R_PX4_ATTITUDE_PITCH_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg cam_r_px4_attitude_yaw_deg "${CAM_R_PX4_ATTITUDE_YAW_DEG:-0.0}" "${launch_input[@]}"
+add_default_launch_arg cam_l_gnss_baseline_to_forward_yaw_deg "${CAM_L_GNSS_BASELINE_TO_FORWARD_YAW_DEG:--90.0}" "${launch_input[@]}"
+add_default_launch_arg cam_r_gnss_baseline_to_forward_yaw_deg "${CAM_R_GNSS_BASELINE_TO_FORWARD_YAW_DEG:--90.0}" "${launch_input[@]}"
 add_default_launch_arg common_optical_roll_error_deg "${COMMON_OPTICAL_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg relative_optical_roll_error_deg "${RELATIVE_OPTICAL_ROLL_ERROR_DEG:-0.0}" "${launch_input[@]}"
 add_default_launch_arg common_optical_pitch_error_deg "${COMMON_OPTICAL_PITCH_ERROR_DEG:-0.0}" "${launch_input[@]}"

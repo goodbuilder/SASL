@@ -49,6 +49,12 @@ def _node() -> StereoDistanceNode:
     node.gps_baseline_max_age_s = 2.5
     node.gps_baseline_fixes = {"left": None, "right": None, "uam": None}
     node.global_baseline_fixes = {"left": None, "right": None}
+    # nominal_camera_poses() gives both cameras yaw=pi/2 (ENU) with the
+    # baseline along body Right -- Forward sits 90 deg CCW of the baseline
+    # bearing, hence -90.0 for both sides (verified against the actual
+    # geometry, not assumed).
+    node.cam_l_gnss_baseline_to_forward_yaw_deg = -90.0
+    node.cam_r_gnss_baseline_to_forward_yaw_deg = -90.0
     node._ensure_camera_frames()
     seed_observed_camera_oracle(node, left_pose=node.nominal_left_camera, right_pose=node.nominal_right_camera)
     return node
@@ -354,7 +360,7 @@ def _seed_gps_matching_nominal_baseline(node: StereoDistanceNode, *, declination
     """Seed distinct, realistic left/right GPS fixes whose true-north
     geodetic baseline matches the node's nominal camera separation (unlike
     ``_seed_gps``, which points both cameras at the identical fixed lat/lon
-    -- a degenerate zero-length baseline that ``declination_from_gps_baseline_rad``
+    -- a degenerate zero-length baseline that ``gps_baseline_bearing_rad``
     correctly rejects). ``declination_deg`` rotates the GPS baseline bearing
     away from the nominal/design bearing, simulating a location with that
     much true declination relative to the injected attitude bias.
@@ -415,36 +421,163 @@ def test_true_north_attitude_pose_selection_rejects_missing_and_stale_gps() -> N
     assert status == "stale_left_gps_fix"
 
 
-def test_declination_corrected_ray_reduces_position_error_versus_plain_attitude_ray(
-    monkeypatch,
-) -> None:
-    """The whole point of the attitude_true_north Ray: with a magnetometer
-    yaw bias present and GPS fixes implying zero true declination, the
-    GPS-baseline-corrected Ray should land much closer to Ground Truth than
-    the plain, uncorrected Attitude Ray for the identical observation."""
+def _pitch_yaw_q_wxyz(pitch_deg: float, yaw_deg: float) -> tuple[float, float, float, float]:
+    """Body-FRD (roll=0) quaternion for a given pitch+yaw, ZYX Euler order
+    (R = Rz(yaw) @ Ry(pitch)), verified to reduce exactly to ``_yaw_q_wxyz``
+    when pitch=0 and to produce the expected nonzero vertical component when
+    yaw=0."""
 
+    half_pitch, half_yaw = math.radians(pitch_deg) / 2.0, math.radians(yaw_deg) / 2.0
+    cos_p, sin_p = math.cos(half_pitch), math.sin(half_pitch)
+    cos_y, sin_y = math.cos(half_yaw), math.sin(half_yaw)
+    return (cos_p * cos_y, -sin_p * sin_y, sin_p * cos_y, cos_p * sin_y)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: per-camera GNSS True-North yaw correction (tests A-E)
+# ---------------------------------------------------------------------------
+
+
+def test_true_north_correction_a_zero_error_stays_near_zero_and_does_not_degrade() -> None:
     node = _node()
-    injected_yaw_bias_deg = 4.0
-    _seed_attitudes(
-        node,
-        left_q=_yaw_q_wxyz(injected_yaw_bias_deg),
-        right_q=_yaw_q_wxyz(injected_yaw_bias_deg),
-    )
+    _seed_attitudes(node)  # identity quaternion on both sides -- no injected bias
     _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
-    monkeypatch.setattr(
-        stereo_distance_module, "gps_baseline_enu_m", lambda _left, _right: (25.0, 0.0, 0.0)
-    )
     expected_frd = (900.0, 3.0, -2.0)
     pixels = _observed_pixels_for_baseline_point(node, expected_frd)
 
     diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    corrected = diagnostics["attitude_true_north"]
 
-    assert diagnostics["attitude_true_north"]["computation_status"] == "computed"
-    assert diagnostics["attitude_true_north"]["valid"] is True
-    biased_error_m = _position_error(diagnostics["attitude"], expected_frd)
-    corrected_error_m = _position_error(diagnostics["attitude_true_north"], expected_frd)
-    assert biased_error_m > 1.0  # the injected bias must actually matter at this range
-    assert corrected_error_m < biased_error_m * 0.05
+    assert corrected["computation_status"] == "computed"
+    assert corrected["valid"] is True
+    assert abs(corrected["left_true_north_yaw_correction_deg"]) < 1.0e-2
+    assert abs(corrected["right_true_north_yaw_correction_deg"]) < 1.0e-2
+    assert abs(corrected["differential_yaw_correction_deg"]) < 1.0e-2
+    # A near-zero correction from the (flat-Earth-approximated) synthetic GPS
+    # fixture introduces a tiny (sub-cm at this range) residual -- assert the
+    # corrected ray stays accurate in absolute terms, not exactly as perfect
+    # as the deliberately zero-bias uncorrected ray.
+    assert _position_error(corrected, expected_frd) < 0.05
+
+
+def test_true_north_correction_b_common_bias_is_recovered_and_right_error_improves() -> None:
+    node = _node()
+    injected_bias_deg = 0.30
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(injected_bias_deg),
+        right_q=_yaw_q_wxyz(injected_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    corrected = diagnostics["attitude_true_north"]
+
+    assert abs(corrected["left_true_north_yaw_correction_deg"] - (-injected_bias_deg)) < 1.0e-2
+    assert abs(corrected["right_true_north_yaw_correction_deg"] - (-injected_bias_deg)) < 1.0e-2
+    assert abs(corrected["differential_yaw_correction_deg"]) < 1.0e-2
+    biased_right_error = abs(diagnostics["attitude"]["right_m"] - expected_frd[1])
+    corrected_right_error = abs(corrected["right_m"] - expected_frd[1])
+    assert corrected_right_error < biased_right_error * 0.1
+
+
+def test_true_north_correction_c_differential_bias_restores_intersection_angle_and_forward_error() -> None:
+    """The core Phase-2 regression test: Phase 1's shared correction cannot
+    fix a DIFFERENTIAL left/right bias (it collapses the ray intersection
+    angle, which blows up Forward/Range error even after the common offset
+    is corrected) -- this asserts the per-camera correction does fix it."""
+
+    node = _node()
+    left_bias_deg, right_bias_deg = 0.30, -0.30
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(left_bias_deg),
+        right_q=_yaw_q_wxyz(right_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    corrected = diagnostics["attitude_true_north"]
+    biased = diagnostics["attitude"]
+    nominal_raw = node._triangulate_pixel_centers(*pixels, 1280, 720)
+
+    # Corrections recover the injected left/right asymmetry independently.
+    assert abs(corrected["left_true_north_yaw_correction_deg"] - (-left_bias_deg)) < 1.0e-2
+    assert abs(corrected["right_true_north_yaw_correction_deg"] - (-right_bias_deg)) < 1.0e-2
+
+    # The degenerate (differential-bias) case: uncorrected intersection angle
+    # must actually be far from the healthy/nominal one, or this test proves
+    # nothing.
+    assert abs(biased["intersection_angle_deg"] - nominal_raw["intersection_angle_deg"]) > 0.05
+
+    # Core assertion: the per-camera-corrected ray's intersection angle is
+    # close to the bias-free nominal reference, not to the degenerate biased
+    # one.
+    assert abs(corrected["intersection_angle_deg"] - nominal_raw["intersection_angle_deg"]) < 0.01
+
+    # Forward/range error shrinks accordingly.
+    biased_forward_error = abs(biased["forward_m"] - expected_frd[0])
+    corrected_forward_error = abs(corrected["forward_m"] - expected_frd[0])
+    assert corrected_forward_error < biased_forward_error * 0.1
+
+
+def test_true_north_correction_d_preserves_px4_pitch_tilt() -> None:
+    """Yaw correction must never touch tilt: the corrected pose's Forward
+    vector elevation (vertical component) must match the uncorrected one,
+    even with differential yaw bias present alongside a common pitch bias."""
+
+    node = _node()
+    pitch_deg = 2.0
+    left_yaw_bias_deg, right_yaw_bias_deg = 0.30, -0.30
+    _seed_attitudes(
+        node,
+        left_q=_pitch_yaw_q_wxyz(pitch_deg, left_yaw_bias_deg),
+        right_q=_pitch_yaw_q_wxyz(pitch_deg, right_yaw_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    snapshot = node._camera_oracle_snapshot()
+
+    uncorrected_poses, _status = node._px4_attitude_camera_poses(snapshot)
+    corrected_poses, status = node._px4_attitude_true_north_camera_poses(snapshot)
+    assert status == "available"
+
+    for side_index in (0, 1):
+        uncorrected_elevation_deg = math.degrees(
+            math.asin(max(-1.0, min(1.0, uncorrected_poses[side_index].forward_world_enu[2])))
+        )
+        corrected_elevation_deg = math.degrees(
+            math.asin(max(-1.0, min(1.0, corrected_poses[side_index].forward_world_enu[2])))
+        )
+        assert abs(corrected_elevation_deg - uncorrected_elevation_deg) < 1.0e-6
+
+
+def test_true_north_correction_e_mixed_common_and_differential_bias() -> None:
+    node = _node()
+    left_bias_deg, right_bias_deg = 0.40, -0.20
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(left_bias_deg),
+        right_q=_yaw_q_wxyz(right_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    corrected = diagnostics["attitude_true_north"]
+    biased = diagnostics["attitude"]
+    nominal_raw = node._triangulate_pixel_centers(*pixels, 1280, 720)
+
+    assert abs(corrected["left_true_north_yaw_correction_deg"] - (-left_bias_deg)) < 1.0e-2
+    assert abs(corrected["right_true_north_yaw_correction_deg"] - (-right_bias_deg)) < 1.0e-2
+    assert abs(corrected["intersection_angle_deg"] - nominal_raw["intersection_angle_deg"]) < 0.01
+    corrected_position_error = _position_error(corrected, expected_frd)
+    biased_position_error = _position_error(biased, expected_frd)
+    assert corrected_position_error < biased_position_error * 0.1
 
 
 def test_attitude_pose_selection_rejects_stale_skewed_and_old_epoch_samples() -> None:

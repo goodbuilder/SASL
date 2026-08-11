@@ -19,7 +19,8 @@ from stereo_ground_sim.coordinate_frames import (  # noqa: E402
 )
 from stereo_ground_sim.gps_baseline import (  # noqa: E402
     RawGpsFix,
-    declination_from_gps_baseline_rad,
+    gps_baseline_bearing_rad,
+    true_north_yaw_correction_rad,
 )
 
 WGS84_A_M = 6_378_137.0
@@ -50,7 +51,8 @@ def _gps_fixes_for_enu_baseline(baseline_enu_m, *, lat0_deg=47.398, lon0_deg=8.5
 
 
 # ---------------------------------------------------------------------------
-# NED yaw correction rotation
+# NED yaw correction rotation (unchanged from Phase 1, still the application
+# mechanism for whatever yaw-correction radians value is computed)
 # ---------------------------------------------------------------------------
 
 
@@ -71,118 +73,97 @@ def test_ned_yaw_correction_rotation_rotates_north_toward_east_by_exactly_yaw(
 
 
 # ---------------------------------------------------------------------------
-# declination_from_gps_baseline_rad
+# gps_baseline_bearing_rad
 # ---------------------------------------------------------------------------
 
 
-def test_declination_from_gps_baseline_is_near_zero_with_no_injected_bias() -> None:
+def test_gps_baseline_bearing_matches_known_geometry() -> None:
     nominal_left, nominal_right = nominal_camera_poses(baseline_m=25.0, camera_height_m=0.1)
     nominal_baseline = tuple(
         nominal_right.center_world_enu_m[index] - nominal_left.center_world_enu_m[index]
         for index in range(3)
     )
     left_fix, right_fix = _gps_fixes_for_enu_baseline(nominal_baseline)
-    unbiased_attitude_pose = camera_optical_pose_from_px4_attitude_wxyz(
-        nominal_left.center_world_enu_m, _pure_yaw_quaternion_wxyz(0.0)
-    )
 
-    declination_rad = declination_from_gps_baseline_rad(
-        left_fix, right_fix, nominal_baseline, nominal_left, unbiased_attitude_pose
-    )
+    bearing_rad = gps_baseline_bearing_rad(left_fix, right_fix)
 
-    assert declination_rad is not None
-    assert abs(math.degrees(declination_rad)) < 1.0e-3
+    assert bearing_rad is not None
+    assert abs(math.degrees(bearing_rad) - 90.0) < 1.0e-2  # pure East baseline
 
 
-@pytest.mark.parametrize("injected_yaw_bias_deg", (3.7, -2.1, 10.0, -25.0))
-def test_declination_from_gps_baseline_recovers_injected_yaw_bias(
-    injected_yaw_bias_deg,
+def test_gps_baseline_bearing_returns_none_for_degenerate_baseline() -> None:
+    left_fix, _right_fix = _gps_fixes_for_enu_baseline((25.0, 0.0, 0.0))
+
+    assert gps_baseline_bearing_rad(left_fix, left_fix) is None
+
+
+# ---------------------------------------------------------------------------
+# true_north_yaw_correction_rad
+# ---------------------------------------------------------------------------
+
+
+def test_true_north_yaw_correction_is_zero_when_forward_already_matches_expected() -> None:
+    bearing_rad = math.radians(90.0)
+    offset_rad = math.radians(-90.0)
+    expected_heading_rad = bearing_rad + offset_rad  # 0 deg -> pure North
+    matching_forward = (math.sin(expected_heading_rad), math.cos(expected_heading_rad), 0.0)
+
+    correction_rad = true_north_yaw_correction_rad(bearing_rad, offset_rad, matching_forward)
+
+    assert correction_rad is not None
+    assert abs(math.degrees(correction_rad)) < 1.0e-6
+
+
+@pytest.mark.parametrize("injected_live_bias_deg", (5.0, -12.0, 179.0, -179.0))
+def test_true_north_yaw_correction_recovers_injected_live_heading_bias(
+    injected_live_bias_deg,
 ) -> None:
-    nominal_left, nominal_right = nominal_camera_poses(baseline_m=25.0, camera_height_m=0.1)
-    nominal_baseline = tuple(
-        nominal_right.center_world_enu_m[index] - nominal_left.center_world_enu_m[index]
-        for index in range(3)
-    )
-    left_fix, right_fix = _gps_fixes_for_enu_baseline(nominal_baseline)
-    biased_attitude_pose = camera_optical_pose_from_px4_attitude_wxyz(
-        nominal_left.center_world_enu_m,
-        _pure_yaw_quaternion_wxyz(injected_yaw_bias_deg),
-    )
+    bearing_rad = math.radians(90.0)
+    offset_rad = math.radians(-90.0)
+    expected_heading_rad = bearing_rad + offset_rad
+    biased_heading_rad = expected_heading_rad + math.radians(injected_live_bias_deg)
+    biased_forward = (math.sin(biased_heading_rad), math.cos(biased_heading_rad), 0.0)
 
-    declination_rad = declination_from_gps_baseline_rad(
-        left_fix, right_fix, nominal_baseline, nominal_left, biased_attitude_pose
-    )
+    correction_rad = true_north_yaw_correction_rad(bearing_rad, offset_rad, biased_forward)
 
-    assert declination_rad is not None
-    # true = magnetic + declination, so declination should recover -bias.
-    assert abs(math.degrees(declination_rad) - (-injected_yaw_bias_deg)) < 1.0e-2
+    assert correction_rad is not None
+    # expected - live = -injected_bias
+    assert abs(math.degrees(correction_rad) - (-injected_live_bias_deg)) < 1.0e-6
 
 
-def test_declination_correction_applied_back_cancels_the_injected_bias() -> None:
-    nominal_left, nominal_right = nominal_camera_poses(baseline_m=25.0, camera_height_m=0.1)
-    nominal_baseline = tuple(
-        nominal_right.center_world_enu_m[index] - nominal_left.center_world_enu_m[index]
-        for index in range(3)
-    )
-    left_fix, right_fix = _gps_fixes_for_enu_baseline(nominal_baseline)
-    injected_yaw_bias_deg = 7.25
-    biased_quaternion = _pure_yaw_quaternion_wxyz(injected_yaw_bias_deg)
-    biased_attitude_pose = camera_optical_pose_from_px4_attitude_wxyz(
-        nominal_left.center_world_enu_m, biased_quaternion
-    )
-    unbiased_attitude_pose = camera_optical_pose_from_px4_attitude_wxyz(
+def test_true_north_yaw_correction_returns_none_for_near_vertical_forward() -> None:
+    bearing_rad = math.radians(90.0)
+    offset_rad = math.radians(-90.0)
+
+    assert true_north_yaw_correction_rad(bearing_rad, offset_rad, (0.0, 0.0, 1.0)) is None
+
+
+def test_true_north_yaw_correction_applied_back_cancels_the_injected_bias() -> None:
+    """End-to-end: estimate a correction from a biased live PX4 attitude pose
+    and confirm applying it via camera_optical_pose_from_px4_attitude_wxyz's
+    declination_correction_rad recovers the unbiased pose."""
+
+    nominal_left, _nominal_right = nominal_camera_poses(baseline_m=25.0, camera_height_m=0.1)
+    bearing_rad = math.radians(90.0)
+    offset_rad = math.radians(-90.0)
+
+    unbiased_pose = camera_optical_pose_from_px4_attitude_wxyz(
         nominal_left.center_world_enu_m, _pure_yaw_quaternion_wxyz(0.0)
     )
-
-    declination_rad = declination_from_gps_baseline_rad(
-        left_fix, right_fix, nominal_baseline, nominal_left, biased_attitude_pose
+    injected_bias_deg = 6.5
+    biased_pose = camera_optical_pose_from_px4_attitude_wxyz(
+        nominal_left.center_world_enu_m, _pure_yaw_quaternion_wxyz(injected_bias_deg)
     )
+
+    correction_rad = true_north_yaw_correction_rad(
+        bearing_rad, offset_rad, biased_pose.forward_world_enu
+    )
+    assert correction_rad is not None
     corrected_pose = camera_optical_pose_from_px4_attitude_wxyz(
         nominal_left.center_world_enu_m,
-        biased_quaternion,
-        declination_correction_rad=declination_rad,
+        _pure_yaw_quaternion_wxyz(injected_bias_deg),
+        declination_correction_rad=correction_rad,
     )
 
-    residual_deg = relative_rotation_angle_deg(corrected_pose, unbiased_attitude_pose)
+    residual_deg = relative_rotation_angle_deg(corrected_pose, unbiased_pose)
     assert residual_deg < 1.0e-2
-
-
-def test_declination_from_gps_baseline_returns_none_on_degenerate_baseline() -> None:
-    nominal_left, nominal_right = nominal_camera_poses(baseline_m=25.0, camera_height_m=0.1)
-    left_fix, right_fix = _gps_fixes_for_enu_baseline((25.0, 0.0, 0.0))
-    unbiased_attitude_pose = camera_optical_pose_from_px4_attitude_wxyz(
-        nominal_left.center_world_enu_m, _pure_yaw_quaternion_wxyz(0.0)
-    )
-
-    declination_rad = declination_from_gps_baseline_rad(
-        left_fix, right_fix, (0.0, 0.0, 0.0), nominal_left, unbiased_attitude_pose
-    )
-
-    assert declination_rad is None
-
-
-def test_declination_estimate_requires_distinct_design_and_live_poses_a_regression_guard() -> None:
-    """Regression guard for a real bug found during implementation: passing
-    the SAME pose as both the design projection basis and the live rotation
-    makes the round-trip a mathematical no-op, silently returning ~0
-    regardless of the true heading error."""
-
-    nominal_left, nominal_right = nominal_camera_poses(baseline_m=25.0, camera_height_m=0.1)
-    nominal_baseline = tuple(
-        nominal_right.center_world_enu_m[index] - nominal_left.center_world_enu_m[index]
-        for index in range(3)
-    )
-    left_fix, right_fix = _gps_fixes_for_enu_baseline(nominal_baseline)
-    biased_attitude_pose = camera_optical_pose_from_px4_attitude_wxyz(
-        nominal_left.center_world_enu_m, _pure_yaw_quaternion_wxyz(9.0)
-    )
-
-    same_pose_declination_rad = declination_from_gps_baseline_rad(
-        left_fix, right_fix, nominal_baseline, biased_attitude_pose, biased_attitude_pose
-    )
-    distinct_pose_declination_rad = declination_from_gps_baseline_rad(
-        left_fix, right_fix, nominal_baseline, nominal_left, biased_attitude_pose
-    )
-
-    assert abs(math.degrees(same_pose_declination_rad)) < 1.0e-3
-    assert abs(math.degrees(distinct_pose_declination_rad)) > 1.0

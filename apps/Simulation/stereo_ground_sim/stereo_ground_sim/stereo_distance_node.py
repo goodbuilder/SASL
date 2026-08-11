@@ -523,6 +523,8 @@ class StereoDistanceNode(Node):
         self.declare_parameter("cam_r_px4_attitude_roll_deg", 0.0)
         self.declare_parameter("cam_r_px4_attitude_pitch_deg", 0.0)
         self.declare_parameter("cam_r_px4_attitude_yaw_deg", 0.0)
+        self.declare_parameter("cam_l_gnss_baseline_to_forward_yaw_deg", -90.0)
+        self.declare_parameter("cam_r_gnss_baseline_to_forward_yaw_deg", -90.0)
         self.declare_parameter("common_optical_roll_error_deg", 0.0)
         self.declare_parameter("relative_optical_roll_error_deg", 0.0)
         self.declare_parameter("common_optical_pitch_error_deg", 0.0)

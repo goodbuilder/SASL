@@ -74,75 +74,64 @@ def norm_m(vector: tuple[float, float, float]) -> float:
     return math.sqrt(sum(float(value) * float(value) for value in vector))
 
 
-def _bearing_deg(vector_enu: tuple[float, float, float]) -> float:
-    """Compass bearing (clockwise from North) of an ENU vector's horizontal part.
+def _wrap_pi(angle_rad: float) -> float:
+    """Wrap an angle in radians to (-pi, pi]."""
 
+    return ((float(angle_rad) + math.pi) % (2.0 * math.pi)) - math.pi
+
+
+def gps_baseline_bearing_rad(left_fix: RawGpsFix, right_fix: RawGpsFix) -> float | None:
+    """True-north horizontal bearing of the left->right GNSS baseline.
+
+    Pure WGS84 geodesy (``gps_baseline_enu_m``), magnetism/attitude-free.
     World-ENU vectors in this codebase are ordered (East, North, Up), so
-    bearing is ``atan2(East, North)``.
-    """
-
-    east, north, _up = vector_enu
-    return math.degrees(math.atan2(float(east), float(north)))
-
-
-def _wrap_180_deg(angle_deg: float) -> float:
-    return ((float(angle_deg) + 180.0) % 360.0) - 180.0
-
-
-def declination_from_gps_baseline_rad(
-    left_fix: RawGpsFix,
-    right_fix: RawGpsFix,
-    nominal_baseline_enu_m: tuple[float, float, float],
-    nominal_left_camera_pose,
-    attitude_left_camera_pose,
-) -> float | None:
-    """Estimate local magnetic declination from the dual-GPS camera baseline.
-
-    Compares the left/right GPS baseline's true-north bearing (pure WGS84
-    geodesy, magnetism-free) against the same baseline direction as predicted
-    by the live, uncorrected magnetometer-derived left-camera attitude. The
-    angular difference is ``true - magnetic``, matching the convention
-    ``true_heading = magnetic_heading + declination`` (the same convention
-    PX4's own EKF2 declination fusion uses).
-
-    ``nominal_left_camera_pose`` and ``attitude_left_camera_pose`` must be
-    DISTINCT poses: the nominal/design pose (fixed, config-derived, no live
-    sensors) is used only to express the known baseline direction in the
-    camera's own local frame; the live magnetometer-derived attitude pose is
-    then used to rotate that local vector back into world ENU. Passing the
-    same pose for both makes the projection-and-back-rotation a mathematical
-    no-op that cancels any injected bias -- always returns ~0 regardless of
-    the true heading error.
-
-    Returns ``None`` if any input is non-finite or the baseline is
-    degenerate, rather than raising -- callers should fail the ray closed.
+    bearing is ``atan2(East, North)``. Returns ``None`` if the fixes are
+    invalid or the horizontal baseline is degenerate (near-vertical/zero),
+    rather than raising -- callers should fail closed.
     """
 
     try:
-        gps_measured_enu = gps_baseline_enu_m(left_fix, right_fix)
+        baseline_enu = gps_baseline_enu_m(left_fix, right_fix)
     except ValueError:
         return None
-    if not all(math.isfinite(value) for value in gps_measured_enu):
+    east, north, _up = baseline_enu
+    horizontal_norm = math.hypot(east, north)
+    if not math.isfinite(horizontal_norm) or horizontal_norm <= 1.0e-6:
         return None
-    if norm_m(gps_measured_enu) <= 1.0e-12:
-        return None
-    if not all(math.isfinite(float(value)) for value in nominal_baseline_enu_m):
-        return None
-    local_baseline_design = (
-        float(_dot3(nominal_left_camera_pose.right_world_enu, nominal_baseline_enu_m)),
-        float(_dot3(nominal_left_camera_pose.down_world_enu, nominal_baseline_enu_m)),
-        float(_dot3(nominal_left_camera_pose.forward_world_enu, nominal_baseline_enu_m)),
-    )
-    if norm_m(local_baseline_design) <= 1.0e-12:
-        return None
-    magnetometer_predicted_enu = attitude_left_camera_pose.ray_to_world(local_baseline_design)
-    if not all(math.isfinite(value) for value in magnetometer_predicted_enu):
-        return None
-    declination_deg = _wrap_180_deg(
-        _bearing_deg(gps_measured_enu) - _bearing_deg(magnetometer_predicted_enu)
-    )
-    return math.radians(declination_deg)
+    return math.atan2(east, north)
 
 
-def _dot3(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
-    return sum(float(a[index]) * float(b[index]) for index in range(3))
+def true_north_yaw_correction_rad(
+    gps_baseline_bearing_rad: float,
+    baseline_to_forward_yaw_offset_rad: float,
+    camera_forward_world_enu: tuple[float, float, float],
+) -> float | None:
+    """Per-camera yaw correction from a GNSS-baseline-derived True-North heading.
+
+    ``expected_heading = gps_baseline_bearing_rad + baseline_to_forward_yaw_offset_rad``
+    is the camera's Forward bearing implied by the (magnetism-free) GNSS
+    baseline plus the known rig calibration offset between the baseline and
+    that camera's own boresight. ``camera_forward_world_enu`` is the SAME
+    camera's live, uncorrected PX4-attitude-derived Forward vector (from the
+    full body-to-world rotation -- never Euler-decomposed); its own horizontal
+    bearing is the "live" heading. The correction is ``expected - live``,
+    wrapped to (-pi, pi], to be applied as a world-frame (NED Z) yaw
+    pre-multiply -- see ``coordinate_frames.camera_optical_pose_from_px4_attitude_wxyz``'s
+    ``declination_correction_rad`` kwarg.
+
+    Returns ``None`` if any input is non-finite or the camera's forward
+    vector is near-vertical (horizontal heading undefined), rather than
+    raising -- callers should fail the ray closed.
+    """
+
+    if not math.isfinite(float(gps_baseline_bearing_rad)) or not math.isfinite(
+        float(baseline_to_forward_yaw_offset_rad)
+    ):
+        return None
+    expected_heading_rad = float(gps_baseline_bearing_rad) + float(baseline_to_forward_yaw_offset_rad)
+    east, north, _up = camera_forward_world_enu
+    horizontal_norm = math.hypot(east, north)
+    if not math.isfinite(horizontal_norm) or horizontal_norm <= 1.0e-6:
+        return None
+    live_heading_rad = math.atan2(east, north)
+    return _wrap_pi(expected_heading_rad - live_heading_rad)
