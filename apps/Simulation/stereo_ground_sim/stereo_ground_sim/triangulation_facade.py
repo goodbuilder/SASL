@@ -249,6 +249,7 @@ class TriangulationFacade:
             {
                 "attitude_poses": self.node._px4_attitude_camera_poses,
                 "true_north_attitude_poses": self.node._px4_attitude_true_north_camera_poses,
+                "declination_attitude_poses": self.node._px4_attitude_declination_camera_poses,
                 "gps_poses": self.node._gps_baseline_camera_poses,
                 "triangulate": self.node._triangulate_pixel_centers_with_cameras,
             },

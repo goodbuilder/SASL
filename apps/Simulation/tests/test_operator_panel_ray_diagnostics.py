@@ -94,14 +94,14 @@ def _cell(table, row, column):
     return "" if item is None else item.text()
 
 
-def test_panel_renders_all_eight_ray_rows_with_correct_labels_and_order(qt_app):
+def test_panel_renders_all_nine_ray_rows_with_correct_labels_and_order(qt_app):
     panel = operator_panel.RayDiagnosticsPanel()
 
     labels = [_cell(panel._geometry_table, row, 0) for row in range(panel._geometry_table.rowCount())]
 
     assert labels == [
         "Nominal Pose", "Optical Pose", "Ideal", "GPS Baseline", "Global Baseline",
-        "Attitude", "Operational", "Attitude (True North)",
+        "Attitude", "Operational", "Attitude (True North)", "Attitude (Declination)",
     ]
 
 
@@ -423,8 +423,8 @@ def test_analysis_graph_legend_does_not_collide_gt_with_the_truth_ray():
     assert operator_panel.SERIES_LABELS["truth"] != operator_panel.SERIES_LABELS["optical_pose"]
 
 
-def test_analysis_tab_series_covers_all_eight_recorded_rays():
-    # RAY_DIAGNOSTICS_ROWS is the canonical list of the eight recorded Rays.
+def test_analysis_tab_series_covers_all_nine_recorded_rays():
+    # RAY_DIAGNOSTICS_ROWS is the canonical list of the nine recorded Rays.
     # The Analysis tab's SERIES must plot every one of them, under the same
     # display name it uses elsewhere (the Ray Diagnostics panel, CSV/XLSX).
     ray_display_names = dict(operator_panel.RAY_DIAGNOSTICS_ROWS)
@@ -437,6 +437,7 @@ def test_analysis_tab_series_covers_all_eight_recorded_rays():
         "attitude": "attitude",
         "operational": "operational",
         "attitude_true_north": "attitude_true_north",
+        "attitude_declination": "attitude_declination",
     }
     series_names = {name for name, _topic, _color in operator_panel.SERIES}
     assert set(series_key_by_ray_key.values()) <= series_names

@@ -360,6 +360,125 @@ class PoseConversionAdapter:
         provenance["camera_orientation_source"] = "px4_vehicle_attitude_true_north_corrected"
         return finish(corrected_poses, "available", provenance)
 
+    def _px4_attitude_declination_camera_poses(
+        self,
+        camera_sources,
+        *,
+        include_provenance=False,
+        operational_snapshot=None,
+        observation_timestamp_ns=None,
+    ):
+        """Attitude-ray poses with a single, shared GPS-baseline True-North
+        yaw correction applied to both cameras.
+
+        This is the pre-Phase-2 (shared-correction) sibling of
+        ``_px4_attitude_true_north_camera_poses``, kept as its own Ray for
+        direct comparison. It computes exactly ONE yaw correction -- from the
+        LEFT camera's own live Forward heading and
+        ``CAM_L_GNSS_BASELINE_TO_FORWARD_YAW_DEG`` only -- and applies that
+        same value to both left and right cameras. Unlike the per-camera
+        correction, this cannot resolve any differential (left-vs-right) yaw
+        error between the two independent PX4 EKF instances, so it fixes a
+        common declination-like offset but leaves the stereo intersection
+        angle uncorrected under differential bias. Fails closed the same way
+        as ``_px4_attitude_true_north_camera_poses``.
+        """
+
+        def finish(poses, status, provenance):
+            return (
+                (poses, status, provenance)
+                if include_provenance
+                else (poses, status)
+            )
+
+        uncorrected_poses, attitude_status, attitude_provenance = self._px4_attitude_camera_poses(
+            camera_sources,
+            include_provenance=True,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+        )
+        provenance = dict(attitude_provenance)
+        provenance["camera_orientation_source"] = "px4_vehicle_attitude_declination_shared_corrected"
+        if uncorrected_poses is None:
+            return finish(None, attitude_status, provenance)
+
+        current_epoch = getattr(getattr(self.node, "simulation_epoch", None), "epoch", 0)
+        snapshot_fixes = (
+            operational_snapshot.get("gps_baseline_fixes")
+            if isinstance(operational_snapshot, dict)
+            else None
+        )
+        if isinstance(snapshot_fixes, dict):
+            left_entry = snapshot_fixes.get("left")
+            right_entry = snapshot_fixes.get("right")
+        else:
+            with self.node.lock:
+                left_entry = self.node.gps_baseline_fixes.get("left")
+                right_entry = self.node.gps_baseline_fixes.get("right")
+        if left_entry is None:
+            return finish(None, "missing_left_gps_fix", provenance)
+        if right_entry is None:
+            return finish(None, "missing_right_gps_fix", provenance)
+        left_fix, left_received_ns, left_epoch, _left_ts_ns = self.node._gps_fix_entry(
+            left_entry, current_epoch
+        )
+        right_fix, right_received_ns, right_epoch, _right_ts_ns = self.node._gps_fix_entry(
+            right_entry, current_epoch
+        )
+        if left_epoch != current_epoch or right_epoch != current_epoch:
+            return finish(None, "gps_epoch_mismatch", provenance)
+        now_ns = (
+            int(operational_snapshot.get("captured_monotonic_ns"))
+            if isinstance(operational_snapshot, dict)
+            and operational_snapshot.get("captured_monotonic_ns") is not None
+            else time.monotonic_ns()
+        )
+        left_age_ms = (now_ns - left_received_ns) / 1_000_000.0
+        right_age_ms = (now_ns - right_received_ns) / 1_000_000.0
+        provenance.update(
+            {"gps_left_age_ms": left_age_ms, "gps_right_age_ms": right_age_ms}
+        )
+        if left_age_ms > self.node.gps_baseline_max_age_s * 1_000.0:
+            return finish(None, "stale_left_gps_fix", provenance)
+        if right_age_ms > self.node.gps_baseline_max_age_s * 1_000.0:
+            return finish(None, "stale_right_gps_fix", provenance)
+
+        bearing_rad = gps_baseline_bearing_rad(left_fix, right_fix)
+        if bearing_rad is None:
+            return finish(None, "gps_baseline_bearing_unavailable", provenance)
+        provenance["gps_baseline_bearing_deg"] = math.degrees(bearing_rad)
+
+        left_offset_deg = float(self.node.cam_l_gnss_baseline_to_forward_yaw_deg)
+        provenance["left_baseline_to_forward_yaw_deg"] = left_offset_deg
+        provenance["left_expected_true_north_heading_deg"] = math.degrees(bearing_rad) + left_offset_deg
+        provenance["left_px4_forward_heading_deg"] = math.degrees(
+            math.atan2(uncorrected_poses[0].forward_world_enu[0], uncorrected_poses[0].forward_world_enu[1])
+        )
+
+        yaw_correction_rad = true_north_yaw_correction_rad(
+            bearing_rad,
+            math.radians(left_offset_deg),
+            uncorrected_poses[0].forward_world_enu,
+        )
+        if yaw_correction_rad is None:
+            return finish(None, "shared_true_north_heading_undefined", provenance)
+        provenance["shared_yaw_correction_deg"] = math.degrees(yaw_correction_rad)
+        provenance["reference_camera"] = "left"
+
+        corrected_poses, corrected_status, corrected_provenance = self._px4_attitude_camera_poses(
+            camera_sources,
+            include_provenance=True,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+            left_true_north_yaw_correction_rad=yaw_correction_rad,
+            right_true_north_yaw_correction_rad=yaw_correction_rad,
+        )
+        if corrected_poses is None:
+            return finish(None, corrected_status, provenance)
+        provenance.update(corrected_provenance)
+        provenance["camera_orientation_source"] = "px4_vehicle_attitude_declination_shared_corrected"
+        return finish(corrected_poses, "available", provenance)
+
     @staticmethod
     def _gps_fix_entry(entry, current_epoch):
         if entry is None:

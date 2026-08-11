@@ -34,6 +34,14 @@ def test_orchestrator_keeps_world_pose_inputs_and_frd_outputs_separate():
             {"pose": "px4_true_north"},
         )
 
+    def declination_attitude_poses(source, **kwargs):
+        calls.append(("declination", source, kwargs))
+        return (
+            ("left_declination_enu", "right_declination_enu"),
+            "available",
+            {"pose": "px4_declination"},
+        )
+
     def gps_poses(source, **kwargs):
         calls.append(("gps", source, kwargs))
         return (("left_enu", "right_enu"), "available", {"baseline": "enu"})
@@ -46,6 +54,7 @@ def test_orchestrator_keeps_world_pose_inputs_and_frd_outputs_separate():
         {
             "attitude_poses": attitude_poses,
             "true_north_attitude_poses": true_north_attitude_poses,
+            "declination_attitude_poses": declination_attitude_poses,
             "gps_poses": gps_poses,
             "triangulate": triangulate,
         },
@@ -55,18 +64,21 @@ def test_orchestrator_keeps_world_pose_inputs_and_frd_outputs_separate():
 
     assert result["attitude"]["output_frame"] == "baseline_center_frd"
     assert result["attitude_true_north"]["output_frame"] == "baseline_center_frd"
+    assert result["attitude_declination"]["output_frame"] == "baseline_center_frd"
     assert result["operational"]["output_frame"] == "baseline_center_frd"
     assert result["operational"]["baseline_anchor_policy"] == "nominal_left_plus_relative_enu"
     # Call order: attitude ray (pose + triangulate), attitude_true_north ray
-    # (pose + triangulate), then the gps-baseline-fed operational ray (pose
-    # + triangulate).
+    # (pose + triangulate), attitude_declination ray (pose + triangulate),
+    # then the gps-baseline-fed operational ray (pose + triangulate).
     assert calls[0][1] == "gazebo_snapshot"
     assert calls[1][1] == "left_world_enu"
     assert calls[2][1] == "gazebo_snapshot"
     assert calls[3][1] == "left_true_north_enu"
-    assert calls[4][1] == "gps_baseline"
-    assert calls[5][1] == ("left_enu", "right_enu")
-    assert calls[6][1] == "left_world_enu"
+    assert calls[4][1] == "gazebo_snapshot"
+    assert calls[5][1] == "left_declination_enu"
+    assert calls[6][1] == "gps_baseline"
+    assert calls[7][1] == ("left_enu", "right_enu")
+    assert calls[8][1] == "left_world_enu"
     assert calls[0][2]["observation_timestamp_ns"] == 42
 
 
@@ -79,6 +91,9 @@ def test_orchestrator_reports_gps_and_attitude_failures_without_triangulating():
     def true_north_attitude_poses(_source, **_kwargs):
         return (None, "missing_left_gps_fix", {"pose": "px4_true_north"})
 
+    def declination_attitude_poses(_source, **_kwargs):
+        return (None, "shared_true_north_heading_undefined", {"pose": "px4_declination"})
+
     def gps_poses(_source, **_kwargs):
         return (None, "stale_gps", {"baseline": "enu"})
 
@@ -89,6 +104,7 @@ def test_orchestrator_reports_gps_and_attitude_failures_without_triangulating():
         {
             "attitude_poses": attitude_poses,
             "true_north_attitude_poses": true_north_attitude_poses,
+            "declination_attitude_poses": declination_attitude_poses,
             "gps_poses": gps_poses,
             "triangulate": unexpected_triangulation,
         },
@@ -97,5 +113,6 @@ def test_orchestrator_reports_gps_and_attitude_failures_without_triangulating():
 
     assert result["attitude"]["failure_reason"] == "stale_attitude"
     assert result["attitude_true_north"]["failure_reason"] == "missing_left_gps_fix"
+    assert result["attitude_declination"]["failure_reason"] == "shared_true_north_heading_undefined"
     assert result["operational"]["failure_reason"] == "gps:stale_gps;attitude:stale_attitude"
     assert result["operational"]["valid"] is False

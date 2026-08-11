@@ -69,7 +69,7 @@ def test_operator_panel_separates_setup_flight_analysis_and_debug() -> None:
     assert "FRDR comparison" not in source
     assert "legend_x = right + 12" in source
     assert "legend_x + 35" in source
-    assert "legend_y += 18" in source
+    assert "legend_y += 20" in source
     assert "legend_label_width" in source
     assert "set_series_visible" in source
     assert "QCheckBox" in source

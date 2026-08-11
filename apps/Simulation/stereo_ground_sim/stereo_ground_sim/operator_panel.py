@@ -93,6 +93,7 @@ SERIES = (
     ("attitude", None, QColor(156, 39, 176)),
     ("operational", None, QColor(0, 0, 0)),
     ("attitude_true_north", None, QColor(0, 217, 102)),
+    ("attitude_declination", None, QColor(230, 200, 20)),
 )
 SERIES_LABELS = {
     # "truth" subscribes to /ground_truth_position, the literal Gazebo
@@ -111,6 +112,7 @@ SERIES_LABELS = {
     "attitude": "Attitude",
     "operational": "Operational",
     "attitude_true_north": "Attitude (True North)",
+    "attitude_declination": "Attitude (Declination)",
     "uam_raw_gps_reference": "UAM GPS",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -612,6 +614,7 @@ RAY_DIAGNOSTICS_ROWS = (
     ("attitude", "Attitude"),
     ("operational", "Operational"),
     ("attitude_true_north", "Attitude (True North)"),
+    ("attitude_declination", "Attitude (Declination)"),
 )
 
 # Coarse state buckets derived from the existing computation_status/failure_reason
@@ -2252,7 +2255,7 @@ class FrdPlotStack(QWidget):
                 painter.drawLine(legend_x, legend_y, legend_x + 20, legend_y)
                 painter.setPen(QPen(QColor(32, 32, 32), 1))
                 painter.drawText(legend_x + 35, legend_y + 5, SERIES_LABELS[series_name])
-                legend_y += 18
+                legend_y += 20
 
             for series_name, _topic, color in visible_series:
                 points = [
@@ -2582,7 +2585,10 @@ class OperatorPanel(Plugin):
         # topic of their own (unlike Nominal/Optical/Ideal/GPS above);
         # /stereo/ray_metrics is their only source, so plot/facts/CSV get
         # them from here instead of the SERIES topic-subscription loop.
-        for ray_key in ("global_baseline", "attitude", "operational", "attitude_true_north"):
+        for ray_key in (
+            "global_baseline", "attitude", "operational",
+            "attitude_true_north", "attitude_declination",
+        ):
             ray = parsed.get(ray_key)
             if not isinstance(ray, dict):
                 continue

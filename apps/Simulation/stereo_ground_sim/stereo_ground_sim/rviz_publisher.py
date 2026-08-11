@@ -226,6 +226,7 @@ class RvizVisualizationPublisher:
         attitude=None,
         operational=None,
         attitude_true_north=None,
+        attitude_declination=None,
         gt_source=None,
         gt_fallback_used=None,
     ):
@@ -244,6 +245,7 @@ class RvizVisualizationPublisher:
             attitude=attitude,
             operational=operational,
             attitude_true_north=attitude_true_north,
+            attitude_declination=attitude_declination,
         )
         if payload:
             publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
@@ -283,7 +285,8 @@ class RvizVisualizationPublisher:
     def _publish_ray_markers(
         self, nominal_pose=None, optical_pose=None, ideal=None,
         gps_baseline=None, global_baseline=None, attitude=None,
-        operational=None, attitude_true_north=None, uam_gps_ray=None,
+        operational=None, attitude_true_north=None, attitude_declination=None,
+        uam_gps_ray=None,
     ):
         """Publish stereo rays in World ENU, including the UAM GPS ray.
 
@@ -402,6 +405,21 @@ class RvizVisualizationPublisher:
                 right_color=(0.0, 0.85, 0.4),
                 gap_color=(0.45, 0.95, 0.7),
                 midpoint_color=(0.0, 0.85, 0.4),
+            )
+        )
+        markers.extend(
+            marker_group(
+                attitude_declination,
+                label="attitude_declination",
+                marker_id=100,
+                # Yellow denotes PX4 attitude with a single shared GPS-baseline
+                # True-North yaw correction (left-camera-only, applied to both
+                # sides) -- see _px4_attitude_declination_camera_poses; contrast
+                # with attitude_true_north's independent per-camera correction.
+                left_color=(1.0, 0.9, 0.1),
+                right_color=(1.0, 0.9, 0.1),
+                gap_color=(1.0, 0.95, 0.55),
+                midpoint_color=(1.0, 0.9, 0.1),
             )
         )
         markers.extend(

@@ -70,6 +70,30 @@ class DiagnosticRayOrchestrator:
                 provenance=true_north_provenance,
             )
 
+        declination_poses, declination_status, declination_provenance = d["declination_attitude_poses"](
+            snapshot, include_provenance=True,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+        )
+        declination_provenance.update({
+            "baseline_source": "gazebo_observed_optical_centers",
+            "left_camera_center_source": "gazebo_observed_left_optical_center",
+            "right_camera_center_source": "gazebo_observed_right_optical_center",
+        })
+        if declination_poses is None:
+            attitude_declination = finalize_diagnostic_ray(
+                {"computation_status": declination_status},
+                provenance=declination_provenance, failure_reason=declination_status,
+            )
+        else:
+            attitude_declination = finalize_diagnostic_ray(
+                d["triangulate"](
+                    *pixels, left_camera_pose=declination_poses[0],
+                    right_camera_pose=declination_poses[1],
+                ),
+                provenance=declination_provenance,
+            )
+
         gps_poses, gps_status, gps_provenance = d["gps_poses"](
             "gps_baseline", operational_snapshot=operational_snapshot,
             observation_timestamp_ns=observation_timestamp_ns,
@@ -113,6 +137,7 @@ class DiagnosticRayOrchestrator:
             "attitude": attitude,
             "operational": operational,
             "attitude_true_north": attitude_true_north,
+            "attitude_declination": attitude_declination,
         }
 
 

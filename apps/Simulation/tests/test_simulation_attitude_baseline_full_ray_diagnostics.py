@@ -580,6 +580,92 @@ def test_true_north_correction_e_mixed_common_and_differential_bias() -> None:
     assert corrected_position_error < biased_position_error * 0.1
 
 
+# ---------------------------------------------------------------------------
+# Phase 3: attitude_declination -- shared (left-camera-only) correction,
+# kept alongside attitude_true_north for direct comparison.
+# ---------------------------------------------------------------------------
+
+
+def test_declination_correction_common_bias_is_recovered_and_right_error_improves() -> None:
+    node = _node()
+    injected_bias_deg = 0.30
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(injected_bias_deg),
+        right_q=_yaw_q_wxyz(injected_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    corrected = diagnostics["attitude_declination"]
+
+    assert corrected["computation_status"] == "computed"
+    assert abs(corrected["shared_yaw_correction_deg"] - (-injected_bias_deg)) < 1.0e-2
+    biased_right_error = abs(diagnostics["attitude"]["right_m"] - expected_frd[1])
+    corrected_right_error = abs(corrected["right_m"] - expected_frd[1])
+    assert corrected_right_error < biased_right_error * 0.1
+
+
+def test_declination_correction_differential_bias_does_not_restore_intersection_angle() -> None:
+    """Contrast with Phase 2 Test C: the shared correction is blind to a
+    DIFFERENTIAL left/right bias, so it should NOT recover the collapsed
+    intersection angle the way attitude_true_north's per-camera correction
+    does -- this makes the comparative value of keeping both rays explicit
+    in the test suite itself, not just provable live."""
+
+    node = _node()
+    left_bias_deg, right_bias_deg = 0.30, -0.30
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(left_bias_deg),
+        right_q=_yaw_q_wxyz(right_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    declination = diagnostics["attitude_declination"]
+    true_north = diagnostics["attitude_true_north"]
+    biased = diagnostics["attitude"]
+    nominal_raw = node._triangulate_pixel_centers(*pixels, 1280, 720)
+
+    # The degenerate baseline case: uncorrected intersection angle is far
+    # from the healthy/nominal one, or this test proves nothing.
+    assert abs(biased["intersection_angle_deg"] - nominal_raw["intersection_angle_deg"]) > 0.05
+
+    # Shared correction stays close to the degenerate uncorrected value...
+    assert abs(declination["intersection_angle_deg"] - biased["intersection_angle_deg"]) < 0.02
+    # ...while per-camera correction recovers close to the healthy nominal value.
+    assert abs(true_north["intersection_angle_deg"] - nominal_raw["intersection_angle_deg"]) < 0.01
+    # Making the contrast explicit: declination's angle stays far from nominal.
+    assert abs(declination["intersection_angle_deg"] - nominal_raw["intersection_angle_deg"]) > 0.05
+
+
+def test_declination_pose_selection_rejects_missing_and_stale_gps() -> None:
+    node = _node()
+    snapshot = node._camera_oracle_snapshot()
+    _seed_attitudes(node)
+
+    poses, status = node._px4_attitude_declination_camera_poses(snapshot)
+    assert poses is None
+    assert status == "missing_left_gps_fix"
+
+    _seed_gps_matching_nominal_baseline(node)
+    poses, status = node._px4_attitude_declination_camera_poses(snapshot)
+    assert poses is not None
+    assert status == "available"
+
+    old = time.monotonic_ns() - int((node.gps_baseline_max_age_s + 0.1) * 1.0e9)
+    left_fix, _old_ns, epoch, ts_ns = node.gps_baseline_fixes["left"]
+    node.gps_baseline_fixes["left"] = (left_fix, old, epoch, ts_ns)
+    poses, status = node._px4_attitude_declination_camera_poses(snapshot)
+    assert poses is None
+    assert status == "stale_left_gps_fix"
+
+
 def test_attitude_pose_selection_rejects_stale_skewed_and_old_epoch_samples() -> None:
     node = _node()
     snapshot = node._camera_oracle_snapshot()

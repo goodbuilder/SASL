@@ -42,6 +42,7 @@ CAMERA_POSE_COORDINATION_METHODS = [
     "_legacy_attitude_sample",
     "_px4_attitude_camera_poses",
     "_px4_attitude_true_north_camera_poses",
+    "_px4_attitude_declination_camera_poses",
     "_global_baseline_callback",
     "_gps_fix_entry",
     "_gps_baseline_enu_m",
@@ -375,6 +376,21 @@ class CameraPoseCoordinator:
         observation_timestamp_ns=None,
     ):
         return self.node._pose_conversion_adapter()._px4_attitude_true_north_camera_poses(
+            camera_sources,
+            include_provenance=include_provenance,
+            operational_snapshot=operational_snapshot,
+            observation_timestamp_ns=observation_timestamp_ns,
+        )
+
+    def _px4_attitude_declination_camera_poses(
+        self,
+        camera_sources,
+        *,
+        include_provenance=False,
+        operational_snapshot=None,
+        observation_timestamp_ns=None,
+    ):
+        return self.node._pose_conversion_adapter()._px4_attitude_declination_camera_poses(
             camera_sources,
             include_provenance=include_provenance,
             operational_snapshot=operational_snapshot,
