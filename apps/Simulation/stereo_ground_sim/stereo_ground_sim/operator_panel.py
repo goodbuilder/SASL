@@ -94,6 +94,7 @@ SERIES = (
     ("operational", None, QColor(0, 0, 0)),
     ("attitude_true_north", None, QColor(0, 217, 102)),
     ("attitude_declination", None, QColor(230, 200, 20)),
+    ("operational_true_north", None, QColor(30, 144, 255)),
 )
 SERIES_LABELS = {
     # "truth" subscribes to /ground_truth_position, the literal Gazebo
@@ -113,6 +114,7 @@ SERIES_LABELS = {
     "operational": "Operational",
     "attitude_true_north": "Attitude (True North)",
     "attitude_declination": "Attitude (Declination)",
+    "operational_true_north": "Operational (True North)",
     "uam_raw_gps_reference": "UAM GPS",
 }
 _IMAGE_TOPIC_MODE = os.environ.get("RQT_IMAGE_TOPIC_MODE", "detection").strip().lower()
@@ -615,6 +617,7 @@ RAY_DIAGNOSTICS_ROWS = (
     ("operational", "Operational"),
     ("attitude_true_north", "Attitude (True North)"),
     ("attitude_declination", "Attitude (Declination)"),
+    ("operational_true_north", "Operational (True North)"),
 )
 
 # Coarse state buckets derived from the existing computation_status/failure_reason
@@ -2587,7 +2590,7 @@ class OperatorPanel(Plugin):
         # them from here instead of the SERIES topic-subscription loop.
         for ray_key in (
             "global_baseline", "attitude", "operational",
-            "attitude_true_north", "attitude_declination",
+            "attitude_true_north", "attitude_declination", "operational_true_north",
         ):
             ray = parsed.get(ray_key)
             if not isinstance(ray, dict):

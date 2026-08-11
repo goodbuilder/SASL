@@ -331,6 +331,7 @@ RAY_DISPLAY_NAMES = {
     "operational": "Operational",
     "attitude_true_north": "Attitude (True North)",
     "attitude_declination": "Attitude (Declination)",
+    "operational_true_north": "Operational (True North)",
 }
 
 GPS_BASELINE_ANCHOR_POLICY = (

@@ -67,9 +67,12 @@ def test_orchestrator_keeps_world_pose_inputs_and_frd_outputs_separate():
     assert result["attitude_declination"]["output_frame"] == "baseline_center_frd"
     assert result["operational"]["output_frame"] == "baseline_center_frd"
     assert result["operational"]["baseline_anchor_policy"] == "nominal_left_plus_relative_enu"
+    assert result["operational_true_north"]["output_frame"] == "baseline_center_frd"
     # Call order: attitude ray (pose + triangulate), attitude_true_north ray
     # (pose + triangulate), attitude_declination ray (pose + triangulate),
-    # then the gps-baseline-fed operational ray (pose + triangulate).
+    # the gps-baseline-fed operational ray (pose + triangulate), then
+    # operational_true_north reusing the same gps_poses result with the
+    # true-north pose callback (pose + triangulate).
     assert calls[0][1] == "gazebo_snapshot"
     assert calls[1][1] == "left_world_enu"
     assert calls[2][1] == "gazebo_snapshot"
@@ -79,6 +82,8 @@ def test_orchestrator_keeps_world_pose_inputs_and_frd_outputs_separate():
     assert calls[6][1] == "gps_baseline"
     assert calls[7][1] == ("left_enu", "right_enu")
     assert calls[8][1] == "left_world_enu"
+    assert calls[9][1] == ("left_enu", "right_enu")
+    assert calls[10][1] == "left_true_north_enu"
     assert calls[0][2]["observation_timestamp_ns"] == 42
 
 
@@ -116,3 +121,8 @@ def test_orchestrator_reports_gps_and_attitude_failures_without_triangulating():
     assert result["attitude_declination"]["failure_reason"] == "shared_true_north_heading_undefined"
     assert result["operational"]["failure_reason"] == "gps:stale_gps;attitude:stale_attitude"
     assert result["operational"]["valid"] is False
+    assert (
+        result["operational_true_north"]["failure_reason"]
+        == "gps:stale_gps;attitude:missing_left_gps_fix"
+    )
+    assert result["operational_true_north"]["valid"] is False

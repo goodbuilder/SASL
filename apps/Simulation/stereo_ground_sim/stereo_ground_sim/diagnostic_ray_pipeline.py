@@ -133,11 +133,49 @@ class DiagnosticRayOrchestrator:
                 ),
                 provenance=provenance,
             )
+        true_north_full_poses, true_north_full_status, true_north_full_provenance = (
+            None, true_north_status, true_north_provenance,
+        )
+        if gps_poses is not None:
+            true_north_full_poses, true_north_full_status, true_north_full_provenance = d["true_north_attitude_poses"](
+                gps_poses, include_provenance=True,
+                operational_snapshot=operational_snapshot,
+                observation_timestamp_ns=observation_timestamp_ns,
+            )
+        operational_true_north_provenance = {
+            **gps_provenance, **true_north_full_provenance,
+            "pixel_source": "observed",
+            "baseline_source": "px4_raw_sensor_gps",
+            "baseline_anchor_policy": self.gps_baseline_anchor_policy,
+            "left_camera_center_source": "nominal_left_optical_center_anchor",
+            "right_camera_center_source": "nominal_left_anchor_plus_px4_relative_enu_separation",
+        }
+        if gps_poses is None or true_north_full_poses is None:
+            status = gps_status if gps_poses is None else true_north_full_status
+            reasons = []
+            if gps_poses is None:
+                reasons.append(f"gps:{gps_status}")
+            if true_north_full_poses is None:
+                reasons.append(f"attitude:{true_north_full_status}")
+            operational_true_north = finalize_diagnostic_ray(
+                {"computation_status": status}, provenance=operational_true_north_provenance,
+                failure_reason=";".join(reasons),
+            )
+        else:
+            operational_true_north = finalize_diagnostic_ray(
+                d["triangulate"](
+                    *pixels, left_camera_pose=true_north_full_poses[0],
+                    right_camera_pose=true_north_full_poses[1],
+                ),
+                provenance=operational_true_north_provenance,
+            )
+
         return {
             "attitude": attitude,
             "operational": operational,
             "attitude_true_north": attitude_true_north,
             "attitude_declination": attitude_declination,
+            "operational_true_north": operational_true_north,
         }
 
 

@@ -227,6 +227,7 @@ class RvizVisualizationPublisher:
         operational=None,
         attitude_true_north=None,
         attitude_declination=None,
+        operational_true_north=None,
         gt_source=None,
         gt_fallback_used=None,
     ):
@@ -246,6 +247,7 @@ class RvizVisualizationPublisher:
             operational=operational,
             attitude_true_north=attitude_true_north,
             attitude_declination=attitude_declination,
+            operational_true_north=operational_true_north,
         )
         if payload:
             publisher.publish(String(data=json.dumps(payload, sort_keys=True)))
@@ -286,7 +288,7 @@ class RvizVisualizationPublisher:
         self, nominal_pose=None, optical_pose=None, ideal=None,
         gps_baseline=None, global_baseline=None, attitude=None,
         operational=None, attitude_true_north=None, attitude_declination=None,
-        uam_gps_ray=None,
+        operational_true_north=None, uam_gps_ray=None,
     ):
         """Publish stereo rays in World ENU, including the UAM GPS ray.
 
@@ -405,6 +407,23 @@ class RvizVisualizationPublisher:
                 right_color=(0.0, 0.85, 0.4),
                 gap_color=(0.45, 0.95, 0.7),
                 midpoint_color=(0.0, 0.85, 0.4),
+            )
+        )
+        markers.extend(
+            marker_group(
+                operational_true_north,
+                label="operational_true_north",
+                marker_id=110,
+                # Dodger blue denotes the operational (raw-GPS-baseline
+                # position) pipeline with the same per-camera GPS-baseline
+                # True-North yaw correction as attitude_true_north applied
+                # on top -- see _px4_attitude_true_north_camera_poses, called
+                # here with gps_poses (not the Gazebo oracle snapshot) as
+                # camera_sources.
+                left_color=(0.118, 0.565, 1.0),
+                right_color=(0.118, 0.565, 1.0),
+                gap_color=(0.55, 0.75, 1.0),
+                midpoint_color=(0.118, 0.565, 1.0),
             )
         )
         markers.extend(

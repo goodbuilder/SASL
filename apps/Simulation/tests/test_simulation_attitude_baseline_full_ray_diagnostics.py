@@ -666,6 +666,77 @@ def test_declination_pose_selection_rejects_missing_and_stale_gps() -> None:
     assert status == "stale_left_gps_fix"
 
 
+# ---------------------------------------------------------------------------
+# operational_true_north -- the operational (raw-GPS-baseline position)
+# pipeline with the same per-camera GPS-baseline True-North yaw correction
+# as attitude_true_north layered on top. Requires no new pose-conversion
+# method: _px4_attitude_true_north_camera_poses's correction math depends
+# only on orientation (from live PX4 attitude) and the GPS bearing, never on
+# camera_sources' own position, so calling it with gps_poses in place of the
+# Gazebo-oracle snapshot is already fully correct.
+# ---------------------------------------------------------------------------
+
+
+def test_operational_true_north_common_bias_is_recovered_and_right_error_improves_over_operational() -> None:
+    node = _node()
+    injected_bias_deg = 0.30
+    _seed_attitudes(
+        node,
+        left_q=_yaw_q_wxyz(injected_bias_deg),
+        right_q=_yaw_q_wxyz(injected_bias_deg),
+    )
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    expected_frd = (900.0, 3.0, -2.0)
+    pixels = _observed_pixels_for_baseline_point(node, expected_frd)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+    corrected = diagnostics["operational_true_north"]
+    operational = diagnostics["operational"]
+
+    assert corrected["computation_status"] == "computed"
+    assert corrected["valid"] is True
+    # Reuses attitude_true_north's correction math verbatim -- same
+    # provenance fields, same recovered correction values.
+    assert abs(corrected["left_true_north_yaw_correction_deg"] - (-injected_bias_deg)) < 1.0e-2
+    assert abs(corrected["right_true_north_yaw_correction_deg"] - (-injected_bias_deg)) < 1.0e-2
+    assert abs(corrected["differential_yaw_correction_deg"]) < 1.0e-2
+    biased_right_error = abs(operational["right_m"] - expected_frd[1])
+    corrected_right_error = abs(corrected["right_m"] - expected_frd[1])
+    assert corrected_right_error < biased_right_error * 0.1
+
+
+def test_operational_true_north_position_source_is_raw_gps_baseline_not_gazebo_oracle() -> None:
+    """Distinguishes operational_true_north from attitude_true_north: both
+    apply the identical yaw correction, but operational_true_north's camera
+    *positions* must come from the raw GPS baseline (like operational), not
+    the Gazebo-observed optical centers (like attitude_true_north)."""
+
+    node = _node()
+    _seed_attitudes(node)
+    _seed_gps_matching_nominal_baseline(node, declination_deg=0.0)
+    pixels = _observed_pixels_for_baseline_point(node)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+
+    assert diagnostics["operational_true_north"]["baseline_source"] == "px4_raw_sensor_gps"
+    assert diagnostics["attitude_true_north"]["baseline_source"] == "gazebo_observed_optical_centers"
+
+
+def test_operational_true_north_fails_closed_on_missing_gps_with_combined_reason() -> None:
+    node = _node()
+    _seed_attitudes(node)  # no GPS seeded at all
+    pixels = _observed_pixels_for_baseline_point(node)
+
+    diagnostics = node._diagnostic_rays(*pixels, 1280, 720, node._camera_oracle_snapshot())
+
+    operational_true_north = diagnostics["operational_true_north"]
+    assert operational_true_north["valid"] is False
+    assert operational_true_north["computation_status"] == "missing_left_gps_fix"
+    assert operational_true_north["failure_reason"] == (
+        "gps:missing_left_gps_fix;attitude:missing_left_gps_fix"
+    )
+
+
 def test_attitude_pose_selection_rejects_stale_skewed_and_old_epoch_samples() -> None:
     node = _node()
     snapshot = node._camera_oracle_snapshot()

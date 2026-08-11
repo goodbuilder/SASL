@@ -724,6 +724,7 @@ class PairResultCoordinator:
             ("global_baseline", metrics.get("_gps_baselines", {}).get("global_baseline")),
             ("attitude_true_north", diagnostic_rays.get("attitude_true_north")),
             ("attitude_declination", diagnostic_rays.get("attitude_declination")),
+            ("operational_true_north", diagnostic_rays.get("operational_true_north")),
         ):
             if isinstance(ray, dict):
                 ray.update(ray_gt_error(ray, gt_baseline))
