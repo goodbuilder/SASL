@@ -74,8 +74,6 @@ class StatusIndicator(QtWidgets.QFrame):
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setHorizontalSpacing(7)
         layout.setVerticalSpacing(0)
-        self.dot = QtWidgets.QLabel("●")
-        self.dot.setFixedWidth(14)
         self.label = QtWidgets.QLabel(label)
         self.label.setObjectName("statusIndicatorLabel")
         self.state = QtWidgets.QLabel("UNKNOWN")
@@ -85,11 +83,10 @@ class StatusIndicator(QtWidgets.QFrame):
         self.detail = QtWidgets.QLabel("--")
         self.detail.setObjectName("statusIndicatorDetail")
         self.detail.setWordWrap(True)
-        layout.addWidget(self.dot, 0, 0, 2, 1)
-        layout.addWidget(self.label, 0, 1)
-        layout.addWidget(self.state, 0, 2)
-        layout.addWidget(self.age, 0, 3)
-        layout.addWidget(self.detail, 1, 1, 1, 3)
+        layout.addWidget(self.label, 0, 0)
+        layout.addWidget(self.state, 0, 1)
+        layout.addWidget(self.age, 0, 2)
+        layout.addWidget(self.detail, 1, 0, 1, 3)
         self.setStyleSheet(
             f"QFrame#statusIndicator {{ background: {PANEL_ALT_BG}; border: 1px solid {PANEL_BORDER}; }}"
         )
@@ -106,7 +103,6 @@ class StatusIndicator(QtWidgets.QFrame):
         if status is None:
             self.state.setText("UNKNOWN")
             self.detail.setText("no evidence")
-            self.dot.setStyleSheet(f"color: {TEXT_MUTED};")
             self.state.setStyleSheet(f"color: {TEXT_MUTED};")
             self.age.clear()
             self.setToolTip("No status evidence")
@@ -128,8 +124,7 @@ class StatusIndicator(QtWidgets.QFrame):
         self.age.setText("" if status.age_s is None else _format_age(status.age_s))
         detail = status.detail or "--"
         self.detail.setText(_compact_status_detail(detail))
-        self.dot.setStyleSheet(f"color: {color};")
-        self.state.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self.state.setStyleSheet(f"color: {color};")
         self.age.setStyleSheet(f"color: {TEXT_MUTED};")
         tooltip_lines = [f"{status.label}: {status.state}", detail]
         tooltip_lines.append(f"Clock: {status.clock}{age}")
@@ -208,7 +203,7 @@ class EngineeringValue(QtWidgets.QWidget):
         if valid is not None:
             status_text = "VALID" if valid else "INVALID"
             status_color = SUCCESS if valid else ERROR
-            flags.append(f'<span style="color:{status_color}; font-weight:600;">● {status_text}</span>')
+            flags.append(f'<span style="color:{status_color};">{status_text}</span>')
         if age_s is not None:
             flags.append(f'<span style="color:{TEXT_MUTED};">{_format_age(age_s)}</span>')
         self.meta.setText(" · ".join(flags))

@@ -71,8 +71,8 @@ in-app execution button.
 their RTCP/NTP pair decision at capture time, then encodes PNG files and runs checkerboard
 detection in the shared background calibration slot. Its purpose is to prevent image
 encoding and OpenCV detection from blocking live controls. A stereo capture assumes both
-frames contain RTCP/NTP camera timestamps within the configured pair limit; otherwise
-neither side is admitted as a stereo pair. The output contract is unchanged OpenCV image
+frames contain RTCP/NTP camera timestamps within the 100 ms pair limit; otherwise neither
+side is admitted as a stereo pair. The output contract is unchanged OpenCV image
 pixels with capture metadata recording the original RTCP/NTP timestamps and delta. PASS
 means at least one available image was encoded and passed checkerboard detection (or was
 explicitly retained because OpenCV was unavailable); FAIL leaves rejected images out of the
@@ -87,6 +87,33 @@ pairs. The output contract remains OpenCV optical RDF intrinsics and
 `X_right = R_left_to_right * X_left + T_left_to_right_m`. Completion with a typed calibration
 result is PASS; an OpenCV/input exception or invalid result is FAIL and leaves the prior
 applied result unchanged.
+
+`R,t only` is the fixed-intrinsic stereo path. Its purpose is to estimate the physical
+left/right rig transform from a large checkerboard without replacing the selected K,D.
+Inputs are a selected intrinsics profile, matching synchronized left/right checkerboard
+pairs, checkerboard dimensions, and square size in metres. It calls OpenCV stereo
+calibration with `CALIB_FIX_INTRINSIC`. Output is a standalone stereo-extrinsics profile:
+`R_left_to_right`, `T_left_to_right_m`, method, source zoom, source-intrinsics path/hash,
+pair count, reprojection error, and the frame contract
+`X_right = R_left_to_right X_left + T_left_to_right_m`. The derived right-camera origin in
+left optical RDF is recorded separately as `C_right_in_left = -R^T T`; it must not be
+treated as an alias of OpenCV T. PASS means at least three stereo pairs produced a finite,
+proper rotation and metre translation. Input/OpenCV errors are FAIL and leave the previous
+candidate unchanged.
+
+Intrinsics and extrinsics are independently selectable. A supported manual configuration
+is, for example, `intrinsics_zoom_08.json + extrinsics_zoom_01_large_board.json`. Source
+zoom mismatch, missing external validation, and failed zoom readback are informational and
+do not block `Apply K,D + R,t`. Only malformed or non-computable data is rejected. The
+application records both paths, hashes, source zooms, the manual/cross-zoom selection, and
+`validation_gate=disabled` in measurement/recording provenance. Physical validity across
+zoom is an external experiment decision and is not promoted to calibration-time or runtime
+truth by the Workstation.
+
+The Calibration workspace can set both visible cameras to nominal 1× or 8× and query
+each camera with `GZVV`. Requested and read-back values remain separate. A mismatch is
+displayed as evidence only; it does not disable calibration bundle application or runtime
+measurement.
 
 `Random stereo-pair validation` repeats the same calculation on seeded subsets in the same
 background calculation slot. It assumes a completed full result and at least three matching

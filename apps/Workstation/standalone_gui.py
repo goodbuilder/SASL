@@ -32,13 +32,17 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workstation_core.calibration import (
     CheckerboardConfig,
+    StereoExtrinsicsProfile,
     StereoIntrinsicsResult,
     calibrate_camera_from_images,
     calibrate_stereo_extrinsics_from_image_pairs,
+    compose_stereo_calibration,
     detect_checkerboard,
+    intrinsics_content_sha256,
     opencv_available,
     load_intrinsics_json,
     save_intrinsics_json,
+    without_stereo_extrinsics,
 )
 
 from Workstation.workstation_core.attitude_geometry import (
@@ -325,6 +329,10 @@ from Workstation.workstation_core.wiris_zoom import (
     build_zoom_command,
     send_tcp_line,
 )
+from Workstation.wiris_sdk_catalog import (
+    WIRIS_COMMAND_CATALOG,
+    WIRIS_DANGEROUS_COMMAND_PREFIXES,
+)
 
 
 def angle_diff_deg(a_deg: float, b_deg: float) -> float:
@@ -380,6 +388,10 @@ RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
+# WIRIS cameras expose the SDK and RTSP services a short time after power-up.
+# Keep auto-connect responsive while allowing that normal boot window to settle.
+CAMERA_AUTO_CONNECT_MAX_ATTEMPTS = 6
+CAMERA_AUTO_CONNECT_RETRY_DELAY_MS = 1_500
 
 
 def _format_visible_zoom_fx_estimates() -> str:
@@ -397,107 +409,6 @@ def _format_visible_zoom_fx_estimates() -> str:
 
 
 WIRIS_VISIBLE_ZOOM_FX_TOOLTIP = _format_visible_zoom_fx_estimates()
-
-WIRIS_COMMAND_CATALOG = (
-    ("Activation", "Check SDK activation", "IACT", LINE_TERMINATOR, "SDK 활성화 상태를 TRUE/FALSE로 읽습니다."),
-    ("Activation", "Activate SDK", "ACTV <ACTIVATION-CODE>", LINE_TERMINATOR, "활성화 코드로 SDK를 활성화합니다. 전송 전에 실제 코드로 바꾸세요."),
-    ("Activation", "Get Ethernet Mode", "GETH", LINE_TERMINATOR, "Ethernet/RTSP 모드 상태를 TRUE/FALSE로 읽습니다."),
-    ("Activation", "Set Ethernet Mode ON", "SETH TRUE", LINE_TERMINATOR, "Ethernet/RTSP 모드를 켜서 영상 송출을 시작합니다."),
-    ("Activation", "Set Ethernet Mode OFF", "SETH FALSE", LINE_TERMINATOR, "Ethernet/RTSP 모드를 끕니다."),
-    ("Activation", "Set SDK Port", "SSDK <port>", LINE_TERMINATOR, "SDK 제어 TCP 포트를 변경합니다."),
-    ("Basic", "Check connection", "HIWS", LINE_TERMINATOR, "연결 확인 명령입니다. 정상 응답은 OK입니다."),
-    ("Basic", "Set delimiter NULL", "SDLM NULL", LINE_TERMINATOR, "명령 구분자를 NULL로 설정합니다."),
-    ("Basic", "Set delimiter LINE", "SDLM LINE", LINE_TERMINATOR, "명령 구분자를 줄바꿈 문자로 설정합니다."),
-    ("Basic", "Get delimiter", "GDLM", LINE_TERMINATOR, "현재 명령 구분자 설정을 읽습니다."),
-    ("Basic", "Get serial number", "GSRN", LINE_TERMINATOR, "카메라 시리얼 번호를 읽습니다."),
-    ("Basic", "Get article number", "GATN", LINE_TERMINATOR, "카메라 article 번호를 읽습니다."),
-    ("Basic", "Get firmware version", "GFWV", LINE_TERMINATOR, "카메라 펌웨어 버전을 읽습니다."),
-    ("Basic", "Get CPU temperature", "GTCU", LINE_TERMINATOR, "CPU 온도를 읽습니다."),
-    ("Basic", "Get internal core temperature", "GTIC", LINE_TERMINATOR, "카메라 내부 core 온도를 읽습니다."),
-    ("Basic", "Get inside temperature", "GTIN", LINE_TERMINATOR, "카메라 내부 온도를 읽습니다."),
-    ("Basic", "Get fan power", "GFPW", LINE_TERMINATOR, "팬 출력 상태를 읽습니다."),
-    ("Date/Time", "Get date/time", "GDTI", LINE_TERMINATOR, "현재 카메라 날짜/시간을 읽습니다."),
-    (
-        "Date/Time",
-        "Set Unix time",
-        "STUS <unix_seconds> <microseconds>",
-        LINE_TERMINATOR,
-        "카메라 시간을 Unix epoch 초+마이크로초로 설정합니다. 재부팅 후 유지되지 않을 수 있습니다.",
-    ),
-    (
-        "Date/Time",
-        "Set date/time text",
-        "SDTI yyyy/MM/dd-hh:mm:ss",
-        LINE_TERMINATOR,
-        "카메라 시간을 날짜 문자열로 설정합니다. 재부팅 후 유지되지 않을 수 있습니다.",
-    ),
-    ("Menu", "Move up", "MOVE UP", LINE_TERMINATOR, "카메라 메뉴에서 위로 이동합니다."),
-    ("Menu", "Move down", "MOVE DOWN", LINE_TERMINATOR, "카메라 메뉴에서 아래로 이동합니다."),
-    ("Menu", "Move OK", "MOVE OK", LINE_TERMINATOR, "카메라 메뉴에서 현재 항목을 확인합니다."),
-    ("Menu", "Move cancel", "MOVE CANCEL", LINE_TERMINATOR, "카메라 메뉴에서 취소하거나 뒤로 이동합니다."),
-    ("GPS", "Get GPS coordinates", "GGPS", LINE_TERMINATOR, "사용 가능할 때 카메라 GPS 좌표를 읽습니다."),
-    ("Appearance", "Set main camera thermal", "SMCA THERMO", LINE_TERMINATOR, "열화상 카메라를 메인 카메라로 설정합니다."),
-    ("Appearance", "Set main camera visible", "SMCA VISIBLE", LINE_TERMINATOR, "가시광 카메라를 메인 카메라로 설정합니다."),
-    ("Appearance", "Get main camera", "GMCA", LINE_TERMINATOR, "현재 메인 카메라 설정을 읽습니다."),
-    ("Appearance", "Set GPS info position", "SGPI POSITION", LINE_TERMINATOR, "화면 GPS 정보 표시를 위치 정보로 설정합니다."),
-    ("Appearance", "Set GPS info altitude/speed", "SGPI ALTITUDE_SPEED", LINE_TERMINATOR, "화면 GPS 정보 표시를 고도/속도 정보로 설정합니다."),
-    ("Appearance", "Get GPS info mode", "GGPI", LINE_TERMINATOR, "현재 GPS 정보 표시 모드를 읽습니다."),
-    ("Zoom", "Zoom in", "SZIN", LINE_TERMINATOR, "선택한 카메라를 줌 인합니다."),
-    ("Zoom", "Zoom out", "SZOT", LINE_TERMINATOR, "선택한 카메라를 줌 아웃합니다."),
-    ("Zoom", "Stop focus/zoom action", "SGFA", LINE_TERMINATOR, "지원되는 경우 진행 중인 포커스/줌 동작을 중지합니다."),
-    ("Zoom", "Set simultaneous zoom ON", "SZSM TRUE", LINE_TERMINATOR, "열화상/가시광 카메라를 동시에 줌하도록 설정합니다."),
-    ("Zoom", "Set simultaneous zoom OFF", "SZSM FALSE", LINE_TERMINATOR, "열화상/가시광 동시 줌을 끕니다."),
-    ("Zoom", "Get simultaneous zoom", "GZSM", LINE_TERMINATOR, "동시 줌 설정 상태를 읽습니다."),
-    ("Zoom", "Set thermal zoom", "SZTN <index>", LINE_TERMINATOR, "열화상 줌 값을 설정합니다. <index>를 지원 값으로 바꾸세요."),
-    ("Zoom", "Get thermal zoom", "GZTV", LINE_TERMINATOR, "현재 열화상 줌 값을 읽습니다."),
-    ("Zoom", "Get thermal zoom list", "GZTL", LINE_TERMINATOR, "지원되는 열화상 줌 값 목록을 읽습니다."),
-    ("Zoom", "Set visible zoom", "SZVN <index>", LINE_TERMINATOR, "가시광 줌 값을 설정합니다. <index>를 지원 값으로 바꾸세요."),
-    ("Zoom", "Get visible zoom", "GZVV", LINE_TERMINATOR, "현재 가시광 줌 값을 읽습니다."),
-    ("Capture/Record", "Recording start", "RCRS", LINE_TERMINATOR, "카메라 자체 녹화를 시작합니다."),
-    ("Capture/Record", "Recording finish", "RCRF", LINE_TERMINATOR, "카메라 자체 녹화를 종료합니다."),
-    ("Capture/Record", "Is recording", "IRCR", LINE_TERMINATOR, "카메라 녹화 상태를 읽습니다."),
-    ("Capture/Record", "Set periodic capture", "SPIC <period>", LINE_TERMINATOR, "주기 캡처 값을 설정합니다. <period>를 SDK 지원 값으로 바꾸세요."),
-    ("Capture/Record", "Get periodic capture", "GPIC", LINE_TERMINATOR, "현재 주기 캡처 설정을 읽습니다."),
-    ("Stream", "Get thermal resolution", "GTRE", LINE_TERMINATOR, "열화상 스트림 해상도를 읽습니다."),
-    ("Stream", "Set encoder bitrate", "SEBR VISIBLE <bitrate>", LINE_TERMINATOR, "가시광 스트림/녹화 인코더 bitrate를 설정합니다."),
-    ("Stream", "Get encoder bitrate", "GEBR VISIBLE", LINE_TERMINATOR, "가시광 인코더 bitrate 설정을 읽습니다."),
-    ("Stream", "Set GOP size", "SEGS VISIBLE <gop>", LINE_TERMINATOR, "가시광 인코더 GOP 크기를 설정합니다."),
-    ("Stream", "Get GOP size", "GEGS VISIBLE", LINE_TERMINATOR, "가시광 인코더 GOP 크기를 읽습니다."),
-    ("Stream", "Set IDR interval", "SEIR VISIBLE <idr>", LINE_TERMINATOR, "가시광 인코더 IDR 간격을 설정합니다."),
-    ("Stream", "Get IDR interval", "GEIR VISIBLE", LINE_TERMINATOR, "가시광 인코더 IDR 간격을 읽습니다."),
-    ("Stream", "Set quantization quality", "SEQZ VISIBLE <qp>", LINE_TERMINATOR, "가시광 인코더 QP 값을 설정합니다. 범위는 0-51입니다."),
-    ("Stream", "Get quantization quality", "GEQZ VISIBLE", LINE_TERMINATOR, "가시광 인코더 QP 설정을 읽습니다."),
-    ("Trigger", "Set trigger correction", "STRG CORRECTION", LINE_TERMINATOR, "외부 trigger 입력을 보정 동작으로 설정합니다."),
-    ("Trigger", "Set trigger capture", "STRG CAPTURE", LINE_TERMINATOR, "외부 trigger 입력을 이미지 캡처 동작으로 설정합니다."),
-    ("Trigger", "Set trigger record", "STRG RECORD", LINE_TERMINATOR, "외부 trigger 입력을 녹화 제어 동작으로 설정합니다."),
-    ("Trigger", "Disable trigger action", "STRG NA", LINE_TERMINATOR, "외부 trigger 동작을 사용하지 않도록 설정합니다."),
-    ("Trigger", "Get trigger action", "GTRG", LINE_TERMINATOR, "현재 외부 trigger 동작 설정을 읽습니다."),
-    ("System", "Set IP address", "STIP <IPv4>", LINE_TERMINATOR, "카메라 IP 주소를 변경합니다."),
-    ("System", "Set subnet mask", "STMS <mask>", LINE_TERMINATOR, "카메라 서브넷 마스크를 변경합니다."),
-    ("System", "Get subnet mask", "GTMS", LINE_TERMINATOR, "현재 서브넷 마스크를 읽습니다."),
-    ("System", "Set gateway", "STGW <gateway>", LINE_TERMINATOR, "카메라 gateway 주소를 변경합니다."),
-    ("System", "Get gateway", "GTGW", LINE_TERMINATOR, "현재 gateway 주소를 읽습니다."),
-    ("System", "Manual gateway ON", "SMGW TRUE", LINE_TERMINATOR, "수동 gateway 설정을 사용합니다."),
-    ("System", "Manual gateway OFF", "SMGW FALSE", LINE_TERMINATOR, "수동 gateway 설정을 끕니다."),
-    ("System", "Get manual gateway", "GMGW", LINE_TERMINATOR, "수동 gateway 사용 여부를 읽습니다."),
-    ("System", "Reboot", "REBT", LINE_TERMINATOR, "카메라를 재부팅합니다."),
-    ("Custom", "Custom SDK command", "", LINE_TERMINATOR, "SDK 명령을 직접 입력합니다."),
-)
-WIRIS_DANGEROUS_COMMAND_PREFIXES = (
-    "ACTV",
-    "SSDK",
-    "SETH FALSE",
-    "STIP",
-    "STMS",
-    "STGW",
-    "SMGW",
-    "STUS",
-    "SDTI",
-    "REBT",
-    "RCRS",
-    "RCRF",
-)
-
 
 from Workstation.workstation_core.runtime_camera_status import (
     camera_display_name,
@@ -618,12 +529,14 @@ class CameraAutoDetectWorker(QtCore.QObject):
         control_port: int | None = None,
         host_hints: tuple[str, ...] = (),
         target_side: str | None = None,
+        full_control_scan: bool = True,
     ) -> None:
         super().__init__()
         self.mode = mode
         self.control_port = control_port
         self.host_hints = tuple(host_hints)
         self.target_side = target_side
+        self.full_control_scan = bool(full_control_scan)
 
     def _discover_wiris_control(self, arp_scan_reports: list[object]) -> tuple[list[object], list[dict[str, object]]]:
         preferred_ports = _preferred_wiris_control_ports(self.control_port)
@@ -640,15 +553,17 @@ class CameraAutoDetectWorker(QtCore.QObject):
         if len([candidate for candidate in preferred_verified if candidate.get("ok")]) >= 2:
             return list(preferred_candidates), preferred_verified
 
-        full_scan_candidates = discover_tcp_port_range_candidates(
-            _full_wiris_control_port_sequence(self.control_port),
-            timeout=0.08,
-            max_hosts_per_network=0,
-            fallback_scan_if_empty=False,
-            stop_after=None,
-            arp_scan_reports=None,
-            host_hints=self.host_hints,
-        )
+        full_scan_candidates: list[object] = []
+        if self.full_control_scan:
+            full_scan_candidates = discover_tcp_port_range_candidates(
+                _full_wiris_control_port_sequence(self.control_port),
+                timeout=0.08,
+                max_hosts_per_network=0,
+                fallback_scan_if_empty=False,
+                stop_after=None,
+                arp_scan_reports=None,
+                host_hints=self.host_hints,
+            )
 
         fallback_candidates: list[object] = []
         if len([candidate for candidate in preferred_verified if candidate.get("ok")]) < 2:
@@ -682,6 +597,7 @@ class CameraAutoDetectWorker(QtCore.QObject):
                 control, verified = self._discover_wiris_control(arp_scan_reports)
                 result = {
                     "mode": "auto_connect",
+                    "full_control_scan": self.full_control_scan,
                     "host_interfaces": host_interfaces,
                     "control": control,
                     "verified_control": verified,
@@ -691,6 +607,7 @@ class CameraAutoDetectWorker(QtCore.QObject):
                 control, verified = self._discover_wiris_control(arp_scan_reports)
                 result = {
                     "mode": "control",
+                    "full_control_scan": self.full_control_scan,
                     "target_side": self.target_side,
                     "host_interfaces": host_interfaces,
                     "control": control,
@@ -803,6 +720,7 @@ from Workstation.wiris_runtime_workers import (
     RtspStreamCheckWorker,
     WirisClockCommandWorker,
     WirisCommandWorker,
+    WirisLrfPollWorker,
     WirisRtspEnableWorker,
     WirisStipWorker,
     WirisZoomWorker,
@@ -816,8 +734,6 @@ from Workstation.app_lifecycle_controller import (
     AppLifecycleController,
 )
 from Workstation.camera_time_sync_controller import (
-    CAMERA_GDTI_MAX_PAIR_DELTA_S,
-    CAMERA_GDTI_RESOLUTION_S,
     CAMERA_RTCP_MAX_PC_OFFSET_S,
     CAMERA_RTCP_PAIR_MAX_DELTA_S,
     CAMERA_SYNC_FRAME_HISTORY_WINDOW_S,
@@ -1013,6 +929,7 @@ class NoWheelSpinBox(QtWidgets.QSpinBox):
 class WirisStereoDistancePanel(QtWidgets.QWidget):
     calibration_preview_requested = QtCore.pyqtSignal(object)
     calibration_preview_changed = QtCore.pyqtSignal(object)
+    camera_preview_cleared = QtCore.pyqtSignal()
     wiris_command_response = QtCore.pyqtSignal(object)
 
     def event(self, event: QtCore.QEvent) -> bool:  # noqa: N802 - Qt override.
@@ -1053,6 +970,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.latest_right: DetectionObservation | None = None
         self.latest_calibration_preview_images: dict[str, QtGui.QImage] = {}
         self.calibration_preview_overlay_images: dict[str, QtGui.QImage] = {}
+        self.calibration_preview_detection_results: dict[str, dict[str, object]] = {}
         self.calibration_preview_times = {
             "left": 0.0,
             "right": 0.0,
@@ -1085,10 +1003,32 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.checkerboard_validation_result: StereoIntrinsicsResult | None = None
         self.checkerboard_validation_result_mode = "pixhawk"
         self.checkerboard_validation_summary: dict[str, object] = {}
+        self.checkerboard_validation_run_results: list[dict[str, object]] = []
         self.checkerboard_validation_result_saved = False
+        self.calibration_progress: dict[str, object] = {
+            "phase": "idle",
+            "processed": 0,
+            "total": 0,
+            "percent": 0.0,
+            "message": "대기",
+        }
         self.last_calibration_zoom_level: int | None = None
         self.active_intrinsics: StereoIntrinsicsResult | None = None
         self._active_intrinsics_profile_path = ""
+        self.selected_extrinsics_profile: StereoExtrinsicsProfile | None = None
+        self._selected_extrinsics_profile_path = ""
+        self._selected_extrinsics_profile_hash = ""
+        self._active_intrinsics_profile_hash = ""
+        self._active_intrinsics_source_zoom_level: int | None = None
+        self._active_extrinsics_profile_path = ""
+        self._active_extrinsics_profile_hash = ""
+        self._active_extrinsics_source_zoom_level: int | None = None
+        self._active_calibration_selection_mode = ""
+        self.actual_visible_zoom: dict[str, dict[str, object]] = {
+            "left": {},
+            "right": {},
+        }
+        self._zoom_readback_target: str | None = None
         self.zoom_intrinsics_compare_paths: list[Path] = []
         self.attitude_buffers = {
             "left": TimedSampleBuffer[CameraExtrinsicState](maxlen=1000),
@@ -1105,16 +1045,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._pending_camera_start: tuple[bool, bool] | None = None
         self.camera_auto_detect_thread: QtCore.QThread | None = None
         self.camera_auto_detect_worker: CameraAutoDetectWorker | None = None
+        self._camera_auto_connect_attempt = 0
+        self._camera_auto_connect_retry_generation = 0
+        # Once a camera accepted SETH TRUE, do not send the same activation
+        # command again merely because RTSP frame verification is delayed.
+        # Some WIRIS firmware restarts the RTSP service on SETH TRUE and can
+        # become unresponsive when that command is repeated in a retry loop.
+        self._auto_wiris_enabled_cameras: set[tuple[str, str]] = set()
+        self._rtsp_reactivation_side: str | None = None
+        self._rtsp_reactivation_enable_detection = False
+        self._rtsp_reactivation_generation = 0
         self.wiris_control_check_thread: QtCore.QThread | None = None
         self.wiris_control_check_worker: WirisControlCheckWorker | None = None
         self.wiris_command_thread: QtCore.QThread | None = None
         self.wiris_command_worker: WirisCommandWorker | None = None
+        self.wiris_lrf_thread: QtCore.QThread | None = None
+        self.wiris_lrf_worker: WirisLrfPollWorker | None = None
         self.wiris_zoom_thread: QtCore.QThread | None = None
         self.wiris_zoom_worker: WirisZoomWorker | None = None
         self.wiris_time_sync_thread: QtCore.QThread | None = None
         self.wiris_time_sync_worker: WirisClockCommandWorker | None = None
-        self.wiris_gdti_thread: QtCore.QThread | None = None
-        self.wiris_gdti_worker: WirisClockCommandWorker | None = None
         self.wiris_stip_thread: QtCore.QThread | None = None
         self.wiris_stip_worker: WirisStipWorker | None = None
         self.camera_network_discovery_thread: QtCore.QThread | None = None
@@ -1181,6 +1131,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_base_survey_samples: deque[tuple[float, int, float, bool, bool]] = deque(maxlen=240)
         self.gnss_base_rtcm_stats = self._new_gnss_base_rtcm_stats()
         self.auto_wiris_connect_pending = False
+        self._startup_camera_sequence_pending = False
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
         self.settings = load_settings(self.settings_path)
@@ -1226,9 +1177,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.workstation_time_sync_checkpoints: list[dict[str, object]] = []
         self._camera_sync_transport_override: str | None = None
         self._camera_sync_deadline_monotonic_s: float | None = None
-        self._camera_sync_requested_utc_s: float | None = None
-        self._camera_sync_requested_utc_by_camera: dict[str, float] = {}
-        self._camera_sync_gdti: dict[str, dict[str, object]] = {}
+        self._camera_sync_stus_sr_baseline: dict[str, int] = {}
         self._camera_sync_timer = QtCore.QTimer(self)
         self._camera_sync_timer.setInterval(250)
         self._camera_sync_timer.timeout.connect(self._poll_camera_sync_state)
@@ -1304,6 +1253,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         self.latest_gps_sensors: dict[str, dict[str, object]] = {"left": {}, "right": {}}
         self.latest_gnss_relative: dict[str, object] = {}
+        self.latest_wiris_lrf: dict[str, dict[str, object]] = {
+            "left": {},
+            "right": {},
+        }
         self.last_rtsp_check_status: dict[str, str] = {"left": "unchecked", "right": "unchecked"}
         self.last_distance_quality = "WARNING"
         self.last_distance_status = "거리: 좌/우 검출 매칭 대기 중"
@@ -2640,7 +2593,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         zoom_group_layout = QtWidgets.QVBoxLayout(zoom_group)
         self.zoom_level_spin = QtWidgets.QSpinBox()
         self.zoom_level_spin.setRange(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL)
-        self.zoom_level_spin.setValue(10)
+        self.zoom_level_spin.setValue(self.settings.calibration_zoom_level)
         self.zoom_level_spin.valueChanged.connect(lambda _value: self._refresh_zoom_intrinsics_tab())
         self.zoom_target_combo = QtWidgets.QComboBox()
         self.zoom_target_combo.addItem("양쪽 카메라", "both")
@@ -2726,33 +2679,51 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calib_form.setColumnStretch(5, 1)
         self.calib_cols_spin = QtWidgets.QSpinBox()
         self.calib_cols_spin.setRange(2, 30)
-        self.calib_cols_spin.setValue(13)
+        self.calib_cols_spin.setValue(self.settings.calibration_inner_cols)
         self.calib_cols_spin.valueChanged.connect(self._refresh_all_calibration_previews)
         self.calib_rows_spin = QtWidgets.QSpinBox()
         self.calib_rows_spin.setRange(2, 30)
-        self.calib_rows_spin.setValue(8)
+        self.calib_rows_spin.setValue(self.settings.calibration_inner_rows)
         self.calib_rows_spin.valueChanged.connect(self._refresh_all_calibration_previews)
         self.calib_square_spin = QtWidgets.QDoubleSpinBox()
         self.calib_square_spin.setRange(1.0, 500.0)
-        self.calib_square_spin.setValue(40.0)
+        self.calib_square_spin.setValue(self.settings.calibration_square_size_mm)
         self.calib_square_spin.setSuffix(" mm")
         self.calib_min_images_spin = QtWidgets.QSpinBox()
         self.calib_min_images_spin.setRange(3, 100)
-        self.calib_min_images_spin.setValue(20)
+        self.calib_min_images_spin.setValue(self.settings.calibration_min_images)
+        self.calib_calculation_pairs_spin = QtWidgets.QSpinBox()
+        self.calib_calculation_pairs_spin.setRange(0, 10000)
+        self.calib_calculation_pairs_spin.setValue(self.settings.calibration_calculation_pair_count)
+        self.calib_calculation_pairs_spin.setSpecialValueText("전체 pair")
+        self.calib_calculation_pairs_spin.setSuffix(" pair")
         for spin, width in (
             (self.calib_cols_spin, 72),
             (self.calib_rows_spin, 72),
             (self.calib_square_spin, 96),
+            (self.calib_calculation_pairs_spin, 96),
         ):
             spin.setProperty("compactFormField", True)
             spin.setMinimumWidth(width)
             spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         initial_intrinsics = self._intrinsics_storage_base_path()
-        self.calib_dir_edit = QtWidgets.QLineEdit(str(initial_intrinsics.parent))
+        calibration_root = self.settings.calibration_root.strip() or str(initial_intrinsics.parent)
+        self.calib_dir_edit = QtWidgets.QLineEdit(calibration_root)
         self.calib_dir_edit.setProperty("compactFormField", True)
         self.calib_dir_edit.setMinimumWidth(260)
         self.capture_calibration_button = QtWidgets.QPushButton("캡처")
         self.capture_calibration_button.clicked.connect(self.capture_calibration_images)
+        self.calibration_auto_interval_spin = QtWidgets.QDoubleSpinBox()
+        self.calibration_auto_interval_spin.setRange(0.5, 10.0)
+        self.calibration_auto_interval_spin.setSingleStep(0.5)
+        self.calibration_auto_interval_spin.setValue(self.settings.calibration_auto_interval_s)
+        self.calibration_auto_interval_spin.setSuffix(" s")
+        self.calibration_auto_target_spin = QtWidgets.QSpinBox()
+        self.calibration_auto_target_spin.setRange(1, 200)
+        self.calibration_auto_target_spin.setValue(self.settings.calibration_auto_target_pairs)
+        self.calibration_auto_target_spin.setSuffix(" pair")
+        self.capture_calibration_auto_button = QtWidgets.QPushButton("자동 촬영 시작")
+        self.capture_calibration_auto_button.clicked.connect(self.toggle_auto_calibration_capture)
         self.save_intrinsics_button = QtWidgets.QPushButton("저장")
         self.save_intrinsics_button.clicked.connect(self.save_intrinsics)
         self.apply_intrinsics_button = QtWidgets.QPushButton("계산에 적용")
@@ -2789,6 +2760,15 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         calib_form.addWidget(dir_label, 1, 0)
         calib_form.addWidget(self.calib_dir_edit, 1, 1, 1, 5)
         calib_form.addWidget(self.capture_calibration_button, 1, 6)
+        auto_interval_label = QtWidgets.QLabel("자동 간격")
+        auto_interval_label.setProperty("compactFormLabel", True)
+        auto_target_label = QtWidgets.QLabel("목표 pair")
+        auto_target_label.setProperty("compactFormLabel", True)
+        calib_form.addWidget(auto_interval_label, 2, 0)
+        calib_form.addWidget(self.calibration_auto_interval_spin, 2, 1)
+        calib_form.addWidget(auto_target_label, 2, 2)
+        calib_form.addWidget(self.calibration_auto_target_spin, 2, 3)
+        calib_form.addWidget(self.capture_calibration_auto_button, 2, 4, 1, 3)
 
         validation_source_group = QtWidgets.QGroupBox("입력 / 계산 목적")
         validation_source_form = QtWidgets.QGridLayout(validation_source_group)
@@ -2799,16 +2779,28 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.checkerboard_validation_mode_combo = QtWidgets.QComboBox()
         self.checkerboard_validation_mode_combo.addItem("Pixhawk 자세 + GPS/RTK baseline", "pixhawk")
         self.checkerboard_validation_mode_combo.addItem("체커보드 Stereo 외부 파라미터", "checkerboard")
+        self._set_combo_data(
+            self.checkerboard_validation_mode_combo,
+            self.settings.calibration_validation_mode,
+        )
         self.checkerboard_validation_mode_combo.setToolTip(
             "Pixhawk 모드는 내부 파라미터만 계산하고, 체커보드 모드는 내부 파라미터와 stereo R/T를 함께 계산합니다."
         )
-        self.checkerboard_validation_root_edit = QtWidgets.QLineEdit(self.calib_dir_edit.text())
+        validation_root = (
+            self.settings.calibration_validation_root.strip()
+            or self.calib_dir_edit.text()
+        )
+        self.checkerboard_validation_root_edit = QtWidgets.QLineEdit(validation_root)
         self.checkerboard_validation_root_edit.setMinimumWidth(260)
         self.checkerboard_validation_choose_root_button = QtWidgets.QPushButton("폴더 선택")
         self.checkerboard_validation_choose_root_button.clicked.connect(self.choose_checkerboard_validation_root)
         self.checkerboard_validation_scan_button = QtWidgets.QPushButton("스캔")
         self.checkerboard_validation_scan_button.clicked.connect(self.scan_checkerboard_validation_files)
-        self.checkerboard_validation_json_edit = QtWidgets.QLineEdit(str(self._intrinsics_storage_path()))
+        validation_json = (
+            self.settings.calibration_validation_json.strip()
+            or str(self._intrinsics_storage_path())
+        )
+        self.checkerboard_validation_json_edit = QtWidgets.QLineEdit(validation_json)
         self.checkerboard_validation_json_edit.setMinimumWidth(260)
         self.checkerboard_validation_choose_json_button = QtWidgets.QPushButton("JSON 선택")
         self.checkerboard_validation_choose_json_button.clicked.connect(self.choose_checkerboard_validation_json)
@@ -2841,16 +2833,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calib_min_images_spin.setProperty("compactFormField", True)
         self.calib_min_images_spin.setMinimumWidth(72)
         self.calib_min_images_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+        self.calib_calculation_pairs_spin.setProperty("compactFormField", True)
+        self.calib_calculation_pairs_spin.setMinimumWidth(96)
+        self.calib_calculation_pairs_spin.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
         self.checkerboard_validation_random_runs_spin = QtWidgets.QSpinBox()
         self.checkerboard_validation_random_runs_spin.setRange(1, 20)
-        self.checkerboard_validation_random_runs_spin.setValue(3)
+        self.checkerboard_validation_random_runs_spin.setValue(self.settings.calibration_validation_runs)
         self.checkerboard_validation_random_pair_count_spin = QtWidgets.QSpinBox()
         self.checkerboard_validation_random_pair_count_spin.setRange(0, 10000)
-        self.checkerboard_validation_random_pair_count_spin.setValue(0)
+        self.checkerboard_validation_random_pair_count_spin.setValue(self.settings.calibration_validation_pair_count)
         self.checkerboard_validation_random_pair_count_spin.setSpecialValueText("자동")
         self.checkerboard_validation_seed_spin = QtWidgets.QSpinBox()
         self.checkerboard_validation_seed_spin.setRange(0, 2_147_483_647)
-        self.checkerboard_validation_seed_spin.setValue(0)
+        self.checkerboard_validation_seed_spin.setValue(self.settings.calibration_validation_seed)
         self.checkerboard_validation_seed_spin.setSpecialValueText("자동")
         self.run_calibration_button = QtWidgets.QPushButton("전체 사진으로 계산")
         self.run_calibration_button.clicked.connect(self.run_intrinsic_calibration)
@@ -2862,12 +2857,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.checkerboard_validation_apply_button.clicked.connect(self.apply_checkerboard_validation_result)
         validation_action_form.addWidget(QtWidgets.QLabel("최소 이미지"), 0, 0)
         validation_action_form.addWidget(self.calib_min_images_spin, 0, 1)
-        validation_action_form.addWidget(QtWidgets.QLabel("반복"), 0, 2)
-        validation_action_form.addWidget(self.checkerboard_validation_random_runs_spin, 0, 3)
-        validation_action_form.addWidget(QtWidgets.QLabel("회당 pair"), 0, 4)
-        validation_action_form.addWidget(self.checkerboard_validation_random_pair_count_spin, 0, 5)
-        validation_action_form.addWidget(QtWidgets.QLabel("seed"), 0, 6)
-        validation_action_form.addWidget(self.checkerboard_validation_seed_spin, 0, 7)
+        validation_action_form.addWidget(QtWidgets.QLabel("계산 pair"), 0, 2)
+        validation_action_form.addWidget(self.calib_calculation_pairs_spin, 0, 3)
+        validation_action_form.addWidget(QtWidgets.QLabel("반복"), 0, 4)
+        validation_action_form.addWidget(self.checkerboard_validation_random_runs_spin, 0, 5)
+        validation_action_form.addWidget(QtWidgets.QLabel("회당 pair"), 0, 6)
+        validation_action_form.addWidget(self.checkerboard_validation_random_pair_count_spin, 0, 7)
+        validation_action_form.addWidget(QtWidgets.QLabel("seed"), 0, 8)
+        validation_action_form.addWidget(self.checkerboard_validation_seed_spin, 0, 9)
         validation_action_form.addWidget(self.run_calibration_button, 1, 0, 1, 2)
         validation_action_form.addWidget(self.checkerboard_validation_random_button, 1, 2, 1, 2)
         validation_action_form.addWidget(self.checkerboard_validation_save_button, 1, 4, 1, 2)
@@ -2876,6 +2873,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.checkerboard_validation_status_label.setObjectName("statusStrip")
         self.checkerboard_validation_status_label.setWordWrap(True)
         validation_action_form.addWidget(self.checkerboard_validation_status_label, 2, 0, 1, 10)
+        self.calibration_progress_bar = QtWidgets.QProgressBar()
+        self.calibration_progress_bar.setRange(0, 100)
+        self.calibration_progress_bar.setValue(0)
+        self.calibration_progress_bar.setFormat("대기 · %p%")
+        self.calibration_progress_bar.setTextVisible(True)
+        validation_action_form.addWidget(self.calibration_progress_bar, 3, 0, 1, 10)
 
         calibration_top_stack = QtWidgets.QVBoxLayout()
         calibration_top_stack.setSpacing(6)
@@ -3558,9 +3561,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.calib_rows_spin: "체커보드 내부 코너의 행 개수입니다.",
             self.calib_square_spin: "내부 파라미터 보정에 사용할 체커보드 한 칸 크기입니다.",
             self.calib_min_images_spin: "카메라별 권장 유효 체커보드 프레임 최소 개수입니다.",
+            self.calib_calculation_pairs_spin: (
+                "내부 파라미터 계산에 실제로 사용할 matching pair 수입니다. "
+                "0(전체 pair)이면 입력된 모든 pair를 사용합니다."
+            ),
             self.calib_dir_edit: "보정 이미지와 intrinsics.json / intrinsics_zoom_##.json을 저장/로드할 디렉터리입니다.",
             self.capture_calibration_button: "현재 좌/우 카메라 프레임 중 체커보드가 검출된 쪽만 내부 파라미터 보정 이미지로 저장합니다.",
+            self.calibration_auto_interval_spin: "자동 촬영 시도 간격입니다. 보드 검출·좌우 시각 동기·중복 검사를 통과한 pair만 저장합니다.",
+            self.calibration_auto_target_spin: "자동 촬영을 멈출 유효한 좌/우 체커보드 pair 개수입니다.",
+            self.capture_calibration_auto_button: "좌·우 모두 체커보드가 검출되고 RTCP/NTP 시각 차이가 100ms 이하인 pair를 자동으로 저장합니다.",
             self.run_calibration_button: "캡처된 체커보드 이미지로 OpenCV 내부 파라미터 보정을 실행합니다.",
+            self.calibration_progress_bar: "내부 파라미터 및 stereo 계산에서 실제 검사한 이미지/pair 기준 진행률입니다.",
             self.save_intrinsics_button: "현재 WIRIS 줌 레벨의 내부 파라미터를 intrinsics_zoom_##.json으로 저장하고 latest alias intrinsics.json도 갱신합니다.",
             self.apply_intrinsics_button: "현재 WIRIS 줌 레벨의 intrinsics_zoom_##.json 또는 막 계산한 결과를 거리 측정에 적용합니다.",
             self.add_zoom_intrinsics_file_button: "비교 목록에 저장된 intrinsics JSON 파일을 추가합니다. 파일 자체는 복사하거나 변경하지 않습니다.",
@@ -3862,6 +3873,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.right_mavlink_button,
             self.start_button,
             self.capture_calibration_button,
+            self.capture_calibration_auto_button,
             self.run_calibration_button,
             self.save_intrinsics_button,
             self.save_settings_button,
@@ -6572,9 +6584,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self._session_recording_active():
             self._log("[카메라] 세션 기록 중에는 WIRIS 자동 연결을 시작할 수 없습니다.")
             return False
+        self._camera_auto_connect_retry_generation += 1
+        self._camera_auto_connect_attempt = 0
+        self._auto_wiris_enabled_cameras.clear()
         self.auto_wiris_connect_pending = True
         self._start_camera_detection("auto_connect")
         return None
+
+    def _start_startup_camera_sequence(self) -> None:
+        """Enable and verify WIRIS streams before starting the requested preview."""
+        self._startup_camera_sequence_pending = True
+        if self.auto_connect_wiris() is False:
+            self._startup_camera_sequence_pending = False
 
     def _camera_host_hints(self) -> tuple[str, ...]:
         hints: list[str] = []
@@ -6605,6 +6626,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _start_camera_detection(self, mode: str, *, target_side: str | None = None) -> None:
         if self.camera_auto_detect_thread is not None:
             return
+        attempt_text = ""
+        if mode == "auto_connect":
+            self._camera_auto_connect_attempt += 1
+            attempt_text = (
+                f" (시도 {self._camera_auto_connect_attempt}/{CAMERA_AUTO_CONNECT_MAX_ATTEMPTS})"
+            )
+        full_control_scan = mode != "auto_connect" or self._camera_auto_connect_attempt <= 1
         self.workstation_camera_discovery_status = f"SEARCHING {mode.upper()}"
         self._log(
             f"[연결] 카메라 {mode} 탐색은 설정된 인터페이스를 사용합니다. "
@@ -6612,11 +6640,14 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         if mode == "auto_connect":
             self._log(
-                "[카메라] WIRIS 자동 연결을 시작합니다: 제어 포트 전체 스캔, HIWS 검증, "
+                "[카메라] WIRIS 자동 연결을 시작합니다"
+                f"{attempt_text}: 설정/기본 제어 포트, HIWS 검증, "
                 "RTSP 활성화, 프레임 확인을 순차 실행합니다."
             )
+            self._log("[arp] scan: 카메라망 후보 탐색을 시작합니다.")
         elif mode == "control":
             self._log("[카메라] 카메라 네트워크에서 WIRIS 제어 포트를 전체 스캔하고 HIWS로 검증합니다.")
+            self._log("[arp] scan: 카메라망 후보 탐색을 시작합니다.")
         else:
             self._log("[카메라] 카메라 네트워크와 RTSP 후보를 탐색합니다.")
         self.auto_wiris_connect_button.setEnabled(False)
@@ -6630,6 +6661,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             control_port=self.zoom_port_spin.value(),
             host_hints=self._camera_host_hints(),
             target_side=target_side,
+            full_control_scan=full_control_scan,
         )
         self.camera_auto_detect_worker.moveToThread(self.camera_auto_detect_thread)
         self.camera_auto_detect_thread.started.connect(self.camera_auto_detect_worker.run)
@@ -6641,6 +6673,60 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_auto_detect_thread.finished.connect(self._clear_camera_auto_detect_worker)
         self.camera_auto_detect_thread.start()
 
+    def _cancel_auto_wiris_connect_retry(self) -> None:
+        self._camera_auto_connect_retry_generation += 1
+        self._camera_auto_connect_attempt = 0
+        self.auto_wiris_connect_pending = False
+        self._startup_camera_sequence_pending = False
+
+    def _schedule_auto_wiris_connect_retry(self, reason: str) -> None:
+        if not self.auto_wiris_connect_pending:
+            return
+        attempt = max(0, int(self._camera_auto_connect_attempt))
+        if attempt >= CAMERA_AUTO_CONNECT_MAX_ATTEMPTS:
+            self.auto_wiris_connect_pending = False
+            self._startup_camera_sequence_pending = False
+            self._log(
+                "[카메라] WIRIS 자동 연결을 중단했습니다: "
+                f"{CAMERA_AUTO_CONNECT_MAX_ATTEMPTS}회 시도 후에도 카메라 서비스가 준비되지 않았습니다. "
+                "전원/Ethernet Mode/IP를 확인하세요."
+            )
+            self.camera_connection_label.setText("WIRIS auto connect: camera service unavailable")
+            self._refresh_operation_header()
+            return
+
+        self._camera_auto_connect_retry_generation += 1
+        generation = self._camera_auto_connect_retry_generation
+        next_attempt = attempt + 1
+        delay_s = CAMERA_AUTO_CONNECT_RETRY_DELAY_MS / 1000.0
+        self.workstation_camera_discovery_status = (
+            f"RETRYING AUTO_CONNECT {next_attempt}/{CAMERA_AUTO_CONNECT_MAX_ATTEMPTS}"
+        )
+        self.camera_connection_label.setText(
+            f"WIRIS auto connect: waiting for camera service "
+            f"({next_attempt}/{CAMERA_AUTO_CONNECT_MAX_ATTEMPTS})"
+        )
+        self._log(
+            f"[카메라] WIRIS 자동 연결 재시도 예약: {reason}; "
+            f"{delay_s:.1f}초 후 {next_attempt}/{CAMERA_AUTO_CONNECT_MAX_ATTEMPTS}회 시도"
+        )
+
+        def retry() -> None:
+            if generation != self._camera_auto_connect_retry_generation:
+                return
+            if not self.auto_wiris_connect_pending:
+                return
+            if (
+                self.camera_auto_detect_thread is not None
+                or self.rtsp_enable_thread is not None
+                or self.rtsp_check_thread is not None
+            ):
+                QtCore.QTimer.singleShot(100, retry)
+                return
+            self._start_camera_detection("auto_connect")
+
+        QtCore.QTimer.singleShot(CAMERA_AUTO_CONNECT_RETRY_DELAY_MS, retry)
+
     def _apply_camera_detection(self, result: object) -> None:
         if isinstance(result, dict):
             mode = str(result.get("mode") or "rtsp")
@@ -6650,6 +6736,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             control_candidates = list(result.get("control") or [])
             verified_control_candidates = list(result.get("verified_control") or [])
             arp_scan_reports = list(result.get("arp_scan") or [])
+            full_control_scan = bool(result.get("full_control_scan", False))
         else:
             mode = "rtsp"
             target_side = None
@@ -6658,10 +6745,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             control_candidates = []
             verified_control_candidates = []
             arp_scan_reports = []
+            full_control_scan = False
         self._log_arp_scan_reports(arp_scan_reports)
         self._set_camera_candidate_rows(host_interfaces, rtsp_candidates, control_candidates, verified_control_candidates)
         if mode == "auto_connect" and self._session_recording_active():
-            self.auto_wiris_connect_pending = False
+            self._cancel_auto_wiris_connect_retry()
             self.camera_connection_label.setText("WIRIS auto connect: recording is active")
             self._log("[카메라] 탐색 중 세션 기록이 시작되어 자동 후보 적용과 프리뷰 연결을 건너뛰었습니다.")
             return
@@ -6670,7 +6758,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if host_interfaces:
             self._apply_host_interface_candidates(host_interfaces)
         if mode == "auto_connect":
-            self._apply_auto_wiris_connect_candidates(verified_control_candidates, control_candidates)
+            self._apply_auto_wiris_connect_candidates(
+                verified_control_candidates,
+                control_candidates,
+                full_control_scan=full_control_scan,
+            )
         elif mode == "control":
             self._apply_control_candidates(verified_control_candidates, control_candidates, target_side=target_side)
         elif not rtsp_candidates:
@@ -7131,20 +7223,41 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.check_wiris_control()
         self._refresh_operation_header()
 
-    def _apply_auto_wiris_connect_candidates(self, verified: list[object], fallback: list[object]) -> None:
+    def _apply_auto_wiris_connect_candidates(
+        self,
+        verified: list[object],
+        fallback: list[object],
+        *,
+        full_control_scan: bool = False,
+    ) -> None:
         ok_candidates = self._ok_control_candidates(verified)
         self._log_verified_control_candidates(verified)
         if not ok_candidates:
-            self.auto_wiris_connect_pending = False
             if fallback:
+                reason = "열린 포트에서 HIWS=OK 응답 없음"
                 self._log("[카메라] 열린 TCP 포트 후보는 있으나 HIWS=OK 응답을 받은 WIRIS를 찾지 못했습니다.")
-                self.camera_connection_label.setText("WIRIS auto connect: no HIWS OK response")
             else:
+                reason = "WIRIS 제어 포트가 아직 열리지 않음"
                 self._log("[카메라] WIRIS 제어 포트 후보를 찾지 못했습니다. PC IP 대역 또는 카메라 IP를 확인하세요.")
-                self.camera_connection_label.setText("WIRIS auto connect: no control candidates")
+            if verified:
+                open_ports = ", ".join(
+                    f"{_control_candidate_value(candidate, 'host')}:{_control_candidate_value(candidate, 'port')}"
+                    for candidate in verified
+                )
+                self._log(
+                    "[카메라] 열린 포트의 HIWS 검증 결과: "
+                    f"{open_ports}; WIRIS SDK 응답 없음"
+                )
+            elif full_control_scan:
+                self._log(
+                    "[카메라] 설정/기본 포트와 전체 TCP 1-65535 스캔 모두에서 "
+                    "WIRIS SDK 포트를 찾지 못했습니다."
+                )
+            self._schedule_auto_wiris_connect_retry(reason)
             self._refresh_operation_header()
             return
 
+        self._camera_auto_connect_retry_generation += 1
         selected = ok_candidates[:2]
         self._apply_discovered_control_port_hint(selected)
         self._apply_control_candidate_to_side("left", selected[0])
@@ -7162,8 +7275,25 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._log("[카메라] HIWS=OK WIRIS가 1개만 발견되어 Left Control Host에 입력했습니다.")
         else:
             self._log("[카메라] HIWS=OK WIRIS 2개를 Left/Right Control Host에 입력했습니다.")
-        self.camera_connection_label.setText("WIRIS auto connect: control verified, enabling RTSP")
-        self.enable_wiris_rtsp()
+        selected_sides = ("left",) if len(selected) == 1 else ("left", "right")
+        activation_targets: list[str] = []
+        for side, candidate in zip(selected_sides, selected):
+            host = str(_control_candidate_value(candidate, "host", "") or "").strip()
+            camera_key = (side, host)
+            if camera_key in self._auto_wiris_enabled_cameras:
+                self._log(
+                    f"[카메라] {self._camera_name_ko(side)}는 이미 SETH TRUE가 승인되어 "
+                    "RTSP 프레임만 다시 확인합니다."
+                )
+                continue
+            activation_targets.append(side)
+
+        if activation_targets:
+            self.camera_connection_label.setText("WIRIS auto connect: control verified, enabling RTSP")
+            self.enable_wiris_rtsp(target_labels=tuple(activation_targets))
+        else:
+            self.camera_connection_label.setText("WIRIS auto connect: control verified, checking RTSP")
+            self.check_cameras()
 
     def _pixhawk_candidate_table_for_source(self, source: str) -> QtWidgets.QTableWidget:
         if source == "pc":
@@ -7485,6 +7615,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log(f"[카메라] 자동 탐색 실패: {error}")
         self.camera_connection_label.setText(f"camera RTSP: auto detect failed ({error})")
         self.last_rtsp_check_status = {"left": "check-failed", "right": "check-failed"}
+        if self.auto_wiris_connect_pending:
+            self._schedule_auto_wiris_connect_retry(f"탐색 오류: {error}")
         self._refresh_operation_header()
 
     def _clear_camera_auto_detect_worker(self) -> None:
@@ -7550,6 +7682,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         right_text = right.text()
         right.setText(left_text)
         return right_text
+
+    def _finish_auto_wiris_connect(self) -> None:
+        startup_sequence = self._startup_camera_sequence_pending
+        self._cancel_auto_wiris_connect_retry()
+        if startup_sequence:
+            self._log(
+                "[카메라] 시작 시퀀스 완료: WIRIS Ethernet/RTSP 활성화와 좌/우 프레임 확인 후 "
+                "카메라 스트림을 시작합니다."
+            )
+            self.start_yolo()
+            return
+        self._log("[카메라] WIRIS 자동 연결: 좌/우 RTSP 프레임 확인 완료. 카메라 프리뷰를 연결합니다.")
+        self.connect_cameras()
 
     def check_cameras(self) -> None:
         if self.rtsp_check_thread is not None:
@@ -7657,11 +7802,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 unique_ports.append(port)
         return unique_ports
 
-    def enable_wiris_rtsp(self) -> None:
-        if self.rtsp_enable_thread is not None:
-            self._log("[카메라] RTSP 송출 활성화가 이미 진행 중입니다.")
-            return
-        self._log("[연결] RTSP 활성화는 설정된 Control Host/port와 영상 URL을 사용합니다.")
+    def _start_rtsp_enable_worker(self, *, target_labels: tuple[str, ...], reactivate: bool) -> None:
         hosts = {label: host.strip() for label, host in self.zoom_hosts("both")}
         candidate_ports = {label: self._ethernet_mode_candidate_ports(label) for label in ("left", "right")}
         urls = {
@@ -7669,13 +7810,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right": self.right_url_edit.text().strip(),
         }
         self.enable_rtsp_button.setEnabled(False)
-        self.camera_connection_label.setText("camera RTSP enable: enabling...")
+        status_text = "camera RTSP reactivate: enabling safely..." if reactivate else "camera RTSP enable: enabling..."
+        self.camera_connection_label.setText(status_text)
         self.rtsp_enable_thread = QtCore.QThread(self)
         self.rtsp_enable_worker = WirisRtspEnableWorker(
             hosts=hosts,
             candidate_ports=candidate_ports,
             urls=urls,
             timeout_s=self.zoom_timeout_spin.value(),
+            target_labels=target_labels,
+            reactivate=reactivate,
         )
         self.rtsp_enable_worker.moveToThread(self.rtsp_enable_thread)
         self.rtsp_enable_thread.started.connect(self.rtsp_enable_worker.run)
@@ -7687,6 +7831,60 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.rtsp_enable_thread.finished.connect(self._clear_rtsp_enable_worker)
         self.rtsp_enable_thread.start()
 
+    def enable_wiris_rtsp(self, *, target_labels: tuple[str, ...] = ("left", "right")) -> None:
+        if self.rtsp_enable_thread is not None:
+            self._log("[카메라] RTSP 송출 활성화가 이미 진행 중입니다.")
+            return
+        if self._rtsp_reactivation_side is not None:
+            self._log("[카메라] 카메라별 RTSP 재활성화가 진행 중입니다.")
+            return
+        self._log("[연결] RTSP 활성화는 설정된 Control Host/port와 영상 URL을 사용합니다.")
+        self._start_rtsp_enable_worker(target_labels=target_labels, reactivate=False)
+
+    def reactivate_wiris_rtsp(self, camera: str) -> bool | None:
+        if camera not in {"left", "right"}:
+            self._log(f"[카메라] 알 수 없는 재활성화 대상입니다: {camera}")
+            return False
+        if self._session_recording_active():
+            self._log("[카메라] 세션 기록 중에는 카메라 RTSP 재활성화를 실행할 수 없습니다.")
+            return False
+        if self.rtsp_enable_thread is not None or self.rtsp_check_thread is not None:
+            self._log("[카메라] 다른 RTSP 확인/활성화 작업이 진행 중입니다.")
+            return False
+        host = dict(self.zoom_hosts("both")).get(camera, "").strip()
+        if not host:
+            self._log(f"[카메라] {self._camera_name_ko(camera)} Control Host가 비어 있어 재활성화할 수 없습니다.")
+            self.camera_connection_label.setText(f"camera RTSP reactivate: {camera}=missing-host")
+            return False
+        if self.auto_wiris_connect_pending:
+            self._cancel_auto_wiris_connect_retry()
+
+        self._rtsp_reactivation_side = camera
+        self._rtsp_reactivation_enable_detection = bool(self.yolo_enabled)
+        self._rtsp_reactivation_generation += 1
+        generation = self._rtsp_reactivation_generation
+        camera_name = self._camera_name_ko(camera)
+        self._log(
+            f"[카메라] {camera_name} RTSP 재활성화를 시작합니다: "
+            "스트림 정리 → GETH 확인 → SETH TRUE → 프레임 확인 → Preview 재연결 "
+            "(제어 서비스 보호를 위해 SETH FALSE 생략)"
+        )
+        self.camera_connection_label.setText(f"camera RTSP reactivate: {camera}=stopping")
+        pane = self.left_pane if camera == "left" else self.right_pane
+        pane.stop(wait=False)
+
+        def start_when_stopped() -> None:
+            if generation != self._rtsp_reactivation_generation or self._rtsp_reactivation_side != camera:
+                return
+            if pane.worker is not None or pane.thread is not None:
+                pane.stop(wait=False)
+                QtCore.QTimer.singleShot(100, start_when_stopped)
+                return
+            self._start_rtsp_enable_worker(target_labels=(camera,), reactivate=True)
+
+        start_when_stopped()
+        return None
+
     def _apply_wiris_rtsp_enable_result(self, result: object) -> None:
         data = dict(result or {})
         for label, port in dict(data.get("corrected_ports") or {}).items():
@@ -7696,18 +7894,97 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for message in list(data.get("logs") or []):
             self._log(str(message))
         statuses = [str(status) for status in list(data.get("statuses") or [])]
-        self.camera_connection_label.setText(f"camera RTSP enable: {', '.join(statuses)}")
+        mode = str(data.get("mode") or "enable")
+        if mode == "enable" and self.auto_wiris_connect_pending:
+            for status in statuses:
+                label, separator, state = status.partition("=")
+                if not separator or state != "enable-sent" or label not in {"left", "right"}:
+                    continue
+                host = dict(self.zoom_hosts("both")).get(label, "").strip()
+                if host:
+                    self._auto_wiris_enabled_cameras.add((label, host))
+                    self._log(
+                        f"[카메라] {self._camera_name_ko(label)} SETH TRUE 승인 상태를 기억합니다. "
+                        "RTSP 실패 재시도에서는 SETH TRUE를 반복 전송하지 않습니다."
+                    )
+        self.camera_connection_label.setText(
+            f"camera RTSP {'reactivate' if mode == 'reactivate' else 'enable'}: {', '.join(statuses)}"
+        )
+        if mode == "reactivate" and self._rtsp_reactivation_side is not None:
+            camera = self._rtsp_reactivation_side
+            expected_status = f"{camera}=reactivated-sent"
+            if expected_status not in statuses:
+                self._finish_camera_rtsp_reactivation(False, f"{camera}=reactivation-failed")
+            elif data.get("should_check"):
+                self._log(f"[카메라] {self._camera_name_ko(camera)} RTSP 재활성화 후 실제 프레임을 확인합니다.")
+                self.check_cameras()
+            else:
+                self._finish_camera_rtsp_reactivation(False, f"{camera}=no-stream")
+            return
         if data.get("should_check"):
             self.check_cameras()
+        elif self.auto_wiris_connect_pending:
+            self._schedule_auto_wiris_connect_retry("RTSP 활성화에 성공한 카메라가 없음")
 
     def _wiris_rtsp_enable_failed(self, error: str) -> None:
         self._log(f"[카메라] RTSP 송출 활성화 실패: {error}")
         self.camera_connection_label.setText(f"camera RTSP enable: failed ({error})")
+        if self._rtsp_reactivation_side is not None:
+            self._finish_camera_rtsp_reactivation(False, error)
+            return
+        if self.auto_wiris_connect_pending:
+            self._schedule_auto_wiris_connect_retry(f"RTSP 활성화 오류: {error}")
 
     def _clear_rtsp_enable_worker(self) -> None:
         self.rtsp_enable_thread = None
         self.rtsp_enable_worker = None
         self.enable_rtsp_button.setEnabled(True)
+
+    def _finish_camera_rtsp_reactivation(self, success: bool, detail: str = "") -> None:
+        camera = self._rtsp_reactivation_side
+        if camera is None:
+            return
+        enable_detection = self._rtsp_reactivation_enable_detection
+        self._rtsp_reactivation_side = None
+        self._rtsp_reactivation_enable_detection = False
+        self._rtsp_reactivation_generation += 1
+        camera_name = self._camera_name_ko(camera)
+        if not success:
+            self._log(f"[카메라] {camera_name} RTSP 재활성화 실패: {detail or 'frame check failed'}")
+            self.camera_connection_label.setText(f"camera RTSP reactivate: {camera}=failed")
+            self._refresh_operation_header()
+            return
+
+        pane = self.left_pane if camera == "left" else self.right_pane
+        url = self.left_url_edit.text().strip() if camera == "left" else self.right_url_edit.text().strip()
+        self.camera_frame_times[camera].clear()
+        self.camera_frame_metadata[camera] = {}
+        self.camera_frame_metadata_history[camera].clear()
+        self.camera_stream_stats[camera] = {}
+        self.active_stream_decoders[camera] = None
+        if enable_detection:
+            self.tabs.setCurrentIndex(self.depth_tab_index)
+        self._camera_sync_transport_override = None
+        self._set_camera_sync_state(
+            CAMERA_SYNC_STATUS_NOT_VERIFIED,
+            f"{camera_name} RTSP가 재활성화되어 RTCP/NTP 검증이 필요합니다.",
+        )
+        started = pane.start_stream(
+            url,
+            enable_detection=enable_detection,
+            **self.yolo_kwargs(),
+            **self._video_recording_kwargs(camera),
+        )
+        if not started:
+            self._log(f"[카메라] {camera_name} RTSP 재활성화 후 Preview 재연결을 시작하지 못했습니다.")
+            self.camera_connection_label.setText(f"camera RTSP reactivate: {camera}=preview-start-failed")
+            self._refresh_operation_header()
+            return
+        self.camera_connected = bool(self.left_pane.worker or self.right_pane.worker)
+        self.yolo_enabled = bool(enable_detection)
+        self._log(f"[카메라] {camera_name} RTSP 프레임 확인 완료. 해당 Preview를 다시 연결했습니다.")
+        self._refresh_session_toggle_buttons()
+        self._refresh_operation_header()
 
     def apply_wiris_stip(self, camera: str) -> None:
         camera_name = self._camera_name_ko(camera)
@@ -7946,19 +8223,31 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.camera_connection_label.setText(f"camera RTSP stream: {', '.join(statuses)}")
         self.last_rtsp_check_status = next_status
         self._refresh_operation_header()
+        if self._rtsp_reactivation_side is not None:
+            camera = self._rtsp_reactivation_side
+            if next_status.get(camera) == "frame-ok":
+                self._finish_camera_rtsp_reactivation(True)
+            else:
+                self._finish_camera_rtsp_reactivation(False, str(next_status.get(camera) or "frame check failed"))
+            return
         if self.auto_wiris_connect_pending:
-            self.auto_wiris_connect_pending = False
-            if all(status == "frame-ok" for status in next_status.values()):
-                self._log("[카메라] WIRIS 자동 연결: 좌/우 RTSP 프레임 확인 완료. 카메라 프리뷰를 연결합니다.")
-                self.connect_cameras()
+            if set(next_status) == {"left", "right"} and all(
+                status == "frame-ok" for status in next_status.values()
+            ):
+                self._finish_auto_wiris_connect()
             else:
                 self._log("[카메라] WIRIS 자동 연결: RTSP 프레임 확인 실패. 제어 주소, Ethernet Mode, 영상 주소를 확인하세요.")
+                self._schedule_auto_wiris_connect_retry("RTSP 프레임 확인 실패")
 
     def _rtsp_stream_check_failed(self, error: str) -> None:
         self._log(f"[카메라] RTSP 스트림 확인 실패: {error}")
         self.camera_connection_label.setText(f"camera RTSP stream: check failed ({error})")
         self.last_rtsp_check_status = {"left": "check-failed", "right": "check-failed"}
-        self.auto_wiris_connect_pending = False
+        if self._rtsp_reactivation_side is not None:
+            self._finish_camera_rtsp_reactivation(False, error)
+            return
+        if self.auto_wiris_connect_pending:
+            self._schedule_auto_wiris_connect_retry(f"RTSP 확인 오류: {error}")
         self._refresh_operation_header()
 
     def _clear_rtsp_check_worker(self) -> None:
@@ -8791,8 +9080,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._record_clock_offset_sample(now_s)
         if self._is_clock_sync_tab_visible():
             self._update_clock_sync_display()
-        if self.yolo_enabled:
-            return
         self.latest_calibration_preview_images[camera] = image.copy()
         self.calibration_preview_changed.emit(
             {
@@ -8802,7 +9089,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "metadata": dict(frame_metadata),
             }
         )
-        if not self._is_checkerboard_calibration_visible():
+        if not (
+            self._is_checkerboard_calibration_visible()
+            or self._workstation_calibration_preview_active
+        ):
             return
         if now_s - self.calibration_preview_times[camera] < 0.5:
             return
@@ -8872,9 +9162,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return True
 
     def _refresh_calibration_preview(self, camera: str) -> None:
-        if self.yolo_enabled:
-            self._clear_calibration_previews("YOLO depth mode")
-            return
         image = self.latest_calibration_preview_images.get(camera)
         if image is None:
             return
@@ -8901,9 +9188,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if index == self.parameter_tab_index:
             self._refresh_camera_parameters_tab()
         if index == self.calibration_tab_index and self._is_checkerboard_calibration_visible():
-            if self.yolo_enabled:
-                self._clear_calibration_previews("YOLO depth mode")
-                return
             self.calibration_preview_times["left"] = 0.0
             self.calibration_preview_times["right"] = 0.0
             self._refresh_all_calibration_previews()
@@ -8943,13 +9227,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             pen = QtGui.QPen(QtGui.QColor(SUCCESS), 3)
             painter.setPen(pen)
             painter.setBrush(QtGui.QBrush(QtGui.QColor(SUCCESS)))
-            previous = None
+            columns, rows = self._checkerboard_config().pattern_size
+            if len(corners) == columns * rows:
+                for row in range(rows):
+                    start = row * columns
+                    for column in range(columns - 1):
+                        painter.drawLine(
+                            QtCore.QPointF(*corners[start + column]),
+                            QtCore.QPointF(*corners[start + column + 1]),
+                        )
+                for column in range(columns):
+                    for row in range(rows - 1):
+                        painter.drawLine(
+                            QtCore.QPointF(*corners[row * columns + column]),
+                            QtCore.QPointF(*corners[(row + 1) * columns + column]),
+                        )
             for x, y in corners:
-                point = QtCore.QPointF(x, y)
-                painter.drawEllipse(point, 5.0, 5.0)
-                if previous is not None:
-                    painter.drawLine(previous, point)
-                previous = point
+                painter.drawEllipse(QtCore.QPointF(x, y), 5.0, 5.0)
         else:
             painter.setPen(QtGui.QPen(QtGui.QColor(ERROR), 4))
             painter.drawRect(2, 2, max(0, annotated.width() - 4), max(0, annotated.height() - 4))
@@ -8970,6 +9264,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 "request_id": request_id,
                 "image": image.convertToFormat(QtGui.QImage.Format_RGB888).copy(),
                 "pattern_size": self._checkerboard_config().pattern_size,
+                "metadata": dict(self.camera_frame_metadata.get(camera) or {}),
             }
         )
         return request_id
@@ -9004,10 +9299,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         image = payload.get("image")
         if not isinstance(image, QtGui.QImage):
             return
-        if (
-            not self._is_checkerboard_calibration_visible()
-            and not self._workstation_calibration_preview_active
-        ) or self.yolo_enabled:
+        metadata = payload.get("metadata")
+        self.calibration_preview_detection_results[camera] = {
+            "request_id": request_id,
+            "image": image.copy(),
+            "found": bool(payload.get("found")),
+            "corners": list(payload.get("corners") or []),
+            "status": str(payload.get("status") or "checkerboard: not found"),
+            "metadata": dict(metadata) if isinstance(metadata, dict) else {},
+        }
+        if not (
+            self._is_checkerboard_calibration_visible()
+            or self._workstation_calibration_preview_active
+        ):
             return
         corners = payload.get("corners")
         overlay = self._calibration_overlay_image(
@@ -9168,6 +9472,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def save_current_settings_from_ui(self) -> None:
         self._save_current_settings()
         self._log("[저장] 현재 StereoWIRIS 설정을 저장했습니다.")
+
+    def save_workstation_calibration_setup(self) -> None:
+        """Persist the calibration setup surfaced by the Workstation shell."""
+
+        self._save_current_settings()
+        self._log("[저장] Workstation 캘리브레이션 설정을 저장했습니다.")
 
     def workstation_settings_snapshot(self) -> dict[str, object]:
         """Return the complete editable AppSettings contract for Workstation."""
@@ -9473,6 +9783,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         set_value("inner_rows", "calib_rows_spin")
         set_value("square_size_mm", "calib_square_spin")
         set_value("min_images", "calib_min_images_spin")
+        set_value("calculation_pair_count", "calib_calculation_pairs_spin")
+        set_value("auto_interval_s", "calibration_auto_interval_spin")
+        set_value("auto_target_pairs", "calibration_auto_target_spin")
         set_text("calibration_root", "calib_dir_edit")
         if "validation_mode" in setup and setup["validation_mode"] is not None:
             self._set_combo_data(
@@ -10627,6 +10940,23 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             yolo_gate_max_time_delta_s=self.yolo_gate_time_delta_spin.value(),
             yolo_gate_time_basis=str(self.yolo_gate_time_basis_combo.currentData() or "camera_rtc_required"),
             preview_width=self.preview_width_spin.value(),
+            calibration_zoom_level=self.zoom_level_spin.value(),
+            calibration_inner_cols=self.calib_cols_spin.value(),
+            calibration_inner_rows=self.calib_rows_spin.value(),
+            calibration_square_size_mm=self.calib_square_spin.value(),
+            calibration_min_images=self.calib_min_images_spin.value(),
+            calibration_calculation_pair_count=self.calib_calculation_pairs_spin.value(),
+            calibration_auto_interval_s=self.calibration_auto_interval_spin.value(),
+            calibration_auto_target_pairs=self.calibration_auto_target_spin.value(),
+            calibration_root=self.calib_dir_edit.text().strip(),
+            calibration_validation_mode=str(
+                self.checkerboard_validation_mode_combo.currentData() or "pixhawk"
+            ),
+            calibration_validation_root=self.checkerboard_validation_root_edit.text().strip(),
+            calibration_validation_json=self.checkerboard_validation_json_edit.text().strip(),
+            calibration_validation_runs=self.checkerboard_validation_random_runs_spin.value(),
+            calibration_validation_pair_count=self.checkerboard_validation_random_pair_count_spin.value(),
+            calibration_validation_seed=self.checkerboard_validation_seed_spin.value(),
             rtsp_latency_ms=self.rtsp_latency_spin.value(),
             yolo_event_queue_size=self.yolo_event_queue_size_spin.value(),
             yolo_frame_queue_size=self.yolo_frame_queue_size_spin.value(),
@@ -10698,13 +11028,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "zoom_level": zoom_level,
             "zoom_target": str(self.zoom_target_combo.currentData() or "both"),
         }
+        # K/D and R/T have independent lifecycles.  Keep the generic JSON
+        # loader backward-compatible with older embedded files, but new
+        # per-zoom intrinsic saves intentionally exclude stereo extrinsics.
+        intrinsics_only = without_stereo_extrinsics(self.last_calibration_result)
         save_intrinsics_json(
             zoom_output,
-            self.last_calibration_result,
+            intrinsics_only,
             metadata=metadata,
         )
         if zoom_output != latest_output:
-            save_intrinsics_json(latest_output, self.last_calibration_result, metadata=metadata)
+            save_intrinsics_json(latest_output, intrinsics_only, metadata=metadata)
         self.last_calibration_zoom_level = zoom_level
         self.calibration_status_label.setText(f"Saved intrinsics for zoom {zoom_level:02d}: {zoom_output}")
         self._add_zoom_intrinsics_comparison_path(zoom_output)
@@ -10747,16 +11081,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         right_size = (result.right.width, result.right.height)
         if left_size != right_size:
             warnings.append(f"좌/우 calibration 해상도가 다름: left={left_size}, right={right_size}")
-        if not warnings:
-            return True
-        answer = QtWidgets.QMessageBox.warning(
-            self,
-            "Intrinsics profile mismatch",
-            f"{path.name}\n\n" + "\n".join(warnings) + "\n\n그래도 적용하시겠습니까?",
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        return answer == QtWidgets.QMessageBox.Yes
+        if warnings:
+            warning_text = "; ".join(warnings)
+            self.calibration_status_label.setText(
+                f"Profile warning (non-blocking): {warning_text}"
+            )
+            self._log(
+                f"[캘리브레이션] intrinsic profile mismatch warning; "
+                f"manual apply remains allowed: {path}: {warning_text}"
+            )
+        return True
 
     def load_intrinsics(self) -> None:
         initial_path = self._intrinsics_storage_path(self.zoom_level_spin.value())
@@ -10821,12 +11155,68 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.last_calibration_result is None:
             self.calibration_status_label.setText("Run or load calibration before applying intrinsics.")
             return
-        self.active_intrinsics = self.last_calibration_result
+        selected_profile = self.selected_extrinsics_profile
+        if selected_profile is None and self.last_calibration_result.extrinsics is not None:
+            selected_profile = StereoExtrinsicsProfile(
+                extrinsics=self.last_calibration_result.extrinsics,
+                source_zoom_level=self.last_calibration_zoom_level,
+                method="legacy_embedded_checkerboard",
+                source_intrinsics_path=self._active_intrinsics_profile_path,
+                source_intrinsics_sha256=intrinsics_content_sha256(
+                    self.last_calibration_result
+                ),
+                profile_id="legacy_embedded_extrinsics",
+            )
+            self.selected_extrinsics_profile = selected_profile
+            self._selected_extrinsics_profile_path = (
+                f"{self._active_intrinsics_profile_path}#embedded-extrinsics"
+            )
+            self._selected_extrinsics_profile_hash = selected_profile.content_sha256
+        self.active_intrinsics = compose_stereo_calibration(
+            self.last_calibration_result,
+            selected_profile,
+        )
+        self._active_intrinsics_source_zoom_level = self.last_calibration_zoom_level
+        self._active_intrinsics_profile_hash = intrinsics_content_sha256(
+            self.last_calibration_result
+        )
+        if selected_profile is None:
+            self._active_extrinsics_profile_path = ""
+            self._active_extrinsics_profile_hash = ""
+            self._active_extrinsics_source_zoom_level = None
+            self._active_calibration_selection_mode = "intrinsics_only"
+        else:
+            self._active_extrinsics_profile_path = (
+                self._selected_extrinsics_profile_path
+                or f"memory:{selected_profile.profile_id or 'stereo_extrinsics'}"
+            )
+            self._active_extrinsics_profile_hash = selected_profile.content_sha256
+            self._active_extrinsics_source_zoom_level = selected_profile.source_zoom_level
+            self._active_calibration_selection_mode = "manual_cross_zoom"
+            self._set_combo_data(self.distance_mode_combo, "checkerboard")
         left_fx = self.active_intrinsics.left.camera_matrix[0][0]
         right_fx = self.active_intrinsics.right.camera_matrix[0][0]
         self.focal_spin.setValue((left_fx + right_fx) / 2.0)
         self.manual_focal_checkbox.setChecked(False)
-        self.calibration_status_label.setText("Applied intrinsics and average fx to StereoWIRIS.")
+        cross_zoom = (
+            selected_profile is not None
+            and selected_profile.source_zoom_level is not None
+            and self.last_calibration_zoom_level is not None
+            and selected_profile.source_zoom_level != self.last_calibration_zoom_level
+        )
+        detail = (
+            f"K,D zoom={self.last_calibration_zoom_level}; "
+            f"R,t zoom={selected_profile.source_zoom_level}; "
+            "cross-zoom/manual, validation not gated"
+            if cross_zoom and selected_profile is not None
+            else f"K,D zoom={self.last_calibration_zoom_level}; "
+            + (
+                f"R,t zoom={selected_profile.source_zoom_level}"
+                if selected_profile is not None
+                else "R,t not selected"
+            )
+        )
+        self.calibration_status_label.setText(f"Applied calibration bundle: {detail}")
         self._refresh_camera_parameters_tab()
         self._refresh_distance()
         self._refresh_optical_alignment_view()
@@ -10841,7 +11231,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if self.auto_start_pixhawk:
             QtCore.QTimer.singleShot(500, self._auto_start_pixhawk)
         if self.auto_start:
-            self.start_yolo()
+            self._log("[카메라] --start: WIRIS 활성화와 RTSP 프레임 확인 후 GStreamer를 시작합니다.")
+            self._start_startup_camera_sequence()
 
     def _start_interface_status_worker(self) -> None:
         if self.interface_status_thread is not None:
@@ -10962,6 +11353,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             or text.startswith("[캘리브레이션]")
             or text.startswith("[시계]")
             or text.startswith("[연결]")
+            or text.startswith("[arp]")
             or "WIRIS" in text
         )
         is_pixhawk_message = text.startswith("[픽스호크]") or (
@@ -10977,6 +11369,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             targets.append(self.wiris_log)
         for target in dict.fromkeys(targets):
             target.appendPlainText(text)
+        if is_wiris_message:
+            try:
+                print(text, flush=True)
+            except OSError:
+                # A GUI launched without a live terminal must keep its UI/log
+                # path alive even if stdout was closed by the launcher.
+                pass
 
 
 

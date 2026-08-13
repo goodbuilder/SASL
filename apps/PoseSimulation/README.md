@@ -60,7 +60,7 @@ importing ROS or starting a source process. Empty metric thresholds mean
 
 `Simulation` and `PoseSimulation` use separate process environments. The
 Simulation-owned `SIM_CONFIG`, `SIM_SCENARIO_CONFIG`, `CAM_*`, `DRONE_*`,
-`WAYPOINT_*`, `YOLO_*`, and `ATTITUDE_EXPERIMENT_*` variables are rejected by
+`WAYPOINT_*` and `YOLO_*` variables are rejected by
 the PoseSimulation configuration loader; they are never sourced, interpreted,
 or forwarded as PoseSimulation settings. PoseSimulation accepts only the
 `POSESIM_*` configuration contract.

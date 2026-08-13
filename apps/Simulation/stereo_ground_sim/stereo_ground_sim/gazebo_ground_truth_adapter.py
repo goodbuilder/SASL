@@ -40,7 +40,7 @@ DRONE_MESH_VISUAL_SCALE = 24.5245
 _ADDITIONAL_TARGET_MODEL_VISUALS: dict[str, tuple[str, float]] = {
     "x500_2m": (
         "package://stereo_ground_sim/models/x500_2m/meshes/NXP-HGD-CF.dae",
-        3.2699,
+        4.0638,
     ),
 }
 

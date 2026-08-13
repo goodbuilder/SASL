@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import threading
 import time
 from collections.abc import Sequence
@@ -57,6 +58,37 @@ WIRIS_STUS_RTT_PROBE_COMMAND = "HIWS"
 WIRIS_STUS_RTT_PROBE_COUNT = 3
 WIRIS_STUS_MAX_VALID_RTT_S = 0.250
 WIRIS_STUS_PARSE_MARGIN_S = 0.002
+WIRIS_LRF_COMMAND = "GLRD"
+WIRIS_LRF_POLL_HZ = 1.0
+WIRIS_LRF_POLL_PERIOD_S = 1.0 / WIRIS_LRF_POLL_HZ
+
+
+_LRF_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][-+]?\d+)?")
+
+
+def parse_lrf_distance(response: object) -> float | None:
+    """Parse the WIRIS ``GLRD`` response, whose distance is in metres.
+
+    The camera may return a bare number, a number prefixed by ``OK``, or
+    ``ERR`` when the optional LRF is unavailable.  Keep the parser tolerant of
+    decimal commas and the spacing used in SDK examples, but never turn an
+    error response into a numeric sample.
+    """
+
+    text = str(response or "").replace("\x00", "").strip()
+    if not text or text.upper().startswith("ERR"):
+        return None
+    matches = _LRF_NUMBER_RE.findall(text)
+    if not matches:
+        return None
+    token = matches[-1]
+    if "," in token and "." not in token:
+        token = token.replace(",", ".")
+    try:
+        value = float(token)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value >= 0.0 else None
 
 
 class WirisClockCommandWorker(QtCore.QObject):
@@ -454,12 +486,16 @@ class WirisRtspEnableWorker(QtCore.QObject):
         candidate_ports: dict[str, list[int]],
         urls: dict[str, str],
         timeout_s: float,
+        target_labels: Sequence[str] = ("left", "right"),
+        reactivate: bool = False,
     ) -> None:
         super().__init__()
         self.hosts = hosts
         self.candidate_ports = candidate_ports
         self.urls = urls
         self.timeout_s = timeout_s
+        self.target_labels = tuple(label for label in target_labels if label in {"left", "right"})
+        self.reactivate = bool(reactivate)
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
@@ -476,7 +512,8 @@ class WirisRtspEnableWorker(QtCore.QObject):
         logs: list[str] = []
         statuses: list[str] = []
         corrected_ports: dict[str, int] = {}
-        for label in ("left", "right"):
+        target_labels = self.target_labels or ("left", "right")
+        for label in target_labels:
             host = self.hosts.get(label, "").strip()
             camera_name = camera_display_name(label)
             if not host:
@@ -511,28 +548,39 @@ class WirisRtspEnableWorker(QtCore.QObject):
                 logs.append(f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: {exc}")
                 continue
             if not self._set_ethernet_response_ok(response):
-                statuses.append(f"{label}=enable-rejected")
+                statuses.append(f"{label}=reactivate-rejected" if self.reactivate else f"{label}=enable-rejected")
                 logs.append(
                     f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화 실패: "
                     f"{SET_ETHERNET_MODE_COMMAND} 응답={response or 'empty'}"
                 )
                 continue
-            statuses.append(f"{label}=enable-sent")
+            statuses.append(f"{label}=reactivated-sent" if self.reactivate else f"{label}=enable-sent")
             logs.append(
-                f"[카메라] {camera_name} RTSP/Ethernet Mode 활성화: "
+                f"[카메라] {camera_name} RTSP/Ethernet Mode "
+                f"{'재활성화' if self.reactivate else '활성화'}: "
                 f"{GET_ETHERNET_MODE_COMMAND}={before or 'n/a'}, {SET_ETHERNET_MODE_COMMAND} 응답={response or 'sent'}"
+                + (" (제어 서비스 보호를 위해 SETH FALSE는 전송하지 않음)" if self.reactivate else "")
             )
 
-        should_check = any(status.endswith("=enable-sent") for status in statuses)
+        should_check = any(
+            status.endswith("=enable-sent") or status.endswith("=reactivated-sent")
+            for status in statuses
+        )
         closed: list[str] = []
         if should_check:
             logs.append(
                 f"[카메라] RTSP port가 열릴 때까지 최대 {RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS}초 대기한 뒤 프레임 수신을 확인합니다."
             )
-            closed = self._wait_for_rtsp_ports(logs)
+            closed = self._wait_for_rtsp_ports(logs, labels=target_labels)
         else:
-            logs.append("[카메라] RTSP 활성화에 성공한 카메라가 없어 프레임 확인을 건너뜁니다.")
+            logs.append(
+                "[카메라] RTSP 재활성화에 성공한 카메라가 없어 프레임 확인을 건너뜁니다."
+                if self.reactivate
+                else "[카메라] RTSP 활성화에 성공한 카메라가 없어 프레임 확인을 건너뜁니다."
+            )
         return {
+            "mode": "reactivate" if self.reactivate else "enable",
+            "target_labels": target_labels,
             "statuses": statuses,
             "logs": logs,
             "corrected_ports": corrected_ports,
@@ -562,11 +610,11 @@ class WirisRtspEnableWorker(QtCore.QObject):
             failures.append(f"{port}={response or 'empty'}")
         return None, failures[-1] if failures else "no-candidate", None, ", ".join(failures)
 
-    def _wait_for_rtsp_ports(self, logs: list[str]) -> list[str]:
+    def _wait_for_rtsp_ports(self, logs: list[str], *, labels: Sequence[str] | None = None) -> list[str]:
         closed: list[str] = []
         QtCore.QThread.msleep(RTSP_ENABLE_SETTLE_DELAY_MS)
         for attempt in range(RTSP_ENABLE_PORT_WAIT_MAX_ATTEMPTS + 1):
-            closed = self._closed_rtsp_ports()
+            closed = self._closed_rtsp_ports(labels=labels)
             if not closed:
                 logs.append("[카메라] RTSP port 열림 확인 완료. 프레임 수신 확인을 시작합니다.")
                 return []
@@ -577,9 +625,11 @@ class WirisRtspEnableWorker(QtCore.QObject):
             QtCore.QThread.msleep(RTSP_ENABLE_PORT_WAIT_INTERVAL_MS)
         return closed
 
-    def _closed_rtsp_ports(self) -> list[str]:
+    def _closed_rtsp_ports(self, *, labels: Sequence[str] | None = None) -> list[str]:
         closed = []
-        for camera, url in self.urls.items():
+        selected_labels = tuple(labels) if labels is not None else tuple(self.urls)
+        for camera in selected_labels:
+            url = self.urls.get(camera, "")
             try:
                 host, port = rtsp_host_port(url.strip())
             except Exception as exc:
@@ -673,6 +723,126 @@ class WirisCommandWorker(QtCore.QObject):
             self.failed.emit(str(exc))
         finally:
             self.finished.emit()
+
+
+class WirisLrfPollWorker(QtCore.QObject):
+    """Continuously read the optional WIRIS laser rangefinder off the UI thread."""
+
+    sampled = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(
+        self,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        *,
+        period_s: float = WIRIS_LRF_POLL_PERIOD_S,
+    ) -> None:
+        super().__init__()
+        self.target_infos = tuple(
+            (str(label), str(host), int(port), max(0.1, float(timeout_s)))
+            for label, host, port, timeout_s in target_infos
+        )
+        self.period_s = max(0.05, float(period_s))
+        self._stop_event = threading.Event()
+
+    def request_stop(self) -> None:
+        self._stop_event.set()
+
+    def _poll_one(
+        self,
+        label: str,
+        host: str,
+        port: int,
+        timeout_s: float,
+    ) -> dict[str, object]:
+        started_s = time.monotonic()
+        response = ""
+        distance_m: float | None = None
+        error = ""
+        try:
+            if not host.strip():
+                raise ValueError("WIRIS control host is empty")
+            command = build_wiris_command(
+                host=host,
+                port=port,
+                command=WIRIS_LRF_COMMAND,
+                timeout_s=timeout_s,
+                terminator=LINE_TERMINATOR,
+            )
+            response = send_tcp_line(command)
+            distance_m = parse_lrf_distance(response)
+            if not response:
+                error = "empty response"
+            elif distance_m is None:
+                error = response.strip() or "distance parse failed"
+        except Exception as exc:
+            error = str(exc) or exc.__class__.__name__
+        observed_s = time.monotonic()
+        return {
+            "side": label,
+            "host": host,
+            "port": port,
+            "command": WIRIS_LRF_COMMAND,
+            "response": response,
+            "distance_m": distance_m,
+            "error": error,
+            "attempted_s": started_s,
+            "observed_s": observed_s,
+            "duration_s": max(0.0, observed_s - started_s),
+            "observed_unix_s": time.time(),
+        }
+
+    def poll_once(self) -> tuple[dict[str, object], ...]:
+        """Run one parallel left/right poll; exposed for deterministic tests."""
+
+        results: dict[str, dict[str, object]] = {}
+
+        def poll_one(info: tuple[str, str, int, float]) -> None:
+            label, host, port, timeout_s = info
+            results[label] = self._poll_one(label, host, port, timeout_s)
+
+        threads = [
+            threading.Thread(target=poll_one, args=(info,), name=f"wiris-lrf-{info[0]}")
+            for info in self.target_infos
+        ]
+        for thread in threads:
+            thread.start()
+        for thread, info in zip(threads, self.target_infos):
+            thread.join(timeout=max(1.0, info[3]) + 0.25)
+            if thread.is_alive():
+                results.setdefault(
+                    info[0],
+                    {
+                        "side": info[0],
+                        "host": info[1],
+                        "port": info[2],
+                        "command": WIRIS_LRF_COMMAND,
+                        "response": "",
+                        "distance_m": None,
+                        "error": "poll thread timeout",
+                        "attempted_s": time.monotonic(),
+                        "observed_s": time.monotonic(),
+                        "duration_s": 0.0,
+                        "observed_unix_s": time.time(),
+                    },
+                )
+        return tuple(results[label] for label, *_ in self.target_infos if label in results)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                cycle_started_s = time.monotonic()
+                self.sampled.emit({"samples": self.poll_once(), "polled_s": time.monotonic()})
+                remaining_s = self.period_s - (time.monotonic() - cycle_started_s)
+                if self._stop_event.wait(max(0.0, remaining_s)):
+                    break
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
 
 class WirisZoomWorker(QtCore.QObject):
     """Send WIRIS zoom commands without blocking the UI thread."""

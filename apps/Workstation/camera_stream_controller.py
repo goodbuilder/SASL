@@ -50,6 +50,8 @@ class CameraStreamLifecycleController:
         return None
 
     def connect_cameras(self) -> None:
+        if self.panel.auto_wiris_connect_pending:
+            self.panel._cancel_auto_wiris_connect_retry()
         self.panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
 
     def start_yolo(self) -> None:
@@ -127,30 +129,37 @@ class CameraStreamLifecycleController:
                 **kwargs,
                 **self.panel._video_recording_kwargs("left"),
             )
-            if not left_started:
-                self.panel.camera_connected = False
-                self.panel.yolo_enabled = False
-                self.panel._schedule_camera_start_retry(enable_detection, switch_to_depth)
-                self.panel._refresh_operation_header()
-                return
             right_started = self.panel.right_pane.start_stream(
                 right_url,
                 enable_detection=enable_detection,
                 **kwargs,
                 **self.panel._video_recording_kwargs("right"),
             )
-            if not right_started:
-                self.panel.left_pane.stop(wait=False)
+
+            started_sides = tuple(
+                side for side, started in (("left", left_started), ("right", right_started)) if started
+            )
+            if not started_sides:
                 self.panel.camera_connected = False
                 self.panel.yolo_enabled = False
                 self.panel._schedule_camera_start_retry(enable_detection, switch_to_depth)
                 self.panel._refresh_operation_header()
                 return
+
             self.panel._pending_camera_start = None
             self.panel.camera_connected = True
             self.panel.yolo_enabled = enable_detection
             self.panel.start_button.setEnabled(True)
             self.panel.camera_connect_button.setEnabled(True)
+            if len(started_sides) != 2:
+                failed_side = "right" if left_started else "left"
+                self.panel._log(
+                    f"[카메라] {failed_side} Preview 시작 실패. "
+                    f"{', '.join(started_sides)} 스트림은 유지하며 실패한 카메라만 재활성화하세요."
+                )
+                self.panel.camera_connection_label.setText(
+                    f"camera partial: {', '.join(started_sides)} connected; {failed_side} unavailable"
+                )
             self.panel._refresh_session_toggle_buttons()
             self.panel._refresh_operation_header()
 
@@ -188,6 +197,8 @@ class CameraStreamLifecycleController:
         self.panel._pending_camera_start = None
 
     def stop_yolo_streams(self, *, wait: bool = False) -> bool:
+        if self.panel.auto_wiris_connect_pending:
+            self.panel._cancel_auto_wiris_connect_retry()
         self.panel._cancel_pending_camera_start()
         self.panel._camera_sync_timer.stop()
         self.panel._camera_sync_deadline_monotonic_s = None
@@ -240,6 +251,10 @@ class CameraStreamLifecycleController:
         self.panel.active_stream_decoders["right"] = None
         self.panel._update_runtime_camera_stats_labels()
         if clear_previews:
+            clear_signal = getattr(self.panel, "camera_preview_cleared", None)
+            emit = getattr(clear_signal, "emit", None)
+            if callable(emit):
+                emit()
             self.panel._clear_calibration_previews("left preview", right_text="right preview")
         return bool(left_stopped and right_stopped)
 
@@ -280,7 +295,6 @@ class CameraStreamLifecycleController:
             "wiris_command_thread",
             "wiris_zoom_thread",
             "wiris_time_sync_thread",
-            "wiris_gdti_thread",
             "wiris_stip_thread",
             "camera_network_discovery_thread",
             "camera_network_apply_thread",

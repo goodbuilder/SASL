@@ -90,7 +90,12 @@ def test_dkl_ideal_pixels_project_world_enu_reference_through_nominal_cameras() 
     assert 0.0 <= pixels[3] < 720.0
 
 
-def test_rviz_reference_ray_can_display_points_outside_dkl_pixel_bounds() -> None:
+def test_dkl_ideal_pixels_are_fov_independent_when_in_front_of_the_camera() -> None:
+    """dkl_ideal_pixels_from_world is a FOV-independent debug reference: it
+
+    must keep reporting a projection for points in front of the camera even
+    when that projection falls outside the image bounds.
+    """
     left, right = nominal_camera_poses(25.0, 5.0)
     frame = build_baseline_center_frd(
         left.center_world_enu_m,
@@ -99,6 +104,23 @@ def test_rviz_reference_ray_can_display_points_outside_dkl_pixel_bounds() -> Non
         right.forward_world_enu,
     )
     point_world = frame.point_to_world((1000.0, 0.0, -120.0))
+    intrinsics = PinholeIntrinsics(fx_px=6400.0, fy_px=6400.0, cx_px=640.0, cy_px=360.0)
+
+    pixels = dkl_ideal_pixels_from_world(point_world, left, right, intrinsics, 1280, 720)
+
+    assert pixels is not None
+    assert not (0.0 <= pixels[1] < 720.0)
+
+
+def test_rviz_reference_ray_can_display_points_dkl_cannot_project() -> None:
+    left, right = nominal_camera_poses(25.0, 5.0)
+    frame = build_baseline_center_frd(
+        left.center_world_enu_m,
+        right.center_world_enu_m,
+        left.forward_world_enu,
+        right.forward_world_enu,
+    )
+    point_world = frame.point_to_world((-50.0, 0.0, 0.0))  # behind the camera plane
     intrinsics = PinholeIntrinsics(fx_px=6400.0, fy_px=6400.0, cx_px=640.0, cy_px=360.0)
 
     assert dkl_ideal_pixels_from_world(point_world, left, right, intrinsics, 1280, 720) is None

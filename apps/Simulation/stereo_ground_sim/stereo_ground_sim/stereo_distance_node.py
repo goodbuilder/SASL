@@ -301,7 +301,7 @@ DRONE_MESH_VISUAL_SCALE = 24.5245
 _ADDITIONAL_TARGET_MODEL_VISUALS: dict[str, tuple[str, float]] = {
     "x500_2m": (
         "package://stereo_ground_sim/models/x500_2m/meshes/NXP-HGD-CF.dae",
-        3.2699,
+        4.0638,
     ),
 }
 
@@ -412,7 +412,9 @@ def dkl_ideal_pixels_from_world(
 
     The point and both camera poses are World ENU; ``intrinsics`` are pixel
     units.  The returned ``(u_l, v_l, u_r, v_r)`` values are nearest-pixel
-    centers and are valid only within the supplied image bounds.
+    centers. This is a FOV-independent debug reference: it reports where the
+    target would project even outside the image bounds, so it stays available
+    for comparison whenever a real (bounded) detection is missing.
     """
 
     width = int(width)
@@ -433,8 +435,6 @@ def dkl_ideal_pixels_from_world(
             return None
         u_px = float(math.floor(float(pixel[0]) + 0.5))
         v_px = float(math.floor(float(pixel[1]) + 0.5))
-        if not (0.0 <= u_px < width and 0.0 <= v_px < height):
-            return None
         pixels.extend((u_px, v_px))
     return tuple(pixels)
 
@@ -1419,13 +1419,18 @@ class StereoDistanceNode(Node):
     def _ideal_detection_pair_from_reference_world(
         self, point_world_enu_m, width, height, *, camera_oracle_snapshot=_CAMERA_ORACLE_UNSET
     ):
+        """FOV-independent debug reference: reports the target's projection
+
+        even when it falls outside the image bounds, matching the RViz ideal
+        ray so both stay visible whenever the same reference point is used.
+        """
         self._ensure_camera_frames()
         return self._detection_pair_from_world(
             point_world_enu_m,
             width,
             height,
             projection_camera_mode="gazebo_observed_optical",
-            enforce_fov_bounds=True,
+            enforce_fov_bounds=False,
             camera_oracle_snapshot=camera_oracle_snapshot,
         )
 

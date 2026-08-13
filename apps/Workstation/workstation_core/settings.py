@@ -11,6 +11,7 @@ from Workstation.workstation_core.gnss_operation import GnssOperationConfig
 APP_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SETTINGS_PATH = APP_ROOT / "stereo_distance_settings.json"
 DEFAULT_INTRINSICS_PATH = "calibration_captures/intrinsics.json"
+DEFAULT_CALIBRATION_ROOT = "calibration_captures"
 PIXHAWK_ETHERNET_MODES = ("mavlink",)
 DEFAULT_PIXHAWK_ETHERNET_MODE = "mavlink"
 
@@ -49,15 +50,30 @@ class AppSettings:
     # fall back to the app's monotonic receive clock when their camera clocks
     # are not mutually synchronized.
     yolo_gate_time_basis: str = "camera_rtcp"
-    preview_width: int = 1920
-    rtsp_latency_ms: int = 50
+    preview_width: int = 1280
+    calibration_zoom_level: int = 10
+    calibration_inner_cols: int = 13
+    calibration_inner_rows: int = 8
+    calibration_square_size_mm: float = 40.0
+    calibration_min_images: int = 20
+    # Maximum number of matching stereo pairs used by the full calibration
+    # calculation.  Zero means use every pair in the selected root.
+    calibration_calculation_pair_count: int = 20
+    calibration_auto_interval_s: float = 1.0
+    calibration_auto_target_pairs: int = 20
+    calibration_root: str = DEFAULT_CALIBRATION_ROOT
+    calibration_validation_mode: str = "pixhawk"
+    calibration_validation_root: str = DEFAULT_CALIBRATION_ROOT
+    calibration_validation_json: str = DEFAULT_INTRINSICS_PATH
+    calibration_validation_runs: int = 3
+    calibration_validation_pair_count: int = 0
+    calibration_validation_seed: int = 0
+    rtsp_latency_ms: int = 100
     yolo_event_queue_size: int = 128
     yolo_frame_queue_size: int = 2
-    rtsp_decoder: str = "nvidia"
+    rtsp_decoder: str = "auto"
     stream_backend: str = "gstreamer"
-    # TCP interleaving keeps RTCP Sender Reports on the RTSP control channel;
-    # use it as the safe default for absolute camera-clock verification.
-    rtsp_transport: str = "tcp"
+    rtsp_transport: str = "udp"
     camera_sync_history_window_s: float = 1.0
     camera_sync_receive_pair_max_delta_s: float = 0.350
     camera_sync_rtcp_pair_max_delta_s: float = 0.050
@@ -116,6 +132,11 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         triangulation_extrinsics_source = "checkerboard"
     if triangulation_extrinsics_source not in {"pixhawk", "checkerboard"}:
         triangulation_extrinsics_source = "pixhawk"
+    calibration_validation_mode = str(
+        payload.get("calibration_validation_mode", AppSettings.calibration_validation_mode)
+    )
+    if calibration_validation_mode not in {"pixhawk", "checkerboard"}:
+        calibration_validation_mode = AppSettings.calibration_validation_mode
     return AppSettings(
         intrinsics_path=str(payload.get("intrinsics_path", AppSettings.intrinsics_path)),
         yolo_weights_path=str(payload.get("yolo_weights_path", AppSettings.yolo_weights_path)),
@@ -160,6 +181,69 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         ),
         yolo_gate_time_basis=str(payload.get("yolo_gate_time_basis", AppSettings.yolo_gate_time_basis)),
         preview_width=int(payload.get("preview_width", AppSettings.preview_width)),
+        calibration_zoom_level=max(
+            0,
+            min(100, int(payload.get("calibration_zoom_level", AppSettings.calibration_zoom_level))),
+        ),
+        calibration_inner_cols=max(
+            2,
+            min(30, int(payload.get("calibration_inner_cols", AppSettings.calibration_inner_cols))),
+        ),
+        calibration_inner_rows=max(
+            2,
+            min(30, int(payload.get("calibration_inner_rows", AppSettings.calibration_inner_rows))),
+        ),
+        calibration_square_size_mm=max(
+            1.0,
+            min(500.0, float(payload.get("calibration_square_size_mm", AppSettings.calibration_square_size_mm))),
+        ),
+        calibration_min_images=max(
+            3,
+            min(100, int(payload.get("calibration_min_images", AppSettings.calibration_min_images))),
+        ),
+        calibration_calculation_pair_count=max(
+            0,
+            min(
+                10000,
+                int(
+                    payload.get(
+                        "calibration_calculation_pair_count",
+                        AppSettings.calibration_calculation_pair_count,
+                    )
+                ),
+            ),
+        ),
+        calibration_auto_interval_s=max(
+            0.5,
+            min(10.0, float(payload.get("calibration_auto_interval_s", AppSettings.calibration_auto_interval_s))),
+        ),
+        calibration_auto_target_pairs=max(
+            1,
+            min(200, int(payload.get("calibration_auto_target_pairs", AppSettings.calibration_auto_target_pairs))),
+        ),
+        calibration_root=str(payload.get("calibration_root", AppSettings.calibration_root)),
+        calibration_validation_mode=calibration_validation_mode,
+        calibration_validation_root=str(
+            payload.get("calibration_validation_root", AppSettings.calibration_validation_root)
+        ),
+        calibration_validation_json=str(
+            payload.get("calibration_validation_json", AppSettings.calibration_validation_json)
+        ),
+        calibration_validation_runs=max(
+            1,
+            min(20, int(payload.get("calibration_validation_runs", AppSettings.calibration_validation_runs))),
+        ),
+        calibration_validation_pair_count=max(
+            0,
+            min(
+                10000,
+                int(payload.get("calibration_validation_pair_count", AppSettings.calibration_validation_pair_count)),
+            ),
+        ),
+        calibration_validation_seed=max(
+            0,
+            int(payload.get("calibration_validation_seed", AppSettings.calibration_validation_seed)),
+        ),
         rtsp_latency_ms=int(payload.get("rtsp_latency_ms", AppSettings.rtsp_latency_ms)),
         yolo_event_queue_size=max(
             1,

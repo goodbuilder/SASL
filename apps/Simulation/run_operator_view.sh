@@ -64,6 +64,7 @@ SIM_EXPLICIT_NAMES=(
   CAM_L_PX4_ATTITUDE_ROLL_DEG CAM_L_PX4_ATTITUDE_PITCH_DEG CAM_L_PX4_ATTITUDE_YAW_DEG
   CAM_R_PX4_ATTITUDE_ROLL_DEG CAM_R_PX4_ATTITUDE_PITCH_DEG CAM_R_PX4_ATTITUDE_YAW_DEG
   CAM_L_GNSS_BASELINE_TO_FORWARD_YAW_DEG CAM_R_GNSS_BASELINE_TO_FORWARD_YAW_DEG
+  CAM_L_SIM_GPS_USED CAM_R_SIM_GPS_USED
   CAM_L_PX4_MODEL_NAME CAM_R_PX4_MODEL_NAME CAM_L_PX4_INSTANCE CAM_R_PX4_INSTANCE
   CAM_L_PX4_DDS_NAMESPACE CAM_R_PX4_DDS_NAMESPACE
   PX4_REQUIRED_VERSION
@@ -1308,6 +1309,8 @@ setsid bash -c '
     console_log="${13}"
     camera_airframe_src="${14}"
     skip_px4_build="${15}"
+    cam_l_sim_gps_used="${16}"
+    cam_r_sim_gps_used="${17}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
@@ -1367,6 +1370,7 @@ setsid bash -c '
       local dds_namespace="$3"
       local label="$4"
       local sys_autostart="$5"
+      local sim_gps_used="${6:-}"
       local instance_log="$console_log"
       if [[ "$console_log" != "/dev/null" ]]; then
         instance_log="${console_log}.${label}"
@@ -1384,6 +1388,13 @@ setsid bash -c '
         else
           unset PX4_UXRCE_DDS_NS || true
         fi
+        # Read by the SIM_GPS_USED param set-default line in
+        # vendor/px4_camera_airframe/4090_camera_px4. Only set for the
+        # left/right camera instances (see the two start_px4_instance calls
+        # below); the target instance keeps the PX4 default.
+        if [[ -n "$sim_gps_used" ]]; then
+          export SIM_GPS_USED="$sim_gps_used"
+        fi
         cd "$gz_bridge_dir"
         exec "$px4_binary" -d -i "$instance"
       ) >"$instance_log" 2>&1 &
@@ -1391,8 +1402,8 @@ setsid bash -c '
     }
 
     start_px4_instance 0 "$target_model" "" target 4001
-    start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left 4090
-    start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right 4090
+    start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left 4090 "$cam_l_sim_gps_used"
+    start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right 4090 "$cam_r_sim_gps_used"
     wait -n "${pids[@]}"
   ' _ \
     "$PX4_DIR" \
@@ -1409,7 +1420,9 @@ setsid bash -c '
     "$PX4_UXRCE_DDS_PORT" \
     "$PX4_CONSOLE_LOG" \
     "$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4" \
-    "$skip_px4_build" &
+    "$skip_px4_build" \
+    "${CAM_L_SIM_GPS_USED:-10}" \
+    "${CAM_R_SIM_GPS_USED:-10}" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
 printf '%s\n' \

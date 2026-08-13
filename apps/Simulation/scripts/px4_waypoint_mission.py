@@ -35,14 +35,19 @@ def non_negative_float(value):
 
 def parse_xy_alt(entry):
     parts = [part.strip() for part in entry.split(",")]
-    if len(parts) != 3:
+    if len(parts) not in (3, 4):
         raise argparse.ArgumentTypeError(
-            "waypoint must be north,east,altitude_agl_m"
+            "waypoint must be north,east,altitude_agl_m[,hold_s]"
         )
-    north, east, altitude = (float(part) for part in parts)
+    north, east, altitude = (float(part) for part in parts[:3])
     if altitude < 0:
         raise argparse.ArgumentTypeError("altitude_agl_m must be zero or greater")
-    return north, east, -altitude
+    hold_s = None
+    if len(parts) == 4 and parts[3] != "":
+        hold_s = float(parts[3])
+        if hold_s < 0:
+            raise argparse.ArgumentTypeError("hold_s must be zero or greater")
+    return north, east, -altitude, hold_s
 
 
 def parse_waypoint_list(value):
@@ -77,7 +82,11 @@ def read_path_file(path):
                     raise ValueError(
                         "CSV header must include north/east/altitude columns"
                     )
-                waypoints.append(parse_xy_alt(f"{north},{east},{altitude}"))
+                hold_s = row.get("hold_s") or row.get("hold")
+                entry = f"{north},{east},{altitude}"
+                if hold_s not in (None, ""):
+                    entry += f",{hold_s}"
+                waypoints.append(parse_xy_alt(entry))
         else:
             reader = csv.reader(
                 row for row in handle if row.strip() and not row.lstrip().startswith("#")
@@ -99,15 +108,17 @@ def build_parser():
     parser.add_argument(
         "--waypoints-xy-alt",
         default="",
-        help="Semicolon-separated north,east,altitude_agl_m list.",
+        help="Semicolon-separated north,east,altitude_agl_m[,hold_s] list. "
+        "hold_s overrides --hold-s for that one waypoint (e.g. to hover "
+        "only at some waypoints in a dense path); omit it to use --hold-s.",
     )
     parser.add_argument(
         "--waypoint",
         action="append",
         default=[],
         type=parse_xy_alt,
-        metavar="X,Y,ALT",
-        help="Add one north,east,altitude_agl_m waypoint. Repeatable.",
+        metavar="X,Y,ALT[,HOLD_S]",
+        help="Add one north,east,altitude_agl_m[,hold_s] waypoint. Repeatable.",
     )
     parser.add_argument("--path-file", help="Read waypoints from CSV/text file.")
     parser.add_argument("--speed-mps", type=positive_float, default=12.0)
@@ -125,11 +136,102 @@ def build_parser():
         help="Override PX4 MPC_Z_VEL_MAX_DN (descent speed limit, default PX4 value: 1.5 m/s) "
         "before the mission starts. Unset leaves PX4's configured value alone.",
     )
+    parser.add_argument(
+        "--mpc-tiltmax-air-deg",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MPC_TILTMAX_AIR (max roll/pitch lean angle in flight, "
+        "default PX4 value: 45 deg) before the mission starts. Unset leaves "
+        "PX4's configured value alone.",
+    )
+    parser.add_argument(
+        "--mc-rollrate-p",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MC_ROLLRATE_P (roll rate loop gain, default PX4 value: "
+        "0.15) before the mission starts. Higher values reach the commanded "
+        "tilt rate faster. Unset leaves PX4's configured value alone.",
+    )
+    parser.add_argument(
+        "--mc-pitchrate-p",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MC_PITCHRATE_P (pitch rate loop gain, default PX4 "
+        "value: 0.15) before the mission starts. Unset leaves PX4's "
+        "configured value alone.",
+    )
+    parser.add_argument(
+        "--mc-roll-p",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MC_ROLL_P (roll attitude loop gain, default PX4 "
+        "value: 4.0) before the mission starts. Unset leaves PX4's "
+        "configured value alone.",
+    )
+    parser.add_argument(
+        "--mc-pitch-p",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MC_PITCH_P (pitch attitude loop gain, default PX4 "
+        "value: 4.0) before the mission starts. Unset leaves PX4's "
+        "configured value alone.",
+    )
+    parser.add_argument(
+        "--mpc-xy-vel-p-acc",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MPC_XY_VEL_P_ACC (horizontal velocity loop gain, "
+        "default PX4 value: 1.8) before the mission starts. Unset leaves "
+        "PX4's configured value alone.",
+    )
+    parser.add_argument(
+        "--mpc-acc-hor-max",
+        type=positive_float,
+        default=None,
+        help="Override PX4 MPC_ACC_HOR_MAX (hard horizontal acceleration cap, "
+        "default PX4 value: 5.0 m/s^2) before the mission starts. Unlike the "
+        "loop gains, this is a ceiling the controller saturates against, not "
+        "an error multiplier. Unset leaves PX4's configured value alone.",
+    )
     parser.add_argument("--acceptance-radius-m", type=positive_float, default=5.0)
     parser.add_argument("--waypoint-timeout-s", type=positive_float, default=120.0)
-    parser.add_argument("--takeoff-timeout-s", type=positive_float, default=60.0)
-    parser.add_argument("--hold-s", type=non_negative_float, default=1.0)
-    parser.add_argument("--final-hover-s", type=non_negative_float, default=3.0)
+    parser.add_argument(
+        "--hold-s",
+        type=non_negative_float,
+        default=1.0,
+        help="Hover time at each waypoint, in seconds. 0 disables the hover.",
+    )
+    parser.add_argument(
+        "--ramp-s",
+        type=non_negative_float,
+        default=1.0,
+        help="Time to accelerate the horizontal speed from 0 to full "
+        "speed_mps (and symmetrically decelerate to 0 on arrival) at the "
+        "start of a leg, in seconds. Direction is fixed at the start of "
+        "the leg rather than re-aimed from the live position every tick, "
+        "so this and --vertical-ramp-s independently time the horizontal "
+        "and vertical components of one straight-line path instead of "
+        "each other's noise. 0 disables ramping (jumps straight to full "
+        "speed).",
+    )
+    parser.add_argument(
+        "--vertical-ramp-s",
+        type=non_negative_float,
+        default=2.5,
+        help="Time to accelerate the vertical speed from 0 to full "
+        "speed_mps, in seconds. Kept longer than --ramp-s by default: the "
+        "vehicle's real Z response (thrust only) engages almost "
+        "immediately while its horizontal response lags (needs to build a "
+        "tilt angle first), so ramping vertical in more slowly keeps it "
+        "from outrunning horizontal and dropping off the intended "
+        "approach line. 0 disables ramping.",
+    )
+    parser.add_argument(
+        "--final-hover-s",
+        type=non_negative_float,
+        default=3.0,
+        help="Hover time after the final waypoint, in seconds. 0 disables the hover.",
+    )
     parser.add_argument("--land-timeout-s", type=positive_float, default=90.0)
     parser.add_argument("--setpoint-hz", type=positive_float, default=20.0)
     parser.add_argument("--heartbeat-timeout-s", type=positive_float, default=30.0)
@@ -146,6 +248,23 @@ def build_parser():
         help="Stay in offboard hover after the final waypoint.",
     )
     parser.set_defaults(land_after=True)
+    parser.add_argument(
+        "--stop-after-hover",
+        dest="stop_after_hover",
+        action="store_true",
+        help="With --no-land: exit automatically once --final-hover-s "
+        "elapses, instead of hovering indefinitely until interrupted "
+        "(Ctrl+C). Ignored when landing after the final waypoint, since "
+        "landing already ends the mission on its own.",
+    )
+    parser.add_argument(
+        "--no-stop-after-hover",
+        dest="stop_after_hover",
+        action="store_false",
+        help="With --no-land: hover indefinitely at the final waypoint "
+        "until interrupted (Ctrl+C). This is the default.",
+    )
+    parser.set_defaults(stop_after_hover=False)
     parser.add_argument(
         "--check-connection",
         action="store_true",
@@ -205,9 +324,27 @@ def send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz):
 
 
 def wait_waypoint(master, boot_time, args, waypoint, index, total):
-    x, y, z = waypoint
+    x, y, z = waypoint[:3]
     period_s = 1.0 / args.setpoint_hz
-    deadline = time.monotonic() + args.waypoint_timeout_s
+    start = time.monotonic()
+    deadline = start + args.waypoint_timeout_s
+    # A hold ends at zero velocity. When the next leg's velocity command
+    # starts, the real vehicle's Z response (thrust only) engages almost
+    # immediately, while its horizontal response (needs to build a tilt
+    # angle first) lags by roughly 1.5-2s before it starts translating.
+    # Commanding both axes with the same ramp does not fix this -- the
+    # imbalance is in the vehicle's physical response, not the command
+    # timing -- so vz is ramped in on its own, slower schedule to stay
+    # synchronized with how fast the vehicle actually starts moving
+    # horizontally, instead of outrunning it and dropping off the ray.
+    #
+    # A fixed-direction, time-explicit trapezoidal profile (single shared
+    # ramp, and later two independently-ramped horizontal/vertical
+    # profiles) was tried here empirically and measured worse in both
+    # forms -- the live-position re-aiming below, imperfect as it is,
+    # outperformed both redesigns. Left as pure pursuit.
+    horizontal_ramp_s = args.ramp_s
+    vertical_ramp_s = args.vertical_ramp_s
     last_report = 0.0
     print(
         f"Waypoint {index}/{total}: north={x:.1f}, east={y:.1f}, altitude={-z:.1f} m",
@@ -219,9 +356,16 @@ def wait_waypoint(master, boot_time, args, waypoint, index, total):
             remaining = distance_3d(pos, waypoint)
             if remaining > 0.001:
                 speed = min(args.speed_mps, remaining)
-                vx = (x - float(pos.x)) / remaining * speed
-                vy = (y - float(pos.y)) / remaining * speed
-                vz = (z - float(pos.z)) / remaining * speed
+                elapsed = time.monotonic() - start
+                h_ramp = (
+                    1.0 if horizontal_ramp_s <= 0 else min(1.0, elapsed / horizontal_ramp_s)
+                )
+                v_ramp = (
+                    1.0 if vertical_ramp_s <= 0 else min(1.0, elapsed / vertical_ramp_s)
+                )
+                vx = (x - float(pos.x)) / remaining * speed * h_ramp
+                vy = (y - float(pos.y)) / remaining * speed * h_ramp
+                vz = (z - float(pos.z)) / remaining * speed * v_ramp
             else:
                 vx = vy = vz = 0.0
             send_position_velocity_setpoint(master, boot_time, x, y, z, vx, vy, vz)
@@ -258,6 +402,20 @@ def run(args):
             set_param_float(master, "MPC_Z_VEL_MAX_UP", args.mpc_z_vel_max_up_mps)
         if args.mpc_z_vel_max_dn_mps is not None:
             set_param_float(master, "MPC_Z_VEL_MAX_DN", args.mpc_z_vel_max_dn_mps)
+        if args.mpc_tiltmax_air_deg is not None:
+            set_param_float(master, "MPC_TILTMAX_AIR", args.mpc_tiltmax_air_deg)
+        if args.mc_rollrate_p is not None:
+            set_param_float(master, "MC_ROLLRATE_P", args.mc_rollrate_p)
+        if args.mc_pitchrate_p is not None:
+            set_param_float(master, "MC_PITCHRATE_P", args.mc_pitchrate_p)
+        if args.mc_roll_p is not None:
+            set_param_float(master, "MC_ROLL_P", args.mc_roll_p)
+        if args.mc_pitch_p is not None:
+            set_param_float(master, "MC_PITCH_P", args.mc_pitch_p)
+        if args.mpc_xy_vel_p_acc is not None:
+            set_param_float(master, "MPC_XY_VEL_P_ACC", args.mpc_xy_vel_p_acc)
+        if args.mpc_acc_hor_max is not None:
+            set_param_float(master, "MPC_ACC_HOR_MAX", args.mpc_acc_hor_max)
 
         first = waypoints[0]
         boot_time = time.monotonic()
@@ -278,8 +436,9 @@ def run(args):
 
         for index, waypoint in enumerate(waypoints, start=1):
             wait_waypoint(master, boot_time, args, waypoint, index, len(waypoints))
+            hold_s = waypoint[3] if waypoint[3] is not None else args.hold_s
             stream_for(
-                args.hold_s,
+                hold_s,
                 args.setpoint_hz,
                 lambda waypoint=waypoint: send_position_setpoint(
                     master, boot_time, waypoint[0], waypoint[1], waypoint[2]
@@ -302,6 +461,8 @@ def run(args):
             else:
                 command_long(master, mavutil.mavlink.MAV_CMD_NAV_LAND)
             wait_landed(master, args.land_timeout_s)
+        elif args.stop_after_hover:
+            print("Mission complete. Stopping after the final hover.", flush=True)
         else:
             print(
                 "Mission complete. Hovering at the final waypoint in OFFBOARD "

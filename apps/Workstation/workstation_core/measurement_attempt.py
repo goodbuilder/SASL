@@ -704,11 +704,39 @@ class StereoIntrinsicsSnapshot:
     active_zoom_level: int
     selected_profile_path: str
     content_sha256: str
+    intrinsics_content_sha256: str = ""
+    selected_extrinsics_profile_path: str = ""
+    extrinsics_content_sha256: str = ""
+    intrinsics_source_zoom_level: int | None = None
+    extrinsics_source_zoom_level: int | None = None
+    selection_mode: str = "legacy_combined"
+    validation_gate: str = "disabled"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "active_zoom_level", int(self.active_zoom_level))
         object.__setattr__(self, "selected_profile_path", str(self.selected_profile_path))
         object.__setattr__(self, "content_sha256", str(self.content_sha256))
+        object.__setattr__(
+            self,
+            "intrinsics_source_zoom_level",
+            self.active_zoom_level
+            if self.intrinsics_source_zoom_level is None
+            else int(self.intrinsics_source_zoom_level),
+        )
+        object.__setattr__(
+            self,
+            "extrinsics_source_zoom_level",
+            None
+            if self.extrinsics_source_zoom_level is None
+            else int(self.extrinsics_source_zoom_level),
+        )
+        object.__setattr__(
+            self,
+            "selected_extrinsics_profile_path",
+            str(self.selected_extrinsics_profile_path),
+        )
+        object.__setattr__(self, "selection_mode", str(self.selection_mode))
+        object.__setattr__(self, "validation_gate", str(self.validation_gate))
         if not isinstance(self.left, CameraIntrinsicsSnapshot) or not isinstance(
             self.right, CameraIntrinsicsSnapshot
         ):
@@ -721,6 +749,29 @@ class StereoIntrinsicsSnapshot:
             raise ValueError("active_zoom_level must be non-negative")
         if len(self.content_sha256) != 64 or any(character not in "0123456789abcdef" for character in self.content_sha256):
             raise ValueError("content_sha256 must be a lowercase SHA-256 hex digest")
+        intrinsic_digest = self.intrinsics_content_sha256 or _sha256_payload(
+            {"left": asdict(self.left), "right": asdict(self.right)}
+        )
+        object.__setattr__(self, "intrinsics_content_sha256", intrinsic_digest)
+        extrinsics_digest = self.extrinsics_content_sha256
+        if self.checkerboard_extrinsics is not None and not extrinsics_digest:
+            extrinsics_digest = _sha256_payload(asdict(self.checkerboard_extrinsics))
+        object.__setattr__(self, "extrinsics_content_sha256", extrinsics_digest)
+        for name, digest in (
+            ("intrinsics_content_sha256", intrinsic_digest),
+            ("extrinsics_content_sha256", extrinsics_digest),
+        ):
+            if digest and (
+                len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(f"{name} must be a lowercase SHA-256 hex digest")
+        if self.intrinsics_source_zoom_level is not None and self.intrinsics_source_zoom_level < 0:
+            raise ValueError("intrinsics_source_zoom_level must be non-negative")
+        if self.extrinsics_source_zoom_level is not None and self.extrinsics_source_zoom_level < 0:
+            raise ValueError("extrinsics_source_zoom_level must be non-negative")
+        if self.validation_gate != "disabled":
+            raise ValueError("calibration validation_gate must remain disabled")
 
     @classmethod
     def from_result(
@@ -729,6 +780,10 @@ class StereoIntrinsicsSnapshot:
         *,
         active_zoom_level: int,
         selected_profile_path: str,
+        selected_extrinsics_profile_path: str = "",
+        intrinsics_source_zoom_level: int | None = None,
+        extrinsics_source_zoom_level: int | None = None,
+        selection_mode: str = "legacy_combined",
     ) -> "StereoIntrinsicsSnapshot":
         left = CameraIntrinsicsSnapshot.from_intrinsics(result.left)
         right = CameraIntrinsicsSnapshot.from_intrinsics(result.right)
@@ -749,6 +804,25 @@ class StereoIntrinsicsSnapshot:
             active_zoom_level=int(active_zoom_level),
             selected_profile_path=str(selected_profile_path),
             content_sha256=_sha256_payload(content),
+            intrinsics_content_sha256=_sha256_payload(
+                {"left": asdict(left), "right": asdict(right)}
+            ),
+            selected_extrinsics_profile_path=str(selected_extrinsics_profile_path),
+            extrinsics_content_sha256=(
+                "" if extrinsics is None else _sha256_payload(asdict(extrinsics))
+            ),
+            intrinsics_source_zoom_level=(
+                int(active_zoom_level)
+                if intrinsics_source_zoom_level is None
+                else int(intrinsics_source_zoom_level)
+            ),
+            extrinsics_source_zoom_level=(
+                None
+                if extrinsics_source_zoom_level is None
+                else int(extrinsics_source_zoom_level)
+            ),
+            selection_mode=str(selection_mode),
+            validation_gate="disabled",
         )
 
     @property

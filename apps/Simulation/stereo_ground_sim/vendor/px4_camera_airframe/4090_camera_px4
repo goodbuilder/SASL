@@ -71,6 +71,17 @@ param set-default NAV_DLL_ACT 2
 # 2D heading and never attempts hard-iron bias learning, avoiding this.
 param set-default EKF2_MAG_TYPE 1
 
+# Simulated visible-satellite count (see CAM_L/R_SIM_GPS_USED in
+# config/simulation.env, exported by run_operator_view.sh's
+# start_px4_instance so each camera instance can get a different value).
+# PX4's SITL GPS driver (src/modules/simulation/sensor_gps_sim/SensorGpsSim.cpp)
+# only reports a 3D fix (eph=0.9m, epv=1.78m) when this is >= 4; below that
+# it reports fix_type=0 with eph=epv=100, letting this camera simulate a GPS
+# dropout for testing how the GNSS-baseline-derived Rays
+# (attitude_true_north/operational_true_north/attitude_declination) fail
+# closed. Default 10 keeps the always-fix behavior this rig has always had.
+param set-default SIM_GPS_USED ${SIM_GPS_USED:=10}
+
 # Operator MAVLink ATTITUDE diagnostics link (see operator_panel.py's
 # MavlinkAttitudeReader/MAVLINK_ATTITUDE_URL/MAVLINK_ATTITUDE_SIDE_BY_SYSID).
 # The rqt panel cross-checks its ROS2 VehicleAttitude reading against a raw

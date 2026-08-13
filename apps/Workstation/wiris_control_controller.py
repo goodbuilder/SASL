@@ -10,8 +10,10 @@ from datetime import datetime, timezone
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.wiris_runtime_workers import (
+    WIRIS_LRF_POLL_PERIOD_S,
     WirisClockCommandWorker,
     WirisCommandWorker,
+    WirisLrfPollWorker,
     WirisZoomWorker,
 )
 from Workstation.workstation_core.pixhawk_attitude import (
@@ -22,110 +24,15 @@ from Workstation.workstation_core.wiris_zoom import (
     DEFAULT_ZOOM_IN_TEMPLATE,
     DEFAULT_ZOOM_OUT_TEMPLATE,
     DEFAULT_ZOOM_SET_TEMPLATE,
+    DEFAULT_ZOOM_QUERY_TEMPLATE,
     DEFAULT_ZOOM_STOP_TEMPLATE,
     LINE_TERMINATOR,
     NUL_TERMINATOR,
+    parse_visible_zoom_response,
 )
-
-WIRIS_COMMAND_CATALOG = (
-    ("Activation", "Check SDK activation", "IACT", LINE_TERMINATOR, "SDK 활성화 상태를 TRUE/FALSE로 읽습니다."),
-    ("Activation", "Activate SDK", "ACTV <ACTIVATION-CODE>", LINE_TERMINATOR, "활성화 코드로 SDK를 활성화합니다. 전송 전에 실제 코드로 바꾸세요."),
-    ("Activation", "Get Ethernet Mode", "GETH", LINE_TERMINATOR, "Ethernet/RTSP 모드 상태를 TRUE/FALSE로 읽습니다."),
-    ("Activation", "Set Ethernet Mode ON", "SETH TRUE", LINE_TERMINATOR, "Ethernet/RTSP 모드를 켜서 영상 송출을 시작합니다."),
-    ("Activation", "Set Ethernet Mode OFF", "SETH FALSE", LINE_TERMINATOR, "Ethernet/RTSP 모드를 끕니다."),
-    ("Activation", "Set SDK Port", "SSDK <port>", LINE_TERMINATOR, "SDK 제어 TCP 포트를 변경합니다."),
-    ("Basic", "Check connection", "HIWS", LINE_TERMINATOR, "연결 확인 명령입니다. 정상 응답은 OK입니다."),
-    ("Basic", "Set delimiter NULL", "SDLM NULL", LINE_TERMINATOR, "명령 구분자를 NULL로 설정합니다."),
-    ("Basic", "Set delimiter LINE", "SDLM LINE", LINE_TERMINATOR, "명령 구분자를 줄바꿈 문자로 설정합니다."),
-    ("Basic", "Get delimiter", "GDLM", LINE_TERMINATOR, "현재 명령 구분자 설정을 읽습니다."),
-    ("Basic", "Get serial number", "GSRN", LINE_TERMINATOR, "카메라 시리얼 번호를 읽습니다."),
-    ("Basic", "Get article number", "GATN", LINE_TERMINATOR, "카메라 article 번호를 읽습니다."),
-    ("Basic", "Get firmware version", "GFWV", LINE_TERMINATOR, "카메라 펌웨어 버전을 읽습니다."),
-    ("Basic", "Get CPU temperature", "GTCU", LINE_TERMINATOR, "CPU 온도를 읽습니다."),
-    ("Basic", "Get internal core temperature", "GTIC", LINE_TERMINATOR, "카메라 내부 core 온도를 읽습니다."),
-    ("Basic", "Get inside temperature", "GTIN", LINE_TERMINATOR, "카메라 내부 온도를 읽습니다."),
-    ("Basic", "Get fan power", "GFPW", LINE_TERMINATOR, "팬 출력 상태를 읽습니다."),
-    ("Date/Time", "Get date/time", "GDTI", LINE_TERMINATOR, "현재 카메라 날짜/시간을 읽습니다."),
-    (
-        "Date/Time",
-        "Set Unix time",
-        "STUS <unix_seconds> <microseconds>",
-        LINE_TERMINATOR,
-        "카메라 시간을 Unix epoch 초+마이크로초로 설정합니다. 재부팅 후 유지되지 않을 수 있습니다.",
-    ),
-    (
-        "Date/Time",
-        "Set date/time text",
-        "SDTI yyyy/MM/dd-hh:mm:ss",
-        LINE_TERMINATOR,
-        "카메라 시간을 날짜 문자열로 설정합니다. 재부팅 후 유지되지 않을 수 있습니다.",
-    ),
-    ("Menu", "Move up", "MOVE UP", LINE_TERMINATOR, "카메라 메뉴에서 위로 이동합니다."),
-    ("Menu", "Move down", "MOVE DOWN", LINE_TERMINATOR, "카메라 메뉴에서 아래로 이동합니다."),
-    ("Menu", "Move OK", "MOVE OK", LINE_TERMINATOR, "카메라 메뉴에서 현재 항목을 확인합니다."),
-    ("Menu", "Move cancel", "MOVE CANCEL", LINE_TERMINATOR, "카메라 메뉴에서 취소하거나 뒤로 이동합니다."),
-    ("GPS", "Get GPS coordinates", "GGPS", LINE_TERMINATOR, "사용 가능할 때 카메라 GPS 좌표를 읽습니다."),
-    ("Appearance", "Set main camera thermal", "SMCA THERMO", LINE_TERMINATOR, "열화상 카메라를 메인 카메라로 설정합니다."),
-    ("Appearance", "Set main camera visible", "SMCA VISIBLE", LINE_TERMINATOR, "가시광 카메라를 메인 카메라로 설정합니다."),
-    ("Appearance", "Get main camera", "GMCA", LINE_TERMINATOR, "현재 메인 카메라 설정을 읽습니다."),
-    ("Appearance", "Set GPS info position", "SGPI POSITION", LINE_TERMINATOR, "화면 GPS 정보 표시를 위치 정보로 설정합니다."),
-    ("Appearance", "Set GPS info altitude/speed", "SGPI ALTITUDE_SPEED", LINE_TERMINATOR, "화면 GPS 정보 표시를 고도/속도 정보로 설정합니다."),
-    ("Appearance", "Get GPS info mode", "GGPI", LINE_TERMINATOR, "현재 GPS 정보 표시 모드를 읽습니다."),
-    ("Zoom", "Zoom in", "SZIN", LINE_TERMINATOR, "선택한 카메라를 줌 인합니다."),
-    ("Zoom", "Zoom out", "SZOT", LINE_TERMINATOR, "선택한 카메라를 줌 아웃합니다."),
-    ("Zoom", "Stop focus/zoom action", "SGFA", LINE_TERMINATOR, "지원되는 경우 진행 중인 포커스/줌 동작을 중지합니다."),
-    ("Zoom", "Set simultaneous zoom ON", "SZSM TRUE", LINE_TERMINATOR, "열화상/가시광 카메라를 동시에 줌하도록 설정합니다."),
-    ("Zoom", "Set simultaneous zoom OFF", "SZSM FALSE", LINE_TERMINATOR, "열화상/가시광 동시 줌을 끕니다."),
-    ("Zoom", "Get simultaneous zoom", "GZSM", LINE_TERMINATOR, "동시 줌 설정 상태를 읽습니다."),
-    ("Zoom", "Set thermal zoom", "SZTN <index>", LINE_TERMINATOR, "열화상 줌 값을 설정합니다. <index>를 지원 값으로 바꾸세요."),
-    ("Zoom", "Get thermal zoom", "GZTV", LINE_TERMINATOR, "현재 열화상 줌 값을 읽습니다."),
-    ("Zoom", "Get thermal zoom list", "GZTL", LINE_TERMINATOR, "지원되는 열화상 줌 값 목록을 읽습니다."),
-    ("Zoom", "Set visible zoom", "SZVN <index>", LINE_TERMINATOR, "가시광 줌 값을 설정합니다. <index>를 지원 값으로 바꾸세요."),
-    ("Zoom", "Get visible zoom", "GZVV", LINE_TERMINATOR, "현재 가시광 줌 값을 읽습니다."),
-    ("Capture/Record", "Recording start", "RCRS", LINE_TERMINATOR, "카메라 자체 녹화를 시작합니다."),
-    ("Capture/Record", "Recording finish", "RCRF", LINE_TERMINATOR, "카메라 자체 녹화를 종료합니다."),
-    ("Capture/Record", "Is recording", "IRCR", LINE_TERMINATOR, "카메라 녹화 상태를 읽습니다."),
-    ("Capture/Record", "Set periodic capture", "SPIC <period>", LINE_TERMINATOR, "주기 캡처 값을 설정합니다. <period>를 SDK 지원 값으로 바꾸세요."),
-    ("Capture/Record", "Get periodic capture", "GPIC", LINE_TERMINATOR, "현재 주기 캡처 설정을 읽습니다."),
-    ("Stream", "Get thermal resolution", "GTRE", LINE_TERMINATOR, "열화상 스트림 해상도를 읽습니다."),
-    ("Stream", "Set encoder bitrate", "SEBR VISIBLE <bitrate>", LINE_TERMINATOR, "가시광 스트림/녹화 인코더 bitrate를 설정합니다."),
-    ("Stream", "Get encoder bitrate", "GEBR VISIBLE", LINE_TERMINATOR, "가시광 인코더 bitrate 설정을 읽습니다."),
-    ("Stream", "Set GOP size", "SEGS VISIBLE <gop>", LINE_TERMINATOR, "가시광 인코더 GOP 크기를 설정합니다."),
-    ("Stream", "Get GOP size", "GEGS VISIBLE", LINE_TERMINATOR, "가시광 인코더 GOP 크기를 읽습니다."),
-    ("Stream", "Set IDR interval", "SEIR VISIBLE <idr>", LINE_TERMINATOR, "가시광 인코더 IDR 간격을 설정합니다."),
-    ("Stream", "Get IDR interval", "GEIR VISIBLE", LINE_TERMINATOR, "가시광 인코더 IDR 간격을 읽습니다."),
-    ("Stream", "Set quantization quality", "SEQZ VISIBLE <qp>", LINE_TERMINATOR, "가시광 인코더 QP 값을 설정합니다. 범위는 0-51입니다."),
-    ("Stream", "Get quantization quality", "GEQZ VISIBLE", LINE_TERMINATOR, "가시광 인코더 QP 설정을 읽습니다."),
-    ("Trigger", "Set trigger correction", "STRG CORRECTION", LINE_TERMINATOR, "외부 trigger 입력을 보정 동작으로 설정합니다."),
-    ("Trigger", "Set trigger capture", "STRG CAPTURE", LINE_TERMINATOR, "외부 trigger 입력을 이미지 캡처 동작으로 설정합니다."),
-    ("Trigger", "Set trigger record", "STRG RECORD", LINE_TERMINATOR, "외부 trigger 입력을 녹화 제어 동작으로 설정합니다."),
-    ("Trigger", "Disable trigger action", "STRG NA", LINE_TERMINATOR, "외부 trigger 동작을 사용하지 않도록 설정합니다."),
-    ("Trigger", "Get trigger action", "GTRG", LINE_TERMINATOR, "현재 외부 trigger 동작 설정을 읽습니다."),
-    ("System", "Set IP address", "STIP <IPv4>", LINE_TERMINATOR, "카메라 IP 주소를 변경합니다."),
-    ("System", "Set subnet mask", "STMS <mask>", LINE_TERMINATOR, "카메라 서브넷 마스크를 변경합니다."),
-    ("System", "Get subnet mask", "GTMS", LINE_TERMINATOR, "현재 서브넷 마스크를 읽습니다."),
-    ("System", "Set gateway", "STGW <gateway>", LINE_TERMINATOR, "카메라 gateway 주소를 변경합니다."),
-    ("System", "Get gateway", "GTGW", LINE_TERMINATOR, "현재 gateway 주소를 읽습니다."),
-    ("System", "Manual gateway ON", "SMGW TRUE", LINE_TERMINATOR, "수동 gateway 설정을 사용합니다."),
-    ("System", "Manual gateway OFF", "SMGW FALSE", LINE_TERMINATOR, "수동 gateway 설정을 끕니다."),
-    ("System", "Get manual gateway", "GMGW", LINE_TERMINATOR, "수동 gateway 사용 여부를 읽습니다."),
-    ("System", "Reboot", "REBT", LINE_TERMINATOR, "카메라를 재부팅합니다."),
-    ("Custom", "Custom SDK command", "", LINE_TERMINATOR, "SDK 명령을 직접 입력합니다."),
-)
-
-WIRIS_DANGEROUS_COMMAND_PREFIXES = (
-    "ACTV",
-    "SSDK",
-    "SETH FALSE",
-    "STIP",
-    "STMS",
-    "STGW",
-    "SMGW",
-    "STUS",
-    "SDTI",
-    "REBT",
-    "RCRS",
-    "RCRF",
+from Workstation.wiris_sdk_catalog import (
+    WIRIS_COMMAND_CATALOG,
+    WIRIS_DANGEROUS_COMMAND_PREFIXES,
 )
 
 WIRIS_CONTROL_METHODS = [
@@ -154,7 +61,12 @@ WIRIS_CONTROL_METHODS = [
     "_start_wiris_command_worker",
     "_apply_wiris_command_result",
     "_wiris_command_failed",
-    "_clear_wiris_command_worker"
+    "_clear_wiris_command_worker",
+    "start_wiris_lrf_polling",
+    "_apply_wiris_lrf_result",
+    "_wiris_lrf_failed",
+    "stop_wiris_lrf_polling",
+    "_clear_wiris_lrf_worker",
 ]
 
 
@@ -171,6 +83,8 @@ class WirisControlController:
             return DEFAULT_ZOOM_STOP_TEMPLATE
         if action == "set":
             return DEFAULT_ZOOM_SET_TEMPLATE
+        if action == "query":
+            return DEFAULT_ZOOM_QUERY_TEMPLATE
         raise ValueError(f"Unknown zoom action: {action}")
 
     def selected_zoom_target(self) -> str:
@@ -239,6 +153,14 @@ class WirisControlController:
             label = str(item.get("label") or "")
             if item.get("state") == "sent":
                 response = str(item.get("response") or "")
+                if action == "query" and label in {"left", "right"}:
+                    index, ratio = parse_visible_zoom_response(response)
+                    self.panel.actual_visible_zoom[label] = {
+                        "index": index,
+                        "ratio": ratio,
+                        "response": response,
+                        "updated_monotonic_s": time.monotonic(),
+                    }
                 suffix = f" 응답={response}" if response else " 전송됨"
                 statuses.append(f"{self.panel._camera_name_ko(label)}: {item.get('command', '')}{suffix}")
             else:
@@ -246,6 +168,8 @@ class WirisControlController:
         status_text = " | ".join(statuses)
         self.panel.zoom_status_label.setText(status_text)
         self.panel._log(f"[카메라] 줌 명령 target={target}, action={action}: {status_text}")
+        if action == "set":
+            self.panel._zoom_readback_target = target
 
     def _wiris_zoom_failed(self, error: str) -> None:
         self.panel.zoom_status_label.setText(f"Zoom command: failed ({error})")
@@ -254,6 +178,13 @@ class WirisControlController:
     def _clear_wiris_zoom_worker(self) -> None:
         self.panel.wiris_zoom_thread = None
         self.panel.wiris_zoom_worker = None
+        readback_target = getattr(self.panel, "_zoom_readback_target", None)
+        if readback_target:
+            self.panel._zoom_readback_target = None
+            QtCore.QTimer.singleShot(
+                0,
+                lambda target=str(readback_target): self.panel.send_zoom(target, "query"),
+            )
 
     def workstation_wiris_command_catalog(self) -> tuple[dict[str, str], ...]:
         return tuple(
@@ -287,7 +218,7 @@ class WirisControlController:
         if target not in {"both", "left", "right"}:
             raise ValueError(f"Unknown zoom target: {target}")
         action = str(action or "")
-        if action not in {"in", "out", "stop", "set"}:
+        if action not in {"in", "out", "stop", "set", "query"}:
             raise ValueError(f"Unknown zoom action: {action}")
         if action == "set":
             if level is None:
@@ -518,12 +449,9 @@ class WirisControlController:
             "stus_rtt_probe_by_camera": dict(data.get("stus_rtt_by_camera") or {}),
             "recorded_at_unix_s": time.time(),
         }
-        self.panel._camera_sync_requested_utc_by_camera = requested_utc_by_camera
         self.panel._begin_camera_sync_after_stus(
             target=target,
             result=result_state,
-            requested_utc_s=None if requested_utc_s is None else float(requested_utc_s),
-            target_infos=target_infos,
         )
         self.panel._log(f"[카메라] WIRIS RTC PC UTC 설정 target={target}: {status_text}")
 
@@ -693,3 +621,94 @@ class WirisControlController:
         self.panel.wiris_command_thread = None
         self.panel.wiris_command_worker = None
         self.panel.wiris_command_send_button.setEnabled(True)
+
+    def start_wiris_lrf_polling(self) -> bool:
+        """Start the persistent GLRD reader used by Alignment's LRF cards."""
+
+        thread = getattr(self.panel, "wiris_lrf_thread", None)
+        if thread is not None and thread.isRunning():
+            return False
+        target_infos = tuple(
+            (
+                label,
+                host,
+                self.panel._control_port_for_camera(label),
+                self.panel.zoom_timeout_spin.value(),
+            )
+            for label, host in self.panel.zoom_hosts("both")
+        )
+        self.panel.wiris_lrf_thread = QtCore.QThread(self.panel)
+        self.panel.wiris_lrf_worker = WirisLrfPollWorker(
+            target_infos,
+            period_s=WIRIS_LRF_POLL_PERIOD_S,
+        )
+        self.panel.wiris_lrf_worker.moveToThread(self.panel.wiris_lrf_thread)
+        self.panel.wiris_lrf_thread.started.connect(self.panel.wiris_lrf_worker.run)
+        self.panel.wiris_lrf_worker.sampled.connect(self.panel._apply_wiris_lrf_result)
+        self.panel.wiris_lrf_worker.failed.connect(self.panel._wiris_lrf_failed)
+        self.panel.wiris_lrf_worker.finished.connect(self.panel.wiris_lrf_thread.quit)
+        self.panel.wiris_lrf_worker.finished.connect(self.panel.wiris_lrf_worker.deleteLater)
+        self.panel.wiris_lrf_thread.finished.connect(self.panel.wiris_lrf_thread.deleteLater)
+        self.panel.wiris_lrf_thread.finished.connect(self.panel._clear_wiris_lrf_worker)
+        self.panel.wiris_lrf_thread.start()
+        return True
+
+    def _apply_wiris_lrf_result(self, result: object) -> None:
+        data = dict(result or {}) if isinstance(result, dict) else {}
+        cache = getattr(self.panel, "latest_wiris_lrf", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self.panel.latest_wiris_lrf = cache
+        for sample in tuple(data.get("samples") or ()):
+            if not isinstance(sample, dict):
+                continue
+            side = str(sample.get("side") or "")
+            if side not in {"left", "right"}:
+                continue
+            previous = dict(cache.get(side) or {})
+            previous_distance = previous.get("distance_m")
+            previous.update(sample)
+            distance = sample.get("distance_m")
+            try:
+                distance_value = float(distance)
+            except (TypeError, ValueError):
+                distance_value = None
+            if distance_value is not None and math.isfinite(distance_value) and distance_value >= 0.0:
+                previous["distance_m"] = distance_value
+                previous["last_good_s"] = float(sample.get("observed_s") or time.monotonic())
+                previous["last_good_unix_s"] = float(sample.get("observed_unix_s") or time.time())
+            else:
+                previous["distance_m"] = previous_distance
+            previous["last_attempt_s"] = float(sample.get("observed_s") or time.monotonic())
+            previous["last_attempt_unix_s"] = float(sample.get("observed_unix_s") or time.time())
+            previous["last_error"] = str(sample.get("error") or "")
+            cache[side] = previous
+
+    def _wiris_lrf_failed(self, error: str) -> None:
+        self.panel._log(f"[카메라] WIRIS LRF 자동 조회 실패: {error}")
+
+    def stop_wiris_lrf_polling(self, *, wait: bool = False) -> bool:
+        """Request the persistent reader to stop; return false while winding down."""
+
+        worker = getattr(self.panel, "wiris_lrf_worker", None)
+        if worker is not None:
+            request_stop = getattr(worker, "request_stop", None)
+            if callable(request_stop):
+                request_stop()
+        thread = getattr(self.panel, "wiris_lrf_thread", None)
+        if thread is None:
+            self.panel.wiris_lrf_worker = None
+            return True
+        if thread.isRunning():
+            thread.quit()
+            if wait and not thread.wait(1500):
+                return False
+            if thread.isRunning():
+                return False
+        self.panel.wiris_lrf_thread = None
+        self.panel.wiris_lrf_worker = None
+        return True
+
+    def _clear_wiris_lrf_worker(self) -> None:
+        self.panel.wiris_lrf_thread = None
+        self.panel.wiris_lrf_worker = None

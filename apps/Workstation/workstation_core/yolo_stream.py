@@ -59,10 +59,12 @@ NTP_UNIX_EPOCH_OFFSET_S = 2_208_988_800
 UINT32_MODULUS = 2**32
 UINT32_HALF_RANGE = 2**31
 MAX_RTP_TIMING_CACHE = 240
+MAX_RTP_PTS_MATCH_DELTA_NS = 5_000_000
 MAX_RTCP_SR_ARRIVAL_CACHE = 128
 MAX_RTCP_RATE_SAMPLES = 12
 DEFAULT_RECORD_VIDEO_QUEUE_SIZE = 300
 MAX_RTCP_SR_PC_OFFSET_S = 0.5
+GST_RTSP_RECONNECT_DELAYS_S = (1.0, 2.0, 4.0, 8.0)
 
 
 @dataclass(frozen=True)
@@ -895,7 +897,11 @@ class GstRtpTimingTracker:
                     rtp_timestamp=int(rtp_buffer.get_timestamp()),
                     rtp_ssrc=int(rtp_buffer.get_ssrc()),
                     rtp_marker_seq=int(rtp_buffer.get_seq()),
-                    rtp_pts_s=None,
+                    rtp_pts_s=(
+                        None
+                        if buffer.pts == self.Gst.CLOCK_TIME_NONE
+                        else int(buffer.pts) / 1e9
+                    ),
                 )
                 with self._lock:
                     self._pending_rtp_frames.append(timing)
@@ -910,9 +916,9 @@ class GstRtpTimingTracker:
         pts_ns = int(buffer.pts)
         pts_s = pts_ns / 1e9
         with self._lock:
-            if not self._pending_rtp_frames:
+            timing = self._pop_pending_rtp_timing_locked(pts_ns)
+            if timing is None:
                 return self.Gst.PadProbeReturn.OK
-            timing = self._pending_rtp_frames.popleft()
             timing = RtpFrameTiming(
                 rtp_timestamp=timing.rtp_timestamp,
                 rtp_ssrc=timing.rtp_ssrc,
@@ -923,6 +929,50 @@ class GstRtpTimingTracker:
             self._pts_order.append(pts_ns)
             self._trim_timing_cache_locked()
         return self.Gst.PadProbeReturn.OK
+
+    def _pop_pending_rtp_timing_locked(self, pts_ns: int) -> RtpFrameTiming | None:
+        """Match a depayloaded access unit to its RTP marker by PTS.
+
+        A camera can emit marker packets that ``rtph264depay`` later merges or
+        drops.  Consuming marker timings as a strict FIFO therefore leaves one
+        extra entry behind whenever that happens; each extra entry makes every
+        following frame appear one frame older and produces a steadily growing
+        RTCP transit delay.  Packet and depay-buffer PTS are preserved by
+        ``rtspsrc``, so discard unmatched older markers and take the closest
+        matching PTS instead.
+        """
+
+        if not self._pending_rtp_frames:
+            return None
+        known_pts = [
+            (index, int(round(float(timing.rtp_pts_s) * 1e9)))
+            for index, timing in enumerate(self._pending_rtp_frames)
+            if timing.rtp_pts_s is not None
+        ]
+        if not known_pts:
+            # Keep compatibility with GStreamer builds that do not put a PTS
+            # on RTP packet buffers.
+            return self._pending_rtp_frames.popleft()
+
+        match_index, match_pts_ns = min(
+            known_pts,
+            key=lambda item: abs(item[1] - int(pts_ns)),
+        )
+        if abs(match_pts_ns - int(pts_ns)) <= MAX_RTP_PTS_MATCH_DELTA_NS:
+            for _ in range(match_index):
+                self._pending_rtp_frames.popleft()
+            return self._pending_rtp_frames.popleft()
+
+        stale_before_ns = int(pts_ns) - MAX_RTP_PTS_MATCH_DELTA_NS
+        while self._pending_rtp_frames:
+            timing = self._pending_rtp_frames[0]
+            if timing.rtp_pts_s is None:
+                break
+            timing_pts_ns = int(round(float(timing.rtp_pts_s) * 1e9))
+            if timing_pts_ns >= stale_before_ns:
+                break
+            self._pending_rtp_frames.popleft()
+        return None
 
     def _pop_frame_timing(self, pts_ns: int | None) -> RtpFrameTiming | None:
         with self._lock:
@@ -943,7 +993,7 @@ class GstRtpTimingTracker:
         if not self._timing_by_pts_ns:
             return None
         nearest_pts = min(self._timing_by_pts_ns, key=lambda candidate: abs(candidate - pts_ns))
-        if abs(nearest_pts - pts_ns) > 5_000_000:
+        if abs(nearest_pts - pts_ns) > MAX_RTP_PTS_MATCH_DELTA_NS:
             return None
         return self._timing_by_pts_ns.pop(nearest_pts, None)
 
@@ -1543,7 +1593,14 @@ def _yolo_device_stats(config: dict[str, Any]) -> tuple[str, str, bool]:
     return requested_device, active_device, cpu_fallback
 
 
-def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
+def _run_gstreamer_stream_once(
+    config: dict[str, Any],
+    output_queue,
+    stop_event,
+    cv2,
+    model,
+    enable_detection: bool,
+) -> bool:
     try:
         import gi
         import numpy as np
@@ -1554,7 +1611,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         from gi.repository import GstRtp
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 사용 불가: {exc}")
-        return
+        return False
 
     Gst.init(None)
     keyframe_only = bool(config.get("keyframe_only", False)) or env_flag_enabled(I_FRAME_ONLY_ENV)
@@ -1565,6 +1622,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
     )
     record_video_path = _record_video_path(config)
     recording_process = _start_ffmpeg_encoded_recording_process(config, output_queue)
+    stream_failed = False
     try:
         pipeline, sink, bus, _decoder = _launch_gst_pipeline(
             Gst,
@@ -1580,7 +1638,7 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
     except Exception as exc:
         _emit_status(output_queue, f"GStreamer 오류: {exc}")
         _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
-        return
+        return False
 
     rate_limiter = AdaptiveYoloRateLimiter.from_config(config, enable_detection=enable_detection)
     next_frame_s = 0.0
@@ -1660,8 +1718,10 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
                 if message.type == Gst.MessageType.ERROR:
                     error, debug = message.parse_error()
                     detail = error.message if debug is None else f"{error.message} ({debug})"
+                    stream_failed = True
                     _emit_status(output_queue, f"스트림 오류: {detail}")
                 else:
+                    stream_failed = True
                     _emit_status(output_queue, "스트림 종료")
                 break
 
@@ -1754,7 +1814,31 @@ def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2,
         pipeline.set_state(Gst.State.NULL)
         reader.join(timeout=1.0)
         _stop_ffmpeg_encoded_recording_process(recording_process, output_queue, record_video_path)
-        _emit_status(output_queue, "중지됨")
+        if not stream_failed or stop_event.is_set():
+            _emit_status(output_queue, "중지됨")
+    return not stream_failed
+
+
+def _run_gstreamer_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:
+    """Run GStreamer and recover transient RTSP server/SDP failures locally."""
+
+    delays = tuple(float(delay) for delay in GST_RTSP_RECONNECT_DELAYS_S)
+    for attempt in range(len(delays) + 1):
+        if stop_event.is_set():
+            return
+        if _run_gstreamer_stream_once(config, output_queue, stop_event, cv2, model, enable_detection):
+            return
+        if stop_event.is_set() or attempt >= len(delays):
+            _emit_status(output_queue, "GStreamer RTSP 재연결 포기: 카메라 서버가 응답하지 않습니다.")
+            return
+        delay_s = delays[attempt]
+        _emit_status(
+            output_queue,
+            f"GStreamer RTSP 재연결 대기 {attempt + 1}/{len(delays)}: "
+            f"{delay_s:.1f}s 후 같은 endpoint 재시도",
+        )
+        if stop_event.wait(delay_s):
+            return
 
 
 def _run_opencv_stream(config: dict[str, Any], output_queue, stop_event, cv2, model, enable_detection: bool) -> None:

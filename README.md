@@ -215,8 +215,8 @@ compatibility facade. Runtime responsibilities extracted from that facade are:
 - `recording_controller.py`: session state, recording rows and timelines,
   camera/PX4/GNSS metadata, save orchestration, and recording presentation.
 - `session_workers.py`: background persistence of a completed session.
-- `wiris_runtime_workers.py`: WIRIS clock, STIP, RTSP enablement, and stream
-  reachability work.
+- `wiris_runtime_workers.py`: WIRIS clock, STIP, RTSP enablement, stream
+  reachability, and optional LRF polling work.
 - `device_runtime_workers.py`: camera-network discovery/configuration and
   Pixhawk discovery, connection, shell, parameter, RTCM, and setup work.
 - `device_runtime_controller.py`: workstation camera-network and Pixhawk
@@ -790,12 +790,63 @@ apps/Workstation/run.sh
 
 `apps/Workstation/run.sh` starts Workstation with `common/python` on its import path. Run `apps/StereoWIRIS/run.sh --ui legacy` for Legacy; Legacy additionally requires the pinned ROS 2/PX4 message overlay prepared by `tools/bootstrap_ros_workspace.sh`. Use `apps/Workstation/run.sh --check` or `apps/StereoWIRIS/run.sh --check --ui legacy` to validate a runtime before opening Qt. Development and CI dependencies are declared in `requirements/dev.txt`.
 
+For the manual cross-zoom calibration flow, open `Pre-run Calibration`. At
+the large-board pose, set both visible cameras to nominal 1×, capture matching
+left/right checkerboard pairs, load or calculate the selected K,D, then use
+`R,t + Apply > Calculate R,t only` and `Save R,t`. At the measurement zoom,
+load the 8× K,D profile, load the saved 1× R,t profile, and select
+`Apply K,D + R,t`. `Read actual zoom` requests a `GZVV` readback from both
+cameras; its result is evidence and does not gate application.
+
+For Simulation, `apps/Simulation/run_operator_view.sh` starts the operator
+view. Its rqt `Auto` action generates a FOV-constrained path and converts every
+absolute Gazebo world ENU point to a PX4 home-relative local NED setpoint using
+the configured `DRONE_SPAWN_X/Y/Z_M` origin before arming and entering
+OFFBOARD. Simulation operator recordings, Waypoint automatic sessions, and
+Auto-generated paths all live below `apps/Simulation/Recordings/`; Mission
+creates a recording there only when an rqt Save preset is pressed. Auto creates
+one `auto_YYYYMMDD_HHMMSS_Full/` session directly below that root and stores
+its generated path, telemetry, XLSX, compact CSVs, and left/right MP4 together.
+
 ## Inputs/Outputs and Interfaces
 
 - Hardware inputs include WIRIS visible RTSP/control streams, Pixhawk telemetry, GNSS/RTK, calibration profiles, and optional ROS 2 topics in Legacy.
+- The Workstation Pixhawk action row includes `Reset level cal.`. It resets
+  only PX4 `SENS_BOARD_X_OFF`, `SENS_BOARD_Y_OFF`, and `SENS_BOARD_Z_OFF` on
+  connected, disarmed Pixhawks through the PX4 `param reset` command.
+- Workstation WIRIS auto-connect probes the configured control port and SDK
+  default port (`2240`), verifies `HIWS`, enables Ethernet/RTSP mode, and
+  waits for both visible frames before starting Preview.
+- The optional WIRIS laser rangefinder is read over each camera's TCP control
+  port with `GLRD`. A numeric response is interpreted as metres; an `ERR` or
+  invalid response remains an error rather than being converted to a value.
+- Alignment displays `LRF L` and `LRF R` status cards with the latest distance,
+  raw response, sample age, and error detail. The cards are backed by the
+  Workstation `StatusModel` and do not synthesize a value before a camera
+  responds.
+- Workstation stores per-zoom intrinsics as `intrinsics_zoom_##.json` and the
+  large-board stereo transform as an independent
+  `extrinsics_zoom_##_large_board.json` profile. Measurement and recording
+  provenance retain both profile paths, SHA-256 hashes, source zoom levels,
+  manual/cross-zoom selection, actual zoom readback, and
+  `validation_gate=disabled`.
+- Stereo R,t uses OpenCV optical RDF `[Right, Down, Forward]` with
+  `X_right = R_left_to_right X_left + T_left_to_right_m`. The right-camera
+  origin expressed in the left optical frame is the distinct derived value
+  `C_right_in_left = -R_left_to_right^T T_left_to_right_m`; OpenCV T and the
+  camera origin are never aliases.
 - Public measurement vectors retain their declared frame and axis contract. Raw local GNSS baseline is NED `[North, East, Down]`; P1 body projection is FRD `[Forward, Right, Down]`; camera optical rays are RDF `[Right, Down, Forward]`; public stereo results use their declared stereo-center FRD schema.
 - Selector observation exports use stereo-center RDF component order. Canonical `nominal_pose_right/down/forward_m` fields and compatibility `raw_right/down/forward_m` fields are exact aliases in that exported schema; neither is a public FRD array or a new coordinate conversion.
 - Runtime recordings are written below `apps/StereoWIRIS/recordings/` or `.local/workstation_data/recordings/` and are not source files. Reusable evidence belongs in a minimized, anonymized `tests/fixtures/` dataset with its schema/frame contract.
+- Simulation runtime outputs use `apps/Simulation/Recordings/` as their common
+  ignored root: `operator_<timestamp>_<mode>/`,
+  `waypoint_<timestamp>_lite/`, and `auto_<timestamp>_Full/`.
+- Simulation Auto waypoint generation consumes absolute Gazebo world ENU
+  `[East, North, Up]` points and outputs PX4 local mission fields
+  `[north_m, east_m, altitude_agl_m]`, where
+  `north=world_north-origin_north`, `east=world_east-origin_east`, and the
+  MAVLink NED setpoint uses `down=-altitude_agl_m` with
+  `altitude_agl_m=world_up-origin_up`.
 
 ## Operational Rules
 
@@ -836,14 +887,24 @@ apps/Workstation/run.sh
   execution requires `PYTHONPATH=common/python python -m Workstation`. Legacy keeps its canonical ROS/PX4 overlay
   validation and ROS setup.
 - Workstation field flow is exposed in `Run > Experiment` in the operator's order: `0` QGC Pixhawk calibration (external), `1` connect/verify WIRIS, Pixhawk, and Base GNSS, `2` start Base Survey-in or NTRIP, `3` initial WIRIS time sync, `4` verify RTCM delivery and numeric Pixhawk `fix_type`, `5–7` physically align the baseline and Roll/Pitch/Yaw with repeated evidence sampling, `8` perform the final time-sync quality check/resync, `9` confirm YOLO/measurement settings, `10` measure, and `11` save. The underlying Setup/Run/Tasks pages remain available from each step.
+- If WIRIS services are still booting, `Connect cameras` keeps the auto-connect
+  request pending and retries up to six times at 1.5-second intervals. Automatic
+  connection does not launch the unbounded 1–65535 TCP port scan; manual control
+  discovery retains the broader scan for cameras using a non-standard port.
 - QGC Pixhawk sensor calibration is documented as an external prerequisite; Workstation does not duplicate that operation. Internal camera intrinsic/stereo calibration remains supported in `Tasks > Calibration` and should be completed before the field sequence.
 - Workstation `Tasks > Calibration > Load intrinsics` opens a JSON file picker,
   validates positive image dimensions, finite 3×3 camera matrices, positive
   `fx/fy`, and finite distortion coefficients, then applies the selected
-  profile. A `metadata.zoom_level` mismatch or unequal left/right calibration
-  resolution requires explicit confirmation. `Load current zoom` retains the
-  deterministic `intrinsics_zoom_##.json` lookup, while `Apply intrinsics`
-  only reapplies the result already held in memory.
+  profile. Zoom metadata mismatch and unequal left/right calibration
+  resolution are reported as non-blocking evidence. `Load current zoom`
+  retains the deterministic `intrinsics_zoom_##.json` lookup, while
+  `Apply intrinsics` only reapplies the result already held in memory.
+- K,D and stereo R,t have independent profile lifecycles. The application may
+  intentionally combine, for example, `intrinsics_zoom_08.json` with
+  `extrinsics_zoom_01_large_board.json`; a source-zoom mismatch, unavailable
+  `GZVV` readback, or missing external validation does not disable
+  `Apply K,D + R,t`. Malformed/non-finite K,D or R,t and an invalid rotation
+  contract are still rejected.
 - RTK baseline evidence keeps the raw selected `P1→P2` GPS/RTK vector as local NED `[North, East, Down]`. When P1 attitude is available, Workstation also derives a separate `P1→P2 @ P1 body FRD` display/recording vector `[Forward, Right, Down]` using the inverse of the PX4 body-FRD→world-NED quaternion; this derived value is not camera optical RDF or public `baseline_center_frd`.
 - Measurement Run control keeps Preview, Detection, Record, and Save session together; Current measurement quality mirrors the existing ray-gap, midpoint-range, method, attitude-timing, and Raw `baseline_center_frd` evidence.
 - Recording shows an advisory experiment preflight for both camera streams, RTCP/NTP sync, detection, active stereo calibration, and the selected Pixhawk/GNSS or checkerboard geometry path. It reports missing evidence without changing the existing start/stop command behavior.
@@ -855,10 +916,22 @@ apps/Workstation/run.sh
 - Experiment protocol method: purpose is to expose the ordered field checklist; inputs are StatusModel states plus existing calibration, time-sync, RTCM/fix, baseline, physical-alignment, and recording evidence; output is per-step `READY`, `WAIT`, `CHECK`, `SAMPLING`, `RUNNING`, or `EXTERNAL`. `READY` is software evidence only; hardware acceptance and long-duration validation remain outside this check.
 - While recording is `ACTIVE` or `FINALIZING`, Preview stop, camera/Pixhawk mapping swaps, and Save session are disabled so the session protocol cannot be interrupted or saved prematurely.
 - Workstation default screens keep the operator path compact: connect cameras → check timing/devices → measure → record. Discovery, low-level controls, and file review remain under `More tools`, `Advanced`, or `Diagnostics` without removing their command IDs.
+- `Reset level cal.` is deliberately narrower than a factory reset: it restores
+  only the Level Horizon fine-tuning offsets after an explicit confirmation.
+  `SENS_BOARD_ROT`, `CAL_ACC*`, `CAL_GYRO*`, MAG parameters, airframe settings,
+  and other PX4 configuration remain unchanged. A MAVLink connection and
+  disarmed state are required; the resulting attitude parameters are read back
+  automatically.
 - Workstation `Pixhawk` keeps the primary operator actions at the top in this order: `Connect` → `Find USB` → `Find network` → `Find host IP` → `Swap P1/P2`. The evidence groups then follow this order: `Connection` → `Attitude (R/P/Y)` → `P1/P2 GNSS receivers` → `P1→P2 baseline` → `Discovered endpoints` → `ETH MAV`.
 - `P1 ETH MAV` and `P2 ETH MAV` use the corresponding configured USB control port and baud rate to start PX4 Ethernet MAVLink at runtime, then reconnect the UDP MAVLink stream. Confirm the link with Heartbeat and `ATTITUDE`/R/P/Y telemetry; USB control status and MAVLink telemetry status are displayed separately.
 - Workstation `Advanced` opens directly on its tool tabs without duplicating the global CAM L/CAM R/P1/P2/REC/MEAS status summary. Use the dedicated camera, Pixhawk, measurement, and recording workspaces for those runtime states; each Advanced tool retains its own operation status.
 - Workstation WIRIS SDK commands are sent from `Advanced > Camera control > WIRIS SDK command`. Select the left, right, or both-camera target and the protocol terminator, then use `Command responses` to read each camera's TCP reply or failure inline; the latest aggregate result remains in the status line and the existing Diagnostics log is retained. `Clear responses` clears only the current UI history and does not send a camera command.
+- Selecting the `Alignment` workspace starts the Workstation-owned LRF polling
+  worker once. It polls both cameras at 5 Hz and keeps the latest valid distance
+  visible while the app is running; returning to Alignment reuses the worker.
+  Each card is `WAITING` before the first response, `LIVE` for a fresh value,
+  `STALE` when the last good sample is older than one second, or `ERROR` for a
+  fresh failed read. Application shutdown stops the worker.
 - Workstation cards show only the value plus age/quality when useful. Frame and provenance details remain available on value tooltips and in Inspector/Diagnostics; the literal `source=` and `frame=` prefixes are not shown in the default metadata rows, and the underlying status/evidence fields are unchanged.
 - Workstation status severity never changes a card, row, or status-label
   background. Neutral backgrounds remain fixed; only a small dot, short state
@@ -871,11 +944,19 @@ apps/Workstation/run.sh
 - Changes to the Legacy UI are not automatically propagated to the standalone Workstation copy; update and test both copies deliberately until the remaining migration is complete.
 - Do not commit venvs, ROS build/install/log trees, runtime recordings, profiler output, downloaded models, or generated experiment runs. Machine-local state is grouped under ignored `.local/`; audit the checkout with `python3 tools/check_repository_policy.py`. `--allow-existing-debt` is only for reporting historical tracked artifacts pending cleanup.
 - Run the targeted tests first. The repository-wide test configuration in `pyproject.toml` excludes generated overlays, PX4 source, reports, and recordings from collection.
+- Regenerate an Auto path after changing `DRONE_SPAWN_X_M`,
+  `DRONE_SPAWN_Y_M`, or `DRONE_SPAWN_Z_M`; do not reuse a mission CSV made for
+  another PX4 home origin. Use rqt `Stop` to request `LAND` if the live path or
+  detections are not behaving as expected.
 - Sealed qualification security tests require the immutable external fixture. Set `SASL_QUALIFICATION_FIXTURE=/path/to/exact-profile-freeze-...` to run them; without it they are reported as explicit skips rather than reading a developer-specific absolute path.
 
 ## Known Limitations and Workarounds
 
 - Real WIRIS, Pixhawk, RTSP, YOLO, stereo matching, and calibration persistence are not connected yet in this software-only validation slice.
+- LRF polling requires a reachable WIRIS TCP control endpoint and the optional
+  laser rangefinder hardware. Without a device response, Alignment correctly
+  remains `WAITING` or reports `ERROR`; it does not estimate distance from the
+  stereo measurement pipeline.
 - Workstation still has a large compatibility facade in
   `apps/Workstation/standalone_gui.py`; GNSS/Pixhawk sensor presentation and
   measurement/view-controller extraction remain in progress. Shared neutral
@@ -887,9 +968,57 @@ apps/Workstation/run.sh
 - Historical recordings and `perf.data` are still tracked repository debt. CI reports all 237 paths but temporarily permits that fixed cleanup debt; remove the escape hatch after a reviewed `git rm --cached` migration. New runtime output is ignored now.
 - The sealed qualification fixture is intentionally not bundled because it is immutable experiment evidence. The normal software suite currently reports 98 skips when `SASL_QUALIFICATION_FIXTURE` is absent.
 - Hardware/ROS integration remains platform-specific. ROS packages come from `/opt/ros/humble` and the reproducible repo bootstrap rather than pip.
+- The level-calibration reset is not a substitute for QGroundControl Sensor
+  Setup. If the accelerometer or gyro calibration itself is invalid, rerun the
+  corresponding QGC calibration rather than using this button; the Workstation
+  button intentionally does not erase `CAL_ACC*` or `CAL_GYRO*`.
+- WIRIS SDK/RTSP services may be unavailable briefly after camera power-up. If
+  six automatic attempts are exhausted, confirm camera power, Ethernet Mode,
+  configured IPs, and TCP control port before retrying. A reachable TCP port
+  alone is not sufficient; Workstation also requires a valid `HIWS` response
+  and a first visible RTSP frame from each camera.
+- The Workstation deliberately does not decide whether a 1× large-board R,t
+  remains physically valid with 8× K,D. Verify that assumption externally with
+  the retained 1×/8× calibration images and the experiment's acceptance
+  criteria. `GZVV` failure or mismatch is informational, so the operator is
+  responsible for confirming the actual hardware zoom before measurement.
 
 ## Change Log
 
+- 2026-08-13: Added independent Workstation K,D and stereo R,t profiles,
+  fixed-intrinsic large-board `R,t only` calculation, manual 1× R,t + 8× K,D
+  composition without a validation gate, nominal 1×/8× controls with `GZVV`
+  readback, active-bundle UI/provenance, and explicit OpenCV RDF transform
+  contracts. Updated the Simulation PX4 launcher test to follow the configured
+  `x500_2m` target model.
+
+- 2026-08-12: Added `Pixhawk > Reset level cal.` beside `Swap P1/P2`. After
+  confirmation and disarm validation it resets only PX4 Level Horizon offsets
+  (`SENS_BOARD_X_OFF/Y_OFF/Z_OFF`) on connected Pixhawks, then refreshes the
+  attitude-calibration readback without changing board rotation or IMU sensor
+  calibration parameters.
+
+- 2026-08-12: Fixed Workstation WIRIS camera auto-connect during camera boot.
+  Automatic discovery no longer blocks on a full 1–65535 TCP scan when the
+  configured/default SDK port is unavailable; it now performs bounded retries
+  while waiting for `HIWS`, Ethernet/RTSP mode, and both first visible frames.
+
+- 2026-08-12: Added persistent Workstation Alignment LRF monitoring. Alignment
+  now polls both WIRIS cameras with `GLRD` at 5 Hz, displays live/stale/error
+  distance cards in metres, retains raw response evidence, and shuts the worker
+  down with the application. Added the `GLRD` entry to the WIRIS command catalog.
+
+- 2026-08-10: Changed Simulation Auto to automatically run the Full recorder
+  and place waypoint files, telemetry, XLSX, compact CSVs, and both overlay MP4
+  files together in `Recordings/auto_YYYYMMDD_HHMMSS_Full/`. Mission remains
+  opt-in recording only.
+- 2026-08-10: Unified Simulation rqt Save sessions, Waypoint automatic lite
+  sessions, and Auto-generated waypoint paths below the ignored
+  `apps/Simulation/Recordings/` runtime root.
+- 2026-08-10: Fixed Simulation rqt Auto waypoint generation to subtract the
+  configured drone spawn/home world-ENU origin before sending PX4 local-NED
+  mission setpoints. Added origin metadata, coordinate-contract regression
+  coverage, and operator documentation.
 - 2026-08-10: Consolidated repository tools under `tools/`, project documents under `docs/`, firmware parameters under `common/firmware/`, and machine-local caches, models, runtime data, and preserved legacy application state under ignored `.local/`. Kept `ref/` and the reproducible `workspace/` at the repository root.
 - 2026-08-10: Introduced the `common/` ownership boundary, moving shared Python contracts to `common/python`, cross-application ROS message sources to `common/ros`, and reproducible Pixhawk material to `common/firmware`. Updated launch and build paths without changing coordinate or message schemas.
 - 2026-08-10: Moved the Workstation application, `workstation_core`, dedicated UI documentation, and dedicated tests under the repository-level `apps/Workstation/` directory. Updated imports and launchers to `Workstation`, while preserving runtime settings and recordings under `workstation_data/`.

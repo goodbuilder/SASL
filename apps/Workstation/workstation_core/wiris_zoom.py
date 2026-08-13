@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import socket
+import re
+import threading
 from dataclasses import dataclass
 
 
@@ -9,8 +11,10 @@ DEFAULT_ZOOM_IN_TEMPLATE = "SZIN"
 DEFAULT_ZOOM_OUT_TEMPLATE = "SZOT"
 DEFAULT_ZOOM_STOP_TEMPLATE = "SGFA"
 DEFAULT_ZOOM_SET_TEMPLATE = "SZVN {level}"
+DEFAULT_ZOOM_QUERY_TEMPLATE = "GZVV"
 GET_ETHERNET_MODE_COMMAND = "GETH"
 SET_ETHERNET_MODE_COMMAND = "SETH TRUE"
+DISABLE_ETHERNET_MODE_COMMAND = "SETH FALSE"
 SET_IP_ADDRESS_TEMPLATE = "STIP {address}"
 SET_SUBNET_MASK_TEMPLATE = "STMS {mask}"
 REBOOT_COMMAND = "REBT"
@@ -18,6 +22,24 @@ MIN_ZOOM_LEVEL = 0
 MAX_ZOOM_LEVEL = 14
 LINE_TERMINATOR = "\n"
 NUL_TERMINATOR = "\0"
+
+_ZOOM_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)")
+
+
+_CONTROL_LOCKS_GUARD = threading.Lock()
+_CONTROL_LOCKS: dict[tuple[str, int], threading.RLock] = {}
+
+
+def _control_lock(host: str, port: int) -> threading.RLock:
+    """Return the process-wide serializer for one camera control endpoint."""
+
+    endpoint = (str(host).strip(), int(port))
+    with _CONTROL_LOCKS_GUARD:
+        lock = _CONTROL_LOCKS.get(endpoint)
+        if lock is None:
+            lock = threading.RLock()
+            _CONTROL_LOCKS[endpoint] = lock
+        return lock
 
 
 @dataclass(frozen=True)
@@ -38,6 +60,30 @@ def render_zoom_command(template: str, *, level: int | None = None) -> str:
             raise ValueError("Zoom level is required for this command template")
         return normalized.format(level=int(level))
     return normalized
+
+
+def parse_visible_zoom_response(response: object) -> tuple[int | None, float | None]:
+    """Parse a tolerant ``GZVV`` index/ratio response without treating it as a gate."""
+
+    text = str(response or "").replace("\x00", " ").strip()
+    if not text or text.upper().startswith("ERR"):
+        return None, None
+    normalized = re.sub(r"\bGZVV\b", " ", text, flags=re.IGNORECASE)
+    numbers = [float(token) for token in _ZOOM_NUMBER_RE.findall(normalized)]
+    if not numbers:
+        return None, None
+    index = next(
+        (
+            int(value)
+            for value in numbers
+            if value.is_integer() and MIN_ZOOM_LEVEL <= int(value) <= MAX_ZOOM_LEVEL
+        ),
+        None,
+    )
+    ratio = next((value for value in numbers[1:] if value > 0.0), None)
+    if ratio is None and index is not None:
+        ratio = float(index)
+    return index, ratio
 
 
 def build_zoom_command(
@@ -66,13 +112,16 @@ def build_zoom_command(
 
 def send_tcp_line(command: WirisZoomCommand) -> str:
     payload = (command.command.rstrip("\r\n\0") + command.terminator).encode("utf-8", errors="replace")
-    with socket.create_connection((command.host, command.port), timeout=command.timeout_s) as sock:
-        sock.settimeout(command.timeout_s)
-        sock.sendall(payload)
-        try:
-            response = sock.recv(4096)
-        except socket.timeout:
-            return ""
+    # WIRIS exposes one SDK control service per camera.  Keep all Workstation
+    # workers from opening overlapping command sessions against that service.
+    with _control_lock(command.host, command.port):
+        with socket.create_connection((command.host, command.port), timeout=command.timeout_s) as sock:
+            sock.settimeout(command.timeout_s)
+            sock.sendall(payload)
+            try:
+                response = sock.recv(4096)
+            except socket.timeout:
+                return ""
     return response.decode("utf-8", errors="replace").strip(" \t\r\n\0")
 
 

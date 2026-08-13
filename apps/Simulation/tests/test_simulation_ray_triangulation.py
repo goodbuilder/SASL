@@ -220,7 +220,11 @@ def test_ideal_reference_projection_raw_matches_same_baseline_ground_truth() -> 
     ) < 1.0e-6
 
 
-def test_ideal_reference_projection_rejects_120m_when_either_camera_is_out_of_fov() -> None:
+def test_ideal_reference_projection_is_unified_with_unbounded_debug_projection_at_120m() -> None:
+    """Ideal is a FOV-independent debug reference, so it must match the
+
+    unbounded projection exactly rather than rejecting out-of-frame cameras.
+    """
     node = StereoDistanceNode.__new__(StereoDistanceNode)
     node.baseline_m = 25.0
     node.camera_height_m = 5.0
@@ -245,5 +249,5 @@ def test_ideal_reference_projection_rejects_120m_when_either_camera_is_out_of_fo
 
     assert unbounded_left["cx"] >= 1280.0
     assert unbounded_right["cx"] < 0.0
-    assert ideal_left is None
-    assert ideal_right is None
+    assert ideal_left == unbounded_left
+    assert ideal_right == unbounded_right

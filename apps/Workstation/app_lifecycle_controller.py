@@ -41,14 +41,15 @@ class AppLifecycleController:
         return True
 
     def _shutdown_stop_auxiliary_workers(self) -> bool:
+        auto_capture_stopped = self.panel.stop_auto_calibration_capture()
         preview_stopped = self.panel._stop_calibration_preview_worker(wait=False)
+        lrf_stopped = self.panel.stop_wiris_lrf_polling(wait=False)
         attrs = (
             "camera_auto_detect_thread",
             "wiris_control_check_thread",
             "wiris_command_thread",
             "wiris_zoom_thread",
             "wiris_time_sync_thread",
-            "wiris_gdti_thread",
             "wiris_stip_thread",
             "camera_network_discovery_thread",
             "camera_network_apply_thread",
@@ -61,7 +62,7 @@ class AppLifecycleController:
             "checkerboard_calibration_thread",
         )
         results = [self.panel._shutdown_stop_thread(attr) for attr in attrs]
-        return bool(preview_stopped and all(results))
+        return bool(auto_capture_stopped and preview_stopped and lrf_stopped and all(results))
 
     def _shutdown_stop_gnss_base_serial(self) -> bool:
         self.panel.disconnect_gnss_base_serial()

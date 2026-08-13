@@ -662,6 +662,19 @@ class MeasurementViewController:
                 self.panel.active_intrinsics,
                 active_zoom_level=self.panel.zoom_level_spin.value(),
                 selected_profile_path=profile_path,
+                selected_extrinsics_profile_path=str(
+                    getattr(self.panel, "_active_extrinsics_profile_path", "") or ""
+                ),
+                intrinsics_source_zoom_level=getattr(
+                    self.panel, "_active_intrinsics_source_zoom_level", None
+                ),
+                extrinsics_source_zoom_level=getattr(
+                    self.panel, "_active_extrinsics_source_zoom_level", None
+                ),
+                selection_mode=str(
+                    getattr(self.panel, "_active_calibration_selection_mode", "")
+                    or "legacy_combined"
+                ),
             )
         max_time_delta_s = self.panel._yolo_pair_max_delta_s()
         max_vertical_delta_px = self.panel._yolo_vertical_max_delta_px()

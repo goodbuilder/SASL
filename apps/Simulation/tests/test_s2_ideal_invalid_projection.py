@@ -20,26 +20,41 @@ def _node():
     return node
 
 
-def test_ideal_projection_rejects_out_of_fov_and_accepts_valid_reference_points():
+def test_ideal_projection_is_fov_independent_debug_reference():
+    """Ideal projection is a debug reference, not a bounded detection: it must
+
+    report a value whether or not the target's projection falls inside the
+    image, unified with the RViz ideal ray's FOV-independent behavior.
+    """
     node = _node()
     out_of_fov = node.baseline_center_frd.point_to_world((120.0, -3.0, 2.0))
     in_fov = node.baseline_center_frd.point_to_world((500.0, -3.0, 2.0))
 
-    rejected = node._ideal_detection_pair_from_reference_world(out_of_fov, 1280, 720)
-    accepted = node._ideal_detection_pair_from_reference_world(in_fov, 1280, 720)
+    out_of_fov_pair = node._ideal_detection_pair_from_reference_world(out_of_fov, 1280, 720)
+    in_fov_pair = node._ideal_detection_pair_from_reference_world(in_fov, 1280, 720)
 
-    assert rejected == (None, None)
-    assert accepted[0] is not None
-    assert accepted[1] is not None
-    assert 0.0 <= accepted[0]["cx"] < 1280.0
-    assert 0.0 <= accepted[1]["cx"] < 1280.0
+    assert out_of_fov_pair[0] is not None
+    assert out_of_fov_pair[1] is not None
+    assert not (0.0 <= out_of_fov_pair[0]["cx"] < 1280.0) or not (
+        0.0 <= out_of_fov_pair[1]["cx"] < 1280.0
+    )
+    assert in_fov_pair[0] is not None
+    assert in_fov_pair[1] is not None
+    assert 0.0 <= in_fov_pair[0]["cx"] < 1280.0
+    assert 0.0 <= in_fov_pair[1]["cx"] < 1280.0
 
 
-def test_rviz_ideal_ray_falls_back_to_reference_point_outside_fov():
+def test_rviz_ideal_ray_falls_back_to_reference_point_behind_camera():
+    """The RViz exact-point fallback still exists for genuine projection
+
+    failures (e.g. a reference point behind the camera plane), even though
+    an out-of-FOV-but-in-front point no longer needs it (see the
+    FOV-independent debug reference test above).
+    """
     node = _node()
-    out_of_fov = node.baseline_center_frd.point_to_world((120.0, -3.0, 2.0))
+    behind_camera = node.baseline_center_frd.point_to_world((-50.0, -3.0, 2.0))
     node.cached_ground_truth_position = {
-        "ground_truth_world_enu_m": out_of_fov,
+        "ground_truth_world_enu_m": behind_camera,
     }
     pair = SimpleNamespace(left_message=SimpleNamespace(width=1280, height=720))
 
@@ -47,4 +62,4 @@ def test_rviz_ideal_ray_falls_back_to_reference_point_outside_fov():
 
     assert ray is not None
     assert ray["computation_status"] == "computed"
-    assert ray["ray_visualization_world_enu"]["midpoint_world_enu_m"] == out_of_fov
+    assert ray["ray_visualization_world_enu"]["midpoint_world_enu_m"] == behind_camera

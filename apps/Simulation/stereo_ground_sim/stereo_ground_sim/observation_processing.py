@@ -6,6 +6,7 @@ metadata and never converts values to world ENU, NED, or camera-centre fields.
 """
 
 import math
+import time
 from collections import deque
 
 import numpy as np
@@ -558,9 +559,16 @@ class ObservationProcessingCoordinator:
 
         width = left_image.shape[1]
         height = left_image.shape[0]
+        # TEMPORARY diagnostic timing (SASL-perf-investigation): pinpointing
+        # which sub-step dominates the ~11-21ms result_commit_ms measured on
+        # /stereo/result_commit_ms. Pure measurement, no behavior change.
+        # Remove once the bottleneck is confirmed and addressed.
+        _t_start = time.monotonic()
         raw = self.node._triangulate_center_pixels(left["cx"], left["cy"], right["cx"], right["cy"], width, height)
+        _t_triangulate = time.monotonic()
         observation_fusion_status = "disabled"
         fused_raw, observation_fusion_status = self.node._apply_observation_fusion(left, right, width, height)
+        _t_fusion = time.monotonic()
         legacy_fused_observation = fused_raw
         raw.setdefault("left_u_px", float(left["cx"]))
         raw.setdefault("left_v_px", float(left["cy"]))
@@ -612,10 +620,12 @@ class ObservationProcessingCoordinator:
             )
             if not isinstance(self.node.bbox_center_adjustment, OriginBBoxReprojectionProfile):
                 profile_status = self.node._profile_status("global_affine_csv", "global_affine_csv", 0, "csv_affine")
+        _t_profile = time.monotonic()
         pre_residual_feature_summary, pre_residual_feature_summary_status = self.node._disparity_residual_feature_summary(
             raw=raw,
             corrected=corrected,
         )
+        _t_feature_summary_1 = time.monotonic()
         selector_feature_summary = pre_residual_feature_summary
         selector_feature_summary_status = pre_residual_feature_summary_status
         selected_residual_profile = None
@@ -632,12 +642,18 @@ class ObservationProcessingCoordinator:
                 )
             elif selector_feature_summary_status != pre_residual_feature_summary_status:
                 feature_selector_status = selector_feature_summary_status
+        _t_selector = time.monotonic()
         corrected, disparity_residual_status = self.node._apply_disparity_residual_profile(
             corrected,
             raw,
             profile=selected_residual_profile,
         )
-        feature_summary, feature_summary_status = self.node._disparity_residual_feature_summary(raw=raw, corrected=corrected)
+        _t_residual_apply = time.monotonic()
+        if disparity_residual_status.startswith("applied:"):
+            feature_summary, feature_summary_status = self.node._disparity_residual_feature_summary(raw=raw, corrected=corrected)
+        else:
+            feature_summary, feature_summary_status = pre_residual_feature_summary, pre_residual_feature_summary_status
+        _t_feature_summary_2 = time.monotonic()
         if feature_summary_status != "ready:current_sample":
             feature_summary_status = pre_residual_feature_summary_status
             feature_summary = pre_residual_feature_summary
@@ -646,6 +662,23 @@ class ObservationProcessingCoordinator:
             if raw["distance_m"] is None or actual is None or not math.isfinite(float(actual))
             else raw["distance_m"] - actual
         )
+        _get_logger = getattr(self.node, "get_logger", None)
+        if _get_logger is not None:
+            try:
+                _get_logger().info(
+                    "PERF _calculate_metrics ms: "
+                    f"triangulate={1000*(_t_triangulate-_t_start):.2f} "
+                    f"fusion={1000*(_t_fusion-_t_triangulate):.2f} "
+                    f"profile={1000*(_t_profile-_t_fusion):.2f} "
+                    f"feature_summary_1={1000*(_t_feature_summary_1-_t_profile):.2f} "
+                    f"selector={1000*(_t_selector-_t_feature_summary_1):.2f} "
+                    f"residual_apply={1000*(_t_residual_apply-_t_selector):.2f} "
+                    f"feature_summary_2={1000*(_t_feature_summary_2-_t_residual_apply):.2f} "
+                    f"total={1000*(_t_feature_summary_2-_t_start):.2f}",
+                    throttle_duration_sec=2.0,
+                )
+            except Exception:
+                pass
         return {
             "left_u_px": raw.get("left_u_px"),
             "left_v_px": raw.get("left_v_px"),

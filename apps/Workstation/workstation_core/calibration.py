@@ -1,10 +1,20 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+CalibrationProgressCallback = Callable[[int, int, str], None]
+
+STEREO_EXTRINSICS_FRAME_CONTRACT = (
+    "opencv_optical:RDF(right,down,forward); "
+    "X_right = R_left_to_right * X_left + T_left_to_right_m"
+)
 
 
 @dataclass(frozen=True)
@@ -42,7 +52,7 @@ class StereoExtrinsics:
     translation_left_to_right_m: list[float]
     reprojection_error_px: float
     pair_count: int
-    frame_contract: str = "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m"
+    frame_contract: str = STEREO_EXTRINSICS_FRAME_CONTRACT
 
 
 @dataclass(frozen=True)
@@ -51,6 +61,144 @@ class StereoIntrinsicsResult:
     right: CameraIntrinsics
     board: CheckerboardConfig
     extrinsics: StereoExtrinsics | None = None
+
+
+def _sha256_json_payload(payload: object) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _validate_stereo_extrinsics(extrinsics: StereoExtrinsics) -> None:
+    rotation = extrinsics.rotation_left_to_right
+    translation = extrinsics.translation_left_to_right_m
+    if len(rotation) != 3 or any(len(row) != 3 for row in rotation):
+        raise ValueError("rotation_left_to_right must be 3x3")
+    values = [float(value) for row in rotation for value in row]
+    values.extend(float(value) for value in translation)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("stereo extrinsics must contain only finite values")
+    if len(translation) != 3:
+        raise ValueError("translation_left_to_right_m must contain 3 values")
+    for left_column in range(3):
+        for right_column in range(3):
+            dot = sum(
+                float(rotation[row][left_column]) * float(rotation[row][right_column])
+                for row in range(3)
+            )
+            expected = 1.0 if left_column == right_column else 0.0
+            if abs(dot - expected) > 1.0e-6:
+                raise ValueError("rotation_left_to_right must be orthonormal within 1e-6")
+    determinant = (
+        float(rotation[0][0])
+        * (float(rotation[1][1]) * float(rotation[2][2]) - float(rotation[1][2]) * float(rotation[2][1]))
+        - float(rotation[0][1])
+        * (float(rotation[1][0]) * float(rotation[2][2]) - float(rotation[1][2]) * float(rotation[2][0]))
+        + float(rotation[0][2])
+        * (float(rotation[1][0]) * float(rotation[2][1]) - float(rotation[1][1]) * float(rotation[2][0]))
+    )
+    if abs(determinant - 1.0) > 1.0e-6:
+        raise ValueError("rotation_left_to_right determinant must equal +1 within 1e-6")
+    if not math.isfinite(float(extrinsics.reprojection_error_px)):
+        raise ValueError("stereo reprojection_error_px must be finite")
+    if int(extrinsics.pair_count) < 0:
+        raise ValueError("stereo pair_count must be non-negative")
+    if str(extrinsics.frame_contract) != STEREO_EXTRINSICS_FRAME_CONTRACT:
+        raise ValueError("stereo extrinsics frame_contract does not match OpenCV optical RDF left-to-right")
+
+
+@dataclass(frozen=True)
+class StereoExtrinsicsProfile:
+    """Independent stereo R/T profile with explicit calibration provenance.
+
+    ``source_zoom_level`` records where R/T was estimated.  It is metadata,
+    not an application gate: callers may intentionally combine this profile
+    with intrinsics from another zoom level.
+    """
+
+    extrinsics: StereoExtrinsics
+    source_zoom_level: int | None = None
+    method: str = "checkerboard_external_only"
+    source_intrinsics_path: str = ""
+    source_intrinsics_sha256: str = ""
+    profile_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_stereo_extrinsics(self.extrinsics)
+        if self.source_zoom_level is not None and int(self.source_zoom_level) < 0:
+            raise ValueError("source_zoom_level must be non-negative")
+        object.__setattr__(
+            self,
+            "source_zoom_level",
+            None if self.source_zoom_level is None else int(self.source_zoom_level),
+        )
+        object.__setattr__(self, "method", str(self.method or "unknown"))
+        object.__setattr__(self, "source_intrinsics_path", str(self.source_intrinsics_path))
+        object.__setattr__(self, "source_intrinsics_sha256", str(self.source_intrinsics_sha256))
+        object.__setattr__(self, "profile_id", str(self.profile_id))
+        object.__setattr__(self, "metadata", dict(self.metadata))
+        digest = self.source_intrinsics_sha256
+        if digest and (
+            len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise ValueError("source_intrinsics_sha256 must be a lowercase SHA-256 digest")
+
+    @property
+    def right_camera_origin_in_left_rdf_m(self) -> tuple[float, float, float]:
+        rotation = self.extrinsics.rotation_left_to_right
+        translation = self.extrinsics.translation_left_to_right_m
+        return tuple(
+            -sum(float(rotation[column][row]) * float(translation[column]) for column in range(3))
+            for row in range(3)
+        )
+
+    @property
+    def baseline_m(self) -> float:
+        return math.sqrt(sum(value * value for value in self.right_camera_origin_in_left_rdf_m))
+
+    @property
+    def content_sha256(self) -> str:
+        return _sha256_json_payload(asdict(self.extrinsics))
+
+
+def intrinsics_content_sha256(result: StereoIntrinsicsResult) -> str:
+    """Hash only K/D and board fields, deliberately excluding stereo R/T."""
+
+    return _sha256_json_payload(
+        {
+            "left": asdict(result.left),
+            "right": asdict(result.right),
+            "board": asdict(result.board),
+        }
+    )
+
+
+def compose_stereo_calibration(
+    intrinsics: StereoIntrinsicsResult,
+    extrinsics: StereoExtrinsics | StereoExtrinsicsProfile | None,
+) -> StereoIntrinsicsResult:
+    """Compose independently selected K/D and R/T without a zoom gate."""
+
+    selected = extrinsics.extrinsics if isinstance(extrinsics, StereoExtrinsicsProfile) else extrinsics
+    if selected is not None:
+        _validate_stereo_extrinsics(selected)
+    return StereoIntrinsicsResult(
+        left=intrinsics.left,
+        right=intrinsics.right,
+        board=intrinsics.board,
+        extrinsics=selected,
+    )
+
+
+def without_stereo_extrinsics(result: StereoIntrinsicsResult) -> StereoIntrinsicsResult:
+    return compose_stereo_calibration(result, None)
 
 
 def opencv_available() -> tuple[bool, str | None]:
@@ -95,7 +243,12 @@ def _object_points(config: CheckerboardConfig):
     return points
 
 
-def calibrate_camera_from_images(paths: list[str | Path], config: CheckerboardConfig) -> CameraIntrinsics:
+def calibrate_camera_from_images(
+    paths: list[str | Path],
+    config: CheckerboardConfig,
+    *,
+    progress_callback: CalibrationProgressCallback | None = None,
+) -> CameraIntrinsics:
     import cv2
     import numpy as np
 
@@ -105,7 +258,8 @@ def calibrate_camera_from_images(paths: list[str | Path], config: CheckerboardCo
     image_size: tuple[int, int] | None = None
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
-    for raw_path in paths:
+    total_paths = len(paths)
+    for index, raw_path in enumerate(paths, start=1):
         path = Path(raw_path)
         image = _load_grayscale(path)
         current_size = (int(image.shape[1]), int(image.shape[0]))
@@ -114,11 +268,12 @@ def calibrate_camera_from_images(paths: list[str | Path], config: CheckerboardCo
         elif image_size != current_size:
             raise ValueError(f"image size mismatch: {path} has {current_size}, expected {image_size}")
         found, corners = cv2.findChessboardCorners(image, config.pattern_size, None)
-        if not found or corners is None:
-            continue
-        refined = cv2.cornerSubPix(image, corners, (11, 11), (-1, -1), criteria)
-        object_points.append(objp)
-        image_points.append(refined)
+        if found and corners is not None:
+            refined = cv2.cornerSubPix(image, corners, (11, 11), (-1, -1), criteria)
+            object_points.append(objp)
+            image_points.append(refined)
+        if progress_callback is not None:
+            progress_callback(index, total_paths, "detect")
 
     if image_size is None:
         raise ValueError("no images supplied")
@@ -132,6 +287,8 @@ def calibrate_camera_from_images(paths: list[str | Path], config: CheckerboardCo
         None,
         None,
     )
+    if progress_callback is not None:
+        progress_callback(total_paths, total_paths, "optimize")
     total_error = 0.0
     total_points = 0
     for obj, img, rvec, tvec in zip(object_points, image_points, rvecs, tvecs):
@@ -156,6 +313,8 @@ def calibrate_stereo_extrinsics_from_image_pairs(
     config: CheckerboardConfig,
     left_intrinsics: CameraIntrinsics,
     right_intrinsics: CameraIntrinsics,
+    *,
+    progress_callback: CalibrationProgressCallback | None = None,
 ) -> StereoExtrinsics:
     import cv2
     import numpy as np
@@ -182,7 +341,8 @@ def calibrate_stereo_extrinsics_from_image_pairs(
     image_size: tuple[int, int] | None = None
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
-    for key in pair_keys:
+    total_pairs = len(pair_keys)
+    for index, key in enumerate(pair_keys, start=1):
         left_image = _load_grayscale(left_by_stem[key])
         right_image = _load_grayscale(right_by_stem[key])
         current_size = (int(left_image.shape[1]), int(left_image.shape[0]))
@@ -198,13 +358,14 @@ def calibrate_stereo_extrinsics_from_image_pairs(
 
         left_found, left_corners = cv2.findChessboardCorners(left_image, config.pattern_size, None)
         right_found, right_corners = cv2.findChessboardCorners(right_image, config.pattern_size, None)
-        if not left_found or not right_found or left_corners is None or right_corners is None:
-            continue
-        left_refined = cv2.cornerSubPix(left_image, left_corners, (11, 11), (-1, -1), criteria)
-        right_refined = cv2.cornerSubPix(right_image, right_corners, (11, 11), (-1, -1), criteria)
-        object_points.append(objp)
-        left_image_points.append(left_refined)
-        right_image_points.append(right_refined)
+        if left_found and right_found and left_corners is not None and right_corners is not None:
+            left_refined = cv2.cornerSubPix(left_image, left_corners, (11, 11), (-1, -1), criteria)
+            right_refined = cv2.cornerSubPix(right_image, right_corners, (11, 11), (-1, -1), criteria)
+            object_points.append(objp)
+            left_image_points.append(left_refined)
+            right_image_points.append(right_refined)
+        if progress_callback is not None:
+            progress_callback(index, total_pairs, "detect")
 
     if image_size is None:
         raise ValueError("no images supplied")
@@ -227,6 +388,8 @@ def calibrate_stereo_extrinsics_from_image_pairs(
         flags=cv2.CALIB_FIX_INTRINSIC,
         criteria=criteria,
     )
+    if progress_callback is not None:
+        progress_callback(total_pairs, total_pairs, "optimize")
     return StereoExtrinsics(
         rotation_left_to_right=[[float(value) for value in row] for row in rotation.tolist()],
         translation_left_to_right_m=[float(value) for value in np.ravel(translation).tolist()],
@@ -259,7 +422,7 @@ def camera_intrinsics_from_dict(payload: dict[str, Any]) -> CameraIntrinsics:
 
 
 def stereo_extrinsics_from_dict(payload: dict[str, Any]) -> StereoExtrinsics:
-    return StereoExtrinsics(
+    result = StereoExtrinsics(
         rotation_left_to_right=[
             [float(value) for value in row] for row in payload["rotation_left_to_right"]
         ],
@@ -269,9 +432,62 @@ def stereo_extrinsics_from_dict(payload: dict[str, Any]) -> StereoExtrinsics:
         frame_contract=str(
             payload.get(
                 "frame_contract",
-                "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
+                STEREO_EXTRINSICS_FRAME_CONTRACT,
             )
         ),
+    )
+    _validate_stereo_extrinsics(result)
+    return result
+
+
+def save_stereo_extrinsics_json(
+    path: str | Path,
+    profile: StereoExtrinsicsProfile,
+) -> None:
+    output = Path(path)
+    payload = {
+        "schema_version": 1,
+        "profile_type": "stereo_extrinsics",
+        "profile_id": profile.profile_id or output.stem,
+        "source_zoom_level": profile.source_zoom_level,
+        "method": profile.method,
+        "source_intrinsics_path": profile.source_intrinsics_path,
+        "source_intrinsics_sha256": profile.source_intrinsics_sha256,
+        "extrinsics": asdict(profile.extrinsics),
+        "derived": {
+            "right_camera_origin_in_left_rdf_m": list(profile.right_camera_origin_in_left_rdf_m),
+            "baseline_m": profile.baseline_m,
+        },
+        "metadata": dict(profile.metadata),
+    }
+    output.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_stereo_extrinsics_json(path: str | Path) -> StereoExtrinsicsProfile:
+    """Load a standalone profile or an older intrinsics JSON with embedded R/T."""
+
+    input_path = Path(path)
+    payload = json.loads(input_path.read_text(encoding="utf-8"))
+    raw_extrinsics = payload.get("extrinsics")
+    if not isinstance(raw_extrinsics, dict):
+        raise ValueError("JSON does not contain stereo extrinsics")
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    source_zoom = payload.get("source_zoom_level", metadata.get("zoom_level"))
+    return StereoExtrinsicsProfile(
+        extrinsics=stereo_extrinsics_from_dict(raw_extrinsics),
+        source_zoom_level=None if source_zoom is None else int(source_zoom),
+        method=str(
+            payload.get("method")
+            or metadata.get("calculation_mode")
+            or "legacy_embedded_checkerboard"
+        ),
+        source_intrinsics_path=str(
+            payload.get("source_intrinsics_path")
+            or (str(input_path) if "left" in payload and "right" in payload else "")
+        ),
+        source_intrinsics_sha256=str(payload.get("source_intrinsics_sha256") or ""),
+        profile_id=str(payload.get("profile_id") or input_path.stem),
+        metadata=dict(metadata),
     )
 
 

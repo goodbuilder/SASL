@@ -320,9 +320,7 @@ class TelemetryHistoryPlot(QtWidgets.QWidget):
         y = legend.top() + 5 + metrics.ascent()
         for label, color in entries:
             painter.setPen(QtGui.QColor(color))
-            painter.drawText(legend.left() + 7, y, "●")
-            painter.setPen(QtGui.QColor(CHART_TEXT))
-            painter.drawText(legend.left() + 20, y, label)
+            painter.drawText(legend.left() + 7, y, label)
             y += row_h
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override.

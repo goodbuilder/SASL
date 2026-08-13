@@ -15,6 +15,7 @@ from collections import deque
 from collections.abc import Sequence
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from math import isfinite
 from pathlib import Path
 from statistics import median
 
@@ -263,7 +264,7 @@ class RecordingController:
         if self.panel._session_save_thread is not None:
             self.panel.recording_status_label.setText("세션 기록: 이전 세션 저장 완료 대기 중")
             return False
-        if self.panel.wiris_time_sync_thread is not None or self.panel.wiris_gdti_thread is not None:
+        if self.panel.wiris_time_sync_thread is not None:
             status_text = "세션 기록: WIRIS 시간 동기화 및 스트림 재연결 완료 대기 중"
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")
@@ -756,7 +757,6 @@ class RecordingController:
             "camera_time_sync_warning": camera_time_metrics["warning"],
             "stream_sync_state": self.panel.camera_sync_status,
             "stream_sync_reason": self.panel.camera_sync_reason,
-            "stream_sync_gdti": self.panel._camera_sync_gdti,
             "camera_time_sync_observation": clock_sync_snapshot,
             "camera_time_sync_observations": {
                 "start": self.panel._recording_clock_sync_start_observation,
@@ -1826,6 +1826,12 @@ class RecordingController:
         return row
 
     def _record_current_intrinsic_parameters(self) -> dict[str, str]:
+        intrinsics_source_zoom = getattr(
+            self.panel, "_active_intrinsics_source_zoom_level", None
+        )
+        extrinsics_source_zoom = getattr(
+            self.panel, "_active_extrinsics_source_zoom_level", None
+        )
         row: dict[str, str] = {
             "intrinsics_active": "true" if self.panel.active_intrinsics is not None else "false",
             "intrinsics_path": str(
@@ -1834,6 +1840,37 @@ class RecordingController:
             "intrinsics_zoom_level": str(self.panel.zoom_level_spin.value()),
             "intrinsics_zoom_path": str(self.panel._intrinsics_storage_path()),
             "intrinsics_latest_path": str(self.panel._intrinsics_storage_base_path()),
+            "intrinsics_profile_path": str(
+                getattr(self.panel, "_active_intrinsics_profile_path", "") or ""
+            ),
+            "intrinsics_profile_sha256": str(
+                getattr(self.panel, "_active_intrinsics_profile_hash", "") or ""
+            ),
+            "intrinsics_source_zoom_level": (
+                "" if intrinsics_source_zoom is None else str(intrinsics_source_zoom)
+            ),
+            "extrinsics_profile_path": str(
+                getattr(self.panel, "_active_extrinsics_profile_path", "") or ""
+            ),
+            "extrinsics_profile_sha256": str(
+                getattr(self.panel, "_active_extrinsics_profile_hash", "") or ""
+            ),
+            "extrinsics_source_zoom_level": (
+                "" if extrinsics_source_zoom is None else str(extrinsics_source_zoom)
+            ),
+            "calibration_selection_mode": str(
+                getattr(self.panel, "_active_calibration_selection_mode", "") or ""
+            ),
+            "calibration_validation_gate": "disabled",
+            "cross_zoom_selection": self.panel._fmt_record_bool(
+                intrinsics_source_zoom is not None
+                and extrinsics_source_zoom is not None
+                and int(intrinsics_source_zoom) != int(extrinsics_source_zoom)
+            ),
+            "actual_visible_zoom": json.dumps(
+                getattr(self.panel, "actual_visible_zoom", {}) or {},
+                separators=(",", ":"),
+            ),
             "manual_focal_override": self.panel._fmt_record_bool(self.panel.manual_focal_checkbox.isChecked()),
             "runtime_focal_px": self.panel._fmt_record_float(self.panel.focal_spin.value(), 3),
         }
@@ -1869,6 +1906,42 @@ class RecordingController:
             "intrinsics_zoom_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
             "intrinsics_latest_path": "" if intrinsics_snapshot is None else intrinsics_snapshot.selected_profile_path,
             "intrinsics_content_sha256": "" if intrinsics_snapshot is None else intrinsics_snapshot.content_sha256,
+            "intrinsics_profile_sha256": (
+                "" if intrinsics_snapshot is None else intrinsics_snapshot.intrinsics_content_sha256
+            ),
+            "intrinsics_source_zoom_level": (
+                ""
+                if intrinsics_snapshot is None
+                else str(intrinsics_snapshot.intrinsics_source_zoom_level)
+            ),
+            "extrinsics_profile_path": (
+                ""
+                if intrinsics_snapshot is None
+                else intrinsics_snapshot.selected_extrinsics_profile_path
+            ),
+            "extrinsics_profile_sha256": (
+                ""
+                if intrinsics_snapshot is None
+                else intrinsics_snapshot.extrinsics_content_sha256
+            ),
+            "extrinsics_source_zoom_level": (
+                ""
+                if intrinsics_snapshot is None
+                or intrinsics_snapshot.extrinsics_source_zoom_level is None
+                else str(intrinsics_snapshot.extrinsics_source_zoom_level)
+            ),
+            "calibration_selection_mode": (
+                "" if intrinsics_snapshot is None else intrinsics_snapshot.selection_mode
+            ),
+            "calibration_validation_gate": (
+                "" if intrinsics_snapshot is None else intrinsics_snapshot.validation_gate
+            ),
+            "cross_zoom_selection": self.panel._fmt_record_bool(
+                intrinsics_snapshot is not None
+                and intrinsics_snapshot.extrinsics_source_zoom_level is not None
+                and intrinsics_snapshot.intrinsics_source_zoom_level
+                != intrinsics_snapshot.extrinsics_source_zoom_level
+            ),
             "manual_focal_override": self.panel._fmt_record_bool(
                 measurement_attempt.geometry_config.manual_focal_override
             ),
@@ -1907,7 +1980,17 @@ class RecordingController:
         extrinsics = None if calibration is None else calibration.extrinsics
         row: dict[str, object] = {
             "active": extrinsics is not None,
-            "source": "applied_intrinsics",
+            "source": "independent_profile_composed_with_intrinsics",
+            "profile_path": str(
+                getattr(self.panel, "_active_extrinsics_profile_path", "") or ""
+            ),
+            "profile_sha256": str(
+                getattr(self.panel, "_active_extrinsics_profile_hash", "") or ""
+            ),
+            "source_zoom_level": getattr(
+                self.panel, "_active_extrinsics_source_zoom_level", None
+            ),
+            "validation_gate": "disabled",
             "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
         }
         if extrinsics is None:
@@ -1933,7 +2016,21 @@ class RecordingController:
         extrinsics = None if calibration is None else calibration.checkerboard_extrinsics
         row: dict[str, object] = {
             "active": extrinsics is not None,
-            "source": "measurement_attempt",
+            "source": "measurement_attempt_independent_profile_bundle",
+            "profile_path": (
+                ""
+                if calibration is None
+                else calibration.selected_extrinsics_profile_path
+            ),
+            "profile_sha256": (
+                "" if calibration is None else calibration.extrinsics_content_sha256
+            ),
+            "source_zoom_level": (
+                None if calibration is None else calibration.extrinsics_source_zoom_level
+            ),
+            "validation_gate": (
+                "disabled" if calibration is None else calibration.validation_gate
+            ),
             "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m",
         }
         if extrinsics is None:

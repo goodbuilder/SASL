@@ -211,7 +211,6 @@ class PoseSimulationConfigTests(unittest.TestCase):
             "DRONE_SPAWN_Y_M",
             "WAYPOINTS_XY_ALT_M",
             "YOLO_MODEL_PATH",
-            "ATTITUDE_EXPERIMENT_AXES",
         ):
             with self.subTest(key=key):
                 with self.assertRaisesRegex(ConfigError, "Simulation-owned"):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import random
 from collections.abc import Sequence
@@ -10,12 +11,25 @@ from pathlib import Path
 from PyQt5 import QtCore, QtGui
 
 from Workstation.workstation_core.calibration import (
+    CameraIntrinsics,
     CheckerboardConfig,
     StereoIntrinsicsResult,
     calibrate_camera_from_images,
     calibrate_stereo_extrinsics_from_image_pairs,
     detect_checkerboard,
 )
+
+
+def _call_with_progress(function, *args, progress_callback, **kwargs):
+    """Keep worker test doubles and older integrations compatible."""
+
+    try:
+        supports_progress = "progress_callback" in inspect.signature(function).parameters
+    except (TypeError, ValueError):
+        supports_progress = True
+    if supports_progress:
+        kwargs["progress_callback"] = progress_callback
+    return function(*args, **kwargs)
 
 
 class CheckerboardCaptureWorker(QtCore.QObject):
@@ -134,6 +148,7 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
     completed = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
+    progress = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -149,19 +164,95 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
         self.right_paths = tuple(Path(path) for path in right_paths)
         self.config = config
 
+    def _emit_progress(
+        self,
+        phase: str,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        total = max(0, int(total))
+        processed = min(max(0, int(processed)), total) if total else 0
+        percent = 100.0 if total == 0 else (100.0 * processed / total)
+        self.progress.emit(
+            {
+                "phase": phase,
+                "processed": processed,
+                "total": total,
+                "percent": percent,
+                "message": message,
+            }
+        )
+
+    def _callback(self, phase: str, label: str):
+        return lambda processed, total, _operation: self._emit_progress(
+            phase,
+            processed,
+            total,
+            f"{label} {processed}/{total}",
+        )
+
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            left = calibrate_camera_from_images(self.left_paths, self.config)
-            right = calibrate_camera_from_images(self.right_paths, self.config)
+            self._emit_progress(
+                "left_intrinsic",
+                0,
+                len(self.left_paths),
+                f"왼쪽 내부 파라미터 검출 0/{len(self.left_paths)}",
+            )
+            left = _call_with_progress(
+                calibrate_camera_from_images,
+                self.left_paths,
+                self.config,
+                progress_callback=self._callback("left_intrinsic", "왼쪽 내부 파라미터 검출"),
+            )
+            self._emit_progress(
+                "left_intrinsic",
+                len(self.left_paths),
+                len(self.left_paths),
+                f"왼쪽 내부 파라미터 완료 {len(self.left_paths)}/{len(self.left_paths)}",
+            )
+            self._emit_progress(
+                "right_intrinsic",
+                0,
+                len(self.right_paths),
+                f"오른쪽 내부 파라미터 검출 0/{len(self.right_paths)}",
+            )
+            right = _call_with_progress(
+                calibrate_camera_from_images,
+                self.right_paths,
+                self.config,
+                progress_callback=self._callback("right_intrinsic", "오른쪽 내부 파라미터 검출"),
+            )
+            self._emit_progress(
+                "right_intrinsic",
+                len(self.right_paths),
+                len(self.right_paths),
+                f"오른쪽 내부 파라미터 완료 {len(self.right_paths)}/{len(self.right_paths)}",
+            )
             extrinsics = None
             if self.mode == "checkerboard":
-                extrinsics = calibrate_stereo_extrinsics_from_image_pairs(
+                self._emit_progress(
+                    "stereo_extrinsic",
+                    0,
+                    min(len(self.left_paths), len(self.right_paths)),
+                    "stereo pair 검출 0개",
+                )
+                extrinsics = _call_with_progress(
+                    calibrate_stereo_extrinsics_from_image_pairs,
                     self.left_paths,
                     self.right_paths,
                     self.config,
                     left,
                     right,
+                    progress_callback=self._callback("stereo_extrinsic", "stereo pair 검출"),
+                )
+                self._emit_progress(
+                    "stereo_extrinsic",
+                    min(len(self.left_paths), len(self.right_paths)),
+                    min(len(self.left_paths), len(self.right_paths)),
+                    "stereo pair 계산 완료",
                 )
             result = StereoIntrinsicsResult(
                 left=left,
@@ -177,12 +268,80 @@ class CheckerboardCalibrationWorker(QtCore.QObject):
             self.finished.emit()
 
 
+class CheckerboardExtrinsicsWorker(QtCore.QObject):
+    """Estimate only stereo R/T while preserving the selected K/D exactly."""
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+    progress = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        *,
+        left_paths: Sequence[Path],
+        right_paths: Sequence[Path],
+        config: CheckerboardConfig,
+        left_intrinsics: CameraIntrinsics,
+        right_intrinsics: CameraIntrinsics,
+    ) -> None:
+        super().__init__()
+        self.left_paths = tuple(Path(path) for path in left_paths)
+        self.right_paths = tuple(Path(path) for path in right_paths)
+        self.config = config
+        self.left_intrinsics = left_intrinsics
+        self.right_intrinsics = right_intrinsics
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        total = min(len(self.left_paths), len(self.right_paths))
+
+        def progress(processed: int, count: int, _operation: str) -> None:
+            percent = 100.0 if count <= 0 else 100.0 * int(processed) / int(count)
+            self.progress.emit(
+                {
+                    "phase": "stereo_extrinsic_only",
+                    "processed": int(processed),
+                    "total": int(count),
+                    "percent": percent,
+                    "message": f"R,t only stereo pair {processed}/{count}",
+                }
+            )
+
+        try:
+            self.progress.emit(
+                {
+                    "phase": "stereo_extrinsic_only",
+                    "processed": 0,
+                    "total": total,
+                    "percent": 0.0,
+                    "message": f"R,t only stereo pair 0/{total}",
+                }
+            )
+            extrinsics = _call_with_progress(
+                calibrate_stereo_extrinsics_from_image_pairs,
+                self.left_paths,
+                self.right_paths,
+                self.config,
+                self.left_intrinsics,
+                self.right_intrinsics,
+                progress_callback=progress,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(extrinsics)
+        finally:
+            self.finished.emit()
+
+
 class CheckerboardRandomValidationWorker(QtCore.QObject):
     """Run repeated checkerboard calibration subsets away from the GUI thread."""
 
     completed = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
+    progress = QtCore.pyqtSignal(object)
 
     def __init__(
         self,
@@ -202,6 +361,38 @@ class CheckerboardRandomValidationWorker(QtCore.QObject):
         self.subset_count = max(1, int(subset_count))
         self.seed = int(seed)
 
+    def _emit_progress(
+        self,
+        run: int,
+        phase: str,
+        processed: int,
+        total: int,
+        message: str,
+    ) -> None:
+        total = max(0, int(total))
+        processed = min(max(0, int(processed)), total) if total else 0
+        percent = 100.0 if total == 0 else (100.0 * processed / total)
+        self.progress.emit(
+            {
+                "run": run,
+                "runs": self.runs,
+                "phase": phase,
+                "processed": processed,
+                "total": total,
+                "percent": percent,
+                "message": message,
+            }
+        )
+
+    def _callback(self, run: int, phase: str, label: str):
+        return lambda processed, total, _operation: self._emit_progress(
+            run,
+            phase,
+            processed,
+            total,
+            f"run {run}/{self.runs} · {label} {processed}/{total}",
+        )
+
     @QtCore.pyqtSlot()
     def run(self) -> None:
         rng = random.Random(self.seed if self.seed > 0 else None)
@@ -212,16 +403,49 @@ class CheckerboardRandomValidationWorker(QtCore.QObject):
                 left_paths = tuple(left for _key, left, _right in subset)
                 right_paths = tuple(right for _key, _left, right in subset)
                 try:
-                    left = calibrate_camera_from_images(left_paths, self.config)
-                    right = calibrate_camera_from_images(right_paths, self.config)
+                    self._emit_progress(
+                        index,
+                        "validation_left",
+                        0,
+                        len(left_paths),
+                        f"run {index}/{self.runs} · 왼쪽 검증 0/{len(left_paths)}",
+                    )
+                    left = _call_with_progress(
+                        calibrate_camera_from_images,
+                        left_paths,
+                        self.config,
+                        progress_callback=self._callback(index, "validation_left", "왼쪽 검증"),
+                    )
+                    self._emit_progress(
+                        index,
+                        "validation_right",
+                        0,
+                        len(right_paths),
+                        f"run {index}/{self.runs} · 오른쪽 검증 0/{len(right_paths)}",
+                    )
+                    right = _call_with_progress(
+                        calibrate_camera_from_images,
+                        right_paths,
+                        self.config,
+                        progress_callback=self._callback(index, "validation_right", "오른쪽 검증"),
+                    )
                     extrinsics = None
                     if self.mode == "checkerboard":
-                        extrinsics = calibrate_stereo_extrinsics_from_image_pairs(
+                        self._emit_progress(
+                            index,
+                            "validation_stereo",
+                            0,
+                            len(left_paths),
+                            f"run {index}/{self.runs} · stereo 검증 0/{len(left_paths)}",
+                        )
+                        extrinsics = _call_with_progress(
+                            calibrate_stereo_extrinsics_from_image_pairs,
                             left_paths,
                             right_paths,
                             self.config,
                             left,
                             right,
+                            progress_callback=self._callback(index, "validation_stereo", "stereo 검증"),
                         )
                     result = StereoIntrinsicsResult(
                         left=left,
@@ -282,6 +506,9 @@ class CheckerboardPreviewWorker(QtCore.QObject):
             "camera": str(payload.get("camera") or ""),
             "request_id": int(payload.get("request_id") or 0),
             "image": image,
+            "metadata": dict(payload.get("metadata") or {})
+            if isinstance(payload.get("metadata"), dict)
+            else {},
             "found": False,
             "corners": [],
             "status": "checkerboard: not found",

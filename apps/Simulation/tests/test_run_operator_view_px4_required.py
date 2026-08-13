@@ -186,7 +186,7 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         px4_binary.parent.mkdir(parents=True)
         px4_binary.write_text(
             "#!/usr/bin/env bash\n"
-            "printf '%s\\n' \"px4:$*:cwd=$PWD:model=${PX4_GZ_MODEL_NAME:-}:namespace=${PX4_UXRCE_DDS_NS:-}:ip=${GZ_IP:-}:port=${PX4_UXRCE_DDS_PORT:-}\" >> \"$PX4_TEST_MARKER\"\n"
+            "printf '%s\\n' \"px4:$*:cwd=$PWD:model=${PX4_GZ_MODEL_NAME:-}:namespace=${PX4_UXRCE_DDS_NS:-}:ip=${GZ_IP:-}:port=${PX4_UXRCE_DDS_PORT:-}:gps_used=${SIM_GPS_USED:-unset}\" >> \"$PX4_TEST_MARKER\"\n"
             "if [[ \"${PX4_TEST_PX4_FAIL_INSTANCE:-}\" == \"${3:-}\" ]]; then exit 17; fi\n"
             "/bin/sleep 1\n",
             encoding="utf-8",
@@ -386,7 +386,7 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         expected_cwd = str(px4_dir / "build" / "px4_sitl_default" / "src" / "modules" / "simulation" / "gz_bridge")
         self.assertTrue(all(f"cwd={expected_cwd}" in event for event in px4_events), px4_events)
         self.assertTrue(all("ip=127.0.0.1" in event for event in px4_events), px4_events)
-        self.assertTrue(any("px4:-d -i 0:" in event and "model=x500_15m" in event and "namespace=:" in event for event in px4_events), px4_events)
+        self.assertTrue(any("px4:-d -i 0:" in event and "model=x500_2m" in event and "namespace=:" in event for event in px4_events), px4_events)
         self.assertTrue(any("px4:-d -i 1:" in event and "model=left_stereo_camera" in event and "namespace=camera_left" in event for event in px4_events), px4_events)
         self.assertTrue(any("px4:-d -i 2:" in event and "model=right_stereo_camera" in event and "namespace=camera_right" in event for event in px4_events), px4_events)
         self.assertTrue(all("port=8888" in event for event in px4_events), px4_events)
@@ -415,6 +415,80 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         px4_events = [event for event in events if event.startswith("px4:")]
         self.assertEqual(len(px4_events), 3, events)
         self.assertTrue(all("port=9999" in event for event in px4_events), px4_events)
+
+    def test_default_sim_gps_used_reaches_every_camera_instance_but_not_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launcher, marker, env = self.make_isolated_launcher(root)
+            px4_dir = self.make_valid_px4_checkout(root)
+            env["PX4_TEST_MARKER"] = str(marker)
+            result = subprocess.run(
+                [str(launcher), "--px4-dir", str(px4_dir), "--headless", "--no-yolo"],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            events = marker.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        px4_events = [event for event in events if event.startswith("px4:")]
+        self.assertEqual(len(px4_events), 3, events)
+        # The target instance (-i 0) is not a camera Pixhawk and must keep
+        # whatever SIM_GPS_USED PX4 itself defaults to -- config/simulation.env
+        # only sets CAM_L/R_SIM_GPS_USED, so the target must see none exported.
+        self.assertTrue(
+            any("px4:-d -i 0:" in event and "gps_used=unset" in event for event in px4_events),
+            px4_events,
+        )
+        # config/simulation.env sets both camera defaults to 10.
+        self.assertTrue(
+            any("px4:-d -i 1:" in event and "gps_used=10" in event for event in px4_events),
+            px4_events,
+        )
+        self.assertTrue(
+            any("px4:-d -i 2:" in event and "gps_used=10" in event for event in px4_events),
+            px4_events,
+        )
+
+    def test_left_and_right_sim_gps_used_are_independently_overridable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            launcher, marker, env = self.make_isolated_launcher(root)
+            px4_dir = self.make_valid_px4_checkout(root)
+            env["PX4_TEST_MARKER"] = str(marker)
+            # Simulate a GPS dropout on the left camera only, matching the
+            # SIM_GPS_USED >= 4 fix/no-fix threshold in PX4's SITL GPS driver.
+            env["CAM_L_SIM_GPS_USED"] = "0"
+            env["CAM_R_SIM_GPS_USED"] = "12"
+            result = subprocess.run(
+                [str(launcher), "--px4-dir", str(px4_dir), "--headless", "--no-yolo"],
+                cwd=root,
+                env=env,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            events = marker.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        px4_events = [event for event in events if event.startswith("px4:")]
+        self.assertEqual(len(px4_events), 3, events)
+        self.assertTrue(
+            any("px4:-d -i 0:" in event and "gps_used=unset" in event for event in px4_events),
+            px4_events,
+        )
+        self.assertTrue(
+            any("px4:-d -i 1:" in event and "gps_used=0" in event for event in px4_events),
+            px4_events,
+        )
+        self.assertTrue(
+            any("px4:-d -i 2:" in event and "gps_used=12" in event for event in px4_events),
+            px4_events,
+        )
 
     def test_px4_supervisor_failure_stops_operator_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

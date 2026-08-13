@@ -270,31 +270,62 @@ class CameraPane(QtWidgets.QGroupBox):
     def _refresh_pixmap(self) -> None:
         if self.latest_image is None:
             return
-        pixmap = QtGui.QPixmap.fromImage(self.latest_image)
-        scaled = pixmap.scaled(self.image_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        target_size = self.image_label.size()
+        source_pixmap = QtGui.QPixmap.fromImage(self.latest_image)
+        scaled = source_pixmap.scaled(
+            target_size, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation
+        )
+        crop_x = max(0, (scaled.width() - target_size.width()) // 2)
+        crop_y = max(0, (scaled.height() - target_size.height()) // 2)
+        display_pixmap = scaled.copy(crop_x, crop_y, target_size.width(), target_size.height())
         if self.latest_detection is not None and not self.measurement_pair_display_active:
-            scaled = self._draw_detection_overlay(scaled, self.latest_detection)
-        self.image_label.setPixmap(scaled)
+            display_pixmap = self._draw_detection_overlay(
+                display_pixmap,
+                self.latest_detection,
+                scale_x=scaled.width() / source_pixmap.width(),
+                scale_y=scaled.height() / source_pixmap.height(),
+                crop_x=crop_x,
+                crop_y=crop_y,
+            )
+        self.image_label.setPixmap(display_pixmap)
 
     def _draw_detection_overlay(
-        self, pixmap: QtGui.QPixmap, detection: DetectionObservation
+        self,
+        pixmap: QtGui.QPixmap,
+        detection: DetectionObservation,
+        *,
+        scale_x: float | None = None,
+        scale_y: float | None = None,
+        crop_x: int = 0,
+        crop_y: int = 0,
     ) -> QtGui.QPixmap:
         if detection.width <= 0 or detection.height <= 0:
             return pixmap
-        scale_x = pixmap.width() / detection.width
-        scale_y = pixmap.height() / detection.height
+        if scale_x is None:
+            scale_x = pixmap.width() / detection.width
+        if scale_y is None:
+            scale_y = pixmap.height() / detection.height
         painter = QtGui.QPainter(pixmap)
         try:
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
             color = QtGui.QColor(ACCENT)
             rect = QtCore.QRectF(
-                detection.x1 * scale_x,
-                detection.y1 * scale_y,
+                detection.x1 * scale_x - crop_x,
+                detection.y1 * scale_y - crop_y,
                 (detection.x2 - detection.x1) * scale_x,
                 (detection.y2 - detection.y1) * scale_y,
             )
             painter.setPen(QtGui.QPen(color, 2))
             painter.drawRect(rect)
+            center_x, center_y = detection.center
+            center = QtCore.QPointF(
+                center_x * scale_x - crop_x,
+                center_y * scale_y - crop_y,
+            )
+            marker_radius = max(3.0, min(6.0, min(pixmap.width(), pixmap.height()) * 0.012))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(color, 2))
+            painter.drawEllipse(center, marker_radius, marker_radius)
             label = detection.class_name or f"#{detection.class_id}"
             painter.drawText(
                 QtCore.QPointF(rect.left(), max(10.0, rect.top() - 4.0)),

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -54,6 +55,79 @@ def test_ui_mode_parser_removes_workstation_argument() -> None:
     assert _parse_ui_mode(["main.py"])[0] == "legacy"
 
 
+def test_calibration_setup_settings_round_trip(tmp_path: Path) -> None:
+    from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
+
+    expected = AppSettings(
+        calibration_zoom_level=24,
+        calibration_inner_cols=9,
+        calibration_inner_rows=6,
+        calibration_square_size_mm=25.0,
+        calibration_min_images=30,
+        calibration_calculation_pair_count=18,
+        calibration_auto_interval_s=2.5,
+        calibration_auto_target_pairs=42,
+        calibration_root="captures/board-a",
+        calibration_validation_mode="checkerboard",
+        calibration_validation_root="validation/board-a",
+        calibration_validation_json="profiles/intrinsics.json",
+        calibration_validation_runs=5,
+        calibration_validation_pair_count=12,
+        calibration_validation_seed=1234,
+    )
+    path = tmp_path / "settings.json"
+
+    save_settings(expected, path)
+    loaded = load_settings(path)
+
+    assert loaded.calibration_zoom_level == 24
+    assert loaded.calibration_inner_cols == 9
+    assert loaded.calibration_inner_rows == 6
+    assert loaded.calibration_square_size_mm == pytest.approx(25.0)
+    assert loaded.calibration_min_images == 30
+    assert loaded.calibration_calculation_pair_count == 18
+    assert loaded.calibration_auto_interval_s == pytest.approx(2.5)
+    assert loaded.calibration_auto_target_pairs == 42
+    assert loaded.calibration_root == "captures/board-a"
+    assert loaded.calibration_validation_mode == "checkerboard"
+    assert loaded.calibration_validation_root == "validation/board-a"
+    assert loaded.calibration_validation_json == "profiles/intrinsics.json"
+    assert loaded.calibration_validation_runs == 5
+    assert loaded.calibration_validation_pair_count == 12
+    assert loaded.calibration_validation_seed == 1234
+
+
+def test_rtp_timing_tracker_matches_depay_output_by_pts_and_discards_merged_markers() -> None:
+    from Workstation.workstation_core.yolo_stream import GstRtpTimingTracker, RtpFrameTiming
+
+    tracker = GstRtpTimingTracker(SimpleNamespace(), SimpleNamespace())
+
+    def timing(pts_s: float, sequence: int) -> RtpFrameTiming:
+        return RtpFrameTiming(
+            rtp_timestamp=90_000 + sequence * 4_500,
+            rtp_ssrc=1234,
+            rtp_marker_seq=sequence,
+            rtp_pts_s=pts_s,
+        )
+
+    with tracker._lock:
+        tracker._pending_rtp_frames.extend(
+            (timing(1.00, 10), timing(1.05, 11), timing(1.10, 12))
+        )
+        matched = tracker._pop_pending_rtp_timing_locked(1_050_000_000)
+
+    assert matched is not None
+    assert matched.rtp_marker_seq == 11
+    assert [row.rtp_marker_seq for row in tracker._pending_rtp_frames] == [12]
+
+    with tracker._lock:
+        matched = tracker._pop_pending_rtp_timing_locked(1_100_000_000)
+
+    assert matched is not None
+    assert matched.rtp_marker_seq == 12
+    assert not tracker._pending_rtp_frames
+
+
 def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
     from Workstation.camera_time_sync_controller import CameraTimeSyncController
 
@@ -67,10 +141,6 @@ def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
     panel = SimpleNamespace(
         camera_connected=True,
         camera_frame_metadata_history={},
-        _camera_sync_gdti={
-            "left": {"unix_s": 1_800_000_000.01},
-            "right": {"unix_s": 1_800_000_000.02},
-        },
         _camera_name_ko=lambda camera: camera,
         _camera_sync_required_sr_count=lambda: 2,
         _camera_sync_max_sr_age_s=lambda: 7.0,
@@ -90,6 +160,52 @@ def test_workstation_camera_sync_readiness_uses_imported_finite_check() -> None:
 
     assert ready is True
     assert "검증 완료" in reason
+
+
+def test_stus_reconnects_only_local_stream_for_fresh_sender_reports() -> None:
+    from Workstation.camera_time_sync_controller import (
+        CAMERA_SYNC_STATUS_RECONNECTING,
+        CameraTimeSyncController,
+    )
+
+    class Timer:
+        def __init__(self) -> None:
+            self.started = 0
+
+        def start(self) -> None:
+            self.started += 1
+
+    states: list[tuple[str, str]] = []
+    stream_starts: list[object] = []
+    timer = Timer()
+    panel = SimpleNamespace(
+        camera_connected=True,
+        camera_frame_metadata={
+            "left": {"rtcp_sr_received_count": 4},
+            "right": {"rtcp_sr_received_count": 7},
+        },
+        _camera_sync_stus_sr_baseline={},
+        _camera_sync_deadline_monotonic_s=None,
+        _camera_sync_transport_override="tcp",
+        _camera_sync_timer=timer,
+        yolo_enabled=True,
+        _session_recording_active=lambda: False,
+        _camera_sync_warmup_timeout_s=lambda: 30.0,
+        _start_camera_streams=lambda **kwargs: stream_starts.append(kwargs),
+        _set_camera_sync_state=lambda status, reason: states.append((status, reason)),
+    )
+
+    CameraTimeSyncController(panel)._begin_camera_sync_after_stus(
+        target="both",
+        result="success",
+    )
+
+    assert stream_starts == [{"enable_detection": True, "switch_to_depth": True}]
+    assert panel._camera_sync_stus_sr_baseline == {"left": 0, "right": 0}
+    assert panel._camera_sync_transport_override is None
+    assert timer.started == 1
+    assert states[-1][0] == CAMERA_SYNC_STATUS_RECONNECTING
+    assert "Ethernet Mode는 유지" in states[-1][1]
 
 
 def test_gui_compatibility_module_aliases_legacy_implementation() -> None:
@@ -148,8 +264,10 @@ def test_workstation_launcher_bypasses_stereowiris_runtime() -> None:
     assert "StereoWIRIS" not in launcher
     assert "Simulation" not in launcher
     assert "-m Workstation" in launcher
+    assert "--start" in launcher
     assert "--ui" not in launcher
     assert "WorkstationMainWindow" in entrypoint
+    assert "--no-start" in entrypoint
     assert "legacy" not in entrypoint.lower()
     assert "PyQt5" in runtime_requirements
     assert "PyQt6" not in runtime_requirements
@@ -159,6 +277,139 @@ def test_workstation_launcher_bypasses_stereowiris_runtime() -> None:
         standalone_gui._parse_ui_mode(["workstation", "--ui", "legacy"])
     assert not hasattr(standalone_gui, "WirisStereoDistanceGui")
     assert not hasattr(standalone_gui, "IntegratedWirisPixhawkConsole")
+
+
+def test_workstation_entrypoint_starts_cameras_by_default_and_supports_no_start() -> None:
+    from Workstation.__main__ import _parser
+
+    assert _parser().parse_args([]).start is True
+    assert _parser().parse_args(["--no-start"]).start is False
+    assert _parser().parse_args(["--start"]).start is True
+
+
+def test_workstation_single_instance_lock_blocks_duplicate(tmp_path: Path) -> None:
+    from Workstation.__main__ import _acquire_single_instance_lock
+
+    lock_path = tmp_path / "workstation.lock"
+    first = _acquire_single_instance_lock(lock_path)
+    assert first is not None
+    try:
+        assert _acquire_single_instance_lock(lock_path) is None
+    finally:
+        first.unlock()
+
+
+def test_workstation_camera_defaults_match_legacy_receive_profile() -> None:
+    from Workstation.workstation_core.settings import AppSettings
+
+    settings = AppSettings()
+
+    assert settings.preview_width == 1280
+    assert settings.rtsp_latency_ms == 100
+    assert settings.rtsp_decoder == "auto"
+    assert settings.stream_backend == "gstreamer"
+    assert settings.rtsp_transport == "udp"
+
+
+def test_gstreamer_rtsp_worker_retries_transient_sdp_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from Workstation.workstation_core import yolo_stream
+
+    attempts: list[int] = []
+    messages: list[object] = []
+
+    class OutputQueue:
+        def put(self, message: object) -> None:
+            messages.append(message)
+
+    def fake_run_once(*_args: object) -> bool:
+        attempts.append(len(attempts) + 1)
+        return len(attempts) >= 2
+
+    monkeypatch.setattr(yolo_stream, "_run_gstreamer_stream_once", fake_run_once)
+    monkeypatch.setattr(yolo_stream, "GST_RTSP_RECONNECT_DELAYS_S", (0.001,))
+
+    yolo_stream._run_gstreamer_stream(
+        {},
+        OutputQueue(),
+        threading.Event(),
+        None,
+        None,
+        False,
+    )
+
+    assert attempts == [1, 2]
+    assert any("RTSP 재연결 대기" in str(message[1]) for message in messages if isinstance(message, tuple))
+
+
+@pytest.mark.parametrize("full_control_scan", (True, False))
+def test_camera_auto_detect_result_records_full_control_scan_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    full_control_scan: bool,
+) -> None:
+    from Workstation import standalone_gui
+
+    emitted: list[dict[str, object]] = []
+    monkeypatch.setattr(standalone_gui, "discover_host_interface_candidates", lambda: [])
+    worker = standalone_gui.CameraAutoDetectWorker(
+        mode="auto_connect",
+        full_control_scan=full_control_scan,
+    )
+    worker._discover_wiris_control = lambda _reports: ([], [])
+    worker.detected.connect(emitted.append)
+
+    worker.run()
+
+    assert emitted and emitted[0]["full_control_scan"] is full_control_scan
+
+
+def test_auto_start_uses_wiris_activation_sequence_before_stream_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    initial_status = standalone_gui.WirisStereoDistancePanel._initial_status
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.auto_start = True
+    monkeypatch.setattr(panel, "_start_interface_status_worker", lambda: None)
+    monkeypatch.setattr(panel, "_recover_retryable_recording_session", lambda: None)
+    startup_calls: list[str] = []
+    monkeypatch.setattr(panel, "_start_startup_camera_sequence", lambda: startup_calls.append("auto-connect"))
+
+    initial_status(panel)
+
+    assert startup_calls == ["auto-connect"]
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
+
+
+@pytest.mark.parametrize(
+    ("startup_sequence", "expected_call"),
+    ((True, "start_yolo"), (False, "connect_cameras")),
+)
+def test_auto_wiris_completion_preserves_manual_preview_mode(
+    startup_sequence: bool,
+    expected_call: str,
+) -> None:
+    from Workstation import standalone_gui
+
+    calls: list[str] = []
+    panel = SimpleNamespace(
+        _startup_camera_sequence_pending=startup_sequence,
+        _cancel_auto_wiris_connect_retry=lambda: calls.append("cancel"),
+        _log=lambda _message: None,
+        start_yolo=lambda: calls.append("start_yolo"),
+        connect_cameras=lambda: calls.append("connect_cameras"),
+    )
+
+    standalone_gui.WirisStereoDistancePanel._finish_auto_wiris_connect(panel)
+
+    assert calls == ["cancel", expected_call]
 
 
 def test_workstation_core_has_no_legacy_ros_or_image_timesync_surface() -> None:
@@ -769,6 +1020,9 @@ class _FakeBackend:
     def camera_enable_rtsp(self) -> None:
         self.calls.append("camera_enable_rtsp")
 
+    def camera_reactivate(self, camera: str) -> None:
+        self.calls.append(("camera_reactivate", camera))
+
     def camera_swap(self) -> None:
         self.calls.append("camera_swap")
 
@@ -783,6 +1037,9 @@ class _FakeBackend:
 
     def pixhawk_toggle_mavlink(self) -> None:
         self.calls.append("pixhawk_toggle_mavlink")
+
+    def pixhawk_reset_level_calibration(self) -> None:
+        self.calls.append("pixhawk_reset_level_calibration")
 
     def pixhawk_recover_eth_mavlink(self, camera: str) -> None:
         self.calls.append(("pixhawk_recover_eth_mavlink", camera))
@@ -826,20 +1083,35 @@ class _FakeBackend:
     def calibration_capture_images(self) -> None:
         self.calls.append("calibration_capture_images")
 
+    def calibration_toggle_auto_capture(self) -> None:
+        self.calls.append("calibration_toggle_auto_capture")
+
     def calibration_run_intrinsic(self) -> None:
         self.calls.append("calibration_run_intrinsic")
+
+    def calibration_run_extrinsics(self) -> None:
+        self.calls.append("calibration_run_extrinsics")
 
     def calibration_save_intrinsics(self) -> None:
         self.calls.append("calibration_save_intrinsics")
 
+    def calibration_save_extrinsics(self) -> None:
+        self.calls.append("calibration_save_extrinsics")
+
     def calibration_load_intrinsics(self) -> None:
         self.calls.append("calibration_load_intrinsics")
+
+    def calibration_load_extrinsics(self) -> None:
+        self.calls.append("calibration_load_extrinsics")
 
     def calibration_load_current_zoom_intrinsics(self) -> None:
         self.calls.append("calibration_load_current_zoom_intrinsics")
 
     def calibration_apply_intrinsics(self) -> None:
         self.calls.append("calibration_apply_intrinsics")
+
+    def calibration_apply_bundle(self) -> None:
+        self.calls.append("calibration_apply_bundle")
 
     def calibration_load_validation(self) -> None:
         self.calls.append("calibration_load_validation")
@@ -899,6 +1171,12 @@ class _FakeBackend:
 
     def alignment_swap_pixhawks(self) -> None:
         self.calls.append("alignment_swap_pixhawks")
+
+    def start_lrf_polling(self) -> None:
+        self.calls.append("start_lrf_polling")
+
+    def stop_lrf_polling(self) -> None:
+        self.calls.append("stop_lrf_polling")
 
     def advanced_wiris_catalog(self) -> tuple[dict[str, str], ...]:
         return (
@@ -1012,13 +1290,14 @@ def test_workstation_shell_navigation_and_close() -> None:
     window.navigation.select_context("devices.time")
     app.processEvents()
     assert window.workspace_host.currentWidget().widget() is window.time_workspace
-    assert window.time_workspace.sync_summary.height() == 143
+    assert window.time_workspace.sync_summary.height() == 200
     assert window.commands.invoke("time.check_sync") is True
     assert backend.calls[-1] == "time_check_sync"
 
     window.navigation.select_context("processing.measurement")
     app.processEvents()
     assert window.workspace_host.currentWidget().widget() is window.measurement
+    assert not window.measurement.findChildren(QtWidgets.QLabel, "measurementResultStatus")
     assert any(
         "baseline_center_frd" in label.text()
         for label in window.measurement.findChildren(QtWidgets.QLabel)
@@ -1471,6 +1750,38 @@ def test_inspector_changes_by_context_and_selected_evidence() -> None:
     app.processEvents()
 
 
+def test_pixhawk_level_reset_only_targets_level_horizon_offsets(monkeypatch: pytest.MonkeyPatch) -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    shell_calls: list[tuple[str, str, dict[str, object]]] = []
+    logs: list[str] = []
+    panel = SimpleNamespace(
+        _session_recording_active=lambda: False,
+        _mavlink_open_sides=lambda: ("left", "right"),
+        px4_mag_managers={"left": SimpleNamespace(armed=False), "right": SimpleNamespace(armed=False)},
+        _px4_mag_camera_label=lambda side: "P1" if side == "left" else "P2",
+        _log=logs.append,
+        _start_pixhawk_shell_worker=lambda camera, command, **kwargs: shell_calls.append(
+            (camera, command, kwargs)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QtWidgets.QMessageBox.Yes,
+    )
+
+    assert DeviceRuntimeController(panel).reset_px4_level_calibration() is True
+    assert [camera for camera, _command, _kwargs in shell_calls] == ["left", "right"]
+    assert all(
+        command == "param reset SENS_BOARD_X_OFF SENS_BOARD_Y_OFF SENS_BOARD_Z_OFF"
+        for _camera, command, _kwargs in shell_calls
+    )
+    assert all(kwargs["operation"] == "reset_level_calibration" for _camera, _command, kwargs in shell_calls)
+    assert "SENS_BOARD_ROT" not in shell_calls[0][1]
+    assert any("PARAM readback" in message for message in logs)
+
+
 def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
@@ -1487,7 +1798,10 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     assert not window.commands.action("time.set_pc").isEnabled()
     assert not window.commands.action("camera.swap").isEnabled()
     assert not window.commands.action("camera.auto_connect").isEnabled()
+    assert not window.commands.action("camera.reactivate_left").isEnabled()
+    assert not window.commands.action("camera.reactivate_right").isEnabled()
     assert not window.commands.action("alignment.swap_pixhawks").isEnabled()
+    assert not window.commands.action("pixhawk.reset_level_calibration").isEnabled()
     assert not window.commands.action("pixhawk.toggle_mavlink").isEnabled()
     assert window.commands.action("detection.toggle").isEnabled()
     assert not window.commands.action("session.save").isEnabled()
@@ -1496,11 +1810,17 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     assert not window.measurement.control_buttons["session.save"].isEnabled()
     assert not window.time_workspace.operation_buttons["time.set_pc"].isEnabled()
     assert not window.camera.operation_buttons["camera.swap"].isEnabled()
+    assert not window.camera.operation_buttons["camera.reactivate_left"].isEnabled()
+    assert not window.camera.operation_buttons["camera.reactivate_right"].isEnabled()
     assert not window.alignment.operation_buttons["alignment.swap_pixhawks"].isEnabled()
+    assert not window.alignment.operation_buttons["pixhawk.reset_level_calibration"].isEnabled()
     calls_before_disabled_invoke = list(backend.calls)
     assert window.commands.invoke("camera.swap") is False
     assert window.commands.invoke("camera.auto_connect") is False
+    assert window.commands.invoke("camera.reactivate_left") is False
+    assert window.commands.invoke("camera.reactivate_right") is False
     assert window.commands.invoke("alignment.swap_pixhawks") is False
+    assert window.commands.invoke("pixhawk.reset_level_calibration") is False
     assert window.commands.invoke("pixhawk.toggle_mavlink") is False
     assert backend.calls == calls_before_disabled_invoke
 
@@ -1520,12 +1840,12 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     assert window.commands.action("session.save").isEnabled()
     assert window.measurement.control_buttons["session.save"].isEnabled()
 
-    backend.panel.wiris_gdti_thread = object()
+    backend.panel.wiris_time_sync_thread = object()
     window._refresh_from_status(window.status_adapter.model.snapshot())
     app.processEvents()
     assert not window.commands.action("recording.toggle").isEnabled()
     assert not window.measurement.control_buttons["recording.toggle"].isEnabled()
-    backend.panel.wiris_gdti_thread = None
+    backend.panel.wiris_time_sync_thread = None
 
     window.close()
     app.processEvents()
@@ -1591,11 +1911,16 @@ def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
     assert panel.auto_wiris_connect_pending is False
     panel._camera_candidate_rows = [{"kind": "RTSP", "address": "rtsp://candidate", "host": "10.0.0.50"}]
     assert panel.apply_camera_candidate(0, "left") is False
+    panel.distance_recording_enabled = False
     panel.auto_wiris_connect_pending = True
     original_left_url = panel.left_url_edit.text()
+    retry_reasons: list[str] = []
+    monkeypatch.setattr(panel, "_schedule_auto_wiris_connect_retry", retry_reasons.append)
     panel._apply_camera_detection({"mode": "auto_connect", "rtsp": [], "control": [], "verified_control": []})
-    assert panel.auto_wiris_connect_pending is False
+    assert panel.auto_wiris_connect_pending is True
+    assert retry_reasons == ["WIRIS 제어 포트가 아직 열리지 않음"]
     assert panel.left_url_edit.text() == original_left_url
+    panel.distance_recording_enabled = True
     panel._pixhawk_candidate_rows_by_source["mavlink"] = [
         {"kind": "MAVLink", "value": "udpin:0.0.0.0:14550"}
     ]
@@ -1607,15 +1932,13 @@ def test_recording_owner_rejects_camera_swap_and_clock_reconnect(
         "_start_camera_streams",
         lambda *, enable_detection, switch_to_depth: starts.append((enable_detection, switch_to_depth)),
     )
-    panel._apply_wiris_gdti_result({})
+    panel.camera_connected = True
+    panel._begin_camera_sync_after_stus(target="both", result="success")
     assert starts == []
     assert panel.camera_sync_status == standalone_gui.CAMERA_SYNC_STATUS_NOT_VERIFIED
+    panel.camera_connected = False
 
     panel.distance_recording_enabled = False
-    panel.wiris_gdti_thread = object()
-    assert panel._start_session_recording() is False
-    assert panel.recording_session_id == ""
-    panel.wiris_gdti_thread = None
 
     panel.pixhawk_connection_thread = object()
     assert panel._start_session_recording() is False
@@ -1673,6 +1996,8 @@ def test_workstation_exposes_device_discovery_and_routes_tools_to_advanced() -> 
 
     assert window.camera.operation_buttons["camera.toggle"].text() == "Preview"
     assert window.camera.operation_buttons["camera.auto_connect"].text() == "Connect cameras"
+    assert window.camera.operation_buttons["camera.reactivate_left"].text() == "Reactivate CAM L"
+    assert window.camera.operation_buttons["camera.reactivate_right"].text() == "Reactivate CAM R"
     assert window.camera.operation_buttons["advanced.open"].text() == "Advanced"
     assert window.camera.preview_splitter.minimumHeight() == 320
     assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Vertical
@@ -1720,16 +2045,20 @@ def test_measurement_workspace_overlays_bbox_on_connected_preview() -> None:
         detection_changed = QtCore.pyqtSignal(str, object)
         stats_changed = QtCore.pyqtSignal(str, object)
 
+    class FakePanel(QtCore.QObject):
+        camera_preview_cleared = QtCore.pyqtSignal()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.left_pane = FakePane()
+            self.right_pane = FakePane()
+            self.settings = SimpleNamespace()
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    left_pane = FakePane()
-    right_pane = FakePane()
-    backend = SimpleNamespace(
-        panel=SimpleNamespace(
-            left_pane=left_pane,
-            right_pane=right_pane,
-            settings=SimpleNamespace(),
-        )
-    )
+    panel = FakePanel()
+    left_pane = panel.left_pane
+    right_pane = panel.right_pane
+    backend = SimpleNamespace(panel=panel)
     workspace = MeasurementWorkspace(backend, StatusModel())
     preview = workspace.previews["left"]
     preview.resize(400, 300)
@@ -1764,9 +2093,163 @@ def test_measurement_workspace_overlays_bbox_on_connected_preview() -> None:
     app.processEvents()
     assert preview.image.pixmap().toImage().copy() == without_box
 
+    panel.camera_preview_cleared.emit()
+    app.processEvents()
+    assert preview._image is None
+    assert preview.image.pixmap().isNull()
+    assert preview.meta.text() == "WAITING | Class: --"
+
     workspace.deleteLater()
     left_pane.deleteLater()
     right_pane.deleteLater()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_calibration_workspace_shows_live_camera_previews_with_actions_below() -> None:
+    from PyQt5 import QtGui
+
+    from Workstation.status_model import StatusModel
+    from Workstation.workspaces import CalibrationWorkspace, CameraPreviewPair
+    from Workstation.workstation_core.stereo import DetectionObservation
+
+    class FakePane(QtCore.QObject):
+        frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
+        detection_changed = QtCore.pyqtSignal(str, object)
+        stats_changed = QtCore.pyqtSignal(str, object)
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    left_pane = FakePane()
+    right_pane = FakePane()
+    backend = SimpleNamespace(
+        panel=SimpleNamespace(left_pane=left_pane, right_pane=right_pane)
+    )
+    workspace = CalibrationWorkspace(
+        backend,
+        lambda: None,
+        lambda _command_id: True,
+    )
+    workspace.resize(1000, 700)
+    workspace.show()
+    app.processEvents()
+
+    assert set(workspace.previews) == {"left", "right"}
+    assert isinstance(workspace.preview_splitter, CameraPreviewPair)
+    assert workspace.preview_splitter.hasHeightForWidth()
+    preview_pair_size = workspace.preview_splitter.size()
+    app.processEvents()
+    app.processEvents()
+    assert workspace.preview_splitter.size() == preview_pair_size
+    camera_container = workspace.preview_splitter.parentWidget()
+    assert workspace.operation_tabs.parentWidget() is camera_container
+    assert camera_container is not None
+    camera_layout = camera_container.layout()
+    assert camera_layout is not None
+    assert camera_layout.indexOf(workspace.operation_tabs) > camera_layout.indexOf(workspace.preview_splitter)
+    assert set(workspace.camera_buttons) == {"camera.toggle", "detection.toggle"}
+    assert "calibration.capture_images" in workspace.operation_buttons
+
+    image = QtGui.QImage(640, 360, QtGui.QImage.Format_RGB888)
+    image.fill(QtGui.QColor("black"))
+    preview = workspace.previews["left"]
+    preview.resize(400, 300)
+    left_pane.frame_changed.emit("left", image, {"timestamp_s": 1.0})
+    right_pane.frame_changed.emit("right", image, {"timestamp_s": 1.0})
+    app.processEvents()
+
+    assert workspace.previews["left"].meta.text().startswith("LIVE | Class: --")
+    assert workspace.previews["right"].meta.text().startswith("LIVE | Class: --")
+    assert preview.image.pixmap().size() == preview.image.size()
+    without_box = preview.image.pixmap().toImage().copy()
+
+    detection = DetectionObservation(
+        camera="left",
+        timestamp_s=1.0,
+        width=640,
+        height=360,
+        x1=100.0,
+        y1=80.0,
+        x2=300.0,
+        y2=260.0,
+        confidence=0.9,
+        class_id=0,
+        class_name="person",
+    )
+    left_pane.detection_changed.emit("left", detection)
+    app.processEvents()
+    assert workspace.previews["left"]._detection is detection
+    assert preview.image.pixmap().toImage().copy() != without_box
+    assert "Class: person" in preview.meta.text()
+    assert "receive=" not in preview.meta.text()
+    assert "camera_ts=" not in preview.meta.text()
+
+    marker_pixmap = QtGui.QPixmap(640, 360)
+    marker_pixmap.fill(QtGui.QColor("black"))
+    marker_pixmap = preview._draw_detection_overlay(marker_pixmap, detection)
+    center_x, center_y = (round(value) for value in detection.center)
+    center_ring_color = marker_pixmap.toImage().pixelColor(center_x + 4, center_y)
+    assert center_ring_color.red() > center_ring_color.green()
+    assert center_ring_color.red() > center_ring_color.blue()
+
+    workspace.deleteLater()
+    left_pane.deleteLater()
+    right_pane.deleteLater()
+    app.processEvents()
+
+
+def test_calibration_workspace_keeps_checkerboard_overlay_over_live_frame() -> None:
+    from PyQt5 import QtGui
+
+    from Workstation.workspaces import CalibrationWorkspace
+
+    class FakePane(QtCore.QObject):
+        frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
+        stats_changed = QtCore.pyqtSignal(str, object)
+
+    class FakePanel(QtCore.QObject):
+        calibration_preview_changed = QtCore.pyqtSignal(object)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.left_pane = FakePane()
+            self.right_pane = FakePane()
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = FakePanel()
+    workspace = CalibrationWorkspace(SimpleNamespace(panel=panel), lambda: None)
+    workspace.show()
+    app.processEvents()
+
+    raw = QtGui.QImage(640, 360, QtGui.QImage.Format_RGB888)
+    raw.fill(QtGui.QColor("black"))
+    panel.left_pane.frame_changed.emit("left", raw, {"timestamp_s": 1.0})
+    app.processEvents()
+
+    overlay = QtGui.QImage(640, 360, QtGui.QImage.Format_RGB888)
+    overlay.fill(QtGui.QColor("green"))
+    panel.calibration_preview_changed.emit(
+        {
+            "camera": "left",
+            "image": overlay,
+            "kind": "overlay",
+            "metadata": {"timestamp_s": 1.0},
+        }
+    )
+    app.processEvents()
+
+    assert workspace._checkerboard_overlay_active["left"] is True
+    assert workspace.previews["left"]._image is not None
+    assert workspace.previews["left"]._image.pixelColor(0, 0) == QtGui.QColor("green")
+
+    raw.fill(QtGui.QColor("black"))
+    panel.left_pane.frame_changed.emit("left", raw, {"timestamp_s": 2.0})
+    app.processEvents()
+    assert workspace.previews["left"]._image.pixelColor(0, 0) == QtGui.QColor("green")
+
+    workspace.deleteLater()
+    panel.left_pane.deleteLater()
+    panel.right_pane.deleteLater()
+    panel.deleteLater()
     app.processEvents()
 
 
@@ -1921,6 +2404,210 @@ def test_wiris_command_and_zoom_workers_keep_tcp_io_off_ui_path(monkeypatch) -> 
     assert zoom_results == [[{"label": "right", "state": "sent", "command": "SZIN", "response": "OK"}]]
 
 
+def test_wiris_rtsp_reactivation_worker_cycles_only_selected_camera(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    sent: list[tuple[str, str]] = []
+
+    def fake_send(command) -> str:
+        sent.append((command.host, command.command))
+        return "TRUE" if command.command == "GETH" else "OK"
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    monkeypatch.setattr(wiris_runtime_workers, "check_tcp_port", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(wiris_runtime_workers, "RTSP_ENABLE_SETTLE_DELAY_MS", 0)
+
+    results: list[object] = []
+    worker = wiris_runtime_workers.WirisRtspEnableWorker(
+        hosts={"left": "10.0.0.11", "right": "10.0.0.12"},
+        candidate_ports={"left": [2240], "right": [2240]},
+        urls={
+            "left": "rtsp://10.0.0.11:8554/visible",
+            "right": "rtsp://10.0.0.12:8554/visible",
+        },
+        timeout_s=1.0,
+        target_labels=("left",),
+        reactivate=True,
+    )
+    worker.enabled.connect(results.append)
+    worker.run()
+
+    assert sent == [
+        ("10.0.0.11", "GETH"),
+        ("10.0.0.11", "SETH TRUE"),
+    ]
+    assert results[0]["mode"] == "reactivate"
+    assert results[0]["target_labels"] == ("left",)
+    assert results[0]["statuses"] == ["left=reactivated-sent"]
+    assert results[0]["should_check"] is True
+    assert "SETH FALSE는 전송하지 않음" in "\n".join(results[0]["logs"])
+
+
+def test_auto_connect_does_not_repeat_seth_after_rtsp_frame_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.auto_wiris_connect_pending = True
+    enabled: list[tuple[str, ...]] = []
+    checks: list[str] = []
+    retries: list[str] = []
+    monkeypatch.setattr(panel, "enable_wiris_rtsp", lambda *, target_labels: enabled.append(target_labels))
+    monkeypatch.setattr(panel, "check_cameras", lambda: checks.append("check"))
+    monkeypatch.setattr(panel, "_schedule_auto_wiris_connect_retry", retries.append)
+
+    candidate = {"host": "10.0.0.11", "port": 2250, "ok": True, "response": "OK"}
+    panel._apply_auto_wiris_connect_candidates([candidate], [], full_control_scan=False)
+    assert enabled == [("left",)]
+    assert checks == []
+
+    panel._apply_wiris_rtsp_enable_result(
+        {
+            "mode": "enable",
+            "statuses": ["left=enable-sent"],
+            "corrected_ports": {"left": 2240},
+            "should_check": False,
+        }
+    )
+    assert retries == ["RTSP 활성화에 성공한 카메라가 없음"]
+
+    panel._apply_auto_wiris_connect_candidates([candidate], [], full_control_scan=False)
+    assert enabled == [("left",)]
+    assert checks == ["check"]
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    app.processEvents()
+    panel.deleteLater()
+    app.processEvents()
+
+
+def test_wiris_lrf_worker_parses_meter_responses_and_reports_errors(monkeypatch) -> None:
+    from Workstation import wiris_runtime_workers
+
+    responses = {"10.0.0.11": "OK 20.4", "10.0.0.12": "ERR"}
+
+    def fake_send(command) -> str:
+        return responses[command.host]
+
+    monkeypatch.setattr(wiris_runtime_workers, "send_tcp_line", fake_send)
+    worker = wiris_runtime_workers.WirisLrfPollWorker(
+        (
+            ("left", "10.0.0.11", 2240, 1.0),
+            ("right", "10.0.0.12", 2240, 1.0),
+        )
+    )
+
+    samples = {row["side"]: row for row in worker.poll_once()}
+
+    assert samples["left"]["distance_m"] == pytest.approx(20.4)
+    assert samples["left"]["error"] == ""
+    assert samples["right"]["distance_m"] is None
+    assert samples["right"]["error"] == "ERR"
+
+
+def test_wiris_lrf_poll_rate_is_limited_to_one_hz() -> None:
+    from Workstation import wiris_runtime_workers
+
+    assert wiris_runtime_workers.WIRIS_LRF_POLL_HZ == pytest.approx(1.0)
+    assert wiris_runtime_workers.WIRIS_LRF_POLL_PERIOD_S == pytest.approx(1.0)
+
+
+def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
+    from Workstation.workstation_core import wiris_zoom
+
+    first_connection_entered = threading.Event()
+    release_first_connection = threading.Event()
+    connection_count = 0
+    count_lock = threading.Lock()
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def settimeout(self, _timeout: float) -> None:
+            return None
+
+        def sendall(self, _payload: bytes) -> None:
+            return None
+
+        def recv(self, _size: int) -> bytes:
+            return b"OK"
+
+    def fake_create_connection(_endpoint, *, timeout):
+        nonlocal connection_count
+        with count_lock:
+            connection_count += 1
+            current = connection_count
+        if current == 1:
+            first_connection_entered.set()
+            assert release_first_connection.wait(1.0)
+        return FakeSocket()
+
+    monkeypatch.setattr(wiris_zoom.socket, "create_connection", fake_create_connection)
+    command = wiris_zoom.build_wiris_command(
+        host="10.0.0.231",
+        port=2240,
+        command="HIWS",
+    )
+    responses: list[str] = []
+    first = threading.Thread(target=lambda: responses.append(wiris_zoom.send_tcp_line(command)))
+    second = threading.Thread(target=lambda: responses.append(wiris_zoom.send_tcp_line(command)))
+    first.start()
+    assert first_connection_entered.wait(1.0)
+    second.start()
+    time.sleep(0.05)
+    assert connection_count == 1
+    release_first_connection.set()
+    first.join(1.0)
+    second.join(1.0)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert connection_count == 2
+    assert responses == ["OK", "OK"]
+
+
+def test_status_adapter_projects_lrf_live_stale_and_error_states() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    now = time.monotonic()
+    backend.panel.latest_wiris_lrf = {
+        "left": {
+            "distance_m": 20.4,
+            "last_good_s": now,
+            "last_attempt_s": now,
+            "response": "20.4",
+            "last_error": "",
+        },
+        "right": {
+            "distance_m": 18.2,
+            "last_good_s": now - 2.0,
+            "last_attempt_s": now,
+            "response": "ERR",
+            "last_error": "ERR",
+        },
+    }
+    adapter = BackendStatusAdapter(backend)
+
+    adapter.refresh()
+
+    left = adapter.model.record("lrf.left")
+    right = adapter.model.record("lrf.right")
+    assert left is not None and left.state == "LIVE" and left.severity == StatusSeverity.OK
+    assert "20.400 m" in left.detail
+    assert right is not None and right.state == "STALE" and right.severity == StatusSeverity.WARN
+    assert "18.200 m" in right.detail
+    _ = app
+
+
 def test_pixhawk_usb_discovery_worker_keeps_serial_probe_off_ui_path(monkeypatch) -> None:
     from Workstation import standalone_gui
     from Workstation import device_runtime_workers
@@ -2022,42 +2709,6 @@ def test_wiris_clock_worker_keeps_stus_and_gdti_io_off_ui_path(monkeypatch) -> N
     assert gdti_results[0]["results"]["left"]["response"].startswith("2026/")
 
 
-def test_camera_time_sync_gdti_thread_uses_panel_qobject_parent(monkeypatch) -> None:
-    from Workstation import camera_time_sync_controller
-
-    class FakeWorker(QtCore.QObject):
-        completed = QtCore.pyqtSignal(object)
-        failed = QtCore.pyqtSignal(str)
-        finished = QtCore.pyqtSignal()
-
-        def __init__(self, *_args, **_kwargs) -> None:
-            super().__init__()
-
-        def run(self) -> None:
-            self.finished.emit()
-
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
-    panel = QtWidgets.QWidget()
-    panel.wiris_gdti_thread = None
-    panel.wiris_gdti_worker = None
-    panel.wiris_command_status_label = QtWidgets.QLabel()
-    panel._log = lambda _text: None
-    panel._apply_wiris_gdti_result = lambda _result: None
-    panel._wiris_gdti_failed = lambda _error: None
-    panel._clear_wiris_gdti_worker = lambda: None
-    monkeypatch.setattr(camera_time_sync_controller, "WirisClockCommandWorker", FakeWorker)
-
-    controller = camera_time_sync_controller.CameraTimeSyncController(panel)
-    controller._start_wiris_gdti_worker((("left", "127.0.0.1", 5000, 1.0),))
-    thread = panel.wiris_gdti_thread
-    assert thread is not None
-    assert thread.parent() is panel
-    thread.quit()
-    thread.wait(1000)
-    panel.deleteLater()
-    app.processEvents()
-
-
 def test_wiris_stus_compensation_rejects_invalid_rtt() -> None:
     from Workstation import standalone_gui
 
@@ -2144,6 +2795,39 @@ def test_session_save_worker_ignores_late_signal_only_after_teardown(monkeypatch
     worker.run()
 
 
+def test_checkerboard_pair_timing_allows_100ms_but_rejects_larger() -> None:
+    from Workstation.calibration_controller import (
+        CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S,
+        CalibrationWorkflowController,
+    )
+
+    panel = SimpleNamespace(
+        camera_frame_metadata={
+            "left": {"rtcp_frame_ntp_unix_s": 0.0},
+            "right": {"rtcp_frame_ntp_unix_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S},
+        },
+        _camera_rtc_timestamp_s_from_metadata=lambda metadata: metadata.get("rtcp_frame_ntp_unix_s"),
+    )
+    controller = CalibrationWorkflowController(panel)
+
+    pair_ok, basis, delta_s, detail = controller._checkerboard_capture_pair_timing()
+
+    assert CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S == pytest.approx(0.100)
+    assert pair_ok is True
+    assert basis == "rtcp-ntp"
+    assert delta_s == pytest.approx(0.100)
+    assert detail == "ok"
+
+    panel.camera_frame_metadata["right"] = {
+        "rtcp_frame_ntp_unix_s": CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S + 0.000001
+    }
+    pair_ok, _basis, delta_s, detail = controller._checkerboard_capture_pair_timing()
+
+    assert pair_ok is False
+    assert delta_s == pytest.approx(0.100001)
+    assert "100.0 ms" in detail
+
+
 def test_checkerboard_capture_worker_saves_and_validates_optical_pixel_images(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2188,6 +2872,121 @@ def test_checkerboard_capture_worker_saves_and_validates_optical_pixel_images(
     metadata = (tmp_path / "capture_metadata" / "capture_001.json").read_text(encoding="utf-8")
     assert "OpenCV image pixels" in metadata
     assert '"stereo_pair_saved": true' in metadata
+
+
+def test_checkerboard_auto_capture_uses_new_synchronized_detection_pairs() -> None:
+    from Workstation.calibration_controller import CalibrationWorkflowController
+    from Workstation import standalone_gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    image = standalone_gui.QtGui.QImage(32, 24, standalone_gui.QtGui.QImage.Format_RGB888)
+    image.fill(127)
+    now_s = time.monotonic()
+    panel = SimpleNamespace(
+        checkerboard_calibration_thread=None,
+        calibration_auto_interval_spin=QtWidgets.QDoubleSpinBox(),
+        calibration_auto_target_spin=QtWidgets.QSpinBox(),
+        calibration_status_label=QtWidgets.QLabel(),
+        capture_calibration_auto_button=QtWidgets.QPushButton(),
+        calibration_preview_detection_results={
+            "left": {
+                "request_id": 1,
+                "image": image,
+                "found": True,
+                "metadata": {"timestamp_s": now_s, "rtcp_frame_ntp_unix_s": 100.000},
+            },
+            "right": {
+                "request_id": 2,
+                "image": image,
+                "found": True,
+                "metadata": {"timestamp_s": now_s, "rtcp_frame_ntp_unix_s": 100.010},
+            },
+        },
+        _checkerboard_capture_pair_timing=lambda _metadata: (True, "rtcp-ntp", 0.010, "ok"),
+    )
+    panel.calibration_auto_interval_spin.setValue(0.5)
+    panel.calibration_auto_target_spin.setValue(2)
+    controller = CalibrationWorkflowController(panel)
+    capture_calls: list[dict[str, object]] = []
+    controller.capture_calibration_images = lambda **kwargs: capture_calls.append(kwargs) or True
+
+    assert controller.start_auto_calibration_capture() is True
+    assert len(capture_calls) == 1
+    assert capture_calls[0]["capture_origin"] == "auto"
+
+    controller._auto_calibration_capture_tick()
+    assert len(capture_calls) == 1
+
+    panel.calibration_preview_detection_results["right"] = {
+        "request_id": 3,
+        "image": image,
+        "found": True,
+        "metadata": {"timestamp_s": time.monotonic(), "rtcp_frame_ntp_unix_s": 100.020},
+    }
+    controller._auto_calibration_capture_tick()
+    assert len(capture_calls) == 2
+    controller.stop_auto_calibration_capture()
+    assert panel.capture_calibration_auto_button.text() == "자동 촬영 시작"
+    app.processEvents()
+
+
+def test_calibration_evidence_reports_live_auto_capture_pair_count() -> None:
+    controller = SimpleNamespace(_auto_capture_active=True, _auto_capture_saved_pairs=3)
+    panel = SimpleNamespace(_calibration_workflow_controller_owner=controller)
+
+    evidence = EvidenceAdapter(panel).calibration()
+
+    assert evidence["valid_pair_count"] == 3
+    assert evidence["auto_capture_active"] is True
+    assert evidence["auto_capture_saved_pairs"] == 3
+
+
+def test_calibration_evidence_uses_selected_validation_mode_without_result() -> None:
+    class ValidationModeCombo:
+        def currentData(self) -> str:
+            return "checkerboard"
+
+    panel = SimpleNamespace(
+        checkerboard_validation_mode_combo=ValidationModeCombo(),
+        checkerboard_validation_result_mode="pixhawk",
+        active_intrinsics=None,
+        last_calibration_result=None,
+    )
+
+    evidence = EvidenceAdapter(panel).calibration()
+
+    assert evidence["validation_mode"] == "checkerboard"
+
+
+def test_checkerboard_preview_detection_runs_alongside_yolo_and_sync_status() -> None:
+    from Workstation import standalone_gui
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel()
+    panel.yolo_enabled = True
+    panel.camera_connected = True
+    panel.camera_sync_status = "verified"
+    panel._workstation_calibration_preview_active = True
+    panel._is_checkerboard_calibration_visible = lambda: False
+    panel._record_gui_camera_frame = lambda *_args, **_kwargs: None
+    panel._capture_recording_clock_sync_start_observation = lambda: None
+    panel._update_camera_connection_status = lambda: None
+    panel._record_clock_offset_sample = lambda _now_s: None
+    panel._queue_calibration_preview_detection = lambda camera, image: queued.append((camera, image))
+    queued: list[tuple[str, object]] = []
+    image = standalone_gui.QtGui.QImage(32, 24, standalone_gui.QtGui.QImage.Format_RGB888)
+    image.fill(127)
+
+    panel._update_calibration_preview(
+        "left",
+        image,
+        {"timestamp_s": time.monotonic(), "rtcp_frame_ntp_unix_s": 100.0},
+    )
+
+    assert queued and queued[0][0] == "left"
+    panel.close()
+    panel.deleteLater()
+    app.processEvents()
 
 
 def test_checkerboard_calibration_worker_preserves_optical_rdf_stereo_contract(monkeypatch, tmp_path) -> None:
@@ -2237,7 +3036,9 @@ def test_checkerboard_calibration_worker_preserves_optical_rdf_stereo_contract(m
         config=config,
     )
     completed: list[object] = []
+    progress: list[dict[str, object]] = []
     worker.completed.connect(completed.append)
+    worker.progress.connect(progress.append)
 
     worker.run()
 
@@ -2247,6 +3048,12 @@ def test_checkerboard_calibration_worker_preserves_optical_rdf_stereo_contract(m
     assert "opencv_optical:RDF" in result.extrinsics.frame_contract
     assert result.extrinsics.translation_left_to_right_m == [-0.3, 0.0, 0.0]
     assert [kind for kind, _paths in calls] == ["intrinsics", "intrinsics", "stereo"]
+    assert {item["phase"] for item in progress} >= {
+        "left_intrinsic",
+        "right_intrinsic",
+        "stereo_extrinsic",
+    }
+    assert progress[-1]["percent"] == pytest.approx(100.0)
 
     calls.clear()
     validation_worker = standalone_gui.CheckerboardRandomValidationWorker(
@@ -2266,6 +3073,27 @@ def test_checkerboard_calibration_worker_preserves_optical_rdf_stereo_contract(m
     assert len(validation_results[0]) == 3
     assert all(row["result"].extrinsics is extrinsics for row in validation_results[0])
     assert [kind for kind, _paths in calls].count("stereo") == 3
+
+
+def test_calibration_pair_limit_selects_evenly_spread_pairs() -> None:
+    from Workstation.calibration_controller import CalibrationWorkflowController
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    limit_spin = QtWidgets.QSpinBox()
+    limit_spin.setRange(0, 10000)
+    limit_spin.setValue(4)
+    panel = SimpleNamespace(calib_calculation_pairs_spin=limit_spin)
+    controller = CalibrationWorkflowController(panel)
+    pairs = [(f"{index:03d}", Path(f"left_{index:03d}.png"), Path(f"right_{index:03d}.png")) for index in range(10)]
+
+    selected = controller._select_calibration_pairs(pairs)
+
+    assert len(selected) == 4
+    assert selected[0][0] == "000"
+    assert selected[-1][0] == "009"
+    assert [item[0] for item in selected] == sorted(item[0] for item in selected)
+    limit_spin.setValue(0)
+    assert controller._select_calibration_pairs(pairs) == pairs
 
 
 def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, tmp_path) -> None:
@@ -2344,6 +3172,8 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
     assert panel.checkerboard_calibration_thread is None
     assert panel.checkerboard_validation_result is not None
     assert EvidenceAdapter(panel).calibration()["state"] == "AVAILABLE"
+    assert EvidenceAdapter(panel).calibration()["valid_pair_count"] == 5
+    assert [row["run"] for row in EvidenceAdapter(panel).calibration()["validation_run_results"]] == ["Full"]
     assert "T_left_to_right_m" in panel.calibration_result_text.toPlainText()
 
     panel.checkerboard_validation_random_runs_spin.setValue(2)
@@ -2356,6 +3186,9 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
         QtCore.QThread.msleep(5)
     assert panel.checkerboard_calibration_thread is None
     assert "Random stereo-pair validation" in panel.calibration_result_text.toPlainText()
+    run_results = EvidenceAdapter(panel).calibration()["validation_run_results"]
+    assert [row["run"] for row in run_results] == ["Full", "Random 1", "Random 2"]
+    assert all(row["state"] == "OK" for row in run_results)
 
     panel.close()
     panel.deleteLater()
@@ -2811,6 +3644,43 @@ def test_camera_mode_switch_restarts_after_workers_stop_without_blocking(
     app.processEvents()
 
 
+def test_camera_start_keeps_healthy_side_when_other_side_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    panel.left_pane.stop = lambda *, wait=False: True
+    panel.right_pane.stop = lambda *, wait=False: True
+    starts: list[str] = []
+    panel.left_pane.start_stream = lambda _url, **_kwargs: starts.append("left") or True
+    panel.right_pane.start_stream = lambda _url, **_kwargs: starts.append("right") or False
+    retries: list[tuple[bool, bool]] = []
+    monkeypatch.setattr(
+        panel,
+        "_schedule_camera_start_retry",
+        lambda enable_detection, switch_to_depth: retries.append((enable_detection, switch_to_depth)),
+    )
+
+    panel._start_camera_streams(enable_detection=False, switch_to_depth=False)
+
+    assert starts == ["left", "right"]
+    assert retries == []
+    assert panel._pending_camera_start is None
+    assert panel.camera_connected is True
+    assert panel.camera_connection_label.text() == "camera partial: left connected; right unavailable"
+    assert "실패한 카메라만 재활성화" in panel.wiris_log.toPlainText()
+    panel._shutdown_coordinator = LifecycleCoordinator([])
+    panel.close()
+    app.processEvents()
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_workstation_exposes_complete_system_settings_surface() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
@@ -2928,6 +3798,7 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
     system_keys = set(window.settings_workspace.settings_widgets)
     measurement_keys = set(window.measurement.settings_widgets)
     time_keys = set(window.time_workspace.settings_widgets)
+    calibration_keys = set(window.calibration.setup_widgets)
     measurement_aliases = {
         "triangulation_extrinsics_source": "distance_mode",
         "yolo_input_size": "yolo_input_size_px",
@@ -2952,11 +3823,31 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         "camera_sync_required_sr_count": "camera_sync_required_sr_count",
         "camera_sync_warmup_timeout_s": "camera_sync_warmup_timeout_s",
     }
+    calibration_aliases = {
+        "calibration_zoom_level": "zoom_level",
+        "calibration_inner_cols": "inner_cols",
+        "calibration_inner_rows": "inner_rows",
+        "calibration_square_size_mm": "square_size_mm",
+        "calibration_min_images": "min_images",
+        "calibration_calculation_pair_count": "calculation_pair_count",
+        "calibration_auto_interval_s": "auto_interval_s",
+        "calibration_auto_target_pairs": "auto_target_pairs",
+        "calibration_root": "calibration_root",
+        "calibration_validation_mode": "validation_mode",
+        "calibration_validation_root": "validation_root",
+        "calibration_validation_json": "validation_json",
+        "calibration_validation_runs": "validation_runs",
+        "calibration_validation_pair_count": "validation_pair_count",
+        "calibration_validation_seed": "validation_seed",
+    }
     flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation"}
 
-    assert flat_fields - system_keys == set(measurement_aliases) | set(sync_aliases)
+    assert flat_fields - system_keys == (
+        set(measurement_aliases) | set(sync_aliases) | set(calibration_aliases)
+    )
     assert set(measurement_aliases.values()) <= measurement_keys
     assert set(sync_aliases.values()) <= time_keys
+    assert set(calibration_aliases.values()) <= calibration_keys
     assert not set(sync_aliases.values()) & measurement_keys
 
     window.close()
@@ -3098,9 +3989,9 @@ def test_status_adapter_emits_one_snapshot_per_poll() -> None:
     adapter.refresh()
 
     assert len(snapshots) == 1
-    assert len(snapshots[0]) == 11
+    assert len(snapshots[0]) == 13
     assert len(polls) == 1
-    assert len(polls[0]) == 11
+    assert len(polls[0]) == 13
     adapter.refresh()
     assert len(snapshots) == 1
     assert len(polls) == 2
@@ -3264,6 +4155,7 @@ def test_phase_one_backend_facades_delegate_to_standalone_owner() -> None:
         "check_cameras",
         "check_wiris_control",
         "enable_wiris_rtsp",
+        "reactivate_wiris_rtsp",
         "swap_cameras",
         "save_current_settings_from_ui",
         "set_selected_wiris_time_from_pc",
@@ -3306,6 +4198,7 @@ def test_phase_one_backend_facades_delegate_to_standalone_owner() -> None:
         "camera_check_rtsp",
         "camera_check_control",
         "camera_enable_rtsp",
+        "camera_reactivate",
         "camera_swap",
         "camera_save_settings",
         "time_set_pc",
@@ -3330,7 +4223,10 @@ def test_phase_one_backend_facades_delegate_to_standalone_owner() -> None:
         "calibration_apply_validation",
     )
     for facade in facades:
-        getattr(backend, facade)()
+        if facade == "camera_reactivate":
+            getattr(backend, facade)("left")
+        else:
+            getattr(backend, facade)()
 
     assert calls == [
         "apply_camera_candidate",
@@ -3399,6 +4295,7 @@ def test_measurement_and_calibration_setup_facades_delegate_to_owner() -> None:
     panel = SimpleNamespace(
         apply_workstation_measurement_settings=lambda payload: calls.append(("measurement", payload)),
         save_current_settings_from_ui=lambda: calls.append(("save", None)),
+        save_workstation_calibration_setup=lambda: calls.append(("save", None)),
         apply_workstation_calibration_setup=lambda payload: calls.append(("calibration", payload)),
         scan_checkerboard_validation_files=lambda: calls.append(("scan", None)),
         refresh_baseline_field_browser=lambda: calls.append(("alignment_scan", None)),
@@ -3504,6 +4401,90 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
         "preview",
     ]
     backend.deleteLater()
+    app.processEvents()
+
+
+def test_wiris_command_catalog_exposes_lrf_distance_query() -> None:
+    from Workstation import standalone_gui
+    from Workstation.wiris_control_controller import WIRIS_COMMAND_CATALOG as controller_catalog
+
+    expected = (
+        "LRF",
+        "Get laser distance",
+        "GLRD",
+        standalone_gui.LINE_TERMINATOR,
+        "LRF(Laser Range Finder)가 측정한 거리 값을 읽습니다.",
+    )
+
+    assert expected in controller_catalog
+    assert expected in standalone_gui.WIRIS_COMMAND_CATALOG
+
+
+def test_wiris_command_catalog_covers_official_workswell_sdk_opcodes() -> None:
+    from Workstation import standalone_gui
+    from Workstation.wiris_sdk_catalog import (
+        WIRIS_COMMAND_CATALOG,
+        WIRIS_SDK_MANUAL_FIRMWARE,
+        WIRIS_SDK_MANUAL_REVISION,
+        WIRIS_SDK_MANUAL_URL,
+    )
+
+    expected_opcodes = set(
+        """
+        ACTV IACT SETH GETH SSDK SDLM GDLM HIWS GSRN GATN GFWV GTCU GTIC GTIN GFPW
+        MOVE GGPS STUT GTUT SRMD GRMD SRMM GRMM SRWC GRWC SREN GREN GREL STST GTST
+        SHRJ GHRJ SCRJ GCRJ SCWM GCWM SCAT GCAT SUSL GUSL SLSL GLSL SCRP GRCP SCHY
+        GCHY SINB GINB SSLB GSLB GEDF GEDS GCWP GCGR SCWV GCWV SLAY STTY SMCA GMCA
+        SGPI GGPI SZIN SZOT SZSM GZSM SZTN GZTV GZTL SZVN GZVV GZVL SGFA SGFI GCDT
+        SGFM GGFM SHSM GHSM GPTE SPTE SPTI GPTL GPLV GCMP SCMP GCML CPTR ICPT RCRS
+        RCRF IRCR SPIC GPIC GGFT SGFT SBFL GBFL SEFL GEFL SCSB GCSB SALM GALM SALV
+        GALV SALC GALC GTEX GROT GOPT CUPD IUPD STEM GTEM STRT GTRT STAT GTAT STII
+        GTII STSC GTSC STCP GTCP GTSL GTSN IMCR SLEN GLEN GLEL SIRJ GIRJ SIRT GIRT
+        SICT GICT SISR GISR SISS GISS SIVI GIVI SIHR GIHR SVTH GVTH SVTE GVTE SVVI
+        GVVI SVHR GVHR SILC GILC SHRR GHRR SLRF GLRF GLRD SDTI GDTI STUS GMST GMSI
+        GMFR GMCP GTRC GVRC GEST CPST CPSS GTRE SEBR GEBR SEGS GEGS SEIR GEIR SEQZ
+        GEQZ STRG GTRG STIP STMS GTMS STGW GTGW SMGW GMGW SDST SHDW REBT
+        """.split()
+    )
+    actual_opcodes = {
+        record[2].split()[0]
+        for record in WIRIS_COMMAND_CATALOG
+        if record[2]
+    }
+
+    assert actual_opcodes == expected_opcodes
+    assert standalone_gui.WIRIS_COMMAND_CATALOG is WIRIS_COMMAND_CATALOG
+    assert WIRIS_SDK_MANUAL_REVISION == "241106EN"
+    assert WIRIS_SDK_MANUAL_FIRMWARE == "2.10.60+"
+    assert WIRIS_SDK_MANUAL_URL.startswith("https://my.workswell.eu/")
+
+
+def test_alignment_workspace_exposes_lrf_indicators() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    now = time.monotonic()
+    backend.panel.latest_wiris_lrf = {
+        "left": {
+            "distance_m": 12.3,
+            "last_good_s": now,
+            "last_attempt_s": now,
+            "response": "12.3",
+            "last_error": "",
+        },
+        "right": {},
+    }
+    window.navigation.select_context("processing.alignment")
+    window.status_adapter.refresh()
+    app.processEvents()
+
+    assert set(window.alignment.lrf_indicators) == {"lrf.left", "lrf.right"}
+    assert window.alignment.lrf_indicators["lrf.left"].state.text() == "LIVE"
+    assert "distance=12.300 m" in window.alignment.lrf_indicators["lrf.left"].detail.text()
+    assert window.alignment.lrf_indicators["lrf.right"].state.text() == "WAITING"
+    window.close()
+    app.processEvents()
+    window.deleteLater()
     app.processEvents()
 
 
@@ -3799,6 +4780,34 @@ def test_workstation_uses_source_backed_alignment_calibration_and_recording_page
     assert any("Physical alignment evidence" in label.text() for label in window.recording.protocol_check_labels.values())
     assert any("Final WIRIS time-sync checkpoint" in label.text() for label in window.recording.protocol_check_labels.values())
     assert "NED" in window.alignment.findChildren(QtWidgets.QLabel)[-1].text()
+
+    assert [
+        window.calibration.operation_tabs.tabText(index)
+        for index in range(window.calibration.operation_tabs.count())
+    ] == ["Setup", "Capture", "R,t + Apply", "Validate"]
+    backend.calls.clear()
+    window.calibration.zoom_1x_button.click()
+    window.calibration.zoom_8x_button.click()
+    window.calibration.zoom_query_button.click()
+    for command_id in (
+        "calibration.run_extrinsics",
+        "calibration.save_extrinsics",
+        "calibration.load_extrinsics",
+        "calibration.apply_bundle",
+    ):
+        window.calibration.operation_buttons[command_id].click()
+    assert ("advanced_zoom", "both", "set", 1) in backend.calls
+    assert ("advanced_zoom", "both", "set", 8) in backend.calls
+    assert ("advanced_zoom", "both", "query", None) in backend.calls
+    assert "calibration_run_extrinsics" in backend.calls
+    assert "calibration_save_extrinsics" in backend.calls
+    assert "calibration_load_extrinsics" in backend.calls
+    assert "calibration_apply_bundle" in backend.calls
+
+    window.measurement.refresh({})
+    assert "K,D=--" in window.measurement.active_calibration_label.text()
+    assert "R,t=--" in window.measurement.active_calibration_label.text()
+    assert "validation gate=disabled" in window.measurement.active_calibration_label.text()
     window.close()
     app.processEvents()
     window.deleteLater()
@@ -3904,6 +4913,7 @@ def test_advanced_camera_control_sends_through_actual_panel_owner(monkeypatch) -
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     window = WorkstationMainWindow()
     try:
+        window._select_context("tasks.advanced")
         window.advanced.wiris_command_edit.setText("HIWS")
         window.advanced.wiris_send_button.click()
         deadline = time.monotonic() + 2.0
@@ -3997,6 +5007,60 @@ def test_status_refresh_updates_only_visible_workspace_and_diagnostics() -> None
     window._refresh_evidence_from_poll({})
     assert calls == ["camera", "diagnostics"]
     assert "measurement" not in calls
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_visible_time_workspace_recomputes_live_sync_summary_after_verification_timer_stops() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.clock_sync_status_label = QtWidgets.QLabel("old status")
+    backend.panel.clock_sync_summary_text = QtWidgets.QPlainTextEdit("old detail")
+    refresh_count = 0
+
+    def update_clock_sync_display() -> str:
+        nonlocal refresh_count
+        refresh_count += 1
+        backend.panel.clock_sync_status_label.setText(f"live status {refresh_count}")
+        backend.panel.clock_sync_summary_text.setPlainText(f"live detail {refresh_count}")
+        return backend.panel.clock_sync_status_label.text()
+
+    backend.panel._update_clock_sync_display = update_clock_sync_display
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    window._select_context("devices.time")
+    refresh_count = 0
+
+    window._refresh_visible_surfaces(window.status_adapter.model.snapshot())
+
+    assert refresh_count == 1
+    assert window.time_workspace.sync_status.text() == "live status 1"
+    assert window.time_workspace.sync_summary.toPlainText() == "live detail 1"
+
+    window._select_context("overview")
+    refresh_count = 0
+    window._refresh_visible_surfaces(window.status_adapter.model.snapshot())
+    assert refresh_count == 0
+
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_lrf_polling_runs_only_while_alignment_workspace_is_selected() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    backend.calls.clear()
+
+    window._select_context("processing.alignment")
+    assert backend.calls[-1] == "start_lrf_polling"
+
+    window._select_context("devices.cameras")
+    assert backend.calls[-1] == "stop_lrf_polling"
 
     window.close()
     window.deleteLater()
@@ -4308,11 +5372,14 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "camera.check_rtsp",
         "camera.check_control",
         "camera.enable_rtsp",
+        "camera.reactivate_left",
+        "camera.reactivate_right",
         "camera.swap",
         "camera.save_settings",
     )
     alignment_commands = (
         "pixhawk.toggle_mavlink",
+        "pixhawk.reset_level_calibration",
         "gnss.base_discover",
         "gnss.base_connect",
         "gnss.base_disconnect",
@@ -4340,14 +5407,20 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
     for command in (*camera_commands, *alignment_commands, *calibration_commands):
         assert window.commands.invoke(command) is True
 
-    assert backend.calls[-len(camera_commands) - len(alignment_commands) - len(calibration_commands):] == [
+    recent_calls = backend.calls[
+        -(len(camera_commands) + len(alignment_commands) + len(calibration_commands) + 2):
+    ]
+    assert [call[0] if isinstance(call, tuple) else call for call in recent_calls] == [
         "camera_discover_host_ip",
         "camera_check_rtsp",
         "camera_check_control",
         "camera_enable_rtsp",
+        "camera_reactivate",
+        "camera_reactivate",
         "camera_swap",
         "camera_save_settings",
         "pixhawk_toggle_mavlink",
+        "pixhawk_reset_level_calibration",
         "gnss_base_discover",
         "gnss_base_connect",
         "gnss_base_disconnect",
@@ -4356,12 +5429,14 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "gnss_ntrip_start",
         "gnss_ntrip_stop",
         "calibration_capture_images",
+        "calibration_apply_setup",
         "calibration_run_intrinsic",
         "calibration_save_intrinsics",
         "calibration_load_intrinsics",
         "calibration_load_current_zoom_intrinsics",
         "calibration_apply_intrinsics",
         "calibration_load_validation",
+        "calibration_apply_setup",
         "calibration_run_validation",
         "calibration_save_validation",
         "calibration_apply_validation",
@@ -4401,6 +5476,29 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     calibration_payload = window.calibration.setup_payload()
     assert calibration_payload["inner_cols"] >= 2
     assert calibration_payload["square_size_mm"] > 0
+    assert calibration_payload["auto_interval_s"] == pytest.approx(1.0)
+    assert calibration_payload["auto_target_pairs"] == 20
+    assert calibration_payload["calculation_pair_count"] == 20
+    window.calibration.setup_widgets["calculation_pair_count"].setValue(12)
+    window.calibration.setup_widgets["auto_interval_s"].setValue(2.5)
+    window.calibration.setup_widgets["auto_target_pairs"].setValue(12)
+    assert window.commands.invoke("calibration.auto_capture") is True
+    assert backend.calls[-2][0] == "calibration_apply_setup"
+    assert backend.calls[-2][1]["auto_interval_s"] == pytest.approx(2.5)
+    assert backend.calls[-2][1]["auto_target_pairs"] == 12
+    assert backend.calls[-2][1]["calculation_pair_count"] == 12
+    assert backend.calls[-1] == "calibration_toggle_auto_capture"
+    window.calibration.setup_widgets["validation_mode"].setCurrentIndex(
+        window.calibration.setup_widgets["validation_mode"].findData("checkerboard")
+    )
+    assert window.commands.invoke("calibration.run_intrinsic") is True
+    assert backend.calls[-2][0] == "calibration_apply_setup"
+    assert backend.calls[-2][1]["validation_mode"] == "checkerboard"
+    assert backend.calls[-1] == "calibration_run_intrinsic"
+    assert window.commands.invoke("calibration.run_validation") is True
+    assert backend.calls[-2][0] == "calibration_apply_setup"
+    assert backend.calls[-2][1]["validation_mode"] == "checkerboard"
+    assert backend.calls[-1] == "calibration_run_validation"
     assert window.commands.invoke("measurement.apply_settings") is True
     assert window.commands.invoke("measurement.save_settings") is True
     assert window.commands.invoke("time.apply_settings") is True
@@ -4414,15 +5512,16 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     assert window.commands.invoke("alignment.save_profile") is True
     assert window.commands.invoke("alignment.load_profile") is True
     assert window.commands.invoke("alignment.swap_pixhawks") is True
-    extended_calls = backend.calls[-13:]
+    extended_calls = backend.calls[-14:]
     assert extended_calls[0][0] == "measurement_apply_settings"
     assert extended_calls[1] == "measurement_save_settings"
     assert extended_calls[2][0] == "measurement_apply_settings"
     assert extended_calls[3] == "measurement_save_settings"
     assert extended_calls[4][0] == "calibration_apply_setup"
     assert extended_calls[5] == "calibration_scan_validation"
-    assert extended_calls[6] == "calibration_save_setup"
-    assert extended_calls[7:] == [
+    assert extended_calls[6][0] == "calibration_apply_setup"
+    assert extended_calls[7] == "calibration_save_setup"
+    assert extended_calls[8:] == [
         "alignment_scan_sources",
         "alignment_start_sampling",
         "alignment_stop_sampling",
@@ -4432,6 +5531,52 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     ]
     window.close()
     app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_calibration_workspace_displays_run_by_run_results() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    backend.panel.checkerboard_validation_run_results = [
+        {
+            "run": "Full",
+            "pairs": 12,
+            "left_reprojection_error_px": 0.21,
+            "right_reprojection_error_px": 0.23,
+            "stereo_reprojection_error_px": 0.31,
+            "baseline_m": 0.42,
+            "baseline_delta_mm": 0.0,
+            "rotation_delta_deg": 0.0,
+            "left_intrinsics_delta_px": 0.0,
+            "right_intrinsics_delta_px": 0.0,
+            "state": "OK",
+        },
+        {
+            "run": "Random 1",
+            "pairs": 8,
+            "left_reprojection_error_px": 0.25,
+            "right_reprojection_error_px": 0.28,
+            "stereo_reprojection_error_px": 0.35,
+            "baseline_m": 0.421,
+            "baseline_delta_mm": 1.0,
+            "rotation_delta_deg": 0.02,
+            "left_intrinsics_delta_px": 0.4,
+            "right_intrinsics_delta_px": 0.5,
+            "state": "OK",
+        },
+    ]
+    window = WorkstationMainWindow(backend=backend)
+    window.status_adapter.stop()
+    window.calibration.refresh(window.status_adapter.model.snapshot())
+
+    assert window.calibration.validation_run_model.rowCount() == 2
+    assert window.calibration.validation_run_model.item(0, 0).text() == "Full"
+    assert window.calibration.validation_run_model.item(1, 0).text() == "Random 1"
+    assert window.calibration.validation_run_model.item(1, 2).text() == "0.250"
+    assert "2 run(s)" in window.calibration.validation_run_status.text()
+
+    window.close()
     window.deleteLater()
     app.processEvents()
 

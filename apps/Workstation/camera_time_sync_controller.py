@@ -1,27 +1,17 @@
 """Camera clock synchronization controller for the workstation app.
 
-The controller coordinates WIRIS STUS/GDTI evidence and RTCP/NTP observations.
+The controller coordinates WIRIS STUS evidence and RTCP/NTP observations.
 Timestamp values are Unix UTC seconds or monotonic seconds as explicitly named;
 it performs no camera RDF, body FRD, or world NED coordinate conversion.
 """
 
 from __future__ import annotations
 
-import re
 import time
-from collections.abc import Sequence
-from datetime import datetime, timezone
 from math import isfinite
 
-from PyQt5 import QtCore
-
-from Workstation.wiris_runtime_workers import WirisClockCommandWorker
 from Workstation.workstation_core.measurement_widgets import ClockOffsetPoint
 from Workstation.workstation_core.runtime_camera_status import infer_runtime_camera_timestamp_reference
-from Workstation.workstation_core.yolo_stream import RTSP_TRANSPORT_TCP
-
-CAMERA_GDTI_RESOLUTION_S = 1.0
-CAMERA_GDTI_MAX_PAIR_DELTA_S = 1.0
 CAMERA_RTCP_PAIR_MAX_DELTA_S = 0.050
 CAMERA_RTCP_MAX_PC_OFFSET_S = 0.100
 CAMERA_SYNC_FRAME_HISTORY_WINDOW_S = 1.0
@@ -39,8 +29,6 @@ CAMERA_SYNC_STATUS_FAILED = "failed"
 
 CAMERA_TIME_SYNC_METHODS = [
     "_set_camera_sync_state",
-    "_parse_wiris_gdti_unix_s",
-    "_format_wiris_gdti_results",
     "_camera_sync_widget_value",
     "_camera_sync_history_window_s",
     "_camera_sync_receive_pair_max_delta_s",
@@ -53,10 +41,6 @@ CAMERA_TIME_SYNC_METHODS = [
     "_camera_sync_readiness",
     "_poll_camera_sync_state",
     "_begin_camera_sync_after_stus",
-    "_start_wiris_gdti_worker",
-    "_apply_wiris_gdti_result",
-    "_wiris_gdti_failed",
-    "_clear_wiris_gdti_worker",
     "_clock_sync_side_summary",
     "_rtcp_sender_report_count",
     "_clock_sync_pair_metadata",
@@ -81,87 +65,6 @@ class CameraTimeSyncController:
         self.panel.camera_sync_reason = str(reason)
         if hasattr(self.panel, "clock_sync_status_label"):
             self.panel._update_clock_sync_display()
-
-    def _parse_wiris_gdti_unix_s(self, response: str) -> float | None:
-        """Parse the documented WIRIS date/time text without trusting raw text."""
-
-        text = str(response or "")
-        match = re.search(
-            r"(?P<year>\d{4})[/-](?P<month>\d{2})[/-](?P<day>\d{2})"
-            r"(?:[ T-])(?P<hour>\d{2}):(?P<minute>\d{2}):(?P<second>\d{2})"
-            r"(?:\.(?P<fraction>\d{1,6}))?",
-            text,
-        )
-        if match is None:
-            return None
-        fraction = (match.group("fraction") or "").ljust(6, "0")
-        try:
-            value = datetime(
-                int(match.group("year")),
-                int(match.group("month")),
-                int(match.group("day")),
-                int(match.group("hour")),
-                int(match.group("minute")),
-                int(match.group("second")),
-                int(fraction or 0),
-                tzinfo=timezone.utc,
-            )
-        except ValueError:
-            return None
-        return value.timestamp()
-
-    def _format_wiris_gdti_results(self, result: object) -> dict[str, dict[str, object]]:
-        data = dict(result or {})
-        raw_results = dict(data.get("results") or {})
-        results: dict[str, dict[str, object]] = {}
-        for camera, raw in raw_results.items():
-            row = dict(raw or {})
-            requested_utc_s = self.panel._camera_sync_requested_utc_by_camera.get(camera)
-            if requested_utc_s is None:
-                requested_utc_s = self.panel._camera_sync_requested_utc_s
-            response = str(row.get("response") or "")
-            parsed_s = self.panel._parse_wiris_gdti_unix_s(response)
-            started_s = row.get("query_started_utc_s")
-            finished_s = row.get("query_finished_utc_s")
-            midpoint_s = None
-            query_duration_s = None
-            if started_s is not None and finished_s is not None:
-                query_duration_s = max(0.0, float(finished_s) - float(started_s))
-                midpoint_s = (float(started_s) + float(finished_s)) / 2.0
-            reference_s = midpoint_s
-            if reference_s is None:
-                reference_s = requested_utc_s
-            query_offset_ms = (
-                None
-                if parsed_s is None or reference_s is None
-                else (parsed_s - reference_s) * 1000.0
-            )
-            tolerance_ms = CAMERA_GDTI_RESOLUTION_S * 500.0
-            if query_duration_s is not None:
-                tolerance_ms += query_duration_s * 500.0
-            clock_valid = (
-                parsed_s is not None
-                and query_offset_ms is not None
-                and abs(float(query_offset_ms)) <= tolerance_ms
-            )
-            results[camera] = {
-                "response": response,
-                "unix_s": parsed_s,
-                "offset_ms": (
-                    None
-                    if parsed_s is None or requested_utc_s is None
-                    else (parsed_s - requested_utc_s) * 1000.0
-                ),
-                "query_started_utc_s": started_s,
-                "query_finished_utc_s": finished_s,
-                "query_midpoint_utc_s": midpoint_s,
-                "query_duration_ms": None if query_duration_s is None else query_duration_s * 1000.0,
-                "query_offset_ms": query_offset_ms,
-                "resolution_s": CAMERA_GDTI_RESOLUTION_S,
-                "offset_tolerance_ms": tolerance_ms,
-                "clock_valid": clock_valid,
-            }
-        return results
 
     def _camera_sync_widget_value(self, attribute: str, fallback: float) -> float:
         try:
@@ -257,12 +160,17 @@ class CameraTimeSyncController:
             left_metadata = self.panel.camera_frame_metadata.get("left") or {}
             right_metadata = self.panel.camera_frame_metadata.get("right") or {}
         metadata_by_camera = {"left": left_metadata, "right": right_metadata}
+        sr_baseline = dict(getattr(self.panel, "_camera_sync_stus_sr_baseline", {}) or {})
         missing: list[str] = []
         for camera, metadata in metadata_by_camera.items():
             count = int(metadata.get("rtcp_sr_received_count") or 0)
             required_sr_count = self.panel._camera_sync_required_sr_count()
             if count < required_sr_count:
                 missing.append(f"{self.panel._camera_name_ko(camera)} SR {count}/{required_sr_count}")
+                continue
+            baseline_count = sr_baseline.get(camera)
+            if baseline_count is not None and count <= int(baseline_count):
+                missing.append(f"{self.panel._camera_name_ko(camera)} STUS 이후 새 SR 대기")
                 continue
             try:
                 age_s = float(metadata.get("rtcp_sr_age_s"))
@@ -282,33 +190,6 @@ class CameraTimeSyncController:
                     continue
                 if not isfinite(rate) or abs(rate - 1.0) > self.panel._camera_sync_max_clock_rate_error():
                     missing.append(f"{self.panel._camera_name_ko(camera)} {label}={rate:.6f}")
-
-            gdti = self.panel._camera_sync_gdti.get(camera) or {}
-            gdti_s = gdti.get("unix_s")
-            if gdti_s is None:
-                missing.append(f"{self.panel._camera_name_ko(camera)} GDTI 파싱 실패")
-            elif gdti.get("clock_valid") is False:
-                offset_ms = gdti.get("query_offset_ms")
-                tolerance_ms = gdti.get("offset_tolerance_ms")
-                try:
-                    missing.append(
-                        f"{self.panel._camera_name_ko(camera)} GDTI query offset="
-                        f"{float(offset_ms):+.1f}ms (허용 {float(tolerance_ms):.1f}ms)"
-                    )
-                except (TypeError, ValueError):
-                    missing.append(f"{self.panel._camera_name_ko(camera)} GDTI 시간 검증 실패")
-
-        gdti_values = [
-            (self.panel._camera_sync_gdti.get(camera) or {}).get("unix_s")
-            for camera in ("left", "right")
-        ]
-        if all(value is not None for value in gdti_values):
-            try:
-                gdti_pair_delta_s = abs(float(gdti_values[1]) - float(gdti_values[0]))
-            except (TypeError, ValueError):
-                gdti_pair_delta_s = float("inf")
-            if gdti_pair_delta_s > CAMERA_GDTI_MAX_PAIR_DELTA_S:
-                missing.append(f"좌우 GDTI Δt={gdti_pair_delta_s:.3f}s")
 
         metrics = self.panel._camera_time_sync_metrics(
             left_metadata,
@@ -340,7 +221,7 @@ class CameraTimeSyncController:
             missing.append(f"RTCP SR/PC UTC offset={float(max_sr_pc_offset_ms):.1f}ms")
         if missing:
             return False, "; ".join(missing)
-        return True, "GDTI·RTCP/NTP·PC UTC·좌우 Δt 검증 완료"
+        return True, "RTCP/NTP·PC UTC·좌우 Δt 검증 완료"
 
     def _poll_camera_sync_state(self) -> None:
         if self.panel.camera_sync_status not in {
@@ -352,6 +233,7 @@ class CameraTimeSyncController:
         deadline = self.panel._camera_sync_deadline_monotonic_s
         if deadline is not None and time.monotonic() >= deadline:
             self.panel._camera_sync_timer.stop()
+            self.panel._camera_sync_stus_sr_baseline = {}
             self.panel._set_camera_sync_state(
                 CAMERA_SYNC_STATUS_FAILED,
                 "동기화 검증 timeout: " + self.panel.camera_sync_reason,
@@ -361,6 +243,7 @@ class CameraTimeSyncController:
         if ready:
             self.panel._camera_sync_timer.stop()
             self.panel._camera_sync_deadline_monotonic_s = None
+            self.panel._camera_sync_stus_sr_baseline = {}
             self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_VERIFIED, reason)
         else:
             self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_WARMING, reason)
@@ -370,72 +253,43 @@ class CameraTimeSyncController:
         *,
         target: str,
         result: str,
-        requested_utc_s: float | None,
-        target_infos: Sequence[tuple[str, str, int, float]],
     ) -> None:
-        self.panel._camera_sync_requested_utc_s = requested_utc_s
         if target != "both" or result != "success":
+            self.panel._camera_sync_stus_sr_baseline = {}
             self.panel._set_camera_sync_state(
                 CAMERA_SYNC_STATUS_FAILED,
                 "좌우 카메라 모두에 STUS가 성공해야 동기화를 검증할 수 있습니다.",
             )
             return
-        self.panel._set_camera_sync_state(
-            CAMERA_SYNC_STATUS_RECONNECTING,
-            "STUS 완료: GDTI 확인 후 RTSP 스트림을 TCP로 재연결합니다.",
-        )
         if not self.panel.camera_connected:
+            self.panel._camera_sync_stus_sr_baseline = {}
             self.panel._set_camera_sync_state(
                 CAMERA_SYNC_STATUS_NOT_VERIFIED,
                 "STUS는 완료됐지만 RTSP 스트림이 없어 검증을 시작하지 않았습니다.",
             )
             return
-        self.panel._start_wiris_gdti_worker(target_infos)
-
-    def _start_wiris_gdti_worker(self, target_infos: Sequence[tuple[str, str, int, float]]) -> None:
-        if self.panel.wiris_gdti_thread is not None:
-            self.panel._log("[시계] GDTI 조회가 이미 진행 중입니다.")
-            return
-        self.panel.wiris_command_status_label.setText("GDTI 확인: querying...")
-        # The controller is a plain Python coordinator, not a QObject.  The
-        # panel owns the Qt thread so its lifetime follows the Workstation
-        # widget and Qt receives a valid QObject parent.
-        self.panel.wiris_gdti_thread = QtCore.QThread(self.panel)
-        self.panel.wiris_gdti_worker = WirisClockCommandWorker(target_infos, command_text="GDTI")
-        self.panel.wiris_gdti_worker.moveToThread(self.panel.wiris_gdti_thread)
-        self.panel.wiris_gdti_thread.started.connect(self.panel.wiris_gdti_worker.run)
-        self.panel.wiris_gdti_worker.completed.connect(self.panel._apply_wiris_gdti_result)
-        self.panel.wiris_gdti_worker.failed.connect(self.panel._wiris_gdti_failed)
-        self.panel.wiris_gdti_worker.finished.connect(self.panel.wiris_gdti_thread.quit)
-        self.panel.wiris_gdti_worker.finished.connect(self.panel.wiris_gdti_worker.deleteLater)
-        self.panel.wiris_gdti_thread.finished.connect(self.panel.wiris_gdti_thread.deleteLater)
-        self.panel.wiris_gdti_thread.finished.connect(self.panel._clear_wiris_gdti_worker)
-        self.panel.wiris_gdti_thread.start()
-
-    def _apply_wiris_gdti_result(self, result: object) -> None:
-        self.panel._camera_sync_gdti = self.panel._format_wiris_gdti_results(result)
         if self.panel._session_recording_active():
             reason = "세션 기록이 시작되어 RTSP 재연결을 건너뛰었습니다. 기록 종료 후 다시 동기화하세요."
             self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_NOT_VERIFIED, reason)
             self.panel._log(f"[시계] {reason}")
             return
-        self.panel._camera_sync_transport_override = RTSP_TRANSPORT_TCP
+        # The camera RTSP sender can keep the NTP/RTP mapping created when the
+        # session was opened even after STUS changes the camera wall clock.
+        # Recreate only the local RTSP/GStreamer sessions so the next Sender
+        # Reports use the new clock.  Do not toggle Ethernet Mode and do not
+        # override the configured UDP/TCP transport.
+        self.panel._camera_sync_stus_sr_baseline = {"left": 0, "right": 0}
         self.panel._camera_sync_deadline_monotonic_s = time.monotonic() + self.panel._camera_sync_warmup_timeout_s()
-        self.panel._start_camera_streams(enable_detection=self.panel.yolo_enabled, switch_to_depth=self.panel.yolo_enabled)
+        self.panel._camera_sync_transport_override = None
         self.panel._set_camera_sync_state(
-            CAMERA_SYNC_STATUS_WARMING,
-            "RTSP 재연결 완료 대기: 양쪽 RTCP Sender Report를 수집합니다.",
+            CAMERA_SYNC_STATUS_RECONNECTING,
+            "STUS 완료: Ethernet Mode는 유지하고 로컬 RTSP 수신기만 재연결합니다.",
+        )
+        self.panel._start_camera_streams(
+            enable_detection=self.panel.yolo_enabled,
+            switch_to_depth=self.panel.yolo_enabled,
         )
         self.panel._camera_sync_timer.start()
-
-    def _wiris_gdti_failed(self, error: str) -> None:
-        self.panel._camera_sync_gdti = {}
-        self.panel._set_camera_sync_state(CAMERA_SYNC_STATUS_FAILED, f"GDTI 조회 실패: {error}")
-        self.panel._log(f"[시계] GDTI 조회 실패: {error}")
-
-    def _clear_wiris_gdti_worker(self) -> None:
-        self.panel.wiris_gdti_thread = None
-        self.panel.wiris_gdti_worker = None
 
     def _clock_sync_side_summary(self, camera: str, metadata: dict[str, object], now_wall_s: float, now_mono_s: float) -> tuple[str, float | None]:
         if metadata.get("rtcp_timing_invalid_reason"):

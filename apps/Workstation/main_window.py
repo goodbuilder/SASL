@@ -155,6 +155,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._camera_enable_rtsp,
             ),
             (
+                "camera.reactivate_left",
+                "Reactivate CAM L",
+                "Safely send SETH TRUE for the left WIRIS camera, verify frames, and reconnect only the left preview.",
+                "camera",
+                lambda: self._camera_reactivate("left"),
+            ),
+            (
+                "camera.reactivate_right",
+                "Reactivate CAM R",
+                "Safely send SETH TRUE for the right WIRIS camera, verify frames, and reconnect only the right preview.",
+                "camera",
+                lambda: self._camera_reactivate("right"),
+            ),
+            (
                 "camera.swap",
                 "Swap L/R",
                 "Swap the existing Left/Right camera mapping without changing coordinate contracts.",
@@ -174,6 +188,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Connect/disconnect the existing MAVLink Pixhawk path.",
                 "device",
                 self._pixhawk_toggle_mavlink,
+            ),
+            (
+                "pixhawk.reset_level_calibration",
+                "Reset level cal.",
+                "Reset only PX4 SENS_BOARD_X_OFF/Y_OFF/Z_OFF to firmware defaults on connected Pixhawks.",
+                "device",
+                self._pixhawk_reset_level_calibration,
             ),
             (
                 "pixhawk.recover_eth_mavlink.p1",
@@ -296,10 +317,22 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._calibration_capture_images,
             ),
             (
+                "calibration.auto_capture",
+                "Auto capture",
+                "Start/stop validated automatic checkerboard pair capture through the existing owner.",
+                self._calibration_toggle_auto_capture,
+            ),
+            (
                 "calibration.run_intrinsic",
                 "Run calibration",
                 "Run the existing intrinsic calibration pipeline without duplicating camera math.",
                 self._calibration_run_intrinsic,
+            ),
+            (
+                "calibration.run_extrinsics",
+                "Calculate R,t only",
+                "Estimate OpenCV optical RDF left-to-right R,t with the selected K,D fixed.",
+                self._calibration_run_extrinsics,
             ),
             (
                 "calibration.save_intrinsics",
@@ -308,10 +341,22 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._calibration_save_intrinsics,
             ),
             (
+                "calibration.save_extrinsics",
+                "Save R,t",
+                "Save the selected stereo R,t as an independent profile.",
+                self._calibration_save_extrinsics,
+            ),
+            (
                 "calibration.load_intrinsics",
                 "Load intrinsics",
                 "Choose an intrinsic JSON file, validate it, and apply it.",
                 self._calibration_load_intrinsics,
+            ),
+            (
+                "calibration.load_extrinsics",
+                "Load R,t",
+                "Load a standalone R,t profile or legacy intrinsics JSON with embedded extrinsics.",
+                self._calibration_load_extrinsics,
             ),
             (
                 "calibration.load_current_zoom_intrinsics",
@@ -321,9 +366,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "calibration.apply_intrinsics",
-                "Apply intrinsics",
-                "Apply the existing intrinsic result to the distance path.",
+                "Apply current K,D/R,t",
+                "Apply current K,D with the independently selected R,t, if any.",
                 self._calibration_apply_intrinsics,
+            ),
+            (
+                "calibration.apply_bundle",
+                "Apply K,D + R,t",
+                "Apply the independently selected K,D and R,t; source-zoom mismatch is informational only.",
+                self._calibration_apply_bundle,
             ),
             (
                 "calibration.load_validation",
@@ -379,7 +430,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "calibration.save_setup",
                 "Save setup",
-                "Persist the selected calibration/intrinsics path through the existing settings owner.",
+                "Persist the current Workstation calibration setup through the existing settings owner.",
                 self._calibration_save_setup,
             ),
             (
@@ -590,9 +641,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "camera.check_rtsp",
             "camera.check_control",
             "camera.enable_rtsp",
+            "camera.reactivate_left",
+            "camera.reactivate_right",
             "time.set_pc",
             "time.check_sync",
             "pixhawk.toggle_mavlink",
+            "pixhawk.reset_level_calibration",
             "pixhawk.recover_eth_mavlink.p1",
             "pixhawk.recover_eth_mavlink.p2",
             "pixhawk.discover_usb",
@@ -606,7 +660,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "gnss.ntrip_stop",
             "calibration.capture_images",
             "calibration.run_intrinsic",
+            "calibration.run_extrinsics",
             "calibration.load_intrinsics",
+            "calibration.load_extrinsics",
             "calibration.load_current_zoom_intrinsics",
             "calibration.run_validation",
             "calibration.load_validation",
@@ -711,6 +767,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         device_menu.addAction(self.commands.action("camera.toggle"))
         device_menu.addAction(self.commands.action("camera.auto_connect"))
         device_menu.addAction(self.commands.action("pixhawk.toggle_mavlink"))
+        device_menu.addAction(self.commands.action("pixhawk.reset_level_calibration"))
         device_menu.addAction(self.commands.action("pixhawk.recover_eth_mavlink.p1"))
         device_menu.addAction(self.commands.action("pixhawk.recover_eth_mavlink.p2"))
         device_menu.addAction(self.commands.action("pixhawk.discover_usb"))
@@ -857,19 +914,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             QGroupBox {{ border: 1px solid {PANEL_BORDER}; margin-top: 7px; padding-top: 5px; }}
             QGroupBox::title {{ subcontrol-origin: margin; left: 7px; padding: 0 3px; color: {TEXT_MUTED}; }}
             QFrame#workstationHeader {{ border-bottom: 1px solid {PANEL_BORDER}; }}
-            QLabel#workspaceTitle {{ font-size: 16px; font-weight: 600; }}
-            QLabel#inspectorContext {{ font-size: 14px; font-weight: 600; }}
-            QLabel#engineeringLabel {{ color: {TEXT_MUTED}; font-size: 10px; }}
+            QLabel#engineeringLabel {{ color: {TEXT_MUTED}; }}
             QLabel#workspaceSubtitle,
             QLabel#engineeringMeta,
             QLabel#cameraPreviewMeta,
             QLabel#statusIndicatorDetail,
             QLabel#statusStrip,
             QLabel#compactContract,
-            QLabel#protocolCheck {{ color: {TEXT_MUTED}; font-size: 10px; }}
-            QLabel#engineeringMeta {{ font-size: 9px; }}
-            QLabel#protocolState {{ font-size: 11px; font-weight: 600; }}
-            QLabel#engineeringValue {{ font-size: 13px; font-weight: 600; }}
+            QLabel#protocolCheck {{ color: {TEXT_MUTED}; }}
             QFrame#cameraPreview {{ background: #161616; border: 1px solid #525252; }}
             QLabel#cameraPreviewTitle, QLabel#cameraPreviewMeta {{ color: #ffffff; }}
             QLabel#cameraPreviewImage {{ background: #262626; color: #c6c6c6; }}
@@ -914,7 +966,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         if isinstance(page, str):
             self.workspace_host.setCurrentIndex(self._workspace_indexes[page])
         if page == "alignment":
+            start_lrf = getattr(self.backend, "start_lrf_polling", None)
+            if callable(start_lrf):
+                try:
+                    start_lrf()
+                except Exception as exc:
+                    self.statusBar().showMessage(f"LRF polling: {exc}", 5000)
             self.alignment.select_tab_for_context(context_id)
+        elif isinstance(page, str):
+            stop_lrf = getattr(self.backend, "stop_lrf_polling", None)
+            if callable(stop_lrf):
+                try:
+                    stop_lrf()
+                except Exception as exc:
+                    self.statusBar().showMessage(f"LRF polling stop: {exc}", 5000)
         self._refresh_visible_surfaces(self.status_adapter.model.snapshot())
         self.inspector.refresh(context_id, self.status_adapter.model)
         if context_id.startswith("diagnostics"):
@@ -957,6 +1022,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _camera_enable_rtsp(self) -> object:
         return self.backend.camera_enable_rtsp()
 
+    def _camera_reactivate(self, camera: str) -> object:
+        return self.backend.camera_reactivate(camera)
+
     def _camera_swap(self) -> object:
         return self.backend.camera_swap()
 
@@ -977,6 +1045,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _pixhawk_toggle_mavlink(self) -> object:
         return self.backend.pixhawk_toggle_mavlink()
+
+    def _pixhawk_reset_level_calibration(self) -> object:
+        return self.backend.pixhawk_reset_level_calibration()
 
     def _pixhawk_recover_eth_mavlink(self, camera: str) -> object:
         return self.backend.pixhawk_recover_eth_mavlink(camera)
@@ -1014,14 +1085,33 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _calibration_capture_images(self) -> object:
         return self.backend.calibration_capture_images()
 
+    def _calibration_toggle_auto_capture(self) -> object:
+        panel = getattr(self.backend, "panel", None)
+        controller = getattr(panel, "_calibration_workflow_controller_owner", None)
+        active = bool(getattr(controller, "_auto_capture_active", False))
+        if not active:
+            self.backend.calibration_apply_setup(self.calibration.setup_payload())
+        return self.backend.calibration_toggle_auto_capture()
+
     def _calibration_run_intrinsic(self) -> object:
+        self.backend.calibration_apply_setup(self.calibration.setup_payload())
         return self.backend.calibration_run_intrinsic()
+
+    def _calibration_run_extrinsics(self) -> object:
+        self.backend.calibration_apply_setup(self.calibration.setup_payload())
+        return self.backend.calibration_run_extrinsics()
 
     def _calibration_save_intrinsics(self) -> object:
         return self.backend.calibration_save_intrinsics()
 
+    def _calibration_save_extrinsics(self) -> object:
+        return self.backend.calibration_save_extrinsics()
+
     def _calibration_load_intrinsics(self) -> object:
         return self.backend.calibration_load_intrinsics()
+
+    def _calibration_load_extrinsics(self) -> object:
+        return self.backend.calibration_load_extrinsics()
 
     def _calibration_load_current_zoom_intrinsics(self) -> object:
         return self.backend.calibration_load_current_zoom_intrinsics()
@@ -1029,10 +1119,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _calibration_apply_intrinsics(self) -> object:
         return self.backend.calibration_apply_intrinsics()
 
+    def _calibration_apply_bundle(self) -> object:
+        return self.backend.calibration_apply_bundle()
+
     def _calibration_load_validation(self) -> object:
         return self.backend.calibration_load_validation()
 
     def _calibration_run_validation(self) -> object:
+        self.backend.calibration_apply_setup(self.calibration.setup_payload())
         return self.backend.calibration_run_validation()
 
     def _calibration_save_validation(self) -> object:
@@ -1060,6 +1154,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.calibration_scan_validation()
 
     def _calibration_save_setup(self) -> object:
+        self.backend.calibration_apply_setup(self.calibration.setup_payload())
         return self.backend.calibration_save_setup()
 
     def _alignment_scan_sources(self) -> object:
@@ -1176,29 +1271,43 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             status is not None and status.state in {"LIVE", "STARTING"}
             for status in (snapshot.get("camera.left"), snapshot.get("camera.right"))
         )
-        clock_change_active = any(
-            getattr(panel, name, None) is not None
-            for name in ("wiris_time_sync_thread", "wiris_gdti_thread")
-        )
+        clock_change_active = getattr(panel, "wiris_time_sync_thread", None) is not None
         # These controls are safety gates shared by several hidden pages, so
         # keep their enabled state current without rebuilding those pages.
         self.measurement.refresh_run_controls(snapshot, panel)
-        for command_id in ("camera.swap", "camera.save_settings"):
+        rtsp_operation_active = any(
+            getattr(panel, attribute, None) is not None
+            for attribute in ("_rtsp_reactivation_side", "rtsp_enable_thread", "rtsp_check_thread")
+        )
+        for command_id in (
+            "camera.swap",
+            "camera.save_settings",
+        ):
             button = self.camera.operation_buttons.get(command_id)
             if button is not None:
                 button.setEnabled(not recording_locked)
+        for command_id in ("camera.reactivate_left", "camera.reactivate_right"):
+            button = self.camera.operation_buttons.get(command_id)
+            if button is not None:
+                button.setEnabled(not recording_locked and not rtsp_operation_active)
         time_set_button = self.time_workspace.operation_buttons.get("time.set_pc")
         if time_set_button is not None:
             time_set_button.setEnabled(not recording_locked)
         swap_button = self.alignment.operation_buttons.get("alignment.swap_pixhawks")
         if swap_button is not None:
             swap_button.setEnabled(not recording_locked)
+        reset_level_button = self.alignment.operation_buttons.get("pixhawk.reset_level_calibration")
+        if reset_level_button is not None:
+            reset_level_button.setEnabled(not recording_locked)
         self.commands.set_enabled("camera.toggle", not recording_locked)
         self.commands.set_enabled("camera.auto_connect", not recording_locked)
         self.commands.set_enabled("camera.swap", not recording_locked)
         self.commands.set_enabled("camera.save_settings", not recording_locked)
+        self.commands.set_enabled("camera.reactivate_left", not recording_locked and not rtsp_operation_active)
+        self.commands.set_enabled("camera.reactivate_right", not recording_locked and not rtsp_operation_active)
         self.commands.set_enabled("alignment.swap_pixhawks", not recording_locked)
         self.commands.set_enabled("pixhawk.toggle_mavlink", not recording_locked)
+        self.commands.set_enabled("pixhawk.reset_level_calibration", not recording_locked)
         bootstrap_active = getattr(panel, "pixhawk_usb_bootstrap_thread", None) is not None
         for command_id in (
             "pixhawk.recover_eth_mavlink.p1",

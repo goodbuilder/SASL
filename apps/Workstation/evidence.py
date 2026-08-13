@@ -906,6 +906,15 @@ class EvidenceAdapter:
             "inner_rows": _integer(_widget_value(getattr(self.panel, "calib_rows_spin", None))),
             "square_size_mm": _number(_widget_value(getattr(self.panel, "calib_square_spin", None))),
             "min_images": _integer(_widget_value(getattr(self.panel, "calib_min_images_spin", None))),
+            "calculation_pair_count": _integer(
+                _widget_value(getattr(self.panel, "calib_calculation_pairs_spin", None))
+            ),
+            "auto_interval_s": _number(
+                _widget_value(getattr(self.panel, "calibration_auto_interval_spin", None))
+            ),
+            "auto_target_pairs": _integer(
+                _widget_value(getattr(self.panel, "calibration_auto_target_spin", None))
+            ),
             "calibration_root": _widget_text(getattr(self.panel, "calib_dir_edit", None)),
             "validation_mode": str(
                 _combo_data(getattr(self.panel, "checkerboard_validation_mode_combo", None), "pixhawk")
@@ -1136,18 +1145,118 @@ class EvidenceAdapter:
         if zoom is None:
             zoom_widget = getattr(self.panel, "zoom_level_spin", None)
             zoom = _integer(_widget_value(zoom_widget))
+        selected_extrinsics_profile = getattr(
+            self.panel, "selected_extrinsics_profile", None
+        )
         extrinsics = None if result is None else getattr(result, "extrinsics", None)
+        if extrinsics is None and selected_extrinsics_profile is not None:
+            extrinsics = getattr(selected_extrinsics_profile, "extrinsics", None)
         extrinsics_payload: dict[str, object] = {}
         if extrinsics is not None:
             translation = tuple(getattr(extrinsics, "translation_left_to_right_m", ()) or ())
+            rotation = tuple(
+                tuple(row)
+                for row in (getattr(extrinsics, "rotation_left_to_right", ()) or ())
+            )
+            right_origin = None
+            if len(rotation) == 3 and all(len(row) == 3 for row in rotation) and len(translation) == 3:
+                right_origin = tuple(
+                    -sum(
+                        float(rotation[column][row]) * float(translation[column])
+                        for column in range(3)
+                    )
+                    for row in range(3)
+                )
             extrinsics_payload = {
                 "state": "AVAILABLE",
                 "pair_count": _integer(getattr(extrinsics, "pair_count", None)),
                 "reprojection_error_px": _number(getattr(extrinsics, "reprojection_error_px", None)),
+                "rotation_left_to_right": rotation,
                 "translation_left_to_right_m": translation,
+                "right_camera_origin_in_left_rdf_m": right_origin,
                 "frame_contract": str(getattr(extrinsics, "frame_contract", "") or f"{CAMERA_FRAME}; left→right R/T"),
                 "baseline_m": sum(float(value) * float(value) for value in translation) ** 0.5 if translation else None,
             }
+        active_intrinsics_zoom = _integer(
+            getattr(self.panel, "_active_intrinsics_source_zoom_level", None)
+        )
+        if active_intrinsics_zoom is None:
+            active_intrinsics_zoom = zoom
+        active_extrinsics_zoom = _integer(
+            getattr(self.panel, "_active_extrinsics_source_zoom_level", None)
+        )
+        selected_extrinsics_zoom = _integer(
+            getattr(selected_extrinsics_profile, "source_zoom_level", None)
+        )
+        extrinsics_source_zoom = (
+            active_extrinsics_zoom
+            if active is not None and active_extrinsics_zoom is not None
+            else selected_extrinsics_zoom
+        )
+        extrinsics_profile_path = str(
+            getattr(self.panel, "_active_extrinsics_profile_path", "")
+            if active is not None
+            else getattr(self.panel, "_selected_extrinsics_profile_path", "")
+            or ""
+        )
+        if not extrinsics_profile_path and selected_extrinsics_profile is not None:
+            profile_id = str(getattr(selected_extrinsics_profile, "profile_id", "") or "stereo_extrinsics")
+            extrinsics_profile_path = f"memory:{profile_id}"
+        cross_zoom = (
+            active_intrinsics_zoom is not None
+            and extrinsics_source_zoom is not None
+            and active_intrinsics_zoom != extrinsics_source_zoom
+        )
+        combination = (
+            f"K,D zoom {active_intrinsics_zoom} + R,t zoom {extrinsics_source_zoom} "
+            f"({'cross-zoom/manual' if cross_zoom else 'same-zoom/manual'})"
+            if extrinsics is not None
+            else f"K,D zoom {active_intrinsics_zoom}; R,t not selected"
+        )
+        actual_zoom = getattr(self.panel, "actual_visible_zoom", {}) or {}
+        actual_parts: list[str] = []
+        for side in ("left", "right"):
+            state = actual_zoom.get(side, {}) if isinstance(actual_zoom, dict) else {}
+            index = state.get("index") if isinstance(state, dict) else None
+            actual_parts.append(f"{side}={index if index is not None else 'unknown'}")
+        zoom_readback = ", ".join(actual_parts)
+        capture_controller = getattr(self.panel, "_calibration_workflow_controller_owner", None)
+        auto_capture_active = bool(getattr(capture_controller, "_auto_capture_active", False))
+        auto_capture_saved_pairs = _integer(
+            getattr(capture_controller, "_auto_capture_saved_pairs", None)
+        )
+        valid_pair_count = extrinsics_payload.get("pair_count")
+        if auto_capture_saved_pairs is not None and (
+            auto_capture_active or auto_capture_saved_pairs > 0
+        ):
+            valid_pair_count = auto_capture_saved_pairs
+        selected_validation_mode = str(
+            _combo_data(getattr(self.panel, "checkerboard_validation_mode_combo", None), "pixhawk")
+            or "pixhawk"
+        )
+        result_validation_mode = str(
+            getattr(self.panel, "checkerboard_validation_result_mode", "") or ""
+        )
+        validation_mode = (
+            result_validation_mode
+            if result is not None and result_validation_mode
+            else selected_validation_mode
+        )
+        validation_run_results = getattr(self.panel, "checkerboard_validation_run_results", ()) or ()
+        if not isinstance(validation_run_results, (tuple, list)):
+            validation_run_results = ()
+        raw_progress = getattr(self.panel, "calibration_progress", {}) or {}
+        if isinstance(raw_progress, dict):
+            progress = dict(raw_progress)
+        else:
+            progress = {}
+        try:
+            progress_percent = float(progress.get("percent", 0.0))
+        except (TypeError, ValueError):
+            progress_percent = 0.0
+        progress_text = str(progress.get("message") or progress.get("phase") or "Idle")
+        if progress:
+            progress_text = f"{progress_text} ({max(0.0, min(100.0, progress_percent)):.0f}%)"
         return {
             "state": (
                 "CALCULATING"
@@ -1161,14 +1270,47 @@ class EvidenceAdapter:
             "active": active is not None,
             "calculation_active": calculation_active,
             "profile_path": profile_path,
+            "intrinsics_profile_hash": str(
+                getattr(self.panel, "_active_intrinsics_profile_hash", "") or ""
+            ),
             "zoom": zoom,
+            "intrinsics_source_zoom": active_intrinsics_zoom,
+            "extrinsics_profile_path": extrinsics_profile_path,
+            "extrinsics_profile_hash": str(
+                getattr(self.panel, "_active_extrinsics_profile_hash", "")
+                if active is not None
+                else getattr(self.panel, "_selected_extrinsics_profile_hash", "")
+                or ""
+            ),
+            "extrinsics_source_zoom": extrinsics_source_zoom,
+            "combination": combination,
+            "cross_zoom": cross_zoom,
+            "selection_mode": str(
+                getattr(self.panel, "_active_calibration_selection_mode", "")
+                or ("manual_candidate" if extrinsics is not None else "intrinsics_only")
+            ),
+            "validation_gate": "disabled",
+            "zoom_readback": zoom_readback,
             "status_label": status_label,
-            "source": "checkerboard calculation worker + active_intrinsics/last_calibration_result",
+            "progress": progress_text,
+            "valid_pair_count": valid_pair_count,
+            "auto_capture_active": auto_capture_active,
+            "auto_capture_saved_pairs": auto_capture_saved_pairs,
+            "auto_capture_target_pairs": _integer(
+                _widget_value(getattr(self.panel, "calibration_auto_target_spin", None))
+            ),
+            "source": (
+                "checkerboard calculation worker + live auto-capture controller + "
+                "active_intrinsics/last_calibration_result"
+            ),
             "left": self._camera_intrinsics(None if result is None else getattr(result, "left", None)),
             "right": self._camera_intrinsics(None if result is None else getattr(result, "right", None)),
             "extrinsics": extrinsics_payload,
-            "validation_mode": str(getattr(self.panel, "checkerboard_validation_result_mode", "") or ""),
+            "validation_mode": validation_mode,
             "validation_summary": dict(getattr(self.panel, "checkerboard_validation_summary", {}) or {}),
+            "validation_run_results": tuple(
+                dict(row) for row in validation_run_results if isinstance(row, dict)
+            ),
             "frame_contract": f"{CAMERA_FRAME}; calibration intrinsics/extrinsics stay in OpenCV optical RDF",
             "measurement_contract": f"public output {MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]; baseline {BASELINE_TRANSLATION_FRAME}",
         }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -7,6 +8,9 @@ from enum import Enum
 from typing import Any, Iterator, Mapping
 
 from PyQt5 import QtCore
+
+
+LRF_STALE_AFTER_S = 1.0
 
 
 class StatusSeverity(str, Enum):
@@ -172,6 +176,7 @@ class BackendStatusAdapter(QtCore.QObject):
         with self.model.batch():
             self._refresh_camera(panel, "left", "CAM L", now_s)
             self._refresh_camera(panel, "right", "CAM R", now_s)
+            self._refresh_lrf(panel, now_s)
             self._refresh_pixhawk(panel, "left", "P1", now_s)
             self._refresh_pixhawk(panel, "right", "P2", now_s)
             self._refresh_base_gnss(panel, now_s)
@@ -210,6 +215,64 @@ class BackendStatusAdapter(QtCore.QObject):
             clock="app_receive_monotonic",
             observed_monotonic_s=now_s,
         )
+
+    def _refresh_lrf(self, panel: object, now_s: float) -> None:
+        values = getattr(panel, "latest_wiris_lrf", {}) or {}
+        values = values if isinstance(values, Mapping) else {}
+        for side, label in (("left", "LRF L"), ("right", "LRF R")):
+            row = values.get(side)
+            row = row if isinstance(row, Mapping) else {}
+            distance_m = row.get("distance_m")
+            last_good_s = row.get("last_good_s")
+            last_attempt_s = row.get("last_attempt_s")
+            try:
+                distance_m = float(distance_m)
+                if not math.isfinite(distance_m) or distance_m < 0.0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                distance_m = None
+            try:
+                good_age_s = None if last_good_s is None else max(0.0, now_s - float(last_good_s))
+            except (TypeError, ValueError):
+                good_age_s = None
+            try:
+                attempt_age_s = None if last_attempt_s is None else max(0.0, now_s - float(last_attempt_s))
+            except (TypeError, ValueError):
+                attempt_age_s = None
+            error = str(row.get("last_error") or "").strip()
+            response = str(row.get("response") or "").strip()
+            if distance_m is None and not error:
+                state, severity = "WAITING", StatusSeverity.UNKNOWN
+                age_s = attempt_age_s
+            elif good_age_s is not None and good_age_s > LRF_STALE_AFTER_S:
+                state, severity = "STALE", StatusSeverity.WARN
+                age_s = good_age_s
+            elif error:
+                state, severity = "ERROR", StatusSeverity.BAD
+                age_s = attempt_age_s if attempt_age_s is not None else good_age_s
+            else:
+                state, severity = "LIVE", StatusSeverity.OK
+                age_s = good_age_s
+            detail_parts: list[str] = []
+            if distance_m is not None:
+                detail_parts.append(f"distance={distance_m:.3f} m")
+            if response:
+                detail_parts.append(f"response={response}")
+            if error:
+                detail_parts.append(f"error={error}")
+            if not detail_parts:
+                detail_parts.append("GLRD response 대기")
+            self.model.set_status(
+                f"lrf.{side}",
+                label,
+                state,
+                severity,
+                detail="; ".join(detail_parts),
+                source="WIRIS GLRD / WirisLrfPollWorker",
+                age_s=age_s,
+                clock="app receive monotonic; GLRD distance metres",
+                observed_monotonic_s=now_s,
+            )
 
     def _refresh_base_gnss(self, panel: object, now_s: float) -> None:
         """Project only the correction-source/Base receiver lifecycle.

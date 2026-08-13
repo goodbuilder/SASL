@@ -75,6 +75,7 @@ Simulation/bags/
 Simulation/recordings/
 apps/Simulation/bags/
 apps/Simulation/recordings/
+apps/Simulation/Recordings/
 *.bag
 *.db3
 *.ulg

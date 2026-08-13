@@ -73,6 +73,9 @@ class StandalonePanelBackend(QtCore.QObject):
     def camera_enable_rtsp(self) -> Any:
         return self._call("enable_wiris_rtsp")
 
+    def camera_reactivate(self, camera: str) -> Any:
+        return self._call("reactivate_wiris_rtsp", camera)
+
     def camera_swap(self) -> Any:
         return self._call("swap_cameras")
 
@@ -91,6 +94,9 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def pixhawk_toggle_mavlink(self) -> Any:
         return self._call("toggle_mavlink_connection")
+
+    def pixhawk_reset_level_calibration(self) -> Any:
+        return self._call("reset_px4_level_calibration")
 
     def pixhawk_recover_eth_mavlink(self, camera: str) -> Any:
         """Recover one PX4 Ethernet MAVLink stream through its USB shell path."""
@@ -140,20 +146,35 @@ class StandalonePanelBackend(QtCore.QObject):
     def calibration_capture_images(self) -> Any:
         return self._call("capture_calibration_images")
 
+    def calibration_toggle_auto_capture(self) -> Any:
+        return self._call("toggle_auto_calibration_capture")
+
     def calibration_run_intrinsic(self) -> Any:
         return self._call("run_intrinsic_calibration")
+
+    def calibration_run_extrinsics(self) -> Any:
+        return self._call("run_stereo_extrinsics_calibration")
 
     def calibration_save_intrinsics(self) -> Any:
         return self._call("save_intrinsics")
 
+    def calibration_save_extrinsics(self) -> Any:
+        return self._call("save_stereo_extrinsics_profile")
+
     def calibration_load_intrinsics(self) -> Any:
         return self._call("load_intrinsics")
+
+    def calibration_load_extrinsics(self) -> Any:
+        return self._call("load_stereo_extrinsics_profile")
 
     def calibration_load_current_zoom_intrinsics(self) -> Any:
         return self._call("load_current_zoom_intrinsics")
 
     def calibration_apply_intrinsics(self) -> Any:
         return self._call("apply_intrinsics_to_distance")
+
+    def calibration_apply_bundle(self) -> Any:
+        return self._call("apply_calibration_bundle")
 
     def calibration_load_validation(self) -> Any:
         return self._call("load_checkerboard_validation_json")
@@ -191,7 +212,7 @@ class StandalonePanelBackend(QtCore.QObject):
         return self._call("scan_checkerboard_validation_files")
 
     def calibration_save_setup(self) -> Any:
-        return self._call("save_current_settings_from_ui")
+        return self._call("save_workstation_calibration_setup")
 
     def alignment_scan_sources(self) -> Any:
         return self._call("refresh_baseline_field_browser")
@@ -216,6 +237,16 @@ class StandalonePanelBackend(QtCore.QObject):
     # dialogs, preview workers, and session writers.
     def advanced_wiris_catalog(self) -> Any:
         return self._call("workstation_wiris_command_catalog")
+
+    def start_lrf_polling(self) -> Any:
+        """Start the Alignment-only WIRIS GLRD polling worker."""
+
+        return self._call("start_wiris_lrf_polling")
+
+    def stop_lrf_polling(self) -> Any:
+        """Stop GLRD polling when the Alignment workspace is not visible."""
+
+        return self._call("stop_wiris_lrf_polling", wait=False)
 
     def advanced_send_wiris_command(self, target: str, command: str, terminator: str) -> Any:
         return self._call("workstation_send_wiris_command", target, command, terminator)

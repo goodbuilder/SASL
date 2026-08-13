@@ -52,7 +52,6 @@ SIMULATION_ENV_PREFIXES = (
     "WAYPOINT_",
     "WAYPOINTS_",
     "YOLO_",
-    "ATTITUDE_EXPERIMENT_",
 )
 
 

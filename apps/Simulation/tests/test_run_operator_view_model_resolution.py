@@ -67,7 +67,7 @@ def test_runtime_outputs_share_recordings_root() -> None:
 
     assert '"$ROOT_DIR/Recordings/operator_$(date +%Y%m%d_%H%M%S)_$record_mode"' in operator_source
     assert 'export OPERATOR_BAG_DIR="${OPERATOR_BAG_DIR:-$ROOT_DIR/Recordings}"' in operator_source
-    assert '"$ROOT_DIR/Recordings/waypoint_$(date +%Y%m%d_%H%M%S)_lite"' in waypoint_source
+    assert '"$ROOT_DIR/Recordings/waypoint_$(date +%Y%m%d_%H%M%S)_full"' in waypoint_source
     assert 'Path.cwd() / "Recordings"' in panel_source
 
 

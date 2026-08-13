@@ -8,10 +8,10 @@
       <inertial>
         <mass>2.0</mass>
         <inertia>
-          <ixx>0.02166666666666667</ixx>
+          <ixx>0.08804885057471266</ixx>
           <ixy>0</ixy>
           <ixz>0</ixz>
-          <iyy>0.02166666666666667</iyy>
+          <iyy>0.08804885057471266</iyy>
           <iyz>0</iyz>
           <izz>0.04000000000000001</izz>
         </inertia>
@@ -22,7 +22,7 @@
         <pose>0 0 0 0 0 3.141592654</pose>
         <geometry>
           <mesh>
-            <scale>3.2699 3.2699 3.2699</scale>
+            <scale>4.0638 4.0638 4.0638</scale>
             <uri>model://x500_2m/meshes/NXP-HGD-CF.dae</uri>
           </mesh>
         </geometry>
@@ -34,10 +34,10 @@
         </material>
       </visual>
       <collision name="base_link_collision_0">
-        <pose>0 0 0.0010 0 0 0</pose>
+        <pose>0 0 0.0012 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0525 0.0525 0.0074</size>
+            <size>0.0652 0.0652 0.0092</size>
           </box>
         </geometry>
         <surface>
@@ -53,10 +53,10 @@
         </surface>
       </collision>
       <collision name="base_link_collision_1">
-        <pose>0 -0.0146 -0.8105 -0.35 0 0</pose>
+        <pose>0 -0.0181 -1.0073 -0.35 0 0</pose>
         <geometry>
           <box>
-            <size>0.0022 0.0022 0.0312</size>
+            <size>0.0027 0.0027 0.0388</size>
           </box>
         </geometry>
         <surface>
@@ -72,10 +72,10 @@
         </surface>
       </collision>
       <collision name="base_link_collision_2">
-        <pose>0 0.0146 -0.8105 0.35 0 0</pose>
+        <pose>0 0.0181 -1.0073 0.35 0 0</pose>
         <geometry>
           <box>
-            <size>0.0022 0.0022 0.0312</size>
+            <size>0.0027 0.0027 0.0388</size>
           </box>
         </geometry>
         <surface>
@@ -91,10 +91,10 @@
         </surface>
       </collision>
       <collision name="base_link_collision_3">
-        <pose>0 -0.0196 -0.8248 0 0 0</pose>
+        <pose>0 -0.0244 -1.0251 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0372 0.0022 0.0022</size>
+            <size>0.0462 0.0027 0.0027</size>
           </box>
         </geometry>
         <surface>
@@ -110,10 +110,10 @@
         </surface>
       </collision>
       <collision name="base_link_collision_4">
-        <pose>0 0.0196 -0.8248 0 0 0</pose>
+        <pose>0 0.0244 -1.0251 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0372 0.0022 0.0022</size>
+            <size>0.0462 0.0027 0.0027</size>
           </box>
         </geometry>
         <surface>
@@ -228,7 +228,7 @@
       <gravity>false</gravity>
       <self_collide>false</self_collide>
       <velocity_decay />
-      <pose>0.5690 -0.5690 1.0 0 0 0</pose>
+      <pose>0.7071 -0.7071 0.2438 0 0 0</pose>
       <inertial>
         <mass>0.016076923076923075</mass>
         <inertia>
@@ -241,7 +241,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -252,10 +252,10 @@
         </material>
       </visual>
       <visual name="rotor_0_visual_blade_cross">
-        <pose>0 0 0.01 0 0 1.570796327</pose>
+        <pose>0 0 0.0124 0 0 1.570796327</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -266,11 +266,11 @@
         </material>
       </visual>
       <visual name="rotor_0_visual_hub">
-        <pose>0 0 0.04 0 0 0</pose>
+        <pose>0 0 0.0497 0 0 0</pose>
         <geometry>
           <cylinder>
-            <radius>0.0624</radius>
-            <length>0.0238</length>
+            <radius>0.0776</radius>
+            <length>0.0296</length>
           </cylinder>
         </geometry>
         <material>
@@ -281,10 +281,10 @@
         </material>
       </visual>
       <visual name="rotor_0_visual_motor_bell">
-        <pose>0 0 -0.1046 0 0 0</pose>
+        <pose>0 0 -0.13 0 0 0</pose>
         <geometry>
           <mesh>
-            <scale>3.2699 3.2699 3.2699</scale>
+            <scale>4.0638 4.0638 4.0638</scale>
             <uri>model://x500_2m/meshes/5010Bell.dae</uri>
           </mesh>
         </geometry>
@@ -299,7 +299,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0415 0.0025 0.0001258</size>
+            <size>0.0516 0.0031 0.0001563</size>
           </box>
         </geometry>
         <surface>
@@ -334,7 +334,7 @@
       <gravity>false</gravity>
       <self_collide>false</self_collide>
       <velocity_decay />
-      <pose>-0.5690 0.5690 1.0 0 0 0</pose>
+      <pose>-0.7071 0.7071 0.2438 0 0 0</pose>
       <inertial>
         <mass>0.016076923076923075</mass>
         <inertia>
@@ -347,7 +347,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -358,10 +358,10 @@
         </material>
       </visual>
       <visual name="rotor_1_visual_blade_cross">
-        <pose>0 0 0.01 0 0 1.570796327</pose>
+        <pose>0 0 0.0124 0 0 1.570796327</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -372,11 +372,11 @@
         </material>
       </visual>
       <visual name="rotor_1_visual_hub">
-        <pose>0 0 0.04 0 0 0</pose>
+        <pose>0 0 0.0497 0 0 0</pose>
         <geometry>
           <cylinder>
-            <radius>0.0624</radius>
-            <length>0.0238</length>
+            <radius>0.0776</radius>
+            <length>0.0296</length>
           </cylinder>
         </geometry>
         <material>
@@ -387,10 +387,10 @@
         </material>
       </visual>
       <visual name="rotor_1_visual_motor_top">
-        <pose>0 0 -0.1046 0 0 0</pose>
+        <pose>0 0 -0.13 0 0 0</pose>
         <geometry>
           <mesh>
-            <scale>3.2699 3.2699 3.2699</scale>
+            <scale>4.0638 4.0638 4.0638</scale>
             <uri>model://x500_2m/meshes/5010Bell.dae</uri>
           </mesh>
         </geometry>
@@ -405,7 +405,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0415 0.0025 0.0001258</size>
+            <size>0.0516 0.0031 0.0001563</size>
           </box>
         </geometry>
         <surface>
@@ -440,7 +440,7 @@
       <gravity>false</gravity>
       <self_collide>false</self_collide>
       <velocity_decay />
-      <pose>0.5690 0.5690 1.0 0 0 0</pose>
+      <pose>0.7071 0.7071 0.2438 0 0 0</pose>
       <inertial>
         <mass>0.016076923076923075</mass>
         <inertia>
@@ -453,7 +453,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -464,10 +464,10 @@
         </material>
       </visual>
       <visual name="rotor_2_visual_blade_cross">
-        <pose>0 0 0.01 0 0 1.570796327</pose>
+        <pose>0 0 0.0124 0 0 1.570796327</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -478,11 +478,11 @@
         </material>
       </visual>
       <visual name="rotor_2_visual_hub">
-        <pose>0 0 0.04 0 0 0</pose>
+        <pose>0 0 0.0497 0 0 0</pose>
         <geometry>
           <cylinder>
-            <radius>0.0624</radius>
-            <length>0.0238</length>
+            <radius>0.0776</radius>
+            <length>0.0296</length>
           </cylinder>
         </geometry>
         <material>
@@ -493,10 +493,10 @@
         </material>
       </visual>
       <visual name="rotor_2_visual_motor_top">
-        <pose>0 0 -0.1046 0 0 0</pose>
+        <pose>0 0 -0.13 0 0 0</pose>
         <geometry>
           <mesh>
-            <scale>3.2699 3.2699 3.2699</scale>
+            <scale>4.0638 4.0638 4.0638</scale>
             <uri>model://x500_2m/meshes/5010Bell.dae</uri>
           </mesh>
         </geometry>
@@ -511,7 +511,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0415 0.0025 0.0001258</size>
+            <size>0.0516 0.0031 0.0001563</size>
           </box>
         </geometry>
         <surface>
@@ -546,7 +546,7 @@
       <gravity>false</gravity>
       <self_collide>false</self_collide>
       <velocity_decay />
-      <pose>-0.5690 -0.5690 1.0 0 0 0</pose>
+      <pose>-0.7071 -0.7071 0.2438 0 0 0</pose>
       <inertial>
         <mass>0.016076923076923075</mass>
         <inertia>
@@ -559,7 +559,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -570,10 +570,10 @@
         </material>
       </visual>
       <visual name="rotor_3_visual_blade_cross">
-        <pose>0 0 0.01 0 0 1.570796327</pose>
+        <pose>0 0 0.0124 0 0 1.570796327</pose>
         <geometry>
           <box>
-            <size>0.8621 0.0505 0.0089</size>
+            <size>1.0714 0.0628 0.0111</size>
           </box>
         </geometry>
         <material>
@@ -584,11 +584,11 @@
         </material>
       </visual>
       <visual name="rotor_3_visual_hub">
-        <pose>0 0 0.04 0 0 0</pose>
+        <pose>0 0 0.0497 0 0 0</pose>
         <geometry>
           <cylinder>
-            <radius>0.0624</radius>
-            <length>0.0238</length>
+            <radius>0.0776</radius>
+            <length>0.0296</length>
           </cylinder>
         </geometry>
         <material>
@@ -599,10 +599,10 @@
         </material>
       </visual>
       <visual name="rotor_3_visual_motor_top">
-        <pose>0 0 -0.1046 0 0 0</pose>
+        <pose>0 0 -0.13 0 0 0</pose>
         <geometry>
           <mesh>
-            <scale>3.2699 3.2699 3.2699</scale>
+            <scale>4.0638 4.0638 4.0638</scale>
             <uri>model://x500_2m/meshes/5010Bell.dae</uri>
           </mesh>
         </geometry>
@@ -617,7 +617,7 @@
         <pose>0 0 0 0 0 0</pose>
         <geometry>
           <box>
-            <size>0.0415 0.0025 0.0001258</size>
+            <size>0.0516 0.0031 0.0001563</size>
           </box>
         </geometry>
         <surface>

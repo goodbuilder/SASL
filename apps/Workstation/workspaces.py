@@ -104,6 +104,39 @@ def _sync_table_rows(
                 item.setText(text)
 
 
+def _balance_preview_pair(splitter: QtWidgets.QSplitter) -> None:
+    """Give the two camera previews equal room before sizing them by aspect."""
+
+    if splitter.width() <= 0 or splitter.height() <= 0:
+        return
+    if splitter.orientation() == QtCore.Qt.Horizontal:
+        available = max(2, splitter.width() - splitter.handleWidth())
+    else:
+        available = max(2, splitter.height() - splitter.handleWidth())
+    first = available // 2
+    sizes = [first, available - first]
+    if splitter.sizes() != sizes:
+        splitter.setSizes(sizes)
+
+
+def _preview_pair_height(
+    splitter: QtWidgets.QSplitter,
+    previews: Mapping[str, "CameraPreview"],
+) -> int:
+    """Return the height needed to show both previews without letterboxing."""
+
+    _balance_preview_pair(splitter)
+    heights = [
+        max(0, preview.heightForWidth(max(1, preview.width())))
+        for preview in previews.values()
+    ]
+    if not heights:
+        return 0
+    if splitter.orientation() == QtCore.Qt.Horizontal:
+        return max(heights)
+    return sum(heights) + splitter.handleWidth() * max(0, len(heights) - 1)
+
+
 def _command_button(
     text: str,
     command_id: str,
@@ -509,6 +542,7 @@ class CameraPreview(QtWidgets.QFrame):
         layout.addWidget(self.meta)
         self._image: QtGui.QImage | None = None
         self._detection: DetectionObservation | None = None
+        self._metadata: object = {}
 
     def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override.
         return True
@@ -527,6 +561,15 @@ class CameraPreview(QtWidgets.QFrame):
         self._render()
         self._set_metadata(metadata, live=True)
 
+    def clear(self) -> None:
+        """Clear the displayed frame when the camera Preview is stopped."""
+
+        self._image = None
+        self._detection = None
+        self._metadata = {}
+        self._render()
+        self._set_metadata({}, live=False)
+
     def set_detection(self, detection: DetectionObservation | None) -> None:
         """Keep the latest image-space bbox for this display preview.
 
@@ -537,25 +580,28 @@ class CameraPreview(QtWidgets.QFrame):
 
         self._detection = detection
         self._render()
+        self._set_metadata(
+            self._metadata,
+            live=self._image is not None and not self._image.isNull(),
+        )
 
     def set_metadata(self, metadata: object) -> None:
         live = self._image is not None and not self._image.isNull()
         self._set_metadata(metadata, live=live)
 
     def _set_metadata(self, metadata: object, *, live: bool) -> None:
-        self.meta.setText("LIVE" if live else "WAITING")
+        self._metadata = metadata
         detail = self._metadata_text(metadata, live=live)
+        self.meta.setText(detail)
         self.meta.setToolTip(detail)
 
     def _metadata_text(self, metadata: object, *, live: bool) -> str:
-        data = metadata if isinstance(metadata, dict) else {}
-        stamp = data.get("timestamp_s")
-        source_stamp = data.get("source_timestamp_s")
         parts = ["LIVE" if live else "WAITING"]
-        if stamp is not None:
-            parts.append(f"receive={float(stamp):.3f} monotonic")
-        if source_stamp is not None:
-            parts.append(f"camera_ts={float(source_stamp):.3f}")
+        if self._detection is None:
+            parts.append("Class: --")
+        else:
+            class_name = self._detection.class_name or f"#{self._detection.class_id}"
+            parts.append(f"Class: {class_name}")
         return " | ".join(parts)
 
     def _render(self) -> None:
@@ -563,35 +609,64 @@ class CameraPreview(QtWidgets.QFrame):
             self.image.setText("NO VIDEO")
             self.image.setPixmap(QtGui.QPixmap())
             return
-        pixmap = QtGui.QPixmap.fromImage(self._image).scaled(
-            self.image.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation
+        target_size = self.image.size()
+        source_pixmap = QtGui.QPixmap.fromImage(self._image)
+        scaled = source_pixmap.scaled(
+            target_size, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation
         )
+        crop_x = max(0, (scaled.width() - target_size.width()) // 2)
+        crop_y = max(0, (scaled.height() - target_size.height()) // 2)
+        pixmap = scaled.copy(crop_x, crop_y, target_size.width(), target_size.height())
         if self._detection is not None:
-            pixmap = self._draw_detection_overlay(pixmap, self._detection)
+            pixmap = self._draw_detection_overlay(
+                pixmap,
+                self._detection,
+                scale_x=scaled.width() / source_pixmap.width(),
+                scale_y=scaled.height() / source_pixmap.height(),
+                crop_x=crop_x,
+                crop_y=crop_y,
+            )
         self.image.setPixmap(pixmap)
 
     @staticmethod
     def _draw_detection_overlay(
-        pixmap: QtGui.QPixmap, detection: DetectionObservation
+        pixmap: QtGui.QPixmap,
+        detection: DetectionObservation,
+        *,
+        scale_x: float | None = None,
+        scale_y: float | None = None,
+        crop_x: int = 0,
+        crop_y: int = 0,
     ) -> QtGui.QPixmap:
-        """Draw an image-pixel bbox on the already-scaled display pixmap."""
+        """Draw a bbox and circular center marker on the display pixmap."""
 
         if detection.width <= 0 or detection.height <= 0:
             return pixmap
-        scale_x = pixmap.width() / detection.width
-        scale_y = pixmap.height() / detection.height
+        if scale_x is None:
+            scale_x = pixmap.width() / detection.width
+        if scale_y is None:
+            scale_y = pixmap.height() / detection.height
         painter = QtGui.QPainter(pixmap)
         try:
             painter.setRenderHint(QtGui.QPainter.Antialiasing)
             color = QtGui.QColor(ACCENT)
             rect = QtCore.QRectF(
-                detection.x1 * scale_x,
-                detection.y1 * scale_y,
+                detection.x1 * scale_x - crop_x,
+                detection.y1 * scale_y - crop_y,
                 (detection.x2 - detection.x1) * scale_x,
                 (detection.y2 - detection.y1) * scale_y,
             )
             painter.setPen(QtGui.QPen(color, 2))
             painter.drawRect(rect)
+            center_x, center_y = detection.center
+            center = QtCore.QPointF(
+                center_x * scale_x - crop_x,
+                center_y * scale_y - crop_y,
+            )
+            marker_radius = max(3.0, min(6.0, min(pixmap.width(), pixmap.height()) * 0.012))
+            painter.setBrush(QtCore.Qt.NoBrush)
+            painter.setPen(QtGui.QPen(color, 2))
+            painter.drawEllipse(center, marker_radius, marker_radius)
             label = detection.class_name or f"#{detection.class_id}"
             painter.drawText(
                 QtCore.QPointF(rect.left(), max(10.0, rect.top() - 4.0)),
@@ -604,6 +679,52 @@ class CameraPreview(QtWidgets.QFrame):
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         self._render()
         super().resizeEvent(event)
+
+
+class CameraPreviewPair(QtWidgets.QSplitter):
+    """Aspect-aware pair container for the calibration camera previews."""
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(QtCore.Qt.Horizontal, parent)
+        self.setChildrenCollapsible(False)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override.
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt override.
+        previews = [self.widget(index) for index in range(self.count())]
+        if not previews:
+            return 0
+        if self.orientation() == QtCore.Qt.Horizontal:
+            available_width = max(0, int(width) - self.handleWidth())
+            first_width = available_width // len(previews)
+            widths = [first_width] * len(previews)
+            widths[-1] += available_width - sum(widths)
+            heights = [
+                int(preview.heightForWidth(max(0, preview_width)))
+                if callable(getattr(preview, "heightForWidth", None))
+                else 0
+                for preview, preview_width in zip(previews, widths)
+            ]
+            return max(heights, default=0)
+        preview_height = max(0, int(width))
+        return sum(
+            int(preview.heightForWidth(preview_height))
+            if callable(getattr(preview, "heightForWidth", None))
+            else 0
+            for preview in previews
+        ) + self.handleWidth() * max(0, len(previews) - 1)
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt override.
+        hint = super().sizeHint()
+        if hint.width() > 0:
+            hint.setHeight(self.heightForWidth(hint.width()))
+        return hint
+
+    def setOrientation(self, orientation: QtCore.Qt.Orientation) -> None:  # noqa: N802 - Qt override.
+        super().setOrientation(orientation)
+        self.updateGeometry()
 
 
 class CameraWorkspace(QtWidgets.QWidget):
@@ -749,12 +870,23 @@ class CameraWorkspace(QtWidgets.QWidget):
         mapping_group = QtWidgets.QGroupBox("Mapping")
         mapping_layout = QtWidgets.QHBoxLayout(mapping_group)
         mapping_layout.setContentsMargins(6, 6, 6, 6)
-        for command_id, label in (
-            ("camera.swap", "Swap L/R"),
-            ("camera.save_settings", "Save"),
-            ("advanced.open", "Advanced"),
+        for command_id, label, tooltip in (
+            ("camera.swap", "Swap L/R", "Swap the current Left/Right camera mapping."),
+            ("camera.save_settings", "Save", "Save the current camera settings."),
+            (
+                "camera.reactivate_left",
+                "Reactivate CAM L",
+                "Safely send SETH TRUE for the left camera, verify frames, and reconnect its preview.",
+            ),
+            (
+                "camera.reactivate_right",
+                "Reactivate CAM R",
+                "Safely send SETH TRUE for the right camera, verify frames, and reconnect its preview.",
+            ),
+            ("advanced.open", "Advanced", "Open Workstation advanced diagnostics and tools."),
         ):
             button = _command_button(label, command_id, invoke_command)
+            button.setToolTip(tooltip)
             self.operation_buttons[command_id] = button
             mapping_layout.addWidget(button)
         mapping_layout.addStretch(1)
@@ -796,12 +928,33 @@ class CameraWorkspace(QtWidgets.QWidget):
         self.preview_splitter.setOrientation(orientation)
         self.preview_splitter.setSizes([1, 1])
 
+    def _fit_preview_layout(self) -> None:
+        self._update_preview_pair_orientation()
+        required_height = _preview_pair_height(self.preview_splitter, self.previews)
+        if required_height <= 0:
+            return
+        target_height = max(320, required_height)
+        self.preview_splitter.setMinimumHeight(target_height)
+        total_height = self.workspace_splitter.height()
+        if total_height <= 0:
+            return
+        self.workspace_splitter.setStretchFactor(0, 0)
+        self.workspace_splitter.setStretchFactor(1, 1)
+        self.workspace_splitter.setSizes(
+            [target_height, max(1, total_height - target_height)]
+        )
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._update_preview_pair_orientation()
+        QtCore.QTimer.singleShot(0, self._fit_preview_layout)
 
     def _connect_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
+        clear_signal = getattr(panel, "camera_preview_cleared", None)
+        connect = getattr(clear_signal, "connect", None)
+        if callable(connect):
+            connect(self._clear_camera_previews)
         for side in ("left", "right"):
             pane = getattr(panel, f"{side}_pane", None)
             signal = getattr(pane, "frame_changed", None)
@@ -810,6 +963,10 @@ class CameraWorkspace(QtWidgets.QWidget):
             stats_signal = getattr(pane, "stats_changed", None)
             if stats_signal is not None:
                 stats_signal.connect(lambda _label, stats, side=side: self.previews[side].set_metadata(stats))
+
+    def _clear_camera_previews(self) -> None:
+        for preview in self.previews.values():
+            preview.clear()
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         evidence = _evidence(self.backend)
@@ -837,6 +994,11 @@ class CameraWorkspace(QtWidgets.QWidget):
         recording = snapshot.get("recording")
         recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
         self._recording_locked = recording_locked
+        panel = getattr(self.backend, "panel", self.backend)
+        rtsp_operation_active = any(
+            getattr(panel, attribute, None) is not None
+            for attribute in ("_rtsp_reactivation_side", "rtsp_enable_thread", "rtsp_check_thread")
+        )
         preview_button = self.operation_buttons.get("camera.toggle")
         if preview_button is not None:
             camera_running = any(
@@ -845,10 +1007,17 @@ class CameraWorkspace(QtWidgets.QWidget):
             )
             preview_button.setText("Stop preview" if camera_running else "Preview")
             preview_button.setEnabled(not recording_locked)
-        for command_id in ("camera.swap", "camera.save_settings"):
+        for command_id in (
+            "camera.swap",
+            "camera.save_settings",
+        ):
             button = self.operation_buttons.get(command_id)
             if button is not None:
                 button.setEnabled(not recording_locked)
+        for command_id in ("camera.reactivate_left", "camera.reactivate_right"):
+            button = self.operation_buttons.get(command_id)
+            if button is not None:
+                button.setEnabled(not recording_locked and not rtsp_operation_active)
         connection = evidence.camera_connection_candidates()
         camera_discovery_status = str(connection.get("status", "NOT RUN") or "NOT RUN")
         self.discovery_status.set_value(
@@ -1023,17 +1192,27 @@ class TimeWorkspace(QtWidgets.QWidget):
 
         sync_group = QtWidgets.QGroupBox("Sync status")
         sync_layout = QtWidgets.QVBoxLayout(sync_group)
+        sync_status_row = QtWidgets.QHBoxLayout()
         self.sync_status = QtWidgets.QLabel("Waiting for RTCP/NTP")
         self.sync_status.setObjectName("statusStrip")
         self.sync_status.setWordWrap(True)
         self.sync_status.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.sync_reason = QtWidgets.QLabel("")
+        self.sync_reason.setObjectName("statusReason")
+        self.sync_reason.setWordWrap(True)
+        self.sync_reason.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.sync_reason.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.sync_reason.setStyleSheet(f"color: {ERROR_TEXT};")
+        self.sync_reason.hide()
+        sync_status_row.addWidget(self.sync_status, 1)
+        sync_status_row.addWidget(self.sync_reason, 1)
+        sync_layout.addLayout(sync_status_row)
         self.sync_summary = QtWidgets.QPlainTextEdit()
         self.sync_summary.setReadOnly(True)
         self.sync_summary.setMaximumBlockCount(80)
-        # Keep the sync evidence readable while preserving the compact time
-        # workflow: 30% more vertical room than the original 110 px.
-        self.sync_summary.setFixedHeight(143)
-        sync_layout.addWidget(self.sync_status)
+        # Tall enough to show recent RTCP/NTP sync lines without an inner
+        # scrollbar; the workspace itself scrolls at the page level.
+        self.sync_summary.setFixedHeight(200)
         sync_layout.addWidget(self.sync_summary)
         layout.addWidget(sync_group)
 
@@ -1125,11 +1304,29 @@ class TimeWorkspace(QtWidgets.QWidget):
 
     def refresh(self, _snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
+        # The Workstation owns a separate visible Time workspace while the
+        # source panel (and its legacy time tab) stays hidden.  Once the
+        # finite STUS verification timer reaches verified/failed, frame-path
+        # refreshes therefore no longer update the source labels.  Recompute
+        # the source-backed summary at the bounded 4 Hz workspace poll while
+        # this page is visible, then mirror the resulting widgets below.
+        update_clock_sync = getattr(panel, "_update_clock_sync_display", None)
+        if callable(update_clock_sync):
+            update_clock_sync()
         sync_status = self._widget_text(
             getattr(panel, "clock_sync_status_label", None), "Waiting for RTCP/NTP"
         )
         self.sync_status.setText(_compact_text(sync_status))
         self.sync_status.setToolTip(sync_status)
+        sync_state = str(getattr(panel, "camera_sync_status", "") or "").lower()
+        if sync_state == "failed":
+            reason = str(getattr(panel, "camera_sync_reason", "") or "reason unavailable")
+            self.sync_reason.setText(f"Failed: {reason}")
+            self.sync_reason.setToolTip(reason)
+            self.sync_reason.show()
+        else:
+            self.sync_reason.clear()
+            self.sync_reason.hide()
         summary = self._widget_text(getattr(panel, "clock_sync_summary_text", None), "")
         if summary != self.sync_summary.toPlainText():
             self.sync_summary.setPlainText(summary)
@@ -1161,10 +1358,6 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
         layout.addWidget(WorkspaceHeader("Measurement", "Camera → detection → result"))
-        self.result_status = QtWidgets.QLabel("Waiting for measurement")
-        self.result_status.setObjectName("measurementResultStatus")
-        self.result_status.setWordWrap(True)
-        layout.addWidget(self.result_status)
 
         run_group = QtWidgets.QGroupBox("Run")
         run_layout = QtWidgets.QHBoxLayout(run_group)
@@ -1182,6 +1375,16 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             run_layout.addWidget(button)
         run_layout.addStretch(1)
         layout.addWidget(run_group)
+
+        self.active_calibration_label = QtWidgets.QLabel(
+            "Calibration bundle: not applied"
+        )
+        self.active_calibration_label.setObjectName("statusStrip")
+        self.active_calibration_label.setWordWrap(True)
+        self.active_calibration_label.setTextInteractionFlags(
+            QtCore.Qt.TextSelectableByMouse
+        )
+        layout.addWidget(self.active_calibration_label)
 
         upstream_group = QtWidgets.QGroupBox("Inputs")
         upstream_layout = QtWidgets.QVBoxLayout(upstream_group)
@@ -1471,9 +1674,16 @@ class MeasurementWorkspace(QtWidgets.QWidget):
         self.preview_splitter.setOrientation(orientation)
         self.preview_splitter.setSizes([1, 1])
 
+    def _fit_preview_layout(self) -> None:
+        self._update_preview_pair_orientation()
+        required_height = _preview_pair_height(self.preview_splitter, self.previews)
+        if required_height > 0:
+            self.preview_splitter.setFixedHeight(max(280, required_height))
+
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 - Qt override.
         super().resizeEvent(event)
         self._update_preview_pair_orientation()
+        QtCore.QTimer.singleShot(0, self._fit_preview_layout)
 
     def _inspect_upstream(self, key: str) -> None:
         self.inspection_requested.emit(
@@ -1543,6 +1753,10 @@ class MeasurementWorkspace(QtWidgets.QWidget):
 
     def _connect_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
+        clear_signal = getattr(panel, "camera_preview_cleared", None)
+        connect = getattr(clear_signal, "connect", None)
+        if callable(connect):
+            connect(self._clear_camera_previews)
         for side in ("left", "right"):
             pane = getattr(panel, f"{side}_pane", None)
             signal = getattr(pane, "frame_changed", None)
@@ -1556,6 +1770,10 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             stats_signal = getattr(pane, "stats_changed", None)
             if stats_signal is not None:
                 stats_signal.connect(lambda _label, stats, side=side: self.previews[side].set_metadata(stats))
+
+    def _clear_camera_previews(self) -> None:
+        for preview in self.previews.values():
+            preview.clear()
 
     def _refresh_preview_metadata(self, panel: object) -> None:
         metadata = getattr(panel, "camera_frame_metadata", {}) or {}
@@ -1592,10 +1810,7 @@ class MeasurementWorkspace(QtWidgets.QWidget):
             "LIVE",
             "STARTING",
         }
-        clock_change_active = any(
-            getattr(panel, name, None) is not None
-            for name in ("wiris_time_sync_thread", "wiris_gdti_thread")
-        )
+        clock_change_active = getattr(panel, "wiris_time_sync_thread", None) is not None
         self.control_buttons["camera.toggle"].setText(
             "Stop preview" if camera_state in {"LIVE", "STARTING"} else "Preview"
         )
@@ -1622,11 +1837,14 @@ class MeasurementWorkspace(QtWidgets.QWidget):
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         panel = getattr(self.backend, "panel", self.backend)
-        measurement = snapshot.get("measurement")
-        measurement_detail = measurement.detail if measurement else "Waiting for measurement"
-        self.result_status.setText(_compact_text(measurement_detail))
-        self.result_status.setToolTip(
-            f"{measurement_detail}\nclock={measurement.clock}" if measurement else ""
+        calibration = _evidence(self.backend).calibration()
+        self.active_calibration_label.setText(
+            "Calibration bundle: "
+            f"{calibration.get('combination') or 'not applied'} | "
+            f"K,D={calibration.get('profile_path') or '--'} | "
+            f"R,t={calibration.get('extrinsics_profile_path') or '--'} | "
+            f"actual {calibration.get('zoom_readback') or 'left=unknown, right=unknown'} | "
+            "validation gate=disabled"
         )
         self._refresh_preview_metadata(panel)
         self._refresh_quality(panel)
@@ -1709,6 +1927,7 @@ class PixhawkWorkspace(QtWidgets.QWidget):
             ("pixhawk.discover_mavlink_candidates", "Find network"),
             ("pixhawk.discover_host_ip", "Find host IP"),
             ("alignment.swap_pixhawks", "Swap P1/P2"),
+            ("pixhawk.reset_level_calibration", "Reset level cal."),
         ):
             button = _command_button(label, command_id, invoke_command)
             self.operation_buttons[command_id] = button
@@ -1912,6 +2131,9 @@ class PixhawkWorkspace(QtWidgets.QWidget):
         recording = snapshot.get("recording")
         self._recording_locked = recording is not None and recording.state in {"ACTIVE", "FINALIZING"}
         self.operation_buttons["pixhawk.toggle_mavlink"].setEnabled(not self._recording_locked)
+        reset_level_button = self.operation_buttons.get("pixhawk.reset_level_calibration")
+        if reset_level_button is not None:
+            reset_level_button.setEnabled(not self._recording_locked)
         recovery_feedback: list[str] = []
         for side, label in (("left", "P1"), ("right", "P2")):
             recovery = evidence.pixhawk_recovery(side)
@@ -2676,6 +2898,17 @@ class AlignmentWorkspace(QtWidgets.QWidget):
             evidence_layout.addWidget(indicator, index // 2, index % 2)
         layout.addWidget(evidence_group)
 
+        lrf_group = QtWidgets.QGroupBox("LRF (Laser Range Finder)")
+        lrf_layout = QtWidgets.QGridLayout(lrf_group)
+        self.lrf_indicators: dict[str, StatusIndicator] = {}
+        for index, (key, label) in enumerate(
+            (("lrf.left", "CAM L"), ("lrf.right", "CAM R"))
+        ):
+            indicator = StatusIndicator(label)
+            self.lrf_indicators[key] = indicator
+            lrf_layout.addWidget(indicator, 0, index)
+        layout.addWidget(lrf_group)
+
         attitude_group = QtWidgets.QGroupBox("Attitude")
         attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
         self.attitude_model = _table_model(
@@ -2794,6 +3027,7 @@ class AlignmentWorkspace(QtWidgets.QWidget):
                     ("pixhawk.discover_mavlink_candidates", "Find network"),
                     ("pixhawk.discover_host_ip", "Find host IP"),
                     ("alignment.swap_pixhawks", "Swap P1/P2"),
+                    ("pixhawk.reset_level_calibration", "Reset level cal."),
                 ),
             ),
             (
@@ -2850,6 +3084,8 @@ class AlignmentWorkspace(QtWidgets.QWidget):
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         for key, indicator in self.indicators.items():
+            indicator.set_status(snapshot.get(key))
+        for key, indicator in self.lrf_indicators.items():
             indicator.set_status(snapshot.get(key))
         evidence = _evidence(self.backend)
         attitude_rows: list[tuple[object, ...]] = []
@@ -2984,6 +3220,9 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         swap_button = self.operation_buttons.get("alignment.swap_pixhawks")
         if swap_button is not None:
             swap_button.setEnabled(not recording_locked)
+        reset_level_button = self.operation_buttons.get("pixhawk.reset_level_calibration")
+        if reset_level_button is not None:
+            reset_level_button.setEnabled(not recording_locked)
 
     def _inspect_attitude_row(self, index: QtCore.QModelIndex) -> None:
         side = "left" if index.row() == 0 else "right"
@@ -3116,6 +3355,17 @@ class CalibrationWorkspace(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self.backend = backend
+        self.invoke_command = invoke_command
+        self._camera_preview_metadata: dict[str, object] = {"left": {}, "right": {}}
+        self._checkerboard_overlay_active = {"left": False, "right": False}
+        self._checkerboard_preview_supported = callable(
+            getattr(self.backend, "advanced_refresh_calibration_preview", None)
+        )
+        self._checkerboard_preview_timer = QtCore.QTimer(self)
+        self._checkerboard_preview_timer.setInterval(500)
+        self._checkerboard_preview_timer.timeout.connect(self._request_checkerboard_preview)
+        self.setup_widgets: dict[str, QtWidgets.QWidget] = {}
+        self._initial_calibration_setup = dict(_evidence(self.backend).calibration_setup())
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -3124,11 +3374,72 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 "Calibration",
             )
         )
+
+        zoom_group = QtWidgets.QGroupBox("Visible zoom state (informational)")
+        zoom_layout = QtWidgets.QHBoxLayout(zoom_group)
+        self.zoom_1x_button = QtWidgets.QPushButton("Set both 1×")
+        self.zoom_8x_button = QtWidgets.QPushButton("Set both 8×")
+        self.zoom_query_button = QtWidgets.QPushButton("Read actual zoom")
+        self.zoom_readback_label = QtWidgets.QLabel("left=unknown, right=unknown")
+        self.zoom_readback_label.setObjectName("statusStrip")
+        self.zoom_readback_label.setWordWrap(True)
+        self.zoom_1x_button.clicked.connect(lambda: self._send_calibration_zoom("set", 1))
+        self.zoom_8x_button.clicked.connect(lambda: self._send_calibration_zoom("set", 8))
+        self.zoom_query_button.clicked.connect(lambda: self._send_calibration_zoom("query", None))
+        zoom_layout.addWidget(self.zoom_1x_button)
+        zoom_layout.addWidget(self.zoom_8x_button)
+        zoom_layout.addWidget(self.zoom_query_button)
+        zoom_layout.addWidget(self.zoom_readback_label, 1)
+        layout.addWidget(zoom_group)
+
+        camera_group = QtWidgets.QGroupBox("Live cameras")
+        camera_layout = QtWidgets.QVBoxLayout(camera_group)
+        camera_layout.setContentsMargins(6, 6, 6, 6)
+        camera_layout.setSpacing(5)
+        self.preview_splitter = CameraPreviewPair(self)
+        self.previews = {side: CameraPreview(side) for side in ("left", "right")}
+        for side in ("left", "right"):
+            preview = self.previews[side]
+            self.preview_splitter.addWidget(preview)
+        self.preview_splitter.setStretchFactor(0, 1)
+        self.preview_splitter.setStretchFactor(1, 1)
+        camera_layout.addWidget(self.preview_splitter)
+
+        camera_actions = QtWidgets.QHBoxLayout()
+        self.camera_buttons: dict[str, QtWidgets.QPushButton] = {}
+        for command_id, label in (
+            ("camera.toggle", "Preview"),
+            ("detection.toggle", "Detection"),
+        ):
+            button = _command_button(label, command_id, invoke_command)
+            self.camera_buttons[command_id] = button
+            camera_actions.addWidget(button)
+        camera_actions.addStretch(1)
+        camera_layout.addLayout(camera_actions)
+
+        self.operation_tabs = self._build_operation_tabs()
+        camera_layout.addWidget(self.operation_tabs)
+        layout.addWidget(camera_group)
+        self._connect_camera_panes()
+        self._connect_calibration_preview_signal()
+
         profile_group = QtWidgets.QGroupBox("Profile")
         profile_layout = QtWidgets.QGridLayout(profile_group)
         self.profile_values: dict[str, EngineeringValue] = {}
         for index, (key, label) in enumerate(
-            (("state", "State"), ("profile_path", "Profile"), ("zoom", "Zoom"), ("validation_mode", "Validation"), ("status_label", "Result"))
+            (
+                ("state", "State"),
+                ("profile_path", "Profile"),
+                ("zoom", "Zoom"),
+                ("extrinsics_profile_path", "R,t profile"),
+                ("extrinsics_source_zoom", "R,t source zoom"),
+                ("combination", "Combination"),
+                ("zoom_readback", "Actual zoom"),
+                ("validation_mode", "Validation"),
+                ("status_label", "Result"),
+                ("valid_pair_count", "Valid pairs"),
+                ("progress", "Progress"),
+            )
         ):
             value = EngineeringValue(label)
             self.profile_values[key] = value
@@ -3164,12 +3475,44 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         metrics_layout.addWidget(self.calibration_contract)
         layout.addWidget(metrics_group)
 
+        run_results_group = QtWidgets.QGroupBox("Calibration run results")
+        run_results_layout = QtWidgets.QVBoxLayout(run_results_group)
+        self.validation_run_model = _table_model(
+            self,
+            (
+                "Run",
+                "Pairs",
+                "L reproj px",
+                "R reproj px",
+                "Stereo px",
+                "Baseline m",
+                "ΔB mm",
+                "ΔR deg",
+                "ΔK L px",
+                "ΔK R px",
+                "State",
+            ),
+        )
+        self.validation_run_table = QtWidgets.QTableView()
+        self.validation_run_table.setModel(self.validation_run_model)
+        self.validation_run_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.validation_run_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.validation_run_table.setAlternatingRowColors(True)
+        self.validation_run_table.verticalHeader().setVisible(False)
+        self.validation_run_table.setMaximumHeight(190)
+        self.validation_run_table.horizontalHeader().setStretchLastSection(True)
+        self.validation_run_status = QtWidgets.QLabel("No calibration runs")
+        self.validation_run_status.setObjectName("statusStrip")
+        run_results_layout.addWidget(self.validation_run_table)
+        run_results_layout.addWidget(self.validation_run_status)
+        layout.addWidget(run_results_group)
+
         setup_group = QtWidgets.QGroupBox("Setup")
         setup_layout = QtWidgets.QVBoxLayout(setup_group)
         setup_layout.setContentsMargins(6, 6, 6, 6)
         setup_layout.setSpacing(5)
         setup = _evidence(self.backend).calibration_setup()
-        self.setup_widgets: dict[str, QtWidgets.QWidget] = {}
+        self._initial_calibration_setup = dict(setup)
 
         def setup_spin(
             key: str,
@@ -3180,8 +3523,11 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             widget = QtWidgets.QSpinBox()
             widget.setRange(minimum, maximum)
             value = setup.get(key)
-            widget.setValue(int(value if value is not None else minimum))
+            default_value = 20 if key == "calculation_pair_count" else minimum
+            widget.setValue(int(value if value is not None else default_value))
             widget.setSuffix(suffix)
+            if key == "calculation_pair_count":
+                widget.setSpecialValueText("all pairs")
             self.setup_widgets[key] = widget
             return widget
 
@@ -3228,6 +3574,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 ("Inner rows", setup_spin("inner_rows", 2, 30)),
                 ("Square size", setup_double("square_size_mm", 1.0, 500.0, " mm")),
                 ("Minimum images", setup_spin("min_images", 3, 100)),
+                ("Calculation pairs", setup_spin("calculation_pair_count", 0, 10000, " pair")),
                 ("Validation runs", setup_spin("validation_runs", 1, 20)),
                 ("Pairs / run", setup_spin("validation_pair_count", 0, 10000)),
                 ("Seed", setup_spin("validation_seed", 0, 2147483647)),
@@ -3254,7 +3601,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         path_form.addWidget(setup_text("validation_json", "intrinsics.json"), 2, 1, 1, 3)
         setup_layout.addLayout(path_form)
         setup_contract = QtWidgets.QLabel(
-            "Square: mm · pixels/intrinsics: OpenCV RDF · stereo T: left-camera→right-camera"
+            "Square: mm · pixels/intrinsics: OpenCV RDF · "
+            "X_right = R_left_to_right X_left + T_left_to_right_m"
         )
         setup_contract.setObjectName("compactContract")
         setup_layout.addWidget(setup_contract)
@@ -3266,8 +3614,30 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         )
         handoff_button.clicked.connect(open_advanced)
         layout.addWidget(handoff_button, alignment=QtCore.Qt.AlignRight)
+        layout.addStretch(1)
 
-        self.operation_tabs = QtWidgets.QTabWidget()
+    def _send_calibration_zoom(self, action: str, level: int | None) -> None:
+        sender = getattr(self.backend, "advanced_send_zoom", None)
+        if not callable(sender):
+            self.zoom_readback_label.setText("Zoom control unavailable")
+            return
+        if level is not None and "zoom_level" in self.setup_widgets:
+            widget = self.setup_widgets["zoom_level"]
+            if isinstance(widget, QtWidgets.QSpinBox):
+                widget.setValue(level)
+        try:
+            sender("both", action, level)
+        except Exception as exc:
+            self.zoom_readback_label.setText(f"Zoom command failed: {exc}")
+            return
+        self.zoom_readback_label.setText(
+            f"Requested both={level}×; GZVV readback pending"
+            if action == "set"
+            else "GZVV readback pending"
+        )
+
+    def _build_operation_tabs(self) -> QtWidgets.QTabWidget:
+        operation_tabs = QtWidgets.QTabWidget()
         self.operation_buttons: dict[str, QtWidgets.QPushButton] = {}
         operation_sections = (
             (
@@ -3285,7 +3655,16 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                     ("calibration.save_intrinsics", "Save intrinsics"),
                     ("calibration.load_intrinsics", "Load intrinsics"),
                     ("calibration.load_current_zoom_intrinsics", "Load current zoom"),
-                    ("calibration.apply_intrinsics", "Apply intrinsics"),
+                    ("calibration.apply_intrinsics", "Apply current K,D/R,t"),
+                ),
+            ),
+            (
+                "R,t + Apply",
+                (
+                    ("calibration.run_extrinsics", "Calculate R,t only"),
+                    ("calibration.save_extrinsics", "Save R,t"),
+                    ("calibration.load_extrinsics", "Load R,t"),
+                    ("calibration.apply_bundle", "Apply K,D + R,t"),
                 ),
             ),
             (
@@ -3305,14 +3684,144 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             page_layout.setContentsMargins(6, 6, 6, 6)
             actions_layout = QtWidgets.QGridLayout()
             for index, (command_id, label) in enumerate(actions):
-                button = _command_button(label, command_id, invoke_command)
+                button = _command_button(label, command_id, self.invoke_command)
                 self.operation_buttons[command_id] = button
                 actions_layout.addWidget(button, index // 3, index % 3)
             page_layout.addLayout(actions_layout)
+            if tab_label == "Capture":
+                auto_group = QtWidgets.QGroupBox("Automatic capture")
+                auto_layout = QtWidgets.QGridLayout(auto_group)
+                auto_layout.setHorizontalSpacing(8)
+                auto_layout.setVerticalSpacing(5)
+                auto_layout.setColumnStretch(1, 1)
+                auto_layout.setColumnStretch(3, 1)
+
+                auto_interval = QtWidgets.QDoubleSpinBox()
+                auto_interval.setRange(0.5, 10.0)
+                auto_interval.setSingleStep(0.5)
+                auto_interval.setDecimals(1)
+                auto_interval.setSuffix(" s")
+                auto_interval.setValue(
+                    float(self._initial_calibration_setup.get("auto_interval_s") or 1.0)
+                )
+                self.setup_widgets["auto_interval_s"] = auto_interval
+                auto_target = QtWidgets.QSpinBox()
+                auto_target.setRange(1, 200)
+                auto_target.setSuffix(" pair")
+                auto_target.setValue(
+                    int(self._initial_calibration_setup.get("auto_target_pairs") or 20)
+                )
+                self.setup_widgets["auto_target_pairs"] = auto_target
+                auto_button = _command_button(
+                    "Start auto capture",
+                    "calibration.auto_capture",
+                    self.invoke_command,
+                )
+                self.operation_buttons["calibration.auto_capture"] = auto_button
+                auto_button.setToolTip(
+                    "Capture only new left/right checkerboard detections whose RTCP/NTP timestamps differ by at most 100 ms."
+                )
+                auto_layout.addWidget(QtWidgets.QLabel("Interval"), 0, 0)
+                auto_layout.addWidget(auto_interval, 0, 1)
+                auto_layout.addWidget(QtWidgets.QLabel("Target pairs"), 0, 2)
+                auto_layout.addWidget(auto_target, 0, 3)
+                auto_layout.addWidget(auto_button, 1, 0, 1, 4)
+                page_layout.addWidget(auto_group)
             page_layout.addStretch(1)
-            self.operation_tabs.addTab(page, tab_label)
-        layout.addWidget(self.operation_tabs)
-        layout.addStretch(1)
+            operation_tabs.addTab(page, tab_label)
+        return operation_tabs
+
+    def _connect_camera_panes(self) -> None:
+        panel = getattr(self.backend, "panel", self.backend)
+        clear_signal = getattr(panel, "camera_preview_cleared", None)
+        connect = getattr(clear_signal, "connect", None)
+        if callable(connect):
+            connect(self._clear_camera_previews)
+        for side in ("left", "right"):
+            pane = getattr(panel, f"{side}_pane", None)
+            frame_signal = getattr(pane, "frame_changed", None)
+            connect = getattr(frame_signal, "connect", None)
+            if callable(connect):
+                connect(
+                    lambda _label, image, metadata, side=side: self._on_camera_frame(
+                        side,
+                        image,
+                        metadata,
+                    )
+                )
+            detection_signal = getattr(pane, "detection_changed", None)
+            connect = getattr(detection_signal, "connect", None)
+            if callable(connect):
+                connect(
+                    lambda _label, detection, side=side: self.previews[side].set_detection(detection)
+                )
+            stats_signal = getattr(pane, "stats_changed", None)
+            connect = getattr(stats_signal, "connect", None)
+            if callable(connect):
+                connect(
+                    lambda _label, stats, side=side: self.previews[side].set_metadata(stats)
+                )
+
+    def _clear_camera_previews(self) -> None:
+        self._checkerboard_overlay_active = {"left": False, "right": False}
+        self._camera_preview_metadata = {"left": {}, "right": {}}
+        for preview in self.previews.values():
+            preview.clear()
+
+    def _connect_calibration_preview_signal(self) -> None:
+        panel = getattr(self.backend, "panel", self.backend)
+        signal = getattr(panel, "calibration_preview_changed", None)
+        connect = getattr(signal, "connect", None)
+        if callable(connect):
+            connect(self._on_calibration_preview_changed)
+
+    def _on_camera_frame(self, side: str, image: QtGui.QImage, metadata: object) -> None:
+        self._camera_preview_metadata[side] = metadata
+        if not self._checkerboard_overlay_active[side]:
+            self.previews[side].set_frame(image, metadata)
+
+    def _on_calibration_preview_changed(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        camera = str(payload.get("camera") or "")
+        image = payload.get("image")
+        if camera not in self.previews or not isinstance(image, QtGui.QImage) or image.isNull():
+            return
+        kind = str(payload.get("kind") or "raw")
+        metadata = payload.get("metadata", self._camera_preview_metadata[camera])
+        if kind == "overlay":
+            self._checkerboard_overlay_active[camera] = True
+            self.previews[camera].set_frame(image, metadata)
+        elif not self._checkerboard_overlay_active[camera]:
+            self.previews[camera].set_frame(image, metadata)
+
+    def _request_checkerboard_preview(self) -> None:
+        if not self._checkerboard_preview_supported:
+            return
+        self._checkerboard_overlay_active = {"left": False, "right": False}
+        refresh = getattr(self.backend, "advanced_refresh_calibration_preview", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh()
+        except Exception as exc:
+            for preview in self.previews.values():
+                preview.meta.setToolTip(f"Checkerboard preview unavailable: {exc}")
+
+    def _start_checkerboard_preview(self) -> None:
+        if not self._checkerboard_preview_supported:
+            return
+        if not self._checkerboard_preview_timer.isActive():
+            self._checkerboard_preview_timer.start()
+        self._request_checkerboard_preview()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:  # noqa: N802 - Qt override.
+        super().showEvent(event)
+        self._start_checkerboard_preview()
+
+    def hideEvent(self, event: QtGui.QHideEvent) -> None:  # noqa: N802 - Qt override.
+        self._checkerboard_preview_timer.stop()
+        super().hideEvent(event)
 
     def setup_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {}
@@ -3325,8 +3834,40 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 payload[key] = widget.value()
         return payload
 
-    def refresh(self, _snapshot: dict[str, RuntimeStatus]) -> None:
+    def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
+        camera = snapshot.get("camera.left")
+        detection = snapshot.get("detection")
+        self.camera_buttons["camera.toggle"].setText(
+            "Stop preview" if camera and camera.state in {"LIVE", "STARTING"} else "Preview"
+        )
+        self.camera_buttons["detection.toggle"].setText(
+            "Stop detection"
+            if detection and detection.state in {"RUNNING", "STARTING"}
+            else "Detection"
+        )
+        panel = getattr(self.backend, "panel", self.backend)
+        calibration_controller = getattr(panel, "_calibration_workflow_controller_owner", None)
+        auto_capture_active = bool(getattr(calibration_controller, "_auto_capture_active", False))
+        auto_capture_button = self.operation_buttons.get("calibration.auto_capture")
+        if auto_capture_button is not None:
+            auto_capture_button.setText("Stop auto capture" if auto_capture_active else "Start auto capture")
+        recording = snapshot.get("recording")
+        recording_locked = bool(recording and recording.state in {"ACTIVE", "FINALIZING"})
+        camera_running = bool(
+            camera and camera.state in {"LIVE", "STARTING"}
+        ) or any(
+            status is not None and status.state in {"LIVE", "STARTING"}
+            for status in (snapshot.get("camera.left"), snapshot.get("camera.right"))
+        )
+        self.camera_buttons["camera.toggle"].setEnabled(not recording_locked)
+        self.camera_buttons["detection.toggle"].setEnabled(
+            not (recording_locked and camera_running)
+        )
         data = _evidence(self.backend).calibration()
+        self.zoom_readback_label.setText(
+            f"requested={data.get('zoom', '--')} | {data.get('zoom_readback', 'left=unknown, right=unknown')} | "
+            "mismatch is non-blocking"
+        )
         for key, value in self.profile_values.items():
             value.set_value(data.get(key), source=str(data.get("source", "")))
         intrinsic_rows: list[tuple[object, ...]] = []
@@ -3356,8 +3897,22 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             extrinsics = {}
         translation = extrinsics.get("translation_left_to_right_m")
         translation_text = "--" if not translation else "[" + ", ".join(_display_number(value, digits=6) for value in translation) + "] m"
+        rotation = extrinsics.get("rotation_left_to_right")
+        rotation_text = (
+            "--"
+            if not rotation
+            else "[" + "; ".join(
+                ", ".join(_display_number(value, digits=6) for value in row)
+                for row in rotation
+            ) + "]"
+        )
+        right_origin = extrinsics.get("right_camera_origin_in_left_rdf_m")
+        right_origin_text = "--" if not right_origin else "[" + ", ".join(_display_number(value, digits=6) for value in right_origin) + "] m"
         self.extrinsic_value.set_value(
-            f"{extrinsics.get('state', 'NO DATA')} | T_left_to_right={translation_text} | baseline={_display_number(extrinsics.get('baseline_m'))} m",
+            f"{extrinsics.get('state', 'NO DATA')} | R_left_to_right={rotation_text} | "
+            f"T_left_to_right={translation_text} | "
+            f"C_right_in_left=-RᵀT={right_origin_text} | "
+            f"baseline={_display_number(extrinsics.get('baseline_m'))} m",
             source=str(data.get("source", "")),
             frame=str(extrinsics.get("frame_contract", CAMERA_FRAME)),
         )
@@ -3368,8 +3923,53 @@ class CalibrationWorkspace(QtWidgets.QWidget):
             source="checkerboard_validation_summary",
             valid=True if summary_text else None,
         )
+        raw_run_results = data.get("validation_run_results") or ()
+        run_rows: list[tuple[object, ...]] = []
+        for run in raw_run_results if isinstance(raw_run_results, (tuple, list)) else ():
+            if not isinstance(run, dict):
+                continue
+            state = str(run.get("state") or "OK")
+            if state != "OK":
+                run_rows.append(
+                    (
+                        run.get("run", "--"),
+                        run.get("pairs", "--"),
+                        "--",
+                        "--",
+                        "--",
+                        "--",
+                        "--",
+                        "--",
+                        "--",
+                        "--",
+                        f"{state}: {run.get('error', '')}".strip(),
+                    )
+                )
+                continue
+            run_rows.append(
+                (
+                    run.get("run", "--"),
+                    run.get("pairs", "--"),
+                    _display_number(run.get("left_reprojection_error_px")),
+                    _display_number(run.get("right_reprojection_error_px")),
+                    _display_number(run.get("stereo_reprojection_error_px")),
+                    _display_number(run.get("baseline_m"), digits=6),
+                    _display_number(run.get("baseline_delta_mm")),
+                    _display_number(run.get("rotation_delta_deg"), digits=6),
+                    _display_number(run.get("left_intrinsics_delta_px")),
+                    _display_number(run.get("right_intrinsics_delta_px")),
+                    state,
+                )
+            )
+        _sync_table_rows(self.validation_run_model, tuple(run_rows))
+        self.validation_run_status.setText(
+            f"{len(run_rows)} run(s) · Full baseline + random validation runs"
+            if run_rows
+            else "No calibration runs"
+        )
         self.calibration_contract.setText(
-            f"Pixels/intrinsics: {CAMERA_FRAME} · stereo T: left→right · "
+            f"Pixels/intrinsics: {CAMERA_FRAME} · "
+            "X_right = R_left_to_right X_left + T_left_to_right_m · "
             f"output: {MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]"
         )
 

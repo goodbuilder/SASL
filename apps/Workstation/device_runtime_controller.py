@@ -28,6 +28,9 @@ from Workstation.workstation_core.pixhawk_attitude import (
     DualPixhawkMavlinkSubscriber,
     camera_label_ko,
 )
+from Workstation.workstation_core.px4_attitude_cal_manager import (
+    LEVEL_HORIZON_RESET_PARAM_NAMES,
+)
 
 DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "toggle_mavlink_connection",
@@ -81,6 +84,7 @@ DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "_apply_pixhawk_shell_worker_result",
     "_pixhawk_shell_worker_failed",
     "_clear_pixhawk_shell_worker",
+    "reset_px4_level_calibration",
     "_start_pixhawk_parameter_worker",
     "_apply_pixhawk_parameter_worker_result",
     "_pixhawk_parameter_worker_failed",
@@ -107,6 +111,77 @@ class DeviceRuntimeController:
         else:
             self.panel.connect_mavlink_pixhawk(camera)
         return None
+
+    def reset_px4_level_calibration(self) -> bool:
+        """Reset only PX4 Level Horizon fine-tuning offsets on both Pixhawks.
+
+        The board mounting rotation and the individual accelerometer/gyro
+        calibration slots are deliberately left untouched.  The PX4 shell's
+        ``param reset`` command restores each named parameter to the firmware
+        default and persists the change.
+        """
+
+        if self.panel._session_recording_active():
+            self.panel._log("[픽스호크] 세션 기록 중에는 수평 보정 파라미터를 초기화할 수 없습니다.")
+            return False
+        target_sides = tuple(self.panel._mavlink_open_sides())
+        if not target_sides:
+            self.panel._log("[픽스호크] 수평 보정 초기화 차단: MAVLink 연결이 없습니다.")
+            return False
+        armed_sides = tuple(
+            side
+            for side in target_sides
+            if bool(getattr(self.panel.px4_mag_managers.get(side), "armed", False))
+        )
+        if armed_sides:
+            labels = ", ".join(self.panel._px4_mag_camera_label(side) for side in armed_sides)
+            self.panel._log(
+                f"[픽스호크] 수평 보정 초기화 차단: {labels}가 armed 상태입니다. Disarm 후 다시 시도하세요."
+            )
+            return False
+
+        parameter_text = ", ".join(LEVEL_HORIZON_RESET_PARAM_NAMES)
+        labels = ", ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            "Reset Level Horizon Calibration",
+            (
+                f"{labels}의 PX4 수평(Level Horizon) 미세 보정값을 펌웨어 기본값으로 초기화합니다.\n\n"
+                f"대상: {parameter_text}\n"
+                "보드 장착 방향(SENS_BOARD_ROT), 가속도계/자이로(CAL_ACC*/CAL_GYRO*)와 "
+                "다른 PX4 파라미터는 변경하지 않습니다.\n\n"
+                "기체를 반드시 Disarm한 상태에서 진행하세요. 계속할까요?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self.panel._log("[픽스호크] 수평 보정 파라미터 초기화를 취소했습니다.")
+            return False
+
+        command = "param reset " + " ".join(LEVEL_HORIZON_RESET_PARAM_NAMES)
+        started = False
+        for side in target_sides:
+            started = (
+                self.panel._start_pixhawk_shell_worker(
+                    side,
+                    command,
+                    operation="reset_level_calibration",
+                    timeout_s=3.0,
+                    on_complete=lambda _result, camera=side: self.panel._start_pixhawk_parameter_worker(
+                        camera, "attitude_refresh"
+                    ),
+                )
+                or started
+            )
+        if not started:
+            self.panel._log("[픽스호크] 수평 보정 파라미터 초기화 명령을 시작하지 못했습니다.")
+            return False
+        self.panel._log(
+            f"[픽스호크] {labels} 수평 보정 초기화를 요청했습니다: {parameter_text}. "
+            "PX4 PARAM readback을 갱신합니다."
+        )
+        return True
 
     def _stop_pixhawk_operation_workers(self, *, wait: bool) -> bool:
         all_stopped = True

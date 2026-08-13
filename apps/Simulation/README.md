@@ -6184,7 +6184,7 @@ WAYPOINTS_XY_ALT_M="-300,0,10;-600,0,10;-900,0,10"
 WAYPOINT_SPEED_MPS=12.0
 WAYPOINT_ACCEPTANCE_RADIUS_M=5.0
 WAYPOINT_LAND_AFTER=true
-WAYPOINT_RECORD_LITE=true
+WAYPOINT_RECORD_FULL=true
 ```
 
 `WAYPOINTS_XY_ALT_M`의 각 항목은 `north,east,altitude_agl_m` 순서이며, 항목은 세미콜론으로 구분합니다. PX4 내부 `LOCAL_NED` 좌표계에서 north/east는 x/y이고, 고도는 사람이 보기 쉽게 양수 AGL 값으로 적습니다. 기본 waypoint는 `config/simulation.env`의 `DRONE_MOVE_DISTANCE_M`와 `DRONE_TAKEOFF_ALTITUDE_M`를 참조합니다. 파일을 수정한 뒤 `./run_operator_view.sh`로 Gazebo/PX4를 먼저 띄우고 별도 터미널에서 실행합니다.

@@ -34,7 +34,10 @@ recordings는 `.local/workstation_data/` 아래, Legacy 설정과 recordings는 
 저장·좌표 계약만 공유한다. Workstation에는 기존 CameraPane 신호를 재사용한 Camera/Measurement 프리뷰,
 측정 품질, detection, RTCP/NTP 동기화, GNSS/RTK NED baseline, recording/FPS 증거와 함께
 Alignment/Pixhawk/GNSS 표, Calibration profile/intrinsics/R/T 표, Recording/Review/Export
-session/artifact 표가 포함됩니다. Inspector와 Diagnostics도 같은 `EvidenceAdapter` source를
+session/artifact 표가 포함됩니다. Pre-run Calibration에는 좌/우 라이브 카메라 프리뷰가
+표시되고, 체커보드가 검출되면 프레임 위에 코너 그리드와 검출 상태가 표시됩니다. 프리뷰
+하단에서 카메라/검출 및 캘리브레이션 작업 버튼을 바로 조작할 수 있습니다.
+Inspector와 Diagnostics도 같은 `EvidenceAdapter` source를
 읽습니다. Workstation 테스트는 source/clock/age, 좌표 라벨, 명령 실패 전파와 context 종료를
 확인하며, Camera의 IP/RTSP/control 명령과 Pixhawk/GNSS의 discovery/MAVLink/Base/Survey-in/NTRIP
 명령도 기존 owner를 호출하는 phase-one facade로 제공합니다. Calibration 실행/적용,

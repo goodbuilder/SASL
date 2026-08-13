@@ -7,6 +7,7 @@ import faulthandler
 import os
 import signal
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -14,7 +15,19 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Start the SASL Workstation UI.")
     parser.add_argument("--check", action="store_true", help="Verify runtime imports without opening Qt.")
     parser.add_argument("--maximized", action="store_true", help="Open the Workstation maximized.")
-    parser.add_argument("--start", action="store_true", help="Start the camera preview after launch.")
+    parser.add_argument(
+        "--start",
+        dest="start",
+        action="store_true",
+        default=True,
+        help="Enable WIRIS/RTSP and start the camera preview after launch (default).",
+    )
+    parser.add_argument(
+        "--no-start",
+        dest="start",
+        action="store_false",
+        help="Open the Workstation without starting camera discovery or preview.",
+    )
     parser.add_argument(
         "--start-pixhawk",
         "--connect-pixhawk",
@@ -47,6 +60,23 @@ def _runtime_check() -> int:
     return 0
 
 
+def _workstation_lock_path() -> Path:
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    base = Path(runtime_dir) if runtime_dir else Path(tempfile.gettempdir())
+    return base / f"sasl-workstation-{uid}.lock"
+
+
+def _acquire_single_instance_lock(lock_path: Path | None = None):
+    """Keep one Workstation process per OS user to protect camera SDK ports."""
+
+    from PyQt5 import QtCore
+
+    lock = QtCore.QLockFile(str(lock_path or _workstation_lock_path()))
+    lock.setStaleLockTime(30_000)
+    return lock if lock.tryLock(0) else None
+
+
 def main(argv: list[str] | None = None) -> int:
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     try:
@@ -64,6 +94,10 @@ def main(argv: list[str] | None = None) -> int:
 
     _configure_gl_surface_format()
     app = QtWidgets.QApplication([sys.argv[0], *qt_args])
+    instance_lock = _acquire_single_instance_lock()
+    if instance_lock is None:
+        print("SASL Workstation is already running; duplicate launch was blocked.", file=sys.stderr)
+        return 0
     window = WorkstationMainWindow(
         auto_start=bool(args.start),
         auto_start_pixhawk=bool(args.start_pixhawk),

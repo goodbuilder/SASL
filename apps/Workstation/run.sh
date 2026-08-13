@@ -2,6 +2,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APPS_DIR="$(cd "$APP_DIR/.." && pwd)"
 SASL_ROOT="$(cd "$APP_DIR/../.." && pwd)"
 COMMON_PYTHON="$SASL_ROOT/common/python"
 
@@ -30,7 +31,7 @@ if [[ -z "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(resolve_python "$SASL_ROOT/.venv/bin/python" python3 python)"
 fi
 
-export PYTHONPATH="$SASL_ROOT:$COMMON_PYTHON${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$APPS_DIR:$SASL_ROOT:$COMMON_PYTHON${PYTHONPATH:+:$PYTHONPATH}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-$SASL_ROOT/.local/workstation_data/.cache/matplotlib}"
 mkdir -p "$MPLCONFIGDIR"
 
@@ -40,4 +41,4 @@ case "${1:-}" in
     ;;
 esac
 
-exec "$PYTHON_BIN" -m Workstation --maximized "$@"
+exec "$PYTHON_BIN" -m Workstation --maximized --start "$@"
