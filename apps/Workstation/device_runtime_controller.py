@@ -31,10 +31,12 @@ from Workstation.workstation_core.pixhawk_attitude import (
 from Workstation.workstation_core.px4_attitude_cal_manager import (
     LEVEL_HORIZON_RESET_PARAM_NAMES,
 )
+from Workstation.workstation_core.px4_calibration_groups import px4_calibration_group
 
 DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "toggle_mavlink_connection",
     "_stop_pixhawk_operation_workers",
+    "reset_px4_calibration_group",
     "discover_pc_camera_ip",
     "_apply_camera_network_discovery",
     "_camera_network_discovery_failed",
@@ -72,6 +74,7 @@ DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "_pixhawk_connection_failed",
     "_clear_pixhawk_connection_worker",
     "disconnect_mavlink_pixhawk",
+    "apply_selected_pixhawk_candidate",
     "apply_persistent_pixhawk_eth",
     "_apply_pixhawk_persistent_config_result",
     "_clear_pixhawk_persistent_config_worker",
@@ -744,6 +747,9 @@ class DeviceRuntimeController:
         )
 
     def connect_mavlink_pixhawk(self, camera: str | None = None, *, force_setup: bool = False) -> None:
+        if self.panel._session_recording_active():
+            self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
+            return
         target_sides = self.panel._mavlink_target_sides(camera)
         if all(side in self.panel._mavlink_connected_sides() for side in target_sides):
             if force_setup and self.panel.mavlink_pixhawk is not None:
@@ -833,11 +839,19 @@ class DeviceRuntimeController:
         self.panel.pixhawk_connection_worker = None
 
     def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
+        if self.panel._session_recording_active():
+            self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
+            return
         target_sides = self.panel._mavlink_target_sides(camera)
         if self.panel.mavlink_pixhawk is not None:
-            self.panel.mavlink_pixhawk.stop(camera)
+            stop = getattr(self.panel.mavlink_pixhawk, "stop", None)
+            if callable(stop):
+                stop(camera)
             if not getattr(self.panel.mavlink_pixhawk, "connections", {}):
                 self.panel.mavlink_pixhawk = None
+        connection_thread = getattr(self.panel, "pixhawk_connection_thread", None)
+        if connection_thread is not None and connection_thread.isRunning():
+            connection_thread.quit()
         for side in target_sides:
             self.panel.pixhawk_attitude_times[side].clear()
         self.panel._clear_px4_mag_manager_connection_state(camera)
@@ -851,6 +865,77 @@ class DeviceRuntimeController:
             self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
         label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
         self.panel._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
+        self.panel._refresh_operation_header()
+
+    def apply_selected_pixhawk_candidate(self, side: str, *, source: str | None = None) -> None:
+        if source is None:
+            source = "pc" if side == "host" else "mavlink"
+        entry = self.panel._selected_pixhawk_candidate(source)
+        if entry is None:
+            return
+        kind = str(entry.get("kind", ""))
+        value = str(entry.get("value", "")).strip()
+        if not value:
+            self.panel._log("[픽스호크] 선택 후보에 적용할 값이 없습니다.")
+            return
+        if kind == "PC_IP":
+            if side != "host":
+                self.panel._log("[픽스호크] PC IP 후보는 Host에 적용 버튼으로 적용하세요.")
+                return
+            old_text = self.panel.pixhawk_host_address_edit.text().strip()
+            self.panel.pixhawk_host_address_edit.setText(value)
+            self.panel._log(
+                f"[픽스호크] 선택 PC IP 후보를 Pixhawk Host IP에 적용했습니다: "
+                f"{old_text or '<empty>'} -> {value} ({entry.get('interface', '')})"
+            )
+            self.panel.pixhawk_connection_label.setText(f"Pixhawk Host IP 후보 적용됨: {value}")
+            self.panel._save_current_settings()
+            self.panel._refresh_operation_header()
+            return
+        if side not in {"left", "right"}:
+            self.panel._log(f"[픽스호크] {kind} 후보는 P1/P2에 적용하세요.")
+            return
+        mavlink_was_active = side in self.panel._mavlink_open_sides()
+        if kind == "USB":
+            try:
+                baud = int(entry.get("baud") or 0)
+            except (TypeError, ValueError):
+                baud = 0
+            if side == "left":
+                self.panel.left_pixhawk_bootstrap_url_edit.setText(value)
+                if baud:
+                    self.panel.left_pixhawk_bootstrap_baud_spin.setValue(baud)
+            else:
+                self.panel.right_pixhawk_bootstrap_url_edit.setText(value)
+                if baud:
+                    self.panel.right_pixhawk_bootstrap_baud_spin.setValue(baud)
+        elif kind == "MAVLink":
+            try:
+                baud = int(entry.get("baud") or 0)
+            except (TypeError, ValueError):
+                baud = 0
+            if side == "left":
+                self.panel.left_mavlink_url_edit.setText(value)
+                if baud:
+                    self.panel.left_mavlink_baud_spin.setValue(baud)
+            else:
+                self.panel.right_mavlink_url_edit.setText(value)
+                if baud:
+                    self.panel.right_mavlink_baud_spin.setValue(baud)
+        else:
+            self.panel._log(f"[픽스호크] 지원하지 않는 후보 종류입니다: {kind}")
+            return
+        label = "Pixhawk 1" if side == "left" else "Pixhawk 2"
+        self.panel._log(f"[픽스호크] 선택 후보를 {label}에 적용했습니다: {kind} {value}")
+        if kind in {"USB", "MAVLink"}:
+            self.panel._refresh_mavlink_side_actions()
+            if kind == "MAVLink" and mavlink_was_active:
+                self.panel._log(f"[픽스호크] {label} MAVLink URL 후보 적용으로 기존 {label} MAVLink 세션을 해제합니다. 다시 연결하세요.")
+                self.panel.disconnect_mavlink_pixhawk(side)
+            if kind == "USB":
+                self.panel.pixhawk_connection_label.setText(f"{label} USB 부트스트랩 후보 적용됨: ETH MAV 시작(USB)을 누르세요.")
+            else:
+                self.panel.pixhawk_connection_label.setText(f"{label} MAVLink URL 후보 적용됨: {label} MAVLink 연결을 누르세요.")
         self.panel._refresh_operation_header()
 
     def apply_persistent_pixhawk_eth(self, camera: str) -> None:
@@ -1062,6 +1147,16 @@ class DeviceRuntimeController:
             flag = str(data.get("flag_label") or "")
             suffix = f" ({flag})" if flag else ""
             self.panel._log(f"[픽스호크] {camera_label_ko(camera)} PX4 Shell 명령 완료{suffix}: {command}")
+        if operation.startswith("reset_calibration:"):
+            group = operation.split(":", 1)[1]
+            reset_errors = getattr(self.panel, "_px4_calibration_reset_error", None)
+            if not isinstance(reset_errors, dict):
+                reset_errors = {}
+                setattr(self.panel, "_px4_calibration_reset_error", reset_errors)
+            reset_errors.pop(f"{camera}:{group}", None)
+            reset_pending = getattr(self.panel, "_px4_calibration_reset_pending", None)
+            if isinstance(reset_pending, dict):
+                reset_pending.pop(camera, None)
         if callable(callback):
             callback(data)
 
@@ -1071,6 +1166,79 @@ class DeviceRuntimeController:
         dialog = self.panel.px4_shell_dialogs.get(camera)
         if dialog is not None:
             dialog.append_output(f"\n[error] {error}\n")
+        reset_pending = getattr(self.panel, "_px4_calibration_reset_pending", None)
+        group = reset_pending.pop(camera, None) if isinstance(reset_pending, dict) else None
+        if group:
+            reset_errors = getattr(self.panel, "_px4_calibration_reset_error", None)
+            if not isinstance(reset_errors, dict):
+                reset_errors = {}
+                setattr(self.panel, "_px4_calibration_reset_error", reset_errors)
+            reset_errors[f"{camera}:{group}"] = str(error)
+
+    def reset_px4_calibration_group(self, camera: str, group: str) -> bool:
+        """Reset one calibration-owned parameter group on one Pixhawk.
+
+        PX4's shell resolves the firmware-specific defaults.  The Workstation
+        only owns the group membership and never substitutes a host-side
+        numeric default table.
+        """
+
+        camera = str(camera or "")
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        calibration = px4_calibration_group(group)
+        if not calibration.resettable:
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} {calibration.label}은 수동 파라미터 그룹이라 초기화하지 않습니다."
+            )
+            return False
+        if self.panel.mavlink_pixhawk is None or camera not in self.panel._mavlink_open_sides():
+            self.panel._log(f"[픽스호크] {camera_label_ko(camera)} 캘리브레이션 초기화 실패: MAVLink 연결이 없습니다.")
+            return False
+        manager = self.panel.px4_mag_managers.get(camera)
+        if bool(getattr(manager, "armed", False)):
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} {calibration.label} 초기화 차단: Disarm required"
+            )
+            return False
+        parameter_text = ", ".join(calibration.reset_parameter_names)
+        result = QtWidgets.QMessageBox.question(
+            self.panel,
+            f"Reset {calibration.label}",
+            (
+                f"{camera_label_ko(camera)}의 {calibration.label} 파라미터를 PX4 firmware default로 초기화합니다.\n\n"
+                f"대상: {parameter_text}\n"
+                f"{calibration.description}\n"
+                "QGC에서 수행한 해당 캘리브레이션 결과가 삭제되며, 이후 재캘리브레이션이 필요합니다.\n"
+                "기체는 반드시 Disarm 상태여야 합니다. 계속할까요?"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if result != QtWidgets.QMessageBox.Yes:
+            self.panel._log(
+                f"[픽스호크] {camera_label_ko(camera)} {calibration.label} 초기화를 취소했습니다."
+            )
+            return False
+
+        command = "param reset " + " ".join(calibration.reset_parameter_names)
+        reset_pending = getattr(self.panel, "_px4_calibration_reset_pending", None)
+        if not isinstance(reset_pending, dict):
+            reset_pending = {}
+            setattr(self.panel, "_px4_calibration_reset_pending", reset_pending)
+        reset_pending[camera] = calibration.key
+        started = self.panel._start_pixhawk_shell_worker(
+            camera,
+            command,
+            operation=f"reset_calibration:{calibration.key}",
+            timeout_s=4.0,
+            on_complete=lambda _result, camera=camera: self.panel._start_pixhawk_parameter_worker(
+                camera, "calibration_refresh"
+            ),
+        )
+        if not started:
+            reset_pending.pop(camera, None)
+        return started
 
     def _clear_pixhawk_shell_worker(self, camera: str, thread: QtCore.QThread) -> None:
         if self.panel.pixhawk_shell_threads.get(camera) is thread:
@@ -1152,9 +1320,25 @@ class DeviceRuntimeController:
                 if worker.operation == kind:
                     camera = side
                     break
+        if kind == "calibration_refresh":
+            mag_status = data.get("mag_status")
+            attitude_status = data.get("attitude_status")
+            if not camera or (mag_status is None and attitude_status is None):
+                return
+            self.panel._px4_calibration_parameter_error.pop(camera, None)
+            if mag_status is not None:
+                manager = self.panel.px4_mag_managers.get(camera)
+                if manager is not None:
+                    manager.actual_selected_device_id = getattr(mag_status, "actual_selected_device_id", None)
+                    manager.armed = bool(getattr(mag_status, "armed", False))
+                self.panel._render_px4_mag_status(camera, mag_status)
+            if attitude_status is not None:
+                self.panel._render_px4_attitude_cal_status(camera, attitude_status, using_real_params=True)
+            return
         if not camera or status is None:
             return
         if kind in {"mag_refresh", "mag_apply"}:
+            self.panel._px4_calibration_parameter_error.pop(camera, None)
             manager = self.panel.px4_mag_managers.get(camera)
             if manager is not None:
                 manager.actual_selected_device_id = getattr(status, "actual_selected_device_id", None)
@@ -1172,9 +1356,12 @@ class DeviceRuntimeController:
                         f"[PX4 MAG] {self.panel._px4_mag_camera_label(camera)} 미적용 role: {', '.join(missing)}"
                     )
         elif kind == "attitude_refresh":
+            self.panel._px4_calibration_parameter_error.pop(camera, None)
             self.panel._render_px4_attitude_cal_status(camera, status, using_real_params=True)
 
     def _pixhawk_parameter_worker_failed(self, camera: str, operation: str, error: str) -> None:
+        if operation == "calibration_refresh":
+            self.panel._px4_calibration_parameter_error[camera] = str(error)
         self.panel._log(
             f"[픽스호크] {camera_label_ko(camera)} PARAM 작업 실패 ({operation}): {error}"
         )

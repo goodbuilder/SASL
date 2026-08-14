@@ -9,6 +9,7 @@ performs no NED/ENU aliasing.
 
 from __future__ import annotations
 
+import json
 import math
 import time
 from pathlib import Path
@@ -26,6 +27,8 @@ from Workstation.workstation_core.calibration import (
     StereoExtrinsics,
     StereoExtrinsicsProfile,
     StereoIntrinsicsResult,
+    compose_stereo_calibration,
+    independent_zoom_selection_mode,
     intrinsics_content_sha256,
     load_intrinsics_json,
     load_stereo_extrinsics_json,
@@ -45,6 +48,8 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_app_relative_path_text",
     "_checkerboard_validation_mode",
     "_checkerboard_validation_root",
+    "_capture_zoom_snapshot",
+    "_capture_zoom_level_for_paths",
     "_calibration_image_paths_for_root",
     "_calibration_stereo_pair_paths_for_root",
     "_checkerboard_validation_scan_counts",
@@ -68,6 +73,7 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_checkerboard_validation_result_data",
     "save_checkerboard_validation_result",
     "apply_checkerboard_validation_result",
+    "apply_intrinsics_to_distance",
     "_checkerboard_config",
     "_calibration_dirs",
     "_intrinsics_storage_base_path",
@@ -127,6 +133,90 @@ class CalibrationWorkflowController:
             return resolve_settings_path(text, base_dir=self.panel.app_root)
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
         return root
+
+    @staticmethod
+    def _zoom_index(value: object) -> int | None:
+        try:
+            level = int(value)
+        except (TypeError, ValueError):
+            return None
+        return level if level >= 0 else None
+
+    def _capture_zoom_snapshot(self) -> dict[str, object]:
+        """Capture the latest camera readback alongside every calibration image."""
+
+        actual = getattr(self.panel, "actual_visible_zoom", {}) or {}
+        values: dict[str, int | None] = {}
+        readbacks: dict[str, dict[str, object]] = {}
+        for side in ("left", "right"):
+            row = actual.get(side, {}) if isinstance(actual, dict) else {}
+            readback = dict(row) if isinstance(row, dict) else {}
+            readbacks[side] = readback
+            values[side] = self._zoom_index(readback.get("index"))
+        shared_level = (
+            values["left"]
+            if values["left"] is not None and values["left"] == values["right"]
+            else None
+        )
+        requested = getattr(self.panel, "zoom_level_spin", None)
+        try:
+            requested_level = int(requested.value()) if requested is not None else None
+        except (AttributeError, TypeError, ValueError):
+            requested_level = None
+        return {
+            "capture_zoom_level": shared_level,
+            "capture_left_zoom_level": values["left"],
+            "capture_right_zoom_level": values["right"],
+            "capture_zoom_source": "GZVV" if shared_level is not None else "unresolved",
+            "capture_zoom_readback": readbacks,
+            "requested_zoom_level": requested_level,
+        }
+
+    def _capture_zoom_level_for_paths(
+        self,
+        root: Path,
+        paths: list[Path] | tuple[Path, ...],
+    ) -> tuple[int | None, str]:
+        """Resolve one common zoom from the capture metadata selected for a run."""
+
+        capture_ids = {
+            path.stem.split("_", 1)[1]
+            for path in paths
+            if "_" in path.stem
+        }
+        if not capture_ids:
+            return None, "capture IDs are missing from the calibration image names"
+        levels: dict[str, int] = {}
+        missing: list[str] = []
+        metadata_root = root / "capture_metadata"
+        for capture_id in sorted(capture_ids):
+            metadata_path = metadata_root / f"capture_{capture_id}.json"
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, TypeError):
+                missing.append(capture_id)
+                continue
+            level = self._zoom_index(payload.get("capture_zoom_level"))
+            if level is None:
+                left_level = self._zoom_index(payload.get("capture_left_zoom_level"))
+                right_level = self._zoom_index(payload.get("capture_right_zoom_level"))
+                if left_level is not None and left_level == right_level:
+                    level = left_level
+            if level is None:
+                missing.append(capture_id)
+            else:
+                levels[capture_id] = level
+        if missing:
+            return (
+                None,
+                "capture-time zoom readback is missing for "
+                + ", ".join(missing[:5])
+                + (" …" if len(missing) > 5 else ""),
+            )
+        unique_levels = sorted(set(levels.values()))
+        if len(unique_levels) != 1:
+            return None, f"mixed capture zoom levels: {', '.join(str(level) for level in unique_levels)}"
+        return unique_levels[0], f"capture-time zoom={unique_levels[0]}"
 
     def _calibration_image_paths_for_root(self, root: Path, side: str) -> list[Path]:
         return sorted((root / side).glob(f"{side}_*.png"))
@@ -193,6 +283,7 @@ class CalibrationWorkflowController:
         mode: str,
         summary: dict[str, object],
         text: str,
+        zoom_level: int | None = None,
     ) -> None:
         self.panel.checkerboard_validation_result = result
         self.panel.checkerboard_validation_result_mode = mode
@@ -213,9 +304,15 @@ class CalibrationWorkflowController:
         ]
         self.panel.checkerboard_validation_result_saved = False
         self.panel.last_calibration_result = result
-        self.panel.last_calibration_zoom_level = self.panel.zoom_level_spin.value()
+        if zoom_level is not None:
+            self.panel.last_calibration_zoom_level = int(zoom_level)
+        elif getattr(self.panel, "last_calibration_zoom_level", None) is None:
+            self.panel.last_calibration_zoom_level = self.panel.zoom_level_spin.value()
         self.panel._active_intrinsics_profile_path = (
-            f"memory:checkerboard-validation:{mode}:zoom-{self.panel.last_calibration_zoom_level:02d}"
+            f"memory:checkerboard-validation:{mode}:zoom-"
+            f"{self.panel.last_calibration_zoom_level:02d}"
+            if self.panel.last_calibration_zoom_level is not None
+            else f"memory:checkerboard-validation:{mode}:zoom-unknown"
         )
         self.panel.calibration_result_text.setPlainText(text)
         extrinsics_state = "with checkerboard stereo R/T" if result.extrinsics is not None else "intrinsics only"
@@ -682,13 +779,21 @@ class CalibrationWorkflowController:
             return
         root, _left_dir, _right_dir = self.panel._calibration_dirs()
         root.mkdir(parents=True, exist_ok=True)
-        zoom_level = self.panel.zoom_level_spin.value()
+        zoom_level = getattr(self.panel, "last_calibration_zoom_level", None)
+        if zoom_level is None:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                "저장 실패: 계산 결과에 촬영 당시 줌 readback이 없습니다",
+                "bad",
+            )
+            return
         zoom_output = self.panel._intrinsics_storage_path(zoom_level)
         latest_output = self.panel._intrinsics_storage_base_path()
         metadata = {
-            "note": "Generated by StereoWIRIS checkerboard validation/calculation tab",
+            "note": "Generated by StereoWIRIS calibration calculation",
             "timestamp_s": time.time(),
             "zoom_level": zoom_level,
+            "capture_zoom_level": zoom_level,
             "zoom_target": str(self.panel.zoom_target_combo.currentData() or "both"),
             "calculation_mode": self.panel.checkerboard_validation_result_mode,
             "validation": self.panel.checkerboard_validation_summary,
@@ -732,6 +837,74 @@ class CalibrationWorkflowController:
             f"계산에 적용 완료: mode={mode} | {saved_text}",
             "good",
         )
+
+    def apply_intrinsics_to_distance(self) -> None:
+        panel = self.panel
+        if panel.last_calibration_result is None:
+            panel.calibration_status_label.setText("Run or load calibration before applying intrinsics.")
+            return
+        selected_profile = panel.selected_extrinsics_profile
+        if selected_profile is None and panel.last_calibration_result.extrinsics is not None:
+            selected_profile = StereoExtrinsicsProfile(
+                extrinsics=panel.last_calibration_result.extrinsics,
+                source_zoom_level=panel.last_calibration_zoom_level,
+                method="legacy_embedded_checkerboard",
+                source_intrinsics_path=panel._active_intrinsics_profile_path,
+                source_intrinsics_sha256=intrinsics_content_sha256(
+                    panel.last_calibration_result
+                ),
+                profile_id="legacy_embedded_extrinsics",
+            )
+            panel.selected_extrinsics_profile = selected_profile
+            panel._selected_extrinsics_profile_path = (
+                f"{panel._active_intrinsics_profile_path}#embedded-extrinsics"
+            )
+            panel._selected_extrinsics_profile_hash = selected_profile.content_sha256
+        panel.active_intrinsics = compose_stereo_calibration(
+            panel.last_calibration_result,
+            selected_profile,
+        )
+        panel._active_intrinsics_source_zoom_level = panel.last_calibration_zoom_level
+        panel._active_intrinsics_profile_hash = intrinsics_content_sha256(
+            panel.last_calibration_result
+        )
+        if selected_profile is None:
+            panel._active_extrinsics_profile_path = ""
+            panel._active_extrinsics_profile_hash = ""
+            panel._active_extrinsics_source_zoom_level = None
+            panel._active_calibration_selection_mode = "intrinsics_only"
+        else:
+            panel._active_extrinsics_profile_path = (
+                panel._selected_extrinsics_profile_path
+                or f"memory:{selected_profile.profile_id or 'stereo_extrinsics'}"
+            )
+            panel._active_extrinsics_profile_hash = selected_profile.content_sha256
+            panel._active_extrinsics_source_zoom_level = selected_profile.source_zoom_level
+            panel._active_calibration_selection_mode = independent_zoom_selection_mode(
+                panel.last_calibration_zoom_level,
+                selected_profile.source_zoom_level,
+            )
+            panel._set_combo_data(panel.distance_mode_combo, "checkerboard")
+        left_fx = panel.active_intrinsics.left.camera_matrix[0][0]
+        right_fx = panel.active_intrinsics.right.camera_matrix[0][0]
+        panel.focal_spin.setValue((left_fx + right_fx) / 2.0)
+        panel.manual_focal_checkbox.setChecked(False)
+        selection_label = {
+            "manual_cross_zoom": "cross-zoom/manual",
+            "manual_same_zoom": "same-zoom/manual",
+            "manual_independent_zoom": "independent/manual; source zoom unknown",
+        }.get(panel._active_calibration_selection_mode, "")
+        detail = f"K,D zoom={panel.last_calibration_zoom_level}; " + (
+            f"R,t zoom={selected_profile.source_zoom_level}; "
+            f"{selection_label}, validation not gated"
+            if selected_profile is not None
+            else "R,t not selected"
+        )
+        panel.calibration_status_label.setText(f"Applied calibration bundle: {detail}")
+        panel._refresh_camera_parameters_tab()
+        panel._refresh_distance()
+        panel._refresh_optical_alignment_view()
+        panel._refresh_operation_header()
 
     def _checkerboard_config(self) -> CheckerboardConfig:
         return CheckerboardConfig(
@@ -860,6 +1033,8 @@ class CalibrationWorkflowController:
             pair_timing_ok, pair_time_basis, pair_delta_s, pair_timing_detail = self.panel._checkerboard_capture_pair_timing(
                 metadata_by_camera
             )
+        zoom_snapshot = self._capture_zoom_snapshot()
+        self.panel.last_capture_zoom_level = zoom_snapshot.get("capture_zoom_level")
         metadata_payload = {
             "capture_origin": str(capture_origin),
             "pair_time_basis": pair_time_basis,
@@ -869,6 +1044,7 @@ class CalibrationWorkflowController:
             "left_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("left") or {}).get("rtcp_frame_ntp_unix_s"),
             "right_rtcp_frame_ntp_unix_s": (metadata_by_camera.get("right") or {}).get("rtcp_frame_ntp_unix_s"),
             "frame_contract": "OpenCV image pixels; stereo timing uses RTCP/NTP camera timestamp before saving a left/right pair",
+            **zoom_snapshot,
         }
         worker = CheckerboardCaptureWorker(
             root=root,
@@ -1130,6 +1306,18 @@ class CalibrationWorkflowController:
                 "bad",
             )
             return
+        capture_zoom_level, zoom_detail = self._capture_zoom_level_for_paths(
+            root,
+            [*left_paths, *right_paths],
+        )
+        if capture_zoom_level is None:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                f"계산 실패: {zoom_detail}. 촬영 당시 양쪽 GZVV readback이 같은지 확인하고 다시 촬영하세요.",
+                "bad",
+            )
+            self.panel._log(f"[캘리브레이션] 계산 중단: {zoom_detail}")
+            return
         self.panel.scan_checkerboard_validation_files()
         worker = CheckerboardCalibrationWorker(
             mode=mode,
@@ -1146,6 +1334,7 @@ class CalibrationWorkflowController:
             root=root,
             pair_count=pair_count,
             min_images=min_images,
+            capture_zoom_level=capture_zoom_level,
             left_count=len(left_paths),
             right_count=len(right_paths): self.panel._handle_intrinsic_calibration_completed(
                 result,
@@ -1153,6 +1342,7 @@ class CalibrationWorkflowController:
                 root=root,
                 pair_count=pair_count,
                 min_images=min_images,
+                capture_zoom_level=capture_zoom_level,
                 left_count=left_count,
                 right_count=right_count,
             )
@@ -1225,7 +1415,18 @@ class CalibrationWorkflowController:
             return
         left_paths = [left for _key, left, _right in selected_pairs]
         right_paths = [right for _key, _left, right in selected_pairs]
-        source_zoom = getattr(self.panel, "last_calibration_zoom_level", None)
+        source_zoom, zoom_detail = self._capture_zoom_level_for_paths(
+            root,
+            [*left_paths, *right_paths],
+        )
+        if source_zoom is None:
+            self.panel._set_health_label(
+                self.panel.checkerboard_validation_status_label,
+                f"R,t only 계산 실패: {zoom_detail}. 촬영 당시 양쪽 GZVV readback이 같은지 확인하고 다시 촬영하세요.",
+                "bad",
+            )
+            self.panel._log(f"[캘리브레이션] R,t 계산 중단: {zoom_detail}")
+            return
         source_path = str(getattr(self.panel, "_active_intrinsics_profile_path", "") or "")
         source_hash = intrinsics_content_sha256(intrinsics)
         worker = CheckerboardExtrinsicsWorker(
@@ -1396,6 +1597,7 @@ class CalibrationWorkflowController:
         root: Path,
         pair_count: int,
         min_images: int,
+        capture_zoom_level: int,
         left_count: int,
         right_count: int,
     ) -> None:
@@ -1421,12 +1623,14 @@ class CalibrationWorkflowController:
                 "source": "full",
                 "root": str(root),
                 "mode": mode,
+                "capture_zoom_level": capture_zoom_level,
                 "left_image_count": left_count,
                 "right_image_count": right_count,
                 "stereo_pair_count": pair_count,
                 "min_images": min_images,
             },
             text=text,
+            zoom_level=capture_zoom_level,
         )
         if mode == "checkerboard":
             self.panel._log("[캘리브레이션] 전체 사진 기반 intrinsic 및 체커보드 stereo 외부 파라미터 계산을 완료했습니다.")

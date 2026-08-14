@@ -6,6 +6,7 @@ import math
 import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
+from ipaddress import IPv4Address
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -14,6 +15,7 @@ from Workstation.wiris_runtime_workers import (
     WirisClockCommandWorker,
     WirisCommandWorker,
     WirisLrfPollWorker,
+    WirisStipWorker,
     WirisZoomWorker,
 )
 from Workstation.workstation_core.pixhawk_attitude import (
@@ -67,6 +69,10 @@ WIRIS_CONTROL_METHODS = [
     "_wiris_lrf_failed",
     "stop_wiris_lrf_polling",
     "_clear_wiris_lrf_worker",
+    "apply_wiris_stip",
+    "_apply_wiris_stip_result",
+    "_wiris_stip_failed",
+    "_clear_wiris_stip_worker",
 ]
 
 
@@ -712,3 +718,134 @@ class WirisControlController:
     def _clear_wiris_lrf_worker(self) -> None:
         self.panel.wiris_lrf_thread = None
         self.panel.wiris_lrf_worker = None
+
+    def apply_wiris_stip(self, camera: str) -> None:
+        panel = self.panel
+        camera_name = panel._camera_name_ko(camera)
+        host_edit = panel.left_zoom_host_edit if camera == "left" else panel.right_zoom_host_edit
+        new_ip_edit = panel.left_stip_ip_edit if camera == "left" else panel.right_stip_ip_edit
+        url_edit = panel.left_url_edit if camera == "left" else panel.right_url_edit
+        current_host = host_edit.text().strip()
+        new_ip = new_ip_edit.text().strip()
+        mask = panel.stip_mask_edit.text().strip()
+        try:
+            IPv4Address(current_host)
+            IPv4Address(new_ip)
+            IPv4Address(mask)
+        except ValueError as exc:
+            panel._log(f"[카메라] {camera_name} STIP 입력 오류: {exc}")
+            panel.camera_connection_label.setText(f"camera STIP: {camera}=invalid-input")
+            return
+        if current_host == new_ip:
+            panel._log(f"[카메라] {camera_name} STIP 건너뜀: 현재 host와 새 IP가 같습니다 ({new_ip}).")
+            panel.camera_connection_label.setText(f"camera STIP: {camera}=unchanged")
+            return
+        port = panel._control_port_for_camera(camera)
+        reboot_text = " and reboot" if panel.stip_reboot_checkbox.isChecked() else ""
+        answer = QtWidgets.QMessageBox.warning(
+            panel,
+            "Apply WIRIS STIP",
+            (
+                f"{camera_name} WIRIS at {current_host}:{port} will be changed to {new_ip} "
+                f"with subnet mask {mask}{reboot_text}.\n\n"
+                "Use this only when the target WIRIS is uniquely identified, preferably with one camera connected."
+            ),
+            QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer != QtWidgets.QMessageBox.Ok:
+            panel._log(f"[카메라] {camera_name} STIP 취소됨.")
+            return
+        if panel.wiris_stip_thread is not None:
+            panel._log("[카메라] STIP 적용이 이미 진행 중입니다.")
+            return
+        if camera == "left":
+            panel.left_stip_button.setEnabled(False)
+        else:
+            panel.right_stip_button.setEnabled(False)
+        panel.camera_connection_label.setText(f"camera STIP: {camera}=applying...")
+        panel.wiris_stip_thread = QtCore.QThread(panel)
+        panel.wiris_stip_worker = WirisStipWorker(
+            interface_name=panel.interface_edit.text().strip(),
+            host_address=panel.host_address_edit.text().strip(),
+            host_hints=panel._camera_host_hints(),
+            current_host=current_host,
+            new_ip=new_ip,
+            mask=mask,
+            port=port,
+            reboot=panel.stip_reboot_checkbox.isChecked(),
+            timeout_s=panel.zoom_timeout_spin.value(),
+        )
+        panel.wiris_stip_worker.moveToThread(panel.wiris_stip_thread)
+        panel.wiris_stip_thread.started.connect(panel.wiris_stip_worker.run)
+        panel.wiris_stip_worker.completed.connect(
+            lambda result, camera=camera, camera_name=camera_name, host_edit=host_edit, new_ip_edit=new_ip_edit, url_edit=url_edit, new_ip=new_ip, current_host=current_host: panel._apply_wiris_stip_result(
+                camera,
+                camera_name,
+                host_edit,
+                new_ip_edit,
+                url_edit,
+                new_ip,
+                current_host,
+                result,
+            )
+        )
+        panel.wiris_stip_worker.failed.connect(
+            lambda error, camera=camera, camera_name=camera_name: panel._wiris_stip_failed(camera, camera_name, error)
+        )
+        panel.wiris_stip_worker.finished.connect(panel.wiris_stip_thread.quit)
+        panel.wiris_stip_worker.finished.connect(panel.wiris_stip_worker.deleteLater)
+        panel.wiris_stip_thread.finished.connect(panel.wiris_stip_thread.deleteLater)
+        panel.wiris_stip_thread.finished.connect(lambda camera=camera: panel._clear_wiris_stip_worker(camera))
+        panel.wiris_stip_thread.start()
+
+    def _apply_wiris_stip_result(
+        self,
+        camera: str,
+        camera_name: str,
+        host_edit: QtWidgets.QLineEdit,
+        new_ip_edit: QtWidgets.QLineEdit,
+        url_edit: QtWidgets.QLineEdit,
+        new_ip: str,
+        current_host: str,
+        result: object,
+    ) -> None:
+        panel = self.panel
+        data = dict(result or {})
+        candidates = list(data.get("candidates") or [])
+        if candidates:
+            panel._apply_host_interface_candidates(candidates)
+        interface_name = str(data.get("interface_name") or panel.interface_edit.text().strip())
+        host_address = str(data.get("host_address") or panel.host_address_edit.text().strip())
+        if interface_name:
+            panel.interface_edit.setText(interface_name)
+        if host_address:
+            panel.host_address_edit.setText(host_address)
+        if str(data.get("state") or "failed") != "sent":
+            error = str(data.get("error") or "unknown error")
+            panel._log(f"[카메라] {camera_name} STIP 적용 실패: {error}")
+            panel.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
+            panel._refresh_operation_header()
+            return
+        statuses = [str(status) for status in list(data.get("statuses") or [])]
+        host_edit.setText(new_ip)
+        new_ip_edit.setText(new_ip)
+        panel._replace_rtsp_url_host(url_edit, new_ip)
+        panel._rtsp_widgets_for_camera(camera)[1].setText(new_ip)
+        panel._log(f"[카메라] {camera_name} STIP 적용: {current_host} -> {new_ip}, {'; '.join(statuses)}")
+        panel.camera_connection_label.setText(f"camera STIP: {camera}={current_host}->{new_ip}")
+        panel._save_current_settings()
+        panel._refresh_operation_header()
+
+    def _wiris_stip_failed(self, camera: str, camera_name: str, error: str) -> None:
+        self.panel._log(f"[카메라] {camera_name} STIP worker 실패: {error}")
+        self.panel.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
+        self.panel._refresh_operation_header()
+
+    def _clear_wiris_stip_worker(self, camera: str) -> None:
+        self.panel.wiris_stip_thread = None
+        self.panel.wiris_stip_worker = None
+        if camera == "left":
+            self.panel.left_stip_button.setEnabled(True)
+        else:
+            self.panel.right_stip_button.setEnabled(True)

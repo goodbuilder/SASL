@@ -7,12 +7,15 @@ persistence I/O runs in Workstation.session_workers.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import os
+import re
 import time
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from math import isfinite
@@ -22,7 +25,13 @@ from statistics import median
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workstation_core.attitude_geometry import (quaternion_conjugate, quaternion_multiply, relative_attitude, relative_rotation_angle_deg)
-from Workstation.workstation_core.measurement_attempt import AttitudeSnapshot, GpsSnapshot, MeasurementAttempt
+from Workstation.workstation_core.measurement_attempt import (
+    AttitudeSnapshot,
+    GpsSnapshot,
+    MeasurementAttempt,
+    StereoIntrinsicsSnapshot,
+)
+from Workstation.workstation_core.dual_geometry import evaluate_nominal_active
 from Workstation.workstation_core.coordinate_contract import (
     BODY_FRAME,
     CAMERA_FRAME,
@@ -34,10 +43,23 @@ from Workstation.workstation_core.coordinate_contract import (
     WORLD_FRAME,
 )
 from Workstation.workstation_core.measurement_widgets import DistanceHistoryPoint
+from Workstation.workstation_core.hr_evidence import (
+    CapturePurpose,
+    create_hr_capture_event,
+    import_hr_image_file,
+)
+from Workstation.workstation_core.native_frame_store import NativeFrameStore
+from Workstation.ulog_controller import (
+    ManualOwnershipClaim,
+    ULogController,
+)
+from Workstation.workstation_core.mavlink_sources import MavlinkSourceId
 from Workstation.workstation_core.recording_session import (
     SavedSessionFiles,
     SpoolRows,
     compact_distance_measurement_rows,
+    discover_retryable_sessions,
+    load_retryable_session,
     session_id_now,
     session_sheet_previews,
     write_recovery_metadata,
@@ -55,6 +77,10 @@ from Workstation.workstation_core.sync import (
 from Workstation.device_runtime_workers import PixhawkParameterWorker
 from Workstation.evidence import mavlink_link_provenance
 from Workstation.session_workers import SessionSaveWorker
+from Workstation.wiris_runtime_workers import (
+    WirisOZPhotoCaptureWorker,
+    WirisPnPPhotoCaptureWorker,
+)
 
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
@@ -78,15 +104,72 @@ RECORDING_CONTROLLER_METHODS = [
     "_refresh_recording_sample_detail",
     "toggle_session_recording",
     "_start_session_recording",
+    "_recover_retryable_recording_session",
     "_stop_session_recording",
+    "capture_pnp_hr_photos",
+    "capture_pnp_oz_photos",
+    "import_hr_files",
+    "_append_pnp_photo_capture_record",
+    "_append_oz_photo_capture_record",
+    "_handle_pnp_photo_capture_completed",
+    "_handle_pnp_photo_capture_failed",
+    "_clear_pnp_photo_capture_worker",
+    "_handle_oz_photo_capture_completed",
+    "_handle_oz_photo_capture_failed",
+    "_clear_oz_photo_capture_worker",
     "toggle_distance_recording",
-    "toggle_video_recording"
+    "toggle_video_recording",
+    "_pair_recording_base_row",
+    "_upsert_pair_recording_row",
+    "_record_unresolved_pair",
+    "_append_distance_history",
+    "_distance_history_class_name",
+    "_fmt_record_float",
+    "_fmt_record_bool",
+    "_recording_elapsed_s",
+    "_session_utc_ns_for_monotonic_ns",
+    "_recording_side",
+    "_raw_timeline_row",
+    "_record_gui_camera_frame",
+    "_record_external_timeline_row",
+    "_record_bbox_parameters",
+    "_detection_utc_unix_s",
+    "_unix_seconds_to_ns",
+    "_record_measurement_sync_timestamp_parameters",
+    "_record_frame_timestamp_parameters",
+    "_record_live_telemetry_snapshot_parameters",
+    "_record_reference_delta_parameters",
+    "_record_current_intrinsic_parameters",
+    "_record_intrinsic_parameters",
+    "_record_current_checkerboard_extrinsics_parameters",
+    "_record_checkerboard_extrinsics_parameters",
+    "_record_external_parameters",
+    "_record_extrinsic_state",
+    "_record_gps_state",
+    "_record_gnss_relative_state",
+    "save_distance_history_csv",
+    "_handle_session_saved",
+    "_handle_session_save_failed",
+    "_handle_session_save_thread_finished",
+    "_wait_for_session_save",
+    "_record_px4_mag_status_rows",
+    "_record_px4_mag_status_snapshot",
+    "_recording_camera_timing_diagnostics",
+    "_recording_session_metadata",
+    "workstation_ulog_snapshot",
+    "import_workstation_ulog",
+    "_remove_distance_history_point",
 ]
 
 
 class RecordingController:
     def __init__(self, panel):
         self.panel = panel
+        # Completion/failure signals do not carry the operator purpose or the
+        # Workstation request timestamp.  Keep that immutable request context
+        # in the GUI owner until the worker returns; it is never camera truth.
+        self._pending_hr_requests: dict[str, dict[str, object]] = {}
+        self._pending_oz_requests: dict[str, dict[str, object]] = {}
 
     def _refresh_recording_status_label(self) -> None:
         if self.panel._session_save_thread is not None:
@@ -261,6 +344,9 @@ class RecordingController:
         return self.panel._start_session_recording()
 
     def _start_session_recording(self) -> bool | None:
+        if self._camera_photo_capture_active():
+            self.panel.recording_status_label.setText("세션 기록: OZ/HR Capture 완료 대기 중")
+            return False
         if self.panel._session_save_thread is not None:
             self.panel.recording_status_label.setText("세션 기록: 이전 세션 저장 완료 대기 중")
             return False
@@ -274,8 +360,24 @@ class RecordingController:
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")
             return False
-        self.panel.recording_session_id = session_id_now()
+        if not self.panel._pnp_session_prepared:
+            self.panel.recording_session_id = session_id_now()
+            self.panel.pnp_photo_capture_records = []
+            self.panel.oz_photo_capture_records = []
+        self.panel._pnp_session_prepared = False
         self.panel._session_save_finalized = False
+        self._ensure_ulog_controller()
+        evidence_start = getattr(self.panel, "ensure_workstation_run_evidence", None)
+        if callable(evidence_start):
+            try:
+                evidence_start(
+                    "recording_started",
+                    {"session_id": self.panel.recording_session_id},
+                    source="RecordingController",
+                    coordinate_contract="not_applicable",
+                )
+            except Exception as exc:
+                self.panel._log(f"[저장] run evidence linkage failed: {exc}")
         self.panel._measurement_attempt_generation_id = new_measurement_attempt_generation_id(
             self.panel.recording_session_id
         )
@@ -326,6 +428,10 @@ class RecordingController:
             if camera in {"left", "right"}
         }
         self.panel.recording_origin_gps = self.panel.recording_reference_gps.get("left")
+        self.panel.recording_nominal_intrinsics_snapshot = self._snapshot_current_intrinsics()
+        self.panel.recording_nominal_optical_pose_profile_hash = str(
+            getattr(self.panel, "_active_optical_pose_profile_hash", "") or ""
+        )
         left_reference_gps = self.panel.recording_reference_gps.get("left")
         right_reference_gps = self.panel.recording_reference_gps.get("right")
         self.panel.recording_reference_baseline_ned_m = (
@@ -359,7 +465,66 @@ class RecordingController:
         self.panel._refresh_operation_header()
         return None
 
+    def _recover_retryable_recording_session(self) -> bool:
+        candidates = discover_retryable_sessions(self.panel.app_root / "recordings")
+        if not candidates:
+            return False
+        try:
+            recovered = load_retryable_session(candidates[0])
+        except Exception as exc:
+            self.panel._log(f"[저장] 미완료 세션 복구 정보를 읽지 못했습니다: {exc}")
+            return False
+        metadata = recovered.metadata
+
+        def optional_int(value: object) -> int | None:
+            return None if value in (None, "") else int(value)
+
+        self.panel.recording_session_id = str(metadata.get("session_id") or recovered.output_dir.name)
+        self.panel.recording_session_started_unix_ns = optional_int(
+            metadata.get("session_started_unix_ns")
+        )
+        self.panel.recording_session_started_monotonic_ns = optional_int(
+            metadata.get("session_started_monotonic_ns")
+        )
+        self.panel.recording_session_anchor_uncertainty_ns = optional_int(
+            metadata.get("session_time_anchor_uncertainty_ns")
+        )
+        self.panel.recording_session_started_wall_s = (
+            None
+            if self.panel.recording_session_started_unix_ns is None
+            else self.panel.recording_session_started_unix_ns * 1e-9
+        )
+        self.panel.recording_session_started_monotonic_s = (
+            None
+            if self.panel.recording_session_started_monotonic_ns is None
+            else self.panel.recording_session_started_monotonic_ns * 1e-9
+        )
+        self.panel.distance_recording_rows = recovered.pair_rows
+        self.panel.camera_recording_rows = recovered.camera_rows
+        self.panel.px4_recording_rows = recovered.px4_rows
+        self.panel.gnss_base_recording_rows = recovered.gnss_base_rows
+        self.panel._recovered_session_metadata = metadata
+        self.panel._session_save_retry_required = True
+        self.panel._session_save_finalized = False
+        self.panel.distance_recording_enabled = False
+        self.panel.video_recording_enabled = False
+        self.panel.record_button.setEnabled(False)
+        self.panel.save_history_button.setEnabled(True)
+        self.panel._refresh_recording_table()
+        self.panel.recording_status_label.setText(
+            f"미완료 세션 복구됨: session={self.panel.recording_session_id}, "
+            f"프레임쌍={len(self.panel.distance_recording_rows)}개 — 세션 파일 저장으로 재시도"
+        )
+        self.panel._log(
+            f"[저장] 미완료 세션 spool을 복구했습니다: {recovered.output_dir} "
+            f"(pair={len(self.panel.distance_recording_rows)})"
+        )
+        return True
+
     def _stop_session_recording(self) -> None:
+        if self._camera_photo_capture_active():
+            self.panel.recording_status_label.setText("세션 기록: OZ/HR Capture 완료 대기 중")
+            return
         final_clock_sync_snapshot = (
             self.panel._camera_time_sync_snapshot("last_observed_before_session_stop")
             if self.panel._session_recording_active()
@@ -367,6 +532,42 @@ class RecordingController:
         )
         if final_clock_sync_snapshot is not None:
             self.panel._recording_clock_sync_end_observation = final_clock_sync_snapshot
+        try:
+            self._finalize_workstation_ulogs()
+        except Exception as exc:
+            self.panel.recording_status_label.setText(
+                f"세션 기록: ULog finalization failed ({exc})"
+            )
+            self.panel._log(f"[저장] ULog finalization 실패: {exc}")
+            return
+        target_owner = getattr(self.panel, "_target_drone_controller_owner", None)
+        if target_owner is not None:
+            try:
+                target_snapshot = target_owner.target_drone_stream_snapshot()
+                if target_snapshot.get("worker_alive") or target_snapshot.get("phase") in {
+                    "RUNNING",
+                    "STARTING",
+                }:
+                    target_snapshot = target_owner.stop_target_drone_stream(timeout_s=3.0)
+                artifact = target_snapshot.get("artifact")
+                importer = getattr(self.panel, "import_workstation_session_artifact", None)
+                if isinstance(artifact, dict) and callable(importer):
+                    importer(
+                        artifact["absolute_path"],
+                        role="target_drone_raw_mavlink_jsonl",
+                        media_type="application/x-ndjson",
+                        metadata={
+                            key: value
+                            for key, value in artifact.items()
+                            if key != "absolute_path"
+                        },
+                    )
+            except Exception as exc:
+                self.panel.recording_status_label.setText(
+                    f"세션 기록: Target Drone drain/artifact 실패 ({exc})"
+                )
+                self.panel._log(f"[저장] Target Drone finalization 실패: {exc}")
+                return
         self.panel.distance_recording_enabled = False
         self.panel.video_recording_enabled = False
         self.panel.distance_recording_started_monotonic_s = None
@@ -380,6 +581,872 @@ class RecordingController:
         self.panel.save_distance_history_csv(final_clock_sync_snapshot=final_clock_sync_snapshot)
         self.panel._refresh_recording_status_label()
         self.panel._refresh_operation_header()
+
+    def _finalize_workstation_ulogs(self) -> None:
+        """Stop/download only ULogs whose injected adapter proves ownership."""
+
+        controller = getattr(self.panel, "_workstation_ulog_controller", None)
+        if not isinstance(controller, ULogController):
+            return
+        snapshot = controller.ulog_snapshot()
+        for source in MavlinkSourceId:
+            row = snapshot.get("sources", {}).get(source.value, {})
+            if not isinstance(row, dict) or row.get("owner") != "WORKSTATION":
+                continue
+            controller.stop_automatic_ulog_and_collect(source)
+        refreshed = controller.ulog_snapshot()
+        importer = getattr(self.panel, "import_workstation_session_artifact", None)
+        if not callable(importer):
+            return
+        for artifact in refreshed.get("artifacts", ()) or ():
+            if not isinstance(artifact, dict):
+                continue
+            relative = str(artifact.get("relative_path") or "")
+            if not relative:
+                continue
+            importer(
+                controller.session_root / relative,
+                role=f"ulog/{artifact.get('source_id', 'unknown')}",
+                media_type="application/vnd.px4.ulog",
+                metadata=dict(artifact),
+            )
+
+    def _camera_photo_capture_active(self) -> bool:
+        return bool(
+            getattr(self.panel, "pnp_photo_capture_thread", None) is not None
+            or getattr(self.panel, "oz_photo_capture_thread", None) is not None
+        )
+
+    @staticmethod
+    def _hr_capture_purpose(value: CapturePurpose | str) -> CapturePurpose:
+        try:
+            return CapturePurpose(str(getattr(value, "value", value)).strip().lower())
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in CapturePurpose)
+            raise ValueError(f"HR capture purpose must be one of: {allowed}") from exc
+
+    def _prepare_camera_evidence_session(self, capture_channel: str) -> None:
+        """Prepare a session without pretending that distance recording started."""
+
+        if not self.panel.recording_session_id or self.panel._session_save_finalized:
+            self.panel.recording_session_id = session_id_now()
+            self.panel.pnp_photo_capture_records = []
+            self.panel.oz_photo_capture_records = []
+            self.panel._session_save_finalized = False
+            self.panel._pnp_session_prepared = True
+        self._ensure_ulog_controller()
+        evidence_start = getattr(self.panel, "ensure_workstation_run_evidence", None)
+        if callable(evidence_start):
+            evidence_start(
+                f"{capture_channel}_capture_requested",
+                {
+                    "session_id": self.panel.recording_session_id,
+                    "capture_channel": capture_channel,
+                },
+                source="RecordingController",
+                coordinate_contract="native raster u-right/v-down; OpenCV optical RDF",
+            )
+
+    def _prepare_pnp_evidence_session(self) -> None:
+        self._prepare_camera_evidence_session("hr")
+
+    def _prepare_oz_evidence_session(self) -> None:
+        self._prepare_camera_evidence_session("oz")
+
+    def _ensure_ulog_controller(self) -> ULogController:
+        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
+        if not session_id:
+            raise RuntimeError("recording session ID is not prepared")
+        root_resolver = getattr(self.panel, "_recording_session_dir", None)
+        if not callable(root_resolver):
+            raise RuntimeError("recording session directory owner is unavailable")
+        root = Path(root_resolver(session_id)).resolve()
+        current = getattr(self.panel, "_workstation_ulog_controller", None)
+        if (
+            not isinstance(current, ULogController)
+            or current.session_id != session_id
+            or current.session_root != root
+        ):
+            automatic_sources = getattr(self.panel, "ulog_automatic_sources", None)
+            current = ULogController(
+                root,
+                session_id,
+                automatic_sources=(
+                    automatic_sources if isinstance(automatic_sources, dict) else None
+                ),
+            )
+            setattr(self.panel, "_workstation_ulog_controller", current)
+        return current
+
+    def workstation_ulog_snapshot(self) -> dict[str, object]:
+        controller = getattr(self.panel, "_workstation_ulog_controller", None)
+        if not isinstance(controller, ULogController):
+            return {
+                "schema": "workstation-ulog-controller-v1",
+                "state": "NOT_PREPARED",
+                "artifacts": [],
+                "sources": {},
+            }
+        return controller.ulog_snapshot()
+
+    def import_workstation_ulog(
+        self,
+        source: str,
+        path: str,
+        *,
+        ownership: str = "UNKNOWN",
+        expected_sha256: str | None = None,
+    ) -> dict[str, object]:
+        """Import one exact P1/P2/target ULog into this session."""
+
+        self._prepare_pnp_evidence_session()
+        controller = self._ensure_ulog_controller()
+        source_value = str(source).strip().lower()
+        if source_value in {"target", "drone", "target_drone"}:
+            source_value = MavlinkSourceId.TARGET_DRONE.value
+        resolved_source = MavlinkSourceId(source_value)
+        artifact = controller.import_manual_ulog(
+            resolved_source,
+            path,
+            ownership=ManualOwnershipClaim(str(ownership).upper()),
+            expected_sha256=expected_sha256,
+        )
+        absolute = controller.session_root / str(artifact["relative_path"])
+        importer = getattr(self.panel, "import_workstation_session_artifact", None)
+        if callable(importer):
+            importer(
+                absolute,
+                role=f"ulog/{resolved_source.value}",
+                media_type="application/vnd.px4.ulog",
+                metadata=dict(artifact),
+            )
+        append_event = getattr(self.panel, "append_workstation_run_event", None)
+        if callable(append_event):
+            append_event(
+                "ulog_imported",
+                dict(artifact),
+                source="RecordingController",
+                coordinate_contract="opaque PX4 ULog; no optical RDF conversion",
+            )
+        return controller.ulog_snapshot()
+
+    def _new_camera_request_context(
+        self,
+        capture_id: str,
+        purpose: CapturePurpose,
+        capture_channel: str,
+    ) -> dict[str, object]:
+        """Anchor an HR request in host UTC and the session monotonic clock.
+
+        ``request_session_delta_ns`` is a signed host-monotonic delta from the
+        distance-session anchor.  It is ``None`` for HR captures made before a
+        distance session starts.  Neither value is a camera exposure time.
+        """
+
+        monotonic_before_ns = time.monotonic_ns()
+        request_utc_ns = time.time_ns()
+        monotonic_after_ns = time.monotonic_ns()
+        request_monotonic_ns = (monotonic_before_ns + monotonic_after_ns) // 2
+        session_started_ns = getattr(
+            self.panel, "recording_session_started_monotonic_ns", None
+        )
+        request_session_delta_ns = (
+            None
+            if session_started_ns is None
+            else request_monotonic_ns - int(session_started_ns)
+        )
+        return {
+            "capture_id": str(capture_id),
+            "purpose": purpose.value,
+            "capture_channel": str(capture_channel),
+            "request_utc_ns": request_utc_ns,
+            "request_monotonic_ns": request_monotonic_ns,
+            "request_clock_anchor_uncertainty_ns": (
+                monotonic_after_ns - monotonic_before_ns
+            )
+            // 2,
+            "request_utc_method": "host_time_ns_at_monotonic_midpoint",
+            "request_session_delta_ns": request_session_delta_ns,
+            "request_session_delta_s": (
+                None
+                if request_session_delta_ns is None
+                else request_session_delta_ns * 1e-9
+            ),
+            "request_time_semantics": (
+                "Workstation command request; not camera exposure or camera-file UTC"
+            ),
+        }
+
+    def _new_hr_request_context(
+        self,
+        capture_id: str,
+        purpose: CapturePurpose,
+    ) -> dict[str, object]:
+        return self._new_camera_request_context(capture_id, purpose, "hr")
+
+    def _new_oz_request_context(
+        self,
+        capture_id: str,
+        purpose: CapturePurpose,
+    ) -> dict[str, object]:
+        return self._new_camera_request_context(capture_id, purpose, "oz")
+
+    @staticmethod
+    def _camera_hr_request_delta(record: dict[str, object]) -> int | None:
+        cameras = record.get("cameras")
+        if not isinstance(cameras, dict):
+            return None
+        left = cameras.get("left")
+        right = cameras.get("right")
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return None
+        try:
+            left_ns = int(left["capture_requested_unix_ns"])
+            right_ns = int(right["capture_requested_unix_ns"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return right_ns - left_ns
+
+    def _hr_capture_event_record(
+        self,
+        record: dict[str, object],
+        *,
+        capture_id: str,
+        request: dict[str, object] | None = None,
+        note: str = "camera-internal HR capture",
+    ) -> dict[str, object]:
+        """Return one hash-bound, append-only HR event record."""
+
+        context = dict(request or {})
+        purpose = self._hr_capture_purpose(
+            context.get("purpose", record.get("purpose", CapturePurpose.UNSPECIFIED))
+        )
+        request_utc_ns = int(context.get("request_utc_ns") or time.time_ns())
+        event = create_hr_capture_event(
+            capture_id,
+            purpose=purpose,
+            captured_utc_ns=request_utc_ns,
+            note=note,
+        ).to_mapping()
+        event.update(context)
+        event.update(record)
+        event["capture_id"] = str(capture_id)
+        event["purpose"] = purpose.value
+        event["capture_time_semantics"] = (
+            "Workstation request UTC; HR exposure UTC remains unavailable"
+        )
+        request_delta = self._camera_hr_request_delta(event)
+        event["camera_request_delta_right_minus_left_ns"] = request_delta
+        event["camera_request_delta_sign_contract"] = (
+            "right capture_requested_unix_ns minus left capture_requested_unix_ns"
+        )
+        event["pixel_coordinate_contract"] = (
+            "stored image raster u-right/v-down; OpenCV optical frame RDF "
+            "(right/down/forward); no pixel or pose conversion performed"
+        )
+        return event
+
+    def _oz_capture_event_record(
+        self,
+        record: dict[str, object],
+        *,
+        capture_id: str,
+        request: dict[str, object] | None = None,
+        note: str = "camera-internal OZ still capture",
+    ) -> dict[str, object]:
+        """Return one hash-bound, append-only OZ still event record."""
+
+        context = dict(request or {})
+        purpose = self._hr_capture_purpose(
+            context.get("purpose", record.get("purpose", CapturePurpose.UNSPECIFIED))
+        )
+        request_utc_ns = int(context.get("request_utc_ns") or time.time_ns())
+        event = {
+            "schema": "workstation-oz-capture-event-v1",
+            "event_id": str(uuid.uuid4()),
+            "capture_id": str(capture_id),
+            "purpose": purpose.value,
+            "captured_utc_ns": request_utc_ns,
+            "note": note,
+        }
+        event.update(context)
+        event.update(record)
+        event["capture_id"] = str(capture_id)
+        event["capture_channel"] = "oz"
+        event["purpose"] = purpose.value
+        event["capture_time_semantics"] = (
+            "Workstation request UTC; OZ exposure UTC remains unavailable"
+        )
+        request_delta = self._camera_hr_request_delta(event)
+        event["camera_request_delta_right_minus_left_ns"] = request_delta
+        event["camera_request_delta_sign_contract"] = (
+            "right capture_requested_unix_ns minus left capture_requested_unix_ns"
+        )
+        event["pixel_coordinate_contract"] = (
+            "camera-native visible/OZ still raster u-right/v-down; OpenCV optical "
+            "frame RDF (right/down/forward); no pixel or pose conversion performed"
+        )
+        return event
+
+    def capture_pnp_hr_photos(
+        self,
+        purpose: CapturePurpose | str = CapturePurpose.UNSPECIFIED,
+    ) -> bool:
+        """Capture one left/right HR pair and append its evidence to the session JSONL.
+
+        ``purpose`` is an experiment label (pre/post/checkpoint/unspecified),
+        not a change to WIRIS capture behavior.  The legacy zero-argument API
+        remains equivalent to ``purpose="unspecified"``.
+        """
+
+        if self._camera_photo_capture_active():
+            self.panel.recording_status_label.setText("OZ/HR Capture가 이미 진행 중입니다")
+            return False
+        normalized_purpose = self._hr_capture_purpose(purpose)
+        self._prepare_pnp_evidence_session()
+        capture_index = len(self.panel.pnp_photo_capture_records) + 1
+        capture_id = f"hr-{capture_index:03d}"
+        request = self._new_hr_request_context(capture_id, normalized_purpose)
+        self._pending_hr_requests[capture_id] = request
+        target_infos = self._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            self.panel._append_pnp_photo_capture_record(
+                self._hr_capture_event_record(
+                    {
+                        "state": "not_started",
+                        "error": "both WIRIS control hosts are required",
+                        "stored_on_camera": False,
+                        "ftp_downloaded": False,
+                    },
+                    capture_id=capture_id,
+                    request=self._pending_hr_requests.pop(capture_id, None),
+                )
+            )
+            return False
+        self.panel.pnp_photo_capture_thread = QtCore.QThread(self.panel)
+        self.panel.pnp_photo_capture_worker = WirisPnPPhotoCaptureWorker(
+            target_infos,
+            capture_id=capture_id,
+            completion_timeout_s=10.0,
+        )
+        self.panel.pnp_photo_capture_worker.moveToThread(self.panel.pnp_photo_capture_thread)
+        self.panel.pnp_photo_capture_thread.started.connect(self.panel.pnp_photo_capture_worker.run)
+        self.panel.pnp_photo_capture_worker.completed.connect(
+            self.panel._handle_pnp_photo_capture_completed
+        )
+        self.panel.pnp_photo_capture_worker.failed.connect(
+            lambda error, capture_id=capture_id: self.panel._handle_pnp_photo_capture_failed(
+                capture_id, error
+            )
+        )
+        self.panel.pnp_photo_capture_worker.finished.connect(self.panel.pnp_photo_capture_thread.quit)
+        self.panel.pnp_photo_capture_worker.finished.connect(self.panel.pnp_photo_capture_worker.deleteLater)
+        self.panel.pnp_photo_capture_thread.finished.connect(self.panel.pnp_photo_capture_thread.deleteLater)
+        self.panel.pnp_photo_capture_thread.finished.connect(self.panel._clear_pnp_photo_capture_worker)
+        self.panel.pnp_photo_capture_thread.start()
+        self.panel.recording_status_label.setText(
+            f"HR Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+        )
+        return True
+
+    def capture_pnp_oz_photos(
+        self,
+        purpose: CapturePurpose | str = CapturePurpose.UNSPECIFIED,
+    ) -> bool:
+        """Capture one visible operating-zoom still pair.
+
+        OZ stills use the camera's normal visible-image storage command
+        (``SIVI TRUE``) and are kept as a separate evidence stream from both
+        the RTSP/MP4 session recording and the visible-HR capture stream.
+        """
+
+        if self._camera_photo_capture_active():
+            self.panel.recording_status_label.setText("OZ/HR Capture가 이미 진행 중입니다")
+            return False
+        normalized_purpose = self._hr_capture_purpose(purpose)
+        self._prepare_oz_evidence_session()
+        capture_index = len(getattr(self.panel, "oz_photo_capture_records", ())) + 1
+        capture_id = f"oz-{capture_index:03d}"
+        request = self._new_oz_request_context(capture_id, normalized_purpose)
+        self._pending_oz_requests[capture_id] = request
+        target_infos = self._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            self.panel._append_oz_photo_capture_record(
+                self._oz_capture_event_record(
+                    {
+                        "state": "not_started",
+                        "error": "both WIRIS control hosts are required",
+                        "stored_on_camera": False,
+                        "ftp_downloaded": False,
+                    },
+                    capture_id=capture_id,
+                    request=self._pending_oz_requests.pop(capture_id, None),
+                )
+            )
+            return False
+        self.panel.oz_photo_capture_thread = QtCore.QThread(self.panel)
+        self.panel.oz_photo_capture_worker = WirisOZPhotoCaptureWorker(
+            target_infos,
+            capture_id=capture_id,
+            completion_timeout_s=10.0,
+        )
+        self.panel.oz_photo_capture_worker.moveToThread(self.panel.oz_photo_capture_thread)
+        self.panel.oz_photo_capture_thread.started.connect(self.panel.oz_photo_capture_worker.run)
+        self.panel.oz_photo_capture_worker.completed.connect(
+            self.panel._handle_oz_photo_capture_completed
+        )
+        self.panel.oz_photo_capture_worker.failed.connect(
+            lambda error, capture_id=capture_id: self.panel._handle_oz_photo_capture_failed(
+                capture_id, error
+            )
+        )
+        self.panel.oz_photo_capture_worker.finished.connect(self.panel.oz_photo_capture_thread.quit)
+        self.panel.oz_photo_capture_worker.finished.connect(self.panel.oz_photo_capture_worker.deleteLater)
+        self.panel.oz_photo_capture_thread.finished.connect(self.panel.oz_photo_capture_thread.deleteLater)
+        self.panel.oz_photo_capture_thread.finished.connect(self.panel._clear_oz_photo_capture_worker)
+        self.panel.oz_photo_capture_thread.start()
+        self.panel.recording_status_label.setText(
+            f"OZ Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+        )
+        return True
+
+    def _camera_photo_target_infos(self) -> tuple[tuple[str, str, int, float], ...]:
+        return tuple(
+            (
+                label,
+                host,
+                self.panel._control_port_for_camera(label),
+                self.panel.zoom_timeout_spin.value(),
+            )
+            for label, host in self.panel.zoom_hosts("both")
+            if str(host or "").strip()
+        )
+
+    def _append_pnp_photo_capture_record(
+        self, record: dict[str, object]
+    ) -> dict[str, object]:
+        # JSON round-tripping detaches nested mappings from signal payloads.
+        # The append-only JSONL record and in-memory row therefore cannot be
+        # changed by a worker mutating its original result after this call.
+        normalized = json.loads(
+            json.dumps(record, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        )
+        normalized["session_id"] = self.panel.recording_session_id
+        normalized["event_index"] = len(self.panel.pnp_photo_capture_records) + 1
+        normalized.setdefault("recorded_utc_ns", time.time_ns())
+        # Preserve the legacy spelling for downstream readers while making
+        # the UTC basis explicit in new records.
+        normalized.setdefault("recorded_unix_ns", normalized["recorded_utc_ns"])
+        normalized.setdefault("schema", "workstation-hr-capture-event-v1")
+        normalized.setdefault("capture_channel", "hr")
+        normalized.setdefault("event_id", str(uuid.uuid4()))
+        normalized.setdefault("purpose", CapturePurpose.UNSPECIFIED.value)
+        normalized.setdefault("active_zoom", {
+            side: dict(self.panel.actual_visible_zoom.get(side, {}))
+            for side in ("left", "right")
+        })
+        normalized.setdefault("requested_zoom_level", self.panel.zoom_level_spin.value())
+        normalized.setdefault("storage", "camera_internal")
+        normalized.setdefault("ftp_downloaded", False)
+        normalized["record_sha256"] = hashlib.sha256(
+            json.dumps(
+                normalized,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        output_dir = self.panel._recording_session_dir(self.panel.recording_session_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        event_path = output_dir / "hr_captures.jsonl"
+        with event_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self.panel.pnp_photo_capture_records.append(normalized)
+        run_event_writer = getattr(self.panel, "append_workstation_run_event", None)
+        if callable(run_event_writer):
+            try:
+                run_event_writer(
+                    "hr_capture_event",
+                    normalized,
+                    source="RecordingController",
+                    coordinate_contract=str(
+                        normalized.get("pixel_coordinate_contract", "not_applicable")
+                    ),
+                    source_timestamp_ns=normalized.get("request_utc_ns"),
+                )
+            except Exception as exc:
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(f"[HR Capture] run evidence linkage failed: {exc}")
+        return json.loads(
+            json.dumps(normalized, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        )
+
+    def _append_oz_photo_capture_record(
+        self, record: dict[str, object]
+    ) -> dict[str, object]:
+        """Append one camera-internal OZ still event to session evidence."""
+
+        normalized = json.loads(
+            json.dumps(record, ensure_ascii=False, allow_nan=False, sort_keys=True)
+        )
+        records = getattr(self.panel, "oz_photo_capture_records", None)
+        if not isinstance(records, list):
+            records = []
+            self.panel.oz_photo_capture_records = records
+        normalized["session_id"] = self.panel.recording_session_id
+        normalized["event_index"] = len(records) + 1
+        normalized.setdefault("recorded_utc_ns", time.time_ns())
+        normalized.setdefault("recorded_unix_ns", normalized["recorded_utc_ns"])
+        normalized.setdefault("schema", "workstation-oz-capture-event-v1")
+        normalized.setdefault("capture_channel", "oz")
+        normalized.setdefault("event_id", str(uuid.uuid4()))
+        normalized.setdefault("purpose", CapturePurpose.UNSPECIFIED.value)
+        normalized.setdefault(
+            "active_zoom",
+            {
+                side: dict(self.panel.actual_visible_zoom.get(side, {}))
+                for side in ("left", "right")
+            },
+        )
+        normalized.setdefault("requested_zoom_level", self.panel.zoom_level_spin.value())
+        normalized.setdefault("storage", "camera_internal")
+        normalized.setdefault("ftp_downloaded", False)
+        normalized.setdefault("image_enable_command", "SIVI TRUE")
+        normalized["record_sha256"] = hashlib.sha256(
+            json.dumps(
+                normalized,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        output_dir = self.panel._recording_session_dir(self.panel.recording_session_id)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        event_path = output_dir / "oz_captures.jsonl"
+        with event_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(normalized, ensure_ascii=False, sort_keys=True) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        records.append(normalized)
+        run_event_writer = getattr(self.panel, "append_workstation_run_event", None)
+        if callable(run_event_writer):
+            try:
+                run_event_writer(
+                    "oz_capture_event",
+                    normalized,
+                    source="RecordingController",
+                    coordinate_contract=str(
+                        normalized.get("pixel_coordinate_contract", "not_applicable")
+                    ),
+                    source_timestamp_ns=normalized.get("request_utc_ns"),
+                )
+            except Exception as exc:
+                logger = getattr(self.panel, "_log", None)
+                if callable(logger):
+                    logger(f"[OZ Capture] run evidence linkage failed: {exc}")
+        return json.loads(
+            json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+        )
+
+    def _handle_pnp_photo_capture_completed(self, result: object) -> None:
+        record = dict(result or {}) if isinstance(result, dict) else {"state": "failed"}
+        cameras = record.get("cameras")
+        camera_states = (
+            [str(item.get("state", "failed")) for item in cameras.values()]
+            if isinstance(cameras, dict)
+            else ["failed"]
+        )
+        record["state"] = "completed" if camera_states and all(
+            state == "completed" for state in camera_states
+        ) else "partial_or_failed"
+        record["stored_on_camera"] = record["state"] == "completed"
+        capture_id = str(record.get("capture_id") or "")
+        record = self._hr_capture_event_record(
+            record,
+            capture_id=capture_id,
+            request=self._pending_hr_requests.pop(capture_id, None),
+        )
+        self.panel._append_pnp_photo_capture_record(record)
+        self.panel._log(
+            f"[HR Capture] {capture_id} 카메라 내부 저장: state={record['state']}, FTP=disabled"
+        )
+        self.panel.recording_status_label.setText(
+            f"HR Capture {capture_id}: {record['state']} · camera internal · FTP disabled"
+        )
+
+    def _handle_pnp_photo_capture_failed(self, capture_id: str, error: str) -> None:
+        self.panel._append_pnp_photo_capture_record(
+            self._hr_capture_event_record(
+                {
+                    "state": "failed",
+                    "error": str(error),
+                    "stored_on_camera": False,
+                    "ftp_downloaded": False,
+                },
+                capture_id=str(capture_id),
+                request=self._pending_hr_requests.pop(str(capture_id), None),
+            )
+        )
+        self.panel._log(f"[HR Capture] {capture_id} 촬영 실패: {error}")
+        self.panel.recording_status_label.setText(f"HR Capture {capture_id}: failed ({error})")
+
+    def _handle_oz_photo_capture_completed(self, result: object) -> None:
+        record = dict(result or {}) if isinstance(result, dict) else {"state": "failed"}
+        cameras = record.get("cameras")
+        camera_states = (
+            [str(item.get("state", "failed")) for item in cameras.values()]
+            if isinstance(cameras, dict)
+            else ["failed"]
+        )
+        record["state"] = "completed" if camera_states and all(
+            state == "completed" for state in camera_states
+        ) else "partial_or_failed"
+        record["stored_on_camera"] = record["state"] == "completed"
+        capture_id = str(record.get("capture_id") or "")
+        record = self._oz_capture_event_record(
+            record,
+            capture_id=capture_id,
+            request=self._pending_oz_requests.pop(capture_id, None),
+        )
+        self.panel._append_oz_photo_capture_record(record)
+        self.panel._log(
+            f"[OZ Capture] {capture_id} 카메라 내부 저장: state={record['state']}, FTP=disabled"
+        )
+        self.panel.recording_status_label.setText(
+            f"OZ Capture {capture_id}: {record['state']} · camera internal · FTP disabled"
+        )
+
+    def _handle_oz_photo_capture_failed(self, capture_id: str, error: str) -> None:
+        self.panel._append_oz_photo_capture_record(
+            self._oz_capture_event_record(
+                {
+                    "state": "failed",
+                    "error": str(error),
+                    "stored_on_camera": False,
+                    "ftp_downloaded": False,
+                },
+                capture_id=str(capture_id),
+                request=self._pending_oz_requests.pop(str(capture_id), None),
+            )
+        )
+        self.panel._log(f"[OZ Capture] {capture_id} 촬영 실패: {error}")
+        self.panel.recording_status_label.setText(f"OZ Capture {capture_id}: failed ({error})")
+
+    def _clear_pnp_photo_capture_worker(self) -> None:
+        self.panel.pnp_photo_capture_thread = None
+        self.panel.pnp_photo_capture_worker = None
+
+    def _clear_oz_photo_capture_worker(self) -> None:
+        self.panel.oz_photo_capture_thread = None
+        self.panel.oz_photo_capture_worker = None
+
+    @staticmethod
+    def _hr_capture_path_component(capture_id: str) -> str:
+        raw = str(capture_id or "").strip()
+        if not raw:
+            raise ValueError("capture_id is required")
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip(".-")
+        if not safe:
+            safe = "capture"
+        if safe != raw:
+            # Prevent different unsafe IDs from collapsing onto one directory.
+            safe = f"{safe}-{uuid.uuid5(uuid.NAMESPACE_URL, raw).hex[:10]}"
+        return safe[:128]
+
+    def _known_hr_purpose(self, capture_id: str) -> CapturePurpose:
+        for record in reversed(self.panel.pnp_photo_capture_records):
+            if str(record.get("capture_id") or "") == str(capture_id):
+                try:
+                    return self._hr_capture_purpose(
+                        record.get("purpose", CapturePurpose.UNSPECIFIED)
+                    )
+                except ValueError:
+                    break
+        return CapturePurpose.UNSPECIFIED
+
+    def import_hr_files(
+        self,
+        capture_id: str,
+        *,
+        side: str | None = None,
+        path: str | Path | None = None,
+        left_path: str | Path | None = None,
+        right_path: str | Path | None = None,
+        camera_serial: str | None = None,
+        left_camera_serial: str | None = None,
+        right_camera_serial: str | None = None,
+        camera_serials: dict[str, str] | None = None,
+        purpose: CapturePurpose | str | None = None,
+        captured_utc_ns: int | None = None,
+        expected_sha256_by_side: dict[str, str] | None = None,
+        expected_resolution_by_side: dict[str, tuple[int, int]] | None = None,
+    ) -> dict[str, object]:
+        """Validate and atomically retain exact HR files under the session.
+
+        Callers may supply one ``side``/``path`` pair or ``left_path`` and/or
+        ``right_path``.  File decoding, byte hashing, camera-serial validation,
+        atomic writes, and event persistence all remain controller-owned; UI
+        code should pass paths only.
+
+        Pixel coordinates, if later annotated, are native raster ``u`` right,
+        ``v`` down and map to an OpenCV optical RDF frame.  This import performs
+        no geometry or frame conversion.
+        """
+
+        capture_text = str(capture_id or "").strip()
+        capture_component = self._hr_capture_path_component(capture_text)
+        single_supplied = side is not None or path is not None
+        pair_supplied = left_path is not None or right_path is not None
+        if single_supplied and pair_supplied:
+            raise ValueError("use side/path or left_path/right_path, not both")
+        sources: dict[str, Path] = {}
+        if single_supplied:
+            if side is None or path is None:
+                raise ValueError("side and path must be supplied together")
+            normalized_side = str(side).strip().lower()
+            if normalized_side not in {"left", "right"}:
+                raise ValueError("side must be left or right")
+            sources[normalized_side] = Path(path)
+        else:
+            if left_path is not None:
+                sources["left"] = Path(left_path)
+            if right_path is not None:
+                sources["right"] = Path(right_path)
+        if not sources:
+            raise ValueError("at least one HR file path is required")
+
+        serials = {
+            str(key).strip().lower(): str(value or "").strip()
+            for key, value in dict(camera_serials or {}).items()
+        }
+        if left_camera_serial is not None:
+            serials["left"] = str(left_camera_serial).strip()
+        if right_camera_serial is not None:
+            serials["right"] = str(right_camera_serial).strip()
+        if camera_serial is not None:
+            if len(sources) != 1:
+                raise ValueError(
+                    "camera_serial is only valid for one side; use per-side serials for a pair"
+                )
+            serials[next(iter(sources))] = str(camera_serial).strip()
+        missing_serials = [side_name for side_name in sources if not serials.get(side_name)]
+        if missing_serials:
+            raise ValueError(
+                "explicit camera serial required for HR import: " + ", ".join(missing_serials)
+            )
+
+        expected_hashes = dict(expected_sha256_by_side or {})
+        expected_resolutions = dict(expected_resolution_by_side or {})
+        imported_utc_ns = time.time_ns()
+        imported = {}
+        # Validate every source before materializing any destination.  This
+        # prevents a bad second side from producing a misleading pair event.
+        for side_name, source_path in sources.items():
+            expected_resolution = expected_resolutions.get(side_name)
+            if expected_resolution is not None and len(expected_resolution) != 2:
+                raise ValueError("expected resolution must be a (width_px, height_px) pair")
+            imported[side_name] = import_hr_image_file(
+                source_path,
+                side=side_name,
+                camera_serial=serials[side_name],
+                expected_sha256=expected_hashes.get(side_name),
+                expected_width_px=(
+                    None if expected_resolution is None else int(expected_resolution[0])
+                ),
+                expected_height_px=(
+                    None if expected_resolution is None else int(expected_resolution[1])
+                ),
+                imported_utc_ns=imported_utc_ns,
+            )
+
+        self._prepare_pnp_evidence_session()
+        session_root = Path(
+            self.panel._recording_session_dir(self.panel.recording_session_id)
+        ).resolve()
+        destination_root = session_root / "hr" / "imported" / capture_component
+        stored_files: dict[str, dict[str, object]] = {}
+        for side_name, image in imported.items():
+            suffix = Path(image.source_name).suffix.lower()
+            if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+                suffix = ".bin"
+            destination = destination_root / f"{side_name}-{image.sha256}{suffix}"
+            stored = image.write_exact(destination)
+            resolved = stored.resolve(strict=True)
+            try:
+                relative_path = resolved.relative_to(session_root)
+            except ValueError as exc:  # defensive: destination must be session-owned
+                raise RuntimeError("HR destination escaped the session directory") from exc
+            stored_files[side_name] = {
+                **image.to_mapping(),
+                "session_relative_path": relative_path.as_posix(),
+            }
+
+        normalized_purpose = (
+            self._known_hr_purpose(capture_text)
+            if purpose is None
+            else self._hr_capture_purpose(purpose)
+        )
+        known_request = next(
+            (
+                dict(record)
+                for record in reversed(self.panel.pnp_photo_capture_records)
+                if str(record.get("capture_id") or "") == capture_text
+            ),
+            {},
+        )
+        source_capture_utc_ns = (
+            int(captured_utc_ns)
+            if captured_utc_ns is not None
+            else int(known_request.get("request_utc_ns") or imported_utc_ns)
+        )
+        time_semantics = (
+            "caller_supplied_source_capture_utc"
+            if captured_utc_ns is not None
+            else (
+                "Workstation_capture_request_utc"
+                if known_request.get("request_utc_ns") is not None
+                else "import_utc_fallback_not_source_capture_truth"
+            )
+        )
+        capture_event = create_hr_capture_event(
+            capture_text,
+            purpose=normalized_purpose,
+            left=imported.get("left"),
+            right=imported.get("right"),
+            captured_utc_ns=source_capture_utc_ns,
+            note="exact HR file import into Workstation session",
+        ).to_mapping()
+        capture_event.update(
+            {
+                "event_type": "hr_file_imported",
+                "state": "imported",
+                "storage": "session_owned_exact_file",
+                "ftp_downloaded": False,
+                "stored_files": stored_files,
+                "capture_time_semantics": time_semantics,
+                "pixel_coordinate_contract": (
+                    "native image raster u-right/v-down; OpenCV optical RDF "
+                    "(right/down/forward); exact bytes retained; no conversion"
+                ),
+            }
+        )
+        for key in (
+            "request_utc_ns",
+            "request_monotonic_ns",
+            "request_clock_anchor_uncertainty_ns",
+            "request_utc_method",
+            "request_session_delta_ns",
+            "request_session_delta_s",
+            "request_time_semantics",
+        ):
+            if key in known_request:
+                capture_event[key] = known_request[key]
+        return self._append_pnp_photo_capture_record(capture_event)
 
     def toggle_distance_recording(self) -> None:
         self.panel.toggle_session_recording()
@@ -438,6 +1505,48 @@ class RecordingController:
                     },
                 }
             )
+            # Automatic selection and annotation review may have happened
+            # after the initial recovery metadata was written.  Refresh this
+            # projection for the final static JSON while preserving the
+            # previous recovery copy if the owner is unavailable after a
+            # restart.
+            optical_pose = self._recording_optical_pose_session_data()
+            if optical_pose.get("state") not in {"UNAVAILABLE", "ERROR"}:
+                previous_optical_pose = metadata.get("optical_pose")
+                current_snapshot = optical_pose.get("snapshot")
+                previous_snapshot = (
+                    previous_optical_pose.get("snapshot")
+                    if isinstance(previous_optical_pose, Mapping)
+                    else None
+                )
+                evidence_keys = (
+                    "frozen_frame_artifacts",
+                    "auto_suggestions",
+                    "accepted_auto_suggestion",
+                    "annotation_review",
+                    "candidates",
+                    "active_profile_id",
+                )
+                current_has_evidence = isinstance(current_snapshot, Mapping) and any(
+                    current_snapshot.get(key) for key in evidence_keys
+                )
+                previous_has_evidence = isinstance(previous_snapshot, Mapping) and any(
+                    previous_snapshot.get(key) for key in evidence_keys
+                )
+                # A retry after an application restart has a fresh owner in
+                # NO DATA state. Do not erase a previously persisted pose
+                # review merely because that owner has not rehydrated it yet.
+                if (
+                    optical_pose.get("state") != "NO DATA"
+                    or current_has_evidence
+                    or not previous_has_evidence
+                ):
+                    metadata["optical_pose"] = optical_pose
+        # Keep retry metadata aligned with the exact payload sent to the
+        # worker.  This matters when finalization fails after a suggestion or
+        # manual annotation was recorded.
+        write_recovery_metadata(output_dir, metadata)
+        self.panel._recovered_session_metadata = json.loads(json.dumps(metadata))
         if isinstance(self.panel.distance_recording_rows, SpoolRows):
             pair_rows = self.panel.distance_recording_rows
         else:
@@ -711,6 +1820,77 @@ class RecordingController:
             }
         return diagnostics
 
+    def _recording_optical_pose_session_data(self) -> dict[str, object]:
+        """Return JSON-safe optical-pose state for session_static.json.
+
+        The live snapshot can contain QImages for the annotation UI.  Session
+        metadata stores only frame identities, artifact paths, candidates,
+        automatic proposals, and annotation provenance; the lossless pixels
+        remain in the session-owned native-frame artifacts.
+        """
+
+        evidence_files = {
+            "run_setup": "run_setup.json",
+            "run_events": "run_events.jsonl",
+            "native_frames": "native_frames.jsonl",
+            "native_frame_root": "frames/optical-pose-burst",
+        }
+        reader = getattr(self.panel, "workstation_optical_pose_snapshot", None)
+        if not callable(reader):
+            return {
+                "schema": "workstation-optical-pose-session-v1",
+                "state": "UNAVAILABLE",
+                "snapshot": {},
+                "evidence_files": evidence_files,
+                "reason": "optical pose owner snapshot is unavailable",
+            }
+        try:
+            try:
+                snapshot = reader(include_frames=False)
+            except TypeError:
+                # Keep compatibility with small test/legacy owners that do
+                # not yet expose the include_frames keyword.
+                snapshot = reader()
+        except Exception as exc:
+            return {
+                "schema": "workstation-optical-pose-session-v1",
+                "state": "ERROR",
+                "snapshot": {},
+                "evidence_files": evidence_files,
+                "reason": str(exc),
+            }
+        if not isinstance(snapshot, Mapping):
+            return {
+                "schema": "workstation-optical-pose-session-v1",
+                "state": "ERROR",
+                "snapshot": {},
+                "evidence_files": evidence_files,
+                "reason": "optical pose owner snapshot is not a mapping",
+            }
+        projection = dict(snapshot)
+        # Never allow a UI QImage to cross into recovery/static JSON, even if
+        # a legacy owner ignores include_frames=False.
+        projection.pop("frozen_frames", None)
+        projection.pop("frozen_native_frames", None)
+        try:
+            safe_projection = json.loads(
+                json.dumps(projection, ensure_ascii=False)
+            )
+        except (TypeError, ValueError) as exc:
+            return {
+                "schema": "workstation-optical-pose-session-v1",
+                "state": "ERROR",
+                "snapshot": {},
+                "evidence_files": evidence_files,
+                "reason": f"snapshot is not JSON-safe: {exc}",
+            }
+        return {
+            "schema": "workstation-optical-pose-session-v1",
+            "state": str(snapshot.get("state") or "NO DATA"),
+            "snapshot": safe_projection,
+            "evidence_files": evidence_files,
+        }
+
     def _recording_session_metadata(
         self,
         *,
@@ -763,6 +1943,20 @@ class RecordingController:
                 "end": self.panel._recording_clock_sync_end_observation,
             },
             "camera_time_sync_drift": self.panel._camera_time_sync_drift_metadata(),
+            "pnp_hr_photo_capture": {
+                "storage": "camera_internal",
+                "ftp_downloaded": False,
+                "event_file": "hr_captures.jsonl",
+                "capture_command": "SIHR TRUE + CPTR + ICPT",
+                "captures": list(getattr(self.panel, "pnp_photo_capture_records", ())),
+            },
+            "oz_photo_capture": {
+                "storage": "camera_internal",
+                "ftp_downloaded": False,
+                "event_file": "oz_captures.jsonl",
+                "capture_command": "SIVI TRUE + CPTR + ICPT",
+                "captures": list(getattr(self.panel, "oz_photo_capture_records", ())),
+            },
             "camera_timing_diagnostics": self.panel._recording_camera_timing_diagnostics(),
             "pc_utc_sync": self.panel._last_wiris_pc_utc_sync,
             "gnss_operation": self.panel.gnss_operation_manager.metadata(),
@@ -823,6 +2017,37 @@ class RecordingController:
                 "clock_offset_check": "Use the 시간 tab RTCP/NTP check plus direct WIRIS GDTI validation before absolute UTC claims.",
             },
             "intrinsics": self.panel._record_current_intrinsic_parameters(),
+            "dual_geometry": {
+                "state": "nominal_active_enabled",
+                "nominal_profile_sha256": (
+                    ""
+                    if not isinstance(
+                        getattr(self.panel, "recording_nominal_intrinsics_snapshot", None),
+                        StereoIntrinsicsSnapshot,
+                    )
+                    else self.panel.recording_nominal_intrinsics_snapshot.content_sha256
+                ),
+                "nominal_intrinsics_profile_sha256": (
+                    ""
+                    if not isinstance(
+                        getattr(self.panel, "recording_nominal_intrinsics_snapshot", None),
+                        StereoIntrinsicsSnapshot,
+                    )
+                    else self.panel.recording_nominal_intrinsics_snapshot.intrinsics_content_sha256
+                ),
+                "nominal_optical_pose_profile_hash": str(
+                    getattr(self.panel, "recording_nominal_optical_pose_profile_hash", "") or ""
+                ),
+                "active_selection_id": str(
+                    getattr(self.panel, "_active_optical_pose_selection_id", "") or ""
+                ),
+                "selection_effective_from_pair_sequence": getattr(
+                    self.panel, "_active_optical_pose_effective_from_pair_sequence", None
+                ),
+                "same_detection_evaluated_twice": True,
+                "coordinate_contract": "both evaluations use OpenCV optical RDF and baseline-center FRD output",
+            },
+            "optical_pose": self._recording_optical_pose_session_data(),
             "stream": {
                 "left_rtsp_url": self.panel.left_url_edit.text().strip(),
                 "right_rtsp_url": self.panel.right_url_edit.text().strip(),
@@ -934,6 +2159,7 @@ class RecordingController:
                 measurement_attempt.right_detection.pairing_timestamp_s, 9
             ),
         }
+        row.update(self._persist_native_measurement_pair(measurement_attempt))
         row.update(self.panel._record_bbox_parameters(measurement_attempt))
         row.update(self.panel._record_measurement_sync_timestamp_parameters(measurement_attempt))
         row.update(self.panel._record_intrinsic_parameters(measurement_attempt))
@@ -942,7 +2168,147 @@ class RecordingController:
         row.update(self.panel._measurement_gnss_record_metadata())
         row.update(self.panel._record_external_parameters(estimate=None, measurement_attempt=measurement_attempt))
         row.update(self.panel._record_reference_delta_parameters(measurement_attempt))
+        row.update(self._record_dual_geometry_parameters(measurement_attempt))
         return row
+
+    def _snapshot_current_intrinsics(self) -> StereoIntrinsicsSnapshot | None:
+        """Freeze the run-start K,D and checkerboard R,t for nominal comparison."""
+
+        result = getattr(self.panel, "active_intrinsics", None)
+        if result is None:
+            return None
+        try:
+            zoom = int(self.panel.zoom_level_spin.value())
+            return StereoIntrinsicsSnapshot.from_result(
+                result,
+                active_zoom_level=zoom,
+                selected_profile_path=str(
+                    getattr(self.panel, "_active_intrinsics_profile_path", "")
+                    or f"memory:nominal-calibration:zoom-{zoom:02d}"
+                ),
+                selected_extrinsics_profile_path=str(
+                    getattr(self.panel, "_active_extrinsics_profile_path", "") or ""
+                ),
+                intrinsics_source_zoom_level=getattr(
+                    self.panel, "_active_intrinsics_source_zoom_level", None
+                ),
+                extrinsics_source_zoom_level=getattr(
+                    self.panel, "_active_extrinsics_source_zoom_level", None
+                ),
+                selection_mode=str(
+                    getattr(self.panel, "_active_calibration_selection_mode", "")
+                    or "legacy_combined"
+                ),
+            )
+        except (AttributeError, TypeError, ValueError) as exc:
+            logger = getattr(self.panel, "_log", None)
+            if callable(logger):
+                logger(f"[저장] nominal K,D snapshot unavailable: {exc}")
+            return None
+
+    def _record_dual_geometry_parameters(
+        self, measurement_attempt: MeasurementAttempt
+    ) -> dict[str, object]:
+        nominal = getattr(self.panel, "recording_nominal_intrinsics_snapshot", None)
+        active = measurement_attempt.intrinsics
+        if (
+            not isinstance(nominal, StereoIntrinsicsSnapshot)
+            or not isinstance(active, StereoIntrinsicsSnapshot)
+            or measurement_attempt.triangulation_source != "checkerboard"
+        ):
+            return {
+                "dual_geometry_state": (
+                    "not_applicable_pixhawk_path"
+                    if measurement_attempt.triangulation_source != "checkerboard"
+                    else "nominal_or_active_profile_unavailable"
+                ),
+                "nominal_profile_sha256": "" if not isinstance(nominal, StereoIntrinsicsSnapshot) else nominal.content_sha256,
+                "active_profile_sha256": "" if not isinstance(active, StereoIntrinsicsSnapshot) else active.content_sha256,
+            }
+        try:
+            nominal_eval, active_eval = evaluate_nominal_active(
+                measurement_attempt,
+                nominal_intrinsics=nominal,
+                active_intrinsics=active,
+                active_selection_id=str(
+                    getattr(self.panel, "_active_optical_pose_selection_id", "") or ""
+                ),
+                active_effective_from_pair_sequence=getattr(
+                    self.panel, "_active_optical_pose_effective_from_pair_sequence", None
+                ),
+            )
+            fields = {}
+            fields.update(nominal_eval.to_record_fields())
+            fields.update(active_eval.to_record_fields())
+            fields["dual_geometry_state"] = "evaluated"
+            fields["nominal_optical_pose_profile_hash"] = str(
+                getattr(self.panel, "recording_nominal_optical_pose_profile_hash", "") or ""
+            )
+            return fields
+        except (TypeError, ValueError, RuntimeError) as exc:
+            return {
+                "dual_geometry_state": "evaluation_error",
+                "dual_geometry_error": str(exc),
+                "nominal_profile_sha256": nominal.content_sha256,
+                "active_profile_sha256": active.content_sha256,
+            }
+
+    def _persist_native_measurement_pair(
+        self,
+        measurement_attempt: MeasurementAttempt,
+    ) -> dict[str, object]:
+        """Persist accepted-pair source pixels without resizing or overlays.
+
+        The producer's OpenCV/native image coordinates are retained.  Missing
+        cached frames do not block raw attempt recording; the explicit status
+        lets offline analysis distinguish absence from a hash/path mismatch.
+        """
+
+        if not self.panel.recording_session_id:
+            return {"native_pair_status": "session_id_missing"}
+        pair_id = f"pair-{measurement_attempt.attempt_id}"
+        store = NativeFrameStore(
+            self.panel._recording_session_dir(self.panel.recording_session_id)
+        )
+        output: dict[str, object] = {"native_pair_status": "complete"}
+        missing: list[str] = []
+        for side, detection in (
+            ("left", measurement_attempt.left_detection),
+            ("right", measurement_attempt.right_detection),
+        ):
+            pane = getattr(self.panel, f"{side}_pane", None)
+            getter = getattr(pane, "native_measurement_frame", None)
+            cached = getter(detection.pairing_timestamp_s) if callable(getter) else None
+            if cached is None:
+                missing.append(side)
+                continue
+            _timestamp_s, image, metadata = cached
+            try:
+                artifact = store.persist(
+                    side=side,
+                    purpose="accepted-measurement",
+                    frame_id=pair_id,
+                    image=image,
+                    metadata=metadata,
+                )
+            except Exception as exc:
+                output[f"native_{side}_error"] = str(exc)
+                missing.append(side)
+                continue
+            output.update(
+                {
+                    f"native_{side}_frame_id": artifact.frame_id,
+                    f"native_{side}_png_path": artifact.relative_path,
+                    f"native_{side}_png_sha256": artifact.sha256,
+                    f"native_{side}_width_px": artifact.width,
+                    f"native_{side}_height_px": artifact.height,
+                    f"native_{side}_timestamp_reference": artifact.timestamp_reference,
+                    f"native_{side}_source_frame_id": artifact.source_native_frame_id,
+                }
+            )
+        if missing:
+            output["native_pair_status"] = "missing:" + ",".join(missing)
+        return output
 
     def _upsert_pair_recording_row(
         self,
@@ -2397,43 +3763,3 @@ class RecordingController:
         }
 
 
-RECORDING_CONTROLLER_METHODS += [
-    "_pair_recording_base_row",
-    "_upsert_pair_recording_row",
-    "_record_unresolved_pair",
-    "_append_distance_history",
-    "_distance_history_class_name",
-    "_fmt_record_float",
-    "_fmt_record_bool",
-    "_recording_elapsed_s",
-    "_session_utc_ns_for_monotonic_ns",
-    "_recording_side",
-    "_raw_timeline_row",
-    "_record_gui_camera_frame",
-    "_record_external_timeline_row",
-    "_record_bbox_parameters",
-    "_detection_utc_unix_s",
-    "_unix_seconds_to_ns",
-    "_record_measurement_sync_timestamp_parameters",
-    "_record_frame_timestamp_parameters",
-    "_record_live_telemetry_snapshot_parameters",
-    "_record_reference_delta_parameters",
-    "_record_current_intrinsic_parameters",
-    "_record_intrinsic_parameters",
-    "_record_current_checkerboard_extrinsics_parameters",
-    "_record_checkerboard_extrinsics_parameters",
-    "_record_external_parameters",
-    "_record_extrinsic_state",
-    "_record_gps_state",
-    "_record_gnss_relative_state",
-    "save_distance_history_csv",
-    "_handle_session_saved",
-    "_handle_session_save_failed",
-    "_handle_session_save_thread_finished",
-    "_wait_for_session_save",
-    "_record_px4_mag_status_rows",
-    "_record_px4_mag_status_snapshot",
-    "_recording_camera_timing_diagnostics",
-    "_recording_session_metadata",
-    "_remove_distance_history_point"
-]

@@ -26,9 +26,12 @@ from ipaddress import IPv4Address
 from math import isfinite
 from pathlib import Path
 from statistics import median
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+from Workstation.controller_delegation import ControllerDelegateBinding, bind_controller_delegates
 
 from Workstation.workstation_core.calibration import (
     CheckerboardConfig,
@@ -36,9 +39,7 @@ from Workstation.workstation_core.calibration import (
     StereoIntrinsicsResult,
     calibrate_camera_from_images,
     calibrate_stereo_extrinsics_from_image_pairs,
-    compose_stereo_calibration,
     detect_checkerboard,
-    intrinsics_content_sha256,
     opencv_available,
     load_intrinsics_json,
     save_intrinsics_json,
@@ -92,7 +93,6 @@ from Workstation.workstation_core.gnss_operation import (
     GnssOperationConfig,
     GnssOperationManager,
     GnssOperationMode,
-    GnssOperationState,
     GnssReadinessSnapshot,
     GgaPolicy,
     GnssStatusGroup,
@@ -158,6 +158,7 @@ from Workstation.workstation_core.pixhawk_attitude import (
     discover_mavlink_messages,
     mavlink_graphable_fields_for_message,
     magnetometer_value_units,
+    parse_px4_sensor_mag_shell_output,
     probe_usb_mavlink_devices,
     usb_mavlink_device_candidates,
 )
@@ -166,6 +167,7 @@ from Workstation.workstation_core.px4_mag_manager import (
     GPS1_MAG_ID,
     GPS2_MAG_ID,
     MAG_PARAM_NAMES,
+    MAG_PRIORITY_LEVELS,
     MAG_SLOTS,
     MockParameterStore,
     Px4MagManager,
@@ -177,6 +179,7 @@ from Workstation.workstation_core.px4_mag_manager import (
     build_mag_status,
     current_pixhawk_6x_mag_params,
     identify_mag_device,
+    mag_priority_display,
 )
 from Workstation.workstation_core.px4_attitude_cal_manager import (
     ATTITUDE_CAL_PARAM_NAMES,
@@ -197,9 +200,7 @@ from Workstation.workstation_core.recording_session import (
     SavedSessionFiles,
     SpoolRows,
     compact_distance_measurement_rows,
-    discover_retryable_sessions,
     format_video_paths,
-    load_retryable_session,
     raw_video_paths,
     save_session_files,
     session_dir,
@@ -211,7 +212,6 @@ from Workstation.workstation_core.settings import (
     DEFAULT_INTRINSICS_PATH,
     AppSettings,
     load_settings as _load_shared_settings,
-    resolve_settings_path,
     save_settings as _save_shared_settings,
 )
 from Workstation.workstation_core.stereo import (
@@ -325,6 +325,7 @@ from Workstation.workstation_core.wiris_zoom import (
     SET_ETHERNET_MODE_COMMAND,
     SET_IP_ADDRESS_TEMPLATE,
     SET_SUBNET_MASK_TEMPLATE,
+    VISIBLE_ZOOM_FX_ESTIMATES,
     build_wiris_command,
     build_zoom_command,
     send_tcp_line,
@@ -364,23 +365,7 @@ STARTUP_READY_MESSAGE = (
 )
 YOLO_CPU_DEVICE = "cpu"
 YOLO_CUDA_DEVICE = "cuda:0"
-WIRIS_VISIBLE_ZOOM_FX_ESTIMATES = (
-    (0, 1.0, 1030),
-    (1, 1.2, 1236),
-    (2, 1.5, 1545),
-    (3, 2.0, 2060),
-    (4, 3.0, 3091),
-    (5, 4.0, 4121),
-    (6, 5.0, 5151),
-    (7, 6.0, 6181),
-    (8, 8.0, 8242),
-    (9, 10.0, 10302),
-    (10, 12.0, 12362),
-    (11, 16.0, 16483),
-    (12, 20.0, 20604),
-    (13, 25.0, 25755),
-    (14, 30.0, 30906),
-)
+WIRIS_VISIBLE_ZOOM_FX_ESTIMATES = VISIBLE_ZOOM_FX_ESTIMATES
 MAX_MANUAL_FOCAL_PX = 100_000.0
 DETECTION_PAIR_MAX_AGE_S = 1.0
 RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
@@ -429,10 +414,43 @@ from Workstation.workstation_core.runtime_camera_status import (
 from Workstation.telemetry_plots import (
     AttitudeHistoryPlot,
     AttitudeHistoryPoint,
+    Px4ShellDialog,
     RtkAlignmentPlot,
     TelemetryHistoryPlot,
     TelemetryHistoryPoint,
 )
+
+
+def _set_px4_priority_combo_value(combo: QtWidgets.QComboBox, value: int | float | None) -> None:
+    if value is None:
+        return
+    raw = int(value)
+    index = combo.findData(raw)
+    if index < 0:
+        combo.addItem(f"Custom ({raw})", raw)
+        index = combo.count() - 1
+    combo.setCurrentIndex(index)
+    combo.setToolTip(f"PX4 CAL_MAG*_PRIO: {mag_priority_display(raw)}")
+
+
+def _build_px4_priority_combo(value: int) -> QtWidgets.QComboBox:
+    combo = QtWidgets.QComboBox()
+    for raw, label in MAG_PRIORITY_LEVELS:
+        combo.addItem(label, raw)
+    _set_px4_priority_combo_value(combo, value)
+    combo.currentIndexChanged.connect(
+        lambda _index, combo=combo: combo.setToolTip(
+            f"PX4 CAL_MAG*_PRIO: {mag_priority_display(combo.currentData())}"
+        )
+    )
+    return combo
+
+
+def _px4_priority_combo_value(combo: QtWidgets.QComboBox) -> int:
+    value = combo.currentData()
+    return 0 if value is None else int(value)
+
+
 def _control_candidate_value(candidate: object, key: str, default: object | None = None) -> object | None:
     if isinstance(candidate, dict):
         return candidate.get(key, default)
@@ -813,6 +831,23 @@ from Workstation.recording_controller import (
     RecordingController,
     new_measurement_attempt_generation_id as _new_measurement_attempt_generation_id,
 )
+from Workstation.run_evidence_controller import (
+    RUN_EVIDENCE_CONTROLLER_METHODS,
+    RunEvidenceController,
+)
+from Workstation.optical_pose_controller import (
+    OPTICAL_POSE_CONTROLLER_METHODS,
+    OpticalPoseController,
+)
+from Workstation.target_drone_controller import (
+    TARGET_DRONE_CONTROLLER_METHODS,
+    TargetDroneController,
+)
+from Workstation.drone_telemetry_controller import (
+    DRONE_TELEMETRY_CONTROLLER_METHODS,
+    DroneTelemetryController,
+    normalize_drone_rtcm_source,
+)
 from Workstation.measurement_view_controller import (
     MEASUREMENT_VIEW_CONTROLLER_METHODS,
     MeasurementViewController,
@@ -820,6 +855,10 @@ from Workstation.measurement_view_controller import (
 from Workstation.sensor_presentation_controller import (
     SENSOR_PRESENTATION_METHODS,
     SensorPresentationController,
+)
+from Workstation.settings_controller import (
+    SETTINGS_CONTROLLER_METHODS,
+    WorkstationSettingsController,
 )
 
 
@@ -1012,6 +1051,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "percent": 0.0,
             "message": "대기",
         }
+        self.last_capture_zoom_level: int | None = None
         self.last_calibration_zoom_level: int | None = None
         self.active_intrinsics: StereoIntrinsicsResult | None = None
         self._active_intrinsics_profile_path = ""
@@ -1059,6 +1099,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.wiris_control_check_worker: WirisControlCheckWorker | None = None
         self.wiris_command_thread: QtCore.QThread | None = None
         self.wiris_command_worker: WirisCommandWorker | None = None
+        self.pnp_photo_capture_thread: QtCore.QThread | None = None
+        self.pnp_photo_capture_worker: QtCore.QObject | None = None
+        self.pnp_photo_capture_records: list[dict[str, object]] = []
+        self.oz_photo_capture_thread: QtCore.QThread | None = None
+        self.oz_photo_capture_worker: QtCore.QObject | None = None
+        self.oz_photo_capture_records: list[dict[str, object]] = []
+        self._pnp_session_prepared = False
         self.wiris_lrf_thread: QtCore.QThread | None = None
         self.wiris_lrf_worker: WirisLrfPollWorker | None = None
         self.wiris_zoom_thread: QtCore.QThread | None = None
@@ -1105,7 +1152,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_network_thread: QtCore.QThread | None = None
         self.gnss_network_worker: NtripNetworkWorker | None = None
         self.gnss_network_connected = False
+        self.gnss_network_phase = "DISCONNECTED"
+        self.gnss_network_stats: object | None = None
         self.gnss_network_status_line = ""
+        self.gnss_network_last_error = ""
+        self.gnss_network_reconnect_count = 0
         self.gnss_network_rtcm_parser = Rtcm3StreamParser()
         self.gnss_coordinate_samples: deque[GnssCoordinateSample] = deque(maxlen=2400)
         # Latest Base position is a WGS84 geodetic sample used only for the
@@ -1135,6 +1186,16 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.auto_start = auto_start
         self.auto_start_pixhawk = auto_start_pixhawk
         self.settings = load_settings(self.settings_path)
+        self.drone_telemetry_url = self.settings.drone_telemetry_url
+        self.drone_telemetry_baud = self.settings.drone_telemetry_baud
+        self.drone_telemetry_rtcm_forward = self.settings.drone_telemetry_rtcm_forward
+        self.drone_telemetry_rtcm_source = normalize_drone_rtcm_source(
+            self.settings.drone_telemetry_rtcm_source
+        )
+        self.drone_telemetry_connection_state = "DISCONNECTED"
+        self.drone_telemetry_last_error = ""
+        self.drone_telemetry_connection_thread: QtCore.QThread | None = None
+        self.drone_telemetry_connection_worker: PixhawkConnectionWorker | None = None
         self._workstation_setting_overrides: dict[str, object] = {}
         self.gnss_operation_manager = GnssOperationManager(self.settings.gnss_operation)
         self.distance_history: deque[DistanceHistoryPoint] = deque(maxlen=600)
@@ -1240,12 +1301,17 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.alignment_profile_manager = AlignmentProfileManager()
         self.loaded_alignment_profile: dict[str, object] | None = None
         self.latest_mag_sensors: dict[str, dict[str, object]] = {"left": {}, "right": {}}
+        self.latest_can_mag_sensors: dict[str, dict[str, object]] = {"left": {}, "right": {}}
         self.latest_vehicle_mag_device_ids: dict[str, int | None] = {"left": None, "right": None}
         self.px4_mag_managers = {
             "left": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
             "right": Px4MagManager(MockParameterStore(current_pixhawk_6x_mag_params())),
         }
         self._px4_mag_status_cache: dict[str, object] = {}
+        self._px4_attitude_cal_status_cache: dict[str, Px4AttitudeCalStatus] = {}
+        self._px4_calibration_parameter_error: dict[str, str] = {}
+        self._px4_calibration_reset_error: dict[str, str] = {}
+        self._px4_calibration_reset_pending: dict[str, str] = {}
         self.px4_mag_manager = self.px4_mag_managers["left"]
         self.px4_attitude_cal_managers = {
             "left": Px4AttitudeCalManager(MockParameterStore(current_pixhawk_6x_attitude_cal_params())),
@@ -3163,6 +3229,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
         self._shutdown_coordinator = LifecycleCoordinator(
             [
+                LifecycleStep("stop-target-drone", lambda: self._shutdown_stop_target_drone()),
+                LifecycleStep("stop-drone-telemetry", lambda: self._shutdown_stop_drone_telemetry()),
                 LifecycleStep("stop-runtime-workers", lambda: self.stop_all(wait=False)),
                 LifecycleStep("stop-gnss-network", lambda: self.stop_gnss_network()),
                 LifecycleStep("stop-gnss-base-serial", lambda: self._shutdown_stop_gnss_base_serial()),
@@ -3572,7 +3640,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.capture_calibration_auto_button: "좌·우 모두 체커보드가 검출되고 RTCP/NTP 시각 차이가 100ms 이하인 pair를 자동으로 저장합니다.",
             self.run_calibration_button: "캡처된 체커보드 이미지로 OpenCV 내부 파라미터 보정을 실행합니다.",
             self.calibration_progress_bar: "내부 파라미터 및 stereo 계산에서 실제 검사한 이미지/pair 기준 진행률입니다.",
-            self.save_intrinsics_button: "현재 WIRIS 줌 레벨의 내부 파라미터를 intrinsics_zoom_##.json으로 저장하고 latest alias intrinsics.json도 갱신합니다.",
+            self.save_intrinsics_button: "촬영 당시 양쪽 카메라 GZVV readback으로 확인된 줌 레벨의 내부 파라미터를 intrinsics_zoom_##.json으로 저장하고 latest alias intrinsics.json도 갱신합니다.",
             self.apply_intrinsics_button: "현재 WIRIS 줌 레벨의 intrinsics_zoom_##.json 또는 막 계산한 결과를 거리 측정에 적용합니다.",
             self.add_zoom_intrinsics_file_button: "비교 목록에 저장된 intrinsics JSON 파일을 추가합니다. 파일 자체는 복사하거나 변경하지 않습니다.",
             self.remove_zoom_intrinsics_file_button: "선택한 intrinsics JSON 파일을 비교 목록에서만 제거합니다. 저장된 파일은 삭제하지 않습니다.",
@@ -4354,10 +4422,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             lambda _index: self._handle_gnss_operation_mode_changed()
         )
         self.gnss_ntrip_host_edit = QtWidgets.QLineEdit(operation_config.network.caster_host)
+        self.gnss_ntrip_host_edit.setPlaceholderText("caster.example.com (hostname only)")
         self.gnss_ntrip_port_spin = QtWidgets.QSpinBox()
         self.gnss_ntrip_port_spin.setRange(1, 65535)
         self.gnss_ntrip_port_spin.setValue(operation_config.network.caster_port)
         self.gnss_ntrip_mountpoint_edit = QtWidgets.QLineEdit(operation_config.network.mountpoint)
+        self.gnss_ntrip_mountpoint_edit.setPlaceholderText("MOUNTPOINT")
         self.gnss_ntrip_username_env_edit = QtWidgets.QLineEdit(operation_config.network.username_env)
         self.gnss_ntrip_password_env_edit = QtWidgets.QLineEdit(operation_config.network.password_env)
         self.gnss_ntrip_gga_policy_combo = QtWidgets.QComboBox()
@@ -4425,7 +4495,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         add_setting(survey_config_form, 0, "Survey-in 최소 시간(s)", self.gnss_base_survey_duration_spin)
         add_setting(survey_config_form, 1, "Survey-in 목표 정확도(m)", self.gnss_base_survey_accuracy_spin)
 
-        self.gnss_network_config_group = QtWidgets.QGroupBox("NTRIP Network 설정")
+        self.gnss_network_config_group = QtWidgets.QGroupBox("임의 NTRIP caster 설정")
         network_config_form = QtWidgets.QGridLayout(self.gnss_network_config_group)
         add_setting(network_config_form, 0, "NTRIP caster host", self.gnss_ntrip_host_edit)
         add_setting(network_config_form, 1, "NTRIP port", self.gnss_ntrip_port_spin)
@@ -4661,6 +4731,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "injection": {
                 "left": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
                 "right": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
+                "drone": {"frames": 0, "bytes": 0, "packets": 0, "fail": 0},
             },
         }
 
@@ -6169,7 +6240,9 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.px4_mag_apply_manual_buttons: dict[str, QtWidgets.QPushButton] = {}
         self.px4_mag_save_buttons: dict[str, QtWidgets.QPushButton] = {}
         self.px4_mag_reboot_buttons: dict[str, QtWidgets.QPushButton] = {}
-        self.px4_mag_priority_spins: dict[str, dict[str, QtWidgets.QSpinBox]] = {}
+        # Kept under the historical ``*_spins`` attribute name for backend
+        # compatibility; the controls now expose PX4's semantic priority enum.
+        self.px4_mag_priority_spins: dict[str, dict[str, QtWidgets.QComboBox]] = {}
 
         self.px4_mag_tab_widget = QtWidgets.QTabWidget()
         for camera, title in (("left", "Pixhawk 1"), ("right", "Pixhawk 2")):
@@ -6217,15 +6290,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         }
         self.px4_mag_priority_spins[camera] = {}
         for row, role in enumerate(("BOARD", "CAN1", "CAN2", "GPS1_MAG", "GPS2_MAG")):
-            spin = QtWidgets.QSpinBox()
-            spin.setRange(0, 100)
-            spin.setValue(default_priorities[role])
-            spin.setSuffix(" prio")
-            spin.setToolTip(f"{role}가 등록된 CAL_MAG 슬롯의 PRIO 값을 설정합니다.")
+            spin = _build_px4_priority_combo(default_priorities[role])
+            spin.setToolTip(
+                f"{role}가 등록된 CAL_MAG 슬롯의 PRIO 값을 설정합니다. "
+                f"현재 선택: {mag_priority_display(default_priorities[role])}"
+            )
             manual_layout.addWidget(QtWidgets.QLabel(role), row, 0)
             manual_layout.addWidget(spin, row, 1)
             self.px4_mag_priority_spins[camera][role] = spin
-        manual_note = QtWidgets.QLabel("MAVLink heartbeat + PARAM readback 상태에서만 실제 PX4 CAL_MAG*_PRIO에 적용됩니다.")
+        manual_note = QtWidgets.QLabel(
+            "PX4 값: Uninitialized=-1, Disabled=0, Min=1, Low=25, Medium=50, High=75, Max=100. "
+            "기존의 비표준 값은 Custom으로 보존합니다. MAVLink heartbeat + PARAM readback 상태에서만 적용됩니다."
+        )
         manual_note.setObjectName("statusStrip")
         manual_note.setWordWrap(True)
         manual_layout.addWidget(manual_note, len(default_priorities), 0, 1, 2)
@@ -7522,77 +7598,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return None
         return rows[row]
 
-    def apply_selected_pixhawk_candidate(self, side: str, *, source: str | None = None) -> None:
-        if source is None:
-            source = "pc" if side == "host" else "mavlink"
-        entry = self._selected_pixhawk_candidate(source)
-        if entry is None:
-            return
-        kind = str(entry.get("kind", ""))
-        value = str(entry.get("value", "")).strip()
-        if not value:
-            self._log("[픽스호크] 선택 후보에 적용할 값이 없습니다.")
-            return
-        if kind == "PC_IP":
-            if side != "host":
-                self._log("[픽스호크] PC IP 후보는 Host에 적용 버튼으로 적용하세요.")
-                return
-            old_text = self.pixhawk_host_address_edit.text().strip()
-            self.pixhawk_host_address_edit.setText(value)
-            self._log(
-                f"[픽스호크] 선택 PC IP 후보를 Pixhawk Host IP에 적용했습니다: "
-                f"{old_text or '<empty>'} -> {value} ({entry.get('interface', '')})"
-            )
-            self.pixhawk_connection_label.setText(f"Pixhawk Host IP 후보 적용됨: {value}")
-            self._save_current_settings()
-            self._refresh_operation_header()
-            return
-        if side not in {"left", "right"}:
-            self._log(f"[픽스호크] {kind} 후보는 P1/P2에 적용하세요.")
-            return
-        mavlink_was_active = side in self._mavlink_open_sides()
-        if kind == "USB":
-            try:
-                baud = int(entry.get("baud") or 0)
-            except (TypeError, ValueError):
-                baud = 0
-            if side == "left":
-                self.left_pixhawk_bootstrap_url_edit.setText(value)
-                if baud:
-                    self.left_pixhawk_bootstrap_baud_spin.setValue(baud)
-            else:
-                self.right_pixhawk_bootstrap_url_edit.setText(value)
-                if baud:
-                    self.right_pixhawk_bootstrap_baud_spin.setValue(baud)
-        elif kind == "MAVLink":
-            try:
-                baud = int(entry.get("baud") or 0)
-            except (TypeError, ValueError):
-                baud = 0
-            if side == "left":
-                self.left_mavlink_url_edit.setText(value)
-                if baud:
-                    self.left_mavlink_baud_spin.setValue(baud)
-            else:
-                self.right_mavlink_url_edit.setText(value)
-                if baud:
-                    self.right_mavlink_baud_spin.setValue(baud)
-        else:
-            self._log(f"[픽스호크] 지원하지 않는 후보 종류입니다: {kind}")
-            return
-        label = "Pixhawk 1" if side == "left" else "Pixhawk 2"
-        self._log(f"[픽스호크] 선택 후보를 {label}에 적용했습니다: {kind} {value}")
-        if kind in {"USB", "MAVLink"}:
-            self._refresh_mavlink_side_actions()
-            if kind == "MAVLink" and mavlink_was_active:
-                self._log(f"[픽스호크] {label} MAVLink URL 후보 적용으로 기존 {label} MAVLink 세션을 해제합니다. 다시 연결하세요.")
-                self.disconnect_mavlink_pixhawk(side)
-            if kind == "USB":
-                self.pixhawk_connection_label.setText(f"{label} USB 부트스트랩 후보 적용됨: ETH MAV 시작(USB)을 누르세요.")
-            else:
-                self.pixhawk_connection_label.setText(f"{label} MAVLink URL 후보 적용됨: {label} MAVLink 연결을 누르세요.")
-        self._refresh_operation_header()
-
     def apply_pixhawk_candidate(self, source: str, row: int, target: str) -> bool:
         """Apply a discovered endpoint selected by the Workstation surface."""
 
@@ -7985,135 +7990,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log(f"[카메라] {camera_name} RTSP 프레임 확인 완료. 해당 Preview를 다시 연결했습니다.")
         self._refresh_session_toggle_buttons()
         self._refresh_operation_header()
-
-    def apply_wiris_stip(self, camera: str) -> None:
-        camera_name = self._camera_name_ko(camera)
-        host_edit = self.left_zoom_host_edit if camera == "left" else self.right_zoom_host_edit
-        new_ip_edit = self.left_stip_ip_edit if camera == "left" else self.right_stip_ip_edit
-        url_edit = self.left_url_edit if camera == "left" else self.right_url_edit
-        current_host = host_edit.text().strip()
-        new_ip = new_ip_edit.text().strip()
-        mask = self.stip_mask_edit.text().strip()
-        try:
-            IPv4Address(current_host)
-            IPv4Address(new_ip)
-            IPv4Address(mask)
-        except ValueError as exc:
-            self._log(f"[카메라] {camera_name} STIP 입력 오류: {exc}")
-            self.camera_connection_label.setText(f"camera STIP: {camera}=invalid-input")
-            return
-        if current_host == new_ip:
-            self._log(f"[카메라] {camera_name} STIP 건너뜀: 현재 host와 새 IP가 같습니다 ({new_ip}).")
-            self.camera_connection_label.setText(f"camera STIP: {camera}=unchanged")
-            return
-        port = self._control_port_for_camera(camera)
-        reboot_text = " and reboot" if self.stip_reboot_checkbox.isChecked() else ""
-        answer = QtWidgets.QMessageBox.warning(
-            self,
-            "Apply WIRIS STIP",
-            (
-                f"{camera_name} WIRIS at {current_host}:{port} will be changed to {new_ip} "
-                f"with subnet mask {mask}{reboot_text}.\n\n"
-                "Use this only when the target WIRIS is uniquely identified, preferably with one camera connected."
-            ),
-            QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel,
-            QtWidgets.QMessageBox.Cancel,
-        )
-        if answer != QtWidgets.QMessageBox.Ok:
-            self._log(f"[카메라] {camera_name} STIP 취소됨.")
-            return
-        if self.wiris_stip_thread is not None:
-            self._log("[카메라] STIP 적용이 이미 진행 중입니다.")
-            return
-        if camera == "left":
-            self.left_stip_button.setEnabled(False)
-        else:
-            self.right_stip_button.setEnabled(False)
-        self.camera_connection_label.setText(f"camera STIP: {camera}=applying...")
-        self.wiris_stip_thread = QtCore.QThread(self)
-        self.wiris_stip_worker = WirisStipWorker(
-            interface_name=self.interface_edit.text().strip(),
-            host_address=self.host_address_edit.text().strip(),
-            host_hints=self._camera_host_hints(),
-            current_host=current_host,
-            new_ip=new_ip,
-            mask=mask,
-            port=port,
-            reboot=self.stip_reboot_checkbox.isChecked(),
-            timeout_s=self.zoom_timeout_spin.value(),
-        )
-        self.wiris_stip_worker.moveToThread(self.wiris_stip_thread)
-        self.wiris_stip_thread.started.connect(self.wiris_stip_worker.run)
-        self.wiris_stip_worker.completed.connect(
-            lambda result, camera=camera, camera_name=camera_name, host_edit=host_edit, new_ip_edit=new_ip_edit, url_edit=url_edit, new_ip=new_ip, current_host=current_host: self._apply_wiris_stip_result(
-                camera,
-                camera_name,
-                host_edit,
-                new_ip_edit,
-                url_edit,
-                new_ip,
-                current_host,
-                result,
-            )
-        )
-        self.wiris_stip_worker.failed.connect(
-            lambda error, camera=camera, camera_name=camera_name: self._wiris_stip_failed(camera, camera_name, error)
-        )
-        self.wiris_stip_worker.finished.connect(self.wiris_stip_thread.quit)
-        self.wiris_stip_worker.finished.connect(self.wiris_stip_worker.deleteLater)
-        self.wiris_stip_thread.finished.connect(self.wiris_stip_thread.deleteLater)
-        self.wiris_stip_thread.finished.connect(lambda camera=camera: self._clear_wiris_stip_worker(camera))
-        self.wiris_stip_thread.start()
-
-    def _apply_wiris_stip_result(
-        self,
-        camera: str,
-        camera_name: str,
-        host_edit: QtWidgets.QLineEdit,
-        new_ip_edit: QtWidgets.QLineEdit,
-        url_edit: QtWidgets.QLineEdit,
-        new_ip: str,
-        current_host: str,
-        result: object,
-    ) -> None:
-        data = dict(result or {})
-        candidates = list(data.get("candidates") or [])
-        if candidates:
-            self._apply_host_interface_candidates(candidates)
-        interface_name = str(data.get("interface_name") or self.interface_edit.text().strip())
-        host_address = str(data.get("host_address") or self.host_address_edit.text().strip())
-        if interface_name:
-            self.interface_edit.setText(interface_name)
-        if host_address:
-            self.host_address_edit.setText(host_address)
-        if str(data.get("state") or "failed") != "sent":
-            error = str(data.get("error") or "unknown error")
-            self._log(f"[카메라] {camera_name} STIP 적용 실패: {error}")
-            self.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
-            self._refresh_operation_header()
-            return
-        statuses = [str(status) for status in list(data.get("statuses") or [])]
-        host_edit.setText(new_ip)
-        new_ip_edit.setText(new_ip)
-        self._replace_rtsp_url_host(url_edit, new_ip)
-        self._rtsp_widgets_for_camera(camera)[1].setText(new_ip)
-        self._log(f"[카메라] {camera_name} STIP 적용: {current_host} -> {new_ip}, {'; '.join(statuses)}")
-        self.camera_connection_label.setText(f"camera STIP: {camera}={current_host}->{new_ip}")
-        self._save_current_settings()
-        self._refresh_operation_header()
-
-    def _wiris_stip_failed(self, camera: str, camera_name: str, error: str) -> None:
-        self._log(f"[카메라] {camera_name} STIP worker 실패: {error}")
-        self.camera_connection_label.setText(f"camera STIP: {camera}=failed ({error})")
-        self._refresh_operation_header()
-
-    def _clear_wiris_stip_worker(self, camera: str) -> None:
-        self.wiris_stip_thread = None
-        self.wiris_stip_worker = None
-        if camera == "left":
-            self.left_stip_button.setEnabled(True)
-        else:
-            self.right_stip_button.setEnabled(True)
 
     def _rtsp_widgets_for_camera(self, camera: str) -> tuple[QtWidgets.QLineEdit, QtWidgets.QLineEdit]:
         if camera == "left":
@@ -9381,6 +9257,34 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._recording_controller_owner = owner
         return owner
 
+    def _run_evidence_controller(self):
+        owner = getattr(self, "_run_evidence_controller_owner", None)
+        if owner is None:
+            owner = RunEvidenceController(self)
+            self._run_evidence_controller_owner = owner
+        return owner
+
+    def _optical_pose_controller(self):
+        owner = getattr(self, "_optical_pose_controller_owner", None)
+        if owner is None:
+            owner = OpticalPoseController(self)
+            self._optical_pose_controller_owner = owner
+        return owner
+
+    def _target_drone_controller(self):
+        owner = getattr(self, "_target_drone_controller_owner", None)
+        if owner is None:
+            owner = TargetDroneController(self)
+            self._target_drone_controller_owner = owner
+        return owner
+
+    def _drone_telemetry_controller(self):
+        owner = getattr(self, "_drone_telemetry_controller_owner", None)
+        if owner is None:
+            owner = DroneTelemetryController(self)
+            self._drone_telemetry_controller_owner = owner
+        return owner
+
     def _calibration_workflow_controller(self):
         owner = getattr(self, "_calibration_workflow_controller_owner", None)
         if owner is None:
@@ -9437,6 +9341,449 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._app_lifecycle_controller_owner = owner
         return owner
 
+    def _workstation_settings_controller(self):
+        owner = getattr(self, "_workstation_settings_controller_owner", None)
+        if owner is None:
+            owner = WorkstationSettingsController(self)
+            self._workstation_settings_controller_owner = owner
+        return owner
+
+    # BEGIN GENERATED PANEL DELEGATE STUBS - see tools/gen_panel_delegate_stubs.py
+    #
+    # These declarations are inert at runtime (TYPE_CHECKING is False when the
+    # module is imported); they exist only so IDEs/type checkers can see the
+    # ~410 methods that `_CONTROLLER_DELEGATE_BINDINGS` attaches via setattr,
+    # which are otherwise invisible to static analysis. Do not hand-edit -
+    # regenerate with `python3 tools/gen_panel_delegate_stubs.py` after
+    # changing any `*_METHODS` registry.
+    if TYPE_CHECKING:
+        def _set_camera_sync_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_widget_value(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_history_window_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_receive_pair_max_delta_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_rtcp_pair_max_delta_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_max_sr_age_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_max_pc_offset_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_max_clock_rate_error(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_required_sr_count(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_warmup_timeout_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_sync_readiness(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _poll_camera_sync_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _begin_camera_sync_after_stus(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clock_sync_side_summary(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _rtcp_sender_report_count(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clock_sync_pair_metadata(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_time_sync_metrics(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_time_sync_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _capture_recording_clock_sync_start_observation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_time_sync_drift_metadata(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_clock_sync_status(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_clock_offset_sample(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_clock_sync_display(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _is_clock_sync_tab_visible(self, *args: Any, **kwargs: Any) -> Any: ...
+        def refresh_clock_sync_status(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_recording_status_label(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_table_value(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_preview_rows(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_sheet_names(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_sheet_kind(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _active_recording_sheet_name(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_recording_table_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_active_recording_sheet(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _fill_recording_sheet(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_recording_table(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_recording_sample_detail(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_session_recording(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _start_session_recording(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recover_retryable_recording_session(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _stop_session_recording(self, *args: Any, **kwargs: Any) -> Any: ...
+        def capture_pnp_hr_photos(self, *args: Any, **kwargs: Any) -> Any: ...
+        def capture_pnp_oz_photos(self, *args: Any, **kwargs: Any) -> Any: ...
+        def import_hr_files(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_pnp_photo_capture_record(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_oz_photo_capture_record(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_pnp_photo_capture_completed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_pnp_photo_capture_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pnp_photo_capture_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_oz_photo_capture_completed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_oz_photo_capture_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_oz_photo_capture_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_distance_recording(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_video_recording(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pair_recording_base_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _upsert_pair_recording_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_unresolved_pair(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_distance_history(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _distance_history_class_name(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _fmt_record_float(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _fmt_record_bool(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_elapsed_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _session_utc_ns_for_monotonic_ns(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_side(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _raw_timeline_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_gui_camera_frame(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_external_timeline_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_bbox_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _detection_utc_unix_s(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _unix_seconds_to_ns(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_measurement_sync_timestamp_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_frame_timestamp_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_live_telemetry_snapshot_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_reference_delta_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_current_intrinsic_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_intrinsic_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_current_checkerboard_extrinsics_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_checkerboard_extrinsics_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_external_parameters(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_extrinsic_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_gps_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_gnss_relative_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def save_distance_history_csv(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_session_saved(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_session_save_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_session_save_thread_finished(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wait_for_session_save(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_px4_mag_status_rows(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_px4_mag_status_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_camera_timing_diagnostics(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _recording_session_metadata(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_ulog_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def import_workstation_ulog(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _remove_distance_history_point(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_workstation_run_setup(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_run_setup_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def ensure_workstation_run_evidence(self, *args: Any, **kwargs: Any) -> Any: ...
+        def append_workstation_run_event(self, *args: Any, **kwargs: Any) -> Any: ...
+        def import_workstation_session_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_optical_pose_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def register_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
+        def revert_workstation_optical_pose(self, *args: Any, **kwargs: Any) -> Any: ...
+        def capture_workstation_optical_pose_burst(self, *args: Any, **kwargs: Any) -> Any: ...
+        def import_workstation_optical_pose_terrain(self, *args: Any, **kwargs: Any) -> Any: ...
+        def solve_workstation_optical_pose_horizon(self, *args: Any, **kwargs: Any) -> Any: ...
+        def solve_workstation_optical_pose_terrain(self, *args: Any, **kwargs: Any) -> Any: ...
+        def solve_workstation_optical_pose_gnss_mountain(self, *args: Any, **kwargs: Any) -> Any: ...
+        def solve_workstation_optical_pose_drone_yaw(self, *args: Any, **kwargs: Any) -> Any: ...
+        def solve_workstation_optical_pose_combined(self, *args: Any, **kwargs: Any) -> Any: ...
+        def auto_select_workstation_optical_pose_horizon(self, *args: Any, **kwargs: Any) -> Any: ...
+        def auto_select_workstation_optical_pose_mountain(self, *args: Any, **kwargs: Any) -> Any: ...
+        def accept_workstation_optical_pose_suggestion(self, *args: Any, **kwargs: Any) -> Any: ...
+        def record_workstation_optical_pose_annotation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def configure_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
+        def connect_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
+        def start_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
+        def drain_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
+        def target_drone_stream_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def target_drone_spool_artifact(self, *args: Any, **kwargs: Any) -> Any: ...
+        def configure_drone_telemetry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def connect_drone_telemetry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def disconnect_drone_telemetry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def save_drone_telemetry_settings(self, *args: Any, **kwargs: Any) -> Any: ...
+        def drone_telemetry_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _app_relative_path_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_mode(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_root(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _capture_zoom_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _capture_zoom_level_for_paths(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _calibration_image_paths_for_root(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _calibration_stereo_pair_paths_for_root(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_scan_counts(self, *args: Any, **kwargs: Any) -> Any: ...
+        def scan_checkerboard_validation_files(self, *args: Any, **kwargs: Any) -> Any: ...
+        def choose_checkerboard_validation_root(self, *args: Any, **kwargs: Any) -> Any: ...
+        def choose_checkerboard_validation_json(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_set_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_result_baseline_m(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _rotation_delta_deg_from_matrices(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_checkerboard_validation_result_summary(self, *args: Any, **kwargs: Any) -> Any: ...
+        def load_checkerboard_validation_json(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_random_subset_count(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _calibration_calculation_pair_limit(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _select_calibration_pairs(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_intrinsic_delta_px(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_stddev(self, *args: Any, **kwargs: Any) -> Any: ...
+        def run_checkerboard_random_validation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_random_validation_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_random_validation_completed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_result_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_validation_result_data(self, *args: Any, **kwargs: Any) -> Any: ...
+        def save_checkerboard_validation_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_checkerboard_validation_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_intrinsics_to_distance(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_config(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _calibration_dirs(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _intrinsics_storage_base_path(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _intrinsics_storage_path(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _extrinsics_storage_path(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _calibration_image_paths(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _next_calibration_capture_stem(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_capture_pair_timing(self, *args: Any, **kwargs: Any) -> Any: ...
+        def capture_calibration_images(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_auto_calibration_capture(self, *args: Any, **kwargs: Any) -> Any: ...
+        def start_auto_calibration_capture(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_auto_calibration_capture(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_checkerboard_capture_completed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_checkerboard_capture_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def run_intrinsic_calibration(self, *args: Any, **kwargs: Any) -> Any: ...
+        def run_stereo_extrinsics_calibration(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_stereo_extrinsics_completed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def save_stereo_extrinsics_profile(self, *args: Any, **kwargs: Any) -> Any: ...
+        def load_stereo_extrinsics_profile(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_calibration_bundle(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_calibration_progress(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_intrinsic_calibration_completed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_intrinsic_calibration_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_checkerboard_calibration_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_mavlink_connection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _stop_pixhawk_operation_workers(self, *args: Any, **kwargs: Any) -> Any: ...
+        def reset_px4_calibration_group(self, *args: Any, **kwargs: Any) -> Any: ...
+        def discover_pc_camera_ip(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_camera_network_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_network_discovery_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_camera_network_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
+        def discover_pc_pixhawk_ip(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_host_ip_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_host_ip_discovery_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_host_ip_discovery(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_pixhawk_host_ip_candidates(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_pc_camera_ip(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_camera_network_address_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _camera_network_apply_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_camera_network_apply(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_mavlink_optional_timeline(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _mavlink_connected_sides(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _mavlink_open_sides(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_mavlink_side_actions(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _mavlink_target_sides(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _sync_mavlink_subscriber_settings(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _ensure_mavlink_subscriber(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_mavlink_status_changed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _configured_mavlink_sides(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _mavlink_setup_target_sides(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_mavlink_pixhawk_setup(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _start_pixhawk_stream_setup_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_mavlink_stream_setup_required(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_stream_setup_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def bootstrap_ethernet_mavlink_from_usb(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_usb_bootstrap_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_usb_bootstrap_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _temporary_mavlink_heartbeat(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _ethernet_mavlink_bootstrap_command(self, *args: Any, **kwargs: Any) -> Any: ...
+        def connect_mavlink_pixhawk(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_connection_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_connection_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_connection_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def disconnect_mavlink_pixhawk(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_selected_pixhawk_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_persistent_pixhawk_eth(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_persistent_config_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_persistent_config_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def reboot_pixhawk_from_mavlink(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _persistent_pixhawk_eth_command(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _persistent_pixhawk_extras_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _persistent_pixhawk_net_cfg_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _persistent_pixhawk_eth_setup(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _start_pixhawk_shell_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_shell_worker_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_shell_worker_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_shell_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def reset_px4_level_calibration(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _start_pixhawk_parameter_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_parameter_worker_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _pixhawk_parameter_worker_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_parameter_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_gnss_base_tab(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_selected_operation_mode(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_active_operation_config(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_gnss_operation_controls_locked(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _build_gnss_operation_config(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_configure_manager(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_status_label_key_for_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_transition(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_operation_mode_changed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_source_identity(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_gga_provider(self, *args: Any, **kwargs: Any) -> Any: ...
+        def start_gnss_network(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_gnss_network(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_network_connected(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_network_stats(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_network_chunk(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_network_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_network_reconnecting(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_gnss_network_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_gnss_base_position_row(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_position(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _fail_gnss_fixed_base_reconfiguration(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_ubx_message(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _maybe_activate_gnss_fixed_base(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_gnss_operation_readiness(self, *args: Any, **kwargs: Any) -> Any: ...
+        def connect_gnss_base_serial(self, *args: Any, **kwargs: Any) -> Any: ...
+        def disconnect_gnss_base_serial(self, *args: Any, **kwargs: Any) -> Any: ...
+        def start_gnss_base_survey_in(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_gnss_base_survey_in(self, *args: Any, **kwargs: Any) -> Any: ...
+        def discover_gnss_base_serial_ports(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_candidates_detected(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_candidate_detect_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_gnss_base_detect_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_gnss_base_candidate_rows(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_gnss_base_candidate_actions(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_selected_gnss_base_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_gnss_base_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_serial_connected(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_serial_stats(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_serial_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_serial_disconnected(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_satellite_count(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_gnss_base_quality_waiting(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _reset_gnss_base_rtcm_stats(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_rtcm_message_types(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_gnss_base_rtcm_stats(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_satellite_quality(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gnss_base_rtcm_target_sides(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_gnss_base_rtcm_frame(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _record_gnss_base_rtcm_injection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_rtcm_frame(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _ensure_pixhawk_rtcm_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_pixhawk_rtcm_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_pixhawk_rtcm_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_command_sent(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_base_survey_in(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_gnss_base_survey_visualization(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_eta_seconds(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_gnss_base_survey_convergence(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_detection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _checkerboard_translation_right_in_left_m(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _active_baseline_m(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gps_fix_ready_for_baseline(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gps_baseline_usable_for_translation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _rtk_fixed_status_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_rtk_baseline(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_rtk_summary_chip(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _baseline_forward_geometry_from_camera_translation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _baseline_camera_translation_in_side_rdf_m(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_baseline_forward_metric_labels(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _baseline_forward_angle_level(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _baseline_forward_geometry_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_rtk_alignment_view(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _optical_alignment_intrinsics_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _optical_alignment_mean_focal_px(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _optical_alignment_expected_dy_px(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _optical_alignment_level_from_mrad(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _optical_alignment_overall_level(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _optical_alignment_level_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_optical_px(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_optical_mrad(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_optical_alignment_view(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _build_measurement_attempt(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _translation_right_in_left_m(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _latest_translation_right_in_left_m_for_diagnostics(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _alignment_view_camera_translation_right_in_left_m(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _capture_measurement_gnss_contract(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _measurement_gnss_record_metadata(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_distance(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _show_measurement_pair(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_measurement_pair_display(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_selected_runtime_measurement_pair(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _detection_wait_detail(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _detection_wait_status(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _stereo_geometry_wait_detail(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _triangulation_wait_detail(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_distance_label_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_quality_point(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_attitude_timing_age(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _attitude_timing_health_level(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _format_attitude_timing_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_triangulation_quality(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_triangulation_quality(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_distance_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _distance_style(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_extrinsic(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_gps(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_mag_sensor(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_gps_sensor(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_f9p_compare_label(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_gnss_relative(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _freshest_sensor_slots(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_health_label(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_label_text_if_changed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _telemetry_source_label(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gps_position_summary_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gps_fix_level(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _gps_sensor_status_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _vector_angle_deg(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _fix_type_label(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_pixhawk_sensor_health(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_one_pixhawk_sensor_health(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _update_relative_attitude_status(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _attitude_delta_level(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_camera_connection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def toggle_yolo_detection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def connect_cameras(self, *args: Any, **kwargs: Any) -> Any: ...
+        def start_yolo(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_yolo_detection(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _start_camera_streams(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _schedule_camera_start_retry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _cancel_pending_camera_start(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_yolo_streams(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _stop_camera_panes(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_calibration_previews(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_detection_state(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_all(self, *args: Any, **kwargs: Any) -> Any: ...
+        def zoom_command_text(self, *args: Any, **kwargs: Any) -> Any: ...
+        def selected_zoom_target(self, *args: Any, **kwargs: Any) -> Any: ...
+        def zoom_hosts(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _control_port_spin_for_camera(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _control_port_for_camera(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _set_control_port_for_camera(self, *args: Any, **kwargs: Any) -> Any: ...
+        def send_zoom(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_wiris_zoom_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wiris_zoom_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_wiris_zoom_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_wiris_command_catalog(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_send_wiris_command(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_send_zoom(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_selected_wiris_command(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_wiris_command_log(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wiris_command_needs_confirmation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _stus_command_from_unix_time(self, *args: Any, **kwargs: Any) -> Any: ...
+        def set_selected_wiris_time_from_pc(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_wiris_time_sync_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wiris_time_sync_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_wiris_time_sync_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def send_selected_wiris_command(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _start_wiris_command_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_wiris_command_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wiris_command_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_wiris_command_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def start_wiris_lrf_polling(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_wiris_lrf_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wiris_lrf_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def stop_wiris_lrf_polling(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_wiris_lrf_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_wiris_stip(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _apply_wiris_stip_result(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _wiris_stip_failed(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _clear_wiris_stip_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_save_settings(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_stop_thread(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_stop_auxiliary_workers(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_stop_gnss_base_serial(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_stop_target_drone(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _shutdown_stop_drone_telemetry(self, *args: Any, **kwargs: Any) -> Any: ...
+        def shutdown_for_close(self, *args: Any, **kwargs: Any) -> Any: ...
+        def closeEvent(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _stop_calibration_preview_worker(self, *args: Any, **kwargs: Any) -> Any: ...
+        def save_current_settings_from_ui(self, *args: Any, **kwargs: Any) -> Any: ...
+        def save_workstation_calibration_setup(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_settings_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_workstation_system_settings(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_workstation_measurement_settings(self, *args: Any, **kwargs: Any) -> Any: ...
+        def apply_workstation_calibration_setup(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_calibration_preview_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _save_current_settings(self, *args: Any, **kwargs: Any) -> Any: ...
+    # END GENERATED PANEL DELEGATE STUBS
+
     def clear_distance_history(self) -> None:
         if self._session_save_thread is not None:
             self.recording_status_label.setText("세션 기록: 저장 중에는 기록을 초기화할 수 없습니다")
@@ -9469,344 +9816,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._log("[Depth] 거리 그래프와 미저장 기록을 초기화했습니다.")
         self._refresh_operation_header()
 
-    def save_current_settings_from_ui(self) -> None:
-        self._save_current_settings()
-        self._log("[저장] 현재 StereoWIRIS 설정을 저장했습니다.")
-
-    def save_workstation_calibration_setup(self) -> None:
-        """Persist the calibration setup surfaced by the Workstation shell."""
-
-        self._save_current_settings()
-        self._log("[저장] Workstation 캘리브레이션 설정을 저장했습니다.")
-
-    def workstation_settings_snapshot(self) -> dict[str, object]:
-        """Return the complete editable AppSettings contract for Workstation."""
-
-        snapshot = dict(self.settings.__dict__)
-        snapshot["gnss_operation"] = self.settings.gnss_operation.to_mapping()
-        for key, value in self._workstation_setting_overrides.items():
-            snapshot[key] = value
-        return snapshot
-
     def _workstation_setting(self, name: str, default: object = None) -> object:
         value = self._workstation_setting_overrides.get(name, default)
         return default if value is None else value
 
-    def apply_workstation_system_settings(self, values: dict[str, object]) -> None:
-        """Apply the complete Workstation system-settings surface to owner widgets."""
-
-        def has(name: str) -> bool:
-            return name in values and values[name] is not None
-
-        def set_text(name: str, attribute: str) -> None:
-            if not has(name):
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setText", None)
-            if callable(setter):
-                setter(str(values[name] or ""))
-
-        def set_value(name: str, attribute: str) -> None:
-            if not has(name):
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setValue", None)
-            if callable(setter):
-                value = values[name]
-                if isinstance(widget, QtWidgets.QDoubleSpinBox):
-                    value = float(value)
-                elif isinstance(widget, QtWidgets.QSpinBox):
-                    value = int(value)
-                setter(value)
-
-        def set_numeric_widget(widget: object, value: object) -> None:
-            setter = getattr(widget, "setValue", None)
-            if not callable(setter):
-                return
-            if isinstance(widget, QtWidgets.QDoubleSpinBox):
-                setter(float(value))
-            elif isinstance(widget, QtWidgets.QSpinBox):
-                setter(int(value))
-            else:
-                setter(value)
-
-        def set_checked(name: str, attribute: str) -> None:
-            if not has(name):
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setChecked", None)
-            if callable(setter):
-                setter(bool(values[name]))
-
-        def set_combo(name: str, attribute: str, default: str = "") -> None:
-            if not has(name):
-                return
-            self._set_combo_data(getattr(self, attribute), str(values[name] or default))
-
-        # Keep an in-memory mirror until the next explicit Save.  This makes
-        # navigating away and back in Workstation lossless while leaving the
-        # JSON file unchanged until the user chooses Save.
-        for name, value in values.items():
-            if name != "gnss_operation":
-                self._workstation_setting_overrides[name] = value
-
-        simple_text = {
-            "interface_name": "interface_edit",
-            "camera_host_address": "host_address_edit",
-            "left_rtsp_url": "left_url_edit",
-            "right_rtsp_url": "right_url_edit",
-            "left_control_host": "left_zoom_host_edit",
-            "right_control_host": "right_zoom_host_edit",
-            "left_stip_ip": "left_stip_ip_edit",
-            "right_stip_ip": "right_stip_ip_edit",
-            "stip_subnet_mask": "stip_mask_edit",
-            "yolo_weights_path": "weights_edit",
-            "pixhawk_host_address": "pixhawk_host_address_edit",
-            "left_pixhawk_eth_ip": "left_pixhawk_eth_ip_edit",
-            "right_pixhawk_eth_ip": "right_pixhawk_eth_ip_edit",
-            "left_mavlink_url": "left_mavlink_url_edit",
-            "right_mavlink_url": "right_mavlink_url_edit",
-            "left_pixhawk_bootstrap_url": "left_pixhawk_bootstrap_url_edit",
-            "right_pixhawk_bootstrap_url": "right_pixhawk_bootstrap_url_edit",
-            "gnss_base_serial_port": "gnss_base_serial_port_edit",
-        }
-        for name, attribute in simple_text.items():
-            set_text(name, attribute)
-
-        simple_values = {
-            "wiris_control_port": "zoom_port_spin",
-            "left_control_port": "left_control_port_spin",
-            "right_control_port": "right_control_port_spin",
-            "wiris_control_timeout_s": "zoom_timeout_spin",
-            "preview_width": "preview_width_spin",
-            "rtsp_latency_ms": "rtsp_latency_spin",
-            "yolo_event_queue_size": "yolo_event_queue_size_spin",
-            "yolo_frame_queue_size": "yolo_frame_queue_size_spin",
-            "left_mavlink_baud": "left_mavlink_baud_spin",
-            "right_mavlink_baud": "right_mavlink_baud_spin",
-            "left_pixhawk_bootstrap_baud": "left_pixhawk_bootstrap_baud_spin",
-            "right_pixhawk_bootstrap_baud": "right_pixhawk_bootstrap_baud_spin",
-            "mavlink_stream_rate": "mavlink_stream_rate_spin",
-            "gnss_base_baud": "gnss_base_baud_spin",
-            "gnss_base_survey_in_min_duration_s": "gnss_base_survey_duration_spin",
-            "gnss_base_survey_in_accuracy_m": "gnss_base_survey_accuracy_spin",
-        }
-        for name, attribute in simple_values.items():
-            set_value(name, attribute)
-
-        simple_checks = {
-            "stip_reboot": "stip_reboot_checkbox",
-            "mavlink_configure_streams": "mavlink_configure_streams_checkbox",
-        }
-        for name, attribute in simple_checks.items():
-            set_checked(name, attribute)
-
-        set_combo("yolo_device", "device_combo", "cpu")
-        set_text("yolo_device", "device_edit")
-        set_combo("rtsp_decoder", "decoder_combo", "nvidia")
-        set_combo("stream_backend", "stream_backend_combo", "gstreamer")
-        set_combo("rtsp_transport", "rtsp_transport_combo", "tcp")
-        set_combo("pixhawk_ethernet_mode", "pixhawk_ethernet_mode_combo", "mavlink")
-
-        if has("manual_focal_override"):
-            self.manual_focal_checkbox.setChecked(bool(values["manual_focal_override"]))
-
-        if has("gnss_operation"):
-            operation = GnssOperationConfig.from_mapping(values["gnss_operation"]).to_mapping()
-            operation.pop("require_drone_rtk_fixed", None)
-            operation["routing"] = {
-                **operation["routing"],
-                "drone_enabled": False,
-                "field_base_enabled": operation["operation_mode"]
-                == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE.value,
-            }
-            config = GnssOperationConfig.from_mapping(operation)
-            operation = config.to_mapping()
-            operation.pop("require_drone_rtk_fixed", None)
-            self._workstation_setting_overrides["gnss_operation"] = operation
-            self._set_combo_data(self.gnss_operation_mode_combo, operation["operation_mode"])
-            self.gnss_site_label_edit.setText(str(operation.get("site_label", "")))
-            self.gnss_site_address_edit.setText(str(operation.get("site_address", "")))
-            set_numeric_widget(self.gnss_rover_min_fix_type_spin, operation["readiness"].get("minimum_fix_type", 3))
-            set_checked("gnss_readiness_gate_enabled", "gnss_readiness_gate_checkbox")
-            network = operation["network"]
-            for name, attribute in (
-                ("caster_host", "gnss_ntrip_host_edit"),
-                ("mountpoint", "gnss_ntrip_mountpoint_edit"),
-                ("username_env", "gnss_ntrip_username_env_edit"),
-                ("password_env", "gnss_ntrip_password_env_edit"),
-            ):
-                widget = getattr(self, attribute, None)
-                if widget is not None:
-                    widget.setText(str(network[name]))
-            for name, attribute in (
-                ("caster_port", "gnss_ntrip_port_spin"),
-                ("acquisition_duration_s", "gnss_fixed_acquisition_duration_spin"),
-                ("minimum_fixed_duration_s", "gnss_fixed_min_duration_spin"),
-            ):
-                source = network if name == "caster_port" else operation["fixed_base"]
-                widget = getattr(self, attribute, None)
-                if widget is not None:
-                    set_numeric_widget(widget, source[name])
-            self._set_combo_data(self.gnss_ntrip_gga_policy_combo, network["gga_policy"])
-            self._set_combo_data(self.gnss_fixed_height_combo, operation["fixed_base"]["height_type"])
-            if has("gnss_base_rtcm_injection_target"):
-                self._set_combo_data(self.gnss_base_rtcm_target_combo, str(values["gnss_base_rtcm_injection_target"]))
-            manager_state = self.gnss_operation_manager.state
-            if manager_state in {
-                GnssOperationState.DISCONNECTED,
-                GnssOperationState.STOPPED,
-                GnssOperationState.CONFIGURED,
-                GnssOperationState.FAULT,
-                GnssOperationState.INVALIDATED,
-            }:
-                self.gnss_operation_manager.configure(config)
-            else:
-                self._log(
-                    "[GNSS] 활성 운용 중에는 새 Workstation GNSS 설정을 다음 운용 시작 시 적용합니다."
-                )
-            self._handle_gnss_operation_mode_changed()
-
-        self._refresh_yolo_device_toggle()
-        self._refresh_pixhawk_ethernet_mode_controls()
-        self._set_focal_override_enabled(self.manual_focal_checkbox.isChecked())
-        self._refresh_operation_header()
-        self._log("[설정] Workstation 전체 설정을 owner widget에 적용했습니다.")
-
-    def apply_workstation_measurement_settings(self, values: dict[str, object]) -> None:
-        """Apply Workstation Measurement and Time/Sync controls to owner widgets.
-
-        This is intentionally a thin UI bridge.  The panel remains the single
-        owner of AppSettings, stream workers, measurement gates, geometry, and
-        camera synchronization limits;
-        Workstation only supplies validated widget values.  Timing values keep
-        their displayed units (milliseconds/percent) until the existing
-        ``_save_current_settings`` conversion writes AppSettings.
-        """
-
-        def has(name: str) -> bool:
-            return name in values and values[name] is not None
-
-        def set_value(name: str, attribute: str) -> None:
-            if not has(name):
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setValue", None)
-            if callable(setter):
-                setter(values[name])
-
-        def set_checked(name: str, attribute: str) -> None:
-            if not has(name):
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setChecked", None)
-            if callable(setter):
-                setter(bool(values[name]))
-
-        def set_text(name: str, attribute: str) -> None:
-            if not has(name):
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setText", None)
-            if callable(setter):
-                setter(str(values[name] or ""))
-
-        if has("intrinsics_source"):
-            source = str(values["intrinsics_source"] or "checkerboard")
-            if source not in {"manual", "checkerboard"}:
-                raise ValueError(f"unsupported intrinsics source: {source}")
-            self._set_combo_data(self.intrinsics_source_combo, source)
-            self.manual_focal_checkbox.setChecked(source == "manual")
-        elif has("manual_focal_override"):
-            self.manual_focal_checkbox.setChecked(bool(values["manual_focal_override"]))
-        if has("distance_mode"):
-            mode = str(values["distance_mode"] or "pixhawk")
-            if mode not in {"pixhawk", "checkerboard"}:
-                raise ValueError(f"unsupported distance mode: {mode}")
-            self._set_combo_data(self.distance_mode_combo, mode)
-
-        set_value("focal_px", "focal_spin")
-        set_value("yolo_input_size_px", "input_size_spin")
-        set_value("yolo_confidence", "conf_spin")
-        set_value("yolo_iou", "iou_spin")
-        set_checked("class_gate_enabled", "yolo_gate_class_checkbox")
-        set_text("class_gate", "yolo_gate_class_edit")
-        set_checked("matching_gate_enabled", "yolo_gate_matching_checkbox")
-        if has("time_basis"):
-            self._set_combo_data(self.yolo_gate_time_basis_combo, str(values["time_basis"] or "camera_rtcp"))
-        set_checked("time_delta_gate_enabled", "yolo_gate_time_delta_checkbox")
-        set_value("max_pair_delta_s", "yolo_gate_time_delta_spin")
-        set_checked("vertical_delta_gate_enabled", "yolo_gate_vertical_delta_checkbox")
-        set_value("max_vertical_delta_px", "yolo_gate_vertical_delta_spin")
-        set_value("camera_sync_history_window_s", "camera_sync_history_window_spin")
-        set_value("camera_sync_receive_pair_max_delta_ms", "camera_sync_receive_pair_max_delta_spin")
-        set_value("camera_sync_rtcp_pair_max_delta_ms", "camera_sync_rtcp_pair_max_delta_spin")
-        set_value("camera_sync_max_sr_age_s", "camera_sync_max_sr_age_spin")
-        set_value("camera_sync_max_pc_offset_ms", "camera_sync_max_pc_offset_spin")
-        set_value("camera_sync_clock_rate_error_pct", "camera_sync_clock_rate_error_spin")
-        set_value("camera_sync_required_sr_count", "camera_sync_required_sr_count_spin")
-        set_value("camera_sync_warmup_timeout_s", "camera_sync_warmup_timeout_spin")
-
-        self._set_focal_override_enabled(self.manual_focal_checkbox.isChecked())
-        self._refresh_yolo_gate_controls()
-        self._refresh_distance()
-        self._refresh_camera_parameters_tab()
-        self._refresh_operation_header()
-        self._log(
-            "[설정] Workstation Measurement/Time-Sync 설정 적용: "
-            f"intrinsics={self._intrinsics_source()}, "
-            f"extrinsics={self._distance_mode()}, "
-            "public output=baseline_center_frd [Forward,Right,Down,Range]"
-        )
-
-    def apply_workstation_calibration_setup(self, setup: dict[str, object]) -> None:
-        """Apply Workstation calibration setup fields to the existing owner."""
-
-        def set_value(name: str, attribute: str) -> None:
-            if name not in setup or setup[name] is None:
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setValue", None)
-            if callable(setter):
-                setter(setup[name])
-
-        def set_text(name: str, attribute: str) -> None:
-            if name not in setup or setup[name] is None:
-                return
-            widget = getattr(self, attribute, None)
-            setter = getattr(widget, "setText", None)
-            if callable(setter):
-                setter(str(setup[name]))
-
-        set_value("zoom_level", "zoom_level_spin")
-        set_value("inner_cols", "calib_cols_spin")
-        set_value("inner_rows", "calib_rows_spin")
-        set_value("square_size_mm", "calib_square_spin")
-        set_value("min_images", "calib_min_images_spin")
-        set_value("calculation_pair_count", "calib_calculation_pairs_spin")
-        set_value("auto_interval_s", "calibration_auto_interval_spin")
-        set_value("auto_target_pairs", "calibration_auto_target_spin")
-        set_text("calibration_root", "calib_dir_edit")
-        if "validation_mode" in setup and setup["validation_mode"] is not None:
-            self._set_combo_data(
-                self.checkerboard_validation_mode_combo,
-                str(setup["validation_mode"] or "pixhawk"),
-            )
-        set_text("validation_root", "checkerboard_validation_root_edit")
-        set_text("validation_json", "checkerboard_validation_json_edit")
-        set_value("validation_runs", "checkerboard_validation_random_runs_spin")
-        set_value("validation_pair_count", "checkerboard_validation_random_pair_count_spin")
-        set_value("validation_seed", "checkerboard_validation_seed_spin")
-        self._refresh_all_calibration_previews()
-        self._refresh_zoom_intrinsics_tab()
-        self.scan_checkerboard_validation_files()
-        self._refresh_operation_header()
-        self._log(
-            "[캘리브레이션] Workstation setup 적용: "
-            f"checkerboard={self.calib_cols_spin.value()}x{self.calib_rows_spin.value()}, "
-            f"square={self.calib_square_spin.value():.3f} mm, zoom={self.zoom_level_spin.value():02d}; "
-            "image geometry remains OpenCV optical RDF"
-        )
 
 
 
@@ -9967,6 +9980,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             dialog = Px4ShellDialog(
                 f"{camera_label_ko(camera)} PX4 Shell",
                 lambda command, camera=camera: self._send_px4_shell_command(camera, command),
+                lambda _checked=False, camera=camera: self._read_px4_sensor_mag_shell(camera),
             )
             dialog.destroyed.connect(lambda _obj=None, camera=camera: self.px4_shell_dialogs.pop(camera, None))
             self.px4_shell_dialogs[camera] = dialog
@@ -9981,6 +9995,33 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         self._start_pixhawk_shell_worker(camera, command)
 
+    def _read_px4_sensor_mag_shell(self, camera: str) -> None:
+        """Read sensor_mag instances through the existing Ethernet Shell path."""
+        commands = "; ".join(f"listener sensor_mag -i {instance} -n 1" for instance in range(5))
+        self._start_pixhawk_shell_worker(
+            camera,
+            commands,
+            operation="sensor_mag_shell_watch",
+            timeout_s=4.0,
+            on_complete=lambda result, camera=camera: self._apply_px4_sensor_mag_shell_result(camera, result),
+        )
+
+    def _apply_px4_sensor_mag_shell_result(self, camera: str, result: dict[str, object]) -> None:
+        output = str(result.get("output") or "")
+        states = parse_px4_sensor_mag_shell_output(output, camera=camera)
+        if not states:
+            self._log(
+                f"[픽스호크] {camera_label_ko(camera)} sensor_mag Shell 결과에서 CAN device_id를 찾지 못했습니다."
+            )
+            return
+        can_states = self.latest_can_mag_sensors.setdefault(camera, {})
+        for state in states:
+            can_states[state.sensor_slot] = state
+        self._log(
+            f"[픽스호크] {camera_label_ko(camera)} Shell sensor_mag 감시 갱신: "
+            + ", ".join(f"{state.sensor_slot} device_id={state.device_id}" for state in states)
+        )
+
 
 
 
@@ -9990,7 +10031,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
 
     def _px4_mag_camera_label(self, camera: str) -> str:
-        return "Pixhawk 1" if camera == "left" else "Pixhawk 2"
+        if camera == "left":
+            return "Pixhawk 1"
+        if camera == "right":
+            return "Pixhawk 2"
+        if camera == "drone":
+            return "Drone Pixhawk"
+        return str(camera)
 
     def _px4_mag_manager_has_data_source(self, camera: str) -> bool:
         if self.latest_vehicle_mag_device_ids.get(camera) is not None:
@@ -10062,6 +10109,11 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         for side in sides:
             self.latest_vehicle_mag_device_ids[side] = None
             self._px4_mag_status_cache.pop(side, None)
+            self._px4_calibration_parameter_error.pop(side, None)
+            for key in tuple(self._px4_calibration_reset_error):
+                if key.startswith(f"{side}:"):
+                    self._px4_calibration_reset_error.pop(key, None)
+            self._px4_calibration_reset_pending.pop(side, None)
             self._clear_px4_mag_manager_ui(side)
 
     def _render_px4_mag_mavlink_pending_status(self, camera: str) -> None:
@@ -10140,6 +10192,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _clear_px4_attitude_cal_connection_state(self, camera: str | None = None) -> None:
         sides = ("left", "right") if camera is None else (camera,)
         for side in sides:
+            self._px4_attitude_cal_status_cache.pop(side, None)
             self._clear_px4_attitude_cal_ui(side)
 
     def _render_px4_attitude_cal_pending_status(self, camera: str) -> None:
@@ -10189,6 +10242,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _render_px4_attitude_cal_status(
         self, camera: str, status: Px4AttitudeCalStatus, *, using_real_params: bool
     ) -> None:
+        self._px4_attitude_cal_status_cache[camera] = status
         label = self.px4_attitude_cal_status_labels.get(camera) if hasattr(self, "px4_attitude_cal_status_labels") else None
         if label is not None:
             label.setText(self._format_attitude_cal_status_text(camera, status))
@@ -10251,7 +10305,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self.refresh_px4_mag_manager(camera, read_params=True)
             return
         spins = self.px4_mag_priority_spins.get(camera, {})
-        desired = {role: int(spin.value()) for role, spin in spins.items()}
+        desired = {role: _px4_priority_combo_value(spin) for role, spin in spins.items()}
         if using_mavlink_params:
             if self._start_pixhawk_parameter_worker(
                 camera,
@@ -10346,6 +10400,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._px4_mag_status_cache[camera] = status
         if not hasattr(self, "px4_mag_tables"):
             return
+        priority_controls = self.px4_mag_priority_spins.get(camera, {})
+        for slot in status.slots:
+            role = self._px4_mag_role_for_device_id(slot.device_id)
+            if role is None or role not in priority_controls or slot.priority is None:
+                continue
+            _set_px4_priority_combo_value(priority_controls[role], slot.priority)
         table = self.px4_mag_tables.get(camera)
         status_label = self.px4_mag_status_labels.get(camera)
         if status_label is None:
@@ -10359,7 +10419,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                     slot.device_type,
                     slot.interface,
                     "true" if slot.is_rm3100 else "false",
-                    "N/A" if slot.priority is None else str(slot.priority),
+                    mag_priority_display(slot.priority),
                     "true" if slot.enabled else "false",
                     "true" if slot.expected_selected else "false",
                     "true" if slot.actual_selected else "false",
@@ -10629,6 +10689,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return
         self.refresh_px4_attitude_cal_status(camera, read_params=bool(read_params))
 
+    def workstation_refresh_px4_calibration_params(self, camera: str, *, read_params: bool = True) -> None:
+        """Read the QGC calibration parameter set for one Pixhawk."""
+
+        camera = str(camera or "")
+        if camera not in {"left", "right"}:
+            raise ValueError(f"Unknown Pixhawk side: {camera}")
+        if read_params and self._start_pixhawk_parameter_worker(camera, "calibration_refresh"):
+            return
+        self._log(
+            f"[픽스호크] {self._px4_mag_camera_label(camera)} QGC calibration PARAM readback을 시작할 수 없습니다."
+        )
+
     def workstation_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> None:
         camera = str(camera or "")
         if camera not in {"left", "right"}:
@@ -10638,7 +10710,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             spin = spins.get(str(role))
             if spin is None:
                 raise ValueError(f"Unknown PX4 MAG role: {role}")
-            spin.setValue(int(value))
+            _set_px4_priority_combo_value(spin, int(value))
         if self._start_pixhawk_parameter_worker(
             camera,
             "mag_apply",
@@ -10694,27 +10766,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.calibration_preview_times["right"] = 0.0
         self._refresh_all_calibration_previews()
         return self.workstation_calibration_preview_snapshot()
-
-    def workstation_calibration_preview_snapshot(self) -> dict[str, object]:
-        images: dict[str, QtGui.QImage] = {}
-        raw_images: dict[str, QtGui.QImage] = {}
-        overlay_images: dict[str, QtGui.QImage] = {}
-        for camera in ("left", "right"):
-            raw = self.latest_calibration_preview_images.get(camera)
-            overlay = self.calibration_preview_overlay_images.get(camera)
-            if isinstance(raw, QtGui.QImage) and not raw.isNull():
-                raw_images[camera] = raw.copy()
-            if isinstance(overlay, QtGui.QImage) and not overlay.isNull():
-                overlay_images[camera] = overlay.copy()
-                images[camera] = overlay.copy()
-            elif isinstance(raw, QtGui.QImage) and not raw.isNull():
-                images[camera] = raw.copy()
-        return {
-            "images": images,
-            "raw_images": raw_images,
-            "overlay_images": overlay_images,
-            "axis_contract": "checkerboard image pixels; left/right camera optical RDF labels remain unchanged",
-        }
 
 
 
@@ -10900,132 +10951,30 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_operation_header()
         self._refresh_zoom_intrinsics_tab()
 
-    def _save_current_settings(self, intrinsics_path: Path | None = None) -> None:
-        path = intrinsics_path
-        if path is None:
-            configured_path = str(self._workstation_setting("intrinsics_path", "") or "").strip()
-            if configured_path:
-                path = resolve_settings_path(configured_path, base_dir=self.app_root)
-            else:
-                root, _left_dir, _right_dir = self._calibration_dirs()
-                path = root / "intrinsics.json"
-        relative = self._app_relative_path_text(path)
-        self.settings = AppSettings(
-            intrinsics_path=relative,
-            yolo_weights_path=self.weights_edit.text().strip() or DEFAULT_YOLO_WEIGHTS,
-            interface_name=self.interface_edit.text().strip() or DEFAULT_INTERFACE,
-            camera_host_address=self.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
-            left_rtsp_url=self.left_url_edit.text().strip() or DEFAULT_CAMERA_URLS[0],
-            right_rtsp_url=self.right_url_edit.text().strip() or DEFAULT_CAMERA_URLS[1],
-            left_control_host=self.left_zoom_host_edit.text().strip(),
-            right_control_host=self.right_zoom_host_edit.text().strip(),
-            left_stip_ip=self.left_stip_ip_edit.text().strip(),
-            right_stip_ip=self.right_stip_ip_edit.text().strip(),
-            stip_subnet_mask=self.stip_mask_edit.text().strip(),
-            stip_reboot=self.stip_reboot_checkbox.isChecked(),
-            wiris_control_port=self.zoom_port_spin.value(),
-            left_control_port=self.left_control_port_spin.value(),
-            right_control_port=self.right_control_port_spin.value(),
-            wiris_control_timeout_s=self.zoom_timeout_spin.value(),
-            yolo_device=self.device_edit.text().strip() or "cpu",
-            yolo_input_size=self.input_size_spin.value(),
-            yolo_conf_threshold=self.conf_spin.value(),
-            yolo_iou_threshold=self.iou_spin.value(),
-            yolo_gate_class_enabled=self.yolo_gate_class_checkbox.isChecked(),
-            yolo_gate_class_text=self.yolo_gate_class_edit.text().strip(),
-            yolo_gate_matching_enabled=self.yolo_gate_matching_checkbox.isChecked(),
-            yolo_gate_time_delta_enabled=self.yolo_gate_time_delta_checkbox.isChecked(),
-            yolo_gate_vertical_delta_enabled=self.yolo_gate_vertical_delta_checkbox.isChecked(),
-            yolo_gate_max_vertical_delta_px=self.yolo_gate_vertical_delta_spin.value(),
-            yolo_gate_max_time_delta_s=self.yolo_gate_time_delta_spin.value(),
-            yolo_gate_time_basis=str(self.yolo_gate_time_basis_combo.currentData() or "camera_rtc_required"),
-            preview_width=self.preview_width_spin.value(),
-            calibration_zoom_level=self.zoom_level_spin.value(),
-            calibration_inner_cols=self.calib_cols_spin.value(),
-            calibration_inner_rows=self.calib_rows_spin.value(),
-            calibration_square_size_mm=self.calib_square_spin.value(),
-            calibration_min_images=self.calib_min_images_spin.value(),
-            calibration_calculation_pair_count=self.calib_calculation_pairs_spin.value(),
-            calibration_auto_interval_s=self.calibration_auto_interval_spin.value(),
-            calibration_auto_target_pairs=self.calibration_auto_target_spin.value(),
-            calibration_root=self.calib_dir_edit.text().strip(),
-            calibration_validation_mode=str(
-                self.checkerboard_validation_mode_combo.currentData() or "pixhawk"
-            ),
-            calibration_validation_root=self.checkerboard_validation_root_edit.text().strip(),
-            calibration_validation_json=self.checkerboard_validation_json_edit.text().strip(),
-            calibration_validation_runs=self.checkerboard_validation_random_runs_spin.value(),
-            calibration_validation_pair_count=self.checkerboard_validation_random_pair_count_spin.value(),
-            calibration_validation_seed=self.checkerboard_validation_seed_spin.value(),
-            rtsp_latency_ms=self.rtsp_latency_spin.value(),
-            yolo_event_queue_size=self.yolo_event_queue_size_spin.value(),
-            yolo_frame_queue_size=self.yolo_frame_queue_size_spin.value(),
-            rtsp_decoder=self.decoder_combo.currentData(),
-            stream_backend=self.stream_backend_combo.currentData(),
-            rtsp_transport=self.rtsp_transport_combo.currentData(),
-            camera_sync_history_window_s=self.camera_sync_history_window_spin.value(),
-            camera_sync_receive_pair_max_delta_s=self.camera_sync_receive_pair_max_delta_spin.value() / 1000.0,
-            camera_sync_rtcp_pair_max_delta_s=self.camera_sync_rtcp_pair_max_delta_spin.value() / 1000.0,
-            camera_sync_max_sr_age_s=self.camera_sync_max_sr_age_spin.value(),
-            camera_sync_max_pc_offset_s=self.camera_sync_max_pc_offset_spin.value() / 1000.0,
-            camera_sync_max_clock_rate_error=self.camera_sync_clock_rate_error_spin.value() / 100.0,
-            camera_sync_required_sr_count=self.camera_sync_required_sr_count_spin.value(),
-            camera_sync_warmup_timeout_s=self.camera_sync_warmup_timeout_spin.value(),
-            pixhawk_host_address=self.pixhawk_host_address_edit.text().strip(),
-            left_pixhawk_eth_ip=self.left_pixhawk_eth_ip_edit.text().strip(),
-            right_pixhawk_eth_ip=self.right_pixhawk_eth_ip_edit.text().strip(),
-            left_mavlink_url=self.left_mavlink_url_edit.text().strip(),
-            right_mavlink_url=self.right_mavlink_url_edit.text().strip(),
-            left_mavlink_baud=self.left_mavlink_baud_spin.value(),
-            right_mavlink_baud=self.right_mavlink_baud_spin.value(),
-            left_pixhawk_bootstrap_url=self.left_pixhawk_bootstrap_url_edit.text().strip(),
-            right_pixhawk_bootstrap_url=self.right_pixhawk_bootstrap_url_edit.text().strip(),
-            left_pixhawk_bootstrap_baud=self.left_pixhawk_bootstrap_baud_spin.value(),
-            right_pixhawk_bootstrap_baud=self.right_pixhawk_bootstrap_baud_spin.value(),
-            mavlink_configure_streams=self.mavlink_configure_streams_checkbox.isChecked(),
-            mavlink_stream_rate=self.mavlink_stream_rate_spin.value(),
-            pixhawk_ethernet_mode=self._pixhawk_ethernet_mode(),
-            auto_load_intrinsics=bool(
-                self._workstation_setting("auto_load_intrinsics", self.settings.auto_load_intrinsics)
-            ),
-            manual_focal_override=self.manual_focal_checkbox.isChecked(),
-            use_triangulation=bool(
-                self._workstation_setting("use_triangulation", self.settings.use_triangulation)
-            ),
-            triangulation_extrinsics_source=self._triangulation_extrinsics_source(),
-            measurement_display_mode=self._measurement_display_mode(),
-            use_rtk_baseline=bool(
-                self._workstation_setting("use_rtk_baseline", self.settings.use_rtk_baseline)
-            ),
-            require_rtk_fixed=bool(
-                self._workstation_setting("require_rtk_fixed", self.settings.require_rtk_fixed)
-            ),
-            gnss_base_serial_port=self.gnss_base_serial_port_edit.text().strip() or "/dev/ttyACM0",
-            gnss_base_baud=self.gnss_base_baud_spin.value(),
-            gnss_base_survey_in_min_duration_s=self.gnss_base_survey_duration_spin.value(),
-            gnss_base_survey_in_accuracy_m=self.gnss_base_survey_accuracy_spin.value(),
-            gnss_base_rtcm_injection_target=str(self.gnss_base_rtcm_target_combo.currentData() or "disabled"),
-            gnss_operation=(
-                self._build_gnss_operation_config()
-                if hasattr(self, "gnss_operation_mode_combo")
-                else self.settings.gnss_operation
-            ),
-        )
-        save_settings(self.settings, self.settings_path)
-
     def save_intrinsics(self) -> None:
         if self.last_calibration_result is None:
             self.calibration_status_label.setText("Run calibration before saving intrinsics.")
             return
         root, _left_dir, _right_dir = self._calibration_dirs()
         root.mkdir(parents=True, exist_ok=True)
-        zoom_level = self.zoom_level_spin.value()
+        zoom_level = self.last_calibration_zoom_level
+        if zoom_level is None:
+            self.calibration_status_label.setText(
+                "Cannot save intrinsics: capture-time camera zoom readback is unavailable."
+            )
+            self._log(
+                "[캘리브레이션] intrinsic 저장을 중단했습니다. "
+                "촬영 당시 양쪽 카메라 GZVV readback이 필요합니다."
+            )
+            return
         zoom_output = self._intrinsics_storage_path(zoom_level)
         latest_output = self._intrinsics_storage_base_path()
         metadata = {
             "note": "Generated by StereoWIRIS Camera Calibration tab",
             "timestamp_s": time.time(),
             "zoom_level": zoom_level,
+            "capture_zoom_level": zoom_level,
+            "zoom_source": "capture_metadata",
             "zoom_target": str(self.zoom_target_combo.currentData() or "both"),
         }
         # K/D and R/T have independent lifecycles.  Keep the generic JSON
@@ -11151,77 +11100,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._refresh_zoom_intrinsics_tab()
         self._refresh_operation_header()
 
-    def apply_intrinsics_to_distance(self) -> None:
-        if self.last_calibration_result is None:
-            self.calibration_status_label.setText("Run or load calibration before applying intrinsics.")
-            return
-        selected_profile = self.selected_extrinsics_profile
-        if selected_profile is None and self.last_calibration_result.extrinsics is not None:
-            selected_profile = StereoExtrinsicsProfile(
-                extrinsics=self.last_calibration_result.extrinsics,
-                source_zoom_level=self.last_calibration_zoom_level,
-                method="legacy_embedded_checkerboard",
-                source_intrinsics_path=self._active_intrinsics_profile_path,
-                source_intrinsics_sha256=intrinsics_content_sha256(
-                    self.last_calibration_result
-                ),
-                profile_id="legacy_embedded_extrinsics",
-            )
-            self.selected_extrinsics_profile = selected_profile
-            self._selected_extrinsics_profile_path = (
-                f"{self._active_intrinsics_profile_path}#embedded-extrinsics"
-            )
-            self._selected_extrinsics_profile_hash = selected_profile.content_sha256
-        self.active_intrinsics = compose_stereo_calibration(
-            self.last_calibration_result,
-            selected_profile,
-        )
-        self._active_intrinsics_source_zoom_level = self.last_calibration_zoom_level
-        self._active_intrinsics_profile_hash = intrinsics_content_sha256(
-            self.last_calibration_result
-        )
-        if selected_profile is None:
-            self._active_extrinsics_profile_path = ""
-            self._active_extrinsics_profile_hash = ""
-            self._active_extrinsics_source_zoom_level = None
-            self._active_calibration_selection_mode = "intrinsics_only"
-        else:
-            self._active_extrinsics_profile_path = (
-                self._selected_extrinsics_profile_path
-                or f"memory:{selected_profile.profile_id or 'stereo_extrinsics'}"
-            )
-            self._active_extrinsics_profile_hash = selected_profile.content_sha256
-            self._active_extrinsics_source_zoom_level = selected_profile.source_zoom_level
-            self._active_calibration_selection_mode = "manual_cross_zoom"
-            self._set_combo_data(self.distance_mode_combo, "checkerboard")
-        left_fx = self.active_intrinsics.left.camera_matrix[0][0]
-        right_fx = self.active_intrinsics.right.camera_matrix[0][0]
-        self.focal_spin.setValue((left_fx + right_fx) / 2.0)
-        self.manual_focal_checkbox.setChecked(False)
-        cross_zoom = (
-            selected_profile is not None
-            and selected_profile.source_zoom_level is not None
-            and self.last_calibration_zoom_level is not None
-            and selected_profile.source_zoom_level != self.last_calibration_zoom_level
-        )
-        detail = (
-            f"K,D zoom={self.last_calibration_zoom_level}; "
-            f"R,t zoom={selected_profile.source_zoom_level}; "
-            "cross-zoom/manual, validation not gated"
-            if cross_zoom and selected_profile is not None
-            else f"K,D zoom={self.last_calibration_zoom_level}; "
-            + (
-                f"R,t zoom={selected_profile.source_zoom_level}"
-                if selected_profile is not None
-                else "R,t not selected"
-            )
-        )
-        self.calibration_status_label.setText(f"Applied calibration bundle: {detail}")
-        self._refresh_camera_parameters_tab()
-        self._refresh_distance()
-        self._refresh_optical_alignment_view()
-        self._refresh_operation_header()
-
     def _initial_status(self) -> None:
         self._start_interface_status_worker()
         self.camera_connection_label.setText(STARTUP_CAMERA_STATUS)
@@ -11260,61 +11138,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
     def _clear_interface_status_worker(self) -> None:
         self.interface_status_thread = None
         self.interface_status_worker = None
-
-    def _recover_retryable_recording_session(self) -> bool:
-        candidates = discover_retryable_sessions(self.app_root / "recordings")
-        if not candidates:
-            return False
-        try:
-            recovered = load_retryable_session(candidates[0])
-        except Exception as exc:
-            self._log(f"[저장] 미완료 세션 복구 정보를 읽지 못했습니다: {exc}")
-            return False
-        metadata = recovered.metadata
-        def optional_int(value: object) -> int | None:
-            return None if value in (None, "") else int(value)
-
-        self.recording_session_id = str(metadata.get("session_id") or recovered.output_dir.name)
-        self.recording_session_started_unix_ns = optional_int(
-            metadata.get("session_started_unix_ns")
-        )
-        self.recording_session_started_monotonic_ns = optional_int(
-            metadata.get("session_started_monotonic_ns")
-        )
-        self.recording_session_anchor_uncertainty_ns = optional_int(
-            metadata.get("session_time_anchor_uncertainty_ns")
-        )
-        self.recording_session_started_wall_s = (
-            None
-            if self.recording_session_started_unix_ns is None
-            else self.recording_session_started_unix_ns * 1e-9
-        )
-        self.recording_session_started_monotonic_s = (
-            None
-            if self.recording_session_started_monotonic_ns is None
-            else self.recording_session_started_monotonic_ns * 1e-9
-        )
-        self.distance_recording_rows = recovered.pair_rows
-        self.camera_recording_rows = recovered.camera_rows
-        self.px4_recording_rows = recovered.px4_rows
-        self.gnss_base_recording_rows = recovered.gnss_base_rows
-        self._recovered_session_metadata = metadata
-        self._session_save_retry_required = True
-        self._session_save_finalized = False
-        self.distance_recording_enabled = False
-        self.video_recording_enabled = False
-        self.record_button.setEnabled(False)
-        self.save_history_button.setEnabled(True)
-        self._refresh_recording_table()
-        self.recording_status_label.setText(
-            f"미완료 세션 복구됨: session={self.recording_session_id}, "
-            f"프레임쌍={len(self.distance_recording_rows)}개 — 세션 파일 저장으로 재시도"
-        )
-        self._log(
-            f"[저장] 미완료 세션 spool을 복구했습니다: {recovered.output_dir} "
-            f"(pair={len(self.distance_recording_rows)})"
-        )
-        return True
 
     def _auto_start_pixhawk(self) -> None:
         self.tabs.setCurrentIndex(self.alignment_tab_index)
@@ -11379,176 +11202,46 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
 
 
 
-def _camera_time_sync_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        method = getattr(panel._camera_time_sync_controller(), method_name)
-        return method(*args, **kwargs)
+# Every controller module whose methods are exposed directly on
+# WirisStereoDistancePanel. `accessor_name` must name a lazy-init method
+# already defined on the class (see the `_x_controller` accessor block
+# above) that caches the real controller instance; `bind_controller_delegates`
+# falls back to an uncached `controller_cls(panel)` construction when that
+# accessor isn't present (e.g. a bare test double standing in for the panel).
+_CONTROLLER_DELEGATE_BINDINGS: tuple[ControllerDelegateBinding, ...] = (
+    ControllerDelegateBinding(CameraTimeSyncController, "_camera_time_sync_controller", CAMERA_TIME_SYNC_METHODS),
+    ControllerDelegateBinding(RecordingController, "_recording_controller", RECORDING_CONTROLLER_METHODS),
+    ControllerDelegateBinding(RunEvidenceController, "_run_evidence_controller", RUN_EVIDENCE_CONTROLLER_METHODS),
+    ControllerDelegateBinding(OpticalPoseController, "_optical_pose_controller", OPTICAL_POSE_CONTROLLER_METHODS),
+    ControllerDelegateBinding(TargetDroneController, "_target_drone_controller", TARGET_DRONE_CONTROLLER_METHODS),
+    ControllerDelegateBinding(
+        DroneTelemetryController, "_drone_telemetry_controller", DRONE_TELEMETRY_CONTROLLER_METHODS
+    ),
+    ControllerDelegateBinding(
+        CalibrationWorkflowController, "_calibration_workflow_controller", CALIBRATION_WORKFLOW_METHODS
+    ),
+    ControllerDelegateBinding(
+        DeviceRuntimeController, "_device_runtime_controller", DEVICE_RUNTIME_CONTROLLER_METHODS
+    ),
+    ControllerDelegateBinding(GnssRuntimeController, "_gnss_runtime_controller", GNSS_RUNTIME_CONTROLLER_METHODS),
+    ControllerDelegateBinding(
+        MeasurementViewController, "_measurement_view_controller", MEASUREMENT_VIEW_CONTROLLER_METHODS
+    ),
+    ControllerDelegateBinding(
+        SensorPresentationController, "_sensor_presentation_controller", SENSOR_PRESENTATION_METHODS
+    ),
+    ControllerDelegateBinding(
+        CameraStreamLifecycleController, "_camera_stream_lifecycle_controller", CAMERA_STREAM_LIFECYCLE_METHODS
+    ),
+    ControllerDelegateBinding(WirisControlController, "_wiris_control_controller", WIRIS_CONTROL_METHODS),
+    ControllerDelegateBinding(AppLifecycleController, "_app_lifecycle_controller", APP_LIFECYCLE_METHODS),
+    ControllerDelegateBinding(
+        WorkstationSettingsController, "_workstation_settings_controller", SETTINGS_CONTROLLER_METHODS
+    ),
+)
 
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _camera_time_sync_method_name in CAMERA_TIME_SYNC_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _camera_time_sync_method_name,
-        _camera_time_sync_delegate(_camera_time_sync_method_name),
-    )
-
-
-def _recording_controller_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_recording_controller", None)
-        owner = owner_factory() if callable(owner_factory) else RecordingController(panel)
-        method = getattr(owner, method_name)
-        return method(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _recording_controller_method_name in RECORDING_CONTROLLER_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _recording_controller_method_name,
-        _recording_controller_delegate(_recording_controller_method_name),
-    )
-
-
-def _calibration_workflow_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_calibration_workflow_controller", None)
-        owner = owner_factory() if callable(owner_factory) else CalibrationWorkflowController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _calibration_workflow_method_name in CALIBRATION_WORKFLOW_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _calibration_workflow_method_name,
-        _calibration_workflow_delegate(_calibration_workflow_method_name),
-    )
-
-
-def _device_runtime_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_device_runtime_controller", None)
-        owner = owner_factory() if callable(owner_factory) else DeviceRuntimeController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _device_runtime_method_name in DEVICE_RUNTIME_CONTROLLER_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _device_runtime_method_name,
-        _device_runtime_delegate(_device_runtime_method_name),
-    )
-
-
-def _gnss_runtime_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_gnss_runtime_controller", None)
-        owner = owner_factory() if callable(owner_factory) else GnssRuntimeController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _gnss_runtime_method_name in GNSS_RUNTIME_CONTROLLER_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _gnss_runtime_method_name,
-        _gnss_runtime_delegate(_gnss_runtime_method_name),
-    )
-
-
-def _measurement_view_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_measurement_view_controller", None)
-        owner = owner_factory() if callable(owner_factory) else MeasurementViewController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _measurement_view_method_name in MEASUREMENT_VIEW_CONTROLLER_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _measurement_view_method_name,
-        _measurement_view_delegate(_measurement_view_method_name),
-    )
-
-
-def _sensor_presentation_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_sensor_presentation_controller", None)
-        owner = owner_factory() if callable(owner_factory) else SensorPresentationController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _sensor_presentation_method_name in SENSOR_PRESENTATION_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _sensor_presentation_method_name,
-        _sensor_presentation_delegate(_sensor_presentation_method_name),
-    )
-
-
-def _camera_stream_lifecycle_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_camera_stream_lifecycle_controller", None)
-        owner = owner_factory() if callable(owner_factory) else CameraStreamLifecycleController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _camera_stream_lifecycle_method_name in CAMERA_STREAM_LIFECYCLE_METHODS:
-    setattr(
-        WirisStereoDistancePanel,
-        _camera_stream_lifecycle_method_name,
-        _camera_stream_lifecycle_delegate(_camera_stream_lifecycle_method_name),
-    )
-
-
-def _wiris_control_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_wiris_control_controller", None)
-        owner = owner_factory() if callable(owner_factory) else WirisControlController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _wiris_control_method_name in WIRIS_CONTROL_METHODS:
-    setattr(WirisStereoDistancePanel, _wiris_control_method_name, _wiris_control_delegate(_wiris_control_method_name))
-
-
-def _app_lifecycle_delegate(method_name):
-    def delegated(panel, *args, **kwargs):
-        owner_factory = getattr(panel, "_app_lifecycle_controller", None)
-        owner = owner_factory() if callable(owner_factory) else AppLifecycleController(panel)
-        return getattr(owner, method_name)(*args, **kwargs)
-
-    delegated.__name__ = method_name
-    return delegated
-
-
-for _app_lifecycle_method_name in APP_LIFECYCLE_METHODS:
-    setattr(WirisStereoDistancePanel, _app_lifecycle_method_name, _app_lifecycle_delegate(_app_lifecycle_method_name))
+for _controller_delegate_binding in _CONTROLLER_DELEGATE_BINDINGS:
+    bind_controller_delegates(WirisStereoDistancePanel, _controller_delegate_binding)
 
 
 def _configure_gl_surface_format() -> None:
