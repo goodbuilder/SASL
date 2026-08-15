@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "profile_type": "stereo_extrinsics",
+  "profile_id": "dummy-identity-01",
+  "source_zoom_level": 1,
+  "method": "synthetic_placeholder",
+  "source_intrinsics_path": "",
+  "source_intrinsics_sha256": "",
+  "extrinsics": {
+    "rotation_left_to_right": [
+      [1.0, 0.0, 0.0],
+      [0.0, 1.0, 0.0],
+      [0.0, 0.0, 1.0]
+    ],
+    "translation_left_to_right_m": [0.5, 0.0, 0.0],
+    "reprojection_error_px": 0.0,
+    "pair_count": 0,
+    "frame_contract": "opencv_optical:RDF(right,down,forward); X_right = R_left_to_right * X_left + T_left_to_right_m"
+  },
+  "derived": {
+    "right_camera_origin_in_left_rdf_m": [-0.5, 0.0, 0.0],
+    "baseline_m": 0.5
+  },
+  "metadata": {
+    "note": "Synthetic placeholder R,t (identity rotation, 0.5m baseline along +X). Not a real calibration -- only satisfies the prior-pose requirement so Auto-select overlay rendering can be tested without a measured stereo rig geometry."
+  }
+}
