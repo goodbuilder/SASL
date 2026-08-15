@@ -579,7 +579,9 @@ class PixhawkParameterWorker(QtCore.QObject):
 
     def _read_mag_params(self) -> dict[str, int | float | None]:
         return {
-            name: self.subscriber.read_param_int(self.camera, name, timeout_s=1.5)
+            # MAG calibration includes REAL32 offset/scale/soft-iron values;
+            # using the integer-only reader would destroy the QGC result.
+            name: self.subscriber.read_param(self.camera, name, timeout_s=1.5)
             for name in MAG_PARAM_NAMES
         }
 
@@ -655,6 +657,19 @@ class PixhawkParameterWorker(QtCore.QObject):
                 elif self.operation == "attitude_refresh":
                     status = build_attitude_cal_status(self._read_attitude_params())
                     result = {"kind": self.operation, "camera": self.camera, "status": status}
+                elif self.operation == "calibration_refresh":
+                    mag_status = build_mag_status(
+                        self._read_mag_params(),
+                        actual_selected_device_id=self.actual_selected_device_id,
+                        armed=self.armed,
+                    )
+                    attitude_status = build_attitude_cal_status(self._read_attitude_params())
+                    result = {
+                        "kind": self.operation,
+                        "camera": self.camera,
+                        "mag_status": mag_status,
+                        "attitude_status": attitude_status,
+                    }
                 elif self.operation == "mag_apply":
                     result = self._run_mag_apply()
                 else:

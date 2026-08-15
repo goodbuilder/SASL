@@ -157,6 +157,7 @@ class NtripNetworkWorker(QtCore.QObject):
     """Qt adapter for the blocking, dependency-free NTRIP client."""
 
     connected = QtCore.pyqtSignal(str, object)
+    stats_changed = QtCore.pyqtSignal(object)
     chunk_received = QtCore.pyqtSignal(object)
     reconnecting = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
@@ -184,6 +185,8 @@ class NtripNetworkWorker(QtCore.QObject):
                         gga_provider=self.gga_provider,
                         initial_payload=initial_payload,
                     ):
+                        if client.stats is not None:
+                            self.stats_changed.emit(client.stats)
                         self.chunk_received.emit(chunk)
                     if self._stop_event.is_set():
                         break

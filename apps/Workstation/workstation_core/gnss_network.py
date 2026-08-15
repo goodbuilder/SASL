@@ -68,8 +68,8 @@ _NTRIP1_STATUS_LINE_PREFIXES = ("ICY ", "SOURCETABLE ", "ERROR")
 def _ntrip1_status_line(data: bytes) -> str | None:
     """Return the decoded first line when a legacy NTRIP 1.0 header is complete.
 
-    NTRIP 1.0 casters (the common ICY-style response used by rtk2go/SNIP and
-    most volunteer casters) terminate their status line with a single
+    NTRIP 1.0 casters using the common ICY-style response terminate their
+    status line with a single
     ``\\r\\n`` and start streaming raw RTCM bytes immediately after -- there
     is no second ``\\r\\n`` to close out an HTTP-style header block. This is
     only recognised once we can see that what follows the single ``\\r\\n``

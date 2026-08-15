@@ -6,14 +6,18 @@ coordinate frames.
 
 
 class MavlinkParameterStore:
-    """Integer parameter adapter with mandatory write readback."""
+    """Type-aware PX4 parameter adapter with integer write readback.
+
+    MAG calibration contains REAL32 values, so reads must preserve the
+    MAVLink parameter type. Priority writes remain INT32 by contract.
+    """
 
     def __init__(self, subscriber, camera: str) -> None:
         self.subscriber = subscriber
         self.camera = camera
 
     def get_param(self, name: str) -> int | float | None:
-        return self.subscriber.read_param_int(self.camera, name, timeout_s=1.5)
+        return self.subscriber.read_param(self.camera, name, timeout_s=1.5)
 
     def set_param(self, name: str, value: int | float) -> None:
         expected = int(value)

@@ -103,6 +103,10 @@ class SettingsWorkspace(QtWidgets.QWidget):
             "gnss_site_address": self._gnss().get("site_address"),
             "gnss_operation_mode": self._gnss().get("operation_mode"),
             "gnss_readiness_gate_enabled": self._gnss().get("readiness_gate_enabled"),
+            "gnss_require_drone_rtk_fixed": self._gnss().get("require_drone_rtk_fixed"),
+            "gnss_route_left_enabled": self._gnss_value("routing", "left_enabled"),
+            "gnss_route_right_enabled": self._gnss_value("routing", "right_enabled"),
+            "gnss_route_drone_enabled": self._gnss_value("routing", "drone_enabled"),
             "gnss_network_caster_host": self._gnss_value("network", "caster_host"),
             "gnss_network_caster_port": self._gnss_value("network", "caster_port"),
             "gnss_network_mountpoint": self._gnss_value("network", "mountpoint"),
@@ -260,6 +264,19 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
+        layout.addWidget(
+            self._group(
+                "WIRIS FTP (HR/OZ capture download)",
+                [
+                    ("Enable FTP download", self._toggle("wiris_ftp_enabled", "Download captured stills after HR/OZ capture")),
+                    ("FTP port", self._integer("wiris_ftp_port", 1, 65535)),
+                    ("FTP user", self._text("wiris_ftp_user")),
+                    ("FTP password", self._text("wiris_ftp_password", password=True)),
+                    ("FTP remote dir", self._text("wiris_ftp_remote_dir", placeholder="/")),
+                    ("FTP timeout", self._number("wiris_ftp_timeout_s", 0.5, 60.0, 1, " s")),
+                ],
+            )
+        )
         layout.addStretch(1)
 
     def _build_yolo_tab(self) -> None:
@@ -315,6 +332,22 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("Right MAVLink URL", self._text("right_mavlink_url")),
                     ("Left MAVLink baud", self._integer("left_mavlink_baud", 1, 10_000_000)),
                     ("Right MAVLink baud", self._integer("right_mavlink_baud", 1, 10_000_000)),
+                    ("Drone Telemetry URL", self._text("drone_telemetry_url", placeholder="udpin:0.0.0.0:14552")),
+                    ("Drone Telemetry baud", self._integer("drone_telemetry_baud", 1, 10_000_000)),
+                    (
+                        "Drone RTCM source",
+                        self._combo(
+                            "drone_telemetry_rtcm_source",
+                            (("Base GNSS", "base"), ("Network NTRIP", "ntrip")),
+                        ),
+                    ),
+                    (
+                        "Forward RTCM to drone",
+                        self._toggle(
+                            "drone_telemetry_rtcm_forward",
+                            "Send the selected RTCM source to the connected drone Pixhawk",
+                        ),
+                    ),
                     ("Left bootstrap URL", self._text("left_pixhawk_bootstrap_url")),
                     ("Right bootstrap URL", self._text("right_pixhawk_bootstrap_url")),
                     ("Left bootstrap baud", self._integer("left_pixhawk_bootstrap_baud", 1, 10_000_000)),
@@ -352,43 +385,157 @@ class SettingsWorkspace(QtWidgets.QWidget):
         )
         layout.addStretch(1)
 
+    def _refresh_gnss_mode_controls(self) -> None:
+        operation_mode = self.settings_widgets.get("gnss_operation_mode")
+        if not isinstance(operation_mode, QtWidgets.QComboBox):
+            return
+
+        mode = str(operation_mode.currentData() or "LOCAL_SURVEY_IN")
+        local_survey_in = mode == "LOCAL_SURVEY_IN"
+        network_assisted_fixed_base = mode == "NETWORK_ASSISTED_FIXED_BASE"
+        network_rtk_direct = mode == "NETWORK_RTK_DIRECT"
+
+        for key in ("gnss_base_serial_port", "gnss_base_baud"):
+            widget = self.settings_widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(local_survey_in or network_assisted_fixed_base)
+
+        for key in ("gnss_base_survey_in_min_duration_s", "gnss_base_survey_in_accuracy_m"):
+            widget = self.settings_widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(local_survey_in)
+
+        for key in (
+            "gnss_network_caster_host",
+            "gnss_network_caster_port",
+            "gnss_network_mountpoint",
+            "gnss_network_username_env",
+            "gnss_network_password_env",
+            "gnss_network_tls",
+            "gnss_network_reconnect_interval_s",
+            "gnss_network_connect_timeout_s",
+            "gnss_network_read_timeout_s",
+            "gnss_network_gga_policy",
+        ):
+            widget = self.settings_widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(not local_survey_in)
+
+        for key in (
+            "gnss_fixed_coordinate_profile_path",
+            "gnss_fixed_acquisition_duration_s",
+            "gnss_fixed_minimum_fixed_duration_s",
+            "gnss_fixed_minimum_fixed_ratio",
+            "gnss_fixed_max_horizontal_scatter_m",
+            "gnss_fixed_max_vertical_scatter_m",
+            "gnss_fixed_permit_profile_reuse",
+            "gnss_fixed_height_type",
+        ):
+            widget = self.settings_widgets.get(key)
+            if widget is not None:
+                widget.setEnabled(network_assisted_fixed_base)
+
+        # Keep this explicit so a future mode addition cannot accidentally leave
+        # the base-only controls active in Network RTK direct mode.
+        if network_rtk_direct:
+            for key in (
+                "gnss_base_serial_port",
+                "gnss_base_baud",
+                "gnss_base_survey_in_min_duration_s",
+                "gnss_base_survey_in_accuracy_m",
+                "gnss_fixed_coordinate_profile_path",
+                "gnss_fixed_acquisition_duration_s",
+                "gnss_fixed_minimum_fixed_duration_s",
+                "gnss_fixed_minimum_fixed_ratio",
+                "gnss_fixed_max_horizontal_scatter_m",
+                "gnss_fixed_max_vertical_scatter_m",
+                "gnss_fixed_permit_profile_reuse",
+                "gnss_fixed_height_type",
+            ):
+                widget = self.settings_widgets.get(key)
+                if widget is not None:
+                    widget.setEnabled(False)
+
     def _build_gnss_tab(self) -> None:
         layout = self._tab("GNSS / RTK")
+        site_label = self._text("gnss_site_label", placeholder="Per-experiment site name")
+        site_label.setToolTip(
+            "실험 장소 또는 측점을 사람이 식별하기 위한 이름입니다. "
+            "GNSS 보정과 거리 계산에는 사용되지 않고 세션 메타데이터로 저장됩니다."
+        )
+        site_address = self._text(
+            "gnss_site_address",
+            placeholder="Per-experiment address or field note",
+        )
+        site_address.setToolTip(
+            "현장 주소, 설치 위치, 조사 조건 등 기록용 주소/메모입니다. "
+            "GNSS 보정과 측정 계산에는 영향을 주지 않습니다."
+        )
+        operation_mode = self._combo(
+            "gnss_operation_mode",
+            (
+                ("Local Survey-in", "LOCAL_SURVEY_IN"),
+                ("Network assisted fixed base", "NETWORK_ASSISTED_FIXED_BASE"),
+                ("Network RTK direct", "NETWORK_RTK_DIRECT"),
+            ),
+        )
+        operation_mode.setToolTip(
+            "Local Survey-in은 Base가 직접 보정 기준을 만들고, Network assisted fixed base는 "
+            "Base가 NTRIP를 수신하며, Network RTK direct는 Base 없이 Network NTRIP를 사용합니다."
+        )
+        operation_mode.currentIndexChanged.connect(
+            lambda _index: self._refresh_gnss_mode_controls()
+        )
         layout.addWidget(
             self._group(
                 "Base / operation",
                 [
-                    ("Experiment site / point", self._text("gnss_site_label", placeholder="Per-experiment site name")),
-                    ("Experiment address / note", self._text("gnss_site_address", placeholder="Per-experiment address or field note")),
+                    ("Experiment site / point", site_label),
+                    ("Experiment address / note", site_address),
+                    ("Operation mode", operation_mode),
                     (
-                        "Operation mode",
-                        self._combo(
-                            "gnss_operation_mode",
-                            (
-                                ("Local Survey-in", "LOCAL_SURVEY_IN"),
-                                ("Network assisted fixed base", "NETWORK_ASSISTED_FIXED_BASE"),
-                                ("Network RTK direct", "NETWORK_RTK_DIRECT"),
-                            ),
+                        "Base serial port",
+                        self._text(
+                            "gnss_base_serial_port",
+                            placeholder="Required for Local Survey-in / assisted fixed base",
                         ),
                     ),
-                    ("Base serial port", self._text("gnss_base_serial_port")),
                     ("Base baud", self._integer("gnss_base_baud", 1, 10_000_000)),
                     ("Survey-in minimum duration", self._integer("gnss_base_survey_in_min_duration_s", 1, 86_400, " s")),
                     ("Survey-in accuracy", self._number("gnss_base_survey_in_accuracy_m", 0.001, 1000.0, 3, " m")),
-                    ("RTCM injection target", self._combo("gnss_base_rtcm_injection_target", (("Disabled", "disabled"), ("Left", "left"), ("Right", "right"), ("Both", "both")))),
                     ("GNSS readiness gate", self._toggle("gnss_readiness_gate_enabled", "Require GNSS readiness before operation")),
                 ],
             )
         )
         layout.addWidget(
             self._group(
-                "NTRIP network",
+                "RTCM routing / Drone readiness",
                 [
-                    ("Caster host", self._text("gnss_network_caster_host")),
+                    ("P1 Pixhawk RTCM route", self._toggle("gnss_route_left_enabled", "Send correction frames to P1")),
+                    ("P2 Pixhawk RTCM route", self._toggle("gnss_route_right_enabled", "Send correction frames to P2")),
+                    ("Drone RTCM route", self._toggle("gnss_route_drone_enabled", "Enable the Drone correction route and readiness target")),
+                    ("Drone RTK Fixed requirement", self._toggle("gnss_require_drone_rtk_fixed", "Require Drone RTK Fixed for GNSS readiness")),
+                ],
+            )
+        )
+        layout.addWidget(
+            self._group(
+                "NTRIP caster (any provider)",
+                [
+                    (
+                        "Caster host",
+                        self._text("gnss_network_caster_host", placeholder="caster.example.com (hostname only)"),
+                    ),
                     ("Caster port", self._integer("gnss_network_caster_port", 1, 65535)),
-                    ("Mountpoint", self._text("gnss_network_mountpoint")),
-                    ("Username environment variable", self._text("gnss_network_username_env")),
-                    ("Password environment variable", self._text("gnss_network_password_env")),
+                    ("Mountpoint", self._text("gnss_network_mountpoint", placeholder="MOUNTPOINT")),
+                    (
+                        "Username environment variable",
+                        self._text("gnss_network_username_env", placeholder="NTRIP_USERNAME"),
+                    ),
+                    (
+                        "Password environment variable",
+                        self._text("gnss_network_password_env", placeholder="NTRIP_PASSWORD"),
+                    ),
                     ("TLS", self._toggle("gnss_network_tls", "Use TLS for NTRIP")),
                     ("Reconnect interval", self._number("gnss_network_reconnect_interval_s", 0.0, 3600.0, 2, " s")),
                     ("Connect timeout", self._number("gnss_network_connect_timeout_s", 0.1, 3600.0, 2, " s")),
@@ -428,6 +575,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
             )
         )
         layout.addStretch(1)
+        self._refresh_gnss_mode_controls()
 
     def _widget_value(self, widget: QtWidgets.QWidget) -> object:
         if isinstance(widget, QtWidgets.QComboBox):
@@ -451,9 +599,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
         gnss["operation_mode"] = payload.get("gnss_operation_mode")
         gnss["site_label"] = payload.get("gnss_site_label", "")
         gnss["site_address"] = payload.get("gnss_site_address", "")
-        # Workstation owns P1/P2 and one field Base receiver.  The old
-        # third-drone readiness flag is intentionally not part of this schema.
-        gnss.pop("require_drone_rtk_fixed", None)
+        gnss["require_drone_rtk_fixed"] = bool(payload.get("gnss_require_drone_rtk_fixed"))
         gnss["readiness_gate_enabled"] = bool(payload.get("gnss_readiness_gate_enabled"))
         local_base.update(
             {
@@ -501,12 +647,22 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 "height_type": payload.get("gnss_fixed_height_type", "UNKNOWN"),
             }
         )
-        target = str(payload.get("gnss_base_rtcm_injection_target", "disabled"))
+        left_enabled = bool(payload.get("gnss_route_left_enabled"))
+        right_enabled = bool(payload.get("gnss_route_right_enabled"))
+        drone_enabled = bool(payload.get("gnss_route_drone_enabled"))
+        if left_enabled and right_enabled:
+            target = "both"
+        elif left_enabled:
+            target = "left"
+        elif right_enabled:
+            target = "right"
+        else:
+            target = "disabled"
         routing.update(
             {
-                "left_enabled": target in {"left", "both"},
-                "right_enabled": target in {"right", "both"},
-                "drone_enabled": False,
+                "left_enabled": left_enabled,
+                "right_enabled": right_enabled,
+                "drone_enabled": drone_enabled,
                 # NTRIP-to-Base routing is inherent in the assisted fixed-base
                 # operation; it is not an independent operator choice.
                 "field_base_enabled": payload.get("gnss_operation_mode")
@@ -514,7 +670,9 @@ class SettingsWorkspace(QtWidgets.QWidget):
             }
         )
         gnss.update({"readiness": readiness, "local_base": local_base, "network": network, "fixed_base": fixed_base, "routing": routing})
-        gnss.pop("require_drone_rtk_fixed", None)
+        # Keep the legacy flat target available to the owner bridge and older
+        # settings files while the visible UI uses explicit P1/P2 route flags.
+        payload["gnss_base_rtcm_injection_target"] = target
         payload["gnss_operation"] = gnss
         return payload
 

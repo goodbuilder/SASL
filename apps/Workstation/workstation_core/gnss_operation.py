@@ -216,9 +216,12 @@ class LocalBaseConfig:
 
 @dataclass(frozen=True)
 class NetworkConfig:
-    caster_host: str = "rtk2go.com"
+    # Caster identity is site configuration, not a generic data-model default.
+    # The application selects the NGII RTS2 profile for new field settings;
+    # this model remains provider-neutral for explicit custom configurations.
+    caster_host: str = ""
     caster_port: int = 2101
-    mountpoint: str = "KAIST-RTK-RTCM"
+    mountpoint: str = ""
     username_env: str = "NTRIP_USERNAME"
     password_env: str = "NTRIP_PASSWORD"
     tls: bool = False
@@ -365,6 +368,38 @@ class GnssOperationConfig:
     fixed_base: FixedBaseConfig = field(default_factory=FixedBaseConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     readiness_gate_enabled: bool = True
+
+    @classmethod
+    def ngii_rts2_base_assisted(cls) -> "GnssOperationConfig":
+        """Return the field profile for the NGII RTS2 Base-assisted workflow.
+
+        The profile contains only non-secret provider and routing metadata.
+        NTRIP credentials remain environment-variable references and are never
+        persisted in the settings JSON.  Readiness remains observable in the
+        GNSS UI, but it is deliberately not a measurement gate for this field
+        workflow.
+        """
+
+        return cls(
+            operation_mode=GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
+            network=NetworkConfig(
+                caster_host="RTS2.ngii.go.kr",
+                caster_port=2101,
+                mountpoint="VRS-RTCM32",
+                username_env="NGII_RTS2_USERNAME",
+                password_env="NGII_RTS2_PASSWORD",
+                tls=False,
+                gga_policy=GgaPolicy.BASE_GNSS,
+            ),
+            fixed_base=FixedBaseConfig(height_type=HeightType.ELLIPSOID),
+            routing=RoutingConfig(
+                left_enabled=True,
+                right_enabled=True,
+                drone_enabled=False,
+                field_base_enabled=True,
+            ),
+            readiness_gate_enabled=False,
+        )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "site_label", str(self.site_label).strip())

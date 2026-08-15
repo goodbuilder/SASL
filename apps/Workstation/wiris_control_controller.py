@@ -11,16 +11,11 @@ from ipaddress import IPv4Address
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.wiris_runtime_workers import (
-    WIRIS_LRF_POLL_PERIOD_S,
     WirisClockCommandWorker,
     WirisCommandWorker,
     WirisLrfPollWorker,
     WirisStipWorker,
     WirisZoomWorker,
-)
-from Workstation.workstation_core.pixhawk_attitude import (
-    discover_mavlink_messages,
-    mavlink_graphable_fields_for_message,
 )
 from Workstation.workstation_core.wiris_zoom import (
     DEFAULT_ZOOM_IN_TEMPLATE,
@@ -64,7 +59,7 @@ WIRIS_CONTROL_METHODS = [
     "_apply_wiris_command_result",
     "_wiris_command_failed",
     "_clear_wiris_command_worker",
-    "start_wiris_lrf_polling",
+    "query_wiris_lrf_once",
     "_apply_wiris_lrf_result",
     "_wiris_lrf_failed",
     "stop_wiris_lrf_polling",
@@ -628,11 +623,17 @@ class WirisControlController:
         self.panel.wiris_command_worker = None
         self.panel.wiris_command_send_button.setEnabled(True)
 
-    def start_wiris_lrf_polling(self) -> bool:
-        """Start the persistent GLRD reader used by Alignment's LRF cards."""
+    def query_wiris_lrf_once(self) -> bool:
+        """Run one on-demand GLRD read on both cameras for Alignment's LRF cards.
+
+        Each call opens and closes its own control-port connection instead of
+        keeping a background poll loop running; see
+        ``WirisLrfPollWorker`` for why continuous polling was removed.
+        """
 
         thread = getattr(self.panel, "wiris_lrf_thread", None)
         if thread is not None and thread.isRunning():
+            self.panel._log("[카메라] WIRIS LRF 조회가 이미 진행 중입니다.")
             return False
         target_infos = tuple(
             (
@@ -644,10 +645,7 @@ class WirisControlController:
             for label, host in self.panel.zoom_hosts("both")
         )
         self.panel.wiris_lrf_thread = QtCore.QThread(self.panel)
-        self.panel.wiris_lrf_worker = WirisLrfPollWorker(
-            target_infos,
-            period_s=WIRIS_LRF_POLL_PERIOD_S,
-        )
+        self.panel.wiris_lrf_worker = WirisLrfPollWorker(target_infos)
         self.panel.wiris_lrf_worker.moveToThread(self.panel.wiris_lrf_thread)
         self.panel.wiris_lrf_thread.started.connect(self.panel.wiris_lrf_worker.run)
         self.panel.wiris_lrf_worker.sampled.connect(self.panel._apply_wiris_lrf_result)
@@ -691,16 +689,11 @@ class WirisControlController:
             cache[side] = previous
 
     def _wiris_lrf_failed(self, error: str) -> None:
-        self.panel._log(f"[카메라] WIRIS LRF 자동 조회 실패: {error}")
+        self.panel._log(f"[카메라] WIRIS LRF 조회 실패: {error}")
 
     def stop_wiris_lrf_polling(self, *, wait: bool = False) -> bool:
-        """Request the persistent reader to stop; return false while winding down."""
+        """Wind down any in-flight on-demand LRF query; return false while winding down."""
 
-        worker = getattr(self.panel, "wiris_lrf_worker", None)
-        if worker is not None:
-            request_stop = getattr(worker, "request_stop", None)
-            if callable(request_stop):
-                request_stop()
         thread = getattr(self.panel, "wiris_lrf_thread", None)
         if thread is None:
             self.panel.wiris_lrf_worker = None

@@ -856,6 +856,7 @@ class CalibrationWorkflowController:
                 profile_id="legacy_embedded_extrinsics",
             )
             panel.selected_extrinsics_profile = selected_profile
+            panel.checkerboard_extrinsics_profile = selected_profile
             panel._selected_extrinsics_profile_path = (
                 f"{panel._active_intrinsics_profile_path}#embedded-extrinsics"
             )
@@ -1498,6 +1499,10 @@ class CalibrationWorkflowController:
             },
         )
         self.panel.selected_extrinsics_profile = profile
+        # Kept separate from ``selected_extrinsics_profile`` (which a later
+        # PnP apply would overwrite) so the geometry-comparison display can
+        # always show the raw checkerboard stereoCalibrate result on its own.
+        self.panel.checkerboard_extrinsics_profile = profile
         self.panel._selected_extrinsics_profile_path = (
             f"memory:{profile.profile_id}"
         )
@@ -1549,6 +1554,13 @@ class CalibrationWorkflowController:
             self.panel._log(f"[캘리브레이션] R,t profile 로드 실패: {path}: {exc}")
             return
         self.panel.selected_extrinsics_profile = profile
+        # Route into the geometry-comparison slot matching this profile's
+        # origin so a loaded file doesn't silently blend checkerboard and
+        # PnP provenance in the comparison display.
+        if str(profile.method or "").startswith("optical_pose/"):
+            self.panel.optical_pose_extrinsics_profile = profile
+        else:
+            self.panel.checkerboard_extrinsics_profile = profile
         self.panel._selected_extrinsics_profile_path = str(path)
         self.panel._selected_extrinsics_profile_hash = profile.content_sha256
         self.panel.calibration_status_label.setText(

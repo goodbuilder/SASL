@@ -273,7 +273,6 @@ from Workstation.workstation_core.triangulation import (
     body_frd_vector_to_camera,
     camera_translation_right_in_left_camera,
     invert_left_to_right_camera_transform,
-    world_ned_vector_to_body_frd,
 )
 from Workstation.workstation_core.yolo_stream import (
     DECODER_AUTO,
@@ -370,6 +369,14 @@ MAX_MANUAL_FOCAL_PX = 100_000.0
 DETECTION_PAIR_MAX_AGE_S = 1.0
 RUNTIME_CAMERA_STATUS_LABEL_HEIGHT_PX = 32
 RUNTIME_CAMERA_STATUS_GROUP_HEIGHT_PX = 48
+RUNTIME_CAMERA_LAYOUT_BREAKPOINT_PX = 1060
+# Switching runtime_header_layout's direction changes its own preferred
+# height/width, which immediately changes how much of runtime_layout's
+# remaining stretch space the camera panes get. A single breakpoint flips
+# back and forth every resize pass near RUNTIME_CAMERA_LAYOUT_BREAKPOINT_PX,
+# visibly jittering the camera preview size. This margin makes the two
+# transition points distinct so the direction only changes once per crossing.
+RUNTIME_CAMERA_LAYOUT_HYSTERESIS_PX = 48
 VISIBLE_STREAM_GOP_GET_COMMAND = "GEGS VISIBLE"
 RECORDING_PREVIEW_LIMIT = 256
 RECORDING_KEY_CACHE_LIMIT = 1024
@@ -1056,6 +1063,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.active_intrinsics: StereoIntrinsicsResult | None = None
         self._active_intrinsics_profile_path = ""
         self.selected_extrinsics_profile: StereoExtrinsicsProfile | None = None
+        # Independent geometry-comparison slots: unlike selected_extrinsics_profile,
+        # these never overwrite each other, so Measurement-tab comparison rows
+        # can always show the last checkerboard result and the last applied
+        # PnP result side by side.
+        self.checkerboard_extrinsics_profile: StereoExtrinsicsProfile | None = None
+        self.optical_pose_extrinsics_profile: StereoExtrinsicsProfile | None = None
         self._selected_extrinsics_profile_path = ""
         self._selected_extrinsics_profile_hash = ""
         self._active_intrinsics_profile_hash = ""
@@ -1196,9 +1209,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.drone_telemetry_last_error = ""
         self.drone_telemetry_connection_thread: QtCore.QThread | None = None
         self.drone_telemetry_connection_worker: PixhawkConnectionWorker | None = None
+        self.drone_telemetry_usb_discovery_thread: QtCore.QThread | None = None
+        self.drone_telemetry_usb_discovery_worker: PixhawkUsbDiscoveryWorker | None = None
+        self.drone_telemetry_usb_discovery_state = ""
         self._workstation_setting_overrides: dict[str, object] = {}
         self.gnss_operation_manager = GnssOperationManager(self.settings.gnss_operation)
         self.distance_history: deque[DistanceHistoryPoint] = deque(maxlen=600)
+        self.geometry_comparison_rows: tuple[dict[str, object], ...] = ()
         self.distance_recording_rows: SpoolRows | list[dict[str, object]] = SpoolRows(
             preview_limit=RECORDING_PREVIEW_LIMIT,
             supports_updates=True,
@@ -1214,6 +1231,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             "right": SpoolRows(),
         }
         self.gnss_base_recording_rows: SpoolRows = SpoolRows()
+        self.extrinsics_comparison_recording_rows: SpoolRows = SpoolRows()
         self._session_save_thread: QtCore.QThread | None = None
         self._session_save_worker: SessionSaveWorker | None = None
         self._session_save_retry_required = False
@@ -2565,13 +2583,13 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         setup_layout.addWidget(connection_tabs, 1)
         pixhawk_tabs = QtWidgets.QTabWidget()
         pixhawk_summary_tab = QtWidgets.QWidget()
-        pixhawk_summary_layout = QtWidgets.QVBoxLayout(pixhawk_summary_tab)
+        QtWidgets.QVBoxLayout(pixhawk_summary_tab)
         pixhawk_1_tab = QtWidgets.QWidget()
-        pixhawk_1_layout = QtWidgets.QVBoxLayout(pixhawk_1_tab)
+        QtWidgets.QVBoxLayout(pixhawk_1_tab)
         pixhawk_2_tab = QtWidgets.QWidget()
-        pixhawk_2_layout = QtWidgets.QVBoxLayout(pixhawk_2_tab)
+        QtWidgets.QVBoxLayout(pixhawk_2_tab)
         pixhawk_attitude_tab = QtWidgets.QWidget()
-        pixhawk_common_layout = QtWidgets.QVBoxLayout(pixhawk_attitude_tab)
+        QtWidgets.QVBoxLayout(pixhawk_attitude_tab)
         custom_watch_tab = QtWidgets.QWidget()
         custom_watch_layout = QtWidgets.QVBoxLayout(custom_watch_tab)
         pixhawk_tabs.addTab(pixhawk_summary_tab, "요약")
@@ -8164,12 +8182,20 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         if not hasattr(self, "runtime_header_layout") or not hasattr(self, "runtime_camera_settings_group"):
             return
         current_width = self.runtime_camera_settings_group.width() if width is None else width
-        direction = (
-            QtWidgets.QBoxLayout.LeftToRight
-            if current_width >= 1060
-            else QtWidgets.QBoxLayout.TopToBottom
-        )
-        if self.runtime_header_layout.direction() != direction:
+        current_direction = self.runtime_header_layout.direction()
+        # Hysteresis prevents flip-flopping right at the breakpoint: toggling
+        # direction changes the header's own sizeHint, which changes how much
+        # vertical space is left for the camera panes below it (video_row
+        # holds nearly all of runtime_layout's stretch). Without a dead zone,
+        # each resize pass near the breakpoint could cross back over it,
+        # making the camera preview visibly jitter in size.
+        if current_direction == QtWidgets.QBoxLayout.LeftToRight:
+            should_stack = current_width < RUNTIME_CAMERA_LAYOUT_BREAKPOINT_PX - RUNTIME_CAMERA_LAYOUT_HYSTERESIS_PX
+            direction = QtWidgets.QBoxLayout.TopToBottom if should_stack else QtWidgets.QBoxLayout.LeftToRight
+        else:
+            should_unstack = current_width >= RUNTIME_CAMERA_LAYOUT_BREAKPOINT_PX + RUNTIME_CAMERA_LAYOUT_HYSTERESIS_PX
+            direction = QtWidgets.QBoxLayout.LeftToRight if should_unstack else QtWidgets.QBoxLayout.TopToBottom
+        if direction != current_direction:
             self.runtime_header_layout.setDirection(direction)
 
     def _format_runtime_pair_status(self) -> tuple[str, str]:
@@ -9414,6 +9440,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _upsert_pair_recording_row(self, *args: Any, **kwargs: Any) -> Any: ...
         def _record_unresolved_pair(self, *args: Any, **kwargs: Any) -> Any: ...
         def _append_distance_history(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _append_extrinsics_comparison_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
         def _distance_history_class_name(self, *args: Any, **kwargs: Any) -> Any: ...
         def _fmt_record_float(self, *args: Any, **kwargs: Any) -> Any: ...
         def _fmt_record_bool(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9460,6 +9487,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def apply_workstation_optical_pose_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
         def revert_workstation_optical_pose(self, *args: Any, **kwargs: Any) -> Any: ...
         def capture_workstation_optical_pose_burst(self, *args: Any, **kwargs: Any) -> Any: ...
+        def import_workstation_optical_pose_burst(self, *args: Any, **kwargs: Any) -> Any: ...
         def import_workstation_optical_pose_terrain(self, *args: Any, **kwargs: Any) -> Any: ...
         def solve_workstation_optical_pose_horizon(self, *args: Any, **kwargs: Any) -> Any: ...
         def solve_workstation_optical_pose_terrain(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9470,6 +9498,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def auto_select_workstation_optical_pose_mountain(self, *args: Any, **kwargs: Any) -> Any: ...
         def accept_workstation_optical_pose_suggestion(self, *args: Any, **kwargs: Any) -> Any: ...
         def record_workstation_optical_pose_annotation(self, *args: Any, **kwargs: Any) -> Any: ...
+        def workstation_optical_pose_candidate_poses(self, *args: Any, **kwargs: Any) -> Any: ...
+        def register_workstation_optical_pose_reference_candidate(self, *args: Any, **kwargs: Any) -> Any: ...
         def configure_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
         def connect_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
         def start_target_drone_stream(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9482,6 +9512,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def disconnect_drone_telemetry(self, *args: Any, **kwargs: Any) -> Any: ...
         def save_drone_telemetry_settings(self, *args: Any, **kwargs: Any) -> Any: ...
         def drone_telemetry_snapshot(self, *args: Any, **kwargs: Any) -> Any: ...
+        def discover_drone_telemetry_usb(self, *args: Any, **kwargs: Any) -> Any: ...
         def _app_relative_path_text(self, *args: Any, **kwargs: Any) -> Any: ...
         def _checkerboard_validation_mode(self, *args: Any, **kwargs: Any) -> Any: ...
         def _checkerboard_validation_root(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9682,6 +9713,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _capture_measurement_gnss_contract(self, *args: Any, **kwargs: Any) -> Any: ...
         def _measurement_gnss_record_metadata(self, *args: Any, **kwargs: Any) -> Any: ...
         def _refresh_distance(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _geometry_comparison_rows(self, *args: Any, **kwargs: Any) -> Any: ...
         def _show_measurement_pair(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_measurement_pair_display(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_selected_runtime_measurement_pair(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9756,7 +9788,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _apply_wiris_command_result(self, *args: Any, **kwargs: Any) -> Any: ...
         def _wiris_command_failed(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_wiris_command_worker(self, *args: Any, **kwargs: Any) -> Any: ...
-        def start_wiris_lrf_polling(self, *args: Any, **kwargs: Any) -> Any: ...
+        def query_wiris_lrf_once(self, *args: Any, **kwargs: Any) -> Any: ...
         def _apply_wiris_lrf_result(self, *args: Any, **kwargs: Any) -> Any: ...
         def _wiris_lrf_failed(self, *args: Any, **kwargs: Any) -> Any: ...
         def stop_wiris_lrf_polling(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9797,6 +9829,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.px4_recording_rows["left"].clear()
         self.px4_recording_rows["right"].clear()
         self.gnss_base_recording_rows.clear()
+        self.extrinsics_comparison_recording_rows.clear()
         if self.distance_recording_enabled and self.recording_session_id:
             spool_root = self._recording_session_dir(self.recording_session_id) / ".spool"
             if isinstance(self.distance_recording_rows, SpoolRows):
@@ -9806,6 +9839,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             for side, rows in self.px4_recording_rows.items():
                 rows.bind(spool_root / f"px4_{side}.jsonl")
             self.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
+            self.extrinsics_comparison_recording_rows.bind(spool_root / "extrinsics_comparison.jsonl")
         self._recording_pair_row_index.clear()
         if not self.distance_recording_enabled:
             self.distance_recording_started_monotonic_s = None
@@ -10540,7 +10574,6 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         return text
 
     def _active_mavlink_remote_hosts(self) -> tuple[str, ...]:
-        hosts: list[str] = []
         subscriber = self.mavlink_pixhawk
         if subscriber is None:
             return ()

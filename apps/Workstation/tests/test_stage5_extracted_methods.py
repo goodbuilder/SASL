@@ -93,6 +93,7 @@ def test_recover_retryable_recording_session_restores_spool_state(tmp_path) -> N
         camera_rows={"left": SpoolRows(), "right": SpoolRows()},
         px4_rows={"left": SpoolRows(), "right": SpoolRows()},
         gnss_base_rows=SpoolRows(),
+        extrinsics_comparison_rows=SpoolRows(),
     )
     logs = []
     panel = SimpleNamespace(

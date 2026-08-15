@@ -10,6 +10,7 @@ This module performs no NED/FRD/camera-frame conversion.
 import math
 from collections import deque
 from dataclasses import dataclass
+from math import isfinite
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -23,6 +24,7 @@ from Workstation.workstation_core.theme import (
     CHART_MUTED,
     CHART_TEXT,
     ERROR,
+    INVERSE_BG,
     INVERSE_TEXT,
     PANEL_BORDER,
     PANEL_BORDER_STRONG,
@@ -147,7 +149,7 @@ class AttitudeHistoryPlot(QtWidgets.QWidget):
 
 
 class Px4ShellDialog(QtWidgets.QDialog):
-    def __init__(self, title: str, send_callback) -> None:
+    def __init__(self, title: str, send_callback, mag_watch_callback=None) -> None:
         super().__init__()
         self.send_callback = send_callback
         self.setWindowTitle(title)
@@ -165,6 +167,13 @@ class Px4ShellDialog(QtWidgets.QDialog):
         self.command_edit.returnPressed.connect(self.send_command)
         self.send_button = QtWidgets.QPushButton("Send")
         self.send_button.clicked.connect(self.send_command)
+        if mag_watch_callback is not None:
+            self.mag_watch_button = QtWidgets.QPushButton("Read MAG instances")
+            self.mag_watch_button.setToolTip(
+                "PX4 sensor_mag instance 0~4를 읽고 알려진 CAN device_id만 CAN 표에 반영합니다."
+            )
+            self.mag_watch_button.clicked.connect(mag_watch_callback)
+            command_row.addWidget(self.mag_watch_button)
         command_row.addWidget(self.command_edit, 1)
         command_row.addWidget(self.send_button)
         layout.addWidget(self.output, 1)

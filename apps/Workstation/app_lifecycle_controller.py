@@ -8,6 +8,8 @@ APP_LIFECYCLE_METHODS = [
     "_shutdown_stop_thread",
     "_shutdown_stop_auxiliary_workers",
     "_shutdown_stop_gnss_base_serial",
+    "_shutdown_stop_target_drone",
+    "_shutdown_stop_drone_telemetry",
     "shutdown_for_close",
     "closeEvent",
     "_stop_calibration_preview_worker"
@@ -48,6 +50,7 @@ class AppLifecycleController:
             "camera_auto_detect_thread",
             "wiris_control_check_thread",
             "wiris_command_thread",
+            "pnp_photo_capture_thread",
             "wiris_zoom_thread",
             "wiris_time_sync_thread",
             "wiris_stip_thread",
@@ -56,6 +59,7 @@ class AppLifecycleController:
             "interface_status_thread",
             "pixhawk_usb_discovery_thread",
             "pixhawk_host_ip_discovery_thread",
+            "drone_telemetry_usb_discovery_thread",
             "rtsp_check_thread",
             "rtsp_enable_thread",
             "gnss_base_detect_thread",
@@ -67,6 +71,56 @@ class AppLifecycleController:
     def _shutdown_stop_gnss_base_serial(self) -> bool:
         self.panel.disconnect_gnss_base_serial()
         thread = getattr(self.panel, "gnss_base_serial_thread", None)
+        return thread is None or not thread.isRunning()
+
+    def _shutdown_stop_target_drone(self) -> bool:
+        owner = getattr(self.panel, "_target_drone_controller_owner", None)
+        if owner is None:
+            return True
+        snapshot = owner.target_drone_stream_snapshot()
+        if not snapshot.get("worker_alive") and snapshot.get("phase") in {
+            "UNCONFIGURED",
+            "CONFIGURED",
+            "DEFERRED",
+            "STOPPED",
+            "SEALED",
+            "FAILED",
+        }:
+            return True
+        try:
+            result = owner.stop_target_drone_stream(timeout_s=1.0)
+        except Exception as exc:
+            self.panel._log(f"[종료] Target Drone drain/stop 실패: {exc}")
+            return False
+        artifact = result.get("artifact") if isinstance(result, dict) else None
+        if isinstance(artifact, dict):
+            importer = getattr(self.panel, "import_workstation_session_artifact", None)
+            if callable(importer) and not artifact.get("ledger_imported"):
+                try:
+                    importer(
+                        artifact["absolute_path"],
+                        role="target_drone_raw_mavlink_jsonl",
+                        media_type="application/x-ndjson",
+                        metadata={
+                            key: value
+                            for key, value in artifact.items()
+                            if key != "absolute_path"
+                        },
+                    )
+                except Exception as exc:
+                    self.panel._log(f"[종료] Target Drone artifact linkage 실패: {exc}")
+                    return False
+        return not bool(result.get("worker_alive"))
+
+    def _shutdown_stop_drone_telemetry(self) -> bool:
+        owner = getattr(self.panel, "_drone_telemetry_controller_owner", None)
+        if owner is not None:
+            try:
+                owner.disconnect_drone_telemetry()
+            except Exception as exc:
+                self.panel._log(f"[종료] Drone Telemetry 연결 해제 실패: {exc}")
+                return False
+        thread = getattr(self.panel, "drone_telemetry_connection_thread", None)
         return thread is None or not thread.isRunning()
 
     def shutdown_for_close(self) -> bool:

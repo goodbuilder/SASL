@@ -180,6 +180,19 @@ def intrinsics_content_sha256(result: StereoIntrinsicsResult) -> str:
     )
 
 
+def independent_zoom_selection_mode(
+    intrinsics_zoom: int | None,
+    extrinsics_zoom: int | None,
+) -> str:
+    """Classify independently selected K/D and R/T zoom provenance."""
+
+    if intrinsics_zoom is None or extrinsics_zoom is None:
+        return "manual_independent_zoom"
+    if int(intrinsics_zoom) == int(extrinsics_zoom):
+        return "manual_same_zoom"
+    return "manual_cross_zoom"
+
+
 def compose_stereo_calibration(
     intrinsics: StereoIntrinsicsResult,
     extrinsics: StereoExtrinsics | StereoExtrinsicsProfile | None,

@@ -15,6 +15,9 @@ _CONTEXT_ALIASES = {
     "processing.synchronization": "devices.time",
     "tasks.playback": "tasks.recording",
     "tasks.export": "tasks.recording",
+    # The former Protocol page was removed; old saved UI state returns to the
+    # overview instead of opening a hidden/dead workspace.
+    "processing.experiment": "overview",
 }
 
 
@@ -58,15 +61,17 @@ class NavigationTree(QtWidgets.QTreeView):
         self.model.appendRow(root)
         root.appendRow(self._item("Overview", "overview"))
 
-        root.appendRow(self._item("Protocol", "processing.experiment"))
-        root.appendRow(self._item("Pre-run Calibration", "tasks.calibration"))
-
         devices = self._item("Devices", "devices", selectable=False)
         devices.appendRow(self._item("Cameras", "devices.cameras"))
         devices.appendRow(self._item("Pixhawk", "devices.pixhawk"))
+        devices.appendRow(self._item("Telemetry", "devices.telemetry"))
         devices.appendRow(self._item("Base GNSS", "devices.gnss"))
         devices.appendRow(self._item("Time / Sync", "devices.time"))
         root.appendRow(devices)
+
+        # Calibration needs a connected camera to capture checkerboard images
+        # against, so it belongs after Devices, not before it.
+        root.appendRow(self._item("Calibration", "tasks.calibration"))
 
         root.appendRow(self._item("Alignment", "processing.alignment"))
         root.appendRow(self._item("Measurement", "processing.measurement"))

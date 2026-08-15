@@ -112,13 +112,28 @@ opens the Workstation `Advanced` preview tab rather than exposing the internal o
 ## 17. Pixhawk / GNSS / Detection / Recording / Analysis
 
 Pixhawk, Base GNSS, and Alignment have separate Workstation pages. Pixhawk presents P1/P2
-attitude, rover fix numbers, and NED/FRD baseline evidence; Base GNSS presents the Base
-receiver, Survey-in/NTRIP, discovered receiver candidates, and RTCM delivery; Alignment
-presents physical sampling and iteration evidence. Detection remains with Cameras, and
-Recording/Review/Files is exposed once as Recording / Sessions.
+attitude, rover fix numbers, and NED/FRD baseline evidence. Its `Pixhawk Parameters`
+group has P1/P2 tabs, each split into Accelerometer, Gyroscope, Compass/Magnetometer,
+Level Horizon, and manual Board Orientation groups. The first four groups provide a guarded
+reset button that sends PX4 `param reset` only for that group's parameters and then refreshes
+the readback; Board Orientation is explicitly manual and has no calibration reset. Priority
+values are shown with their PX4 semantic label and raw number. These values retain the PX4
+sensor-axis/board-parameter contract and are not converted to NED, ENU, or camera frames.
+Base GNSS presents the Base receiver, Survey-in/NTRIP, discovered receiver candidates, and
+RTCM delivery; Alignment presents physical sampling and iteration evidence. Detection remains
+with Cameras, and Recording/Review/Files is exposed once as Recording / Sessions.
+The Alignment page places its Pixhawk, GNSS / RTK, Alignment, and Optical pose operation tabs directly
+below the page header so field controls remain reachable before the evidence tables.
+Optical pose contains frozen native left/right annotation views, horizon Roll/Pitch,
+terrain/GeoTIFF PnP, Drone RTK Yaw, candidate residuals/observability, explicit six-DOF
+selection, and immutable Apply/Revert actions. It is not a second calibration owner.
 The Alignment evidence keeps raw RTK NED `[N,E,D]` and the separate P1 body-FRD
 `[F,R,D]` projection in adjacent groups so the operator can use the intuitive P1
 orientation without confusing it with camera optical RDF or public measurement output.
+Recording keeps Run setup (including Drone/UAM mode and camera identity), HR purpose/import
+events, and a PX4 ULog evidence table. UAM target telemetry is shown as deferred rather
+than erroneous; target Drone data is a separate receive-only source and never replaces P1/P2
+attitude, GNSS baseline, or nominal stereo geometry.
 
 ## 18. Density Targets
 

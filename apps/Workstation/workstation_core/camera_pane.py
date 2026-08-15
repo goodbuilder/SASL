@@ -31,6 +31,7 @@ def infer_camera_timestamp_reference(metadata: dict) -> str:
 class CameraPane(QtWidgets.QGroupBox):
     detection_changed = QtCore.pyqtSignal(str, object)
     frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
+    native_measurement_frame_changed = QtCore.pyqtSignal(str, object, QtGui.QImage)
     stats_changed = QtCore.pyqtSignal(str, object)
     state_changed = QtCore.pyqtSignal(str, str)
 
@@ -43,7 +44,11 @@ class CameraPane(QtWidgets.QGroupBox):
         self.latest_image: QtGui.QImage | None = None
         self.latest_detection: DetectionObservation | None = None
         self.measurement_frame_images: dict[float, QtGui.QImage] = {}
-        self.measurement_frame_order: deque[float] = deque(maxlen=120)
+        self.measurement_frame_metadata: dict[float, dict[str, object]] = {}
+        # Native RGB frames can be several MiB each.  Keep only the short
+        # producer-side evidence window needed to bind a matched detection or
+        # a frozen pose burst; durable frames are moved to NativeFrameStore.
+        self.measurement_frame_order: deque[float] = deque(maxlen=16)
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s: float | None = None
         self.selected_measurement_frame_lookup_delta_s: float | None = None
@@ -77,6 +82,7 @@ class CameraPane(QtWidgets.QGroupBox):
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
+        self.measurement_frame_metadata.clear()
         self.measurement_frame_order.clear()
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s = None
@@ -99,6 +105,11 @@ class CameraPane(QtWidgets.QGroupBox):
         self.worker.measurement_frame_ready.connect(
             lambda timestamp_s, image, generation=stream_generation: self._store_measurement_frame_if_current(
                 generation, timestamp_s, image
+            )
+        )
+        self.worker.native_measurement_frame_ready.connect(
+            lambda metadata, image, generation=stream_generation: self._emit_native_measurement_frame_if_current(
+                generation, metadata, image
             )
         )
         self.worker.detection_ready.connect(
@@ -168,6 +179,7 @@ class CameraPane(QtWidgets.QGroupBox):
         self.latest_image = None
         self.latest_detection = None
         self.measurement_frame_images.clear()
+        self.measurement_frame_metadata.clear()
         self.measurement_frame_order.clear()
         self.measurement_pair_display_active = False
         self.selected_measurement_frame_timestamp_s = None
@@ -212,19 +224,84 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self._show_frame(image, metadata)
 
-    def _store_measurement_frame(self, timestamp_s: float, image: QtGui.QImage) -> None:
+    def _store_measurement_frame(
+        self,
+        timestamp_s: float,
+        image: QtGui.QImage,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
         key = float(timestamp_s)
         if key not in self.measurement_frame_images:
             if len(self.measurement_frame_order) == self.measurement_frame_order.maxlen:
                 old_key = self.measurement_frame_order.popleft()
                 self.measurement_frame_images.pop(old_key, None)
+                self.measurement_frame_metadata.pop(old_key, None)
             self.measurement_frame_order.append(key)
         self.measurement_frame_images[key] = image.copy()
+        if metadata is not None:
+            self.measurement_frame_metadata[key] = dict(metadata)
 
     def _store_measurement_frame_if_current(self, generation: int, timestamp_s: float, image: QtGui.QImage) -> None:
         if generation != self.stream_generation:
             return
         self._store_measurement_frame(timestamp_s, image)
+
+    def _emit_native_measurement_frame_if_current(
+        self,
+        generation: int,
+        metadata: object,
+        image: QtGui.QImage,
+    ) -> None:
+        if generation != self.stream_generation:
+            return
+        frame_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        timestamp_s = float(frame_metadata.get("timestamp_s", time.monotonic()))
+        # The compatibility signal above may arrive immediately before this
+        # metadata-rich signal.  Store the native raster and metadata together
+        # so a frozen burst works even when detection is disabled.
+        self._store_measurement_frame(timestamp_s, image, frame_metadata)
+        self.native_measurement_frame_changed.emit(self.camera_label, frame_metadata, image)
+
+    def native_measurement_frame(
+        self,
+        timestamp_s: float,
+        *,
+        maximum_delta_s: float = 0.001,
+    ) -> tuple[float, QtGui.QImage, dict[str, object]] | None:
+        """Return a native, unannotated frame near a detection timestamp."""
+
+        if not self.measurement_frame_images:
+            return None
+        requested = float(timestamp_s)
+        key = min(self.measurement_frame_images, key=lambda candidate: abs(candidate - requested))
+        if abs(key - requested) > float(maximum_delta_s):
+            return None
+        image = self.measurement_frame_images.get(key)
+        if image is None:
+            return None
+        metadata = dict(self.measurement_frame_metadata.get(key, {}))
+        metadata.setdefault("timestamp_s", key)
+        metadata.setdefault("native_width", image.width())
+        metadata.setdefault("native_height", image.height())
+        metadata.setdefault("overlay_applied", False)
+        return key, image.copy(), metadata
+
+    def latest_native_measurement_frame(
+        self,
+    ) -> tuple[float, QtGui.QImage, dict[str, object]] | None:
+        """Return the newest native, unannotated producer frame.
+
+        This is intentionally distinct from ``latest_image``, which is a
+        display preview and may be resized.  Optical-pose burst capture must
+        call this method so annotations remain on the decoded source grid.
+        """
+
+        if not self.measurement_frame_order:
+            return None
+        return self.native_measurement_frame(
+            self.measurement_frame_order[-1],
+            maximum_delta_s=0.0,
+        )
 
     def show_measurement_frame_for_detection(self, detection: DetectionObservation) -> bool:
         detection_timestamp_s = float(detection.timestamp_s)

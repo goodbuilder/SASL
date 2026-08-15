@@ -46,7 +46,9 @@ Success: required devices for intended task are connected and providing expected
 Field sequence for the Workstation implementation:
 0. Complete Pixhawk Sensor Calibration in QGC outside Workstation.
 1. Connect and verify WIRIS, Pixhawk P1/P2, and Base GNSS.
-2. Start Base Survey-in or NTRIP.
+2. Start Base Survey-in or NTRIP. For NTRIP, configure the provider's caster hostname,
+   port, mountpoint, TLS setting, GGA policy, and credential environment-variable names in
+   `Settings > GNSS`; new field settings use the NGII RTS2 Base-assisted profile.
 3. Set/check WIRIS time synchronization.
 4. Verify RTCM delivery to Left/Right Pixhawk and record numeric `fix_type`; do not assume every condition reaches `RTK_FIXED=6`.
 5. Physically align the P1–P2 baseline.
@@ -62,8 +64,21 @@ available in `Pre-run Calibration`, but it is not inserted into the numbered fie
 sequence after the final time-sync checkpoint.
 
 The `Protocol` page mirrors this order and links to the corresponding Workstation page for
-each action. QGC calibration is displayed as an external prerequisite and has no
-in-app execution button.
+each action. QGC remains the calibration executor. The Pixhawk page's `Pixhawk Parameters`
+group provides a MAVLink PARAM readback of the QGC/PX4 result for each P1/P2, split into
+Accelerometer, Gyroscope, Compass/Magnetometer, Level Horizon, and manual Board Orientation
+tabs. The first four tabs expose a guarded `Reset to PX4 default` action that resets only
+that calibration's owned parameters through the connected firmware's `param reset` command;
+the action requires a disarmed vehicle and refreshes the readback after completion. Board
+rotation and `SENS_BOARD_Z_OFF` remain manual parameters and intentionally have no calibration
+reset button.
+
+`CAL_MAG*_PRIO` is displayed with the PX4 semantic levels `Uninitialized (-1)`,
+`Disabled (0)`, `Min (1)`, `Low (25)`, `Medium (50)`, `High (75)`, and `Max (100)`.
+If a connected vehicle reports a non-standard raw value, Workstation preserves and shows
+it as `Custom (raw)` rather than silently remapping it. MAG offsets, scales, soft-iron,
+and board-rotation values remain PX4 sensor-axis parameters; Workstation does not convert
+them to NED, ENU, or camera coordinates.
 
 ### Calibration calculation execution
 
@@ -101,19 +116,106 @@ treated as an alias of OpenCV T. PASS means at least three stereo pairs produced
 proper rotation and metre translation. Input/OpenCV errors are FAIL and leave the previous
 candidate unchanged.
 
-Intrinsics and extrinsics are independently selectable. A supported manual configuration
-is, for example, `intrinsics_zoom_08.json + extrinsics_zoom_01_large_board.json`. Source
-zoom mismatch, missing external validation, and failed zoom readback are informational and
-do not block `Apply K,D + R,t`. Only malformed or non-computable data is rejected. The
-application records both paths, hashes, source zooms, the manual/cross-zoom selection, and
-`validation_gate=disabled` in measurement/recording provenance. Physical validity across
-zoom is an external experiment decision and is not promoted to calibration-time or runtime
-truth by the Workstation.
+Intrinsics and extrinsics are independently selectable. The general cross-zoom workflow is
+`K,D` from the intended operating zoom B plus `R,t` estimated at any independently chosen
+calibration zoom A. A and B are not fixed presets and may be any supported zoom levels; for
+example, a 1x `R,t` profile can be paired with exact 8x `K,D`. A difference between A and B
+is recorded as cross-zoom provenance and does not by itself reject `R,t`.
 
-The Calibration workspace can set both visible cameras to nominal 1× or 8× and query
-each camera with `GZVV`. Requested and read-back values remain separate. A mismatch is
-displayed as evidence only; it does not disable calibration bundle application or runtime
-measurement.
+Exact operating `K,D` is a separate, fail-closed geometry gate. Each left/right profile
+must match the observed operating zoom, native frame resolution, physical camera serial,
+and stabilization state; zoom readback must also be present and fresh. Unknown or
+mismatched evidence blocks optical-pose solving/application and other derived geometry
+that claims this profile, while raw recording remains available. This distinction lets an
+experiment retain useful evidence without silently treating requested zoom or a legacy
+profile as runtime truth. Both intrinsics and extrinsics paths/hashes/source zooms and the
+same-/cross-/unknown-zoom classification remain in provenance.
+
+The Calibration workspace accepts an arbitrary supported visible zoom in `Selected zoom`,
+can apply it to both cameras, and can query each camera with `GZVV`. Requested and read-back
+values remain separate. A mismatch remains visible as evidence and makes exact operating
+`K,D` inapplicable to derived geometry; it does not prohibit preserving raw camera,
+telemetry, or session evidence.
+
+### HR Capture, import, and HR→OZ bridge
+
+The Recording workspace exposes one repeatable `HR Capture` action with an explicit
+`Pre`, `Post`, `Checkpoint`, or `Unspecified` purpose. Every press sends `SIHR TRUE`,
+triggers `CPTR` on the left and right cameras, and polls `ICPT` until each camera reports
+completion. The request/result timestamps, left-minus-right request timing, zoom readback,
+SDK responses, and completion state are appended to `<session>/hr_captures.jsonl`.
+A capture failure is evidence and does not block the measurement session.
+
+Capture initially leaves the photos in WIRIS internal storage. After retrieving them by an
+external camera-storage workflow, the operator selects the capture event and explicitly
+imports the left/right files. Workstation copies the exact original bytes into the session
+without image re-encoding, verifies that they decode, and records byte count, SHA-256,
+native resolution, camera side/serial, capture purpose, and import time. Imported HR is
+therefore comparison/PnP evidence, not an automatic replacement for the operating-zoom
+video image.
+
+Any later HR-to-operating-zoom transfer is per physical camera and has the explicit optical
+RDF contract `X_OZ = R_OZ_from_HR X_HR + T_OZ_from_HR`. A full-SE(3) bridge may transfer
+rotation and translation; a rotation-only bridge records translation as unobservable and
+must not transfer a stereo baseline. Bridge inputs, solver metrics, hashes, and pre/post
+comparison remain analysis evidence rather than a hidden calibration truth.
+
+### Optical pose initialization
+
+The fourth local tab of Alignment is `Optical pose`. Its workflow is:
+
+1. Capture a synchronized frozen native left/right reference burst. The exact operating
+   per-camera `K,D` applicability decision and the input image IDs/hashes are frozen with it.
+2. Annotate the actual horizon, a mountain-ridge polyline, or a Drone target point in native
+   OpenCV pixels (`u` right, `v` down). The frozen reference viewport is fixed at 16:9 with
+   a center crop (no side margins); this presentation transform does not alter saved
+   coordinates, and a small red hover dot shows the native pixel under the pointer.
+3. Select `Manual Horizon` or `Manual Mountain` to mark points directly. The corresponding
+   `Auto Horizon Roll/Pitch` and `Auto Mountain PnP` buttons remain available after manual
+   marking; they run the owner solver over the frozen evidence. Selecting Horizon disables
+   the Yaw DOF because a horizon cannot observe Yaw. Use Mountain PnP or live target-Drone
+   RTK with explicit camera/target line of sight for Yaw. Terrain PnP also requires a
+   declared vertical datum; a skyline alone is not promoted to a 3-D correspondence or
+   truth source.
+4. Inspect immutable candidates, residual/uncertainty evidence, warnings, and observable
+   degrees of freedom. Independent non-overlapping candidates may be combined.
+5. Apply only selected DOF that the candidate actually optimized and observed, or revert to
+   the previous immutable profile. The main KPI is right-minus-left optical boresight Yaw;
+   low numerical residual never overrides missing applicability/observability evidence.
+
+`Existing calibration` is a reference, not another Alignment solver. `Pre-run Calibration`
+creates and applies the checkerboard `K,D + R,t` bundle; Alignment reads the active profile and
+baseline as the prior/reference for optical-pose candidates and does not recalculate or overwrite
+that calibration in this tab. If the selected calibration is not the intended operating profile,
+the exact operating `K,D` applicability gate remains visible and derived geometry stays blocked.
+
+`Combine candidates` is an explicit composition step. The operator checks at least two immutable
+candidate IDs (for example, Horizon R/P plus Drone RTK Yaw); Alignment does not choose the latest
+candidate and does not average poses. The owner accepts the request only when all sources share the
+same explicit prior, the exact operating `K,D` profile, and non-overlapping optimized DOF. The
+result is a new immutable candidate with source IDs, hashes, and quality evidence; it is not applied
+automatically.
+
+The method contract is: purpose = initialize only the observable optical-pose DOF; runtime inputs =
+the frozen native image burst, the active exact operating `K,D/R,t` evidence, and the explicitly
+provided horizon, mountain/GNSS, or Drone RTK observations; output = an immutable candidate in PX4
+virtual-camera FRD to world NED; PASS = applicability, observability, prior, and method-specific
+input checks pass; FAIL = no candidate is applied and the reason remains visible. Calibration-time
+checkerboard results are reference evidence, not runtime ground truth.
+
+Pose uses PX4 virtual camera FRD to world NED; image measurements and stereo calibration
+remain OpenCV optical RDF. Workstation stores the candidate and selection history. It does
+not label a horizon, Drone RTK sample, nominal profile, or later UAM trajectory as ground
+truth.
+
+When Terrain PnP is pressed, the owner asks for a JSON object such as
+`{"left":{"object_points_ned_m":[[N,E,D],...]},"right":{"object_points_ned_m":[[N,E,D],...]}}`.
+The points must correspond one-for-one, in order, to the ridge points clicked in each frozen
+frame. Drone RTK Yaw similarly asks for per-side JSON such as
+`{"left":{"camera_center_ned_m":[N,E,D],"target_point_ned_m":[N,E,D],"timestamp_alignment_verified":true}}`;
+the right side may be supplied in the same object. A precomputed normalized ray and expected
+LOS may be supplied instead. These files are hashed into the candidate and are not promoted
+to live truth.
 
 `Random stereo-pair validation` repeats the same calculation on seeded subsets in the same
 background calculation slot. It assumes a completed full result and at least three matching
@@ -181,6 +283,21 @@ not change the existing recording command.
 State candidates: Idle, Starting, Recording, Stopping, Saved, Error.
 
 Record command is not proof that data is being written.
+
+Each run also freezes a nominal K,D/R,t profile at recording start. If an optical-pose
+selection becomes active later, the same immutable detection evidence is evaluated again
+with the active profile. Pair rows carry `nominal_*` and `active_*` validity, range, output
+frame, profile hash, selection ID, and effective pair boundary; an unprefixed legacy value
+continues to mean the active calculation. Pixhawk-baseline rows retain this dual-profile
+state as explicitly not-applicable rather than mixing GNSS geometry with checkerboard R,t.
+
+The Recording workspace includes a PX4 ULog evidence group for P1, P2, and Target Drone.
+Manual imports copy exact bytes into the session, validate ULog framing/size/SHA-256, and
+record source role, ownership claim, runtime identity, and relative path. Automatic logger
+capture is only allowed through an injected adapter that proves the same boot/connection,
+correlated command receipt, post-command status, and remote log path; pre-existing or
+ambiguous loggers are never stopped. UAM target ULog is normally `DEFERRED` until the
+external file is supplied.
 
 ## 9. Camera Configuration
 

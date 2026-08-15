@@ -18,7 +18,8 @@ from math import isfinite
 from PyQt5 import QtCore
 
 from Workstation.workstation_core.attitude_geometry import relative_attitude, world_ned_vector_to_body_frd
-from Workstation.workstation_core.calibration import StereoIntrinsicsResult
+from Workstation.workstation_core.calibration import StereoExtrinsics, StereoIntrinsicsResult, intrinsics_content_sha256
+from Workstation.workstation_core.optical_pose import stereo_pose_from_absolute
 from Workstation.workstation_core.gnss_operation import GnssOperationState, GnssReadinessSnapshot
 from Workstation.workstation_core.measurement_attempt import (
     AttitudeSnapshot,
@@ -46,6 +47,8 @@ from Workstation.workstation_core.triangulation import (
     body_frd_vector_to_camera,
     camera_translation_right_in_left_camera,
     invert_left_to_right_camera_transform,
+    triangulate_pixels_with_pixhawk_mount_attempt,
+    triangulate_pixels_with_relative_pose_attempt,
 )
 
 MEASUREMENT_VIEW_CONTROLLER_METHODS = [
@@ -79,6 +82,7 @@ MEASUREMENT_VIEW_CONTROLLER_METHODS = [
     "_capture_measurement_gnss_contract",
     "_measurement_gnss_record_metadata",
     "_refresh_distance",
+    "_geometry_comparison_rows",
     "_show_measurement_pair",
     "_clear_measurement_pair_display",
     "_clear_selected_runtime_measurement_pair",
@@ -625,13 +629,33 @@ class MeasurementViewController:
         right_pairing_timestamp_s = self.panel._yolo_match_timestamp_s(pair.right)
         if left_pairing_timestamp_s is None or right_pairing_timestamp_s is None:
             raise ValueError("matched detection pair has no timestamp on its selected basis")
-        key = detection_pair_key(
+        detection_key = detection_pair_key(
             triangulation_source=triangulation_source,
             timestamp_basis=timestamp_basis,
             left=pair.left,
             right=pair.right,
             left_pairing_timestamp_s=left_pairing_timestamp_s,
             right_pairing_timestamp_s=right_pairing_timestamp_s,
+        )
+        # A matched pair is only the observation identity.  Geometry profile
+        # selection is part of the attempt identity as well: otherwise a pose
+        # candidate applied to the same frozen detections could silently reuse
+        # a geometry-ready attempt produced with the previous R,t/K,D bundle.
+        intrinsics_math_sha256 = ""
+        if self.panel.active_intrinsics is not None:
+            try:
+                intrinsics_math_sha256 = intrinsics_content_sha256(
+                    self.panel.active_intrinsics
+                )
+            except (TypeError, ValueError):
+                intrinsics_math_sha256 = "invalid"
+        key = (
+            *detection_key,
+            "geometry_revision_v1",
+            intrinsics_math_sha256,
+            str(getattr(self.panel, "_active_intrinsics_profile_hash", "") or ""),
+            str(getattr(self.panel, "_active_extrinsics_profile_hash", "") or ""),
+            str(getattr(self.panel, "_active_optical_pose_profile_hash", "") or ""),
         )
         cached_attempt = (
             self.panel._last_measurement_attempt
@@ -914,7 +938,168 @@ class MeasurementViewController:
             else self.panel._fmt_record_float(readiness.get("timestamp_s"), 6),
         }
 
+    def _geometry_comparison_rows(self, pair) -> tuple[dict[str, object], ...]:
+        """Preview F/R/D/Range for every extrinsics source, side by side.
+
+        This never reads ``_distance_mode()`` and never touches
+        ``active_intrinsics``/``selected_extrinsics_profile`` — it is a
+        read-only comparison for the Measurement tab, independent of which
+        source is officially selected for the recorded measurement.
+        """
+
+        intrinsics = self.panel.active_intrinsics
+        if intrinsics is None:
+            return ()
+        left_pixel = pair.left.center
+        right_pixel = pair.right.center
+        rows: list[dict[str, object]] = []
+
+        def add_row(label: str, attempt: object | None, *, provenance_note: str = "") -> None:
+            suffix = f" · {provenance_note}" if provenance_note else ""
+            if attempt is None:
+                rows.append(
+                    {
+                        "method": label,
+                        "forward_m": None,
+                        "right_m": None,
+                        "down_m": None,
+                        "range_m": None,
+                        "status": f"waiting for inputs{suffix}",
+                    }
+                )
+                return
+            result = attempt.result
+            if result is None:
+                rows.append(
+                    {
+                        "method": label,
+                        "forward_m": None,
+                        "right_m": None,
+                        "down_m": None,
+                        "range_m": None,
+                        "status": f"{attempt.reason}{suffix}",
+                    }
+                )
+                return
+            forward_m, right_m, down_m = result.point_m
+            rows.append(
+                {
+                    "method": label,
+                    "forward_m": forward_m,
+                    "right_m": right_m,
+                    "down_m": down_m,
+                    "range_m": result.range_m,
+                    "status": f"{attempt.reason}{suffix}",
+                }
+            )
+
+        def relative_pose_attempt(
+            rotation_left_to_right: object, translation_left_to_right_m: object
+        ) -> object:
+            rotation_right_to_left, translation_right_in_left_m = invert_left_to_right_camera_transform(
+                rotation_left_to_right,
+                translation_left_to_right_m,
+            )
+            return triangulate_pixels_with_relative_pose_attempt(
+                left_pixel=left_pixel,
+                right_pixel=right_pixel,
+                left_intrinsics=intrinsics.left,
+                right_intrinsics=intrinsics.right,
+                rotation_right_to_left=rotation_right_to_left,
+                translation_right_in_left_m=translation_right_in_left_m,
+            )
+
+        # 1) Pixhawk attitude + live RTK GNSS baseline (always evaluated live,
+        # independent of the Distance Mode toggle).
+        left_ext = self.panel.latest_extrinsics.get("left")
+        right_ext = self.panel.latest_extrinsics.get("right")
+        baseline = self.panel.latest_rtk_baseline
+        pixhawk_attempt = None
+        if left_ext is not None and baseline is not None:
+            usable, _reason = self.panel._gps_baseline_usable_for_translation(baseline)
+            if usable:
+                world_vector = (baseline.north_m, baseline.east_m, baseline.down_m)
+                translation_right_in_left_m = camera_translation_right_in_left_camera(
+                    baseline_right_in_left_world_m=world_vector,
+                    left_body_to_world_q=left_ext.q,
+                    right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
+                    scale_to_m=None,
+                )
+                pixhawk_attempt = triangulate_pixels_with_pixhawk_mount_attempt(
+                    left_pixel=left_pixel,
+                    right_pixel=right_pixel,
+                    left_intrinsics=intrinsics.left,
+                    right_intrinsics=intrinsics.right,
+                    left_body_to_world_q=left_ext.q,
+                    right_body_to_world_q=right_ext.q if right_ext is not None else left_ext.q,
+                    translation_right_in_left_m=translation_right_in_left_m,
+                )
+        add_row("Pixhawk + RTK (live)", pixhawk_attempt)
+
+        # 2) Checkerboard stereoCalibrate profile, kept in its own slot so a
+        # later PnP apply cannot overwrite it here.
+        checkerboard_profile = getattr(self.panel, "checkerboard_extrinsics_profile", None)
+        checkerboard_attempt = (
+            None
+            if checkerboard_profile is None
+            else relative_pose_attempt(
+                checkerboard_profile.extrinsics.rotation_left_to_right,
+                checkerboard_profile.extrinsics.translation_left_to_right_m,
+            )
+        )
+        add_row("Checkerboard", checkerboard_attempt)
+
+        # 3) The last applied Optical Pose / PnP profile, kept in its own slot.
+        applied_profile = getattr(self.panel, "optical_pose_extrinsics_profile", None)
+        applied_attempt = (
+            None
+            if applied_profile is None
+            else relative_pose_attempt(
+                applied_profile.extrinsics.rotation_left_to_right,
+                applied_profile.extrinsics.translation_left_to_right_m,
+            )
+        )
+        add_row(
+            "PnP active"
+            if applied_profile is None
+            else f"PnP active ({applied_profile.method})",
+            applied_attempt,
+        )
+
+        # 4) Every unapplied PnP candidate (latest solve per method), so an
+        # operator can compare Horizon/Mountain/Drone-yaw/Combined solves
+        # before deciding whether to apply one.
+        candidate_poses = self.panel.workstation_optical_pose_candidate_poses()
+        for candidate_row in candidate_poses:
+            stereo = stereo_pose_from_absolute(
+                candidate_row["left_pose_ned"],
+                candidate_row["right_pose_ned"],
+            )
+            attempt = relative_pose_attempt(
+                [list(row) for row in stereo.rotation_right_from_left_rdf],
+                list(stereo.translation_right_from_left_rdf_m),
+            )
+            # Horizon/Drone-yaw-style solves only optimize a subset of the 6
+            # pose DOF; every unselected axis in left/right_pose_ned is a
+            # verbatim copy of the prior pose, not something this candidate
+            # measured. Label the row so a full-looking F/R/D/Rg is never
+            # mistaken for an independent measurement when it is not.
+            optimized = tuple(candidate_row.get("optimized_dofs", ()))
+            translation_observed = bool(set(optimized) & {"north_m", "east_m", "down_m"})
+            observed_text = ",".join(optimized) if optimized else "none"
+            if translation_observed:
+                note = f"observed={observed_text}"
+            else:
+                note = (
+                    f"observed={observed_text} — Range/F/R/D는 prior 기준선 그대로 상속됨, "
+                    "이 방식이 측정한 값 아님"
+                )
+            add_row(f"PnP candidate: {candidate_row['method']}", attempt, provenance_note=note)
+
+        return tuple(rows)
+
     def _refresh_distance(self) -> None:
+        self.panel.geometry_comparison_rows = ()
         if self.panel._rtsp_urls_are_same_stream():
             self.panel._clear_measurement_pair_display()
             self.panel._clear_triangulation_quality("좌/우 RTSP URL이 동일해 3D ray 품질을 표시할 수 없습니다.")
@@ -935,6 +1120,12 @@ class MeasurementViewController:
                 detail=self.panel._detection_wait_detail(),
             )
             return
+        try:
+            self.panel.geometry_comparison_rows = self.panel._geometry_comparison_rows(pair)
+        except (TypeError, ValueError):
+            # A comparison-only preview must never block the official
+            # measurement pipeline below it.
+            self.panel.geometry_comparison_rows = ()
         gnss_measurement_block_reason: str | None = None
         gnss_measurement_block_warnings: tuple[str, ...] = ()
         if self.panel.gnss_operation_gate_active:

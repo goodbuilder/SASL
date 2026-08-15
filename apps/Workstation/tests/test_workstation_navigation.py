@@ -5,16 +5,15 @@ from PyQt5 import QtCore, QtWidgets
 from Workstation.navigation import NavigationTree
 
 
-def test_navigation_uses_paired_contexts_and_protocol_first_order() -> None:
+def test_navigation_uses_paired_contexts_without_protocol_page() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     tree = NavigationTree()
     root = tree.model.item(0, 0)
 
     assert [root.child(row).text() for row in range(root.rowCount())] == [
         "Overview",
-        "Protocol",
-        "Pre-run Calibration",
         "Devices",
+        "Calibration",
         "Alignment",
         "Measurement",
         "Recording / Sessions",
@@ -22,10 +21,11 @@ def test_navigation_uses_paired_contexts_and_protocol_first_order() -> None:
         "Settings",
         "Diagnostics",
     ]
-    devices = root.child(3)
+    devices = root.child(1)
     assert [devices.child(row).text() for row in range(devices.rowCount())] == [
         "Cameras",
         "Pixhawk",
+        "Telemetry",
         "Base GNSS",
         "Time / Sync",
     ]
@@ -39,6 +39,7 @@ def test_navigation_uses_paired_contexts_and_protocol_first_order() -> None:
         "processing.synchronization": "devices.time",
         "tasks.playback": "tasks.recording",
         "tasks.export": "tasks.recording",
+        "processing.experiment": "overview",
     }.items():
         assert tree.select_context(legacy_id)
         assert tree.currentIndex().data(QtCore.Qt.UserRole) == canonical_id

@@ -9,8 +9,16 @@ from typing import Any, Iterator, Mapping
 
 from PyQt5 import QtCore
 
+from Workstation.workstation_core.gnss_monitor import (
+    NtripHealthState,
+    evaluate_ntrip_health,
+)
 
-LRF_STALE_AFTER_S = 1.0
+
+# LRF reads are on-demand (a manual Alignment button click), not a
+# continuous 1 Hz poll, so a reading stays "LIVE" for a while after the
+# query that produced it rather than going stale within one poll period.
+LRF_STALE_AFTER_S = 60.0
 
 
 class StatusSeverity(str, Enum):
@@ -180,6 +188,7 @@ class BackendStatusAdapter(QtCore.QObject):
             self._refresh_pixhawk(panel, "left", "P1", now_s)
             self._refresh_pixhawk(panel, "right", "P2", now_s)
             self._refresh_base_gnss(panel, now_s)
+            self._refresh_ntrip(panel, now_s)
             self._refresh_gnss(panel, now_s)
             self._refresh_detection(panel, now_s)
             self._refresh_synchronization(panel, now_s)
@@ -340,6 +349,88 @@ class BackendStatusAdapter(QtCore.QObject):
             source="GnssOperationManager + Base serial/NTRIP/RTCM/NAV-SVIN evidence",
             age_s=frame_age_s,
             clock="app_receive_monotonic; Base WGS84/Survey ECEF contracts remain separate",
+            observed_monotonic_s=now_s,
+        )
+
+    def _refresh_ntrip(self, panel: object, now_s: float) -> None:
+        manager = getattr(panel, "gnss_operation_manager", None)
+        config = getattr(manager, "config", None)
+        mode = str(
+            getattr(getattr(config, "operation_mode", None), "value", "UNKNOWN")
+            or "UNKNOWN"
+        ).upper()
+        network_mode = mode in {"NETWORK_ASSISTED_FIXED_BASE", "NETWORK_RTK_DIRECT"}
+        network_config = getattr(config, "network", None)
+        readiness_config = getattr(config, "readiness", None)
+        base_stats = getattr(panel, "gnss_base_rtcm_stats", {}) or {}
+        base_stats = base_stats if isinstance(base_stats, Mapping) else {}
+        stream_stats = getattr(panel, "gnss_network_stats", None)
+        phase = str(getattr(panel, "gnss_network_phase", "DISCONNECTED") or "DISCONNECTED")
+        health = evaluate_ntrip_health(
+            network_mode=network_mode,
+            connected=bool(getattr(panel, "gnss_network_connected", False)),
+            running=getattr(panel, "gnss_network_thread", None) is not None,
+            phase=phase,
+            connected_at_s=getattr(stream_stats, "connected_at_monotonic_s", None),
+            last_chunk_s=getattr(stream_stats, "last_chunk_monotonic_s", None),
+            last_rtcm_s=base_stats.get("last_frame_s"),
+            now_s=now_s,
+            transport_stale_after_s=float(getattr(network_config, "read_timeout_s", 10.0) or 10.0),
+            correction_stale_after_s=float(
+                getattr(readiness_config, "maximum_correction_age_s", 3.0) or 3.0
+            ),
+            bytes_received=getattr(stream_stats, "bytes_received", 0),
+            chunks_received=getattr(stream_stats, "chunks_received", 0),
+            reconnect_count=getattr(panel, "gnss_network_reconnect_count", 0),
+            last_error=str(getattr(panel, "gnss_network_last_error", "") or ""),
+        )
+        severity = {
+            NtripHealthState.DISABLED: StatusSeverity.INFO,
+            NtripHealthState.DISCONNECTED: StatusSeverity.UNKNOWN,
+            NtripHealthState.CONNECTING: StatusSeverity.WARN,
+            NtripHealthState.CONNECTED_NO_DATA: StatusSeverity.WARN,
+            NtripHealthState.STREAMING: StatusSeverity.WARN,
+            NtripHealthState.RTCM_ACTIVE: StatusSeverity.OK,
+            NtripHealthState.RTCM_STALE: StatusSeverity.BAD,
+            NtripHealthState.STALE: StatusSeverity.BAD,
+            NtripHealthState.RECONNECTING: StatusSeverity.WARN,
+            NtripHealthState.ERROR: StatusSeverity.BAD,
+        }[health.state]
+        chunks = health.chunks_received
+        byte_rate = (
+            health.bytes_received / health.session_age_s
+            if health.session_age_s is not None and health.session_age_s > 0.0
+            else 0.0
+        )
+        detail_parts = [
+            f"phase={phase}",
+            f"connected={'yes' if bool(getattr(panel, 'gnss_network_connected', False)) else 'no'}",
+            f"chunks={chunks}",
+            f"bytes={health.bytes_received}",
+            f"rate={byte_rate:.1f} B/s",
+        ]
+        if health.transport_age_s is not None:
+            detail_parts.append(f"last chunk={health.transport_age_s:.2f}s")
+        else:
+            detail_parts.append("last chunk=--")
+        if health.rtcm_age_s is not None:
+            detail_parts.append(f"RTCM age={health.rtcm_age_s:.2f}s")
+        else:
+            detail_parts.append("RTCM age=--")
+        detail_parts.append(
+            f"reconnects={health.reconnect_count}"
+        )
+        if health.last_error:
+            detail_parts.append(f"error={health.last_error}")
+        self.model.set_status(
+            "gnss.ntrip",
+            "NTRIP",
+            health.state.value,
+            severity,
+            detail="; ".join(detail_parts),
+            source="NtripNetworkWorker + NtripStreamStats + RTCM parser",
+            age_s=health.rtcm_age_s if health.rtcm_age_s is not None else health.transport_age_s,
+            clock="app_receive_monotonic; caster transport and parsed RTCM are separate",
             observed_monotonic_s=now_s,
         )
 

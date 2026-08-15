@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from PyQt5 import QtCore, QtWidgets
@@ -52,6 +51,105 @@ class StandalonePanelBackend(QtCore.QObject):
     def save_session(self) -> Any:
         return self._call("save_distance_history_csv")
 
+    def apply_run_setup(self, values: dict[str, object]) -> Any:
+        return self._call("apply_workstation_run_setup", dict(values))
+
+    def run_setup_snapshot(self) -> Any:
+        return self._call("workstation_run_setup_snapshot")
+
+    def optical_pose_snapshot(self, *, include_frames: bool = True) -> Any:
+        return self._call(
+            "workstation_optical_pose_snapshot",
+            include_frames=bool(include_frames),
+        )
+
+    def optical_pose_capture_burst(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "capture_workstation_optical_pose_burst",
+            dict(payload or {}),
+        )
+
+    def optical_pose_import_burst(self, payload: dict[str, object]) -> Any:
+        return self._call("import_workstation_optical_pose_burst", dict(payload))
+
+    def optical_pose_import_terrain(self, payload: dict[str, object]) -> Any:
+        return self._call("import_workstation_optical_pose_terrain", dict(payload))
+
+    def optical_pose_solve_horizon(self, payload: dict[str, object]) -> Any:
+        return self._call("solve_workstation_optical_pose_horizon", dict(payload))
+
+    def optical_pose_solve_terrain(self, payload: dict[str, object]) -> Any:
+        return self._call("solve_workstation_optical_pose_terrain", dict(payload))
+
+    def optical_pose_solve_gnss_mountain(self, payload: dict[str, object]) -> Any:
+        return self._call("solve_workstation_optical_pose_gnss_mountain", dict(payload))
+
+    def optical_pose_solve_drone_yaw(self, payload: dict[str, object]) -> Any:
+        return self._call("solve_workstation_optical_pose_drone_yaw", dict(payload))
+
+    def optical_pose_solve_combined(self, payload: dict[str, object]) -> Any:
+        return self._call("solve_workstation_optical_pose_combined", dict(payload))
+
+    def optical_pose_auto_select_horizon(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "auto_select_workstation_optical_pose_horizon",
+            dict(payload or {}),
+        )
+
+    def optical_pose_auto_select_mountain(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "auto_select_workstation_optical_pose_mountain",
+            dict(payload or {}),
+        )
+
+    def optical_pose_accept_suggestion(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "accept_workstation_optical_pose_suggestion",
+            dict(payload),
+        )
+
+    def optical_pose_record_annotation(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "record_workstation_optical_pose_annotation",
+            dict(payload),
+        )
+
+    def optical_pose_apply_candidate(self, payload: dict[str, object]) -> Any:
+        return self._call("apply_workstation_optical_pose_candidate", dict(payload))
+
+    def optical_pose_revert(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call("revert_workstation_optical_pose", dict(payload or {}))
+
+    def target_drone_configure(self, payload: dict[str, object]) -> Any:
+        return self._call("configure_target_drone_stream", dict(payload))
+
+    def target_drone_connect(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call("connect_target_drone_stream", None if payload is None else dict(payload))
+
+    def target_drone_stop(self, *, timeout_s: float | None = None) -> Any:
+        return self._call("stop_target_drone_stream", timeout_s=timeout_s)
+
+    def target_drone_snapshot(self) -> Any:
+        return self._call("target_drone_stream_snapshot")
+
+    def drone_telemetry_configure(self, payload: dict[str, object]) -> Any:
+        return self._call("configure_drone_telemetry", dict(payload))
+
+    def drone_telemetry_connect(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call("connect_drone_telemetry", None if payload is None else dict(payload))
+
+    def drone_telemetry_disconnect(self) -> Any:
+        return self._call("disconnect_drone_telemetry")
+
+    def drone_telemetry_save_settings(self, payload: dict[str, object]) -> Any:
+        return self._call("save_drone_telemetry_settings", dict(payload))
+
+    def drone_telemetry_snapshot(self) -> Any:
+        return self._call("drone_telemetry_snapshot")
+
+    def drone_telemetry_discover_usb(self) -> Any:
+        return self._call("discover_drone_telemetry_usb")
+
     # Operation facades delegate to the standalone panel owner.  The
     # Workstation has one camera/telemetry worker per runtime; sibling
     # applications keep independent resource owners.
@@ -95,8 +193,17 @@ class StandalonePanelBackend(QtCore.QObject):
     def pixhawk_toggle_mavlink(self) -> Any:
         return self._call("toggle_mavlink_connection")
 
+    def pixhawk_connect_mavlink(self) -> Any:
+        return self._call("connect_mavlink_pixhawk")
+
+    def pixhawk_disconnect_mavlink(self) -> Any:
+        return self._call("disconnect_mavlink_pixhawk")
+
     def pixhawk_reset_level_calibration(self) -> Any:
         return self._call("reset_px4_level_calibration")
+
+    def pixhawk_reset_calibration(self, camera: str, group: str) -> Any:
+        return self._call("reset_px4_calibration_group", camera, group)
 
     def pixhawk_recover_eth_mavlink(self, camera: str) -> Any:
         """Recover one PX4 Ethernet MAVLink stream through its USB shell path."""
@@ -148,6 +255,27 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def calibration_toggle_auto_capture(self) -> Any:
         return self._call("toggle_auto_calibration_capture")
+
+    def capture_pnp_hr_photos(self, purpose: str = "unspecified") -> Any:
+        return self._call("capture_pnp_hr_photos", purpose)
+
+    def capture_pnp_oz_photos(self, purpose: str = "unspecified") -> Any:
+        return self._call("capture_pnp_oz_photos", purpose)
+
+    def import_hr_files(self, capture_id: str, **values: object) -> Any:
+        return self._call("import_hr_files", capture_id, **values)
+
+    def ulog_snapshot(self) -> Any:
+        return self._call("workstation_ulog_snapshot")
+
+    def ulog_import(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "import_workstation_ulog",
+            str(payload.get("source") or "p1"),
+            str(payload.get("path") or ""),
+            ownership=str(payload.get("ownership") or "UNKNOWN"),
+            expected_sha256=payload.get("expected_sha256"),
+        )
 
     def calibration_run_intrinsic(self) -> Any:
         return self._call("run_intrinsic_calibration")
@@ -238,15 +366,10 @@ class StandalonePanelBackend(QtCore.QObject):
     def advanced_wiris_catalog(self) -> Any:
         return self._call("workstation_wiris_command_catalog")
 
-    def start_lrf_polling(self) -> Any:
-        """Start the Alignment-only WIRIS GLRD polling worker."""
+    def query_lrf_once(self) -> Any:
+        """Run one on-demand WIRIS GLRD read, triggered by the Alignment LRF button."""
 
-        return self._call("start_wiris_lrf_polling")
-
-    def stop_lrf_polling(self) -> Any:
-        """Stop GLRD polling when the Alignment workspace is not visible."""
-
-        return self._call("stop_wiris_lrf_polling", wait=False)
+        return self._call("query_wiris_lrf_once")
 
     def advanced_send_wiris_command(self, target: str, command: str, terminator: str) -> Any:
         return self._call("workstation_send_wiris_command", target, command, terminator)
@@ -274,6 +397,9 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def advanced_refresh_px4_attitude_cal(self, camera: str, *, read_params: bool = True) -> Any:
         return self._call("workstation_refresh_px4_attitude_cal", camera, read_params=read_params)
+
+    def advanced_refresh_px4_calibration_params(self, camera: str, *, read_params: bool = True) -> Any:
+        return self._call("workstation_refresh_px4_calibration_params", camera, read_params=read_params)
 
     def advanced_apply_px4_mag_priorities(self, camera: str, priorities: dict[str, int]) -> Any:
         return self._call("workstation_apply_px4_mag_priorities", camera, dict(priorities))

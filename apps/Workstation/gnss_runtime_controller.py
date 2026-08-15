@@ -17,6 +17,11 @@ from Workstation.gnss_runtime_workers import (
     GnssBaseSerialWorker,
     NtripNetworkWorker,
 )
+from Workstation.drone_telemetry_controller import (
+    DRONE_RTCM_SOURCE_BASE,
+    DRONE_RTCM_SOURCE_NTRIP,
+    normalize_drone_rtcm_source,
+)
 from Workstation.device_runtime_workers import PixhawkRtcmInjectionWorker
 from Workstation.telemetry_plots import TelemetryHistoryPoint
 from Workstation.workstation_core.fixed_base_initializer import FixedBaseInitializer
@@ -69,6 +74,7 @@ GNSS_RUNTIME_CONTROLLER_METHODS = [
     "start_gnss_network",
     "stop_gnss_network",
     "_handle_gnss_network_connected",
+    "_handle_gnss_network_stats",
     "_handle_gnss_network_chunk",
     "_handle_gnss_network_failed",
     "_handle_gnss_network_reconnecting",
@@ -219,7 +225,6 @@ class GnssRuntimeController:
             height_value = HeightType.ELLIPSOID.value
         target = str(self.panel.gnss_base_rtcm_target_combo.currentData() or "disabled")
         mapping = previous.to_mapping()
-        mapping.pop("require_drone_rtk_fixed", None)
         mapping.update(
             {
                 "site_label": self.panel.gnss_site_label_edit.text().strip(),
@@ -255,7 +260,6 @@ class GnssRuntimeController:
                     **previous.routing.to_mapping(),
                     "left_enabled": target in {"both", "left"},
                     "right_enabled": target in {"both", "right"},
-                    "drone_enabled": False,
                     "field_base_enabled": self.panel._gnss_selected_operation_mode()
                     == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE,
                 },
@@ -477,7 +481,11 @@ class GnssRuntimeController:
         self.panel.gnss_operation_gate_active = True
         self.panel.gnss_active_operation_config = config
         self.panel.gnss_network_connected = False
+        self.panel.gnss_network_phase = "CONNECTING"
+        self.panel.gnss_network_stats = None
         self.panel.gnss_network_status_line = ""
+        self.panel.gnss_network_last_error = ""
+        self.panel.gnss_network_reconnect_count = 0
         self.panel.gnss_network_rtcm_parser = Rtcm3StreamParser()
         self.panel.gnss_coordinate_samples.clear()
         if hasattr(self.panel, "gnss_base_fixed_state_plot"):
@@ -502,6 +510,7 @@ class GnssRuntimeController:
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.connected.connect(self.panel._handle_gnss_network_connected)
+        worker.stats_changed.connect(self.panel._handle_gnss_network_stats)
         worker.chunk_received.connect(self.panel._handle_gnss_network_chunk)
         worker.reconnecting.connect(self.panel._handle_gnss_network_reconnecting)
         worker.failed.connect(self.panel._handle_gnss_network_failed)
@@ -518,6 +527,7 @@ class GnssRuntimeController:
             worker.request_stop()
         thread = self.panel.gnss_network_thread
         self.panel.gnss_network_connected = False
+        self.panel.gnss_network_phase = "STOPPED"
         self.panel.latest_gnss_base_position = None
         self.panel.gnss_operation_gate_active = False
         self.panel.gnss_operation_manager.stop()
@@ -536,33 +546,65 @@ class GnssRuntimeController:
 
     def _handle_gnss_network_connected(self, status_line: str, stats: object) -> None:
         self.panel.gnss_network_connected = True
+        self.panel.gnss_network_phase = "CONNECTED"
+        self.panel.gnss_network_stats = stats
+        self.panel.gnss_network_last_error = ""
         self.panel.gnss_network_status_line = str(status_line)
         self.panel._gnss_transition(GnssOperationState.NTRIP_ACTIVE, f"NTRIP active: {status_line}")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"{status_line} | RTCM 대기", "good")
+
+    def _handle_gnss_network_stats(self, stats: object) -> None:
+        self.panel.gnss_network_stats = stats
+        if (
+            self.panel.gnss_network_connected
+            and getattr(stats, "last_chunk_monotonic_s", None) is not None
+        ):
+            self.panel.gnss_network_phase = "STREAMING"
 
     def _handle_gnss_network_chunk(self, chunk: object) -> None:
         if not isinstance(chunk, (bytes, bytearray)):
             return
         payload = bytes(chunk)
         mode = self.panel._gnss_active_operation_config().operation_mode
+        frames = self.panel.gnss_network_rtcm_parser.feed(payload)
         if mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
             worker = self.panel.gnss_base_serial_worker
             if worker is None or not self.panel.gnss_base_serial_connected:
-                self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "NTRIP 수신 중이나 Base serial이 끊겼습니다", "bad")
-                return
-            worker.send_bytes("NTRIP RTCM -> fixed base", payload)
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP {len(payload)} bytes -> fixed base", "good")
+                self.panel._set_health_label(
+                    self.panel.gnss_base_status_labels["network"],
+                    "NTRIP 수신 중이나 Base serial이 끊겼습니다",
+                    "bad",
+                )
+            else:
+                worker.send_bytes("NTRIP RTCM -> fixed base", payload)
+                self.panel._set_health_label(
+                    self.panel.gnss_base_status_labels["network"],
+                    f"NTRIP {len(payload)} bytes -> fixed base",
+                    "good",
+                )
+            # Assisted Fixed Base still forwards the raw NTRIP stream to the
+            # Base receiver. If Drone is configured to use Network NTRIP, its
+            # complete RTCM frames are also delivered independently, without
+            # changing the existing P1/P2 rover route.
+            if frames and self._drone_rtcm_source() == DRONE_RTCM_SOURCE_NTRIP:
+                for frame in frames:
+                    self.panel._handle_gnss_base_rtcm_frame(
+                        frame,
+                        source=DRONE_RTCM_SOURCE_NTRIP,
+                        include_rover_targets=False,
+                    )
             return
-        frames = self.panel.gnss_network_rtcm_parser.feed(payload)
         if not frames:
             self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP raw {len(payload)} bytes | RTCM frame 대기", "warn")
             return
         for frame in frames:
-            self.panel._handle_gnss_base_rtcm_frame(frame)
+            self.panel._handle_gnss_base_rtcm_frame(frame, source=DRONE_RTCM_SOURCE_NTRIP)
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP RTCM {len(frames)} frame 수신", "good")
 
     def _handle_gnss_network_failed(self, message: str) -> None:
         self.panel.gnss_network_connected = False
+        self.panel.gnss_network_phase = "ERROR"
+        self.panel.gnss_network_last_error = str(message)
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP 실패: {message}", "bad")
         self.panel._gnss_transition(GnssOperationState.FAULT, f"NTRIP failure: {message}")
 
@@ -570,6 +612,11 @@ class GnssRuntimeController:
         if not self.panel.gnss_operation_gate_active:
             return
         self.panel.gnss_network_connected = False
+        self.panel.gnss_network_phase = "RECONNECTING"
+        self.panel.gnss_network_last_error = str(message)
+        self.panel.gnss_network_reconnect_count = int(
+            getattr(self.panel, "gnss_network_reconnect_count", 0) or 0
+        ) + 1
         self.panel._set_health_label(
             self.panel.gnss_base_status_labels["network"],
             f"NTRIP 재연결 대기: {message}",
@@ -581,6 +628,8 @@ class GnssRuntimeController:
             self.panel.gnss_network_thread = None
             self.panel.gnss_network_worker = None
             self.panel.gnss_network_connected = False
+            if getattr(self.panel, "gnss_network_phase", "") != "ERROR":
+                self.panel.gnss_network_phase = "STOPPED"
             self.panel.gnss_active_operation_config = None
             self.panel._set_gnss_operation_controls_locked(False)
             if hasattr(self.panel, "gnss_network_start_button"):
@@ -1266,7 +1315,7 @@ class GnssRuntimeController:
         injection_parts: list[str] = []
         total_packets = 0
         total_fail = 0
-        for side, label in (("left", "L"), ("right", "R")):
+        for side, label in (("left", "L"), ("right", "R"), ("drone", "D")):
             side_stats = injection.get(side) if isinstance(injection, dict) else None
             if not isinstance(side_stats, dict):
                 side_stats = {}
@@ -1277,7 +1326,11 @@ class GnssRuntimeController:
             total_packets += side_packets
             total_fail += side_fail
             injection_parts.append(f"{label} frames={side_frames} bytes={side_bytes} fail={side_fail}")
-        target_sides = self.panel._gnss_base_rtcm_target_sides() if hasattr(self.panel, "gnss_base_rtcm_target_combo") else ()
+        target_sides = (
+            self.panel._gnss_base_rtcm_target_sides(source=self._drone_rtcm_source())
+            if hasattr(self.panel, "gnss_base_rtcm_target_combo")
+            else ()
+        )
         if not target_sides:
             injection_text = "비활성"
             injection_level = "idle"
@@ -1356,20 +1409,63 @@ class GnssRuntimeController:
             constellation_level,
         )
 
-    def _gnss_base_rtcm_target_sides(self) -> tuple[str, ...]:
+    def _drone_rtcm_source(self) -> str:
+        return normalize_drone_rtcm_source(
+            getattr(self.panel, "drone_telemetry_rtcm_source", DRONE_RTCM_SOURCE_BASE)
+        )
+
+    def _drone_rtcm_route_enabled(self) -> bool:
+        config = getattr(self.panel, "gnss_active_operation_config", None)
+        if config is None:
+            builder = getattr(self.panel, "_build_gnss_operation_config", None)
+            if callable(builder):
+                try:
+                    config = builder()
+                except (AttributeError, TypeError, ValueError):
+                    config = None
+        routing = getattr(config, "routing", None)
+        return bool(getattr(routing, "drone_enabled", False))
+
+    def _drone_rtcm_target_sides(self, source: str) -> tuple[str, ...]:
+        if normalize_drone_rtcm_source(source) != self._drone_rtcm_source():
+            return ()
+        if not self._drone_rtcm_route_enabled():
+            return ()
+        if not bool(getattr(self.panel, "drone_telemetry_rtcm_forward", False)):
+            return ()
+        subscriber = getattr(self.panel, "mavlink_pixhawk", None)
+        connections = getattr(subscriber, "connections", {}) if subscriber is not None else {}
+        if isinstance(connections, dict) and "drone" in connections:
+            return ("drone",)
+        return ()
+
+    def _gnss_base_rtcm_target_sides(
+        self,
+        *,
+        source: str = DRONE_RTCM_SOURCE_BASE,
+        include_rover_targets: bool = True,
+    ) -> tuple[str, ...]:
         config = self.panel.gnss_active_operation_config
-        if config is not None:
-            return tuple(
+        if not include_rover_targets:
+            targets: tuple[str, ...] = ()
+        elif config is not None:
+            targets = tuple(
                 side
                 for side, enabled in (("left", config.routing.left_enabled), ("right", config.routing.right_enabled))
                 if enabled
             )
-        target = str(self.panel.gnss_base_rtcm_target_combo.currentData() or "disabled")
-        if target == "both":
-            return ("left", "right")
-        if target in {"left", "right"}:
-            return (target,)
-        return ()
+        else:
+            target = str(self.panel.gnss_base_rtcm_target_combo.currentData() or "disabled")
+            if target == "both":
+                targets = ("left", "right")
+            elif target in {"left", "right"}:
+                targets = (target,)
+            else:
+                targets = ()
+        # Drone Telemetry is appended only when the GNSS routing target is
+        # enabled, this frame came from the source selected for the active
+        # Drone link, forwarding is enabled, and the MAVLink endpoint is open.
+        return tuple(dict.fromkeys((*targets, *self._drone_rtcm_target_sides(source))))
 
     def _record_gnss_base_rtcm_frame(self, payload: bytes) -> None:
         stats = self.panel.gnss_base_rtcm_stats
@@ -1407,7 +1503,13 @@ class GnssRuntimeController:
         side_stats["packets"] = int(side_stats.get("packets") or 0) + int(packet_count)
         side_stats["last_delivery_s"] = time.monotonic()
 
-    def _handle_gnss_base_rtcm_frame(self, frame: object) -> None:
+    def _handle_gnss_base_rtcm_frame(
+        self,
+        frame: object,
+        *,
+        source: str = DRONE_RTCM_SOURCE_BASE,
+        include_rover_targets: bool = True,
+    ) -> None:
         if not isinstance(frame, (bytes, bytearray)):
             return
         payload = bytes(frame)
@@ -1417,7 +1519,10 @@ class GnssRuntimeController:
             and parse_rtcm3_message_type(payload) in {1005, 1006}
         ):
             self.panel.gnss_fixed_base_reconfigure_rtcm = True
-        target_sides = self.panel._gnss_base_rtcm_target_sides()
+        target_sides = self.panel._gnss_base_rtcm_target_sides(
+            source=source,
+            include_rover_targets=include_rover_targets,
+        )
         if not target_sides:
             self.panel._set_health_label(self.panel.gnss_base_status_labels["rtcm_injection"], "비활성", "idle")
             self.panel._refresh_gnss_base_rtcm_stats()

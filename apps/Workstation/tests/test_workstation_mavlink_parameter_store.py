@@ -11,7 +11,7 @@ from Workstation.workstation_core.mavlink_parameter_store import (
 def test_integer_store_requires_matching_readback():
     calls = []
     subscriber = SimpleNamespace(
-        read_param_int=lambda camera, name, timeout_s: calls.append(
+        read_param=lambda camera, name, timeout_s: calls.append(
             ("read", camera, name, timeout_s)
         ) or 7,
         set_param_int=lambda camera, name, value, timeout_s: calls.append(
@@ -21,6 +21,7 @@ def test_integer_store_requires_matching_readback():
     store = MavlinkParameterStore(subscriber, "left")
 
     assert store.get_param("CAL_MAG0_ID") == 7
+    assert calls[-1] == ("read", "left", "CAL_MAG0_ID", 1.5)
     store.set_param("CAL_MAG0_PRIO", 50.9)
     assert calls[-1] == ("set", "left", "CAL_MAG0_PRIO", 50, 2.0)
 

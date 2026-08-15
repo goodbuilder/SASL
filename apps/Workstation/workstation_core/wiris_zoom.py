@@ -20,6 +20,27 @@ SET_SUBNET_MASK_TEMPLATE = "STMS {mask}"
 REBOOT_COMMAND = "REBT"
 MIN_ZOOM_LEVEL = 0
 MAX_ZOOM_LEVEL = 14
+# Nominal 1280x720 WIRIS visible-camera focal lengths.  Calibrated intrinsics
+# remain preferred when they match the active zoom; these values keep
+# zoom-dependent reference calculations usable before a calibration bundle is
+# loaded.
+VISIBLE_ZOOM_FX_ESTIMATES = (
+    (0, 1.0, 1030),
+    (1, 1.2, 1236),
+    (2, 1.5, 1545),
+    (3, 2.0, 2060),
+    (4, 3.0, 3091),
+    (5, 4.0, 4121),
+    (6, 5.0, 5151),
+    (7, 6.0, 6181),
+    (8, 8.0, 8242),
+    (9, 10.0, 10302),
+    (10, 12.0, 12362),
+    (11, 16.0, 16483),
+    (12, 20.0, 20604),
+    (13, 25.0, 25755),
+    (14, 30.0, 30906),
+)
 LINE_TERMINATOR = "\n"
 NUL_TERMINATOR = "\0"
 
@@ -84,6 +105,19 @@ def parse_visible_zoom_response(response: object) -> tuple[int | None, float | N
     if ratio is None and index is not None:
         ratio = float(index)
     return index, ratio
+
+
+def nominal_focal_length_px(zoom_level: object) -> float | None:
+    """Return the nominal visible-camera ``fx`` for a WIRIS zoom index."""
+
+    try:
+        index = int(zoom_level)
+    except (TypeError, ValueError):
+        return None
+    for candidate, _ratio, focal_length_px in VISIBLE_ZOOM_FX_ESTIMATES:
+        if candidate == index:
+            return float(focal_length_px)
+    return None
 
 
 def build_zoom_command(

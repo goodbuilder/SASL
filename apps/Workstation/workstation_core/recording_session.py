@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import shutil
@@ -274,6 +275,16 @@ GNSS_BASE_COMPACT_COLUMNS = DEVICE_TIMELINE_COLUMNS + (
     "device_id",
     "gnss_operation_state",
 )
+EXTRINSICS_COMPARISON_COMPACT_COLUMNS = (
+    "pair_sequence",
+    "timestamp_s",
+    "method",
+    "forward_m",
+    "right_m",
+    "down_m",
+    "range_m",
+    "status",
+)
 DYNAMIC_SHEET_RULES: dict[str, tuple[str, ...]] = {
     "Measurements": (
         "measurement",
@@ -320,6 +331,8 @@ CALIBRATION_KEYWORDS = (
     "projection_matrix",
     "rectification",
 )
+
+AUTHORITATIVE_JSONL_SCHEMA_VERSION = "stereowiris-authoritative-jsonl-v1"
 
 
 _SESSION_ID_LOCK = threading.Lock()
@@ -373,6 +386,8 @@ class SavedSessionFiles:
     session_rtk_xlsx: Path
     gnss_base_csv: Path
     gnss_base_parquet: Path
+    extrinsics_comparison_csv: Path
+    extrinsics_comparison_parquet: Path
     manifest: Path
     finalized: bool = True
     error: str = ""
@@ -402,6 +417,8 @@ class SavedSessionFiles:
             self.session_rtk_xlsx,
             self.gnss_base_csv,
             self.gnss_base_parquet,
+            self.extrinsics_comparison_csv,
+            self.extrinsics_comparison_parquet,
         ]
 
 
@@ -413,6 +430,7 @@ class RetryableSession:
     camera_rows: dict[str, "SpoolRows"]
     px4_rows: dict[str, "SpoolRows"]
     gnss_base_rows: "SpoolRows"
+    extrinsics_comparison_rows: "SpoolRows"
 
 
 class SpoolRows(Sequence[dict[str, object]]):
@@ -646,6 +664,139 @@ def _normalized_generic_rows(rows: Iterable[dict[str, object]]) -> list[dict[str
         {key: _serializable_value(value) for key, value in row.items()}
         for row in rows
     ]
+
+
+def _authoritative_jsonl_row_bytes(row: dict[str, object]) -> bytes:
+    return (
+        json.dumps(row, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _authoritative_jsonl_schema(
+    rows: Iterable[dict[str, object]],
+    *,
+    normalization: str,
+) -> dict[str, object]:
+    return {
+        "version": AUTHORITATIVE_JSONL_SCHEMA_VERSION,
+        "format": "jsonl",
+        "encoding": "utf-8",
+        "normalization": normalization,
+        "fields": sorted({str(key) for row in rows for key in row}),
+    }
+
+
+def _write_authoritative_jsonl(
+    output: Path,
+    rows: Iterable[dict[str, object]],
+) -> None:
+    """Atomically write every normalized source row without field selection."""
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        fd, temp_name = tempfile.mkstemp(
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(fd, "wb") as handle:
+            for row in rows:
+                handle.write(_authoritative_jsonl_row_bytes(row))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, output)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+def _validate_authoritative_jsonl(
+    output: Path,
+    expected_rows: Sequence[dict[str, object]],
+    *,
+    role: str,
+    artifact_path: str,
+    normalization: str,
+) -> dict[str, object]:
+    """Re-read a staged JSONL artifact and return its verified manifest detail."""
+
+    digest = hashlib.sha256()
+    row_count = 0
+    try:
+        with output.open("rb") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                digest.update(raw_line)
+                if row_count >= len(expected_rows):
+                    raise OSError(
+                        f"authoritative JSONL has an unexpected row: "
+                        f"path={output}, line={line_number}"
+                    )
+                if raw_line != _authoritative_jsonl_row_bytes(expected_rows[row_count]):
+                    raise OSError(
+                        f"authoritative JSONL content mismatch: "
+                        f"path={output}, line={line_number}"
+                    )
+                try:
+                    decoded = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise OSError(
+                        f"authoritative JSONL is not valid UTF-8 JSON: "
+                        f"path={output}, line={line_number}"
+                    ) from exc
+                if not isinstance(decoded, dict):
+                    raise OSError(
+                        f"authoritative JSONL row is not an object: "
+                        f"path={output}, line={line_number}"
+                    )
+                row_count += 1
+    except OSError:
+        raise
+
+    if row_count != len(expected_rows):
+        raise OSError(
+            f"authoritative JSONL row count mismatch: "
+            f"path={output}, expected={len(expected_rows)}, actual={row_count}"
+        )
+    size = output.stat().st_size
+    return {
+        "role": role,
+        "path": artifact_path,
+        "size": size,
+        "size_unit": "bytes",
+        "row_count": row_count,
+        "schema": _authoritative_jsonl_schema(
+            expected_rows,
+            normalization=normalization,
+        ),
+        "sha256": digest.hexdigest(),
+        "authoritative": True,
+        "verified": True,
+    }
+
+
+def _scope_unpublished_artifact_details(
+    manifest: dict[str, object],
+    *,
+    artifact_root: Path,
+) -> None:
+    """Keep failed-attempt details distinct from the stable published paths."""
+
+    details = manifest.get("artifact_details")
+    unpublished: dict[str, object] = {}
+    if isinstance(details, dict):
+        for name, value in details.items():
+            if not isinstance(value, dict):
+                continue
+            unpublished[str(name)] = {
+                **value,
+                "path": (artifact_root / Path(str(name)).name).as_posix(),
+                "published": False,
+            }
+    manifest["artifact_details"] = {}
+    manifest["unpublished_artifact_details"] = unpublished
+    manifest["authoritative_raw_artifacts_verified"] = False
 
 
 def _none_if_empty(value: object) -> object | None:
@@ -898,7 +1049,6 @@ def _compact_px4_timeline_row(
         "attitude_time_boot_ms": _optional_int(row.get("attitude_time_boot_ms")),
         "roll_deg": _optional_float(row.get("roll_deg")),
         "pitch_deg": _optional_float(row.get("pitch_deg")),
-        "yaw_deg": _optional_float(row.get("yaw_deg")),
         "latitude_deg": _optional_float(_first_present(row, "latitude_deg", "lat_deg")),
         "longitude_deg": _optional_float(_first_present(row, "longitude_deg", "lon_deg")),
         "altitude_m": _optional_float(_first_present(row, "altitude_m", "alt_m")),
@@ -1159,6 +1309,45 @@ def _projected_columns(fieldnames: list[str], keywords: tuple[str, ...]) -> list
     return selected
 
 
+_INVALID_XLSX_SHEET_CHARS = frozenset("[]:\\/?*")
+
+
+def _sanitize_xlsx_sheet_name(name: str, *, used: set[str]) -> str:
+    """Fit an arbitrary method string into Excel's 31-char, symbol-free sheet name rule."""
+
+    cleaned = "".join("_" if ch in _INVALID_XLSX_SHEET_CHARS else ch for ch in str(name)).strip()
+    cleaned = (cleaned or "Sheet")[:31]
+    candidate = cleaned
+    suffix = 1
+    while candidate in used:
+        suffix_text = f"~{suffix}"
+        candidate = cleaned[: max(1, 31 - len(suffix_text))] + suffix_text
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _extrinsics_comparison_sheet_groups(
+    rows: Sequence[dict[str, object]],
+) -> list[tuple[str, str, list[dict[str, object]]]]:
+    """Group extrinsics-comparison rows by method into one sheet each.
+
+    Method names are per-session dynamic (an ad-hoc PnP candidate id/method
+    string, not a fixed enum), so sheets are discovered from the data itself
+    rather than declared up front like the other fixed-category sheets.
+    """
+
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        method = str(row.get("method") or "unknown")
+        grouped.setdefault(method, []).append(row)
+    used_names: set[str] = set()
+    return [
+        (_sanitize_xlsx_sheet_name(f"Ext_{method}", used=used_names), method, method_rows)
+        for method, method_rows in grouped.items()
+    ]
+
+
 @dataclass(frozen=True)
 class SessionSheetPreview:
     """One sheet of the session workbook, in the order it is written.
@@ -1179,6 +1368,7 @@ def session_sheet_previews(
     *,
     camera_rows: dict[str, Sequence[dict[str, object]]] | None = None,
     px4_rows: dict[str, Sequence[dict[str, object]]] | None = None,
+    extrinsics_comparison_rows: Sequence[dict[str, object]] | None = None,
 ) -> list[SessionSheetPreview]:
     """Describe the sheets ``write_session_workbook`` would produce.
 
@@ -1226,6 +1416,16 @@ def session_sheet_previews(
             ),
         ) for name in ("Calibration",)
     )
+    for sheet_name, _method, _method_rows in _extrinsics_comparison_sheet_groups(
+        extrinsics_comparison_rows or ()
+    ):
+        previews.append(
+            SessionSheetPreview(
+                name=sheet_name,
+                kind="table",
+                columns=tuple(EXTRINSICS_COMPARISON_COMPACT_COLUMNS),
+            )
+        )
     return previews
 
 
@@ -1610,9 +1810,11 @@ def _write_xlsx(
     *,
     camera_rows: dict[str, list[dict[str, object]]] | None = None,
     px4_rows: dict[str, list[dict[str, object]]] | None = None,
+    extrinsics_comparison_rows: Sequence[dict[str, object]] | None = None,
 ) -> None:
     camera_rows = camera_rows or {}
     px4_rows = px4_rows or {}
+    extrinsics_comparison_rows = extrinsics_comparison_rows or ()
     sheet_rows = {
         "DistanceMeasurements": distance_rows,
         "CameraLeft": camera_rows.get("left", []),
@@ -1620,11 +1822,16 @@ def _write_xlsx(
         "Px4Left": px4_rows.get("left", []),
         "Px4Right": px4_rows.get("right", []),
     }
+    for sheet_name, _method, method_rows in _extrinsics_comparison_sheet_groups(
+        extrinsics_comparison_rows
+    ):
+        sheet_rows[sheet_name] = method_rows
     previews = session_sheet_previews(
         metadata,
         distance_rows,
         camera_rows=camera_rows,
         px4_rows=px4_rows,
+        extrinsics_comparison_rows=extrinsics_comparison_rows,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(dir=output.parent, prefix=f".{output.name}.", suffix=".tmp")
@@ -1711,7 +1918,13 @@ def load_retryable_session(output_dir: Path) -> RetryableSession:
     # Sessions recorded before this field existed have no gnss_base.jsonl;
     # open_existing() tolerates a missing path (empty rows, fresh append handle).
     gnss_base_rows.open_existing(spool_dir / "gnss_base.jsonl")
-    return RetryableSession(output_dir, metadata, pair_rows, camera_rows, px4_rows, gnss_base_rows)
+    extrinsics_comparison_rows = SpoolRows()
+    # Sessions recorded before this field existed have no extrinsics_comparison.jsonl;
+    # open_existing() tolerates a missing path (empty rows, fresh append handle).
+    extrinsics_comparison_rows.open_existing(spool_dir / "extrinsics_comparison.jsonl")
+    return RetryableSession(
+        output_dir, metadata, pair_rows, camera_rows, px4_rows, gnss_base_rows, extrinsics_comparison_rows
+    )
 
 
 def _cleanup_finalize_orphans(output_dir: Path) -> None:
@@ -1776,6 +1989,7 @@ def save_session_files(
     camera_rows: dict[str, Iterable[dict[str, object]]] | None = None,
     px4_rows: dict[str, Iterable[dict[str, object]]] | None = None,
     gnss_base_rows: Iterable[dict[str, object]] | None = None,
+    extrinsics_comparison_rows: Iterable[dict[str, object]] | None = None,
 ) -> SavedSessionFiles:
     output_dir.mkdir(parents=True, exist_ok=True)
     session_id = Path(str(metadata.get("session_id") or output_dir.name)).name
@@ -1783,6 +1997,7 @@ def save_session_files(
     camera_rows = camera_rows or {}
     px4_rows = px4_rows or {}
     gnss_base_full_rows = _normalized_generic_rows(gnss_base_rows or [])
+    extrinsics_comparison_full_rows = _normalized_generic_rows(extrinsics_comparison_rows or [])
     camera_full_rows = {
         side: _normalized_generic_rows(camera_rows.get(side, []))
         for side in ("left", "right")
@@ -1819,6 +2034,15 @@ def save_session_files(
     session_rtk_xlsx_output = output_dir / f"{session_id}_session_rtk.xlsx"
     gnss_base_output = output_dir / f"{session_id}_gnss_base.csv"
     gnss_base_parquet_output = output_dir / f"{session_id}_gnss_base.parquet"
+    extrinsics_comparison_output = output_dir / f"{session_id}_extrinsics_comparison.csv"
+    extrinsics_comparison_parquet_output = output_dir / f"{session_id}_extrinsics_comparison.parquet"
+    raw_pair_output = output_dir / f"{session_id}_raw_pair_rows.jsonl"
+    raw_camera_left_output = output_dir / f"{session_id}_raw_camera_left_rows.jsonl"
+    raw_camera_right_output = output_dir / f"{session_id}_raw_camera_right_rows.jsonl"
+    raw_px4_left_output = output_dir / f"{session_id}_raw_px4_left_rows.jsonl"
+    raw_px4_right_output = output_dir / f"{session_id}_raw_px4_right_rows.jsonl"
+    raw_gnss_base_output = output_dir / f"{session_id}_raw_gnss_base_rows.jsonl"
+    raw_extrinsics_comparison_output = output_dir / f"{session_id}_raw_extrinsics_comparison_rows.jsonl"
     manifest_output = output_dir / "session_manifest.json"
     resource_files = {
         "session_static": static_output.name,
@@ -1837,6 +2061,15 @@ def save_session_files(
         "session_rtk_xlsx": session_rtk_xlsx_output.name,
         "gnss_base_csv": gnss_base_output.name,
         "gnss_base_parquet": gnss_base_parquet_output.name,
+        "extrinsics_comparison_csv": extrinsics_comparison_output.name,
+        "extrinsics_comparison_parquet": extrinsics_comparison_parquet_output.name,
+        "raw_pair_rows_jsonl": raw_pair_output.name,
+        "raw_camera_left_rows_jsonl": raw_camera_left_output.name,
+        "raw_camera_right_rows_jsonl": raw_camera_right_output.name,
+        "raw_px4_left_rows_jsonl": raw_px4_left_output.name,
+        "raw_px4_right_rows_jsonl": raw_px4_right_output.name,
+        "raw_gnss_base_rows_jsonl": raw_gnss_base_output.name,
+        "raw_extrinsics_comparison_rows_jsonl": raw_extrinsics_comparison_output.name,
         "workbook": xlsx_output.name,
     }
     _cleanup_finalize_orphans(output_dir)
@@ -1852,6 +2085,11 @@ def save_session_files(
         (px4_left_output.name, compact_px4_rows["left"], PX4_TIMELINE_COMPACT_COLUMNS),
         (px4_right_output.name, compact_px4_rows["right"], PX4_TIMELINE_COMPACT_COLUMNS),
         (gnss_base_output.name, compact_gnss_base_row_list, GNSS_BASE_COMPACT_COLUMNS),
+        (
+            extrinsics_comparison_output.name,
+            extrinsics_comparison_full_rows,
+            EXTRINSICS_COMPARISON_COMPACT_COLUMNS,
+        ),
     )
     parquet_names_and_rows = (
         (distance_parquet_output.name, compact_distance_rows, DISTANCE_MEASUREMENT_COLUMNS),
@@ -1860,13 +2098,65 @@ def save_session_files(
         (px4_left_parquet_output.name, compact_px4_rows["left"], PX4_TIMELINE_COMPACT_COLUMNS),
         (px4_right_parquet_output.name, compact_px4_rows["right"], PX4_TIMELINE_COMPACT_COLUMNS),
         (gnss_base_parquet_output.name, compact_gnss_base_row_list, GNSS_BASE_COMPACT_COLUMNS),
+        (
+            extrinsics_comparison_parquet_output.name,
+            extrinsics_comparison_full_rows,
+            EXTRINSICS_COMPARISON_COMPACT_COLUMNS,
+        ),
+    )
+    raw_jsonl_names_and_rows = (
+        (
+            raw_pair_output.name,
+            rows,
+            "raw_pair_rows_jsonl",
+            "_normalized_pair_rows",
+        ),
+        (
+            raw_camera_left_output.name,
+            camera_full_rows["left"],
+            "raw_camera_left_rows_jsonl",
+            "_normalized_generic_rows",
+        ),
+        (
+            raw_camera_right_output.name,
+            camera_full_rows["right"],
+            "raw_camera_right_rows_jsonl",
+            "_normalized_generic_rows",
+        ),
+        (
+            raw_px4_left_output.name,
+            px4_full_rows["left"],
+            "raw_px4_left_rows_jsonl",
+            "_normalized_generic_rows",
+        ),
+        (
+            raw_px4_right_output.name,
+            px4_full_rows["right"],
+            "raw_px4_right_rows_jsonl",
+            "_normalized_generic_rows",
+        ),
+        (
+            raw_gnss_base_output.name,
+            gnss_base_full_rows,
+            "raw_gnss_base_rows_jsonl",
+            "_normalized_generic_rows",
+        ),
+        (
+            raw_extrinsics_comparison_output.name,
+            extrinsics_comparison_full_rows,
+            "raw_extrinsics_comparison_rows_jsonl",
+            "_normalized_generic_rows",
+        ),
     )
     manifest: dict[str, object] = {
         "session_id": session_id,
         "status": "preparing",
         "resource_files_authoritative": True,
+        "resource_files": resource_files,
         "time_axis": "recording_time_ns",
         "artifacts": {},
+        "artifact_details": {},
+        "authoritative_raw_artifacts_verified": False,
         "artifact_roles": {
             static_output.name: "session_static_metadata",
             distance_csv_output.name: "distance_measurements_csv",
@@ -1884,9 +2174,19 @@ def save_session_files(
             session_rtk_xlsx_output.name: "session_rtk_workbook",
             gnss_base_output.name: "gnss_base_timeline_csv",
             gnss_base_parquet_output.name: "gnss_base_timeline_parquet",
+            extrinsics_comparison_output.name: "extrinsics_comparison_csv",
+            extrinsics_comparison_parquet_output.name: "extrinsics_comparison_parquet",
+            raw_pair_output.name: "raw_pair_rows_jsonl",
+            raw_camera_left_output.name: "raw_camera_left_rows_jsonl",
+            raw_camera_right_output.name: "raw_camera_right_rows_jsonl",
+            raw_px4_left_output.name: "raw_px4_left_rows_jsonl",
+            raw_px4_right_output.name: "raw_px4_right_rows_jsonl",
+            raw_gnss_base_output.name: "raw_gnss_base_rows_jsonl",
+            raw_extrinsics_comparison_output.name: "raw_extrinsics_comparison_rows_jsonl",
             xlsx_output.name: "integrated_review_workbook",
         },
     }
+    authoritative_raw_artifacts_verified = False
     try:
         _write_session_static_json(
             staging_dir / static_output.name,
@@ -1894,6 +2194,20 @@ def save_session_files(
             resource_files=resource_files,
         )
         manifest["artifacts"][static_output.name] = "prepared"  # type: ignore[index]
+        for name, source_rows, role, normalization in raw_jsonl_names_and_rows:
+            staged_path = staging_dir / name
+            _write_authoritative_jsonl(staged_path, source_rows)
+            detail = _validate_authoritative_jsonl(
+                staged_path,
+                source_rows,
+                role=role,
+                artifact_path=name,
+                normalization=normalization,
+            )
+            manifest["artifacts"][name] = "prepared"  # type: ignore[index]
+            manifest["artifact_details"][name] = detail  # type: ignore[index]
+        authoritative_raw_artifacts_verified = True
+        manifest["authoritative_raw_artifacts_verified"] = True
         for name, source_rows, required in csv_names_and_rows:
             staged_path = staging_dir / name
             write_dynamic_csv(staged_path, source_rows, required_columns=required)
@@ -1908,6 +2222,7 @@ def save_session_files(
         for name in (px4_left_xlsx_output.name, px4_right_xlsx_output.name, session_rtk_xlsx_output.name):
             manifest["artifacts"][name] = "prepared"  # type: ignore[index]
     except Exception as exc:
+        _scope_unpublished_artifact_details(manifest, artifact_root=staging_dir)
         manifest.update(
             status="failed",
             phase="prepare_resource_files",
@@ -1928,6 +2243,7 @@ def save_session_files(
             compact_distance_rows,
             camera_rows=compact_camera_rows,
             px4_rows=compact_px4_rows,
+            extrinsics_comparison_rows=extrinsics_comparison_full_rows,
         )
         manifest["artifacts"][xlsx_output.name] = "prepared"  # type: ignore[index]
     except Exception as exc:
@@ -1947,10 +2263,12 @@ def save_session_files(
             [static_output.name]
             + [name for name, _rows, _required in csv_names_and_rows]
             + [name for name, _rows, _columns in parquet_names_and_rows]
+            + [name for name, _rows, _role, _normalization in raw_jsonl_names_and_rows]
             + [px4_left_xlsx_output.name, px4_right_xlsx_output.name, session_rtk_xlsx_output.name]
             + [xlsx_output.name],
         )
     except Exception as exc:
+        _scope_unpublished_artifact_details(manifest, artifact_root=generation_dir)
         manifest.update(
             status="failed", phase="publish", error=f"generation publish failed: {exc}",
             retryable=True, generation_id=generation_id,
@@ -1985,12 +2303,20 @@ def save_session_files(
         session_rtk_xlsx=session_rtk_xlsx_output,
         gnss_base_csv=gnss_base_output,
         gnss_base_parquet=gnss_base_parquet_output,
+        extrinsics_comparison_csv=extrinsics_comparison_output,
+        extrinsics_comparison_parquet=extrinsics_comparison_parquet_output,
         manifest=manifest_output,
         finalized=not error,
         error=error,
     )
-    if saved.finalized:
-        for source_rows in (pair_rows, *camera_rows.values(), *px4_rows.values(), gnss_base_rows):
+    if saved.finalized and authoritative_raw_artifacts_verified:
+        for source_rows in (
+            pair_rows,
+            *camera_rows.values(),
+            *px4_rows.values(),
+            gnss_base_rows,
+            extrinsics_comparison_rows,
+        ):
             if isinstance(source_rows, SpoolRows):
                 source_rows.discard_spool()
         recovery_metadata = output_dir / ".spool" / "session_metadata.json"

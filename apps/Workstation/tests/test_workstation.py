@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -871,6 +872,10 @@ def test_workstation_evidence_uses_panel_data_root(tmp_path, monkeypatch: pytest
         "recording_time_ns,forward_m,right_m,down_m,range_m\n1,2,3,4,5\n",
         encoding="utf-8",
     )
+    (session_dir / "hr_captures.jsonl").write_text(
+        '{"capture_id":"hr-001","recorded_unix_ns":10,"storage":"camera_internal"}\n',
+        encoding="utf-8",
+    )
 
     adapter = EvidenceAdapter(SimpleNamespace(app_root=workstation_root))
     catalog = adapter.session_catalog()
@@ -878,10 +883,15 @@ def test_workstation_evidence_uses_panel_data_root(tmp_path, monkeypatch: pytest
         "workstation-session",
         "workstation-session_distance_measurements.csv",
     )
+    hr_rows = adapter.session_artifact_rows("workstation-session", "hr_captures.jsonl")
 
     assert catalog and catalog[0]["path"] == str(session_dir)
+    assert "hr_captures.jsonl" in catalog[0]["artifacts"]
     assert rows["rows"] == (
         {"recording_time_ns": "1", "forward_m": "2", "right_m": "3", "down_m": "4", "range_m": "5"},
+    )
+    assert hr_rows["rows"] == (
+        {"capture_id": "hr-001", "recorded_unix_ns": 10, "storage": "camera_internal"},
     )
 
 
@@ -998,6 +1008,10 @@ class _FakeBackend:
     def save_session(self) -> None:
         self.calls.append("save")
 
+    def capture_pnp_hr_photos(self) -> bool:
+        self.calls.append("hr_capture")
+        return True
+
     def apply_camera_settings(self, left: str, right: str) -> bool:
         self.calls.append(("settings", left, right))
         return True
@@ -1040,6 +1054,9 @@ class _FakeBackend:
 
     def pixhawk_reset_level_calibration(self) -> None:
         self.calls.append("pixhawk_reset_level_calibration")
+
+    def pixhawk_reset_calibration(self, camera: str, group: str) -> None:
+        self.calls.append(("pixhawk_reset_calibration", camera, group))
 
     def pixhawk_recover_eth_mavlink(self, camera: str) -> None:
         self.calls.append(("pixhawk_recover_eth_mavlink", camera))
@@ -1172,11 +1189,8 @@ class _FakeBackend:
     def alignment_swap_pixhawks(self) -> None:
         self.calls.append("alignment_swap_pixhawks")
 
-    def start_lrf_polling(self) -> None:
-        self.calls.append("start_lrf_polling")
-
-    def stop_lrf_polling(self) -> None:
-        self.calls.append("stop_lrf_polling")
+    def query_lrf_once(self) -> None:
+        self.calls.append("query_lrf_once")
 
     def advanced_wiris_catalog(self) -> tuple[dict[str, str], ...]:
         return (
@@ -1258,9 +1272,8 @@ def test_workstation_shell_navigation_and_close() -> None:
     root = window.navigation.model.item(0, 0)
     assert [root.child(row).text() for row in range(root.rowCount())] == [
         "Overview",
-        "Protocol",
-        "Pre-run Calibration",
         "Devices",
+        "Calibration",
         "Alignment",
         "Measurement",
         "Recording / Sessions",
@@ -1368,6 +1381,7 @@ def test_workstation_shell_navigation_and_close() -> None:
     app.processEvents()
     assert window.workspace_host.currentWidget().widget() is window.base_gnss
     assert window.base_gnss.summary_values["mode"].label.text() == "Mode"
+    assert "gnss.ntrip" in window.status_widgets
     assert window.base_gnss.survey_values["accuracy"].label.text() == "Mean accuracy"
     assert window.base_gnss.ntrip_values["mountpoint"].label.text() == "Mountpoint"
     assert [
@@ -1381,15 +1395,23 @@ def test_workstation_shell_navigation_and_close() -> None:
         )
     ] == [
         "Find Base",
-        "Connect Base",
-        "Disconnect Base",
+        "Connect",
+        "Disconnect",
         "Start NTRIP",
         "Stop NTRIP",
     ]
 
     window.navigation.select_context("processing.alignment")
     app.processEvents()
-    assert window.alignment.operation_tabs.currentIndex() == 2
+    assert window.alignment.operation_tabs.currentIndex() == 0
+    assert [
+        window.alignment.operation_tabs.tabText(index)
+        for index in range(window.alignment.operation_tabs.count())
+    ] == ["R,t methods"]
+    alignment_layout = window.alignment.layout()
+    assert alignment_layout.indexOf(window.alignment.operation_tabs) == 1
+    assert window.alignment.findChild(QtWidgets.QGroupBox, "alignmentDevicePrerequisites") is None
+    assert not window.alignment.attitude_table.parentWidget().isVisible()
 
     window.navigation.select_context("diagnostics.logs")
     app.processEvents()
@@ -1526,8 +1548,69 @@ def test_base_gnss_workspace_projects_survey_in_and_ntrip_without_relabeling_fra
     assert workspace.summary_values["mode"].value.text() == "Network RTK Direct"
     assert workspace.ntrip_values["caster"].value.text().startswith("caster.example.org:2101")
     assert workspace.ntrip_values["mountpoint"].value.text() == "BASE01"
+    assert workspace.ntrip_values["health"].value.text() == "CONNECTED_NO_DATA"
+    assert "last=--" in workspace.ntrip_values["transport"].value.text()
     assert workspace.survey_group.isHidden()
     assert not workspace.ntrip_group.isHidden()
+    workspace.deleteLater()
+    app.processEvents()
+
+
+def test_base_gnss_workspace_shows_non_gating_rts2_checklist() -> None:
+    from Workstation.workspaces import BaseGnssWorkspace
+    from Workstation.workstation_core.gnss_operation import (
+        CorrectionSourceIdentity,
+        GnssOperationConfig,
+        GnssOperationManager,
+    )
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    config = GnssOperationConfig.ngii_rts2_base_assisted()
+    manager = GnssOperationManager(config)
+    manager.configure(config)
+    manager.set_source_identity(
+        CorrectionSourceIdentity(
+            source_kind="NTRIP",
+            caster_host=config.network.caster_host,
+            caster_port=config.network.caster_port,
+            mountpoint=config.network.mountpoint,
+            gga_policy=config.network.gga_policy,
+        )
+    )
+    now = time.monotonic()
+    gps = lambda side: SimpleNamespace(
+        camera=side,
+        namespace=side,
+        timestamp_s=now,
+        topic=f"gps/{side}",
+        fix_type=6,
+        rtk_label="RTK_FIXED",
+        satellites_used=20,
+        eph_m=0.01,
+        epv_m=0.02,
+    )
+    panel = SimpleNamespace(
+        gnss_operation_manager=manager,
+        gnss_base_serial_connected=True,
+        gnss_base_rtcm_stats={"start_s": now - 60.0, "last_frame_s": now - 1.0, "frames": 12, "bytes": 960},
+        gnss_network_connected=True,
+        gnss_network_status_line="ICY 200 OK",
+        latest_gps={"left": gps("left"), "right": gps("right")},
+        gnss_rover_fixed_since={"left": now - 45.0, "right": now - 50.0},
+        gnss_coordinate_samples=(),
+        gnss_fixed_base_profile=SimpleNamespace(to_mapping=lambda: {"profile_hash": "base-profile"}),
+        gnss_fixed_base_reconfigure_ack=True,
+        gnss_fixed_base_reconfigure_readback=True,
+        gnss_fixed_base_reconfigure_rtcm=True,
+    )
+    backend = SimpleNamespace(panel=panel)
+    workspace = BaseGnssWorkspace(backend, lambda _command: True)
+
+    workspace.refresh({})
+
+    assert not workspace.checklist_group.isHidden()
+    assert all(value.value.text() == "SATISFIED" for value in workspace.checklist_values.values())
+    assert manager.config.readiness_gate_enabled is False
     workspace.deleteLater()
     app.processEvents()
 
@@ -1703,15 +1786,6 @@ def test_inspector_changes_by_context_and_selected_evidence() -> None:
     window.navigation.select_context("overview")
     app.processEvents()
     assert "Overview preserves each producer contract" in window.inspector.context_values["contract"].value.text()
-    protocol_button = next(
-        button
-        for button in window.overview.findChildren(QtWidgets.QPushButton)
-        if button.text() == "Protocol"
-    )
-    protocol_button.click()
-    app.processEvents()
-    assert window.workspace_host.currentWidget().widget() is window.experiment
-
     window.navigation.select_context("diagnostics.system")
     app.processEvents()
     assert window.inspector.context_label.text() == "Diagnostics · System"
@@ -1750,6 +1824,75 @@ def test_inspector_changes_by_context_and_selected_evidence() -> None:
     app.processEvents()
 
 
+def test_inspector_centralizes_active_geometry_and_applies_gnss_mountain_candidate() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    candidate_snapshot = {
+        "state": "CANDIDATE",
+        "active_candidate_id": "",
+        "active_selection_id": "",
+        "active_selected_dof": {},
+        "candidates": [
+            {
+                "candidate_id": "gnss-mountain-1",
+                "method": "gnss-constrained-mountain-uv",
+                "state": "WARNING",
+                "applicable": True,
+                "observable_dof": {
+                    "roll_deg": True,
+                    "pitch_deg": True,
+                    "yaw_deg": True,
+                    "north_m": True,
+                    "east_m": True,
+                    "down_m": True,
+                },
+                "input_hashes": {
+                    "operating_intrinsics_profile_sha256": "a" * 64,
+                    "gnss_baseline_sha256": "b" * 64,
+                },
+                "quality_metrics": {"gnss_baseline_m": 1.2},
+                "source_observation_ids": ["mountain-left", "mountain-right"],
+                "warnings": ["camera optical center equals GNSS antenna"],
+            }
+        ],
+    }
+    backend.optical_pose_snapshot = lambda include_frames=True: candidate_snapshot
+    backend.optical_pose_apply_candidate = lambda payload: backend.calls.append(
+        ("optical_pose_apply_candidate", payload)
+    ) or candidate_snapshot
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    window.inspector.refresh("processing.alignment", window.status_adapter.model)
+    assert window.inspector.geometry_section.title() == "Active Geometry"
+    assert window.inspector.geometry_candidate_combo.currentData() == "gnss-mountain-1"
+    assert window.inspector.geometry_apply_candidate_button.isEnabled()
+    assert "K,D" in window.inspector.geometry_values["bundle"].value.text()
+    assert "gnss-mountain-1" in window.inspector.geometry_candidate_combo.currentText()
+
+    window.inspector.geometry_apply_candidate_button.click()
+    assert backend.calls[-1] == (
+        "optical_pose_apply_candidate",
+        {
+            "candidate_id": "gnss-mountain-1",
+            "dof": {
+                "roll": True,
+                "pitch": True,
+                "yaw": True,
+                "north": True,
+                "east": True,
+                "down": True,
+            },
+        },
+    )
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
 def test_pixhawk_level_reset_only_targets_level_horizon_offsets(monkeypatch: pytest.MonkeyPatch) -> None:
     from Workstation.device_runtime_controller import DeviceRuntimeController
 
@@ -1774,12 +1917,62 @@ def test_pixhawk_level_reset_only_targets_level_horizon_offsets(monkeypatch: pyt
     assert DeviceRuntimeController(panel).reset_px4_level_calibration() is True
     assert [camera for camera, _command, _kwargs in shell_calls] == ["left", "right"]
     assert all(
-        command == "param reset SENS_BOARD_X_OFF SENS_BOARD_Y_OFF SENS_BOARD_Z_OFF"
+        command == "param reset SENS_BOARD_X_OFF SENS_BOARD_Y_OFF"
         for _camera, command, _kwargs in shell_calls
     )
     assert all(kwargs["operation"] == "reset_level_calibration" for _camera, _command, kwargs in shell_calls)
     assert "SENS_BOARD_ROT" not in shell_calls[0][1]
     assert any("PARAM readback" in message for message in logs)
+
+
+def test_pixhawk_calibration_group_reset_is_scoped_and_uses_px4_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    from Workstation.device_runtime_controller import DeviceRuntimeController
+
+    shell_calls: list[tuple[str, str, dict[str, object]]] = []
+    panel = SimpleNamespace(
+        mavlink_pixhawk=object(),
+        _mavlink_open_sides=lambda: ("left",),
+        px4_mag_managers={"left": SimpleNamespace(armed=False)},
+        _px4_calibration_reset_pending={},
+        _px4_mag_camera_label=lambda _side: "P1",
+        _log=lambda _message: None,
+        _start_pixhawk_shell_worker=lambda camera, command, **kwargs: shell_calls.append(
+            (camera, command, kwargs)
+        ) or True,
+    )
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QtWidgets.QMessageBox.Yes,
+    )
+
+    assert DeviceRuntimeController(panel).reset_px4_calibration_group("left", "accelerometer") is True
+    assert shell_calls[0][0] == "left"
+    assert shell_calls[0][1].startswith("param reset CAL_ACC0_ID")
+    assert "CAL_GYRO0_ID" not in shell_calls[0][1]
+    assert "CAL_MAG0_ID" not in shell_calls[0][1]
+    assert "SENS_BOARD_X_OFF" not in shell_calls[0][1]
+    assert shell_calls[0][2]["operation"] == "reset_calibration:accelerometer"
+    assert panel._px4_calibration_reset_pending["left"] == "accelerometer"
+
+
+def test_pixhawk_calibration_reset_commands_route_to_the_selected_group() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    window = WorkstationMainWindow(backend=backend)
+    window.show()
+    app.processEvents()
+
+    command_id = "pixhawk.reset_calibration.p1.compass"
+    assert window.commands.action(command_id).text() == "Reset P1 Compass / magnetometer calibration"
+    assert window.commands.invoke(command_id) is True
+    assert backend.calls[-1] == ("pixhawk_reset_calibration", "left", "compass")
+    assert "pixhawk.reset_calibration.p1.board" not in window.commands._actions
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
 
 
 def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
@@ -1812,8 +2005,8 @@ def test_workstation_recording_gate_protects_preview_mapping_and_save() -> None:
     assert not window.camera.operation_buttons["camera.swap"].isEnabled()
     assert not window.camera.operation_buttons["camera.reactivate_left"].isEnabled()
     assert not window.camera.operation_buttons["camera.reactivate_right"].isEnabled()
-    assert not window.alignment.operation_buttons["alignment.swap_pixhawks"].isEnabled()
-    assert not window.alignment.operation_buttons["pixhawk.reset_level_calibration"].isEnabled()
+    assert "alignment.swap_pixhawks" not in window.alignment.operation_buttons
+    assert "pixhawk.reset_level_calibration" not in window.alignment.operation_buttons
     calls_before_disabled_invoke = list(backend.calls)
     assert window.commands.invoke("camera.swap") is False
     assert window.commands.invoke("camera.auto_connect") is False
@@ -2005,10 +2198,13 @@ def test_workstation_exposes_device_discovery_and_routes_tools_to_advanced() -> 
     assert window.camera.preview_pair_orientation(1600, 700) == QtCore.Qt.Horizontal
     assert window.camera.preview_pair_orientation(900, 700) == QtCore.Qt.Vertical
     assert window.measurement.preview_splitter.minimumHeight() == 280
-    assert window.measurement.workspace_splitter.orientation() == QtCore.Qt.Vertical
-    assert window.measurement.details_scroll.widgetResizable() is True
+    assert window.measurement.upstream_group.parentWidget() is window.measurement.details
+    assert window.measurement.details.layout().indexOf(window.measurement.upstream_group) == 0
+    assert not hasattr(window.measurement, "workspace_splitter")
+    assert not hasattr(window.measurement, "details_scroll")
     assert window.measurement.preview_pair_orientation(1600, 700) == QtCore.Qt.Horizontal
     assert window.measurement.preview_pair_orientation(900, 700) == QtCore.Qt.Vertical
+    assert not hasattr(window.measurement, "active_calibration_label")
     for command_id in (
         "camera.auto_connect",
         "pixhawk.discover_usb",
@@ -2026,6 +2222,78 @@ def test_workstation_exposes_device_discovery_and_routes_tools_to_advanced() -> 
     assert window.commands.invoke("advanced.open") is True
     assert window.workspace_host.currentWidget().widget() is window.advanced
     assert "legacy" not in window._workspace_indexes
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_camera_workspace_uses_hidden_diagnostics_height_without_cropping_preview_contract() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = WorkstationMainWindow(backend=_FakeBackend())
+    window.resize(1600, 980)
+    window.diagnostics_dock.show()
+    window.show()
+    window.navigation.select_context("devices.cameras")
+    app.processEvents()
+    app.processEvents()
+
+    shown_height = window.camera.preview_splitter.height()
+    assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Vertical
+    assert window.camera.preview_splitter.orientation() == QtCore.Qt.Horizontal
+
+    window.diagnostics_dock.hide()
+    app.processEvents()
+    app.processEvents()
+
+    assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Horizontal
+    assert window.camera.preview_splitter.orientation() == QtCore.Qt.Vertical
+    assert window.camera.preview_splitter.height() > shown_height
+    image = window.camera.previews["left"].image
+    assert image.width() > 0
+    assert image.height() > 0
+    assert image.width() / image.height() == pytest.approx(16.0 / 9.0, abs=0.05)
+
+    window.diagnostics_dock.show()
+    app.processEvents()
+    app.processEvents()
+    assert window.camera.workspace_splitter.orientation() == QtCore.Qt.Vertical
+    assert window.camera.preview_splitter.orientation() == QtCore.Qt.Horizontal
+
+    window.close()
+    app.processEvents()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_alignment_surface_reclaims_height_when_diagnostics_hidden() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    window = WorkstationMainWindow(backend=_FakeBackend())
+    window.resize(1600, 980)
+    window.diagnostics_dock.show()
+    window.show()
+    window.navigation.select_context("processing.alignment")
+    app.processEvents()
+    app.processEvents()
+
+    shown_tabs_height = window.alignment.operation_tabs.height()
+    shown_scroll_height = window.alignment.optical_pose_scroll.height()
+
+    window.diagnostics_dock.hide()
+    app.processEvents()
+    app.processEvents()
+
+    hidden_tabs_height = window.alignment.operation_tabs.height()
+    hidden_scroll_height = window.alignment.optical_pose_scroll.height()
+    assert hidden_tabs_height > shown_tabs_height + 100
+    assert hidden_scroll_height > shown_scroll_height + 100
+
+    window.diagnostics_dock.show()
+    app.processEvents()
+    app.processEvents()
+    assert window.alignment.operation_tabs.height() <= shown_tabs_height + 4
+    assert window.alignment.optical_pose_scroll.height() <= shown_scroll_height + 4
 
     window.close()
     app.processEvents()
@@ -2146,7 +2414,10 @@ def test_calibration_workspace_shows_live_camera_previews_with_actions_below() -
     camera_layout = camera_container.layout()
     assert camera_layout is not None
     assert camera_layout.indexOf(workspace.operation_tabs) > camera_layout.indexOf(workspace.preview_splitter)
-    assert set(workspace.camera_buttons) == {"camera.toggle", "detection.toggle"}
+    assert set(workspace.camera_buttons) == {"camera.toggle"}
+    assert workspace.zoom_set_button.text() == "Set both"
+    assert workspace.zoom_level_spin.value() == 1
+    assert not hasattr(workspace, "zoom_8x_button")
     assert "calibration.capture_images" in workspace.operation_buttons
 
     image = QtGui.QImage(640, 360, QtGui.QImage.Format_RGB888)
@@ -2510,13 +2781,6 @@ def test_wiris_lrf_worker_parses_meter_responses_and_reports_errors(monkeypatch)
     assert samples["right"]["error"] == "ERR"
 
 
-def test_wiris_lrf_poll_rate_is_limited_to_one_hz() -> None:
-    from Workstation import wiris_runtime_workers
-
-    assert wiris_runtime_workers.WIRIS_LRF_POLL_HZ == pytest.approx(1.0)
-    assert wiris_runtime_workers.WIRIS_LRF_POLL_PERIOD_S == pytest.approx(1.0)
-
-
 def test_wiris_control_sessions_are_serialized_per_camera(monkeypatch) -> None:
     from Workstation.workstation_core import wiris_zoom
 
@@ -2589,7 +2853,7 @@ def test_status_adapter_projects_lrf_live_stale_and_error_states() -> None:
         },
         "right": {
             "distance_m": 18.2,
-            "last_good_s": now - 2.0,
+            "last_good_s": now - 90.0,
             "last_attempt_s": now,
             "response": "ERR",
             "last_error": "ERR",
@@ -3112,6 +3376,20 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
         directory.mkdir(parents=True)
         for index in range(4):
             (directory / f"{side}_{index:03d}.png").write_text("fixture", encoding="utf-8")
+    metadata_root = root / "capture_metadata"
+    metadata_root.mkdir(parents=True)
+    for index in range(4):
+        (metadata_root / f"capture_{index:03d}.json").write_text(
+            json.dumps(
+                {
+                    "capture_zoom_level": 8,
+                    "capture_left_zoom_level": 8,
+                    "capture_right_zoom_level": 8,
+                    "capture_zoom_source": "GZVV",
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def fake_intrinsics(paths, _config):
         return CameraIntrinsics(
@@ -3152,6 +3430,8 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
     panel.right_pane.current_image = lambda: image
     panel.camera_frame_metadata["left"] = {"rtcp_frame_ntp_unix_s": 100.000}
     panel.camera_frame_metadata["right"] = {"rtcp_frame_ntp_unix_s": 100.002}
+    panel.actual_visible_zoom["left"] = {"index": 8, "ratio": 8.0}
+    panel.actual_visible_zoom["right"] = {"index": 8, "ratio": 8.0}
     panel.capture_calibration_images()
     assert panel.checkerboard_calibration_thread is not None
     deadline = time.monotonic() + 2.0
@@ -3292,6 +3572,9 @@ def test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path() -> Non
                     "UAVCAN_SUB_MAG": 1,
                     "CAL_MAG0_ID": standalone_gui.BOARD_INTERNAL_MAG_ID,
                     "CAL_MAG0_PRIO": 75,
+                    "CAL_MAG0_PITCH": -0.01,
+                    "CAL_MAG0_XOFF": 0.125,
+                    "CAL_MAG0_XSCALE": 1.015,
                 }
             )
             self.active: list[str] = []
@@ -3346,6 +3629,29 @@ def test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path() -> Non
     parameter_worker.run()
     assert parameter_results[0]["applied"] == ("BOARD:CAL_MAG0_PRIO=100",)
     assert subscriber.params["CAL_MAG0_PRIO"] == 100
+
+    refresh_results: list[object] = []
+    parameter_refresh_worker = standalone_gui.PixhawkParameterWorker(
+        subscriber,
+        camera="left",
+        operation="mag_refresh",
+    )
+    parameter_refresh_worker.completed.connect(refresh_results.append)
+    parameter_refresh_worker.run()
+    assert refresh_results[0]["status"].params["CAL_MAG0_XOFF"] == pytest.approx(0.125)
+    assert refresh_results[0]["status"].params["CAL_MAG0_XSCALE"] == pytest.approx(1.015)
+    assert refresh_results[0]["status"].params["CAL_MAG0_PITCH"] == pytest.approx(-0.01)
+
+    combined_results: list[object] = []
+    combined_worker = standalone_gui.PixhawkParameterWorker(
+        subscriber,
+        camera="left",
+        operation="calibration_refresh",
+    )
+    combined_worker.completed.connect(combined_results.append)
+    combined_worker.run()
+    assert combined_results[0]["mag_status"].params["CAL_MAG0_XOFF"] == pytest.approx(0.125)
+    assert "CAL_ACC0_XOFF" in combined_results[0]["attitude_status"].params
 
 
 def test_pixhawk_connection_and_stream_setup_workers_keep_transport_io_off_ui_path() -> None:
@@ -3547,6 +3853,8 @@ def test_workstation_shutdown_orders_runtime_stop_before_settings_save(
     assert panel.app_root == tmp_path.resolve()
     assert panel.settings_path == (tmp_path / "stereo_distance_settings.json").resolve()
     assert tuple(step.name for step in panel._shutdown_coordinator.steps) == (
+        "stop-target-drone",
+        "stop-drone-telemetry",
         "stop-runtime-workers",
         "stop-gnss-network",
         "stop-gnss-base-serial",
@@ -3711,6 +4019,13 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
         "gnss_readiness_maximum_baseline_std_m",
         "gnss_fixed_coordinate_profile_path",
     } <= set(settings.settings_widgets)
+    assert {
+        "gnss_require_drone_rtk_fixed",
+        "gnss_route_left_enabled",
+        "gnss_route_right_enabled",
+        "gnss_route_drone_enabled",
+    } <= set(settings.settings_widgets)
+    assert "gnss_route_field_base_enabled" not in settings.settings_widgets
     assert not {
         "ros_domain_id",
         "left_namespace",
@@ -3718,22 +4033,61 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
         "mavlink_configure_uxrce_agent",
         "uxrce_port",
         "clock_ftp_password",
-        "gnss_require_drone_rtk_fixed",
-        "gnss_route_drone_enabled",
-        "gnss_route_field_base_enabled",
     } & set(settings.settings_widgets)
     assert settings.settings_widgets["gnss_readiness_minimum_fixed_duration_s"].value() == pytest.approx(30.0)
     assert settings.settings_widgets["gnss_readiness_maximum_baseline_std_m"].value() == pytest.approx(0.02)
+    assert settings.settings_widgets["gnss_network_caster_host"].text() == ""
+    assert "hostname only" in settings.settings_widgets["gnss_network_caster_host"].placeholderText()
+    assert "세션 메타데이터" in settings.settings_widgets["gnss_site_label"].toolTip()
+    assert "기록용" in settings.settings_widgets["gnss_site_address"].toolTip()
+
+    operation_mode = settings.settings_widgets["gnss_operation_mode"]
+    assert operation_mode.currentData() == "LOCAL_SURVEY_IN"
+    assert settings.settings_widgets["gnss_base_serial_port"].isEnabled()
+    assert settings.settings_widgets["gnss_base_survey_in_min_duration_s"].isEnabled()
+    assert not settings.settings_widgets["gnss_network_caster_host"].isEnabled()
+    assert not settings.settings_widgets["gnss_fixed_coordinate_profile_path"].isEnabled()
+
+    operation_mode.setCurrentIndex(operation_mode.findData("NETWORK_RTK_DIRECT"))
+    assert not settings.settings_widgets["gnss_base_serial_port"].isEnabled()
+    assert not settings.settings_widgets["gnss_base_survey_in_min_duration_s"].isEnabled()
+    assert settings.settings_widgets["gnss_network_caster_host"].isEnabled()
+    assert not settings.settings_widgets["gnss_fixed_coordinate_profile_path"].isEnabled()
+
+    operation_mode.setCurrentIndex(operation_mode.findData("NETWORK_ASSISTED_FIXED_BASE"))
+    assert settings.settings_widgets["gnss_base_serial_port"].isEnabled()
+    assert not settings.settings_widgets["gnss_base_survey_in_min_duration_s"].isEnabled()
+    assert settings.settings_widgets["gnss_network_caster_host"].isEnabled()
+    assert settings.settings_widgets["gnss_fixed_coordinate_profile_path"].isEnabled()
+
+    operation_mode.setCurrentIndex(operation_mode.findData("LOCAL_SURVEY_IN"))
 
     settings.settings_widgets["interface_name"].setText("enx-workstation")
+    settings.settings_widgets["gnss_network_caster_host"].setText("caster.example.org")
+    settings.settings_widgets["gnss_network_caster_port"].setValue(2201)
+    settings.settings_widgets["gnss_network_mountpoint"].setText("VRS_RTCM32")
+    settings.settings_widgets["gnss_network_username_env"].setText("EXAMPLE_NTRIP_USER")
+    settings.settings_widgets["gnss_network_password_env"].setText("EXAMPLE_NTRIP_PASSWORD")
     settings.settings_widgets["gnss_network_tls"].setChecked(True)
     settings.settings_widgets["gnss_readiness_maximum_baseline_std_m"].setValue(0.1234)
     settings.settings_widgets["gnss_fixed_coordinate_profile_path"].setText("gnss/base.json")
+    settings.settings_widgets["gnss_route_left_enabled"].setChecked(False)
+    settings.settings_widgets["gnss_route_right_enabled"].setChecked(True)
+    settings.settings_widgets["gnss_route_drone_enabled"].setChecked(True)
+    settings.settings_widgets["gnss_require_drone_rtk_fixed"].setChecked(True)
     payload = settings.settings_payload()
     assert payload["interface_name"] == "enx-workstation"
-    assert "require_drone_rtk_fixed" not in payload["gnss_operation"]
-    assert payload["gnss_operation"]["routing"]["drone_enabled"] is False
+    assert payload["gnss_operation"]["require_drone_rtk_fixed"] is True
+    assert payload["gnss_operation"]["routing"]["left_enabled"] is False
+    assert payload["gnss_operation"]["routing"]["right_enabled"] is True
+    assert payload["gnss_operation"]["routing"]["drone_enabled"] is True
     assert payload["gnss_operation"]["routing"]["field_base_enabled"] is False
+    assert payload["gnss_base_rtcm_injection_target"] == "right"
+    assert payload["gnss_operation"]["network"]["caster_host"] == "caster.example.org"
+    assert payload["gnss_operation"]["network"]["caster_port"] == 2201
+    assert payload["gnss_operation"]["network"]["mountpoint"] == "VRS_RTCM32"
+    assert payload["gnss_operation"]["network"]["username_env"] == "EXAMPLE_NTRIP_USER"
+    assert payload["gnss_operation"]["network"]["password_env"] == "EXAMPLE_NTRIP_PASSWORD"
     assert payload["gnss_operation"]["network"]["tls"] is True
     assert payload["gnss_operation"]["readiness"]["maximum_baseline_std_m"] == pytest.approx(0.1234)
     assert payload["gnss_operation"]["fixed_base"]["coordinate_profile_path"] == "gnss/base.json"
@@ -3748,7 +4102,7 @@ def test_workstation_exposes_complete_system_settings_surface() -> None:
     app.processEvents()
 
 
-def test_workstation_gnss_settings_normalize_routes_to_supported_p1_p2_base_topology(
+def test_workstation_gnss_settings_preserve_drone_route_and_derive_field_base(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -3756,6 +4110,7 @@ def test_workstation_gnss_settings_normalize_routes_to_supported_p1_p2_base_topo
     from Workstation.workstation_core.settings import AppSettings
 
     monkeypatch.setattr(standalone_gui, "APP_ROOT", tmp_path)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     panel = standalone_gui.WirisStereoDistancePanel()
     operation = AppSettings().gnss_operation.to_mapping()
@@ -3774,12 +4129,12 @@ def test_workstation_gnss_settings_normalize_routes_to_supported_p1_p2_base_topo
     panel.apply_workstation_system_settings({"gnss_operation": operation})
 
     applied = panel._workstation_setting_overrides["gnss_operation"]
-    assert "require_drone_rtk_fixed" not in applied
-    assert applied["routing"]["drone_enabled"] is False
+    assert applied["require_drone_rtk_fixed"] is True
+    assert applied["routing"]["drone_enabled"] is True
     assert applied["routing"]["field_base_enabled"] is False
     built = panel._build_gnss_operation_config()
-    assert built.require_drone_rtk_fixed is False
-    assert built.routing.drone_enabled is False
+    assert built.require_drone_rtk_fixed is True
+    assert built.routing.drone_enabled is True
     assert built.routing.field_base_enabled is False
 
     panel._save_current_settings = lambda: None
@@ -3824,7 +4179,6 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         "camera_sync_warmup_timeout_s": "camera_sync_warmup_timeout_s",
     }
     calibration_aliases = {
-        "calibration_zoom_level": "zoom_level",
         "calibration_inner_cols": "inner_cols",
         "calibration_inner_rows": "inner_rows",
         "calibration_square_size_mm": "square_size_mm",
@@ -3834,20 +4188,35 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         "calibration_auto_target_pairs": "auto_target_pairs",
         "calibration_root": "calibration_root",
         "calibration_validation_mode": "validation_mode",
-        "calibration_validation_root": "validation_root",
-        "calibration_validation_json": "validation_json",
-        "calibration_validation_runs": "validation_runs",
-        "calibration_validation_pair_count": "validation_pair_count",
-        "calibration_validation_seed": "validation_seed",
+    }
+    retired_calibration_settings = {
+        "calibration_zoom_level",
+        "calibration_validation_root",
+        "calibration_validation_json",
+        "calibration_validation_runs",
+        "calibration_validation_pair_count",
+        "calibration_validation_seed",
+    }
+    compatibility_only_settings = {
+        # The visible GNSS surface now exposes independent P1/P2 route
+        # toggles; this flat target remains only for older settings files and
+        # the owner bridge.
+        "gnss_base_rtcm_injection_target",
     }
     flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation"}
 
     assert flat_fields - system_keys == (
-        set(measurement_aliases) | set(sync_aliases) | set(calibration_aliases)
+        set(measurement_aliases)
+        | set(sync_aliases)
+        | set(calibration_aliases)
+        | retired_calibration_settings
+        | compatibility_only_settings
     )
     assert set(measurement_aliases.values()) <= measurement_keys
     assert set(sync_aliases.values()) <= time_keys
     assert set(calibration_aliases.values()) <= calibration_keys
+    assert "zoom_level" not in calibration_keys
+    assert window.advanced.zoom_level_spin.value() > 0
     assert not set(sync_aliases.values()) & measurement_keys
 
     window.close()
@@ -3989,9 +4358,9 @@ def test_status_adapter_emits_one_snapshot_per_poll() -> None:
     adapter.refresh()
 
     assert len(snapshots) == 1
-    assert len(snapshots[0]) == 13
+    assert len(snapshots[0]) == 14
     assert len(polls) == 1
-    assert len(polls[0]) == 13
+    assert len(polls[0]) == 14
     adapter.refresh()
     assert len(snapshots) == 1
     assert len(polls) == 2
@@ -4094,6 +4463,53 @@ def test_status_adapter_separates_base_gnss_from_rover_baseline() -> None:
     assert "Survey-in=active(42s, 0.12m, obs=540)" in base.detail
     assert "baseline NED" not in base.detail
     assert aggregate is not None and "baseline NED" in aggregate.detail
+    _ = app
+
+
+def test_status_adapter_reports_ntrip_transport_and_rtcm_health_separately() -> None:
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    now = time.monotonic()
+    backend.panel.gnss_operation_manager = SimpleNamespace(
+        state=SimpleNamespace(value="NTRIP_ACTIVE"),
+        config=SimpleNamespace(
+            operation_mode=SimpleNamespace(value="NETWORK_RTK_DIRECT"),
+            network=SimpleNamespace(read_timeout_s=10.0),
+            readiness=SimpleNamespace(maximum_correction_age_s=3.0),
+        ),
+    )
+    backend.panel.gnss_network_connected = True
+    backend.panel.gnss_network_thread = object()
+    backend.panel.gnss_network_phase = "STREAMING"
+    backend.panel.gnss_network_stats = SimpleNamespace(
+        connected_at_monotonic_s=now - 10.0,
+        last_chunk_monotonic_s=now - 0.5,
+        bytes_received=2400,
+        chunks_received=12,
+    )
+    backend.panel.gnss_base_rtcm_stats = {
+        "frames": 4,
+        "last_frame_s": now - 1.0,
+    }
+
+    adapter = BackendStatusAdapter(backend)
+    adapter.refresh()
+    ntrip = adapter.model.record("gnss.ntrip")
+    assert ntrip is not None and ntrip.state == "RTCM_ACTIVE"
+    assert "chunks=12" in ntrip.detail
+    assert "RTCM age=" in ntrip.detail
+
+    backend.panel.gnss_base_rtcm_stats["last_frame_s"] = now - 4.0
+    adapter.refresh()
+    ntrip = adapter.model.record("gnss.ntrip")
+    assert ntrip is not None and ntrip.state == "RTCM_STALE"
+    assert ntrip.severity == StatusSeverity.BAD
+
+    backend.panel.gnss_network_connected = False
+    backend.panel.gnss_network_phase = "RECONNECTING"
+    adapter.refresh()
+    ntrip = adapter.model.record("gnss.ntrip")
+    assert ntrip is not None and ntrip.state == "RECONNECTING"
     _ = app
 
 
@@ -4360,6 +4776,9 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
     panel.workstation_refresh_px4_attitude_cal = lambda camera, read_params=True: calls.append(
         ("attitude", camera, read_params)
     )
+    panel.reset_px4_calibration_group = lambda camera, group: calls.append(
+        ("reset_calibration", camera, group)
+    )
     panel.workstation_apply_px4_mag_priorities = lambda camera, priorities: calls.append(
         ("apply_mag", camera, priorities)
     )
@@ -4379,6 +4798,7 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
     backend.advanced_open_px4_shell("right")
     backend.advanced_refresh_px4_mag("right")
     backend.advanced_refresh_px4_attitude_cal("right")
+    backend.pixhawk_reset_calibration("right", "compass")
     backend.advanced_apply_px4_mag_priorities("right", {"CAN1": 100})
     backend.advanced_save_px4_mag_params("right")
     backend.advanced_reboot_px4("right")
@@ -4395,6 +4815,7 @@ def test_advanced_backend_facades_delegate_without_creating_resource_owners() ->
         ("shell", "right"),
         ("mag", "right", True),
         ("attitude", "right", True),
+        ("reset_calibration", "right", "compass"),
         ("apply_mag", "right", {"CAN1": 100}),
         ("save_mag", "right"),
         ("reboot", "right"),
@@ -4784,10 +5205,8 @@ def test_workstation_uses_source_backed_alignment_calibration_and_recording_page
     assert [
         window.calibration.operation_tabs.tabText(index)
         for index in range(window.calibration.operation_tabs.count())
-    ] == ["Setup", "Capture", "R,t + Apply", "Validate"]
+    ] == ["Capture & Compute", "Load & Apply"]
     backend.calls.clear()
-    window.calibration.zoom_1x_button.click()
-    window.calibration.zoom_8x_button.click()
     window.calibration.zoom_query_button.click()
     for command_id in (
         "calibration.run_extrinsics",
@@ -4796,18 +5215,31 @@ def test_workstation_uses_source_backed_alignment_calibration_and_recording_page
         "calibration.apply_bundle",
     ):
         window.calibration.operation_buttons[command_id].click()
-    assert ("advanced_zoom", "both", "set", 1) in backend.calls
-    assert ("advanced_zoom", "both", "set", 8) in backend.calls
     assert ("advanced_zoom", "both", "query", None) in backend.calls
+    assert "detection.toggle" not in window.calibration.camera_buttons
+    assert "calibration.load_current_zoom_intrinsics" not in window.commands._specs
+    assert "calibration.apply_intrinsics" not in window.commands._specs
+    assert "calibration.run_validation" not in window.commands._specs
+    assert "calibration.scan_validation" not in window.commands._specs
+    advanced_zoom_button = window.calibration.findChildren(QtWidgets.QPushButton)[-1]
+    assert advanced_zoom_button.text() == "Advanced Zoom"
+    advanced_zoom_button.click()
+    assert window.workspace_host.currentWidget().widget() is window.advanced
+    assert window.advanced.tabs.currentIndex() == 0
     assert "calibration_run_extrinsics" in backend.calls
     assert "calibration_save_extrinsics" in backend.calls
     assert "calibration_load_extrinsics" in backend.calls
     assert "calibration_apply_bundle" in backend.calls
 
+    window.recording.pnp_capture_button.click()
+    assert "hr_capture" in backend.calls
+    assert window.recording.pnp_capture_button.text() == "HR Capture"
+
     window.measurement.refresh({})
-    assert "K,D=--" in window.measurement.active_calibration_label.text()
-    assert "R,t=--" in window.measurement.active_calibration_label.text()
-    assert "validation gate=disabled" in window.measurement.active_calibration_label.text()
+    assert not any(
+        "Calibration bundle:" in label.text()
+        for label in window.measurement.findChildren(QtWidgets.QLabel)
+    )
     window.close()
     app.processEvents()
     window.deleteLater()
@@ -4914,6 +5346,9 @@ def test_advanced_camera_control_sends_through_actual_panel_owner(monkeypatch) -
     window = WorkstationMainWindow()
     try:
         window._select_context("tasks.advanced")
+        # Any startup/alignment LRF polling belongs to the window lifecycle,
+        # not to this raw WIRIS command assertion.
+        sent.clear()
         window.advanced.wiris_command_edit.setText("HIWS")
         window.advanced.wiris_send_button.click()
         deadline = time.monotonic() + 2.0
@@ -5049,7 +5484,7 @@ def test_visible_time_workspace_recomputes_live_sync_summary_after_verification_
     app.processEvents()
 
 
-def test_lrf_polling_runs_only_while_alignment_workspace_is_selected() -> None:
+def test_lrf_query_runs_only_on_manual_refresh() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
     window = WorkstationMainWindow(backend=backend)
@@ -5057,10 +5492,13 @@ def test_lrf_polling_runs_only_while_alignment_workspace_is_selected() -> None:
     backend.calls.clear()
 
     window._select_context("processing.alignment")
-    assert backend.calls[-1] == "start_lrf_polling"
+    assert "query_lrf_once" not in backend.calls
 
     window._select_context("devices.cameras")
-    assert backend.calls[-1] == "stop_lrf_polling"
+    assert "query_lrf_once" not in backend.calls
+
+    assert window.commands.invoke("alignment.query_lrf") is True
+    assert backend.calls[-1] == "query_lrf_once"
 
     window.close()
     window.deleteLater()
@@ -5265,6 +5703,52 @@ def test_load_intrinsics_opens_file_picker_and_applies_selected_profile(
     app.processEvents()
 
 
+def test_save_intrinsics_uses_capture_zoom_for_filename(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from Workstation import standalone_gui
+    from Workstation.workstation_core.calibration import (
+        CameraIntrinsics,
+        CheckerboardConfig,
+        StereoIntrinsicsResult,
+    )
+
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_initial_status", lambda self: None)
+    monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = standalone_gui.WirisStereoDistancePanel(app_root=tmp_path)
+    root = tmp_path / "captures"
+    root.mkdir()
+    panel.calib_dir_edit.setText(str(root))
+    camera = CameraIntrinsics(
+        width=1920,
+        height=1080,
+        camera_matrix=[[1000.0, 0.0, 960.0], [0.0, 1001.0, 540.0], [0.0, 0.0, 1.0]],
+        distortion_coefficients=[0.0, 0.0, 0.0, 0.0, 0.0],
+        reprojection_error_px=0.2,
+        image_count=12,
+    )
+    panel.last_calibration_result = StereoIntrinsicsResult(
+        left=camera,
+        right=camera,
+        board=CheckerboardConfig(inner_cols=9, inner_rows=6, square_size_m=0.025),
+    )
+    panel.last_calibration_zoom_level = 8
+    panel.zoom_level_spin.setValue(1)
+    monkeypatch.setattr(panel, "_save_current_settings", lambda *_args, **_kwargs: None)
+
+    panel.save_intrinsics()
+
+    assert (root / "intrinsics_zoom_08.json").is_file()
+    assert not (root / "intrinsics_zoom_01.json").exists()
+    metadata = json.loads((root / "intrinsics_zoom_08.json").read_text(encoding="utf-8"))["metadata"]
+    assert metadata["capture_zoom_level"] == 8
+    assert metadata["zoom_source"] == "capture_metadata"
+    panel.deleteLater()
+    app.processEvents()
+
+
 def test_pixhawk_eth_mav_recovery_is_visible_and_routes_to_usb_owner() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
@@ -5276,12 +5760,15 @@ def test_pixhawk_eth_mav_recovery_is_visible_and_routes_to_usb_owner() -> None:
     pixhawk_layout = window.pixhawk.layout()
     assert [
         pixhawk_layout.itemAt(index).widget().title()
-        for index in range(2, 8)
+        for index in range(2, 11)
         if pixhawk_layout.itemAt(index).widget() is not None
     ] == [
         "Connection",
         "Attitude (R/P/Y)",
         "P1/P2 GNSS receivers",
+        "IMU magnetometer (MAVLink)",
+        "CAN magnetometer (dedicated MAVLink)",
+        "Pixhawk Parameters · calibration-owned groups",
         "P1→P2 baseline",
         "Discovered endpoints",
         "ETH MAV",
@@ -5289,10 +5776,10 @@ def test_pixhawk_eth_mav_recovery_is_visible_and_routes_to_usb_owner() -> None:
     top_actions = pixhawk_layout.itemAt(1).layout()
     assert [top_actions.itemAt(index).widget().text() for index in range(5)] == [
         "Connect",
+        "Disconnect",
         "Find USB",
         "Find network",
         "Find host IP",
-        "Swap P1/P2",
     ]
     assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p1"].text() == "P1 ETH MAV"
     assert window.pixhawk.operation_buttons["pixhawk.recover_eth_mavlink.p2"].text() == "P2 ETH MAV"
@@ -5377,9 +5864,12 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "camera.swap",
         "camera.save_settings",
     )
-    alignment_commands = (
+    pixhawk_commands = (
         "pixhawk.toggle_mavlink",
         "pixhawk.reset_level_calibration",
+        "alignment.swap_pixhawks",
+    )
+    gnss_commands = (
         "gnss.base_discover",
         "gnss.base_connect",
         "gnss.base_disconnect",
@@ -5393,24 +5883,16 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "calibration.run_intrinsic",
         "calibration.save_intrinsics",
         "calibration.load_intrinsics",
-        "calibration.load_current_zoom_intrinsics",
-        "calibration.apply_intrinsics",
-        "calibration.load_validation",
-        "calibration.run_validation",
-        "calibration.save_validation",
-        "calibration.apply_validation",
     )
 
     assert all(window.camera.operation_buttons[command].isEnabled() for command in camera_commands)
-    assert all(window.alignment.operation_buttons[command].isEnabled() for command in alignment_commands)
+    assert all(window.pixhawk.operation_buttons[command].isEnabled() for command in pixhawk_commands)
+    assert all(window.base_gnss.operation_buttons[command].isEnabled() for command in gnss_commands)
     assert all(window.calibration.operation_buttons[command].isEnabled() for command in calibration_commands)
-    for command in (*camera_commands, *alignment_commands, *calibration_commands):
+    for command in (*camera_commands, *pixhawk_commands, *gnss_commands, *calibration_commands):
         assert window.commands.invoke(command) is True
 
-    recent_calls = backend.calls[
-        -(len(camera_commands) + len(alignment_commands) + len(calibration_commands) + 2):
-    ]
-    assert [call[0] if isinstance(call, tuple) else call for call in recent_calls] == [
+    expected_calls = [
         "camera_discover_host_ip",
         "camera_check_rtsp",
         "camera_check_control",
@@ -5421,6 +5903,7 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "camera_save_settings",
         "pixhawk_toggle_mavlink",
         "pixhawk_reset_level_calibration",
+        "alignment_swap_pixhawks",
         "gnss_base_discover",
         "gnss_base_connect",
         "gnss_base_disconnect",
@@ -5433,14 +5916,9 @@ def test_workstation_exposes_phase_one_camera_pixhawk_and_gnss_commands() -> Non
         "calibration_run_intrinsic",
         "calibration_save_intrinsics",
         "calibration_load_intrinsics",
-        "calibration_load_current_zoom_intrinsics",
-        "calibration_apply_intrinsics",
-        "calibration_load_validation",
-        "calibration_apply_setup",
-        "calibration_run_validation",
-        "calibration_save_validation",
-        "calibration_apply_validation",
     ]
+    recent_calls = backend.calls[-len(expected_calls):]
+    assert [call[0] if isinstance(call, tuple) else call for call in recent_calls] == expected_calls
     window.close()
     app.processEvents()
     window.deleteLater()
@@ -5459,14 +5937,14 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     assert window.time_workspace.operation_buttons["time.apply_settings"].isEnabled()
     assert window.time_workspace.operation_buttons["time.save_settings"].isEnabled()
     assert window.calibration.operation_buttons["calibration.apply_setup"].isEnabled()
-    assert window.calibration.operation_buttons["calibration.scan_validation"].isEnabled()
+    assert "calibration.scan_validation" not in window.calibration.operation_buttons
     assert window.calibration.operation_buttons["calibration.save_setup"].isEnabled()
-    assert window.alignment.operation_buttons["alignment.scan_sources"].isEnabled()
-    assert window.alignment.operation_buttons["alignment.start_sampling"].isEnabled()
-    assert window.alignment.operation_buttons["alignment.stop_sampling"].isEnabled()
-    assert window.alignment.operation_buttons["alignment.save_profile"].isEnabled()
-    assert window.alignment.operation_buttons["alignment.load_profile"].isEnabled()
-    assert window.alignment.operation_buttons["alignment.swap_pixhawks"].isEnabled()
+    assert "alignment.scan_sources" not in window.alignment.operation_buttons
+    assert "alignment.start_sampling" not in window.alignment.operation_buttons
+    assert "alignment.stop_sampling" not in window.alignment.operation_buttons
+    assert "alignment.save_profile" not in window.alignment.operation_buttons
+    assert "alignment.load_profile" not in window.alignment.operation_buttons
+    assert "alignment.swap_pixhawks" not in window.alignment.operation_buttons
     measurement_payload = window.measurement.settings_payload()
     time_payload = window.time_workspace.settings_payload()
     assert measurement_payload["distance_mode"] in {"pixhawk", "checkerboard"}
@@ -5495,16 +5973,13 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     assert backend.calls[-2][0] == "calibration_apply_setup"
     assert backend.calls[-2][1]["validation_mode"] == "checkerboard"
     assert backend.calls[-1] == "calibration_run_intrinsic"
-    assert window.commands.invoke("calibration.run_validation") is True
-    assert backend.calls[-2][0] == "calibration_apply_setup"
-    assert backend.calls[-2][1]["validation_mode"] == "checkerboard"
-    assert backend.calls[-1] == "calibration_run_validation"
+    assert window.commands.invoke("calibration.run_validation") is False
     assert window.commands.invoke("measurement.apply_settings") is True
     assert window.commands.invoke("measurement.save_settings") is True
     assert window.commands.invoke("time.apply_settings") is True
     assert window.commands.invoke("time.save_settings") is True
     assert window.commands.invoke("calibration.apply_setup") is True
-    assert window.commands.invoke("calibration.scan_validation") is True
+    assert window.commands.invoke("calibration.scan_validation") is False
     assert window.commands.invoke("calibration.save_setup") is True
     assert window.commands.invoke("alignment.scan_sources") is True
     assert window.commands.invoke("alignment.start_sampling") is True
@@ -5512,16 +5987,15 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     assert window.commands.invoke("alignment.save_profile") is True
     assert window.commands.invoke("alignment.load_profile") is True
     assert window.commands.invoke("alignment.swap_pixhawks") is True
-    extended_calls = backend.calls[-14:]
-    assert extended_calls[0][0] == "measurement_apply_settings"
-    assert extended_calls[1] == "measurement_save_settings"
-    assert extended_calls[2][0] == "measurement_apply_settings"
-    assert extended_calls[3] == "measurement_save_settings"
-    assert extended_calls[4][0] == "calibration_apply_setup"
-    assert extended_calls[5] == "calibration_scan_validation"
-    assert extended_calls[6][0] == "calibration_apply_setup"
-    assert extended_calls[7] == "calibration_save_setup"
-    assert extended_calls[8:] == [
+    extended_calls = backend.calls[-13:]
+    assert [call[0] if isinstance(call, tuple) else call for call in extended_calls] == [
+        "measurement_apply_settings",
+        "measurement_save_settings",
+        "measurement_apply_settings",
+        "measurement_save_settings",
+        "calibration_apply_setup",
+        "calibration_apply_setup",
+        "calibration_save_setup",
         "alignment_scan_sources",
         "alignment_start_sampling",
         "alignment_stop_sampling",
@@ -5535,46 +6009,19 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     app.processEvents()
 
 
-def test_calibration_workspace_displays_run_by_run_results() -> None:
+def test_calibration_workspace_omits_validation_controls() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
-    backend.panel.checkerboard_validation_run_results = [
-        {
-            "run": "Full",
-            "pairs": 12,
-            "left_reprojection_error_px": 0.21,
-            "right_reprojection_error_px": 0.23,
-            "stereo_reprojection_error_px": 0.31,
-            "baseline_m": 0.42,
-            "baseline_delta_mm": 0.0,
-            "rotation_delta_deg": 0.0,
-            "left_intrinsics_delta_px": 0.0,
-            "right_intrinsics_delta_px": 0.0,
-            "state": "OK",
-        },
-        {
-            "run": "Random 1",
-            "pairs": 8,
-            "left_reprojection_error_px": 0.25,
-            "right_reprojection_error_px": 0.28,
-            "stereo_reprojection_error_px": 0.35,
-            "baseline_m": 0.421,
-            "baseline_delta_mm": 1.0,
-            "rotation_delta_deg": 0.02,
-            "left_intrinsics_delta_px": 0.4,
-            "right_intrinsics_delta_px": 0.5,
-            "state": "OK",
-        },
-    ]
     window = WorkstationMainWindow(backend=backend)
     window.status_adapter.stop()
     window.calibration.refresh(window.status_adapter.model.snapshot())
 
-    assert window.calibration.validation_run_model.rowCount() == 2
-    assert window.calibration.validation_run_model.item(0, 0).text() == "Full"
-    assert window.calibration.validation_run_model.item(1, 0).text() == "Random 1"
-    assert window.calibration.validation_run_model.item(1, 2).text() == "0.250"
-    assert "2 run(s)" in window.calibration.validation_run_status.text()
+    assert [
+        window.calibration.operation_tabs.tabText(index)
+        for index in range(window.calibration.operation_tabs.count())
+    ] == ["Capture & Compute", "Load & Apply"]
+    assert not hasattr(window.calibration, "validation_run_model")
+    assert not hasattr(window.calibration, "validation_run_status")
 
     window.close()
     window.deleteLater()

@@ -7,12 +7,13 @@ from typing import Protocol
 ACC_SLOTS = (0, 1, 2)
 GYRO_SLOTS = (0, 1, 2)
 
-ACCEL_AXIS_SUFFIXES = ("XOFF", "YOFF", "ZOFF", "XSCALE", "YSCALE", "ZSCALE")
-GYRO_AXIS_SUFFIXES = ("XOFF", "YOFF", "ZOFF")
+ACCEL_AXIS_SUFFIXES = ("ROT", "XOFF", "YOFF", "ZOFF", "XSCALE", "YSCALE", "ZSCALE")
+GYRO_AXIS_SUFFIXES = ("ROT", "XOFF", "YOFF", "ZOFF")
+# PX4's level-horizon calibration owns the board roll/pitch fine-tuning
+# offsets.  SENS_BOARD_Z_OFF remains a manual mounting parameter.
 LEVEL_HORIZON_RESET_PARAM_NAMES = (
     "SENS_BOARD_X_OFF",
     "SENS_BOARD_Y_OFF",
-    "SENS_BOARD_Z_OFF",
 )
 
 ATTITUDE_CAL_PARAM_NAMES = (

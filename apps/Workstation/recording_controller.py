@@ -123,6 +123,7 @@ RECORDING_CONTROLLER_METHODS = [
     "_upsert_pair_recording_row",
     "_record_unresolved_pair",
     "_append_distance_history",
+    "_append_extrinsics_comparison_snapshot",
     "_distance_history_class_name",
     "_fmt_record_float",
     "_fmt_record_bool",
@@ -408,11 +409,13 @@ class RecordingController:
             side: SpoolRows() for side in ("left", "right")
         }
         self.panel.gnss_base_recording_rows = SpoolRows()
+        self.panel.extrinsics_comparison_recording_rows = SpoolRows()
         for side, rows in self.panel.camera_recording_rows.items():
             rows.bind(spool_root / f"camera_{side}.jsonl")
         for side, rows in self.panel.px4_recording_rows.items():
             rows.bind(spool_root / f"px4_{side}.jsonl")
         self.panel.gnss_base_recording_rows.bind(spool_root / "gnss_base.jsonl")
+        self.panel.extrinsics_comparison_recording_rows.bind(spool_root / "extrinsics_comparison.jsonl")
         self.panel._recording_pair_row_index.clear()
         self.panel._recovered_session_metadata = None
         self.panel._recording_clock_sync_start_observation = None
@@ -503,6 +506,7 @@ class RecordingController:
         self.panel.camera_recording_rows = recovered.camera_rows
         self.panel.px4_recording_rows = recovered.px4_rows
         self.panel.gnss_base_recording_rows = recovered.gnss_base_rows
+        self.panel.extrinsics_comparison_recording_rows = recovered.extrinsics_comparison_rows
         self.panel._recovered_session_metadata = metadata
         self.panel._session_save_retry_required = True
         self.panel._session_save_finalized = False
@@ -928,6 +932,7 @@ class RecordingController:
             target_infos,
             capture_id=capture_id,
             completion_timeout_s=10.0,
+            **self._wiris_ftp_worker_kwargs(),
         )
         self.panel.pnp_photo_capture_worker.moveToThread(self.panel.pnp_photo_capture_thread)
         self.panel.pnp_photo_capture_thread.started.connect(self.panel.pnp_photo_capture_worker.run)
@@ -989,6 +994,7 @@ class RecordingController:
             target_infos,
             capture_id=capture_id,
             completion_timeout_s=10.0,
+            **self._wiris_ftp_worker_kwargs(),
         )
         self.panel.oz_photo_capture_worker.moveToThread(self.panel.oz_photo_capture_thread)
         self.panel.oz_photo_capture_thread.started.connect(self.panel.oz_photo_capture_worker.run)
@@ -1009,6 +1015,34 @@ class RecordingController:
             f"OZ Capture {capture_id}: 좌/우 카메라 내부 저장 중"
         )
         return True
+
+    def _wiris_ftp_worker_kwargs(self) -> dict[str, object]:
+        """FTP config shared by HR and OZ capture workers.
+
+        The FTP server lives on the same WIRIS Enterprise host as the
+        CPTR/ICPT command channel (only the port differs), so no separate
+        host is needed here -- the worker reuses the host from target_infos.
+        """
+
+        settings = getattr(self.panel, "settings", None)
+        output_dir = None
+        if self.panel.recording_session_id:
+            output_dir = self.panel._recording_session_dir(self.panel.recording_session_id) / "frames"
+        return {
+            "ftp_enabled": bool(getattr(settings, "wiris_ftp_enabled", False)),
+            "ftp_port": int(getattr(settings, "wiris_ftp_port", 21)),
+            "ftp_user": getattr(settings, "wiris_ftp_user", "anonymous"),
+            "ftp_password": getattr(settings, "wiris_ftp_password", ""),
+            "ftp_remote_dir": getattr(settings, "wiris_ftp_remote_dir", "/"),
+            "ftp_timeout_s": float(getattr(settings, "wiris_ftp_timeout_s", 10.0)),
+            "ftp_output_dir": output_dir,
+        }
+
+    def _wiris_ftp_status_text(self, ftp_downloaded: bool) -> str:
+        settings = getattr(self.panel, "settings", None)
+        if not bool(getattr(settings, "wiris_ftp_enabled", False)):
+            return "FTP=disabled"
+        return "FTP=ok" if ftp_downloaded else "FTP=failed"
 
     def _camera_photo_target_infos(self) -> tuple[tuple[str, str, int, float], ...]:
         return tuple(
@@ -1165,6 +1199,13 @@ class RecordingController:
             state == "completed" for state in camera_states
         ) else "partial_or_failed"
         record["stored_on_camera"] = record["state"] == "completed"
+        ftp_states = (
+            [bool(item.get("ftp_downloaded")) for item in cameras.values()]
+            if isinstance(cameras, dict)
+            else []
+        )
+        record["ftp_downloaded"] = bool(ftp_states) and all(ftp_states)
+        ftp_text = self._wiris_ftp_status_text(record["ftp_downloaded"])
         capture_id = str(record.get("capture_id") or "")
         record = self._hr_capture_event_record(
             record,
@@ -1173,10 +1214,10 @@ class RecordingController:
         )
         self.panel._append_pnp_photo_capture_record(record)
         self.panel._log(
-            f"[HR Capture] {capture_id} 카메라 내부 저장: state={record['state']}, FTP=disabled"
+            f"[HR Capture] {capture_id} 카메라 내부 저장: state={record['state']}, {ftp_text}"
         )
         self.panel.recording_status_label.setText(
-            f"HR Capture {capture_id}: {record['state']} · camera internal · FTP disabled"
+            f"HR Capture {capture_id}: {record['state']} · camera internal · {ftp_text}"
         )
 
     def _handle_pnp_photo_capture_failed(self, capture_id: str, error: str) -> None:
@@ -1207,6 +1248,13 @@ class RecordingController:
             state == "completed" for state in camera_states
         ) else "partial_or_failed"
         record["stored_on_camera"] = record["state"] == "completed"
+        ftp_states = (
+            [bool(item.get("ftp_downloaded")) for item in cameras.values()]
+            if isinstance(cameras, dict)
+            else []
+        )
+        record["ftp_downloaded"] = bool(ftp_states) and all(ftp_states)
+        ftp_text = self._wiris_ftp_status_text(record["ftp_downloaded"])
         capture_id = str(record.get("capture_id") or "")
         record = self._oz_capture_event_record(
             record,
@@ -1215,10 +1263,10 @@ class RecordingController:
         )
         self.panel._append_oz_photo_capture_record(record)
         self.panel._log(
-            f"[OZ Capture] {capture_id} 카메라 내부 저장: state={record['state']}, FTP=disabled"
+            f"[OZ Capture] {capture_id} 카메라 내부 저장: state={record['state']}, {ftp_text}"
         )
         self.panel.recording_status_label.setText(
-            f"OZ Capture {capture_id}: {record['state']} · camera internal · FTP disabled"
+            f"OZ Capture {capture_id}: {record['state']} · camera internal · {ftp_text}"
         )
 
     def _handle_oz_photo_capture_failed(self, capture_id: str, error: str) -> None:
@@ -1481,6 +1529,7 @@ class RecordingController:
             *self.panel.camera_recording_rows.values(),
             *self.panel.px4_recording_rows.values(),
             self.panel.gnss_base_recording_rows,
+            self.panel.extrinsics_comparison_recording_rows,
         ):
             if isinstance(rows, SpoolRows):
                 rows.close()
@@ -1498,6 +1547,7 @@ class RecordingController:
                     "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
                     "px4_right_sample_count": len(self.panel.px4_recording_rows["right"]),
                     "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
+                    "extrinsics_comparison_sample_count": len(self.panel.extrinsics_comparison_recording_rows),
                     "finalization": {
                         "requested_unix_ns": time.time_ns(),
                         "recovered_retry": True,
@@ -1559,6 +1609,7 @@ class RecordingController:
             camera_rows=dict(self.panel.camera_recording_rows),
             px4_rows=dict(self.panel.px4_recording_rows),
             gnss_base_rows=self.panel.gnss_base_recording_rows,
+            extrinsics_comparison_rows=self.panel.extrinsics_comparison_recording_rows,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1920,6 +1971,7 @@ class RecordingController:
             "px4_left_sample_count": len(self.panel.px4_recording_rows["left"]),
             "px4_right_sample_count": len(self.panel.px4_recording_rows["right"]),
             "gnss_base_sample_count": len(self.panel.gnss_base_recording_rows),
+            "extrinsics_comparison_sample_count": len(self.panel.extrinsics_comparison_recording_rows),
             "device_timeline_contract": {
                 "camera_row": "one row per frame delivered to the GUI frame_changed callback",
                 "camera_not_guaranteed": "not a one-to-one index of encoded MP4 frames",
@@ -2520,7 +2572,37 @@ class RecordingController:
         row["measurement_attempt_content_sha256"] = measurement_attempt_content_sha256
         row["measurement_attempt_instance_sha256"] = measurement_attempt_instance_sha256
         self.panel._upsert_pair_recording_row(measurement_attempt, row)
+        pair_sequence = self.panel._recording_pair_row_index.get(
+            tuple(measurement_attempt.detection_pair_key)
+        )
+        if pair_sequence is not None:
+            self.panel._append_extrinsics_comparison_snapshot(pair_sequence, timestamp_s)
         return True
+
+    def _append_extrinsics_comparison_snapshot(self, pair_sequence: int, timestamp_s: float) -> None:
+        """Snapshot the live per-method F/R/D/Range preview for one accepted pair.
+
+        ``geometry_comparison_rows`` is recomputed every ``_refresh_distance``
+        tick; only the value at the exact moment a pair is accepted is worth
+        persisting, so this is called once from ``_append_distance_history``
+        rather than on every tick.
+        """
+
+        if not self.panel.distance_recording_enabled:
+            return
+        for comparison_row in getattr(self.panel, "geometry_comparison_rows", ()) or ():
+            self.panel.extrinsics_comparison_recording_rows.append(
+                {
+                    "pair_sequence": pair_sequence,
+                    "timestamp_s": self.panel._fmt_record_float(timestamp_s, 6),
+                    "method": str(comparison_row.get("method", "")),
+                    "forward_m": self.panel._fmt_record_float(comparison_row.get("forward_m"), 6),
+                    "right_m": self.panel._fmt_record_float(comparison_row.get("right_m"), 6),
+                    "down_m": self.panel._fmt_record_float(comparison_row.get("down_m"), 6),
+                    "range_m": self.panel._fmt_record_float(comparison_row.get("range_m"), 6),
+                    "status": str(comparison_row.get("status", "")),
+                }
+            )
 
     def _distance_history_class_name(self, estimate) -> str | None:
         left_class_name = str(getattr(estimate.left, "class_name", "") or "").strip()

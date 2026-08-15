@@ -3,9 +3,7 @@ from __future__ import annotations
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from Workstation.workstation_core.theme import (
-    ACCENT,
     APP_BG,
-    ERROR,
     FONT_FAMILY,
     PANEL_ALT_BG,
     PANEL_BORDER,
@@ -20,6 +18,7 @@ from .inspector import InspectorWidget
 from .navigation import NavigationTree, canonical_context_id
 from .settings_workspace import SettingsWorkspace
 from .status_model import BackendStatusAdapter, RuntimeStatus
+from Workstation.workstation_core.px4_calibration_groups import PX4_CALIBRATION_GROUPS
 from .workspaces import (
     AlignmentWorkspace,
     AdvancedWorkspace,
@@ -27,11 +26,11 @@ from .workspaces import (
     CameraWorkspace,
     CalibrationWorkspace,
     DiagnosticsContent,
-    ExperimentWorkspace,
     MeasurementWorkspace,
     OverviewWorkspace,
     PixhawkWorkspace,
     RecordingWorkspace,
+    TelemetryWorkspace,
     TimeWorkspace,
 )
 
@@ -68,6 +67,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self._build_commands()
         self._build_shell()
         self._build_workspaces()
+        self.inspector.command_requested.connect(self._handle_inspector_command)
         self._apply_style()
         self._ui_settings = QtCore.QSettings("SASL", "StereoWIRIS Workstation")
         self._restore_ui_state()
@@ -185,16 +185,44 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "pixhawk.toggle_mavlink",
                 "Connect Pixhawk",
-                "Connect/disconnect the existing MAVLink Pixhawk path.",
+                "Legacy toggle for the existing MAVLink Pixhawk path.",
                 "device",
                 self._pixhawk_toggle_mavlink,
             ),
             (
+                "pixhawk.connect_mavlink",
+                "Connect Pixhawk",
+                "Connect the configured P1/P2 MAVLink Pixhawk endpoints.",
+                "device",
+                self._pixhawk_connect_mavlink,
+            ),
+            (
+                "pixhawk.disconnect_mavlink",
+                "Disconnect Pixhawk",
+                "Disconnect the configured P1/P2 MAVLink Pixhawk endpoints.",
+                "device",
+                self._pixhawk_disconnect_mavlink,
+            ),
+            (
                 "pixhawk.reset_level_calibration",
                 "Reset level cal.",
-                "Reset only PX4 SENS_BOARD_X_OFF/Y_OFF/Z_OFF to firmware defaults on connected Pixhawks.",
+                "Reset only PX4 SENS_BOARD_X_OFF/Y_OFF to firmware defaults on connected Pixhawks.",
                 "device",
                 self._pixhawk_reset_level_calibration,
+            ),
+            (
+                "pixhawk.refresh_parameters.p1",
+                "Refresh P1 parameters",
+                "Read P1 PX4 calibration parameters written by QGC and show their raw sensor-axis values.",
+                "device",
+                lambda: self._pixhawk_refresh_parameters("left"),
+            ),
+            (
+                "pixhawk.refresh_parameters.p2",
+                "Refresh P2 parameters",
+                "Read P2 PX4 calibration parameters written by QGC and show their raw sensor-axis values.",
+                "device",
+                lambda: self._pixhawk_refresh_parameters("right"),
             ),
             (
                 "pixhawk.recover_eth_mavlink.p1",
@@ -230,6 +258,41 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "List local IPv4 interfaces that can be used for Pixhawk Ethernet candidates.",
                 "device",
                 self._pixhawk_discover_host_ip,
+            ),
+            (
+                "telemetry.apply",
+                "Apply drone telemetry",
+                "Apply the active Drone Pixhawk endpoint and RTCM forwarding settings.",
+                "device",
+                self._telemetry_apply,
+            ),
+            (
+                "telemetry.connect",
+                "Connect drone telemetry",
+                "Connect the active Drone Pixhawk MAVLink endpoint and receive its GPS position.",
+                "device",
+                self._telemetry_connect,
+            ),
+            (
+                "telemetry.disconnect",
+                "Disconnect drone telemetry",
+                "Disconnect the active Drone Pixhawk MAVLink endpoint.",
+                "device",
+                self._telemetry_disconnect,
+            ),
+            (
+                "telemetry.save_settings",
+                "Save drone telemetry",
+                "Persist the active Drone Pixhawk endpoint and RTCM forwarding settings.",
+                "device",
+                self._telemetry_save_settings,
+            ),
+            (
+                "telemetry.discover_usb",
+                "Find USB telemetry radio",
+                "Probe /dev/serial/by-id, ttyACM, and ttyUSB candidates for a MAVLink heartbeat and fill the URL.",
+                "device",
+                self._telemetry_discover_usb,
             ),
             (
                 "gnss.base_discover",
@@ -282,6 +345,25 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
         ):
             self.commands.register(CommandSpec(command_id, text, tooltip, category, handler))
+        for side_code, camera in (("p1", "left"), ("p2", "right")):
+            for calibration in PX4_CALIBRATION_GROUPS:
+                if not calibration.resettable:
+                    continue
+                command_id = f"pixhawk.reset_calibration.{side_code}.{calibration.key}"
+                self.commands.register(
+                    CommandSpec(
+                        command_id,
+                        f"Reset {side_code.upper()} {calibration.label}",
+                        (
+                            f"Reset only {', '.join(calibration.reset_parameter_names)} "
+                            "to the connected PX4 firmware defaults."
+                        ),
+                        "device",
+                        lambda camera=camera, group=calibration.key: self._pixhawk_reset_calibration(
+                            camera, group
+                        ),
+                    )
+                )
         for command_id, text, tooltip, handler in (
             (
                 "time.set_pc",
@@ -349,7 +431,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "calibration.load_intrinsics",
                 "Load intrinsics",
-                "Choose an intrinsic JSON file, validate it, and apply it.",
+                "Choose an intrinsic JSON file and apply it.",
                 self._calibration_load_intrinsics,
             ),
             (
@@ -359,46 +441,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._calibration_load_extrinsics,
             ),
             (
-                "calibration.load_current_zoom_intrinsics",
-                "Load current zoom",
-                "Load and apply the saved intrinsic profile matching the current WIRIS zoom.",
-                self._calibration_load_current_zoom_intrinsics,
-            ),
-            (
-                "calibration.apply_intrinsics",
-                "Apply current K,D/R,t",
-                "Apply current K,D with the independently selected R,t, if any.",
-                self._calibration_apply_intrinsics,
-            ),
-            (
                 "calibration.apply_bundle",
                 "Apply K,D + R,t",
                 "Apply the independently selected K,D and R,t; source-zoom mismatch is informational only.",
                 self._calibration_apply_bundle,
-            ),
-            (
-                "calibration.load_validation",
-                "Load validation",
-                "Load checkerboard validation evidence through the existing owner.",
-                self._calibration_load_validation,
-            ),
-            (
-                "calibration.run_validation",
-                "Run validation",
-                "Run the existing checkerboard random validation pipeline.",
-                self._calibration_run_validation,
-            ),
-            (
-                "calibration.save_validation",
-                "Save validation",
-                "Save the existing checkerboard validation result.",
-                self._calibration_save_validation,
-            ),
-            (
-                "calibration.apply_validation",
-                "Apply validation",
-                "Apply the existing checkerboard validation result.",
-                self._calibration_apply_validation,
             ),
         ):
             self.commands.register(CommandSpec(command_id, text, tooltip, "calibration", handler))
@@ -418,14 +464,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             (
                 "calibration.apply_setup",
                 "Apply setup",
-                "Apply checkerboard geometry, zoom, path, and validation setup through the existing owner.",
+                "Apply checkerboard geometry, calculation mode, and capture path through the existing owner.",
                 self._calibration_apply_setup,
-            ),
-            (
-                "calibration.scan_validation",
-                "Find validation files",
-                "Scan the selected calibration validation root through the existing owner.",
-                self._calibration_scan_validation,
             ),
             (
                 "calibration.save_setup",
@@ -468,6 +508,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Swap P1/P2",
                 "Swap P1/P2 mapping through the existing owner; coordinate labels remain explicit.",
                 self._alignment_swap_pixhawks,
+            ),
+            (
+                "alignment.query_lrf",
+                "Refresh LRF",
+                "Run one on-demand WIRIS GLRD read on both cameras instead of a continuous poll.",
+                self._alignment_query_lrf,
             ),
         ):
             category = (
@@ -646,7 +692,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "time.set_pc",
             "time.check_sync",
             "pixhawk.toggle_mavlink",
+            "pixhawk.connect_mavlink",
+            "pixhawk.disconnect_mavlink",
             "pixhawk.reset_level_calibration",
+            "pixhawk.refresh_parameters.p1",
+            "pixhawk.refresh_parameters.p2",
             "pixhawk.recover_eth_mavlink.p1",
             "pixhawk.recover_eth_mavlink.p2",
             "pixhawk.discover_usb",
@@ -663,9 +713,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "calibration.run_extrinsics",
             "calibration.load_intrinsics",
             "calibration.load_extrinsics",
-            "calibration.load_current_zoom_intrinsics",
-            "calibration.run_validation",
-            "calibration.load_validation",
             "advanced.wiris.send",
             "advanced.zoom.in",
             "advanced.zoom.out",
@@ -686,6 +733,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             "advanced.media.open_video",
         ):
             self.commands.set_deferred_completion(command_id)
+        for side_code in ("p1", "p2"):
+            for calibration in PX4_CALIBRATION_GROUPS:
+                if calibration.resettable:
+                    self.commands.set_deferred_completion(
+                        f"pixhawk.reset_calibration.{side_code}.{calibration.key}"
+                    )
 
     def _build_shell(self) -> None:
         self.navigation_dock = QtWidgets.QDockWidget("Navigation", self)
@@ -744,6 +797,7 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ("pixhawk.left", "P1"),
             ("pixhawk.right", "P2"),
             ("gnss", "RTK"),
+            ("gnss.ntrip", "NTRIP"),
             ("detection", "DET"),
             ("measurement", "MEAS"),
             ("recording", "REC"),
@@ -766,7 +820,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         device_menu = self.menuBar().addMenu("Device")
         device_menu.addAction(self.commands.action("camera.toggle"))
         device_menu.addAction(self.commands.action("camera.auto_connect"))
-        device_menu.addAction(self.commands.action("pixhawk.toggle_mavlink"))
+        device_menu.addAction(self.commands.action("pixhawk.connect_mavlink"))
+        device_menu.addAction(self.commands.action("pixhawk.disconnect_mavlink"))
         device_menu.addAction(self.commands.action("pixhawk.reset_level_calibration"))
         device_menu.addAction(self.commands.action("pixhawk.recover_eth_mavlink.p1"))
         device_menu.addAction(self.commands.action("pixhawk.recover_eth_mavlink.p2"))
@@ -791,10 +846,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.status_adapter.model,
             self.commands.invoke,
         )
-        self.experiment = ExperimentWorkspace(self.backend)
         self.pixhawk = PixhawkWorkspace(
             self.backend,
             self.status_adapter.model,
+            self.commands.invoke,
+        )
+        self.telemetry = TelemetryWorkspace(
+            self.backend,
             self.commands.invoke,
         )
         self.base_gnss = BaseGnssWorkspace(
@@ -819,12 +877,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.alignment.inspection_requested.connect(
             lambda selection: self._inspect_selection("processing.alignment", selection)
         )
+        self.alignment.optical_pose_command_requested.connect(
+            self._handle_optical_pose_command
+        )
         self.measurement.inspection_requested.connect(
             lambda selection: self._inspect_selection("processing.measurement", selection)
         )
         self.calibration = CalibrationWorkspace(
             self.backend,
-            lambda: self._select_context("tasks.advanced"),
+            self._open_advanced_zoom,
             self.commands.invoke,
         )
         self.recording = RecordingWorkspace(
@@ -833,6 +894,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             lambda: self._select_context("tasks.advanced"),
             self.commands.invoke,
         )
+        self.recording.hr_command_requested.connect(self._handle_hr_command)
+        self.recording.ulog_command_requested.connect(self._handle_ulog_command)
         self.advanced = AdvancedWorkspace(
             self.backend,
             self.status_adapter.model,
@@ -855,8 +918,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ("camera", self.camera),
             ("time", self.time_workspace),
             ("measurement", self.measurement),
-            ("experiment", self.experiment),
             ("pixhawk", self.pixhawk),
+            ("telemetry", self.telemetry),
             ("base_gnss", self.base_gnss),
             ("alignment", self.alignment),
             ("calibration", self.calibration),
@@ -868,8 +931,212 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             self.workspace_scrolls[context_id] = scroll
             self._workspace_indexes[context_id] = self.workspace_host.addWidget(scroll)
         self.overview.open_context.connect(self._select_context)
-        self.experiment.open_context.connect(self._select_context)
         self._select_context("overview")
+
+    def _handle_hr_command(self, command_id: str, payload: object) -> None:
+        """Route camera still work while keeping file selection outside the workspace.
+
+        The dialog returns only a source path.  Exact-byte copy, decoding,
+        hashing, serial checks, and append-only event creation remain owned by
+        ``RecordingController`` behind the backend facade.
+        """
+
+        values = dict(payload) if isinstance(payload, dict) else {}
+        try:
+            if command_id in {"recording.hr.capture", "recording.oz.capture"}:
+                capture_method = (
+                    self.backend.capture_pnp_hr_photos
+                    if command_id == "recording.hr.capture"
+                    else self.backend.capture_pnp_oz_photos
+                )
+                try:
+                    result = capture_method(str(values.get("purpose") or "unspecified"))
+                except TypeError:
+                    # Compatibility for test/legacy facades while the real
+                    # Workstation owner records the typed purpose.
+                    result = capture_method()
+            elif command_id == "recording.hr.import":
+                source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    f"Import {str(values.get('side') or '').title()} HR image",
+                    "",
+                    "Images (*.png *.jpg *.jpeg *.tif *.tiff);;All files (*)",
+                )
+                if not source_path:
+                    self.statusBar().showMessage("HR import cancelled", 2500)
+                    return
+                result = self.backend.import_hr_files(
+                    str(values.get("capture_id") or ""),
+                    side=str(values.get("side") or ""),
+                    path=source_path,
+                    purpose=str(values.get("purpose") or "unspecified"),
+                )
+            else:
+                raise RuntimeError(f"unknown camera still command: {command_id}")
+        except Exception as exc:
+            status_label = (
+                self.recording.pnp_capture_status_label
+                if command_id.startswith("recording.hr")
+                else self.recording.oz_capture_status_label
+            )
+            status_label.setText(f"{command_id.rsplit('.', 2)[-2].upper()} ERROR · {exc}")
+            self.statusBar().showMessage(f"{command_id}: {exc}", 6000)
+            return
+        state = "in progress" if command_id.endswith("capture") else "imported"
+        if result is False:
+            state = "rejected"
+        elif isinstance(result, dict):
+            state = str(result.get("state", state) or state)
+        status_label = (
+            self.recording.pnp_capture_status_label
+            if command_id.startswith("recording.hr")
+            else self.recording.oz_capture_status_label
+        )
+        channel_label = "HR" if command_id.startswith("recording.hr") else "OZ"
+        status_label.setText(f"{channel_label} {state}")
+        self.statusBar().showMessage(f"{command_id}: {state}", 3000)
+
+    def _handle_ulog_command(self, command_id: str, payload: object) -> None:
+        if command_id != "recording.ulog.import":
+            return
+        values = dict(payload) if isinstance(payload, dict) else {}
+        source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            f"Import {str(values.get('source') or '').upper()} ULog",
+            "",
+            "PX4 ULog (*.ulg *.ulog);;All files (*)",
+        )
+        if not source_path:
+            self.recording.ulog_status_label.setText("ULog import cancelled")
+            return
+        values["path"] = source_path
+        try:
+            result = self.backend.ulog_import(values)
+        except Exception as exc:
+            self.recording.ulog_status_label.setText(f"ULog ERROR · {exc}")
+            self.statusBar().showMessage(f"ULog import: {exc}", 6000)
+            return
+        self.recording.apply_ulog_snapshot(result)
+        self.statusBar().showMessage("ULog imported and hash-verified", 3500)
+
+    def _handle_optical_pose_command(self, command_id: str, payload: object) -> None:
+        """Route typed OpticalPosePane requests through backend owner facades."""
+
+        values = dict(payload) if isinstance(payload, dict) else {}
+        try:
+            if command_id == "alignment.pose.apply_candidate":
+                result = self.backend.optical_pose_apply_candidate(values)
+            elif command_id == "alignment.pose.revert":
+                result = self.backend.optical_pose_revert(values)
+            elif command_id == "alignment.pose.capture_burst":
+                # Native burst acquisition is retained as an explicit owner
+                # boundary; capture cannot be faked from the downscaled UI.
+                method = getattr(self.backend, "optical_pose_capture_burst", None)
+                if not callable(method):
+                    raise RuntimeError("native frozen-burst owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.import_burst":
+                method = getattr(self.backend, "optical_pose_import_burst", None)
+                if not callable(method):
+                    raise RuntimeError("frozen-burst import owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.auto_select_horizon":
+                method = getattr(self.backend, "optical_pose_auto_select_horizon", None)
+                if not callable(method):
+                    raise RuntimeError("automatic Horizon selector owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.auto_select_mountain":
+                method = getattr(self.backend, "optical_pose_auto_select_mountain", None)
+                if not callable(method):
+                    raise RuntimeError("automatic Mountain selector owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.use_suggestion":
+                method = getattr(self.backend, "optical_pose_accept_suggestion", None)
+                if not callable(method):
+                    raise RuntimeError("automatic suggestion approval owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.annotation_changed":
+                method = getattr(self.backend, "optical_pose_record_annotation", None)
+                if not callable(method):
+                    raise RuntimeError("optical-pose annotation persistence owner is not available")
+                result = method(values)
+            else:
+                method_name = {
+                    "alignment.pose.solve_horizon": "optical_pose_solve_horizon",
+                    "alignment.pose.solve_gnss_mountain": "optical_pose_solve_gnss_mountain",
+                    "alignment.pose.solve_drone_yaw": "optical_pose_solve_drone_yaw",
+                    "alignment.pose.solve_combined": "optical_pose_solve_combined",
+                }.get(command_id)
+                method = getattr(self.backend, str(method_name), None)
+                if not method_name or not callable(method):
+                    raise RuntimeError(f"pose solver owner is not available: {command_id}")
+                if command_id == "alignment.pose.solve_drone_yaw" and not (
+                    values.get("drone_yaw") or values.get("observations")
+                ):
+                    source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+                        self,
+                        "Import Drone RTK yaw observation JSON",
+                        "",
+                        "JSON (*.json);;All files (*)",
+                    )
+                    if not source_path:
+                        self.statusBar().showMessage(
+                            "Drone RTK observation import cancelled", 2500
+                        )
+                        return
+                    values["drone_yaw_path"] = source_path
+                result = method(values)
+        except Exception as exc:
+            # This is the *only* feedback when a command never produces a
+            # suggestion/candidate at all (e.g. auto-select failing before
+            # _require_frozen_intrinsics() clears) -- give it as much room as
+            # the "not eligible" case below, not the default 3s toast.
+            self.statusBar().showMessage(f"{command_id}: failed — {exc}", 10000)
+            if command_id in {
+                "alignment.pose.auto_select_horizon",
+                "alignment.pose.auto_select_mountain",
+            }:
+                # The status bar toast fades in 10s; keep the reason visible
+                # next to the Auto-select buttons until the next attempt.
+                self.alignment.optical_pose_pane.set_auto_suggestion_error(command_id, str(exc))
+            return
+        snapshot = result if isinstance(result, dict) and "candidates" in result else self.backend.optical_pose_snapshot()
+        if isinstance(snapshot, dict):
+            self.alignment.optical_pose_pane.apply_snapshot(snapshot)
+        self.inspector.refresh(self._current_context, self.status_adapter.model)
+        message = f"{command_id}: accepted"
+        duration_ms = 3000
+        if command_id in {
+            "alignment.pose.auto_select_horizon",
+            "alignment.pose.auto_select_mountain",
+        } and isinstance(snapshot, dict):
+            suggestions = snapshot.get("auto_suggestions")
+            latest = suggestions[-1] if isinstance(suggestions, list) and suggestions else None
+            if isinstance(latest, dict):
+                pose_state = str(latest.get("state") or "UNKNOWN")
+                confidence = latest.get("confidence")
+                confidence_text = f"{float(confidence):.2f}" if isinstance(confidence, (int, float)) else "--"
+                if latest.get("eligible", False):
+                    message = f"{command_id}: {pose_state} (confidence={confidence_text})"
+                else:
+                    reason = str(latest.get("failure_reason") or "no eligible detection")
+                    message = f"{command_id}: {pose_state} — {reason}"
+                    duration_ms = 8000
+        self.statusBar().showMessage(message, duration_ms)
+
+    def _handle_inspector_command(self, command_id: str, payload: object) -> None:
+        """Route Inspector actions through the same owner/command boundaries."""
+
+        if str(command_id).startswith("alignment.pose."):
+            self._handle_optical_pose_command(command_id, payload)
+            return
+        try:
+            self.commands.invoke(str(command_id))
+        except Exception as exc:
+            self.statusBar().showMessage(f"{command_id}: {exc}", 6000)
+            return
+        self._refresh_visible_surfaces(self.status_adapter.model.snapshot())
+        self.inspector.refresh(self._current_context, self.status_adapter.model)
 
     @staticmethod
     def _scroll_container(
@@ -938,14 +1205,14 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             page = "camera"
         elif context_id == "devices.time":
             page = "time"
-        elif context_id == "processing.experiment":
-            page = "experiment"
         elif context_id in {"processing.measurement"}:
             page = "measurement"
         elif context_id in {"tasks.recording"}:
             page = "recording"
         elif context_id in {"devices.pixhawk", "devices.pixhawk.p1", "devices.pixhawk.p2"}:
             page = "pixhawk"
+        elif context_id == "devices.telemetry":
+            page = "telemetry"
         elif context_id == "devices.gnss":
             page = "base_gnss"
         elif context_id == "processing.alignment":
@@ -966,26 +1233,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         if isinstance(page, str):
             self.workspace_host.setCurrentIndex(self._workspace_indexes[page])
         if page == "alignment":
-            start_lrf = getattr(self.backend, "start_lrf_polling", None)
-            if callable(start_lrf):
-                try:
-                    start_lrf()
-                except Exception as exc:
-                    self.statusBar().showMessage(f"LRF polling: {exc}", 5000)
             self.alignment.select_tab_for_context(context_id)
-        elif isinstance(page, str):
-            stop_lrf = getattr(self.backend, "stop_lrf_polling", None)
-            if callable(stop_lrf):
-                try:
-                    stop_lrf()
-                except Exception as exc:
-                    self.statusBar().showMessage(f"LRF polling stop: {exc}", 5000)
         self._refresh_visible_surfaces(self.status_adapter.model.snapshot())
         self.inspector.refresh(context_id, self.status_adapter.model)
         if context_id.startswith("diagnostics"):
             self.diagnostics.select_tab_for_context(context_id)
         if context_id not in {"overview"} and self.navigation.currentIndex().data(QtCore.Qt.UserRole) != context_id:
             self.navigation.select_context(context_id)
+
+    def _open_advanced_zoom(self) -> None:
+        """Open the shared Advanced camera-control surface for physical zoom."""
+
+        self._select_context("tasks.advanced")
+        if hasattr(self, "advanced") and hasattr(self.advanced, "tabs"):
+            self.advanced.tabs.setCurrentIndex(0)
 
     def _inspect_selection(self, context_id: str, selection: object) -> None:
         if not isinstance(selection, dict):
@@ -1046,8 +1307,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _pixhawk_toggle_mavlink(self) -> object:
         return self.backend.pixhawk_toggle_mavlink()
 
+    def _pixhawk_connect_mavlink(self) -> object:
+        return self.backend.pixhawk_connect_mavlink()
+
+    def _pixhawk_disconnect_mavlink(self) -> object:
+        return self.backend.pixhawk_disconnect_mavlink()
+
     def _pixhawk_reset_level_calibration(self) -> object:
         return self.backend.pixhawk_reset_level_calibration()
+
+    def _pixhawk_refresh_parameters(self, camera: str) -> object:
+        return self.backend.advanced_refresh_px4_calibration_params(camera, read_params=True)
+
+    def _pixhawk_reset_calibration(self, camera: str, group: str) -> object:
+        return self.backend.pixhawk_reset_calibration(camera, group)
 
     def _pixhawk_recover_eth_mavlink(self, camera: str) -> object:
         return self.backend.pixhawk_recover_eth_mavlink(camera)
@@ -1060,6 +1333,21 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _pixhawk_discover_host_ip(self) -> object:
         return self.backend.pixhawk_discover_host_ip()
+
+    def _telemetry_apply(self) -> object:
+        return self.backend.drone_telemetry_configure(self.telemetry.payload())
+
+    def _telemetry_connect(self) -> object:
+        return self.backend.drone_telemetry_connect(self.telemetry.payload())
+
+    def _telemetry_disconnect(self) -> object:
+        return self.backend.drone_telemetry_disconnect()
+
+    def _telemetry_save_settings(self) -> object:
+        return self.backend.drone_telemetry_save_settings(self.telemetry.payload())
+
+    def _telemetry_discover_usb(self) -> object:
+        return self.backend.drone_telemetry_discover_usb()
 
     def _gnss_base_discover(self) -> object:
         return self.backend.gnss_base_discover()
@@ -1113,27 +1401,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _calibration_load_extrinsics(self) -> object:
         return self.backend.calibration_load_extrinsics()
 
-    def _calibration_load_current_zoom_intrinsics(self) -> object:
-        return self.backend.calibration_load_current_zoom_intrinsics()
-
-    def _calibration_apply_intrinsics(self) -> object:
-        return self.backend.calibration_apply_intrinsics()
-
     def _calibration_apply_bundle(self) -> object:
         return self.backend.calibration_apply_bundle()
-
-    def _calibration_load_validation(self) -> object:
-        return self.backend.calibration_load_validation()
-
-    def _calibration_run_validation(self) -> object:
-        self.backend.calibration_apply_setup(self.calibration.setup_payload())
-        return self.backend.calibration_run_validation()
-
-    def _calibration_save_validation(self) -> object:
-        return self.backend.calibration_save_validation()
-
-    def _calibration_apply_validation(self) -> object:
-        return self.backend.calibration_apply_validation()
 
     def _measurement_apply_settings(self) -> object:
         return self.backend.apply_measurement_settings(self.measurement.settings_payload())
@@ -1149,9 +1418,6 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _calibration_apply_setup(self) -> object:
         return self.backend.calibration_apply_setup(self.calibration.setup_payload())
-
-    def _calibration_scan_validation(self) -> object:
-        return self.backend.calibration_scan_validation()
 
     def _calibration_save_setup(self) -> object:
         self.backend.calibration_apply_setup(self.calibration.setup_payload())
@@ -1174,6 +1440,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _alignment_swap_pixhawks(self) -> object:
         return self.backend.alignment_swap_pixhawks()
+
+    def _alignment_query_lrf(self) -> object:
+        return self.backend.query_lrf_once()
 
     def _advanced_wiris_send(self) -> object:
         return self.backend.advanced_send_wiris_command(
@@ -1307,7 +1576,24 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         self.commands.set_enabled("camera.reactivate_right", not recording_locked and not rtsp_operation_active)
         self.commands.set_enabled("alignment.swap_pixhawks", not recording_locked)
         self.commands.set_enabled("pixhawk.toggle_mavlink", not recording_locked)
+        pixhawk_states = {
+            str(snapshot.get(key).state).upper()
+            for key in ("pixhawk.left", "pixhawk.right")
+            if snapshot.get(key) is not None
+        }
+        pixhawk_connected = bool(pixhawk_states & {"LIVE", "CONNECTED", "STARTING"})
+        pixhawk_connecting = getattr(panel, "pixhawk_connection_thread", None) is not None
+        pixhawk_active = pixhawk_connected or pixhawk_connecting
+        self.commands.set_enabled("pixhawk.connect_mavlink", not recording_locked and not pixhawk_active)
+        self.commands.set_enabled("pixhawk.disconnect_mavlink", not recording_locked and pixhawk_active)
         self.commands.set_enabled("pixhawk.reset_level_calibration", not recording_locked)
+        for side_code in ("p1", "p2"):
+            for calibration in PX4_CALIBRATION_GROUPS:
+                if calibration.resettable:
+                    self.commands.set_enabled(
+                        f"pixhawk.reset_calibration.{side_code}.{calibration.key}",
+                        not recording_locked,
+                    )
         bootstrap_active = getattr(panel, "pixhawk_usb_bootstrap_thread", None) is not None
         for command_id in (
             "pixhawk.recover_eth_mavlink.p1",
@@ -1334,21 +1620,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         detection = snapshot.get("detection")
         self.commands.set_text("detection.toggle", "Stop detection" if detection and detection.state in {"RUNNING", "STARTING"} else "Detection")
         self.commands.set_text("recording.toggle", "Stop recording" if recording and recording.state in {"ACTIVE", "FINALIZING"} else "Record")
-        pixhawk_states = {
-            str(snapshot.get(key).state).upper()
-            for key in ("pixhawk.left", "pixhawk.right")
-            if snapshot.get(key) is not None
-        }
-        pixhawk_connected = bool(pixhawk_states & {"LIVE", "CONNECTED", "STARTING"})
         self.commands.set_text(
             "pixhawk.toggle_mavlink",
             "Disconnect Pixhawk MAVLink" if pixhawk_connected else "Connect Pixhawk MAVLink",
         )
-        pixhawk_button = self.alignment.operation_buttons.get("pixhawk.toggle_mavlink")
-        if pixhawk_button is not None:
-            pixhawk_button.setText(
-                "Disconnect Pixhawk MAVLink" if pixhawk_connected else "Connect Pixhawk MAVLink"
-            )
 
     def _refresh_evidence_from_poll(self, snapshot: object) -> None:
         if not isinstance(snapshot, dict):

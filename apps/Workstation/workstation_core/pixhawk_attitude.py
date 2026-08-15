@@ -65,6 +65,7 @@ class MagSensorState:
     timestamp_s: float
     topic: str
     device_id: int | None = None
+    node_id: int | None = None
     x: float | None = None
     y: float | None = None
     z: float | None = None
@@ -85,12 +86,70 @@ class MagSensorState:
     mavlink_message_id: int | None = None
 
 
+def parse_px4_sensor_mag_shell_output(
+    output: str,
+    *,
+    camera: str,
+    timestamp_s: float | None = None,
+) -> tuple[MagSensorState, ...]:
+    """Parse PX4 ``listener sensor_mag`` output for known CAN mags.
+
+    PX4 prints producer values in sensor axes (FRD).  Shell output has no
+    transport timestamp, so ``timestamp_s`` is the local receipt time used
+    only for freshness; the PX4 ``timestamp`` field is retained separately.
+    """
+    if not output:
+        return ()
+    received_s = time.monotonic() if timestamp_s is None else float(timestamp_s)
+    blocks = re.split(r"(?=TOPIC:\s*sensor_mag\b)", str(output), flags=re.IGNORECASE)
+    states: list[MagSensorState] = []
+    for block in blocks:
+        if "TOPIC:" not in block or "sensor_mag" not in block.lower():
+            continue
+
+        def number(field: str) -> float | None:
+            match = re.search(rf"^\s*{re.escape(field)}\s*:\s*([-+0-9.eE]+)", block, re.MULTILINE)
+            return None if match is None else float(match.group(1))
+
+        device_match = re.search(r"^\s*device_id\s*:\s*(-?\d+)", block, re.MULTILINE)
+        if device_match is None:
+            continue
+        device_id = int(device_match.group(1))
+        if device_id in RM3100_PRIMARY_IDS:
+            sensor_slot = "CAN1"
+        elif device_id in RM3100_BACKUP_IDS:
+            sensor_slot = "CAN2"
+        else:
+            continue
+        x, y, z = number("x"), number("y"), number("z")
+        timestamp_us = number("timestamp")
+        instance_match = re.search(r"TOPIC:\s*sensor_mag\s+instance\s+(\d+)", block, re.IGNORECASE)
+        states.append(
+            MagSensorState(
+                camera=camera,
+                namespace="px4_shell",
+                sensor_slot=sensor_slot,
+                timestamp_s=received_s,
+                topic=f"px4-shell/sensor_mag/{instance_match.group(1) if instance_match else '?'}",
+                device_id=device_id,
+                x=x,
+                y=y,
+                z=z,
+                magnitude=(math.sqrt(x * x + y * y + z * z) if None not in (x, y, z) else None),
+                px4_timestamp_s=(timestamp_us * 1e-6 if timestamp_us is not None else None),
+            )
+        )
+    return tuple(states)
+
+
 def magnetometer_value_units(topic: object) -> str:
     """Return the unit carried by a raw magnetometer telemetry topic."""
     topic_text = str(topic)
     if topic_text.startswith("mavlink/SCALED_IMU"):
         return "mG"
     if "sensor_mag" in topic_text or "vehicle_magnetometer" in topic_text:
+        return "G"
+    if "CAN_MAG" in topic_text.upper():
         return "G"
     return ""
 
@@ -239,6 +298,17 @@ MAVLINK_MESSAGE_IDS = {
     "SCALED_IMU": 26,
     "SCALED_IMU2": 116,
     "SCALED_IMU3": 129,
+    "DEBUG_VECT": 250,
+}
+MAVLINK_MAG_STREAMS = (
+    ("CAN1", "IMU stream 1", "SCALED_IMU"),
+    ("CAN2", "IMU stream 2", "SCALED_IMU2"),
+    ("CAN3", "IMU stream 3", "SCALED_IMU3"),
+)
+MAVLINK_CAN_MAG_MESSAGE_TYPES = frozenset(("CAN_MAG", "CAN_MAGNETOMETER", "SASL_CAN_MAG"))
+MAVLINK_MAG_SLOT_BY_MESSAGE = {
+    message_name: sensor_slot
+    for sensor_slot, _imu_label, message_name in MAVLINK_MAG_STREAMS
 }
 MAVLINK_RM3100_STREAM_REQUESTS = (
     ("ATTITUDE", 30.0),
@@ -250,6 +320,7 @@ MAVLINK_RM3100_STREAM_REQUESTS = (
     ("SCALED_IMU", 20.0),
     ("SCALED_IMU2", 20.0),
     ("SCALED_IMU3", 20.0),
+    ("DEBUG_VECT", 20.0),
     ("RAW_IMU", 20.0),
     ("LOCAL_POSITION_NED", 10.0),
     ("GLOBAL_POSITION_INT", 10.0),
@@ -590,22 +661,22 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 self.status_changed.emit(f"{camera_label_ko(camera)} MAVLink stream 명령 슬롯 실패: {exc}")
 
     def read_param_int(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | None:
-        connection = self.connections.get(camera)
-        if connection is None:
-            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        return _mavlink_read_param_int(connection, name, timeout_s=timeout_s)
+        # PARAM reads must reserve the receive path (see exclusive_command's
+        # docstring) or spin_once's 20ms timer silently drains the
+        # PARAM_VALUE response before this blocking read ever sees it.
+        with self.exclusive_command(camera):
+            connection = self.connections[camera]
+            return _mavlink_read_param_int(connection, name, timeout_s=timeout_s)
 
     def read_param(self, camera: str, name: str, *, timeout_s: float = 2.0) -> int | float | None:
-        connection = self.connections.get(camera)
-        if connection is None:
-            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        return _mavlink_read_param(connection, name, timeout_s=timeout_s)
+        with self.exclusive_command(camera):
+            connection = self.connections[camera]
+            return _mavlink_read_param(connection, name, timeout_s=timeout_s)
 
     def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float = 2.0) -> int | None:
-        connection = self.connections.get(camera)
-        if connection is None:
-            raise RuntimeError(f"{camera_label_ko(camera)} MAVLink 연결이 없습니다.")
-        actual = _mavlink_set_param_int(connection, name, int(value), timeout_s=timeout_s)
+        with self.exclusive_command(camera):
+            connection = self.connections[camera]
+            actual = _mavlink_set_param_int(connection, name, int(value), timeout_s=timeout_s)
         if actual == int(value):
             self.status_changed.emit(f"{camera_label_ko(camera)} PX4 param 설정 확인: {name}={actual}")
         else:
@@ -865,6 +936,16 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             return
         if message_type in {"SCALED_IMU", "SCALED_IMU2", "SCALED_IMU3"}:
             mag = _mag_sensor_state_from_mavlink(camera, namespace, message, message_type, now_s)
+            if mag is not None:
+                self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
+            return
+        if message_type in MAVLINK_CAN_MAG_MESSAGE_TYPES:
+            mag = _can_mag_sensor_state_from_mavlink(camera, namespace, message, message_type, now_s)
+            if mag is not None:
+                self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
+            return
+        if message_type == "DEBUG_VECT":
+            mag = _can_mag_sensor_state_from_debug_vect(camera, namespace, message, now_s)
             if mag is not None:
                 self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
             return
@@ -1213,7 +1294,7 @@ def _mag_sensor_state_from_mavlink(
     z = _optional_float(message, "zmag")
     if x is None or y is None or z is None:
         return None
-    slot = {"SCALED_IMU": "CAN1", "SCALED_IMU2": "CAN2", "SCALED_IMU3": "CAN3"}.get(message_type, "CAN?")
+    slot = MAVLINK_MAG_SLOT_BY_MESSAGE.get(message_type, "CAN?")
     return MagSensorState(
         camera=camera,
         namespace=namespace,
@@ -1234,6 +1315,91 @@ def _mag_sensor_state_from_mavlink(
         gyro_y=_optional_float(message, "ygyro"),
         gyro_z=_optional_float(message, "zgyro"),
         time_boot_ms=_optional_int(message, "time_boot_ms"),
+    )
+
+
+def _can_mag_sensor_state_from_mavlink(
+    camera: str, namespace: str, message: Any, message_type: str, timestamp_s: float
+) -> MagSensorState | None:
+    """Decode a firmware-provided per-CAN magnetometer MAVLink message.
+
+    This deliberately accepts only a dedicated CAN message family.  The
+    standard SCALED_IMU* messages are handled separately because their stream
+    number identifies an onboard IMU, not a CAN port.
+    """
+
+    x = _optional_float(message, "xmag")
+    y = _optional_float(message, "ymag")
+    z = _optional_float(message, "zmag")
+    if x is None or y is None or z is None:
+        return None
+
+    raw_port = getattr(message, "can_port", getattr(message, "bus", getattr(message, "port", None)))
+    port_text = str(raw_port or "").strip().upper()
+    if port_text.startswith("CAN"):
+        sensor_slot = port_text
+    else:
+        port_number = _optional_int(message, "can_port")
+        if port_number is None:
+            port_number = _optional_int(message, "bus")
+        sensor_slot = f"CAN{port_number}" if port_number is not None else "CAN?"
+
+    timestamp_us = _optional_int(message, "time_usec")
+    if timestamp_us is None:
+        timestamp_us = _optional_int(message, "timestamp")
+    return MagSensorState(
+        camera=camera,
+        namespace=namespace,
+        sensor_slot=sensor_slot,
+        timestamp_s=timestamp_s,
+        topic=f"mavlink/{message_type}",
+        device_id=_optional_int(message, "device_id"),
+        node_id=_optional_int(message, "node_id"),
+        x=x,
+        y=y,
+        z=z,
+        magnitude=math.sqrt(x * x + y * y + z * z),
+        temperature_c=_optional_float(message, "temperature"),
+        px4_timestamp_s=None if timestamp_us is None else float(timestamp_us) * 1e-6,
+    )
+
+
+def _can_mag_sensor_state_from_debug_vect(
+    camera: str, namespace: str, message: Any, timestamp_s: float
+) -> MagSensorState | None:
+    """Decode the PX4 1.17 CAN-RM3100 DEBUG_VECT compatibility stream."""
+
+    name = getattr(message, "name", "")
+    if isinstance(name, bytes):
+        name = name.split(b"\0", 1)[0].decode("ascii", errors="ignore")
+    name = str(name).strip(" \0")
+    known = {
+        "CAN1_MAG": ("CAN1", RM3100_PRIMARY_IDS[0], 0x7D),
+        "CAN2_MAG": ("CAN2", RM3100_BACKUP_IDS[0], 0x7B),
+    }
+    identity = known.get(name)
+    if identity is None:
+        return None
+    sensor_slot, device_id, node_id = identity
+    x = _optional_float(message, "x")
+    y = _optional_float(message, "y")
+    z = _optional_float(message, "z")
+    if x is None or y is None or z is None:
+        return None
+    timestamp_us = _optional_int(message, "time_usec")
+    return MagSensorState(
+        camera=camera,
+        namespace=namespace,
+        sensor_slot=sensor_slot,
+        timestamp_s=timestamp_s,
+        topic="mavlink/DEBUG_VECT",
+        device_id=device_id,
+        node_id=node_id,
+        x=x,
+        y=y,
+        z=z,
+        magnitude=math.sqrt(x * x + y * y + z * z),
+        px4_timestamp_s=None if timestamp_us is None else float(timestamp_us) * 1e-6,
     )
 
 

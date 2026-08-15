@@ -1,0 +1,7 @@
+# Install after the repository runtime requirements.  These packages are
+# intentionally isolated here because GeoTIFF/CRS support is optional at app
+# startup but required before terrain inspection or ray casting is enabled.
+-r ../../requirements/runtime.txt
+
+rasterio>=1.3,<2
+pyproj>=3.5,<4

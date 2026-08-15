@@ -118,14 +118,24 @@ class StatusIndicator(QtWidgets.QFrame):
             "FINALIZING": "SAVE",
             "RECOVERABLE": "RETRY",
             "AVAILABLE": "READY",
+            "CONNECTING": "CONN..",
+            "CONNECTED_NO_DATA": "NO RTCM",
+            "STREAMING": "STREAM",
+            "RTCM_ACTIVE": "RTCM OK",
+            "RTCM_STALE": "STALE",
+            "RECONNECTING": "RETRY",
         }
         age = "" if status.age_s is None else f" · age {status.age_s:.2f}s"
         self.state.setText(compact_state_names.get(status.state, status.state) if self.compact else status.state)
         self.age.setText("" if status.age_s is None else _format_age(status.age_s))
         detail = status.detail or "--"
         self.detail.setText(_compact_status_detail(detail))
-        self.state.setStyleSheet(f"color: {color};")
+        self.state.setStyleSheet(f"color: {color}; font-weight: 600;")
         self.age.setStyleSheet(f"color: {TEXT_MUTED};")
+        if self.compact:
+            self.setStyleSheet(
+                f"QFrame#statusIndicator {{ background: {PANEL_ALT_BG}; border: 2px solid {color}; }}"
+            )
         tooltip_lines = [f"{status.label}: {status.state}", detail]
         tooltip_lines.append(f"Clock: {status.clock}{age}")
         self.setToolTip("\n".join(tooltip_lines))

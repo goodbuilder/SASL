@@ -1486,7 +1486,17 @@ def _process_frame_for_output(
                 annotated = _draw_detections(cv2, frame, [best_detection], best_detection)
             inferred = True
             if best_detection is not None and bool(config.get("emit_measurement_frames", False)):
-                _emit_measurement_frame(cv2, annotated, config, output_queue, timestamp_s=now_s)
+                # Measurement/reference evidence must retain the decoded native
+                # pixel grid and must not contain a display overlay.  Native
+                # BGR is converted to RGB only; no resize or annotation occurs.
+                _emit_measurement_frame(
+                    cv2,
+                    frame,
+                    config,
+                    output_queue,
+                    timestamp_s=now_s,
+                    timestamp_metadata=timestamp_metadata,
+                )
             output_queue.put(
                 (
                     "detection",
@@ -1515,6 +1525,48 @@ def _emit_preview_frame(
     timestamp_source: str = "app-receive",
     extra_metadata: dict[str, Any] | None = None,
 ) -> None:
+    native_height, native_width = frame.shape[:2]
+    # Pose initialization must also work while detection is disabled.  Emit a
+    # low-rate native reference sample in addition to the resized UI preview;
+    # accepted measurement frames are emitted at their exact detection time
+    # below and therefore remain a separate purpose/identity.
+    reference_period_s = max(
+        0.1,
+        float(config.get("native_reference_period_s", 1.0) or 1.0),
+    )
+    last_reference_s = float(config.get("_last_native_reference_s", float("-inf")))
+    if (
+        bool(config.get("emit_native_reference_frames", True))
+        and float(timestamp_s) - last_reference_s >= reference_period_s
+    ):
+        reference_metadata = dict(extra_metadata or {})
+        reference_metadata.update(
+            {
+                "source_timestamp_s": (
+                    None if source_timestamp_s is None else float(source_timestamp_s)
+                ),
+                "timestamp_source": str(timestamp_source),
+                "timestamp_reference": (
+                    "rtcp-invalid"
+                    if reference_metadata.get("rtcp_timing_invalid_reason")
+                    else "rtcp-ntp"
+                    if reference_metadata.get("rtcp_frame_ntp_unix_s") is not None
+                    else "source"
+                    if source_timestamp_s is not None
+                    else "app-receive"
+                ),
+                "native_frame_purpose": "pose-reference-cache",
+            }
+        )
+        _emit_measurement_frame(
+            cv2,
+            frame,
+            config,
+            output_queue,
+            timestamp_s=timestamp_s,
+            timestamp_metadata=reference_metadata,
+        )
+        config["_last_native_reference_s"] = float(timestamp_s)
     display_frame = frame
     max_preview_width = int(config["preview_max_width"])
     if max_preview_width > 0 and display_frame.shape[1] > max_preview_width:
@@ -1529,6 +1581,10 @@ def _emit_preview_frame(
         "timestamp_s": float(timestamp_s),
         "source_timestamp_s": None if source_timestamp_s is None else float(source_timestamp_s),
         "timestamp_source": timestamp_source,
+        "native_width": int(native_width),
+        "native_height": int(native_height),
+        "preview_width": int(rgb.shape[1]),
+        "preview_height": int(rgb.shape[0]),
     }
     if extra_metadata:
         metadata.update(extra_metadata)
@@ -1552,18 +1608,32 @@ def _emit_measurement_frame(
     output_queue,
     *,
     timestamp_s: float,
+    timestamp_metadata: dict[str, Any] | None = None,
 ) -> None:
-    display_frame = frame
-    max_preview_width = int(config["preview_max_width"])
-    if max_preview_width > 0 and display_frame.shape[1] > max_preview_width:
-        scale = max_preview_width / float(display_frame.shape[1])
-        display_frame = cv2.resize(
-            display_frame,
-            (max_preview_width, max(1, int(round(display_frame.shape[0] * scale)))),
-            interpolation=cv2.INTER_AREA,
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    metadata = dict(timestamp_metadata or {})
+    metadata.update(
+        {
+            "timestamp_s": float(timestamp_s),
+            "native_width": int(rgb.shape[1]),
+            "native_height": int(rgb.shape[0]),
+            "native_lossless_source": True,
+            "overlay_applied": False,
+            "source_native_frame_id": (
+                "decoded-"
+                f"{int(round(float(timestamp_s) * 1_000_000_000.0)):019d}"
+            ),
+        }
+    )
+    output_queue.put(
+        (
+            "measurement_frame",
+            metadata,
+            rgb.shape[1],
+            rgb.shape[0],
+            rgb.tobytes(),
         )
-    rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-    output_queue.put(("measurement_frame", float(timestamp_s), rgb.shape[1], rgb.shape[0], rgb.tobytes()))
+    )
 
 
 def _emit_stream_status(output_queue, enable_detection: bool, best_detection, now_s: float, last_status_s: float) -> float:
@@ -2257,6 +2327,7 @@ def _get_queue_message_nowait(message_queue):
 class YoloStreamWorker(QtCore.QObject):
     frame_ready = QtCore.pyqtSignal(QtGui.QImage, object)
     measurement_frame_ready = QtCore.pyqtSignal(float, QtGui.QImage)
+    native_measurement_frame_ready = QtCore.pyqtSignal(object, QtGui.QImage)
     detection_ready = QtCore.pyqtSignal(dict)
     stats_ready = QtCore.pyqtSignal(dict)
     status_changed = QtCore.pyqtSignal(str)
@@ -2308,6 +2379,8 @@ class YoloStreamWorker(QtCore.QObject):
             "rtsp_transport": normalize_rtsp_transport(rtsp_transport),
             "enable_detection": enable_detection,
             "emit_measurement_frames": enable_detection,
+            "emit_native_reference_frames": True,
+            "native_reference_period_s": 1.0,
             "adaptive_rate": adaptive_rate,
             "adaptive_max_rate_hz": DEFAULT_CPU_YOLO_ADAPTIVE_MAX_RATE_HZ if adaptive_rate else 0.0,
             "worker_cpu_threads": _default_worker_cpu_threads(device),
@@ -2463,7 +2536,19 @@ class YoloStreamWorker(QtCore.QObject):
             self.frame_ready.emit(image, metadata)
             return
         if kind == "measurement_frame":
-            _kind, timestamp_s, width, height, data = message
+            _kind, timestamp_value, width, height, data = message
+            metadata = (
+                dict(timestamp_value)
+                if isinstance(timestamp_value, dict)
+                else {
+                    "timestamp_s": float(timestamp_value),
+                    "native_width": int(width),
+                    "native_height": int(height),
+                    "native_lossless_source": False,
+                    "overlay_applied": False,
+                }
+            )
+            timestamp_s = float(metadata.get("timestamp_s", time.monotonic()))
             image = QtGui.QImage(
                 data,
                 width,
@@ -2472,6 +2557,7 @@ class YoloStreamWorker(QtCore.QObject):
                 QtGui.QImage.Format_RGB888,
             ).copy()
             self.measurement_frame_ready.emit(float(timestamp_s), image)
+            self.native_measurement_frame_ready.emit(metadata, image)
             return
         if kind == "detection":
             if len(message) >= 7:

@@ -18,10 +18,9 @@ _CONTEXT_LABELS = {
     "devices.time": "Time / Sync",
     "devices.pixhawk": "Pixhawk",
     "devices.gnss": "Base GNSS",
-    "processing.experiment": "Protocol",
     "processing.measurement": "Measurement",
     "processing.alignment": "Alignment",
-    "tasks.calibration": "Pre-run Calibration",
+    "tasks.calibration": "Calibration",
     "tasks.recording": "Recording / Sessions",
     "tasks.advanced": "Advanced",
     "tasks.settings": "Settings",
@@ -53,10 +52,6 @@ _CONTEXT_LAYOUTS = {
     "devices.time": (
         "Time synchronization",
         ("State", "Evidence", "Clock basis", "Time contract", "Next check"),
-    ),
-    "processing.experiment": (
-        "Field protocol",
-        ("Sequence", "Field path", "Evidence", "Coordinate impact", "Next step"),
     ),
     "processing.alignment": (
         "Physical alignment",
@@ -114,12 +109,15 @@ _CONTEXT_LAYOUTS = {
 
 
 class InspectorWidget(QtWidgets.QWidget):
+    command_requested = QtCore.pyqtSignal(str, object)
+
     def __init__(self, backend: object, open_advanced: Callable[[], None], parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self.backend = backend
         self.open_advanced = open_advanced
         self._context_id = "overview"
         self._selection: dict[str, object] | None = None
+        self._optical_pose_snapshot: dict[str, object] = {}
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
@@ -155,6 +153,61 @@ class InspectorWidget(QtWidgets.QWidget):
                 self.context_row_labels[key] = row_label
         root.addWidget(self.context_section)
 
+        self.geometry_section = PropertySection("Active Geometry")
+        self.geometry_values: dict[str, EngineeringValue] = {}
+        for key, label in (
+            ("bundle", "Bundle"),
+            ("intrinsics", "K,D"),
+            ("extrinsics", "R,t"),
+            ("pose", "Pose"),
+            ("evidence", "Evidence"),
+        ):
+            value = EngineeringValue(label)
+            value.label.hide()
+            self.geometry_values[key] = value
+            self.geometry_section.add_row(label, value)
+
+        self.geometry_candidate_combo = QtWidgets.QComboBox()
+        self.geometry_candidate_combo.setObjectName("inspectorPoseCandidate")
+        self.geometry_candidate_combo.setToolTip(
+            "Select an immutable optical-pose candidate. The full observable DOF "
+            "mask is applied through the OpticalPoseController."
+        )
+        self.geometry_candidate_combo.currentIndexChanged.connect(
+            self._refresh_geometry_actions
+        )
+        self.geometry_section.add_row("Candidate", self.geometry_candidate_combo)
+
+        geometry_actions = QtWidgets.QHBoxLayout()
+        self.geometry_apply_candidate_button = QtWidgets.QPushButton("Apply pose candidate")
+        self.geometry_apply_candidate_button.setObjectName("inspectorApplyPoseCandidate")
+        self.geometry_apply_candidate_button.setToolTip(
+            "Apply the selected candidate's observable Roll/Pitch/Yaw and NED position DOFs."
+        )
+        self.geometry_apply_candidate_button.clicked.connect(
+            self._request_geometry_candidate
+        )
+        self.geometry_revert_button = QtWidgets.QPushButton("Revert pose")
+        self.geometry_revert_button.setObjectName("inspectorRevertPose")
+        self.geometry_revert_button.setToolTip(
+            "Restore the immutable extrinsics profile that was active before the pose selection."
+        )
+        self.geometry_revert_button.clicked.connect(self._request_geometry_revert)
+        self.geometry_apply_bundle_button = QtWidgets.QPushButton("Apply K,D + R,t")
+        self.geometry_apply_bundle_button.setObjectName("inspectorApplyGeometryBundle")
+        self.geometry_apply_bundle_button.setToolTip(
+            "Apply the currently selected operating K,D and R,t bundle through the calibration owner."
+        )
+        self.geometry_apply_bundle_button.clicked.connect(self._request_geometry_bundle)
+        geometry_actions.addWidget(self.geometry_apply_candidate_button)
+        geometry_actions.addWidget(self.geometry_revert_button)
+        geometry_actions.addWidget(self.geometry_apply_bundle_button)
+        geometry_actions.addStretch(1)
+        geometry_action_host = QtWidgets.QWidget()
+        geometry_action_host.setLayout(geometry_actions)
+        self.geometry_section.form.addRow(geometry_action_host)
+        root.addWidget(self.geometry_section)
+
         self.output_section = PropertySection("Output")
         contract_value = QtWidgets.QLabel(f"{MEASUREMENT_FRAME}\n[F, R, D] · metres")
         contract_value.setWordWrap(True)
@@ -183,13 +236,13 @@ class InspectorWidget(QtWidgets.QWidget):
         key_map = {
             "devices.cameras": ("camera.left", "camera.right"),
             "devices.pixhawk": ("pixhawk.left", "pixhawk.right"),
-            "devices.gnss": ("gnss.base",),
+            "devices.gnss": ("gnss.base", "gnss.ntrip"),
             "devices.time": ("synchronization",),
             "processing.measurement": ("measurement",),
             "tasks.recording": ("recording",),
             "diagnostics.camera": ("camera.left", "camera.right"),
             "diagnostics.pixhawk": ("pixhawk.left", "pixhawk.right"),
-            "diagnostics.gnss": ("gnss.base",),
+            "diagnostics.gnss": ("gnss.base", "gnss.ntrip"),
             "diagnostics.measurement": ("measurement",),
             "diagnostics.performance": ("fps",),
             "processing.alignment": ("gnss",),
@@ -228,6 +281,7 @@ class InspectorWidget(QtWidgets.QWidget):
         self.output_section.setVisible(context_id in {"processing.measurement", "tasks.recording"})
         self.open_advanced_button.setVisible(context_id.startswith("diagnostics."))
         self._refresh_context_details(context_id)
+        self._refresh_active_geometry()
 
     def inspect_selection(
         self,
@@ -244,6 +298,249 @@ class InspectorWidget(QtWidgets.QWidget):
         self._configure_context_section(context_id)
         self.context_label.setText(_CONTEXT_LABELS.get(context_id, context_id.replace(".", " · ").title()))
         self._refresh_context_details(context_id)
+        self._refresh_active_geometry()
+
+    def _read_optical_pose_snapshot(self) -> dict[str, object]:
+        readers = (
+            getattr(self.backend, "optical_pose_snapshot", None),
+            getattr(getattr(self.backend, "panel", self.backend), "workstation_optical_pose_snapshot", None),
+        )
+        for reader in readers:
+            if not callable(reader):
+                continue
+            try:
+                value = reader(include_frames=False)
+            except TypeError:
+                try:
+                    value = reader()
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if isinstance(value, Mapping):
+                return dict(value)
+        return dict(self._optical_pose_snapshot)
+
+    @staticmethod
+    def _format_float(value: object, *, digits: int = 3) -> str:
+        try:
+            return f"{float(value):.{digits}f}"
+        except (TypeError, ValueError):
+            return "--"
+
+    @classmethod
+    def _format_vector(cls, value: object, *, digits: int = 3) -> str:
+        if not isinstance(value, (tuple, list)):
+            return "--"
+        return "[" + ", ".join(cls._format_float(item, digits=digits) for item in value) + "]"
+
+    @classmethod
+    def _format_matrix(cls, value: object, *, digits: int = 4) -> str:
+        if not isinstance(value, (tuple, list)):
+            return "--"
+        return "[" + "; ".join(
+            cls._format_vector(row, digits=digits) for row in value
+            if isinstance(row, (tuple, list))
+        ) + "]"
+
+    def _refresh_active_geometry(self) -> None:
+        """Keep active K,D, R,t, pose selection, and provenance together."""
+
+        evidence = getattr(self.backend, "evidence", None)
+        if not isinstance(evidence, EvidenceAdapter):
+            evidence = EvidenceAdapter(getattr(self.backend, "panel", self.backend))
+        try:
+            calibration = evidence.calibration()
+        except Exception:
+            calibration = {}
+        snapshot = self._read_optical_pose_snapshot()
+        self._optical_pose_snapshot = snapshot
+
+        state = str(calibration.get("state", "NO DATA") or "NO DATA")
+        combination = str(calibration.get("combination", "K,D + R,t not selected") or "")
+        self.geometry_values["bundle"].set_value(
+            combination,
+            source="EvidenceAdapter.calibration · active_intrinsics + selected_extrinsics_profile",
+            frame=str(calibration.get("frame_contract", "OpenCV optical RDF")),
+            valid=state not in {"NO DATA", "CALCULATING"},
+        )
+
+        left = calibration.get("left") if isinstance(calibration.get("left"), Mapping) else {}
+        right = calibration.get("right") if isinstance(calibration.get("right"), Mapping) else {}
+        intrinsics_text = (
+            f"{state} · zoom={calibration.get('intrinsics_source_zoom', calibration.get('zoom', '--'))} · "
+            f"profile={calibration.get('profile_path') or '--'} · "
+            f"hash={str(calibration.get('intrinsics_profile_hash') or '')[:12] or '--'}"
+        )
+        self.geometry_values["intrinsics"].set_value(
+            intrinsics_text,
+            source=str(calibration.get("profile_path") or "active K,D source unavailable"),
+            frame="OpenCV camera matrix K in pixels; distortion D; native image u/v",
+            valid=state in {"ACTIVE", "AVAILABLE"},
+        )
+        self.geometry_values["intrinsics"].setToolTip(
+            "K,D values\n"
+            f"Left K fx/fy/cx/cy={self._format_float(left.get('fx_px'))}/"
+            f"{self._format_float(left.get('fy_px'))}/"
+            f"{self._format_float(left.get('cx_px'))}/"
+            f"{self._format_float(left.get('cy_px'))}; D={left.get('distortion_coefficients', '--')}\n"
+            f"Right K fx/fy/cx/cy={self._format_float(right.get('fx_px'))}/"
+            f"{self._format_float(right.get('fy_px'))}/"
+            f"{self._format_float(right.get('cx_px'))}/"
+            f"{self._format_float(right.get('cy_px'))}; D={right.get('distortion_coefficients', '--')}\n"
+            f"Source: {calibration.get('profile_path') or '--'}\n"
+            f"Profile SHA-256: {calibration.get('intrinsics_profile_hash') or '--'}"
+        )
+
+        extrinsics = calibration.get("extrinsics") if isinstance(calibration.get("extrinsics"), Mapping) else {}
+        extrinsics_method = str(calibration.get("extrinsics_method") or "base/legacy")
+        extrinsics_path = str(calibration.get("extrinsics_profile_path") or "--")
+        extrinsics_text = (
+            f"{extrinsics_method} · {extrinsics_path} · "
+            f"T={self._format_vector(extrinsics.get('translation_left_to_right_m'))} m · "
+            f"baseline={self._format_float(extrinsics.get('baseline_m'))} m"
+        )
+        self.geometry_values["extrinsics"].set_value(
+            extrinsics_text,
+            source=f"{extrinsics_method} · {extrinsics_path}",
+            frame=str(extrinsics.get("frame_contract", "OpenCV optical RDF; X_right=R*X_left+T")),
+            valid=bool(extrinsics),
+        )
+        self.geometry_values["extrinsics"].setToolTip(
+            f"Method: {extrinsics_method}\n"
+            f"Profile: {extrinsics_path}\n"
+            f"Profile SHA-256: {calibration.get('extrinsics_profile_hash') or '--'}\n"
+            f"R={self._format_matrix(extrinsics.get('rotation_left_to_right'))}\n"
+            f"T={self._format_vector(extrinsics.get('translation_left_to_right_m'))} m\n"
+            f"Right origin in left RDF={self._format_vector(extrinsics.get('right_camera_origin_in_left_rdf_m'))} m\n"
+            f"Reprojection error={extrinsics.get('reprojection_error_px', '--')} px"
+        )
+
+        active_candidate_id = str(snapshot.get("active_candidate_id") or "")
+        active_selection_id = str(snapshot.get("active_selection_id") or "")
+        active_dof = snapshot.get("active_selected_dof")
+        if active_selection_id:
+            dof_text = ",".join(
+                key for key, value in (active_dof.items() if isinstance(active_dof, Mapping) else ()) if value
+            ) or "none"
+            pose_text = f"ACTIVE · candidate={active_candidate_id} · selection={active_selection_id} · DOF={dof_text}"
+            pose_valid = True
+        else:
+            pose_text = f"NOT APPLIED · {len(snapshot.get('candidates', ()) or ())} candidate(s) available"
+            pose_valid = None
+        self.geometry_values["pose"].set_value(
+            pose_text,
+            source="OpticalPoseController selection history",
+            frame="camera optical RDF pose in world NED; derived stereo R,t",
+            valid=pose_valid,
+        )
+
+        active_candidate = snapshot.get("active_candidate")
+        source_ids = active_candidate.get("source_observation_ids", ()) if isinstance(active_candidate, Mapping) else ()
+        hashes = active_candidate.get("input_hashes", {}) if isinstance(active_candidate, Mapping) else {}
+        quality = active_candidate.get("quality_metrics", {}) if isinstance(active_candidate, Mapping) else {}
+        evidence_text = (
+            f"source ids={len(source_ids) if isinstance(source_ids, (tuple, list)) else 0} · "
+            f"K,D hash={str(hashes.get('operating_intrinsics_profile_sha256', '') if isinstance(hashes, Mapping) else '')[:12] or '--'} · "
+            f"GNSS baseline={self._format_float(quality.get('gnss_baseline_m') if isinstance(quality, Mapping) else None)} m"
+        )
+        self.geometry_values["evidence"].set_value(
+            evidence_text,
+            source="candidate source_observation_ids + input_hashes + quality_metrics",
+            frame="GNSS baseline: right minus left, world NED metres",
+            valid=True if active_candidate else None,
+        )
+        self.geometry_values["evidence"].setToolTip(
+            "Active candidate provenance\n"
+            f"Source observation IDs: {source_ids or '--'}\n"
+            f"Input hashes: {hashes or '--'}\n"
+            f"Quality metrics: {quality or '--'}\n"
+            f"Warnings: {active_candidate.get('warnings', '--') if isinstance(active_candidate, Mapping) else '--'}"
+        )
+
+        self._refresh_geometry_candidates(snapshot)
+
+    def _refresh_geometry_candidates(self, snapshot: Mapping[str, object]) -> None:
+        candidates = snapshot.get("candidates")
+        rows = [dict(row) for row in candidates if isinstance(row, Mapping)] if isinstance(candidates, (tuple, list)) else []
+        previous_id = str(self.geometry_candidate_combo.currentData() or "")
+        desired_id = str(snapshot.get("active_candidate_id") or previous_id)
+        self.geometry_candidate_combo.blockSignals(True)
+        self.geometry_candidate_combo.clear()
+        desired_index = -1
+        for index, row in enumerate(rows):
+            candidate_id = str(row.get("candidate_id") or "")
+            method = str(row.get("method") or "candidate")
+            state = str(row.get("state") or "")
+            label = f"{candidate_id} · {method} · {state}" if candidate_id else f"{method} · {state}"
+            self.geometry_candidate_combo.addItem(label, candidate_id)
+            self.geometry_candidate_combo.setItemData(index, row, QtCore.Qt.UserRole + 1)
+            if candidate_id == desired_id:
+                desired_index = index
+        if desired_index < 0 and rows:
+            desired_index = len(rows) - 1
+        if desired_index >= 0:
+            self.geometry_candidate_combo.setCurrentIndex(desired_index)
+        self.geometry_candidate_combo.blockSignals(False)
+        self._refresh_geometry_actions()
+
+    def _selected_geometry_candidate(self) -> Mapping[str, object] | None:
+        value = self.geometry_candidate_combo.itemData(
+            self.geometry_candidate_combo.currentIndex(),
+            QtCore.Qt.UserRole + 1,
+        )
+        return value if isinstance(value, Mapping) else None
+
+    def _refresh_geometry_actions(self, _index: int = -1) -> None:
+        candidate = self._selected_geometry_candidate()
+        applicable = bool(candidate and candidate.get("applicable", True))
+        observable = candidate.get("observable_dof") if isinstance(candidate, Mapping) else {}
+        has_dof = bool(
+            isinstance(observable, Mapping)
+            and any(bool(value) for value in observable.values())
+        )
+        self.geometry_apply_candidate_button.setEnabled(applicable and has_dof)
+        active = bool(self._optical_pose_snapshot.get("active_selection_id"))
+        self.geometry_revert_button.setEnabled(active)
+        calibration_state = str(
+            getattr(self.backend, "evidence", None).calibration().get("state", "NO DATA")
+            if isinstance(getattr(self.backend, "evidence", None), EvidenceAdapter)
+            else "NO DATA"
+        )
+        has_bundle = calibration_state in {"ACTIVE", "AVAILABLE"}
+        self.geometry_apply_bundle_button.setEnabled(has_bundle)
+
+    def _request_geometry_candidate(self) -> None:
+        candidate = self._selected_geometry_candidate()
+        if not isinstance(candidate, Mapping):
+            return
+        raw = candidate.get("observable_dof")
+        if not isinstance(raw, Mapping):
+            return
+        aliases = {
+            "roll_deg": "roll",
+            "pitch_deg": "pitch",
+            "yaw_deg": "yaw",
+            "north_m": "north",
+            "east_m": "east",
+            "down_m": "down",
+        }
+        self.command_requested.emit(
+            "alignment.pose.apply_candidate",
+            {
+                "candidate_id": str(candidate.get("candidate_id") or ""),
+                "dof": {external: bool(raw.get(internal, False)) for internal, external in aliases.items()},
+            },
+        )
+
+    def _request_geometry_revert(self) -> None:
+        self.command_requested.emit(
+            "alignment.pose.revert",
+            {"restore": "previous_immutable_profile"},
+        )
+
+    def _request_geometry_bundle(self) -> None:
+        self.command_requested.emit("calibration.apply_bundle", {})
 
     def _configure_context_section(self, context_id: str) -> None:
         if self._selection is not None:
@@ -443,14 +740,6 @@ class InspectorWidget(QtWidgets.QWidget):
                 contract="WIRIS RTCP/NTP timestamps; camera-pair timing evidence",
             )
             source = status.source if status else "clock sync status"
-        elif context_id == "processing.experiment":
-            values.update(
-                primary="0 external prerequisite · 1–11 field steps",
-                secondary="connect → RTK/fix → physical alignment → measure → save",
-                timing="advisory evidence checklist",
-                contract="Protocol order does not alter measurement fields or frames",
-            )
-            source = "Experiment protocol evidence"
         elif context_id == "processing.alignment":
             alignment = evidence.physical_alignment()
             quality = alignment.get("quality") if isinstance(alignment.get("quality"), Mapping) else {}

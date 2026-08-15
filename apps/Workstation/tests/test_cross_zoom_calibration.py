@@ -10,6 +10,7 @@ from Workstation.workstation_core.calibration import (
     StereoExtrinsicsProfile,
     StereoIntrinsicsResult,
     compose_stereo_calibration,
+    independent_zoom_selection_mode,
     intrinsics_content_sha256,
     load_stereo_extrinsics_json,
     save_intrinsics_json,
@@ -53,22 +54,39 @@ def _extrinsics() -> StereoExtrinsics:
     )
 
 
-def test_cross_zoom_composition_uses_zoom8_kd_and_zoom1_rt_without_gate() -> None:
-    zoom8 = _intrinsics_result(7200.0)
+def test_cross_zoom_composition_uses_arbitrary_operating_and_calibration_zooms_without_gate() -> None:
+    operating_zoom = _intrinsics_result(7200.0)
     profile = StereoExtrinsicsProfile(
         extrinsics=_extrinsics(),
-        source_zoom_level=1,
-        source_intrinsics_path="intrinsics_zoom_01.json",
+        source_zoom_level=3,
+        source_intrinsics_path="intrinsics_zoom_03.json",
         source_intrinsics_sha256=intrinsics_content_sha256(_intrinsics_result(900.0)),
     )
 
-    composed = compose_stereo_calibration(zoom8, profile)
+    composed = compose_stereo_calibration(operating_zoom, profile)
 
     assert composed.left.camera_matrix[0][0] == 7200.0
     assert composed.extrinsics is profile.extrinsics
-    assert profile.source_zoom_level == 1
+    assert profile.source_zoom_level == 3
     assert profile.right_camera_origin_in_left_rdf_m == pytest.approx((0.3, 0.0, 0.0))
     assert profile.baseline_m == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize(
+    ("intrinsics_zoom", "extrinsics_zoom", "expected"),
+    (
+        (12, 3, "manual_cross_zoom"),
+        (7, 7, "manual_same_zoom"),
+        (12, None, "manual_independent_zoom"),
+        (None, 3, "manual_independent_zoom"),
+    ),
+)
+def test_independent_zoom_selection_mode_describes_actual_source_relationship(
+    intrinsics_zoom,
+    extrinsics_zoom,
+    expected,
+) -> None:
+    assert independent_zoom_selection_mode(intrinsics_zoom, extrinsics_zoom) == expected
 
 
 def test_standalone_extrinsics_profile_round_trip_preserves_contract_and_provenance(
@@ -76,21 +94,21 @@ def test_standalone_extrinsics_profile_round_trip_preserves_contract_and_provena
 ) -> None:
     profile = StereoExtrinsicsProfile(
         extrinsics=_extrinsics(),
-        source_zoom_level=1,
+        source_zoom_level=3,
         method="checkerboard_external_only",
-        source_intrinsics_path="intrinsics_zoom_01.json",
+        source_intrinsics_path="intrinsics_zoom_03.json",
         source_intrinsics_sha256=intrinsics_content_sha256(_intrinsics_result(900.0)),
-        profile_id="large-board-01",
+        profile_id="large-board-03",
         metadata={"validation_managed_by_application": False},
     )
-    path = tmp_path / "extrinsics_zoom_01_large_board.json"
+    path = tmp_path / "extrinsics_zoom_03_large_board.json"
 
     save_stereo_extrinsics_json(path, profile)
     loaded = load_stereo_extrinsics_json(path)
 
-    assert loaded.source_zoom_level == 1
+    assert loaded.source_zoom_level == 3
     assert loaded.method == "checkerboard_external_only"
-    assert loaded.profile_id == "large-board-01"
+    assert loaded.profile_id == "large-board-03"
     assert loaded.extrinsics.translation_left_to_right_m == [-0.3, 0.0, 0.0]
     assert loaded.content_sha256 == profile.content_sha256
     assert loaded.metadata["validation_managed_by_application"] is False
@@ -118,18 +136,18 @@ def test_measurement_snapshot_records_independent_cross_zoom_sources() -> None:
 
     snapshot = StereoIntrinsicsSnapshot.from_result(
         composed,
-        active_zoom_level=8,
-        selected_profile_path="intrinsics_zoom_08.json",
-        selected_extrinsics_profile_path="extrinsics_zoom_01_large_board.json",
-        intrinsics_source_zoom_level=8,
-        extrinsics_source_zoom_level=1,
+        active_zoom_level=12,
+        selected_profile_path="intrinsics_zoom_12.json",
+        selected_extrinsics_profile_path="extrinsics_zoom_03_large_board.json",
+        intrinsics_source_zoom_level=12,
+        extrinsics_source_zoom_level=3,
         selection_mode="manual_cross_zoom",
     )
 
-    assert snapshot.active_zoom_level == 8
-    assert snapshot.intrinsics_source_zoom_level == 8
-    assert snapshot.extrinsics_source_zoom_level == 1
-    assert snapshot.selected_extrinsics_profile_path.endswith("zoom_01_large_board.json")
+    assert snapshot.active_zoom_level == 12
+    assert snapshot.intrinsics_source_zoom_level == 12
+    assert snapshot.extrinsics_source_zoom_level == 3
+    assert snapshot.selected_extrinsics_profile_path.endswith("zoom_03_large_board.json")
     assert len(snapshot.intrinsics_content_sha256) == 64
     assert len(snapshot.extrinsics_content_sha256) == 64
     assert snapshot.validation_gate == "disabled"
@@ -208,18 +226,18 @@ def test_panel_apply_method_composes_cross_zoom_selection_without_validation_sta
         def text(self):
             return str(self.value_state)
 
-    zoom8 = _intrinsics_result(7200.0)
+    operating_zoom = _intrinsics_result(7200.0)
     profile = StereoExtrinsicsProfile(
         extrinsics=_extrinsics(),
-        source_zoom_level=1,
-        profile_id="zoom01-large-board",
+        source_zoom_level=3,
+        profile_id="zoom03-large-board",
     )
     panel = SimpleNamespace(
-        last_calibration_result=zoom8,
-        last_calibration_zoom_level=8,
+        last_calibration_result=operating_zoom,
+        last_calibration_zoom_level=12,
         selected_extrinsics_profile=profile,
-        _active_intrinsics_profile_path="intrinsics_zoom_08.json",
-        _selected_extrinsics_profile_path="extrinsics_zoom_01_large_board.json",
+        _active_intrinsics_profile_path="intrinsics_zoom_12.json",
+        _selected_extrinsics_profile_path="extrinsics_zoom_03_large_board.json",
         _selected_extrinsics_profile_hash=profile.content_sha256,
         distance_mode_combo=SimpleNamespace(current=None),
         focal_spin=ValueWidget(),
@@ -236,8 +254,8 @@ def test_panel_apply_method_composes_cross_zoom_selection_without_validation_sta
 
     assert panel.active_intrinsics.left.camera_matrix[0][0] == 7200.0
     assert panel.active_intrinsics.extrinsics is profile.extrinsics
-    assert panel._active_intrinsics_source_zoom_level == 8
-    assert panel._active_extrinsics_source_zoom_level == 1
+    assert panel._active_intrinsics_source_zoom_level == 12
+    assert panel._active_extrinsics_source_zoom_level == 3
     assert panel._active_calibration_selection_mode == "manual_cross_zoom"
     assert panel.distance_mode_combo.current == "checkerboard"
     assert "validation not gated" in panel.calibration_status_label.text()

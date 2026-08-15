@@ -1,0 +1,417 @@
+from __future__ import annotations
+
+from math import isinf, sqrt
+from random import Random
+
+import pytest
+
+from Workstation.workstation_core.optical_pose import (
+    POSE_DOF_NAMES,
+    CameraPoseNed,
+    PoseDofMask,
+    PoseParametersNed,
+    opencv_pnp_from_camera_pose_ned,
+)
+from Workstation.workstation_core.pose_solvers import (
+    NORMALIZED_IDEAL,
+    PNP_RANSAC_SEED_SEMANTICS,
+    ConstrainedPoseLeastSquaresResult,
+    PnpCorrespondences,
+    PnpEnsembleConfig,
+    PoseLeastSquaresConfig,
+    analyze_jacobian,
+    analyze_object_point_geometry,
+    fit_normalized_horizon_line,
+    fixed_center_orientation_ray_residuals,
+    numerical_pose_jacobian,
+    pose_reprojection_residuals,
+    solve_constrained_pose_least_squares,
+    solve_pnp_ensemble,
+)
+
+
+def _matvec(matrix, vector):
+    return tuple(sum(matrix[row][column] * vector[column] for column in range(3)) for row in range(3))
+
+
+def _add(left, right):
+    return tuple(a + b for a, b in zip(left, right))
+
+
+def _scale(vector, scalar):
+    return tuple(value * scalar for value in vector)
+
+
+def _synthetic_raw_correspondences(*, add_outliers: bool = False):
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    pose = CameraPoseNed.from_virtual_frd_rpy_deg(
+        center_ned_m=(12.0, -8.0, 2.5),
+        roll_deg=4.0,
+        pitch_deg=-7.0,
+        yaw_deg=21.0,
+    )
+    camera_points = np.asarray(
+        [
+            [-12.0, -8.0, 80.0],
+            [11.0, -5.0, 95.0],
+            [-8.0, 9.0, 110.0],
+            [14.0, 12.0, 125.0],
+            [3.0, -14.0, 145.0],
+            [-17.0, 3.0, 165.0],
+            [19.0, 1.0, 180.0],
+            [-2.0, 16.0, 205.0],
+            [8.0, -19.0, 230.0],
+            [-21.0, -3.0, 250.0],
+            [23.0, 15.0, 270.0],
+            [-5.0, -22.0, 295.0],
+        ],
+        dtype=np.float64,
+    )
+    rotation_ned_from_camera = np.asarray(pose.rotation_ned_from_camera_rdf)
+    center = np.asarray(pose.center_ned_m)
+    object_points = (rotation_ned_from_camera @ camera_points.T).T + center
+    intrinsics = np.asarray(
+        ((1600.0, 0.0, 640.0), (0.0, 1580.0, 360.0), (0.0, 0.0, 1.0)),
+        dtype=np.float64,
+    )
+    distortion = np.asarray((0.012, -0.006, 0.0003, -0.0002, 0.001), dtype=np.float64)
+    rotation_camera_from_ned, translation_camera_from_ned = opencv_pnp_from_camera_pose_ned(pose)
+    rvec, _jacobian = cv2.Rodrigues(np.asarray(rotation_camera_from_ned))
+    image_points, _projection_jacobian = cv2.projectPoints(
+        object_points,
+        rvec,
+        np.asarray(translation_camera_from_ned).reshape(3, 1),
+        intrinsics,
+        distortion,
+    )
+    image_points = image_points.reshape(-1, 2)
+    random = Random(20260813)
+    image_points += np.asarray(
+        [(random.gauss(0.0, 0.08), random.gauss(0.0, 0.08)) for _point in image_points]
+    )
+    if add_outliers:
+        image_points[1] += (90.0, -70.0)
+        image_points[9] += (-80.0, 60.0)
+    correspondences = PnpCorrespondences.from_raw_camera_pixels(
+        object_points_ned_m=object_points,
+        image_points_px=image_points,
+        camera_matrix=intrinsics,
+        distortion_coefficients=distortion,
+    )
+    return pose, correspondences
+
+
+def test_pnp_input_space_prevents_double_undistort_and_rejects_fake_methods() -> None:
+    objects = ((0.0, 0.0, 10.0), (1.0, 0.0, 10.0), (0.0, 1.0, 10.0), (1.0, 1.0, 11.0))
+    images = ((0.0, 0.0), (0.1, 0.0), (0.0, 0.1), (0.09, 0.09))
+
+    normalized = PnpCorrespondences.from_normalized_ideal(
+        object_points_ned_m=objects,
+        image_points_normalized=images,
+    )
+
+    assert normalized.image_space == NORMALIZED_IDEAL
+    assert normalized.camera_matrix is None
+    assert normalized.distortion_coefficients == ()
+    with pytest.raises(ValueError, match="double-undistort"):
+        PnpCorrespondences(
+            object_points_ned_m=objects,
+            image_points=images,
+            image_space=NORMALIZED_IDEAL,
+            camera_matrix=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+        )
+    with pytest.raises(ValueError, match="intentionally not exposed"):
+        PnpEnsembleConfig(methods=("EPNP", "DLS"))
+    with pytest.raises(ValueError, match="intentionally not exposed"):
+        PnpEnsembleConfig(methods=("UPNP",))
+
+
+def test_seeded_pnp_ensemble_runs_three_real_solvers_and_two_independent_refinements() -> None:
+    expected_pose, correspondences = _synthetic_raw_correspondences(add_outliers=True)
+    config = PnpEnsembleConfig(
+        ransac_seed=7717,
+        ransac_iterations=700,
+        ransac_reprojection_threshold_px=2.0,
+    )
+
+    first = solve_pnp_ensemble(correspondences, config=config)
+    second = solve_pnp_ensemble(correspondences, config=config)
+
+    assert first.failures == ()
+    assert len(first.candidates) == 9
+    assert {candidate.solver for candidate in first.candidates} == {"ITERATIVE", "EPNP", "SQPNP"}
+    assert {candidate.refinement for candidate in first.candidates} == {"NONE", "LM", "VVS"}
+    assert all("DLS" not in candidate.candidate_id and "UPNP" not in candidate.candidate_id for candidate in first.candidates)
+    assert first.ransac_seed == 7717
+    assert first.seed_semantics == PNP_RANSAC_SEED_SEMANTICS
+    assert first.object_geometry.classification == "volumetric"
+    assert [candidate.candidate_id for candidate in first.candidates] == [
+        candidate.candidate_id for candidate in second.candidates
+    ]
+    for left, right in zip(first.candidates, second.candidates):
+        assert left.inlier_indices == right.inlier_indices
+        assert left.pose_ned.center_ned_m == pytest.approx(right.pose_ned.center_ned_m, abs=1.0e-12)
+
+    accurate = min(
+        first.candidates,
+        key=lambda candidate: sqrt(
+            sum(
+                (actual - expected) ** 2
+                for actual, expected in zip(candidate.pose_ned.center_ned_m, expected_pose.center_ned_m)
+            )
+        ),
+    )
+    center_error = sqrt(
+        sum(
+            (actual - expected) ** 2
+            for actual, expected in zip(accurate.pose_ned.center_ned_m, expected_pose.center_ned_m)
+        )
+    )
+    assert center_error < 0.25
+    assert accurate.positive_depth_ratio == pytest.approx(1.0)
+    assert accurate.jacobian_diagnostics.parameter_names == POSE_DOF_NAMES
+    assert accurate.jacobian_diagnostics.rank == 6
+
+
+def test_normalized_ideal_pnp_uses_implicit_identity_intrinsics() -> None:
+    expected_pose, raw = _synthetic_raw_correspondences()
+    cv2 = pytest.importorskip("cv2")
+    np = pytest.importorskip("numpy")
+    raw_points = np.asarray(raw.image_points, dtype=np.float64).reshape(-1, 1, 2)
+    normalized_points = cv2.undistortPoints(
+        raw_points,
+        np.asarray(raw.camera_matrix),
+        np.asarray(raw.distortion_coefficients),
+    ).reshape(-1, 2)
+    normalized = PnpCorrespondences.from_normalized_ideal(
+        object_points_ned_m=raw.object_points_ned_m,
+        image_points_normalized=normalized_points,
+    )
+
+    result = solve_pnp_ensemble(
+        normalized,
+        config=PnpEnsembleConfig(
+            methods=("EPNP", "SQPNP"),
+            refinements=(),
+            use_ransac=False,
+        ),
+    )
+
+    assert result.failures == ()
+    assert len(result.candidates) == 2
+    assert all(candidate.residual_unit == "normalized" for candidate in result.candidates)
+    best = result.best_candidate
+    assert best is not None
+    assert best.pose_ned.center_ned_m == pytest.approx(expected_pose.center_ned_m, abs=0.15)
+
+
+def test_normalized_horizon_fit_recovers_roll_pitch_and_rejects_degenerate_points() -> None:
+    pose = CameraPoseNed.from_virtual_frd_rpy_deg(
+        center_ned_m=(0.0, 0.0, 0.0),
+        roll_deg=3.25,
+        pitch_deg=-2.75,
+        yaw_deg=117.0,
+    )
+    rotation_camera_from_ned, _translation = opencv_pnp_from_camera_pose_ned(pose)
+    gravity = _matvec(rotation_camera_from_ned, (0.0, 0.0, 1.0))
+    random = Random(9)
+    points = []
+    for index in range(31):
+        x = -0.8 + 1.6 * index / 30.0
+        y = -(gravity[0] * x + gravity[2]) / gravity[1]
+        points.append((x, y + random.gauss(0.0, 2.0e-5)))
+
+    fit = fit_normalized_horizon_line(points)
+
+    assert fit.roll_deg == pytest.approx(3.25, abs=0.01)
+    assert fit.pitch_deg == pytest.approx(-2.75, abs=0.01)
+    assert fit.rms_normalized < 3.0e-5
+    assert not hasattr(fit, "yaw_deg")
+    with pytest.raises(ValueError, match="degenerate"):
+        fit_normalized_horizon_line(((0.1, 0.2), (0.1, 0.2), (0.1, 0.2)))
+
+
+def test_fixed_center_orientation_residual_has_two_direction_constraints_per_ray() -> None:
+    pose = CameraPoseNed.from_virtual_frd_rpy_deg(
+        center_ned_m=(10.0, 20.0, -3.0),
+        roll_deg=2.0,
+        pitch_deg=-4.0,
+        yaw_deg=31.0,
+    )
+    rays = ((0.0, 0.0, 1.0), (0.2, -0.1, 1.0), (-0.15, 0.12, 1.0))
+    targets = tuple(
+        _add(pose.center_ned_m, _scale(_matvec(pose.rotation_ned_from_camera_rdf, ray), distance))
+        for ray, distance in zip(rays, (500.0, 750.0, 900.0))
+    )
+
+    residual = fixed_center_orientation_ray_residuals(
+        (2.0, -4.0, 31.0),
+        camera_center_ned_m=pose.center_ned_m,
+        observed_rays_camera_rdf=rays,
+        target_points_ned_m=targets,
+    )
+    wrong = fixed_center_orientation_ray_residuals(
+        (2.0, -4.0, 35.0),
+        camera_center_ned_m=pose.center_ned_m,
+        observed_rays_camera_rdf=rays,
+        target_points_ned_m=targets,
+    )
+
+    assert max(abs(value) for value in residual) < 1.0e-12
+    assert sqrt(sum(value * value for value in wrong)) > 0.05
+
+
+def test_constrained_least_squares_changes_only_checked_yaw_and_east_and_reports_covariance() -> None:
+    pytest.importorskip("scipy")
+    initial = PoseParametersNed(1.0, 2.0, -30.0, 10.0, -20.0, 30.0)
+    mask = PoseDofMask.from_names(("yaw_deg", "east_m"))
+
+    def residual(parameters: PoseParametersNed):
+        return (
+            parameters.yaw_deg - 12.0,
+            0.5 * (parameters.yaw_deg - 12.0),
+            parameters.east_m - 40.0,
+            2.0 * (parameters.east_m - 40.0),
+            0.01,
+        )
+
+    result = solve_constrained_pose_least_squares(
+        initial,
+        mask,
+        residual,
+        parameter_scales=(10.0, 10.0),
+        config=PoseLeastSquaresConfig(loss="linear"),
+    )
+
+    assert isinstance(result, ConstrainedPoseLeastSquaresResult)
+    assert result.success is True
+    assert result.parameters.yaw_deg == pytest.approx(12.0, abs=1.0e-9)
+    assert result.parameters.east_m == pytest.approx(40.0, abs=1.0e-9)
+    assert result.parameters.roll_deg == initial.roll_deg
+    assert result.parameters.pitch_deg == initial.pitch_deg
+    assert result.parameters.north_m == initial.north_m
+    assert result.parameters.down_m == initial.down_m
+    assert result.jacobian_diagnostics.rank == 2
+    assert result.jacobian_diagnostics.covariance is not None
+
+
+def test_jacobian_rank_condition_covariance_and_nullspace_are_fail_closed() -> None:
+    full = analyze_jacobian(
+        ((1.0, 0.0), (0.0, 2.0), (1.0, 1.0)),
+        parameter_names=("yaw_deg", "east_m"),
+        parameter_scales=(10.0, 2.0),
+        residual_variance=0.04,
+    )
+    deficient = analyze_jacobian(
+        ((1.0, 1.0), (2.0, 2.0), (3.0, 3.0)),
+        parameter_names=("yaw_deg", "east_m"),
+        residual_variance=0.04,
+    )
+
+    assert full.full_rank is True
+    assert full.rank == 2
+    assert full.condition_number < 10.0
+    assert full.covariance is not None
+    assert deficient.rank == 1
+    assert deficient.full_rank is False
+    assert isinf(deficient.condition_number)
+    assert deficient.covariance is None
+    assert len(deficient.nullspace_basis) == 1
+
+
+def test_near_collinear_and_planar_object_geometry_are_not_called_volumetric() -> None:
+    near_collinear = tuple(
+        (float(index), 1.0e-9 * index * index, -2.0e-9 * index)
+        for index in range(8)
+    )
+    planar = (
+        (0.0, 0.0, 5.0),
+        (1.0, 0.0, 5.0),
+        (0.0, 1.0, 5.0),
+        (1.0, 1.0, 5.0),
+        (0.5, 0.2, 5.0),
+    )
+    volumetric = planar + ((0.3, 0.4, 6.0),)
+
+    line_result = analyze_object_point_geometry(near_collinear, relative_rank_tolerance=1.0e-6)
+    plane_result = analyze_object_point_geometry(planar)
+    volume_result = analyze_object_point_geometry(volumetric)
+
+    assert line_result.classification == "near_collinear"
+    assert line_result.rank == 1
+    assert isinf(line_result.condition_number)
+    assert plane_result.classification == "planar"
+    assert plane_result.rank == 2
+    assert isinf(plane_result.condition_number)
+    assert volume_result.classification == "volumetric"
+    assert volume_result.rank == 3
+
+
+def test_planar_pnp_result_preserves_global_ambiguity_warning_even_with_local_jacobian() -> None:
+    np = pytest.importorskip("numpy")
+    pose = CameraPoseNed.from_virtual_frd_rpy_deg(
+        center_ned_m=(0.0, 0.0, 0.0),
+        roll_deg=2.0,
+        pitch_deg=-3.0,
+        yaw_deg=15.0,
+    )
+    camera_points = (
+        (-10.0, -7.0, 100.0),
+        (12.0, -7.0, 100.0),
+        (-10.0, 8.0, 100.0),
+        (12.0, 8.0, 100.0),
+        (-3.0, 2.0, 100.0),
+        (5.0, -1.0, 100.0),
+    )
+    objects = tuple(
+        _add(pose.center_ned_m, _matvec(pose.rotation_ned_from_camera_rdf, point))
+        for point in camera_points
+    )
+    images = tuple((point[0] / point[2], point[1] / point[2]) for point in camera_points)
+    correspondences = PnpCorrespondences.from_normalized_ideal(
+        object_points_ned_m=objects,
+        image_points_normalized=images,
+    )
+
+    result = solve_pnp_ensemble(
+        correspondences,
+        config=PnpEnsembleConfig(
+            methods=("ITERATIVE", "EPNP", "SQPNP"),
+            refinements=(),
+            use_ransac=False,
+        ),
+    )
+
+    assert result.object_geometry.classification == "planar"
+    assert result.object_geometry.rank == 2
+    assert result.candidates
+    assert all(candidate.jacobian_diagnostics.parameter_count == 6 for candidate in result.candidates)
+
+
+def test_numerical_pose_jacobian_uses_only_selected_native_dofs() -> None:
+    parameters = PoseParametersNed(1.0, 2.0, 3.0, 10.0, 20.0, 30.0)
+    mask = PoseDofMask.from_names(("pitch_deg", "down_m"))
+
+    jacobian = numerical_pose_jacobian(
+        parameters,
+        mask,
+        lambda value: (
+            2.0 * value.pitch_deg + value.down_m,
+            value.pitch_deg - 3.0 * value.down_m,
+        ),
+    )
+
+    np = pytest.importorskip("numpy")
+    assert np.asarray(jacobian) == pytest.approx(np.asarray(((2.0, 1.0), (1.0, -3.0))), abs=1.0e-9)
+
+
+def test_pose_reprojection_residual_is_zero_on_the_declared_raw_grid() -> None:
+    pose, correspondences = _synthetic_raw_correspondences()
+    parameters = PoseParametersNed(4.0, -7.0, 21.0, 12.0, -8.0, 2.5)
+
+    residuals = pose_reprojection_residuals(parameters, correspondences)
+
+    # Synthetic observations include only deterministic subpixel marking noise.
+    assert sqrt(sum(value * value for value in residuals) / len(residuals)) < 0.15
+    assert parameters.to_camera_pose_ned().center_ned_m == pose.center_ned_m

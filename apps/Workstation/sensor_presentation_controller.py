@@ -17,9 +17,9 @@ from Workstation.telemetry_plots import AttitudeHistoryPoint, TelemetryHistoryPo
 from Workstation.workstation_core.pixhawk_attitude import CameraExtrinsicState
 from Workstation.workstation_core.rtk_geometry import GpsPositionState
 from Workstation.workstation_core.theme import (
-    ERROR, ERROR_BG, ERROR_TEXT, PANEL_ALT_BG, PANEL_BORDER,
-    SUCCESS, SUCCESS_BG, SUCCESS_TEXT, TEXT_MUTED,
-    WARNING, WARNING_BG, WARNING_TEXT,
+    ERROR, ERROR_TEXT, PANEL_ALT_BG, PANEL_BORDER,
+    SUCCESS, SUCCESS_TEXT, TEXT_MUTED,
+    WARNING, WARNING_TEXT,
 )
 
 
@@ -55,13 +55,13 @@ class SensorPresentationController:
         self.panel = panel
 
     def _update_extrinsic(self, camera: str, extrinsic: CameraExtrinsicState) -> None:
+        # Drone Telemetry shares the receive subscriber but is a position/
+        # correction endpoint, not a third stereo camera. Do not feed its
+        # ATTITUDE packets into the two-camera attitude/baseline surfaces.
+        if camera not in self.panel.attitude_buffers:
+            return
         age_ms = max(0.0, time.monotonic() - extrinsic.timestamp_s) * 1000.0
         px4_text = f", px4_t={extrinsic.px4_timestamp_s:.3f}" if extrinsic.px4_timestamp_s is not None else ""
-        text = (
-            f"{camera}/namespace={extrinsic.namespace}: "
-            f"roll={extrinsic.roll_deg:.4f}°, pitch={extrinsic.pitch_deg:.4f}°, "
-            f"yaw={extrinsic.yaw_deg:.4f}°, age={age_ms:.0f}ms{px4_text}"
-        )
         self.panel.latest_extrinsics[camera] = extrinsic
         self.panel.attitude_monitor.update(camera, extrinsic)
         self.panel._record_external_timeline_row(
@@ -236,12 +236,22 @@ class SensorPresentationController:
         timestamp_s = float(getattr(state, "timestamp_s", time.monotonic()))
         px4_timestamp_s = getattr(state, "px4_timestamp_s", None)
         if "vehicle_magnetometer" in topic and getattr(state, "device_id", None) is not None:
-            self.panel.latest_vehicle_mag_device_ids[camera] = int(state.device_id)
-            self.panel.refresh_px4_mag_manager(camera)
+            if camera in self.panel.latest_vehicle_mag_device_ids:
+                self.panel.latest_vehicle_mag_device_ids[camera] = int(state.device_id)
+                self.panel.refresh_px4_mag_manager(camera)
         sensor_slot = str(getattr(state, "sensor_slot", ""))
         device_id, device_source = self.panel._mag_state_display_device_id(camera, state)
         device_type = self.panel._magnetometer_device_type(sensor_slot, device_id)
-        self.panel.latest_mag_sensors.setdefault(camera, {})[state.sensor_slot] = state
+        is_dedicated_can_mag = any(
+            message_name in topic.upper() for message_name in ("CAN_MAG", "CAN_MAGNETOMETER", "SASL_CAN_MAG")
+        ) or (topic.upper().endswith("DEBUG_VECT") and sensor_slot in {"CAN1", "CAN2"})
+        if is_dedicated_can_mag:
+            can_states = getattr(self.panel, "latest_can_mag_sensors", None)
+            if can_states is None:
+                can_states = self.panel.latest_can_mag_sensors = {"left": {}, "right": {}}
+            can_states.setdefault(camera, {})[state.sensor_slot] = state
+        else:
+            self.panel.latest_mag_sensors.setdefault(camera, {})[state.sensor_slot] = state
         stream_prefix = {
             "mavlink/SCALED_IMU": "mag_scaled_imu",
             "mavlink/SCALED_IMU2": "mag_scaled_imu2",
@@ -272,6 +282,8 @@ class SensorPresentationController:
                     if "sensor_mag" in topic or "vehicle_magnetometer" in topic
                     else "milligauss"
                     if topic.startswith("mavlink/SCALED_IMU")
+                    else "gauss"
+                    if topic.upper().endswith("DEBUG_VECT") and sensor_slot in {"CAN1", "CAN2"}
                     else ""
                 ),
                 "mag_x": self.panel._fmt_record_float(getattr(state, "x", None), 9),

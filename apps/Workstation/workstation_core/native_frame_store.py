@@ -1,0 +1,123 @@
+"""Lossless native PNG persistence for pose and accepted-measurement evidence."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping
+
+from PyQt5 import QtGui
+
+
+@dataclass(frozen=True)
+class NativeFrameArtifact:
+    frame_id: str
+    side: str
+    purpose: str
+    relative_path: str
+    width: int
+    height: int
+    size_bytes: int
+    sha256: str
+    timestamp_s: float
+    source_timestamp_s: float | None
+    timestamp_reference: str
+    source_native_frame_id: str = ""
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema": "native-frame-artifact-v1",
+            **self.__dict__,
+            "pixel_contract": "decoded native RGB pixels; lossless PNG; no overlay; no resize",
+        }
+
+
+def _safe_token(value: object, fallback: str) -> str:
+    text = "".join(character if character.isalnum() or character in "._-" else "_" for character in str(value or ""))
+    return text.strip("._") or fallback
+
+
+class NativeFrameStore:
+    """Synchronous atomic writer intended for a dedicated controller/worker."""
+
+    def __init__(self, session_root: Path | str) -> None:
+        self.root = Path(session_root).expanduser().resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.events_path = self.root / "native_frames.jsonl"
+
+    def persist(
+        self,
+        *,
+        side: str,
+        purpose: str,
+        image: QtGui.QImage,
+        metadata: Mapping[str, Any],
+        frame_id: str | None = None,
+    ) -> NativeFrameArtifact:
+        side_value = str(side).lower()
+        if side_value not in {"left", "right"}:
+            raise ValueError("side must be left or right")
+        if image.isNull():
+            raise ValueError("native image is null")
+        if metadata.get("overlay_applied") not in (False, None):
+            raise ValueError("annotated frames cannot be persisted as native evidence")
+        expected_width = int(metadata.get("native_width", image.width()))
+        expected_height = int(metadata.get("native_height", image.height()))
+        if (image.width(), image.height()) != (expected_width, expected_height):
+            raise ValueError("native frame dimensions do not match producer metadata")
+        identifier = _safe_token(frame_id or uuid.uuid4(), "frame")
+        purpose_value = _safe_token(purpose, "unspecified")
+        output_dir = self.root / "frames" / purpose_value
+        output_dir.mkdir(parents=True, exist_ok=True)
+        destination = output_dir / f"{identifier}-{side_value}.png"
+        temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.part")
+        try:
+            if not image.save(str(temporary), "PNG", 100):
+                raise IOError("Qt failed to encode native PNG")
+            with temporary.open("rb") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            descriptor = os.open(output_dir, os.O_RDONLY)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        payload = destination.read_bytes()
+        decoded = QtGui.QImage(str(destination))
+        if decoded.isNull() or (decoded.width(), decoded.height()) != (image.width(), image.height()):
+            raise IOError("persisted native PNG failed decode/dimension verification")
+        record = NativeFrameArtifact(
+            frame_id=identifier,
+            side=side_value,
+            purpose=purpose_value,
+            relative_path=destination.relative_to(self.root).as_posix(),
+            width=image.width(),
+            height=image.height(),
+            size_bytes=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            timestamp_s=float(metadata.get("timestamp_s", time.monotonic())),
+            source_timestamp_s=(
+                None if metadata.get("source_timestamp_s") is None else float(metadata["source_timestamp_s"])
+            ),
+            timestamp_reference=str(metadata.get("timestamp_reference") or "app-receive"),
+            source_native_frame_id=str(metadata.get("source_native_frame_id") or ""),
+        )
+        with self.events_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record.to_mapping(), ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return record
+
+
+__all__ = ["NativeFrameArtifact", "NativeFrameStore"]

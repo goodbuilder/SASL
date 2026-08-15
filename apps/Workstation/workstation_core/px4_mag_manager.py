@@ -18,13 +18,66 @@ GPS2_MAG_ID = 396817
 GPS_MAG_IDS = (GPS1_MAG_ID, GPS2_MAG_ID)
 INTERNAL_MAG_IDS = (BOARD_INTERNAL_MAG_ID, *GPS_MAG_IDS)
 MAG_SLOTS = tuple(range(5))
+MAG_PRIORITY_LEVELS = (
+    (-1, "Uninitialized"),
+    (0, "Disabled"),
+    (1, "Min"),
+    (25, "Low"),
+    (50, "Medium"),
+    (75, "High"),
+    (100, "Max"),
+)
+MAG_PRIORITY_LABELS = dict(MAG_PRIORITY_LEVELS)
+
+
+def mag_priority_label(value: int | float | None) -> str:
+    """Return the PX4 semantic label while preserving non-standard raw values."""
+
+    if value is None:
+        return "N/A"
+    raw = int(value)
+    label = MAG_PRIORITY_LABELS.get(raw)
+    return label if label is not None else f"Custom ({raw})"
+
+
+def mag_priority_display(value: int | float | None) -> str:
+    """Return a lossless operator-facing value such as ``High (75)``."""
+
+    if value is None:
+        return "N/A"
+    raw = int(value)
+    label = MAG_PRIORITY_LABELS.get(raw)
+    return f"{label} ({raw})" if label is not None else f"Custom ({raw})"
+
+
+MAG_CAL_PARAM_NAMES = (
+    *(f"CAL_MAG{slot}_ID" for slot in MAG_SLOTS),
+    *(f"CAL_MAG{slot}_PRIO" for slot in MAG_SLOTS),
+    *(f"CAL_MAG{slot}_{suffix}" for slot in MAG_SLOTS for suffix in ("ROT", "ROLL", "PITCH", "YAW")),
+    *(
+        f"CAL_MAG{slot}_{suffix}"
+        for slot in MAG_SLOTS
+        for suffix in (
+            "XOFF",
+            "YOFF",
+            "ZOFF",
+            "XSCALE",
+            "YSCALE",
+            "ZSCALE",
+            "XODIAG",
+            "YODIAG",
+            "ZODIAG",
+            "XCOMP",
+            "YCOMP",
+            "ZCOMP",
+        )
+    ),
+)
 MAG_PARAM_NAMES = (
     "UAVCAN_ENABLE",
     "UAVCAN_SUB_MAG",
     "EKF2_MAG_TYPE",
-    *(f"CAL_MAG{slot}_ID" for slot in MAG_SLOTS),
-    *(f"CAL_MAG{slot}_PRIO" for slot in MAG_SLOTS),
-    *(f"CAL_MAG{slot}_ROT" for slot in MAG_SLOTS),
+    *MAG_CAL_PARAM_NAMES,
 )
 
 
@@ -85,6 +138,25 @@ class Px4MagStatus:
         for slot in MAG_SLOTS:
             data[f"CAL_MAG{slot}_ID"] = self.params.get(f"CAL_MAG{slot}_ID")
             data[f"CAL_MAG{slot}_PRIO"] = self.params.get(f"CAL_MAG{slot}_PRIO")
+            for suffix in (
+                "ROT",
+                "ROLL",
+                "PITCH",
+                "YAW",
+                "XOFF",
+                "YOFF",
+                "ZOFF",
+                "XSCALE",
+                "YSCALE",
+                "ZSCALE",
+                "XODIAG",
+                "YODIAG",
+                "ZODIAG",
+                "XCOMP",
+                "YCOMP",
+                "ZCOMP",
+            ):
+                data[f"CAL_MAG{slot}_{suffix}"] = self.params.get(f"CAL_MAG{slot}_{suffix}")
         return data
 
     def to_json(self) -> str:

@@ -7,12 +7,14 @@ leave UI state ownership with the workstation panel/controller.
 
 from __future__ import annotations
 
+import ftplib
 import math
 import os
 import re
 import threading
 import time
 from collections.abc import Sequence
+from pathlib import Path
 from statistics import median
 
 from PyQt5 import QtCore
@@ -59,8 +61,6 @@ WIRIS_STUS_RTT_PROBE_COUNT = 3
 WIRIS_STUS_MAX_VALID_RTT_S = 0.250
 WIRIS_STUS_PARSE_MARGIN_S = 0.002
 WIRIS_LRF_COMMAND = "GLRD"
-WIRIS_LRF_POLL_HZ = 1.0
-WIRIS_LRF_POLL_PERIOD_S = 1.0 / WIRIS_LRF_POLL_HZ
 
 
 _LRF_NUMBER_RE = re.compile(r"[-+]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][-+]?\d+)?")
@@ -725,8 +725,264 @@ class WirisCommandWorker(QtCore.QObject):
             self.finished.emit()
 
 
+class WirisPnPPhotoCaptureWorker(QtCore.QObject):
+    """Enable one visible still channel and wait for camera-local storage.
+
+    The WIRIS camera uses the same ``CPTR``/``ICPT`` lifecycle for the normal
+    visible operating-zoom still and the visible HR still.  The channel's
+    image-storage command is injected so the two evidence paths can remain
+    separate while sharing the timing and completion contract.
+    """
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    #: JPG/TIFF are the only still formats WIRIS Enterprise stores for CPTR.
+    FTP_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".tif", ".tiff")
+
+    def __init__(
+        self,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        *,
+        capture_id: str,
+        image_enable_command: str = "SIHR TRUE",
+        capture_channel: str = "hr",
+        completion_timeout_s: float = 10.0,
+        ftp_enabled: bool = False,
+        ftp_port: int = 21,
+        ftp_user: str = "anonymous",
+        ftp_password: str = "",
+        ftp_remote_dir: str = "/",
+        ftp_timeout_s: float = 10.0,
+        ftp_output_dir: str | os.PathLike[str] | None = None,
+    ) -> None:
+        super().__init__()
+        self.target_infos = tuple(
+            (str(label), str(host), int(port), max(0.1, float(timeout_s)))
+            for label, host, port, timeout_s in target_infos
+        )
+        self.capture_id = str(capture_id)
+        self.image_enable_command = str(image_enable_command).strip()
+        self.capture_channel = str(capture_channel).strip().lower() or "hr"
+        self.completion_timeout_s = max(0.0, float(completion_timeout_s))
+        # FTP reaches the same WIRIS Enterprise host as the TCP command
+        # channel above; only the port differs. Downloading is best-effort:
+        # a failure here never turns an otherwise-successful CPTR capture
+        # into a failed one, it only leaves ftp_downloaded False so the
+        # operator falls back to the existing manual import path.
+        self.ftp_enabled = bool(ftp_enabled)
+        self.ftp_port = int(ftp_port)
+        self.ftp_user = str(ftp_user) or "anonymous"
+        self.ftp_password = str(ftp_password)
+        self.ftp_remote_dir = str(ftp_remote_dir) or "/"
+        self.ftp_timeout_s = max(0.1, float(ftp_timeout_s))
+        self.ftp_output_dir = (
+            None if ftp_output_dir is None else Path(ftp_output_dir) / f"{self.capture_channel}_capture"
+        )
+
+    @staticmethod
+    def _capture_busy(response: str) -> bool:
+        text = str(response or "").strip().upper()
+        if not text:
+            return False
+        if (
+            any(token in text for token in ("FALSE", "IDLE", "DONE", "READY", " 0", "=0"))
+            or text == "0"
+        ):
+            return False
+        return (
+            any(token in text for token in ("TRUE", "BUSY", "CAPT", " 1", "=1"))
+            or text == "1"
+        )
+
+    @staticmethod
+    def _send(host: str, port: int, timeout_s: float, command_text: str) -> str:
+        return send_tcp_line(
+            build_wiris_command(
+                host=host,
+                port=port,
+                command=command_text,
+                timeout_s=timeout_s,
+                terminator=LINE_TERMINATOR,
+            )
+        )
+
+    def _latest_ftp_file_name(self, ftp: ftplib.FTP) -> str:
+        names = [
+            name
+            for name in ftp.nlst()
+            if Path(name).suffix.lower() in self.FTP_IMAGE_EXTENSIONS
+        ]
+        if not names:
+            raise FileNotFoundError("WIRIS FTP remote directory has no JPG/TIFF images")
+
+        def _modified_at(name: str) -> str:
+            try:
+                response = ftp.voidcmd(f"MDTM {name}")
+                return response.strip().rsplit(" ", 1)[-1]
+            except ftplib.all_errors:
+                return ""
+
+        return max(names, key=_modified_at)
+
+    def _download_latest_ftp_file(self, host: str, label: str) -> Path:
+        if self.ftp_output_dir is None:
+            raise RuntimeError("no local FTP download directory was configured")
+        self.ftp_output_dir.mkdir(parents=True, exist_ok=True)
+        with ftplib.FTP() as ftp:
+            ftp.connect(host, self.ftp_port, timeout=self.ftp_timeout_s)
+            ftp.login(user=self.ftp_user, passwd=self.ftp_password)
+            if self.ftp_remote_dir:
+                ftp.cwd(self.ftp_remote_dir)
+            latest_name = self._latest_ftp_file_name(ftp)
+            destination = self.ftp_output_dir / f"{self.capture_id}_{label}_{latest_name}"
+            with destination.open("wb") as handle:
+                ftp.retrbinary(f"RETR {latest_name}", handle.write)
+        return destination
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        results: dict[str, dict[str, object]] = {}
+
+        def capture_one(label: str, host: str, port: int, timeout_s: float) -> None:
+            item: dict[str, object] = {
+                "state": "failed",
+                f"{self.capture_channel}_enabled": False,
+                "capture_complete": False,
+                "stored_on_camera": False,
+                "ftp_downloaded": False,
+            }
+            try:
+                item[f"{self.capture_channel}_enable_response"] = self._send(
+                    host, port, timeout_s, self.image_enable_command
+                )
+                item[f"{self.capture_channel}_enabled"] = True
+                item["capture_requested_unix_ns"] = time.time_ns()
+                item["capture_response"] = self._send(host, port, timeout_s, "CPTR")
+                deadline_s = time.monotonic() + self.completion_timeout_s
+                while True:
+                    response = self._send(host, port, timeout_s, "ICPT")
+                    item["capture_status_response"] = response
+                    if not self._capture_busy(response):
+                        item["capture_complete"] = True
+                        item["stored_on_camera"] = True
+                        item["state"] = "completed"
+                        break
+                    if time.monotonic() >= deadline_s:
+                        item["state"] = "timeout"
+                        item["error"] = "ICPT completion timeout"
+                        break
+                    time.sleep(0.25)
+            except Exception as exc:
+                item["error"] = str(exc)
+            if item.get("stored_on_camera") and self.ftp_enabled:
+                try:
+                    downloaded = self._download_latest_ftp_file(host, label)
+                    item["ftp_downloaded"] = True
+                    item["ftp_local_path"] = str(downloaded)
+                except Exception as exc:
+                    item["ftp_downloaded"] = False
+                    item["ftp_error"] = str(exc)
+            item["finished_unix_ns"] = time.time_ns()
+            results[label] = item
+
+        threads = [
+            threading.Thread(
+                target=capture_one,
+                args=(label, host, port, timeout_s),
+                name=f"wiris-pnp-photo-{self.capture_id}-{label}",
+            )
+            for label, host, port, timeout_s in self.target_infos
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            ftp_wait_budget_s = self.ftp_timeout_s * 2.0 if self.ftp_enabled else 0.0
+            maximum_wait_s = self.completion_timeout_s + ftp_wait_budget_s + sum(
+                max(1.0, timeout_s) * 3.0
+                for _label, _host, _port, timeout_s in self.target_infos[:1]
+            )
+            for thread in threads:
+                thread.join(timeout=maximum_wait_s)
+            for label, _host, _port, _timeout_s in self.target_infos:
+                results.setdefault(
+                    label,
+                    {
+                        "state": "failed",
+                        "error": "capture worker thread timeout",
+                        f"{self.capture_channel}_enabled": False,
+                        "capture_complete": False,
+                        "stored_on_camera": False,
+                        "ftp_downloaded": False,
+                        "finished_unix_ns": time.time_ns(),
+                    },
+                )
+            camera_items = list(results.values())
+            self.completed.emit(
+                {
+                    "capture_id": self.capture_id,
+                    "capture_channel": self.capture_channel,
+                    "image_enable_command": self.image_enable_command,
+                    "commands": (self.image_enable_command, "CPTR", "ICPT"),
+                    "cameras": results,
+                    "stored_on_camera": bool(camera_items)
+                    and all(item.get("stored_on_camera") for item in camera_items),
+                    "ftp_downloaded": self.ftp_enabled
+                    and bool(camera_items)
+                    and all(item.get("ftp_downloaded") for item in camera_items),
+                }
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+
+class WirisOZPhotoCaptureWorker(WirisPnPPhotoCaptureWorker):
+    """Capture a normal visible operating-zoom still on both cameras."""
+
+    def __init__(
+        self,
+        target_infos: Sequence[tuple[str, str, int, float]],
+        *,
+        capture_id: str,
+        completion_timeout_s: float = 10.0,
+        ftp_enabled: bool = False,
+        ftp_port: int = 21,
+        ftp_user: str = "anonymous",
+        ftp_password: str = "",
+        ftp_remote_dir: str = "/",
+        ftp_timeout_s: float = 10.0,
+        ftp_output_dir: str | os.PathLike[str] | None = None,
+    ) -> None:
+        super().__init__(
+            target_infos,
+            capture_id=capture_id,
+            image_enable_command="SIVI TRUE",
+            capture_channel="oz",
+            completion_timeout_s=completion_timeout_s,
+            ftp_enabled=ftp_enabled,
+            ftp_port=ftp_port,
+            ftp_user=ftp_user,
+            ftp_password=ftp_password,
+            ftp_remote_dir=ftp_remote_dir,
+            ftp_timeout_s=ftp_timeout_s,
+            ftp_output_dir=ftp_output_dir,
+        )
+
+
 class WirisLrfPollWorker(QtCore.QObject):
-    """Continuously read the optional WIRIS laser rangefinder off the UI thread."""
+    """Read the optional WIRIS laser rangefinder once, off the UI thread.
+
+    The control port is a single embedded TCP service shared with zoom,
+    clock-sync, and RTSP-enable commands; each read opens and closes its own
+    connection (``send_tcp_line``). Earlier versions of this worker looped
+    forever at 1 Hz, which kept that connection churn running for as long as
+    the Alignment workspace stayed open and could exhaust the camera's
+    control service over a long session. Reads now happen only when a caller
+    explicitly requests one.
+    """
 
     sampled = QtCore.pyqtSignal(object)
     failed = QtCore.pyqtSignal(str)
@@ -735,19 +991,12 @@ class WirisLrfPollWorker(QtCore.QObject):
     def __init__(
         self,
         target_infos: Sequence[tuple[str, str, int, float]],
-        *,
-        period_s: float = WIRIS_LRF_POLL_PERIOD_S,
     ) -> None:
         super().__init__()
         self.target_infos = tuple(
             (str(label), str(host), int(port), max(0.1, float(timeout_s)))
             for label, host, port, timeout_s in target_infos
         )
-        self.period_s = max(0.05, float(period_s))
-        self._stop_event = threading.Event()
-
-    def request_stop(self) -> None:
-        self._stop_event.set()
 
     def _poll_one(
         self,
@@ -832,12 +1081,7 @@ class WirisLrfPollWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run(self) -> None:
         try:
-            while not self._stop_event.is_set():
-                cycle_started_s = time.monotonic()
-                self.sampled.emit({"samples": self.poll_once(), "polled_s": time.monotonic()})
-                remaining_s = self.period_s - (time.monotonic() - cycle_started_s)
-                if self._stop_event.wait(max(0.0, remaining_s)):
-                    break
+            self.sampled.emit({"samples": self.poll_once(), "polled_s": time.monotonic()})
         except Exception as exc:
             self.failed.emit(str(exc))
         finally:

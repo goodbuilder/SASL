@@ -16,6 +16,25 @@ PIXHAWK_ETHERNET_MODES = ("mavlink",)
 DEFAULT_PIXHAWK_ETHERNET_MODE = "mavlink"
 
 
+def _load_gnss_operation(value: object) -> GnssOperationConfig:
+    """Load GNSS settings and retire the former public-caster profile.
+
+    Existing field settings that still point at the retired caster are
+    switched to the NGII RTS2 profile before the runtime can open a network
+    connection. Explicit non-retired operation modes and caster settings are
+    preserved.
+    """
+
+    if value is None:
+        return GnssOperationConfig.ngii_rts2_base_assisted()
+    config = GnssOperationConfig.from_mapping(value)
+    host = config.network.caster_host.casefold().strip().rstrip(".")
+    mountpoint = config.network.mountpoint.casefold().strip().lstrip("/")
+    if host == "rtk2go.com" or host.endswith(".rtk2go.com") or mountpoint == "kaist-rtk-rtcm":
+        return GnssOperationConfig.ngii_rts2_base_assisted()
+    return config
+
+
 @dataclass(frozen=True)
 class AppSettings:
     intrinsics_path: str = DEFAULT_INTRINSICS_PATH
@@ -35,6 +54,15 @@ class AppSettings:
     right_control_port: int = 2240
     # The left camera's SDK can acknowledge read commands after roughly 2 s.
     wiris_control_timeout_s: float = 5.0
+    # WIRIS Enterprise's onboard FTP server, reached over the same host as
+    # the TCP command channel above (different port only). Used to retrieve
+    # a captured HR/OZ still after the camera reports it stored.
+    wiris_ftp_enabled: bool = False
+    wiris_ftp_port: int = 21
+    wiris_ftp_user: str = "anonymous"
+    wiris_ftp_password: str = ""
+    wiris_ftp_remote_dir: str = "/"
+    wiris_ftp_timeout_s: float = 10.0
     yolo_device: str = "cpu"
     yolo_input_size: int = 416
     yolo_conf_threshold: float = 0.5
@@ -89,6 +117,13 @@ class AppSettings:
     right_mavlink_url: str = "udpin:0.0.0.0:14551"
     left_mavlink_baud: int = 57600
     right_mavlink_baud: int = 57600
+    # The third Pixhawk link is an active telemetry/correction endpoint for
+    # the drone.  It is deliberately separate from the receive-only target
+    # drone artifact path.
+    drone_telemetry_url: str = "udpin:0.0.0.0:14552"
+    drone_telemetry_baud: int = 57600
+    drone_telemetry_rtcm_forward: bool = True
+    drone_telemetry_rtcm_source: str = "base"
     left_pixhawk_bootstrap_url: str = ""
     right_pixhawk_bootstrap_url: str = ""
     left_pixhawk_bootstrap_baud: int = 57600
@@ -116,7 +151,7 @@ class AppSettings:
 def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
     settings_path = Path(path)
     if not settings_path.exists():
-        settings = AppSettings()
+        settings = AppSettings(gnss_operation=GnssOperationConfig.ngii_rts2_base_assisted())
         save_settings(settings, settings_path)
         return settings
     payload = json.loads(settings_path.read_text())
@@ -137,6 +172,12 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
     )
     if calibration_validation_mode not in {"pixhawk", "checkerboard"}:
         calibration_validation_mode = AppSettings.calibration_validation_mode
+    drone_telemetry_rtcm_source = str(
+        payload.get("drone_telemetry_rtcm_source", AppSettings.drone_telemetry_rtcm_source)
+    ).strip().lower()
+    if drone_telemetry_rtcm_source not in {"base", "ntrip"}:
+        drone_telemetry_rtcm_source = AppSettings.drone_telemetry_rtcm_source
+    gnss_operation = _load_gnss_operation(payload.get("gnss_operation"))
     return AppSettings(
         intrinsics_path=str(payload.get("intrinsics_path", AppSettings.intrinsics_path)),
         yolo_weights_path=str(payload.get("yolo_weights_path", AppSettings.yolo_weights_path)),
@@ -158,6 +199,12 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
             payload.get("right_control_port", payload.get("wiris_control_port", AppSettings.right_control_port))
         ),
         wiris_control_timeout_s=float(payload.get("wiris_control_timeout_s", AppSettings.wiris_control_timeout_s)),
+        wiris_ftp_enabled=bool(payload.get("wiris_ftp_enabled", AppSettings.wiris_ftp_enabled)),
+        wiris_ftp_port=int(payload.get("wiris_ftp_port", AppSettings.wiris_ftp_port)),
+        wiris_ftp_user=str(payload.get("wiris_ftp_user", AppSettings.wiris_ftp_user)),
+        wiris_ftp_password=str(payload.get("wiris_ftp_password", AppSettings.wiris_ftp_password)),
+        wiris_ftp_remote_dir=str(payload.get("wiris_ftp_remote_dir", AppSettings.wiris_ftp_remote_dir)),
+        wiris_ftp_timeout_s=float(payload.get("wiris_ftp_timeout_s", AppSettings.wiris_ftp_timeout_s)),
         yolo_device=str(payload.get("yolo_device", AppSettings.yolo_device)),
         yolo_input_size=int(payload.get("yolo_input_size", AppSettings.yolo_input_size)),
         yolo_conf_threshold=float(payload.get("yolo_conf_threshold", AppSettings.yolo_conf_threshold)),
@@ -310,6 +357,12 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         right_mavlink_url=str(payload.get("right_mavlink_url", AppSettings.right_mavlink_url)),
         left_mavlink_baud=int(payload.get("left_mavlink_baud", AppSettings.left_mavlink_baud)),
         right_mavlink_baud=int(payload.get("right_mavlink_baud", AppSettings.right_mavlink_baud)),
+        drone_telemetry_url=str(payload.get("drone_telemetry_url", AppSettings.drone_telemetry_url)),
+        drone_telemetry_baud=int(payload.get("drone_telemetry_baud", AppSettings.drone_telemetry_baud)),
+        drone_telemetry_rtcm_forward=bool(
+            payload.get("drone_telemetry_rtcm_forward", AppSettings.drone_telemetry_rtcm_forward)
+        ),
+        drone_telemetry_rtcm_source=drone_telemetry_rtcm_source,
         left_pixhawk_bootstrap_url=str(
             payload.get("left_pixhawk_bootstrap_url", AppSettings.left_pixhawk_bootstrap_url)
         ),
@@ -348,7 +401,7 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         gnss_base_rtcm_injection_target=str(
             payload.get("gnss_base_rtcm_injection_target", AppSettings.gnss_base_rtcm_injection_target)
         ),
-        gnss_operation=GnssOperationConfig.from_mapping(payload.get("gnss_operation")),
+        gnss_operation=gnss_operation,
     )
 
 
