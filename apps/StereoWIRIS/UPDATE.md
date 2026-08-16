@@ -1,5 +1,22 @@
 # 업데이트 기록
 
+## Alignment 입력·카메라 레이아웃·optical pose 후보 — 2026-08-14
+
+- Alignment 상단의 `Device prerequisites`를 큰 고정 게이트 카드에서 읽기 전용 요약과 접을 수 있는 상세 snapshot으로 바꿨다. 실제 입력 소유자는 `Devices`이며, 선택한 method가 요구하는 입력만 owner가 판정한다.
+- Diagnostics dock을 숨기면 Camera workspace가 가용 높이를 사용해 두 카메라 화면을 세로로 확장하고, 상세 pane을 옆에 배치한다. 카메라 viewport의 16:9 표시와 native pixel/bounding-box 계약은 유지하며, Diagnostics를 다시 표시하면 일반 가로 pair layout으로 돌아간다.
+- Alignment의 `R,t methods` surface에도 남은 viewport 높이를 배정해 Diagnostics를 숨길 때 내부 camera/annotation scroll surface가 창 하단까지 확장되고, dock을 다시 표시하면 원래 높이로 복귀한다. 16:9 native image sizing은 유지한다.
+- `Existing calibration`을 Alignment solver가 아니라 `Pre-run Calibration`에서 만든 checkerboard `K,D + R,t` reference/base profile로 설명했다. `Combine candidates`는 최신 결과 자동 선택이나 평균이 아니라, 사용자가 명시적으로 체크한 immutable candidate ID만 조합한다.
+- 방법 계약: 목적은 관측 가능한 optical-pose DOF 초기화, 입력은 frozen native image burst·exact operating `K,D/R,t`·명시적 horizon/mountain/GNSS/Drone RTK evidence, 출력은 PX4 virtual-camera FRD→world NED immutable candidate, 통과 기준은 applicability·observability·prior·method-specific input 검증 통과다. Calibration-time checkerboard 결과는 runtime ground truth가 아니다.
+- 확인:
+  - Alignment/optical-pose 집중 회귀 — `18 passed, 130 deselected, 1 warning`.
+  - Diagnostics 전환 레이아웃 회귀 — `3 passed, 131 deselected`.
+  - 전체 pytest(`ROS_LOG_DIR=/tmp/sasl-ros-log MPLCONFIGDIR=/tmp/sasl-mpl QT_QPA_PLATFORM=offscreen python3 -m pytest -q`) — `2466 passed, 99 skipped, 2 warnings`.
+  - `git diff --check` 통과.
+- 남은 위험:
+  - 실제 장비 화면과 실제 Diagnostics dock 토글에서 카메라 표시 크기·스크롤 경험은 현장 확인이 필요하다. 테스트는 Qt offscreen 레이아웃과 16:9 계약을 검증한다.
+
+Coordinate contract checked: `Workstation/workspaces.py`, `Workstation/optical_pose_controller.py`, `Workstation/workstation_core/optical_pose.py`, `Workstation/tests/test_workstation.py`, `Workstation/tests/test_optical_pose_workspace.py`, `Workstation/tests/test_optical_pose_controller_integration.py`, `Workstation/docs/ui/01_USER_WORKFLOW.md`; source image `x/y` and `bbox_px` remain native OpenCV optical pixels `(u right, v down)`, camera preview is presentation-only 16:9, stereo calibration remains optical RDF, and optical-pose candidates remain PX4 virtual-camera FRD→world NED.
+
 ## GNSS/NTRIP 세션 운용 — 2026-08-10
 
 - Workstation과 Legacy에 동일한 세 가지 GNSS 운용 모드, Base USB u-blox by-id 자동 선택, 세션별 장소/주소와 caster/mountpoint 설정을 노출했다.

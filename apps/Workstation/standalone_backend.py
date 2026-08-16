@@ -72,6 +72,18 @@ class StandalonePanelBackend(QtCore.QObject):
     def optical_pose_import_burst(self, payload: dict[str, object]) -> Any:
         return self._call("import_workstation_optical_pose_burst", dict(payload))
 
+    def optical_pose_capture_burst_wiris_ftp(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "capture_workstation_optical_pose_burst_wiris_ftp",
+            dict(payload or {}),
+        )
+
+    def optical_pose_capture_burst_wiris_ftp_oz(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "capture_workstation_optical_pose_burst_wiris_ftp_oz",
+            dict(payload or {}),
+        )
+
     def optical_pose_import_terrain(self, payload: dict[str, object]) -> Any:
         return self._call("import_workstation_optical_pose_terrain", dict(payload))
 
@@ -87,6 +99,15 @@ class StandalonePanelBackend(QtCore.QObject):
     def optical_pose_solve_drone_yaw(self, payload: dict[str, object]) -> Any:
         return self._call("solve_workstation_optical_pose_drone_yaw", dict(payload))
 
+    def optical_pose_initialize_telemetry(self, payload: dict[str, object]) -> Any:
+        return self._call("initialize_workstation_optical_pose_telemetry", dict(payload))
+
+    def optical_pose_solve_drone_rtk_multiview(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "solve_workstation_optical_pose_drone_rtk_multiview",
+            dict(payload),
+        )
+
     def optical_pose_solve_combined(self, payload: dict[str, object]) -> Any:
         return self._call("solve_workstation_optical_pose_combined", dict(payload))
 
@@ -100,6 +121,30 @@ class StandalonePanelBackend(QtCore.QObject):
         return self._call(
             "auto_select_workstation_optical_pose_mountain",
             dict(payload or {}),
+        )
+
+    def optical_pose_set_mountain_ridge_margin(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "set_workstation_optical_pose_mountain_ridge_margin",
+            dict(payload),
+        )
+
+    def optical_pose_set_mountain_max_points(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "set_workstation_optical_pose_mountain_max_points",
+            dict(payload),
+        )
+
+    def optical_pose_clear_auto_suggestions(self, payload: dict[str, object] | None = None) -> Any:
+        return self._call(
+            "clear_workstation_optical_pose_auto_suggestions",
+            dict(payload or {}),
+        )
+
+    def optical_pose_register_reference_candidate(self, payload: dict[str, object]) -> Any:
+        return self._call(
+            "register_workstation_optical_pose_reference_candidate",
+            dict(payload),
         )
 
     def optical_pose_accept_suggestion(self, payload: dict[str, object]) -> Any:
@@ -253,6 +298,12 @@ class StandalonePanelBackend(QtCore.QObject):
     def calibration_capture_images(self) -> Any:
         return self._call("capture_calibration_images")
 
+    def calibration_capture_images_wiris_ftp(self) -> Any:
+        return self._call("capture_calibration_images_wiris_ftp")
+
+    def calibration_capture_images_wiris_ftp_oz(self) -> Any:
+        return self._call("capture_calibration_images_wiris_ftp_oz")
+
     def calibration_toggle_auto_capture(self) -> Any:
         return self._call("toggle_auto_calibration_capture")
 
@@ -315,6 +366,24 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def calibration_apply_validation(self) -> Any:
         return self._call("apply_checkerboard_validation_result")
+
+    def workstation_checkerboard_validation_snapshot(self) -> Any:
+        return self._call("workstation_checkerboard_validation_snapshot")
+
+    def configure_workstation_checkerboard_validation(self, payload: dict[str, object]) -> Any:
+        return self._call("configure_workstation_checkerboard_validation", dict(payload))
+
+    def load_workstation_checkerboard_validation_json(self, payload: dict[str, object]) -> Any:
+        return self._call("load_workstation_checkerboard_validation_json", dict(payload))
+
+    def run_workstation_checkerboard_validation(self, payload: dict[str, object]) -> Any:
+        return self._call("run_workstation_checkerboard_validation", dict(payload))
+
+    def save_workstation_checkerboard_validation_result(self) -> Any:
+        return self._call("save_workstation_checkerboard_validation_result")
+
+    def apply_workstation_checkerboard_validation_result(self) -> Any:
+        return self._call("apply_workstation_checkerboard_validation_result")
 
     def apply_measurement_settings(self, settings: dict[str, object]) -> Any:
         """Apply Workstation-owned controls through the existing panel owner."""

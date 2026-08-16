@@ -178,7 +178,10 @@ def gga_from_position(position: Any, *, utc_datetime: datetime | None = None) ->
         longitude,
         altitude,
         utc_datetime=utc_datetime,
-        fix_quality=6 if getattr(position, "fix_type", None) == 6 else 1,
+        # NMEA GGA fix_quality is a different enum than MAVLink fix_type: 4 is
+        # RTK Fixed there (6 means "Estimated/dead reckoning"), even though
+        # MAVLink's RTK_FIXED happens to be numbered 6.
+        fix_quality=4 if getattr(position, "fix_type", None) == 6 else 1,
         satellites=getattr(position, "satellites_used", None) or 12,
         hdop=getattr(position, "eph_m", None) or 1.0,
     )
@@ -210,7 +213,8 @@ def gga_from_coordinate_sample(sample: Any, *, utc_datetime: datetime | None = N
         longitude,
         altitude,
         utc_datetime=utc_datetime,
-        fix_quality=6 if bool(getattr(sample, "fixed", False)) else 1,
+        # See gga_from_position: GGA fix_quality 4 (not 6) is RTK Fixed.
+        fix_quality=4 if bool(getattr(sample, "fixed", False)) else 1,
         satellites=getattr(sample, "satellites_used", None) or 12,
         hdop=1.0,
     )

@@ -117,8 +117,11 @@ class AnnotationImageView(QtWidgets.QWidget):
 
     ``load_frozen_native_frame`` copies the input image, so later producer-side
     mutations cannot change the displayed evidence.  Loading a different
-    ``(frame_id, image_sha256)`` clears annotations.  Loading the same identity
-    preserves them, including across arbitrary widget resizes.  The display
+    ``(frame_id, image_sha256)`` clears annotations by default.  The
+    multi-view workflow may pass ``preserve_annotations=True``: old points
+    remain visible, but their exported identity stays pinned to the previous
+    frame until the operator explicitly clears them.  Loading the same identity
+    preserves points, including across arbitrary widget resizes.  The display
     viewport is intentionally 16:9 and uses a center crop (never a horizontal
     letterbox) so a camera reference fills its column.  The source image is
     never cropped in storage: source/widget conversion accounts for the crop
@@ -173,6 +176,10 @@ class AnnotationImageView(QtWidgets.QWidget):
         self._image: QtGui.QImage | None = None
         self._frame_id: str | None = None
         self._image_sha256: str | None = None
+        self._annotation_frame_id: str | None = None
+        self._annotation_image_sha256: str | None = None
+        self._annotation_source_width_px: int | None = None
+        self._annotation_source_height_px: int | None = None
         self._mode = AnnotationMode.HORIZON
         self._points: dict[AnnotationMode, list[SourcePixel]] = {
             mode: [] for mode in AnnotationMode
@@ -223,6 +230,18 @@ class AnnotationImageView(QtWidgets.QWidget):
         return self._image_sha256
 
     @property
+    def annotations_stale(self) -> bool:
+        """Whether visible points remain bound to a previous frozen frame."""
+
+        return bool(
+            self._annotation_frame_id
+            and self._annotation_image_sha256
+            and (self._annotation_frame_id, self._annotation_image_sha256)
+            != (self._frame_id, self._image_sha256)
+            and any(self._points.values())
+        )
+
+    @property
     def annotation_mode(self) -> AnnotationMode:
         return self._mode
 
@@ -257,8 +276,14 @@ class AnnotationImageView(QtWidgets.QWidget):
         frame_id: str,
         image_sha256: str | None = None,
         metadata: dict[str, object] | None = None,
+        preserve_annotations: bool = False,
     ) -> None:
-        """Load a copied, unannotated native image and bind annotations to it."""
+        """Load a copied native image, optionally retaining old visible points.
+
+        Retained points remain bound to their original frame identity. They are
+        display-only until ``clear_annotations`` is called, so a new frame
+        cannot silently reinterpret old pixel coordinates.
+        """
 
         if not isinstance(image, QtGui.QImage) or image.isNull():
             raise ValueError("frozen native frame must be a non-null QImage")
@@ -279,8 +304,16 @@ class AnnotationImageView(QtWidgets.QWidget):
         identity_changed = (identifier, digest) != (self._frame_id, self._image_sha256)
         if not identity_changed and self._image is not None and image.size() != self._image.size():
             raise ValueError("one frozen frame identity cannot have two native dimensions")
-        if identity_changed:
+        retain_points = bool(
+            preserve_annotations and identity_changed and any(self._points.values())
+        )
+        if identity_changed and not retain_points:
             self._clear_points(emit=False)
+            self._clear_suggestions()
+            self._set_hover_source_pixel(None)
+            self._reset_view(emit=False)
+        elif identity_changed:
+            # Automatic suggestions are also frame-pinned and never carry over.
             self._clear_suggestions()
             self._set_hover_source_pixel(None)
             self._reset_view(emit=False)
@@ -291,6 +324,13 @@ class AnnotationImageView(QtWidgets.QWidget):
         self._image.setDevicePixelRatio(1.0)
         self._frame_id = identifier
         self._image_sha256 = digest
+        if not retain_points:
+            self._bind_annotations_to_current_frame(
+                identifier,
+                digest,
+                self._image.width(),
+                self._image.height(),
+            )
         self.update()
         self.frame_changed.emit(
             {
@@ -310,6 +350,10 @@ class AnnotationImageView(QtWidgets.QWidget):
         self._image = None
         self._frame_id = None
         self._image_sha256 = None
+        self._annotation_frame_id = None
+        self._annotation_image_sha256 = None
+        self._annotation_source_width_px = None
+        self._annotation_source_height_px = None
         self._clear_points(emit=False)
         self._clear_suggestions()
         self._set_hover_source_pixel(None)
@@ -393,6 +437,10 @@ class AnnotationImageView(QtWidgets.QWidget):
         converted = [_coerce_point(point) for point in points]
         if self._image is None:
             raise RuntimeError("load a frozen native frame before annotating")
+        if self.annotations_stale:
+            raise RuntimeError(
+                "clear the previous annotation before replacing points on a new frozen frame"
+            )
         if any(not self._source_contains(point) for point in converted):
             raise ValueError("annotation is outside the native source image")
         self._points[parsed_mode] = converted
@@ -408,6 +456,10 @@ class AnnotationImageView(QtWidgets.QWidget):
     ) -> None:
         if self._image is None:
             raise RuntimeError("load a frozen native frame before annotating")
+        if self.annotations_stale:
+            raise RuntimeError(
+                "clear the previous annotation before adding points to a new frozen frame"
+            )
         parsed_mode = self._mode if mode is None else _parse_mode(mode)
         source = _coerce_point(point)
         if not self._source_contains(source):
@@ -443,18 +495,35 @@ class AnnotationImageView(QtWidgets.QWidget):
             parsed_mode = _parse_mode(mode)
             changed = bool(self._points[parsed_mode])
             self._points[parsed_mode].clear()
+        if not any(self._points.values()) and self._image is not None:
+            # Rebind before emitting the cleared payload so the owner records
+            # that the current frame is now ready for fresh points.
+            self._bind_annotations_to_current_frame(
+                self._frame_id,
+                self._image_sha256,
+                self._image.width(),
+                self._image.height(),
+            )
         if changed:
             self.update()
             self.annotation_changed.emit(self.export_annotations())
+        if not any(self._points.values()) and self._image is not None:
+            self.update()
 
     def export_annotations(self) -> FrozenAnnotationPayload | None:
-        if self._image is None or self._frame_id is None or self._image_sha256 is None:
+        if (
+            self._image is None
+            or self._annotation_frame_id is None
+            or self._annotation_image_sha256 is None
+            or self._annotation_source_width_px is None
+            or self._annotation_source_height_px is None
+        ):
             return None
         return FrozenAnnotationPayload(
-            frame_id=self._frame_id,
-            image_sha256=self._image_sha256,
-            source_width_px=self._image.width(),
-            source_height_px=self._image.height(),
+            frame_id=self._annotation_frame_id,
+            image_sha256=self._annotation_image_sha256,
+            source_width_px=self._annotation_source_width_px,
+            source_height_px=self._annotation_source_height_px,
             horizon_line=tuple(self._points[AnnotationMode.HORIZON]),
             ridge_polyline=tuple(self._points[AnnotationMode.RIDGE]),
             target_point=tuple(self._points[AnnotationMode.TARGET]),
@@ -597,15 +666,25 @@ class AnnotationImageView(QtWidgets.QWidget):
             float(self.height()) / self._image.height(),
         )
         next_scale = base_scale * next_zoom
-        viewport_center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
-        next_center = SourcePixel(
-            source_before.u - (cursor.x() - viewport_center.x()) / next_scale,
-            source_before.v - (cursor.y() - viewport_center.y()) / next_scale,
-        )
-        self._view_center_source = SourcePixel(
-            min(max(next_center.u, 0.0), float(self._image.width() - 1)),
-            min(max(next_center.v, 0.0), float(self._image.height() - 1)),
-        )
+        if next_zoom <= self.MIN_ZOOM_FACTOR:
+            # At the fully-zoomed-out level the display rect exactly fills
+            # the viewport, so it must be centered on the true image center
+            # or one edge overhangs while the other falls short, leaving an
+            # empty gap. Snap back to that centered state here -- the same
+            # one reset_zoom() sets -- instead of keeping whatever off-center
+            # point the cursor last anchored, which is what let repeated
+            # wheel zoom in/out drift the image to one side.
+            self._view_center_source = None
+        else:
+            viewport_center = QtCore.QPointF(self.width() / 2.0, self.height() / 2.0)
+            next_center = SourcePixel(
+                source_before.u - (cursor.x() - viewport_center.x()) / next_scale,
+                source_before.v - (cursor.y() - viewport_center.y()) / next_scale,
+            )
+            self._view_center_source = SourcePixel(
+                min(max(next_center.u, 0.0), float(self._image.width() - 1)),
+                min(max(next_center.v, 0.0), float(self._image.height() - 1)),
+            )
         self._zoom_factor = next_zoom
         self.update()
         self.zoom_changed.emit(self._zoom_factor)
@@ -615,7 +694,15 @@ class AnnotationImageView(QtWidgets.QWidget):
         if event.button() == QtCore.Qt.LeftButton:
             source = self.widget_to_source_pixel(event.localPos())
             if source is not None:
-                self.add_source_point(source)
+                try:
+                    self.add_source_point(source)
+                except RuntimeError:
+                    # A retained multi-view mark is still pinned to the
+                    # previous frame. Keep it visible and require the explicit
+                    # Clear current annotation action before accepting new
+                    # points on this frame.
+                    event.accept()
+                    return
                 event.accept()
                 return
         elif event.button() == QtCore.Qt.RightButton and self.undo_last_point():
@@ -674,7 +761,11 @@ class AnnotationImageView(QtWidgets.QWidget):
     ) -> None:
         """Draw automatic points as dashed overlays, never as saved points."""
 
-        widget_points = [self.source_pixel_to_widget(point) for point in points]
+        widget_points = [
+            self.source_pixel_to_widget(point)
+            for point in points
+            if self._source_contains(point)
+        ]
         if not widget_points:
             return
         color = self._SUGGESTION_COLORS[mode]
@@ -711,7 +802,11 @@ class AnnotationImageView(QtWidgets.QWidget):
         mode: AnnotationMode,
         points: Iterable[SourcePixel],
     ) -> None:
-        widget_points = [self.source_pixel_to_widget(point) for point in points]
+        widget_points = [
+            self.source_pixel_to_widget(point)
+            for point in points
+            if self._source_contains(point)
+        ]
         if not widget_points:
             return
         color = self._COLORS[mode]
@@ -747,6 +842,20 @@ class AnnotationImageView(QtWidgets.QWidget):
             points.clear()
         if emit:
             self.annotation_changed.emit(self.export_annotations())
+
+    def _bind_annotations_to_current_frame(
+        self,
+        frame_id: str | None,
+        image_sha256: str | None,
+        width_px: int,
+        height_px: int,
+    ) -> None:
+        self._annotation_frame_id = None if frame_id is None else str(frame_id)
+        self._annotation_image_sha256 = (
+            None if image_sha256 is None else str(image_sha256)
+        )
+        self._annotation_source_width_px = int(width_px) if frame_id is not None else None
+        self._annotation_source_height_px = int(height_px) if frame_id is not None else None
 
     def _clear_suggestions(self) -> None:
         for points in self._suggestion_points.values():

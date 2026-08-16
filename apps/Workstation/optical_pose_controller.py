@@ -18,7 +18,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
-from PyQt5 import QtGui
+from PyQt5 import QtCore, QtGui
 
 from Workstation.workstation_core.calibration import (
     StereoExtrinsics,
@@ -52,10 +52,13 @@ from Workstation.workstation_core.optical_pose import (
     pose_parameters_from_camera_pose,
     stereo_pose_from_absolute,
 )
+from Workstation.workstation_core.baseline_alignment import baseline_from_gps
+from Workstation.workstation_core.ideal_disparity import target_distance_from_gps
 from Workstation.workstation_core.pose_solvers import (
     PnpCorrespondences,
     fit_normalized_horizon_line,
     fixed_center_orientation_ray_residuals,
+    pose_target_ray_residuals,
     pose_reprojection_residuals,
     solve_known_baseline_rotation,
     solve_constrained_pose_least_squares,
@@ -63,8 +66,13 @@ from Workstation.workstation_core.pose_solvers import (
 )
 from Workstation.workstation_core.recording_session import session_id_now
 from Workstation.workstation_core.run_evidence import canonical_json_bytes
-from Workstation.workstation_core.rtk_geometry import estimate_rtk_baseline
+from Workstation.workstation_core.rtk_geometry import (
+    GpsPositionState,
+    estimate_rtk_baseline,
+    ned_delta_m,
+)
 from Workstation.workstation_core.terrain import TerrainMetadata, inspect_geotiff
+from Workstation.wiris_runtime_workers import WirisPnPPhotoCaptureWorker
 
 
 OPTICAL_POSE_CONTROLLER_METHODS = (
@@ -79,6 +87,8 @@ OPTICAL_POSE_CONTROLLER_METHODS = (
     "solve_workstation_optical_pose_terrain",
     "solve_workstation_optical_pose_gnss_mountain",
     "solve_workstation_optical_pose_drone_yaw",
+    "initialize_workstation_optical_pose_telemetry",
+    "solve_workstation_optical_pose_drone_rtk_multiview",
     "solve_workstation_optical_pose_combined",
     "auto_select_workstation_optical_pose_horizon",
     "auto_select_workstation_optical_pose_mountain",
@@ -86,6 +96,17 @@ OPTICAL_POSE_CONTROLLER_METHODS = (
     "record_workstation_optical_pose_annotation",
     "workstation_optical_pose_candidate_poses",
     "register_workstation_optical_pose_reference_candidate",
+    "set_workstation_optical_pose_mountain_ridge_margin",
+    "set_workstation_optical_pose_mountain_max_points",
+    "clear_workstation_optical_pose_auto_suggestions",
+    "capture_workstation_optical_pose_burst_wiris_ftp",
+    "_handle_optical_pose_wiris_ftp_capture_completed",
+    "_handle_optical_pose_wiris_ftp_capture_failed",
+    "_clear_optical_pose_wiris_ftp_capture_worker",
+    "capture_workstation_optical_pose_burst_wiris_ftp_oz",
+    "_handle_optical_pose_wiris_ftp_oz_capture_completed",
+    "_handle_optical_pose_wiris_ftp_oz_capture_failed",
+    "_clear_optical_pose_wiris_ftp_oz_capture_worker",
 )
 
 
@@ -136,6 +157,15 @@ def _finite_vector(values: Iterable[Any], *, length: int, name: str) -> tuple[fl
     if len(parsed) != length or not all(math.isfinite(value) for value in parsed):
         raise ValueError(f"{name} must contain {length} finite values")
     return parsed
+
+
+def _vector_value(value: Any, *, name: str) -> tuple[float, float, float]:
+    if isinstance(value, Mapping):
+        value = value.get("ned_m", value.get("vector_m", value))
+        if isinstance(value, Mapping):
+            value = (value.get("north_m"), value.get("east_m"), value.get("down_m"))
+    parsed = _finite_vector(value or (), length=3, name=name)
+    return parsed  # type: ignore[return-value]
 
 
 def _mask_observability(mask: PoseDofMask) -> tuple[tuple[str, bool], ...]:
@@ -199,6 +229,13 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
 class OpticalPoseController:
     """Keep native observations, priors, candidates, and selections auditable."""
 
+    _MOUNTAIN_RIDGE_MARGIN_DEFAULT = 0.06
+    _MOUNTAIN_RIDGE_MARGIN_MIN = 0.02
+    _MOUNTAIN_RIDGE_MARGIN_MAX = 0.15
+    _MOUNTAIN_MAX_POINTS_DEFAULT = 12
+    _MOUNTAIN_MAX_POINTS_MIN = 4
+    _MOUNTAIN_MAX_POINTS_MAX = 40
+
     def __init__(self, panel: object) -> None:
         self.panel = panel
         self._candidates: dict[str, OpticalPoseCandidate] = {}
@@ -222,6 +259,21 @@ class OpticalPoseController:
         self._auto_suggestions: dict[str, dict[str, Any]] = {}
         self._last_accepted_auto_suggestion: dict[str, Any] | None = None
         self._annotation_review: dict[str, Any] | None = None
+        # Operator-tunable Mountain ridge-boundary match margin (fraction of
+        # image height); see optical_pose_auto_select.detect_mountain. An
+        # in-session control, not a persisted AppSettings field -- it is
+        # meant to be observed and adjusted alongside the frozen photo, not
+        # configured ahead of time.
+        self._mountain_ridge_margin_fraction = self._MOUNTAIN_RIDGE_MARGIN_DEFAULT
+        # Operator-tunable cap on how many spread correspondences Mountain
+        # keeps for the final suggestion; same in-session, non-persisted
+        # nature as the ridge margin above.
+        self._mountain_max_points = self._MOUNTAIN_MAX_POINTS_DEFAULT
+        # Carries the caller's dof/annotation-mode/etc. payload from
+        # capture_workstation_optical_pose_burst_wiris_ftp across the
+        # background capture, so the completion handler can forward it into
+        # import_workstation_optical_pose_burst.
+        self._pending_wiris_ftp_payload: dict[str, Any] = {}
 
     def register_workstation_optical_pose_candidate(
         self,
@@ -530,6 +582,187 @@ class OpticalPoseController:
         self._append_event("optical_pose_burst_captured", event_payload)
         return self.workstation_optical_pose_snapshot()
 
+    def capture_workstation_optical_pose_burst_wiris_ftp(
+        self,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Trigger a WIRIS HR still + FTP download, then freeze it as a burst.
+
+        A second source alongside ``capture_workstation_optical_pose_burst``,
+        not a replacement: once both stills are downloaded, they are handed to
+        ``import_workstation_optical_pose_burst`` (``sources.left/right.path``),
+        so every downstream solve is unaffected by which source produced the
+        frozen burst. Capture and download happen on a background thread, so
+        this call only starts the sequence -- the frozen-burst preview updates
+        once ``_handle_optical_pose_wiris_ftp_capture_completed`` runs.
+        """
+
+        if self.panel.optical_pose_wiris_ftp_thread is not None:
+            raise RuntimeError("a WIRIS FTP alignment capture is already in progress")
+        if self.panel.optical_pose_wiris_ftp_oz_thread is not None:
+            raise RuntimeError("a WIRIS FTP (OZ) alignment capture is already in progress")
+        settings = getattr(self.panel, "settings", None)
+        if not bool(getattr(settings, "wiris_ftp_enabled", False)):
+            raise RuntimeError('WIRIS FTP capture requires "Enable FTP download" in Settings')
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            raise RuntimeError("WIRIS FTP capture failed: both WIRIS control hosts are required")
+        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
+        if not session_id:
+            session_id = session_id_now()
+            setattr(self.panel, "recording_session_id", session_id)
+        resolver = getattr(self.panel, "_recording_session_dir", None)
+        if not callable(resolver):
+            raise RuntimeError("recording session directory owner is unavailable")
+        root = Path(resolver(session_id)) / "frames"
+        capture_id = f"align-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=root)
+        thread = QtCore.QThread(self.panel)
+        worker = WirisPnPPhotoCaptureWorker(
+            target_infos,
+            capture_id=capture_id,
+            capture_channel="align",
+            completion_timeout_s=10.0,
+            **kwargs,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_optical_pose_wiris_ftp_capture_completed)
+        worker.failed.connect(self.panel._handle_optical_pose_wiris_ftp_capture_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_optical_pose_wiris_ftp_capture_worker)
+        self.panel.optical_pose_wiris_ftp_thread = thread
+        self.panel.optical_pose_wiris_ftp_worker = worker
+        self._pending_wiris_ftp_payload = dict(payload or {})
+        self.panel._log(f"[정렬] WIRIS FTP Capture {capture_id}: 좌/우 카메라 내부 저장 중")
+        thread.start()
+        return self.workstation_optical_pose_snapshot()
+
+    def _handle_optical_pose_wiris_ftp_capture_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        cameras = record.get("cameras")
+        cameras = cameras if isinstance(cameras, dict) else {}
+        capture_id = str(record.get("capture_id") or "")
+        failures = [
+            f"{side}: {item.get('error') or item.get('state', 'failed')}"
+            for side, item in cameras.items()
+            if item.get("state") != "completed" or not item.get("ftp_downloaded")
+        ]
+        if set(cameras) != {"left", "right"} or failures:
+            self._handle_optical_pose_wiris_ftp_capture_failed(
+                "; ".join(failures) or "camera result is missing left/right entries"
+            )
+            return
+        payload = dict(getattr(self, "_pending_wiris_ftp_payload", None) or {})
+        payload.pop("sources", None)
+        payload["sources"] = {
+            side: {"path": str(item.get("ftp_local_path") or "")} for side, item in cameras.items()
+        }
+        self.panel._log(f"[정렬] WIRIS FTP Capture {capture_id}: 다운로드 완료, 프리즈 프레임 저장 중")
+        try:
+            self.import_workstation_optical_pose_burst(payload)
+        except Exception as exc:
+            self.panel._log(f"[정렬] WIRIS FTP Capture {capture_id}: 프리즈 프레임 저장 실패 - {exc}")
+
+    def _handle_optical_pose_wiris_ftp_capture_failed(self, error: str) -> None:
+        self.panel._log(f"[정렬] WIRIS FTP Capture 실패: {error}")
+
+    def _clear_optical_pose_wiris_ftp_capture_worker(self) -> None:
+        self.panel.optical_pose_wiris_ftp_thread = None
+        self.panel.optical_pose_wiris_ftp_worker = None
+
+    def capture_workstation_optical_pose_burst_wiris_ftp_oz(
+        self,
+        payload: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Same as ``capture_workstation_optical_pose_burst_wiris_ftp``, on OZ.
+
+        The WIRIS normal visible operating-zoom still (``SIVI TRUE``) instead
+        of the HR still -- lower resolution, faster, no camera reboot risk.
+        Downloads land in a separate ``align_oz_capture`` subfolder so they
+        never mix with HR downloads, and feed the same
+        ``import_workstation_optical_pose_burst`` freeze path.
+        """
+
+        if self.panel.optical_pose_wiris_ftp_oz_thread is not None:
+            raise RuntimeError("a WIRIS FTP (OZ) alignment capture is already in progress")
+        if self.panel.optical_pose_wiris_ftp_thread is not None:
+            raise RuntimeError("a WIRIS FTP alignment capture is already in progress")
+        settings = getattr(self.panel, "settings", None)
+        if not bool(getattr(settings, "wiris_ftp_enabled", False)):
+            raise RuntimeError('WIRIS FTP capture requires "Enable FTP download" in Settings')
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            raise RuntimeError("WIRIS FTP capture failed: both WIRIS control hosts are required")
+        session_id = str(getattr(self.panel, "recording_session_id", "") or "")
+        if not session_id:
+            session_id = session_id_now()
+            setattr(self.panel, "recording_session_id", session_id)
+        resolver = getattr(self.panel, "_recording_session_dir", None)
+        if not callable(resolver):
+            raise RuntimeError("recording session directory owner is unavailable")
+        root = Path(resolver(session_id)) / "frames"
+        capture_id = f"align-oz-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=root)
+        thread = QtCore.QThread(self.panel)
+        worker = WirisPnPPhotoCaptureWorker(
+            target_infos,
+            capture_id=capture_id,
+            image_enable_command="SIVI TRUE",
+            capture_channel="align_oz",
+            completion_timeout_s=10.0,
+            **kwargs,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_optical_pose_wiris_ftp_oz_capture_completed)
+        worker.failed.connect(self.panel._handle_optical_pose_wiris_ftp_oz_capture_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_optical_pose_wiris_ftp_oz_capture_worker)
+        self.panel.optical_pose_wiris_ftp_oz_thread = thread
+        self.panel.optical_pose_wiris_ftp_oz_worker = worker
+        self._pending_wiris_ftp_payload = dict(payload or {})
+        self.panel._log(f"[정렬] WIRIS FTP (OZ) Capture {capture_id}: 좌/우 카메라 내부 저장 중")
+        thread.start()
+        return self.workstation_optical_pose_snapshot()
+
+    def _handle_optical_pose_wiris_ftp_oz_capture_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        cameras = record.get("cameras")
+        cameras = cameras if isinstance(cameras, dict) else {}
+        capture_id = str(record.get("capture_id") or "")
+        failures = [
+            f"{side}: {item.get('error') or item.get('state', 'failed')}"
+            for side, item in cameras.items()
+            if item.get("state") != "completed" or not item.get("ftp_downloaded")
+        ]
+        if set(cameras) != {"left", "right"} or failures:
+            self._handle_optical_pose_wiris_ftp_oz_capture_failed(
+                "; ".join(failures) or "camera result is missing left/right entries"
+            )
+            return
+        payload = dict(getattr(self, "_pending_wiris_ftp_payload", None) or {})
+        payload.pop("sources", None)
+        payload["sources"] = {
+            side: {"path": str(item.get("ftp_local_path") or "")} for side, item in cameras.items()
+        }
+        self.panel._log(f"[정렬] WIRIS FTP (OZ) Capture {capture_id}: 다운로드 완료, 프리즈 프레임 저장 중")
+        try:
+            self.import_workstation_optical_pose_burst(payload)
+        except Exception as exc:
+            self.panel._log(f"[정렬] WIRIS FTP (OZ) Capture {capture_id}: 프리즈 프레임 저장 실패 - {exc}")
+
+    def _handle_optical_pose_wiris_ftp_oz_capture_failed(self, error: str) -> None:
+        self.panel._log(f"[정렬] WIRIS FTP (OZ) Capture 실패: {error}")
+
+    def _clear_optical_pose_wiris_ftp_oz_capture_worker(self) -> None:
+        self.panel.optical_pose_wiris_ftp_oz_thread = None
+        self.panel.optical_pose_wiris_ftp_oz_worker = None
+
     def import_workstation_optical_pose_burst(
         self,
         payload: Mapping[str, Any] | None = None,
@@ -791,6 +1024,81 @@ class OpticalPoseController:
             return None
         return camera
 
+    def set_workstation_optical_pose_mountain_ridge_margin(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Set the Mountain ridge-boundary match margin for later Auto-select runs.
+
+        A fraction of image height (see ``detect_mountain``'s
+        ``ridge_margin_fraction``); does not itself re-run detection.
+        """
+
+        raw = payload.get("ridge_margin_fraction")
+        try:
+            fraction = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("ridge_margin_fraction must be a finite number") from exc
+        if not math.isfinite(fraction):
+            raise ValueError("ridge_margin_fraction must be a finite number")
+        clamped = min(
+            self._MOUNTAIN_RIDGE_MARGIN_MAX,
+            max(self._MOUNTAIN_RIDGE_MARGIN_MIN, fraction),
+        )
+        self._mountain_ridge_margin_fraction = clamped
+        return self.workstation_optical_pose_snapshot()
+
+    def set_workstation_optical_pose_mountain_max_points(
+        self, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Set how many spread correspondences Mountain keeps for later Auto-select runs.
+
+        See ``detect_mountain``'s ``max_points``; does not itself re-run detection.
+        """
+
+        raw = payload.get("max_points")
+        try:
+            count = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("max_points must be an integer") from exc
+        clamped = min(
+            self._MOUNTAIN_MAX_POINTS_MAX,
+            max(self._MOUNTAIN_MAX_POINTS_MIN, count),
+        )
+        self._mountain_max_points = clamped
+        return self.workstation_optical_pose_snapshot()
+
+    def clear_workstation_optical_pose_auto_suggestions(
+        self, payload: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Discard automatic Horizon/Mountain suggestions.
+
+        Mirrors the UI's "Clear" action: an operator clearing the points
+        they are looking at should also discard whatever automatic
+        suggestion produced them, not just the manual overlay copy, or a
+        stale suggestion keeps reappearing in the snapshot after the manual
+        points are gone. With no ``mode`` (or an empty one) every suggestion
+        is discarded; with a ``mode`` ("horizon" or "mountain") only that
+        mode's suggestions are.
+        """
+
+        values = dict(payload or {})
+        mode = str(values.get("mode") or "").strip().lower()
+        if mode:
+            self._auto_suggestions = {
+                suggestion_id: value
+                for suggestion_id, value in self._auto_suggestions.items()
+                if str(value.get("mode") or "") != mode
+            }
+            if (
+                self._last_accepted_auto_suggestion is not None
+                and str(self._last_accepted_auto_suggestion.get("mode") or "") == mode
+            ):
+                self._last_accepted_auto_suggestion = None
+        else:
+            self._auto_suggestions.clear()
+            self._last_accepted_auto_suggestion = None
+        return self.workstation_optical_pose_snapshot()
+
     def auto_select_workstation_optical_pose_horizon(
         self,
         payload: Mapping[str, Any] | None = None,
@@ -913,6 +1221,8 @@ class OpticalPoseController:
             right_distortion_coefficients=None if right_camera is None else right_camera.distortion_coefficients,
             baseline_ned_m=baseline_ned,
             prior_rotation_right_from_left_rdf=prior_rotation,
+            ridge_margin_fraction=self._mountain_ridge_margin_fraction,
+            max_points=self._mountain_max_points,
         )
         sides = {
             "left": self._auto_suggestion_side_mapping(
@@ -1594,6 +1904,489 @@ class OpticalPoseController:
         self.register_workstation_optical_pose_candidate(candidate, prior_poses=priors)
         return self.workstation_optical_pose_snapshot()
 
+    @staticmethod
+    def _coerce_gps_state(value: Any, *, side: str, now_s: float) -> GpsPositionState | None:
+        """Accept live ``GpsPositionState`` or a serialized telemetry row."""
+
+        if isinstance(value, GpsPositionState):
+            return value
+        if not isinstance(value, Mapping):
+            return None
+        latitude = value.get("latitude_deg", value.get("lat"))
+        longitude = value.get("longitude_deg", value.get("lon"))
+        altitude = value.get("altitude_m", value.get("alt"))
+        if latitude is None or longitude is None or altitude is None:
+            return None
+        timestamp = value.get("timestamp_s")
+        if timestamp is None:
+            age = value.get("age_s")
+            timestamp = float(now_s) - max(0.0, float(age or 0.0))
+        try:
+            fix_value = value.get("fix_type")
+            fix_type = None if fix_value in (None, "") else int(fix_value)
+            return GpsPositionState(
+                camera=side,
+                namespace=str(value.get("namespace") or "telemetry"),
+                timestamp_s=float(timestamp),
+                topic=str(value.get("topic") or "telemetry/gps"),
+                latitude_deg=float(latitude),
+                longitude_deg=float(longitude),
+                altitude_m=float(altitude),
+                fix_type=fix_type,
+                satellites_used=(
+                    None
+                    if value.get("satellites_used", value.get("satellites")) in (None, "")
+                    else int(value.get("satellites_used", value.get("satellites")))
+                ),
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def _resolve_telemetry_geometry(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve fresh P1/P2/Drone GNSS into one local world-NED frame."""
+
+        now_s = float(payload.get("now_s", time.monotonic()))
+        raw_states = payload.get("telemetry_gps")
+        if not isinstance(raw_states, Mapping):
+            snapshot = payload.get("telemetry")
+            if isinstance(snapshot, Mapping):
+                raw_states = {
+                    "left": snapshot.get("left_position"),
+                    "right": snapshot.get("right_position"),
+                    "drone": snapshot.get("position"),
+                }
+        if not isinstance(raw_states, Mapping):
+            raw_states = getattr(self.panel, "latest_gps", {}) or {}
+        if not isinstance(raw_states, Mapping):
+            raw_states = {}
+
+        states = {
+            side: self._coerce_gps_state(raw_states.get(side), side=side, now_s=now_s)
+            for side in ("left", "right", "drone")
+        }
+        missing = [side for side, state in states.items() if state is None or not state.has_position]
+        if missing:
+            raise RuntimeError(
+                "Telemetry initialization requires valid left/right/Drone GNSS positions; "
+                "missing " + ", ".join(missing)
+            )
+        age_limit = max(0.0, float(payload.get("maximum_gps_age_s", 2.0)))
+        ages = {
+            side: max(0.0, now_s - float(states[side].timestamp_s))  # type: ignore[union-attr]
+            for side in states
+        }
+        stale = [side for side, age in ages.items() if age > age_limit]
+        if stale:
+            detail = ", ".join(f"{side}={ages[side]:.2f}s" for side in stale)
+            raise RuntimeError(
+                f"Telemetry initialization requires GNSS newer than {age_limit:.2f}s; stale {detail}"
+            )
+
+        left = states["left"]
+        right = states["right"]
+        drone = states["drone"]
+        baseline = baseline_from_gps(left, right)  # type: ignore[arg-type]
+        baseline_ned = ned_delta_m(left, right)  # type: ignore[arg-type]
+        target_distance = target_distance_from_gps(left, right, drone)  # type: ignore[arg-type]
+        if baseline is None or baseline_ned is None or target_distance is None:
+            raise RuntimeError("Telemetry initialization could not derive a non-zero GNSS geometry")
+        if baseline.length_m <= 1.0e-9:
+            raise RuntimeError("Telemetry initialization requires a non-zero P1/P2 baseline")
+
+        return {
+            "now_s": now_s,
+            "states": states,
+            "ages": ages,
+            "baseline": baseline,
+            "baseline_ned": tuple(float(value) for value in baseline_ned),
+            "target_distance_m": float(target_distance),
+            "coordinate_contract": "origin=left GNSS; world NED metres; right=right-left",
+        }
+
+    def _telemetry_pose_for_side(
+        self,
+        side: str,
+        *,
+        center_ned_m: Sequence[float],
+        prior: CameraPoseNed,
+        payload: Mapping[str, Any],
+        now_s: float,
+        maximum_age_s: float,
+    ) -> tuple[CameraPoseNed, bool, float | None]:
+        """Use a fresh PX4 R/P/Y sample when available, otherwise keep prior R."""
+
+        attitude_root = payload.get("telemetry_attitude")
+        if not isinstance(attitude_root, Mapping):
+            attitude_root = payload.get("attitude_rpy_deg")
+        raw = attitude_root.get(side) if isinstance(attitude_root, Mapping) else None
+        timestamp_s: float | None = None
+        rpy: Any = None
+        if isinstance(raw, Mapping):
+            rpy = raw.get("virtual_frd_rpy_deg", raw.get("rpy_deg"))
+            if rpy is None:
+                rpy = (raw.get("roll_deg"), raw.get("pitch_deg"), raw.get("yaw_deg"))
+            if raw.get("timestamp_s") is not None:
+                timestamp_s = float(raw["timestamp_s"])
+        elif isinstance(raw, (tuple, list)):
+            rpy = raw
+        if rpy is None:
+            extrinsics = getattr(self.panel, "latest_extrinsics", {}) or {}
+            sample = extrinsics.get(side) if isinstance(extrinsics, Mapping) else None
+            if sample is not None:
+                rpy = (
+                    getattr(sample, "roll_deg", None),
+                    getattr(sample, "pitch_deg", None),
+                    getattr(sample, "yaw_deg", None),
+                )
+                timestamp_value = getattr(sample, "timestamp_s", None)
+                timestamp_s = None if timestamp_value is None else float(timestamp_value)
+        try:
+            parsed_rpy = _finite_vector(rpy or (), length=3, name=f"{side}.telemetry_attitude_rpy_deg")
+        except (TypeError, ValueError):
+            parsed_rpy = ()
+        if len(parsed_rpy) != 3:
+            return CameraPoseNed(prior.rotation_ned_from_camera_rdf, tuple(center_ned_m)), False, None
+        age_s = 0.0 if timestamp_s is None else max(0.0, now_s - timestamp_s)
+        if age_s > maximum_age_s:
+            return CameraPoseNed(prior.rotation_ned_from_camera_rdf, tuple(center_ned_m)), False, age_s
+        pose = CameraPoseNed.from_virtual_frd_rpy_deg(
+            center_ned_m=center_ned_m,
+            roll_deg=parsed_rpy[0],
+            pitch_deg=parsed_rpy[1],
+            yaw_deg=parsed_rpy[2],
+        )
+        return pose, True, age_s
+
+    @staticmethod
+    def _gps_state_hash_mapping(state: GpsPositionState) -> dict[str, Any]:
+        return {
+            "camera": state.camera,
+            "timestamp_s": float(state.timestamp_s),
+            "latitude_deg": state.latitude_deg,
+            "longitude_deg": state.longitude_deg,
+            "altitude_m": state.altitude_m,
+            "fix_type": state.fix_type,
+            "topic": state.topic,
+        }
+
+    def initialize_workstation_optical_pose_telemetry(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Create the first candidate from live three-point GNSS + Pixhawk attitude.
+
+        This is deliberately an initialization step.  GNSS supplies the
+        relative camera centers in local NED and fresh Pixhawk R/P/Y supplies
+        the orientation when available.  It does not consume image clicks or
+        silently replace the active profile; the common candidate review/apply
+        path remains the only mutation boundary.
+        """
+
+        profile = self._operating_intrinsics_profile()
+        if profile is None:
+            raise RuntimeError("Telemetry initialization requires an active exact K,D profile")
+        geometry = self._resolve_telemetry_geometry(payload)
+        priors = self._resolve_prior_poses(payload, prefer_frozen=False)
+        max_attitude_age_s = max(0.0, float(payload.get("maximum_attitude_age_s", 2.0)))
+        centers = ((0.0, 0.0, 0.0), geometry["baseline_ned"])
+        poses: list[CameraPoseNed] = []
+        attitude_used: dict[str, bool] = {}
+        attitude_ages: dict[str, float | None] = {}
+        for side, prior, center in zip(("left", "right"), priors, centers):
+            pose, used, age_s = self._telemetry_pose_for_side(
+                side,
+                center_ned_m=center,
+                prior=prior,
+                payload=payload,
+                now_s=geometry["now_s"],
+                maximum_age_s=max_attitude_age_s,
+            )
+            poses.append(pose)
+            attitude_used[side] = used
+            attitude_ages[side] = age_s
+
+        full_attitude = all(attitude_used.values())
+        optimized = _ALL_DOF if full_attitude else _TRANSLATION_DOF
+        warnings = [
+            "Telemetry initialization is a reviewed candidate; it does not overwrite the active pose",
+            "GNSS camera centers use the zero-lever-arm assumption: optical center equals GNSS antenna",
+            "world-NED origin is the left/P1 GNSS position at initialization",
+        ]
+        if not full_attitude:
+            warnings.append(
+                "fresh left/right Pixhawk attitude was not available; rotation remains at the prior pose"
+            )
+        if any(getattr(geometry["states"][side], "fix_type", None) != 6 for side in ("left", "right", "drone")):
+            warnings.append("one or more GNSS samples are not RTK_FIXED; fix quality is retained as evidence")
+        input_hashes = [
+            ("operating_intrinsics_profile_sha256", profile.profile_sha256),
+            (
+                "telemetry_gnss_sha256",
+                _payload_sha256(
+                    {
+                        side: self._gps_state_hash_mapping(geometry["states"][side])
+                        for side in ("left", "right", "drone")
+                    }
+                ),
+            ),
+        ]
+        source_ids = [f"telemetry:gnss:{side}" for side in ("left", "right", "drone")]
+        source_ids.extend(
+            f"telemetry:attitude:{side}"
+            for side in ("left", "right")
+            if attitude_used[side]
+        )
+        quality = [
+            ("gnss_baseline_m", float(geometry["baseline"].length_m)),
+            ("target_distance_m", float(geometry["target_distance_m"])),
+            ("left_gnss_age_s", float(geometry["ages"]["left"])),
+            ("right_gnss_age_s", float(geometry["ages"]["right"])),
+            ("drone_gnss_age_s", float(geometry["ages"]["drone"])),
+        ]
+        for side in ("left", "right"):
+            if attitude_ages[side] is not None:
+                quality.append((f"{side}_attitude_age_s", float(attitude_ages[side])))
+        candidate = OpticalPoseCandidate(
+            candidate_id=f"telemetry-initial-{uuid.uuid4().hex}",
+            method="telemetry-initial-pose",
+            left_pose_ned=poses[0],
+            right_pose_ned=poses[1],
+            optimized_dofs=optimized,
+            observability=_mask_observability(optimized),
+            source_observation_ids=tuple(source_ids),
+            input_hashes=tuple(input_hashes),
+            quality_metrics=tuple(quality),
+            warnings=tuple(warnings),
+            created_utc_ns=time.time_ns(),
+        )
+        self.register_workstation_optical_pose_candidate(candidate, prior_poses=priors)
+        return self.workstation_optical_pose_snapshot()
+
+    def solve_workstation_optical_pose_drone_rtk_multiview(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Solve full per-camera R,t from several Drone RTK target observations.
+
+        The imported set contains paired ``observed_ray_camera_rdf`` (or
+        native ``pixel_uv``) and ``target_point_ned_m`` rows for each side.
+        The target point is the Drone RTK position in the same local-NED frame
+        as the camera prior.  Camera centers and orientation are both solver
+        variables; current GNSS is used only as a better initial center when it
+        is fresh and available.
+        """
+
+        profile, _applicability = self._require_frozen_intrinsics()
+        priors = self._resolve_prior_poses(payload, prefer_frozen=True)
+        root: Mapping[str, Any] | None = None
+        source_file_sha256 = ""
+        raw_root = payload.get("drone_rtk_multiview")
+        if isinstance(raw_root, Mapping):
+            root = raw_root
+        elif isinstance(payload.get("multiview"), Mapping):
+            root = payload.get("multiview")  # type: ignore[assignment]
+        elif payload.get("drone_rtk_multiview_path"):
+            loaded, source_file_sha256 = _load_json_mapping(
+                payload.get("drone_rtk_multiview_path"),
+                label="Drone RTK multi-view observation JSON",
+            )
+            loaded_root = loaded.get("drone_rtk_multiview", loaded)
+            if isinstance(loaded_root, Mapping):
+                root = loaded_root
+        if root is None:
+            raise ValueError(
+                "Drone RTK Multi-view requires an observation JSON or a drone_rtk_multiview payload"
+            )
+        observation_root = root.get("observations", root)
+        if not isinstance(observation_root, Mapping):
+            raise ValueError("Drone RTK multi-view observations must contain left/right arrays")
+
+        live_geometry: dict[str, Any] | None = None
+        try:
+            live_geometry = self._resolve_telemetry_geometry(payload)
+        except (RuntimeError, ValueError):
+            # An offline/imported set may already contain an explicit local-NED
+            # origin and camera centers.  Do not make the live link mandatory.
+            live_geometry = None
+        initial_centers = {
+            "left": tuple(priors[0].center_ned_m),
+            "right": tuple(priors[1].center_ned_m),
+        }
+        if live_geometry is not None:
+            initial_centers = {
+                "left": (0.0, 0.0, 0.0),
+                "right": tuple(live_geometry["baseline_ned"]),
+            }
+        center_root = root.get("camera_centers_ned_m")
+        if isinstance(center_root, Mapping):
+            for side in ("left", "right"):
+                if side in center_root:
+                    initial_centers[side] = _vector_value(
+                        center_root[side],
+                        name=f"camera_centers_ned_m.{side}",
+                    )
+
+        origin_state: GpsPositionState | None = None
+        if live_geometry is not None:
+            origin_state = live_geometry["states"]["left"]
+        elif root.get("origin_gps") is not None:
+            origin_state = self._coerce_gps_state(
+                root.get("origin_gps"),
+                side="origin",
+                now_s=time.monotonic(),
+            )
+
+        solved: dict[str, tuple[CameraPoseNed, Any, tuple[dict[str, Any], ...]]] = {}
+        source_ids: list[str] = []
+        input_hashes: list[tuple[str, str]] = [
+            ("operating_intrinsics_profile_sha256", profile.profile_sha256),
+        ]
+        if source_file_sha256:
+            input_hashes.append(("drone_rtk_multiview_json_sha256", source_file_sha256))
+        warning_set: list[str] = [
+            "Drone RTK target positions and camera rays are solved jointly for full R,t",
+            "camera pose coordinate contract: X_NED = R_NED<-optical_RDF X_RDF + C_NED",
+        ]
+        for side, prior, camera in (
+            ("left", priors[0], profile.left),
+            ("right", priors[1], profile.right),
+        ):
+            raw_rows = observation_root.get(side)
+            if not isinstance(raw_rows, (tuple, list)):
+                raise ValueError(f"Drone RTK multi-view requires a {side} observation array")
+            if len(raw_rows) < 4:
+                raise ValueError(f"{side}: Drone RTK multi-view requires at least four observations")
+            rays: list[tuple[float, float, float]] = []
+            targets: list[tuple[float, float, float]] = []
+            rows_for_hash: list[dict[str, Any]] = []
+            side_source_ids: list[str] = []
+            for index, raw_row in enumerate(raw_rows):
+                if not isinstance(raw_row, Mapping):
+                    raise ValueError(f"{side}[{index}] must be an object")
+                row = dict(raw_row)
+                ray_value = row.get("observed_ray_camera_rdf")
+                if ray_value is None:
+                    pixel = row.get("pixel_uv", row.get("image_point_px", row.get("target_pixel")))
+                    if isinstance(pixel, Mapping):
+                        pixel = (pixel.get("u_px", pixel.get("u")), pixel.get("v_px", pixel.get("v")))
+                    pixel_uv = _finite_vector(pixel or (), length=2, name=f"{side}[{index}].pixel_uv")
+                    normalized = self._undistort_pixels(camera, (tuple(pixel_uv),))[0]
+                    ray_value = (normalized[0], normalized[1], 1.0)
+                ray = _finite_vector(
+                    ray_value,
+                    length=3,
+                    name=f"{side}[{index}].observed_ray_camera_rdf",
+                )
+                target_value = row.get("target_point_ned_m", row.get("drone_position_ned_m"))
+                if target_value is None:
+                    target_gps = row.get("drone_gps", row.get("target_gps"))
+                    if target_gps is None or origin_state is None:
+                        raise ValueError(
+                            f"{side}[{index}] requires target_point_ned_m or Drone RTK GPS plus origin_gps"
+                        )
+                    target_state = self._coerce_gps_state(
+                        target_gps,
+                        side="drone",
+                        now_s=time.monotonic(),
+                    )
+                    target_value = None if target_state is None else ned_delta_m(origin_state, target_state)
+                target = _vector_value(target_value, name=f"{side}[{index}].target_point_ned_m")
+                rays.append(ray)
+                targets.append(target)
+                observation_id = str(row.get("observation_id") or row.get("frame_id") or f"{side}-{index:04d}")
+                side_source_ids.append(f"drone-rtk:{side}:{observation_id}")
+                if row.get("timestamp_alignment_verified") is not True:
+                    warning_set.append(
+                        f"{side}[{index}]: image/Drone RTK timestamp alignment is not verified"
+                    )
+                rows_for_hash.append(row)
+            before_pose = CameraPoseNed(
+                prior.rotation_ned_from_camera_rdf,
+                initial_centers[side],
+            )
+            before = pose_parameters_from_camera_pose(before_pose)
+
+            def _residuals(
+                parameters: PoseParametersNed,
+                *,
+                _rays=tuple(rays),
+                _targets=tuple(targets),
+            ) -> tuple[float, ...]:
+                return pose_target_ray_residuals(
+                    parameters,
+                    observed_rays_camera_rdf=_rays,
+                    target_points_ned_m=_targets,
+                )
+
+            result = solve_constrained_pose_least_squares(
+                before,
+                _ALL_DOF,
+                _residuals,
+                parameter_scales=(1.0, 1.0, 1.0, 1.0, 1.0, 1.0),
+            )
+            if not result.success:
+                raise ValueError(
+                    f"{side}: Drone RTK multi-view R,t solve did not converge ({result.message})"
+                )
+            if not result.jacobian_diagnostics.full_rank:
+                raise ValueError(
+                    f"{side}: Drone RTK multi-view observations are geometrically degenerate; "
+                    "use targets with varied 3-D positions"
+                )
+            solved[side] = (result.parameters.to_camera_pose_ned(), result, tuple(rows_for_hash))
+            source_ids.extend(side_source_ids)
+            input_hashes.append(
+                (f"{side}_drone_rtk_multiview_sha256", _payload_sha256({"observations": rows_for_hash}))
+            )
+
+        left = solved["left"][0]
+        right = solved["right"][0]
+        quality: list[tuple[str, float]] = []
+        uncertainty: list[tuple[str, float]] = []
+        for side, (_pose, result, rows) in solved.items():
+            residuals = tuple(float(value) for value in result.residuals)
+            rms = math.sqrt(sum(value * value for value in residuals) / len(residuals))
+            quality.extend(
+                (
+                    (f"{side}_observation_count", float(len(rows))),
+                    (f"{side}_angular_rms_chord", rms),
+                )
+            )
+            condition = float(result.jacobian_diagnostics.condition_number)
+            if math.isfinite(condition):
+                uncertainty.append((f"{side}_jacobian_condition", condition))
+        input_hashes.append(
+            (
+                "multiview_coordinate_contract_sha256",
+                _payload_sha256(
+                    {
+                        "camera_origin": "local NED origin from imported origin_gps/current left GNSS or prior",
+                        "target": "Drone RTK position in same local NED frame",
+                        "ray": "camera optical RDF",
+                    }
+                ),
+            )
+        )
+        candidate = OpticalPoseCandidate(
+            candidate_id=f"drone-rtk-multiview-{uuid.uuid4().hex}",
+            method="drone-rtk-multiview-r-t",
+            left_pose_ned=left,
+            right_pose_ned=right,
+            optimized_dofs=_ALL_DOF,
+            observability=_mask_observability(_ALL_DOF),
+            source_observation_ids=tuple(source_ids),
+            input_hashes=tuple(input_hashes),
+            quality_metrics=tuple(quality),
+            uncertainty_metrics=tuple(uncertainty),
+            warnings=tuple(dict.fromkeys(warning_set)),
+            created_utc_ns=time.time_ns(),
+        )
+        self.register_workstation_optical_pose_candidate(candidate, prior_poses=priors)
+        return self.workstation_optical_pose_snapshot()
+
     def solve_workstation_optical_pose_drone_yaw(
         self,
         payload: Mapping[str, Any],
@@ -2070,6 +2863,8 @@ class OpticalPoseController:
             "active_selection_id": active_profile_id,
             "active_selected_dof": active_selected_dof,
             "active_candidate": active_candidate,
+            "mountain_ridge_margin_fraction": self._mountain_ridge_margin_fraction,
+            "mountain_max_points": self._mountain_max_points,
             "readiness": {
                 "state": "ACTIVE" if active_profile_id else "CANDIDATE" if self._candidates else "NO DATA",
                 "operating_zoom": f"{self._zoom(actual_zoom, 'left')} / {self._zoom(actual_zoom, 'right')}",

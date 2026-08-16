@@ -134,6 +134,40 @@ class InspectorWidget(QtWidgets.QWidget):
         self.status_section.add_row("Evidence", self.source_value)
         root.addWidget(self.status_section)
 
+        self.mountain_margin_section = PropertySection("Mountain detection")
+        self.mountain_margin_combo = QtWidgets.QComboBox()
+        self.mountain_margin_combo.setObjectName("inspectorMountainRidgeMargin")
+        self.mountain_margin_combo.setEditable(False)
+        for percent in (2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0):
+            label = f"{percent:.0f}%" + ("  (default)" if percent == 6.0 else "")
+            self.mountain_margin_combo.addItem(label, percent / 100.0)
+        self.mountain_margin_combo.setToolTip(
+            "How close a matched point must be to Mountain's estimated ridge/skyline\n"
+            "boundary to be kept, as a fraction of image height. Wider keeps more\n"
+            "matches but risks drifting off the ridge; narrower is stricter but can\n"
+            "drop legitimate points on a jagged silhouette. Takes effect on the next\n"
+            "Auto-select Mountain run, not live."
+        )
+        self.mountain_margin_combo.currentIndexChanged.connect(self._request_mountain_ridge_margin)
+        self.mountain_margin_section.add_row("Ridge margin", self.mountain_margin_combo)
+
+        self.mountain_max_points_combo = QtWidgets.QComboBox()
+        self.mountain_max_points_combo.setObjectName("inspectorMountainMaxPoints")
+        self.mountain_max_points_combo.setEditable(False)
+        for count in (4, 8, 12, 16, 20, 30, 40):
+            label = f"{count}" + ("  (default)" if count == 12 else "")
+            self.mountain_max_points_combo.addItem(label, count)
+        self.mountain_max_points_combo.setToolTip(
+            "How many spatially-spread correspondences Mountain keeps for the\n"
+            "final suggestion, out of however many actually pass matching and\n"
+            "RANSAC. More gives the solver more evidence but crowds the overlay;\n"
+            "fewer keeps the overlay readable. Takes effect on the next\n"
+            "Auto-select Mountain run, not live."
+        )
+        self.mountain_max_points_combo.currentIndexChanged.connect(self._request_mountain_max_points)
+        self.mountain_margin_section.add_row("Max points", self.mountain_max_points_combo)
+        root.addWidget(self.mountain_margin_section)
+
         self.context_section = PropertySection("Context")
         self.context_values: dict[str, EngineeringValue] = {}
         self.context_row_labels: dict[str, QtWidgets.QLabel] = {}
@@ -282,6 +316,7 @@ class InspectorWidget(QtWidgets.QWidget):
         self.open_advanced_button.setVisible(context_id.startswith("diagnostics."))
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
+        self._refresh_mountain_margin_control(context_id)
 
     def inspect_selection(
         self,
@@ -299,6 +334,7 @@ class InspectorWidget(QtWidgets.QWidget):
         self.context_label.setText(_CONTEXT_LABELS.get(context_id, context_id.replace(".", " · ").title()))
         self._refresh_context_details(context_id)
         self._refresh_active_geometry()
+        self._refresh_mountain_margin_control(context_id)
 
     def _read_optical_pose_snapshot(self) -> dict[str, object]:
         readers = (
@@ -541,6 +577,59 @@ class InspectorWidget(QtWidgets.QWidget):
 
     def _request_geometry_bundle(self) -> None:
         self.command_requested.emit("calibration.apply_bundle", {})
+
+    def _request_mountain_ridge_margin(self, _index: int = -1) -> None:
+        fraction = self.mountain_margin_combo.currentData()
+        if not isinstance(fraction, float):
+            return
+        self.command_requested.emit(
+            "alignment.mountain_ridge_margin.set",
+            {"ridge_margin_fraction": fraction},
+        )
+
+    def _request_mountain_max_points(self, _index: int = -1) -> None:
+        count = self.mountain_max_points_combo.currentData()
+        if not isinstance(count, int):
+            return
+        self.command_requested.emit(
+            "alignment.mountain_max_points.set",
+            {"max_points": count},
+        )
+
+    def _refresh_mountain_margin_control(self, context_id: str) -> None:
+        self.mountain_margin_section.setVisible(context_id == "processing.alignment")
+        if not self.mountain_margin_combo.view().isVisible():
+            raw_margin = self._optical_pose_snapshot.get("mountain_ridge_margin_fraction")
+            try:
+                fraction = float(raw_margin)
+            except (TypeError, ValueError):
+                fraction = None
+            if fraction is not None:
+                closest_index = min(
+                    range(self.mountain_margin_combo.count()),
+                    key=lambda index: abs(float(self.mountain_margin_combo.itemData(index)) - fraction),
+                    default=-1,
+                )
+                if closest_index >= 0:
+                    self.mountain_margin_combo.blockSignals(True)
+                    self.mountain_margin_combo.setCurrentIndex(closest_index)
+                    self.mountain_margin_combo.blockSignals(False)
+        if not self.mountain_max_points_combo.view().isVisible():
+            raw_count = self._optical_pose_snapshot.get("mountain_max_points")
+            try:
+                count = int(raw_count)
+            except (TypeError, ValueError):
+                count = None
+            if count is not None:
+                closest_index = min(
+                    range(self.mountain_max_points_combo.count()),
+                    key=lambda index: abs(int(self.mountain_max_points_combo.itemData(index)) - count),
+                    default=-1,
+                )
+                if closest_index >= 0:
+                    self.mountain_max_points_combo.blockSignals(True)
+                    self.mountain_max_points_combo.setCurrentIndex(closest_index)
+                    self.mountain_max_points_combo.blockSignals(False)
 
     def _configure_context_section(self, context_id: str) -> None:
         if self._selection is not None:

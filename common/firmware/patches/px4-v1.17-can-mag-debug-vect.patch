@@ -1,0 +1,98 @@
+diff --git a/src/modules/mavlink/streams/DEBUG_VECT.hpp b/src/modules/mavlink/streams/DEBUG_VECT.hpp
+--- a/src/modules/mavlink/streams/DEBUG_VECT.hpp
++++ b/src/modules/mavlink/streams/DEBUG_VECT.hpp
+@@ -34,7 +34,10 @@
+ #ifndef DEBUG_VECT_HPP
+ #define DEBUG_VECT_HPP
+ 
++#include <cstring>
++#include <uORB/SubscriptionMultiArray.hpp>
+ #include <uORB/topics/debug_vect.h>
++#include <uORB/topics/sensor_mag.h>
+ 
+ class MavlinkStreamDebugVect : public MavlinkStream
+ {
+@@ -49,13 +51,82 @@ public:
+ 	unsigned get_size() override
+ 	{
+-		return _debug_sub.advertised() ? MAVLINK_MSG_ID_DEBUG_VECT_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES : 0;
++		return (_debug_sub.advertised() || sensor_mag_advertised()) ?
++		       MAVLINK_MSG_ID_DEBUG_VECT_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES : 0;
+ 	}
+ 
+ private:
+ 	explicit MavlinkStreamDebugVect(Mavlink *mavlink) : MavlinkStream(mavlink) {}
+ 
++	static constexpr int MAX_SENSOR_COUNT = 4;
++	static constexpr uint32_t RM3100_PRIMARY_ID = 8944899;
++	static constexpr uint32_t RM3100_ALTERNATE_PRIMARY_ID = 8944643;
++	static constexpr uint32_t RM3100_BACKUP_ID = 8944387;
++	static constexpr uint32_t RM3100_ALTERNATE_BACKUP_ID = 8944395;
++
+ 	uORB::Subscription _debug_sub{ORB_ID(debug_vect)};
++	uORB::SubscriptionMultiArray<sensor_mag_s, MAX_SENSOR_COUNT> _sensor_mag_subs{ORB_ID::sensor_mag};
++	sensor_mag_s _sensor_mag[MAX_SENSOR_COUNT] {};
++	bool _sensor_mag_valid[MAX_SENSOR_COUNT] {};
++	int _next_sensor {0};
++
++	bool sensor_mag_advertised() const
++	{
++		for (int i = 0; i < MAX_SENSOR_COUNT; i++) {
++			if (_sensor_mag_subs[i].advertised()) {
++				return true;
++			}
++		}
++
++		return false;
++	}
++
++	static const char *rm3100_name(uint32_t device_id)
++	{
++		switch (device_id) {
++		case RM3100_PRIMARY_ID:
++		case RM3100_ALTERNATE_PRIMARY_ID:
++			return "CAN1_MAG";
++		case RM3100_BACKUP_ID:
++		case RM3100_ALTERNATE_BACKUP_ID:
++			return "CAN2_MAG";
++		default:
++			return nullptr;
++		}
++	}
++
++	bool send_rm3100()
++	{
++		for (int i = 0; i < MAX_SENSOR_COUNT; i++) {
++			_sensor_mag_subs[i].update(&_sensor_mag[i]);
++			_sensor_mag_valid[i] = _sensor_mag_valid[i] || (_sensor_mag[i].device_id != 0);
++		}
++
++		for (int count = 0; count < MAX_SENSOR_COUNT; count++) {
++			const int index = (_next_sensor + count) % MAX_SENSOR_COUNT;
++			const char *name = _sensor_mag_valid[index] ? rm3100_name(_sensor_mag[index].device_id) : nullptr;
++
++			if (name == nullptr) {
++				continue;
++			}
++
++			_next_sensor = (index + 1) % MAX_SENSOR_COUNT;
++			mavlink_debug_vect_t msg{};
++			msg.time_usec = _sensor_mag[index].timestamp;
++			std::strncpy(msg.name, name, sizeof(msg.name) - 1);
++			msg.x = _sensor_mag[index].x;
++			msg.y = _sensor_mag[index].y;
++			msg.z = _sensor_mag[index].z;
++			mavlink_msg_debug_vect_send_struct(_mavlink->get_channel(), &msg);
++			return true;
++		}
++
++		return false;
++	}
+ 
+ 	bool send() override
+ 	{
++		if (send_rm3100()) {
++			return true;
++		}
++
+ 		debug_vect_s debug;

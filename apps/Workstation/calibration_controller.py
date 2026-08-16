@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import time
+import uuid
 from pathlib import Path
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -40,6 +41,7 @@ from Workstation.workstation_core.settings import (
     DEFAULT_INTRINSICS_PATH,
     resolve_settings_path,
 )
+from Workstation.wiris_runtime_workers import WirisPnPPhotoCaptureWorker
 
 CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.100
 CALIBRATION_AUTO_DETECTION_MAX_AGE_S = 2.0
@@ -97,7 +99,21 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_handle_calibration_progress",
     "_handle_intrinsic_calibration_completed",
     "_handle_intrinsic_calibration_failed",
-    "_clear_checkerboard_calibration_worker"
+    "_clear_checkerboard_calibration_worker",
+    "workstation_checkerboard_validation_snapshot",
+    "configure_workstation_checkerboard_validation",
+    "load_workstation_checkerboard_validation_json",
+    "run_workstation_checkerboard_validation",
+    "save_workstation_checkerboard_validation_result",
+    "apply_workstation_checkerboard_validation_result",
+    "capture_calibration_images_wiris_ftp",
+    "_handle_calibration_wiris_ftp_capture_completed",
+    "_handle_calibration_wiris_ftp_capture_failed",
+    "_clear_calibration_wiris_ftp_capture_worker",
+    "capture_calibration_images_wiris_ftp_oz",
+    "_handle_calibration_wiris_ftp_oz_capture_completed",
+    "_handle_calibration_wiris_ftp_oz_capture_failed",
+    "_clear_calibration_wiris_ftp_oz_capture_worker",
 ]
 
 
@@ -838,6 +854,76 @@ class CalibrationWorkflowController:
             "good",
         )
 
+    def workstation_checkerboard_validation_snapshot(self) -> dict:
+        """Read-only projection of the validation workflow's current state.
+
+        The action methods above (``load_checkerboard_validation_json`` etc.)
+        read/write panel widget attributes directly and return ``None``; this
+        gives a payload-in/result-out caller (the navigation UI, not the
+        legacy panel's own hidden widgets) something to read after any
+        action, or to poll while a random-validation run is in flight.
+        """
+
+        panel = self.panel
+        return {
+            "root": panel.checkerboard_validation_root_edit.text(),
+            "mode": str(panel.checkerboard_validation_mode_combo.currentData() or "pixhawk"),
+            "json_path": panel.checkerboard_validation_json_edit.text(),
+            "scan_status": panel.checkerboard_validation_scan_label.text(),
+            "status": panel.checkerboard_validation_status_label.text(),
+            "random_pair_count": panel.checkerboard_validation_random_pair_count_spin.value(),
+            "runs": panel.checkerboard_validation_random_runs_spin.value(),
+            "seed": panel.checkerboard_validation_seed_spin.value(),
+            "running": panel.checkerboard_calibration_thread is not None,
+            "result_available": panel.checkerboard_validation_result is not None,
+            "result_mode": str(getattr(panel, "checkerboard_validation_result_mode", "") or ""),
+            "result_saved": bool(getattr(panel, "checkerboard_validation_result_saved", False)),
+            "summary": dict(getattr(panel, "checkerboard_validation_summary", {}) or {}),
+            "run_results": list(getattr(panel, "checkerboard_validation_run_results", []) or []),
+        }
+
+    def configure_workstation_checkerboard_validation(self, payload: dict) -> dict:
+        """Apply operator-supplied settings, keeping the panel widgets as the
+        single owner of this state (unchanged since before the navigation UI
+        existed) rather than duplicating it. Only the keys present in
+        ``payload`` are touched.
+        """
+
+        panel = self.panel
+        if "root" in payload:
+            panel.checkerboard_validation_root_edit.setText(str(payload["root"]))
+        if "mode" in payload:
+            panel._set_combo_data(panel.checkerboard_validation_mode_combo, str(payload["mode"]))
+        if "json_path" in payload:
+            panel.checkerboard_validation_json_edit.setText(str(payload["json_path"]))
+        if "random_pair_count" in payload:
+            panel.checkerboard_validation_random_pair_count_spin.setValue(int(payload["random_pair_count"]))
+        if "runs" in payload:
+            panel.checkerboard_validation_random_runs_spin.setValue(int(payload["runs"]))
+        if "seed" in payload:
+            panel.checkerboard_validation_seed_spin.setValue(int(payload["seed"]))
+        if "root" in payload or "mode" in payload:
+            panel.scan_checkerboard_validation_files()
+        return self.panel.workstation_checkerboard_validation_snapshot()
+
+    def load_workstation_checkerboard_validation_json(self, payload: dict) -> dict:
+        self.panel.configure_workstation_checkerboard_validation(payload)
+        self.panel.load_checkerboard_validation_json()
+        return self.panel.workstation_checkerboard_validation_snapshot()
+
+    def run_workstation_checkerboard_validation(self, payload: dict) -> dict:
+        self.panel.configure_workstation_checkerboard_validation(payload)
+        self.panel.run_checkerboard_random_validation()
+        return self.panel.workstation_checkerboard_validation_snapshot()
+
+    def save_workstation_checkerboard_validation_result(self) -> dict:
+        self.panel.save_checkerboard_validation_result()
+        return self.panel.workstation_checkerboard_validation_snapshot()
+
+    def apply_workstation_checkerboard_validation_result(self) -> dict:
+        self.panel.apply_checkerboard_validation_result()
+        return self.panel.workstation_checkerboard_validation_snapshot()
+
     def apply_intrinsics_to_distance(self) -> None:
         panel = self.panel
         if panel.last_calibration_result is None:
@@ -1076,6 +1162,211 @@ class CalibrationWorkflowController:
         self.panel.calibration_status_label.setText(f"Capture {stem}: encoding and checkerboard validation running")
         thread.start()
         return True
+
+    def capture_calibration_images_wiris_ftp(self) -> bool:
+        """Capture a left/right pair via a WIRIS HR still + FTP download.
+
+        A second source alongside ``capture_calibration_images``'s live-RTSP
+        path, not a replacement: once the still is downloaded, it is handed
+        to that exact same method (``frames=..., capture_origin="ftp"``), so
+        save/naming/checkerboard-validation logic is entirely unchanged.
+        """
+
+        if self.panel.calibration_wiris_ftp_thread is not None:
+            self.panel.calibration_status_label.setText(
+                "A WIRIS FTP calibration capture is already in progress."
+            )
+            return False
+        if self.panel.calibration_wiris_ftp_oz_thread is not None:
+            self.panel.calibration_status_label.setText(
+                "A WIRIS FTP (OZ) calibration capture is already in progress."
+            )
+            return False
+        if self.panel.checkerboard_calibration_thread is not None:
+            self.panel.calibration_status_label.setText("A calibration operation is already running.")
+            return False
+        settings = getattr(self.panel, "settings", None)
+        if not bool(getattr(settings, "wiris_ftp_enabled", False)):
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP capture requires \"Enable FTP download\" in Settings."
+            )
+            return False
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP capture failed: both WIRIS control hosts are required."
+            )
+            return False
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        capture_id = f"calib-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=root)
+        thread = QtCore.QThread(self.panel)
+        worker = WirisPnPPhotoCaptureWorker(
+            target_infos,
+            capture_id=capture_id,
+            capture_channel="calib",
+            completion_timeout_s=10.0,
+            **kwargs,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_ftp_capture_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_ftp_capture_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_ftp_capture_worker)
+        self.panel.calibration_wiris_ftp_thread = thread
+        self.panel.calibration_wiris_ftp_worker = worker
+        self.panel.capture_calibration_button.setEnabled(False)
+        self.panel.run_calibration_button.setEnabled(False)
+        self.panel.calibration_status_label.setText(
+            f"WIRIS FTP Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+        )
+        thread.start()
+        return True
+
+    def _handle_calibration_wiris_ftp_capture_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        cameras = record.get("cameras")
+        cameras = cameras if isinstance(cameras, dict) else {}
+        capture_id = str(record.get("capture_id") or "")
+        failures = [
+            f"{side}: {item.get('error') or item.get('state', 'failed')}"
+            for side, item in cameras.items()
+            if item.get("state") != "completed" or not item.get("ftp_downloaded")
+        ]
+        if set(cameras) != {"left", "right"} or failures:
+            self._handle_calibration_wiris_ftp_capture_failed(
+                "; ".join(failures) or "camera result is missing left/right entries"
+            )
+            return
+        frames: dict[str, QtGui.QImage | None] = {}
+        for side, item in cameras.items():
+            path = str(item.get("ftp_local_path") or "")
+            image = QtGui.QImage(path) if path else QtGui.QImage()
+            if image.isNull():
+                self._handle_calibration_wiris_ftp_capture_failed(
+                    f"{side}: downloaded file could not be decoded as an image ({path or 'no path'})"
+                )
+                return
+            frames[side] = image
+        self.panel._log(f"[캘리브레이션] WIRIS FTP Capture {capture_id}: 다운로드 완료, 캘리브레이션 저장 시작")
+        self.panel.capture_calibration_images(frames=frames, capture_origin="ftp")
+
+    def _handle_calibration_wiris_ftp_capture_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] WIRIS FTP Capture 실패: {error}")
+        self.panel.calibration_status_label.setText(f"WIRIS FTP Capture failed: {error}")
+        self.panel.capture_calibration_button.setEnabled(True)
+        self.panel.run_calibration_button.setEnabled(True)
+
+    def _clear_calibration_wiris_ftp_capture_worker(self) -> None:
+        self.panel.calibration_wiris_ftp_thread = None
+        self.panel.calibration_wiris_ftp_worker = None
+
+    def capture_calibration_images_wiris_ftp_oz(self) -> bool:
+        """Same as ``capture_calibration_images_wiris_ftp``, on the OZ channel.
+
+        The WIRIS normal visible operating-zoom still (``SIVI TRUE``) instead
+        of the HR still (``SIHR TRUE``) -- lower resolution than HR, but a
+        faster capture with no camera reboot risk (unlike changing HR
+        resolution via ``SHRR``). Downloads land in a separate
+        ``calib_oz_capture`` subfolder so they never mix with HR downloads,
+        and feed the exact same ``capture_calibration_images`` save path.
+        """
+
+        if self.panel.calibration_wiris_ftp_oz_thread is not None:
+            self.panel.calibration_status_label.setText(
+                "A WIRIS FTP (OZ) calibration capture is already in progress."
+            )
+            return False
+        if self.panel.calibration_wiris_ftp_thread is not None:
+            self.panel.calibration_status_label.setText(
+                "A WIRIS FTP calibration capture is already in progress."
+            )
+            return False
+        if self.panel.checkerboard_calibration_thread is not None:
+            self.panel.calibration_status_label.setText("A calibration operation is already running.")
+            return False
+        settings = getattr(self.panel, "settings", None)
+        if not bool(getattr(settings, "wiris_ftp_enabled", False)):
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP capture requires \"Enable FTP download\" in Settings."
+            )
+            return False
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP capture failed: both WIRIS control hosts are required."
+            )
+            return False
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        capture_id = f"calib-oz-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=root)
+        thread = QtCore.QThread(self.panel)
+        worker = WirisPnPPhotoCaptureWorker(
+            target_infos,
+            capture_id=capture_id,
+            image_enable_command="SIVI TRUE",
+            capture_channel="calib_oz",
+            completion_timeout_s=10.0,
+            **kwargs,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_ftp_oz_capture_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_ftp_oz_capture_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_ftp_oz_capture_worker)
+        self.panel.calibration_wiris_ftp_oz_thread = thread
+        self.panel.calibration_wiris_ftp_oz_worker = worker
+        self.panel.capture_calibration_button.setEnabled(False)
+        self.panel.run_calibration_button.setEnabled(False)
+        self.panel.calibration_status_label.setText(
+            f"WIRIS FTP (OZ) Capture {capture_id}: 좌/우 카메라 내부 저장 중"
+        )
+        thread.start()
+        return True
+
+    def _handle_calibration_wiris_ftp_oz_capture_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        cameras = record.get("cameras")
+        cameras = cameras if isinstance(cameras, dict) else {}
+        capture_id = str(record.get("capture_id") or "")
+        failures = [
+            f"{side}: {item.get('error') or item.get('state', 'failed')}"
+            for side, item in cameras.items()
+            if item.get("state") != "completed" or not item.get("ftp_downloaded")
+        ]
+        if set(cameras) != {"left", "right"} or failures:
+            self._handle_calibration_wiris_ftp_oz_capture_failed(
+                "; ".join(failures) or "camera result is missing left/right entries"
+            )
+            return
+        frames: dict[str, QtGui.QImage | None] = {}
+        for side, item in cameras.items():
+            path = str(item.get("ftp_local_path") or "")
+            image = QtGui.QImage(path) if path else QtGui.QImage()
+            if image.isNull():
+                self._handle_calibration_wiris_ftp_oz_capture_failed(
+                    f"{side}: downloaded file could not be decoded as an image ({path or 'no path'})"
+                )
+                return
+            frames[side] = image
+        self.panel._log(f"[캘리브레이션] WIRIS FTP (OZ) Capture {capture_id}: 다운로드 완료, 캘리브레이션 저장 시작")
+        self.panel.capture_calibration_images(frames=frames, capture_origin="ftp_oz")
+
+    def _handle_calibration_wiris_ftp_oz_capture_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] WIRIS FTP (OZ) Capture 실패: {error}")
+        self.panel.calibration_status_label.setText(f"WIRIS FTP (OZ) Capture failed: {error}")
+        self.panel.capture_calibration_button.setEnabled(True)
+        self.panel.run_calibration_button.setEnabled(True)
+
+    def _clear_calibration_wiris_ftp_oz_capture_worker(self) -> None:
+        self.panel.calibration_wiris_ftp_oz_thread = None
+        self.panel.calibration_wiris_ftp_oz_worker = None
 
     def toggle_auto_calibration_capture(self) -> None:
         if self._auto_capture_active:

@@ -29,7 +29,10 @@ ATTITUDE_CAL_PARAM_NAMES = (
     "SENS_BOARD_Z_OFF",
 )
 
-# PX4 Rotation enum (src/lib/conversion/rotation.h), only the commonly used subset.
+# PX4/MAVLink Rotation enum (MAV_SENSOR_ROTATION_*, src/lib/conversion/rotation.h),
+# only the commonly used subset. Values verified against pymavlink's
+# dialects.v20.common.MAV_SENSOR_ROTATION_* -- do not reorder without
+# re-checking against that source, the codes are not evenly spaced.
 BOARD_ROTATION_LABELS = {
     0: "ROTATION_NONE",
     1: "ROTATION_YAW_45",
@@ -40,11 +43,13 @@ BOARD_ROTATION_LABELS = {
     6: "ROTATION_YAW_270",
     7: "ROTATION_YAW_315",
     8: "ROTATION_ROLL_180",
-    16: "ROTATION_PITCH_180",
-    20: "ROTATION_ROLL_90",
-    24: "ROTATION_ROLL_270",
-    32: "ROTATION_PITCH_90",
-    28: "ROTATION_PITCH_270",
+    12: "ROTATION_PITCH_180",
+    16: "ROTATION_ROLL_90",
+    20: "ROTATION_ROLL_270",
+    24: "ROTATION_PITCH_90",
+    25: "ROTATION_PITCH_270",
+    28: "ROTATION_ROLL_90_PITCH_90",
+    32: "ROTATION_ROLL_270_PITCH_180",
 }
 
 

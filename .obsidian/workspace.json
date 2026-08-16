@@ -11,14 +11,10 @@
             "id": "eb6797c961e82976",
             "type": "leaf",
             "state": {
-              "type": "markdown",
-              "state": {
-                "file": "Simulation/PX4-Autopilot/docs/uk/SUMMARY.md",
-                "mode": "source",
-                "source": false
-              },
-              "icon": "lucide-file",
-              "title": "SUMMARY"
+              "type": "graph",
+              "state": {},
+              "icon": "lucide-git-fork",
+              "title": "그래프 뷰"
             }
           }
         ]
@@ -55,7 +51,7 @@
             "state": {
               "type": "search",
               "state": {
-                "query": "",
+                "query": "README",
                 "matchingCase": false,
                 "explainSearch": false,
                 "collapseAll": false,
@@ -79,7 +75,8 @@
               "title": "북마크"
             }
           }
-        ]
+        ],
+        "currentTab": 1
       }
     ],
     "direction": "horizontal",
@@ -190,6 +187,22 @@
   },
   "active": "eb6797c961e82976",
   "lastOpenFiles": [
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1649729",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1649546",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1625475",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.2",
+    "yolov8n.pt",
+    "StereoWIRIS/tests/__pycache__/test_workstation.cpython-310-pytest-6.2.5.pyc.1559512",
+    "00_PROJECT_INDEX.md",
+    "Simulation/build/px4/_deps/abseil-cpp-src/README.md",
+    "Workstation/docs/ui/11_DESIGN_AUDIT_RESULT.md",
+    "StereoWIRIS/docs/AGENTS.md",
+    "Simulation/PX4-Autopilot/docs/uk/concept/architecture.md",
+    "Simulation/config/scenarios/README.md",
+    "AGENTS.md",
+    "Simulation/PX4-Autopilot/docs/uk/SUMMARY.md",
+    "무제 1",
+    "무제",
     "Simulation/README.md",
     "Simulation/reports/README.md",
     "Simulation/reports/candidate_method_validation_summary_20260609.md",

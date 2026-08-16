@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -410,7 +412,21 @@ def save_settings(settings: AppSettings, path: str | Path = DEFAULT_SETTINGS_PAT
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     payload = dict(settings.__dict__)
     payload["gnss_operation"] = settings.gnss_operation.to_mapping()
-    settings_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    # Write via a temp file + atomic replace so a write interrupted mid-way
+    # (disk full, process killed, power loss) can never leave a half-written
+    # settings file behind -- load_settings() has no error handling around
+    # json.loads() and runs at startup, so a truncated file would otherwise
+    # crash the app on every subsequent launch.
+    fd, temp_name = tempfile.mkstemp(
+        dir=settings_path.parent, prefix=f".{settings_path.name}.", suffix=".tmp"
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
+        os.replace(temp_path, settings_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def resolve_settings_path(raw_path: str, *, base_dir: str | Path) -> Path:

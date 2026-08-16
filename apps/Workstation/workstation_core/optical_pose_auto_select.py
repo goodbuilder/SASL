@@ -629,11 +629,16 @@ def _select_spread_matches(
     width: int,
     height: int,
     np: Any,
+    max_points: int = 12,
 ) -> tuple[list[Point2], list[Point2], list[float]]:
     order = sorted(range(len(distances)), key=lambda index: float(distances[index]))
     selected: list[int] = []
     cells: set[tuple[int, int]] = set()
     grid_x, grid_y = 4, 3
+    # Once roughly two thirds of the budget is spent on distinct grid cells,
+    # let the rest fill in from the same cells rather than staying empty --
+    # preserves the original 8-of-12 ratio at any configured max_points.
+    relax_after = max(1, (max_points * 2) // 3)
     for index in order:
         point = left[index]
         cell = (
@@ -646,11 +651,11 @@ def _select_spread_matches(
             for chosen in selected
         ):
             continue
-        if cell in cells and len(selected) < 8:
+        if cell in cells and len(selected) < relax_after:
             continue
         selected.append(index)
         cells.add(cell)
-        if len(selected) >= 12:
+        if len(selected) >= max_points:
             break
     # Fill remaining slots by descriptor quality when the image occupies only
     # a few grid cells.  This keeps the four-point minimum usable for a small
@@ -664,7 +669,7 @@ def _select_spread_matches(
             continue
         if index not in selected:
             selected.append(index)
-        if len(selected) >= min(12, len(order)):
+        if len(selected) >= min(max_points, len(order)):
             break
     return (
         [(float(left[index][0]), float(left[index][1])) for index in selected],
@@ -785,10 +790,24 @@ def detect_mountain(
     right_distortion_coefficients: Any = None,
     baseline_ned_m: Sequence[float] | None = None,
     prior_rotation_right_from_left_rdf: Sequence[Sequence[float]] | None = None,
+    ridge_margin_fraction: float = 0.06,
+    max_points: int = 12,
 ) -> MountainAutoSelection:
-    """Suggest distributed left/right ridge correspondences without 3-D data."""
+    """Suggest distributed left/right ridge correspondences without 3-D data.
+
+    ``ridge_margin_fraction`` is the half-width of the boundary-curve match
+    band, as a fraction of image height (default 0.06 = 6%). Wider tolerates
+    a rougher/less certain boundary estimate at the cost of letting more
+    off-ridge matches back in; narrower rejects more aggressively but can
+    drop legitimate points on a very jagged silhouette.
+
+    ``max_points`` caps how many spatially-spread correspondences are kept
+    for the final suggestion (default 12); it never discards inliers beyond
+    what is needed to build that spread selection.
+    """
 
     method = "sift/ratio-mutual-ransac"
+    max_points = max(4, int(max_points))
     try:
         cv2, np = _require_cv_numpy()
         left_gray = _undistort_gray(
@@ -864,7 +883,8 @@ def detect_mountain(
         if left_ground_mask is not None or right_ground_mask is not None:
             left_boundary = None if left_ground_mask is None else _estimate_ridge_boundary(left_ground_mask, np)
             right_boundary = None if right_ground_mask is None else _estimate_ridge_boundary(right_ground_mask, np)
-            boundary_margin_px = 0.06 * max(left_gray.shape[0], right_gray.shape[0])
+            margin_fraction = min(0.25, max(0.01, float(ridge_margin_fraction)))
+            boundary_margin_px = margin_fraction * max(left_gray.shape[0], right_gray.shape[0])
 
             def _on_ground(point: Point2, mask: Any | None) -> bool:
                 if mask is None:
@@ -886,11 +906,20 @@ def detect_mountain(
                     return True
                 return abs(point[1] - row) <= boundary_margin_px
 
+            # Proximity to the estimated boundary curve alone is not enough:
+            # the curve itself can be locally wrong at a handful of columns
+            # (an isolated cloud-edge misclassification, or an unstable
+            # estimate near the image border), and a keypoint can happen to
+            # sit within margin of that wrong value while still being sky at
+            # its own pixel. Require both the point itself to be ground-like
+            # and to sit near the boundary curve.
             boundary_matches = [
                 match
                 for match in matches
                 if _near_boundary(key_left[match.queryIdx].pt, left_boundary)
                 and _near_boundary(key_right[match.trainIdx].pt, right_boundary)
+                and _on_ground(key_left[match.queryIdx].pt, left_ground_mask)
+                and _on_ground(key_right[match.trainIdx].pt, right_ground_mask)
             ]
             if len(boundary_matches) >= 4:
                 matches = boundary_matches
@@ -983,6 +1012,7 @@ def detect_mountain(
             width=width,
             height=height,
             np=np,
+            max_points=max_points,
         )
         rank, rank_ratio, area = _spatial_rank(selected_left, np)
         # Epipolar residual in normalized coordinates, converted to a useful

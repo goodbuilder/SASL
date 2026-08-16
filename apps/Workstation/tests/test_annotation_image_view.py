@@ -186,6 +186,33 @@ def test_frame_identity_pins_annotations_and_export_is_deeply_immutable() -> Non
     assert view.export_payload().target_point == ()
 
 
+def test_multiview_capture_can_keep_visible_points_until_explicit_clear() -> None:
+    view = AnnotationImageView()
+    first = _native_image(640, 480, "#333333")
+    second = _native_image(640, 480, "#444444")
+    view.load_frozen_native_frame(first, frame_id="burst-1", image_sha256="1" * 64)
+    view.add_source_point((120.0, 140.0), mode=AnnotationMode.TARGET)
+
+    view.load_frozen_native_frame(
+        second,
+        frame_id="burst-2",
+        image_sha256="2" * 64,
+        preserve_annotations=True,
+    )
+
+    assert view.annotation_points(AnnotationMode.TARGET) == (SourcePixel(120.0, 140.0),)
+    assert view.annotations_stale is True
+    assert view.export_annotations().frame_id == "burst-1"
+    with pytest.raises(RuntimeError, match="clear the previous annotation"):
+        view.add_source_point((200.0, 220.0), mode=AnnotationMode.TARGET)
+
+    view.clear_annotations(AnnotationMode.TARGET)
+    assert view.annotations_stale is False
+    assert view.export_annotations().frame_id == "burst-2"
+    view.add_source_point((200.0, 220.0), mode=AnnotationMode.TARGET)
+    assert view.export_annotations().frame_id == "burst-2"
+
+
 def test_rejects_overlay_or_non_native_dimensions() -> None:
     view = AnnotationImageView()
     image = _native_image(640, 480)
@@ -249,3 +276,34 @@ def test_wheel_zoom_keeps_cursor_native_pixel_fixed() -> None:
     assert after.u == pytest.approx(before.u, abs=1.0e-9)
     assert after.v == pytest.approx(before.v, abs=1.0e-9)
     assert view.export_annotations().target_point == (before,)
+
+
+def test_wheel_zoom_out_to_min_recenters_with_no_gap() -> None:
+    """Zooming in near one corner, then back out while the cursor has moved
+    to a different point (the ordinary way a user actually zooms -- look at
+    one feature, scroll in, move the mouse, scroll back out) must recenter
+    the view once it reaches the fully-zoomed-out level, or the display rect
+    stays off-center at a scale where it exactly fills the viewport --
+    leaving an empty gap on one edge. Regression guard for that drift."""
+
+    view = AnnotationImageView()
+    view.resize(800, 600)
+    view.load_frozen_native_frame(
+        _native_image(1600, 1200),
+        frame_id="zoom-recenter",
+        image_sha256="r" * 64,
+    )
+
+    for _ in range(5):
+        view.wheelEvent(_WheelEvent(QtCore.QPoint(40, 30), 120))  # type: ignore[arg-type]
+    assert view.zoom_factor > 1.0
+
+    for _ in range(5):
+        view.wheelEvent(_WheelEvent(QtCore.QPoint(760, 570), -120))  # type: ignore[arg-type]
+
+    assert view.zoom_factor == pytest.approx(1.0)
+    rect = view.image_display_rect()
+    assert rect.left() <= 1.0e-6
+    assert rect.top() <= 1.0e-6
+    assert rect.right() >= view.width() - 1.0e-6
+    assert rect.bottom() >= view.height() - 1.0e-6

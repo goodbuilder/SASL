@@ -83,6 +83,58 @@ def test_recover_retryable_recording_session_returns_false_without_candidates(tm
     assert result is False
 
 
+def test_recover_retryable_recording_session_restores_hr_oz_capture_records(tmp_path) -> None:
+    # event_index/capture_id for the *next* HR/OZ capture are derived from
+    # len(panel.pnp_photo_capture_records)/len(panel.oz_photo_capture_records);
+    # if recovery leaves those empty despite hr_captures.jsonl/oz_captures.jsonl
+    # already holding events on disk, the next capture restarts at event_index=1
+    # and duplicates an id already present in that session's JSONL file.
+    output_dir = tmp_path / "recovered-session"
+    output_dir.mkdir()
+    (output_dir / "hr_captures.jsonl").write_text(
+        '{"capture_id": "hr-001", "event_index": 1}\n'
+        '{"capture_id": "hr-002", "event_index": 2}\n',
+        encoding="utf-8",
+    )
+    (output_dir / "oz_captures.jsonl").write_text(
+        '{"capture_id": "oz-001", "event_index": 1}\n',
+        encoding="utf-8",
+    )
+    recovered = RetryableSession(
+        output_dir=output_dir,
+        metadata={"session_id": "recovered-1", "session_started_unix_ns": 1_000_000_000},
+        pair_rows=SpoolRows(),
+        camera_rows={"left": SpoolRows(), "right": SpoolRows()},
+        px4_rows={"left": SpoolRows(), "right": SpoolRows()},
+        gnss_base_rows=SpoolRows(),
+        extrinsics_comparison_rows=SpoolRows(),
+    )
+    panel = SimpleNamespace(
+        app_root=tmp_path,
+        record_button=_ValueWidget(),
+        save_history_button=_ValueWidget(),
+        recording_status_label=_ValueWidget(),
+        _log=lambda message: None,
+        _refresh_recording_table=lambda: None,
+    )
+    original_discover = recording_controller_module.discover_retryable_sessions
+    original_load = recording_controller_module.load_retryable_session
+    recording_controller_module.discover_retryable_sessions = lambda root: [output_dir]
+    recording_controller_module.load_retryable_session = lambda candidate: recovered
+    try:
+        RecordingController(panel)._recover_retryable_recording_session()
+    finally:
+        recording_controller_module.discover_retryable_sessions = original_discover
+        recording_controller_module.load_retryable_session = original_load
+
+    assert [row["capture_id"] for row in panel.pnp_photo_capture_records] == ["hr-001", "hr-002"]
+    assert [row["capture_id"] for row in panel.oz_photo_capture_records] == ["oz-001"]
+    # The next capture's event_index/capture_id (len(records) + 1) now
+    # continues from disk instead of colliding with "hr-001"/event_index=1.
+    assert len(panel.pnp_photo_capture_records) + 1 == 3
+    assert len(panel.oz_photo_capture_records) + 1 == 2
+
+
 def test_recover_retryable_recording_session_restores_spool_state(tmp_path) -> None:
     output_dir = tmp_path / "recovered-session"
     output_dir.mkdir()
@@ -120,6 +172,8 @@ def test_recover_retryable_recording_session_restores_spool_state(tmp_path) -> N
     assert panel._session_save_retry_required is True
     assert panel.record_button.value_state is False
     assert panel.save_history_button.value_state is True
+    assert panel.pnp_photo_capture_records == []
+    assert panel.oz_photo_capture_records == []
 
 
 def test_apply_wiris_stip_skips_unchanged_host_without_starting_worker() -> None:

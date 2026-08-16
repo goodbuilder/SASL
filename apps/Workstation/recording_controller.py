@@ -109,6 +109,8 @@ RECORDING_CONTROLLER_METHODS = [
     "capture_pnp_hr_photos",
     "capture_pnp_oz_photos",
     "import_hr_files",
+    "_camera_photo_target_infos",
+    "_wiris_ftp_worker_kwargs",
     "_append_pnp_photo_capture_record",
     "_append_oz_photo_capture_record",
     "_handle_pnp_photo_capture_completed",
@@ -468,6 +470,23 @@ class RecordingController:
         self.panel._refresh_operation_header()
         return None
 
+    @staticmethod
+    def _load_jsonl_records(path: Path) -> list[dict[str, object]]:
+        if not path.is_file():
+            return []
+        records: list[dict[str, object]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                records.append(record)
+        return records
+
     def _recover_retryable_recording_session(self) -> bool:
         candidates = discover_retryable_sessions(self.panel.app_root / "recordings")
         if not candidates:
@@ -507,6 +526,17 @@ class RecordingController:
         self.panel.px4_recording_rows = recovered.px4_rows
         self.panel.gnss_base_recording_rows = recovered.gnss_base_rows
         self.panel.extrinsics_comparison_recording_rows = recovered.extrinsics_comparison_rows
+        # HR/OZ capture event_index/capture_id counters are derived from
+        # len(pnp_photo_capture_records)/len(oz_photo_capture_records); without
+        # restoring them here they would silently restart at 1 on top of a
+        # recovered session's existing hr_captures.jsonl/oz_captures.jsonl,
+        # producing duplicate event_index/capture_id values in that file.
+        self.panel.pnp_photo_capture_records = self._load_jsonl_records(
+            recovered.output_dir / "hr_captures.jsonl"
+        )
+        self.panel.oz_photo_capture_records = self._load_jsonl_records(
+            recovered.output_dir / "oz_captures.jsonl"
+        )
         self.panel._recovered_session_metadata = metadata
         self.panel._session_save_retry_required = True
         self.panel._session_save_finalized = False
@@ -1016,17 +1046,21 @@ class RecordingController:
         )
         return True
 
-    def _wiris_ftp_worker_kwargs(self) -> dict[str, object]:
-        """FTP config shared by HR and OZ capture workers.
+    def _wiris_ftp_worker_kwargs(self, *, output_dir: Path | None = None) -> dict[str, object]:
+        """FTP config shared by every WIRIS still-capture worker (HR/OZ/etc).
 
         The FTP server lives on the same WIRIS Enterprise host as the
         CPTR/ICPT command channel (only the port differs), so no separate
         host is needed here -- the worker reuses the host from target_infos.
+
+        ``output_dir`` lets a caller outside the Recording session (e.g.
+        Calibration, whose save root is independent of any recording
+        session) stage FTP downloads under its own directory instead of the
+        default ``<recording_session_dir>/frames``.
         """
 
         settings = getattr(self.panel, "settings", None)
-        output_dir = None
-        if self.panel.recording_session_id:
+        if output_dir is None and self.panel.recording_session_id:
             output_dir = self.panel._recording_session_dir(self.panel.recording_session_id) / "frames"
         return {
             "ftp_enabled": bool(getattr(settings, "wiris_ftp_enabled", False)),

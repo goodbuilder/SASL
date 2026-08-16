@@ -5,7 +5,11 @@ from Workstation.workstation_core.gnss_monitor import (
     NtripHealthState,
     evaluate_ntrip_health,
 )
-from Workstation.workstation_core.gnss_network import build_ntrip_request
+from Workstation.workstation_core.gnss_network import (
+    build_ntrip_request,
+    gga_from_coordinate_sample,
+    gga_from_position,
+)
 from Workstation.workstation_core.gnss_operation import (
     CorrectionSourceIdentity,
     GgaPolicy,
@@ -17,6 +21,28 @@ from Workstation.workstation_core.gnss_operation import (
     HeightType,
     NetworkConfig,
 )
+
+
+def test_gga_from_position_reports_rtk_fixed_as_nmea_quality_4() -> None:
+    # NMEA GGA fix_quality is a different enum than MAVLink fix_type: 4 is
+    # RTK Fixed there, not 6 (which means "Estimated/dead reckoning").
+    fixed = SimpleNamespace(
+        latitude_deg=37.0, longitude_deg=127.0, altitude_m=52.0, fix_type=6, satellites_used=14, eph_m=0.02
+    )
+    not_fixed = SimpleNamespace(
+        latitude_deg=37.0, longitude_deg=127.0, altitude_m=52.0, fix_type=3, satellites_used=14, eph_m=0.02
+    )
+
+    assert gga_from_position(fixed).split(",")[6] == "4"
+    assert gga_from_position(not_fixed).split(",")[6] == "1"
+
+
+def test_gga_from_coordinate_sample_reports_rtk_fixed_as_nmea_quality_4() -> None:
+    fixed = SimpleNamespace(latitude_deg=37.0, longitude_deg=127.0, msl_altitude_m=52.0, fixed=True)
+    not_fixed = SimpleNamespace(latitude_deg=37.0, longitude_deg=127.0, msl_altitude_m=52.0, fixed=False)
+
+    assert gga_from_coordinate_sample(fixed).split(",")[6] == "4"
+    assert gga_from_coordinate_sample(not_fixed).split(",")[6] == "1"
 
 
 def test_ngii_rts2_base_assisted_profile_uses_non_gating_field_defaults() -> None:

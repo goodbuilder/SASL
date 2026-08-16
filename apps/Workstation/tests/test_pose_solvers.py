@@ -138,9 +138,12 @@ def test_seeded_pnp_ensemble_runs_three_real_solvers_and_two_independent_refinem
     first = solve_pnp_ensemble(correspondences, config=config)
     second = solve_pnp_ensemble(correspondences, config=config)
 
-    assert first.failures == ()
-    assert len(first.candidates) == 9
-    assert {candidate.solver for candidate in first.candidates} == {"ITERATIVE", "EPNP", "SQPNP"}
+    assert len(first.failures) == 1
+    assert first.failures[0][0] == "IPPE/NONE"
+    assert "coplanar" in first.failures[0][1]
+    assert len(first.candidates) == 10
+    assert {candidate.solver for candidate in first.candidates} == {"ITERATIVE", "EPNP", "SQPNP", "ROBUST_LSQ"}
+    assert sum(1 for candidate in first.candidates if candidate.solver == "ROBUST_LSQ") == 1
     assert {candidate.refinement for candidate in first.candidates} == {"NONE", "LM", "VVS"}
     assert all("DLS" not in candidate.candidate_id and "UPNP" not in candidate.candidate_id for candidate in first.candidates)
     assert first.ransac_seed == 7717

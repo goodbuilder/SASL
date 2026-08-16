@@ -64,6 +64,10 @@ class AppLifecycleController:
             "rtsp_enable_thread",
             "gnss_base_detect_thread",
             "checkerboard_calibration_thread",
+            "calibration_wiris_ftp_thread",
+            "calibration_wiris_ftp_oz_thread",
+            "optical_pose_wiris_ftp_thread",
+            "optical_pose_wiris_ftp_oz_thread",
         )
         results = [self.panel._shutdown_stop_thread(attr) for attr in attrs]
         return bool(auto_capture_stopped and preview_stopped and lrf_stopped and all(results))

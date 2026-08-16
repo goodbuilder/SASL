@@ -125,6 +125,9 @@ def ubx_cfg_tmode3_fixed_frame(
     coarse_y, high_y = _ubx_tmode3_ecef_components(ecef[1])
     coarse_z, high_z = _ubx_tmode3_ecef_components(ecef[2])
     accuracy_0_1mm = max(1, int(round(float(fixed_position_accuracy_m) / 0.0001)))
+    # CFG-TMODE3's three trailing U4 fields are, in wire order, fixedPosAcc /
+    # svinMinDur / svinAccLimit. Fixed-base mode only uses fixedPosAcc (the
+    # other two are survey-in-only), so it goes first, not last.
     payload = struct.pack(
         "<BBHlllbbbBIII8s",
         0,
@@ -137,9 +140,9 @@ def ubx_cfg_tmode3_fixed_frame(
         high_y,
         high_z,
         0,
-        0,
-        0,
         accuracy_0_1mm,
+        0,
+        0,
         b"\x00" * 8,
     )
     return ubx_frame(0x06, 0x71, payload)
@@ -176,11 +179,16 @@ def parse_ubx_cfg_tmode3(payload: bytes) -> dict[str, object] | None:
 
     Coordinate contract: the three coordinate components are WGS84 ECEF
     centimetres plus signed 0.1 mm high parts.  They are intentionally never
-    treated as rover NED or camera-frame values.
+    treated as rover NED or camera-frame values.  The trailing U4 fields are
+    fixedPosAcc at payload offset 20, svinMinDur at offset 24, and
+    svinAccLimit at offset 28; fixed_accuracy_0_1mm always names the first of
+    those fields.
     """
 
     if len(payload) < 40:
         return None
+    # Wire order of the trailing U4 fields is fixedPosAcc / svinMinDur /
+    # svinAccLimit -- match ubx_cfg_tmode3_fixed_frame's field order above.
     (
         _version,
         _reserved0,
@@ -192,9 +200,9 @@ def parse_ubx_cfg_tmode3(payload: bytes) -> dict[str, object] | None:
         y_hp,
         z_hp,
         _reserved1,
+        fixed_accuracy_0_1mm,
         _svin_min_duration_s,
         _svin_accuracy_0_1mm,
-        fixed_accuracy_0_1mm,
         _reserved2,
     ) = struct.unpack_from("<BBHlllbbbBIII8s", payload, 0)
     return {
@@ -500,6 +508,20 @@ class UbxStreamParser:
         return messages
 
 
+def _crc24q(data: bytes) -> int:
+    """RTCM3's CRC-24Q (Qualcomm) checksum: poly 0x1864CFB, init 0, MSB-first."""
+
+    crc = 0
+    for byte in data:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+        crc &= 0xFFFFFF
+    return crc
+
+
 class Rtcm3StreamParser:
     def __init__(self) -> None:
         self._buffer = bytearray()
@@ -523,6 +545,11 @@ class Rtcm3StreamParser:
             frame_len = 3 + payload_len + 3
             if len(self._buffer) < frame_len:
                 break
-            frames.append(bytes(self._buffer[:frame_len]))
+            frame = bytes(self._buffer[:frame_len])
             del self._buffer[:frame_len]
+            if _crc24q(frame[:-3]) != int.from_bytes(frame[-3:], "big"):
+                # Sync byte landed on corrupted/misaligned data; drop this
+                # candidate frame and keep scanning for the next 0xD3.
+                continue
+            frames.append(frame)
         return frames

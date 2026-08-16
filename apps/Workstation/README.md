@@ -47,6 +47,11 @@ export NGII_RTS2_PASSWORD='<RTS2 password>'
 ./apps/Workstation/run.sh
 ```
 
+When a validated fixed Base coordinate is applied, the Workstation sends UBX-CFG-TMODE3 with
+the fixed-position accuracy in the u-blox `fixedPosAcc` slot at payload offset 20. The
+survey-in-only fields remain at offsets 24 (`svinMinDur`) and 28 (`svinAccLimit`); the ACK and
+readback path compares the receiver's fixed-position accuracy against that same field.
+
 To monitor NTRIP while it is running, open `Devices > GNSS`. The NTRIP panel separates the
 caster connection from correction health: `CONNECTED_NO_DATA` means the caster accepted the
 request but no stream bytes have arrived, `STREAMING` means bytes are arriving but no valid
@@ -65,20 +70,48 @@ drone Pixhawk through MAVLink `GPS_RTCM_DATA` in real time.
 
 The Telemetry panel also reports the live Left/Right GNSS baseline and computes the ideal
 rectified-stereo disparity as `d = fx × B / Z`, using the active stereo calibration focal
-length `fx`, the GNSS baseline `B`, and the configured target distance `Z`. A target
-distance of `0` uses the latest measured distance. This is a geometry reference for
-operator feedback, not image-observed disparity, and no RTK-Fixed state is forced as a
-measurement gate; the GNSS checklist remains informational.
+length `fx`, the P1/P2 GNSS baseline `B`, and the automatically derived distance `Z` from
+the P1/P2 baseline midpoint to the Drone GNSS position. There is no user-entered target
+distance for this value. If one of the three GNSS positions or the active zoom focal length
+is missing or stale, the panel reports a waiting/stale state instead of fabricating pixels.
+This is a geometry reference for operator feedback, not image-observed disparity, and no
+RTK-Fixed state is forced as a measurement gate; the GNSS checklist remains informational.
 
 The `Alignment` workspace keeps the `Pixhawk`, `GNSS / RTK`, and `Alignment` operation
 buttons directly below its title. The live evidence tables remain below these controls.
 
-For optical-pose point selection, first press `Capture frozen burst` in `Alignment > R,t
-methods`. The `Auto-select Horizon` and `Auto-select Mountain` actions analyze only those
+For optical-pose point selection, first press `Capture` in `Alignment > R,t methods`. The
+`Auto-select Horizon` and `Auto-select Mountain` actions analyze only those
 immutable native left/right frames with the exact frozen operating `K,D`. Review the dashed
 overlay and quality strip, then press `Use suggestion` before running the existing Horizon or
 Mountain solver. Automatic selection never applies `R,t` by itself. The manual Horizon,
 Mountain, and Target modes remain available as a fallback.
+
+The three manual actions have distinct roles: `Manual Horizon` marks two visible horizon
+points and estimates Roll/Pitch only; `Manual Mountain` marks matching terrain features in
+the same order on both images and supplies the paired observations for the GNSS + Mountain
+metric `R,t` solve (at least four pairs); `Manual Target` marks one Drone RTK target pixel
+per image for the single-target Drone RTK Yaw fallback. Full multi-view `R,t` refinement
+uses the separately imported synchronized observations.
+
+`Clear` removes the selected annotation mode from both frozen frames. `Import` loads a
+left/right frozen pair from disk. The WIRIS alternatives are labeled `Capture (WIRIS FTP)`
+and `Capture (WIRIS FTP OZ)`. The LRF status card is part of the R,t methods scroll content,
+so it scrolls with the workflow instead of staying pinned below it.
+
+The Alignment `Pose workflow` separates the Drone path into two reviewed stages. `Initialize from
+Telemetry` uses fresh P1/P2/Drone GNSS to establish the local world-NED camera centers and uses
+fresh left/right Pixhawk R/P/Y when available; it creates a candidate and never auto-applies it.
+`Refine Drone RTK Multi-view R,t` imports a JSON set of synchronized per-camera rays (or native
+pixel coordinates) and Drone RTK target positions, then optimizes full 6-DOF camera `R,t` for
+both sides. The multi-view target positions must be in one local NED frame, with at least four
+non-degenerate observations per side. The existing `Drone RTK Yaw` tab remains an advanced
+single-target fallback and does not infer translation.
+
+In Drone Target annotation mode, capturing another frozen burst keeps the previous target mark
+visible for multi-view review until `Clear` is pressed. The mark remains bound
+to its original frame identity; it is not silently reused as a pixel from the new frame, and new
+points are blocked until the old mark is cleared.
 
 When the session is saved, the static JSON also stores the frozen-frame artifact identities,
 complete automatic proposals, accepted points, current annotation payload, and provenance.
@@ -118,6 +151,9 @@ python3 -m pytest -q
   F9P` during Base initialization. After the fixed Base coordinate is confirmed, local RTCM
   follows `Base F9P → StereoDistance PC → Ethernet/MAVLink GPS_RTCM_DATA → Left/Right
   Pixhawk → Left/Right F9P`.
+- UBX-CFG-TMODE3 fixed-base payload fields follow the u-blox wire order: `fixedPosAcc` at
+  offset 20, `svinMinDur` at offset 24, and `svinAccLimit` at offset 28. Fixed-base commands
+  populate only `fixedPosAcc`; survey-in commands populate the latter two fields.
 - The supported field receiver arrangement is one Base F9P and one F9P-based receiver on each
   Pixhawk rover. Receiver firmware versions are observed on the devices at runtime and are
   not assumed by the settings profile.
@@ -218,6 +254,19 @@ object points and an imported GeoTIFF with a declared vertical datum.
 
 ## Change Log
 
+- 2026-08-17: Clarified that Telemetry ideal disparity derives `Z` automatically from the
+  P1/P2 baseline midpoint to Drone GNSS and does not accept a user-entered target distance.
+- 2026-08-17: Split optical-pose Drone alignment into a reviewed Telemetry initialization
+  candidate and a separate Drone RTK multi-view full `R,t` refinement path; retained the
+  single-target Drone RTK Yaw solver as an advanced fallback.
+- 2026-08-17: Keep Drone Target marks visible across a new frozen burst for multi-view review;
+  explicit `Clear` rebinds the editor to the new frame before new points are accepted.
+- 2026-08-17: Shortened optical-pose annotation actions to `Capture`, `Clear`, and `Import`,
+  documented the Horizon/Mountain/Target roles, and moved the LRF status card into the
+  scrollable R,t workflow.
+- 2026-08-17: Corrected UBX-CFG-TMODE3 fixed-base accuracy encoding and readback parsing to
+  use the u-blox `fixedPosAcc` field at payload offset 20; added independent wire-layout
+  regression coverage so a self-consistent but incorrectly shifted round trip cannot pass.
 - 2026-08-14: Added separate visible/OZ `OZ Capture` beside `HR Capture`, using
   `SIVI TRUE + CPTR + ICPT`, Pre/Post/Checkpoint purpose evidence, and
   `oz_captures.jsonl`/`oz_capture_event` storage independent of RTSP session video.

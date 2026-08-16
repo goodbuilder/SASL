@@ -3975,6 +3975,7 @@ class OpticalPosePane(QtWidgets.QWidget):
                 ("intrinsics", "Exact K,D"),
                 ("base_extrinsics", "Base R,t"),
                 ("mountain_uv", "Mountain u,v"),
+                ("terrain", "Terrain GeoTIFF"),
                 ("target_reference", "Target reference"),
             )
         ):
@@ -4012,6 +4013,23 @@ class OpticalPosePane(QtWidgets.QWidget):
         self.annotation_mode_combo.currentIndexChanged.connect(self._set_annotation_mode)
         annotation_actions.addWidget(self.annotation_mode_combo)
         self.manual_mode_buttons: dict[str, QtWidgets.QPushButton] = {}
+        self._manual_mode_tooltips = {
+            AnnotationMode.HORIZON.value: (
+                "Mark two points on the visible horizon in the frozen native image. "
+                "The Horizon solver estimates Roll/Pitch only; Yaw and camera position "
+                "remain at the prior pose."
+            ),
+            AnnotationMode.RIDGE.value: (
+                "Mark corresponding Mountain features in the same order on the left and "
+                "right frozen images. GNSS + Mountain needs at least four paired points "
+                "to solve metric R,t."
+            ),
+            AnnotationMode.TARGET.value: (
+                "Mark one Drone RTK target pixel in each frozen image. The single-target "
+                "Drone RTK Yaw solver uses it with line-of-sight evidence; multi-view "
+                "refinement uses imported observations separately."
+            ),
+        }
         for mode, label in (
             (AnnotationMode.HORIZON.value, "Manual Horizon"),
             (AnnotationMode.RIDGE.value, "Manual Mountain"),
@@ -4019,15 +4037,12 @@ class OpticalPosePane(QtWidgets.QWidget):
         ):
             button = QtWidgets.QPushButton(label)
             button.setObjectName(f"opticalPoseManual{mode.title()}")
-            button.setToolTip(
-                "Select this annotation mode, then click the frozen native image. "
-                "Saved points remain native OpenCV (u, v) pixels."
-            )
+            button.setToolTip(self._manual_mode_tooltips[mode])
             button.clicked.connect(
                 lambda _checked=False, mode=mode: self._select_manual_annotation_mode(mode)
             )
             self.manual_mode_buttons[mode] = button
-        self.annotation_clear_button = QtWidgets.QPushButton("Clear current annotation")
+        self.annotation_clear_button = QtWidgets.QPushButton("Clear")
         self.annotation_clear_button.setObjectName("opticalPoseAnnotationClear")
         self.annotation_clear_button.setToolTip(
             "Clear the selected horizon/ridge/target points from both frozen frames."
@@ -4036,18 +4051,36 @@ class OpticalPosePane(QtWidgets.QWidget):
         annotation_actions.addWidget(self.annotation_clear_button)
         self.capture_frozen_burst_button = make_solver_button(
             "alignment.pose.capture_burst",
-            "Capture frozen burst",
+            "Capture",
         )
         self.capture_frozen_burst_button.setToolTip(
             "Capture once, then use the same immutable native left/right frames across all R,t methods."
         )
         annotation_actions.addWidget(self.capture_frozen_burst_button)
-        self.import_frozen_burst_button = QtWidgets.QPushButton("Import frozen burst")
+        self.capture_frozen_burst_wiris_ftp_button = make_solver_button(
+            "alignment.pose.capture_burst_wiris_ftp",
+            "Capture (WIRIS FTP)",
+        )
+        self.capture_frozen_burst_wiris_ftp_button.setToolTip(
+            "Trigger a WIRIS HR still on both cameras and download it via FTP instead of the "
+            "live RTSP feed, then freeze it the same way as Capture."
+        )
+        annotation_actions.addWidget(self.capture_frozen_burst_wiris_ftp_button)
+        self.capture_frozen_burst_wiris_ftp_oz_button = make_solver_button(
+            "alignment.pose.capture_burst_wiris_ftp_oz",
+            "Capture (WIRIS FTP OZ)",
+        )
+        self.capture_frozen_burst_wiris_ftp_oz_button.setToolTip(
+            "Same as Capture (WIRIS FTP), using the lower-resolution "
+            "operating-zoom still (SIVI) instead of the HR still."
+        )
+        annotation_actions.addWidget(self.capture_frozen_burst_wiris_ftp_oz_button)
+        self.import_frozen_burst_button = QtWidgets.QPushButton("Import")
         self.import_frozen_burst_button.setObjectName("opticalPoseImportBurst")
         self.import_frozen_burst_button.setToolTip(
             "Load left/right images from disk instead of a live capture -- reuse an "
             "FTP-downloaded HR/OZ still, or feed local test imagery for offline accuracy evaluation. "
-            "The same immutable-frame contract as Capture frozen burst applies."
+            "The same immutable-frame contract as Capture applies."
         )
         self.import_frozen_burst_button.clicked.connect(self._import_frozen_burst)
         annotation_actions.addWidget(self.import_frozen_burst_button)
@@ -4144,6 +4177,38 @@ class OpticalPosePane(QtWidgets.QWidget):
         auto_layout.addWidget(self.auto_suggestion_metrics_label, 2, 0, 1, 3)
         layout.addWidget(auto_group)
 
+        workflow_group = QtWidgets.QGroupBox("Pose workflow")
+        workflow_group.setObjectName("opticalPoseWorkflowGroup")
+        workflow_layout = QtWidgets.QGridLayout(workflow_group)
+        workflow_layout.setContentsMargins(6, 6, 6, 6)
+        workflow_layout.setSpacing(5)
+        initialize_button = make_solver_button(
+            "alignment.pose.initialize_telemetry",
+            "Initialize from Telemetry",
+        )
+        initialize_button.setToolTip(
+            "Build a reviewed initial pose candidate from fresh P1/P2/Drone GNSS and, when available, "
+            "fresh Pixhawk R/P/Y. GNSS positions are converted to local world NED; this does not auto-apply."
+        )
+        multiview_button = make_solver_button(
+            "alignment.pose.solve_drone_rtk_multiview",
+            "Refine Drone RTK Multi-view R,t",
+        )
+        multiview_button.setToolTip(
+            "Import a multi-view JSON containing per-side camera rays/pixels and synchronized Drone RTK "
+            "target positions, then solve full 6-DOF R,t for both cameras."
+        )
+        workflow_layout.addWidget(initialize_button, 0, 0)
+        workflow_layout.addWidget(multiview_button, 0, 1)
+        workflow_note = QtWidgets.QLabel(
+            "Two explicit stages: initialize with live Telemetry, then refine with several synchronized "
+            "Drone RTK target observations. Both results become candidates and share the same review/apply path."
+        )
+        workflow_note.setObjectName("compactContract")
+        workflow_note.setWordWrap(True)
+        workflow_layout.addWidget(workflow_note, 1, 0, 1, 2)
+        layout.addWidget(workflow_group)
+
         method_group = QtWidgets.QGroupBox("R,t measurement methods")
         method_layout = QtWidgets.QVBoxLayout(method_group)
         self.method_tabs = QtWidgets.QTabWidget()
@@ -4188,13 +4253,62 @@ class OpticalPosePane(QtWidgets.QWidget):
                 make_solver_button("alignment.pose.solve_gnss_mountain", "Solve GNSS + Mountain R,t"),
             ),
         )
+        def build_terrain_content(page_layout: QtWidgets.QVBoxLayout) -> None:
+            terrain_note = QtWidgets.QLabel(
+                "Uses the same Ridge points as Mountain + GNSS -- switch to Ridge mode on that "
+                "tab to click them. \"Solve Terrain PnP\" will prompt for a correspondences JSON "
+                "matching each side's clicked points 1:1 with object_points_ned_m; see the "
+                "Readiness card above for GeoTIFF/vertical-datum status."
+            )
+            terrain_note.setObjectName("compactContract")
+            terrain_note.setWordWrap(True)
+            page_layout.addWidget(terrain_note)
+
+        add_method_tab(
+            "Terrain PnP",
+            "Full 6-DOF pose from 2D/3D correspondences against an imported GeoTIFF -- the only "
+            "method that does not inherit any axis from the prior pose when it succeeds.",
+            (
+                make_solver_button("alignment.pose.import_terrain", "Import GeoTIFF"),
+                make_solver_button("alignment.pose.solve_terrain", "Solve Terrain PnP"),
+            ),
+            content=build_terrain_content,
+        )
         add_method_tab(
             "Drone RTK Yaw",
-            "A frozen target pixel plus explicit target Drone RTK line-of-sight evidence constrains Yaw.",
+            "Advanced single-target fallback: a frozen target pixel plus explicit Drone RTK line-of-sight "
+            "evidence constrains Yaw. Use Pose workflow above for Telemetry initialization and full multi-view R,t.",
             (
                 self.manual_mode_buttons[AnnotationMode.TARGET.value],
                 make_solver_button("alignment.pose.solve_drone_yaw", "Solve Drone RTK Yaw"),
             ),
+        )
+        def register_reference_candidate(source: str) -> None:
+            self.command_requested.emit(
+                "alignment.pose.register_reference",
+                {"source": source},
+            )
+
+        register_checkerboard_button = QtWidgets.QPushButton("Register Checkerboard as candidate")
+        register_checkerboard_button.setObjectName("opticalPoseRegisterCheckerboardReference")
+        register_checkerboard_button.setToolTip(
+            "Package the stored Checkerboard stereoCalibrate R,t (all 6 DOF) as an immutable "
+            "candidate, anchored to the current prior's left pose, so Combine candidates can mix "
+            "specific axes from it -- e.g. take only its translation alongside a rotation-only "
+            "Horizon/Drone-yaw solve. This does not recalculate or overwrite the stored profile."
+        )
+        register_checkerboard_button.clicked.connect(
+            lambda _checked=False: register_reference_candidate("checkerboard")
+        )
+        register_pixhawk_button = QtWidgets.QPushButton("Register Pixhawk + RTK (live) as candidate")
+        register_pixhawk_button.setObjectName("opticalPoseRegisterPixhawkReference")
+        register_pixhawk_button.setToolTip(
+            "Package the current live RTK GNSS baseline as a translation-only candidate (rotation "
+            "is not packaged here -- the attitude quaternion is body-FRD, not camera-RDF) so "
+            "Combine candidates can mix its N/E/D with a separately solved rotation."
+        )
+        register_pixhawk_button.clicked.connect(
+            lambda _checked=False: register_reference_candidate("pixhawk_rtk")
         )
         add_method_tab(
             "Existing calibration",
@@ -4203,7 +4317,7 @@ class OpticalPosePane(QtWidgets.QWidget):
             "bundle in Calibration first, then use this reference as the base pose for "
             "optical-pose candidates. The active profile and baseline are shown below in the "
             "common comparison card.",
-            (),
+            (register_checkerboard_button, register_pixhawk_button),
         )
 
         combine_button = make_solver_button(
@@ -4235,8 +4349,37 @@ class OpticalPosePane(QtWidgets.QWidget):
                 "Explicit source candidates for the combined pose. Check each source; the owner "
                 "retains their IDs, hashes, shared prior, and quality evidence."
             )
-            self.combine_candidate_list.itemChanged.connect(self._refresh_combine_action)
+            self.combine_candidate_list.itemChanged.connect(self._on_combine_candidates_changed)
             page_layout.addWidget(self.combine_candidate_list)
+
+            dof_note = QtWidgets.QLabel(
+                "Per checked candidate, which axes it contributes to the combined pose. Defaults to "
+                "every axis that candidate actually observed; uncheck an axis to exclude it (e.g. take "
+                "only Checkerboard's translation while Horizon supplies Roll/Pitch). An axis checked by "
+                "more than one candidate blocks the build below until resolved."
+            )
+            dof_note.setObjectName("compactContract")
+            dof_note.setWordWrap(True)
+            page_layout.addWidget(dof_note)
+            self.combine_dof_table = QtWidgets.QTableWidget(0, 7)
+            self.combine_dof_table.setObjectName("opticalPoseCombineDofTable")
+            self.combine_dof_table.setHorizontalHeaderLabels(
+                ["Candidate", "Roll", "Pitch", "Yaw", "N", "E", "D"]
+            )
+            self.combine_dof_table.verticalHeader().setVisible(False)
+            self.combine_dof_table.horizontalHeader().setSectionResizeMode(
+                0, QtWidgets.QHeaderView.Stretch
+            )
+            for column in range(1, 7):
+                self.combine_dof_table.horizontalHeader().setSectionResizeMode(
+                    column, QtWidgets.QHeaderView.ResizeToContents
+                )
+            self.combine_dof_table.setMinimumHeight(82)
+            self.combine_dof_table.setMaximumHeight(160)
+            self.combine_dof_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            self.combine_dof_table.itemChanged.connect(self._refresh_combine_action)
+            page_layout.addWidget(self.combine_dof_table)
+
             self.combine_candidate_status = QtWidgets.QLabel(
                 "No candidates checked · select at least two"
             )
@@ -4458,6 +4601,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         }
         if command_id == "alignment.pose.solve_combined":
             payload["candidate_ids"] = list(self.combine_candidate_ids())
+            payload["candidate_dofs"] = self.combine_candidate_dofs()
         if command_id in {
             "alignment.pose.auto_select_horizon",
             "alignment.pose.auto_select_mountain",
@@ -4535,6 +4679,12 @@ class OpticalPosePane(QtWidgets.QWidget):
         metadata.setdefault("native_height", detail.get("height", image.height()))
         metadata.setdefault("overlay_applied", detail.get("overlay_applied", False))
         previous_identity = (view.frame_id, view.image_sha256)
+        # Drone RTK multi-view uses one target mark per captured frame. Keep
+        # the previous target mark visible across a new frozen burst until
+        # the operator explicitly presses Clear. The view
+        # keeps its exported frame identity pinned to the old evidence, so a
+        # normal single-frame solver cannot silently consume stale pixels.
+        preserve_annotations = bool(view.annotation_points(AnnotationMode.TARGET))
         try:
             self._auto_accept_in_progress = True
             try:
@@ -4543,6 +4693,7 @@ class OpticalPosePane(QtWidgets.QWidget):
                     frame_id=frame_id,
                     image_sha256=str(detail.get("image_sha256", detail.get("sha256", "")) or "") or None,
                     metadata=metadata,
+                    preserve_annotations=preserve_annotations,
                 )
             finally:
                 self._auto_accept_in_progress = False
@@ -4561,8 +4712,14 @@ class OpticalPosePane(QtWidgets.QWidget):
                     "Confidence / inliers / residual / detector: --"
                 )
         digest = str(view.image_sha256 or "")
+        retained_note = (
+            " · previous target mark retained; Clear to edit"
+            if view.annotations_stale
+            else ""
+        )
         label.setText(
             f"{side.title()}: {frame_id} · {image.width()}×{image.height()} · sha256={digest[:12]}…"
+            f"{retained_note}"
         )
 
     @staticmethod
@@ -4819,7 +4976,8 @@ class OpticalPosePane(QtWidgets.QWidget):
             button.style().polish(button)
         if manual_button is not None:
             manual_button.setToolTip(
-                "Active manual mode: click the frozen native image to add points."
+                "Active manual mode. Click the frozen native image to add points. "
+                + self._manual_mode_tooltips.get(mode, "")
             )
 
     def _select_manual_annotation_mode(self, mode: AnnotationMode | str) -> None:
@@ -4835,6 +4993,16 @@ class OpticalPosePane(QtWidgets.QWidget):
         )
         for view in self.annotation_views.values():
             view.clear_annotations(mode)
+        # A stale automatic suggestion for this mode would otherwise keep
+        # reappearing in the snapshot after the manual points it produced
+        # are gone. "ridge" annotations come from Mountain suggestions;
+        # "target" has no automatic-suggestion counterpart, so this is a
+        # harmless no-op for it server-side.
+        suggestion_mode = "mountain" if mode == AnnotationMode.RIDGE.value else mode
+        self.command_requested.emit(
+            "alignment.pose.clear_auto_suggestions",
+            {"mode": suggestion_mode},
+        )
 
     def set_readiness(self, readiness: Mapping[str, object]) -> None:
         for key, widget in self.readiness_values.items():
@@ -5027,21 +5195,116 @@ class OpticalPosePane(QtWidgets.QWidget):
                 candidate_list.addItem(item)
         finally:
             candidate_list.blockSignals(False)
+        self._on_combine_candidates_changed()
+
+    def combine_candidate_dofs(self) -> dict[str, list[str]]:
+        """Per checked candidate, only the axes explicitly kept checked."""
+
+        table = getattr(self, "combine_dof_table", None)
+        if table is None:
+            return {}
+        axis_names = ("roll_deg", "pitch_deg", "yaw_deg", "north_m", "east_m", "down_m")
+        result: dict[str, list[str]] = {}
+        for row in range(table.rowCount()):
+            header_item = table.item(row, 0)
+            if header_item is None:
+                continue
+            candidate_id = str(header_item.data(QtCore.Qt.UserRole) or "")
+            if not candidate_id:
+                continue
+            checked: list[str] = []
+            for column, axis in enumerate(axis_names, start=1):
+                cell = table.item(row, column)
+                if cell is not None and cell.checkState() == QtCore.Qt.Checked:
+                    checked.append(axis)
+            result[candidate_id] = checked
+        return result
+
+    def _sync_combine_dof_table(self) -> None:
+        """Rebuild per-candidate axis rows for the currently checked candidates.
+
+        Defaults each axis to checked when the candidate actually observed
+        it; an axis the candidate never observed is shown unchecked and
+        disabled since it has nothing valid to contribute there. An axis an
+        operator already unchecked is preserved across a rebuild triggered
+        by checking/unchecking a different candidate.
+        """
+
+        table = getattr(self, "combine_dof_table", None)
+        if table is None:
+            return
+        axis_names = ("roll_deg", "pitch_deg", "yaw_deg", "north_m", "east_m", "down_m")
+        previous: dict[str, set[str]] = {}
+        for row in range(table.rowCount()):
+            header_item = table.item(row, 0)
+            if header_item is None:
+                continue
+            candidate_id = str(header_item.data(QtCore.Qt.UserRole) or "")
+            previous[candidate_id] = {
+                axis_names[column - 1]
+                for column in range(1, 7)
+                if (cell := table.item(row, column)) is not None
+                and cell.checkState() == QtCore.Qt.Checked
+            }
+        checked_ids = self.combine_candidate_ids()
+        table.blockSignals(True)
+        try:
+            table.setRowCount(len(checked_ids))
+            for row, candidate_id in enumerate(checked_ids):
+                candidate = self._candidate_rows.get(candidate_id, {})
+                method = str(candidate.get("method", candidate.get("solver", "candidate")) or "candidate")
+                header_item = QtWidgets.QTableWidgetItem(f"{method} · {candidate_id}")
+                header_item.setFlags(QtCore.Qt.ItemIsEnabled)
+                header_item.setData(QtCore.Qt.UserRole, candidate_id)
+                table.setItem(row, 0, header_item)
+                observable = candidate.get("observable_dof")
+                observable = observable if isinstance(observable, Mapping) else {}
+                kept = previous.get(candidate_id)
+                for column, axis in enumerate(axis_names, start=1):
+                    cell = QtWidgets.QTableWidgetItem()
+                    if bool(observable.get(axis)):
+                        cell.setFlags(QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+                        default_checked = axis in kept if kept is not None else True
+                        cell.setCheckState(QtCore.Qt.Checked if default_checked else QtCore.Qt.Unchecked)
+                    else:
+                        cell.setFlags(QtCore.Qt.NoItemFlags)
+                        cell.setCheckState(QtCore.Qt.Unchecked)
+                    table.setItem(row, column, cell)
+        finally:
+            table.blockSignals(False)
+
+    def _on_combine_candidates_changed(self, *_args: object) -> None:
+        self._sync_combine_dof_table()
         self._refresh_combine_action()
 
     def _refresh_combine_action(self, *_args: object) -> None:
         selected_count = len(self.combine_candidate_ids())
         button = self.solver_buttons.get("alignment.pose.solve_combined")
-        if button is not None:
-            button.setEnabled(selected_count >= 2)
         status = getattr(self, "combine_candidate_status", None)
+        overlap: set[str] = set()
+        if selected_count >= 2:
+            claimed_by: dict[str, str] = {}
+            for candidate_id, axes in self.combine_candidate_dofs().items():
+                for axis in axes:
+                    owner = claimed_by.get(axis)
+                    if owner is not None and owner != candidate_id:
+                        overlap.add(axis)
+                    claimed_by[axis] = candidate_id
+        if button is not None:
+            button.setEnabled(selected_count >= 2 and not overlap)
         if status is None:
             return
         if selected_count < 2:
             status.setText(f"{selected_count} candidate checked · select at least two")
+        elif overlap:
+            status.setText(
+                "Axis claimed by more than one candidate: "
+                + ", ".join(sorted(overlap))
+                + " · uncheck one"
+            )
         else:
             status.setText(
-                f"{selected_count} candidates checked · owner will verify shared prior, exact K,D, and non-overlapping DOF"
+                f"{selected_count} candidates checked · owner will verify shared prior and exact K,D"
             )
 
     def _apply_candidate_dof_defaults(self) -> None:
@@ -5155,30 +5418,14 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         # The Alignment page itself lives in an outer scroll area.  Give the
         # R,t surface the remaining viewport height so hiding the bottom
         # Diagnostics dock expands the camera/annotation scroll surface all
-        # the way to the window bottom; the inner 16:9 image contract remains
-        # unchanged and can still scroll to the method controls below it.
+        # the way to the window bottom. The LRF card is part of that same
+        # scroll content, so it does not remain pinned as a separate footer.
         self.operation_tabs.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding,
         )
         layout.addWidget(self.operation_tabs, 1)
         self.indicators: dict[str, StatusIndicator] = {}
-
-        lrf_group = QtWidgets.QGroupBox("LRF (Laser Range Finder)")
-        lrf_layout = QtWidgets.QGridLayout(lrf_group)
-        self.lrf_indicators: dict[str, StatusIndicator] = {}
-        for index, (key, label) in enumerate(
-            (("lrf.left", "CAM L"), ("lrf.right", "CAM R"))
-        ):
-            indicator = StatusIndicator(label)
-            self.lrf_indicators[key] = indicator
-            lrf_layout.addWidget(indicator, 0, index)
-        # On-demand only: reads open/close their own control-port connection,
-        # so a query runs on click instead of a continuous background poll.
-        lrf_refresh_button = _command_button("Refresh LRF", "alignment.query_lrf", invoke_command)
-        self.operation_buttons["alignment.query_lrf"] = lrf_refresh_button
-        lrf_layout.addWidget(lrf_refresh_button, 0, 2)
-        layout.addWidget(lrf_group)
 
         attitude_group = QtWidgets.QGroupBox("Attitude")
         attitude_layout = QtWidgets.QVBoxLayout(attitude_group)
@@ -5321,6 +5568,26 @@ class AlignmentWorkspace(QtWidgets.QWidget):
         self.operation_buttons.update(self.optical_pose_pane.solver_buttons)
         self.operation_buttons["alignment.pose.apply_candidate"] = self.optical_pose_pane.apply_button
         self.operation_buttons["alignment.pose.revert"] = self.optical_pose_pane.revert_button
+
+        # Keep LRF status in the same scrollable content as the R,t controls.
+        # It is an on-demand read: each refresh opens/closes its own control
+        # port instead of starting a continuous background poll.
+        lrf_group = QtWidgets.QGroupBox("LRF (Laser Range Finder)")
+        lrf_group.setObjectName("alignmentLrfGroup")
+        lrf_layout = QtWidgets.QGridLayout(lrf_group)
+        self.lrf_group = lrf_group
+        self.lrf_indicators: dict[str, StatusIndicator] = {}
+        for index, (key, label) in enumerate(
+            (("lrf.left", "CAM L"), ("lrf.right", "CAM R"))
+        ):
+            indicator = StatusIndicator(label)
+            self.lrf_indicators[key] = indicator
+            lrf_layout.addWidget(indicator, 0, index)
+        lrf_refresh_button = _command_button("Refresh LRF", "alignment.query_lrf", invoke_command)
+        self.operation_buttons["alignment.query_lrf"] = lrf_refresh_button
+        lrf_layout.addWidget(lrf_refresh_button, 0, 2)
+        self.optical_pose_pane.layout().addWidget(lrf_group)
+
         optical_pose_scroll = QtWidgets.QScrollArea()
         optical_pose_scroll.setObjectName("alignmentOpticalPoseScroll")
         optical_pose_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -5896,6 +6163,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 "Capture & Compute",
                 (
                     ("calibration.capture_images", "Capture"),
+                    ("calibration.capture_images_wiris_ftp", "Capture (WIRIS FTP)"),
+                    ("calibration.capture_images_wiris_ftp_oz", "Capture (WIRIS FTP OZ)"),
                     ("calibration.run_intrinsic", "Run calibration (K,D)"),
                     ("calibration.run_extrinsics", "Calculate R,t"),
                     ("calibration.save_intrinsics", "Save Intrinsics"),
@@ -5910,6 +6179,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                     ("calibration.apply_bundle", "Apply (K,D + R,t)"),
                 ),
             ),
+            ("Validation", ()),
         )
         for tab_label, actions in operation_sections:
             page = QtWidgets.QWidget()
@@ -5960,9 +6230,216 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 auto_layout.addWidget(auto_target, 0, 3)
                 auto_layout.addWidget(auto_button, 1, 0, 1, 4)
                 page_layout.addWidget(auto_group)
+            elif tab_label == "Validation":
+                page_layout.addWidget(self._build_checkerboard_validation_group())
             page_layout.addStretch(1)
             operation_tabs.addTab(page, tab_label)
         return operation_tabs
+
+    def _build_checkerboard_validation_group(self) -> QtWidgets.QGroupBox:
+        """Recompute K,D (and R,t) from random subsets of the scanned pairs
+        and report how much the result varies, as a check on calibration
+        stability -- distinct from the main Capture & Compute/Load & Apply
+        flow, which only ever produces or loads one "official" result.
+
+        This talks to the owner only through the payload-in/result-out
+        ``*_workstation_checkerboard_validation_*`` facade methods; it does
+        not reach into the legacy panel's own hidden validation widgets.
+        """
+
+        group = QtWidgets.QGroupBox("Checkerboard random validation")
+        grid = QtWidgets.QGridLayout(group)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(5)
+        grid.setColumnStretch(1, 1)
+        row = 0
+
+        self.checkerboard_validation_root_edit = QtWidgets.QLineEdit()
+        self.checkerboard_validation_root_edit.setToolTip(
+            "Directory containing left/right checkerboard capture images to validate against."
+        )
+        browse_root_button = QtWidgets.QPushButton("Browse…")
+        browse_root_button.clicked.connect(self._choose_checkerboard_validation_root)
+        grid.addWidget(QtWidgets.QLabel("Image root"), row, 0)
+        grid.addWidget(self.checkerboard_validation_root_edit, row, 1)
+        grid.addWidget(browse_root_button, row, 2)
+        row += 1
+
+        self.checkerboard_validation_mode_combo = QtWidgets.QComboBox()
+        self.checkerboard_validation_mode_combo.addItem("Pixhawk (K,D only)", "pixhawk")
+        self.checkerboard_validation_mode_combo.addItem("Checkerboard (K,D + R,t)", "checkerboard")
+        grid.addWidget(QtWidgets.QLabel("Mode"), row, 0)
+        grid.addWidget(self.checkerboard_validation_mode_combo, row, 1, 1, 2)
+        row += 1
+
+        scan_button = QtWidgets.QPushButton("Scan")
+        scan_button.clicked.connect(self._scan_checkerboard_validation)
+        self.checkerboard_validation_scan_label = QtWidgets.QLabel("--")
+        self.checkerboard_validation_scan_label.setWordWrap(True)
+        grid.addWidget(scan_button, row, 0)
+        grid.addWidget(self.checkerboard_validation_scan_label, row, 1, 1, 2)
+        row += 1
+
+        self.checkerboard_validation_json_edit = QtWidgets.QLineEdit()
+        self.checkerboard_validation_json_edit.setToolTip(
+            "Existing intrinsics/extrinsics JSON to use as the validation reference, instead of "
+            "capturing and computing a fresh result in Capture & Compute first."
+        )
+        browse_json_button = QtWidgets.QPushButton("Browse…")
+        browse_json_button.clicked.connect(self._choose_checkerboard_validation_json)
+        grid.addWidget(QtWidgets.QLabel("Reference JSON"), row, 0)
+        grid.addWidget(self.checkerboard_validation_json_edit, row, 1)
+        grid.addWidget(browse_json_button, row, 2)
+        row += 1
+        load_json_button = QtWidgets.QPushButton("Load JSON as reference")
+        load_json_button.clicked.connect(self._load_checkerboard_validation_json)
+        grid.addWidget(load_json_button, row, 1, 1, 2)
+        row += 1
+
+        self.checkerboard_validation_random_pair_count_spin = QtWidgets.QSpinBox()
+        self.checkerboard_validation_random_pair_count_spin.setRange(0, 500)
+        self.checkerboard_validation_random_pair_count_spin.setToolTip(
+            "Stereo pairs per random subset run; 0 auto-sizes the same way a normal run does."
+        )
+        self.checkerboard_validation_random_runs_spin = QtWidgets.QSpinBox()
+        self.checkerboard_validation_random_runs_spin.setRange(1, 50)
+        self.checkerboard_validation_random_runs_spin.setValue(5)
+        self.checkerboard_validation_seed_spin = QtWidgets.QSpinBox()
+        self.checkerboard_validation_seed_spin.setRange(0, 999999)
+        self.checkerboard_validation_seed_spin.setToolTip("0 uses a non-deterministic seed.")
+        grid.addWidget(QtWidgets.QLabel("Subset pairs"), row, 0)
+        grid.addWidget(self.checkerboard_validation_random_pair_count_spin, row, 1, 1, 2)
+        row += 1
+        grid.addWidget(QtWidgets.QLabel("Runs"), row, 0)
+        grid.addWidget(self.checkerboard_validation_random_runs_spin, row, 1, 1, 2)
+        row += 1
+        grid.addWidget(QtWidgets.QLabel("Seed"), row, 0)
+        grid.addWidget(self.checkerboard_validation_seed_spin, row, 1, 1, 2)
+        row += 1
+
+        self.checkerboard_validation_random_button = QtWidgets.QPushButton("Run random validation")
+        self.checkerboard_validation_random_button.setToolTip(
+            "Requires a reference result first: load one above, or run a normal capture/compute in "
+            "Capture & Compute. Recomputes K,D (and R,t in Checkerboard mode) from several random "
+            "subsets of the scanned stereo pairs and reports how much the result varies."
+        )
+        self.checkerboard_validation_random_button.clicked.connect(self._run_checkerboard_validation)
+        grid.addWidget(self.checkerboard_validation_random_button, row, 0, 1, 3)
+        row += 1
+
+        self.checkerboard_validation_status_label = QtWidgets.QLabel("계산 결과 없음")
+        self.checkerboard_validation_status_label.setWordWrap(True)
+        grid.addWidget(self.checkerboard_validation_status_label, row, 0, 1, 3)
+        row += 1
+
+        self.checkerboard_validation_results_text = QtWidgets.QPlainTextEdit()
+        self.checkerboard_validation_results_text.setReadOnly(True)
+        self.checkerboard_validation_results_text.setMaximumHeight(160)
+        grid.addWidget(self.checkerboard_validation_results_text, row, 0, 1, 3)
+        row += 1
+
+        save_result_button = QtWidgets.QPushButton("Save result")
+        save_result_button.clicked.connect(self._save_checkerboard_validation_result)
+        apply_result_button = QtWidgets.QPushButton("Apply result")
+        apply_result_button.clicked.connect(self._apply_checkerboard_validation_result)
+        grid.addWidget(save_result_button, row, 0)
+        grid.addWidget(apply_result_button, row, 1)
+
+        self._checkerboard_validation_poll_timer = QtCore.QTimer(self)
+        self._checkerboard_validation_poll_timer.setInterval(700)
+        self._checkerboard_validation_poll_timer.timeout.connect(self._poll_checkerboard_validation)
+        return group
+
+    def _choose_checkerboard_validation_root(self) -> None:
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select checkerboard image root",
+            self.checkerboard_validation_root_edit.text(),
+        )
+        if directory:
+            self.checkerboard_validation_root_edit.setText(directory)
+
+    def _choose_checkerboard_validation_json(self) -> None:
+        path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select reference intrinsics JSON",
+            "",
+            "Intrinsics JSON (*.json);;All files (*)",
+        )
+        if path:
+            self.checkerboard_validation_json_edit.setText(path)
+
+    def _checkerboard_validation_payload(self) -> dict[str, object]:
+        return {
+            "root": self.checkerboard_validation_root_edit.text().strip(),
+            "mode": str(self.checkerboard_validation_mode_combo.currentData() or "pixhawk"),
+            "json_path": self.checkerboard_validation_json_edit.text().strip(),
+            "random_pair_count": self.checkerboard_validation_random_pair_count_spin.value(),
+            "runs": self.checkerboard_validation_random_runs_spin.value(),
+            "seed": self.checkerboard_validation_seed_spin.value(),
+        }
+
+    def _apply_checkerboard_validation_snapshot(self, snapshot: object) -> None:
+        if not isinstance(snapshot, Mapping):
+            return
+        self.checkerboard_validation_scan_label.setText(str(snapshot.get("scan_status") or "--"))
+        self.checkerboard_validation_status_label.setText(str(snapshot.get("status") or "계산 결과 없음"))
+        lines: list[str] = []
+        summary = snapshot.get("summary")
+        if isinstance(summary, Mapping) and summary:
+            lines.append(f"summary: {summary}")
+        run_results = snapshot.get("run_results")
+        if isinstance(run_results, (list, tuple)):
+            lines.extend(str(row) for row in run_results if isinstance(row, Mapping))
+        self.checkerboard_validation_results_text.setPlainText("\n".join(lines))
+        running = bool(snapshot.get("running"))
+        self.checkerboard_validation_random_button.setEnabled(not running)
+        if running:
+            if not self._checkerboard_validation_poll_timer.isActive():
+                self._checkerboard_validation_poll_timer.start()
+        else:
+            self._checkerboard_validation_poll_timer.stop()
+
+    def _scan_checkerboard_validation(self) -> None:
+        method = getattr(self.backend, "configure_workstation_checkerboard_validation", None)
+        if not callable(method):
+            return
+        payload = {
+            "root": self.checkerboard_validation_root_edit.text().strip(),
+            "mode": str(self.checkerboard_validation_mode_combo.currentData() or "pixhawk"),
+        }
+        self._apply_checkerboard_validation_snapshot(method(payload))
+
+    def _load_checkerboard_validation_json(self) -> None:
+        method = getattr(self.backend, "load_workstation_checkerboard_validation_json", None)
+        if not callable(method):
+            return
+        self._apply_checkerboard_validation_snapshot(method(self._checkerboard_validation_payload()))
+
+    def _run_checkerboard_validation(self) -> None:
+        method = getattr(self.backend, "run_workstation_checkerboard_validation", None)
+        if not callable(method):
+            return
+        self._apply_checkerboard_validation_snapshot(method(self._checkerboard_validation_payload()))
+
+    def _poll_checkerboard_validation(self) -> None:
+        method = getattr(self.backend, "workstation_checkerboard_validation_snapshot", None)
+        if not callable(method):
+            self._checkerboard_validation_poll_timer.stop()
+            return
+        self._apply_checkerboard_validation_snapshot(method())
+
+    def _save_checkerboard_validation_result(self) -> None:
+        method = getattr(self.backend, "save_workstation_checkerboard_validation_result", None)
+        if not callable(method):
+            return
+        self._apply_checkerboard_validation_snapshot(method())
+
+    def _apply_checkerboard_validation_result(self) -> None:
+        method = getattr(self.backend, "apply_workstation_checkerboard_validation_result", None)
+        if not callable(method):
+            return
+        self._apply_checkerboard_validation_snapshot(method())
 
     def _connect_camera_panes(self) -> None:
         panel = getattr(self.backend, "panel", self.backend)
@@ -7221,6 +7698,12 @@ class RecordingWorkspace(QtWidgets.QWidget):
                 self.apply_ulog_snapshot(ulog_reader())
             except Exception as exc:
                 self.ulog_status_label.setText(f"ULog status unavailable · {exc}")
+        target_drone_reader = getattr(self.backend, "target_drone_snapshot", None)
+        if callable(target_drone_reader):
+            try:
+                self._apply_target_drone_snapshot(target_drone_reader())
+            except Exception as exc:
+                self.target_stream_state_label.setText(f"Target Drone: status unavailable · {exc}")
         self.refresh_sessions(force=False)
 
     def run_setup_payload(self) -> dict[str, object]:

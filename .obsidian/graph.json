@@ -1,6 +1,6 @@
 {
-  "collapse-filter": true,
-  "search": "",
+  "collapse-filter": false,
+  "search": "README",
   "showTags": false,
   "showAttachments": false,
   "hideUnresolved": false,
@@ -17,6 +17,6 @@
   "repelStrength": 10,
   "linkStrength": 0.776454961381414,
   "linkDistance": 250,
-  "scale": 0.08392812523427436,
+  "scale": 0.2097391545618532,
   "close": false
 }

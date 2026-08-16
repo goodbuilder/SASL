@@ -40,7 +40,7 @@ Matrix3 = tuple[Vector3, Vector3, Vector3]
 
 RAW_CAMERA_PIXELS = "raw_camera_pixels"
 NORMALIZED_IDEAL = "normalized_ideal"
-SUPPORTED_PNP_METHODS = ("ITERATIVE", "EPNP", "SQPNP")
+SUPPORTED_PNP_METHODS = ("ITERATIVE", "EPNP", "SQPNP", "IPPE", "ROBUST_LSQ")
 SUPPORTED_REFINEMENTS = ("LM", "VVS")
 PNP_RANSAC_SEED_SEMANTICS = "opencv_rng_reset_before_each_solver_under_process_lock"
 
@@ -506,6 +506,63 @@ def fixed_center_orientation_ray_residuals(
         expected = _normalize(_subtract(target, center), name="target_los_ned")
         predicted = _normalize(
             _matvec(pose.rotation_ned_from_camera_rdf, ray),
+            name="predicted_ray_ned",
+        )
+        scale = sqrt(weight)
+        residuals.extend((predicted[index] - expected[index]) * scale for index in range(3))
+    return tuple(residuals)
+
+
+def pose_target_ray_residuals(
+    parameters: PoseParametersNed,
+    *,
+    observed_rays_camera_rdf: Iterable[Iterable[Any]],
+    target_points_ned_m: Iterable[Iterable[Any]],
+    weights: Iterable[Any] | None = None,
+) -> tuple[float, ...]:
+    """Return unit-chord residuals for a variable camera center and RPY.
+
+    Each observation is a camera ray paired with a known world-NED target
+    point, for example a Drone RTK position captured at the same instant as
+    the image.  Unlike :func:`fixed_center_orientation_ray_residuals`, the
+    camera center comes from ``parameters`` and is therefore part of the
+    least-squares state.  The residual remains bounded and frame-explicit:
+    predicted camera ray in NED minus the normalized center-to-target LOS.
+    """
+
+    rays = tuple(
+        _normalize(ray, name="observed_rays_camera_rdf")
+        for ray in observed_rays_camera_rdf
+    )
+    targets = tuple(
+        _vector3(point, name="target_points_ned_m")
+        for point in target_points_ned_m
+    )
+    if not rays or len(rays) != len(targets):
+        raise ValueError("pose ray/target correspondences must be non-empty and matched")
+    resolved_weights = (
+        tuple(1.0 for _ray in rays)
+        if weights is None
+        else tuple(_finite_float(value, name="weights") for value in weights)
+    )
+    if len(resolved_weights) != len(rays) or any(value <= 0.0 for value in resolved_weights):
+        raise ValueError("weights must be positive and match ray count")
+
+    pose = parameters.to_camera_pose_ned()
+    residuals: list[float] = []
+    for ray, target, weight in zip(rays, targets, resolved_weights):
+        expected = _normalize(
+            tuple(target[index] - pose.center_ned_m[index] for index in range(3)),
+            name="target_los_ned",
+        )
+        predicted = _normalize(
+            tuple(
+                sum(
+                    pose.rotation_ned_from_camera_rdf[row][column] * ray[column]
+                    for column in range(3)
+                )
+                for row in range(3)
+            ),
             name="predicted_ray_ned",
         )
         scale = sqrt(weight)
@@ -994,6 +1051,7 @@ def _pnp_candidate_from_rt(
     inlier_indices: tuple[int, ...],
     correspondences: PnpCorrespondences,
     config: PnpEnsembleConfig,
+    solution_suffix: str = "",
 ) -> PnpPoseCandidate:
     cv2 = _require_cv2()
     np = _require_numpy()
@@ -1036,7 +1094,7 @@ def _pnp_candidate_from_rt(
         relative_rank_tolerance=config.jacobian_rank_relative_tolerance,
     )
     return PnpPoseCandidate(
-        candidate_id=f"{solver}/{refinement}",
+        candidate_id=f"{solver}/{refinement}{solution_suffix}",
         solver=solver,
         refinement=refinement,
         pose_ned=pose,
@@ -1073,7 +1131,67 @@ def solve_pnp_ensemble(
     )
     candidates: list[PnpPoseCandidate] = []
     failures: list[tuple[str, str]] = []
+
+    def _refine_and_append(
+        method: str,
+        rvec: Any,
+        tvec: Any,
+        inliers: tuple[int, ...],
+        refine_objects: Any,
+        refine_images: Any,
+        solution_suffix: str,
+    ) -> None:
+        for refinement in config.refinements:
+            try:
+                function_name = f"solvePnPRefine{refinement}"
+                if not hasattr(cv2, function_name):
+                    raise PoseSolverDependencyError(
+                        f"installed OpenCV does not provide {function_name}"
+                    )
+                refine_function = getattr(cv2, function_name)
+                refined_rvec, refined_tvec = refine_function(
+                    refine_objects,
+                    refine_images,
+                    camera_matrix,
+                    distortion,
+                    np.asarray(rvec, dtype=np.float64).reshape(3, 1).copy(),
+                    np.asarray(tvec, dtype=np.float64).reshape(3, 1).copy(),
+                )
+                candidates.append(
+                    _pnp_candidate_from_rt(
+                        solver=method,
+                        refinement=refinement,
+                        rotation_vector=refined_rvec,
+                        translation_vector=refined_tvec,
+                        inlier_indices=inliers,
+                        correspondences=correspondences,
+                        config=config,
+                        solution_suffix=solution_suffix,
+                    )
+                )
+            except Exception as exc:
+                failures.append((f"{method}/{refinement}{solution_suffix}", str(exc)))
+
     for method in config.methods:
+        if method == "ROBUST_LSQ":
+            # Not a cv2.SOLVEPNP_* flag -- a robust-loss refinement over
+            # every point, seeded from the best candidate found by the other
+            # methods.  Handled once after this loop so it has something to
+            # seed from; see below.
+            continue
+        if method == "IPPE" and geometry.classification != "planar":
+            # IPPE assumes coplanar object points; on non-planar terrain
+            # evidence it is not merely less accurate but not applicable at
+            # all, so skip it rather than let OpenCV fail or silently return
+            # a degenerate pose.
+            failures.append(
+                (
+                    f"{method}/NONE",
+                    "IPPE requires coplanar object points; "
+                    f"geometry classified as {geometry.classification}",
+                )
+            )
+            continue
         try:
             flag = _pnp_flag(cv2, method)
             if config.use_ransac:
@@ -1123,35 +1241,98 @@ def solve_pnp_ensemble(
         inlier_array = np.asarray(inliers, dtype=np.int32)
         refine_objects = objects[inlier_array]
         refine_images = images[inlier_array]
-        for refinement in config.refinements:
+        _refine_and_append(method, rvec, tvec, inliers, refine_objects, refine_images, "")
+
+        if method == "IPPE":
+            # A planar PnP genuinely has (up to) two valid poses; the
+            # single-solution solvePnP/solvePnPRansac path above silently
+            # picks one and discards the other. Recover it directly from
+            # solvePnPGeneric on the same inlier set so a wrong internal
+            # choice does not go unrecoverable -- both become candidates and
+            # reprojection error picks between them like any other pair.
             try:
-                function_name = f"solvePnPRefine{refinement}"
-                if not hasattr(cv2, function_name):
-                    raise PoseSolverDependencyError(
-                        f"installed OpenCV does not provide {function_name}"
-                    )
-                refine_function = getattr(cv2, function_name)
-                refined_rvec, refined_tvec = refine_function(
+                ok_generic, alt_rvecs, alt_tvecs, _errors = cv2.solvePnPGeneric(
                     refine_objects,
                     refine_images,
                     camera_matrix,
                     distortion,
-                    np.asarray(rvec, dtype=np.float64).reshape(3, 1).copy(),
-                    np.asarray(tvec, dtype=np.float64).reshape(3, 1).copy(),
+                    flags=flag,
                 )
+                if ok_generic and alt_rvecs is not None and len(alt_rvecs) > 1:
+                    primary = np.asarray(rvec, dtype=np.float64).reshape(3)
+                    closest_index = min(
+                        range(len(alt_rvecs)),
+                        key=lambda index: float(
+                            np.linalg.norm(np.asarray(alt_rvecs[index]).reshape(3) - primary)
+                        ),
+                    )
+                    alternate_index = 1 if closest_index == 0 else 0
+                    candidates.append(
+                        _pnp_candidate_from_rt(
+                            solver=method,
+                            refinement="NONE",
+                            rotation_vector=alt_rvecs[alternate_index],
+                            translation_vector=alt_tvecs[alternate_index],
+                            inlier_indices=inliers,
+                            correspondences=correspondences,
+                            config=config,
+                            solution_suffix="#alt",
+                        )
+                    )
+                    _refine_and_append(
+                        method,
+                        alt_rvecs[alternate_index],
+                        alt_tvecs[alternate_index],
+                        inliers,
+                        refine_objects,
+                        refine_images,
+                        "#alt",
+                    )
+            except Exception as exc:
+                failures.append((f"{method}/NONE#alt", str(exc)))
+
+    if "ROBUST_LSQ" in config.methods:
+        seed = min(
+            candidates,
+            key=lambda candidate: (
+                candidate.reprojection_p95,
+                candidate.reprojection_rmse,
+                candidate.candidate_id,
+            ),
+            default=None,
+        )
+        if seed is None:
+            failures.append(("ROBUST_LSQ/NONE", "no seed candidate available; every other method failed"))
+        else:
+            try:
+                initial_parameters = pose_parameters_from_camera_pose(seed.pose_ned)
+                lsq_config = PoseLeastSquaresConfig(loss="huber", f_scale=threshold)
+                lsq_result = solve_constrained_pose_least_squares(
+                    initial_parameters,
+                    _full_pose_mask(),
+                    lambda parameters: pose_reprojection_residuals(parameters, correspondences),
+                    config=lsq_config,
+                )
+                if not lsq_result.success:
+                    raise ValueError(f"robust least-squares did not converge: {lsq_result.message}")
+                refined_pose = lsq_result.parameters.to_camera_pose_ned()
+                refined_rotation, refined_translation = opencv_pnp_from_camera_pose_ned(refined_pose)
+                refined_rvec, _jacobian = cv2.Rodrigues(np.asarray(refined_rotation, dtype=np.float64))
                 candidates.append(
                     _pnp_candidate_from_rt(
-                        solver=method,
-                        refinement=refinement,
+                        solver="ROBUST_LSQ",
+                        refinement="NONE",
                         rotation_vector=refined_rvec,
-                        translation_vector=refined_tvec,
-                        inlier_indices=inliers,
+                        translation_vector=np.asarray(refined_translation, dtype=np.float64).reshape(3, 1),
+                        # Every point contributed via the Huber loss, not a
+                        # hard RANSAC inlier/outlier split; report all indices.
+                        inlier_indices=tuple(range(len(objects))),
                         correspondences=correspondences,
                         config=config,
                     )
                 )
             except Exception as exc:
-                failures.append((f"{method}/{refinement}", str(exc)))
+                failures.append(("ROBUST_LSQ/NONE", str(exc)))
     return PnpEnsembleResult(
         candidates=tuple(candidates),
         failures=tuple(failures),

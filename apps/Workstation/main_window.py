@@ -399,6 +399,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._calibration_capture_images,
             ),
             (
+                "calibration.capture_images_wiris_ftp",
+                "Capture (WIRIS FTP)",
+                "Trigger a WIRIS HR still on both cameras and download it via FTP "
+                "into this calibration run, instead of the live RTSP feed.",
+                self._calibration_capture_images_wiris_ftp,
+            ),
+            (
+                "calibration.capture_images_wiris_ftp_oz",
+                "Capture (WIRIS FTP OZ)",
+                "Same as Capture (WIRIS FTP), using the lower-resolution operating-zoom "
+                "still (SIVI) instead of the HR still -- faster, no camera reboot risk.",
+                self._calibration_capture_images_wiris_ftp_oz,
+            ),
+            (
                 "calibration.auto_capture",
                 "Auto capture",
                 "Start/stop validated automatic checkerboard pair capture through the existing owner.",
@@ -1040,6 +1054,19 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 if not callable(method):
                     raise RuntimeError("frozen-burst import owner is not available")
                 result = method(values)
+            elif command_id == "alignment.pose.capture_burst_wiris_ftp":
+                # Same native-owner boundary as capture_burst: the capture and
+                # FTP download run on a background thread owned by the panel,
+                # not the UI process.
+                method = getattr(self.backend, "optical_pose_capture_burst_wiris_ftp", None)
+                if not callable(method):
+                    raise RuntimeError("WIRIS FTP frozen-burst capture owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.capture_burst_wiris_ftp_oz":
+                method = getattr(self.backend, "optical_pose_capture_burst_wiris_ftp_oz", None)
+                if not callable(method):
+                    raise RuntimeError("WIRIS FTP (OZ) frozen-burst capture owner is not available")
+                result = method(values)
             elif command_id == "alignment.pose.auto_select_horizon":
                 method = getattr(self.backend, "optical_pose_auto_select_horizon", None)
                 if not callable(method):
@@ -1060,11 +1087,61 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 if not callable(method):
                     raise RuntimeError("optical-pose annotation persistence owner is not available")
                 result = method(values)
+            elif command_id == "alignment.pose.clear_auto_suggestions":
+                method = getattr(self.backend, "optical_pose_clear_auto_suggestions", None)
+                if not callable(method):
+                    raise RuntimeError("automatic suggestion clear owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.register_reference":
+                method = getattr(self.backend, "optical_pose_register_reference_candidate", None)
+                if not callable(method):
+                    raise RuntimeError("reference candidate owner is not available")
+                result = method(values)
+            elif command_id == "alignment.mountain_ridge_margin.set":
+                method = getattr(self.backend, "optical_pose_set_mountain_ridge_margin", None)
+                if not callable(method):
+                    raise RuntimeError("Mountain ridge margin owner is not available")
+                result = method(values)
+            elif command_id == "alignment.mountain_max_points.set":
+                method = getattr(self.backend, "optical_pose_set_mountain_max_points", None)
+                if not callable(method):
+                    raise RuntimeError("Mountain max points owner is not available")
+                result = method(values)
+            elif command_id == "alignment.pose.import_terrain":
+                method = getattr(self.backend, "optical_pose_import_terrain", None)
+                if not callable(method):
+                    raise RuntimeError("terrain GeoTIFF import owner is not available")
+                source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+                    self,
+                    "Import terrain GeoTIFF",
+                    "",
+                    "GeoTIFF (*.tif *.tiff);;All files (*)",
+                )
+                if not source_path:
+                    self.statusBar().showMessage("Terrain GeoTIFF import cancelled", 2500)
+                    return
+                vertical_datum, confirmed = QtWidgets.QInputDialog.getText(
+                    self,
+                    "Terrain vertical datum",
+                    "Vertical datum of this GeoTIFF's height values (e.g. EGM96, WGS84 "
+                    "ellipsoid). Leave blank only if genuinely unknown -- Terrain PnP "
+                    "solving stays blocked until this is set to something other than "
+                    "unknown.",
+                )
+                if not confirmed:
+                    self.statusBar().showMessage("Terrain GeoTIFF import cancelled", 2500)
+                    return
+                values["path"] = source_path
+                values["vertical_datum"] = vertical_datum.strip() or "unknown"
+                result = method(values)
             else:
                 method_name = {
                     "alignment.pose.solve_horizon": "optical_pose_solve_horizon",
+                    "alignment.pose.solve_terrain": "optical_pose_solve_terrain",
                     "alignment.pose.solve_gnss_mountain": "optical_pose_solve_gnss_mountain",
                     "alignment.pose.solve_drone_yaw": "optical_pose_solve_drone_yaw",
+                    "alignment.pose.initialize_telemetry": "optical_pose_initialize_telemetry",
+                    "alignment.pose.solve_drone_rtk_multiview": "optical_pose_solve_drone_rtk_multiview",
                     "alignment.pose.solve_combined": "optical_pose_solve_combined",
                 }.get(command_id)
                 method = getattr(self.backend, str(method_name), None)
@@ -1085,6 +1162,38 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                         )
                         return
                     values["drone_yaw_path"] = source_path
+                if command_id == "alignment.pose.solve_drone_rtk_multiview" and not (
+                    values.get("drone_rtk_multiview")
+                    or values.get("multiview")
+                    or values.get("drone_rtk_multiview_path")
+                ):
+                    source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+                        self,
+                        "Import Drone RTK multi-view observation JSON",
+                        "",
+                        "JSON (*.json);;All files (*)",
+                    )
+                    if not source_path:
+                        self.statusBar().showMessage(
+                            "Drone RTK multi-view import cancelled", 2500
+                        )
+                        return
+                    values["drone_rtk_multiview_path"] = source_path
+                if command_id == "alignment.pose.solve_terrain" and not (
+                    values.get("correspondences") or values.get("correspondences_path")
+                ):
+                    source_path, _selected_filter = QtWidgets.QFileDialog.getOpenFileName(
+                        self,
+                        "Import Terrain PnP object-point correspondences JSON",
+                        "",
+                        "JSON (*.json);;All files (*)",
+                    )
+                    if not source_path:
+                        self.statusBar().showMessage(
+                            "Terrain PnP correspondence import cancelled", 2500
+                        )
+                        return
+                    values["correspondences_path"] = source_path
                 result = method(values)
         except Exception as exc:
             # This is the *only* feedback when a command never produces a
@@ -1127,7 +1236,10 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _handle_inspector_command(self, command_id: str, payload: object) -> None:
         """Route Inspector actions through the same owner/command boundaries."""
 
-        if str(command_id).startswith("alignment.pose."):
+        if str(command_id).startswith("alignment.pose.") or command_id in (
+            "alignment.mountain_ridge_margin.set",
+            "alignment.mountain_max_points.set",
+        ):
             self._handle_optical_pose_command(command_id, payload)
             return
         try:
@@ -1372,6 +1484,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _calibration_capture_images(self) -> object:
         return self.backend.calibration_capture_images()
+
+    def _calibration_capture_images_wiris_ftp(self) -> object:
+        return self.backend.calibration_capture_images_wiris_ftp()
+
+    def _calibration_capture_images_wiris_ftp_oz(self) -> object:
+        return self.backend.calibration_capture_images_wiris_ftp_oz()
 
     def _calibration_toggle_auto_capture(self) -> object:
         panel = getattr(self.backend, "panel", None)

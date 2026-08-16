@@ -170,7 +170,12 @@ The fourth local tab of Alignment is `Optical pose`. Its workflow is:
    OpenCV pixels (`u` right, `v` down). The frozen reference viewport is fixed at 16:9 with
    a center crop (no side margins); this presentation transform does not alter saved
    coordinates, and a small red hover dot shows the native pixel under the pointer.
-3. Select `Manual Horizon` or `Manual Mountain` to mark points directly. The corresponding
+3. Select `Manual Horizon`, `Manual Mountain`, or `Manual Target` to mark points directly.
+   `Manual Horizon` marks two horizon points for Roll/Pitch only. `Manual Mountain` marks
+   same-order terrain correspondences for the GNSS + Mountain metric `R,t` solve (at least
+   four pairs). `Manual Target` marks one Drone RTK target pixel per image for the
+   single-target Drone RTK Yaw fallback; full multi-view `R,t` uses imported observations.
+   The corresponding
    `Auto Horizon Roll/Pitch` and `Auto Mountain PnP` buttons remain available after manual
    marking; they run the owner solver over the frozen evidence. Selecting Horizon disables
    the Yaw DOF because a horizon cannot observe Yaw. Use Mountain PnP or live target-Drone

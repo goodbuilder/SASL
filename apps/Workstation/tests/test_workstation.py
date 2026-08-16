@@ -98,6 +98,30 @@ def test_calibration_setup_settings_round_trip(tmp_path: Path) -> None:
     assert loaded.calibration_validation_seed == 1234
 
 
+def test_save_settings_failure_leaves_existing_settings_file_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # save_settings() writes via a temp file + os.replace(); if the replace
+    # step itself fails partway (disk full, killed process), the previously
+    # saved settings file must stay exactly as it was -- never truncated or
+    # half-written, since load_settings() has no error handling around
+    # json.loads() and runs unconditionally at app startup.
+    from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
+
+    path = tmp_path / "settings.json"
+    save_settings(AppSettings(calibration_zoom_level=11), path)
+    original_bytes = path.read_bytes()
+
+    monkeypatch.setattr(os, "replace", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk full")))
+
+    with pytest.raises(OSError):
+        save_settings(AppSettings(calibration_zoom_level=99), path)
+
+    assert path.read_bytes() == original_bytes
+    assert list(tmp_path.glob(".*.tmp")) == []
+    assert load_settings(path).calibration_zoom_level == 11
+
+
 def test_rtp_timing_tracker_matches_depay_output_by_pts_and_discards_merged_markers() -> None:
     from Workstation.workstation_core.yolo_stream import GstRtpTimingTracker, RtpFrameTiming
 
@@ -5205,7 +5229,7 @@ def test_workstation_uses_source_backed_alignment_calibration_and_recording_page
     assert [
         window.calibration.operation_tabs.tabText(index)
         for index in range(window.calibration.operation_tabs.count())
-    ] == ["Capture & Compute", "Load & Apply"]
+    ] == ["Capture & Compute", "Load & Apply", "Validation"]
     backend.calls.clear()
     window.calibration.zoom_query_button.click()
     for command_id in (
@@ -6009,7 +6033,7 @@ def test_workstation_exposes_measurement_and_calibration_setup_controls() -> Non
     app.processEvents()
 
 
-def test_calibration_workspace_omits_validation_controls() -> None:
+def test_calibration_workspace_exposes_validation_controls() -> None:
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     backend = _FakeBackend()
     window = WorkstationMainWindow(backend=backend)
@@ -6019,9 +6043,15 @@ def test_calibration_workspace_omits_validation_controls() -> None:
     assert [
         window.calibration.operation_tabs.tabText(index)
         for index in range(window.calibration.operation_tabs.count())
-    ] == ["Capture & Compute", "Load & Apply"]
-    assert not hasattr(window.calibration, "validation_run_model")
-    assert not hasattr(window.calibration, "validation_run_status")
+    ] == ["Capture & Compute", "Load & Apply", "Validation"]
+    # The checkerboard random-validation workflow (load/run/save/apply) was
+    # fully implemented in calibration_controller.py/standalone_gui.py from
+    # early on, but never had a way to reach it from this navigation-based
+    # UI -- only from the legacy panel's own hidden widgets. These controls
+    # are the payload-in/result-out surface added to close that gap.
+    assert hasattr(window.calibration, "checkerboard_validation_root_edit")
+    assert hasattr(window.calibration, "checkerboard_validation_status_label")
+    assert hasattr(window.calibration, "checkerboard_validation_random_button")
 
     window.close()
     window.deleteLater()
