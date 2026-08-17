@@ -264,16 +264,88 @@ the settings file. Use Base receiver discovery or confirm the connected F9P devi
 firmware before field operation.
 
 Automatic Horizon detection can confuse clouds, trees, roofs, or multiple strong boundaries
-with the sky/terrain edge; inspect its confidence, residual, and overlay before approval. It
-uses a flat, unrefracted horizon model and observes Roll/Pitch only. Automatic Mountain matching
-depends on shared visible texture and can be weak in fog, low-texture terrain, vegetation, or
-repeated patterns; a failure or low-confidence result should be handled with manual clicks.
-Mountain auto-selection does not create terrain heights or 3-D PnP correspondences and does not
-replace the existing GNSS-baseline rotation solver. Terrain PnP still requires explicit 3-D
-object points and an imported GeoTIFF with a declared vertical datum.
+with the sky/terrain edge; inspect its confidence, residual, and overlay before approval. Only
+a physical/geometric horizon compatible with the selected `horizon_model` is a valid input --
+a mountain ridge, building skyline, or tree line is not; use the Mountain method for a ridge.
+Automatic Mountain matching depends on shared visible texture and can be weak in fog,
+low-texture terrain, vegetation, or repeated patterns; a failure or low-confidence result
+should be handled with manual clicks. Mountain auto-selection does not create terrain heights
+or 3-D PnP correspondences and does not replace the GNSS-baseline rotation solver. Terrain PnP
+still requires explicit 3-D object points and an imported GeoTIFF with a declared vertical
+datum.
+
+Atmospheric refraction is not modeled anywhere in Horizon or Mountain. `spherical_geometric`
+Horizon candidates only correct the unrefracted, purely geometric Earth-curvature dip; no
+refraction coefficient is applied or estimated. The GNSS-antenna-to-optical-center lever arm is
+not automatically estimated anywhere in this codebase; without an explicit calibrated offset it
+remains `UNMODELED` (zero-vector proxy) and is a real systematic uncertainty in the Mountain
+metric baseline, not a solved unknown.
+
+## Optical-Pose Horizon and Mountain Methods
+
+Both Horizon and Mountain are geometry-from-evidence methods, not PnP: neither consumes a known
+3-D landmark or terrain height, and neither performs a 3-D-to-2-D reprojection. Metrics named
+`reprojection_error_px` therefore only ever appear for genuine PnP methods (Terrain PnP); Horizon
+and Mountain instead report `*_rms_normalized`/`*_rms_px_equivalent` (Horizon, a line/model
+fit-quality metric) and `sampson_rms_normalized`/`sampson_rms_px_equivalent` (Mountain, a
+normalized Sampson epipolar-coplanarity metric). Neither metric is a statistical pose
+uncertainty.
+
+**Horizon.** A fitted image horizon line constrains only the projective direction of gravity in
+the camera frame, i.e. Roll and Pitch; Yaw and the optical-center position are never observable
+from a horizon and are always copied unchanged from the prior/anchor pose. The prior's expected
+gravity direction is used only to resolve the `g` vs `-g` projective sign ambiguity of the fitted
+line -- it is never the source of the recovered Roll/Pitch value, and changing the prior Yaw (or
+any DOF that does not flip the sign) never changes the recovered Roll/Pitch. Two horizon models
+are supported and always recorded on the candidate as `horizon_model`: `flat_local` (`g.r=0`,
+the historical default) and `spherical_geometric` (`g.r=sin(dip)`, where `dip` is the
+unrefracted spherical-Earth horizon dip from `geometric_horizon_dip_rad(camera_height_m)`).
+`spherical_geometric` requires an explicit `camera_height_above_reference_surface_m` -- GNSS
+ellipsoid altitude is never automatically substituted for this value, because the two are not
+the same physical quantity in general. For a manual two-endpoint annotation, the interpolated
+samples between the two clicked endpoints are not independent observations, so a small
+`rms_normalized` must never be read as proof of small pose uncertainty; instead the candidate
+reports `*_roll_sensitivity_1px_deg`/`*_pitch_sensitivity_1px_deg`, the worst-case Roll/Pitch
+change from an independent +/-1px perturbation of each endpoint coordinate one axis at a time.
+Endpoints closer together than 25% of the image width are rejected outright, since a short
+endpoint baseline amplifies click noise into a large angular error.
+
+**Mountain.** Same-order left/right frozen `(u,v)` clicks (or accepted auto-suggestions) supply
+paired image bearings; capture-time GNSS supplies a metric baseline; the selected Left absolute
+pose supplies the world-frame anchor. The *direction* of that baseline conditions a two-stage
+robust epipolar-rotation fit (`(u,v)` correspondences), while the baseline's *metric length* only
+scales the resulting translation -- the fitted rotation and its normalized Sampson residual are
+provably invariant to the baseline's metric length. Correspondences are classified inlier/outlier
+by a normalized Sampson threshold after a soft-L1 seed solve, and the candidate is only
+`apply_eligible` when the final fit has full rotation rank, a bounded Jacobian condition number,
+and a sufficient inlier count/ratio; GNSS translation is only `apply_eligible` when both Left and
+Right report `RTK_FIXED`. Mountain never measures the Left absolute pose -- it remains the
+prior/anchor -- so a candidate's `left_anchor_pose_sha256` input hash changes whenever the
+selected Left anchor changes, even for identical pixels and GNSS baseline; UI review must treat
+such a candidate as anchor-dependent, not as an independent absolute-pose measurement. The GNSS
+antenna is not assumed to be the camera optical center: without an explicit
+`lever_arm_baseline_correction_left_rdf_m` override the candidate's `lever_arm_status` is
+`UNMODELED` and the raw antenna baseline is used as an optical-baseline proxy; this module never
+estimates that correction automatically.
+
+Frozen Mountain evidence resolves its GNSS baseline from the Drone RTK Capture Observation bound
+to that exact frozen burst (or from an explicit payload override), never from whatever GNSS is
+live on the panel at solve time -- a later live-GPS change cannot silently retarget an already
+frozen Mountain image.
 
 ## Change Log
 
+- 2026-08-17: Hardened optical-pose Mountain and Horizon evidence/geometry. Mountain now
+  resolves its GNSS baseline from the frozen burst's own Drone RTK Capture Observation (never
+  from live panel GNSS), fits relative rotation with a baseline-scale-invariant normalized
+  Sampson residual and a robust soft-L1-seed/inlier-refit/rank-and-condition-gated solve, records
+  `left_anchor_pose_sha256` and an explicit `lever_arm_status` (`UNMODELED` unless a calibrated
+  correction is supplied), and no longer reports a `reprojection_error_px` metric it never
+  computed. Horizon gained an explicit `flat_local`/`spherical_geometric` model selection (the
+  spherical model requires an explicit `camera_height_above_reference_surface_m` and is never
+  fed GNSS altitude automatically), documented that its expected-gravity prior only resolves a
+  sign ambiguity, and added `*_roll_sensitivity_1px_deg`/`*_pitch_sensitivity_1px_deg` so a
+  small line-fit RMS from a two-point manual click is never read as a pose-uncertainty proof.
 - 2026-08-17: Clarified that Telemetry ideal disparity derives `Z` automatically from the
   P1/P2 baseline midpoint to Drone GNSS and does not accept a user-entered target distance.
 - 2026-08-17: Split optical-pose Drone alignment into a reviewed Telemetry initialization

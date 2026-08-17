@@ -16,6 +16,7 @@ import json
 import math
 import time
 import uuid
+from dataclasses import fields as _dataclass_fields
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -50,20 +51,23 @@ from Workstation.workstation_core.optical_pose import (
     apply_selected_dofs,
     boresight_relative_yaw_right_minus_left_deg,
     estimate_drone_yaw_deg,
+    geometric_horizon_dip_rad,
     pose_parameters_from_camera_pose,
     stereo_pose_from_absolute,
 )
 from Workstation.workstation_core.baseline_alignment import baseline_from_gps
 from Workstation.workstation_core.ideal_disparity import target_distance_from_gps
 from Workstation.workstation_core.pose_solvers import (
+    MountainRotationConfig,
     PnpCorrespondences,
     fit_normalized_horizon_line,
     fixed_center_orientation_ray_residuals,
     pose_target_ray_residuals,
     pose_reprojection_residuals,
-    solve_known_baseline_rotation,
     solve_constrained_pose_least_squares,
+    solve_mountain_relative_rotation_robust,
     solve_pnp_ensemble,
+    solve_spherical_horizon_roll_pitch,
 )
 from Workstation.workstation_core.recording_session import session_id_now
 from Workstation.workstation_core.run_evidence import canonical_json_bytes
@@ -224,6 +228,26 @@ def _gps_state_observation_mapping(value: Any, *, role: str) -> dict[str, Any] |
     }
 
 
+_GPS_STATE_FIELD_NAMES = frozenset(field.name for field in _dataclass_fields(GpsPositionState))
+
+
+def _gps_state_from_capture_mapping(row: Any) -> GpsPositionState | None:
+    """Reconstruct one immutable ``GpsPositionState`` from stored evidence.
+
+    ``row`` is the JSON-safe deep snapshot produced by
+    ``_gps_state_observation_mapping`` for a *past* Capture, never live
+    telemetry. Returns ``None`` when no usable lat/lon/alt was recorded --
+    the caller must not fabricate a position from a partial snapshot.
+    """
+
+    if not isinstance(row, Mapping):
+        return None
+    if row.get("latitude_deg") is None or row.get("longitude_deg") is None or row.get("altitude_m") is None:
+        return None
+    kwargs = {key: value for key, value in row.items() if key in _GPS_STATE_FIELD_NAMES}
+    return GpsPositionState(**kwargs)
+
+
 def _frame_clock_domain_verified(artifact: NativeFrameArtifact) -> bool:
     """True only when ``artifact.timestamp_s`` is provably host-monotonic.
 
@@ -333,7 +357,15 @@ def _candidate_mapping(candidate: OpticalPoseCandidate) -> dict[str, Any]:
         "left_delta_rpy_deg": [left.roll_deg, left.pitch_deg, left.yaw_deg],
         "right_delta_rpy_deg": [right.roll_deg, right.pitch_deg, right.yaw_deg],
         "relative_delta_yaw_deg": candidate.relative_boresight_yaw_right_minus_left_deg,
-        "residual": residuals.get("angular_residual_rad", residuals.get("reprojection_error_px")),
+        "residual": (
+            residuals.get("angular_residual_rad")
+            if residuals.get("angular_residual_rad") is not None
+            else residuals.get("reprojection_error_px")
+            if residuals.get("reprojection_error_px") is not None
+            else residuals.get("sampson_rms_px_equivalent")
+            if residuals.get("sampson_rms_px_equivalent") is not None
+            else residuals.get("rms_px_equivalent")
+        ),
         "observable_dof": dict(candidate.observability),
         "applicable": True,
         "state": "WARNING" if candidate.warnings else "CANDIDATE",
@@ -673,6 +705,26 @@ class OpticalPoseController:
         self._drone_rtk_observations.append(observation)
         self._append_event("optical_pose_drone_rtk_observation_captured", observation)
         return observation
+
+    def _capture_observation_for_frozen_burst(self) -> dict[str, Any] | None:
+        """Return the Drone-RTK observation captured with the frozen burst.
+
+        Matches on ``burst_id`` (== the frozen left artifact's ``frame_id``)
+        so a later live-GPS change or a later Capture can never be silently
+        substituted for the GNSS evidence that belonged to *this* frozen
+        image. Returns ``None`` for an imported burst (which never appends
+        an observation) or an empty history.
+        """
+
+        left_frozen = self._frozen_frames.get("left")
+        artifact = left_frozen.get("artifact") if isinstance(left_frozen, Mapping) else None
+        burst_id = getattr(artifact, "frame_id", None)
+        if not burst_id:
+            return None
+        for observation in reversed(self._drone_rtk_observations):
+            if observation.get("burst_id") == burst_id:
+                return observation
+        return None
 
     def capture_workstation_optical_pose_burst(
         self,
@@ -1631,6 +1683,95 @@ class OpticalPoseController:
         self._append_event("terrain_geotiff_imported", self._terrain_snapshot)
         return self.workstation_optical_pose_snapshot()
 
+    _HORIZON_CLICK_UNCERTAINTY_PX = 1.0
+    _HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION = 0.25
+    _HORIZON_MODELS = ("flat_local", "spherical_geometric")
+
+    def _solve_horizon_roll_pitch(
+        self,
+        normalized_points: Sequence[tuple[float, float]],
+        *,
+        horizon_model: str,
+        dip_rad: float | None,
+        prior: CameraPoseNed,
+    ) -> tuple[float, float, float, float]:
+        """Return ``(roll_deg, pitch_deg, rms_normalized, max_abs_normalized)``.
+
+        ``flat_local`` treats the horizon as ``g.r=0`` (a flat/unrefracted
+        line fit); the prior's expected gravity only resolves the ``g`` vs
+        ``-g`` projective sign ambiguity, it never supplies the Roll/Pitch
+        value itself. ``spherical_geometric`` instead solves ``g.r=sin(dip)``
+        per sampled ray with a fixed prior Yaw -- Yaw and position are never
+        variables of this fit.
+        """
+
+        before = pose_parameters_from_camera_pose(prior)
+        if horizon_model == "spherical_geometric":
+            assert dip_rad is not None
+            rays = tuple((x, y, 1.0) for x, y in normalized_points)
+            result = solve_spherical_horizon_roll_pitch(
+                rays,
+                dip_rad=dip_rad,
+                prior_roll_deg=before.roll_deg,
+                prior_pitch_deg=before.pitch_deg,
+                prior_yaw_deg=before.yaw_deg,
+            )
+            return result.roll_deg, result.pitch_deg, result.rms_normalized, result.max_abs_normalized
+        expected_gravity = _matvec(
+            _mat_transpose(prior.rotation_ned_from_camera_rdf),
+            (0.0, 0.0, 1.0),
+        )
+        fit = fit_normalized_horizon_line(
+            normalized_points,
+            expected_gravity_camera_rdf=expected_gravity,
+        )
+        return fit.roll_deg, fit.pitch_deg, fit.rms_normalized, fit.max_abs_normalized
+
+    def _horizon_endpoint_sensitivity_deg(
+        self,
+        *,
+        raw_points: Sequence[tuple[float, float]],
+        camera: Any,
+        horizon_model: str,
+        dip_rad: float | None,
+        prior: CameraPoseNed,
+        nominal_roll_deg: float,
+        nominal_pitch_deg: float,
+    ) -> tuple[float, float]:
+        """Deterministic one-axis-at-a-time +/-1px endpoint perturbation.
+
+        This is a worst-case manual-click sensitivity, not a statistical
+        1-sigma uncertainty: each of the two endpoints is perturbed along u
+        and v independently by ``_HORIZON_CLICK_UNCERTAINTY_PX``, the same
+        model is re-solved, and the maximum absolute Roll/Pitch delta from
+        the nominal solve is retained.
+        """
+
+        max_roll_delta = 0.0
+        max_pitch_delta = 0.0
+        step = self._HORIZON_CLICK_UNCERTAINTY_PX
+        for endpoint_index in range(2):
+            for axis in (0, 1):
+                for sign in (1.0, -1.0):
+                    perturbed = list(raw_points)
+                    u, v = perturbed[endpoint_index]
+                    if axis == 0:
+                        u = u + sign * step
+                    else:
+                        v = v + sign * step
+                    perturbed[endpoint_index] = (u, v)
+                    sampled = self._sample_horizon_pixels(tuple(perturbed))
+                    normalized = self._undistort_pixels(camera, sampled)
+                    roll_deg, pitch_deg, _rms, _max_abs = self._solve_horizon_roll_pitch(
+                        normalized,
+                        horizon_model=horizon_model,
+                        dip_rad=dip_rad,
+                        prior=prior,
+                    )
+                    max_roll_delta = max(max_roll_delta, abs(roll_deg - nominal_roll_deg))
+                    max_pitch_delta = max(max_pitch_delta, abs(pitch_deg - nominal_pitch_deg))
+        return max_roll_delta, max_pitch_delta
+
     def solve_workstation_optical_pose_horizon(
         self,
         payload: Mapping[str, Any],
@@ -1638,7 +1779,28 @@ class OpticalPoseController:
         profile, applicability = self._require_frozen_intrinsics()
         priors = self._resolve_prior_poses(payload, prefer_frozen=True)
         annotations = self._annotation_root(payload)
-        solved: dict[str, tuple[CameraPoseNed, Any, Mapping[str, Any]]] = {}
+        horizon_model = str(payload.get("horizon_model") or "flat_local")
+        if horizon_model not in self._HORIZON_MODELS:
+            raise ValueError(f"unsupported horizon_model: {horizon_model!r}")
+        dip_rad: float | None = None
+        camera_height_m: float | None = None
+        if horizon_model == "spherical_geometric":
+            height_raw = payload.get("camera_height_above_reference_surface_m")
+            if height_raw is None:
+                raise ValueError(
+                    "spherical_geometric horizon requires an explicit "
+                    "camera_height_above_reference_surface_m; GNSS ellipsoid altitude "
+                    "is not automatically substituted"
+                )
+            try:
+                camera_height_m = float(height_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("camera_height_above_reference_surface_m must be numeric") from exc
+            if not math.isfinite(camera_height_m) or camera_height_m < 0.0:
+                raise ValueError("camera_height_above_reference_surface_m must be a finite, non-negative metres value")
+            dip_rad = geometric_horizon_dip_rad(camera_height_m)
+
+        solved: dict[str, dict[str, Any]] = {}
         for side, prior, camera in (
             ("left", priors[0], profile.left),
             ("right", priors[1], profile.right),
@@ -1650,57 +1812,112 @@ class OpticalPoseController:
             points = self._annotation_points(annotation, "horizon_line")
             if len(points) < 2:
                 continue
+            sensitivity: tuple[float, float] | None = None
+            if len(points) == 2:
+                width = float(annotation["source_width_px"])
+                separation = math.hypot(points[1][0] - points[0][0], points[1][1] - points[0][1])
+                minimum_separation = self._HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION * width
+                if separation < minimum_separation:
+                    raise ValueError(
+                        f"{side}: horizon endpoints are only {separation:.1f}px apart; "
+                        f"at least {minimum_separation:.1f}px ({self._HORIZON_MIN_ENDPOINT_SEPARATION_FRACTION:.0%} "
+                        "of image width) is required so +/-1px click noise stays bounded"
+                    )
             sampled = self._sample_horizon_pixels(points)
             normalized = self._undistort_pixels(camera, sampled)
-            expected_gravity = _matvec(
-                _mat_transpose(prior.rotation_ned_from_camera_rdf),
-                (0.0, 0.0, 1.0),
-            )
-            fit = fit_normalized_horizon_line(
+            roll_deg, pitch_deg, rms_normalized, max_abs_normalized = self._solve_horizon_roll_pitch(
                 normalized,
-                expected_gravity_camera_rdf=expected_gravity,
+                horizon_model=horizon_model,
+                dip_rad=dip_rad,
+                prior=prior,
             )
+            if not (math.isfinite(roll_deg) and math.isfinite(pitch_deg)):
+                raise ValueError(f"{side}: horizon solve returned a non-finite Roll/Pitch")
+            if len(points) == 2:
+                sensitivity = self._horizon_endpoint_sensitivity_deg(
+                    raw_points=points,
+                    camera=camera,
+                    horizon_model=horizon_model,
+                    dip_rad=dip_rad,
+                    prior=prior,
+                    nominal_roll_deg=roll_deg,
+                    nominal_pitch_deg=pitch_deg,
+                )
             before = pose_parameters_from_camera_pose(prior)
             updated = PoseParametersNed(
-                fit.roll_deg,
-                fit.pitch_deg,
+                roll_deg,
+                pitch_deg,
                 before.yaw_deg,
                 before.north_m,
                 before.east_m,
                 before.down_m,
             ).to_camera_pose_ned()
-            solved[side] = (updated, fit, annotation)
+            solved[side] = {
+                "pose": updated,
+                "rms_normalized": rms_normalized,
+                "max_abs_normalized": max_abs_normalized,
+                "sensitivity_deg": sensitivity,
+                "annotation": annotation,
+            }
         if not solved:
             raise ValueError(
                 "frozen horizon annotations require at least two native points on left or right"
             )
-        left = solved.get("left", (priors[0], None, {}))[0]
-        right = solved.get("right", (priors[1], None, {}))[0]
+        left = solved.get("left", {}).get("pose", priors[0])
+        right = solved.get("right", {}).get("pose", priors[1])
         quality: list[tuple[str, float]] = []
         source_ids: list[str] = []
         input_hashes: list[tuple[str, str]] = [
-            ("operating_intrinsics_profile_sha256", profile.profile_sha256)
+            ("operating_intrinsics_profile_sha256", profile.profile_sha256),
+            ("horizon_model", horizon_model),
         ]
-        approximate_errors: list[float] = []
-        for side, (_pose, fit, annotation) in solved.items():
-            approximate_px = float(fit.rms_normalized) * math.sqrt(
+        if camera_height_m is not None:
+            input_hashes.append(
+                ("camera_height_above_reference_surface_m", f"{camera_height_m:.6f}")
+            )
+        for side, row in solved.items():
+            approximate_px = float(row["rms_normalized"]) * math.sqrt(
                 float(getattr(profile, side).camera_matrix[0][0])
                 * float(getattr(profile, side).camera_matrix[1][1])
             )
-            approximate_errors.append(approximate_px)
             quality.extend(
                 (
-                    (f"{side}_rms_normalized", float(fit.rms_normalized)),
-                    (f"{side}_max_abs_normalized", float(fit.max_abs_normalized)),
-                    (f"{side}_approximate_rms_px", approximate_px),
+                    (f"{side}_rms_normalized", float(row["rms_normalized"])),
+                    (f"{side}_max_abs_normalized", float(row["max_abs_normalized"])),
+                    (f"{side}_rms_px_equivalent", approximate_px),
                 )
             )
-            source_ids.append(str(annotation["frame_id"]))
-            input_hashes.append((f"{side}_annotation_sha256", _payload_sha256(annotation)))
-        quality.append(("reprojection_error_px", max(approximate_errors)))
+            sensitivity = row["sensitivity_deg"]
+            if sensitivity is not None:
+                roll_sensitivity, pitch_sensitivity = sensitivity
+                quality.extend(
+                    (
+                        (f"{side}_roll_sensitivity_1px_deg", float(roll_sensitivity)),
+                        (f"{side}_pitch_sensitivity_1px_deg", float(pitch_sensitivity)),
+                    )
+                )
+            source_ids.append(str(row["annotation"]["frame_id"]))
+            input_hashes.append((f"{side}_annotation_sha256", _payload_sha256(row["annotation"])))
+        warnings: list[str] = [
+            "yaw and optical-center position are unobservable from a horizon",
+            "the prior expected gravity resolves only the g vs -g projective sign; it is not "
+            "the source of the recovered Roll/Pitch value",
+            "rms_normalized is a line/model fit-quality metric, not a pose uncertainty; see "
+            "*_roll_sensitivity_1px_deg / *_pitch_sensitivity_1px_deg for a worst-case "
+            "+/-1px manual endpoint-click sensitivity",
+            "use only a physical/geometric horizon compatible with the selected model; a "
+            "mountain ridge, building skyline, or tree line is not a valid horizon input "
+            "(use the Mountain method for a ridge)",
+        ]
+        if horizon_model == "flat_local":
+            warnings.append("flat/unrefracted horizon model; Earth curvature dip is not applied")
+        else:
+            warnings.append(
+                "geometric spherical-Earth horizon; atmospheric refraction is not modeled"
+            )
         candidate = OpticalPoseCandidate(
             candidate_id=f"horizon-{uuid.uuid4().hex}",
-            method="flat-horizon-roll-pitch",
+            method="flat-horizon-roll-pitch" if horizon_model == "flat_local" else "spherical-horizon-roll-pitch",
             left_pose_ned=left,
             right_pose_ned=right,
             optimized_dofs=_HORIZON_DOF,
@@ -1708,10 +1925,7 @@ class OpticalPoseController:
             source_observation_ids=tuple(dict.fromkeys(source_ids)),
             input_hashes=tuple(input_hashes),
             quality_metrics=tuple(quality),
-            warnings=(
-                "yaw and optical-center position are unobservable from a horizon",
-                "flat/unrefracted horizon model; Mountain uses GNSS + paired u,v clicks",
-            ),
+            warnings=tuple(warnings),
             created_utc_ns=time.time_ns(),
         )
         self.register_workstation_optical_pose_candidate(candidate, prior_poses=priors)
@@ -1841,15 +2055,24 @@ class OpticalPoseController:
         self,
         payload: Mapping[str, Any],
     ) -> tuple[tuple[float, float, float], dict[str, Any]]:
-        """Resolve one auditable right-minus-left GNSS baseline in world NED."""
+        """Resolve one auditable right-minus-left GNSS baseline in world NED.
+
+        Priority is (1) an explicit payload override -- always tagged as an
+        override, never silently mistaken for capture evidence -- then (2)
+        the Left/Right GNSS snapshot captured with *this exact* frozen burst
+        (``self._drone_rtk_observations``, matched by ``burst_id``). There is
+        no fallback to ``panel.latest_gps``/``panel.latest_rtk_baseline``: a
+        frozen Mountain image must never be paired with whatever GNSS
+        happens to be live on the panel at solve time.
+        """
 
         raw = payload.get("gnss_baseline_ned_m")
-        source = "payload.gnss_baseline_ned_m"
+        source = "payload.gnss_baseline_ned_m (explicit override)"
         details: dict[str, Any] = {}
         if raw is None:
             raw = payload.get("baseline_ned_m")
             if raw is not None:
-                source = "payload.baseline_ned_m"
+                source = "payload.baseline_ned_m (explicit override)"
 
         if raw is not None:
             if isinstance(raw, Mapping):
@@ -1868,59 +2091,97 @@ class OpticalPoseController:
                 length=3,
                 name="gnss_baseline_ned_m",
             )
+            details["capture_observation_id"] = None
             details.setdefault("fix_quality", payload.get("gnss_fix_quality", "UNKNOWN"))
+            details.setdefault("left_rtk_label", payload.get("gnss_left_rtk_label", "UNKNOWN"))
+            details.setdefault("right_rtk_label", payload.get("gnss_right_rtk_label", "UNKNOWN"))
             details.setdefault("left_age_s", payload.get("gnss_left_age_s"))
             details.setdefault("right_age_s", payload.get("gnss_right_age_s"))
         else:
-            estimate = getattr(self.panel, "latest_rtk_baseline", None)
-            if estimate is None:
-                states = getattr(self.panel, "latest_gps", {}) or {}
-                states = states if isinstance(states, Mapping) else {}
-                estimate = estimate_rtk_baseline(
-                    states.get("left"),
-                    states.get("right"),
-                    now_s=time.monotonic(),
-                    require_fixed=False,
-                )
-                source = "panel.latest_gps → estimate_rtk_baseline"
-            else:
-                source = "panel.latest_rtk_baseline"
-            if estimate is None:
+            observation = self._capture_observation_for_frozen_burst()
+            if observation is None:
                 raise RuntimeError(
-                    "GNSS + Mountain requires a current left/right RTK baseline "
-                    "in NED metres"
+                    "frozen Mountain image has no capture-associated GNSS baseline evidence; "
+                    "capture a burst with GNSS evidence, or supply an explicit "
+                    "gnss_baseline_ned_m override"
                 )
-            baseline_ned = _finite_vector(
-                (
-                    getattr(estimate, "north_m", None),
-                    getattr(estimate, "east_m", None),
-                    getattr(estimate, "down_m", None),
-                ),
-                length=3,
-                name="latest_rtk_baseline.ned_m",
-            )
+            gnss = observation.get("gnss")
+            gnss = gnss if isinstance(gnss, Mapping) else {}
+            left_row = gnss.get("left")
+            right_row = gnss.get("right")
+            left_state = _gps_state_from_capture_mapping(left_row)
+            right_state = _gps_state_from_capture_mapping(right_row)
+            if left_state is None or right_state is None:
+                raise RuntimeError(
+                    "frozen Mountain image has no capture-associated GNSS baseline evidence "
+                    f"(capture observation {observation.get('observation_id')} is missing "
+                    "left/right GNSS position)"
+                )
+            delta = ned_delta_m(left_state, right_state)
+            if delta is None:
+                raise RuntimeError(
+                    "frozen Mountain image has no capture-associated GNSS baseline evidence "
+                    "(left/right GNSS position incomplete)"
+                )
+            baseline_ned = delta
+            source = f"capture_observation:{observation.get('observation_id')}"
+            left_label = str((left_row or {}).get("rtk_label") or "UNKNOWN")
+            right_label = str((right_row or {}).get("rtk_label") or "UNKNOWN")
             details = {
-                "baseline_m": getattr(estimate, "baseline_m", None),
-                "fix_quality": getattr(estimate, "fix_quality", "UNKNOWN"),
-                "left_age_s": getattr(estimate, "left_age_s", None),
-                "right_age_s": getattr(estimate, "right_age_s", None),
-                "warnings": list(getattr(estimate, "warnings", ()) or ()),
+                "capture_observation_id": observation.get("observation_id"),
+                "left_rtk_label": left_label,
+                "right_rtk_label": right_label,
+                "fix_quality": (
+                    "RTK_FIXED"
+                    if left_label == "RTK_FIXED" and right_label == "RTK_FIXED"
+                    else "DEGRADED"
+                ),
+                "left_timestamp_s": (left_row or {}).get("timestamp_s"),
+                "right_timestamp_s": (right_row or {}).get("timestamp_s"),
             }
 
         baseline_m = math.sqrt(sum(value * value for value in baseline_ned))
         if baseline_m <= 1.0e-9:
             raise ValueError("GNSS + Mountain requires a non-zero RTK baseline")
         fix_quality = str(details.get("fix_quality") or "UNKNOWN").upper()
+        apply_eligible = (
+            str(details.get("left_rtk_label") or "").upper() == "RTK_FIXED"
+            and str(details.get("right_rtk_label") or "").upper() == "RTK_FIXED"
+        )
         details.update(
             {
                 "source": source,
                 "ned_m": list(baseline_ned),
                 "baseline_m": baseline_m,
                 "fix_quality": fix_quality,
+                "apply_eligible": apply_eligible,
                 "coordinate_contract": "right GNSS antenna minus left GNSS antenna; world NED metres",
             }
         )
         return baseline_ned, details
+
+    @staticmethod
+    def _resolve_mountain_lever_arm(
+        payload: Mapping[str, Any],
+    ) -> tuple[tuple[float, float, float], str]:
+        """Resolve an explicit optical-center correction, never an estimate.
+
+        The correction is the vector to *add* to the antenna-to-antenna GNSS
+        baseline (already expressed in Left camera RDF) to obtain the
+        optical-center-to-optical-center baseline. This module never
+        estimates it: without an explicit
+        ``lever_arm_baseline_correction_left_rdf_m`` payload override the
+        status is ``UNMODELED`` and the correction is the zero vector, which
+        must be surfaced to the caller as an assumption, not a measurement.
+        """
+
+        raw = payload.get("lever_arm_baseline_correction_left_rdf_m")
+        if raw is None:
+            return (0.0, 0.0, 0.0), "UNMODELED"
+        correction = _finite_vector(
+            raw, length=3, name="lever_arm_baseline_correction_left_rdf_m"
+        )
+        return correction, "CALIBRATED"
 
     def solve_workstation_optical_pose_gnss_mountain(
         self,
@@ -1930,10 +2191,13 @@ class OpticalPoseController:
 
         No GeoTIFF, terrain height, or 3-D object correspondence is used.
         Same-order ridge clicks on the frozen left/right frames provide the
-        normalized bearing pairs; GNSS provides the right-minus-left metric
-        baseline.  The prior absolute left pose remains the world-frame
-        anchor because pixels plus a stereo baseline determine relative R,t,
-        not an independent absolute world yaw.
+        normalized bearing pairs; the *direction* of the GNSS baseline
+        conditions the relative rotation fit (its metric length never enters
+        the rotation residual), while the GNSS baseline's metric length
+        supplies the relative translation.  The prior absolute left pose
+        remains the world-frame anchor: pixels plus a stereo baseline
+        direction determine relative R,t, not an independent absolute world
+        yaw, so this method never measures the Left absolute pose.
         """
 
         profile, _applicability = self._require_frozen_intrinsics()
@@ -1979,6 +2243,10 @@ class OpticalPoseController:
             _mat_transpose(priors[0].rotation_ned_from_camera_rdf),
             baseline_ned,
         )
+        lever_arm_correction, lever_arm_status = self._resolve_mountain_lever_arm(payload)
+        optical_baseline_left_rdf = tuple(
+            baseline_left_rdf[index] + lever_arm_correction[index] for index in range(3)
+        )
         left_bearings = tuple(
             (*normalized, 1.0)
             for normalized in self._undistort_pixels(profile.left, left_points)
@@ -1988,42 +2256,48 @@ class OpticalPoseController:
             for normalized in self._undistort_pixels(profile.right, right_points)
         )
         prior_stereo = stereo_pose_from_absolute(*priors)
-        solve = solve_known_baseline_rotation(
-            left_bearings_rdf=left_bearings,
-            right_bearings_rdf=right_bearings,
-            baseline_right_minus_left_left_rdf_m=baseline_left_rdf,
-            prior_rotation_right_from_left_rdf=prior_stereo.rotation_right_from_left_rdf,
-        )
         left = priors[0]
+        left_anchor_sha256 = _payload_sha256(_pose_mapping(left))
+        rotation_config = MountainRotationConfig()
+        try:
+            solve = solve_mountain_relative_rotation_robust(
+                left_bearings_rdf=left_bearings,
+                right_bearings_rdf=right_bearings,
+                baseline_direction_left_rdf=optical_baseline_left_rdf,
+                prior_rotation_right_from_left_rdf=prior_stereo.rotation_right_from_left_rdf,
+                config=rotation_config,
+            )
+        except ValueError as exc:
+            raise ValueError(f"GNSS + Mountain rotation solve failed: {exc}") from exc
+
         right_rotation_ned = _matmul(
             left.rotation_ned_from_camera_rdf,
             _mat_transpose(solve.rotation_right_from_left_rdf),
         )
+        optical_baseline_ned = _matvec(
+            left.rotation_ned_from_camera_rdf,
+            optical_baseline_left_rdf,
+        )
         right = CameraPoseNed(
             right_rotation_ned,
-            tuple(left.center_ned_m[index] + baseline_ned[index] for index in range(3)),
+            tuple(left.center_ned_m[index] + optical_baseline_ned[index] for index in range(3)),
         )
-        normalized_errors = sorted(abs(value) for value in solve.residuals)
+
         focal_scale = math.sqrt(
             float(profile.left.camera_matrix[0][0])
             * float(profile.left.camera_matrix[1][1])
             * float(profile.right.camera_matrix[0][0])
             * float(profile.right.camera_matrix[1][1])
         ) ** 0.25
-        epipolar_rms_px = math.sqrt(
-            sum(value * value for value in normalized_errors) / len(normalized_errors)
-        ) * focal_scale
-        epipolar_p95_px = normalized_errors[
-            min(len(normalized_errors) - 1, int(round((len(normalized_errors) - 1) * 0.95)))
-        ] * focal_scale
-        rotation_observable = solve.jacobian_rank >= 3
+        rotation_apply_eligible = bool(solve.apply_eligible)
+        gnss_apply_eligible = bool(gnss_details.get("apply_eligible"))
         observable = PoseDofMask(
-            roll_deg=rotation_observable,
-            pitch_deg=rotation_observable,
-            yaw_deg=rotation_observable,
-            north_m=True,
-            east_m=True,
-            down_m=True,
+            roll_deg=rotation_apply_eligible,
+            pitch_deg=rotation_apply_eligible,
+            yaw_deg=rotation_apply_eligible,
+            north_m=gnss_apply_eligible,
+            east_m=gnss_apply_eligible,
+            down_m=gnss_apply_eligible,
         )
         uv_hash = _payload_sha256(
             {
@@ -2042,33 +2316,64 @@ class OpticalPoseController:
             (
                 ("mountain_uv_pairs_sha256", uv_hash),
                 ("gnss_baseline_sha256", _payload_sha256(gnss_details)),
-                (
-                    "optical_center_assumption_sha256",
-                    _payload_sha256(
-                        {
-                            "assumption": "camera optical center == GNSS antenna",
-                            "lever_arm_m": [0.0, 0.0, 0.0],
-                        }
-                    ),
-                ),
+                ("left_anchor_pose_sha256", left_anchor_sha256),
+                ("lever_arm_status", lever_arm_status),
+                ("pose_component_sources.left_rotation", "prior_anchor"),
+                ("pose_component_sources.left_position", "prior_anchor"),
+                ("pose_component_sources.relative_rotation", "mountain_correspondences"),
+                ("pose_component_sources.relative_translation", "capture_gnss_baseline"),
+                ("pose_component_sources.right_rotation", "derived"),
+                ("pose_component_sources.right_position", "derived"),
+                ("pose_component_sources.lever_arm", lever_arm_status),
             )
         )
         warnings: list[str] = [
-            "GNSS is authoritative for right-minus-left translation in world NED",
+            "GNSS is authoritative for right-minus-left metric translation in world NED",
             "Mountain uses only same-order left/right frozen u,v clicks; no GeoTIFF or terrain height",
-            "assumption: camera optical center equals GNSS antenna; lever arm is zero",
-            f"GNSS fix quality={gnss_details['fix_quality']} is retained as evidence; no hard quality gate is applied",
-            "absolute left world pose remains the selected/frozen prior anchor",
+            "relative R is conditioned on the selected Left absolute anchor; changing the anchor "
+            "changes/invalidates this candidate even for identical pixels and GNSS baseline",
+            "Left absolute pose is not measured by Mountain; it remains the prior/anchor",
+            f"GNSS fix quality={gnss_details['fix_quality']}",
+            (
+                "lever arm CALIBRATED: an explicit optical-center correction was applied"
+                if lever_arm_status == "CALIBRATED"
+                else "lever arm UNMODELED: GNSS antenna baseline is used as an optical-baseline "
+                "proxy with zero correction; this is an assumption, not a measurement"
+            ),
         ]
-        if not rotation_observable:
+        if not gnss_apply_eligible:
             warnings.append(
-                "Mountain u,v rotation Jacobian is rank deficient; rotation DOF are not applicable"
+                "GNSS + Mountain apply eligibility requires RTK_FIXED on both Left and Right; "
+                f"left={gnss_details.get('left_rtk_label')} right={gnss_details.get('right_rtk_label')}"
             )
-        uncertainty = (
-            (("rotation_jacobian_condition", float(solve.jacobian_condition)),)
-            if math.isfinite(solve.jacobian_condition)
-            else ()
-        )
+        if not rotation_apply_eligible:
+            warnings.append(
+                "Mountain rotation is not apply-eligible: " + "; ".join(solve.ineligibility_reasons)
+            )
+        uncertainty: list[tuple[str, float]] = []
+        if math.isfinite(solve.jacobian_condition):
+            uncertainty.append(("rotation_jacobian_condition", float(solve.jacobian_condition)))
+        quality: list[tuple[str, float]] = [
+            ("mountain_uv_pair_count", float(len(left_points))),
+            ("inlier_count", float(len(solve.inlier_indices))),
+            ("outlier_count", float(len(solve.outlier_indices))),
+            (
+                "inlier_ratio",
+                float(len(solve.inlier_indices)) / float(solve.total_count) if solve.total_count else 0.0,
+            ),
+            ("gnss_baseline_m", float(gnss_details["baseline_m"])),
+        ]
+        if math.isfinite(solve.sampson_rms_normalized) and math.isfinite(solve.sampson_p95_normalized):
+            quality.extend(
+                (
+                    ("sampson_rms_normalized", float(solve.sampson_rms_normalized)),
+                    ("sampson_p95_normalized", float(solve.sampson_p95_normalized)),
+                    ("sampson_rms_px_equivalent", float(solve.sampson_rms_normalized) * focal_scale),
+                    ("sampson_p95_px_equivalent", float(solve.sampson_p95_normalized) * focal_scale),
+                )
+            )
+        else:
+            warnings.append("Sampson residual metrics are unavailable (non-finite; too few inliers)")
         candidate = OpticalPoseCandidate(
             candidate_id=f"gnss-mountain-uv-{uuid.uuid4().hex}",
             method="gnss-constrained-mountain-uv",
@@ -2080,14 +2385,8 @@ class OpticalPoseController:
                 dict.fromkeys((*source_ids, f"gnss-baseline:{_payload_sha256(gnss_details)}"))
             ),
             input_hashes=tuple(input_hashes),
-            quality_metrics=(
-                ("mountain_uv_pair_count", float(len(left_points))),
-                ("epipolar_rms_px", float(epipolar_rms_px)),
-                ("epipolar_p95_px", float(epipolar_p95_px)),
-                ("reprojection_error_px", float(epipolar_rms_px)),
-                ("gnss_baseline_m", float(gnss_details["baseline_m"])),
-            ),
-            uncertainty_metrics=uncertainty,
+            quality_metrics=tuple(quality),
+            uncertainty_metrics=tuple(uncertainty),
             warnings=tuple(warnings),
             created_utc_ns=time.time_ns(),
         )

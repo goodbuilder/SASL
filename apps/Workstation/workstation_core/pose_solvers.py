@@ -28,6 +28,7 @@ from Workstation.workstation_core.optical_pose import (
     expand_selected_dofs,
     gravity_camera_rdf_from_normalized_horizon_line,
     horizon_roll_pitch_deg_from_gravity_camera_rdf,
+    horizon_unit_ray_residual,
     opencv_pnp_from_camera_pose_ned,
     pack_selected_dofs,
     pose_parameters_from_camera_pose,
@@ -992,6 +993,403 @@ def solve_known_baseline_rotation(
     )
 
 
+def mountain_sampson_residuals_normalized(
+    rotation_right_from_left_rdf: Iterable[Iterable[Any]],
+    baseline_direction_left_rdf: Iterable[Any],
+    left_bearings_xy1_rdf: Iterable[Iterable[Any]],
+    right_bearings_xy1_rdf: Iterable[Iterable[Any]],
+) -> tuple[float, ...]:
+    """Return signed normalized Sampson residuals ``e_i / sqrt(denom_i)``.
+
+    ``E = R [b_hat]_x`` with a *unit* baseline direction; ``x_l,x_r`` are
+    normalized ideal ``(x,y,1)`` coordinates (implicit ``K=I,D=0``), not unit
+    sphere bearings.  ``e_i = x_rᵀ E x_l``; the Sampson denominator is the
+    squared image-plane gradient of ``e_i`` with respect to both points'
+    ``(x,y)`` -- the first two components of ``E x_l`` and ``Eᵀ x_r``.  This
+    is dimensionless and, unlike the raw coplanarity error, does not scale
+    with the metric baseline length because the baseline direction is unit
+    norm.  A near-zero denominator (degenerate epipolar geometry for that
+    point) yields ``nan``; callers must treat ``nan`` as an invalid/rejected
+    observation, never as a small residual.
+    """
+
+    np = _require_numpy()
+    rotation = np.asarray(
+        _matrix3(rotation_right_from_left_rdf, name="rotation_right_from_left_rdf"),
+        dtype=np.float64,
+    )
+    baseline = np.asarray(
+        _normalize(baseline_direction_left_rdf, name="baseline_direction_left_rdf"),
+        dtype=np.float64,
+    )
+    left = np.asarray(
+        tuple(_vector3(value, name="left_bearings_xy1_rdf") for value in left_bearings_xy1_rdf),
+        dtype=np.float64,
+    )
+    right = np.asarray(
+        tuple(_vector3(value, name="right_bearings_xy1_rdf") for value in right_bearings_xy1_rdf),
+        dtype=np.float64,
+    )
+    if left.shape != right.shape or left.ndim != 2 or left.shape[1] != 3:
+        raise ValueError("left/right bearing arrays must have equal shape (N,3)")
+    skew = np.array(
+        [
+            [0.0, -baseline[2], baseline[1]],
+            [baseline[2], 0.0, -baseline[0]],
+            [-baseline[1], baseline[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+    essential = rotation @ skew
+    e_left = (essential @ left.T).T
+    e_right = (essential.T @ right.T).T
+    numerator = np.einsum("ij,ij->i", right, e_left)
+    denominator = (
+        e_left[:, 0] ** 2 + e_left[:, 1] ** 2 + e_right[:, 0] ** 2 + e_right[:, 1] ** 2
+    )
+    epsilon = 1.0e-18
+    with np.errstate(invalid="ignore", divide="ignore"):
+        residuals = np.where(
+            denominator > epsilon,
+            numerator / np.sqrt(np.where(denominator > epsilon, denominator, epsilon)),
+            np.nan,
+        )
+    return tuple(float(value) for value in residuals)
+
+
+@dataclass(frozen=True)
+class MountainRotationConfig:
+    """Fail-closed engineering defaults for robust Mountain rotation fitting.
+
+    These thresholds are not a physical-accuracy guarantee; they are a
+    reproducible fail-closed gate.  ``inlier_sampson_threshold_normalized``
+    is dimensionless (see :func:`mountain_sampson_residuals_normalized`); a
+    caller wanting a pixel-equivalent angular threshold must convert it with
+    the camera's focal scale before constructing this config.
+    """
+
+    min_correspondences: int = 4
+    min_inliers: int = 4
+    min_inlier_ratio: float = 0.60
+    inlier_sampson_threshold_normalized: float = 0.02
+    max_jacobian_condition: float = 1.0e6
+    robust_loss: str = "soft_l1"
+    robust_f_scale: float = 0.02
+
+    def __post_init__(self) -> None:
+        if int(self.min_correspondences) < 4:
+            raise ValueError("min_correspondences must be at least 4")
+        if int(self.min_inliers) < 4:
+            raise ValueError("min_inliers must be at least 4")
+        if not 0.0 < float(self.min_inlier_ratio) <= 1.0:
+            raise ValueError("min_inlier_ratio must be in (0,1]")
+        if float(self.inlier_sampson_threshold_normalized) <= 0.0:
+            raise ValueError("inlier_sampson_threshold_normalized must be positive")
+        if float(self.max_jacobian_condition) <= 0.0:
+            raise ValueError("max_jacobian_condition must be positive")
+        if float(self.robust_f_scale) <= 0.0:
+            raise ValueError("robust_f_scale must be positive")
+        object.__setattr__(self, "min_correspondences", int(self.min_correspondences))
+        object.__setattr__(self, "min_inliers", int(self.min_inliers))
+
+
+@dataclass(frozen=True)
+class MountainRotationResult:
+    """Robust relative-rotation fit with explicit inlier/eligibility evidence.
+
+    ``rotation_right_from_left_rdf`` is fitted from Mountain image
+    correspondences conditioned on the *direction* of the supplied GNSS
+    baseline only -- its metric length never enters the rotation fit or the
+    normalized Sampson residuals.
+    """
+
+    rotation_right_from_left_rdf: Matrix3
+    total_count: int
+    inlier_indices: tuple[int, ...]
+    outlier_indices: tuple[int, ...]
+    sampson_residuals_normalized: tuple[float, ...]
+    sampson_rms_normalized: float
+    sampson_p95_normalized: float
+    jacobian_rank: int
+    jacobian_condition: float
+    iterations: int
+    apply_eligible: bool
+    ineligibility_reasons: tuple[str, ...]
+
+
+def solve_mountain_relative_rotation_robust(
+    *,
+    left_bearings_rdf: Iterable[Iterable[Any]],
+    right_bearings_rdf: Iterable[Iterable[Any]],
+    baseline_direction_left_rdf: Iterable[Any],
+    prior_rotation_right_from_left_rdf: Iterable[Iterable[Any]],
+    config: MountainRotationConfig = MountainRotationConfig(),
+) -> MountainRotationResult:
+    """Two-stage robust fit: soft-L1 seed, Sampson inlier gate, LM refit.
+
+    ``left_bearings_rdf``/``right_bearings_rdf`` are normalized ideal
+    ``(x,y,1)`` correspondences (same-order Mountain clicks).  Only the
+    *direction* of ``baseline_direction_left_rdf`` is used -- its magnitude
+    is discarded here so the fitted rotation and its normalized residuals
+    are provably invariant to the GNSS baseline's metric length (see
+    ``mountain_sampson_residuals_normalized``).  ``apply_eligible`` is False
+    whenever rank, condition, inlier count, inlier ratio, or residual
+    finiteness fails the configured fail-closed gate; the caller must never
+    treat the returned rotation as applicable when this is False.
+    """
+
+    cv2 = _require_cv2()
+    np = _require_numpy()
+    least_squares = _require_least_squares()
+
+    left = np.asarray(
+        tuple(_vector3(value, name="left_bearings_rdf") for value in left_bearings_rdf),
+        dtype=np.float64,
+    )
+    right = np.asarray(
+        tuple(_vector3(value, name="right_bearings_rdf") for value in right_bearings_rdf),
+        dtype=np.float64,
+    )
+    if left.shape != right.shape or left.ndim != 2 or left.shape[1] != 3:
+        raise ValueError("left/right bearing arrays must have equal shape (N,3)")
+    total_count = int(left.shape[0])
+    if total_count < config.min_correspondences:
+        raise ValueError(
+            f"Mountain rotation requires at least {config.min_correspondences} "
+            f"paired u,v observations, got {total_count}"
+        )
+    baseline_direction = np.asarray(
+        _normalize(baseline_direction_left_rdf, name="baseline_direction_left_rdf"),
+        dtype=np.float64,
+    )
+    prior = np.asarray(
+        _matrix3(prior_rotation_right_from_left_rdf, name="prior_rotation_right_from_left_rdf"),
+        dtype=np.float64,
+    )
+    prior_rvec, _ = cv2.Rodrigues(prior)
+    cross_terms = np.cross(np.broadcast_to(baseline_direction, left.shape), left)
+
+    def _residuals(rvec: Any, cross: Any, obs_right: Any) -> Any:
+        rotation, _ = cv2.Rodrigues(np.asarray(rvec, dtype=np.float64).reshape(3, 1))
+        rotated = (rotation @ cross.T).T
+        return np.einsum("ij,ij->i", obs_right, rotated)
+
+    seed = least_squares(
+        lambda rvec: _residuals(rvec, cross_terms, right),
+        prior_rvec.reshape(3),
+        method="trf",
+        loss=config.robust_loss,
+        f_scale=config.robust_f_scale,
+        max_nfev=2000,
+        xtol=1.0e-13,
+        ftol=1.0e-13,
+        gtol=1.0e-13,
+    )
+    if not np.all(np.isfinite(seed.x)):
+        raise ValueError("Mountain robust rotation seed solve returned non-finite values")
+    seed_rotation, _ = cv2.Rodrigues(np.asarray(seed.x, dtype=np.float64).reshape(3, 1))
+    seed_rotation_tuple = tuple(tuple(float(value) for value in row) for row in seed_rotation)
+
+    seed_sampson = mountain_sampson_residuals_normalized(
+        seed_rotation_tuple, baseline_direction, left, right
+    )
+    threshold = config.inlier_sampson_threshold_normalized
+    inlier_indices = tuple(
+        index
+        for index, value in enumerate(seed_sampson)
+        if isfinite(value) and abs(value) <= threshold
+    )
+
+    reasons: list[str] = []
+    final_x = seed.x
+    jacobian_array = np.asarray(seed.jac, dtype=np.float64)
+    refit_nfev = 0
+    if len(inlier_indices) >= 4:
+        inlier_array = np.asarray(inlier_indices, dtype=np.int64)
+        refit = least_squares(
+            lambda rvec: _residuals(rvec, cross_terms[inlier_array], right[inlier_array]),
+            seed.x,
+            method="lm",
+            max_nfev=2000,
+            xtol=1.0e-13,
+            ftol=1.0e-13,
+            gtol=1.0e-13,
+        )
+        refit_nfev = int(getattr(refit, "nfev", 0))
+        if np.all(np.isfinite(refit.x)) and np.all(np.isfinite(refit.fun)):
+            final_x = refit.x
+            jacobian_array = np.asarray(refit.jac, dtype=np.float64)
+        else:
+            reasons.append("inlier refit returned non-finite values; retained robust seed")
+    else:
+        reasons.append(
+            f"fewer than 4 inliers after robust seed ({len(inlier_indices)}); refit skipped"
+        )
+
+    final_rotation, _ = cv2.Rodrigues(np.asarray(final_x, dtype=np.float64).reshape(3, 1))
+    final_rotation_tuple = tuple(
+        tuple(float(value) for value in row) for row in final_rotation
+    )
+    final_sampson = mountain_sampson_residuals_normalized(
+        final_rotation_tuple, baseline_direction, left, right
+    )
+    final_inliers = tuple(
+        index
+        for index, value in enumerate(final_sampson)
+        if isfinite(value) and abs(value) <= threshold
+    )
+    final_outliers = tuple(index for index in range(total_count) if index not in final_inliers)
+
+    singular_values = np.linalg.svd(jacobian_array, compute_uv=False)
+    maximum = float(singular_values[0]) if len(singular_values) else 0.0
+    tolerance = max(1.0e-12, maximum * 1.0e-8)
+    rank = int(np.sum(singular_values > tolerance))
+    condition = (
+        float(singular_values[0] / singular_values[-1])
+        if len(singular_values) and float(singular_values[-1]) > tolerance
+        else inf
+    )
+
+    inlier_sampson_values = tuple(final_sampson[index] for index in final_inliers)
+    finite_inlier_values = tuple(value for value in inlier_sampson_values if isfinite(value))
+    if finite_inlier_values:
+        sorted_abs = sorted(abs(value) for value in finite_inlier_values)
+        rms = sqrt(sum(value * value for value in finite_inlier_values) / len(finite_inlier_values))
+        p95 = _percentile(sorted_abs, 0.95)
+    else:
+        rms = inf
+        p95 = inf
+
+    if rank != 3:
+        reasons.append(f"jacobian rank {rank} != 3")
+    if not isfinite(condition) or condition > config.max_jacobian_condition:
+        reasons.append(
+            f"jacobian condition {condition} exceeds max_jacobian_condition "
+            f"{config.max_jacobian_condition}"
+        )
+    if len(final_inliers) < config.min_inliers:
+        reasons.append(f"inlier_count {len(final_inliers)} < min_inliers {config.min_inliers}")
+    inlier_ratio = (len(final_inliers) / total_count) if total_count else 0.0
+    if inlier_ratio < config.min_inlier_ratio:
+        reasons.append(
+            f"inlier_ratio {inlier_ratio:.3f} < min_inlier_ratio {config.min_inlier_ratio}"
+        )
+    if not (isfinite(rms) and isfinite(p95)):
+        reasons.append("Sampson residual metrics are non-finite")
+
+    apply_eligible = not reasons
+
+    return MountainRotationResult(
+        rotation_right_from_left_rdf=final_rotation_tuple,
+        total_count=total_count,
+        inlier_indices=final_inliers,
+        outlier_indices=final_outliers,
+        sampson_residuals_normalized=final_sampson,
+        sampson_rms_normalized=rms,
+        sampson_p95_normalized=p95,
+        jacobian_rank=rank,
+        jacobian_condition=condition,
+        iterations=int(getattr(seed, "nfev", 0)) + refit_nfev,
+        apply_eligible=apply_eligible,
+        ineligibility_reasons=tuple(reasons),
+    )
+
+
+@dataclass(frozen=True)
+class SphericalHorizonSolveResult:
+    """Roll/Pitch-only spherical-Earth horizon fit; Yaw/position are prior."""
+
+    roll_deg: float
+    pitch_deg: float
+    gravity_camera_rdf: Vector3
+    dip_rad: float
+    rms_normalized: float
+    max_abs_normalized: float
+    point_count: int
+    success: bool
+    message: str
+
+
+def solve_spherical_horizon_roll_pitch(
+    rays_camera_rdf: Iterable[Iterable[Any]],
+    *,
+    dip_rad: float,
+    prior_roll_deg: float,
+    prior_pitch_deg: float,
+    prior_yaw_deg: float,
+) -> SphericalHorizonSolveResult:
+    """Fit Roll/Pitch so ``g_C . r_i == sin(dip)`` for every sampled ray.
+
+    ``dip_rad`` must come from :func:`geometric_horizon_dip_rad` (or an
+    equivalent explicit Earth-curvature model); this function does not
+    assume a flat horizon.  Yaw is not a variable -- it is copied from
+    ``prior_yaw_deg`` unchanged, matching the fact that a horizon never
+    observes yaw.  No atmospheric refraction correction is applied.
+    """
+
+    np = _require_numpy()
+    least_squares = _require_least_squares()
+    rays = tuple(_normalize(ray, name="rays_camera_rdf") for ray in rays_camera_rdf)
+    if len(rays) < 2:
+        raise ValueError("spherical horizon fitting requires at least two rays")
+    dip = _finite_float(dip_rad, name="dip_rad")
+    if not 0.0 <= dip < 0.5 * 3.141592653589793:
+        raise ValueError("dip_rad must be in [0, pi/2)")
+    yaw = _finite_float(prior_yaw_deg, name="prior_yaw_deg")
+
+    def _gravity_camera_rdf(roll_deg: float, pitch_deg: float) -> Vector3:
+        pose = CameraPoseNed.from_virtual_frd_rpy_deg(
+            center_ned_m=(0.0, 0.0, 0.0),
+            roll_deg=roll_deg,
+            pitch_deg=pitch_deg,
+            yaw_deg=yaw,
+        )
+        rotation = pose.rotation_ned_from_camera_rdf
+        # gravity_camera = R_ned_from_camera^T @ (0,0,1)_ned (world Down),
+        # which is exactly the third row of R_ned_from_camera.
+        return (rotation[2][0], rotation[2][1], rotation[2][2])
+
+    def residuals(roll_pitch: Any) -> Any:
+        roll_deg, pitch_deg = float(roll_pitch[0]), float(roll_pitch[1])
+        gravity = _gravity_camera_rdf(roll_deg, pitch_deg)
+        return np.asarray(
+            [horizon_unit_ray_residual(gravity, ray, dip_rad=dip) for ray in rays],
+            dtype=np.float64,
+        )
+
+    x0 = np.asarray(
+        [_finite_float(prior_roll_deg, name="prior_roll_deg"), _finite_float(prior_pitch_deg, name="prior_pitch_deg")],
+        dtype=np.float64,
+    )
+    result = least_squares(
+        residuals,
+        x0,
+        method="lm",
+        max_nfev=2000,
+        xtol=1.0e-13,
+        ftol=1.0e-13,
+        gtol=1.0e-13,
+    )
+    if not np.all(np.isfinite(result.x)) or not np.all(np.isfinite(result.fun)):
+        raise ValueError("spherical horizon solve returned non-finite values")
+    roll_deg, pitch_deg = float(result.x[0]), float(result.x[1])
+    gravity = _gravity_camera_rdf(roll_deg, pitch_deg)
+    final_residuals = tuple(
+        horizon_unit_ray_residual(gravity, ray, dip_rad=dip) for ray in rays
+    )
+    return SphericalHorizonSolveResult(
+        roll_deg=roll_deg,
+        pitch_deg=pitch_deg,
+        gravity_camera_rdf=gravity,
+        dip_rad=dip,
+        rms_normalized=sqrt(sum(value * value for value in final_residuals) / len(final_residuals)),
+        max_abs_normalized=max(abs(value) for value in final_residuals),
+        point_count=len(rays),
+        success=bool(result.success),
+        message=str(result.message),
+    )
+
+
 @dataclass(frozen=True)
 class PnpPoseCandidate:
     candidate_id: str
@@ -1020,9 +1418,25 @@ class PnpEnsembleResult:
 
     @property
     def best_candidate(self) -> PnpPoseCandidate | None:
+        """Lowest-reprojection-error candidate, but never at the cost of cheirality.
+
+        A pose with any object point behind the camera is not merely noisier
+        than one without -- it is geometrically impossible given the observed
+        pixels, a known failure mode for near-planar/near-collinear PnP
+        (mirror/flipped solutions can still reproject deceptively well).
+        ``positive_depth_ratio`` is bucketed ahead of reprojection error so a
+        fully-in-front candidate always outranks one that is not, regardless
+        of which has the smaller residual; reprojection error only breaks
+        ties within the same cheirality bucket. If every candidate has a
+        point behind the camera, the least-bad one by reprojection error is
+        still returned -- the ratio remains visible to the caller as
+        evidence rather than silently blocking a result.
+        """
+
         return min(
             self.candidates,
             key=lambda candidate: (
+                0 if candidate.positive_depth_ratio >= 1.0 else 1,
                 candidate.reprojection_p95,
                 candidate.reprojection_rmse,
                 candidate.candidate_id,
@@ -1292,9 +1706,13 @@ def solve_pnp_ensemble(
                 failures.append((f"{method}/NONE#alt", str(exc)))
 
     if "ROBUST_LSQ" in config.methods:
+        # Same cheirality-before-reprojection-error bucketing as
+        # ``PnpEnsembleResult.best_candidate`` -- seeding the refinement from
+        # a flipped/behind-camera candidate would just polish a wrong pose.
         seed = min(
             candidates,
             key=lambda candidate: (
+                0 if candidate.positive_depth_ratio >= 1.0 else 1,
                 candidate.reprojection_p95,
                 candidate.reprojection_rmse,
                 candidate.candidate_id,

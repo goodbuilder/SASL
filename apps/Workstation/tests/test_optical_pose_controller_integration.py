@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,7 @@ from Workstation.workstation_core.optical_pose import (
     OpticalPoseCandidate,
     PoseDofMask,
 )
-from Workstation.workstation_core.rtk_geometry import GpsPositionState
+from Workstation.workstation_core.rtk_geometry import GpsPositionState, ned_delta_m
 from Workstation.workstation_core.terrain import TerrainMetadata
 
 
@@ -362,10 +363,13 @@ def test_gnss_mountain_uses_mountain_rotation_and_gnss_metric_baseline(tmp_path:
     assert "terrain_geotiff_sha256" not in candidate["input_hashes"]
     assert candidate["quality_metrics"]["mountain_uv_pair_count"] == pytest.approx(4.0)
     assert candidate["quality_metrics"]["gnss_baseline_m"] == pytest.approx(2.015564437)
-    assert "camera optical center equals GNSS antenna" in " ".join(candidate["warnings"])
+    assert "lever arm UNMODELED" in " ".join(candidate["warnings"])
     assert "no GeoTIFF" in " ".join(candidate["warnings"])
     assert "fix quality=DEGRADED" in " ".join(candidate["warnings"])
     assert candidate["right_pose"]["center_ned_m"] == pytest.approx([0.0, 2.0, 0.25])
+    assert candidate["input_hashes"]["lever_arm_status"] == "UNMODELED"
+    assert candidate["input_hashes"]["left_anchor_pose_sha256"]
+    assert "reprojection_error_px" not in candidate["quality_metrics"]
 
 
 def test_registration_rejects_candidate_as_its_own_implicit_prior() -> None:
@@ -586,3 +590,195 @@ def test_drone_rtk_observation_capture_has_no_solver_side_effects(tmp_path: Path
     assert snapshot["active_candidate_id"] == ""
     assert controller._active_poses is None
     assert controller._active_selection is None
+
+
+def _mountain_annotations(snapshot: dict[str, object]):
+    annotations = _annotations(snapshot, horizon=False)
+    annotations["left"]["ridge_polyline"] = [
+        {"u_px": 80.0, "v_px": 180.0},
+        {"u_px": 200.0, "v_px": 210.0},
+        {"u_px": 350.0, "v_px": 160.0},
+        {"u_px": 520.0, "v_px": 230.0},
+    ]
+    annotations["right"]["ridge_polyline"] = [
+        {"u_px": 90.0, "v_px": 175.0},
+        {"u_px": 210.0, "v_px": 205.0},
+        {"u_px": 360.0, "v_px": 155.0},
+        {"u_px": 530.0, "v_px": 225.0},
+    ]
+    return annotations
+
+
+def test_gnss_mountain_uses_capture_time_baseline_not_live_gps(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0, latitude_deg=37.0, longitude_deg=127.0, altitude_m=50.0),
+        "right": _gps_state("right", timestamp_s=100.0, latitude_deg=37.00002, longitude_deg=127.0, altitude_m=50.2),
+        "drone": _gps_state("drone", timestamp_s=100.0, latitude_deg=37.00001, longitude_deg=127.00001, altitude_m=50.1),
+    }
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    expected_baseline = ned_delta_m(panel.latest_gps["left"], panel.latest_gps["right"])
+
+    # Live GPS changes after the Capture; the frozen burst's GNSS evidence
+    # must not be affected, and Mountain must not read this live state.
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=200.0, latitude_deg=10.0, longitude_deg=10.0, altitude_m=0.0),
+        "right": _gps_state("right", timestamp_s=200.0, latitude_deg=20.0, longitude_deg=20.0, altitude_m=0.0),
+        "drone": _gps_state("drone", timestamp_s=200.0, latitude_deg=15.0, longitude_deg=15.0, altitude_m=0.0),
+    }
+
+    snapshot = controller.solve_workstation_optical_pose_gnss_mountain(
+        {"annotations": _mountain_annotations(frozen)}
+    )
+
+    candidate = snapshot["candidates"][-1]
+    right_center = candidate["right_pose"]["center_ned_m"]
+    # Left prior center is (0,0,0); lever arm is UNMODELED (zero), so the
+    # right optical center is exactly the resolved GNSS baseline expressed
+    # in NED after the left->NED rotation. The magnitude must match the
+    # captured baseline, never the live-changed one (which is ~1500km away).
+    baseline_m = math.sqrt(sum(v * v for v in right_center))
+    expected_m = math.sqrt(sum(v * v for v in expected_baseline))
+    assert baseline_m == pytest.approx(expected_m, rel=1.0e-6)
+    assert baseline_m < 100.0  # metres; a live-GPS leak would be ~1500 km
+
+
+def test_gnss_mountain_fails_closed_without_capture_baseline_or_override(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    with pytest.raises(RuntimeError, match="no capture-associated GNSS baseline evidence"):
+        controller.solve_workstation_optical_pose_gnss_mountain(
+            {"annotations": _mountain_annotations(frozen)}
+        )
+
+
+def test_gnss_mountain_left_anchor_change_changes_provenance_hash(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    annotations = _mountain_annotations(frozen)
+    payload_base = {
+        "annotations": annotations,
+        "gnss_baseline_ned_m": [0.0, 2.0, 0.25],
+    }
+
+    first = controller.solve_workstation_optical_pose_gnss_mountain(dict(payload_base))
+    first_hash = first["candidates"][-1]["input_hashes"]["left_anchor_pose_sha256"]
+
+    rotated_left = CameraPoseNed.from_virtual_frd_rpy_deg(
+        center_ned_m=(0.0, 0.0, 0.0), roll_deg=0.0, pitch_deg=0.0, yaw_deg=15.0
+    )
+    rotated_right = CameraPoseNed.from_virtual_frd_rpy_deg(
+        center_ned_m=(0.0, -25.0, 0.0), roll_deg=0.0, pitch_deg=0.0, yaw_deg=15.0
+    )
+    payload_rotated = dict(payload_base)
+    payload_rotated["prior_poses"] = {
+        "left": {
+            "rotation_ned_from_camera_rdf": [list(row) for row in rotated_left.rotation_ned_from_camera_rdf],
+            "center_ned_m": list(rotated_left.center_ned_m),
+        },
+        "right": {
+            "rotation_ned_from_camera_rdf": [list(row) for row in rotated_right.rotation_ned_from_camera_rdf],
+            "center_ned_m": list(rotated_right.center_ned_m),
+        },
+    }
+    second = controller.solve_workstation_optical_pose_gnss_mountain(payload_rotated)
+    second_hash = second["candidates"][-1]["input_hashes"]["left_anchor_pose_sha256"]
+
+    assert first_hash != second_hash
+
+
+def test_gnss_mountain_lever_arm_defaults_unmodeled_and_applies_explicit_correction(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    annotations = _mountain_annotations(frozen)
+    payload = {"annotations": annotations, "gnss_baseline_ned_m": [0.0, 2.0, 0.25]}
+
+    uncorrected = controller.solve_workstation_optical_pose_gnss_mountain(dict(payload))
+    uncorrected_candidate = uncorrected["candidates"][-1]
+    assert uncorrected_candidate["input_hashes"]["lever_arm_status"] == "UNMODELED"
+    assert "lever arm UNMODELED" in " ".join(uncorrected_candidate["warnings"])
+    uncorrected_center = uncorrected_candidate["right_pose"]["center_ned_m"]
+
+    corrected_payload = dict(payload)
+    corrected_payload["lever_arm_baseline_correction_left_rdf_m"] = [0.05, 0.0, -0.02]
+    corrected = controller.solve_workstation_optical_pose_gnss_mountain(corrected_payload)
+    corrected_candidate = corrected["candidates"][-1]
+    assert corrected_candidate["input_hashes"]["lever_arm_status"] == "CALIBRATED"
+    corrected_center = corrected_candidate["right_pose"]["center_ned_m"]
+
+    delta = [corrected_center[i] - uncorrected_center[i] for i in range(3)]
+    delta_norm = math.sqrt(sum(v * v for v in delta))
+    expected_norm = math.sqrt(0.05 ** 2 + 0.0 ** 2 + 0.02 ** 2)
+    assert delta_norm == pytest.approx(expected_norm, rel=1.0e-6)
+    assert delta_norm > 1.0e-6
+
+
+def test_horizon_spherical_model_requires_explicit_camera_height(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    with pytest.raises(ValueError, match="camera_height_above_reference_surface_m"):
+        controller.solve_workstation_optical_pose_horizon(
+            {
+                "annotations": _annotations(frozen),
+                "horizon_model": "spherical_geometric",
+            }
+        )
+
+
+def test_horizon_reports_endpoint_click_sensitivity_and_rejects_short_baseline(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+    annotations = _annotations(frozen)
+
+    solved = controller.solve_workstation_optical_pose_horizon({"annotations": annotations})
+    candidate = solved["candidates"][-1]
+    metrics = candidate["quality_metrics"]
+    assert "left_roll_sensitivity_1px_deg" in metrics
+    assert "left_pitch_sensitivity_1px_deg" in metrics
+    assert metrics["left_roll_sensitivity_1px_deg"] >= 0.0
+    assert "reprojection_error_px" not in metrics
+
+    short_annotations = _annotations(frozen)
+    for row in short_annotations.values():
+        row["horizon_line"] = [
+            {"u_px": 300.0, "v_px": 240.0},
+            {"u_px": 340.0, "v_px": 240.0},
+        ]
+    with pytest.raises(ValueError, match="horizon endpoints are only"):
+        controller.solve_workstation_optical_pose_horizon({"annotations": short_annotations})
+
+
+def test_horizon_short_endpoint_baseline_has_higher_sensitivity_than_long_one(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+    frozen = controller.capture_workstation_optical_pose_burst({})
+
+    long_annotations = _annotations(frozen)
+    long_solved = controller.solve_workstation_optical_pose_horizon({"annotations": long_annotations})
+    long_metrics = long_solved["candidates"][-1]["quality_metrics"]
+
+    medium_annotations = _annotations(frozen)
+    for row in medium_annotations.values():
+        row["horizon_line"] = [
+            {"u_px": 250.0, "v_px": 240.0},
+            {"u_px": 490.0, "v_px": 240.0},
+        ]
+    medium_solved = controller.solve_workstation_optical_pose_horizon({"annotations": medium_annotations})
+    medium_metrics = medium_solved["candidates"][-1]["quality_metrics"]
+
+    assert medium_metrics["left_pitch_sensitivity_1px_deg"] > long_metrics["left_pitch_sensitivity_1px_deg"]

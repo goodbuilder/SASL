@@ -292,6 +292,41 @@ def test_low_quality_candidate_remains_selectable_and_emits_explicit_payload() -
     app.processEvents()
 
 
+def test_candidate_detail_panel_shows_provenance_and_warnings_on_selection() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+
+    pane.set_candidates(
+        [
+            {
+                "candidate_id": "gnss-mountain-uv-1",
+                "method": "gnss-constrained-mountain-uv",
+                "input_hashes": {
+                    "lever_arm_status": "UNMODELED",
+                    "left_anchor_pose_sha256": "a" * 64,
+                },
+                "quality_metrics": {
+                    "sampson_rms_normalized": 1.2345e-4,
+                    "inlier_count": 8.0,
+                    "outlier_count": 2.0,
+                },
+                "warnings": ["lever arm UNMODELED: assumption, not a measurement"],
+                "observable_dof": {"roll": True, "pitch": True, "yaw": True},
+            }
+        ]
+    )
+
+    text = pane.candidate_detail_text.toPlainText()
+    assert "lever_arm_status: UNMODELED" in text
+    assert "left_anchor_pose_sha256: " + "a" * 64 in text
+    assert "sampson_rms_normalized:" in text
+    assert "inlier_count: 8" in text
+    assert "lever arm UNMODELED" in text
+
+    pane.deleteLater()
+    app.processEvents()
+
+
 def test_candidate_refresh_preserves_selection_by_candidate_id_after_reorder() -> None:
     app = _app()
     pane = OpticalPosePane()

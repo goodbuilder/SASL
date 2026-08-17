@@ -1857,8 +1857,20 @@ class MeasurementWorkspace(QtWidgets.QWidget):
     def _fit_preview_layout(self) -> None:
         self._update_preview_pair_orientation()
         required_height = _preview_pair_height(self.preview_splitter, self.previews)
-        if required_height > 0:
-            self.preview_splitter.setFixedHeight(max(280, required_height))
+        if required_height <= 0:
+            return
+        target_height = max(280, required_height)
+        if self.preview_splitter.minimumHeight() == target_height:
+            return
+        # setFixedHeight() pins both the minimum and maximum height, so any
+        # heightForWidth() fluctuation forces an immediate hard resize.  That
+        # resize can toggle the ancestor QScrollArea's AsNeeded vertical
+        # scrollbar, which changes this widget's width, which changes
+        # heightForWidth() again -- an infinite grow/shrink loop.  A
+        # minimum-only constraint (mirroring CameraWorkspace) lets the layout
+        # settle instead of re-forcing the exact pixel height every pass.
+        self.preview_splitter.setMaximumHeight(16777215)
+        self.preview_splitter.setMinimumHeight(target_height)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 - Qt override.
         super().resizeEvent(event)
@@ -3442,6 +3454,7 @@ class BaseGnssWorkspace(QtWidgets.QWidget):
                 ("gnss.survey_stop", "Stop Survey-in"),
                 ("gnss.ntrip_start", "Start NTRIP"),
                 ("gnss.ntrip_stop", "Stop NTRIP"),
+                ("gnss.ntrip_forget_password", "Forget NTRIP password"),
             )
         ):
             button = _command_button(label, command_id, invoke_command)
@@ -3953,6 +3966,38 @@ class _FrozenPreviewColumn(QtWidgets.QWidget):
         super().resizeEvent(event)
 
 
+class _CurrentPageTabWidget(QtWidgets.QTabWidget):
+    """Size to the current tab's page instead of the tallest page.
+
+    QTabWidget's internal QStackedWidget normally reports the size hint of
+    its largest page for every tab, so switching to a short page (e.g. a
+    single note + button) leaves most of that page blank. Following only
+    the current page's hint trades that wasted space for a height that
+    shifts when the active tab changes.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def _current_page_size(self) -> QtCore.QSize:
+        current = self.currentWidget()
+        page_size = current.sizeHint() if current is not None else QtCore.QSize(0, 0)
+        tab_bar = self.tabBar()
+        tab_bar_height = tab_bar.sizeHint().height() if tab_bar is not None else 0
+        frame_width = self.style().pixelMetric(QtWidgets.QStyle.PM_DefaultFrameWidth, None, self)
+        return QtCore.QSize(
+            page_size.width() + 2 * frame_width,
+            page_size.height() + tab_bar_height + 2 * frame_width,
+        )
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API.
+        return self._current_page_size()
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802 - Qt API.
+        return self._current_page_size()
+
+
 class _FrozenPreviewGroup(QtWidgets.QGroupBox):
     """Prevent the Alignment page from vertically squeezing the 16:9 pair."""
 
@@ -4067,7 +4112,6 @@ class OpticalPosePane(QtWidgets.QWidget):
         self.annotation_mode_combo.addItem("Drone target (1 point)", AnnotationMode.TARGET.value)
         self.annotation_mode_combo.currentIndexChanged.connect(self._set_annotation_mode)
         annotation_actions.addWidget(self.annotation_mode_combo)
-        self.manual_mode_buttons: dict[str, QtWidgets.QPushButton] = {}
         self._manual_mode_tooltips = {
             AnnotationMode.HORIZON.value: (
                 "Mark two points on the visible horizon in the frozen native image. "
@@ -4085,18 +4129,6 @@ class OpticalPosePane(QtWidgets.QWidget):
                 "refinement uses imported observations separately."
             ),
         }
-        for mode, label in (
-            (AnnotationMode.HORIZON.value, "Manual Horizon"),
-            (AnnotationMode.RIDGE.value, "Manual Mountain"),
-            (AnnotationMode.TARGET.value, "Manual Target"),
-        ):
-            button = QtWidgets.QPushButton(label)
-            button.setObjectName(f"opticalPoseManual{mode.title()}")
-            button.setToolTip(self._manual_mode_tooltips[mode])
-            button.clicked.connect(
-                lambda _checked=False, mode=mode: self._select_manual_annotation_mode(mode)
-            )
-            self.manual_mode_buttons[mode] = button
         self.annotation_clear_button = QtWidgets.QPushButton("Clear")
         self.annotation_clear_button.setObjectName("opticalPoseAnnotationClear")
         self.annotation_clear_button.setToolTip(
@@ -4114,7 +4146,7 @@ class OpticalPosePane(QtWidgets.QWidget):
         annotation_actions.addWidget(self.capture_frozen_burst_button)
         self.capture_frozen_burst_wiris_ftp_button = make_solver_button(
             "alignment.pose.capture_burst_wiris_ftp",
-            "Capture (WIRIS FTP)",
+            "Capture FTP HR",
         )
         self.capture_frozen_burst_wiris_ftp_button.setToolTip(
             "Trigger a WIRIS HR still on both cameras and download it via FTP instead of the "
@@ -4123,10 +4155,10 @@ class OpticalPosePane(QtWidgets.QWidget):
         annotation_actions.addWidget(self.capture_frozen_burst_wiris_ftp_button)
         self.capture_frozen_burst_wiris_ftp_oz_button = make_solver_button(
             "alignment.pose.capture_burst_wiris_ftp_oz",
-            "Capture (WIRIS FTP OZ)",
+            "Capture FTP OZ",
         )
         self.capture_frozen_burst_wiris_ftp_oz_button.setToolTip(
-            "Same as Capture (WIRIS FTP), using the lower-resolution "
+            "Same as Capture FTP HR, using the lower-resolution "
             "operating-zoom still (SIVI) instead of the HR still."
         )
         annotation_actions.addWidget(self.capture_frozen_burst_wiris_ftp_oz_button)
@@ -4373,7 +4405,7 @@ class OpticalPosePane(QtWidgets.QWidget):
 
         method_group = QtWidgets.QGroupBox("R,t measurement methods")
         method_layout = QtWidgets.QVBoxLayout(method_group)
-        self.method_tabs = QtWidgets.QTabWidget()
+        self.method_tabs = _CurrentPageTabWidget()
         self.method_tabs.setObjectName("opticalPoseMethodTabs")
 
         def add_method_tab(
@@ -4403,7 +4435,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Horizon R/P",
             "Two horizon points constrain Roll/Pitch only. Yaw and camera position remain at the prior pose.",
             (
-                self.manual_mode_buttons[AnnotationMode.HORIZON.value],
                 make_solver_button("alignment.pose.solve_horizon", "Solve Horizon Roll/Pitch"),
             ),
         )
@@ -4411,7 +4442,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Mountain + GNSS",
             "Click corresponding Mountain features in the same order on both frames. Uses paired u,v and the numeric GNSS baseline; no GeoTIFF or terrain height.",
             (
-                self.manual_mode_buttons[AnnotationMode.RIDGE.value],
                 make_solver_button("alignment.pose.solve_gnss_mountain", "Solve GNSS + Mountain R,t"),
             ),
         )
@@ -4441,7 +4471,6 @@ class OpticalPosePane(QtWidgets.QWidget):
             "Advanced single-target fallback: a frozen target pixel plus explicit Drone RTK line-of-sight "
             "evidence constrains Yaw. Use Pose workflow above for Telemetry initialization and full multi-view R,t.",
             (
-                self.manual_mode_buttons[AnnotationMode.TARGET.value],
                 make_solver_button("alignment.pose.solve_drone_yaw", "Solve Drone RTK Yaw"),
             ),
         )
@@ -4613,6 +4642,16 @@ class OpticalPosePane(QtWidgets.QWidget):
         self.candidate_table.setMinimumHeight(145)
         self.candidate_table.itemSelectionChanged.connect(self._refresh_candidate_actions)
         candidate_layout.addWidget(self.candidate_table)
+        self.candidate_detail_text = QtWidgets.QPlainTextEdit()
+        self.candidate_detail_text.setObjectName("opticalPoseCandidateDetail")
+        self.candidate_detail_text.setReadOnly(True)
+        self.candidate_detail_text.setMaximumHeight(110)
+        self.candidate_detail_text.setPlaceholderText(
+            "Select a candidate to review its provenance: rotation/translation/lever-arm "
+            "source, GNSS fix quality, Sampson/rms residuals, inliers, apply eligibility, "
+            "and warnings."
+        )
+        candidate_layout.addWidget(self.candidate_detail_text)
         self.reference_value = EngineeringValue("Existing calibration R,t")
         candidate_layout.addWidget(self.reference_value)
 
@@ -4901,6 +4940,20 @@ class OpticalPosePane(QtWidgets.QWidget):
                 points.append((u, v))
         return tuple(points)
 
+    @staticmethod
+    def _auto_confidences(value: object) -> tuple[float, ...]:
+        raw = value if isinstance(value, (tuple, list)) else ()
+        confidences: list[float] = []
+        for entry in raw:
+            try:
+                confidence = float(entry)
+            except (TypeError, ValueError):
+                return ()
+            if not math.isfinite(confidence):
+                return ()
+            confidences.append(confidence)
+        return tuple(confidences)
+
     def _clear_auto_overlays(self) -> None:
         for view in self.annotation_views.values():
             view.clear_suggestion_points()
@@ -4976,8 +5029,9 @@ class OpticalPosePane(QtWidgets.QWidget):
                 if not isinstance(row, Mapping):
                     continue
                 points = self._auto_points(row.get("points", row.get("annotation_points", ())))
+                confidences = self._auto_confidences(row.get("point_confidences", ()))
                 try:
-                    view.set_suggestion_points(points, mode=annotation_mode)
+                    view.set_suggestion_points(points, mode=annotation_mode, confidences=confidences)
                 except (RuntimeError, ValueError):
                     # A stale frame identity is shown in the status strip; it
                     # must not affect committed native annotations.
@@ -5130,23 +5184,10 @@ class OpticalPosePane(QtWidgets.QWidget):
                     "may provide Yaw when it is observable."
                 )
 
-        manual_button = self.manual_mode_buttons.get(mode)
-        for key, button in self.manual_mode_buttons.items():
-            button.setEnabled(True)
-            button.setProperty("selected", key == mode)
-            button.style().unpolish(button)
-            button.style().polish(button)
-        if manual_button is not None:
-            manual_button.setToolTip(
-                "Active manual mode. Click the frozen native image to add points. "
-                + self._manual_mode_tooltips.get(mode, "")
-            )
-
-    def _select_manual_annotation_mode(self, mode: AnnotationMode | str) -> None:
-        parsed = mode.value if isinstance(mode, AnnotationMode) else str(mode)
-        index = self.annotation_mode_combo.findData(parsed)
-        if index >= 0:
-            self.annotation_mode_combo.setCurrentIndex(index)
+        self.annotation_mode_combo.setToolTip(
+            "Click the frozen native image to add points. "
+            + self._manual_mode_tooltips.get(mode, "")
+        )
 
     def _clear_current_annotations(self) -> None:
         mode = str(
@@ -5478,15 +5519,73 @@ class OpticalPosePane(QtWidgets.QWidget):
         item = self.candidate_table.item(row, 0) if row >= 0 else None
         return bool(item is not None and item.data(QtCore.Qt.UserRole + 1))
 
+    _CANDIDATE_DETAIL_INPUT_HASH_KEYS = (
+        "lever_arm_status",
+        "left_anchor_pose_sha256",
+        "horizon_model",
+        "camera_height_above_reference_surface_m",
+        "pose_component_sources.relative_rotation",
+        "pose_component_sources.relative_translation",
+        "pose_component_sources.left_rotation",
+        "pose_component_sources.left_position",
+    )
+    _CANDIDATE_DETAIL_QUALITY_KEYS = (
+        "sampson_rms_normalized",
+        "sampson_p95_normalized",
+        "sampson_rms_px_equivalent",
+        "inlier_count",
+        "outlier_count",
+        "inlier_ratio",
+        "gnss_baseline_m",
+        "left_rms_normalized",
+        "right_rms_normalized",
+        "left_roll_sensitivity_1px_deg",
+        "left_pitch_sensitivity_1px_deg",
+        "right_roll_sensitivity_1px_deg",
+        "right_pitch_sensitivity_1px_deg",
+    )
+
+    @classmethod
+    def _candidate_detail_text(cls, candidate: Mapping[str, object]) -> str:
+        """Render provenance/quality/warnings for the selected candidate.
+
+        Purely additive review text: it only formats fields the owner
+        snapshot already exposes (``input_hashes``/``quality_metrics``/
+        ``warnings``) so a reviewer can see each value's source without a
+        dedicated widget per method.
+        """
+
+        lines: list[str] = []
+        input_hashes = candidate.get("input_hashes")
+        input_hashes = input_hashes if isinstance(input_hashes, Mapping) else {}
+        for key in cls._CANDIDATE_DETAIL_INPUT_HASH_KEYS:
+            if key in input_hashes:
+                lines.append(f"{key}: {input_hashes[key]}")
+        quality = candidate.get("quality_metrics")
+        quality = quality if isinstance(quality, Mapping) else {}
+        for key in cls._CANDIDATE_DETAIL_QUALITY_KEYS:
+            if key in quality:
+                lines.append(f"{key}: {quality[key]:.6g}")
+        warnings = candidate.get("warnings")
+        if isinstance(warnings, (tuple, list)) and warnings:
+            lines.append("warnings:")
+            lines.extend(f"  - {text}" for text in warnings)
+        return "\n".join(lines)
+
     def _refresh_candidate_actions(self) -> None:
         candidate_id = self.selected_candidate_id()
         self.apply_button.setEnabled(bool(candidate_id) and self._selected_candidate_applicable())
+        detail_widget = getattr(self, "candidate_detail_text", None)
         if not candidate_id:
             self.candidate_status_label.setText("No pose candidate")
+            if detail_widget is not None:
+                detail_widget.setPlainText("")
             return
         candidate = self._candidate_rows.get(candidate_id, {})
         state = candidate.get("state", candidate.get("quality", "available"))
         self.candidate_status_label.setText(f"{candidate_id} · {state}")
+        if detail_widget is not None:
+            detail_widget.setPlainText(self._candidate_detail_text(candidate))
 
     def combine_candidate_ids(self) -> tuple[str, ...]:
         """Return only the source candidates explicitly checked for composition."""
@@ -6504,8 +6603,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 "Capture & Compute",
                 (
                     ("calibration.capture_images", "Capture"),
-                    ("calibration.capture_images_wiris_ftp", "Capture (WIRIS FTP)"),
-                    ("calibration.capture_images_wiris_ftp_oz", "Capture (WIRIS FTP OZ)"),
+                    ("calibration.capture_images_wiris_ftp", "Capture FTP HR"),
+                    ("calibration.capture_images_wiris_ftp_oz", "Capture FTP OZ"),
                     ("calibration.run_intrinsic", "Run calibration (K,D)"),
                     ("calibration.run_extrinsics", "Calculate R,t"),
                     ("calibration.save_intrinsics", "Save Intrinsics"),
