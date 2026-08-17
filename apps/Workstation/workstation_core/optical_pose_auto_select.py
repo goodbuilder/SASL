@@ -54,6 +54,12 @@ class AutoSelectionResult:
     state: str
     detection_method: str
     points: tuple[Point2, ...] = ()
+    # Optional per-point match-quality score in [0, 1], index-aligned with
+    # ``points``. Empty when the mode has no natural per-point score (e.g.
+    # Horizon's single fitted line, or the skyline fallback's sampled
+    # points) -- callers must treat empty as "no per-point data", not as
+    # zero confidence.
+    point_confidences: tuple[float, ...] = ()
     candidate_count: int = 0
     match_count: int = 0
     inlier_count: int = 0
@@ -76,6 +82,12 @@ class AutoSelectionResult:
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "detection_method", str(self.detection_method or "unknown"))
         object.__setattr__(self, "points", _points(self.points))
+        confidences = tuple(
+            min(1.0, max(0.0, _finite(value, name="point_confidences"))) for value in self.point_confidences
+        )
+        if confidences and len(confidences) != len(self.points):
+            raise ValueError("point_confidences must be empty or match points length")
+        object.__setattr__(self, "point_confidences", confidences)
         object.__setattr__(self, "candidate_count", max(0, int(self.candidate_count)))
         object.__setattr__(self, "match_count", max(0, int(self.match_count)))
         object.__setattr__(self, "inlier_count", max(0, int(self.inlier_count)))
@@ -103,6 +115,7 @@ class AutoSelectionResult:
             "state": self.state,
             "detection_method": self.detection_method,
             "points": [{"u_px": u, "v_px": v} for u, v in self.points],
+            "point_confidences": list(self.point_confidences),
             "candidate_count": self.candidate_count,
             "match_count": self.match_count,
             "inlier_count": self.inlier_count,
@@ -710,6 +723,7 @@ def _skyline_mountain_fallback(
     right_camera_matrix: Any,
     left_distortion_coefficients: Any,
     right_distortion_coefficients: Any,
+    max_points: int = 8,
 ) -> MountainAutoSelection:
     """Return visible-but-unaccepted skyline samples for textureless scenes."""
 
@@ -723,8 +737,8 @@ def _skyline_mountain_fallback(
         camera_matrix=right_camera_matrix,
         distortion_coefficients=right_distortion_coefficients,
     )
-    left_points = _sample_line_endpoints(left_horizon.points)
-    right_points = _sample_line_endpoints(right_horizon.points)
+    left_points = _sample_line_endpoints(left_horizon.points, count=max_points)
+    right_points = _sample_line_endpoints(right_horizon.points, count=max_points)
     if len(left_points) < 4 or len(right_points) < 4:
         return _empty_mountain(
             "no_texture_matches_and_no_pairable_skyline_gradient",
@@ -846,6 +860,7 @@ def detect_mountain(
                 right_camera_matrix=right_camera_matrix,
                 left_distortion_coefficients=left_distortion_coefficients,
                 right_distortion_coefficients=right_distortion_coefficients,
+                max_points=max_points,
             )
         matcher = cv2.BFMatcher(norm, crossCheck=False)
         forward = matcher.knnMatch(descriptor_left, descriptor_right, k=2)
@@ -940,6 +955,7 @@ def detect_mountain(
                 right_camera_matrix=right_camera_matrix,
                 left_distortion_coefficients=left_distortion_coefficients,
                 right_distortion_coefficients=right_distortion_coefficients,
+                max_points=max_points,
             )
         left_points = np.asarray(
             [key_left[match.queryIdx].pt for match in matches], dtype=np.float64
@@ -998,6 +1014,7 @@ def detect_mountain(
                 right_camera_matrix=right_camera_matrix,
                 left_distortion_coefficients=left_distortion_coefficients,
                 right_distortion_coefficients=right_distortion_coefficients,
+                max_points=max_points,
             )
 
         inlier_left = left_points[inlier_indices]
@@ -1014,6 +1031,20 @@ def detect_mountain(
             np=np,
             max_points=max_points,
         )
+        # Lower SIFT/ORB descriptor distance means a stronger appearance
+        # match. Normalize against the whole geometrically-consistent inlier
+        # pool (not just the spread-selected subset) so a point's score
+        # reflects how it compares to every RANSAC-accepted match, not only
+        # to the handful of other points shown alongside it.
+        if selected_distances:
+            worst = float(np.max(inlier_distances)) if inlier_distances.size else float(max(selected_distances))
+            best = float(np.min(inlier_distances)) if inlier_distances.size else float(min(selected_distances))
+            spread = max(1.0e-6, worst - best)
+            point_confidences = tuple(
+                min(1.0, max(0.0, 1.0 - (float(distance) - best) / spread)) for distance in selected_distances
+            )
+        else:
+            point_confidences = ()
         rank, rank_ratio, area = _spatial_rank(selected_left, np)
         # Epipolar residual in normalized coordinates, converted to a useful
         # approximate pixel scale for the UI.  Do not call this a PnP or
@@ -1071,6 +1102,7 @@ def detect_mountain(
             "eligible": eligible and state == "GOOD",
             "failure_reason": reason,
             "warnings": warnings,
+            "point_confidences": point_confidences,
             "metadata": {
                 "inlier_ratio": inlier_ratio,
                 "coverage_score": coverage,

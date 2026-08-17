@@ -7,7 +7,9 @@ performed in this UI orchestration module.
 
 from __future__ import annotations
 
+import os
 import time
+from dataclasses import dataclass
 from math import isfinite
 
 from PyQt5 import QtCore, QtWidgets
@@ -17,6 +19,7 @@ from Workstation.gnss_runtime_workers import (
     GnssBaseSerialWorker,
     NtripNetworkWorker,
 )
+from Workstation.workstation_core import ntrip_credentials
 from Workstation.drone_telemetry_controller import (
     DRONE_RTCM_SOURCE_BASE,
     DRONE_RTCM_SOURCE_NTRIP,
@@ -59,6 +62,23 @@ from Workstation.workstation_core.gnss_protocol import (
     ubx_nav_svin_poll_frame,
 )
 
+class NtripCredentialError(RuntimeError):
+    """Raised by ``_resolve_ntrip_credentials`` with a precise, user-facing reason.
+
+    The message is safe to show as-is: it names which input is missing, never
+    a credential value.
+    """
+
+
+@dataclass(frozen=True)
+class NtripCredentialResolution:
+    username: str
+    password: str
+    # "session" (typed into the UI this run), "keyring" (OS secure store), or
+    # "legacy_env" (username_env/password_env indirection).
+    source: str
+
+
 GNSS_RUNTIME_CONTROLLER_METHODS = [
     "_refresh_gnss_base_tab",
     "_gnss_selected_operation_mode",
@@ -71,6 +91,10 @@ GNSS_RUNTIME_CONTROLLER_METHODS = [
     "_handle_gnss_operation_mode_changed",
     "_gnss_source_identity",
     "_gnss_gga_provider",
+    "_resolve_ntrip_credentials",
+    "_refresh_ntrip_credential_status",
+    "forget_gnss_ntrip_password",
+    "set_gnss_ntrip_session_password",
     "start_gnss_network",
     "stop_gnss_network",
     "_handle_gnss_network_connected",
@@ -78,6 +102,7 @@ GNSS_RUNTIME_CONTROLLER_METHODS = [
     "_handle_gnss_network_chunk",
     "_handle_gnss_network_failed",
     "_handle_gnss_network_reconnecting",
+    "_handle_gnss_network_diagnostic",
     "_clear_gnss_network_worker",
     "_record_gnss_base_position_row",
     "_handle_gnss_base_position",
@@ -208,9 +233,12 @@ class GnssRuntimeController:
     def _build_gnss_operation_config(self) -> GnssOperationConfig:
         """Build the persisted GNSS contract from the visible controls.
 
-        Credentials remain environment-variable names only.  The raw serial
-        and MAVLink paths are still owned by their existing widgets; this
-        object records how correction bytes are sourced and routed.
+        ``network.username`` is plain text and safe to persist.  The
+        password is never read here and never enters this config -- see
+        ``_resolve_ntrip_credentials`` for how it is looked up at connect
+        time.  The raw serial and MAVLink paths are still owned by their
+        existing widgets; this object records how correction bytes are
+        sourced and routed.
         """
 
         previous = self.panel._workstation_setting_overrides.get("gnss_operation", self.panel.settings.gnss_operation)
@@ -242,6 +270,8 @@ class GnssRuntimeController:
                     "caster_host": self.panel.gnss_ntrip_host_edit.text().strip(),
                     "caster_port": int(self.panel.gnss_ntrip_port_spin.value()),
                     "mountpoint": self.panel.gnss_ntrip_mountpoint_edit.text().strip(),
+                    "username": self.panel.gnss_ntrip_username_edit.text().strip(),
+                    "remember_password": self.panel.gnss_ntrip_remember_checkbox.isChecked(),
                     "username_env": self.panel.gnss_ntrip_username_env_edit.text().strip() or "NTRIP_USERNAME",
                     "password_env": self.panel.gnss_ntrip_password_env_edit.text().strip() or "NTRIP_PASSWORD",
                     "gga_policy": str(self.panel.gnss_ntrip_gga_policy_combo.currentData() or GgaPolicy.BASE_GNSS.value),
@@ -336,6 +366,16 @@ class GnssRuntimeController:
         # another rover/session policy.
         if assisted_fixed_mode and hasattr(self.panel, "gnss_ntrip_gga_policy_combo"):
             self.panel._set_combo_data(self.panel.gnss_ntrip_gga_policy_combo, GgaPolicy.BASE_GNSS.value)
+        elif (
+            not assisted_fixed_mode
+            and hasattr(self.panel, "gnss_ntrip_gga_policy_combo")
+            and self.panel.gnss_ntrip_gga_policy_combo.currentData() == GgaPolicy.BASE_GNSS.value
+        ):
+            # BASE_GNSS has no position source outside assisted Fixed Base --
+            # only that mode feeds latest_gnss_base_position from a local
+            # Base receiver.  Leaving a policy of BASE_GNSS selected here
+            # would silently stop sending GGA to a VRS mountpoint.
+            self.panel._set_combo_data(self.panel.gnss_ntrip_gga_policy_combo, GgaPolicy.SYSTEM_CENTER.value)
 
         # Keep the settings page focused on the currently selected correction
         # path.  The underlying widgets remain alive so persisted settings and
@@ -344,6 +384,7 @@ class GnssRuntimeController:
             ("gnss_base_config_group", serial_allowed),
             ("gnss_survey_config_group", local_mode),
             ("gnss_network_config_group", network_allowed),
+            ("gnss_network_legacy_env_group", network_allowed),
             ("gnss_fixed_config_group", assisted_fixed_mode),
             ("gnss_base_candidate_group", serial_allowed),
             ("gnss_survey_progress_group", local_mode),
@@ -420,16 +461,46 @@ class GnssRuntimeController:
         )
 
     def _gnss_gga_provider(self) -> str | None:
+        """Return the current GGA sentence, or ``None`` with a logged reason.
+
+        This is polled at connect time and roughly once per
+        ``on_gga_interval_s`` while streaming (see ``NtripClient``), so a
+        genuinely stuck ``None`` state logs at that same modest rate --
+        frequent enough to see live, never a per-recv()-loop spam risk.
+        """
+
         policy = self.panel._gnss_active_operation_config().network.gga_policy
         if policy == GgaPolicy.BASE_GNSS:
             sample = getattr(self.panel, "latest_gnss_base_position", None)
-            if sample is None or max(0.0, time.monotonic() - sample.timestamp_s) > 15.0:
+            if sample is None:
+                self.panel._log("[GNSS][NTRIP] GGA skipped: no Base GNSS sample received yet (policy=BASE_GNSS)")
+                return None
+            age_s = max(0.0, time.monotonic() - sample.timestamp_s)
+            if age_s > 15.0:
+                self.panel._log(
+                    f"[GNSS][NTRIP] GGA skipped: Base GNSS sample is stale "
+                    f"(age={age_s:.1f}s > 15.0s, policy=BASE_GNSS)"
+                )
                 return None
             return gga_from_coordinate_sample(sample)
         left = self.panel.latest_gps.get("left")
         right = self.panel.latest_gps.get("right")
         positions = [position for position in (left, right) if position is not None and position.has_position]
-        if policy == GgaPolicy.MANUAL or not positions:
+        if policy == GgaPolicy.MANUAL:
+            self.panel._log("[GNSS][NTRIP] GGA skipped: GGA policy is MANUAL; GGA is intentionally never sent")
+            return None
+        if not positions:
+            def _describe(position: object) -> str:
+                if position is None:
+                    return "no message received"
+                if not getattr(position, "has_position", False):
+                    return "message received but lat/lon/alt incomplete"
+                return "ok"
+
+            self.panel._log(
+                "[GNSS][NTRIP] GGA skipped: no left/right GNSS position available "
+                f"(policy={policy.value}, left={_describe(left)}, right={_describe(right)})"
+            )
             return None
         if policy == GgaPolicy.LEFT_GNSS or len(positions) == 1:
             return gga_from_position(positions[0])
@@ -441,32 +512,116 @@ class GnssRuntimeController:
         alt = sum(float(position.altitude_m) for position in positions) / len(positions)
         return format_nmea_gga(lat, lon, alt, fix_quality=1, satellites=12, hdop=1.0)
 
+    def _resolve_ntrip_credentials(self, network) -> "NtripCredentialResolution":
+        """Resolve the username/password to authenticate with, in priority order.
+
+        1. The password currently typed into the UI (this run's session).
+        2. The OS secure credential store (keyring), keyed by
+           host/mountpoint/username.
+        3. The legacy ``username_env``/``password_env`` indirection, read
+           from the OS environment.
+        4. None of the above -> raise with a specific, non-guessing reason.
+
+        The username itself is plain config (``network.username``, or the
+        legacy env var's resolved value); only the password is ever secret.
+        """
+
+        username = str(network.username).strip()
+        session_password = ""
+        if hasattr(self.panel, "gnss_ntrip_password_edit"):
+            session_password = self.panel.gnss_ntrip_password_edit.text()
+
+        if username and session_password:
+            return NtripCredentialResolution(username=username, password=session_password, source="session")
+
+        if not username:
+            # A legacy env-only configuration never set a username in the
+            # new field; fall through to the legacy tier below instead of
+            # failing immediately.
+            legacy_username = os.getenv(network.username_env, "") if network.username_env else ""
+            legacy_password = os.getenv(network.password_env, "") if network.password_env else ""
+            if legacy_username and legacy_password:
+                return NtripCredentialResolution(username=legacy_username, password=legacy_password, source="legacy_env")
+            raise NtripCredentialError("NTRIP username이 필요합니다")
+
+        storage_available = ntrip_credentials.secure_storage_available()
+        if storage_available:
+            stored = ntrip_credentials.load_password(network.caster_host, network.mountpoint, username)
+            if stored:
+                return NtripCredentialResolution(username=username, password=stored, source="keyring")
+
+        legacy_username = os.getenv(network.username_env, "") if network.username_env else ""
+        legacy_password = os.getenv(network.password_env, "") if network.password_env else ""
+        if legacy_username and legacy_password:
+            return NtripCredentialResolution(username=legacy_username, password=legacy_password, source="legacy_env")
+
+        if not storage_available:
+            raise NtripCredentialError(
+                "보안 자격증명 저장소를 사용할 수 없습니다 -- password를 입력하세요"
+            )
+        raise NtripCredentialError(
+            "저장된 NTRIP password가 없습니다 -- password를 입력하거나 저장된 자격증명을 확인하세요"
+        )
+
+    def _maybe_persist_ntrip_credential(self, network, credential: "NtripCredentialResolution") -> None:
+        """Save a freshly-typed session password, but only when asked to.
+
+        A password resolved from the keyring or the legacy env-var tier is
+        already stored (or intentionally not persisted anywhere); only a
+        brand-new "session" password is ever a candidate for saving, and
+        only when ``remember_password`` is set.
+        """
+
+        if credential.source != "session" or not network.remember_password:
+            return
+        ntrip_credentials.save_password(
+            network.caster_host, network.mountpoint, credential.username, credential.password
+        )
+
+    def _reject_ntrip_start(self, message: str, tone: str) -> None:
+        """Every guard below routes through here so a rejected Start NTRIP
+        click always leaves a line in the visible log, not only the small
+        "NTRIP" status label in the GNSS Base status grid -- a click that
+        only updates that label is easy to miss and reads as "did nothing".
+        """
+
+        self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], message, tone)
+        self.panel._log(f"[GNSS] NTRIP 시작 거부: {message}")
+
     def start_gnss_network(self) -> None:
         if self.panel.gnss_network_thread is not None:
             return
         config = self.panel._build_gnss_operation_config()
         if config.operation_mode == GnssOperationMode.LOCAL_SURVEY_IN:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "현장 모드에서는 NTRIP을 시작할 수 없습니다", "warn")
+            self._reject_ntrip_start("현장 모드에서는 NTRIP을 시작할 수 없습니다", "warn")
             return
-        if not config.network.caster_host or not config.network.mountpoint:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "caster host/mountpoint 필요", "bad")
+        if not config.network.caster_host:
+            self._reject_ntrip_start("caster host 필요", "bad")
+            return
+        if not config.network.mountpoint:
+            self._reject_ntrip_start("mountpoint 필요", "bad")
             return
         if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and not self.panel.gnss_base_serial_connected:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "보조 Fixed Base 모드는 먼저 Base serial을 연결하세요", "bad")
+            self._reject_ntrip_start("보조 Fixed Base 모드는 먼저 Base serial을 연결하세요", "bad")
             return
         if config.operation_mode == GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE:
             if config.network.gga_policy != GgaPolicy.BASE_GNSS:
-                self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "보조 Fixed Base는 Base GNSS GGA가 필요합니다", "bad")
+                self._reject_ntrip_start("보조 Fixed Base는 Base GNSS GGA가 필요합니다", "bad")
                 return
             if config.fixed_base.height_type != HeightType.ELLIPSOID:
-                self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "절대 WGS84 운용은 Fixed Base 높이를 ellipsoid로 설정하세요", "bad")
+                self._reject_ntrip_start("절대 WGS84 운용은 Fixed Base 높이를 ellipsoid로 설정하세요", "bad")
                 return
             base_sample = getattr(self.panel, "latest_gnss_base_position", None)
             if base_sample is None or max(0.0, time.monotonic() - base_sample.timestamp_s) > 15.0:
-                self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "Base WGS84 위치 샘플 대기 중입니다", "warn")
+                self._reject_ntrip_start("Base WGS84 위치 샘플 대기 중입니다", "warn")
                 return
         if config.operation_mode != GnssOperationMode.NETWORK_ASSISTED_FIXED_BASE and self.panel.mavlink_pixhawk is None:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
+            self._reject_ntrip_start("RTCM을 받을 MAVLink Pixhawk가 없습니다", "bad")
+            return
+        try:
+            credential = self._resolve_ntrip_credentials(config.network)
+        except NtripCredentialError as exc:
+            self._reject_ntrip_start(str(exc), "bad")
             return
         try:
             self.panel._gnss_configure_manager(config)
@@ -476,7 +631,7 @@ class GnssRuntimeController:
             if not self.panel._gnss_transition(GnssOperationState.NTRIP_CONNECTING, "NTRIP caster 연결 중"):
                 return
         except (ValueError, RuntimeError) as exc:
-            self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"운용 설정 실패: {exc}", "bad")
+            self._reject_ntrip_start(f"운용 설정 실패: {exc}", "bad")
             return
         self.panel.gnss_operation_gate_active = True
         self.panel.gnss_active_operation_config = config
@@ -505,8 +660,15 @@ class GnssRuntimeController:
         self.panel.gnss_network_stop_button.setEnabled(True)
         self.panel._set_gnss_operation_controls_locked(True)
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], "NTRIP 연결 중", "warn")
+        self._maybe_persist_ntrip_credential(config.network, credential)
+        self.panel._refresh_ntrip_credential_status()
         thread = QtCore.QThread(self.panel)
-        worker = NtripNetworkWorker(config=config.network, gga_provider=self.panel._gnss_gga_provider)
+        worker = NtripNetworkWorker(
+            config=config.network,
+            gga_provider=self.panel._gnss_gga_provider,
+            username=credential.username,
+            password=credential.password,
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.connected.connect(self.panel._handle_gnss_network_connected)
@@ -514,6 +676,7 @@ class GnssRuntimeController:
         worker.chunk_received.connect(self.panel._handle_gnss_network_chunk)
         worker.reconnecting.connect(self.panel._handle_gnss_network_reconnecting)
         worker.failed.connect(self.panel._handle_gnss_network_failed)
+        worker.diagnostic.connect(self.panel._handle_gnss_network_diagnostic)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda: self.panel._clear_gnss_network_worker(thread))
@@ -544,13 +707,73 @@ class GnssRuntimeController:
             return True
         return False
 
+    def _ntrip_credential_lookup_key(self) -> tuple[str, str, str]:
+        config = self.panel._build_gnss_operation_config()
+        network = config.network
+        return network.caster_host, network.mountpoint, network.username
+
+    def _refresh_ntrip_credential_status(self) -> None:
+        """Recompute and display whether a password is currently saved.
+
+        Never shows the password itself -- only Saved securely / Not saved /
+        Unavailable, per the current host/mountpoint/username.
+        """
+
+        if not hasattr(self.panel, "gnss_ntrip_credential_status_label"):
+            return
+        host, mountpoint, username = self._ntrip_credential_lookup_key()
+        status = ntrip_credentials.credential_status(host, mountpoint, username)
+        text, tone = {
+            ntrip_credentials.CredentialStorageStatus.SAVED: ("Saved securely", "good"),
+            ntrip_credentials.CredentialStorageStatus.NOT_SAVED: ("Not saved", "idle"),
+            ntrip_credentials.CredentialStorageStatus.UNAVAILABLE: ("Unavailable (session only)", "warn"),
+        }[status]
+        self.panel._set_health_label(self.panel.gnss_ntrip_credential_status_label, text, tone)
+
+    def forget_gnss_ntrip_password(self) -> None:
+        host, mountpoint, username = self._ntrip_credential_lookup_key()
+        ntrip_credentials.delete_password(host, mountpoint, username)
+        self.panel._refresh_ntrip_credential_status()
+
+    def set_gnss_ntrip_session_password(self, password: str) -> None:
+        """Copy a typed password into the widget ``_resolve_ntrip_credentials``
+        actually reads.
+
+        The Settings workspace has its own separate "NTRIP caster (any
+        provider)" password field so the value never has to round-trip
+        through ``settings_payload()``'s JSON-safe dict (the password is
+        deliberately not a ``NetworkConfig`` field -- see
+        ``_resolve_ntrip_credentials``). That field lives on the
+        ``SettingsWorkspace`` widget, not on ``panel``, so it must be handed
+        over explicitly by a caller that has both objects in scope
+        (``main_window.py``'s ``_settings_apply``) rather than discovered
+        here. Without this bridge, typing a password there and clicking
+        Apply Settings never reached ``gnss_ntrip_password_edit``, so Start
+        NTRIP kept reporting "no saved password" no matter what was typed.
+        """
+
+        if hasattr(self.panel, "gnss_ntrip_password_edit"):
+            self.panel.gnss_ntrip_password_edit.setText(str(password))
+
     def _handle_gnss_network_connected(self, status_line: str, stats: object) -> None:
         self.panel.gnss_network_connected = True
         self.panel.gnss_network_phase = "CONNECTED"
         self.panel.gnss_network_stats = stats
         self.panel.gnss_network_last_error = ""
         self.panel.gnss_network_status_line = str(status_line)
-        self.panel._gnss_transition(GnssOperationState.NTRIP_ACTIVE, f"NTRIP active: {status_line}")
+        # NtripNetworkWorker reconnects transparently on any transient stream
+        # drop (a caster closing the connection, a network blip) and
+        # re-emits ``connected`` every time -- including well after the
+        # operation state machine has already progressed past NTRIP_ACTIVE to
+        # READY/MEASURING. Only INITIALIZING/NTRIP_CONNECTING can legally
+        # transition into NTRIP_ACTIVE; attempting it again from a later
+        # state used to log a scary "상태 전환 실패: invalid GNSS state
+        # transition" fault on every ordinary reconnect, even though RTCM
+        # kept flowing the whole time -- chunk routing in
+        # _handle_gnss_network_chunk never depended on this state machine.
+        current_state = self.panel.gnss_operation_manager.state
+        if current_state in {GnssOperationState.INITIALIZING, GnssOperationState.NTRIP_CONNECTING}:
+            self.panel._gnss_transition(GnssOperationState.NTRIP_ACTIVE, f"NTRIP active: {status_line}")
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"{status_line} | RTCM 대기", "good")
 
     def _handle_gnss_network_stats(self, stats: object) -> None:
@@ -601,12 +824,35 @@ class GnssRuntimeController:
             self.panel._handle_gnss_base_rtcm_frame(frame, source=DRONE_RTCM_SOURCE_NTRIP)
         self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP RTCM {len(frames)} frame 수신", "good")
 
+    def _handle_gnss_network_diagnostic(self, message: str) -> None:
+        """Surface NtripClient's per-event evidence (connect/GGA TX outcome).
+
+        These events never stop or restart anything -- they carry no status
+        of their own -- so without this they would never reach the visible
+        log at all, unlike a stream failure which already flows through
+        ``reconnecting``/``failed``.
+        """
+
+        self.panel._log(f"[GNSS][NTRIP] {message}")
+
     def _handle_gnss_network_failed(self, message: str) -> None:
         self.panel.gnss_network_connected = False
         self.panel.gnss_network_phase = "ERROR"
         self.panel.gnss_network_last_error = str(message)
-        self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], f"NTRIP 실패: {message}", "bad")
-        self.panel._gnss_transition(GnssOperationState.FAULT, f"NTRIP failure: {message}")
+        text = str(message)
+        # 401 means the caster rejected the credentials; it is deliberately
+        # not asserted here whether the username or the password was wrong.
+        if "401" in text or "unauthorized" in text.lower():
+            display = f"NTRIP 인증 거부 (username/password 확인 필요): {text}"
+        else:
+            display = f"NTRIP 실패: {text}"
+        self.panel._set_health_label(self.panel.gnss_base_status_labels["network"], display, "bad")
+        # A worker-thread failure after credentials already resolved is the
+        # one NTRIP fault that used to leave zero trace in the log -- only
+        # this same small status label, which is exactly why a rejected
+        # password after Start NTRIP "does nothing" a second time.
+        self.panel._log(f"[GNSS] {display}")
+        self.panel._gnss_transition(GnssOperationState.FAULT, f"NTRIP failure: {text}")
 
     def _handle_gnss_network_reconnecting(self, message: str) -> None:
         if not self.panel.gnss_operation_gate_active:
@@ -622,6 +868,7 @@ class GnssRuntimeController:
             f"NTRIP 재연결 대기: {message}",
             "warn",
         )
+        self.panel._log(f"[GNSS] NTRIP 재연결 시도 {self.panel.gnss_network_reconnect_count}: {message}")
 
     def _clear_gnss_network_worker(self, thread: QtCore.QThread) -> None:
         if self.panel.gnss_network_thread is thread:

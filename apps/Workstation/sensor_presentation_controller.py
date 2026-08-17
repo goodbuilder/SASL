@@ -611,12 +611,13 @@ class SensorPresentationController:
             self.panel._refresh_one_pixhawk_sensor_health(camera, title, now_s)
 
     def _refresh_one_pixhawk_sensor_health(self, camera: str, title: str, now_s: float) -> None:
-        mag_slots = self.panel.latest_mag_sensors.get(camera, {})
         gps_slots = self.panel.latest_gps_sensors.get(camera, {})
         gnss_relative = self.panel.latest_gnss_relative.get(camera)
-        rm_detected = sum(1 for slot in ("CAN1", "CAN2") if slot in mag_slots)
+        rm_detected = sum(
+            1 for slot in ("CAN1", "CAN2") if self.panel._mag_slot_state(camera, slot) is not None
+        )
         for slot, label in self.panel.rm3100_slot_labels[camera].items():
-            state = mag_slots.get(slot)
+            state = self.panel._mag_slot_state(camera, slot)
             if state is None:
                 self.panel._set_health_label(
                     label,
@@ -635,8 +636,8 @@ class SensorPresentationController:
             level = "bad" if age_ms > 3000 else "warn" if age_ms > 1000 else "good"
             self.panel._set_health_label(label, f"{components}{magnitude}{temp}{errors} | age={age_ms:.0f}ms{device}", level)
 
-        can1 = mag_slots.get("CAN1")
-        can2 = mag_slots.get("CAN2")
+        can1 = self.panel._mag_slot_state(camera, "CAN1")
+        can2 = self.panel._mag_slot_state(camera, "CAN2")
         rm_level = "bad"
         rm_summary = f"Status: 대기 중 | {rm_detected}/2 detected"
         if can1 is not None and can2 is not None:

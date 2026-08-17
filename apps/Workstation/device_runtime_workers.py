@@ -645,35 +645,41 @@ class PixhawkParameterWorker(QtCore.QObject):
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
+        # Each individual read_param/read_param_int/set_param_int call below
+        # already reserves the receive path for itself via the subscriber's
+        # own exclusive_command(camera). Wrapping this whole method in a
+        # second, outer exclusive_command(camera) used to make every single
+        # operation fail immediately: the guard treats a second reservation
+        # for the same camera as another command already in progress and
+        # raises, even though it is this same worker calling into itself.
         try:
-            with self.subscriber.exclusive_command(self.camera):
-                if self.operation == "mag_refresh":
-                    status = build_mag_status(
-                        self._read_mag_params(),
-                        actual_selected_device_id=self.actual_selected_device_id,
-                        armed=self.armed,
-                    )
-                    result = {"kind": self.operation, "camera": self.camera, "status": status}
-                elif self.operation == "attitude_refresh":
-                    status = build_attitude_cal_status(self._read_attitude_params())
-                    result = {"kind": self.operation, "camera": self.camera, "status": status}
-                elif self.operation == "calibration_refresh":
-                    mag_status = build_mag_status(
-                        self._read_mag_params(),
-                        actual_selected_device_id=self.actual_selected_device_id,
-                        armed=self.armed,
-                    )
-                    attitude_status = build_attitude_cal_status(self._read_attitude_params())
-                    result = {
-                        "kind": self.operation,
-                        "camera": self.camera,
-                        "mag_status": mag_status,
-                        "attitude_status": attitude_status,
-                    }
-                elif self.operation == "mag_apply":
-                    result = self._run_mag_apply()
-                else:
-                    raise ValueError(f"Unknown Pixhawk parameter operation: {self.operation}")
+            if self.operation == "mag_refresh":
+                status = build_mag_status(
+                    self._read_mag_params(),
+                    actual_selected_device_id=self.actual_selected_device_id,
+                    armed=self.armed,
+                )
+                result = {"kind": self.operation, "camera": self.camera, "status": status}
+            elif self.operation == "attitude_refresh":
+                status = build_attitude_cal_status(self._read_attitude_params())
+                result = {"kind": self.operation, "camera": self.camera, "status": status}
+            elif self.operation == "calibration_refresh":
+                mag_status = build_mag_status(
+                    self._read_mag_params(),
+                    actual_selected_device_id=self.actual_selected_device_id,
+                    armed=self.armed,
+                )
+                attitude_status = build_attitude_cal_status(self._read_attitude_params())
+                result = {
+                    "kind": self.operation,
+                    "camera": self.camera,
+                    "mag_status": mag_status,
+                    "attitude_status": attitude_status,
+                }
+            elif self.operation == "mag_apply":
+                result = self._run_mag_apply()
+            else:
+                raise ValueError(f"Unknown Pixhawk parameter operation: {self.operation}")
         except Exception as exc:
             self.failed.emit(str(exc))
         else:

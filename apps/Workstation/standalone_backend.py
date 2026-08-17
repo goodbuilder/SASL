@@ -295,6 +295,12 @@ class StandalonePanelBackend(QtCore.QObject):
         self._call("stop_gnss_network")
         return None
 
+    def gnss_ntrip_forget_password(self) -> Any:
+        return self._call("forget_gnss_ntrip_password")
+
+    def set_gnss_ntrip_session_password(self, password: str) -> Any:
+        return self._call("set_gnss_ntrip_session_password", password)
+
     def calibration_capture_images(self) -> Any:
         return self._call("capture_calibration_images")
 

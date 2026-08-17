@@ -343,6 +343,13 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "gnss",
                 self._gnss_ntrip_stop,
             ),
+            (
+                "gnss.ntrip_forget_password",
+                "Forget NTRIP password",
+                "Remove the saved NTRIP password from the OS secure credential store.",
+                "gnss",
+                self._gnss_ntrip_forget_password,
+            ),
         ):
             self.commands.register(CommandSpec(command_id, text, tooltip, category, handler))
         for side_code, camera in (("p1", "left"), ("p2", "right")):
@@ -400,15 +407,15 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
             ),
             (
                 "calibration.capture_images_wiris_ftp",
-                "Capture (WIRIS FTP)",
+                "Capture FTP HR",
                 "Trigger a WIRIS HR still on both cameras and download it via FTP "
                 "into this calibration run, instead of the live RTSP feed.",
                 self._calibration_capture_images_wiris_ftp,
             ),
             (
                 "calibration.capture_images_wiris_ftp_oz",
-                "Capture (WIRIS FTP OZ)",
-                "Same as Capture (WIRIS FTP), using the lower-resolution operating-zoom "
+                "Capture FTP OZ",
+                "Same as Capture FTP HR, using the lower-resolution operating-zoom "
                 "still (SIVI) instead of the HR still -- faster, no camera reboot risk.",
                 self._calibration_capture_images_wiris_ftp_oz,
             ),
@@ -800,6 +807,8 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         toolbar.addAction(self.commands.action("recording.toggle"))
         toolbar.addAction(self.commands.action("session.save"))
         toolbar.addSeparator()
+        toolbar.addAction(self.navigation_dock.toggleViewAction())
+        toolbar.addAction(self.inspector_dock.toggleViewAction())
         toolbar.addAction(self.diagnostics_dock.toggleViewAction())
         self.toolbar = toolbar
 
@@ -1482,6 +1491,9 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _gnss_ntrip_stop(self) -> object:
         return self.backend.gnss_ntrip_stop()
 
+    def _gnss_ntrip_forget_password(self) -> object:
+        return self.backend.gnss_ntrip_forget_password()
+
     def _calibration_capture_images(self) -> object:
         return self.backend.calibration_capture_images()
 
@@ -1529,6 +1541,11 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
         return self.backend.save_measurement_settings()
 
     def _settings_apply(self) -> object:
+        # The NTRIP password field lives only on this workspace widget, never
+        # in settings_payload()'s JSON-safe dict (see NetworkConfig /
+        # ntrip_credentials.py). It needs its own explicit handoff here,
+        # where both this workspace and the backend are in scope.
+        self.backend.set_gnss_ntrip_session_password(self.settings_workspace.gnss_network_password_edit.text())
         return self.backend.apply_workstation_system_settings(self.settings_workspace.settings_payload())
 
     def _settings_save(self) -> object:

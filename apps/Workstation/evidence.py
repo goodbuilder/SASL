@@ -735,6 +735,10 @@ class EvidenceAdapter:
                 "mountpoint": str(source_identity.get("mountpoint", network_config.get("mountpoint", "")) or ""),
                 "gga_policy": str(source_identity.get("gga_policy", network_config.get("gga_policy", "")) or ""),
                 "tls": bool(network_config.get("tls", False)),
+                # Username is plain config; the password is never present in
+                # network_config (NetworkConfig has no such field) and must
+                # never be added here -- see workstation_core/ntrip_credentials.py.
+                "username": str(network_config.get("username", "") or ""),
                 "username_env": str(network_config.get("username_env", "") or ""),
                 "password_env": str(network_config.get("password_env", "") or ""),
                 "session_age_s": ntrip_health.session_age_s,

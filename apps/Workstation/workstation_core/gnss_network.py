@@ -227,6 +227,11 @@ class NtripStreamStats:
     chunks_received: int = 0
     last_chunk_monotonic_s: float | None = None
     last_gga_monotonic_s: float | None = None
+    # Total GGA sentences actually written to the socket (initial + periodic),
+    # not merely "handed to gga_provider" -- a send that raises OSError does
+    # not count. Distinct diagnostic evidence for "did we ever confirm a live
+    # rover position to the caster" versus "did RTCM keep flowing".
+    gga_sent_count: int = 0
 
 
 class NtripClient:
@@ -244,6 +249,7 @@ class NtripClient:
         username: str | None = None,
         password: str | None = None,
         socket_factory: Callable[..., socket.socket] | None = None,
+        diagnostics: Callable[[str], None] | None = None,
     ) -> None:
         self.config = config
         self.username = os.getenv(config.username_env, "") if username is None else str(username)
@@ -252,10 +258,50 @@ class NtripClient:
         self._socket: socket.socket | ssl.SSLSocket | None = None
         self._closed = False
         self._stats: NtripStreamStats | None = None
+        # Optional one-line-per-event hook (e.g. wired to a Qt log signal by
+        # the caller). Never allowed to break the network loop: a raising
+        # callback is swallowed, not propagated.
+        self._diagnostics = diagnostics
 
     @property
     def stats(self) -> NtripStreamStats | None:
         return self._stats
+
+    def _diagnostic(self, message: str) -> None:
+        if self._diagnostics is None:
+            return
+        try:
+            self._diagnostics(message)
+        except Exception:
+            pass
+
+    def _eof_diagnostic_message(self, now_s: float) -> str:
+        """Build the disconnect evidence bundle for a caster-closed stream.
+
+        Every field the operator needs to tell "we never confirmed a live
+        rover position" (last_gga_age) apart from "the caster just stopped
+        sending RTCM" (last_rtcm_age) apart from "the caster capped the
+        session duration regardless" (connected_duration) lands in this one
+        message, which is what reaches the visible log via the existing
+        reconnecting/failed handlers -- no separate plumbing needed.
+        """
+
+        stats = self._stats
+        if stats is None:
+            return "NTRIP caster closed the stream (no stream stats available)"
+        connected_duration_s = now_s - stats.connected_at_monotonic_s
+        last_gga_age = (
+            "never" if stats.last_gga_monotonic_s is None else f"{now_s - stats.last_gga_monotonic_s:.2f}s"
+        )
+        last_rtcm_age = (
+            "never" if stats.last_chunk_monotonic_s is None else f"{now_s - stats.last_chunk_monotonic_s:.2f}s"
+        )
+        return (
+            "NTRIP caster closed the stream "
+            f"(connected_duration={connected_duration_s:.2f}s, last_gga_age={last_gga_age}, "
+            f"last_rtcm_age={last_rtcm_age}, gga_sent={stats.gga_sent_count}, "
+            f"chunks_received={stats.chunks_received}, bytes_received={stats.bytes_received})"
+        )
 
     def connect(self, *, gga_sentence: str | None = None) -> tuple[str, bytes]:
         if self._socket is not None:
@@ -293,7 +339,30 @@ class NtripClient:
                 password=self.password,
                 gga_sentence=gga_sentence,
             )
-            self._socket.sendall(request)
+            # NTRIP 1.x client behaviour: the initial GGA (when available) is
+            # part of the same initial wire transmission as the request, sent
+            # as a raw NMEA line directly following the request's blank-line
+            # terminator -- not merely referenced via the non-standard
+            # ``Ntrip-GGA:`` request header above, which most casters ignore.
+            # Folding it into one sendall() (rather than a second write after
+            # the response arrives, as an earlier version of this method did)
+            # means a caster that requires an on-the-wire GGA before it will
+            # keep a session open never sees a window with none: previously,
+            # a caster that both required this AND rejected the ``Ntrip-GGA:``
+            # header saw a live connection with zero position evidence for
+            # the round trip between the request and this second write.
+            initial_gga_bytes = (
+                (gga_sentence.rstrip("\r\n") + "\r\n").encode("ascii") if gga_sentence else b""
+            )
+            self._socket.sendall(request + initial_gga_bytes)
+            if gga_sentence:
+                self._diagnostic(
+                    f"INITIAL GGA TX ok len={len(gga_sentence)} sent_with_request=True at={time.monotonic():.3f}"
+                )
+            else:
+                self._diagnostic(
+                    "INITIAL GGA TX skipped: no gga_sentence available (gga_provider returned None)"
+                )
             response = bytearray()
             deadline = time.monotonic() + float(self.config.connect_timeout_s)
             while not ntrip_header_ready(bytes(response)):
@@ -306,7 +375,13 @@ class NtripClient:
                     break
                 response.extend(chunk)
             status_line, initial_payload = parse_ntrip_response_header(bytes(response))
-            self._stats = NtripStreamStats(connected_at_monotonic_s=time.monotonic())
+            now_s = time.monotonic()
+            self._stats = NtripStreamStats(
+                connected_at_monotonic_s=now_s,
+                last_gga_monotonic_s=now_s if gga_sentence else None,
+                gga_sent_count=1 if gga_sentence else 0,
+            )
+            self._diagnostic(f"NTRIP CONNECTED status={status_line!r} at={now_s:.3f}")
             return status_line, initial_payload
         except Exception:
             self._socket = None
@@ -320,7 +395,7 @@ class NtripClient:
         *,
         gga_provider: Callable[[], str | None] | None = None,
         initial_payload: bytes = b"",
-        on_gga_interval_s: float = 10.0,
+        on_gga_interval_s: float = 5.0,
     ) -> Iterator[bytes]:
         if self._socket is None:
             raise RuntimeError("NTRIP client is not connected")
@@ -330,6 +405,13 @@ class NtripClient:
         while not self._closed and not stop_event.is_set():
             now_s = time.monotonic()
             if gga_provider is not None and now_s - last_gga_s >= max(1.0, float(on_gga_interval_s)):
+                # Advance the interval clock unconditionally, even when the
+                # provider has nothing to send this cycle. Only bumping it
+                # inside the ``if sentence:`` branch below meant a provider
+                # stuck returning ``None`` (e.g. GNSS fix lost mid-session)
+                # got re-polled on every loop iteration -- as fast as
+                # ``recv()`` returns -- instead of once per interval.
+                last_gga_s = now_s
                 sentence = gga_provider()
                 if sentence:
                     try:
@@ -338,11 +420,20 @@ class NtripClient:
                         if self._closed or stop_event.is_set():
                             return
                         raise
-                    last_gga_s = now_s
                     if self._stats is not None:
                         self._stats = NtripStreamStats(
-                            **{**self._stats.__dict__, "last_gga_monotonic_s": now_s}
+                            **{
+                                **self._stats.__dict__,
+                                "last_gga_monotonic_s": now_s,
+                                "gga_sent_count": self._stats.gga_sent_count + 1,
+                            }
                         )
+                    self._diagnostic(
+                        f"PERIODIC GGA TX #{self._stats.gga_sent_count if self._stats else '?'} "
+                        f"ok len={len(sentence)} at={now_s:.3f}"
+                    )
+                else:
+                    self._diagnostic(f"PERIODIC GGA TX skipped: gga_provider returned no sentence at={now_s:.3f}")
             try:
                 chunk = self._socket.recv(4096)
             except socket.timeout:
@@ -354,7 +445,7 @@ class NtripClient:
             if not chunk:
                 if self._closed or stop_event.is_set():
                     return
-                raise NtripProtocolError("NTRIP caster closed the stream")
+                raise NtripProtocolError(self._eof_diagnostic_message(now_s))
             if self._stats is not None:
                 self._stats = NtripStreamStats(
                     **{

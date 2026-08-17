@@ -5,6 +5,8 @@ from typing import Any
 
 from PyQt5 import QtWidgets
 
+from Workstation.wiris_ftp_browser import WirisFtpBrowserDialog
+from Workstation.workstation_core import ntrip_credentials
 from Workstation.workstation_core.settings import AppSettings
 
 from .components import WorkspaceHeader
@@ -25,6 +27,7 @@ class SettingsWorkspace(QtWidgets.QWidget):
     ) -> None:
         super().__init__(parent)
         self.backend = backend
+        self.invoke_command = invoke_command
         self.settings_widgets: dict[str, QtWidgets.QWidget] = {}
         self._snapshot = self._read_snapshot()
 
@@ -110,6 +113,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
             "gnss_network_caster_host": self._gnss_value("network", "caster_host"),
             "gnss_network_caster_port": self._gnss_value("network", "caster_port"),
             "gnss_network_mountpoint": self._gnss_value("network", "mountpoint"),
+            "gnss_network_username": self._gnss_value("network", "username"),
+            "gnss_network_remember_password": self._gnss_value("network", "remember_password"),
             "gnss_network_username_env": self._gnss_value("network", "username_env"),
             "gnss_network_password_env": self._gnss_value("network", "password_env"),
             "gnss_network_tls": self._gnss_value("network", "tls"),
@@ -274,10 +279,35 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ("FTP password", self._text("wiris_ftp_password", password=True)),
                     ("FTP remote dir", self._text("wiris_ftp_remote_dir", placeholder="/")),
                     ("FTP timeout", self._number("wiris_ftp_timeout_s", 0.5, 60.0, 1, " s")),
+                    ("", self._ftp_browse_button()),
                 ],
             )
         )
         layout.addStretch(1)
+
+    def _ftp_browse_button(self) -> QtWidgets.QPushButton:
+        button = QtWidgets.QPushButton("Browse FTP...")
+        button.setToolTip("Open a live FTP browser to explore the camera and find the right remote dir.")
+        button.clicked.connect(self._open_wiris_ftp_browser)
+        return button
+
+    def _open_wiris_ftp_browser(self) -> None:
+        hosts = {
+            "Left": self.settings_widgets["left_control_host"].text().strip(),
+            "Right": self.settings_widgets["right_control_host"].text().strip(),
+        }
+        hosts = {label: host for label, host in hosts.items() if host}
+        dialog = WirisFtpBrowserDialog(
+            self,
+            hosts=hosts,
+            port=self.settings_widgets["wiris_ftp_port"].value(),
+            user=self.settings_widgets["wiris_ftp_user"].text(),
+            password=self.settings_widgets["wiris_ftp_password"].text(),
+            remote_dir=self.settings_widgets["wiris_ftp_remote_dir"].text() or "/",
+            timeout_s=self.settings_widgets["wiris_ftp_timeout_s"].value(),
+        )
+        if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.selected_remote_dir:
+            self.settings_widgets["wiris_ftp_remote_dir"].setText(dialog.selected_remote_dir)
 
     def _build_yolo_tab(self) -> None:
         layout = self._tab("YOLO / RTSP")
@@ -409,6 +439,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
             "gnss_network_caster_host",
             "gnss_network_caster_port",
             "gnss_network_mountpoint",
+            "gnss_network_username",
+            "gnss_network_remember_password",
             "gnss_network_username_env",
             "gnss_network_password_env",
             "gnss_network_tls",
@@ -420,6 +452,10 @@ class SettingsWorkspace(QtWidgets.QWidget):
             widget = self.settings_widgets.get(key)
             if widget is not None:
                 widget.setEnabled(not local_survey_in)
+        if hasattr(self, "gnss_network_password_edit"):
+            self.gnss_network_password_edit.setEnabled(not local_survey_in)
+        if hasattr(self, "gnss_network_forget_password_button"):
+            self.gnss_network_forget_password_button.setEnabled(not local_survey_in)
 
         for key in (
             "gnss_fixed_coordinate_profile_path",
@@ -518,6 +554,14 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 ],
             )
         )
+        self.gnss_network_password_edit = QtWidgets.QLineEdit()
+        self.gnss_network_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.gnss_network_password_edit.setPlaceholderText("NTRIP password")
+        self.gnss_network_credential_status_label = QtWidgets.QLabel("--")
+        self.gnss_network_forget_password_button = QtWidgets.QPushButton("Forget saved password")
+        self.gnss_network_forget_password_button.clicked.connect(
+            lambda: self.invoke_command("gnss.ntrip_forget_password") if self.invoke_command else None
+        )
         layout.addWidget(
             self._group(
                 "NTRIP caster (any provider)",
@@ -528,6 +572,23 @@ class SettingsWorkspace(QtWidgets.QWidget):
                     ),
                     ("Caster port", self._integer("gnss_network_caster_port", 1, 65535)),
                     ("Mountpoint", self._text("gnss_network_mountpoint", placeholder="MOUNTPOINT")),
+                    ("Username", self._text("gnss_network_username", placeholder="NTRIP username")),
+                    ("Password", self.gnss_network_password_edit),
+                    ("Remember password securely", self._toggle("gnss_network_remember_password", "Store password in the OS credential store")),
+                    ("Credential status", self.gnss_network_credential_status_label),
+                    ("", self.gnss_network_forget_password_button),
+                    ("TLS", self._toggle("gnss_network_tls", "Use TLS for NTRIP")),
+                    ("Reconnect interval", self._number("gnss_network_reconnect_interval_s", 0.0, 3600.0, 2, " s")),
+                    ("Connect timeout", self._number("gnss_network_connect_timeout_s", 0.1, 3600.0, 2, " s")),
+                    ("Read timeout", self._number("gnss_network_read_timeout_s", 0.1, 3600.0, 2, " s")),
+                    ("GGA policy", self._combo("gnss_network_gga_policy", (("Base GNSS (assisted fixed base)", "BASE_GNSS"), ("System center", "SYSTEM_CENTER"), ("Left GNSS", "LEFT_GNSS"), ("Manual / disabled", "MANUAL"), ("Per rover session", "PER_ROVER_SESSION")))),
+                ],
+            )
+        )
+        layout.addWidget(
+            self._group(
+                "레거시 환경변수 인증 (선택 사항 -- 위 Username/Password가 비어 있을 때만 fallback으로 사용)",
+                [
                     (
                         "Username environment variable",
                         self._text("gnss_network_username_env", placeholder="NTRIP_USERNAME"),
@@ -536,11 +597,6 @@ class SettingsWorkspace(QtWidgets.QWidget):
                         "Password environment variable",
                         self._text("gnss_network_password_env", placeholder="NTRIP_PASSWORD"),
                     ),
-                    ("TLS", self._toggle("gnss_network_tls", "Use TLS for NTRIP")),
-                    ("Reconnect interval", self._number("gnss_network_reconnect_interval_s", 0.0, 3600.0, 2, " s")),
-                    ("Connect timeout", self._number("gnss_network_connect_timeout_s", 0.1, 3600.0, 2, " s")),
-                    ("Read timeout", self._number("gnss_network_read_timeout_s", 0.1, 3600.0, 2, " s")),
-                    ("GGA policy", self._combo("gnss_network_gga_policy", (("Base GNSS (assisted fixed base)", "BASE_GNSS"), ("System center", "SYSTEM_CENTER"), ("Left GNSS", "LEFT_GNSS"), ("Manual / disabled", "MANUAL"), ("Per rover session", "PER_ROVER_SESSION")))),
                 ],
             )
         )
@@ -576,6 +632,26 @@ class SettingsWorkspace(QtWidgets.QWidget):
         )
         layout.addStretch(1)
         self._refresh_gnss_mode_controls()
+        self._refresh_settings_credential_status()
+
+    def _refresh_settings_credential_status(self) -> None:
+        """Show whether a password is saved for the currently-displayed caster/username.
+
+        A one-time read taken from the loaded snapshot -- this tab is an
+        edit-then-Apply surface, not a live status monitor, so it does not
+        track further changes until the tab is rebuilt.
+        """
+
+        host = str(self._gnss_value("network", "caster_host") or "")
+        mountpoint = str(self._gnss_value("network", "mountpoint") or "")
+        username = str(self._gnss_value("network", "username") or "")
+        status = ntrip_credentials.credential_status(host, mountpoint, username)
+        text = {
+            ntrip_credentials.CredentialStorageStatus.SAVED: "Saved securely",
+            ntrip_credentials.CredentialStorageStatus.NOT_SAVED: "Not saved",
+            ntrip_credentials.CredentialStorageStatus.UNAVAILABLE: "Unavailable (session only)",
+        }[status]
+        self.gnss_network_credential_status_label.setText(text)
 
     def _widget_value(self, widget: QtWidgets.QWidget) -> object:
         if isinstance(widget, QtWidgets.QComboBox):
@@ -614,6 +690,8 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 "caster_host": payload.get("gnss_network_caster_host", ""),
                 "caster_port": payload.get("gnss_network_caster_port", 2101),
                 "mountpoint": payload.get("gnss_network_mountpoint", ""),
+                "username": payload.get("gnss_network_username", ""),
+                "remember_password": bool(payload.get("gnss_network_remember_password")),
                 "username_env": payload.get("gnss_network_username_env", "NTRIP_USERNAME"),
                 "password_env": payload.get("gnss_network_password_env", "NTRIP_PASSWORD"),
                 "tls": bool(payload.get("gnss_network_tls")),

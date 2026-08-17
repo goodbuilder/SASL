@@ -156,29 +156,64 @@ class GnssBaseSerialWorker(QtCore.QObject):
 class NtripNetworkWorker(QtCore.QObject):
     """Qt adapter for the blocking, dependency-free NTRIP client."""
 
+    # A caster rejection (bad credentials, unknown mountpoint, DNS failure)
+    # never clears itself by retrying -- it just repeats the same
+    # "reconnecting" message forever, leaving the UI's Start control disabled
+    # (see start_gnss_network's early-return guard) with no visible fault.
+    # Once a failure repeats this many times in a row, treat it as fatal:
+    # stop retrying and let ``failed`` surface it instead.
+    MAX_CONSECUTIVE_FAILURES = 3
+
     connected = QtCore.pyqtSignal(str, object)
     stats_changed = QtCore.pyqtSignal(object)
     chunk_received = QtCore.pyqtSignal(object)
     reconnecting = QtCore.pyqtSignal(str)
     failed = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal()
+    # Per-event evidence from NtripClient (connect success, initial/periodic
+    # GGA TX outcome) that has no other signal to ride on -- unlike a stream
+    # failure, these do not stop or restart anything, so they need their own
+    # channel to reach the visible log at all.
+    diagnostic = QtCore.pyqtSignal(str)
 
-    def __init__(self, *, config: NetworkConfig, gga_provider=None) -> None:
+    def __init__(
+        self,
+        *,
+        config: NetworkConfig,
+        gga_provider=None,
+        username: str | None = None,
+        password: str | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.gga_provider = gga_provider
+        # Explicit credentials resolved once by the caller (session entry,
+        # OS keyring, or legacy env-var fallback -- see
+        # gnss_runtime_controller._resolve_ntrip_credentials). Passing them
+        # through explicitly means every reconnect attempt below reuses the
+        # exact same credential instead of re-reading os.environ, and keeps
+        # this worker from ever needing to know which tier they came from.
+        self._username = username
+        self._password = password
         self._stop_event = threading.Event()
         self._client: NtripClient | None = None
 
     @QtCore.pyqtSlot()
     def run(self) -> None:
+        consecutive_failures = 0
         try:
             while not self._stop_event.is_set():
-                client = NtripClient(self.config)
+                client = NtripClient(
+                    self.config,
+                    username=self._username,
+                    password=self._password,
+                    diagnostics=self.diagnostic.emit,
+                )
                 self._client = client
                 try:
                     initial_gga = self.gga_provider() if self.gga_provider is not None else None
                     status_line, initial_payload = client.connect(gga_sentence=initial_gga)
+                    consecutive_failures = 0
                     self.connected.emit(status_line, client.stats)
                     for chunk in client.iter_chunks(
                         self._stop_event,
@@ -193,6 +228,10 @@ class NtripNetworkWorker(QtCore.QObject):
                     raise RuntimeError("NTRIP stream ended without a stop request")
                 except Exception as exc:
                     if self._stop_event.is_set():
+                        break
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.MAX_CONSECUTIVE_FAILURES:
+                        self.failed.emit(str(exc))
                         break
                     self.reconnecting.emit(str(exc))
                     # The failed client is closed before retrying.  A fresh

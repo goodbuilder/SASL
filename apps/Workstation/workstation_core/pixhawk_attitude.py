@@ -513,8 +513,10 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         self.urls = {"left": left_url.strip(), "right": right_url.strip()}
         self.baudrates = {"left": int(left_baud), "right": int(right_baud)}
         self.connections: dict[str, Any] = {}
+        self.last_connect_errors: dict[str, str] = {}
         self.custom_watches = list(custom_watches)
         self._heartbeat_logged: set[str] = set()
+        self._unrecognized_debug_vect_names: set[str] = set()
         self._mavlink_stream_requests_sent: set[str] = set()
         self._mavlink_stream_config: dict[str, Any] | None = None
         self._mavlink_stream_configured: set[str] = set()
@@ -566,9 +568,11 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
         for side in cameras:
             url = self.urls.get(side, "").strip()
             if not url:
+                self.last_connect_errors[side] = "MAVLink URL이 설정되지 않았습니다."
                 continue
             if side in self.connections:
                 started_any = True
+                self.last_connect_errors.pop(side, None)
                 continue
             try:
                 connection = mavutil.mavlink_connection(
@@ -578,11 +582,17 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     robust_parsing=True,
                 )
             except Exception as exc:
+                # A multi-side request (``camera=None``) must not fail the sides
+                # that did connect just because one side raised; the caller reads
+                # ``last_connect_errors`` afterwards to surface a partial-connect
+                # status instead of a misleading full-success label.
+                self.last_connect_errors[side] = str(exc)
                 self.status_changed.emit(f"{camera_label_ko(side)} MAVLink 연결 실패: {exc}")
                 continue
             with self._command_state_lock:
                 self.connections[side] = connection
             started_any = True
+            self.last_connect_errors.pop(side, None)
             self.status_changed.emit(
                 f"{camera_label_ko(side)} MAVLink 연결 시작: {url} @ {self.baudrates.get(side, 57600)}"
             )
@@ -841,6 +851,28 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                 if time.monotonic() >= deadline:
                     break
 
+    def _log_unrecognized_debug_vect(self, camera: str, message: Any) -> None:
+        """Surface DEBUG_VECT names the CAN-mag decoder doesn't recognize.
+
+        Only "CAN1_MAG"/"CAN2_MAG" are decoded (see
+        _can_mag_sensor_state_from_debug_vect); any other firmware naming was
+        previously dropped silently, making a firmware-side naming mismatch
+        indistinguishable from no CAN mag data being sent at all.
+        """
+
+        name = getattr(message, "name", "")
+        if isinstance(name, bytes):
+            name = name.split(b"\0", 1)[0].decode("ascii", errors="ignore")
+        name = str(name).strip(" \0")
+        key = f"{camera}:{name}"
+        if key in self._unrecognized_debug_vect_names:
+            return
+        self._unrecognized_debug_vect_names.add(key)
+        self.status_changed.emit(
+            f"{camera_label_ko(camera)} 인식되지 않는 DEBUG_VECT 이름 수신: '{name}' "
+            "(CAN1_MAG/CAN2_MAG 아님 - CAN 자력계 데이터가 아닐 수 있음)"
+        )
+
     def _handle_mavlink_message(self, camera: str, message: Any) -> None:
         message_type = message.get_type() if hasattr(message, "get_type") else ""
         namespace = self.urls.get(camera, "")
@@ -948,6 +980,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             mag = _can_mag_sensor_state_from_debug_vect(camera, namespace, message, now_s)
             if mag is not None:
                 self.mag_sensor_changed.emit(camera, replace(mag, **provenance))
+            else:
+                self._log_unrecognized_debug_vect(camera, message)
             return
         if message_type == "HEARTBEAT":
             connection = self.connections.get(camera)

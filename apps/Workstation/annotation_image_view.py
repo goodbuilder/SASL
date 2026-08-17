@@ -112,6 +112,24 @@ def _parse_mode(mode: AnnotationMode | str) -> AnnotationMode:
     return AnnotationMode(str(mode).strip().lower())
 
 
+def _confidence_color(confidence: float) -> QtGui.QColor:
+    """Map a [0, 1] match-quality score onto the app's neutral/red palette.
+
+    Stays within the existing gray-to-red contract (no new semantic hue):
+    a weak match (0) reads as ``theme.WARNING`` red, a strong one (1) fades
+    to the neutral ``theme.SERIES_Z`` gray already used for suggestions.
+    """
+
+    weak = QtGui.QColor(theme.WARNING)
+    strong = QtGui.QColor(theme.SERIES_Z)
+    t = min(1.0, max(0.0, float(confidence)))
+    return QtGui.QColor(
+        round(weak.red() + (strong.red() - weak.red()) * t),
+        round(weak.green() + (strong.green() - weak.green()) * t),
+        round(weak.blue() + (strong.blue() - weak.blue()) * t),
+    )
+
+
 class AnnotationImageView(QtWidgets.QWidget):
     """16:9 viewer/editor for a *frozen native* camera frame.
 
@@ -185,6 +203,12 @@ class AnnotationImageView(QtWidgets.QWidget):
             mode: [] for mode in AnnotationMode
         }
         self._suggestion_points: dict[AnnotationMode, list[SourcePixel]] = {
+            mode: [] for mode in AnnotationMode
+        }
+        # Optional per-point match-quality score in [0, 1], index-aligned
+        # with ``_suggestion_points``.  Empty for modes/suggestions with no
+        # natural per-point score (e.g. Horizon's single fitted line).
+        self._suggestion_confidences: dict[AnnotationMode, list[float]] = {
             mode: [] for mode in AnnotationMode
         }
         self._hover_source_pixel: SourcePixel | None = None
@@ -398,14 +422,28 @@ class AnnotationImageView(QtWidgets.QWidget):
         points: Iterable[SourcePixel | QtCore.QPointF | QtCore.QPoint | Sequence[float]],
         *,
         mode: AnnotationMode | str,
+        confidences: Sequence[float] | None = None,
     ) -> None:
-        """Replace the separate automatic overlay without changing annotation data."""
+        """Replace the separate automatic overlay without changing annotation data.
+
+        ``confidences`` is an optional per-point match-quality score in
+        ``[0, 1]``, index-aligned with ``points`` -- e.g. Mountain's
+        descriptor-distance-derived score. Omit it (or pass an empty
+        sequence) for suggestions with no natural per-point score, such as
+        Horizon's single fitted line; the dots then fall back to the plain
+        suggestion color.
+        """
 
         parsed_mode = _parse_mode(mode)
         converted = [_coerce_point(point) for point in points]
         if self._image is not None and any(not self._source_contains(point) for point in converted):
             raise ValueError("suggestion point is outside the native source image")
+        if confidences is not None and len(confidences) not in (0, len(converted)):
+            raise ValueError("confidences must be empty or match the point count")
         self._suggestion_points[parsed_mode] = converted
+        self._suggestion_confidences[parsed_mode] = (
+            [min(1.0, max(0.0, float(value))) for value in confidences] if confidences else []
+        )
         self.update()
 
     def clear_suggestion_points(self, mode: AnnotationMode | str | None = None) -> None:
@@ -416,6 +454,7 @@ class AnnotationImageView(QtWidgets.QWidget):
             parsed_mode = _parse_mode(mode)
             changed = bool(self._suggestion_points[parsed_mode])
             self._suggestion_points[parsed_mode].clear()
+            self._suggestion_confidences[parsed_mode].clear()
         if changed:
             self.update()
 
@@ -631,9 +670,15 @@ class AnnotationImageView(QtWidgets.QWidget):
     widget_to_source = widget_to_source_pixel
 
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802 - Qt API.
-        """Zoom around the pointer while keeping the pointed native pixel fixed."""
+        """Zoom around the pointer while keeping the pointed native pixel fixed.
 
-        if self._image is None:
+        Only Ctrl+wheel zooms. Plain wheel scrolling must fall through to the
+        enclosing QScrollArea (e.g. on the Alignment page) instead of being
+        swallowed here -- otherwise scrolling the page while the cursor
+        happens to sit over a camera preview zoomed the image instead.
+        """
+
+        if self._image is None or not (event.modifiers() & QtCore.Qt.ControlModifier):
             super().wheelEvent(event)
             return
         cursor = QtCore.QPointF(event.pos())
@@ -761,23 +806,35 @@ class AnnotationImageView(QtWidgets.QWidget):
     ) -> None:
         """Draw automatic points as dashed overlays, never as saved points."""
 
-        widget_points = [
-            self.source_pixel_to_widget(point)
-            for point in points
+        confidences = self._suggestion_confidences.get(mode, [])
+        visible = [
+            (index, self.source_pixel_to_widget(point))
+            for index, point in enumerate(points)
             if self._source_contains(point)
         ]
-        if not widget_points:
+        if not visible:
             return
-        color = self._SUGGESTION_COLORS[mode]
-        pen = QtGui.QPen(color, 2.0)
-        pen.setCosmetic(True)
-        pen.setStyle(QtCore.Qt.DashLine)
-        painter.setPen(pen)
-        painter.setBrush(QtGui.QBrush(color))
-        if mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE) and len(widget_points) >= 2:
-            painter.drawPolyline(QtGui.QPolygonF(widget_points))
-        for point in widget_points:
-            painter.drawEllipse(point, 4.5, 4.5)
+        base_color = self._SUGGESTION_COLORS[mode]
+        show_polyline = mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE) and len(visible) >= 2
+        if show_polyline:
+            line_pen = QtGui.QPen(base_color, 2.0)
+            line_pen.setCosmetic(True)
+            line_pen.setStyle(QtCore.Qt.DashLine)
+            painter.setPen(line_pen)
+            painter.drawPolyline(QtGui.QPolygonF([widget_point for _, widget_point in visible]))
+        show_index = mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE)
+        for index, widget_point in visible:
+            # A per-point score (currently only Mountain's descriptor-distance
+            # confidence) colors the dot itself; suggestions without one keep
+            # the plain suggestion color.
+            dot_color = _confidence_color(confidences[index]) if index < len(confidences) else base_color
+            dot_pen = QtGui.QPen(dot_color, 2.0)
+            dot_pen.setCosmetic(True)
+            painter.setPen(dot_pen)
+            painter.setBrush(QtGui.QBrush(dot_color))
+            painter.drawEllipse(widget_point, 4.5, 4.5)
+            if show_index:
+                self._draw_point_label(painter, widget_point, index + 1)
 
     def _paint_hover_dot(self, painter: QtGui.QPainter) -> None:
         """Draw a small red, source-centered hover marker over the image."""
@@ -802,26 +859,49 @@ class AnnotationImageView(QtWidgets.QWidget):
         mode: AnnotationMode,
         points: Iterable[SourcePixel],
     ) -> None:
-        widget_points = [
-            self.source_pixel_to_widget(point)
-            for point in points
+        visible = [
+            (index, self.source_pixel_to_widget(point))
+            for index, point in enumerate(points)
             if self._source_contains(point)
         ]
-        if not widget_points:
+        if not visible:
             return
         color = self._COLORS[mode]
         pen = QtGui.QPen(color, 2.0 if mode == self._mode else 1.5)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(QtGui.QBrush(color))
-        if mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE) and len(widget_points) >= 2:
-            painter.drawPolyline(QtGui.QPolygonF(widget_points))
-        for point in widget_points:
-            painter.drawEllipse(point, 3.5, 3.5)
+        show_polyline = mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE) and len(visible) >= 2
+        if show_polyline:
+            painter.drawPolyline(QtGui.QPolygonF([widget_point for _, widget_point in visible]))
+        show_index = mode in (AnnotationMode.HORIZON, AnnotationMode.RIDGE)
+        for index, widget_point in visible:
+            painter.drawEllipse(widget_point, 3.5, 3.5)
+            if show_index:
+                self._draw_point_label(painter, widget_point, index + 1)
         if mode == AnnotationMode.TARGET:
-            point = widget_points[0]
+            point = visible[0][1]
             painter.drawLine(QtCore.QPointF(point.x() - 8.0, point.y()), QtCore.QPointF(point.x() + 8.0, point.y()))
             painter.drawLine(QtCore.QPointF(point.x(), point.y() - 8.0), QtCore.QPointF(point.x(), point.y() + 8.0))
+
+    def _draw_point_label(self, painter: QtGui.QPainter, point: QtCore.QPointF, number: int) -> None:
+        """Draw a small 1-based index next to a point, offset up-right.
+
+        Matching numbers on the left/right views are the operator's only cue
+        that a Horizon/Ridge correspondence pair is in the right order --
+        without it, a swapped click only shows up as a vaguely wrong polyline
+        shape instead of pointing at exactly which pair is swapped.
+        """
+
+        text = str(number)
+        text_point = QtCore.QPointF(point.x() + 7.0, point.y() - 7.0)
+        # Same dark-halo trick as the hover dot: keeps the digit legible on
+        # bright sky and dark terrain alike.
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 210)))
+        for dx, dy in ((-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)):
+            painter.drawText(text_point + QtCore.QPointF(dx, dy), text)
+        painter.setPen(QtGui.QColor(theme.INVERSE_TEXT))
+        painter.drawText(text_point, text)
 
     def _source_contains(self, point: SourcePixel) -> bool:
         return bool(
@@ -860,6 +940,8 @@ class AnnotationImageView(QtWidgets.QWidget):
     def _clear_suggestions(self) -> None:
         for points in self._suggestion_points.values():
             points.clear()
+        for confidences in self._suggestion_confidences.values():
+            confidences.clear()
 
 
 __all__ = [

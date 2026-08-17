@@ -4249,7 +4249,12 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._gps_fix_ready_for_baseline(self.latest_gps.get("right")),
         ]
         gps_count = sum(1 for ready in gps_ready if ready)
-        mag_count = sum(1 for side in ("left", "right") for slot in ("CAN1", "CAN2") if slot in self.latest_mag_sensors.get(side, {}))
+        mag_count = sum(
+            1
+            for side in ("left", "right")
+            for slot in ("CAN1", "CAN2")
+            if self._mag_slot_state(side, slot) is not None
+        )
         if gps_count == 2:
             sensor_text = f"GPS OK / MAG {mag_count}/4"
             sensor_level = "good" if mag_count >= 4 else "warn"
@@ -4454,6 +4459,26 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.gnss_ntrip_port_spin.setValue(operation_config.network.caster_port)
         self.gnss_ntrip_mountpoint_edit = QtWidgets.QLineEdit(operation_config.network.mountpoint)
         self.gnss_ntrip_mountpoint_edit.setPlaceholderText("MOUNTPOINT")
+        self.gnss_ntrip_username_edit = QtWidgets.QLineEdit(operation_config.network.username)
+        self.gnss_ntrip_username_edit.setPlaceholderText("NTRIP username")
+        # Session-only: never pre-filled from a stored password, and never
+        # read back into GnssOperationConfig/settings JSON. See
+        # gnss_runtime_controller._resolve_ntrip_credentials for how this
+        # value is used (and workstation_core/ntrip_credentials.py for where
+        # "Remember" actually persists it).
+        self.gnss_ntrip_password_edit = QtWidgets.QLineEdit()
+        self.gnss_ntrip_password_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.gnss_ntrip_password_edit.setPlaceholderText("NTRIP password")
+        self.gnss_ntrip_remember_checkbox = QtWidgets.QCheckBox("Remember password securely")
+        self.gnss_ntrip_credential_status_label = QtWidgets.QLabel("--")
+        self.gnss_ntrip_forget_password_button = QtWidgets.QPushButton("Forget saved password")
+        self.gnss_ntrip_forget_password_button.clicked.connect(self.forget_gnss_ntrip_password)
+        self.gnss_ntrip_host_edit.editingFinished.connect(self._refresh_ntrip_credential_status)
+        self.gnss_ntrip_mountpoint_edit.editingFinished.connect(self._refresh_ntrip_credential_status)
+        self.gnss_ntrip_username_edit.editingFinished.connect(self._refresh_ntrip_credential_status)
+        # Legacy indirection, kept only so settings files written before this
+        # UI existed keep authenticating.  New setups should leave these
+        # alone and use the Username/Password fields above instead.
         self.gnss_ntrip_username_env_edit = QtWidgets.QLineEdit(operation_config.network.username_env)
         self.gnss_ntrip_password_env_edit = QtWidgets.QLineEdit(operation_config.network.password_env)
         self.gnss_ntrip_gga_policy_combo = QtWidgets.QComboBox()
@@ -4526,9 +4551,19 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         add_setting(network_config_form, 0, "NTRIP caster host", self.gnss_ntrip_host_edit)
         add_setting(network_config_form, 1, "NTRIP port", self.gnss_ntrip_port_spin)
         add_setting(network_config_form, 2, "NTRIP mountpoint", self.gnss_ntrip_mountpoint_edit)
-        add_setting(network_config_form, 3, "NTRIP username 환경변수", self.gnss_ntrip_username_env_edit)
-        add_setting(network_config_form, 4, "NTRIP password 환경변수", self.gnss_ntrip_password_env_edit)
-        add_setting(network_config_form, 5, "NTRIP GGA 정책", self.gnss_ntrip_gga_policy_combo)
+        add_setting(network_config_form, 3, "NTRIP username", self.gnss_ntrip_username_edit)
+        add_setting(network_config_form, 4, "NTRIP password", self.gnss_ntrip_password_edit)
+        add_setting(network_config_form, 5, "", self.gnss_ntrip_remember_checkbox)
+        add_setting(network_config_form, 6, "Credential status", self.gnss_ntrip_credential_status_label)
+        add_setting(network_config_form, 7, "", self.gnss_ntrip_forget_password_button)
+        add_setting(network_config_form, 8, "NTRIP GGA 정책", self.gnss_ntrip_gga_policy_combo)
+
+        self.gnss_network_legacy_env_group = QtWidgets.QGroupBox(
+            "레거시 환경변수 인증 (선택 사항 -- 위 Username/Password가 비어 있을 때만 fallback으로 사용)"
+        )
+        network_legacy_env_form = QtWidgets.QGridLayout(self.gnss_network_legacy_env_group)
+        add_setting(network_legacy_env_form, 0, "NTRIP username 환경변수", self.gnss_ntrip_username_env_edit)
+        add_setting(network_legacy_env_form, 1, "NTRIP password 환경변수", self.gnss_ntrip_password_env_edit)
 
         self.gnss_fixed_config_group = QtWidgets.QGroupBox("Fixed Base 설정")
         fixed_config_form = QtWidgets.QGridLayout(self.gnss_fixed_config_group)
@@ -4588,6 +4623,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         content_layout.addWidget(self.gnss_base_config_group)
         content_layout.addWidget(self.gnss_survey_config_group)
         content_layout.addWidget(self.gnss_network_config_group)
+        content_layout.addWidget(self.gnss_network_legacy_env_group)
         content_layout.addWidget(self.gnss_fixed_config_group)
         content_layout.addWidget(self.gnss_base_control_group)
         content_layout.addWidget(self.gnss_base_candidate_group)
@@ -5714,7 +5750,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 text = "인식" if state is not None else "대기"
                 self._set_health_label(labels[f"{side}_{slot.lower()}"], text, level)
             for slot in ("CAN1", "CAN2"):
-                state = self.latest_mag_sensors.get(side, {}).get(slot)
+                state = self._mag_slot_state(side, slot)
                 level = "good" if state is not None else "idle"
                 text = "인식" if state is not None else "대기"
                 self._set_health_label(labels[f"{side}_{slot.lower()}"], text, level)
@@ -5828,7 +5864,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             for slot in ("BOARD", "CAN1", "CAN2", "GPS1_MAG", "GPS2_MAG"):
                 key = f"{side}_{slot}"
                 labels = self.alignment_mag_labels[key]
-                state = self.latest_mag_sensors.get(side, {}).get(slot)
+                state = self._mag_slot_state(side, slot)
                 if state is None:
                     text = self._magnetometer_pending_text(side)
                     labels["device_type"].setText(self._magnetometer_device_type(slot, None))
@@ -5887,6 +5923,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             return "--"
         text = f"{float(value):.3f}"
         return f"{text} {units}" if units else text
+
+    def _mag_slot_state(self, camera: str, slot: str) -> object | None:
+        """Prefer a dedicated CAN-mag sample over the legacy SCALED_IMU-labeled one.
+
+        ``latest_can_mag_sensors`` only ever holds genuine CAN_MAG/DEBUG_VECT
+        readings, while ``latest_mag_sensors`` reuses the same "CAN1"/"CAN2"
+        slot names for onboard-IMU-derived samples; the dedicated dict must
+        win whenever it has data so real CAN telemetry is never hidden behind
+        a stale/absent legacy sample.
+        """
+
+        if slot in ("CAN1", "CAN2"):
+            dedicated = self.latest_can_mag_sensors.get(camera, {}).get(slot)
+            if dedicated is not None:
+                return dedicated
+        return self.latest_mag_sensors.get(camera, {}).get(slot)
 
     def _mag_state_display_device_id(self, camera: str, state: object) -> tuple[int | None, str]:
         device_id = getattr(state, "device_id", None)
@@ -9672,6 +9724,10 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _handle_gnss_operation_mode_changed(self, *args: Any, **kwargs: Any) -> Any: ...
         def _gnss_source_identity(self, *args: Any, **kwargs: Any) -> Any: ...
         def _gnss_gga_provider(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _resolve_ntrip_credentials(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _refresh_ntrip_credential_status(self, *args: Any, **kwargs: Any) -> Any: ...
+        def forget_gnss_ntrip_password(self, *args: Any, **kwargs: Any) -> Any: ...
+        def set_gnss_ntrip_session_password(self, *args: Any, **kwargs: Any) -> Any: ...
         def start_gnss_network(self, *args: Any, **kwargs: Any) -> Any: ...
         def stop_gnss_network(self, *args: Any, **kwargs: Any) -> Any: ...
         def _handle_gnss_network_connected(self, *args: Any, **kwargs: Any) -> Any: ...
@@ -9679,6 +9735,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         def _handle_gnss_network_chunk(self, *args: Any, **kwargs: Any) -> Any: ...
         def _handle_gnss_network_failed(self, *args: Any, **kwargs: Any) -> Any: ...
         def _handle_gnss_network_reconnecting(self, *args: Any, **kwargs: Any) -> Any: ...
+        def _handle_gnss_network_diagnostic(self, *args: Any, **kwargs: Any) -> Any: ...
         def _clear_gnss_network_worker(self, *args: Any, **kwargs: Any) -> Any: ...
         def _record_gnss_base_position_row(self, *args: Any, **kwargs: Any) -> Any: ...
         def _handle_gnss_base_position(self, *args: Any, **kwargs: Any) -> Any: ...

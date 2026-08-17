@@ -11,3 +11,5 @@ pyserial>=3.5,<4
 pymavlink>=2.4.41,<3
 pyqtgraph>=0.13,<1
 av>=11,<16
+# OS-secured NTRIP password storage (workstation_core/ntrip_credentials.py).
+keyring>=23,<26

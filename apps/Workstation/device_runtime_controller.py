@@ -806,9 +806,32 @@ class DeviceRuntimeController:
             )
         self.panel._refresh_session_toggle_buttons()
         self.panel._refresh_mavlink_side_actions()
-        label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
-        self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
-        self.panel._log(f"[픽스호크] {label} MAVLink 세션이 시작됐습니다. 데이터 수신을 기다립니다.")
+        # A request that targets both sides (``camera=None``, e.g. auto-start)
+        # can partially fail: DualPixhawkMavlinkSubscriber.start() only raises
+        # when every requested side fails, so a lone P2 failure alongside a
+        # successful P1 never reaches ``_pixhawk_connection_failed`` and must be
+        # surfaced here instead of being reported as a full success.
+        connect_errors = getattr(subscriber, "last_connect_errors", {})
+        failed_sides = {side: connect_errors[side] for side in target_sides if side in connect_errors}
+        if failed_sides:
+            ok_sides = [side for side in target_sides if side not in failed_sides]
+            ok_label = (
+                " / ".join(self.panel._px4_mag_camera_label(side) for side in ok_sides)
+                if ok_sides
+                else "없음"
+            )
+            fail_label = ", ".join(
+                f"{self.panel._px4_mag_camera_label(side)} ({error})"
+                for side, error in failed_sides.items()
+            )
+            self.panel.pixhawk_connection_label.setText(
+                f"픽스호크 MAVLink: {ok_label} 연결됨, 실패: {fail_label}"
+            )
+            self.panel._log(f"[픽스호크] MAVLink 부분 연결: 성공={ok_label}, 실패={fail_label}")
+        else:
+            label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
+            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 세션 시작, 데이터 대기 중")
+            self.panel._log(f"[픽스호크] {label} MAVLink 세션이 시작됐습니다. 데이터 수신을 기다립니다.")
         self.panel._request_mavlink_eth0_status(tuple(target_sides))
         self.panel.refresh_px4_mag_manager()
         self.panel.refresh_px4_attitude_cal_status()

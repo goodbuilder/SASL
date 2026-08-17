@@ -1183,6 +1183,9 @@ class _FakeBackend:
     def apply_workstation_system_settings(self, settings: dict[str, object]) -> None:
         self.calls.append(("settings_apply", dict(settings)))
 
+    def set_gnss_ntrip_session_password(self, password: str) -> None:
+        self.calls.append(("set_gnss_ntrip_session_password", password))
+
     def save_workstation_system_settings(self) -> None:
         self.calls.append("settings_save")
 
@@ -3605,28 +3608,38 @@ def test_pixhawk_shell_and_parameter_workers_use_exclusive_command_path() -> Non
 
         @contextmanager
         def exclusive_command(self, camera: str):
+            # Mirrors the real MavlinkPixhawkSubscriber.exclusive_command: a
+            # second reservation for the same camera while one is already
+            # held (even by the same worker/thread re-entering) is rejected,
+            # not silently nested.
+            if camera in self.active:
+                raise RuntimeError(f"{camera} MAVLink 명령이 이미 진행 중입니다.")
             self.active.append(camera)
             try:
                 yield
             finally:
-                self.active.pop()
+                self.active.remove(camera)
 
         def send_shell_command_with_result(self, camera: str, command: str, *, timeout_s: float):
             assert self.active == [camera]
             return MavlinkShellCommandResult(command, "nsh> OK", "respond+exclusive")
 
         def read_param_int(self, camera: str, name: str, *, timeout_s: float):
-            assert self.active == [camera]
-            return self.params.get(name)
+            # Mirrors the real MavlinkPixhawkSubscriber: each PARAM read/write
+            # reserves its own exclusive_command slice. PixhawkParameterWorker
+            # must not also hold one around the whole operation, or this
+            # reservation collides with itself (regression: it used to).
+            with self.exclusive_command(camera):
+                return self.params.get(name)
 
         def read_param(self, camera: str, name: str, *, timeout_s: float):
-            assert self.active == [camera]
-            return self.params.get(name)
+            with self.exclusive_command(camera):
+                return self.params.get(name)
 
         def set_param_int(self, camera: str, name: str, value: int, *, timeout_s: float):
-            assert self.active == [camera]
-            self.params[name] = int(value)
-            return int(value)
+            with self.exclusive_command(camera):
+                self.params[name] = int(value)
+                return int(value)
 
         def reboot_autopilot(self, camera: str) -> None:
             assert self.active == [camera]
@@ -4874,14 +4887,17 @@ def test_wiris_command_catalog_covers_official_workswell_sdk_opcodes() -> None:
         WIRIS_SDK_MANUAL_URL,
     )
 
+    # Workstation only operates WIRIS Enterprise units, so opcodes the manual
+    # documents as exclusive to WIRIS AGRO (5.8, CWSI/crop stress), WIRIS
+    # Security (5.7), GIS 320 (5.11), or AGRO's Colourmap (5.13) are
+    # deliberately absent from the catalog and therefore from this set too.
     expected_opcodes = set(
         """
         ACTV IACT SETH GETH SSDK SDLM GDLM HIWS GSRN GATN GFWV GTCU GTIC GTIN GFPW
-        MOVE GGPS STUT GTUT SRMD GRMD SRMM GRMM SRWC GRWC SREN GREN GREL STST GTST
-        SHRJ GHRJ SCRJ GCRJ SCWM GCWM SCAT GCAT SUSL GUSL SLSL GLSL SCRP GRCP SCHY
-        GCHY SINB GINB SSLB GSLB GEDF GEDS GCWP GCGR SCWV GCWV SLAY STTY SMCA GMCA
-        SGPI GGPI SZIN SZOT SZSM GZSM SZTN GZTV GZTL SZVN GZVV GZVL SGFA SGFI GCDT
-        SGFM GGFM SHSM GHSM GPTE SPTE SPTI GPTL GPLV GCMP SCMP GCML CPTR ICPT RCRS
+        MOVE GGPS STUT GTUT SRMD GRMD SRMM GRMM SRWC GRWC SREN GREN GREL
+        SLAY STTY SMCA GMCA
+        SGPI GGPI SZIN SZOT SZSM GZSM SZTN GZTV GZTL SZVN GZVV GZVL
+        GPTE SPTE SPTI GPTL GPLV CPTR ICPT RCRS
         RCRF IRCR SPIC GPIC GGFT SGFT SBFL GBFL SEFL GEFL SCSB GCSB SALM GALM SALV
         GALV SALC GALC GTEX GROT GOPT CUPD IUPD STEM GTEM STRT GTRT STAT GTAT STII
         GTII STSC GTSC STCP GTCP GTSL GTSN IMCR SLEN GLEN GLEL SIRJ GIRJ SIRT GIRT

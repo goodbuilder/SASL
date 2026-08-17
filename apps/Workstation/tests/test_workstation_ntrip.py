@@ -1,11 +1,25 @@
 import json
+import threading
+import time
 from types import SimpleNamespace
 
+import pytest
+from PyQt5 import QtWidgets
+
+from Workstation.gnss_runtime_controller import (
+    GnssRuntimeController,
+    NtripCredentialError,
+    NtripCredentialResolution,
+)
+from Workstation.settings_workspace import SettingsWorkspace
+from Workstation.workstation_core import ntrip_credentials
 from Workstation.workstation_core.gnss_monitor import (
     NtripHealthState,
     evaluate_ntrip_health,
 )
 from Workstation.workstation_core.gnss_network import (
+    NtripClient,
+    NtripProtocolError,
     build_ntrip_request,
     gga_from_coordinate_sample,
     gga_from_position,
@@ -21,6 +35,7 @@ from Workstation.workstation_core.gnss_operation import (
     HeightType,
     NetworkConfig,
 )
+from Workstation.workstation_core.settings import AppSettings, load_settings, save_settings
 
 
 def test_gga_from_position_reports_rtk_fixed_as_nmea_quality_4() -> None:
@@ -167,6 +182,309 @@ def test_arbitrary_ntrip_caster_round_trips_and_builds_request() -> None:
     assert b"secret" not in request
 
 
+class _FakeConnectSocket:
+    """Minimal fake standing in for a raw ``socket.socket`` during connect()."""
+
+    def __init__(self, response: bytes) -> None:
+        self._response = bytearray(response)
+        self.sent: list[bytes] = []
+
+    def settimeout(self, _value: float) -> None:
+        return None
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+
+    def recv(self, size: int) -> bytes:
+        chunk = bytes(self._response[:size])
+        del self._response[:size]
+        return chunk
+
+    def close(self) -> None:
+        return None
+
+
+def test_ntrip_client_connect_writes_initial_gga_in_the_same_transmission_as_the_request() -> None:
+    """Regression: most NTRIP 1.0 casters ignore the ``Ntrip-GGA`` request
+    header, and a caster that instead waits for an on-the-wire raw GGA to
+    confirm a live rover position must never see a window with none. An
+    earlier version of this method sent the request first and the raw GGA in
+    a *second* ``sendall()`` only after the response arrived -- leaving a
+    live, position-evidence-free connection for that round trip. This client
+    now folds the raw GGA line into the exact same initial ``sendall()`` as
+    the request, directly after its blank-line terminator, matching standard
+    NTRIP 1.x client wire behaviour.
+    """
+
+    fake_socket = _FakeConnectSocket(b"HTTP/1.1 200 OK\r\n\r\ninitial-rtcm")
+    client = NtripClient(
+        NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT"),
+        username="user",
+        password="pass",
+        socket_factory=lambda *args, **kwargs: fake_socket,
+    )
+
+    status_line, initial_payload = client.connect(gga_sentence="$GPGGA,fake*00")
+
+    assert status_line == "HTTP/1.1 200 OK"
+    assert initial_payload == b"initial-rtcm"
+    # Exactly one sendall() call: request header block immediately followed
+    # by the raw GGA line, not a separate post-handshake write.
+    assert len(fake_socket.sent) == 1
+    sent = fake_socket.sent[0]
+    assert sent.startswith(b"GET /MOUNT HTTP/1.0\r\n")
+    assert b"Ntrip-GGA: $GPGGA,fake*00\r\n" in sent
+    assert sent.endswith(b"\r\n\r\n$GPGGA,fake*00\r\n")
+    assert client.stats is not None
+    assert client.stats.last_gga_monotonic_s is not None
+    assert client.stats.gga_sent_count == 1
+
+
+def test_ntrip_client_connect_without_gga_sends_only_the_request() -> None:
+    """No GGA available yet (e.g. no fix) must not write a stray empty line."""
+
+    fake_socket = _FakeConnectSocket(b"HTTP/1.1 200 OK\r\n\r\n")
+    client = NtripClient(
+        NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT"),
+        username="user",
+        password="pass",
+        socket_factory=lambda *args, **kwargs: fake_socket,
+    )
+
+    client.connect(gga_sentence=None)
+
+    assert len(fake_socket.sent) == 1
+    assert fake_socket.sent[0].endswith(b"\r\n\r\n")
+    assert client.stats.last_gga_monotonic_s is None
+    assert client.stats.gga_sent_count == 0
+
+
+def test_ntrip_client_reconnect_sends_initial_gga_again_on_the_new_connection() -> None:
+    """Each fresh ``connect()`` -- including on reconnect -- must resend the
+    initial GGA on its own new socket; it is per-connection wire state, not
+    something the caster remembers across a dropped TCP session.
+    """
+
+    first_socket = _FakeConnectSocket(b"HTTP/1.1 200 OK\r\n\r\n")
+    second_socket = _FakeConnectSocket(b"HTTP/1.1 200 OK\r\n\r\n")
+    sockets = iter([first_socket, second_socket])
+    config = NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT")
+
+    first_client = NtripClient(
+        config, username="user", password="pass", socket_factory=lambda *a, **k: next(sockets)
+    )
+    first_client.connect(gga_sentence="$GPGGA,one*00")
+    first_client.close()
+
+    second_client = NtripClient(
+        config, username="user", password="pass", socket_factory=lambda *a, **k: next(sockets)
+    )
+    second_client.connect(gga_sentence="$GPGGA,two*00")
+
+    assert first_socket.sent[0].endswith(b"$GPGGA,one*00\r\n")
+    assert second_socket.sent[0].endswith(b"$GPGGA,two*00\r\n")
+    assert second_client.stats.gga_sent_count == 1
+
+
+def test_ntrip_client_connect_diagnostics_report_connected_and_initial_gga_events() -> None:
+    # A trailing non-printable byte after the single CRLF is what tells
+    # _ntrip1_status_line the legacy ICY-style header is actually complete
+    # (real casters follow it with binary RTCM, e.g. the 0xD3 sync byte).
+    fake_socket = _FakeConnectSocket(b"ICY 200 OK\r\n\xd3")
+    events: list[str] = []
+    client = NtripClient(
+        NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT"),
+        username="user",
+        password="pass",
+        socket_factory=lambda *args, **kwargs: fake_socket,
+        diagnostics=events.append,
+    )
+
+    client.connect(gga_sentence="$GPGGA,fake*00")
+
+    assert any(event.startswith("INITIAL GGA TX ok") for event in events)
+    assert any(event.startswith("NTRIP CONNECTED status='ICY 200 OK'") for event in events)
+    # Chronological order matters: the GGA is on the wire before the
+    # handshake response is even parsed.
+    assert events.index([e for e in events if e.startswith("INITIAL GGA TX")][0]) < events.index(
+        [e for e in events if e.startswith("NTRIP CONNECTED")][0]
+    )
+
+
+def test_ntrip_client_connect_diagnostics_report_skip_reason_without_gga() -> None:
+    fake_socket = _FakeConnectSocket(b"HTTP/1.1 200 OK\r\n\r\n")
+    events: list[str] = []
+    client = NtripClient(
+        NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT"),
+        username="user",
+        password="pass",
+        socket_factory=lambda *args, **kwargs: fake_socket,
+        diagnostics=events.append,
+    )
+
+    client.connect(gga_sentence=None)
+
+    assert any("INITIAL GGA TX skipped" in event for event in events)
+
+
+def test_ntrip_client_diagnostics_callback_never_breaks_the_connect_path() -> None:
+    """A raising diagnostics hook (e.g. a broken log widget) must not take
+    down the network thread -- it is purely an observability side channel.
+    """
+
+    fake_socket = _FakeConnectSocket(b"HTTP/1.1 200 OK\r\n\r\n")
+
+    def _broken(_message: str) -> None:
+        raise RuntimeError("log widget exploded")
+
+    client = NtripClient(
+        NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT"),
+        username="user",
+        password="pass",
+        socket_factory=lambda *args, **kwargs: fake_socket,
+        diagnostics=_broken,
+    )
+
+    status_line, _payload = client.connect(gga_sentence="$GPGGA,fake*00")
+
+    assert status_line == "HTTP/1.1 200 OK"
+
+
+class _FakeStreamSocket:
+    """Fake socket for iter_chunks(): scripted recv() results, tracked sends."""
+
+    def __init__(self, recv_results: list[bytes]) -> None:
+        self._results = list(recv_results)
+        self.sent: list[bytes] = []
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+
+    def recv(self, _size: int) -> bytes:
+        if not self._results:
+            return b""
+        return self._results.pop(0)
+
+
+def _connected_client(*, gga_provider=None, diagnostics=None) -> NtripClient:
+    from Workstation.workstation_core.gnss_network import NtripStreamStats
+
+    client = NtripClient(
+        NetworkConfig(caster_host="caster.example.org", mountpoint="MOUNT"),
+        username="user",
+        password="pass",
+        diagnostics=diagnostics,
+    )
+    client._socket = _FakeStreamSocket([])  # noqa: SLF001 -- test seam, no public setter
+    client._stats = NtripStreamStats(connected_at_monotonic_s=time.monotonic())
+    return client
+
+
+def test_iter_chunks_sends_periodic_gga_after_the_configured_interval(monkeypatch) -> None:
+    import Workstation.workstation_core.gnss_network as gnss_network_module
+
+    client = _connected_client()
+    socket_obj = _FakeStreamSocket([])
+    client._socket = socket_obj  # noqa: SLF001
+
+    stop_event = threading.Event()
+
+    def stop_after_one_chunk(_size: int) -> bytes:
+        stop_event.set()
+        return b"rtcm-chunk-1"
+
+    socket_obj.recv = stop_after_one_chunk
+
+    calls = {"count": 0}
+
+    def provider() -> str:
+        calls["count"] += 1
+        return "$GPGGA,periodic*00"
+
+    # iter_chunks() reads time.monotonic() exactly once for last_gga_s at
+    # entry, then once per loop iteration for now_s. Scripting two calls
+    # 2s apart makes the >= on_gga_interval_s check fire deterministically,
+    # without a real sleep. (Must be set up after _connected_client(), which
+    # also calls time.monotonic() once for its own unrelated setup.)
+    times = iter([100.0, 102.0])
+    monkeypatch.setattr(gnss_network_module.time, "monotonic", lambda: next(times))
+
+    list(
+        client.iter_chunks(
+            stop_event,
+            gga_provider=provider,
+            on_gga_interval_s=1.0,
+        )
+    )
+
+    assert calls["count"] == 1
+    assert socket_obj.sent == [b"$GPGGA,periodic*00\r\n"]
+    assert client.stats.gga_sent_count == 1
+
+
+def test_iter_chunks_does_not_send_blank_line_when_provider_returns_none() -> None:
+    stop_event = threading.Event()
+
+    def provider() -> None:
+        stop_event.set()
+        return None
+
+    client = _connected_client()
+    socket_obj = _FakeStreamSocket([b""])
+    client._socket = socket_obj  # noqa: SLF001
+
+    with pytest.raises(NtripProtocolError):
+        list(client.iter_chunks(stop_event, gga_provider=provider, on_gga_interval_s=0.0))
+
+    assert socket_obj.sent == []
+
+
+def test_iter_chunks_socket_eof_raises_with_full_disconnect_diagnostics() -> None:
+    """The EOF exception message is what actually reaches the visible log
+    (via the existing reconnecting/failed handlers), so every field the
+    operator needs to diagnose *why* the caster closed the stream must be in
+    this one message: connection duration, last GGA age, last RTCM age, GGA
+    send count, and RTCM byte/chunk counts.
+    """
+
+    stop_event = threading.Event()
+    client = _connected_client()
+    socket_obj = _FakeStreamSocket([b"one-chunk", b""])
+    client._socket = socket_obj  # noqa: SLF001
+
+    with pytest.raises(NtripProtocolError) as excinfo:
+        list(client.iter_chunks(stop_event, gga_provider=None))
+
+    message = str(excinfo.value)
+    assert message.startswith("NTRIP caster closed the stream")
+    assert "connected_duration=" in message
+    assert "last_gga_age=never" in message
+    assert "last_rtcm_age=" in message
+    assert "gga_sent=0" in message
+    assert "chunks_received=1" in message
+    assert "bytes_received=9" in message
+
+
+def test_iter_chunks_socket_eof_after_stop_requested_does_not_raise() -> None:
+    """An operator-requested Stop closing the socket must not be reported as
+    a caster-side failure."""
+
+    stop_event = threading.Event()
+    client = _connected_client()
+    socket_obj = _FakeStreamSocket([b""])
+    client._socket = socket_obj  # noqa: SLF001
+    stop_event.set()
+
+    assert list(client.iter_chunks(stop_event, gga_provider=None)) == []
+
+
+def test_iter_chunks_default_gga_interval_is_five_seconds() -> None:
+    import inspect
+
+    signature = inspect.signature(NtripClient.iter_chunks)
+    assert signature.parameters["on_gga_interval_s"].default == 5.0
+
+
 def test_ntrip_health_distinguishes_transport_from_valid_rtcm() -> None:
     active = evaluate_ntrip_health(
         network_mode=True,
@@ -233,8 +551,10 @@ def test_ntrip_worker_emits_updated_stream_stats_after_each_chunk(monkeypatch) -
     import Workstation.gnss_runtime_workers as runtime_workers
 
     class FakeClient:
-        def __init__(self, _config) -> None:
+        def __init__(self, _config, *, username=None, password=None, diagnostics=None) -> None:
             self._stats = None
+            self.username = username
+            self.password = password
 
         @property
         def stats(self):
@@ -280,3 +600,482 @@ def test_ntrip_worker_emits_updated_stream_stats_after_each_chunk(monkeypatch) -
     assert stats[0].chunks_received == 1
     assert stats[0].bytes_received == 128
     assert chunks == [b"rtcm-chunk"]
+
+
+# --- Direct username/password UI: credential plumbing, storage, and UI ----
+
+
+def test_ntrip_worker_passes_explicit_credentials_to_client_and_reuses_them_on_reconnect(monkeypatch) -> None:
+    """Required test 1 + 8: explicit credentials reach NtripClient, including on retry."""
+
+    import Workstation.gnss_runtime_workers as runtime_workers
+
+    seen_credentials: list[tuple[object, object]] = []
+
+    class FakeClient:
+        def __init__(self, _config, *, username=None, password=None, diagnostics=None) -> None:
+            self._stats = None
+            self._attempt = len(seen_credentials)
+            seen_credentials.append((username, password))
+
+        @property
+        def stats(self):
+            return self._stats
+
+        def connect(self, *, gga_sentence=None):
+            if self._attempt == 0:
+                raise RuntimeError("simulated transient failure")
+            self._stats = SimpleNamespace(
+                connected_at_monotonic_s=10.0,
+                bytes_received=0,
+                chunks_received=0,
+                last_chunk_monotonic_s=None,
+                last_gga_monotonic_s=None,
+            )
+            return "ICY 200 OK", b""
+
+        def iter_chunks(self, stop_event, **_kwargs):
+            stop_event.set()
+            return iter(())
+
+        def close(self):
+            return None
+
+    class ImmediateWaiter:
+        def __init__(self, _config) -> None:
+            pass
+
+        def wait_for_reconnect(self, stop_event, **_kwargs):
+            return not stop_event.is_set()
+
+    def fake_client_factory(config, *, username=None, password=None, diagnostics=None):
+        if username is None and password is None:
+            return ImmediateWaiter(config)
+        return FakeClient(config, username=username, password=password)
+
+    monkeypatch.setattr(runtime_workers, "NtripClient", fake_client_factory)
+    worker = runtime_workers.NtripNetworkWorker(
+        config=NetworkConfig(), username="field-user", password="field-secret"
+    )
+    reconnecting: list[str] = []
+    connected: list[object] = []
+    worker.reconnecting.connect(reconnecting.append)
+    worker.connected.connect(lambda status, _stats: connected.append(status))
+
+    worker.run()
+
+    assert reconnecting, "the first attempt should have failed and reconnected"
+    assert connected == ["ICY 200 OK"]
+    credential_attempts = [pair for pair in seen_credentials if pair != (None, None)]
+    assert len(credential_attempts) == 2
+    assert credential_attempts[0] == ("field-user", "field-secret")
+    assert credential_attempts[1] == ("field-user", "field-secret")
+
+
+def test_network_config_carries_plain_username_and_never_a_password_field() -> None:
+    """Required test 2 (structural half): NetworkConfig has nowhere to put a password."""
+
+    config = NetworkConfig(username="field-user")
+    mapping = config.to_mapping()
+
+    assert mapping["username"] == "field-user"
+    assert "password" not in mapping
+    assert NetworkConfig.from_mapping(mapping).username == "field-user"
+
+
+def test_saved_settings_json_never_contains_a_ntrip_password(tmp_path) -> None:
+    """Required test 2: a full settings round trip never writes a password."""
+
+    settings = AppSettings(
+        gnss_operation=GnssOperationConfig(
+            network=NetworkConfig(
+                caster_host="caster.example.org",
+                mountpoint="VRS",
+                username="field-user",
+                remember_password=True,
+            )
+        )
+    )
+    path = tmp_path / "settings.json"
+    save_settings(settings, path)
+
+    raw_text = path.read_text(encoding="utf-8")
+    payload = json.loads(raw_text)
+
+    assert payload["gnss_operation"]["network"]["username"] == "field-user"
+    assert "password" not in payload["gnss_operation"]["network"]
+    assert "secret" not in raw_text.lower()
+    reloaded = load_settings(path)
+    assert reloaded.gnss_operation.network.username == "field-user"
+    assert reloaded.gnss_operation.network.remember_password is True
+
+
+class _FakeKeyringBackend:
+    """In-memory stand-in for a real OS credential store."""
+
+    def __init__(self) -> None:
+        self.store: dict[tuple[str, str], str] = {}
+
+    def get_keyring(self):
+        return self
+
+    def set_password(self, service: str, username: str, password: str) -> None:
+        self.store[(service, username)] = password
+
+    def get_password(self, service: str, username: str) -> str | None:
+        return self.store.get((service, username))
+
+    def delete_password(self, service: str, username: str) -> None:
+        key = (service, username)
+        if key not in self.store:
+            raise ntrip_credentials.PasswordDeleteError("not found")
+        del self.store[key]
+
+
+def test_ntrip_credentials_keyring_save_load_delete_roundtrip(monkeypatch) -> None:
+    """Required test 3: save/load/delete against the OS credential store."""
+
+    backend = _FakeKeyringBackend()
+    monkeypatch.setattr(ntrip_credentials, "keyring", backend)
+
+    assert ntrip_credentials.secure_storage_available() is True
+    assert ntrip_credentials.credential_status("caster", "MOUNT", "field-user") == (
+        ntrip_credentials.CredentialStorageStatus.NOT_SAVED
+    )
+
+    assert ntrip_credentials.save_password("caster", "MOUNT", "field-user", "field-secret") is True
+    assert ntrip_credentials.load_password("caster", "MOUNT", "field-user") == "field-secret"
+    assert ntrip_credentials.credential_status("caster", "MOUNT", "field-user") == (
+        ntrip_credentials.CredentialStorageStatus.SAVED
+    )
+
+    # A different mountpoint/username must not see this caster's credential.
+    assert ntrip_credentials.load_password("caster", "OTHER-MOUNT", "field-user") is None
+    assert ntrip_credentials.load_password("caster", "MOUNT", "other-user") is None
+
+    assert ntrip_credentials.delete_password("caster", "MOUNT", "field-user") is True
+    assert ntrip_credentials.load_password("caster", "MOUNT", "field-user") is None
+    # Deleting an already-absent entry is idempotent, not an error.
+    assert ntrip_credentials.delete_password("caster", "MOUNT", "field-user") is True
+
+
+def test_ntrip_credentials_report_unavailable_without_a_usable_backend(monkeypatch) -> None:
+    monkeypatch.setattr(ntrip_credentials, "keyring", None)
+
+    assert ntrip_credentials.secure_storage_available() is False
+    assert ntrip_credentials.save_password("caster", "MOUNT", "field-user", "secret") is False
+    assert ntrip_credentials.load_password("caster", "MOUNT", "field-user") is None
+    assert ntrip_credentials.credential_status("caster", "MOUNT", "field-user") == (
+        ntrip_credentials.CredentialStorageStatus.UNAVAILABLE
+    )
+
+
+def test_resolve_ntrip_credentials_remember_off_never_persists_session_password(monkeypatch) -> None:
+    """Required test 4: Remember=OFF keeps a typed password to this process only."""
+
+    import Workstation.gnss_runtime_controller as gnss_runtime_controller
+
+    saved: list[tuple[str, str, str, str]] = []
+    monkeypatch.setattr(
+        gnss_runtime_controller.ntrip_credentials,
+        "save_password",
+        lambda host, mount, user, password: saved.append((host, mount, user, password)),
+    )
+
+    controller = GnssRuntimeController(SimpleNamespace())
+    session_credential = NtripCredentialResolution(username="field-user", password="field-secret", source="session")
+
+    controller._maybe_persist_ntrip_credential(
+        NetworkConfig(caster_host="caster", mountpoint="MOUNT", remember_password=False),
+        session_credential,
+    )
+    assert saved == []
+
+    controller._maybe_persist_ntrip_credential(
+        NetworkConfig(caster_host="caster", mountpoint="MOUNT", remember_password=True),
+        session_credential,
+    )
+    assert saved == [("caster", "MOUNT", "field-user", "field-secret")]
+
+    # A credential that was *not* freshly typed this session (already came
+    # from the keyring or a legacy env var) is never re-saved.
+    saved.clear()
+    keyring_credential = NtripCredentialResolution(username="field-user", password="field-secret", source="keyring")
+    controller._maybe_persist_ntrip_credential(
+        NetworkConfig(caster_host="caster", mountpoint="MOUNT", remember_password=True),
+        keyring_credential,
+    )
+    assert saved == []
+
+
+def _panel_with_password(text: str) -> SimpleNamespace:
+    return SimpleNamespace(gnss_ntrip_password_edit=QtWidgets.QLineEdit(text))
+
+
+def test_resolve_ntrip_credentials_prefers_session_password(monkeypatch) -> None:
+    controller = GnssRuntimeController(_panel_with_password("typed-secret"))
+    network = NetworkConfig(caster_host="caster", mountpoint="MOUNT", username="field-user")
+
+    resolved = controller._resolve_ntrip_credentials(network)
+
+    assert resolved == NtripCredentialResolution(username="field-user", password="typed-secret", source="session")
+
+
+def test_set_gnss_ntrip_session_password_bridges_settings_workspace_field_into_resolve() -> None:
+    """Regression: the Settings workspace's password field lives on a
+    different object than ``panel`` (SettingsWorkspace.gnss_network_password_edit
+    vs panel.gnss_ntrip_password_edit). settings_controller.py used to try
+    ``getattr(panel, "gnss_network_password_edit", None)``, which is always
+    ``None`` since that attribute was never on ``panel`` -- so typing a
+    password in Settings and clicking Apply never reached the field
+    ``_resolve_ntrip_credentials`` reads, and Start NTRIP kept reporting "no
+    saved password" no matter what was typed. main_window.py now calls this
+    method directly with the live text, where both objects are in scope.
+    """
+
+    controller = GnssRuntimeController(_panel_with_password(""))
+
+    controller.set_gnss_ntrip_session_password("typed-in-settings-workspace")
+
+    network = NetworkConfig(caster_host="caster", mountpoint="MOUNT", username="field-user")
+    resolved = controller._resolve_ntrip_credentials(network)
+
+    assert resolved == NtripCredentialResolution(
+        username="field-user", password="typed-in-settings-workspace", source="session"
+    )
+
+
+def test_resolve_ntrip_credentials_falls_back_to_keyring(monkeypatch) -> None:
+    import Workstation.gnss_runtime_controller as gnss_runtime_controller
+
+    backend = _FakeKeyringBackend()
+    monkeypatch.setattr(ntrip_credentials, "keyring", backend)
+    ntrip_credentials.save_password("caster", "MOUNT", "field-user", "stored-secret")
+
+    controller = GnssRuntimeController(_panel_with_password(""))
+    network = NetworkConfig(caster_host="caster", mountpoint="MOUNT", username="field-user")
+
+    resolved = controller._resolve_ntrip_credentials(network)
+
+    assert resolved == NtripCredentialResolution(username="field-user", password="stored-secret", source="keyring")
+
+
+def test_resolve_ntrip_credentials_falls_back_to_legacy_env_vars(monkeypatch) -> None:
+    """Required test 6: the pre-existing username_env/password_env path keeps working."""
+
+    monkeypatch.setattr(ntrip_credentials, "keyring", None)
+    monkeypatch.setenv("EXAMPLE_LEGACY_USER", "legacy-user")
+    monkeypatch.setenv("EXAMPLE_LEGACY_PASS", "legacy-secret")
+
+    controller = GnssRuntimeController(_panel_with_password(""))
+    network = NetworkConfig(
+        caster_host="caster",
+        mountpoint="MOUNT",
+        username="",
+        username_env="EXAMPLE_LEGACY_USER",
+        password_env="EXAMPLE_LEGACY_PASS",
+    )
+
+    resolved = controller._resolve_ntrip_credentials(network)
+
+    assert resolved == NtripCredentialResolution(username="legacy-user", password="legacy-secret", source="legacy_env")
+
+
+def test_resolve_ntrip_credentials_fails_clearly_with_no_credential_anywhere(monkeypatch) -> None:
+    """Required test 5: no session/keyring/legacy credential -> a specific, clear failure."""
+
+    monkeypatch.setattr(ntrip_credentials, "keyring", None)
+    monkeypatch.delenv("NTRIP_USERNAME", raising=False)
+    monkeypatch.delenv("NTRIP_PASSWORD", raising=False)
+
+    controller = GnssRuntimeController(_panel_with_password(""))
+    network = NetworkConfig(caster_host="caster", mountpoint="MOUNT", username="field-user")
+
+    with pytest.raises(NtripCredentialError) as excinfo:
+        controller._resolve_ntrip_credentials(network)
+    assert "password" in str(excinfo.value).lower()
+    # The failure never guesses which credential (if any) is wrong.
+    assert "field-user" not in str(excinfo.value)
+
+
+def test_resolve_ntrip_credentials_requires_a_username() -> None:
+    controller = GnssRuntimeController(_panel_with_password(""))
+    network = NetworkConfig(caster_host="caster", mountpoint="MOUNT", username="", username_env="UNSET_ENV_USER", password_env="UNSET_ENV_PASS")
+
+    with pytest.raises(NtripCredentialError) as excinfo:
+        controller._resolve_ntrip_credentials(network)
+    assert "username" in str(excinfo.value).lower()
+
+
+def test_resolved_credential_password_never_appears_in_ntrip_request_bytes() -> None:
+    """Required test 7: the Authorization header is built without leaking the raw password."""
+
+    controller = GnssRuntimeController(_panel_with_password("field-secret"))
+    network = NetworkConfig(caster_host="caster.example.org", mountpoint="VRS", username="field-user")
+
+    resolved = controller._resolve_ntrip_credentials(network)
+    request = build_ntrip_request(network, username=resolved.username, password=resolved.password)
+
+    assert b"Authorization: Basic " in request
+    assert b"field-secret" not in request
+    assert resolved.password == "field-secret"  # sanity: the credential itself was resolved correctly
+
+
+def test_settings_workspace_ntrip_password_field_is_masked_and_not_a_settings_widget() -> None:
+    """Required test 9 (+ structural half of test 2): password input is masked and untracked."""
+
+    QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    workspace = SettingsWorkspace(backend=object())
+    try:
+        assert workspace.gnss_network_password_edit.echoMode() == QtWidgets.QLineEdit.Password
+        assert workspace.gnss_network_password_edit.text() == ""
+        # The password widget must never be reachable through the generic
+        # settings payload path that gets serialized to disk.
+        assert "gnss_network_password" not in workspace.settings_widgets
+        payload = workspace.settings_payload()
+        assert "gnss_network_password" not in payload
+    finally:
+        workspace.deleteLater()
+
+
+def test_network_reconnect_after_ready_does_not_attempt_invalid_state_transition() -> None:
+    """Regression: NtripNetworkWorker reconnects transparently on any
+    transient stream drop (caster closes the connection, network blip) and
+    re-emits ``connected`` every time -- including well after the operation
+    state machine already progressed past NTRIP_ACTIVE to READY/MEASURING.
+    Only INITIALIZING/NTRIP_CONNECTING can legally reach NTRIP_ACTIVE;
+    retrying it from READY used to log a spurious "상태 전환 실패: invalid
+    GNSS state transition" fault on every ordinary reconnect, even though
+    RTCM kept flowing the whole time (chunk routing never depended on this
+    state machine).
+    """
+
+    transition_calls: list[tuple[object, str]] = []
+    health_calls: list[tuple[str, str, str]] = []
+
+    panel = SimpleNamespace(
+        gnss_network_connected=False,
+        gnss_network_phase="",
+        gnss_network_stats=None,
+        gnss_network_last_error="",
+        gnss_network_status_line="",
+        gnss_operation_manager=SimpleNamespace(state=GnssOperationState.READY),
+        gnss_base_status_labels={"network": "network-label"},
+        _gnss_transition=lambda state, reason: transition_calls.append((state, reason)),
+        _set_health_label=lambda label, text, tone: health_calls.append((label, text, tone)),
+    )
+    controller = GnssRuntimeController(panel)
+
+    controller._handle_gnss_network_connected("ICY 200 OK", stats=object())
+
+    assert transition_calls == []
+    assert panel.gnss_network_connected is True
+    assert health_calls == [("network-label", "ICY 200 OK | RTCM 대기", "good")]
+
+
+def test_network_connect_from_ntrip_connecting_still_transitions_to_active() -> None:
+    """The legitimate first-connect path must keep transitioning normally."""
+
+    transition_calls: list[tuple[object, str]] = []
+
+    panel = SimpleNamespace(
+        gnss_network_connected=False,
+        gnss_network_phase="",
+        gnss_network_stats=None,
+        gnss_network_last_error="",
+        gnss_network_status_line="",
+        gnss_operation_manager=SimpleNamespace(state=GnssOperationState.NTRIP_CONNECTING),
+        gnss_base_status_labels={"network": "network-label"},
+        _gnss_transition=lambda state, reason: transition_calls.append((state, reason)),
+        _set_health_label=lambda *args: None,
+    )
+    controller = GnssRuntimeController(panel)
+
+    controller._handle_gnss_network_connected("ICY 200 OK", stats=object())
+
+    assert transition_calls == [(GnssOperationState.NTRIP_ACTIVE, "NTRIP active: ICY 200 OK")]
+
+
+def test_handle_gnss_network_diagnostic_forwards_to_the_visible_log() -> None:
+    """NtripClient's connect/GGA-TX events have no status of their own and no
+    other signal to ride on -- without this handler they never reach the log.
+    """
+
+    logged: list[str] = []
+    panel = SimpleNamespace(_log=lambda text: logged.append(text))
+    controller = GnssRuntimeController(panel)
+
+    controller._handle_gnss_network_diagnostic("NTRIP CONNECTED status='HTTP/1.1 200 OK' at=123.456")
+
+    assert logged == ["[GNSS][NTRIP] NTRIP CONNECTED status='HTTP/1.1 200 OK' at=123.456"]
+
+
+def _gga_panel(
+    *,
+    gga_policy: GgaPolicy,
+    log_sink: list[str],
+    latest_gps: dict | None = None,
+    latest_gnss_base_position=None,
+) -> SimpleNamespace:
+    config = GnssOperationConfig(network=NetworkConfig(caster_host="caster", mountpoint="MOUNT", gga_policy=gga_policy))
+    return SimpleNamespace(
+        _gnss_active_operation_config=lambda: config,
+        latest_gps=latest_gps or {},
+        latest_gnss_base_position=latest_gnss_base_position,
+        _log=log_sink.append,
+    )
+
+
+def test_gga_provider_logs_specific_reason_for_manual_policy() -> None:
+    logged: list[str] = []
+    panel = _gga_panel(gga_policy=GgaPolicy.MANUAL, log_sink=logged)
+    controller = GnssRuntimeController(panel)
+
+    result = controller._gnss_gga_provider()
+
+    assert result is None
+    assert any("MANUAL" in message for message in logged)
+
+
+def test_gga_provider_logs_specific_reason_for_missing_rover_positions() -> None:
+    logged: list[str] = []
+    panel = _gga_panel(gga_policy=GgaPolicy.SYSTEM_CENTER, log_sink=logged, latest_gps={})
+    controller = GnssRuntimeController(panel)
+
+    result = controller._gnss_gga_provider()
+
+    assert result is None
+    assert any(
+        "no left/right GNSS position available" in message and "left=no message received" in message
+        for message in logged
+    )
+
+
+def test_gga_provider_logs_stale_base_sample_age_for_base_gnss_policy() -> None:
+    logged: list[str] = []
+    stale_sample = SimpleNamespace(timestamp_s=time.monotonic() - 30.0)
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.BASE_GNSS, log_sink=logged, latest_gnss_base_position=stale_sample
+    )
+    controller = GnssRuntimeController(panel)
+
+    result = controller._gnss_gga_provider()
+
+    assert result is None
+    assert any("stale" in message and "age=" in message for message in logged)
+
+
+def test_gga_provider_system_center_success_does_not_log_anything() -> None:
+    logged: list[str] = []
+    left = SimpleNamespace(latitude_deg=37.0, longitude_deg=127.0, altitude_m=50.0, has_position=True)
+    right = SimpleNamespace(latitude_deg=37.0001, longitude_deg=127.0001, altitude_m=51.0, has_position=True)
+    panel = _gga_panel(
+        gga_policy=GgaPolicy.SYSTEM_CENTER, log_sink=logged, latest_gps={"left": left, "right": right}
+    )
+    controller = GnssRuntimeController(panel)
+
+    result = controller._gnss_gga_provider()
+
+    assert result is not None
+    assert result.startswith("$GPGGA,")
+    assert logged == []

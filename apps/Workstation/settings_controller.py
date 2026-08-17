@@ -216,12 +216,27 @@ class WorkstationSettingsController:
             for name, attribute in (
                 ("caster_host", "gnss_ntrip_host_edit"),
                 ("mountpoint", "gnss_ntrip_mountpoint_edit"),
+                ("username", "gnss_ntrip_username_edit"),
                 ("username_env", "gnss_ntrip_username_env_edit"),
                 ("password_env", "gnss_ntrip_password_env_edit"),
             ):
                 widget = getattr(panel, attribute, None)
                 if widget is not None:
                     widget.setText(str(network[name]))
+            # The password itself is intentionally not part of ``network`` --
+            # see NetworkConfig / ntrip_credentials.py -- so it never appears
+            # in this ``values``/settings mapping and is not handled here.
+            # The Settings workspace's own password field
+            # (SettingsWorkspace.gnss_network_password_edit) lives on a
+            # different object than ``panel`` and was never reachable via
+            # ``getattr(panel, ...)``; see
+            # GnssRuntimeController.set_gnss_ntrip_session_password, called
+            # directly from main_window.py's ``_settings_apply`` where both
+            # objects are actually in scope, for the real widget-to-widget
+            # handoff.
+            remember_widget = getattr(panel, "gnss_ntrip_remember_checkbox", None)
+            if remember_widget is not None:
+                remember_widget.setChecked(bool(network["remember_password"]))
             for name, attribute in (
                 ("caster_port", "gnss_ntrip_port_spin"),
                 ("acquisition_duration_s", "gnss_fixed_acquisition_duration_spin"),
@@ -232,6 +247,8 @@ class WorkstationSettingsController:
                 if widget is not None:
                     set_numeric_widget(widget, source[name])
             panel._set_combo_data(panel.gnss_ntrip_gga_policy_combo, network["gga_policy"])
+            if hasattr(panel, "_refresh_ntrip_credential_status"):
+                panel._refresh_ntrip_credential_status()
             panel._set_combo_data(panel.gnss_fixed_height_combo, operation["fixed_base"]["height_type"])
             if has("gnss_base_rtcm_injection_target"):
                 panel._set_combo_data(

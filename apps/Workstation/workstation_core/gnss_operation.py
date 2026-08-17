@@ -222,8 +222,22 @@ class NetworkConfig:
     caster_host: str = ""
     caster_port: int = 2101
     mountpoint: str = ""
+    # Plain-text username is not a secret and may live in the settings JSON.
+    # The password never gets a field here -- it only ever lives in the OS
+    # keyring (ntrip_credentials.py) or the current process's memory; see
+    # gnss_runtime_controller._resolve_ntrip_credentials for the lookup order.
+    username: str = ""
+    # Legacy indirection: the *names* of OS environment variables holding
+    # credentials, kept only so settings files written before the direct
+    # Username/Password UI still authenticate. New configuration should leave
+    # ``username`` set directly instead of pointing at an environment variable.
     username_env: str = "NTRIP_USERNAME"
     password_env: str = "NTRIP_PASSWORD"
+    # Whether a freshly-typed session password should be written to the OS
+    # keyring (workstation_core/ntrip_credentials.py). This flag itself is
+    # not a secret. When False, a typed password is used for this run only
+    # and is never persisted anywhere.
+    remember_password: bool = False
     tls: bool = False
     gga_policy: GgaPolicy = GgaPolicy.SYSTEM_CENTER
     reconnect_interval_s: float = 5.0
@@ -236,6 +250,7 @@ class NetworkConfig:
         if self.caster_port <= 0 or self.caster_port > 65535:
             raise ValueError("network.caster_port must be between 1 and 65535")
         object.__setattr__(self, "mountpoint", str(self.mountpoint).strip().lstrip("/"))
+        object.__setattr__(self, "username", str(self.username).strip())
         object.__setattr__(self, "username_env", str(self.username_env).strip())
         object.__setattr__(self, "password_env", str(self.password_env).strip())
         if not self.username_env or not self.password_env:
@@ -253,8 +268,10 @@ class NetworkConfig:
             caster_host=value.get("caster_host", defaults.caster_host),
             caster_port=value.get("caster_port", defaults.caster_port),
             mountpoint=value.get("mountpoint", defaults.mountpoint),
+            username=value.get("username", defaults.username),
             username_env=value.get("username_env", defaults.username_env),
             password_env=value.get("password_env", defaults.password_env),
+            remember_password=bool(value.get("remember_password", defaults.remember_password)),
             tls=value.get("tls", defaults.tls),
             gga_policy=value.get("gga_policy", defaults.gga_policy.value),
             reconnect_interval_s=value.get("reconnect_interval_s", defaults.reconnect_interval_s),
@@ -267,8 +284,10 @@ class NetworkConfig:
             "caster_host": self.caster_host,
             "caster_port": self.caster_port,
             "mountpoint": self.mountpoint,
+            "username": self.username,
             "username_env": self.username_env,
             "password_env": self.password_env,
+            "remember_password": self.remember_password,
             "tls": self.tls,
             "gga_policy": self.gga_policy.value,
             "reconnect_interval_s": self.reconnect_interval_s,

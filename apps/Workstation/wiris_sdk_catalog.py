@@ -5,6 +5,12 @@ SDK`` user manual, revision ``241106EN`` (6 November 2024, firmware 2.10.60
 and higher).  It intentionally contains command variants as separate entries
 so the Workstation preset selector can expose every documented choice while
 still allowing the raw command editor to be used for a device-specific value.
+
+Workstation only operates WIRIS Enterprise units, so commands the manual
+documents as exclusive to a different product line -- WIRIS AGRO (CWSI/crop
+stress, section 5.8), WIRIS Security (section 5.7), GIS 320 (section 5.11),
+and AGRO's Colourmap (section 5.13) -- are deliberately left out rather than
+offered as dead presets a WIRIS Enterprise camera cannot execute.
 """
 
 from __future__ import annotations
@@ -67,41 +73,6 @@ WIRIS_COMMAND_CATALOG: tuple[tuple[str, str, str, str, str], ...] = (
     _entry("Thermal", "Get environment range", "GREN", "현재 환경 온도 range를 읽습니다. (WWP/WWE/GIS)"),
     _entry("Thermal", "Get environment range options", "GREL", "카메라가 지원하는 환경 온도 range 목록을 읽습니다. (WWP/WWE/GIS)"),
 
-    # 5.7 WIRIS Security thermal parameters
-    _entry("WIRIS Security", "Set stabilization time", "STST <seconds>", "WIRIS Security 안정화 시간을 설정합니다(0-5초)."),
-    _entry("WIRIS Security", "Get stabilization time", "GTST", "WIRIS Security 안정화 시간을 읽습니다."),
-    _entry("WIRIS Security", "Set hot rejection", "SHRJ <percent>", "WIRIS Security hot rejection을 설정합니다(0-30%)."),
-    _entry("WIRIS Security", "Get hot rejection", "GHRJ", "WIRIS Security hot rejection을 읽습니다."),
-    _entry("WIRIS Security", "Set cold rejection", "SCRJ <percent>", "WIRIS Security cold rejection을 설정합니다(0-30%)."),
-    _entry("WIRIS Security", "Get cold rejection", "GCRJ", "WIRIS Security cold rejection을 읽습니다."),
-
-    # 5.8 WIRIS AGRO thermal parameters
-    _entry("WIRIS AGRO", "Set CWSI mode theoretic", "SCWM THEORETIC", "WIRIS AGRO CWSI mode를 THEORETIC으로 설정합니다."),
-    _entry("WIRIS AGRO", "Set CWSI mode empirical", "SCWM EMPIRICAL", "WIRIS AGRO CWSI mode를 EMPIRICAL로 설정합니다."),
-    _entry("WIRIS AGRO", "Set CWSI mode differential", "SCWM DIFFERENTIAL", "WIRIS AGRO CWSI mode를 DIFFERENTIAL로 설정합니다."),
-    _entry("WIRIS AGRO", "Get CWSI mode", "GCWM", "현재 WIRIS AGRO CWSI mode를 읽습니다."),
-    _entry("WIRIS AGRO", "Set air temperature", "SCAT <temperature>", "WIRIS AGRO air temperature를 설정합니다."),
-    _entry("WIRIS AGRO", "Get air temperature", "GCAT", "WIRIS AGRO air temperature를 읽습니다."),
-    _entry("WIRIS AGRO", "Set 100% stress level", "SUSL", "현재 중심 온도를 WIRIS AGRO 100% stress level로 저장합니다."),
-    _entry("WIRIS AGRO", "Get 100% stress level", "GUSL", "WIRIS AGRO 100% stress level을 읽습니다."),
-    _entry("WIRIS AGRO", "Set 0% stress level", "SLSL", "현재 중심 온도를 WIRIS AGRO 0% stress level로 저장합니다."),
-    _entry("WIRIS AGRO", "Get 0% stress level", "GLSL", "WIRIS AGRO 0% stress level을 읽습니다."),
-    _entry("WIRIS AGRO", "Set crop index", "SCRP <index>", "WIRIS AGRO crop index를 설정합니다(1-3)."),
-    _entry("WIRIS AGRO", "Get crop index", "GRCP", "WIRIS AGRO crop index를 읽습니다."),
-    _entry("WIRIS AGRO", "Set relative humidity", "SCHY <percent>", "WIRIS AGRO 상대 습도를 설정합니다."),
-    _entry("WIRIS AGRO", "Get relative humidity", "GCHY", "WIRIS AGRO 상대 습도를 읽습니다."),
-    _entry("WIRIS AGRO", "Set intercept baseline", "SINB <value>", "WIRIS AGRO intercept baseline을 설정합니다(0-10)."),
-    _entry("WIRIS AGRO", "Get intercept baseline", "GINB", "WIRIS AGRO intercept baseline을 읽습니다."),
-    _entry("WIRIS AGRO", "Set slope baseline", "SSLB <value>", "WIRIS AGRO slope baseline을 설정합니다(-5-0)."),
-    _entry("WIRIS AGRO", "Get slope baseline", "GSLB", "WIRIS AGRO slope baseline을 읽습니다."),
-    _entry("WIRIS AGRO", "Get CWSI d1", "GEDF", "WIRIS AGRO CWSI d1 계산값을 읽습니다."),
-    _entry("WIRIS AGRO", "Get CWSI d2", "GEDS", "WIRIS AGRO CWSI d2 계산값을 읽습니다."),
-    _entry("WIRIS AGRO", "Get CWSI extremes", "GCWP", "WIRIS AGRO CWSI extreme 값들을 읽습니다."),
-    _entry("WIRIS AGRO", "Get CWSI graph ratios", "GCGR", "WIRIS AGRO CWSI graph 비율을 읽습니다."),
-    _entry("WIRIS AGRO", "Display CWSI ON", "SCWV TRUE", "WIRIS AGRO CWSI 값을 HDMI에 표시합니다."),
-    _entry("WIRIS AGRO", "Display CWSI OFF", "SCWV FALSE", "WIRIS AGRO CWSI 값의 HDMI 표시를 끕니다."),
-    _entry("WIRIS AGRO", "Get CWSI display", "GCWV", "WIRIS AGRO CWSI HDMI 표시 상태를 읽습니다."),
-
     # 5.9 Appearance
     _entry("Appearance", "Set layout inspection", "SLAY INSPECTION", "HDMI layout을 INSPECTION으로 설정합니다."),
     _entry("Appearance", "Set layout security", "SLAY SECURITY", "HDMI layout을 SECURITY로 설정합니다."),
@@ -128,27 +99,12 @@ WIRIS_COMMAND_CATALOG: tuple[tuple[str, str, str, str, str], ...] = (
     _entry("Zoom", "Get visible zoom", "GZVV", "현재 가시광 줌 index/ratio를 읽습니다."),
     _entry("Zoom", "Get visible zoom list", "GZVL", "지원되는 가시광 줌 index/ratio 목록을 읽습니다."),
 
-    # 5.11 GIS 320 specific settings
-    _entry("GIS 320", "Autofocus", "SGFA", "GIS 320 autofocus를 실행합니다."),
-    _entry("GIS 320", "Focus to infinity", "SGFI", "GIS 320 focus를 infinity로 설정합니다."),
-    _entry("GIS 320", "Get remaining cooling time", "GCDT", "GIS 320 냉각 완료까지 남은 예상 시간을 읽습니다."),
-    _entry("GIS 320", "Set filter mode normal", "SGFM NORMAL", "GIS 320 filter mode를 NORMAL로 설정합니다."),
-    _entry("GIS 320", "Set filter mode HSM", "SGFM HSM", "GIS 320 filter mode를 HSM으로 설정합니다."),
-    _entry("GIS 320", "Set filter mode DGM", "SGFM DGM", "GIS 320 filter mode를 DGM으로 설정합니다."),
-    _entry("GIS 320", "Get filter mode", "GGFM", "GIS 320 filter mode를 읽습니다."),
-    _entry("GIS 320", "Set high sensitivity ON", "SHSM TRUE", "GIS 320 high sensitivity mode를 켭니다."),
-    _entry("GIS 320", "Set high sensitivity OFF", "SHSM FALSE", "GIS 320 high sensitivity mode를 끕니다."),
-    _entry("GIS 320", "Get high sensitivity", "GHSM", "GIS 320 high sensitivity mode를 읽습니다."),
-
-    # 5.12 Palettes / 5.13 Colourmap
+    # 5.12 Palettes
     _entry("Palette", "Get current palette", "GPTE", "현재 thermal palette index/name을 읽습니다. (WIRIS AGRO 제외)"),
     _entry("Palette", "Set palette by name", "SPTE <name>", "thermal palette를 이름으로 설정합니다. (WIRIS AGRO 제외)"),
     _entry("Palette", "Set palette by index", "SPTI <index>", "thermal palette를 index로 설정합니다. (WIRIS AGRO 제외)"),
     _entry("Palette", "Get palette list", "GPTL", "지원되는 thermal palette 목록을 읽습니다. (WIRIS AGRO 제외)"),
     _entry("Palette", "Get palette lookup table", "GPLV", "현재 palette의 256-entry RGB lookup table을 읽습니다. (WIRIS AGRO 제외)"),
-    _entry("Colourmap", "Get current colourmap", "GCMP", "WIRIS AGRO 현재 colourmap index/name을 읽습니다."),
-    _entry("Colourmap", "Set colourmap", "SCMP <index>", "WIRIS AGRO colourmap index를 설정합니다."),
-    _entry("Colourmap", "Get colourmap list", "GCML", "WIRIS AGRO colourmap 목록을 읽습니다."),
 
     # 5.14 Capture and record
     _entry("Capture/Record", "Capture image", "CPTR", "카메라 자체 이미지 캡처를 트리거합니다."),
@@ -333,18 +289,6 @@ WIRIS_DANGEROUS_COMMAND_PREFIXES = (
     "SRMM",
     "SRWC",
     "SREN",
-    "STST",
-    "SHRJ",
-    "SCRJ",
-    "SCWM",
-    "SCAT",
-    "SUSL",
-    "SLSL",
-    "SCRP",
-    "SCHY",
-    "SINB",
-    "SSLB",
-    "SCWV",
     "SLAY",
     "STTY",
     "SMCA",
@@ -352,12 +296,8 @@ WIRIS_DANGEROUS_COMMAND_PREFIXES = (
     "SZSM",
     "SZTN",
     "SZVN",
-    "SGFI",
-    "SGFM",
-    "SHSM",
     "SPTE",
     "SPTI",
-    "SCMP",
     "CPTR",
     "RCRS",
     "RCRF",

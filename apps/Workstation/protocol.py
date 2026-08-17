@@ -77,6 +77,8 @@ BACKEND_FACADE_METHODS = (
     "gnss_survey_stop",
     "gnss_ntrip_start",
     "gnss_ntrip_stop",
+    "gnss_ntrip_forget_password",
+    "set_gnss_ntrip_session_password",
     "calibration_capture_images",
     "calibration_capture_images_wiris_ftp",
     "calibration_capture_images_wiris_ftp_oz",
