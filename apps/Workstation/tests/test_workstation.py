@@ -5577,6 +5577,56 @@ def test_diagnostics_refreshes_only_the_visible_tab_and_skips_unchanged_text() -
     assert len(changes) == 1
 
 
+def test_diagnostics_gnss_tab_surfaces_the_registered_ntrip_status() -> None:
+    """Regression: the GNSS Diagnostics tab used to ask ``_status_text`` for
+    a plain ``"gnss"`` key that was never registered in StatusModel (the
+    real key is ``"gnss.ntrip"``, built by ``StatusModel._refresh_ntrip``
+    with phase/GGA age/RTCM age/reconnects/error detail). The typo meant
+    that detailed line silently rendered as "NO DATA" regardless of what
+    NTRIP was actually doing.
+    """
+
+    from Workstation.status_model import BackendStatusAdapter
+    from Workstation.workspaces import DiagnosticsContent
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    backend = _FakeBackend()
+    now = time.monotonic()
+    backend.panel.gnss_operation_manager = SimpleNamespace(
+        state=SimpleNamespace(value="NTRIP_ACTIVE"),
+        config=SimpleNamespace(
+            operation_mode=SimpleNamespace(value="NETWORK_RTK_DIRECT"),
+            network=SimpleNamespace(read_timeout_s=10.0, caster_host="RTS1.ngii.go.kr", mountpoint="RTK-RTCM32"),
+            readiness=SimpleNamespace(maximum_correction_age_s=3.0),
+        ),
+    )
+    backend.panel.gnss_network_connected = True
+    backend.panel.gnss_network_thread = object()
+    backend.panel.gnss_network_phase = "STREAMING"
+    backend.panel.gnss_network_stats = SimpleNamespace(
+        connected_at_monotonic_s=now - 10.0,
+        last_chunk_monotonic_s=now - 0.5,
+        last_gga_monotonic_s=now - 2.0,
+        gga_sent_count=3,
+        bytes_received=2400,
+        chunks_received=12,
+    )
+    backend.panel.gnss_base_rtcm_stats = {"frames": 4, "last_frame_s": now - 1.0}
+
+    adapter = BackendStatusAdapter(backend)
+    adapter.refresh()
+    diagnostics = DiagnosticsContent(backend, adapter.model)
+    diagnostics.tabs.setCurrentIndex(3)  # "GNSS" tab
+
+    diagnostics.refresh(adapter.model.snapshot())
+
+    text = diagnostics.gnss_view.toPlainText()
+    assert "NO DATA" not in text.split("\n\n", 1)[0]
+    assert "phase=STREAMING" in text
+    assert "GGA sent=3" in text
+    assert "caster=RTS1.ngii.go.kr/RTK-RTCM32" in text
+
+
 def test_diagnostics_log_preserves_manual_scroll_and_offers_follow_latest() -> None:
     from Workstation.status_model import StatusModel
     from Workstation.workspaces import DiagnosticsContent

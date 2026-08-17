@@ -744,6 +744,7 @@ class EvidenceAdapter:
                 "session_age_s": ntrip_health.session_age_s,
                 "last_chunk_age_s": ntrip_health.transport_age_s,
                 "last_gga_age_s": _age(getattr(network_stats, "last_gga_monotonic_s", None), now),
+                "gga_sent_count": _integer(getattr(network_stats, "gga_sent_count", 0), 0),
                 "bytes_received": ntrip_health.bytes_received,
                 "chunks_received": ntrip_health.chunks_received,
                 "byte_rate_bps": (

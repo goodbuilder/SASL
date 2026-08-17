@@ -8899,7 +8899,13 @@ class DiagnosticsContent(QtWidgets.QWidget):
         survey = operation.get("survey_in") if isinstance(operation.get("survey_in"), dict) else {}
         ntrip = operation.get("ntrip") if isinstance(operation.get("ntrip"), dict) else {}
         lines = [
-            self._status_text(snapshot, ("gnss.base", "gnss")),
+            # "gnss.ntrip" is the actually-registered status key (see
+            # status_model.py's _refresh_ntrip) -- this used to ask for a
+            # plain "gnss" key that was never registered, so the detailed
+            # NTRIP status line (phase/GGA age/RTCM age/reconnects/error)
+            # silently rendered as "NO DATA" here no matter what NTRIP was
+            # actually doing.
+            self._status_text(snapshot, ("gnss.base", "gnss.ntrip")),
             "Base operation (Base receiver / Survey-in / NTRIP / RTCM):",
             f"mode={operation.get('mode', 'UNKNOWN')} state={operation.get('state', 'UNKNOWN')} "
             f"serial={'CONNECTED' if base_serial.get('connected') else 'DISCONNECTED'} "

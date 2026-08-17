@@ -417,6 +417,20 @@ class BackendStatusAdapter(QtCore.QObject):
             detail_parts.append(f"RTCM age={health.rtcm_age_s:.2f}s")
         else:
             detail_parts.append("RTCM age=--")
+        # GGA is the rover-position keep-alive a VRS/session caster (e.g.
+        # NGII) requires to keep the stream open at all -- surfacing it here
+        # is what tells "we never confirmed a live position" (last GGA=never)
+        # apart from "the caster just stopped sending RTCM" (RTCM age above).
+        last_gga_s = getattr(stream_stats, "last_gga_monotonic_s", None)
+        if last_gga_s is not None:
+            detail_parts.append(f"last GGA={max(0.0, now_s - last_gga_s):.2f}s")
+        else:
+            detail_parts.append("last GGA=never")
+        detail_parts.append(f"GGA sent={getattr(stream_stats, 'gga_sent_count', 0)}")
+        caster_host = str(getattr(network_config, "caster_host", "") or "")
+        mountpoint = str(getattr(network_config, "mountpoint", "") or "")
+        if caster_host or mountpoint:
+            detail_parts.append(f"caster={caster_host or '--'}/{mountpoint or '--'}")
         detail_parts.append(
             f"reconnects={health.reconnect_count}"
         )
