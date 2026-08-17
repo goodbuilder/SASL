@@ -234,9 +234,16 @@ def test_rejects_overlay_or_non_native_dimensions() -> None:
 
 
 class _WheelEvent:
-    def __init__(self, position: QtCore.QPoint, delta_y: int) -> None:
+    def __init__(
+        self,
+        position: QtCore.QPoint,
+        delta_y: int,
+        *,
+        modifiers: QtCore.Qt.KeyboardModifiers = QtCore.Qt.ControlModifier,
+    ) -> None:
         self._position = position
         self._delta_y = delta_y
+        self._modifiers = modifiers
         self.accepted = False
 
     def pos(self) -> QtCore.QPoint:
@@ -247,6 +254,14 @@ class _WheelEvent:
 
     def pixelDelta(self) -> QtCore.QPoint:
         return QtCore.QPoint()
+
+    def modifiers(self) -> QtCore.Qt.KeyboardModifiers:
+        # wheelEvent() only zooms on Ctrl+wheel (plain wheel must fall
+        # through to the enclosing QScrollArea); every caller of this fixture
+        # in this file is exercising that zoom path, so Ctrl-held is the
+        # default. A caller can still pass modifiers=QtCore.Qt.NoModifier to
+        # exercise the pass-through path instead.
+        return self._modifiers
 
     def accept(self) -> None:
         self.accepted = True
