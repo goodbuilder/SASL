@@ -1,0 +1,87 @@
+# px4_fmu-v6x_sasl_can_mag Custom Firmware
+
+Tracked firmware artifact:
+
+```text
+apps/Workstation/firmware/px4_fmu-v6x_sasl_can_mag/px4_fmu-v6x_default.px4
+```
+
+Purpose:
+
+- PX4 FMU v6X build that adds a MAVLink-only telemetry path for the two
+  DroneCAN (UAVCAN) RM3100 magnetometers, in parallel to the existing
+  `sensor_mag` -> EKF2 path (which is untouched).
+- New private MAVLink message `SASL_CAN_MAG` (id 180, added to
+  `message_definitions/v1.0/common.xml`) carries `time_usec`, `device_id`,
+  `can_port` (1=CAN1, 2=CAN2, from `getIfaceIndex()`), `node_id`, and
+  `xmag`/`ymag`/`zmag` in Gauss (same sensor-frame vector fed to
+  `PX4Magnetometer::update()`, not rotated).
+- Fed by a new `sasl_can_mag` uORB topic, published from
+  `UavcanMagnetometerBridge::mag_sub_cb`/`mag2_sub_cb`
+  (`src/drivers/uavcan/sensors/mag.cpp`), streamed by a new
+  `MavlinkStreamSaslCanMag` (`src/modules/mavlink/streams/SASL_CAN_MAG.hpp`).
+- No ROS2/DDS/uXRCE-DDS involved in this path -- MAVLink only, per project
+  requirement. (This build otherwise still carries the earlier SASL GPS/MAG
+  uXRCE-DDS export patches from the `px4_fmu-v6x_default` artifact next to
+  this one; that DDS path is unrelated/unused by this telemetry feature.)
+- `CONFIG_MODULES_FW_AUTOTUNE_ATTITUDE_CONTROL` disabled in
+  `boards/px4/fmu-v6x/default.px4board` to free ~10KB of flash headroom --
+  the board was already at ~100% flash before this feature. This vehicle is
+  airframe `4001_quad_x` (pure multirotor); fixed-wing autotune is unused on
+  it. **This board default is shared board-wide, so any future fixed-wing/VTOL
+  build from this source tree needs that option re-enabled first.**
+
+Source build record:
+
+- PX4 git describe: `v1.17.0-alpha1-1214-g7b1e54889d-dirty`
+- Build host tree: `/home/moontaehyung/Capstone/source/PX4-Autopilot`
+- Build timestamp: see `.px4` JSON `build_time` field
+- Files changed from that commit (outer repo):
+  - `src/drivers/uavcan/sensors/mag.cpp`, `mag.hpp`
+  - `msg/SaslCanMag.msg` (new), `msg/CMakeLists.txt`
+  - `src/modules/mavlink/streams/SASL_CAN_MAG.hpp` (new)
+  - `src/modules/mavlink/mavlink_messages.cpp`
+  - `boards/px4/fmu-v6x/default.px4board`
+  - (pre-existing, unrelated: `src/modules/uxrce_dds_client/*` DDS export patches)
+- Files changed in the `mavlink` submodule:
+  - `message_definitions/v1.0/common.xml` (+`SASL_CAN_MAG` message, id 180)
+
+Integrity:
+
+```text
+SHA256 70443e355a0c6d9219883766d9fe7decb38c37d84eb18ba5b91f38bc11cad069  px4_fmu-v6x_default.px4
+```
+
+Flash usage: 1,956,244 / 1,966,080 bytes (99.50%).
+
+QGroundControl upload:
+
+Use QGC's custom firmware file flow and select this `.px4` file. Do not
+choose the automatic PX4 stable firmware install path -- that overwrites
+this custom build with stock PX4 and silently removes both this telemetry
+path and the SASL DDS export patches (this appears to be what happened to
+the vehicle before this investigation: `ver all` on the bench showed plain
+`Release 1.17.0` stable, not this "dirty" custom build).
+
+Workstation-side counterpart:
+
+- `workstation_core/mavlink_dialects/` -- vendored pymavlink dialect
+  (`sasl_can_mag_dialect.py`, generated from the same `common.xml`) so the
+  app can decode `SASL_CAN_MAG`. Registered and applied in
+  `PixhawkMavlinkSubscriber.start()`.
+- `workstation_core/pixhawk_attitude.py` -- `SASL_CAN_MAG` added to
+  `MAVLINK_MESSAGE_IDS`/`MAVLINK_RM3100_STREAM_REQUESTS` (20 Hz). Existing
+  `_can_mag_sensor_state_from_mavlink` parser needed no changes; field names
+  (`xmag`/`ymag`/`zmag`/`can_port`/`device_id`/`node_id`/`time_usec`) already
+  matched.
+
+Not yet verified on real hardware (flash this build first):
+
+- CAN1/CAN2 magnet-proximity isolation (each port's `SASL_CAN_MAG` should
+  move independently)
+- node_id/device_id distinguish the two sensors correctly over the air
+- Independent per-port timestamps hold up under sustained streaming
+- No regression to `sensor_mag`/EKF/`SCALED_IMU*` (code review says untouched,
+  but not flight/bench re-verified after this specific build)
+- PX4 accepts `MAV_CMD_SET_MESSAGE_INTERVAL` for the private message id (180)
+  from Workstation's stream-request path

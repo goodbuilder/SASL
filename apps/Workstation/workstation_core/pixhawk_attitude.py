@@ -299,6 +299,7 @@ MAVLINK_MESSAGE_IDS = {
     "SCALED_IMU2": 116,
     "SCALED_IMU3": 129,
     "DEBUG_VECT": 250,
+    "SASL_CAN_MAG": 180,
 }
 MAVLINK_MAG_STREAMS = (
     ("CAN1", "IMU stream 1", "SCALED_IMU"),
@@ -321,6 +322,7 @@ MAVLINK_RM3100_STREAM_REQUESTS = (
     ("SCALED_IMU2", 20.0),
     ("SCALED_IMU3", 20.0),
     ("DEBUG_VECT", 20.0),
+    ("SASL_CAN_MAG", 20.0),
     ("RAW_IMU", 20.0),
     ("LOCAL_POSITION_NED", 10.0),
     ("GLOBAL_POSITION_INT", 10.0),
@@ -563,6 +565,8 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
             from pymavlink import mavutil
         except Exception as exc:
             raise RuntimeError(f"pymavlink를 사용할 수 없습니다. MAVLink 연결에는 pymavlink 설치가 필요합니다. ({exc})") from exc
+        from Workstation.workstation_core.mavlink_dialects import ensure_registered as _ensure_sasl_dialect
+        sasl_dialect = _ensure_sasl_dialect()
         cameras = (camera,) if camera is not None else tuple(self.urls.keys())
         started_any = False
         for side in cameras:
@@ -580,6 +584,7 @@ class DualPixhawkMavlinkSubscriber(QtCore.QObject):
                     baud=self.baudrates.get(side, 57600),
                     autoreconnect=True,
                     robust_parsing=True,
+                    dialect=sasl_dialect,
                 )
             except Exception as exc:
                 # A multi-side request (``camera=None``) must not fail the sides
