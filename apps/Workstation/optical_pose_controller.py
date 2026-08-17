@@ -10,6 +10,7 @@ profiles retain OpenCV's ``X_right = R_right_from_left X_left + T`` contract.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -176,6 +177,125 @@ def _payload_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+_DRONE_RTK_OBSERVATION_SCHEMA = "optical-pose-drone-rtk-capture-observation-v1"
+
+
+def _gps_state_observation_mapping(value: Any, *, role: str) -> dict[str, Any] | None:
+    """JSON-safe deep snapshot of one live ``GpsPositionState``.
+
+    Returns ``None`` when no live sample exists for this role -- the caller
+    must not fabricate a position.  ``state.raw`` (the live mavlink message
+    object) is deliberately excluded: observation history must never hold a
+    reference back into mutable/live telemetry state, only a plain-value copy
+    taken at this instant.
+    """
+
+    if not isinstance(value, GpsPositionState):
+        return None
+    return {
+        "role": role,
+        "camera": value.camera,
+        "namespace": value.namespace,
+        "topic": value.topic,
+        "latitude_deg": value.latitude_deg,
+        "longitude_deg": value.longitude_deg,
+        "altitude_m": value.altitude_m,
+        "altitude_ellipsoid_m": value.altitude_ellipsoid_m,
+        "fix_type": value.fix_type,
+        "rtk_label": value.rtk_label,
+        "satellites_used": value.satellites_used,
+        "eph_m": value.eph_m,
+        "epv_m": value.epv_m,
+        "timestamp_s": float(value.timestamp_s),
+        "time_source": value.time_source,
+        "px4_timestamp_s": value.px4_timestamp_s,
+        "px4_timestamp_us": value.px4_timestamp_us,
+        "px4_timestamp_sample_us": value.px4_timestamp_sample_us,
+        "gps_utc_us": value.gps_utc_us,
+        "gps_timestamp_time_relative_us": value.gps_timestamp_time_relative_us,
+        "velocity_n_m_s": value.velocity_n_m_s,
+        "velocity_e_m_s": value.velocity_e_m_s,
+        "velocity_d_m_s": value.velocity_d_m_s,
+        "velocity_ned_valid": value.velocity_ned_valid,
+        "hdop": value.hdop,
+        "vdop": value.vdop,
+        "device_id": value.device_id,
+        "has_position": value.has_position,
+    }
+
+
+def _frame_clock_domain_verified(artifact: NativeFrameArtifact) -> bool:
+    """True only when ``artifact.timestamp_s`` is provably host-monotonic.
+
+    ``timestamp_reference`` is set by
+    ``camera_pane.infer_camera_timestamp_reference``
+    (workstation_core/camera_pane.py:13-28) and resolves to "app-receive"
+    only when the frame producer supplied no NTP/source timestamp -- i.e.
+    ``timestamp_s`` was stamped with ``time.monotonic()`` at
+    ``CameraPane._show_frame`` (workstation_core/camera_pane.py:210). Every
+    live ``GpsPositionState.timestamp_s`` in this codebase is stamped with
+    that same ``time.monotonic()`` call, in the same process, at MAVLink
+    message receipt (``PixhawkTelemetrySubscriber._handle_mavlink_message``,
+    workstation_core/pixhawk_attitude.py:861-905). Only when both sides carry
+    that "app-receive" marker are the two timestamps known to share a clock
+    and therefore safe to subtract.
+    """
+
+    return artifact.timestamp_reference == "app-receive"
+
+
+def _drone_rtk_sync_mapping(
+    *,
+    left_artifact: NativeFrameArtifact,
+    right_artifact: NativeFrameArtifact,
+    drone_state: GpsPositionState | None,
+) -> dict[str, Any]:
+    if drone_state is None:
+        return {
+            "state": "SYNC_UNVERIFIED",
+            "left_frame_to_drone_gnss_s": None,
+            "right_frame_to_drone_gnss_s": None,
+            "reason": "no Drone GNSS sample was available at capture",
+        }
+    if _frame_clock_domain_verified(left_artifact) and _frame_clock_domain_verified(right_artifact):
+        return {
+            "state": "SYNC_OK",
+            "left_frame_to_drone_gnss_s": float(drone_state.timestamp_s) - float(left_artifact.timestamp_s),
+            "right_frame_to_drone_gnss_s": float(drone_state.timestamp_s) - float(right_artifact.timestamp_s),
+            "reason": "",
+        }
+    return {
+        "state": "SYNC_UNVERIFIED",
+        "left_frame_to_drone_gnss_s": None,
+        "right_frame_to_drone_gnss_s": None,
+        "reason": (
+            "frame/GNSS clock-domain identity not confirmed "
+            f"(left.timestamp_reference={left_artifact.timestamp_reference!r}, "
+            f"right.timestamp_reference={right_artifact.timestamp_reference!r})"
+        ),
+    }
+
+
+def _drone_rtk_observation_state(
+    *,
+    left_gnss: dict[str, Any] | None,
+    right_gnss: dict[str, Any] | None,
+    drone_gnss: dict[str, Any] | None,
+    sync: Mapping[str, Any],
+) -> str:
+    """Evidence-completeness state -- never a claim about pose accuracy."""
+
+    for row in (left_gnss, right_gnss, drone_gnss):
+        if row is None or not row.get("has_position"):
+            return "INCOMPLETE"
+    all_fixed = all(
+        row.get("rtk_label") == "RTK_FIXED" for row in (left_gnss, right_gnss, drone_gnss)
+    )
+    if all_fixed and sync.get("state") == "SYNC_OK":
+        return "EVIDENCE_READY"
+    return "WARNING"
+
+
 def _load_json_mapping(path_value: object, *, label: str) -> tuple[dict[str, Any], str]:
     source = Path(str(path_value or "")).expanduser().resolve(strict=True)
     if not source.is_file():
@@ -259,6 +379,12 @@ class OpticalPoseController:
         self._auto_suggestions: dict[str, dict[str, Any]] = {}
         self._last_accepted_auto_suggestion: dict[str, Any] | None = None
         self._annotation_review: dict[str, Any] | None = None
+        # Append-only Drone RTK capture-observation evidence: one immutable
+        # entry per live ``capture_workstation_optical_pose_burst`` call,
+        # holding the left/right frame identity plus the Left/Right/Drone
+        # GNSS snapshot available at that instant. A later Capture must never
+        # rewrite or drop an earlier entry.
+        self._drone_rtk_observations: list[dict[str, Any]] = []
         # Operator-tunable Mountain ridge-boundary match margin (fraction of
         # image height); see optical_pose_auto_select.detect_mountain. An
         # in-session control, not a persisted AppSettings field -- it is
@@ -489,6 +615,65 @@ class OpticalPoseController:
         self._append_event("pose_selection_reverted", result)
         return result
 
+    def _capture_drone_rtk_observation(
+        self,
+        *,
+        session_id: str,
+        burst_id: str,
+        frozen: Mapping[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Snapshot Left/Right/Drone GNSS against the just-frozen native burst.
+
+        This is evidence capture only: it never touches candidates, the
+        active selection, or any solver. Missing/degraded GNSS is recorded
+        as such (state INCOMPLETE/WARNING); it never raises, so a live
+        Horizon/Mountain/Target Capture with no GNSS still succeeds.
+        """
+
+        raw_gps = getattr(self.panel, "latest_gps", {})
+        raw_gps = raw_gps if isinstance(raw_gps, Mapping) else {}
+        left_artifact: NativeFrameArtifact = frozen["left"]["artifact"]
+        right_artifact: NativeFrameArtifact = frozen["right"]["artifact"]
+        left_state = raw_gps.get("left")
+        right_state = raw_gps.get("right")
+        drone_state = raw_gps.get("drone")
+        left_gnss = _gps_state_observation_mapping(left_state, role="left")
+        right_gnss = _gps_state_observation_mapping(right_state, role="right")
+        drone_gnss = _gps_state_observation_mapping(drone_state, role="drone")
+        sync = _drone_rtk_sync_mapping(
+            left_artifact=left_artifact,
+            right_artifact=right_artifact,
+            drone_state=drone_state if isinstance(drone_state, GpsPositionState) else None,
+        )
+        state = _drone_rtk_observation_state(
+            left_gnss=left_gnss,
+            right_gnss=right_gnss,
+            drone_gnss=drone_gnss,
+            sync=sync,
+        )
+        observation = {
+            "schema": _DRONE_RTK_OBSERVATION_SCHEMA,
+            "observation_id": f"drone-rtk-obs-{uuid.uuid4().hex}",
+            "sequence": len(self._drone_rtk_observations),
+            "session_id": session_id,
+            "burst_id": burst_id,
+            "frames": {
+                "left": left_artifact.to_mapping(),
+                "right": right_artifact.to_mapping(),
+            },
+            "gnss": {
+                "left": left_gnss,
+                "right": right_gnss,
+                "drone": drone_gnss,
+            },
+            "synchronization": sync,
+            "state": state,
+            "created_utc_ns": time.time_ns(),
+        }
+        self._drone_rtk_observations.append(observation)
+        self._append_event("optical_pose_drone_rtk_observation_captured", observation)
+        return observation
+
     def capture_workstation_optical_pose_burst(
         self,
         payload: Mapping[str, Any] | None = None,
@@ -580,6 +765,11 @@ class OpticalPoseController:
             "coordinate_contract": "native decoded pixels; u right, v down; no resize/overlay",
         }
         self._append_event("optical_pose_burst_captured", event_payload)
+        # Horizon/Mountain/Target Capture is shared evidence acquisition; GNSS
+        # availability must never gate it. This only records whatever
+        # Left/Right/Drone GNSS happens to be live right now -- it never
+        # raises on missing/degraded GNSS.
+        self._capture_drone_rtk_observation(session_id=session_id, burst_id=burst_id, frozen=frozen)
         return self.workstation_optical_pose_snapshot()
 
     def capture_workstation_optical_pose_burst_wiris_ftp(
@@ -2904,6 +3094,13 @@ class OpticalPoseController:
             "annotation_review": (
                 None if self._annotation_review is None else dict(self._annotation_review)
             ),
+            # Append-only Drone RTK capture-observation evidence (deep-copied
+            # so a caller mutating the returned list/dicts cannot corrupt the
+            # stored history). Solve/apply/candidate state above is entirely
+            # unaffected by this key.
+            "drone_rtk_capture_observations": [
+                copy.deepcopy(observation) for observation in self._drone_rtk_observations
+            ],
         }
 
     @staticmethod

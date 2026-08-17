@@ -10,7 +10,7 @@ from Workstation.optical_pose_controller import OpticalPoseController
 from Workstation.recording_controller import RecordingController
 from Workstation.workstation_core.recording_session import save_session_files
 
-from test_optical_pose_controller_integration import _panel
+from test_optical_pose_controller_integration import _gps_state, _panel
 
 
 def test_auto_suggestion_and_annotation_review_are_durable_audit_data(
@@ -119,3 +119,51 @@ def test_optical_pose_session_projection_excludes_qimages_and_is_published(
     static_path = output_dir / "persisted-session_session_static.json"
     saved = json.loads(static_path.read_text(encoding="utf-8"))
     assert saved["metadata"]["optical_pose"] == projection
+
+
+def test_drone_rtk_observation_history_is_durable_across_session_persistence(
+    tmp_path: Path,
+) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.0),
+        "drone": _gps_state("drone", timestamp_s=100.0, latitude_deg=1.0, longitude_deg=2.0, altitude_m=3.0),
+    }
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=200.0),
+        "right": _gps_state("right", timestamp_s=200.0),
+        "drone": _gps_state("drone", timestamp_s=200.0, latitude_deg=9.0, longitude_deg=8.0, altitude_m=7.0),
+    }
+    controller.capture_workstation_optical_pose_burst({})
+
+    owner = SimpleNamespace(workstation_optical_pose_snapshot=controller.workstation_optical_pose_snapshot)
+    projection = RecordingController(owner)._recording_optical_pose_session_data()
+    observations = projection["snapshot"]["drone_rtk_capture_observations"]
+    assert len(observations) == 2
+    assert observations[0]["gnss"]["drone"]["latitude_deg"] == 1.0
+    assert observations[1]["gnss"]["drone"]["latitude_deg"] == 9.0
+    assert observations[0]["observation_id"] != observations[1]["observation_id"]
+
+    output_dir = tmp_path / "sessions" / "drone-rtk-session"
+    save_session_files(
+        output_dir,
+        metadata={"session_id": "drone-rtk-session", "optical_pose": projection},
+        pair_rows=[],
+        camera_rows={"left": [], "right": []},
+        px4_rows={"left": [], "right": []},
+        gnss_base_rows=[],
+    )
+    static_path = output_dir / "drone-rtk-session_session_static.json"
+    saved = json.loads(static_path.read_text(encoding="utf-8"))
+    saved_observations = saved["metadata"]["optical_pose"]["snapshot"]["drone_rtk_capture_observations"]
+    assert len(saved_observations) == 2
+    assert saved_observations[0]["gnss"]["drone"]["latitude_deg"] == 1.0
+    assert saved_observations[1]["gnss"]["drone"]["latitude_deg"] == 9.0
+    assert saved_observations[0]["frames"]["left"]["frame_id"]
+    assert saved_observations[0]["synchronization"]["state"] in {"SYNC_OK", "SYNC_UNVERIFIED"}
+    # No QImage or other raw Python object leaked into the JSON projection.
+    assert "image" not in json.dumps(saved_observations)

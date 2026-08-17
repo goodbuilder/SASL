@@ -40,12 +40,12 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     app = _app()
     pane = OpticalPosePane()
 
-    pane.manual_mode_buttons["ridge"].click()
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("ridge"))
     assert pane.annotation_mode_combo.currentData() == "ridge"
     assert pane.dof_checkboxes["yaw"].isEnabled()
     assert pane.dof_payload()["yaw"] is True
 
-    pane.manual_mode_buttons["horizon"].click()
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("horizon"))
     assert pane.annotation_mode_combo.currentData() == "horizon"
     assert not pane.dof_checkboxes["yaw"].isEnabled()
     assert pane.dof_payload()["yaw"] is False
@@ -56,9 +56,12 @@ def test_horizon_disables_yaw_and_manual_mountain_restores_it() -> None:
     assert pane.capture_frozen_burst_button.text() == "Capture"
     assert pane.annotation_clear_button.text() == "Clear"
     assert pane.import_frozen_burst_button.text() == "Import"
-    assert "Roll/Pitch" in pane.manual_mode_buttons["horizon"].toolTip()
-    assert "at least four paired points" in pane.manual_mode_buttons["ridge"].toolTip()
-    assert "single-target" in pane.manual_mode_buttons["target"].toolTip()
+    assert "Roll/Pitch" in pane.annotation_mode_combo.toolTip()
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("ridge"))
+    assert "at least four paired points" in pane.annotation_mode_combo.toolTip()
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("target"))
+    assert "single-target" in pane.annotation_mode_combo.toolTip()
+    pane.annotation_mode_combo.setCurrentIndex(pane.annotation_mode_combo.findData("horizon"))
     annotation_layout = pane.annotation_clear_button.parentWidget().layout().itemAt(0).layout()
     assert annotation_layout.indexOf(pane.capture_frozen_burst_button) == annotation_layout.indexOf(
         pane.annotation_clear_button
@@ -577,4 +580,146 @@ def test_hr_purpose_event_selection_and_import_emit_typed_owner_payloads(monkeyp
     assert "sha256" not in payload
 
     workspace.deleteLater()
+    app.processEvents()
+
+
+def _drone_rtk_observation(
+    observation_id: str,
+    *,
+    sequence: int,
+    state: str,
+    drone: dict | None,
+    left: dict | None,
+    right: dict | None,
+    sync_left_s: float | None,
+    sync_right_s: float | None,
+    left_frame_timestamp_s: float,
+    right_frame_timestamp_s: float,
+) -> dict:
+    return {
+        "schema": "optical-pose-drone-rtk-capture-observation-v1",
+        "observation_id": observation_id,
+        "sequence": sequence,
+        "session_id": "session-001",
+        "burst_id": f"burst-{sequence:03d}",
+        "state": state,
+        "gnss": {"drone": drone, "left": left, "right": right},
+        "frames": {
+            "left": {
+                "frame_id": f"frame-l-{sequence}",
+                "sha256": "a" * 64,
+                "timestamp_s": left_frame_timestamp_s,
+                "timestamp_reference": "app-receive",
+            },
+            "right": {
+                "frame_id": f"frame-r-{sequence}",
+                "sha256": "b" * 64,
+                "timestamp_s": right_frame_timestamp_s,
+                "timestamp_reference": "app-receive",
+            },
+        },
+        "synchronization": {
+            "state": "SYNC_OK" if sync_left_s is not None else "SYNC_UNVERIFIED",
+            "left_frame_to_drone_gnss_s": sync_left_s,
+            "right_frame_to_drone_gnss_s": sync_right_s,
+            "reason": "" if sync_left_s is not None else "no Drone GNSS sample was available at capture",
+        },
+        "created_utc_ns": 0,
+    }
+
+
+def _drone_rtk_gnss_row(*, role: str, latitude_deg: float, longitude_deg: float) -> dict:
+    return {
+        "role": role,
+        "latitude_deg": latitude_deg,
+        "longitude_deg": longitude_deg,
+        "altitude_m": 100.0,
+        "altitude_ellipsoid_m": 120.0,
+        "fix_type": 6,
+        "rtk_label": "RTK_FIXED",
+        "satellites_used": 22,
+        "eph_m": 0.02,
+        "epv_m": 0.03,
+        "timestamp_s": 100.008,
+        "has_position": True,
+    }
+
+
+def test_drone_rtk_observation_history_and_detail_selection() -> None:
+    app = _app()
+    pane = OpticalPosePane()
+
+    ready = _drone_rtk_observation(
+        "obs-001",
+        sequence=0,
+        state="EVIDENCE_READY",
+        drone=_drone_rtk_gnss_row(role="drone", latitude_deg=37.111111111, longitude_deg=127.111111111),
+        left=_drone_rtk_gnss_row(role="left", latitude_deg=37.222222222, longitude_deg=127.222222222),
+        right=_drone_rtk_gnss_row(role="right", latitude_deg=37.333333333, longitude_deg=127.333333333),
+        sync_left_s=0.008,
+        sync_right_s=0.004,
+        left_frame_timestamp_s=100.0,
+        right_frame_timestamp_s=100.004,
+    )
+    incomplete = _drone_rtk_observation(
+        "obs-002",
+        sequence=1,
+        state="INCOMPLETE",
+        drone=None,
+        left=None,
+        right=None,
+        sync_left_s=None,
+        sync_right_s=None,
+        left_frame_timestamp_s=200.0,
+        right_frame_timestamp_s=200.004,
+    )
+
+    pane.apply_snapshot({"drone_rtk_capture_observations": [ready, incomplete]})
+
+    table = pane.observation_history_table
+    assert table.rowCount() == 2
+    assert table.item(0, 0).text() == "001"
+    assert table.item(0, 1).text() == "EVIDENCE_READY"
+    assert table.item(0, 2).text() == "RTK_FIXED"  # Drone RTK
+    assert table.item(0, 3).text() == "RTK_FIXED"  # P1 RTK
+    assert table.item(0, 4).text() == "RTK_FIXED"  # P2 RTK
+    assert table.item(0, 5).text() == "+8 ms"
+    assert table.item(0, 6).text() == "+4 ms"
+    assert table.item(0, 7).text() == "NOT ANNOTATED"
+    assert table.item(1, 0).text() == "002"
+    assert table.item(1, 1).text() == "INCOMPLETE"
+    assert table.item(1, 2).text() == "NO DATA"
+    assert table.item(1, 5).text() == "--"
+    assert table.item(1, 6).text() == "--"
+
+    # Default selection is the most recent capture (row 1 / obs-002), and the
+    # Current Observation summary always tracks the latest capture too.
+    assert pane.observation_detail_values["observation_id"].value.text() == "obs-002"
+    assert pane.observation_detail_values["drone_latitude"].value.text() == "--"
+    assert pane.current_observation_summary_label.text() == "#002 · INCOMPLETE"
+    assert pane.current_observation_values["drone_rtk"].value.text() == "NO DATA"
+
+    # Selecting row 0 must replace every stale row-1 value, not merge with it.
+    table.selectRow(0)
+    table.setCurrentCell(0, 0)
+    assert pane.observation_detail_values["observation_id"].value.text() == "obs-001"
+    assert pane.observation_detail_values["observation_state"].value.text() == "EVIDENCE_READY"
+    assert pane.observation_detail_values["drone_latitude"].value.text().startswith("37.111111111")
+    assert pane.observation_detail_values["p1_latitude"].value.text().startswith("37.222222222")
+    assert pane.observation_detail_values["p2_latitude"].value.text().startswith("37.333333333")
+    assert pane.observation_detail_values["left_frame_id"].value.text() == "frame-l-0"
+    assert pane.observation_detail_values["sync_state"].value.text() == "SYNC_OK"
+    assert pane.observation_detail_values["sync_delta_left"].value.text() == "+8 ms"
+
+    # Current Observation stays on the latest capture (obs-002) even though
+    # the detail panel below is now inspecting obs-001.
+    assert pane.current_observation_summary_label.text() == "#002 · INCOMPLETE"
+
+    # Re-applying the identical snapshot (a routine poll) must preserve the
+    # operator's row-0 selection instead of resetting it.
+    pane.apply_snapshot({"drone_rtk_capture_observations": [ready, incomplete]})
+    assert pane.observation_detail_values["observation_id"].value.text() == "obs-001"
+    assert pane.observation_detail_values["drone_latitude"].value.text().startswith("37.111111111")
+
+    pane.deleteLater()
     app.processEvents()

@@ -21,6 +21,7 @@ from Workstation.workstation_core.optical_pose import (
     OpticalPoseCandidate,
     PoseDofMask,
 )
+from Workstation.workstation_core.rtk_geometry import GpsPositionState
 from Workstation.workstation_core.terrain import TerrainMetadata
 
 
@@ -48,6 +49,63 @@ class _CameraPane:
                 "stabilization_state": "disabled",
             },
         )
+
+
+class _TimedCameraPane:
+    """Like ``_CameraPane`` but with an explicit per-side frame timestamp.
+
+    Used only by the Drone RTK capture-observation clock-domain tests, which
+    need independent control over each side's ``timestamp_s`` /
+    ``timestamp_reference`` -- something the fixed ``_CameraPane`` above
+    cannot express.
+    """
+
+    def __init__(self, side: str, *, timestamp_s: float, timestamp_reference: str = "app-receive") -> None:
+        self.side = side
+        self._timestamp_s = timestamp_s
+        self._timestamp_reference = timestamp_reference
+
+    def latest_native_measurement_frame(self):
+        return (
+            self._timestamp_s,
+            _image(),
+            {
+                "timestamp_s": self._timestamp_s,
+                "timestamp_reference": self._timestamp_reference,
+                "native_width": 640,
+                "native_height": 480,
+                "overlay_applied": False,
+                "camera_serial": f"SERIAL-{self.side.upper()}",
+                "stabilization_state": "disabled",
+            },
+        )
+
+
+def _gps_state(
+    camera: str,
+    *,
+    timestamp_s: float,
+    latitude_deg: float | None = 37.123456789,
+    longitude_deg: float | None = 127.987654321,
+    altitude_m: float | None = 183.25,
+    altitude_ellipsoid_m: float | None = 205.42,
+    fix_type: int | None = 6,
+    satellites_used: int | None = 24,
+) -> GpsPositionState:
+    return GpsPositionState(
+        camera=camera,
+        namespace=f"{camera}-pixhawk",
+        timestamp_s=timestamp_s,
+        topic="mavlink/GPS_RAW_INT",
+        latitude_deg=latitude_deg,
+        longitude_deg=longitude_deg,
+        altitude_m=altitude_m,
+        altitude_ellipsoid_m=altitude_ellipsoid_m,
+        fix_type=fix_type,
+        satellites_used=satellites_used,
+        eph_m=0.02,
+        epv_m=0.03,
+    )
 
 
 def _intrinsics() -> StereoIntrinsicsResult:
@@ -337,3 +395,194 @@ def test_registration_rejects_candidate_as_its_own_implicit_prior() -> None:
 
     with pytest.raises(RuntimeError, match="explicit prior"):
         controller.register_workstation_optical_pose_candidate(candidate)
+
+
+def test_capture_preserves_exact_drone_rtk_gnss_snapshot(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0, latitude_deg=37.1, longitude_deg=127.1, altitude_m=50.0),
+        "right": _gps_state("right", timestamp_s=100.0, latitude_deg=37.2, longitude_deg=127.2, altitude_m=51.0),
+        "drone": _gps_state(
+            "drone",
+            timestamp_s=100.008,
+            latitude_deg=37.123456789,
+            longitude_deg=127.987654321,
+            altitude_m=183.25,
+            altitude_ellipsoid_m=205.42,
+            fix_type=6,
+            satellites_used=24,
+        ),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    observations = snapshot["drone_rtk_capture_observations"]
+    assert len(observations) == 1
+    drone = observations[0]["gnss"]["drone"]
+    assert drone["latitude_deg"] == 37.123456789
+    assert drone["longitude_deg"] == 127.987654321
+    assert drone["altitude_m"] == 183.25
+    assert drone["altitude_ellipsoid_m"] == 205.42
+    assert drone["fix_type"] == 6
+    assert drone["rtk_label"] == "RTK_FIXED"
+    assert drone["satellites_used"] == 24
+    assert observations[0]["state"] == "EVIDENCE_READY"
+
+
+def test_drone_rtk_observation_history_is_immutable_across_captures(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.0),
+        "drone": _gps_state("drone", timestamp_s=100.0, latitude_deg=10.0, longitude_deg=20.0, altitude_m=30.0),
+    }
+    controller = OpticalPoseController(panel)
+    controller.capture_workstation_optical_pose_burst({})
+
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=200.0),
+        "right": _gps_state("right", timestamp_s=200.0),
+        "drone": _gps_state("drone", timestamp_s=200.0, latitude_deg=99.0, longitude_deg=88.0, altitude_m=77.0),
+    }
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    observations = snapshot["drone_rtk_capture_observations"]
+    assert len(observations) == 2
+    assert observations[0]["sequence"] == 0
+    assert observations[1]["sequence"] == 1
+    assert observations[0]["observation_id"] != observations[1]["observation_id"]
+    assert observations[0]["gnss"]["drone"]["latitude_deg"] == 10.0
+    assert observations[1]["gnss"]["drone"]["latitude_deg"] == 99.0
+
+
+def test_capture_succeeds_and_marks_incomplete_when_drone_gnss_missing(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.0),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    assert snapshot["frozen_frame_artifacts"]["left"]["frame_id"]
+    observation = snapshot["drone_rtk_capture_observations"][0]
+    assert observation["state"] == "INCOMPLETE"
+    assert observation["gnss"]["drone"] is None
+    assert observation["gnss"]["left"] is not None
+
+
+def test_capture_succeeds_without_any_gnss_state_at_all(tmp_path: Path) -> None:
+    """Horizon/Mountain/Target Capture must keep working with no GNSS wiring."""
+
+    panel = _panel(tmp_path)
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    observation = snapshot["drone_rtk_capture_observations"][0]
+    assert observation["state"] == "INCOMPLETE"
+    assert observation["gnss"]["left"] is None
+    assert observation["gnss"]["right"] is None
+    assert observation["gnss"]["drone"] is None
+
+
+def test_capture_reports_rtk_float_without_falsely_showing_fixed(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.0),
+        "drone": _gps_state("drone", timestamp_s=100.0, fix_type=5),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    observation = snapshot["drone_rtk_capture_observations"][0]
+    assert observation["gnss"]["drone"]["fix_type"] == 5
+    assert observation["gnss"]["drone"]["rtk_label"] == "RTK_FLOAT"
+    assert observation["gnss"]["drone"]["rtk_label"] != "RTK_FIXED"
+    assert observation["state"] == "WARNING"
+
+
+def test_drone_rtk_sync_delta_computed_only_for_confirmed_shared_clock(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.left_pane = _TimedCameraPane("left", timestamp_s=100.000, timestamp_reference="app-receive")
+    panel.right_pane = _TimedCameraPane("right", timestamp_s=100.004, timestamp_reference="app-receive")
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.000),
+        "right": _gps_state("right", timestamp_s=100.004),
+        "drone": _gps_state("drone", timestamp_s=100.008),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    sync = snapshot["drone_rtk_capture_observations"][0]["synchronization"]
+    assert sync["state"] == "SYNC_OK"
+    assert sync["left_frame_to_drone_gnss_s"] == pytest.approx(0.008, abs=1e-12)
+    assert sync["right_frame_to_drone_gnss_s"] == pytest.approx(0.004, abs=1e-12)
+
+
+def test_drone_rtk_sync_is_unverified_when_clock_domain_is_not_confirmed(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    # The left frame carries an NTP/source-derived timestamp instead of the
+    # host-monotonic "app-receive" stamp, so it is not provably on the same
+    # clock as the Drone GNSS sample even though the numbers look adjacent.
+    panel.left_pane = _TimedCameraPane("left", timestamp_s=100.000, timestamp_reference="rtcp-ntp")
+    panel.right_pane = _TimedCameraPane("right", timestamp_s=100.004, timestamp_reference="app-receive")
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.000),
+        "right": _gps_state("right", timestamp_s=100.004),
+        "drone": _gps_state("drone", timestamp_s=100.008),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    sync = snapshot["drone_rtk_capture_observations"][0]["synchronization"]
+    assert sync["state"] == "SYNC_UNVERIFIED"
+    assert sync["left_frame_to_drone_gnss_s"] is None
+    assert sync["right_frame_to_drone_gnss_s"] is None
+    assert sync["reason"]
+
+
+def test_import_burst_does_not_attach_current_gnss_as_capture_time_gnss(tmp_path: Path) -> None:
+    left_path = tmp_path / "left.png"
+    right_path = tmp_path / "right.png"
+    _image().save(str(left_path), "PNG")
+    _image().save(str(right_path), "PNG")
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.0),
+        "drone": _gps_state("drone", timestamp_s=100.0, latitude_deg=1.0, longitude_deg=2.0, altitude_m=3.0),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.import_workstation_optical_pose_burst(
+        {"sources": {"left": {"path": str(left_path)}, "right": {"path": str(right_path)}}}
+    )
+
+    assert snapshot["frozen_frame_artifacts"]["left"]["frame_id"]
+    assert snapshot["drone_rtk_capture_observations"] == []
+
+
+def test_drone_rtk_observation_capture_has_no_solver_side_effects(tmp_path: Path) -> None:
+    panel = _panel(tmp_path)
+    panel.latest_gps = {
+        "left": _gps_state("left", timestamp_s=100.0),
+        "right": _gps_state("right", timestamp_s=100.0),
+        "drone": _gps_state("drone", timestamp_s=100.0),
+    }
+    controller = OpticalPoseController(panel)
+
+    snapshot = controller.capture_workstation_optical_pose_burst({})
+
+    assert snapshot["drone_rtk_capture_observations"][0]["state"] == "EVIDENCE_READY"
+    assert snapshot["candidates"] == []
+    assert snapshot["active_profile_id"] == ""
+    assert snapshot["active_candidate_id"] == ""
+    assert controller._active_poses is None
+    assert controller._active_selection is None

@@ -99,6 +99,26 @@ left/right frozen pair from disk. The WIRIS alternatives are labeled `Capture (W
 and `Capture (WIRIS FTP OZ)`. The LRF status card is part of the R,t methods scroll content,
 so it scrolls with the workflow instead of staying pinned below it.
 
+Every live `Capture` in `Alignment > R,t methods` also records a `Drone RTK Capture
+Observations` entry: the frozen left/right native frame identity plus whatever Left (P1),
+Right (P2), and Drone GNSS is available from `panel.latest_gps` at that instant, saved as one
+immutable, append-only observation. Missing or degraded GNSS never blocks the frame Capture
+itself -- Horizon, Mountain, and Target annotation all keep working with no GNSS at all; the
+observation is simply recorded as `INCOMPLETE` or `WARNING` evidence rather than raising an
+error. This state describes the completeness/quality of the captured *evidence*, not the
+accuracy of any later pose solve.
+
+Frame and GNSS timestamps are each preserved from their own original source and are never
+averaged or discarded. A `Left/Right frame -> Drone GNSS` delta is only computed when the
+frame's `timestamp_reference` is confirmed `"app-receive"` (the same `time.monotonic()` host
+clock every live GNSS sample also uses) -- otherwise the pair is `SYNC_UNVERIFIED` and no
+delta number is fabricated. `Import`, `Capture (WIRIS FTP)`, and `Capture (WIRIS FTP OZ)` do
+not create a Drone RTK observation: the current live GNSS at import/download time is not the
+GNSS at the time that image was actually taken, so attaching it would be a false
+correspondence. Binding an annotated target pixel `(u, v)` to a specific past observation, and
+feeding this evidence automatically into `Refine Drone RTK Multi-view R,t`, are both later
+work; today the observation detail panel shows `Target: NOT ANNOTATED` for every entry.
+
 The Alignment `Pose workflow` separates the Drone path into two reviewed stages. `Initialize from
 Telemetry` uses fresh P1/P2/Drone GNSS to establish the local world-NED camera centers and uses
 fresh left/right Pixhawk R/P/Y when available; it creates a candidate and never auto-applies it.
