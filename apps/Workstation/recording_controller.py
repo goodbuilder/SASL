@@ -660,9 +660,18 @@ class RecordingController:
             raise ValueError(f"HR capture purpose must be one of: {allowed}") from exc
 
     def _prepare_camera_evidence_session(self, capture_channel: str) -> None:
-        """Prepare a session without pretending that distance recording started."""
+        """Prepare a session without pretending that distance recording started.
 
-        if not self.panel.recording_session_id or self.panel._session_save_finalized:
+        Deliberately does NOT open a fresh session just because the current
+        one already finalized (measurement stopped/saved) -- a photo taken
+        right after stopping (a "post" bookend shot) still belongs with that
+        measurement. The only thing that opens a genuinely new session is the
+        next ``_start_session_recording`` call with no pending prepared
+        session (see its ``_pnp_session_prepared`` check); that's the one
+        user action that unambiguously means "this is a new measurement."
+        """
+
+        if not self.panel.recording_session_id:
             self.panel.recording_session_id = session_id_now()
             self.panel.pnp_photo_capture_records = []
             self.panel.oz_photo_capture_records = []

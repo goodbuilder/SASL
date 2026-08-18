@@ -128,6 +128,48 @@ def test_completed_capture_records_signed_right_minus_left_request_delta(
     _assert_record_hash(row)
 
 
+def test_post_measurement_photo_reuses_the_just_finalized_session(tmp_path: Path) -> None:
+    """A "post" bookend photo taken right after stopping recording must join
+    the session that was just saved, not open a fresh one.
+
+    Only the next explicit measurement start (``_pnp_session_prepared`` still
+    False when it runs) is a "new session" boundary -- see
+    ``_prepare_camera_evidence_session``'s docstring.
+    """
+
+    panel = _panel(tmp_path, session_id="will-be-replaced")
+    panel.recording_session_id = None
+    controller = RecordingController(panel)
+
+    controller._prepare_camera_evidence_session("hr")
+    first_session_id = panel.recording_session_id
+    assert first_session_id
+    assert panel._pnp_session_prepared is True
+
+    # Measurement "starts": consumes the prepared session, same as
+    # _start_session_recording's `if not self.panel._pnp_session_prepared`
+    # branch would (that method needs more panel surface than this test
+    # wires up, so drive its two relevant side effects directly).
+    panel._pnp_session_prepared = False
+
+    # Measurement "stops and saves".
+    panel._session_save_finalized = True
+    panel.pnp_photo_capture_records.append({"purpose": "pre"})
+
+    # A "post" bookend photo, taken after the save finished.
+    controller._prepare_camera_evidence_session("hr")
+
+    assert panel.recording_session_id == first_session_id
+    assert panel._session_save_finalized is True, "must not pretend a new save is pending"
+    assert panel.pnp_photo_capture_records == [{"purpose": "pre"}], (
+        "must not wipe records from the measurement that was just saved"
+    )
+    # Not consumed by a real measurement start yet, so it stays False -- the
+    # next _start_session_recording call will see this and correctly mint a
+    # brand new session instead of resuming this already-finalized one.
+    assert panel._pnp_session_prepared is False
+
+
 def test_import_hr_pair_retains_exact_session_owned_bytes_and_evidence(
     tmp_path: Path,
 ) -> None:
