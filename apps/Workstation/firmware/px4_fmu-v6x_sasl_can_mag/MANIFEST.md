@@ -46,6 +46,33 @@ Source build record:
 - Files changed in the `mavlink` submodule:
   - `message_definitions/v1.0/common.xml` (+`SASL_CAN_MAG` message, id 180)
 
+Source diff (patches):
+
+Until now this diff existed only as uncommitted working-tree state in the
+build host tree above -- unrecoverable if that checkout is lost. It is now
+also captured as patches under `../patches/`:
+
+- `px4-v1.17-sasl-can-mag-core.patch` -- the driver/msg/mavlink-stream diff
+  (`mag.cpp`, `mag.hpp`, `SaslCanMag.msg`, `msg/CMakeLists.txt`,
+  `SASL_CAN_MAG.hpp`, `mavlink_messages.cpp`). Applies to both v6x and v6c.
+- `px4-v1.17-sasl-can-mag-mavlink-dialect.patch` -- the `common.xml` addition.
+  Apply inside the `mavlink` submodule (`src/modules/mavlink/mavlink`), not
+  the outer PX4-Autopilot tree.
+- `px4-v1.17-sasl-can-mag-v6x-flash-fit.patch` -- the
+  `CONFIG_MODULES_FW_AUTOTUNE_ATTITUDE_CONTROL` removal from
+  `boards/px4/fmu-v6x/default.px4board`. **v6x only** -- see v6c's MANIFEST,
+  its board default did not need this.
+
+Apply from a PX4-Autopilot `v1.17.0-alpha1-1214-g7b1e54889d` checkout:
+
+```sh
+cd /path/to/PX4-Autopilot
+git apply /path/to/SASL-20270724/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-core.patch
+git apply /path/to/SASL-20270724/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-v6x-flash-fit.patch
+(cd src/modules/mavlink/mavlink && git apply /path/to/SASL-20270724/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch)
+make px4_fmu-v6x_default
+```
+
 Integrity:
 
 ```text

@@ -1,0 +1,237 @@
+diff --git a/msg/CMakeLists.txt b/msg/CMakeLists.txt
+index 06feb9a335..ffcc243868 100644
+--- a/msg/CMakeLists.txt
++++ b/msg/CMakeLists.txt
+@@ -192,6 +192,7 @@ set(msg_files
+ 	Rpm.msg
+ 	RtlStatus.msg
+ 	RtlTimeEstimate.msg
++	SaslCanMag.msg
+ 	SatelliteInfo.msg
+ 	SensorAccel.msg
+ 	SensorAccelFifo.msg
+diff --git a/msg/SaslCanMag.msg b/msg/SaslCanMag.msg
+new file mode 100644
+index 0000000000..4d1a20f8ec
+--- /dev/null
++++ b/msg/SaslCanMag.msg
+@@ -0,0 +1,19 @@
++# SASL telemetry-only message: per-CAN-port DroneCAN (UAVCAN) magnetometer
++# reading, published in parallel to (never instead of) sensor_mag. This topic
++# feeds only the SASL_CAN_MAG MAVLink stream; it is not consumed by EKF2.
++#
++# xmag/ymag/zmag are the exact same raw sensor-frame vector handed to
++# PX4Magnetometer::update() by the UAVCAN mag driver (ROTATION_NONE is used
++# for CAN magnetometers there) -- Gauss, not rotated into FRD/NED/board frame.
++
++uint64 timestamp          # time since system start (microseconds), publish time
++uint64 timestamp_sample   # time the CAN frame was received (microseconds)
++
++uint32 device_id          # PX4 device id of the magnetometer driver instance
++
++uint8 can_port             # physical CAN bus the sample arrived on: 1 = CAN1, 2 = CAN2
++uint8 node_id               # DroneCAN node ID of the magnetometer
++
++float32 xmag               # magnetic field X, sensor frame, Gauss
++float32 ymag               # magnetic field Y, sensor frame, Gauss
++float32 zmag               # magnetic field Z, sensor frame, Gauss
+diff --git a/src/drivers/uavcan/sensors/mag.cpp b/src/drivers/uavcan/sensors/mag.cpp
+index 36fa8ec415..6e8e0b7d16 100644
+--- a/src/drivers/uavcan/sensors/mag.cpp
++++ b/src/drivers/uavcan/sensors/mag.cpp
+@@ -52,6 +52,27 @@ UavcanMagnetometerBridge::UavcanMagnetometerBridge(uavcan::INode &node, NodeInfo
+ 	set_device_type(DRV_MAG_DEVTYPE_UAVCAN);
+ }
+ 
++void UavcanMagnetometerBridge::publish_sasl_can_mag(uint8_t iface_index, uint8_t node_id, uint32_t device_id,
++		hrt_abstime timestamp_sample, float xmag, float ymag, float zmag)
++{
++	struct sasl_can_mag_s sample {};
++	sample.timestamp_sample = timestamp_sample;
++	sample.device_id = device_id;
++	sample.can_port = (iface_index == 0) ? 1 : 2; // iface 0 = CAN1, iface 1 = CAN2
++	sample.node_id = node_id;
++	sample.xmag = xmag;
++	sample.ymag = ymag;
++	sample.zmag = zmag;
++	sample.timestamp = hrt_absolute_time();
++
++	if (_sasl_can_mag_pub == nullptr) {
++		_sasl_can_mag_pub = orb_advertise(ORB_ID(sasl_can_mag), &sample);
++
++	} else {
++		orb_publish(ORB_ID(sasl_can_mag), _sasl_can_mag_pub, &sample);
++	}
++}
++
+ int UavcanMagnetometerBridge::init()
+ {
+ 	int res = _sub_mag.start(MagCbBinder(this, &UavcanMagnetometerBridge::mag_sub_cb));
+@@ -98,7 +119,10 @@ void UavcanMagnetometerBridge::mag_sub_cb(const
+ 	const float y = msg.magnetic_field_ga[1];
+ 	const float z = msg.magnetic_field_ga[2];
+ 
+-	mag->update(hrt_absolute_time(), x, y, z);
++	const hrt_abstime timestamp_sample = hrt_absolute_time();
++	mag->update(timestamp_sample, x, y, z);
++	publish_sasl_can_mag(msg.getIfaceIndex(), msg.getSrcNodeID().get(), mag->get_device_id(),
++			      timestamp_sample, x, y, z);
+ }
+ 
+ void
+@@ -130,7 +154,10 @@ UavcanMagnetometerBridge::mag2_sub_cb(const
+ 	const float y = msg.magnetic_field_ga[1];
+ 	const float z = msg.magnetic_field_ga[2];
+ 
+-	mag->update(hrt_absolute_time(), x, y, z);
++	const hrt_abstime timestamp_sample = hrt_absolute_time();
++	mag->update(timestamp_sample, x, y, z);
++	publish_sasl_can_mag(msg.getIfaceIndex(), msg.getSrcNodeID().get(), mag->get_device_id(),
++			      timestamp_sample, x, y, z);
+ }
+ 
+ int UavcanMagnetometerBridge::init_driver(uavcan_bridge::Channel *channel)
+diff --git a/src/drivers/uavcan/sensors/mag.hpp b/src/drivers/uavcan/sensors/mag.hpp
+index 14253dc161..2bf4e827ac 100644
+--- a/src/drivers/uavcan/sensors/mag.hpp
++++ b/src/drivers/uavcan/sensors/mag.hpp
+@@ -42,6 +42,9 @@
+ #include <uavcan/equipment/ahrs/MagneticFieldStrength.hpp>
+ #include <uavcan/equipment/ahrs/MagneticFieldStrength2.hpp>
+ 
++#include <drivers/drv_hrt.h>
++#include <uORB/topics/sasl_can_mag.h>
++
+ class UavcanMagnetometerBridge : public UavcanSensorBridgeBase
+ {
+ public:
+@@ -60,6 +63,15 @@ private:
+ 	void mag_sub_cb(const uavcan::ReceivedDataStructure<uavcan::equipment::ahrs::MagneticFieldStrength> &msg);
+ 	void mag2_sub_cb(const uavcan::ReceivedDataStructure<uavcan::equipment::ahrs::MagneticFieldStrength2> &msg);
+ 
++	// SASL telemetry-only path: publishes sasl_can_mag (-> SASL_CAN_MAG MAVLink
++	// stream) in parallel to the existing sensor_mag/EKF path above. Does not
++	// touch mag->update(); iface_index 0/1 maps to physical CAN1/CAN2 (see
++	// sensor_bridge.hpp make_uavcan_device_id doc comment).
++	void publish_sasl_can_mag(uint8_t iface_index, uint8_t node_id, uint32_t device_id,
++				   hrt_abstime timestamp_sample, float xmag, float ymag, float zmag);
++
++	orb_advert_t _sasl_can_mag_pub{nullptr};
++
+ 	typedef uavcan::MethodBinder < UavcanMagnetometerBridge *,
+ 		void (UavcanMagnetometerBridge::*)
+ 		(const uavcan::ReceivedDataStructure<uavcan::equipment::ahrs::MagneticFieldStrength> &) >
+diff --git a/src/modules/mavlink/mavlink_messages.cpp b/src/modules/mavlink/mavlink_messages.cpp
+index e05cfa99c5..d4a98b4c04 100644
+--- a/src/modules/mavlink/mavlink_messages.cpp
++++ b/src/modules/mavlink/mavlink_messages.cpp
+@@ -146,6 +146,7 @@
+ # include "streams/DEBUG.hpp"
+ # include "streams/DEBUG_FLOAT_ARRAY.hpp"
+ # include "streams/DEBUG_VECT.hpp"
++# include "streams/SASL_CAN_MAG.hpp"
+ # include "streams/GIMBAL_DEVICE_ATTITUDE_STATUS.hpp"
+ # include "streams/GIMBAL_DEVICE_SET_ATTITUDE.hpp"
+ # include "streams/GIMBAL_MANAGER_INFORMATION.hpp"
+@@ -401,6 +402,9 @@ static const StreamListItem streams_list[] = {
+ #if defined(DEBUG_VECT_HPP)
+ 	create_stream_list_item<MavlinkStreamDebugVect>(),
+ #endif // DEBUG_VECT_HPP
++#if defined(SASL_CAN_MAG_HPP)
++	create_stream_list_item<MavlinkStreamSaslCanMag>(),
++#endif // SASL_CAN_MAG_HPP
+ #if defined(DEBUG_FLOAT_ARRAY_HPP)
+ 	create_stream_list_item<MavlinkStreamDebugFloatArray>(),
+ #endif // DEBUG_FLOAT_ARRAY_HPP
+diff --git a/src/modules/mavlink/streams/SASL_CAN_MAG.hpp b/src/modules/mavlink/streams/SASL_CAN_MAG.hpp
+new file mode 100644
+index 0000000000..a8f070b9c4
+--- /dev/null
++++ b/src/modules/mavlink/streams/SASL_CAN_MAG.hpp
+@@ -0,0 +1,86 @@
++/****************************************************************************
++ *
++ *   Copyright (c) 2026 PX4 Development Team. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ *
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in
++ *    the documentation and/or other materials provided with the
++ *    distribution.
++ * 3. Neither the name PX4 nor the names of its contributors may be
++ *    used to endorse or promote products derived from this software
++ *    without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
++ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
++ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
++ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
++ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
++ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
++ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
++ * POSSIBILITY OF SUCH DAMAGE.
++ *
++ ****************************************************************************/
++
++// SASL private MAVLink stream: forwards the sasl_can_mag uORB topic (per-CAN-port
++// DroneCAN magnetometer telemetry) unchanged; does not touch sensor_mag/EKF.
++
++#ifndef SASL_CAN_MAG_HPP
++#define SASL_CAN_MAG_HPP
++
++#include <uORB/topics/sasl_can_mag.h>
++
++class MavlinkStreamSaslCanMag : public MavlinkStream
++{
++public:
++	static MavlinkStream *new_instance(Mavlink *mavlink) { return new MavlinkStreamSaslCanMag(mavlink); }
++
++	static constexpr const char *get_name_static() { return "SASL_CAN_MAG"; }
++	static constexpr uint16_t get_id_static() { return MAVLINK_MSG_ID_SASL_CAN_MAG; }
++
++	const char *get_name() const override { return get_name_static(); }
++	uint16_t get_id() override { return get_id_static(); }
++
++	unsigned get_size() override
++	{
++		return _sasl_can_mag_sub.advertised() ? MAVLINK_MSG_ID_SASL_CAN_MAG_LEN + MAVLINK_NUM_NON_PAYLOAD_BYTES : 0;
++	}
++
++private:
++	explicit MavlinkStreamSaslCanMag(Mavlink *mavlink) : MavlinkStream(mavlink) {}
++
++	uORB::Subscription _sasl_can_mag_sub{ORB_ID(sasl_can_mag)};
++
++	bool send() override
++	{
++		sasl_can_mag_s sample;
++
++		if (_sasl_can_mag_sub.update(&sample)) {
++			mavlink_sasl_can_mag_t msg{};
++			msg.time_usec = sample.timestamp_sample;
++			msg.device_id = sample.device_id;
++			msg.can_port = sample.can_port;
++			msg.node_id = sample.node_id;
++			msg.xmag = sample.xmag;
++			msg.ymag = sample.ymag;
++			msg.zmag = sample.zmag;
++
++			mavlink_msg_sasl_can_mag_send_struct(_mavlink->get_channel(), &msg);
++
++			return true;
++		}
++
++		return false;
++	}
++};
++
++#endif // SASL_CAN_MAG_HPP

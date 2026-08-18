@@ -1,0 +1,20 @@
+diff --git a/message_definitions/v1.0/common.xml b/message_definitions/v1.0/common.xml
+index 4b37e5eb..1d92007d 100644
+--- a/message_definitions/v1.0/common.xml
++++ b/message_definitions/v1.0/common.xml
+@@ -8209,5 +8209,15 @@
+       <field type="int16_t" name="temperature" units="cdegC">Temperature</field>
+       <field type="uint16_t" name="humidity" units="c%">Humidity</field>
+     </message>
++    <message id="180" name="SASL_CAN_MAG">
++      <description>SASL private message: per-CAN-port DroneCAN (UAVCAN) magnetometer reading, telemetry-only path in parallel to sensor_mag/EKF. xmag/ymag/zmag are the same raw sensor-frame vector passed to PX4Magnetometer::update(), in Gauss -- not rotated into any vehicle/NED frame.</description>
++      <field type="uint64_t" name="time_usec" units="us">Timestamp of the CAN sample (time since system boot)</field>
++      <field type="uint32_t" name="device_id">PX4 device id of the magnetometer driver instance</field>
++      <field type="uint8_t" name="can_port">Physical CAN bus the sample arrived on: 1=CAN1, 2=CAN2</field>
++      <field type="uint8_t" name="node_id">DroneCAN node ID of the magnetometer</field>
++      <field type="float" name="xmag" units="Gauss">Magnetic field X, sensor frame</field>
++      <field type="float" name="ymag" units="Gauss">Magnetic field Y, sensor frame</field>
++      <field type="float" name="zmag" units="Gauss">Magnetic field Z, sensor frame</field>
++    </message>
+   </messages>
+ </mavlink>

@@ -26,6 +26,12 @@ Board-specific notes:
 - Confirmed 2 CAN interfaces (`UAVCAN_NUM_IFACES=2` in the build), so the
   `can_port` 1=CAN1/2=CAN2 mapping applies the same as on v6x.
 
+Source diff (patches): same core diff as v6x, see
+`../px4_fmu-v6x_sasl_can_mag/MANIFEST.md` for the full list and apply
+instructions -- `../patches/px4-v1.17-sasl-can-mag-core.patch` and
+`../patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch` apply here
+unchanged; skip `px4-v1.17-sasl-can-mag-v6x-flash-fit.patch`, it is v6x-only.
+
 Source build record:
 
 - PX4 git describe: `v1.17.0-alpha1-1214-g7b1e54889d-dirty` (same commit/tree
