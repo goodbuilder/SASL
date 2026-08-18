@@ -23,6 +23,27 @@ def test_operator_launcher_auto_selects_a_kconfiglib_capable_px4_python() -> Non
     assert "-c 'import kconfiglib'" in source
 
 
+def test_operator_recorder_video_fps_matches_the_overlay_publish_rate() -> None:
+    # operator_recorder writes MP4 frames from detection_image topics, which
+    # publish at overlay_publish_hz -- not at --video-fps's own 20.0 default.
+    # A mismatch there compresses the recorded MP4 into a fraction of the
+    # real session length (cv2.VideoWriter assumes frames arrive at
+    # --video-fps). run_operator_view.sh must pass the actual configured
+    # overlay_publish_hz through so playback speed matches wall-clock time.
+    source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(encoding="utf-8")
+
+    assert (
+        'overlay_publish_hz_value="$(get_launch_arg_value overlay_publish_hz "${launch_args[@]}" || true)"'
+        in source
+    )
+    assert 'recorder_cmd+=(--video-fps "$overlay_publish_hz_value")' in source
+    # Must be wired up after launch_args is fully resolved (defaults merged
+    # in), not the raw launch_input the caller passed.
+    assert source.index('overlay_publish_hz_value="$(get_launch_arg_value') > source.index(
+        'launch_args+=("${launch_input[@]}")'
+    )
+
+
 def test_cleanup_kills_rqt_process_group_even_after_its_wrapper_exits() -> None:
     source = (Path(__file__).resolve().parents[1] / "run_operator_view.sh").read_text(encoding="utf-8")
 

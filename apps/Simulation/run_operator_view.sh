@@ -29,6 +29,15 @@ export GZ_CONFIG_HOME="${GZ_CONFIG_HOME:-/tmp/gz-config}"
 PX4_CONSOLE_LOG="${PX4_CONSOLE_LOG:-/dev/null}"
 PX4_UXRCE_DDS_AGENT="${PX4_UXRCE_DDS_AGENT:-MicroXRCEAgent}"
 PX4_UXRCE_DDS_PORT="${PX4_UXRCE_DDS_PORT:-8888}"
+# Each PX4 instance gets its own MicroXRCEAgent process on its own port.
+# Sharing one agent across all three instances let a newly-connecting
+# instance's burst of ~30 entity-creation requests starve an already-connected
+# instance's ping/heartbeat handling long enough for the agent to consider it
+# unresponsive and disconnect it -- and PX4's own reconnect attempt often
+# never recovers (create entities failed with sentinel id 255), permanently
+# losing that instance's GPS/attitude telemetry for the rest of the run.
+CAM_L_PX4_UXRCE_DDS_PORT="${CAM_L_PX4_UXRCE_DDS_PORT:-8889}"
+CAM_R_PX4_UXRCE_DDS_PORT="${CAM_R_PX4_UXRCE_DDS_PORT:-8890}"
 PX4_UXRCE_DDS_AGENT_LOG="${PX4_UXRCE_DDS_AGENT_LOG:-/dev/null}"
 PX4_UXRCE_DDS_LIBRARY_PATH="${PX4_UXRCE_DDS_LIBRARY_PATH:-}"
 export GZ_SIM_RESOURCE_PATH="$ROOT_DIR/install/stereo_ground_sim/share/stereo_ground_sim/models:${GZ_SIM_RESOURCE_PATH:-}"
@@ -861,10 +870,11 @@ set -u
 
 children=()
 start_uxrce_dds_agent() {
-  local existing_pid agent_binary agent_prefix candidate_library_path agent_library_path agent_pid
-  existing_pid="$(pgrep -f "[M]icroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}([[:space:]]|$)" | head -n 1 || true)"
+  local port="$1"
+  local existing_pid agent_binary agent_prefix candidate_library_path agent_library_path agent_pid agent_log
+  existing_pid="$(pgrep -f "[M]icroXRCEAgent.*udp4.*-p[ =]${port}([[:space:]]|$)" | head -n 1 || true)"
   if [[ -n "$existing_pid" ]]; then
-    printf '%s\n' "Using existing MicroXRCEAgent PID $existing_pid on UDP port $PX4_UXRCE_DDS_PORT."
+    printf '%s\n' "Using existing MicroXRCEAgent PID $existing_pid on UDP port $port."
     return 0
   fi
 
@@ -884,15 +894,17 @@ start_uxrce_dds_agent() {
       agent_library_path="$candidate_library_path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     fi
   fi
-  if [[ "$PX4_UXRCE_DDS_AGENT_LOG" != "/dev/null" ]]; then
-    mkdir -p "$(dirname "$PX4_UXRCE_DDS_AGENT_LOG")"
+  agent_log="$PX4_UXRCE_DDS_AGENT_LOG"
+  if [[ "$agent_log" != "/dev/null" ]]; then
+    agent_log="${agent_log}.port${port}"
+    mkdir -p "$(dirname "$agent_log")"
   fi
   if [[ -n "$agent_library_path" ]]; then
-    setsid env LD_LIBRARY_PATH="$agent_library_path" "$agent_binary" udp4 -p "$PX4_UXRCE_DDS_PORT" \
-      >"$PX4_UXRCE_DDS_AGENT_LOG" 2>&1 &
+    setsid env LD_LIBRARY_PATH="$agent_library_path" "$agent_binary" udp4 -p "$port" \
+      >"$agent_log" 2>&1 &
   else
-    setsid "$agent_binary" udp4 -p "$PX4_UXRCE_DDS_PORT" \
-      >"$PX4_UXRCE_DDS_AGENT_LOG" 2>&1 &
+    setsid "$agent_binary" udp4 -p "$port" \
+      >"$agent_log" 2>&1 &
   fi
   agent_pid="$!"
   children+=("$agent_pid")
@@ -900,10 +912,10 @@ start_uxrce_dds_agent() {
   if ! kill -0 "$agent_pid" >/dev/null 2>&1; then
     printf '%s\n' \
       "error: MicroXRCEAgent exited before PX4 startup." \
-      "Inspect: $PX4_UXRCE_DDS_AGENT_LOG" >&2
+      "Inspect: $agent_log" >&2
     return 2
   fi
-  printf '%s\n' "MicroXRCEAgent started on UDP port $PX4_UXRCE_DDS_PORT."
+  printf '%s\n' "MicroXRCEAgent started on UDP port $port."
 }
 
 terminate_matching() {
@@ -953,9 +965,11 @@ cleanup_previous_run() {
   terminate_matching TERM "run_mission.sh"
   terminate_matching TERM "run_auto.sh"
   terminate_matching TERM "px4_auto_mission.py"
+  terminate_matching TERM "run_px4_waypoint_mission.sh"
+  terminate_matching TERM "px4_waypoint_mission.py"
   terminate_matching TERM "make px4_sitl gz_x500"
   terminate_matching TERM "$PX4_DIR/build/px4_sitl_default/bin/px4"
-  terminate_matching TERM "MicroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}"
+  terminate_matching TERM "MicroXRCEAgent.*udp4.*-p[ =](${PX4_UXRCE_DDS_PORT}|${CAM_L_PX4_UXRCE_DDS_PORT}|${CAM_R_PX4_UXRCE_DDS_PORT})"
 
   sleep 1
 
@@ -979,9 +993,11 @@ cleanup_previous_run() {
   terminate_matching KILL "run_mission.sh"
   terminate_matching KILL "run_auto.sh"
   terminate_matching KILL "px4_auto_mission.py"
+  terminate_matching KILL "run_px4_waypoint_mission.sh"
+  terminate_matching KILL "px4_waypoint_mission.py"
   terminate_matching KILL "make px4_sitl gz_x500"
   terminate_matching KILL "$PX4_DIR/build/px4_sitl_default/bin/px4"
-  terminate_matching KILL "MicroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}"
+  terminate_matching KILL "MicroXRCEAgent.*udp4.*-p[ =](${PX4_UXRCE_DDS_PORT}|${CAM_L_PX4_UXRCE_DDS_PORT}|${CAM_R_PX4_UXRCE_DDS_PORT})"
 
   rm -f /tmp/stereo_ground_drone_attitude_error.sdf /tmp/stereo_distance_node_params.yaml /tmp/detection_overlay_node_params.yaml
 }
@@ -1033,7 +1049,7 @@ cleanup() {
   terminate_matching KILL "ros2 launch stereo_ground_sim stereo_ground_sim.launch.py"
   terminate_matching KILL "stereo_ground_sim.stereo_distance_node"
   terminate_matching KILL "$PX4_DIR/build/px4_sitl_default/bin/px4"
-  terminate_matching KILL "MicroXRCEAgent.*udp4.*-p[ =]${PX4_UXRCE_DDS_PORT}"
+  terminate_matching KILL "MicroXRCEAgent.*udp4.*-p[ =](${PX4_UXRCE_DDS_PORT}|${CAM_L_PX4_UXRCE_DDS_PORT}|${CAM_R_PX4_UXRCE_DDS_PORT})"
   terminate_matching KILL "^gz sim server$"
   terminate_matching KILL "^gz sim gui$"
   terminate_gz_sim_processes KILL
@@ -1287,7 +1303,9 @@ children+=("$ros_launch_pid")
 
 sleep 8
 
-start_uxrce_dds_agent
+start_uxrce_dds_agent "$PX4_UXRCE_DDS_PORT"
+start_uxrce_dds_agent "$CAM_L_PX4_UXRCE_DDS_PORT"
+start_uxrce_dds_agent "$CAM_R_PX4_UXRCE_DDS_PORT"
 
 if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
   mkdir -p "$(dirname "$PX4_CONSOLE_LOG")"
@@ -1305,12 +1323,14 @@ setsid bash -c '
     right_namespace="$9"
     display_value="${10}"
     px4_python="${11}"
-    uxrce_dds_port="${12}"
+    target_uxrce_dds_port="${12}"
     console_log="${13}"
     camera_airframe_src="${14}"
     skip_px4_build="${15}"
     cam_l_sim_gps_used="${16}"
     cam_r_sim_gps_used="${17}"
+    left_uxrce_dds_port="${18}"
+    right_uxrce_dds_port="${19}"
     cd "$px4_dir"
     export DISPLAY="$display_value"
     if [[ -x "$px4_python" ]]; then
@@ -1370,7 +1390,8 @@ setsid bash -c '
       local dds_namespace="$3"
       local label="$4"
       local sys_autostart="$5"
-      local sim_gps_used="${6:-}"
+      local port="$6"
+      local sim_gps_used="${7:-}"
       local instance_log="$console_log"
       if [[ "$console_log" != "/dev/null" ]]; then
         instance_log="${console_log}.${label}"
@@ -1382,7 +1403,7 @@ setsid bash -c '
         export PX4_GZ_NO_FOLLOW=1
         export PX4_SYS_AUTOSTART="$sys_autostart"
         export GZ_IP=127.0.0.1
-        export PX4_UXRCE_DDS_PORT="$uxrce_dds_port"
+        export PX4_UXRCE_DDS_PORT="$port"
         if [[ -n "$dds_namespace" ]]; then
           export PX4_UXRCE_DDS_NS="$dds_namespace"
         else
@@ -1401,9 +1422,9 @@ setsid bash -c '
       pids+=("$!")
     }
 
-    start_px4_instance 0 "$target_model" "" target 4001
-    start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left 4090 "$cam_l_sim_gps_used"
-    start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right 4090 "$cam_r_sim_gps_used"
+    start_px4_instance 0 "$target_model" "" target 4001 "$target_uxrce_dds_port"
+    start_px4_instance "$left_instance" "$left_model" "$left_namespace" camera-left 4090 "$left_uxrce_dds_port" "$cam_l_sim_gps_used"
+    start_px4_instance "$right_instance" "$right_model" "$right_namespace" camera-right 4090 "$right_uxrce_dds_port" "$cam_r_sim_gps_used"
     wait -n "${pids[@]}"
   ' _ \
     "$PX4_DIR" \
@@ -1422,13 +1443,15 @@ setsid bash -c '
     "$ROOT_DIR/stereo_ground_sim/vendor/px4_camera_airframe/4090_camera_px4" \
     "$skip_px4_build" \
     "${CAM_L_SIM_GPS_USED:-10}" \
-    "${CAM_R_SIM_GPS_USED:-10}" &
+    "${CAM_R_SIM_GPS_USED:-10}" \
+    "$CAM_L_PX4_UXRCE_DDS_PORT" \
+    "$CAM_R_PX4_UXRCE_DDS_PORT" &
 px4_supervisor_pid="$!"
 children+=("$px4_supervisor_pid")
 printf '%s\n' \
-  "Target PX4 instance 0: model=$PX4_GZ_MODEL_NAME namespace=/fmu" \
-  "Camera_Left PX4 instance ${CAM_L_PX4_INSTANCE:-1}: model=${CAM_L_PX4_MODEL_NAME:-left_stereo_camera} namespace=/${CAM_L_PX4_DDS_NAMESPACE:-camera_left}/fmu" \
-  "Camera_Right PX4 instance ${CAM_R_PX4_INSTANCE:-2}: model=${CAM_R_PX4_MODEL_NAME:-right_stereo_camera} namespace=/${CAM_R_PX4_DDS_NAMESPACE:-camera_right}/fmu"
+  "Target PX4 instance 0: model=$PX4_GZ_MODEL_NAME namespace=/fmu port=$PX4_UXRCE_DDS_PORT" \
+  "Camera_Left PX4 instance ${CAM_L_PX4_INSTANCE:-1}: model=${CAM_L_PX4_MODEL_NAME:-left_stereo_camera} namespace=/${CAM_L_PX4_DDS_NAMESPACE:-camera_left}/fmu port=$CAM_L_PX4_UXRCE_DDS_PORT" \
+  "Camera_Right PX4 instance ${CAM_R_PX4_INSTANCE:-2}: model=${CAM_R_PX4_MODEL_NAME:-right_stereo_camera} namespace=/${CAM_R_PX4_DDS_NAMESPACE:-camera_right}/fmu port=$CAM_R_PX4_UXRCE_DDS_PORT"
 printf '%s\n' "QGC should connect through PX4 MAVLink UDP 14550; operator MAVLink ATTITUDE uses UDP 14551."
 if [[ "$PX4_CONSOLE_LOG" != "/dev/null" ]]; then
   printf '%s\n' "PX4 console log: $PX4_CONSOLE_LOG"
@@ -1528,6 +1551,19 @@ if [[ -n "$record_mode" ]]; then
   )
   if [[ "$record_wait_for_bbox" == true ]]; then
     recorder_cmd+=(--wait-for-bbox)
+  fi
+  # operator_recorder writes MP4 frames from /left_camera/detection_image and
+  # /right_camera/detection_image, which detection_overlay_node publishes at
+  # overlay_publish_hz -- not at --video-fps's own default (20.0). A mismatch
+  # there makes cv2.VideoWriter encode each real frame as if it arrived
+  # overlay_publish_hz/video_fps times faster than it did, so the MP4 plays
+  # back compressed into a fraction of the real session length. Pass the
+  # actual configured overlay_publish_hz through so playback speed matches
+  # wall-clock time.
+  overlay_publish_hz_value="$(get_launch_arg_value overlay_publish_hz "${launch_args[@]}" || true)"
+  if [[ -n "$overlay_publish_hz_value" ]] \
+    && awk -v value="$overlay_publish_hz_value" 'BEGIN { exit !(value == value && value > 0) }'; then
+    recorder_cmd+=(--video-fps "$overlay_publish_hz_value")
   fi
   setsid "${recorder_cmd[@]}" &
   recording_pid="$!"

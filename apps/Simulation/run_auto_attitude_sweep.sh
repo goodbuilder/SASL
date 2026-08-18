@@ -34,8 +34,11 @@ SIM_EXPLICIT_NAMES=(
   SWEEP_WAIT_S SWEEP_SEED SWEEP_RANDOMIZE SWEEP_SKIP_COLCON_BUILD
   SWEEP_SKIP_PX4_BUILD
   SWEEP_KEEP_GOING SWEEP_FORCE_EXISTING_SIM SWEEP_CAMERA_UPDATE_RATE_HZ
-  SWEEP_YOLO_TARGET_HZ SWEEP_ALTITUDES_M SWEEP_LATERAL_BIASES_M
-  SWEEP_LATERAL_SWEEP_AMPLITUDE_M SWEEP_LATERAL_SWEEP_PERIOD_S
+  SWEEP_YOLO_TARGET_HZ
+  CAM_L_OPTICAL_ROLL_DEG CAM_L_OPTICAL_PITCH_DEG CAM_L_OPTICAL_YAW_DEG
+  CAM_R_OPTICAL_ROLL_DEG CAM_R_OPTICAL_PITCH_DEG CAM_R_OPTICAL_YAW_DEG
+  WAYPOINT_SPEED_MPS WAYPOINT_TIMEOUT_S WAYPOINT_LAND_AFTER WAYPOINT_STOP_AFTER_HOVER
+  DRONE_TARGET_DISTANCE_M DRONE_SPAWN_Y_M DRONE_MOVE_DISTANCE_M AUTO_WAYPOINT_RANGE_STEP_M
 )
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
@@ -44,11 +47,15 @@ load_sim_config_preserving_env "${SIM_EXPLICIT_NAMES[@]}"
 usage() {
   cat <<'USAGE'
 Usage:
-  ./run_auto_attitude_sweep.sh [options] -- [run_auto.sh options]
+  ./run_auto_attitude_sweep.sh [options] -- [run_px4_waypoint_mission.sh options]
 
-Runs the PX4/FOV-guarded Auto mission repeatedly. Each case launches a fresh
-simulation with one right-camera optical RDF attitude perturbation and enables
-the explicit S2 research pair recorder for offline calibration/validation.
+Runs a deterministic, open-loop PX4 waypoint mission repeatedly. Every case
+flies the exact same shared waypoint path (generated once, up front, from the
+baseline camera attitude), so recorded differences are attributable to the
+per-case right-camera optical RDF attitude perturbation alone -- not to a
+different flight path or to FOV-guard velocity gating (this mission runner has
+no bbox/FOV dependency at all). Each case launches a fresh simulation and
+enables the explicit S2 research pair recorder for offline calibration/validation.
 
 Options:
   --axes LIST              Comma-separated axes: roll,pitch,yaw,combined. Default: all.
@@ -56,22 +63,6 @@ Options:
                            yaw simultaneously in one case.
   --values-deg LIST        Comma-separated degrees. Default: -1.0..1.0 in 0.1 steps.
   --repetitions N          Repeat every non-zero attitude case. Default: 1.
-  --altitudes-m LIST       Comma-separated takeoff altitudes (m), cycled by case
-                           index for elevation-angle diversity. Default: 20,30,40.
-                           Skipped for a case whose -- run_auto.sh args already
-                           include --altitude-m.
-  --lateral-biases-m LIST  Comma-separated constant lateral offsets (m), cycled by
-                           case index for off-boresight diversity. Default: -5,0,5.
-                           Skipped for a case whose -- run_auto.sh args already
-                           include --lateral-bias-m.
-  --lateral-sweep-amplitude-m N  Triangle-wave lateral sweep amplitude (m) added on
-                           top of the per-case lateral bias during every case's
-                           approach, so one flight actively samples a range of
-                           off-boresight offsets within the safe-FOV margin
-                           instead of holding one fixed value. Default: 10.
-                           Skipped for a case whose -- run_auto.sh args already
-                           include --lateral-sweep-amplitude-m.
-  --lateral-sweep-period-s N     Sweep period in seconds. Default: 24.
   --output-dir DIR         Evidence directory. Default: apps/Simulation/recordings/auto-attitude-sweep-....
   --px4-dir DIR            PX4 checkout passed to run_operator_view.sh.
   --skip-colcon-build      Reuse the existing ROS install for every case.
@@ -85,12 +76,9 @@ Options:
   --force-existing-sim     Allow cleanup of an existing operator session.
   --help, -h               Show this help.
 
-The non-zero attitude cases are randomized by default. A 0 deg baseline runs
-before each condition and once after the final condition. With the default
-axes/values grid every case also cycles through --altitudes-m and
---lateral-biases-m, so case count grows with axes x values x2 + 1. Use
---quick after `--` only for smoke tests; the sweep preserves the configured
-500 m FOV-safe target distance unless an explicit --target-distance-m follows.
+The non-zero attitude cases are randomized by default. A single 0 deg
+baseline case runs once up front as the reference every condition is
+compared against, so case count is axes x values + 1.
 RViz and rqt_gui stay visible for every case; each case launches its own
 window set, so a long default sweep keeps a display busy throughout.
 
@@ -106,7 +94,7 @@ Coordinate contract:
   Gazebo world: ENU; PX4 flight control: local NED/body FRD;
   recorded public vectors: baseline_center_frd [Forward, Right, Down], metres;
   Gazebo Target GT: offline calibration/validation truth only.
-  case PASS: PX4 readiness and Auto exit successfully, and the S2 recorder
+  case PASS: PX4 readiness and the waypoint mission exit successfully, and the S2 recorder
   produces RUN_FINALIZED_VALID, run_valid=true, and pair_records.csv.
 USAGE
 }
@@ -122,10 +110,6 @@ normalize_bool() {
 
 axes_csv="${SWEEP_AXES:-roll,pitch,yaw,combined}"
 values_csv="${SWEEP_VALUES_DEG:--1.0,-0.9,-0.8,-0.7,-0.6,-0.5,-0.4,-0.3,-0.2,-0.1,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0}"
-altitudes_csv="${SWEEP_ALTITUDES_M:-20,30,40}"
-lateral_biases_csv="${SWEEP_LATERAL_BIASES_M:--5,0,5}"
-lateral_sweep_amplitude_m="${SWEEP_LATERAL_SWEEP_AMPLITUDE_M:-10}"
-lateral_sweep_period_s="${SWEEP_LATERAL_SWEEP_PERIOD_S:-24}"
 repetitions="${SWEEP_REPETITIONS:-1}"
 output_dir="${SWEEP_OUTPUT_DIR:-}"
 px4_dir="${PX4_DIR:-}"
@@ -149,10 +133,6 @@ while (($#)); do
       ;;
     --axes) axes_csv="${2:?missing value for --axes}"; shift 2 ;;
     --values-deg) values_csv="${2:?missing value for --values-deg}"; shift 2 ;;
-    --altitudes-m) altitudes_csv="${2:?missing value for --altitudes-m}"; shift 2 ;;
-    --lateral-biases-m) lateral_biases_csv="${2:?missing value for --lateral-biases-m}"; shift 2 ;;
-    --lateral-sweep-amplitude-m) lateral_sweep_amplitude_m="${2:?missing value for --lateral-sweep-amplitude-m}"; shift 2 ;;
-    --lateral-sweep-period-s) lateral_sweep_period_s="${2:?missing value for --lateral-sweep-period-s}"; shift 2 ;;
     --repetitions) repetitions="${2:?missing value for --repetitions}"; shift 2 ;;
     --output-dir) output_dir="${2:?missing value for --output-dir}"; shift 2 ;;
     --px4-dir) px4_dir="${2:?missing value for --px4-dir}"; shift 2 ;;
@@ -169,34 +149,6 @@ while (($#)); do
     *) printf 'error: unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
 done
-
-# run_mission.sh's generic --quick profile stops at 200 m, which is outside
-# this stereo rig's validated common FOV and can leave the mission waiting for
-# a bbox that cannot reappear. Keep its shorter hover/speed settings, but use
-# the Simulation campaign target unless the caller explicitly supplied one.
-quick_requested=false
-target_distance_requested=false
-altitude_requested=false
-lateral_bias_requested=false
-lateral_sweep_requested=false
-for auto_arg in "${auto_args[@]}"; do
-  [[ "$auto_arg" == "--quick" ]] && quick_requested=true
-  if [[ "$auto_arg" == "--target-distance-m" || "$auto_arg" == --target-distance-m=* ]]; then
-    target_distance_requested=true
-  fi
-  if [[ "$auto_arg" == "--altitude-m" || "$auto_arg" == --altitude-m=* ]]; then
-    altitude_requested=true
-  fi
-  if [[ "$auto_arg" == "--lateral-bias-m" || "$auto_arg" == --lateral-bias-m=* ]]; then
-    lateral_bias_requested=true
-  fi
-  if [[ "$auto_arg" == "--lateral-sweep-amplitude-m" || "$auto_arg" == --lateral-sweep-amplitude-m=* ]]; then
-    lateral_sweep_requested=true
-  fi
-done
-if [[ "$quick_requested" == true && "$target_distance_requested" == false ]]; then
-  auto_args+=(--target-distance-m "${DRONE_TARGET_DISTANCE_M:-500.0}")
-fi
 
 observation_mode="bbox_yolo"
 for auto_arg in "${auto_args[@]}"; do
@@ -254,39 +206,6 @@ for value in "${values[@]}"; do
     exit 2
   fi
 done
-IFS=',' read -r -a altitudes_m <<< "$altitudes_csv"
-if ((${#altitudes_m[@]} == 0)); then
-  printf '%s\n' 'error: --altitudes-m must not be empty' >&2
-  exit 2
-fi
-for altitude_m in "${altitudes_m[@]}"; do
-  altitude_m="${altitude_m//[[:space:]]/}"
-  if ! awk -v value="$altitude_m" 'BEGIN { exit !(value == value && value > 0) }'; then
-    printf 'error: invalid --altitudes-m value: %s\n' "$altitude_m" >&2
-    exit 2
-  fi
-done
-IFS=',' read -r -a lateral_biases_m <<< "$lateral_biases_csv"
-if ((${#lateral_biases_m[@]} == 0)); then
-  printf '%s\n' 'error: --lateral-biases-m must not be empty' >&2
-  exit 2
-fi
-for lateral_bias_m in "${lateral_biases_m[@]}"; do
-  lateral_bias_m="${lateral_bias_m//[[:space:]]/}"
-  if ! awk -v value="$lateral_bias_m" 'BEGIN { exit !(value != "" && value == value && value + 0 == value) }'; then
-    printf 'error: invalid --lateral-biases-m value: %s\n' "$lateral_bias_m" >&2
-    exit 2
-  fi
-done
-if ! awk -v value="$lateral_sweep_amplitude_m" 'BEGIN { exit !(value == value && value >= 0) }'; then
-  printf '%s\n' 'error: --lateral-sweep-amplitude-m must be zero or a positive number' >&2
-  exit 2
-fi
-if ! awk -v value="$lateral_sweep_period_s" 'BEGIN { exit !(value == value && value > 0) }'; then
-  printf '%s\n' 'error: --lateral-sweep-period-s must be a positive number' >&2
-  exit 2
-fi
-
 if [[ -z "$output_dir" ]]; then
   output_dir="$ROOT_DIR/recordings/auto-attitude-sweep-$(date +%Y%m%d_%H%M%S)"
 fi
@@ -310,14 +229,58 @@ else
 fi
 
 if [[ "$force_existing_sim" != true ]]; then
-  existing_session="$(ps -eo args= | search_text -e '(^|/)run_operator_view\.sh([[:space:]]|$)|ros2 launch stereo_ground_sim stereo_ground_sim\.launch.py|px4_auto_mission\.py' || true)"
+  existing_session="$(ps -eo args= | search_text -e '(^|/)run_operator_view\.sh([[:space:]]|$)|ros2 launch stereo_ground_sim stereo_ground_sim\.launch.py|px4_auto_mission\.py|px4_waypoint_mission\.py' || true)"
   if [[ -n "$existing_session" ]]; then
     printf '%s\n' \
-      'error: an operator/PX4/Auto session is already running.' \
+      'error: an operator/PX4/mission session is already running.' \
       'Stop it first, or pass --force-existing-sim if cleaning it is intentional.' >&2
     exit 2
   fi
 fi
+
+# Every case must fly the exact same physical trajectory so that recorded
+# differences are attributable to attitude error alone, not to a different
+# flight path -- so the shared waypoint path is generated once, here, from
+# the *baseline* (unperturbed) camera attitude, and reused by every case.
+# Mirrors run_auto.sh's own generation call (min/max range derived from the
+# target drone's own spawn/approach geometry) so this is byte-identical to
+# what a baseline-only run_auto.sh run would generate today.
+shared_waypoints_dir="$output_dir/shared_waypoints"
+drone_spawn_y_m="${DRONE_SPAWN_Y_M:-2000}"
+drone_move_distance_m="${DRONE_MOVE_DISTANCE_M:-0}"
+shared_waypoint_max_range_m="$(awk -v v="$drone_spawn_y_m" 'BEGIN { printf "%.6f", v }')"
+shared_waypoint_min_range_m="$(awk -v spawn="$drone_spawn_y_m" -v move="$drone_move_distance_m" \
+  'BEGIN { v = spawn - move; if (v < 1.0) v = 1.0; printf "%.6f", v }')"
+shared_waypoint_range_step_m="${AUTO_WAYPOINT_RANGE_STEP_M:-5.0}"
+shared_pixel_margin_px="$(awk -v w="${CAMERA_IMAGE_WIDTH_PX:-1280}" -v r="${AUTO_FOV_MARGIN_RATIO:-0.05}" 'BEGIN { printf "%.6f", w * r }')"
+printf '%s\n' "Generating the shared waypoint path (every ${shared_waypoint_range_step_m} m Front," \
+  "range ${shared_waypoint_min_range_m}-${shared_waypoint_max_range_m} m) from baseline attitude" \
+  "L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
+  "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $shared_waypoints_dir"
+python3 "$ROOT_DIR/scripts/generate_fov_constrained_waypoints.py" \
+  --output-dir "$shared_waypoints_dir" \
+  --seed "${AUTO_WAYPOINT_SEED:-20260729}" \
+  --calibration-count 0 \
+  --validation-count "${AUTO_WAYPOINT_COUNT:-8}" \
+  --min-range-m "$shared_waypoint_min_range_m" \
+  --max-range-m "$shared_waypoint_max_range_m" \
+  --range-step-m "$shared_waypoint_range_step_m" \
+  --camera-baseline-m "${CAMERA_BASELINE_M:-25.0}" \
+  --camera-height-m "${CAMERA_HEIGHT_M:-0.1}" \
+  --px4-origin-world-east-m "${DRONE_SPAWN_X_M:-0.0}" \
+  --px4-origin-world-north-m "${DRONE_SPAWN_Y_M:-0.0}" \
+  --px4-origin-world-up-m "${DRONE_SPAWN_Z_M:-0.0}" \
+  --cam-l-optical-roll-deg "${CAM_L_OPTICAL_ROLL_DEG:-0.0}" \
+  --cam-l-optical-pitch-deg "${CAM_L_OPTICAL_PITCH_DEG:-0.0}" \
+  --cam-l-optical-yaw-deg "${CAM_L_OPTICAL_YAW_DEG:-0.0}" \
+  --cam-r-optical-roll-deg "${CAM_R_OPTICAL_ROLL_DEG:-0.0}" \
+  --cam-r-optical-pitch-deg "${CAM_R_OPTICAL_PITCH_DEG:-0.0}" \
+  --cam-r-optical-yaw-deg "${CAM_R_OPTICAL_YAW_DEG:-0.0}" \
+  --horizontal-fov-rad "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" \
+  --image-width-px "${CAMERA_IMAGE_WIDTH_PX:-1280}" \
+  --image-height-px "${CAMERA_IMAGE_HEIGHT_PX:-720}" \
+  --pixel-margin-px "$shared_pixel_margin_px"
+shared_path_file="$shared_waypoints_dir/validation_mission.csv"
 
 branch="$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || true)"
 commit_sha="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
@@ -344,22 +307,24 @@ printf '%s\n' \
   "truth_source=Gazebo Target GT (offline calibration/validation only)" \
   "camera_update_rate_hz=$camera_update_rate_hz" \
   "yolo_target_hz=$yolo_target_hz" \
+  "shared_waypoint_path=$shared_path_file" \
+  "shared_waypoint_baseline_cam_l_optical_deg=${CAM_L_OPTICAL_ROLL_DEG:-0.0},${CAM_L_OPTICAL_PITCH_DEG:-0.0},${CAM_L_OPTICAL_YAW_DEG:-0.0}" \
+  "shared_waypoint_baseline_cam_r_optical_deg=${CAM_R_OPTICAL_ROLL_DEG:-0.0},${CAM_R_OPTICAL_PITCH_DEG:-0.0},${CAM_R_OPTICAL_YAW_DEG:-0.0}" \
   > "$output_dir/sweep_contract.txt"
 
 write_effective_config() {
   local config_path="$1" case_id="$2" axis="$3" angle="$4" repetition="$5"
-  local roll="$6" pitch="$7" yaw="$8" recording_dir="$9" operator_recording_dir="${10}"
-  local geometry_altitude_m="${11}" geometry_lateral_bias_m="${12}"
-  local geometry_lateral_sweep_amplitude_m="${13}" geometry_lateral_sweep_period_s="${14}"
+  local roll="$6" pitch="$7" yaw="$8"
+  local left_roll="$9" left_pitch="${10}" left_yaw="${11}"
+  local recording_dir="${12}" operator_recording_dir="${13}"
   python3 - "$config_path" "$session_id" "$run_id" "$case_id" "$axis" "$angle" "$repetition" "$observation_mode" \
-    "$roll" "$pitch" "$yaw" "$seed" "$camera_update_rate_hz" "$yolo_target_hz" \
+    "$roll" "$pitch" "$yaw" "$left_roll" "$left_pitch" "$left_yaw" \
+    "$seed" "$camera_update_rate_hz" "$yolo_target_hz" \
     "${CAMERA_BASELINE_M:-25.0}" "${CAMERA_HEIGHT_M:-30.0}" "${CAMERA_HORIZONTAL_FOV_RAD:-0.154997710698}" \
     "${CAMERA_IMAGE_WIDTH_PX:-1280}" "${CAMERA_IMAGE_HEIGHT_PX:-720}" \
     "$SIM_CONFIG" "$REPO_ROOT" "$branch" "$commit_sha" "$git_status" \
     "$git_status_short" "$git_remote_url" \
     "$recording_dir" "$operator_recording_dir" "$auto_args_serialized" \
-    "$geometry_altitude_m" "$geometry_lateral_bias_m" \
-    "$geometry_lateral_sweep_amplitude_m" "$geometry_lateral_sweep_period_s" \
     "${PX4_GZ_MODEL_NAME:-x500_15m}" <<'PY'
 import hashlib
 import json
@@ -368,11 +333,10 @@ import sys
 from pathlib import Path
 
 (path, session_id, run_id, case_id, axis, angle, repetition, observation_mode, roll, pitch, yaw,
+ left_roll, left_pitch, left_yaw,
  seed, camera_hz, yolo_hz, baseline_m, camera_height_m, fov_rad, image_width, image_height,
  sim_config, repo_root, branch, commit_sha, git_status, git_status_short, git_remote_url,
  recording_dir, operator_recording_dir, auto_args_serialized,
- geometry_altitude_m, geometry_lateral_bias_m,
- geometry_lateral_sweep_amplitude_m, geometry_lateral_sweep_period_s,
  px4_gz_model_name) = sys.argv[1:]
 intrinsic_contract = {
     "image_width_px": int(image_width),
@@ -420,27 +384,13 @@ payload = {
         "random_seed": float(seed),
         "application_mode": "right_optical_combined" if axis == "combined" else "right_optical_ofat",
         "observation_mode": observation_mode,
-        "trajectory_id": "px4_auto_takeoff_forward_approach_land",
-        "run_auto_args": [item for item in auto_args_serialized.split("\x1f") if item],
-        "geometry_altitude_m": (
-            float(geometry_altitude_m) if geometry_altitude_m != "" else None
-        ),
-        "geometry_lateral_bias_m": (
-            float(geometry_lateral_bias_m) if geometry_lateral_bias_m != "" else None
-        ),
-        "geometry_lateral_sweep_amplitude_m": (
-            float(geometry_lateral_sweep_amplitude_m)
-            if geometry_lateral_sweep_amplitude_m != "" else None
-        ),
-        "geometry_lateral_sweep_period_s": (
-            float(geometry_lateral_sweep_period_s)
-            if geometry_lateral_sweep_amplitude_m != "" else None
-        ),
+        "trajectory_id": "px4_waypoint_mission_shared_baseline_path",
+        "mission_runner_args": [item for item in auto_args_serialized.split("\x1f") if item],
     },
     "attitude_injection": {
         "target": "right_camera_optical",
         "frame": "camera_optical_rdf",
-        "left_applied_deg": {"roll": 0.0, "pitch": 0.0, "yaw": 0.0},
+        "left_applied_deg": {"roll": float(left_roll), "pitch": float(left_pitch), "yaw": float(left_yaw)},
         "right_applied_deg": {"roll": float(roll), "pitch": float(pitch), "yaw": float(yaw)},
         "composition": "R_Down(yaw) @ R_Right(pitch) @ R_Forward(roll)",
         "euler_order": "roll_pitch_yaw",
@@ -558,7 +508,7 @@ wait_for_px4() {
   local check_log="$1"
   while ((SECONDS < deadline)); do
     kill -0 "$operator_pid" >/dev/null 2>&1 || return 1
-    if SIM_CONFIG="$SIM_CONFIG" "$ROOT_DIR/run_auto.sh" --check-connection >> "$check_log" 2>&1; then
+    if SIM_CONFIG="$SIM_CONFIG" "$ROOT_DIR/run_px4_waypoint_mission.sh" --check-connection >> "$check_log" 2>&1; then
       return 0
     fi
     sleep 2
@@ -566,10 +516,42 @@ wait_for_px4() {
   return 1
 }
 
-format_value() {
-  local value="$1"
-  value="${value//+/p}"; value="${value//-/m}"; value="${value//./p}"
-  printf '%s' "$value"
+# Case directories are named after the actual absolute camera attitude they
+# fly with (not the axis+delta abstraction), so a directory listing is
+# self-describing without cross-referencing the sweep's baseline config.
+# "_" is the only structural separator, which leaves "-" and "." free to
+# appear literally inside a value (e.g. "y-0.2") without becoming ambiguous
+# with a delimiter or being misread as a CLI flag.
+format_deg() {
+  awk -v v="$1" 'BEGIN { printf "%g", v }'
+}
+
+attitude_token() {
+  local prefix="$1" roll="$2" pitch="$3" yaw="$4"
+  printf '%sr%sp%sy%s' "$prefix" "$(format_deg "$roll")" "$(format_deg "$pitch")" "$(format_deg "$yaw")"
+}
+
+compute_offset_attitude() {
+  local axis="$1" angle="$2"
+  local roll_offset=0 pitch_offset=0 yaw_offset=0
+  case "$axis" in
+    roll) roll_offset="$angle" ;;
+    pitch) pitch_offset="$angle" ;;
+    yaw) yaw_offset="$angle" ;;
+    combined) roll_offset="$angle"; pitch_offset="$angle"; yaw_offset="$angle" ;;
+    baseline) ;;
+  esac
+  # The sweep perturbs the right camera's attitude relative to its own
+  # configured baseline (e.g. CAM_R_OPTICAL_PITCH_DEG=20.0), not in absolute
+  # terms -- otherwise a "pitch=0.1" case would fly with a near-level camera
+  # instead of the actually-deployed 20 deg pitch plus a 0.1 deg error. The
+  # left camera stays exactly at its own configured baseline throughout.
+  left_roll="${CAM_L_OPTICAL_ROLL_DEG:-0.0}"
+  left_pitch="${CAM_L_OPTICAL_PITCH_DEG:-0.0}"
+  left_yaw="${CAM_L_OPTICAL_YAW_DEG:-0.0}"
+  roll="$(awk -v b="${CAM_R_OPTICAL_ROLL_DEG:-0.0}" -v o="$roll_offset" 'BEGIN { printf "%.6f", b + o }')"
+  pitch="$(awk -v b="${CAM_R_OPTICAL_PITCH_DEG:-0.0}" -v o="$pitch_offset" 'BEGIN { printf "%.6f", b + o }')"
+  yaw="$(awk -v b="${CAM_R_OPTICAL_YAW_DEG:-0.0}" -v o="$yaw_offset" 'BEGIN { printf "%.6f", b + o }')"
 }
 
 condition_specs=()
@@ -605,65 +587,41 @@ for condition_index in "${condition_order[@]}"; do
 done
 
 run_case() {
-  local case_id="$1" axis="$2" angle="$3" repetition="$4" geometry_index="$5"
+  local axis="$1" angle="$2" repetition="$3"
+  local operator_status=0 auto_status=0
+  local left_roll left_pitch left_yaw roll pitch yaw
+  local failure_stage="" failure_reason=""
+  local start_time_utc start_monotonic_ns end_time_utc end_monotonic_ns
+  start_time_utc="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+  start_monotonic_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
+  execution_order=$((execution_order + 1))
+  compute_offset_attitude "$axis" "$angle"
+  local case_id
+  case_id="case-$(printf '%03d' "$case_index")_$(attitude_token L "$left_roll" "$left_pitch" "$left_yaw")_$(attitude_token R "$roll" "$pitch" "$yaw")_repetition$(printf '%02d' "$repetition")"
   local case_dir="$output_dir/$case_id"
   local effective_config_path="$case_dir/effective_config.json"
   local recording_dir="$case_dir/recording"
   local operator_recording_dir="$case_dir/operator-recording"
   local operator_log="$case_dir/operator.log" readiness_log="$case_dir/readiness.log" auto_log="$case_dir/auto.log"
   local validation_log="$case_dir/data_validation.log" validation_report="$case_dir/data_validation.json"
-  local roll=0 pitch=0 yaw=0 operator_status=0 auto_status=0
-  local failure_stage="" failure_reason=""
-  local start_time_utc start_monotonic_ns end_time_utc end_monotonic_ns
-  local geometry_altitude_m="" geometry_lateral_bias_m="" geometry_lateral_sweep_amplitude_m=""
-  start_time_utc="$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
-  start_monotonic_ns="$(python3 -c 'import time; print(time.monotonic_ns())')"
-  execution_order=$((execution_order + 1))
-  case "$axis" in
-    roll) roll="$angle" ;;
-    pitch) pitch="$angle" ;;
-    yaw) yaw="$angle" ;;
-    combined) roll="$angle"; pitch="$angle"; yaw="$angle" ;;
-    baseline) ;;
-  esac
-  if [[ "$altitude_requested" == false ]]; then
-    geometry_altitude_m="${altitudes_m[$(( geometry_index % ${#altitudes_m[@]} ))]}"
-  fi
-  if [[ "$lateral_bias_requested" == false ]]; then
-    geometry_lateral_bias_m="${lateral_biases_m[$(( geometry_index % ${#lateral_biases_m[@]} ))]}"
-  fi
-  if [[ "$lateral_sweep_requested" == false ]] \
-    && awk -v value="$lateral_sweep_amplitude_m" 'BEGIN { exit !(value > 0) }'; then
-    geometry_lateral_sweep_amplitude_m="$lateral_sweep_amplitude_m"
-  fi
   local case_auto_args=("${auto_args[@]}")
-  [[ -n "$geometry_altitude_m" ]] && case_auto_args+=(--altitude-m "$geometry_altitude_m")
-  [[ -n "$geometry_lateral_bias_m" ]] && case_auto_args+=(--lateral-bias-m "$geometry_lateral_bias_m")
-  if [[ -n "$geometry_lateral_sweep_amplitude_m" ]]; then
-    case_auto_args+=(
-      --lateral-sweep-amplitude-m "$geometry_lateral_sweep_amplitude_m"
-      --lateral-sweep-period-s "$lateral_sweep_period_s"
-    )
-  fi
   mkdir -p "$case_dir"
   local effective_config_sha256
-  effective_config_sha256="$(write_effective_config "$effective_config_path" "$case_id" "$axis" "$angle" "$repetition" "$roll" "$pitch" "$yaw" "$recording_dir" "$operator_recording_dir" "$geometry_altitude_m" "$geometry_lateral_bias_m" "$geometry_lateral_sweep_amplitude_m" "$lateral_sweep_period_s")"
+  effective_config_sha256="$(write_effective_config "$effective_config_path" "$case_id" "$axis" "$angle" "$repetition" "$roll" "$pitch" "$yaw" "$left_roll" "$left_pitch" "$left_yaw" "$recording_dir" "$operator_recording_dir")"
   printf '%s\n' \
     "case_id=$case_id" "axis=$axis" "angle_deg=$angle" "repetition=$repetition" \
     "session_id=$session_id" "run_id=$run_id" "attempt_id=$case_id" \
     "effective_config_sha256=$effective_config_sha256" \
-    "attitude_frame=camera_optical_rdf" "cam_r_optical_roll_deg=$roll" \
+    "attitude_frame=camera_optical_rdf" \
+    "cam_l_optical_roll_deg=$left_roll" "cam_l_optical_pitch_deg=$left_pitch" "cam_l_optical_yaw_deg=$left_yaw" \
+    "cam_r_optical_roll_deg=$roll" \
     "cam_r_optical_pitch_deg=$pitch" "cam_r_optical_yaw_deg=$yaw" \
     "output_frame=baseline_center_frd[forward,right,down]" \
     "truth_source=Gazebo Target GT (offline calibration/validation only)" \
     "operator_recording_dir=$operator_recording_dir" \
-    "geometry_altitude_m=$geometry_altitude_m" \
-    "geometry_lateral_bias_m=$geometry_lateral_bias_m" \
-    "geometry_lateral_sweep_amplitude_m=$geometry_lateral_sweep_amplitude_m" \
-    "geometry_lateral_sweep_period_s=$lateral_sweep_period_s" \
     > "$case_dir/case_contract.txt"
 
-  printf '%s\n' "Starting $case_id: $axis=$angle deg, repetition=$repetition, altitude_m=${geometry_altitude_m:-inherited}, lateral_bias_m=${geometry_lateral_bias_m:-inherited}, lateral_sweep_amplitude_m=${geometry_lateral_sweep_amplitude_m:-0}"
+  printf '%s\n' "Starting $case_id: $axis=$angle deg, repetition=$repetition"
   operator_cmd=(
     "$ROOT_DIR/run_operator_view.sh"
     --record-full "$operator_recording_dir"
@@ -683,7 +641,7 @@ run_case() {
     "research_commit_sha:=$commit_sha" "research_git_status:=$git_status"
     "research_gazebo_version:=${GAZEBO_MAJOR_VERSION:-8}"
     "research_px4_version:=${PX4_REQUIRED_VERSION:-v1.17.0}"
-    "cam_l_optical_roll_deg:=0.0" "cam_l_optical_pitch_deg:=0.0" "cam_l_optical_yaw_deg:=0.0"
+    "cam_l_optical_roll_deg:=$left_roll" "cam_l_optical_pitch_deg:=$left_pitch" "cam_l_optical_yaw_deg:=$left_yaw"
     "cam_r_optical_roll_deg:=$roll" "cam_r_optical_pitch_deg:=$pitch" "cam_r_optical_yaw_deg:=$yaw"
     "camera_update_rate_hz:=$camera_update_rate_hz" "yolo_target_hz:=$yolo_target_hz"
     # At the sweep's bounded 2 Hz default, retain overlay publication so the
@@ -700,15 +658,27 @@ run_case() {
     printf '%s\n' "PX4 readiness failed for $case_id; see $readiness_log and $operator_log" >&2
   else
     set +e
-    setsid env SIM_CONFIG="$SIM_CONFIG" "$ROOT_DIR/run_auto.sh" "${case_auto_args[@]}" > "$auto_log" 2>&1 &
+    setsid env SIM_CONFIG="$SIM_CONFIG" "$ROOT_DIR/run_px4_waypoint_mission.sh" \
+      --path-file "$shared_path_file" \
+      --no-record \
+      --hold-s 0 \
+      --ramp-s 0 \
+      --vertical-ramp-s 0 \
+      "${case_auto_args[@]}" > "$auto_log" 2>&1 &
     auto_pid="$!"
+    # Unlike px4_auto_mission.py's FOV-guard success path (which holds
+    # OFFBOARD forever and needed a progress.json-poll + SIGINT to end),
+    # px4_waypoint_mission.py exits on its own once it completes the shared
+    # path and its final hover (WAYPOINT_LAND_AFTER=false,
+    # WAYPOINT_STOP_AFTER_HOVER=true) -- so a plain wait on its exit is
+    # enough; only watch the operator stack for an early crash meanwhile.
     while kill -0 "$auto_pid" >/dev/null 2>&1; do
       if ! kill -0 "$operator_pid" >/dev/null 2>&1; then
         operator_status=1
         auto_status=125
         failure_stage="operator_runtime"
-        failure_reason="operator stack exited while Auto mission was running"
-        printf '%s\n' "Operator stack exited during Auto for $case_id; see $operator_log" >&2
+        failure_reason="operator stack exited while the waypoint mission was running"
+        printf '%s\n' "Operator stack exited during the mission for $case_id; see $operator_log" >&2
         stop_auto
         break
       fi
@@ -724,9 +694,9 @@ run_case() {
       operator_status=1
       if [[ -z "$failure_stage" ]]; then
         failure_stage="auto_mission"
-        failure_reason="run_auto.sh exited with status $auto_status"
+        failure_reason="run_px4_waypoint_mission.sh exited with status $auto_status"
       fi
-      printf '%s\n' "Auto failed for $case_id (status $auto_status); see $auto_log" >&2
+      printf '%s\n' "Waypoint mission failed for $case_id (status $auto_status); see $auto_log" >&2
     fi
   fi
   stop_operator
@@ -793,41 +763,25 @@ PY
   return 1
 }
 
-# geometry_index is shared by a baseline-before and its paired attitude case
-# (one increment per condition, not per case), so the two share the same
-# altitude_m/lateral_bias_m and the baseline stays a same-geometry zero
-# reference for isolating the attitude-only effect. It advances once more
-# between condition pairs and for each closing baseline.
-case_index=0 pair_index=0 failures=0 execution_order=0 completed_case=""
+case_index=0 failures=0 execution_order=0 completed_case=""
+
+# Baseline (zero error) runs once, up front, as the reference the whole
+# sweep is compared against -- not once per condition.
+case_index=$((case_index + 1))
+if ! run_case baseline 0 0; then
+  failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
+fi
+completed_case=baseline
+
 for condition_index in "${condition_order[@]}"; do
   case_spec="${condition_specs[$condition_index]}"
   IFS='|' read -r axis value repetition <<< "$case_spec"
 
   case_index=$((case_index + 1))
-  if ! run_case "case-$(printf '%03d' "$case_index")-baseline-before" baseline 0 0 "$pair_index"; then
+  if ! run_case "$axis" "$value" "$repetition"; then
     failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
   fi
-  completed_case=baseline
-
-  case_index=$((case_index + 1))
-  case_id="case-$(printf '%03d' "$case_index")-${axis}-$(format_value "$value")-r$(printf '%02d' "$repetition")"
-  if ! run_case "$case_id" "$axis" "$value" "$repetition" "$pair_index"; then
-    failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
-  fi
-  pair_index=$((pair_index + 1))
 done
-
-if ((${#condition_order[@]} > 0)); then
-  case_index=$((case_index + 1))
-  if ! run_case "case-$(printf '%03d' "$case_index")-baseline-after" baseline 0 0 "$pair_index"; then
-    failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
-  fi
-else
-  case_index=$((case_index + 1))
-  if ! run_case "case-$(printf '%03d' "$case_index")-baseline" baseline 0 0 "$pair_index"; then
-    failures=$((failures + 1)); [[ "$keep_going" == true ]] || exit 1
-  fi
-fi
 
 if ((failures == 0)); then
   if python3 "$ROOT_DIR/scripts/validate_attitude_sweep_output.py" \

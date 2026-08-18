@@ -514,22 +514,57 @@ XLSX_DIRECT_SHEET_FIELDS = (
         (
             "time_sec",
             "ros_time_sec",
-            "nominal_F_m",
-            "nominal_R_m",
-            "nominal_D_m",
-            "nominal_Rg_m",
-            "optical_F_m",
-            "optical_R_m",
-            "optical_D_m",
-            "optical_Rg_m",
-            "ideal_F_m",
-            "ideal_R_m",
-            "ideal_D_m",
-            "ideal_Rg_m",
+            "uam_lat_deg",
+            "uam_lon_deg",
+            "uam_alt_m",
+            "uam_gps_F_m",
+            "uam_gps_R_m",
+            "uam_gps_D_m",
+            "uam_gps_Rg_m",
             "ground_truth_F_m",
             "ground_truth_R_m",
             "ground_truth_D_m",
             "ground_truth_Rg_m",
+            "ideal_F_m",
+            "ideal_R_m",
+            "ideal_D_m",
+            "ideal_Rg_m",
+            "optical_F_m",
+            "optical_R_m",
+            "optical_D_m",
+            "optical_Rg_m",
+            "nominal_F_m",
+            "nominal_R_m",
+            "nominal_D_m",
+            "nominal_Rg_m",
+            "global_baseline_F_m",
+            "global_baseline_R_m",
+            "global_baseline_D_m",
+            "global_baseline_Rg_m",
+            "gps_baseline_F_m",
+            "gps_baseline_R_m",
+            "gps_baseline_D_m",
+            "gps_baseline_Rg_m",
+            "attitude_F_m",
+            "attitude_R_m",
+            "attitude_D_m",
+            "attitude_Rg_m",
+            "operational_F_m",
+            "operational_R_m",
+            "operational_D_m",
+            "operational_Rg_m",
+            "attitude_declination_F_m",
+            "attitude_declination_R_m",
+            "attitude_declination_D_m",
+            "attitude_declination_Rg_m",
+            "attitude_true_north_F_m",
+            "attitude_true_north_R_m",
+            "attitude_true_north_D_m",
+            "attitude_true_north_Rg_m",
+            "operational_true_north_F_m",
+            "operational_true_north_R_m",
+            "operational_true_north_D_m",
+            "operational_true_north_Rg_m",
             "nominal_pose_range_m",
             "corrected_range_m",
             "optical_pose_range_m",
@@ -645,60 +680,12 @@ XLSX_DIRECT_SHEET_FIELDS = (
             "gps_baseline_minus_global_baseline_delta_m",
         ),
     ),
-    (
-        "Quality Events",
-        (
-            "time_sec",
-            "ros_time_sec",
-            "yolo_update_hz",
-            "yolo_inference_ms",
-            "disparity_px",
-            "distance_error_m",
-            "comparison_distance_error_m",
-            "profile_id",
-            "profile_mode",
-            "profile_fallback_level",
-            "profile_fallback_reason",
-            "nominal_pose_ray_computation_status",
-            "optical_pose_ray_computation_status",
-            "ideal_ray_computation_status",
-            "attitude_ray_computation_status",
-            "gps_baseline_ray_computation_status",
-            "global_baseline_ray_computation_status",
-            "operational_ray_computation_status",
-            "attitude_true_north_ray_computation_status",
-            "attitude_declination_ray_computation_status",
-            "operational_true_north_ray_computation_status",
-            "attitude_ray_failure_reason",
-            "gps_baseline_ray_failure_reason",
-            "global_baseline_ray_failure_reason",
-            "operational_ray_failure_reason",
-            "attitude_true_north_ray_failure_reason",
-            "attitude_declination_ray_failure_reason",
-            "operational_true_north_ray_failure_reason",
-            "nominal_pose_ray_gap_m",
-            "optical_pose_ray_gap_m",
-            "ideal_ray_gap_m",
-            "attitude_ray_gap_m",
-            "gps_baseline_ray_gap_m",
-            "global_baseline_ray_gap_m",
-            "operational_ray_gap_m",
-            "attitude_true_north_ray_gap_m",
-            "attitude_declination_ray_gap_m",
-            "operational_true_north_ray_gap_m",
-            "nominal_pose_ray_intersection_angle_deg",
-            "optical_pose_ray_intersection_angle_deg",
-            "ideal_ray_intersection_angle_deg",
-            "attitude_ray_intersection_angle_deg",
-            "gps_baseline_ray_intersection_angle_deg",
-            "global_baseline_ray_intersection_angle_deg",
-            "operational_ray_intersection_angle_deg",
-            "attitude_true_north_ray_intersection_angle_deg",
-            "attitude_declination_ray_intersection_angle_deg",
-            "operational_true_north_ray_intersection_angle_deg",
-        ),
-    ),
 )
+# "Quality Events" used to duplicate this same per-ray computation_status/
+# failure_reason/gap_m/intersection_angle_deg data in a wide, fixed-column
+# layout. The "Rays" sheet below already carries all of that (plus every
+# other per-ray field) in a long format that doesn't need a hand-picked
+# column list per ray type, so the separate sheet was dropped as redundant.
 
 RAYS_SHEET_FIELDS = (
     "time_sec",
@@ -1479,6 +1466,13 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                     values = []
                     for field in fields:
                         source_field = {
+                            "uam_lat_deg": "uam_raw_gps_lat_deg",
+                            "uam_lon_deg": "uam_raw_gps_lon_deg",
+                            "uam_alt_m": "uam_raw_gps_alt_msl_m",
+                            "uam_gps_F_m": "uam_raw_gps_reference_forward_m",
+                            "uam_gps_R_m": "uam_raw_gps_reference_right_m",
+                            "uam_gps_D_m": "uam_raw_gps_reference_down_m",
+                            "uam_gps_Rg_m": "uam_raw_gps_reference_range_m",
                             "ground_truth_F_m": "drone_forward_m",
                             "ground_truth_R_m": "drone_right_m",
                             "ground_truth_D_m": "drone_down_m",
@@ -1495,6 +1489,34 @@ def export_session_xlsx(csv_path, xlsx_path, *, mode, manifest_rows=()):
                             "ideal_R_m": "ideal_ray_midpoint_right_m",
                             "ideal_D_m": "ideal_ray_midpoint_down_m",
                             "ideal_Rg_m": "ideal_ray_range_m",
+                            "global_baseline_F_m": "global_baseline_ray_midpoint_forward_m",
+                            "global_baseline_R_m": "global_baseline_ray_midpoint_right_m",
+                            "global_baseline_D_m": "global_baseline_ray_midpoint_down_m",
+                            "global_baseline_Rg_m": "global_baseline_ray_range_m",
+                            "gps_baseline_F_m": "gps_baseline_ray_midpoint_forward_m",
+                            "gps_baseline_R_m": "gps_baseline_ray_midpoint_right_m",
+                            "gps_baseline_D_m": "gps_baseline_ray_midpoint_down_m",
+                            "gps_baseline_Rg_m": "gps_baseline_ray_range_m",
+                            "attitude_F_m": "attitude_ray_midpoint_forward_m",
+                            "attitude_R_m": "attitude_ray_midpoint_right_m",
+                            "attitude_D_m": "attitude_ray_midpoint_down_m",
+                            "attitude_Rg_m": "attitude_ray_range_m",
+                            "operational_F_m": "operational_ray_midpoint_forward_m",
+                            "operational_R_m": "operational_ray_midpoint_right_m",
+                            "operational_D_m": "operational_ray_midpoint_down_m",
+                            "operational_Rg_m": "operational_ray_range_m",
+                            "attitude_declination_F_m": "attitude_declination_ray_midpoint_forward_m",
+                            "attitude_declination_R_m": "attitude_declination_ray_midpoint_right_m",
+                            "attitude_declination_D_m": "attitude_declination_ray_midpoint_down_m",
+                            "attitude_declination_Rg_m": "attitude_declination_ray_range_m",
+                            "attitude_true_north_F_m": "attitude_true_north_ray_midpoint_forward_m",
+                            "attitude_true_north_R_m": "attitude_true_north_ray_midpoint_right_m",
+                            "attitude_true_north_D_m": "attitude_true_north_ray_midpoint_down_m",
+                            "attitude_true_north_Rg_m": "attitude_true_north_ray_range_m",
+                            "operational_true_north_F_m": "operational_true_north_ray_midpoint_forward_m",
+                            "operational_true_north_R_m": "operational_true_north_ray_midpoint_right_m",
+                            "operational_true_north_D_m": "operational_true_north_ray_midpoint_down_m",
+                            "operational_true_north_Rg_m": "operational_true_north_ray_range_m",
                         }.get(field, field)
                         values.append(row.get(source_field, ""))
                     worksheet.write_row(
@@ -1617,6 +1639,7 @@ class OperatorRecorder(Node):
         self.csv_file = None
         self.csv_writer = None
         self.video_writers = {}
+        self.auto_stop_requested = False
         self.bag_process = None
         self.bag_storage = (
             self._resolve_bag_storage(args.bag_storage) if self.mode == "debug" else args.bag_storage
@@ -1875,6 +1898,12 @@ class OperatorRecorder(Node):
             String,
             "/stereo/profile_status",
             self._profile_status_cb,
+            10,
+        )
+        self.create_subscription(
+            String,
+            "/stereo/auto_mission_phase",
+            self._auto_mission_phase_cb,
             10,
         )
         if SensorGps is None or VehicleGlobalPosition is None or VehicleOdometry is None:
@@ -2243,6 +2272,19 @@ class OperatorRecorder(Node):
         self.latest["profile_fallback_reason"] = str(payload.get("fallback_reason", ""))
         self.last_stamp["/stereo/profile_status"] = self.get_clock().now().nanoseconds * 1e-9
 
+    def _auto_mission_phase_cb(self, msg):
+        # px4_auto_mission.py's FOV-guarded waypoint approach publishes this
+        # phase the instant it stops advancing waypoints and starts holding
+        # position indefinitely (Ctrl+C-only exit). The vehicle keeps
+        # hovering after this point, but there is nothing left worth
+        # recording, so end the Auto session's CSV/MP4 here rather than
+        # waiting for a manual stop.
+        if msg.data == "target_distance_reached_hover" and self.recording_active and not self.auto_stop_requested:
+            self.auto_stop_requested = True
+            self.get_logger().info(
+                "Auto mission reached its final waypoint and is holding; stopping recording (CSV/MP4 finalize)."
+            )
+
     def _ray_metrics_cb(self, msg):
         try:
             payload = json.loads(msg.data)
@@ -2498,15 +2540,27 @@ def parse_args():
     return parser.parse_args()
 
 
+_signal_stop_requested = False
+
+
 def main():
+    global _signal_stop_requested
     args = parse_args()
     rclpy.init()
     recorder = OperatorRecorder(args)
 
     def _stop(signum, frame):
-        if _CLOSING:
-            return
-        raise KeyboardInterrupt
+        # Relying on Python's default signal->KeyboardInterrupt delivery
+        # (raising directly from the handler) is not reliable here: this
+        # process runs several rclpy-related background threads (e.g. any
+        # spin threads owned by subscribed monitors), and a signal can sit
+        # queued for minutes without the main thread ever raising it
+        # (observed directly via /proc/<pid>/status SigQ, same failure mode
+        # fixed in px4_auto_mission.py). Set a flag polled every spin_once
+        # instead, so the loop notices within ~0.2s regardless of thread
+        # scheduling.
+        global _signal_stop_requested
+        _signal_stop_requested = True
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
@@ -2517,7 +2571,7 @@ def main():
         # telemetry sample must not terminate an otherwise valid run.
         executor = rclpy.executors.SingleThreadedExecutor()
         executor.add_node(recorder)
-        while rclpy.ok():
+        while rclpy.ok() and not recorder.auto_stop_requested and not _signal_stop_requested:
             try:
                 executor.spin_once(timeout_sec=0.2)
             except RuntimeError as exc:

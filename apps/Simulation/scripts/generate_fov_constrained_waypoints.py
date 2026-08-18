@@ -49,6 +49,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validation-count", type=int, default=12)
     parser.add_argument("--min-range-m", type=float, default=500.0)
     parser.add_argument("--max-range-m", type=float, default=2000.0)
+    parser.add_argument(
+        "--range-step-m", type=float, default=None,
+        help=(
+            "If set, generate points on the FOV boresight (right=down=0, i.e. "
+            "dead centre of the FOV) stepped from --min-range-m to "
+            "--max-range-m in this increment, instead of scattering them "
+            "randomly through the FOV cone. The point count for each enabled "
+            "phase (calibration/validation) is then derived from the range "
+            "interval, overriding --calibration-count/--validation-count as "
+            "a count (their nonzero-ness still selects whether that phase "
+            "runs)."
+        ),
+    )
     parser.add_argument("--camera-baseline-m", type=float, default=25.0)
     parser.add_argument("--camera-height-m", type=float, default=0.5)
     parser.add_argument(
@@ -162,6 +175,9 @@ def sample_one(
     pixel_margin_px: float,
     max_attempts: int,
     px4_origin_world_enu_m: tuple[float, float, float],
+    forced_forward_m: float | None = None,
+    forced_right_m: float | None = None,
+    forced_down_m: float | None = None,
 ) -> dict[str, float | int | str]:
     usable_h = horizontal_fov_rad * 0.5 - fov_margin_rad
     usable_v = vertical_fov * 0.5 - fov_margin_rad
@@ -169,9 +185,9 @@ def sample_one(
         raise ValueError("FOV margin leaves no usable angular envelope")
 
     for _ in range(max_attempts):
-        forward = rng.uniform(min_range_m, max_range_m)
-        right = rng.uniform(-math.tan(usable_h) * forward, math.tan(usable_h) * forward)
-        down = rng.uniform(-math.tan(usable_v) * forward, math.tan(usable_v) * forward)
+        forward = forced_forward_m if forced_forward_m is not None else rng.uniform(min_range_m, max_range_m)
+        right = forced_right_m if forced_right_m is not None else rng.uniform(-math.tan(usable_h) * forward, math.tan(usable_h) * forward)
+        down = forced_down_m if forced_down_m is not None else rng.uniform(-math.tan(usable_v) * forward, math.tan(usable_v) * forward)
         world = frame.point_to_world((forward, right, down))
         left_pixel = project_world_point_to_pixel(
             world,
@@ -237,6 +253,19 @@ def sample_one(
     raise RuntimeError(f"could not sample {phase} waypoint {index} inside FOV after {max_attempts} attempts")
 
 
+def build_stepped_range_values(min_range_m: float, max_range_m: float, step_m: float) -> list[float]:
+    if step_m <= 0.0:
+        raise ValueError("range step must be positive")
+    values: list[float] = []
+    n = 0
+    value = min_range_m
+    while value <= max_range_m + 1e-6:
+        values.append(value)
+        n += 1
+        value = min_range_m + n * step_m
+    return values
+
+
 def generate_waypoints(
     args: argparse.Namespace,
 ) -> tuple[
@@ -248,6 +277,7 @@ def generate_waypoints(
         raise ValueError("waypoint counts must be non-negative")
     if args.min_range_m <= 0.0 or args.max_range_m <= args.min_range_m:
         raise ValueError("range bounds must be positive and increasing")
+    range_step_m = getattr(args, "range_step_m", None)
     rng = random.Random(args.seed)
     nominal_left, nominal_right = nominal_camera_poses(args.camera_baseline_m, args.camera_height_m)
     # nominal_camera_poses() is always level (roll=pitch=0); rotate it to the
@@ -285,8 +315,15 @@ def generate_waypoints(
         float(args.px4_origin_world_up_m),
     )
 
+    calibration_range_values = (
+        build_stepped_range_values(args.min_range_m, args.max_range_m, range_step_m)
+        if range_step_m is not None and args.calibration_count > 0
+        else None
+    )
+    calibration_total = len(calibration_range_values) if calibration_range_values is not None else args.calibration_count
+
     calibration: list[dict[str, float | int | str]] = []
-    for index in range(args.calibration_count):
+    for index in range(calibration_total):
         calibration.append(
             sample_one(
                 rng,
@@ -309,11 +346,21 @@ def generate_waypoints(
                 pixel_margin_px=args.pixel_margin_px,
                 max_attempts=args.max_attempts,
                 px4_origin_world_enu_m=px4_origin_world_enu_m,
+                forced_forward_m=calibration_range_values[index] if calibration_range_values is not None else None,
+                forced_right_m=0.0 if calibration_range_values is not None else None,
+                forced_down_m=0.0 if calibration_range_values is not None else None,
             )
         )
 
+    validation_range_values = (
+        build_stepped_range_values(args.min_range_m, args.max_range_m, range_step_m)
+        if range_step_m is not None and args.validation_count > 0
+        else None
+    )
+    validation_total = len(validation_range_values) if validation_range_values is not None else args.validation_count
+
     validation: list[dict[str, float | int | str]] = []
-    for index in range(args.validation_count):
+    for index in range(validation_total):
         validation.append(
             sample_one(
                 rng,
@@ -336,6 +383,9 @@ def generate_waypoints(
                 pixel_margin_px=args.pixel_margin_px,
                 max_attempts=args.max_attempts,
                 px4_origin_world_enu_m=px4_origin_world_enu_m,
+                forced_forward_m=validation_range_values[index] if validation_range_values is not None else None,
+                forced_right_m=0.0 if validation_range_values is not None else None,
+                forced_down_m=0.0 if validation_range_values is not None else None,
             )
         )
 
@@ -370,6 +420,7 @@ def generate_waypoints(
         "pixel_margin_px": args.pixel_margin_px,
         "range_min_m": args.min_range_m,
         "range_max_m": args.max_range_m,
+        "range_step_m": range_step_m,
     }
     return calibration, validation, manifest
 

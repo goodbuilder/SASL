@@ -43,8 +43,9 @@ SIM_EXPLICIT_NAMES=(
   CAMERA_BASELINE_M CAMERA_HEIGHT_M CAMERA_HORIZONTAL_FOV_RAD
   CAMERA_IMAGE_WIDTH_PX CAMERA_IMAGE_HEIGHT_PX
   DRONE_SPAWN_X_M DRONE_SPAWN_Y_M DRONE_SPAWN_Z_M
+  DRONE_MOVE_DISTANCE_M DRONE_TARGET_DISTANCE_M
   AUTO_WAYPOINT_COUNT AUTO_WAYPOINT_MIN_RANGE_M AUTO_WAYPOINT_MAX_RANGE_M
-  AUTO_WAYPOINT_SEED
+  AUTO_WAYPOINT_RANGE_STEP_M AUTO_WAYPOINT_SEED
 )
 # shellcheck disable=SC1091
 source "$ROOT_DIR/scripts/load_sim_config.sh"
@@ -61,17 +62,28 @@ Starts a FOV-guarded mission and automatically records a Full operator session
 By default this first generates a waypoint approach path with
 scripts/generate_fov_constrained_waypoints.py, verified point-by-point
 against the actual configured camera optical attitude (CAM_L/R_OPTICAL_*_DEG)
--- not a fixed pitch assumption -- so it works for any camera pose. The
-mission then flies that path and stops to hover the instant both cameras'
-bboxes fill the safe margin on every side (see px4_auto_mission.py
---waypoints-xy-alt), instead of the older straight-line approach.
+-- not a fixed pitch assumption -- so it works for any camera pose. Points sit
+on the FOV boresight (dead centre of the FOV, not scattered) and step inward
+along Front/range by AUTO_WAYPOINT_RANGE_STEP_M each, so the point count is
+derived from the range interval instead of --waypoint-count. The mission then
+flies that path and stops to hover once it reaches the final waypoint --
+the closest configured distance to the target (see px4_auto_mission.py
+--waypoints-xy-alt) -- instead of the older straight-line approach.
 
 Options:
   --bbox-margin-ratio N          Safe image-edge margin. Default: 0.05.
   --fov-detection-timeout-s N    Maximum age of paired detections. Default: 0.5.
-  --waypoint-count N             Points to generate for the approach path. Default: 8.
-  --waypoint-min-range-m N       Nearest generated point's range, m. Default: 500.
-  --waypoint-max-range-m N       Farthest generated point's range, m. Default: 2000.
+  --waypoint-count N             Points to generate when --waypoint-range-step-m
+                                 is disabled (empty/0). Default: 8.
+  --waypoint-min-range-m N       Nearest generated point's range, m.
+                                 Default: DRONE_SPAWN_Y_M - DRONE_MOVE_DISTANCE_M
+                                 (the target drone mission's own approach end distance).
+  --waypoint-max-range-m N       Farthest generated point's range, m.
+                                 Default: DRONE_SPAWN_Y_M (the target drone's spawn range).
+  --waypoint-range-step-m N      Front/range spacing between generated waypoints, m,
+                                 centred on the FOV boresight. Set to 0 or empty to
+                                 fall back to --waypoint-count random FOV scatter.
+                                 Default: 5.0 (AUTO_WAYPOINT_RANGE_STEP_M).
   --waypoint-seed N              RNG seed for waypoint generation. Default: 20260729.
   --waypoints-dir DIR            Where to write the generated waypoint set.
                                  Also becomes the Full recording session directory.
@@ -94,8 +106,21 @@ USAGE
 fov_margin_ratio="${AUTO_FOV_MARGIN_RATIO:-0.05}"
 fov_detection_timeout_s="${AUTO_FOV_DETECTION_TIMEOUT_S:-0.5}"
 waypoint_count="${AUTO_WAYPOINT_COUNT:-8}"
-waypoint_min_range_m="${AUTO_WAYPOINT_MIN_RANGE_M:-500}"
-waypoint_max_range_m="${AUTO_WAYPOINT_MAX_RANGE_M:-2000}"
+# Default range bounds follow the target drone mission's own geometry
+# (DRONE_SPAWN_Y_M -> DRONE_SPAWN_Y_M - DRONE_MOVE_DISTANCE_M) instead of an
+# independent guess, so the generated waypoints land where the target drone
+# actually spawns/approaches to.
+drone_spawn_y_m="${DRONE_SPAWN_Y_M:-2000}"
+drone_move_distance_m="${DRONE_MOVE_DISTANCE_M:-0}"
+waypoint_max_range_default="$(awk -v v="$drone_spawn_y_m" 'BEGIN { printf "%.6f", v }')"
+waypoint_min_range_default="$(awk -v spawn="$drone_spawn_y_m" -v move="$drone_move_distance_m" \
+  'BEGIN { v = spawn - move; if (v < 1.0) v = 1.0; printf "%.6f", v }')"
+waypoint_min_range_m="${AUTO_WAYPOINT_MIN_RANGE_M:-$waypoint_min_range_default}"
+waypoint_max_range_m="${AUTO_WAYPOINT_MAX_RANGE_M:-$waypoint_max_range_default}"
+# Front/range spacing between generated waypoints; centred on the FOV
+# boresight so the approach heads straight at the FOV centre instead of
+# scattering. Set to 0/empty to fall back to --waypoint-count random scatter.
+waypoint_range_step_m="${AUTO_WAYPOINT_RANGE_STEP_M:-5.0}"
 waypoint_seed="${AUTO_WAYPOINT_SEED:-20260729}"
 waypoints_dir=""
 generate_waypoints=true
@@ -128,6 +153,10 @@ while (($#)); do
       waypoint_max_range_m="${2:?missing value for $1}"
       shift 2
       ;;
+    --waypoint-range-step-m)
+      waypoint_range_step_m="${2:?missing value for $1}"
+      shift 2
+      ;;
     --waypoint-seed)
       waypoint_seed="${2:?missing value for $1}"
       shift 2
@@ -158,9 +187,18 @@ if [[ -z "$waypoints_dir" ]]; then
 fi
 if [[ "$generate_waypoints" == true && "$mission_supplies_path" == false ]]; then
   pixel_margin_px="$(awk -v w="${CAMERA_IMAGE_WIDTH_PX:-1280}" -v r="$fov_margin_ratio" 'BEGIN { printf "%.6f", w * r }')"
-  echo "Generating $waypoint_count FOV-verified waypoint(s) (range ${waypoint_min_range_m}-${waypoint_max_range_m} m)" \
-    "for optical attitude L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
-    "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $waypoints_dir"
+  range_step_args=()
+  if awk -v v="${waypoint_range_step_m:-0}" 'BEGIN { exit !(v > 0) }'; then
+    echo "Generating FOV-centred waypoint(s) every ${waypoint_range_step_m} m Front" \
+      "(range ${waypoint_min_range_m}-${waypoint_max_range_m} m)" \
+      "for optical attitude L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
+      "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $waypoints_dir"
+    range_step_args=(--range-step-m "$waypoint_range_step_m")
+  else
+    echo "Generating $waypoint_count FOV-verified waypoint(s) (range ${waypoint_min_range_m}-${waypoint_max_range_m} m)" \
+      "for optical attitude L=(${CAM_L_OPTICAL_ROLL_DEG:-0},${CAM_L_OPTICAL_PITCH_DEG:-0},${CAM_L_OPTICAL_YAW_DEG:-0})" \
+      "R=(${CAM_R_OPTICAL_ROLL_DEG:-0},${CAM_R_OPTICAL_PITCH_DEG:-0},${CAM_R_OPTICAL_YAW_DEG:-0}) deg -> $waypoints_dir"
+  fi
   python3 "$ROOT_DIR/scripts/generate_fov_constrained_waypoints.py" \
     --output-dir "$waypoints_dir" \
     --seed "$waypoint_seed" \
@@ -168,6 +206,7 @@ if [[ "$generate_waypoints" == true && "$mission_supplies_path" == false ]]; the
     --validation-count "$waypoint_count" \
     --min-range-m "$waypoint_min_range_m" \
     --max-range-m "$waypoint_max_range_m" \
+    "${range_step_args[@]}" \
     --camera-baseline-m "${CAMERA_BASELINE_M:-25.0}" \
     --camera-height-m "${CAMERA_HEIGHT_M:-0.1}" \
     --px4-origin-world-east-m "${DRONE_SPAWN_X_M:-0.0}" \

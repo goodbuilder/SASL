@@ -585,7 +585,18 @@ def validate_case(case_dir: Path) -> dict[str, Any]:
             case_result.get("effective_config_sha256") == config_hash,
             "case_result config hash mismatch",
         )
-        validation.require(case_result.get("auto_exit_status") == 0, "Auto exit status is not zero")
+        # 0 is the expected exit status for a successful case:
+        # run_px4_waypoint_mission.sh's px4_waypoint_mission.py completes the
+        # shared waypoint path and its final hover, then returns normally --
+        # it is a deterministic, camera/FOV-independent MAVLink follower with
+        # no OFFBOARD hold to interrupt. 130 (128+SIGINT) remains accepted
+        # for historical data recorded under the older FOV-guarded
+        # px4_auto_mission.py flow, whose success path required SIGINT to end
+        # an intentionally-infinite OFFBOARD hold.
+        validation.require(
+            case_result.get("auto_exit_status") in (0, 130),
+            "Auto exit status is neither 0 nor 130 (clean SIGINT stop)",
+        )
         validation.require(not case_result.get("failure_stage"), "successful case has a failure_stage")
         validation.require(not case_result.get("failure_reason"), "successful case has a failure_reason")
 
@@ -627,7 +638,9 @@ def validate_sweep(sweep_dir: Path) -> dict[str, Any]:
         with manifest_path.open(encoding="utf-8", newline="") as handle:
             manifest_rows = list(csv.DictReader(handle, delimiter="\t"))
     condition_count = _condition_count(sweep_dir)
-    expected_case_count = None if condition_count is None else (condition_count * 2 + 1 if condition_count else 1)
+    # One baseline case runs once up front, followed by one case per
+    # condition (see run_auto_attitude_sweep.sh's main loop).
+    expected_case_count = None if condition_count is None else condition_count + 1
     if expected_case_count is None:
         errors.append("condition_count is missing from sweep_contract.txt")
     elif len(manifest_rows) != expected_case_count:

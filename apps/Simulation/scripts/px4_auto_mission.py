@@ -3,12 +3,35 @@ import argparse
 import csv
 import math
 import os
+import signal
 import sys
 import threading
 import time
 from pathlib import Path
 
 from pymavlink import mavutil
+
+
+_interrupted = threading.Event()
+
+
+def _request_interrupt(signum, frame):
+    _interrupted.set()
+
+
+def raise_if_interrupted():
+    """Convert a caught SIGINT/SIGTERM into KeyboardInterrupt at a safe point.
+
+    Python's default SIGINT->KeyboardInterrupt delivery is not reliable in
+    this process: the background rclpy spin threads used by
+    ActualDistanceMonitor/BboxFovMonitor keep the interpreter busy enough
+    that a signal can sit queued for minutes without the main thread ever
+    raising it (observed directly via /proc/<pid>/status SigQ). Installing
+    our own handler and polling this flag at every loop iteration makes the
+    interrupt point explicit and reliable instead of depending on that.
+    """
+    if _interrupted.is_set():
+        raise KeyboardInterrupt
 
 
 def positive_float(value):
@@ -59,32 +82,6 @@ def bbox_inside_safe_fov(bbox, image_width_px, image_height_px, margin_ratio):
         and y1 >= margin_y
         and x2 <= float(image_width_px) - margin_x
         and y2 <= float(image_height_px) - margin_y
-    )
-
-
-def bbox_fills_safe_margin(bbox, image_width_px, image_height_px, margin_ratio):
-    """True once all four bbox edges have reached their margin.
-
-    Unlike ``bbox_inside_safe_fov`` (which fails once an edge crosses past the
-    margin), this is the approach-side condition: the target has grown to
-    exactly span the safe box between the margins on every side, without yet
-    violating any of them.
-    """
-    if bbox is None or len(bbox) != 4:
-        return False
-    try:
-        x1, y1, x2, y2 = (float(value) for value in bbox)
-    except (TypeError, ValueError):
-        return False
-    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or x2 <= x1 or y2 <= y1:
-        return False
-    margin_x = float(image_width_px) * float(margin_ratio)
-    margin_y = float(image_height_px) * float(margin_ratio)
-    return (
-        x1 <= margin_x
-        and y1 <= margin_y
-        and x2 >= float(image_width_px) - margin_x
-        and y2 >= float(image_height_px) - margin_y
     )
 
 
@@ -225,9 +222,9 @@ def build_parser():
         default="",
         help="Semicolon-separated north,east,altitude_agl_m list. When set, the "
         "mission flies this path (instead of the straight --altitude-m/--distance-m "
-        "approach) and, with --fov-guard, stops to hover in place the instant both "
-        "cameras' bboxes span the full safe box on every side, rather than "
-        "flying every waypoint.",
+        "approach) and, with --fov-guard, stops to hover in place once it reaches "
+        "the final configured waypoint -- the closest configured distance to the "
+        "target -- instead of raising a failure.",
     )
     parser.add_argument(
         "--waypoint",
@@ -457,33 +454,6 @@ class BboxFovMonitor:
                 return False, f"{side} full bbox is outside the safe FOV margin"
         return True, "both full bboxes inside safe FOV margin"
 
-    def filled_snapshot(self):
-        """True once both cameras' bboxes span the full safe box on every side.
-
-        Unlike ``snapshot()``, missing/stale/unpaired detections count as
-        "not filled" here -- filling the margin is a positive claim that
-        requires real, fresh, paired detections to back it up.
-        """
-        with self._lock:
-            latest = self._latest
-            latest_time = self._latest_time
-        if self.error:
-            return False, f"FOV monitor unavailable ({self.error})"
-        if latest is None or latest_time is None:
-            return False, "no paired detections; margin-fill undetermined"
-        age = time.monotonic() - latest_time
-        if age > self.timeout_s:
-            return False, f"detections stale ({age:.2f}s); margin-fill undetermined"
-        if latest[0] is None or latest[1] is None:
-            return False, "left/right full bbox pair unavailable; margin-fill undetermined"
-
-        for side, bbox in zip(("left", "right"), latest):
-            if not bbox_fills_safe_margin(
-                bbox, self.image_width_px, self.image_height_px, self.margin_ratio
-            ):
-                return False, f"{side} bbox has not yet reached all four margins"
-        return True, "both left and right bboxes span the full safe box on every side"
-
     def stop(self):
         self._stop.set()
         if self._thread is not None:
@@ -532,6 +502,7 @@ def wait_heartbeat(master, timeout_s):
     deadline = time.monotonic() + timeout_s
     heartbeat = None
     while time.monotonic() < deadline:
+        raise_if_interrupted()
         candidate = master.wait_heartbeat(timeout=1.0)
         if candidate is None:
             continue
@@ -563,6 +534,7 @@ def wait_heartbeat(master, timeout_s):
 def wait_local_position(master, timeout_s=10.0):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        raise_if_interrupted()
         msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=True, timeout=1.0)
         if msg is not None:
             return msg
@@ -770,14 +742,16 @@ def stream_for(duration_s, hz, callback):
     period_s = 1.0 / hz
     end_time = time.monotonic() + duration_s
     while time.monotonic() < end_time:
+        raise_if_interrupted()
         callback()
         time.sleep(period_s)
 
 
 def stream_until_interrupted(hz, callback):
-    """Stream a setpoint forever; Ctrl+C raises KeyboardInterrupt to stop."""
+    """Stream a setpoint forever; SIGINT/SIGTERM (see raise_if_interrupted) stops it."""
     period_s = 1.0 / hz
     while True:
+        raise_if_interrupted()
         callback()
         time.sleep(period_s)
 
@@ -820,6 +794,7 @@ def approach_until_target(master, boot_time, args, x0, y0, fov_monitor=None, dis
     )
     try:
         while time.monotonic() < deadline:
+            raise_if_interrupted()
             msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
             traveled = None
             lateral_error = 0.0
@@ -908,24 +883,25 @@ def approach_until_target(master, boot_time, args, x0, y0, fov_monitor=None, dis
     )
 
 
-def follow_waypoints_until_margin_filled(
+def follow_waypoints_to_final_position(
     master, boot_time, args, waypoints, fov_monitor, distance_monitor=None
 ):
-    """Fly the given waypoints (takeoff included), gated by the FOV margin.
+    """Fly the given waypoints (takeoff included) to the last configured one.
 
     Moves toward each waypoint in turn using a 3D velocity vector, same as
-    ``px4_waypoint_mission.py``'s ``wait_waypoint``. On a hard margin
+    ``px4_waypoint_mission.py``'s ``wait_waypoint``. On a hard FOV-margin
     violation (a bbox edge has crossed past the margin) it freezes, same as
-    ``approach_until_target``. Its normal exit is different: the instant both
-    cameras' bboxes span the full safe box on every side (see
-    ``BboxFovMonitor.filled_snapshot``), it stops right there and holds
-    position in OFFBOARD forever (Ctrl+C to stop) instead of continuing to
-    the next waypoint -- getting closer from there would only push the bbox
-    past the margin.
+    ``approach_until_target``. Once the final waypoint is reached -- the
+    closest configured distance to the target -- it stops right there and
+    holds position in OFFBOARD forever (Ctrl+C to stop), instead of raising a
+    failure. The stopping point is fully determined by the configured
+    waypoint path (e.g. --waypoint-min-range-m / DRONE_TARGET_DISTANCE_M),
+    not by anything the cameras detect.
 
-    Every exit path -- margin filled, a waypoint/approach timeout, or an
-    exception -- zeroes velocity before returning/raising so a stale non-zero
-    setpoint is never the last thing PX4 heard from this process.
+    Every exit path -- reaching the end of the path, a waypoint/approach
+    timeout, or an exception -- zeroes velocity before returning/raising so a
+    stale non-zero setpoint is never the last thing PX4 heard from this
+    process.
     """
 
     period_s = 1.0 / args.setpoint_hz
@@ -941,28 +917,10 @@ def follow_waypoints_until_margin_filled(
                 flush=True,
             )
             while time.monotonic() < deadline:
+                raise_if_interrupted()
                 msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
                 if msg is not None:
                     last_pos = msg
-
-                filled, filled_reason = fov_monitor.filled_snapshot()
-                if filled:
-                    hold_x = float(last_pos.x) if last_pos is not None else x
-                    hold_y = float(last_pos.y) if last_pos is not None else y
-                    hold_z = float(last_pos.z) if last_pos is not None else z
-                    print(
-                        f"Safety margin filled on every side ({filled_reason}); "
-                        f"holding position north={hold_x:.1f}, east={hold_y:.1f}, "
-                        f"altitude={-hold_z:.1f} m in OFFBOARD (Ctrl+C to stop).",
-                        flush=True,
-                    )
-                    if distance_monitor is not None:
-                        distance_monitor.publish_phase("margin_filled_hover")
-                    stream_until_interrupted(
-                        args.setpoint_hz,
-                        lambda: send_position_setpoint(master, boot_time, hold_x, hold_y, hold_z),
-                    )
-                    return
 
                 fov_allowed, fov_reason = fov_monitor.snapshot()
                 remaining = None
@@ -999,12 +957,23 @@ def follow_waypoints_until_margin_filled(
                 time.sleep(period_s)
             else:
                 raise RuntimeError(
-                    f"Approach timed out before waypoint {index} was reached "
-                    "and the safety margin was never filled."
+                    f"Approach timed out before waypoint {index} was reached."
                 )
 
-        raise RuntimeError(
-            "All waypoints were flown but the safety margin was never filled."
+        hold_x, hold_y, hold_z = waypoints[-1]
+        if last_pos is not None:
+            hold_x, hold_y, hold_z = float(last_pos.x), float(last_pos.y), float(last_pos.z)
+        print(
+            f"Reached the final configured waypoint ({len(waypoints)}/{len(waypoints)}); "
+            f"holding position north={hold_x:.1f}, east={hold_y:.1f}, "
+            f"altitude={-hold_z:.1f} m in OFFBOARD (Ctrl+C to stop).",
+            flush=True,
+        )
+        if distance_monitor is not None:
+            distance_monitor.publish_phase("target_distance_reached_hover")
+        stream_until_interrupted(
+            args.setpoint_hz,
+            lambda: send_position_setpoint(master, boot_time, hold_x, hold_y, hold_z),
         )
     finally:
         send_local_velocity_setpoint(master, boot_time, 0.0, 0.0, 0.0)
@@ -1016,6 +985,7 @@ def wait_takeoff(master, boot_time, hz, x, y, target_z, timeout_s):
     deadline = time.monotonic() + timeout_s
     last_report = 0.0
     while time.monotonic() < deadline:
+        raise_if_interrupted()
         send_position_setpoint(master, boot_time, x, y, target_z)
         msg = master.recv_match(type="LOCAL_POSITION_NED", blocking=False)
         if msg is not None:
@@ -1034,6 +1004,7 @@ def wait_landed(master, timeout_s):
     print("Waiting for landing ...", flush=True)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        raise_if_interrupted()
         msg = master.recv_match(type="EXTENDED_SYS_STATE", blocking=True, timeout=1.0)
         if msg is None:
             continue
@@ -1108,7 +1079,7 @@ def run(args):
             )
             arm(master)
             distance_monitor.publish_phase("approach")
-            follow_waypoints_until_margin_filled(
+            follow_waypoints_to_final_position(
                 master, boot_time, args, waypoints, fov_monitor,
                 distance_monitor=distance_monitor,
             )
@@ -1191,6 +1162,8 @@ def run(args):
 
 def main():
     args = build_parser().parse_args()
+    signal.signal(signal.SIGINT, _request_interrupt)
+    signal.signal(signal.SIGTERM, _request_interrupt)
     try:
         run(args)
     except KeyboardInterrupt:

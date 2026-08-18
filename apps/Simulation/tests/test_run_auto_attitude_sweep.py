@@ -35,64 +35,142 @@ def test_auto_attitude_sweep_preserves_interactive_auto_recording_contract():
     assert 'auto_$(date +%Y%m%d_%H%M%S)_Full' in auto_source
     assert "run_auto_attitude_sweep.sh" in auto_source
     assert "SWEEP_RANDOMIZE" in source
-    assert "baseline-before" in source
-    assert "baseline-after" in source
+    assert "baseline-before" not in source
+    assert "baseline-after" not in source
     assert 'kill -TERM "$pid"' in source
     assert 'kill -INT "$pid"' not in source
     assert "--headless" not in source  # RViz/rqt_gui stay visible for every case.
     assert 'setsid env SIM_CONFIG="$SIM_CONFIG"' in source
-    assert 'Operator stack exited during Auto' in source
+    assert 'Operator stack exited during the mission' in source
     assert "validate_attitude_sweep_output.py" in source
     assert "SWEEP_FINALIZED_VALID" in source
-    assert "quick_requested" in source
-    assert 'auto_args+=(--target-distance-m "${DRONE_TARGET_DISTANCE_M:-500.0}")' in source
+    # The --quick/--target-distance-m shim existed only to patch around
+    # run_mission.sh --quick's stop distance conflicting with FOV-guard;
+    # irrelevant now that the mission runner has no FOV concept at all.
+    assert "quick_requested" not in source
+    assert 'auto_args+=(--target-distance-m "${DRONE_TARGET_DISTANCE_M:-500.0}")' not in source
 
 
-def test_auto_attitude_sweep_supports_combined_axis_and_geometry_diversity():
+def test_auto_attitude_sweep_flies_one_shared_deterministic_waypoint_path():
+    # Every case must fly the identical physical trajectory so recorded
+    # differences are attributable to attitude error alone -- not to a
+    # different flight path (generate_fov_constrained_waypoints.py is
+    # attitude-dependent) or to FOV-guard velocity gating (which could
+    # deadlock: drone stops -> view doesn't change -> stays gated forever).
     source = RUNNER.read_text(encoding="utf-8")
-    mission = (ROOT / "scripts" / "px4_auto_mission.py").read_text(encoding="utf-8")
-    mission_runner = (ROOT / "run_mission.sh").read_text(encoding="utf-8")
+    # Path generated exactly once, from baseline attitude, before any case
+    # (including the baseline case itself) runs.
+    assert source.count("scripts/generate_fov_constrained_waypoints.py") == 1
+    generate_pos = source.index("scripts/generate_fov_constrained_waypoints.py")
+    baseline_run_pos = source.index('run_case baseline 0 0')
+    assert generate_pos < baseline_run_pos
+    assert 'shared_path_file="$shared_waypoints_dir/validation_mission.csv"' in source
+    # Per-case invocation: the deterministic, camera/FOV-independent MAVLink
+    # waypoint follower -- no --fov-guard concept exists for it to take.
+    assert '"$ROOT_DIR/run_px4_waypoint_mission.sh"' in source
+    assert '--path-file "$shared_path_file"' in source
+    assert "--no-record" in source
+    assert "--hold-s 0" in source
+    assert "--ramp-s 0" in source
+    assert "--vertical-ramp-s 0" in source
+    assert "--fov-guard" not in source
+    assert '"$ROOT_DIR/run_auto.sh"' not in source
+    assert '"$ROOT_DIR/run_px4_waypoint_mission.sh" --check-connection' in source
+
+
+def test_auto_attitude_sweep_supports_combined_axis():
+    source = RUNNER.read_text(encoding="utf-8")
     assert "roll,pitch,yaw,combined" in source
-    assert 'combined) roll="$angle"; pitch="$angle"; yaw="$angle" ;;' in source
-    assert "--altitudes-m" in source
-    assert "--lateral-biases-m" in source
-    assert "SWEEP_ALTITUDES_M" in source
-    assert "SWEEP_LATERAL_BIASES_M" in source
-    assert "geometry_altitude_m" in source
-    assert "geometry_lateral_bias_m" in source
-    assert "altitude_requested" in source
-    assert "lateral_bias_requested" in source
+    assert 'combined) roll_offset="$angle"; pitch_offset="$angle"; yaw_offset="$angle" ;;' in source
+    # Sweep angles are errors added to the configured right-camera baseline
+    # (CAM_R_OPTICAL_*_DEG), not absolute attitudes -- see CAM_L/R_OPTICAL_*
+    # wiring below. The left camera stays at its own configured baseline.
+    assert 'left_roll="${CAM_L_OPTICAL_ROLL_DEG:-0.0}"' in source
+    assert 'roll="$(awk -v b="${CAM_R_OPTICAL_ROLL_DEG:-0.0}" -v o="$roll_offset"' in source
+    assert '"cam_l_optical_roll_deg:=$left_roll"' in source
     assert '"${case_auto_args[@]}"' in source
-    assert "--lateral-bias-m" in mission
-    assert "--lateral-bias-m" in mission_runner
+    # The FOV-guard waypoint path px4_auto_mission.py takes when run_auto.sh
+    # supplies --path-file never reaches args.altitude_m/args.lateral_bias_m
+    # (those only apply to the older straight-line approach), so the sweep
+    # no longer pretends to vary them per case -- geometry_altitude_m,
+    # geometry_lateral_bias_m, --altitudes-m, --lateral-biases-m, and their
+    # SWEEP_* env vars were removed as dead configuration.
+    for dead_token in (
+        "--altitudes-m",
+        "--lateral-biases-m",
+        "--lateral-sweep-amplitude-m",
+        "--lateral-sweep-period-s",
+        "SWEEP_ALTITUDES_M",
+        "SWEEP_LATERAL_BIASES_M",
+        "SWEEP_LATERAL_SWEEP_AMPLITUDE_M",
+        "SWEEP_LATERAL_SWEEP_PERIOD_S",
+        "geometry_altitude_m",
+        "geometry_lateral_bias_m",
+        "geometry_lateral_sweep_amplitude_m",
+        "geometry_index",
+        "pair_index",
+        "altitude_requested",
+        "lateral_bias_requested",
+        "lateral_sweep_requested",
+    ):
+        assert dead_token not in source, f"{dead_token!r} should have been removed as dead configuration"
 
 
-def test_auto_attitude_sweep_baseline_before_shares_geometry_with_its_condition():
+def test_auto_attitude_sweep_run_case_takes_no_geometry_index():
     source = RUNNER.read_text(encoding="utf-8")
-    assert 'local case_id="$1" axis="$2" angle="$3" repetition="$4" geometry_index="$5"' in source
+    assert 'local axis="$1" angle="$2" repetition="$3"' in source
+    assert 'run_case baseline 0 0' in source
+    assert 'run_case "$axis" "$value" "$repetition"' in source
+
+
+def test_auto_attitude_sweep_case_id_encodes_absolute_camera_attitude():
+    # case_id is built inside run_case from the actual absolute L/R camera
+    # attitude (not the axis+delta abstraction), so a directory listing is
+    # self-describing without cross-referencing the sweep's baseline config.
+    # "_" is the only structural separator; "-" and "." stay literal inside
+    # a value (e.g. "y-0.2") since they never collide with a delimiter.
+    source = RUNNER.read_text(encoding="utf-8")
+    assert "format_deg() {" in source
+    assert 'awk -v v="$1" \'BEGIN { printf "%g", v }\'' in source
+    assert 'attitude_token() {' in source
     assert (
-        'run_case "case-$(printf \'%03d\' "$case_index")-baseline-before" baseline 0 0 "$pair_index"'
+        "printf '%sr%sp%sy%s' \"$prefix\" \"$(format_deg \"$roll\")\" \"$(format_deg \"$pitch\")\" \"$(format_deg \"$yaw\")\""
         in source
     )
+    assert "compute_offset_attitude() {" in source
     assert (
-        'run_case "$case_id" "$axis" "$value" "$repetition" "$pair_index"' in source
+        'case_id="case-$(printf \'%03d\' "$case_index")_$(attitude_token L "$left_roll" "$left_pitch" "$left_yaw")_'
+        '$(attitude_token R "$roll" "$pitch" "$yaw")_repetition$(printf \'%02d\' "$repetition")"' in source
     )
-    # pair_index advances once per condition (after the paired case runs),
-    # not once per case, so baseline-before and its condition share geometry.
-    assert source.count("pair_index=$((pair_index + 1))") == 1
+    assert "format_value" not in source  # superseded by format_deg/attitude_token
 
 
-def test_auto_attitude_sweep_supports_active_lateral_sweep_within_fov_margin():
+def test_auto_attitude_sweep_baseline_runs_once_up_front():
+    # Corrected design: a single 0 deg baseline runs once, before the
+    # per-condition loop -- not once per condition (baseline-before) plus a
+    # closing baseline-after.
     source = RUNNER.read_text(encoding="utf-8")
+    assert source.count('run_case baseline 0 0') == 1
+    assert "completed_case=baseline" in source
+    # There are two "for condition_index in ...condition_order..." loops: an
+    # earlier one that only logs sweep_contract.txt provenance, and the real
+    # execution loop. Anchor on the main-loop counter init (unique) so this
+    # doesn't accidentally match the earlier, unrelated loop.
+    main_loop_start = source.index('case_index=0 failures=0 execution_order=0 completed_case=""')
+    baseline_pos = source.index('run_case baseline 0 0', main_loop_start)
+    loop_pos = source.index('for condition_index in "${condition_order[@]}"; do', main_loop_start)
+    assert main_loop_start < baseline_pos < loop_pos
+
+
+def test_auto_mission_still_supports_lateral_sweep_for_the_straight_line_path():
+    # --lateral-sweep-amplitude-m/-period-s remain a legitimate feature of
+    # px4_auto_mission.py's older straight-line approach (used when no
+    # --path-file/--waypoints-xy-alt is given); only run_auto_attitude_sweep.sh's
+    # dead per-case wiring of them was removed.
     mission = (ROOT / "scripts" / "px4_auto_mission.py").read_text(encoding="utf-8")
     mission_runner = (ROOT / "run_mission.sh").read_text(encoding="utf-8")
-    assert "--lateral-sweep-amplitude-m" in source
-    assert "--lateral-sweep-period-s" in source
-    assert "SWEEP_LATERAL_SWEEP_AMPLITUDE_M" in source
-    assert "SWEEP_LATERAL_SWEEP_PERIOD_S" in source
-    assert "geometry_lateral_sweep_amplitude_m" in source
-    assert "geometry_lateral_sweep_period_s" in source
-    assert "lateral_sweep_requested" in source
+    assert "--lateral-bias-m" in mission
+    assert "--lateral-bias-m" in mission_runner
     assert "def triangle_wave(elapsed_s, period_s, amplitude_m):" in mission
     assert "lateral_reference = args.lateral_bias_m + triangle_wave(" in mission
     # The safe-FOV guard remains the hard stop; the sweep only changes the
@@ -100,8 +178,6 @@ def test_auto_attitude_sweep_supports_active_lateral_sweep_within_fov_margin():
     assert "lateral_error = raw_lateral - lateral_reference" in mission
     assert "--lateral-sweep-amplitude-m" in mission_runner
     assert "--lateral-sweep-period-s" in mission_runner
-    assert "geometry_index % ${#altitudes_m[@]}" in source
-    assert "geometry_index % ${#lateral_biases_m[@]}" in source
 
 
 def test_research_node_has_an_explicit_graceful_signal_path():
@@ -145,10 +221,6 @@ def test_auto_attitude_sweep_exposes_stable_defaults_through_simulation_config()
         "SWEEP_SKIP_COLCON_BUILD",
         "SWEEP_KEEP_GOING",
         "SWEEP_FORCE_EXISTING_SIM",
-        "SWEEP_ALTITUDES_M",
-        "SWEEP_LATERAL_BIASES_M",
-        "SWEEP_LATERAL_SWEEP_AMPLITUDE_M",
-        "SWEEP_LATERAL_SWEEP_PERIOD_S",
     ):
         assert name in source
         assert name in config

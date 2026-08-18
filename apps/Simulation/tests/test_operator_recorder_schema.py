@@ -485,12 +485,15 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
                 "Right PX4",
                 "Camera Observations",
                 "Stereo Estimates",
-                "Quality Events",
                 "Rays",
                 "Performance",
                 "Config",
             ):
                 self.assertIn(f'name="{sheet_name}"', workbook_xml)
+            # "Quality Events" duplicated the same per-ray computation_status/
+            # failure_reason/gap_m/intersection_angle_deg data the "Rays"
+            # sheet already carries in full, so it was dropped as redundant.
+            self.assertNotIn('name="Quality Events"', workbook_xml)
             self.assertIn(result["csv_sha256"], worksheets_xml)
             self.assertIn("nominal_pose", worksheets_xml)
             self.assertIn("ground_truth_F_m", worksheets_xml)
@@ -507,6 +510,50 @@ class OperatorRecorderSchemaTests(unittest.TestCase):
             self.assertIn("gps_baseline", worksheets_xml)
             self.assertIn("global_baseline", worksheets_xml)
             self.assertIn("operational", worksheets_xml)
+            # UAM's own raw lat/lon/alt lead the sheet, immediately followed by
+            # its F/R/D/Rg block -- both ahead of the ten Ray-type blocks.
+            self.assertIn("uam_lat_deg", worksheets_xml)
+            self.assertIn("uam_lon_deg", worksheets_xml)
+            self.assertIn("uam_alt_m", worksheets_xml)
+            summary_fields = dict(module.XLSX_DIRECT_SHEET_FIELDS)["Summary"]
+            self.assertEqual(
+                summary_fields[2:9],
+                (
+                    "uam_lat_deg",
+                    "uam_lon_deg",
+                    "uam_alt_m",
+                    "uam_gps_F_m",
+                    "uam_gps_R_m",
+                    "uam_gps_D_m",
+                    "uam_gps_Rg_m",
+                ),
+            )
+            # All ten Ray types must appear in "Summary" (not just "Rays"),
+            # in the user-specified order: GT, ideal, optical, nominal,
+            # global_baseline, gps_baseline, attitude, operational,
+            # attitude_declination, attitude_true_north, operational_true_north.
+            expected_ray_order = (
+                "uam_gps",
+                "ground_truth",
+                "ideal",
+                "optical",
+                "nominal",
+                "global_baseline",
+                "gps_baseline",
+                "attitude",
+                "operational",
+                "attitude_declination",
+                "attitude_true_north",
+                "operational_true_north",
+            )
+            expected_summary_ray_fields = tuple(
+                f"{name}_{axis}_m" for name in expected_ray_order for axis in ("F", "R", "D", "Rg")
+            )
+            summary_ray_fields = tuple(f for f in summary_fields if f in expected_summary_ray_fields)
+            self.assertEqual(summary_ray_fields, expected_summary_ray_fields)
+            for name in expected_ray_order:
+                for axis in ("F", "R", "D", "Rg"):
+                    self.assertIn(f"{name}_{axis}_m", worksheets_xml)
             self.assertIn("failure_reason", worksheets_xml)
             self.assertIn("position_difference_m", worksheets_xml)
             self.assertIn("gt_forward_error_m", worksheets_xml)

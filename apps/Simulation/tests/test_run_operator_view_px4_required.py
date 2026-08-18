@@ -272,9 +272,12 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             events = marker.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        agent_index = next(index for index, event in enumerate(events) if event.startswith("uxrce-agent:"))
+        # Each PX4 instance gets its own MicroXRCEAgent, so all three must be
+        # up before any PX4 instance is started, not just the first one.
+        agent_indexes = [index for index, event in enumerate(events) if event.startswith("uxrce-agent:")]
+        self.assertEqual(len(agent_indexes), 3, events)
         px4_index = next(index for index, event in enumerate(events) if event.startswith("px4:"))
-        self.assertLess(agent_index, px4_index, events)
+        self.assertLess(max(agent_indexes), px4_index, events)
 
     def test_existing_but_invalid_px4_dir_exits_before_bootstrap_build_or_launch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -386,19 +389,20 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
         expected_cwd = str(px4_dir / "build" / "px4_sitl_default" / "src" / "modules" / "simulation" / "gz_bridge")
         self.assertTrue(all(f"cwd={expected_cwd}" in event for event in px4_events), px4_events)
         self.assertTrue(all("ip=127.0.0.1" in event for event in px4_events), px4_events)
-        self.assertTrue(any("px4:-d -i 0:" in event and "model=x500_2m" in event and "namespace=:" in event for event in px4_events), px4_events)
-        self.assertTrue(any("px4:-d -i 1:" in event and "model=left_stereo_camera" in event and "namespace=camera_left" in event for event in px4_events), px4_events)
-        self.assertTrue(any("px4:-d -i 2:" in event and "model=right_stereo_camera" in event and "namespace=camera_right" in event for event in px4_events), px4_events)
-        self.assertTrue(all("port=8888" in event for event in px4_events), px4_events)
+        self.assertTrue(any("px4:-d -i 0:" in event and "model=x500_2m" in event and "namespace=:" in event and "port=8888" in event for event in px4_events), px4_events)
+        self.assertTrue(any("px4:-d -i 1:" in event and "model=left_stereo_camera" in event and "namespace=camera_left" in event and "port=8889" in event for event in px4_events), px4_events)
+        self.assertTrue(any("px4:-d -i 2:" in event and "model=right_stereo_camera" in event and "namespace=camera_right" in event and "port=8890" in event for event in px4_events), px4_events)
         self.assertNotIn("mission-start", events)
 
-    def test_custom_uxrce_port_reaches_every_px4_instance(self) -> None:
+    def test_custom_uxrce_ports_reach_their_respective_px4_instance(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             launcher, marker, env = self.make_isolated_launcher(root)
             px4_dir = self.make_valid_px4_checkout(root)
             env["PX4_TEST_MARKER"] = str(marker)
             env["PX4_UXRCE_DDS_PORT"] = "9999"
+            env["CAM_L_PX4_UXRCE_DDS_PORT"] = "9998"
+            env["CAM_R_PX4_UXRCE_DDS_PORT"] = "9997"
             result = subprocess.run(
                 [str(launcher), "--px4-dir", str(px4_dir), "--headless", "--no-yolo"],
                 cwd=root,
@@ -411,10 +415,25 @@ class RunOperatorViewPx4RequiredTests(unittest.TestCase):
             events = marker.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(result.returncode, 0, result.stderr)
+        # Each PX4 instance gets its own MicroXRCEAgent process on its own
+        # port -- sharing one agent across all three instances let a
+        # newly-connecting instance's burst of entity-creation traffic starve
+        # an already-connected instance's ping/heartbeat handling long enough
+        # for the agent to disconnect it, with no reliable recovery.
         self.assertIn("uxrce-agent:udp4 -p 9999", events)
+        self.assertIn("uxrce-agent:udp4 -p 9998", events)
+        self.assertIn("uxrce-agent:udp4 -p 9997", events)
         px4_events = [event for event in events if event.startswith("px4:")]
         self.assertEqual(len(px4_events), 3, events)
-        self.assertTrue(all("port=9999" in event for event in px4_events), px4_events)
+        self.assertTrue(
+            any("px4:-d -i 0:" in event and "port=9999" in event for event in px4_events), px4_events
+        )
+        self.assertTrue(
+            any("px4:-d -i 1:" in event and "port=9998" in event for event in px4_events), px4_events
+        )
+        self.assertTrue(
+            any("px4:-d -i 2:" in event and "port=9997" in event for event in px4_events), px4_events
+        )
 
     def test_default_sim_gps_used_reaches_every_camera_instance_but_not_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

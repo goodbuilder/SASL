@@ -6,6 +6,8 @@ import time
 import types
 from pathlib import Path
 
+import pytest
+
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "px4_auto_mission.py"
 
@@ -34,6 +36,42 @@ def test_full_bbox_must_fit_inside_both_image_safe_regions() -> None:
     assert module.bbox_inside_safe_fov((100, 100, 1180, 620), 1280, 720, 0.05)
     assert not module.bbox_inside_safe_fov((40, 100, 500, 620), 1280, 720, 0.05)
     assert not module.bbox_inside_safe_fov((100, 100, 1180, 700), 1280, 720, 0.05)
+
+
+def test_interrupt_flag_stops_stream_until_interrupted_without_relying_on_os_delivery() -> None:
+    """SIGINT delivery is unreliable in this multi-threaded process (observed
+
+    via /proc/<pid>/status SigQ staying nonzero for minutes); the mission
+    must be stoppable purely by setting the module-level flag, independent
+    of whether the OS ever actually schedules the signal handler.
+    """
+    module = load_mission_module()
+    module._interrupted.clear()
+    calls = {"count": 0}
+
+    def callback():
+        calls["count"] += 1
+        if calls["count"] == 3:
+            module._interrupted.set()
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            module.stream_until_interrupted(1000.0, callback)
+        assert calls["count"] == 3
+    finally:
+        module._interrupted.clear()
+
+
+def test_request_interrupt_handler_sets_flag_directly() -> None:
+    module = load_mission_module()
+    module._interrupted.clear()
+    try:
+        module._request_interrupt(module.signal.SIGINT, None)
+        assert module._interrupted.is_set()
+        with pytest.raises(KeyboardInterrupt):
+            module.raise_if_interrupted()
+    finally:
+        module._interrupted.clear()
 
 
 def test_fov_monitor_does_not_gate_movement_without_a_fresh_pair() -> None:
