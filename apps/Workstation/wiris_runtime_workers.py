@@ -13,7 +13,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from statistics import median
 
@@ -750,11 +750,7 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         capture_channel: str = "hr",
         completion_timeout_s: float = 10.0,
         ftp_enabled: bool = False,
-        ftp_port: int = 21,
-        ftp_user: str = "anonymous",
-        ftp_password: str = "",
-        ftp_remote_dir: str = "/",
-        ftp_timeout_s: float = 10.0,
+        ftp_settings_by_label: Mapping[str, Mapping[str, object]] | None = None,
         ftp_output_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         super().__init__()
@@ -771,12 +767,13 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         # a failure here never turns an otherwise-successful CPTR capture
         # into a failed one, it only leaves ftp_downloaded False so the
         # operator falls back to the existing manual import path.
+        # Each camera runs its own local FTP account, so the connection
+        # settings are looked up per label (``left``/``right``) rather than
+        # shared across both cameras.
         self.ftp_enabled = bool(ftp_enabled)
-        self.ftp_port = int(ftp_port)
-        self.ftp_user = str(ftp_user) or "anonymous"
-        self.ftp_password = str(ftp_password)
-        self.ftp_remote_dir = str(ftp_remote_dir) or "/"
-        self.ftp_timeout_s = max(0.1, float(ftp_timeout_s))
+        self.ftp_settings_by_label: dict[str, dict[str, object]] = {
+            str(label): dict(config) for label, config in (ftp_settings_by_label or {}).items()
+        }
         self.ftp_output_dir = (
             None if ftp_output_dir is None else Path(ftp_output_dir) / f"{self.capture_channel}_capture"
         )
@@ -830,11 +827,17 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         if self.ftp_output_dir is None:
             raise RuntimeError("no local FTP download directory was configured")
         self.ftp_output_dir.mkdir(parents=True, exist_ok=True)
+        config = self.ftp_settings_by_label.get(label, {})
+        port = int(config.get("port", 21))
+        user = str(config.get("user") or "anonymous")
+        password = str(config.get("password", ""))
+        remote_dir = str(config.get("remote_dir") or "/")
+        timeout_s = max(0.1, float(config.get("timeout_s", 10.0)))
         with ftplib.FTP() as ftp:
-            ftp.connect(host, self.ftp_port, timeout=self.ftp_timeout_s)
-            ftp.login(user=self.ftp_user, passwd=self.ftp_password)
-            if self.ftp_remote_dir:
-                ftp.cwd(self.ftp_remote_dir)
+            ftp.connect(host, port, timeout=timeout_s)
+            ftp.login(user=user, passwd=password)
+            if remote_dir:
+                ftp.cwd(remote_dir)
             latest_name = self._latest_ftp_file_name(ftp)
             destination = self.ftp_output_dir / f"{self.capture_id}_{label}_{latest_name}"
             with destination.open("wb") as handle:
@@ -898,7 +901,11 @@ class WirisPnPPhotoCaptureWorker(QtCore.QObject):
         try:
             for thread in threads:
                 thread.start()
-            ftp_wait_budget_s = self.ftp_timeout_s * 2.0 if self.ftp_enabled else 0.0
+            max_ftp_timeout_s = max(
+                (float(config.get("timeout_s", 10.0)) for config in self.ftp_settings_by_label.values()),
+                default=10.0,
+            )
+            ftp_wait_budget_s = max_ftp_timeout_s * 2.0 if self.ftp_enabled else 0.0
             maximum_wait_s = self.completion_timeout_s + ftp_wait_budget_s + sum(
                 max(1.0, timeout_s) * 3.0
                 for _label, _host, _port, timeout_s in self.target_infos[:1]
@@ -949,11 +956,7 @@ class WirisOZPhotoCaptureWorker(WirisPnPPhotoCaptureWorker):
         capture_id: str,
         completion_timeout_s: float = 10.0,
         ftp_enabled: bool = False,
-        ftp_port: int = 21,
-        ftp_user: str = "anonymous",
-        ftp_password: str = "",
-        ftp_remote_dir: str = "/",
-        ftp_timeout_s: float = 10.0,
+        ftp_settings_by_label: Mapping[str, Mapping[str, object]] | None = None,
         ftp_output_dir: str | os.PathLike[str] | None = None,
     ) -> None:
         super().__init__(
@@ -963,11 +966,7 @@ class WirisOZPhotoCaptureWorker(WirisPnPPhotoCaptureWorker):
             capture_channel="oz",
             completion_timeout_s=completion_timeout_s,
             ftp_enabled=ftp_enabled,
-            ftp_port=ftp_port,
-            ftp_user=ftp_user,
-            ftp_password=ftp_password,
-            ftp_remote_dir=ftp_remote_dir,
-            ftp_timeout_s=ftp_timeout_s,
+            ftp_settings_by_label=ftp_settings_by_label,
             ftp_output_dir=ftp_output_dir,
         )
 

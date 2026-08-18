@@ -1052,6 +1052,8 @@ class RecordingController:
         The FTP server lives on the same WIRIS Enterprise host as the
         CPTR/ICPT command channel (only the port differs), so no separate
         host is needed here -- the worker reuses the host from target_infos.
+        Each camera has its own local FTP account, so the port/user/password/
+        remote dir/timeout are looked up per ``left``/``right`` label.
 
         ``output_dir`` lets a caller outside the Recording session (e.g.
         Calibration, whose save root is independent of any recording
@@ -1064,11 +1066,22 @@ class RecordingController:
             output_dir = self.panel._recording_session_dir(self.panel.recording_session_id) / "frames"
         return {
             "ftp_enabled": bool(getattr(settings, "wiris_ftp_enabled", False)),
-            "ftp_port": int(getattr(settings, "wiris_ftp_port", 21)),
-            "ftp_user": getattr(settings, "wiris_ftp_user", "anonymous"),
-            "ftp_password": getattr(settings, "wiris_ftp_password", ""),
-            "ftp_remote_dir": getattr(settings, "wiris_ftp_remote_dir", "/"),
-            "ftp_timeout_s": float(getattr(settings, "wiris_ftp_timeout_s", 10.0)),
+            "ftp_settings_by_label": {
+                "left": {
+                    "port": int(getattr(settings, "left_ftp_port", 21)),
+                    "user": getattr(settings, "left_ftp_user", "anonymous"),
+                    "password": getattr(settings, "left_ftp_password", ""),
+                    "remote_dir": getattr(settings, "left_ftp_remote_dir", "/"),
+                    "timeout_s": float(getattr(settings, "left_ftp_timeout_s", 10.0)),
+                },
+                "right": {
+                    "port": int(getattr(settings, "right_ftp_port", 21)),
+                    "user": getattr(settings, "right_ftp_user", "anonymous"),
+                    "password": getattr(settings, "right_ftp_password", ""),
+                    "remote_dir": getattr(settings, "right_ftp_remote_dir", "/"),
+                    "timeout_s": float(getattr(settings, "right_ftp_timeout_s", 10.0)),
+                },
+            },
             "ftp_output_dir": output_dir,
         }
 

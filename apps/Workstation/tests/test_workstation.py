@@ -4239,6 +4239,14 @@ def test_workstation_every_flat_app_setting_has_an_editable_surface() -> None:
         # toggles; this flat target remains only for older settings files and
         # the owner bridge.
         "gnss_base_rtcm_injection_target",
+        # The visible WIRIS FTP surface now exposes independent left/right
+        # camera credentials; these shared flat targets remain only as
+        # fallback defaults for older settings files.
+        "wiris_ftp_port",
+        "wiris_ftp_user",
+        "wiris_ftp_password",
+        "wiris_ftp_remote_dir",
+        "wiris_ftp_timeout_s",
     }
     flat_fields = {field.name for field in fields(AppSettings)} - {"gnss_operation"}
 

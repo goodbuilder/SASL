@@ -159,6 +159,8 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
         parent: QtWidgets.QWidget | None = None,
         *,
         hosts: dict[str, str] | None = None,
+        credentials: dict[str, dict[str, object]] | None = None,
+        initial_camera: str | None = None,
         port: int = 21,
         user: str = "anonymous",
         password: str = "",
@@ -169,8 +171,14 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
         self.setWindowTitle("WIRIS FTP Browser")
         self.resize(640, 480)
         self.selected_remote_dir: str | None = None
+        self.selected_camera_label: str | None = None
 
         self._hosts = dict(hosts or {})
+        # Each WIRIS camera can have its own FTP account, so switching the
+        # "Camera" combo also swaps in that camera's own port/user/password
+        # instead of leaving the previously-selected camera's credentials in
+        # place.
+        self._credentials = {label: dict(config) for label, config in (credentials or {}).items()}
         self._thread: QtCore.QThread | None = None
         self._worker: QtCore.QObject | None = None
         self._current_path = remote_dir or "/"
@@ -238,7 +246,8 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
         layout.addLayout(button_row)
 
         if self._hosts:
-            self.camera_combo.setCurrentIndex(0)
+            initial_index = self.camera_combo.findText(initial_camera or "")
+            self.camera_combo.setCurrentIndex(max(0, initial_index))
             self._apply_camera_selection(self.camera_combo.currentText())
         if self.host_edit.text().strip():
             self._start_listing()
@@ -247,6 +256,15 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
         host = self._hosts.get(label)
         if host:
             self.host_edit.setText(host)
+        config = self._credentials.get(label)
+        if config is not None:
+            self.port_spin.setValue(int(config.get("port", self.port_spin.value())))
+            self.user_edit.setText(str(config.get("user", self.user_edit.text())))
+            self.password_edit.setText(str(config.get("password", self.password_edit.text())))
+            self.timeout_spin.setValue(float(config.get("timeout_s", self.timeout_spin.value())))
+            remote_dir = str(config.get("remote_dir") or "/")
+            self._current_path = remote_dir
+            self.path_edit.setText(remote_dir)
 
     def _busy(self, busy: bool) -> None:
         for widget in (
@@ -401,4 +419,5 @@ class WirisFtpBrowserDialog(QtWidgets.QDialog):
 
     def _use_current_path(self) -> None:
         self.selected_remote_dir = self._current_path
+        self.selected_camera_label = self.camera_combo.currentText() or None
         self.accept()

@@ -59,12 +59,25 @@ class AppSettings:
     # WIRIS Enterprise's onboard FTP server, reached over the same host as
     # the TCP command channel above (different port only). Used to retrieve
     # a captured HR/OZ still after the camera reports it stored.
+    # Each camera has its own local FTP account (the login is set per-unit on
+    # the camera itself), so port/user/password/remote dir/timeout are kept
+    # separate per side; only the download toggle is shared.
     wiris_ftp_enabled: bool = False
     wiris_ftp_port: int = 21
     wiris_ftp_user: str = "anonymous"
     wiris_ftp_password: str = ""
     wiris_ftp_remote_dir: str = "/"
     wiris_ftp_timeout_s: float = 10.0
+    left_ftp_port: int = 21
+    right_ftp_port: int = 21
+    left_ftp_user: str = "anonymous"
+    right_ftp_user: str = "anonymous"
+    left_ftp_password: str = ""
+    right_ftp_password: str = ""
+    left_ftp_remote_dir: str = "/"
+    right_ftp_remote_dir: str = "/"
+    left_ftp_timeout_s: float = 10.0
+    right_ftp_timeout_s: float = 10.0
     yolo_device: str = "cpu"
     yolo_input_size: int = 416
     yolo_conf_threshold: float = 0.5
@@ -207,6 +220,34 @@ def load_settings(path: str | Path = DEFAULT_SETTINGS_PATH) -> AppSettings:
         wiris_ftp_password=str(payload.get("wiris_ftp_password", AppSettings.wiris_ftp_password)),
         wiris_ftp_remote_dir=str(payload.get("wiris_ftp_remote_dir", AppSettings.wiris_ftp_remote_dir)),
         wiris_ftp_timeout_s=float(payload.get("wiris_ftp_timeout_s", AppSettings.wiris_ftp_timeout_s)),
+        left_ftp_port=int(payload.get("left_ftp_port", payload.get("wiris_ftp_port", AppSettings.left_ftp_port))),
+        right_ftp_port=int(
+            payload.get("right_ftp_port", payload.get("wiris_ftp_port", AppSettings.right_ftp_port))
+        ),
+        left_ftp_user=str(payload.get("left_ftp_user", payload.get("wiris_ftp_user", AppSettings.left_ftp_user))),
+        right_ftp_user=str(
+            payload.get("right_ftp_user", payload.get("wiris_ftp_user", AppSettings.right_ftp_user))
+        ),
+        left_ftp_password=str(
+            payload.get("left_ftp_password", payload.get("wiris_ftp_password", AppSettings.left_ftp_password))
+        ),
+        right_ftp_password=str(
+            payload.get("right_ftp_password", payload.get("wiris_ftp_password", AppSettings.right_ftp_password))
+        ),
+        left_ftp_remote_dir=str(
+            payload.get("left_ftp_remote_dir", payload.get("wiris_ftp_remote_dir", AppSettings.left_ftp_remote_dir))
+        ),
+        right_ftp_remote_dir=str(
+            payload.get(
+                "right_ftp_remote_dir", payload.get("wiris_ftp_remote_dir", AppSettings.right_ftp_remote_dir)
+            )
+        ),
+        left_ftp_timeout_s=float(
+            payload.get("left_ftp_timeout_s", payload.get("wiris_ftp_timeout_s", AppSettings.left_ftp_timeout_s))
+        ),
+        right_ftp_timeout_s=float(
+            payload.get("right_ftp_timeout_s", payload.get("wiris_ftp_timeout_s", AppSettings.right_ftp_timeout_s))
+        ),
         yolo_device=str(payload.get("yolo_device", AppSettings.yolo_device)),
         yolo_input_size=int(payload.get("yolo_input_size", AppSettings.yolo_input_size)),
         yolo_conf_threshold=float(payload.get("yolo_conf_threshold", AppSettings.yolo_conf_threshold)),

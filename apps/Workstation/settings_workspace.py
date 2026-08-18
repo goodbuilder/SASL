@@ -274,40 +274,85 @@ class SettingsWorkspace(QtWidgets.QWidget):
                 "WIRIS FTP (HR/OZ capture download)",
                 [
                     ("Enable FTP download", self._toggle("wiris_ftp_enabled", "Download captured stills after HR/OZ capture")),
-                    ("FTP port", self._integer("wiris_ftp_port", 1, 65535)),
-                    ("FTP user", self._text("wiris_ftp_user")),
-                    ("FTP password", self._text("wiris_ftp_password", password=True)),
-                    ("FTP remote dir", self._text("wiris_ftp_remote_dir", placeholder="/")),
-                    ("FTP timeout", self._number("wiris_ftp_timeout_s", 0.5, 60.0, 1, " s")),
-                    ("", self._ftp_browse_button()),
+                ],
+            )
+        )
+        # Each WIRIS camera has its own local FTP account (set on the unit
+        # itself), so the connection settings are per-side rather than a
+        # single value applied to both hosts.
+        layout.addWidget(
+            self._group(
+                "Left WIRIS FTP",
+                [
+                    ("FTP port", self._integer("left_ftp_port", 1, 65535)),
+                    ("FTP user", self._text("left_ftp_user")),
+                    ("FTP password", self._text("left_ftp_password", password=True)),
+                    ("FTP remote dir", self._text("left_ftp_remote_dir", placeholder="/")),
+                    ("FTP timeout", self._number("left_ftp_timeout_s", 0.5, 60.0, 1, " s")),
+                    ("", self._ftp_browse_button("Left")),
+                ],
+            )
+        )
+        layout.addWidget(
+            self._group(
+                "Right WIRIS FTP",
+                [
+                    ("FTP port", self._integer("right_ftp_port", 1, 65535)),
+                    ("FTP user", self._text("right_ftp_user")),
+                    ("FTP password", self._text("right_ftp_password", password=True)),
+                    ("FTP remote dir", self._text("right_ftp_remote_dir", placeholder="/")),
+                    ("FTP timeout", self._number("right_ftp_timeout_s", 0.5, 60.0, 1, " s")),
+                    ("", self._ftp_browse_button("Right")),
                 ],
             )
         )
         layout.addStretch(1)
 
-    def _ftp_browse_button(self) -> QtWidgets.QPushButton:
+    def _ftp_browse_button(self, side: str) -> QtWidgets.QPushButton:
         button = QtWidgets.QPushButton("Browse FTP...")
         button.setToolTip("Open a live FTP browser to explore the camera and find the right remote dir.")
-        button.clicked.connect(self._open_wiris_ftp_browser)
+        button.clicked.connect(lambda: self._open_wiris_ftp_browser(side))
         return button
 
-    def _open_wiris_ftp_browser(self) -> None:
+    def _open_wiris_ftp_browser(self, initial_side: str) -> None:
         hosts = {
             "Left": self.settings_widgets["left_control_host"].text().strip(),
             "Right": self.settings_widgets["right_control_host"].text().strip(),
         }
         hosts = {label: host for label, host in hosts.items() if host}
+        credentials = {
+            "Left": {
+                "port": self.settings_widgets["left_ftp_port"].value(),
+                "user": self.settings_widgets["left_ftp_user"].text(),
+                "password": self.settings_widgets["left_ftp_password"].text(),
+                "remote_dir": self.settings_widgets["left_ftp_remote_dir"].text() or "/",
+                "timeout_s": self.settings_widgets["left_ftp_timeout_s"].value(),
+            },
+            "Right": {
+                "port": self.settings_widgets["right_ftp_port"].value(),
+                "user": self.settings_widgets["right_ftp_user"].text(),
+                "password": self.settings_widgets["right_ftp_password"].text(),
+                "remote_dir": self.settings_widgets["right_ftp_remote_dir"].text() or "/",
+                "timeout_s": self.settings_widgets["right_ftp_timeout_s"].value(),
+            },
+        }
+        initial = credentials.get(initial_side, {})
         dialog = WirisFtpBrowserDialog(
             self,
             hosts=hosts,
-            port=self.settings_widgets["wiris_ftp_port"].value(),
-            user=self.settings_widgets["wiris_ftp_user"].text(),
-            password=self.settings_widgets["wiris_ftp_password"].text(),
-            remote_dir=self.settings_widgets["wiris_ftp_remote_dir"].text() or "/",
-            timeout_s=self.settings_widgets["wiris_ftp_timeout_s"].value(),
+            credentials=credentials,
+            initial_camera=initial_side,
+            port=initial.get("port", 21),
+            user=initial.get("user", "anonymous"),
+            password=initial.get("password", ""),
+            remote_dir=initial.get("remote_dir") or "/",
+            timeout_s=initial.get("timeout_s", 10.0),
         )
         if dialog.exec_() == QtWidgets.QDialog.Accepted and dialog.selected_remote_dir:
-            self.settings_widgets["wiris_ftp_remote_dir"].setText(dialog.selected_remote_dir)
+            side = dialog.selected_camera_label or initial_side
+            key = f"{side.lower()}_ftp_remote_dir"
+            if key in self.settings_widgets:
+                self.settings_widgets[key].setText(dialog.selected_remote_dir)
 
     def _build_yolo_tab(self) -> None:
         layout = self._tab("YOLO / RTSP")
