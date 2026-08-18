@@ -1679,21 +1679,28 @@ class RecordingController:
 
     @QtCore.pyqtSlot(object)
     def _handle_session_saved(self, saved_files: SavedSessionFiles) -> None:
+        # Parquet writing is disabled (see WRITE_PARQUET_ARTIFACTS in
+        # workstation_core/recording_session.py); the paths still exist on
+        # SavedSessionFiles for a stable interface, but nothing is written
+        # there, so don't log them as saved.
+        parquet_written = saved_files.distance_measurements_parquet.exists()
         self.panel._log(
-            "[저장] 거리 측정 compact CSV/Parquet을 저장했습니다: "
-            f"csv={saved_files.distance_measurements_csv}, "
-            f"parquet={saved_files.distance_measurements_parquet}"
+            f"[저장] 거리 측정 compact CSV{'/Parquet' if parquet_written else ''}을 저장했습니다: "
+            f"csv={saved_files.distance_measurements_csv}"
+            + (f", parquet={saved_files.distance_measurements_parquet}" if parquet_written else "")
         )
         self.panel._log(f"[저장] 세션 고정 JSON을 저장했습니다: {saved_files.session_static_json}")
         self.panel._log(
-            "[저장] GUI 전달 카메라 프레임 CSV/Parquet을 저장했습니다: "
-            f"left={saved_files.camera_left_csv}/{saved_files.camera_left_parquet}, "
-            f"right={saved_files.camera_right_csv}/{saved_files.camera_right_parquet}"
+            f"[저장] GUI 전달 카메라 프레임 CSV{'/Parquet' if parquet_written else ''}을 저장했습니다: "
+            f"left={saved_files.camera_left_csv}" + (f"/{saved_files.camera_left_parquet}" if parquet_written else "")
+            + f", right={saved_files.camera_right_csv}"
+            + (f"/{saved_files.camera_right_parquet}" if parquet_written else "")
         )
         self.panel._log(
-            "[저장] PX4 타임라인 CSV/Parquet을 저장했습니다: "
-            f"left={saved_files.px4_left_csv}/{saved_files.px4_left_parquet}, "
-            f"right={saved_files.px4_right_csv}/{saved_files.px4_right_parquet}"
+            f"[저장] PX4 타임라인 CSV{'/Parquet' if parquet_written else ''}을 저장했습니다: "
+            f"left={saved_files.px4_left_csv}" + (f"/{saved_files.px4_left_parquet}" if parquet_written else "")
+            + f", right={saved_files.px4_right_csv}"
+            + (f"/{saved_files.px4_right_parquet}" if parquet_written else "")
         )
         self.panel._log(f"[저장] 세션 manifest를 저장했습니다: {saved_files.manifest}")
         if saved_files.finalized:

@@ -21,6 +21,13 @@ import pyarrow.parquet as pq
 import xlsxwriter
 
 
+# Solo-team project; nothing in this repo (or downstream of it) reads the
+# .parquet session artifacts back -- CSV already covers every consumer.
+# Flip back to True to resume writing them (write_parquet/the workbook code
+# is untouched, only the write-time gating and manifest bookkeeping below
+# skip it).
+WRITE_PARQUET_ARTIFACTS = False
+
 PAIR_AXIS_COLUMNS = ("sample_index", "session_elapsed_s")
 DISTANCE_MEASUREMENT_COLUMNS = (
     "sample_index",
@@ -1371,6 +1378,7 @@ def session_sheet_previews(
     *,
     camera_rows: dict[str, Sequence[dict[str, object]]] | None = None,
     px4_rows: dict[str, Sequence[dict[str, object]]] | None = None,
+    gnss_base_rows: Sequence[dict[str, object]] | None = None,
     extrinsics_comparison_rows: Sequence[dict[str, object]] | None = None,
 ) -> list[SessionSheetPreview]:
     """Describe the sheets ``write_session_workbook`` would produce.
@@ -1408,6 +1416,13 @@ def session_sheet_previews(
                 columns=tuple(PX4_TIMELINE_COMPACT_COLUMNS),
             )
         )
+    previews.append(
+        SessionSheetPreview(
+            name="GnssBase",
+            kind="table",
+            columns=tuple(GNSS_BASE_COMPACT_COLUMNS),
+        )
+    )
     previews.extend(
         SessionSheetPreview(
             name=f"{name}Static",
@@ -1813,10 +1828,12 @@ def _write_xlsx(
     *,
     camera_rows: dict[str, list[dict[str, object]]] | None = None,
     px4_rows: dict[str, list[dict[str, object]]] | None = None,
+    gnss_base_rows: list[dict[str, object]] | None = None,
     extrinsics_comparison_rows: Sequence[dict[str, object]] | None = None,
 ) -> None:
     camera_rows = camera_rows or {}
     px4_rows = px4_rows or {}
+    gnss_base_rows = gnss_base_rows or []
     extrinsics_comparison_rows = extrinsics_comparison_rows or ()
     sheet_rows = {
         "DistanceMeasurements": distance_rows,
@@ -1824,6 +1841,7 @@ def _write_xlsx(
         "CameraRight": camera_rows.get("right", []),
         "Px4Left": px4_rows.get("left", []),
         "Px4Right": px4_rows.get("right", []),
+        "GnssBase": gnss_base_rows,
     }
     for sheet_name, _method, method_rows in _extrinsics_comparison_sheet_groups(
         extrinsics_comparison_rows
@@ -1834,6 +1852,7 @@ def _write_xlsx(
         distance_rows,
         camera_rows=camera_rows,
         px4_rows=px4_rows,
+        gnss_base_rows=gnss_base_rows,
         extrinsics_comparison_rows=extrinsics_comparison_rows,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -2075,6 +2094,17 @@ def save_session_files(
         "raw_extrinsics_comparison_rows_jsonl": raw_extrinsics_comparison_output.name,
         "workbook": xlsx_output.name,
     }
+    if not WRITE_PARQUET_ARTIFACTS:
+        for key in (
+            "distance_measurements_parquet",
+            "camera_left_parquet",
+            "camera_right_parquet",
+            "px4_left_parquet",
+            "px4_right_parquet",
+            "gnss_base_parquet",
+            "extrinsics_comparison_parquet",
+        ):
+            resource_files.pop(key, None)
     _cleanup_finalize_orphans(output_dir)
     generation_id = session_id_now()
     generations_root = output_dir / ".generations"
@@ -2095,17 +2125,21 @@ def save_session_files(
         ),
     )
     parquet_names_and_rows = (
-        (distance_parquet_output.name, compact_distance_rows, DISTANCE_MEASUREMENT_COLUMNS),
-        (camera_left_parquet_output.name, compact_camera_rows["left"], CAMERA_TIMELINE_COMPACT_COLUMNS),
-        (camera_right_parquet_output.name, compact_camera_rows["right"], CAMERA_TIMELINE_COMPACT_COLUMNS),
-        (px4_left_parquet_output.name, compact_px4_rows["left"], PX4_TIMELINE_COMPACT_COLUMNS),
-        (px4_right_parquet_output.name, compact_px4_rows["right"], PX4_TIMELINE_COMPACT_COLUMNS),
-        (gnss_base_parquet_output.name, compact_gnss_base_row_list, GNSS_BASE_COMPACT_COLUMNS),
         (
-            extrinsics_comparison_parquet_output.name,
-            extrinsics_comparison_full_rows,
-            EXTRINSICS_COMPARISON_COMPACT_COLUMNS,
-        ),
+            (distance_parquet_output.name, compact_distance_rows, DISTANCE_MEASUREMENT_COLUMNS),
+            (camera_left_parquet_output.name, compact_camera_rows["left"], CAMERA_TIMELINE_COMPACT_COLUMNS),
+            (camera_right_parquet_output.name, compact_camera_rows["right"], CAMERA_TIMELINE_COMPACT_COLUMNS),
+            (px4_left_parquet_output.name, compact_px4_rows["left"], PX4_TIMELINE_COMPACT_COLUMNS),
+            (px4_right_parquet_output.name, compact_px4_rows["right"], PX4_TIMELINE_COMPACT_COLUMNS),
+            (gnss_base_parquet_output.name, compact_gnss_base_row_list, GNSS_BASE_COMPACT_COLUMNS),
+            (
+                extrinsics_comparison_parquet_output.name,
+                extrinsics_comparison_full_rows,
+                EXTRINSICS_COMPARISON_COMPACT_COLUMNS,
+            ),
+        )
+        if WRITE_PARQUET_ARTIFACTS
+        else ()
     )
     raw_jsonl_names_and_rows = (
         (
@@ -2189,6 +2223,18 @@ def save_session_files(
             xlsx_output.name: "integrated_review_workbook",
         },
     }
+    if not WRITE_PARQUET_ARTIFACTS:
+        artifact_roles = manifest["artifact_roles"]  # type: ignore[assignment]
+        for name in (
+            distance_parquet_output.name,
+            camera_left_parquet_output.name,
+            camera_right_parquet_output.name,
+            px4_left_parquet_output.name,
+            px4_right_parquet_output.name,
+            gnss_base_parquet_output.name,
+            extrinsics_comparison_parquet_output.name,
+        ):
+            artifact_roles.pop(name, None)  # type: ignore[union-attr]
     authoritative_raw_artifacts_verified = False
     try:
         _write_session_static_json(
@@ -2246,6 +2292,7 @@ def save_session_files(
             compact_distance_rows,
             camera_rows=compact_camera_rows,
             px4_rows=compact_px4_rows,
+            gnss_base_rows=compact_gnss_base_row_list,
             extrinsics_comparison_rows=extrinsics_comparison_full_rows,
         )
         manifest["artifacts"][xlsx_output.name] = "prepared"  # type: ignore[index]
