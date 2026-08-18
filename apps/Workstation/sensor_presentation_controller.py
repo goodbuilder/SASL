@@ -276,6 +276,7 @@ class SensorPresentationController:
                 "sample_app_timestamp_s": timestamp_s,
                 "sample_px4_timestamp_s": self.panel._fmt_record_float(px4_timestamp_s, 6),
                 "device_id": "" if getattr(state, "device_id", None) is None else state.device_id,
+                "node_id": "" if getattr(state, "node_id", None) is None else state.node_id,
                 "mag_device_type": device_type,
                 "mag_value_units": (
                     "gauss"
