@@ -102,13 +102,34 @@ Workstation-side counterpart:
   (`xmag`/`ymag`/`zmag`/`can_port`/`device_id`/`node_id`/`time_usec`) already
   matched.
 
-Not yet verified on real hardware (flash this build first):
+## 2026-08-18 Hardware Finding - Pixhawk 1 (left/P1)
 
-- CAN1/CAN2 magnet-proximity isolation (each port's `SASL_CAN_MAG` should
-  move independently)
+Flashed via QGC's custom firmware file flow (Ethernet MAVLink was already
+provisioned on this vehicle from earlier work -- SD card `net.cfg`/
+`extras.txt` and the saved `MAV_2_CONFIG=1000` param survived the reflash,
+so it reconnected over ETH without needing to redo USB bootstrap).
+
+Confirmed:
+
+- PX4 accepts `MAV_CMD_SET_MESSAGE_INTERVAL` for the private message id
+  (180) from Workstation's stream-request path -- `SASL_CAN_MAG` streams
+  live once Workstation connects, no firmware-side rejection.
+- CAN1/CAN2 magnet-proximity isolation: holding a magnet near one CAN port's
+  RM3100 moves only that port's panel reading; the other port's reading
+  stays put. Checked both directions (CAN1-only, then CAN2-only).
+- Workstation-side dedicated-sample priority (the `_mag_slot_state` fix in
+  `sensor_presentation_controller.py`) holds under live traffic: the CAN2
+  label stays on the `SASL_CAN_MAG` reading and does not flicker back to the
+  concurrent, port-ambiguous `SCALED_IMU2` stream.
+
+Still not yet verified on real hardware:
+
 - node_id/device_id distinguish the two sensors correctly over the air
+  (isolation was confirmed by physical magnet placement, not yet by reading
+  back node_id/device_id values themselves)
 - Independent per-port timestamps hold up under sustained streaming
 - No regression to `sensor_mag`/EKF/`SCALED_IMU*` (code review says untouched,
-  but not flight/bench re-verified after this specific build)
-- PX4 accepts `MAV_CMD_SET_MESSAGE_INTERVAL` for the private message id (180)
-  from Workstation's stream-request path
+  but not flight-verified after this specific build)
+- Pixhawk 2 (right/P2) has not been flashed yet -- see
+  `../px4_fmu-v6c_sasl_can_mag/MANIFEST.md` or reflash this same v6x build if
+  P2 is also v6X hardware
