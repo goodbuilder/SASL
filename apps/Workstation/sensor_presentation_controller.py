@@ -240,7 +240,7 @@ class SensorPresentationController:
                 self.panel.latest_vehicle_mag_device_ids[camera] = int(state.device_id)
                 self.panel.refresh_px4_mag_manager(camera)
         sensor_slot = str(getattr(state, "sensor_slot", ""))
-        device_id, device_source = self.panel._mag_state_display_device_id(camera, state)
+        device_id = self.panel._mag_state_display_device_id(camera, state)[0]
         device_type = self.panel._magnetometer_device_type(sensor_slot, device_id)
         is_dedicated_can_mag = any(
             message_name in topic.upper() for message_name in ("CAN_MAG", "CAN_MAGNETOMETER", "SASL_CAN_MAG")
@@ -300,25 +300,41 @@ class SensorPresentationController:
             table = self.panel.px4_mag_tables.get(camera) if hasattr(self.panel, "px4_mag_tables") else None
             if table is not None and table.rowCount() == 0 and self.panel._mag_state_display_device_id(camera, state)[0] is not None:
                 self.panel.refresh_px4_mag_manager(camera)
-        self.panel.magnetometer_monitor.update(camera, state)
-        label = self.panel.mag_sensor_labels.get(camera, {}).get(state.sensor_slot)
-        age_ms = max(0.0, time.monotonic() - state.timestamp_s) * 1000.0
+        # A dedicated CAN_MAG/SASL_CAN_MAG sample for this slot must keep winning
+        # over legacy SCALED_IMU-labeled samples regardless of arrival order --
+        # same precedence as _mag_slot_state, reused here so the live label,
+        # plots, and magnetometer_monitor (which feeds the CAN1/CAN2 difference
+        # calibration metric) never regress to a stale/coincidental legacy read.
+        # ``state`` (the raw message just received) is still used above for
+        # timeline logging and device-id inference, which must reflect what was
+        # actually received rather than the winning cached sample.
+        display_state = self.panel._mag_slot_state(camera, sensor_slot)
+        if display_state is None:
+            display_state = state
+        display_device_id, display_device_source = self.panel._mag_state_display_device_id(camera, display_state)
+        self.panel.magnetometer_monitor.update(camera, display_state)
+        label = self.panel.mag_sensor_labels.get(camera, {}).get(display_state.sensor_slot)
+        age_ms = max(0.0, time.monotonic() - display_state.timestamp_s) * 1000.0
         components = "x/y/z=waiting"
-        if state.x is not None and state.y is not None and state.z is not None:
-            components = f"x/y/z={state.x:.3f}/{state.y:.3f}/{state.z:.3f}"
-        vector_norm = f" norm={state.magnitude:.3f}" if state.magnitude is not None else ""
-        device = "" if device_id is None else f" device={device_id} ({device_source})"
+        if display_state.x is not None and display_state.y is not None and display_state.z is not None:
+            components = f"x/y/z={display_state.x:.3f}/{display_state.y:.3f}/{display_state.z:.3f}"
+        vector_norm = f" norm={display_state.magnitude:.3f}" if display_state.magnitude is not None else ""
+        device = "" if display_device_id is None else f" device={display_device_id} ({display_device_source})"
         text = f"{components}{vector_norm}, age={age_ms:.0f}ms{device}"
         if label is not None:
             label.setText(text)
-        if state.magnitude is not None:
+        if display_state.magnitude is not None:
             legacy_plot = self.panel.mag_sensor_plots.get(camera)
             if legacy_plot is not None:
-                legacy_plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.magnitude))
+                legacy_plot.add_point(
+                    TelemetryHistoryPoint(display_state.timestamp_s, display_state.sensor_slot, display_state.magnitude)
+                )
             if hasattr(self.panel, "rm3100_norm_plots"):
                 plot = self.panel.rm3100_norm_plots.get(camera)
                 if plot is not None:
-                    plot.add_point(TelemetryHistoryPoint(state.timestamp_s, state.sensor_slot, state.magnitude))
+                    plot.add_point(
+                        TelemetryHistoryPoint(display_state.timestamp_s, display_state.sensor_slot, display_state.magnitude)
+                    )
         self.panel._refresh_pixhawk_sensor_health()
         self.panel._refresh_alignment_workflow_status()
         self.panel._refresh_alignment_magnetometer_ui()

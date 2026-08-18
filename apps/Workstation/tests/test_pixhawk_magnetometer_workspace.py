@@ -309,6 +309,101 @@ def test_can_magnetometer_evidence_requires_dedicated_message_and_times_out() ->
     assert "SCALED_IMU" not in str(rows[0]["source"])
 
 
+def test_dedicated_can_mag_sample_wins_over_legacy_scaled_imu_regardless_of_arrival_order() -> None:
+    """A SASL_CAN_MAG sample must keep winning the CAN2 label/plot/monitor.
+
+    Once a dedicated sample exists for a slot, a stock SCALED_IMU2 message
+    that happens to arrive afterwards (untouched firmware behaviour running
+    in parallel to SASL_CAN_MAG) must not regress the label, plots, or the
+    magnetometer_monitor calibration feed back to the legacy, port-ambiguous
+    reading -- see sensor_presentation_controller._update_mag_sensor's
+    ``display_state`` resolution via ``panel._mag_slot_state``.
+    """
+
+    from Workstation.sensor_presentation_controller import SensorPresentationController
+
+    class _FakeMonitor:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def update(self, camera: str, state: object) -> None:
+            self.calls.append((camera, state))
+
+    class _FakePlot:
+        def __init__(self) -> None:
+            self.points: list[object] = []
+
+        def add_point(self, point: object) -> None:
+            self.points.append(point)
+
+    class _FakePanel:
+        def __init__(self) -> None:
+            self.latest_mag_sensors = {"left": {}, "right": {}}
+            self.latest_can_mag_sensors = {"left": {}, "right": {}}
+            self.latest_vehicle_mag_device_ids = {"left": None, "right": None}
+            self.mag_sensor_labels = {"left": {"CAN2": QtWidgets.QLabel()}, "right": {}}
+            self.mag_sensor_plots = {"left": _FakePlot(), "right": _FakePlot()}
+            self.rm3100_norm_plots = {"left": _FakePlot(), "right": _FakePlot()}
+            self.magnetometer_monitor = _FakeMonitor()
+
+        def _mag_state_display_device_id(self, camera, state):
+            device_id = getattr(state, "device_id", None)
+            return (device_id, "telemetry") if device_id is not None else (None, "unknown")
+
+        def _magnetometer_device_type(self, slot, device_id):
+            return "rm3100" if device_id is not None else "unknown"
+
+        def _mag_slot_state(self, camera, slot):
+            if slot in ("CAN1", "CAN2"):
+                dedicated = self.latest_can_mag_sensors.get(camera, {}).get(slot)
+                if dedicated is not None:
+                    return dedicated
+            return self.latest_mag_sensors.get(camera, {}).get(slot)
+
+        def _record_external_timeline_row(self, *args, **kwargs) -> None:
+            pass
+
+        def refresh_px4_mag_manager(self, camera: str) -> None:
+            pass
+
+        def _fmt_record_float(self, value, digits):
+            return "" if value is None else f"{value:.{digits}f}"
+
+        def _refresh_pixhawk_sensor_health(self) -> None:
+            pass
+
+        def _refresh_alignment_workflow_status(self) -> None:
+            pass
+
+        def _refresh_alignment_magnetometer_ui(self) -> None:
+            pass
+
+        def _refresh_alignment_overview(self) -> None:
+            pass
+
+    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
+    panel = _FakePanel()
+    controller = SensorPresentationController(panel)
+
+    dedicated = _can_mag_state(
+        slot="CAN2", topic="mavlink/SASL_CAN_MAG", timestamp_s=100.0, x=0.010, y=-0.020, z=0.030
+    )
+    controller._update_mag_sensor("left", dedicated)
+
+    legacy = _mag_state(
+        slot="CAN2", topic="mavlink/SCALED_IMU2", timestamp_s=100.5, x=-4.0, y=5.0, z=-6.0
+    )
+    controller._update_mag_sensor("left", legacy)
+
+    assert panel.magnetometer_monitor.calls[-1] == ("left", dedicated)
+    assert "0.010" in panel.mag_sensor_labels["left"]["CAN2"].text()
+    assert "-4.000" not in panel.mag_sensor_labels["left"]["CAN2"].text()
+    assert panel.mag_sensor_plots["left"].points[-1].value == dedicated.magnitude
+    assert panel.rm3100_norm_plots["left"].points[-1].value == dedicated.magnitude
+
+    app.processEvents()
+
+
 def test_can_magnetometer_mavlink_decoder_keeps_port_and_device_identity() -> None:
     message = SimpleNamespace(
         can_port=2,
