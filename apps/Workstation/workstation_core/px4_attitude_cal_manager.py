@@ -9,6 +9,20 @@ GYRO_SLOTS = (0, 1, 2)
 
 ACCEL_AXIS_SUFFIXES = ("ROT", "XOFF", "YOFF", "ZOFF", "XSCALE", "YSCALE", "ZSCALE")
 GYRO_AXIS_SUFFIXES = ("ROT", "XOFF", "YOFF", "ZOFF")
+# Calibration-fit offset/scale only -- excludes _ROT (external mounting
+# orientation, a manual descriptor like SENS_BOARD_ROT, not a calibration
+# output). Resetting only these to their firmware defaults (0 offset, 1
+# scale) makes PX4 apply an identity transform -- i.e. pass the raw sensor
+# reading through -- without touching _ID/_PRIO, so the slot stays bound to
+# its physical device and armable.
+ACCEL_CORRECTION_SUFFIXES = ("XOFF", "YOFF", "ZOFF", "XSCALE", "YSCALE", "ZSCALE")
+GYRO_CORRECTION_SUFFIXES = ("XOFF", "YOFF", "ZOFF")
+ACCEL_CORRECTION_PARAM_NAMES = tuple(
+    f"CAL_ACC{slot}_{suffix}" for slot in ACC_SLOTS for suffix in ACCEL_CORRECTION_SUFFIXES
+)
+GYRO_CORRECTION_PARAM_NAMES = tuple(
+    f"CAL_GYRO{slot}_{suffix}" for slot in GYRO_SLOTS for suffix in GYRO_CORRECTION_SUFFIXES
+)
 # PX4's level-horizon calibration owns the board roll/pitch fine-tuning
 # offsets.  SENS_BOARD_Z_OFF remains a manual mounting parameter.
 LEVEL_HORIZON_RESET_PARAM_NAMES = (

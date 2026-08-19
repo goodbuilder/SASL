@@ -1354,7 +1354,8 @@ class DeviceRuntimeController:
                 f"{camera_label_ko(camera)}의 {calibration.label} 파라미터를 PX4 firmware default로 초기화합니다.\n\n"
                 f"대상: {parameter_text}\n"
                 f"{calibration.description}\n"
-                "QGC에서 수행한 해당 캘리브레이션 결과가 삭제되며, 이후 재캘리브레이션이 필요합니다.\n"
+                "센서 device_id/priority는 그대로 유지되므로 재캘리브레이션 없이 계속 armable하며, "
+                "이후 raw(보정 없음) 센서 값이 그대로 사용됩니다. 필요하면 QGC에서 다시 캘리브레이션하세요.\n"
                 "기체는 반드시 Disarm 상태여야 합니다. 계속할까요?"
             ),
             QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,

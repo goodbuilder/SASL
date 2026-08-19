@@ -10,8 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .px4_attitude_cal_manager import ATTITUDE_CAL_PARAM_NAMES
-from .px4_mag_manager import MAG_CAL_PARAM_NAMES
+from .px4_attitude_cal_manager import (
+    ACCEL_CORRECTION_PARAM_NAMES,
+    ATTITUDE_CAL_PARAM_NAMES,
+    GYRO_CORRECTION_PARAM_NAMES,
+)
+from .px4_mag_manager import MAG_CAL_CORRECTION_PARAM_NAMES, MAG_CAL_PARAM_NAMES
 
 
 @dataclass(frozen=True)
@@ -43,25 +47,41 @@ PX4_CALIBRATION_GROUPS = (
         key="accelerometer",
         label="Accelerometer calibration",
         parameter_names=_ACCELEROMETER_PARAM_NAMES,
-        reset_parameter_names=_ACCELEROMETER_PARAM_NAMES,
+        reset_parameter_names=ACCEL_CORRECTION_PARAM_NAMES,
         contract="PX4 accelerometer sensor axes; no NED/ENU/camera conversion",
-        description="CAL_ACC* identity, priority, rotation, offsets, and scale factors.",
+        description=(
+            "CAL_ACC* identity, priority, rotation, offsets, and scale factors. "
+            "Reset only zeroes offsets and sets scale to 1 (raw sensor passthrough) -- "
+            "_ID/_PRIO/_ROT are left alone, like level's SENS_BOARD_ROT, so the slot "
+            "stays bound to its device and armable without a QGC re-run."
+        ),
     ),
     Px4CalibrationGroup(
         key="gyroscope",
         label="Gyroscope calibration",
         parameter_names=_GYROSCOPE_PARAM_NAMES,
-        reset_parameter_names=_GYROSCOPE_PARAM_NAMES,
+        reset_parameter_names=GYRO_CORRECTION_PARAM_NAMES,
         contract="PX4 gyroscope sensor axes; no NED/ENU/camera conversion",
-        description="CAL_GYRO* identity, priority, rotation, and bias offsets.",
+        description=(
+            "CAL_GYRO* identity, priority, rotation, and bias offsets. "
+            "Reset only zeroes the bias offsets (raw sensor passthrough) -- "
+            "_ID/_PRIO/_ROT are left alone, like level's SENS_BOARD_ROT, so the slot "
+            "stays bound to its device and armable without a QGC re-run."
+        ),
     ),
     Px4CalibrationGroup(
         key="compass",
         label="Compass / magnetometer calibration",
         parameter_names=tuple(MAG_CAL_PARAM_NAMES),
-        reset_parameter_names=tuple(MAG_CAL_PARAM_NAMES),
+        reset_parameter_names=MAG_CAL_CORRECTION_PARAM_NAMES,
         contract="PX4 magnetometer sensor axes; no NED/ENU/camera conversion",
-        description="CAL_MAG* identity, priority, rotation, hard/soft-iron, and compensation values.",
+        description=(
+            "CAL_MAG* identity, priority, rotation, hard/soft-iron, and compensation values. "
+            "Reset only zeroes hard-iron/off-diagonal/compensation and sets scale to 1 (raw "
+            "sensor passthrough) -- _ID/_PRIO/_ROT/_ROLL/_PITCH/_YAW are left alone, like "
+            "level's SENS_BOARD_ROT, so the slot stays bound to its device and armable "
+            "without a QGC re-run."
+        ),
     ),
     Px4CalibrationGroup(
         key="level",

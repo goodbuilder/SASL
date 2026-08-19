@@ -1975,7 +1975,13 @@ def test_pixhawk_calibration_group_reset_is_scoped_and_uses_px4_defaults(monkeyp
 
     assert DeviceRuntimeController(panel).reset_px4_calibration_group("left", "accelerometer") is True
     assert shell_calls[0][0] == "left"
-    assert shell_calls[0][1].startswith("param reset CAL_ACC0_ID")
+    assert shell_calls[0][1].startswith("param reset CAL_ACC0_XOFF")
+    # Only the calibration-fit offset/scale terms reset (raw sensor
+    # passthrough): _ID/_PRIO/_ROT stay untouched, like level leaves
+    # SENS_BOARD_ROT alone, so the slot stays bound to its device and
+    # armable without forcing a QGC re-run.
+    assert "CAL_ACC0_ID" not in shell_calls[0][1]
+    assert "CAL_ACC0_ROT" not in shell_calls[0][1]
     assert "CAL_GYRO0_ID" not in shell_calls[0][1]
     assert "CAL_MAG0_ID" not in shell_calls[0][1]
     assert "SENS_BOARD_X_OFF" not in shell_calls[0][1]

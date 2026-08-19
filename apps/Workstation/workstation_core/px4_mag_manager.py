@@ -50,28 +50,35 @@ def mag_priority_display(value: int | float | None) -> str:
     return f"{label} ({raw})" if label is not None else f"Custom ({raw})"
 
 
+# Hard-iron/soft-iron fit coefficients only -- the calibration *output*,
+# as opposed to _ID/_PRIO (which slot/device this is) and _ROT/_ROLL/_PITCH/
+# _YAW (external compass mounting orientation, a manual descriptor like
+# SENS_BOARD_ROT). Resetting only these to their firmware defaults
+# (0 offset, 1 scale, 0 off-diagonal/compensation) makes PX4 apply an
+# identity transform -- i.e. pass the raw sensor reading through -- without
+# forgetting which physical device this slot belongs to.
+MAG_CAL_CORRECTION_SUFFIXES = (
+    "XOFF",
+    "YOFF",
+    "ZOFF",
+    "XSCALE",
+    "YSCALE",
+    "ZSCALE",
+    "XODIAG",
+    "YODIAG",
+    "ZODIAG",
+    "XCOMP",
+    "YCOMP",
+    "ZCOMP",
+)
+MAG_CAL_CORRECTION_PARAM_NAMES = tuple(
+    f"CAL_MAG{slot}_{suffix}" for slot in MAG_SLOTS for suffix in MAG_CAL_CORRECTION_SUFFIXES
+)
 MAG_CAL_PARAM_NAMES = (
     *(f"CAL_MAG{slot}_ID" for slot in MAG_SLOTS),
     *(f"CAL_MAG{slot}_PRIO" for slot in MAG_SLOTS),
     *(f"CAL_MAG{slot}_{suffix}" for slot in MAG_SLOTS for suffix in ("ROT", "ROLL", "PITCH", "YAW")),
-    *(
-        f"CAL_MAG{slot}_{suffix}"
-        for slot in MAG_SLOTS
-        for suffix in (
-            "XOFF",
-            "YOFF",
-            "ZOFF",
-            "XSCALE",
-            "YSCALE",
-            "ZSCALE",
-            "XODIAG",
-            "YODIAG",
-            "ZODIAG",
-            "XCOMP",
-            "YCOMP",
-            "ZCOMP",
-        )
-    ),
+    *MAG_CAL_CORRECTION_PARAM_NAMES,
 )
 MAG_PARAM_NAMES = (
     "UAVCAN_ENABLE",
