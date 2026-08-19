@@ -28,6 +28,56 @@ def infer_camera_timestamp_reference(metadata: dict) -> str:
     return "app-receive"
 
 
+class _AspectRatioPreviewContainer(QtWidgets.QWidget):
+    """Sizes its single child to a locked width:height ratio, centered.
+
+    The camera preview label used to fill this container completely, so
+    ``_refresh_pixmap`` had to crop-to-fill whenever the container's ratio
+    drifted from the source frame's ratio -- visually indistinguishable from
+    the picture "zooming in".  Locking the child's own geometry to the
+    source aspect ratio here means that crop is a no-op instead.
+    """
+
+    def __init__(self, child: QtWidgets.QWidget, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._child = child
+        child.setParent(self)
+        self._aspect_ratio: float | None = None
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.setMinimumSize(child.minimumSize())
+
+    def set_aspect_ratio(self, ratio: float | None) -> None:
+        if ratio is not None and (ratio <= 0 or ratio != ratio):  # reject <=0 and NaN
+            ratio = None
+        if ratio == self._aspect_ratio:
+            return
+        self._aspect_ratio = ratio
+        self._apply_child_geometry(self.size())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override.
+        self._apply_child_geometry(event.size())
+        super().resizeEvent(event)
+
+    def _apply_child_geometry(self, available: QtCore.QSize) -> None:
+        # Deliberately setGeometry() rather than setFixedSize(): a fixed size
+        # policy would make the child's current size a hard minimum for this
+        # container (and everything above it), so the pane could grow to fit
+        # a wide frame but could never shrink back down again.
+        width = max(1, available.width())
+        height = max(1, available.height())
+        if self._aspect_ratio is None:
+            target_w, target_h = width, height
+        else:
+            candidate_width = height * self._aspect_ratio
+            if candidate_width <= width:
+                target_w, target_h = max(1, round(candidate_width)), height
+            else:
+                target_w, target_h = width, max(1, round(width / self._aspect_ratio))
+        x = (width - target_w) // 2
+        y = (height - target_h) // 2
+        self._child.setGeometry(x, y, target_w, target_h)
+
+
 class CameraPane(QtWidgets.QGroupBox):
     detection_changed = QtCore.pyqtSignal(str, object)
     frame_changed = QtCore.pyqtSignal(str, QtGui.QImage, object)
@@ -66,7 +116,8 @@ class CameraPane(QtWidgets.QGroupBox):
         self.image_label.setMinimumSize(360, 220)
         self.image_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Ignored)
         self.image_label.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.image_label, 1)
+        self._preview_container = _AspectRatioPreviewContainer(self.image_label)
+        layout.addWidget(self._preview_container, 1)
         self.detection_label = QtWidgets.QLabel("최고 bbox: 없음")
         self.detection_label.setObjectName("cameraMeta")
         self.detection_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
@@ -187,6 +238,7 @@ class CameraPane(QtWidgets.QGroupBox):
         self.detection_stream_active = False
         self.image_label.setText("중지됨")
         self.image_label.setPixmap(QtGui.QPixmap())
+        self._preview_container.set_aspect_ratio(None)
         self._set_status("중지됨")
         self._set_detection_label(None)
         self.detection_changed.emit(self.camera_label, None)
@@ -216,6 +268,8 @@ class CameraPane(QtWidgets.QGroupBox):
             return
         self.measurement_pair_display_active = False
         self.latest_image = image
+        if image.height() > 0:
+            self._preview_container.set_aspect_ratio(image.width() / image.height())
         self.frame_changed.emit(self.camera_label, image, frame_metadata)
         self._refresh_pixmap()
 
@@ -326,6 +380,8 @@ class CameraPane(QtWidgets.QGroupBox):
     def show_selected_measurement_frame(self, image: QtGui.QImage) -> None:
         self.measurement_pair_display_active = True
         self.latest_image = image.copy()
+        if image.height() > 0:
+            self._preview_container.set_aspect_ratio(image.width() / image.height())
         self._refresh_pixmap()
 
     def clear_measurement_pair_display(self) -> None:
