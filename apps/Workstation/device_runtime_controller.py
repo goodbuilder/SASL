@@ -16,6 +16,7 @@ from Workstation.device_runtime_workers import (
     CameraNetworkAddressApplyWorker,
     CameraNetworkDiscoveryWorker,
     PixhawkConnectionWorker,
+    PixhawkDisconnectWorker,
     PixhawkHostIpDiscoveryWorker,
     PixhawkParameterWorker,
     PixhawkPersistentConfigWorker,
@@ -32,6 +33,15 @@ from Workstation.workstation_core.px4_attitude_cal_manager import (
     LEVEL_HORIZON_RESET_PARAM_NAMES,
 )
 from Workstation.workstation_core.px4_calibration_groups import px4_calibration_group
+
+# pymavlink's UDP transport (used for Ethernet-connected Pixhawks) has no
+# disconnect notification: unplugging the cable or losing the link leaves
+# ``connections[side]`` and ``_heartbeat_logged`` exactly as they were at the
+# last successful heartbeat. Without this timeout, ``_mavlink_connected_sides``
+# keeps reporting the side as connected forever, so pressing "Connect" again
+# silently no-ops instead of re-establishing the link. See
+# ``DeviceRuntimeController._mavlink_side_is_stale``.
+_MAVLINK_STALE_TIMEOUT_S = 5.0
 
 DEVICE_RUNTIME_CONTROLLER_METHODS = [
     "toggle_mavlink_connection",
@@ -190,6 +200,7 @@ class DeviceRuntimeController:
         all_stopped = True
         for attr in (
             "pixhawk_connection_thread",
+            "pixhawk_disconnection_thread",
             "pixhawk_stream_setup_thread",
             "pixhawk_usb_bootstrap_thread",
             "pixhawk_persistent_config_thread",
@@ -531,6 +542,20 @@ class DeviceRuntimeController:
         self.panel._log(f"[픽스호크] {text}")
         self.panel._refresh_session_toggle_buttons()
         self.panel._refresh_mavlink_side_actions()
+        self._auto_refresh_px4_calibration_params_on_heartbeat()
+
+    def _auto_refresh_px4_calibration_params_on_heartbeat(self) -> None:
+        # Fires once per side, right when that side's first heartbeat is
+        # logged (status_changed emits that message exactly once -- see
+        # DualPixhawkMavlinkSubscriber._handle_mavlink_message). Without
+        # this, the Pixhawk Parameters group sits at "readback 대기 중"
+        # until the operator manually presses "QGC 결과 새로고침".
+        auto_refreshed = self.panel._px4_calibration_auto_refreshed_sides
+        for side in self.panel._mavlink_connected_sides():
+            if side in auto_refreshed:
+                continue
+            auto_refreshed.add(side)
+            self.panel._start_pixhawk_parameter_worker(side, "calibration_refresh")
 
     def _configured_mavlink_sides(self) -> tuple[str, ...]:
         sides = []
@@ -752,8 +777,12 @@ class DeviceRuntimeController:
             return
         target_sides = self.panel._mavlink_target_sides(camera)
         if all(side in self.panel._mavlink_connected_sides() for side in target_sides):
-            if force_setup and self.panel.mavlink_pixhawk is not None:
-                self.panel._apply_mavlink_pixhawk_setup(self.panel.mavlink_pixhawk, target_sides)
+            stale_sides = tuple(side for side in target_sides if self._mavlink_side_is_stale(side))
+            if not stale_sides:
+                if force_setup and self.panel.mavlink_pixhawk is not None:
+                    self.panel._apply_mavlink_pixhawk_setup(self.panel.mavlink_pixhawk, target_sides)
+                return
+            self._reconnect_stale_mavlink_sides(camera, stale_sides, force_setup)
             return
         if self.panel.pixhawk_connection_thread is not None:
             self.panel._log("[픽스호크] MAVLink 연결 작업이 이미 진행 중입니다.")
@@ -861,34 +890,127 @@ class DeviceRuntimeController:
         self.panel.pixhawk_connection_thread = None
         self.panel.pixhawk_connection_worker = None
 
+    def _mavlink_side_is_stale(self, side: str) -> bool:
+        """True if ``side`` has a logged heartbeat but has gone quiet.
+
+        Only meaningful for a side that ``_mavlink_connected_sides`` already
+        counts as connected. A PARAM/shell worker temporarily reserves the
+        receive path via ``exclusive_command`` and pauses normal ATTITUDE
+        processing for its duration, so a side mid-command is never treated
+        as stale here -- that gap reflects the command, not a dead link.
+        """
+
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None or side not in getattr(subscriber, "connections", {}):
+            return False
+        if side in getattr(subscriber, "_active_command_cameras", set()):
+            return False
+        timestamps = self.panel.pixhawk_attitude_times.get(side)
+        if not timestamps:
+            return False
+        return time.monotonic() - timestamps[-1] > _MAVLINK_STALE_TIMEOUT_S
+
+    def _reconnect_stale_mavlink_sides(
+        self,
+        camera: str | None,
+        stale_sides: Sequence[str],
+        force_setup: bool,
+    ) -> None:
+        if self.panel.pixhawk_disconnection_thread is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 해제 작업이 이미 진행 중입니다.")
+            return
+        label = " / ".join(self.panel._px4_mag_camera_label(side) for side in stale_sides)
+        self.panel._log(
+            f"[픽스호크] {label} 응답이 {_MAVLINK_STALE_TIMEOUT_S:.0f}초 넘게 없어 "
+            "연결이 끊긴 것으로 보고 재연결을 시도합니다."
+        )
+        stale_camera = stale_sides[0] if len(stale_sides) == 1 else None
+        self.disconnect_mavlink_pixhawk(stale_camera)
+        thread = self.panel.pixhawk_disconnection_thread
+        if thread is None:
+            # The subscriber was already gone by the time disconnect ran (it
+            # finished synchronously without starting a worker thread); retry
+            # the connect immediately instead of waiting on a signal that will
+            # never fire.
+            self.connect_mavlink_pixhawk(camera, force_setup=force_setup)
+            return
+        thread.finished.connect(
+            lambda camera=camera, force_setup=force_setup:
+            self.connect_mavlink_pixhawk(camera, force_setup=force_setup)
+        )
+
     def disconnect_mavlink_pixhawk(self, camera: str | None = None) -> None:
         if self.panel._session_recording_active():
             self.panel._log("[픽스호크] 세션 기록 중에는 Pixhawk MAVLink 연결을 변경할 수 없습니다.")
             return
+        if self.panel.pixhawk_disconnection_thread is not None:
+            self.panel._log("[픽스호크] MAVLink 연결 해제 작업이 이미 진행 중입니다.")
+            return
         target_sides = self.panel._mavlink_target_sides(camera)
-        if self.panel.mavlink_pixhawk is not None:
-            stop = getattr(self.panel.mavlink_pixhawk, "stop", None)
-            if callable(stop):
-                stop(camera)
-            if not getattr(self.panel.mavlink_pixhawk, "connections", {}):
-                self.panel.mavlink_pixhawk = None
+        subscriber = self.panel.mavlink_pixhawk
+        if subscriber is None:
+            self._finish_pixhawk_disconnect(camera, target_sides)
+            return
+        # ``subscriber.stop()`` closes the underlying serial/socket connection,
+        # which can block for as long as an in-flight shell/parameter worker
+        # holds a concurrent blocking read on the same connection (they share
+        # ``_command_state_lock``). Running that on the GUI thread froze the
+        # whole app for the duration; do it on a worker thread instead, the
+        # same way ``connect_mavlink_pixhawk`` already does for ``start()``.
+        thread = QtCore.QThread(self.panel)
+        worker = PixhawkDisconnectWorker(subscriber, camera)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(
+            lambda _result, camera=camera, target_sides=target_sides:
+            self._finish_pixhawk_disconnect(camera, target_sides)
+        )
+        worker.failed.connect(
+            lambda error, camera=camera, target_sides=target_sides:
+            self._finish_pixhawk_disconnect(camera, target_sides, error=error)
+        )
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._clear_pixhawk_disconnection_worker)
+        self.panel.pixhawk_disconnection_thread = thread
+        self.panel.pixhawk_disconnection_worker = worker
+        thread.start()
+
+    def _finish_pixhawk_disconnect(
+        self,
+        camera: str | None,
+        target_sides: Sequence[str],
+        *,
+        error: str | None = None,
+    ) -> None:
+        if not getattr(self.panel.mavlink_pixhawk, "connections", {}):
+            self.panel.mavlink_pixhawk = None
         connection_thread = getattr(self.panel, "pixhawk_connection_thread", None)
         if connection_thread is not None and connection_thread.isRunning():
             connection_thread.quit()
         for side in target_sides:
             self.panel.pixhawk_attitude_times[side].clear()
+            self.panel._px4_calibration_auto_refreshed_sides.discard(side)
         self.panel._clear_px4_mag_manager_connection_state(camera)
         self.panel._clear_px4_attitude_cal_connection_state(camera)
         self.panel._refresh_session_toggle_buttons()
         self.panel._refresh_mavlink_side_actions()
-        if self.panel.mavlink_pixhawk is None:
-            self.panel.pixhawk_connection_label.setText("픽스호크: 연결 해제")
-        else:
-            label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
-            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
         label = " / ".join(self.panel._px4_mag_camera_label(side) for side in target_sides)
-        self.panel._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
+        if error is not None:
+            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제 중 오류 ({error})")
+            self.panel._log(f"[픽스호크] {label} MAVLink 연결 해제 중 오류: {error}")
+        elif self.panel.mavlink_pixhawk is None:
+            self.panel.pixhawk_connection_label.setText("픽스호크: 연결 해제")
+            self.panel._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
+        else:
+            self.panel.pixhawk_connection_label.setText(f"픽스호크 MAVLink: {label} 연결 해제")
+            self.panel._log(f"[픽스호크] {label} MAVLink 연결을 해제했습니다.")
         self.panel._refresh_operation_header()
+
+    def _clear_pixhawk_disconnection_worker(self) -> None:
+        self.panel.pixhawk_disconnection_thread = None
+        self.panel.pixhawk_disconnection_worker = None
 
     def apply_selected_pixhawk_candidate(self, side: str, *, source: str | None = None) -> None:
         if source is None:

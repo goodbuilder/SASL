@@ -358,7 +358,11 @@ class RecordingController:
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")
             return False
-        if self.panel.pixhawk_connection_thread is not None or self.panel.pixhawk_usb_bootstrap_thread is not None:
+        if (
+            self.panel.pixhawk_connection_thread is not None
+            or self.panel.pixhawk_disconnection_thread is not None
+            or self.panel.pixhawk_usb_bootstrap_thread is not None
+        ):
             status_text = "세션 기록: Pixhawk 연결/부트스트랩 완료 대기 중"
             self.panel.recording_status_label.setText(status_text)
             self.panel._log(f"[저장] {status_text}")

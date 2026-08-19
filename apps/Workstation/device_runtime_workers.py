@@ -226,6 +226,43 @@ class PixhawkConnectionWorker(QtCore.QObject):
             self.finished.emit()
 
 
+class PixhawkDisconnectWorker(QtCore.QObject):
+    """Close a MAVLink transport without touching the Workstation event loop.
+
+    ``DualPixhawkMavlinkSubscriber.stop()`` closes the underlying
+    serial/socket connection, which can block for the duration of a
+    concurrent blocking read held by an in-flight shell/parameter worker
+    (they share ``_command_state_lock``). Running it synchronously on the
+    GUI thread froze the whole app for that duration; this worker mirrors
+    ``PixhawkConnectionWorker`` so disconnect no longer blocks the UI thread.
+    """
+
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+    finished = QtCore.pyqtSignal()
+
+    def __init__(self, subscriber: DualPixhawkMavlinkSubscriber, camera: str | None) -> None:
+        super().__init__()
+        self.subscriber = subscriber
+        self.camera = None if camera is None else str(camera)
+
+    @QtCore.pyqtSlot()
+    def run(self) -> None:
+        try:
+            self.subscriber.stop(self.camera)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        else:
+            self.completed.emit(
+                {
+                    "camera": self.camera,
+                    "connections": tuple(getattr(self.subscriber, "connections", {}).keys()),
+                }
+            )
+        finally:
+            self.finished.emit()
+
+
 class PixhawkStreamSetupWorker(QtCore.QObject):
     """Apply the optional PX4 MAVLink stream setup away from the UI thread."""
 

@@ -721,6 +721,7 @@ from Workstation.device_runtime_workers import (
     InterfaceStatusWorker,
     PixhawkHostIpDiscoveryWorker,
     PixhawkConnectionWorker,
+    PixhawkDisconnectWorker,
     PixhawkStreamSetupWorker,
     PixhawkUsbBootstrapWorker,
     PixhawkPersistentConfigWorker,
@@ -1147,6 +1148,8 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self.pixhawk_host_ip_discovery_worker: PixhawkHostIpDiscoveryWorker | None = None
         self.pixhawk_connection_thread: QtCore.QThread | None = None
         self.pixhawk_connection_worker: PixhawkConnectionWorker | None = None
+        self.pixhawk_disconnection_thread: QtCore.QThread | None = None
+        self.pixhawk_disconnection_worker: PixhawkDisconnectWorker | None = None
         self.pixhawk_stream_setup_thread: QtCore.QThread | None = None
         self.pixhawk_stream_setup_worker: PixhawkStreamSetupWorker | None = None
         self.pixhawk_usb_bootstrap_thread: QtCore.QThread | None = None
@@ -1338,6 +1341,7 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         self._px4_calibration_parameter_error: dict[str, str] = {}
         self._px4_calibration_reset_error: dict[str, str] = {}
         self._px4_calibration_reset_pending: dict[str, str] = {}
+        self._px4_calibration_auto_refreshed_sides: set[str] = set()
         self.px4_mag_manager = self.px4_mag_managers["left"]
         self.px4_attitude_cal_managers = {
             "left": Px4AttitudeCalManager(MockParameterStore(current_pixhawk_6x_attitude_cal_params())),
