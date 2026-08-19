@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import time
 from collections.abc import Mapping
@@ -999,6 +1000,8 @@ class CameraWorkspace(QtWidgets.QWidget):
             mapping_layout.addWidget(button)
         mapping_layout.addStretch(1)
         details_layout.addWidget(mapping_group)
+
+        details_layout.addWidget(self._build_image_format_group(invoke_command))
         details_layout.addStretch(1)
 
         self.details_scroll = QtWidgets.QScrollArea()
@@ -1013,6 +1016,107 @@ class CameraWorkspace(QtWidgets.QWidget):
         self.workspace_splitter.setSizes([600, 240])
         layout.addWidget(self.workspace_splitter, 1)
         self._connect_panes()
+
+    # -- Image Format group ---------------------------------------------
+    #
+    # CPTR emits one file per enabled SIxx save-format toggle
+    # (SIRJ=radiometric, SISR=super-resolution, SIHR=HR, SIVI=OZ visible).
+    # Left/right were found with different toggles on, which breaks any
+    # "one file per capture" assumption downstream (e.g. the calibration OZ
+    # FTP sync). This group makes that state visible and lets the operator
+    # force both cameras to a known state; the calibration OZ capture path
+    # additionally forces it automatically before every trigger.
+
+    IMAGE_FORMAT_TOGGLES = (
+        ("SIRJ", "GIRJ", "Radiometric"),
+        ("SISR", "GISR", "Super-res"),
+        ("SIHR", "GIHR", "HR"),
+        ("SIVI", "GIVI", "Visible (OZ)"),
+    )
+
+    def _build_image_format_group(
+        self, invoke_command: Callable[[str], bool] | None
+    ) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Image Format")
+        layout = QtWidgets.QVBoxLayout(group)
+
+        status_layout = QtWidgets.QGridLayout()
+        status_layout.setHorizontalSpacing(10)
+        self.image_format_values: dict[str, EngineeringValue] = {}
+        get_commands = tuple(get_cmd for _set_cmd, get_cmd, _label in self.IMAGE_FORMAT_TOGGLES) + ("GILC",)
+        for row, side in enumerate(("left", "right")):
+            for col, get_cmd in enumerate(get_commands):
+                value = EngineeringValue(f"{side.title()} {get_cmd}")
+                self.image_format_values[f"{side}_{get_cmd}"] = value
+                status_layout.addWidget(value, row, col)
+        layout.addLayout(status_layout)
+
+        toggle_layout = QtWidgets.QHBoxLayout()
+        self.image_format_checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        for set_cmd, _get_cmd, label in self.IMAGE_FORMAT_TOGGLES:
+            checkbox = QtWidgets.QCheckBox(label)
+            checkbox.setToolTip(
+                f"체크: 양쪽 카메라에 {set_cmd} TRUE 전송. 해제: 양쪽에 {set_cmd} FALSE 전송."
+            )
+            checkbox.toggled.connect(
+                lambda checked, set_cmd=set_cmd: self._on_image_format_checkbox_toggled(set_cmd, checked)
+            )
+            self.image_format_checkboxes[set_cmd] = checkbox
+            toggle_layout.addWidget(checkbox)
+        toggle_layout.addStretch(1)
+        layout.addLayout(toggle_layout)
+
+        actions_layout = QtWidgets.QHBoxLayout()
+        refresh_button = _command_button(
+            "새로고침", "camera.refresh_image_format_status", invoke_command
+        )
+        refresh_button.setToolTip("좌우 GIVI/GIRJ/GISR/GIHR/GILC 상태를 다시 조회합니다.")
+        self.operation_buttons["camera.refresh_image_format_status"] = refresh_button
+        actions_layout.addWidget(refresh_button)
+        preset_button = _command_button(
+            "OZ 전용 초기화", "camera.apply_oz_only_image_format", invoke_command
+        )
+        preset_button.setToolTip(
+            "SIRJ FALSE, SISR FALSE, SIHR FALSE, SIVI TRUE를 양쪽 카메라에 전송합니다."
+        )
+        self.operation_buttons["camera.apply_oz_only_image_format"] = preset_button
+        actions_layout.addWidget(preset_button)
+        actions_layout.addStretch(1)
+        layout.addLayout(actions_layout)
+        return group
+
+    def _on_image_format_checkbox_toggled(self, set_command: str, checked: bool) -> None:
+        setter = getattr(self.backend, "camera_set_image_format", None)
+        if not callable(setter):
+            return
+        setter(set_command, checked)
+
+    def _sync_image_format_status(self) -> None:
+        values = getattr(self, "image_format_values", None)
+        if values is None:
+            return
+        status = _evidence(self.backend).image_format_status()
+        for side in ("left", "right"):
+            responses = status.get(side) if isinstance(status.get(side), dict) else {}
+            for _set_cmd, get_cmd, _label in self.IMAGE_FORMAT_TOGGLES:
+                widget = values.get(f"{side}_{get_cmd}")
+                if widget is not None:
+                    widget.set_value(responses.get(get_cmd))
+            gilc_widget = values.get(f"{side}_GILC")
+            if gilc_widget is not None:
+                gilc_widget.set_value(responses.get("GILC"))
+        left = status.get("left") if isinstance(status.get("left"), dict) else {}
+        right = status.get("right") if isinstance(status.get("right"), dict) else {}
+        for set_cmd, get_cmd, _label in self.IMAGE_FORMAT_TOGGLES:
+            checkbox = self.image_format_checkboxes.get(set_cmd)
+            if checkbox is None:
+                continue
+            both_true = str(left.get(get_cmd, "")).strip().upper() == "TRUE" and (
+                str(right.get(get_cmd, "")).strip().upper() == "TRUE"
+            )
+            checkbox.blockSignals(True)
+            checkbox.setChecked(both_true)
+            checkbox.blockSignals(False)
 
     @classmethod
     def preview_pair_orientation(cls, width: int, height: int) -> QtCore.Qt.Orientation:
@@ -1123,6 +1227,7 @@ class CameraWorkspace(QtWidgets.QWidget):
 
     def refresh(self, snapshot: dict[str, RuntimeStatus]) -> None:
         evidence = _evidence(self.backend)
+        self._sync_image_format_status()
         for side in ("left", "right"):
             status = snapshot.get(f"camera.{side}")
             self.camera_values[f"camera.{side}"].set_value(
@@ -6605,6 +6710,8 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                     ("calibration.capture_images", "Capture"),
                     ("calibration.capture_images_wiris_ftp", "Capture FTP HR"),
                     ("calibration.capture_images_wiris_ftp_oz", "Capture FTP OZ"),
+                    ("calibration.capture_images_wiris_oz_capture_only", "OZ 캡처"),
+                    ("calibration.sync_images_wiris_oz_ftp", "FTP 접근"),
                     ("calibration.run_intrinsic", "Run calibration (K,D)"),
                     ("calibration.run_extrinsics", "Calculate R,t"),
                     ("calibration.save_intrinsics", "Save Intrinsics"),
@@ -6670,11 +6777,144 @@ class CalibrationWorkspace(QtWidgets.QWidget):
                 auto_layout.addWidget(auto_target, 0, 3)
                 auto_layout.addWidget(auto_button, 1, 0, 1, 4)
                 page_layout.addWidget(auto_group)
+                page_layout.addWidget(self._build_calibration_pair_picker_group())
             elif tab_label == "Validation":
                 page_layout.addWidget(self._build_checkerboard_validation_group())
             page_layout.addStretch(1)
             operation_tabs.addTab(page, tab_label)
         return operation_tabs
+
+    # -- Manual calculation-pair picker --------------------------------
+    #
+    # ``_select_calibration_pairs`` on the hidden panel auto-samples an
+    # even spread of pairs by count. This picker lets the operator instead
+    # check exactly which left/right pairs go into the next calculation --
+    # useful once WIRIS FTP OZ sync has pulled in more pairs than are
+    # actually good (blur, board partly out of frame, etc). Selection state
+    # is handed to the hidden panel via a JSON sidecar
+    # (``calibration_pair_selection.json`` next to the images) rather than a
+    # cross-panel command, since it needs to be read at calculation time by
+    # ``CalibrationWorkflowController._choose_calibration_pairs``.
+
+    def _build_calibration_pair_picker_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("계산용 사진 선택")
+        layout = QtWidgets.QVBoxLayout(group)
+        self.calibration_manual_selection_checkbox = QtWidgets.QCheckBox("수동 선택 사용")
+        self.calibration_manual_selection_checkbox.setToolTip(
+            "끄면 기존처럼 균등 분산 자동 선택을 사용합니다. 켜면 아래에서 체크한 쌍만 계산에 사용합니다."
+        )
+        self.calibration_manual_selection_checkbox.toggled.connect(
+            self._on_calibration_pair_selection_changed
+        )
+        layout.addWidget(self.calibration_manual_selection_checkbox)
+        self.calibration_pair_picker_list = QtWidgets.QListWidget()
+        self.calibration_pair_picker_list.setObjectName("calibrationPairPickerList")
+        self.calibration_pair_picker_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.calibration_pair_picker_list.setIconSize(QtCore.QSize(64, 36))
+        self.calibration_pair_picker_list.setMinimumHeight(90)
+        self.calibration_pair_picker_list.setMaximumHeight(220)
+        self.calibration_pair_picker_list.setToolTip(
+            "체크된 쌍만(수동 선택 사용 시) Run calibration / Calculate R,t 에 사용됩니다."
+        )
+        self.calibration_pair_picker_list.itemChanged.connect(
+            self._on_calibration_pair_selection_changed
+        )
+        layout.addWidget(self.calibration_pair_picker_list)
+        self._calibration_pair_picker_root: Path | None = None
+        return group
+
+    def _calibration_pair_selection_path(self) -> Path | None:
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        if not root_text:
+            return None
+        return Path(root_text) / "calibration_pair_selection.json"
+
+    def _load_calibration_pair_selection(self) -> dict[str, object]:
+        empty: dict[str, object] = {"manual_mode": False, "included_keys": []}
+        path = self._calibration_pair_selection_path()
+        if path is None or not path.exists():
+            return empty
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        return {
+            "manual_mode": bool(data.get("manual_mode", False)),
+            "included_keys": [str(key) for key in data.get("included_keys", []) or []],
+        }
+
+    def _on_calibration_pair_selection_changed(self, *_args: object) -> None:
+        path = self._calibration_pair_selection_path()
+        if path is None:
+            return
+        included_keys = [
+            str(self.calibration_pair_picker_list.item(index).data(QtCore.Qt.UserRole))
+            for index in range(self.calibration_pair_picker_list.count())
+            if self.calibration_pair_picker_list.item(index).checkState() == QtCore.Qt.Checked
+        ]
+        payload = {
+            "manual_mode": bool(self.calibration_manual_selection_checkbox.isChecked()),
+            "included_keys": included_keys,
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _sync_calibration_pair_picker(self) -> None:
+        picker = getattr(self, "calibration_pair_picker_list", None)
+        if picker is None:
+            return
+        root_text = str(_evidence(self.backend).calibration_setup().get("calibration_root_resolved") or "")
+        if not root_text:
+            return
+        root = Path(root_text)
+        left_dir, right_dir = root / "left", root / "right"
+        left_keys = {path.stem.removeprefix("left_") for path in left_dir.glob("left_*.png")} if left_dir.is_dir() else set()
+        right_keys = {path.stem.removeprefix("right_") for path in right_dir.glob("right_*.png")} if right_dir.is_dir() else set()
+        keys = sorted(left_keys & right_keys)
+        selection = self._load_calibration_pair_selection()
+        included = set(selection.get("included_keys") or ())
+        picker.blockSignals(True)
+        self.calibration_manual_selection_checkbox.blockSignals(True)
+        try:
+            self.calibration_manual_selection_checkbox.setChecked(bool(selection.get("manual_mode")))
+            picker.clear()
+            metadata_dir = root / "capture_metadata"
+            for key in keys:
+                origin = "manual"
+                metadata_path = metadata_dir / f"capture_{key}.json"
+                if metadata_path.exists():
+                    try:
+                        origin = str(
+                            json.loads(metadata_path.read_text(encoding="utf-8")).get("capture_origin", "manual")
+                        )
+                    except (OSError, ValueError):
+                        pass
+                left_path = left_dir / f"left_{key}.png"
+                captured_at = ""
+                try:
+                    captured_at = time.strftime(
+                        "%H:%M:%S", time.localtime(left_path.stat().st_mtime)
+                    )
+                except OSError:
+                    pass
+                item = QtWidgets.QListWidgetItem(f"{key} · {origin} · {captured_at}")
+                item.setData(QtCore.Qt.UserRole, key)
+                item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsEnabled)
+                item.setCheckState(
+                    QtCore.Qt.Checked if not included or key in included else QtCore.Qt.Unchecked
+                )
+                thumbnail = QtGui.QPixmap(str(left_path))
+                if not thumbnail.isNull():
+                    item.setIcon(QtGui.QIcon(thumbnail.scaledToHeight(36, QtCore.Qt.SmoothTransformation)))
+                picker.addItem(item)
+        finally:
+            picker.blockSignals(False)
+            self.calibration_manual_selection_checkbox.blockSignals(False)
 
     def _build_checkerboard_validation_group(self) -> QtWidgets.QGroupBox:
         """Recompute K,D (and R,t) from random subsets of the scanned pairs
@@ -6998,6 +7238,7 @@ class CalibrationWorkspace(QtWidgets.QWidget):
         recording = snapshot.get("recording")
         recording_locked = bool(recording and recording.state in {"ACTIVE", "FINALIZING"})
         self.camera_buttons["camera.toggle"].setEnabled(not recording_locked)
+        self._sync_calibration_pair_picker()
         data = _evidence(self.backend).calibration()
         self.zoom_readback_label.setText(
             f"capture zoom={data.get('zoom', '--')} | "

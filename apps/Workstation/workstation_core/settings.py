@@ -70,10 +70,10 @@ class AppSettings:
     wiris_ftp_timeout_s: float = 10.0
     left_ftp_port: int = 21
     right_ftp_port: int = 21
-    left_ftp_user: str = "anonymous"
-    right_ftp_user: str = "anonymous"
-    left_ftp_password: str = ""
-    right_ftp_password: str = ""
+    left_ftp_user: str = "wiris-enterprise"
+    right_ftp_user: str = "wiris-enterprise"
+    left_ftp_password: str = "ABCD"
+    right_ftp_password: str = "ABCD"
     left_ftp_remote_dir: str = "/"
     right_ftp_remote_dir: str = "/"
     left_ftp_timeout_s: float = 10.0

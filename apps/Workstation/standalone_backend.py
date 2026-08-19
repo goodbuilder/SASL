@@ -225,6 +225,15 @@ class StandalonePanelBackend(QtCore.QObject):
     def camera_save_settings(self) -> Any:
         return self._call("save_current_settings_from_ui")
 
+    def camera_refresh_image_format_status(self) -> Any:
+        return self._call("refresh_wiris_image_format_status")
+
+    def camera_apply_oz_only_image_format(self) -> Any:
+        return self._call("apply_oz_only_image_format")
+
+    def camera_set_image_format(self, set_command: str, value: bool) -> Any:
+        return self._call("set_wiris_image_format", set_command, value)
+
     def time_set_pc(self) -> Any:
         """Set the selected WIRIS camera clock from the existing PC-time path."""
 
@@ -309,6 +318,12 @@ class StandalonePanelBackend(QtCore.QObject):
 
     def calibration_capture_images_wiris_ftp_oz(self) -> Any:
         return self._call("capture_calibration_images_wiris_ftp_oz")
+
+    def calibration_capture_images_wiris_oz_capture_only(self) -> Any:
+        return self._call("capture_calibration_images_wiris_oz_capture_only")
+
+    def calibration_sync_images_wiris_oz_ftp(self) -> Any:
+        return self._call("sync_calibration_images_wiris_oz_ftp")
 
     def calibration_toggle_auto_capture(self) -> Any:
         return self._call("toggle_auto_calibration_capture")

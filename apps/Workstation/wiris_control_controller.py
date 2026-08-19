@@ -13,6 +13,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from Workstation.wiris_runtime_workers import (
     WirisClockCommandWorker,
     WirisCommandWorker,
+    WirisImageFormatWorker,
     WirisLrfPollWorker,
     WirisStipWorker,
     WirisZoomWorker,
@@ -68,6 +69,16 @@ WIRIS_CONTROL_METHODS = [
     "_apply_wiris_stip_result",
     "_wiris_stip_failed",
     "_clear_wiris_stip_worker",
+    "_image_format_target_infos",
+    "_start_wiris_image_format_worker",
+    "refresh_wiris_image_format_status",
+    "apply_oz_only_image_format",
+    "set_wiris_image_format",
+    "_handle_wiris_image_format_status_completed",
+    "_handle_wiris_image_format_preset_completed",
+    "_handle_wiris_image_format_set_completed",
+    "_wiris_image_format_failed",
+    "_clear_wiris_image_format_worker",
 ]
 
 
@@ -842,3 +853,83 @@ class WirisControlController:
             self.panel.left_stip_button.setEnabled(True)
         else:
             self.panel.right_stip_button.setEnabled(True)
+
+    # -- Image Format (Cameras tab) --------------------------------------
+
+    def _image_format_target_infos(self) -> tuple[tuple[str, str, int, float], ...]:
+        return tuple(
+            (label, host, self.panel._control_port_for_camera(label), self.panel.zoom_timeout_spin.value())
+            for label, host in self.panel.zoom_hosts("both")
+            if str(host or "").strip()
+        )
+
+    def _start_wiris_image_format_worker(
+        self,
+        commands: Sequence[str],
+        completed_handler_name: str,
+        *,
+        auto_refresh_after: bool = False,
+    ) -> bool:
+        if self.panel.wiris_image_format_thread is not None:
+            self.panel._log("[카메라] Image Format 작업이 이미 진행 중입니다.")
+            return False
+        target_infos = self._image_format_target_infos()
+        if len(target_infos) != 2:
+            self.panel._log("[카메라] Image Format 작업 실패: 좌우 제어 호스트가 모두 필요합니다.")
+            return False
+        thread = QtCore.QThread(self.panel)
+        worker = WirisImageFormatWorker(target_infos, commands=commands)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(getattr(self.panel, completed_handler_name))
+        worker.failed.connect(self.panel._wiris_image_format_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_wiris_image_format_worker)
+        self.panel.wiris_image_format_thread = thread
+        self.panel.wiris_image_format_worker = worker
+        self._auto_refresh_image_format_after_worker = auto_refresh_after
+        thread.start()
+        return True
+
+    def refresh_wiris_image_format_status(self) -> bool:
+        return self._start_wiris_image_format_worker(
+            ("GIVI", "GIRJ", "GISR", "GIHR", "GILC"),
+            "_handle_wiris_image_format_status_completed",
+        )
+
+    def apply_oz_only_image_format(self) -> bool:
+        return self._start_wiris_image_format_worker(
+            ("SIRJ FALSE", "SISR FALSE", "SIHR FALSE", "SIVI TRUE"),
+            "_handle_wiris_image_format_preset_completed",
+            auto_refresh_after=True,
+        )
+
+    def set_wiris_image_format(self, set_command: str, value: bool) -> bool:
+        state = "TRUE" if value else "FALSE"
+        return self._start_wiris_image_format_worker(
+            (f"{set_command} {state}",),
+            "_handle_wiris_image_format_set_completed",
+            auto_refresh_after=True,
+        )
+
+    def _handle_wiris_image_format_status_completed(self, result: object) -> None:
+        self.panel.wiris_image_format_status = result if isinstance(result, dict) else {}
+        self.panel._log(f"[카메라] Image Format 상태: {self.panel.wiris_image_format_status}")
+
+    def _handle_wiris_image_format_preset_completed(self, result: object) -> None:
+        self.panel._log(f"[카메라] OZ 전용 초기화: {result}")
+
+    def _handle_wiris_image_format_set_completed(self, result: object) -> None:
+        self.panel._log(f"[카메라] Image Format 설정: {result}")
+
+    def _wiris_image_format_failed(self, error: str) -> None:
+        self.panel._log(f"[카메라] Image Format 작업 실패: {error}")
+
+    def _clear_wiris_image_format_worker(self) -> None:
+        self.panel.wiris_image_format_thread = None
+        self.panel.wiris_image_format_worker = None
+        if getattr(self, "_auto_refresh_image_format_after_worker", False):
+            self._auto_refresh_image_format_after_worker = False
+            self.panel.refresh_wiris_image_format_status()

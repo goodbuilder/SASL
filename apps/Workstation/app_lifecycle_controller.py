@@ -66,6 +66,12 @@ class AppLifecycleController:
             "checkerboard_calibration_thread",
             "calibration_wiris_ftp_thread",
             "calibration_wiris_ftp_oz_thread",
+            "calibration_wiris_oz_capture_thread",
+            "calibration_wiris_oz_sync_thread",
+            "calibration_wiris_oz_delete_thread",
+            "calibration_wiris_oz_format_thread",
+            "calibration_wiris_oz_gilc_thread",
+            "wiris_image_format_thread",
             "optical_pose_wiris_ftp_thread",
             "optical_pose_wiris_ftp_oz_thread",
         )

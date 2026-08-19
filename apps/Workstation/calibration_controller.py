@@ -41,7 +41,13 @@ from Workstation.workstation_core.settings import (
     DEFAULT_INTRINSICS_PATH,
     resolve_settings_path,
 )
-from Workstation.wiris_runtime_workers import WirisPnPPhotoCaptureWorker
+from Workstation.wiris_runtime_workers import (
+    WirisFtpBatchDeleteWorker,
+    WirisImageFormatWorker,
+    WirisOzFtpSyncWorker,
+    WirisOZPhotoCaptureWorker,
+    WirisPnPPhotoCaptureWorker,
+)
 
 CHECKERBOARD_STEREO_PAIR_MAX_DELTA_S = 0.100
 CALIBRATION_AUTO_DETECTION_MAX_AGE_S = 2.0
@@ -114,6 +120,32 @@ CALIBRATION_WORKFLOW_METHODS = [
     "_handle_calibration_wiris_ftp_oz_capture_completed",
     "_handle_calibration_wiris_ftp_oz_capture_failed",
     "_clear_calibration_wiris_ftp_oz_capture_worker",
+    "capture_calibration_images_wiris_oz_capture_only",
+    "_handle_calibration_wiris_oz_format_preset_completed",
+    "_handle_calibration_wiris_oz_format_preset_failed",
+    "_clear_calibration_wiris_oz_format_worker",
+    "_start_calibration_wiris_oz_capture",
+    "_handle_calibration_wiris_oz_capture_only_completed",
+    "_handle_calibration_wiris_oz_capture_only_failed",
+    "_clear_calibration_wiris_oz_capture_only_worker",
+    "sync_calibration_images_wiris_oz_ftp",
+    "_handle_calibration_wiris_oz_gilc_completed",
+    "_handle_calibration_wiris_oz_gilc_failed",
+    "_clear_calibration_wiris_oz_gilc_worker",
+    "_handle_calibration_wiris_oz_sync_completed",
+    "_handle_calibration_wiris_oz_sync_failed",
+    "_clear_calibration_wiris_oz_sync_worker",
+    "_process_next_ftp_oz_sync_pair",
+    "_start_calibration_wiris_oz_delete",
+    "_handle_calibration_wiris_oz_delete_completed",
+    "_handle_calibration_wiris_oz_delete_failed",
+    "_clear_calibration_wiris_oz_delete_worker",
+    "_calib_oz_ledger_path",
+    "_load_calib_oz_ledger",
+    "_save_calib_oz_ledger",
+    "_calibration_pair_selection_path",
+    "_load_calibration_pair_selection",
+    "_choose_calibration_pairs",
 ]
 
 
@@ -1368,6 +1400,497 @@ class CalibrationWorkflowController:
         self.panel.calibration_wiris_ftp_oz_thread = None
         self.panel.calibration_wiris_ftp_oz_worker = None
 
+    # -- OZ capture-only + FTP sync -------------------------------------
+    #
+    # "Capture FTP OZ" above bundles a still trigger with an immediate FTP
+    # download; every capture pays the full FTP round-trip before the next
+    # one can start. These three pieces decouple that: capture repeatedly
+    # (fast, camera-local only), then sync everything new in one pass, then
+    # let the operator pick which synced pairs feed the calculation.
+    #
+    # Extrinsics need proof that a left/right pair came from the *same*
+    # trigger. The two camera clocks can differ by hours, so remote
+    # timestamps can't establish that once several stills have piled up
+    # un-downloaded. Instead a local ledger (``calib_oz_capture/ledger.json``)
+    # records each trigger round and whether *both* sides reported
+    # ``stored_on_camera`` -- only such "synchronized" rounds are ever
+    # eligible for sync/pairing, and syncing matches each camera's new
+    # remote files to ledger rounds strictly in that camera's own upload
+    # order (MDTM), never by cross-camera timestamp.
+
+    def _calib_oz_ledger_path(self) -> Path:
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        return root / "calib_oz_capture" / "ledger.json"
+
+    def _load_calib_oz_ledger(self) -> dict[str, object]:
+        empty: dict[str, object] = {"rounds": [], "consumed_remote_names": {"left": [], "right": []}}
+        path = self.panel._calib_oz_ledger_path()
+        if not path.exists():
+            return empty
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        data.setdefault("rounds", [])
+        data.setdefault("consumed_remote_names", {"left": [], "right": []})
+        return data
+
+    def _save_calib_oz_ledger(self, ledger: dict[str, object]) -> None:
+        path = self.panel._calib_oz_ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(ledger, indent=2), encoding="utf-8")
+
+    def capture_calibration_images_wiris_oz_capture_only(self) -> bool:
+        """Trigger an OZ still on both cameras and leave it on camera storage.
+
+        No FTP download here -- see ``sync_calibration_images_wiris_oz_ftp``.
+        Meant to be pressed repeatedly while watching the live view for board
+        framing, accumulating stills quickly without paying an FTP round-trip
+        per shot.
+        """
+
+        busy_threads = (
+            self.panel.calibration_wiris_oz_format_thread,
+            self.panel.calibration_wiris_oz_gilc_thread,
+            self.panel.calibration_wiris_oz_capture_thread,
+            self.panel.calibration_wiris_oz_sync_thread,
+            self.panel.calibration_wiris_ftp_thread,
+            self.panel.calibration_wiris_ftp_oz_thread,
+            self.panel.checkerboard_calibration_thread,
+        )
+        if any(thread is not None for thread in busy_threads):
+            self.panel.calibration_status_label.setText(
+                "A WIRIS OZ capture/sync/calibration operation is already in progress."
+            )
+            return False
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            self.panel.calibration_status_label.setText(
+                "OZ capture failed: both WIRIS control hosts are required."
+            )
+            return False
+        # Force a known, single-file-per-round format state before every
+        # trigger -- CPTR emits one file per enabled SIxx toggle, and the
+        # two cameras were found with different toggles on (left had
+        # radiometric on, right had HR on). Best-effort: proceed to capture
+        # either way, since a failed format command shouldn't block the shot,
+        # it'll just be caught later by the sync's per-name ``-visible.jpg``
+        # filter and count check.
+        self.panel.calibration_status_label.setText("OZ Capture: 이미지 포맷 강제 설정 중")
+        thread = QtCore.QThread(self.panel)
+        worker = WirisImageFormatWorker(
+            target_infos,
+            commands=("SIRJ FALSE", "SISR FALSE", "SIHR FALSE", "SIVI TRUE"),
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_oz_format_preset_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_oz_format_preset_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_oz_format_worker)
+        self.panel.calibration_wiris_oz_format_thread = thread
+        self.panel.calibration_wiris_oz_format_worker = worker
+        self._pending_oz_capture_target_infos = target_infos
+        thread.start()
+        return True
+
+    def _handle_calibration_wiris_oz_format_preset_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        for label, responses in record.items():
+            self.panel._log(f"[캘리브레이션] OZ 포맷 강제 설정 {label}: {responses}")
+        self._start_calibration_wiris_oz_capture()
+
+    def _handle_calibration_wiris_oz_format_preset_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] OZ 포맷 강제 설정 실패 (촬영은 계속 진행): {error}")
+        self._start_calibration_wiris_oz_capture()
+
+    def _clear_calibration_wiris_oz_format_worker(self) -> None:
+        self.panel.calibration_wiris_oz_format_thread = None
+        self.panel.calibration_wiris_oz_format_worker = None
+
+    def _start_calibration_wiris_oz_capture(self) -> None:
+        target_infos = getattr(self, "_pending_oz_capture_target_infos", ())
+        self._pending_oz_capture_target_infos = ()
+        if len(target_infos) != 2:
+            return
+        capture_id = f"calib-ozcap-{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        thread = QtCore.QThread(self.panel)
+        worker = WirisOZPhotoCaptureWorker(target_infos, capture_id=capture_id, completion_timeout_s=10.0)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_oz_capture_only_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_oz_capture_only_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_oz_capture_only_worker)
+        self.panel.calibration_wiris_oz_capture_thread = thread
+        self.panel.calibration_wiris_oz_capture_worker = worker
+        self.panel.calibration_status_label.setText(f"OZ Capture {capture_id}: 좌/우 카메라 내부 저장 중")
+        thread.start()
+
+    def _handle_calibration_wiris_oz_capture_only_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        cameras = record.get("cameras")
+        cameras = cameras if isinstance(cameras, dict) else {}
+        capture_id = str(record.get("capture_id") or "")
+        left_ok = bool((cameras.get("left") or {}).get("stored_on_camera"))
+        right_ok = bool((cameras.get("right") or {}).get("stored_on_camera"))
+        synchronized = left_ok and right_ok
+        ledger = self.panel._load_calib_oz_ledger()
+        rounds = ledger["rounds"]
+        rounds.append(
+            {
+                "capture_id": capture_id,
+                "requested_at_unix_ns": time.time_ns(),
+                "left": {"stored_on_camera": left_ok, "state": (cameras.get("left") or {}).get("state")},
+                "right": {"stored_on_camera": right_ok, "state": (cameras.get("right") or {}).get("state")},
+                "synchronized": synchronized,
+                "downloaded": False,
+                "left_remote_name": None,
+                "right_remote_name": None,
+            }
+        )
+        self.panel._save_calib_oz_ledger(ledger)
+        pending = sum(1 for row in rounds if row.get("synchronized") and not row.get("downloaded"))
+        if not synchronized:
+            self.panel._log(
+                f"[캘리브레이션] OZ Capture {capture_id}: 좌우 중 한쪽만 성공 -- 페어링 대상에서 제외 "
+                f"(left={left_ok}, right={right_ok})"
+            )
+        self.panel.calibration_status_label.setText(
+            f"OZ Capture {capture_id}: 완료 (동기화 대기 {pending}쌍)"
+        )
+
+    def _handle_calibration_wiris_oz_capture_only_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] OZ Capture 실패: {error}")
+        self.panel.calibration_status_label.setText(f"OZ Capture failed: {error}")
+
+    def _clear_calibration_wiris_oz_capture_only_worker(self) -> None:
+        self.panel.calibration_wiris_oz_capture_thread = None
+        self.panel.calibration_wiris_oz_capture_worker = None
+
+    #: GILC's storage-location names, mapped to their FTP root folder name.
+    IMAGE_LOCATION_FTP_ROOTS = {"SSD": "ssd", "SD_CARD": "sdcard", "FLASH_DRIVE": "flashd"}
+
+    def sync_calibration_images_wiris_oz_ftp(self) -> bool:
+        """Download every un-synced, both-sides-successful OZ round via FTP.
+
+        WIRIS Enterprise has no fixed image directory -- stills land under
+        /<GILC storage root>/<session folder>/img/, and a new session folder
+        appears every time Ethernet Mode (re)starts or the camera reboots.
+        The storage root is queried fresh via GILC before every sync (a
+        camera-side ``SILC`` change should be picked up immediately, not
+        cached); the sync worker itself walks every session folder under it.
+        """
+
+        busy_threads = (
+            self.panel.calibration_wiris_oz_format_thread,
+            self.panel.calibration_wiris_oz_gilc_thread,
+            self.panel.calibration_wiris_oz_capture_thread,
+            self.panel.calibration_wiris_oz_sync_thread,
+            self.panel.calibration_wiris_ftp_thread,
+            self.panel.calibration_wiris_ftp_oz_thread,
+            self.panel.checkerboard_calibration_thread,
+        )
+        if any(thread is not None for thread in busy_threads):
+            self.panel.calibration_status_label.setText(
+                "A WIRIS OZ capture/sync/calibration operation is already in progress."
+            )
+            return False
+        settings = getattr(self.panel, "settings", None)
+        if not bool(getattr(settings, "wiris_ftp_enabled", False)):
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP sync requires \"Enable FTP download\" in Settings."
+            )
+            return False
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP sync failed: both WIRIS control hosts are required."
+            )
+            return False
+        ledger = self.panel._load_calib_oz_ledger()
+        rounds = ledger["rounds"]
+        pending_rounds = [row for row in rounds if row.get("synchronized") and not row.get("downloaded")]
+        if not pending_rounds:
+            self.panel.calibration_status_label.setText("동기화할 새 OZ 회차가 없습니다.")
+            return False
+        self.panel.calibration_status_label.setText("WIRIS FTP 동기화: 저장소 위치(GILC) 확인 중")
+        thread = QtCore.QThread(self.panel)
+        worker = WirisImageFormatWorker(target_infos, commands=("GILC",))
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_oz_gilc_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_oz_gilc_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_oz_gilc_worker)
+        self.panel.calibration_wiris_oz_gilc_thread = thread
+        self.panel.calibration_wiris_oz_gilc_worker = worker
+        self._pending_ftp_oz_sync_target_infos = target_infos
+        self._pending_ftp_oz_sync_rounds = pending_rounds
+        thread.start()
+        return True
+
+    def _handle_calibration_wiris_oz_gilc_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        target_infos = getattr(self, "_pending_ftp_oz_sync_target_infos", ())
+        pending_rounds = getattr(self, "_pending_ftp_oz_sync_rounds", [])
+        self._pending_ftp_oz_sync_target_infos = ()
+        self._pending_ftp_oz_sync_rounds = []
+        storage_root_by_label: dict[str, str] = {}
+        for label, responses in record.items():
+            location = str((responses or {}).get("GILC", "")).strip().upper()
+            root_name = self.IMAGE_LOCATION_FTP_ROOTS.get(location)
+            if root_name is None:
+                self.panel._log(
+                    f"[캘리브레이션] WIRIS FTP 동기화 실패: {label} GILC 응답을 알 수 없습니다 ({location!r})."
+                )
+                self.panel.calibration_status_label.setText(
+                    "WIRIS FTP sync failed: 저장소 위치(GILC)를 확인하지 못했습니다."
+                )
+                return
+            storage_root_by_label[label] = root_name
+        if len(storage_root_by_label) != 2:
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP sync failed: 좌우 저장소 위치를 모두 확인하지 못했습니다."
+            )
+            return
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        output_dir = root / "calib_oz_capture"
+        kwargs = self.panel._wiris_ftp_worker_kwargs(output_dir=output_dir)
+        ledger = self.panel._load_calib_oz_ledger()
+        fetch_counts = {"left": len(pending_rounds), "right": len(pending_rounds)}
+        thread = QtCore.QThread(self.panel)
+        worker = WirisOzFtpSyncWorker(
+            target_infos,
+            ftp_settings_by_label=kwargs["ftp_settings_by_label"],
+            storage_root_by_label=storage_root_by_label,
+            ftp_output_dir=output_dir,
+            fetch_counts=fetch_counts,
+            downloaded_remote_names=ledger.get("consumed_remote_names") or {},
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_oz_sync_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_oz_sync_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_oz_sync_worker)
+        self.panel.calibration_wiris_oz_sync_thread = thread
+        self.panel.calibration_wiris_oz_sync_worker = worker
+        self._pending_ftp_oz_sync_round_ids = [str(row.get("capture_id")) for row in pending_rounds]
+        self.panel.calibration_status_label.setText(
+            f"WIRIS FTP 동기화: {len(pending_rounds)}쌍 다운로드 중"
+        )
+        thread.start()
+
+    def _handle_calibration_wiris_oz_gilc_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] WIRIS FTP 동기화: GILC 조회 실패 - {error}")
+        self.panel.calibration_status_label.setText(f"WIRIS FTP sync failed: GILC query failed ({error})")
+        self._pending_ftp_oz_sync_target_infos = ()
+        self._pending_ftp_oz_sync_rounds = []
+
+    def _clear_calibration_wiris_oz_gilc_worker(self) -> None:
+        self.panel.calibration_wiris_oz_gilc_thread = None
+        self.panel.calibration_wiris_oz_gilc_worker = None
+
+    def _handle_calibration_wiris_oz_sync_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        left = record.get("left") if isinstance(record.get("left"), dict) else {}
+        right = record.get("right") if isinstance(record.get("right"), dict) else {}
+        for side, item in (("left", left), ("right", right)):
+            if item.get("error"):
+                self.panel._log(f"[캘리브레이션] WIRIS FTP 동기화: {side} 오류 - {item['error']}")
+        left_items = list(left.get("items") or ())
+        right_items = list(right.get("items") or ())
+        round_ids = list(getattr(self, "_pending_ftp_oz_sync_round_ids", ()))
+        self._pending_ftp_oz_sync_round_ids = []
+
+        # Hard-fail the *whole* batch on any count mismatch or unreadable
+        # file, rather than zipping via min(len(left), len(right)). A
+        # mismatch anywhere except the tail (a round missing on one side
+        # only, or a stray pre-existing remote file mixed in) would
+        # otherwise get silently zipped against the wrong round -- exactly
+        # the cross-camera mixup the ledger exists to prevent. Nothing here
+        # is deleted from the camera; a failed batch can simply be retried
+        # once the remote directory / ledger state is sorted out.
+        left_invalid = [str(item.get("name")) for item in left_items if not item.get("valid")]
+        right_invalid = [str(item.get("name")) for item in right_items if not item.get("valid")]
+        if len(left_items) != len(round_ids) or len(right_items) != len(round_ids) or left_invalid or right_invalid:
+            self.panel._log(
+                "[캘리브레이션] WIRIS FTP 동기화 실패: 좌우 회차 수/유효성이 요청과 일치하지 않아 "
+                f"배치 전체를 건너뜁니다 (요청={len(round_ids)}, left={len(left_items)}개"
+                f"(무효 {left_invalid}), right={len(right_items)}개(무효 {right_invalid})). "
+                "카메라 원본은 삭제하지 않았습니다 -- 다른 캡처 채널이 같은 원격 디렉토리에 "
+                "파일을 남기지 않았는지 확인 후 다시 시도하세요."
+            )
+            self.panel.calibration_status_label.setText(
+                "WIRIS FTP sync failed: 좌우 회차가 정확히 매칭되지 않아 중단했습니다 (로그 참고)."
+            )
+            return
+        ledger = self.panel._load_calib_oz_ledger()
+        rounds_by_id = {str(row.get("capture_id")): row for row in ledger["rounds"]}
+        consumed = ledger.setdefault("consumed_remote_names", {"left": [], "right": []})
+        queue: list[tuple[str, dict[str, object]]] = []
+        delete_names: dict[str, list[str]] = {"left": [], "right": []}
+        for index, capture_id in enumerate(round_ids):
+            left_name, right_name = str(left_items[index]["name"]), str(right_items[index]["name"])
+            row = rounds_by_id.get(capture_id)
+            if row is not None:
+                row["downloaded"] = True
+                row["left_remote_name"] = left_name
+                row["right_remote_name"] = right_name
+            consumed.setdefault("left", []).append(left_name)
+            consumed.setdefault("right", []).append(right_name)
+            delete_names["left"].append(left_name)
+            delete_names["right"].append(right_name)
+            queue.append(
+                (
+                    capture_id,
+                    {
+                        "left": QtGui.QImage(str(left_items[index]["path"])),
+                        "right": QtGui.QImage(str(right_items[index]["path"])),
+                    },
+                )
+            )
+        self.panel._save_calib_oz_ledger(ledger)
+        self._pending_ftp_oz_sync_frames = queue
+        self._ftp_oz_sync_saved_count = 0
+        self.panel._process_next_ftp_oz_sync_pair()
+        # Only ever asked for once every file in the batch downloaded clean
+        # and every round paired 1:1 -- see the hard-fail check above.
+        self.panel._start_calibration_wiris_oz_delete(delete_names)
+
+    def _handle_calibration_wiris_oz_sync_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] WIRIS FTP 동기화 실패: {error}")
+        self.panel.calibration_status_label.setText(f"WIRIS FTP sync failed: {error}")
+        self._pending_ftp_oz_sync_round_ids = []
+
+    def _clear_calibration_wiris_oz_sync_worker(self) -> None:
+        self.panel.calibration_wiris_oz_sync_thread = None
+        self.panel.calibration_wiris_oz_sync_worker = None
+
+    def _start_calibration_wiris_oz_delete(self, names_by_label: dict[str, list[str]]) -> None:
+        if not any(names_by_label.values()):
+            return
+        if self.panel.calibration_wiris_oz_delete_thread is not None:
+            self.panel._log(
+                "[캘리브레이션] WIRIS FTP 원본 삭제: 이전 삭제 작업이 아직 진행 중이라 이번 정리는 건너뜁니다 "
+                "(로컬 사본은 이미 확보됨, 카메라에 파일이 남아있습니다)."
+            )
+            return
+        target_infos = self.panel._camera_photo_target_infos()
+        if len(target_infos) != 2:
+            return
+        kwargs = self.panel._wiris_ftp_worker_kwargs()
+        thread = QtCore.QThread(self.panel)
+        worker = WirisFtpBatchDeleteWorker(
+            target_infos,
+            ftp_settings_by_label=kwargs["ftp_settings_by_label"],
+            names_by_label=names_by_label,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.completed.connect(self.panel._handle_calibration_wiris_oz_delete_completed)
+        worker.failed.connect(self.panel._handle_calibration_wiris_oz_delete_failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self.panel._clear_calibration_wiris_oz_delete_worker)
+        self.panel.calibration_wiris_oz_delete_thread = thread
+        self.panel.calibration_wiris_oz_delete_worker = worker
+        thread.start()
+
+    def _handle_calibration_wiris_oz_delete_completed(self, result: object) -> None:
+        record = result if isinstance(result, dict) else {}
+        for side in ("left", "right"):
+            item = record.get(side) if isinstance(record.get(side), dict) else {}
+            if item.get("error"):
+                self.panel._log(f"[캘리브레이션] WIRIS FTP 원본 삭제: {side} 오류 - {item['error']}")
+            for name, error in (item.get("delete_errors") or {}).items():
+                self.panel._log(
+                    f"[캘리브레이션] WIRIS FTP 원본 삭제 실패 {side}/{name}: {error} "
+                    "(로컬 사본은 이미 확보됨, 카메라에 파일이 남아있습니다)"
+                )
+            deleted = item.get("deleted_names") or []
+            if deleted:
+                self.panel._log(f"[캘리브레이션] WIRIS FTP 원본 삭제: {side} {len(deleted)}개 삭제됨")
+
+    def _handle_calibration_wiris_oz_delete_failed(self, error: str) -> None:
+        self.panel._log(f"[캘리브레이션] WIRIS FTP 원본 삭제 실패: {error} (로컬 사본은 이미 확보됨)")
+
+    def _clear_calibration_wiris_oz_delete_worker(self) -> None:
+        self.panel.calibration_wiris_oz_delete_thread = None
+        self.panel.calibration_wiris_oz_delete_worker = None
+
+    def _process_next_ftp_oz_sync_pair(self) -> None:
+        queue = getattr(self, "_pending_ftp_oz_sync_frames", None)
+        if not queue:
+            saved = getattr(self, "_ftp_oz_sync_saved_count", 0)
+            self.panel._log(f"[캘리브레이션] WIRIS FTP 동기화 완료: {saved}쌍 저장")
+            self.panel.calibration_status_label.setText(f"WIRIS FTP 동기화 완료: {saved}쌍 저장")
+            return
+        capture_id, frames = queue.pop(0)
+        started = self.panel.capture_calibration_images(frames=frames, capture_origin="ftp_oz_sync")
+        if not started:
+            QtCore.QTimer.singleShot(200, self.panel._process_next_ftp_oz_sync_pair)
+            return
+        self._ftp_oz_sync_saved_count = getattr(self, "_ftp_oz_sync_saved_count", 0) + 1
+        thread = self.panel.checkerboard_calibration_thread
+        if thread is not None:
+            thread.finished.connect(self.panel._process_next_ftp_oz_sync_pair)
+        else:
+            QtCore.QTimer.singleShot(200, self.panel._process_next_ftp_oz_sync_pair)
+
+    # -- Manual calculation-pair selection --------------------------------
+
+    def _calibration_pair_selection_path(self) -> Path:
+        root, _left_dir, _right_dir = self.panel._calibration_dirs()
+        return root / "calibration_pair_selection.json"
+
+    def _load_calibration_pair_selection(self) -> dict[str, object]:
+        empty: dict[str, object] = {"manual_mode": False, "included_keys": []}
+        path = self.panel._calibration_pair_selection_path()
+        if not path.exists():
+            return empty
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return empty
+        if not isinstance(data, dict):
+            return empty
+        return {
+            "manual_mode": bool(data.get("manual_mode", False)),
+            "included_keys": [str(key) for key in data.get("included_keys", []) or []],
+        }
+
+    def _choose_calibration_pairs(
+        self,
+        pairs: list[tuple[str, Path, Path]],
+    ) -> list[tuple[str, Path, Path]]:
+        """Manual picker override of ``_select_calibration_pairs``.
+
+        Falls back to the existing even-distribution auto-selection unless
+        the operator has switched on manual selection in the picker (which
+        writes ``calibration_pair_selection.json`` -- the picker lives on the
+        visible workspace panel, calculation runs on this hidden one, so a
+        JSON sidecar is the handoff instead of a cross-panel command).
+        """
+
+        selection = self.panel._load_calibration_pair_selection()
+        if not selection.get("manual_mode"):
+            return self._select_calibration_pairs(pairs)
+        included = set(selection.get("included_keys") or ())
+        return [pair for pair in pairs if pair[0] in included]
+
     def toggle_auto_calibration_capture(self) -> None:
         if self._auto_capture_active:
             self.stop_auto_calibration_capture()
@@ -1575,7 +2098,7 @@ class CalibrationWorkflowController:
         root, left_paths, right_paths, pairs = self.panel._checkerboard_validation_scan_counts()
         source_pair_count = len(pairs)
         calculation_pair_limit = self._calibration_calculation_pair_limit()
-        selected_pairs = self._select_calibration_pairs(pairs)
+        selected_pairs = self._choose_calibration_pairs(pairs)
         if mode == "checkerboard":
             left_paths = [left for _key, left, _right in selected_pairs]
             right_paths = [right for _key, _left, right in selected_pairs]
@@ -1697,7 +2220,7 @@ class CalibrationWorkflowController:
             )
             return
         root, _left_paths, _right_paths, pairs = self.panel._checkerboard_validation_scan_counts()
-        selected_pairs = self._select_calibration_pairs(pairs)
+        selected_pairs = self._choose_calibration_pairs(pairs)
         if len(selected_pairs) < 3:
             self.panel._set_health_label(
                 self.panel.checkerboard_validation_status_label,

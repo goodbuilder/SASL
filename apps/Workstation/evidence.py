@@ -1187,6 +1187,11 @@ class EvidenceAdapter:
             "coordinate_contract": f"intrinsics/extrinsics source selectors; public output {MEASUREMENT_FRAME} [{MEASUREMENT_AXIS_CONTRACT}]",
         }
 
+    def image_format_status(self) -> dict[str, object]:
+        """Latest left/right GIVI/GIRJ/GISR/GIHR/GILC snapshot, if queried."""
+
+        return dict(getattr(self.panel, "wiris_image_format_status", {}) or {})
+
     def calibration_setup(self) -> dict[str, object]:
         """Project editable calibration setup fields without changing them."""
 
@@ -1206,6 +1211,9 @@ class EvidenceAdapter:
                 _widget_value(getattr(self.panel, "calibration_auto_target_spin", None))
             ),
             "calibration_root": _widget_text(getattr(self.panel, "calib_dir_edit", None)),
+            "calibration_root_resolved": str(self.panel._calibration_dirs()[0])
+            if hasattr(self.panel, "_calibration_dirs")
+            else "",
             "validation_mode": str(
                 _combo_data(getattr(self.panel, "checkerboard_validation_mode_combo", None), "pixhawk")
                 or "pixhawk"

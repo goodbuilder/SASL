@@ -183,6 +183,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 self._camera_save_settings,
             ),
             (
+                "camera.refresh_image_format_status",
+                "새로고침",
+                "Query GIVI/GIRJ/GISR/GIHR/GILC on both WIRIS cameras.",
+                "camera",
+                self._camera_refresh_image_format_status,
+            ),
+            (
+                "camera.apply_oz_only_image_format",
+                "OZ 전용 초기화",
+                "Send SIRJ FALSE, SISR FALSE, SIHR FALSE, SIVI TRUE to both WIRIS cameras.",
+                "camera",
+                self._camera_apply_oz_only_image_format,
+            ),
+            (
                 "pixhawk.toggle_mavlink",
                 "Connect Pixhawk",
                 "Legacy toggle for the existing MAVLink Pixhawk path.",
@@ -418,6 +432,20 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
                 "Same as Capture FTP HR, using the lower-resolution operating-zoom "
                 "still (SIVI) instead of the HR still -- faster, no camera reboot risk.",
                 self._calibration_capture_images_wiris_ftp_oz,
+            ),
+            (
+                "calibration.capture_images_wiris_oz_capture_only",
+                "OZ 캡처",
+                "Trigger an OZ still on both cameras and leave it on camera storage -- "
+                "no FTP download, so it can be pressed repeatedly and quickly.",
+                self._calibration_capture_images_wiris_oz_capture_only,
+            ),
+            (
+                "calibration.sync_images_wiris_oz_ftp",
+                "FTP 접근",
+                "Download every OZ still accumulated on camera storage since the last "
+                "sync, pairing left/right by trigger order, not by camera clock.",
+                self._calibration_sync_images_wiris_oz_ftp,
             ),
             (
                 "calibration.auto_capture",
@@ -1413,6 +1441,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
     def _camera_save_settings(self) -> object:
         return self.backend.camera_save_settings()
 
+    def _camera_refresh_image_format_status(self) -> object:
+        return self.backend.camera_refresh_image_format_status()
+
+    def _camera_apply_oz_only_image_format(self) -> object:
+        return self.backend.camera_apply_oz_only_image_format()
+
     def _time_set_pc(self) -> object:
         return self.backend.time_set_pc()
 
@@ -1502,6 +1536,12 @@ class WorkstationMainWindow(QtWidgets.QMainWindow):
 
     def _calibration_capture_images_wiris_ftp_oz(self) -> object:
         return self.backend.calibration_capture_images_wiris_ftp_oz()
+
+    def _calibration_capture_images_wiris_oz_capture_only(self) -> object:
+        return self.backend.calibration_capture_images_wiris_oz_capture_only()
+
+    def _calibration_sync_images_wiris_oz_ftp(self) -> object:
+        return self.backend.calibration_sync_images_wiris_oz_ftp()
 
     def _calibration_toggle_auto_capture(self) -> object:
         panel = getattr(self.backend, "panel", None)
