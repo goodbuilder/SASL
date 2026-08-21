@@ -8,13 +8,11 @@ import random
 from pathlib import Path
 
 
-DEFAULT_SOURCE_MATRIX = (
-    "/home/moontaehyung/영상감시시스템/ref/Stereo_Camera_3D_Position_DKL/"
-    "Cent_Bbox_Adj_Mtrx.csv"
-)
-DEFAULT_PROFILE_SOURCE = (
-    "/home/moontaehyung/영상감시시스템/ref/Stereo_Camera_3D_Position_DKL/"
-    "Gazebo_Sim/time (csv)/8x/pitch0_yaw0.csv"
+REPO_ROOT = Path(__file__).resolve().parents[3]
+REFERENCE_ROOT = REPO_ROOT / "ref" / "Stereo_Camera_3D_Position_DKL"
+DEFAULT_SOURCE_MATRIX = str(REFERENCE_ROOT / "Cent_Bbox_Adj_Mtrx.csv")
+DEFAULT_PROFILE_SOURCE = str(
+    REFERENCE_ROOT / "Gazebo_Sim" / "time (csv)" / "8x" / "pitch0_yaw0.csv"
 )
 
 

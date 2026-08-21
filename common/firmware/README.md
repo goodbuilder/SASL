@@ -53,17 +53,19 @@ The local machine uses the user-local ARM toolchain and the SASL simulation
 venv Python:
 
 ```sh
+SASL_ROOT=/path/to/SASL
+ARM_TOOLCHAIN_BIN=/path/to/gcc-arm-none-eabi/bin
 cd /path/to/PX4-Autopilot
-PATH=/home/moon/tools/gcc-arm-none-eabi-10.3-2021.10/bin:$PATH \
-PYTHON_EXECUTABLE=/home/moon/Desktop/SASL/apps/Simulation/.venv/bin/python \
+PATH="$ARM_TOOLCHAIN_BIN:$PATH" \
+PYTHON_EXECUTABLE="$SASL_ROOT/.venv/bin/python" \
 make px4_fmu-v6x_default
 ```
 
 Flash a USB-connected FMU v6X:
 
 ```sh
-PATH=/home/moon/tools/gcc-arm-none-eabi-10.3-2021.10/bin:$PATH \
-PYTHON_EXECUTABLE=/home/moon/Desktop/SASL/apps/Simulation/.venv/bin/python \
+PATH="$ARM_TOOLCHAIN_BIN:$PATH" \
+PYTHON_EXECUTABLE="$SASL_ROOT/.venv/bin/python" \
 make px4_fmu-v6x_default upload
 ```
 
@@ -219,8 +221,7 @@ Expected entries include `sensor_gps_0`, `sensor_gps_1`,
 
 The USB-connected FMU v6X was flashed from:
 
-- PX4 checkout: local PX4-Autopilot checkout previously stored under
-  `/home/moontaehyung/Capstone/source/PX4-Autopilot`
+- PX4 checkout: external machine-local PX4-Autopilot checkout at the revision below
 - PX4 git describe: `v1.17.0-alpha1-1214-g7b1e54889d-dirty`
 - Firmware artifact:
   `common/firmware/artifacts/px4_fmu-v6x_default/px4_fmu-v6x_default.px4`

@@ -301,6 +301,8 @@ from Workstation.evidence import mavlink_link_provenance
 from Workstation.runtime_paths import (
     WORKSTATION_DATA_ROOT,
     WORKSTATION_SETTINGS_PATH,
+    import_workstation_asset_file,
+    portable_workstation_data_path_text,
     resolve_workstation_data_path,
 )
 
@@ -6813,8 +6815,22 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         if not selected:
             return
-        self.weights_edit.setText(selected)
-        self._log(f"[YOLO] weights 파일 선택: {selected}")
+        try:
+            imported = import_workstation_asset_file(
+                selected,
+                category="models",
+                data_root=self.app_root,
+            )
+            portable = portable_workstation_data_path_text(
+                imported,
+                data_root=self.app_root,
+                field_name="yolo_weights_path",
+            )
+        except (OSError, ValueError) as exc:
+            self._log(f"[YOLO] weights portable import 실패: {selected}: {exc}")
+            return
+        self.weights_edit.setText(portable)
+        self._log(f"[YOLO] weights 파일을 portable data root로 가져왔습니다: {portable}")
 
     def _format_age(self, age_s: float) -> str:
         if not isfinite(age_s):
@@ -11481,6 +11497,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
                 }
                 self.checkerboard_validation_summary = summary
         root, _left_dir, _right_dir = self._calibration_dirs()
+        try:
+            portable_workstation_data_path_text(
+                root,
+                data_root=self.app_root,
+                field_name="calibration_root",
+            )
+        except ValueError as exc:
+            self.calibration_status_label.setText(
+                f"Cannot save intrinsics outside the portable data root: {exc}"
+            )
+            self._log(f"[캘리브레이션] intrinsic 저장 차단: {exc}")
+            return
         root.mkdir(parents=True, exist_ok=True)
         zoom_level = self.last_calibration_zoom_level
         if zoom_level is None:
@@ -11565,20 +11593,37 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
         )
         if not selected:
             return
-        path = Path(selected)
+        source_path = Path(selected)
         try:
-            result = load_intrinsics_json(path)
+            result = load_intrinsics_json(source_path)
             errors = self._validate_intrinsics_result(result)
             if errors:
                 raise ValueError("; ".join(errors))
-            metadata_zoom_level = self._intrinsics_file_zoom_level(path)
+            metadata_zoom_level = self._intrinsics_file_zoom_level(source_path)
         except Exception as exc:
             self.calibration_status_label.setText(f"Failed to load intrinsics: {exc}")
-            self._log(f"[캘리브레이션] intrinsic 파일 검증 실패: {path}: {exc}")
+            self._log(f"[캘리브레이션] intrinsic 파일 검증 실패: {source_path}: {exc}")
             return
-        if not self._confirm_intrinsics_profile_mismatch(path, result, metadata_zoom_level):
-            self._log(f"[캘리브레이션] intrinsic 적용을 취소했습니다: {path}")
+        if not self._confirm_intrinsics_profile_mismatch(source_path, result, metadata_zoom_level):
+            self._log(f"[캘리브레이션] intrinsic 적용을 취소했습니다: {source_path}")
             return
+        try:
+            path = import_workstation_asset_file(
+                source_path,
+                category="calibration",
+                data_root=self.app_root,
+            )
+        except (OSError, ValueError) as exc:
+            self.calibration_status_label.setText(f"Failed to import intrinsics: {exc}")
+            self._log(
+                f"[캘리브레이션] intrinsic portable import 실패: {source_path}: {exc}"
+            )
+            return
+        if path != source_path.resolve(strict=False):
+            self._log(
+                f"[캘리브레이션] 외부 intrinsic을 portable data root로 가져왔습니다: "
+                f"source={source_path}, imported={path}"
+            )
         self.last_calibration_result = result
         self.calibration_image_diagnostics = tuple(result.image_diagnostics)
         self.last_calibration_zoom_level = (
@@ -11590,8 +11635,18 @@ class WirisStereoDistancePanel(QtWidgets.QWidget):
             self._refresh_zoom_intrinsics_tab()
             self._refresh_operation_header()
             return
-        self._save_current_settings(path)
-        self.calibration_status_label.setText(f"Loaded and applied intrinsics: {path.name}")
+        try:
+            self._save_current_settings(path)
+        except ValueError as exc:
+            self.calibration_status_label.setText(
+                f"Loaded intrinsics for this run; portable settings were not saved: {exc}"
+            )
+            self._log(
+                f"[캘리브레이션] intrinsic은 현재 실행에 적용했지만 portable 설정 저장은 "
+                f"차단됐습니다: {exc}"
+            )
+        else:
+            self.calibration_status_label.setText(f"Loaded and applied intrinsics: {path.name}")
         self._add_zoom_intrinsics_comparison_path(path)
         self._log(f"[캘리브레이션] intrinsic 파일을 선택해 적용했습니다: {path}")
         self._refresh_zoom_intrinsics_tab()

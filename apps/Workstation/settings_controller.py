@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt5 import QtGui, QtWidgets
 
 from Workstation.drone_telemetry_controller import normalize_drone_rtcm_source
+from Workstation.runtime_paths import portable_workstation_data_path_text
 from Workstation.workstation_core.gnss_operation import (
     GnssOperationConfig,
     GnssOperationMode,
@@ -492,10 +493,37 @@ class WorkstationSettingsController:
             else:
                 root, _left_dir, _right_dir = panel._calibration_dirs()
                 path = root / "intrinsics.json"
-        relative = panel._app_relative_path_text(path)
+        portable_paths = {
+            "intrinsics_path": portable_workstation_data_path_text(
+                path,
+                data_root=panel.app_root,
+                field_name="intrinsics_path",
+            ),
+            "yolo_weights_path": portable_workstation_data_path_text(
+                panel.weights_edit.text().strip() or DEFAULT_YOLO_WEIGHTS,
+                data_root=panel.app_root,
+                field_name="yolo_weights_path",
+            ),
+            "calibration_root": portable_workstation_data_path_text(
+                panel.calib_dir_edit.text().strip(),
+                data_root=panel.app_root,
+                field_name="calibration_root",
+            ),
+            "calibration_validation_root": portable_workstation_data_path_text(
+                panel.checkerboard_validation_root_edit.text().strip(),
+                data_root=panel.app_root,
+                field_name="calibration_validation_root",
+            ),
+            "calibration_validation_json": portable_workstation_data_path_text(
+                panel.checkerboard_validation_json_edit.text().strip(),
+                data_root=panel.app_root,
+                field_name="calibration_validation_json",
+                allow_empty=True,
+            ),
+        }
         panel.settings = AppSettings(
-            intrinsics_path=relative,
-            yolo_weights_path=panel.weights_edit.text().strip() or DEFAULT_YOLO_WEIGHTS,
+            intrinsics_path=portable_paths["intrinsics_path"],
+            yolo_weights_path=portable_paths["yolo_weights_path"],
             interface_name=panel.interface_edit.text().strip() or DEFAULT_INTERFACE,
             camera_host_address=panel.host_address_edit.text().strip() or DEFAULT_HOST_ADDRESS,
             left_rtsp_url=panel.left_url_edit.text().strip() or DEFAULT_CAMERA_URLS[0],
@@ -531,12 +559,12 @@ class WorkstationSettingsController:
             calibration_calculation_pair_count=panel.calib_calculation_pairs_spin.value(),
             calibration_auto_interval_s=panel.calibration_auto_interval_spin.value(),
             calibration_auto_target_pairs=panel.calibration_auto_target_spin.value(),
-            calibration_root=panel.calib_dir_edit.text().strip(),
+            calibration_root=portable_paths["calibration_root"],
             calibration_validation_mode=str(
                 panel.checkerboard_validation_mode_combo.currentData() or "pixhawk"
             ),
-            calibration_validation_root=panel.checkerboard_validation_root_edit.text().strip(),
-            calibration_validation_json=panel.checkerboard_validation_json_edit.text().strip(),
+            calibration_validation_root=portable_paths["calibration_validation_root"],
+            calibration_validation_json=portable_paths["calibration_validation_json"],
             calibration_validation_runs=panel.checkerboard_validation_random_runs_spin.value(),
             calibration_validation_pair_count=panel.checkerboard_validation_random_pair_count_spin.value(),
             calibration_validation_seed=panel.checkerboard_validation_seed_spin.value(),
@@ -613,3 +641,12 @@ class WorkstationSettingsController:
             ),
         )
         _save_shared_settings(panel.settings, panel.settings_path)
+        panel.weights_edit.setText(portable_paths["yolo_weights_path"])
+        panel.calib_dir_edit.setText(portable_paths["calibration_root"])
+        panel.checkerboard_validation_root_edit.setText(
+            portable_paths["calibration_validation_root"]
+        )
+        panel.checkerboard_validation_json_edit.setText(
+            portable_paths["calibration_validation_json"]
+        )
+        panel._workstation_setting_overrides.update(portable_paths)

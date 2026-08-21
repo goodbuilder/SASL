@@ -37,6 +37,12 @@ export SASL_WORKSTATION_DATA_ROOT=/absolute/path/to/workstation_data
 ./apps/Workstation/run.sh
 ```
 
+The settings JSON itself stores required asset paths relative to that data root. Selecting an
+external intrinsics or YOLO file imports verified bytes into a content-addressed
+`calibration/imported/` or `models/imported/` child before persistence. A calibration directory
+outside the data root remains usable only for the current workflow until it is explicitly migrated;
+Save rejects it instead of creating a machine-specific absolute dependency.
+
 GStreamer is the default stream backend. Install the optional PyAV overlay only when the selected
 settings profile uses PyAV:
 
@@ -309,13 +315,20 @@ Run the Workstation regression suite from `apps/Workstation` with:
 python3 -m pytest -q
 ```
 
+Run the repository portability gate from the repository root with:
+
+```bash
+python3 tools/check_portable_paths.py
+```
+
 ## Inputs/Outputs and Interfaces
 
 - The canonical runtime root is `.local/workstation_data/` at the repository root, or the path in
   `SASL_WORKSTATION_DATA_ROOT`. It owns `stereo_distance_settings.json`, `recordings/`,
-  `calibration/`, `models/`, and runtime caches. Known historical default paths remain
-  read-compatible in place; they are never automatically copied, renamed, or deleted, and an
-  explicit custom path is preserved.
+  `calibration/`, `models/`, and runtime caches. The five persistent asset fields—intrinsics,
+  detector weights, calibration root, validation root, and validation JSON—are normalized to
+  data-root-relative POSIX paths. Known legacy values remain readable, but the next production Save
+  refuses machine-external directories and never writes a checkout/user-home absolute path.
 - New sessions live directly under `.local/workstation_data/recordings/<session-id>/`. The
   timestamp-based session ID is allocated only by explicit `Session > Open Session`; an app-run ID is
   recorded separately so one session can be recovered across application restarts. Existing
@@ -510,6 +523,10 @@ python3 -m pytest -q
   names are retained, but credential values are never read into the package. Recovered
   session-relative and FTP-local artifact paths must remain beneath the active session root;
   package finalization never imports an arbitrary host path.
+- Persistent settings path rules do not rewrite sealed evidence. Historical source paths may remain
+  as provenance, but replay and preview must use package-relative artifact paths and verified hashes.
+  `/dev`, `/opt`, bounded `/tmp`, and camera-side `/` remain explicit machine/device contracts rather
+  than portable asset fields.
 - Canonical capture/event rows are append-only evidence. Hiding a graph row changes only the view,
   corrupt JSONL lines remain represented by hashed synthetic records, and preview opens only after
   the artifact's recorded byte size and SHA-256 have been reverified.
@@ -670,6 +687,11 @@ A clean checkout does not download model weights. Copy the approved `yolov8m.pt`
 `run.sh --check` to pass before operation. Historical `apps/Workstation/calibration/` data is
 preserved and ignored by Git; migrate it only through an operator-approved copy-and-hash process.
 
+`.local/workstation_data` remains Git-ignored even though its internal settings paths are portable.
+To continue on another PC, transfer that directory or an approved checksum inventory separately;
+Git pull alone does not provide models, calibration images, recordings, credentials, or device-local
+settings. Large external calibration directories are deliberately not copied implicitly by Save.
+
 A calibration image directory is not itself an intrinsics profile. If startup reports a missing
 `intrinsics_zoom_XX.json`, calculate and quality-check K,D at that actual camera zoom or explicitly
 select an existing profile whose metadata declares the same zoom. Disabling `auto_load_intrinsics`
@@ -824,6 +846,13 @@ live on the panel at solve time -- a later live-GPS change cannot silently retar
 frozen Mountain image.
 
 ## Change Log
+
+- 2026-08-21: Made persistent Workstation asset paths checkout-independent. New defaults and saved
+  settings use `SASL_WORKSTATION_DATA_ROOT`-relative paths; external intrinsics and model files are
+  atomically copied into content-addressed data-root storage with SHA-256 verification; external
+  calibration directories and traversal/symlink escapes fail closed. Added runtime validation,
+  tracked-path audit tooling/CI, repo-root-derived Simulation defaults, and an `AGENTS.md` path
+  portability gate while preserving historical evidence paths as non-replay provenance.
 
 - 2026-08-21: Fixed restart auto-load of explicitly selected intrinsics. Startup now prefers the
   exact persisted `intrinsics_path`, preserves that real source path in the UI/provenance, requires

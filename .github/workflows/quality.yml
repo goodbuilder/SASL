@@ -13,6 +13,8 @@ jobs:
         # Remove --allow-existing-debt after the historical recording/profiler
         # files reported by this command are untracked in a dedicated cleanup.
         run: python3 tools/check_repository_policy.py --allow-existing-debt
+      - name: Reject user-home and dated-checkout paths
+        run: python3 tools/check_portable_paths.py
 
   python-tests:
     runs-on: ubuntu-22.04

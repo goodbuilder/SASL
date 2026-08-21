@@ -262,6 +262,9 @@ def _runtime_check(
         else _installed_runtime_versions(requirements, version_lookup=version_lookup)
     )
     errors = _runtime_version_errors(installed_versions, requirements)
+    from Workstation.runtime_paths import workstation_settings_portability_errors
+
+    errors.extend(workstation_settings_portability_errors(settings))
     errors.extend(_runtime_model_errors(settings))
     if not errors:
         errors.extend(_runtime_import_errors(settings, requirements, importer=importer))
@@ -279,7 +282,9 @@ def _runtime_check(
     print(f"python={sys.executable}")
     print(f"repository={Path(__file__).resolve().parents[2]}")
     print(f"stream_backend={_selected_stream_backend(settings)}")
-    print(f"yolo_model={getattr(settings, 'yolo_weights_path', '')}")
+    from Workstation.runtime_paths import resolve_workstation_data_path
+
+    print(f"yolo_model={resolve_workstation_data_path(getattr(settings, 'yolo_weights_path', ''))}")
     print(version_summary)
     return 0
 

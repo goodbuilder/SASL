@@ -4482,7 +4482,7 @@ def test_workstation_calibration_and_validation_run_off_ui_thread(monkeypatch, t
     monkeypatch.setattr(standalone_gui.WirisStereoDistancePanel, "_auto_load_intrinsics", lambda self: None)
     monkeypatch.setattr(standalone_gui, "opencv_available", lambda: (True, None))
     monkeypatch.setattr(standalone_gui, "save_settings", lambda _settings: None)
-    root = tmp_path / "calibration"
+    root = tmp_path / "custom-calibration"
     for side in ("left", "right"):
         directory = root / side
         directory.mkdir(parents=True)

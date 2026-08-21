@@ -19,6 +19,7 @@ from typing import Mapping
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from Workstation.runtime_paths import portable_workstation_data_path_text
 from Workstation.calibration_workers import (
     CheckerboardCalibrationWorker,
     CheckerboardCaptureWorker,
@@ -47,7 +48,6 @@ from Workstation.workstation_core.calibration_quality import (
 )
 from Workstation.workstation_core.settings import (
     DEFAULT_CALIBRATION_ROOT,
-    DEFAULT_INTRINSICS_PATH,
     resolve_settings_path,
 )
 from Workstation.wiris_runtime_workers import (
@@ -272,11 +272,11 @@ class CalibrationWorkflowController:
             )
 
     def _app_relative_path_text(self, path: str | Path) -> str:
-        resolved = Path(path).expanduser().resolve()
-        try:
-            return str(resolved.relative_to(self.panel.app_root))
-        except ValueError:
-            return str(resolved)
+        return portable_workstation_data_path_text(
+            path,
+            data_root=self.panel.app_root,
+            field_name="asset_path",
+        )
 
     def _checkerboard_validation_mode(self) -> str:
         if not hasattr(self.panel, "checkerboard_validation_mode_combo"):

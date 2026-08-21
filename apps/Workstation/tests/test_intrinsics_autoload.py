@@ -98,7 +98,7 @@ def autoload_panel_factory(
 
 def test_auto_load_prefers_exact_external_intrinsics_path(autoload_panel_factory, tmp_path: Path) -> None:
     storage_root = tmp_path / "storage"
-    storage_root.mkdir()
+    storage_root.mkdir(parents=True)
     exact_path = tmp_path / "external" / "approved-intrinsics.json"
     expected = _intrinsics_result(focal_px=1100.0)
     _save_profile(exact_path, expected, zoom_level=4)
@@ -279,12 +279,13 @@ def test_manually_selected_external_profile_is_auto_loaded_after_restart(
     )
     app_root = tmp_path / "data"
     app_root.mkdir()
-    storage_root = tmp_path / "storage"
-    storage_root.mkdir()
+    storage_root = app_root / "calibration" / "session-a"
+    storage_root.mkdir(parents=True)
     settings_path = tmp_path / "settings.json"
     save_settings(
         AppSettings(
-            calibration_root=str(storage_root),
+            calibration_root="calibration/session-a",
+            calibration_validation_root="calibration/session-a",
             calibration_zoom_level=4,
             auto_load_intrinsics=True,
         ),
@@ -305,7 +306,11 @@ def test_manually_selected_external_profile_is_auto_loaded_after_restart(
     second = None
     try:
         first.load_intrinsics()
-        assert load_settings(settings_path).intrinsics_path == str(exact_path)
+        persisted_path = load_settings(settings_path).intrinsics_path
+        assert not Path(persisted_path).is_absolute()
+        assert persisted_path.startswith("calibration/imported/")
+        imported_path = app_root / persisted_path
+        assert imported_path.read_bytes() == exact_path.read_bytes()
 
         second = standalone_gui.WirisStereoDistancePanel(
             app_root=app_root,
@@ -314,8 +319,8 @@ def test_manually_selected_external_profile_is_auto_loaded_after_restart(
         original_auto_load(second)
 
         assert second.active_intrinsics == expected
-        assert second._active_intrinsics_profile_path == str(exact_path)
-        assert str(exact_path) in second.zoom_intrinsics_path_label.text()
+        assert second._active_intrinsics_profile_path == str(imported_path)
+        assert str(imported_path) in second.zoom_intrinsics_path_label.text()
     finally:
         for panel in (first, second):
             if panel is None:
@@ -333,14 +338,14 @@ def test_saving_new_calibration_replaces_previous_persisted_exact_profile(
     autoload_panel_factory,
     tmp_path: Path,
 ) -> None:
-    storage_root = tmp_path / "storage"
-    storage_root.mkdir()
+    storage_root = tmp_path / "data-1" / "calibration"
     previous_path = tmp_path / "external" / "previous.json"
     _save_profile(previous_path, _intrinsics_result(focal_px=900.0), zoom_level=4)
     panel, auto_load = autoload_panel_factory(
         AppSettings(
             intrinsics_path=str(previous_path),
-            calibration_root=str(storage_root),
+            calibration_root="calibration",
+            calibration_validation_root="calibration",
             calibration_zoom_level=4,
             auto_load_intrinsics=True,
         )
@@ -352,7 +357,7 @@ def test_saving_new_calibration_replaces_previous_persisted_exact_profile(
 
     zoom_output = storage_root / "intrinsics_zoom_04.json"
     assert zoom_output.is_file()
-    assert load_settings(panel.settings_path).intrinsics_path == str(zoom_output)
+    assert load_settings(panel.settings_path).intrinsics_path == "calibration/intrinsics_zoom_04.json"
 
     panel.last_calibration_result = None
     panel.last_calibration_zoom_level = None
@@ -362,6 +367,27 @@ def test_saving_new_calibration_replaces_previous_persisted_exact_profile(
 
     assert panel.active_intrinsics is not None
     assert panel._active_intrinsics_profile_path == str(zoom_output)
+
+
+def test_save_intrinsics_rejects_external_calibration_root_without_writing(
+    autoload_panel_factory,
+    tmp_path: Path,
+) -> None:
+    external_root = tmp_path / "external-calibration"
+    panel, _auto_load = autoload_panel_factory(
+        AppSettings(
+            calibration_root=str(external_root),
+            calibration_validation_root="calibration",
+            calibration_zoom_level=4,
+        )
+    )
+    panel.last_calibration_result = _intrinsics_result(focal_px=1500.0)
+    panel.last_calibration_zoom_level = 4
+
+    panel.save_intrinsics()
+
+    assert not external_root.exists()
+    assert "outside the portable data root" in panel.calibration_status_label.text()
 
 
 def test_auto_load_restores_previous_runtime_state_when_apply_gate_rejects(

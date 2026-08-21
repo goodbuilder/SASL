@@ -5,13 +5,10 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from Workstation.runtime_paths import (
     REPO_ROOT,
-    WORKSTATION_CALIBRATION_ROOT,
     WORKSTATION_DATA_ROOT,
-    WORKSTATION_MODELS_ROOT,
     WORKSTATION_SETTINGS_PATH,
 )
 from Workstation.workstation_core.gnss_operation import GnssOperationConfig
@@ -29,9 +26,9 @@ LEGACY_REPOSITORY_DATA_ROOT = REPO_ROOT / ".local" / "workstation_data"
 LEGACY_CALIBRATION_CAPTURES_ROOT = WORKSTATION_DATA_ROOT / "calibration_captures"
 LEGACY_MODELS_ROOT = REPO_ROOT / ".local" / "models"
 DEFAULT_SETTINGS_PATH = WORKSTATION_SETTINGS_PATH
-DEFAULT_CALIBRATION_ROOT = str(WORKSTATION_CALIBRATION_ROOT)
-DEFAULT_INTRINSICS_PATH = str(Path(DEFAULT_CALIBRATION_ROOT) / "intrinsics.json")
-DEFAULT_YOLO_WEIGHTS_PATH = str(WORKSTATION_MODELS_ROOT / "yolov8m.pt")
+DEFAULT_CALIBRATION_ROOT = "calibration"
+DEFAULT_INTRINSICS_PATH = "calibration/intrinsics.json"
+DEFAULT_YOLO_WEIGHTS_PATH = "models/yolov8m.pt"
 PIXHAWK_ETHERNET_MODES = ("mavlink",)
 DEFAULT_PIXHAWK_ETHERNET_MODE = "mavlink"
 

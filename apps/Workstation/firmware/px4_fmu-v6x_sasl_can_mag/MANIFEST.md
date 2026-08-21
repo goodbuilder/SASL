@@ -34,7 +34,7 @@ Purpose:
 Source build record:
 
 - PX4 git describe: `v1.17.0-alpha1-1214-g7b1e54889d-dirty`
-- Build host tree: `/home/moontaehyung/Capstone/source/PX4-Autopilot`
+- Build host tree: external PX4 checkout at the recorded revision (machine-local path omitted)
 - Build timestamp: see `.px4` JSON `build_time` field
 - Files changed from that commit (outer repo):
   - `src/drivers/uavcan/sensors/mag.cpp`, `mag.hpp`
@@ -66,10 +66,11 @@ also captured as patches under `../patches/`:
 Apply from a PX4-Autopilot `v1.17.0-alpha1-1214-g7b1e54889d` checkout:
 
 ```sh
+SASL_ROOT=/path/to/SASL
 cd /path/to/PX4-Autopilot
-git apply /path/to/SASL-20260821/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-core.patch
-git apply /path/to/SASL-20260821/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-v6x-flash-fit.patch
-(cd src/modules/mavlink/mavlink && git apply /path/to/SASL-20260821/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch)
+git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-core.patch"
+git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-v6x-flash-fit.patch"
+(cd src/modules/mavlink/mavlink && git apply "$SASL_ROOT/apps/Workstation/firmware/patches/px4-v1.17-sasl-can-mag-mavlink-dialect.patch")
 make px4_fmu-v6x_default
 ```
 

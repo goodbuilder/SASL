@@ -39,6 +39,7 @@ from Workstation.runtime_paths import (
     WORKSTATION_MODELS_ROOT,
     WORKSTATION_RECORDINGS_ROOT,
     WORKSTATION_SETTINGS_PATH,
+    resolve_workstation_data_path,
 )
 from Workstation.workstation_core.settings import AppSettings, DEFAULT_SETTINGS_PATH
 
@@ -55,6 +56,8 @@ print(json.dumps({
     "validation_root": settings.calibration_validation_root,
     "validation_json": settings.calibration_validation_json,
     "weights": settings.yolo_weights_path,
+    "resolved_intrinsics": str(resolve_workstation_data_path(settings.intrinsics_path)),
+    "resolved_weights": str(resolve_workstation_data_path(settings.yolo_weights_path)),
 }))
 """
     observed = []
@@ -78,11 +81,13 @@ print(json.dumps({
         "calibration": str(data_root / "calibration"),
         "models": str(data_root / "models"),
         "default_settings": str(data_root / "stereo_distance_settings.json"),
-        "intrinsics": str(data_root / "calibration" / "intrinsics.json"),
-        "calibration_setting": str(data_root / "calibration"),
-        "validation_root": str(data_root / "calibration"),
-        "validation_json": str(data_root / "calibration" / "intrinsics.json"),
-        "weights": str(data_root / "models" / "yolov8m.pt"),
+        "intrinsics": "calibration/intrinsics.json",
+        "calibration_setting": "calibration",
+        "validation_root": "calibration",
+        "validation_json": "calibration/intrinsics.json",
+        "weights": "models/yolov8m.pt",
+        "resolved_intrinsics": str(data_root / "calibration" / "intrinsics.json"),
+        "resolved_weights": str(data_root / "models" / "yolov8m.pt"),
     }
 
 

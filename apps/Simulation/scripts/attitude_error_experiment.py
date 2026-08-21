@@ -19,10 +19,8 @@ from std_msgs.msg import Float32, Float32MultiArray
 
 DEFAULT_AXES = ("common_optical_yaw_error_deg", "relative_optical_yaw_error_deg")
 AXIS_CONTRACT = "stereo_center_frd:forward_right_down"
-DEFAULT_YOLO_MODEL = (
-    "/home/moontaehyung/영상감시시스템/ref/wiris_stereo (copy)/wiris_stereo/"
-    "yolov8n_uav.pt"
-)
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_YOLO_MODEL = str(REPO_ROOT / "apps" / "Simulation" / "yolov8n_uav.pt")
 VALID_ATTITUDE_AXES = {
     "common_optical_yaw_error_deg",
     "relative_optical_yaw_error_deg",
